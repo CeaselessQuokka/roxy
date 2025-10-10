@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Roxy Admin Dashboard</title>
+		<link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}" />
+		<link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='roxy_favicon.png') }}" />
+	</head>
+	<body class="app app--dark" data-theme="dark">
+		<!-- Top App Bar -->
+		<header class="app-bar" role="banner">
+			<div class="app-bar__section app-bar__section--start">
+				<button
+					id="navToggle"
+					class="icon-btn"
+					aria-label="Toggle navigation"
+					aria-controls="appNav"
+					aria-expanded="false"
+				>
+					☰
+				</button>
+				<h1 class="app-title">Roxy Admin</h1>
+			</div>
+			<div class="app-bar__section app-bar__section--end">
+				<span id="sessionUser" class="chip" aria-live="polite" aria-atomic="true">admin</span>
+				<form id="logoutForm" action="/admin/logout" method="post" class="inline-form">
+					<button type="submit" class="btn btn--tonal" id="logoutBtn">Logout</button>
+				</form>
+			</div>
+		</header>
+
+		<!-- Layout: Nav + Main -->
+		<div class="layout">
+			<!-- Navigation -->
+			<nav id="appNav" class="nav" aria-label="Primary">
+				<ul class="nav__list">
+					<li><a class="nav__link is-active" href="#section-overview">Overview</a></li>
+					<li><a class="nav__link" href="#section-tokens">Auth Tokens</a></li>
+					<li><a class="nav__link" href="#section-requests">Requests</a></li>
+					<li><a class="nav__link" href="#section-proxy">Proxy Timings</a></li>
+					<li><a class="nav__link" href="#section-probes">Exploit / Probe Attempts</a></li>
+					<li><a class="nav__link" href="#section-logins">Admin Logins</a></li>
+					<li><a class="nav__link" href="#section-health">Health</a></li>
+					<li><a class="nav__link" href="#section-tools">Tools</a></li>
+				</ul>
+			</nav>
+
+			<!-- Main Content -->
+			<main id="main" class="main" role="main">
+				<!-- Overview / KPI Cards -->
+				<section id="section-overview" class="section" aria-labelledby="overviewHeading">
+					<div class="section__header">
+						<h2 id="overviewHeading" class="section__title">Overview</h2>
+						<div class="section__actions">
+							<button id="refreshAll" class="btn btn--filled">Refresh</button>
+							<button id="exportAll" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+
+					<div class="grid grid--kpis">
+						<article class="card kpi" aria-live="polite">
+							<h3 class="kpi__title">Total Requests</h3>
+							<div class="kpi__value" id="kpi_total_requests">0</div>
+							<div class="kpi__meta">Sum of Successful + Failed across methods</div>
+						</article>
+
+						<article class="card kpi" aria-live="polite">
+							<h3 class="kpi__title">2xx Success</h3>
+							<div class="kpi__value" id="kpi_2xx">0</div>
+							<div class="kpi__meta">From StatusCodeCounts["2xx"]</div>
+						</article>
+
+						<article class="card kpi" aria-live="polite">
+							<h3 class="kpi__title">4xx Client Errors</h3>
+							<div class="kpi__value" id="kpi_4xx">0</div>
+							<div class="kpi__meta">From StatusCodeCounts["4xx"]</div>
+						</article>
+					</div>
+				</section>
+
+				<!-- Auth Tokens (submit & fetch) -->
+				<section id="section-tokens" class="section" aria-labelledby="tokensHeading">
+					<div class="section__header">
+						<h2 id="tokensHeading" class="section__title">Auth Tokens</h2>
+						<div class="section__actions">
+							<button id="fetchTokensBtn" class="btn btn--outline">Get Current Tokens</button>
+						</div>
+					</div>
+
+					<div class="card">
+						<form id="tokenForm" class="form" method="post" action="/admin/tokens">
+							<p class="form__hint">
+								Paste one token per line. On submit, server will atomically replace the in-memory token
+								set (and optionally persist to disk).
+							</p>
+							<div class="form__field">
+								<label class="form__label" for="tokensInput">New Tokens</label>
+								<textarea
+									id="tokensInput"
+									class="input input--textarea"
+									name="tokens"
+									rows="8"
+									placeholder="token_a\ntoken_b\n..."
+									required
+								></textarea>
+							</div>
+							<div class="form__row">
+								<label class="switch">
+									<input type="checkbox" id="persistTokens" name="persist" />
+									<span class="switch__label">Also write to token file</span>
+								</label>
+								<div class="spacer"></div>
+								<button id="submitTokensBtn" type="submit" class="btn btn--filled">
+									Submit Tokens
+								</button>
+							</div>
+						</form>
+					</div>
+
+					<div class="card" aria-live="polite" aria-atomic="true">
+						<h3 class="card__title">Current Tokens In Memory</h3>
+						<div class="table-wrap">
+							<table id="tokensTable" class="table" aria-describedby="tokensDesc">
+								<caption id="tokensDesc" class="visually-hidden">
+									Tokens currently loaded (masked tail), validation state.
+								</caption>
+								<thead>
+									<tr>
+										<th scope="col">#</th>
+										<th scope="col">Masked</th>
+										<th scope="col">Being Validated</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- populated by JS from diagnostics Tokens[] (Masked, BeingValidated) -->
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
+				<!-- Requests Counters by Method (Successful/Failed) -->
+				<section id="section-requests" class="section" aria-labelledby="requestsHeading">
+					<div class="section__header">
+						<h2 id="requestsHeading" class="section__title">Requests</h2>
+					</div>
+
+					<div class="grid grid--cards">
+						<article class="card">
+							<h3 class="card__title">Counts by Method</h3>
+							<div class="table-wrap">
+								<table id="methodCountsTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Method</th>
+											<th scope="col">Successful</th>
+											<th scope="col">Failed</th>
+											<th scope="col">Total</th>
+										</tr>
+									</thead>
+									<tbody>
+										<tr>
+											<td>GET</td>
+											<td id="mc_get_s">0</td>
+											<td id="mc_get_f">0</td>
+											<td id="mc_get_t">0</td>
+										</tr>
+										<tr>
+											<td>POST</td>
+											<td id="mc_post_s">0</td>
+											<td id="mc_post_f">0</td>
+											<td id="mc_post_t">0</td>
+										</tr>
+										<tr>
+											<td>PATCH</td>
+											<td id="mc_patch_s">0</td>
+											<td id="mc_patch_f">0</td>
+											<td id="mc_patch_t">0</td>
+										</tr>
+										<tr>
+											<td>PUT</td>
+											<td id="mc_put_s">0</td>
+											<td id="mc_put_f">0</td>
+											<td id="mc_put_t">0</td>
+										</tr>
+										<tr>
+											<td>DELETE</td>
+											<td id="mc_delete_s">0</td>
+											<td id="mc_delete_f">0</td>
+											<td id="mc_delete_t">0</td>
+										</tr>
+										<tr class="row--emph">
+											<td>Total</td>
+											<td id="mc_total_s">0</td>
+											<td id="mc_total_f">0</td>
+											<td id="mc_total_t">0</td>
+										</tr>
+									</tbody>
+								</table>
+							</div>
+						</article>
+
+						<article class="card">
+							<h3 class="card__title">Status Code Totals</h3>
+							<div class="table-wrap">
+								<table id="statusTotalsTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">2xx</th>
+											<th scope="col">4xx</th>
+										</tr>
+									</thead>
+									<tbody>
+										<tr>
+											<td id="count_2xx">0</td>
+											<td id="count_4xx">0</td>
+										</tr>
+									</tbody>
+								</table>
+							</div>
+						</article>
+					</div>
+				</section>
+
+				<!-- Proxy Timings by Method -->
+				<section id="section-proxy" class="section" aria-labelledby="proxyHeading">
+					<div class="section__header">
+						<h2 id="proxyHeading" class="section__title">Proxy Timings</h2>
+					</div>
+					<div class="card">
+						<div class="table-wrap">
+							<table id="proxyTimingsTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Method</th>
+										<th scope="col">Count</th>
+										<th scope="col">Avg Time (s)</th>
+										<th scope="col">Min (s)</th>
+										<th scope="col">Max (s)</th>
+										<th scope="col">Last Request (ts)</th>
+									</tr>
+								</thead>
+								<tbody>
+									<tr>
+										<td>GET</td>
+										<td id="pt_get_c">0</td>
+										<td id="pt_get_tot">0</td>
+										<td id="pt_get_min">0</td>
+										<td id="pt_get_max">0</td>
+										<td id="pt_get_last">0</td>
+									</tr>
+									<tr>
+										<td>POST</td>
+										<td id="pt_post_c">0</td>
+										<td id="pt_post_tot">0</td>
+										<td id="pt_post_min">0</td>
+										<td id="pt_post_max">0</td>
+										<td id="pt_post_last">0</td>
+									</tr>
+									<tr>
+										<td>PATCH</td>
+										<td id="pt_patch_c">0</td>
+										<td id="pt_patch_tot">0</td>
+										<td id="pt_patch_min">0</td>
+										<td id="pt_patch_max">0</td>
+										<td id="pt_patch_last">0</td>
+									</tr>
+									<tr>
+										<td>PUT</td>
+										<td id="pt_put_c">0</td>
+										<td id="pt_put_tot">0</td>
+										<td id="pt_put_min">0</td>
+										<td id="pt_put_max">0</td>
+										<td id="pt_put_last">0</td>
+									</tr>
+									<tr>
+										<td>DELETE</td>
+										<td id="pt_delete_c">0</td>
+										<td id="pt_delete_tot">0</td>
+										<td id="pt_delete_min">0</td>
+										<td id="pt_delete_max">0</td>
+										<td id="pt_delete_last">0</td>
+									</tr>
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
+				<!-- Probe / Exploit Attempts -->
+				<section id="section-probes" class="section" aria-labelledby="probesHeading">
+					<div class="section__header">
+						<h2 id="probesHeading" class="section__title">Exploit / Probe Attempts</h2>
+						<div class="section__actions">
+							<button id="clearProbes" class="btn btn--warning">Clear</button>
+							<button id="exportProbes" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+
+					<div class="card">
+						<div class="table-wrap">
+							<table id="probeTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Date (ts)</th>
+										<th scope="col">IP</th>
+										<th scope="col">User-Agent</th>
+										<th scope="col">Reason</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- rows from ExploitAttempts: {IP, Date, Reason, UserAgent} -->
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
+				<!-- Admin Login Events -->
+				<section id="section-logins" class="section" aria-labelledby="loginsHeading">
+					<div class="section__header">
+						<h2 id="loginsHeading" class="section__title">Admin Logins</h2>
+						<div class="section__actions">
+							<button id="exportLogins" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+
+					<div class="card">
+						<div class="table-wrap">
+							<table id="loginsTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Date (ts)</th>
+										<th scope="col">IP</th>
+										<th scope="col">Successful</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- rows from LoginAttempts: {IP, Date, Successful} -->
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
+				<!-- Service Health -->
+				<section id="section-health" class="section" aria-labelledby="healthHeading">
+					<div class="section__header">
+						<h2 id="healthHeading" class="section__title">Service Health</h2>
+					</div>
+
+					<div class="grid grid--kpis">
+						<article class="card kpi">
+							<h3 class="kpi__title">Direct API</h3>
+							<div class="kpi__value" id="health_direct">OK</div>
+							<div class="kpi__meta">
+								Last: <span id="direct_last">0</span> • Cooldown:
+								<span id="direct_cooldown">false</span>
+							</div>
+						</article>
+						<article class="card kpi">
+							<h3 class="kpi__title">RoProxy</h3>
+							<div class="kpi__value" id="health_roproxy">OK</div>
+							<div class="kpi__meta">
+								Last: <span id="roproxy_last">0</span> • Cooldown:
+								<span id="roproxy_cooldown">false</span>
+							</div>
+						</article>
+						<article class="card kpi">
+							<h3 class="kpi__title">Tokens</h3>
+							<div class="kpi__value" id="health_tokens_count">0</div>
+							<div class="kpi__meta">
+								Expired: <span id="health_tokens_expired">0</span> • Being Validated:
+								<span id="health_tokens_validating">0</span>
+							</div>
+						</article>
+					</div>
+				</section>
+
+				<!-- Tools / Actions -->
+				<section id="section-tools" class="section" aria-labelledby="toolsHeading">
+					<div class="section__header">
+						<h2 id="toolsHeading" class="section__title">Tools</h2>
+					</div>
+
+					<div class="grid grid--cards">
+						<article class="card">
+							<h3 class="card__title">Diagnostics JSON</h3>
+							<p class="card__desc">Download the current `get_diagnostics()` snapshot.</p>
+							<form class="inline-form" action="/admin/diagnostics" method="get">
+								<button class="btn btn--filled" type="submit">Download JSON</button>
+							</form>
+						</article>
+
+						<article class="card">
+							<h3 class="card__title">Force Revalidate Tokens</h3>
+							<p class="card__desc">Ask the proxy to re-check tokens (clears cooldowns).</p>
+							<form class="inline-form" action="/admin/tokens/force_revalidate" method="post">
+								<button class="btn btn--warning" type="submit">Force Revalidate</button>
+							</form>
+						</article>
+
+						<article class="card">
+							<h3 class="card__title">Health Check</h3>
+							<p class="card__desc">Ping internal /health endpoint.</p>
+							<form class="inline-form" action="/health" method="get">
+								<button class="btn btn--outline" type="submit">Run</button>
+							</form>
+						</article>
+					</div>
+				</section>
+
+				<!-- Toasts / Live region for notifications -->
+				<div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+			</main>
+		</div>
+
+		<!-- Footer -->
+		<footer class="footer" role="contentinfo">
+			<small>Roxy Proxy • Admin Dashboard</small>
+		</footer>
+
+		<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+	</body>
+</html>

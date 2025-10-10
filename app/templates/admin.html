@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>Roxy Admin Login</title>
+		<link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='roxy_favicon.png') }}" />
+		<link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}" />
+	</head>
+	<body>
+		<main class="login-container">
+			<div class="login-card">
+				<div class="logo-wrapper">
+					<img src="{{ url_for('static', filename='roxy_icon.png') }}" alt="Roxy Logo" class="logo" />
+					<h1 class="app-title">Roxy Admin</h1>
+				</div>
+
+				<form class="login-form">
+					<label for="username">Username</label>
+					<input id="username" type="text" placeholder="Enter username" autocomplete="off" />
+
+					<label for="password">Password</label>
+					<input id="password" type="password" placeholder="Enter password" autocomplete="off" />
+
+					<button id="submit" type="button" class="btn-primary">Login</button>
+				</form>
+			</div>
+		</main>
+
+		<!-- 2FA Modal -->
+		<div
+			id="twofaModal"
+			class="modal"
+			aria-hidden="true"
+			role="dialog"
+			aria-labelledby="twofaTitle"
+			aria-modal="true"
+		>
+			<div class="modal__backdrop" data-close="true"></div>
+			<div class="modal__dialog" role="document">
+				<header class="modal__header">
+					<h2 id="twofaTitle" class="modal__title">Two-Factor Authentication</h2>
+					<button class="modal__close" type="button" aria-label="Close 2FA dialog" data-close="true">
+						✕
+					</button>
+				</header>
+				<div class="modal__content">
+					<p class="modal__hint">Enter the digit code sent to your admin email.</p>
+					<input id="twofaInput" type="text" inputmode="numeric" placeholder="········" />
+					<p id="twofaError" class="modal__error" hidden></p>
+				</div>
+				<footer class="modal__footer">
+					<button id="twofaSubmit" type="button" class="btn-primary">Verify</button>
+					<button id="twofaCancel" type="button" class="btn-secondary" data-close="true">Cancel</button>
+				</footer>
+			</div>
+		</div>
+
+		<script src="{{ url_for('static', filename='admin.js') }}"></script>
+	</body>
+</html>
