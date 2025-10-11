@@ -1,0 +1,27 @@
+{
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.black-formatter",
+    },
+    "[javascript]": {
+        "editor.tabSize": 4,
+        "editor.useTabStops": true,
+        "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+    "[html]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+    "[css]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+    "editor.formatOnSave": true,
+    "files.insertFinalNewline": true,
+    "cSpell.words": [
+        "cooldown",
+        "cooldowns",
+        "kpis",
+        "ROBLOSECURITY",
+        "Roproxy",
+        "tabindex",
+        "twofa"
+    ],
+}
