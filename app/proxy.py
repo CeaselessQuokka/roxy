@@ -22,10 +22,10 @@ for t in tokens:
 def request(
     url: str, method: str = "get", headers: dict = None, params: dict = None, data: str = None, roblox_token: str = None
 ) -> tuple[bool, str]:
-    successful, should_request_again, response, csrf_token = False, True, None, None
+    successful, should_request_again, response, csrf_token, retries = False, True, None, None, 0
     while should_request_again:
-        successful, should_request_again, response, csrf_token = _request(
-            url, method, headers, params, data, roblox_token, csrf_token
+        successful, should_request_again, response, csrf_token, retries = _request(
+            url, method, headers, params, data, roblox_token, csrf_token, retries
         )
         if successful:
             return True, response
@@ -81,12 +81,13 @@ def _request(
     data: str = None,
     roblox_token: str = None,
     csrf_token: str = None,
-) -> tuple[bool, bool, str | None, str | None]:
+    retries: int = 0,
+) -> tuple[bool, bool, str | None, str | None, int]:
     global tokens, current_token_index, is_direct_api_in_cooldown, is_roproxy_in_cooldown
     if len(tokens) == 0 and is_direct_api_in_cooldown and is_roproxy_in_cooldown:
         diagnostics.log_status_code(404)
         diagnostics.log_request(method.upper(), False)
-        return False, False, "No available tokens or APIs to call", None
+        return False, False, "No available tokens or APIs to call", None, retries
 
     with request_lock:
         token = None
@@ -108,7 +109,7 @@ def _request(
                 if len(tokens) == 0:
                     diagnostics.log_status_code(404)
                     diagnostics.log_request(method.upper(), False)
-                    return False, False, "No valid tokens available; please try again in ~65 seconds.", None
+                    return False, False, "No valid tokens available; please try again in ~65 seconds.", None, retries
 
                 current_token_index %= len(tokens)
                 token = tokens[current_token_index]
@@ -122,7 +123,7 @@ def _request(
     diagnostics.log_request(method.upper(), req.status_code == 200)
     diagnostics.log_proxy_request(method.upper(), req.elapsed.total_seconds())
     if req.status_code == 200:
-        return True, False, req.text, None
+        return True, False, req.text, None, retries
     elif req.status_code == 429:
         with request_lock:
             if token in tokens:
@@ -130,11 +131,17 @@ def _request(
                 tokens.remove(token)
                 diagnostics.update_token(token, being_validated=True)
                 delay(TOKEN_EXPIRATION_COOLDOWN, lambda: validate_token(token)).start()
-        return False, True, None, None
-    elif req.status_code == 403:
-        return False, True, None, req.headers.get("x-csrf-token")
+        retries += 1
+        if retries > MAX_RETRIES_PER_REQUEST:
+            return False, False, req.text, None, retries
+        else:
+            return False, True, None, None, retries
+    elif req.status_code == 403 and "x-csrf-token" in req.headers:
+        return False, True, None, req.headers.get("x-csrf-token"), retries
+    elif req.status_code == 403 and "x-csrf-token" not in req.headers:
+        return False, False, req.text, None, retries
     else:
-        return False, False, f"Unexpected error {req.status_code}\n\n{req.text}", None
+        return False, False, f"Unexpected error {req.status_code}\n\n{req.text}", None, retries
 
 
 def update_tokens(new_tokens: list[str]):

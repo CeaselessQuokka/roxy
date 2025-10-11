@@ -112,6 +112,31 @@ def validate_url(url: str) -> bool:
     return re.match(r"^[a-z]+\.roblox\.com/", url, re.IGNORECASE) != None
 
 
+def is_browser(user_agent: str) -> bool:
+    user_agent = user_agent.lower()
+    browsers = [
+        "gecko",
+        "webkit",
+        "blink",
+        "trident",
+        "edgehtml",
+        "chrome",
+        "safari",
+        "firefox",
+        "edge",
+        "opera",
+        "opr",
+        "msie",
+        "ucbrowser",
+        "vivaldi",
+        "brave",
+        "yandex",
+        "samsungbrowser",
+        "mozilla",
+    ]
+    return any(browser in user_agent for browser in browsers)
+
+
 # Handle Get proxying.
 @app.route("/<path:dst>", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
 def proxy_page(dst: str):
@@ -130,9 +155,11 @@ def proxy_page(dst: str):
     headers = dict(request.headers)
     headers.pop("Host", None)
     headers.pop("Roblox-Id", None)
-    headers["User-Agent"] = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-    )
+    is_actually_browser = is_browser(request.user_agent.string)
+    if not is_actually_browser:
+        headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+        )
 
     roblox_token = headers.pop("X-Roblox-Token", None)
     if roblox_token is not None and not config.TOKEN_PREFIX in roblox_token:
@@ -153,7 +180,8 @@ def proxy_page(dst: str):
             response = json.dumps(json.loads(response), indent=4)
         except:
             pass
-    return f"<pre>{response}</pre>" if successful and response is not None else (response, 500)
+    response = f"<pre>{response}</pre>" if is_actually_browser else response
+    return response if successful and response is not None else (response, 500)
 
 
 if __name__ == "__main__":
