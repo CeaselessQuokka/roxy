@@ -54,9 +54,9 @@ def validate_token(token: str):
             if time.time() - email_last_sent > EMAIL_COOLDOWN:
                 email_last_sent = time.time()
                 mail.send(
-                    "hurricanedavensb+proxy@gmail.com",
+                    auth.get_emails()[0],
                     "Token Expired",
-                    f'An auth token has expired: "{token[-3:]}".\nhttp://127.0.0.1:5000/admin',
+                    f'An auth token has expired: "{token[-3:]}".\nhttps://roxytheproxy.com/admin',
                 )
 
 
@@ -119,6 +119,12 @@ def _request(
         headers["x-csrf-token"] = csrf_token
     cookies = {".ROBLOSECURITY": token} if token else None
     req = requests.request(method, f"https://{url}", headers=headers, params=params, data=data, cookies=cookies)
+    if token:
+        diagnostics.update_token(token, used=True)
+    elif "roproxy" in url:
+        diagnostics.proxy_health["RoProxy"]["Count"] += 1
+    else:
+        diagnostics.proxy_health["DirectAPI"]["Count"] += 1
     diagnostics.log_status_code(req.status_code)
     diagnostics.log_request(method.upper(), req.status_code == 200)
     diagnostics.log_proxy_request(method.upper(), req.elapsed.total_seconds())
@@ -147,9 +153,7 @@ def _request(
 def update_tokens(new_tokens: list[str]):
     global tokens
     with request_lock:
-        print("TOKENS UPDATED", len(new_tokens))
         for t in new_tokens:
             if t not in tokens:
                 tokens.append(t)
                 diagnostics.update_token(t)
-                print("New token added:", t[-5:])

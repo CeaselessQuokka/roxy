@@ -3,7 +3,7 @@ import smtplib
 from email.message import EmailMessage
 
 APP_PASSWORD = auth.read_app_password()
-FROM = "pluginsroblox@gmail.com"
+FROM = auth.get_emails()[1]
 
 
 def send(to: str, subject: str, body: str):

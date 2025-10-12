@@ -1,6 +1,7 @@
 import auth
-import diagnostics
+import challenge
 import config
+import diagnostics
 import proxy
 import json
 import os
@@ -47,40 +48,59 @@ def validate_login(data: dict) -> bool:
 
 def requires_admin(fn: callable):
     def wrapper(*args, **kwargs):
-        if not session.get("is_admin"):
+        if not session.get("IsAdmin", False):
             return redirect(url_for("home_page"))
         return fn(*args, **kwargs)
 
     return wrapper
 
 
-# TODO: generate better challenge, use secrets hash and use ua + ip to get encoded from hmac using the secrets hash as key, that result is now the hash for the challenge or something
-# TODO: test every way to input and make sure no errors occur
 @app.route("/admin", methods=["GET", "POST"])
 def admin_page():
+    ip = request.access_route[0]
+    user_agent = request.user_agent.string
     if request.method == "POST":
         data = request.json
         if "IsLogin" in data:
             if validate_login(request.json):
-                two_fa.send_2fa("hurricanedavensb+proxy@gmail.com")
+                session["Challenge"] = dict(
+                    {"Challenge": challenge.generate_challenge(ip, user_agent), "IP": ip, "UserAgent": user_agent}
+                )
+                two_fa.send_2fa(auth.get_emails()[0])
                 return "Success", 200
-            diagnostics.log_login_attempt(request.access_route[0], False)
+            diagnostics.log_login_attempt(ip, False)
             return "Invalid credentials", 403
         elif "Is2FA" in data:
-            if not two_fa.is_code_valid(data.get("TwoFA", "")):
-                diagnostics.log_exploit_attempt(request.access_route[0], "Invalid 2FA code", request.user_agent.string)
-                return "2FA code expired", 401  # Give false impression that code expired instead of 2FA being wrong.
-            diagnostics.log_login_attempt(request.access_route[0], True)
-            session["is_admin"] = True
+            # Returns 404 on failure to avoid revealing whether the challenge or code was wrong.
+            is_2fa_valid = two_fa.is_code_valid(data.get("TwoFA", ""))  # Remove to avoid reuse on precondition failure.
+            if not "Challenge" in session:
+                diagnostics.log_exploit_attempt(ip, "Missing challenge", user_agent)
+                return "Not Found", 404
+            if session["Challenge"].get("IP", "") != ip:
+                diagnostics.log_exploit_attempt(ip, "IP mismatch on challenge", user_agent)
+                return "Not Found", 404
+            if session["Challenge"].get("UserAgent", "") != user_agent:
+                diagnostics.log_exploit_attempt(ip, "User-Agent mismatch on challenge", user_agent)
+                return "Not Found", 404
+            if not challenge.is_challenge_valid(session["Challenge"].get("Challenge", "")):
+                diagnostics.log_exploit_attempt(ip, "Invalid or expired challenge", user_agent)
+                return "Not Found", 404
+            if not is_2fa_valid:
+                diagnostics.log_exploit_attempt(ip, "Invalid 2FA code", user_agent)
+                return "Not Found", 404
+
+            diagnostics.log_login_attempt(ip, True)
+            session.pop("Challenge", None)
+            session["IsAdmin"] = True
             return "Success", 200
         else:
             return "Invalid request", 400
     elif request.method == "GET":
-        if session.get("is_admin"):
+        if session.get("IsAdmin"):
             return redirect(url_for("admin_dashboard"))
         return render_template("admin.html")
     else:
-        diagnostics.log_exploit_attempt(request.access_route[0], "Invalid method on /admin", request.user_agent.string)
+        diagnostics.log_exploit_attempt(ip, "Invalid method on /admin", user_agent)
         return "Method not allowed", 405
 
 
@@ -106,7 +126,21 @@ def admin_set_tokens():
     return "Success", 200
 
 
+@app.route("/admin/logout", methods=["POST"], endpoint="admin_logout")
+@requires_admin
+def admin_logout():
+    session.clear()
+    return redirect(url_for("home_page"))
+
+
 ## Handle proxying requests.
+path_ignore_set = set(
+    [
+        ".well-known/appspecific/com.chrome.devtools.json",  # Chrome DevTools related.
+    ]
+)
+
+
 def validate_url(url: str) -> bool:
     return re.match(r"^[a-z]+\.roblox\.com/", url, re.IGNORECASE) != None
 
@@ -139,6 +173,9 @@ def is_browser(user_agent: str) -> bool:
 # Handle Get proxying.
 @app.route("/<path:dst>", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
 def proxy_page(dst: str):
+    if dst in path_ignore_set:
+        return "Not Found", 404
+
     if dst != escape(dst):
         diagnostics.log_exploit_attempt(request.access_route[0], f'Invalid URL: "{dst}"', request.user_agent.string)
         return "Invalid URL", 404
@@ -184,4 +221,4 @@ def proxy_page(dst: str):
 
 
 if __name__ == "__main__":
-    app.run(debug=False)  # TODO: MAKE DEBUG = FALSE WHEN DEPLOYING
+    app.run(debug=False)

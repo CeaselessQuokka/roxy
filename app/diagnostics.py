@@ -30,25 +30,25 @@ crawls = dict(
 
 proxy_request_counts = dict(
     {
-        "GET": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),
-        "POST": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),
-        "PATCH": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),
-        "PUT": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),
-        "DELETE": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),
+        "GET": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),  # Count = nRequests.
+        "POST": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),  # Count = nRequests.
+        "PATCH": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),  # Count = nRequests.
+        "PUT": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),  # Count = nRequests.
+        "DELETE": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),  # Count = nRequests.
     }
 )
 
 proxy_health = dict(
     {
-        "DirectAPI": dict({"LastRequestTime": 0, "IsInCooldown": False}),
-        "RoProxy": dict({"LastRequestTime": 0, "IsInCooldown": False}),
-        "Tokens": dict({"Count": 0, "ExpiredCount": 0, "BeingValidatedCount": 0}),
+        "DirectAPI": dict({"Count": 0, "LastRequestTime": 0, "IsInCooldown": False}),  # Count = nRequests.
+        "RoProxy": dict({"Count": 0, "LastRequestTime": 0, "IsInCooldown": False}),  # Count = nRequests.
+        "Tokens": dict({"Count": 0, "ExpiredCount": 0, "BeingValidatedCount": 0}),  # Count = nTokens.
     }
 )
 
 tokens = dict(
     {
-        # [full_token]: {Masked: str, BeingValidated: bool}
+        # [full_token]: {Masked: str, BeingValidated: bool, Uses: int}
     }
 )
 
@@ -101,10 +101,19 @@ def log_proxy_request(method: str, duration: float):
             proxy_request_counts[method]["Max"] = duration
 
 
-def update_token(token: str, being_validated: bool = False):
+def update_token(token: str, being_validated: bool = False, used: bool = False):
     global tokens
     masked = f"...{token[-20:]}"
-    tokens[token] = dict(Masked=masked, BeingValidated=being_validated)
+    if token in tokens:
+        tokens[token]["BeingValidated"] = being_validated
+        if used:
+            tokens[token]["Uses"] += 1
+    else:
+        tokens[token] = dict(
+            Masked=masked,
+            BeingValidated=being_validated,
+            Uses=tokens.get(token, {}).get("Uses", 0) + (1 if used else 0),
+        )
     proxy_health["Tokens"]["Count"] = len(tokens)
     proxy_health["Tokens"]["BeingValidatedCount"] = sum(1 for t in tokens.values() if t["BeingValidated"])
 
@@ -119,6 +128,7 @@ def get_diagnostics() -> dict:
             "StatusCodeCounts": status_code_counts,
             "ProxyRequestCounts": proxy_request_counts,
             "ProxyHealth": proxy_health,
-            "Tokens": list(copy.deepcopy(tokens).values()),
+            "Crawls": crawls,
+            "Tokens": copy.deepcopy(list(tokens.values())),
         }
     )
