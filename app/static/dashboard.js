@@ -72,6 +72,21 @@ const print = console.log;
 		setText("kpi_4xx", String(sc["4xx"] || 0));
 	}
 
+	function renderPageVisits(d) {
+		const pv = d.PageVisits || {};
+		const home = pv.home ?? 0;
+		const admin = pv.admin ?? 0;
+		const robots = pv.robots ?? 0;
+
+		const elHome = document.getElementById("home_page_visits");
+		const elAdmin = document.getElementById("admin_page_visits");
+		const elRobots = document.getElementById("robots_page_visits");
+
+		if (elHome) elHome.textContent = String(home);
+		if (elAdmin) elAdmin.textContent = String(admin);
+		if (elRobots) elRobots.textContent = String(robots);
+	}
+
 	function renderRequests(d) {
 		const rc = d.RequestCounts || {};
 		const methods = ["GET", "POST", "PATCH", "PUT", "DELETE"];
@@ -213,6 +228,7 @@ const print = console.log;
 		try {
 			const d = await fetchDiagnostics();
 			renderOverview(d);
+			renderPageVisits(d);
 			renderRequests(d);
 			renderProxyTimings(d);
 			renderTokens(d);
@@ -245,6 +261,14 @@ const print = console.log;
 		const lines = [];
 		lines.push("# Roxy Diagnostics Export");
 		lines.push(`# Timestamp,${new Date().toISOString()}`);
+
+		// PageVisits
+		lines.push("");
+		lines.push("[PageVisits]");
+		const pv = d.PageVisits || {};
+		lines.push(toCSVRow(["home", pv.home ?? 0]));
+		lines.push(toCSVRow(["admin", pv.admin ?? 0]));
+		lines.push(toCSVRow(["robots", pv.robots ?? 0]));
 
 		// Requests
 		lines.push("");

@@ -58,6 +58,22 @@ tokens = dict(
     }
 )
 
+page_visits = dict(
+    {
+        "home": 0,
+        "admin": 0,
+        "robots": 0,
+    }
+)
+
+
+def log_page_visit(page: str):
+    global page_visits
+    if page in page_visits:
+        page_visits[page] += 1
+    else:
+        page_visits[page] = 1
+
 
 def log_throttle(ip: str):
     global throttled_ips
@@ -144,6 +160,7 @@ def get_diagnostics() -> dict:
     global tokens
     return dict(
         {
+            "PageVisits": page_visits,
             "ThrottledIPs": throttled_ips,
             "ExploitAttempts": exploit_attempts,
             "LoginAttempts": login_attempts,

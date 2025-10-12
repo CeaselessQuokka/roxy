@@ -27,12 +27,14 @@ app.config.update(
 # Handle home page.
 @app.route("/", methods=["GET"])
 def home_page():
+    diagnostics.log_page_visit("home")
     return render_template("home_page.html")
 
 
 @app.route("/robots.txt", methods=["GET"])
 def robots_txt():
     diagnostics.log_crawl(request.access_route[0])
+    diagnostics.log_page_visit("robots")
     return send_from_directory(os.path.join(app.root_path), "robots.txt")
 
 
@@ -99,6 +101,7 @@ def admin_page():
     elif request.method == "GET":
         if session.get("IsAdmin"):
             return redirect(url_for("admin_dashboard"))
+        diagnostics.log_page_visit("admin")
         return render_template("admin.html")
     else:
         diagnostics.log_exploit_attempt(ip, "Invalid method on /admin", user_agent)
