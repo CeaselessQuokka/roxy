@@ -9,4 +9,4 @@ echo "Setting permissions..."
 sudo chown -R $USER:$USER /etc/roxy
 sudo chmod 600 -R /etc/roxy
 sudo chmod 700 /etc/roxy
-echo "Permissions set; don't forget to create files.txt!"
+echo "Permissions set; don't forget to create files.txt and misc.txt!"
