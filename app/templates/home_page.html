@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Roxy Proxy</title>
+		<link rel="stylesheet" href="{{ url_for('static', filename='home_page.css') }}" />
+		<link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='roxy_favicon.png') }}" />
+	</head>
+	<body class="app app--dark" data-theme="dark">
+		<header class="app-bar" role="banner">
+			<h1 class="app-title">Roxy Proxy</h1>
+		</header>
+
+		<main class="main" role="main">
+			<section class="section collapsible-block" aria-labelledby="titleHeader">
+				<div class="section__header">
+					<h2 id="titleHeader" class="section__title">Welcome to Roxy!</h2>
+					<button
+						class="btn btn--tonal collapsible-toggle"
+						type="button"
+						data-target="titleSection"
+						aria-expanded="true"
+					>
+						Collapse
+					</button>
+				</div>
+				<div id="titleSection" class="collapsible is-open">
+					<i>There are examples below this section if you want to skip the yap.</i>
+					<p class="lead">
+						<strong>Roxy</strong> is a free proxy for Roblox web APIs. The code for Roxy is planned to be
+						made open source in the future. Right now the code may not be 100% secure, so I am afraid to
+						release it publicly and someone uses it and runs into issues, or a bad actor uses it and
+						exploits the server with a vulnerability I did not foresee (not to mention the code is pretty
+						hideous because this is my first project like this). I am still learning web development, so if
+						you find any security issues or just general issues, please let me know! If you're a White Hat,
+						refer to the bottom of the page for more info on vulnerability reporting and rewards.
+					</p>
+					<p class="light--warning">
+						The person who made
+						<a
+							href="https://devforum.roblox.com/t/roproxycom-a-free-rotating-proxy-for-roblox-apis/1508367"
+							target="_blank"
+							>Roproxy</a
+						>
+						has a <a href="https://github.com/askfalse/roproxy-lite" target="_blank">GitHub</a> available to
+						make your own proxy. So if you are looking for this option, it exists and is your safest option
+						for using a proxy.
+					</p>
+					<p class="lead">
+						Why did I make Roxy? Because
+						<a
+							href="https://devforum.roblox.com/t/roproxycom-a-free-rotating-proxy-for-roblox-apis/1508367"
+							target="_blank"
+							>Roproxy</a
+						>
+						throttles about 60 seconds per request. Thus I wanted something a bit faster for my own
+						projects. Specifically my
+						<a
+							href="https://devforum.roblox.com/t/bundle-and-characteroutfit-inserter-free-plugin/3972083"
+							target="_blank"
+							>Bundle and Character/Outfit Inserter (shameful plug)</a
+						>
+						plugin as of right now. I figured if I'm going to make the proxy anyway, I may as well share it.
+						My general rule of thumb for most things I make really, haha.
+					</p>
+				</div>
+			</section>
+
+			<!-- Prettyprint Example -->
+			<section class="section collapsible-block" aria-labelledby="getExampleHeading">
+				<div class="section__header">
+					<h2 id="getExampleHeading" class="section__title">
+						Example: GET Request (and prettyprint example)
+					</h2>
+					<button
+						class="btn btn--tonal collapsible-toggle"
+						type="button"
+						data-target="getExample"
+						aria-expanded="true"
+					>
+						Collapse
+					</button>
+				</div>
+				<div id="getExample" class="collapsible is-open">
+					<i>
+						Note: Roxy supports <strong>GET</strong>, <strong>POST</strong>, <strong>PATCH</strong>,
+						<strong>PUT</strong>, and <strong>DELETE</strong> requests. </i
+					><br />
+					<br />
+					<p>
+						You can use Roxy exactly like the Roblox API, just prefix your Roblox endpoint with
+						<code>https://roxytheproxy.com/</code>. For example:
+					</p>
+					<pre
+						class="example"
+					><code>https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&page=1&itemsPerPage=100&isEditable=true</code></pre>
+					<p>In the case of that user ID, you will get something that looks like this:</p>
+					<pre
+						class="output"
+					><code>{"data":[{"id":152266819767,"name":"X","isEditable":true,"outfitType":"Avatar"},{"id":26926749690,"name":"I","isEditable":true,"outfitType":"Avatar"},{"id":11706768233,"name":"H","isEditable":true,"outfitType":"Avatar"},{"id":7277992048,"name":"A","isEditable":true,"outfitType":"Avatar"},{"id":3977261404,"name":"B","isEditable":true,"outfitType":"Avatar"},{"id":87611659,"name":"F","isEditable":true,"outfitType":"Avatar"},{"id":87610579,"name":"G","isEditable":true,"outfitType":"Avatar"}],"paginationToken":""}</code></pre>
+					<p>
+						That will work if you put it in the browser's URL, but you can also do this from Roblox using
+						HttpService (which is probably what you're here for)
+					</p>
+					<pre
+						class="example"
+					><code>local URL = "https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&page=1&itemsPerPage=100&isEditable=true"
+print(HttpService:GetAsync(URL))</code></pre>
+					<p>
+						Adding <code>&prettyprint=true</code> makes the JSON easier to read (this is specific to Roxy,
+						and also works for all request types).
+					</p>
+
+					<h3>Pretty-printed GET</h3>
+					<pre
+						class="example"
+					><code>https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&page=1&itemsPerPage=100&isEditable=true&prettyprint=true</code></pre>
+
+					<pre class="output"><code>{
+    "data": [
+        { "id": 152266819767, "name": "X", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 26926749690,  "name": "I", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 11706768233,  "name": "H", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 7277992048,   "name": "A", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 3977261404,   "name": "B", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 87611659,     "name": "F", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 87610579,     "name": "G", "isEditable": true, "outfitType": "Avatar" }
+    ],
+    "paginationToken": ""
+}</code></pre>
+				</div>
+			</section>
+
+			<!-- PATCH Example -->
+			<section class="section collapsible-block" aria-labelledby="patchExampleHeading">
+				<div class="section__header">
+					<h2 id="patchExampleHeading" class="section__title">Example: PATCH Request</h2>
+					<button
+						class="btn btn--tonal collapsible-toggle"
+						type="button"
+						data-target="patchExample"
+						aria-expanded="true"
+					>
+						Collapse
+					</button>
+				</div>
+				<div id="patchExample" class="collapsible is-open">
+					<p class="light--warning">
+						Note: Remove the prepended
+						<code>_|WARNING:-DO-NOT-SHARE-THIS.--...|_</code> text if present in your token, otherwise
+						Roblox will give you an error due to an invalid character (specifically the pipe "|" character).
+					</p>
+					<pre class="example"><code>local HEADERS = {
+	["X-Roblox-Token"] = "YOUR_ROBLOX_TOKEN",
+	["Content-Type"] = "application/json",
+}
+HttpService:RequestAsync({
+	Url = "https://roxytheproxy.com/users.roblox.com/v1/users/YOUR_USER_ID/display-names",
+	Method = "PATCH",
+	Headers = HEADERS,
+	Body = HttpService:JSONEncode({ newDisplayName = "Roxy" }),
+})</code></pre>
+				</div>
+			</section>
+
+			<!-- POST Example -->
+			<section class="section collapsible-block" aria-labelledby="postExampleHeading">
+				<div class="section__header">
+					<h2 id="postExampleHeading" class="section__title">Example: POST Request</h2>
+					<button
+						class="btn btn--tonal collapsible-toggle"
+						type="button"
+						data-target="postExample"
+						aria-expanded="true"
+					>
+						Collapse
+					</button>
+				</div>
+				<div id="postExample" class="collapsible is-open">
+					<p class="light--warning">
+						Note: Remove the prepended
+						<code>_|WARNING:-DO-NOT-SHARE-THIS.--...|_</code> text if present in your token, otherwise
+						Roblox will give you an error due to an invalid character (specifically the pipe "|" character).
+					</p>
+					<pre class="example"><code>local HEADERS = {
+	["X-Roblox-Token"] = "YOUR_ROBLOX_TOKEN",
+}
+HttpService:PostAsync(
+	`https://roxytheproxy.com/accountinformation.roblox.com/v1/description`,
+	HttpService:JSONEncode({description = "New Description!"}),
+	Enum.HttpContentType.ApplicationJson,
+	false,
+	HEADERS
+)
+
+-- Or using RequestAsync:
+
+local HEADERS = {
+	["X-Roblox-Token"] = "YOUR_ROBLOX_TOKEN",
+	["Content-Type"] = "application/json",
+}
+HttpService:RequestAsync({
+	Url = "https://roxytheproxy.com/accountinformation.roblox.com/v1/description",
+	Method = "POST",
+	Headers = HEADERS,
+	Body = HttpService:JSONEncode({ description = "New Description!" }),
+})</code></pre>
+				</div>
+			</section>
+
+			<!-- DELETE Example -->
+			<section class="section collapsible-block" aria-labelledby="deleteExampleHeading">
+				<div class="section__header">
+					<h2 id="deleteExampleHeading" class="section__title">Example: DELETE Request (remove badge)</h2>
+					<button
+						class="btn btn--tonal collapsible-toggle"
+						type="button"
+						data-target="deleteExample"
+						aria-expanded="true"
+					>
+						Collapse
+					</button>
+				</div>
+				<div id="deleteExample" class="collapsible is-open">
+					<p class="light--warning">
+						Note: Remove the prepended
+						<code>_|WARNING:-DO-NOT-SHARE-THIS.--...|_</code> text if present in your token, otherwise
+						Roblox will give you an error due to an invalid character (specifically the pipe "|" character).
+					</p>
+					<pre class="example"><code>local HEADERS = { ["X-Roblox-Token"] = "YOUR_ROBLOX_TOKEN" }
+
+HttpService:RequestAsync({
+	Url = "https://roxytheproxy.com/badges.roblox.com/v1/user/badges/4396259312169682",
+	Method = "DELETE",
+	Headers = HEADERS,
+})</code></pre>
+				</div>
+			</section>
+
+			<!-- Safety & White Hat Info -->
+			<section class="section safety">
+				<h2 class="section__title">Token Safety & White Hats</h2>
+				<p>
+					You can pass your own <code>ROBLOSECURITY</code> token via the <code>X-Roblox-Token</code> header
+					for authenticated requests. This is optional for <code>GET</code> calls (unless required by Roblox).
+					If you do pass it for <code>GET</code> requests (not recommended for your general safety) you will
+					just help alleviate the internal tokens throttling potential. Thank you, but prioritize your safety.
+				</p>
+				<p class="warning">
+					<strong
+						>Passing your ROBLOSECURITY token is very risky. Even if the server is secure and the headers
+						are encrypted, you never know if that server is storing your token. So please be careful and
+						make sure you trust whatever it is you are sending your token to.<br /><br />Also, even if the
+						code for a server is open source, you never actually know what is running on the server. Anyone
+						can lie at anytime. So again, please be very careful.
+					</strong>
+				</p>
+				<hr />
+				<p>
+					If you're a <strong>White Hat</strong> and find a vulnerability, I'm offering rewards from
+					<strong>$50–$250 USD</strong> depending on severity. Any serious exploit report is always paid and
+					appreciated. I'm still learning web development, so there may be a lot of issues.
+				</p>
+			</section>
+
+			<!-- Roxy Internals -->
+			<section class="section internals">
+				<h2 class="section__title">Roxy Internals</h2>
+				<p>
+					Roxy was made using Python and Flask. It is hosted using the second tier option of Lightsail on AWS.
+					Which means there is 2TB of transfer data per month. So if the site goes down that is probably why.
+					Hopefully 2TB is enough, but I will monitor.
+				</p>
+				<p>
+					Internally, whenever a request is made, Roxy will try to make a direct call to the API. If that call
+					is throttled (about 60 seconds per request, and this is tracked so no unnecessary calls are made),
+					Roxy will then try
+					<a
+						href="https://devforum.roblox.com/t/roproxycom-a-free-rotating-proxy-for-roblox-apis/1508367"
+						target="_blank"
+						>Roproxy</a
+					>. If
+					<a
+						href="https://devforum.roblox.com/t/roproxycom-a-free-rotating-proxy-for-roblox-apis/1508367"
+						target="_blank"
+						>Roproxy</a
+					>
+					is also throttled (same cooldown applies as above), Roxy will then start iterating through a list of
+					internally used tokens. If those tokens expire, I get an email and I can update them in a few
+					minutes.
+				</p>
+				<p>
+					How much does Roxy cost to maintain? As of right now, 7 USD per month (for the Lightsail instance) +
+					15 USD per year (for the domain). So right now it is very manageable to maintain, but if you want to
+					support me beyond just using anything I make then you can find a way to support me below :).
+				</p>
+			</section>
+
+			<!-- Support -->
+			<section class="section support">
+				<h2 class="section__title">Support Me</h2>
+				<p>
+					If you would like to support me, you can support me at at
+					<a href="https://ko-fi.com/ceaselessquokka" target="_blank">Ko-fi</a>. Any amount is appreciated!
+					You never have to donate though, you just using anything I make is enough support for me. If you
+					ever make anything with something I create, please tag me in it, I'd love to see it!
+				</p>
+			</section>
+		</main>
+		<!-- https://ko-fi.com/ceaselessquokka -->
+		<footer class="footer" role="contentinfo">
+			<small>Roxy Proxy 2025</small>
+		</footer>
+
+		<script src="{{ url_for('static', filename='home_page.js') }}"></script>
+	</body>
+</html>

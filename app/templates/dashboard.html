@@ -130,6 +130,7 @@
 										<th scope="col">#</th>
 										<th scope="col">Masked</th>
 										<th scope="col">Being Validated</th>
+										<th scope="col">Uses</th>
 									</tr>
 								</thead>
 								<tbody>
@@ -288,31 +289,115 @@
 					</div>
 				</section>
 
+				<!-- Crawler Activity -->
+				<section id="section-crawls" class="section" aria-labelledby="crawlsHeading">
+					<div class="section__header">
+						<h2 id="crawlsHeading" class="section__title">Crawler Activity</h2>
+						<div class="section__actions">
+							<button
+								class="btn btn--tonal collapsible-toggle"
+								type="button"
+								data-target="crawlsContent"
+								aria-expanded="true"
+							>
+								Collapse
+							</button>
+							<button id="exportCrawls" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+
+					<div id="crawlsContent" class="collapsible is-open">
+						<div class="card">
+							<div class="table-wrap">
+								<table id="crawlsTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">IP</th>
+											<th scope="col">Count</th>
+											<th scope="col">Last Request (ts)</th>
+										</tr>
+									</thead>
+									<tbody>
+										<!-- rows from Crawls: {IP, Count, LastRequestTime} -->
+									</tbody>
+								</table>
+							</div>
+						</div>
+					</div>
+				</section>
+
+				<!-- Throttled IPs -->
+				<section id="section-throttled" class="section collapsible-block" aria-labelledby="throttledHeading">
+					<div class="section__header">
+						<h2 id="throttledHeading" class="section__title">Throttled IPs</h2>
+						<div class="section__actions">
+							<button
+								class="btn btn--tonal collapsible-toggle"
+								type="button"
+								data-target="throttledTableWrap"
+								aria-expanded="true"
+							>
+								Collapse
+							</button>
+							<button id="exportThrottled" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+
+					<div id="throttledTableWrap" class="collapsible is-open">
+						<div class="card">
+							<div class="table-wrap">
+								<table id="throttledTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">IP</th>
+											<th scope="col">Count</th>
+											<th scope="col">Last Throttle (ts)</th>
+										</tr>
+									</thead>
+									<tbody>
+										<!-- rows from throttled_ips: {IP, Count, LastThrottleTime} -->
+									</tbody>
+								</table>
+							</div>
+						</div>
+					</div>
+				</section>
+
 				<!-- Probe / Exploit Attempts -->
 				<section id="section-probes" class="section" aria-labelledby="probesHeading">
 					<div class="section__header">
 						<h2 id="probesHeading" class="section__title">Exploit / Probe Attempts</h2>
 						<div class="section__actions">
+							<button
+								class="btn btn--tonal collapsible-toggle"
+								type="button"
+								data-target="probesContent"
+								aria-expanded="true"
+							>
+								Collapse
+							</button>
 							<button id="clearProbes" class="btn btn--warning">Clear</button>
 							<button id="exportProbes" class="btn btn--outline">Export CSV</button>
 						</div>
 					</div>
 
-					<div class="card">
-						<div class="table-wrap">
-							<table id="probeTable" class="table">
-								<thead>
-									<tr>
-										<th scope="col">Date (ts)</th>
-										<th scope="col">IP</th>
-										<th scope="col">User-Agent</th>
-										<th scope="col">Reason</th>
-									</tr>
-								</thead>
-								<tbody>
-									<!-- rows from ExploitAttempts: {IP, Date, Reason, UserAgent} -->
-								</tbody>
-							</table>
+					<div id="probesContent" class="collapsible is-open">
+						<div class="card">
+							<div class="table-wrap">
+								<table id="probeTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Date (ts)</th>
+											<th scope="col">IP</th>
+											<th scope="col">User-Agent</th>
+											<th scope="col">Reason</th>
+										</tr>
+									</thead>
+									<tbody>
+										<!-- rows from ExploitAttempts: {IP, Date, Reason, UserAgent} -->
+									</tbody>
+								</table>
+							</div>
 						</div>
 					</div>
 				</section>
@@ -322,24 +407,34 @@
 					<div class="section__header">
 						<h2 id="loginsHeading" class="section__title">Admin Logins</h2>
 						<div class="section__actions">
+							<button
+								class="btn btn--tonal collapsible-toggle"
+								type="button"
+								data-target="loginsContent"
+								aria-expanded="true"
+							>
+								Collapse
+							</button>
 							<button id="exportLogins" class="btn btn--outline">Export CSV</button>
 						</div>
 					</div>
 
-					<div class="card">
-						<div class="table-wrap">
-							<table id="loginsTable" class="table">
-								<thead>
-									<tr>
-										<th scope="col">Date (ts)</th>
-										<th scope="col">IP</th>
-										<th scope="col">Successful</th>
-									</tr>
-								</thead>
-								<tbody>
-									<!-- rows from LoginAttempts: {IP, Date, Successful} -->
-								</tbody>
-							</table>
+					<div id="loginsContent" class="collapsible is-open">
+						<div class="card">
+							<div class="table-wrap">
+								<table id="loginsTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Date (ts)</th>
+											<th scope="col">IP</th>
+											<th scope="col">Successful</th>
+										</tr>
+									</thead>
+									<tbody>
+										<!-- rows from LoginAttempts: {IP, Date, Successful} -->
+									</tbody>
+								</table>
+							</div>
 						</div>
 					</div>
 				</section>
@@ -355,18 +450,22 @@
 							<h3 class="kpi__title">Direct API</h3>
 							<div class="kpi__value" id="health_direct">OK</div>
 							<div class="kpi__meta">
-								Last: <span id="direct_last">0</span> • Cooldown:
-								<span id="direct_cooldown">false</span>
+								Last: <span id="direct_last">—</span> • Cooldown:
+								<span id="direct_cooldown">false</span> • Count:
+								<span id="direct_count">0</span>
 							</div>
 						</article>
+
 						<article class="card kpi">
 							<h3 class="kpi__title">RoProxy</h3>
 							<div class="kpi__value" id="health_roproxy">OK</div>
 							<div class="kpi__meta">
-								Last: <span id="roproxy_last">0</span> • Cooldown:
-								<span id="roproxy_cooldown">false</span>
+								Last: <span id="roproxy_last">—</span> • Cooldown:
+								<span id="roproxy_cooldown">false</span> • Count:
+								<span id="roproxy_count">0</span>
 							</div>
 						</article>
+
 						<article class="card kpi">
 							<h3 class="kpi__title">Tokens</h3>
 							<div class="kpi__value" id="health_tokens_count">0</div>

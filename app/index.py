@@ -6,8 +6,9 @@ import proxy
 import json
 import os
 import re
+import throttle
 import two_fa
-from flask import Flask, request, render_template, session, redirect, url_for, send_from_directory
+from flask import Flask, request, render_template, session, redirect, url_for, send_from_directory, jsonify
 from markupsafe import escape
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
@@ -15,7 +16,7 @@ app.secret_key = auth.read_admin_credentials()[3]
 
 app.config.update(
     SESSION_COOKIE_DOMAIN=None,
-    SESSION_COOKIE_SECURE=False,  # Set to True if using HTTPS.
+    SESSION_COOKIE_SECURE=True,  # TODO: Set to True if using HTTPS.
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=1800 if config.DEBUG else 300,
@@ -24,12 +25,12 @@ app.config.update(
 
 ## Handle web pages.
 # Handle home page.
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET"])
 def home_page():
-    return render_template("home.html")
+    return render_template("home_page.html")
 
 
-@app.route("/robots.txt")
+@app.route("/robots.txt", methods=["GET"])
 def robots_txt():
     diagnostics.log_crawl(request.access_route[0])
     return send_from_directory(os.path.join(app.root_path), "robots.txt")
@@ -170,20 +171,45 @@ def is_browser(user_agent: str) -> bool:
     return any(browser in user_agent for browser in browsers)
 
 
-# Handle Get proxying.
+# Handle proxying.
 @app.route("/<path:dst>", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
 def proxy_page(dst: str):
+    ip = request.access_route[0]
+    user_agent = request.user_agent.string
+    print(ip)
+    if throttle.is_throttled(ip):
+        resp = jsonify(
+            f"You have been throttled; try again in {throttle.get_throttle_reset_time_left(ip)} seconds (you get ~{config.ALLOWED_REQUESTS_PER_MINUTE} requests per ~minute)."
+        )
+        resp.headers["Roxy-Requests-Left"] = 0
+        resp.headers["Roxy-Throttle-Reset"] = throttle.get_throttle_reset_time_left(ip)
+        resp.headers["Roxy-Throttled"] = "True"
+        return resp, 429
+
     if dst in path_ignore_set:
-        return "Not Found", 404
+        resp = jsonify("Not Found")
+        resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
+        resp.headers["Roxy-Throttle-Reset"] = throttle.get_throttle_reset_time_left(ip)
+        resp.headers["Roxy-Throttled"] = "False"
+        return resp, 404
 
     if dst != escape(dst):
-        diagnostics.log_exploit_attempt(request.access_route[0], f'Invalid URL: "{dst}"', request.user_agent.string)
-        return "Invalid URL", 404
+        diagnostics.log_exploit_attempt(ip, f'Invalid URL: "{dst}"', user_agent)
+        resp = jsonify("Invalid URL")
+        resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
+        resp.headers["Roxy-Throttle-Reset"] = throttle.get_throttle_reset_time_left(ip)
+        resp.headers["Roxy-Throttled"] = "False"
+        return resp, 404
 
     if not validate_url(dst):
-        diagnostics.log_exploit_attempt(request.access_route[0], f'Non-Roblox URL: "{dst}"', request.user_agent.string)
-        return "Not a Roblox URL", 404
+        diagnostics.log_exploit_attempt(ip, f'Non-Roblox URL: "{dst}"', user_agent)
+        resp = jsonify("Not a Roblox URL")
+        resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
+        resp.headers["Roxy-Throttle-Reset"] = throttle.get_throttle_reset_time_left(ip)
+        resp.headers["Roxy-Throttled"] = "False"
+        return resp, 404
 
+    throttle.update_throttling(ip, made_request=True)
     params = dict(request.args)
     data = request.data if request.method in ("POST", "PATCH", "PUT", "DELETE") else None
 
@@ -191,7 +217,7 @@ def proxy_page(dst: str):
     headers = dict(request.headers)
     headers.pop("Host", None)
     headers.pop("Roblox-Id", None)
-    is_actually_browser = is_browser(request.user_agent.string)
+    is_actually_browser = is_browser(user_agent)
     if not is_actually_browser:
         headers["User-Agent"] = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
@@ -217,7 +243,12 @@ def proxy_page(dst: str):
         except:
             pass
     response = f"<pre>{response}</pre>" if is_actually_browser else response
-    return response if successful and response is not None else (response, 500)
+    response = response if response is not None else "Internal Server Error"
+    resp = jsonify(response)
+    resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
+    resp.headers["Roxy-Throttle-Reset"] = throttle.get_throttle_reset_time_left(ip)
+    resp.headers["Roxy-Throttled"] = str(throttle.is_throttled(ip))
+    return resp, 200 if successful else 500
 
 
 if __name__ == "__main__":

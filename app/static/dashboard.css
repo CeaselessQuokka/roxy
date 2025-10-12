@@ -627,3 +627,21 @@ a:hover {
 		border-color: #aaa;
 	}
 }
+
+/* =============================
+   COLLAPSIBLE SECTIONS
+   ============================= */
+.collapsible {
+	overflow: hidden;
+	max-height: 1000px;
+	opacity: 1;
+	transition: max-height var(--dur-med) var(--easing), opacity var(--dur-med) var(--easing);
+}
+.collapsible:not(.is-open) {
+	max-height: 0;
+	opacity: 0;
+	pointer-events: none;
+}
+.collapsible-toggle {
+	min-width: 90px;
+}

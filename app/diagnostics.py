@@ -5,6 +5,12 @@ import time
 exploit_attempts = list()
 login_attempts = list()
 
+throttled_ips = dict(
+    {
+        # [IP]: {LastThrottleTime: float, Count: int}, # Count = nTimesThrottled
+    }
+)
+
 request_counts = dict(
     {
         "GET": dict({"Successful": 0, "Failed": 0}),
@@ -53,6 +59,19 @@ tokens = dict(
 )
 
 
+def log_throttle(ip: str):
+    global throttled_ips
+    now = time.time()
+    if ip in throttled_ips:
+        throttled_ips[ip]["Count"] += 1
+        throttled_ips[ip]["LastThrottleTime"] = now
+    else:
+        throttled_ips[ip] = dict(LastThrottleTime=now, Count=1)
+    if len(throttled_ips) > config.MAX_THROTTLE_RECORDS:
+        oldest_ip = min(throttled_ips.items(), key=lambda x: x[1]["LastThrottleTime"])[0]
+        throttled_ips.pop(oldest_ip, None)
+
+
 def log_crawl(ip: str):
     global crawls
     now = time.time()
@@ -61,6 +80,9 @@ def log_crawl(ip: str):
         crawls[ip]["LastRequestTime"] = now
     else:
         crawls[ip] = dict(LastRequestTime=now, Count=1)
+    if len(crawls) > config.MAX_CRAWL_RECORDS:
+        oldest_ip = min(crawls.items(), key=lambda x: x[1]["LastRequestTime"])[0]
+        crawls.pop(oldest_ip, None)
 
 
 def log_exploit_attempt(ip: str, reason: str, user_agent: str):
@@ -122,6 +144,7 @@ def get_diagnostics() -> dict:
     global tokens
     return dict(
         {
+            "ThrottledIPs": throttled_ips,
             "ExploitAttempts": exploit_attempts,
             "LoginAttempts": login_attempts,
             "RequestCounts": request_counts,

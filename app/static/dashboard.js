@@ -121,8 +121,30 @@ const print = console.log;
 			const idx = i + 1;
 			const masked = t?.Masked ?? "…***";
 			const being = Boolean(t?.BeingValidated);
-			tbody.appendChild(tr([String(idx), masked, being ? "Yes" : "No"]));
+			const uses = Number(t?.Uses || 0);
+			tbody.appendChild(tr([String(idx), masked, being ? "Yes" : "No", String(uses)]));
 		});
+	}
+
+	function renderThrottled(d) {
+		const tbody = document.querySelector("#throttledTable tbody");
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const data = d.ThrottledIPs || d.throttled_ips || {}; // handle either casing
+		for (const [ip, info] of Object.entries(data)) {
+			const row = document.createElement("tr");
+			const cells = [
+				ip,
+				info.Count ?? 0,
+				info.LastThrottleTime ? new Date(info.LastThrottleTime * 1000).toLocaleString() : "—",
+			];
+			cells.forEach(v => {
+				const td = document.createElement("td");
+				td.textContent = v;
+				row.appendChild(td);
+			});
+			tbody.appendChild(row);
+		}
 	}
 
 	function renderProbes(d) {
@@ -145,18 +167,33 @@ const print = console.log;
 		});
 	}
 
+	function renderCrawls(d) {
+		const tbody = $("#crawlsTable tbody");
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const crawls = d.Crawls || {};
+		const entries = Object.entries(crawls);
+		entries.sort((a, b) => b[1].Count - a[1].Count);
+		for (const [ip, info] of entries) {
+			tbody.appendChild(tr([ip, String(info.Count || 0), toTS(info.LastRequestTime || 0)]));
+		}
+	}
+
 	function renderHealth(d) {
 		const h = d.ProxyHealth || {};
 		const da = h.DirectAPI || {};
 		const rp = h.RoProxy || {};
 		const tk = h.Tokens || {};
+
 		setText("health_direct", da.IsInCooldown ? "COOLDOWN" : "OK");
 		setText("direct_last", toTS(da.LastRequestTime || 0));
 		setText("direct_cooldown", String(Boolean(da.IsInCooldown)));
+		setText("direct_count", String(da.Count || 0));
 
 		setText("health_roproxy", rp.IsInCooldown ? "COOLDOWN" : "OK");
 		setText("roproxy_last", toTS(rp.LastRequestTime || 0));
 		setText("roproxy_cooldown", String(Boolean(rp.IsInCooldown)));
+		setText("roproxy_count", String(rp.Count || 0));
 
 		setText("health_tokens_count", String(tk.Count ?? 0));
 		setText("health_tokens_expired", String(tk.ExpiredCount ?? 0));
@@ -182,6 +219,8 @@ const print = console.log;
 			renderProbes(d);
 			renderLogins(d);
 			renderHealth(d);
+			renderCrawls(d);
+			renderThrottled?.(d);
 			showToast("Dashboard updated");
 		} catch (err) {
 			console.error(err);
@@ -241,11 +280,19 @@ const print = console.log;
 			);
 		});
 
+		// Crawls
+		lines.push("");
+		lines.push("[Crawls]");
+		const crawls = d.Crawls || {};
+		for (const [ip, info] of Object.entries(crawls)) {
+			lines.push(toCSVRow([ip, info.Count || 0, info.LastRequestTime || 0]));
+		}
+
 		// Tokens (masked only)
 		lines.push("");
 		lines.push("[Tokens]");
 		(Array.isArray(d.Tokens) ? d.Tokens : []).forEach((t, i) => {
-			lines.push(toCSVRow([i + 1, t.Masked || "…***", t.BeingValidated ? "Yes" : "No"]));
+			lines.push(toCSVRow([i + 1, t.Masked || "…***", t.BeingValidated ? "Yes" : "No", t.Uses || 0]));
 		});
 
 		// Exploit attempts
@@ -261,6 +308,14 @@ const print = console.log;
 		(Array.isArray(d.LoginAttempts) ? d.LoginAttempts : []).forEach(r => {
 			lines.push(toCSVRow([r.Date || 0, r.IP || "", r.Successful ? "success" : "fail"]));
 		});
+
+		// Throttled IPs
+		lines.push("");
+		lines.push("[ThrottledIPs]");
+		const ti = d.ThrottledIPs || d.throttled_ips || {};
+		for (const [ip, info] of Object.entries(ti)) {
+			lines.push(toCSVRow([ip, info.Count ?? 0, info.LastThrottleTime ?? 0]));
+		}
 
 		download(`roxy_diagnostics_${Date.now()}.csv`, lines.join("\n"));
 	}
@@ -281,6 +336,36 @@ const print = console.log;
 			const d = await fetchDiagnostics();
 			exportCSV(d);
 			showToast("CSV exported");
+		} catch {
+			showToast("Export failed");
+		}
+	});
+
+	$("#exportCrawls")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			const crawls = d.Crawls || {};
+			const lines = ["IP,Count,LastRequestTime"];
+			for (const [ip, info] of Object.entries(crawls)) {
+				lines.push(`${ip},${info.Count || 0},${info.LastRequestTime || 0}`);
+			}
+			download(`roxy_crawls_${Date.now()}.csv`, lines.join("\n"));
+			showToast("Crawler data exported");
+		} catch {
+			showToast("Failed to export crawls");
+		}
+	});
+
+	document.getElementById("exportThrottled")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			const ti = d.ThrottledIPs || d.throttled_ips || {};
+			const lines = ["IP,Count,LastThrottleTime"];
+			for (const [ip, info] of Object.entries(ti)) {
+				lines.push(`${ip},${info.Count ?? 0},${info.LastThrottleTime ?? 0}`);
+			}
+			download(`roxy_throttled_${Date.now()}.csv`, lines.join("\n"));
+			showToast("Throttled IPs exported");
 		} catch {
 			showToast("Export failed");
 		}
@@ -315,6 +400,18 @@ const print = console.log;
 			console.error(err);
 			showToast("Token submit failed");
 		}
+	});
+
+	// Collapsible sections
+	$$(".collapsible-toggle").forEach(btn => {
+		btn.addEventListener("click", () => {
+			const id = btn.dataset.target;
+			const content = document.getElementById(id);
+			if (!content) return;
+			const isOpen = content.classList.toggle("is-open");
+			btn.textContent = isOpen ? "Collapse" : "Expand";
+			btn.setAttribute("aria-expanded", String(isOpen));
+		});
 	});
 
 	// Initial load
