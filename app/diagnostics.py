@@ -22,6 +22,12 @@ status_code_counts = dict(
     }
 )
 
+crawls = dict(
+    {
+        # [IP]: {LastRequestTime: float, Count: int},
+    }
+)
+
 proxy_request_counts = dict(
     {
         "GET": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),
@@ -45,6 +51,16 @@ tokens = dict(
         # [full_token]: {Masked: str, BeingValidated: bool}
     }
 )
+
+
+def log_crawl(ip: str):
+    global crawls
+    now = time.time()
+    if ip in crawls:
+        crawls[ip]["Count"] += 1
+        crawls[ip]["LastRequestTime"] = now
+    else:
+        crawls[ip] = dict(LastRequestTime=now, Count=1)
 
 
 def log_exploit_attempt(ip: str, reason: str, user_agent: str):

@@ -1,14 +1,12 @@
 import auth
 import diagnostics
 import config
-import file_watcher
 import proxy
 import json
-import requests
-import urllib
+import os
 import re
 import two_fa
-from flask import Flask, request, render_template, session, redirect, url_for
+from flask import Flask, request, render_template, session, redirect, url_for, send_from_directory
 from markupsafe import escape
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
@@ -30,9 +28,10 @@ def home_page():
     return render_template("home.html")
 
 
-# @app.route("/credits")
-# def credits_page():
-#     return render_template("credits.html")
+@app.route("/robots.txt")
+def robots_txt():
+    diagnostics.log_crawl(request.access_route[0])
+    return send_from_directory(os.path.join(app.root_path), "robots.txt")
 
 
 # Handle admin page.
