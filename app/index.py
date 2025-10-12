@@ -179,7 +179,6 @@ def is_browser(user_agent: str) -> bool:
 def proxy_page(dst: str):
     ip = request.access_route[0]
     user_agent = request.user_agent.string
-    print(ip)
     if throttle.is_throttled(ip):
         resp = jsonify(
             f"You have been throttled; try again in {throttle.get_throttle_reset_time_left(ip)} seconds (you get ~{config.ALLOWED_REQUESTS_PER_MINUTE} requests per ~minute)."
