@@ -57,7 +57,7 @@ def update_throttling(ip, made_request: bool = False):
             throttled_ip["ThrottleResetTime"] = now + THROTTLE_RESET_DURATION
         if made_request:
             throttled_ip["Requests"] += 1
-            throttled_ip["ThrottleResetTime"] += 0.5
+            throttled_ip["ThrottleResetTime"] += 1
             throttled_ip["LastRequestTime"] = now
         if throttled_ip["Requests"] > ALLOWED_REQUESTS_PER_MINUTE:
             throttled_ip["Throttled"] = True

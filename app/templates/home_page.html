@@ -67,6 +67,46 @@
 				</div>
 			</section>
 
+			<!-- General Tips -->
+			<main class="main" role="main">
+			<section class="section collapsible-block" aria-labelledby="generalTipsHeader">
+				<div class="section__header">
+					<h2 id="generalTipsHeader" class="section__title">General Tips (Highly Recommended Reading)</h2>
+					<button
+						class="btn btn--tonal collapsible-toggle"
+						type="button"
+						data-target="generalTips"
+						aria-expanded="true"
+					>
+						Collapse
+					</button>
+				</div>
+				<div id="generalTips" class="collapsible is-open">
+					<p class="light--warning">
+						Note: Remove the prepended
+						<code>_|WARNING:-DO-NOT-SHARE-THIS.--...|_</code> text if present in your token, otherwise
+						Roblox will give you an error due to an invalid character (specifically the pipe "|" character).
+					</p>
+					<p class="light--warning">
+						If you use RequestAsync, Roblox gives you the response headers. There are three custom headers that Roxy adds:
+						<ul>
+							<li><code>Roxy-Requests-Left</code>: How many more requests you have until you get throttled.
+							<li><code>Roxy-Throttle-Reset</code>: How many seconds until your request pool resets.
+							<li><code>Roxy-Throttled</code>: Whether or not you have been throttled.
+						</ul>
+					</p>
+					<p>
+						You get around 100 requests a minute. However, for every request you make your throttle reset timer increases by 1 second.
+						So if you quickly make 100 requests, you will have to wait an extra 100 seconds on top of whatever time your throttle reset timer is at.
+						<br /><br />
+						This shouldn't be a huge problem unless you are either trying to scrape data, or you maybe have a really big server that makes a lot of requests.
+						If the latter, then try to cache data as much as possible, and if you can't, let me know what your use case is and I can potentially increase the request limit.
+						<br /><br />
+						At least hopefully with the above headers, you should be able to try to balance your request limit.
+					</p>
+				</div>
+			</section>
+
 			<!-- Prettyprint Example -->
 			<section class="section collapsible-block" aria-labelledby="getExampleHeading">
 				<div class="section__header">
@@ -146,11 +186,6 @@ print(HttpService:GetAsync(URL))</code></pre>
 					</button>
 				</div>
 				<div id="patchExample" class="collapsible is-open">
-					<p class="light--warning">
-						Note: Remove the prepended
-						<code>_|WARNING:-DO-NOT-SHARE-THIS.--...|_</code> text if present in your token, otherwise
-						Roblox will give you an error due to an invalid character (specifically the pipe "|" character).
-					</p>
 					<pre class="example"><code>local HEADERS = {
 	["X-Roblox-Token"] = "YOUR_ROBLOX_TOKEN",
 	["Content-Type"] = "application/json",
@@ -178,11 +213,6 @@ HttpService:RequestAsync({
 					</button>
 				</div>
 				<div id="postExample" class="collapsible is-open">
-					<p class="light--warning">
-						Note: Remove the prepended
-						<code>_|WARNING:-DO-NOT-SHARE-THIS.--...|_</code> text if present in your token, otherwise
-						Roblox will give you an error due to an invalid character (specifically the pipe "|" character).
-					</p>
 					<pre class="example"><code>local HEADERS = {
 	["X-Roblox-Token"] = "YOUR_ROBLOX_TOKEN",
 }
@@ -223,11 +253,6 @@ HttpService:RequestAsync({
 					</button>
 				</div>
 				<div id="deleteExample" class="collapsible is-open">
-					<p class="light--warning">
-						Note: Remove the prepended
-						<code>_|WARNING:-DO-NOT-SHARE-THIS.--...|_</code> text if present in your token, otherwise
-						Roblox will give you an error due to an invalid character (specifically the pipe "|" character).
-					</p>
 					<pre class="example"><code>local HEADERS = { ["X-Roblox-Token"] = "YOUR_ROBLOX_TOKEN" }
 
 HttpService:RequestAsync({
