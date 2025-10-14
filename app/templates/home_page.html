@@ -59,7 +59,7 @@
 						<a
 							href="https://devforum.roblox.com/t/bundle-and-characteroutfit-inserter-free-plugin/3972083"
 							target="_blank"
-							>Bundle and Character/Outfit Inserter (shameful plug)</a
+							>Bundle and Character/Outfit Inserter (shameful plug(in))</a
 						>
 						plugin as of right now. I figured if I'm going to make the proxy anyway, I may as well share it.
 						My general rule of thumb for most things I make really, haha.
@@ -83,7 +83,7 @@
 				</div>
 				<div id="generalTips" class="collapsible is-open">
 					<p class="light--warning">
-						Note: Remove the prepended
+						Note: If you are using an API that needs authentication, remove the prepended
 						<code>_|WARNING:-DO-NOT-SHARE-THIS.--...|_</code> text if present in your token, otherwise
 						Roblox will give you an error due to an invalid character (specifically the pipe "|" character).
 					</p>
@@ -96,13 +96,10 @@
 						</ul>
 					</p>
 					<p>
-						You get around 100 requests a minute. However, for every request you make your throttle reset timer increases by 1 second.
-						So if you quickly make 100 requests, you will have to wait an extra 100 seconds on top of whatever time your throttle reset timer is at.
+						You get around 10 requests every 50 seconds. However, for every request you make your throttle reset timer increases by 1 second.
+						So if you quickly make 10 requests, you will have to wait an extra 10 seconds on top of whatever time your throttle reset timer is at.
 						<br /><br />
-						This shouldn't be a huge problem unless you are either trying to scrape data, or you maybe have a really big server that makes a lot of requests.
-						If the latter, then try to cache data as much as possible, and if you can't, let me know what your use case is and I can potentially increase the request limit.
-						<br /><br />
-						At least hopefully with the above headers, you should be able to try to balance your request limit.
+						This is done to hopefully prevent Roblox from blacklisting or throttling Roxy's IP address.
 					</p>
 				</div>
 			</section>

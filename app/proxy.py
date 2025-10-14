@@ -138,7 +138,7 @@ def _request(
                 diagnostics.update_token(token, being_validated=True)
                 delay(TOKEN_EXPIRATION_COOLDOWN, lambda: validate_token(token)).start()
         retries += 1
-        if retries > MAX_RETRIES_PER_REQUEST:
+        if retries > MAX_RETRIES_PER_REQUEST - 1:
             return False, False, req.text, None, retries
         else:
             return False, True, None, None, retries

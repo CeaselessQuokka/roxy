@@ -174,6 +174,25 @@ def is_browser(user_agent: str) -> bool:
     return any(browser in user_agent for browser in browsers)
 
 
+def get_fake_headers() -> dict:
+    return {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+        "Cache-Control": "max-age=0",
+        "Priority": "u=0, i",
+        "Sec-Ch-Ua": '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+    }
+
+
 # Handle proxying.
 @app.route("/<path:dst>", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
 def proxy_page(dst: str):
@@ -218,12 +237,14 @@ def proxy_page(dst: str):
     # Remove/overwrite headers that could cause issues.
     headers = dict(request.headers)
     headers.pop("Host", None)
+    headers.pop("Accept", None)
+    headers.pop("Accept-Encoding", None)
+    headers.pop("Cache-Control", None)
+    headers.pop("Connection", None)
+    headers.pop("User-Agent", None)
     headers.pop("Roblox-Id", None)
-    is_actually_browser = is_browser(user_agent)
-    if not is_actually_browser:
-        headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-        )
+    headers.pop("Traceparent", None)
+    headers.update(get_fake_headers())
 
     roblox_token = headers.pop("X-Roblox-Token", None)
     if roblox_token is not None and not config.TOKEN_PREFIX in roblox_token:
@@ -244,12 +265,13 @@ def proxy_page(dst: str):
             response = json.dumps(json.loads(response), indent=4)
         except:
             pass
-    response = f"<pre>{response}</pre>" if is_actually_browser else response
+    response = f"<pre>{response}</pre>" if is_browser(user_agent) else response
     response = response if response is not None else "Internal Server Error"
     resp = jsonify(response)
     resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
     resp.headers["Roxy-Throttle-Reset"] = throttle.get_throttle_reset_time_left(ip)
     resp.headers["Roxy-Throttled"] = str(throttle.is_throttled(ip))
+    resp.data = response
     return resp, 200 if successful else 500
 
 
