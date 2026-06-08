@@ -48,17 +48,19 @@ def reset_throttle(ip: str):
         throttled_ips[ip]["ThrottleResetTime"] = time.time() + runtime.get_setting("throttle_reset_duration")
 
 
-def check_endpoint_limit(ip: str, path: str) -> tuple[bool, int]:
+def check_endpoint_limit(ip: str, path: str) -> tuple[bool, int, str | None]:
     """Enforce a per-(IP, endpoint) rate rule, if one matches the path.
 
-    Counts the request when allowed. Returns (allowed, seconds_until_reset).
+    Counts the request when allowed. Returns (allowed, seconds_until_reset, pattern).
+    `pattern` is the matched rule pattern (or None when no rule applies), so the
+    caller can record which rule rejected the request.
     The effective limit is clamped to the global per-IP limit, so an endpoint
     rule can only ever make access MORE restrictive — never bypass the max.
     """
     global endpoint_buckets
     rule = runtime.match_endpoint_rule(path)
     if not rule:
-        return True, 0
+        return True, 0, None
     pattern = rule["Pattern"]
     limit = int(rule.get("Limit", 1))
     period = int(rule.get("Period", 60))
@@ -73,9 +75,9 @@ def check_endpoint_limit(ip: str, path: str) -> tuple[bool, int]:
         bucket = dict(Count=0, ResetTime=now + period)
         endpoint_buckets[key] = bucket
     if bucket["Count"] >= limit:
-        return False, int(max(0, bucket["ResetTime"] - now))
+        return False, int(max(0, bucket["ResetTime"] - now)), pattern
     bucket["Count"] += 1
-    return True, 0
+    return True, 0, pattern
 
 
 def update_throttling(ip, made_request: bool = False):

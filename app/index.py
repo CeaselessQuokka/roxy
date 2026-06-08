@@ -409,8 +409,9 @@ def proxy_page(dst: str):
         resp.headers["Roxy-Blocked"] = "True"
         return resp, 403
 
-    endpoint_allowed, endpoint_retry = throttle.check_endpoint_limit(ip, dst)
+    endpoint_allowed, endpoint_retry, endpoint_pattern = throttle.check_endpoint_limit(ip, dst)
     if not endpoint_allowed:
+        diagnostics.log_rate_limited_endpoint(dst, request.method, ip, endpoint_pattern)
         resp = jsonify(f"This endpoint is rate-limited for you; try again in {endpoint_retry} seconds.")
         resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
         resp.headers["Roxy-Throttle-Reset"] = endpoint_retry

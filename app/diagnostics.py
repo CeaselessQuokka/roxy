@@ -95,6 +95,9 @@ endpoints = dict()
 # Attempts to reach a blocked endpoint: path -> {Count, LastRequestTime, Pattern, LastIP, Methods, IPs}.
 blocked_endpoint_attempts = dict()
 
+# Requests rejected by a per-endpoint rate rule: path -> {Count, LastRequestTime, Pattern, LastIP, Methods, IPs}.
+rate_limited_attempts = dict()
+
 # Retry metrics: how often requests were retried, by status code and reason.
 retry_counts = dict(
     {
@@ -222,13 +225,22 @@ def log_endpoint(path: str, method: str):
 
 def log_blocked_endpoint(path: str, method: str, ip: str, pattern: str):
     """Record an attempt to reach a blocked endpoint, keeping the most-frequent ones."""
+    _log_rejected_endpoint(blocked_endpoint_attempts, path, method, ip, pattern)
+
+
+def log_rate_limited_endpoint(path: str, method: str, ip: str, pattern: str):
+    """Record a request rejected by a per-endpoint rate rule, keeping the most-frequent ones."""
+    _log_rejected_endpoint(rate_limited_attempts, path, method, ip, pattern)
+
+
+def _log_rejected_endpoint(store: dict, path: str, method: str, ip: str, pattern: str):
     path = (path or "").split("?", 1)[0].strip("/")
     if not path:
         return
     now = time.time()
     cap = runtime.get_setting("max_endpoint_records") or config.MAX_ENDPOINT_RECORDS
     with _state_lock:
-        record = blocked_endpoint_attempts.get(path)
+        record = store.get(path)
         if record:
             record["Count"] += 1
             record["LastRequestTime"] = now
@@ -240,10 +252,10 @@ def log_blocked_endpoint(path: str, method: str, ip: str, pattern: str):
                 least = min(record["IPs"].items(), key=lambda kv: kv[1])[0]
                 record["IPs"].pop(least, None)
         else:
-            if len(blocked_endpoint_attempts) >= cap:
-                least = min(blocked_endpoint_attempts.items(), key=lambda kv: kv[1]["Count"])[0]
-                blocked_endpoint_attempts.pop(least, None)
-            blocked_endpoint_attempts[path] = dict(
+            if len(store) >= cap:
+                least = min(store.items(), key=lambda kv: kv[1]["Count"])[0]
+                store.pop(least, None)
+            store[path] = dict(
                 Count=1, LastRequestTime=now, Pattern=pattern, LastIP=ip, Methods={method: 1}, IPs={ip: 1}
             )
 
@@ -355,6 +367,13 @@ def clear_tokens():
 
 def get_diagnostics() -> dict:
     global tokens
+    # Push this worker's pending stats into the shared file and adopt the merged
+    # global totals, so the dashboard shows the true aggregate across all gunicorn
+    # workers (not just the slice this worker happened to handle).
+    try:
+        _flush()
+    except Exception:
+        pass  # If persistence is briefly unavailable, fall back to local memory.
     with _state_lock:
         # Deep-copy the whole snapshot under the lock so no other thread can
         # mutate a structure while Flask iterates it during JSON serialization.
@@ -374,6 +393,7 @@ def get_diagnostics() -> dict:
                 "Crawls": crawls,
                 "Endpoints": endpoints,
                 "BlockedEndpointAttempts": blocked_endpoint_attempts,
+                "RateLimitedAttempts": rate_limited_attempts,
                 "RetryCounts": retry_counts,
                 "ReasonCounts": reason_counts,
                 "LiveRequests": list(reversed(live_requests)),  # Most-recent first.
@@ -398,6 +418,7 @@ _PERSISTED_NAMES = (
     "throttled_ips",
     "endpoints",
     "blocked_endpoint_attempts",
+    "rate_limited_attempts",
     "retry_counts",
     "reason_counts",
     "live_requests",
@@ -504,18 +525,26 @@ def _merge_stats(shared: dict, local: dict, base: dict) -> dict:
 
 
 def _flush():
-    """Merge this worker's stats into the shared file, then adopt the global totals."""
+    """Merge this worker's stats into the shared file, then adopt the global totals.
+
+    The entire operation is held under _state_lock — including the file I/O — so no
+    request thread can mutate a counter between the snapshot and the readback. Under
+    multi-worker `flock` contention the I/O window can be non-trivial, and without
+    this an increment landing in that window would be silently overwritten on
+    readback (the cause of counters appearing to "not count").
+    """
     global _baseline
-    local = serialize()
-    base = _baseline if _baseline is not None else {name: None for name in _PERSISTED_NAMES}
+    with _state_lock:
+        local = serialize()
+        base = _baseline if _baseline is not None else {name: None for name in _PERSISTED_NAMES}
 
-    def mutate(data):
-        data["Diagnostics"] = _merge_stats(data.get("Diagnostics", {}), local, base)
-        return data
+        def mutate(data):
+            data["Diagnostics"] = _merge_stats(data.get("Diagnostics", {}), local, base)
+            return data
 
-    merged = storage.update_data(mutate)
-    restore(merged.get("Diagnostics", {}))  # Adopt the combined global totals.
-    _baseline = serialize()  # New baseline = what we just adopted.
+        merged = storage.update_data(mutate)
+        restore(merged.get("Diagnostics", {}))  # Adopt the combined global totals.
+        _baseline = serialize()  # New baseline = what we just adopted.
 
 
 def _bootstrap():

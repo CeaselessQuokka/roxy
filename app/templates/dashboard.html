@@ -48,6 +48,7 @@
 					<li><a class="nav__link" href="#section-endpoints">Endpoints</a></li>
 					<li><a class="nav__link" href="#section-endpoint-controls">Endpoint Controls</a></li>
 					<li><a class="nav__link" href="#section-blocked-attempts">Blocked Attempts</a></li>
+					<li><a class="nav__link" href="#section-ratelimited-attempts">Rate-Limited Attempts</a></li>
 					<li><a class="nav__link" href="#section-tokens">Auth Tokens</a></li>
 					<li><a class="nav__link" href="#section-requests">Requests</a></li>
 					<li><a class="nav__link" href="#section-status">Status Codes</a></li>
@@ -307,6 +308,42 @@
 								</thead>
 								<tbody>
 									<!-- rows from BlockedEndpointAttempts -->
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
+				<!-- Rate-Limited Attempts -->
+				<section id="section-ratelimited-attempts" class="section" aria-labelledby="rateLimitedAttemptsHeading">
+					<div class="section__header">
+						<h2 id="rateLimitedAttemptsHeading" class="section__title">Rate-Limited Attempts</h2>
+						<div class="section__actions">
+							<span id="rateLimitedAttemptsTotal" class="chip">0 attempts</span>
+							<button id="exportRateLimitedAttempts" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							Requests rejected by a per-endpoint rate rule (too many requests from one IP to that
+							endpoint). Sorted by frequency. Shows how many times, which IPs, the rule that matched, and
+							when it was last attempted.
+						</p>
+						<div class="table-wrap">
+							<table id="rateLimitedAttemptsTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Endpoint</th>
+										<th scope="col">Attempts</th>
+										<th scope="col">Unique IPs</th>
+										<th scope="col">Methods</th>
+										<th scope="col">Matched Rule</th>
+										<th scope="col">Last IP</th>
+										<th scope="col">Last Attempt</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- rows from RateLimitedAttempts -->
 								</tbody>
 							</table>
 						</div>

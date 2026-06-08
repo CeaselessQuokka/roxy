@@ -452,10 +452,22 @@ const print = console.log;
 	}
 
 	function renderBlockedAttempts(d) {
-		const tbody = $("#blockedAttemptsTable tbody");
+		renderRejectedAttempts("#blockedAttemptsTable tbody", "blockedAttemptsTotal", d.BlockedEndpointAttempts || {});
+	}
+
+	function renderRateLimitedAttempts(d) {
+		renderRejectedAttempts(
+			"#rateLimitedAttemptsTable tbody",
+			"rateLimitedAttemptsTotal",
+			d.RateLimitedAttempts || {},
+		);
+	}
+
+	function renderRejectedAttempts(tbodySel, totalId, data) {
+		const tbody = $(tbodySel);
 		if (!tbody) return;
 		tbody.innerHTML = "";
-		const entries = Object.entries(d.BlockedEndpointAttempts || {});
+		const entries = Object.entries(data);
 		entries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
 		let total = 0;
 		for (const [path, info] of entries) {
@@ -479,7 +491,7 @@ const print = console.log;
 		if (entries.length === 0) {
 			tbody.appendChild(tr(["—", "0", "0", "—", "—", "—", "—"]));
 		}
-		setText("blockedAttemptsTotal", `${total} attempts`);
+		setText(totalId, `${total} attempts`);
 	}
 
 	async function unblockEndpoint(pattern) {
@@ -545,6 +557,7 @@ const print = console.log;
 			renderEndpointBlocks(d);
 			renderEndpointRules(d);
 			renderBlockedAttempts(d);
+			renderRateLimitedAttempts(d);
 			showToast("Dashboard updated");
 		} catch (err) {
 			console.error(err);
@@ -902,6 +915,35 @@ const print = console.log;
 			}
 			download(`roxy_blocked_attempts_${Date.now()}.csv`, lines.join("\n"));
 			showToast("Blocked attempts exported");
+		} catch {
+			showToast("Export failed");
+		}
+	});
+
+	// Rate-limited endpoint attempts export
+	$("#exportRateLimitedAttempts")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			const lines = ["Endpoint,Attempts,UniqueIPs,Methods,Pattern,LastIP,LastRequestTime"];
+			for (const [path, info] of Object.entries(d.RateLimitedAttempts || {})) {
+				const methods = Object.entries(info.Methods || {})
+					.map(([m, n]) => `${m}:${n}`)
+					.join(" ");
+				const uniqueIps = info.IPs ? Object.keys(info.IPs).length : 0;
+				lines.push(
+					toCSVRow([
+						path,
+						info.Count || 0,
+						uniqueIps,
+						methods,
+						info.Pattern || "",
+						info.LastIP || "",
+						info.LastRequestTime || 0,
+					]),
+				);
+			}
+			download(`roxy_rate_limited_attempts_${Date.now()}.csv`, lines.join("\n"));
+			showToast("Rate-limited attempts exported");
 		} catch {
 			showToast("Export failed");
 		}
