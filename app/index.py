@@ -2,11 +2,15 @@ import auth
 import challenge
 import config
 import diagnostics
-import proxy
+import functools
 import json
+import mail
 import os
+import proxy
 import re
+import runtime
 import throttle
+import time
 import two_fa
 from flask import Flask, request, render_template, session, redirect, url_for, send_from_directory, jsonify
 from markupsafe import escape
@@ -28,6 +32,7 @@ app.config.update(
 @app.route("/", methods=["GET"])
 def home_page():
     diagnostics.log_page_visit("home")
+    diagnostics.log_visitor(request.user_agent.string)
     return render_template("home_page.html")
 
 
@@ -49,9 +54,32 @@ def validate_login(data: dict) -> bool:
     return username == admin_username and password == admin_password
 
 
+def send_login_notification(ip: str, user_agent: str):
+    """Email the admin that someone logged in, with a one-click session-invalidation link."""
+    try:
+        token = runtime.create_invalidation_token()
+        invalidate_url = url_for("admin_invalidate", token=token, _external=True)
+        body = (
+            "A successful login to the Roxy admin panel just occurred.\n\n"
+            f"IP: {ip}\n"
+            f"User-Agent: {user_agent}\n"
+            f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n\n"
+            "If this was not you, invalidate all admin sessions immediately:\n"
+            f"{invalidate_url}\n"
+        )
+        mail.send(auth.get_emails()[0], "Roxy Admin Login", body)
+    except Exception:
+        pass  # A failed notification must never block login.
+
+
 def requires_admin(fn: callable):
+    @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         if not session.get("IsAdmin", False):
+            return redirect(url_for("home_page"))
+        # Server-side kill switch: a stale session epoch means the session was invalidated.
+        if session.get("Epoch") != runtime.get_session_epoch():
+            session.clear()
             return redirect(url_for("home_page"))
         return fn(*args, **kwargs)
 
@@ -93,8 +121,11 @@ def admin_page():
                 return "Not Found", 404
 
             diagnostics.log_login_attempt(ip, True)
+            diagnostics.decrement_admin_visit()  # Don't count the admin's own visit before logging in.
             session.pop("Challenge", None)
             session["IsAdmin"] = True
+            session["Epoch"] = runtime.get_session_epoch()
+            send_login_notification(ip, user_agent)
             return "Success", 200
         else:
             return "Invalid request", 400
@@ -117,7 +148,10 @@ def admin_dashboard():
 @app.route("/admin/diagnostics", methods=["GET"], endpoint="admin_diagnostics")
 @requires_admin
 def admin_diagnostics():
-    return diagnostics.get_diagnostics()
+    data = diagnostics.get_diagnostics()
+    data["Pause"] = runtime.get_pause_state()
+    data["Settings"] = runtime.get_settings()
+    return jsonify(data)
 
 
 @app.route("/admin/tokens", methods=["POST"], endpoint="admin_set_tokens")
@@ -135,6 +169,56 @@ def admin_set_tokens():
 def admin_logout():
     session.clear()
     return redirect(url_for("home_page"))
+
+
+@app.route("/admin/proxy/toggle", methods=["POST"], endpoint="admin_proxy_toggle")
+@requires_admin
+def admin_proxy_toggle():
+    data = request.json if request.is_json else {}
+    if isinstance(data, dict) and "paused" in data:
+        runtime.set_paused(bool(data["paused"]))
+    else:
+        runtime.toggle_paused()
+    return jsonify(runtime.get_pause_state()), 200
+
+
+@app.route("/admin/settings", methods=["GET", "POST"], endpoint="admin_settings")
+@requires_admin
+def admin_settings():
+    if request.method == "GET":
+        return jsonify({"Settings": runtime.get_settings(), "Pause": runtime.get_pause_state()}), 200
+    data = request.json if request.is_json else None
+    if not isinstance(data, dict):
+        return "Invalid request", 400
+    updates = data.get("settings", data)  # Accept {settings:{...}} or a bare mapping.
+    if not isinstance(updates, dict) or not updates:
+        return "No settings provided", 400
+    results = {}
+    for key, value in updates.items():
+        ok, message = runtime.set_setting(key, value)
+        results[key] = message
+    return jsonify({"Results": results, "Settings": runtime.get_settings()}), 200
+
+
+@app.route("/admin/tokens/force_revalidate", methods=["POST"], endpoint="admin_force_revalidate")
+@requires_admin
+def admin_force_revalidate():
+    proxy.force_revalidate_tokens()
+    return jsonify("Revalidation queued"), 200
+
+
+@app.route("/admin/invalidate/<token>", methods=["GET"], endpoint="admin_invalidate")
+def admin_invalidate(token: str):
+    # Reachable from the emailed login alert; protected by a single-use random token.
+    if runtime.consume_invalidation_token(token):
+        runtime.bump_session_epoch()
+        return "All admin sessions have been invalidated.", 200
+    return "Invalid or expired invalidation link.", 404
+
+
+@app.route("/health", methods=["GET"], endpoint="health")
+def health():
+    return jsonify({"Status": "ok", "Paused": runtime.is_paused()}), 200
 
 
 ## Handle proxying requests.
@@ -193,11 +277,49 @@ def get_fake_headers() -> dict:
     }
 
 
+_SENSITIVE_HEADERS = {"x-roblox-token", "cookie", "authorization", "x-csrf-token"}
+
+
+def log_live_request(ip, user_agent, method, url, headers, body, status_code):
+    """Record a sanitized snapshot of a proxied request for the dashboard live feed."""
+    safe_headers = {}
+    for key, value in dict(headers).items():
+        safe_headers[key] = "[redacted]" if key.lower() in _SENSITIVE_HEADERS else value
+    body_text = ""
+    if body:
+        try:
+            body_text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+        except Exception:
+            body_text = "[unreadable body]"
+        if len(body_text) > config.MAX_LIVE_BODY_LENGTH:
+            body_text = body_text[: config.MAX_LIVE_BODY_LENGTH] + "… [truncated]"
+    diagnostics.log_live_request(
+        dict(
+            Date=time.time(),
+            IP=ip,
+            UserAgent=user_agent,
+            Method=method,
+            URL=url,
+            Headers=safe_headers,
+            Body=body_text,
+            StatusCode=status_code,
+        )
+    )
+
+
 # Handle proxying.
 @app.route("/<path:dst>", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
 def proxy_page(dst: str):
     ip = request.access_route[0]
     user_agent = request.user_agent.string
+    if runtime.is_paused():
+        resp = jsonify("The proxy is temporarily paused; please try again later.")
+        resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
+        resp.headers["Roxy-Throttle-Reset"] = throttle.get_throttle_reset_time_left(ip)
+        resp.headers["Roxy-Throttled"] = "False"
+        resp.headers["Roxy-Paused"] = "True"
+        return resp, 503
+
     if throttle.is_throttled(ip):
         resp = jsonify(
             f"You have been throttled; try again in {throttle.get_throttle_reset_time_left(ip)} seconds (you get ~{config.ALLOWED_REQUESTS_PER_MINUTE} requests per ~minute)."
@@ -231,6 +353,7 @@ def proxy_page(dst: str):
         return resp, 404
 
     throttle.update_throttling(ip, made_request=True)
+    diagnostics.log_endpoint(dst, request.method)
     params = dict(request.args)
     data = request.data if request.method in ("POST", "PATCH", "PUT", "DELETE") else None
 
@@ -272,7 +395,24 @@ def proxy_page(dst: str):
     resp.headers["Roxy-Throttle-Reset"] = throttle.get_throttle_reset_time_left(ip)
     resp.headers["Roxy-Throttled"] = str(throttle.is_throttled(ip))
     resp.data = response
+    log_live_request(ip, user_agent, request.method, dst, request.headers, data, 200 if successful else 500)
     return resp, 200 if successful else 500
+
+
+@app.errorhandler(500)
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    # Email the admin about unexpected server errors (rate-limited inside proxy.notify_error).
+    try:
+        proxy.notify_error(
+            "Unhandled server error",
+            f"{request.method} {request.path}\n"
+            f"IP: {request.access_route[0] if request.access_route else '?'}\n\n"
+            f"{type(error).__name__}: {error}",
+        )
+    except Exception:
+        pass
+    return jsonify("Internal Server Error"), 500
 
 
 if __name__ == "__main__":

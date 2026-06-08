@@ -3,6 +3,7 @@ import config
 import hashlib
 import hmac
 import mail
+import runtime
 import secrets
 import time
 from threading import Timer as delay
@@ -23,7 +24,9 @@ def hash_code(code: str) -> str:
     return hmac.new(KEY, code.encode(), hashlib.sha256).hexdigest()
 
 
-def generate_2fa(expires_in: int = EXPIRATION_TIME) -> str:
+def generate_2fa(expires_in: int = None) -> str:
+    if expires_in is None:
+        expires_in = runtime.get_setting("two_fa_expiration") or EXPIRATION_TIME
     code = f"{secrets.randbelow(10**DIGITS):0{DIGITS}}"
     hashed_code = hash_code(code)
     codes[hashed_code] = time.time() + expires_in

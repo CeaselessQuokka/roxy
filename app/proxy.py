@@ -1,21 +1,36 @@
 import auth
+import config
 import diagnostics
 import mail
 import requests
+import runtime
 import time
-from config import *
+from config import TOKEN_EXPIRATION_COOLDOWN
 from threading import Timer as delay
 from threading import Lock
 
 tokens = auth.read_tokens()
 current_token_index = 0
 email_last_sent = 0
+error_email_last_sent = 0
 is_direct_api_in_cooldown = False
 is_roproxy_in_cooldown = False
 request_lock = Lock()
 
 for t in tokens:
     diagnostics.update_token(t)
+
+
+def notify_error(subject: str, body: str):
+    """Email the admin about a runtime error, rate-limited to avoid spam."""
+    global error_email_last_sent
+    if time.time() - error_email_last_sent < config.ERROR_EMAIL_COOLDOWN:
+        return
+    error_email_last_sent = time.time()
+    try:
+        mail.send(auth.get_emails()[0], f"Roxy Error: {subject}", body)
+    except Exception:
+        pass  # Never let error reporting raise.
 
 
 # Returns (successful, response)
@@ -40,7 +55,17 @@ def request(
 def validate_token(token: str):
     # Test token by using an auth-dependent endpoint. If it works, the token is not expired.
     global tokens, email_last_sent
-    req = requests.get("https://accountinformation.roblox.com/v1/birthdate", cookies={".ROBLOSECURITY": token})
+    try:
+        req = requests.get(
+            "https://accountinformation.roblox.com/v1/birthdate",
+            cookies={".ROBLOSECURITY": token},
+            timeout=config.REQUEST_TIMEOUT,
+        )
+    except requests.RequestException:
+        # Couldn't reach Roblox to validate; re-queue a retry rather than dropping the token.
+        diagnostics.update_token(token, being_validated=True)
+        delay(TOKEN_EXPIRATION_COOLDOWN, lambda: validate_token(token)).start()
+        return
     with request_lock:
         if req.status_code == 200:
             if token not in tokens:
@@ -51,7 +76,7 @@ def validate_token(token: str):
             if token in diagnostics.tokens:
                 diagnostics.tokens.pop(token, None)
                 diagnostics.proxy_health["Tokens"]["Count"] = len(diagnostics.tokens)
-            if time.time() - email_last_sent > EMAIL_COOLDOWN:
+            if time.time() - email_last_sent > config.EMAIL_COOLDOWN:
                 email_last_sent = time.time()
                 mail.send(
                     auth.get_emails()[0],
@@ -87,6 +112,7 @@ def _request(
     if len(tokens) == 0 and is_direct_api_in_cooldown and is_roproxy_in_cooldown:
         diagnostics.log_status_code(404)
         diagnostics.log_request(method.upper(), False)
+        diagnostics.log_reason(True)
         return False, False, "No available tokens or APIs to call", None, retries
 
     with request_lock:
@@ -98,17 +124,18 @@ def _request(
                 is_direct_api_in_cooldown = True
                 diagnostics.proxy_health["DirectAPI"]["IsInCooldown"] = True
                 diagnostics.proxy_health["DirectAPI"]["LastRequestTime"] = time.time()
-                delay(DIRECT_API_COOLDOWN, lambda: reset_direct_api_cooldown()).start()
+                delay(runtime.get_setting("direct_api_cooldown"), lambda: reset_direct_api_cooldown()).start()
             elif not is_roproxy_in_cooldown:
                 is_roproxy_in_cooldown = True
                 url = url.replace("roblox.com", "roproxy.com")
                 diagnostics.proxy_health["RoProxy"]["IsInCooldown"] = True
                 diagnostics.proxy_health["RoProxy"]["LastRequestTime"] = time.time()
-                delay(ROPROXY_COOLDOWN, lambda: reset_roproxy_cooldown()).start()
+                delay(runtime.get_setting("roproxy_cooldown"), lambda: reset_roproxy_cooldown()).start()
             else:
                 if len(tokens) == 0:
                     diagnostics.log_status_code(404)
                     diagnostics.log_request(method.upper(), False)
+                    diagnostics.log_reason(True)
                     return False, False, "No valid tokens available; please try again in ~65 seconds.", None, retries
 
                 current_token_index %= len(tokens)
@@ -118,7 +145,21 @@ def _request(
     if csrf_token is not None:
         headers["x-csrf-token"] = csrf_token
     cookies = {".ROBLOSECURITY": token} if token else None
-    req = requests.request(method, f"https://{url}", headers=headers, params=params, data=data, cookies=cookies)
+    try:
+        req = requests.request(
+            method,
+            f"https://{url}",
+            headers=headers,
+            params=params,
+            data=data,
+            cookies=cookies,
+            timeout=config.REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        diagnostics.log_request(method.upper(), False)
+        diagnostics.log_reason(True)
+        notify_error("Upstream request failed", f"{method.upper()} https://{url}\n\n{type(e).__name__}: {e}")
+        return False, False, "Upstream request failed; please try again later.", None, retries
     if token:
         diagnostics.update_token(token, used=True)
     elif "roproxy" in url:
@@ -138,15 +179,20 @@ def _request(
                 diagnostics.update_token(token, being_validated=True)
                 delay(TOKEN_EXPIRATION_COOLDOWN, lambda: validate_token(token)).start()
         retries += 1
-        if retries > MAX_RETRIES_PER_REQUEST - 1:
+        if retries > runtime.get_setting("max_retries_per_request") - 1:
+            diagnostics.log_reason(False)
             return False, False, req.text, None, retries
         else:
+            diagnostics.log_retry(429, "Rate limited (429); retrying")
             return False, True, None, None, retries
     elif req.status_code == 403 and "x-csrf-token" in req.headers:
+        diagnostics.log_retry(403, "CSRF token refresh")
         return False, True, None, req.headers.get("x-csrf-token"), retries
     elif req.status_code == 403 and "x-csrf-token" not in req.headers:
+        diagnostics.log_reason(False)
         return False, False, req.text, None, retries
     else:
+        diagnostics.log_reason(False)
         return False, False, f"Unexpected error {req.status_code}\n\n{req.text}", None, retries
 
 
@@ -157,3 +203,38 @@ def update_tokens(new_tokens: list[str]):
             if t not in tokens:
                 tokens.append(t)
                 diagnostics.update_token(t)
+
+
+def _revalidate_one(token: str):
+    global tokens
+    try:
+        req = requests.get(
+            "https://accountinformation.roblox.com/v1/birthdate",
+            cookies={".ROBLOSECURITY": token},
+            timeout=config.REQUEST_TIMEOUT,
+        )
+    except requests.RequestException:
+        return  # Couldn't reach Roblox; leave the token as-is.
+    with request_lock:
+        if req.status_code == 200:
+            diagnostics.update_token(token)
+        else:
+            if token in tokens:
+                tokens.remove(token)
+            diagnostics.proxy_health["Tokens"]["ExpiredCount"] += 1
+            diagnostics.tokens.pop(token, None)
+            diagnostics.proxy_health["Tokens"]["Count"] = len(diagnostics.tokens)
+
+
+def force_revalidate_tokens():
+    """Re-check every known token against Roblox; drop any that are no longer valid."""
+    global is_direct_api_in_cooldown, is_roproxy_in_cooldown
+    # Clear API cooldowns so traffic can flow again immediately after revalidation.
+    is_direct_api_in_cooldown = False
+    is_roproxy_in_cooldown = False
+    diagnostics.proxy_health["DirectAPI"]["IsInCooldown"] = False
+    diagnostics.proxy_health["RoProxy"]["IsInCooldown"] = False
+    with request_lock:
+        snapshot = list(tokens)
+    for t in snapshot:
+        delay(0, lambda tok=t: _revalidate_one(tok)).start()

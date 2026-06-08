@@ -216,6 +216,192 @@ const print = console.log;
 	}
 
 	// -----------------------------
+	// New renderers (expanded metrics)
+	// -----------------------------
+	function renderPause(d) {
+		const paused = Boolean(d?.Pause?.Paused);
+		const since = Number(d?.Pause?.PausedSince || 0);
+		const chip = $("#proxyStatusChip");
+		const btn = $("#pauseToggle");
+		const banner = $("#pauseBanner");
+		if (chip) {
+			chip.textContent = paused ? "Proxy: PAUSED" : "Proxy: Running";
+			chip.classList.toggle("chip--danger", paused);
+			chip.classList.toggle("chip--ok", !paused);
+		}
+		if (btn) {
+			btn.textContent = paused ? "Resume Proxy" : "Pause Proxy";
+			btn.classList.toggle("btn--filled", paused);
+			btn.classList.toggle("btn--warning", !paused);
+			btn.dataset.paused = String(paused);
+		}
+		if (banner) {
+			banner.hidden = !paused;
+			setText("pauseBannerSince", paused && since ? `(since ${toTS(since)})` : "");
+		}
+	}
+
+	function renderVisitors(d) {
+		const v = d.VisitorCounts || {};
+		setText("kpi_human", String(v.Human ?? 0));
+		setText("kpi_crawler", String(v.Crawler ?? 0));
+	}
+
+	function renderEndpoints(d) {
+		const tbody = $("#endpointsTable tbody");
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const entries = Object.entries(d.Endpoints || {});
+		entries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+		for (const [path, info] of entries) {
+			const methods = Object.entries(info.Methods || {})
+				.map(([m, n]) => `${m}:${n}`)
+				.join(", ");
+			tbody.appendChild(tr([path, String(info.Count || 0), methods || "—", toTS(info.LastRequestTime || 0)]));
+		}
+	}
+
+	function renderStatusDetailed(d) {
+		const tbody = $("#statusDetailedTable tbody");
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const entries = Object.entries(d.StatusCodesDetailed || {});
+		entries.sort((a, b) => Number(a[0]) - Number(b[0]));
+		for (const [code, count] of entries) {
+			tbody.appendChild(tr([code, String(count)]));
+		}
+	}
+
+	function renderRetries(d) {
+		const rc = d.RetryCounts || {};
+		setText("retryTotal", `${rc.Total || 0} total`);
+
+		const byStatus = $("#retryStatusTable tbody");
+		if (byStatus) {
+			byStatus.innerHTML = "";
+			for (const [code, n] of Object.entries(rc.ByStatusCode || {})) {
+				byStatus.appendChild(tr([code, String(n)]));
+			}
+		}
+		const byReason = $("#retryReasonTable tbody");
+		if (byReason) {
+			byReason.innerHTML = "";
+			for (const [reason, n] of Object.entries(rc.Reasons || {})) {
+				byReason.appendChild(tr([reason, String(n)]));
+			}
+		}
+		const reasons = d.ReasonCounts || {};
+		setText("reason_custom", String(reasons.Custom || 0));
+		setText("reason_roblox", String(reasons.Roblox || 0));
+	}
+
+	function renderExploitSummary(d) {
+		const tbody = $("#exploitSummaryTable tbody");
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const entries = Object.entries(d.ExploitSummary || {});
+		entries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+		for (const [reason, info] of entries) {
+			tbody.appendChild(tr([reason, String(info.Count || 0), toTS(info.LastSeen || 0)]));
+		}
+	}
+
+	function renderLiveFeed(d) {
+		const feed = $("#liveFeed");
+		if (!feed) return;
+		const items = Array.isArray(d.LiveRequests) ? d.LiveRequests : [];
+		setText("liveCount", `${items.length} shown`);
+		feed.innerHTML = "";
+		if (items.length === 0) {
+			const empty = document.createElement("p");
+			empty.className = "text-muted";
+			empty.textContent = "No requests recorded yet.";
+			feed.appendChild(empty);
+			return;
+		}
+		for (const item of items) {
+			const card = document.createElement("details");
+			card.className = "live-item";
+			const code = Number(item.StatusCode || 0);
+			const codeClass = code >= 200 && code < 300 ? "ok" : "bad";
+
+			const summary = document.createElement("summary");
+			summary.className = "live-item__summary";
+			summary.innerHTML =
+				`<span class="badge badge--method">${escapeHtml(item.Method || "?")}</span>` +
+				`<span class="badge badge--${codeClass}">${code || "?"}</span>` +
+				`<span class="live-item__url">${escapeHtml(item.URL || "")}</span>` +
+				`<span class="live-item__meta">${escapeHtml(item.IP || "")} • ${toTS(item.Date)}</span>`;
+			card.appendChild(summary);
+
+			const body = document.createElement("div");
+			body.className = "live-item__body";
+			const ua = escapeHtml(item.UserAgent || "—");
+			const headers = escapeHtml(JSON.stringify(item.Headers || {}, null, 2));
+			const reqBody = escapeHtml(item.Body || "");
+			body.innerHTML =
+				`<div class="live-item__row"><strong>User-Agent:</strong> ${ua}</div>` +
+				`<div class="live-item__row"><strong>Headers:</strong><pre>${headers}</pre></div>` +
+				(reqBody ? `<div class="live-item__row"><strong>Body:</strong><pre>${reqBody}</pre></div>` : "");
+			card.appendChild(body);
+			feed.appendChild(card);
+		}
+	}
+
+	function escapeHtml(s) {
+		return String(s)
+			.replaceAll("&", "&amp;")
+			.replaceAll("<", "&lt;")
+			.replaceAll(">", "&gt;")
+			.replaceAll('"', "&quot;");
+	}
+
+	const SETTING_LABELS = {
+		allowed_requests_per_minute: "Allowed requests per period",
+		throttle_reset_duration: "Throttle reset duration (s)",
+		stale_ip_duration: "Stale IP duration (s)",
+		direct_api_cooldown: "Direct API cooldown (s)",
+		roproxy_cooldown: "RoProxy cooldown (s)",
+		max_retries_per_request: "Max retries per request",
+		two_fa_expiration: "2FA code lifetime (s)",
+	};
+
+	function renderSettings(d) {
+		const tbody = $("#settingsTable tbody");
+		if (!tbody) return;
+		const settings = d.Settings || {};
+		tbody.innerHTML = "";
+		for (const [key, info] of Object.entries(settings)) {
+			const row = document.createElement("tr");
+
+			const tdName = document.createElement("td");
+			tdName.textContent = SETTING_LABELS[key] || key;
+
+			const tdCurrent = document.createElement("td");
+			tdCurrent.textContent = String(info.value);
+
+			const tdInput = document.createElement("td");
+			const input = document.createElement("input");
+			input.className = "input";
+			input.type = "number";
+			input.value = String(info.value);
+			input.min = String(info.min);
+			input.max = String(info.max);
+			input.dataset.setting = key;
+			tdInput.appendChild(input);
+
+			const tdRange = document.createElement("td");
+			tdRange.textContent = `${info.min} – ${info.max}`;
+
+			const tdUpdated = document.createElement("td");
+			tdUpdated.textContent = info.updated ? toTS(info.updated) : "—";
+
+			[tdName, tdCurrent, tdInput, tdRange, tdUpdated].forEach(td => row.appendChild(td));
+			tbody.appendChild(row);
+		}
+	}
+
+	// -----------------------------
 	// Data plumbing
 	// -----------------------------
 	async function fetchDiagnostics() {
@@ -229,6 +415,7 @@ const print = console.log;
 			const d = await fetchDiagnostics();
 			renderOverview(d);
 			renderPageVisits(d);
+			renderVisitors(d);
 			renderRequests(d);
 			renderProxyTimings(d);
 			renderTokens(d);
@@ -237,6 +424,13 @@ const print = console.log;
 			renderHealth(d);
 			renderCrawls(d);
 			renderThrottled?.(d);
+			renderPause(d);
+			renderEndpoints(d);
+			renderStatusDetailed(d);
+			renderRetries(d);
+			renderExploitSummary(d);
+			renderLiveFeed(d);
+			renderSettings(d);
 			showToast("Dashboard updated");
 		} catch (err) {
 			console.error(err);
@@ -436,6 +630,144 @@ const print = console.log;
 			btn.textContent = isOpen ? "Collapse" : "Expand";
 			btn.setAttribute("aria-expanded", String(isOpen));
 		});
+	});
+
+	// Pause / resume the proxy
+	$("#pauseToggle")?.addEventListener("click", async () => {
+		const currentlyPaused = $("#pauseToggle")?.dataset.paused === "true";
+		try {
+			const res = await fetch("/admin/proxy/toggle", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ paused: !currentlyPaused }),
+			});
+			if (!res.ok) throw new Error(String(res.status));
+			const state = await res.json();
+			renderPause({ Pause: state });
+			showToast(state.Paused ? "Proxy paused" : "Proxy resumed");
+		} catch (err) {
+			console.error(err);
+			showToast("Failed to change pause state");
+		}
+	});
+
+	// Auto-refresh
+	let autoRefreshTimer = null;
+	$("#autoRefreshToggle")?.addEventListener("change", e => {
+		if (e.target.checked) {
+			autoRefreshTimer = setInterval(refreshAll, 5000);
+			showToast("Auto-refresh on");
+		} else {
+			clearInterval(autoRefreshTimer);
+			autoRefreshTimer = null;
+			showToast("Auto-refresh off");
+		}
+	});
+
+	// Live feed manual refresh
+	$("#refreshLive")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			renderLiveFeed(d);
+			showToast("Live feed updated");
+		} catch {
+			showToast("Failed to refresh live feed");
+		}
+	});
+
+	// Settings: save changes
+	$("#settingsForm")?.addEventListener("submit", async e => {
+		e.preventDefault();
+		const inputs = $$("#settingsTable input[data-setting]");
+		const settings = {};
+		inputs.forEach(i => {
+			settings[i.dataset.setting] = Number(i.value);
+		});
+		try {
+			const res = await fetch("/admin/settings", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ settings }),
+			});
+			if (!res.ok) throw new Error(String(res.status));
+			await refreshAll();
+			showToast("Settings saved");
+		} catch (err) {
+			console.error(err);
+			showToast("Failed to save settings");
+		}
+	});
+	$("#reloadSettings")?.addEventListener("click", refreshAll);
+
+	// Endpoints export
+	$("#exportEndpoints")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			const lines = ["Endpoint,Count,Methods,LastRequestTime"];
+			for (const [path, info] of Object.entries(d.Endpoints || {})) {
+				const methods = Object.entries(info.Methods || {})
+					.map(([m, n]) => `${m}:${n}`)
+					.join(" ");
+				lines.push(toCSVRow([path, info.Count || 0, methods, info.LastRequestTime || 0]));
+			}
+			download(`roxy_endpoints_${Date.now()}.csv`, lines.join("\n"));
+			showToast("Endpoints exported");
+		} catch {
+			showToast("Export failed");
+		}
+	});
+
+	// Exploit summary export
+	$("#exportExploitSummary")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			const lines = ["Reason,Count,LastSeen"];
+			for (const [reason, info] of Object.entries(d.ExploitSummary || {})) {
+				lines.push(toCSVRow([reason, info.Count || 0, info.LastSeen || 0]));
+			}
+			download(`roxy_exploit_summary_${Date.now()}.csv`, lines.join("\n"));
+			showToast("Exploit summary exported");
+		} catch {
+			showToast("Export failed");
+		}
+	});
+
+	// Tools: download diagnostics JSON
+	$("#downloadJsonBtn")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			const a = document.createElement("a");
+			a.href = URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], { type: "application/json" }));
+			a.download = `roxy_diagnostics_${Date.now()}.json`;
+			a.click();
+			setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+			showToast("Diagnostics downloaded");
+		} catch {
+			showToast("Download failed");
+		}
+	});
+
+	// Tools: force revalidate tokens
+	$("#forceRevalidateBtn")?.addEventListener("click", async () => {
+		try {
+			const res = await fetch("/admin/tokens/force_revalidate", { method: "POST" });
+			if (!res.ok) throw new Error(String(res.status));
+			showToast("Token revalidation queued");
+			setTimeout(refreshAll, 1500);
+		} catch {
+			showToast("Revalidation failed");
+		}
+	});
+
+	// Tools: health check
+	$("#healthCheckBtn")?.addEventListener("click", async () => {
+		try {
+			const res = await fetch("/health");
+			const data = await res.json();
+			showToast(`Health: ${data.Status}${data.Paused ? " (paused)" : ""}`);
+		} catch {
+			showToast("Health check failed");
+		}
 	});
 
 	// Initial load

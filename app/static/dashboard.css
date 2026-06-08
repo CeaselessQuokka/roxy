@@ -645,3 +645,156 @@ a:hover {
 .collapsible-toggle {
 	min-width: 90px;
 }
+
+/* =============================
+   13) MOBILE SCROLL / OVERFLOW FIXES
+   ============================= */
+html,
+body {
+	min-height: 100%;
+	height: auto; /* allow content taller than viewport to scroll on mobile */
+}
+body {
+	overflow-x: hidden; /* prevent horizontal page scroll/cutoff */
+	-webkit-text-size-adjust: 100%;
+}
+.layout {
+	min-height: auto;
+}
+.main {
+	padding-bottom: 96px; /* keep last section clear of the toast on small screens */
+	min-width: 0;
+}
+.table-wrap {
+	-webkit-overflow-scrolling: touch; /* momentum scroll for wide tables on iOS */
+}
+@media (max-width: 980px) {
+	.app-bar {
+		flex-wrap: wrap;
+		gap: var(--pad-2);
+	}
+	.app-bar__section--end {
+		flex-wrap: wrap;
+	}
+	.main {
+		padding: var(--pad-3);
+		padding-bottom: 96px;
+	}
+	.table {
+		min-width: 520px;
+	}
+}
+
+/* =============================
+   14) PAUSE BANNER + STATUS CHIPS
+   ============================= */
+.pause-banner {
+	position: sticky;
+	top: 64px;
+	z-index: 40;
+	margin: 0;
+	padding: 12px var(--pad-4);
+	background: rgba(255, 107, 107, 0.16);
+	border-bottom: 1px solid var(--color-danger);
+	color: var(--color-text);
+	font-size: var(--fs-sm);
+}
+.pause-banner[hidden] {
+	display: none;
+}
+.chip--ok {
+	color: var(--color-success);
+	border-color: var(--color-success);
+}
+.chip--danger {
+	color: var(--color-danger);
+	border-color: var(--color-danger);
+	background: rgba(255, 107, 107, 0.12);
+}
+
+/* =============================
+   15) LIVE REQUEST FEED
+   ============================= */
+.live-feed {
+	display: grid;
+	gap: 8px;
+}
+.live-item {
+	border: 1px solid var(--color-outline);
+	border-radius: var(--radius-md);
+	background: var(--color-surface2);
+	overflow: hidden;
+}
+.live-item__summary {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 10px 12px;
+	cursor: pointer;
+	list-style: none;
+	flex-wrap: wrap;
+}
+.live-item__summary::-webkit-details-marker {
+	display: none;
+}
+.live-item__url {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: var(--fs-sm);
+	color: var(--color-text);
+	word-break: break-all;
+	flex: 1 1 240px;
+	min-width: 0;
+}
+.live-item__meta {
+	color: var(--color-text-muted);
+	font-size: var(--fs-xs);
+}
+.live-item__body {
+	padding: 12px;
+	border-top: 1px solid var(--color-outline);
+	display: grid;
+	gap: 8px;
+}
+.live-item__row {
+	font-size: var(--fs-sm);
+	color: var(--color-text-dim);
+	word-break: break-word;
+}
+.live-item__body pre {
+	margin: 6px 0 0 0;
+	padding: 8px;
+	background: var(--color-surface0);
+	border: 1px solid var(--color-outline);
+	border-radius: var(--radius-sm);
+	overflow: auto;
+	max-height: 280px;
+	font-size: var(--fs-xs);
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+/* Badges */
+.badge {
+	display: inline-flex;
+	align-items: center;
+	padding: 2px 8px;
+	border-radius: 999px;
+	font-size: var(--fs-xs);
+	font-weight: 600;
+	border: 1px solid var(--color-outline);
+}
+.badge--method {
+	background: rgba(124, 196, 255, 0.14);
+	color: var(--color-primary-strong);
+	border-color: var(--color-outline-strong);
+}
+.badge--ok {
+	background: rgba(105, 240, 174, 0.14);
+	color: var(--color-success);
+	border-color: var(--color-success);
+}
+.badge--bad {
+	background: rgba(255, 107, 107, 0.14);
+	color: var(--color-danger);
+	border-color: var(--color-danger);
+}

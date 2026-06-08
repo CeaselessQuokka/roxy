@@ -23,6 +23,8 @@
 				<h1 class="app-title">Roxy Admin</h1>
 			</div>
 			<div class="app-bar__section app-bar__section--end">
+				<span id="proxyStatusChip" class="chip" aria-live="polite" aria-atomic="true">Proxy: …</span>
+				<button type="button" class="btn btn--warning" id="pauseToggle">Pause Proxy</button>
 				<span id="sessionUser" class="chip" aria-live="polite" aria-atomic="true">admin</span>
 				<form id="logoutForm" action="/admin/logout" method="post" class="inline-form">
 					<button type="submit" class="btn btn--tonal" id="logoutBtn">Logout</button>
@@ -30,17 +32,28 @@
 			</div>
 		</header>
 
+		<!-- Paused banner -->
+		<div id="pauseBanner" class="pause-banner" role="alert" hidden>
+			⏸ The proxy is currently <strong>PAUSED</strong>. The site stays online, but proxy requests are
+			rejected. <span id="pauseBannerSince" class="text-dim"></span>
+		</div>
+
 		<!-- Layout: Nav + Main -->
 		<div class="layout">
 			<!-- Navigation -->
 			<nav id="appNav" class="nav" aria-label="Primary">
 				<ul class="nav__list">
 					<li><a class="nav__link is-active" href="#section-overview">Overview</a></li>
+					<li><a class="nav__link" href="#section-live">Live Requests</a></li>
+					<li><a class="nav__link" href="#section-endpoints">Endpoints</a></li>
 					<li><a class="nav__link" href="#section-tokens">Auth Tokens</a></li>
 					<li><a class="nav__link" href="#section-requests">Requests</a></li>
+					<li><a class="nav__link" href="#section-status">Status Codes</a></li>
+					<li><a class="nav__link" href="#section-retries">Retries</a></li>
 					<li><a class="nav__link" href="#section-proxy">Proxy Timings</a></li>
 					<li><a class="nav__link" href="#section-probes">Exploit / Probe Attempts</a></li>
 					<li><a class="nav__link" href="#section-logins">Admin Logins</a></li>
+					<li><a class="nav__link" href="#section-settings">Settings</a></li>
 					<li><a class="nav__link" href="#section-health">Health</a></li>
 					<li><a class="nav__link" href="#section-tools">Tools</a></li>
 				</ul>
@@ -55,6 +68,10 @@
 						<div class="section__actions">
 							<button id="refreshAll" class="btn btn--filled">Refresh</button>
 							<button id="exportAll" class="btn btn--outline">Export CSV</button>
+							<label class="switch">
+								<input type="checkbox" id="autoRefreshToggle" />
+								<span class="switch__label">Auto-refresh (5s)</span>
+							</label>
 						</div>
 					</div>
 
@@ -78,6 +95,18 @@
 						</article>
 
 						<article class="card kpi" aria-live="polite">
+							<h3 class="kpi__title">Human Visitors</h3>
+							<div class="kpi__value" id="kpi_human">0</div>
+							<div class="kpi__meta">Visitors with browser-like User-Agents</div>
+						</article>
+
+						<article class="card kpi" aria-live="polite">
+							<h3 class="kpi__title">Crawler Visitors</h3>
+							<div class="kpi__value" id="kpi_crawler">0</div>
+							<div class="kpi__meta">Likely bots / automated clients</div>
+						</article>
+
+						<article class="card kpi" aria-live="polite">
 							<h3 class="kpi__title">Home Page Visits</h3>
 							<div class="kpi__value" id="home_page_visits">0</div>
 							<div class="kpi__meta">Total visits to the home page</div>
@@ -94,6 +123,53 @@
 							<div class="kpi__value" id="robots_page_visits">0</div>
 							<div class="kpi__meta">Total crawls to the robots.txt file</div>
 						</article>
+					</div>
+				</section>
+
+				<!-- Live Request Feed -->
+				<section id="section-live" class="section" aria-labelledby="liveHeading">
+					<div class="section__header">
+						<h2 id="liveHeading" class="section__title">Live Requests</h2>
+						<div class="section__actions">
+							<span id="liveCount" class="chip">0 shown</span>
+							<button id="refreshLive" class="btn btn--outline">Refresh</button>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							Most recent proxied requests (newest first). Sensitive headers are redacted; bodies are
+							truncated.
+						</p>
+						<div id="liveFeed" class="live-feed">
+							<!-- populated by JS from LiveRequests[] -->
+						</div>
+					</div>
+				</section>
+
+				<!-- Endpoints -->
+				<section id="section-endpoints" class="section" aria-labelledby="endpointsHeading">
+					<div class="section__header">
+						<h2 id="endpointsHeading" class="section__title">Top Endpoints</h2>
+						<div class="section__actions">
+							<button id="exportEndpoints" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+					<div class="card">
+						<div class="table-wrap">
+							<table id="endpointsTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Endpoint</th>
+										<th scope="col">Count</th>
+										<th scope="col">Methods</th>
+										<th scope="col">Last Request</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- rows from Endpoints -->
+								</tbody>
+							</table>
+						</div>
 					</div>
 				</section>
 
@@ -234,6 +310,91 @@
 										<tr>
 											<td id="count_2xx">0</td>
 											<td id="count_4xx">0</td>
+										</tr>
+									</tbody>
+								</table>
+							</div>
+						</article>
+					</div>
+				</section>
+
+				<!-- Status Code Breakdown -->
+				<section id="section-status" class="section" aria-labelledby="statusHeading">
+					<div class="section__header">
+						<h2 id="statusHeading" class="section__title">Status Codes</h2>
+					</div>
+					<div class="card">
+						<div class="table-wrap">
+							<table id="statusDetailedTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Status Code</th>
+										<th scope="col">Count</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- rows from StatusCodesDetailed -->
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
+				<!-- Retries -->
+				<section id="section-retries" class="section" aria-labelledby="retriesHeading">
+					<div class="section__header">
+						<h2 id="retriesHeading" class="section__title">Retries</h2>
+						<div class="section__actions">
+							<span id="retryTotal" class="chip">0 total</span>
+						</div>
+					</div>
+					<div class="grid grid--cards">
+						<article class="card">
+							<h3 class="card__title">By Status Code</h3>
+							<div class="table-wrap">
+								<table id="retryStatusTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Status Code</th>
+											<th scope="col">Retries</th>
+										</tr>
+									</thead>
+									<tbody></tbody>
+								</table>
+							</div>
+						</article>
+						<article class="card">
+							<h3 class="card__title">By Reason</h3>
+							<div class="table-wrap">
+								<table id="retryReasonTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Reason</th>
+											<th scope="col">Retries</th>
+										</tr>
+									</thead>
+									<tbody></tbody>
+								</table>
+							</div>
+						</article>
+						<article class="card">
+							<h3 class="card__title">Returned Reasons</h3>
+							<div class="table-wrap">
+								<table id="reasonSourceTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Source</th>
+											<th scope="col">Count</th>
+										</tr>
+									</thead>
+									<tbody>
+										<tr>
+											<td>Custom (our message)</td>
+											<td id="reason_custom">0</td>
+										</tr>
+										<tr>
+											<td>Roblox (passthrough)</td>
+											<td id="reason_roblox">0</td>
 										</tr>
 									</tbody>
 								</table>
@@ -420,6 +581,34 @@
 					</div>
 				</section>
 
+				<!-- Exploit Summary (aggregated, persistent) -->
+				<section id="section-exploit-summary" class="section" aria-labelledby="exploitSummaryHeading">
+					<div class="section__header">
+						<h2 id="exploitSummaryHeading" class="section__title">Exploit / Probe Summary</h2>
+						<div class="section__actions">
+							<button id="exportExploitSummary" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							Aggregated probe/exploit reasons (bots scanning for vulnerabilities). Persists beyond the
+							recent-attempts list.
+						</p>
+						<div class="table-wrap">
+							<table id="exploitSummaryTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Reason</th>
+										<th scope="col">Count</th>
+										<th scope="col">Last Seen</th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
 				<!-- Admin Login Events -->
 				<section id="section-logins" class="section" aria-labelledby="loginsHeading">
 					<div class="section__header">
@@ -454,6 +643,44 @@
 								</table>
 							</div>
 						</div>
+					</div>
+				</section>
+
+				<!-- Runtime Settings -->
+				<section id="section-settings" class="section" aria-labelledby="settingsHeading">
+					<div class="section__header">
+						<h2 id="settingsHeading" class="section__title">Runtime Settings</h2>
+						<div class="section__actions">
+							<button id="reloadSettings" class="btn btn--outline">Reload</button>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							These values are what the server's internals are actually using right now. Changes apply
+							immediately (no restart) and persist to disk. "Updated" shows when each was last changed.
+						</p>
+						<form id="settingsForm" class="form">
+							<div class="table-wrap">
+								<table id="settingsTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Setting</th>
+											<th scope="col">Current</th>
+											<th scope="col">New Value</th>
+											<th scope="col">Range</th>
+											<th scope="col">Updated</th>
+										</tr>
+									</thead>
+									<tbody>
+										<!-- populated by JS from Settings -->
+									</tbody>
+								</table>
+							</div>
+							<div class="form__row">
+								<div class="spacer"></div>
+								<button type="submit" class="btn btn--filled" id="saveSettingsBtn">Save Changes</button>
+							</div>
+						</form>
 					</div>
 				</section>
 
@@ -504,26 +731,20 @@
 					<div class="grid grid--cards">
 						<article class="card">
 							<h3 class="card__title">Diagnostics JSON</h3>
-							<p class="card__desc">Download the current `get_diagnostics()` snapshot.</p>
-							<form class="inline-form" action="/admin/diagnostics" method="get">
-								<button class="btn btn--filled" type="submit">Download JSON</button>
-							</form>
+							<p class="card__desc">Download the current diagnostics snapshot.</p>
+							<button class="btn btn--filled" type="button" id="downloadJsonBtn">Download JSON</button>
 						</article>
 
 						<article class="card">
 							<h3 class="card__title">Force Revalidate Tokens</h3>
-							<p class="card__desc">Ask the proxy to re-check tokens (clears cooldowns).</p>
-							<form class="inline-form" action="/admin/tokens/force_revalidate" method="post">
-								<button class="btn btn--warning" type="submit">Force Revalidate</button>
-							</form>
+							<p class="card__desc">Re-check every token against Roblox and clear API cooldowns.</p>
+							<button class="btn btn--warning" type="button" id="forceRevalidateBtn">Force Revalidate</button>
 						</article>
 
 						<article class="card">
 							<h3 class="card__title">Health Check</h3>
-							<p class="card__desc">Ping internal /health endpoint.</p>
-							<form class="inline-form" action="/health" method="get">
-								<button class="btn btn--outline" type="submit">Run</button>
-							</form>
+							<p class="card__desc">Ping the internal /health endpoint.</p>
+							<button class="btn btn--outline" type="button" id="healthCheckBtn">Run</button>
 						</article>
 					</div>
 				</section>

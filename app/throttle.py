@@ -1,6 +1,6 @@
 import diagnostics
+import runtime
 import time
-from config import *
 from threading import Thread
 
 throttled_ips = dict(
@@ -18,10 +18,11 @@ def is_throttled(ip: str) -> bool:
 
 def get_requests_left(ip: str) -> int:
     global throttled_ips
+    allowed = runtime.get_setting("allowed_requests_per_minute")
     throttled_ip = throttled_ips.get(ip, None)
     if throttled_ip:
-        return max(0, ALLOWED_REQUESTS_PER_MINUTE - throttled_ip["Requests"])
-    return ALLOWED_REQUESTS_PER_MINUTE
+        return max(0, allowed - throttled_ip["Requests"])
+    return allowed
 
 
 def get_throttle_reset_time_left(ip: str) -> int:
@@ -37,29 +38,32 @@ def reset_throttle(ip: str):
     if ip in throttled_ips:
         throttled_ips[ip]["Throttled"] = False
         throttled_ips[ip]["Requests"] = 0
-        throttled_ips[ip]["ThrottleResetTime"] = time.time() + THROTTLE_RESET_DURATION
+        throttled_ips[ip]["ThrottleResetTime"] = time.time() + runtime.get_setting("throttle_reset_duration")
 
 
 def update_throttling(ip, made_request: bool = False):
     global throttled_ips
     now = time.time()
+    allowed = runtime.get_setting("allowed_requests_per_minute")
+    throttle_reset_duration = runtime.get_setting("throttle_reset_duration")
+    stale_ip_duration = runtime.get_setting("stale_ip_duration")
     throttled_ip = throttled_ips.get(ip, None)
     if throttled_ip:
         if throttled_ip["Throttled"]:
             return
-        if now > throttled_ip["LastRequestTime"] + STALE_IP_DURATION:
+        if now > throttled_ip["LastRequestTime"] + stale_ip_duration:
             throttled_ips.pop(ip, None)
             return
 
         if now > throttled_ip["ThrottleResetTime"]:
             throttled_ip["Throttled"] = False
             throttled_ip["Requests"] = 0
-            throttled_ip["ThrottleResetTime"] = now + THROTTLE_RESET_DURATION
+            throttled_ip["ThrottleResetTime"] = now + throttle_reset_duration
         if made_request:
             throttled_ip["Requests"] += 1
             throttled_ip["ThrottleResetTime"] += 1
             throttled_ip["LastRequestTime"] = now
-        if throttled_ip["Requests"] > ALLOWED_REQUESTS_PER_MINUTE:
+        if throttled_ip["Requests"] > allowed:
             throttled_ip["Throttled"] = True
             diagnostics.log_throttle(ip)
     else:
@@ -67,7 +71,7 @@ def update_throttling(ip, made_request: bool = False):
             Requests=1 if made_request else 0,
             Throttled=False,
             LastRequestTime=now,
-            ThrottleResetTime=now + THROTTLE_RESET_DURATION,
+            ThrottleResetTime=now + throttle_reset_duration,
         )
 
 
