@@ -1,10 +1,18 @@
 import config
 import copy
 import json
+import threading
 import time
 
 import runtime
 import storage
+
+# Guards all reads/writes of the shared in-memory stat structures below. Without
+# it, concurrent request threads (e.g. bots hammering a blocked endpoint) can
+# mutate a dict while another thread iterates it for eviction or JSON
+# serialization, raising "dictionary changed size during iteration". Reentrant
+# so a locked function can safely call another locked one.
+_state_lock = threading.RLock()
 
 exploit_attempts = list()
 login_attempts = list()
@@ -121,69 +129,74 @@ def _is_crawler(user_agent: str) -> bool:
 
 def log_page_visit(page: str):
     global page_visits
-    if page in page_visits:
-        page_visits[page] += 1
-    else:
-        page_visits[page] = 1
+    with _state_lock:
+        if page in page_visits:
+            page_visits[page] += 1
+        else:
+            page_visits[page] = 1
 
 
 def log_visitor(user_agent: str):
     """Classify a page visitor as likely-human or likely-crawler."""
-    if _is_crawler(user_agent):
-        visitor_counts["Crawler"] += 1
-    else:
-        visitor_counts["Human"] += 1
+    with _state_lock:
+        if _is_crawler(user_agent):
+            visitor_counts["Crawler"] += 1
+        else:
+            visitor_counts["Human"] += 1
 
 
 def decrement_admin_visit():
     """Subtract one admin page visit (used after a successful login to discount self-visits)."""
-    page_visits["admin"] = max(0, page_visits.get("admin", 0) - 1)
-
+    with _state_lock:
+        page_visits["admin"] = max(0, page_visits.get("admin", 0) - 1)
 
 
 def log_throttle(ip: str):
     global throttled_ips
     now = time.time()
-    if ip in throttled_ips:
-        throttled_ips[ip]["Count"] += 1
-        throttled_ips[ip]["LastThrottleTime"] = now
-    else:
-        throttled_ips[ip] = dict(LastThrottleTime=now, Count=1)
     cap = runtime.get_setting("max_throttle_records") or config.MAX_THROTTLE_RECORDS
-    if len(throttled_ips) > cap:
-        oldest_ip = min(throttled_ips.items(), key=lambda x: x[1]["LastThrottleTime"])[0]
-        throttled_ips.pop(oldest_ip, None)
+    with _state_lock:
+        if ip in throttled_ips:
+            throttled_ips[ip]["Count"] += 1
+            throttled_ips[ip]["LastThrottleTime"] = now
+        else:
+            throttled_ips[ip] = dict(LastThrottleTime=now, Count=1)
+        if len(throttled_ips) > cap:
+            oldest_ip = min(throttled_ips.items(), key=lambda x: x[1]["LastThrottleTime"])[0]
+            throttled_ips.pop(oldest_ip, None)
 
 
 def log_crawl(ip: str):
     global crawls
     now = time.time()
-    if ip in crawls:
-        crawls[ip]["Count"] += 1
-        crawls[ip]["LastRequestTime"] = now
-    else:
-        crawls[ip] = dict(LastRequestTime=now, Count=1)
     cap = runtime.get_setting("max_crawl_records") or config.MAX_CRAWL_RECORDS
-    if len(crawls) > cap:
-        oldest_ip = min(crawls.items(), key=lambda x: x[1]["LastRequestTime"])[0]
-        crawls.pop(oldest_ip, None)
+    with _state_lock:
+        if ip in crawls:
+            crawls[ip]["Count"] += 1
+            crawls[ip]["LastRequestTime"] = now
+        else:
+            crawls[ip] = dict(LastRequestTime=now, Count=1)
+        if len(crawls) > cap:
+            oldest_ip = min(crawls.items(), key=lambda x: x[1]["LastRequestTime"])[0]
+            crawls.pop(oldest_ip, None)
 
 
 def log_exploit_attempt(ip: str, reason: str, user_agent: str):
-    exploit_attempts.append(dict(IP=ip, Date=time.time(), Reason=reason, UserAgent=user_agent))
     cap = runtime.get_setting("max_exploit_records") or config.MAX_EXPLOIT_RECORDS
-    while len(exploit_attempts) > cap:
-        exploit_attempts.pop(0)
-    # Aggregate the reason so popular probes persist beyond the recent-list cap.
-    summary = exploit_summary.get(reason)
-    if summary:
-        summary["Count"] += 1
-        summary["LastSeen"] = time.time()
-    else:
-        exploit_summary[reason] = dict(Count=1, LastSeen=time.time())
-        if len(exploit_summary) > config.MAX_EXPLOIT_SUMMARY:
-            least = min(exploit_summary.items(), key=lambda kv: kv[1]["Count"])[0]
-            exploit_summary.pop(least, None)
+    with _state_lock:
+        exploit_attempts.append(dict(IP=ip, Date=time.time(), Reason=reason, UserAgent=user_agent))
+        while len(exploit_attempts) > cap:
+            exploit_attempts.pop(0)
+        # Aggregate the reason so popular probes persist beyond the recent-list cap.
+        summary = exploit_summary.get(reason)
+        if summary:
+            summary["Count"] += 1
+            summary["LastSeen"] = time.time()
+        else:
+            exploit_summary[reason] = dict(Count=1, LastSeen=time.time())
+            if len(exploit_summary) > config.MAX_EXPLOIT_SUMMARY:
+                least = min(exploit_summary.items(), key=lambda kv: kv[1]["Count"])[0]
+                exploit_summary.pop(least, None)
 
 
 def log_endpoint(path: str, method: str):
@@ -192,18 +205,19 @@ def log_endpoint(path: str, method: str):
     path = (path or "").split("?", 1)[0].strip("/")
     if not path:
         return
-    record = endpoints.get(path)
-    if record:
-        record["Count"] += 1
-        record["LastRequestTime"] = time.time()
-        record["Methods"][method] = record["Methods"].get(method, 0) + 1
-    else:
-        cap = runtime.get_setting("max_endpoint_records") or config.MAX_ENDPOINT_RECORDS
-        if len(endpoints) >= cap:
-            # Evict the least-frequent endpoint to make room.
-            least = min(endpoints.items(), key=lambda kv: kv[1]["Count"])[0]
-            endpoints.pop(least, None)
-        endpoints[path] = dict(Count=1, LastRequestTime=time.time(), Methods={method: 1})
+    cap = runtime.get_setting("max_endpoint_records") or config.MAX_ENDPOINT_RECORDS
+    with _state_lock:
+        record = endpoints.get(path)
+        if record:
+            record["Count"] += 1
+            record["LastRequestTime"] = time.time()
+            record["Methods"][method] = record["Methods"].get(method, 0) + 1
+        else:
+            if len(endpoints) >= cap:
+                # Evict the least-frequent endpoint to make room.
+                least = min(endpoints.items(), key=lambda kv: kv[1]["Count"])[0]
+                endpoints.pop(least, None)
+            endpoints[path] = dict(Count=1, LastRequestTime=time.time(), Methods={method: 1})
 
 
 def log_blocked_endpoint(path: str, method: str, ip: str, pattern: str):
@@ -212,129 +226,160 @@ def log_blocked_endpoint(path: str, method: str, ip: str, pattern: str):
     if not path:
         return
     now = time.time()
-    record = blocked_endpoint_attempts.get(path)
-    if record:
-        record["Count"] += 1
-        record["LastRequestTime"] = now
-        record["LastIP"] = ip
-        record["Pattern"] = pattern
-        record["Methods"][method] = record["Methods"].get(method, 0) + 1
-        record["IPs"][ip] = record["IPs"].get(ip, 0) + 1
-        if len(record["IPs"]) > 50:  # Keep only the busiest IPs per endpoint.
-            least = min(record["IPs"].items(), key=lambda kv: kv[1])[0]
-            record["IPs"].pop(least, None)
-    else:
-        cap = runtime.get_setting("max_endpoint_records") or config.MAX_ENDPOINT_RECORDS
-        if len(blocked_endpoint_attempts) >= cap:
-            least = min(blocked_endpoint_attempts.items(), key=lambda kv: kv[1]["Count"])[0]
-            blocked_endpoint_attempts.pop(least, None)
-        blocked_endpoint_attempts[path] = dict(
-            Count=1, LastRequestTime=now, Pattern=pattern, LastIP=ip, Methods={method: 1}, IPs={ip: 1}
-        )
+    cap = runtime.get_setting("max_endpoint_records") or config.MAX_ENDPOINT_RECORDS
+    with _state_lock:
+        record = blocked_endpoint_attempts.get(path)
+        if record:
+            record["Count"] += 1
+            record["LastRequestTime"] = now
+            record["LastIP"] = ip
+            record["Pattern"] = pattern
+            record["Methods"][method] = record["Methods"].get(method, 0) + 1
+            record["IPs"][ip] = record["IPs"].get(ip, 0) + 1
+            if len(record["IPs"]) > 50:  # Keep only the busiest IPs per endpoint.
+                least = min(record["IPs"].items(), key=lambda kv: kv[1])[0]
+                record["IPs"].pop(least, None)
+        else:
+            if len(blocked_endpoint_attempts) >= cap:
+                least = min(blocked_endpoint_attempts.items(), key=lambda kv: kv[1]["Count"])[0]
+                blocked_endpoint_attempts.pop(least, None)
+            blocked_endpoint_attempts[path] = dict(
+                Count=1, LastRequestTime=now, Pattern=pattern, LastIP=ip, Methods={method: 1}, IPs={ip: 1}
+            )
 
 
 def log_retry(status_code: int, reason: str = ""):
     """Record that a proxied request was retried, with the triggering status/reason."""
-    retry_counts["Total"] += 1
-    code = str(status_code)
-    retry_counts["ByStatusCode"][code] = retry_counts["ByStatusCode"].get(code, 0) + 1
-    if reason:
-        retry_counts["Reasons"][reason] = retry_counts["Reasons"].get(reason, 0) + 1
+    with _state_lock:
+        retry_counts["Total"] += 1
+        code = str(status_code)
+        retry_counts["ByStatusCode"][code] = retry_counts["ByStatusCode"].get(code, 0) + 1
+        if reason:
+            retry_counts["Reasons"][reason] = retry_counts["Reasons"].get(reason, 0) + 1
 
 
 def log_reason(is_custom: bool):
     """Record whether a returned error reason was our own message or Roblox's passthrough."""
-    if is_custom:
-        reason_counts["Custom"] += 1
-    else:
-        reason_counts["Roblox"] += 1
+    with _state_lock:
+        if is_custom:
+            reason_counts["Custom"] += 1
+        else:
+            reason_counts["Roblox"] += 1
 
 
 def log_live_request(entry: dict):
     """Append a recent request to the live feed ring buffer."""
-    live_requests.append(entry)
     cap = runtime.get_setting("max_live_requests") or config.MAX_LIVE_REQUESTS
-    while len(live_requests) > cap:
-        live_requests.pop(0)
+    with _state_lock:
+        live_requests.append(entry)
+        while len(live_requests) > cap:
+            live_requests.pop(0)
 
 
 def log_login_attempt(ip: str, successful: bool):
-    login_attempts.append(dict(IP=ip, Date=time.time(), Successful=successful))
     cap = runtime.get_setting("max_login_records") or config.MAX_LOGIN_RECORDS
-    while len(login_attempts) > cap:
-        login_attempts.pop(0)
+    with _state_lock:
+        login_attempts.append(dict(IP=ip, Date=time.time(), Successful=successful))
+        while len(login_attempts) > cap:
+            login_attempts.pop(0)
 
 
 def log_request(method: str, successful: bool):
-    if method in request_counts:
-        if successful:
-            request_counts[method]["Successful"] += 1
-        else:
-            request_counts[method]["Failed"] += 1
+    with _state_lock:
+        if method in request_counts:
+            if successful:
+                request_counts[method]["Successful"] += 1
+            else:
+                request_counts[method]["Failed"] += 1
 
 
 def log_status_code(status_code: int):
-    if 200 <= status_code < 300:
-        status_code_counts["2xx"] += 1
-    elif 400 <= status_code < 500:
-        status_code_counts["4xx"] += 1
-    # Detailed per-code breakdown (covers 1xx/3xx/5xx too).
-    code = str(status_code)
-    status_codes_detailed[code] = status_codes_detailed.get(code, 0) + 1
+    with _state_lock:
+        if 200 <= status_code < 300:
+            status_code_counts["2xx"] += 1
+        elif 400 <= status_code < 500:
+            status_code_counts["4xx"] += 1
+        # Detailed per-code breakdown (covers 1xx/3xx/5xx too).
+        code = str(status_code)
+        status_codes_detailed[code] = status_codes_detailed.get(code, 0) + 1
 
 
 def log_proxy_request(method: str, duration: float):
-    if method in proxy_request_counts:
-        proxy_request_counts[method]["TotalTime"] += duration
-        proxy_request_counts[method]["Count"] += 1
-        proxy_request_counts[method]["LastRequestTime"] = time.time()
-        if duration < proxy_request_counts[method]["Min"] or proxy_request_counts[method]["Min"] == 0:
-            proxy_request_counts[method]["Min"] = duration
-        if duration > proxy_request_counts[method]["Max"]:
-            proxy_request_counts[method]["Max"] = duration
+    with _state_lock:
+        if method in proxy_request_counts:
+            proxy_request_counts[method]["TotalTime"] += duration
+            proxy_request_counts[method]["Count"] += 1
+            proxy_request_counts[method]["LastRequestTime"] = time.time()
+            if duration < proxy_request_counts[method]["Min"] or proxy_request_counts[method]["Min"] == 0:
+                proxy_request_counts[method]["Min"] = duration
+            if duration > proxy_request_counts[method]["Max"]:
+                proxy_request_counts[method]["Max"] = duration
 
 
 def update_token(token: str, being_validated: bool = False, used: bool = False):
     global tokens
     masked = f"...{token[-20:]}"
-    if token in tokens:
-        tokens[token]["BeingValidated"] = being_validated
-        if used:
-            tokens[token]["Uses"] += 1
-    else:
-        tokens[token] = dict(
-            Masked=masked,
-            BeingValidated=being_validated,
-            Uses=tokens.get(token, {}).get("Uses", 0) + (1 if used else 0),
-        )
-    proxy_health["Tokens"]["Count"] = len(tokens)
-    proxy_health["Tokens"]["BeingValidatedCount"] = sum(1 for t in tokens.values() if t["BeingValidated"])
+    with _state_lock:
+        if token in tokens:
+            tokens[token]["BeingValidated"] = being_validated
+            if used:
+                tokens[token]["Uses"] += 1
+        else:
+            tokens[token] = dict(
+                Masked=masked,
+                BeingValidated=being_validated,
+                Uses=tokens.get(token, {}).get("Uses", 0) + (1 if used else 0),
+            )
+        proxy_health["Tokens"]["Count"] = len(tokens)
+        proxy_health["Tokens"]["BeingValidatedCount"] = sum(1 for t in tokens.values() if t["BeingValidated"])
+
+
+def remove_token(token: str, expired: bool = False):
+    """Remove a token from the diagnostics view (thread-safe). Used by the proxy."""
+    with _state_lock:
+        if token in tokens:
+            tokens.pop(token, None)
+        if expired:
+            proxy_health["Tokens"]["ExpiredCount"] += 1
+        proxy_health["Tokens"]["Count"] = len(tokens)
+        proxy_health["Tokens"]["BeingValidatedCount"] = sum(1 for t in tokens.values() if t["BeingValidated"])
+
+
+def clear_tokens():
+    """Drop all tokens from the diagnostics view (thread-safe)."""
+    with _state_lock:
+        tokens.clear()
+        proxy_health["Tokens"]["Count"] = 0
+        proxy_health["Tokens"]["BeingValidatedCount"] = 0
 
 
 def get_diagnostics() -> dict:
     global tokens
-    return dict(
-        {
-            "PageVisits": page_visits,
-            "VisitorCounts": visitor_counts,
-            "ThrottledIPs": throttled_ips,
-            "ExploitAttempts": exploit_attempts,
-            "ExploitSummary": exploit_summary,
-            "LoginAttempts": login_attempts,
-            "RequestCounts": request_counts,
-            "StatusCodeCounts": status_code_counts,
-            "StatusCodesDetailed": status_codes_detailed,
-            "ProxyRequestCounts": proxy_request_counts,
-            "ProxyHealth": proxy_health,
-            "Crawls": crawls,
-            "Endpoints": endpoints,
-            "BlockedEndpointAttempts": blocked_endpoint_attempts,
-            "RetryCounts": retry_counts,
-            "ReasonCounts": reason_counts,
-            "LiveRequests": list(reversed(live_requests)),  # Most-recent first.
-            "Tokens": copy.deepcopy(list(tokens.values())),
-        }
-    )
+    with _state_lock:
+        # Deep-copy the whole snapshot under the lock so no other thread can
+        # mutate a structure while Flask iterates it during JSON serialization.
+        return copy.deepcopy(
+            {
+                "PageVisits": page_visits,
+                "VisitorCounts": visitor_counts,
+                "ThrottledIPs": throttled_ips,
+                "ExploitAttempts": exploit_attempts,
+                "ExploitSummary": exploit_summary,
+                "LoginAttempts": login_attempts,
+                "RequestCounts": request_counts,
+                "StatusCodeCounts": status_code_counts,
+                "StatusCodesDetailed": status_codes_detailed,
+                "ProxyRequestCounts": proxy_request_counts,
+                "ProxyHealth": proxy_health,
+                "Crawls": crawls,
+                "Endpoints": endpoints,
+                "BlockedEndpointAttempts": blocked_endpoint_attempts,
+                "RetryCounts": retry_counts,
+                "ReasonCounts": reason_counts,
+                "LiveRequests": list(reversed(live_requests)),  # Most-recent first.
+                "Tokens": list(tokens.values()),
+            }
+        )
 
 
 # --- Persistence ------------------------------------------------------------
@@ -361,26 +406,28 @@ _PERSISTED_NAMES = (
 
 def serialize() -> dict:
     g = globals()
-    # Deep-copy so callers serialize a stable snapshot.
-    return {name: copy.deepcopy(g[name]) for name in _PERSISTED_NAMES}
+    with _state_lock:
+        # Deep-copy so callers serialize a stable snapshot.
+        return {name: copy.deepcopy(g[name]) for name in _PERSISTED_NAMES}
 
 
 def restore(data: dict):
     if not isinstance(data, dict):
         return
     g = globals()
-    for name in _PERSISTED_NAMES:
-        value = data.get(name)
-        if value is None:
-            continue
-        existing = g[name]
-        # Merge into the existing container so module-level references stay valid.
-        if isinstance(existing, dict) and isinstance(value, dict):
-            existing.clear()
-            existing.update(value)
-        elif isinstance(existing, list) and isinstance(value, list):
-            existing.clear()
-            existing.extend(value)
+    with _state_lock:
+        for name in _PERSISTED_NAMES:
+            value = data.get(name)
+            if value is None:
+                continue
+            existing = g[name]
+            # Merge into the existing container so module-level references stay valid.
+            if isinstance(existing, dict) and isinstance(value, dict):
+                existing.clear()
+                existing.update(value)
+            elif isinstance(existing, list) and isinstance(value, list):
+                existing.clear()
+                existing.extend(value)
 
 
 # --- Cross-worker stat merging ----------------------------------------------

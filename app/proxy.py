@@ -70,10 +70,7 @@ def validate_token(token: str):
                 tokens.append(token)
                 diagnostics.update_token(token)
         else:
-            diagnostics.proxy_health["Tokens"]["ExpiredCount"] += 1
-            if token in diagnostics.tokens:
-                diagnostics.tokens.pop(token, None)
-                diagnostics.proxy_health["Tokens"]["Count"] = len(diagnostics.tokens)
+            diagnostics.remove_token(token, expired=True)
             if time.time() - email_last_sent > (runtime.get_setting("email_cooldown") or config.EMAIL_COOLDOWN):
                 email_last_sent = time.time()
                 mail.send(
@@ -214,11 +211,8 @@ def set_tokens(new_tokens: list[str]) -> int:
         if t and t not in cleaned:
             cleaned.append(t)
     with request_lock:
-        for old in list(diagnostics.tokens.keys()):
-            diagnostics.tokens.pop(old, None)
         tokens = cleaned
-        diagnostics.proxy_health["Tokens"]["Count"] = 0
-        diagnostics.proxy_health["Tokens"]["BeingValidatedCount"] = 0
+        diagnostics.clear_tokens()
         for t in tokens:
             diagnostics.update_token(t)
     return len(tokens)
@@ -240,9 +234,7 @@ def _revalidate_one(token: str):
         else:
             if token in tokens:
                 tokens.remove(token)
-            diagnostics.proxy_health["Tokens"]["ExpiredCount"] += 1
-            diagnostics.tokens.pop(token, None)
-            diagnostics.proxy_health["Tokens"]["Count"] = len(diagnostics.tokens)
+            diagnostics.remove_token(token, expired=True)
 
 
 def force_revalidate_tokens():
