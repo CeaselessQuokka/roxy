@@ -9,6 +9,13 @@ throttled_ips = dict(
     }
 )
 
+# Per-(IP, endpoint) rate limiting for endpoints that have a runtime rule set.
+endpoint_buckets = dict(
+    {
+        # "ip|pattern": {Count: int, ResetTime: float},
+    }
+)
+
 
 def is_throttled(ip: str) -> bool:
     global throttled_ips
@@ -39,6 +46,36 @@ def reset_throttle(ip: str):
         throttled_ips[ip]["Throttled"] = False
         throttled_ips[ip]["Requests"] = 0
         throttled_ips[ip]["ThrottleResetTime"] = time.time() + runtime.get_setting("throttle_reset_duration")
+
+
+def check_endpoint_limit(ip: str, path: str) -> tuple[bool, int]:
+    """Enforce a per-(IP, endpoint) rate rule, if one matches the path.
+
+    Counts the request when allowed. Returns (allowed, seconds_until_reset).
+    The effective limit is clamped to the global per-IP limit, so an endpoint
+    rule can only ever make access MORE restrictive — never bypass the max.
+    """
+    global endpoint_buckets
+    rule = runtime.match_endpoint_rule(path)
+    if not rule:
+        return True, 0
+    pattern = rule["Pattern"]
+    limit = int(rule.get("Limit", 1))
+    period = int(rule.get("Period", 60))
+    global_allowed = runtime.get_setting("allowed_requests_per_minute")
+    if global_allowed:
+        limit = min(limit, global_allowed)
+
+    now = time.time()
+    key = f"{ip}|{pattern}"
+    bucket = endpoint_buckets.get(key)
+    if not bucket or now > bucket["ResetTime"]:
+        bucket = dict(Count=0, ResetTime=now + period)
+        endpoint_buckets[key] = bucket
+    if bucket["Count"] >= limit:
+        return False, int(max(0, bucket["ResetTime"] - now))
+    bucket["Count"] += 1
+    return True, 0
 
 
 def update_throttling(ip, made_request: bool = False):
@@ -76,11 +113,15 @@ def update_throttling(ip, made_request: bool = False):
 
 
 def run_throttle_loop():
-    global throttled_ips
+    global throttled_ips, endpoint_buckets
     while True:
         ips = list(throttled_ips.keys())
         for ip in ips:
             update_throttling(ip)
+        # Drop expired per-endpoint buckets so memory doesn't grow unbounded.
+        now = time.time()
+        for key in [k for k, b in list(endpoint_buckets.items()) if now > b["ResetTime"] + 60]:
+            endpoint_buckets.pop(key, None)
         time.sleep(1)
 
 

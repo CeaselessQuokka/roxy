@@ -151,6 +151,8 @@ def admin_diagnostics():
     data = diagnostics.get_diagnostics()
     data["Pause"] = runtime.get_pause_state()
     data["Settings"] = runtime.get_settings()
+    data["EndpointBlocks"] = runtime.get_endpoint_blocks()
+    data["EndpointRules"] = runtime.get_endpoint_rules()
     return jsonify(data)
 
 
@@ -160,8 +162,8 @@ def admin_set_tokens():
     data = request.json
     if not "tokens" in data:
         return "Missing tokens", 400
-    proxy.update_tokens(data["tokens"])
-    return "Success", 200
+    count = proxy.set_tokens(data["tokens"])
+    return jsonify({"Count": count}), 200
 
 
 @app.route("/admin/logout", methods=["POST"], endpoint="admin_logout")
@@ -205,6 +207,52 @@ def admin_settings():
 def admin_force_revalidate():
     proxy.force_revalidate_tokens()
     return jsonify("Revalidation queued"), 200
+
+
+@app.route("/admin/endpoints/block", methods=["POST"], endpoint="admin_block_endpoint")
+@requires_admin
+def admin_block_endpoint():
+    data = request.json if request.is_json else None
+    if not isinstance(data, dict) or not data.get("pattern"):
+        return "Missing pattern", 400
+    ok, message = runtime.block_endpoint(data["pattern"], data.get("note", ""))
+    status = 200 if ok else 400
+    return jsonify({"Message": message, "EndpointBlocks": runtime.get_endpoint_blocks()}), status
+
+
+@app.route("/admin/endpoints/unblock", methods=["POST"], endpoint="admin_unblock_endpoint")
+@requires_admin
+def admin_unblock_endpoint():
+    data = request.json if request.is_json else None
+    if not isinstance(data, dict) or not data.get("pattern"):
+        return "Missing pattern", 400
+    ok, message = runtime.unblock_endpoint(data["pattern"])
+    status = 200 if ok else 400
+    return jsonify({"Message": message, "EndpointBlocks": runtime.get_endpoint_blocks()}), status
+
+
+@app.route("/admin/endpoints/rule", methods=["POST"], endpoint="admin_set_endpoint_rule")
+@requires_admin
+def admin_set_endpoint_rule():
+    data = request.json if request.is_json else None
+    if not isinstance(data, dict) or not data.get("pattern"):
+        return "Missing pattern", 400
+    ok, message = runtime.set_endpoint_rule(
+        data["pattern"], data.get("limit"), data.get("period", config.DEFAULT_ENDPOINT_RULE_PERIOD)
+    )
+    status = 200 if ok else 400
+    return jsonify({"Message": message, "EndpointRules": runtime.get_endpoint_rules()}), status
+
+
+@app.route("/admin/endpoints/rule/clear", methods=["POST"], endpoint="admin_clear_endpoint_rule")
+@requires_admin
+def admin_clear_endpoint_rule():
+    data = request.json if request.is_json else None
+    if not isinstance(data, dict) or not data.get("pattern"):
+        return "Missing pattern", 400
+    ok, message = runtime.clear_endpoint_rule(data["pattern"])
+    status = 200 if ok else 400
+    return jsonify({"Message": message, "EndpointRules": runtime.get_endpoint_rules()}), status
 
 
 @app.route("/admin/invalidate/<token>", methods=["GET"], endpoint="admin_invalidate")
@@ -351,6 +399,24 @@ def proxy_page(dst: str):
         resp.headers["Roxy-Throttle-Reset"] = throttle.get_throttle_reset_time_left(ip)
         resp.headers["Roxy-Throttled"] = "False"
         return resp, 404
+
+    if runtime.is_endpoint_blocked(dst):
+        diagnostics.log_blocked_endpoint(dst, request.method, ip, runtime.get_matching_block(dst))
+        resp = jsonify("This endpoint is currently blocked.")
+        resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
+        resp.headers["Roxy-Throttle-Reset"] = throttle.get_throttle_reset_time_left(ip)
+        resp.headers["Roxy-Throttled"] = "False"
+        resp.headers["Roxy-Blocked"] = "True"
+        return resp, 403
+
+    endpoint_allowed, endpoint_retry = throttle.check_endpoint_limit(ip, dst)
+    if not endpoint_allowed:
+        resp = jsonify(f"This endpoint is rate-limited for you; try again in {endpoint_retry} seconds.")
+        resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
+        resp.headers["Roxy-Throttle-Reset"] = endpoint_retry
+        resp.headers["Roxy-Throttled"] = "True"
+        resp.headers["Roxy-Endpoint-Limited"] = "True"
+        return resp, 429
 
     throttle.update_throttling(ip, made_request=True)
     diagnostics.log_endpoint(dst, request.method)

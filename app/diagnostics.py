@@ -1,7 +1,9 @@
 import config
 import copy
+import json
 import time
 
+import runtime
 import storage
 
 exploit_attempts = list()
@@ -82,6 +84,9 @@ status_codes_detailed = dict()
 # Endpoint popularity: "service.roblox.com/path" -> {Count, LastRequestTime, Methods: {GET: n, ...}}.
 endpoints = dict()
 
+# Attempts to reach a blocked endpoint: path -> {Count, LastRequestTime, Pattern, LastIP, Methods, IPs}.
+blocked_endpoint_attempts = dict()
+
 # Retry metrics: how often requests were retried, by status code and reason.
 retry_counts = dict(
     {
@@ -144,7 +149,8 @@ def log_throttle(ip: str):
         throttled_ips[ip]["LastThrottleTime"] = now
     else:
         throttled_ips[ip] = dict(LastThrottleTime=now, Count=1)
-    if len(throttled_ips) > config.MAX_THROTTLE_RECORDS:
+    cap = runtime.get_setting("max_throttle_records") or config.MAX_THROTTLE_RECORDS
+    if len(throttled_ips) > cap:
         oldest_ip = min(throttled_ips.items(), key=lambda x: x[1]["LastThrottleTime"])[0]
         throttled_ips.pop(oldest_ip, None)
 
@@ -157,14 +163,16 @@ def log_crawl(ip: str):
         crawls[ip]["LastRequestTime"] = now
     else:
         crawls[ip] = dict(LastRequestTime=now, Count=1)
-    if len(crawls) > config.MAX_CRAWL_RECORDS:
+    cap = runtime.get_setting("max_crawl_records") or config.MAX_CRAWL_RECORDS
+    if len(crawls) > cap:
         oldest_ip = min(crawls.items(), key=lambda x: x[1]["LastRequestTime"])[0]
         crawls.pop(oldest_ip, None)
 
 
 def log_exploit_attempt(ip: str, reason: str, user_agent: str):
     exploit_attempts.append(dict(IP=ip, Date=time.time(), Reason=reason, UserAgent=user_agent))
-    if len(exploit_attempts) > config.MAX_EXPLOIT_RECORDS:
+    cap = runtime.get_setting("max_exploit_records") or config.MAX_EXPLOIT_RECORDS
+    while len(exploit_attempts) > cap:
         exploit_attempts.pop(0)
     # Aggregate the reason so popular probes persist beyond the recent-list cap.
     summary = exploit_summary.get(reason)
@@ -190,11 +198,39 @@ def log_endpoint(path: str, method: str):
         record["LastRequestTime"] = time.time()
         record["Methods"][method] = record["Methods"].get(method, 0) + 1
     else:
-        if len(endpoints) >= config.MAX_ENDPOINT_RECORDS:
+        cap = runtime.get_setting("max_endpoint_records") or config.MAX_ENDPOINT_RECORDS
+        if len(endpoints) >= cap:
             # Evict the least-frequent endpoint to make room.
             least = min(endpoints.items(), key=lambda kv: kv[1]["Count"])[0]
             endpoints.pop(least, None)
         endpoints[path] = dict(Count=1, LastRequestTime=time.time(), Methods={method: 1})
+
+
+def log_blocked_endpoint(path: str, method: str, ip: str, pattern: str):
+    """Record an attempt to reach a blocked endpoint, keeping the most-frequent ones."""
+    path = (path or "").split("?", 1)[0].strip("/")
+    if not path:
+        return
+    now = time.time()
+    record = blocked_endpoint_attempts.get(path)
+    if record:
+        record["Count"] += 1
+        record["LastRequestTime"] = now
+        record["LastIP"] = ip
+        record["Pattern"] = pattern
+        record["Methods"][method] = record["Methods"].get(method, 0) + 1
+        record["IPs"][ip] = record["IPs"].get(ip, 0) + 1
+        if len(record["IPs"]) > 50:  # Keep only the busiest IPs per endpoint.
+            least = min(record["IPs"].items(), key=lambda kv: kv[1])[0]
+            record["IPs"].pop(least, None)
+    else:
+        cap = runtime.get_setting("max_endpoint_records") or config.MAX_ENDPOINT_RECORDS
+        if len(blocked_endpoint_attempts) >= cap:
+            least = min(blocked_endpoint_attempts.items(), key=lambda kv: kv[1]["Count"])[0]
+            blocked_endpoint_attempts.pop(least, None)
+        blocked_endpoint_attempts[path] = dict(
+            Count=1, LastRequestTime=now, Pattern=pattern, LastIP=ip, Methods={method: 1}, IPs={ip: 1}
+        )
 
 
 def log_retry(status_code: int, reason: str = ""):
@@ -217,13 +253,15 @@ def log_reason(is_custom: bool):
 def log_live_request(entry: dict):
     """Append a recent request to the live feed ring buffer."""
     live_requests.append(entry)
-    while len(live_requests) > config.MAX_LIVE_REQUESTS:
+    cap = runtime.get_setting("max_live_requests") or config.MAX_LIVE_REQUESTS
+    while len(live_requests) > cap:
         live_requests.pop(0)
 
 
 def log_login_attempt(ip: str, successful: bool):
     login_attempts.append(dict(IP=ip, Date=time.time(), Successful=successful))
-    if len(login_attempts) > config.MAX_LOGIN_RECORDS:
+    cap = runtime.get_setting("max_login_records") or config.MAX_LOGIN_RECORDS
+    while len(login_attempts) > cap:
         login_attempts.pop(0)
 
 
@@ -290,6 +328,7 @@ def get_diagnostics() -> dict:
             "ProxyHealth": proxy_health,
             "Crawls": crawls,
             "Endpoints": endpoints,
+            "BlockedEndpointAttempts": blocked_endpoint_attempts,
             "RetryCounts": retry_counts,
             "ReasonCounts": reason_counts,
             "LiveRequests": list(reversed(live_requests)),  # Most-recent first.
@@ -313,6 +352,7 @@ _PERSISTED_NAMES = (
     "crawls",
     "throttled_ips",
     "endpoints",
+    "blocked_endpoint_attempts",
     "retry_counts",
     "reason_counts",
     "live_requests",
@@ -321,7 +361,7 @@ _PERSISTED_NAMES = (
 
 def serialize() -> dict:
     g = globals()
-    # Deep-copy so the autosave thread serializes a stable snapshot.
+    # Deep-copy so callers serialize a stable snapshot.
     return {name: copy.deepcopy(g[name]) for name in _PERSISTED_NAMES}
 
 
@@ -343,14 +383,101 @@ def restore(data: dict):
             existing.extend(value)
 
 
-def _bootstrap():
-    """Load persisted diagnostics + runtime state on import and start autosaving."""
-    import runtime  # Imported here to avoid an import cycle at module load.
+# --- Cross-worker stat merging ----------------------------------------------
+# Counters are additive, so each worker tracks how much it has counted since the
+# last flush (the "baseline") and merges only that delta into the shared file.
+# Min/Max/Last* fields combine idempotently; recent-event lists union + dedup + cap.
+_baseline = None
 
+_MAX_KEYS = {"Max", "LastRequestTime", "LastThrottleTime", "LastSeen"}
+_MIN_KEYS = {"Min"}
+_LIST_CAP_SETTINGS = {
+    "exploit_attempts": ("max_exploit_records", config.MAX_EXPLOIT_RECORDS),
+    "login_attempts": ("max_login_records", config.MAX_LOGIN_RECORDS),
+    "live_requests": ("max_live_requests", config.MAX_LIVE_REQUESTS),
+}
+
+
+def _list_cap(key: str) -> int:
+    setting, fallback = _LIST_CAP_SETTINGS.get(key, (None, 50))
+    return (runtime.get_setting(setting) if setting else None) or fallback
+
+
+def _merge_list(key, shared_list, local_list):
+    cap = _list_cap(key)
+    combined = list(local_list) + list(shared_list)
+    combined.sort(key=lambda item: item.get("Date", 0) if isinstance(item, dict) else 0, reverse=True)
+    seen = set()
+    out = []
+    for item in combined:
+        sig = json.dumps(item, sort_keys=True, separators=(",", ":"), default=str)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(item)
+        if cap and len(out) >= cap:
+            break
+    out.reverse()  # Store oldest-first to match append/pop(0) semantics.
+    return out
+
+
+def _merge_value(key, shared_v, local_v, base_v):
+    if isinstance(local_v, dict):
+        shared = shared_v if isinstance(shared_v, dict) else {}
+        base = base_v if isinstance(base_v, dict) else {}
+        merged = copy.deepcopy(shared)
+        for k in set(local_v) | set(merged):
+            lv = local_v.get(k)
+            if lv is None:
+                continue  # Key only the shared file has; keep it as-is.
+            merged[k] = _merge_value(k, merged.get(k), lv, base.get(k))
+        return merged
+    if isinstance(local_v, list):
+        return _merge_list(key, shared_v if isinstance(shared_v, list) else [], local_v)
+    if key in _MAX_KEYS:
+        return max(shared_v or 0, local_v or 0)
+    if key in _MIN_KEYS:
+        candidates = [v for v in (shared_v, local_v) if v]
+        return min(candidates) if candidates else 0
+    if isinstance(local_v, bool):
+        return bool(shared_v) or local_v
+    if isinstance(local_v, (int, float)):
+        return (shared_v or 0) + (local_v - (base_v or 0))
+    return local_v
+
+
+def _merge_stats(shared: dict, local: dict, base: dict) -> dict:
+    merged = copy.deepcopy(shared) if isinstance(shared, dict) else {}
+    for name in _PERSISTED_NAMES:
+        local_v = local.get(name)
+        if local_v is None:
+            continue
+        merged[name] = _merge_value(name, merged.get(name), local_v, base.get(name))
+    return merged
+
+
+def _flush():
+    """Merge this worker's stats into the shared file, then adopt the global totals."""
+    global _baseline
+    local = serialize()
+    base = _baseline if _baseline is not None else {name: None for name in _PERSISTED_NAMES}
+
+    def mutate(data):
+        data["Diagnostics"] = _merge_stats(data.get("Diagnostics", {}), local, base)
+        return data
+
+    merged = storage.update_data(mutate)
+    restore(merged.get("Diagnostics", {}))  # Adopt the combined global totals.
+    _baseline = serialize()  # New baseline = what we just adopted.
+
+
+def _bootstrap():
+    """Load persisted stats on import and start the cross-worker autosave flush."""
+    global _baseline
     saved = storage.load_data()
     restore(saved.get("Diagnostics", {}))
-    runtime.restore(saved.get("Runtime", {}))
-    storage.start_autosave(lambda: {"Diagnostics": serialize(), "Runtime": runtime.serialize()})
+    _baseline = serialize()  # Loaded state is the baseline so the first flush only adds new events.
+    storage.start_autosave(_flush)
 
 
 _bootstrap()

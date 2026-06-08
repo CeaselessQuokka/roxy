@@ -5,12 +5,10 @@ import mail
 import requests
 import runtime
 import time
-from config import TOKEN_EXPIRATION_COOLDOWN
 from threading import Timer as delay
 from threading import Lock
 
 tokens = auth.read_tokens()
-current_token_index = 0
 email_last_sent = 0
 error_email_last_sent = 0
 is_direct_api_in_cooldown = False
@@ -24,7 +22,7 @@ for t in tokens:
 def notify_error(subject: str, body: str):
     """Email the admin about a runtime error, rate-limited to avoid spam."""
     global error_email_last_sent
-    if time.time() - error_email_last_sent < config.ERROR_EMAIL_COOLDOWN:
+    if time.time() - error_email_last_sent < (runtime.get_setting("error_email_cooldown") or config.ERROR_EMAIL_COOLDOWN):
         return
     error_email_last_sent = time.time()
     try:
@@ -59,12 +57,12 @@ def validate_token(token: str):
         req = requests.get(
             "https://accountinformation.roblox.com/v1/birthdate",
             cookies={".ROBLOSECURITY": token},
-            timeout=config.REQUEST_TIMEOUT,
+            timeout=runtime.get_setting("request_timeout") or config.REQUEST_TIMEOUT,
         )
     except requests.RequestException:
         # Couldn't reach Roblox to validate; re-queue a retry rather than dropping the token.
         diagnostics.update_token(token, being_validated=True)
-        delay(TOKEN_EXPIRATION_COOLDOWN, lambda: validate_token(token)).start()
+        delay(runtime.get_setting("token_expiration_cooldown") or config.TOKEN_EXPIRATION_COOLDOWN, lambda: validate_token(token)).start()
         return
     with request_lock:
         if req.status_code == 200:
@@ -76,7 +74,7 @@ def validate_token(token: str):
             if token in diagnostics.tokens:
                 diagnostics.tokens.pop(token, None)
                 diagnostics.proxy_health["Tokens"]["Count"] = len(diagnostics.tokens)
-            if time.time() - email_last_sent > config.EMAIL_COOLDOWN:
+            if time.time() - email_last_sent > (runtime.get_setting("email_cooldown") or config.EMAIL_COOLDOWN):
                 email_last_sent = time.time()
                 mail.send(
                     auth.get_emails()[0],
@@ -108,7 +106,7 @@ def _request(
     csrf_token: str = None,
     retries: int = 0,
 ) -> tuple[bool, bool, str | None, str | None, int]:
-    global tokens, current_token_index, is_direct_api_in_cooldown, is_roproxy_in_cooldown
+    global tokens, is_direct_api_in_cooldown, is_roproxy_in_cooldown
     if len(tokens) == 0 and is_direct_api_in_cooldown and is_roproxy_in_cooldown:
         diagnostics.log_status_code(404)
         diagnostics.log_request(method.upper(), False)
@@ -138,9 +136,8 @@ def _request(
                     diagnostics.log_reason(True)
                     return False, False, "No valid tokens available; please try again in ~65 seconds.", None, retries
 
-                current_token_index %= len(tokens)
-                token = tokens[current_token_index]
-                current_token_index += 1
+                # Single active token only (token rotation upsets Roblox).
+                token = tokens[0]
 
     if csrf_token is not None:
         headers["x-csrf-token"] = csrf_token
@@ -153,7 +150,7 @@ def _request(
             params=params,
             data=data,
             cookies=cookies,
-            timeout=config.REQUEST_TIMEOUT,
+            timeout=runtime.get_setting("request_timeout") or config.REQUEST_TIMEOUT,
         )
     except requests.RequestException as e:
         diagnostics.log_request(method.upper(), False)
@@ -177,7 +174,7 @@ def _request(
                 # Token may be throttled instead of expired; put it in cooldown to try again later.
                 tokens.remove(token)
                 diagnostics.update_token(token, being_validated=True)
-                delay(TOKEN_EXPIRATION_COOLDOWN, lambda: validate_token(token)).start()
+                delay(runtime.get_setting("token_expiration_cooldown") or config.TOKEN_EXPIRATION_COOLDOWN, lambda: validate_token(token)).start()
         retries += 1
         if retries > runtime.get_setting("max_retries_per_request") - 1:
             diagnostics.log_reason(False)
@@ -205,13 +202,35 @@ def update_tokens(new_tokens: list[str]):
                 diagnostics.update_token(t)
 
 
+def set_tokens(new_tokens: list[str]) -> int:
+    """Replace the active token set (single active token; rotation is disabled).
+
+    Used by the dashboard to update the token when it expires.
+    """
+    global tokens
+    cleaned = []
+    for t in new_tokens:
+        t = (t or "").strip()
+        if t and t not in cleaned:
+            cleaned.append(t)
+    with request_lock:
+        for old in list(diagnostics.tokens.keys()):
+            diagnostics.tokens.pop(old, None)
+        tokens = cleaned
+        diagnostics.proxy_health["Tokens"]["Count"] = 0
+        diagnostics.proxy_health["Tokens"]["BeingValidatedCount"] = 0
+        for t in tokens:
+            diagnostics.update_token(t)
+    return len(tokens)
+
+
 def _revalidate_one(token: str):
     global tokens
     try:
         req = requests.get(
             "https://accountinformation.roblox.com/v1/birthdate",
             cookies={".ROBLOSECURITY": token},
-            timeout=config.REQUEST_TIMEOUT,
+            timeout=runtime.get_setting("request_timeout") or config.REQUEST_TIMEOUT,
         )
     except requests.RequestException:
         return  # Couldn't reach Roblox; leave the token as-is.

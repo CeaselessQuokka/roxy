@@ -46,6 +46,8 @@
 					<li><a class="nav__link is-active" href="#section-overview">Overview</a></li>
 					<li><a class="nav__link" href="#section-live">Live Requests</a></li>
 					<li><a class="nav__link" href="#section-endpoints">Endpoints</a></li>
+					<li><a class="nav__link" href="#section-endpoint-controls">Endpoint Controls</a></li>
+					<li><a class="nav__link" href="#section-blocked-attempts">Blocked Attempts</a></li>
 					<li><a class="nav__link" href="#section-tokens">Auth Tokens</a></li>
 					<li><a class="nav__link" href="#section-requests">Requests</a></li>
 					<li><a class="nav__link" href="#section-status">Status Codes</a></li>
@@ -173,6 +175,144 @@
 					</div>
 				</section>
 
+				<!-- Endpoint Controls (block + per-IP rate rules) -->
+				<section id="section-endpoint-controls" class="section" aria-labelledby="endpointControlsHeading">
+					<div class="section__header">
+						<h2 id="endpointControlsHeading" class="section__title">Endpoint Controls</h2>
+					</div>
+
+					<div class="grid grid--cards">
+						<!-- Block / unblock -->
+						<article class="card">
+							<h3 class="card__title">Blocked Endpoints</h3>
+							<p class="form__hint">
+								Blocked endpoints return 403 to everyone in real-time. Use a full path
+								(<code>games.roblox.com/v1/games</code>) to block it and everything under it, or just a
+								host (<code>games.roblox.com</code>) to block the whole service.
+							</p>
+							<form id="blockForm" class="form">
+								<div class="form__row">
+									<input
+										id="blockPattern"
+										class="input"
+										type="text"
+										placeholder="games.roblox.com/v1/games"
+										required
+									/>
+									<input id="blockNote" class="input" type="text" placeholder="Note (optional)" />
+									<button type="submit" class="btn btn--warning">Block</button>
+								</div>
+							</form>
+							<div class="table-wrap">
+								<table id="blocksTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Pattern</th>
+											<th scope="col">Note</th>
+											<th scope="col">Added</th>
+											<th scope="col"></th>
+										</tr>
+									</thead>
+									<tbody>
+										<!-- rows from EndpointBlocks -->
+									</tbody>
+								</table>
+							</div>
+						</article>
+
+						<!-- Per-endpoint rate rules -->
+						<article class="card">
+							<h3 class="card__title">Per-Endpoint Rate Rules</h3>
+							<p class="form__hint">
+								Limit how often a single IP can hit an endpoint (e.g. 1 every 60s). This only ever
+								makes an endpoint <em>more</em> restrictive — the global per-IP limit still applies on
+								top.
+							</p>
+							<form id="ruleForm" class="form">
+								<div class="form__row">
+									<input
+										id="rulePattern"
+										class="input"
+										type="text"
+										placeholder="economy.roblox.com/v1"
+										required
+									/>
+									<input
+										id="ruleLimit"
+										class="input"
+										type="number"
+										min="1"
+										placeholder="Limit"
+										required
+										style="max-width: 110px"
+									/>
+									<input
+										id="rulePeriod"
+										class="input"
+										type="number"
+										min="1"
+										value="60"
+										placeholder="Period (s)"
+										style="max-width: 130px"
+									/>
+									<button type="submit" class="btn btn--filled">Set Rule</button>
+								</div>
+							</form>
+							<div class="table-wrap">
+								<table id="rulesTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Pattern</th>
+											<th scope="col">Limit</th>
+											<th scope="col">Per (s)</th>
+											<th scope="col">Added</th>
+											<th scope="col"></th>
+										</tr>
+									</thead>
+									<tbody>
+										<!-- rows from EndpointRules -->
+									</tbody>
+								</table>
+							</div>
+						</article>
+					</div>
+				</section>
+
+				<!-- Blocked Endpoint Attempts -->
+				<section id="section-blocked-attempts" class="section" aria-labelledby="blockedAttemptsHeading">
+					<div class="section__header">
+						<h2 id="blockedAttemptsHeading" class="section__title">Blocked Endpoint Attempts</h2>
+						<div class="section__actions">
+							<span id="blockedAttemptsTotal" class="chip">0 attempts</span>
+							<button id="exportBlockedAttempts" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							Requests that were rejected because the endpoint is blocked. Sorted by frequency. Shows
+							how many times, which IPs, and when it was last attempted.
+						</p>
+						<div class="table-wrap">
+							<table id="blockedAttemptsTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Endpoint</th>
+										<th scope="col">Attempts</th>
+										<th scope="col">Unique IPs</th>
+										<th scope="col">Methods</th>
+										<th scope="col">Matched Block</th>
+										<th scope="col">Last IP</th>
+										<th scope="col">Last Attempt</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- rows from BlockedEndpointAttempts -->
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
 				<!-- Auth Tokens (submit & fetch) -->
 				<section id="section-tokens" class="section" aria-labelledby="tokensHeading">
 					<div class="section__header">
@@ -185,8 +325,9 @@
 					<div class="card">
 						<form id="tokenForm" class="form" method="post" action="/admin/tokens">
 							<p class="form__hint">
-								Paste one token per line. On submit, server will atomically replace the in-memory token
-								set (and optionally persist to disk).
+								Paste your active <code>.ROBLOSECURITY</code> token (one per line). On submit, the
+								server replaces the in-memory token set. Token rotation is disabled, so normally you
+								have just one active token — update it here whenever it expires.
 							</p>
 							<div class="form__field">
 								<label class="form__label" for="tokensInput">New Tokens</label>

@@ -37,6 +37,11 @@ MAX_LIVE_BODY_LENGTH = 2000  # Max characters of a request body to retain for th
 # --- Admin session invalidation ---
 INVALIDATION_TOKEN_EXPIRATION = 86400  # In seconds, how long an emailed "invalidate session" link stays valid.
 
+# --- Endpoint controls ---
+MAX_ENDPOINT_BLOCKS = 200  # How many distinct blocked-endpoint patterns to keep.
+MAX_ENDPOINT_RULES = 200  # How many distinct per-endpoint rate rules to keep.
+DEFAULT_ENDPOINT_RULE_PERIOD = 60  # In seconds, default window for a per-endpoint per-IP rate rule.
+
 # Substrings that mark a User-Agent as an automated crawler/bot (for visitor classification).
 CRAWLER_USER_AGENT_MARKERS = [
     "bot",

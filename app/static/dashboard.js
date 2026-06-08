@@ -364,6 +364,18 @@ const print = console.log;
 		roproxy_cooldown: "RoProxy cooldown (s)",
 		max_retries_per_request: "Max retries per request",
 		two_fa_expiration: "2FA code lifetime (s)",
+		challenge_expiration: "Login challenge lifetime (s)",
+		token_expiration_cooldown: "Token re-check cooldown (s)",
+		request_timeout: "Upstream request timeout (s)",
+		email_cooldown: "Token-expired email cooldown (s)",
+		error_email_cooldown: "Error email cooldown (s)",
+		autosave_interval: "Autosave interval (s)",
+		max_live_requests: "Live feed size",
+		max_exploit_records: "Exploit records kept",
+		max_login_records: "Login records kept",
+		max_crawl_records: "Crawl records kept",
+		max_throttle_records: "Throttle records kept",
+		max_endpoint_records: "Endpoint records kept",
 	};
 
 	function renderSettings(d) {
@@ -401,6 +413,105 @@ const print = console.log;
 		}
 	}
 
+	function renderEndpointBlocks(d) {
+		const tbody = $("#blocksTable tbody");
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const entries = Object.entries(d.EndpointBlocks || {});
+		if (entries.length === 0) {
+			tbody.appendChild(tr(["—", "No endpoints blocked", "—", ""]));
+			return;
+		}
+		for (const [pattern, info] of entries) {
+			const btn = document.createElement("button");
+			btn.className = "btn btn--outline btn--sm";
+			btn.textContent = "Unblock";
+			btn.addEventListener("click", () => unblockEndpoint(pattern));
+			tbody.appendChild(tr([pattern, info.Note || "—", toTS(info.Added || 0), btn]));
+		}
+	}
+
+	function renderEndpointRules(d) {
+		const tbody = $("#rulesTable tbody");
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const entries = Object.entries(d.EndpointRules || {});
+		if (entries.length === 0) {
+			tbody.appendChild(tr(["—", "—", "—", "—", ""]));
+			return;
+		}
+		for (const [pattern, info] of entries) {
+			const btn = document.createElement("button");
+			btn.className = "btn btn--outline btn--sm";
+			btn.textContent = "Remove";
+			btn.addEventListener("click", () => clearEndpointRule(pattern));
+			tbody.appendChild(
+				tr([pattern, String(info.Limit ?? "—"), String(info.Period ?? "—"), toTS(info.Added || 0), btn]),
+			);
+		}
+	}
+
+	function renderBlockedAttempts(d) {
+		const tbody = $("#blockedAttemptsTable tbody");
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const entries = Object.entries(d.BlockedEndpointAttempts || {});
+		entries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+		let total = 0;
+		for (const [path, info] of entries) {
+			total += Number(info.Count || 0);
+			const methods = Object.entries(info.Methods || {})
+				.map(([m, n]) => `${m}:${n}`)
+				.join(", ");
+			const uniqueIps = info.IPs ? Object.keys(info.IPs).length : 0;
+			tbody.appendChild(
+				tr([
+					path,
+					String(info.Count || 0),
+					String(uniqueIps),
+					methods || "—",
+					info.Pattern || "—",
+					info.LastIP || "—",
+					toTS(info.LastRequestTime || 0),
+				]),
+			);
+		}
+		if (entries.length === 0) {
+			tbody.appendChild(tr(["—", "0", "0", "—", "—", "—", "—"]));
+		}
+		setText("blockedAttemptsTotal", `${total} attempts`);
+	}
+
+	async function unblockEndpoint(pattern) {
+		try {
+			const res = await fetch("/admin/endpoints/unblock", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ pattern }),
+			});
+			const data = await res.json();
+			renderEndpointBlocks({ EndpointBlocks: data.EndpointBlocks });
+			showToast(`Unblocked ${pattern}`);
+		} catch {
+			showToast("Failed to unblock");
+		}
+	}
+
+	async function clearEndpointRule(pattern) {
+		try {
+			const res = await fetch("/admin/endpoints/rule/clear", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ pattern }),
+			});
+			const data = await res.json();
+			renderEndpointRules({ EndpointRules: data.EndpointRules });
+			showToast(`Removed rule for ${pattern}`);
+		} catch {
+			showToast("Failed to remove rule");
+		}
+	}
+
 	// -----------------------------
 	// Data plumbing
 	// -----------------------------
@@ -431,6 +542,9 @@ const print = console.log;
 			renderExploitSummary(d);
 			renderLiveFeed(d);
 			renderSettings(d);
+			renderEndpointBlocks(d);
+			renderEndpointRules(d);
+			renderBlockedAttempts(d);
 			showToast("Dashboard updated");
 		} catch (err) {
 			console.error(err);
@@ -699,6 +813,53 @@ const print = console.log;
 	});
 	$("#reloadSettings")?.addEventListener("click", refreshAll);
 
+	// Endpoint controls: block
+	$("#blockForm")?.addEventListener("submit", async e => {
+		e.preventDefault();
+		const pattern = $("#blockPattern")?.value.trim();
+		const note = $("#blockNote")?.value.trim() || "";
+		if (!pattern) return;
+		try {
+			const res = await fetch("/admin/endpoints/block", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ pattern, note }),
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(data.Message || String(res.status));
+			renderEndpointBlocks({ EndpointBlocks: data.EndpointBlocks });
+			$("#blockPattern").value = "";
+			$("#blockNote").value = "";
+			showToast(`Blocked ${pattern}`);
+		} catch (err) {
+			showToast("Block failed: " + err.message);
+		}
+	});
+
+	// Endpoint controls: set rate rule
+	$("#ruleForm")?.addEventListener("submit", async e => {
+		e.preventDefault();
+		const pattern = $("#rulePattern")?.value.trim();
+		const limit = Number($("#ruleLimit")?.value);
+		const period = Number($("#rulePeriod")?.value) || 60;
+		if (!pattern || !limit) return;
+		try {
+			const res = await fetch("/admin/endpoints/rule", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ pattern, limit, period }),
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(data.Message || String(res.status));
+			renderEndpointRules({ EndpointRules: data.EndpointRules });
+			$("#rulePattern").value = "";
+			$("#ruleLimit").value = "";
+			showToast(`Rule set for ${pattern}`);
+		} catch (err) {
+			showToast("Rule failed: " + err.message);
+		}
+	});
+
 	// Endpoints export
 	$("#exportEndpoints")?.addEventListener("click", async () => {
 		try {
@@ -712,6 +873,35 @@ const print = console.log;
 			}
 			download(`roxy_endpoints_${Date.now()}.csv`, lines.join("\n"));
 			showToast("Endpoints exported");
+		} catch {
+			showToast("Export failed");
+		}
+	});
+
+	// Blocked endpoint attempts export
+	$("#exportBlockedAttempts")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			const lines = ["Endpoint,Attempts,UniqueIPs,Methods,Pattern,LastIP,LastRequestTime"];
+			for (const [path, info] of Object.entries(d.BlockedEndpointAttempts || {})) {
+				const methods = Object.entries(info.Methods || {})
+					.map(([m, n]) => `${m}:${n}`)
+					.join(" ");
+				const uniqueIps = info.IPs ? Object.keys(info.IPs).length : 0;
+				lines.push(
+					toCSVRow([
+						path,
+						info.Count || 0,
+						uniqueIps,
+						methods,
+						info.Pattern || "",
+						info.LastIP || "",
+						info.LastRequestTime || 0,
+					]),
+				);
+			}
+			download(`roxy_blocked_attempts_${Date.now()}.csv`, lines.join("\n"));
+			showToast("Blocked attempts exported");
 		} catch {
 			showToast("Export failed");
 		}
