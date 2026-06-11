@@ -799,6 +799,322 @@ body {
 	border-color: var(--color-danger);
 }
 
+/* =============================
+   16) TRAFFIC CHART
+   ============================= */
+.traffic-chart {
+	display: flex;
+	align-items: flex-end;
+	gap: 3px;
+	height: 180px;
+	padding: var(--pad-2);
+	border: 1px solid var(--color-outline);
+	border-radius: var(--radius-md);
+	background: var(--color-surface0);
+}
+.traffic-chart__bar {
+	flex: 1 1 0;
+	min-width: 0;
+	height: 100%;
+	display: flex;
+	flex-direction: column;
+	justify-content: flex-end;
+	border-radius: 3px 3px 0 0;
+	overflow: hidden; /* rounds whichever segment ends up on top */
+	cursor: default;
+	transition: filter var(--dur-fast) var(--easing);
+}
+.traffic-chart__bar:hover {
+	filter: brightness(1.45);
+}
+.traffic-chart__bar.is-empty {
+	background: linear-gradient(180deg, transparent calc(100% - 2px), var(--color-outline) calc(100% - 2px));
+}
+.traffic-chart__seg {
+	width: 100%;
+	min-height: 0;
+}
+.traffic-chart__seg--ok {
+	background: linear-gradient(180deg, var(--color-primary), color-mix(in oklab, var(--color-primary) 55%, black 45%));
+}
+.traffic-chart__seg--bad {
+	background: linear-gradient(180deg, var(--color-danger), color-mix(in oklab, var(--color-danger) 60%, black 40%));
+}
+.traffic-chart__axis {
+	display: flex;
+	justify-content: space-between;
+	margin-top: 6px;
+	color: var(--color-text-muted);
+	font-size: var(--fs-xs);
+}
+.legend-dot {
+	display: inline-block;
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+}
+.legend-dot--ok {
+	background: var(--color-primary);
+}
+.legend-dot--bad {
+	background: var(--color-danger);
+}
+
+/* =============================
+   17) MINI BARS (status code table)
+   ============================= */
+.minibar {
+	position: relative;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	min-width: 220px;
+	height: 18px;
+}
+.minibar__fill {
+	height: 10px;
+	border-radius: 999px;
+	min-width: 4px;
+	transition: width var(--dur-med) var(--easing);
+}
+.minibar__fill--ok {
+	background: linear-gradient(90deg, color-mix(in oklab, var(--color-success) 70%, black 30%), var(--color-success));
+}
+.minibar__fill--bad {
+	background: linear-gradient(90deg, color-mix(in oklab, var(--color-danger) 70%, black 30%), var(--color-danger));
+}
+.minibar__fill--mid {
+	background: linear-gradient(90deg, color-mix(in oklab, var(--color-warning) 70%, black 30%), var(--color-warning));
+}
+.minibar__label {
+	font-size: var(--fs-sm);
+	color: var(--color-text-dim);
+	white-space: nowrap;
+}
+
+/* =============================
+   18) SESSION CHIP + EXPIRED OVERLAY
+   ============================= */
+.chip--warn {
+	color: var(--color-warning);
+	border-color: var(--color-warning);
+	background: rgba(255, 183, 77, 0.12);
+}
+.expired-overlay {
+	position: fixed;
+	inset: 0;
+	z-index: 200;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: rgba(4, 7, 11, 0.78);
+	backdrop-filter: blur(6px);
+	animation: overlayFade 240ms var(--easing);
+}
+.expired-overlay[hidden] {
+	display: none;
+}
+.expired-overlay__card {
+	background: linear-gradient(180deg, var(--color-surface3), var(--color-surface1));
+	border: 1px solid var(--color-outline-strong);
+	border-radius: var(--radius-lg);
+	padding: var(--pad-5);
+	max-width: 420px;
+	text-align: center;
+	box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+	display: grid;
+	gap: var(--pad-2);
+	justify-items: center;
+}
+.expired-overlay__card h2 {
+	margin: 0;
+}
+.expired-overlay__card p {
+	margin: 0;
+	color: var(--color-text-dim);
+}
+.expired-overlay__icon {
+	font-size: 40px;
+	line-height: 1;
+}
+@keyframes overlayFade {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}
+
+/* =============================
+   19) FILTER INPUTS
+   ============================= */
+.input--filter {
+	max-width: 360px;
+	margin-bottom: var(--pad-2);
+}
+
+/* =============================
+   20) COLLAPSIBLE SECTIONS (whole-section fold via title click)
+   ============================= */
+.section__title--toggle {
+	cursor: pointer;
+	user-select: none;
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+}
+.section__title--toggle:hover {
+	color: var(--color-primary-strong);
+}
+.section__chevron {
+	display: inline-block;
+	font-size: 0.8em;
+	color: var(--color-text-muted);
+	transition: transform var(--dur-med) var(--easing);
+}
+.section.is-collapsed .section__chevron {
+	transform: rotate(-90deg);
+}
+.section.is-collapsed > *:not(.section__header) {
+	display: none;
+}
+.section.is-collapsed {
+	margin-bottom: var(--pad-3);
+}
+
+/* =============================
+   21) TOKEN BUDGET GAUGE
+   ============================= */
+.gauge {
+	height: 12px;
+	margin: 8px 0 6px 0;
+	border-radius: 999px;
+	background: var(--color-surface0);
+	border: 1px solid var(--color-outline);
+	overflow: hidden;
+}
+.gauge__fill {
+	height: 100%;
+	border-radius: 999px;
+	background: linear-gradient(90deg, color-mix(in oklab, var(--color-success) 70%, black 30%), var(--color-success));
+	transition: width var(--dur-med) var(--easing);
+}
+.gauge__fill--warn {
+	background: linear-gradient(90deg, color-mix(in oklab, var(--color-warning) 70%, black 30%), var(--color-warning));
+}
+.gauge__fill--bad {
+	background: linear-gradient(90deg, color-mix(in oklab, var(--color-danger) 70%, black 30%), var(--color-danger));
+}
+
+/* Persistence card details */
+.persist-file {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: var(--fs-xs);
+	word-break: break-all;
+}
+.persist-error {
+	color: var(--color-danger);
+	font-size: var(--fs-xs);
+	word-break: break-word;
+}
+.text-danger {
+	color: var(--color-danger);
+}
+
+/* =============================
+   22) SPLIT BARS (method mix / success split)
+   ============================= */
+.split-charts {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: var(--pad-3);
+	margin-top: var(--pad-3);
+}
+@media (max-width: 760px) {
+	.split-charts {
+		grid-template-columns: 1fr;
+	}
+}
+.split-bar {
+	display: flex;
+	height: 14px;
+	margin-top: 8px;
+	border-radius: 999px;
+	overflow: hidden;
+	border: 1px solid var(--color-outline);
+	background: var(--color-surface0);
+}
+.split-bar__seg {
+	height: 100%;
+	min-width: 2px;
+	transition: width var(--dur-med) var(--easing);
+}
+.split-bar__seg--empty {
+	background: var(--color-surface2);
+}
+.split-legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 14px;
+	margin-top: 8px;
+	font-size: var(--fs-xs);
+	color: var(--color-text-dim);
+}
+.split-legend__item {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+.fill-get {
+	background: #7cc4ff;
+}
+.fill-post {
+	background: #69f0ae;
+}
+.fill-patch {
+	background: #ffb74d;
+}
+.fill-put {
+	background: #ce93d8;
+}
+.fill-delete {
+	background: #ff6b6b;
+}
+.fill-ok {
+	background: var(--color-success);
+}
+.fill-bad {
+	background: var(--color-danger);
+}
+
+/* =============================
+   23) ENDPOINT HOST GROUPING
+   ============================= */
+.endpoint-host {
+	cursor: pointer;
+	background: rgba(124, 196, 255, 0.04);
+}
+.endpoint-host:hover {
+	background: var(--color-hover) !important;
+}
+.endpoint-host__chevron {
+	display: inline-block;
+	width: 14px;
+	color: var(--color-primary-strong);
+}
+.endpoint-host__count {
+	color: var(--color-text-muted);
+	font-size: var(--fs-xs);
+}
+.endpoint-child td:first-child {
+	padding-left: 28px;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: var(--fs-sm);
+	color: var(--color-text-dim);
+	word-break: break-all;
+}
+
 /* Small button + inline code (endpoint controls) */
 .btn--sm {
 	padding: 4px 10px;

@@ -4,25 +4,26 @@
 		<meta charset="UTF-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 		<title>Roxy Admin Login</title>
-		<link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='roxy_favicon.png') }}" />
-		<link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}" />
+		<link rel="icon" type="image/x-icon" href="{{ static_url('roxy_favicon.png') }}" />
+		<link rel="stylesheet" href="{{ static_url('admin.css') }}" />
 	</head>
 	<body>
 		<main class="login-container">
 			<div class="login-card">
 				<div class="logo-wrapper">
-					<img src="{{ url_for('static', filename='roxy_icon.png') }}" alt="Roxy Logo" class="logo" />
+					<img src="{{ static_url('roxy_icon.png') }}" alt="Roxy Logo" class="logo" />
 					<h1 class="app-title">Roxy Admin</h1>
 				</div>
 
-				<form class="login-form">
+				<form id="loginForm" class="login-form">
 					<label for="username">Username</label>
-					<input id="username" type="text" placeholder="Enter username" autocomplete="off" />
+					<input id="username" type="text" placeholder="Enter username" autocomplete="username" />
 
 					<label for="password">Password</label>
-					<input id="password" type="password" placeholder="Enter password" autocomplete="off" />
+					<input id="password" type="password" placeholder="Enter password" autocomplete="current-password" />
 
-					<button id="submit" type="button" class="btn-primary">Login</button>
+					<button id="submit" type="submit" class="btn-primary">Login</button>
+					<p id="loginError" class="form-error" role="alert" hidden></p>
 				</form>
 			</div>
 		</main>
@@ -45,8 +46,15 @@
 					</button>
 				</header>
 				<div class="modal__content">
-					<p class="modal__hint">Enter the digit code sent to your admin email.</p>
-					<input id="twofaInput" type="text" inputmode="numeric" placeholder="········" />
+					<p class="modal__hint">Enter the digit code sent to your admin email. It expires in ~60 seconds.</p>
+					<input
+						id="twofaInput"
+						type="text"
+						inputmode="numeric"
+						autocomplete="one-time-code"
+						maxlength="16"
+						placeholder="········"
+					/>
 					<p id="twofaError" class="modal__error" hidden></p>
 				</div>
 				<footer class="modal__footer">
@@ -56,6 +64,6 @@
 			</div>
 		</div>
 
-		<script src="{{ url_for('static', filename='admin.js') }}"></script>
+		<script src="{{ static_url('admin.js') }}"></script>
 	</body>
 </html>

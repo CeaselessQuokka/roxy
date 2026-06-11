@@ -31,6 +31,13 @@ _session_epoch = 1
 # --- Emailed single-use session-invalidation tokens -------------------------
 _invalidation_tokens = dict()  # token -> expiration_time
 
+# --- Short-lived login secrets (shared across workers) -----------------------
+# 2FA codes are stored hashed; challenges are random hex. Both live in the
+# shared file so a login started on one gunicorn worker can finish on another.
+_two_fa_codes = dict()  # hashed_code -> expiration_time
+_challenges = dict()  # challenge -> expiration_time
+
+
 # --- Blocked endpoints ------------------------------------------------------
 _endpoint_blocks = dict()  # pattern -> {"Added": ts, "Note": str}
 
@@ -69,6 +76,10 @@ _settings = {
     "max_crawl_records": _setting(config.MAX_CRAWL_RECORDS, 1, 5000, "int"),
     "max_throttle_records": _setting(config.MAX_THROTTLE_RECORDS, 1, 5000, "int"),
     "max_endpoint_records": _setting(config.MAX_ENDPOINT_RECORDS, 1, 5000, "int"),
+    # Hard safety budget for the internal token: at most N token-authenticated
+    # requests to Roblox per window, so the server never looks like a bot burst.
+    "token_budget_requests": _setting(config.TOKEN_BUDGET_REQUESTS, 1, 10000, "int"),
+    "token_budget_window": _setting(config.TOKEN_BUDGET_WINDOW, 1, 3600, "int"),
 }
 
 
@@ -93,8 +104,13 @@ def _matches(pattern: str, path: str) -> bool:
 
 # --- Cross-worker reload ----------------------------------------------------
 def _restore_from(data: dict):
-    """Apply a persisted Runtime blob into memory (no re-persist). Locked by caller."""
-    global _paused, _paused_since, _session_epoch, _invalidation_tokens, _endpoint_blocks, _endpoint_rules
+    """Apply a persisted Runtime blob into memory (no re-persist). Locked by caller.
+
+    Dicts are mutated IN PLACE (never rebound): helpers capture references to
+    them, and a rebind would silently disconnect those helpers from the state
+    that actually gets persisted.
+    """
+    global _paused, _paused_since, _session_epoch
     if not isinstance(data, dict) or not data:
         return
     _paused = bool(data.get("Paused", _paused))
@@ -114,17 +130,27 @@ def _restore_from(data: dict):
         entry["value"] = max(entry["min"], min(entry["max"], value))
         entry["updated"] = float(stored_updated.get(key, entry["updated"]) or 0.0)
 
+    def replace_in_place(store: dict, fresh: dict):
+        store.clear()
+        store.update(fresh)
+
     blocks = data.get("EndpointBlocks", {})
     if isinstance(blocks, dict):
-        _endpoint_blocks = {str(k): dict(v) for k, v in blocks.items() if isinstance(v, dict)}
+        replace_in_place(_endpoint_blocks, {str(k): dict(v) for k, v in blocks.items() if isinstance(v, dict)})
     rules = data.get("EndpointRules", {})
     if isinstance(rules, dict):
-        _endpoint_rules = {str(k): dict(v) for k, v in rules.items() if isinstance(v, dict)}
+        replace_in_place(_endpoint_rules, {str(k): dict(v) for k, v in rules.items() if isinstance(v, dict)})
 
     tokens = data.get("InvalidationTokens", {})
     if isinstance(tokens, dict):
-        _invalidation_tokens = {str(k): float(v) for k, v in tokens.items()}
-        _prune_invalidation_tokens()
+        replace_in_place(_invalidation_tokens, {str(k): float(v) for k, v in tokens.items()})
+    codes = data.get("TwoFACodes", {})
+    if isinstance(codes, dict):
+        replace_in_place(_two_fa_codes, {str(k): float(v) for k, v in codes.items()})
+    challenges = data.get("Challenges", {})
+    if isinstance(challenges, dict):
+        replace_in_place(_challenges, {str(k): float(v) for k, v in challenges.items()})
+    _prune_expirables()
 
 
 def _maybe_reload():
@@ -157,8 +183,14 @@ def _persist_change(apply_change):
             data["Runtime"] = _serialize_unlocked()
         return data
 
-    storage.update_data(mutate)
-    _last_mtime = storage.get_mtime()
+    try:
+        storage.update_data(mutate)
+        _last_mtime = storage.get_mtime()
+    except OSError:
+        # Disk hiccup: apply the change in memory anyway so this worker keeps
+        # working; cross-worker sync catches up on the next successful write.
+        with _lock:
+            apply_change()
 
 
 # --- Pause controls ---------------------------------------------------------
@@ -187,10 +219,16 @@ def toggle_paused() -> bool:
 
 
 # --- Settings ---------------------------------------------------------------
-def get_setting(key: str):
+def get_setting(key: str, default=None):
+    """Current value of a runtime setting, or `default` for unknown keys.
+
+    Callers must NOT use `get_setting(k) or fallback` — that silently swaps in
+    the fallback when the configured value is a legitimate 0 (e.g. a cooldown
+    of 0 meaning "disabled"). Pass the fallback as `default` instead.
+    """
     _maybe_reload()
     entry = _settings.get(key)
-    return entry["value"] if entry else None
+    return entry["value"] if entry else default
 
 
 def get_settings() -> dict:
@@ -339,48 +377,77 @@ def bump_session_epoch() -> int:
     return _session_epoch
 
 
-# --- Invalidation tokens ----------------------------------------------------
-def create_invalidation_token() -> str:
-    token = secrets.token_urlsafe(32)
-
+# --- Short-lived secrets (invalidation tokens, 2FA codes, challenges) --------
+def _store_expirable(store: dict, key: str, expires_at: float):
     def change():
-        _invalidation_tokens[token] = time.time() + config.INVALIDATION_TOKEN_EXPIRATION
-        _prune_invalidation_tokens()
+        store[key] = expires_at
+        _prune_expirables()
 
     _persist_change(change)
-    return token
 
 
-def consume_invalidation_token(token: str) -> bool:
-    """Validate and remove an invalidation token. Returns True if it was valid."""
+def _consume_expirable(store: dict, key: str) -> bool:
+    """Validate and remove a single-use entry. Returns True if it was present and unexpired."""
     result = {"valid": False}
 
     def change():
-        expiration = _invalidation_tokens.pop(token, None)
-        _prune_invalidation_tokens()
+        expiration = store.pop(key, None)
+        _prune_expirables()
         result["valid"] = expiration is not None and time.time() < expiration
 
     _persist_change(change)
     return result["valid"]
 
 
-def _prune_invalidation_tokens():
+def create_invalidation_token() -> str:
+    token = secrets.token_urlsafe(32)
+    _store_expirable(_invalidation_tokens, token, time.time() + config.INVALIDATION_TOKEN_EXPIRATION)
+    return token
+
+
+def consume_invalidation_token(token: str) -> bool:
+    """Validate and remove an invalidation token. Returns True if it was valid."""
+    return _consume_expirable(_invalidation_tokens, str(token))
+
+
+def store_two_fa_code(hashed_code: str, expires_at: float):
+    _store_expirable(_two_fa_codes, hashed_code, expires_at)
+
+
+def consume_two_fa_code(hashed_code: str) -> bool:
+    return _consume_expirable(_two_fa_codes, hashed_code)
+
+
+def store_challenge(challenge: str, expires_at: float):
+    _store_expirable(_challenges, challenge, expires_at)
+
+
+def consume_challenge(challenge: str) -> bool:
+    return _consume_expirable(_challenges, str(challenge))
+
+
+def _prune_expirables():
     now = time.time()
-    for tok in [t for t, exp in _invalidation_tokens.items() if exp < now]:
-        _invalidation_tokens.pop(tok, None)
+    for store in (_invalidation_tokens, _two_fa_codes, _challenges):
+        for key in [k for k, exp in store.items() if exp < now]:
+            store.pop(key, None)
 
 
 # --- Persistence ------------------------------------------------------------
 def _serialize_unlocked() -> dict:
+    # Copies, not references: the caller JSON-serializes this blob after the
+    # lock is released, and the live dicts are mutated in place by reloads.
     return {
         "Paused": _paused,
         "PausedSince": _paused_since,
         "SessionEpoch": _session_epoch,
         "Settings": {k: v["value"] for k, v in _settings.items()},
         "SettingsUpdated": {k: v["updated"] for k, v in _settings.items()},
-        "EndpointBlocks": _endpoint_blocks,
-        "EndpointRules": _endpoint_rules,
-        "InvalidationTokens": _invalidation_tokens,
+        "EndpointBlocks": {k: dict(v) for k, v in _endpoint_blocks.items()},
+        "EndpointRules": {k: dict(v) for k, v in _endpoint_rules.items()},
+        "InvalidationTokens": dict(_invalidation_tokens),
+        "TwoFACodes": dict(_two_fa_codes),
+        "Challenges": dict(_challenges),
     }
 
 

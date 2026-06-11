@@ -4,8 +4,8 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<title>Roxy Proxy</title>
-		<link rel="stylesheet" href="{{ url_for('static', filename='home_page.css') }}" />
-		<link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='roxy_favicon.png') }}" />
+		<link rel="stylesheet" href="{{ static_url('home_page.css') }}" />
+		<link rel="icon" type="image/x-icon" href="{{ static_url('roxy_favicon.png') }}" />
 	</head>
 	<body class="app app--dark" data-theme="dark">
 		<header class="app-bar" role="banner">
@@ -68,7 +68,6 @@
 			</section>
 
 			<!-- General Tips -->
-			<main class="main" role="main">
 			<section class="section collapsible-block" aria-labelledby="generalTipsHeader">
 				<div class="section__header">
 					<h2 id="generalTipsHeader" class="section__title">General Tips (Highly Recommended Reading)</h2>
@@ -88,11 +87,14 @@
 						Roblox will give you an error due to an invalid character (specifically the pipe "|" character).
 					</p>
 					<p class="light--warning">
-						If you use RequestAsync, Roblox gives you the response headers. There are three custom headers that Roxy adds:
+						If you use RequestAsync, Roblox gives you the response headers. These are the custom headers that Roxy adds:
 						<ul>
 							<li><code>Roxy-Requests-Left</code>: How many more requests you have until you get throttled.
 							<li><code>Roxy-Throttle-Reset</code>: How many seconds until your request pool resets.
 							<li><code>Roxy-Throttled</code>: Whether or not you have been throttled.
+							<li><code>Roxy-Paused</code>: Only present when the proxy is temporarily paused for maintenance.
+							<li><code>Roxy-Blocked</code>: Only present when the endpoint you requested has been blocked by the admin.
+							<li><code>Roxy-Endpoint-Limited</code>: Only present when a per-endpoint rate limit rejected your request.
 						</ul>
 					</p>
 					<p>
@@ -308,9 +310,8 @@ HttpService:RequestAsync({
 						target="_blank"
 						>Roproxy</a
 					>
-					is also throttled (same cooldown applies as above), Roxy will then start iterating through a list of
-					internally used tokens. If those tokens expire, I get an email and I can update them in a few
-					minutes.
+					is also throttled (same cooldown applies as above), Roxy will then fall back to an internally
+					provided token. If that token expires, I get an email and I can update it in a few minutes.
 				</p>
 				<p>
 					How much does Roxy cost to maintain? As of right now, 7 USD per month (for the Lightsail instance) +
@@ -332,9 +333,9 @@ HttpService:RequestAsync({
 		</main>
 		<!-- https://ko-fi.com/ceaselessquokka -->
 		<footer class="footer" role="contentinfo">
-			<small>Roxy Proxy 2025</small>
+			<small>Roxy Proxy 2025–2026</small>
 		</footer>
 
-		<script src="{{ url_for('static', filename='home_page.js') }}"></script>
+		<script src="{{ static_url('home_page.js') }}"></script>
 	</body>
 </html>

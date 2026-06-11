@@ -2,6 +2,7 @@ import config
 import fcntl
 import json
 import os
+import shutil
 import tempfile
 import time
 from contextlib import contextmanager
@@ -11,9 +12,56 @@ from threading import Lock, Thread
 # (e.g. multiple gunicorn workers) so the shared data file is never corrupted.
 _io_lock = Lock()
 
+# Persistence health, surfaced on the admin dashboard so a broken data file
+# (permissions, full disk...) is visible instead of silently eating stats.
+_status_lock = Lock()
+_last_write_ok = 0.0
+_last_error = ""
+_last_error_at = 0.0
+_write_count = 0
+BACKUP_EVERY = 50  # Copy the data file to .bak every N successful writes.
+
+
+def _record_write_ok():
+    global _last_write_ok, _write_count
+    with _status_lock:
+        _last_write_ok = time.time()
+        _write_count += 1
+        return _write_count
+
+
+def _record_write_error(error: Exception):
+    global _last_error, _last_error_at
+    with _status_lock:
+        _last_error = f"{type(error).__name__}: {error}"
+        _last_error_at = time.time()
+
+
+def get_status() -> dict:
+    """Persistence health for the dashboard."""
+    directory = os.path.dirname(config.DATA_FILE) or "."
+    try:
+        writable = os.access(directory, os.W_OK) and (
+            not os.path.exists(config.DATA_FILE) or os.access(config.DATA_FILE, os.W_OK)
+        )
+    except OSError:
+        writable = False
+    with _status_lock:
+        return {
+            "DataFile": config.DATA_FILE,
+            "Writable": writable,
+            "LastWriteOK": _last_write_ok,
+            "LastError": _last_error,
+            "LastErrorAt": _last_error_at,
+        }
+
 
 def _lock_path() -> str:
     return config.DATA_FILE + ".lock"
+
+
+def _backup_path() -> str:
+    return config.DATA_FILE + ".bak"
 
 
 @contextmanager
@@ -33,9 +81,25 @@ def _interprocess_lock():
 
 
 def load_data() -> dict:
-    """Load the persisted state file. Returns an empty dict if missing or unreadable."""
+    """Load the persisted state file, falling back to the rolling backup.
+
+    A corrupt main file is quarantined (renamed aside) instead of being
+    silently overwritten, so stats are never lost without a trace.
+    """
     try:
         with open(config.DATA_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        pass
+    except json.JSONDecodeError:
+        try:
+            os.replace(config.DATA_FILE, config.DATA_FILE + f".corrupt-{int(time.time())}")
+        except OSError:
+            pass
+    except OSError:
+        pass
+    try:
+        with open(_backup_path(), "r", encoding="utf-8") as file:
             return json.load(file)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
@@ -63,14 +127,26 @@ def _write_atomic(data: dict):
             os.remove(tmp_path)
 
 
+def _after_successful_write():
+    """Bookkeeping + rolling backup. Called while holding the write locks."""
+    count = _record_write_ok()
+    if count % BACKUP_EVERY == 0:
+        try:
+            shutil.copy2(config.DATA_FILE, _backup_path())
+        except OSError:
+            pass  # Backups are best-effort.
+
+
 def save_data(data: dict) -> bool:
     """Atomically write minified JSON to disk. Returns True on success."""
     with _io_lock:
         try:
             with _interprocess_lock():
                 _write_atomic(data)
+                _after_successful_write()
             return True
-        except OSError:
+        except OSError as error:
+            _record_write_error(error)
             return False
 
 
@@ -83,13 +159,18 @@ def update_data(mutator) -> dict:
     Returns the final data dict that was written.
     """
     with _io_lock:
-        with _interprocess_lock():
-            data = load_data()
-            result = mutator(data)
-            if result is not None:
-                data = result
-            _write_atomic(data)
-            return data
+        try:
+            with _interprocess_lock():
+                data = load_data()
+                result = mutator(data)
+                if result is not None:
+                    data = result
+                _write_atomic(data)
+                _after_successful_write()
+                return data
+        except OSError as error:
+            _record_write_error(error)
+            raise
 
 
 def start_autosave(flush):

@@ -121,6 +121,23 @@ exploit_summary = dict()  # reason -> {Count, LastSeen}
 # Ring buffer of the most recent proxied requests for the live feed.
 live_requests = list()
 
+# Proxied requests per minute bucket: {"<epoch_minute>": {"Successful": n, "Failed": n}}.
+# Keys are strings because the JSON persistence round-trip stringifies them anyway.
+traffic_minutes = dict()
+
+# Requests refused because the internal token hit its safety budget.
+token_budget = dict({"Rejections": 0})
+
+# When this worker process started (not persisted; for the dashboard uptime card).
+_started_at = time.time()
+
+
+def _cap(setting_name: str, fallback: int) -> int:
+    """A runtime-tunable record cap. NOTE: 0 is a valid configured value (it
+    disables the record type), so this must not use `or fallback`."""
+    value = runtime.get_setting(setting_name)
+    return fallback if value is None else value
+
 
 def _is_crawler(user_agent: str) -> bool:
     ua = (user_agent or "").lower()
@@ -157,7 +174,7 @@ def decrement_admin_visit():
 def log_throttle(ip: str):
     global throttled_ips
     now = time.time()
-    cap = runtime.get_setting("max_throttle_records") or config.MAX_THROTTLE_RECORDS
+    cap = _cap("max_throttle_records", config.MAX_THROTTLE_RECORDS)
     with _state_lock:
         if ip in throttled_ips:
             throttled_ips[ip]["Count"] += 1
@@ -172,7 +189,7 @@ def log_throttle(ip: str):
 def log_crawl(ip: str):
     global crawls
     now = time.time()
-    cap = runtime.get_setting("max_crawl_records") or config.MAX_CRAWL_RECORDS
+    cap = _cap("max_crawl_records", config.MAX_CRAWL_RECORDS)
     with _state_lock:
         if ip in crawls:
             crawls[ip]["Count"] += 1
@@ -185,7 +202,7 @@ def log_crawl(ip: str):
 
 
 def log_exploit_attempt(ip: str, reason: str, user_agent: str):
-    cap = runtime.get_setting("max_exploit_records") or config.MAX_EXPLOIT_RECORDS
+    cap = _cap("max_exploit_records", config.MAX_EXPLOIT_RECORDS)
     with _state_lock:
         exploit_attempts.append(dict(IP=ip, Date=time.time(), Reason=reason, UserAgent=user_agent))
         while len(exploit_attempts) > cap:
@@ -208,7 +225,7 @@ def log_endpoint(path: str, method: str):
     path = (path or "").split("?", 1)[0].strip("/")
     if not path:
         return
-    cap = runtime.get_setting("max_endpoint_records") or config.MAX_ENDPOINT_RECORDS
+    cap = _cap("max_endpoint_records", config.MAX_ENDPOINT_RECORDS)
     with _state_lock:
         record = endpoints.get(path)
         if record:
@@ -238,7 +255,7 @@ def _log_rejected_endpoint(store: dict, path: str, method: str, ip: str, pattern
     if not path:
         return
     now = time.time()
-    cap = runtime.get_setting("max_endpoint_records") or config.MAX_ENDPOINT_RECORDS
+    cap = _cap("max_endpoint_records", config.MAX_ENDPOINT_RECORDS)
     with _state_lock:
         record = store.get(path)
         if record:
@@ -258,6 +275,12 @@ def _log_rejected_endpoint(store: dict, path: str, method: str, ip: str, pattern
             store[path] = dict(
                 Count=1, LastRequestTime=now, Pattern=pattern, LastIP=ip, Methods={method: 1}, IPs={ip: 1}
             )
+
+
+def log_budget_rejection():
+    """Record a request refused because the internal token hit its safety budget."""
+    with _state_lock:
+        token_budget["Rejections"] = token_budget.get("Rejections", 0) + 1
 
 
 def log_retry(status_code: int, reason: str = ""):
@@ -281,7 +304,7 @@ def log_reason(is_custom: bool):
 
 def log_live_request(entry: dict):
     """Append a recent request to the live feed ring buffer."""
-    cap = runtime.get_setting("max_live_requests") or config.MAX_LIVE_REQUESTS
+    cap = _cap("max_live_requests", config.MAX_LIVE_REQUESTS)
     with _state_lock:
         live_requests.append(entry)
         while len(live_requests) > cap:
@@ -289,11 +312,17 @@ def log_live_request(entry: dict):
 
 
 def log_login_attempt(ip: str, successful: bool):
-    cap = runtime.get_setting("max_login_records") or config.MAX_LOGIN_RECORDS
+    cap = _cap("max_login_records", config.MAX_LOGIN_RECORDS)
     with _state_lock:
         login_attempts.append(dict(IP=ip, Date=time.time(), Successful=successful))
         while len(login_attempts) > cap:
             login_attempts.pop(0)
+
+
+def _prune_traffic_unlocked(store: dict):
+    cutoff = int(time.time() // 60) - config.TRAFFIC_HISTORY_MINUTES
+    for key in [k for k in store if not str(k).isdigit() or int(k) < cutoff]:
+        store.pop(key, None)
 
 
 def log_request(method: str, successful: bool):
@@ -303,6 +332,13 @@ def log_request(method: str, successful: bool):
                 request_counts[method]["Successful"] += 1
             else:
                 request_counts[method]["Failed"] += 1
+        # Per-minute traffic series for the dashboard chart.
+        bucket = str(int(time.time() // 60))
+        entry = traffic_minutes.get(bucket)
+        if entry is None:
+            _prune_traffic_unlocked(traffic_minutes)
+            entry = traffic_minutes[bucket] = {"Successful": 0, "Failed": 0}
+        entry["Successful" if successful else "Failed"] += 1
 
 
 def log_status_code(status_code: int):
@@ -398,6 +434,10 @@ def get_diagnostics() -> dict:
                 "ReasonCounts": reason_counts,
                 "LiveRequests": list(reversed(live_requests)),  # Most-recent first.
                 "Tokens": list(tokens.values()),
+                "TrafficMinutes": traffic_minutes,
+                "TokenBudgetRejections": token_budget.get("Rejections", 0),
+                "ServerTime": time.time(),
+                "WorkerStartedAt": _started_at,
             }
         )
 
@@ -422,7 +462,85 @@ _PERSISTED_NAMES = (
     "retry_counts",
     "reason_counts",
     "live_requests",
+    "traffic_minutes",
+    "token_budget",
 )
+
+# Pristine copies of every persisted structure, captured at import (before any
+# saved data is restored), so "clear" can reset a structure to its true initial
+# shape (e.g. request_counts keeps its method keys at 0).
+_INITIAL_SHAPES = {name: copy.deepcopy(globals()[name]) for name in _PERSISTED_NAMES}
+
+# ClearEpochs this worker has already applied (name -> epoch timestamp). The
+# shared file carries the authoritative ClearEpochs map; every flush applies
+# any epochs newer than these before merging, so a "clear" on one worker can
+# never be resurrected by another worker's stale in-memory copy.
+_applied_clear_epochs = dict()
+
+# Section-clear targets exposed to the admin API: target -> structures it wipes.
+CLEAR_TARGETS = {
+    "probes": ("exploit_attempts", "exploit_summary"),
+    "requests": (
+        "request_counts",
+        "status_code_counts",
+        "status_codes_detailed",
+        "proxy_request_counts",
+        "retry_counts",
+        "reason_counts",
+        "traffic_minutes",
+        "token_budget",
+    ),
+    "endpoints": ("endpoints",),
+    "blocked_attempts": ("blocked_endpoint_attempts",),
+    "rate_limited_attempts": ("rate_limited_attempts",),
+    "live": ("live_requests",),
+    "logins": ("login_attempts",),
+    "crawls": ("crawls",),
+    "throttled": ("throttled_ips",),
+    "visits": ("page_visits", "visitor_counts"),
+}
+
+
+def _reset_name_unlocked(name: str):
+    """Reset one persisted structure to its pristine shape, in place."""
+    target = globals()[name]
+    pristine = copy.deepcopy(_INITIAL_SHAPES[name])
+    if isinstance(target, dict):
+        target.clear()
+        target.update(pristine)
+    elif isinstance(target, list):
+        target.clear()
+        target.extend(pristine)
+
+
+def clear_stats(names: tuple) -> bool:
+    """Manually wipe the given structures everywhere: this worker's memory, the
+    shared file, and (via ClearEpochs) every other worker at its next flush.
+    Returns False if the file write failed (memory is still cleared locally)."""
+    global _baseline
+    now = time.time()
+    with _state_lock:
+        for name in names:
+            _reset_name_unlocked(name)
+            if isinstance(_baseline, dict):
+                _baseline[name] = copy.deepcopy(_INITIAL_SHAPES[name])
+            _applied_clear_epochs[name] = now
+
+        def mutate(data):
+            diag = data.setdefault("Diagnostics", {})
+            if not isinstance(diag, dict):
+                diag = data["Diagnostics"] = {}
+            epochs = diag.setdefault("ClearEpochs", {})
+            for name in names:
+                diag[name] = copy.deepcopy(_INITIAL_SHAPES[name])
+                epochs[name] = now
+            return data
+
+        try:
+            storage.update_data(mutate)
+            return True
+        except OSError:
+            return False
 
 
 def serialize() -> dict:
@@ -468,7 +586,9 @@ _LIST_CAP_SETTINGS = {
 
 def _list_cap(key: str) -> int:
     setting, fallback = _LIST_CAP_SETTINGS.get(key, (None, 50))
-    return (runtime.get_setting(setting) if setting else None) or fallback
+    if setting is None:
+        return fallback
+    return _cap(setting, fallback)
 
 
 def _merge_list(key, shared_list, local_list):
@@ -539,7 +659,24 @@ def _flush():
         base = _baseline if _baseline is not None else {name: None for name in _PERSISTED_NAMES}
 
         def mutate(data):
-            data["Diagnostics"] = _merge_stats(data.get("Diagnostics", {}), local, base)
+            shared = data.get("Diagnostics", {})
+            if not isinstance(shared, dict):
+                shared = {}
+            # Apply any clears other workers issued since our last flush BEFORE
+            # merging, so our stale in-memory copies can't resurrect wiped data.
+            epochs = shared.get("ClearEpochs", {})
+            if isinstance(epochs, dict):
+                for name, epoch in epochs.items():
+                    if name in _PERSISTED_NAMES and float(epoch) > _applied_clear_epochs.get(name, 0.0):
+                        _reset_name_unlocked(name)
+                        local[name] = copy.deepcopy(_INITIAL_SHAPES[name])
+                        base[name] = copy.deepcopy(_INITIAL_SHAPES[name])
+                        _applied_clear_epochs[name] = float(epoch)
+            data["Diagnostics"] = _merge_stats(shared, local, base)
+            # Old minute buckets only the file still has would otherwise live forever.
+            merged_traffic = data["Diagnostics"].get("traffic_minutes")
+            if isinstance(merged_traffic, dict):
+                _prune_traffic_unlocked(merged_traffic)
             return data
 
         merged = storage.update_data(mutate)
@@ -551,7 +688,13 @@ def _bootstrap():
     """Load persisted stats on import and start the cross-worker autosave flush."""
     global _baseline
     saved = storage.load_data()
-    restore(saved.get("Diagnostics", {}))
+    diag = saved.get("Diagnostics", {})
+    if isinstance(diag, dict):
+        # The loaded data already reflects past clears; adopt their epochs.
+        epochs = diag.get("ClearEpochs", {})
+        if isinstance(epochs, dict):
+            _applied_clear_epochs.update({str(k): float(v) for k, v in epochs.items()})
+        restore(diag)
     _baseline = serialize()  # Loaded state is the baseline so the first flush only adds new events.
     storage.start_autosave(_flush)
 
