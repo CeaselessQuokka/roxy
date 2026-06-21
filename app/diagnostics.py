@@ -121,7 +121,10 @@ proxy_health = dict(
         # Count = nRequests; Failed = nNon-200 responses; Timeouts = nUpstream timeouts.
         "DirectAPI": dict({"Count": 0, "Failed": 0, "Timeouts": 0, "LastRequestTime": 0, "IsInCooldown": False}),
         "RoProxy": dict({"Count": 0, "Failed": 0, "Timeouts": 0, "LastRequestTime": 0, "IsInCooldown": False}),
-        "Tokens": dict({"Count": 0, "ExpiredCount": 0, "BeingValidatedCount": 0, "Timeouts": 0}),  # Count = nTokens.
+        # Count = nTokens loaded; Requests/Failed = token-route request totals.
+        "Tokens": dict(
+            {"Count": 0, "ExpiredCount": 0, "BeingValidatedCount": 0, "Timeouts": 0, "Requests": 0, "Failed": 0}
+        ),
     }
 )
 
@@ -196,6 +199,16 @@ token_budget = dict({"Rejections": 0})
 # Requests dropped during downtime (reset at the start of each downtime via clear_stats).
 pause_drops = dict({"Count": 0})
 throttle_drops = dict({"Count": 0})
+
+# Server/upstream errors, deduped by signature: sig -> {Count, FirstSeen, LastSeen, LastDetail}.
+# Distinct errors are retained until the admin clears them (high cap as an OOM guard only).
+errors = dict()
+
+# Request fingerprints for spotting abusive clients:
+#   header_names: lowercased header NAME -> {Count, LastSeen}
+#   user_agents:  full User-Agent VALUE -> {Count, LastSeen}
+header_names = dict()
+user_agents = dict()
 
 # Per-minute PEAK of the token's sliding-window usage:
 # {"<epoch_minute>": {"Max": peak_usage}}. "Max" leaf so cross-worker merges take
@@ -293,12 +306,16 @@ def log_exploit_attempt(ip: str, reason: str, user_agent: str):
                 exploit_summary.pop(least, None)
 
 
-def log_endpoint(path: str, method: str):
+def log_endpoint(path: str, method: str, last_headers: str = "", last_ip: str = ""):
     """Record which Roblox endpoint was requested, keeping the most-frequent ones.
 
     Paths are grouped under an ID-collapsed template so volatile IDs don't blow
     up cardinality; the real paths seen under each template are kept (capped) so
-    the dashboard can drill into the specific IDs on demand.
+    the dashboard can drill into the specific IDs — and each concrete path keeps
+    the last sanitized headers/IP that were sent to it.
+
+    `last_headers` is a pre-sanitized JSON string (secrets already redacted by the
+    caller); stored as-is so the cross-worker merge treats it as last-writer-wins.
     """
     # Strip query string and normalize so similar paths group together.
     path = (path or "").split("?", 1)[0].strip("/")
@@ -327,11 +344,16 @@ def log_endpoint(path: str, method: str):
                 c["Count"] += 1
                 c["LastRequestTime"] = now
                 c["Methods"][method] = c["Methods"].get(method, 0) + 1
+                if last_headers:
+                    c["LastHeaders"] = last_headers
+                    c["LastIP"] = last_ip
             else:
                 if len(concrete) >= MAX_CONCRETE_PER_TEMPLATE:
                     least = min(concrete.items(), key=lambda kv: kv[1]["Count"])[0]
                     concrete.pop(least, None)
-                concrete[path] = dict(Count=1, LastRequestTime=now, Methods={method: 1})
+                concrete[path] = dict(
+                    Count=1, LastRequestTime=now, Methods={method: 1}, LastHeaders=last_headers, LastIP=last_ip
+                )
 
 
 def log_blocked_endpoint(path: str, method: str, ip: str, pattern: str):
@@ -481,10 +503,62 @@ def log_route_timeout(is_roproxy: bool):
         proxy_health[route]["Timeouts"] = proxy_health[route].get("Timeouts", 0) + 1
 
 
+def log_token_result(success: bool):
+    """Count a token-route request and whether it was rejected (non-200)."""
+    with _state_lock:
+        proxy_health["Tokens"]["Requests"] = proxy_health["Tokens"].get("Requests", 0) + 1
+        if not success:
+            proxy_health["Tokens"]["Failed"] = proxy_health["Tokens"].get("Failed", 0) + 1
+
+
 def log_token_timeout():
     """Count an upstream timeout while using the internal token."""
     with _state_lock:
         proxy_health["Tokens"]["Timeouts"] = proxy_health["Tokens"].get("Timeouts", 0) + 1
+
+
+def log_error(signature: str, detail: str = ""):
+    """Record a server/upstream error, deduped by signature with a frequency count.
+
+    Distinct errors are kept until the admin clears them (capped only to guard
+    against an attacker deliberately generating unbounded error variety)."""
+    signature = (signature or "Unknown error")[:200]
+    now = time.time()
+    with _state_lock:
+        rec = errors.get(signature)
+        if rec:
+            rec["Count"] += 1
+            rec["LastSeen"] = now
+            if detail:
+                rec["LastDetail"] = str(detail)[:2000]
+        else:
+            if len(errors) >= config.MAX_ERROR_RECORDS:
+                least = min(errors.items(), key=lambda kv: kv[1]["Count"])[0]
+                errors.pop(least, None)
+            errors[signature] = dict(Count=1, FirstSeen=now, LastSeen=now, LastDetail=str(detail)[:2000])
+
+
+def _log_fingerprint(store: dict, key: str, cap: int):
+    if not key:
+        return
+    now = time.time()
+    rec = store.get(key)
+    if rec:
+        rec["Count"] += 1
+        rec["LastSeen"] = now
+    else:
+        if len(store) >= cap:
+            least = min(store.items(), key=lambda kv: kv[1]["Count"])[0]
+            store.pop(least, None)
+        store[key] = dict(Count=1, FirstSeen=now, LastSeen=now)
+
+
+def log_request_fingerprint(header_names_seen, user_agent: str):
+    """Track the distinct header names and user-agent of a proxied request."""
+    with _state_lock:
+        for name in header_names_seen:
+            _log_fingerprint(header_names, str(name).lower()[:120], config.MAX_HEADER_NAME_RECORDS)
+        _log_fingerprint(user_agents, (user_agent or "(none)")[:400], config.MAX_USER_AGENT_RECORDS)
 
 
 def log_pause_drop():
@@ -655,6 +729,9 @@ def get_diagnostics() -> dict:
                 "BudgetPeak24h": _budget_peak_since(1440),
                 "PauseDrops": pause_drops.get("Count", 0),
                 "ThrottleAllDrops": throttle_drops.get("Count", 0),
+                "Errors": errors,
+                "HeaderNames": header_names,
+                "UserAgents": user_agents,
                 "ServerTime": time.time(),
                 "WorkerStartedAt": _started_at,
             }
@@ -687,6 +764,9 @@ _PERSISTED_NAMES = (
     "token_budget_minutes",
     "pause_drops",
     "throttle_drops",
+    "errors",
+    "header_names",
+    "user_agents",
 )
 
 # Pristine copies of every persisted structure, captured at import (before any
@@ -725,7 +805,12 @@ CLEAR_TARGETS = {
     "crawls": ("crawls",),
     "throttled": ("throttled_ips",),
     "visits": ("page_visits", "visitor_counts"),
+    "errors": ("errors",),
+    "fingerprints": ("header_names", "user_agents"),
 }
+
+# "all" clears every distinct structure exactly once (no cross-clear, no repeats).
+CLEAR_ALL_NAMES = tuple(dict.fromkeys(name for names in CLEAR_TARGETS.values() for name in names))
 
 
 def _reset_name_unlocked(name: str):
@@ -803,7 +888,7 @@ def restore(data: dict):
 _baseline = None
 
 _MAX_KEYS = {"Max", "LastRequestTime", "LastThrottleTime", "LastSeen"}
-_MIN_KEYS = {"Min"}
+_MIN_KEYS = {"Min", "FirstSeen"}
 _LIST_CAP_SETTINGS = {
     "exploit_attempts": ("max_exploit_records", config.MAX_EXPLOIT_RECORDS),
     "login_attempts": ("max_login_records", config.MAX_LOGIN_RECORDS),

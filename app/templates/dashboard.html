@@ -23,6 +23,9 @@
 				<h1 class="app-title">Roxy Admin</h1>
 			</div>
 			<div class="app-bar__section app-bar__section--end">
+				<button type="button" class="btn btn--outline" id="navRefresh" title="Refresh all dashboard data">
+					⟳ Refresh
+				</button>
 				<span id="proxyStatusChip" class="chip" aria-live="polite" aria-atomic="true">Proxy: …</span>
 				<button
 					type="button"
@@ -84,6 +87,8 @@
 					<li><a class="nav__link" href="#section-retries">Retries</a></li>
 					<li><a class="nav__link" href="#section-proxy">Proxy Timings</a></li>
 					<li><a class="nav__link" href="#section-probes">Exploit / Probe Attempts</a></li>
+					<li><a class="nav__link" href="#section-fingerprints">Request Fingerprints</a></li>
+					<li><a class="nav__link" href="#section-errors">Error Log</a></li>
 					<li><a class="nav__link" href="#section-logins">Admin Logins</a></li>
 					<li><a class="nav__link" href="#section-settings">Settings</a></li>
 					<li><a class="nav__link" href="#section-health">Health</a></li>
@@ -224,6 +229,22 @@
 									maxlength="300"
 									placeholder="e.g. High load — please slow down."
 								/>
+							</div>
+						</article>
+
+						<article class="card">
+							<h3 class="card__title">Trusted Devices</h3>
+							<p class="form__hint">
+								A trusted device skips the email 2FA step for 30 days (you still enter your
+								username/password). Tick <em>Trust this device</em> on the login screen to enrol the
+								browser you're on. This browser is currently:
+								<strong id="trustedThisDevice">—</strong>.
+							</p>
+							<div class="form__row">
+								<span class="chip">Trusted devices: <strong id="trustedCount">0</strong></span>
+								<button id="revokeTrustedBtn" type="button" class="btn btn--warning">
+									Revoke all trusted devices
+								</button>
 							</div>
 						</article>
 					</div>
@@ -1045,6 +1066,112 @@
 					</div>
 				</section>
 
+				<!-- Request Fingerprints (unique header names + user-agents) -->
+				<section id="section-fingerprints" class="section" aria-labelledby="fingerprintsHeading">
+					<div class="section__header">
+						<h2 id="fingerprintsHeading" class="section__title">Request Fingerprints</h2>
+						<div class="section__actions">
+							<button id="exportFingerprints" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+					<div class="grid grid--cards">
+						<article class="card">
+							<h3 class="card__title">Header Names <span id="headerNamesTotal" class="chip">0 distinct</span></h3>
+							<p class="form__hint">
+								Every distinct header NAME seen across proxied requests, by frequency. Exploit tooling
+								often tags traffic with tell-tale headers (e.g. <code>Exploit-Guid</code>) — copy one into
+								Request Filters to block it.
+							</p>
+							<input
+								id="headerNamesFilter"
+								class="input input--filter"
+								type="search"
+								placeholder="Filter header names…"
+								aria-label="Filter header names"
+							/>
+							<div class="table-wrap">
+								<table id="headerNamesTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Header Name</th>
+											<th scope="col">Count</th>
+											<th scope="col">Last Seen</th>
+										</tr>
+									</thead>
+									<tbody></tbody>
+								</table>
+							</div>
+						</article>
+
+						<article class="card">
+							<h3 class="card__title">User-Agents <span id="userAgentsTotal" class="chip">0 distinct</span></h3>
+							<p class="form__hint">
+								Every distinct <code>User-Agent</code> seen, by frequency. Spot the exploiter's client and
+								block it via a Request Filter on the User-Agent value.
+							</p>
+							<input
+								id="userAgentsFilter"
+								class="input input--filter"
+								type="search"
+								placeholder="Filter user-agents…"
+								aria-label="Filter user-agents"
+							/>
+							<div class="table-wrap">
+								<table id="userAgentsTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">User-Agent</th>
+											<th scope="col">Count</th>
+											<th scope="col">Last Seen</th>
+										</tr>
+									</thead>
+									<tbody></tbody>
+								</table>
+							</div>
+						</article>
+					</div>
+				</section>
+
+				<!-- Error Log -->
+				<section id="section-errors" class="section" aria-labelledby="errorsHeading">
+					<div class="section__header">
+						<h2 id="errorsHeading" class="section__title">Error Log</h2>
+						<div class="section__actions">
+							<span id="errorsTotal" class="chip">0 distinct</span>
+							<button id="exportErrors" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							Server and upstream errors, deduped by signature with a frequency count. Distinct errors are
+							kept until you clear them — nothing is dropped as more accumulate. Click a row to see the
+							latest detail/traceback.
+						</p>
+						<input
+							id="errorsFilter"
+							class="input input--filter"
+							type="search"
+							placeholder="Filter errors…"
+							aria-label="Filter errors"
+						/>
+						<div class="table-wrap">
+							<table id="errorsTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Error</th>
+										<th scope="col">Count</th>
+										<th scope="col">First Seen</th>
+										<th scope="col">Last Seen</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- rows from Errors -->
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
 				<!-- Admin Login Events -->
 				<section id="section-logins" class="section" aria-labelledby="loginsHeading">
 					<div class="section__header">
@@ -1147,9 +1274,11 @@
 							<h3 class="kpi__title">Tokens</h3>
 							<div class="kpi__value" id="health_tokens_count">0</div>
 							<div class="kpi__meta">
+								Requests: <span id="health_tokens_requests">0</span> • Rejected:
+								<span id="health_tokens_failed">0</span> • Timeouts:
+								<span id="health_tokens_timeouts">0</span><br />
 								Expired: <span id="health_tokens_expired">0</span> • Being Validated:
-								<span id="health_tokens_validating">0</span> • Timeouts:
-								<span id="health_tokens_timeouts">0</span>
+								<span id="health_tokens_validating">0</span>
 							</div>
 						</article>
 
@@ -1211,8 +1340,23 @@
 
 						<article class="card">
 							<h3 class="card__title">Health Check</h3>
-							<p class="card__desc">Ping the internal /health endpoint.</p>
-							<button class="btn btn--outline" type="button" id="healthCheckBtn">Run</button>
+							<p class="card__desc">
+								Confirms the Flask app itself is alive and reachable: it calls the public
+								<code>/health</code> endpoint and reports whether the server responds and whether the proxy
+								is currently paused. It does <strong>not</strong> contact Roblox or test your tokens — use
+								<em>Force Revalidate</em> for that. A quick "is the server up?" ping.
+							</p>
+							<button class="btn btn--outline" type="button" id="healthCheckBtn">Run health check</button>
+						</article>
+
+						<article class="card">
+							<h3 class="card__title">Clear All Data</h3>
+							<p class="card__desc">
+								Permanently wipe <strong>every</strong> diagnostics section at once (stats, logs,
+								endpoints, fingerprints, errors…). Does not touch settings, tokens, endpoint/header rules,
+								or trusted devices.
+							</p>
+							<button class="btn btn--warning" type="button" id="clearAllBtn">Clear All Data</button>
 						</article>
 					</div>
 				</section>

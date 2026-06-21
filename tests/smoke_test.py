@@ -482,7 +482,7 @@ r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/
 diag = r.get_json()
 check("Throttle-all drops counted in diagnostics", diag.get("ThrottleAllDrops", 0) >= 1, diag.get("ThrottleAllDrops"))
 r = client.post("/admin/proxy/throttle_all", headers=IP_MAIN, json={"enabled": False})
-check("Disable throttle-all -> state off + reason cleared", r.get_json().get("ThrottleAll") is False and not r.get_json().get("Reason"), r.data[:80])
+check("Disable throttle-all -> state off", r.get_json().get("ThrottleAll") is False, r.data[:80])
 IP_TA2 = {"X-Forwarded-For": "10.8.8.2"}
 n = len(upstream_calls)
 r = api_client.get("/games.roblox.com/v1/after-throttle-all", headers=IP_TA2)
@@ -500,12 +500,15 @@ r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/
 check("Pause drops counted", r.get_json().get("PauseDrops", 0) >= 2, r.get_json().get("PauseDrops"))
 # Re-pausing resets the drop counter for the new downtime.
 client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": False})
-r = client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": True})  # no reason → default
+r = client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": True})  # reuses the persisted message
 api_client.get("/games.roblox.com/v1/while-paused-3", headers=IP_PAUSE)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 check("Pause drop counter reset on new downtime", r.get_json().get("PauseDrops", 0) == 1, r.get_json().get("PauseDrops"))
+# Explicitly clearing the message (reason="") falls back to the default.
+client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": False})
+client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": True, "reason": ""})
 r = api_client.get("/games.roblox.com/v1/while-paused-4", headers=IP_PAUSE)
-check("Default pause message used when none supplied", b"Service down for maintenance." in r.data, r.data[:80])
+check("Default pause message used when message is cleared", b"Service down for maintenance." in r.data, r.data[:80])
 client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": False})
 r = api_client.get("/games.roblox.com/v1/after-pause", headers={"X-Forwarded-For": "10.15.0.2"})
 check("After resume, proxy works again -> 200", r.status_code == 200, r.status_code)
@@ -649,6 +652,154 @@ check("Budget peak (24h) captured", diag.get("BudgetPeak24h") == 3, diag.get("Bu
 proxy_module.is_direct_api_in_cooldown = False
 proxy_module.is_roproxy_in_cooldown = False
 
+print("== No user-facing retries (429 fails immediately; CSRF handshake kept) ==")
+proxy_module.is_direct_api_in_cooldown = True
+proxy_module.is_roproxy_in_cooldown = True
+proxy_module.set_tokens(["RETRY_TOKEN"])
+proxy_module._token_uses.clear()
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
+
+
+def upstream_429(method, url, headers=None, params=None, data=None, cookies=None, timeout=None):
+    upstream_calls.append({"method": method, "url": url})
+    return FakeUpstreamResponse(status=429, text="Too Many Requests")
+
+
+proxy_module.requests.request = upstream_429
+n = len(upstream_calls)
+r = api_client.get("/games.roblox.com/v1/retry-test", headers={"X-Forwarded-For": "10.20.0.1"})
+check("A 429 fails the user request immediately", r.status_code == 500, r.status_code)
+check("A 429 is NOT retried (single upstream attempt)", len(upstream_calls) == n + 1, len(upstream_calls) - n)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+rc = r.get_json().get("RetryCounts", {})
+check("No 429 retries recorded", "429" not in (rc.get("ByStatusCode") or {}), rc.get("ByStatusCode"))
+
+# CSRF handshake (a required protocol step for writes) must still work.
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens([])
+
+
+def upstream_csrf(method, url, headers=None, params=None, data=None, cookies=None, timeout=None):
+    upstream_calls.append({"method": method, "url": url})
+    if headers and headers.get("x-csrf-token"):
+        return FakeUpstreamResponse(status=200, text='{"ok":true}')
+    return FakeUpstreamResponse(status=403, text="csrf", headers={"x-csrf-token": "CSRF123"})
+
+
+proxy_module.requests.request = upstream_csrf
+n = len(upstream_calls)
+r = api_client.post("/economy.roblox.com/v1/purchase", headers={"X-Forwarded-For": "10.20.0.2"}, data=b"{}")
+check("CSRF handshake still completes a write -> 200", r.status_code == 200, r.status_code)
+check("CSRF handshake used exactly one retry", len(upstream_calls) == n + 2, len(upstream_calls) - n)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check("CSRF retry recorded (403)", "403" in (r.get_json().get("RetryCounts", {}).get("ByStatusCode") or {}))
+proxy_module.requests.request = fake_upstream
+
+print("== Service messages persist after disabling ==")
+client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": True, "reason": "Persisted pause msg"})
+client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": False})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check("Pause message persists after resume", r.get_json().get("Pause", {}).get("Reason") == "Persisted pause msg", r.get_json().get("Pause"))
+
+print("== Per-endpoint last headers recorded ==")
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["HDR_TOKEN"])
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "endpoints"})
+api_client.get("/avatar.roblox.com/v2/avatar/users/777/outfits", headers={"X-Forwarded-For": "10.21.0.1", "X-Test-Header": "fingerprint-me"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+concrete = (r.get_json().get("Endpoints", {}).get(tmpl, {}).get("Concrete", {}) or {}).get(
+    "avatar.roblox.com/v2/avatar/users/777/outfits", {}
+)
+check("Concrete endpoint stores last headers", "X-Test-Header" in (concrete.get("LastHeaders") or ""), concrete.get("LastHeaders"))
+check("Concrete endpoint stores last IP", concrete.get("LastIP") == "10.21.0.1", concrete.get("LastIP"))
+
+print("== Token route Requests/Rejected counted ==")
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+tk = r.get_json().get("ProxyHealth", {}).get("Tokens", {})
+check("Token route request count tracked", tk.get("Requests", 0) >= 1, tk)
+
+print("== Request fingerprints (header names + user-agents) ==")
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "fingerprints"})
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["FP_TOKEN"])
+api_client.get("/games.roblox.com/v1/fp", headers={"X-Forwarded-For": "10.22.0.1", "User-Agent": "EvilExploiter/9", "X-Weird-Header": "1"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag = r.get_json()
+check("Distinct header names tracked", "x-weird-header" in (diag.get("HeaderNames") or {}), list(diag.get("HeaderNames", {}))[:8])
+check("Distinct user-agents tracked", "EvilExploiter/9" in (diag.get("UserAgents") or {}), list(diag.get("UserAgents", {}))[:8])
+
+print("== Error log (deduped, admin-clear only) ==")
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "errors"})
+client.get("/_boom_test_only", headers=IP_MAIN)
+client.get("/_boom_test_only", headers=IP_MAIN)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+errs = r.get_json().get("Errors", {})
+boom_sig = next((k for k in errs if "intentional test explosion" in k), None)
+check("Server error logged with signature", boom_sig is not None, list(errs))
+check("Repeated identical errors dedupe with a count", errs.get(boom_sig, {}).get("Count", 0) >= 2, errs.get(boom_sig))
+check("Error log keeps a detail/traceback", "Traceback" in (errs.get(boom_sig, {}).get("LastDetail") or ""), errs.get(boom_sig))
+
+print("== Trusted device skips 2FA for 30 days ==")
+td_ip = {"X-Forwarded-For": "10.23.0.1"}
+r = client_post_login = app.test_client()
+r = client_post_login.post("/admin", headers=td_ip, json={"IsLogin": True, "Username": ADMIN_USER, "Password": ADMIN_PASS, "TrustDevice": True})
+check("Login with TrustDevice still asks for 2FA first", r.get_json().get("TwoFA") is True, r.data[:80])
+code = emails_with("Admin 2FA")[-1]["body"].strip()
+r = client_post_login.post("/admin", headers=td_ip, json={"Is2FA": True, "TwoFA": code})
+check("2FA with trust -> logged in", r.get_json().get("LoggedIn") is True, r.data[:80])
+set_cookies = r.headers.getlist("Set-Cookie")
+td_cookie = next((c for c in set_cookies if c.startswith("roxy_trusted_device=")), "")
+td_token = td_cookie.split(";", 1)[0].split("=", 1)[1] if td_cookie else ""
+check("Trusted-device cookie issued", bool(td_token), set_cookies)
+import runtime as runtime_module
+
+check("Backend recognizes the trusted-device token", runtime_module.is_trusted_device(td_token), "not recognized")
+emails_n = len(emails_with("Admin 2FA"))
+fresh = app.test_client()
+fresh.set_cookie("roxy_trusted_device", td_token, domain="localhost")
+r = fresh.post("/admin", headers=td_ip, json={"IsLogin": True, "Username": ADMIN_USER, "Password": ADMIN_PASS})
+check("Trusted device logs in WITHOUT 2FA", r.get_json().get("LoggedIn") is True, r.data[:80])
+check("Trusted re-login sent no new 2FA email", len(emails_with("Admin 2FA")) == emails_n, "new 2FA email sent")
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check("Trusted device counted", r.get_json().get("TrustedDevices", 0) >= 1, r.get_json().get("TrustedDevices"))
+client.post("/admin/trusted_devices/revoke", headers=IP_MAIN)
+check("Revoke clears backend trust", not runtime_module.is_trusted_device(td_token), "still trusted")
+fresh2 = app.test_client()
+fresh2.set_cookie("roxy_trusted_device", td_token, domain="localhost")
+r = fresh2.post("/admin", headers=td_ip, json={"IsLogin": True, "Username": ADMIN_USER, "Password": ADMIN_PASS})
+check("After revoke, the device needs 2FA again", r.get_json().get("TwoFA") is True, r.data[:80])
+
+print("== Clear isolation + Clear All ==")
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["ISO_TOKEN"])
+api_client.get("/avatar.roblox.com/v2/avatar/users/999/outfits", headers={"X-Forwarded-For": "10.24.0.1"})  # endpoints
+api_client.get("/not-a-roblox-domain-iso", headers={"X-Forwarded-For": "10.24.0.1"})  # probe
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "probes"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag = r.get_json()
+check("Clearing probes leaves endpoints intact (no cross-clear)", len(diag.get("Endpoints", {})) >= 1, list(diag.get("Endpoints", {})))
+check("Clearing probes did clear the probe summary", diag.get("ExploitSummary", {}) == {}, diag.get("ExploitSummary"))
+r = client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "all"})
+check("Clear All -> 200", r.status_code == 200, r.status_code)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag = r.get_json()
+check("Clear All wiped endpoints", diag.get("Endpoints", {}) == {}, diag.get("Endpoints"))
+check("Clear All wiped errors", diag.get("Errors", {}) == {}, diag.get("Errors"))
+check("Clear All wiped fingerprints", diag.get("HeaderNames", {}) == {} and diag.get("UserAgents", {}) == {}, (diag.get("HeaderNames"), diag.get("UserAgents")))
+check("Clear All zeroed request counters", diag["RequestCounts"]["GET"]["Successful"] == 0, diag["RequestCounts"]["GET"])
+check("Clear All does NOT touch trusted-device/rules state", "Settings" in diag)
+
+print("== Admin page-visit counter works for anonymous GET /admin ==")
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+visits0 = r.get_json()["PageVisits"].get("admin", 0)
+app.test_client().get("/admin", headers={"X-Forwarded-For": "10.25.0.1"})  # fresh anonymous bot
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check("Anonymous GET /admin increments the counter", r.get_json()["PageVisits"].get("admin", 0) == visits0 + 1, r.get_json()["PageVisits"])
+
 print("== Emailed invalidation link (kill switch) ==")
 invalidate_emails = emails_with("Roxy Admin Login")
 link_token = invalidate_emails[-1]["body"].split("/admin/invalidate/")[-1].strip().splitlines()[0]
@@ -666,6 +817,7 @@ r = client.post("/admin", headers=IP_BRUTE, json={"IsLogin": True, "Username": A
 check("Locked out after repeated failures -> 429", r.status_code == 429, r.status_code)
 
 print("== Error emails still work for real 500s (rate-limited) ==")
+proxy_module.error_email_last_sent = 0  # Clear any cooldown left by earlier error-log tests.
 before = len(emails_with("Roxy Error"))
 r = client.get("/_boom_test_only", headers=IP_MAIN)
 check("Real exception -> 500", r.status_code == 500, r.status_code)

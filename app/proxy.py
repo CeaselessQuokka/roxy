@@ -80,7 +80,12 @@ def get_token_budget_state() -> dict:
 
 
 def notify_error(subject: str, body: str):
-    """Email the admin about a runtime error, rate-limited to avoid spam."""
+    """Record a runtime error and email the admin about it (email is rate-limited).
+
+    The error is always logged to diagnostics (deduped, never lost) even when the
+    email is suppressed by the cooldown — so the dashboard error log is complete.
+    """
+    diagnostics.log_error(subject, body)
     global error_email_last_sent
     cooldown = runtime.get_setting("error_email_cooldown", config.ERROR_EMAIL_COOLDOWN)
     if time.time() - error_email_last_sent < cooldown:
@@ -258,6 +263,7 @@ def _request(
         return False, False, "Upstream request failed; please try again later.", None, retries
     if token:
         diagnostics.update_token(token, used=True)
+        diagnostics.log_token_result(req.status_code == 200)
     else:
         # Direct-API or RoProxy call: count it and whether it was rejected (non-200).
         diagnostics.log_route_result("roproxy" in url, req.status_code == 200)
@@ -267,9 +273,11 @@ def _request(
     if req.status_code == 200:
         return True, False, req.text, None, retries
     elif req.status_code == 429:
+        # The token is throttled (or the endpoint is). Put the token in cooldown
+        # for revalidation, but do NOT retry the user's request — fail it
+        # immediately so callers can't drive a retry storm.
         with request_lock:
             if token in tokens:
-                # Token may be throttled instead of expired; put it in cooldown to try again later.
                 tokens.remove(token)
                 diagnostics.update_token(token, being_validated=True)
                 background.schedule(
@@ -277,13 +285,8 @@ def _request(
                     validate_token,
                     token,
                 )
-        retries += 1
-        if retries > runtime.get_setting("max_retries_per_request", config.MAX_RETRIES_PER_REQUEST) - 1:
-            diagnostics.log_reason(False)
-            return False, False, req.text, None, retries
-        else:
-            diagnostics.log_retry(429, "Rate limited (429); retrying")
-            return False, True, None, None, retries
+        diagnostics.log_reason(False)
+        return False, False, req.text, None, retries
     elif req.status_code == 403 and "x-csrf-token" in req.headers and csrf_token is None:
         # First 403 with a CSRF header is Roblox handing us the token to retry with.
         diagnostics.log_retry(403, "CSRF token refresh")

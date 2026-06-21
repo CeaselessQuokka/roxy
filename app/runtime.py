@@ -11,6 +11,7 @@ inter-process lock) and every read reloads from disk when the file changes.
 """
 
 import config
+import hashlib
 import re
 import secrets
 import time
@@ -50,6 +51,11 @@ _invalidation_tokens = dict()  # token -> expiration_time
 # shared file so a login started on one gunicorn worker can finish on another.
 _two_fa_codes = dict()  # hashed_code -> expiration_time
 _challenges = dict()  # challenge -> expiration_time
+
+# --- Trusted devices --------------------------------------------------------
+# A trusted device may skip the 2FA step for config.TRUSTED_DEVICE_DURATION.
+# token (hashed) -> {"Expires": ts, "IP": str, "UserAgent": str, "Added": ts}
+_trusted_devices = dict()
 
 
 # --- Blocked endpoints ------------------------------------------------------
@@ -240,6 +246,9 @@ def _restore_from(data: dict):
     challenges = data.get("Challenges", {})
     if isinstance(challenges, dict):
         replace_in_place(_challenges, {str(k): float(v) for k, v in challenges.items()})
+    devices = data.get("TrustedDevices", {})
+    if isinstance(devices, dict):
+        replace_in_place(_trusted_devices, {str(k): dict(v) for k, v in devices.items() if isinstance(v, dict)})
     _prune_expirables()
 
 
@@ -304,10 +313,10 @@ def set_paused(paused: bool, reason: str = None):
         global _paused, _paused_since, _pause_reason
         _paused = bool(paused)
         _paused_since = time.time() if _paused else 0.0
+        # The message persists (so it survives refreshes/restarts and is reused
+        # next time); it is only changed when a new value is explicitly supplied.
         if reason is not None:
             _pause_reason = str(reason)[:300]
-        if not _paused:
-            _pause_reason = ""  # Clear the message when resuming.
 
     _persist_change(change)
     return _paused
@@ -344,10 +353,9 @@ def set_throttle_all(enabled: bool, reason: str = None):
         global _throttle_all, _throttle_all_since, _throttle_all_reason
         _throttle_all = bool(enabled)
         _throttle_all_since = time.time() if _throttle_all else 0.0
+        # The message persists (reused next time); only changed when explicitly supplied.
         if reason is not None:
             _throttle_all_reason = str(reason)[:300]
-        if not _throttle_all:
-            _throttle_all_reason = ""
 
     _persist_change(change)
     return _throttle_all
@@ -686,6 +694,58 @@ def _prune_expirables():
     for store in (_invalidation_tokens, _two_fa_codes, _challenges):
         for key in [k for k, exp in store.items() if exp < now]:
             store.pop(key, None)
+    for key in [k for k, v in _trusted_devices.items() if float(v.get("Expires", 0)) < now]:
+        _trusted_devices.pop(key, None)
+
+
+# --- Trusted devices --------------------------------------------------------
+def _hash_device_token(token: str) -> str:
+    # Stored hashed so a leaked data file can't be used to forge a trusted device.
+    return hashlib.sha256((token or "").encode()).hexdigest()
+
+
+def create_trusted_device(ip: str, user_agent: str) -> str:
+    """Mint a trusted-device token (returned in clear; only its hash is stored)."""
+    token = secrets.token_urlsafe(32)
+
+    def change():
+        _trusted_devices[_hash_device_token(token)] = {
+            "Expires": time.time() + config.TRUSTED_DEVICE_DURATION,
+            "IP": str(ip)[:64],
+            "UserAgent": str(user_agent)[:300],
+            "Added": time.time(),
+        }
+        _prune_expirables()
+
+    _persist_change(change)
+    return token
+
+
+def is_trusted_device(token: str) -> bool:
+    """Whether a device token is currently trusted (valid + unexpired)."""
+    if not token:
+        return False
+    _maybe_reload()
+    entry = _trusted_devices.get(_hash_device_token(token))
+    return bool(entry) and time.time() < float(entry.get("Expires", 0))
+
+
+def get_trusted_device_count() -> int:
+    _maybe_reload()
+    now = time.time()
+    return sum(1 for v in _trusted_devices.values() if time.time() < float(v.get("Expires", 0)) and now)
+
+
+def revoke_trusted_devices() -> int:
+    """Revoke every trusted device (e.g. after losing one). Returns how many were removed."""
+    removed = {"n": 0}
+
+    def change():
+        removed["n"] = len(_trusted_devices)
+        _trusted_devices.clear()
+
+    _persist_change(change)
+    return removed["n"]
 
 
 # --- Persistence ------------------------------------------------------------
@@ -708,6 +768,7 @@ def _serialize_unlocked() -> dict:
         "InvalidationTokens": dict(_invalidation_tokens),
         "TwoFACodes": dict(_two_fa_codes),
         "Challenges": dict(_challenges),
+        "TrustedDevices": {k: dict(v) for k, v in _trusted_devices.items()},
     }
 
 

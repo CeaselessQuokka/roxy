@@ -89,7 +89,12 @@ loginForm.addEventListener("submit", async e => {
 		return;
 	}
 
-	const FORM = { IsLogin: true, Username: USERNAME, Password: PASSWORD };
+	const FORM = {
+		IsLogin: true,
+		Username: USERNAME,
+		Password: PASSWORD,
+		TrustDevice: $("#trustDevice")?.checked || false,
+	};
 	setBusy(submitBtn, true, "Checking…", "Login");
 	try {
 		const res = await fetch("/admin", {
@@ -98,7 +103,13 @@ loginForm.addEventListener("submit", async e => {
 			body: JSON.stringify(FORM),
 		});
 		if (res.ok) {
-			openModal();
+			const data = await res.json().catch(() => ({}));
+			if (data && data.LoggedIn) {
+				// Trusted device: 2FA was skipped, go straight to the dashboard.
+				window.location.href = "/admin/dashboard";
+			} else {
+				openModal();
+			}
 		} else if (res.status === 403) {
 			showLoginError("Invalid credentials.");
 		} else if (res.status === 429) {

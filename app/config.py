@@ -34,6 +34,9 @@ ADMIN_HEARTBEAT_INTERVAL = 10  # In seconds, how often the dashboard pings to ke
 MAX_LOGIN_FAILURES = 5  # Failed credential/2FA attempts per IP per window before a temporary lockout.
 LOGIN_FAILURE_WINDOW = 600  # In seconds, the sliding lockout window.
 
+# --- Trusted devices ---
+TRUSTED_DEVICE_DURATION = 30 * 24 * 3600  # 30 days a trusted device may skip the 2FA step.
+
 # --- Traffic history ---
 TRAFFIC_HISTORY_MINUTES = 180  # How many per-minute traffic buckets to keep (dashboard shows the last hour).
 
@@ -73,6 +76,13 @@ MAX_ENDPOINT_BLOCKS = 200  # How many distinct blocked-endpoint patterns to keep
 MAX_ENDPOINT_RULES = 200  # How many distinct per-endpoint rate rules to keep.
 DEFAULT_ENDPOINT_RULE_PERIOD = 60  # In seconds, default window for a per-endpoint per-IP rate rule.
 MAX_HEADER_RULES = 100  # How many distinct header-block rules to keep.
+
+# --- Error log + request fingerprints (kept until the admin clears them) ---
+# Generous caps that act only as an out-of-memory guard against an attacker
+# deliberately generating unbounded variety; real traffic stays well under.
+MAX_ERROR_RECORDS = 2000  # Distinct error signatures retained.
+MAX_HEADER_NAME_RECORDS = 1000  # Distinct header names retained.
+MAX_USER_AGENT_RECORDS = 5000  # Distinct user-agents retained.
 
 # Substrings that mark a User-Agent as an automated crawler/bot (for visitor classification).
 CRAWLER_USER_AGENT_MARKERS = [

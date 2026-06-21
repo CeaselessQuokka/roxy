@@ -1132,6 +1132,30 @@ body {
 .endpoint-sub-label {
 	color: inherit;
 }
+.endpoint-headers__meta {
+	font-size: var(--fs-xs);
+	color: var(--color-text-muted);
+	margin-bottom: 6px;
+}
+.endpoint-headers__pre,
+.error-detail__pre {
+	margin: 0;
+	padding: 10px;
+	background: var(--color-surface0);
+	border: 1px solid var(--color-outline);
+	border-radius: var(--radius-sm);
+	overflow: auto;
+	max-height: 280px;
+	font-size: var(--fs-xs);
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+.error-row:hover {
+	background: var(--color-hover) !important;
+}
+.error-detail-open {
+	background: rgba(124, 196, 255, 0.04);
+}
 
 /* Throttle-all banner (amber, distinct from the red pause banner) */
 .throttle-banner {

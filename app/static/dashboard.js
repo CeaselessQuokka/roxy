@@ -441,6 +441,8 @@ const print = console.log;
 		setText("roproxy_timeouts", String(rp.Timeouts || 0));
 
 		setText("health_tokens_count", String(tk.Count ?? 0));
+		setText("health_tokens_requests", String(tk.Requests ?? 0));
+		setText("health_tokens_failed", String(tk.Failed ?? 0));
 		setText("health_tokens_expired", String(tk.ExpiredCount ?? 0));
 		setText("health_tokens_validating", String(tk.BeingValidatedCount ?? 0));
 		setText("health_tokens_timeouts", String(tk.Timeouts ?? 0));
@@ -477,6 +479,11 @@ const print = console.log;
 			setText("pauseBannerMsg", reason ? `Message shown to users: "${reason}".` : "");
 			setText("pauseBannerSince", paused && since ? `(since ${toTS(since)})` : "");
 		}
+		// Keep the saved message in the input (don't clobber while the admin types).
+		const reasonInput = $("#pauseReason");
+		if (reasonInput && document.activeElement !== reasonInput && d?.Pause) {
+			reasonInput.value = d.Pause.Reason || "";
+		}
 	}
 
 	function renderThrottleAll(d) {
@@ -508,6 +515,17 @@ const print = console.log;
 			setText("throttleAllBannerMsg", reason ? `Message shown to users: "${reason}".` : "");
 			setText("throttleAllBannerSince", on && since ? `(since ${toTS(since)})` : "");
 		}
+		const reasonInput = $("#throttleReason");
+		if (reasonInput && document.activeElement !== reasonInput) reasonInput.value = ta.Reason || "";
+	}
+
+	function renderTrustedDevices(d) {
+		setText("trustedCount", String(d?.TrustedDevices ?? 0));
+		const here = $("#trustedThisDevice");
+		if (here) {
+			here.textContent = d?.TrustedThisDevice ? "trusted (skips 2FA)" : "not trusted";
+			here.classList.toggle("text-danger", !d?.TrustedThisDevice);
+		}
 	}
 
 	function renderVisitors(d) {
@@ -519,6 +537,7 @@ const print = console.log;
 	let endpointEntries = []; // cached for filtering without refetch
 	const expandedHosts = new Set(); // which root hosts are expanded (survives refreshes)
 	const expandedTemplates = new Set(); // which templates are expanded to their concrete IDs
+	const expandedConcretes = new Set(); // which concrete paths show their last headers
 	const methodsText = methods =>
 		Object.entries(methods || {})
 			.map(([m, n]) => `${m}:${n}`)
@@ -649,10 +668,12 @@ const print = console.log;
 				for (const [concretePath, cinfo] of concretes) {
 					if (q && !concretePath.toLowerCase().includes(q) && !template.toLowerCase().includes(q)) continue;
 					const csub = concretePath.slice(host.length) || "/";
+					const hasHeaders = Boolean(cinfo.LastHeaders);
+					const cExpanded = expandedConcretes.has(concretePath);
 					const cRow = document.createElement("tr");
 					cRow.className = "endpoint-concrete";
 					cRow.title = concretePath;
-					cRow.appendChild(endpointNameCell("", csub, { depth: 2, sub: true }));
+					cRow.appendChild(endpointNameCell(hasHeaders ? (cExpanded ? "▾" : "▸") : "", csub, { depth: 2, sub: true }));
 					for (const text of [String(cinfo.Count || 0), methodsText(cinfo.Methods)]) {
 						const td = document.createElement("td");
 						td.textContent = text;
@@ -661,7 +682,31 @@ const print = console.log;
 					const tdCLast = document.createElement("td");
 					tdCLast.appendChild(tsNode(cinfo.LastRequestTime));
 					cRow.appendChild(tdCLast);
+					if (hasHeaders) {
+						cRow.style.cursor = "pointer";
+						cRow.addEventListener("click", () => {
+							expandedConcretes.has(concretePath)
+								? expandedConcretes.delete(concretePath)
+								: expandedConcretes.add(concretePath);
+							renderEndpoints({});
+						});
+					}
 					tbody.appendChild(cRow);
+					if (hasHeaders && cExpanded) {
+						let headersText = cinfo.LastHeaders;
+						try {
+							headersText = JSON.stringify(JSON.parse(cinfo.LastHeaders), null, 2);
+						} catch {}
+						const detail = document.createElement("tr");
+						detail.className = "endpoint-headers";
+						const td = document.createElement("td");
+						td.colSpan = 4;
+						td.innerHTML =
+							`<div class="endpoint-headers__meta">Last request from IP <strong>${escapeHtml(cinfo.LastIP || "—")}</strong> • last sent headers:</div>` +
+							`<pre class="endpoint-headers__pre">${escapeHtml(headersText || "(none)")}</pre>`;
+						detail.appendChild(td);
+						tbody.appendChild(detail);
+					}
 				}
 			}
 		}
@@ -726,6 +771,76 @@ const print = console.log;
 		if (entries.length === 0) {
 			tbody.appendChild(tr(["Nothing recorded (or cleared)", "—", "—"]));
 		}
+	}
+
+	function renderErrors(d) {
+		const tbody = $("#errorsTable tbody");
+		if (!tbody) return;
+		if (d.Errors) renderErrors._last = d.Errors;
+		const all = Object.entries(renderErrors._last || {});
+		all.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+		setText("errorsTotal", `${all.length} distinct`);
+		const q = ($("#errorsFilter")?.value || "").trim().toLowerCase();
+		// Keep expanded detail rows expanded across refreshes.
+		const open = new Set($$("#errorsTable tr.error-detail-open").map(r => r.dataset.sig));
+		tbody.innerHTML = "";
+		const shown = all.filter(([sig, info]) => !q || `${sig} ${info.LastDetail || ""}`.toLowerCase().includes(q));
+		if (shown.length === 0) {
+			tbody.appendChild(tr([q ? "No errors match the filter" : "No errors recorded 🎉", "—", "—", "—"]));
+			return;
+		}
+		for (const [sig, info] of shown) {
+			const row = tr([sig, String(info.Count || 0), tsNode(info.FirstSeen), tsNode(info.LastSeen)]);
+			row.className = "error-row";
+			row.style.cursor = "pointer";
+			row.dataset.sig = sig;
+			const detail = document.createElement("tr");
+			detail.className = "error-detail";
+			detail.dataset.sig = sig;
+			const td = document.createElement("td");
+			td.colSpan = 4;
+			const pre = document.createElement("pre");
+			pre.className = "error-detail__pre";
+			pre.textContent = info.LastDetail || "(no detail)";
+			td.appendChild(pre);
+			detail.appendChild(td);
+			const isOpen = open.has(sig);
+			detail.style.display = isOpen ? "" : "none";
+			if (isOpen) row.classList.add("error-detail-open");
+			row.addEventListener("click", () => {
+				const showing = detail.style.display !== "none";
+				detail.style.display = showing ? "none" : "";
+				row.classList.toggle("error-detail-open", !showing);
+			});
+			tbody.appendChild(row);
+			tbody.appendChild(detail);
+		}
+	}
+
+	function renderFingerprintTable(tbodySel, totalId, data, filterSel, label) {
+		const tbody = $(tbodySel);
+		if (!tbody) return;
+		const entries = Object.entries(data || {});
+		entries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+		setText(totalId, `${entries.length} distinct`);
+		const q = ($(filterSel)?.value || "").trim().toLowerCase();
+		tbody.innerHTML = "";
+		let shown = 0;
+		for (const [key, info] of entries) {
+			if (q && !key.toLowerCase().includes(q)) continue;
+			shown++;
+			tbody.appendChild(tr([key, String(info.Count || 0), tsNode(info.LastSeen)]));
+		}
+		if (shown === 0) {
+			tbody.appendChild(tr([q ? `No ${label} match the filter` : `No ${label} recorded yet`, "—", "—"]));
+		}
+	}
+
+	function renderFingerprints(d) {
+		if (d.HeaderNames) renderFingerprints._hn = d.HeaderNames;
+		if (d.UserAgents) renderFingerprints._ua = d.UserAgents;
+		renderFingerprintTable("#headerNamesTable tbody", "headerNamesTotal", renderFingerprints._hn || {}, "#headerNamesFilter", "header names");
+		renderFingerprintTable("#userAgentsTable tbody", "userAgentsTotal", renderFingerprints._ua || {}, "#userAgentsFilter", "user-agents");
 	}
 
 	let liveItems = []; // cached for filtering without refetch
@@ -1100,10 +1215,13 @@ const print = console.log;
 			renderThrottled(d);
 			renderPause(d);
 			renderThrottleAll(d);
+			renderTrustedDevices(d);
 			renderEndpoints(d);
 			renderStatusDetailed(d);
 			renderRetries(d);
 			renderExploitSummary(d);
+			renderErrors(d);
+			renderFingerprints(d);
 			renderLiveFeed(d);
 			renderBudget(d);
 			renderPersistence(d);
@@ -1250,6 +1368,10 @@ const print = console.log;
 	$$("main .section[id]").forEach(s => spy.observe(s));
 
 	$("#refreshAll")?.addEventListener("click", () => refreshAll(false));
+	$("#navRefresh")?.addEventListener("click", () => refreshAll(false));
+	$("#errorsFilter")?.addEventListener("input", () => renderErrors({ Errors: renderErrors._last || {} }));
+	$("#headerNamesFilter")?.addEventListener("input", () => renderFingerprints({}));
+	$("#userAgentsFilter")?.addEventListener("input", () => renderFingerprints({}));
 	$("#exportAll")?.addEventListener("click", async () => {
 		try {
 			const d = await fetchDiagnostics();
@@ -1477,6 +1599,8 @@ const print = console.log;
 		"section-logins": { target: "logins", what: "admin login records" },
 		"section-crawls": { target: "crawls", what: "crawler activity records" },
 		"section-throttled": { target: "throttled", what: "throttled-IP records" },
+		"section-fingerprints": { target: "fingerprints", what: "the recorded header names and user-agents" },
+		"section-errors": { target: "errors", what: "the error log" },
 	};
 	for (const [sectionId, info] of Object.entries(CLEAR_BUTTONS)) {
 		const section = document.getElementById(sectionId);
@@ -1816,9 +1940,77 @@ const print = console.log;
 		try {
 			const res = await fetch("/health", { headers: { Accept: "application/json" } });
 			const data = await res.json();
-			showToast(`Health: ${data.Status}${data.Paused ? " (paused)" : ""}`);
+			showToast(`Server is up — status: ${data.Status}${data.Paused ? ", proxy PAUSED" : ", proxy running"}`, 3200);
 		} catch {
-			showToast("Health check failed");
+			showToast("Health check FAILED — the server did not respond", 3200);
+		}
+	});
+
+	// Tools: clear all data
+	$("#clearAllBtn")?.addEventListener("click", async () => {
+		if (!confirm("Permanently clear ALL diagnostics data (every section)? Settings, tokens, rules and trusted devices are kept. This cannot be undone.")) {
+			return;
+		}
+		try {
+			const res = await api("/admin/data/clear", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ target: "all" }),
+			});
+			if (!res.ok) throw new Error(String(res.status));
+			showToast("All diagnostics data cleared");
+			await refreshAll(true);
+		} catch {
+			showToast("Failed to clear all data");
+		}
+	});
+
+	// Service Controls: revoke trusted devices
+	$("#revokeTrustedBtn")?.addEventListener("click", async () => {
+		if (!confirm("Revoke ALL trusted devices? Every device (including this one) will need full 2FA next login.")) {
+			return;
+		}
+		try {
+			const res = await api("/admin/trusted_devices/revoke", { method: "POST" });
+			if (!res.ok) throw new Error(String(res.status));
+			const data = await res.json();
+			showToast(`Revoked ${data.Revoked ?? 0} trusted device(s)`);
+			await refreshAll(true);
+		} catch {
+			showToast("Failed to revoke trusted devices");
+		}
+	});
+
+	// Errors export
+	$("#exportErrors")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			const lines = ["Error,Count,FirstSeen,LastSeen,LastDetail"];
+			for (const [sig, info] of Object.entries(d.Errors || {})) {
+				lines.push(toCSVRow([sig, info.Count || 0, info.FirstSeen || 0, info.LastSeen || 0, info.LastDetail || ""]));
+			}
+			download(`roxy_errors_${Date.now()}.csv`, lines.join("\n"));
+			showToast("Errors exported");
+		} catch {
+			showToast("Export failed");
+		}
+	});
+
+	// Fingerprints export (header names + user-agents)
+	$("#exportFingerprints")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			const lines = ["Type,Value,Count,LastSeen"];
+			for (const [name, info] of Object.entries(d.HeaderNames || {})) {
+				lines.push(toCSVRow(["header", name, info.Count || 0, info.LastSeen || 0]));
+			}
+			for (const [ua, info] of Object.entries(d.UserAgents || {})) {
+				lines.push(toCSVRow(["user-agent", ua, info.Count || 0, info.LastSeen || 0]));
+			}
+			download(`roxy_fingerprints_${Date.now()}.csv`, lines.join("\n"));
+			showToast("Fingerprints exported");
+		} catch {
+			showToast("Export failed");
 		}
 	});
 

@@ -158,6 +158,36 @@ def requires_admin(fn: callable):
 # Marks a browser that has successfully logged in before, so the dev's own
 # visits to the login page stop inflating the "admin page visits" counter.
 ADMIN_SEEN_COOKIE = "roxy_admin_seen"
+# A trusted device may skip the 2FA step on future logins (see runtime).
+TRUSTED_DEVICE_COOKIE = "roxy_trusted_device"
+
+
+def _complete_login(ip: str, user_agent: str, trust_device: bool):
+    """Finish a successful login: mark the session, notify, set cookies. Returns the response."""
+    diagnostics.log_login_attempt(ip, True)
+    if not request.cookies.get(ADMIN_SEEN_COOKIE):
+        diagnostics.decrement_admin_visit()  # Don't count the admin's own visit before logging in.
+    throttle.reset_login_failures(ip)
+    session.pop("Challenge", None)
+    session["IsAdmin"] = True
+    session["Epoch"] = runtime.get_session_epoch()
+    session["LastSeen"] = time.time()
+    send_login_notification(ip, user_agent)
+    resp = jsonify({"Status": "Success", "LoggedIn": True})
+    resp.set_cookie(
+        ADMIN_SEEN_COOKIE, "1", max_age=180 * 24 * 3600, secure=not config.DEBUG, httponly=True, samesite="Lax"
+    )
+    if trust_device:
+        token = runtime.create_trusted_device(ip, user_agent)
+        resp.set_cookie(
+            TRUSTED_DEVICE_COOKIE,
+            token,
+            max_age=config.TRUSTED_DEVICE_DURATION,
+            secure=not config.DEBUG,
+            httponly=True,
+            samesite="Lax",
+        )
+    return resp
 
 
 @app.route("/admin", methods=["GET", "POST"])
@@ -175,15 +205,23 @@ def admin_page():
             return jsonify("Invalid request"), 400
         if "IsLogin" in data:
             if validate_login(data):
+                # A trusted device skips the 2FA step entirely.
+                if runtime.is_trusted_device(request.cookies.get(TRUSTED_DEVICE_COOKIE, "")):
+                    return _complete_login(ip, user_agent, trust_device=False), 200
                 session["Challenge"] = dict(
-                    {"Challenge": challenge.generate_challenge(ip, user_agent), "IP": ip, "UserAgent": user_agent}
+                    {
+                        "Challenge": challenge.generate_challenge(ip, user_agent),
+                        "IP": ip,
+                        "UserAgent": user_agent,
+                        "TrustDevice": bool(data.get("TrustDevice")),
+                    }
                 )
                 try:
                     two_fa.send_2fa(auth.get_emails()[0])
                 except Exception:
                     session.pop("Challenge", None)
                     return jsonify("Could not send the 2FA email; please try again shortly."), 503
-                return jsonify("Success"), 200
+                return jsonify({"Status": "Success", "TwoFA": True}), 200
             throttle.register_login_failure(ip)
             diagnostics.log_login_attempt(ip, False)
             return jsonify("Invalid credentials"), 403
@@ -214,26 +252,8 @@ def admin_page():
                 throttle.register_login_failure(ip)
                 return jsonify("Not Found"), 404
 
-            diagnostics.log_login_attempt(ip, True)
-            if not request.cookies.get(ADMIN_SEEN_COOKIE):
-                diagnostics.decrement_admin_visit()  # Don't count the admin's own visit before logging in.
-            throttle.reset_login_failures(ip)
-            session.pop("Challenge", None)
-            session["IsAdmin"] = True
-            session["Epoch"] = runtime.get_session_epoch()
-            session["LastSeen"] = time.time()
-            send_login_notification(ip, user_agent)
-            resp = jsonify("Success")
-            # Remember this browser so future login-page visits aren't counted as traffic.
-            resp.set_cookie(
-                ADMIN_SEEN_COOKIE,
-                "1",
-                max_age=180 * 24 * 3600,
-                secure=not config.DEBUG,
-                httponly=True,
-                samesite="Lax",
-            )
-            return resp, 200
+            trust_device = bool(stored.get("TrustDevice"))
+            return _complete_login(ip, user_agent, trust_device=trust_device), 200
         else:
             return jsonify("Invalid request"), 400
     # GET
@@ -279,6 +299,8 @@ def admin_diagnostics():
     data["ThrottleAll"] = runtime.get_throttle_all_state()
     data["TokenBudget"] = proxy.get_token_budget_state()
     data["Persistence"] = storage.get_status()
+    data["TrustedDevices"] = runtime.get_trusted_device_count()
+    data["TrustedThisDevice"] = runtime.is_trusted_device(request.cookies.get(TRUSTED_DEVICE_COOKIE, ""))
     return jsonify(data)
 
 
@@ -361,17 +383,30 @@ def admin_force_revalidate():
     return jsonify("Revalidation queued"), 200
 
 
+@app.route("/admin/trusted_devices/revoke", methods=["POST"], endpoint="admin_revoke_trusted")
+@requires_admin
+def admin_revoke_trusted():
+    # Revoke every trusted device (e.g. if one is lost); they'll need full 2FA again.
+    count = runtime.revoke_trusted_devices()
+    resp = jsonify({"Revoked": count})
+    resp.delete_cookie(TRUSTED_DEVICE_COOKIE)  # Also drop this browser's trust cookie.
+    return resp, 200
+
+
 @app.route("/admin/data/clear", methods=["POST"], endpoint="admin_clear_data")
 @requires_admin
 def admin_clear_data():
     data = get_json_dict()
     target = (data or {}).get("target")
-    names = diagnostics.CLEAR_TARGETS.get(target)
+    if target == "all":
+        names = diagnostics.CLEAR_ALL_NAMES  # Every section, each exactly once.
+    else:
+        names = diagnostics.CLEAR_TARGETS.get(target)
     if not names:
         return jsonify(f"Unknown clear target: {target}"), 400
     ok = diagnostics.clear_stats(names)
     if ok:
-        return jsonify("Cleared"), 200
+        return jsonify("Cleared everything" if target == "all" else "Cleared"), 200
     return jsonify("Cleared in memory, but the data file could not be written"), 200
 
 
@@ -558,12 +593,18 @@ def get_fake_headers() -> dict:
 _SENSITIVE_HEADERS = {"x-roblox-token", "cookie", "authorization", "x-csrf-token"}
 
 
+def sanitize_headers(headers) -> dict:
+    """A copy of the incoming headers with secret values redacted."""
+    safe = {}
+    for key, value in dict(headers).items():
+        safe[key] = "[redacted]" if key.lower() in _SENSITIVE_HEADERS else value
+    return safe
+
+
 def log_live_request(ip, user_agent, method, url, headers, body, status_code):
     """Record a sanitized snapshot of a proxied request for the dashboard live feed."""
     try:
-        safe_headers = {}
-        for key, value in dict(headers).items():
-            safe_headers[key] = "[redacted]" if key.lower() in _SENSITIVE_HEADERS else value
+        safe_headers = sanitize_headers(headers)
         body_text = ""
         if body:
             try:
@@ -666,7 +707,10 @@ def proxy_page(dst: str):
         return resp, 429
 
     throttle.update_throttling(ip, made_request=True)
-    diagnostics.log_endpoint(dst, request.method)
+    safe_headers = sanitize_headers(request.headers)
+    diagnostics.log_endpoint(dst, request.method, json.dumps(safe_headers), ip)
+    # Track distinct header names + user-agents to help spot abusive clients.
+    diagnostics.log_request_fingerprint(list(safe_headers.keys()), user_agent)
 
     # Preserve repeated query params (e.g. ?ids=1&ids=2); requests encodes lists.
     params = request.args.to_dict(flat=False)
@@ -733,13 +777,14 @@ def handle_unexpected_error(error):
         response.content_type = "application/json"
         return response
 
-    # Genuine server-side failure: email the admin (rate-limited in notify_error).
+    # Genuine server-side failure: log it (deduped per exception type+message) and
+    # email the admin (rate-limited in notify_error).
     try:
+        signature = f"{type(error).__name__}: {error}"
         proxy.notify_error(
-            "Unhandled server error",
+            signature,
             f"{request.method} {request.path}\n"
             f"IP: {get_client_ip()}\n\n"
-            f"{type(error).__name__}: {error}\n\n"
             f"{traceback.format_exc()}",
         )
     except Exception:

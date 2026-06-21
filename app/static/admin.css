@@ -128,6 +128,22 @@ input:focus {
 	cursor: wait;
 }
 
+.trust-device {
+	display: flex;
+	align-items: center;
+	gap: 0.55rem;
+	font-size: 0.85rem;
+	color: var(--text-muted);
+	cursor: pointer;
+	margin-top: -0.4rem;
+}
+.trust-device input {
+	width: 16px;
+	height: 16px;
+	accent-color: var(--accent);
+	cursor: pointer;
+}
+
 .form-error {
 	margin: 0;
 	color: var(--error);
