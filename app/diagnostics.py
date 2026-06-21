@@ -1,5 +1,6 @@
 import config
 import copy
+import hashlib
 import json
 import re
 import threading
@@ -204,11 +205,17 @@ throttle_drops = dict({"Count": 0})
 # Distinct errors are retained until the admin clears them (high cap as an OOM guard only).
 errors = dict()
 
-# Request fingerprints for spotting abusive clients:
-#   header_names: lowercased header NAME -> {Count, LastSeen}
-#   user_agents:  full User-Agent VALUE -> {Count, LastSeen}
+# Request fingerprints for spotting abusive clients. Each header name keeps a
+# breakdown of the distinct VALUES seen under it (secret values are stored as a
+# short fingerprint, never raw — see _value_for_storage):
+#   header_names: header NAME -> {Count, FirstSeen, LastSeen, Values: {value -> {Count, FirstSeen, LastSeen}}}
+#   user_agents:  full User-Agent VALUE -> {Count, FirstSeen, LastSeen}
 header_names = dict()
 user_agents = dict()
+# Same shape, but ONLY for requests blocked by a header rule — so the admin can
+# review exactly what got blocked and catch false positives.
+blocked_header_names = dict()
+blocked_user_agents = dict()
 
 # Per-minute PEAK of the token's sliding-window usage:
 # {"<epoch_minute>": {"Max": peak_usage}}. "Max" leaf so cross-worker merges take
@@ -553,27 +560,78 @@ def log_error(signature: str, detail: str = ""):
             errors[signature] = dict(Count=1, FirstSeen=now, LastSeen=now, LastDetail=str(detail)[:2000])
 
 
-def _log_fingerprint(store: dict, key: str, cap: int):
+def _bump_fingerprint(store: dict, key: str, cap: int) -> dict | None:
+    """Increment (or create) a {Count, FirstSeen, LastSeen} record. Returns it."""
     if not key:
-        return
+        return None
     now = time.time()
     rec = store.get(key)
     if rec:
         rec["Count"] += 1
         rec["LastSeen"] = now
-    else:
-        if len(store) >= cap:
-            least = min(store.items(), key=lambda kv: kv[1]["Count"])[0]
-            store.pop(least, None)
-        store[key] = dict(Count=1, FirstSeen=now, LastSeen=now)
+        return rec
+    if len(store) >= cap:
+        least = min(store.items(), key=lambda kv: kv[1]["Count"])[0]
+        store.pop(least, None)
+    rec = store[key] = dict(Count=1, FirstSeen=now, LastSeen=now)
+    return rec
 
 
-def log_request_fingerprint(header_names_seen, user_agent: str):
-    """Track the distinct header names and user-agent of a proxied request."""
+def _value_for_storage(header_name_lower: str, value: str) -> str:
+    """The value to record for a header. Secret headers are stored as a short
+    irreversible fingerprint (so distinct values can still be counted/compared)
+    rather than the raw secret."""
+    value = "" if value is None else str(value)
+    if header_name_lower in _SENSITIVE_HEADER_NAMES:
+        if not value:
+            return "(empty)"
+        return "fp:" + hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:12]
+    return value[:200] if value else "(empty)"
+
+
+def log_request_fingerprint(header_pairs, user_agent: str, blocked: bool = False):
+    """Track the distinct header names + their values + the user-agent of a request.
+
+    `header_pairs` is an iterable of (name, value). When `blocked` is True the data
+    goes into the blocked-request stores instead (for false-positive review)."""
+    names_store = blocked_header_names if blocked else header_names
+    ua_store = blocked_user_agents if blocked else user_agents
+    pairs = list(header_pairs.items()) if hasattr(header_pairs, "items") else list(header_pairs)
     with _state_lock:
-        for name in header_names_seen:
-            _log_fingerprint(header_names, str(name).lower()[:120], config.MAX_HEADER_NAME_RECORDS)
-        _log_fingerprint(user_agents, (user_agent or "(none)")[:400], config.MAX_USER_AGENT_RECORDS)
+        for name, value in pairs:
+            name_l = str(name).lower()[:120]
+            rec = _bump_fingerprint(names_store, name_l, config.MAX_HEADER_NAME_RECORDS)
+            if rec is None:
+                continue
+            values = rec.setdefault("Values", {})
+            _bump_fingerprint(values, _value_for_storage(name_l, value), config.MAX_HEADER_VALUE_RECORDS)
+        _bump_fingerprint(ua_store, (user_agent or "(none)")[:400], config.MAX_USER_AGENT_RECORDS)
+
+
+def clear_fingerprint_header(blocked: bool, name: str) -> bool:
+    """Clear one header's recorded values everywhere (in-memory + the data file).
+
+    Lets the admin reset a single header after reviewing it so it repopulates
+    fresh. Best-effort across multiple workers (exact for the common single
+    worker)."""
+    store_name = "blocked_header_names" if blocked else "header_names"
+    key = str(name).lower()[:120]
+    with _state_lock:
+        globals()[store_name].pop(key, None)
+        if isinstance(_baseline, dict) and isinstance(_baseline.get(store_name), dict):
+            _baseline[store_name].pop(key, None)
+
+        def mutate(data):
+            diag = data.get("Diagnostics", {})
+            if isinstance(diag, dict) and isinstance(diag.get(store_name), dict):
+                diag[store_name].pop(key, None)
+            return data
+
+        try:
+            storage.update_data(mutate)
+            return True
+        except OSError:
+            return False
 
 
 def log_pause_drop():
@@ -747,6 +805,8 @@ def get_diagnostics() -> dict:
                 "Errors": errors,
                 "HeaderNames": header_names,
                 "UserAgents": user_agents,
+                "BlockedHeaderNames": blocked_header_names,
+                "BlockedUserAgents": blocked_user_agents,
                 "ServerTime": time.time(),
                 "WorkerStartedAt": _started_at,
             }
@@ -800,6 +860,8 @@ _PERSISTED_NAMES = (
     "errors",
     "header_names",
     "user_agents",
+    "blocked_header_names",
+    "blocked_user_agents",
 )
 
 # Pristine copies of every persisted structure, captured at import (before any
@@ -840,6 +902,7 @@ CLEAR_TARGETS = {
     "visits": ("page_visits", "visitor_counts"),
     "errors": ("errors",),
     "fingerprints": ("header_names", "user_agents"),
+    "blocked_fingerprints": ("blocked_header_names", "blocked_user_agents"),
 }
 
 # "all" clears every distinct structure exactly once (no cross-clear, no repeats).

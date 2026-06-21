@@ -215,6 +215,9 @@ const print = console.log;
 		}
 		setText("kpi_hour_requests", String(hourTotal));
 		setText("kpi_hour_failed", String(hourFailed));
+		// Traffic pills mirror the chart's window (last 60 minutes).
+		setText("trafficTotalOk", (hourTotal - hourFailed).toLocaleString());
+		setText("trafficTotalFail", hourFailed.toLocaleString());
 
 		chart.innerHTML = "";
 		for (const bar of bars) {
@@ -294,9 +297,6 @@ const print = console.log;
 		setText("mc_total_s", String(totalS));
 		setText("mc_total_f", String(totalF));
 		setText("mc_total_t", String(totalS + totalF));
-		// At-a-glance totals shown in the Traffic section.
-		setText("trafficTotalOk", totalS.toLocaleString());
-		setText("trafficTotalFail", totalF.toLocaleString());
 
 		renderSplitBar(
 			"methodMixBar",
@@ -830,7 +830,8 @@ const print = console.log;
 		}
 	}
 
-	function renderFingerprintTable(tbodySel, totalId, data, filterSel, label) {
+	// Simple 3-column frequency table (user-agents).
+	function renderUaTable(tbodySel, totalId, data, filterSel) {
 		const tbody = $(tbodySel);
 		if (!tbody) return;
 		const entries = Object.entries(data || {});
@@ -845,15 +846,113 @@ const print = console.log;
 			tbody.appendChild(tr([key, String(info.Count || 0), tsNode(info.LastSeen)]));
 		}
 		if (shown === 0) {
-			tbody.appendChild(tr([q ? `No ${label} match the filter` : `No ${label} recorded yet`, "—", "—"]));
+			tbody.appendChild(tr([q ? "No user-agents match the filter" : "No user-agents recorded yet", "—", "—"]));
+		}
+	}
+
+	const expandedFp = new Set(); // which header rows are expanded to show their values
+	// Header-name table with a value drill-down + per-header Clear.
+	function renderHeaderNameTable(tbodySel, totalId, data, filterSel, blocked) {
+		const tbody = $(tbodySel);
+		if (!tbody) return;
+		const entries = Object.entries(data || {});
+		entries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+		setText(totalId, `${entries.length} distinct`);
+		const q = ($(filterSel)?.value || "").trim().toLowerCase();
+		tbody.innerHTML = "";
+		let shown = 0;
+		for (const [name, info] of entries) {
+			if (q && !name.toLowerCase().includes(q)) continue;
+			shown++;
+			const values = info.Values || {};
+			const valCount = Object.keys(values).length;
+			const fpKey = (blocked ? "b:" : "l:") + name;
+			const expanded = expandedFp.has(fpKey);
+
+			const row = document.createElement("tr");
+			row.className = "fp-row";
+			const tdName = document.createElement("td");
+			if (valCount) tdName.style.cursor = "pointer";
+			const chev = document.createElement("span");
+			chev.className = "endpoint-host__chevron";
+			chev.textContent = valCount ? (expanded ? "▾" : "▸") : "";
+			const nm = document.createElement("strong");
+			nm.textContent = ` ${name} `;
+			const cnt = document.createElement("span");
+			cnt.className = "endpoint-host__count";
+			cnt.textContent = valCount ? `(${valCount} value${valCount === 1 ? "" : "s"})` : "";
+			tdName.append(chev, nm, cnt);
+			if (valCount) {
+				tdName.addEventListener("click", () => {
+					expandedFp.has(fpKey) ? expandedFp.delete(fpKey) : expandedFp.add(fpKey);
+					renderFingerprints({});
+				});
+			}
+			row.appendChild(tdName);
+			const tdC = document.createElement("td");
+			tdC.textContent = String(info.Count || 0);
+			row.appendChild(tdC);
+			const tdL = document.createElement("td");
+			tdL.appendChild(tsNode(info.LastSeen));
+			row.appendChild(tdL);
+			const tdAct = document.createElement("td");
+			const clr = document.createElement("button");
+			clr.className = "btn btn--outline btn--sm";
+			clr.textContent = "Clear";
+			clr.title = `Clear recorded data for "${name}"`;
+			clr.addEventListener("click", e => {
+				e.stopPropagation();
+				clearFingerprintHeader(blocked, name);
+			});
+			tdAct.appendChild(clr);
+			row.appendChild(tdAct);
+			tbody.appendChild(row);
+
+			if (expanded && valCount) {
+				const detail = document.createElement("tr");
+				detail.className = "fp-values";
+				const td = document.createElement("td");
+				td.colSpan = 4;
+				const valEntries = Object.entries(values).sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+				let html = '<table class="fp-values__table">';
+				for (const [val, vinfo] of valEntries) {
+					html += `<tr><td class="fp-values__val">${escapeHtml(val)}</td><td>${vinfo.Count || 0}×</td><td>${escapeHtml(timeAgo(vinfo.LastSeen))}</td></tr>`;
+				}
+				html += "</table>";
+				td.innerHTML = html;
+				detail.appendChild(td);
+				tbody.appendChild(detail);
+			}
+		}
+		if (shown === 0) {
+			tbody.appendChild(tr([q ? "No header names match the filter" : "No header names recorded yet", "—", "—", ""]));
+		}
+	}
+
+	async function clearFingerprintHeader(blocked, name) {
+		try {
+			const res = await api("/admin/fingerprints/clear_header", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ blocked, name }),
+			});
+			if (!res.ok) throw new Error(String(res.status));
+			showToast(`Cleared "${name}"`);
+			await refreshAll(true);
+		} catch {
+			showToast("Failed to clear header");
 		}
 	}
 
 	function renderFingerprints(d) {
 		if (d.HeaderNames) renderFingerprints._hn = d.HeaderNames;
 		if (d.UserAgents) renderFingerprints._ua = d.UserAgents;
-		renderFingerprintTable("#headerNamesTable tbody", "headerNamesTotal", renderFingerprints._hn || {}, "#headerNamesFilter", "header names");
-		renderFingerprintTable("#userAgentsTable tbody", "userAgentsTotal", renderFingerprints._ua || {}, "#userAgentsFilter", "user-agents");
+		if (d.BlockedHeaderNames) renderFingerprints._bhn = d.BlockedHeaderNames;
+		if (d.BlockedUserAgents) renderFingerprints._bua = d.BlockedUserAgents;
+		renderHeaderNameTable("#headerNamesTable tbody", "headerNamesTotal", renderFingerprints._hn || {}, "#headerNamesFilter", false);
+		renderUaTable("#userAgentsTable tbody", "userAgentsTotal", renderFingerprints._ua || {}, "#userAgentsFilter");
+		renderHeaderNameTable("#blockedHeaderNamesTable tbody", "blockedHeaderNamesTotal", renderFingerprints._bhn || {}, "#blockedHeaderNamesFilter", true);
+		renderUaTable("#blockedUserAgentsTable tbody", "blockedUserAgentsTotal", renderFingerprints._bua || {}, "#blockedUserAgentsFilter");
 	}
 
 	let liveItems = []; // cached for filtering without refetch
@@ -1125,7 +1224,7 @@ const print = console.log;
 		tbody.innerHTML = "";
 		const entries = Object.entries(d.HeaderRules || {});
 		if (entries.length === 0) {
-			tbody.appendChild(tr(["—", "—", "No header rules", "—", "—", ""]));
+			tbody.appendChild(tr(["—", "—", "—", "No header rules", "—", "—", ""]));
 			return;
 		}
 		for (const [id, info] of entries) {
@@ -1135,6 +1234,7 @@ const print = console.log;
 			btn.addEventListener("click", () => removeHeaderRule(id));
 			tbody.appendChild(
 				tr([
+					info.Header || "(any)",
 					HEADER_SCOPE_LABELS[info.Scope] || info.Scope || "—",
 					HEADER_MODE_LABELS[info.Mode] || info.Mode || "Contains",
 					info.Needle || "—",
@@ -1385,6 +1485,8 @@ const print = console.log;
 	$("#errorsFilter")?.addEventListener("input", () => renderErrors({ Errors: renderErrors._last || {} }));
 	$("#headerNamesFilter")?.addEventListener("input", () => renderFingerprints({}));
 	$("#userAgentsFilter")?.addEventListener("input", () => renderFingerprints({}));
+	$("#blockedHeaderNamesFilter")?.addEventListener("input", () => renderFingerprints({}));
+	$("#blockedUserAgentsFilter")?.addEventListener("input", () => renderFingerprints({}));
 	$("#exportAll")?.addEventListener("click", async () => {
 		try {
 			const d = await fetchDiagnostics();
@@ -1613,6 +1715,7 @@ const print = console.log;
 		"section-crawls": { target: "crawls", what: "crawler activity records" },
 		"section-throttled": { target: "throttled", what: "throttled-IP records" },
 		"section-fingerprints": { target: "fingerprints", what: "the recorded header names and user-agents" },
+		"section-blocked-fingerprints": { target: "blocked_fingerprints", what: "the blocked-request header names and user-agents" },
 		"section-errors": { target: "errors", what: "the error log" },
 	};
 	for (const [sectionId, info] of Object.entries(CLEAR_BUTTONS)) {
@@ -1739,6 +1842,7 @@ const print = console.log;
 	// Header rules: add
 	$("#headerRuleForm")?.addEventListener("submit", async e => {
 		e.preventDefault();
+		const header = $("#headerRuleHeader")?.value.trim() || "";
 		const scope = $("#headerRuleScope")?.value || "either";
 		const mode = $("#headerRuleMode")?.value || "contains";
 		const needle = $("#headerRuleNeedle")?.value.trim();
@@ -1748,11 +1852,12 @@ const print = console.log;
 			const res = await api("/admin/headers/rule", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ scope, mode, needle, note }),
+				body: JSON.stringify({ header, scope, mode, needle, note }),
 			});
 			const data = await res.json();
 			if (!res.ok) throw new Error(data.Message || String(res.status));
 			renderHeaderRules({ HeaderRules: data.HeaderRules });
+			$("#headerRuleHeader").value = "";
 			$("#headerRuleNeedle").value = "";
 			$("#headerRuleNote").value = "";
 			showToast("Header rule added");
@@ -2009,19 +2114,34 @@ const print = console.log;
 		}
 	});
 
-	// Fingerprints export (header names + user-agents)
+	// Fingerprints export (header names + their values + user-agents)
+	function exportFingerprints(headerStore, uaStore, filename) {
+		const lines = ["Type,Header,Value,Count,LastSeen"];
+		for (const [name, info] of Object.entries(headerStore || {})) {
+			lines.push(toCSVRow(["header", name, "", info.Count || 0, info.LastSeen || 0]));
+			for (const [val, vinfo] of Object.entries(info.Values || {})) {
+				lines.push(toCSVRow(["header-value", name, val, vinfo.Count || 0, vinfo.LastSeen || 0]));
+			}
+		}
+		for (const [ua, info] of Object.entries(uaStore || {})) {
+			lines.push(toCSVRow(["user-agent", "", ua, info.Count || 0, info.LastSeen || 0]));
+		}
+		download(filename, lines.join("\n"));
+	}
 	$("#exportFingerprints")?.addEventListener("click", async () => {
 		try {
 			const d = await fetchDiagnostics();
-			const lines = ["Type,Value,Count,LastSeen"];
-			for (const [name, info] of Object.entries(d.HeaderNames || {})) {
-				lines.push(toCSVRow(["header", name, info.Count || 0, info.LastSeen || 0]));
-			}
-			for (const [ua, info] of Object.entries(d.UserAgents || {})) {
-				lines.push(toCSVRow(["user-agent", ua, info.Count || 0, info.LastSeen || 0]));
-			}
-			download(`roxy_fingerprints_${Date.now()}.csv`, lines.join("\n"));
+			exportFingerprints(d.HeaderNames, d.UserAgents, `roxy_fingerprints_${Date.now()}.csv`);
 			showToast("Fingerprints exported");
+		} catch {
+			showToast("Export failed");
+		}
+	});
+	$("#exportBlockedFingerprints")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			exportFingerprints(d.BlockedHeaderNames, d.BlockedUserAgents, `roxy_blocked_fingerprints_${Date.now()}.csv`);
+			showToast("Blocked fingerprints exported");
 		} catch {
 			showToast("Export failed");
 		}

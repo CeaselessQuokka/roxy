@@ -88,6 +88,7 @@
 					<li><a class="nav__link" href="#section-proxy">Proxy Timings</a></li>
 					<li><a class="nav__link" href="#section-probes">Exploit / Probe Attempts</a></li>
 					<li><a class="nav__link" href="#section-fingerprints">Request Fingerprints</a></li>
+					<li><a class="nav__link" href="#section-blocked-fingerprints">Blocked Fingerprints</a></li>
 					<li><a class="nav__link" href="#section-errors">Error Log</a></li>
 					<li><a class="nav__link" href="#section-logins">Admin Logins</a></li>
 					<li><a class="nav__link" href="#section-settings">Settings</a></li>
@@ -255,11 +256,11 @@
 					<div class="section__header">
 						<h2 id="trafficHeading" class="section__title">Traffic — Last 60 Minutes</h2>
 						<div class="section__actions">
-							<span class="chip chip--ok stat-pill" title="Total successful requests (all time)">
+							<span class="chip chip--ok stat-pill" title="Successful requests in the last 60 minutes">
 								<span class="legend-dot legend-dot--ok"></span> Successful:
 								<strong id="trafficTotalOk">0</strong>
 							</span>
-							<span class="chip chip--danger stat-pill" title="Total failed requests (all time)">
+							<span class="chip chip--danger stat-pill" title="Failed requests in the last 60 minutes">
 								<span class="legend-dot legend-dot--bad"></span> Failed:
 								<strong id="trafficTotalFail">0</strong>
 							</span>
@@ -469,25 +470,31 @@
 						<p class="form__hint">
 							Deny requests by their headers — useful for blocking exploit tooling that tags its traffic
 							(e.g. a <code>Xeno-Fingerprint</code> header, or a <code>User-Agent</code> containing
-							<code>Xeno</code>). Blocked callers get a generic <em>Not Found</em> with no hint as to why,
-							so they can't reverse-engineer the rule. Matching is case-insensitive.
+							<code>Xeno</code>). Blocked callers get a normal-looking <em>throttle</em> response (429), so
+							they think they're rate-limited rather than filtered. Matching is case-insensitive, and every
+							blocked request is recorded under <strong>Blocked Request Fingerprints</strong> below so you
+							can check for false positives.
 						</p>
 						<ul class="form__hint">
 							<li>
-								<strong>Header name</strong> — matches the header's key (e.g. block any request sending
-								an <code>Exploit-Guid</code> header).
+								<strong>Specific header</strong> (most precise — fewest false positives): fill the
+								<em>Header</em> box (e.g. <code>User-Agent</code>) to match only that header's value.
 							</li>
 							<li>
-								<strong>Header value</strong> — matches the header's value (e.g. block a
-								<code>User-Agent</code> value containing <code>Xeno</code>).
-							</li>
-							<li>
-								<strong>Name or value</strong> — trips if either side matches (one rule catches
-								<code>Xeno-Fingerprint</code> and <code>User-Agent: Xeno/…</code>).
+								Otherwise <strong>Match against</strong> applies: <em>Header name</em> (the key),
+								<em>Header value</em> (any value), or <em>Name or value</em> (either).
 							</li>
 						</ul>
 						<form id="headerRuleForm" class="form">
 							<div class="form__row">
+								<input
+									id="headerRuleHeader"
+									class="input"
+									type="text"
+									style="max-width: 170px"
+									placeholder="Header (optional)"
+									aria-label="Specific header name (optional)"
+								/>
 								<select
 									id="headerRuleScope"
 									class="input input--select"
@@ -523,6 +530,7 @@
 							<table id="headerRulesTable" class="table">
 								<thead>
 									<tr>
+										<th scope="col">Header</th>
 										<th scope="col">Match Against</th>
 										<th scope="col">Type</th>
 										<th scope="col">Text</th>
@@ -1086,7 +1094,10 @@
 							<p class="form__hint">
 								Every distinct header NAME seen across proxied requests, by frequency. Exploit tooling
 								often tags traffic with tell-tale headers (e.g. <code>Exploit-Guid</code>) — copy one into
-								Request Filters to block it.
+								Request Filters to block it. <strong>Click a header</strong> to see the distinct values it
+								carried (great for <code>Roblox-Id</code>, <code>Roblox-Game-Id</code>, etc.); secret values
+								like cookies show a safe fingerprint, never the raw secret. <em>Clear</em> resets one header
+								so it repopulates fresh.
 							</p>
 							<input
 								id="headerNamesFilter"
@@ -1124,6 +1135,74 @@
 							/>
 							<div class="table-wrap">
 								<table id="userAgentsTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">User-Agent</th>
+											<th scope="col">Count</th>
+											<th scope="col">Last Seen</th>
+										</tr>
+									</thead>
+									<tbody></tbody>
+								</table>
+							</div>
+						</article>
+					</div>
+				</section>
+
+				<!-- Blocked Request Fingerprints (for false-positive review) -->
+				<section id="section-blocked-fingerprints" class="section" aria-labelledby="blockedFpHeading">
+					<div class="section__header">
+						<h2 id="blockedFpHeading" class="section__title">Blocked Request Fingerprints</h2>
+						<div class="section__actions">
+							<button id="exportBlockedFingerprints" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							The headers and user-agents of requests that your <strong>Request Filters</strong> actually
+							blocked. Review this to catch <strong>false positives</strong> — if a legit request shows up
+							here, loosen the rule that caught it. Click a header to see its distinct values.
+						</p>
+					</div>
+					<div class="grid grid--cards">
+						<article class="card">
+							<h3 class="card__title">
+								Blocked Header Names <span id="blockedHeaderNamesTotal" class="chip">0 distinct</span>
+							</h3>
+							<input
+								id="blockedHeaderNamesFilter"
+								class="input input--filter"
+								type="search"
+								placeholder="Filter header names…"
+								aria-label="Filter blocked header names"
+							/>
+							<div class="table-wrap">
+								<table id="blockedHeaderNamesTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Header Name</th>
+											<th scope="col">Count</th>
+											<th scope="col">Last Seen</th>
+										</tr>
+									</thead>
+									<tbody></tbody>
+								</table>
+							</div>
+						</article>
+
+						<article class="card">
+							<h3 class="card__title">
+								Blocked User-Agents <span id="blockedUserAgentsTotal" class="chip">0 distinct</span>
+							</h3>
+							<input
+								id="blockedUserAgentsFilter"
+								class="input input--filter"
+								type="search"
+								placeholder="Filter user-agents…"
+								aria-label="Filter blocked user-agents"
+							/>
+							<div class="table-wrap">
+								<table id="blockedUserAgentsTable" class="table">
 									<thead>
 										<tr>
 											<th scope="col">User-Agent</th>

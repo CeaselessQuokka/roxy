@@ -405,12 +405,13 @@ IP_HDR = {"X-Forwarded-For": "10.7.7.1"}
 
 n = len(upstream_calls)
 r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "Xeno-Fingerprint": "9b6c6e24"})
-check("Header rule blocks request with Xeno-* header (key match) -> 404", r.status_code == 404, r.status_code)
-check("Header-blocked body is a GENERIC error (no reason leaked)", b"Not Found" in r.data and b"eader" not in r.data, r.data[:80])
+check("Header rule blocks request with Xeno-* header (key match) -> disguised 429", r.status_code == 429, r.status_code)
+check("Header-blocked body looks like a throttle (no reason leaked)", b"throttled" in r.data and b"eader" not in r.data, r.data[:80])
+check("Header-blocked response disguised as throttled", r.headers.get("Roxy-Throttled") == "True", dict(r.headers))
 check("Header-blocked request never hit upstream", len(upstream_calls) == n, len(upstream_calls) - n)
 
 r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "User-Agent": "Xeno/1.3.55"})
-check("Header rule blocks Xeno User-Agent (value match) -> 404", r.status_code == 404, r.status_code)
+check("Header rule blocks Xeno User-Agent (value match) -> 429", r.status_code == 429, r.status_code)
 
 n = len(upstream_calls)
 r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "User-Agent": "Roblox/WinInet"})
@@ -434,7 +435,7 @@ check("Header rule stored in HeaderRules", any("xeno" in k for k in diag.get("He
 # Key-scope exact rule
 client.post("/admin/headers/rule", headers=IP_MAIN, json={"scope": "key", "mode": "exact", "needle": "exploit-guid"})
 r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "Exploit-Guid": "x"})
-check("Exact key-scope rule blocks Exploit-Guid header -> 404", r.status_code == 404, r.status_code)
+check("Exact key-scope rule blocks Exploit-Guid header -> 429", r.status_code == 429, r.status_code)
 r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "Exploit-Guid-Extra": "x"})
 check("Exact key rule does NOT match a longer header name -> 200", r.status_code == 200, r.status_code)
 
@@ -450,7 +451,9 @@ check("Clear header-blocked attempts -> 200", r.status_code == 200, r.status_cod
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 check("Header-blocked attempts cleared", r.get_json().get("HeaderBlockedAttempts") == {}, r.get_json().get("HeaderBlockedAttempts"))
 # Remove the remaining exact rule so it doesn't affect later sections.
-client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": "key|exact|exploit-guid"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+for rid in [k for k in r.get_json().get("HeaderRules", {}) if "exploit-guid" in k]:
+    client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": rid})
 
 print("== Global throttle-all mode (configurable N per P, custom message, drops) ==")
 proxy_module.requests.request = fake_upstream
@@ -625,13 +628,13 @@ r = client.post("/admin/headers/rule", headers=IP_MAIN, json={"scope": "value", 
 check("Add regex header rule -> 200", r.status_code == 200, r.data[:80])
 IP_RXH = {"X-Forwarded-For": "10.13.0.1"}
 r = api_client.get("/games.roblox.com/v1/x", headers={**IP_RXH, "User-Agent": "KRNL/2.0"})
-check("Regex header rule blocks matching UA -> 404", r.status_code == 404, r.status_code)
+check("Regex header rule blocks matching UA -> 429", r.status_code == 429, r.status_code)
 r = api_client.get("/games.roblox.com/v1/x", headers={**IP_RXH, "User-Agent": "LegitClient/1.0"})
 check("Regex header rule lets a clean UA through -> 200", r.status_code == 200, r.status_code)
 r = client.post("/admin/headers/rule", headers=IP_MAIN, json={"scope": "value", "mode": "regex", "needle": "([bad"})
 check("Invalid regex header rule rejected -> 400", r.status_code == 400, r.data[:80])
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-for rid in [k for k in r.get_json().get("HeaderRules", {}) if k.startswith("value|regex|")]:
+for rid in [k for k in r.get_json().get("HeaderRules", {}) if "|regex|" in k]:
     client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": rid})
 
 print("== Token budget peak (1h / 24h) ==")
@@ -844,6 +847,74 @@ ph_after = r.get_json().get("ProxyHealth", {})
 check("Clear-all zeroed Direct API request count", ph_after.get("DirectAPI", {}).get("Count", 0) == 0, ph_after.get("DirectAPI"))
 check("Clear-all zeroed RoProxy request count", ph_after.get("RoProxy", {}).get("Count", 0) == 0, ph_after.get("RoProxy"))
 check("Clear-all zeroed token Requests", ph_after.get("Tokens", {}).get("Requests", 0) == 0, ph_after.get("Tokens"))
+
+print("== Specific-header request filter (precise targeting) ==")
+proxy_module.requests.request = fake_upstream
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["SPEC_TOKEN"])
+# Target ONLY the User-Agent value; other headers containing the word must NOT trip it.
+r = client.post("/admin/headers/rule", headers=IP_MAIN, json={"header": "User-Agent", "mode": "contains", "needle": "BadClient"})
+check("Add specific-header rule -> 200", r.status_code == 200, r.data[:80])
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+spec_rule = next((v for k, v in r.get_json().get("HeaderRules", {}).items() if v.get("Header") == "User-Agent"), {})
+check("Specific-header rule stored with Header field", spec_rule.get("Header") == "User-Agent", spec_rule)
+IP_SPEC = {"X-Forwarded-For": "10.40.0.1"}
+r = api_client.get("/games.roblox.com/v1/spec", headers={**IP_SPEC, "User-Agent": "BadClient/1.0"})
+check("Specific-header rule blocks the targeted header value -> 429", r.status_code == 429, r.status_code)
+n = len(upstream_calls)
+r = api_client.get("/games.roblox.com/v1/spec", headers={**IP_SPEC, "User-Agent": "Good/1.0", "X-Note": "BadClient is here"})
+check("Same text in a DIFFERENT header does NOT trip the targeted rule -> 200", r.status_code == 200, r.status_code)
+check("Non-matching request reached upstream", len(upstream_calls) == n + 1, len(upstream_calls) - n)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+for rid in [k for k, v in r.get_json().get("HeaderRules", {}).items() if v.get("Header") == "User-Agent"]:
+    client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": rid})
+
+print("== Fingerprint value drill-down (+ sensitive fingerprinting) ==")
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "fingerprints"})
+IP_FP = {"X-Forwarded-For": "10.41.0.1"}
+api_client.get("/games.roblox.com/v1/v", headers={**IP_FP, "Roblox-Id": "111", "Cookie": ".ROBLOSECURITY=SECRET_AAA"})
+api_client.get("/games.roblox.com/v1/v", headers={**IP_FP, "Roblox-Id": "222", "Cookie": ".ROBLOSECURITY=SECRET_AAA"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+hn = r.get_json().get("HeaderNames", {})
+roblox_id_vals = hn.get("roblox-id", {}).get("Values", {})
+check("Header value drill-down records distinct values", set(roblox_id_vals) == {"111", "222"}, roblox_id_vals)
+cookie_vals = hn.get("cookie", {}).get("Values", {})
+check("Sensitive cookie values are fingerprinted, not stored raw", all(v.startswith("fp:") for v in cookie_vals) and cookie_vals, cookie_vals)
+check("Two identical cookies collapse to one fingerprint with count 2", any(info.get("Count") == 2 for info in cookie_vals.values()), cookie_vals)
+# Per-header clear: clear just roblox-id, leave cookie intact.
+r = client.post("/admin/fingerprints/clear_header", headers=IP_MAIN, json={"name": "Roblox-Id"})
+check("Per-header clear -> 200", r.status_code == 200, r.status_code)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+hn = r.get_json().get("HeaderNames", {})
+check("Cleared header is gone", "roblox-id" not in hn, list(hn))
+check("Other headers untouched by per-header clear", "cookie" in hn, list(hn))
+
+print("== Blocked Request Fingerprints (false-positive review) ==")
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "blocked_fingerprints"})
+client.post("/admin/headers/rule", headers=IP_MAIN, json={"header": "User-Agent", "mode": "contains", "needle": "Grief"})
+api_client.get("/games.roblox.com/v1/bfp", headers={"X-Forwarded-For": "10.42.0.1", "User-Agent": "GrieferTool/3", "X-Tag": "abc"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag = r.get_json()
+check("Blocked request's header names recorded separately", "user-agent" in (diag.get("BlockedHeaderNames") or {}), list(diag.get("BlockedHeaderNames", {})))
+check("Blocked request's user-agent recorded separately", "GrieferTool/3" in (diag.get("BlockedUserAgents") or {}), list(diag.get("BlockedUserAgents", {})))
+check("Blocked fingerprints are separate from accepted ones", "GrieferTool/3" not in (diag.get("UserAgents") or {}), list(diag.get("UserAgents", {})))
+# Clean up the rule.
+for rid in [k for k, v in diag.get("HeaderRules", {}).items() if v.get("Needle") == "Grief"]:
+    client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": rid})
+
+print("== Traffic pills reflect the last hour ==")
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["PILL_TOKEN"])
+for i in range(4):
+    api_client.get(f"/games.roblox.com/v1/pill{i}", headers={"X-Forwarded-For": "10.43.0.1"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag = r.get_json()
+now_minute = int(diag["ServerTime"] // 60)
+hour_ok = sum(b.get("Successful", 0) for m, b in diag.get("TrafficMinutes", {}).items() if int(m) > now_minute - 60)
+check("Traffic minutes reflect recent successful requests (drives the pills)", hour_ok >= 4, hour_ok)
 
 print("== Emailed invalidation link (kill switch) ==")
 invalidate_emails = emails_with("Roxy Admin Login")

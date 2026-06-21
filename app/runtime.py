@@ -528,9 +528,9 @@ def match_endpoint_rule(path: str):
 
 
 # --- Header block rules -----------------------------------------------------
-def _header_rule_id(scope: str, mode: str, needle: str) -> str:
+def _header_rule_id(scope: str, mode: str, needle: str, header: str = "") -> str:
     """Canonical id so the same rule can't be added twice and is easy to remove."""
-    return f"{scope}|{mode}|{needle.lower()}"
+    return f"{header.lower()}|{scope}|{mode}|{needle.lower()}"
 
 
 def get_header_rules() -> dict:
@@ -538,10 +538,11 @@ def get_header_rules() -> dict:
     return {k: dict(v) for k, v in _header_rules.items()}
 
 
-def add_header_rule(scope: str, mode: str, needle: str, note: str = "") -> tuple[bool, str]:
+def add_header_rule(scope: str, mode: str, needle: str, note: str = "", header: str = "") -> tuple[bool, str]:
     scope = (scope or "either").strip().lower()
     mode = (mode or "contains").strip().lower()
     needle = (needle or "").strip()
+    header = (header or "").strip()
     if scope not in HEADER_RULE_SCOPES:
         return False, f"Scope must be one of: {', '.join(HEADER_RULE_SCOPES)}"
     if mode not in HEADER_RULE_MODES:
@@ -550,12 +551,16 @@ def add_header_rule(scope: str, mode: str, needle: str, note: str = "") -> tuple
         return False, "Empty match text"
     if mode == "regex" and not valid_regex(needle):
         return False, "Invalid regular expression"
-    rule_id = _header_rule_id(scope, mode, needle)
+    # Targeting a specific header means we match its VALUE.
+    if header:
+        scope = "value"
+    rule_id = _header_rule_id(scope, mode, needle, header)
     if rule_id not in _header_rules and len(_header_rules) >= config.MAX_HEADER_RULES:
         return False, "Too many header rules"
 
     def change():
         _header_rules[rule_id] = {
+            "Header": header,
             "Scope": scope,
             "Mode": mode,
             "Needle": needle,
@@ -609,9 +614,22 @@ def match_header_rule(headers) -> dict | None:
         scope = rule.get("Scope", "either")
         mode = rule.get("Mode", "contains")
         needle = str(rule.get("Needle", ""))
+        target_header = str(rule.get("Header", "")).lower()
         if not needle:
             continue
         for name, value in pairs:
+            if target_header:
+                # Rule targets one specific header: match only that header's value.
+                if name.lower() != target_header:
+                    continue
+                if _header_field_matches(mode, needle, value):
+                    hit = dict(rule)
+                    hit["Id"] = rule_id
+                    hit["MatchedHeader"] = name
+                    hit["MatchedField"] = "value"
+                    hit["MatchedText"] = value
+                    return hit
+                continue
             key_hit = scope in ("key", "either") and _header_field_matches(mode, needle, name)
             value_hit = scope in ("value", "either") and _header_field_matches(mode, needle, value)
             if key_hit or value_hit:

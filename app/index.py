@@ -383,6 +383,16 @@ def admin_force_revalidate():
     return jsonify("Revalidation queued"), 200
 
 
+@app.route("/admin/fingerprints/clear_header", methods=["POST"], endpoint="admin_clear_fingerprint_header")
+@requires_admin
+def admin_clear_fingerprint_header():
+    data = get_json_dict()
+    if data is None or not data.get("name"):
+        return jsonify("Missing header name"), 400
+    ok = diagnostics.clear_fingerprint_header(bool(data.get("blocked")), str(data["name"]))
+    return jsonify("Cleared" if ok else "Cleared in memory, but the data file could not be written"), 200
+
+
 @app.route("/admin/trusted_devices/revoke", methods=["POST"], endpoint="admin_revoke_trusted")
 @requires_admin
 def admin_revoke_trusted():
@@ -479,6 +489,7 @@ def admin_add_header_rule():
         str(data.get("mode", "contains")),
         str(data["needle"]),
         str(data.get("note", "")),
+        str(data.get("header", "")),
     )
     status = 200 if ok else 400
     return jsonify({"Message": message, "HeaderRules": runtime.get_header_rules()}), status
@@ -638,6 +649,19 @@ def _with_throttle_headers(resp, ip: str, **extra):
     return resp
 
 
+def throttled_response(ip: str, reset_in=None):
+    """The standard 'you've been throttled' 429. Reused for header-rule blocks so a
+    blocked exploiter sees an ordinary rate-limit message and can't tell they were
+    filtered (it's indistinguishable from a real throttle)."""
+    if reset_in is None:
+        reset_in = throttle.get_throttle_reset_time_left(ip)
+    allowed = runtime.get_setting("allowed_requests_per_minute", config.ALLOWED_REQUESTS_PER_MINUTE)
+    resp = jsonify(
+        f"You have been throttled; try again in {reset_in} seconds (you get ~{allowed} requests per ~minute)."
+    )
+    return _with_throttle_headers(resp, ip, Roxy_Throttle_Reset=reset_in, Roxy_Throttled="True"), 429
+
+
 # Handle proxying.
 @app.route("/<path:dst>", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
 def proxy_page(dst: str):
@@ -660,12 +684,7 @@ def proxy_page(dst: str):
             return _with_throttle_headers(resp, ip, Roxy_Throttle_Reset=retry_in, Roxy_Global_Throttled="True"), 429
 
     if throttle.is_throttled(ip):
-        reset_in = throttle.get_throttle_reset_time_left(ip)
-        allowed = runtime.get_setting("allowed_requests_per_minute", config.ALLOWED_REQUESTS_PER_MINUTE)
-        resp = jsonify(
-            f"You have been throttled; try again in {reset_in} seconds (you get ~{allowed} requests per ~minute)."
-        )
-        return _with_throttle_headers(resp, ip), 429
+        return throttled_response(ip)
 
     if dst in path_ignore_set:
         resp = jsonify("Not Found")
@@ -682,14 +701,16 @@ def proxy_page(dst: str):
         return _with_throttle_headers(resp, ip), 404
 
     # Header rules deny abusive clients (e.g. exploit fingerprints) outright.
-    # The caller only ever gets a generic error — nothing reveals WHY it failed,
-    # so the exploiter can't reverse-engineer the rule. The admin sees the detail
-    # on the dashboard.
+    # The blocked caller gets a normal-looking THROTTLE 429 — indistinguishable
+    # from a real rate-limit — so the exploiter thinks they're requesting too much
+    # rather than realizing they're filtered. The admin sees the real detail (and
+    # the blocked request's full fingerprint, for false-positive review).
     header_rule = runtime.match_header_rule(request.headers)
     if header_rule:
         diagnostics.log_header_blocked(header_rule, dst, request.method, ip)
-        resp = jsonify("Not Found")
-        return _with_throttle_headers(resp, ip), 404
+        diagnostics.log_request_fingerprint(request.headers.items(), user_agent, blocked=True)
+        reset_in = runtime.get_setting("throttle_reset_duration", config.THROTTLE_RESET_DURATION)
+        return throttled_response(ip, reset_in=reset_in)
 
     if runtime.is_endpoint_blocked(dst):
         diagnostics.log_blocked_endpoint(dst, request.method, ip, runtime.get_matching_block(dst))
@@ -709,8 +730,9 @@ def proxy_page(dst: str):
     throttle.update_throttling(ip, made_request=True)
     safe_headers = sanitize_headers(request.headers)
     diagnostics.log_endpoint(dst, request.method, json.dumps(safe_headers), ip)
-    # Track distinct header names + user-agents to help spot abusive clients.
-    diagnostics.log_request_fingerprint(list(safe_headers.keys()), user_agent)
+    # Track distinct header names + their values + user-agents (secret values are
+    # fingerprinted, not stored raw) to help spot abusive clients.
+    diagnostics.log_request_fingerprint(request.headers.items(), user_agent)
 
     # Preserve repeated query params (e.g. ?ids=1&ids=2); requests encodes lists.
     params = request.args.to_dict(flat=False)
