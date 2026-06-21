@@ -716,6 +716,11 @@ check("Concrete endpoint stores last headers", "X-Test-Header" in (concrete.get(
 check("Concrete endpoint stores last IP", concrete.get("LastIP") == "10.21.0.1", concrete.get("LastIP"))
 
 print("== Token route Requests/Rejected counted ==")
+# Force the token route (direct + roproxy in cooldown) so a token request actually happens.
+proxy_module.set_tokens(["TKR_TOKEN"])
+proxy_module.is_direct_api_in_cooldown = True
+proxy_module.is_roproxy_in_cooldown = True
+api_client.get("/games.roblox.com/v1/token-route", headers={"X-Forwarded-For": "10.21.0.2"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 tk = r.get_json().get("ProxyHealth", {}).get("Tokens", {})
 check("Token route request count tracked", tk.get("Requests", 0) >= 1, tk)
@@ -799,6 +804,46 @@ visits0 = r.get_json()["PageVisits"].get("admin", 0)
 app.test_client().get("/admin", headers={"X-Forwarded-For": "10.25.0.1"})  # fresh anonymous bot
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 check("Anonymous GET /admin increments the counter", r.get_json()["PageVisits"].get("admin", 0) == visits0 + 1, r.get_json()["PageVisits"])
+
+print("== Health: Tokens Requests == sum of Uses; Direct/RoProxy ResetIn ==")
+proxy_module.requests.request = fake_upstream
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["MATCH_TOKEN"])
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "all"})
+# Force the token route (direct + roproxy in cooldown) and make a few requests.
+proxy_module.is_direct_api_in_cooldown = True
+proxy_module.is_roproxy_in_cooldown = True
+for i in range(3):
+    api_client.get(f"/games.roblox.com/v1/match{i}", headers={"X-Forwarded-For": "10.30.0.1"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag = r.get_json()
+token_uses = sum(int(t.get("Uses", 0)) for t in diag.get("Tokens", []))
+tokens_requests = diag.get("ProxyHealth", {}).get("Tokens", {}).get("Requests", 0)
+check("Token health Requests equals sum of Auth-token Uses", tokens_requests == token_uses and token_uses >= 3, (tokens_requests, token_uses))
+# Trigger a direct-API cooldown and confirm ResetIn is reported.
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens([])
+api_client.get("/games.roblox.com/v1/cooldown-test", headers={"X-Forwarded-For": "10.30.0.2"})  # enters direct cooldown
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+da = r.get_json().get("ProxyHealth", {}).get("DirectAPI", {})
+check("Direct API reports a cooldown ResetIn", da.get("IsInCooldown") and da.get("ResetIn", 0) > 0, da)
+
+print("== Clear-all resets the live health counters too ==")
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["CLR_TOKEN"])
+api_client.get("/games.roblox.com/v1/before-clear", headers={"X-Forwarded-For": "10.30.0.3"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+ph_before = r.get_json().get("ProxyHealth", {})
+check("Health has request counts before clear", (ph_before.get("DirectAPI", {}).get("Count", 0) + ph_before.get("RoProxy", {}).get("Count", 0)) >= 1, ph_before)
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "all"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+ph_after = r.get_json().get("ProxyHealth", {})
+check("Clear-all zeroed Direct API request count", ph_after.get("DirectAPI", {}).get("Count", 0) == 0, ph_after.get("DirectAPI"))
+check("Clear-all zeroed RoProxy request count", ph_after.get("RoProxy", {}).get("Count", 0) == 0, ph_after.get("RoProxy"))
+check("Clear-all zeroed token Requests", ph_after.get("Tokens", {}).get("Requests", 0) == 0, ph_after.get("Tokens"))
 
 print("== Emailed invalidation link (kill switch) ==")
 invalidate_emails = emails_with("Roxy Admin Login")

@@ -1195,3 +1195,153 @@ body {
 		max-width: none !important;
 	}
 }
+
+/* =============================
+   24) POLISH — color & flair
+   ============================= */
+:root {
+	--accent-1: #7cc4ff; /* blue */
+	--accent-2: #69f0ae; /* green */
+	--accent-3: #ffb74d; /* amber */
+	--accent-4: #ff6b6b; /* red */
+	--accent-5: #ce93d8; /* purple */
+	--accent-6: #4dd0e1; /* cyan */
+}
+
+/* Gradient brand title + a colorful hairline under the top bar */
+.app-bar {
+	border-bottom: 1px solid transparent;
+	border-image: linear-gradient(90deg, var(--accent-1), var(--accent-5), var(--accent-2)) 1;
+}
+.app-title {
+	background: linear-gradient(90deg, var(--accent-1), var(--accent-5));
+	-webkit-background-clip: text;
+	background-clip: text;
+	-webkit-text-fill-color: transparent;
+	color: transparent;
+}
+
+/* Cards lift + brighten on hover */
+.card {
+	transition: transform var(--dur-med) var(--easing), border-color var(--dur-med) var(--easing),
+		box-shadow var(--dur-med) var(--easing);
+}
+.card:hover {
+	transform: translateY(-2px);
+	border-color: var(--color-outline-strong);
+	box-shadow: 0 10px 30px rgba(var(--shadow-color), 0.45);
+}
+
+/* KPI cards: a colored accent stripe + tinted value, cycling through the palette */
+.kpi {
+	position: relative;
+	overflow: hidden;
+	--kpi-accent: var(--accent-1);
+}
+.kpi::before {
+	content: "";
+	position: absolute;
+	left: 0;
+	top: 0;
+	bottom: 0;
+	width: 4px;
+	background: var(--kpi-accent);
+	opacity: 0.9;
+}
+.kpi::after {
+	content: "";
+	position: absolute;
+	right: -40px;
+	top: -40px;
+	width: 120px;
+	height: 120px;
+	border-radius: 50%;
+	background: radial-gradient(circle, var(--kpi-accent), transparent 70%);
+	opacity: 0.07;
+	pointer-events: none;
+}
+.kpi__value {
+	color: var(--kpi-accent);
+	background: linear-gradient(180deg, var(--kpi-accent), color-mix(in oklab, var(--kpi-accent) 55%, white 12%));
+	-webkit-background-clip: text;
+	background-clip: text;
+	-webkit-text-fill-color: transparent;
+}
+.grid--kpis > .kpi:nth-child(6n + 1) {
+	--kpi-accent: var(--accent-1);
+}
+.grid--kpis > .kpi:nth-child(6n + 2) {
+	--kpi-accent: var(--accent-2);
+}
+.grid--kpis > .kpi:nth-child(6n + 3) {
+	--kpi-accent: var(--accent-3);
+}
+.grid--kpis > .kpi:nth-child(6n + 4) {
+	--kpi-accent: var(--accent-4);
+}
+.grid--kpis > .kpi:nth-child(6n + 5) {
+	--kpi-accent: var(--accent-5);
+}
+.grid--kpis > .kpi:nth-child(6n + 6) {
+	--kpi-accent: var(--accent-6);
+}
+
+/* Section titles get a gradient accent bar to the left */
+.section__title {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+.section__title::before {
+	content: "";
+	width: 5px;
+	align-self: stretch;
+	min-height: 1.1em;
+	border-radius: 999px;
+	background: linear-gradient(180deg, var(--accent-1), var(--accent-5));
+}
+.section__title--toggle::before {
+	order: -1;
+}
+
+/* Stat pills (Traffic totals) a touch bolder */
+.stat-pill strong {
+	font-size: var(--fs-md);
+	margin-left: 2px;
+}
+.chip--ok strong {
+	color: var(--color-success);
+}
+.chip--danger strong {
+	color: var(--color-danger);
+}
+
+/* Buttons: subtle gradient on the primary filled action */
+.btn--filled {
+	background: linear-gradient(180deg, var(--accent-1), color-mix(in oklab, var(--accent-1) 80%, var(--accent-6) 20%));
+}
+
+/* Section nav: active link gets an accent dot */
+.nav__link.is-active {
+	box-shadow: inset 3px 0 0 var(--accent-1);
+}
+
+/* Health "value" words get color by state via JS-set classes */
+.health-ok {
+	color: var(--color-success);
+}
+.health-bad {
+	color: var(--color-warning);
+}
+
+/* Make the Refresh nav button pop a little on hover */
+#navRefresh:hover {
+	color: var(--accent-1);
+	border-color: var(--accent-1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.card:hover {
+		transform: none;
+	}
+}

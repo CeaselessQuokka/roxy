@@ -255,8 +255,14 @@
 					<div class="section__header">
 						<h2 id="trafficHeading" class="section__title">Traffic — Last 60 Minutes</h2>
 						<div class="section__actions">
-							<span class="chip"><span class="legend-dot legend-dot--ok"></span> Successful</span>
-							<span class="chip"><span class="legend-dot legend-dot--bad"></span> Failed</span>
+							<span class="chip chip--ok stat-pill" title="Total successful requests (all time)">
+								<span class="legend-dot legend-dot--ok"></span> Successful:
+								<strong id="trafficTotalOk">0</strong>
+							</span>
+							<span class="chip chip--danger stat-pill" title="Total failed requests (all time)">
+								<span class="legend-dot legend-dot--bad"></span> Failed:
+								<strong id="trafficTotalFail">0</strong>
+							</span>
 						</div>
 					</div>
 					<div class="card">
@@ -1251,7 +1257,8 @@
 							<div class="kpi__value" id="health_direct">OK</div>
 							<div class="kpi__meta">
 								Last: <span id="direct_last">—</span> • Cooldown:
-								<span id="direct_cooldown">false</span> • Count:
+								<span id="direct_cooldown">false</span> • Resets in:
+								<span id="direct_reset">—</span> • Requests:
 								<span id="direct_count">0</span> • Rejected:
 								<span id="direct_failed">0</span> • Timeouts:
 								<span id="direct_timeouts">0</span>
@@ -1263,7 +1270,8 @@
 							<div class="kpi__value" id="health_roproxy">OK</div>
 							<div class="kpi__meta">
 								Last: <span id="roproxy_last">—</span> • Cooldown:
-								<span id="roproxy_cooldown">false</span> • Count:
+								<span id="roproxy_cooldown">false</span> • Resets in:
+								<span id="roproxy_reset">—</span> • Requests:
 								<span id="roproxy_count">0</span> • Rejected:
 								<span id="roproxy_failed">0</span> • Timeouts:
 								<span id="roproxy_timeouts">0</span>

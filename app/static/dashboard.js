@@ -294,6 +294,9 @@ const print = console.log;
 		setText("mc_total_s", String(totalS));
 		setText("mc_total_f", String(totalF));
 		setText("mc_total_t", String(totalS + totalF));
+		// At-a-glance totals shown in the Traffic section.
+		setText("trafficTotalOk", totalS.toLocaleString());
+		setText("trafficTotalFail", totalF.toLocaleString());
 
 		renderSplitBar(
 			"methodMixBar",
@@ -426,19 +429,29 @@ const print = console.log;
 		const rp = h.RoProxy || {};
 		const tk = h.Tokens || {};
 
-		setText("health_direct", da.IsInCooldown ? "COOLDOWN" : "OK");
+		const healthState = (id, inCooldown) => {
+			setText(id, inCooldown ? "COOLDOWN" : "OK");
+			const el = document.getElementById(id);
+			if (el) {
+				el.classList.toggle("health-ok", !inCooldown);
+				el.classList.toggle("health-bad", Boolean(inCooldown));
+			}
+		};
+		healthState("health_direct", da.IsInCooldown);
 		setText("direct_last", da.LastRequestTime ? timeAgo(da.LastRequestTime) : "—");
 		setText("direct_cooldown", String(Boolean(da.IsInCooldown)));
 		setText("direct_count", String(da.Count || 0));
 		setText("direct_failed", String(da.Failed || 0));
 		setText("direct_timeouts", String(da.Timeouts || 0));
+		setText("direct_reset", da.IsInCooldown ? `${da.ResetIn ?? 0}s` : "—");
 
-		setText("health_roproxy", rp.IsInCooldown ? "COOLDOWN" : "OK");
+		healthState("health_roproxy", rp.IsInCooldown);
 		setText("roproxy_last", rp.LastRequestTime ? timeAgo(rp.LastRequestTime) : "—");
 		setText("roproxy_cooldown", String(Boolean(rp.IsInCooldown)));
 		setText("roproxy_count", String(rp.Count || 0));
 		setText("roproxy_failed", String(rp.Failed || 0));
 		setText("roproxy_timeouts", String(rp.Timeouts || 0));
+		setText("roproxy_reset", rp.IsInCooldown ? `${rp.ResetIn ?? 0}s` : "—");
 
 		setText("health_tokens_count", String(tk.Count ?? 0));
 		setText("health_tokens_requests", String(tk.Requests ?? 0));

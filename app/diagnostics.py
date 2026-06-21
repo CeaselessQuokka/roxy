@@ -504,11 +504,26 @@ def log_route_timeout(is_roproxy: bool):
 
 
 def log_token_result(success: bool):
-    """Count a token-route request and whether it was rejected (non-200)."""
+    """Count a rejected (non-200) token-route request. (The total request count is
+    derived from per-token Uses in get_diagnostics so it matches the Auth Tokens table.)"""
+    if success:
+        return
     with _state_lock:
-        proxy_health["Tokens"]["Requests"] = proxy_health["Tokens"].get("Requests", 0) + 1
-        if not success:
-            proxy_health["Tokens"]["Failed"] = proxy_health["Tokens"].get("Failed", 0) + 1
+        proxy_health["Tokens"]["Failed"] = proxy_health["Tokens"].get("Failed", 0) + 1
+
+
+def reset_proxy_health_counters():
+    """Zero the live request counters on the health cards (Direct/RoProxy/Token).
+
+    Keeps live state (cooldown flags, last-request times, token inventory) — only
+    the cumulative request/failure/timeout tallies are reset, so a 'clear' makes
+    the Service Health numbers start fresh like the rest of the dashboard."""
+    with _state_lock:
+        for route in ("DirectAPI", "RoProxy"):
+            for key in ("Count", "Failed", "Timeouts"):
+                proxy_health[route][key] = 0
+        for key in ("Failed", "Timeouts", "ExpiredCount"):
+            proxy_health["Tokens"][key] = 0
 
 
 def log_token_timeout():
@@ -701,7 +716,7 @@ def get_diagnostics() -> dict:
     with _state_lock:
         # Deep-copy the whole snapshot under the lock so no other thread can
         # mutate a structure while Flask iterates it during JSON serialization.
-        return copy.deepcopy(
+        snapshot = copy.deepcopy(
             {
                 "PageVisits": page_visits,
                 "VisitorCounts": visitor_counts,
@@ -736,6 +751,24 @@ def get_diagnostics() -> dict:
                 "WorkerStartedAt": _started_at,
             }
         )
+    # Derived health fields (computed outside the lock):
+    health = snapshot["ProxyHealth"]
+    now = snapshot["ServerTime"]
+    # Token route "Requests" is the sum of per-token Uses, so it always matches
+    # the Uses column in the Auth Tokens table.
+    health["Tokens"]["Requests"] = sum(int(t.get("Uses", 0)) for t in snapshot["Tokens"])
+    # How long until each upstream route's cooldown lifts (like the token budget).
+    for route, setting, default in (
+        ("DirectAPI", "direct_api_cooldown", config.DIRECT_API_COOLDOWN),
+        ("RoProxy", "roproxy_cooldown", config.ROPROXY_COOLDOWN),
+    ):
+        rh = health.get(route, {})
+        if rh.get("IsInCooldown"):
+            cooldown = runtime.get_setting(setting, default)
+            rh["ResetIn"] = int(max(0, rh.get("LastRequestTime", 0) + cooldown - now))
+        else:
+            rh["ResetIn"] = 0
+    return snapshot
 
 
 # --- Persistence ------------------------------------------------------------
@@ -848,11 +881,16 @@ def clear_stats(names: tuple) -> bool:
                 epochs[name] = now
             return data
 
+        ok = True
         try:
             storage.update_data(mutate)
-            return True
         except OSError:
-            return False
+            ok = False
+    # The live health counters aren't persisted, so reset them here too when the
+    # request stats are being cleared (and thus on "clear all").
+    if "request_counts" in names:
+        reset_proxy_health_counters()
+    return ok
 
 
 def serialize() -> dict:
