@@ -865,6 +865,79 @@ const print = console.log;
 		}
 	}
 
+	const HEADER_SCOPE_LABELS = { key: "Header name", value: "Header value", either: "Name or value" };
+	function renderHeaderRules(d) {
+		const tbody = $("#headerRulesTable tbody");
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const entries = Object.entries(d.HeaderRules || {});
+		if (entries.length === 0) {
+			tbody.appendChild(tr(["—", "—", "No header rules", "—", "—", ""]));
+			return;
+		}
+		for (const [id, info] of entries) {
+			const btn = document.createElement("button");
+			btn.className = "btn btn--outline btn--sm";
+			btn.textContent = "Remove";
+			btn.addEventListener("click", () => removeHeaderRule(id));
+			tbody.appendChild(
+				tr([
+					HEADER_SCOPE_LABELS[info.Scope] || info.Scope || "—",
+					info.Mode === "exact" ? "Exact" : "Contains",
+					info.Needle || "—",
+					info.Note || "—",
+					tsNode(info.Added),
+					btn,
+				]),
+			);
+		}
+	}
+
+	function renderHeaderBlocked(d) {
+		const tbody = $("#headerBlockedTable tbody");
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const entries = Object.entries(d.HeaderBlockedAttempts || {});
+		entries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+		let total = 0;
+		for (const [, info] of entries) {
+			total += Number(info.Count || 0);
+			const scope = HEADER_SCOPE_LABELS[info.Scope] || info.Scope || "?";
+			const ruleDesc = `${scope} ${info.Mode === "exact" ? "is" : "contains"} "${info.Needle || ""}"`;
+			const uniqueIps = info.IPs ? Object.keys(info.IPs).length : 0;
+			tbody.appendChild(
+				tr([
+					ruleDesc,
+					String(info.Count || 0),
+					String(uniqueIps),
+					info.LastHeader || "—",
+					info.LastIP || "—",
+					info.LastPath || "—",
+					tsNode(info.LastRequestTime),
+				]),
+			);
+		}
+		if (entries.length === 0) {
+			tbody.appendChild(tr(["No header-blocked requests", "0", "0", "—", "—", "—", "—"]));
+		}
+		setText("headerBlockedTotal", `${total} blocked`);
+	}
+
+	async function removeHeaderRule(id) {
+		try {
+			const res = await api("/admin/headers/rule/clear", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ id }),
+			});
+			const data = await res.json();
+			renderHeaderRules({ HeaderRules: data.HeaderRules });
+			showToast("Header rule removed");
+		} catch {
+			showToast("Failed to remove header rule");
+		}
+	}
+
 	// -----------------------------
 	// Data plumbing
 	// -----------------------------
@@ -907,8 +980,10 @@ const print = console.log;
 			renderSettings(d);
 			renderEndpointBlocks(d);
 			renderEndpointRules(d);
+			renderHeaderRules(d);
 			renderBlockedAttempts(d);
 			renderRateLimitedAttempts(d);
+			renderHeaderBlocked(d);
 			setText("lastUpdatedChip", "Updated: just now");
 			if (!silent) showToast("Dashboard updated");
 		} catch (err) {
@@ -1234,6 +1309,7 @@ const print = console.log;
 		"section-endpoints": { target: "endpoints", what: "the endpoint popularity records" },
 		"section-blocked-attempts": { target: "blocked_attempts", what: "blocked-endpoint attempt records" },
 		"section-ratelimited-attempts": { target: "rate_limited_attempts", what: "rate-limited attempt records" },
+		"section-header-blocked": { target: "header_blocked_attempts", what: "header-blocked attempt records" },
 		"section-live": { target: "live", what: "the live request feed" },
 		"section-probes": { target: "probes", what: "probe/exploit attempts and their summary" },
 		"section-exploit-summary": { target: "probes", what: "probe/exploit attempts and their summary" },
@@ -1357,6 +1433,60 @@ const print = console.log;
 			showToast(`Rule set for ${pattern}`);
 		} catch (err) {
 			showToast("Rule failed: " + err.message);
+		}
+	});
+
+	// Header rules: add
+	$("#headerRuleForm")?.addEventListener("submit", async e => {
+		e.preventDefault();
+		const scope = $("#headerRuleScope")?.value || "either";
+		const mode = $("#headerRuleMode")?.value || "contains";
+		const needle = $("#headerRuleNeedle")?.value.trim();
+		const note = $("#headerRuleNote")?.value.trim() || "";
+		if (!needle) return;
+		try {
+			const res = await api("/admin/headers/rule", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ scope, mode, needle, note }),
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(data.Message || String(res.status));
+			renderHeaderRules({ HeaderRules: data.HeaderRules });
+			$("#headerRuleNeedle").value = "";
+			$("#headerRuleNote").value = "";
+			showToast("Header rule added");
+		} catch (err) {
+			showToast("Header rule failed: " + err.message);
+		}
+	});
+
+	// Header-blocked attempts export
+	$("#exportHeaderBlocked")?.addEventListener("click", async () => {
+		try {
+			const d = await fetchDiagnostics();
+			const lines = ["Rule,Scope,Mode,Needle,Blocked,UniqueIPs,LastHeader,LastIP,LastPath,LastRequestTime"];
+			for (const [id, info] of Object.entries(d.HeaderBlockedAttempts || {})) {
+				const uniqueIps = info.IPs ? Object.keys(info.IPs).length : 0;
+				lines.push(
+					toCSVRow([
+						id,
+						info.Scope || "",
+						info.Mode || "",
+						info.Needle || "",
+						info.Count || 0,
+						uniqueIps,
+						info.LastHeader || "",
+						info.LastIP || "",
+						info.LastPath || "",
+						info.LastRequestTime || 0,
+					]),
+				);
+			}
+			download(`roxy_header_blocked_${Date.now()}.csv`, lines.join("\n"));
+			showToast("Header-blocked attempts exported");
+		} catch {
+			showToast("Export failed");
 		}
 	});
 

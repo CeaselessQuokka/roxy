@@ -275,6 +275,7 @@ def admin_diagnostics():
     data["Settings"] = runtime.get_settings()
     data["EndpointBlocks"] = runtime.get_endpoint_blocks()
     data["EndpointRules"] = runtime.get_endpoint_rules()
+    data["HeaderRules"] = runtime.get_header_rules()
     data["TokenBudget"] = proxy.get_token_budget_state()
     data["Persistence"] = storage.get_status()
     return jsonify(data)
@@ -406,6 +407,33 @@ def admin_clear_endpoint_rule():
     ok, message = runtime.clear_endpoint_rule(str(data["pattern"]))
     status = 200 if ok else 400
     return jsonify({"Message": message, "EndpointRules": runtime.get_endpoint_rules()}), status
+
+
+@app.route("/admin/headers/rule", methods=["POST"], endpoint="admin_add_header_rule")
+@requires_admin
+def admin_add_header_rule():
+    data = get_json_dict()
+    if data is None or not data.get("needle"):
+        return jsonify({"Message": "Missing match text"}), 400
+    ok, message = runtime.add_header_rule(
+        str(data.get("scope", "either")),
+        str(data.get("mode", "contains")),
+        str(data["needle"]),
+        str(data.get("note", "")),
+    )
+    status = 200 if ok else 400
+    return jsonify({"Message": message, "HeaderRules": runtime.get_header_rules()}), status
+
+
+@app.route("/admin/headers/rule/clear", methods=["POST"], endpoint="admin_clear_header_rule")
+@requires_admin
+def admin_clear_header_rule():
+    data = get_json_dict()
+    if data is None or not data.get("id"):
+        return jsonify({"Message": "Missing rule id"}), 400
+    ok, message = runtime.remove_header_rule(str(data["id"]))
+    status = 200 if ok else 400
+    return jsonify({"Message": message, "HeaderRules": runtime.get_header_rules()}), status
 
 
 @app.route("/admin/invalidate/<token>", methods=["GET"], endpoint="admin_invalidate")
@@ -574,6 +602,16 @@ def proxy_page(dst: str):
     if not validate_url(dst):
         diagnostics.log_exploit_attempt(ip, f'Non-Roblox URL: "{dst}"', user_agent)
         resp = jsonify("Not a Roblox URL")
+        return _with_throttle_headers(resp, ip), 404
+
+    # Header rules deny abusive clients (e.g. exploit fingerprints) outright.
+    # The caller only ever gets a generic error — nothing reveals WHY it failed,
+    # so the exploiter can't reverse-engineer the rule. The admin sees the detail
+    # on the dashboard.
+    header_rule = runtime.match_header_rule(request.headers)
+    if header_rule:
+        diagnostics.log_header_blocked(header_rule, dst, request.method, ip)
+        resp = jsonify("Not Found")
         return _with_throttle_headers(resp, ip), 404
 
     if runtime.is_endpoint_blocked(dst):

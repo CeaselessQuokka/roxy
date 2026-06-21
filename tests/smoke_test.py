@@ -355,6 +355,100 @@ r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/
 check("Known-admin browser visit does NOT count", r.get_json()["PageVisits"].get("admin", 0) == visits_before + 1)
 check("Login response set the admin-seen cookie", any(c.key == "roxy_admin_seen" for c in client._cookies.values()) if hasattr(client, "_cookies") else True)
 
+print("== Wildcard endpoint blocking ==")
+# Make sure proxied (non-blocked) requests reach the fake upstream.
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["WILDCARD_TOKEN"])
+IP_WILD = {"X-Forwarded-For": "10.6.6.1"}
+client.post("/admin/endpoints/block", headers=IP_MAIN, json={"pattern": "games.roblox.com/v1/games/*/servers"})
+
+n = len(upstream_calls)
+r = api_client.get("/games.roblox.com/v1/games/694768217/servers/0", headers=IP_WILD)
+check("Wildcard blocks .../games/<id>/servers/0 -> 403", r.status_code == 403, r.status_code)
+check("Wildcard-blocked request never hit upstream", len(upstream_calls) == n, len(upstream_calls) - n)
+r = api_client.get("/games.roblox.com/v1/games/123/servers", headers=IP_WILD)
+check("Wildcard blocks bare .../servers (trailing wildcard) -> 403", r.status_code == 403, r.status_code)
+n = len(upstream_calls)
+r = api_client.get("/games.roblox.com/v1/games/9583680112/votes", headers=IP_WILD)
+check("Sibling .../votes is NOT blocked -> 200", r.status_code == 200, r.status_code)
+check("Allowed sibling DID hit upstream", len(upstream_calls) == n + 1, len(upstream_calls) - n)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check(
+    "Wildcard block pattern stored",
+    "games.roblox.com/v1/games/*/servers" in r.get_json().get("EndpointBlocks", {}),
+    list(r.get_json().get("EndpointBlocks", {})),
+)
+client.post("/admin/endpoints/unblock", headers=IP_MAIN, json={"pattern": "games.roblox.com/v1/games/*/servers"})
+n = len(upstream_calls)
+r = api_client.get("/games.roblox.com/v1/games/694768217/servers/0", headers=IP_WILD)
+check("After unblock, .../servers passes again -> 200", r.status_code == 200, r.status_code)
+
+print("== Wildcard per-endpoint rate rule ==")
+IP_WRULE = {"X-Forwarded-For": "10.6.6.2"}
+client.post(
+    "/admin/endpoints/rule",
+    headers=IP_MAIN,
+    json={"pattern": "thumbnails.roblox.com/v1/*/icons", "limit": 1, "period": 3600},
+)
+r1 = api_client.get("/thumbnails.roblox.com/v1/users/icons?size=150", headers=IP_WRULE)
+r2 = api_client.get("/thumbnails.roblox.com/v1/users/icons?size=420", headers=IP_WRULE)
+check("Wildcard rate rule allows 1st -> 200", r1.status_code == 200, r1.status_code)
+check("Wildcard rate rule blocks 2nd -> 429", r2.status_code == 429, r2.status_code)
+r3 = api_client.get("/thumbnails.roblox.com/v1/groups/thumbnails?id=1", headers=IP_WRULE)
+check("Non-matching thumbnails path is NOT rate-limited -> 200", r3.status_code == 200, r3.status_code)
+client.post("/admin/endpoints/rule/clear", headers=IP_MAIN, json={"pattern": "thumbnails.roblox.com/v1/*/icons"})
+
+print("== Header-based request blocking (Xeno) ==")
+client.post("/admin/headers/rule", headers=IP_MAIN, json={"scope": "either", "mode": "contains", "needle": "xeno"})
+IP_HDR = {"X-Forwarded-For": "10.7.7.1"}
+
+n = len(upstream_calls)
+r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "Xeno-Fingerprint": "9b6c6e24"})
+check("Header rule blocks request with Xeno-* header (key match) -> 404", r.status_code == 404, r.status_code)
+check("Header-blocked body is a GENERIC error (no reason leaked)", b"Not Found" in r.data and b"eader" not in r.data, r.data[:80])
+check("Header-blocked request never hit upstream", len(upstream_calls) == n, len(upstream_calls) - n)
+
+r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "User-Agent": "Xeno/1.3.55"})
+check("Header rule blocks Xeno User-Agent (value match) -> 404", r.status_code == 404, r.status_code)
+
+n = len(upstream_calls)
+r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "User-Agent": "Roblox/WinInet"})
+check("Clean request passes -> 200", r.status_code == 200, r.status_code)
+check("Clean request DID hit upstream", len(upstream_calls) == n + 1)
+
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag = r.get_json()
+hba = diag.get("HeaderBlockedAttempts", {})
+check("Header-blocked attempts recorded", any(int(v.get("Count", 0)) >= 1 for v in hba.values()), hba)
+check(
+    "Recorded rule remembers the matched header",
+    any(v.get("LastHeader") for v in hba.values()),
+    hba,
+)
+check("Header rule stored in HeaderRules", any("xeno" in k for k in diag.get("HeaderRules", {})), list(diag.get("HeaderRules", {})))
+
+# Key-scope exact rule
+client.post("/admin/headers/rule", headers=IP_MAIN, json={"scope": "key", "mode": "exact", "needle": "exploit-guid"})
+r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "Exploit-Guid": "x"})
+check("Exact key-scope rule blocks Exploit-Guid header -> 404", r.status_code == 404, r.status_code)
+r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "Exploit-Guid-Extra": "x"})
+check("Exact key rule does NOT match a longer header name -> 200", r.status_code == 200, r.status_code)
+
+# Remove the broad xeno rule; a Xeno UA should pass again (exact exploit-guid rule still stands)
+xeno_id = next(k for k in diag.get("HeaderRules", {}) if "xeno" in k)
+client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": xeno_id})
+r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "User-Agent": "Xeno/1.3.55"})
+check("After removing the rule, Xeno UA passes -> 200", r.status_code == 200, r.status_code)
+
+# Clear the header-blocked attempt records
+r = client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "header_blocked_attempts"})
+check("Clear header-blocked attempts -> 200", r.status_code == 200, r.status_code)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check("Header-blocked attempts cleared", r.get_json().get("HeaderBlockedAttempts") == {}, r.get_json().get("HeaderBlockedAttempts"))
+# Remove the remaining exact rule so it doesn't affect later sections.
+client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": "key|exact|exploit-guid"})
+
 print("== Emailed invalidation link (kill switch) ==")
 invalidate_emails = emails_with("Roxy Admin Login")
 link_token = invalidate_emails[-1]["body"].split("/admin/invalidate/")[-1].strip().splitlines()[0]

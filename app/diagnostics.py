@@ -98,6 +98,10 @@ blocked_endpoint_attempts = dict()
 # Requests rejected by a per-endpoint rate rule: path -> {Count, LastRequestTime, Pattern, LastIP, Methods, IPs}.
 rate_limited_attempts = dict()
 
+# Requests denied by a header rule (exploit fingerprints, etc.):
+# rule_id -> {Count, LastRequestTime, Scope, Mode, Needle, LastIP, LastHeader, LastPath, IPs}.
+header_blocked_attempts = dict()
+
 # Retry metrics: how often requests were retried, by status code and reason.
 retry_counts = dict(
     {
@@ -277,6 +281,47 @@ def _log_rejected_endpoint(store: dict, path: str, method: str, ip: str, pattern
             )
 
 
+def log_header_blocked(rule: dict, path: str, method: str, ip: str):
+    """Record a request denied by a header rule, keyed by the rule that caught it.
+
+    The admin sees exactly which rule is catching exploiters and which header
+    tripped it; the client only ever sees a generic error.
+    """
+    rule_id = str(rule.get("Id", "?"))
+    path = (path or "").split("?", 1)[0].strip("/")
+    now = time.time()
+    cap = _cap("max_endpoint_records", config.MAX_ENDPOINT_RECORDS)
+    with _state_lock:
+        record = header_blocked_attempts.get(rule_id)
+        if record:
+            record["Count"] += 1
+            record["LastRequestTime"] = now
+            record["LastIP"] = ip
+            record["LastHeader"] = rule.get("MatchedHeader", "")
+            record["LastPath"] = path
+            record["Methods"][method] = record["Methods"].get(method, 0) + 1
+            record["IPs"][ip] = record["IPs"].get(ip, 0) + 1
+            if len(record["IPs"]) > 50:
+                least = min(record["IPs"].items(), key=lambda kv: kv[1])[0]
+                record["IPs"].pop(least, None)
+        else:
+            if len(header_blocked_attempts) >= cap:
+                least = min(header_blocked_attempts.items(), key=lambda kv: kv[1]["Count"])[0]
+                header_blocked_attempts.pop(least, None)
+            header_blocked_attempts[rule_id] = dict(
+                Count=1,
+                LastRequestTime=now,
+                Scope=rule.get("Scope", ""),
+                Mode=rule.get("Mode", ""),
+                Needle=rule.get("Needle", ""),
+                LastIP=ip,
+                LastHeader=rule.get("MatchedHeader", ""),
+                LastPath=path,
+                Methods={method: 1},
+                IPs={ip: 1},
+            )
+
+
 def log_budget_rejection():
     """Record a request refused because the internal token hit its safety budget."""
     with _state_lock:
@@ -430,6 +475,7 @@ def get_diagnostics() -> dict:
                 "Endpoints": endpoints,
                 "BlockedEndpointAttempts": blocked_endpoint_attempts,
                 "RateLimitedAttempts": rate_limited_attempts,
+                "HeaderBlockedAttempts": header_blocked_attempts,
                 "RetryCounts": retry_counts,
                 "ReasonCounts": reason_counts,
                 "LiveRequests": list(reversed(live_requests)),  # Most-recent first.
@@ -459,6 +505,7 @@ _PERSISTED_NAMES = (
     "endpoints",
     "blocked_endpoint_attempts",
     "rate_limited_attempts",
+    "header_blocked_attempts",
     "retry_counts",
     "reason_counts",
     "live_requests",
@@ -493,6 +540,7 @@ CLEAR_TARGETS = {
     "endpoints": ("endpoints",),
     "blocked_attempts": ("blocked_endpoint_attempts",),
     "rate_limited_attempts": ("rate_limited_attempts",),
+    "header_blocked_attempts": ("header_blocked_attempts",),
     "live": ("live_requests",),
     "logins": ("login_attempts",),
     "crawls": ("crawls",),

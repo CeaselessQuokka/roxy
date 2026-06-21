@@ -55,8 +55,10 @@
 					<li><a class="nav__link" href="#section-live">Live Requests</a></li>
 					<li><a class="nav__link" href="#section-endpoints">Endpoints</a></li>
 					<li><a class="nav__link" href="#section-endpoint-controls">Endpoint Controls</a></li>
+					<li><a class="nav__link" href="#section-header-rules">Request Filters</a></li>
 					<li><a class="nav__link" href="#section-blocked-attempts">Blocked Attempts</a></li>
 					<li><a class="nav__link" href="#section-ratelimited-attempts">Rate-Limited Attempts</a></li>
+					<li><a class="nav__link" href="#section-header-blocked">Header-Blocked Attempts</a></li>
 					<li><a class="nav__link" href="#section-tokens">Auth Tokens</a></li>
 					<li><a class="nav__link" href="#section-requests">Requests</a></li>
 					<li><a class="nav__link" href="#section-status">Status Codes</a></li>
@@ -246,9 +248,12 @@
 						<article class="card">
 							<h3 class="card__title">Blocked Endpoints</h3>
 							<p class="form__hint">
-								Blocked endpoints return 403 to everyone in real-time. Use a full path
+								Blocked endpoints return an error to everyone in real-time. Use a full path
 								(<code>games.roblox.com/v1/games</code>) to block it and everything under it, or just a
-								host (<code>games.roblox.com</code>) to block the whole service.
+								host (<code>games.roblox.com</code>) to block the whole service. Use <code>*</code> as a
+								wildcard for one path segment:
+								<code>games.roblox.com/v1/games/*/servers</code> blocks servers for any game but leaves
+								<code>/votes</code> alone.
 							</p>
 							<form id="blockForm" class="form">
 								<div class="form__row">
@@ -286,7 +291,8 @@
 							<p class="form__hint">
 								Limit how often a single IP can hit an endpoint (e.g. 1 every 60s). This only ever
 								makes an endpoint <em>more</em> restrictive — the global per-IP limit still applies on
-								top.
+								top. Supports <code>*</code> wildcards too, e.g.
+								<code>games.roblox.com/v1/games/*/servers</code>.
 							</p>
 							<form id="ruleForm" class="form">
 								<div class="form__row">
@@ -335,6 +341,84 @@
 								</table>
 							</div>
 						</article>
+					</div>
+				</section>
+
+				<!-- Request Filters (header blocking) -->
+				<section id="section-header-rules" class="section" aria-labelledby="headerRulesHeading">
+					<div class="section__header">
+						<h2 id="headerRulesHeading" class="section__title">Request Filters (Header Blocking)</h2>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							Deny requests by their headers — useful for blocking exploit tooling that tags its traffic
+							(e.g. a <code>Xeno-Fingerprint</code> header, or a <code>User-Agent</code> containing
+							<code>Xeno</code>). Blocked callers get a generic <em>Not Found</em> with no hint as to why,
+							so they can't reverse-engineer the rule. Matching is case-insensitive.
+						</p>
+						<ul class="form__hint">
+							<li>
+								<strong>Header name</strong> — matches the header's key (e.g. block any request sending
+								an <code>Exploit-Guid</code> header).
+							</li>
+							<li>
+								<strong>Header value</strong> — matches the header's value (e.g. block a
+								<code>User-Agent</code> value containing <code>Xeno</code>).
+							</li>
+							<li>
+								<strong>Name or value</strong> — trips if either side matches (one rule catches
+								<code>Xeno-Fingerprint</code> and <code>User-Agent: Xeno/…</code>).
+							</li>
+						</ul>
+						<form id="headerRuleForm" class="form">
+							<div class="form__row">
+								<select
+									id="headerRuleScope"
+									class="input input--select"
+									style="max-width: 170px"
+									aria-label="Match against"
+								>
+									<option value="either">Name or value</option>
+									<option value="key">Header name</option>
+									<option value="value">Header value</option>
+								</select>
+								<select
+									id="headerRuleMode"
+									class="input input--select"
+									style="max-width: 150px"
+									aria-label="Match type"
+								>
+									<option value="contains">Contains</option>
+									<option value="exact">Exact</option>
+								</select>
+								<input
+									id="headerRuleNeedle"
+									class="input"
+									type="text"
+									placeholder="Text to match (e.g. Xeno)"
+									required
+								/>
+								<input id="headerRuleNote" class="input" type="text" placeholder="Note (optional)" />
+								<button type="submit" class="btn btn--warning">Add Rule</button>
+							</div>
+						</form>
+						<div class="table-wrap">
+							<table id="headerRulesTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Match Against</th>
+										<th scope="col">Type</th>
+										<th scope="col">Text</th>
+										<th scope="col">Note</th>
+										<th scope="col">Added</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- rows from HeaderRules -->
+								</tbody>
+							</table>
+						</div>
 					</div>
 				</section>
 
@@ -403,6 +487,42 @@
 								</thead>
 								<tbody>
 									<!-- rows from RateLimitedAttempts -->
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
+				<!-- Header-Blocked Attempts -->
+				<section id="section-header-blocked" class="section" aria-labelledby="headerBlockedHeading">
+					<div class="section__header">
+						<h2 id="headerBlockedHeading" class="section__title">Header-Blocked Attempts</h2>
+						<div class="section__actions">
+							<span id="headerBlockedTotal" class="chip">0 blocked</span>
+							<button id="exportHeaderBlocked" class="btn btn--outline">Export CSV</button>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							Requests denied by a header rule above (e.g. exploit fingerprints). Grouped by the rule that
+							caught them, with the most recently matched header, IP, and path. The clients only saw a
+							generic error.
+						</p>
+						<div class="table-wrap">
+							<table id="headerBlockedTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Rule</th>
+										<th scope="col">Blocked</th>
+										<th scope="col">Unique IPs</th>
+										<th scope="col">Last Matched Header</th>
+										<th scope="col">Last IP</th>
+										<th scope="col">Last Path</th>
+										<th scope="col">Last Attempt</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- rows from HeaderBlockedAttempts -->
 								</tbody>
 							</table>
 						</div>

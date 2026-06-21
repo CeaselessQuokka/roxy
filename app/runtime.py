@@ -11,8 +11,10 @@ inter-process lock) and every read reloads from disk when the file changes.
 """
 
 import config
+import re
 import secrets
 import time
+from functools import lru_cache
 from threading import Lock
 
 import storage
@@ -43,6 +45,14 @@ _endpoint_blocks = dict()  # pattern -> {"Added": ts, "Note": str}
 
 # --- Per-endpoint per-IP rate rules -----------------------------------------
 _endpoint_rules = dict()  # pattern -> {"Limit": int, "Period": int, "Added": ts}
+
+# --- Header block rules -----------------------------------------------------
+# Deny a request outright based on its headers (e.g. exploit fingerprints like
+# "Xeno"). id -> {"Scope": key|value|either, "Mode": contains|exact,
+#                 "Needle": str, "Note": str, "Added": ts}
+_header_rules = dict()
+HEADER_RULE_SCOPES = ("key", "value", "either")
+HEADER_RULE_MODES = ("contains", "exact")
 
 # --- Cross-worker reload bookkeeping ----------------------------------------
 _last_mtime = 0.0
@@ -88,18 +98,42 @@ def _norm(pattern: str) -> str:
     return (pattern or "").strip().lstrip("/").lower()
 
 
-def _matches(pattern: str, path: str) -> bool:
-    """Whether a normalized request path is covered by an endpoint pattern.
+@lru_cache(maxsize=1024)
+def _compile_pattern(pattern: str):
+    """Compile an endpoint pattern into a regex.
 
-    - No slash in the pattern => match the whole service host (e.g. "games.roblox.com").
-    - Otherwise => exact match or prefix match on a path boundary.
+    - `*` is a wildcard for a run of characters WITHIN one path segment; it never
+      spans a `/`. So `games.roblox.com/v1/games/*/servers` matches
+      `games.roblox.com/v1/games/694768217/servers` (and, via the implied
+      trailing wildcard below, `.../servers/0`) but NOT `.../games/123/votes`.
+    - A trailing path is always allowed: a pattern matches the path it names and
+      everything nested under it (the historical behavior).
+    - A host-only pattern (no slash) matches that whole service.
+
+    Cached because patterns are few and reused across many requests.
     """
+    base = pattern.rstrip("/")
+    # Escape everything literally, then turn the escaped '*' back into a
+    # single-segment wildcard. re.escape turns '*' into r'\*'.
+    escaped = re.escape(base).replace(r"\*", r"[^/]*")
+    return re.compile(rf"^{escaped}(?:/.*)?$")
+
+
+def _matches(pattern: str, path: str) -> bool:
+    """Whether a normalized request path is covered by an endpoint pattern."""
     if not pattern:
         return False
-    if "/" not in pattern:
-        return path.split("/", 1)[0] == pattern
-    base = pattern.rstrip("/")
-    return path == base or path.startswith(base + "/")
+    try:
+        return _compile_pattern(pattern).match(path) is not None
+    except re.error:
+        return False
+
+
+def _specificity(pattern: str):
+    """Sort key for "most specific match wins". More path segments rank higher;
+    among equals, more literal (non-wildcard) characters rank higher, so a
+    concrete rule beats a wildcard one covering the same path."""
+    return (pattern.count("/"), len(pattern) - pattern.count("*"))
 
 
 # --- Cross-worker reload ----------------------------------------------------
@@ -140,6 +174,9 @@ def _restore_from(data: dict):
     rules = data.get("EndpointRules", {})
     if isinstance(rules, dict):
         replace_in_place(_endpoint_rules, {str(k): dict(v) for k, v in rules.items() if isinstance(v, dict)})
+    header_rules = data.get("HeaderRules", {})
+    if isinstance(header_rules, dict):
+        replace_in_place(_header_rules, {str(k): dict(v) for k, v in header_rules.items() if isinstance(v, dict)})
 
     tokens = data.get("InvalidationTokens", {})
     if isinstance(tokens, dict):
@@ -268,15 +305,17 @@ def is_endpoint_blocked(path: str) -> bool:
 
 
 def get_matching_block(path: str):
-    """Return the most specific (longest) block pattern matching a path, or None."""
+    """Return the most specific block pattern matching a path, or None."""
     _maybe_reload()
     p = _norm(path)
     best = None
-    best_len = -1
+    best_score = None
     for pattern in _endpoint_blocks:
-        if _matches(pattern, p) and len(pattern) > best_len:
-            best = pattern
-            best_len = len(pattern)
+        if _matches(pattern, p):
+            score = _specificity(pattern)
+            if best_score is None or score > best_score:
+                best = pattern
+                best_score = score
     return best
 
 
@@ -353,13 +392,96 @@ def match_endpoint_rule(path: str):
     _maybe_reload()
     p = _norm(path)
     best = None
-    best_len = -1
+    best_score = None
     for pattern, rule in _endpoint_rules.items():
-        if _matches(pattern, p) and len(pattern) > best_len:
-            best = dict(rule)
-            best["Pattern"] = pattern
-            best_len = len(pattern)
+        if _matches(pattern, p):
+            score = _specificity(pattern)
+            if best_score is None or score > best_score:
+                best = dict(rule)
+                best["Pattern"] = pattern
+                best_score = score
     return best
+
+
+# --- Header block rules -----------------------------------------------------
+def _header_rule_id(scope: str, mode: str, needle: str) -> str:
+    """Canonical id so the same rule can't be added twice and is easy to remove."""
+    return f"{scope}|{mode}|{needle.lower()}"
+
+
+def get_header_rules() -> dict:
+    _maybe_reload()
+    return {k: dict(v) for k, v in _header_rules.items()}
+
+
+def add_header_rule(scope: str, mode: str, needle: str, note: str = "") -> tuple[bool, str]:
+    scope = (scope or "either").strip().lower()
+    mode = (mode or "contains").strip().lower()
+    needle = (needle or "").strip()
+    if scope not in HEADER_RULE_SCOPES:
+        return False, f"Scope must be one of: {', '.join(HEADER_RULE_SCOPES)}"
+    if mode not in HEADER_RULE_MODES:
+        return False, f"Mode must be one of: {', '.join(HEADER_RULE_MODES)}"
+    if not needle:
+        return False, "Empty match text"
+    rule_id = _header_rule_id(scope, mode, needle)
+    if rule_id not in _header_rules and len(_header_rules) >= config.MAX_HEADER_RULES:
+        return False, "Too many header rules"
+
+    def change():
+        _header_rules[rule_id] = {
+            "Scope": scope,
+            "Mode": mode,
+            "Needle": needle,
+            "Note": str(note)[:200],
+            "Added": time.time(),
+        }
+
+    _persist_change(change)
+    return True, "Success"
+
+
+def remove_header_rule(rule_id: str) -> tuple[bool, str]:
+    def change():
+        _header_rules.pop(str(rule_id), None)
+
+    _persist_change(change)
+    return True, "Success"
+
+
+def _header_field_matches(mode: str, needle_lower: str, target: str) -> bool:
+    target = (target or "").lower()
+    if mode == "exact":
+        return target == needle_lower
+    return needle_lower in target  # contains
+
+
+def match_header_rule(headers) -> dict | None:
+    """Return the first header rule a request's headers trip, or None.
+
+    `headers` is any iterable of (name, value) pairs (e.g. request.headers.items()).
+    The returned dict includes an "Id" key for diagnostics; it intentionally does
+    NOT get shown to the client (a blocked caller only sees a generic error).
+    """
+    _maybe_reload()
+    if not _header_rules:
+        return None
+    pairs = list(headers.items()) if hasattr(headers, "items") else list(headers)
+    for rule_id, rule in _header_rules.items():
+        scope = rule.get("Scope", "either")
+        mode = rule.get("Mode", "contains")
+        needle_lower = str(rule.get("Needle", "")).lower()
+        if not needle_lower:
+            continue
+        for name, value in pairs:
+            key_hit = scope in ("key", "either") and _header_field_matches(mode, needle_lower, name)
+            value_hit = scope in ("value", "either") and _header_field_matches(mode, needle_lower, value)
+            if key_hit or value_hit:
+                hit = dict(rule)
+                hit["Id"] = rule_id
+                hit["MatchedHeader"] = name
+                return hit
+    return None
 
 
 # --- Admin session epoch ----------------------------------------------------
@@ -445,6 +567,7 @@ def _serialize_unlocked() -> dict:
         "SettingsUpdated": {k: v["updated"] for k, v in _settings.items()},
         "EndpointBlocks": {k: dict(v) for k, v in _endpoint_blocks.items()},
         "EndpointRules": {k: dict(v) for k, v in _endpoint_rules.items()},
+        "HeaderRules": {k: dict(v) for k, v in _header_rules.items()},
         "InvalidationTokens": dict(_invalidation_tokens),
         "TwoFACodes": dict(_two_fa_codes),
         "Challenges": dict(_challenges),

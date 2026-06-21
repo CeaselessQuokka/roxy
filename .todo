@@ -1,0 +1,9 @@
+Would be nice to have a way to instead of completely pausing use of the service, you can throttle every IP at once (IP-based of course) (existing specific throttles will still work)
+
+Should track the max amount of Token Safety Budget hit within the last hour, 4 hours, 12 hours, 24 hours and 7 days
+
+It should show the amount of times a request was rejected from a direct API call and a RoProxy call (like how it does for the token)
+
+For the "top endpoints" it'd be nice to have it breakdown further, games.roblox.com/v1 has many different APIs it offers, like server data and voting data; it'd be nice to see this breakdown further in which is being used and last when used, all the goodies related to the data
+
+on the note of top endpoints, stuff like avatar.roblox.com isn't necessarily spread across (well I guess technically) 200+ endpoints, the ID changes, so it'd be nice to have it say `/v2/avatar/users/<USER_ID>>/outfits` instead of listing out every ID. But if you click it, it will give a list of IDs for more info, and this should apply in general (like servers/votes for `games.roblox.com/v1/...`)
