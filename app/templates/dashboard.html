@@ -50,13 +50,17 @@
 		<!-- Paused banner -->
 		<div id="pauseBanner" class="pause-banner" role="alert" hidden>
 			⏸ The proxy is currently <strong>PAUSED</strong>. The site stays online, but proxy requests are
-			rejected. <span id="pauseBannerSince" class="text-dim"></span>
+			rejected. <strong id="pauseBannerDrops">0</strong> request(s) dropped so far.
+			<span id="pauseBannerMsg" class="text-dim"></span>
+			<span id="pauseBannerSince" class="text-dim"></span>
 		</div>
 
 		<!-- Throttle-all banner -->
 		<div id="throttleAllBanner" class="throttle-banner" role="alert" hidden>
-			🐢 <strong>Throttle-All</strong> is active. Every IP is being throttled to relieve load; requests get a
-			429 and clients back off. <span id="throttleAllBannerSince" class="text-dim"></span>
+			🐢 <strong>Throttle-All</strong> is active (<span id="throttleBannerRate">1/60s</span> per IP).
+			<strong id="throttleBannerDrops">0</strong> request(s) dropped so far.
+			<span id="throttleAllBannerMsg" class="text-dim"></span>
+			<span id="throttleAllBannerSince" class="text-dim"></span>
 		</div>
 
 		<!-- Layout: Nav + Main -->
@@ -65,6 +69,7 @@
 			<nav id="appNav" class="nav" aria-label="Primary">
 				<ul class="nav__list">
 					<li><a class="nav__link is-active" href="#section-overview">Overview</a></li>
+					<li><a class="nav__link" href="#section-controls">Service Controls</a></li>
 					<li><a class="nav__link" href="#section-traffic">Traffic</a></li>
 					<li><a class="nav__link" href="#section-live">Live Requests</a></li>
 					<li><a class="nav__link" href="#section-endpoints">Endpoints</a></li>
@@ -162,6 +167,64 @@
 							<h3 class="kpi__title">Failures (Last Hour)</h3>
 							<div class="kpi__value" id="kpi_hour_failed">0</div>
 							<div class="kpi__meta">Non-200 upstream results in the last 60 minutes</div>
+						</article>
+					</div>
+				</section>
+
+				<!-- Service Controls (pause / throttle-all messages + limits) -->
+				<section id="section-controls" class="section" aria-labelledby="controlsHeading">
+					<div class="section__header">
+						<h2 id="controlsHeading" class="section__title">Service Controls</h2>
+					</div>
+					<div class="grid grid--cards">
+						<article class="card">
+							<h3 class="card__title">Pause</h3>
+							<p class="form__hint">
+								Rejects all proxy requests with a 503. The message below is returned to users; leave it
+								blank for the default (<em>Service down for maintenance.</em>). Use the
+								<strong>Pause Proxy</strong> button in the top bar to toggle.
+							</p>
+							<div class="form__field">
+								<label class="form__label" for="pauseReason">Pause message (optional)</label>
+								<input
+									id="pauseReason"
+									class="input"
+									type="text"
+									maxlength="300"
+									placeholder="e.g. Back in ~10 minutes, updating tokens."
+								/>
+							</div>
+						</article>
+
+						<article class="card">
+							<h3 class="card__title">Throttle All</h3>
+							<p class="form__hint">
+								A softer alternative to pausing: every IP is limited to
+								<strong><span id="ta_limit_display">1</span></strong> request(s) per
+								<strong><span id="ta_period_display">60</span></strong>s. Allowed requests still go
+								through; the rest get a 429 with the message below. Toggle with the
+								<strong>Throttle All</strong> button in the top bar.
+							</p>
+							<div class="form__row">
+								<div class="form__field" style="flex: 1 1 120px">
+									<label class="form__label" for="throttleLimit">Limit</label>
+									<input id="throttleLimit" class="input" type="number" min="1" value="1" />
+								</div>
+								<div class="form__field" style="flex: 1 1 120px">
+									<label class="form__label" for="throttlePeriod">Per (seconds)</label>
+									<input id="throttlePeriod" class="input" type="number" min="1" value="60" />
+								</div>
+							</div>
+							<div class="form__field">
+								<label class="form__label" for="throttleReason">Throttle message (optional)</label>
+								<input
+									id="throttleReason"
+									class="input"
+									type="text"
+									maxlength="300"
+									placeholder="e.g. High load — please slow down."
+								/>
+							</div>
 						</article>
 					</div>
 				</section>
@@ -542,7 +605,9 @@
 										<th scope="col">Rule</th>
 										<th scope="col">Blocked</th>
 										<th scope="col">Unique IPs</th>
-										<th scope="col">Last Matched Header</th>
+										<th scope="col">Last Header</th>
+										<th scope="col">Triggered By</th>
+										<th scope="col">Matched Text</th>
 										<th scope="col">Last IP</th>
 										<th scope="col">Last Path</th>
 										<th scope="col">Last Attempt</th>
@@ -1061,7 +1126,8 @@
 								Last: <span id="direct_last">—</span> • Cooldown:
 								<span id="direct_cooldown">false</span> • Count:
 								<span id="direct_count">0</span> • Rejected:
-								<span id="direct_failed">0</span>
+								<span id="direct_failed">0</span> • Timeouts:
+								<span id="direct_timeouts">0</span>
 							</div>
 						</article>
 
@@ -1072,7 +1138,8 @@
 								Last: <span id="roproxy_last">—</span> • Cooldown:
 								<span id="roproxy_cooldown">false</span> • Count:
 								<span id="roproxy_count">0</span> • Rejected:
-								<span id="roproxy_failed">0</span>
+								<span id="roproxy_failed">0</span> • Timeouts:
+								<span id="roproxy_timeouts">0</span>
 							</div>
 						</article>
 
@@ -1081,7 +1148,8 @@
 							<div class="kpi__value" id="health_tokens_count">0</div>
 							<div class="kpi__meta">
 								Expired: <span id="health_tokens_expired">0</span> • Being Validated:
-								<span id="health_tokens_validating">0</span>
+								<span id="health_tokens_validating">0</span> • Timeouts:
+								<span id="health_tokens_timeouts">0</span>
 							</div>
 						</article>
 

@@ -431,16 +431,19 @@ const print = console.log;
 		setText("direct_cooldown", String(Boolean(da.IsInCooldown)));
 		setText("direct_count", String(da.Count || 0));
 		setText("direct_failed", String(da.Failed || 0));
+		setText("direct_timeouts", String(da.Timeouts || 0));
 
 		setText("health_roproxy", rp.IsInCooldown ? "COOLDOWN" : "OK");
 		setText("roproxy_last", rp.LastRequestTime ? timeAgo(rp.LastRequestTime) : "—");
 		setText("roproxy_cooldown", String(Boolean(rp.IsInCooldown)));
 		setText("roproxy_count", String(rp.Count || 0));
 		setText("roproxy_failed", String(rp.Failed || 0));
+		setText("roproxy_timeouts", String(rp.Timeouts || 0));
 
 		setText("health_tokens_count", String(tk.Count ?? 0));
 		setText("health_tokens_expired", String(tk.ExpiredCount ?? 0));
 		setText("health_tokens_validating", String(tk.BeingValidatedCount ?? 0));
+		setText("health_tokens_timeouts", String(tk.Timeouts ?? 0));
 
 		const started = Number(d.WorkerStartedAt || 0);
 		const server = Number(d.ServerTime || 0);
@@ -469,13 +472,19 @@ const print = console.log;
 		}
 		if (banner) {
 			banner.hidden = !paused;
+			setText("pauseBannerDrops", String(d?.PauseDrops ?? 0));
+			const reason = d?.Pause?.Reason || "";
+			setText("pauseBannerMsg", reason ? `Message shown to users: "${reason}".` : "");
 			setText("pauseBannerSince", paused && since ? `(since ${toTS(since)})` : "");
 		}
 	}
 
 	function renderThrottleAll(d) {
-		const on = Boolean(d?.ThrottleAll?.ThrottleAll);
-		const since = Number(d?.ThrottleAll?.ThrottleAllSince || 0);
+		const ta = d?.ThrottleAll || {};
+		const on = Boolean(ta.ThrottleAll);
+		const since = Number(ta.ThrottleAllSince || 0);
+		const limit = ta.Limit ?? 1;
+		const period = ta.Period ?? 60;
 		const btn = $("#throttleAllToggle");
 		const banner = $("#throttleAllBanner");
 		if (btn) {
@@ -484,8 +493,19 @@ const print = console.log;
 			btn.classList.toggle("btn--tonal", !on);
 			btn.dataset.on = String(on);
 		}
+		// Keep the Service Controls inputs/labels in sync (don't clobber while editing).
+		setText("ta_limit_display", String(limit));
+		setText("ta_period_display", String(period));
+		const limitInput = $("#throttleLimit");
+		const periodInput = $("#throttlePeriod");
+		if (limitInput && document.activeElement !== limitInput) limitInput.value = String(limit);
+		if (periodInput && document.activeElement !== periodInput) periodInput.value = String(period);
 		if (banner) {
 			banner.hidden = !on;
+			setText("throttleBannerRate", `${limit}/${period}s`);
+			setText("throttleBannerDrops", String(d?.ThrottleAllDrops ?? 0));
+			const reason = ta.Reason || "";
+			setText("throttleAllBannerMsg", reason ? `Message shown to users: "${reason}".` : "");
 			setText("throttleAllBannerSince", on && since ? `(since ${toTS(since)})` : "");
 		}
 	}
@@ -787,6 +807,8 @@ const print = console.log;
 		max_endpoint_records: "Endpoint records kept",
 		token_budget_requests: "Token budget: max requests",
 		token_budget_window: "Token budget: window (s)",
+		global_throttle_limit: "Throttle-all: max requests / IP",
+		global_throttle_period: "Throttle-all: window (s)",
 	};
 
 	function renderSettings(d) {
@@ -1009,12 +1031,15 @@ const print = console.log;
 			const verb = info.Mode === "exact" ? "is" : info.Mode === "regex" ? "matches" : "contains";
 			const ruleDesc = `${scope} ${verb} "${info.Needle || ""}"`;
 			const uniqueIps = info.IPs ? Object.keys(info.IPs).length : 0;
+			const triggered = info.LastField === "key" ? "Header name" : info.LastField === "value" ? "Header value" : "—";
 			tbody.appendChild(
 				tr([
 					ruleDesc,
 					String(info.Count || 0),
 					String(uniqueIps),
 					info.LastHeader || "—",
+					triggered,
+					info.LastMatch || "—",
 					info.LastIP || "—",
 					info.LastPath || "—",
 					tsNode(info.LastRequestTime),
@@ -1022,7 +1047,7 @@ const print = console.log;
 			);
 		}
 		if (entries.length === 0) {
-			tbody.appendChild(tr(["No header-blocked requests", "0", "0", "—", "—", "—", "—"]));
+			tbody.appendChild(tr(["No header-blocked requests", "0", "0", "—", "—", "—", "—", "—", "—"]));
 		}
 		setText("headerBlockedTotal", `${total} blocked`);
 	}
@@ -1310,38 +1335,50 @@ const print = console.log;
 		});
 	});
 
-	// Pause / resume the proxy
+	// Pause / resume the proxy (sends the optional reason from Service Controls)
 	$("#pauseToggle")?.addEventListener("click", async () => {
 		const currentlyPaused = $("#pauseToggle")?.dataset.paused === "true";
+		const body = { paused: !currentlyPaused };
+		if (!currentlyPaused) body.reason = $("#pauseReason")?.value.trim() || "";
 		try {
 			const res = await api("/admin/proxy/toggle", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ paused: !currentlyPaused }),
+				body: JSON.stringify(body),
 			});
 			if (!res.ok) throw new Error(String(res.status));
 			const state = await res.json();
 			renderPause({ Pause: state });
 			showToast(state.Paused ? "Proxy paused" : "Proxy resumed");
+			refreshAll(true);
 		} catch (err) {
 			console.error(err);
 			showToast("Failed to change pause state");
 		}
 	});
 
-	// Throttle-all toggle
+	// Throttle-all toggle (sends limit/period/reason from Service Controls)
 	$("#throttleAllToggle")?.addEventListener("click", async () => {
 		const currentlyOn = $("#throttleAllToggle")?.dataset.on === "true";
+		const body = { enabled: !currentlyOn };
+		if (!currentlyOn) {
+			body.reason = $("#throttleReason")?.value.trim() || "";
+			const limit = Number($("#throttleLimit")?.value);
+			const period = Number($("#throttlePeriod")?.value);
+			if (limit >= 1) body.limit = limit;
+			if (period >= 1) body.period = period;
+		}
 		try {
 			const res = await api("/admin/proxy/throttle_all", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ enabled: !currentlyOn }),
+				body: JSON.stringify(body),
 			});
 			if (!res.ok) throw new Error(String(res.status));
 			const state = await res.json();
 			renderThrottleAll({ ThrottleAll: state });
-			showToast(state.ThrottleAll ? "Throttling all IPs" : "Throttle-all disabled");
+			showToast(state.ThrottleAll ? `Throttling all IPs to ${state.Limit}/${state.Period}s` : "Throttle-all disabled");
+			refreshAll(true);
 		} catch (err) {
 			console.error(err);
 			showToast("Failed to change throttle-all state");
@@ -1591,7 +1628,9 @@ const print = console.log;
 	$("#exportHeaderBlocked")?.addEventListener("click", async () => {
 		try {
 			const d = await fetchDiagnostics();
-			const lines = ["Rule,Scope,Mode,Needle,Blocked,UniqueIPs,LastHeader,LastIP,LastPath,LastRequestTime"];
+			const lines = [
+				"Rule,Scope,Mode,Needle,Blocked,UniqueIPs,LastHeader,TriggeredBy,MatchedText,LastIP,LastPath,LastRequestTime",
+			];
 			for (const [id, info] of Object.entries(d.HeaderBlockedAttempts || {})) {
 				const uniqueIps = info.IPs ? Object.keys(info.IPs).length : 0;
 				lines.push(
@@ -1603,6 +1642,8 @@ const print = console.log;
 						info.Count || 0,
 						uniqueIps,
 						info.LastHeader || "",
+						info.LastField || "",
+						info.LastMatch || "",
 						info.LastIP || "",
 						info.LastPath || "",
 						info.LastRequestTime || 0,

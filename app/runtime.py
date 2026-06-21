@@ -24,12 +24,18 @@ _lock = Lock()
 # --- Proxy pause flag -------------------------------------------------------
 _paused = False
 _paused_since = 0.0
+_pause_reason = ""  # Optional admin message shown to users while paused.
 
 # --- Global throttle-all flag -----------------------------------------------
-# A softer alternative to pausing: when on, EVERY IP is throttled (each still
-# tracked individually, so per-IP reset timers and per-endpoint rules apply).
+# A softer alternative to pausing: when on, every IP is rate-limited to
+# global_throttle_limit requests per global_throttle_period seconds (configurable
+# below). Allowed requests still proceed (and remain subject to the normal per-IP
+# and per-endpoint limits); the rest get a friendly 429.
 _throttle_all = False
 _throttle_all_since = 0.0
+_throttle_all_reason = ""  # Optional admin message shown to throttled users.
+
+DEFAULT_DOWNTIME_MESSAGE = "Service down for maintenance."
 
 # --- Admin session epoch ----------------------------------------------------
 # Every admin session records the epoch it was created under. Bumping the epoch
@@ -96,6 +102,9 @@ _settings = {
     # requests to Roblox per window, so the server never looks like a bot burst.
     "token_budget_requests": _setting(config.TOKEN_BUDGET_REQUESTS, 1, 10000, "int"),
     "token_budget_window": _setting(config.TOKEN_BUDGET_WINDOW, 1, 3600, "int"),
+    # When global throttle-all is ON: each IP may make this many requests per window.
+    "global_throttle_limit": _setting(config.GLOBAL_THROTTLE_LIMIT, 1, 100000, "int"),
+    "global_throttle_period": _setting(config.GLOBAL_THROTTLE_PERIOD, 1, 86400, "int"),
 }
 
 
@@ -184,12 +193,15 @@ def _restore_from(data: dict):
     that actually gets persisted.
     """
     global _paused, _paused_since, _session_epoch, _throttle_all, _throttle_all_since
+    global _pause_reason, _throttle_all_reason
     if not isinstance(data, dict) or not data:
         return
     _paused = bool(data.get("Paused", _paused))
     _paused_since = float(data.get("PausedSince", _paused_since) or 0.0)
+    _pause_reason = str(data.get("PauseReason", _pause_reason) or "")
     _throttle_all = bool(data.get("ThrottleAll", _throttle_all))
     _throttle_all_since = float(data.get("ThrottleAllSince", _throttle_all_since) or 0.0)
+    _throttle_all_reason = str(data.get("ThrottleAllReason", _throttle_all_reason) or "")
     _session_epoch = int(data.get("SessionEpoch", _session_epoch) or 1)
 
     stored_values = data.get("Settings", {}) or {}
@@ -279,14 +291,23 @@ def is_paused() -> bool:
 
 def get_pause_state() -> dict:
     _maybe_reload()
-    return {"Paused": _paused, "PausedSince": _paused_since}
+    return {"Paused": _paused, "PausedSince": _paused_since, "Reason": _pause_reason}
 
 
-def set_paused(paused: bool):
+def pause_message() -> str:
+    _maybe_reload()
+    return _pause_reason or DEFAULT_DOWNTIME_MESSAGE
+
+
+def set_paused(paused: bool, reason: str = None):
     def change():
-        global _paused, _paused_since
+        global _paused, _paused_since, _pause_reason
         _paused = bool(paused)
         _paused_since = time.time() if _paused else 0.0
+        if reason is not None:
+            _pause_reason = str(reason)[:300]
+        if not _paused:
+            _pause_reason = ""  # Clear the message when resuming.
 
     _persist_change(change)
     return _paused
@@ -304,14 +325,29 @@ def is_throttle_all() -> bool:
 
 def get_throttle_all_state() -> dict:
     _maybe_reload()
-    return {"ThrottleAll": _throttle_all, "ThrottleAllSince": _throttle_all_since}
+    return {
+        "ThrottleAll": _throttle_all,
+        "ThrottleAllSince": _throttle_all_since,
+        "Reason": _throttle_all_reason,
+        "Limit": get_setting("global_throttle_limit", config.GLOBAL_THROTTLE_LIMIT),
+        "Period": get_setting("global_throttle_period", config.GLOBAL_THROTTLE_PERIOD),
+    }
 
 
-def set_throttle_all(enabled: bool) -> bool:
+def throttle_all_message() -> str:
+    _maybe_reload()
+    return _throttle_all_reason or DEFAULT_DOWNTIME_MESSAGE
+
+
+def set_throttle_all(enabled: bool, reason: str = None):
     def change():
-        global _throttle_all, _throttle_all_since
+        global _throttle_all, _throttle_all_since, _throttle_all_reason
         _throttle_all = bool(enabled)
         _throttle_all_since = time.time() if _throttle_all else 0.0
+        if reason is not None:
+            _throttle_all_reason = str(reason)[:300]
+        if not _throttle_all:
+            _throttle_all_reason = ""
 
     _persist_change(change)
     return _throttle_all
@@ -574,6 +610,9 @@ def match_header_rule(headers) -> dict | None:
                 hit = dict(rule)
                 hit["Id"] = rule_id
                 hit["MatchedHeader"] = name
+                # Which side tripped it, and the offending text (the caller redacts secrets).
+                hit["MatchedField"] = "key" if key_hit else "value"
+                hit["MatchedText"] = name if key_hit else value
                 return hit
     return None
 
@@ -656,8 +695,10 @@ def _serialize_unlocked() -> dict:
     return {
         "Paused": _paused,
         "PausedSince": _paused_since,
+        "PauseReason": _pause_reason,
         "ThrottleAll": _throttle_all,
         "ThrottleAllSince": _throttle_all_since,
+        "ThrottleAllReason": _throttle_all_reason,
         "SessionEpoch": _session_epoch,
         "Settings": {k: v["value"] for k, v in _settings.items()},
         "SettingsUpdated": {k: v["updated"] for k, v in _settings.items()},

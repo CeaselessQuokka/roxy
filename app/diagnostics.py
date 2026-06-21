@@ -118,10 +118,10 @@ proxy_request_counts = dict(
 
 proxy_health = dict(
     {
-        # Count = nRequests; Failed = nNon-200 responses from that route.
-        "DirectAPI": dict({"Count": 0, "Failed": 0, "LastRequestTime": 0, "IsInCooldown": False}),
-        "RoProxy": dict({"Count": 0, "Failed": 0, "LastRequestTime": 0, "IsInCooldown": False}),
-        "Tokens": dict({"Count": 0, "ExpiredCount": 0, "BeingValidatedCount": 0}),  # Count = nTokens.
+        # Count = nRequests; Failed = nNon-200 responses; Timeouts = nUpstream timeouts.
+        "DirectAPI": dict({"Count": 0, "Failed": 0, "Timeouts": 0, "LastRequestTime": 0, "IsInCooldown": False}),
+        "RoProxy": dict({"Count": 0, "Failed": 0, "Timeouts": 0, "LastRequestTime": 0, "IsInCooldown": False}),
+        "Tokens": dict({"Count": 0, "ExpiredCount": 0, "BeingValidatedCount": 0, "Timeouts": 0}),  # Count = nTokens.
     }
 )
 
@@ -192,6 +192,10 @@ traffic_minutes = dict()
 
 # Requests refused because the internal token hit its safety budget.
 token_budget = dict({"Rejections": 0})
+
+# Requests dropped during downtime (reset at the start of each downtime via clear_stats).
+pause_drops = dict({"Count": 0})
+throttle_drops = dict({"Count": 0})
 
 # Per-minute PEAK of the token's sliding-window usage:
 # {"<epoch_minute>": {"Max": peak_usage}}. "Max" leaf so cross-worker merges take
@@ -377,13 +381,18 @@ def log_header_blocked(rule: dict, path: str, method: str, ip: str):
     path = (path or "").split("?", 1)[0].strip("/")
     now = time.time()
     cap = _cap("max_endpoint_records", config.MAX_ENDPOINT_RECORDS)
+    header = rule.get("MatchedHeader", "")
+    field = rule.get("MatchedField", "")  # "key" or "value" — what tripped the rule
+    snippet = _snippet_for(header, rule.get("MatchedText", ""))
     with _state_lock:
         record = header_blocked_attempts.get(rule_id)
         if record:
             record["Count"] += 1
             record["LastRequestTime"] = now
             record["LastIP"] = ip
-            record["LastHeader"] = rule.get("MatchedHeader", "")
+            record["LastHeader"] = header
+            record["LastField"] = field
+            record["LastMatch"] = snippet
             record["LastPath"] = path
             record["Methods"][method] = record["Methods"].get(method, 0) + 1
             record["IPs"][ip] = record["IPs"].get(ip, 0) + 1
@@ -401,11 +410,25 @@ def log_header_blocked(rule: dict, path: str, method: str, ip: str):
                 Mode=rule.get("Mode", ""),
                 Needle=rule.get("Needle", ""),
                 LastIP=ip,
-                LastHeader=rule.get("MatchedHeader", ""),
+                LastHeader=header,
+                LastField=field,
+                LastMatch=snippet,
                 LastPath=path,
                 Methods={method: 1},
                 IPs={ip: 1},
             )
+
+
+# Header names whose VALUES must never be surfaced on the dashboard.
+_SENSITIVE_HEADER_NAMES = {"x-roblox-token", "cookie", "authorization", "x-csrf-token"}
+
+
+def _snippet_for(header_name: str, text: str) -> str:
+    """A short, safe snippet of what tripped a header rule (sensitive values redacted)."""
+    if (header_name or "").lower() in _SENSITIVE_HEADER_NAMES:
+        return "[redacted]"
+    text = str(text or "")
+    return text if len(text) <= 120 else text[:120] + "…"
 
 
 def log_budget_rejection():
@@ -449,6 +472,29 @@ def log_route_result(is_roproxy: bool, success: bool):
         proxy_health[route]["LastRequestTime"] = time.time()
         if not success:
             proxy_health[route]["Failed"] = proxy_health[route].get("Failed", 0) + 1
+
+
+def log_route_timeout(is_roproxy: bool):
+    """Count an upstream timeout for the Direct-API or RoProxy route (transient; not emailed)."""
+    route = "RoProxy" if is_roproxy else "DirectAPI"
+    with _state_lock:
+        proxy_health[route]["Timeouts"] = proxy_health[route].get("Timeouts", 0) + 1
+
+
+def log_token_timeout():
+    """Count an upstream timeout while using the internal token."""
+    with _state_lock:
+        proxy_health["Tokens"]["Timeouts"] = proxy_health["Tokens"].get("Timeouts", 0) + 1
+
+
+def log_pause_drop():
+    with _state_lock:
+        pause_drops["Count"] = pause_drops.get("Count", 0) + 1
+
+
+def log_throttle_all_drop():
+    with _state_lock:
+        throttle_drops["Count"] = throttle_drops.get("Count", 0) + 1
 
 
 def log_retry(status_code: int, reason: str = ""):
@@ -607,6 +653,8 @@ def get_diagnostics() -> dict:
                 "TokenBudgetRejections": token_budget.get("Rejections", 0),
                 "BudgetPeak1h": _budget_peak_since(60),
                 "BudgetPeak24h": _budget_peak_since(1440),
+                "PauseDrops": pause_drops.get("Count", 0),
+                "ThrottleAllDrops": throttle_drops.get("Count", 0),
                 "ServerTime": time.time(),
                 "WorkerStartedAt": _started_at,
             }
@@ -637,6 +685,8 @@ _PERSISTED_NAMES = (
     "traffic_minutes",
     "token_budget",
     "token_budget_minutes",
+    "pause_drops",
+    "throttle_drops",
 )
 
 # Pristine copies of every persisted structure, captured at import (before any
@@ -668,6 +718,8 @@ CLEAR_TARGETS = {
     "blocked_attempts": ("blocked_endpoint_attempts",),
     "rate_limited_attempts": ("rate_limited_attempts",),
     "header_blocked_attempts": ("header_blocked_attempts",),
+    "pause_drops": ("pause_drops",),
+    "throttle_drops": ("throttle_drops",),
     "live": ("live_requests",),
     "logins": ("login_attempts",),
     "crawls": ("crawls",),

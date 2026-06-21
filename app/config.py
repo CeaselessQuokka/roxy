@@ -53,6 +53,12 @@ REQUEST_TIMEOUT = 15  # In seconds, how long to wait on an upstream Roblox reque
 TOKEN_BUDGET_REQUESTS = 95
 TOKEN_BUDGET_WINDOW = 65  # In seconds.
 
+# --- Global throttle-all defaults ---
+# When the admin enables "throttle all", each IP is limited to this many requests
+# per window. Strict by default (a softer alternative to a full pause), tunable live.
+GLOBAL_THROTTLE_LIMIT = 1
+GLOBAL_THROTTLE_PERIOD = 60  # In seconds.
+
 # --- Extra diagnostics limits ---
 MAX_ENDPOINT_RECORDS = 200  # How many distinct endpoints to track (most-frequent are kept).
 MAX_EXPLOIT_SUMMARY = 100  # How many distinct exploit/probe reasons to keep aggregated.

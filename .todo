@@ -1,4 +1,0 @@
-- Would be whenever the Proxy is paused or globally throttled I could specify a message of why it is happening, but if no message is supplied it will return something like "Service down for maintenance"
-- Whenever the service is paused or throttled, the banner that says "The proxy is currently paused" it should say how many requests were dropped during its down time
-- Ensure the filtered IPs are shown in the blocked endpoints in some way or its own section
-- Please ensure this is a non-issue: `GET https://www.roproxy.com/games/votingservice/128704212053925 | ReadTimeout: HTTPSConnectionPool(host='www.roproxy.com', port=443): Read timed out. (read timeout=15)`

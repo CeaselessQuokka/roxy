@@ -235,9 +235,25 @@ def _request(
             cookies=cookies,
             timeout=runtime.get_setting("request_timeout", config.REQUEST_TIMEOUT),
         )
+    except requests.Timeout:
+        # Upstream timeouts are an expected, transient condition (RoProxy/Cloudflare
+        # are slow under load). They must NOT email the admin. Instead, count them
+        # and — for the direct/RoProxy routes, which are now in cooldown — fall
+        # through to the next available route so the caller still gets served.
+        diagnostics.log_request(method.upper(), False)
+        diagnostics.log_reason(True)
+        if token is None:
+            diagnostics.log_route_timeout("roproxy" in url)
+            return False, True, None, csrf_token, retries  # retry → next route
+        diagnostics.log_token_timeout()
+        return False, False, "Upstream timed out; please try again shortly.", None, retries
     except requests.RequestException as e:
         diagnostics.log_request(method.upper(), False)
         diagnostics.log_reason(True)
+        if token is None:
+            # A connection error on direct/RoProxy: fall through to the next route.
+            diagnostics.log_route_result("roproxy" in url, False)
+            return False, True, None, csrf_token, retries
         notify_error("Upstream request failed", f"{method.upper()} https://{url}\n\n{type(e).__name__}: {e}")
         return False, False, "Upstream request failed; please try again later.", None, retries
     if token:

@@ -426,6 +426,9 @@ check(
     any(v.get("LastHeader") for v in hba.values()),
     hba,
 )
+xeno_rec = next((v for k, v in hba.items() if "xeno" in k), {})
+check("Header-blocked record notes which field triggered (value)", xeno_rec.get("LastField") == "value", xeno_rec)
+check("Header-blocked record captures the matched text", "Xeno" in (xeno_rec.get("LastMatch") or ""), xeno_rec)
 check("Header rule stored in HeaderRules", any("xeno" in k for k in diag.get("HeaderRules", {})), list(diag.get("HeaderRules", {})))
 
 # Key-scope exact rule
@@ -449,30 +452,63 @@ check("Header-blocked attempts cleared", r.get_json().get("HeaderBlockedAttempts
 # Remove the remaining exact rule so it doesn't affect later sections.
 client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": "key|exact|exploit-guid"})
 
-print("== Global throttle-all mode ==")
+print("== Global throttle-all mode (configurable N per P, custom message, drops) ==")
 proxy_module.requests.request = fake_upstream
 proxy_module.is_direct_api_in_cooldown = False
 proxy_module.is_roproxy_in_cooldown = False
 proxy_module.set_tokens(["TA_TOKEN"])
-r = client.post("/admin/proxy/throttle_all", headers=IP_MAIN, json={"enabled": True})
-check("Enable throttle-all -> 200, state on", r.status_code == 200 and r.get_json().get("ThrottleAll") is True, r.data[:80])
+# Enable with a custom message and limit of 2 per 3600s so the 3rd request trips it.
+r = client.post(
+    "/admin/proxy/throttle_all",
+    headers=IP_MAIN,
+    json={"enabled": True, "reason": "Heavy load, slow down.", "limit": 2, "period": 3600},
+)
+state = r.get_json()
+check("Enable throttle-all -> state on", r.status_code == 200 and state.get("ThrottleAll") is True, r.data[:80])
+check("Throttle-all stored the configurable limit", state.get("Limit") == 2 and state.get("Period") == 3600, state)
+check("Throttle-all stored the custom reason", state.get("Reason") == "Heavy load, slow down.", state)
 IP_TA = {"X-Forwarded-For": "10.8.8.1"}
 n = len(upstream_calls)
-r = api_client.get("/games.roblox.com/v1/throttle-all-test", headers=IP_TA)
-check("Throttle-all returns 429 to every IP", r.status_code == 429, r.status_code)
-check("Throttle-all 429 body is generic 'busy'", b"busy" in r.data, r.data[:80])
-check("Throttle-all blocked the upstream call", len(upstream_calls) == n, len(upstream_calls) - n)
+r1 = api_client.get("/games.roblox.com/v1/ta1", headers=IP_TA)
+r2 = api_client.get("/games.roblox.com/v1/ta2", headers=IP_TA)
+check("Throttle-all lets the first N requests through", r1.status_code == 200 and r2.status_code == 200, (r1.status_code, r2.status_code))
+check("Allowed throttle-all requests reached upstream", len(upstream_calls) == n + 2, len(upstream_calls) - n)
+n = len(upstream_calls)
+r3 = api_client.get("/games.roblox.com/v1/ta3", headers=IP_TA)
+check("Throttle-all blocks beyond the limit -> 429", r3.status_code == 429, r3.status_code)
+check("Throttle-all 429 returns the CUSTOM message", b"Heavy load, slow down." in r3.data, r3.data[:80])
+check("Over-limit throttle-all request never hit upstream", len(upstream_calls) == n, len(upstream_calls) - n)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 diag = r.get_json()
-check("Throttle-all state shown in diagnostics", diag.get("ThrottleAll", {}).get("ThrottleAll") is True, diag.get("ThrottleAll"))
-check("Throttled IP recorded during throttle-all", "10.8.8.1" in diag.get("ThrottledIPs", {}), list(diag.get("ThrottledIPs", {})))
+check("Throttle-all drops counted in diagnostics", diag.get("ThrottleAllDrops", 0) >= 1, diag.get("ThrottleAllDrops"))
 r = client.post("/admin/proxy/throttle_all", headers=IP_MAIN, json={"enabled": False})
-check("Disable throttle-all -> state off", r.get_json().get("ThrottleAll") is False, r.data[:80])
-IP_TA2 = {"X-Forwarded-For": "10.8.8.2"}  # fresh IP, never throttled
+check("Disable throttle-all -> state off + reason cleared", r.get_json().get("ThrottleAll") is False and not r.get_json().get("Reason"), r.data[:80])
+IP_TA2 = {"X-Forwarded-For": "10.8.8.2"}
 n = len(upstream_calls)
 r = api_client.get("/games.roblox.com/v1/after-throttle-all", headers=IP_TA2)
-check("After disabling, a fresh IP proxies normally -> 200", r.status_code == 200, r.status_code)
+check("After disabling, requests proxy normally -> 200", r.status_code == 200, r.status_code)
 check("Normal request hit upstream again", len(upstream_calls) == n + 1, len(upstream_calls) - n)
+
+print("== Pause: custom message + dropped-request counter ==")
+r = client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": True, "reason": "Updating tokens, back soon."})
+check("Pause with reason -> state paused + reason", r.get_json().get("Paused") is True and r.get_json().get("Reason") == "Updating tokens, back soon.", r.data[:80])
+IP_PAUSE = {"X-Forwarded-For": "10.15.0.1"}
+r = api_client.get("/games.roblox.com/v1/while-paused", headers=IP_PAUSE)
+check("Paused proxy returns 503 with the custom message", r.status_code == 503 and b"Updating tokens, back soon." in r.data, (r.status_code, r.data[:80]))
+api_client.get("/games.roblox.com/v1/while-paused-2", headers=IP_PAUSE)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check("Pause drops counted", r.get_json().get("PauseDrops", 0) >= 2, r.get_json().get("PauseDrops"))
+# Re-pausing resets the drop counter for the new downtime.
+client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": False})
+r = client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": True})  # no reason → default
+api_client.get("/games.roblox.com/v1/while-paused-3", headers=IP_PAUSE)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check("Pause drop counter reset on new downtime", r.get_json().get("PauseDrops", 0) == 1, r.get_json().get("PauseDrops"))
+r = api_client.get("/games.roblox.com/v1/while-paused-4", headers=IP_PAUSE)
+check("Default pause message used when none supplied", b"Service down for maintenance." in r.data, r.data[:80])
+client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": False})
+r = api_client.get("/games.roblox.com/v1/after-pause", headers={"X-Forwarded-For": "10.15.0.2"})
+check("After resume, proxy works again -> 200", r.status_code == 200, r.status_code)
 
 print("== Direct API / RoProxy rejection counts ==")
 proxy_module.is_direct_api_in_cooldown = False
@@ -496,6 +532,42 @@ r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/
 ph1 = r.get_json().get("ProxyHealth", {})
 check("Direct API rejection counted", ph1.get("DirectAPI", {}).get("Failed", 0) >= da0 + 1, ph1.get("DirectAPI"))
 check("RoProxy rejection counted", ph1.get("RoProxy", {}).get("Failed", 0) >= rp0 + 1, ph1.get("RoProxy"))
+proxy_module.requests.request = fake_upstream  # restore 200s
+
+print("== Upstream timeouts: fall through routes, never email ==")
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["FALLBACK_TOKEN"])
+proxy_module._token_uses.clear()
+
+
+def timeout_unless_token(method, url, headers=None, params=None, data=None, cookies=None, timeout=None):
+    upstream_calls.append({"method": method, "url": url, "cookies": cookies})
+    if cookies and cookies.get(".ROBLOSECURITY"):
+        return FakeUpstreamResponse(status=200, text='{"ok":true}')  # token route works
+    raise proxy_module.requests.Timeout("read timed out")  # direct + roproxy time out
+
+
+proxy_module.requests.request = timeout_unless_token
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+ph0 = r.get_json().get("ProxyHealth", {})
+emails_before = len(sent_emails)
+r = api_client.get("/games.roblox.com/v1/timeout-test", headers={"X-Forwarded-For": "10.16.0.1"})
+check("Direct+RoProxy timeout falls through to the token -> 200", r.status_code == 200, r.status_code)
+check("Timed-out request was ultimately served", r.data == b'{"ok":true}', r.data[:60])
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+ph1 = r.get_json().get("ProxyHealth", {})
+check(
+    "Direct API timeout counted",
+    ph1.get("DirectAPI", {}).get("Timeouts", 0) >= ph0.get("DirectAPI", {}).get("Timeouts", 0) + 1,
+    ph1.get("DirectAPI"),
+)
+check(
+    "RoProxy timeout counted",
+    ph1.get("RoProxy", {}).get("Timeouts", 0) >= ph0.get("RoProxy", {}).get("Timeouts", 0) + 1,
+    ph1.get("RoProxy"),
+)
+check("Timeouts never email the admin", len(sent_emails) == emails_before, sent_emails[emails_before:])
 proxy_module.requests.request = fake_upstream  # restore 200s
 
 print("== Endpoint templating (ID collapse + concrete drill-down) ==")

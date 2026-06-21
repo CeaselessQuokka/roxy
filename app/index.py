@@ -311,10 +311,11 @@ def admin_logout():
 @requires_admin
 def admin_proxy_toggle():
     data = get_json_dict() or {}
-    if "paused" in data:
-        runtime.set_paused(bool(data["paused"]))
-    else:
-        runtime.toggle_paused()
+    reason = data.get("reason") if isinstance(data.get("reason"), str) else None
+    target = bool(data["paused"]) if "paused" in data else not runtime.is_paused()
+    if target:
+        diagnostics.clear_stats(("pause_drops",))  # Fresh drop count for this downtime.
+    runtime.set_paused(target, reason=reason)
     return jsonify(runtime.get_pause_state()), 200
 
 
@@ -322,10 +323,16 @@ def admin_proxy_toggle():
 @requires_admin
 def admin_throttle_all():
     data = get_json_dict() or {}
-    if "enabled" in data:
-        runtime.set_throttle_all(bool(data["enabled"]))
-    else:
-        runtime.toggle_throttle_all()
+    reason = data.get("reason") if isinstance(data.get("reason"), str) else None
+    # Optionally update the configurable per-IP limit/period in the same call.
+    if "limit" in data:
+        runtime.set_setting("global_throttle_limit", data.get("limit"))
+    if "period" in data:
+        runtime.set_setting("global_throttle_period", data.get("period"))
+    target = bool(data["enabled"]) if "enabled" in data else not runtime.is_throttle_all()
+    if target:
+        diagnostics.clear_stats(("throttle_drops",))  # Fresh drop count for this downtime.
+    runtime.set_throttle_all(target, reason=reason)
     return jsonify(runtime.get_throttle_all_state()), 200
 
 
@@ -596,17 +603,20 @@ def proxy_page(dst: str):
     ip = get_client_ip()
     user_agent = request.user_agent.string
     if runtime.is_paused():
-        resp = jsonify("The proxy is temporarily paused; please try again later.")
+        diagnostics.log_pause_drop()
+        resp = jsonify(runtime.pause_message())
         return _with_throttle_headers(resp, ip, Roxy_Paused="True"), 503
 
     # Global throttle-all: a softer alternative to a full pause. Every IP is
-    # forced into the throttled state (still tracked per-IP, so reset timers and
-    # per-endpoint rules continue to apply).
+    # rate-limited to a configurable N requests per P seconds; requests within
+    # that budget proceed normally (still subject to the regular per-IP and
+    # per-endpoint limits), the rest get a friendly 429.
     if runtime.is_throttle_all():
-        throttle.apply_global_throttle(ip)
-        reset_in = throttle.get_throttle_reset_time_left(ip)
-        resp = jsonify(f"The proxy is busy right now; please try again in {reset_in} seconds.")
-        return _with_throttle_headers(resp, ip), 429
+        allowed, retry_in = throttle.check_global_throttle(ip)
+        if not allowed:
+            diagnostics.log_throttle_all_drop()
+            resp = jsonify(runtime.throttle_all_message())
+            return _with_throttle_headers(resp, ip, Roxy_Throttle_Reset=retry_in, Roxy_Global_Throttled="True"), 429
 
     if throttle.is_throttled(ip):
         reset_in = throttle.get_throttle_reset_time_left(ip)
