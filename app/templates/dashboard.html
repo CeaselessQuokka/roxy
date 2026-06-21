@@ -24,6 +24,14 @@
 			</div>
 			<div class="app-bar__section app-bar__section--end">
 				<span id="proxyStatusChip" class="chip" aria-live="polite" aria-atomic="true">Proxy: …</span>
+				<button
+					type="button"
+					class="btn btn--tonal"
+					id="throttleAllToggle"
+					title="Throttle every IP at once — a softer alternative to a full pause. Per-IP and per-endpoint limits still apply."
+				>
+					Throttle All
+				</button>
 				<button type="button" class="btn btn--warning" id="pauseToggle">Pause Proxy</button>
 				<span
 					id="sessionChip"
@@ -43,6 +51,12 @@
 		<div id="pauseBanner" class="pause-banner" role="alert" hidden>
 			⏸ The proxy is currently <strong>PAUSED</strong>. The site stays online, but proxy requests are
 			rejected. <span id="pauseBannerSince" class="text-dim"></span>
+		</div>
+
+		<!-- Throttle-all banner -->
+		<div id="throttleAllBanner" class="throttle-banner" role="alert" hidden>
+			🐢 <strong>Throttle-All</strong> is active. Every IP is being throttled to relieve load; requests get a
+			429 and clients back off. <span id="throttleAllBannerSince" class="text-dim"></span>
 		</div>
 
 		<!-- Layout: Nav + Main -->
@@ -253,7 +267,8 @@
 								host (<code>games.roblox.com</code>) to block the whole service. Use <code>*</code> as a
 								wildcard for one path segment:
 								<code>games.roblox.com/v1/games/*/servers</code> blocks servers for any game but leaves
-								<code>/votes</code> alone.
+								<code>/votes</code> alone. Switch the type to <strong>Regex</strong> for a full regular
+								expression, e.g. <code>games\.roblox\.com/v1/games/\d+/servers</code>.
 							</p>
 							<form id="blockForm" class="form">
 								<div class="form__row">
@@ -265,6 +280,10 @@
 										required
 									/>
 									<input id="blockNote" class="input" type="text" placeholder="Note (optional)" />
+									<select id="blockType" class="input input--select" style="max-width: 120px" aria-label="Match type">
+										<option value="glob">Wildcard</option>
+										<option value="regex">Regex</option>
+									</select>
 									<button type="submit" class="btn btn--warning">Block</button>
 								</div>
 							</form>
@@ -273,6 +292,7 @@
 									<thead>
 										<tr>
 											<th scope="col">Pattern</th>
+											<th scope="col">Type</th>
 											<th scope="col">Note</th>
 											<th scope="col">Added</th>
 											<th scope="col"></th>
@@ -291,7 +311,8 @@
 							<p class="form__hint">
 								Limit how often a single IP can hit an endpoint (e.g. 1 every 60s). This only ever
 								makes an endpoint <em>more</em> restrictive — the global per-IP limit still applies on
-								top. Supports <code>*</code> wildcards too, e.g.
+								top. Supports <code>*</code> wildcards and (via the type selector)
+								<strong>Regex</strong> too, e.g.
 								<code>games.roblox.com/v1/games/*/servers</code>.
 							</p>
 							<form id="ruleForm" class="form">
@@ -321,6 +342,10 @@
 										placeholder="Period (s)"
 										style="max-width: 130px"
 									/>
+									<select id="ruleType" class="input input--select" style="max-width: 120px" aria-label="Match type">
+										<option value="glob">Wildcard</option>
+										<option value="regex">Regex</option>
+									</select>
 									<button type="submit" class="btn btn--filled">Set Rule</button>
 								</div>
 							</form>
@@ -329,6 +354,7 @@
 									<thead>
 										<tr>
 											<th scope="col">Pattern</th>
+											<th scope="col">Type</th>
 											<th scope="col">Limit</th>
 											<th scope="col">Per (s)</th>
 											<th scope="col">Added</th>
@@ -390,6 +416,7 @@
 								>
 									<option value="contains">Contains</option>
 									<option value="exact">Exact</option>
+									<option value="regex">Regex</option>
 								</select>
 								<input
 									id="headerRuleNeedle"
@@ -1033,7 +1060,8 @@
 							<div class="kpi__meta">
 								Last: <span id="direct_last">—</span> • Cooldown:
 								<span id="direct_cooldown">false</span> • Count:
-								<span id="direct_count">0</span>
+								<span id="direct_count">0</span> • Rejected:
+								<span id="direct_failed">0</span>
 							</div>
 						</article>
 
@@ -1043,7 +1071,8 @@
 							<div class="kpi__meta">
 								Last: <span id="roproxy_last">—</span> • Cooldown:
 								<span id="roproxy_cooldown">false</span> • Count:
-								<span id="roproxy_count">0</span>
+								<span id="roproxy_count">0</span> • Rejected:
+								<span id="roproxy_failed">0</span>
 							</div>
 						</article>
 
@@ -1075,7 +1104,9 @@
 							</div>
 							<div class="kpi__meta">
 								Window: <span id="budget_window">—</span>s • Resets in:
-								<span id="budget_reset">—</span>s • Rejected: <span id="budget_rejections">0</span>
+								<span id="budget_reset">—</span>s • Rejected: <span id="budget_rejections">0</span><br />
+								Peak / window — last hour: <span id="budget_peak_1h">0</span> • last 24h:
+								<span id="budget_peak_24h">0</span>
 							</div>
 						</article>
 

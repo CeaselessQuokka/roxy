@@ -25,6 +25,12 @@ _lock = Lock()
 _paused = False
 _paused_since = 0.0
 
+# --- Global throttle-all flag -----------------------------------------------
+# A softer alternative to pausing: when on, EVERY IP is throttled (each still
+# tracked individually, so per-IP reset timers and per-endpoint rules apply).
+_throttle_all = False
+_throttle_all_since = 0.0
+
 # --- Admin session epoch ----------------------------------------------------
 # Every admin session records the epoch it was created under. Bumping the epoch
 # invalidates every existing admin session at once (a server-side kill switch).
@@ -52,7 +58,7 @@ _endpoint_rules = dict()  # pattern -> {"Limit": int, "Period": int, "Added": ts
 #                 "Needle": str, "Note": str, "Added": ts}
 _header_rules = dict()
 HEADER_RULE_SCOPES = ("key", "value", "either")
-HEADER_RULE_MODES = ("contains", "exact")
+HEADER_RULE_MODES = ("contains", "exact", "regex")
 
 # --- Cross-worker reload bookkeeping ----------------------------------------
 _last_mtime = 0.0
@@ -95,44 +101,77 @@ _settings = {
 
 # --- Endpoint pattern helpers -----------------------------------------------
 def _norm(pattern: str) -> str:
+    """Normalize a GLOB pattern: trim, drop leading slashes, lowercase."""
     return (pattern or "").strip().lstrip("/").lower()
 
 
-@lru_cache(maxsize=1024)
-def _compile_pattern(pattern: str):
-    """Compile an endpoint pattern into a regex.
+def _norm_regex(pattern: str) -> str:
+    """Normalize a REGEX pattern: trim and drop leading slashes only.
 
-    - `*` is a wildcard for a run of characters WITHIN one path segment; it never
-      spans a `/`. So `games.roblox.com/v1/games/*/servers` matches
-      `games.roblox.com/v1/games/694768217/servers` (and, via the implied
-      trailing wildcard below, `.../servers/0`) but NOT `.../games/123/votes`.
-    - A trailing path is always allowed: a pattern matches the path it names and
-      everything nested under it (the historical behavior).
-    - A host-only pattern (no slash) matches that whole service.
-
-    Cached because patterns are few and reused across many requests.
+    Crucially does NOT lowercase — lowercasing would corrupt regex escapes like
+    \\D, \\W, \\S, \\B into their opposites. Case-insensitivity is handled by the
+    re.IGNORECASE flag at compile time instead.
     """
-    base = pattern.rstrip("/")
-    # Escape everything literally, then turn the escaped '*' back into a
-    # single-segment wildcard. re.escape turns '*' into r'\*'.
-    escaped = re.escape(base).replace(r"\*", r"[^/]*")
-    return re.compile(rf"^{escaped}(?:/.*)?$")
+    return (pattern or "").strip().lstrip("/")
 
 
-def _matches(pattern: str, path: str) -> bool:
-    """Whether a normalized request path is covered by an endpoint pattern."""
-    if not pattern:
-        return False
+def normalize_pattern(pattern: str, kind: str) -> str:
+    return _norm_regex(pattern) if kind == "regex" else _norm(pattern)
+
+
+def valid_regex(pattern: str) -> bool:
     try:
-        return _compile_pattern(pattern).match(path) is not None
+        re.compile(pattern)
+        return True
     except re.error:
         return False
 
 
-def _specificity(pattern: str):
+@lru_cache(maxsize=2048)
+def _compile_pattern(pattern: str, kind: str):
+    """Compile an endpoint pattern into a regex.
+
+    kind == "glob" (default):
+      - `*` is a wildcard for a run of characters WITHIN one path segment; it
+        never spans a `/`. So `games.roblox.com/v1/games/*/servers` matches
+        `games.roblox.com/v1/games/694768217/servers`.
+      - A trailing path is always allowed: a pattern matches the path it names
+        and everything nested under it.
+      - A host-only pattern (no slash) matches that whole service.
+
+    kind == "regex":
+      - The pattern is a raw Python regex, matched with re.search (so the admin
+        anchors it themselves with ^ / $). No implied trailing wildcard.
+
+    Both are case-insensitive. Cached because patterns are few and reused.
+    """
+    if kind == "regex":
+        return re.compile(pattern, re.IGNORECASE)
+    base = pattern.rstrip("/")
+    # Escape everything literally, then turn the escaped '*' back into a
+    # single-segment wildcard. re.escape turns '*' into r'\*'.
+    escaped = re.escape(base).replace(r"\*", r"[^/]*")
+    return re.compile(rf"^{escaped}(?:/.*)?$", re.IGNORECASE)
+
+
+def _matches(pattern: str, path: str, kind: str = "glob") -> bool:
+    """Whether a normalized request path is covered by an endpoint pattern."""
+    if not pattern:
+        return False
+    try:
+        rx = _compile_pattern(pattern, kind)
+    except re.error:
+        return False
+    return (rx.search(path) if kind == "regex" else rx.match(path)) is not None
+
+
+def _specificity(pattern: str, kind: str = "glob"):
     """Sort key for "most specific match wins". More path segments rank higher;
     among equals, more literal (non-wildcard) characters rank higher, so a
-    concrete rule beats a wildcard one covering the same path."""
+    concrete rule beats a wildcard one covering the same path. Regex patterns
+    sort by length only (they have no clean segment notion)."""
+    if kind == "regex":
+        return (pattern.count("/"), len(pattern))
     return (pattern.count("/"), len(pattern) - pattern.count("*"))
 
 
@@ -144,11 +183,13 @@ def _restore_from(data: dict):
     them, and a rebind would silently disconnect those helpers from the state
     that actually gets persisted.
     """
-    global _paused, _paused_since, _session_epoch
+    global _paused, _paused_since, _session_epoch, _throttle_all, _throttle_all_since
     if not isinstance(data, dict) or not data:
         return
     _paused = bool(data.get("Paused", _paused))
     _paused_since = float(data.get("PausedSince", _paused_since) or 0.0)
+    _throttle_all = bool(data.get("ThrottleAll", _throttle_all))
+    _throttle_all_since = float(data.get("ThrottleAllSince", _throttle_all_since) or 0.0)
     _session_epoch = int(data.get("SessionEpoch", _session_epoch) or 1)
 
     stored_values = data.get("Settings", {}) or {}
@@ -255,6 +296,31 @@ def toggle_paused() -> bool:
     return set_paused(not is_paused())
 
 
+# --- Global throttle-all controls -------------------------------------------
+def is_throttle_all() -> bool:
+    _maybe_reload()
+    return _throttle_all
+
+
+def get_throttle_all_state() -> dict:
+    _maybe_reload()
+    return {"ThrottleAll": _throttle_all, "ThrottleAllSince": _throttle_all_since}
+
+
+def set_throttle_all(enabled: bool) -> bool:
+    def change():
+        global _throttle_all, _throttle_all_since
+        _throttle_all = bool(enabled)
+        _throttle_all_since = time.time() if _throttle_all else 0.0
+
+    _persist_change(change)
+    return _throttle_all
+
+
+def toggle_throttle_all() -> bool:
+    return set_throttle_all(not is_throttle_all())
+
+
 # --- Settings ---------------------------------------------------------------
 def get_setting(key: str, default=None):
     """Current value of a runtime setting, or `default` for unknown keys.
@@ -301,7 +367,7 @@ def get_endpoint_blocks() -> dict:
 def is_endpoint_blocked(path: str) -> bool:
     _maybe_reload()
     p = _norm(path)
-    return any(_matches(pattern, p) for pattern in _endpoint_blocks)
+    return any(_matches(pattern, p, rule.get("Type", "glob")) for pattern, rule in _endpoint_blocks.items())
 
 
 def get_matching_block(path: str):
@@ -310,34 +376,41 @@ def get_matching_block(path: str):
     p = _norm(path)
     best = None
     best_score = None
-    for pattern in _endpoint_blocks:
-        if _matches(pattern, p):
-            score = _specificity(pattern)
+    for pattern, rule in _endpoint_blocks.items():
+        kind = rule.get("Type", "glob")
+        if _matches(pattern, p, kind):
+            score = _specificity(pattern, kind)
             if best_score is None or score > best_score:
                 best = pattern
                 best_score = score
     return best
 
 
-def block_endpoint(pattern: str, note: str = "") -> tuple[bool, str]:
-    pattern = _norm(pattern)
+def block_endpoint(pattern: str, note: str = "", kind: str = "glob") -> tuple[bool, str]:
+    kind = "regex" if kind == "regex" else "glob"
+    pattern = normalize_pattern(pattern, kind)
     if not pattern:
         return False, "Empty endpoint pattern"
+    if kind == "regex" and not valid_regex(pattern):
+        return False, "Invalid regular expression"
     if pattern not in _endpoint_blocks and len(_endpoint_blocks) >= config.MAX_ENDPOINT_BLOCKS:
         return False, "Too many blocked endpoints"
 
     def change():
-        _endpoint_blocks[pattern] = {"Added": time.time(), "Note": str(note)[:200]}
+        _endpoint_blocks[pattern] = {"Added": time.time(), "Note": str(note)[:200], "Type": kind}
 
     _persist_change(change)
     return True, "Success"
 
 
 def unblock_endpoint(pattern: str) -> tuple[bool, str]:
-    pattern = _norm(pattern)
+    # The caller passes back the exact stored key; also tolerate glob/regex
+    # normalization differences so either form removes the rule.
+    candidates = {(pattern or "").strip(), _norm(pattern), _norm_regex(pattern)}
 
     def change():
-        _endpoint_blocks.pop(pattern, None)
+        for key in candidates:
+            _endpoint_blocks.pop(key, None)
 
     _persist_change(change)
     return True, "Success"
@@ -349,10 +422,15 @@ def get_endpoint_rules() -> dict:
     return {k: dict(v) for k, v in _endpoint_rules.items()}
 
 
-def set_endpoint_rule(pattern: str, limit, period=config.DEFAULT_ENDPOINT_RULE_PERIOD) -> tuple[bool, str]:
-    pattern = _norm(pattern)
+def set_endpoint_rule(
+    pattern: str, limit, period=config.DEFAULT_ENDPOINT_RULE_PERIOD, kind: str = "glob"
+) -> tuple[bool, str]:
+    kind = "regex" if kind == "regex" else "glob"
+    pattern = normalize_pattern(pattern, kind)
     if not pattern:
         return False, "Empty endpoint pattern"
+    if kind == "regex" and not valid_regex(pattern):
+        return False, "Invalid regular expression"
     try:
         limit = int(limit)
         period = int(period)
@@ -367,17 +445,18 @@ def set_endpoint_rule(pattern: str, limit, period=config.DEFAULT_ENDPOINT_RULE_P
         return False, "Too many endpoint rules"
 
     def change():
-        _endpoint_rules[pattern] = {"Limit": limit, "Period": period, "Added": time.time()}
+        _endpoint_rules[pattern] = {"Limit": limit, "Period": period, "Added": time.time(), "Type": kind}
 
     _persist_change(change)
     return True, "Success"
 
 
 def clear_endpoint_rule(pattern: str) -> tuple[bool, str]:
-    pattern = _norm(pattern)
+    candidates = {(pattern or "").strip(), _norm(pattern), _norm_regex(pattern)}
 
     def change():
-        _endpoint_rules.pop(pattern, None)
+        for key in candidates:
+            _endpoint_rules.pop(key, None)
 
     _persist_change(change)
     return True, "Success"
@@ -394,8 +473,9 @@ def match_endpoint_rule(path: str):
     best = None
     best_score = None
     for pattern, rule in _endpoint_rules.items():
-        if _matches(pattern, p):
-            score = _specificity(pattern)
+        kind = rule.get("Type", "glob")
+        if _matches(pattern, p, kind):
+            score = _specificity(pattern, kind)
             if best_score is None or score > best_score:
                 best = dict(rule)
                 best["Pattern"] = pattern
@@ -424,6 +504,8 @@ def add_header_rule(scope: str, mode: str, needle: str, note: str = "") -> tuple
         return False, f"Mode must be one of: {', '.join(HEADER_RULE_MODES)}"
     if not needle:
         return False, "Empty match text"
+    if mode == "regex" and not valid_regex(needle):
+        return False, "Invalid regular expression"
     rule_id = _header_rule_id(scope, mode, needle)
     if rule_id not in _header_rules and len(_header_rules) >= config.MAX_HEADER_RULES:
         return False, "Too many header rules"
@@ -449,11 +531,23 @@ def remove_header_rule(rule_id: str) -> tuple[bool, str]:
     return True, "Success"
 
 
-def _header_field_matches(mode: str, needle_lower: str, target: str) -> bool:
-    target = (target or "").lower()
+@lru_cache(maxsize=512)
+def _compile_header_regex(needle: str):
+    return re.compile(needle, re.IGNORECASE)
+
+
+def _header_field_matches(mode: str, needle: str, target: str) -> bool:
+    target = target or ""
+    if mode == "regex":
+        try:
+            return _compile_header_regex(needle).search(target) is not None
+        except re.error:
+            return False
+    target_lower = target.lower()
+    needle_lower = needle.lower()
     if mode == "exact":
-        return target == needle_lower
-    return needle_lower in target  # contains
+        return target_lower == needle_lower
+    return needle_lower in target_lower  # contains
 
 
 def match_header_rule(headers) -> dict | None:
@@ -470,12 +564,12 @@ def match_header_rule(headers) -> dict | None:
     for rule_id, rule in _header_rules.items():
         scope = rule.get("Scope", "either")
         mode = rule.get("Mode", "contains")
-        needle_lower = str(rule.get("Needle", "")).lower()
-        if not needle_lower:
+        needle = str(rule.get("Needle", ""))
+        if not needle:
             continue
         for name, value in pairs:
-            key_hit = scope in ("key", "either") and _header_field_matches(mode, needle_lower, name)
-            value_hit = scope in ("value", "either") and _header_field_matches(mode, needle_lower, value)
+            key_hit = scope in ("key", "either") and _header_field_matches(mode, needle, name)
+            value_hit = scope in ("value", "either") and _header_field_matches(mode, needle, value)
             if key_hit or value_hit:
                 hit = dict(rule)
                 hit["Id"] = rule_id
@@ -562,6 +656,8 @@ def _serialize_unlocked() -> dict:
     return {
         "Paused": _paused,
         "PausedSince": _paused_since,
+        "ThrottleAll": _throttle_all,
+        "ThrottleAllSince": _throttle_all_since,
         "SessionEpoch": _session_epoch,
         "Settings": {k: v["value"] for k, v in _settings.items()},
         "SettingsUpdated": {k: v["updated"] for k, v in _settings.items()},

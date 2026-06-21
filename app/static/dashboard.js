@@ -318,6 +318,8 @@ const print = console.log;
 		setText("budget_window", String(b.Window ?? "—"));
 		setText("budget_reset", String(b.ResetIn ?? 0));
 		setText("budget_rejections", String(d.TokenBudgetRejections ?? 0));
+		setText("budget_peak_1h", String(d.BudgetPeak1h ?? 0));
+		setText("budget_peak_24h", String(d.BudgetPeak24h ?? 0));
 		const gauge = $("#budget_gauge");
 		if (gauge && limit) {
 			const pct = Math.min(100, (used / limit) * 100);
@@ -428,11 +430,13 @@ const print = console.log;
 		setText("direct_last", da.LastRequestTime ? timeAgo(da.LastRequestTime) : "—");
 		setText("direct_cooldown", String(Boolean(da.IsInCooldown)));
 		setText("direct_count", String(da.Count || 0));
+		setText("direct_failed", String(da.Failed || 0));
 
 		setText("health_roproxy", rp.IsInCooldown ? "COOLDOWN" : "OK");
 		setText("roproxy_last", rp.LastRequestTime ? timeAgo(rp.LastRequestTime) : "—");
 		setText("roproxy_cooldown", String(Boolean(rp.IsInCooldown)));
 		setText("roproxy_count", String(rp.Count || 0));
+		setText("roproxy_failed", String(rp.Failed || 0));
 
 		setText("health_tokens_count", String(tk.Count ?? 0));
 		setText("health_tokens_expired", String(tk.ExpiredCount ?? 0));
@@ -469,6 +473,23 @@ const print = console.log;
 		}
 	}
 
+	function renderThrottleAll(d) {
+		const on = Boolean(d?.ThrottleAll?.ThrottleAll);
+		const since = Number(d?.ThrottleAll?.ThrottleAllSince || 0);
+		const btn = $("#throttleAllToggle");
+		const banner = $("#throttleAllBanner");
+		if (btn) {
+			btn.textContent = on ? "Stop Throttle All" : "Throttle All";
+			btn.classList.toggle("btn--warning", on);
+			btn.classList.toggle("btn--tonal", !on);
+			btn.dataset.on = String(on);
+		}
+		if (banner) {
+			banner.hidden = !on;
+			setText("throttleAllBannerSince", on && since ? `(since ${toTS(since)})` : "");
+		}
+	}
+
 	function renderVisitors(d) {
 		const v = d.VisitorCounts || {};
 		setText("kpi_human", String(v.Human ?? 0));
@@ -477,13 +498,30 @@ const print = console.log;
 
 	let endpointEntries = []; // cached for filtering without refetch
 	const expandedHosts = new Set(); // which root hosts are expanded (survives refreshes)
+	const expandedTemplates = new Set(); // which templates are expanded to their concrete IDs
 	const methodsText = methods =>
 		Object.entries(methods || {})
 			.map(([m, n]) => `${m}:${n}`)
 			.join(", ") || "—";
 
-	// Endpoints grouped by root service (games.roblox.com, avatar.roblox.com...).
-	// Clicking a host row expands into the individual endpoints under it.
+	// A clickable cell with a chevron + indented label, for the endpoint tree.
+	function endpointNameCell(chevronChar, label, { strong = false, depth = 0, sub = false } = {}) {
+		const td = document.createElement("td");
+		if (depth) td.style.paddingLeft = `${depth * 18 + 12}px`;
+		if (chevronChar) {
+			const chev = document.createElement("span");
+			chev.className = "endpoint-host__chevron";
+			chev.textContent = chevronChar;
+			td.appendChild(chev);
+		}
+		const text = document.createElement(strong ? "strong" : "span");
+		text.textContent = ` ${label} `;
+		if (sub) text.className = "endpoint-sub-label";
+		td.appendChild(text);
+		return td;
+	}
+
+	// Top Endpoints as a 3-level tree: host -> ID-collapsed template -> concrete IDs.
 	function renderEndpoints(d) {
 		if (d.Endpoints) {
 			endpointEntries = Object.entries(d.Endpoints);
@@ -493,14 +531,21 @@ const print = console.log;
 		if (!tbody) return;
 		tbody.innerHTML = "";
 		const q = ($("#endpointsFilter")?.value || "").trim().toLowerCase();
+		const filtering = Boolean(q);
 
+		// Group templates by host.
 		const hosts = new Map();
-		for (const [path, info] of endpointEntries) {
-			if (q && !path.toLowerCase().includes(q)) continue;
-			const host = path.split("/", 1)[0];
+		for (const [template, info] of endpointEntries) {
+			const concretes = Object.entries(info.Concrete || {});
+			// A template matches the filter if it or any of its concrete paths match.
+			if (q) {
+				const hit = template.toLowerCase().includes(q) || concretes.some(([p]) => p.toLowerCase().includes(q));
+				if (!hit) continue;
+			}
+			const host = template.split("/", 1)[0];
 			let group = hosts.get(host);
 			if (!group) {
-				group = { count: 0, last: 0, methods: {}, children: [] };
+				group = { count: 0, last: 0, methods: {}, templates: [] };
 				hosts.set(host, group);
 			}
 			group.count += Number(info.Count || 0);
@@ -508,7 +553,7 @@ const print = console.log;
 			for (const [m, n] of Object.entries(info.Methods || {})) {
 				group.methods[m] = (group.methods[m] || 0) + Number(n || 0);
 			}
-			group.children.push([path, info]);
+			group.templates.push([template, info, concretes]);
 		}
 
 		const sortedHosts = [...hosts.entries()].sort((a, b) => b[1].count - a[1].count);
@@ -516,46 +561,88 @@ const print = console.log;
 			tbody.appendChild(tr([q ? "No endpoints match the filter" : "No endpoints recorded yet", "—", "—", "—"]));
 			return;
 		}
+
 		for (const [host, group] of sortedHosts) {
-			const expanded = expandedHosts.has(host) || Boolean(q); // filtering implies expanded
+			const hostExpanded = expandedHosts.has(host) || filtering;
 			const hostRow = document.createElement("tr");
 			hostRow.className = "endpoint-host";
-			hostRow.setAttribute("aria-expanded", String(expanded));
-
-			const tdHost = document.createElement("td");
-			const chevron = document.createElement("span");
-			chevron.className = "endpoint-host__chevron";
-			chevron.textContent = expanded ? "▾" : "▸";
-			const name = document.createElement("strong");
-			name.textContent = ` ${host} `;
+			hostRow.setAttribute("aria-expanded", String(hostExpanded));
+			const tdHost = endpointNameCell(hostExpanded ? "▾" : "▸", host, { strong: true });
 			const meta = document.createElement("span");
 			meta.className = "endpoint-host__count";
-			meta.textContent = `(${group.children.length} endpoint${group.children.length === 1 ? "" : "s"})`;
-			tdHost.append(chevron, name, meta);
+			meta.textContent = ` (${group.templates.length} endpoint${group.templates.length === 1 ? "" : "s"})`;
+			tdHost.appendChild(meta);
 			hostRow.appendChild(tdHost);
-			[String(group.count), methodsText(group.methods)].forEach(text => {
+			for (const text of [String(group.count), methodsText(group.methods)]) {
 				const td = document.createElement("td");
 				td.textContent = text;
 				hostRow.appendChild(td);
-			});
+			}
 			const tdLast = document.createElement("td");
 			tdLast.appendChild(tsNode(group.last));
 			hostRow.appendChild(tdLast);
-
 			hostRow.addEventListener("click", () => {
-				if (expandedHosts.has(host)) expandedHosts.delete(host);
-				else expandedHosts.add(host);
+				expandedHosts.has(host) ? expandedHosts.delete(host) : expandedHosts.add(host);
 				renderEndpoints({});
 			});
 			tbody.appendChild(hostRow);
+			if (!hostExpanded) continue;
 
-			if (!expanded) continue;
-			for (const [path, info] of group.children) {
-				const sub = path.slice(host.length) || "/";
-				const row = tr([`└ ${sub}`, String(info.Count || 0), methodsText(info.Methods), tsNode(info.LastRequestTime)]);
-				row.className = "endpoint-child";
-				row.title = path;
-				tbody.appendChild(row);
+			group.templates.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+			for (const [template, info, concretes] of group.templates) {
+				const sub = template.slice(host.length) || "/";
+				const hasConcrete = concretes.length > 0;
+				const tmplExpanded = (expandedTemplates.has(template) || filtering) && hasConcrete;
+				const tmplRow = document.createElement("tr");
+				tmplRow.className = "endpoint-template";
+				tmplRow.title = template;
+				const chevron = hasConcrete ? (tmplExpanded ? "▾" : "▸") : "";
+				const tdName = endpointNameCell(chevron, sub, { depth: 1 });
+				if (hasConcrete) {
+					const c = document.createElement("span");
+					c.className = "endpoint-host__count";
+					c.textContent = ` (${concretes.length} id${concretes.length === 1 ? "" : "s"})`;
+					tdName.appendChild(c);
+				}
+				tmplRow.appendChild(tdName);
+				for (const text of [String(info.Count || 0), methodsText(info.Methods)]) {
+					const td = document.createElement("td");
+					td.textContent = text;
+					tmplRow.appendChild(td);
+				}
+				const tdTLast = document.createElement("td");
+				tdTLast.appendChild(tsNode(info.LastRequestTime));
+				tmplRow.appendChild(tdTLast);
+				if (hasConcrete) {
+					tmplRow.style.cursor = "pointer";
+					tmplRow.addEventListener("click", () => {
+						expandedTemplates.has(template)
+							? expandedTemplates.delete(template)
+							: expandedTemplates.add(template);
+						renderEndpoints({});
+					});
+				}
+				tbody.appendChild(tmplRow);
+				if (!tmplExpanded) continue;
+
+				concretes.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+				for (const [concretePath, cinfo] of concretes) {
+					if (q && !concretePath.toLowerCase().includes(q) && !template.toLowerCase().includes(q)) continue;
+					const csub = concretePath.slice(host.length) || "/";
+					const cRow = document.createElement("tr");
+					cRow.className = "endpoint-concrete";
+					cRow.title = concretePath;
+					cRow.appendChild(endpointNameCell("", csub, { depth: 2, sub: true }));
+					for (const text of [String(cinfo.Count || 0), methodsText(cinfo.Methods)]) {
+						const td = document.createElement("td");
+						td.textContent = text;
+						cRow.appendChild(td);
+					}
+					const tdCLast = document.createElement("td");
+					tdCLast.appendChild(tsNode(cinfo.LastRequestTime));
+					cRow.appendChild(tdCLast);
+					tbody.appendChild(cRow);
+				}
 			}
 		}
 	}
@@ -754,13 +841,21 @@ const print = console.log;
 		}
 	}
 
+	const typeBadge = info => {
+		const badge = document.createElement("span");
+		const isRegex = info.Type === "regex";
+		badge.className = `badge ${isRegex ? "badge--method" : ""}`;
+		badge.textContent = isRegex ? "Regex" : "Wildcard";
+		return badge;
+	};
+
 	function renderEndpointBlocks(d) {
 		const tbody = $("#blocksTable tbody");
 		if (!tbody) return;
 		tbody.innerHTML = "";
 		const entries = Object.entries(d.EndpointBlocks || {});
 		if (entries.length === 0) {
-			tbody.appendChild(tr(["—", "No endpoints blocked", "—", ""]));
+			tbody.appendChild(tr(["—", "—", "No endpoints blocked", "—", ""]));
 			return;
 		}
 		for (const [pattern, info] of entries) {
@@ -768,7 +863,7 @@ const print = console.log;
 			btn.className = "btn btn--outline btn--sm";
 			btn.textContent = "Unblock";
 			btn.addEventListener("click", () => unblockEndpoint(pattern));
-			tbody.appendChild(tr([pattern, info.Note || "—", tsNode(info.Added), btn]));
+			tbody.appendChild(tr([pattern, typeBadge(info), info.Note || "—", tsNode(info.Added), btn]));
 		}
 	}
 
@@ -778,7 +873,7 @@ const print = console.log;
 		tbody.innerHTML = "";
 		const entries = Object.entries(d.EndpointRules || {});
 		if (entries.length === 0) {
-			tbody.appendChild(tr(["—", "—", "—", "—", ""]));
+			tbody.appendChild(tr(["—", "—", "—", "—", "—", ""]));
 			return;
 		}
 		for (const [pattern, info] of entries) {
@@ -787,7 +882,14 @@ const print = console.log;
 			btn.textContent = "Remove";
 			btn.addEventListener("click", () => clearEndpointRule(pattern));
 			tbody.appendChild(
-				tr([pattern, String(info.Limit ?? "—"), String(info.Period ?? "—"), tsNode(info.Added), btn]),
+				tr([
+					pattern,
+					typeBadge(info),
+					String(info.Limit ?? "—"),
+					String(info.Period ?? "—"),
+					tsNode(info.Added),
+					btn,
+				]),
 			);
 		}
 	}
@@ -866,6 +968,7 @@ const print = console.log;
 	}
 
 	const HEADER_SCOPE_LABELS = { key: "Header name", value: "Header value", either: "Name or value" };
+	const HEADER_MODE_LABELS = { contains: "Contains", exact: "Exact", regex: "Regex" };
 	function renderHeaderRules(d) {
 		const tbody = $("#headerRulesTable tbody");
 		if (!tbody) return;
@@ -883,7 +986,7 @@ const print = console.log;
 			tbody.appendChild(
 				tr([
 					HEADER_SCOPE_LABELS[info.Scope] || info.Scope || "—",
-					info.Mode === "exact" ? "Exact" : "Contains",
+					HEADER_MODE_LABELS[info.Mode] || info.Mode || "Contains",
 					info.Needle || "—",
 					info.Note || "—",
 					tsNode(info.Added),
@@ -903,7 +1006,8 @@ const print = console.log;
 		for (const [, info] of entries) {
 			total += Number(info.Count || 0);
 			const scope = HEADER_SCOPE_LABELS[info.Scope] || info.Scope || "?";
-			const ruleDesc = `${scope} ${info.Mode === "exact" ? "is" : "contains"} "${info.Needle || ""}"`;
+			const verb = info.Mode === "exact" ? "is" : info.Mode === "regex" ? "matches" : "contains";
+			const ruleDesc = `${scope} ${verb} "${info.Needle || ""}"`;
 			const uniqueIps = info.IPs ? Object.keys(info.IPs).length : 0;
 			tbody.appendChild(
 				tr([
@@ -970,6 +1074,7 @@ const print = console.log;
 			renderCrawls(d);
 			renderThrottled(d);
 			renderPause(d);
+			renderThrottleAll(d);
 			renderEndpoints(d);
 			renderStatusDetailed(d);
 			renderRetries(d);
@@ -1224,6 +1329,25 @@ const print = console.log;
 		}
 	});
 
+	// Throttle-all toggle
+	$("#throttleAllToggle")?.addEventListener("click", async () => {
+		const currentlyOn = $("#throttleAllToggle")?.dataset.on === "true";
+		try {
+			const res = await api("/admin/proxy/throttle_all", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ enabled: !currentlyOn }),
+			});
+			if (!res.ok) throw new Error(String(res.status));
+			const state = await res.json();
+			renderThrottleAll({ ThrottleAll: state });
+			showToast(state.ThrottleAll ? "Throttling all IPs" : "Throttle-all disabled");
+		} catch (err) {
+			console.error(err);
+			showToast("Failed to change throttle-all state");
+		}
+	});
+
 	// Auto-refresh (paused while the tab is hidden; remembered across visits)
 	const AUTO_REFRESH_KEY = "roxy.autoRefresh";
 	let autoRefreshTimer = null;
@@ -1394,12 +1518,13 @@ const print = console.log;
 		e.preventDefault();
 		const pattern = $("#blockPattern")?.value.trim();
 		const note = $("#blockNote")?.value.trim() || "";
+		const type = $("#blockType")?.value || "glob";
 		if (!pattern) return;
 		try {
 			const res = await api("/admin/endpoints/block", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ pattern, note }),
+				body: JSON.stringify({ pattern, note, type }),
 			});
 			const data = await res.json();
 			if (!res.ok) throw new Error(data.Message || String(res.status));
@@ -1418,12 +1543,13 @@ const print = console.log;
 		const pattern = $("#rulePattern")?.value.trim();
 		const limit = Number($("#ruleLimit")?.value);
 		const period = Number($("#rulePeriod")?.value) || 60;
+		const type = $("#ruleType")?.value || "glob";
 		if (!pattern || !limit) return;
 		try {
 			const res = await api("/admin/endpoints/rule", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ pattern, limit, period }),
+				body: JSON.stringify({ pattern, limit, period, type }),
 			});
 			const data = await res.json();
 			if (!res.ok) throw new Error(data.Message || String(res.status));
@@ -1490,16 +1616,22 @@ const print = console.log;
 		}
 	});
 
-	// Endpoints export
+	// Endpoints export (template rows + their concrete IDs)
 	$("#exportEndpoints")?.addEventListener("click", async () => {
 		try {
 			const d = await fetchDiagnostics();
-			const lines = ["Endpoint,Count,Methods,LastRequestTime"];
-			for (const [path, info] of Object.entries(d.Endpoints || {})) {
-				const methods = Object.entries(info.Methods || {})
-					.map(([m, n]) => `${m}:${n}`)
+			const lines = ["Level,Endpoint,Count,Methods,LastRequestTime"];
+			const methodsOf = m =>
+				Object.entries(m || {})
+					.map(([k, n]) => `${k}:${n}`)
 					.join(" ");
-				lines.push(toCSVRow([path, info.Count || 0, methods, info.LastRequestTime || 0]));
+			for (const [template, info] of Object.entries(d.Endpoints || {})) {
+				lines.push(toCSVRow(["template", template, info.Count || 0, methodsOf(info.Methods), info.LastRequestTime || 0]));
+				for (const [concrete, cinfo] of Object.entries(info.Concrete || {})) {
+					lines.push(
+						toCSVRow(["concrete", concrete, cinfo.Count || 0, methodsOf(cinfo.Methods), cinfo.LastRequestTime || 0]),
+					);
+				}
 			}
 			download(`roxy_endpoints_${Date.now()}.csv`, lines.join("\n"));
 			showToast("Endpoints exported");

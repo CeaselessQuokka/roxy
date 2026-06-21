@@ -449,6 +449,134 @@ check("Header-blocked attempts cleared", r.get_json().get("HeaderBlockedAttempts
 # Remove the remaining exact rule so it doesn't affect later sections.
 client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": "key|exact|exploit-guid"})
 
+print("== Global throttle-all mode ==")
+proxy_module.requests.request = fake_upstream
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["TA_TOKEN"])
+r = client.post("/admin/proxy/throttle_all", headers=IP_MAIN, json={"enabled": True})
+check("Enable throttle-all -> 200, state on", r.status_code == 200 and r.get_json().get("ThrottleAll") is True, r.data[:80])
+IP_TA = {"X-Forwarded-For": "10.8.8.1"}
+n = len(upstream_calls)
+r = api_client.get("/games.roblox.com/v1/throttle-all-test", headers=IP_TA)
+check("Throttle-all returns 429 to every IP", r.status_code == 429, r.status_code)
+check("Throttle-all 429 body is generic 'busy'", b"busy" in r.data, r.data[:80])
+check("Throttle-all blocked the upstream call", len(upstream_calls) == n, len(upstream_calls) - n)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag = r.get_json()
+check("Throttle-all state shown in diagnostics", diag.get("ThrottleAll", {}).get("ThrottleAll") is True, diag.get("ThrottleAll"))
+check("Throttled IP recorded during throttle-all", "10.8.8.1" in diag.get("ThrottledIPs", {}), list(diag.get("ThrottledIPs", {})))
+r = client.post("/admin/proxy/throttle_all", headers=IP_MAIN, json={"enabled": False})
+check("Disable throttle-all -> state off", r.get_json().get("ThrottleAll") is False, r.data[:80])
+IP_TA2 = {"X-Forwarded-For": "10.8.8.2"}  # fresh IP, never throttled
+n = len(upstream_calls)
+r = api_client.get("/games.roblox.com/v1/after-throttle-all", headers=IP_TA2)
+check("After disabling, a fresh IP proxies normally -> 200", r.status_code == 200, r.status_code)
+check("Normal request hit upstream again", len(upstream_calls) == n + 1, len(upstream_calls) - n)
+
+print("== Direct API / RoProxy rejection counts ==")
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens([])  # force the direct-API / RoProxy routes (no token path)
+
+
+def failing_upstream(method, url, headers=None, params=None, data=None, cookies=None, timeout=None):
+    upstream_calls.append({"method": method, "url": url, "headers": headers or {}, "params": params or {}, "cookies": cookies})
+    return FakeUpstreamResponse(status=500, text="upstream boom")
+
+
+proxy_module.requests.request = failing_upstream
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+ph0 = r.get_json().get("ProxyHealth", {})
+da0 = ph0.get("DirectAPI", {}).get("Failed", 0)
+rp0 = ph0.get("RoProxy", {}).get("Failed", 0)
+api_client.get("/games.roblox.com/v1/fail-direct", headers={"X-Forwarded-For": "10.10.0.1"})  # direct route, 500
+api_client.get("/games.roblox.com/v1/fail-roproxy", headers={"X-Forwarded-For": "10.10.0.2"})  # roproxy route, 500
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+ph1 = r.get_json().get("ProxyHealth", {})
+check("Direct API rejection counted", ph1.get("DirectAPI", {}).get("Failed", 0) >= da0 + 1, ph1.get("DirectAPI"))
+check("RoProxy rejection counted", ph1.get("RoProxy", {}).get("Failed", 0) >= rp0 + 1, ph1.get("RoProxy"))
+proxy_module.requests.request = fake_upstream  # restore 200s
+
+print("== Endpoint templating (ID collapse + concrete drill-down) ==")
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["TPL_TOKEN"])
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "endpoints"})
+IP_TPL = {"X-Forwarded-For": "10.11.0.1"}
+for uid in ("111", "222", "333"):
+    api_client.get(f"/avatar.roblox.com/v2/avatar/users/{uid}/outfits", headers=IP_TPL)
+api_client.get("/games.roblox.com/v1/games/694768217/servers/0", headers=IP_TPL)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+eps = r.get_json().get("Endpoints", {})
+tmpl = "avatar.roblox.com/v2/avatar/users/{userId}/outfits"
+check("IDs collapse into a {userId} template", tmpl in eps, list(eps))
+check("Template counts all 3 requests", eps.get(tmpl, {}).get("Count") == 3, eps.get(tmpl))
+check("Template keeps the 3 concrete IDs", len(eps.get(tmpl, {}).get("Concrete", {})) == 3, eps.get(tmpl, {}).get("Concrete"))
+check(
+    "Concrete drill-down has the real path",
+    "avatar.roblox.com/v2/avatar/users/111/outfits" in eps.get(tmpl, {}).get("Concrete", {}),
+    list(eps.get(tmpl, {}).get("Concrete", {})),
+)
+check(
+    "games servers path collapses gameId + serverId",
+    "games.roblox.com/v1/games/{gameId}/servers/{serverId}" in eps,
+    [k for k in eps if k.startswith("games.roblox.com")],
+)
+
+print("== Regex endpoint blocking ==")
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+proxy_module.set_tokens(["RX_TOKEN"])
+rx_pattern = r"games\.roblox\.com/v1/games/\d+/votes"
+r = client.post("/admin/endpoints/block", headers=IP_MAIN, json={"pattern": rx_pattern, "type": "regex"})
+check("Add regex block -> 200", r.status_code == 200, r.data[:80])
+IP_RX = {"X-Forwarded-For": "10.12.0.1"}
+n = len(upstream_calls)
+r = api_client.get("/games.roblox.com/v1/games/999/votes", headers=IP_RX)
+check("Regex block matches /votes -> 403", r.status_code == 403, r.status_code)
+check("Regex-blocked request never hit upstream", len(upstream_calls) == n, len(upstream_calls) - n)
+r = api_client.get("/games.roblox.com/v1/games/999/servers/0", headers=IP_RX)
+check("Regex block does NOT match /servers -> 200", r.status_code == 200, r.status_code)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+blocks = r.get_json().get("EndpointBlocks", {})
+check("Regex block stored with Type=regex", blocks.get(rx_pattern, {}).get("Type") == "regex", blocks.get(rx_pattern))
+r = client.post("/admin/endpoints/unblock", headers=IP_MAIN, json={"pattern": rx_pattern})
+r = api_client.get("/games.roblox.com/v1/games/999/votes", headers=IP_RX)
+check("After unblock, regex pattern no longer blocks -> 200", r.status_code == 200, r.status_code)
+
+print("== Regex header rule ==")
+r = client.post("/admin/headers/rule", headers=IP_MAIN, json={"scope": "value", "mode": "regex", "needle": r"Synapse|Xeno|KRNL"})
+check("Add regex header rule -> 200", r.status_code == 200, r.data[:80])
+IP_RXH = {"X-Forwarded-For": "10.13.0.1"}
+r = api_client.get("/games.roblox.com/v1/x", headers={**IP_RXH, "User-Agent": "KRNL/2.0"})
+check("Regex header rule blocks matching UA -> 404", r.status_code == 404, r.status_code)
+r = api_client.get("/games.roblox.com/v1/x", headers={**IP_RXH, "User-Agent": "LegitClient/1.0"})
+check("Regex header rule lets a clean UA through -> 200", r.status_code == 200, r.status_code)
+r = client.post("/admin/headers/rule", headers=IP_MAIN, json={"scope": "value", "mode": "regex", "needle": "([bad"})
+check("Invalid regex header rule rejected -> 400", r.status_code == 400, r.data[:80])
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+for rid in [k for k in r.get_json().get("HeaderRules", {}) if k.startswith("value|regex|")]:
+    client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": rid})
+
+print("== Token budget peak (1h / 24h) ==")
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
+proxy_module._token_uses.clear()  # fresh window so the peak is exactly what we drive
+proxy_module.is_direct_api_in_cooldown = True
+proxy_module.is_roproxy_in_cooldown = True
+proxy_module.set_tokens(["PEAK_TOKEN"])
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"token_budget_requests": 95, "token_budget_window": 65}})
+IP_PK = {"X-Forwarded-For": "10.14.0.1"}
+for i in range(3):
+    api_client.get(f"/games.roblox.com/v1/peak{i}", headers=IP_PK)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag = r.get_json()
+check("Token budget Used reflects the 3 token requests", diag.get("TokenBudget", {}).get("Used") == 3, diag.get("TokenBudget"))
+check("Budget peak (1h) captured", diag.get("BudgetPeak1h") == 3, diag.get("BudgetPeak1h"))
+check("Budget peak (24h) captured", diag.get("BudgetPeak24h") == 3, diag.get("BudgetPeak24h"))
+proxy_module.is_direct_api_in_cooldown = False
+proxy_module.is_roproxy_in_cooldown = False
+
 print("== Emailed invalidation link (kill switch) ==")
 invalidate_emails = emails_with("Roxy Admin Login")
 link_token = invalidate_emails[-1]["body"].split("/admin/invalidate/")[-1].strip().splitlines()[0]

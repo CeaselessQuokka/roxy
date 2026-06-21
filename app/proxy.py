@@ -49,14 +49,18 @@ def _token_budget_has_room_unlocked() -> bool:
     return len(_token_uses) < limit
 
 
-def _record_token_use_unlocked():
+def _record_token_use_unlocked() -> int:
+    """Append a token use and return the resulting sliding-window usage."""
     _token_uses.append(time.time())
+    _prune_token_uses_unlocked(_budget_limits()[1], time.time())
+    return len(_token_uses)
 
 
 def record_token_use():
     """Count a token-authenticated request (e.g. a validation ping) against the budget."""
     with request_lock:
-        _record_token_use_unlocked()
+        usage = _record_token_use_unlocked()
+    diagnostics.record_token_budget_usage(usage)
 
 
 def get_token_budget_state() -> dict:
@@ -216,7 +220,7 @@ def _request(
 
                 # Single active token only (token rotation upsets Roblox).
                 token = tokens[0]
-                _record_token_use_unlocked()
+                diagnostics.record_token_budget_usage(_record_token_use_unlocked())
 
     if csrf_token is not None:
         headers["x-csrf-token"] = csrf_token
@@ -238,10 +242,9 @@ def _request(
         return False, False, "Upstream request failed; please try again later.", None, retries
     if token:
         diagnostics.update_token(token, used=True)
-    elif "roproxy" in url:
-        diagnostics.proxy_health["RoProxy"]["Count"] += 1
     else:
-        diagnostics.proxy_health["DirectAPI"]["Count"] += 1
+        # Direct-API or RoProxy call: count it and whether it was rejected (non-200).
+        diagnostics.log_route_result("roproxy" in url, req.status_code == 200)
     diagnostics.log_status_code(req.status_code)
     diagnostics.log_request(method.upper(), req.status_code == 200)
     diagnostics.log_proxy_request(method.upper(), req.elapsed.total_seconds())

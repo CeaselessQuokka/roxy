@@ -62,6 +62,31 @@ def reset_throttle(ip: str):
             throttled_ips[ip]["ThrottleResetTime"] = time.time() + duration
 
 
+def apply_global_throttle(ip: str) -> bool:
+    """Force this IP into the throttled state (used by the global throttle-all mode).
+
+    Idempotent while active: an already-throttled IP keeps its existing countdown
+    instead of having it pushed further out on every request, so when the admin
+    turns the mode off each IP drains within one throttle window. Returns True if
+    this call newly logged the throttle (first time for this IP)."""
+    now = time.time()
+    duration = runtime.get_setting("throttle_reset_duration", config.THROTTLE_RESET_DURATION)
+    newly_throttled = False
+    with _lock:
+        entry = throttled_ips.get(ip)
+        if entry and entry.get("Throttled"):
+            return False  # Already throttled; leave its countdown alone.
+        newly_throttled = True
+        throttled_ips[ip] = dict(
+            Requests=entry.get("Requests", 0) if entry else 0,
+            Throttled=True,
+            LastRequestTime=now,
+            ThrottleResetTime=now + duration,
+        )
+    diagnostics.log_throttle(ip)
+    return newly_throttled
+
+
 def check_endpoint_limit(ip: str, path: str) -> tuple[bool, int, str | None]:
     """Enforce a per-(IP, endpoint) rate rule, if one matches the path.
 

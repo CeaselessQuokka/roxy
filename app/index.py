@@ -276,6 +276,7 @@ def admin_diagnostics():
     data["EndpointBlocks"] = runtime.get_endpoint_blocks()
     data["EndpointRules"] = runtime.get_endpoint_rules()
     data["HeaderRules"] = runtime.get_header_rules()
+    data["ThrottleAll"] = runtime.get_throttle_all_state()
     data["TokenBudget"] = proxy.get_token_budget_state()
     data["Persistence"] = storage.get_status()
     return jsonify(data)
@@ -315,6 +316,17 @@ def admin_proxy_toggle():
     else:
         runtime.toggle_paused()
     return jsonify(runtime.get_pause_state()), 200
+
+
+@app.route("/admin/proxy/throttle_all", methods=["POST"], endpoint="admin_throttle_all")
+@requires_admin
+def admin_throttle_all():
+    data = get_json_dict() or {}
+    if "enabled" in data:
+        runtime.set_throttle_all(bool(data["enabled"]))
+    else:
+        runtime.toggle_throttle_all()
+    return jsonify(runtime.get_throttle_all_state()), 200
 
 
 @app.route("/admin/settings", methods=["GET", "POST"], endpoint="admin_settings")
@@ -369,7 +381,9 @@ def admin_block_endpoint():
     data = get_json_dict()
     if data is None or not data.get("pattern"):
         return jsonify({"Message": "Missing pattern"}), 400
-    ok, message = runtime.block_endpoint(str(data["pattern"]), str(data.get("note", "")))
+    ok, message = runtime.block_endpoint(
+        str(data["pattern"]), str(data.get("note", "")), str(data.get("type", "glob"))
+    )
     status = 200 if ok else 400
     return jsonify({"Message": message, "EndpointBlocks": runtime.get_endpoint_blocks()}), status
 
@@ -392,7 +406,10 @@ def admin_set_endpoint_rule():
     if data is None or not data.get("pattern"):
         return jsonify({"Message": "Missing pattern"}), 400
     ok, message = runtime.set_endpoint_rule(
-        str(data["pattern"]), data.get("limit"), data.get("period", config.DEFAULT_ENDPOINT_RULE_PERIOD)
+        str(data["pattern"]),
+        data.get("limit"),
+        data.get("period", config.DEFAULT_ENDPOINT_RULE_PERIOD),
+        str(data.get("type", "glob")),
     )
     status = 200 if ok else 400
     return jsonify({"Message": message, "EndpointRules": runtime.get_endpoint_rules()}), status
@@ -581,6 +598,15 @@ def proxy_page(dst: str):
     if runtime.is_paused():
         resp = jsonify("The proxy is temporarily paused; please try again later.")
         return _with_throttle_headers(resp, ip, Roxy_Paused="True"), 503
+
+    # Global throttle-all: a softer alternative to a full pause. Every IP is
+    # forced into the throttled state (still tracked per-IP, so reset timers and
+    # per-endpoint rules continue to apply).
+    if runtime.is_throttle_all():
+        throttle.apply_global_throttle(ip)
+        reset_in = throttle.get_throttle_reset_time_left(ip)
+        resp = jsonify(f"The proxy is busy right now; please try again in {reset_in} seconds.")
+        return _with_throttle_headers(resp, ip), 429
 
     if throttle.is_throttled(ip):
         reset_in = throttle.get_throttle_reset_time_left(ip)

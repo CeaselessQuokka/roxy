@@ -1,11 +1,71 @@
 import config
 import copy
 import json
+import re
 import threading
 import time
 
 import runtime
 import storage
+
+# Map an ID's parent collection segment to a friendly placeholder, so a path
+# like .../users/29371917/outfits collapses to .../users/{userId}/outfits.
+_ID_COLLECTION_NAMES = {
+    "users": "userId",
+    "user": "userId",
+    "games": "gameId",
+    "universes": "universeId",
+    "universe": "universeId",
+    "places": "placeId",
+    "place": "placeId",
+    "groups": "groupId",
+    "group": "groupId",
+    "assets": "assetId",
+    "asset": "assetId",
+    "badges": "badgeId",
+    "badge": "badgeId",
+    "bundles": "bundleId",
+    "outfits": "outfitId",
+    "items": "itemId",
+    "passes": "passId",
+    "gamepasses": "gamePassId",
+    "servers": "serverId",
+    "thumbnails": "thumbnailId",
+}
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+_HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
+_TOKENISH_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+MAX_CONCRETE_PER_TEMPLATE = 100  # How many distinct real paths to keep under one template.
+
+
+def _is_id_segment(seg: str) -> bool:
+    """Heuristic: does this path segment look like a volatile ID rather than a route word?"""
+    if seg.isdigit():
+        return True
+    if _UUID_RE.match(seg):
+        return True
+    if len(seg) >= 16 and _HEX_RE.match(seg):  # long hex hash/token
+        return True
+    if len(seg) >= 24 and _TOKENISH_RE.match(seg) and any(c.isdigit() for c in seg):  # opaque token
+        return True
+    return False
+
+
+def _templatize(path: str) -> str:
+    """Collapse ID-like path segments into placeholders so similar paths group.
+
+    e.g. avatar.roblox.com/v2/avatar/users/29371917/outfits
+      -> avatar.roblox.com/v2/avatar/users/{userId}/outfits
+    """
+    segments = path.split("/")
+    out = []
+    for i, seg in enumerate(segments):
+        if _is_id_segment(seg):
+            prev = segments[i - 1].lower() if i > 0 else ""
+            out.append("{" + _ID_COLLECTION_NAMES.get(prev, "id") + "}")
+        else:
+            out.append(seg)
+    return "/".join(out)
 
 # Guards all reads/writes of the shared in-memory stat structures below. Without
 # it, concurrent request threads (e.g. bots hammering a blocked endpoint) can
@@ -58,8 +118,9 @@ proxy_request_counts = dict(
 
 proxy_health = dict(
     {
-        "DirectAPI": dict({"Count": 0, "LastRequestTime": 0, "IsInCooldown": False}),  # Count = nRequests.
-        "RoProxy": dict({"Count": 0, "LastRequestTime": 0, "IsInCooldown": False}),  # Count = nRequests.
+        # Count = nRequests; Failed = nNon-200 responses from that route.
+        "DirectAPI": dict({"Count": 0, "Failed": 0, "LastRequestTime": 0, "IsInCooldown": False}),
+        "RoProxy": dict({"Count": 0, "Failed": 0, "LastRequestTime": 0, "IsInCooldown": False}),
         "Tokens": dict({"Count": 0, "ExpiredCount": 0, "BeingValidatedCount": 0}),  # Count = nTokens.
     }
 )
@@ -131,6 +192,11 @@ traffic_minutes = dict()
 
 # Requests refused because the internal token hit its safety budget.
 token_budget = dict({"Rejections": 0})
+
+# Per-minute PEAK of the token's sliding-window usage:
+# {"<epoch_minute>": {"Max": peak_usage}}. "Max" leaf so cross-worker merges take
+# the max, not a sum. Used to report the worst budget pressure over 1h / 24h.
+token_budget_minutes = dict()
 
 # When this worker process started (not persisted; for the dashboard uptime card).
 _started_at = time.time()
@@ -224,24 +290,44 @@ def log_exploit_attempt(ip: str, reason: str, user_agent: str):
 
 
 def log_endpoint(path: str, method: str):
-    """Record which Roblox endpoint was requested, keeping the most-frequent ones."""
+    """Record which Roblox endpoint was requested, keeping the most-frequent ones.
+
+    Paths are grouped under an ID-collapsed template so volatile IDs don't blow
+    up cardinality; the real paths seen under each template are kept (capped) so
+    the dashboard can drill into the specific IDs on demand.
+    """
     # Strip query string and normalize so similar paths group together.
     path = (path or "").split("?", 1)[0].strip("/")
     if not path:
         return
+    template = _templatize(path)
     cap = _cap("max_endpoint_records", config.MAX_ENDPOINT_RECORDS)
+    now = time.time()
     with _state_lock:
-        record = endpoints.get(path)
+        record = endpoints.get(template)
         if record:
             record["Count"] += 1
-            record["LastRequestTime"] = time.time()
+            record["LastRequestTime"] = now
             record["Methods"][method] = record["Methods"].get(method, 0) + 1
         else:
             if len(endpoints) >= cap:
-                # Evict the least-frequent endpoint to make room.
+                # Evict the least-frequent template to make room.
                 least = min(endpoints.items(), key=lambda kv: kv[1]["Count"])[0]
                 endpoints.pop(least, None)
-            endpoints[path] = dict(Count=1, LastRequestTime=time.time(), Methods={method: 1})
+            record = endpoints[template] = dict(Count=1, LastRequestTime=now, Methods={method: 1}, Concrete={})
+        # Track the concrete path only when the template actually collapsed an ID.
+        if template != path:
+            concrete = record.setdefault("Concrete", {})
+            c = concrete.get(path)
+            if c:
+                c["Count"] += 1
+                c["LastRequestTime"] = now
+                c["Methods"][method] = c["Methods"].get(method, 0) + 1
+            else:
+                if len(concrete) >= MAX_CONCRETE_PER_TEMPLATE:
+                    least = min(concrete.items(), key=lambda kv: kv[1]["Count"])[0]
+                    concrete.pop(least, None)
+                concrete[path] = dict(Count=1, LastRequestTime=now, Methods={method: 1})
 
 
 def log_blocked_endpoint(path: str, method: str, ip: str, pattern: str):
@@ -326,6 +412,43 @@ def log_budget_rejection():
     """Record a request refused because the internal token hit its safety budget."""
     with _state_lock:
         token_budget["Rejections"] = token_budget.get("Rejections", 0) + 1
+
+
+def record_token_budget_usage(usage: int):
+    """Record the token's current sliding-window usage, keeping a per-minute peak.
+
+    Lets the dashboard show the worst budget pressure over the last hour / day."""
+    bucket = str(int(time.time() // 60))
+    with _state_lock:
+        entry = token_budget_minutes.get(bucket)
+        if entry is None:
+            # Keep ~24h of minute buckets.
+            cutoff = int(time.time() // 60) - 1440
+            for key in [k for k in token_budget_minutes if not str(k).isdigit() or int(k) < cutoff]:
+                token_budget_minutes.pop(key, None)
+            token_budget_minutes[bucket] = {"Max": int(usage)}
+        elif int(usage) > entry.get("Max", 0):
+            entry["Max"] = int(usage)
+
+
+def _budget_peak_since(minutes: int) -> int:
+    cutoff = int(time.time() // 60) - minutes
+    peak = 0
+    with _state_lock:
+        for key, entry in token_budget_minutes.items():
+            if str(key).isdigit() and int(key) >= cutoff:
+                peak = max(peak, int(entry.get("Max", 0)))
+    return peak
+
+
+def log_route_result(is_roproxy: bool, success: bool):
+    """Count a Direct-API or RoProxy call and whether it failed (non-200)."""
+    route = "RoProxy" if is_roproxy else "DirectAPI"
+    with _state_lock:
+        proxy_health[route]["Count"] = proxy_health[route].get("Count", 0) + 1
+        proxy_health[route]["LastRequestTime"] = time.time()
+        if not success:
+            proxy_health[route]["Failed"] = proxy_health[route].get("Failed", 0) + 1
 
 
 def log_retry(status_code: int, reason: str = ""):
@@ -482,6 +605,8 @@ def get_diagnostics() -> dict:
                 "Tokens": list(tokens.values()),
                 "TrafficMinutes": traffic_minutes,
                 "TokenBudgetRejections": token_budget.get("Rejections", 0),
+                "BudgetPeak1h": _budget_peak_since(60),
+                "BudgetPeak24h": _budget_peak_since(1440),
                 "ServerTime": time.time(),
                 "WorkerStartedAt": _started_at,
             }
@@ -511,6 +636,7 @@ _PERSISTED_NAMES = (
     "live_requests",
     "traffic_minutes",
     "token_budget",
+    "token_budget_minutes",
 )
 
 # Pristine copies of every persisted structure, captured at import (before any
@@ -536,6 +662,7 @@ CLEAR_TARGETS = {
         "reason_counts",
         "traffic_minutes",
         "token_budget",
+        "token_budget_minutes",
     ),
     "endpoints": ("endpoints",),
     "blocked_attempts": ("blocked_endpoint_attempts",),
