@@ -77,6 +77,7 @@
 					<li><a class="nav__link" href="#section-live">Live Requests</a></li>
 					<li><a class="nav__link" href="#section-endpoints">Endpoints</a></li>
 					<li><a class="nav__link" href="#section-endpoint-controls">Endpoint Controls</a></li>
+					<li><a class="nav__link" href="#section-throttle-bypass">Throttle Bypass</a></li>
 					<li><a class="nav__link" href="#section-header-rules">Request Filters</a></li>
 					<li><a class="nav__link" href="#section-blocked-attempts">Blocked Attempts</a></li>
 					<li><a class="nav__link" href="#section-ratelimited-attempts">Rate-Limited Attempts</a></li>
@@ -463,6 +464,58 @@
 								</table>
 							</div>
 						</article>
+					</div>
+				</section>
+
+				<!-- Throttle Bypass allowlist (spam/load testing) -->
+				<section id="section-throttle-bypass" class="section" aria-labelledby="throttleBypassHeading">
+					<div class="section__header">
+						<h2 id="throttleBypassHeading" class="section__title">Throttle Bypass (testing)</h2>
+						<div class="section__actions">
+							<span id="throttleBypassTotal" class="chip">0 IPs</span>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							IPs here skip the rate-limit <strong>429s</strong> (per-IP throttle, throttle-all, and
+							per-endpoint rules) so you can spam-test — e.g. to watch the Token danger-zone reweighting
+							kick in. It does <strong>not</strong> bypass pause, endpoint blocks, request filters, or the
+							Token safety budget, so the real routing behavior still applies. Leave expiry blank for "never".
+							Your current IP is <strong id="yourIp">—</strong>
+							<button id="bypassMyIp" type="button" class="btn btn--outline btn--sm">Use my IP</button>
+						</p>
+						<form id="bypassForm" class="form">
+							<div class="form__row">
+								<input id="bypassIp" class="input" type="text" placeholder="e.g. 203.0.113.7" required />
+								<input
+									id="bypassExpiry"
+									class="input"
+									type="number"
+									min="1"
+									placeholder="Expire after (minutes, optional)"
+									style="max-width: 240px"
+									aria-label="Expire after minutes (optional)"
+								/>
+								<input id="bypassNote" class="input" type="text" placeholder="Note (optional)" />
+								<button type="submit" class="btn btn--filled">Add Bypass</button>
+							</div>
+						</form>
+						<div class="table-wrap">
+							<table id="bypassTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">IP</th>
+										<th scope="col">Note</th>
+										<th scope="col">Added</th>
+										<th scope="col">Expires</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- built by JS from ThrottleBypassIps -->
+								</tbody>
+							</table>
+						</div>
 					</div>
 				</section>
 

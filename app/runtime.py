@@ -58,6 +58,13 @@ _challenges = dict()  # challenge -> expiration_time
 _trusted_devices = dict()
 
 
+# --- Throttle-bypass allowlist ----------------------------------------------
+# IPs that skip the rate-limit 429s (per-IP throttle, throttle-all, per-endpoint
+# rate rules) — handy for load/spam testing. Does NOT bypass pause, endpoint
+# blocks, header rules, or the Token safety budget. Optional per-IP expiry.
+# ip -> {"Added": ts, "Expires": ts (0 = never), "Note": str}
+_throttle_bypass_ips = dict()
+
 # --- Blocked endpoints ------------------------------------------------------
 _endpoint_blocks = dict()  # pattern -> {"Added": ts, "Note": str}
 
@@ -236,6 +243,9 @@ def _restore_from(data: dict):
         store.clear()
         store.update(fresh)
 
+    bypass = data.get("ThrottleBypassIps", {})
+    if isinstance(bypass, dict):
+        replace_in_place(_throttle_bypass_ips, {str(k): dict(v) for k, v in bypass.items() if isinstance(v, dict)})
     blocks = data.get("EndpointBlocks", {})
     if isinstance(blocks, dict):
         replace_in_place(_endpoint_blocks, {str(k): dict(v) for k, v in blocks.items() if isinstance(v, dict)})
@@ -406,6 +416,59 @@ def set_setting(key: str, value) -> tuple[bool, str]:
     def change():
         entry["value"] = value
         entry["updated"] = time.time()
+
+    _persist_change(change)
+    return True, "Success"
+
+
+# --- Throttle-bypass allowlist ----------------------------------------------
+def _bypass_active(entry: dict, now: float) -> bool:
+    expires = float(entry.get("Expires", 0) or 0)
+    return expires == 0 or now < expires
+
+
+def is_throttle_bypassed(ip: str) -> bool:
+    """Whether this IP is on the (unexpired) throttle-bypass allowlist."""
+    if not ip:
+        return False
+    _maybe_reload()
+    entry = _throttle_bypass_ips.get(ip)
+    return bool(entry) and _bypass_active(entry, time.time())
+
+
+def get_throttle_bypass_ips() -> dict:
+    _maybe_reload()
+    now = time.time()
+    # Surface only currently-active entries (an expired one is effectively gone).
+    return {k: dict(v) for k, v in _throttle_bypass_ips.items() if _bypass_active(v, now)}
+
+
+def add_throttle_bypass(ip: str, expires_in: float = 0, note: str = "") -> tuple[bool, str]:
+    """Allowlist an IP to skip rate-limit 429s. `expires_in` is seconds from now
+    (0 = never expires). Re-adding an IP updates its expiry/note."""
+    ip = (ip or "").strip()
+    if not ip or len(ip) > 64:
+        return False, "Enter a valid IP address"
+    try:
+        expires_in = float(expires_in or 0)
+    except (TypeError, ValueError):
+        return False, "Expiry must be a number of seconds"
+    if expires_in < 0:
+        return False, "Expiry cannot be negative"
+    if ip not in _throttle_bypass_ips and len(_throttle_bypass_ips) >= config.MAX_THROTTLE_BYPASS_IPS:
+        return False, "Too many bypass IPs"
+    expires_at = time.time() + expires_in if expires_in > 0 else 0
+
+    def change():
+        _throttle_bypass_ips[ip] = {"Added": time.time(), "Expires": expires_at, "Note": str(note)[:200]}
+
+    _persist_change(change)
+    return True, "Success"
+
+
+def remove_throttle_bypass(ip: str) -> tuple[bool, str]:
+    def change():
+        _throttle_bypass_ips.pop((ip or "").strip(), None)
 
     _persist_change(change)
     return True, "Success"
@@ -723,6 +786,9 @@ def _prune_expirables():
             store.pop(key, None)
     for key in [k for k, v in _trusted_devices.items() if float(v.get("Expires", 0)) < now]:
         _trusted_devices.pop(key, None)
+    # Throttle-bypass entries with a set expiry (Expires > 0) that has lapsed.
+    for key in [k for k, v in _throttle_bypass_ips.items() if 0 < float(v.get("Expires", 0)) < now]:
+        _throttle_bypass_ips.pop(key, None)
 
 
 # --- Trusted devices --------------------------------------------------------
@@ -789,6 +855,7 @@ def _serialize_unlocked() -> dict:
         "SessionEpoch": _session_epoch,
         "Settings": {k: v["value"] for k, v in _settings.items()},
         "SettingsUpdated": {k: v["updated"] for k, v in _settings.items()},
+        "ThrottleBypassIps": {k: dict(v) for k, v in _throttle_bypass_ips.items()},
         "EndpointBlocks": {k: dict(v) for k, v in _endpoint_blocks.items()},
         "EndpointRules": {k: dict(v) for k, v in _endpoint_rules.items()},
         "HeaderRules": {k: dict(v) for k, v in _header_rules.items()},

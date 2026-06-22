@@ -1318,6 +1318,48 @@ const print = console.log;
 		return badge;
 	};
 
+	function renderThrottleBypass(d) {
+		if ("YourIP" in d) {
+			renderThrottleBypass._yourIp = d.YourIP || "";
+			setText("yourIp", d.YourIP || "—");
+		}
+		if (d.ThrottleBypassIps) renderThrottleBypass._last = d.ThrottleBypassIps;
+		const tbody = $("#bypassTable tbody");
+		if (!tbody) return;
+		const entries = Object.entries(renderThrottleBypass._last || {});
+		entries.sort((a, b) => (b[1].Added || 0) - (a[1].Added || 0));
+		setText("throttleBypassTotal", `${entries.length} IP${entries.length === 1 ? "" : "s"}`);
+		tbody.innerHTML = "";
+		if (entries.length === 0) {
+			tbody.appendChild(tr(["—", "No bypass IPs", "—", "—", ""]));
+			return;
+		}
+		for (const [ip, info] of entries) {
+			const btn = document.createElement("button");
+			btn.className = "btn btn--outline btn--sm";
+			btn.textContent = "Remove";
+			btn.addEventListener("click", () => removeThrottleBypass(ip));
+			const expires = Number(info.Expires || 0);
+			tbody.appendChild(tr([ip, info.Note || "—", tsNode(info.Added), expires > 0 ? tsNode(expires) : "never", btn]));
+		}
+	}
+
+	async function removeThrottleBypass(ip) {
+		try {
+			const res = await api("/admin/throttle/bypass/remove", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ ip }),
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(data.Message || String(res.status));
+			renderThrottleBypass({ ThrottleBypassIps: data.ThrottleBypassIps });
+			showToast(`Removed bypass for ${ip}`);
+		} catch {
+			showToast("Failed to remove bypass");
+		}
+	}
+
 	function renderEndpointBlocks(d) {
 		const tbody = $("#blocksTable tbody");
 		if (!tbody) return;
@@ -1564,6 +1606,7 @@ const print = console.log;
 			renderSettings(d);
 			renderEndpointBlocks(d);
 			renderEndpointRules(d);
+			renderThrottleBypass(d);
 			renderHeaderRules(d);
 			renderBlockedAttempts(d);
 			renderRateLimitedAttempts(d);
@@ -2013,6 +2056,37 @@ const print = console.log;
 				toggle();
 			}
 		});
+	});
+
+	// Throttle bypass: add an allowlisted IP (optional expiry in minutes)
+	$("#bypassForm")?.addEventListener("submit", async e => {
+		e.preventDefault();
+		const ip = $("#bypassIp")?.value.trim();
+		const minutes = Number($("#bypassExpiry")?.value);
+		const note = $("#bypassNote")?.value.trim() || "";
+		if (!ip) return;
+		const body = { ip, note };
+		if (minutes >= 1) body.expires_in = Math.round(minutes * 60);
+		try {
+			const res = await api("/admin/throttle/bypass", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(data.Message || String(res.status));
+			renderThrottleBypass({ ThrottleBypassIps: data.ThrottleBypassIps });
+			$("#bypassIp").value = "";
+			$("#bypassExpiry").value = "";
+			$("#bypassNote").value = "";
+			showToast(`Bypass added for ${ip}`);
+		} catch (err) {
+			showToast("Add bypass failed: " + err.message);
+		}
+	});
+	$("#bypassMyIp")?.addEventListener("click", () => {
+		const ipInput = $("#bypassIp");
+		if (ipInput && renderThrottleBypass._yourIp) ipInput.value = renderThrottleBypass._yourIp;
 	});
 
 	// Endpoint controls: block

@@ -118,6 +118,7 @@ MAX_ENDPOINT_BLOCKS = 200  # How many distinct blocked-endpoint patterns to keep
 MAX_ENDPOINT_RULES = 200  # How many distinct per-endpoint rate rules to keep.
 DEFAULT_ENDPOINT_RULE_PERIOD = 60  # In seconds, default window for a per-endpoint per-IP rate rule.
 MAX_HEADER_RULES = 100  # How many distinct header-block rules to keep.
+MAX_THROTTLE_BYPASS_IPS = 100  # How many IPs may be on the throttle-bypass allowlist.
 
 # --- Error log + request fingerprints (kept until the admin clears them) ---
 # Generous caps that act only as an out-of-memory guard against an attacker

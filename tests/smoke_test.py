@@ -1180,6 +1180,44 @@ for p in procs:
 mp_total = lockfile_module.LockedJSON(lambda: mp_file).read().get("n", 0)
 check("5 processes x 200 increments == 1000 (inter-process flock loses nothing)", mp_total == 1000, mp_total)
 
+print("== Throttle-bypass allowlist (skip 429s for spam testing) ==")
+import runtime as runtime_module
+
+proxy_module.requests.request = fake_upstream
+set_method_weights(0, 100, 0)
+proxy_module.set_tokens(["BYPASS_TOKEN"])
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 3, "throttle_reset_duration": 300}})
+# Control: a normal IP is throttled once it passes the limit.
+IP_CTRL = {"X-Forwarded-For": "10.80.0.1"}
+ctrl = [api_client.get(f"/games.roblox.com/v1/np{i}", headers=IP_CTRL).status_code for i in range(6)]
+check("Without bypass, an IP is throttled past the limit", 429 in ctrl, ctrl)
+# Add a bypass; that IP can now blow past the limit with no 429.
+r = client.post("/admin/throttle/bypass", headers=IP_MAIN, json={"ip": "10.80.0.2", "note": "spam test"})
+check("Add bypass -> 200", r.status_code == 200, r.data[:80])
+check("Bypass IP appears in the returned list", "10.80.0.2" in r.get_json().get("ThrottleBypassIps", {}), r.get_json())
+IP_BYP = {"X-Forwarded-For": "10.80.0.2"}
+byp = [api_client.get(f"/games.roblox.com/v1/by{i}", headers=IP_BYP).status_code for i in range(12)]
+check("Bypassed IP never gets a 429 (spam allowed)", all(s == 200 for s in byp), byp)
+diag = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+check("Diagnostics lists the bypass IP", "10.80.0.2" in diag.get("ThrottleBypassIps", {}), diag.get("ThrottleBypassIps"))
+check("Diagnostics reports the requester's own IP (for one-click add)", bool(diag.get("YourIP")), diag.get("YourIP"))
+# Remove it -> throttling resumes for that IP.
+r = client.post("/admin/throttle/bypass/remove", headers=IP_MAIN, json={"ip": "10.80.0.2"})
+check("Remove bypass -> 200", r.status_code == 200, r.status_code)
+check("Bypass removed from the list", "10.80.0.2" not in r.get_json().get("ThrottleBypassIps", {}), r.get_json())
+after = [api_client.get(f"/games.roblox.com/v1/ar{i}", headers=IP_BYP).status_code for i in range(6)]
+check("After removal, the IP is throttled again", 429 in after, after)
+# Optional expiry: a set expiry that has passed deactivates the bypass on its own.
+runtime_module.add_throttle_bypass("10.80.0.3", expires_in=0.05, note="temp")
+check("Bypass is active before its expiry", runtime_module.is_throttle_bypassed("10.80.0.3") is True)
+time.sleep(0.12)
+check("Bypass auto-expires after its expiry", runtime_module.is_throttle_bypassed("10.80.0.3") is False)
+check("Expired bypass is hidden from the list", "10.80.0.3" not in runtime_module.get_throttle_bypass_ips())
+runtime_module.remove_throttle_bypass("10.80.0.3")
+check("Bypass with no expiry never expires", (runtime_module.add_throttle_bypass("10.80.0.4"), runtime_module.is_throttle_bypassed("10.80.0.4"))[1] is True)
+runtime_module.remove_throttle_bypass("10.80.0.4")
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 100000, "throttle_reset_duration": 50}})
+
 print("== Login lockout + email de-dup are shared across workers ==")
 throttle_module.reset_login_failures("10.71.0.1")
 for _ in range(config.MAX_LOGIN_FAILURES):

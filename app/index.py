@@ -302,6 +302,8 @@ def admin_diagnostics():
     data["EndpointBlocks"] = runtime.get_endpoint_blocks()
     data["EndpointRules"] = runtime.get_endpoint_rules()
     data["HeaderRules"] = runtime.get_header_rules()
+    data["ThrottleBypassIps"] = runtime.get_throttle_bypass_ips()
+    data["YourIP"] = get_client_ip()  # so the admin can one-click bypass their own IP for testing
     data["ThrottleAll"] = runtime.get_throttle_all_state()
     # Token budget for the dashboard, sourced from the shared routing state that
     # get_diagnostics already fetched (no extra file read).
@@ -472,6 +474,30 @@ def admin_clear_data():
 def admin_clear_probes():
     diagnostics.clear_stats(diagnostics.CLEAR_TARGETS["probes"])
     return jsonify("Probe records cleared"), 200
+
+
+@app.route("/admin/throttle/bypass", methods=["POST"], endpoint="admin_add_throttle_bypass")
+@requires_admin
+def admin_add_throttle_bypass():
+    data = get_json_dict()
+    if data is None or not str(data.get("ip", "")).strip():
+        return jsonify({"Message": "Missing IP"}), 400
+    ok, message = runtime.add_throttle_bypass(
+        str(data["ip"]), data.get("expires_in", 0), str(data.get("note", ""))
+    )
+    status = 200 if ok else 400
+    return jsonify({"Message": message, "ThrottleBypassIps": runtime.get_throttle_bypass_ips()}), status
+
+
+@app.route("/admin/throttle/bypass/remove", methods=["POST"], endpoint="admin_remove_throttle_bypass")
+@requires_admin
+def admin_remove_throttle_bypass():
+    data = get_json_dict()
+    if data is None or not str(data.get("ip", "")).strip():
+        return jsonify({"Message": "Missing IP"}), 400
+    ok, message = runtime.remove_throttle_bypass(str(data["ip"]))
+    status = 200 if ok else 400
+    return jsonify({"Message": message, "ThrottleBypassIps": runtime.get_throttle_bypass_ips()}), status
 
 
 @app.route("/admin/endpoints/block", methods=["POST"], endpoint="admin_block_endpoint")
@@ -731,18 +757,24 @@ def proxy_page(dst: str):
         resp = jsonify(runtime.pause_message())
         return _with_throttle_headers(resp, ip, Roxy_Paused="True"), 503
 
+    # Throttle-bypass allowlist: an admin-listed IP skips the rate-limit 429s
+    # (per-IP throttle, throttle-all, per-endpoint rate rules) for load/spam
+    # testing. It does NOT bypass pause, endpoint blocks, header rules, or the
+    # Token safety budget — so the real routing behavior is still exercised.
+    bypass = runtime.is_throttle_bypassed(ip)
+
     # Global throttle-all: a softer alternative to a full pause. Every IP is
     # rate-limited to a configurable N requests per P seconds; requests within
     # that budget proceed normally (still subject to the regular per-IP and
     # per-endpoint limits), the rest get a friendly 429.
-    if runtime.is_throttle_all():
+    if not bypass and runtime.is_throttle_all():
         allowed, retry_in = throttle.check_global_throttle(ip)
         if not allowed:
             diagnostics.log_throttle_all_drop()
             resp = jsonify(runtime.throttle_all_message())
             return _with_throttle_headers(resp, ip, Roxy_Throttle_Reset=retry_in, Roxy_Global_Throttled="True"), 429
 
-    if throttle.is_throttled(ip):
+    if not bypass and throttle.is_throttled(ip):
         return throttled_response(ip)
 
     if dst in path_ignore_set:
@@ -783,17 +815,19 @@ def proxy_page(dst: str):
         resp = jsonify("This endpoint is currently blocked.")
         return _with_throttle_headers(resp, ip, Roxy_Blocked="True"), 403
 
-    endpoint_allowed, endpoint_retry, endpoint_pattern = throttle.check_endpoint_limit(ip, dst)
-    if not endpoint_allowed:
-        diagnostics.log_rate_limited_endpoint(dst, request.method, ip, endpoint_pattern)
-        resp = jsonify(f"This endpoint is rate-limited for you; try again in {endpoint_retry} seconds.")
-        resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
-        resp.headers["Roxy-Throttle-Reset"] = endpoint_retry
-        resp.headers["Roxy-Throttled"] = "True"
-        resp.headers["Roxy-Endpoint-Limited"] = "True"
-        return resp, 429
-
-    throttle.update_throttling(ip, made_request=True)
+    if not bypass:
+        endpoint_allowed, endpoint_retry, endpoint_pattern = throttle.check_endpoint_limit(ip, dst)
+        if not endpoint_allowed:
+            diagnostics.log_rate_limited_endpoint(dst, request.method, ip, endpoint_pattern)
+            resp = jsonify(f"This endpoint is rate-limited for you; try again in {endpoint_retry} seconds.")
+            resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
+            resp.headers["Roxy-Throttle-Reset"] = endpoint_retry
+            resp.headers["Roxy-Throttled"] = "True"
+            resp.headers["Roxy-Endpoint-Limited"] = "True"
+            return resp, 429
+        # Count the request toward the per-IP limit (skipped for bypass IPs so
+        # their spam testing doesn't mark them throttled in the dashboard).
+        throttle.update_throttling(ip, made_request=True)
     safe_headers = sanitize_headers(request.headers)
     safe_headers_json = json.dumps(safe_headers)
     diagnostics.log_endpoint(dst, request.method, safe_headers_json, ip)
