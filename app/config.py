@@ -50,6 +50,18 @@ AUTOSAVE_INTERVAL = 30 if not DEBUG else 5  # In seconds, how often to flush sta
 # without thrashing the big data file. Separate from DATA_FILE on purpose.
 ROUTING_FILE = os.environ.get("ROXY_ROUTING_FILE", "/etc/roxy/roxy_routing.json")
 
+# Shared per-IP throttle state (per-IP request counts, per-endpoint + global
+# rate-limit buckets, and login-failure windows), so all gunicorn workers enforce
+# ONE shared limit instead of N workers each allowing the full quota. Also small,
+# high-frequency, and flock-guarded — kept separate from DATA_FILE/ROUTING_FILE.
+THROTTLE_FILE = os.environ.get("ROXY_THROTTLE_FILE", "/etc/roxy/roxy_throttle.json")
+# Tiny shared file for cross-worker singletons that aren't per-request (e.g. email
+# send de-duplication, so 4 workers don't each send the same alert).
+COORD_FILE = os.environ.get("ROXY_COORD_FILE", "/etc/roxy/roxy_coord.json")
+# Hard cap on distinct IPs tracked in the throttle file so a spoofed-IP flood
+# can't bloat it; the oldest (least-recently-seen) entry is evicted past this.
+MAX_TRACKED_THROTTLE_IPS = 20000
+
 # --- Upstream method routing (RoProxy / Token / Rotate) ---
 # A request picks one method by weighted random among those currently available.
 # Base weights (percent-ish; they're normalized): RoProxy 10, Token 70, Rotate 20.

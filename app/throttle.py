@@ -1,76 +1,90 @@
+"""Per-IP request throttling — shared across ALL gunicorn workers.
+
+Every counter here (per-IP request counts, per-endpoint and global rate-limit
+buckets, and admin login-failure windows) lives in a single flock-guarded file,
+NOT in per-worker memory. With N workers, per-worker memory would let an IP make
+N x the configured limit (each worker counting only the requests it happened to
+handle). Backing the counters with one shared file means the 4 workers enforce a
+single, correct limit.
+
+Reads that only feed response headers / gate decisions use a lock-free snapshot
+(atomic writes make torn reads impossible). The authoritative increments use a
+flock'd read-modify-write. Runtime settings are read BEFORE taking the lock so the
+critical section never does nested file I/O.
+"""
+
 import config
 import diagnostics
 import runtime
 import time
-from threading import Lock, Thread
+from threading import Thread
 
-# Guards every read-modify-write of the dicts below; request threads and the
-# cleanup loop touch them concurrently.
-_lock = Lock()
+from lockfile import LockedJSON
 
-throttled_ips = dict(
-    {
-        # [IP]: {Requests: int, Throttled: bool, ThrottleResetTime: float, LastRequestTime: float},
-    }
-)
+# The shared store. Keys: "Ips", "Endpoint", "Global", "Login" (see module docs).
+_store = LockedJSON(lambda: config.THROTTLE_FILE)
 
-# Per-(IP, endpoint) rate limiting for endpoints that have a runtime rule set.
-endpoint_buckets = dict(
-    {
-        # "ip|pattern": {Count: int, ResetTime: float},
-    }
-)
-
-# Per-IP buckets for the global throttle-all mode (limit/period are configurable).
-global_buckets = dict(
-    {
-        # ip: {Count: int, ResetTime: float},
-    }
-)
-
-# Failed admin-login attempts per IP (credentials or 2FA), for temporary lockout.
-login_failures = dict(
-    {
-        # [IP]: {Count: int, WindowStart: float},
-    }
-)
 MAX_TRACKED_LOGIN_IPS = 10000  # Hard cap so a spoofed-IP flood can't grow this unbounded.
 
 
+def _ip_entry(ip: str):
+    return _store.read().get("Ips", {}).get(ip)
+
+
 def is_throttled(ip: str) -> bool:
-    with _lock:
-        throttled_ip = throttled_ips.get(ip, None)
-        return bool(throttled_ip and throttled_ip["Throttled"])
+    entry = _ip_entry(ip)
+    if not entry:
+        return False
+    # Self-expiring: once the reset time passes the IP is no longer throttled,
+    # even if no request has come in to clear the flag yet.
+    return bool(entry.get("Throttled")) and time.time() < float(entry.get("ThrottleResetTime", 0))
 
 
 def get_requests_left(ip: str) -> int:
     allowed = runtime.get_setting("allowed_requests_per_minute", config.ALLOWED_REQUESTS_PER_MINUTE)
-    with _lock:
-        throttled_ip = throttled_ips.get(ip, None)
-        if throttled_ip:
-            return max(0, allowed - throttled_ip["Requests"])
-        return allowed
+    entry = _ip_entry(ip)
+    if entry:
+        return max(0, allowed - int(entry.get("Requests", 0)))
+    return allowed
 
 
 def get_throttle_reset_time_left(ip: str) -> int:
-    with _lock:
-        throttled_ip = throttled_ips.get(ip, None)
-        if throttled_ip:
-            return int(max(0, throttled_ip["ThrottleResetTime"] - time.time()))
-        return 0
+    entry = _ip_entry(ip)
+    if entry:
+        return int(max(0, float(entry.get("ThrottleResetTime", 0)) - time.time()))
+    return 0
+
+
+def headers_snapshot(ip: str) -> dict:
+    """All three throttle header values from ONE read (used on every response)."""
+    allowed = runtime.get_setting("allowed_requests_per_minute", config.ALLOWED_REQUESTS_PER_MINUTE)
+    now = time.time()
+    entry = _ip_entry(ip)
+    if not entry:
+        return {"RequestsLeft": allowed, "ResetIn": 0, "Throttled": False}
+    return {
+        "RequestsLeft": max(0, allowed - int(entry.get("Requests", 0))),
+        "ResetIn": int(max(0, float(entry.get("ThrottleResetTime", 0)) - now)),
+        "Throttled": bool(entry.get("Throttled")) and now < float(entry.get("ThrottleResetTime", 0)),
+    }
 
 
 def reset_throttle(ip: str):
     duration = runtime.get_setting("throttle_reset_duration", config.THROTTLE_RESET_DURATION)
-    with _lock:
-        if ip in throttled_ips:
-            throttled_ips[ip]["Throttled"] = False
-            throttled_ips[ip]["Requests"] = 0
-            throttled_ips[ip]["ThrottleResetTime"] = time.time() + duration
+    now = time.time()
+
+    def mutate(data):
+        entry = data.setdefault("Ips", {}).get(ip)
+        if entry:
+            entry["Throttled"] = 0
+            entry["Requests"] = 0
+            entry["ThrottleResetTime"] = now + duration
+
+    _store.update(mutate)
 
 
 def check_global_throttle(ip: str) -> tuple[bool, int]:
-    """Enforce the global throttle-all rate limit for one IP.
+    """Enforce the global throttle-all rate limit for one IP (shared across workers).
 
     Each IP may make `global_throttle_limit` requests per `global_throttle_period`
     seconds (both admin-configurable). Counts the request when allowed.
@@ -79,27 +93,30 @@ def check_global_throttle(ip: str) -> tuple[bool, int]:
     limit = int(runtime.get_setting("global_throttle_limit", config.GLOBAL_THROTTLE_LIMIT))
     period = int(runtime.get_setting("global_throttle_period", config.GLOBAL_THROTTLE_PERIOD))
     now = time.time()
-    with _lock:
-        bucket = global_buckets.get(ip)
+
+    def mutate(data):
+        buckets = data.setdefault("Global", {})
+        bucket = buckets.get(ip)
         if not bucket or now > bucket["ResetTime"]:
             bucket = dict(Count=0, ResetTime=now + period)
-            global_buckets[ip] = bucket
+            buckets[ip] = bucket
         if bucket["Count"] >= limit:
-            return False, int(max(0, bucket["ResetTime"] - now))
+            return (False, int(max(0, bucket["ResetTime"] - now)))
         bucket["Count"] += 1
-    return True, 0
+        _cap_buckets(buckets)
+        return (True, 0)
+
+    return _store.update(mutate)
 
 
 def check_endpoint_limit(ip: str, path: str) -> tuple[bool, int, str | None]:
-    """Enforce a per-(IP, endpoint) rate rule, if one matches the path.
+    """Enforce a per-(IP, endpoint) rate rule, if one matches the path (shared).
 
     Counts the request when allowed. Returns (allowed, seconds_until_reset, pattern).
-    `pattern` is the matched rule pattern (or None when no rule applies), so the
-    caller can record which rule rejected the request.
-    The effective limit is clamped to the global per-IP limit, so an endpoint
-    rule can only ever make access MORE restrictive — never bypass the max.
+    The effective limit is clamped to the global per-IP limit, so an endpoint rule
+    can only ever make access MORE restrictive — never bypass the max.
     """
-    rule = runtime.match_endpoint_rule(path)
+    rule = runtime.match_endpoint_rule(path)  # resolved before the lock (no nested I/O)
     if not rule:
         return True, 0, None
     pattern = rule["Pattern"]
@@ -108,18 +125,29 @@ def check_endpoint_limit(ip: str, path: str) -> tuple[bool, int, str | None]:
     global_allowed = runtime.get_setting("allowed_requests_per_minute", config.ALLOWED_REQUESTS_PER_MINUTE)
     if global_allowed:
         limit = min(limit, global_allowed)
-
     now = time.time()
     key = f"{ip}|{pattern}"
-    with _lock:
-        bucket = endpoint_buckets.get(key)
+
+    def mutate(data):
+        buckets = data.setdefault("Endpoint", {})
+        bucket = buckets.get(key)
         if not bucket or now > bucket["ResetTime"]:
             bucket = dict(Count=0, ResetTime=now + period)
-            endpoint_buckets[key] = bucket
+            buckets[key] = bucket
         if bucket["Count"] >= limit:
-            return False, int(max(0, bucket["ResetTime"] - now)), pattern
+            return (False, int(max(0, bucket["ResetTime"] - now)), pattern)
         bucket["Count"] += 1
-    return True, 0, pattern
+        _cap_buckets(buckets)
+        return (True, 0, pattern)
+
+    return _store.update(mutate)
+
+
+def _cap_buckets(buckets: dict):
+    """Bound a bucket dict so a spoofed-IP flood can't grow the file unbounded."""
+    if len(buckets) > config.MAX_TRACKED_THROTTLE_IPS:
+        oldest = min(buckets.items(), key=lambda kv: kv[1].get("ResetTime", 0))[0]
+        buckets.pop(oldest, None)
 
 
 def update_throttling(ip, made_request: bool = False):
@@ -127,107 +155,120 @@ def update_throttling(ip, made_request: bool = False):
     allowed = runtime.get_setting("allowed_requests_per_minute", config.ALLOWED_REQUESTS_PER_MINUTE)
     throttle_reset_duration = runtime.get_setting("throttle_reset_duration", config.THROTTLE_RESET_DURATION)
     stale_ip_duration = runtime.get_setting("stale_ip_duration", config.STALE_IP_DURATION)
-    just_throttled = False
-    with _lock:
-        throttled_ip = throttled_ips.get(ip, None)
-        if throttled_ip:
-            if throttled_ip["Throttled"]:
-                if now > throttled_ip["ThrottleResetTime"]:
-                    throttled_ip["Throttled"] = False
-                    throttled_ip["Requests"] = 0
-                    throttled_ip["ThrottleResetTime"] = now + throttle_reset_duration
-                else:
-                    return
-            if now > throttled_ip["LastRequestTime"] + stale_ip_duration:
-                throttled_ips.pop(ip, None)
-                if not made_request:
-                    return
-                throttled_ip = None  # Stale entry dropped; fall through and recreate below.
 
-        if throttled_ip:
-            if now > throttled_ip["ThrottleResetTime"]:
-                throttled_ip["Throttled"] = False
-                throttled_ip["Requests"] = 0
-                throttled_ip["ThrottleResetTime"] = now + throttle_reset_duration
+    def mutate(data):
+        ips = data.setdefault("Ips", {})
+        entry = ips.get(ip)
+        if entry:
+            if entry.get("Throttled"):
+                if now > entry["ThrottleResetTime"]:
+                    entry["Throttled"] = 0
+                    entry["Requests"] = 0
+                    entry["ThrottleResetTime"] = now + throttle_reset_duration
+                else:
+                    return False  # still throttled; nothing to count
+            if now > entry["LastRequestTime"] + stale_ip_duration:
+                ips.pop(ip, None)
+                if not made_request:
+                    return False
+                entry = None  # stale entry dropped; recreate below
+        if entry:
+            if now > entry["ThrottleResetTime"]:
+                entry["Throttled"] = 0
+                entry["Requests"] = 0
+                entry["ThrottleResetTime"] = now + throttle_reset_duration
             if made_request:
-                throttled_ip["Requests"] += 1
-                throttled_ip["ThrottleResetTime"] += 1
-                throttled_ip["LastRequestTime"] = now
-            if throttled_ip["Requests"] > allowed:
-                throttled_ip["Throttled"] = True
-                just_throttled = True
+                entry["Requests"] += 1
+                entry["ThrottleResetTime"] += 1
+                entry["LastRequestTime"] = now
+            if entry["Requests"] > allowed:
+                entry["Throttled"] = 1
+                return True  # just throttled
         else:
-            throttled_ips[ip] = dict(
+            if len(ips) >= config.MAX_TRACKED_THROTTLE_IPS:
+                oldest = min(ips.items(), key=lambda kv: kv[1].get("LastRequestTime", 0))[0]
+                ips.pop(oldest, None)
+            ips[ip] = dict(
                 Requests=1 if made_request else 0,
-                Throttled=False,
+                Throttled=0,
                 LastRequestTime=now,
                 ThrottleResetTime=now + throttle_reset_duration,
             )
-    # Log outside the lock; diagnostics takes its own lock.
+        return False
+
+    just_throttled = _store.update(mutate)
+    # Log outside the lock; diagnostics takes its own lock + flushes to a different file.
     if just_throttled:
         diagnostics.log_throttle(ip)
 
 
-# --- Admin login lockout ------------------------------------------------------
-# Tracked per worker (not shared): with N workers an attacker gets at most
-# N * MAX_LOGIN_FAILURES tries per window, which is still a handful.
+# --- Admin login lockout (now shared across workers too) ----------------------
 def register_login_failure(ip: str):
     now = time.time()
-    with _lock:
-        entry = login_failures.get(ip)
+
+    def mutate(data):
+        failures = data.setdefault("Login", {})
+        entry = failures.get(ip)
         if not entry or now - entry["WindowStart"] > config.LOGIN_FAILURE_WINDOW:
-            if len(login_failures) >= MAX_TRACKED_LOGIN_IPS:
-                oldest = min(login_failures.items(), key=lambda kv: kv[1]["WindowStart"])[0]
-                login_failures.pop(oldest, None)
-            login_failures[ip] = dict(Count=1, WindowStart=now)
+            if len(failures) >= MAX_TRACKED_LOGIN_IPS:
+                oldest = min(failures.items(), key=lambda kv: kv[1]["WindowStart"])[0]
+                failures.pop(oldest, None)
+            failures[ip] = dict(Count=1, WindowStart=now)
         else:
             entry["Count"] += 1
+
+    _store.update(mutate)
 
 
 def is_login_blocked(ip: str) -> tuple[bool, int]:
     """Whether this IP has burned its login attempts. Returns (blocked, seconds_until_retry)."""
     now = time.time()
-    with _lock:
-        entry = login_failures.get(ip)
-        if not entry:
-            return False, 0
-        if now - entry["WindowStart"] > config.LOGIN_FAILURE_WINDOW:
-            login_failures.pop(ip, None)
-            return False, 0
-        if entry["Count"] >= config.MAX_LOGIN_FAILURES:
-            return True, int(max(1, entry["WindowStart"] + config.LOGIN_FAILURE_WINDOW - now))
+    entry = _store.read().get("Login", {}).get(ip)
+    if not entry:
         return False, 0
+    if now - entry["WindowStart"] > config.LOGIN_FAILURE_WINDOW:
+        return False, 0  # expired; the cleanup loop will drop it
+    if entry["Count"] >= config.MAX_LOGIN_FAILURES:
+        return True, int(max(1, entry["WindowStart"] + config.LOGIN_FAILURE_WINDOW - now))
+    return False, 0
 
 
 def reset_login_failures(ip: str):
-    with _lock:
-        login_failures.pop(ip, None)
+    _store.update(lambda data: data.get("Login", {}).pop(ip, None))
 
 
 # --- Cleanup loop ---------------------------------------------------------------
+# One flock'd pass that prunes stale/expired entries so the shared file stays
+# small. Expiry of the throttle itself is lazy (handled on read/next request), so
+# this loop is only about bounding memory — it can run infrequently.
+def _prune_once():
+    stale_ip_duration = runtime.get_setting("stale_ip_duration", config.STALE_IP_DURATION)
+    now = time.time()
+
+    def mutate(data):
+        ips = data.get("Ips", {})
+        for ip in [i for i, e in ips.items() if now > e.get("LastRequestTime", 0) + stale_ip_duration]:
+            ips.pop(ip, None)
+        endpoint = data.get("Endpoint", {})
+        for key in [k for k, b in endpoint.items() if now > b.get("ResetTime", 0) + 60]:
+            endpoint.pop(key, None)
+        glob = data.get("Global", {})
+        for ip in [i for i, b in glob.items() if now > b.get("ResetTime", 0) + 60]:
+            glob.pop(ip, None)
+        login = data.get("Login", {})
+        for ip in [i for i, e in login.items() if now - e.get("WindowStart", 0) > config.LOGIN_FAILURE_WINDOW]:
+            login.pop(ip, None)
+
+    _store.update(mutate)
+
+
 def run_throttle_loop():
     while True:
+        time.sleep(30)  # Infrequent: expiry is lazy; this only bounds file size.
         try:
-            with _lock:
-                ips = list(throttled_ips.keys())
-            for ip in ips:
-                update_throttling(ip)
-            now = time.time()
-            with _lock:
-                # Drop expired per-endpoint buckets so memory doesn't grow unbounded.
-                for key in [k for k, b in endpoint_buckets.items() if now > b["ResetTime"] + 60]:
-                    endpoint_buckets.pop(key, None)
-                # Drop expired global-throttle buckets too.
-                for key in [k for k, b in global_buckets.items() if now > b["ResetTime"] + 60]:
-                    global_buckets.pop(key, None)
-                # Drop login-failure windows that have lapsed.
-                for ip in [
-                    i for i, e in login_failures.items() if now - e["WindowStart"] > config.LOGIN_FAILURE_WINDOW
-                ]:
-                    login_failures.pop(ip, None)
+            _prune_once()
         except Exception:
             pass  # The cleanup loop must never die.
-        time.sleep(1)
 
 
 Thread(target=run_throttle_loop, daemon=True).start()

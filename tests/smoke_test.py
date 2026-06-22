@@ -22,6 +22,8 @@ sandbox = tempfile.mkdtemp(prefix="roxy_test_")
 os.environ["ROXY_FILE_ROOT"] = sandbox
 os.environ["ROXY_DATA_FILE"] = os.path.join(sandbox, "roxy_data.json")
 os.environ["ROXY_ROUTING_FILE"] = os.path.join(sandbox, "roxy_routing.json")
+os.environ["ROXY_THROTTLE_FILE"] = os.path.join(sandbox, "roxy_throttle.json")
+os.environ["ROXY_COORD_FILE"] = os.path.join(sandbox, "roxy_coord.json")
 # Rotation proxy points at a sandbox file that doesn't exist yet → rotation is
 # disabled until a test writes it.
 ROTATE_PROXY_PATH = os.path.join(sandbox, "rotate_proxy.txt")
@@ -1138,6 +1140,60 @@ set_method_weights(0, 100, 0)
 reset_routing()
 proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
 
+print("== Per-IP throttle is shared across workers (one limit, no Nx bypass) ==")
+import throttle as throttle_module
+import lockfile as lockfile_module
+
+proxy_module.requests.request = fake_upstream
+set_method_weights(0, 100, 0)
+proxy_module.set_tokens(["THR_TOKEN"])
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 3, "throttle_reset_duration": 300}})
+IP_THR = {"X-Forwarded-For": "10.70.0.1"}
+statuses = [api_client.get(f"/games.roblox.com/v1/thr{i}", headers=IP_THR).status_code for i in range(6)]
+check("Over the shared per-IP limit returns 429", statuses[-1] == 429, statuses)
+# A SECOND worker (independent store object on the SAME file) sees the same count
+# — proving the limit lives in shared state, not per-worker memory.
+worker_b = lockfile_module.LockedJSON(lambda: config.THROTTLE_FILE)
+entry_b = worker_b.read().get("Ips", {}).get("10.70.0.1", {})
+check("Per-IP count lives in the shared file (worker B sees it)", entry_b.get("Requests", 0) >= 4, entry_b)
+check("Worker B sees the IP as throttled (no Nx bypass)", bool(entry_b.get("Throttled")), entry_b)
+check("throttle.is_throttled reads the shared state", throttle_module.is_throttled("10.70.0.1") is True)
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 100000, "throttle_reset_duration": 50}})
+
+# The real multi-worker scenario: separate OS PROCESSES (like gunicorn workers)
+# hammering one shared file. The in-process test above is serialized by the
+# per-process lock, so this is what actually exercises the inter-process flock.
+import subprocess
+
+mp_file = os.path.join(sandbox, "mp_counter.json")
+app_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app")
+worker_code = (
+    f"import sys; sys.path.insert(0, {app_dir!r})\n"
+    "from lockfile import LockedJSON\n"
+    f"store = LockedJSON(lambda: {mp_file!r})\n"
+    "for _ in range(200):\n"
+    "    store.update(lambda d: d.__setitem__('n', d.get('n', 0) + 1))\n"
+)
+procs = [subprocess.Popen([sys.executable, "-c", worker_code]) for _ in range(5)]
+for p in procs:
+    p.wait()
+mp_total = lockfile_module.LockedJSON(lambda: mp_file).read().get("n", 0)
+check("5 processes x 200 increments == 1000 (inter-process flock loses nothing)", mp_total == 1000, mp_total)
+
+print("== Login lockout + email de-dup are shared across workers ==")
+throttle_module.reset_login_failures("10.71.0.1")
+for _ in range(config.MAX_LOGIN_FAILURES):
+    throttle_module.register_login_failure("10.71.0.1")
+login_b = worker_b.read().get("Login", {}).get("10.71.0.1", {})
+check("Login failures recorded in the shared file", login_b.get("Count", 0) >= config.MAX_LOGIN_FAILURES, login_b)
+check("Lockout is enforced from shared state", throttle_module.is_login_blocked("10.71.0.1")[0] is True)
+throttle_module.reset_login_failures("10.71.0.1")
+# Email gate: the first call reserves the slot, a second within the cooldown is denied.
+check("First email send is allowed", proxy_module._email_allowed("smoketest_email", 100) is True)
+check("Duplicate email within cooldown is suppressed (shared gate)", proxy_module._email_allowed("smoketest_email", 100) is False)
+coord_b = lockfile_module.LockedJSON(lambda: config.COORD_FILE)
+check("Email gate timestamp lives in the shared coord file", float(coord_b.read().get("EmailGate", {}).get("smoketest_email", 0)) > 0)
+
 print("== Emailed invalidation link (kill switch) ==")
 invalidate_emails = emails_with("Roxy Admin Login")
 link_token = invalidate_emails[-1]["body"].split("/admin/invalidate/")[-1].strip().splitlines()[0]
@@ -1155,7 +1211,8 @@ r = client.post("/admin", headers=IP_BRUTE, json={"IsLogin": True, "Username": A
 check("Locked out after repeated failures -> 429", r.status_code == 429, r.status_code)
 
 print("== Error emails still work for real 500s (rate-limited) ==")
-proxy_module.error_email_last_sent = 0  # Clear any cooldown left by earlier error-log tests.
+# Reset the SHARED (cross-worker) email gate left by earlier error-log tests.
+proxy_module._coord.update(lambda d: d.get("EmailGate", {}).clear())
 before = len(emails_with("Roxy Error"))
 r = client.get("/_boom_test_only", headers=IP_MAIN)
 check("Real exception -> 500", r.status_code == 500, r.status_code)
@@ -1188,6 +1245,32 @@ for t in threads:
 for t in threads:
     t.join()
 check("400 concurrent requests raised no exceptions", not hammer_errors, hammer_errors[:3])
+
+# Lost-update check: many threads incrementing the SAME shared counter must land
+# EXACTLY the right total (proves the flock read-modify-write loses nothing).
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 1000000, "throttle_reset_duration": 600}})
+HAMMER_IP = "10.99.0.1"
+throttle_module._store.update(lambda d: d.get("Ips", {}).pop(HAMMER_IP, None))
+INC_THREADS, INC_EACH = 8, 50
+
+
+def count_hammer():
+    for _ in range(INC_EACH):
+        throttle_module.update_throttling(HAMMER_IP, made_request=True)
+
+
+inc_threads = [threading.Thread(target=count_hammer) for _ in range(INC_THREADS)]
+for t in inc_threads:
+    t.start()
+for t in inc_threads:
+    t.join()
+final = lockfile_module.LockedJSON(lambda: config.THROTTLE_FILE).read().get("Ips", {}).get(HAMMER_IP, {})
+check(
+    "Concurrent counter increments lose nothing (no write race)",
+    final.get("Requests") == INC_THREADS * INC_EACH,
+    (final.get("Requests"), INC_THREADS * INC_EACH),
+)
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 100000, "throttle_reset_duration": 50}})
 
 # Log back in (the kill switch above ended the old session) and confirm the app is still healthy.
 r = client.post("/admin", headers=IP_MAIN, json={"IsLogin": True, "Username": ADMIN_USER, "Password": ADMIN_PASS})

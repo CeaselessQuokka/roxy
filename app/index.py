@@ -698,9 +698,11 @@ def log_live_request(ip, user_agent, method, url, headers, body, status_code):
 
 
 def _with_throttle_headers(resp, ip: str, **extra):
-    resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
-    resp.headers["Roxy-Throttle-Reset"] = throttle.get_throttle_reset_time_left(ip)
-    resp.headers["Roxy-Throttled"] = str(throttle.is_throttled(ip))
+    # One shared-store read for all three header values (cheaper than three).
+    snap = throttle.headers_snapshot(ip)
+    resp.headers["Roxy-Requests-Left"] = snap["RequestsLeft"]
+    resp.headers["Roxy-Throttle-Reset"] = snap["ResetIn"]
+    resp.headers["Roxy-Throttled"] = str(snap["Throttled"])
     for key, value in extra.items():
         resp.headers[key.replace("_", "-")] = value
     return resp

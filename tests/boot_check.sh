@@ -14,6 +14,8 @@ printf 'a@x.com\nb@x.com\n' > "$SANDBOX/emails.txt"
 
 cd app
 ROXY_FILE_ROOT="$SANDBOX" ROXY_DATA_FILE="$SANDBOX/data.json" \
+	ROXY_ROUTING_FILE="$SANDBOX/routing.json" ROXY_THROTTLE_FILE="$SANDBOX/throttle.json" \
+	ROXY_COORD_FILE="$SANDBOX/coord.json" \
 	../env2/bin/python -c "import index; index.app.run(port=5099)" > /tmp/roxy_boot.log 2>&1 &
 SERVER_PID=$!
 sleep 3

@@ -31,15 +31,35 @@ import runtime
 import time
 from threading import Lock
 
+from lockfile import LockedJSON
+
 # Token list is loaded from the token file and reloaded across workers when the
 # file changes (so a dashboard token update reaches every worker).
 _tokens_lock = Lock()
 tokens = auth.read_tokens()
 _tokens_mtime = auth.tokens_mtime()
 
-email_last_sent = 0
-error_email_last_sent = 0
-all_throttled_email_last_sent = 0
+# Email send de-duplication, SHARED across workers: without this, 4 workers all
+# hitting the same error would each send the "rate-limited" alert, so the admin
+# gets 4x the email. The shared coordination file keeps one last-sent timestamp
+# per alert key, so a cooldown applies fleet-wide, not per worker.
+_coord = LockedJSON(lambda: config.COORD_FILE)
+
+
+def _email_allowed(key: str, cooldown: float) -> bool:
+    """True if no worker has sent the `key` alert within `cooldown` seconds; if so,
+    atomically reserves the slot (records 'now') so only one worker sends."""
+    now = time.time()
+
+    def mutate(data):
+        gates = data.setdefault("EmailGate", {})
+        last = float(gates.get(key, 0) or 0)
+        if now - last < cooldown:
+            return False
+        gates[key] = now
+        return True
+
+    return _coord.update(mutate)
 
 # Per single proxied request: each method may be tried once, plus a CSRF retry
 # inside a method. This bounds the work for one request across the whole chain.
@@ -96,22 +116,18 @@ def has_tokens() -> bool:
 def notify_error(subject: str, body: str):
     """Record a runtime error and email the admin (email rate-limited; log always)."""
     diagnostics.log_error(subject, body)
-    global error_email_last_sent
     cooldown = runtime.get_setting("error_email_cooldown", config.ERROR_EMAIL_COOLDOWN)
-    if time.time() - error_email_last_sent < cooldown:
+    if not _email_allowed("error_email", cooldown):
         return
-    error_email_last_sent = time.time()
     mail.try_send(auth.get_emails()[0], f"Roxy Error: {subject}", body)
 
 
 def _notify_all_throttled(url: str):
     """Email when EVERY upstream method is unavailable, rate-limited separately."""
-    global all_throttled_email_last_sent
     cooldown = runtime.get_setting("error_email_cooldown", config.ERROR_EMAIL_COOLDOWN)
     diagnostics.log_error("All upstream methods unavailable", f"No method could serve: https://{url}")
-    if time.time() - all_throttled_email_last_sent < cooldown:
+    if not _email_allowed("all_throttled_email", cooldown):
         return
-    all_throttled_email_last_sent = time.time()
     mail.try_send(
         auth.get_emails()[0],
         "Roxy: all upstream methods unavailable",
@@ -313,7 +329,7 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
 # --- Token validation / management ------------------------------------------
 def validate_token(token: str):
     """Re-check a token against Roblox; re-add if valid, drop + email if expired."""
-    global tokens, email_last_sent
+    global tokens
     diagnostics.record_token_budget_usage(routing.record_token_use())  # counts toward budget + peak
     try:
         req = requests.get(
@@ -327,7 +343,7 @@ def validate_token(token: str):
             runtime.get_setting("token_expiration_cooldown", config.TOKEN_EXPIRATION_COOLDOWN), validate_token, token
         )
         return
-    should_email = False
+    expired = False
     with _tokens_lock:
         if req.status_code == 200:
             if token not in tokens:
@@ -335,10 +351,10 @@ def validate_token(token: str):
                 diagnostics.update_token(token)
         else:
             diagnostics.remove_token(token, expired=True)
-            should_email = time.time() - email_last_sent > runtime.get_setting("email_cooldown", config.EMAIL_COOLDOWN)
-            if should_email:
-                email_last_sent = time.time()
-    if should_email:
+            expired = True
+    # Email gate is shared across workers (so only one worker emails per cooldown);
+    # done outside the tokens lock so the flock'd file I/O doesn't hold it.
+    if expired and _email_allowed("token_expired_email", runtime.get_setting("email_cooldown", config.EMAIL_COOLDOWN)):
         mail.try_send(
             auth.get_emails()[0],
             "Token Expired",
