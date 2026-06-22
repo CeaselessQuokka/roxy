@@ -393,8 +393,41 @@ def admin_settings():
 @app.route("/admin/tokens/force_revalidate", methods=["POST"], endpoint="admin_force_revalidate")
 @requires_admin
 def admin_force_revalidate():
-    proxy.force_revalidate_tokens()
-    return jsonify("Revalidation queued"), 200
+    # Synchronously re-checks each token against Roblox and reports which are live.
+    report = proxy.force_revalidate_tokens()
+    active = sum(1 for t in report if t.get("Active") is True)
+    return jsonify({"Tokens": report, "Active": active, "Total": len(report)}), 200
+
+
+@app.route("/admin/health_check", methods=["POST"], endpoint="admin_health_check")
+@requires_admin
+def admin_health_check():
+    """Active health probe for the dashboard's Run Health Check: verifies the
+    server is up, each token is still live (real request to Roblox), and that the
+    rotation proxy hands out a working exit IP."""
+    tokens_report = proxy.check_tokens()
+    rotation = proxy.probe_rotation()
+    return (
+        jsonify(
+            {
+                "Status": "ok",
+                "Paused": runtime.is_paused(),
+                "Tokens": tokens_report,
+                "TokensActive": sum(1 for t in tokens_report if t.get("Active") is True),
+                "TokensTotal": len(tokens_report),
+                "Rotation": rotation,
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/admin/rotation/verify", methods=["POST"], endpoint="admin_verify_rotation")
+@requires_admin
+def admin_verify_rotation():
+    # Fetches our exit IP THROUGH the rotation proxy and logs it (rotation only —
+    # does not touch the tokens, to avoid spending token budget on a quick check).
+    return jsonify(proxy.probe_rotation()), 200
 
 
 @app.route("/admin/fingerprints/clear_header", methods=["POST"], endpoint="admin_clear_fingerprint_header")
@@ -732,7 +765,14 @@ def proxy_page(dst: str):
     header_rule = runtime.match_header_rule(request.headers)
     if header_rule:
         diagnostics.log_header_blocked(header_rule, dst, request.method, ip)
-        diagnostics.log_request_fingerprint(request.headers.items(), user_agent, blocked=True)
+        diagnostics.log_request_fingerprint(
+            request.headers.items(),
+            user_agent,
+            blocked=True,
+            last_headers=json.dumps(sanitize_headers(request.headers)),
+            last_path=dst,
+            last_ip=ip,
+        )
         reset_in = runtime.get_setting("throttle_reset_duration", config.THROTTLE_RESET_DURATION)
         return throttled_response(ip, reset_in=reset_in)
 
@@ -753,10 +793,14 @@ def proxy_page(dst: str):
 
     throttle.update_throttling(ip, made_request=True)
     safe_headers = sanitize_headers(request.headers)
-    diagnostics.log_endpoint(dst, request.method, json.dumps(safe_headers), ip)
+    safe_headers_json = json.dumps(safe_headers)
+    diagnostics.log_endpoint(dst, request.method, safe_headers_json, ip)
     # Track distinct header names + their values + user-agents (secret values are
-    # fingerprinted, not stored raw) to help spot abusive clients.
-    diagnostics.log_request_fingerprint(request.headers.items(), user_agent)
+    # fingerprinted, not stored raw) to help spot abusive clients. The UA record
+    # also keeps the last headers/endpoint so a UA can be drilled into.
+    diagnostics.log_request_fingerprint(
+        request.headers.items(), user_agent, last_headers=safe_headers_json, last_path=dst, last_ip=ip
+    )
 
     # Preserve repeated query params (e.g. ?ids=1&ids=2); requests encodes lists.
     params = request.args.to_dict(flat=False)

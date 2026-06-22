@@ -218,6 +218,7 @@ const print = console.log;
 		// Traffic pills mirror the chart's window (last 60 minutes).
 		setText("trafficTotalOk", (hourTotal - hourFailed).toLocaleString());
 		setText("trafficTotalFail", hourFailed.toLocaleString());
+		setText("trafficTotalAll", hourTotal.toLocaleString());
 
 		chart.innerHTML = "";
 		for (const bar of bars) {
@@ -358,20 +359,122 @@ const print = console.log;
 		}
 	}
 
+	// Per-requester upstream timings (RoProxy/Token/Rotate) + a running Total row.
+	function renderMethodTimings(d) {
+		const tbody = $("#methodTimingsTable tbody");
+		if (!tbody) return;
+		const mt = d.MethodTimings || {};
+		tbody.innerHTML = "";
+		const total = { TotalTime: 0, Count: 0, Min: 0, Max: 0, LastRequestTime: 0 };
+		for (const name of ["RoProxy", "Token", "Rotate"]) {
+			const row = mt[name] || { TotalTime: 0, Count: 0, Min: 0, Max: 0, LastRequestTime: 0 };
+			const count = Number(row.Count || 0);
+			const minVal = row.Min === Infinity ? 0 : Number(row.Min || 0);
+			tbody.appendChild(
+				tr([
+					name,
+					String(count),
+					fmtNum(count ? row.TotalTime / count : 0, 3),
+					fmtNum(minVal, 3),
+					fmtNum(Number(row.Max || 0), 3),
+					row.LastRequestTime ? tsNode(row.LastRequestTime) : "—",
+				]),
+			);
+			total.TotalTime += Number(row.TotalTime || 0);
+			total.Count += count;
+			total.Max = Math.max(total.Max, Number(row.Max || 0));
+			if (minVal && (!total.Min || minVal < total.Min)) total.Min = minVal;
+			total.LastRequestTime = Math.max(total.LastRequestTime, Number(row.LastRequestTime || 0));
+		}
+		const totalRow = tr([
+			"Total",
+			String(total.Count),
+			fmtNum(total.Count ? total.TotalTime / total.Count : 0, 3),
+			fmtNum(total.Min, 3),
+			fmtNum(total.Max, 3),
+			total.LastRequestTime ? tsNode(total.LastRequestTime) : "—",
+		]);
+		totalRow.style.fontWeight = "700";
+		tbody.appendChild(totalRow);
+	}
+
+	const expandedFailures = new Set();
+	function renderRequestFailures(d) {
+		const tbody = $("#requestFailuresTable tbody");
+		if (!tbody) return;
+		if (d.RequestFailures) renderRequestFailures._last = d.RequestFailures;
+		const entries = Object.entries(renderRequestFailures._last || {});
+		entries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+		let total = 0;
+		tbody.innerHTML = "";
+		if (entries.length === 0) {
+			tbody.appendChild(tr(["No failures recorded 🎉", "—", "—", "—", "—", "—", "—"]));
+			setText("requestFailuresTotal", "0 failures");
+			return;
+		}
+		for (const [sig, info] of entries) {
+			total += Number(info.Count || 0);
+			// "Method: reason" — split the leading method off for its own column.
+			const reason = sig.includes(":") ? sig.slice(sig.indexOf(":") + 1).trim() : sig;
+			const row = tr([
+				info.Method || "—",
+				reason,
+				String(info.Count || 0),
+				String(info.LastStatus ?? "—"),
+				info.LastEndpoint || "—",
+				tsNode(info.FirstSeen),
+				tsNode(info.LastSeen),
+			]);
+			row.style.cursor = "pointer";
+			const detail = document.createElement("tr");
+			const td = document.createElement("td");
+			td.colSpan = 7;
+			const pre = document.createElement("pre");
+			pre.className = "error-detail__pre";
+			pre.textContent = info.LastDetail || "(no detail)";
+			td.appendChild(pre);
+			detail.appendChild(td);
+			detail.style.display = expandedFailures.has(sig) ? "" : "none";
+			row.addEventListener("click", () => {
+				const showing = detail.style.display !== "none";
+				detail.style.display = showing ? "none" : "";
+				showing ? expandedFailures.delete(sig) : expandedFailures.add(sig);
+			});
+			tbody.appendChild(row);
+			tbody.appendChild(detail);
+		}
+		setText("requestFailuresTotal", `${total} failures`);
+	}
+
+	function renderRotateIps(d) {
+		const tbody = $("#rotateIpsTable tbody");
+		if (!tbody) return;
+		const list = Array.isArray(d.RotateIps) ? d.RotateIps : [];
+		tbody.innerHTML = "";
+		setText("rotateIpsTotal", `${list.length} seen`);
+		if (list.length === 0) {
+			tbody.appendChild(tr(["No exit IPs recorded yet — click “Verify rotation now”", "—", "—"]));
+			return;
+		}
+		for (const item of list) {
+			tbody.appendChild(tr([item.IP || "—", item.Source || "—", tsNode(item.Date)]));
+		}
+	}
+
 	function renderTokens(d) {
 		const tbody = $("#tokensTable tbody");
 		if (!tbody) return;
 		tbody.innerHTML = "";
 		const list = Array.isArray(d.Tokens) ? d.Tokens : [];
 		if (list.length === 0) {
-			tbody.appendChild(tr(["—", "No tokens loaded", "—", "—"]));
+			tbody.appendChild(tr(["—", "No tokens loaded", "—", "—", "—"]));
 			return;
 		}
 		list.forEach((t, i) => {
 			const masked = t?.Masked ?? "…***";
 			const being = Boolean(t?.BeingValidated);
 			const uses = Number(t?.Uses || 0);
-			tbody.appendChild(tr([String(i + 1), masked, being ? "Yes" : "No", String(uses)]));
+			tbody.appendChild(tr([String(i + 1), masked, being ? "Yes" : "No", String(uses), tsNode(t?.LastUsedAt)]));
 		});
 	}
 
@@ -860,8 +963,10 @@ const print = console.log;
 		}
 	}
 
-	// Simple 3-column frequency table (user-agents).
-	function renderUaTable(tbodySel, totalId, data, filterSel) {
+	const expandedUa = new Set(); // which UA rows are expanded to show last headers
+	// User-agent frequency table. Rows with a captured last request expand to show
+	// the last headers + endpoint that UA sent (handy for the mysterious "(none)" UA).
+	function renderUaTable(tbodySel, totalId, data, filterSel, keyPrefix = "") {
 		const tbody = $(tbodySel);
 		if (!tbody) return;
 		const entries = Object.entries(data || {});
@@ -873,7 +978,49 @@ const print = console.log;
 		for (const [key, info] of entries) {
 			if (q && !key.toLowerCase().includes(q)) continue;
 			shown++;
-			tbody.appendChild(tr([key, String(info.Count || 0), tsNode(info.LastSeen)]));
+			const hasDetail = Boolean(info.LastHeaders);
+			const uaKey = keyPrefix + key;
+			const expanded = expandedUa.has(uaKey);
+			const tdName = document.createElement("td");
+			if (hasDetail) {
+				const chev = document.createElement("span");
+				chev.className = "endpoint-host__chevron";
+				chev.textContent = expanded ? "▾ " : "▸ ";
+				tdName.appendChild(chev);
+			}
+			tdName.appendChild(document.createTextNode(key));
+			const row = document.createElement("tr");
+			row.appendChild(tdName);
+			for (const cell of [String(info.Count || 0), tsNode(info.LastSeen)]) {
+				const td = document.createElement("td");
+				if (cell instanceof Node) td.appendChild(cell);
+				else td.textContent = cell;
+				row.appendChild(td);
+			}
+			if (hasDetail) {
+				row.style.cursor = "pointer";
+				const detail = document.createElement("tr");
+				const td = document.createElement("td");
+				td.colSpan = 3;
+				let headersText = info.LastHeaders;
+				try {
+					headersText = JSON.stringify(JSON.parse(info.LastHeaders), null, 2);
+				} catch {}
+				td.innerHTML =
+					`<div class="endpoint-headers__meta">Last seen at <strong>${escapeHtml(info.LastPath || "—")}</strong> from IP <strong>${escapeHtml(info.LastIP || "—")}</strong> • last sent headers:</div>` +
+					`<pre class="endpoint-headers__pre">${escapeHtml(headersText || "(none)")}</pre>`;
+				detail.appendChild(td);
+				detail.style.display = expanded ? "" : "none";
+				row.addEventListener("click", () => {
+					const showing = detail.style.display !== "none";
+					detail.style.display = showing ? "none" : "";
+					showing ? expandedUa.delete(uaKey) : expandedUa.add(uaKey);
+				});
+				tbody.appendChild(row);
+				tbody.appendChild(detail);
+			} else {
+				tbody.appendChild(row);
+			}
 		}
 		if (shown === 0) {
 			tbody.appendChild(tr([q ? "No user-agents match the filter" : "No user-agents recorded yet", "—", "—"]));
@@ -980,9 +1127,9 @@ const print = console.log;
 		if (d.BlockedHeaderNames) renderFingerprints._bhn = d.BlockedHeaderNames;
 		if (d.BlockedUserAgents) renderFingerprints._bua = d.BlockedUserAgents;
 		renderHeaderNameTable("#headerNamesTable tbody", "headerNamesTotal", renderFingerprints._hn || {}, "#headerNamesFilter", false);
-		renderUaTable("#userAgentsTable tbody", "userAgentsTotal", renderFingerprints._ua || {}, "#userAgentsFilter");
+		renderUaTable("#userAgentsTable tbody", "userAgentsTotal", renderFingerprints._ua || {}, "#userAgentsFilter", "l:");
 		renderHeaderNameTable("#blockedHeaderNamesTable tbody", "blockedHeaderNamesTotal", renderFingerprints._bhn || {}, "#blockedHeaderNamesFilter", true);
-		renderUaTable("#blockedUserAgentsTable tbody", "blockedUserAgentsTotal", renderFingerprints._bua || {}, "#blockedUserAgentsFilter");
+		renderUaTable("#blockedUserAgentsTable tbody", "blockedUserAgentsTotal", renderFingerprints._bua || {}, "#blockedUserAgentsFilter", "b:");
 	}
 
 	let liveItems = []; // cached for filtering without refetch
@@ -1072,7 +1219,33 @@ const print = console.log;
 		token_danger_zone: "Token danger zone (requests)",
 		rotate_enabled: "IP rotation enabled (1/0)",
 		rotate_cooldown: "Rotate cooldown after failures (s)",
+		rotate_max_failures: "Rotate: failures before cooldown",
 	};
+
+	// Group settings so the (long) list is navigable. Any key not listed falls
+	// into "Other" so nothing is ever hidden.
+	const SETTING_GROUPS = [
+		["Routing & method mix", ["roproxy_weight", "token_weight", "rotate_weight", "token_danger_zone", "roproxy_cooldown", "direct_api_cooldown"]],
+		["IP rotation", ["rotate_enabled", "rotate_cooldown", "rotate_max_failures"]],
+		["Token safety budget", ["token_budget_requests", "token_budget_window", "token_expiration_cooldown"]],
+		["Throttling", ["allowed_requests_per_minute", "throttle_reset_duration", "stale_ip_duration", "global_throttle_limit", "global_throttle_period"]],
+		["Upstream & retries", ["request_timeout", "max_retries_per_request"]],
+		["Email", ["email_cooldown", "error_email_cooldown"]],
+		["Login & sessions", ["two_fa_expiration", "challenge_expiration"]],
+		["Record caps & persistence", ["autosave_interval", "max_live_requests", "max_exploit_records", "max_login_records", "max_crawl_records", "max_throttle_records", "max_endpoint_records"]],
+	];
+	function groupedSettingKeys(settings) {
+		const seen = new Set();
+		const groups = [];
+		for (const [label, keys] of SETTING_GROUPS) {
+			const present = keys.filter(k => k in settings);
+			present.forEach(k => seen.add(k));
+			if (present.length) groups.push([label, present]);
+		}
+		const leftovers = Object.keys(settings).filter(k => !seen.has(k));
+		if (leftovers.length) groups.push(["Other", leftovers]);
+		return groups;
+	}
 
 	function renderSettings(d) {
 		const tbody = $("#settingsTable tbody");
@@ -1091,38 +1264,49 @@ const print = console.log;
 			return;
 		}
 		tbody.innerHTML = "";
-		for (const [key, info] of Object.entries(settings)) {
-			const row = document.createElement("tr");
+		for (const [groupLabel, keys] of groupedSettingKeys(settings)) {
+			const headRow = document.createElement("tr");
+			headRow.className = "settings-group";
+			const headTd = document.createElement("td");
+			headTd.colSpan = 5;
+			headTd.innerHTML = `<strong>${escapeHtml(groupLabel)}</strong>`;
+			headRow.appendChild(headTd);
+			tbody.appendChild(headRow);
 
-			const tdName = document.createElement("td");
-			tdName.textContent = SETTING_LABELS[key] || key;
-			tdName.title = key;
+			for (const key of keys) {
+				const info = settings[key];
+				const row = document.createElement("tr");
 
-			const tdCurrent = document.createElement("td");
-			tdCurrent.textContent = String(info.value);
-			tdCurrent.dataset.current = "1";
+				const tdName = document.createElement("td");
+				tdName.textContent = SETTING_LABELS[key] || key;
+				tdName.title = key;
 
-			const tdInput = document.createElement("td");
-			const input = document.createElement("input");
-			input.className = "input";
-			input.type = "number";
-			input.value = String(info.value);
-			input.min = String(info.min);
-			input.max = String(info.max);
-			input.dataset.setting = key;
-			input.addEventListener("input", () => {
-				input.dataset.dirty = "1";
-			});
-			tdInput.appendChild(input);
+				const tdCurrent = document.createElement("td");
+				tdCurrent.textContent = String(info.value);
+				tdCurrent.dataset.current = "1";
 
-			const tdRange = document.createElement("td");
-			tdRange.textContent = `${info.min} – ${info.max}`;
+				const tdInput = document.createElement("td");
+				const input = document.createElement("input");
+				input.className = "input";
+				input.type = "number";
+				input.value = String(info.value);
+				input.min = String(info.min);
+				input.max = String(info.max);
+				input.dataset.setting = key;
+				input.addEventListener("input", () => {
+					input.dataset.dirty = "1";
+				});
+				tdInput.appendChild(input);
 
-			const tdUpdated = document.createElement("td");
-			tdUpdated.appendChild(info.updated ? tsNode(info.updated) : document.createTextNode("—"));
+				const tdRange = document.createElement("td");
+				tdRange.textContent = `${info.min} – ${info.max}`;
 
-			[tdName, tdCurrent, tdInput, tdRange, tdUpdated].forEach(td => row.appendChild(td));
-			tbody.appendChild(row);
+				const tdUpdated = document.createElement("td");
+				tdUpdated.appendChild(info.updated ? tsNode(info.updated) : document.createTextNode("—"));
+
+				[tdName, tdCurrent, tdInput, tdRange, tdUpdated].forEach(td => row.appendChild(td));
+				tbody.appendChild(row);
+			}
 		}
 	}
 
@@ -1356,6 +1540,9 @@ const print = console.log;
 			renderTraffic(d);
 			renderRequests(d);
 			renderProxyTimings(d);
+			renderMethodTimings(d);
+			renderRequestFailures(d);
+			renderRotateIps(d);
 			renderTokens(d);
 			renderProbes(d);
 			renderLogins(d);
@@ -1739,7 +1926,9 @@ const print = console.log;
 		"section-requests": { target: "requests", what: "ALL request stats (counters, status codes, timings, retries, traffic chart)" },
 		"section-status": { target: "requests", what: "ALL request stats (counters, status codes, timings, retries, traffic chart)" },
 		"section-retries": { target: "requests", what: "ALL request stats (counters, status codes, timings, retries, traffic chart)" },
-		"section-proxy": { target: "requests", what: "ALL request stats (counters, status codes, timings, retries, traffic chart)" },
+		"section-proxy": { target: "proxy_timings", what: "the proxy timing stats (independently of the request counters)" },
+		"section-request-failures": { target: "request_failures", what: "the request-failure log" },
+		"section-rotation": { target: "rotate_ips", what: "the recorded rotation exit IPs" },
 		"section-endpoints": { target: "endpoints", what: "the endpoint popularity records" },
 		"section-blocked-attempts": { target: "blocked_attempts", what: "blocked-endpoint attempt records" },
 		"section-ratelimited-attempts": { target: "rate_limited_attempts", what: "rate-limited attempt records" },
@@ -2077,26 +2266,61 @@ const print = console.log;
 		}
 	});
 
-	// Tools: force revalidate tokens
+	// Tools: force revalidate tokens (synchronous; reports which are still active)
 	$("#forceRevalidateBtn")?.addEventListener("click", async () => {
+		showToast("Revalidating tokens against Roblox…");
 		try {
 			const res = await api("/admin/tokens/force_revalidate", { method: "POST" });
 			if (!res.ok) throw new Error(String(res.status));
-			showToast("Token revalidation queued");
-			setTimeout(() => refreshAll(true), 1500);
+			const data = await res.json();
+			const total = Number(data.Total || 0);
+			if (!total) {
+				showToast("No tokens loaded to revalidate", 3200);
+			} else {
+				const dead = (data.Tokens || []).filter(t => t.Active === false).map(t => t.Masked);
+				let msg = `${data.Active}/${total} token(s) active`;
+				if (dead.length) msg += ` — expired: ${dead.join(", ")}`;
+				showToast(msg, 4200);
+			}
+			await refreshAll(true);
 		} catch {
 			showToast("Revalidation failed");
 		}
 	});
 
-	// Tools: health check
+	// Tools: health check — server up + each token live + rotation exit IP
 	$("#healthCheckBtn")?.addEventListener("click", async () => {
+		showToast("Running health check…");
 		try {
-			const res = await fetch("/health", { headers: { Accept: "application/json" } });
-			const data = await res.json();
-			showToast(`Server is up — status: ${data.Status}${data.Paused ? ", proxy PAUSED" : ", proxy running"}`, 3200);
+			const res = await api("/admin/health_check", { method: "POST" });
+			if (!res.ok) throw new Error(String(res.status));
+			const d = await res.json();
+			const parts = [`Server ${d.Status}${d.Paused ? " (PAUSED)" : ""}`];
+			parts.push(`Tokens: ${d.TokensActive}/${d.TokensTotal} active`);
+			const rot = d.Rotation || {};
+			if (!rot.Configured) parts.push("Rotation: not configured");
+			else if (rot.ExitIP) parts.push(`Rotation OK — exit IP ${rot.ExitIP}`);
+			else parts.push(`Rotation FAILED — ${rot.Error || "no IP"}`);
+			showToast(parts.join(" • "), 6000);
+			await refreshAll(true);
 		} catch {
 			showToast("Health check FAILED — the server did not respond", 3200);
+		}
+	});
+
+	// Rotation: verify exit IP through the proxy (rotation only; no token spend)
+	$("#verifyRotationBtn")?.addEventListener("click", async () => {
+		showToast("Checking rotation exit IP…");
+		try {
+			const res = await api("/admin/rotation/verify", { method: "POST" });
+			if (!res.ok) throw new Error(String(res.status));
+			const d = await res.json();
+			if (!d.Configured) showToast("Rotation is not configured", 3500);
+			else if (d.ExitIP) showToast(`Rotation working — exit IP ${d.ExitIP}`, 4500);
+			else showToast(`Rotation FAILED — ${d.Error || "no IP returned"}`, 5000);
+			await refreshAll(true);
+		} catch {
+			showToast("Rotation check failed");
 		}
 	});
 

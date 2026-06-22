@@ -119,6 +119,7 @@ _settings = {
     # IP rotation (DataImpulse): master on/off + cooldown after proxy failures.
     "rotate_enabled": _setting(1, 0, 1, "int"),
     "rotate_cooldown": _setting(config.ROTATE_COOLDOWN, 0, 86400, "int"),
+    "rotate_max_failures": _setting(config.ROTATE_MAX_FAILURES, 1, 100, "int"),
 }
 
 

@@ -8,6 +8,7 @@ so rotated requests look like many different browsers rather than one bot.
 
 import auth
 import config
+import requests
 import runtime
 import time
 from threading import Lock
@@ -68,6 +69,38 @@ def random_user_agent() -> str:
         return _ua.random or _FALLBACK_UA
     except Exception:
         return _FALLBACK_UA
+
+
+def probe_exit_ip() -> tuple[str, str]:
+    """Fetch an IP-echo endpoint THROUGH the rotation proxy to learn the exit IP.
+
+    Returns (ip, error): on success ip is the observed exit IP and error is "";
+    on failure ip is "" and error describes what went wrong. This is the only way
+    to verify rotation is actually working — a normal Roblox response never tells
+    us which exit IP DataImpulse used. Best-effort and fully guarded so a probe can
+    never raise into a caller (e.g. the health check)."""
+    proxy_map = proxies()
+    if not proxy_map:
+        return "", "Rotation proxy is not configured."
+    try:
+        resp = requests.get(
+            config.ROTATE_IP_ECHO_URL,
+            headers={"User-Agent": random_user_agent()},
+            proxies=proxy_map,
+            timeout=config.ROTATE_PROBE_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return "", f"{type(e).__name__}: {e}"[:200]
+    if resp.status_code != 200:
+        return "", f"IP-echo returned HTTP {resp.status_code}"
+    # ipify returns {"ip": "1.2.3.4"} with format=json; fall back to raw text.
+    try:
+        ip = str(resp.json().get("ip", "")).strip()
+    except ValueError:
+        ip = resp.text.strip()
+    if not ip:
+        return "", "IP-echo response had no IP"
+    return ip[:64], ""
 
 
 def masked_url() -> str:

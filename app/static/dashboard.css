@@ -543,6 +543,18 @@ a:hover {
 .row--emph td {
 	font-weight: 600;
 }
+/* Category header rows inside the Runtime Settings table. */
+.settings-group td {
+	background: rgba(255, 255, 255, 0.04);
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	font-size: 0.8rem;
+	color: var(--text-muted, #9aa);
+	padding-top: 14px;
+}
+.settings-group:hover td {
+	background: rgba(255, 255, 255, 0.04);
+}
 
 /* =============================
    8) TOASTS

@@ -154,6 +154,39 @@ tokens = dict(
     }
 )
 
+# Per-token usage, keyed by an irreversible fingerprint of the token (NOT the
+# secret) so it can be persisted + MERGED across workers. The full token is never
+# written to disk; the inventory above stays per-worker. The displayed "Auth
+# Tokens → Uses" is read from here so it matches the merged Token method Requests.
+#   fingerprint -> {"Uses": int, "LastUsedAt": float}
+token_usage = dict()
+
+# Per-requester upstream timings (RoProxy / Token / Rotate), MERGED across workers.
+# Parallel to proxy_request_counts (which is per HTTP verb); this one answers
+# "how fast is each requester?" with a running total derived in the UI.
+def _timing_stat():
+    return dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0})
+
+
+method_timings = dict(
+    {
+        "RoProxy": _timing_stat(),
+        "Token": _timing_stat(),
+        "Rotate": _timing_stat(),
+    }
+)
+
+# Every failed routed upstream request, deduped by "Method: reason" so the admin
+# can diagnose WHY each requester (RoProxy/Token/Rotate) is being rejected.
+#   "Method: signature" -> {Method, Count, FirstSeen, LastSeen, LastStatus,
+#                           LastEndpoint, LastDetail}
+request_failures = dict()
+
+# Ring buffer of the most recent rotation exit IPs we observed (via the IP-echo
+# probe on health-check / force-revalidate), so the admin can verify rotation is
+# truly handing out different IPs. {"IP", "Date", "Source"}.
+rotate_ips = list()
+
 page_visits = dict(
     {
         "home": 0,
@@ -547,6 +580,67 @@ def log_rotate_health(ok: bool, error: str = ""):
                 method_stats["Rotate"]["LastError"] = str(error)[:200]
 
 
+def log_method_timing(method: str, duration: float):
+    """Record an upstream timing sample for a requester (RoProxy/Token/Rotate)."""
+    name = _METHOD_NAMES.get(method)
+    if not name:
+        return
+    with _state_lock:
+        stat = method_timings[name]
+        stat["TotalTime"] += duration
+        stat["Count"] += 1
+        stat["LastRequestTime"] = time.time()
+        if duration < stat["Min"] or stat["Min"] == 0:
+            stat["Min"] = duration
+        if duration > stat["Max"]:
+            stat["Max"] = duration
+
+
+def log_request_failure(method: str, status, reason: str, endpoint: str = "", detail: str = ""):
+    """Record a failed routed upstream request so the admin can see WHY a given
+    requester is being rejected (deduped by method + reason, with a frequency
+    count and the last status/endpoint/detail)."""
+    name = _METHOD_NAMES.get(method, (method or "?").title())
+    reason = (reason or "Unknown")[:120]
+    sig = f"{name}: {reason}"
+    endpoint = (endpoint or "").split("?", 1)[0][:200]
+    now = time.time()
+    with _state_lock:
+        rec = request_failures.get(sig)
+        if rec:
+            rec["Count"] += 1
+            rec["LastSeen"] = now
+            rec["LastStatus"] = str(status)  # string so the cross-worker merge treats it as last-writer
+            if endpoint:
+                rec["LastEndpoint"] = endpoint
+            if detail:
+                rec["LastDetail"] = str(detail)[:2000]
+        else:
+            if len(request_failures) >= config.MAX_ERROR_RECORDS:
+                least = min(request_failures.items(), key=lambda kv: kv[1]["Count"])[0]
+                request_failures.pop(least, None)
+            request_failures[sig] = dict(
+                Method=name,
+                Count=1,
+                FirstSeen=now,
+                LastSeen=now,
+                LastStatus=str(status),
+                LastEndpoint=endpoint,
+                LastDetail=str(detail)[:2000],
+            )
+
+
+def log_rotate_ip(ip: str, source: str = ""):
+    """Append a verified rotation exit IP to the ring buffer (newest kept)."""
+    ip = str(ip or "").strip()[:64]
+    if not ip:
+        return
+    with _state_lock:
+        rotate_ips.append(dict(IP=ip, Date=time.time(), Source=str(source)[:40]))
+        while len(rotate_ips) > config.MAX_ROTATE_IPS:
+            rotate_ips.pop(0)
+
+
 def reset_method_counters():
     """Zero the per-method request tallies (used when clearing request stats)."""
     with _state_lock:
@@ -606,11 +700,17 @@ def _value_for_storage(header_name_lower: str, value: str) -> str:
     return value[:200] if value else "(empty)"
 
 
-def log_request_fingerprint(header_pairs, user_agent: str, blocked: bool = False):
+def log_request_fingerprint(
+    header_pairs, user_agent: str, blocked: bool = False, last_headers: str = "", last_path: str = "", last_ip: str = ""
+):
     """Track the distinct header names + their values + the user-agent of a request.
 
     `header_pairs` is an iterable of (name, value). When `blocked` is True the data
-    goes into the blocked-request stores instead (for false-positive review)."""
+    goes into the blocked-request stores instead (for false-positive review).
+
+    `last_headers` (a pre-sanitized JSON string), `last_path` and `last_ip` are
+    attached to the user-agent record so the admin can drill into exactly what a
+    given UA (including the "(none)" UA) last sent and where."""
     names_store = blocked_header_names if blocked else header_names
     ua_store = blocked_user_agents if blocked else user_agents
     pairs = list(header_pairs.items()) if hasattr(header_pairs, "items") else list(header_pairs)
@@ -622,7 +722,11 @@ def log_request_fingerprint(header_pairs, user_agent: str, blocked: bool = False
                 continue
             values = rec.setdefault("Values", {})
             _bump_fingerprint(values, _value_for_storage(name_l, value), config.MAX_HEADER_VALUE_RECORDS)
-        _bump_fingerprint(ua_store, (user_agent or "(none)")[:400], config.MAX_USER_AGENT_RECORDS)
+        ua_rec = _bump_fingerprint(ua_store, (user_agent or "(none)")[:400], config.MAX_USER_AGENT_RECORDS)
+        if ua_rec is not None and last_headers:
+            ua_rec["LastHeaders"] = last_headers
+            ua_rec["LastPath"] = (last_path or "")[:300]
+            ua_rec["LastIP"] = (last_ip or "")[:64]
 
 
 def clear_fingerprint_header(blocked: bool, name: str) -> bool:
@@ -742,6 +846,11 @@ def log_proxy_request(method: str, duration: float):
                 proxy_request_counts[method]["Max"] = duration
 
 
+def _token_fp(token: str) -> str:
+    """An irreversible fingerprint of a token — safe to persist (unlike the token)."""
+    return hashlib.sha256((token or "").encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def update_token(token: str, being_validated: bool = False, used: bool = False):
     global tokens
     masked = f"...{token[-20:]}"
@@ -756,6 +865,15 @@ def update_token(token: str, being_validated: bool = False, used: bool = False):
                 BeingValidated=being_validated,
                 Uses=tokens.get(token, {}).get("Uses", 0) + (1 if used else 0),
             )
+        # Cross-worker-mergeable usage, keyed by fingerprint (never the secret).
+        if used:
+            fp = _token_fp(token)
+            rec = token_usage.get(fp)
+            if rec:
+                rec["Uses"] += 1
+                rec["LastUsedAt"] = time.time()
+            else:
+                token_usage[fp] = dict(Uses=1, LastUsedAt=time.time())
         proxy_health["Tokens"]["Count"] = len(tokens)
         proxy_health["Tokens"]["BeingValidatedCount"] = sum(1 for t in tokens.values() if t["BeingValidated"])
 
@@ -777,6 +895,24 @@ def clear_tokens():
         tokens.clear()
         proxy_health["Tokens"]["Count"] = 0
         proxy_health["Tokens"]["BeingValidatedCount"] = 0
+
+
+def _tokens_view() -> list:
+    """The Auth Tokens table: current inventory + MERGED usage (so per-token Uses
+    matches the cross-worker Token method Requests). Call under _state_lock and
+    after a flush so token_usage holds the global totals."""
+    out = []
+    for full, info in tokens.items():
+        usage = token_usage.get(_token_fp(full), {})
+        out.append(
+            {
+                "Masked": info.get("Masked", "…***"),
+                "BeingValidated": bool(info.get("BeingValidated")),
+                "Uses": int(usage.get("Uses", 0)),
+                "LastUsedAt": usage.get("LastUsedAt", 0),
+            }
+        )
+    return out
 
 
 def get_diagnostics() -> dict:
@@ -803,8 +939,11 @@ def get_diagnostics() -> dict:
                 "StatusCodeCounts": status_code_counts,
                 "StatusCodesDetailed": status_codes_detailed,
                 "ProxyRequestCounts": proxy_request_counts,
+                "MethodTimings": method_timings,
                 "ProxyHealth": proxy_health,
                 "MethodStats": method_stats,
+                "RequestFailures": request_failures,
+                "RotateIps": list(reversed(rotate_ips)),  # Most-recent first.
                 "Crawls": crawls,
                 "Endpoints": endpoints,
                 "BlockedEndpointAttempts": blocked_endpoint_attempts,
@@ -813,7 +952,7 @@ def get_diagnostics() -> dict:
                 "RetryCounts": retry_counts,
                 "ReasonCounts": reason_counts,
                 "LiveRequests": list(reversed(live_requests)),  # Most-recent first.
-                "Tokens": list(tokens.values()),
+                "Tokens": _tokens_view(),
                 "TrafficMinutes": traffic_minutes,
                 "TokenBudgetRejections": token_budget.get("Rejections", 0),
                 "BudgetPeak1h": _budget_peak_since(60),
@@ -863,7 +1002,11 @@ _PERSISTED_NAMES = (
     "status_code_counts",
     "status_codes_detailed",
     "proxy_request_counts",
+    "method_timings",
     "method_stats",
+    "token_usage",
+    "request_failures",
+    "rotate_ips",
     "crawls",
     "throttled_ips",
     "endpoints",
@@ -903,14 +1046,18 @@ CLEAR_TARGETS = {
         "request_counts",
         "status_code_counts",
         "status_codes_detailed",
-        "proxy_request_counts",
         "method_stats",
+        "token_usage",
         "retry_counts",
         "reason_counts",
         "traffic_minutes",
         "token_budget",
         "token_budget_minutes",
     ),
+    # Proxy timings clear INDEPENDENTLY of the request counters above.
+    "proxy_timings": ("proxy_request_counts", "method_timings"),
+    "request_failures": ("request_failures",),
+    "rotate_ips": ("rotate_ips",),
     "endpoints": ("endpoints",),
     "blocked_attempts": ("blocked_endpoint_attempts",),
     "rate_limited_attempts": ("rate_limited_attempts",),
@@ -1010,12 +1157,13 @@ def restore(data: dict):
 # Min/Max/Last* fields combine idempotently; recent-event lists union + dedup + cap.
 _baseline = None
 
-_MAX_KEYS = {"Max", "LastRequestTime", "LastThrottleTime", "LastSeen", "LastSuccessAt", "LastErrorAt"}
+_MAX_KEYS = {"Max", "LastRequestTime", "LastThrottleTime", "LastSeen", "LastSuccessAt", "LastErrorAt", "LastUsedAt"}
 _MIN_KEYS = {"Min", "FirstSeen"}
 _LIST_CAP_SETTINGS = {
     "exploit_attempts": ("max_exploit_records", config.MAX_EXPLOIT_RECORDS),
     "login_attempts": ("max_login_records", config.MAX_LOGIN_RECORDS),
     "live_requests": ("max_live_requests", config.MAX_LIVE_REQUESTS),
+    "rotate_ips": (None, config.MAX_ROTATE_IPS),
 }
 
 

@@ -225,6 +225,9 @@ class FakeUpstreamResponse:
         self.headers = headers or {}
         self.elapsed = _dt.timedelta(milliseconds=42)
 
+    def json(self):
+        return json.loads(self.text)
+
 
 upstream_calls = []
 
@@ -236,7 +239,22 @@ def fake_upstream(method, url, headers=None, params=None, data=None, cookies=Non
     return FakeUpstreamResponse()
 
 
+# requests.get is used by token validation (accountinformation) and the rotation
+# exit-IP probe (ipify). Stub it so those never hit the network in tests.
+get_calls = []
+_probe_ip_counter = [0]
+
+
+def fake_get(url, headers=None, params=None, cookies=None, proxies=None, timeout=None):
+    get_calls.append({"url": url, "cookies": cookies, "proxies": proxies})
+    if "ipify" in url or "ip-echo" in url:
+        _probe_ip_counter[0] += 1
+        return FakeUpstreamResponse(status=200, text='{"ip":"203.0.113.%d"}' % _probe_ip_counter[0])
+    return FakeUpstreamResponse(status=200, text='{"ok":true}')  # token validation: active
+
+
 proxy_module.requests.request = fake_upstream
+proxy_module.requests.get = fake_get
 
 import routing as routing_module  # noqa: E402
 
@@ -1023,6 +1041,102 @@ check("GET /sitemap.xml -> 200 XML", r.status_code == 200 and b"<urlset" in r.da
 r = client.get("/robots.txt", headers=IP_MAIN)
 check("robots.txt references the sitemap", b"Sitemap:" in r.data, r.data[:120])
 check("robots.txt disallows /admin", b"/admin" in r.data, r.data[:120])
+
+print("== Token Uses stay in sync with Token method Requests ==")
+proxy_module.requests.request = fake_upstream
+reset_routing()
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "proxy_timings"})
+set_method_weights(0, 100, 0)
+proxy_module.set_tokens(["SYNC_TOKEN"])
+IP_SYNC = {"X-Forwarded-For": "10.60.0.1"}
+for i in range(4):
+    api_client.get(f"/games.roblox.com/v1/sync{i}", headers=IP_SYNC)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag = r.get_json()
+token_req = diag.get("MethodStats", {}).get("Token", {}).get("Requests", 0)
+uses_sum = sum(int(t.get("Uses", 0)) for t in diag.get("Tokens", []))
+check("Token method recorded 4 requests", token_req == 4, token_req)
+check("Sum of per-token Uses equals Token method Requests", uses_sum == token_req and uses_sum == 4, (uses_sum, token_req))
+check("Token row shows a Last Used time", any(t.get("LastUsedAt") for t in diag.get("Tokens", [])), diag.get("Tokens"))
+
+print("== Per-requester timings ==")
+mt = diag.get("MethodTimings", {})
+check("Token timing recorded for the 4 requests", mt.get("Token", {}).get("Count", 0) == 4, mt.get("Token"))
+check("Token timing captured a latency", mt.get("Token", {}).get("Max", 0) > 0, mt.get("Token"))
+
+print("== Proxy timings clear independently of request counters ==")
+rc_before = diag.get("RequestCounts", {}).get("GET", {}).get("Successful", 0)
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "proxy_timings"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag2 = r.get_json()
+check("proxy_timings clear zeroed method timings", diag2.get("MethodTimings", {}).get("Token", {}).get("Count", 0) == 0, diag2.get("MethodTimings"))
+check("Request counters SURVIVED a proxy_timings clear", diag2.get("RequestCounts", {}).get("GET", {}).get("Successful", 0) == rc_before, (diag2.get("RequestCounts", {}).get("GET"), rc_before))
+api_client.get("/games.roblox.com/v1/sync-again", headers=IP_SYNC)  # repopulate both
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag3 = r.get_json()
+check("'requests' clear zeroed the request counters", diag3.get("RequestCounts", {}).get("GET", {}).get("Successful", 0) == 0, diag3.get("RequestCounts", {}).get("GET"))
+check("Proxy timings SURVIVED a 'requests' clear", diag3.get("MethodTimings", {}).get("Token", {}).get("Count", 0) >= 1, diag3.get("MethodTimings", {}).get("Token"))
+
+print("== Request failures log (per requester, why + when) ==")
+reset_routing()
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "request_failures"})
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"roproxy_cooldown": 0}})
+set_method_weights(100, 0, 0)  # RoProxy
+proxy_module.requests.request = failing_upstream  # returns 500
+api_client.get("/games.roblox.com/v1/boom", headers={"X-Forwarded-For": "10.61.0.1"})
+proxy_module.requests.request = fake_upstream
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+rf = r.get_json().get("RequestFailures", {})
+check("Failure logged against the RoProxy requester", any(v.get("Method") == "RoProxy" for v in rf.values()), rf)
+check("Failure records the status code", any("500" in str(v.get("LastStatus")) for v in rf.values()), rf)
+check("Failure records the endpoint", any("boom" in (v.get("LastEndpoint") or "") for v in rf.values()), rf)
+set_method_weights(0, 100, 0)
+reset_routing()
+proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
+
+print("== Blocked user-agent drill-down (last headers + endpoint) ==")
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "blocked_fingerprints"})
+client.post("/admin/headers/rule", headers=IP_MAIN, json={"header": "User-Agent", "mode": "contains", "needle": "DrillBot"})
+api_client.get("/games.roblox.com/v1/drill", headers={"X-Forwarded-For": "10.62.0.1", "User-Agent": "DrillBot/1", "X-Marker": "yes"})
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+bua = r.get_json().get("BlockedUserAgents", {})
+rec = next((v for k, v in bua.items() if "DrillBot" in k), {})
+check("Blocked UA captured its last headers", bool(rec.get("LastHeaders")), rec)
+check("Blocked UA captured its last endpoint", "drill" in (rec.get("LastPath") or ""), rec)
+check("Blocked UA captured its last IP", rec.get("LastIP") == "10.62.0.1", rec)
+for rid in [k for k in r.get_json().get("HeaderRules", {}) if "drillbot" in k]:
+    client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": rid})
+
+print("== Settings expose all tunables (weights, rotation) ==")
+settings = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"}).get_json().get("Settings", {})
+for key in ("roproxy_weight", "token_weight", "rotate_weight", "token_danger_zone", "rotate_enabled", "rotate_cooldown", "rotate_max_failures"):
+    check(f"Setting '{key}' is editable", key in settings, list(settings))
+
+print("== Force-revalidate + health check report token + rotation status ==")
+with open(ROTATE_PROXY_PATH, "w") as f:
+    f.write("http://gw.dataimpulse.test:823\n")
+reset_routing()
+proxy_module.set_tokens(["LIVE_TOKEN"])
+r = client.post("/admin/tokens/force_revalidate", headers=IP_MAIN)
+fr = r.get_json()
+check("Force-revalidate reports token totals", fr.get("Total") == 1 and fr.get("Active") == 1, fr)
+check("Force-revalidate report lists the token", bool(fr.get("Tokens")) and fr["Tokens"][0].get("Active") is True, fr)
+r = client.post("/admin/health_check", headers=IP_MAIN)
+hc = r.get_json()
+check("Health check reports tokens active", hc.get("TokensActive") == 1 and hc.get("TokensTotal") == 1, hc)
+check("Health check probed a rotation exit IP", (hc.get("Rotation", {}).get("ExitIP") or "").startswith("203.0.113"), hc.get("Rotation"))
+r = client.post("/admin/rotation/verify", headers=IP_MAIN)
+rv = r.get_json()
+check("Rotation verify returns an exit IP", (rv.get("ExitIP") or "").startswith("203.0.113"), rv)
+check("Rotation verify sent through the proxy", get_calls[-1].get("proxies") is not None, get_calls[-1])
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check("Exit IPs are logged for verification", len(r.get_json().get("RotateIps", [])) >= 1, r.get_json().get("RotateIps"))
+os.remove(ROTATE_PROXY_PATH)
+set_method_weights(0, 100, 0)
+reset_routing()
+proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
 
 print("== Emailed invalidation link (kill switch) ==")
 invalidate_emails = emails_with("Roxy Admin Login")

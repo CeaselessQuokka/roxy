@@ -86,6 +86,7 @@
 					<li><a class="nav__link" href="#section-status">Status Codes</a></li>
 					<li><a class="nav__link" href="#section-retries">Retries</a></li>
 					<li><a class="nav__link" href="#section-proxy">Proxy Timings</a></li>
+					<li><a class="nav__link" href="#section-request-failures">Request Failures</a></li>
 					<li><a class="nav__link" href="#section-probes">Exploit / Probe Attempts</a></li>
 					<li><a class="nav__link" href="#section-fingerprints">Request Fingerprints</a></li>
 					<li><a class="nav__link" href="#section-blocked-fingerprints">Blocked Fingerprints</a></li>
@@ -93,6 +94,7 @@
 					<li><a class="nav__link" href="#section-logins">Admin Logins</a></li>
 					<li><a class="nav__link" href="#section-settings">Settings</a></li>
 					<li><a class="nav__link" href="#section-health">Health</a></li>
+					<li><a class="nav__link" href="#section-rotation">Rotation Exit IPs</a></li>
 					<li><a class="nav__link" href="#section-tools">Tools</a></li>
 				</ul>
 			</nav>
@@ -263,6 +265,9 @@
 							<span class="chip chip--danger stat-pill" title="Failed requests in the last 60 minutes">
 								<span class="legend-dot legend-dot--bad"></span> Failed:
 								<strong id="trafficTotalFail">0</strong>
+							</span>
+							<span class="chip stat-pill" title="All requests (successful + failed) in the last 60 minutes">
+								Total: <strong id="trafficTotalAll">0</strong>
 							</span>
 						</div>
 					</div>
@@ -709,6 +714,7 @@
 										<th scope="col">Masked</th>
 										<th scope="col">Being Validated</th>
 										<th scope="col">Uses</th>
+										<th scope="col">Last Used</th>
 									</tr>
 								</thead>
 								<tbody>
@@ -905,6 +911,27 @@
 						<h2 id="proxyHeading" class="section__title">Proxy Timings</h2>
 					</div>
 					<div class="card">
+						<p class="form__hint">
+							Latency of each upstream requester (RoProxy / Token / Rotate), with a running total.
+						</p>
+						<div class="table-wrap">
+							<table id="methodTimingsTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Requester</th>
+										<th scope="col">Count</th>
+										<th scope="col">Avg Time (s)</th>
+										<th scope="col">Min (s)</th>
+										<th scope="col">Max (s)</th>
+										<th scope="col">Last Request</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- built by JS from MethodTimings -->
+								</tbody>
+							</table>
+						</div>
+						<p class="form__hint">Per HTTP method (all requesters combined).</p>
 						<div class="table-wrap">
 							<table id="proxyTimingsTable" class="table">
 								<thead>
@@ -958,6 +985,41 @@
 										<td id="pt_delete_max">0</td>
 										<td id="pt_delete_last">0</td>
 									</tr>
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
+				<!-- Request Failures (per requester: reason, when, endpoint) -->
+				<section id="section-request-failures" class="section" aria-labelledby="requestFailuresHeading">
+					<div class="section__header">
+						<h2 id="requestFailuresHeading" class="section__title">Request Failures</h2>
+						<div class="section__actions">
+							<span id="requestFailuresTotal" class="chip">0 failures</span>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							Every failed upstream attempt, grouped by requester (RoProxy / Token / Rotate) and reason
+							— so you can diagnose exactly why each one is being rejected. Click a row for the last
+							detail. Clears independently of other stats.
+						</p>
+						<div class="table-wrap">
+							<table id="requestFailuresTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Requester</th>
+										<th scope="col">Reason</th>
+										<th scope="col">Count</th>
+										<th scope="col">Last Status</th>
+										<th scope="col">Last Endpoint</th>
+										<th scope="col">First Seen</th>
+										<th scope="col">Last Seen</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- built by JS from RequestFailures -->
 								</tbody>
 							</table>
 						</div>
@@ -1412,6 +1474,41 @@
 								<span id="persist_error" class="persist-error"></span>
 							</div>
 						</article>
+					</div>
+				</section>
+
+				<!-- Rotation: exit-IP verification -->
+				<section id="section-rotation" class="section" aria-labelledby="rotationHeading">
+					<div class="section__header">
+						<h2 id="rotationHeading" class="section__title">Rotation Exit IPs</h2>
+						<div class="section__actions">
+							<span id="rotateIpsTotal" class="chip">0 seen</span>
+							<button id="verifyRotationBtn" type="button" class="btn btn--outline btn--sm">
+								Verify rotation now
+							</button>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							The only way to confirm rotation is really working: Roxy fetches an IP-echo service
+							<em>through</em> the DataImpulse proxy and records the exit IP it was given. Different IPs
+							here = rotation is genuinely handing out fresh IPs. Each check uses a tiny bit of proxy
+							bandwidth, so it runs only when you click "Verify rotation now" or "Run Health Check".
+						</p>
+						<div class="table-wrap">
+							<table id="rotateIpsTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Exit IP</th>
+										<th scope="col">Source</th>
+										<th scope="col">When</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- built by JS from RotateIps -->
+								</tbody>
+							</table>
+						</div>
 					</div>
 				</section>
 

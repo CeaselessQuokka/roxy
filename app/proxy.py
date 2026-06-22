@@ -195,13 +195,35 @@ def _do_method(choice: str, url: str, method: str, headers: dict, params: dict, 
     return (False, True, None)
 
 
+def _endpoint_of(full_url: str) -> str:
+    """A clean endpoint label (no scheme/query) for failure diagnostics."""
+    return full_url.split("://", 1)[-1].split("?", 1)[0]
+
+
+def _failure_reason(status: int) -> str:
+    if status == 429:
+        return "Rate limited (429)"
+    if 500 <= status < 600:
+        return f"Upstream error ({status})"
+    if status == 403:
+        return "Forbidden (403)"
+    if status == 404:
+        return "Not found (404)"
+    if 400 <= status < 500:
+        return f"Client error ({status})"
+    return f"HTTP {status}"
+
+
 def _attempt(choice, full_url, method, headers, params, data, cookies=None, proxies=None, token=None):
     """One HTTP attempt to the upstream, with a single CSRF (403) handshake retry.
 
     Returns (ok, fallback, response). `choice` is the method name for stats
     ("user" for caller-token requests, which aren't part of the routed methods).
+    Every non-success outcome is recorded to the per-requester failure log so the
+    admin can see exactly WHY a given requester is being rejected.
     """
     is_routed = choice in ("roproxy", "token", "rotate")
+    endpoint = _endpoint_of(full_url)
     csrf = None
     headers = dict(headers)
     for _ in range(2):  # original attempt + at most one CSRF retry
@@ -221,6 +243,7 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
         except requests.Timeout:
             diagnostics.log_request(method.upper(), False)
             diagnostics.log_reason(True)
+            diagnostics.log_request_failure(choice, "timeout", "Upstream timed out", endpoint)
             if is_routed:
                 diagnostics.log_method_timeout(choice)
             if choice == "rotate":
@@ -230,6 +253,7 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
         except requests.RequestException as e:
             diagnostics.log_request(method.upper(), False)
             diagnostics.log_reason(True)
+            diagnostics.log_request_failure(choice, "error", type(e).__name__, endpoint, f"{type(e).__name__}: {e}")
             if choice == "rotate":
                 # Proxy/connection error talking to DataImpulse — count + fall back.
                 routing.record_rotate_result(False)
@@ -237,6 +261,8 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
                 diagnostics.log_method(choice, False)
                 return (False, True, None)
             if is_routed:
+                if token is not None:
+                    diagnostics.update_token(token, used=True)  # keep Uses in sync with method Requests
                 diagnostics.log_method(choice, False)
                 return (False, True, None)  # roproxy/token connection error → fall back
             # User-token request couldn't reach Roblox: report and give up.
@@ -251,6 +277,7 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
             diagnostics.update_token(token, used=True)
         if is_routed:
             diagnostics.log_method(choice, req.status_code == 200)
+            diagnostics.log_method_timing(choice, req.elapsed.total_seconds())
         diagnostics.log_status_code(req.status_code)
         diagnostics.log_request(method.upper(), req.status_code == 200)
         diagnostics.log_proxy_request(method.upper(), req.elapsed.total_seconds())
@@ -262,6 +289,8 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
             diagnostics.log_retry(403, "CSRF token refresh")
             csrf = req.headers.get("x-csrf-token")
             continue
+        # Any non-200: record the reason so the admin can diagnose this requester.
+        diagnostics.log_request_failure(choice, req.status_code, _failure_reason(req.status_code), endpoint, req.text)
         if req.status_code == 429:
             # Rate-limited. For the token, drop it for revalidation. Either way,
             # fall through and let another method try (no user-facing retry storm).
@@ -365,11 +394,58 @@ def _revalidate_one(token: str):
             diagnostics.remove_token(token, expired=True)
 
 
-def force_revalidate_tokens():
-    """Re-check every known token, and clear the routing cooldowns so traffic can
-    flow again immediately."""
-    routing.reset()
+def check_tokens() -> list[dict]:
+    """Synchronously verify each current token against Roblox and return a report
+    [{Masked, Active, Error}]. Updates the inventory (drops expired, re-adds valid).
+
+    Counts toward the token's request budget (it IS a request to Roblox) but NOT
+    toward the per-requester Token stats, which track user-serving traffic only."""
+    _maybe_reload_tokens()
     with _tokens_lock:
         snapshot = list(tokens)
-    for t in snapshot:
-        background.schedule(0, _revalidate_one, t)
+    report = []
+    for token in snapshot:
+        masked = f"...{token[-20:]}"
+        diagnostics.record_token_budget_usage(routing.record_token_use())
+        try:
+            req = requests.get(
+                "https://accountinformation.roblox.com/v1/birthdate",
+                cookies={".ROBLOSECURITY": token},
+                timeout=_timeout(),
+            )
+        except requests.RequestException as e:
+            report.append({"Masked": masked, "Active": None, "Error": type(e).__name__})
+            continue
+        active = req.status_code == 200
+        with _tokens_lock:
+            if active:
+                if token not in tokens:
+                    tokens.append(token)
+                diagnostics.update_token(token)
+            else:
+                if token in tokens:
+                    tokens.remove(token)
+                diagnostics.remove_token(token, expired=True)
+        report.append({"Masked": masked, "Active": active, "Error": "" if active else f"HTTP {req.status_code}"})
+    return report
+
+
+def probe_rotation() -> dict:
+    """Verify rotation by fetching our exit IP through the proxy; logs it on success.
+    Returns the rotation status + the observed exit IP (or the error)."""
+    ip, error = rotate.probe_exit_ip()
+    if ip:
+        diagnostics.log_rotate_ip(ip, "probe")
+    return {
+        "Configured": rotate.is_configured(),
+        "Enabled": rotate.is_enabled(),
+        "ExitIP": ip,
+        "Error": error,
+    }
+
+
+def force_revalidate_tokens() -> list[dict]:
+    """Re-check every known token, clear the routing cooldowns so traffic can flow
+    again immediately, and return a report of which tokens are still active."""
+    routing.reset()
+    return check_tokens()

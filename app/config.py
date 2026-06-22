@@ -68,6 +68,12 @@ ROTATE_PROXY_FILE = os.environ.get("ROXY_ROTATE_PROXY_FILE", "/etc/roxy/rotate_p
 ROTATE_PROXY_ENV = os.environ.get("ROXY_ROTATE_PROXY", "")
 ROTATE_COOLDOWN = 60  # In seconds to pause Rotate after a streak of proxy-level failures.
 ROTATE_MAX_FAILURES = 3  # Consecutive proxy failures before Rotate goes on cooldown.
+# Verifying rotation: an IP-echo endpoint we fetch THROUGH the rotation proxy to
+# learn (and log) which exit IP we got. DataImpulse responses to Roblox never
+# reveal the exit IP, so this is the only way to confirm rotation is working.
+ROTATE_IP_ECHO_URL = "https://api.ipify.org?format=json"
+ROTATE_PROBE_TIMEOUT = 10  # Seconds for the exit-IP probe (kept short).
+MAX_ROTATE_IPS = 20  # How many recent exit IPs to keep for verification.
 
 # --- Proxying robustness ---
 REQUEST_TIMEOUT = 15  # In seconds, how long to wait on an upstream Roblox request before failing.

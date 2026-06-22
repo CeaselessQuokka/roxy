@@ -195,7 +195,7 @@ def record_rotate_result(ok: bool):
             data["RotateFails"] = 0
         else:
             fails = int(data.get("RotateFails", 0)) + 1
-            max_fails = config.ROTATE_MAX_FAILURES
+            max_fails = int(runtime.get_setting("rotate_max_failures", config.ROTATE_MAX_FAILURES))
             if fails >= max_fails:
                 data["RotateUntil"] = now + int(runtime.get_setting("rotate_cooldown", config.ROTATE_COOLDOWN))
                 data["RotateFails"] = 0
