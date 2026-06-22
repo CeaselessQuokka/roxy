@@ -4,6 +4,7 @@ ENV_NAME=SiteEnv
 SERVICE_NAME="roxy.service"
 SITE_NAME="Roxy"
 GITHUB_REPO_NAME="roxy"
+SITE_CODE_ROOT="app"
 
 if systemctl is-active --quiet "$SERVICE_NAME"; then
 	echo "Stopping $SITE_NAME service."
@@ -30,7 +31,7 @@ python3 -m venv "$ENV_NAME"
 cd ~/Build
 
 echo "Deploying newest build."
-sudo mv "$GITHUB_REPO_NAME"/src "$DEPLOY_TO"
+sudo mv "$GITHUB_REPO_NAME"/"$SITE_CODE_ROOT" "$DEPLOY_TO"
 rm -rf ~/Build
 
 if systemctl list-unit-files "$SERVICE_NAME" | grep -q "$SERVICE_NAME"; then
@@ -41,13 +42,3 @@ else
 	echo "Service $SERVICE_NAME not found. Create a systemd service to run the site."
 fi
 rm ~/UpdateBuildOld.sh
-
-
-# TODO: REMOVE
-cd ~/temp
-rm -rf ~/temp/roxy
-git clone https://github.com/CeaselessQuokka/roxy
-rm -rf ~/roxy/app
-mv roxy/app/ ~/roxy/app
-cd ~/roxy/app
-sudo systemctl start roxy.service
