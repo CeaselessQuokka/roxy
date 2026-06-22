@@ -111,6 +111,14 @@ _settings = {
     # When global throttle-all is ON: each IP may make this many requests per window.
     "global_throttle_limit": _setting(config.GLOBAL_THROTTLE_LIMIT, 1, 100000, "int"),
     "global_throttle_period": _setting(config.GLOBAL_THROTTLE_PERIOD, 1, 86400, "int"),
+    # Upstream method routing weights + the token "danger zone".
+    "roproxy_weight": _setting(config.ROPROXY_WEIGHT, 0, 1000, "int"),
+    "token_weight": _setting(config.TOKEN_WEIGHT, 0, 1000, "int"),
+    "rotate_weight": _setting(config.ROTATE_WEIGHT, 0, 1000, "int"),
+    "token_danger_zone": _setting(config.TOKEN_DANGER_ZONE, 0, 100000, "int"),
+    # IP rotation (DataImpulse): master on/off + cooldown after proxy failures.
+    "rotate_enabled": _setting(1, 0, 1, "int"),
+    "rotate_cooldown": _setting(config.ROTATE_COOLDOWN, 0, 86400, "int"),
 }
 
 

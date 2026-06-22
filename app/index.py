@@ -89,6 +89,12 @@ def robots_txt():
     return send_from_directory(os.path.join(app.root_path), "robots.txt")
 
 
+@app.route("/sitemap.xml", methods=["GET"])
+def sitemap_xml():
+    diagnostics.log_crawl(get_client_ip())
+    return send_from_directory(os.path.join(app.root_path), "sitemap.xml", mimetype="application/xml")
+
+
 @app.route("/favicon.ico", methods=["GET"])
 def favicon():
     # Browsers request this automatically; without a route it would fall into the
@@ -297,7 +303,15 @@ def admin_diagnostics():
     data["EndpointRules"] = runtime.get_endpoint_rules()
     data["HeaderRules"] = runtime.get_header_rules()
     data["ThrottleAll"] = runtime.get_throttle_all_state()
-    data["TokenBudget"] = proxy.get_token_budget_state()
+    # Token budget for the dashboard, sourced from the shared routing state that
+    # get_diagnostics already fetched (no extra file read).
+    rs = data.get("Routing", {})
+    data["TokenBudget"] = {
+        "Used": rs.get("TokenUsed", 0),
+        "Limit": rs.get("TokenLimit", 0),
+        "Window": rs.get("TokenWindow", 0),
+        "ResetIn": rs.get("TokenResetIn", 0),
+    }
     data["Persistence"] = storage.get_status()
     data["TrustedDevices"] = runtime.get_trusted_device_count()
     data["TrustedThisDevice"] = runtime.is_trusted_device(request.cookies.get(TRUSTED_DEVICE_COOKIE, ""))
@@ -529,6 +543,9 @@ path_ignore_set = set(
 )
 
 # Hop-by-hop / environment headers that must never be forwarded to Roblox.
+# Exact header names to drop before forwarding to Roblox. Anything that could
+# reveal our server, our domain, or the visitor's IP must go (so Roblox can't
+# fingerprint us as a proxy / flag bot behavior).
 _STRIPPED_REQUEST_HEADERS = (
     "Host",
     "Accept",
@@ -540,13 +557,20 @@ _STRIPPED_REQUEST_HEADERS = (
     "Traceparent",
     "Cookie",  # Never forward visitor cookies upstream.
     "Transfer-Encoding",
-    "X-Forwarded-For",
-    "X-Forwarded-Proto",
-    "X-Forwarded-Host",
-    "X-Forwarded-Port",
-    "X-Real-Ip",
     "Forwarded",
+    "Via",
+    "Referer",  # Would reveal roxytheproxy.com.
+    "Origin",  # Same.
+    "True-Client-Ip",
+    "X-Real-Ip",
+    "X-Client-Ip",
+    "X-Cluster-Client-Ip",
+    "X-Original-Forwarded-For",
 )
+
+# Any header whose lowercased name starts with one of these prefixes is dropped
+# too — covers X-Forwarded-*, all Cloudflare CF-* headers, and our own Roxy-*.
+_STRIPPED_HEADER_PREFIXES = ("x-forwarded", "cf-", "roxy-", "x-real", "fly-", "x-vercel", "x-amzn")
 
 
 def validate_url(url: str) -> bool:
@@ -742,10 +766,14 @@ def proxy_page(dst: str):
 
     data = request.get_data() if request.method in ("POST", "PATCH", "PUT", "DELETE") else None
 
-    # Remove/overwrite headers that could cause issues or leak visitor data.
-    headers = dict(request.headers)
-    for name in _STRIPPED_REQUEST_HEADERS:
-        headers.pop(name, None)
+    # Remove/overwrite headers that could cause issues or identify us/the visitor.
+    headers = {}
+    stripped = {name.lower() for name in _STRIPPED_REQUEST_HEADERS}
+    for key, value in request.headers.items():
+        kl = key.lower()
+        if kl in stripped or any(kl.startswith(p) for p in _STRIPPED_HEADER_PREFIXES):
+            continue
+        headers[key] = value
     headers.update(get_fake_headers())
 
     roblox_token = headers.pop("X-Roblox-Token", None)

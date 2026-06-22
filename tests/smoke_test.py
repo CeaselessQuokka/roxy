@@ -21,6 +21,11 @@ import time
 sandbox = tempfile.mkdtemp(prefix="roxy_test_")
 os.environ["ROXY_FILE_ROOT"] = sandbox
 os.environ["ROXY_DATA_FILE"] = os.path.join(sandbox, "roxy_data.json")
+os.environ["ROXY_ROUTING_FILE"] = os.path.join(sandbox, "roxy_routing.json")
+# Rotation proxy points at a sandbox file that doesn't exist yet → rotation is
+# disabled until a test writes it.
+ROTATE_PROXY_PATH = os.path.join(sandbox, "rotate_proxy.txt")
+os.environ["ROXY_ROTATE_PROXY_FILE"] = ROTATE_PROXY_PATH
 
 ADMIN_USER = "testadmin"
 ADMIN_PASS = "testpassword123"
@@ -224,14 +229,49 @@ class FakeUpstreamResponse:
 upstream_calls = []
 
 
-def fake_upstream(method, url, headers=None, params=None, data=None, cookies=None, timeout=None):
+def fake_upstream(method, url, headers=None, params=None, data=None, cookies=None, timeout=None, proxies=None):
     upstream_calls.append(
-        {"method": method, "url": url, "headers": headers or {}, "params": params or {}, "cookies": cookies}
+        {"method": method, "url": url, "headers": headers or {}, "params": params or {}, "cookies": cookies, "proxies": proxies}
     )
     return FakeUpstreamResponse()
 
 
 proxy_module.requests.request = fake_upstream
+
+import routing as routing_module  # noqa: E402
+
+
+def reset_routing():
+    """Clear the shared routing file (token budget + cooldowns) between sections."""
+    routing_module.reset()
+
+
+def set_method_weights(roproxy, token, rotate):
+    """Force the routing mix deterministically for a test section."""
+    client.post(
+        "/admin/settings",
+        headers=IP_MAIN,
+        json={"settings": {"roproxy_weight": roproxy, "token_weight": token, "rotate_weight": rotate}},
+    )
+
+
+# Default for most sections: every routed request goes via Token (roblox.com),
+# with a budget so high it never interferes, and no RoProxy cooldown getting in
+# the way. Specific sections override these as needed.
+client.post(
+    "/admin/settings",
+    headers=IP_MAIN,
+    json={
+        "settings": {
+            "roproxy_weight": 0,
+            "token_weight": 100,
+            "rotate_weight": 0,
+            "token_budget_requests": 100000,
+            "roproxy_cooldown": 0,
+        }
+    },
+)
+proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
 
 api_client = app.test_client()
 api_client.set_cookie("some_visitor_cookie", "should-not-be-forwarded")
@@ -240,14 +280,10 @@ IP_API = {"X-Forwarded-For": "10.3.3.3"}
 r = api_client.get("/avatar.roblox.com/v2/test?prettyprint=true&ids=1&ids=2", headers=IP_API)
 check("Proxied GET -> 200", r.status_code == 200, r.status_code)
 check("prettyprint=true formats the response", json.loads(r.data) == {"ok": True} and b"\n" in r.data, r.data[:60])
-call = upstream_calls[-1]  # The first request, before cooldown reroutes the next one to RoProxy.
+call = upstream_calls[-1]
 r = api_client.get("/avatar.roblox.com/v2/test-plain", headers=IP_API)
 check("Raw upstream body passed through without prettyprint", r.data == b'{"ok":true}', r.data[:60])
-check(
-    "Second request fell back to RoProxy (direct API in cooldown)",
-    upstream_calls[-1]["url"] == "https://avatar.roproxy.com/v2/test-plain",
-    upstream_calls[-1]["url"],
-)
+check("Token route attaches the .ROBLOSECURITY cookie", (call["cookies"] or {}).get(".ROBLOSECURITY") == "FAKE_TOKEN_AAA", call["cookies"])
 check("Upstream URL is https + roblox", call["url"] == "https://avatar.roblox.com/v2/test", call["url"])
 check("prettyprint stripped before proxying", "prettyprint" not in call["params"], call["params"])
 check("Repeated query params preserved", call["params"].get("ids") == ["1", "2"], call["params"])
@@ -278,41 +314,33 @@ check(
 )
 check("Persistence health says writable", diag.get("Persistence", {}).get("Writable") is True, diag.get("Persistence"))
 
-print("== Token safety budget (never exceeds the configured cap) ==")
+print("== Token safety budget (hard cap; falls back, never exceeds) ==")
+reset_routing()
+# Token preferred; RoProxy is the only fallback (rotate disabled, cooldown off).
 client.post(
     "/admin/settings",
     headers=IP_MAIN,
-    json={"settings": {"token_budget_requests": 2, "token_budget_window": 3600}},
+    json={"settings": {"token_budget_requests": 2, "token_budget_window": 3600, "roproxy_cooldown": 0}},
 )
-proxy_module.is_direct_api_in_cooldown = True
-proxy_module.is_roproxy_in_cooldown = True
+set_method_weights(0, 100, 0)  # token-only while available; falls to roproxy when budget-capped
 proxy_module.set_tokens(["BUDGET_TOKEN"])
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})  # fresh method counters
 budget_client = app.test_client()
 IP_BUDGET = {"X-Forwarded-For": "10.4.4.4"}
-r1 = budget_client.get("/games.roblox.com/v1/list?a=1", headers=IP_BUDGET)
-r2 = budget_client.get("/games.roblox.com/v1/list?a=2", headers=IP_BUDGET)
-check("Token requests 1-2 within budget -> 200", r1.status_code == 200 and r2.status_code == 200)
-check(
-    "Internal token attached upstream",
-    (upstream_calls[-1]["cookies"] or {}).get(".ROBLOSECURITY") == "BUDGET_TOKEN",
-    upstream_calls[-1]["cookies"],
-)
-r3 = budget_client.get("/games.roblox.com/v1/list?a=3", headers=IP_BUDGET)
-check("Request 3 rejected by budget (no upstream call)", r3.status_code == 500 and b"safety budget" in r3.data, r3.data[:90])
-check("Budget rejection did not hit Roblox", (upstream_calls[-1]["params"] or {}).get("a") == ["2"], upstream_calls[-1])
+for i in range(5):
+    budget_client.get(f"/games.roblox.com/v1/list?a={i}", headers=IP_BUDGET)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 diag = r.get_json()
-check("TokenBudget shows usage", diag.get("TokenBudget", {}).get("Used") == 2, diag.get("TokenBudget"))
+ms = diag.get("MethodStats", {})
+check("Token used exactly the budget (2), never more", ms.get("Token", {}).get("Requests") == 2, ms.get("Token"))
+check("Over-budget requests fell back to RoProxy (3)", ms.get("RoProxy", {}).get("Requests") == 3, ms.get("RoProxy"))
+check("TokenBudget shows the cap usage", diag.get("TokenBudget", {}).get("Used") == 2, diag.get("TokenBudget"))
 check("TokenBudget limit reflects setting", diag.get("TokenBudget", {}).get("Limit") == 2, diag.get("TokenBudget"))
-check("Budget rejections counted", diag.get("TokenBudgetRejections", 0) >= 1, diag.get("TokenBudgetRejections"))
 # Restore sane values for the rest of the run.
-client.post(
-    "/admin/settings",
-    headers=IP_MAIN,
-    json={"settings": {"token_budget_requests": 95, "token_budget_window": 65}},
-)
-proxy_module.is_direct_api_in_cooldown = False
-proxy_module.is_roproxy_in_cooldown = False
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"token_budget_requests": 100000, "token_budget_window": 65}})
+set_method_weights(0, 100, 0)
+reset_routing()
+proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
 
 print("== Clear-data targets (manual-only erasure) ==")
 r = client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "nope"})
@@ -516,65 +544,59 @@ client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": False})
 r = api_client.get("/games.roblox.com/v1/after-pause", headers={"X-Forwarded-For": "10.15.0.2"})
 check("After resume, proxy works again -> 200", r.status_code == 200, r.status_code)
 
-print("== Direct API / RoProxy rejection counts ==")
-proxy_module.is_direct_api_in_cooldown = False
-proxy_module.is_roproxy_in_cooldown = False
-proxy_module.set_tokens([])  # force the direct-API / RoProxy routes (no token path)
+print("== RoProxy rejection counts (non-200) ==")
+reset_routing()
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"roproxy_cooldown": 0}})
+set_method_weights(100, 0, 0)  # force RoProxy
 
 
-def failing_upstream(method, url, headers=None, params=None, data=None, cookies=None, timeout=None):
+def failing_upstream(method, url, headers=None, params=None, data=None, cookies=None, timeout=None, proxies=None):
     upstream_calls.append({"method": method, "url": url, "headers": headers or {}, "params": params or {}, "cookies": cookies})
     return FakeUpstreamResponse(status=500, text="upstream boom")
 
 
 proxy_module.requests.request = failing_upstream
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-ph0 = r.get_json().get("ProxyHealth", {})
-da0 = ph0.get("DirectAPI", {}).get("Failed", 0)
-rp0 = ph0.get("RoProxy", {}).get("Failed", 0)
-api_client.get("/games.roblox.com/v1/fail-direct", headers={"X-Forwarded-For": "10.10.0.1"})  # direct route, 500
-api_client.get("/games.roblox.com/v1/fail-roproxy", headers={"X-Forwarded-For": "10.10.0.2"})  # roproxy route, 500
+rp0 = r.get_json().get("MethodStats", {}).get("RoProxy", {}).get("Failed", 0)
+api_client.get("/games.roblox.com/v1/fail-a", headers={"X-Forwarded-For": "10.10.0.1"})
+api_client.get("/games.roblox.com/v1/fail-b", headers={"X-Forwarded-For": "10.10.0.2"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-ph1 = r.get_json().get("ProxyHealth", {})
-check("Direct API rejection counted", ph1.get("DirectAPI", {}).get("Failed", 0) >= da0 + 1, ph1.get("DirectAPI"))
-check("RoProxy rejection counted", ph1.get("RoProxy", {}).get("Failed", 0) >= rp0 + 1, ph1.get("RoProxy"))
+rp1 = r.get_json().get("MethodStats", {}).get("RoProxy", {})
+check("RoProxy rejection (non-200) counted", rp1.get("Failed", 0) >= rp0 + 1, rp1)
+check("RoProxy requests counted", rp1.get("Requests", 0) >= 2, rp1)
 proxy_module.requests.request = fake_upstream  # restore 200s
+set_method_weights(0, 100, 0)
+reset_routing()
 
 print("== Upstream timeouts: fall through routes, never email ==")
-proxy_module.is_direct_api_in_cooldown = False
-proxy_module.is_roproxy_in_cooldown = False
+reset_routing()
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"roproxy_cooldown": 0}})
+set_method_weights(100, 1, 0)  # try RoProxy first; Token is the fallback
 proxy_module.set_tokens(["FALLBACK_TOKEN"])
-proxy_module._token_uses.clear()
 
 
-def timeout_unless_token(method, url, headers=None, params=None, data=None, cookies=None, timeout=None):
+def timeout_unless_token(method, url, headers=None, params=None, data=None, cookies=None, timeout=None, proxies=None):
     upstream_calls.append({"method": method, "url": url, "cookies": cookies})
     if cookies and cookies.get(".ROBLOSECURITY"):
         return FakeUpstreamResponse(status=200, text='{"ok":true}')  # token route works
-    raise proxy_module.requests.Timeout("read timed out")  # direct + roproxy time out
+    raise proxy_module.requests.Timeout("read timed out")  # roproxy times out
 
 
 proxy_module.requests.request = timeout_unless_token
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-ph0 = r.get_json().get("ProxyHealth", {})
+to0 = r.get_json().get("MethodStats", {}).get("RoProxy", {}).get("Timeouts", 0)
 emails_before = len(sent_emails)
 r = api_client.get("/games.roblox.com/v1/timeout-test", headers={"X-Forwarded-For": "10.16.0.1"})
-check("Direct+RoProxy timeout falls through to the token -> 200", r.status_code == 200, r.status_code)
+check("RoProxy timeout falls through to the token -> 200", r.status_code == 200, r.status_code)
 check("Timed-out request was ultimately served", r.data == b'{"ok":true}', r.data[:60])
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-ph1 = r.get_json().get("ProxyHealth", {})
-check(
-    "Direct API timeout counted",
-    ph1.get("DirectAPI", {}).get("Timeouts", 0) >= ph0.get("DirectAPI", {}).get("Timeouts", 0) + 1,
-    ph1.get("DirectAPI"),
-)
-check(
-    "RoProxy timeout counted",
-    ph1.get("RoProxy", {}).get("Timeouts", 0) >= ph0.get("RoProxy", {}).get("Timeouts", 0) + 1,
-    ph1.get("RoProxy"),
-)
+to1 = r.get_json().get("MethodStats", {}).get("RoProxy", {}).get("Timeouts", 0)
+check("RoProxy timeout counted", to1 >= to0 + 1, to1)
 check("Timeouts never email the admin", len(sent_emails) == emails_before, sent_emails[emails_before:])
 proxy_module.requests.request = fake_upstream  # restore 200s
+set_method_weights(0, 100, 0)
+reset_routing()
+proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
 
 print("== Endpoint templating (ID collapse + concrete drill-down) ==")
 proxy_module.is_direct_api_in_cooldown = False
@@ -639,9 +661,8 @@ for rid in [k for k in r.get_json().get("HeaderRules", {}) if "|regex|" in k]:
 
 print("== Token budget peak (1h / 24h) ==")
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
-proxy_module._token_uses.clear()  # fresh window so the peak is exactly what we drive
-proxy_module.is_direct_api_in_cooldown = True
-proxy_module.is_roproxy_in_cooldown = True
+reset_routing()  # fresh window so the peak is exactly what we drive
+set_method_weights(0, 100, 0)  # token-only
 proxy_module.set_tokens(["PEAK_TOKEN"])
 client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"token_budget_requests": 95, "token_budget_window": 65}})
 IP_PK = {"X-Forwarded-For": "10.14.0.1"}
@@ -652,18 +673,18 @@ diag = r.get_json()
 check("Token budget Used reflects the 3 token requests", diag.get("TokenBudget", {}).get("Used") == 3, diag.get("TokenBudget"))
 check("Budget peak (1h) captured", diag.get("BudgetPeak1h") == 3, diag.get("BudgetPeak1h"))
 check("Budget peak (24h) captured", diag.get("BudgetPeak24h") == 3, diag.get("BudgetPeak24h"))
-proxy_module.is_direct_api_in_cooldown = False
-proxy_module.is_roproxy_in_cooldown = False
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"token_budget_requests": 100000}})
+reset_routing()
 
-print("== No user-facing retries (429 fails immediately; CSRF handshake kept) ==")
-proxy_module.is_direct_api_in_cooldown = True
-proxy_module.is_roproxy_in_cooldown = True
+print("== No same-method retry on 429; CSRF handshake kept ==")
+reset_routing()
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"roproxy_cooldown": 0}})
+set_method_weights(50, 50, 0)  # token + roproxy both eligible
 proxy_module.set_tokens(["RETRY_TOKEN"])
-proxy_module._token_uses.clear()
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
 
 
-def upstream_429(method, url, headers=None, params=None, data=None, cookies=None, timeout=None):
+def upstream_429(method, url, headers=None, params=None, data=None, cookies=None, timeout=None, proxies=None):
     upstream_calls.append({"method": method, "url": url})
     return FakeUpstreamResponse(status=429, text="Too Many Requests")
 
@@ -671,19 +692,18 @@ def upstream_429(method, url, headers=None, params=None, data=None, cookies=None
 proxy_module.requests.request = upstream_429
 n = len(upstream_calls)
 r = api_client.get("/games.roblox.com/v1/retry-test", headers={"X-Forwarded-For": "10.20.0.1"})
-check("A 429 fails the user request immediately", r.status_code == 500, r.status_code)
-check("A 429 is NOT retried (single upstream attempt)", len(upstream_calls) == n + 1, len(upstream_calls) - n)
+check("All methods 429'd -> request fails", r.status_code == 500, r.status_code)
+check("Each method tried at most once on 429 (no retry storm)", len(upstream_calls) - n <= 2, len(upstream_calls) - n)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 rc = r.get_json().get("RetryCounts", {})
 check("No 429 retries recorded", "429" not in (rc.get("ByStatusCode") or {}), rc.get("ByStatusCode"))
 
-# CSRF handshake (a required protocol step for writes) must still work.
-proxy_module.is_direct_api_in_cooldown = False
-proxy_module.is_roproxy_in_cooldown = False
-proxy_module.set_tokens([])
+# CSRF handshake (a required protocol step for writes) must still work — via RoProxy.
+reset_routing()
+set_method_weights(100, 0, 0)  # force RoProxy
 
 
-def upstream_csrf(method, url, headers=None, params=None, data=None, cookies=None, timeout=None):
+def upstream_csrf(method, url, headers=None, params=None, data=None, cookies=None, timeout=None, proxies=None):
     upstream_calls.append({"method": method, "url": url})
     if headers and headers.get("x-csrf-token"):
         return FakeUpstreamResponse(status=200, text='{"ok":true}')
@@ -694,10 +714,13 @@ proxy_module.requests.request = upstream_csrf
 n = len(upstream_calls)
 r = api_client.post("/economy.roblox.com/v1/purchase", headers={"X-Forwarded-For": "10.20.0.2"}, data=b"{}")
 check("CSRF handshake still completes a write -> 200", r.status_code == 200, r.status_code)
-check("CSRF handshake used exactly one retry", len(upstream_calls) == n + 2, len(upstream_calls) - n)
+check("CSRF handshake used exactly one retry (same method)", len(upstream_calls) == n + 2, len(upstream_calls) - n)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 check("CSRF retry recorded (403)", "403" in (r.get_json().get("RetryCounts", {}).get("ByStatusCode") or {}))
 proxy_module.requests.request = fake_upstream
+set_method_weights(0, 100, 0)
+reset_routing()
+proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
 
 print("== Service messages persist after disabling ==")
 client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": True, "reason": "Persisted pause msg"})
@@ -719,14 +742,12 @@ check("Concrete endpoint stores last headers", "X-Test-Header" in (concrete.get(
 check("Concrete endpoint stores last IP", concrete.get("LastIP") == "10.21.0.1", concrete.get("LastIP"))
 
 print("== Token route Requests/Rejected counted ==")
-# Force the token route (direct + roproxy in cooldown) so a token request actually happens.
+set_method_weights(0, 100, 0)  # force the token route
 proxy_module.set_tokens(["TKR_TOKEN"])
-proxy_module.is_direct_api_in_cooldown = True
-proxy_module.is_roproxy_in_cooldown = True
 api_client.get("/games.roblox.com/v1/token-route", headers={"X-Forwarded-For": "10.21.0.2"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-tk = r.get_json().get("ProxyHealth", {}).get("Tokens", {})
-check("Token route request count tracked", tk.get("Requests", 0) >= 1, tk)
+tk = r.get_json().get("MethodStats", {}).get("Token", {})
+check("Token method request count tracked", tk.get("Requests", 0) >= 1, tk)
 
 print("== Request fingerprints (header names + user-agents) ==")
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "fingerprints"})
@@ -808,50 +829,43 @@ app.test_client().get("/admin", headers={"X-Forwarded-For": "10.25.0.1"})  # fre
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 check("Anonymous GET /admin increments the counter", r.get_json()["PageVisits"].get("admin", 0) == visits0 + 1, r.get_json()["PageVisits"])
 
-print("== Health: Tokens Requests == sum of Uses; Direct/RoProxy ResetIn ==")
+print("== Health: method stats + routing budget/cooldown ResetIn ==")
 proxy_module.requests.request = fake_upstream
-proxy_module.is_direct_api_in_cooldown = False
-proxy_module.is_roproxy_in_cooldown = False
+reset_routing()
+set_method_weights(0, 100, 0)  # token-only
 proxy_module.set_tokens(["MATCH_TOKEN"])
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "all"})
-# Force the token route (direct + roproxy in cooldown) and make a few requests.
-proxy_module.is_direct_api_in_cooldown = True
-proxy_module.is_roproxy_in_cooldown = True
 for i in range(3):
     api_client.get(f"/games.roblox.com/v1/match{i}", headers={"X-Forwarded-For": "10.30.0.1"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 diag = r.get_json()
-token_uses = sum(int(t.get("Uses", 0)) for t in diag.get("Tokens", []))
-tokens_requests = diag.get("ProxyHealth", {}).get("Tokens", {}).get("Requests", 0)
-check("Token health Requests equals sum of Auth-token Uses", tokens_requests == token_uses and token_uses >= 3, (tokens_requests, token_uses))
-# Trigger a direct-API cooldown and confirm ResetIn is reported.
-proxy_module.is_direct_api_in_cooldown = False
-proxy_module.is_roproxy_in_cooldown = False
-proxy_module.set_tokens([])
-api_client.get("/games.roblox.com/v1/cooldown-test", headers={"X-Forwarded-For": "10.30.0.2"})  # enters direct cooldown
+check("Token method recorded 3 requests", diag.get("MethodStats", {}).get("Token", {}).get("Requests") == 3, diag.get("MethodStats", {}).get("Token"))
+check("Routing reports token budget usage", diag.get("Routing", {}).get("TokenUsed", 0) >= 3, diag.get("Routing"))
+# Force a RoProxy pick with a real cooldown and confirm RoProxyResetIn is reported.
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"roproxy_cooldown": 65}})
+set_method_weights(100, 0, 0)
+api_client.get("/games.roblox.com/v1/cooldown-test", headers={"X-Forwarded-For": "10.30.0.2"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-da = r.get_json().get("ProxyHealth", {}).get("DirectAPI", {})
-check("Direct API reports a cooldown ResetIn", da.get("IsInCooldown") and da.get("ResetIn", 0) > 0, da)
+check("RoProxy reports a cooldown ResetIn", r.get_json().get("Routing", {}).get("RoProxyResetIn", 0) > 0, r.get_json().get("Routing"))
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"roproxy_cooldown": 0}})
+set_method_weights(0, 100, 0)
+reset_routing()
 
-print("== Clear-all resets the live health counters too ==")
-proxy_module.is_direct_api_in_cooldown = False
-proxy_module.is_roproxy_in_cooldown = False
+print("== Clear-all resets the method counters too ==")
 proxy_module.set_tokens(["CLR_TOKEN"])
 api_client.get("/games.roblox.com/v1/before-clear", headers={"X-Forwarded-For": "10.30.0.3"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-ph_before = r.get_json().get("ProxyHealth", {})
-check("Health has request counts before clear", (ph_before.get("DirectAPI", {}).get("Count", 0) + ph_before.get("RoProxy", {}).get("Count", 0)) >= 1, ph_before)
+ms_before = r.get_json().get("MethodStats", {})
+check("Method stats have requests before clear", ms_before.get("Token", {}).get("Requests", 0) >= 1, ms_before)
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "all"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-ph_after = r.get_json().get("ProxyHealth", {})
-check("Clear-all zeroed Direct API request count", ph_after.get("DirectAPI", {}).get("Count", 0) == 0, ph_after.get("DirectAPI"))
-check("Clear-all zeroed RoProxy request count", ph_after.get("RoProxy", {}).get("Count", 0) == 0, ph_after.get("RoProxy"))
-check("Clear-all zeroed token Requests", ph_after.get("Tokens", {}).get("Requests", 0) == 0, ph_after.get("Tokens"))
+ms_after = r.get_json().get("MethodStats", {})
+check("Clear-all zeroed Token request count", ms_after.get("Token", {}).get("Requests", 0) == 0, ms_after.get("Token"))
+check("Clear-all zeroed RoProxy request count", ms_after.get("RoProxy", {}).get("Requests", 0) == 0, ms_after.get("RoProxy"))
+proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
 
 print("== Specific-header request filter (precise targeting) ==")
 proxy_module.requests.request = fake_upstream
-proxy_module.is_direct_api_in_cooldown = False
-proxy_module.is_roproxy_in_cooldown = False
 proxy_module.set_tokens(["SPEC_TOKEN"])
 # Target ONLY the User-Agent value; other headers containing the word must NOT trip it.
 r = client.post("/admin/headers/rule", headers=IP_MAIN, json={"header": "User-Agent", "mode": "contains", "needle": "BadClient"})
@@ -915,6 +929,100 @@ diag = r.get_json()
 now_minute = int(diag["ServerTime"] // 60)
 hour_ok = sum(b.get("Successful", 0) for m, b in diag.get("TrafficMinutes", {}).items() if int(m) > now_minute - 60)
 check("Traffic minutes reflect recent successful requests (drives the pills)", hour_ok >= 4, hour_ok)
+
+print("== IP rotation (DataImpulse) ==")
+import rotate as rotate_module
+
+# Enable rotation by writing the proxy file the rotate module watches.
+with open(ROTATE_PROXY_PATH, "w") as f:
+    f.write("http://gw.dataimpulse.test:823\n")
+reset_routing()
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
+set_method_weights(0, 0, 100)  # force Rotate
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check("Rotation reports configured + enabled", r.get_json().get("Rotate", {}).get("Configured") and r.get_json().get("Rotate", {}).get("Enabled"), r.get_json().get("Rotate"))
+check("Proxy URL shown masked (no creds)", "@" not in (r.get_json().get("Rotate", {}).get("ProxyUrl") or ""), r.get_json().get("Rotate"))
+IP_ROT = {"X-Forwarded-For": "10.50.0.1"}
+r = api_client.get("/games.roblox.com/v1/rotate-me", headers={**IP_ROT, "User-Agent": "OriginalUA/1"})
+check("Rotated request -> 200", r.status_code == 200, r.status_code)
+last = upstream_calls[-1]
+check("Rotate sends through the proxy", bool(last.get("proxies")), last.get("proxies"))
+check("Rotate uses roblox.com (not roproxy)", last["url"] == "https://games.roblox.com/v1/rotate-me", last["url"])
+check("Rotate sends NO token cookie", not (last.get("cookies") or {}).get(".ROBLOSECURITY"), last.get("cookies"))
+check("Rotate swaps in a random User-Agent", last["headers"].get("User-Agent") != "OriginalUA/1", last["headers"].get("User-Agent"))
+check("Rotate drops Chrome client-hints (UA mismatch)", "Sec-Ch-Ua" not in last["headers"], list(last["headers"]))
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check("Rotation count recorded", r.get_json().get("MethodStats", {}).get("Rotate", {}).get("Requests", 0) >= 1, r.get_json().get("MethodStats", {}).get("Rotate"))
+
+print("== Rotation proxy failure falls back ==")
+reset_routing()
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"roproxy_cooldown": 0}})
+set_method_weights(0, 1, 100)  # prefer Rotate, Token as fallback
+proxy_module.set_tokens(["ROT_FALLBACK_TOKEN"])
+
+
+def rotate_fails_token_ok(method, url, headers=None, params=None, data=None, cookies=None, timeout=None, proxies=None):
+    upstream_calls.append({"method": method, "url": url, "cookies": cookies, "proxies": proxies})
+    if proxies:  # the rotation proxy is "down"
+        raise proxy_module.requests.exceptions.ProxyError("502 from proxy")
+    return FakeUpstreamResponse(status=200, text='{"ok":true}')
+
+
+proxy_module.requests.request = rotate_fails_token_ok
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+rf0 = r.get_json().get("MethodStats", {}).get("Rotate", {}).get("Failed", 0)
+r = api_client.get("/games.roblox.com/v1/rot-fallback", headers={"X-Forwarded-For": "10.50.0.2"})
+check("Rotate proxy failure falls back to another method -> 200", r.status_code == 200, r.status_code)
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+check("Rotate failure counted", r.get_json().get("MethodStats", {}).get("Rotate", {}).get("Failed", 0) >= rf0 + 1, r.get_json().get("MethodStats", {}).get("Rotate"))
+proxy_module.requests.request = fake_upstream
+
+print("== All methods unavailable emails the admin ==")
+reset_routing()
+os.remove(ROTATE_PROXY_PATH)  # disable rotation
+set_method_weights(0, 100, 0)
+proxy_module.set_tokens([])  # no token
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"roproxy_cooldown": 3600}})
+# Burn the single RoProxy slot, then the next request has nothing left.
+set_method_weights(100, 0, 0)
+api_client.get("/games.roblox.com/v1/use-roproxy", headers={"X-Forwarded-For": "10.51.0.1"})
+emails_before = len(emails_with("all upstream methods unavailable"))
+r = api_client.get("/games.roblox.com/v1/nothing-left", headers={"X-Forwarded-For": "10.51.0.2"})
+check("No method available -> request fails", r.status_code == 500, r.status_code)
+check("All-unavailable emails the admin", len(emails_with("all upstream methods unavailable")) > emails_before, "no email")
+# Restore healthy defaults.
+client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"roproxy_cooldown": 0}})
+set_method_weights(0, 100, 0)
+reset_routing()
+proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
+
+print("== No identifying info forwarded upstream ==")
+proxy_module.requests.request = fake_upstream
+set_method_weights(0, 100, 0)
+proxy_module.set_tokens(["LEAK_TOKEN"])
+api_client.get(
+    "/games.roblox.com/v1/leak-check",
+    headers={
+        "X-Forwarded-For": "9.9.9.9",
+        "X-Real-IP": "9.9.9.9",
+        "Referer": "https://roxytheproxy.com/secret",
+        "Origin": "https://roxytheproxy.com",
+        "CF-Connecting-IP": "9.9.9.9",
+        "Via": "1.1 roxy",
+        "Roxy-Internal": "leak",
+        "True-Client-IP": "9.9.9.9",
+    },
+)
+sent = {k.lower() for k in upstream_calls[-1]["headers"]}
+for bad in ("x-forwarded-for", "x-real-ip", "referer", "origin", "cf-connecting-ip", "via", "roxy-internal", "true-client-ip"):
+    check(f"Upstream did NOT receive '{bad}'", bad not in sent, sorted(sent))
+
+print("== sitemap.xml + robots SEO ==")
+r = client.get("/sitemap.xml", headers=IP_MAIN)
+check("GET /sitemap.xml -> 200 XML", r.status_code == 200 and b"<urlset" in r.data, r.status_code)
+r = client.get("/robots.txt", headers=IP_MAIN)
+check("robots.txt references the sitemap", b"Sitemap:" in r.data, r.data[:120])
+check("robots.txt disallows /admin", b"/admin" in r.data, r.data[:120])
 
 print("== Emailed invalidation link (kill switch) ==")
 invalidate_emails = emails_with("Roxy Admin Login")

@@ -423,42 +423,72 @@ const print = console.log;
 		}
 	}
 
+	function setStateWord(id, word, good) {
+		setText(id, word);
+		const el = document.getElementById(id);
+		if (el) {
+			el.classList.toggle("health-ok", good === true);
+			el.classList.toggle("health-bad", good === false);
+		}
+	}
+
 	function renderHealth(d) {
-		const h = d.ProxyHealth || {};
-		const da = h.DirectAPI || {};
-		const rp = h.RoProxy || {};
-		const tk = h.Tokens || {};
+		const ms = d.MethodStats || {};
+		const rp = ms.RoProxy || {};
+		const tok = ms.Token || {};
+		const rot = ms.Rotate || {};
+		const routing = d.Routing || {};
+		const rotate = d.Rotate || {};
+		const tk = (d.ProxyHealth || {}).Tokens || {};
 
-		const healthState = (id, inCooldown) => {
-			setText(id, inCooldown ? "COOLDOWN" : "OK");
-			const el = document.getElementById(id);
-			if (el) {
-				el.classList.toggle("health-ok", !inCooldown);
-				el.classList.toggle("health-bad", Boolean(inCooldown));
-			}
-		};
-		healthState("health_direct", da.IsInCooldown);
-		setText("direct_last", da.LastRequestTime ? timeAgo(da.LastRequestTime) : "—");
-		setText("direct_cooldown", String(Boolean(da.IsInCooldown)));
-		setText("direct_count", String(da.Count || 0));
-		setText("direct_failed", String(da.Failed || 0));
-		setText("direct_timeouts", String(da.Timeouts || 0));
-		setText("direct_reset", da.IsInCooldown ? `${da.ResetIn ?? 0}s` : "—");
-
-		healthState("health_roproxy", rp.IsInCooldown);
-		setText("roproxy_last", rp.LastRequestTime ? timeAgo(rp.LastRequestTime) : "—");
-		setText("roproxy_cooldown", String(Boolean(rp.IsInCooldown)));
-		setText("roproxy_count", String(rp.Count || 0));
+		// RoProxy: in cooldown when routing says so.
+		const roCooldown = Number(routing.RoProxyResetIn || 0) > 0;
+		setStateWord("health_roproxy", roCooldown ? "COOLDOWN" : "OK", !roCooldown);
+		setText("roproxy_reset", roCooldown ? `${routing.RoProxyResetIn}s` : "—");
+		setText("roproxy_count", String(rp.Requests || 0));
 		setText("roproxy_failed", String(rp.Failed || 0));
 		setText("roproxy_timeouts", String(rp.Timeouts || 0));
-		setText("roproxy_reset", rp.IsInCooldown ? `${rp.ResetIn ?? 0}s` : "—");
+
+		// Token: "BUDGET" when the safety budget is full, else OK.
+		const tokenFull = Number(routing.TokenUsed || 0) >= Number(routing.TokenLimit || 0) && routing.TokenLimit;
+		const noTokens = Number(tk.Count || 0) === 0;
+		setStateWord(
+			"health_token",
+			noTokens ? "NO TOKEN" : tokenFull ? "AT BUDGET" : "OK",
+			!noTokens && !tokenFull,
+		);
+		setText("token_count", String(tok.Requests || 0));
+		setText("token_failed", String(tok.Failed || 0));
+		setText("token_timeouts", String(tok.Timeouts || 0));
+
+		// Rotate: Disabled / Cooldown / Working.
+		const rotResetIn = Number(routing.RotateResetIn || 0);
+		let rotWord = "DISABLED";
+		let rotGood = null;
+		if (rotate.Configured && rotate.Enabled) {
+			if (rotResetIn > 0) {
+				rotWord = "COOLDOWN";
+				rotGood = false;
+			} else {
+				rotWord = "WORKING";
+				rotGood = true;
+			}
+		} else if (rotate.Configured) {
+			rotWord = "OFF";
+		}
+		setStateWord("health_rotate", rotWord, rotGood);
+		setText("rotate_count", String(rot.Requests || 0));
+		setText("rotate_failed", String(rot.Failed || 0));
+		setText("rotate_timeouts", String(rot.Timeouts || 0));
+		setText("rotate_last_ok", rot.LastSuccessAt ? timeAgo(rot.LastSuccessAt) : "—");
+		setText("rotate_reset", rotResetIn > 0 ? `${rotResetIn}s` : "—");
+		setText("rotate_proxy", rotate.ProxyUrl || "(not configured)");
+		const rerr = $("#rotate_error");
+		if (rerr) rerr.textContent = rot.LastError ? ` • last error: ${rot.LastError}` : "";
 
 		setText("health_tokens_count", String(tk.Count ?? 0));
-		setText("health_tokens_requests", String(tk.Requests ?? 0));
-		setText("health_tokens_failed", String(tk.Failed ?? 0));
 		setText("health_tokens_expired", String(tk.ExpiredCount ?? 0));
 		setText("health_tokens_validating", String(tk.BeingValidatedCount ?? 0));
-		setText("health_tokens_timeouts", String(tk.Timeouts ?? 0));
 
 		const started = Number(d.WorkerStartedAt || 0);
 		const server = Number(d.ServerTime || 0);
@@ -1036,6 +1066,12 @@ const print = console.log;
 		token_budget_window: "Token budget: window (s)",
 		global_throttle_limit: "Throttle-all: max requests / IP",
 		global_throttle_period: "Throttle-all: window (s)",
+		roproxy_weight: "Method weight: RoProxy",
+		token_weight: "Method weight: Token",
+		rotate_weight: "Method weight: Rotate",
+		token_danger_zone: "Token danger zone (requests)",
+		rotate_enabled: "IP rotation enabled (1/0)",
+		rotate_cooldown: "Rotate cooldown after failures (s)",
 	};
 
 	function renderSettings(d) {

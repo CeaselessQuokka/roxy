@@ -117,15 +117,34 @@ proxy_request_counts = dict(
     }
 )
 
+# Token INVENTORY (how many tokens are loaded right now, plus validation/expiry
+# bookkeeping). Maintained by update_token/remove_token/clear_tokens. Per-worker,
+# but identical across workers since they all load the same token file.
 proxy_health = dict(
     {
-        # Count = nRequests; Failed = nNon-200 responses; Timeouts = nUpstream timeouts.
-        "DirectAPI": dict({"Count": 0, "Failed": 0, "Timeouts": 0, "LastRequestTime": 0, "IsInCooldown": False}),
-        "RoProxy": dict({"Count": 0, "Failed": 0, "Timeouts": 0, "LastRequestTime": 0, "IsInCooldown": False}),
-        # Count = nTokens loaded; Requests/Failed = token-route request totals.
-        "Tokens": dict(
-            {"Count": 0, "ExpiredCount": 0, "BeingValidatedCount": 0, "Timeouts": 0, "Requests": 0, "Failed": 0}
-        ),
+        "Tokens": dict({"Count": 0, "ExpiredCount": 0, "BeingValidatedCount": 0}),
+    }
+)
+
+# Per-method request tallies (RoProxy / Token / Rotate), MERGED across workers so
+# the dashboard shows true global totals. Requests = total; Failed = non-200 /
+# proxy errors; Timeouts = upstream timeouts. Rotate also keeps health/last-error.
+def _method_stat():
+    return dict({"Requests": 0, "Failed": 0, "Timeouts": 0})
+
+
+method_stats = dict(
+    {
+        "RoProxy": _method_stat(),
+        "Token": _method_stat(),
+        "Rotate": {
+            "Requests": 0,
+            "Failed": 0,
+            "Timeouts": 0,
+            "LastSuccessAt": 0,
+            "LastErrorAt": 0,
+            "LastError": "",
+        },
     }
 )
 
@@ -493,50 +512,48 @@ def _budget_peak_since(minutes: int) -> int:
     return peak
 
 
-def log_route_result(is_roproxy: bool, success: bool):
-    """Count a Direct-API or RoProxy call and whether it failed (non-200)."""
-    route = "RoProxy" if is_roproxy else "DirectAPI"
-    with _state_lock:
-        proxy_health[route]["Count"] = proxy_health[route].get("Count", 0) + 1
-        proxy_health[route]["LastRequestTime"] = time.time()
-        if not success:
-            proxy_health[route]["Failed"] = proxy_health[route].get("Failed", 0) + 1
+_METHOD_NAMES = {"roproxy": "RoProxy", "token": "Token", "rotate": "Rotate"}
 
 
-def log_route_timeout(is_roproxy: bool):
-    """Count an upstream timeout for the Direct-API or RoProxy route (transient; not emailed)."""
-    route = "RoProxy" if is_roproxy else "DirectAPI"
-    with _state_lock:
-        proxy_health[route]["Timeouts"] = proxy_health[route].get("Timeouts", 0) + 1
-
-
-def log_token_result(success: bool):
-    """Count a rejected (non-200) token-route request. (The total request count is
-    derived from per-token Uses in get_diagnostics so it matches the Auth Tokens table.)"""
-    if success:
+def log_method(method: str, success: bool):
+    """Count an upstream request by method (roproxy/token/rotate) + whether it failed."""
+    name = _METHOD_NAMES.get(method)
+    if not name:
         return
     with _state_lock:
-        proxy_health["Tokens"]["Failed"] = proxy_health["Tokens"].get("Failed", 0) + 1
+        method_stats[name]["Requests"] = method_stats[name].get("Requests", 0) + 1
+        if not success:
+            method_stats[name]["Failed"] = method_stats[name].get("Failed", 0) + 1
 
 
-def reset_proxy_health_counters():
-    """Zero the live request counters on the health cards (Direct/RoProxy/Token).
-
-    Keeps live state (cooldown flags, last-request times, token inventory) — only
-    the cumulative request/failure/timeout tallies are reset, so a 'clear' makes
-    the Service Health numbers start fresh like the rest of the dashboard."""
+def log_method_timeout(method: str):
+    """Count an upstream timeout for a method (transient; never emailed)."""
+    name = _METHOD_NAMES.get(method)
+    if not name:
+        return
     with _state_lock:
-        for route in ("DirectAPI", "RoProxy"):
-            for key in ("Count", "Failed", "Timeouts"):
-                proxy_health[route][key] = 0
-        for key in ("Failed", "Timeouts", "ExpiredCount"):
-            proxy_health["Tokens"][key] = 0
+        method_stats[name]["Timeouts"] = method_stats[name].get("Timeouts", 0) + 1
 
 
-def log_token_timeout():
-    """Count an upstream timeout while using the internal token."""
+def log_rotate_health(ok: bool, error: str = ""):
+    """Track the rotation proxy's last success / last proxy-level error."""
+    now = time.time()
     with _state_lock:
-        proxy_health["Tokens"]["Timeouts"] = proxy_health["Tokens"].get("Timeouts", 0) + 1
+        if ok:
+            method_stats["Rotate"]["LastSuccessAt"] = now
+        else:
+            method_stats["Rotate"]["LastErrorAt"] = now
+            if error:
+                method_stats["Rotate"]["LastError"] = str(error)[:200]
+
+
+def reset_method_counters():
+    """Zero the per-method request tallies (used when clearing request stats)."""
+    with _state_lock:
+        for name in ("RoProxy", "Token", "Rotate"):
+            for key in ("Requests", "Failed", "Timeouts"):
+                method_stats[name][key] = 0
+        proxy_health["Tokens"]["ExpiredCount"] = 0
 
 
 def log_error(signature: str, detail: str = ""):
@@ -787,6 +804,7 @@ def get_diagnostics() -> dict:
                 "StatusCodesDetailed": status_codes_detailed,
                 "ProxyRequestCounts": proxy_request_counts,
                 "ProxyHealth": proxy_health,
+                "MethodStats": method_stats,
                 "Crawls": crawls,
                 "Endpoints": endpoints,
                 "BlockedEndpointAttempts": blocked_endpoint_attempts,
@@ -811,23 +829,25 @@ def get_diagnostics() -> dict:
                 "WorkerStartedAt": _started_at,
             }
         )
-    # Derived health fields (computed outside the lock):
-    health = snapshot["ProxyHealth"]
-    now = snapshot["ServerTime"]
-    # Token route "Requests" is the sum of per-token Uses, so it always matches
-    # the Uses column in the Auth Tokens table.
-    health["Tokens"]["Requests"] = sum(int(t.get("Uses", 0)) for t in snapshot["Tokens"])
-    # How long until each upstream route's cooldown lifts (like the token budget).
-    for route, setting, default in (
-        ("DirectAPI", "direct_api_cooldown", config.DIRECT_API_COOLDOWN),
-        ("RoProxy", "roproxy_cooldown", config.ROPROXY_COOLDOWN),
-    ):
-        rh = health.get(route, {})
-        if rh.get("IsInCooldown"):
-            cooldown = runtime.get_setting(setting, default)
-            rh["ResetIn"] = int(max(0, rh.get("LastRequestTime", 0) + cooldown - now))
-        else:
-            rh["ResetIn"] = 0
+    # Live cross-worker routing state (token budget + per-method cooldowns) and
+    # the rotation proxy's status. Computed outside the lock; imported lazily to
+    # avoid an import cycle (routing/rotate import runtime, not diagnostics).
+    try:
+        import routing
+
+        snapshot["Routing"] = routing.get_state()
+    except Exception:
+        snapshot["Routing"] = {}
+    try:
+        import rotate
+
+        snapshot["Rotate"] = {
+            "Configured": rotate.is_configured(),
+            "Enabled": rotate.is_enabled(),
+            "ProxyUrl": rotate.masked_url(),
+        }
+    except Exception:
+        snapshot["Rotate"] = {"Configured": False, "Enabled": False, "ProxyUrl": ""}
     return snapshot
 
 
@@ -843,6 +863,7 @@ _PERSISTED_NAMES = (
     "status_code_counts",
     "status_codes_detailed",
     "proxy_request_counts",
+    "method_stats",
     "crawls",
     "throttled_ips",
     "endpoints",
@@ -883,6 +904,7 @@ CLEAR_TARGETS = {
         "status_code_counts",
         "status_codes_detailed",
         "proxy_request_counts",
+        "method_stats",
         "retry_counts",
         "reason_counts",
         "traffic_minutes",
@@ -949,10 +971,10 @@ def clear_stats(names: tuple) -> bool:
             storage.update_data(mutate)
         except OSError:
             ok = False
-    # The live health counters aren't persisted, so reset them here too when the
-    # request stats are being cleared (and thus on "clear all").
+    # The token-inventory ExpiredCount in proxy_health isn't persisted, so reset
+    # it here too when the request stats are being cleared (and on "clear all").
     if "request_counts" in names:
-        reset_proxy_health_counters()
+        reset_method_counters()
     return ok
 
 
@@ -988,7 +1010,7 @@ def restore(data: dict):
 # Min/Max/Last* fields combine idempotently; recent-event lists union + dedup + cap.
 _baseline = None
 
-_MAX_KEYS = {"Max", "LastRequestTime", "LastThrottleTime", "LastSeen"}
+_MAX_KEYS = {"Max", "LastRequestTime", "LastThrottleTime", "LastSeen", "LastSuccessAt", "LastErrorAt"}
 _MIN_KEYS = {"Min", "FirstSeen"}
 _LIST_CAP_SETTINGS = {
     "exploit_attempts": ("max_exploit_records", config.MAX_EXPLOIT_RECORDS),

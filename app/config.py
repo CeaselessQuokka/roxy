@@ -45,6 +45,30 @@ TRAFFIC_HISTORY_MINUTES = 180  # How many per-minute traffic buckets to keep (da
 DATA_FILE = os.environ.get("ROXY_DATA_FILE", "/etc/roxy/roxy_data.json")  # Minified-JSON stats/runtime state.
 AUTOSAVE_INTERVAL = 30 if not DEBUG else 5  # In seconds, how often to flush stats/state to disk.
 
+# Small, high-frequency shared file holding the request-routing state (global
+# token-use window + RoProxy/Rotate cooldowns) so all gunicorn workers coordinate
+# without thrashing the big data file. Separate from DATA_FILE on purpose.
+ROUTING_FILE = os.environ.get("ROXY_ROUTING_FILE", "/etc/roxy/roxy_routing.json")
+
+# --- Upstream method routing (RoProxy / Token / Rotate) ---
+# A request picks one method by weighted random among those currently available.
+# Base weights (percent-ish; they're normalized): RoProxy 10, Token 70, Rotate 20.
+ROPROXY_WEIGHT = 10
+TOKEN_WEIGHT = 70
+ROTATE_WEIGHT = 20
+# Once the token's usage in its window passes this "danger zone", its weight is
+# progressively shifted to Rotate (then RoProxy) until the hard cap cuts it off.
+TOKEN_DANGER_ZONE = 60
+
+# --- IP rotation (DataImpulse or any HTTP proxy) ---
+# The full proxy URL (e.g. http://user:pass@gw.dataimpulse.com:823, or just
+# http://gw.dataimpulse.com:823 with IP-whitelist auth) is read from this file
+# if present; the env var wins if set. Empty/missing => rotation disabled.
+ROTATE_PROXY_FILE = os.environ.get("ROXY_ROTATE_PROXY_FILE", "/etc/roxy/rotate_proxy.txt")
+ROTATE_PROXY_ENV = os.environ.get("ROXY_ROTATE_PROXY", "")
+ROTATE_COOLDOWN = 60  # In seconds to pause Rotate after a streak of proxy-level failures.
+ROTATE_MAX_FAILURES = 3  # Consecutive proxy failures before Rotate goes on cooldown.
+
 # --- Proxying robustness ---
 REQUEST_TIMEOUT = 15  # In seconds, how long to wait on an upstream Roblox request before failing.
 

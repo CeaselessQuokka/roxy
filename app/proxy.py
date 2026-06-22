@@ -1,90 +1,100 @@
+"""Upstream request handling.
+
+A proxied request (without a user-supplied token) is served by ONE of three
+methods, chosen by weighted random among those currently available, then falling
+down the chain if the chosen one fails:
+
+  - "roproxy": games.roproxy.com (RoProxy's IPs). Cooldown-limited globally.
+  - "token":   games.roblox.com with our .ROBLOSECURITY (our STATIC IP).
+               Hard global request budget so we never look like a bot burst.
+  - "rotate":  games.roblox.com via the rotating proxy (DataImpulse exit IPs),
+               with a random realistic User-Agent.
+
+The selection + budget + cooldowns are coordinated across all gunicorn workers by
+routing.py (a shared, flock-guarded file), so 4 workers can't collectively burst
+Roblox/RoProxy from our static IP.
+
+A request that supplies its OWN X-Roblox-Token is sent straight to roblox.com with
+that cookie — never through RoProxy or the rotating proxy, so the caller's secret
+is never exposed to a third party.
+"""
+
 import auth
 import background
 import config
 import diagnostics
 import mail
 import requests
+import rotate
+import routing
 import runtime
 import time
-from collections import deque
 from threading import Lock
 
+# Token list is loaded from the token file and reloaded across workers when the
+# file changes (so a dashboard token update reaches every worker).
+_tokens_lock = Lock()
 tokens = auth.read_tokens()
+_tokens_mtime = auth.tokens_mtime()
+
 email_last_sent = 0
 error_email_last_sent = 0
-is_direct_api_in_cooldown = False
-is_roproxy_in_cooldown = False
-request_lock = Lock()
+all_throttled_email_last_sent = 0
 
-# Hard cap on attempts for a single proxied request (CSRF refreshes + 429
-# retries combined). Without it, an invalid user token can bounce 403s with
-# fresh CSRF headers forever and spin a worker on one request.
-MAX_REQUEST_ATTEMPTS = 10
-
-# --- Internal token safety budget ---------------------------------------------
-# Timestamps of every Roblox request made WITH the internal token (including
-# validation pings). The token must never look like a bot burst to Roblox, so
-# once the window's budget is spent, requests get a try-later error instead.
-_token_uses = deque()
+# Per single proxied request: each method may be tried once, plus a CSRF retry
+# inside a method. This bounds the work for one request across the whole chain.
+MAX_METHOD_ATTEMPTS = 6
 
 for t in tokens:
     diagnostics.update_token(t)
 
 
-def _budget_limits() -> tuple[int, int]:
-    limit = runtime.get_setting("token_budget_requests", config.TOKEN_BUDGET_REQUESTS)
-    window = runtime.get_setting("token_budget_window", config.TOKEN_BUDGET_WINDOW)
-    return int(limit), int(window)
+# --- Token list (cross-worker, file-backed) ---------------------------------
+def _maybe_reload_tokens():
+    """Pull the latest token set from the file if another worker changed it."""
+    global tokens, _tokens_mtime
+    mtime = auth.tokens_mtime()
+    if mtime == _tokens_mtime:
+        return
+    with _tokens_lock:
+        if mtime == _tokens_mtime:
+            return
+        try:
+            fresh = [t for t in (line.strip() for line in auth.read_tokens()) if t]
+        except OSError:
+            return
+        tokens = fresh
+        _tokens_mtime = mtime
+        diagnostics.clear_tokens()
+        for t in tokens:
+            diagnostics.update_token(t)
 
 
-def _prune_token_uses_unlocked(window: int, now: float):
-    while _token_uses and _token_uses[0] <= now - window:
-        _token_uses.popleft()
+def _first_token() -> str | None:
+    with _tokens_lock:
+        return tokens[0] if tokens else None
 
 
-def _token_budget_has_room_unlocked() -> bool:
-    """Whether the internal token may make another request right now. Caller holds request_lock."""
-    limit, window = _budget_limits()
-    _prune_token_uses_unlocked(window, time.time())
-    return len(_token_uses) < limit
+def _drop_token(token: str):
+    """Remove a token (throttled/expired) and queue a revalidation."""
+    global tokens
+    with _tokens_lock:
+        if token in tokens:
+            tokens.remove(token)
+    diagnostics.update_token(token, being_validated=True)
+    background.schedule(
+        runtime.get_setting("token_expiration_cooldown", config.TOKEN_EXPIRATION_COOLDOWN), validate_token, token
+    )
 
 
-def _record_token_use_unlocked() -> int:
-    """Append a token use and return the resulting sliding-window usage."""
-    _token_uses.append(time.time())
-    _prune_token_uses_unlocked(_budget_limits()[1], time.time())
-    return len(_token_uses)
-
-
-def record_token_use():
-    """Count a token-authenticated request (e.g. a validation ping) against the budget."""
-    with request_lock:
-        usage = _record_token_use_unlocked()
-    diagnostics.record_token_budget_usage(usage)
-
-
-def get_token_budget_state() -> dict:
-    """Live budget usage for the dashboard."""
-    limit, window = _budget_limits()
-    now = time.time()
-    with request_lock:
-        _prune_token_uses_unlocked(window, now)
-        used = len(_token_uses)
-        oldest = _token_uses[0] if _token_uses else None
-    return {
-        "Used": used,
-        "Limit": limit,
-        "Window": window,
-        "ResetIn": int(max(0, oldest + window - now)) if oldest else 0,
-    }
+def has_tokens() -> bool:
+    _maybe_reload_tokens()
+    with _tokens_lock:
+        return bool(tokens)
 
 
 def notify_error(subject: str, body: str):
-    """Record a runtime error and email the admin about it (email is rate-limited).
-
-    The error is always logged to diagnostics (deduped, never lost) even when the
-    email is suppressed by the cooldown — so the dashboard error log is complete.
-    """
+    """Record a runtime error and email the admin (email rate-limited; log always)."""
     diagnostics.log_error(subject, body)
     global error_email_last_sent
     cooldown = runtime.get_setting("error_email_cooldown", config.ERROR_EMAIL_COOLDOWN)
@@ -94,52 +104,211 @@ def notify_error(subject: str, body: str):
     mail.try_send(auth.get_emails()[0], f"Roxy Error: {subject}", body)
 
 
-# Returns (successful, response)
+def _notify_all_throttled(url: str):
+    """Email when EVERY upstream method is unavailable, rate-limited separately."""
+    global all_throttled_email_last_sent
+    cooldown = runtime.get_setting("error_email_cooldown", config.ERROR_EMAIL_COOLDOWN)
+    diagnostics.log_error("All upstream methods unavailable", f"No method could serve: https://{url}")
+    if time.time() - all_throttled_email_last_sent < cooldown:
+        return
+    all_throttled_email_last_sent = time.time()
+    mail.try_send(
+        auth.get_emails()[0],
+        "Roxy: all upstream methods unavailable",
+        "Every request method (RoProxy, Token, Rotate) was throttled/unavailable for:\n"
+        f"https://{url}\n\nCheck token validity, the rotation proxy, and cooldowns on the dashboard.",
+    )
+
+
+def _timeout() -> int:
+    return runtime.get_setting("request_timeout", config.REQUEST_TIMEOUT)
+
+
+def _rotate_headers(headers: dict) -> dict:
+    """Headers for a rotated request: random realistic UA, no Chrome-only client
+    hints (which would mismatch a non-Chrome UA), nothing identifying us."""
+    out = dict(headers)
+    out["User-Agent"] = rotate.random_user_agent()
+    for hint in ("Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform"):
+        out.pop(hint, None)
+    return out
+
+
+# --- The public entry point --------------------------------------------------
+# Returns (successful, response).
 def request(
     url: str, method: str = "get", headers: dict = None, params: dict = None, data: str = None, roblox_token: str = None
 ) -> tuple[bool, str]:
-    successful, response, csrf_token, retries = False, None, None, 0
-    for _ in range(MAX_REQUEST_ATTEMPTS):
-        successful, should_request_again, response, csrf_token, retries = _request(
-            url, method, headers, params, data, roblox_token, csrf_token, retries
+    headers = headers if headers is not None else {}
+    _maybe_reload_tokens()
+
+    # A caller's own token: go straight to roblox.com with their cookie. Never via
+    # RoProxy/Rotate — their .ROBLOSECURITY must not pass through a third party.
+    if roblox_token is not None:
+        ok, _again, response = _attempt(
+            "user", f"https://{url}", method, headers, params, data, cookies={".ROBLOSECURITY": roblox_token}
         )
-        if successful:
+        return ok, response if response is not None else "Upstream request failed; please try again later."
+
+    tried: set = set()
+    last_response = None
+    for _ in range(MAX_METHOD_ATTEMPTS):
+        choice, _token_used = routing.choose(tried, has_tokens(), rotate.is_enabled())
+        if choice is None:
+            if not tried:
+                # Nothing was ever available → everything is throttled/unconfigured.
+                _notify_all_throttled(url)
+                return False, "All request methods are busy right now; please try again shortly."
+            return False, last_response or "All request methods are busy right now; please try again shortly."
+
+        if choice == "token":
+            diagnostics.record_token_budget_usage(_token_used)  # feeds the 1h/24h peak
+        ok, again, response = _do_method(choice, url, method, headers, params, data)
+        if ok:
             return True, response
-        if not should_request_again:
-            return False, response or "Too many requests; please try again in ~65 seconds."
+        tried.add(choice)
+        if response is not None:
+            last_response = response
+        if not again:
+            # A definitive answer from Roblox (404/403/400…) — same on any method.
+            return False, response if response is not None else "Upstream request failed; please try again later."
 
-    return False, response or "Too many upstream retries; please try again later."
+    return False, last_response or "All request methods are busy right now; please try again shortly."
 
 
+def _do_method(choice: str, url: str, method: str, headers: dict, params: dict, data):
+    """Run one method (with its internal CSRF retry). Returns (ok, fallback, response)
+    where fallback=True means 'this method couldn't serve — try the next one'."""
+    if choice == "roproxy":
+        return _attempt("roproxy", f"https://{url.replace('roblox.com', 'roproxy.com')}", method, headers, params, data)
+    if choice == "token":
+        token = _first_token()
+        if not token:
+            return (False, True, None)  # token vanished between choose() and now
+        return _attempt(
+            "token", f"https://{url}", method, headers, params, data, cookies={".ROBLOSECURITY": token}, token=token
+        )
+    if choice == "rotate":
+        return _attempt(
+            "rotate", f"https://{url}", method, _rotate_headers(headers), params, data, proxies=rotate.proxies()
+        )
+    return (False, True, None)
+
+
+def _attempt(choice, full_url, method, headers, params, data, cookies=None, proxies=None, token=None):
+    """One HTTP attempt to the upstream, with a single CSRF (403) handshake retry.
+
+    Returns (ok, fallback, response). `choice` is the method name for stats
+    ("user" for caller-token requests, which aren't part of the routed methods).
+    """
+    is_routed = choice in ("roproxy", "token", "rotate")
+    csrf = None
+    headers = dict(headers)
+    for _ in range(2):  # original attempt + at most one CSRF retry
+        if csrf is not None:
+            headers["x-csrf-token"] = csrf
+        try:
+            req = requests.request(
+                method,
+                full_url,
+                headers=headers,
+                params=params,
+                data=data,
+                cookies=cookies,
+                proxies=proxies,
+                timeout=_timeout(),
+            )
+        except requests.Timeout:
+            diagnostics.log_request(method.upper(), False)
+            diagnostics.log_reason(True)
+            if is_routed:
+                diagnostics.log_method_timeout(choice)
+            if choice == "rotate":
+                routing.record_rotate_result(False)
+                diagnostics.log_rotate_health(False, "timeout")
+            return (False, True, None)  # transient → fall through to next method
+        except requests.RequestException as e:
+            diagnostics.log_request(method.upper(), False)
+            diagnostics.log_reason(True)
+            if choice == "rotate":
+                # Proxy/connection error talking to DataImpulse — count + fall back.
+                routing.record_rotate_result(False)
+                diagnostics.log_rotate_health(False, f"{type(e).__name__}: {e}")
+                diagnostics.log_method(choice, False)
+                return (False, True, None)
+            if is_routed:
+                diagnostics.log_method(choice, False)
+                return (False, True, None)  # roproxy/token connection error → fall back
+            # User-token request couldn't reach Roblox: report and give up.
+            notify_error("Upstream request failed", f"{method.upper()} {full_url}\n\n{type(e).__name__}: {e}")
+            return (False, False, "Upstream request failed; please try again later.")
+
+        # Got an HTTP response.
+        if choice == "rotate":
+            routing.record_rotate_result(True)  # the proxy itself worked
+            diagnostics.log_rotate_health(True)
+        if token is not None:
+            diagnostics.update_token(token, used=True)
+        if is_routed:
+            diagnostics.log_method(choice, req.status_code == 200)
+        diagnostics.log_status_code(req.status_code)
+        diagnostics.log_request(method.upper(), req.status_code == 200)
+        diagnostics.log_proxy_request(method.upper(), req.elapsed.total_seconds())
+
+        if req.status_code == 200:
+            return (True, False, req.text)
+        if req.status_code == 403 and "x-csrf-token" in req.headers and csrf is None:
+            # Roblox handing us a CSRF token to retry with (required for writes).
+            diagnostics.log_retry(403, "CSRF token refresh")
+            csrf = req.headers.get("x-csrf-token")
+            continue
+        if req.status_code == 429:
+            # Rate-limited. For the token, drop it for revalidation. Either way,
+            # fall through and let another method try (no user-facing retry storm).
+            diagnostics.log_reason(False)
+            if token is not None:
+                _drop_token(token)
+            if choice == "user":
+                return (False, False, req.text)  # caller's own token is throttled; report it
+            return (False, True, req.text)
+        if 500 <= req.status_code < 600:
+            diagnostics.log_reason(False)
+            return (False, True, req.text)  # transient upstream error → try another method
+        # Other 4xx (403 without CSRF, 404, 400…): a real answer from Roblox.
+        diagnostics.log_reason(False)
+        return (False, False, req.text)
+
+    return (False, True, None)  # CSRF retry exhausted
+
+
+# --- Token validation / management ------------------------------------------
 def validate_token(token: str):
-    # Test token by using an auth-dependent endpoint. If it works, the token is not expired.
+    """Re-check a token against Roblox; re-add if valid, drop + email if expired."""
     global tokens, email_last_sent
-    record_token_use()  # Validation pings count toward the safety budget too.
+    diagnostics.record_token_budget_usage(routing.record_token_use())  # counts toward budget + peak
     try:
         req = requests.get(
             "https://accountinformation.roblox.com/v1/birthdate",
             cookies={".ROBLOSECURITY": token},
-            timeout=runtime.get_setting("request_timeout", config.REQUEST_TIMEOUT),
+            timeout=_timeout(),
         )
     except requests.RequestException:
-        # Couldn't reach Roblox to validate; re-queue a retry rather than dropping the token.
         diagnostics.update_token(token, being_validated=True)
         background.schedule(
             runtime.get_setting("token_expiration_cooldown", config.TOKEN_EXPIRATION_COOLDOWN), validate_token, token
         )
         return
-    with request_lock:
+    should_email = False
+    with _tokens_lock:
         if req.status_code == 200:
             if token not in tokens:
                 tokens.append(token)
                 diagnostics.update_token(token)
-            should_email = False
         else:
             diagnostics.remove_token(token, expired=True)
             should_email = time.time() - email_last_sent > runtime.get_setting("email_cooldown", config.EMAIL_COOLDOWN)
             if should_email:
                 email_last_sent = time.time()
-    # Send outside the lock; SMTP can take seconds and must not block proxying.
     if should_email:
         mail.try_send(
             auth.get_emails()[0],
@@ -148,162 +317,9 @@ def validate_token(token: str):
         )
 
 
-def reset_direct_api_cooldown():
-    global is_direct_api_in_cooldown
-    is_direct_api_in_cooldown = False
-    diagnostics.proxy_health["DirectAPI"]["IsInCooldown"] = False
-
-
-def reset_roproxy_cooldown():
-    global is_roproxy_in_cooldown
-    is_roproxy_in_cooldown = False
-    diagnostics.proxy_health["RoProxy"]["IsInCooldown"] = False
-
-
-# Returns (successful, should_request_again, response, csrf_token, retries)
-def _request(
-    url: str,
-    method: str = "get",
-    headers: dict = None,
-    params: dict = None,
-    data: str = None,
-    roblox_token: str = None,
-    csrf_token: str = None,
-    retries: int = 0,
-) -> tuple[bool, bool, str | None, str | None, int]:
-    global tokens, is_direct_api_in_cooldown, is_roproxy_in_cooldown
-    headers = headers if headers is not None else {}
-    if len(tokens) == 0 and is_direct_api_in_cooldown and is_roproxy_in_cooldown:
-        diagnostics.log_status_code(404)
-        diagnostics.log_request(method.upper(), False)
-        diagnostics.log_reason(True)
-        return False, False, "No available tokens or APIs to call", None, retries
-
-    with request_lock:
-        token = None
-        if roblox_token is not None:
-            token = roblox_token
-        else:
-            if not is_direct_api_in_cooldown:
-                is_direct_api_in_cooldown = True
-                diagnostics.proxy_health["DirectAPI"]["IsInCooldown"] = True
-                diagnostics.proxy_health["DirectAPI"]["LastRequestTime"] = time.time()
-                background.schedule(
-                    runtime.get_setting("direct_api_cooldown", config.DIRECT_API_COOLDOWN), reset_direct_api_cooldown
-                )
-            elif not is_roproxy_in_cooldown:
-                is_roproxy_in_cooldown = True
-                url = url.replace("roblox.com", "roproxy.com")
-                diagnostics.proxy_health["RoProxy"]["IsInCooldown"] = True
-                diagnostics.proxy_health["RoProxy"]["LastRequestTime"] = time.time()
-                background.schedule(
-                    runtime.get_setting("roproxy_cooldown", config.ROPROXY_COOLDOWN), reset_roproxy_cooldown
-                )
-            else:
-                if len(tokens) == 0:
-                    diagnostics.log_status_code(404)
-                    diagnostics.log_request(method.upper(), False)
-                    diagnostics.log_reason(True)
-                    return False, False, "No valid tokens available; please try again in ~65 seconds.", None, retries
-
-                # NEVER exceed the token's safety budget — Roblox flags bursty
-                # bot behavior, and a flagged token risks the server IP.
-                if not _token_budget_has_room_unlocked():
-                    limit, window = _budget_limits()
-                    diagnostics.log_budget_rejection()
-                    diagnostics.log_status_code(429)
-                    diagnostics.log_request(method.upper(), False)
-                    diagnostics.log_reason(True)
-                    return (
-                        False,
-                        False,
-                        f"Roxy is at its internal safety budget ({limit} requests per {window}s); "
-                        "please try again in a few seconds.",
-                        None,
-                        retries,
-                    )
-
-                # Single active token only (token rotation upsets Roblox).
-                token = tokens[0]
-                diagnostics.record_token_budget_usage(_record_token_use_unlocked())
-
-    if csrf_token is not None:
-        headers["x-csrf-token"] = csrf_token
-    cookies = {".ROBLOSECURITY": token} if token else None
-    try:
-        req = requests.request(
-            method,
-            f"https://{url}",
-            headers=headers,
-            params=params,
-            data=data,
-            cookies=cookies,
-            timeout=runtime.get_setting("request_timeout", config.REQUEST_TIMEOUT),
-        )
-    except requests.Timeout:
-        # Upstream timeouts are an expected, transient condition (RoProxy/Cloudflare
-        # are slow under load). They must NOT email the admin. Instead, count them
-        # and — for the direct/RoProxy routes, which are now in cooldown — fall
-        # through to the next available route so the caller still gets served.
-        diagnostics.log_request(method.upper(), False)
-        diagnostics.log_reason(True)
-        if token is None:
-            diagnostics.log_route_timeout("roproxy" in url)
-            return False, True, None, csrf_token, retries  # retry → next route
-        diagnostics.log_token_timeout()
-        return False, False, "Upstream timed out; please try again shortly.", None, retries
-    except requests.RequestException as e:
-        diagnostics.log_request(method.upper(), False)
-        diagnostics.log_reason(True)
-        if token is None:
-            # A connection error on direct/RoProxy: fall through to the next route.
-            diagnostics.log_route_result("roproxy" in url, False)
-            return False, True, None, csrf_token, retries
-        notify_error("Upstream request failed", f"{method.upper()} https://{url}\n\n{type(e).__name__}: {e}")
-        return False, False, "Upstream request failed; please try again later.", None, retries
-    if token:
-        diagnostics.update_token(token, used=True)
-        diagnostics.log_token_result(req.status_code == 200)
-    else:
-        # Direct-API or RoProxy call: count it and whether it was rejected (non-200).
-        diagnostics.log_route_result("roproxy" in url, req.status_code == 200)
-    diagnostics.log_status_code(req.status_code)
-    diagnostics.log_request(method.upper(), req.status_code == 200)
-    diagnostics.log_proxy_request(method.upper(), req.elapsed.total_seconds())
-    if req.status_code == 200:
-        return True, False, req.text, None, retries
-    elif req.status_code == 429:
-        # The token is throttled (or the endpoint is). Put the token in cooldown
-        # for revalidation, but do NOT retry the user's request — fail it
-        # immediately so callers can't drive a retry storm.
-        with request_lock:
-            if token in tokens:
-                tokens.remove(token)
-                diagnostics.update_token(token, being_validated=True)
-                background.schedule(
-                    runtime.get_setting("token_expiration_cooldown", config.TOKEN_EXPIRATION_COOLDOWN),
-                    validate_token,
-                    token,
-                )
-        diagnostics.log_reason(False)
-        return False, False, req.text, None, retries
-    elif req.status_code == 403 and "x-csrf-token" in req.headers and csrf_token is None:
-        # First 403 with a CSRF header is Roblox handing us the token to retry with.
-        diagnostics.log_retry(403, "CSRF token refresh")
-        return False, True, None, req.headers.get("x-csrf-token"), retries
-    elif req.status_code == 403:
-        # Either no CSRF header, or we already retried with one — the request is
-        # genuinely forbidden (e.g. an invalid/expired user token). Never loop on it.
-        diagnostics.log_reason(False)
-        return False, False, req.text, None, retries
-    else:
-        diagnostics.log_reason(False)
-        return False, False, f"Unexpected error {req.status_code}\n\n{req.text}", None, retries
-
-
 def update_tokens(new_tokens: list[str]):
     global tokens
-    with request_lock:
+    with _tokens_lock:
         for t in new_tokens:
             if t not in tokens:
                 tokens.append(t)
@@ -311,37 +327,36 @@ def update_tokens(new_tokens: list[str]):
 
 
 def set_tokens(new_tokens: list[str]) -> list[str]:
-    """Replace the active token set (single active token; rotation is disabled).
-
-    Used by the dashboard to update the token when it expires.
-    Returns the cleaned list that is now active.
-    """
-    global tokens
+    """Replace the active token set. Writes through to the token file so ALL
+    gunicorn workers pick it up (they reload on file change)."""
+    global tokens, _tokens_mtime
     cleaned = []
     for t in new_tokens:
         t = (t or "").strip()
         if t and t not in cleaned:
             cleaned.append(t)
-    with request_lock:
+    with _tokens_lock:
         tokens = cleaned
         diagnostics.clear_tokens()
         for t in tokens:
             diagnostics.update_token(t)
+    auth.write_tokens(cleaned)  # propagate to other workers via the file
+    _tokens_mtime = auth.tokens_mtime()
     return list(cleaned)
 
 
 def _revalidate_one(token: str):
     global tokens
-    record_token_use()  # Validation pings count toward the safety budget too.
+    diagnostics.record_token_budget_usage(routing.record_token_use())
     try:
         req = requests.get(
             "https://accountinformation.roblox.com/v1/birthdate",
             cookies={".ROBLOSECURITY": token},
-            timeout=runtime.get_setting("request_timeout", config.REQUEST_TIMEOUT),
+            timeout=_timeout(),
         )
     except requests.RequestException:
-        return  # Couldn't reach Roblox; leave the token as-is.
-    with request_lock:
+        return
+    with _tokens_lock:
         if req.status_code == 200:
             diagnostics.update_token(token)
         else:
@@ -351,14 +366,10 @@ def _revalidate_one(token: str):
 
 
 def force_revalidate_tokens():
-    """Re-check every known token against Roblox; drop any that are no longer valid."""
-    global is_direct_api_in_cooldown, is_roproxy_in_cooldown
-    # Clear API cooldowns so traffic can flow again immediately after revalidation.
-    is_direct_api_in_cooldown = False
-    is_roproxy_in_cooldown = False
-    diagnostics.proxy_health["DirectAPI"]["IsInCooldown"] = False
-    diagnostics.proxy_health["RoProxy"]["IsInCooldown"] = False
-    with request_lock:
+    """Re-check every known token, and clear the routing cooldowns so traffic can
+    flow again immediately."""
+    routing.reset()
+    with _tokens_lock:
         snapshot = list(tokens)
     for t in snapshot:
         background.schedule(0, _revalidate_one, t)

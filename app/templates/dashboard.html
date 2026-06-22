@@ -1332,25 +1332,10 @@
 
 					<div class="grid grid--kpis">
 						<article class="card kpi">
-							<h3 class="kpi__title">Direct API</h3>
-							<div class="kpi__value" id="health_direct">OK</div>
-							<div class="kpi__meta">
-								Last: <span id="direct_last">—</span> • Cooldown:
-								<span id="direct_cooldown">false</span> • Resets in:
-								<span id="direct_reset">—</span> • Requests:
-								<span id="direct_count">0</span> • Rejected:
-								<span id="direct_failed">0</span> • Timeouts:
-								<span id="direct_timeouts">0</span>
-							</div>
-						</article>
-
-						<article class="card kpi">
 							<h3 class="kpi__title">RoProxy</h3>
 							<div class="kpi__value" id="health_roproxy">OK</div>
 							<div class="kpi__meta">
-								Last: <span id="roproxy_last">—</span> • Cooldown:
-								<span id="roproxy_cooldown">false</span> • Resets in:
-								<span id="roproxy_reset">—</span> • Requests:
+								Resets in: <span id="roproxy_reset">—</span> • Requests:
 								<span id="roproxy_count">0</span> • Rejected:
 								<span id="roproxy_failed">0</span> • Timeouts:
 								<span id="roproxy_timeouts">0</span>
@@ -1358,12 +1343,36 @@
 						</article>
 
 						<article class="card kpi">
-							<h3 class="kpi__title">Tokens</h3>
+							<h3 class="kpi__title">Token</h3>
+							<div class="kpi__value" id="health_token">OK</div>
+							<div class="kpi__meta">
+								Requests: <span id="token_count">0</span> • Rejected:
+								<span id="token_failed">0</span> • Timeouts:
+								<span id="token_timeouts">0</span>
+							</div>
+						</article>
+
+						<article
+							class="card kpi"
+							title="Requests sent through the rotating proxy (DataImpulse). Each request uses a fresh exit IP, hiding our static IP."
+						>
+							<h3 class="kpi__title">Rotate (IP rotation)</h3>
+							<div class="kpi__value" id="health_rotate">—</div>
+							<div class="kpi__meta">
+								Rotations: <span id="rotate_count">0</span> • Failed:
+								<span id="rotate_failed">0</span> • Timeouts:
+								<span id="rotate_timeouts">0</span><br />
+								Last success: <span id="rotate_last_ok">—</span> • Resets in:
+								<span id="rotate_reset">—</span><br />
+								Proxy: <span id="rotate_proxy" class="persist-file">—</span>
+								<span id="rotate_error" class="persist-error"></span>
+							</div>
+						</article>
+
+						<article class="card kpi">
+							<h3 class="kpi__title">Tokens Loaded</h3>
 							<div class="kpi__value" id="health_tokens_count">0</div>
 							<div class="kpi__meta">
-								Requests: <span id="health_tokens_requests">0</span> • Rejected:
-								<span id="health_tokens_failed">0</span> • Timeouts:
-								<span id="health_tokens_timeouts">0</span><br />
 								Expired: <span id="health_tokens_expired">0</span> • Being Validated:
 								<span id="health_tokens_validating">0</span>
 							</div>

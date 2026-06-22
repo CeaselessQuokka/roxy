@@ -3,7 +3,34 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<title>Roxy Proxy</title>
+		<title>Roxy — Free Proxy for Roblox Web APIs</title>
+		<meta
+			name="description"
+			content="Roxy is a free, fast proxy for Roblox web APIs. Call any Roblox endpoint from HttpService by prefixing it with roxytheproxy.com — supports GET, POST, PATCH, PUT and DELETE."
+		/>
+		<meta
+			name="keywords"
+			content="Roblox proxy, Roblox API proxy, free Roblox proxy, RoProxy alternative, HttpService proxy, Roblox web API"
+		/>
+		<meta name="robots" content="index, follow" />
+		<meta name="theme-color" content="#0b0f14" />
+		<link rel="canonical" href="https://roxytheproxy.com/" />
+		<!-- Open Graph / social -->
+		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content="Roxy Proxy" />
+		<meta property="og:title" content="Roxy — Free Proxy for Roblox Web APIs" />
+		<meta
+			property="og:description"
+			content="A free, fast proxy for Roblox web APIs. Prefix any Roblox endpoint with roxytheproxy.com and call it from HttpService."
+		/>
+		<meta property="og:url" content="https://roxytheproxy.com/" />
+		<meta property="og:image" content="https://roxytheproxy.com/{{ static_url('roxy_icon.png').lstrip('/') }}" />
+		<meta name="twitter:card" content="summary" />
+		<meta name="twitter:title" content="Roxy — Free Proxy for Roblox Web APIs" />
+		<meta
+			name="twitter:description"
+			content="A free, fast proxy for Roblox web APIs. Prefix any Roblox endpoint with roxytheproxy.com and call it from HttpService."
+		/>
 		<link rel="stylesheet" href="{{ static_url('home_page.css') }}" />
 		<link rel="icon" type="image/x-icon" href="{{ static_url('roxy_favicon.png') }}" />
 	</head>
@@ -297,7 +324,7 @@ HttpService:RequestAsync({
 					Hopefully 2TB is enough, but I will monitor.
 				</p>
 				<p>
-					Internally, whenever a request is made, Roxy will try to make a direct call to the API. If that call
+					Internally, whenever a request is made, Roxy will route the request through one of a few paths (to respect Roblox's rate limits). If that call
 					is throttled (about 60 seconds per request, and this is tracked so no unnecessary calls are made),
 					Roxy will then try
 					<a

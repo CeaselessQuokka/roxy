@@ -55,3 +55,37 @@ def get_emails() -> tuple[str, str]:
     with open(FILES[3], "r") as file:
         main, alt, *_ = file.read().strip().splitlines()
         return main, alt
+
+
+def read_rotate_proxy() -> str:
+    """The IP-rotation proxy URL, or "" if rotation isn't configured.
+
+    Precedence: ROXY_ROTATE_PROXY env var, then the rotate_proxy.txt file. Both
+    are optional, so existing deploys keep working with rotation simply disabled.
+    """
+    import config
+
+    if config.ROTATE_PROXY_ENV.strip():
+        return config.ROTATE_PROXY_ENV.strip()
+    try:
+        with open(config.ROTATE_PROXY_FILE, "r") as file:
+            return file.read().strip()
+    except OSError:
+        return ""
+
+
+def rotate_proxy_mtime() -> float:
+    import config
+
+    try:
+        return os.path.getmtime(config.ROTATE_PROXY_FILE)
+    except OSError:
+        return 0.0
+
+
+def tokens_mtime() -> float:
+    """Last-modified time of the token file (so workers can reload it on change)."""
+    try:
+        return os.path.getmtime(FILES[2])
+    except OSError:
+        return 0.0
