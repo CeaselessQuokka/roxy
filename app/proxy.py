@@ -1,22 +1,21 @@
 """Upstream request handling.
 
-A proxied request (without a user-supplied token) is served by ONE of three
-methods, chosen by weighted random among those currently available, then falling
-down the chain if the chosen one fails:
+Every proxied request is served by ONE of two methods, chosen by weighted random
+among those currently available, then falling down the chain if the chosen one
+fails:
 
-  - "roproxy": games.roproxy.com (RoProxy's IPs). Cooldown-limited globally.
-  - "token":   games.roblox.com with our .ROBLOSECURITY (our STATIC IP).
-               Hard global request budget so we never look like a bot burst.
-  - "rotate":  games.roblox.com via the rotating proxy (DataImpulse exit IPs),
-               with a random realistic User-Agent.
+  - "token":  games.roblox.com with our .ROBLOSECURITY (our STATIC IP).
+              Hard global request budget so we never look like a bot burst.
+  - "rotate": games.roblox.com via the rotating proxy (DataImpulse exit IPs),
+              with a random realistic User-Agent.
 
-The selection + budget + cooldowns are coordinated across all gunicorn workers by
-routing.py (a shared, flock-guarded file), so 4 workers can't collectively burst
-Roblox/RoProxy from our static IP.
+The selection + budget are coordinated across all gunicorn workers by routing.py
+(a shared, flock-guarded file), so 4 workers can't collectively burst Roblox from
+our static IP.
 
-A request that supplies its OWN X-Roblox-Token is sent straight to roblox.com with
-that cookie — never through RoProxy or the rotating proxy, so the caller's secret
-is never exposed to a third party.
+Roxy does not support authenticated requests: a caller is never allowed to supply
+their own Roblox session token, and index.py rejects any request that tries
+before it ever reaches this module — see index._detect_auth_attempt.
 """
 
 import auth
@@ -63,7 +62,7 @@ def _email_allowed(key: str, cooldown: float) -> bool:
 
 # Per single proxied request: each method may be tried once, plus a CSRF retry
 # inside a method. This bounds the work for one request across the whole chain.
-MAX_METHOD_ATTEMPTS = 6
+MAX_METHOD_ATTEMPTS = 3
 
 for t in tokens:
     diagnostics.update_token(t)
@@ -131,7 +130,7 @@ def _notify_all_throttled(url: str):
     mail.try_send(
         auth.get_emails()[0],
         "Roxy: all upstream methods unavailable",
-        "Every request method (RoProxy, Token, Rotate) was throttled/unavailable for:\n"
+        "Every request method (Token, Rotate) was throttled/unavailable for:\n"
         f"https://{url}\n\nCheck token validity, the rotation proxy, and cooldowns on the dashboard.",
     )
 
@@ -152,19 +151,9 @@ def _rotate_headers(headers: dict) -> dict:
 
 # --- The public entry point --------------------------------------------------
 # Returns (successful, response).
-def request(
-    url: str, method: str = "get", headers: dict = None, params: dict = None, data: str = None, roblox_token: str = None
-) -> tuple[bool, str]:
+def request(url: str, method: str = "get", headers: dict = None, params: dict = None, data: str = None) -> tuple[bool, str]:
     headers = headers if headers is not None else {}
     _maybe_reload_tokens()
-
-    # A caller's own token: go straight to roblox.com with their cookie. Never via
-    # RoProxy/Rotate — their .ROBLOSECURITY must not pass through a third party.
-    if roblox_token is not None:
-        ok, _again, response = _attempt(
-            "user", f"https://{url}", method, headers, params, data, cookies={".ROBLOSECURITY": roblox_token}
-        )
-        return ok, response if response is not None else "Upstream request failed; please try again later."
 
     tried: set = set()
     last_response = None
@@ -195,8 +184,6 @@ def request(
 def _do_method(choice: str, url: str, method: str, headers: dict, params: dict, data):
     """Run one method (with its internal CSRF retry). Returns (ok, fallback, response)
     where fallback=True means 'this method couldn't serve — try the next one'."""
-    if choice == "roproxy":
-        return _attempt("roproxy", f"https://{url.replace('roblox.com', 'roproxy.com')}", method, headers, params, data)
     if choice == "token":
         token = _first_token()
         if not token:
@@ -233,12 +220,10 @@ def _failure_reason(status: int) -> str:
 def _attempt(choice, full_url, method, headers, params, data, cookies=None, proxies=None, token=None):
     """One HTTP attempt to the upstream, with a single CSRF (403) handshake retry.
 
-    Returns (ok, fallback, response). `choice` is the method name for stats
-    ("user" for caller-token requests, which aren't part of the routed methods).
-    Every non-success outcome is recorded to the per-requester failure log so the
-    admin can see exactly WHY a given requester is being rejected.
+    Returns (ok, fallback, response). Every non-success outcome is recorded to the
+    per-requester failure log so the admin can see exactly WHY a given requester
+    (token/rotate) is being rejected.
     """
-    is_routed = choice in ("roproxy", "token", "rotate")
     endpoint = _endpoint_of(full_url)
     csrf = None
     headers = dict(headers)
@@ -260,8 +245,7 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
             diagnostics.log_request(method.upper(), False)
             diagnostics.log_reason(True)
             diagnostics.log_request_failure(choice, "timeout", "Upstream timed out", endpoint)
-            if is_routed:
-                diagnostics.log_method_timeout(choice)
+            diagnostics.log_method_timeout(choice)
             if choice == "rotate":
                 routing.record_rotate_result(False)
                 diagnostics.log_rotate_health(False, "timeout")
@@ -274,16 +258,10 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
                 # Proxy/connection error talking to DataImpulse — count + fall back.
                 routing.record_rotate_result(False)
                 diagnostics.log_rotate_health(False, f"{type(e).__name__}: {e}")
-                diagnostics.log_method(choice, False)
-                return (False, True, None)
-            if is_routed:
-                if token is not None:
-                    diagnostics.update_token(token, used=True)  # keep Uses in sync with method Requests
-                diagnostics.log_method(choice, False)
-                return (False, True, None)  # roproxy/token connection error → fall back
-            # User-token request couldn't reach Roblox: report and give up.
-            notify_error("Upstream request failed", f"{method.upper()} {full_url}\n\n{type(e).__name__}: {e}")
-            return (False, False, "Upstream request failed; please try again later.")
+            if token is not None:
+                diagnostics.update_token(token, used=True)  # keep Uses in sync with method Requests
+            diagnostics.log_method(choice, False)
+            return (False, True, None)  # connection error → fall back to the other method
 
         # Got an HTTP response.
         if choice == "rotate":
@@ -291,9 +269,8 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
             diagnostics.log_rotate_health(True)
         if token is not None:
             diagnostics.update_token(token, used=True)
-        if is_routed:
-            diagnostics.log_method(choice, req.status_code == 200)
-            diagnostics.log_method_timing(choice, req.elapsed.total_seconds())
+        diagnostics.log_method(choice, req.status_code == 200)
+        diagnostics.log_method_timing(choice, req.elapsed.total_seconds())
         diagnostics.log_status_code(req.status_code)
         diagnostics.log_request(method.upper(), req.status_code == 200)
         diagnostics.log_proxy_request(method.upper(), req.elapsed.total_seconds())
@@ -309,16 +286,14 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
         diagnostics.log_request_failure(choice, req.status_code, _failure_reason(req.status_code), endpoint, req.text)
         if req.status_code == 429:
             # Rate-limited. For the token, drop it for revalidation. Either way,
-            # fall through and let another method try (no user-facing retry storm).
+            # fall through and let the other method try (no user-facing retry storm).
             diagnostics.log_reason(False)
             if token is not None:
                 _drop_token(token)
-            if choice == "user":
-                return (False, False, req.text)  # caller's own token is throttled; report it
             return (False, True, req.text)
         if 500 <= req.status_code < 600:
             diagnostics.log_reason(False)
-            return (False, True, req.text)  # transient upstream error → try another method
+            return (False, True, req.text)  # transient upstream error → try the other method
         # Other 4xx (403 without CSRF, 404, 400…): a real answer from Roblox.
         diagnostics.log_reason(False)
         return (False, False, req.text)

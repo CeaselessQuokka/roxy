@@ -1,8 +1,6 @@
 import os
 
 DEBUG = False
-DIRECT_API_COOLDOWN = 65  # In seconds, how long to wait between requests to the actual Roblox API.
-ROPROXY_COOLDOWN = 65  # In seconds, how long to wait between roproxy requests.
 TOKEN_EXPIRATION_COOLDOWN = (
     15 if not DEBUG else 5
 )  # In seconds, how long to wait before retrying a token to see if it's actually expired.
@@ -11,6 +9,10 @@ ERROR_EMAIL_COOLDOWN = 300  # In seconds, how long to wait between sending error
 TWO_FA_EXPIRATION = 60  # In seconds, how long a 2FA code is valid for.
 CHALLENGE_EXPIRATION = 60  # In seconds, how long a challenge code is valid for.
 TWO_FA_DIGITS = 16  # How many digits a 2FA code has.
+# The literal prefix Roblox itself bakes into every real .ROBLOSECURITY cookie
+# value. Roxy doesn't accept authenticated requests, but this is used to DETECT
+# (and reject + log) anyone trying to smuggle a real Roblox session cookie into a
+# request via any header — see index._detect_auth_attempt.
 TOKEN_PREFIX = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items.|_"
 MAX_LOGIN_RECORDS = 20  # How many login attempts to keep in memory.
 MAX_EXPLOIT_RECORDS = 20  # How many exploit attempts to keep in memory
@@ -46,7 +48,7 @@ DATA_FILE = os.environ.get("ROXY_DATA_FILE", "/etc/roxy/roxy_data.json")  # Mini
 AUTOSAVE_INTERVAL = 30 if not DEBUG else 5  # In seconds, how often to flush stats/state to disk.
 
 # Small, high-frequency shared file holding the request-routing state (global
-# token-use window + RoProxy/Rotate cooldowns) so all gunicorn workers coordinate
+# token-use window + Rotate's failure cooldown) so all gunicorn workers coordinate
 # without thrashing the big data file. Separate from DATA_FILE on purpose.
 ROUTING_FILE = os.environ.get("ROXY_ROUTING_FILE", "/etc/roxy/roxy_routing.json")
 
@@ -62,14 +64,13 @@ COORD_FILE = os.environ.get("ROXY_COORD_FILE", "/etc/roxy/roxy_coord.json")
 # can't bloat it; the oldest (least-recently-seen) entry is evicted past this.
 MAX_TRACKED_THROTTLE_IPS = 20000
 
-# --- Upstream method routing (RoProxy / Token / Rotate) ---
+# --- Upstream method routing (Token / Rotate) ---
 # A request picks one method by weighted random among those currently available.
-# Base weights (percent-ish; they're normalized): RoProxy 10, Token 70, Rotate 20.
-ROPROXY_WEIGHT = 10
-TOKEN_WEIGHT = 70
-ROTATE_WEIGHT = 20
+# Base weights (percent-ish; they're normalized): Token 75, Rotate 25.
+TOKEN_WEIGHT = 75
+ROTATE_WEIGHT = 25
 # Once the token's usage in its window passes this "danger zone", its weight is
-# progressively shifted to Rotate (then RoProxy) until the hard cap cuts it off.
+# progressively shifted to Rotate until the hard cap cuts it off.
 TOKEN_DANGER_ZONE = 60
 
 # --- IP rotation (DataImpulse or any HTTP proxy) ---

@@ -95,8 +95,6 @@ _settings = {
     "allowed_requests_per_minute": _setting(config.ALLOWED_REQUESTS_PER_MINUTE, 1, 100000, "int"),
     "throttle_reset_duration": _setting(config.THROTTLE_RESET_DURATION, 1, 86400, "int"),
     "stale_ip_duration": _setting(config.STALE_IP_DURATION, 1, 86400, "int"),
-    "direct_api_cooldown": _setting(config.DIRECT_API_COOLDOWN, 0, 86400, "int"),
-    "roproxy_cooldown": _setting(config.ROPROXY_COOLDOWN, 0, 86400, "int"),
     "max_retries_per_request": _setting(config.MAX_RETRIES_PER_REQUEST, 0, 20, "int"),
     "two_fa_expiration": _setting(config.TWO_FA_EXPIRATION, 5, 600, "int"),
     "challenge_expiration": _setting(config.CHALLENGE_EXPIRATION, 5, 600, "int"),
@@ -119,7 +117,6 @@ _settings = {
     "global_throttle_limit": _setting(config.GLOBAL_THROTTLE_LIMIT, 1, 100000, "int"),
     "global_throttle_period": _setting(config.GLOBAL_THROTTLE_PERIOD, 1, 86400, "int"),
     # Upstream method routing weights + the token "danger zone".
-    "roproxy_weight": _setting(config.ROPROXY_WEIGHT, 0, 1000, "int"),
     "token_weight": _setting(config.TOKEN_WEIGHT, 0, 1000, "int"),
     "rotate_weight": _setting(config.ROTATE_WEIGHT, 0, 1000, "int"),
     "token_danger_zone": _setting(config.TOKEN_DANGER_ZONE, 0, 100000, "int"),

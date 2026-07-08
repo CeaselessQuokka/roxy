@@ -3,14 +3,14 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<title>Roxy — Free Proxy for Roblox Web APIs</title>
+		<title>Roxy: Free Proxy for Roblox Web APIs</title>
 		<meta
 			name="description"
-			content="Roxy is a free, fast proxy for Roblox web APIs. Call any Roblox endpoint from HttpService by prefixing it with roxytheproxy.com — supports GET, POST, PATCH, PUT and DELETE."
+			content="Roxy is a free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Call any public Roblox endpoint from HttpService by prefixing it with roxytheproxy.com; supports GET, POST, PATCH, PUT and DELETE."
 		/>
 		<meta
 			name="keywords"
-			content="Roblox proxy, Roblox API proxy, free Roblox proxy, RoProxy alternative, HttpService proxy, Roblox web API"
+			content="Roblox proxy, Roblox API proxy, free Roblox proxy, RoProxy alternative, HttpService proxy, Roblox web API, Roblox HttpService CORS, no login Roblox proxy"
 		/>
 		<meta name="robots" content="index, follow" />
 		<meta name="theme-color" content="#0b0f14" />
@@ -18,21 +18,38 @@
 		<!-- Open Graph / social -->
 		<meta property="og:type" content="website" />
 		<meta property="og:site_name" content="Roxy Proxy" />
-		<meta property="og:title" content="Roxy — Free Proxy for Roblox Web APIs" />
+		<meta property="og:title" content="Roxy: Free Proxy for Roblox Web APIs" />
 		<meta
 			property="og:description"
-			content="A free, fast proxy for Roblox web APIs. Prefix any Roblox endpoint with roxytheproxy.com and call it from HttpService."
+			content="A free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Prefix any Roblox endpoint with roxytheproxy.com and call it from HttpService."
 		/>
 		<meta property="og:url" content="https://roxytheproxy.com/" />
 		<meta property="og:image" content="https://roxytheproxy.com/{{ static_url('roxy_icon.png').lstrip('/') }}" />
 		<meta name="twitter:card" content="summary" />
-		<meta name="twitter:title" content="Roxy — Free Proxy for Roblox Web APIs" />
+		<meta name="twitter:title" content="Roxy: Free Proxy for Roblox Web APIs" />
 		<meta
 			name="twitter:description"
-			content="A free, fast proxy for Roblox web APIs. Prefix any Roblox endpoint with roxytheproxy.com and call it from HttpService."
+			content="A free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Prefix any Roblox endpoint with roxytheproxy.com and call it from HttpService."
 		/>
+		<meta name="twitter:image" content="https://roxytheproxy.com/{{ static_url('roxy_icon.png').lstrip('/') }}" />
 		<link rel="stylesheet" href="{{ static_url('home_page.css') }}" />
 		<link rel="icon" type="image/x-icon" href="{{ static_url('roxy_favicon.png') }}" />
+		<script type="application/ld+json">
+			{
+				"@context": "https://schema.org",
+				"@type": "WebApplication",
+				"name": "Roxy",
+				"url": "https://roxytheproxy.com/",
+				"description": "A free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Prefix any public Roblox endpoint with roxytheproxy.com and call it from Roblox's HttpService.",
+				"applicationCategory": "DeveloperApplication",
+				"operatingSystem": "Any",
+				"offers": {
+					"@type": "Offer",
+					"price": "0",
+					"priceCurrency": "USD"
+				}
+			}
+		</script>
 	</head>
 	<body class="app app--dark" data-theme="dark">
 		<header class="app-bar" role="banner">
@@ -109,9 +126,11 @@
 				</div>
 				<div id="generalTips" class="collapsible is-open">
 					<p class="light--warning">
-						Note: If you are using an API that needs authentication, remove the prepended
-						<code>_|WARNING:-DO-NOT-SHARE-THIS.--...|_</code> text if present in your token, otherwise
-						Roblox will give you an error due to an invalid character (specifically the pipe "|" character).
+						Roxy is for <strong>public, unauthenticated</strong> Roblox web API calls only; it does not
+						support requests that need you to be logged in, and it will reject any request that resembles
+						anything that looks like a Roblox <code>.ROBLOSECURITY</code> cookie.
+						Never send your <code>ROBLOSECURITY</code> token to Roxy
+						(or to any third-party proxy). More info <a href="#tokenSafetyHeading">below</a> for why.
 					</p>
 					<p class="light--warning">
 						If you use RequestAsync, Roblox gives you the response headers. These are the custom headers that Roxy adds:
@@ -128,7 +147,7 @@
 						You get around 10 requests every 50 seconds. However, for every request you make your throttle reset timer increases by 1 second.
 						So if you quickly make 10 requests, you will have to wait an extra 10 seconds on top of whatever time your throttle reset timer is at.
 						<br /><br />
-						This is done to hopefully prevent Roblox from blacklisting or throttling Roxy's IP address.
+						It is highly encouraged to have caching on your end to make less requests, and also have instant responses.
 					</p>
 				</div>
 			</section>
@@ -198,119 +217,61 @@ print(HttpService:GetAsync(URL))</code></pre>
 				</div>
 			</section>
 
-			<!-- PATCH Example -->
-			<section class="section collapsible-block" aria-labelledby="patchExampleHeading">
+			<!-- Other HTTP Methods -->
+			<section class="section collapsible-block" aria-labelledby="otherMethodsHeading">
 				<div class="section__header">
-					<h2 id="patchExampleHeading" class="section__title">Example: PATCH Request</h2>
+					<h2 id="otherMethodsHeading" class="section__title">POST / PATCH / PUT / DELETE Requests</h2>
 					<button
 						class="btn btn--tonal collapsible-toggle"
 						type="button"
-						data-target="patchExample"
+						data-target="otherMethodsExample"
 						aria-expanded="true"
 					>
 						Collapse
 					</button>
 				</div>
-				<div id="patchExample" class="collapsible is-open">
-					<pre class="example"><code>local HEADERS = {
-	["X-Roblox-Token"] = "YOUR_ROBLOX_TOKEN",
-	["Content-Type"] = "application/json",
-}
-HttpService:RequestAsync({
-	Url = "https://roxytheproxy.com/users.roblox.com/v1/users/YOUR_USER_ID/display-names",
-	Method = "PATCH",
-	Headers = HEADERS,
-	Body = HttpService:JSONEncode({ newDisplayName = "Roxy" }),
-})</code></pre>
-				</div>
-			</section>
-
-			<!-- POST Example -->
-			<section class="section collapsible-block" aria-labelledby="postExampleHeading">
-				<div class="section__header">
-					<h2 id="postExampleHeading" class="section__title">Example: POST Request</h2>
-					<button
-						class="btn btn--tonal collapsible-toggle"
-						type="button"
-						data-target="postExample"
-						aria-expanded="true"
-					>
-						Collapse
-					</button>
-				</div>
-				<div id="postExample" class="collapsible is-open">
-					<pre class="example"><code>local HEADERS = {
-	["X-Roblox-Token"] = "YOUR_ROBLOX_TOKEN",
-}
-HttpService:PostAsync(
-	`https://roxytheproxy.com/accountinformation.roblox.com/v1/description`,
-	HttpService:JSONEncode({description = "New Description!"}),
-	Enum.HttpContentType.ApplicationJson,
-	false,
-	HEADERS
-)
-
--- Or using RequestAsync:
-
-local HEADERS = {
-	["X-Roblox-Token"] = "YOUR_ROBLOX_TOKEN",
-	["Content-Type"] = "application/json",
-}
-HttpService:RequestAsync({
-	Url = "https://roxytheproxy.com/accountinformation.roblox.com/v1/description",
-	Method = "POST",
-	Headers = HEADERS,
-	Body = HttpService:JSONEncode({ description = "New Description!" }),
-})</code></pre>
-				</div>
-			</section>
-
-			<!-- DELETE Example -->
-			<section class="section collapsible-block" aria-labelledby="deleteExampleHeading">
-				<div class="section__header">
-					<h2 id="deleteExampleHeading" class="section__title">Example: DELETE Request (remove badge)</h2>
-					<button
-						class="btn btn--tonal collapsible-toggle"
-						type="button"
-						data-target="deleteExample"
-						aria-expanded="true"
-					>
-						Collapse
-					</button>
-				</div>
-				<div id="deleteExample" class="collapsible is-open">
-					<pre class="example"><code>local HEADERS = { ["X-Roblox-Token"] = "YOUR_ROBLOX_TOKEN" }
-
-HttpService:RequestAsync({
-	Url = "https://roxytheproxy.com/badges.roblox.com/v1/user/badges/4396259312169682",
-	Method = "DELETE",
-	Headers = HEADERS,
+				<div id="otherMethodsExample" class="collapsible is-open">
+					<p class="light--warning">
+						Most (if not all) <code>POST</code>/<code>PATCH</code>/<code>PUT</code>/<code>DELETE</code> endpoints on
+						Roblox's API require you to be logged in. Roxy
+						<a href="#tokenSafetyHeading">does not support authenticated requests</a>, so these methods
+						only work against the small number of public, unauthenticated write endpoints Roblox exposes (again, if any).
+						If you need to write data as a specific account, you'll need to call Roblox directly with
+						your own authenticated client, and unfortunately that isn't something Roxy can do for you.
+					</p>
+					<p>The calling convention is the same as <code>GET</code>, just with a different <code>Method</code>:</p>
+					<pre
+						class="example"
+					><code>HttpService:RequestAsync({
+	Url = "https://roxytheproxy.com/" .. endpointPath,
+	Method = "POST", -- or "PATCH", "PUT", "DELETE"
+	Headers = { ["Content-Type"] = "application/json" },
+	Body = HttpService:JSONEncode({ --[[ your payload ]] }),
 })</code></pre>
 				</div>
 			</section>
 
 			<!-- Safety & White Hat Info -->
 			<section class="section safety">
-				<h2 class="section__title">Token Safety & White Hats</h2>
+				<h2 id="tokenSafetyHeading" class="section__title">No Login Required & White Hats</h2>
 				<p>
-					You can pass your own <code>ROBLOSECURITY</code> token via the <code>X-Roblox-Token</code> header
-					for authenticated requests. This is optional for <code>GET</code> calls (unless required by Roblox).
-					If you do pass it for <code>GET</code> requests (not recommended for your general safety) you will
-					just help alleviate the internal tokens throttling potential. Thank you, but prioritize your safety.
+					Roxy is built for <strong>public, unauthenticated</strong> Roblox web API calls only; it does not
+					support requests that require you to be logged in, and it will refuse any request that
+					carries anything that looks like a real Roblox
+					<code>.ROBLOSECURITY</code> session cookie.
 				</p>
 				<p class="warning">
 					<strong
-						>Passing your ROBLOSECURITY token is very risky. Even if the server is secure and the headers
-						are encrypted, you never know if that server is storing your token. So please be careful and
-						make sure you trust whatever it is you are sending your token to.<br /><br />Also, even if the
-						code for a server is open source, you never actually know what is running on the server. Anyone
-						can lie at anytime. So again, please be very careful.
+						>Never send your <code>ROBLOSECURITY</code> token to Roxy, or to any third-party proxy.
+						Sharing it lets someone log in as you and take your account, Robux, and items; no exceptions,
+						no matter how trustworthy a service looks or claims to be. Even a secure, open-source server
+						can't prove what's actually running on it. The only safe token is one you never send.
 					</strong>
 				</p>
 				<hr />
 				<p>
 					If you're a <strong>White Hat</strong> and find a vulnerability, I'm offering rewards from
-					<strong>$50–$250 USD</strong> depending on severity. Any serious exploit report is always paid and
+					<strong>$10-$250 USD</strong> depending on severity. Any serious exploit report is always paid and
 					appreciated. I'm still learning web development, so there may be a lot of issues.
 				</p>
 			</section>
@@ -324,26 +285,8 @@ HttpService:RequestAsync({
 					Hopefully 2TB is enough, but I will monitor.
 				</p>
 				<p>
-					Internally, whenever a request is made, Roxy will route the request through one of a few paths (to respect Roblox's rate limits). If that call
-					is throttled (about 60 seconds per request, and this is tracked so no unnecessary calls are made),
-					Roxy will then try
-					<a
-						href="https://devforum.roblox.com/t/roproxycom-a-free-rotating-proxy-for-roblox-apis/1508367"
-						target="_blank"
-						>Roproxy</a
-					>. If
-					<a
-						href="https://devforum.roblox.com/t/roproxycom-a-free-rotating-proxy-for-roblox-apis/1508367"
-						target="_blank"
-						>Roproxy</a
-					>
-					is also throttled (same cooldown applies as above), Roxy will then fall back to an internally
-					provided token. If that token expires, I get an email and I can update it in a few minutes.
-				</p>
-				<p>
-					How much does Roxy cost to maintain? As of right now, 7 USD per month (for the Lightsail instance) +
-					15 USD per year (for the domain). So right now it is very manageable to maintain, but if you want to
-					support me beyond just using anything I make then you can find a way to support me below :).
+					If you're curious how much Roxy costs to maintain: as of right now, 7 USD per month (for the Lightsail instance) +
+					15 USD per year (for the domain). Which comes out to be exactly $99 per year.
 				</p>
 			</section>
 
@@ -351,16 +294,13 @@ HttpService:RequestAsync({
 			<section class="section support">
 				<h2 class="section__title">Support Me</h2>
 				<p>
-					If you would like to support me, you can support me at at
-					<a href="https://ko-fi.com/ceaselessquokka" target="_blank">Ko-fi</a>. Any amount is appreciated!
-					You never have to donate though, you just using anything I make is enough support for me. If you
-					ever make anything with something I create, please tag me in it, I'd love to see it!
+					You never have to donate or pay anything; just using anything I make is enough support for me.
+					If you ever make something with something I create, please tag me in it, I'd love to see it! :D
 				</p>
 			</section>
 		</main>
-		<!-- https://ko-fi.com/ceaselessquokka -->
 		<footer class="footer" role="contentinfo">
-			<small>Roxy Proxy 2025–2026</small>
+			<small>Roxy Proxy 2025-Present</small>
 		</footer>
 
 		<script src="{{ static_url('home_page.js') }}"></script>

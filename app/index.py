@@ -615,6 +615,7 @@ _STRIPPED_REQUEST_HEADERS = (
     "Roblox-Id",
     "Traceparent",
     "Cookie",  # Never forward visitor cookies upstream.
+    "X-Roblox-Token",  # Roxy doesn't support authenticated requests; also rejected outright (see _detect_auth_attempt).
     "Transfer-Encoding",
     "Forwarded",
     "Via",
@@ -634,6 +635,21 @@ _STRIPPED_HEADER_PREFIXES = ("x-forwarded", "cf-", "roxy-", "x-real", "fly-", "x
 
 def validate_url(url: str) -> bool:
     return re.match(r"^[a-z]+\.roblox\.com/", url, re.IGNORECASE) != None
+
+
+def _detect_auth_attempt(headers) -> str | None:
+    """Roxy does not support authenticated (ROBLOSECURITY) requests. Detect an
+    attempt to send one — via the documented X-Roblox-Token header, or any header
+    whose value carries an actual Roblox session cookie (identified by the
+    literal warning prefix Roblox itself bakes into every real cookie value, so
+    this catches one smuggled in via any other header too). Returns a short
+    reason for the probe log, or None if the request is clean."""
+    for name, value in headers.items():
+        if name.lower() == "x-roblox-token":
+            return "X-Roblox-Token header"
+        if config.TOKEN_PREFIX in (value or ""):
+            return f'"{name}" header carried a ROBLOSECURITY-shaped value'
+    return None
 
 
 def is_browser(user_agent: str) -> bool:
@@ -665,9 +681,9 @@ def get_fake_headers() -> dict:
     return {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         # Only advertise encodings `requests` can ALWAYS decode. Advertising
-        # br/zstd without the optional decoder packages installed makes
-        # upstream (especially Cloudflare/RoProxy) reply compressed and the
-        # client receives raw binary gibberish.
+        # br/zstd without the optional decoder packages installed makes a
+        # Cloudflare-fronted upstream reply compressed and the client
+        # receives raw binary gibberish.
         "Accept-Encoding": "gzip, deflate",
         "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
         "Cache-Control": "max-age=0",
@@ -791,6 +807,14 @@ def proxy_page(dst: str):
         resp = jsonify("Not a Roblox URL")
         return _with_throttle_headers(resp, ip), 404
 
+    # Roxy does not support authenticated requests: reject and log any attempt to
+    # send a Roblox session token/cookie, before anything upstream is touched.
+    auth_attempt = _detect_auth_attempt(request.headers)
+    if auth_attempt:
+        diagnostics.log_exploit_attempt(ip, f"Sent a ROBLOSECURITY token ({auth_attempt})", user_agent)
+        resp = jsonify("Requests requiring authentication are not allowed with this proxy.")
+        return _with_throttle_headers(resp, ip), 400
+
     # Header rules deny abusive clients (e.g. exploit fingerprints) outright.
     # The blocked caller gets a normal-looking THROTTLE 429 — indistinguishable
     # from a real rate-limit — so the exploiter thinks they're requesting too much
@@ -856,10 +880,6 @@ def proxy_page(dst: str):
         headers[key] = value
     headers.update(get_fake_headers())
 
-    roblox_token = headers.pop("X-Roblox-Token", None)
-    if roblox_token is not None and not config.TOKEN_PREFIX in roblox_token:
-        roblox_token = f"{config.TOKEN_PREFIX}{roblox_token}"
-
     # Handle proxying the request.
     successful, response = proxy.request(
         str(escape(dst)),
@@ -867,7 +887,6 @@ def proxy_page(dst: str):
         headers=headers,
         params=params,
         data=data,
-        roblox_token=roblox_token,
     )
     if successful and response is not None and pretty_print:
         try:

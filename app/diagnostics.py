@@ -126,8 +126,8 @@ proxy_health = dict(
     }
 )
 
-# Per-method request tallies (RoProxy / Token / Rotate), MERGED across workers so
-# the dashboard shows true global totals. Requests = total; Failed = non-200 /
+# Per-method request tallies (Token / Rotate), MERGED across workers so the
+# dashboard shows true global totals. Requests = total; Failed = non-200 /
 # proxy errors; Timeouts = upstream timeouts. Rotate also keeps health/last-error.
 def _method_stat():
     return dict({"Requests": 0, "Failed": 0, "Timeouts": 0})
@@ -135,7 +135,6 @@ def _method_stat():
 
 method_stats = dict(
     {
-        "RoProxy": _method_stat(),
         "Token": _method_stat(),
         "Rotate": {
             "Requests": 0,
@@ -161,7 +160,7 @@ tokens = dict(
 #   fingerprint -> {"Uses": int, "LastUsedAt": float}
 token_usage = dict()
 
-# Per-requester upstream timings (RoProxy / Token / Rotate), MERGED across workers.
+# Per-requester upstream timings (Token / Rotate), MERGED across workers.
 # Parallel to proxy_request_counts (which is per HTTP verb); this one answers
 # "how fast is each requester?" with a running total derived in the UI.
 def _timing_stat():
@@ -170,14 +169,13 @@ def _timing_stat():
 
 method_timings = dict(
     {
-        "RoProxy": _timing_stat(),
         "Token": _timing_stat(),
         "Rotate": _timing_stat(),
     }
 )
 
 # Every failed routed upstream request, deduped by "Method: reason" so the admin
-# can diagnose WHY each requester (RoProxy/Token/Rotate) is being rejected.
+# can diagnose WHY each requester (Token/Rotate) is being rejected.
 #   "Method: signature" -> {Method, Count, FirstSeen, LastSeen, LastStatus,
 #                           LastEndpoint, LastDetail}
 request_failures = dict()
@@ -545,11 +543,11 @@ def _budget_peak_since(minutes: int) -> int:
     return peak
 
 
-_METHOD_NAMES = {"roproxy": "RoProxy", "token": "Token", "rotate": "Rotate"}
+_METHOD_NAMES = {"token": "Token", "rotate": "Rotate"}
 
 
 def log_method(method: str, success: bool):
-    """Count an upstream request by method (roproxy/token/rotate) + whether it failed."""
+    """Count an upstream request by method (token/rotate) + whether it failed."""
     name = _METHOD_NAMES.get(method)
     if not name:
         return
@@ -581,7 +579,7 @@ def log_rotate_health(ok: bool, error: str = ""):
 
 
 def log_method_timing(method: str, duration: float):
-    """Record an upstream timing sample for a requester (RoProxy/Token/Rotate)."""
+    """Record an upstream timing sample for a requester (Token/Rotate)."""
     name = _METHOD_NAMES.get(method)
     if not name:
         return
@@ -644,7 +642,7 @@ def log_rotate_ip(ip: str, source: str = ""):
 def reset_method_counters():
     """Zero the per-method request tallies (used when clearing request stats)."""
     with _state_lock:
-        for name in ("RoProxy", "Token", "Rotate"):
+        for name in ("Token", "Rotate"):
             for key in ("Requests", "Failed", "Timeouts"):
                 method_stats[name][key] = 0
         proxy_health["Tokens"]["ExpiredCount"] = 0

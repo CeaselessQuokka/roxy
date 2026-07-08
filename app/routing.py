@@ -1,19 +1,18 @@
 """Cross-worker request routing state.
 
-Every proxied request (without a user-supplied token) picks ONE upstream method:
-  - "roproxy": via games.roproxy.com (RoProxy's IPs)
-  - "token":   to games.roblox.com with our .ROBLOSECURITY (our STATIC IP)
-  - "rotate":  to games.roblox.com via the rotating proxy (DataImpulse's IPs)
+Every proxied request picks ONE upstream method:
+  - "token":  to games.roblox.com with our .ROBLOSECURITY (our STATIC IP)
+  - "rotate": to games.roblox.com via the rotating proxy (DataImpulse's IPs)
 
-Because there are multiple gunicorn workers, the safety-critical constraints —
-the token's global request budget and RoProxy's cooldown — MUST be shared, or 4
-workers would each independently burst our static IP and get it shadow-banned.
+Because there are multiple gunicorn workers, the token's global request budget
+MUST be shared, or 4 workers would each independently burst our static IP and
+get it shadow-banned.
 
 This module keeps that shared state in a tiny dedicated JSON file guarded by an
 inter-process flock (separate from the big data file so the per-request
 read-modify-write stays cheap). choose() atomically reads the state, picks a
 method by weighted random among those currently available, and reserves the
-pick — all under the lock — so the global budget/cooldowns are never exceeded.
+pick — all under the lock — so the global budget is never exceeded.
 """
 
 import config
@@ -31,7 +30,7 @@ import runtime
 # Guards this process's writers; the flock guards across processes.
 _io_lock = Lock()
 
-METHODS = ("roproxy", "token", "rotate")
+METHODS = ("token", "rotate")
 
 
 def _lock_path() -> str:
@@ -103,21 +102,18 @@ def _budget():
 
 def _weights(available, token_used, limit):
     """Weighted preference among available methods. Below the danger zone the base
-    weights apply; past it, the token's share shifts to Rotate and (increasingly,
-    the deeper in) RoProxy, hitting zero token weight at the hard cap."""
-    rw = float(runtime.get_setting("roproxy_weight", config.ROPROXY_WEIGHT))
+    weights apply; past it, the token's share progressively shifts to Rotate,
+    hitting zero token weight at the hard cap."""
     tw = float(runtime.get_setting("token_weight", config.TOKEN_WEIGHT))
     rotw = float(runtime.get_setting("rotate_weight", config.ROTATE_WEIGHT))
     danger = int(runtime.get_setting("token_danger_zone", config.TOKEN_DANGER_ZONE))
 
-    base = {"roproxy": rw, "token": tw, "rotate": rotw}
+    base = {"token": tw, "rotate": rotw}
     if token_used > danger and limit > danger:
         progress = min(1.0, (token_used - danger) / (limit - danger))  # 0 at danger → 1 at cap
         freed = tw * progress
         base["token"] = tw - freed
-        roproxy_frac = 0.2 + 0.4 * progress  # RoProxy takes a growing share of the freed weight
-        base["roproxy"] = rw + freed * roproxy_frac
-        base["rotate"] = rotw + freed * (1.0 - roproxy_frac)
+        base["rotate"] = rotw + freed
     if token_used >= limit:
         base["token"] = 0.0
 
@@ -141,12 +137,9 @@ def choose(exclude: set, has_tokens: bool, rotate_enabled: bool):
         limit, window = _budget()
         uses = [t for t in data.get("TokenUses", []) if isinstance(t, (int, float)) and t > now - window]
         token_used = len(uses)
-        roproxy_until = float(data.get("RoProxyUntil", 0) or 0)
         rotate_until = float(data.get("RotateUntil", 0) or 0)
 
         available = []
-        if "roproxy" not in exclude and now >= roproxy_until:
-            available.append("roproxy")
         if "token" not in exclude and has_tokens and token_used < limit:
             available.append("token")
         if "rotate" not in exclude and rotate_enabled and now >= rotate_until:
@@ -161,8 +154,6 @@ def choose(exclude: set, has_tokens: bool, rotate_enabled: bool):
             uses.append(now)
             data["TokenUses"] = uses
             token_used += 1
-        elif choice == "roproxy":
-            data["RoProxyUntil"] = now + int(runtime.get_setting("roproxy_cooldown", config.ROPROXY_COOLDOWN))
         # rotate: each request is a fresh exit IP, so no reservation/cooldown here
         # (failures are handled by record_rotate_result).
         return (choice, token_used)
@@ -219,7 +210,6 @@ def get_state() -> dict:
             "TokenLimit": limit,
             "TokenWindow": window,
             "TokenResetIn": int(max(0, (min(uses) + window - now))) if uses else 0,
-            "RoProxyResetIn": int(max(0, float(data.get("RoProxyUntil", 0) or 0) - now)),
             "RotateResetIn": int(max(0, float(data.get("RotateUntil", 0) or 0) - now)),
         }
 

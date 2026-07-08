@@ -359,14 +359,14 @@ const print = console.log;
 		}
 	}
 
-	// Per-requester upstream timings (RoProxy/Token/Rotate) + a running Total row.
+	// Per-requester upstream timings (Token/Rotate) + a running Total row.
 	function renderMethodTimings(d) {
 		const tbody = $("#methodTimingsTable tbody");
 		if (!tbody) return;
 		const mt = d.MethodTimings || {};
 		tbody.innerHTML = "";
 		const total = { TotalTime: 0, Count: 0, Min: 0, Max: 0, LastRequestTime: 0 };
-		for (const name of ["RoProxy", "Token", "Rotate"]) {
+		for (const name of ["Token", "Rotate"]) {
 			const row = mt[name] || { TotalTime: 0, Count: 0, Min: 0, Max: 0, LastRequestTime: 0 };
 			const count = Number(row.Count || 0);
 			const minVal = row.Min === Infinity ? 0 : Number(row.Min || 0);
@@ -537,20 +537,11 @@ const print = console.log;
 
 	function renderHealth(d) {
 		const ms = d.MethodStats || {};
-		const rp = ms.RoProxy || {};
 		const tok = ms.Token || {};
 		const rot = ms.Rotate || {};
 		const routing = d.Routing || {};
 		const rotate = d.Rotate || {};
 		const tk = (d.ProxyHealth || {}).Tokens || {};
-
-		// RoProxy: in cooldown when routing says so.
-		const roCooldown = Number(routing.RoProxyResetIn || 0) > 0;
-		setStateWord("health_roproxy", roCooldown ? "COOLDOWN" : "OK", !roCooldown);
-		setText("roproxy_reset", roCooldown ? `${routing.RoProxyResetIn}s` : "—");
-		setText("roproxy_count", String(rp.Requests || 0));
-		setText("roproxy_failed", String(rp.Failed || 0));
-		setText("roproxy_timeouts", String(rp.Timeouts || 0));
 
 		// Token: "BUDGET" when the safety budget is full, else OK.
 		const tokenFull = Number(routing.TokenUsed || 0) >= Number(routing.TokenLimit || 0) && routing.TokenLimit;
@@ -1193,8 +1184,6 @@ const print = console.log;
 		allowed_requests_per_minute: "Allowed requests per period",
 		throttle_reset_duration: "Throttle reset duration (s)",
 		stale_ip_duration: "Stale IP duration (s)",
-		direct_api_cooldown: "Direct API cooldown (s)",
-		roproxy_cooldown: "RoProxy cooldown (s)",
 		max_retries_per_request: "Max retries per request",
 		two_fa_expiration: "2FA code lifetime (s)",
 		challenge_expiration: "Login challenge lifetime (s)",
@@ -1213,7 +1202,6 @@ const print = console.log;
 		token_budget_window: "Token budget: window (s)",
 		global_throttle_limit: "Throttle-all: max requests / IP",
 		global_throttle_period: "Throttle-all: window (s)",
-		roproxy_weight: "Method weight: RoProxy",
 		token_weight: "Method weight: Token",
 		rotate_weight: "Method weight: Rotate",
 		token_danger_zone: "Token danger zone (requests)",
@@ -1225,7 +1213,7 @@ const print = console.log;
 	// Group settings so the (long) list is navigable. Any key not listed falls
 	// into "Other" so nothing is ever hidden.
 	const SETTING_GROUPS = [
-		["Routing & method mix", ["roproxy_weight", "token_weight", "rotate_weight", "token_danger_zone", "roproxy_cooldown", "direct_api_cooldown"]],
+		["Routing & method mix", ["token_weight", "rotate_weight", "token_danger_zone"]],
 		["IP rotation", ["rotate_enabled", "rotate_cooldown", "rotate_max_failures"]],
 		["Token safety budget", ["token_budget_requests", "token_budget_window", "token_expiration_cooldown"]],
 		["Throttling", ["allowed_requests_per_minute", "throttle_reset_duration", "stale_ip_duration", "global_throttle_limit", "global_throttle_period"]],

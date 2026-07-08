@@ -965,7 +965,7 @@
 					</div>
 					<div class="card">
 						<p class="form__hint">
-							Latency of each upstream requester (RoProxy / Token / Rotate), with a running total.
+							Latency of each upstream requester (Token / Rotate), with a running total.
 						</p>
 						<div class="table-wrap">
 							<table id="methodTimingsTable" class="table">
@@ -1054,9 +1054,9 @@
 					</div>
 					<div class="card">
 						<p class="form__hint">
-							Every failed upstream attempt, grouped by requester (RoProxy / Token / Rotate) and reason
-							— so you can diagnose exactly why each one is being rejected. Click a row for the last
-							detail. Clears independently of other stats.
+							Every failed upstream attempt, grouped by requester (Token / Rotate) and reason — so you
+							can diagnose exactly why each one is being rejected. Click a row for the last detail.
+							Clears independently of other stats.
 						</p>
 						<div class="table-wrap">
 							<table id="requestFailuresTable" class="table">
@@ -1447,17 +1447,6 @@
 
 					<div class="grid grid--kpis">
 						<article class="card kpi">
-							<h3 class="kpi__title">RoProxy</h3>
-							<div class="kpi__value" id="health_roproxy">OK</div>
-							<div class="kpi__meta">
-								Resets in: <span id="roproxy_reset">—</span> • Requests:
-								<span id="roproxy_count">0</span> • Rejected:
-								<span id="roproxy_failed">0</span> • Timeouts:
-								<span id="roproxy_timeouts">0</span>
-							</div>
-						</article>
-
-						<article class="card kpi">
 							<h3 class="kpi__title">Token</h3>
 							<div class="kpi__value" id="health_token">OK</div>
 							<div class="kpi__meta">
@@ -1587,10 +1576,9 @@
 						<article class="card">
 							<h3 class="card__title">Health Check</h3>
 							<p class="card__desc">
-								Confirms the Flask app itself is alive and reachable: it calls the public
-								<code>/health</code> endpoint and reports whether the server responds and whether the proxy
-								is currently paused. It does <strong>not</strong> contact Roblox or test your tokens — use
-								<em>Force Revalidate</em> for that. A quick "is the server up?" ping.
+								A full active probe: confirms the server is up, re-checks every token against Roblox
+								(same as <em>Force Revalidate</em>), and verifies the rotation proxy by fetching an
+								exit IP through it. Reports all three at once.
 							</p>
 							<button class="btn btn--outline" type="button" id="healthCheckBtn">Run health check</button>
 						</article>
