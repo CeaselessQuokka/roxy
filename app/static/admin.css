@@ -231,6 +231,15 @@ input:focus {
 	color: var(--text-muted);
 	font-size: 0.9rem;
 }
+/* Live countdown to the 2FA code's expiry, so it never lapses silently. */
+.modal__countdown {
+	display: inline-block;
+	font-variant-numeric: tabular-nums;
+}
+.modal__countdown.is-expired {
+	color: var(--error);
+	font-weight: 600;
+}
 .modal__error {
 	color: var(--error);
 	font-weight: 600;

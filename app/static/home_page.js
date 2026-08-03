@@ -25,6 +25,12 @@
 	// ---- COPY BUTTONS FOR CODE BLOCKS ----
 	function setupCopyButtons() {
 		$$("pre.example, pre.output").forEach(block => {
+			// Capture the snippet BEFORE the button is added, rather than slicing
+			// the button's label back off afterwards: that slice assumed the label
+			// was always exactly "Copy", so clicking again while it read "Copied!"
+			// silently handed over a truncated snippet.
+			const code = block.textContent;
+
 			const button = document.createElement("button");
 			button.className = "btn btn--tonal copy-btn";
 			button.textContent = "Copy";
@@ -33,7 +39,6 @@
 			block.appendChild(button);
 
 			button.addEventListener("click", async () => {
-				const code = block.textContent.substring(0, block.textContent.length - 4); // Remove "Copy" text.
 				try {
 					await navigator.clipboard.writeText(code);
 					button.textContent = "Copied!";

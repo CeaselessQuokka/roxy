@@ -28,9 +28,32 @@ import rotate
 import routing
 import runtime
 import time
+from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
 from lockfile import LockedJSON
+
+# Tokens are sent as a DOMAIN-SCOPED cookie jar, never a bare {name: value}
+# dict. A dict becomes a cookie with no domain, which `requests` will replay to
+# whatever host a redirect points at -- so a single open redirect anywhere on
+# roblox.com would hand our account cookie to a third party. Scoping it to
+# .roblox.com makes the cookie jar itself refuse to send it off-domain, which
+# keeps redirect-following intact without the exposure.
+TOKEN_COOKIE_DOMAIN = ".roblox.com"
+
+
+def _token_jar(token: str):
+    jar = requests.cookies.RequestsCookieJar()
+    jar.set(".ROBLOSECURITY", token, domain=TOKEN_COOKIE_DOMAIN, path="/")
+    return jar
+
+
+def mask_token(token: str) -> str:
+    """A short, non-reversible label for a token. Deliberately brief: this is
+    rendered on the dashboard and lands in CSV/JSON exports, so it must not be
+    enough of a live credential to matter if one leaks."""
+    return f"…{(token or '')[-6:]}"
+
 
 # Token list is loaded from the token file and reloaded across workers when the
 # file changes (so a dashboard token update reaches every worker).
@@ -60,9 +83,14 @@ def _email_allowed(key: str, cooldown: float) -> bool:
 
     return _coord.update(mutate)
 
+
 # Per single proxied request: each method may be tried once, plus a CSRF retry
 # inside a method. This bounds the work for one request across the whole chain.
 MAX_METHOD_ATTEMPTS = 3
+
+# Bounds on the admin health check, so it can never outlive a worker timeout.
+MAX_TOKEN_CHECK_WORKERS = 8
+TOKEN_CHECK_GRACE = 5  # Seconds allowed on top of request_timeout per probe.
 
 for t in tokens:
     diagnostics.update_token(t)
@@ -151,7 +179,9 @@ def _rotate_headers(headers: dict) -> dict:
 
 # --- The public entry point --------------------------------------------------
 # Returns (successful, response).
-def request(url: str, method: str = "get", headers: dict = None, params: dict = None, data: str = None) -> tuple[bool, str]:
+def request(
+    url: str, method: str = "get", headers: dict = None, params: dict = None, data: str = None
+) -> tuple[bool, str]:
     headers = headers if headers is not None else {}
     _maybe_reload_tokens()
 
@@ -189,7 +219,7 @@ def _do_method(choice: str, url: str, method: str, headers: dict, params: dict, 
         if not token:
             return (False, True, None)  # token vanished between choose() and now
         return _attempt(
-            "token", f"https://{url}", method, headers, params, data, cookies={".ROBLOSECURITY": token}, token=token
+            "token", f"https://{url}", method, headers, params, data, cookies=_token_jar(token), token=token
         )
     if choice == "rotate":
         return _attempt(
@@ -246,6 +276,13 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
             diagnostics.log_reason(True)
             diagnostics.log_request_failure(choice, "timeout", "Upstream timed out", endpoint)
             diagnostics.log_method_timeout(choice)
+            # A timeout is an attempt this method made and lost, so it counts
+            # toward the method's Requests/Failed exactly like a connection
+            # error does. Omitting it made those two numbers freeze during an
+            # upstream outage -- precisely when they are being watched.
+            diagnostics.log_method(choice, False)
+            if token is not None:
+                diagnostics.update_token(token, used=True)  # keep Uses in sync with method Requests
             if choice == "rotate":
                 routing.record_rotate_result(False)
                 diagnostics.log_rotate_health(False, "timeout")
@@ -309,7 +346,7 @@ def validate_token(token: str):
     try:
         req = requests.get(
             "https://accountinformation.roblox.com/v1/birthdate",
-            cookies={".ROBLOSECURITY": token},
+            cookies=_token_jar(token),
             timeout=_timeout(),
         )
     except requests.RequestException:
@@ -333,7 +370,7 @@ def validate_token(token: str):
         mail.try_send(
             auth.get_emails()[0],
             "Token Expired",
-            f'An auth token has expired: "{token[-3:]}".\nhttps://roxytheproxy.com/admin',
+            f'An auth token has expired: "{mask_token(token)}".\nhttps://roxytheproxy.com/admin',
         )
 
 
@@ -346,9 +383,12 @@ def update_tokens(new_tokens: list[str]):
                 diagnostics.update_token(t)
 
 
-def set_tokens(new_tokens: list[str]) -> list[str]:
+def set_tokens(new_tokens: list[str]) -> tuple[list[str], bool]:
     """Replace the active token set. Writes through to the token file so ALL
-    gunicorn workers pick it up (they reload on file change)."""
+    gunicorn workers pick it up (they reload on file change) -- which is why the
+    write is unconditional rather than opt-in.
+
+    Returns (cleaned tokens, whether the file write succeeded)."""
     global tokens, _tokens_mtime
     cleaned = []
     for t in new_tokens:
@@ -360,9 +400,9 @@ def set_tokens(new_tokens: list[str]) -> list[str]:
         diagnostics.clear_tokens()
         for t in tokens:
             diagnostics.update_token(t)
-    auth.write_tokens(cleaned)  # propagate to other workers via the file
+    persisted = auth.write_tokens(cleaned)  # propagate to other workers via the file
     _tokens_mtime = auth.tokens_mtime()
-    return list(cleaned)
+    return list(cleaned), persisted
 
 
 def _revalidate_one(token: str):
@@ -371,7 +411,7 @@ def _revalidate_one(token: str):
     try:
         req = requests.get(
             "https://accountinformation.roblox.com/v1/birthdate",
-            cookies={".ROBLOSECURITY": token},
+            cookies=_token_jar(token),
             timeout=_timeout(),
         )
     except requests.RequestException:
@@ -385,39 +425,56 @@ def _revalidate_one(token: str):
             diagnostics.remove_token(token, expired=True)
 
 
+def _check_one_token(token: str) -> dict:
+    """Probe one token against Roblox and reconcile the inventory. Never raises."""
+    masked = mask_token(token)
+    diagnostics.record_token_budget_usage(routing.record_token_use())
+    try:
+        req = requests.get(
+            "https://accountinformation.roblox.com/v1/birthdate",
+            cookies=_token_jar(token),
+            timeout=_timeout(),
+        )
+    except requests.RequestException as e:
+        return {"Masked": masked, "Active": None, "Error": type(e).__name__}
+    active = req.status_code == 200
+    with _tokens_lock:
+        if active:
+            if token not in tokens:
+                tokens.append(token)
+            diagnostics.update_token(token)
+        else:
+            if token in tokens:
+                tokens.remove(token)
+            diagnostics.remove_token(token, expired=True)
+    return {"Masked": masked, "Active": active, "Error": "" if active else f"HTTP {req.status_code}"}
+
+
 def check_tokens() -> list[dict]:
-    """Synchronously verify each current token against Roblox and return a report
+    """Verify each current token against Roblox and return a report
     [{Masked, Active, Error}]. Updates the inventory (drops expired, re-adds valid).
+
+    Probes run in parallel behind a whole-call deadline. Run serially, N tokens
+    against a slow upstream took N x request_timeout seconds inside a single
+    admin request, which outlives gunicorn's worker timeout and gets the worker
+    killed part-way through the check.
 
     Counts toward the token's request budget (it IS a request to Roblox) but NOT
     toward the per-requester Token stats, which track user-serving traffic only."""
     _maybe_reload_tokens()
     with _tokens_lock:
         snapshot = list(tokens)
-    report = []
-    for token in snapshot:
-        masked = f"...{token[-20:]}"
-        diagnostics.record_token_budget_usage(routing.record_token_use())
-        try:
-            req = requests.get(
-                "https://accountinformation.roblox.com/v1/birthdate",
-                cookies={".ROBLOSECURITY": token},
-                timeout=_timeout(),
-            )
-        except requests.RequestException as e:
-            report.append({"Masked": masked, "Active": None, "Error": type(e).__name__})
-            continue
-        active = req.status_code == 200
-        with _tokens_lock:
-            if active:
-                if token not in tokens:
-                    tokens.append(token)
-                diagnostics.update_token(token)
-            else:
-                if token in tokens:
-                    tokens.remove(token)
-                diagnostics.remove_token(token, expired=True)
-        report.append({"Masked": masked, "Active": active, "Error": "" if active else f"HTTP {req.status_code}"})
+    if not snapshot:
+        return []
+    deadline = _timeout() + TOKEN_CHECK_GRACE
+    with ThreadPoolExecutor(max_workers=min(len(snapshot), MAX_TOKEN_CHECK_WORKERS)) as pool:
+        pending = [(token, pool.submit(_check_one_token, token)) for token in snapshot]
+        report = []
+        for token, future in pending:
+            try:
+                report.append(future.result(timeout=deadline))
+            except Exception as e:
+                report.append({"Masked": mask_token(token), "Active": None, "Error": type(e).__name__})
     return report
 
 

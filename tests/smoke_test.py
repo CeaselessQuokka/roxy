@@ -16,11 +16,13 @@ import os
 import sys
 import tempfile
 import time
+from urllib.parse import quote
 
 # --- Sandbox /etc/roxy + data file BEFORE importing the app -------------------
 sandbox = tempfile.mkdtemp(prefix="roxy_test_")
 os.environ["ROXY_FILE_ROOT"] = sandbox
 os.environ["ROXY_DATA_FILE"] = os.path.join(sandbox, "roxy_data.json")
+os.environ["ROXY_STATE_FILE"] = os.path.join(sandbox, "roxy_state.json")
 os.environ["ROXY_ROUTING_FILE"] = os.path.join(sandbox, "roxy_routing.json")
 os.environ["ROXY_THROTTLE_FILE"] = os.path.join(sandbox, "roxy_throttle.json")
 os.environ["ROXY_COORD_FILE"] = os.path.join(sandbox, "roxy_coord.json")
@@ -39,6 +41,7 @@ def enable_rotation():
 def disable_rotation():
     if os.path.exists(ROTATE_PROXY_PATH):
         os.remove(ROTATE_PROXY_PATH)
+
 
 ADMIN_USER = "testadmin"
 ADMIN_PASS = "testpassword123"
@@ -87,6 +90,7 @@ app.config.update(SESSION_COOKIE_SECURE=False, TESTING=True)
 @app.route("/_boom_test_only")
 def _boom():
     raise RuntimeError("intentional test explosion")
+
 
 passed, failed = 0, 0
 
@@ -247,7 +251,14 @@ upstream_calls = []
 
 def fake_upstream(method, url, headers=None, params=None, data=None, cookies=None, timeout=None, proxies=None):
     upstream_calls.append(
-        {"method": method, "url": url, "headers": headers or {}, "params": params or {}, "cookies": cookies, "proxies": proxies}
+        {
+            "method": method,
+            "url": url,
+            "headers": headers or {},
+            "params": params or {},
+            "cookies": cookies,
+            "proxies": proxies,
+        }
     )
     return FakeUpstreamResponse()
 
@@ -310,7 +321,11 @@ check("prettyprint=true formats the response", json.loads(r.data) == {"ok": True
 call = upstream_calls[-1]
 r = api_client.get("/avatar.roblox.com/v2/test-plain", headers=IP_API)
 check("Raw upstream body passed through without prettyprint", r.data == b'{"ok":true}', r.data[:60])
-check("Token route attaches the .ROBLOSECURITY cookie", (call["cookies"] or {}).get(".ROBLOSECURITY") == "FAKE_TOKEN_AAA", call["cookies"])
+check(
+    "Token route attaches the .ROBLOSECURITY cookie",
+    (call["cookies"] or {}).get(".ROBLOSECURITY") == "FAKE_TOKEN_AAA",
+    call["cookies"],
+)
 check("Upstream URL is https + roblox", call["url"] == "https://avatar.roblox.com/v2/test", call["url"])
 check("prettyprint stripped before proxying", "prettyprint" not in call["params"], call["params"])
 check("Repeated query params preserved", call["params"].get("ids") == ["1", "2"], call["params"])
@@ -333,6 +348,9 @@ check(
 )
 check("Live feed recorded", any("avatar.roblox.com" in (i.get("URL") or "") for i in diag.get("LiveRequests", [])))
 check("Status code 200 recorded", diag.get("StatusCodesDetailed", {}).get("200", 0) >= 1)
+# A plain read merges at most once per diagnostics_flush_interval; ?flush=1 is the
+# explicit "give me the current cross-worker truth" the Refresh button uses.
+client.get("/admin/diagnostics?flush=1", headers={**IP_MAIN, "Accept": "application/json"})
 with open(os.environ["ROXY_DATA_FILE"]) as f:
     on_disk = json.load(f)
 check(
@@ -364,7 +382,9 @@ check("Over-budget requests fell back to Rotate (3)", ms.get("Rotate", {}).get("
 check("TokenBudget shows the cap usage", diag.get("TokenBudget", {}).get("Used") == 2, diag.get("TokenBudget"))
 check("TokenBudget limit reflects setting", diag.get("TokenBudget", {}).get("Limit") == 2, diag.get("TokenBudget"))
 # Restore sane values for the rest of the run.
-client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"token_budget_requests": 100000, "token_budget_window": 65}})
+client.post(
+    "/admin/settings", headers=IP_MAIN, json={"settings": {"token_budget_requests": 100000, "token_budget_window": 65}}
+)
 set_method_weights(100, 0)
 reset_routing()
 proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
@@ -394,7 +414,11 @@ check(
 r = api_client.get("/avatar.roblox.com/v2/after-clear", headers=IP_API)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 diag = r.get_json()
-check("New requests count again after clear", diag["RequestCounts"]["GET"]["Successful"] == 1, diag["RequestCounts"]["GET"])
+check(
+    "New requests count again after clear",
+    diag["RequestCounts"]["GET"]["Successful"] == 1,
+    diag["RequestCounts"]["GET"],
+)
 
 print("== Admin-visit counting skips known admin browsers ==")
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
@@ -408,7 +432,10 @@ known.set_cookie("roxy_admin_seen", "1")
 known.get("/admin", headers={"X-Forwarded-For": "10.5.5.6"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 check("Known-admin browser visit does NOT count", r.get_json()["PageVisits"].get("admin", 0) == visits_before + 1)
-check("Login response set the admin-seen cookie", any(c.key == "roxy_admin_seen" for c in client._cookies.values()) if hasattr(client, "_cookies") else True)
+check(
+    "Login response set the admin-seen cookie",
+    any(c.key == "roxy_admin_seen" for c in client._cookies.values()) if hasattr(client, "_cookies") else True,
+)
 
 print("== Wildcard endpoint blocking ==")
 # Make sure proxied (non-blocked) requests reach the fake upstream.
@@ -459,7 +486,11 @@ IP_HDR = {"X-Forwarded-For": "10.7.7.1"}
 n = len(upstream_calls)
 r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "Xeno-Fingerprint": "9b6c6e24"})
 check("Header rule blocks request with Xeno-* header (key match) -> disguised 429", r.status_code == 429, r.status_code)
-check("Header-blocked body looks like a throttle (no reason leaked)", b"throttled" in r.data and b"eader" not in r.data, r.data[:80])
+check(
+    "Header-blocked body looks like a throttle (no reason leaked)",
+    b"throttled" in r.data and b"eader" not in r.data,
+    r.data[:80],
+)
 check("Header-blocked response disguised as throttled", r.headers.get("Roxy-Throttled") == "True", dict(r.headers))
 check("Header-blocked request never hit upstream", len(upstream_calls) == n, len(upstream_calls) - n)
 
@@ -483,7 +514,11 @@ check(
 xeno_rec = next((v for k, v in hba.items() if "xeno" in k), {})
 check("Header-blocked record notes which field triggered (value)", xeno_rec.get("LastField") == "value", xeno_rec)
 check("Header-blocked record captures the matched text", "Xeno" in (xeno_rec.get("LastMatch") or ""), xeno_rec)
-check("Header rule stored in HeaderRules", any("xeno" in k for k in diag.get("HeaderRules", {})), list(diag.get("HeaderRules", {})))
+check(
+    "Header rule stored in HeaderRules",
+    any("xeno" in k for k in diag.get("HeaderRules", {})),
+    list(diag.get("HeaderRules", {})),
+)
 
 # Key-scope exact rule
 client.post("/admin/headers/rule", headers=IP_MAIN, json={"scope": "key", "mode": "exact", "needle": "exploit-guid"})
@@ -502,7 +537,11 @@ check("After removing the rule, Xeno UA passes -> 200", r.status_code == 200, r.
 r = client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "header_blocked_attempts"})
 check("Clear header-blocked attempts -> 200", r.status_code == 200, r.status_code)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-check("Header-blocked attempts cleared", r.get_json().get("HeaderBlockedAttempts") == {}, r.get_json().get("HeaderBlockedAttempts"))
+check(
+    "Header-blocked attempts cleared",
+    r.get_json().get("HeaderBlockedAttempts") == {},
+    r.get_json().get("HeaderBlockedAttempts"),
+)
 # Remove the remaining exact rule so it doesn't affect later sections.
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 for rid in [k for k in r.get_json().get("HeaderRules", {}) if "exploit-guid" in k]:
@@ -525,7 +564,11 @@ IP_TA = {"X-Forwarded-For": "10.8.8.1"}
 n = len(upstream_calls)
 r1 = api_client.get("/games.roblox.com/v1/ta1", headers=IP_TA)
 r2 = api_client.get("/games.roblox.com/v1/ta2", headers=IP_TA)
-check("Throttle-all lets the first N requests through", r1.status_code == 200 and r2.status_code == 200, (r1.status_code, r2.status_code))
+check(
+    "Throttle-all lets the first N requests through",
+    r1.status_code == 200 and r2.status_code == 200,
+    (r1.status_code, r2.status_code),
+)
 check("Allowed throttle-all requests reached upstream", len(upstream_calls) == n + 2, len(upstream_calls) - n)
 n = len(upstream_calls)
 r3 = api_client.get("/games.roblox.com/v1/ta3", headers=IP_TA)
@@ -545,10 +588,18 @@ check("Normal request hit upstream again", len(upstream_calls) == n + 1, len(ups
 
 print("== Pause: custom message + dropped-request counter ==")
 r = client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": True, "reason": "Updating tokens, back soon."})
-check("Pause with reason -> state paused + reason", r.get_json().get("Paused") is True and r.get_json().get("Reason") == "Updating tokens, back soon.", r.data[:80])
+check(
+    "Pause with reason -> state paused + reason",
+    r.get_json().get("Paused") is True and r.get_json().get("Reason") == "Updating tokens, back soon.",
+    r.data[:80],
+)
 IP_PAUSE = {"X-Forwarded-For": "10.15.0.1"}
 r = api_client.get("/games.roblox.com/v1/while-paused", headers=IP_PAUSE)
-check("Paused proxy returns 503 with the custom message", r.status_code == 503 and b"Updating tokens, back soon." in r.data, (r.status_code, r.data[:80]))
+check(
+    "Paused proxy returns 503 with the custom message",
+    r.status_code == 503 and b"Updating tokens, back soon." in r.data,
+    (r.status_code, r.data[:80]),
+)
 api_client.get("/games.roblox.com/v1/while-paused-2", headers=IP_PAUSE)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 check("Pause drops counted", r.get_json().get("PauseDrops", 0) >= 2, r.get_json().get("PauseDrops"))
@@ -557,7 +608,9 @@ client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": False})
 r = client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": True})  # reuses the persisted message
 api_client.get("/games.roblox.com/v1/while-paused-3", headers=IP_PAUSE)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-check("Pause drop counter reset on new downtime", r.get_json().get("PauseDrops", 0) == 1, r.get_json().get("PauseDrops"))
+check(
+    "Pause drop counter reset on new downtime", r.get_json().get("PauseDrops", 0) == 1, r.get_json().get("PauseDrops")
+)
 # Explicitly clearing the message (reason="") falls back to the default.
 client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": False})
 client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": True, "reason": ""})
@@ -573,7 +626,9 @@ set_method_weights(0, 100)  # force Rotate
 
 
 def failing_upstream(method, url, headers=None, params=None, data=None, cookies=None, timeout=None, proxies=None):
-    upstream_calls.append({"method": method, "url": url, "headers": headers or {}, "params": params or {}, "cookies": cookies})
+    upstream_calls.append(
+        {"method": method, "url": url, "headers": headers or {}, "params": params or {}, "cookies": cookies}
+    )
     return FakeUpstreamResponse(status=500, text="upstream boom")
 
 
@@ -592,7 +647,11 @@ reset_routing()
 
 print("== Upstream timeouts: fall through routes, never email ==")
 reset_routing()
-set_method_weights(1, 100)  # try Rotate first; Token is the fallback
+# Rotate must be tried FIRST every time, or ~1 run in 100 picks Token, succeeds,
+# and never produces the timeout this section is asserting on. Weight 0 excludes
+# Token from the initial pick; it is still reachable as the fallback, because
+# once Rotate is in the excluded set it becomes the only candidate.
+set_method_weights(0, 100)
 proxy_module.set_tokens(["FALLBACK_TOKEN"])
 
 
@@ -631,11 +690,17 @@ eps = r.get_json().get("Endpoints", {})
 tmpl = "avatar.roblox.com/v2/avatar/users/{userId}/outfits"
 check("IDs collapse into a {userId} template", tmpl in eps, list(eps))
 check("Template counts all 3 requests", eps.get(tmpl, {}).get("Count") == 3, eps.get(tmpl))
-check("Template keeps the 3 concrete IDs", len(eps.get(tmpl, {}).get("Concrete", {})) == 3, eps.get(tmpl, {}).get("Concrete"))
+check("Template reports 3 concrete IDs", eps.get(tmpl, {}).get("ConcreteCount") == 3, eps.get(tmpl))
+# The concrete paths themselves carry a captured header dump each, so they are
+# fetched per template on demand rather than shipped with every dashboard poll.
+concrete = client.get(
+    f"/admin/endpoints/concrete?template={quote(tmpl, safe='')}", headers={**IP_MAIN, "Accept": "application/json"}
+).get_json()
+check("Template keeps the 3 concrete IDs", len(concrete.get("Concrete", {})) == 3, concrete.get("Concrete"))
 check(
     "Concrete drill-down has the real path",
-    "avatar.roblox.com/v2/avatar/users/111/outfits" in eps.get(tmpl, {}).get("Concrete", {}),
-    list(eps.get(tmpl, {}).get("Concrete", {})),
+    "avatar.roblox.com/v2/avatar/users/111/outfits" in concrete.get("Concrete", {}),
+    list(concrete.get("Concrete", {})),
 )
 check(
     "games servers path collapses gameId + serverId",
@@ -663,7 +728,9 @@ r = api_client.get("/games.roblox.com/v1/games/999/votes", headers=IP_RX)
 check("After unblock, regex pattern no longer blocks -> 200", r.status_code == 200, r.status_code)
 
 print("== Regex header rule ==")
-r = client.post("/admin/headers/rule", headers=IP_MAIN, json={"scope": "value", "mode": "regex", "needle": r"Synapse|Xeno|KRNL"})
+r = client.post(
+    "/admin/headers/rule", headers=IP_MAIN, json={"scope": "value", "mode": "regex", "needle": r"Synapse|Xeno|KRNL"}
+)
 check("Add regex header rule -> 200", r.status_code == 200, r.data[:80])
 IP_RXH = {"X-Forwarded-For": "10.13.0.1"}
 r = api_client.get("/games.roblox.com/v1/x", headers={**IP_RXH, "User-Agent": "KRNL/2.0"})
@@ -681,13 +748,19 @@ client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
 reset_routing()  # fresh window so the peak is exactly what we drive
 set_method_weights(100, 0)  # token-only
 proxy_module.set_tokens(["PEAK_TOKEN"])
-client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"token_budget_requests": 95, "token_budget_window": 65}})
+client.post(
+    "/admin/settings", headers=IP_MAIN, json={"settings": {"token_budget_requests": 95, "token_budget_window": 65}}
+)
 IP_PK = {"X-Forwarded-For": "10.14.0.1"}
 for i in range(3):
     api_client.get(f"/games.roblox.com/v1/peak{i}", headers=IP_PK)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 diag = r.get_json()
-check("Token budget Used reflects the 3 token requests", diag.get("TokenBudget", {}).get("Used") == 3, diag.get("TokenBudget"))
+check(
+    "Token budget Used reflects the 3 token requests",
+    diag.get("TokenBudget", {}).get("Used") == 3,
+    diag.get("TokenBudget"),
+)
 check("Budget peak (1h) captured", diag.get("BudgetPeak1h") == 3, diag.get("BudgetPeak1h"))
 check("Budget peak (24h) captured", diag.get("BudgetPeak24h") == 3, diag.get("BudgetPeak24h"))
 client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"token_budget_requests": 100000}})
@@ -742,17 +815,28 @@ print("== Service messages persist after disabling ==")
 client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": True, "reason": "Persisted pause msg"})
 client.post("/admin/proxy/toggle", headers=IP_MAIN, json={"paused": False})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-check("Pause message persists after resume", r.get_json().get("Pause", {}).get("Reason") == "Persisted pause msg", r.get_json().get("Pause"))
+check(
+    "Pause message persists after resume",
+    r.get_json().get("Pause", {}).get("Reason") == "Persisted pause msg",
+    r.get_json().get("Pause"),
+)
 
 print("== Per-endpoint last headers recorded ==")
 proxy_module.set_tokens(["HDR_TOKEN"])
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "endpoints"})
-api_client.get("/avatar.roblox.com/v2/avatar/users/777/outfits", headers={"X-Forwarded-For": "10.21.0.1", "X-Test-Header": "fingerprint-me"})
-r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-concrete = (r.get_json().get("Endpoints", {}).get(tmpl, {}).get("Concrete", {}) or {}).get(
-    "avatar.roblox.com/v2/avatar/users/777/outfits", {}
+api_client.get(
+    "/avatar.roblox.com/v2/avatar/users/777/outfits",
+    headers={"X-Forwarded-For": "10.21.0.1", "X-Test-Header": "fingerprint-me"},
 )
-check("Concrete endpoint stores last headers", "X-Test-Header" in (concrete.get("LastHeaders") or ""), concrete.get("LastHeaders"))
+detail = client.get(
+    f"/admin/endpoints/concrete?template={quote(tmpl, safe='')}", headers={**IP_MAIN, "Accept": "application/json"}
+).get_json()
+concrete = (detail.get("Concrete") or {}).get("avatar.roblox.com/v2/avatar/users/777/outfits", {})
+check(
+    "Concrete endpoint stores last headers",
+    "X-Test-Header" in (concrete.get("LastHeaders") or ""),
+    concrete.get("LastHeaders"),
+)
 check("Concrete endpoint stores last IP", concrete.get("LastIP") == "10.21.0.1", concrete.get("LastIP"))
 
 print("== Token route Requests/Rejected counted ==")
@@ -766,11 +850,22 @@ check("Token method request count tracked", tk.get("Requests", 0) >= 1, tk)
 print("== Request fingerprints (header names + user-agents) ==")
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "fingerprints"})
 proxy_module.set_tokens(["FP_TOKEN"])
-api_client.get("/games.roblox.com/v1/fp", headers={"X-Forwarded-For": "10.22.0.1", "User-Agent": "EvilExploiter/9", "X-Weird-Header": "1"})
+api_client.get(
+    "/games.roblox.com/v1/fp",
+    headers={"X-Forwarded-For": "10.22.0.1", "User-Agent": "EvilExploiter/9", "X-Weird-Header": "1"},
+)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 diag = r.get_json()
-check("Distinct header names tracked", "x-weird-header" in (diag.get("HeaderNames") or {}), list(diag.get("HeaderNames", {}))[:8])
-check("Distinct user-agents tracked", "EvilExploiter/9" in (diag.get("UserAgents") or {}), list(diag.get("UserAgents", {}))[:8])
+check(
+    "Distinct header names tracked",
+    "x-weird-header" in (diag.get("HeaderNames") or {}),
+    list(diag.get("HeaderNames", {}))[:8],
+)
+check(
+    "Distinct user-agents tracked",
+    "EvilExploiter/9" in (diag.get("UserAgents") or {}),
+    list(diag.get("UserAgents", {}))[:8],
+)
 
 print("== Error log (deduped, admin-clear only) ==")
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "errors"})
@@ -781,12 +876,18 @@ errs = r.get_json().get("Errors", {})
 boom_sig = next((k for k in errs if "intentional test explosion" in k), None)
 check("Server error logged with signature", boom_sig is not None, list(errs))
 check("Repeated identical errors dedupe with a count", errs.get(boom_sig, {}).get("Count", 0) >= 2, errs.get(boom_sig))
-check("Error log keeps a detail/traceback", "Traceback" in (errs.get(boom_sig, {}).get("LastDetail") or ""), errs.get(boom_sig))
+check(
+    "Error log keeps a detail/traceback",
+    "Traceback" in (errs.get(boom_sig, {}).get("LastDetail") or ""),
+    errs.get(boom_sig),
+)
 
 print("== Trusted device skips 2FA for 30 days ==")
 td_ip = {"X-Forwarded-For": "10.23.0.1"}
 r = client_post_login = app.test_client()
-r = client_post_login.post("/admin", headers=td_ip, json={"IsLogin": True, "Username": ADMIN_USER, "Password": ADMIN_PASS, "TrustDevice": True})
+r = client_post_login.post(
+    "/admin", headers=td_ip, json={"IsLogin": True, "Username": ADMIN_USER, "Password": ADMIN_PASS, "TrustDevice": True}
+)
 check("Login with TrustDevice still asks for 2FA first", r.get_json().get("TwoFA") is True, r.data[:80])
 code = emails_with("Admin 2FA")[-1]["body"].strip()
 r = client_post_login.post("/admin", headers=td_ip, json={"Is2FA": True, "TwoFA": code})
@@ -820,7 +921,11 @@ api_client.get("/not-a-roblox-domain-iso", headers={"X-Forwarded-For": "10.24.0.
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "probes"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 diag = r.get_json()
-check("Clearing probes leaves endpoints intact (no cross-clear)", len(diag.get("Endpoints", {})) >= 1, list(diag.get("Endpoints", {})))
+check(
+    "Clearing probes leaves endpoints intact (no cross-clear)",
+    len(diag.get("Endpoints", {})) >= 1,
+    list(diag.get("Endpoints", {})),
+)
 check("Clearing probes did clear the probe summary", diag.get("ExploitSummary", {}) == {}, diag.get("ExploitSummary"))
 r = client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "all"})
 check("Clear All -> 200", r.status_code == 200, r.status_code)
@@ -828,8 +933,14 @@ r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/
 diag = r.get_json()
 check("Clear All wiped endpoints", diag.get("Endpoints", {}) == {}, diag.get("Endpoints"))
 check("Clear All wiped errors", diag.get("Errors", {}) == {}, diag.get("Errors"))
-check("Clear All wiped fingerprints", diag.get("HeaderNames", {}) == {} and diag.get("UserAgents", {}) == {}, (diag.get("HeaderNames"), diag.get("UserAgents")))
-check("Clear All zeroed request counters", diag["RequestCounts"]["GET"]["Successful"] == 0, diag["RequestCounts"]["GET"])
+check(
+    "Clear All wiped fingerprints",
+    diag.get("HeaderNames", {}) == {} and diag.get("UserAgents", {}) == {},
+    (diag.get("HeaderNames"), diag.get("UserAgents")),
+)
+check(
+    "Clear All zeroed request counters", diag["RequestCounts"]["GET"]["Successful"] == 0, diag["RequestCounts"]["GET"]
+)
 check("Clear All does NOT touch trusted-device/rules state", "Settings" in diag)
 
 print("== Admin page-visit counter works for anonymous GET /admin ==")
@@ -837,7 +948,11 @@ r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/
 visits0 = r.get_json()["PageVisits"].get("admin", 0)
 app.test_client().get("/admin", headers={"X-Forwarded-For": "10.25.0.1"})  # fresh anonymous bot
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-check("Anonymous GET /admin increments the counter", r.get_json()["PageVisits"].get("admin", 0) == visits0 + 1, r.get_json()["PageVisits"])
+check(
+    "Anonymous GET /admin increments the counter",
+    r.get_json()["PageVisits"].get("admin", 0) == visits0 + 1,
+    r.get_json()["PageVisits"],
+)
 
 print("== Health: method stats + routing budget/cooldown ResetIn ==")
 proxy_module.requests.request = fake_upstream
@@ -849,7 +964,11 @@ for i in range(3):
     api_client.get(f"/games.roblox.com/v1/match{i}", headers={"X-Forwarded-For": "10.30.0.1"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 diag = r.get_json()
-check("Token method recorded 3 requests", diag.get("MethodStats", {}).get("Token", {}).get("Requests") == 3, diag.get("MethodStats", {}).get("Token"))
+check(
+    "Token method recorded 3 requests",
+    diag.get("MethodStats", {}).get("Token", {}).get("Requests") == 3,
+    diag.get("MethodStats", {}).get("Token"),
+)
 check("Routing reports token budget usage", diag.get("Routing", {}).get("TokenUsed", 0) >= 3, diag.get("Routing"))
 # Force a Rotate failure (with max_failures=1) and confirm RotateResetIn is reported.
 client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"rotate_max_failures": 1, "rotate_cooldown": 65}})
@@ -866,7 +985,11 @@ def rotate_fails_once(method, url, headers=None, params=None, data=None, cookies
 proxy_module.requests.request = rotate_fails_once
 api_client.get("/games.roblox.com/v1/cooldown-test", headers={"X-Forwarded-For": "10.30.0.2"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-check("Rotate reports a cooldown ResetIn", r.get_json().get("Routing", {}).get("RotateResetIn", 0) > 0, r.get_json().get("Routing"))
+check(
+    "Rotate reports a cooldown ResetIn",
+    r.get_json().get("Routing", {}).get("RotateResetIn", 0) > 0,
+    r.get_json().get("Routing"),
+)
 proxy_module.requests.request = fake_upstream
 client.post(
     "/admin/settings",
@@ -886,14 +1009,18 @@ client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "all"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 ms_after = r.get_json().get("MethodStats", {})
 check("Clear-all zeroed Token request count", ms_after.get("Token", {}).get("Requests", 0) == 0, ms_after.get("Token"))
-check("Clear-all zeroed Rotate request count", ms_after.get("Rotate", {}).get("Requests", 0) == 0, ms_after.get("Rotate"))
+check(
+    "Clear-all zeroed Rotate request count", ms_after.get("Rotate", {}).get("Requests", 0) == 0, ms_after.get("Rotate")
+)
 proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
 
 print("== Specific-header request filter (precise targeting) ==")
 proxy_module.requests.request = fake_upstream
 proxy_module.set_tokens(["SPEC_TOKEN"])
 # Target ONLY the User-Agent value; other headers containing the word must NOT trip it.
-r = client.post("/admin/headers/rule", headers=IP_MAIN, json={"header": "User-Agent", "mode": "contains", "needle": "BadClient"})
+r = client.post(
+    "/admin/headers/rule", headers=IP_MAIN, json={"header": "User-Agent", "mode": "contains", "needle": "BadClient"}
+)
 check("Add specific-header rule -> 200", r.status_code == 200, r.data[:80])
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 spec_rule = next((v for k, v in r.get_json().get("HeaderRules", {}).items() if v.get("Header") == "User-Agent"), {})
@@ -902,7 +1029,9 @@ IP_SPEC = {"X-Forwarded-For": "10.40.0.1"}
 r = api_client.get("/games.roblox.com/v1/spec", headers={**IP_SPEC, "User-Agent": "BadClient/1.0"})
 check("Specific-header rule blocks the targeted header value -> 429", r.status_code == 429, r.status_code)
 n = len(upstream_calls)
-r = api_client.get("/games.roblox.com/v1/spec", headers={**IP_SPEC, "User-Agent": "Good/1.0", "X-Note": "BadClient is here"})
+r = api_client.get(
+    "/games.roblox.com/v1/spec", headers={**IP_SPEC, "User-Agent": "Good/1.0", "X-Note": "BadClient is here"}
+)
 check("Same text in a DIFFERENT header does NOT trip the targeted rule -> 200", r.status_code == 200, r.status_code)
 check("Non-matching request reached upstream", len(upstream_calls) == n + 1, len(upstream_calls) - n)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
@@ -916,11 +1045,32 @@ api_client.get("/games.roblox.com/v1/v", headers={**IP_FP, "Roblox-Id": "111", "
 api_client.get("/games.roblox.com/v1/v", headers={**IP_FP, "Roblox-Id": "222", "Cookie": ".ROBLOSECURITY=SECRET_AAA"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 hn = r.get_json().get("HeaderNames", {})
-roblox_id_vals = hn.get("roblox-id", {}).get("Values", {})
+check(
+    "Header summary reports the distinct-value count",
+    hn.get("roblox-id", {}).get("ValueCount") == 2,
+    hn.get("roblox-id"),
+)
+
+
+def header_values(name, blocked=False):
+    """Values now live behind their own endpoint so the dashboard poll stays small."""
+    q = f"name={quote(str(name), safe='')}&blocked={1 if blocked else 0}"
+    return client.get(f"/admin/fingerprints/values?{q}", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+
+
+roblox_id_vals = header_values("Roblox-Id").get("Values", {})
 check("Header value drill-down records distinct values", set(roblox_id_vals) == {"111", "222"}, roblox_id_vals)
-cookie_vals = hn.get("cookie", {}).get("Values", {})
-check("Sensitive cookie values are fingerprinted, not stored raw", all(v.startswith("fp:") for v in cookie_vals) and cookie_vals, cookie_vals)
-check("Two identical cookies collapse to one fingerprint with count 2", any(info.get("Count") == 2 for info in cookie_vals.values()), cookie_vals)
+cookie_vals = header_values("Cookie").get("Values", {})
+check(
+    "Sensitive cookie values are fingerprinted, not stored raw",
+    all(v.startswith("fp:") for v in cookie_vals) and cookie_vals,
+    cookie_vals,
+)
+check(
+    "Two identical cookies collapse to one fingerprint with count 2",
+    any(info.get("Count") == 2 for info in cookie_vals.values()),
+    cookie_vals,
+)
 # Per-header clear: clear just roblox-id, leave cookie intact.
 r = client.post("/admin/fingerprints/clear_header", headers=IP_MAIN, json={"name": "Roblox-Id"})
 check("Per-header clear -> 200", r.status_code == 200, r.status_code)
@@ -931,13 +1081,29 @@ check("Other headers untouched by per-header clear", "cookie" in hn, list(hn))
 
 print("== Blocked Request Fingerprints (false-positive review) ==")
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "blocked_fingerprints"})
-client.post("/admin/headers/rule", headers=IP_MAIN, json={"header": "User-Agent", "mode": "contains", "needle": "Grief"})
-api_client.get("/games.roblox.com/v1/bfp", headers={"X-Forwarded-For": "10.42.0.1", "User-Agent": "GrieferTool/3", "X-Tag": "abc"})
+client.post(
+    "/admin/headers/rule", headers=IP_MAIN, json={"header": "User-Agent", "mode": "contains", "needle": "Grief"}
+)
+api_client.get(
+    "/games.roblox.com/v1/bfp", headers={"X-Forwarded-For": "10.42.0.1", "User-Agent": "GrieferTool/3", "X-Tag": "abc"}
+)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 diag = r.get_json()
-check("Blocked request's header names recorded separately", "user-agent" in (diag.get("BlockedHeaderNames") or {}), list(diag.get("BlockedHeaderNames", {})))
-check("Blocked request's user-agent recorded separately", "GrieferTool/3" in (diag.get("BlockedUserAgents") or {}), list(diag.get("BlockedUserAgents", {})))
-check("Blocked fingerprints are separate from accepted ones", "GrieferTool/3" not in (diag.get("UserAgents") or {}), list(diag.get("UserAgents", {})))
+check(
+    "Blocked request's header names recorded separately",
+    "user-agent" in (diag.get("BlockedHeaderNames") or {}),
+    list(diag.get("BlockedHeaderNames", {})),
+)
+check(
+    "Blocked request's user-agent recorded separately",
+    "GrieferTool/3" in (diag.get("BlockedUserAgents") or {}),
+    list(diag.get("BlockedUserAgents", {})),
+)
+check(
+    "Blocked fingerprints are separate from accepted ones",
+    "GrieferTool/3" not in (diag.get("UserAgents") or {}),
+    list(diag.get("UserAgents", {})),
+)
 # Clean up the rule.
 for rid in [k for k, v in diag.get("HeaderRules", {}).items() if v.get("Needle") == "Grief"]:
     client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": rid})
@@ -959,8 +1125,16 @@ reset_routing()
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
 set_method_weights(0, 100)  # force Rotate
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-check("Rotation reports configured + enabled", r.get_json().get("Rotate", {}).get("Configured") and r.get_json().get("Rotate", {}).get("Enabled"), r.get_json().get("Rotate"))
-check("Proxy URL shown masked (no creds)", "@" not in (r.get_json().get("Rotate", {}).get("ProxyUrl") or ""), r.get_json().get("Rotate"))
+check(
+    "Rotation reports configured + enabled",
+    r.get_json().get("Rotate", {}).get("Configured") and r.get_json().get("Rotate", {}).get("Enabled"),
+    r.get_json().get("Rotate"),
+)
+check(
+    "Proxy URL shown masked (no creds)",
+    "@" not in (r.get_json().get("Rotate", {}).get("ProxyUrl") or ""),
+    r.get_json().get("Rotate"),
+)
 IP_ROT = {"X-Forwarded-For": "10.50.0.1"}
 r = api_client.get("/games.roblox.com/v1/rotate-me", headers={**IP_ROT, "User-Agent": "OriginalUA/1"})
 check("Rotated request -> 200", r.status_code == 200, r.status_code)
@@ -968,10 +1142,18 @@ last = upstream_calls[-1]
 check("Rotate sends through the proxy", bool(last.get("proxies")), last.get("proxies"))
 check("Rotate does not rewrite the domain", last["url"] == "https://games.roblox.com/v1/rotate-me", last["url"])
 check("Rotate sends NO token cookie", not (last.get("cookies") or {}).get(".ROBLOSECURITY"), last.get("cookies"))
-check("Rotate swaps in a random User-Agent", last["headers"].get("User-Agent") != "OriginalUA/1", last["headers"].get("User-Agent"))
+check(
+    "Rotate swaps in a random User-Agent",
+    last["headers"].get("User-Agent") != "OriginalUA/1",
+    last["headers"].get("User-Agent"),
+)
 check("Rotate drops Chrome client-hints (UA mismatch)", "Sec-Ch-Ua" not in last["headers"], list(last["headers"]))
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-check("Rotation count recorded", r.get_json().get("MethodStats", {}).get("Rotate", {}).get("Requests", 0) >= 1, r.get_json().get("MethodStats", {}).get("Rotate"))
+check(
+    "Rotation count recorded",
+    r.get_json().get("MethodStats", {}).get("Rotate", {}).get("Requests", 0) >= 1,
+    r.get_json().get("MethodStats", {}).get("Rotate"),
+)
 
 print("== Rotation proxy failure falls back ==")
 reset_routing()
@@ -992,7 +1174,11 @@ rf0 = r.get_json().get("MethodStats", {}).get("Rotate", {}).get("Failed", 0)
 r = api_client.get("/games.roblox.com/v1/rot-fallback", headers={"X-Forwarded-For": "10.50.0.2"})
 check("Rotate proxy failure falls back to another method -> 200", r.status_code == 200, r.status_code)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-check("Rotate failure counted", r.get_json().get("MethodStats", {}).get("Rotate", {}).get("Failed", 0) >= rf0 + 1, r.get_json().get("MethodStats", {}).get("Rotate"))
+check(
+    "Rotate failure counted",
+    r.get_json().get("MethodStats", {}).get("Rotate", {}).get("Failed", 0) >= rf0 + 1,
+    r.get_json().get("MethodStats", {}).get("Rotate"),
+)
 proxy_module.requests.request = fake_upstream
 
 print("== All methods unavailable emails the admin ==")
@@ -1003,7 +1189,9 @@ proxy_module.set_tokens([])  # no token AND rotation disabled -> nothing availab
 emails_before = len(emails_with("all upstream methods unavailable"))
 r = api_client.get("/games.roblox.com/v1/nothing-left", headers={"X-Forwarded-For": "10.51.0.2"})
 check("No method available -> request fails", r.status_code == 500, r.status_code)
-check("All-unavailable emails the admin", len(emails_with("all upstream methods unavailable")) > emails_before, "no email")
+check(
+    "All-unavailable emails the admin", len(emails_with("all upstream methods unavailable")) > emails_before, "no email"
+)
 # Restore healthy defaults.
 enable_rotation()
 set_method_weights(100, 0)
@@ -1028,7 +1216,16 @@ api_client.get(
     },
 )
 sent = {k.lower() for k in upstream_calls[-1]["headers"]}
-for bad in ("x-forwarded-for", "x-real-ip", "referer", "origin", "cf-connecting-ip", "via", "roxy-internal", "true-client-ip"):
+for bad in (
+    "x-forwarded-for",
+    "x-real-ip",
+    "referer",
+    "origin",
+    "cf-connecting-ip",
+    "via",
+    "roxy-internal",
+    "true-client-ip",
+):
     check(f"Upstream did NOT receive '{bad}'", bad not in sent, sorted(sent))
 
 print("== Authenticated requests are rejected (no ROBLOSECURITY support) ==")
@@ -1088,7 +1285,9 @@ diag = r.get_json()
 token_req = diag.get("MethodStats", {}).get("Token", {}).get("Requests", 0)
 uses_sum = sum(int(t.get("Uses", 0)) for t in diag.get("Tokens", []))
 check("Token method recorded 4 requests", token_req == 4, token_req)
-check("Sum of per-token Uses equals Token method Requests", uses_sum == token_req and uses_sum == 4, (uses_sum, token_req))
+check(
+    "Sum of per-token Uses equals Token method Requests", uses_sum == token_req and uses_sum == 4, (uses_sum, token_req)
+)
 check("Token row shows a Last Used time", any(t.get("LastUsedAt") for t in diag.get("Tokens", [])), diag.get("Tokens"))
 
 print("== Per-requester timings ==")
@@ -1101,14 +1300,30 @@ rc_before = diag.get("RequestCounts", {}).get("GET", {}).get("Successful", 0)
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "proxy_timings"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 diag2 = r.get_json()
-check("proxy_timings clear zeroed method timings", diag2.get("MethodTimings", {}).get("Token", {}).get("Count", 0) == 0, diag2.get("MethodTimings"))
-check("Request counters SURVIVED a proxy_timings clear", diag2.get("RequestCounts", {}).get("GET", {}).get("Successful", 0) == rc_before, (diag2.get("RequestCounts", {}).get("GET"), rc_before))
+check(
+    "proxy_timings clear zeroed method timings",
+    diag2.get("MethodTimings", {}).get("Token", {}).get("Count", 0) == 0,
+    diag2.get("MethodTimings"),
+)
+check(
+    "Request counters SURVIVED a proxy_timings clear",
+    diag2.get("RequestCounts", {}).get("GET", {}).get("Successful", 0) == rc_before,
+    (diag2.get("RequestCounts", {}).get("GET"), rc_before),
+)
 api_client.get("/games.roblox.com/v1/sync-again", headers=IP_SYNC)  # repopulate both
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 diag3 = r.get_json()
-check("'requests' clear zeroed the request counters", diag3.get("RequestCounts", {}).get("GET", {}).get("Successful", 0) == 0, diag3.get("RequestCounts", {}).get("GET"))
-check("Proxy timings SURVIVED a 'requests' clear", diag3.get("MethodTimings", {}).get("Token", {}).get("Count", 0) >= 1, diag3.get("MethodTimings", {}).get("Token"))
+check(
+    "'requests' clear zeroed the request counters",
+    diag3.get("RequestCounts", {}).get("GET", {}).get("Successful", 0) == 0,
+    diag3.get("RequestCounts", {}).get("GET"),
+)
+check(
+    "Proxy timings SURVIVED a 'requests' clear",
+    diag3.get("MethodTimings", {}).get("Token", {}).get("Count", 0) >= 1,
+    diag3.get("MethodTimings", {}).get("Token"),
+)
 
 print("== Request failures log (per requester, why + when) ==")
 reset_routing()
@@ -1128,11 +1343,22 @@ proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
 
 print("== Blocked user-agent drill-down (last headers + endpoint) ==")
 client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "blocked_fingerprints"})
-client.post("/admin/headers/rule", headers=IP_MAIN, json={"header": "User-Agent", "mode": "contains", "needle": "DrillBot"})
-api_client.get("/games.roblox.com/v1/drill", headers={"X-Forwarded-For": "10.62.0.1", "User-Agent": "DrillBot/1", "X-Marker": "yes"})
+client.post(
+    "/admin/headers/rule", headers=IP_MAIN, json={"header": "User-Agent", "mode": "contains", "needle": "DrillBot"}
+)
+api_client.get(
+    "/games.roblox.com/v1/drill",
+    headers={"X-Forwarded-For": "10.62.0.1", "User-Agent": "DrillBot/1", "X-Marker": "yes"},
+)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 bua = r.get_json().get("BlockedUserAgents", {})
-rec = next((v for k, v in bua.items() if "DrillBot" in k), {})
+ua_key = next((k for k in bua if "DrillBot" in k), "")
+check("Blocked UA summary flags that a last request was captured", bua.get(ua_key, {}).get("HasDetail") is True, bua)
+# The captured header dump is per-record and heavy, so it is fetched on expand.
+rec = client.get(
+    f"/admin/fingerprints/user_agent?ua={quote(ua_key, safe='')}&blocked=1",
+    headers={**IP_MAIN, "Accept": "application/json"},
+).get_json()
 check("Blocked UA captured its last headers", bool(rec.get("LastHeaders")), rec)
 check("Blocked UA captured its last endpoint", "drill" in (rec.get("LastPath") or ""), rec)
 check("Blocked UA captured its last IP", rec.get("LastIP") == "10.62.0.1", rec)
@@ -1140,8 +1366,17 @@ for rid in [k for k in r.get_json().get("HeaderRules", {}) if "drillbot" in k]:
     client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": rid})
 
 print("== Settings expose all tunables (weights, rotation) ==")
-settings = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"}).get_json().get("Settings", {})
-for key in ("token_weight", "rotate_weight", "token_danger_zone", "rotate_enabled", "rotate_cooldown", "rotate_max_failures"):
+settings = (
+    client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"}).get_json().get("Settings", {})
+)
+for key in (
+    "token_weight",
+    "rotate_weight",
+    "token_danger_zone",
+    "rotate_enabled",
+    "rotate_cooldown",
+    "rotate_max_failures",
+):
     check(f"Setting '{key}' is editable", key in settings, list(settings))
 
 print("== Force-revalidate + health check report token + rotation status ==")
@@ -1155,13 +1390,19 @@ check("Force-revalidate report lists the token", bool(fr.get("Tokens")) and fr["
 r = client.post("/admin/health_check", headers=IP_MAIN)
 hc = r.get_json()
 check("Health check reports tokens active", hc.get("TokensActive") == 1 and hc.get("TokensTotal") == 1, hc)
-check("Health check probed a rotation exit IP", (hc.get("Rotation", {}).get("ExitIP") or "").startswith("203.0.113"), hc.get("Rotation"))
+check(
+    "Health check probed a rotation exit IP",
+    (hc.get("Rotation", {}).get("ExitIP") or "").startswith("203.0.113"),
+    hc.get("Rotation"),
+)
 r = client.post("/admin/rotation/verify", headers=IP_MAIN)
 rv = r.get_json()
 check("Rotation verify returns an exit IP", (rv.get("ExitIP") or "").startswith("203.0.113"), rv)
 check("Rotation verify sent through the proxy", get_calls[-1].get("proxies") is not None, get_calls[-1])
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
-check("Exit IPs are logged for verification", len(r.get_json().get("RotateIps", [])) >= 1, r.get_json().get("RotateIps"))
+check(
+    "Exit IPs are logged for verification", len(r.get_json().get("RotateIps", [])) >= 1, r.get_json().get("RotateIps")
+)
 disable_rotation()
 set_method_weights(100, 0)
 reset_routing()
@@ -1174,7 +1415,11 @@ import lockfile as lockfile_module
 proxy_module.requests.request = fake_upstream
 set_method_weights(100, 0)
 proxy_module.set_tokens(["THR_TOKEN"])
-client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 3, "throttle_reset_duration": 300}})
+client.post(
+    "/admin/settings",
+    headers=IP_MAIN,
+    json={"settings": {"allowed_requests_per_minute": 3, "throttle_reset_duration": 300}},
+)
 IP_THR = {"X-Forwarded-For": "10.70.0.1"}
 statuses = [api_client.get(f"/games.roblox.com/v1/thr{i}", headers=IP_THR).status_code for i in range(6)]
 check("Over the shared per-IP limit returns 429", statuses[-1] == 429, statuses)
@@ -1185,7 +1430,11 @@ entry_b = worker_b.read().get("Ips", {}).get("10.70.0.1", {})
 check("Per-IP count lives in the shared file (worker B sees it)", entry_b.get("Requests", 0) >= 4, entry_b)
 check("Worker B sees the IP as throttled (no Nx bypass)", bool(entry_b.get("Throttled")), entry_b)
 check("throttle.is_throttled reads the shared state", throttle_module.is_throttled("10.70.0.1") is True)
-client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 100000, "throttle_reset_duration": 50}})
+client.post(
+    "/admin/settings",
+    headers=IP_MAIN,
+    json={"settings": {"allowed_requests_per_minute": 100000, "throttle_reset_duration": 50}},
+)
 
 # The real multi-worker scenario: separate OS PROCESSES (like gunicorn workers)
 # hammering one shared file. The in-process test above is serialized by the
@@ -1213,7 +1462,11 @@ import runtime as runtime_module
 proxy_module.requests.request = fake_upstream
 set_method_weights(100, 0)
 proxy_module.set_tokens(["BYPASS_TOKEN"])
-client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 3, "throttle_reset_duration": 300}})
+client.post(
+    "/admin/settings",
+    headers=IP_MAIN,
+    json={"settings": {"allowed_requests_per_minute": 3, "throttle_reset_duration": 300}},
+)
 # Control: a normal IP is throttled once it passes the limit.
 IP_CTRL = {"X-Forwarded-For": "10.80.0.1"}
 ctrl = [api_client.get(f"/games.roblox.com/v1/np{i}", headers=IP_CTRL).status_code for i in range(6)]
@@ -1226,7 +1479,9 @@ IP_BYP = {"X-Forwarded-For": "10.80.0.2"}
 byp = [api_client.get(f"/games.roblox.com/v1/by{i}", headers=IP_BYP).status_code for i in range(12)]
 check("Bypassed IP never gets a 429 (spam allowed)", all(s == 200 for s in byp), byp)
 diag = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
-check("Diagnostics lists the bypass IP", "10.80.0.2" in diag.get("ThrottleBypassIps", {}), diag.get("ThrottleBypassIps"))
+check(
+    "Diagnostics lists the bypass IP", "10.80.0.2" in diag.get("ThrottleBypassIps", {}), diag.get("ThrottleBypassIps")
+)
 check("Diagnostics reports the requester's own IP (for one-click add)", bool(diag.get("YourIP")), diag.get("YourIP"))
 # Remove it -> throttling resumes for that IP.
 r = client.post("/admin/throttle/bypass/remove", headers=IP_MAIN, json={"ip": "10.80.0.2"})
@@ -1241,9 +1496,16 @@ time.sleep(0.12)
 check("Bypass auto-expires after its expiry", runtime_module.is_throttle_bypassed("10.80.0.3") is False)
 check("Expired bypass is hidden from the list", "10.80.0.3" not in runtime_module.get_throttle_bypass_ips())
 runtime_module.remove_throttle_bypass("10.80.0.3")
-check("Bypass with no expiry never expires", (runtime_module.add_throttle_bypass("10.80.0.4"), runtime_module.is_throttle_bypassed("10.80.0.4"))[1] is True)
+check(
+    "Bypass with no expiry never expires",
+    (runtime_module.add_throttle_bypass("10.80.0.4"), runtime_module.is_throttle_bypassed("10.80.0.4"))[1] is True,
+)
 runtime_module.remove_throttle_bypass("10.80.0.4")
-client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 100000, "throttle_reset_duration": 50}})
+client.post(
+    "/admin/settings",
+    headers=IP_MAIN,
+    json={"settings": {"allowed_requests_per_minute": 100000, "throttle_reset_duration": 50}},
+)
 
 print("== Login lockout + email de-dup are shared across workers ==")
 throttle_module.reset_login_failures("10.71.0.1")
@@ -1255,16 +1517,32 @@ check("Lockout is enforced from shared state", throttle_module.is_login_blocked(
 throttle_module.reset_login_failures("10.71.0.1")
 # Email gate: the first call reserves the slot, a second within the cooldown is denied.
 check("First email send is allowed", proxy_module._email_allowed("smoketest_email", 100) is True)
-check("Duplicate email within cooldown is suppressed (shared gate)", proxy_module._email_allowed("smoketest_email", 100) is False)
+check(
+    "Duplicate email within cooldown is suppressed (shared gate)",
+    proxy_module._email_allowed("smoketest_email", 100) is False,
+)
 coord_b = lockfile_module.LockedJSON(lambda: config.COORD_FILE)
-check("Email gate timestamp lives in the shared coord file", float(coord_b.read().get("EmailGate", {}).get("smoketest_email", 0)) > 0)
+check(
+    "Email gate timestamp lives in the shared coord file",
+    float(coord_b.read().get("EmailGate", {}).get("smoketest_email", 0)) > 0,
+)
 
 print("== Emailed invalidation link (kill switch) ==")
 invalidate_emails = emails_with("Roxy Admin Login")
 link_token = invalidate_emails[-1]["body"].split("/admin/invalidate/")[-1].strip().splitlines()[0]
+# GET only shows a confirmation page and must NOT spend the token: mail scanners
+# and link prefetchers issue GETs, and consuming it there burned the one-shot
+# emergency link before the admin ever clicked it.
+epoch_before = runtime_module.get_session_epoch()
 r = client.get(f"/admin/invalidate/{link_token}", headers=IP_MAIN)
-check("Valid invalidation link -> 200", r.status_code == 200, r.status_code)
+check("Invalidation link GET renders a confirmation page -> 200", r.status_code == 200, r.status_code)
+check("A prefetched GET does not spend the token", runtime_module.get_session_epoch() == epoch_before)
 r = client.get(f"/admin/invalidate/{link_token}", headers=IP_MAIN)
+check("Link still valid after a prefetch", r.status_code == 200, r.status_code)
+r = client.post(f"/admin/invalidate/{link_token}", headers=IP_MAIN)
+check("Confirming the invalidation -> 200", r.status_code == 200, r.status_code)
+check("Confirming bumps the session epoch", runtime_module.get_session_epoch() > epoch_before)
+r = client.post(f"/admin/invalidate/{link_token}", headers=IP_MAIN)
 check("Reused invalidation link -> 404 (single use)", r.status_code == 404, r.status_code)
 r = client.get("/admin/dashboard", headers=IP_MAIN)
 check("Session dead after kill switch", r.status_code == 302, r.status_code)
@@ -1313,7 +1591,11 @@ check("400 concurrent requests raised no exceptions", not hammer_errors, hammer_
 
 # Lost-update check: many threads incrementing the SAME shared counter must land
 # EXACTLY the right total (proves the flock read-modify-write loses nothing).
-client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 1000000, "throttle_reset_duration": 600}})
+client.post(
+    "/admin/settings",
+    headers=IP_MAIN,
+    json={"settings": {"allowed_requests_per_minute": 1000000, "throttle_reset_duration": 600}},
+)
 HAMMER_IP = "10.99.0.1"
 throttle_module._store.update(lambda d: d.get("Ips", {}).pop(HAMMER_IP, None))
 INC_THREADS, INC_EACH = 8, 50
@@ -1335,7 +1617,11 @@ check(
     final.get("Requests") == INC_THREADS * INC_EACH,
     (final.get("Requests"), INC_THREADS * INC_EACH),
 )
-client.post("/admin/settings", headers=IP_MAIN, json={"settings": {"allowed_requests_per_minute": 100000, "throttle_reset_duration": 50}})
+client.post(
+    "/admin/settings",
+    headers=IP_MAIN,
+    json={"settings": {"allowed_requests_per_minute": 100000, "throttle_reset_duration": 50}},
+)
 
 # Log back in (the kill switch above ended the old session) and confirm the app is still healthy.
 r = client.post("/admin", headers=IP_MAIN, json={"IsLogin": True, "Username": ADMIN_USER, "Password": ADMIN_PASS})
@@ -1344,6 +1630,326 @@ r = client.post("/admin", headers=IP_MAIN, json={"Is2FA": True, "TwoFA": code})
 check("Login still works after epoch bump + hammer", r.status_code == 200, r.status_code)
 r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
 check("Diagnostics healthy after hammer", r.status_code == 200, r.status_code)
+
+print("== Record caps survive the cross-worker merge (the OOM bug) ==")
+# Each worker caps its own stores, but merging N workers' capped sets used to
+# produce an uncapped UNION -- so the shared file, and therefore every worker's
+# memory, grew forever until the kernel killed the process. The merge must
+# re-apply every ceiling.
+import diagnostics as diag_module  # noqa: E402
+
+cap = diag_module._cap("max_header_value_records", config.MAX_HEADER_VALUE_RECORDS)
+shared_side = {f"shared-{i}": {"Count": 1, "FirstSeen": 1.0, "LastSeen": 1.0} for i in range(cap)}
+local_side = {f"local-{i}": {"Count": 1, "FirstSeen": 1.0, "LastSeen": 1.0} for i in range(cap)}
+merged = diag_module._merge_stats(
+    {"header_names": {"x-merge-test": {"Count": cap, "FirstSeen": 1.0, "LastSeen": 1.0, "Values": shared_side}}},
+    {"header_names": {"x-merge-test": {"Count": cap, "FirstSeen": 1.0, "LastSeen": 1.0, "Values": local_side}}},
+    {},
+)
+merged_values = merged["header_names"]["x-merge-test"]["Values"]
+check(
+    "Merging two full sets stays within the value cap (no unbounded union)",
+    len(merged_values) <= cap,
+    f"{len(merged_values)} > {cap}",
+)
+wide = {f"ua-{i}": {"Count": 1, "FirstSeen": 1.0, "LastSeen": 1.0} for i in range(cap * 4)}
+merged = diag_module._merge_stats({"user_agents": wide}, {"user_agents": dict(wide)}, {})
+ua_cap = diag_module._cap("max_user_agent_records", config.MAX_USER_AGENT_RECORDS)
+check("User-agent store is capped after a merge", len(merged["user_agents"]) <= ua_cap, len(merged["user_agents"]))
+check(
+    "Trimming keeps the busiest records, not arbitrary ones",
+    diag_module._trim_store({"keep": {"Count": 99}, "drop": {"Count": 1}}, 1, "count") == 1 and "keep" in {"keep": 1},
+)
+sizes = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+check("Diagnostics reports per-store record counts", isinstance(sizes.get("StoreSizes"), dict), sizes.get("StoreSizes"))
+check(
+    "Persistence reports the stats-file size against its ceiling",
+    sizes.get("Persistence", {}).get("DataLimitBytes") == config.MAX_DATA_FILE_BYTES,
+    sizes.get("Persistence"),
+)
+
+print("== High-cardinality header values are not enumerated ==")
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "fingerprints"})
+proxy_module.set_tokens(["CARD_TOKEN"])
+IP_CARD = {"X-Forwarded-For": "10.90.0.1"}
+for i in range(5):
+    api_client.get("/games.roblox.com/v1/card", headers={**IP_CARD, "traceparent": f"00-{i:032x}-{i:016x}-01"})
+d = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+tp = d.get("HeaderNames", {}).get("traceparent", {})
+check("traceparent is still counted", tp.get("Count", 0) >= 5, tp)
+check("traceparent's per-request values are NOT stored", tp.get("ValueCount") == 0, tp)
+check("traceparent is flagged as not-enumerated", tp.get("ValuesIgnored") is True, tp)
+check(
+    "traceparent ships in the default ignore list",
+    "traceparent" in d.get("IgnoredValueHeaders", {}),
+    d.get("IgnoredValueHeaders"),
+)
+# ...and the admin can turn it back on, then off again, from the dashboard.
+r = client.post("/admin/fingerprints/ignore", headers=IP_MAIN, json={"name": "traceparent", "ignore": False})
+check("Un-ignoring a header -> 200", r.status_code == 200, r.status_code)
+check("Un-ignored header leaves the list", "traceparent" not in r.get_json().get("IgnoredValueHeaders", {}))
+api_client.get("/games.roblox.com/v1/card", headers={**IP_CARD, "traceparent": "00-abc-def-01"})
+d = client.get("/admin/diagnostics?flush=1", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+check(
+    "Values are recorded again once un-ignored",
+    d["HeaderNames"]["traceparent"].get("ValueCount") == 1,
+    d["HeaderNames"]["traceparent"],
+)
+r = client.post("/admin/fingerprints/ignore", headers=IP_MAIN, json={"name": "traceparent", "ignore": True})
+check("Re-ignoring a header -> 200", r.status_code == 200, r.status_code)
+d = client.get("/admin/diagnostics?flush=1", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+check(
+    "Re-ignoring drops what was already collected",
+    d["HeaderNames"]["traceparent"].get("ValueCount") == 0,
+    d["HeaderNames"]["traceparent"],
+)
+
+print("== Per-header clear cannot be resurrected by another worker ==")
+# The reported bug: clearing a header removed it here and from the file, but every
+# OTHER worker still held it in memory AND in its merge baseline, so its next
+# autosave merged the record straight back. Section clears already guarded against
+# this with ClearEpochs; per-key clears need the same, keyed per record.
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "fingerprints"})
+api_client.get("/games.roblox.com/v1/res", headers={"X-Forwarded-For": "10.90.1.1", "X-Ghost": "boo"})
+diag_module._flush()
+stale_local = json.loads(json.dumps(diag_module.serialize()))  # what a second worker would still be holding
+ok, _removed = diag_module.clear_fingerprint_header(False, "X-Ghost")
+check("Per-header clear reports success", ok is True)
+check("Cleared header is gone from this worker", "x-ghost" not in diag_module.header_names)
+
+
+def worker_b_flush(local_snapshot):
+    """Replay another worker's flush: its stale copy must not put the record back."""
+
+    def mutate(data):
+        shared = data.get("Diagnostics", {})
+        key_epochs = shared.get("KeyClearEpochs", {})
+        applied = dict(local_snapshot)
+        for marker, epoch in (key_epochs or {}).items():
+            store_name, _, remainder = str(marker).partition("/")
+            values_only = remainder.endswith("/Values")
+            key = remainder[: -len("/Values")] if values_only else remainder
+            diag_module._apply_key_clear(applied, store_name, key, values_only)
+        data["Diagnostics"] = diag_module._merge_stats(shared, applied, applied)
+        return data
+
+    return storage_module.update_data(mutate)
+
+
+import storage as storage_module  # noqa: E402
+
+after = worker_b_flush(stale_local)
+check(
+    "A second worker's flush does NOT resurrect the cleared header",
+    "x-ghost" not in after.get("Diagnostics", {}).get("header_names", {}),
+    list(after.get("Diagnostics", {}).get("header_names", {})),
+)
+check(
+    "The clear is recorded as a KeyClearEpoch",
+    any("x-ghost" in k for k in after["Diagnostics"].get("KeyClearEpochs", {})),
+    after["Diagnostics"].get("KeyClearEpochs"),
+)
+# Values-only clear keeps the header itself.
+api_client.get("/games.roblox.com/v1/res", headers={"X-Forwarded-For": "10.90.1.1", "X-Keep": "v1"})
+diag_module._flush()
+diag_module.clear_fingerprint_header(False, "X-Keep", values_only=True)
+check("Values-only clear keeps the header row", "x-keep" in diag_module.header_names, list(diag_module.header_names))
+check(
+    "Values-only clear empties its values",
+    not diag_module.header_names["x-keep"].get("Values"),
+    diag_module.header_names.get("x-keep"),
+)
+
+print("== Client IP comes from a hop we control, not from the caller ==")
+# nginx's conventional `X-Forwarded-For $proxy_add_x_forwarded_for` APPENDS, so the
+# LEFTMOST entry is whatever the caller typed. Reading it let anyone bypass per-IP
+# throttling, the admin login lockout and the 2FA challenge binding.
+with app.test_request_context(
+    "/", environ_base={"REMOTE_ADDR": "203.0.113.7"}, headers={"X-Forwarded-For": "9.9.9.9, 203.0.113.7"}
+):
+    check("Spoofed leading X-Forwarded-For is ignored", index.get_client_ip() == "203.0.113.7", index.get_client_ip())
+with app.test_request_context("/", environ_base={"REMOTE_ADDR": "198.51.100.4"}):
+    check(
+        "Falls back to the socket address with no header",
+        index.get_client_ip() == "198.51.100.4",
+        index.get_client_ip(),
+    )
+
+print("== The Roblox session cookie cannot follow a redirect off-domain ==")
+# Passing cookies={...} makes a domain-less cookie that `requests` replays to
+# whatever host a 302 points at; a domain-scoped jar refuses off-domain instead.
+import requests as requests_module  # noqa: E402
+
+jar = proxy_module._token_jar("SECRET_COOKIE_VALUE")
+for url, should_send in [
+    ("https://games.roblox.com/v1/x", True),
+    ("https://accountinformation.roblox.com/v1/birthdate", True),
+    ("https://evil.example/x", False),
+    ("https://roblox.com.evil.example/x", False),
+]:
+    prepared = requests_module.Request("GET", url).prepare()
+    sent = requests_module.cookies.get_cookie_header(jar, prepared)
+    check(
+        f"Token cookie {'is sent to' if should_send else 'is NOT sent to'} {url.split('/')[2]}",
+        bool(sent) is should_send,
+        sent,
+    )
+check(
+    "Token masking exposes at most 6 characters",
+    len(proxy_module.mask_token("A" * 80).strip("…")) <= 6,
+    proxy_module.mask_token("A" * 80),
+)
+
+print("== Hardening headers, admin 404s, and input guards ==")
+r = client.get("/", headers=IP_MAIN)
+for header in (
+    "Content-Security-Policy",
+    "X-Content-Type-Options",
+    "X-Frame-Options",
+    "Referrer-Policy",
+    "Permissions-Policy",
+):
+    check(f"{header} is set", bool(r.headers.get(header)), dict(r.headers))
+check(
+    "CSP blocks framing and inline script hosts",
+    "frame-ancestors 'none'" in r.headers.get("Content-Security-Policy", ""),
+)
+# nginx terminates TLS and adds HSTS itself, and its add_header APPENDS rather
+# than replaces -- so the app staying quiet is what stops the browser receiving
+# two Strict-Transport-Security headers.
+check(
+    "HSTS is left to nginx by default",
+    r.headers.get("Strict-Transport-Security") is None,
+    r.headers.get("Strict-Transport-Security"),
+)
+config.SEND_HSTS = True
+try:
+    hsts = client.get("/", headers=IP_MAIN).headers.get("Strict-Transport-Security")
+    check("HSTS can be enabled where no proxy adds it", "max-age=" in (hsts or ""), hsts)
+finally:
+    config.SEND_HSTS = False
+probes_before = len(
+    client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+    .get_json()
+    .get("ExploitAttempts", [])
+)
+r = client.get("/admin/dashbaord", headers=IP_MAIN)  # a typo, not an attack
+check("A mistyped admin URL -> 404", r.status_code == 404, r.status_code)
+probes_after = (
+    client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+    .get_json()
+    .get("ExploitAttempts", [])
+)
+check(
+    "A mistyped admin URL is NOT logged as an exploit attempt",
+    not any("dashbaord" in (p.get("Reason") or "") for p in probes_after),
+    [p.get("Reason") for p in probes_after[-3:]],
+)
+r = client.post("/admin/data/clear", headers=IP_MAIN, json={"target": []})
+check("A non-string clear target -> 400, not a 500", r.status_code == 400, r.status_code)
+r = client.post("/admin/data/clear", headers=IP_MAIN, json={"target": {"a": 1}})
+check("An object clear target -> 400, not a 500", r.status_code == 400, r.status_code)
+
+print("== Throttle window does not creep past its configured duration ==")
+client.post(
+    "/admin/settings",
+    headers=IP_MAIN,
+    json={"settings": {"allowed_requests_per_minute": 100, "throttle_reset_duration": 50}},
+)
+IP_CREEP = "10.90.2.1"
+throttle_module._store.update(lambda data: data.get("Ips", {}).pop(IP_CREEP, None))
+throttle_module.update_throttling(IP_CREEP, made_request=True)
+first_reset = throttle_module._store.read()["Ips"][IP_CREEP]["ThrottleResetTime"]
+for _ in range(10):
+    throttle_module.update_throttling(IP_CREEP, made_request=True)
+later_reset = throttle_module._store.read()["Ips"][IP_CREEP]["ThrottleResetTime"]
+check("Extra requests do not push the reset time outwards", later_reset == first_reset, (first_reset, later_reset))
+
+print("== Distinct events are not deduped away by the merge ==")
+# Two genuinely separate probes from one IP in one second with the same reason are
+# two probes; deduping on the whole record collapsed them into one.
+twin = {"IP": "10.90.3.1", "Date": 1000.0, "Reason": "same reason", "UserAgent": "x"}
+merged_list = diag_module._merge_list("exploit_attempts", [dict(twin, Id="a-1")], [dict(twin, Id="a-2")])
+check("Identical-looking events with distinct ids both survive", len(merged_list) == 2, merged_list)
+same = dict(twin, Id="a-9")
+check(
+    "The same event merged twice stays one", len(diag_module._merge_list("exploit_attempts", [same], [dict(same)])) == 1
+)
+
+print("== Upstream timeouts are counted against the method that lost ==")
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "requests"})
+set_method_weights(100, 0)
+reset_routing()
+proxy_module.set_tokens(["TIMEOUT_TOKEN"])
+saved_request = proxy_module.requests.request
+
+
+def always_timeout(method, url, **kwargs):
+    raise requests_module.Timeout("simulated")
+
+
+proxy_module.requests.request = always_timeout
+api_client.get("/games.roblox.com/v1/timeout", headers={"X-Forwarded-For": "10.90.4.1"})
+proxy_module.requests.request = saved_request
+ms = (
+    client.get("/admin/diagnostics?flush=1", headers={**IP_MAIN, "Accept": "application/json"})
+    .get_json()
+    .get("MethodStats", {})
+    .get("Token", {})
+)
+check("A timeout counts as a Token request", ms.get("Requests", 0) >= 1, ms)
+check("A timeout counts as a Token failure", ms.get("Failed", 0) >= 1, ms)
+check("A timeout is still counted as a timeout", ms.get("Timeouts", 0) >= 1, ms)
+reset_routing()
+proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
+
+print("== Control plane is separate from, and survives, the stats file ==")
+check(
+    "The state file exists and is small",
+    os.path.getsize(os.environ["ROXY_STATE_FILE"]) < 256 * 1024,
+    os.path.getsize(os.environ["ROXY_STATE_FILE"]),
+)
+with open(os.environ["ROXY_STATE_FILE"]) as f:
+    state_blob = json.load(f)
+check(
+    "Settings live in the state file",
+    isinstance(state_blob.get("Runtime", {}).get("Settings"), dict),
+    list(state_blob.get("Runtime", {})),
+)
+check(
+    "Endpoint rules live in the state file",
+    "EndpointRules" in state_blob.get("Runtime", {}),
+    list(state_blob.get("Runtime", {})),
+)
+client.post("/admin/endpoints/block", headers=IP_MAIN, json={"pattern": "games.roblox.com/v1/survivor"})
+os.remove(os.environ["ROXY_DATA_FILE"])  # nuke every statistic
+check(
+    "Deleting the whole stats file leaves the rules intact",
+    "games.roblox.com/v1/survivor" in runtime_module.get_endpoint_blocks(),
+    list(runtime_module.get_endpoint_blocks()),
+)
+r = api_client.get("/games.roblox.com/v1/survivor", headers={"X-Forwarded-For": "10.90.5.1"})
+check("...and the rules are still enforced", r.status_code == 403, r.status_code)
+client.post("/admin/endpoints/unblock", headers=IP_MAIN, json={"pattern": "games.roblox.com/v1/survivor"})
+
+print("== An oversized stats file is quarantined, not parsed ==")
+# Parsing is the step that exhausts memory, so the guard has to fire before it.
+with open(os.environ["ROXY_DATA_FILE"], "w") as f:
+    f.write("[" + "0," * (config.MAX_DATA_FILE_BYTES // 2) + "0]")
+check(
+    "The oversized file is above the limit", os.path.getsize(os.environ["ROXY_DATA_FILE"]) > config.MAX_DATA_FILE_BYTES
+)
+loaded = storage_module.load_data()
+check("An oversized stats file loads as empty instead of blowing up memory", loaded == {}, type(loaded))
+check("The oversized file is moved aside for inspection", not os.path.exists(os.environ["ROXY_DATA_FILE"]))
+check(
+    "The quarantine is reported to the dashboard",
+    bool(storage_module.get_status().get("Oversize")),
+    storage_module.get_status(),
+)
+for leftover in os.listdir(sandbox):
+    if ".oversize-" in leftover:
+        os.remove(os.path.join(sandbox, leftover))
 
 print(f"\n{'=' * 40}\nRESULT: {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

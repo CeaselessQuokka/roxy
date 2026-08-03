@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>Roxy — Invalidate Admin Sessions</title>
+		<link rel="icon" type="image/x-icon" href="{{ static_url('roxy_favicon.png') }}" />
+		<link rel="stylesheet" href="{{ static_url('admin.css') }}" />
+	</head>
+	<body>
+		<main class="login-container">
+			<div class="login-card">
+				<div class="logo-wrapper">
+					<img src="{{ static_url('roxy_icon.png') }}" alt="Roxy Logo" class="logo" />
+					<h1 class="app-title">Roxy Admin</h1>
+				</div>
+
+				{% if done %}
+					<p class="modal__hint">
+						<strong>Done.</strong> Every admin session has been signed out. Any device that was logged
+						in will need the full password and 2FA to get back in.
+					</p>
+				{% elif failed %}
+					<p class="form-error" role="alert">
+						This link is no longer valid. It may already have been used, or it may have expired.
+					</p>
+					<p class="modal__hint">
+						If you still think someone else is signed in, log in and use “Revoke trusted devices” in
+						Service Controls.
+					</p>
+				{% else %}
+					<p class="modal__hint">
+						This signs out every admin session immediately. Use it if the login alert you received
+						was not you.
+					</p>
+					<!-- The token is spent by this POST, never by loading the page. Mail
+					     scanners and link prefetchers issue GETs, and consuming the token on
+					     GET meant they burned the one-shot emergency link before it was
+					     clicked. -->
+					<form method="POST" action="{{ url_for('admin_invalidate', token=token) }}">
+						<button type="submit" class="btn-primary">Sign out all admin sessions</button>
+					</form>
+				{% endif %}
+			</div>
+		</main>
+	</body>
+</html>

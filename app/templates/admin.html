@@ -51,7 +51,10 @@
 					</button>
 				</header>
 				<div class="modal__content">
-					<p class="modal__hint">Enter the digit code sent to your admin email. It expires in ~60 seconds.</p>
+					<p class="modal__hint">
+						Enter the code sent to your admin email.
+						<span id="twofaCountdown" class="modal__countdown"></span>
+					</p>
 					<input
 						id="twofaInput"
 						type="text"
@@ -64,6 +67,9 @@
 				</div>
 				<footer class="modal__footer">
 					<button id="twofaSubmit" type="button" class="btn-primary">Verify</button>
+					<!-- Without this, an expired code was a dead end: the only way
+					     forward was to close the dialog and log in from scratch. -->
+					<button id="twofaResend" type="button" class="btn-secondary">Send a new code</button>
 					<button id="twofaCancel" type="button" class="btn-secondary" data-close="true">Cancel</button>
 				</footer>
 			</div>

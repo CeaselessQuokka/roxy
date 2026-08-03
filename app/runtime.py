@@ -5,9 +5,16 @@ restarting the server — the paused flag, throttling/cooldown limits, blocked
 endpoints, per-endpoint rate rules, the admin "session epoch" (a server-side
 kill switch), and short-lived session-invalidation tokens.
 
-The persisted data file is the single source of truth so this works across
-multiple gunicorn workers: every change is written through (under an
-inter-process lock) and every read reloads from disk when the file changes.
+This lives in its own small file (config.STATE_FILE), separate from the big
+diagnostics blob, and is the single source of truth so it works across multiple
+gunicorn workers: every change is written through (under an inter-process lock)
+and every read reloads from disk when the file changes.
+
+The separation matters for more than tidiness. This state is read on the request
+path (is_paused, endpoint rules, header rules) and written by every admin
+action, so it must stay cheap to parse — it cannot share a file with megabytes
+of accumulated statistics. It is also the only part that is genuinely painful to
+lose, so the stats file can be deleted at any time without touching it.
 """
 
 import config
@@ -19,8 +26,13 @@ from functools import lru_cache
 from threading import Lock
 
 import storage
+from lockfile import LockedJSON
 
 _lock = Lock()
+
+# The control-plane file. Durable: configuration is expensive to lose and is
+# written rarely, so the fsync cost is irrelevant here.
+_state = LockedJSON(lambda: config.STATE_FILE, durable=True)
 
 # --- Proxy pause flag -------------------------------------------------------
 _paused = False
@@ -64,6 +76,20 @@ _trusted_devices = dict()
 # blocks, header rules, or the Token safety budget. Optional per-IP expiry.
 # ip -> {"Added": ts, "Expires": ts (0 = never), "Note": str}
 _throttle_bypass_ips = dict()
+
+# --- Headers whose VALUES are not enumerated --------------------------------
+# Some headers carry a different value on every single request (traceparent is
+# in every Roblox request), so the set of distinct values is unbounded by
+# nature. For these we keep the header name and its request count but skip the
+# per-value breakdown -- there is nothing to learn from a list of ten thousand
+# one-shot trace IDs, and building it is what filled the data file.
+# name -> {"Added": ts, "Auto": bool, "Note": str}
+# Seeded at import so a fresh install is protected before anything is persisted;
+# a stored list replaces it wholesale (including an empty one, so an admin who
+# clears the list keeps it cleared).
+_ignored_value_headers = {
+    name: {"Added": 0.0, "Auto": False, "Note": "default"} for name in config.DEFAULT_IGNORED_VALUE_HEADERS
+}
 
 # --- Blocked endpoints ------------------------------------------------------
 _endpoint_blocks = dict()  # pattern -> {"Added": ts, "Note": str}
@@ -109,6 +135,16 @@ _settings = {
     "max_crawl_records": _setting(config.MAX_CRAWL_RECORDS, 1, 5000, "int"),
     "max_throttle_records": _setting(config.MAX_THROTTLE_RECORDS, 1, 5000, "int"),
     "max_endpoint_records": _setting(config.MAX_ENDPOINT_RECORDS, 1, 5000, "int"),
+    "max_header_name_records": _setting(config.MAX_HEADER_NAME_RECORDS, 1, 5000, "int"),
+    "max_header_value_records": _setting(config.MAX_HEADER_VALUE_RECORDS, 1, 5000, "int"),
+    "max_user_agent_records": _setting(config.MAX_USER_AGENT_RECORDS, 1, 20000, "int"),
+    "max_error_records": _setting(config.MAX_ERROR_RECORDS, 1, 20000, "int"),
+    # Automatically stop enumerating a header's values once it proves to be
+    # unique-per-request (see config.AUTO_IGNORE_*). 1 = on.
+    "auto_ignore_high_cardinality": _setting(1, 0, 1, "int"),
+    # How often the dashboard's diagnostics read is allowed to trigger a full
+    # cross-worker merge. Polls in between answer from merged memory.
+    "diagnostics_flush_interval": _setting(config.DIAGNOSTICS_FLUSH_INTERVAL, 0, 3600, "int"),
     # Hard safety budget for the internal token: at most N token-authenticated
     # requests to Roblox per window, so the server never looks like a bot burst.
     "token_budget_requests": _setting(config.TOKEN_BUDGET_REQUESTS, 1, 10000, "int"),
@@ -252,6 +288,13 @@ def _restore_from(data: dict):
     header_rules = data.get("HeaderRules", {})
     if isinstance(header_rules, dict):
         replace_in_place(_header_rules, {str(k): dict(v) for k, v in header_rules.items() if isinstance(v, dict)})
+    ignored = data.get("IgnoredValueHeaders")
+    if isinstance(ignored, dict):
+        # Absent from an older state file means "never configured", so the
+        # seeded defaults stand; present-but-empty means the admin emptied it.
+        replace_in_place(
+            _ignored_value_headers, {str(k).lower(): dict(v) for k, v in ignored.items() if isinstance(v, dict)}
+        )
 
     tokens = data.get("InvalidationTokens", {})
     if isinstance(tokens, dict):
@@ -275,10 +318,10 @@ def _maybe_reload():
     if now - _last_check < RELOAD_CHECK_INTERVAL:
         return
     _last_check = now
-    mtime = storage.get_mtime()
+    mtime = _state.mtime()
     if mtime and mtime != _last_mtime:
         _last_mtime = mtime
-        data = storage.load_data()
+        data = _state.read()
         with _lock:
             _restore_from(data.get("Runtime", {}))
 
@@ -296,16 +339,12 @@ def _persist_change(apply_change):
             _restore_from(data.get("Runtime", {}))
             apply_change()
             data["Runtime"] = _serialize_unlocked()
-        return data
 
-    try:
-        storage.update_data(mutate)
-        _last_mtime = storage.get_mtime()
-    except OSError:
-        # Disk hiccup: apply the change in memory anyway so this worker keeps
-        # working; cross-worker sync catches up on the next successful write.
-        with _lock:
-            apply_change()
+    # LockedJSON.update degrades to an in-memory mutation on disk failure, so the
+    # change still lands in this worker and cross-worker sync catches up on the
+    # next successful write.
+    _state.update(mutate)
+    _last_mtime = _state.mtime()
 
 
 # --- Pause controls ---------------------------------------------------------
@@ -596,6 +635,43 @@ def match_endpoint_rule(path: str):
     return best
 
 
+# --- Headers whose values are not enumerated --------------------------------
+def get_ignored_value_headers() -> dict:
+    _maybe_reload()
+    return {k: dict(v) for k, v in _ignored_value_headers.items()}
+
+
+def ignores_header_values(header_name_lower: str) -> bool:
+    """Whether this header's distinct values should be skipped. Hot path: called
+    once per header per request, so it must not touch disk beyond the shared
+    mtime check every reader already does."""
+    return header_name_lower in _ignored_value_headers
+
+
+def add_ignored_value_header(name: str, note: str = "", auto: bool = False) -> tuple[bool, str]:
+    name = (name or "").strip().lower()[:120]
+    if not name:
+        return False, "Enter a header name"
+    if name not in _ignored_value_headers and len(_ignored_value_headers) >= config.MAX_IGNORED_VALUE_HEADERS:
+        return False, "Too many ignored headers"
+
+    def change():
+        _ignored_value_headers[name] = {"Added": time.time(), "Auto": bool(auto), "Note": str(note)[:200]}
+
+    _persist_change(change)
+    return True, "Success"
+
+
+def remove_ignored_value_header(name: str) -> tuple[bool, str]:
+    name = (name or "").strip().lower()
+
+    def change():
+        _ignored_value_headers.pop(name, None)
+
+    _persist_change(change)
+    return True, "Success"
+
+
 # --- Header block rules -----------------------------------------------------
 def _header_rule_id(scope: str, mode: str, needle: str, header: str = "") -> str:
     """Canonical id so the same rule can't be added twice and is easy to remove."""
@@ -776,11 +852,20 @@ def consume_challenge(challenge: str) -> bool:
     return _consume_expirable(_challenges, str(challenge))
 
 
+MAX_EXPIRABLES_PER_STORE = 500  # Hard ceiling per short-lived-secret store.
+
+
 def _prune_expirables():
     now = time.time()
     for store in (_invalidation_tokens, _two_fa_codes, _challenges):
         for key in [k for k, exp in store.items() if exp < now]:
             store.pop(key, None)
+        # Expiry alone bounds these in practice (they are minted only behind a
+        # correct password), but nothing in this file is allowed to be unbounded
+        # on principle: past the ceiling, the soonest-to-expire entries go.
+        if len(store) > MAX_EXPIRABLES_PER_STORE:
+            for key, _ in sorted(store.items(), key=lambda kv: kv[1])[: len(store) - MAX_EXPIRABLES_PER_STORE]:
+                store.pop(key, None)
     for key in [k for k, v in _trusted_devices.items() if float(v.get("Expires", 0)) < now]:
         _trusted_devices.pop(key, None)
     # Throttle-bypass entries with a set expiry (Expires > 0) that has lapsed.
@@ -823,7 +908,7 @@ def is_trusted_device(token: str) -> bool:
 def get_trusted_device_count() -> int:
     _maybe_reload()
     now = time.time()
-    return sum(1 for v in _trusted_devices.values() if time.time() < float(v.get("Expires", 0)) and now)
+    return sum(1 for v in _trusted_devices.values() if now < float(v.get("Expires", 0)))
 
 
 def revoke_trusted_devices() -> int:
@@ -856,6 +941,7 @@ def _serialize_unlocked() -> dict:
         "EndpointBlocks": {k: dict(v) for k, v in _endpoint_blocks.items()},
         "EndpointRules": {k: dict(v) for k, v in _endpoint_rules.items()},
         "HeaderRules": {k: dict(v) for k, v in _header_rules.items()},
+        "IgnoredValueHeaders": {k: dict(v) for k, v in _ignored_value_headers.items()},
         "InvalidationTokens": dict(_invalidation_tokens),
         "TwoFACodes": dict(_two_fa_codes),
         "Challenges": dict(_challenges),
@@ -874,12 +960,34 @@ def restore(data: dict):
 
 
 def _load_from_disk():
-    """Load control-plane state from the shared file on startup."""
+    """Load control-plane state from the shared file on startup.
+
+    Control-plane state used to live under the "Runtime" key of the diagnostics
+    data file. If the dedicated state file doesn't exist yet, adopt whatever the
+    old location holds and write it across, so an existing deploy keeps its
+    settings, rules and trusted devices through the upgrade. The old key is left
+    where it is and simply ignored from then on.
+    """
     global _last_mtime
-    data = storage.load_data()
+    data = _state.read()
+    blob = data.get("Runtime")
+    migrating = False
+    if not blob:
+        legacy = storage.load_data().get("Runtime")
+        if isinstance(legacy, dict) and legacy:
+            blob, migrating = legacy, True
+
     with _lock:
-        _restore_from(data.get("Runtime", {}))
-    _last_mtime = storage.get_mtime()
+        _restore_from(blob or {})
+
+    if migrating:
+
+        def mutate(state):
+            with _lock:
+                state["Runtime"] = _serialize_unlocked()
+
+        _state.update(mutate)
+    _last_mtime = _state.mtime()
 
 
 _load_from_disk()

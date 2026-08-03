@@ -1,0 +1,18 @@
+[Unit]
+Description=Email the admin that %i failed
+# Referenced by roxy.service's OnFailure=. This is the only thing that can
+# report a SIGKILL: an OOM-killed process raises no Python exception, so the
+# app's own error email cannot fire. Without this layer a crash is invisible
+# until someone notices the 502s.
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=www-data
+# Reads /etc/roxy for the sender credentials, same as the app.
+Environment="ROXY_FILE_ROOT=/etc/roxy/"
+# Reads the same credentials the app uses, so there is nothing extra to
+# configure or rotate.
+# UpdateBuild.sh places this next to itself in the home directory, so it stays
+# available even when a deploy has torn down ~/Roxy.
+ExecStart=/home/ubuntu/SiteEnv/bin/python /home/ubuntu/alert_on_failure.py %i

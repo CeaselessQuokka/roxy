@@ -9,13 +9,38 @@ const loginError = $("#loginError");
 const twofaModal = $("#twofaModal");
 const twofaInput = $("#twofaInput");
 const twofaSubmit = $("#twofaSubmit");
+const twofaResend = $("#twofaResend");
 const twofaError = $("#twofaError");
+const twofaCountdown = $("#twofaCountdown");
+
+// Codes are short-lived, so the dialog counts down rather than letting one
+// expire silently and reporting it as "invalid".
+let expiryTimer = null;
+function startCountdown(seconds) {
+	clearInterval(expiryTimer);
+	if (!twofaCountdown || !seconds) return;
+	let left = Math.max(0, Math.floor(seconds));
+	const tick = () => {
+		if (left <= 0) {
+			clearInterval(expiryTimer);
+			twofaCountdown.textContent = "This code has expired — send a new one.";
+			twofaCountdown.classList.add("is-expired");
+			return;
+		}
+		twofaCountdown.textContent = `Expires in ${left}s.`;
+		twofaCountdown.classList.remove("is-expired");
+		left -= 1;
+	};
+	tick();
+	expiryTimer = setInterval(tick, 1000);
+}
 
 // Modal helpers
-function openModal() {
+function openModal(expiresIn) {
 	twofaModal.classList.add("is-open");
 	twofaModal.setAttribute("aria-hidden", "false");
 	twofaInput.value = "";
+	startCountdown(expiresIn);
 	// focus 2FA input shortly after paint
 	setTimeout(() => twofaInput?.focus(), 0);
 	// basic focus trap
@@ -26,6 +51,8 @@ function closeModal() {
 	twofaModal.setAttribute("aria-hidden", "true");
 	twofaError.hidden = true;
 	twofaError.textContent = "";
+	clearInterval(expiryTimer);
+	if (twofaCountdown) twofaCountdown.textContent = "";
 	document.removeEventListener("keydown", trapTab);
 }
 function trapTab(e) {
@@ -108,7 +135,7 @@ loginForm.addEventListener("submit", async e => {
 				// Trusted device: 2FA was skipped, go straight to the dashboard.
 				window.location.href = "/admin/dashboard";
 			} else {
-				openModal();
+				openModal(data && data.ExpiresIn);
 			}
 		} else if (res.status === 403) {
 			showLoginError("Invalid credentials.");
@@ -161,6 +188,35 @@ twofaSubmit.addEventListener("click", async () => {
 		twofaError.textContent = "Network error. Check connection and retry.";
 	} finally {
 		setBusy(twofaSubmit, false, "Verifying…", "Verify");
+	}
+});
+
+// Request a fresh code without restarting the whole login
+twofaResend?.addEventListener("click", async () => {
+	if (twofaResend.disabled) return;
+	setBusy(twofaResend, true, "Sending…", "Send a new code");
+	try {
+		const res = await fetch("/admin", {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Accept: "application/json" },
+			body: JSON.stringify({ IsResend2FA: true }),
+		});
+		if (res.ok) {
+			const data = await res.json().catch(() => ({}));
+			twofaError.hidden = true;
+			twofaError.textContent = "";
+			twofaInput.value = "";
+			twofaInput.focus();
+			startCountdown(data.ExpiresIn);
+		} else {
+			twofaError.hidden = false;
+			twofaError.textContent = await readMessage(res, "Could not send a new code. Start the login again.");
+		}
+	} catch {
+		twofaError.hidden = false;
+		twofaError.textContent = "Network error. Check your connection and retry.";
+	} finally {
+		setBusy(twofaResend, false, "Sending…", "Send a new code");
 	}
 });
 

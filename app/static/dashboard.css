@@ -810,6 +810,19 @@ body {
 	color: var(--color-danger);
 	border-color: var(--color-danger);
 }
+/* "high cardinality" — this header's values are effectively unbounded. */
+.badge--warn {
+	background: rgba(255, 183, 77, 0.14);
+	color: var(--color-warning);
+	border-color: var(--color-warning);
+}
+/* "values not recorded" — deliberate, not a problem. */
+.badge--muted {
+	background: transparent;
+	color: var(--color-text-muted);
+	border-color: var(--color-outline);
+	font-weight: 500;
+}
 
 /* =============================
    16) TRAFFIC CHART
@@ -1381,4 +1394,55 @@ body {
 	.card:hover {
 		transform: none;
 	}
+}
+
+/* =============================
+   FINGERPRINT ACTIONS & LAZY DETAIL
+   ============================= */
+/* Several small actions per header row; they wrap rather than widen the column. */
+.fp-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	align-items: center;
+}
+.fp-values__meta {
+	color: var(--color-text-muted);
+	font-size: var(--fs-xs);
+	margin-bottom: 6px;
+}
+
+/* Auto-refresh interval picker in the section header. */
+.select-inline {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+.select-inline__label {
+	color: var(--color-text-dim);
+	font-size: var(--fs-xs);
+}
+.input--select {
+	padding: 4px 8px;
+	font-size: var(--fs-xs);
+	width: auto;
+}
+
+/* "Cleared 3m ago" next to a section's Clear button, so a section that has
+   refilled since a clear can't be mistaken for one that never cleared. */
+.section__cleared {
+	font-size: var(--fs-xs);
+	white-space: nowrap;
+}
+
+/* Right-aligned figures in the record-count table. */
+.num {
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+}
+
+/* A busy button keeps its footprint so the layout doesn't jump mid-action. */
+.btn[data-busy="1"] {
+	opacity: 0.7;
+	cursor: progress;
 }

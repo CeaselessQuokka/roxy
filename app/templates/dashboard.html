@@ -89,6 +89,9 @@
 					<li><a class="nav__link" href="#section-proxy">Proxy Timings</a></li>
 					<li><a class="nav__link" href="#section-request-failures">Request Failures</a></li>
 					<li><a class="nav__link" href="#section-probes">Exploit / Probe Attempts</a></li>
+					<li><a class="nav__link" href="#section-exploit-summary">Exploit / Probe Summary</a></li>
+					<li><a class="nav__link" href="#section-crawls">Crawler Activity</a></li>
+					<li><a class="nav__link" href="#section-throttled">Throttled IPs</a></li>
 					<li><a class="nav__link" href="#section-fingerprints">Request Fingerprints</a></li>
 					<li><a class="nav__link" href="#section-blocked-fingerprints">Blocked Fingerprints</a></li>
 					<li><a class="nav__link" href="#section-errors">Error Log</a></li>
@@ -110,9 +113,15 @@
 							<span id="lastUpdatedChip" class="chip" title="When the dashboard data was last fetched">Updated: never</span>
 							<button id="refreshAll" class="btn btn--filled">Refresh</button>
 							<button id="exportAll" class="btn btn--outline">Export CSV</button>
-							<label class="switch">
-								<input type="checkbox" id="autoRefreshToggle" />
-								<span class="switch__label">Auto-refresh (5s)</span>
+							<label class="select-inline">
+								<span class="select-inline__label">Auto-refresh</span>
+								<select id="autoRefreshInterval" class="input input--select">
+									<option value="0">Off</option>
+									<option value="5">Every 5s</option>
+									<option value="15">Every 15s</option>
+									<option value="30">Every 30s</option>
+									<option value="60">Every 60s</option>
+								</select>
 							</label>
 						</div>
 					</div>
@@ -742,10 +751,11 @@
 								></textarea>
 							</div>
 							<div class="form__row">
-								<label class="switch">
-									<input type="checkbox" id="persistTokens" name="persist" />
-									<span class="switch__label">Also write to token file</span>
-								</label>
+								<!-- Saving is not optional: the token file is how the other
+								     workers learn about a change, so it is always written. -->
+								<span class="text-muted"
+									>Saved to the token file and picked up by every worker.</span
+								>
 								<div class="spacer"></div>
 								<button id="submitTokensBtn" type="submit" class="btn btn--filled">
 									Submit Tokens
@@ -1211,8 +1221,14 @@
 								often tags traffic with tell-tale headers (e.g. <code>Exploit-Guid</code>) — copy one into
 								Request Filters to block it. <strong>Click a header</strong> to see the distinct values it
 								carried (great for <code>Roblox-Id</code>, <code>Roblox-Game-Id</code>, etc.); secret values
-								like cookies show a safe fingerprint, never the raw secret. <em>Clear</em> resets one header
-								so it repopulates fresh.
+								like cookies show a safe fingerprint, never the raw secret.
+							</p>
+							<p class="form__hint">
+								A <strong>high cardinality</strong> badge means nearly every request carried a different
+								value, so the list of values is endless and tells you nothing —
+								<em>Ignore values</em> keeps counting the header but stops recording them.
+								<em>Clear values</em> empties the list but keeps recording. <em>Remove</em> drops the
+								header from this table entirely.
 							</p>
 							<input
 								id="headerNamesFilter"
@@ -1228,6 +1244,7 @@
 											<th scope="col">Header Name</th>
 											<th scope="col">Count</th>
 											<th scope="col">Last Seen</th>
+											<th scope="col">Actions</th>
 										</tr>
 									</thead>
 									<tbody></tbody>
@@ -1262,6 +1279,32 @@
 							</div>
 						</article>
 					</div>
+
+					<article class="card">
+						<h3 class="card__title">
+							Headers Not Being Enumerated
+							<span id="ignoredHeadersTotal" class="chip">0 headers</span>
+						</h3>
+						<p class="form__hint">
+							These headers are still counted, but their individual values are not recorded. Headers
+							like <code>traceparent</code> carry a brand-new value on every single request, so the
+							list of values grows forever and never tells you anything. Roxy ships with the usual
+							suspects listed and adds any header that proves to behave the same way.
+						</p>
+						<div class="table-wrap">
+							<table id="ignoredHeadersTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Header</th>
+										<th scope="col">Why</th>
+										<th scope="col">Detail</th>
+										<th scope="col">Actions</th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
+					</article>
 				</section>
 
 				<!-- Blocked Request Fingerprints (for false-positive review) -->
@@ -1298,6 +1341,7 @@
 											<th scope="col">Header Name</th>
 											<th scope="col">Count</th>
 											<th scope="col">Last Seen</th>
+											<th scope="col">Actions</th>
 										</tr>
 									</thead>
 									<tbody></tbody>
@@ -1512,8 +1556,16 @@
 							<div class="kpi__value" id="persist_status">—</div>
 							<div class="kpi__meta">
 								Last save: <span id="persist_last">—</span><br />
+								<!-- Stats-file size against its ceiling. Every record store is
+								     capped, so this should sit still; a climbing bar means
+								     something new is growing without a limit. -->
+								Stats file: <span id="persist_size">—</span>
+								<div class="gauge" aria-hidden="true">
+									<div class="gauge__fill" id="persist_gauge" style="width: 1%"></div>
+								</div>
 								<span id="persist_file" class="persist-file">—</span>
 								<span id="persist_error" class="persist-error"></span>
+								<span id="persist_oversize" class="persist-error" hidden></span>
 							</div>
 						</article>
 					</div>
@@ -1561,6 +1613,26 @@
 					</div>
 
 					<div class="grid grid--cards">
+						<article class="card">
+							<h3 class="card__title">What's Being Stored</h3>
+							<p class="card__desc">
+								How many records each store is holding right now. Every one of these has a hard
+								ceiling, so these numbers should level off rather than climb forever. If one keeps
+								rising, that is the thing worth clearing — or ignoring, in the case of a header.
+							</p>
+							<div class="table-wrap">
+								<table id="storeSizesTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Store</th>
+											<th scope="col">Records</th>
+										</tr>
+									</thead>
+									<tbody></tbody>
+								</table>
+							</div>
+						</article>
+
 						<article class="card">
 							<h3 class="card__title">Diagnostics JSON</h3>
 							<p class="card__desc">Download the current diagnostics snapshot.</p>

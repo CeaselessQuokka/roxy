@@ -1,6 +1,20 @@
 import os
 
 DEBUG = False
+
+# --- Response headers --------------------------------------------------------
+# nginx terminates TLS and already sends Strict-Transport-Security, so the app
+# stays quiet by default rather than emitting a duplicate header. Set
+# ROXY_SEND_HSTS=1 if the app is ever fronted by something that doesn't add it.
+SEND_HSTS = os.environ.get("ROXY_SEND_HSTS", "0") == "1"
+
+# --- Reverse-proxy trust -----------------------------------------------------
+# How many proxy hops in front of the app are OURS and therefore trustworthy.
+# The client IP is taken from the RIGHTMOST end of X-Forwarded-For, skipping
+# this many hops -- never the leftmost entry, which the caller writes and can
+# forge (see index.get_client_ip). 1 = nginx only. Put 2 if Cloudflare (or any
+# other CDN) also sits in front and appends a hop.
+TRUSTED_PROXY_HOPS = int(os.environ.get("ROXY_TRUSTED_PROXY_HOPS", "1"))
 TOKEN_EXPIRATION_COOLDOWN = (
     15 if not DEBUG else 5
 )  # In seconds, how long to wait before retrying a token to see if it's actually expired.
@@ -44,8 +58,24 @@ TRAFFIC_HISTORY_MINUTES = 180  # How many per-minute traffic buckets to keep (da
 
 # --- Persistence ---
 # Env overrides let tests/dev boot the app without touching /etc/roxy.
-DATA_FILE = os.environ.get("ROXY_DATA_FILE", "/etc/roxy/roxy_data.json")  # Minified-JSON stats/runtime state.
+#
+# Two files, split by value and by size:
+#   STATE_FILE - the control plane (settings, endpoint/header rules, trusted
+#                devices, pause flag). Small, precious, read on the request
+#                path. Losing it means losing configuration.
+#   DATA_FILE  - accumulated diagnostics. Large, disposable, rewritten wholesale
+#                on every flush. Losing it costs nothing but history.
+# Keeping them apart means an admin action no longer rewrites megabytes of
+# stats, a stats read no longer parses the config, and the stats file can be
+# deleted at any time without touching configuration.
+STATE_FILE = os.environ.get("ROXY_STATE_FILE", "/etc/roxy/roxy_state.json")  # Control plane.
+DATA_FILE = os.environ.get("ROXY_DATA_FILE", "/etc/roxy/roxy_data.json")  # Minified-JSON stats.
 AUTOSAVE_INTERVAL = 30 if not DEBUG else 5  # In seconds, how often to flush stats/state to disk.
+# Last-resort guard: a stats file larger than this is quarantined on load rather
+# than parsed, because parsing it is what runs the box out of memory. Every
+# record store is capped so this should never trigger; if it does, something new
+# is unbounded and the dashboard error log will say so.
+MAX_DATA_FILE_BYTES = 24 * 1024 * 1024
 
 # Small, high-frequency shared file holding the request-routing state (global
 # token-use window + Rotate's failure cooldown) so all gunicorn workers coordinate
@@ -122,12 +152,52 @@ MAX_HEADER_RULES = 100  # How many distinct header-block rules to keep.
 MAX_THROTTLE_BYPASS_IPS = 100  # How many IPs may be on the throttle-bypass allowlist.
 
 # --- Error log + request fingerprints (kept until the admin clears them) ---
-# Generous caps that act only as an out-of-memory guard against an attacker
-# deliberately generating unbounded variety; real traffic stays well under.
-MAX_ERROR_RECORDS = 2000  # Distinct error signatures retained.
-MAX_HEADER_NAME_RECORDS = 1000  # Distinct header names retained.
-MAX_USER_AGENT_RECORDS = 5000  # Distinct user-agents retained.
-MAX_HEADER_VALUE_RECORDS = 300  # Distinct values retained per header name (drill-down).
+# EVERY record store in diagnostics.py is capped, and the cap is re-applied
+# after the cross-worker merge (see diagnostics._trim_merged) -- a per-worker
+# cap alone is not enough, because merging N workers' capped sets produces an
+# uncapped union. Nothing here may grow without a ceiling.
+MAX_ERROR_RECORDS = 1000  # Distinct error signatures retained.
+MAX_REQUEST_FAILURE_RECORDS = 500  # Distinct "method: reason" failure signatures retained.
+MAX_HEADER_NAME_RECORDS = 300  # Distinct header names retained.
+MAX_USER_AGENT_RECORDS = 1000  # Distinct user-agents retained.
+MAX_HEADER_VALUE_RECORDS = 200  # Distinct values retained per header name (drill-down).
+MAX_STATUS_CODES = 200  # Distinct upstream status codes retained.
+MAX_TOKEN_USAGE_RECORDS = 100  # Distinct token fingerprints retained.
+MAX_IPS_PER_ATTEMPT_RECORD = 50  # Distinct IPs retained per blocked/rate-limited endpoint record.
+MAX_RETRY_REASONS = 100  # Distinct retry reasons retained.
+MAX_BUDGET_MINUTES = 1500  # Per-minute token-budget peaks retained (~25h).
+
+# --- High-cardinality header values -----------------------------------------
+# Some headers carry a unique value on EVERY request (traceparent is in every
+# Roblox request), so enumerating their distinct values is unbounded work with
+# no diagnostic payoff. For these we keep the header's name and request count
+# but skip the per-value breakdown. The admin can edit this list live; these are
+# the defaults applied on a fresh install.
+DEFAULT_IGNORED_VALUE_HEADERS = (
+    "traceparent",
+    "tracestate",
+    "x-request-id",
+    "request-id",
+    "x-correlation-id",
+    "x-amzn-trace-id",
+    "x-b3-traceid",
+    "x-b3-spanid",
+    "x-b3-parentspanid",
+)
+MAX_IGNORED_VALUE_HEADERS = 200
+# Auto-ignore: once a header has been seen this many times AND nearly every
+# request carried a different value, recording those values is provably
+# pointless -- add it to the ignore list automatically (visible + reversible on
+# the dashboard). Disable with the auto_ignore_high_cardinality setting.
+AUTO_IGNORE_MIN_REQUESTS = 500
+AUTO_IGNORE_UNIQUE_RATIO = 0.9  # distinct values / requests seen
+
+# --- Dashboard ---------------------------------------------------------------
+# get_diagnostics() merges every worker's stats before answering, which is the
+# single most expensive thing the app does. The dashboard polls often, so the
+# merge is throttled to at most once per this many seconds; polls in between
+# answer from already-merged memory.
+DIAGNOSTICS_FLUSH_INTERVAL = 10
 
 # Substrings that mark a User-Agent as an automated crawler/bot (for visitor classification).
 CRAWLER_USER_AGENT_MARKERS = [

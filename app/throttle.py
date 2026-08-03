@@ -179,7 +179,10 @@ def update_throttling(ip, made_request: bool = False):
                 entry["ThrottleResetTime"] = now + throttle_reset_duration
             if made_request:
                 entry["Requests"] += 1
-                entry["ThrottleResetTime"] += 1
+                # The reset time is fixed when the window opens and is NOT
+                # extended per request. Nudging it forward on every request made
+                # a busy caller's window outlast the configured duration, so the
+                # Roxy-Throttle-Reset header we hand back understated the wait.
                 entry["LastRequestTime"] = now
             if entry["Requests"] > allowed:
                 entry["Throttled"] = 1

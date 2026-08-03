@@ -28,15 +28,27 @@ from threading import Lock
 
 
 class LockedJSON:
-    def __init__(self, path_getter):
+    def __init__(self, path_getter, durable: bool = False):
         # A callable so the path is resolved at call time: tests point config at a
         # sandbox, and a getter avoids capturing a stale value at import.
         self._path_getter = path_getter if callable(path_getter) else (lambda: path_getter)
         self._io_lock = Lock()
+        # `durable` fsyncs before the atomic rename, so a power cut can't leave
+        # the file pointing at an empty inode. Worth it for state that is
+        # expensive to lose (configuration); not worth it for counters rewritten
+        # on every request, where the sync would dominate the write.
+        self._durable = durable
 
     @property
     def path(self) -> str:
         return self._path_getter()
+
+    def mtime(self) -> float:
+        """Last-modified time, or 0.0 if the file doesn't exist yet."""
+        try:
+            return os.path.getmtime(self.path)
+        except OSError:
+            return 0.0
 
     @contextmanager
     def _interprocess_lock(self):
@@ -67,6 +79,9 @@ class LockedJSON:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as file:
                 json.dump(data, file, separators=(",", ":"))
+                if self._durable:
+                    file.flush()
+                    os.fsync(file.fileno())
             os.replace(tmp_path, self.path)
         finally:
             if os.path.exists(tmp_path):

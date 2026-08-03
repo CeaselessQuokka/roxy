@@ -19,6 +19,9 @@ _last_write_ok = 0.0
 _last_error = ""
 _last_error_at = 0.0
 _write_count = 0
+# Set if the stats file ever had to be quarantined for exceeding the size limit,
+# so the dashboard can shout about it instead of the loss being invisible.
+_last_oversize = None
 BACKUP_EVERY = 50  # Copy the data file to .bak every N successful writes.
 
 
@@ -37,6 +40,13 @@ def _record_write_error(error: Exception):
         _last_error_at = time.time()
 
 
+def _size_of(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def get_status() -> dict:
     """Persistence health for the dashboard."""
     directory = os.path.dirname(config.DATA_FILE) or "."
@@ -49,10 +59,17 @@ def get_status() -> dict:
     with _status_lock:
         return {
             "DataFile": config.DATA_FILE,
+            "StateFile": config.STATE_FILE,
             "Writable": writable,
             "LastWriteOK": _last_write_ok,
             "LastError": _last_error,
             "LastErrorAt": _last_error_at,
+            # Size is the early-warning signal for the whole class of bug that
+            # used to take this server down; it belongs on the dashboard.
+            "DataBytes": _size_of(config.DATA_FILE),
+            "StateBytes": _size_of(config.STATE_FILE),
+            "DataLimitBytes": config.MAX_DATA_FILE_BYTES,
+            "Oversize": _last_oversize,
         }
 
 
@@ -80,37 +97,64 @@ def _interprocess_lock():
             lock_file.close()
 
 
-def load_data() -> dict:
-    """Load the persisted state file, falling back to the rolling backup.
+def _quarantine(path: str, why: str) -> str:
+    """Move a file aside so it stops being loaded, keeping it for inspection."""
+    target = f"{path}.{why}-{int(time.time())}"
+    try:
+        os.replace(path, target)
+        return target
+    except OSError:
+        return ""
 
-    A corrupt main file is quarantined (renamed aside) instead of being
-    silently overwritten, so stats are never lost without a trace.
+
+def _oversize_bytes(path: str) -> int:
+    """Size of `path` if it exceeds the hard limit, else 0."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return 0
+    return size if size > config.MAX_DATA_FILE_BYTES else 0
+
+
+def load_data() -> dict:
+    """Load the persisted stats file, falling back to the rolling backup.
+
+    A corrupt file is quarantined (renamed aside) instead of being silently
+    overwritten, so stats are never lost without a trace.
+
+    An oversized file is quarantined WITHOUT being parsed. Parsing is the
+    expensive step -- a multi-hundred-megabyte json.load is what exhausts the
+    box's memory -- so the guard has to fire before it, not after. Configuration
+    lives in STATE_FILE and is unaffected.
     """
+    global _last_oversize
+    oversize = _oversize_bytes(config.DATA_FILE)
+    if oversize:
+        moved = _quarantine(config.DATA_FILE, "oversize")
+        _quarantine(_backup_path(), "oversize")  # The backup is the same shape and just as unloadable.
+        with _status_lock:
+            _last_oversize = {
+                "Bytes": oversize,
+                "At": time.time(),
+                "MovedTo": moved,
+                "Limit": config.MAX_DATA_FILE_BYTES,
+            }
+        return {}
+
     try:
         with open(config.DATA_FILE, "r", encoding="utf-8") as file:
             return json.load(file)
     except FileNotFoundError:
         pass
     except json.JSONDecodeError:
-        try:
-            os.replace(config.DATA_FILE, config.DATA_FILE + f".corrupt-{int(time.time())}")
-        except OSError:
-            pass
-    except OSError:
+        _quarantine(config.DATA_FILE, "corrupt")
+    except (OSError, MemoryError):
         pass
     try:
         with open(_backup_path(), "r", encoding="utf-8") as file:
             return json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (FileNotFoundError, json.JSONDecodeError, OSError, MemoryError):
         return {}
-
-
-def get_mtime() -> float:
-    """Last-modified time of the data file (0.0 if it doesn't exist yet)."""
-    try:
-        return os.path.getmtime(config.DATA_FILE)
-    except OSError:
-        return 0.0
 
 
 def _write_atomic(data: dict):
@@ -121,6 +165,14 @@ def _write_atomic(data: dict):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as file:
             json.dump(data, file, separators=(",", ":"))  # Minified.
+            # os.replace is atomic against concurrent READERS, but not against
+            # power loss: the rename can reach disk before the bytes do, leaving
+            # the data file pointing at an empty inode. Force the content out
+            # first. Only this file gets the fsync -- the per-request throttle
+            # and routing files are rewritten constantly and losing a few
+            # seconds of their counters on a hard reset is harmless.
+            file.flush()
+            os.fsync(file.fileno())
         os.replace(tmp_path, config.DATA_FILE)
     finally:
         if os.path.exists(tmp_path):

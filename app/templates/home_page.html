@@ -144,8 +144,9 @@
 						</ul>
 					</p>
 					<p>
-						You get around 10 requests every 50 seconds. However, for every request you make your throttle reset timer increases by 1 second.
-						So if you quickly make 10 requests, you will have to wait an extra 10 seconds on top of whatever time your throttle reset timer is at.
+						You get around 10 requests every 50 seconds. The window opens on your first request and closes 50 seconds
+						later no matter how many requests you make in between, so <code>Roxy-Throttle-Reset</code> always tells you
+						exactly how long the wait is.
 						<br /><br />
 						It is highly encouraged to have caching on your end to make less requests, and also have instant responses.
 					</p>

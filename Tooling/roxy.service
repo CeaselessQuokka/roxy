@@ -1,0 +1,88 @@
+[Unit]
+Description=Gunicorn instance for Roxy proxy
+# network-online rather than network.target: network.target only means the
+# networking stack is up, not that an address is assigned, so a reboot could
+# start Roxy before it can bind.
+After=network-online.target
+Wants=network-online.target
+
+# Never give up on restarting. Systemd's default start limit gives up after 5
+# starts in 10s and parks the unit in `failed` forever; with a 1-second crash
+# loop that is reached almost instantly. Disabling the interval means Roxy keeps
+# trying no matter how bad the day is.
+StartLimitIntervalSec=0
+
+# Tell someone when it dies. The app cannot report its own SIGKILL: there is no
+# Python exception to catch, so the in-app error email never fires. This is the
+# only layer that can.
+# NOTE: OnFailure belongs in [Unit]. In [Service] systemd silently ignores it
+# ("Unknown key name"), so the alert would never fire and you would never know.
+OnFailure=roxy-alert@%n.service
+
+[Service]
+# gunicorn signals READY once the arbiter has booted, so systemd knows the
+# difference between "started" and "actually serving" (and so does anything
+# ordered after this unit).
+Type=notify
+
+User=ubuntu
+Group=www-data
+WorkingDirectory=/home/ubuntu/Roxy
+Environment="PATH=/home/ubuntu/SiteEnv/bin"
+
+# How many proxy hops in front of the app are ours. The nginx config uses
+# `X-Forwarded-For $proxy_add_x_forwarded_for`, which APPENDS, so the last entry
+# is the one nginx added and the ones before it are whatever the caller typed.
+# 1 = nginx only. Set to 2 if you ever put Cloudflare (or any CDN) in front,
+# otherwise every client will look like a CDN edge IP.
+Environment="ROXY_TRUSTED_PROXY_HOPS=1"
+
+# nginx already sends Strict-Transport-Security, and its add_header appends
+# rather than replaces. Leave this at 0 so browsers don't receive it twice.
+Environment="ROXY_SEND_HSTS=0"
+
+# Worker count, timeouts and worker recycling now live in gunicorn.conf.py,
+# which ships with the app so they stay versioned next to the code that assumes
+# them. It binds 127.0.0.1:8000, matching the nginx proxy_pass.
+ExecStart=/home/ubuntu/SiteEnv/bin/gunicorn --config /home/ubuntu/Roxy/gunicorn.conf.py index:app
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=20
+
+# --- THE important part ---------------------------------------------------
+# Without a Restart= directive the default is Restart=no: when the gunicorn
+# master died, systemd marked the unit dead and did nothing. That is why the
+# site stayed down until someone noticed, rather than flapping for a second.
+Restart=always
+RestartSec=3
+
+# --- Memory containment ---------------------------------------------------
+# A runaway worker now hits a cgroup limit -- recorded, attributable, and
+# affecting only Roxy -- instead of the global OOM killer picking a victim
+# anywhere on the box. MemoryHigh throttles and reclaims first; MemoryMax is the
+# hard wall. Sized for a 2 GB instance; scale to ~60/70% of real RAM.
+MemoryAccounting=yes
+MemoryHigh=1200M
+MemoryMax=1500M
+
+# --- Sandboxing -----------------------------------------------------------
+# /etc/roxy holds the credentials, the control-plane state and the stats file,
+# and is the ONLY place the app writes. ProtectSystem=strict makes everything
+# else read-only, so a bug can't scribble outside it.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/roxy /home/ubuntu/Roxy
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=roxy
+
+[Install]
+WantedBy=multi-user.target

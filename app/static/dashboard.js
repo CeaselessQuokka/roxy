@@ -85,7 +85,36 @@ const print = console.log;
 			.replaceAll("&", "&amp;")
 			.replaceAll("<", "&lt;")
 			.replaceAll(">", "&gt;")
-			.replaceAll('"', "&quot;");
+			.replaceAll('"', "&quot;")
+			.replaceAll("'", "&#39;"); // Also single quotes, so single-quoted attributes are safe too.
+	}
+
+	// A count with thousands separators, for the many "N distinct" labels.
+	const fmtCount = n => Number(n || 0).toLocaleString();
+
+	function fmtBytes(n) {
+		n = Number(n || 0);
+		if (n < 1024) return `${n} B`;
+		if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+		return `${(n / 1024 / 1024).toFixed(1)} MB`;
+	}
+
+	// Puts a button into a "working…" state and guarantees it comes back, so a
+	// slow action (a health check can take tens of seconds) never looks hung.
+	async function withBusy(btn, busyLabel, fn) {
+		if (!btn) return fn();
+		if (btn.dataset.busy === "1") return; // Already in flight.
+		const original = btn.textContent;
+		btn.dataset.busy = "1";
+		btn.disabled = true;
+		btn.textContent = busyLabel;
+		try {
+			return await fn();
+		} finally {
+			delete btn.dataset.busy;
+			btn.disabled = false;
+			btn.textContent = original;
+		}
 	}
 
 	// -----------------------------
@@ -335,8 +364,30 @@ const print = console.log;
 
 	function renderPersistence(d) {
 		const p = d.Persistence || {};
-		const broken = !p.Writable || (p.LastErrorAt && p.LastErrorAt > (p.LastWriteOK || 0));
+		const broken = !p.Writable || (p.LastErrorAt && p.LastErrorAt > (p.LastWriteOK || 0)) || Boolean(p.Oversize);
 		setText("persist_status", broken ? "PROBLEM" : "OK");
+		// Stats-file size against its hard limit. Every record store is capped,
+		// so this should sit still; a rising number means something new is not.
+		const bytes = Number(p.DataBytes || 0);
+		const limit = Number(p.DataLimitBytes || 0);
+		setText("persist_size", limit ? `${fmtBytes(bytes)} of ${fmtBytes(limit)}` : fmtBytes(bytes));
+		const gauge = $("#persist_gauge");
+		if (gauge && limit) {
+			const pct = Math.min(100, (bytes / limit) * 100);
+			gauge.style.width = `${Math.max(pct, 1)}%`;
+			gauge.classList.toggle("gauge__fill--warn", pct >= 50 && pct < 80);
+			gauge.classList.toggle("gauge__fill--bad", pct >= 80);
+		}
+		const over = $("#persist_oversize");
+		if (over) {
+			over.hidden = !p.Oversize;
+			if (p.Oversize) {
+				over.textContent =
+					`The stats file reached ${fmtBytes(p.Oversize.Bytes)} and was set aside to protect memory` +
+					(p.Oversize.MovedTo ? ` (saved as ${p.Oversize.MovedTo})` : "") +
+					". Statistics restarted from empty; settings and rules were untouched.";
+			}
+		}
 		$("#persist_status")?.classList.toggle("text-danger", Boolean(broken));
 		setText("persist_last", p.LastWriteOK ? timeAgo(p.LastWriteOK) : "never");
 		setText("persist_file", p.DataFile || "—");
@@ -698,6 +749,31 @@ const print = console.log;
 	}
 
 	// Top Endpoints as a 3-level tree: host -> ID-collapsed template -> concrete IDs.
+	// template -> [[concretePath, info], ...], filled by the lazy fetch below.
+	const endpointConcreteCache = new Map();
+
+	async function toggleEndpointTemplate(template) {
+		if (expandedTemplates.has(template)) {
+			expandedTemplates.delete(template);
+			renderEndpoints({});
+			return;
+		}
+		expandedTemplates.add(template);
+		renderEndpoints({}); // Paint "Loading paths…" straight away.
+		if (!endpointConcreteCache.has(template)) {
+			try {
+				const res = await api(`/admin/endpoints/concrete?template=${encodeURIComponent(template)}`);
+				if (!res.ok) throw new Error(String(res.status));
+				const payload = await res.json();
+				endpointConcreteCache.set(template, Object.entries(payload.Concrete || {}));
+			} catch {
+				endpointConcreteCache.set(template, []);
+				showToast("Could not load paths for that endpoint");
+			}
+		}
+		renderEndpoints({});
+	}
+
 	function renderEndpoints(d) {
 		if (d.Endpoints) {
 			endpointEntries = Object.entries(d.Endpoints);
@@ -712,8 +788,10 @@ const print = console.log;
 		// Group templates by host.
 		const hosts = new Map();
 		for (const [template, info] of endpointEntries) {
-			const concretes = Object.entries(info.Concrete || {});
-			// A template matches the filter if it or any of its concrete paths match.
+			// Concrete paths are fetched per template on expand (they carry a
+			// captured header dump each, far too heavy for the dashboard poll),
+			// so only ones already loaded are available to match against.
+			const concretes = endpointConcreteCache.get(template) || [];
 			if (q) {
 				const hit = template.toLowerCase().includes(q) || concretes.some(([p]) => p.toLowerCase().includes(q));
 				if (!hit) continue;
@@ -767,8 +845,9 @@ const print = console.log;
 			group.templates.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
 			for (const [template, info, concretes] of group.templates) {
 				const sub = template.slice(host.length) || "/";
-				const hasConcrete = concretes.length > 0;
-				const tmplExpanded = (expandedTemplates.has(template) || filtering) && hasConcrete;
+				const idCount = Number(info.ConcreteCount || 0);
+				const hasConcrete = idCount > 0;
+				const tmplExpanded = expandedTemplates.has(template) && hasConcrete;
 				const tmplRow = document.createElement("tr");
 				tmplRow.className = "endpoint-template";
 				tmplRow.title = template;
@@ -777,7 +856,7 @@ const print = console.log;
 				if (hasConcrete) {
 					const c = document.createElement("span");
 					c.className = "endpoint-host__count";
-					c.textContent = ` (${concretes.length} id${concretes.length === 1 ? "" : "s"})`;
+					c.textContent = ` (${fmtCount(idCount)} id${idCount === 1 ? "" : "s"})`;
 					tdName.appendChild(c);
 				}
 				tmplRow.appendChild(tdName);
@@ -791,15 +870,19 @@ const print = console.log;
 				tmplRow.appendChild(tdTLast);
 				if (hasConcrete) {
 					tmplRow.style.cursor = "pointer";
-					tmplRow.addEventListener("click", () => {
-						expandedTemplates.has(template)
-							? expandedTemplates.delete(template)
-							: expandedTemplates.add(template);
-						renderEndpoints({});
-					});
+					tmplRow.addEventListener("click", () => toggleEndpointTemplate(template));
 				}
 				tbody.appendChild(tmplRow);
 				if (!tmplExpanded) continue;
+				if (!endpointConcreteCache.has(template)) {
+					const loading = document.createElement("tr");
+					const td = document.createElement("td");
+					td.colSpan = 4;
+					td.innerHTML = '<div class="text-muted endpoint-headers__meta">Loading paths…</div>';
+					loading.appendChild(td);
+					tbody.appendChild(loading);
+					continue;
+				}
 
 				concretes.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
 				for (const [concretePath, cinfo] of concretes) {
@@ -957,19 +1040,22 @@ const print = console.log;
 	const expandedUa = new Set(); // which UA rows are expanded to show last headers
 	// User-agent frequency table. Rows with a captured last request expand to show
 	// the last headers + endpoint that UA sent (handy for the mysterious "(none)" UA).
+	const uaDetailCache = new Map(); // uaKey -> the fetched last-request detail
+
 	function renderUaTable(tbodySel, totalId, data, filterSel, keyPrefix = "") {
 		const tbody = $(tbodySel);
 		if (!tbody) return;
+		const blocked = keyPrefix === "b:";
 		const entries = Object.entries(data || {});
 		entries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
-		setText(totalId, `${entries.length} distinct`);
+		setText(totalId, `${fmtCount(entries.length)} distinct`);
 		const q = ($(filterSel)?.value || "").trim().toLowerCase();
 		tbody.innerHTML = "";
 		let shown = 0;
 		for (const [key, info] of entries) {
 			if (q && !key.toLowerCase().includes(q)) continue;
 			shown++;
-			const hasDetail = Boolean(info.LastHeaders);
+			const hasDetail = Boolean(info.HasDetail);
 			const uaKey = keyPrefix + key;
 			const expanded = expandedUa.has(uaKey);
 			const tdName = document.createElement("td");
@@ -982,133 +1068,333 @@ const print = console.log;
 			tdName.appendChild(document.createTextNode(key));
 			const row = document.createElement("tr");
 			row.appendChild(tdName);
-			for (const cell of [String(info.Count || 0), tsNode(info.LastSeen)]) {
+			for (const cell of [fmtCount(info.Count), tsNode(info.LastSeen)]) {
 				const td = document.createElement("td");
 				if (cell instanceof Node) td.appendChild(cell);
 				else td.textContent = cell;
 				row.appendChild(td);
 			}
-			if (hasDetail) {
-				row.style.cursor = "pointer";
-				const detail = document.createElement("tr");
-				const td = document.createElement("td");
-				td.colSpan = 3;
-				let headersText = info.LastHeaders;
-				try {
-					headersText = JSON.stringify(JSON.parse(info.LastHeaders), null, 2);
-				} catch {}
-				td.innerHTML =
-					`<div class="endpoint-headers__meta">Last seen at <strong>${escapeHtml(info.LastPath || "—")}</strong> from IP <strong>${escapeHtml(info.LastIP || "—")}</strong> • last sent headers:</div>` +
-					`<pre class="endpoint-headers__pre">${escapeHtml(headersText || "(none)")}</pre>`;
-				detail.appendChild(td);
-				detail.style.display = expanded ? "" : "none";
-				row.addEventListener("click", () => {
-					const showing = detail.style.display !== "none";
-					detail.style.display = showing ? "none" : "";
-					showing ? expandedUa.delete(uaKey) : expandedUa.add(uaKey);
-				});
-				tbody.appendChild(row);
-				tbody.appendChild(detail);
-			} else {
-				tbody.appendChild(row);
-			}
+			tbody.appendChild(row);
+			if (!hasDetail) continue;
+
+			row.style.cursor = "pointer";
+			row.addEventListener("click", () => toggleUaDetail(blocked, key, uaKey));
+			// The captured headers are a per-record blob, so they are fetched on
+			// expand rather than shipped with every dashboard poll.
+			if (expanded) tbody.appendChild(uaDetailRow(uaKey));
 		}
 		if (shown === 0) {
 			tbody.appendChild(tr([q ? "No user-agents match the filter" : "No user-agents recorded yet", "—", "—"]));
 		}
 	}
 
+	function uaDetailRow(uaKey) {
+		const detail = document.createElement("tr");
+		const td = document.createElement("td");
+		td.colSpan = 3;
+		const info = uaDetailCache.get(uaKey);
+		if (!info) {
+			td.innerHTML = '<div class="text-muted">Loading last request…</div>';
+		} else {
+			let headersText = info.LastHeaders;
+			try {
+				headersText = JSON.stringify(JSON.parse(info.LastHeaders), null, 2);
+			} catch {}
+			td.innerHTML =
+				`<div class="endpoint-headers__meta">Last seen at <strong>${escapeHtml(info.LastPath || "—")}</strong> from IP <strong>${escapeHtml(info.LastIP || "—")}</strong> • last sent headers:</div>` +
+				`<pre class="endpoint-headers__pre">${escapeHtml(headersText || "(none)")}</pre>`;
+		}
+		detail.appendChild(td);
+		return detail;
+	}
+
+	async function toggleUaDetail(blocked, userAgent, uaKey) {
+		if (expandedUa.has(uaKey)) {
+			expandedUa.delete(uaKey);
+			renderFingerprints({});
+			return;
+		}
+		expandedUa.add(uaKey);
+		renderFingerprints({});
+		try {
+			const res = await api(
+				`/admin/fingerprints/user_agent?ua=${encodeURIComponent(userAgent)}&blocked=${blocked ? 1 : 0}`,
+			);
+			if (!res.ok) throw new Error(String(res.status));
+			uaDetailCache.set(uaKey, await res.json());
+		} catch {
+			uaDetailCache.set(uaKey, { LastHeaders: "", LastPath: "", LastIP: "" });
+			showToast("Could not load the last request for that user-agent");
+		}
+		renderFingerprints({});
+	}
+
 	const expandedFp = new Set(); // which header rows are expanded to show their values
-	// Header-name table with a value drill-down + per-header Clear.
+	const fpValueCache = new Map(); // fpKey -> the fetched value breakdown
+
+	// How many values to render inside an expanded header row. The server caps
+	// how many it will send; this caps how many we will paint. Building a table
+	// of thousands of rows in one innerHTML assignment locks up the tab, and
+	// nobody reads past the first screenful anyway.
+	const FP_VALUES_SHOWN = 50;
+
+	// Header-name table. Values are fetched only when a row is expanded, so the
+	// frequent dashboard poll never carries them.
 	function renderHeaderNameTable(tbodySel, totalId, data, filterSel, blocked) {
 		const tbody = $(tbodySel);
 		if (!tbody) return;
 		const entries = Object.entries(data || {});
 		entries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
-		setText(totalId, `${entries.length} distinct`);
+		setText(totalId, `${fmtCount(entries.length)} distinct`);
 		const q = ($(filterSel)?.value || "").trim().toLowerCase();
 		tbody.innerHTML = "";
 		let shown = 0;
 		for (const [name, info] of entries) {
 			if (q && !name.toLowerCase().includes(q)) continue;
 			shown++;
-			const values = info.Values || {};
-			const valCount = Object.keys(values).length;
+			const ignored = Boolean(info.ValuesIgnored) || isIgnoredHeader(name);
+			const valCount = Number(info.ValueCount || 0);
+			const canExpand = !ignored && valCount > 0;
 			const fpKey = (blocked ? "b:" : "l:") + name;
 			const expanded = expandedFp.has(fpKey);
 
 			const row = document.createElement("tr");
 			row.className = "fp-row";
+
 			const tdName = document.createElement("td");
-			if (valCount) tdName.style.cursor = "pointer";
+			if (canExpand) tdName.style.cursor = "pointer";
 			const chev = document.createElement("span");
 			chev.className = "endpoint-host__chevron";
-			chev.textContent = valCount ? (expanded ? "▾" : "▸") : "";
+			chev.textContent = canExpand ? (expanded ? "▾" : "▸") : "";
 			const nm = document.createElement("strong");
 			nm.textContent = ` ${name} `;
-			const cnt = document.createElement("span");
-			cnt.className = "endpoint-host__count";
-			cnt.textContent = valCount ? `(${valCount} value${valCount === 1 ? "" : "s"})` : "";
-			tdName.append(chev, nm, cnt);
-			if (valCount) {
-				tdName.addEventListener("click", () => {
-					expandedFp.has(fpKey) ? expandedFp.delete(fpKey) : expandedFp.add(fpKey);
-					renderFingerprints({});
-				});
+			tdName.append(chev, nm);
+
+			if (ignored) {
+				// The header is recorded, its values deliberately are not.
+				const badge = document.createElement("span");
+				badge.className = "badge badge--muted";
+				badge.textContent = "values not recorded";
+				badge.title =
+					"This header carries a different value on nearly every request, so the list of values " +
+					"is unbounded and tells you nothing. Its request count is still tracked.";
+				tdName.append(" ", badge);
+			} else {
+				const cnt = document.createElement("span");
+				cnt.className = "endpoint-host__count";
+				cnt.textContent = valCount ? `(${fmtCount(valCount)} value${valCount === 1 ? "" : "s"})` : "";
+				tdName.append(cnt);
+				// Unique-per-request is the signature of a header that will fill
+				// the data file. Surface it before it becomes a problem.
+				const ratio = Number(info.UniqueRatio || 0);
+				if (ratio >= 0.9 && Number(info.Count || 0) >= 100) {
+					const warn = document.createElement("span");
+					warn.className = "badge badge--warn";
+					warn.textContent = "high cardinality";
+					warn.title = `${Math.round(ratio * 100)}% of requests carried a different value — consider "Ignore values".`;
+					tdName.append(" ", warn);
+				}
+			}
+			if (canExpand) {
+				tdName.addEventListener("click", () => toggleHeaderValues(blocked, name, fpKey));
 			}
 			row.appendChild(tdName);
+
 			const tdC = document.createElement("td");
-			tdC.textContent = String(info.Count || 0);
+			tdC.textContent = fmtCount(info.Count);
 			row.appendChild(tdC);
+
 			const tdL = document.createElement("td");
 			tdL.appendChild(tsNode(info.LastSeen));
 			row.appendChild(tdL);
+
 			const tdAct = document.createElement("td");
-			const clr = document.createElement("button");
-			clr.className = "btn btn--outline btn--sm";
-			clr.textContent = "Clear";
-			clr.title = `Clear recorded data for "${name}"`;
-			clr.addEventListener("click", e => {
-				e.stopPropagation();
-				clearFingerprintHeader(blocked, name);
-			});
-			tdAct.appendChild(clr);
+			tdAct.className = "fp-actions";
+			// Three distinct things an admin might mean by "clear", spelled out
+			// instead of collapsed into one ambiguous button.
+			if (!ignored) {
+				tdAct.appendChild(
+					fpButton("Ignore values", `Stop recording distinct values for "${name}" (keeps its count)`, () =>
+						setHeaderIgnored(blocked, name, true),
+					),
+				);
+				tdAct.appendChild(
+					fpButton("Clear values", `Drop the recorded values for "${name}", keep the header`, () =>
+						clearFingerprintHeader(blocked, name, true),
+					),
+				);
+			} else {
+				tdAct.appendChild(
+					fpButton("Record values", `Start recording distinct values for "${name}" again`, () =>
+						setHeaderIgnored(blocked, name, false),
+					),
+				);
+			}
+			tdAct.appendChild(
+				fpButton("Remove", `Remove "${name}" from the table entirely`, () =>
+					clearFingerprintHeader(blocked, name, false),
+				),
+			);
 			row.appendChild(tdAct);
 			tbody.appendChild(row);
 
-			if (expanded && valCount) {
-				const detail = document.createElement("tr");
-				detail.className = "fp-values";
-				const td = document.createElement("td");
-				td.colSpan = 4;
-				const valEntries = Object.entries(values).sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
-				let html = '<table class="fp-values__table">';
-				for (const [val, vinfo] of valEntries) {
-					html += `<tr><td class="fp-values__val">${escapeHtml(val)}</td><td>${vinfo.Count || 0}×</td><td>${escapeHtml(timeAgo(vinfo.LastSeen))}</td></tr>`;
-				}
-				html += "</table>";
-				td.innerHTML = html;
-				detail.appendChild(td);
-				tbody.appendChild(detail);
-			}
+			if (expanded) tbody.appendChild(headerValuesRow(fpKey, name));
 		}
 		if (shown === 0) {
 			tbody.appendChild(tr([q ? "No header names match the filter" : "No header names recorded yet", "—", "—", ""]));
 		}
 	}
 
-	async function clearFingerprintHeader(blocked, name) {
+	function fpButton(label, title, onClick) {
+		const btn = document.createElement("button");
+		btn.className = "btn btn--outline btn--sm";
+		btn.textContent = label;
+		btn.title = title;
+		btn.addEventListener("click", e => {
+			e.stopPropagation();
+			onClick();
+		});
+		return btn;
+	}
+
+	// The expanded value breakdown for one header, rendered from the cache the
+	// lazy fetch fills in.
+	function headerValuesRow(fpKey, name) {
+		const detail = document.createElement("tr");
+		detail.className = "fp-values";
+		const td = document.createElement("td");
+		td.colSpan = 4;
+		const payload = fpValueCache.get(fpKey);
+		if (!payload) {
+			td.innerHTML = '<div class="text-muted">Loading values…</div>';
+			detail.appendChild(td);
+			return detail;
+		}
+		const entries = Object.entries(payload.Values || {}).slice(0, FP_VALUES_SHOWN);
+		if (entries.length === 0) {
+			td.innerHTML = '<div class="text-muted">No values recorded for this header.</div>';
+			detail.appendChild(td);
+			return detail;
+		}
+		let html = "";
+		if (payload.Total > entries.length) {
+			html +=
+				`<div class="fp-values__meta">Showing the ${entries.length} most frequent of ` +
+				`${fmtCount(payload.Total)} recorded values.</div>`;
+		}
+		html += '<table class="fp-values__table">';
+		for (const [val, vinfo] of entries) {
+			html +=
+				`<tr><td class="fp-values__val">${escapeHtml(val)}</td>` +
+				`<td>${fmtCount(vinfo.Count)}×</td>` +
+				`<td>${escapeHtml(timeAgo(vinfo.LastSeen))}</td></tr>`;
+		}
+		html += "</table>";
+		td.innerHTML = html;
+		detail.appendChild(td);
+		return detail;
+	}
+
+	async function toggleHeaderValues(blocked, name, fpKey) {
+		if (expandedFp.has(fpKey)) {
+			expandedFp.delete(fpKey);
+			renderFingerprints({});
+			return;
+		}
+		expandedFp.add(fpKey);
+		renderFingerprints({}); // Paint the "Loading values…" placeholder immediately.
+		try {
+			const query = `name=${encodeURIComponent(name)}&blocked=${blocked ? 1 : 0}&limit=${FP_VALUES_SHOWN * 4}`;
+			const res = await api(`/admin/fingerprints/values?${query}`);
+			if (!res.ok) throw new Error(String(res.status));
+			fpValueCache.set(fpKey, await res.json());
+		} catch {
+			fpValueCache.set(fpKey, { Values: {}, Total: 0 });
+			showToast("Could not load values for that header");
+		}
+		renderFingerprints({});
+	}
+
+	function isIgnoredHeader(name) {
+		return Object.prototype.hasOwnProperty.call(ignoredValueHeaders, String(name).toLowerCase());
+	}
+
+	async function setHeaderIgnored(blocked, name, ignore) {
+		try {
+			const res = await api("/admin/fingerprints/ignore", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ name, ignore, blocked }),
+			});
+			const data = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(String(res.status));
+			ignoredValueHeaders = data.IgnoredValueHeaders || ignoredValueHeaders;
+			fpValueCache.delete((blocked ? "b:" : "l:") + name);
+			showToast(data.Message || "Updated");
+			await refreshAll(true);
+		} catch {
+			showToast("Could not change value recording for that header");
+		}
+	}
+
+	async function clearFingerprintHeader(blocked, name, valuesOnly) {
 		try {
 			const res = await api("/admin/fingerprints/clear_header", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ blocked, name }),
+				body: JSON.stringify({ blocked, name, values_only: Boolean(valuesOnly) }),
 			});
+			const data = await res.json().catch(() => ({}));
 			if (!res.ok) throw new Error(String(res.status));
-			showToast(`Cleared "${name}"`);
+			const fpKey = (blocked ? "b:" : "l:") + name;
+			fpValueCache.delete(fpKey);
+			if (!valuesOnly) expandedFp.delete(fpKey);
+			showToast(data.Message || `Cleared "${name}"`, 3200);
 			await refreshAll(true);
 		} catch {
 			showToast("Failed to clear header");
+		}
+	}
+
+	// The admin-managed list of headers whose values we deliberately don't record.
+	let ignoredValueHeaders = {};
+
+	function renderIgnoredHeaders(d) {
+		if (d.IgnoredValueHeaders) ignoredValueHeaders = d.IgnoredValueHeaders;
+		const tbody = $("#ignoredHeadersTable tbody");
+		if (!tbody) return;
+		const entries = Object.entries(ignoredValueHeaders).sort((a, b) => a[0].localeCompare(b[0]));
+		setText("ignoredHeadersTotal", `${fmtCount(entries.length)} header${entries.length === 1 ? "" : "s"}`);
+		tbody.innerHTML = "";
+		if (entries.length === 0) {
+			tbody.appendChild(tr(["Every header's values are being recorded.", "—", "—", ""]));
+			return;
+		}
+		for (const [name, info] of entries) {
+			const row = document.createElement("tr");
+			const tdName = document.createElement("td");
+			const strong = document.createElement("strong");
+			strong.textContent = name;
+			tdName.appendChild(strong);
+			row.appendChild(tdName);
+
+			const tdWhy = document.createElement("td");
+			tdWhy.textContent = info.Auto ? "Detected automatically" : info.Note === "default" ? "Default" : "Added by you";
+			row.appendChild(tdWhy);
+
+			const tdNote = document.createElement("td");
+			tdNote.className = "text-muted";
+			tdNote.textContent = info.Note && info.Note !== "default" ? info.Note : "—";
+			row.appendChild(tdNote);
+
+			const tdAct = document.createElement("td");
+			tdAct.appendChild(
+				fpButton("Record again", `Start recording distinct values for "${name}"`, () =>
+					setHeaderIgnored(false, name, false),
+				),
+			);
+			row.appendChild(tdAct);
+			tbody.appendChild(row);
 		}
 	}
 
@@ -1197,6 +1483,12 @@ const print = console.log;
 		max_login_records: "Login records kept",
 		max_crawl_records: "Crawl records kept",
 		max_throttle_records: "Throttle records kept",
+		max_header_name_records: "Header names kept",
+		max_header_value_records: "Values kept per header",
+		max_user_agent_records: "User-agents kept",
+		max_error_records: "Error signatures kept",
+		auto_ignore_high_cardinality: "Auto-ignore unique-per-request headers (1 = on)",
+		diagnostics_flush_interval: "Dashboard merge interval (s)",
 		max_endpoint_records: "Endpoint records kept",
 		token_budget_requests: "Token budget: max requests",
 		token_budget_window: "Token budget: window (s)",
@@ -1220,7 +1512,24 @@ const print = console.log;
 		["Upstream & retries", ["request_timeout", "max_retries_per_request"]],
 		["Email", ["email_cooldown", "error_email_cooldown"]],
 		["Login & sessions", ["two_fa_expiration", "challenge_expiration"]],
-		["Record caps & persistence", ["autosave_interval", "max_live_requests", "max_exploit_records", "max_login_records", "max_crawl_records", "max_throttle_records", "max_endpoint_records"]],
+		["Dashboard", ["diagnostics_flush_interval"]],
+		[
+			"Record caps & persistence",
+			[
+				"autosave_interval",
+				"max_live_requests",
+				"max_exploit_records",
+				"max_login_records",
+				"max_crawl_records",
+				"max_throttle_records",
+				"max_endpoint_records",
+				"max_header_name_records",
+				"max_header_value_records",
+				"max_user_agent_records",
+				"max_error_records",
+				"auto_ignore_high_cardinality",
+			],
+		],
 	];
 	function groupedSettingKeys(settings) {
 		const seen = new Set();
@@ -1549,11 +1858,24 @@ const print = console.log;
 	// Data plumbing
 	// -----------------------------
 	let lastFetchedAt = 0;
-	async function fetchDiagnostics() {
-		const res = await api("/admin/diagnostics", { method: "GET" });
+	let refreshInFlight = false;
+	let lastDiagnostics = null; // Reused by exports so a download doesn't refetch everything.
+
+	// `force` makes the server merge every worker's stats before answering. The
+	// background poll skips it (the merge is the expensive part and a few seconds
+	// of staleness is invisible); an explicit Refresh asks for it.
+	async function fetchDiagnostics(force = false) {
+		const res = await api(`/admin/diagnostics${force ? "?flush=1" : ""}`, { method: "GET" });
 		if (!res.ok) throw new Error("Diagnostics fetch failed: " + res.status);
 		lastFetchedAt = Date.now() / 1000;
-		return await res.json();
+		lastDiagnostics = await res.json();
+		return lastDiagnostics;
+	}
+
+	// Exports work from the last refresh rather than pulling the whole payload
+	// again; a click on "Export" should not cost another full server-side merge.
+	async function diagnosticsForExport() {
+		return lastDiagnostics || (await fetchDiagnostics());
 	}
 
 	// Tick the "Updated Xs ago" chip without refetching.
@@ -1562,8 +1884,12 @@ const print = console.log;
 	}, 1000);
 
 	async function refreshAll(silent = false) {
+		if (refreshInFlight) return; // Never let refreshes overlap and pile up.
+		refreshInFlight = true;
 		try {
-			const d = await fetchDiagnostics();
+			// A silent refresh is the background poll; a loud one is the admin
+			// pressing Refresh, which should merge every worker's numbers first.
+			const d = await fetchDiagnostics(!silent);
 			renderOverview(d);
 			renderPageVisits(d);
 			renderVisitors(d);
@@ -1599,19 +1925,64 @@ const print = console.log;
 			renderBlockedAttempts(d);
 			renderRateLimitedAttempts(d);
 			renderHeaderBlocked(d);
+			renderIgnoredHeaders(d);
+			renderStoreSizes(d);
 			setText("lastUpdatedChip", "Updated: just now");
 			if (!silent) showToast("Dashboard updated");
 		} catch (err) {
 			console.error(err);
 			if (!silent && sessionAlive) showToast("Failed to refresh diagnostics");
+		} finally {
+			refreshInFlight = false;
+		}
+	}
+
+	// What is actually accumulating on disk. This is the number that would have
+	// made the old unbounded-growth problem obvious months before it took the
+	// server down, so it gets a permanent home on the dashboard.
+	const STORE_LABELS = {
+		header_names: "Header names",
+		user_agents: "User-agents",
+		endpoints: "Endpoint templates",
+		errors: "Errors",
+		request_failures: "Request failures",
+		exploit_summary: "Probe reasons",
+		blocked_endpoint_attempts: "Blocked attempts",
+		rate_limited_attempts: "Rate-limited attempts",
+		crawls: "Crawlers",
+		throttled_ips: "Throttled IPs",
+		live_requests: "Live feed",
+		traffic_minutes: "Traffic buckets",
+	};
+
+	function renderStoreSizes(d) {
+		const tbody = $("#storeSizesTable tbody");
+		if (!tbody) return;
+		const sizes = d.StoreSizes || {};
+		tbody.innerHTML = "";
+		const rows = Object.entries(STORE_LABELS)
+			.map(([key, label]) => [label, Number(sizes[key] || 0)])
+			.sort((a, b) => b[1] - a[1]);
+		for (const [label, n] of rows) {
+			const row = tr([label, fmtCount(n)]);
+			row.children[1].className = "num";
+			tbody.appendChild(row);
 		}
 	}
 
 	// -----------------------------
 	// CSV Export (simple, sectioned)
 	// -----------------------------
+	// Spreadsheets treat a leading = + - @ (or tab / CR) as the start of a
+	// formula and will evaluate it on open. Much of what we export -- header
+	// names, header values, user-agents -- is written by whoever sent the
+	// request, so a cell is prefixed with an apostrophe to force it to text.
+	function csvSafe(value) {
+		const s = String(value ?? "");
+		return /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+	}
 	function toCSVRow(arr) {
-		return arr.map(x => `"${String(x).replaceAll('"', '""')}"`).join(",");
+		return arr.map(x => `"${csvSafe(x).replaceAll('"', '""')}"`).join(",");
 	}
 	function download(filename, text) {
 		const a = document.createElement("a");
@@ -1743,7 +2114,7 @@ const print = console.log;
 	$("#blockedUserAgentsFilter")?.addEventListener("input", () => renderFingerprints({}));
 	$("#exportAll")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			exportCSV(d);
 			showToast("CSV exported");
 		} catch {
@@ -1753,7 +2124,7 @@ const print = console.log;
 
 	$("#exportCrawls")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			const lines = ["IP,Count,LastRequestTime"];
 			for (const [ip, info] of Object.entries(d.Crawls || {})) {
 				lines.push(`${ip},${info.Count || 0},${info.LastRequestTime || 0}`);
@@ -1767,7 +2138,7 @@ const print = console.log;
 
 	$("#exportThrottled")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			const ti = d.ThrottledIPs || d.throttled_ips || {};
 			const lines = ["IP,Count,LastThrottleTime"];
 			for (const [ip, info] of Object.entries(ti)) {
@@ -1790,7 +2161,6 @@ const print = console.log;
 	$("#tokenForm")?.addEventListener("submit", async e => {
 		e.preventDefault();
 		const tokensRaw = $("#tokensInput")?.value || "";
-		const persist = $("#persistTokens")?.checked || false;
 		const tokens = tokensRaw
 			.split(/\r?\n/)
 			.map(s => s.trim())
@@ -1799,12 +2169,15 @@ const print = console.log;
 			const res = await api("/admin/tokens", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ tokens, persist }),
+				body: JSON.stringify({ tokens }),
 			});
 			if (!res.ok) throw new Error(String(res.status));
 			const data = await res.json();
+			// The token file is always written -- that file is how the other
+			// workers learn about the change -- so the only thing worth
+			// reporting is whether the write actually landed.
 			let msg = `Replaced token set (n=${data.Count ?? tokens.length})`;
-			if (persist) msg += data.Persisted ? "; written to token file" : "; FILE WRITE FAILED";
+			msg += data.Persisted ? "; saved to the token file" : "; COULD NOT SAVE to the token file";
 			showToast(msg, 3200);
 			$("#tokensInput").value = "";
 			await refreshAll(true);
@@ -1876,44 +2249,54 @@ const print = console.log;
 		}
 	});
 
-	// Auto-refresh (paused while the tab is hidden; remembered across visits)
-	const AUTO_REFRESH_KEY = "roxy.autoRefresh";
+	// Auto-refresh (paused while the tab is hidden; remembered across visits).
+	// The interval is the admin's choice, and a tick is skipped whenever the
+	// previous refresh is still in flight -- otherwise a slow response makes the
+	// requests stack up and each one arrives to find another already queued.
+	const AUTO_REFRESH_KEY = "roxy.autoRefreshSeconds";
+	const AUTO_REFRESH_CHOICES = [0, 5, 15, 30, 60];
 	let autoRefreshTimer = null;
-	function startAutoRefresh() {
-		if (autoRefreshTimer) return;
-		autoRefreshTimer = setInterval(() => {
-			if (!document.hidden && sessionAlive) refreshAll(true);
-		}, 5000);
+
+	function autoRefreshSeconds() {
+		const stored = Number(localStorage.getItem(AUTO_REFRESH_KEY));
+		if (AUTO_REFRESH_CHOICES.includes(stored)) return stored;
+		// Migrate the old on/off flag; default to a calm 15s rather than 5s.
+		return localStorage.getItem("roxy.autoRefresh") === "1" ? 15 : 0;
 	}
-	function stopAutoRefresh() {
+
+	function applyAutoRefresh(seconds) {
 		clearInterval(autoRefreshTimer);
 		autoRefreshTimer = null;
+		localStorage.setItem(AUTO_REFRESH_KEY, String(seconds));
+		if (!seconds) return;
+		autoRefreshTimer = setInterval(() => {
+			if (document.hidden || !sessionAlive || refreshInFlight) return;
+			refreshAll(true);
+		}, seconds * 1000);
 	}
-	const autoToggle = $("#autoRefreshToggle");
-	if (autoToggle) {
-		autoToggle.checked = localStorage.getItem(AUTO_REFRESH_KEY) === "1";
-		if (autoToggle.checked) startAutoRefresh();
-		autoToggle.addEventListener("change", e => {
-			localStorage.setItem(AUTO_REFRESH_KEY, e.target.checked ? "1" : "0");
-			if (e.target.checked) {
-				startAutoRefresh();
-				showToast("Auto-refresh on");
-			} else {
-				stopAutoRefresh();
-				showToast("Auto-refresh off");
-			}
+
+	const autoSelect = $("#autoRefreshInterval");
+	if (autoSelect) {
+		autoSelect.value = String(autoRefreshSeconds());
+		applyAutoRefresh(autoRefreshSeconds());
+		autoSelect.addEventListener("change", e => {
+			const seconds = Number(e.target.value) || 0;
+			applyAutoRefresh(seconds);
+			showToast(seconds ? `Auto-refresh every ${seconds}s` : "Auto-refresh off");
 		});
 	}
 
 	// Live feed manual refresh + filter
-	$("#refreshLive")?.addEventListener("click", async () => {
-		try {
-			const d = await fetchDiagnostics();
-			renderLiveFeed(d);
-			showToast("Live feed updated");
-		} catch {
-			showToast("Failed to refresh live feed");
-		}
+	$("#refreshLive")?.addEventListener("click", async e => {
+		// An explicit refresh must actually go to the server, unlike the exports.
+		await withBusy(e.currentTarget, "Refreshing…", async () => {
+			try {
+				renderLiveFeed(await fetchDiagnostics());
+				showToast("Live feed updated");
+			} catch {
+				showToast("Failed to refresh live feed");
+			}
+		});
 	});
 	$("#liveFilter")?.addEventListener("input", () => renderLiveFeed({}));
 	$("#endpointsFilter")?.addEventListener("input", () => renderEndpoints({}));
@@ -1990,20 +2373,58 @@ const print = console.log;
 		btn.title = `Permanently clear ${info.what}`;
 		btn.addEventListener("click", async () => {
 			if (!confirm(`Permanently clear ${info.what}? This cannot be undone.`)) return;
-			try {
-				const res = await api("/admin/data/clear", {
-					method: "POST",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ target: info.target }),
-				});
-				if (!res.ok) throw new Error(String(res.status));
-				showToast(await res.json().catch(() => "Cleared"));
-				await refreshAll(true);
-			} catch {
-				showToast("Failed to clear");
-			}
+			await withBusy(btn, "Clearing…", async () => {
+				try {
+					const res = await api("/admin/data/clear", {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ target: info.target }),
+					});
+					if (!res.ok) throw new Error(String(res.status));
+					showToast(await res.json().catch(() => "Cleared"));
+					noteCleared(sectionId);
+					await refreshAll(true);
+				} catch {
+					showToast("Failed to clear");
+				}
+			});
 		});
 		actions.appendChild(btn);
+		renderClearedStamp(sectionId);
+	}
+
+	// A section that repopulates after a clear looks identical to one that was
+	// never cleared, which is exactly the ambiguity that made the fingerprint
+	// clear bug so hard to pin down. Remember when each section was last cleared
+	// and say so next to the button.
+	const CLEARED_KEY = "roxy.lastCleared";
+	function loadCleared() {
+		try {
+			return JSON.parse(localStorage.getItem(CLEARED_KEY) || "{}");
+		} catch {
+			return {};
+		}
+	}
+	function noteCleared(sectionId) {
+		const all = loadCleared();
+		all[sectionId] = Date.now() / 1000;
+		localStorage.setItem(CLEARED_KEY, JSON.stringify(all));
+		renderClearedStamp(sectionId);
+	}
+	function renderClearedStamp(sectionId) {
+		const section = document.getElementById(sectionId);
+		const when = loadCleared()[sectionId];
+		if (!section || !when) return;
+		const actions = $(".section__actions", section);
+		if (!actions) return;
+		let stamp = $(".section__cleared", actions);
+		if (!stamp) {
+			stamp = document.createElement("span");
+			stamp.className = "section__cleared text-muted";
+			actions.insertBefore(stamp, actions.firstChild);
+		}
+		stamp.textContent = `Cleared ${timeAgo(when)}`;
+		stamp.title = `Last cleared at ${toTS(when)}`;
 	}
 
 	// Collapsible sections: click a section title to fold it; state is remembered.
@@ -2156,7 +2577,7 @@ const print = console.log;
 	// Header-blocked attempts export
 	$("#exportHeaderBlocked")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			const lines = [
 				"Rule,Scope,Mode,Needle,Blocked,UniqueIPs,LastHeader,TriggeredBy,MatchedText,LastIP,LastPath,LastRequestTime",
 			];
@@ -2189,7 +2610,7 @@ const print = console.log;
 	// Endpoints export (template rows + their concrete IDs)
 	$("#exportEndpoints")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			const lines = ["Level,Endpoint,Count,Methods,LastRequestTime"];
 			const methodsOf = m =>
 				Object.entries(m || {})
@@ -2213,7 +2634,7 @@ const print = console.log;
 	// Blocked endpoint attempts export
 	$("#exportBlockedAttempts")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			const lines = ["Endpoint,Attempts,UniqueIPs,Methods,Pattern,LastIP,LastRequestTime"];
 			for (const [path, info] of Object.entries(d.BlockedEndpointAttempts || {})) {
 				const methods = Object.entries(info.Methods || {})
@@ -2242,7 +2663,7 @@ const print = console.log;
 	// Rate-limited endpoint attempts export
 	$("#exportRateLimitedAttempts")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			const lines = ["Endpoint,Attempts,UniqueIPs,Methods,Pattern,LastIP,LastRequestTime"];
 			for (const [path, info] of Object.entries(d.RateLimitedAttempts || {})) {
 				const methods = Object.entries(info.Methods || {})
@@ -2271,7 +2692,7 @@ const print = console.log;
 	// Exploit summary export
 	$("#exportExploitSummary")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			const lines = ["Reason,Count,LastSeen"];
 			for (const [reason, info] of Object.entries(d.ExploitSummary || {})) {
 				lines.push(toCSVRow([reason, info.Count || 0, info.LastSeen || 0]));
@@ -2286,7 +2707,7 @@ const print = console.log;
 	// Probes export
 	$("#exportProbes")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			const lines = ["Date,IP,UserAgent,Reason"];
 			(Array.isArray(d.ExploitAttempts) ? d.ExploitAttempts : []).forEach(r => {
 				lines.push(toCSVRow([r.Date || 0, r.IP || "", r.UserAgent || "", r.Reason || ""]));
@@ -2301,7 +2722,7 @@ const print = console.log;
 	// Logins export
 	$("#exportLogins")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			const lines = ["Date,IP,Successful"];
 			(Array.isArray(d.LoginAttempts) ? d.LoginAttempts : []).forEach(r => {
 				lines.push(toCSVRow([r.Date || 0, r.IP || "", r.Successful ? "success" : "fail"]));
@@ -2316,7 +2737,7 @@ const print = console.log;
 	// Tools: download diagnostics JSON
 	$("#downloadJsonBtn")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			const a = document.createElement("a");
 			a.href = URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], { type: "application/json" }));
 			a.download = `roxy_diagnostics_${Date.now()}.json`;
@@ -2329,61 +2750,66 @@ const print = console.log;
 	});
 
 	// Tools: force revalidate tokens (synchronous; reports which are still active)
-	$("#forceRevalidateBtn")?.addEventListener("click", async () => {
-		showToast("Revalidating tokens against Roblox…");
-		try {
-			const res = await api("/admin/tokens/force_revalidate", { method: "POST" });
-			if (!res.ok) throw new Error(String(res.status));
-			const data = await res.json();
-			const total = Number(data.Total || 0);
-			if (!total) {
-				showToast("No tokens loaded to revalidate", 3200);
-			} else {
-				const dead = (data.Tokens || []).filter(t => t.Active === false).map(t => t.Masked);
-				let msg = `${data.Active}/${total} token(s) active`;
-				if (dead.length) msg += ` — expired: ${dead.join(", ")}`;
-				showToast(msg, 4200);
+	$("#forceRevalidateBtn")?.addEventListener("click", async e => {
+		await withBusy(e.currentTarget, "Revalidating…", async () => {
+			try {
+				const res = await api("/admin/tokens/force_revalidate", { method: "POST" });
+				if (!res.ok) throw new Error(String(res.status));
+				const data = await res.json();
+				const total = Number(data.Total || 0);
+				if (!total) {
+					showToast("No tokens loaded to revalidate", 3200);
+				} else {
+					const dead = (data.Tokens || []).filter(t => t.Active === false).map(t => t.Masked);
+					let msg = `${data.Active}/${total} token(s) active`;
+					if (dead.length) msg += ` — expired: ${dead.join(", ")}`;
+					showToast(msg, 4200);
+				}
+				await refreshAll(true);
+			} catch {
+				showToast("Revalidation failed");
 			}
-			await refreshAll(true);
-		} catch {
-			showToast("Revalidation failed");
-		}
+		});
 	});
 
 	// Tools: health check — server up + each token live + rotation exit IP
-	$("#healthCheckBtn")?.addEventListener("click", async () => {
-		showToast("Running health check…");
-		try {
-			const res = await api("/admin/health_check", { method: "POST" });
-			if (!res.ok) throw new Error(String(res.status));
-			const d = await res.json();
-			const parts = [`Server ${d.Status}${d.Paused ? " (PAUSED)" : ""}`];
-			parts.push(`Tokens: ${d.TokensActive}/${d.TokensTotal} active`);
-			const rot = d.Rotation || {};
-			if (!rot.Configured) parts.push("Rotation: not configured");
-			else if (rot.ExitIP) parts.push(`Rotation OK — exit IP ${rot.ExitIP}`);
-			else parts.push(`Rotation FAILED — ${rot.Error || "no IP"}`);
-			showToast(parts.join(" • "), 6000);
-			await refreshAll(true);
-		} catch {
-			showToast("Health check FAILED — the server did not respond", 3200);
-		}
+	$("#healthCheckBtn")?.addEventListener("click", async e => {
+		// This one really can take tens of seconds (it talks to Roblox), so the
+		// button has to visibly hold rather than just fire a toast and look idle.
+		await withBusy(e.currentTarget, "Checking…", async () => {
+			try {
+				const res = await api("/admin/health_check", { method: "POST" });
+				if (!res.ok) throw new Error(String(res.status));
+				const d = await res.json();
+				const parts = [`Server ${d.Status}${d.Paused ? " (PAUSED)" : ""}`];
+				parts.push(`Tokens: ${d.TokensActive}/${d.TokensTotal} active`);
+				const rot = d.Rotation || {};
+				if (!rot.Configured) parts.push("Rotation: not configured");
+				else if (rot.ExitIP) parts.push(`Rotation OK — exit IP ${rot.ExitIP}`);
+				else parts.push(`Rotation FAILED — ${rot.Error || "no IP"}`);
+				showToast(parts.join(" • "), 6000);
+				await refreshAll(true);
+			} catch {
+				showToast("Health check FAILED — the server did not respond", 3200);
+			}
+		});
 	});
 
 	// Rotation: verify exit IP through the proxy (rotation only; no token spend)
-	$("#verifyRotationBtn")?.addEventListener("click", async () => {
-		showToast("Checking rotation exit IP…");
-		try {
-			const res = await api("/admin/rotation/verify", { method: "POST" });
-			if (!res.ok) throw new Error(String(res.status));
-			const d = await res.json();
-			if (!d.Configured) showToast("Rotation is not configured", 3500);
-			else if (d.ExitIP) showToast(`Rotation working — exit IP ${d.ExitIP}`, 4500);
-			else showToast(`Rotation FAILED — ${d.Error || "no IP returned"}`, 5000);
-			await refreshAll(true);
-		} catch {
-			showToast("Rotation check failed");
-		}
+	$("#verifyRotationBtn")?.addEventListener("click", async e => {
+		await withBusy(e.currentTarget, "Checking…", async () => {
+			try {
+				const res = await api("/admin/rotation/verify", { method: "POST" });
+				if (!res.ok) throw new Error(String(res.status));
+				const d = await res.json();
+				if (!d.Configured) showToast("Rotation is not configured", 3500);
+				else if (d.ExitIP) showToast(`Rotation working — exit IP ${d.ExitIP}`, 4500);
+				else showToast(`Rotation FAILED — ${d.Error || "no IP returned"}`, 5000);
+				await refreshAll(true);
+			} catch {
+				showToast("Rotation check failed");
+			}
+		});
 	});
 
 	// Tools: clear all data
@@ -2424,7 +2850,7 @@ const print = console.log;
 	// Errors export
 	$("#exportErrors")?.addEventListener("click", async () => {
 		try {
-			const d = await fetchDiagnostics();
+			const d = await diagnosticsForExport();
 			const lines = ["Error,Count,FirstSeen,LastSeen,LastDetail"];
 			for (const [sig, info] of Object.entries(d.Errors || {})) {
 				lines.push(toCSVRow([sig, info.Count || 0, info.FirstSeen || 0, info.LastSeen || 0, info.LastDetail || ""]));
@@ -2437,12 +2863,23 @@ const print = console.log;
 	});
 
 	// Fingerprints export (header names + their values + user-agents)
-	function exportFingerprints(headerStore, uaStore, filename) {
+	// Values live behind the per-header endpoint now, so the export pulls them one
+	// header at a time rather than expecting them in the poll payload.
+	async function exportFingerprints(headerStore, uaStore, blocked, filename) {
 		const lines = ["Type,Header,Value,Count,LastSeen"];
 		for (const [name, info] of Object.entries(headerStore || {})) {
 			lines.push(toCSVRow(["header", name, "", info.Count || 0, info.LastSeen || 0]));
-			for (const [val, vinfo] of Object.entries(info.Values || {})) {
-				lines.push(toCSVRow(["header-value", name, val, vinfo.Count || 0, vinfo.LastSeen || 0]));
+			if (info.ValuesIgnored || !info.ValueCount) continue;
+			try {
+				const query = `name=${encodeURIComponent(name)}&blocked=${blocked ? 1 : 0}&limit=1000`;
+				const res = await api(`/admin/fingerprints/values?${query}`);
+				if (!res.ok) continue;
+				const payload = await res.json();
+				for (const [val, vinfo] of Object.entries(payload.Values || {})) {
+					lines.push(toCSVRow(["header-value", name, val, vinfo.Count || 0, vinfo.LastSeen || 0]));
+				}
+			} catch {
+				lines.push(toCSVRow(["header-value", name, "(could not be loaded)", 0, 0]));
 			}
 		}
 		for (const [ua, info] of Object.entries(uaStore || {})) {
@@ -2450,23 +2887,32 @@ const print = console.log;
 		}
 		download(filename, lines.join("\n"));
 	}
-	$("#exportFingerprints")?.addEventListener("click", async () => {
-		try {
-			const d = await fetchDiagnostics();
-			exportFingerprints(d.HeaderNames, d.UserAgents, `roxy_fingerprints_${Date.now()}.csv`);
-			showToast("Fingerprints exported");
-		} catch {
-			showToast("Export failed");
-		}
+	$("#exportFingerprints")?.addEventListener("click", async e => {
+		await withBusy(e.currentTarget, "Exporting…", async () => {
+			try {
+				const d = await diagnosticsForExport();
+				await exportFingerprints(d.HeaderNames, d.UserAgents, false, `roxy_fingerprints_${Date.now()}.csv`);
+				showToast("Fingerprints exported");
+			} catch {
+				showToast("Export failed");
+			}
+		});
 	});
-	$("#exportBlockedFingerprints")?.addEventListener("click", async () => {
-		try {
-			const d = await fetchDiagnostics();
-			exportFingerprints(d.BlockedHeaderNames, d.BlockedUserAgents, `roxy_blocked_fingerprints_${Date.now()}.csv`);
-			showToast("Blocked fingerprints exported");
-		} catch {
-			showToast("Export failed");
-		}
+	$("#exportBlockedFingerprints")?.addEventListener("click", async e => {
+		await withBusy(e.currentTarget, "Exporting…", async () => {
+			try {
+				const d = await diagnosticsForExport();
+				await exportFingerprints(
+					d.BlockedHeaderNames,
+					d.BlockedUserAgents,
+					true,
+					`roxy_blocked_fingerprints_${Date.now()}.csv`,
+				);
+				showToast("Blocked fingerprints exported");
+			} catch {
+				showToast("Export failed");
+			}
+		});
 	});
 
 	// Initial load

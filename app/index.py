@@ -1,3 +1,6 @@
+import logging
+import logging.handlers
+
 import auth
 import challenge
 import config
@@ -18,9 +21,40 @@ import two_fa
 from flask import Flask, request, render_template, session, redirect, url_for, send_from_directory, jsonify
 from markupsafe import escape
 from werkzeug.exceptions import HTTPException
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+
+def _configure_logging():
+    """Send the app's log records somewhere a human can find them.
+
+    Modules log failures (a bounced email, a crashed background task) via the
+    standard logging module, but nothing ever configured a handler, so under
+    gunicorn those records fell through to the last-resort handler and were
+    effectively discarded. stderr is inherited by gunicorn and captured by
+    journald, so this is all it takes to make them readable with journalctl.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return  # Respect a host-provided configuration (gunicorn --log-config).
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG if config.DEBUG else logging.INFO)
+
+
+_configure_logging()
+_logger = logging.getLogger("roxy.app")
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.secret_key = auth.read_admin_credentials()[3]
+
+# Trust exactly config.TRUSTED_PROXY_HOPS proxy hops. ProxyFix rewrites
+# REMOTE_ADDR from the RIGHTMOST end of X-Forwarded-For, skipping that many
+# entries -- the hops our own infrastructure appended. Anything further left was
+# written by the caller and is not evidence of anything.
+app.wsgi_app = ProxyFix(
+    app.wsgi_app, x_for=config.TRUSTED_PROXY_HOPS, x_proto=config.TRUSTED_PROXY_HOPS, x_host=config.TRUSTED_PROXY_HOPS
+)
 
 app.config.update(
     SESSION_COOKIE_DOMAIN=None,
@@ -33,11 +67,17 @@ app.config.update(
 
 # --- Request helpers ----------------------------------------------------------
 def get_client_ip() -> str:
-    """The client IP, preferring the proxy chain. Never raises."""
+    """The client IP. Never raises.
+
+    Reads remote_addr, which ProxyFix (above) has already resolved to the last
+    hop our own proxies vouch for. It must NOT read access_route[0]: with the
+    conventional nginx `X-Forwarded-For $proxy_add_x_forwarded_for`, which
+    appends rather than replaces, the leftmost entry is whatever the caller
+    typed. Everything keyed on this value -- per-IP throttling, the admin login
+    lockout, the 2FA challenge binding, the bypass allowlist -- is only as
+    trustworthy as this function.
+    """
     try:
-        route = request.access_route
-        if route:
-            return route[0]
         return request.remote_addr or "unknown"
     except Exception:
         return "unknown"
@@ -54,11 +94,30 @@ def wants_json() -> bool:
     return "application/json" in (request.headers.get("Accept") or "")
 
 
+# Everything the pages need is served from our own /static, so the policy can be
+# strict with no exceptions. The dashboard renders attacker-supplied header
+# values and user-agents by design; it escapes them all today, and this is the
+# net for the day a refactor forgets one. `data:` is for the favicon only.
+_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+    "font-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+    "base-uri 'none'; object-src 'none'"
+)
+
+
 @app.after_request
 def add_security_headers(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Content-Security-Policy", _CSP)
+    resp.headers.setdefault("Permissions-Policy", "geolocation=(), camera=(), microphone=(), interest-cohort=()")
+    resp.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    if config.SEND_HSTS and not config.DEBUG:
+        # Off by default: nginx terminates TLS and already adds this, and
+        # nginx's add_header appends rather than replaces, so emitting it here
+        # too would send the browser two Strict-Transport-Security headers.
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return resp
 
 
@@ -227,10 +286,43 @@ def admin_page():
                 except Exception:
                     session.pop("Challenge", None)
                     return jsonify("Could not send the 2FA email; please try again shortly."), 503
-                return jsonify({"Status": "Success", "TwoFA": True}), 200
+                # Tell the page how long the code lives so it can show a countdown
+                # instead of letting it expire silently.
+                return (
+                    jsonify(
+                        {
+                            "Status": "Success",
+                            "TwoFA": True,
+                            "ExpiresIn": runtime.get_setting("two_fa_expiration", config.TWO_FA_EXPIRATION),
+                        }
+                    ),
+                    200,
+                )
             throttle.register_login_failure(ip)
             diagnostics.log_login_attempt(ip, False)
             return jsonify("Invalid credentials"), 403
+        elif "IsResend2FA" in data:
+            # Send a fresh code for a login already past the password step.
+            # Rate-limited like any other attempt, and it re-mints the challenge
+            # so an abandoned one can't be reused.
+            stored = session.get("Challenge")
+            if not isinstance(stored, dict) or stored.get("IP", "") != ip or stored.get("UserAgent", "") != user_agent:
+                return jsonify("Start the login again."), 403
+            session["Challenge"] = dict(stored, Challenge=challenge.generate_challenge(ip, user_agent))
+            try:
+                two_fa.send_2fa(auth.get_emails()[0])
+            except Exception:
+                return jsonify("Could not send the 2FA email; please try again shortly."), 503
+            return (
+                jsonify(
+                    {
+                        "Status": "Success",
+                        "TwoFA": True,
+                        "ExpiresIn": runtime.get_setting("two_fa_expiration", config.TWO_FA_EXPIRATION),
+                    }
+                ),
+                200,
+            )
         elif "Is2FA" in data:
             # Returns 404 on failure to avoid revealing whether the challenge or code was wrong.
             code = data.get("TwoFA", "")
@@ -296,7 +388,9 @@ def admin_heartbeat():
 @app.route("/admin/diagnostics", methods=["GET"], endpoint="admin_diagnostics")
 @requires_admin
 def admin_diagnostics():
-    data = diagnostics.get_diagnostics()
+    # The frequent auto-poll accepts slightly-stale cross-worker totals; an
+    # explicit Refresh asks for the current truth and pays for the merge.
+    data = diagnostics.get_diagnostics(force_flush=request.args.get("flush") == "1")
     data["Pause"] = runtime.get_pause_state()
     data["Settings"] = runtime.get_settings()
     data["EndpointBlocks"] = runtime.get_endpoint_blocks()
@@ -315,6 +409,7 @@ def admin_diagnostics():
         "ResetIn": rs.get("TokenResetIn", 0),
     }
     data["Persistence"] = storage.get_status()
+    data["IgnoredValueHeaders"] = runtime.get_ignored_value_headers()
     data["TrustedDevices"] = runtime.get_trusted_device_count()
     data["TrustedThisDevice"] = runtime.is_trusted_device(request.cookies.get(TRUSTED_DEVICE_COOKIE, ""))
     return jsonify(data)
@@ -329,10 +424,11 @@ def admin_set_tokens():
     raw = data["tokens"]
     if not isinstance(raw, list) or not all(isinstance(t, str) for t in raw):
         return jsonify("Tokens must be a list of strings"), 400
-    cleaned = proxy.set_tokens(raw)
-    persisted = None
-    if data.get("persist"):
-        persisted = auth.write_tokens(cleaned)
+    # set_tokens writes the token file itself -- it has to, because that file is
+    # how the other gunicorn workers learn about the change. Persistence is
+    # therefore not optional and never was; the old "persist" flag just wrote the
+    # same file a second time while the UI implied it was a choice.
+    cleaned, persisted = proxy.set_tokens(raw)
     return jsonify({"Count": len(cleaned), "Persisted": persisted}), 200
 
 
@@ -437,9 +533,75 @@ def admin_verify_rotation():
 def admin_clear_fingerprint_header():
     data = get_json_dict()
     if data is None or not data.get("name"):
+        return jsonify({"Message": "Missing header name"}), 400
+    values_only = bool(data.get("values_only"))
+    ok, removed = diagnostics.clear_fingerprint_header(
+        bool(data.get("blocked")), str(data["name"]), values_only=values_only
+    )
+    what = "values" if values_only else "header"
+    message = f"Cleared {what} for \"{data['name']}\" ({removed} value{'' if removed == 1 else 's'} removed)"
+    if not ok:
+        message += " — cleared in memory, but the data file could not be written"
+    return jsonify({"Message": message, "Removed": removed}), 200
+
+
+@app.route("/admin/fingerprints/values", methods=["GET"], endpoint="admin_fingerprint_values")
+@requires_admin
+def admin_fingerprint_values():
+    """One header's distinct values. Fetched only when the admin expands a row,
+    so the dashboard's frequent poll never has to carry them."""
+    name = request.args.get("name", "")
+    if not name:
         return jsonify("Missing header name"), 400
-    ok = diagnostics.clear_fingerprint_header(bool(data.get("blocked")), str(data["name"]))
-    return jsonify("Cleared" if ok else "Cleared in memory, but the data file could not be written"), 200
+    blocked = request.args.get("blocked") == "1"
+    limit = max(1, min(1000, request.args.get("limit", type=int) or 200))
+    return jsonify(diagnostics.get_header_values(blocked, name, limit)), 200
+
+
+@app.route("/admin/fingerprints/user_agent", methods=["GET"], endpoint="admin_fingerprint_user_agent")
+@requires_admin
+def admin_fingerprint_user_agent():
+    """The last headers/path/IP recorded for one user-agent (lazy drill-down)."""
+    ua = request.args.get("ua", "")
+    if not ua:
+        return jsonify("Missing user agent"), 400
+    return jsonify(diagnostics.get_user_agent_detail(request.args.get("blocked") == "1", ua)), 200
+
+
+@app.route("/admin/endpoints/concrete", methods=["GET"], endpoint="admin_endpoint_concrete")
+@requires_admin
+def admin_endpoint_concrete():
+    """The concrete paths recorded under one endpoint template (lazy drill-down)."""
+    template = request.args.get("template", "")
+    if not template:
+        return jsonify("Missing template"), 400
+    limit = max(1, min(500, request.args.get("limit", type=int) or 100))
+    return jsonify(diagnostics.get_endpoint_detail(template, limit)), 200
+
+
+@app.route("/admin/fingerprints/ignore", methods=["POST"], endpoint="admin_ignore_header_values")
+@requires_admin
+def admin_ignore_header_values():
+    """Stop (or resume) enumerating one header's distinct values.
+
+    For headers that carry a unique value per request there is nothing to learn
+    from the list and building it is what used to fill the data file."""
+    data = get_json_dict()
+    if data is None or not data.get("name"):
+        return jsonify({"Message": "Missing header name"}), 400
+    name = str(data["name"])
+    if data.get("ignore", True):
+        ok, message = runtime.add_ignored_value_header(name, str(data.get("note", "")))
+        if ok:
+            # Drop what was already collected, everywhere, so the setting takes
+            # effect immediately instead of at the next eviction.
+            diagnostics.clear_fingerprint_header(bool(data.get("blocked")), name, values_only=True)
+            message = f'No longer recording values for "{name}"'
+    else:
+        ok, message = runtime.remove_ignored_value_header(name)
+        if ok:
+            message = f'Recording values for "{name}" again'
+    return jsonify({"Message": message, "IgnoredValueHeaders": runtime.get_ignored_value_headers()}), 200 if ok else 400
 
 
 @app.route("/admin/trusted_devices/revoke", methods=["POST"], endpoint="admin_revoke_trusted")
@@ -457,6 +619,11 @@ def admin_revoke_trusted():
 def admin_clear_data():
     data = get_json_dict()
     target = (data or {}).get("target")
+    # Must be a string before it reaches the lookup: dict.get() raises TypeError
+    # on an unhashable key, so a JSON body of {"target": []} became a 500 (and an
+    # error email) instead of a 400.
+    if not isinstance(target, str):
+        return jsonify("Clear target must be a string"), 400
     if target == "all":
         names = diagnostics.CLEAR_ALL_NAMES  # Every section, each exactly once.
     else:
@@ -482,9 +649,7 @@ def admin_add_throttle_bypass():
     data = get_json_dict()
     if data is None or not str(data.get("ip", "")).strip():
         return jsonify({"Message": "Missing IP"}), 400
-    ok, message = runtime.add_throttle_bypass(
-        str(data["ip"]), data.get("expires_in", 0), str(data.get("note", ""))
-    )
+    ok, message = runtime.add_throttle_bypass(str(data["ip"]), data.get("expires_in", 0), str(data.get("note", "")))
     status = 200 if ok else 400
     return jsonify({"Message": message, "ThrottleBypassIps": runtime.get_throttle_bypass_ips()}), status
 
@@ -506,9 +671,7 @@ def admin_block_endpoint():
     data = get_json_dict()
     if data is None or not data.get("pattern"):
         return jsonify({"Message": "Missing pattern"}), 400
-    ok, message = runtime.block_endpoint(
-        str(data["pattern"]), str(data.get("note", "")), str(data.get("type", "glob"))
-    )
+    ok, message = runtime.block_endpoint(str(data["pattern"]), str(data.get("note", "")), str(data.get("type", "glob")))
     status = 200 if ok else 400
     return jsonify({"Message": message, "EndpointBlocks": runtime.get_endpoint_blocks()}), status
 
@@ -579,18 +742,52 @@ def admin_clear_header_rule():
     return jsonify({"Message": message, "HeaderRules": runtime.get_header_rules()}), status
 
 
-@app.route("/admin/invalidate/<token>", methods=["GET"], endpoint="admin_invalidate")
+@app.route("/admin/invalidate/<token>", methods=["GET", "POST"], endpoint="admin_invalidate")
 def admin_invalidate(token: str):
-    # Reachable from the emailed login alert; protected by a single-use random token.
+    """The emergency kill switch from the emailed login alert.
+
+    GET only renders a confirmation page; the token is consumed by the POST. It
+    used to be consumed on GET, which meant Gmail's and every mail gateway's
+    link prefetcher burned the single-use token before the admin ever clicked
+    it -- so the one link that exists for an emergency was reliably dead during
+    the emergency.
+    """
+    if request.method == "GET":
+        return render_template("invalidate.html", token=token), 200
     if runtime.consume_invalidation_token(token):
         runtime.bump_session_epoch()
-        return "All admin sessions have been invalidated.", 200
-    return "Invalid or expired invalidation link.", 404
+        return render_template("invalidate.html", token="", done=True), 200
+    return render_template("invalidate.html", token="", failed=True), 404
 
 
 @app.route("/health", methods=["GET"], endpoint="health")
 def health():
-    return jsonify({"Status": "ok", "Paused": runtime.is_paused()}), 200
+    # Includes the stats-file size so an external monitor can alarm on the one
+    # metric that predicts trouble, without needing a session.
+    persistence = storage.get_status()
+    return (
+        jsonify(
+            {
+                "Status": "ok",
+                "Paused": runtime.is_paused(),
+                "DataBytes": persistence["DataBytes"],
+                "DataLimitBytes": persistence["DataLimitBytes"],
+                "PersistenceOK": persistence["Writable"] and not persistence["Oversize"],
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/admin/<path:unknown>", methods=["GET", "POST", "PATCH", "PUT", "DELETE"], endpoint="admin_not_found")
+def admin_not_found(unknown: str):
+    """Catch mistyped or stale admin URLs.
+
+    Without this they fall through to the proxy catch-all below and get logged
+    as "Non-Roblox URL" probe attempts, so every typo and every old bookmark
+    shows up in the security log as an attack.
+    """
+    return jsonify("Not Found"), 404
 
 
 ## Handle proxying requests.
@@ -932,9 +1129,7 @@ def handle_unexpected_error(error):
         signature = f"{type(error).__name__}: {error}"
         proxy.notify_error(
             signature,
-            f"{request.method} {request.path}\n"
-            f"IP: {get_client_ip()}\n\n"
-            f"{traceback.format_exc()}",
+            f"{request.method} {request.path}\n" f"IP: {get_client_ip()}\n\n" f"{traceback.format_exc()}",
         )
     except Exception:
         pass

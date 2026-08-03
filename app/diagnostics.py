@@ -1,8 +1,10 @@
 import config
 import copy
 import hashlib
+import itertools
 import json
 import re
+import secrets
 import threading
 import time
 
@@ -68,6 +70,7 @@ def _templatize(path: str) -> str:
             out.append(seg)
     return "/".join(out)
 
+
 # Guards all reads/writes of the shared in-memory stat structures below. Without
 # it, concurrent request threads (e.g. bots hammering a blocked endpoint) can
 # mutate a dict while another thread iterates it for eviction or JSON
@@ -126,6 +129,7 @@ proxy_health = dict(
     }
 )
 
+
 # Per-method request tallies (Token / Rotate), MERGED across workers so the
 # dashboard shows true global totals. Requests = total; Failed = non-200 /
 # proxy errors; Timeouts = upstream timeouts. Rotate also keeps health/last-error.
@@ -159,6 +163,7 @@ tokens = dict(
 # Tokens → Uses" is read from here so it matches the merged Token method Requests.
 #   fingerprint -> {"Uses": int, "LastUsedAt": float}
 token_usage = dict()
+
 
 # Per-requester upstream timings (Token / Rotate), MERGED across workers.
 # Parallel to proxy_request_counts (which is per HTTP verb); this one answers
@@ -275,6 +280,16 @@ token_budget_minutes = dict()
 # When this worker process started (not persisted; for the dashboard uptime card).
 _started_at = time.time()
 
+# Identity for events appended to the recent-event lists. Unique per worker
+# process, so the cross-worker merge can tell two identical-looking events apart
+# instead of collapsing them (see _merge_list).
+_event_prefix = secrets.token_hex(4)
+_event_counter = itertools.count(1)
+
+
+def _event_id() -> str:
+    return f"{_event_prefix}-{next(_event_counter)}"
+
 
 def _cap(setting_name: str, fallback: int) -> int:
     """A runtime-tunable record cap. NOTE: 0 is a valid configured value (it
@@ -283,12 +298,155 @@ def _cap(setting_name: str, fallback: int) -> int:
     return fallback if value is None else value
 
 
+# --- Record caps -------------------------------------------------------------
+# EVERY dict-shaped store below has a hard ceiling, and the ceiling is re-applied
+# after each cross-worker merge (see _trim_all). A per-worker cap on its own is
+# not enough: merging N workers' individually-capped sets produces an uncapped
+# union, which is exactly how the data file grew until the workers were
+# OOM-killed. Nothing here may grow without a ceiling.
+#
+#   cap      how many entries may survive (None = the store itself isn't capped,
+#            only its children)
+#   by       which entries win when trimming:
+#              "count"  - busiest first (records with a Count field)
+#              "recent" - newest first (records with a timestamp field)
+#              "value"  - plain numeric leaves, largest first
+#   time     the record's timestamp field, used by "recent" and as a tiebreak
+#   children (key, cap, by) trimmed inside every surviving record
+def _caps() -> dict:
+    endpoint_cap = _cap("max_endpoint_records", config.MAX_ENDPOINT_RECORDS)
+    ips = ("IPs", config.MAX_IPS_PER_ATTEMPT_RECORD, "value")
+    value_cap = _cap("max_header_value_records", config.MAX_HEADER_VALUE_RECORDS)
+    fingerprint_children = (("Values", value_cap, "count"),)
+    return {
+        "exploit_summary": dict(cap=config.MAX_EXPLOIT_SUMMARY, by="count", time="LastSeen"),
+        "crawls": dict(cap=_cap("max_crawl_records", config.MAX_CRAWL_RECORDS), by="recent", time="LastRequestTime"),
+        "throttled_ips": dict(
+            cap=_cap("max_throttle_records", config.MAX_THROTTLE_RECORDS), by="recent", time="LastThrottleTime"
+        ),
+        "endpoints": dict(
+            cap=endpoint_cap,
+            by="count",
+            time="LastRequestTime",
+            children=(("Concrete", MAX_CONCRETE_PER_TEMPLATE, "count"),),
+        ),
+        "blocked_endpoint_attempts": dict(cap=endpoint_cap, by="count", time="LastRequestTime", children=(ips,)),
+        "rate_limited_attempts": dict(cap=endpoint_cap, by="count", time="LastRequestTime", children=(ips,)),
+        "header_blocked_attempts": dict(cap=endpoint_cap, by="count", time="LastRequestTime", children=(ips,)),
+        "errors": dict(cap=_cap("max_error_records", config.MAX_ERROR_RECORDS), by="count", time="LastSeen"),
+        "request_failures": dict(cap=config.MAX_REQUEST_FAILURE_RECORDS, by="count", time="LastSeen"),
+        "header_names": dict(
+            cap=_cap("max_header_name_records", config.MAX_HEADER_NAME_RECORDS),
+            by="count",
+            time="LastSeen",
+            children=fingerprint_children,
+        ),
+        "blocked_header_names": dict(
+            cap=_cap("max_header_name_records", config.MAX_HEADER_NAME_RECORDS),
+            by="count",
+            time="LastSeen",
+            children=fingerprint_children,
+        ),
+        "user_agents": dict(
+            cap=_cap("max_user_agent_records", config.MAX_USER_AGENT_RECORDS), by="count", time="LastSeen"
+        ),
+        "blocked_user_agents": dict(
+            cap=_cap("max_user_agent_records", config.MAX_USER_AGENT_RECORDS), by="count", time="LastSeen"
+        ),
+        "status_codes_detailed": dict(cap=config.MAX_STATUS_CODES, by="value"),
+        "token_usage": dict(cap=config.MAX_TOKEN_USAGE_RECORDS, by="count", time="LastUsedAt"),
+        "retry_counts": dict(
+            cap=None,
+            by="count",
+            children=(
+                ("ByStatusCode", config.MAX_STATUS_CODES, "value"),
+                ("Reasons", config.MAX_RETRY_REASONS, "value"),
+            ),
+        ),
+    }
+
+
+# Minute-bucketed stores are bounded by age rather than by rank.
+_MINUTE_STORES = {
+    "traffic_minutes": lambda: config.TRAFFIC_HISTORY_MINUTES,
+    "token_budget_minutes": lambda: config.MAX_BUDGET_MINUTES,
+}
+
+
+def _trim_store(store: dict, cap, by: str, time_key: str = "") -> int:
+    """Drop the lowest-ranked entries until `store` fits `cap`, in place.
+
+    Returns how many were removed. Mirrors the eviction policy each writer
+    already uses locally, so trimming a merged result never surprises a reader.
+    """
+    if cap is None or not isinstance(store, dict) or len(store) <= cap:
+        return 0
+
+    def rank(item):
+        record = item[1]
+        if by == "value":
+            return (float(record) if isinstance(record, (int, float)) else 0.0, 0.0)
+        if not isinstance(record, dict):
+            return (0.0, 0.0)
+        stamp = float(record.get(time_key, 0) or 0) if time_key else 0.0
+        count = float(record.get("Count", record.get("Uses", 0)) or 0)
+        return (stamp, count) if by == "recent" else (count, stamp)
+
+    doomed = sorted(store.items(), key=rank)[: len(store) - cap]
+    for key, _ in doomed:
+        store.pop(key, None)
+    return len(doomed)
+
+
+def _prune_minute_store(store: dict, keep_minutes: int):
+    """Drop minute buckets older than `keep_minutes`, plus any non-numeric key."""
+    if not isinstance(store, dict):
+        return
+    cutoff = int(time.time() // 60) - keep_minutes
+    for key in [k for k in store if not str(k).isdigit() or int(k) < cutoff]:
+        store.pop(key, None)
+
+
+def _trim_all(container) -> int:
+    """Apply every cap to a mapping of store-name -> store, in place.
+
+    `container` is either the merged "Diagnostics" blob or a view of this
+    worker's module-level stores; both are plain dicts of the same shape.
+    """
+    removed = 0
+    for name, spec in _caps().items():
+        store = container.get(name)
+        if not isinstance(store, dict):
+            continue
+        removed += _trim_store(store, spec.get("cap"), spec["by"], spec.get("time", ""))
+        for child_key, child_cap, child_by in spec.get("children", ()):
+            for record in store.values():
+                if isinstance(record, dict) and isinstance(record.get(child_key), dict):
+                    removed += _trim_store(record[child_key], child_cap, child_by, "LastSeen")
+    for name, keep in _MINUTE_STORES.items():
+        _prune_minute_store(container.get(name), keep())
+    return removed
+
+
+def _local_view() -> dict:
+    """This worker's live stores by name (references, so trimming edits them)."""
+    g = globals()
+    return {name: g[name] for name in _PERSISTED_NAMES}
+
+
+def trim_local() -> int:
+    """Re-apply every cap to this worker's in-memory stores. Cheap once the
+    stores are already at size; the point is to shrink an oversized set adopted
+    from disk (e.g. the first boot after this cap system was added)."""
+    with _state_lock:
+        return _trim_all(_local_view())
+
+
 def _is_crawler(user_agent: str) -> bool:
     ua = (user_agent or "").lower()
     if not ua:
         return True  # No User-Agent is itself a strong bot signal.
     return any(marker in ua for marker in config.CRAWLER_USER_AGENT_MARKERS)
-
 
 
 def log_page_visit(page: str):
@@ -348,7 +506,7 @@ def log_crawl(ip: str):
 def log_exploit_attempt(ip: str, reason: str, user_agent: str):
     cap = _cap("max_exploit_records", config.MAX_EXPLOIT_RECORDS)
     with _state_lock:
-        exploit_attempts.append(dict(IP=ip, Date=time.time(), Reason=reason, UserAgent=user_agent))
+        exploit_attempts.append(dict(Id=_event_id(), IP=ip, Date=time.time(), Reason=reason, UserAgent=user_agent))
         while len(exploit_attempts) > cap:
             exploit_attempts.pop(0)
         # Aggregate the reason so popular probes persist beyond the recent-list cap.
@@ -438,7 +596,7 @@ def _log_rejected_endpoint(store: dict, path: str, method: str, ip: str, pattern
             record["Pattern"] = pattern
             record["Methods"][method] = record["Methods"].get(method, 0) + 1
             record["IPs"][ip] = record["IPs"].get(ip, 0) + 1
-            if len(record["IPs"]) > 50:  # Keep only the busiest IPs per endpoint.
+            if len(record["IPs"]) > config.MAX_IPS_PER_ATTEMPT_RECORD:  # Keep only the busiest IPs per endpoint.
                 least = min(record["IPs"].items(), key=lambda kv: kv[1])[0]
                 record["IPs"].pop(least, None)
         else:
@@ -475,7 +633,7 @@ def log_header_blocked(rule: dict, path: str, method: str, ip: str):
             record["LastPath"] = path
             record["Methods"][method] = record["Methods"].get(method, 0) + 1
             record["IPs"][ip] = record["IPs"].get(ip, 0) + 1
-            if len(record["IPs"]) > 50:
+            if len(record["IPs"]) > config.MAX_IPS_PER_ATTEMPT_RECORD:  # Keep only the busiest IPs per rule.
                 least = min(record["IPs"].items(), key=lambda kv: kv[1])[0]
                 record["IPs"].pop(least, None)
         else:
@@ -614,7 +772,7 @@ def log_request_failure(method: str, status, reason: str, endpoint: str = "", de
             if detail:
                 rec["LastDetail"] = str(detail)[:2000]
         else:
-            if len(request_failures) >= config.MAX_ERROR_RECORDS:
+            if len(request_failures) >= config.MAX_REQUEST_FAILURE_RECORDS:
                 least = min(request_failures.items(), key=lambda kv: kv[1]["Count"])[0]
                 request_failures.pop(least, None)
             request_failures[sig] = dict(
@@ -634,7 +792,7 @@ def log_rotate_ip(ip: str, source: str = ""):
     if not ip:
         return
     with _state_lock:
-        rotate_ips.append(dict(IP=ip, Date=time.time(), Source=str(source)[:40]))
+        rotate_ips.append(dict(Id=_event_id(), IP=ip, Date=time.time(), Source=str(source)[:40]))
         while len(rotate_ips) > config.MAX_ROTATE_IPS:
             rotate_ips.pop(0)
 
@@ -663,7 +821,7 @@ def log_error(signature: str, detail: str = ""):
             if detail:
                 rec["LastDetail"] = str(detail)[:2000]
         else:
-            if len(errors) >= config.MAX_ERROR_RECORDS:
+            if len(errors) >= _cap("max_error_records", config.MAX_ERROR_RECORDS):
                 least = min(errors.items(), key=lambda kv: kv[1]["Count"])[0]
                 errors.pop(least, None)
             errors[signature] = dict(Count=1, FirstSeen=now, LastSeen=now, LastDetail=str(detail)[:2000])
@@ -698,6 +856,43 @@ def _value_for_storage(header_name_lower: str, value: str) -> str:
     return value[:200] if value else "(empty)"
 
 
+def _should_skip_values(name_lower: str, record: dict, value_cap: int) -> bool:
+    """Whether to stop enumerating this header's distinct values.
+
+    True when the admin has listed the header, or when the header has proved by
+    observation that its values are unique per request -- at which point the
+    "distinct values" list is just a slow, expensive way of recounting requests.
+    Auto-detections are written to the shared ignore list so every worker agrees
+    and the admin can see (and undo) the decision on the dashboard.
+    """
+    if runtime.ignores_header_values(name_lower):
+        return True
+    if not runtime.get_setting("auto_ignore_high_cardinality", 1):
+        return False
+    seen = int(record.get("Count", 0) or 0)
+    if seen < config.AUTO_IGNORE_MIN_REQUESTS:
+        return False
+    # Distinct values are capped, so once the cap is reached the true unique
+    # count is unknown -- but "we hit the ceiling and kept finding new ones" is
+    # itself the signal. Unique/seen is measured against everything recorded so
+    # far, tracked in UniqueSeen (which is not capped, it's one integer).
+    # Clamped to `seen`: UniqueSeen accumulates per worker, so the same value
+    # observed on two workers counts twice and could otherwise exceed the
+    # request count it is being compared against.
+    unique = min(int(record.get("UniqueSeen", len(record.get("Values", {}))) or 0), seen)
+    if unique < value_cap or seen <= 0:
+        return False
+    if unique / seen < config.AUTO_IGNORE_UNIQUE_RATIO:
+        return False
+    ok, _ = runtime.add_ignored_value_header(
+        name_lower, note=f"auto: {unique} distinct values in {seen} requests", auto=True
+    )
+    if ok:
+        record["Values"] = {}
+        record["ValuesIgnored"] = True
+    return ok
+
+
 def log_request_fingerprint(
     header_pairs, user_agent: str, blocked: bool = False, last_headers: str = "", last_path: str = "", last_ip: str = ""
 ):
@@ -706,51 +901,115 @@ def log_request_fingerprint(
     `header_pairs` is an iterable of (name, value). When `blocked` is True the data
     goes into the blocked-request stores instead (for false-positive review).
 
+    Headers whose values are unique per request (traceparent and friends) keep
+    their name and count but skip the value breakdown -- see _should_skip_values.
+
     `last_headers` (a pre-sanitized JSON string), `last_path` and `last_ip` are
     attached to the user-agent record so the admin can drill into exactly what a
     given UA (including the "(none)" UA) last sent and where."""
     names_store = blocked_header_names if blocked else header_names
     ua_store = blocked_user_agents if blocked else user_agents
     pairs = list(header_pairs.items()) if hasattr(header_pairs, "items") else list(header_pairs)
+    name_cap = _cap("max_header_name_records", config.MAX_HEADER_NAME_RECORDS)
+    value_cap = _cap("max_header_value_records", config.MAX_HEADER_VALUE_RECORDS)
+    ua_cap = _cap("max_user_agent_records", config.MAX_USER_AGENT_RECORDS)
     with _state_lock:
         for name, value in pairs:
             name_l = str(name).lower()[:120]
-            rec = _bump_fingerprint(names_store, name_l, config.MAX_HEADER_NAME_RECORDS)
+            rec = _bump_fingerprint(names_store, name_l, name_cap)
             if rec is None:
                 continue
+            if _should_skip_values(name_l, rec, value_cap):
+                rec["ValuesIgnored"] = True
+                rec.pop("Values", None)
+                continue
+            rec.pop("ValuesIgnored", None)
             values = rec.setdefault("Values", {})
-            _bump_fingerprint(values, _value_for_storage(name_l, value), config.MAX_HEADER_VALUE_RECORDS)
-        ua_rec = _bump_fingerprint(ua_store, (user_agent or "(none)")[:400], config.MAX_USER_AGENT_RECORDS)
+            stored = _value_for_storage(name_l, value)
+            if stored not in values:
+                # Counts distinct values EVER seen, including ones since evicted
+                # by the cap. One integer, so it stays cheap while telling us
+                # what the capped Values dict no longer can.
+                rec["UniqueSeen"] = int(rec.get("UniqueSeen", 0) or 0) + 1
+            _bump_fingerprint(values, stored, value_cap)
+        ua_rec = _bump_fingerprint(ua_store, (user_agent or "(none)")[:400], ua_cap)
         if ua_rec is not None and last_headers:
             ua_rec["LastHeaders"] = last_headers
             ua_rec["LastPath"] = (last_path or "")[:300]
             ua_rec["LastIP"] = (last_ip or "")[:64]
 
 
-def clear_fingerprint_header(blocked: bool, name: str) -> bool:
-    """Clear one header's recorded values everywhere (in-memory + the data file).
+def _apply_key_clear(container: dict, store_name: str, key: str, values_only: bool):
+    """Erase one record (or just its Values) from a store inside `container`."""
+    store = container.get(store_name)
+    if not isinstance(store, dict):
+        return
+    if not values_only:
+        store.pop(key, None)
+        return
+    record = store.get(key)
+    if isinstance(record, dict):
+        record["Values"] = {}
 
-    Lets the admin reset a single header after reviewing it so it repopulates
-    fresh. Best-effort across multiple workers (exact for the common single
-    worker)."""
+
+def clear_fingerprint_header(blocked: bool, name: str, values_only: bool = False) -> tuple[bool, int]:
+    """Clear one header's record everywhere: this worker, the data file, and —
+    via KeyClearEpochs — every other worker at its next flush.
+
+    That last part is the whole point. Popping the key locally and from the file
+    is not enough: every OTHER worker still holds the header in memory and in its
+    merge baseline, so its next autosave merges the record straight back, values
+    and all. Section clears already solve this with ClearEpochs; per-key clears
+    need the same protection, keyed per record instead of per store.
+
+    `values_only` keeps the header and its request count but drops the
+    per-value breakdown. Returns (ok, values_removed).
+    """
     store_name = "blocked_header_names" if blocked else "header_names"
     key = str(name).lower()[:120]
+    epoch_key = f"{store_name}/{key}" + ("/Values" if values_only else "")
+    now = time.time()
+
     with _state_lock:
-        globals()[store_name].pop(key, None)
-        if isinstance(_baseline, dict) and isinstance(_baseline.get(store_name), dict):
-            _baseline[store_name].pop(key, None)
+        existing = globals()[store_name].get(key) or {}
+        removed = len(existing.get("Values", {})) if isinstance(existing, dict) else 0
+
+        _apply_key_clear(_local_view(), store_name, key, values_only)
+        if isinstance(_baseline, dict):
+            _apply_key_clear(_baseline, store_name, key, values_only)
+        _applied_key_clear_epochs[epoch_key] = now
 
         def mutate(data):
-            diag = data.get("Diagnostics", {})
-            if isinstance(diag, dict) and isinstance(diag.get(store_name), dict):
-                diag[store_name].pop(key, None)
+            diag = data.setdefault("Diagnostics", {})
+            if not isinstance(diag, dict):
+                diag = data["Diagnostics"] = {}
+            _apply_key_clear(diag, store_name, key, values_only)
+            epochs = diag.setdefault("KeyClearEpochs", {})
+            epochs[epoch_key] = now
+            _prune_key_clear_epochs(epochs)
             return data
 
         try:
             storage.update_data(mutate)
-            return True
+            return True, removed
         except OSError:
-            return False
+            return False, removed
+
+
+def _prune_key_clear_epochs(epochs: dict):
+    """Forget per-key clear markers once every worker must have applied them.
+
+    A worker that was down through the whole window rejoins by loading the file,
+    which already reflects the clear, so nothing can be resurrected afterwards.
+    """
+    if not isinstance(epochs, dict):
+        return
+    cutoff = time.time() - KEY_CLEAR_EPOCH_TTL
+    for key in [k for k, ts in epochs.items() if float(ts or 0) < cutoff]:
+        epochs.pop(key, None)
+    if len(epochs) > MAX_KEY_CLEAR_EPOCHS:
+        for key, _ in sorted(epochs.items(), key=lambda kv: float(kv[1] or 0))[: len(epochs) - MAX_KEY_CLEAR_EPOCHS]:
+            epochs.pop(key, None)
 
 
 def log_pause_drop():
@@ -769,8 +1028,10 @@ def log_retry(status_code: int, reason: str = ""):
         retry_counts["Total"] += 1
         code = str(status_code)
         retry_counts["ByStatusCode"][code] = retry_counts["ByStatusCode"].get(code, 0) + 1
+        _cap_counter_map(retry_counts["ByStatusCode"], config.MAX_STATUS_CODES)
         if reason:
-            retry_counts["Reasons"][reason] = retry_counts["Reasons"].get(reason, 0) + 1
+            retry_counts["Reasons"][reason[:120]] = retry_counts["Reasons"].get(reason[:120], 0) + 1
+            _cap_counter_map(retry_counts["Reasons"], config.MAX_RETRY_REASONS)
 
 
 def log_reason(is_custom: bool):
@@ -786,6 +1047,7 @@ def log_live_request(entry: dict):
     """Append a recent request to the live feed ring buffer."""
     cap = _cap("max_live_requests", config.MAX_LIVE_REQUESTS)
     with _state_lock:
+        entry.setdefault("Id", _event_id())
         live_requests.append(entry)
         while len(live_requests) > cap:
             live_requests.pop(0)
@@ -794,7 +1056,7 @@ def log_live_request(entry: dict):
 def log_login_attempt(ip: str, successful: bool):
     cap = _cap("max_login_records", config.MAX_LOGIN_RECORDS)
     with _state_lock:
-        login_attempts.append(dict(IP=ip, Date=time.time(), Successful=successful))
+        login_attempts.append(dict(Id=_event_id(), IP=ip, Date=time.time(), Successful=successful))
         while len(login_attempts) > cap:
             login_attempts.pop(0)
 
@@ -821,6 +1083,15 @@ def log_request(method: str, successful: bool):
         entry["Successful" if successful else "Failed"] += 1
 
 
+def _cap_counter_map(store: dict, cap: int):
+    """Bound a {key: count} map by dropping the smallest counts. Real traffic
+    stays far under these ceilings; they exist so a hostile or buggy upstream
+    can't turn a counter map into an unbounded one."""
+    if len(store) > cap:
+        for key, _ in sorted(store.items(), key=lambda kv: kv[1])[: len(store) - cap]:
+            store.pop(key, None)
+
+
 def log_status_code(status_code: int):
     with _state_lock:
         if 200 <= status_code < 300:
@@ -830,6 +1101,7 @@ def log_status_code(status_code: int):
         # Detailed per-code breakdown (covers 1xx/3xx/5xx too).
         code = str(status_code)
         status_codes_detailed[code] = status_codes_detailed.get(code, 0) + 1
+        _cap_counter_map(status_codes_detailed, config.MAX_STATUS_CODES)
 
 
 def log_proxy_request(method: str, duration: float):
@@ -849,9 +1121,17 @@ def _token_fp(token: str) -> str:
     return hashlib.sha256((token or "").encode("utf-8", "replace")).hexdigest()[:16]
 
 
+def _masked(token: str) -> str:
+    """A short label for a token. Kept deliberately brief: it is rendered on the
+    dashboard and ends up in CSV/JSON exports, so it must not carry enough of a
+    live credential to matter. Mirrors proxy.mask_token (duplicated rather than
+    imported because proxy imports this module)."""
+    return f"…{(token or '')[-6:]}"
+
+
 def update_token(token: str, being_validated: bool = False, used: bool = False):
     global tokens
-    masked = f"...{token[-20:]}"
+    masked = _masked(token)
     with _state_lock:
         if token in tokens:
             tokens[token]["BeingValidated"] = being_validated
@@ -871,6 +1151,11 @@ def update_token(token: str, being_validated: bool = False, used: bool = False):
                 rec["Uses"] += 1
                 rec["LastUsedAt"] = time.time()
             else:
+                # Retired tokens leave their fingerprint behind, so this grows
+                # with token churn rather than staying at the token count.
+                if len(token_usage) >= config.MAX_TOKEN_USAGE_RECORDS:
+                    stale = min(token_usage.items(), key=lambda kv: kv[1].get("LastUsedAt", 0))[0]
+                    token_usage.pop(stale, None)
                 token_usage[fp] = dict(Uses=1, LastUsedAt=time.time())
         proxy_health["Tokens"]["Count"] = len(tokens)
         proxy_health["Tokens"]["BeingValidatedCount"] = sum(1 for t in tokens.values() if t["BeingValidated"])
@@ -913,15 +1198,122 @@ def _tokens_view() -> list:
     return out
 
 
-def get_diagnostics() -> dict:
-    global tokens
-    # Push this worker's pending stats into the shared file and adopt the merged
-    # global totals, so the dashboard shows the true aggregate across all gunicorn
-    # workers (not just the slice this worker happened to handle).
+# --- Dashboard views ---------------------------------------------------------
+# The dashboard polls often, so what it receives has to stay small. The bulky
+# parts of each record -- a header's distinct values, a user-agent's last full
+# header dump, an endpoint template's concrete paths -- are summarised here and
+# fetched on demand by the drill-down endpoints below. This keeps the poll
+# response roughly two orders of magnitude smaller than the underlying state.
+def _summarise_header_names(store: dict) -> dict:
+    out = {}
+    for name, rec in store.items():
+        seen = int(rec.get("Count", 0) or 0)
+        unique = min(int(rec.get("UniqueSeen", len(rec.get("Values", {}))) or 0), seen) if seen else 0
+        out[name] = {
+            "Count": seen,
+            "FirstSeen": rec.get("FirstSeen", 0),
+            "LastSeen": rec.get("LastSeen", 0),
+            "ValueCount": len(rec.get("Values", {})),
+            "UniqueSeen": unique,
+            # 1.0 means every request carried a different value, i.e. the header
+            # is unbounded by nature and its values are not worth enumerating.
+            "UniqueRatio": round(unique / seen, 3) if seen else 0,
+            "ValuesIgnored": bool(rec.get("ValuesIgnored")),
+        }
+    return out
+
+
+def _summarise_user_agents(store: dict) -> dict:
+    return {
+        ua: {
+            "Count": rec.get("Count", 0),
+            "FirstSeen": rec.get("FirstSeen", 0),
+            "LastSeen": rec.get("LastSeen", 0),
+            "HasDetail": bool(rec.get("LastHeaders")),
+        }
+        for ua, rec in store.items()
+    }
+
+
+def _summarise_endpoints(store: dict) -> dict:
+    return {
+        template: {
+            "Count": rec.get("Count", 0),
+            "LastRequestTime": rec.get("LastRequestTime", 0),
+            "Methods": dict(rec.get("Methods", {})),
+            "ConcreteCount": len(rec.get("Concrete", {})),
+        }
+        for template, rec in store.items()
+    }
+
+
+def get_header_values(blocked: bool, name: str, limit: int = 200) -> dict:
+    """The distinct values recorded under one header name, busiest first."""
+    store = blocked_header_names if blocked else header_names
+    with _state_lock:
+        rec = copy.deepcopy(store.get(str(name).lower()[:120]) or {})
+    values = rec.get("Values", {})
+    ordered = sorted(values.items(), key=lambda kv: kv[1].get("Count", 0), reverse=True)[:limit]
+    return {
+        "Name": name,
+        "Count": rec.get("Count", 0),
+        "Total": len(values),
+        "Shown": len(ordered),
+        "ValuesIgnored": bool(rec.get("ValuesIgnored")),
+        "Values": dict(ordered),
+    }
+
+
+def get_user_agent_detail(blocked: bool, user_agent: str) -> dict:
+    """The last headers/path/IP recorded for one user-agent."""
+    store = blocked_user_agents if blocked else user_agents
+    with _state_lock:
+        rec = copy.deepcopy(store.get(str(user_agent)[:400]) or {})
+    return {
+        "UserAgent": user_agent,
+        "Count": rec.get("Count", 0),
+        "LastHeaders": rec.get("LastHeaders", ""),
+        "LastPath": rec.get("LastPath", ""),
+        "LastIP": rec.get("LastIP", ""),
+    }
+
+
+def get_endpoint_detail(template: str, limit: int = 100) -> dict:
+    """The concrete paths recorded under one endpoint template, busiest first."""
+    with _state_lock:
+        rec = copy.deepcopy(endpoints.get(template) or {})
+    concrete = rec.get("Concrete", {})
+    ordered = sorted(concrete.items(), key=lambda kv: kv[1].get("Count", 0), reverse=True)[:limit]
+    return {"Template": template, "Total": len(concrete), "Concrete": dict(ordered)}
+
+
+_last_flush_at = 0.0
+
+
+def _maybe_flush(force: bool = False):
+    """Merge with the other workers, but no more often than the configured
+    interval. The merge is the most expensive operation in the app and the
+    dashboard polls far faster than the data meaningfully changes; polls in
+    between are served from already-merged memory. `force` is for an explicit
+    Refresh, where the admin is asking for the current truth."""
+    global _last_flush_at
+    interval = runtime.get_setting("diagnostics_flush_interval", config.DIAGNOSTICS_FLUSH_INTERVAL)
+    now = time.time()
+    if not force and interval and now - _last_flush_at < interval:
+        return
+    _last_flush_at = now
     try:
         _flush()
     except Exception:
         pass  # If persistence is briefly unavailable, fall back to local memory.
+
+
+def get_diagnostics(force_flush: bool = False) -> dict:
+    global tokens
+    # Push this worker's pending stats into the shared file and adopt the merged
+    # global totals, so the dashboard shows the true aggregate across all gunicorn
+    # workers (not just the slice this worker happened to handle).
+    _maybe_flush(force=force_flush)
     with _state_lock:
         # Deep-copy the whole snapshot under the lock so no other thread can
         # mutate a structure while Flask iterates it during JSON serialization.
@@ -943,7 +1335,7 @@ def get_diagnostics() -> dict:
                 "RequestFailures": request_failures,
                 "RotateIps": list(reversed(rotate_ips)),  # Most-recent first.
                 "Crawls": crawls,
-                "Endpoints": endpoints,
+                "Endpoints": _summarise_endpoints(endpoints),
                 "BlockedEndpointAttempts": blocked_endpoint_attempts,
                 "RateLimitedAttempts": rate_limited_attempts,
                 "HeaderBlockedAttempts": header_blocked_attempts,
@@ -958,12 +1350,15 @@ def get_diagnostics() -> dict:
                 "PauseDrops": pause_drops.get("Count", 0),
                 "ThrottleAllDrops": throttle_drops.get("Count", 0),
                 "Errors": errors,
-                "HeaderNames": header_names,
-                "UserAgents": user_agents,
-                "BlockedHeaderNames": blocked_header_names,
-                "BlockedUserAgents": blocked_user_agents,
+                "HeaderNames": _summarise_header_names(header_names),
+                "UserAgents": _summarise_user_agents(user_agents),
+                "BlockedHeaderNames": _summarise_header_names(blocked_header_names),
+                "BlockedUserAgents": _summarise_user_agents(blocked_user_agents),
                 "ServerTime": time.time(),
                 "WorkerStartedAt": _started_at,
+                # Record counts, so the dashboard can show what is actually
+                # accumulating instead of only what it is currently rendering.
+                "StoreSizes": {name: len(globals()[name]) for name in _PERSISTED_NAMES},
             }
         )
     # Live cross-worker routing state (token budget + per-method cooldowns) and
@@ -1036,6 +1431,13 @@ _INITIAL_SHAPES = {name: copy.deepcopy(globals()[name]) for name in _PERSISTED_N
 # any epochs newer than these before merging, so a "clear" on one worker can
 # never be resurrected by another worker's stale in-memory copy.
 _applied_clear_epochs = dict()
+
+# The same idea at single-record granularity ("header_names/traceparent"), for
+# the per-header Clear buttons on the dashboard. Kept only long enough for every
+# worker to have flushed at least once; see _prune_key_clear_epochs.
+_applied_key_clear_epochs = dict()
+KEY_CLEAR_EPOCH_TTL = 3600  # In seconds; far longer than any autosave interval.
+MAX_KEY_CLEAR_EPOCHS = 500
 
 # Section-clear targets exposed to the admin API: target -> structures it wipes.
 CLEAR_TARGETS = {
@@ -1147,6 +1549,10 @@ def restore(data: dict):
             elif isinstance(existing, list) and isinstance(value, list):
                 existing.clear()
                 existing.extend(value)
+        # Adopted data is capped like everything else. Normally a no-op (the
+        # merge already trimmed it); it matters on the first boot after an
+        # upgrade, when the file on disk predates the caps.
+        _trim_all(_local_view())
 
 
 # --- Cross-worker stat merging ----------------------------------------------
@@ -1173,13 +1579,23 @@ def _list_cap(key: str) -> int:
 
 
 def _merge_list(key, shared_list, local_list):
+    """Union two event lists, newest first, deduped, capped.
+
+    Dedupe is by the per-event Id stamped at creation. Falling back to the whole
+    record as a signature (as this used to do) silently merges two genuinely
+    distinct events that happen to look identical -- two probes from the same IP
+    in the same second with the same reason are two probes, not one.
+    """
     cap = _list_cap(key)
     combined = list(local_list) + list(shared_list)
     combined.sort(key=lambda item: item.get("Date", 0) if isinstance(item, dict) else 0, reverse=True)
     seen = set()
     out = []
     for item in combined:
-        sig = json.dumps(item, sort_keys=True, separators=(",", ":"), default=str)
+        if isinstance(item, dict) and item.get("Id"):
+            sig = ("id", item["Id"])
+        else:  # Pre-upgrade records have no Id; fall back to the old behaviour.
+            sig = ("raw", json.dumps(item, sort_keys=True, separators=(",", ":"), default=str))
         if sig in seen:
             continue
         seen.add(sig)
@@ -1222,6 +1638,11 @@ def _merge_stats(shared: dict, local: dict, base: dict) -> dict:
         if local_v is None:
             continue
         merged[name] = _merge_value(name, merged.get(name), local_v, base.get(name))
+    # The merge above unions keys, so N workers each holding a different capped
+    # set produce a union that is N times the cap. Re-apply every ceiling here or
+    # the shared file grows forever -- this is the line that keeps the data file
+    # (and therefore each worker's memory) bounded.
+    _trim_all(merged)
     return merged
 
 
@@ -1253,11 +1674,28 @@ def _flush():
                         local[name] = copy.deepcopy(_INITIAL_SHAPES[name])
                         base[name] = copy.deepcopy(_INITIAL_SHAPES[name])
                         _applied_clear_epochs[name] = float(epoch)
+            # Same, one record at a time (a per-header Clear on the dashboard).
+            # Must clear our live store, the snapshot being merged, AND the
+            # baseline: leaving the record in any of the three lets the delta
+            # arithmetic put it back.
+            key_epochs = shared.get("KeyClearEpochs", {})
+            if isinstance(key_epochs, dict):
+                live = _local_view()
+                for marker, epoch in key_epochs.items():
+                    if float(epoch or 0) <= _applied_key_clear_epochs.get(marker, 0.0):
+                        continue
+                    store_name, _, remainder = str(marker).partition("/")
+                    if store_name not in _PERSISTED_NAMES or not remainder:
+                        continue
+                    values_only = remainder.endswith("/Values")
+                    key = remainder[: -len("/Values")] if values_only else remainder
+                    for container in (live, local, base, shared):
+                        _apply_key_clear(container, store_name, key, values_only)
+                    _applied_key_clear_epochs[marker] = float(epoch)
+                _prune_key_clear_epochs(key_epochs)
+            # _merge_stats deep-copies `shared` as its starting point and only
+            # overwrites _PERSISTED_NAMES, so both epoch maps carry through.
             data["Diagnostics"] = _merge_stats(shared, local, base)
-            # Old minute buckets only the file still has would otherwise live forever.
-            merged_traffic = data["Diagnostics"].get("traffic_minutes")
-            if isinstance(merged_traffic, dict):
-                _prune_traffic_unlocked(merged_traffic)
             return data
 
         merged = storage.update_data(mutate)
@@ -1271,11 +1709,15 @@ def _bootstrap():
     saved = storage.load_data()
     diag = saved.get("Diagnostics", {})
     if isinstance(diag, dict):
-        # The loaded data already reflects past clears; adopt their epochs.
+        # The loaded data already reflects past clears; adopt their epochs so we
+        # don't re-apply them, and so we can't resurrect what they removed.
         epochs = diag.get("ClearEpochs", {})
         if isinstance(epochs, dict):
             _applied_clear_epochs.update({str(k): float(v) for k, v in epochs.items()})
-        restore(diag)
+        key_epochs = diag.get("KeyClearEpochs", {})
+        if isinstance(key_epochs, dict):
+            _applied_key_clear_epochs.update({str(k): float(v) for k, v in key_epochs.items()})
+        restore(diag)  # Also re-applies every cap to what was on disk.
     _baseline = serialize()  # Loaded state is the baseline so the first flush only adds new events.
     storage.start_autosave(_flush)
 
