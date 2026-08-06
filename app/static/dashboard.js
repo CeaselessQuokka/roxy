@@ -714,7 +714,7 @@ const print = console.log;
 		tbody.innerHTML = "";
 		const rows = fleet.Workers || [];
 		if (!rows.length) {
-			tbody.appendChild(tr(["—", "—", "—", "—", "—", "No workers have reported in yet"]));
+			tbody.appendChild(tr(["—", "—", "—", "—", "—", "—", "No workers have reported in yet"]));
 			return;
 		}
 		for (const worker of rows) {
@@ -729,6 +729,12 @@ const print = console.log;
 				pid.appendChild(document.createTextNode(" "));
 				pid.appendChild(tag);
 			}
+			// Zero proxy requests against a climbing total is the "nobody is using
+			// it" case, not a broken one — dim it rather than letting it read as
+			// a missing number.
+			const proxied = document.createElement("span");
+			proxied.textContent = fmtCount(worker.Proxied || 0);
+			if (!Number(worker.Proxied || 0)) proxied.className = "text-muted";
 			tbody.appendChild(
 				tr([
 					pid,
@@ -736,6 +742,7 @@ const print = console.log;
 					fmtBytes(worker.RSS || 0),
 					String(worker.Threads || "—"),
 					fmtCount(worker.Requests || 0),
+					proxied,
 					worker.LastSeen ? tsNode(worker.LastSeen) : "—",
 				]),
 			);

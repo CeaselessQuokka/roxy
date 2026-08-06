@@ -1865,6 +1865,13 @@
 							whose memory climbs while
 							the others stay flat is the one worth looking at.
 						</p>
+						<p class="form__hint">
+							<strong>All Requests</strong> counts everything a worker served — including this
+							dashboard polling itself every few seconds — because that is the set gunicorn counts
+							toward recycling. <strong>Proxy Requests</strong> counts only traffic aimed at the proxy.
+							If the first is climbing and the second is not, the only thing talking to this server is
+							you: the proxy is idle, not broken.
+						</p>
 						<div class="table-wrap">
 							<table id="workersTable" class="table">
 								<thead>
@@ -1873,7 +1880,8 @@
 										<th scope="col">Uptime</th>
 										<th scope="col">Memory</th>
 										<th scope="col">Threads</th>
-										<th scope="col">Requests</th>
+										<th scope="col" title="Every request this worker served, dashboard polls included. This is what gunicorn counts toward recycling the worker.">All Requests</th>
+										<th scope="col" title="Only requests aimed at the proxy, served or refused. This is the one that tells you whether anyone is actually using the service.">Proxy Requests</th>
 										<th scope="col">Last Heartbeat</th>
 									</tr>
 								</thead>

@@ -1026,6 +1026,11 @@ def throttled_response(ip: str, reset_in=None):
 def proxy_page(dst: str):
     ip = get_client_ip()
     user_agent = request.user_agent.string
+    # Counted before any decision, so refusals count too: this is "traffic aimed
+    # at the proxy", the number that distinguishes an idle service from a busy
+    # one. The fleet's other counter includes the dashboard's own polling and so
+    # keeps climbing even when nobody is using the proxy at all.
+    workers.count_proxied()
     if runtime.is_paused():
         diagnostics.log_pause_drop()
         resp = jsonify(runtime.pause_message())

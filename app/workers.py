@@ -32,10 +32,20 @@ _registry = LockedJSON(lambda: config.WORKERS_FILE)
 _pid = os.getpid()
 _started_at = time.time()  # Fallback; _proc_start_time is used when /proc is available.
 
-# Requests served by THIS worker. gunicorn recycles a worker at max_requests, so
-# this is the number that explains why a worker's uptime resets when it does.
+# Two counters, because one number cannot answer both questions asked of it.
+#
+#   _requests_served - EVERY request this worker handled, dashboard polls
+#       included. This is the one that matters for lifecycle: gunicorn counts
+#       exactly the same set toward max_requests, so it explains why a worker
+#       gets recycled and its uptime resets.
+#   _proxied_served  - only requests aimed at the proxy itself (served or
+#       refused). This is the one that answers "is anybody actually using it?"
+#
+# Reporting only the first was actively misleading: an idle proxy with the
+# dashboard open still ticks up once every few seconds, which reads as traffic.
 _requests_lock = Lock()
 _requests_served = 0
+_proxied_served = 0
 
 
 def count_request():
@@ -43,6 +53,13 @@ def count_request():
     global _requests_served
     with _requests_lock:
         _requests_served += 1
+
+
+def count_proxied():
+    """Count one request aimed at the proxy route, whether it was served or refused."""
+    global _proxied_served
+    with _requests_lock:
+        _proxied_served += 1
 
 
 def _read_first_line(path: str) -> str:
@@ -152,7 +169,7 @@ def heartbeat():
     """Refresh this worker's registry entry (and prune dead siblings)."""
     now = time.time()
     with _requests_lock:
-        served = _requests_served
+        served, proxied = _requests_served, _proxied_served
     entry = {
         "Pid": _pid,
         "StartedAt": _own_start_time(),
@@ -160,6 +177,7 @@ def heartbeat():
         "RSS": _rss_bytes(),
         "Threads": _thread_count(),
         "Requests": served,
+        "Proxied": proxied,
     }
 
     def mutate(data):
@@ -196,6 +214,7 @@ def get_state() -> dict:
                     "RSS": int(worker.get("RSS", 0) or 0),
                     "Threads": int(worker.get("Threads", 0) or 0),
                     "Requests": int(worker.get("Requests", 0) or 0),
+                    "Proxied": int(worker.get("Proxied", 0) or 0),
                     "IsThisWorker": int(worker.get("Pid", 0) or 0) == _pid,
                 }
             )
@@ -206,6 +225,8 @@ def get_state() -> dict:
         "Count": len(workers),
         "Expected": int(os.environ.get("ROXY_WORKERS", "4") or 4),
         "TotalRSS": sum(w["RSS"] for w in workers),
+        "TotalRequests": sum(w["Requests"] for w in workers),
+        "TotalProxied": sum(w["Proxied"] for w in workers),
         "ServiceStartedAt": service_started,
         # The headline number: how long the SERVICE has been up, unaffected by a
         # worker being recycled underneath it.

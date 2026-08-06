@@ -2112,6 +2112,23 @@ check("Each worker reports its pid", row.get("Pid"), row)
 check("Each worker reports its memory", row.get("RSS", 0) > 0, row)
 check("Each worker reports its own uptime", row.get("Uptime", 0) >= 0, row)
 check("Each worker reports how many requests it has served", row.get("Requests", 0) > 0, row)
+
+# The two counters must not be the same number. "All" includes the dashboard
+# polling itself, so on an idle proxy it climbs on its own — which reads as
+# traffic unless proxy requests are counted separately.
+before = workers_module.get_state()
+for _ in range(6):
+    client.get("/health", headers=IP_MAIN)
+workers_module.heartbeat()
+idle = workers_module.get_state()
+check("Non-proxy requests raise the total", idle["TotalRequests"] > before["TotalRequests"], idle["TotalRequests"])
+check("...but not the proxy count", idle["TotalProxied"] == before["TotalProxied"], idle["TotalProxied"])
+for _ in range(4):
+    api_client.get("/not-a-roblox-url-here", headers={"X-Forwarded-For": "10.77.0.1"})
+workers_module.heartbeat()
+busy = workers_module.get_state()
+check("Proxy traffic raises the proxy count", busy["TotalProxied"] == idle["TotalProxied"] + 4, busy["TotalProxied"])
+check("...counting refused requests too, not only served ones", busy["TotalProxied"] > 0)
 service_started = fleet.get("ServiceStartedAt")
 workers_module.heartbeat()
 again = workers_module.get_state()
