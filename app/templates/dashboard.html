@@ -78,6 +78,7 @@
 					<li><a class="nav__link" href="#section-endpoints">Endpoints</a></li>
 					<li><a class="nav__link" href="#section-endpoint-controls">Endpoint Controls</a></li>
 					<li><a class="nav__link" href="#section-throttle-bypass">Throttle Bypass</a></li>
+					<li><a class="nav__link" href="#section-tarpit">Tarpit</a></li>
 					<li><a class="nav__link" href="#section-header-rules">Request Filters</a></li>
 					<li><a class="nav__link" href="#section-blocked-attempts">Blocked Attempts</a></li>
 					<li><a class="nav__link" href="#section-ratelimited-attempts">Rate-Limited Attempts</a></li>
@@ -528,6 +529,210 @@
 					</div>
 				</section>
 
+				<!-- Tarpit: hold refusals open -->
+				<section id="section-tarpit" class="section" aria-labelledby="tarpitHeading">
+					<div class="section__header">
+						<h2 id="tarpitHeading" class="section__title">Tarpit (slow refusals)</h2>
+						<div class="section__actions">
+							<span id="tarpitStatusChip" class="chip">Off</span>
+							<button id="clearTarpitBtn" type="button" class="btn btn--outline btn--sm">
+								Clear stats
+							</button>
+						</div>
+					</div>
+
+					<div class="card">
+						<p class="form__hint">
+							When a request is going to be refused anyway, hold the connection open for a while before
+							answering. A <strong>synchronous</strong> client — which most exploit HTTP wrappers are —
+							can't send its next request until this one returns, so the hold acts as a rate limiter:
+							instead of hammering us in a retry loop against an instant 429, they manage one attempt per
+							hold. The caller receives the byte-identical error they always did, just later — nothing in
+							the response reveals the delay.
+						</p>
+						<p class="form__hint">
+							<strong>The thing to watch is “Skipped”.</strong> A held request occupies one gunicorn
+							worker thread for its whole hold, and there are only
+							thread for its whole hold, and there are only
+							<code>workers × threads</code> of those (16 by default). The concurrency cap below is what
+							stops the tarpit starving real traffic: past it, callers get refused instantly exactly as
+							before. If Skipped is climbing, the cap — not the exploiter — is the limit.
+						</p>
+						<p class="form__hint">
+							IPs on the <strong>Throttle Bypass</strong> list are never held, so you can always test
+							against your own server.
+						</p>
+						<div class="form__row">
+							<label class="switch">
+								<input type="checkbox" id="tarpitEnabled" />
+								<span class="switch__label">Tarpit enabled</span>
+							</label>
+						</div>
+						<form id="tarpitForm" class="form">
+							<div class="form__row">
+								<div class="form__field">
+									<label class="form__label" for="tarpitMin">Hold at least (s)</label>
+									<input id="tarpitMin" class="input" type="number" min="0" max="55" />
+								</div>
+								<div class="form__field">
+									<label class="form__label" for="tarpitMax">Hold at most (s)</label>
+									<input id="tarpitMax" class="input" type="number" min="1" max="55" />
+								</div>
+								<div class="form__field">
+									<label class="form__label" for="tarpitConcurrent">Max held at once</label>
+									<input id="tarpitConcurrent" class="input" type="number" min="0" max="64" />
+								</div>
+								<div class="spacer"></div>
+								<button type="submit" class="btn btn--filled">Save</button>
+							</div>
+							<p class="form__hint" id="tarpitBoundsHint">
+								Each hold is a random length in that range — a fixed delay is learnable, so a client
+								could just set a shorter timeout and never wait. Capped at 55s so a hold can never
+								outlive the
+								just set a shorter timeout and never wait. Capped at 55s so a hold can never outlive the
+								gunicorn worker timeout (90s) that would kill the worker instead of the caller.
+							</p>
+						</form>
+						<h3 class="card__title">Which refusals to hold</h3>
+						<div class="tarpit-cats">
+								<label class="tarpit-cat">
+									<input type="checkbox" class="tarpit-cat__box" data-category="header_rule" />
+									<span class="tarpit-cat__text">
+										<strong>Caught by a Request Filter</strong>
+										<span class="text-dim">Traffic you fingerprinted. Safest to hold.</span>
+									</span>
+								</label>
+								<label class="tarpit-cat">
+									<input type="checkbox" class="tarpit-cat__box" data-category="probe" />
+									<span class="tarpit-cat__text">
+										<strong>Not a Roblox URL</strong>
+										<span class="text-dim">Scanners and junk paths. Never a real caller.</span>
+									</span>
+								</label>
+								<label class="tarpit-cat">
+									<input type="checkbox" class="tarpit-cat__box" data-category="throttle" />
+									<span class="tarpit-cat__text">
+										<strong>Hit the per-IP rate limit</strong>
+										<span class="text-dim">⚠ Also catches ordinary users who went too fast.</span>
+									</span>
+								</label>
+								<label class="tarpit-cat">
+									<input type="checkbox" class="tarpit-cat__box" data-category="throttle_all" />
+									<span class="tarpit-cat__text">
+										<strong>Hit the global throttle-all limit</strong>
+										<span class="text-dim">⚠ Also catches ordinary users.</span>
+									</span>
+								</label>
+								<label class="tarpit-cat">
+									<input type="checkbox" class="tarpit-cat__box" data-category="endpoint_rule" />
+									<span class="tarpit-cat__text">
+										<strong>Hit a per-endpoint rate rule</strong>
+										<span class="text-dim">⚠ Also catches ordinary users.</span>
+									</span>
+								</label>
+								<label class="tarpit-cat">
+									<input type="checkbox" class="tarpit-cat__box" data-category="blocked_endpoint" />
+									<span class="tarpit-cat__text">
+										<strong>Asked for a blocked endpoint</strong>
+										<span class="text-dim">⚠ May catch a caller who just wants that endpoint.</span>
+									</span>
+								</label>
+								<label class="tarpit-cat">
+									<input type="checkbox" class="tarpit-cat__box" data-category="auth_attempt" />
+									<span class="tarpit-cat__text">
+										<strong>Sent a ROBLOSECURITY cookie</strong>
+										<span class="text-dim">Never valid here, but sometimes a genuine mistake.</span>
+									</span>
+								</label>
+						</div>
+					</div>
+
+					<div class="grid grid--kpis">
+						<article class="card kpi">
+							<h3 class="kpi__title">Requests Held</h3>
+							<div class="kpi__value" id="tarpit_count">0</div>
+							<div class="kpi__meta">
+								Skipped (at capacity): <span id="tarpit_skipped">0</span><br />
+								Holding right now: <span id="tarpit_active">0</span> /
+								<span id="tarpit_capacity">0</span>
+							</div>
+						</article>
+						<article class="card kpi" title="How long each held caller waited, on average.">
+							<h3 class="kpi__title">Average Hold</h3>
+							<div class="kpi__value" id="tarpit_avg">—</div>
+							<div class="kpi__meta">
+								Shortest: <span id="tarpit_min">—</span> • Longest: <span id="tarpit_max">—</span><br />
+								Total time wasted: <span id="tarpit_total">—</span>
+							</div>
+						</article>
+						<article
+							class="card kpi"
+							title="Mean seconds between one tarpitted caller's successive requests. If the tarpit is working, the recent window should be LONGER than the lifetime figure."
+						>
+							<h3 class="kpi__title">Time Between Requests</h3>
+							<div class="kpi__value" id="tarpit_gap">—</div>
+							<div class="kpi__meta">
+								Last 15m: <span id="tarpit_gap_15">—</span> • Last hour:
+								<span id="tarpit_gap_60">—</span> • Last 24h: <span id="tarpit_gap_1440">—</span><br />
+								<span id="tarpit_trend" class="text-dim">—</span>
+							</div>
+						</article>
+						<article class="card kpi">
+							<h3 class="kpi__title">Held In Last Hour</h3>
+							<div class="kpi__value" id="tarpit_hour">0</div>
+							<div class="kpi__meta">
+								Last 15m: <span id="tarpit_15">0</span> • Last 24h: <span id="tarpit_24h">0</span><br />
+								Distinct callers held: <span id="tarpit_ip_count">0</span>
+							</div>
+						</article>
+					</div>
+
+					<div class="grid grid--cards">
+						<article class="card">
+							<h3 class="card__title">By Reason</h3>
+							<p class="card__desc">Which kind of refusal is actually being held.</p>
+							<div class="table-wrap">
+								<table id="tarpitCategoryTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">Reason</th>
+											<th scope="col">Held</th>
+											<th scope="col">Skipped</th>
+											<th scope="col">Avg Hold</th>
+											<th scope="col">Time Wasted</th>
+											<th scope="col">Last</th>
+										</tr>
+									</thead>
+									<tbody></tbody>
+								</table>
+							</div>
+						</article>
+						<article class="card">
+							<h3 class="card__title">Who Is Being Held</h3>
+							<p class="card__desc">
+								Per caller. <strong>Avg gap</strong> is the mean time between that IP's requests — the
+								number that tells you whether they are backing off.
+							</p>
+							<div class="table-wrap">
+								<table id="tarpitIpsTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col">IP</th>
+											<th scope="col">Held</th>
+											<th scope="col">Skipped</th>
+											<th scope="col">Avg Gap</th>
+											<th scope="col">Time Wasted</th>
+											<th scope="col">First Seen</th>
+											<th scope="col">Last Seen</th>
+										</tr>
+									</thead>
+									<tbody></tbody>
+								</table>
+							</div>
+						</article>
+					</div>
+				</section>
+
 				<!-- Request Filters (header blocking) -->
 				<section id="section-header-rules" class="section" aria-labelledby="headerRulesHeading">
 					<div class="section__header">
@@ -609,6 +814,98 @@
 								<tbody>
 									<!-- rows from HeaderRules -->
 								</tbody>
+							</table>
+						</div>
+					</div>
+
+					<div class="card" id="filterTester">
+						<h3 class="card__title">Try a filter before you save it</h3>
+						<p class="form__hint">
+							Paste headers (or load a real request captured below), then check them against your saved
+							filters and against a rule you haven't added yet. This runs the
+							<strong>same matching code the proxy runs on every request</strong> — not a preview of it —
+							so if it says blocked, the request is blocked. Nothing is saved or changed by testing.
+						</p>
+						<div class="form__row">
+							<select id="testerSample" class="input input--select" aria-label="Load a captured request">
+								<option value="">Load headers from a recent request…</option>
+							</select>
+							<button id="testerExample" type="button" class="btn btn--outline">Use an example</button>
+						</div>
+						<div class="form__field">
+							<label class="form__label" for="testerHeaders">Sample headers</label>
+							<textarea
+								id="testerHeaders"
+								class="input input--textarea"
+								rows="7"
+								spellcheck="false"
+								placeholder="User-Agent: Roblox/WinInet&#10;Xeno-Fingerprint: abc123&#10;Accept: */*"
+							></textarea>
+							<p class="form__hint">
+								One <code>Name: Value</code> per line. A pasted request line is ignored.
+							</p>
+						</div>
+						<h4 class="card__title">Draft rule (optional)</h4>
+						<p class="form__hint">
+							Leave blank to test only the filters you've already saved. Fill it in to see whether a new
+							rule would catch this request — and
+							<button id="testerCopyFromForm" type="button" class="btn btn--outline btn--sm">
+								copy the rule above
+							</button>
+							to try what you were about to add.
+						</p>
+						<div class="form__row">
+							<input
+								id="testerHeader"
+								class="input"
+								type="text"
+								style="max-width: 170px"
+								placeholder="Header (optional)"
+								aria-label="Draft rule: specific header"
+							/>
+							<select
+								id="testerScope"
+								class="input input--select"
+								style="max-width: 170px"
+								aria-label="Draft rule: match against"
+							>
+								<option value="either">Name or value</option>
+								<option value="key">Header name</option>
+								<option value="value">Header value</option>
+							</select>
+							<select
+								id="testerMode"
+								class="input input--select"
+								style="max-width: 150px"
+								aria-label="Draft rule: match type"
+							>
+								<option value="contains">Contains</option>
+								<option value="exact">Exact</option>
+								<option value="regex">Regex</option>
+							</select>
+							<input
+								id="testerNeedle"
+								class="input"
+								type="text"
+								placeholder="Text to match (e.g. Xeno)"
+							/>
+							<button id="testerRun" type="button" class="btn btn--filled">Test</button>
+						</div>
+						<div id="testerVerdict" class="tester-verdict" hidden>
+							<div class="tester-verdict__headline" id="testerHeadline">—</div>
+							<div class="tester-verdict__detail" id="testerDetail"></div>
+						</div>
+						<div id="testerRulesWrap" class="table-wrap" hidden>
+							<table id="testerRulesTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Result</th>
+										<th scope="col">Rule</th>
+										<th scope="col">Matched Header</th>
+										<th scope="col">Matched Text</th>
+									</tr>
+								</thead>
+								<tbody></tbody>
 							</table>
 						</div>
 					</div>
@@ -972,18 +1269,30 @@
 				<section id="section-proxy" class="section" aria-labelledby="proxyHeading">
 					<div class="section__header">
 						<h2 id="proxyHeading" class="section__title">Proxy Timings</h2>
+						<div class="section__actions">
+							<label class="switch">
+								<input type="checkbox" id="timingSplitToggle" checked />
+								<span class="switch__label">Split successes / failures</span>
+							</label>
+						</div>
 					</div>
 					<div class="card">
 						<p class="form__hint">
-							Latency of each upstream requester (Token / Rotate), with a running total.
+							Latency of each upstream requester (Token / Rotate). <strong>Successes and failures are
+							timed separately</strong> because they measure different things: a failure that took 15s
+							is a timeout, a failure that took 0.2s is Roblox answering “no”. Averaged together,
+							neither is
+							timeout, a failure that took 0.2s is Roblox answering “no”. Averaged together, neither is
+							visible. Failures include connection errors and timeouts, not just non-200 replies.
 						</p>
 						<div class="table-wrap">
 							<table id="methodTimingsTable" class="table">
 								<thead>
 									<tr>
 										<th scope="col">Requester</th>
+										<th scope="col">Outcome</th>
 										<th scope="col">Count</th>
-										<th scope="col">Avg Time (s)</th>
+										<th scope="col">Avg (s)</th>
 										<th scope="col">Min (s)</th>
 										<th scope="col">Max (s)</th>
 										<th scope="col">Last Request</th>
@@ -1000,54 +1309,16 @@
 								<thead>
 									<tr>
 										<th scope="col">Method</th>
+										<th scope="col">Outcome</th>
 										<th scope="col">Count</th>
-										<th scope="col">Avg Time (s)</th>
+										<th scope="col">Avg (s)</th>
 										<th scope="col">Min (s)</th>
 										<th scope="col">Max (s)</th>
-										<th scope="col">Last Request (ts)</th>
+										<th scope="col">Last Request</th>
 									</tr>
 								</thead>
 								<tbody>
-									<tr>
-										<td>GET</td>
-										<td id="pt_get_c">0</td>
-										<td id="pt_get_tot">0</td>
-										<td id="pt_get_min">0</td>
-										<td id="pt_get_max">0</td>
-										<td id="pt_get_last">0</td>
-									</tr>
-									<tr>
-										<td>POST</td>
-										<td id="pt_post_c">0</td>
-										<td id="pt_post_tot">0</td>
-										<td id="pt_post_min">0</td>
-										<td id="pt_post_max">0</td>
-										<td id="pt_post_last">0</td>
-									</tr>
-									<tr>
-										<td>PATCH</td>
-										<td id="pt_patch_c">0</td>
-										<td id="pt_patch_tot">0</td>
-										<td id="pt_patch_min">0</td>
-										<td id="pt_patch_max">0</td>
-										<td id="pt_patch_last">0</td>
-									</tr>
-									<tr>
-										<td>PUT</td>
-										<td id="pt_put_c">0</td>
-										<td id="pt_put_tot">0</td>
-										<td id="pt_put_min">0</td>
-										<td id="pt_put_max">0</td>
-										<td id="pt_put_last">0</td>
-									</tr>
-									<tr>
-										<td>DELETE</td>
-										<td id="pt_delete_c">0</td>
-										<td id="pt_delete_tot">0</td>
-										<td id="pt_delete_min">0</td>
-										<td id="pt_delete_max">0</td>
-										<td id="pt_delete_last">0</td>
-									</tr>
+									<!-- built by JS from ProxyRequestCounts -->
 								</tbody>
 							</table>
 						</div>
@@ -1490,13 +1761,21 @@
 					</div>
 
 					<div class="grid grid--kpis">
-						<article class="card kpi">
+						<article
+							class="card kpi"
+							title="Requests sent to Roblox with our own .ROBLOSECURITY, from this server's static IP."
+						>
 							<h3 class="kpi__title">Token</h3>
-							<div class="kpi__value" id="health_token">OK</div>
+							<div class="kpi__value" id="health_token">—</div>
 							<div class="kpi__meta">
 								Requests: <span id="token_count">0</span> • Rejected:
 								<span id="token_failed">0</span> • Timeouts:
-								<span id="token_timeouts">0</span>
+								<span id="token_timeouts">0</span><br />
+								Last success: <span id="token_last_ok">—</span> • Budget resets in:
+								<span id="token_reset">—</span><br />
+								Last request: <span id="token_last_req">—</span> • Loaded:
+								<span id="token_loaded">0</span>
+								<span id="token_error" class="persist-error"></span>
 							</div>
 						</article>
 
@@ -1512,6 +1791,7 @@
 								<span id="rotate_timeouts">0</span><br />
 								Last success: <span id="rotate_last_ok">—</span> • Resets in:
 								<span id="rotate_reset">—</span><br />
+								Last request: <span id="rotate_last_req">—</span><br />
 								Proxy: <span id="rotate_proxy" class="persist-file">—</span>
 								<span id="rotate_error" class="persist-error"></span>
 							</div>
@@ -1526,11 +1806,17 @@
 							</div>
 						</article>
 
-						<article class="card kpi">
-							<h3 class="kpi__title">Worker Uptime</h3>
+						<article
+							class="card kpi"
+							title="How long the service has been up. Individual workers are recycled underneath it, which is why their own uptimes differ — see the Workers table below."
+						>
+							<h3 class="kpi__title">Service Uptime</h3>
 							<div class="kpi__value" id="health_uptime">—</div>
 							<div class="kpi__meta">
-								This worker started <span id="health_started">—</span>
+								Started <span id="health_started">—</span><br />
+								Host up: <span id="health_host_uptime">—</span> • Workers:
+								<span id="health_worker_count">—</span><br />
+								Fleet memory: <span id="health_fleet_rss">—</span>
 							</div>
 						</article>
 
@@ -1568,6 +1854,34 @@
 								<span id="persist_oversize" class="persist-error" hidden></span>
 							</div>
 						</article>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Workers</h3>
+						<p class="form__hint">
+							Every gunicorn worker currently serving traffic. gunicorn recycles a worker once it
+							has served <strong id="workerMaxRequests">2000</strong> requests, so their ages differ
+							by design — that's what made a single “worker uptime” reading jump around. A worker
+							whose memory climbs while
+							the others stay flat is the one worth looking at.
+						</p>
+						<div class="table-wrap">
+							<table id="workersTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">PID</th>
+										<th scope="col">Uptime</th>
+										<th scope="col">Memory</th>
+										<th scope="col">Threads</th>
+										<th scope="col">Requests</th>
+										<th scope="col">Last Heartbeat</th>
+									</tr>
+								</thead>
+								<tbody>
+									<!-- built by JS from WorkerFleet -->
+								</tbody>
+							</table>
+						</div>
 					</div>
 				</section>
 

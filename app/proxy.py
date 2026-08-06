@@ -260,6 +260,11 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
     for _ in range(2):  # original attempt + at most one CSRF retry
         if csrf is not None:
             headers["x-csrf-token"] = csrf
+        # Timed here rather than relying on req.elapsed, because the attempts
+        # worth timing most are the ones that never produce a response: a
+        # 15-second timeout is the single slowest thing this proxy does, and
+        # leaving it out of the latency stats is what made "failures" look fast.
+        started = time.monotonic()
         try:
             req = requests.request(
                 method,
@@ -272,6 +277,7 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
                 timeout=_timeout(),
             )
         except requests.Timeout:
+            elapsed = time.monotonic() - started
             diagnostics.log_request(method.upper(), False)
             diagnostics.log_reason(True)
             diagnostics.log_request_failure(choice, "timeout", "Upstream timed out", endpoint)
@@ -281,6 +287,9 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
             # error does. Omitting it made those two numbers freeze during an
             # upstream outage -- precisely when they are being watched.
             diagnostics.log_method(choice, False)
+            diagnostics.log_method_error(choice, "Upstream timed out")
+            diagnostics.log_method_timing(choice, elapsed, success=False)
+            diagnostics.log_proxy_request(method.upper(), elapsed, success=False)
             if token is not None:
                 diagnostics.update_token(token, used=True)  # keep Uses in sync with method Requests
             if choice == "rotate":
@@ -288,9 +297,13 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
                 diagnostics.log_rotate_health(False, "timeout")
             return (False, True, None)  # transient → fall through to next method
         except requests.RequestException as e:
+            elapsed = time.monotonic() - started
             diagnostics.log_request(method.upper(), False)
             diagnostics.log_reason(True)
             diagnostics.log_request_failure(choice, "error", type(e).__name__, endpoint, f"{type(e).__name__}: {e}")
+            diagnostics.log_method_error(choice, f"{type(e).__name__}: {e}")
+            diagnostics.log_method_timing(choice, elapsed, success=False)
+            diagnostics.log_proxy_request(method.upper(), elapsed, success=False)
             if choice == "rotate":
                 # Proxy/connection error talking to DataImpulse — count + fall back.
                 routing.record_rotate_result(False)
@@ -301,16 +314,17 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
             return (False, True, None)  # connection error → fall back to the other method
 
         # Got an HTTP response.
+        ok = req.status_code == 200
         if choice == "rotate":
             routing.record_rotate_result(True)  # the proxy itself worked
             diagnostics.log_rotate_health(True)
         if token is not None:
             diagnostics.update_token(token, used=True)
-        diagnostics.log_method(choice, req.status_code == 200)
-        diagnostics.log_method_timing(choice, req.elapsed.total_seconds())
+        diagnostics.log_method(choice, ok)
+        diagnostics.log_method_timing(choice, req.elapsed.total_seconds(), success=ok)
         diagnostics.log_status_code(req.status_code)
-        diagnostics.log_request(method.upper(), req.status_code == 200)
-        diagnostics.log_proxy_request(method.upper(), req.elapsed.total_seconds())
+        diagnostics.log_request(method.upper(), ok)
+        diagnostics.log_proxy_request(method.upper(), req.elapsed.total_seconds(), success=ok)
 
         if req.status_code == 200:
             return (True, False, req.text)
@@ -320,7 +334,10 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
             csrf = req.headers.get("x-csrf-token")
             continue
         # Any non-200: record the reason so the admin can diagnose this requester.
+        # Reached only AFTER the CSRF branch, so a routine CSRF handshake never
+        # shows up on the health card as this requester's "last error".
         diagnostics.log_request_failure(choice, req.status_code, _failure_reason(req.status_code), endpoint, req.text)
+        diagnostics.log_method_error(choice, _failure_reason(req.status_code))
         if req.status_code == 429:
             # Rate-limited. For the token, drop it for revalidation. Either way,
             # fall through and let the other method try (no user-facing retry storm).

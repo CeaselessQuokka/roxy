@@ -14,10 +14,12 @@ import proxy
 import re
 import runtime
 import storage
+import tarpit
 import throttle
 import time
 import traceback
 import two_fa
+import workers
 from flask import Flask, request, render_template, session, redirect, url_for, send_from_directory, jsonify
 from markupsafe import escape
 from werkzeug.exceptions import HTTPException
@@ -107,6 +109,7 @@ _CSP = (
 
 @app.after_request
 def add_security_headers(resp):
+    workers.count_request()  # Feeds the fleet view (a worker recycles at max_requests).
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -630,6 +633,11 @@ def admin_clear_data():
         names = diagnostics.CLEAR_TARGETS.get(target)
     if not names:
         return jsonify(f"Unknown clear target: {target}"), 400
+    if target in ("tarpit", "all"):
+        # The per-IP arrival times live in the shared tarpit file, not in the
+        # stats. Leaving them behind would make the first request after a clear
+        # report a gap measured from before it.
+        tarpit.reset()
     ok = diagnostics.clear_stats(names)
     if ok:
         return jsonify("Cleared everything" if target == "all" else "Cleared"), 200
@@ -729,6 +737,59 @@ def admin_add_header_rule():
     )
     status = 200 if ok else 400
     return jsonify({"Message": message, "HeaderRules": runtime.get_header_rules()}), status
+
+
+def _parse_header_text(raw: str) -> list:
+    """Parse pasted "Name: Value" lines into (name, value) pairs.
+
+    Deliberately forgiving — this is a scratchpad the admin pastes real captured
+    headers into, so a leading "GET /path HTTP/1.1" request line, blank lines and
+    stray whitespace are skipped rather than rejected.
+    """
+    pairs = []
+    for line in str(raw or "").splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue  # Request line / junk.
+        name, _, value = line.partition(":")
+        name = name.strip()
+        if name:
+            pairs.append((name[:200], value.strip()[:2000]))
+    return pairs
+
+
+MAX_TEST_HEADERS = 200
+
+
+@app.route("/admin/headers/test", methods=["POST"], endpoint="admin_test_header_rule")
+@requires_admin
+def admin_test_header_rule():
+    """Dry-run the request filters against sample headers, changing nothing.
+
+    Runs runtime.explain_header_rules, which evaluates through the very function
+    the proxy uses on every request — so "would this be blocked?" is answered by
+    the real decision, not by a description of it. A draft rule can be tested
+    before it is saved, which is the point: you find out whether a filter works
+    (and what else it would catch) while you can still change it.
+    """
+    data = get_json_dict()
+    if data is None:
+        return jsonify({"Message": "Invalid request"}), 400
+    raw = data.get("headers")
+    if isinstance(raw, dict):
+        pairs = [(str(k)[:200], str(v)[:2000]) for k, v in raw.items()]
+    elif isinstance(raw, list):
+        pairs = [(str(p[0])[:200], str(p[1])[:2000]) for p in raw if isinstance(p, (list, tuple)) and len(p) >= 2]
+    else:
+        pairs = _parse_header_text(raw)
+    if not pairs:
+        return jsonify({"Message": "Add at least one header to test against"}), 400
+    if len(pairs) > MAX_TEST_HEADERS:
+        return jsonify({"Message": f"Too many headers (max {MAX_TEST_HEADERS})"}), 400
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else None
+    result = runtime.explain_header_rules(pairs, draft=draft)
+    result["Headers"] = [{"Name": name, "Value": value} for name, value in pairs]
+    return jsonify(result), 200
 
 
 @app.route("/admin/headers/rule/clear", methods=["POST"], endpoint="admin_clear_header_rule")
@@ -976,6 +1037,17 @@ def proxy_page(dst: str):
     # Token safety budget — so the real routing behavior is still exercised.
     bypass = runtime.is_throttle_bypassed(ip)
 
+    def hold(category: str):
+        """Sit on a refusal before answering it (see tarpit.py).
+
+        Placed immediately before the error is built, so the caller receives the
+        byte-identical response they always did — just later. Bypass IPs are
+        never held: that allowlist is how the admin tests against their own
+        server, and a 20-second wait per probe would make that useless.
+        """
+        if not bypass:
+            tarpit.hold(ip, category)
+
     # Global throttle-all: a softer alternative to a full pause. Every IP is
     # rate-limited to a configurable N requests per P seconds; requests within
     # that budget proceed normally (still subject to the regular per-IP and
@@ -984,10 +1056,12 @@ def proxy_page(dst: str):
         allowed, retry_in = throttle.check_global_throttle(ip)
         if not allowed:
             diagnostics.log_throttle_all_drop()
+            hold("throttle_all")
             resp = jsonify(runtime.throttle_all_message())
             return _with_throttle_headers(resp, ip, Roxy_Throttle_Reset=retry_in, Roxy_Global_Throttled="True"), 429
 
     if not bypass and throttle.is_throttled(ip):
+        hold("throttle")
         return throttled_response(ip)
 
     if dst in path_ignore_set:
@@ -996,11 +1070,13 @@ def proxy_page(dst: str):
 
     if dst != escape(dst):
         diagnostics.log_exploit_attempt(ip, f'Invalid URL: "{dst}"', user_agent)
+        hold("probe")
         resp = jsonify("Invalid URL")
         return _with_throttle_headers(resp, ip), 404
 
     if not validate_url(dst):
         diagnostics.log_exploit_attempt(ip, f'Non-Roblox URL: "{dst}"', user_agent)
+        hold("probe")
         resp = jsonify("Not a Roblox URL")
         return _with_throttle_headers(resp, ip), 404
 
@@ -1009,6 +1085,7 @@ def proxy_page(dst: str):
     auth_attempt = _detect_auth_attempt(request.headers)
     if auth_attempt:
         diagnostics.log_exploit_attempt(ip, f"Sent a ROBLOSECURITY token ({auth_attempt})", user_agent)
+        hold("auth_attempt")
         resp = jsonify("Requests requiring authentication are not allowed with this proxy.")
         return _with_throttle_headers(resp, ip), 400
 
@@ -1029,10 +1106,12 @@ def proxy_page(dst: str):
             last_ip=ip,
         )
         reset_in = runtime.get_setting("throttle_reset_duration", config.THROTTLE_RESET_DURATION)
+        hold("header_rule")
         return throttled_response(ip, reset_in=reset_in)
 
     if runtime.is_endpoint_blocked(dst):
         diagnostics.log_blocked_endpoint(dst, request.method, ip, runtime.get_matching_block(dst))
+        hold("blocked_endpoint")
         resp = jsonify("This endpoint is currently blocked.")
         return _with_throttle_headers(resp, ip, Roxy_Blocked="True"), 403
 
@@ -1040,6 +1119,7 @@ def proxy_page(dst: str):
         endpoint_allowed, endpoint_retry, endpoint_pattern = throttle.check_endpoint_limit(ip, dst)
         if not endpoint_allowed:
             diagnostics.log_rate_limited_endpoint(dst, request.method, ip, endpoint_pattern)
+            hold("endpoint_rule")
             resp = jsonify(f"This endpoint is rate-limited for you; try again in {endpoint_retry} seconds.")
             resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
             resp.headers["Roxy-Throttle-Reset"] = endpoint_retry

@@ -90,6 +90,13 @@ THROTTLE_FILE = os.environ.get("ROXY_THROTTLE_FILE", "/etc/roxy/roxy_throttle.js
 # Tiny shared file for cross-worker singletons that aren't per-request (e.g. email
 # send de-duplication, so 4 workers don't each send the same alert).
 COORD_FILE = os.environ.get("ROXY_COORD_FILE", "/etc/roxy/roxy_coord.json")
+# Shared tarpit state: the concurrency leases that stop held requests from eating
+# every worker thread, plus the per-IP arrival times used to measure how often a
+# tarpitted caller comes back. Separate file, same flock discipline.
+TARPIT_FILE = os.environ.get("ROXY_TARPIT_FILE", "/etc/roxy/roxy_tarpit.json")
+# Shared worker registry: each gunicorn worker heartbeats its pid/uptime/memory
+# here so the dashboard can show the fleet instead of whichever worker answered.
+WORKERS_FILE = os.environ.get("ROXY_WORKERS_FILE", "/etc/roxy/roxy_workers.json")
 # Hard cap on distinct IPs tracked in the throttle file so a spoofed-IP flood
 # can't bloat it; the oldest (least-recently-seen) entry is evicted past this.
 MAX_TRACKED_THROTTLE_IPS = 20000
@@ -128,6 +135,50 @@ REQUEST_TIMEOUT = 15  # In seconds, how long to wait on an upstream Roblox reque
 # threshold.) Tunable live from the dashboard Settings section.
 TOKEN_BUDGET_REQUESTS = 95
 TOKEN_BUDGET_WINDOW = 65  # In seconds.
+
+# --- Tarpit (slow-drip refusals) ---------------------------------------------
+# A caller we have already decided to refuse can be made to WAIT for its error
+# instead of getting it instantly. A synchronous client (which is what exploit
+# HTTP wrappers usually are) can then only make one request per hold, so the
+# hold is itself a rate limiter — the refusal costs them time instead of costing
+# us a hot retry loop.
+#
+# The danger is self-DoS: gunicorn runs `workers x threads` concurrent slots
+# (4 x 4 = 16 today) and a held request occupies one for the whole hold, so the
+# concurrency cap below is not optional. Past the cap, callers get the same
+# instant refusal they got before the tarpit existed.
+#
+# The hold also has to fit inside the timeouts wrapped around it: gunicorn kills
+# a worker whose request exceeds `timeout` (90s, see gunicorn.conf.py) and nginx
+# gives up at proxy_read_timeout (100s, see Tooling/nginx-roxy.conf). The 55s
+# ceiling on the setting keeps the longest possible hold comfortably under both.
+TARPIT_MIN_SECONDS = 8  # Randomised per request so the delay can't be learned...
+TARPIT_MAX_SECONDS = 20  # ...and short enough to leave the request budget alone.
+TARPIT_MAX_CONCURRENT = 6  # Held requests allowed at once, FLEET-wide. Must stay well under workers*threads.
+TARPIT_SLOT_GRACE = 15  # Seconds a lease may outlive its hold before it's reclaimed (worker killed mid-hold).
+MAX_TARPIT_IP_RECORDS = 200  # Distinct tarpitted IPs kept for the per-IP breakdown.
+MAX_TARPIT_ARRIVALS = 2000  # Distinct IPs whose last arrival time is kept (for the gap measurement).
+TARPIT_HISTORY_MINUTES = 1500  # Per-minute hold buckets retained (~25h), for the request-frequency trend.
+# Which refusals may be held. Each is an independent on/off setting
+# (tarpit_on_<name>); see runtime._settings for the defaults and why.
+TARPIT_CATEGORIES = (
+    "header_rule",  # Caught by a Request Filter — traffic you explicitly fingerprinted.
+    "probe",  # Not a Roblox URL / malformed — never a legitimate caller.
+    "throttle",  # Ordinary per-IP rate limit. Also catches real users; off by default.
+    "throttle_all",  # The global throttle-all limit. Also catches real users; off by default.
+    "endpoint_rule",  # A per-endpoint rate rule.
+    "blocked_endpoint",  # A blocked endpoint.
+    "auth_attempt",  # Tried to smuggle a ROBLOSECURITY cookie.
+)
+
+# --- Worker registry ---------------------------------------------------------
+# Each worker writes a heartbeat so the dashboard can show the whole fleet. A
+# single worker's uptime is misleading on its own: gunicorn recycles workers at
+# max_requests, so the number visibly jumps around depending on which worker
+# answered the poll.
+WORKER_HEARTBEAT_INTERVAL = 10  # In seconds, how often a worker refreshes its registry entry.
+WORKER_STALE_AFTER = 45  # In seconds without a heartbeat before a worker is considered gone.
+MAX_TRACKED_WORKERS = 64  # Hard ceiling on registry entries.
 
 # --- Global throttle-all defaults ---
 # When the admin enables "throttle all", each IP is limited to this many requests

@@ -1446,3 +1446,81 @@ body {
 	opacity: 0.7;
 	cursor: progress;
 }
+
+/* =============================
+   TARPIT CATEGORY PICKER
+   ============================= */
+/* Each refusal type is its own switch, with the collateral-damage warning
+   attached to the ones that can also catch ordinary users. */
+.tarpit-cats {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+	gap: var(--pad-2);
+	margin-top: var(--pad-2);
+}
+.tarpit-cat {
+	display: flex;
+	align-items: flex-start;
+	gap: var(--pad-2);
+	padding: var(--pad-2);
+	border: 1px solid var(--color-outline);
+	border-radius: var(--radius-sm);
+	background: var(--color-surface2);
+	cursor: pointer;
+}
+.tarpit-cat:hover {
+	background: var(--color-hover);
+}
+.tarpit-cat input {
+	margin-top: 2px;
+	flex: none;
+}
+.tarpit-cat__text {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	font-size: var(--fs-sm);
+}
+.tarpit-cat__text .text-dim {
+	font-size: var(--fs-xs);
+}
+
+/* =============================
+   REQUEST-FILTER TESTER VERDICT
+   ============================= */
+/* The whole point of the tester is a yes/no you can read at a glance, so the
+   verdict is colour-coded rather than being another row in a table. */
+.tester-verdict {
+	margin-top: var(--pad-3);
+	padding: var(--pad-3);
+	border-radius: var(--radius-sm);
+	border: 1px solid var(--color-outline-strong);
+	background: var(--color-surface2);
+}
+.tester-verdict--blocked {
+	border-color: color-mix(in oklab, var(--color-danger) 60%, var(--color-outline) 40%);
+	background: color-mix(in oklab, var(--color-danger) 8%, var(--color-surface2) 92%);
+}
+.tester-verdict--allowed {
+	border-color: color-mix(in oklab, var(--color-success) 50%, var(--color-outline) 50%);
+	background: color-mix(in oklab, var(--color-success) 8%, var(--color-surface2) 92%);
+}
+.tester-verdict__headline {
+	font-size: var(--fs-lg);
+	font-weight: 700;
+	margin-bottom: var(--pad-1);
+}
+.tester-verdict__detail {
+	font-size: var(--fs-sm);
+	color: var(--color-text-dim);
+	display: flex;
+	flex-direction: column;
+	gap: var(--pad-1);
+}
+.tester-verdict__detail code {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	background: var(--color-surface3);
+	padding: 1px 5px;
+	border-radius: 5px;
+	word-break: break-all;
+}

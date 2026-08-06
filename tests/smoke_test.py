@@ -26,6 +26,8 @@ os.environ["ROXY_STATE_FILE"] = os.path.join(sandbox, "roxy_state.json")
 os.environ["ROXY_ROUTING_FILE"] = os.path.join(sandbox, "roxy_routing.json")
 os.environ["ROXY_THROTTLE_FILE"] = os.path.join(sandbox, "roxy_throttle.json")
 os.environ["ROXY_COORD_FILE"] = os.path.join(sandbox, "roxy_coord.json")
+os.environ["ROXY_TARPIT_FILE"] = os.path.join(sandbox, "roxy_tarpit.json")
+os.environ["ROXY_WORKERS_FILE"] = os.path.join(sandbox, "roxy_workers.json")
 # Rotation proxy is configured from the start (only "token"/"rotate" methods
 # exist now, so most fallback tests need Rotate available); specific sections
 # temporarily remove/restore this file to test the disabled/unavailable cases.
@@ -80,6 +82,12 @@ mail.try_send = fake_try_send
 
 import index  # noqa: E402  (imports the full app: proxy, throttle, diagnostics, ...)
 import config  # noqa: E402
+import runtime  # noqa: E402
+
+# The tarpit ships ON (probes and filter-blocked requests are held for 8-20s).
+# Every probe in this suite would otherwise sit for that long, so it is disabled
+# here and re-enabled with sub-second holds by its own section at the bottom.
+runtime.set_setting("tarpit_enabled", 0)
 
 app = index.app
 app.config.update(SESSION_COOKIE_SECURE=False, TESTING=True)
@@ -1950,6 +1958,228 @@ check(
 for leftover in os.listdir(sandbox):
     if ".oversize-" in leftover:
         os.remove(os.path.join(sandbox, leftover))
+
+print("== Tarpit: refusals are held open, capped, and measured ==")
+import tarpit as tarpit_module  # noqa: E402
+import threading  # noqa: E402
+
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "tarpit"})
+for key, value in (("tarpit_enabled", 1), ("tarpit_min_seconds", 1), ("tarpit_max_seconds", 1)):
+    runtime.set_setting(key, value)
+TARPIT_IP = {"X-Forwarded-For": "10.44.0.1"}
+
+started = time.time()
+r = api_client.get("/not-a-roblox-url-at-all", headers=TARPIT_IP)
+held_for = time.time() - started
+check("A probe still gets its normal 404", r.status_code == 404, r.status_code)
+check("...but only after being held", held_for >= 0.9, f"{held_for:.2f}s")
+check("The response says nothing about being held", not any("held" in name.lower() for name in r.headers.keys()))
+
+api_client.get("/still-not-roblox", headers=TARPIT_IP)
+stats = diag_module.tarpit_stats
+check("Both holds were counted", stats["Count"] >= 2, stats["Count"])
+check("Time wasted is accumulated", stats["TotalHeld"] >= 1.8, stats["TotalHeld"])
+check("The interval between their requests is measured", stats["Gaps"] >= 1, stats["Gaps"])
+check("Holds are attributed to the category that caused them", "probe" in stats["Categories"], stats["Categories"])
+check("The caller is tracked individually", "10.44.0.1" in diag_module.tarpit_ips, list(diag_module.tarpit_ips))
+
+# A category that is switched off must not be held at all.
+runtime.set_setting("tarpit_on_throttle", 0)
+runtime.set_setting("allowed_requests_per_minute", 3)  # Earlier sections may have raised this.
+before = diag_module.tarpit_stats["Count"]
+for _ in range(8):
+    api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.44.0.9"})
+started = time.time()
+r = api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.44.0.9"})
+check("A throttled caller gets the usual 429", r.status_code == 429, r.status_code)
+check("A disabled category is answered instantly", time.time() - started < 0.5, f"{time.time() - started:.2f}s")
+check("...and is not counted as a hold", diag_module.tarpit_stats["Count"] == before, diag_module.tarpit_stats["Count"])
+
+# The safety valve: holds must never be able to occupy every worker thread.
+runtime.set_setting("tarpit_max_concurrent", 1)
+runtime.set_setting("tarpit_min_seconds", 2)
+runtime.set_setting("tarpit_max_seconds", 2)
+skipped_before = diag_module.tarpit_stats["Skipped"]
+outcomes = []
+threads = [
+    threading.Thread(target=lambda n: outcomes.append(tarpit_module.hold(f"10.44.1.{n}", "probe")), args=(n,))
+    for n in range(4)
+]
+wall = time.time()
+[t.start() for t in threads]
+[t.join() for t in threads]
+wall = time.time() - wall
+check("Only one request is held when the cap is 1", sum(1 for held in outcomes if held > 0) == 1, outcomes)
+check("The rest are refused instantly rather than queueing", wall < 3.5, f"{wall:.2f}s")
+check("Over-capacity refusals are counted separately", diag_module.tarpit_stats["Skipped"] == skipped_before + 3)
+check("No slot is leaked once the holds finish", tarpit_module.active_holds() == 0, tarpit_module.active_holds())
+
+# A worker killed mid-hold must not strand its slot forever.
+tarpit_module._store.update(lambda data: data.setdefault("Slots", {}).update({"dead-worker": time.time() - 1}))
+check("An expired lease is not counted as active", tarpit_module.active_holds() == 0)
+check("...and is reclaimed by the next admission", tarpit_module.hold("10.44.2.1", "probe") > 0)
+
+# If the shared file is unavailable, LockedJSON degrades to a throwaway dict —
+# which would make every worker think it holds the only slot. Fail closed.
+import lockfile as lockfile_module  # noqa: E402
+
+_real_write = lockfile_module.LockedJSON._write
+lockfile_module.LockedJSON._write = lambda self, data: (_ for _ in ()).throw(OSError("disk gone"))
+skipped_before = diag_module.tarpit_stats["Skipped"]
+degraded = tarpit_module.hold("10.44.2.9", "probe")
+lockfile_module.LockedJSON._write = _real_write
+check("With shared state unavailable, nothing is held", degraded == 0.0, degraded)
+check("...and the refusal is counted, not silently dropped", diag_module.tarpit_stats["Skipped"] == skipped_before + 1)
+check("...and holding resumes once it recovers", tarpit_module.hold("10.44.2.8", "probe") > 0)
+
+# The admin's own bypass IP must never be tarpitted (it is how they test).
+client.post("/admin/throttle/bypass", headers=IP_MAIN, json={"ip": "10.44.3.1"})
+runtime.set_setting("tarpit_max_concurrent", 6)
+started = time.time()
+api_client.get("/not-roblox-either", headers={"X-Forwarded-For": "10.44.3.1"})
+check("A bypass IP is answered instantly", time.time() - started < 0.5, f"{time.time() - started:.2f}s")
+client.post("/admin/throttle/bypass/remove", headers=IP_MAIN, json={"ip": "10.44.3.1"})
+
+r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+diag = r.get_json()
+check("Dashboard sees live tarpit capacity", diag.get("Tarpit", {}).get("MaxConcurrent") == 6, diag.get("Tarpit"))
+check("Dashboard sees which categories are armed", "probe" in diag.get("Tarpit", {}).get("Categories", []))
+check("Dashboard gets the arrival-rate windows", len(diag.get("TarpitRates", [])) == 3, diag.get("TarpitRates"))
+check("Tarpit totals reach the dashboard", diag.get("TarpitStats", {}).get("Count", 0) >= 2, diag.get("TarpitStats"))
+
+r = client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "tarpit"})
+check("Tarpit stats can be cleared -> 200", r.status_code == 200, r.status_code)
+check("...and the counters reset", diag_module.tarpit_stats["Count"] == 0, diag_module.tarpit_stats)
+check("...including the shared arrival times", tarpit_module._store.read() == {}, tarpit_module._store.read())
+runtime.set_setting("tarpit_enabled", 0)
+
+print("== Proxy timings separate successes from failures ==")
+client.post("/admin/data/clear", headers=IP_MAIN, json={"target": "proxy_timings"})
+reset_routing()
+
+
+def upstream_404(method, url, headers=None, params=None, data=None, cookies=None, timeout=None, proxies=None):
+    return FakeUpstreamResponse(status=404, text='{"errors":[]}')
+
+
+api_client.get("/games.roblox.com/v1/fast", headers={"X-Forwarded-For": "10.55.0.1"})
+proxy_module.requests.request = upstream_404
+api_client.get("/games.roblox.com/v1/missing", headers={"X-Forwarded-For": "10.55.0.2"})
+proxy_module.requests.request = fake_upstream  # restore 200s
+
+diag = client.get("/admin/diagnostics?flush=1", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+get_row = diag.get("ProxyRequestCounts", {}).get("GET", {})
+check("A successful GET lands in the Success bucket", get_row.get("Success", {}).get("Count", 0) >= 1, get_row)
+check("A failed GET lands in the Failed bucket", get_row.get("Failed", {}).get("Count", 0) >= 1, get_row)
+check(
+    "The combined row still totals both",
+    get_row.get("Count", 0) >= get_row.get("Success", {}).get("Count", 0) + get_row.get("Failed", {}).get("Count", 0),
+    get_row,
+)
+totals = diag.get("MethodTimings", {})
+split = any(m.get("Success", {}).get("Count", 0) or m.get("Failed", {}).get("Count", 0) for m in totals.values())
+check("Per-requester timings are split the same way", split, totals)
+
+print("== Token health reports liveness, not just counters ==")
+api_client.get("/games.roblox.com/v1/live", headers={"X-Forwarded-For": "10.55.0.3"})
+diag = client.get("/admin/diagnostics?flush=1", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+methods = diag.get("MethodStats", {})
+live = [m for m in methods.values() if m.get("Requests")]
+check("A requester records when it last ran", any(m.get("LastRequestTime") for m in live), methods)
+check("A requester records when it last succeeded", any(m.get("LastSuccessAt") for m in live), methods)
+proxy_module.requests.request = failing_upstream  # returns 500
+api_client.get("/games.roblox.com/v1/broken", headers={"X-Forwarded-For": "10.55.0.4"})
+proxy_module.requests.request = fake_upstream
+diag = client.get("/admin/diagnostics?flush=1", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+methods = diag.get("MethodStats", {})
+check(
+    "A requester records why it last failed",
+    any("500" in str(m.get("LastError", "")) for m in methods.values()),
+    {k: v.get("LastError") for k, v in methods.items()},
+)
+
+print("== Worker fleet is reported instead of one worker's uptime ==")
+import workers as workers_module  # noqa: E402
+
+workers_module.heartbeat()
+diag = client.get("/admin/diagnostics?flush=1", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+fleet = diag.get("WorkerFleet", {})
+check("The fleet lists at least this worker", fleet.get("Count", 0) >= 1, fleet)
+check("Service uptime is reported separately from worker uptime", fleet.get("ServiceUptime", 0) > 0, fleet)
+check("Service uptime survives a worker restarting", fleet.get("ServiceStartedAt", 0) > 0, fleet)
+row = (fleet.get("Workers") or [{}])[0]
+check("Each worker reports its pid", row.get("Pid"), row)
+check("Each worker reports its memory", row.get("RSS", 0) > 0, row)
+check("Each worker reports its own uptime", row.get("Uptime", 0) >= 0, row)
+check("Each worker reports how many requests it has served", row.get("Requests", 0) > 0, row)
+service_started = fleet.get("ServiceStartedAt")
+workers_module.heartbeat()
+again = workers_module.get_state()
+check("Service start time is stable across heartbeats", again.get("ServiceStartedAt") == service_started)
+# A stale worker must drop out of the fleet rather than lingering forever.
+workers_module._registry.update(
+    lambda data: data.setdefault("Workers", {}).update(
+        {"999999": {"Pid": 999999, "StartedAt": time.time() - 900, "LastSeen": time.time() - 600, "RSS": 1}}
+    )
+)
+check("A worker that stopped heartbeating is not shown", all(w["Pid"] != 999999 for w in workers_module.get_state()["Workers"]))
+workers_module.heartbeat()
+check("...and is pruned from the registry", "999999" not in workers_module._registry.read().get("Workers", {}))
+
+print("== Request filters can be dry-run before they are saved ==")
+for existing in list(runtime.get_header_rules()):
+    client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": existing})
+client.post("/admin/headers/rule", headers=IP_MAIN, json={"scope": "either", "mode": "contains", "needle": "Xeno"})
+SAMPLE = "User-Agent: Roblox/WinInet\nXeno-Fingerprint: abc123\nAccept: */*"
+
+r = client.post("/admin/headers/test", headers={**IP_MAIN, "Accept": "application/json"}, json={"headers": SAMPLE})
+result = r.get_json()
+check("Testing a filter -> 200", r.status_code == 200, r.status_code)
+check("A matching sample is reported as blocked", result.get("Blocked") is True, result)
+check("...naming the header that tripped it", result.get("BlockedBy", {}).get("MatchedHeader") == "Xeno-Fingerprint")
+check("...and which side matched", result.get("BlockedBy", {}).get("MatchedField") == "key", result.get("BlockedBy"))
+check("Every saved rule is reported, matching or not", len(result.get("Rules", [])) >= 1, result.get("Rules"))
+
+r = client.post(
+    "/admin/headers/test",
+    headers={**IP_MAIN, "Accept": "application/json"},
+    json={"headers": {"User-Agent": "Roblox/WinInet"}},
+)
+check("A clean sample is reported as allowed", r.get_json().get("Blocked") is False, r.get_json())
+
+# The point of the tester: try a rule BEFORE saving it.
+r = client.post(
+    "/admin/headers/test",
+    headers={**IP_MAIN, "Accept": "application/json"},
+    json={"headers": {"User-Agent": "Roblox/WinInet"}, "draft": {"header": "User-Agent", "needle": "wininet"}},
+)
+draft = r.get_json().get("Draft", {})
+check("An unsaved draft rule is evaluated", draft.get("Matched") is True, draft)
+check("Draft matching is case-insensitive, like the real thing", draft.get("MatchedText") == "Roblox/WinInet", draft)
+check("Testing a draft does not save it", "user-agent|value|contains|wininet" not in runtime.get_header_rules())
+
+r = client.post(
+    "/admin/headers/test",
+    headers={**IP_MAIN, "Accept": "application/json"},
+    json={"headers": {"A": "b"}, "draft": {"mode": "regex", "needle": "([unclosed"}},
+)
+check("An invalid draft regex is explained, not crashed", r.get_json().get("Draft", {}).get("Valid") is False)
+
+r = client.post("/admin/headers/test", headers={**IP_MAIN, "Accept": "application/json"}, json={"headers": ""})
+check("Testing with no headers -> 400", r.status_code == 400, r.status_code)
+r = client.post(
+    "/admin/headers/test",
+    headers={**IP_MAIN, "Accept": "application/json"},
+    json={"headers": "GET /v1/users HTTP/1.1\n\nUser-Agent: Xeno-Loader"},
+)
+check("A pasted request line is skipped rather than rejected", r.get_json().get("HeaderCount") == 1, r.get_json())
+check("...and the real header is still matched", r.get_json().get("Blocked") is True, r.get_json())
+
+# The tester must agree with the proxy, or it is worse than useless.
+r = api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.66.0.1", "Xeno-Fingerprint": "abc"})
+check("A sample the tester calls blocked is blocked for real", r.status_code == 429, r.status_code)
+for existing in list(runtime.get_header_rules()):
+    client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": existing})
 
 print(f"\n{'=' * 40}\nRESULT: {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

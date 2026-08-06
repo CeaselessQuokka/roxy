@@ -160,6 +160,31 @@ _settings = {
     "rotate_enabled": _setting(1, 0, 1, "int"),
     "rotate_cooldown": _setting(config.ROTATE_COOLDOWN, 0, 86400, "int"),
     "rotate_max_failures": _setting(config.ROTATE_MAX_FAILURES, 1, 100, "int"),
+    # --- Tarpit -------------------------------------------------------------
+    # Hold a refusal open instead of answering instantly, so a synchronous
+    # caller can only make one request per hold. See tarpit.py.
+    "tarpit_enabled": _setting(1, 0, 1, "int"),
+    "tarpit_min_seconds": _setting(config.TARPIT_MIN_SECONDS, 0, 55, "int"),
+    # Ceiling of 55s: gunicorn kills a worker whose request runs past its 90s
+    # timeout, and nginx gives up at 100s. A longer hold would take out the
+    # worker rather than the caller.
+    "tarpit_max_seconds": _setting(config.TARPIT_MAX_SECONDS, 1, 55, "int"),
+    # THE safety valve. gunicorn serves workers*threads requests at once (16) and
+    # a held request owns one for its whole hold, so this must stay well under
+    # that or the tarpit starves real traffic instead of the exploiter.
+    "tarpit_max_concurrent": _setting(config.TARPIT_MAX_CONCURRENT, 0, 64, "int"),
+    # Which refusals may be held, one switch each. The two that are ON by default
+    # can only catch traffic that is already unambiguously not a real user: one
+    # you fingerprinted yourself with a Request Filter, and one that wasn't even
+    # a Roblox URL. The rest are OFF because they also catch ordinary callers who
+    # merely exceeded a rate limit, and holding those hurts real users.
+    "tarpit_on_header_rule": _setting(1, 0, 1, "int"),
+    "tarpit_on_probe": _setting(1, 0, 1, "int"),
+    "tarpit_on_throttle": _setting(0, 0, 1, "int"),
+    "tarpit_on_throttle_all": _setting(0, 0, 1, "int"),
+    "tarpit_on_endpoint_rule": _setting(0, 0, 1, "int"),
+    "tarpit_on_blocked_endpoint": _setting(0, 0, 1, "int"),
+    "tarpit_on_auth_attempt": _setting(0, 0, 1, "int"),
 }
 
 
@@ -683,35 +708,42 @@ def get_header_rules() -> dict:
     return {k: dict(v) for k, v in _header_rules.items()}
 
 
-def add_header_rule(scope: str, mode: str, needle: str, note: str = "", header: str = "") -> tuple[bool, str]:
+def normalize_header_rule(scope: str, mode: str, needle: str, header: str = "") -> tuple[dict | None, str]:
+    """Validate + canonicalize a header rule. Returns (rule, error_message).
+
+    Shared by add_header_rule and the dry-run tester so a rule that the tester
+    says would match is byte-for-byte the rule that gets saved — the tester
+    validating one thing and the saver storing another is exactly the trap this
+    avoids.
+    """
     scope = (scope or "either").strip().lower()
     mode = (mode or "contains").strip().lower()
     needle = (needle or "").strip()
     header = (header or "").strip()
     if scope not in HEADER_RULE_SCOPES:
-        return False, f"Scope must be one of: {', '.join(HEADER_RULE_SCOPES)}"
+        return None, f"Scope must be one of: {', '.join(HEADER_RULE_SCOPES)}"
     if mode not in HEADER_RULE_MODES:
-        return False, f"Mode must be one of: {', '.join(HEADER_RULE_MODES)}"
+        return None, f"Mode must be one of: {', '.join(HEADER_RULE_MODES)}"
     if not needle:
-        return False, "Empty match text"
+        return None, "Empty match text"
     if mode == "regex" and not valid_regex(needle):
-        return False, "Invalid regular expression"
+        return None, "Invalid regular expression"
     # Targeting a specific header means we match its VALUE.
     if header:
         scope = "value"
-    rule_id = _header_rule_id(scope, mode, needle, header)
+    return {"Header": header, "Scope": scope, "Mode": mode, "Needle": needle}, ""
+
+
+def add_header_rule(scope: str, mode: str, needle: str, note: str = "", header: str = "") -> tuple[bool, str]:
+    rule, error = normalize_header_rule(scope, mode, needle, header)
+    if rule is None:
+        return False, error
+    rule_id = _header_rule_id(rule["Scope"], rule["Mode"], rule["Needle"], rule["Header"])
     if rule_id not in _header_rules and len(_header_rules) >= config.MAX_HEADER_RULES:
         return False, "Too many header rules"
 
     def change():
-        _header_rules[rule_id] = {
-            "Header": header,
-            "Scope": scope,
-            "Mode": mode,
-            "Needle": needle,
-            "Note": str(note)[:200],
-            "Added": time.time(),
-        }
+        _header_rules[rule_id] = dict(rule, Note=str(note)[:200], Added=time.time())
 
     _persist_change(change)
     return True, "Success"
@@ -744,6 +776,53 @@ def _header_field_matches(mode: str, needle: str, target: str) -> bool:
     return needle_lower in target_lower  # contains
 
 
+def _header_pairs(headers) -> list:
+    """Normalize any header container into a list of (name, value) pairs."""
+    if headers is None:
+        return []
+    if hasattr(headers, "items"):
+        return list(headers.items())
+    return [(str(name), str(value)) for name, value in headers]
+
+
+def rule_hit(rule: dict, rule_id: str, pairs) -> dict | None:
+    """Whether ONE rule is tripped by a set of header pairs.
+
+    This is the whole decision for a single rule, factored out so the request
+    path and the dashboard's dry-run tester cannot drift apart: match_header_rule
+    below is nothing but a loop over this, and the tester calls it directly. If
+    the tester says a rule matches, the proxy blocks — by construction.
+
+    Returns the rule plus Id/MatchedHeader/MatchedField/MatchedText, or None.
+    """
+    scope = rule.get("Scope", "either")
+    mode = rule.get("Mode", "contains")
+    needle = str(rule.get("Needle", ""))
+    target_header = str(rule.get("Header", "")).lower()
+    if not needle:
+        return None
+    for name, value in pairs:
+        if target_header:
+            # Rule targets one specific header: match only that header's value.
+            if str(name).lower() != target_header:
+                continue
+            if _header_field_matches(mode, needle, value):
+                return dict(rule, Id=rule_id, MatchedHeader=name, MatchedField="value", MatchedText=value)
+            continue
+        key_hit = scope in ("key", "either") and _header_field_matches(mode, needle, name)
+        value_hit = scope in ("value", "either") and _header_field_matches(mode, needle, value)
+        if key_hit or value_hit:
+            # Which side tripped it, and the offending text (the caller redacts secrets).
+            return dict(
+                rule,
+                Id=rule_id,
+                MatchedHeader=name,
+                MatchedField="key" if key_hit else "value",
+                MatchedText=name if key_hit else value,
+            )
+    return None
+
+
 def match_header_rule(headers) -> dict | None:
     """Return the first header rule a request's headers trip, or None.
 
@@ -754,38 +833,77 @@ def match_header_rule(headers) -> dict | None:
     _maybe_reload()
     if not _header_rules:
         return None
-    pairs = list(headers.items()) if hasattr(headers, "items") else list(headers)
+    pairs = _header_pairs(headers)
     for rule_id, rule in _header_rules.items():
-        scope = rule.get("Scope", "either")
-        mode = rule.get("Mode", "contains")
-        needle = str(rule.get("Needle", ""))
-        target_header = str(rule.get("Header", "")).lower()
-        if not needle:
-            continue
-        for name, value in pairs:
-            if target_header:
-                # Rule targets one specific header: match only that header's value.
-                if name.lower() != target_header:
-                    continue
-                if _header_field_matches(mode, needle, value):
-                    hit = dict(rule)
-                    hit["Id"] = rule_id
-                    hit["MatchedHeader"] = name
-                    hit["MatchedField"] = "value"
-                    hit["MatchedText"] = value
-                    return hit
-                continue
-            key_hit = scope in ("key", "either") and _header_field_matches(mode, needle, name)
-            value_hit = scope in ("value", "either") and _header_field_matches(mode, needle, value)
-            if key_hit or value_hit:
-                hit = dict(rule)
-                hit["Id"] = rule_id
-                hit["MatchedHeader"] = name
-                # Which side tripped it, and the offending text (the caller redacts secrets).
-                hit["MatchedField"] = "key" if key_hit else "value"
-                hit["MatchedText"] = name if key_hit else value
-                return hit
+        hit = rule_hit(rule, rule_id, pairs)
+        if hit:
+            return hit
     return None
+
+
+def explain_header_rules(headers, draft: dict = None) -> dict:
+    """Dry-run every saved rule (and optionally an unsaved draft) against sample
+    headers, and report what the proxy WOULD do.
+
+    Answers the question the Request Filters form could not: "if I add this rule,
+    does it actually catch the traffic I'm looking at — and does it catch anything
+    I didn't mean to?" Evaluation goes through rule_hit, the same function the
+    request path uses, so this is a rehearsal rather than a re-implementation.
+    """
+    _maybe_reload()
+    pairs = _header_pairs(headers)
+    results = []
+    blocked_by = None
+    for rule_id, rule in _header_rules.items():
+        hit = rule_hit(rule, rule_id, pairs)
+        entry = {
+            "Id": rule_id,
+            "Header": rule.get("Header", ""),
+            "Scope": rule.get("Scope", "either"),
+            "Mode": rule.get("Mode", "contains"),
+            "Needle": rule.get("Needle", ""),
+            "Note": rule.get("Note", ""),
+            "Matched": bool(hit),
+            "MatchedHeader": hit.get("MatchedHeader", "") if hit else "",
+            "MatchedField": hit.get("MatchedField", "") if hit else "",
+            "MatchedText": hit.get("MatchedText", "") if hit else "",
+            # The proxy stops at the FIRST match, so a later rule matching is
+            # real but would never be the one credited with the block.
+            "IsFirstMatch": False,
+        }
+        if hit and blocked_by is None:
+            blocked_by = entry
+            entry["IsFirstMatch"] = True
+        results.append(entry)
+
+    draft_result = None
+    if draft:
+        rule, error = normalize_header_rule(
+            draft.get("scope", "either"), draft.get("mode", "contains"), draft.get("needle", ""), draft.get("header", "")
+        )
+        if rule is None:
+            draft_result = {"Valid": False, "Error": error}
+        else:
+            hit = rule_hit(rule, "(draft)", pairs)
+            draft_result = {
+                "Valid": True,
+                "Error": "",
+                **rule,
+                "Matched": bool(hit),
+                "MatchedHeader": hit.get("MatchedHeader", "") if hit else "",
+                "MatchedField": hit.get("MatchedField", "") if hit else "",
+                "MatchedText": hit.get("MatchedText", "") if hit else "",
+                # A saved rule earlier in the list already blocks this request,
+                # so adding the draft would change nothing for this sample.
+                "AlreadyBlocked": blocked_by is not None,
+            }
+    return {
+        "HeaderCount": len(pairs),
+        "Blocked": blocked_by is not None,
+        "BlockedBy": blocked_by,
+        "Rules": results,
+        "Draft": draft_result,
+    }
 
 
 # --- Admin session epoch ----------------------------------------------------

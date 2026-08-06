@@ -395,58 +395,92 @@ const print = console.log;
 		if (err) err.textContent = broken && p.LastError ? ` • ${p.LastError}` : "";
 	}
 
-	function renderProxyTimings(d) {
-		const pc = d.ProxyRequestCounts || {};
-		const methods = ["GET", "POST", "PATCH", "PUT", "DELETE"];
-		for (const m of methods) {
-			const row = pc[m] || { TotalTime: 0, Count: 0, Min: 0, Max: 0, LastRequestTime: 0 };
-			const pref = `pt_${m.toLowerCase()}`;
-			setText(`${pref}_c`, String(row.Count || 0));
-			setText(`${pref}_tot`, fmtNum(row.Count ? row.TotalTime / row.Count : 0, 3));
-			const minVal = row.Min === Infinity ? 0 : row.Min || 0;
-			setText(`${pref}_min`, fmtNum(minVal, 3));
-			setText(`${pref}_max`, fmtNum(row.Max || 0, 3));
-			setText(`${pref}_last`, row.LastRequestTime ? timeAgo(row.LastRequestTime) : "—");
+	// --- Latency tables -------------------------------------------------------
+	// Every timing record carries a combined total plus a Success/Failed split.
+	// The split is the useful part: a 15s "failure" is a timeout and a 0.2s one is
+	// Roblox declining, and a single blended average shows neither.
+	const emptyTiming = () => ({ TotalTime: 0, Count: 0, Min: 0, Max: 0, LastRequestTime: 0 });
+
+	function foldTiming(into, row) {
+		const count = Number(row.Count || 0);
+		const min = row.Min === Infinity ? 0 : Number(row.Min || 0);
+		into.TotalTime += Number(row.TotalTime || 0);
+		into.Count += count;
+		into.Max = Math.max(into.Max, Number(row.Max || 0));
+		if (min && (!into.Min || min < into.Min)) into.Min = min;
+		into.LastRequestTime = Math.max(into.LastRequestTime, Number(row.LastRequestTime || 0));
+		return into;
+	}
+
+	// The split can be turned off — with no failures recorded, three rows per
+	// requester is just noise, so the admin can collapse back to one.
+	const splitTimings = () => $("#timingSplitToggle")?.checked !== false;
+
+	function timingCells(label, outcome, row, outcomeClass) {
+		const count = Number(row.Count || 0);
+		const min = row.Min === Infinity ? 0 : Number(row.Min || 0);
+		const badge = document.createElement("span");
+		badge.className = `badge ${outcomeClass}`;
+		badge.textContent = outcome;
+		return tr([
+			label,
+			badge,
+			String(count),
+			count ? fmtNum(row.TotalTime / count, 3) : "—",
+			count ? fmtNum(min, 3) : "—",
+			count ? fmtNum(Number(row.Max || 0), 3) : "—",
+			row.LastRequestTime ? tsNode(row.LastRequestTime) : "—",
+		]);
+	}
+
+	function appendTimingRows(tbody, label, record) {
+		const combined = record || emptyTiming();
+		const all = timingCells(label, "All", combined, "badge--muted");
+		all.classList.add("row--emph");
+		tbody.appendChild(all);
+		if (!splitTimings()) return;
+		// Indented under the combined row so the relationship is obvious.
+		tbody.appendChild(timingCells("↳", "Success", record?.Success || emptyTiming(), "badge--ok"));
+		tbody.appendChild(timingCells("↳", "Failed", record?.Failed || emptyTiming(), "badge--bad"));
+	}
+
+	function renderTimingTable(selector, rows) {
+		const tbody = $(`${selector} tbody`);
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const totals = { All: emptyTiming(), Success: emptyTiming(), Failed: emptyTiming() };
+		for (const [label, record] of rows) {
+			appendTimingRows(tbody, label, record);
+			foldTiming(totals.All, record || {});
+			foldTiming(totals.Success, record?.Success || {});
+			foldTiming(totals.Failed, record?.Failed || {});
 		}
+		const totalRow = timingCells("Total", "All", totals.All, "badge--muted");
+		totalRow.style.fontWeight = "700";
+		tbody.appendChild(totalRow);
+		if (splitTimings()) {
+			tbody.appendChild(timingCells("↳", "Success", totals.Success, "badge--ok"));
+			tbody.appendChild(timingCells("↳", "Failed", totals.Failed, "badge--bad"));
+		}
+	}
+
+	function renderProxyTimings(d) {
+		if (d.ProxyRequestCounts) renderProxyTimings._last = d.ProxyRequestCounts;
+		const pc = renderProxyTimings._last || {};
+		renderTimingTable(
+			"#proxyTimingsTable",
+			["GET", "POST", "PATCH", "PUT", "DELETE"].map(m => [m, pc[m]]),
+		);
 	}
 
 	// Per-requester upstream timings (Token/Rotate) + a running Total row.
 	function renderMethodTimings(d) {
-		const tbody = $("#methodTimingsTable tbody");
-		if (!tbody) return;
-		const mt = d.MethodTimings || {};
-		tbody.innerHTML = "";
-		const total = { TotalTime: 0, Count: 0, Min: 0, Max: 0, LastRequestTime: 0 };
-		for (const name of ["Token", "Rotate"]) {
-			const row = mt[name] || { TotalTime: 0, Count: 0, Min: 0, Max: 0, LastRequestTime: 0 };
-			const count = Number(row.Count || 0);
-			const minVal = row.Min === Infinity ? 0 : Number(row.Min || 0);
-			tbody.appendChild(
-				tr([
-					name,
-					String(count),
-					fmtNum(count ? row.TotalTime / count : 0, 3),
-					fmtNum(minVal, 3),
-					fmtNum(Number(row.Max || 0), 3),
-					row.LastRequestTime ? tsNode(row.LastRequestTime) : "—",
-				]),
-			);
-			total.TotalTime += Number(row.TotalTime || 0);
-			total.Count += count;
-			total.Max = Math.max(total.Max, Number(row.Max || 0));
-			if (minVal && (!total.Min || minVal < total.Min)) total.Min = minVal;
-			total.LastRequestTime = Math.max(total.LastRequestTime, Number(row.LastRequestTime || 0));
-		}
-		const totalRow = tr([
-			"Total",
-			String(total.Count),
-			fmtNum(total.Count ? total.TotalTime / total.Count : 0, 3),
-			fmtNum(total.Min, 3),
-			fmtNum(total.Max, 3),
-			total.LastRequestTime ? tsNode(total.LastRequestTime) : "—",
-		]);
-		totalRow.style.fontWeight = "700";
-		tbody.appendChild(totalRow);
+		if (d.MethodTimings) renderMethodTimings._last = d.MethodTimings;
+		const mt = renderMethodTimings._last || {};
+		renderTimingTable(
+			"#methodTimingsTable",
+			["Token", "Rotate"].map(name => [name, mt[name]]),
+		);
 	}
 
 	const expandedFailures = new Set();
@@ -594,17 +628,26 @@ const print = console.log;
 		const rotate = d.Rotate || {};
 		const tk = (d.ProxyHealth || {}).Tokens || {};
 
-		// Token: "BUDGET" when the safety budget is full, else OK.
+		// Token: same vocabulary as Rotate. "OK" read as "scraping by" — the state
+		// this card is in almost all the time deserves to look like success.
 		const tokenFull = Number(routing.TokenUsed || 0) >= Number(routing.TokenLimit || 0) && routing.TokenLimit;
 		const noTokens = Number(tk.Count || 0) === 0;
 		setStateWord(
 			"health_token",
-			noTokens ? "NO TOKEN" : tokenFull ? "AT BUDGET" : "OK",
+			noTokens ? "NO TOKEN" : tokenFull ? "AT BUDGET" : "WORKING",
 			!noTokens && !tokenFull,
 		);
 		setText("token_count", String(tok.Requests || 0));
 		setText("token_failed", String(tok.Failed || 0));
 		setText("token_timeouts", String(tok.Timeouts || 0));
+		setText("token_last_ok", tok.LastSuccessAt ? timeAgo(tok.LastSuccessAt) : "—");
+		setText("token_last_req", tok.LastRequestTime ? timeAgo(tok.LastRequestTime) : "—");
+		// The Token equivalent of Rotate's cooldown: when the safety budget frees up.
+		const tokenReset = Number(routing.TokenResetIn || 0);
+		setText("token_reset", tokenFull && tokenReset > 0 ? `${tokenReset}s` : "—");
+		setText("token_loaded", String(tk.Count ?? 0));
+		const terr = $("#token_error");
+		if (terr) terr.textContent = tok.LastError ? ` • last error: ${tok.LastError}` : "";
 
 		// Rotate: Disabled / Cooldown / Working.
 		const rotResetIn = Number(routing.RotateResetIn || 0);
@@ -626,6 +669,7 @@ const print = console.log;
 		setText("rotate_failed", String(rot.Failed || 0));
 		setText("rotate_timeouts", String(rot.Timeouts || 0));
 		setText("rotate_last_ok", rot.LastSuccessAt ? timeAgo(rot.LastSuccessAt) : "—");
+		setText("rotate_last_req", rot.LastRequestTime ? timeAgo(rot.LastRequestTime) : "—");
 		setText("rotate_reset", rotResetIn > 0 ? `${rotResetIn}s` : "—");
 		setText("rotate_proxy", rotate.ProxyUrl || "(not configured)");
 		const rerr = $("#rotate_error");
@@ -635,11 +679,66 @@ const print = console.log;
 		setText("health_tokens_expired", String(tk.ExpiredCount ?? 0));
 		setText("health_tokens_validating", String(tk.BeingValidatedCount ?? 0));
 
-		const started = Number(d.WorkerStartedAt || 0);
+		renderWorkerFleet(d);
+	}
+
+	// The fleet, not "whichever worker answered this poll". A single worker's
+	// uptime jumps around because gunicorn recycles workers at max_requests, so
+	// the headline number is the SERVICE's uptime and the per-worker detail lives
+	// in its own table underneath.
+	function renderWorkerFleet(d) {
+		const fleet = d.WorkerFleet || {};
 		const server = Number(d.ServerTime || 0);
-		if (started && server) {
-			setText("health_uptime", fmtDuration(server - started));
-			setText("health_started", toTS(started));
+		const serviceUptime = Number(fleet.ServiceUptime || 0);
+		if (serviceUptime > 0) {
+			setText("health_uptime", fmtDuration(serviceUptime));
+			setText("health_started", fleet.ServiceStartedAt ? toTS(fleet.ServiceStartedAt) : "—");
+		} else if (server && d.WorkerStartedAt) {
+			// No registry yet (first boot, or the file isn't writable): fall back to
+			// this worker rather than showing nothing.
+			setText("health_uptime", fmtDuration(server - Number(d.WorkerStartedAt)));
+			setText("health_started", toTS(Number(d.WorkerStartedAt)));
+		}
+		setText("health_host_uptime", fleet.HostUptime ? fmtDuration(fleet.HostUptime) : "—");
+		const count = Number(fleet.Count || 0);
+		const expected = Number(fleet.Expected || 0);
+		const workerLabel = expected && count !== expected ? `${count} of ${expected}` : String(count || "—");
+		setText("health_worker_count", workerLabel);
+		setText("health_fleet_rss", fleet.TotalRSS ? fmtBytes(fleet.TotalRSS) : "—");
+		const workerCount = $("#health_worker_count");
+		if (workerCount) workerCount.classList.toggle("text-danger", Boolean(expected && count && count < expected));
+
+		const tbody = $("#workersTable tbody");
+		if (!tbody) return;
+		setText("workerMaxRequests", fmtCount(fleet.MaxRequests || 2000));
+		tbody.innerHTML = "";
+		const rows = fleet.Workers || [];
+		if (!rows.length) {
+			tbody.appendChild(tr(["—", "—", "—", "—", "—", "No workers have reported in yet"]));
+			return;
+		}
+		for (const worker of rows) {
+			const pid = document.createElement("span");
+			pid.textContent = String(worker.Pid || "?");
+			if (worker.IsThisWorker) {
+				// Which worker served this page — the one whose numbers you'd see
+				// without the registry.
+				const tag = document.createElement("span");
+				tag.className = "badge badge--muted";
+				tag.textContent = "serving you";
+				pid.appendChild(document.createTextNode(" "));
+				pid.appendChild(tag);
+			}
+			tbody.appendChild(
+				tr([
+					pid,
+					fmtDuration(Number(worker.Uptime || 0)),
+					fmtBytes(worker.RSS || 0),
+					String(worker.Threads || "—"),
+					fmtCount(worker.Requests || 0),
+					worker.LastSeen ? tsNode(worker.LastSeen) : "—",
+				]),
+			);
 		}
 	}
 
@@ -1500,6 +1599,17 @@ const print = console.log;
 		rotate_enabled: "IP rotation enabled (1/0)",
 		rotate_cooldown: "Rotate cooldown after failures (s)",
 		rotate_max_failures: "Rotate: failures before cooldown",
+		tarpit_enabled: "Tarpit enabled (1/0)",
+		tarpit_min_seconds: "Tarpit: hold at least (s)",
+		tarpit_max_seconds: "Tarpit: hold at most (s)",
+		tarpit_max_concurrent: "Tarpit: max held at once",
+		tarpit_on_header_rule: "Tarpit: filter-blocked requests (1/0)",
+		tarpit_on_probe: "Tarpit: non-Roblox URLs (1/0)",
+		tarpit_on_throttle: "Tarpit: per-IP throttle (1/0)",
+		tarpit_on_throttle_all: "Tarpit: throttle-all (1/0)",
+		tarpit_on_endpoint_rule: "Tarpit: endpoint rate rules (1/0)",
+		tarpit_on_blocked_endpoint: "Tarpit: blocked endpoints (1/0)",
+		tarpit_on_auth_attempt: "Tarpit: ROBLOSECURITY attempts (1/0)",
 	};
 
 	// Group settings so the (long) list is navigable. Any key not listed falls
@@ -1509,6 +1619,22 @@ const print = console.log;
 		["IP rotation", ["rotate_enabled", "rotate_cooldown", "rotate_max_failures"]],
 		["Token safety budget", ["token_budget_requests", "token_budget_window", "token_expiration_cooldown"]],
 		["Throttling", ["allowed_requests_per_minute", "throttle_reset_duration", "stale_ip_duration", "global_throttle_limit", "global_throttle_period"]],
+		[
+			"Tarpit (slow refusals)",
+			[
+				"tarpit_enabled",
+				"tarpit_min_seconds",
+				"tarpit_max_seconds",
+				"tarpit_max_concurrent",
+				"tarpit_on_header_rule",
+				"tarpit_on_probe",
+				"tarpit_on_throttle",
+				"tarpit_on_throttle_all",
+				"tarpit_on_endpoint_rule",
+				"tarpit_on_blocked_endpoint",
+				"tarpit_on_auth_attempt",
+			],
+		],
 		["Upstream & retries", ["request_timeout", "max_retries_per_request"]],
 		["Email", ["email_cooldown", "error_email_cooldown"]],
 		["Login & sessions", ["two_fa_expiration", "challenge_expiration"]],
@@ -1805,6 +1931,167 @@ const print = console.log;
 		}
 	}
 
+	// -----------------------------
+	// Tarpit
+	// -----------------------------
+	const TARPIT_CATEGORY_LABELS = {
+		header_rule: "Caught by a Request Filter",
+		probe: "Not a Roblox URL",
+		throttle: "Per-IP rate limit",
+		throttle_all: "Global throttle-all",
+		endpoint_rule: "Per-endpoint rate rule",
+		blocked_endpoint: "Blocked endpoint",
+		auth_attempt: "Sent a ROBLOSECURITY cookie",
+	};
+
+	// Durations here span "1.4s" to "3 days of wasted exploiter time", so pick a
+	// unit rather than printing 259200s.
+	function fmtSeconds(s) {
+		s = Number(s || 0);
+		if (!s) return "—";
+		if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
+		if (s < 3600) return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+		return fmtDuration(s);
+	}
+
+	function renderTarpit(d) {
+		if (d.TarpitStats) renderTarpit._stats = d.TarpitStats;
+		if (d.TarpitIps) renderTarpit._ips = d.TarpitIps;
+		if (d.TarpitRates) renderTarpit._rates = d.TarpitRates;
+		const stats = renderTarpit._stats || {};
+		const ips = renderTarpit._ips || {};
+		const rates = renderTarpit._rates || [];
+		const state = d.Tarpit || renderTarpit._state || {};
+		if (d.Tarpit) renderTarpit._state = d.Tarpit;
+
+		const enabled = Boolean(state.Enabled) && (state.Categories || []).length > 0;
+		const chip = $("#tarpitStatusChip");
+		if (chip) {
+			chip.textContent = !state.Enabled
+				? "Off"
+				: (state.Categories || []).length === 0
+					? "On, but nothing selected"
+					: `Holding ${(state.Categories || []).length} kind(s)`;
+			chip.classList.toggle("chip--ok", enabled);
+			chip.classList.toggle("chip--danger", Boolean(state.Enabled) && !enabled);
+		}
+
+		// Don't fight the admin while they are typing into these controls.
+		const toggle = $("#tarpitEnabled");
+		if (toggle && document.activeElement !== toggle) toggle.checked = Boolean(state.Enabled);
+		const settings = d.Settings || {};
+		const setIfIdle = (id, value) => {
+			const el = document.getElementById(id);
+			if (el && document.activeElement !== el && el.dataset.dirty !== "1") el.value = String(value);
+		};
+		if (settings.tarpit_min_seconds) setIfIdle("tarpitMin", settings.tarpit_min_seconds.value);
+		if (settings.tarpit_max_seconds) setIfIdle("tarpitMax", settings.tarpit_max_seconds.value);
+		if (settings.tarpit_max_concurrent) setIfIdle("tarpitConcurrent", settings.tarpit_max_concurrent.value);
+		for (const box of $$(".tarpit-cat__box")) {
+			if (document.activeElement === box) continue;
+			box.checked = (state.Categories || []).includes(box.dataset.category);
+		}
+
+		const held = Number(stats.Count || 0);
+		const totalHeld = Number(stats.TotalHeld || 0);
+		setText("tarpit_count", fmtCount(held));
+		setText("tarpit_skipped", fmtCount(stats.Skipped || 0));
+		setText("tarpit_active", String(state.ActiveHolds ?? 0));
+		setText("tarpit_capacity", String(state.MaxConcurrent ?? 0));
+		setText("tarpit_avg", held ? fmtSeconds(totalHeld / held) : "—");
+		setText("tarpit_min", stats.Min ? fmtSeconds(stats.Min) : "—");
+		setText("tarpit_max", stats.Max ? fmtSeconds(stats.Max) : "—");
+		setText("tarpit_total", fmtSeconds(totalHeld));
+
+		// A rising "skipped" means our own concurrency cap is the binding limit,
+		// not the caller — worth shouting about, since it silently disables the
+		// feature you think is running.
+		const skipEl = $("#tarpit_skipped");
+		if (skipEl) skipEl.classList.toggle("text-danger", Number(stats.Skipped || 0) > held && held > 0);
+
+		const gaps = Number(stats.Gaps || 0);
+		const lifetimeGap = gaps ? Number(stats.TotalGap || 0) / gaps : 0;
+		setText("tarpit_gap", lifetimeGap ? fmtSeconds(lifetimeGap) : "—");
+		const byWindow = Object.fromEntries(rates.map(r => [r.Minutes, r]));
+		for (const minutes of [15, 60, 1440]) {
+			const row = byWindow[minutes] || {};
+			setText(`tarpit_gap_${minutes}`, row.Count ? fmtSeconds(row.AvgGap) : "—");
+		}
+		setText("tarpit_hour", fmtCount(byWindow[60]?.Count || 0));
+		setText("tarpit_15", fmtCount(byWindow[15]?.Count || 0));
+		setText("tarpit_24h", fmtCount(byWindow[1440]?.Count || 0));
+		setText("tarpit_ip_count", fmtCount(Object.keys(ips).length));
+
+		// The headline question: are they knocking less often than they used to?
+		const recent = byWindow[60];
+		const trend = $("#tarpit_trend");
+		if (trend) {
+			if (!recent || !recent.Count || !lifetimeGap) {
+				trend.textContent = "Not enough data yet to compare.";
+				trend.className = "text-dim";
+			} else {
+				const ratio = recent.AvgGap / lifetimeGap;
+				const pct = Math.abs(Math.round((ratio - 1) * 100));
+				if (ratio >= 1.15) {
+					trend.textContent = `Backing off: ${pct}% longer between requests this hour than usual.`;
+					trend.className = "health-ok";
+				} else if (ratio <= 0.85) {
+					trend.textContent = `Speeding up: ${pct}% shorter between requests this hour.`;
+					trend.className = "health-bad";
+				} else {
+					trend.textContent = "Holding steady — same request rate as their lifetime average.";
+					trend.className = "text-dim";
+				}
+			}
+		}
+
+		const catBody = $("#tarpitCategoryTable tbody");
+		if (catBody) {
+			catBody.innerHTML = "";
+			const entries = Object.entries(stats.Categories || {});
+			entries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+			if (!entries.length) {
+				catBody.appendChild(tr(["Nothing held yet", "0", "0", "—", "—", "—"]));
+			}
+			for (const [name, info] of entries) {
+				const count = Number(info.Count || 0);
+				catBody.appendChild(
+					tr([
+						TARPIT_CATEGORY_LABELS[name] || name,
+						fmtCount(count),
+						fmtCount(info.Skipped || 0),
+						count ? fmtSeconds(Number(info.TotalHeld || 0) / count) : "—",
+						fmtSeconds(info.TotalHeld || 0),
+						info.LastRequestTime ? tsNode(info.LastRequestTime) : "—",
+					]),
+				);
+			}
+		}
+
+		const ipBody = $("#tarpitIpsTable tbody");
+		if (!ipBody) return;
+		ipBody.innerHTML = "";
+		const rows = Object.entries(ips).sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+		if (!rows.length) {
+			ipBody.appendChild(tr(["No callers held yet", "0", "0", "—", "—", "—", "—"]));
+			return;
+		}
+		for (const [ip, info] of rows) {
+			const ipGaps = Number(info.Gaps || 0);
+			ipBody.appendChild(
+				tr([
+					ip,
+					fmtCount(info.Count || 0),
+					fmtCount(info.Skipped || 0),
+					ipGaps ? fmtSeconds(Number(info.TotalGap || 0) / ipGaps) : "—",
+					fmtSeconds(info.TotalHeld || 0),
+					info.FirstSeen ? tsNode(info.FirstSeen) : "—",
+					info.LastRequestTime ? tsNode(info.LastRequestTime) : "—",
+				]),
+			);
+		}
+	}
+
 	function renderHeaderBlocked(d) {
 		const tbody = $("#headerBlockedTable tbody");
 		if (!tbody) return;
@@ -1921,7 +2208,9 @@ const print = console.log;
 			renderEndpointBlocks(d);
 			renderEndpointRules(d);
 			renderThrottleBypass(d);
+			renderTarpit(d);
 			renderHeaderRules(d);
+			renderTesterSamples();
 			renderBlockedAttempts(d);
 			renderRateLimitedAttempts(d);
 			renderHeaderBlocked(d);
@@ -2545,6 +2834,285 @@ const print = console.log;
 		} catch (err) {
 			showToast("Rule failed: " + err.message);
 		}
+	});
+
+	// -----------------------------
+	// Request-filter tester
+	// -----------------------------
+	// The form above can only tell you a rule was accepted, not whether it does
+	// anything. This runs the server's real matcher over sample headers so a rule
+	// can be checked against actual captured traffic before it goes live.
+	const EXAMPLE_HEADERS = [
+		"User-Agent: Roblox/WinInet",
+		"Xeno-Fingerprint: 4f3a91c0",
+		"Accept: */*",
+		"Content-Type: application/json",
+	].join("\n");
+
+	function headersToText(headers) {
+		return Object.entries(headers || {})
+			.map(([name, value]) => `${name}: ${value}`)
+			.join("\n");
+	}
+
+	// The live feed already carries the (sanitized) headers of recent requests,
+	// so the most useful samples are the ones that actually hit the proxy.
+	function renderTesterSamples() {
+		const select = $("#testerSample");
+		if (!select || document.activeElement === select) return;
+		const chosen = select.value;
+		select.innerHTML = "";
+		const placeholder = document.createElement("option");
+		placeholder.value = "";
+		placeholder.textContent = liveItems.length
+			? "Load headers from a recent request…"
+			: "No recent requests captured yet";
+		select.appendChild(placeholder);
+		liveItems.slice(0, 40).forEach((item, index) => {
+			if (!item || !item.Headers) return;
+			const option = document.createElement("option");
+			option.value = String(index);
+			const ua = (item.UserAgent || "no user-agent").slice(0, 40);
+			option.textContent = `${timeAgo(item.Date)} — ${item.IP || "?"} — ${ua}`;
+			select.appendChild(option);
+		});
+		if (chosen && select.querySelector(`option[value="${chosen}"]`)) select.value = chosen;
+	}
+
+	function draftFromTester() {
+		const needle = $("#testerNeedle")?.value.trim() || "";
+		if (!needle) return null;
+		return {
+			header: $("#testerHeader")?.value.trim() || "",
+			scope: $("#testerScope")?.value || "either",
+			mode: $("#testerMode")?.value || "contains",
+			needle,
+		};
+	}
+
+	function describeRule(info) {
+		const scope = HEADER_SCOPE_LABELS[info.Scope] || info.Scope || "?";
+		const verb = info.Mode === "exact" ? "is" : info.Mode === "regex" ? "matches" : "contains";
+		const target = info.Header ? `"${info.Header}" value` : scope;
+		return `${target} ${verb} "${info.Needle || ""}"`;
+	}
+
+	function renderTesterResult(result) {
+		const panel = $("#testerVerdict");
+		const headline = $("#testerHeadline");
+		const detail = $("#testerDetail");
+		const wrap = $("#testerRulesWrap");
+		if (!panel || !headline || !detail) return;
+		panel.hidden = false;
+		panel.classList.toggle("tester-verdict--blocked", Boolean(result.Blocked));
+		panel.classList.toggle("tester-verdict--allowed", !result.Blocked);
+		detail.innerHTML = "";
+
+		const draft = result.Draft;
+		if (result.Blocked) {
+			const by = result.BlockedBy || {};
+			headline.textContent = "🚫 This request would be BLOCKED";
+			const side = by.MatchedField === "key" ? "header name" : "header value";
+			detail.appendChild(
+				lineNode(
+					`Caught by <strong>${escapeHtml(describeRule(by))}</strong> — the ${side} ` +
+						`<code>${escapeHtml(by.MatchedText || "")}</code> on header ` +
+						`<code>${escapeHtml(by.MatchedHeader || "")}</code>.`,
+				),
+			);
+		} else {
+			headline.textContent = "✅ This request would be allowed through";
+			detail.appendChild(
+				lineNode(
+					`None of your ${result.Rules.length} saved filter(s) match these ${result.HeaderCount} header(s).`,
+				),
+			);
+		}
+
+		if (draft) {
+			if (!draft.Valid) {
+				const why = escapeHtml(draft.Error || "");
+				detail.appendChild(lineNode(`<strong>Draft rule is invalid:</strong> ${why}`));
+			} else if (draft.Matched) {
+				const side = draft.MatchedField === "key" ? "header name" : "header value";
+				detail.appendChild(
+					lineNode(
+						`<strong>Your draft rule WOULD catch this</strong> — matched the ${side} ` +
+							`<code>${escapeHtml(draft.MatchedText || "")}</code> on header ` +
+							`<code>${escapeHtml(draft.MatchedHeader || "")}</code>.` +
+							(draft.AlreadyBlocked
+								? " A saved rule already blocks this request, so adding it would change nothing here."
+								: ""),
+					),
+				);
+			} else {
+				detail.appendChild(
+					lineNode(
+						"<strong>Your draft rule would NOT catch this.</strong> Check the header name, or try " +
+							"“Contains” instead of “Exact”.",
+					),
+				);
+			}
+		}
+
+		if (!wrap) return;
+		const tbody = $("#testerRulesTable tbody");
+		wrap.hidden = !result.Rules.length;
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		for (const rule of result.Rules) {
+			const badge = document.createElement("span");
+			const tone = rule.Matched ? (rule.IsFirstMatch ? "badge--bad" : "badge--warn") : "badge--muted";
+			badge.className = `badge ${tone}`;
+			// Only the first match is credited with the block — the proxy stops there.
+			badge.textContent = rule.IsFirstMatch ? "blocks it" : rule.Matched ? "also matches" : "no match";
+			tbody.appendChild(
+				tr([
+					badge,
+					describeRule(rule),
+					rule.MatchedHeader || "—",
+					rule.MatchedText || "—",
+				]),
+			);
+		}
+	}
+
+	// Every interpolation into this must be escaped by the caller: the sample
+	// headers being described are attacker-authored by definition — that is the
+	// whole point of pasting them in here.
+	function lineNode(html) {
+		const div = document.createElement("div");
+		div.innerHTML = html;
+		return div;
+	}
+
+	async function runFilterTest() {
+		const headers = $("#testerHeaders")?.value || "";
+		if (!headers.trim()) {
+			showToast("Paste some headers to test against");
+			return;
+		}
+		try {
+			const res = await api("/admin/headers/test", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ headers, draft: draftFromTester() }),
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(data.Message || String(res.status));
+			renderTesterResult(data);
+		} catch (err) {
+			showToast("Test failed: " + err.message);
+		}
+	}
+
+	$("#testerRun")?.addEventListener("click", e => withBusy(e.currentTarget, "Testing…", runFilterTest));
+	$("#testerExample")?.addEventListener("click", () => {
+		const box = $("#testerHeaders");
+		if (box) box.value = EXAMPLE_HEADERS;
+	});
+	$("#testerSample")?.addEventListener("change", e => {
+		const item = liveItems[Number(e.target.value)];
+		const box = $("#testerHeaders");
+		if (!item || !box) return;
+		box.value = headersToText(item.Headers);
+		showToast(`Loaded headers from ${item.IP || "a recent request"}`);
+	});
+	// Carry whatever is in the add-rule form into the tester, so "would this work?"
+	// is one click away from "I am about to add this".
+	$("#testerCopyFromForm")?.addEventListener("click", () => {
+		const copy = (from, to) => {
+			const src = $(from);
+			const dst = $(to);
+			if (src && dst) dst.value = src.value;
+		};
+		copy("#headerRuleHeader", "#testerHeader");
+		copy("#headerRuleScope", "#testerScope");
+		copy("#headerRuleMode", "#testerMode");
+		copy("#headerRuleNeedle", "#testerNeedle");
+		showToast("Copied the rule above into the tester");
+	});
+	// Enter in the draft-text box runs the test rather than doing nothing.
+	$("#testerNeedle")?.addEventListener("keydown", e => {
+		if (e.key === "Enter") {
+			e.preventDefault();
+			runFilterTest();
+		}
+	});
+
+	// -----------------------------
+	// Tarpit controls
+	// -----------------------------
+	async function saveTarpitSettings(settings, message) {
+		try {
+			const res = await api("/admin/settings", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ settings }),
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(String(res.status));
+			const failures = Object.entries(data.Results || {}).filter(([, msg]) => msg !== "Success");
+			if (failures.length) throw new Error(failures.map(([key, msg]) => `${key}: ${msg}`).join(", "));
+			showToast(message);
+			refreshAll(true);
+		} catch (err) {
+			showToast("Could not save: " + err.message);
+			refreshAll(true); // Put the controls back to what the server actually has.
+		}
+	}
+
+	$("#tarpitEnabled")?.addEventListener("change", e => {
+		saveTarpitSettings({ tarpit_enabled: e.target.checked ? 1 : 0 }, e.target.checked ? "Tarpit on" : "Tarpit off");
+	});
+
+	$$(".tarpit-cat__box").forEach(box => {
+		box.addEventListener("change", () => {
+			saveTarpitSettings(
+				{ [`tarpit_on_${box.dataset.category}`]: box.checked ? 1 : 0 },
+				box.checked ? "Now holding these" : "No longer holding these",
+			);
+		});
+	});
+
+	$("#tarpitForm")?.addEventListener("submit", e => {
+		e.preventDefault();
+		const min = Number($("#tarpitMin")?.value);
+		const max = Number($("#tarpitMax")?.value);
+		const concurrent = Number($("#tarpitConcurrent")?.value);
+		if (min > max) {
+			showToast("The minimum hold cannot be longer than the maximum");
+			return;
+		}
+		saveTarpitSettings(
+			{ tarpit_min_seconds: min, tarpit_max_seconds: max, tarpit_max_concurrent: concurrent },
+			"Tarpit settings saved",
+		);
+	});
+
+	$("#clearTarpitBtn")?.addEventListener("click", e =>
+		withBusy(e.currentTarget, "Clearing…", async () => {
+			try {
+				const res = await api("/admin/data/clear", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ target: "tarpit" }),
+				});
+				if (!res.ok) throw new Error(String(res.status));
+				renderTarpit._stats = {};
+				renderTarpit._ips = {};
+				renderTarpit._rates = [];
+				showToast("Tarpit stats cleared");
+				refreshAll(true);
+			} catch (err) {
+				showToast("Could not clear: " + err.message);
+			}
+		}),
+	);
+
+	$("#timingSplitToggle")?.addEventListener("change", () => {
+		renderProxyTimings({});
+		renderMethodTimings({});
 	});
 
 	// Header rules: add

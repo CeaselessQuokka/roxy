@@ -110,13 +110,31 @@ crawls = dict(
     }
 )
 
+
+# A latency record. "Outcome" splits the same numbers by whether the upstream
+# call succeeded, because the two populations answer different questions: a
+# failure that takes 15s is a timeout, a failure that takes 0.2s is Roblox saying
+# no. Averaged together they hide both. The nested shape merges across workers
+# for free — the cross-worker merge keys off leaf NAMES (Min/Max/Total/Count),
+# so a nested Min is still min-merged, not summed.
+def _outcome_stat():
+    return dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0})
+
+
+def _timing_record():
+    record = _outcome_stat()
+    record["Success"] = _outcome_stat()
+    record["Failed"] = _outcome_stat()
+    return record
+
+
 proxy_request_counts = dict(
     {
-        "GET": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),  # Count = nRequests.
-        "POST": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),  # Count = nRequests.
-        "PATCH": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),  # Count = nRequests.
-        "PUT": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),  # Count = nRequests.
-        "DELETE": dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0}),  # Count = nRequests.
+        "GET": _timing_record(),  # Count = nRequests.
+        "POST": _timing_record(),
+        "PATCH": _timing_record(),
+        "PUT": _timing_record(),
+        "DELETE": _timing_record(),
     }
 )
 
@@ -132,22 +150,30 @@ proxy_health = dict(
 
 # Per-method request tallies (Token / Rotate), MERGED across workers so the
 # dashboard shows true global totals. Requests = total; Failed = non-200 /
-# proxy errors; Timeouts = upstream timeouts. Rotate also keeps health/last-error.
+# proxy errors; Timeouts = upstream timeouts.
+#
+# Both methods keep the same liveness fields (last request / last success / last
+# error). They used to differ — only Rotate tracked them — which is why the Token
+# card had nothing to say beyond three counters while the Rotate card could show
+# when it last actually worked.
 def _method_stat():
-    return dict({"Requests": 0, "Failed": 0, "Timeouts": 0})
+    return dict(
+        {
+            "Requests": 0,
+            "Failed": 0,
+            "Timeouts": 0,
+            "LastRequestTime": 0,
+            "LastSuccessAt": 0,
+            "LastErrorAt": 0,
+            "LastError": "",
+        }
+    )
 
 
 method_stats = dict(
     {
         "Token": _method_stat(),
-        "Rotate": {
-            "Requests": 0,
-            "Failed": 0,
-            "Timeouts": 0,
-            "LastSuccessAt": 0,
-            "LastErrorAt": 0,
-            "LastError": "",
-        },
+        "Rotate": _method_stat(),
     }
 )
 
@@ -167,15 +193,12 @@ token_usage = dict()
 
 # Per-requester upstream timings (Token / Rotate), MERGED across workers.
 # Parallel to proxy_request_counts (which is per HTTP verb); this one answers
-# "how fast is each requester?" with a running total derived in the UI.
-def _timing_stat():
-    return dict({"TotalTime": 0, "Count": 0, "Min": 0, "Max": 0, "LastRequestTime": 0})
-
-
+# "how fast is each requester?" with a running total derived in the UI. Split by
+# outcome for the same reason — see _timing_record.
 method_timings = dict(
     {
-        "Token": _timing_stat(),
-        "Rotate": _timing_stat(),
+        "Token": _timing_record(),
+        "Rotate": _timing_record(),
     }
 )
 
@@ -255,6 +278,44 @@ token_budget = dict({"Rejections": 0})
 # Requests dropped during downtime (reset at the start of each downtime via clear_stats).
 pause_drops = dict({"Count": 0})
 throttle_drops = dict({"Count": 0})
+
+
+# --- Tarpit ------------------------------------------------------------------
+# Refusals that were deliberately held open (see tarpit.py). Three views, because
+# three different questions are being asked of them:
+#   tarpit_stats   - the totals: how many, for how long, split by which kind of
+#                    refusal was held, plus how many had to be let through
+#                    instantly because the concurrency cap was full.
+#   tarpit_ips     - per caller: how often each one comes back. "Gaps"/"TotalGap"
+#                    accumulate the interval between a caller's successive
+#                    tarpitted requests, which is the number that answers
+#                    "is the tarpit actually slowing them down?".
+#   tarpit_minutes - the same question over time: per-minute arrival counts, so
+#                    the trend is visible rather than inferred from an average
+#                    that includes every request since the counter was cleared.
+def _tarpit_bucket():
+    return dict({"Count": 0, "TotalHeld": 0.0, "Min": 0, "Max": 0, "Skipped": 0, "LastRequestTime": 0})
+
+
+tarpit_stats = dict(
+    {
+        "Count": 0,  # Requests actually held.
+        "Skipped": 0,  # Eligible, but the concurrency cap was full -> answered instantly.
+        "TotalHeld": 0.0,  # Seconds of exploiter time spent waiting.
+        "Min": 0,
+        "Max": 0,
+        "FirstSeen": 0,
+        "LastRequestTime": 0,
+        "TotalGap": 0.0,  # Summed interval between successive tarpitted requests...
+        "Gaps": 0,  # ...over this many measured intervals (first-ever request has none).
+        "Categories": {},  # category -> _tarpit_bucket()
+    }
+)
+
+tarpit_ips = dict()  # ip -> {Count, Skipped, TotalHeld, TotalGap, Gaps, Min, Max, FirstSeen, LastRequestTime}
+
+# Per-minute tarpit arrivals: {"<epoch_minute>": {"Count": n, "Held": seconds}}.
+tarpit_minutes = dict()
 
 # Server/upstream errors, deduped by signature: sig -> {Count, FirstSeen, LastSeen, LastDetail}.
 # Distinct errors are retained until the admin clears them (high cap as an OOM guard only).
@@ -355,6 +416,9 @@ def _caps() -> dict:
         ),
         "status_codes_detailed": dict(cap=config.MAX_STATUS_CODES, by="value"),
         "token_usage": dict(cap=config.MAX_TOKEN_USAGE_RECORDS, by="count", time="LastUsedAt"),
+        # Newest-first: an exploiter who stopped is less interesting than one
+        # still knocking, and a spoofed-IP flood must not push the live one out.
+        "tarpit_ips": dict(cap=config.MAX_TARPIT_IP_RECORDS, by="recent", time="LastRequestTime"),
         "retry_counts": dict(
             cap=None,
             by="count",
@@ -370,6 +434,7 @@ def _caps() -> dict:
 _MINUTE_STORES = {
     "traffic_minutes": lambda: config.TRAFFIC_HISTORY_MINUTES,
     "token_budget_minutes": lambda: config.MAX_BUDGET_MINUTES,
+    "tarpit_minutes": lambda: config.TARPIT_HISTORY_MINUTES,
 }
 
 
@@ -709,10 +774,31 @@ def log_method(method: str, success: bool):
     name = _METHOD_NAMES.get(method)
     if not name:
         return
+    now = time.time()
     with _state_lock:
-        method_stats[name]["Requests"] = method_stats[name].get("Requests", 0) + 1
-        if not success:
-            method_stats[name]["Failed"] = method_stats[name].get("Failed", 0) + 1
+        stat = method_stats[name]
+        stat["Requests"] = stat.get("Requests", 0) + 1
+        stat["LastRequestTime"] = now
+        if success:
+            stat["LastSuccessAt"] = now
+        else:
+            stat["Failed"] = stat.get("Failed", 0) + 1
+
+
+def log_method_error(method: str, error: str = ""):
+    """Record WHEN a requester last failed and why, for its health card.
+
+    Rotate had this from the start (via log_rotate_health) and Token did not,
+    which is the whole reason the Token card could only ever say "OK" — it had no
+    liveness information to show.
+    """
+    name = _METHOD_NAMES.get(method)
+    if not name:
+        return
+    with _state_lock:
+        method_stats[name]["LastErrorAt"] = time.time()
+        if error:
+            method_stats[name]["LastError"] = str(error)[:200]
 
 
 def log_method_timeout(method: str):
@@ -736,20 +822,39 @@ def log_rotate_health(ok: bool, error: str = ""):
                 method_stats["Rotate"]["LastError"] = str(error)[:200]
 
 
-def log_method_timing(method: str, duration: float):
+def _fold_timing(record: dict, duration: float, now: float):
+    """Add one latency sample to a {TotalTime, Count, Min, Max, LastRequestTime}."""
+    record["TotalTime"] = float(record.get("TotalTime", 0) or 0) + duration
+    record["Count"] = int(record.get("Count", 0) or 0) + 1
+    record["LastRequestTime"] = now
+    if duration < record.get("Min", 0) or not record.get("Min"):
+        record["Min"] = duration
+    if duration > record.get("Max", 0):
+        record["Max"] = duration
+
+
+def _record_timing(store: dict, key: str, duration: float, success: bool):
+    """Record a latency sample in both the combined row and its outcome split.
+
+    setdefault rather than direct access on purpose: a stats file written before
+    the split existed restores a record with no Success/Failed children, and this
+    heals it on the next sample instead of raising.
+    """
+    record = store.get(key)
+    if record is None:
+        return
+    now = time.time()
+    _fold_timing(record, duration, now)
+    _fold_timing(record.setdefault("Success" if success else "Failed", _outcome_stat()), duration, now)
+
+
+def log_method_timing(method: str, duration: float, success: bool = True):
     """Record an upstream timing sample for a requester (Token/Rotate)."""
     name = _METHOD_NAMES.get(method)
     if not name:
         return
     with _state_lock:
-        stat = method_timings[name]
-        stat["TotalTime"] += duration
-        stat["Count"] += 1
-        stat["LastRequestTime"] = time.time()
-        if duration < stat["Min"] or stat["Min"] == 0:
-            stat["Min"] = duration
-        if duration > stat["Max"]:
-            stat["Max"] = duration
+        _record_timing(method_timings, name, duration, success)
 
 
 def log_request_failure(method: str, status, reason: str, endpoint: str = "", detail: str = ""):
@@ -801,8 +906,7 @@ def reset_method_counters():
     """Zero the per-method request tallies (used when clearing request stats)."""
     with _state_lock:
         for name in ("Token", "Rotate"):
-            for key in ("Requests", "Failed", "Timeouts"):
-                method_stats[name][key] = 0
+            method_stats[name] = _method_stat()  # Pristine, so added fields reset too.
         proxy_health["Tokens"]["ExpiredCount"] = 0
 
 
@@ -1022,6 +1126,111 @@ def log_throttle_all_drop():
         throttle_drops["Count"] = throttle_drops.get("Count", 0) + 1
 
 
+def _bump_span(record: dict, seconds: float):
+    """Fold one duration sample into a {Min, Max} pair, in place."""
+    if seconds <= 0:
+        return
+    if seconds < record.get("Min", 0) or not record.get("Min"):
+        record["Min"] = seconds
+    if seconds > record.get("Max", 0):
+        record["Max"] = seconds
+
+
+def _log_tarpit_event(ip: str, category: str, held: float, gap: float, arrived: float, skipped: bool):
+    """Record one tarpit-eligible refusal.
+
+    `arrived` is when the request LANDED, not when we let go of it — so the
+    measured interval between a caller's requests reflects how often they knock,
+    undistorted by how long each hold lasted. `gap` is that interval, computed
+    once in the shared tarpit file (see tarpit._admit) rather than per worker.
+    """
+    ip = (ip or "unknown")[:64]
+    category = (category or "other")[:40]
+    with _state_lock:
+        tarpit_stats["LastRequestTime"] = max(float(tarpit_stats.get("LastRequestTime", 0) or 0), arrived)
+        if not tarpit_stats.get("FirstSeen"):
+            tarpit_stats["FirstSeen"] = arrived
+        if gap > 0:
+            tarpit_stats["TotalGap"] = float(tarpit_stats.get("TotalGap", 0) or 0) + gap
+            tarpit_stats["Gaps"] = int(tarpit_stats.get("Gaps", 0) or 0) + 1
+        bucket = tarpit_stats.setdefault("Categories", {}).setdefault(category, _tarpit_bucket())
+        bucket["LastRequestTime"] = max(float(bucket.get("LastRequestTime", 0) or 0), arrived)
+
+        record = tarpit_ips.get(ip)
+        if record is None:
+            if len(tarpit_ips) >= config.MAX_TARPIT_IP_RECORDS:
+                stale = min(tarpit_ips.items(), key=lambda kv: float(kv[1].get("LastRequestTime", 0) or 0))[0]
+                tarpit_ips.pop(stale, None)
+            record = tarpit_ips[ip] = dict(
+                Count=0, Skipped=0, TotalHeld=0.0, TotalGap=0.0, Gaps=0, Min=0, Max=0, FirstSeen=arrived
+            )
+        record["LastRequestTime"] = max(float(record.get("LastRequestTime", 0) or 0), arrived)
+        if gap > 0:
+            record["TotalGap"] = float(record.get("TotalGap", 0) or 0) + gap
+            record["Gaps"] = int(record.get("Gaps", 0) or 0) + 1
+
+        if skipped:
+            tarpit_stats["Skipped"] = int(tarpit_stats.get("Skipped", 0) or 0) + 1
+            bucket["Skipped"] = int(bucket.get("Skipped", 0) or 0) + 1
+            record["Skipped"] = int(record.get("Skipped", 0) or 0) + 1
+        else:
+            tarpit_stats["Count"] = int(tarpit_stats.get("Count", 0) or 0) + 1
+            tarpit_stats["TotalHeld"] = float(tarpit_stats.get("TotalHeld", 0) or 0) + held
+            _bump_span(tarpit_stats, held)
+            bucket["Count"] = int(bucket.get("Count", 0) or 0) + 1
+            bucket["TotalHeld"] = float(bucket.get("TotalHeld", 0) or 0) + held
+            _bump_span(bucket, held)
+            record["Count"] = int(record.get("Count", 0) or 0) + 1
+            record["TotalHeld"] = float(record.get("TotalHeld", 0) or 0) + held
+            _bump_span(record, held)
+
+        # Per-minute arrivals, so a falling request rate is visible as a trend
+        # rather than having to be inferred from a lifetime average.
+        minute = str(int(arrived // 60))
+        entry = tarpit_minutes.get(minute)
+        if entry is None:
+            _prune_minute_store(tarpit_minutes, config.TARPIT_HISTORY_MINUTES)
+            entry = tarpit_minutes[minute] = {"Count": 0, "Held": 0.0}
+        entry["Count"] += 1
+        entry["Held"] = float(entry.get("Held", 0) or 0) + held
+
+
+def log_tarpit(ip: str, category: str, held: float, gap: float, arrived: float):
+    """A refusal that was held open for `held` seconds."""
+    _log_tarpit_event(ip, category, held, gap, arrived, skipped=False)
+
+
+def log_tarpit_skipped(ip: str, category: str, gap: float, arrived: float):
+    """A refusal that WOULD have been held, but every tarpit slot was taken.
+
+    Tracked separately and deliberately: if this number climbs, the limit on the
+    tarpit is our own concurrency cap, not the caller's patience.
+    """
+    _log_tarpit_event(ip, category, 0.0, gap, arrived, skipped=True)
+
+
+def _tarpit_rate(minutes: int) -> dict:
+    """Tarpitted requests over the last `minutes`, and the mean interval between
+    them. This is the "are they backing off?" number: compare a short window with
+    a long one and a caller that is slowing down shows a widening gap."""
+    cutoff = int(time.time() // 60) - minutes
+    count = 0
+    held = 0.0
+    with _state_lock:
+        for key, entry in tarpit_minutes.items():
+            if str(key).isdigit() and int(key) >= cutoff:
+                count += int(entry.get("Count", 0) or 0)
+                held += float(entry.get("Held", 0) or 0)
+    return {
+        "Minutes": minutes,
+        "Count": count,
+        "Held": held,
+        # Seconds between requests, averaged over the window. 0 when nothing
+        # arrived, which the UI renders as "—" rather than "0s apart".
+        "AvgGap": round((minutes * 60) / count, 2) if count else 0,
+    }
+
+
 def log_retry(status_code: int, reason: str = ""):
     """Record that a proxied request was retried, with the triggering status/reason."""
     with _state_lock:
@@ -1104,16 +1313,9 @@ def log_status_code(status_code: int):
         _cap_counter_map(status_codes_detailed, config.MAX_STATUS_CODES)
 
 
-def log_proxy_request(method: str, duration: float):
+def log_proxy_request(method: str, duration: float, success: bool = True):
     with _state_lock:
-        if method in proxy_request_counts:
-            proxy_request_counts[method]["TotalTime"] += duration
-            proxy_request_counts[method]["Count"] += 1
-            proxy_request_counts[method]["LastRequestTime"] = time.time()
-            if duration < proxy_request_counts[method]["Min"] or proxy_request_counts[method]["Min"] == 0:
-                proxy_request_counts[method]["Min"] = duration
-            if duration > proxy_request_counts[method]["Max"]:
-                proxy_request_counts[method]["Max"] = duration
+        _record_timing(proxy_request_counts, method, duration, success)
 
 
 def _token_fp(token: str) -> str:
@@ -1349,6 +1551,8 @@ def get_diagnostics(force_flush: bool = False) -> dict:
                 "BudgetPeak24h": _budget_peak_since(1440),
                 "PauseDrops": pause_drops.get("Count", 0),
                 "ThrottleAllDrops": throttle_drops.get("Count", 0),
+                "TarpitStats": tarpit_stats,
+                "TarpitIps": tarpit_ips,
                 "Errors": errors,
                 "HeaderNames": _summarise_header_names(header_names),
                 "UserAgents": _summarise_user_agents(user_agents),
@@ -1356,6 +1560,10 @@ def get_diagnostics(force_flush: bool = False) -> dict:
                 "BlockedUserAgents": _summarise_user_agents(blocked_user_agents),
                 "ServerTime": time.time(),
                 "WorkerStartedAt": _started_at,
+                # Tarpit arrival rate over three windows. Comparing them is the
+                # answer to "are they knocking less often than they used to?" —
+                # a lifetime average alone can't show a change.
+                "TarpitRates": [_tarpit_rate(15), _tarpit_rate(60), _tarpit_rate(1440)],
                 # Record counts, so the dashboard can show what is actually
                 # accumulating instead of only what it is currently rendering.
                 "StoreSizes": {name: len(globals()[name]) for name in _PERSISTED_NAMES},
@@ -1380,6 +1588,21 @@ def get_diagnostics(force_flush: bool = False) -> dict:
         }
     except Exception:
         snapshot["Rotate"] = {"Configured": False, "Enabled": False, "ProxyUrl": ""}
+    # Live tarpit capacity and the worker fleet. Both read shared files rather
+    # than this worker's memory, and both are lazily imported for the same reason
+    # as the two above (they import runtime/config, not diagnostics).
+    try:
+        import tarpit
+
+        snapshot["Tarpit"] = tarpit.get_state()
+    except Exception:
+        snapshot["Tarpit"] = {}
+    try:
+        import workers
+
+        snapshot["WorkerFleet"] = workers.get_state()
+    except Exception:
+        snapshot["WorkerFleet"] = {}
     return snapshot
 
 
@@ -1414,6 +1637,9 @@ _PERSISTED_NAMES = (
     "token_budget_minutes",
     "pause_drops",
     "throttle_drops",
+    "tarpit_stats",
+    "tarpit_ips",
+    "tarpit_minutes",
     "errors",
     "header_names",
     "user_agents",
@@ -1464,6 +1690,7 @@ CLEAR_TARGETS = {
     "header_blocked_attempts": ("header_blocked_attempts",),
     "pause_drops": ("pause_drops",),
     "throttle_drops": ("throttle_drops",),
+    "tarpit": ("tarpit_stats", "tarpit_ips", "tarpit_minutes"),
     "live": ("live_requests",),
     "logins": ("login_attempts",),
     "crawls": ("crawls",),
