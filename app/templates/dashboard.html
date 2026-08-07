@@ -23,6 +23,13 @@
 				<h1 class="app-title">Roxy Admin</h1>
 			</div>
 			<div class="app-bar__section app-bar__section--end">
+				<input
+					id="sectionJump"
+					class="input input--jump"
+					type="search"
+					placeholder="Jump to section  /"
+					aria-label="Jump to a section"
+				/>
 				<button type="button" class="btn btn--outline" id="navRefresh" title="Refresh all dashboard data">
 					⟳ Refresh
 				</button>
@@ -51,6 +58,9 @@
 		</header>
 
 		<!-- Paused banner -->
+		<!-- Threat level: one line answering "is anything wrong right now?" -->
+		<div id="threatBanner" class="threat-banner" role="status" hidden></div>
+
 		<div id="pauseBanner" class="pause-banner" role="alert" hidden>
 			⏸ The proxy is currently <strong>PAUSED</strong>. The site stays online, but proxy requests are
 			rejected. <strong id="pauseBannerDrops">0</strong> request(s) dropped so far.
@@ -75,6 +85,8 @@
 					<li><a class="nav__link" href="#section-controls">Service Controls</a></li>
 					<li><a class="nav__link" href="#section-traffic">Traffic</a></li>
 					<li><a class="nav__link" href="#section-live">Live Requests</a></li>
+					<li><a class="nav__link" href="#section-callers">Callers &amp; Top Talkers</a></li>
+					<li><a class="nav__link" href="#section-refusals">Refusal Reasons</a></li>
 					<li><a class="nav__link" href="#section-endpoints">Endpoints</a></li>
 					<li><a class="nav__link" href="#section-endpoint-controls">Endpoint Controls</a></li>
 					<li><a class="nav__link" href="#section-throttle-bypass">Throttle Bypass</a></li>
@@ -99,6 +111,7 @@
 					<li><a class="nav__link" href="#section-logins">Admin Logins</a></li>
 					<li><a class="nav__link" href="#section-settings">Settings</a></li>
 					<li><a class="nav__link" href="#section-health">Health</a></li>
+					<li><a class="nav__link" href="#section-internal">Internal Requests</a></li>
 					<li><a class="nav__link" href="#section-rotation">Rotation Exit IPs</a></li>
 					<li><a class="nav__link" href="#section-tools">Tools</a></li>
 				</ul>
@@ -225,11 +238,11 @@
 								<strong>Throttle All</strong> button in the top bar.
 							</p>
 							<div class="form__row">
-								<div class="form__field" style="flex: 1 1 120px">
+								<div class="form__field form__field--half">
 									<label class="form__label" for="throttleLimit">Limit</label>
 									<input id="throttleLimit" class="input" type="number" min="1" value="1" />
 								</div>
-								<div class="form__field" style="flex: 1 1 120px">
+								<div class="form__field form__field--half">
 									<label class="form__label" for="throttlePeriod">Per (seconds)</label>
 									<input id="throttlePeriod" class="input" type="number" min="1" value="60" />
 								</div>
@@ -243,6 +256,32 @@
 									maxlength="300"
 									placeholder="e.g. High load — please slow down."
 								/>
+							</div>
+						</article>
+
+						<article class="card card--wide" id="throttleWatch" hidden>
+							<h3 class="card__title">Who is being throttled right now</h3>
+							<p class="form__hint">
+								Live while throttle-all is on: the callers actually being turned away, what they are
+								asking for and how fast. <strong id="throttleWatchDrops">0</strong> request(s) dropped so
+								far. <span id="throttleWatchTotal" class="chip">0 IP(s)</span>
+							</p>
+							<div class="table-wrap">
+								<table id="throttleWatchTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col" data-sort="ip" data-sort-type="text">IP</th>
+											<th scope="col" data-sort="count" data-sort-type="num">Requests</th>
+											<th scope="col" data-sort="refused" data-sort-type="num" data-sort-default="desc">
+												Refused
+											</th>
+											<th scope="col" data-sort="rate" data-sort-type="num">Rate</th>
+											<th scope="col" data-sort="endpoint" data-sort-type="text">Top Endpoint</th>
+											<th scope="col" data-sort="last" data-sort-type="num">Last Seen</th>
+										</tr>
+									</thead>
+									<tbody></tbody>
+								</table>
 							</div>
 						</article>
 
@@ -303,23 +342,203 @@
 						<h2 id="liveHeading" class="section__title">Live Requests</h2>
 						<div class="section__actions">
 							<span id="liveCount" class="chip">0 shown</span>
+							<span id="captureChip" class="chip chip--muted">Capture off</span>
 							<button id="refreshLive" class="btn btn--outline">Refresh</button>
+							<button id="clearCaptures" class="btn btn--outline" title="Drop the feed and every captured body">
+								Clear
+							</button>
 						</div>
 					</div>
 					<div class="card">
 						<p class="form__hint">
-							Most recent proxied requests (newest first). Sensitive headers are redacted; bodies are
-							truncated.
+							Every request aimed at the proxy, newest first — <strong>including the ones we refused</strong>,
+							which is usually what you are looking for. Each card shows what we answered, what Roblox
+							actually said, and why they differ. Open a card to load its request and response bodies.
+							Sensitive headers are redacted. Bodies are kept for
+							<strong id="captureWindow">—</strong> (tune <code>capture_*</code> in Settings).
 						</p>
-						<input
-							id="liveFilter"
-							class="input input--filter"
-							type="search"
-							placeholder="Filter by URL, IP, or method…"
-							aria-label="Filter live requests"
-						/>
+						<div class="form__row">
+							<input
+								id="liveFilter"
+								class="input input--filter"
+								type="search"
+								placeholder="Filter by URL, IP, place ID, status, body…"
+								aria-label="Filter live requests"
+							/>
+							<select
+								id="liveOutcomeFilter"
+								class="input input--select input--w220"
+								aria-label="Filter by outcome"
+							>
+								<option value="">All outcomes</option>
+								<option value="served">Served</option>
+								<option value="upstream_failed">Upstream failed</option>
+								<option value="throttled">Throttled (per-IP)</option>
+								<option value="throttle_all">Throttled (global)</option>
+								<option value="blocked_endpoint">Blocked endpoint</option>
+								<option value="endpoint_rule">Endpoint rate rule</option>
+								<option value="header_rule">Request filter</option>
+								<option value="probe">Probe</option>
+								<option value="auth_attempt">Auth attempt</option>
+								<option value="paused">Paused</option>
+							</select>
+						</div>
 						<div id="liveFeed" class="live-feed">
 							<!-- populated by JS from LiveRequests[] -->
+						</div>
+					</div>
+				</section>
+
+				<!-- Callers: who is talking to us, and who owns them -->
+				<section id="section-callers" class="section" aria-labelledby="callersHeading">
+					<div class="section__header">
+						<h2 id="callersHeading" class="section__title">Callers &amp; Top Talkers</h2>
+						<div class="section__actions">
+							<span id="callersTotal" class="chip">0 places</span>
+							<span id="talkersTotal" class="chip">0 IPs</span>
+						</div>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Identify an experience</h3>
+						<p class="form__hint">
+							Roblox stamps the calling place ID on every <code>HttpService</code> request as the
+							<code>Roblox-Id</code> header. Paste one here to find out which experience it is and who
+							owns it. Roblox's Open Cloud API can only read experiences your own API key controls, so
+							this uses the public endpoints instead — through this proxy, so it needs no extra
+							credentials.
+						</p>
+						<form id="lookupForm" class="form">
+							<div class="form__row">
+								<input
+									id="lookupId"
+									class="input"
+									type="text"
+									inputmode="numeric"
+									placeholder="e.g. 75227619283955"
+									aria-label="Place or universe ID"
+									required
+								/>
+								<select id="lookupKind" class="input input--select input--w160" aria-label="ID type">
+									<option value="place">Place ID</option>
+									<option value="universe">Universe ID</option>
+								</select>
+								<button type="submit" class="btn btn--filled">Identify</button>
+							</div>
+						</form>
+						<div id="lookupResult" hidden></div>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Callers (by Roblox place ID)</h3>
+						<p class="form__hint">
+							One row per calling experience. This is the identity worth acting on: a Roblox game reaches
+							us from hundreds of rotating server IPs, so the same caller is one row here and a hundred
+							rows in Top Talkers below. The header is self-reported, so treat it as evidence, not proof.
+							Click a row for its full breakdown.
+						</p>
+						<input
+							id="callersFilter"
+							class="input input--filter"
+							type="search"
+							placeholder="Filter by place ID or endpoint…"
+							aria-label="Filter callers"
+						/>
+						<div class="table-wrap">
+							<table id="callersTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col" data-sort="key" data-sort-type="text">Roblox-Id (place)</th>
+										<th scope="col" data-sort="count" data-sort-type="num" data-sort-default="desc">
+											Requests
+										</th>
+										<th scope="col" data-sort="rate" data-sort-type="num" title="Requests in the last minute">
+											Rate
+										</th>
+										<th scope="col" data-sort="refused" data-sort-type="num">Refused</th>
+										<th scope="col" data-sort="endpoint" data-sort-type="text">Top Endpoint</th>
+										<th scope="col" data-sort="peers" data-sort-type="num" title="Distinct source IPs">
+											IPs
+										</th>
+										<th scope="col" data-sort="last" data-sort-type="num">Last Seen</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Top Talkers (by IP)</h3>
+						<p class="form__hint">
+							The same traffic keyed on the client IP. Precise, but noisy for Roblox callers — use it for
+							anything that is not a game (scripts, scrapers, your own testing).
+						</p>
+						<input
+							id="talkersFilter"
+							class="input input--filter"
+							type="search"
+							placeholder="Filter by IP or endpoint…"
+							aria-label="Filter top talkers"
+						/>
+						<div class="table-wrap">
+							<table id="talkersTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col" data-sort="key" data-sort-type="text">IP</th>
+										<th scope="col" data-sort="count" data-sort-type="num" data-sort-default="desc">
+											Requests
+										</th>
+										<th scope="col" data-sort="rate" data-sort-type="num" title="Requests in the last minute">
+											Rate
+										</th>
+										<th scope="col" data-sort="refused" data-sort-type="num">Refused</th>
+										<th scope="col" data-sort="endpoint" data-sort-type="text">Top Endpoint</th>
+										<th scope="col" data-sort="peers" data-sort-type="num" title="Distinct places seen from this IP">
+											Places
+										</th>
+										<th scope="col" data-sort="last" data-sort-type="num">Last Seen</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
+				<!-- Refusals: which rule is answering, not just which code -->
+				<section id="section-refusals" class="section" aria-labelledby="refusalsHeading">
+					<div class="section__header">
+						<h2 id="refusalsHeading" class="section__title">Refusal Reasons</h2>
+						<div class="section__actions">
+							<span id="refusalsTotal" class="chip">0 reasons</span>
+						</div>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							Every refusal Roxy issued, keyed by the rule that produced it. Four different decisions all
+							answer <code>429</code>, so the status code alone cannot tell you which one is firing —
+							this can.
+						</p>
+						<div class="table-wrap">
+							<table id="refusalsTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col" data-sort="reason" data-sort-type="text">Reason</th>
+										<th scope="col" data-sort="count" data-sort-type="num" data-sort-default="desc">
+											Count
+										</th>
+										<th scope="col" data-sort="status" data-sort-type="num">Status</th>
+										<th scope="col" data-sort="path" data-sort-type="text">Last Path</th>
+										<th scope="col" data-sort="ip" data-sort-type="text">Last IP</th>
+										<th scope="col" data-sort="ips" data-sort-type="num">Unique IPs</th>
+										<th scope="col" data-sort="last" data-sort-type="num">Last Seen</th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
 						</div>
 					</div>
 				</section>
@@ -344,10 +563,14 @@
 							<table id="endpointsTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Endpoint</th>
-										<th scope="col">Count</th>
-										<th scope="col">Methods</th>
-										<th scope="col">Last Request</th>
+										<th data-sort="name" data-sort-type="text" scope="col">Endpoint</th>
+										<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Count</th>
+										<th data-sort="methods" data-sort-type="text" scope="col">Methods</th>
+										<th data-sort="ip" data-sort-type="text" scope="col" title="Client IP of the most recent request to reach this endpoint">
+											Last Caller
+										</th>
+										<th data-sort="status" data-sort-type="num" scope="col" title="What we answered that request with">Last Status</th>
+										<th data-sort="last" data-sort-type="num" scope="col">Last Request</th>
 									</tr>
 								</thead>
 								<tbody>
@@ -386,8 +609,16 @@
 										placeholder="games.roblox.com/v1/games"
 										required
 									/>
-									<input id="blockNote" class="input" type="text" placeholder="Note (optional)" />
-									<select id="blockType" class="input input--select" style="max-width: 120px" aria-label="Match type">
+									<input id="blockNote" class="input" type="text" placeholder="Note (private)" />
+									<input
+										id="blockMessage"
+										class="input"
+										type="text"
+										maxlength="400"
+										placeholder="Reply sent to the caller (optional)"
+										title="Returned verbatim instead of the default &quot;This endpoint is currently blocked.&quot; — e.g. point them at the cheaper endpoint"
+									/>
+									<select id="blockType" class="input input--select input--w120" aria-label="Match type">
 										<option value="glob">Wildcard</option>
 										<option value="regex">Regex</option>
 									</select>
@@ -398,10 +629,11 @@
 								<table id="blocksTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">Pattern</th>
-											<th scope="col">Type</th>
-											<th scope="col">Note</th>
-											<th scope="col">Added</th>
+											<th data-sort="pattern" data-sort-type="text" scope="col">Pattern</th>
+											<th data-sort="type" data-sort-type="text" scope="col">Type</th>
+											<th data-sort="note" data-sort-type="text" scope="col">Note</th>
+											<th data-sort="message" data-sort-type="text" scope="col" title="Returned to the caller instead of the default message">Reply</th>
+											<th data-sort="added" data-sort-type="num" data-sort-default="desc" scope="col">Added</th>
 											<th scope="col"></th>
 										</tr>
 									</thead>
@@ -433,26 +665,32 @@
 									/>
 									<input
 										id="ruleLimit"
-										class="input"
+										class="input input--w110"
 										type="number"
 										min="1"
 										placeholder="Limit"
 										required
-										style="max-width: 110px"
 									/>
 									<input
 										id="rulePeriod"
-										class="input"
+										class="input input--w130"
 										type="number"
 										min="1"
 										value="60"
 										placeholder="Period (s)"
-										style="max-width: 130px"
 									/>
-									<select id="ruleType" class="input input--select" style="max-width: 120px" aria-label="Match type">
+									<select id="ruleType" class="input input--select input--w120" aria-label="Match type">
 										<option value="glob">Wildcard</option>
 										<option value="regex">Regex</option>
 									</select>
+									<input
+										id="ruleMessage"
+										class="input"
+										type="text"
+										maxlength="400"
+										placeholder="Reply sent to the caller (optional)"
+										title="Returned verbatim instead of the default rate-limit message"
+									/>
 									<button type="submit" class="btn btn--filled">Set Rule</button>
 								</div>
 							</form>
@@ -460,11 +698,12 @@
 								<table id="rulesTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">Pattern</th>
-											<th scope="col">Type</th>
-											<th scope="col">Limit</th>
-											<th scope="col">Per (s)</th>
-											<th scope="col">Added</th>
+											<th data-sort="pattern" data-sort-type="text" scope="col">Pattern</th>
+											<th data-sort="type" data-sort-type="text" scope="col">Type</th>
+											<th data-sort="limit" data-sort-type="num" scope="col">Limit</th>
+											<th data-sort="period" data-sort-type="num" scope="col">Per (s)</th>
+											<th data-sort="message" data-sort-type="text" scope="col" title="Returned to the caller instead of the default message">Reply</th>
+											<th data-sort="added" data-sort-type="num" data-sort-default="desc" scope="col">Added</th>
 											<th scope="col"></th>
 										</tr>
 									</thead>
@@ -499,11 +738,10 @@
 								<input id="bypassIp" class="input" type="text" placeholder="e.g. 203.0.113.7" required />
 								<input
 									id="bypassExpiry"
-									class="input"
+									class="input input--w240"
 									type="number"
 									min="1"
 									placeholder="Expire after (minutes, optional)"
-									style="max-width: 240px"
 									aria-label="Expire after minutes (optional)"
 								/>
 								<input id="bypassNote" class="input" type="text" placeholder="Note (optional)" />
@@ -514,10 +752,10 @@
 							<table id="bypassTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">IP</th>
-										<th scope="col">Note</th>
-										<th scope="col">Added</th>
-										<th scope="col">Expires</th>
+										<th data-sort="ip" data-sort-type="text" scope="col">IP</th>
+										<th data-sort="note" data-sort-type="text" scope="col">Note</th>
+										<th data-sort="added" data-sort-type="num" data-sort-default="desc" scope="col">Added</th>
+										<th data-sort="expires" data-sort-type="num" scope="col">Expires</th>
 										<th scope="col"></th>
 									</tr>
 								</thead>
@@ -588,9 +826,14 @@
 							<p class="form__hint" id="tarpitBoundsHint">
 								Each hold is a random length in that range — a fixed delay is learnable, so a client
 								could just set a shorter timeout and never wait. Capped at 55s so a hold can never
-								outlive the
-								just set a shorter timeout and never wait. Capped at 55s so a hold can never outlive the
-								gunicorn worker timeout (90s) that would kill the worker instead of the caller.
+								outlive the gunicorn worker timeout (90s), which would kill the worker instead of the
+								caller.
+							</p>
+							<p class="form__hint" id="tarpitCapacityHint">
+								A held request occupies one of the fleet's request slots for its whole hold, so
+								<strong>Max concurrent</strong> is clamped to a share of the real slot count — set it
+								higher than the fleet can afford and the extra is quietly ignored rather than starving
+								real traffic.
 							</p>
 						</form>
 						<h3 class="card__title">Which refusals to hold</h3>
@@ -695,12 +938,12 @@
 								<table id="tarpitCategoryTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">Reason</th>
-											<th scope="col">Held</th>
-											<th scope="col">Skipped</th>
-											<th scope="col">Avg Hold</th>
-											<th scope="col">Time Wasted</th>
-											<th scope="col">Last</th>
+											<th data-sort="reason" data-sort-type="text" scope="col">Reason</th>
+											<th data-sort="held" data-sort-type="num" data-sort-default="desc" scope="col">Held</th>
+											<th data-sort="skipped" data-sort-type="num" scope="col">Skipped</th>
+											<th data-sort="avg" data-sort-type="num" scope="col">Avg Hold</th>
+											<th data-sort="wasted" data-sort-type="num" scope="col">Time Wasted</th>
+											<th data-sort="last" data-sort-type="num" scope="col">Last</th>
 										</tr>
 									</thead>
 									<tbody></tbody>
@@ -717,13 +960,13 @@
 								<table id="tarpitIpsTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">IP</th>
-											<th scope="col">Held</th>
-											<th scope="col">Skipped</th>
-											<th scope="col">Avg Gap</th>
-											<th scope="col">Time Wasted</th>
-											<th scope="col">First Seen</th>
-											<th scope="col">Last Seen</th>
+											<th data-sort="ip" data-sort-type="text" scope="col">IP</th>
+											<th data-sort="held" data-sort-type="num" data-sort-default="desc" scope="col">Held</th>
+											<th data-sort="skipped" data-sort-type="num" scope="col">Skipped</th>
+											<th data-sort="gap" data-sort-type="num" scope="col">Avg Gap</th>
+											<th data-sort="wasted" data-sort-type="num" scope="col">Time Wasted</th>
+											<th data-sort="first" data-sort-type="num" scope="col">First Seen</th>
+											<th data-sort="last" data-sort-type="num" scope="col">Last Seen</th>
 										</tr>
 									</thead>
 									<tbody></tbody>
@@ -761,16 +1004,14 @@
 							<div class="form__row">
 								<input
 									id="headerRuleHeader"
-									class="input"
+									class="input input--w170"
 									type="text"
-									style="max-width: 170px"
 									placeholder="Header (optional)"
 									aria-label="Specific header name (optional)"
 								/>
 								<select
 									id="headerRuleScope"
-									class="input input--select"
-									style="max-width: 170px"
+									class="input input--select input--w170"
 									aria-label="Match against"
 								>
 									<option value="either">Name or value</option>
@@ -779,8 +1020,7 @@
 								</select>
 								<select
 									id="headerRuleMode"
-									class="input input--select"
-									style="max-width: 150px"
+									class="input input--select input--w150"
 									aria-label="Match type"
 								>
 									<option value="contains">Contains</option>
@@ -794,20 +1034,34 @@
 									placeholder="Text to match (e.g. Xeno)"
 									required
 								/>
-								<input id="headerRuleNote" class="input" type="text" placeholder="Note (optional)" />
+								<input id="headerRuleNote" class="input" type="text" placeholder="Note (private)" />
+								<input
+									id="headerRuleMessage"
+									class="input"
+									type="text"
+									maxlength="400"
+									placeholder="Reply (optional — breaks stealth)"
+									title="Leave empty to keep the default: a blocked caller sees an ordinary throttle 429 and cannot tell they were filtered."
+								/>
 								<button type="submit" class="btn btn--warning">Add Rule</button>
 							</div>
+							<p class="form__hint">
+								A filtered caller normally receives the ordinary throttle 429, so they conclude they are
+								sending too much rather than that they have been fingerprinted. Setting a reply tells them
+								they were caught — useful for redirecting a legitimate integration, a gift to a hostile one.
+							</p>
 						</form>
 						<div class="table-wrap">
 							<table id="headerRulesTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Header</th>
-										<th scope="col">Match Against</th>
-										<th scope="col">Type</th>
-										<th scope="col">Text</th>
-										<th scope="col">Note</th>
-										<th scope="col">Added</th>
+										<th data-sort="header" data-sort-type="text" scope="col">Header</th>
+										<th data-sort="scope" data-sort-type="text" scope="col">Match Against</th>
+										<th data-sort="type" data-sort-type="text" scope="col">Type</th>
+										<th data-sort="text" data-sort-type="text" scope="col">Text</th>
+										<th data-sort="note" data-sort-type="text" scope="col">Note</th>
+										<th data-sort="message" data-sort-type="text" scope="col" title="Custom reply. Leave empty to keep the stealth throttle message.">Reply</th>
+										<th data-sort="added" data-sort-type="num" data-sort-default="desc" scope="col">Added</th>
 										<th scope="col"></th>
 									</tr>
 								</thead>
@@ -857,16 +1111,14 @@
 						<div class="form__row">
 							<input
 								id="testerHeader"
-								class="input"
+								class="input input--w170"
 								type="text"
-								style="max-width: 170px"
 								placeholder="Header (optional)"
 								aria-label="Draft rule: specific header"
 							/>
 							<select
 								id="testerScope"
-								class="input input--select"
-								style="max-width: 170px"
+								class="input input--select input--w170"
 								aria-label="Draft rule: match against"
 							>
 								<option value="either">Name or value</option>
@@ -875,8 +1127,7 @@
 							</select>
 							<select
 								id="testerMode"
-								class="input input--select"
-								style="max-width: 150px"
+								class="input input--select input--w150"
 								aria-label="Draft rule: match type"
 							>
 								<option value="contains">Contains</option>
@@ -929,13 +1180,13 @@
 							<table id="blockedAttemptsTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Endpoint</th>
-										<th scope="col">Attempts</th>
-										<th scope="col">Unique IPs</th>
-										<th scope="col">Methods</th>
-										<th scope="col">Matched Block</th>
-										<th scope="col">Last IP</th>
-										<th scope="col">Last Attempt</th>
+										<th data-sort="endpoint" data-sort-type="text" scope="col">Endpoint</th>
+										<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Attempts</th>
+										<th data-sort="ips" data-sort-type="num" scope="col">Unique IPs</th>
+										<th data-sort="methods" data-sort-type="text" scope="col">Methods</th>
+										<th data-sort="pattern" data-sort-type="text" scope="col">Matched Block</th>
+										<th data-sort="lastip" data-sort-type="text" scope="col">Last IP</th>
+										<th data-sort="last" data-sort-type="num" scope="col">Last Attempt</th>
 									</tr>
 								</thead>
 								<tbody>
@@ -965,13 +1216,13 @@
 							<table id="rateLimitedAttemptsTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Endpoint</th>
-										<th scope="col">Attempts</th>
-										<th scope="col">Unique IPs</th>
-										<th scope="col">Methods</th>
-										<th scope="col">Matched Rule</th>
-										<th scope="col">Last IP</th>
-										<th scope="col">Last Attempt</th>
+										<th data-sort="endpoint" data-sort-type="text" scope="col">Endpoint</th>
+										<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Attempts</th>
+										<th data-sort="ips" data-sort-type="num" scope="col">Unique IPs</th>
+										<th data-sort="methods" data-sort-type="text" scope="col">Methods</th>
+										<th data-sort="pattern" data-sort-type="text" scope="col">Matched Rule</th>
+										<th data-sort="lastip" data-sort-type="text" scope="col">Last IP</th>
+										<th data-sort="last" data-sort-type="num" scope="col">Last Attempt</th>
 									</tr>
 								</thead>
 								<tbody>
@@ -1001,15 +1252,15 @@
 							<table id="headerBlockedTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Rule</th>
-										<th scope="col">Blocked</th>
-										<th scope="col">Unique IPs</th>
-										<th scope="col">Last Header</th>
-										<th scope="col">Triggered By</th>
-										<th scope="col">Matched Text</th>
-										<th scope="col">Last IP</th>
-										<th scope="col">Last Path</th>
-										<th scope="col">Last Attempt</th>
+										<th data-sort="rule" data-sort-type="text" scope="col">Rule</th>
+										<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Blocked</th>
+										<th data-sort="ips" data-sort-type="num" scope="col">Unique IPs</th>
+										<th data-sort="header" data-sort-type="text" scope="col">Last Header</th>
+										<th data-sort="trigger" data-sort-type="text" scope="col">Triggered By</th>
+										<th data-sort="matched" data-sort-type="text" scope="col">Matched Text</th>
+										<th data-sort="lastip" data-sort-type="text" scope="col">Last IP</th>
+										<th data-sort="path" data-sort-type="text" scope="col">Last Path</th>
+										<th data-sort="last" data-sort-type="num" scope="col">Last Attempt</th>
 									</tr>
 								</thead>
 								<tbody>
@@ -1070,11 +1321,11 @@
 								</caption>
 								<thead>
 									<tr>
-										<th scope="col">#</th>
-										<th scope="col">Masked</th>
-										<th scope="col">Being Validated</th>
-										<th scope="col">Uses</th>
-										<th scope="col">Last Used</th>
+										<th data-sort="index" data-sort-type="num" scope="col">#</th>
+										<th data-sort="masked" data-sort-type="text" scope="col">Masked</th>
+										<th data-sort="validating" data-sort-type="text" scope="col">Being Validated</th>
+										<th data-sort="uses" data-sort-type="num" data-sort-default="desc" scope="col">Uses</th>
+										<th data-sort="lastused" data-sort-type="num" scope="col">Last Used</th>
 									</tr>
 								</thead>
 								<tbody>
@@ -1190,13 +1441,60 @@
 							<table id="statusDetailedTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Status Code</th>
-										<th scope="col">Count</th>
+										<th data-sort="code" data-sort-type="num" scope="col">Status Code</th>
+										<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Count</th>
 									</tr>
 								</thead>
 								<tbody>
 									<!-- rows from StatusCodesDetailed -->
 								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
+					<div class="card">
+						<h3 class="card__title">Who returned it?</h3>
+						<p class="form__hint">
+							The same codes split by origin. This is the difference between <em>Roblox is rate-limiting
+							us</em> (act on it — the account behind the token is at risk) and <em>we are rate-limiting
+							callers</em> (the system working). The table above counts Roblox's answers only.
+						</p>
+						<div id="statusSourceVerdict" class="callout callout--muted">—</div>
+						<div class="kpi-grid kpi-grid--compact">
+							<article class="kpi">
+								<div class="kpi__label">429s from Roblox</div>
+								<div class="kpi__value" id="src_roblox_429">0</div>
+								<div class="kpi__hint">Roblox throttling us</div>
+							</article>
+							<article class="kpi">
+								<div class="kpi__label">429s from Roxy</div>
+								<div class="kpi__value" id="src_roxy_429">0</div>
+								<div class="kpi__hint">Us throttling callers</div>
+							</article>
+							<article class="kpi">
+								<div class="kpi__label">5xx from Roblox</div>
+								<div class="kpi__value" id="src_roblox_5xx">0</div>
+								<div class="kpi__hint">Upstream failures</div>
+							</article>
+							<article class="kpi">
+								<div class="kpi__label">5xx from Roxy</div>
+								<div class="kpi__value" id="src_roxy_5xx">0</div>
+								<div class="kpi__hint">Our own failures</div>
+							</article>
+						</div>
+						<div class="table-wrap">
+							<table id="statusSourceTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col" data-sort="source" data-sort-type="text">Source</th>
+										<th scope="col" data-sort="code" data-sort-type="num">Status Code</th>
+										<th scope="col" data-sort="count" data-sort-type="num" data-sort-default="desc">
+											Count
+										</th>
+									</tr>
+								</thead>
+								<tbody></tbody>
 							</table>
 						</div>
 					</div>
@@ -1217,8 +1515,8 @@
 								<table id="retryStatusTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">Status Code</th>
-											<th scope="col">Retries</th>
+											<th data-sort="code" data-sort-type="num" scope="col">Status Code</th>
+											<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Retries</th>
 										</tr>
 									</thead>
 									<tbody></tbody>
@@ -1231,8 +1529,8 @@
 								<table id="retryReasonTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">Reason</th>
-											<th scope="col">Retries</th>
+											<th data-sort="reason" data-sort-type="text" scope="col">Reason</th>
+											<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Retries</th>
 										</tr>
 									</thead>
 									<tbody></tbody>
@@ -1343,13 +1641,13 @@
 							<table id="requestFailuresTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Requester</th>
-										<th scope="col">Reason</th>
-										<th scope="col">Count</th>
-										<th scope="col">Last Status</th>
-										<th scope="col">Last Endpoint</th>
-										<th scope="col">First Seen</th>
-										<th scope="col">Last Seen</th>
+										<th data-sort="requester" data-sort-type="text" scope="col">Requester</th>
+										<th data-sort="reason" data-sort-type="text" scope="col">Reason</th>
+										<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Count</th>
+										<th data-sort="status" data-sort-type="num" scope="col">Last Status</th>
+										<th data-sort="endpoint" data-sort-type="text" scope="col">Last Endpoint</th>
+										<th data-sort="first" data-sort-type="num" scope="col">First Seen</th>
+										<th data-sort="last" data-sort-type="num" scope="col">Last Seen</th>
 									</tr>
 								</thead>
 								<tbody>
@@ -1375,9 +1673,9 @@
 								<table id="crawlsTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">IP</th>
-											<th scope="col">Count</th>
-											<th scope="col">Last Request (ts)</th>
+											<th data-sort="ip" data-sort-type="text" scope="col">IP</th>
+											<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Count</th>
+											<th data-sort="last" data-sort-type="num" scope="col">Last Request (ts)</th>
 										</tr>
 									</thead>
 									<tbody>
@@ -1404,9 +1702,9 @@
 								<table id="throttledTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">IP</th>
-											<th scope="col">Count</th>
-											<th scope="col">Last Throttle (ts)</th>
+											<th data-sort="ip" data-sort-type="text" scope="col">IP</th>
+											<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Count</th>
+											<th data-sort="last" data-sort-type="num" scope="col">Last Throttle (ts)</th>
 										</tr>
 									</thead>
 									<tbody>
@@ -1433,10 +1731,10 @@
 								<table id="probeTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">Date (ts)</th>
-											<th scope="col">IP</th>
-											<th scope="col">User-Agent</th>
-											<th scope="col">Reason</th>
+											<th data-sort="date" data-sort-type="num" data-sort-default="desc" scope="col">Date (ts)</th>
+											<th data-sort="ip" data-sort-type="text" scope="col">IP</th>
+											<th data-sort="ua" data-sort-type="text" scope="col">User-Agent</th>
+											<th data-sort="reason" data-sort-type="text" scope="col">Reason</th>
 										</tr>
 									</thead>
 									<tbody>
@@ -1465,9 +1763,9 @@
 							<table id="exploitSummaryTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Reason</th>
-										<th scope="col">Count</th>
-										<th scope="col">Last Seen</th>
+										<th data-sort="reason" data-sort-type="text" scope="col">Reason</th>
+										<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Count</th>
+										<th data-sort="last" data-sort-type="num" scope="col">Last Seen</th>
 									</tr>
 								</thead>
 								<tbody></tbody>
@@ -1512,9 +1810,9 @@
 								<table id="headerNamesTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">Header Name</th>
-											<th scope="col">Count</th>
-											<th scope="col">Last Seen</th>
+											<th data-sort="name" data-sort-type="text" scope="col">Header Name</th>
+											<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Count</th>
+											<th data-sort="last" data-sort-type="num" scope="col">Last Seen</th>
 											<th scope="col">Actions</th>
 										</tr>
 									</thead>
@@ -1540,9 +1838,9 @@
 								<table id="userAgentsTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">User-Agent</th>
-											<th scope="col">Count</th>
-											<th scope="col">Last Seen</th>
+											<th data-sort="ua" data-sort-type="text" scope="col">User-Agent</th>
+											<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Count</th>
+											<th data-sort="last" data-sort-type="num" scope="col">Last Seen</th>
 										</tr>
 									</thead>
 									<tbody></tbody>
@@ -1566,9 +1864,9 @@
 							<table id="ignoredHeadersTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Header</th>
-										<th scope="col">Why</th>
-										<th scope="col">Detail</th>
+										<th data-sort="header" data-sort-type="text" scope="col">Header</th>
+										<th data-sort="why" data-sort-type="text" scope="col">Why</th>
+										<th data-sort="detail" data-sort-type="text" scope="col">Detail</th>
 										<th scope="col">Actions</th>
 									</tr>
 								</thead>
@@ -1609,9 +1907,9 @@
 								<table id="blockedHeaderNamesTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">Header Name</th>
-											<th scope="col">Count</th>
-											<th scope="col">Last Seen</th>
+											<th data-sort="name" data-sort-type="text" scope="col">Header Name</th>
+											<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Count</th>
+											<th data-sort="last" data-sort-type="num" scope="col">Last Seen</th>
 											<th scope="col">Actions</th>
 										</tr>
 									</thead>
@@ -1635,9 +1933,9 @@
 								<table id="blockedUserAgentsTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">User-Agent</th>
-											<th scope="col">Count</th>
-											<th scope="col">Last Seen</th>
+											<th data-sort="ua" data-sort-type="text" scope="col">User-Agent</th>
+											<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Count</th>
+											<th data-sort="last" data-sort-type="num" scope="col">Last Seen</th>
 										</tr>
 									</thead>
 									<tbody></tbody>
@@ -1673,10 +1971,11 @@
 							<table id="errorsTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Error</th>
-										<th scope="col">Count</th>
-										<th scope="col">First Seen</th>
-										<th scope="col">Last Seen</th>
+										<th data-sort="error" data-sort-type="text" scope="col">Error</th>
+										<th data-sort="source" data-sort-type="text" scope="col" title="Whether this failure was ours, Roblox&#39;s, or one of our own probes">Source</th>
+										<th data-sort="count" data-sort-type="num" data-sort-default="desc" scope="col">Count</th>
+										<th data-sort="first" data-sort-type="num" scope="col">First Seen</th>
+										<th data-sort="last" data-sort-type="num" scope="col">Last Seen</th>
 									</tr>
 								</thead>
 								<tbody>
@@ -1702,9 +2001,9 @@
 								<table id="loginsTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">Date (ts)</th>
-											<th scope="col">IP</th>
-											<th scope="col">Successful</th>
+											<th data-sort="date" data-sort-type="num" data-sort-default="desc" scope="col">Date (ts)</th>
+											<th data-sort="ip" data-sort-type="text" scope="col">IP</th>
+											<th data-sort="ok" data-sort-type="text" scope="col">Successful</th>
 										</tr>
 									</thead>
 									<tbody>
@@ -1873,21 +2172,67 @@
 							you: the proxy is idle, not broken.
 						</p>
 						<div class="table-wrap">
+							<div class="form__row form__row--end">
+								<button
+									id="resetWorkerCounts"
+									type="button"
+									class="btn btn--outline btn--sm"
+									title="Zero the request counters on every worker. Uptime and memory are not affected."
+								>
+									Reset request counts
+								</button>
+							</div>
 							<table id="workersTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">PID</th>
-										<th scope="col">Uptime</th>
-										<th scope="col">Memory</th>
-										<th scope="col">Threads</th>
-										<th scope="col" title="Every request this worker served, dashboard polls included. This is what gunicorn counts toward recycling the worker.">All Requests</th>
-										<th scope="col" title="Only requests aimed at the proxy, served or refused. This is the one that tells you whether anyone is actually using the service.">Proxy Requests</th>
-										<th scope="col">Last Heartbeat</th>
+										<th data-sort="pid" data-sort-type="num" scope="col">PID</th>
+										<th data-sort="uptime" data-sort-type="num" data-sort-default="desc" scope="col">Uptime</th>
+										<th data-sort="memory" data-sort-type="num" scope="col">Memory</th>
+										<th data-sort="threads" data-sort-type="num" scope="col">Threads</th>
+										<th data-sort="requests" data-sort-type="num" scope="col" title="Every request this worker served, dashboard polls included. This is what gunicorn counts toward recycling the worker.">All Requests</th>
+										<th data-sort="proxied" data-sort-type="num" scope="col" title="Only requests aimed at the proxy, served or refused. This is the one that tells you whether anyone is actually using the service.">Proxy Requests</th>
+										<th data-sort="last" data-sort-type="num" scope="col">Last Heartbeat</th>
 									</tr>
 								</thead>
 								<tbody>
 									<!-- built by JS from WorkerFleet -->
 								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+
+				<!-- Roxy's own upstream calls -->
+				<section id="section-internal" class="section" aria-labelledby="internalHeading">
+					<div class="section__header">
+						<h2 id="internalHeading" class="section__title">Internal Requests</h2>
+					</div>
+					<div class="card">
+						<p class="form__hint">
+							The calls Roxy makes to Roblox <em>on its own behalf</em> — token validation and the
+							rotation exit-IP probe. These go straight out via HTTP and never enter the proxy route, so
+							<strong>no endpoint block, rate rule, request filter, throttle or pause can affect
+							them</strong>. Client traffic to a similarly-named public endpoint is unrelated to these
+							and safe to block. They do still count against the token's request budget, because they
+							are real requests to Roblox.
+						</p>
+						<div class="table-wrap">
+							<table id="internalTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col" data-sort="purpose" data-sort-type="text">Call Site</th>
+										<th scope="col" data-sort="url" data-sort-type="text">Endpoint</th>
+										<th scope="col" data-sort="health" data-sort-type="num" data-sort-default="asc">
+											Health
+										</th>
+										<th scope="col" data-sort="count" data-sort-type="num">Calls</th>
+										<th scope="col" data-sort="failed" data-sort-type="num">Failed</th>
+										<th scope="col" data-sort="avg" data-sort-type="num">Avg</th>
+										<th scope="col" data-sort="error" data-sort-type="text">Last Error</th>
+										<th scope="col" data-sort="last" data-sort-type="num">Last Call</th>
+									</tr>
+								</thead>
+								<tbody></tbody>
 							</table>
 						</div>
 					</div>
@@ -1915,9 +2260,9 @@
 							<table id="rotateIpsTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Exit IP</th>
-										<th scope="col">Source</th>
-										<th scope="col">When</th>
+										<th data-sort="ip" data-sort-type="text" scope="col">Exit IP</th>
+										<th data-sort="source" data-sort-type="text" scope="col">Source</th>
+										<th data-sort="when" data-sort-type="num" data-sort-default="desc" scope="col">When</th>
 									</tr>
 								</thead>
 								<tbody>
@@ -1946,8 +2291,8 @@
 								<table id="storeSizesTable" class="table">
 									<thead>
 										<tr>
-											<th scope="col">Store</th>
-											<th scope="col">Records</th>
+											<th data-sort="store" data-sort-type="text" scope="col">Store</th>
+											<th data-sort="records" data-sort-type="num" data-sort-default="desc" scope="col">Records</th>
 										</tr>
 									</thead>
 									<tbody></tbody>

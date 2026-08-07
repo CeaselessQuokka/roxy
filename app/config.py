@@ -97,6 +97,12 @@ TARPIT_FILE = os.environ.get("ROXY_TARPIT_FILE", "/etc/roxy/roxy_tarpit.json")
 # Shared worker registry: each gunicorn worker heartbeats its pid/uptime/memory
 # here so the dashboard can show the fleet instead of whichever worker answered.
 WORKERS_FILE = os.environ.get("ROXY_WORKERS_FILE", "/etc/roxy/roxy_workers.json")
+# Shared request/response CAPTURE ring: the full bodies behind the live feed.
+# Deliberately its own file and deliberately NOT part of DATA_FILE, because this
+# is the one store that holds attacker-controlled payloads of arbitrary size.
+# Keeping it separate means it is bounded by its own byte budget + TTL, can be
+# dropped at any moment, and can never contribute to the stats file growing.
+CAPTURE_FILE = os.environ.get("ROXY_CAPTURE_FILE", "/etc/roxy/roxy_capture.json")
 # Hard cap on distinct IPs tracked in the throttle file so a spoofed-IP flood
 # can't bloat it; the oldest (least-recently-seen) entry is evicted past this.
 MAX_TRACKED_THROTTLE_IPS = 20000
@@ -156,6 +162,14 @@ TARPIT_MIN_SECONDS = 8  # Randomised per request so the delay can't be learned..
 TARPIT_MAX_SECONDS = 20  # ...and short enough to leave the request budget alone.
 TARPIT_MAX_CONCURRENT = 6  # Held requests allowed at once, FLEET-wide. Must stay well under workers*threads.
 TARPIT_SLOT_GRACE = 15  # Seconds a lease may outlive its hold before it's reclaimed (worker killed mid-hold).
+# Hard ceiling on the tunable above, expressed as a FRACTION of the fleet's real
+# request slots (workers x threads). The setting's own max is 64, which on a
+# 16-slot fleet would let the tarpit consume every thread and take the proxy
+# down — a misconfiguration the admin has no way to see coming. This clamp is
+# applied at admission time, so raising the setting past what the fleet can
+# afford quietly does nothing instead of quietly self-DoSing.
+TARPIT_MAX_CAPACITY_FRACTION = 0.5
+TARPIT_FALLBACK_SLOTS = 16  # Assumed workers x threads when the real figure can't be read.
 MAX_TARPIT_IP_RECORDS = 200  # Distinct tarpitted IPs kept for the per-IP breakdown.
 MAX_TARPIT_ARRIVALS = 2000  # Distinct IPs whose last arrival time is kept (for the gap measurement).
 TARPIT_HISTORY_MINUTES = 1500  # Per-minute hold buckets retained (~25h), for the request-frequency trend.
@@ -189,8 +203,48 @@ GLOBAL_THROTTLE_PERIOD = 60  # In seconds.
 # --- Extra diagnostics limits ---
 MAX_ENDPOINT_RECORDS = 200  # How many distinct endpoints to track (most-frequent are kept).
 MAX_EXPLOIT_SUMMARY = 100  # How many distinct exploit/probe reasons to keep aggregated.
-MAX_LIVE_REQUESTS = 50  # How many recent requests to keep for the live feed.
+# The live feed is the first place anyone looks during an incident, and 50
+# entries is under twenty seconds of history on a proxy under load — by the time
+# the dashboard is open the interesting requests have already scrolled off.
+MAX_LIVE_REQUESTS = 150  # How many recent requests to keep for the live feed.
 MAX_LIVE_BODY_LENGTH = 2000  # Max characters of a request body to retain for the live feed.
+
+# --- Per-endpoint recent requests --------------------------------------------
+# Each endpoint template keeps a short ring of the most recent requests that hit
+# it (who, with what query/body, and what came back), so "what exactly is this
+# endpoint being asked for?" is answerable without waiting for the live feed to
+# catch the next one. Fetched on demand, never in the dashboard poll.
+ENDPOINT_RECENT_REQUESTS = 5  # Default ring length per endpoint template.
+MAX_ENDPOINT_RECENT_REQUESTS = 25  # Hard ceiling on the tunable above.
+MAX_ENDPOINT_RECENT_BODY = 600  # Characters of query/body kept per recent-request entry.
+MAX_IPS_PER_ENDPOINT_RECORD = 25  # Distinct client IPs retained per endpoint template.
+
+# --- Who is calling ----------------------------------------------------------
+# Two views of the same traffic, because an attacker controls one of them and
+# not the other. IPs churn (Roblox game servers hold hundreds); the Roblox-Id
+# header names the PLACE the request came from and is stable per experience,
+# which is what actually identifies a caller worth blocking.
+MAX_IP_ACTIVITY_RECORDS = 400  # Distinct client IPs tracked in the Top Talkers view.
+MAX_CALLER_RECORDS = 200  # Distinct Roblox place IDs tracked in the Callers view.
+ACTIVITY_ENDPOINTS_PER_RECORD = 12  # Distinct endpoints retained per IP/caller record.
+ACTIVITY_HISTORY_MINUTES = 120  # Per-minute request buckets retained per IP/caller (for rates).
+MAX_REFUSAL_RECORDS = 100  # Distinct refusal reasons retained (each is a code path, so this is generous).
+MAX_INTERNAL_REQUEST_RECORDS = 50  # Distinct internal (Roxy-originated) upstream call sites tracked.
+
+# --- Request/response capture ------------------------------------------------
+# The live feed shows metadata for every request; the actual bodies live here.
+# Three independent ceilings, because any one of them alone has a failure mode:
+# a count cap says nothing about size, a byte cap lets one quiet hour pin stale
+# data forever, and a TTL alone is unbounded under a flood.
+# Sized to outlast the live feed rather than to a round number: a capture window
+# shorter than the feed means most cards in it open to "that expired", which
+# reads as broken. The byte budget is the ceiling that actually binds — at a
+# typical 1-2 KB per pair this count is reached long before it, and at 16 KB
+# bodies the bytes win first. That is the intended order.
+CAPTURE_MAX_RECORDS = 250  # How many captured request/response pairs are retained.
+CAPTURE_MAX_BYTES = 4 * 1024 * 1024  # Total budget for the capture file; oldest entries evicted past it.
+CAPTURE_MAX_BODY = 16 * 1024  # Characters kept per body (request and response counted separately).
+CAPTURE_TTL_SECONDS = 900  # How long a capture may live regardless of the caps above.
 
 # --- Admin session invalidation ---
 INVALIDATION_TOKEN_EXPIRATION = 86400  # In seconds, how long an emailed "invalidate session" link stays valid.

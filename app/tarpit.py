@@ -82,6 +82,39 @@ def _bounds() -> tuple[float, float]:
     return low, high
 
 
+def fleet_slots() -> int:
+    """How many requests the fleet can serve at once (gunicorn workers x threads).
+
+    Read from the same environment gunicorn.conf.py reads, so the two cannot
+    disagree. A held request occupies one of these for its entire hold, which is
+    the fact the whole concurrency cap exists to respect.
+    """
+    try:
+        workers = int(os.environ.get("ROXY_WORKERS", "4") or 4)
+        threads = int(os.environ.get("ROXY_THREADS", "4") or 4)
+        slots = workers * threads
+        return slots if slots > 0 else config.TARPIT_FALLBACK_SLOTS
+    except (TypeError, ValueError):
+        return config.TARPIT_FALLBACK_SLOTS
+
+
+def capacity() -> tuple[int, int, int]:
+    """The concurrency limit actually enforced. Returns (effective, configured, fleet_slots).
+
+    The setting's own maximum is 64. On the 16-slot fleet this runs on, a 64
+    would let held refusals occupy every request slot the service has — the
+    tarpit would stop the proxy rather than the caller, and nothing in the UI
+    would have hinted at it beforehand. So the configured value is clamped to a
+    fraction of the real slot count at admission time. Raising the setting past
+    what the fleet can afford quietly does nothing, which is the correct failure
+    mode for a knob whose worst case is self-inflicted downtime.
+    """
+    configured = max(0, int(_setting("tarpit_max_concurrent", config.TARPIT_MAX_CONCURRENT)))
+    slots = fleet_slots()
+    ceiling = max(1, int(slots * config.TARPIT_MAX_CAPACITY_FRACTION))
+    return min(configured, ceiling), configured, slots
+
+
 def _pick_duration() -> float:
     """A randomised hold. Fixed delays are learnable — a client that knows the
     hold is exactly 15s can set a 1s timeout and never wait; a spread means the
@@ -101,7 +134,7 @@ def _admit(ip: str, lease: str, hold_for: float, now: float) -> tuple[bool, floa
 
     Returns (admitted, seconds_since_this_IP's_previous_tarpitted_request).
     """
-    limit = max(0, int(_setting("tarpit_max_concurrent", config.TARPIT_MAX_CONCURRENT)))
+    limit, _, _ = capacity()
 
     def mutate(data):
         slots = data.setdefault("Slots", {})
@@ -201,7 +234,7 @@ def hold(ip: str, category: str) -> float:
 def get_state() -> dict:
     """Live tarpit configuration + capacity for the dashboard."""
     low, high = _bounds()
-    limit = max(0, int(_setting("tarpit_max_concurrent", config.TARPIT_MAX_CONCURRENT)))
+    limit, configured, slots = capacity()
     active = active_holds()
     return {
         "Enabled": is_enabled(),
@@ -210,8 +243,18 @@ def get_state() -> dict:
         "MinSeconds": low,
         "MaxSeconds": high,
         "MaxConcurrent": limit,
+        # What the admin asked for vs. what the fleet can afford. Shown side by
+        # side so a clamp is visible rather than mysterious.
+        "ConfiguredConcurrent": configured,
+        "Clamped": configured > limit,
+        "FleetSlots": slots,
         "ActiveHolds": active,
         "SlotsFree": max(0, limit - active),
+        # Share of the fleet's total request slots currently sat on by held
+        # refusals. This is the number that says whether the tarpit is costing
+        # real users capacity — the one thing it must never quietly do.
+        "CapacityUsedPct": round((active / slots) * 100, 1) if slots else 0.0,
+        "CapacityCeilingPct": round(config.TARPIT_MAX_CAPACITY_FRACTION * 100),
     }
 
 

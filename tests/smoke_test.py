@@ -28,6 +28,7 @@ os.environ["ROXY_THROTTLE_FILE"] = os.path.join(sandbox, "roxy_throttle.json")
 os.environ["ROXY_COORD_FILE"] = os.path.join(sandbox, "roxy_coord.json")
 os.environ["ROXY_TARPIT_FILE"] = os.path.join(sandbox, "roxy_tarpit.json")
 os.environ["ROXY_WORKERS_FILE"] = os.path.join(sandbox, "roxy_workers.json")
+os.environ["ROXY_CAPTURE_FILE"] = os.path.join(sandbox, "roxy_capture.json")
 # Rotation proxy is configured from the start (only "token"/"rotate" methods
 # exist now, so most fallback tests need Rotate available); specific sections
 # temporarily remove/restore this file to test the disabled/unavailable cases.
@@ -2197,6 +2198,537 @@ r = api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10
 check("A sample the tester calls blocked is blocked for real", r.status_code == 429, r.status_code)
 for existing in list(runtime.get_header_rules()):
     client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": existing})
+
+
+# =============================================================================
+# Diagnostics overhaul: attribution, caller identity, capture, rule messages
+# =============================================================================
+import capture as capture_module  # noqa: E402
+import workers as workers_module  # noqa: E402
+
+# Every store this suite reads is per-worker until a flush merges it, so each
+# section forces one rather than trusting the autosave interval to have run.
+def diag():
+    return diag_module.get_diagnostics(force_flush=True)
+
+
+def clear_all_diag():
+    diag_module.clear_stats(diag_module.CLEAR_ALL_NAMES)
+    capture_module.reset()
+
+
+IP_ATT = {"X-Forwarded-For": "10.55.0.1"}
+PLACE = "75227619283955"
+
+# These sections make many requests from a handful of IPs, so the ordinary
+# per-IP limit would throttle them into refusals and the assertions below would
+# be reading the throttle rather than what they mean to test.
+_PRIOR_RPM = runtime.get_setting("allowed_requests_per_minute")
+runtime.set_setting("allowed_requests_per_minute", 100000)
+
+
+def fresh_upstream():
+    """Restore a healthy upstream: 200s, a live token, no routing cooldowns.
+
+    Earlier sections deliberately break these (a 429 drops the token, a timeout
+    parks Rotate), and an unhealthy upstream turns every later request into a
+    500 that looks like a bug in whatever is being tested.
+    """
+    proxy_module.requests.request = fake_upstream
+    proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
+    reset_routing()
+
+print("\n== Status codes are attributed to whoever produced them ==")
+reset_routing()
+clear_all_diag()
+proxy_module.requests.request = fake_upstream  # 200s
+r = api_client.get("/games.roblox.com/v1/games", headers={**IP_ATT, "Roblox-Id": PLACE})
+check("A proxied request still succeeds", r.status_code == 200, r.status_code)
+sources = diag()["StatusSources"]
+check("Roblox's own 200 is counted under Roblox", sources["Roblox"].get("200") == 1, sources)
+check("...and what the caller received is counted separately", sources["Relay"].get("200") == 1, sources)
+check("Nothing is attributed to Roxy for a clean request", not sources["Roxy"], sources)
+
+# Now a refusal we generate ourselves: same 429 shape, opposite meaning.
+runtime.block_endpoint("games.roblox.com/v1/games/blocked", "test")
+r = api_client.get("/games.roblox.com/v1/games/blocked", headers=IP_ATT)
+check("A blocked endpoint is refused", r.status_code == 403, r.status_code)
+sources = diag()["StatusSources"]
+check("Our own 403 is counted under Roxy, not Roblox", sources["Roxy"].get("403") == 1, sources)
+check("...and never leaks into Roblox's column", "403" not in sources["Roblox"], sources)
+
+# A 429 from Roblox and a 429 from us must be distinguishable — this is the whole
+# point of the split, because the two demand opposite actions.
+clear_all_diag()
+reset_routing()
+proxy_module.requests.request = upstream_429
+api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.55.0.9"})
+sources = diag()["StatusSources"]
+check("A 429 FROM Roblox lands in the Roblox column", sources["Roblox"].get("429", 0) >= 1, sources)
+check("...and not in ours", "429" not in sources["Roxy"], sources)
+
+runtime.set_setting("global_throttle_limit", 1)
+runtime.set_setting("global_throttle_period", 60)
+runtime.set_throttle_all(True)
+api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.55.0.20"})
+api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.55.0.20"})
+runtime.set_throttle_all(False)
+sources = diag()["StatusSources"]
+check("A 429 WE issued lands in the Roxy column", sources["Roxy"].get("429", 0) >= 1, sources)
+fresh_upstream()  # the 429 above dropped the token for revalidation
+
+print("\n== Refusals are keyed by the rule that produced them ==")
+clear_all_diag()
+runtime.block_endpoint("games.roblox.com/v1/blocked-two", "test")
+api_client.get("/games.roblox.com/v1/blocked-two", headers=IP_ATT)
+api_client.get("/nothing.example.com/probe", headers=IP_ATT)
+refusals = diag()["Refusals"]
+blocked = [k for k in refusals if k.startswith("Blocked endpoint")]
+probes = [k for k in refusals if "Non-Roblox" in k]
+check("A blocked endpoint records its own reason", blocked, list(refusals))
+check("A probe records a different reason", probes, list(refusals))
+check("...so a single status code no longer hides which rule fired", len(refusals) >= 2, list(refusals))
+check("A refusal remembers the path it refused", refusals[blocked[0]].get("LastPath") == "games.roblox.com/v1/blocked-two")
+check("...and who asked", refusals[blocked[0]].get("LastIP") == "10.55.0.1", refusals[blocked[0]])
+runtime.unblock_endpoint("games.roblox.com/v1/blocked-two")
+runtime.unblock_endpoint("games.roblox.com/v1/games/blocked")
+
+print("\n== Endpoints record their last request, ID in the path or not ==")
+clear_all_diag()
+fresh_upstream()
+# The regression this covers: LastHeaders/LastIP were only ever attached to
+# CONCRETE paths, and only when the template had collapsed an ID -- so the
+# busiest endpoint there is (no ID in its path) could never show who called it.
+api_client.post(
+    "/users.roblox.com/v1/users",
+    headers={**IP_ATT, "Roblox-Id": PLACE, "User-Agent": "Roblox/Linux"},
+    json={"userIds": [398800, 398801]},
+)
+row = diag()["Endpoints"]["users.roblox.com/v1/users"]
+check("An ID-less endpoint reports its last caller", row.get("LastIP") == "10.55.0.1", row)
+check("...the status it answered with", str(row.get("LastStatus")) == "200", row)
+check("...the place that called it", row.get("LastCallerId") == PLACE, row)
+check("...and offers a drill-down", row.get("HasDetail") is True, row)
+
+detail = diag_module.get_endpoint_detail("users.roblox.com/v1/users")
+check("The drill-down keeps recent requests", len(detail["Recent"]) == 1, detail["Recent"])
+recent = detail["Recent"][0]
+check("...with the body that was sent", "398800" in (recent.get("Body") or ""), recent)
+check("...the headers that came with it", "Roblox-Id" in (recent.get("Headers") or ""), recent)
+check("...and what Roblox answered", str(recent.get("UpstreamStatus")) == "200", recent)
+check("The endpoint tracks its distinct callers", detail["IPs"].get("10.55.0.1") == 1, detail["IPs"])
+
+# An ID-bearing path keeps working exactly as before, at both levels.
+api_client.get("/games.roblox.com/v1/games/9583680112/votes", headers=IP_ATT)
+detail = diag_module.get_endpoint_detail("games.roblox.com/v1/games/{gameId}/votes")
+check("A templated endpoint still lists its concrete paths", "games.roblox.com/v1/games/9583680112/votes" in detail["Concrete"])
+concrete = detail["Concrete"]["games.roblox.com/v1/games/9583680112/votes"]
+check("...and the concrete path keeps its own last request", concrete.get("LastIP") == "10.55.0.1", concrete)
+
+runtime.set_setting("endpoint_recent_requests", 2)
+for _ in range(5):
+    api_client.get("/games.roblox.com/v1/games", headers=IP_ATT)
+detail = diag_module.get_endpoint_detail("games.roblox.com/v1/games")
+check("The recent-request ring honours its cap", len(detail["Recent"]) == 2, len(detail["Recent"]))
+runtime.set_setting("endpoint_recent_requests", config.ENDPOINT_RECENT_REQUESTS)
+
+print("\n== Who is calling: per-IP and per-place activity ==")
+clear_all_diag()
+fresh_upstream()
+for i in range(3):
+    api_client.get(
+        "/games.roblox.com/v1/games",
+        headers={"X-Forwarded-For": "10.56.0.%d" % i, "Roblox-Id": PLACE, "User-Agent": "Roblox/Linux"},
+    )
+snapshot = diag()
+callers = snapshot["Callers"]
+ips = snapshot["IpActivity"]
+check("One experience is one row, however many IPs it uses", callers.get(PLACE, {}).get("Count") == 3, callers)
+check("...while the same traffic is three rows by IP", len([k for k in ips if k.startswith("10.56.")]) == 3, list(ips))
+check("A caller's distinct source IPs are counted", callers[PLACE]["PeerCount"] == 3, callers[PLACE])
+check("A rate is reported alongside the total", callers[PLACE]["Rate1"] == 3, callers[PLACE])
+check("The caller's user-agent is kept", callers[PLACE]["UserAgent"] == "Roblox/Linux", callers[PLACE])
+
+detail = diag_module.get_activity_detail("caller", PLACE)
+check("A caller drills down to its endpoints", detail["Endpoints"].get("games.roblox.com/v1/games") == 3, detail)
+check("...its status codes", detail["Statuses"].get("200") == 3, detail)
+check("...its outcomes", detail["Outcomes"].get("served") == 3, detail)
+check("...and its source IPs", len(detail["Peers"]) == 3, detail)
+
+# Refusals count against the caller too -- the one being blocked is the one worth counting.
+runtime.block_endpoint("economy.roblox.com", "test")
+api_client.get("/economy.roblox.com/v1/x", headers={"X-Forwarded-For": "10.56.0.0", "Roblox-Id": PLACE})
+runtime.unblock_endpoint("economy.roblox.com")
+callers = diag()["Callers"]
+check("A refused request counts against its caller", callers[PLACE]["Refused"] == 1, callers[PLACE])
+check("...but the three served ones do not", callers[PLACE]["Count"] == 4, callers[PLACE])
+
+runtime.set_setting("activity_tracking", 0)
+api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.57.0.1"})
+check("Activity tracking can be turned off", "10.57.0.1" not in diag()["IpActivity"])
+runtime.set_setting("activity_tracking", 1)
+
+print("\n== The live feed covers refusals, not just successes ==")
+clear_all_diag()
+fresh_upstream()
+runtime.block_endpoint("thumbnails.roblox.com", "test")
+api_client.get("/thumbnails.roblox.com/v1/x", headers=IP_ATT)
+api_client.get("/games.roblox.com/v1/games", headers=IP_ATT)
+runtime.unblock_endpoint("thumbnails.roblox.com")
+feed = diag()["LiveRequests"]
+outcomes = {item.get("Outcome") for item in feed}
+check("A served request appears in the feed", "served" in outcomes, outcomes)
+check("A REFUSED request appears too", "blocked_endpoint" in outcomes, outcomes)
+refused = next(i for i in feed if i.get("Outcome") == "blocked_endpoint")
+check("...saying which rule refused it", "Blocked endpoint" in (refused.get("Reason") or ""), refused)
+served = next(i for i in feed if i.get("Outcome") == "served")
+check("A served entry records Roblox's own status", str(served.get("UpstreamStatus")) == "200", served)
+check("...which upstream method served it", served.get("UpstreamMethod") in ("token", "rotate"), served)
+check("...and how long it took", isinstance(served.get("Duration"), (int, float)), served)
+
+print("\n== Captured bodies are bounded three ways ==")
+capture_module.reset()
+runtime.set_setting("capture_enabled", 1)
+runtime.set_setting("capture_max_records", 3)
+for i in range(6):
+    capture_module.record({"URL": "u%d" % i, "RequestBody": "req%d" % i, "ResponseBody": "resp%d" % i})
+state = capture_module.get_state()
+check("The record cap evicts oldest-first", state["Count"] == 3, state)
+
+runtime.set_setting("capture_max_records", 100)
+runtime.set_setting("capture_max_bytes", 900)
+capture_module.reset()
+for i in range(20):
+    capture_module.record({"URL": "u%d" % i, "RequestBody": "x" * 200, "ResponseBody": "y" * 200})
+state = capture_module.get_state()
+check("The byte budget is enforced independently of the count", state["Bytes"] <= 900, state)
+check("...and something survives it", state["Count"] >= 1, state)
+
+runtime.set_setting("capture_max_bytes", config.CAPTURE_MAX_BYTES)
+runtime.set_setting("capture_max_body", 10)
+capture_module.reset()
+cid = capture_module.record({"URL": "u", "RequestBody": "a" * 500, "ResponseBody": "b" * 500})
+entry = capture_module.get(cid)
+check("A body is truncated to the configured length", len(entry["ResponseBody"]) == 10, entry)
+check("...and says so", entry["ResponseBodyTruncated"] is True, entry)
+check("...keeping the original length for context", entry["ResponseBodyLength"] == 500, entry)
+runtime.set_setting("capture_max_body", config.CAPTURE_MAX_BODY)
+
+capture_module.reset()
+runtime.set_setting("capture_ttl_seconds", 0)  # 0 disables the TTL, so this checks the opposite
+cid = capture_module.record({"URL": "u", "ResponseBody": "z"})
+check("A capture is retrievable while it lives", capture_module.get(cid) is not None)
+runtime.set_setting("capture_ttl_seconds", config.CAPTURE_TTL_SECONDS)
+
+capture_module.reset()
+runtime.set_setting("capture_enabled", 0)
+check("Capture can be switched off entirely", capture_module.record({"URL": "u"}) == "")
+runtime.set_setting("capture_enabled", 1)
+
+# The property that keeps capture off the hot path: recording buffers in memory
+# rather than rewriting the whole shared file under an flock on every request.
+# Doing that per request would put a several-hundred-KB serialize plus
+# cross-worker lock contention on the busiest path, worst during exactly the
+# flood this feature exists to diagnose.
+capture_module.reset()
+capture_module.flush()
+_mtime_before = os.path.getmtime(config.CAPTURE_FILE) if os.path.exists(config.CAPTURE_FILE) else 0
+_ids = [capture_module.record({"URL": "u%d" % i, "ResponseBody": "b"}) for i in range(5)]
+_mtime_after = os.path.getmtime(config.CAPTURE_FILE) if os.path.exists(config.CAPTURE_FILE) else 0
+check("Recording does not touch the shared file", _mtime_after == _mtime_before, (_mtime_before, _mtime_after))
+check("...but a buffered capture is readable immediately", capture_module.get(_ids[-1]) is not None)
+capture_module.flush()
+check("...and a flush merges the batch", capture_module.get_state()["Count"] == 5, capture_module.get_state())
+check("...where it stays readable", capture_module.get(_ids[0]) is not None)
+
+# End to end: the live feed hands the dashboard an id that resolves to real bodies.
+clear_all_diag()
+fresh_upstream()
+api_client.post("/users.roblox.com/v1/users", headers=IP_ATT, json={"userIds": [1, 2, 3]})
+item = diag()["LiveRequests"][0]
+check("A live entry carries a capture id", bool(item.get("CaptureId")), item)
+entry = capture_module.get(item["CaptureId"])
+check("...that resolves to the request body", "userIds" in entry["RequestBody"], entry)
+check("...and to the RESPONSE body", entry["ResponseBody"] == '{"ok":true}', entry)
+check("Response headers are captured too", isinstance(entry["ResponseHeaders"], dict), entry)
+
+r = client.get("/admin/live/detail?id=does-not-exist", headers={**IP_MAIN, "Accept": "application/json"})
+check("An expired capture 404s rather than erroring", r.status_code == 404, r.status_code)
+
+print("\n== Secrets never reach the capture store ==")
+capture_module.reset()
+cid = capture_module.record(
+    {
+        "URL": "u",
+        "RequestHeaders": capture_module.redact_headers({"Cookie": "secret", "X-Roblox-Token": "t", "Accept": "json"}),
+        "ResponseHeaders": capture_module.redact_headers({"Set-Cookie": "sess=abc"}),
+    }
+)
+entry = capture_module.get(cid)
+check("Cookies are redacted on the way in", entry["RequestHeaders"]["Cookie"] == "[redacted]", entry)
+check("So is the token header", entry["RequestHeaders"]["X-Roblox-Token"] == "[redacted]", entry)
+check("So is an upstream Set-Cookie", entry["ResponseHeaders"]["Set-Cookie"] == "[redacted]", entry)
+check("Ordinary headers survive", entry["RequestHeaders"]["Accept"] == "json", entry)
+
+print("\n== Rules can carry their own reply to the caller ==")
+fresh_upstream()
+r = client.post(
+    "/admin/endpoints/block",
+    headers={**IP_MAIN, "Accept": "application/json"},
+    json={
+        "pattern": "www.roblox.com/games/votingservice",
+        "note": "legacy",
+        "message": "Deprecated: use games.roblox.com/v1/games/*/votes instead.",
+    },
+)
+check("A block accepts a caller-facing message", r.status_code == 200, r.status_code)
+r = api_client.get("/www.roblox.com/games/votingservice/1234", headers=IP_ATT)
+check("...which is what the caller receives", r.get_json() == "Deprecated: use games.roblox.com/v1/games/*/votes instead.", r.get_json())
+check("...with the normal blocked status", r.status_code == 403, r.status_code)
+check("The private note is not sent to the caller", "legacy" not in (r.get_data(as_text=True) or ""))
+client.post("/admin/endpoints/unblock", headers=IP_MAIN, json={"pattern": "www.roblox.com/games/votingservice"})
+
+r = client.post(
+    "/admin/endpoints/rule",
+    headers={**IP_MAIN, "Accept": "application/json"},
+    json={"pattern": "avatar.roblox.com", "limit": 1, "period": 60, "message": "Batch your avatar lookups."},
+)
+check("A rate rule accepts a message", r.status_code == 200, r.status_code)
+api_client.get("/avatar.roblox.com/v1/x", headers={"X-Forwarded-For": "10.58.0.1"})
+r = api_client.get("/avatar.roblox.com/v1/x", headers={"X-Forwarded-For": "10.58.0.1"})
+check("A rate-limited caller gets the custom message", r.get_json() == "Batch your avatar lookups.", r.get_json())
+check("...still as a 429", r.status_code == 429, r.status_code)
+client.post("/admin/endpoints/rule/clear", headers=IP_MAIN, json={"pattern": "avatar.roblox.com"})
+
+# A filter's default is silence -- a message is opt-in because it gives the game away.
+client.post(
+    "/admin/headers/rule",
+    headers={**IP_MAIN, "Accept": "application/json"},
+    json={"header": "Roblox-Id", "scope": "value", "mode": "exact", "needle": PLACE},
+)
+r = api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.59.0.1", "Roblox-Id": PLACE})
+check("A filtered caller still sees a plain throttle by default", "throttled" in r.get_data(as_text=True).lower(), r.get_data(as_text=True))
+for existing in list(runtime.get_header_rules()):
+    client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": existing})
+
+client.post(
+    "/admin/headers/rule",
+    headers={**IP_MAIN, "Accept": "application/json"},
+    json={
+        "header": "Roblox-Id",
+        "scope": "value",
+        "mode": "exact",
+        "needle": PLACE,
+        "message": "Contact the proxy owner about your usage.",
+    },
+)
+r = api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.59.0.2", "Roblox-Id": PLACE})
+check("...but a filter message is honoured when set", r.get_json() == "Contact the proxy owner about your usage.", r.get_json())
+for existing in list(runtime.get_header_rules()):
+    client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": existing})
+
+print("\n== Internal probes are exempt from every caller-facing rule ==")
+clear_all_diag()
+fresh_upstream()
+# The worry this settles: that a block or rate rule could take out the token
+# health check. It cannot -- internal probes call requests.get directly and never
+# enter the proxy route -- and this asserts it rather than trusting control flow.
+runtime.set_paused(True)
+runtime.set_throttle_all(True)
+runtime.block_endpoint("accountinformation.roblox.com", "would break the health check if it applied")
+runtime.set_endpoint_rule("accountinformation.roblox.com", 1, 60)
+client.post("/admin/headers/rule", headers=IP_MAIN, json={"scope": "either", "mode": "contains", "needle": "Accept"})
+before = len(get_calls)
+report = proxy_module.check_tokens()
+check("A token check still reaches Roblox while paused", len(get_calls) > before, len(get_calls))
+check("...and reports the token as active", any(t.get("Active") for t in report), report)
+check("...through a blocked, rate-limited, filtered endpoint", all(t.get("Error") in ("", None) for t in report), report)
+internal = diag()["InternalRequests"]
+check("The probe is recorded as internal", "token_check" in internal, internal)
+check("...with its own success count", internal["token_check"]["Count"] >= 1, internal)
+check("...and is NOT counted as caller traffic", "token_check" not in diag()["IpActivity"])
+check("Its status lands in the Internal column", diag()["StatusSources"]["Internal"].get("200", 0) >= 1, diag()["StatusSources"])
+check("The internal endpoint list names the probe URL", any("accountinformation" in e["URL"] for e in proxy_module.internal_endpoints()))
+runtime.unblock_endpoint("accountinformation.roblox.com")
+runtime.clear_endpoint_rule("accountinformation.roblox.com")
+for existing in list(runtime.get_header_rules()):
+    client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": existing})
+runtime.set_paused(False)
+runtime.set_throttle_all(False)
+
+r = client.get("/admin/internal/endpoints", headers={**IP_MAIN, "Accept": "application/json"})
+check("The dashboard can list every internal call site", r.status_code == 200, r.status_code)
+check("...and explains why rules cannot reach them", "never pass through the proxy route" in r.get_json()["Note"])
+
+print("\n== Worker request counts are resettable ==")
+workers_module.count_request()
+workers_module.count_request()
+workers_module.count_proxied()
+workers_module.heartbeat()
+before = workers_module.get_state()
+check("Worker counters accumulate", before["TotalRequests"] >= 2, before["TotalRequests"])
+workers_module.reset_counts()
+workers_module.heartbeat()
+after = workers_module.get_state()
+check("Resetting zeroes the fleet's request count", after["TotalRequests"] == 0, after["TotalRequests"])
+check("...and the proxy count with it", after["TotalProxied"] == 0, after["TotalProxied"])
+check("...recording when it happened", after["CountersResetAt"] > 0, after)
+check("Uptime is not disturbed by a counter reset", after["ServiceStartedAt"] == before["ServiceStartedAt"])
+
+r = client.post("/admin/workers/reset", headers={**IP_MAIN, "Accept": "application/json"})
+check("The admin route resets them too", r.status_code == 200, r.status_code)
+
+workers_module.count_request()
+workers_module.heartbeat()
+check("Counters climb again after a reset", workers_module.get_state()["TotalRequests"] >= 1)
+for _ in range(20):
+    workers_module.count_request()
+    workers_module.count_proxied()
+workers_module.heartbeat()
+busy = workers_module.get_state()["TotalRequests"]
+client.post("/admin/data/clear", headers={**IP_MAIN, "Accept": "application/json"}, json={"target": "all"})
+workers_module.heartbeat()
+state = workers_module.get_state()
+# Not exactly zero, and correctly so: the counter includes EVERY request the
+# worker serves (that is what gunicorn recycles on), so the clear-all request
+# itself is counted the moment after it resets them. What must be gone is
+# everything that came before it.
+check("Clear-all takes the worker counters with it", state["TotalRequests"] < busy, (busy, state["TotalRequests"]))
+check("...leaving only the request that did the clearing", state["TotalRequests"] <= 1, state["TotalRequests"])
+check("...and zeroing the proxy count outright", state["TotalProxied"] == 0, state["TotalProxied"])
+check("...and the captured bodies", capture_module.get_state()["Count"] == 0, capture_module.get_state())
+
+print("\n== Tarpit cannot outgrow the fleet it runs on ==")
+# The setting's own maximum is 64. On a 16-slot fleet that would let held
+# refusals occupy every request slot the service has, i.e. the tarpit takes the
+# proxy down instead of the caller. The clamp makes over-configuring a no-op.
+os.environ["ROXY_WORKERS"] = "4"
+os.environ["ROXY_THREADS"] = "4"
+runtime.set_setting("tarpit_max_concurrent", 64)
+effective, configured, slots = tarpit_module.capacity()
+check("The fleet's real slot count is read, not assumed", slots == 16, slots)
+check("An over-configured cap is clamped", effective < configured, (effective, configured))
+check("...to a fraction of the fleet", effective == 8, effective)
+state = tarpit_module.get_state()
+check("The clamp is visible to the admin", state["Clamped"] is True, state)
+check("...alongside what was asked for", state["ConfiguredConcurrent"] == 64, state)
+check("Capacity pressure is reported", "CapacityUsedPct" in state, state)
+runtime.set_setting("tarpit_max_concurrent", 4)
+effective, configured, _ = tarpit_module.capacity()
+check("A sane cap is left alone", effective == configured == 4, (effective, configured))
+check("...and reports itself as unclamped", tarpit_module.get_state()["Clamped"] is False)
+runtime.set_setting("tarpit_max_concurrent", config.TARPIT_MAX_CONCURRENT)
+
+print("\n== The tarpit holds refusals and nothing else ==")
+# The one property that matters: a hold happens only on a path that has already
+# decided to refuse, so it can never delay (or admit) a real request.
+clear_all_diag()
+fresh_upstream()
+runtime.set_setting("tarpit_enabled", 1)
+runtime.set_setting("tarpit_min_seconds", 0)
+runtime.set_setting("tarpit_max_seconds", 1)
+runtime.set_setting("tarpit_on_probe", 1)
+held_before = diag_module.tarpit_stats.get("Count", 0)
+start = time.time()
+r = api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.60.0.1"})
+served_elapsed = time.time() - start
+check("A request that will be SERVED is never held", r.status_code == 200, r.status_code)
+check("...and is not delayed", served_elapsed < 1.5, served_elapsed)
+check("...and is not counted as tarpitted", diag_module.tarpit_stats.get("Count", 0) == held_before)
+api_client.get("/not-roblox.example.com/x", headers={"X-Forwarded-For": "10.60.0.2"})
+check("A probe IS held", diag_module.tarpit_stats.get("Count", 0) > held_before, diag_module.tarpit_stats)
+check("The hold is attributed to the right category", "probe" in diag_module.tarpit_stats.get("Categories", {}))
+
+# A bypass IP is exempt, which is what makes the allowlist usable for testing.
+runtime.add_throttle_bypass("10.60.0.3", 0, "test")
+before = diag_module.tarpit_stats.get("Count", 0)
+start = time.time()
+api_client.get("/not-roblox.example.com/x", headers={"X-Forwarded-For": "10.60.0.3"})
+check("A bypass IP is never held", time.time() - start < 1.5)
+check("...and is not counted", diag_module.tarpit_stats.get("Count", 0) == before)
+runtime.remove_throttle_bypass("10.60.0.3")
+runtime.set_setting("tarpit_enabled", 0)
+
+print("\n== Errors say whose fault they were ==")
+clear_all_diag()
+diag_module.log_error("something we broke", "detail", source="Roxy")
+diag_module.log_error("something Roblox broke", "detail", source="Roblox")
+errors = diag()["Errors"]
+check("An error records its source", errors["something we broke"]["Source"] == "Roxy", errors)
+check("...distinguishing an upstream failure from ours", errors["something Roblox broke"]["Source"] == "Roblox", errors)
+
+print("\n== Merged stat stores stay capped ==")
+# A per-worker cap alone is not enough: merging N workers' individually-capped
+# sets produces an uncapped union. retry_counts' child maps were declared as
+# `children`, which for a single-record store silently did nothing.
+clear_all_diag()
+for i in range(config.MAX_RETRY_REASONS + 25):
+    diag_module.log_retry(429, "reason-%d" % i)
+merged = diag()["RetryCounts"]
+check("Retry reasons are capped after the merge", len(merged["Reasons"]) <= config.MAX_RETRY_REASONS, len(merged["Reasons"]))
+for i in range(config.MAX_STATUS_CODES + 25):
+    diag_module.log_status_code(200 + i, source="Roxy")
+check("Per-source status codes are capped", len(diag()["StatusSources"]["Roxy"]) <= config.MAX_STATUS_CODES)
+for i in range(config.MAX_IP_ACTIVITY_RECORDS + 30):
+    diag_module.log_traffic("10.99.%d.%d" % (i // 256, i % 256), "", "GET", "games.roblox.com/v1/games", 200, "served")
+check("IP activity is capped", len(diag()["IpActivity"]) <= config.MAX_IP_ACTIVITY_RECORDS, len(diag()["IpActivity"]))
+for i in range(config.MAX_CALLER_RECORDS + 30):
+    diag_module.log_traffic("10.98.0.1", "place-%d" % i, "GET", "games.roblox.com/v1/games", 200, "served")
+check("Callers are capped", len(diag()["Callers"]) <= config.MAX_CALLER_RECORDS, len(diag()["Callers"]))
+clear_all_diag()
+
+print("\n== The new sections clear independently ==")
+fresh_upstream()
+api_client.get("/games.roblox.com/v1/games", headers={**IP_ATT, "Roblox-Id": PLACE})
+runtime.block_endpoint("badges.roblox.com", "test")
+api_client.get("/badges.roblox.com/v1/x", headers=IP_ATT)
+runtime.unblock_endpoint("badges.roblox.com")
+check("Callers are populated before the clear", bool(diag()["Callers"]))
+r = client.post("/admin/data/clear", headers={**IP_MAIN, "Accept": "application/json"}, json={"target": "callers"})
+check("Clearing callers -> 200", r.status_code == 200, r.status_code)
+after = diag()
+check("...empties the caller table", not after["Callers"], after["Callers"])
+check("...and leaves refusals alone", bool(after["Refusals"]), after["Refusals"])
+client.post("/admin/data/clear", headers={**IP_MAIN, "Accept": "application/json"}, json={"target": "refusals"})
+check("Refusals clear on their own", not diag()["Refusals"])
+
+print("\n== Place lookup resolves an experience to its owner ==")
+# Walks the same public chain the dashboard button uses: place -> universe ->
+# creator. The upstream is stubbed, so this checks the plumbing and the shape,
+# not Roblox's data.
+lookup_calls = []
+
+
+def fake_lookup(method, url, headers=None, params=None, data=None, cookies=None, timeout=None, proxies=None):
+    lookup_calls.append(url)
+    if "universes/v1/places" in url:
+        return FakeUpstreamResponse(text='{"universeId": 10649318893}')
+    return FakeUpstreamResponse(
+        text='{"data":[{"id":10649318893,"rootPlaceId":75227619283955,"name":"Untitled Experience",'
+        '"description":"","playing":1,"visits":16,"maxPlayers":1,"favoritedCount":0,'
+        '"created":"2026-08-07T15:44:27Z","updated":"2026-08-07T20:09:18Z",'
+        '"creator":{"id":55667462,"name":"vesonce","type":"User","hasVerifiedBadge":false}}]}'
+    )
+
+
+fresh_upstream()
+proxy_module.requests.request = fake_lookup
+r = client.post("/admin/lookup/place", headers={**IP_MAIN, "Accept": "application/json"}, json={"id": PLACE})
+proxy_module.requests.request = fake_upstream
+payload = r.get_json()
+check("Looking up a place -> 200", r.status_code == 200, r.status_code)
+check("It resolves the place to a universe", str(payload.get("UniverseId")) == "10649318893", payload)
+check("...names the experience", payload.get("Name") == "Untitled Experience", payload)
+check("...names the owner", payload.get("CreatorName") == "vesonce", payload)
+check("...and what kind of owner it is", payload.get("CreatorType") == "User", payload)
+check("...with a link to their profile", "users/55667462" in (payload.get("CreatorUrl") or ""), payload)
+check("Both lookup hops go through the proxy stack", len(lookup_calls) == 2, lookup_calls)
+r = client.post("/admin/lookup/place", headers={**IP_MAIN, "Accept": "application/json"}, json={"id": "not-a-number"})
+check("A non-numeric ID is rejected, not proxied", r.status_code == 400, r.status_code)
+
+clear_all_diag()
+reset_routing()
+runtime.set_setting("allowed_requests_per_minute", _PRIOR_RPM)
 
 print(f"\n{'=' * 40}\nRESULT: {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

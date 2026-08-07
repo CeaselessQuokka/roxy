@@ -40,11 +40,28 @@ const print = console.log;
 		if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ago`;
 		return `${Math.floor(s / 86400)}d ago`;
 	}
-	// A timestamp cell: relative time as text, exact time on hover.
+	// A timestamp cell: relative time as text, exact time on hover. The raw epoch
+	// rides along as a sort value, because "3m ago" sorts alphabetically as
+	// nonsense — 3m, 30s and 3h would order 30s, 3h, 3m.
 	function tsNode(ts) {
 		const span = document.createElement("span");
 		span.textContent = timeAgo(ts);
-		if (typeof ts === "number" && isFinite(ts) && ts > 0) span.title = toTS(ts);
+		if (typeof ts === "number" && isFinite(ts) && ts > 0) {
+			span.title = toTS(ts);
+			span.dataset.sortValue = String(ts);
+		} else {
+			span.dataset.sortValue = "";
+		}
+		return span;
+	}
+
+	// A cell whose displayed text and sort key differ (a formatted duration, a
+	// badge, a bar). Wrap the value so the sorter reads the number, not the label.
+	function sortable(node, value) {
+		const el = node instanceof Node ? node : document.createTextNode(String(node ?? ""));
+		const span = document.createElement("span");
+		span.appendChild(el);
+		span.dataset.sortValue = value === null || value === undefined ? "" : String(value);
 		return span;
 	}
 	function fmtNum(x, digits = 0) {
@@ -68,16 +85,160 @@ const print = console.log;
 		if (el) el.textContent = val;
 	}
 
-	// Build a <tr> with cells
+	// Build a <tr> with cells. A cell node carrying data-sort-value hands it up to
+	// its <td>, which is where the table sorter looks — so tsNode()/sortable()
+	// make a column sort correctly wherever they are used, with no per-table work.
 	function tr(cells = []) {
 		const tr = document.createElement("tr");
 		cells.forEach(c => {
 			const td = document.createElement("td");
-			if (c instanceof Node) td.appendChild(c);
-			else td.textContent = c;
+			if (c instanceof Node) {
+				td.appendChild(c);
+				if (c.dataset && c.dataset.sortValue !== undefined) td.dataset.sortValue = c.dataset.sortValue;
+			} else td.textContent = c;
 			tr.appendChild(td);
 		});
 		return tr;
+	}
+
+	// -----------------------------
+	// Sortable tables
+	// -----------------------------
+	// Sorting happens on the rendered DOM rather than inside each renderer. That
+	// is a deliberate trade: the thirty-odd tables here build their rows in thirty
+	// different ways (chevrons, badges, inline buttons, nested detail rows), and
+	// threading a sort key through every one of them would be thirty chances to
+	// get it subtly wrong. Reading the rows back gives every table the same
+	// behaviour from one implementation.
+	//
+	// Two rules keep it honest:
+	//   - a <td> may carry data-sort-value to sort by something other than its
+	//     text (an epoch behind "3m ago", a number behind a bar);
+	//   - a <tr data-sort-skip> is a detail/expansion row and stays welded to the
+	//     row above it, so expanding a row and then re-sorting cannot orphan it.
+	//
+	// State is per table and survives re-renders, which is the point: the poll
+	// redraws every table every few seconds, and a sort that did not survive that
+	// would be useless on exactly the live data it exists for.
+	const SORT_STATE = new Map(); // table selector -> {key, dir}
+	const SORT_RERENDER = new Map(); // table selector -> redraw from last payload
+
+	function sortState(sel) {
+		return SORT_STATE.get(sel);
+	}
+
+	function paintSortHeaders(sel) {
+		const table = $(sel);
+		if (!table) return;
+		const cfg = SORT_STATE.get(sel) || {};
+		for (const th of $$("thead th[data-sort]", table)) {
+			const active = th.dataset.sort === cfg.key;
+			th.classList.toggle("is-sorted", active);
+			th.dataset.dir = active ? cfg.dir : "";
+			th.setAttribute("aria-sort", active ? (cfg.dir === "asc" ? "ascending" : "descending") : "none");
+		}
+	}
+
+	// Wire one table's headers. `rerender` redraws from the data already in hand
+	// so clicking a header never costs a round-trip.
+	function initSortable(sel, rerender) {
+		const table = $(sel);
+		if (!table || table.dataset.sortReady === "1") return;
+		table.dataset.sortReady = "1";
+		if (rerender) SORT_RERENDER.set(sel, rerender);
+		const headers = $$("thead th[data-sort]", table);
+		if (!headers.length) return;
+		if (!SORT_STATE.has(sel)) {
+			const initial = headers.find(th => th.dataset.sortDefault) || null;
+			SORT_STATE.set(sel, {
+				key: initial ? initial.dataset.sort : "",
+				dir: initial ? initial.dataset.sortDefault : "desc",
+			});
+		}
+		const cfg = SORT_STATE.get(sel);
+		for (const th of headers) {
+			th.classList.add("th--sortable");
+			th.tabIndex = 0;
+			th.setAttribute("role", "columnheader");
+			const activate = () => {
+				if (cfg.key === th.dataset.sort) cfg.dir = cfg.dir === "asc" ? "desc" : "asc";
+				else {
+					cfg.key = th.dataset.sort;
+					// Text columns read best A→Z; counts and times read best
+					// biggest/newest first, which is what they are looked at for.
+					cfg.dir = th.dataset.sortDefault || (th.dataset.sortType === "text" ? "asc" : "desc");
+				}
+				paintSortHeaders(sel);
+				const redraw = SORT_RERENDER.get(sel);
+				if (redraw) redraw();
+				else sortTable(sel);
+			};
+			th.addEventListener("click", activate);
+			th.addEventListener("keydown", e => {
+				if (e.key === "Enter" || e.key === " ") {
+					e.preventDefault();
+					activate();
+				}
+			});
+		}
+		paintSortHeaders(sel);
+	}
+
+	const isBlankSort = v => v === undefined || v === null || v === "" || v === "—";
+
+	function cellSortValue(row, index) {
+		const td = row.children[index];
+		if (!td) return "";
+		const raw = td.dataset.sortValue !== undefined ? td.dataset.sortValue : td.textContent.trim();
+		if (isBlankSort(raw)) return "";
+		// Strip the thousands separators the tables render with, so a count column
+		// sorts as a number rather than as the string "1,004" < "999".
+		const numeric = Number(String(raw).replace(/,/g, ""));
+		return Number.isFinite(numeric) && String(raw).trim() !== "" ? numeric : String(raw).toLowerCase();
+	}
+
+	function compareSort(a, b) {
+		if (typeof a === "number" && typeof b === "number") return a - b;
+		return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" });
+	}
+
+	// Reorder a table's rows in place using its current sort state.
+	function sortTable(sel) {
+		const table = $(sel);
+		const cfg = SORT_STATE.get(sel);
+		if (!table || !cfg || !cfg.key) return;
+		const tbody = $("tbody", table);
+		const headers = $$("thead th", table);
+		const index = headers.findIndex(th => th.dataset.sort === cfg.key);
+		if (!tbody || index < 0) return;
+
+		// Group each visible row with the detail rows that trail it, so the pair
+		// travels together.
+		const groups = [];
+		for (const row of Array.from(tbody.children)) {
+			if (row.dataset.sortSkip === "1" && groups.length) groups[groups.length - 1].rows.push(row);
+			else groups.push({ rows: [row], value: cellSortValue(row, index) });
+		}
+		// A single "nothing here yet" placeholder row must not be shuffled.
+		if (groups.length < 2) return;
+		const dir = cfg.dir === "asc" ? 1 : -1;
+		groups.sort((a, b) => {
+			const ab = isBlankSort(a.value);
+			const bb = isBlankSort(b.value);
+			// Blanks sink in BOTH directions. A column sorted ascending should
+			// start with its smallest real value, not with every empty cell.
+			if (ab !== bb) return ab ? 1 : -1;
+			if (ab) return 0;
+			return compareSort(a.value, b.value) * dir;
+		});
+		const frag = document.createDocumentFragment();
+		for (const group of groups) for (const row of group.rows) frag.appendChild(row);
+		tbody.appendChild(frag);
+	}
+
+	// Re-apply every table's sort after a render pass.
+	function sortAllTables() {
+		for (const sel of SORT_STATE.keys()) sortTable(sel);
 	}
 
 	function escapeHtml(s) {
@@ -512,6 +673,7 @@ const print = console.log;
 			]);
 			row.style.cursor = "pointer";
 			const detail = document.createElement("tr");
+			detail.dataset.sortSkip = "1"; // Expansion row: stays with its parent when the table is sorted.
 			const td = document.createElement("td");
 			td.colSpan = 7;
 			const pre = document.createElement("pre");
@@ -855,36 +1017,181 @@ const print = console.log;
 	}
 
 	// Top Endpoints as a 3-level tree: host -> ID-collapsed template -> concrete IDs.
-	// template -> [[concretePath, info], ...], filled by the lazy fetch below.
-	const endpointConcreteCache = new Map();
+	// template -> the drill-down payload (concrete paths, recent requests, IPs),
+	// filled by the lazy fetch below.
+	const endpointDetailCache = new Map();
+	const expandedEndpointDetail = new Set(); // templates showing their recent requests
+
+	function endpointConcretes(template) {
+		return Object.entries(endpointDetailCache.get(template)?.Concrete || {});
+	}
+
+	async function fetchEndpointDetail(template) {
+		if (endpointDetailCache.has(template)) return endpointDetailCache.get(template);
+		try {
+			const res = await api(`/admin/endpoints/concrete?template=${encodeURIComponent(template)}`);
+			if (!res.ok) throw new Error(String(res.status));
+			endpointDetailCache.set(template, await res.json());
+		} catch {
+			endpointDetailCache.set(template, { Concrete: {}, Recent: [], Last: {}, IPs: {} });
+			showToast("Could not load detail for that endpoint");
+		}
+		return endpointDetailCache.get(template);
+	}
 
 	async function toggleEndpointTemplate(template) {
-		if (expandedTemplates.has(template)) {
-			expandedTemplates.delete(template);
-			renderEndpoints({});
-			return;
-		}
-		expandedTemplates.add(template);
-		renderEndpoints({}); // Paint "Loading paths…" straight away.
-		if (!endpointConcreteCache.has(template)) {
-			try {
-				const res = await api(`/admin/endpoints/concrete?template=${encodeURIComponent(template)}`);
-				if (!res.ok) throw new Error(String(res.status));
-				const payload = await res.json();
-				endpointConcreteCache.set(template, Object.entries(payload.Concrete || {}));
-			} catch {
-				endpointConcreteCache.set(template, []);
-				showToast("Could not load paths for that endpoint");
-			}
-		}
+		if (expandedTemplates.has(template)) expandedTemplates.delete(template);
+		else expandedTemplates.add(template);
+		renderEndpoints({}); // Paint "Loading…" straight away.
+		if (expandedTemplates.has(template)) await fetchEndpointDetail(template);
 		renderEndpoints({});
 	}
 
-	function renderEndpoints(d) {
-		if (d.Endpoints) {
-			endpointEntries = Object.entries(d.Endpoints);
-			endpointEntries.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
+	// The "show me what this endpoint is actually being asked for" toggle. It hangs
+	// off every endpoint row, not only ones whose path contains an ID — the busiest
+	// endpoint here has no ID in its path, and it was the one the old drill-down
+	// could say nothing about.
+	async function toggleEndpointRequests(template) {
+		if (expandedEndpointDetail.has(template)) expandedEndpointDetail.delete(template);
+		else expandedEndpointDetail.add(template);
+		renderEndpoints({});
+		if (expandedEndpointDetail.has(template)) {
+			endpointDetailCache.delete(template); // Always re-fetch: "recent" means recent.
+			await fetchEndpointDetail(template);
+			renderEndpoints({});
 		}
+	}
+
+	// One recent request against an endpoint, rendered as a compact block.
+	function recentRequestBlock(entry) {
+		const rows = [
+			["When", toTS(entry.Date)],
+			["From", `${entry.IP || "—"}${entry.CallerId ? ` · place ${entry.CallerId}` : ""}`],
+			["Method", entry.Method || "—"],
+			["Query", entry.Query || "—"],
+			["We answered", entry.Status ?? "—"],
+			["Roblox answered", entry.UpstreamStatus === "" || entry.UpstreamStatus == null ? "—" : entry.UpstreamStatus],
+			["Served by", entry.UpstreamMethod || "—"],
+			["User-Agent", entry.UserAgent || "—"],
+		];
+		let headers = entry.Headers || "";
+		try {
+			headers = JSON.stringify(JSON.parse(headers), null, 2);
+		} catch {}
+		return (
+			'<div class="recent-req">' +
+			rows
+				.map(([k, v]) => `<div class="recent-req__row"><span>${k}</span><span>${escapeHtml(String(v))}</span></div>`)
+				.join("") +
+			(entry.Body ? `<details><summary>Request body</summary><pre>${escapeHtml(entry.Body)}</pre></details>` : "") +
+			(headers ? `<details><summary>Headers</summary><pre>${escapeHtml(headers)}</pre></details>` : "") +
+			"</div>"
+		);
+	}
+
+	function endpointRequestsRow(template) {
+		const row = document.createElement("tr");
+		row.dataset.sortSkip = "1";
+		row.className = "endpoint-headers";
+		const td = document.createElement("td");
+		td.colSpan = 6;
+		const payload = endpointDetailCache.get(template);
+		if (!payload) {
+			td.innerHTML = '<div class="text-muted endpoint-headers__meta">Loading recent requests…</div>';
+		} else {
+			const recent = payload.Recent || [];
+			const ips = Object.entries(payload.IPs || {});
+			td.innerHTML =
+				`<div class="endpoint-headers__meta">Last ${recent.length} request(s) · ${fmtCount(
+					payload.IPCount,
+				)} distinct IP(s)</div>` +
+				(ips.length
+					? '<div class="endpoint-ips">' +
+						ips
+							.slice(0, 12)
+							.map(([ip, n]) => `<span class="chip chip--sm mono">${escapeHtml(ip)} · ${fmtCount(n)}</span>`)
+							.join(" ") +
+						"</div>"
+					: "") +
+				(recent.length
+					? recent.map(recentRequestBlock).join("")
+					: '<div class="text-muted">Nothing recorded yet. Raise <code>endpoint_recent_requests</code> in Settings to keep more.</div>');
+		}
+		row.appendChild(td);
+		return row;
+	}
+
+	// The endpoint tree sorts itself: whichever column header is active orders the
+	// hosts, then the templates within each host, then the concrete IDs within
+	// each template. The generic DOM sorter can't do this one — it would tear the
+	// tree apart — so the active sort state is read here and applied per level.
+	const ENDPOINT_SORTERS = {
+		name: r => r.name.toLowerCase(),
+		count: r => Number(r.count || 0),
+		methods: r => methodsText(r.methods).toLowerCase(),
+		ip: r => (r.ip || "").toLowerCase(),
+		status: r => Number(r.status) || 0,
+		last: r => Number(r.last || 0),
+	};
+
+	function sortEndpointLevel(rows) {
+		const cfg = sortState("#endpointsTable") || { key: "count", dir: "desc" };
+		const pick = ENDPOINT_SORTERS[cfg.key] || ENDPOINT_SORTERS.count;
+		const dir = cfg.dir === "asc" ? 1 : -1;
+		return rows.sort((a, b) => {
+			const av = pick(a);
+			const bv = pick(b);
+			const ab = isBlankSort(av);
+			const bb = isBlankSort(bv);
+			if (ab !== bb) return ab ? 1 : -1;
+			return compareSort(av, bv) * dir;
+		});
+	}
+
+	// Trailing cells shared by every level of the tree.
+	function endpointStatCells(row, info) {
+		const cells = [String(info.Count || 0), methodsText(info.Methods)];
+		for (const text of cells) {
+			const td = document.createElement("td");
+			td.textContent = text;
+			row.appendChild(td);
+		}
+		const tdIp = document.createElement("td");
+		tdIp.className = "mono";
+		tdIp.textContent = info.LastIP || "—";
+		if (info.LastCallerId) tdIp.title = `Roblox-Id (place): ${info.LastCallerId}`;
+		row.appendChild(tdIp);
+		const tdStatus = document.createElement("td");
+		const status = info.LastStatus;
+		if (status) {
+			const badge = document.createElement("span");
+			const s = String(status);
+			badge.className = `badge badge--${s.startsWith("2") ? "ok" : s.startsWith("4") ? "warn" : "bad"}`;
+			badge.textContent = s;
+			tdStatus.appendChild(badge);
+			tdStatus.dataset.sortValue = s;
+		} else tdStatus.textContent = "—";
+		row.appendChild(tdStatus);
+		const tdLast = document.createElement("td");
+		tdLast.appendChild(tsNode(info.LastRequestTime));
+		row.appendChild(tdLast);
+	}
+
+	function inspectButton(template) {
+		const btn = document.createElement("button");
+		btn.type = "button";
+		btn.className = "btn btn--ghost btn--xs";
+		btn.textContent = expandedEndpointDetail.has(template) ? "Hide requests" : "Inspect";
+		btn.title = "Show the most recent requests this endpoint received, with headers and bodies";
+		btn.addEventListener("click", e => {
+			e.stopPropagation();
+			toggleEndpointRequests(template);
+		});
+		return btn;
+	}
+
+	function renderEndpoints(d) {
+		if (d.Endpoints) endpointEntries = Object.entries(d.Endpoints);
 		const tbody = $("#endpointsTable tbody");
 		if (!tbody) return;
 		tbody.innerHTML = "";
@@ -894,10 +1201,10 @@ const print = console.log;
 		// Group templates by host.
 		const hosts = new Map();
 		for (const [template, info] of endpointEntries) {
-			// Concrete paths are fetched per template on expand (they carry a
-			// captured header dump each, far too heavy for the dashboard poll),
-			// so only ones already loaded are available to match against.
-			const concretes = endpointConcreteCache.get(template) || [];
+			// Concrete paths are fetched per template on expand (each carries a
+			// captured header dump, far too heavy for the dashboard poll), so only
+			// ones already loaded are available to match against.
+			const concretes = endpointConcretes(template);
 			if (q) {
 				const hit = template.toLowerCase().includes(q) || concretes.some(([p]) => p.toLowerCase().includes(q));
 				if (!hit) continue;
@@ -905,42 +1212,59 @@ const print = console.log;
 			const host = template.split("/", 1)[0];
 			let group = hosts.get(host);
 			if (!group) {
-				group = { count: 0, last: 0, methods: {}, templates: [] };
+				group = { count: 0, last: 0, methods: {}, templates: [], ip: "", status: "" };
 				hosts.set(host, group);
 			}
 			group.count += Number(info.Count || 0);
-			group.last = Math.max(group.last, Number(info.LastRequestTime || 0));
+			if (Number(info.LastRequestTime || 0) >= group.last) {
+				group.last = Number(info.LastRequestTime || 0);
+				group.ip = info.LastIP || group.ip;
+				group.status = info.LastStatus || group.status;
+			}
 			for (const [m, n] of Object.entries(info.Methods || {})) {
 				group.methods[m] = (group.methods[m] || 0) + Number(n || 0);
 			}
 			group.templates.push([template, info, concretes]);
 		}
 
-		const sortedHosts = [...hosts.entries()].sort((a, b) => b[1].count - a[1].count);
+		const sortedHosts = sortEndpointLevel(
+			[...hosts.entries()].map(([host, group]) => ({
+				host,
+				group,
+				name: host,
+				count: group.count,
+				methods: group.methods,
+				ip: group.ip,
+				status: group.status,
+				last: group.last,
+			})),
+		);
 		if (sortedHosts.length === 0) {
-			tbody.appendChild(tr([q ? "No endpoints match the filter" : "No endpoints recorded yet", "—", "—", "—"]));
+			tbody.appendChild(
+				tr([q ? "No endpoints match the filter" : "No endpoints recorded yet", "—", "—", "—", "—", "—"]),
+			);
 			return;
 		}
 
-		for (const [host, group] of sortedHosts) {
+		for (const { host, group } of sortedHosts) {
 			const hostExpanded = expandedHosts.has(host) || filtering;
 			const hostRow = document.createElement("tr");
 			hostRow.className = "endpoint-host";
 			hostRow.setAttribute("aria-expanded", String(hostExpanded));
 			const tdHost = endpointNameCell(hostExpanded ? "▾" : "▸", host, { strong: true });
+			tdHost.dataset.sortValue = host;
 			const meta = document.createElement("span");
 			meta.className = "endpoint-host__count";
 			meta.textContent = ` (${group.templates.length} endpoint${group.templates.length === 1 ? "" : "s"})`;
 			tdHost.appendChild(meta);
 			hostRow.appendChild(tdHost);
-			for (const text of [String(group.count), methodsText(group.methods)]) {
-				const td = document.createElement("td");
-				td.textContent = text;
-				hostRow.appendChild(td);
-			}
-			const tdLast = document.createElement("td");
-			tdLast.appendChild(tsNode(group.last));
-			hostRow.appendChild(tdLast);
+			endpointStatCells(hostRow, {
+				Count: group.count,
+				Methods: group.methods,
+				LastIP: group.ip,
+				LastStatus: group.status,
+				LastRequestTime: group.last,
+			});
 			hostRow.addEventListener("click", () => {
 				expandedHosts.has(host) ? expandedHosts.delete(host) : expandedHosts.add(host);
 				renderEndpoints({});
@@ -948,8 +1272,20 @@ const print = console.log;
 			tbody.appendChild(hostRow);
 			if (!hostExpanded) continue;
 
-			group.templates.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
-			for (const [template, info, concretes] of group.templates) {
+			const templates = sortEndpointLevel(
+				group.templates.map(([template, info, concretes]) => ({
+					template,
+					info,
+					concretes,
+					name: template,
+					count: info.Count,
+					methods: info.Methods,
+					ip: info.LastIP,
+					status: info.LastStatus,
+					last: info.LastRequestTime,
+				})),
+			);
+			for (const { template, info, concretes } of templates) {
 				const sub = template.slice(host.length) || "/";
 				const idCount = Number(info.ConcreteCount || 0);
 				const hasConcrete = idCount > 0;
@@ -959,55 +1295,64 @@ const print = console.log;
 				tmplRow.title = template;
 				const chevron = hasConcrete ? (tmplExpanded ? "▾" : "▸") : "";
 				const tdName = endpointNameCell(chevron, sub, { depth: 1 });
+				tdName.dataset.sortValue = template;
 				if (hasConcrete) {
 					const c = document.createElement("span");
 					c.className = "endpoint-host__count";
 					c.textContent = ` (${fmtCount(idCount)} id${idCount === 1 ? "" : "s"})`;
 					tdName.appendChild(c);
 				}
+				// Every endpoint gets an Inspect affordance, whether or not its path
+				// happens to contain an ID.
+				tdName.appendChild(inspectButton(template));
 				tmplRow.appendChild(tdName);
-				for (const text of [String(info.Count || 0), methodsText(info.Methods)]) {
-					const td = document.createElement("td");
-					td.textContent = text;
-					tmplRow.appendChild(td);
-				}
-				const tdTLast = document.createElement("td");
-				tdTLast.appendChild(tsNode(info.LastRequestTime));
-				tmplRow.appendChild(tdTLast);
+				endpointStatCells(tmplRow, info);
 				if (hasConcrete) {
 					tmplRow.style.cursor = "pointer";
-					tmplRow.addEventListener("click", () => toggleEndpointTemplate(template));
+					tmplRow.addEventListener("click", e => {
+						if (e.target.closest("button")) return;
+						toggleEndpointTemplate(template);
+					});
 				}
 				tbody.appendChild(tmplRow);
+				if (expandedEndpointDetail.has(template)) tbody.appendChild(endpointRequestsRow(template));
 				if (!tmplExpanded) continue;
-				if (!endpointConcreteCache.has(template)) {
+				if (!endpointDetailCache.has(template)) {
 					const loading = document.createElement("tr");
+					loading.dataset.sortSkip = "1";
 					const td = document.createElement("td");
-					td.colSpan = 4;
+					td.colSpan = 6;
 					td.innerHTML = '<div class="text-muted endpoint-headers__meta">Loading paths…</div>';
 					loading.appendChild(td);
 					tbody.appendChild(loading);
 					continue;
 				}
 
-				concretes.sort((a, b) => (b[1].Count || 0) - (a[1].Count || 0));
-				for (const [concretePath, cinfo] of concretes) {
-					if (q && !concretePath.toLowerCase().includes(q) && !template.toLowerCase().includes(q)) continue;
+				const rows = sortEndpointLevel(
+					concretes
+						.filter(([p]) => !q || p.toLowerCase().includes(q) || template.toLowerCase().includes(q))
+						.map(([path, cinfo]) => ({
+							path,
+							cinfo,
+							name: path,
+							count: cinfo.Count,
+							methods: cinfo.Methods,
+							ip: cinfo.LastIP,
+							status: cinfo.LastStatus,
+							last: cinfo.LastRequestTime,
+						})),
+				);
+				for (const { path: concretePath, cinfo } of rows) {
 					const csub = concretePath.slice(host.length) || "/";
 					const hasHeaders = Boolean(cinfo.LastHeaders);
 					const cExpanded = expandedConcretes.has(concretePath);
 					const cRow = document.createElement("tr");
 					cRow.className = "endpoint-concrete";
 					cRow.title = concretePath;
-					cRow.appendChild(endpointNameCell(hasHeaders ? (cExpanded ? "▾" : "▸") : "", csub, { depth: 2, sub: true }));
-					for (const text of [String(cinfo.Count || 0), methodsText(cinfo.Methods)]) {
-						const td = document.createElement("td");
-						td.textContent = text;
-						cRow.appendChild(td);
-					}
-					const tdCLast = document.createElement("td");
-					tdCLast.appendChild(tsNode(cinfo.LastRequestTime));
-					cRow.appendChild(tdCLast);
+					const tdC = endpointNameCell(hasHeaders ? (cExpanded ? "▾" : "▸") : "", csub, { depth: 2, sub: true });
+					tdC.dataset.sortValue = concretePath;
+					cRow.appendChild(tdC);
+					endpointStatCells(cRow, cinfo);
 					if (hasHeaders) {
 						cRow.style.cursor = "pointer";
 						cRow.addEventListener("click", () => {
@@ -1024,12 +1369,18 @@ const print = console.log;
 							headersText = JSON.stringify(JSON.parse(cinfo.LastHeaders), null, 2);
 						} catch {}
 						const detail = document.createElement("tr");
+						detail.dataset.sortSkip = "1";
 						detail.className = "endpoint-headers";
 						const td = document.createElement("td");
-						td.colSpan = 4;
+						td.colSpan = 6;
 						td.innerHTML =
-							`<div class="endpoint-headers__meta">Last request from IP <strong>${escapeHtml(cinfo.LastIP || "—")}</strong> • last sent headers:</div>` +
-							`<pre class="endpoint-headers__pre">${escapeHtml(headersText || "(none)")}</pre>`;
+							`<div class="endpoint-headers__meta">Last request from IP <strong>${escapeHtml(cinfo.LastIP || "—")}</strong>` +
+							(cinfo.LastCallerId ? ` (place <strong>${escapeHtml(cinfo.LastCallerId)}</strong>)` : "") +
+							" • last sent headers:</div>" +
+							`<pre class="endpoint-headers__pre">${escapeHtml(headersText || "(none)")}</pre>` +
+							(cinfo.LastBody
+								? `<div class="endpoint-headers__meta">Last body:</div><pre class="endpoint-headers__pre">${escapeHtml(cinfo.LastBody)}</pre>`
+								: "");
 						detail.appendChild(td);
 						tbody.appendChild(detail);
 					}
@@ -1112,19 +1463,27 @@ const print = console.log;
 		tbody.innerHTML = "";
 		const shown = all.filter(([sig, info]) => !q || `${sig} ${info.LastDetail || ""}`.toLowerCase().includes(q));
 		if (shown.length === 0) {
-			tbody.appendChild(tr([q ? "No errors match the filter" : "No errors recorded 🎉", "—", "—", "—"]));
+			tbody.appendChild(tr([q ? "No errors match the filter" : "No errors recorded 🎉", "—", "—", "—", "—"]));
 			return;
 		}
 		for (const [sig, info] of shown) {
-			const row = tr([sig, String(info.Count || 0), tsNode(info.FirstSeen), tsNode(info.LastSeen)]);
+			// Whose fault it was. "Is this mine to fix?" is the first question asked
+			// of an error log and the signature alone never answered it.
+			const source = document.createElement("span");
+			const kind = info.Source || "Roxy";
+			source.className = `badge badge--${kind === "Roblox" ? "warn" : kind === "Internal" ? "muted" : "bad"}`;
+			source.textContent = kind;
+			source.dataset.sortValue = kind;
+			const row = tr([sig, source, String(info.Count || 0), tsNode(info.FirstSeen), tsNode(info.LastSeen)]);
 			row.className = "error-row";
 			row.style.cursor = "pointer";
 			row.dataset.sig = sig;
 			const detail = document.createElement("tr");
+			detail.dataset.sortSkip = "1";
 			detail.className = "error-detail";
 			detail.dataset.sig = sig;
 			const td = document.createElement("td");
-			td.colSpan = 4;
+			td.colSpan = 5;
 			const pre = document.createElement("pre");
 			pre.className = "error-detail__pre";
 			pre.textContent = info.LastDetail || "(no detail)";
@@ -1196,6 +1555,7 @@ const print = console.log;
 
 	function uaDetailRow(uaKey) {
 		const detail = document.createElement("tr");
+		detail.dataset.sortSkip = "1";
 		const td = document.createElement("td");
 		td.colSpan = 3;
 		const info = uaDetailCache.get(uaKey);
@@ -1367,6 +1727,7 @@ const print = console.log;
 	// lazy fetch fills in.
 	function headerValuesRow(fpKey, name) {
 		const detail = document.createElement("tr");
+		detail.dataset.sortSkip = "1";
 		detail.className = "fp-values";
 		const td = document.createElement("td");
 		td.colSpan = 4;
@@ -1515,17 +1876,61 @@ const print = console.log;
 		renderUaTable("#blockedUserAgentsTable tbody", "blockedUserAgentsTotal", renderFingerprints._bua || {}, "#blockedUserAgentsFilter", "b:");
 	}
 
+	// -----------------------------
+	// Live request feed
+	// -----------------------------
+	// Every proxied request, served or refused, newest first. The feed carries
+	// metadata only; the actual request/response bytes are fetched per card from
+	// the capture store when a card is opened — see capture.py for why they are
+	// not carried in the poll payload.
+	const OUTCOME_LABELS = {
+		served: "Served",
+		upstream_failed: "Upstream failed",
+		throttled: "Throttled (per-IP)",
+		throttle_all: "Throttled (global)",
+		blocked_endpoint: "Blocked endpoint",
+		endpoint_rule: "Endpoint rate rule",
+		header_rule: "Request filter",
+		auth_attempt: "Auth attempt rejected",
+		probe: "Probe rejected",
+		paused: "Paused",
+		ignored_path: "Ignored path",
+	};
+	// Only "served" is genuinely good; everything else is either us refusing or
+	// Roblox failing, and the feed says which at a glance.
+	const outcomeClass = outcome => (outcome === "served" ? "ok" : outcome === "upstream_failed" ? "bad" : "warn");
+
 	let liveItems = []; // cached for filtering without refetch
-	const liveKey = item => `${item.Date}|${item.IP}|${item.URL}`;
+	const liveBodyCache = new Map(); // capture id -> fetched payload (or an error marker)
+	const liveKey = item => item.Id || `${item.Date}|${item.IP}|${item.URL}`;
+
+	function prettyJson(text) {
+		if (!text) return "";
+		try {
+			return JSON.stringify(JSON.parse(text), null, 2);
+		} catch {
+			return text; // Not JSON (an HTML error page, a plain string) — show it as-is.
+		}
+	}
+
+	function liveMatches(item, q, outcome) {
+		if (outcome && (item.Outcome || "") !== outcome) return false;
+		if (!q) return true;
+		const hay = `${item.URL || ""} ${item.IP || ""} ${item.Method || ""} ${item.CallerId || ""} ${
+			item.UserAgent || ""
+		} ${item.StatusCode || ""} ${item.Outcome || ""} ${item.Query || ""} ${item.Body || ""}`;
+		return hay.toLowerCase().includes(q);
+	}
+
 	function renderLiveFeed(d) {
 		if (Array.isArray(d.LiveRequests)) liveItems = d.LiveRequests;
 		const feed = $("#liveFeed");
 		if (!feed) return;
 		const q = ($("#liveFilter")?.value || "").trim().toLowerCase();
-		const items = liveItems.filter(
-			it => !q || `${it.URL || ""} ${it.IP || ""} ${it.Method || ""}`.toLowerCase().includes(q),
-		);
-		setText("liveCount", `${items.length} shown`);
+		const outcome = $("#liveOutcomeFilter")?.value || "";
+		const items = liveItems.filter(it => liveMatches(it, q, outcome));
+		const refused = items.filter(it => it.Outcome && it.Outcome !== "served").length;
+		setText("liveCount", `${items.length} shown${refused ? ` • ${refused} refused` : ""}`);
 		// Keep expanded cards expanded across refreshes.
 		const openKeys = new Set(
 			$$("#liveFeed details[open]")
@@ -1536,40 +1941,623 @@ const print = console.log;
 		if (items.length === 0) {
 			const empty = document.createElement("p");
 			empty.className = "text-muted";
-			empty.textContent = q ? "No requests match the filter." : "No requests recorded yet.";
+			empty.textContent = q || outcome ? "No requests match the filter." : "No requests recorded yet.";
 			feed.appendChild(empty);
 			return;
 		}
-		for (const item of items) {
-			const card = document.createElement("details");
-			card.className = "live-item";
-			card.dataset.key = liveKey(item);
-			if (openKeys.has(card.dataset.key)) card.open = true;
-			const code = Number(item.StatusCode || 0);
-			const codeClass = code >= 200 && code < 300 ? "ok" : "bad";
+		for (const item of items) feed.appendChild(liveCard(item, openKeys));
+	}
 
-			const summary = document.createElement("summary");
-			summary.className = "live-item__summary";
-			summary.innerHTML =
-				`<span class="badge badge--method">${escapeHtml(item.Method || "?")}</span>` +
-				`<span class="badge badge--${codeClass}">${code || "?"}</span>` +
-				`<span class="live-item__url">${escapeHtml(item.URL || "")}</span>` +
-				`<span class="live-item__meta">${escapeHtml(item.IP || "")} • ${escapeHtml(timeAgo(item.Date))}</span>`;
-			card.appendChild(summary);
+	function liveCard(item, openKeys) {
+		const card = document.createElement("details");
+		card.className = "live-item";
+		card.dataset.key = liveKey(item);
+		const isOpen = openKeys.has(card.dataset.key);
+		if (isOpen) card.open = true;
+		const code = Number(item.StatusCode || 0);
+		const codeClass = code >= 200 && code < 300 ? "ok" : code >= 500 ? "bad" : "warn";
+		const upstream = item.UpstreamStatus;
+		const oc = item.Outcome || "";
 
-			const body = document.createElement("div");
-			body.className = "live-item__body";
-			const ua = escapeHtml(item.UserAgent || "—");
-			const headers = escapeHtml(JSON.stringify(item.Headers || {}, null, 2));
-			const reqBody = escapeHtml(item.Body || "");
-			body.innerHTML =
-				`<div class="live-item__row"><strong>Time:</strong> ${escapeHtml(toTS(item.Date))}</div>` +
-				`<div class="live-item__row"><strong>User-Agent:</strong> ${ua}</div>` +
-				`<div class="live-item__row"><strong>Headers:</strong><pre>${headers}</pre></div>` +
-				(reqBody ? `<div class="live-item__row"><strong>Body:</strong><pre>${reqBody}</pre></div>` : "");
-			card.appendChild(body);
-			feed.appendChild(card);
+		const summary = document.createElement("summary");
+		summary.className = "live-item__summary";
+		summary.innerHTML =
+			`<span class="badge badge--method">${escapeHtml(item.Method || "?")}</span>` +
+			`<span class="badge badge--${codeClass}">${code || "?"}</span>` +
+			// Roblox's own answer next to ours. When they differ — an upstream 404
+			// relayed as a 500, a 200 we refused before sending — that difference is
+			// the single most useful thing on the card.
+			(upstream && String(upstream) !== String(code)
+				? `<span class="badge badge--muted" title="What Roblox actually returned">↑${escapeHtml(
+						String(upstream),
+					)}</span>`
+				: "") +
+			(oc && oc !== "served"
+				? `<span class="badge badge--${outcomeClass(oc)}">${escapeHtml(OUTCOME_LABELS[oc] || oc)}</span>`
+				: "") +
+			`<span class="live-item__url">${escapeHtml(item.URL || "")}</span>` +
+			`<span class="live-item__meta">${escapeHtml(item.IP || "")}${
+				item.CallerId ? ` • place ${escapeHtml(item.CallerId)}` : ""
+			} • ${escapeHtml(timeAgo(item.Date))}</span>`;
+		card.appendChild(summary);
+
+		const body = document.createElement("div");
+		body.className = "live-item__body";
+		body.appendChild(liveMetaBlock(item));
+		const bodies = document.createElement("div");
+		bodies.className = "live-item__bodies";
+		bodies.innerHTML = '<div class="text-muted">Open to load the request and response bodies…</div>';
+		body.appendChild(bodies);
+		card.appendChild(body);
+
+		// Bodies are fetched on first open, not on render: a feed of 50 cards would
+		// otherwise pull 50 payloads the admin never looks at.
+		const load = () => loadLiveBodies(item, bodies);
+		card.addEventListener("toggle", () => {
+			if (card.open) load();
+		});
+		if (isOpen) load();
+		return card;
+	}
+
+	function liveMetaBlock(item) {
+		const wrap = document.createElement("div");
+		const rows = [
+			["Time", toTS(item.Date)],
+			["Outcome", OUTCOME_LABELS[item.Outcome] || item.Outcome || "—"],
+			["Refused because", item.Reason || "—"],
+			["Answered by", item.Source === "Relay" ? "Roblox (relayed)" : item.Source || "—"],
+			["Roblox status", item.UpstreamStatus === "" || item.UpstreamStatus == null ? "—" : item.UpstreamStatus],
+			["Upstream method", item.UpstreamMethod || "—"],
+			["Upstream error", item.UpstreamError || "—"],
+			["Attempts", `${item.Attempts || 0}${item.Retries ? ` (+${item.Retries} retries)` : ""}`],
+			["Took", item.Duration ? `${Number(item.Duration).toFixed(3)}s` : "—"],
+			["Roblox-Id (place)", item.CallerId || "—"],
+			["User-Agent", item.UserAgent || "—"],
+			["Query", item.Query || "—"],
+		];
+		wrap.innerHTML = rows
+			.map(([k, v]) => `<div class="live-item__row"><strong>${k}:</strong> ${escapeHtml(String(v))}</div>`)
+			.join("");
+		if (item.Bypass) {
+			wrap.innerHTML += '<div class="live-item__row"><span class="badge badge--muted">Throttle-bypass IP</span></div>';
 		}
+		const headers = document.createElement("div");
+		headers.className = "live-item__row";
+		headers.innerHTML = `<strong>Headers:</strong><pre>${escapeHtml(
+			JSON.stringify(item.Headers || {}, null, 2),
+		)}</pre>`;
+		wrap.appendChild(headers);
+		return wrap;
+	}
+
+	async function loadLiveBodies(item, mount) {
+		if (mount.dataset.loaded === "1") return;
+		const id = item.CaptureId || "";
+		if (!id) {
+			mount.dataset.loaded = "1";
+			mount.innerHTML =
+				`<div class="live-item__row"><strong>Request body:</strong><pre>${escapeHtml(item.Body || "—")}</pre></div>` +
+				'<div class="text-muted">Response capture was off for this request (Settings → capture_enabled).</div>';
+			return;
+		}
+		if (!liveBodyCache.has(id)) {
+			mount.innerHTML = '<div class="text-muted">Loading bodies…</div>';
+			try {
+				const res = await api(`/admin/live/detail?id=${encodeURIComponent(id)}`);
+				liveBodyCache.set(id, res.ok ? await res.json() : { Expired: true });
+			} catch {
+				liveBodyCache.set(id, { Expired: true });
+			}
+		}
+		mount.dataset.loaded = "1";
+		const payload = liveBodyCache.get(id) || {};
+		if (payload.Expired) {
+			// Say what to change, not just that it is gone. The capture window is
+			// short by design under load, and "expired" on its own reads as broken.
+			mount.innerHTML =
+				`<div class="live-item__row"><strong>Request body:</strong><pre>${escapeHtml(item.Body || "—")}</pre></div>` +
+				'<div class="text-muted">The captured bodies aged out of the capture window (currently ' +
+				`<strong>${escapeHtml(lastDiagnostics?.Capture?.WindowSeconds ? fmtDuration(lastDiagnostics.Capture.WindowSeconds) : "—")}` +
+				"</strong>). Raise <code>capture_max_records</code> or <code>capture_max_bytes</code> in Settings to keep more.</div>";
+			return;
+		}
+		const note = (text, truncated, length) =>
+			truncated ? `<span class="text-muted"> — truncated from ${fmtCount(length)} chars</span>` : "";
+		mount.innerHTML =
+			`<div class="live-item__row"><strong>Request body:</strong>${note(
+				payload.RequestBody,
+				payload.RequestBodyTruncated,
+				payload.RequestBodyLength,
+			)}<pre>${escapeHtml(prettyJson(payload.RequestBody) || "—")}</pre></div>` +
+			`<div class="live-item__row"><strong>Response headers:</strong><pre>${escapeHtml(
+				JSON.stringify(payload.ResponseHeaders || {}, null, 2),
+			)}</pre></div>` +
+			`<div class="live-item__row"><strong>Response body:</strong>${note(
+				payload.ResponseBody,
+				payload.ResponseBodyTruncated,
+				payload.ResponseBodyLength,
+			)}<pre>${escapeHtml(prettyJson(payload.ResponseBody) || "—")}</pre></div>`;
+	}
+
+	function renderCaptureState(d) {
+		const cap = d.Capture || {};
+		const on = Boolean(cap.Enabled);
+		const chip = $("#captureChip");
+		if (chip) {
+			chip.textContent = on
+				? `Capturing • ${fmtCount(cap.Count)}/${fmtCount(cap.MaxRecords)} • ${fmtBytes(cap.Bytes)}`
+				: "Capture off";
+			chip.className = `chip ${on ? "chip--ok" : "chip--muted"}`;
+			chip.title = on
+				? `Bodies are kept for up to ${fmtDuration(cap.TTL)} or ${fmtBytes(cap.MaxBytes)}, whichever runs out first.`
+				: "Enable capture_enabled in Settings to record request/response bodies.";
+		}
+		// How far back the capture window actually reaches. Under a flood it
+		// collapses to seconds — worth seeing, because it explains why an older
+		// card has no bodies rather than leaving it looking broken.
+		setText("captureWindow", on ? (cap.WindowSeconds ? fmtDuration(cap.WindowSeconds) : "—") : "off");
+	}
+
+	// -----------------------------
+	// Who is calling
+	// -----------------------------
+	// Two tables over the same traffic. Top Talkers is keyed on client IP —
+	// precise, but one Roblox experience arrives from hundreds of game-server IPs
+	// and scatters across it. Callers is keyed on the Roblox-Id header, which is
+	// the place the request came from: self-reported, therefore evidence rather
+	// than proof, but the only key that collapses one experience into one row —
+	// and the only one worth writing a block rule against.
+	const expandedActivity = new Set(); // "kind:key" rows showing their breakdown
+	const activityCache = new Map();
+
+	function rateCell(record) {
+		// Requests in the last minute, with the 5- and 60-minute figures behind a
+		// tooltip. The instantaneous rate is what an incident is judged on; the
+		// lifetime Count is what it is judged against.
+		const per1 = Number(record.Rate1 || 0);
+		const span = document.createElement("span");
+		span.textContent = per1 ? `${fmtCount(per1)}/min` : "—";
+		if (per1 >= 60) span.className = "text-bad";
+		else if (per1 >= 10) span.className = "text-warn";
+		span.title = `Last minute: ${fmtCount(per1)} • last 5 min: ${fmtCount(record.Rate5)} • last hour: ${fmtCount(
+			record.Rate60,
+		)}`;
+		span.dataset.sortValue = String(per1);
+		return span;
+	}
+
+	function refusedCell(record) {
+		const total = Number(record.Count || 0);
+		const refused = Number(record.Refused || 0);
+		const pct = total ? Math.round((refused / total) * 100) : 0;
+		const span = document.createElement("span");
+		span.textContent = refused ? `${fmtCount(refused)} (${pct}%)` : "0";
+		if (pct >= 90 && refused) span.className = "text-bad";
+		else if (pct >= 25) span.className = "text-warn";
+		span.dataset.sortValue = String(refused);
+		return span;
+	}
+
+	function activityActions(kind, key, record) {
+		const wrap = document.createElement("div");
+		wrap.className = "row-actions";
+		if (kind === "caller") {
+			// The two things worth doing with an identified caller: find out whose
+			// experience it is, and stop it. Both one click from the row that
+			// prompted the question.
+			wrap.appendChild(
+				fpButton("Identify", "Look up the experience and owner behind this place ID", () => runLookup(key)),
+			);
+			wrap.appendChild(
+				fpButton("Block", "Add a request filter blocking this Roblox-Id header", () => blockCaller(key)),
+			);
+		} else {
+			wrap.appendChild(fpButton("Bypass", "Add this IP to the throttle-bypass allowlist", () => addBypass(key)));
+		}
+		wrap.appendChild(
+			fpButton("Filter feed", "Show this caller's requests in the live feed", () => filterLiveBy(key)),
+		);
+		return wrap;
+	}
+
+	function renderActivityTable(tableSel, totalId, data, kind, filterSel) {
+		const tbody = $(`${tableSel} tbody`);
+		if (!tbody) return;
+		const entries = Object.entries(data || {});
+		setText(totalId, `${fmtCount(entries.length)} ${kind === "caller" ? "places" : "IPs"}`);
+		const q = ($(filterSel)?.value || "").trim().toLowerCase();
+		tbody.innerHTML = "";
+		const shown = entries.filter(([key, info]) => !q || `${key} ${info.TopEndpoint || ""}`.toLowerCase().includes(q));
+		if (!shown.length) {
+			tbody.appendChild(tr([q ? "No matches." : "No traffic recorded yet.", "", "", "", "", "", ""]));
+			return;
+		}
+		for (const [key, info] of shown) {
+			const rowKey = `${kind}:${key}`;
+			const expanded = expandedActivity.has(rowKey);
+			const name = document.createElement("span");
+			name.className = "mono";
+			name.textContent = key;
+			const chev = document.createElement("span");
+			chev.className = "chev";
+			chev.textContent = expanded ? "▾" : "▸";
+			const nameCell = document.createElement("span");
+			nameCell.append(chev, name);
+			nameCell.dataset.sortValue = key;
+
+			const row = tr([
+				nameCell,
+				fmtCount(info.Count),
+				rateCell(info),
+				refusedCell(info),
+				sortable(info.TopEndpoint || "—", info.TopEndpoint || ""),
+				fmtCount(info.PeerCount),
+				tsNode(info.LastSeen),
+				activityActions(kind, key, info),
+			]);
+			row.style.cursor = "pointer";
+			row.addEventListener("click", e => {
+				if (e.target.closest("button")) return;
+				if (expandedActivity.has(rowKey)) expandedActivity.delete(rowKey);
+				else expandedActivity.add(rowKey);
+				loadActivityDetail(kind, key);
+			});
+			tbody.appendChild(row);
+			if (expanded) tbody.appendChild(activityDetailRow(kind, key));
+		}
+	}
+
+	function activityDetailRow(kind, key) {
+		const row = document.createElement("tr");
+		row.dataset.sortSkip = "1";
+		const td = document.createElement("td");
+		td.colSpan = 8;
+		const info = activityCache.get(`${kind}:${key}`);
+		if (!info) {
+			td.innerHTML = '<div class="text-muted">Loading…</div>';
+		} else {
+			const list = (title, map, mono) => {
+				const items = Object.entries(map || {});
+				if (!items.length) return "";
+				return (
+					`<div class="detail-block"><div class="detail-block__title">${title}</div><ul class="detail-list">` +
+					items
+						.map(
+							([k, n]) =>
+								`<li><span class="${mono ? "mono" : ""}">${escapeHtml(k)}</span><span>${fmtCount(n)}</span></li>`,
+						)
+						.join("") +
+					"</ul></div>"
+				);
+			};
+			td.innerHTML =
+				'<div class="detail-grid">' +
+				list("Endpoints", info.Endpoints, true) +
+				list("Status codes", info.Statuses) +
+				list("Outcomes", info.Outcomes) +
+				list("Methods", info.Methods) +
+				list(kind === "ip" ? "Places (Roblox-Id)" : "Source IPs", info.Peers, true) +
+				"</div>" +
+				`<div class="text-muted">Last user-agent: ${escapeHtml(info.UserAgent || "—")}</div>`;
+		}
+		row.appendChild(td);
+		return row;
+	}
+
+	async function loadActivityDetail(kind, key) {
+		const cacheKey = `${kind}:${key}`;
+		if (!expandedActivity.has(cacheKey)) {
+			if (lastDiagnostics) renderActivity(lastDiagnostics);
+			return;
+		}
+		try {
+			const res = await api(`/admin/activity/detail?kind=${kind}&key=${encodeURIComponent(key)}`);
+			if (res.ok) activityCache.set(cacheKey, await res.json());
+		} catch {
+			/* leave it showing "Loading…" rather than blanking the row */
+		}
+		if (lastDiagnostics) renderActivity(lastDiagnostics);
+	}
+
+	function renderActivity(d) {
+		if (d.IpActivity) renderActivity._ips = d.IpActivity;
+		if (d.Callers) renderActivity._callers = d.Callers;
+		renderActivityTable("#talkersTable", "talkersTotal", renderActivity._ips || {}, "ip", "#talkersFilter");
+		renderActivityTable("#callersTable", "callersTotal", renderActivity._callers || {}, "caller", "#callersFilter");
+		sortTable("#talkersTable");
+		sortTable("#callersTable");
+		renderThrottleWatch(d);
+	}
+
+	// While throttle-all is on, this is the "who is knocking, for what, how often"
+	// panel — the same activity data narrowed to the callers being turned away, so
+	// a global throttle can be judged and lifted rather than left on out of caution.
+	function renderThrottleWatch(d) {
+		const panel = $("#throttleWatch");
+		if (!panel) return;
+		const on = Boolean(d?.ThrottleAll?.ThrottleAll);
+		panel.hidden = !on;
+		if (!on) return;
+		const tbody = $("#throttleWatchTable tbody");
+		if (!tbody) return;
+		const rows = Object.entries(renderActivity._ips || {})
+			.filter(([, info]) => Number(info.Refused || 0) > 0)
+			.sort((a, b) => Number(b[1].Refused || 0) - Number(a[1].Refused || 0))
+			.slice(0, 25);
+		setText("throttleWatchTotal", `${rows.length} IP(s) being refused`);
+		setText("throttleWatchDrops", fmtCount(d.ThrottleAllDrops || 0));
+		tbody.innerHTML = "";
+		if (!rows.length) {
+			tbody.appendChild(tr(["Nothing has been refused since throttle-all was enabled.", "", "", "", ""]));
+			return;
+		}
+		for (const [ip, info] of rows) {
+			const row = tr([
+				sortable(ip, ip),
+				fmtCount(info.Count),
+				refusedCell(info),
+				rateCell(info),
+				sortable(info.TopEndpoint || "—", info.TopEndpoint || ""),
+				tsNode(info.LastSeen),
+			]);
+			row.children[0].className = "mono";
+			tbody.appendChild(row);
+		}
+		sortTable("#throttleWatchTable");
+	}
+
+	// -----------------------------
+	// Why are we returning this?
+	// -----------------------------
+	const SOURCE_LABELS = {
+		Roblox: "Roblox → us",
+		Relay: "Roblox → caller (relayed)",
+		Roxy: "Roxy (our own refusals)",
+		Internal: "Our own probes",
+	};
+	const SOURCE_HINTS = {
+		Roblox: "What Roblox actually answered our upstream calls with. 429s here mean WE are being rate-limited.",
+		Relay: "Statuses we passed back to callers that came from Roblox.",
+		Roxy: "Statuses we generated ourselves: throttles, blocks, filters, pause, our own errors.",
+		Internal: "Statuses from Roxy's own calls (token validation, rotation probe) — not user traffic.",
+	};
+
+	function renderStatusSources(d) {
+		const sources = d.StatusSources || {};
+		const tbody = $("#statusSourceTable tbody");
+		if (!tbody) return;
+		tbody.innerHTML = "";
+		const rows = [];
+		for (const [source, codes] of Object.entries(sources)) {
+			for (const [code, count] of Object.entries(codes || {})) {
+				rows.push({ source, code, count: Number(count || 0) });
+			}
+		}
+		// The headline the whole split exists for: are the 429s ours or theirs?
+		const total = (src, pred) =>
+			rows.filter(r => r.source === src && pred(r.code)).reduce((acc, r) => acc + r.count, 0);
+		const robloxLimited = total("Roblox", c => c === "429");
+		const weLimited = total("Roxy", c => c === "429");
+		setText("src_roblox_429", fmtCount(robloxLimited));
+		setText("src_roxy_429", fmtCount(weLimited));
+		setText("src_roblox_5xx", fmtCount(total("Roblox", c => c.startsWith("5"))));
+		setText("src_roxy_5xx", fmtCount(total("Roxy", c => c.startsWith("5"))));
+		const verdict = $("#statusSourceVerdict");
+		if (verdict) {
+			if (robloxLimited > 0) {
+				verdict.textContent =
+					`Roblox has rate-limited us ${fmtCount(robloxLimited)} time(s). This is the one to act on — ` +
+					"reduce upstream volume or the account behind the token is at risk.";
+				verdict.className = "callout callout--bad";
+			} else if (weLimited > 0) {
+				verdict.textContent =
+					`All ${fmtCount(weLimited)} of the 429s are ours — Roxy turning callers away, not Roblox ` +
+					"turning us away. Nothing to do upstream.";
+				verdict.className = "callout callout--ok";
+			} else {
+				verdict.textContent = "No rate limiting recorded from either side.";
+				verdict.className = "callout callout--muted";
+			}
+		}
+		if (!rows.length) {
+			tbody.appendChild(tr(["No status codes recorded yet.", "", "", ""]));
+			return;
+		}
+		for (const row of rows) {
+			const src = document.createElement("span");
+			src.textContent = SOURCE_LABELS[row.source] || row.source;
+			src.title = SOURCE_HINTS[row.source] || "";
+			src.dataset.sortValue = row.source;
+			const code = document.createElement("span");
+			code.className = `badge badge--${
+				row.code.startsWith("2") ? "ok" : row.code.startsWith("4") ? "warn" : "bad"
+			}`;
+			code.textContent = row.code;
+			tbody.appendChild(tr([src, sortable(code, row.code), fmtCount(row.count)]));
+		}
+		sortTable("#statusSourceTable");
+	}
+
+	function renderRefusals(d) {
+		const tbody = $("#refusalsTable tbody");
+		if (!tbody) return;
+		const entries = Object.entries(d.Refusals || {});
+		setText("refusalsTotal", `${fmtCount(entries.length)} reason(s)`);
+		tbody.innerHTML = "";
+		if (!entries.length) {
+			tbody.appendChild(tr(["Roxy has not refused anything yet.", "", "", "", "", ""]));
+			return;
+		}
+		for (const [reason, info] of entries) {
+			const ips = info.IPs ? Object.keys(info.IPs).length : 0;
+			const row = tr([
+				sortable(reason, reason),
+				fmtCount(info.Count),
+				sortable(String(info.Status || "—"), Number(info.Status) || 0),
+				sortable(info.LastPath || "—", info.LastPath || ""),
+				sortable(info.LastIP || "—", info.LastIP || ""),
+				fmtCount(ips),
+				tsNode(info.LastSeen),
+			]);
+			row.children[3].className = "mono";
+			row.children[4].className = "mono";
+			tbody.appendChild(row);
+		}
+		sortTable("#refusalsTable");
+	}
+
+	function renderInternalRequests(d) {
+		const tbody = $("#internalTable tbody");
+		if (!tbody) return;
+		const stats = d.InternalRequests || {};
+		const known = d.InternalEndpoints || [];
+		tbody.innerHTML = "";
+		const byPurpose = new Map(known.map(e => [e.Purpose, e]));
+		for (const key of Object.keys(stats)) if (!byPurpose.has(key)) byPurpose.set(key, { Purpose: key, URL: "", What: "" });
+		for (const [purpose, meta] of byPurpose) {
+			const info = stats[purpose] || {};
+			const count = Number(info.Count || 0);
+			const failed = Number(info.Failed || 0);
+			const health = document.createElement("span");
+			if (!count) {
+				health.className = "badge badge--muted";
+				health.textContent = "Not called yet";
+			} else if (failed && Number(info.LastErrorAt || 0) > Number(info.LastSuccessAt || 0)) {
+				health.className = "badge badge--bad";
+				health.textContent = "Failing";
+			} else {
+				health.className = "badge badge--ok";
+				health.textContent = "OK";
+			}
+			const avg = count ? Number(info.TotalTime || 0) / count : 0;
+			tbody.appendChild(
+				tr([
+					sortable(purpose, purpose),
+					sortable(meta.URL || info.LastEndpoint || "—", meta.URL || ""),
+					sortable(health, count ? (health.textContent === "OK" ? 2 : 1) : 0),
+					fmtCount(count),
+					fmtCount(failed),
+					sortable(avg ? `${avg.toFixed(2)}s` : "—", avg),
+					sortable(info.LastError || "—", info.LastError || ""),
+					tsNode(info.LastSeen),
+				]),
+			);
+			tbody.children[tbody.children.length - 1].children[1].className = "mono";
+		}
+		sortTable("#internalTable");
+	}
+
+	// -----------------------------
+	// Identify a caller
+	// -----------------------------
+	// Turns a place ID from the Roblox-Id header into a named experience with a
+	// named owner. Roblox's Open Cloud v2 could answer more, but only for
+	// experiences the API key's owner controls — which excludes every stranger,
+	// i.e. everyone you would ever want to look up. These public endpoints work
+	// for anyone, and go out through our own proxy so they share its routing.
+	async function runLookup(id, kind = "place") {
+		const input = $("#lookupId");
+		if (input) input.value = id;
+		const out = $("#lookupResult");
+		if (out) {
+			out.hidden = false;
+			out.innerHTML = '<div class="text-muted">Looking up…</div>';
+		}
+		document.getElementById("section-callers")?.scrollIntoView({ behavior: "smooth", block: "start" });
+		try {
+			const res = await api("/admin/lookup/place", {
+				method: "POST",
+				body: JSON.stringify({ id: String(id), kind }),
+			});
+			const data = await res.json().catch(() => ({}));
+			if (!out) return;
+			if (!res.ok) {
+				out.innerHTML = `<div class="callout callout--bad">${escapeHtml(data.Message || "Lookup failed")}</div>`;
+				return;
+			}
+			const created = data.Created ? new Date(data.Created).toLocaleString() : "—";
+			// A place created hours ago with a handful of visits is not a game that
+			// happens to use the proxy heavily; it is a burner made to point at it.
+			const ageMs = data.Created ? Date.now() - new Date(data.Created).getTime() : 0;
+			const suspicious = ageMs > 0 && ageMs < 7 * 86400 * 1000 && Number(data.Visits || 0) < 1000;
+			out.innerHTML =
+				`<div class="lookup"><div class="lookup__head"><strong>${escapeHtml(data.Name || "—")}</strong>` +
+				`<span class="text-dim"> · universe ${escapeHtml(String(data.UniverseId || "—"))}</span></div>` +
+				`<dl class="lookup__grid">` +
+				[
+					["Owner", `${data.CreatorName || "—"} (${data.CreatorType || "?"} ${data.CreatorId || "—"})`],
+					["Place ID", data.RootPlaceId || data.PlaceId || "—"],
+					["Created", created],
+					["Visits", fmtCount(data.Visits)],
+					["Playing now", fmtCount(data.Playing)],
+					["Max players", fmtCount(data.MaxPlayers)],
+					["Favourites", fmtCount(data.FavoritedCount)],
+				]
+					.map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`)
+					.join("") +
+				"</dl>" +
+				(data.Description
+					? `<div class="lookup__desc">${escapeHtml(String(data.Description).slice(0, 400))}</div>`
+					: "") +
+				`<div class="lookup__links">` +
+				(data.Url ? `<a href="${escapeHtml(data.Url)}" target="_blank" rel="noopener">Experience ↗</a>` : "") +
+				(data.CreatorUrl
+					? ` <a href="${escapeHtml(data.CreatorUrl)}" target="_blank" rel="noopener">Owner ↗</a>`
+					: "") +
+				"</div>" +
+				(suspicious
+					? '<div class="callout callout--warn">Recently created with very few visits — consistent with a ' +
+						"throwaway place made to point traffic at this proxy rather than a real game using it.</div>"
+					: "") +
+				"</div>";
+		} catch (err) {
+			if (out) out.innerHTML = '<div class="callout callout--bad">Lookup failed.</div>';
+		}
+	}
+
+	async function blockCaller(id) {
+		if (!confirm(`Block every request carrying Roblox-Id "${id}"?`)) return;
+		try {
+			const res = await api("/admin/headers/rule", {
+				method: "POST",
+				body: JSON.stringify({
+					header: "Roblox-Id",
+					scope: "value",
+					mode: "exact",
+					needle: String(id),
+					note: `Blocked from Callers on ${new Date().toLocaleDateString()}`,
+				}),
+			});
+			const data = await res.json().catch(() => ({}));
+			showToast(res.ok ? `Blocking Roblox-Id ${id}` : data.Message || "Could not add the filter");
+			if (res.ok) refreshAll(true);
+		} catch {
+			showToast("Could not add the filter");
+		}
+	}
+
+	async function addBypass(ip) {
+		try {
+			const res = await api("/admin/throttle/bypass", {
+				method: "POST",
+				body: JSON.stringify({ ip: String(ip), expires_in: 3600, note: "Added from Top Talkers" }),
+			});
+			const data = await res.json().catch(() => ({}));
+			showToast(res.ok ? `${ip} bypasses throttling for 1h` : data.Message || "Could not add the bypass");
+			if (res.ok) refreshAll(true);
+		} catch {
+			showToast("Could not add the bypass");
+		}
+	}
+
+	function filterLiveBy(value) {
+		const input = $("#liveFilter");
+		if (input) {
+			input.value = String(value);
+			input.dispatchEvent(new Event("input"));
+		}
+		document.getElementById("section-live")?.scrollIntoView({ behavior: "smooth", block: "start" });
 	}
 
 	const SETTING_LABELS = {
@@ -1740,6 +2728,25 @@ const print = console.log;
 		}
 	}
 
+	// The admin-authored reply a refused caller receives. Rendered dimmed when
+	// unset so an empty column reads as "default message", not as missing data.
+	function messageCell(info) {
+		const text = String(info?.Message || "").trim();
+		const span = document.createElement("span");
+		if (!text) {
+			span.className = "text-muted";
+			span.textContent = "default";
+			span.dataset.sortValue = "";
+			span.title = "The caller receives the built-in message";
+		} else {
+			span.className = "rule-message";
+			span.textContent = text;
+			span.title = text;
+			span.dataset.sortValue = text;
+		}
+		return span;
+	}
+
 	const typeBadge = info => {
 		const badge = document.createElement("span");
 		const isRegex = info.Type === "regex";
@@ -1796,7 +2803,7 @@ const print = console.log;
 		tbody.innerHTML = "";
 		const entries = Object.entries(d.EndpointBlocks || {});
 		if (entries.length === 0) {
-			tbody.appendChild(tr(["—", "—", "No endpoints blocked", "—", ""]));
+			tbody.appendChild(tr(["—", "—", "No endpoints blocked", "—", "—", ""]));
 			return;
 		}
 		for (const [pattern, info] of entries) {
@@ -1804,7 +2811,9 @@ const print = console.log;
 			btn.className = "btn btn--outline btn--sm";
 			btn.textContent = "Unblock";
 			btn.addEventListener("click", () => unblockEndpoint(pattern));
-			tbody.appendChild(tr([pattern, typeBadge(info), info.Note || "—", tsNode(info.Added), btn]));
+			tbody.appendChild(
+				tr([pattern, typeBadge(info), info.Note || "—", messageCell(info), tsNode(info.Added), btn]),
+			);
 		}
 	}
 
@@ -1814,7 +2823,7 @@ const print = console.log;
 		tbody.innerHTML = "";
 		const entries = Object.entries(d.EndpointRules || {});
 		if (entries.length === 0) {
-			tbody.appendChild(tr(["—", "—", "—", "—", "—", ""]));
+			tbody.appendChild(tr(["—", "—", "—", "—", "—", "—", ""]));
 			return;
 		}
 		for (const [pattern, info] of entries) {
@@ -1828,6 +2837,7 @@ const print = console.log;
 					typeBadge(info),
 					String(info.Limit ?? "—"),
 					String(info.Period ?? "—"),
+					messageCell(info),
 					tsNode(info.Added),
 					btn,
 				]),
@@ -1916,7 +2926,7 @@ const print = console.log;
 		tbody.innerHTML = "";
 		const entries = Object.entries(d.HeaderRules || {});
 		if (entries.length === 0) {
-			tbody.appendChild(tr(["—", "—", "—", "No header rules", "—", "—", ""]));
+			tbody.appendChild(tr(["—", "—", "—", "No header rules", "—", "—", "—", ""]));
 			return;
 		}
 		for (const [id, info] of entries) {
@@ -1924,6 +2934,13 @@ const print = console.log;
 			btn.className = "btn btn--outline btn--sm";
 			btn.textContent = "Remove";
 			btn.addEventListener("click", () => removeHeaderRule(id));
+			const reply = messageCell(info);
+			// An empty reply here is the SAFE state (the caller cannot tell they
+			// were filtered), so it is labelled rather than left looking unset.
+			if (!String(info.Message || "").trim()) {
+				reply.textContent = "stealth 429";
+				reply.title = "The caller sees an ordinary throttle response and cannot tell they were filtered";
+			}
 			tbody.appendChild(
 				tr([
 					info.Header || "(any)",
@@ -1931,6 +2948,7 @@ const print = console.log;
 					HEADER_MODE_LABELS[info.Mode] || info.Mode || "Contains",
 					info.Needle || "—",
 					info.Note || "—",
+					reply,
 					tsNode(info.Added),
 					btn,
 				]),
@@ -2005,6 +3023,23 @@ const print = console.log;
 		setText("tarpit_skipped", fmtCount(stats.Skipped || 0));
 		setText("tarpit_active", String(state.ActiveHolds ?? 0));
 		setText("tarpit_capacity", String(state.MaxConcurrent ?? 0));
+		// The number the admin set vs. the number actually enforced, plus how much
+		// of the fleet is currently sat on by held refusals. A clamp that is not
+		// shown is a setting that silently lies about what it does.
+		const capHint = $("#tarpitCapacityHint");
+		if (capHint) {
+			const slots = Number(state.FleetSlots || 0);
+			const used = Number(state.CapacityUsedPct || 0);
+			capHint.innerHTML =
+				`A held request occupies one of the fleet's <strong>${slots || "—"}</strong> request slots for its ` +
+				`whole hold, so <strong>Max concurrent</strong> is clamped to ${state.CapacityCeilingPct ?? 50}% of ` +
+				"them — setting it higher is quietly ignored rather than starving real traffic. " +
+				(state.Clamped
+					? `<span class="text-warn">Clamped: you asked for ${state.ConfiguredConcurrent}, ` +
+						`${state.MaxConcurrent} is enforced.</span> `
+					: "") +
+				`Currently holding <strong>${used}%</strong> of fleet capacity.`;
+		}
 		setText("tarpit_avg", held ? fmtSeconds(totalHeld / held) : "—");
 		setText("tarpit_min", stats.Min ? fmtSeconds(stats.Min) : "—");
 		setText("tarpit_max", stats.Max ? fmtSeconds(stats.Max) : "—");
@@ -2223,6 +3258,16 @@ const print = console.log;
 			renderHeaderBlocked(d);
 			renderIgnoredHeaders(d);
 			renderStoreSizes(d);
+			renderActivity(d);
+			renderStatusSources(d);
+			renderRefusals(d);
+			renderInternalRequests(d);
+			renderCaptureState(d);
+			renderThreatLevel(d);
+			// One pass at the end rather than inside each renderer: every table has
+			// just been rebuilt from scratch, and the sort the admin chose has to
+			// survive that or it is useless on live data.
+			sortAllTables();
 			setText("lastUpdatedChip", "Updated: just now");
 			if (!silent) showToast("Dashboard updated");
 		} catch (err) {
@@ -2652,6 +3697,9 @@ const print = console.log;
 		"section-fingerprints": { target: "fingerprints", what: "the recorded header names and user-agents" },
 		"section-blocked-fingerprints": { target: "blocked_fingerprints", what: "the blocked-request header names and user-agents" },
 		"section-errors": { target: "errors", what: "the error log" },
+		"section-refusals": { target: "refusals", what: "the refusal-reason records" },
+		"section-callers": { target: "callers", what: "the per-place and per-IP caller activity" },
+		"section-internal": { target: "internal_requests", what: "the internal-request stats" },
 	};
 	for (const [sectionId, info] of Object.entries(CLEAR_BUTTONS)) {
 		const section = document.getElementById(sectionId);
@@ -2800,18 +3848,21 @@ const print = console.log;
 		const pattern = $("#blockPattern")?.value.trim();
 		const note = $("#blockNote")?.value.trim() || "";
 		const type = $("#blockType")?.value || "glob";
+		// Note is private (admin-only); message is returned verbatim to the caller.
+		const message = $("#blockMessage")?.value.trim() || "";
 		if (!pattern) return;
 		try {
 			const res = await api("/admin/endpoints/block", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ pattern, note, type }),
+				body: JSON.stringify({ pattern, note, type, message }),
 			});
 			const data = await res.json();
 			if (!res.ok) throw new Error(data.Message || String(res.status));
 			renderEndpointBlocks({ EndpointBlocks: data.EndpointBlocks });
 			$("#blockPattern").value = "";
 			$("#blockNote").value = "";
+			if ($("#blockMessage")) $("#blockMessage").value = "";
 			showToast(`Blocked ${pattern}`);
 		} catch (err) {
 			showToast("Block failed: " + err.message);
@@ -2825,18 +3876,20 @@ const print = console.log;
 		const limit = Number($("#ruleLimit")?.value);
 		const period = Number($("#rulePeriod")?.value) || 60;
 		const type = $("#ruleType")?.value || "glob";
+		const message = $("#ruleMessage")?.value.trim() || "";
 		if (!pattern || !limit) return;
 		try {
 			const res = await api("/admin/endpoints/rule", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ pattern, limit, period, type }),
+				body: JSON.stringify({ pattern, limit, period, type, message }),
 			});
 			const data = await res.json();
 			if (!res.ok) throw new Error(data.Message || String(res.status));
 			renderEndpointRules({ EndpointRules: data.EndpointRules });
 			$("#rulePattern").value = "";
 			$("#ruleLimit").value = "";
+			if ($("#ruleMessage")) $("#ruleMessage").value = "";
 			showToast(`Rule set for ${pattern}`);
 		} catch (err) {
 			showToast("Rule failed: " + err.message);
@@ -3130,12 +4183,15 @@ const print = console.log;
 		const mode = $("#headerRuleMode")?.value || "contains";
 		const needle = $("#headerRuleNeedle")?.value.trim();
 		const note = $("#headerRuleNote")?.value.trim() || "";
+		// Optional and consequential: a message tells the blocked caller they were
+		// filtered rather than merely rate-limited. See the warning in the form.
+		const message = $("#headerRuleMessage")?.value.trim() || "";
 		if (!needle) return;
 		try {
 			const res = await api("/admin/headers/rule", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ header, scope, mode, needle, note }),
+				body: JSON.stringify({ header, scope, mode, needle, note, message }),
 			});
 			const data = await res.json();
 			if (!res.ok) throw new Error(data.Message || String(res.status));
@@ -3143,6 +4199,7 @@ const print = console.log;
 			$("#headerRuleHeader").value = "";
 			$("#headerRuleNeedle").value = "";
 			$("#headerRuleNote").value = "";
+			if ($("#headerRuleMessage")) $("#headerRuleMessage").value = "";
 			showToast("Header rule added");
 		} catch (err) {
 			showToast("Header rule failed: " + err.message);
@@ -3490,7 +4547,199 @@ const print = console.log;
 		});
 	});
 
+	// -----------------------------
+	// Threat level
+	// -----------------------------
+	// One line at the top that answers "is something wrong right now?" without
+	// reading nine tables. It is deliberately conservative: it reports what the
+	// numbers say and names the section that explains it, rather than trying to
+	// classify an attack.
+	function renderThreatLevel(d) {
+		const banner = $("#threatBanner");
+		if (!banner) return;
+		const ips = d.IpActivity || {};
+		const callers = d.Callers || {};
+		const busiest = arr => arr.reduce((best, cur) => (cur[1].Rate1 > (best?.[1]?.Rate1 ?? -1) ? cur : best), null);
+		const topIp = busiest(Object.entries(ips));
+		const topCaller = busiest(Object.entries(callers));
+		const robloxLimited = Number((d.StatusSources?.Roblox || {})["429"] || 0);
+		const notes = [];
+		let level = "ok";
+
+		if (robloxLimited > 0) {
+			level = "bad";
+			notes.push(`Roblox has rate-limited us ${fmtCount(robloxLimited)} time(s) — reduce upstream volume.`);
+		}
+		const rate = Number(topCaller?.[1]?.Rate1 || 0);
+		if (rate >= 120) {
+			level = "bad";
+			notes.push(`Place ${topCaller[0]} is sending ${fmtCount(rate)} req/min.`);
+		} else if (rate >= 30) {
+			if (level !== "bad") level = "warn";
+			notes.push(`Place ${topCaller[0]} is sending ${fmtCount(rate)} req/min.`);
+		}
+		const ipRate = Number(topIp?.[1]?.Rate1 || 0);
+		if (ipRate >= 120 && !notes.length) {
+			level = "warn";
+			notes.push(`${topIp[0]} is sending ${fmtCount(ipRate)} req/min.`);
+		}
+		if (d?.Pause?.Paused) {
+			level = "warn";
+			notes.push("The proxy is paused.");
+		}
+		if (d?.ThrottleAll?.ThrottleAll) {
+			if (level === "ok") level = "warn";
+			notes.push("Throttle-all is on.");
+		}
+		const tokens = Number((d.ProxyHealth?.Tokens || {}).Count || 0);
+		if (!tokens) {
+			level = "bad";
+			notes.push("No auth tokens are loaded.");
+		}
+		banner.hidden = level === "ok" && !notes.length;
+		banner.className = `threat-banner threat-banner--${level}`;
+		const label = level === "bad" ? "Needs attention" : level === "warn" ? "Worth a look" : "All clear";
+		banner.innerHTML =
+			`<strong>${label}</strong> ${escapeHtml(notes.join(" "))}` +
+			(level !== "ok" ? ' <a href="#section-callers">Investigate →</a>' : "");
+	}
+
+	// -----------------------------
+	// Sortable table registration
+	// -----------------------------
+	// Registered once at boot. Tables that render as a plain list of rows use the
+	// generic DOM sorter; the endpoint tree redraws itself instead, because
+	// reordering its rows in place would separate hosts from their children.
+	const SORTABLE_TABLES = [
+		"#talkersTable",
+		"#callersTable",
+		"#throttleWatchTable",
+		"#refusalsTable",
+		"#statusSourceTable",
+		"#internalTable",
+		"#blocksTable",
+		"#rulesTable",
+		"#bypassTable",
+		"#headerRulesTable",
+		"#blockedAttemptsTable",
+		"#rateLimitedAttemptsTable",
+		"#headerBlockedTable",
+		"#tokensTable",
+		"#statusDetailedTable",
+		"#retryStatusTable",
+		"#retryReasonTable",
+		"#requestFailuresTable",
+		"#crawlsTable",
+		"#throttledTable",
+		"#probeTable",
+		"#exploitSummaryTable",
+		"#headerNamesTable",
+		"#userAgentsTable",
+		"#blockedHeaderNamesTable",
+		"#blockedUserAgentsTable",
+		"#ignoredHeadersTable",
+		"#errorsTable",
+		"#loginsTable",
+		"#workersTable",
+		"#rotateIpsTable",
+		"#storeSizesTable",
+		"#tarpitCategoryTable",
+		"#tarpitIpsTable",
+	];
+
+	function initAllSortables() {
+		for (const sel of SORTABLE_TABLES) initSortable(sel);
+		// The endpoint tree sorts per level, so a header click re-runs its renderer
+		// rather than shuffling rows.
+		initSortable("#endpointsTable", () => renderEndpoints({}));
+	}
+
+	// -----------------------------
+	// New controls
+	// -----------------------------
+	$("#resetWorkerCounts")?.addEventListener("click", async e => {
+		if (!confirm("Zero the request counters for every worker?")) return;
+		await withBusy(e.currentTarget, "Resetting…", async () => {
+			try {
+				const res = await api("/admin/workers/reset", { method: "POST" });
+				showToast(res.ok ? "Worker request counts reset" : "Reset failed");
+				refreshAll(true);
+			} catch {
+				showToast("Reset failed");
+			}
+		});
+	});
+
+	$("#clearCaptures")?.addEventListener("click", async e => {
+		await withBusy(e.currentTarget, "Clearing…", async () => {
+			try {
+				const res = await api("/admin/live/clear", { method: "POST" });
+				liveBodyCache.clear();
+				showToast(res.ok ? "Live feed and captured bodies cleared" : "Clear failed");
+				refreshAll(true);
+			} catch {
+				showToast("Clear failed");
+			}
+		});
+	});
+
+	$("#lookupForm")?.addEventListener("submit", e => {
+		e.preventDefault();
+		const id = $("#lookupId")?.value.trim();
+		if (!id) return;
+		runLookup(id, $("#lookupKind")?.value || "place");
+	});
+
+	for (const sel of ["#talkersFilter", "#callersFilter", "#liveOutcomeFilter"]) {
+		$(sel)?.addEventListener("input", () => {
+			if (!lastDiagnostics) return;
+			if (sel === "#liveOutcomeFilter") renderLiveFeed({});
+			else renderActivity({});
+		});
+		$(sel)?.addEventListener("change", () => {
+			if (!lastDiagnostics) return;
+			if (sel === "#liveOutcomeFilter") renderLiveFeed({});
+			else renderActivity({});
+		});
+	}
+
+	// -----------------------------
+	// Keyboard: jump to a section
+	// -----------------------------
+	// Thirty-odd sections is more than a sidebar scan is good for during an
+	// incident. "/" focuses the section jump box; Escape leaves it.
+	const jump = $("#sectionJump");
+	if (jump) {
+		document.addEventListener("keydown", e => {
+			if (e.key === "/" && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "")) {
+				e.preventDefault();
+				jump.focus();
+				jump.select();
+			}
+			if (e.key === "Escape" && document.activeElement === jump) jump.blur();
+		});
+		const jumpTo = () => {
+			const q = jump.value.trim().toLowerCase();
+			if (!q) return;
+			const link = $$("#appNav .nav__link").find(a => a.textContent.toLowerCase().includes(q));
+			if (link) {
+				document.querySelector(link.getAttribute("href"))?.scrollIntoView({ behavior: "smooth", block: "start" });
+				jump.blur();
+			} else showToast("No section matches that");
+		};
+		jump.addEventListener("keydown", e => {
+			if (e.key === "Enter") {
+				e.preventDefault();
+				jumpTo();
+			}
+		});
+	}
+
 	// Initial load
-	document.addEventListener("DOMContentLoaded", () => refreshAll(true));
-	if (document.readyState !== "loading") refreshAll(true);
+	function boot() {
+		initAllSortables();
+		refreshAll(true);
+	}
+	document.addEventListener("DOMContentLoaded", boot);
+	if (document.readyState !== "loading") boot();
 })();

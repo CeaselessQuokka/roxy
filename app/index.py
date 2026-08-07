@@ -2,6 +2,7 @@ import logging
 import logging.handlers
 
 import auth
+import capture
 import challenge
 import config
 import diagnostics
@@ -412,6 +413,8 @@ def admin_diagnostics():
         "ResetIn": rs.get("TokenResetIn", 0),
     }
     data["Persistence"] = storage.get_status()
+    data["Capture"] = capture.get_state()
+    data["InternalEndpoints"] = proxy.internal_endpoints()
     data["IgnoredValueHeaders"] = runtime.get_ignored_value_headers()
     data["TrustedDevices"] = runtime.get_trusted_device_count()
     data["TrustedThisDevice"] = runtime.is_trusted_device(request.cookies.get(TRUSTED_DEVICE_COOKIE, ""))
@@ -574,12 +577,174 @@ def admin_fingerprint_user_agent():
 @app.route("/admin/endpoints/concrete", methods=["GET"], endpoint="admin_endpoint_concrete")
 @requires_admin
 def admin_endpoint_concrete():
-    """The concrete paths recorded under one endpoint template (lazy drill-down)."""
+    """One endpoint's drill-down: concrete paths, callers, and its recent requests.
+
+    Everything bulky about an endpoint lives here rather than in the poll — the
+    recent-request ring carries headers, query strings and body previews, which
+    would multiply the dashboard's poll payload by the endpoint count if it
+    travelled with it.
+    """
     template = request.args.get("template", "")
     if not template:
         return jsonify("Missing template"), 400
     limit = max(1, min(500, request.args.get("limit", type=int) or 100))
-    return jsonify(diagnostics.get_endpoint_detail(template, limit)), 200
+    return jsonify(diagnostics.get_endpoint_detail(template, limit, request.args.get("path", ""))), 200
+
+
+@app.route("/admin/activity/detail", methods=["GET"], endpoint="admin_activity_detail")
+@requires_admin
+def admin_activity_detail():
+    """The full breakdown for one client IP or one calling Roblox place."""
+    kind = "caller" if request.args.get("kind") == "caller" else "ip"
+    key = request.args.get("key", "")
+    if not key:
+        return jsonify("Missing key"), 400
+    return jsonify(diagnostics.get_activity_detail(kind, key)), 200
+
+
+@app.route("/admin/live/detail", methods=["GET"], endpoint="admin_live_detail")
+@requires_admin
+def admin_live_detail():
+    """The captured request + response bodies behind one live-feed entry.
+
+    404 rather than an error when it's gone: captures expire by design, and an
+    admin scrolling back past the window should be told the bytes aged out, not
+    that something broke.
+    """
+    entry = capture.get(request.args.get("id", ""))
+    if entry is None:
+        return jsonify({"Message": "That capture has expired or was evicted.", "Expired": True}), 404
+    return jsonify(entry), 200
+
+
+@app.route("/admin/live/clear", methods=["POST"], endpoint="admin_clear_captures")
+@requires_admin
+def admin_clear_captures():
+    capture.reset()
+    diagnostics.clear_stats(diagnostics.CLEAR_TARGETS["live"])
+    return jsonify({"Message": "Live feed and captured bodies cleared"}), 200
+
+
+@app.route("/admin/workers/reset", methods=["POST"], endpoint="admin_reset_workers")
+@requires_admin
+def admin_reset_workers():
+    """Zero the fleet's request counters (reaches every worker, not just this one)."""
+    at = workers.reset_counts()
+    return jsonify({"Message": "Worker request counts reset", "ResetAt": at}), 200
+
+
+# Roblox's own public lookup chain, walked through our own proxy so it uses the
+# same routing/budget as everything else and needs no extra credentials:
+#   place id  -> universe id  -> the experience, including its creator.
+# Open Cloud (apis.roblox.com/cloud/v2/universes/...) can return richer data but
+# only for experiences the API key's owner controls, which makes it useless for
+# the question actually being asked here — "who is this stranger hammering me?"
+_PLACE_UNIVERSE_URL = "apis.roblox.com/universes/v1/places/{id}/universe"
+_UNIVERSE_DETAIL_URL = "games.roblox.com/v1/games"
+
+
+def _lookup_json(url: str, params: dict = None):
+    """Fetch one public Roblox JSON endpoint through the proxy stack. Returns (data, error)."""
+    ok, body = proxy.request(url, method="get", headers={}, params=params or {})
+    if not ok:
+        return None, str(body)[:300]
+    try:
+        return json.loads(body), ""
+    except (ValueError, TypeError):
+        return None, "Upstream returned a non-JSON body"
+
+
+@app.route("/admin/lookup/place", methods=["POST"], endpoint="admin_lookup_place")
+@requires_admin
+def admin_lookup_place():
+    """Identify the experience (and its owner) behind a place or universe id.
+
+    The Roblox-Id header on an inbound request is a PLACE id, so this is the
+    step that turns "something called 75227619283955 is hammering me" into a
+    named experience with a named owner — which is what a report, a block, or a
+    conversation with the developer all need.
+    """
+    data = get_json_dict() or {}
+    raw = str(data.get("id", "")).strip()
+    if not raw.isdigit():
+        return jsonify({"Message": "Enter a numeric place or universe ID"}), 400
+    kind = "universe" if data.get("kind") == "universe" else "place"
+    result = {"Query": raw, "Kind": kind, "PlaceId": raw if kind == "place" else "", "UniverseId": ""}
+
+    universe_id = raw
+    if kind == "place":
+        payload, error = _lookup_json(_PLACE_UNIVERSE_URL.format(id=raw))
+        if error:
+            return jsonify({"Message": f"Could not resolve that place: {error}", **result}), 502
+        universe_id = str((payload or {}).get("universeId", "") or "")
+        if not universe_id:
+            return jsonify({"Message": "Roblox did not return a universe for that place", **result}), 404
+    result["UniverseId"] = universe_id
+
+    payload, error = _lookup_json(_UNIVERSE_DETAIL_URL, {"universeIds": universe_id})
+    if error:
+        return jsonify({"Message": f"Could not load that experience: {error}", **result}), 502
+    entries = (payload or {}).get("data") or []
+    if not entries:
+        return jsonify({"Message": "Roblox returned no experience for that ID", **result}), 404
+    game = entries[0]
+    creator = game.get("creator") or {}
+    result.update(
+        {
+            "Name": game.get("name", ""),
+            "Description": str(game.get("description", ""))[:600],
+            "RootPlaceId": game.get("rootPlaceId", ""),
+            "Created": game.get("created", ""),
+            "Updated": game.get("updated", ""),
+            "Playing": game.get("playing", 0),
+            "Visits": game.get("visits", 0),
+            "MaxPlayers": game.get("maxPlayers", 0),
+            "FavoritedCount": game.get("favoritedCount", 0),
+            "CreatorId": creator.get("id", ""),
+            "CreatorName": creator.get("name", ""),
+            "CreatorType": creator.get("type", ""),
+            "CreatorVerified": bool(creator.get("hasVerifiedBadge")),
+            "Url": f"https://www.roblox.com/games/{game.get('rootPlaceId', '')}",
+            "CreatorUrl": _creator_url(creator),
+        }
+    )
+    return jsonify(result), 200
+
+
+def _creator_url(creator: dict) -> str:
+    kind = str(creator.get("type", "")).lower()
+    ident = creator.get("id", "")
+    if not ident:
+        return ""
+    if kind == "group":
+        return f"https://www.roblox.com/groups/{ident}"
+    return f"https://www.roblox.com/users/{ident}/profile"
+
+
+@app.route("/admin/internal/endpoints", methods=["GET"], endpoint="admin_internal_endpoints")
+@requires_admin
+def admin_internal_endpoints():
+    """Every upstream call Roxy makes on its OWN behalf, and their live health.
+
+    Exists to settle a specific worry: that adding a block or rate rule could cut
+    the token health check off at the knees. It cannot — internal probes never
+    enter the proxy route, so no rule on it applies to them — and this endpoint
+    is how that is checked rather than trusted.
+    """
+    return (
+        jsonify(
+            {
+                "Endpoints": proxy.internal_endpoints(),
+                "Stats": diagnostics.get_diagnostics().get("InternalRequests", {}),
+                "Note": (
+                    "Internal probes call Roblox directly and never pass through the proxy route, "
+                    "so endpoint blocks, rate rules, request filters, throttling and pause cannot "
+                    "affect them. Client traffic to a similarly-named endpoint is unrelated."
+                ),
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/admin/fingerprints/ignore", methods=["POST"], endpoint="admin_ignore_header_values")
@@ -638,6 +803,13 @@ def admin_clear_data():
         # stats. Leaving them behind would make the first request after a clear
         # report a gap measured from before it.
         tarpit.reset()
+    if target in ("live", "all"):
+        capture.reset()  # Captured bodies live in their own file, so clear_stats can't reach them.
+    if target == "all":
+        # Same story for the worker registry: the fleet's request counts are
+        # kept per worker process, so "Clear all data" left them standing and
+        # the totals afterwards looked like the clear had partly failed.
+        workers.reset_counts()
     ok = diagnostics.clear_stats(names)
     if ok:
         return jsonify("Cleared everything" if target == "all" else "Cleared"), 200
@@ -679,7 +851,12 @@ def admin_block_endpoint():
     data = get_json_dict()
     if data is None or not data.get("pattern"):
         return jsonify({"Message": "Missing pattern"}), 400
-    ok, message = runtime.block_endpoint(str(data["pattern"]), str(data.get("note", "")), str(data.get("type", "glob")))
+    ok, message = runtime.block_endpoint(
+        str(data["pattern"]),
+        str(data.get("note", "")),
+        str(data.get("type", "glob")),
+        str(data.get("message", "")),
+    )
     status = 200 if ok else 400
     return jsonify({"Message": message, "EndpointBlocks": runtime.get_endpoint_blocks()}), status
 
@@ -706,6 +883,8 @@ def admin_set_endpoint_rule():
         data.get("limit"),
         data.get("period", config.DEFAULT_ENDPOINT_RULE_PERIOD),
         str(data.get("type", "glob")),
+        str(data.get("message", "")),
+        str(data.get("note", "")),
     )
     status = 200 if ok else 400
     return jsonify({"Message": message, "EndpointRules": runtime.get_endpoint_rules()}), status
@@ -734,6 +913,7 @@ def admin_add_header_rule():
         str(data["needle"]),
         str(data.get("note", "")),
         str(data.get("header", "")),
+        str(data.get("message", "")),
     )
     status = 200 if ok else 400
     return jsonify({"Message": message, "HeaderRules": runtime.get_header_rules()}), status
@@ -969,32 +1149,163 @@ def sanitize_headers(headers) -> dict:
     return safe
 
 
-def log_live_request(ip, user_agent, method, url, headers, body, status_code):
-    """Record a sanitized snapshot of a proxied request for the dashboard live feed."""
+def _body_text(body) -> str:
+    """A decoded, length-capped view of a request body for the live feed."""
+    if not body:
+        return ""
     try:
-        safe_headers = sanitize_headers(headers)
-        body_text = ""
-        if body:
+        text = body.decode("utf-8", errors="replace") if isinstance(body, (bytes, bytearray)) else str(body)
+    except Exception:
+        return "[unreadable body]"
+    if len(text) > config.MAX_LIVE_BODY_LENGTH:
+        return text[: config.MAX_LIVE_BODY_LENGTH] + "… [truncated]"
+    return text
+
+
+class RequestContext:
+    """Everything about one inbound proxy request that the bookkeeping needs.
+
+    Gathered once at the top of proxy_page so that every exit path — served,
+    throttled, blocked, filtered, paused, probed — can be recorded identically.
+    Previously only the SUCCESSFUL path was recorded to the live feed, which
+    meant the one view built for watching traffic in real time was blind to
+    exactly the traffic worth watching: an attack that is being refused produced
+    a counter going up and nothing else. Refusals are now first-class events.
+    """
+
+    __slots__ = ("ip", "path", "method", "user_agent", "caller_id", "headers", "query", "started", "bypass", "_body")
+
+    def __init__(self):
+        self.ip = get_client_ip()
+        self.path = ""
+        self.method = request.method
+        self.user_agent = request.user_agent.string
+        # Roblox stamps the calling PLACE id on every HttpService request. It is
+        # self-reported and therefore not proof of anything, but it is the only
+        # identifier that survives a game's server IPs churning — which makes it
+        # the one that actually names a caller.
+        self.caller_id = (request.headers.get("Roblox-Id") or "").strip()[:64]
+        self.headers = request.headers
+        self.query = request.query_string.decode("utf-8", "replace")[:2000]
+        self.started = time.monotonic()
+        self.bypass = False
+        self._body = None
+
+    @property
+    def body(self) -> bytes:
+        """The raw request body, read at most once.
+
+        Werkzeug has already buffered it (MAX_CONTENT_LENGTH caps it at 2 MB), so
+        this is a memory read rather than I/O — but it is only touched when
+        something is going to record it.
+        """
+        if self._body is None:
             try:
-                body_text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+                self._body = request.get_data() or b""
             except Exception:
-                body_text = "[unreadable body]"
-            if len(body_text) > config.MAX_LIVE_BODY_LENGTH:
-                body_text = body_text[: config.MAX_LIVE_BODY_LENGTH] + "… [truncated]"
+                self._body = b""
+        return self._body
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+
+def _record_outcome(ctx: RequestContext, status: int, outcome: str, **extra):
+    """Record one completed proxy request in every view that should show it.
+
+    Single funnel on purpose. The alternative — each branch remembering to call
+    the four or five right loggers — is how the endpoint table ended up able to
+    show the last caller for some paths and not others, and how refusals ended
+    up missing from the live feed entirely. One call site cannot drift.
+
+    Best-effort throughout: diagnostics must never be able to fail a request it
+    is only describing.
+    """
+    try:
+        reason = extra.get("reason", "")
+        source = extra.get("source", "Roxy")
+        trace = extra.get("trace") or {}
+        served = outcome == "served"
+        # Which status code we ANSWERED with, and who decided it. For a refusal
+        # that is us; for a served request the upstream status is recorded
+        # separately by proxy.py, so this one is not double-counted as Roblox's.
+        diagnostics.log_status_code(status, source=source)
+        if not served:
+            diagnostics.log_refusal(
+                reason or outcome,
+                status,
+                ip=ctx.ip,
+                path=ctx.path,
+                category=extra.get("category", ""),
+                detail=extra.get("detail", ""),
+            )
+        if runtime.get_setting("activity_tracking", 1):
+            diagnostics.log_traffic(
+                ctx.ip, ctx.caller_id, ctx.method, ctx.path, status, outcome, user_agent=ctx.user_agent
+            )
+        capture_id = _capture(ctx, status, outcome, trace, extra.get("response_body"))
         diagnostics.log_live_request(
             dict(
                 Date=time.time(),
-                IP=ip,
-                UserAgent=user_agent,
-                Method=method,
-                URL=url,
-                Headers=safe_headers,
-                Body=body_text,
-                StatusCode=status_code,
+                IP=ctx.ip,
+                UserAgent=ctx.user_agent,
+                Method=ctx.method,
+                URL=ctx.path,
+                Query=ctx.query,
+                Headers=sanitize_headers(ctx.headers),
+                Body=_body_text(ctx.body),
+                StatusCode=status,
+                # The three fields that make the feed diagnostic rather than
+                # decorative: what we did, why, and what Roblox actually said.
+                Outcome=outcome,
+                Reason=reason,
+                Source=source,
+                CallerId=ctx.caller_id,
+                UpstreamStatus=trace.get("UpstreamStatus", ""),
+                UpstreamMethod=trace.get("Method", ""),
+                UpstreamError=trace.get("UpstreamError", ""),
+                Attempts=trace.get("Attempts", 0),
+                Retries=trace.get("Retries", 0),
+                Duration=round(ctx.elapsed(), 4),
+                Bypass=ctx.bypass,
+                CaptureId=capture_id,
             )
         )
     except Exception:
-        pass  # The live feed is best-effort; never let it break a proxied response.
+        pass
+
+
+def _capture(ctx: RequestContext, status: int, outcome: str, trace: dict, response_body) -> str:
+    """Stash the full request/response bodies for this request, if capture is on.
+
+    Kept out of the diagnostics stores deliberately — see capture.py for why the
+    bytes live under their own byte budget and TTL rather than in the stats file.
+    Returns the capture id to hang off the live-feed entry, or "".
+    """
+    try:
+        if not capture.is_enabled():
+            return ""
+        return capture.record(
+            {
+                "Date": time.time(),
+                "IP": ctx.ip,
+                "Method": ctx.method,
+                "URL": ctx.path,
+                "Query": ctx.query,
+                "CallerId": ctx.caller_id,
+                "UserAgent": ctx.user_agent,
+                "Outcome": outcome,
+                "Status": status,
+                "UpstreamStatus": trace.get("UpstreamStatus", ""),
+                "UpstreamMethod": trace.get("Method", ""),
+                "RequestHeaders": capture.redact_headers(ctx.headers),
+                "RequestBody": ctx.body,
+                "ResponseHeaders": capture.redact_headers(trace.get("UpstreamHeaders") or {}),
+                "ResponseBody": response_body,
+            }
+        )
+    except Exception:
+        return ""
 
 
 def _with_throttle_headers(resp, ip: str, **extra):
@@ -1024,23 +1335,30 @@ def throttled_response(ip: str, reset_in=None):
 # Handle proxying.
 @app.route("/<path:dst>", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
 def proxy_page(dst: str):
-    ip = get_client_ip()
-    user_agent = request.user_agent.string
+    ctx = RequestContext()
+    ctx.path = dst
+    ip, user_agent = ctx.ip, ctx.user_agent
     # Counted before any decision, so refusals count too: this is "traffic aimed
     # at the proxy", the number that distinguishes an idle service from a busy
     # one. The fleet's other counter includes the dashboard's own polling and so
     # keeps climbing even when nobody is using the proxy at all.
     workers.count_proxied()
+
+    def refuse(resp, status, outcome, reason="", **extra):
+        """Answer a refusal and record it everywhere at once."""
+        response_headers = extra.pop("headers", {})
+        _record_outcome(ctx, status, outcome, reason=reason or outcome, **extra)
+        return _with_throttle_headers(resp, ip, **response_headers), status
+
     if runtime.is_paused():
         diagnostics.log_pause_drop()
-        resp = jsonify(runtime.pause_message())
-        return _with_throttle_headers(resp, ip, Roxy_Paused="True"), 503
+        return refuse(jsonify(runtime.pause_message()), 503, "paused", headers={"Roxy_Paused": "True"})
 
     # Throttle-bypass allowlist: an admin-listed IP skips the rate-limit 429s
     # (per-IP throttle, throttle-all, per-endpoint rate rules) for load/spam
     # testing. It does NOT bypass pause, endpoint blocks, header rules, or the
     # Token safety budget — so the real routing behavior is still exercised.
-    bypass = runtime.is_throttle_bypassed(ip)
+    bypass = ctx.bypass = runtime.is_throttle_bypassed(ip)
 
     def hold(category: str):
         """Sit on a refusal before answering it (see tarpit.py).
@@ -1062,28 +1380,31 @@ def proxy_page(dst: str):
         if not allowed:
             diagnostics.log_throttle_all_drop()
             hold("throttle_all")
-            resp = jsonify(runtime.throttle_all_message())
-            return _with_throttle_headers(resp, ip, Roxy_Throttle_Reset=retry_in, Roxy_Global_Throttled="True"), 429
+            return refuse(
+                jsonify(runtime.throttle_all_message()),
+                429,
+                "throttle_all",
+                headers={"Roxy_Throttle_Reset": retry_in, "Roxy_Global_Throttled": "True"},
+            )
 
     if not bypass and throttle.is_throttled(ip):
         hold("throttle")
-        return throttled_response(ip)
+        resp, status = throttled_response(ip)
+        _record_outcome(ctx, status, "throttled", reason="Per-IP rate limit")
+        return resp, status
 
     if dst in path_ignore_set:
-        resp = jsonify("Not Found")
-        return _with_throttle_headers(resp, ip), 404
+        return refuse(jsonify("Not Found"), 404, "ignored_path")
 
     if dst != escape(dst):
         diagnostics.log_exploit_attempt(ip, f'Invalid URL: "{dst}"', user_agent)
         hold("probe")
-        resp = jsonify("Invalid URL")
-        return _with_throttle_headers(resp, ip), 404
+        return refuse(jsonify("Invalid URL"), 404, "probe", reason="Invalid URL", category="probe")
 
     if not validate_url(dst):
         diagnostics.log_exploit_attempt(ip, f'Non-Roblox URL: "{dst}"', user_agent)
         hold("probe")
-        resp = jsonify("Not a Roblox URL")
-        return _with_throttle_headers(resp, ip), 404
+        return refuse(jsonify("Not a Roblox URL"), 404, "probe", reason="Non-Roblox URL", category="probe")
 
     # Roxy does not support authenticated requests: reject and log any attempt to
     # send a Roblox session token/cookie, before anything upstream is touched.
@@ -1091,14 +1412,21 @@ def proxy_page(dst: str):
     if auth_attempt:
         diagnostics.log_exploit_attempt(ip, f"Sent a ROBLOSECURITY token ({auth_attempt})", user_agent)
         hold("auth_attempt")
-        resp = jsonify("Requests requiring authentication are not allowed with this proxy.")
-        return _with_throttle_headers(resp, ip), 400
+        return refuse(
+            jsonify("Requests requiring authentication are not allowed with this proxy."),
+            400,
+            "auth_attempt",
+            reason="Sent a ROBLOSECURITY token",
+            detail=auth_attempt,
+        )
 
     # Header rules deny abusive clients (e.g. exploit fingerprints) outright.
-    # The blocked caller gets a normal-looking THROTTLE 429 — indistinguishable
-    # from a real rate-limit — so the exploiter thinks they're requesting too much
-    # rather than realizing they're filtered. The admin sees the real detail (and
-    # the blocked request's full fingerprint, for false-positive review).
+    # By default the blocked caller gets a normal-looking THROTTLE 429 —
+    # indistinguishable from a real rate-limit — so the exploiter concludes
+    # they're sending too much rather than realizing they're filtered. A rule may
+    # override that with its own message, which is useful for redirecting a
+    # legitimate integration and a giveaway against a hostile one; that trade-off
+    # is the admin's to make, per rule.
     header_rule = runtime.match_header_rule(request.headers)
     if header_rule:
         diagnostics.log_header_blocked(header_rule, dst, request.method, ip)
@@ -1112,31 +1440,57 @@ def proxy_page(dst: str):
         )
         reset_in = runtime.get_setting("throttle_reset_duration", config.THROTTLE_RESET_DURATION)
         hold("header_rule")
-        return throttled_response(ip, reset_in=reset_in)
+        custom = str(header_rule.get("Message", "")).strip()
+        if custom:
+            resp, status = jsonify(custom), 429
+            _with_throttle_headers(resp, ip, Roxy_Throttle_Reset=reset_in, Roxy_Throttled="True")
+        else:
+            resp, status = throttled_response(ip, reset_in=reset_in)
+        _record_outcome(
+            ctx, status, "header_rule", reason=f"Request filter: {header_rule.get('Id', '?')}", category="header_rule"
+        )
+        return resp, status
 
-    if runtime.is_endpoint_blocked(dst):
-        diagnostics.log_blocked_endpoint(dst, request.method, ip, runtime.get_matching_block(dst))
+    block = runtime.match_endpoint_block(dst)
+    if block:
+        diagnostics.log_blocked_endpoint(dst, request.method, ip, block.get("Pattern", ""))
         hold("blocked_endpoint")
-        resp = jsonify("This endpoint is currently blocked.")
-        return _with_throttle_headers(resp, ip, Roxy_Blocked="True"), 403
+        message = str(block.get("Message", "")).strip() or "This endpoint is currently blocked."
+        return refuse(
+            jsonify(message),
+            403,
+            "blocked_endpoint",
+            reason=f"Blocked endpoint: {block.get('Pattern', '')}",
+            category="blocked_endpoint",
+            headers={"Roxy_Blocked": "True"},
+        )
 
     if not bypass:
         endpoint_allowed, endpoint_retry, endpoint_pattern = throttle.check_endpoint_limit(ip, dst)
         if not endpoint_allowed:
             diagnostics.log_rate_limited_endpoint(dst, request.method, ip, endpoint_pattern)
             hold("endpoint_rule")
-            resp = jsonify(f"This endpoint is rate-limited for you; try again in {endpoint_retry} seconds.")
+            rule = runtime.match_endpoint_rule(dst) or {}
+            custom = str(rule.get("Message", "")).strip()
+            message = custom or f"This endpoint is rate-limited for you; try again in {endpoint_retry} seconds."
+            resp = jsonify(message)
             resp.headers["Roxy-Requests-Left"] = throttle.get_requests_left(ip)
             resp.headers["Roxy-Throttle-Reset"] = endpoint_retry
             resp.headers["Roxy-Throttled"] = "True"
             resp.headers["Roxy-Endpoint-Limited"] = "True"
+            _record_outcome(
+                ctx,
+                429,
+                "endpoint_rule",
+                reason=f"Endpoint rate rule: {endpoint_pattern}",
+                category="endpoint_rule",
+            )
             return resp, 429
         # Count the request toward the per-IP limit (skipped for bypass IPs so
         # their spam testing doesn't mark them throttled in the dashboard).
         throttle.update_throttling(ip, made_request=True)
     safe_headers = sanitize_headers(request.headers)
     safe_headers_json = json.dumps(safe_headers)
-    diagnostics.log_endpoint(dst, request.method, safe_headers_json, ip)
     # Track distinct header names + their values + user-agents (secret values are
     # fingerprinted, not stored raw) to help spot abusive clients. The UA record
     # also keeps the last headers/endpoint so a UA can be drilled into.
@@ -1150,7 +1504,7 @@ def proxy_page(dst: str):
     pretty_values = params.pop("prettyprint", None)
     pretty_print = bool(pretty_values) and str(pretty_values[-1]).lower() == "true"
 
-    data = request.get_data() if request.method in ("POST", "PATCH", "PUT", "DELETE") else None
+    data = ctx.body if request.method in ("POST", "PATCH", "PUT", "DELETE") else None
 
     # Remove/overwrite headers that could cause issues or identify us/the visitor.
     headers = {}
@@ -1162,13 +1516,17 @@ def proxy_page(dst: str):
         headers[key] = value
     headers.update(get_fake_headers())
 
-    # Handle proxying the request.
+    # Handle proxying the request. `trace` comes back describing what actually
+    # happened upstream — which method served it, Roblox's own status, how many
+    # attempts — none of which the (successful, response) pair can express.
+    trace = {}
     successful, response = proxy.request(
         str(escape(dst)),
         method=request.method,
         headers=headers,
         params=params,
         data=data,
+        trace=trace,
     )
     if successful and response is not None and pretty_print:
         try:
@@ -1185,7 +1543,35 @@ def proxy_page(dst: str):
         # API consumers get the raw upstream body passed through untouched.
         resp = app.response_class(response, mimetype="application/json")
     _with_throttle_headers(resp, ip)
-    log_live_request(ip, user_agent, request.method, dst, request.headers, data, status)
+    outcome = "served" if successful else "upstream_failed"
+    # Recorded AFTER the upstream call so the endpoint row carries what came back,
+    # not just what went out — the answer is usually the interesting half.
+    diagnostics.log_endpoint(
+        dst,
+        request.method,
+        safe_headers_json,
+        ip,
+        Query=ctx.query,
+        Body=_body_text(data),
+        Status=status,
+        UpstreamStatus=trace.get("UpstreamStatus", ""),
+        UpstreamMethod=trace.get("Method", ""),
+        Outcome=outcome,
+        UserAgent=user_agent,
+        CallerId=ctx.caller_id,
+    )
+    _record_outcome(
+        ctx,
+        status,
+        outcome,
+        reason="" if successful else (trace.get("Outcome") or "upstream failure"),
+        # A served response is Roblox's answer relayed; only its FAILURE modes are
+        # ours. proxy.py already counted the real upstream status, so counting a
+        # relayed 200 again as "Roblox" would double it.
+        source="Roxy" if not successful else "Relay",
+        trace=trace,
+        response_body=response,
+    )
     return resp, status
 
 

@@ -13,9 +13,14 @@ printf 'FAKETOKEN\n' > "$SANDBOX/auth_tokens.txt"
 printf 'a@x.com\nb@x.com\n' > "$SANDBOX/emails.txt"
 
 cd app
+# EVERY shared-state file has to be redirected, not just the ones that existed
+# when this script was written: anything left out is silently written to
+# /etc/roxy, so a boot check on a live box would scribble on production state.
 ROXY_FILE_ROOT="$SANDBOX" ROXY_DATA_FILE="$SANDBOX/data.json" \
 	ROXY_ROUTING_FILE="$SANDBOX/routing.json" ROXY_THROTTLE_FILE="$SANDBOX/throttle.json" \
 	ROXY_COORD_FILE="$SANDBOX/coord.json" ROXY_STATE_FILE="$SANDBOX/state.json" \
+	ROXY_TARPIT_FILE="$SANDBOX/tarpit.json" ROXY_WORKERS_FILE="$SANDBOX/workers.json" \
+	ROXY_CAPTURE_FILE="$SANDBOX/capture.json" \
 	../env2/bin/python -c "import index; index.app.run(port=5099)" > /tmp/roxy_boot.log 2>&1 &
 SERVER_PID=$!
 sleep 3

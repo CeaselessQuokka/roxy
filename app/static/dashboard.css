@@ -1524,3 +1524,370 @@ body {
 	border-radius: 5px;
 	word-break: break-all;
 }
+
+/* =============================
+   22) SORTABLE TABLES
+   ============================= */
+/* Sorting is applied to the rendered rows (see dashboard.js), so every table
+   gets the same affordance from one place: a hover cue, a persistent arrow on
+   the active column, and a focus ring for keyboard use. */
+.th--sortable {
+	cursor: pointer;
+	user-select: none;
+	position: relative;
+	padding-right: 22px !important;
+	transition: color var(--dur-fast) var(--easing), background var(--dur-fast) var(--easing);
+}
+.th--sortable:hover {
+	color: var(--color-text);
+	background: var(--color-hover);
+}
+.th--sortable:focus-visible {
+	outline: 2px solid var(--color-primary);
+	outline-offset: -2px;
+}
+/* Idle hint: a faint double arrow that says "this column can be sorted". */
+.th--sortable::after {
+	content: "⇅";
+	position: absolute;
+	right: 6px;
+	top: 50%;
+	transform: translateY(-50%);
+	font-size: 11px;
+	opacity: 0.25;
+	transition: opacity var(--dur-fast) var(--easing);
+}
+.th--sortable:hover::after {
+	opacity: 0.6;
+}
+.th--sortable.is-sorted {
+	color: var(--color-primary-strong);
+}
+.th--sortable.is-sorted::after {
+	content: "▾";
+	opacity: 1;
+}
+.th--sortable.is-sorted[data-dir="asc"]::after {
+	content: "▴";
+}
+
+/* =============================
+   23) THREAT BANNER
+   ============================= */
+/* One line at the very top answering "is anything wrong right now?". Sits above
+   the pause/throttle banners because it summarises them along with everything
+   else. */
+.threat-banner {
+	position: sticky;
+	top: 64px;
+	z-index: 41;
+	padding: 10px var(--pad-4);
+	font-size: var(--fs-sm);
+	border-bottom: 1px solid var(--color-outline);
+	background: var(--color-surface2);
+	color: var(--color-text);
+	display: flex;
+	gap: 10px;
+	align-items: center;
+	flex-wrap: wrap;
+}
+.threat-banner[hidden] {
+	display: none;
+}
+.threat-banner strong {
+	flex: 0 0 auto;
+	padding: 2px 10px;
+	border-radius: 999px;
+	font-size: var(--fs-xs);
+	letter-spacing: 0.02em;
+	text-transform: uppercase;
+}
+.threat-banner--ok strong {
+	background: rgba(105, 240, 174, 0.16);
+	color: var(--color-success);
+}
+.threat-banner--warn {
+	background: rgba(255, 183, 77, 0.1);
+	border-bottom-color: var(--color-warning);
+}
+.threat-banner--warn strong {
+	background: rgba(255, 183, 77, 0.2);
+	color: var(--color-warning);
+}
+.threat-banner--bad {
+	background: rgba(255, 107, 107, 0.12);
+	border-bottom-color: var(--color-danger);
+}
+.threat-banner--bad strong {
+	background: rgba(255, 107, 107, 0.2);
+	color: var(--color-danger);
+}
+
+/* =============================
+   24) INVESTIGATION VIEWS
+   ============================= */
+/* A short, prominent statement of what the numbers below mean. Used where the
+   raw figures are ambiguous on their own (429s from Roblox vs from us). */
+.callout {
+	padding: 10px 12px;
+	border-radius: var(--radius-sm);
+	font-size: var(--fs-sm);
+	border: 1px solid var(--color-outline);
+	background: var(--color-surface2);
+	margin-bottom: var(--pad-2);
+}
+.callout--ok {
+	border-color: var(--color-success);
+	background: rgba(105, 240, 174, 0.1);
+}
+.callout--warn {
+	border-color: var(--color-warning);
+	background: rgba(255, 183, 77, 0.1);
+}
+.callout--bad {
+	border-color: var(--color-danger);
+	background: rgba(255, 107, 107, 0.1);
+}
+.callout--muted {
+	color: var(--color-text-dim);
+}
+
+.text-warn {
+	color: var(--color-warning);
+	font-weight: 600;
+}
+.text-bad {
+	color: var(--color-danger);
+	font-weight: 600;
+}
+.mono {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: var(--fs-sm);
+}
+
+.chip--muted {
+	color: var(--color-text-muted);
+}
+.chip--sm {
+	padding: 2px 8px;
+	font-size: var(--fs-xs);
+}
+
+/* Per-row action buttons, kept unobtrusive until the row is hovered. */
+.row-actions {
+	display: inline-flex;
+	gap: 6px;
+	flex-wrap: wrap;
+}
+.btn--ghost {
+	background: transparent;
+	border: 1px solid var(--color-outline);
+	color: var(--color-text-dim);
+}
+.btn--ghost:hover {
+	background: var(--color-hover);
+	color: var(--color-text);
+}
+.btn--xs {
+	padding: 1px 8px;
+	font-size: var(--fs-xs);
+	border-radius: 8px;
+	margin-left: 8px;
+}
+
+/* The expanded breakdown under an IP / caller row. */
+.detail-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+	gap: var(--pad-3);
+	margin-bottom: var(--pad-2);
+}
+.detail-block__title {
+	font-size: var(--fs-xs);
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--color-text-muted);
+	margin-bottom: 4px;
+}
+.detail-list {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	font-size: var(--fs-sm);
+}
+.detail-list li {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 2px 0;
+	border-bottom: 1px solid var(--color-outline);
+}
+.detail-list li span:first-child {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.detail-list li span:last-child {
+	color: var(--color-text-dim);
+	flex: 0 0 auto;
+}
+
+/* Lookup result card (place ID -> experience -> owner). */
+.lookup {
+	margin-top: var(--pad-2);
+	padding: var(--pad-3);
+	border: 1px solid var(--color-outline-strong);
+	border-radius: var(--radius-md);
+	background: var(--color-surface2);
+}
+.lookup__head {
+	font-size: var(--fs-lg);
+	margin-bottom: var(--pad-2);
+}
+.lookup__grid {
+	display: grid;
+	grid-template-columns: max-content 1fr;
+	gap: 4px var(--pad-3);
+	margin: 0 0 var(--pad-2);
+	font-size: var(--fs-sm);
+}
+.lookup__grid dt {
+	color: var(--color-text-muted);
+}
+.lookup__grid dd {
+	margin: 0;
+}
+.lookup__desc {
+	font-size: var(--fs-sm);
+	color: var(--color-text-dim);
+	white-space: pre-wrap;
+	margin-bottom: var(--pad-2);
+	max-height: 140px;
+	overflow: auto;
+}
+.lookup__links {
+	font-size: var(--fs-sm);
+}
+
+/* One recent request against an endpoint. */
+.recent-req {
+	border: 1px solid var(--color-outline);
+	border-radius: var(--radius-sm);
+	padding: var(--pad-2);
+	margin-top: var(--pad-2);
+	background: var(--color-surface1);
+}
+.recent-req__row {
+	display: flex;
+	gap: var(--pad-2);
+	font-size: var(--fs-sm);
+	padding: 1px 0;
+}
+.recent-req__row span:first-child {
+	flex: 0 0 130px;
+	color: var(--color-text-muted);
+}
+.recent-req__row span:last-child {
+	word-break: break-all;
+}
+.recent-req details summary {
+	cursor: pointer;
+	font-size: var(--fs-sm);
+	color: var(--color-primary);
+	margin-top: 4px;
+}
+.recent-req pre {
+	max-height: 220px;
+	overflow: auto;
+	font-size: var(--fs-xs);
+	background: var(--color-surface0);
+	padding: var(--pad-2);
+	border-radius: var(--radius-sm);
+	white-space: pre-wrap;
+	word-break: break-all;
+}
+.endpoint-ips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	margin-bottom: var(--pad-2);
+}
+
+/* Caller-facing rule reply, kept to one line in the table. */
+.rule-message {
+	display: inline-block;
+	max-width: 260px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	vertical-align: bottom;
+	color: var(--color-primary-strong);
+}
+
+/* Request/response bodies inside a live-feed card. */
+.live-item__bodies pre {
+	max-height: 320px;
+	overflow: auto;
+	white-space: pre-wrap;
+	word-break: break-all;
+}
+
+/* "Jump to section" box in the top bar (focused with "/"). */
+.input--jump {
+	max-width: 190px;
+	padding: 6px 10px;
+	font-size: var(--fs-sm);
+}
+@media (max-width: 900px) {
+	.input--jump {
+		display: none;
+	}
+}
+
+.kpi-grid--compact {
+	grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+	margin-bottom: var(--pad-3);
+}
+.card--wide {
+	grid-column: 1 / -1;
+}
+.form__row--end {
+	justify-content: flex-end;
+	margin-bottom: var(--pad-2);
+}
+
+/* =============================
+   25) LAYOUT UTILITIES
+   ============================= */
+/* The CSP is style-src 'self' with no 'unsafe-inline', so a style="" attribute
+   in the template is discarded by the browser before it ever applies. These
+   classes replace the width/flex hints that used to be written inline and were
+   therefore doing nothing. (JS-assigned styles go through the CSSOM, which CSP
+   does not police, so those are left as they are.) */
+.input--w110 {
+	max-width: 110px;
+}
+.input--w120 {
+	max-width: 120px;
+}
+.input--w130 {
+	max-width: 130px;
+}
+.input--w150 {
+	max-width: 150px;
+}
+.input--w160 {
+	max-width: 160px;
+}
+.input--w170 {
+	max-width: 170px;
+}
+.input--w220 {
+	max-width: 220px;
+}
+.input--w240 {
+	max-width: 240px;
+}
+.form__field--half {
+	flex: 1 1 120px;
+}

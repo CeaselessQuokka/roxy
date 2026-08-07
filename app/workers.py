@@ -47,6 +47,14 @@ _requests_lock = Lock()
 _requests_served = 0
 _proxied_served = 0
 
+# The reset epoch this worker has already applied. Resetting has to reach every
+# worker, not just the one that served the admin click — each keeps its counters
+# in its own memory, so clearing locally would zero one row out of four and the
+# total would stay stubbornly wrong. The epoch goes in the shared registry; each
+# worker zeroes itself the next time it heartbeats past it. Same mechanism the
+# diagnostics ClearEpochs use, for the same reason.
+_applied_reset_epoch = 0.0
+
 
 def count_request():
     """Count one request served by this worker (called from an after_request hook)."""
@@ -60,6 +68,40 @@ def count_proxied():
     global _proxied_served
     with _requests_lock:
         _proxied_served += 1
+
+
+def _apply_reset_epoch(epoch: float):
+    """Zero this worker's counters if a reset was issued after we last did."""
+    global _requests_served, _proxied_served, _applied_reset_epoch
+    if epoch <= _applied_reset_epoch:
+        return
+    with _requests_lock:
+        _requests_served = 0
+        _proxied_served = 0
+    _applied_reset_epoch = epoch
+
+
+def reset_counts() -> float:
+    """Zero the fleet's request counters. Returns the reset epoch that was written.
+
+    Applies to this worker immediately and to every other worker at its next
+    heartbeat; stale entries in the registry are dropped outright so the totals
+    do not briefly re-inflate from workers that have not noticed yet.
+    """
+    now = time.time()
+
+    def mutate(data):
+        data["ResetEpoch"] = now
+        workers = data.get("Workers")
+        if isinstance(workers, dict):
+            for entry in workers.values():
+                if isinstance(entry, dict):
+                    entry["Requests"] = 0
+                    entry["Proxied"] = 0
+
+    _registry.update(mutate)
+    _apply_reset_epoch(now)
+    return now
 
 
 def _read_first_line(path: str) -> str:
@@ -168,17 +210,8 @@ def _sync_service_identity(data: dict, now: float, workers: dict):
 def heartbeat():
     """Refresh this worker's registry entry (and prune dead siblings)."""
     now = time.time()
-    with _requests_lock:
-        served, proxied = _requests_served, _proxied_served
-    entry = {
-        "Pid": _pid,
-        "StartedAt": _own_start_time(),
-        "LastSeen": now,
-        "RSS": _rss_bytes(),
-        "Threads": _thread_count(),
-        "Requests": served,
-        "Proxied": proxied,
-    }
+    started = _own_start_time()
+    rss, threads = _rss_bytes(), _thread_count()
 
     def mutate(data):
         workers = data.setdefault("Workers", {})
@@ -186,7 +219,21 @@ def heartbeat():
             workers = data["Workers"] = {}
         _prune(workers, now)
         _sync_service_identity(data, now, workers)
-        workers[str(_pid)] = entry
+        # Read the counters INSIDE the mutator, after honouring any reset another
+        # worker issued. Sampling them before this would write the pre-reset
+        # numbers straight back over the reset that just happened.
+        _apply_reset_epoch(float(data.get("ResetEpoch", 0) or 0))
+        with _requests_lock:
+            served, proxied = _requests_served, _proxied_served
+        workers[str(_pid)] = {
+            "Pid": _pid,
+            "StartedAt": started,
+            "LastSeen": now,
+            "RSS": rss,
+            "Threads": threads,
+            "Requests": served,
+            "Proxied": proxied,
+        }
 
     _registry.update(mutate)
 
@@ -235,6 +282,12 @@ def get_state() -> dict:
         "MasterPid": int(data.get("MasterPid", 0) or 0),
         "ThisWorker": _pid,
         "MaxRequests": int(os.environ.get("ROXY_MAX_REQUESTS", "2000") or 2000),
+        # When the counters were last zeroed, so the totals can be read as "since
+        # X" rather than as lifetime figures that silently are not.
+        "CountersResetAt": float(data.get("ResetEpoch", 0) or 0),
+        # Request slots the fleet can fill at once. The tarpit's concurrency cap
+        # is a fraction of this, so it belongs next to it.
+        "Slots": int(os.environ.get("ROXY_WORKERS", "4") or 4) * int(os.environ.get("ROXY_THREADS", "4") or 4),
     }
 
 

@@ -139,6 +139,27 @@ _settings = {
     "max_header_value_records": _setting(config.MAX_HEADER_VALUE_RECORDS, 1, 5000, "int"),
     "max_user_agent_records": _setting(config.MAX_USER_AGENT_RECORDS, 1, 20000, "int"),
     "max_error_records": _setting(config.MAX_ERROR_RECORDS, 1, 20000, "int"),
+    # --- Investigation depth ------------------------------------------------
+    # How many recent requests each endpoint remembers (0 = only the last one).
+    # The ceiling is deliberate: this ring holds attacker-supplied query strings
+    # and body previews, multiplied by the endpoint cap, so it is a size knob as
+    # much as a detail knob.
+    "endpoint_recent_requests": _setting(
+        config.ENDPOINT_RECENT_REQUESTS, 0, config.MAX_ENDPOINT_RECENT_REQUESTS, "int"
+    ),
+    # Per-IP and per-place traffic tracking (the Top Talkers / Callers tables).
+    # 0 turns the tracking off entirely for the (small) per-request cost.
+    "activity_tracking": _setting(1, 0, 1, "int"),
+    "max_ip_activity_records": _setting(config.MAX_IP_ACTIVITY_RECORDS, 1, 20000, "int"),
+    "max_caller_records": _setting(config.MAX_CALLER_RECORDS, 1, 20000, "int"),
+    # --- Request/response capture -------------------------------------------
+    # Full bodies behind the live feed. Bounded three ways at once (count, total
+    # bytes, age) because each ceiling alone has a hole — see capture.py.
+    "capture_enabled": _setting(1, 0, 1, "int"),
+    "capture_max_records": _setting(config.CAPTURE_MAX_RECORDS, 0, 1000, "int"),
+    "capture_max_bytes": _setting(config.CAPTURE_MAX_BYTES, 0, 64 * 1024 * 1024, "int"),
+    "capture_max_body": _setting(config.CAPTURE_MAX_BODY, 0, 512 * 1024, "int"),
+    "capture_ttl_seconds": _setting(config.CAPTURE_TTL_SECONDS, 0, 86400, "int"),
     # Automatically stop enumerating a header's values once it proves to be
     # unique-per-request (see config.AUTO_IGNORE_*). 1 = on.
     "auto_ignore_high_cardinality": _setting(1, 0, 1, "int"),
@@ -547,8 +568,14 @@ def is_endpoint_blocked(path: str) -> bool:
     return any(_matches(pattern, p, rule.get("Type", "glob")) for pattern, rule in _endpoint_blocks.items())
 
 
-def get_matching_block(path: str):
-    """Return the most specific block pattern matching a path, or None."""
+def match_endpoint_block(path: str):
+    """Return the most specific block RULE matching a path (with its "Pattern"), or None.
+
+    The whole rule rather than just the pattern, because the rule carries the
+    admin's custom Message — the caller needs it to answer with something more
+    useful than a flat "blocked", e.g. pointing a game at the cheaper endpoint
+    that replaced the one it is using.
+    """
     _maybe_reload()
     p = _norm(path)
     best = None
@@ -558,12 +585,28 @@ def get_matching_block(path: str):
         if _matches(pattern, p, kind):
             score = _specificity(pattern, kind)
             if best_score is None or score > best_score:
-                best = pattern
+                best = dict(rule, Pattern=pattern)
                 best_score = score
     return best
 
 
-def block_endpoint(pattern: str, note: str = "", kind: str = "glob") -> tuple[bool, str]:
+def get_matching_block(path: str):
+    """The most specific block PATTERN matching a path, or None."""
+    rule = match_endpoint_block(path)
+    return rule["Pattern"] if rule else None
+
+
+MAX_RULE_MESSAGE = 400  # Characters of admin-authored message returned to a refused caller.
+
+
+def _clean_message(message) -> str:
+    """An admin-authored refusal message, trimmed. Returned verbatim to callers,
+    so it is length-bounded here and JSON-encoded (never interpolated) at the
+    point of use."""
+    return str(message or "").strip()[:MAX_RULE_MESSAGE]
+
+
+def block_endpoint(pattern: str, note: str = "", kind: str = "glob", message: str = "") -> tuple[bool, str]:
     kind = "regex" if kind == "regex" else "glob"
     pattern = normalize_pattern(pattern, kind)
     if not pattern:
@@ -574,7 +617,12 @@ def block_endpoint(pattern: str, note: str = "", kind: str = "glob") -> tuple[bo
         return False, "Too many blocked endpoints"
 
     def change():
-        _endpoint_blocks[pattern] = {"Added": time.time(), "Note": str(note)[:200], "Type": kind}
+        _endpoint_blocks[pattern] = {
+            "Added": time.time(),
+            "Note": str(note)[:200],  # Private: for the admin, never sent anywhere.
+            "Message": _clean_message(message),  # Public: returned to the refused caller.
+            "Type": kind,
+        }
 
     _persist_change(change)
     return True, "Success"
@@ -600,7 +648,7 @@ def get_endpoint_rules() -> dict:
 
 
 def set_endpoint_rule(
-    pattern: str, limit, period=config.DEFAULT_ENDPOINT_RULE_PERIOD, kind: str = "glob"
+    pattern: str, limit, period=config.DEFAULT_ENDPOINT_RULE_PERIOD, kind: str = "glob", message: str = "", note: str = ""
 ) -> tuple[bool, str]:
     kind = "regex" if kind == "regex" else "glob"
     pattern = normalize_pattern(pattern, kind)
@@ -622,7 +670,14 @@ def set_endpoint_rule(
         return False, "Too many endpoint rules"
 
     def change():
-        _endpoint_rules[pattern] = {"Limit": limit, "Period": period, "Added": time.time(), "Type": kind}
+        _endpoint_rules[pattern] = {
+            "Limit": limit,
+            "Period": period,
+            "Added": time.time(),
+            "Type": kind,
+            "Note": str(note)[:200],
+            "Message": _clean_message(message),
+        }
 
     _persist_change(change)
     return True, "Success"
@@ -734,7 +789,18 @@ def normalize_header_rule(scope: str, mode: str, needle: str, header: str = "") 
     return {"Header": header, "Scope": scope, "Mode": mode, "Needle": needle}, ""
 
 
-def add_header_rule(scope: str, mode: str, needle: str, note: str = "", header: str = "") -> tuple[bool, str]:
+def add_header_rule(
+    scope: str, mode: str, needle: str, note: str = "", header: str = "", message: str = ""
+) -> tuple[bool, str]:
+    """Add a request filter.
+
+    `message` is optional and, unlike the endpoint rules, comes with a real
+    trade-off: a filtered caller normally receives the ordinary throttle 429, so
+    they conclude they are sending too much rather than that they have been
+    fingerprinted. Setting a message here is deliberately telling them they were
+    caught. Useful for a legitimate integration you want to redirect; a gift to
+    an exploiter you are trying to keep in the dark.
+    """
     rule, error = normalize_header_rule(scope, mode, needle, header)
     if rule is None:
         return False, error
@@ -743,7 +809,9 @@ def add_header_rule(scope: str, mode: str, needle: str, note: str = "", header: 
         return False, "Too many header rules"
 
     def change():
-        _header_rules[rule_id] = dict(rule, Note=str(note)[:200], Added=time.time())
+        _header_rules[rule_id] = dict(
+            rule, Note=str(note)[:200], Message=_clean_message(message), Added=time.time()
+        )
 
     _persist_change(change)
     return True, "Success"

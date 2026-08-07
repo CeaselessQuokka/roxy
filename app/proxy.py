@@ -88,6 +88,56 @@ def _email_allowed(key: str, cooldown: float) -> bool:
 # inside a method. This bounds the work for one request across the whole chain.
 MAX_METHOD_ATTEMPTS = 3
 
+# --- Roxy's own upstream calls ------------------------------------------------
+# The endpoint we probe to decide whether a token is still alive. It is stated
+# once, here, because "which endpoint does the health check use?" turned out to
+# be a question worth being able to answer precisely: a caller hammering
+# users.roblox.com/v1/usernames/validate through the proxy looks, from the
+# endpoint table, exactly like something internal — and blocking it out of
+# caution would have been a fix for a problem that does not exist. It doesn't:
+# internal probes call requests.* directly and never enter the proxy route, so
+# no block, throttle, filter or pause rule can reach them. That is asserted by
+# the test suite rather than left as a property of the current control flow.
+TOKEN_PROBE_URL = "https://accountinformation.roblox.com/v1/birthdate"
+
+
+def internal_endpoints() -> list[dict]:
+    """Every upstream call Roxy makes on its own behalf, for the dashboard.
+
+    Exposed so the admin can see exactly which endpoints are ours — and confirm
+    that a rule they are about to add does not name one of them.
+    """
+    return [
+        {"Purpose": "token_validate", "URL": TOKEN_PROBE_URL, "What": "Is this auth token still alive?"},
+        {"Purpose": "token_check", "URL": TOKEN_PROBE_URL, "What": "Admin health check / force revalidate"},
+        {"Purpose": "rotate_probe", "URL": config.ROTATE_IP_ECHO_URL, "What": "Which exit IP is rotation giving us?"},
+    ]
+
+
+def _probe_token(purpose: str, token: str):
+    """Run one internal token probe, timed and recorded. Returns the response or None.
+
+    Every internal call goes through here so they are all counted the same way
+    and all show up under the same roof on the dashboard, instead of being three
+    near-identical blocks of requests.get that nothing was watching.
+    """
+    diagnostics.record_token_budget_usage(routing.record_token_use())  # counts toward the token budget
+    started = time.monotonic()
+    try:
+        response = requests.get(TOKEN_PROBE_URL, cookies=_token_jar(token), timeout=_timeout())
+    except requests.RequestException as error:
+        diagnostics.log_internal_request(
+            purpose, False, "error", time.monotonic() - started, TOKEN_PROBE_URL, f"{type(error).__name__}: {error}"
+        )
+        raise
+    diagnostics.log_internal_request(
+        purpose, response.status_code == 200, response.status_code, time.monotonic() - started, TOKEN_PROBE_URL
+    )
+    # Counted as "Internal" so our own probes never inflate the status codes that
+    # describe how Roblox is answering user-serving traffic.
+    diagnostics.log_status_code(response.status_code, source="Internal")
+    return response
+
 # Bounds on the admin health check, so it can never outlive a worker timeout.
 MAX_TOKEN_CHECK_WORKERS = 8
 TOKEN_CHECK_GRACE = 5  # Seconds allowed on top of request_timeout per probe.
@@ -180,9 +230,21 @@ def _rotate_headers(headers: dict) -> dict:
 # --- The public entry point --------------------------------------------------
 # Returns (successful, response).
 def request(
-    url: str, method: str = "get", headers: dict = None, params: dict = None, data: str = None
+    url: str, method: str = "get", headers: dict = None, params: dict = None, data: str = None, trace: dict = None
 ) -> tuple[bool, str]:
+    """Proxy one request upstream, falling down the method chain on failure.
+
+    `trace` is an optional dict this fills in with what actually happened —
+    which method served it, what Roblox really answered, how many attempts it
+    took, how long it spent. The return value alone collapses all of that into
+    one bool, which is why the dashboard could say a request "failed" but never
+    which upstream said so or how hard we tried; the trace is what the live feed
+    renders. Purely observational: nothing here changes the outcome.
+    """
     headers = headers if headers is not None else {}
+    trace = trace if trace is not None else {}
+    trace.setdefault("Attempts", 0)
+    trace.setdefault("Methods", [])
     _maybe_reload_tokens()
 
     tried: set = set()
@@ -192,38 +254,54 @@ def request(
         if choice is None:
             if not tried:
                 # Nothing was ever available → everything is throttled/unconfigured.
+                trace["Outcome"] = "no_method_available"
                 _notify_all_throttled(url)
                 return False, "All request methods are busy right now; please try again shortly."
+            trace["Outcome"] = "methods_exhausted"
             return False, last_response or "All request methods are busy right now; please try again shortly."
 
         if choice == "token":
             diagnostics.record_token_budget_usage(_token_used)  # feeds the 1h/24h peak
-        ok, again, response = _do_method(choice, url, method, headers, params, data)
+        trace["Attempts"] += 1
+        trace["Methods"].append(choice)
+        trace["Method"] = choice
+        ok, again, response = _do_method(choice, url, method, headers, params, data, trace)
         if ok:
+            trace["Outcome"] = "served"
             return True, response
         tried.add(choice)
         if response is not None:
             last_response = response
         if not again:
             # A definitive answer from Roblox (404/403/400…) — same on any method.
+            trace["Outcome"] = "upstream_rejected"
             return False, response if response is not None else "Upstream request failed; please try again later."
 
+    trace["Outcome"] = "retries_exhausted"
     return False, last_response or "All request methods are busy right now; please try again shortly."
 
 
-def _do_method(choice: str, url: str, method: str, headers: dict, params: dict, data):
+def _do_method(choice: str, url: str, method: str, headers: dict, params: dict, data, trace: dict = None):
     """Run one method (with its internal CSRF retry). Returns (ok, fallback, response)
     where fallback=True means 'this method couldn't serve — try the next one'."""
+    trace = trace if trace is not None else {}
     if choice == "token":
         token = _first_token()
         if not token:
             return (False, True, None)  # token vanished between choose() and now
         return _attempt(
-            "token", f"https://{url}", method, headers, params, data, cookies=_token_jar(token), token=token
+            "token", f"https://{url}", method, headers, params, data, cookies=_token_jar(token), token=token, trace=trace
         )
     if choice == "rotate":
         return _attempt(
-            "rotate", f"https://{url}", method, _rotate_headers(headers), params, data, proxies=rotate.proxies()
+            "rotate",
+            f"https://{url}",
+            method,
+            _rotate_headers(headers),
+            params,
+            data,
+            proxies=rotate.proxies(),
+            trace=trace,
         )
     return (False, True, None)
 
@@ -247,7 +325,7 @@ def _failure_reason(status: int) -> str:
     return f"HTTP {status}"
 
 
-def _attempt(choice, full_url, method, headers, params, data, cookies=None, proxies=None, token=None):
+def _attempt(choice, full_url, method, headers, params, data, cookies=None, proxies=None, token=None, trace=None):
     """One HTTP attempt to the upstream, with a single CSRF (403) handshake retry.
 
     Returns (ok, fallback, response). Every non-success outcome is recorded to the
@@ -255,6 +333,7 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
     (token/rotate) is being rejected.
     """
     endpoint = _endpoint_of(full_url)
+    trace = trace if trace is not None else {}
     csrf = None
     headers = dict(headers)
     for _ in range(2):  # original attempt + at most one CSRF retry
@@ -278,6 +357,8 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
             )
         except requests.Timeout:
             elapsed = time.monotonic() - started
+            trace["UpstreamError"] = f"Timeout after {elapsed:.1f}s"
+            trace["Duration"] = elapsed
             diagnostics.log_request(method.upper(), False)
             diagnostics.log_reason(True)
             diagnostics.log_request_failure(choice, "timeout", "Upstream timed out", endpoint)
@@ -298,6 +379,8 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
             return (False, True, None)  # transient → fall through to next method
         except requests.RequestException as e:
             elapsed = time.monotonic() - started
+            trace["UpstreamError"] = f"{type(e).__name__}: {e}"[:300]
+            trace["Duration"] = elapsed
             diagnostics.log_request(method.upper(), False)
             diagnostics.log_reason(True)
             diagnostics.log_request_failure(choice, "error", type(e).__name__, endpoint, f"{type(e).__name__}: {e}")
@@ -315,6 +398,12 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
 
         # Got an HTTP response.
         ok = req.status_code == 200
+        # The upstream's own verdict, recorded before any of our interpretation of
+        # it. This is what separates "Roblox rate-limited us" from "we rate-limited
+        # the caller" once the response reaches the live feed.
+        trace["UpstreamStatus"] = req.status_code
+        trace["Duration"] = req.elapsed.total_seconds()
+        trace["UpstreamHeaders"] = dict(req.headers)
         if choice == "rotate":
             routing.record_rotate_result(True)  # the proxy itself worked
             diagnostics.log_rotate_health(True)
@@ -331,6 +420,7 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
         if req.status_code == 403 and "x-csrf-token" in req.headers and csrf is None:
             # Roblox handing us a CSRF token to retry with (required for writes).
             diagnostics.log_retry(403, "CSRF token refresh")
+            trace["Retries"] = int(trace.get("Retries", 0)) + 1
             csrf = req.headers.get("x-csrf-token")
             continue
         # Any non-200: record the reason so the admin can diagnose this requester.
@@ -359,13 +449,8 @@ def _attempt(choice, full_url, method, headers, params, data, cookies=None, prox
 def validate_token(token: str):
     """Re-check a token against Roblox; re-add if valid, drop + email if expired."""
     global tokens
-    diagnostics.record_token_budget_usage(routing.record_token_use())  # counts toward budget + peak
     try:
-        req = requests.get(
-            "https://accountinformation.roblox.com/v1/birthdate",
-            cookies=_token_jar(token),
-            timeout=_timeout(),
-        )
+        req = _probe_token("token_validate", token)
     except requests.RequestException:
         diagnostics.update_token(token, being_validated=True)
         background.schedule(
@@ -424,13 +509,8 @@ def set_tokens(new_tokens: list[str]) -> tuple[list[str], bool]:
 
 def _revalidate_one(token: str):
     global tokens
-    diagnostics.record_token_budget_usage(routing.record_token_use())
     try:
-        req = requests.get(
-            "https://accountinformation.roblox.com/v1/birthdate",
-            cookies=_token_jar(token),
-            timeout=_timeout(),
-        )
+        req = _probe_token("token_revalidate", token)
     except requests.RequestException:
         return
     with _tokens_lock:
@@ -445,13 +525,8 @@ def _revalidate_one(token: str):
 def _check_one_token(token: str) -> dict:
     """Probe one token against Roblox and reconcile the inventory. Never raises."""
     masked = mask_token(token)
-    diagnostics.record_token_budget_usage(routing.record_token_use())
     try:
-        req = requests.get(
-            "https://accountinformation.roblox.com/v1/birthdate",
-            cookies=_token_jar(token),
-            timeout=_timeout(),
-        )
+        req = _probe_token("token_check", token)
     except requests.RequestException as e:
         return {"Masked": masked, "Active": None, "Error": type(e).__name__}
     active = req.status_code == 200
@@ -498,7 +573,11 @@ def check_tokens() -> list[dict]:
 def probe_rotation() -> dict:
     """Verify rotation by fetching our exit IP through the proxy; logs it on success.
     Returns the rotation status + the observed exit IP (or the error)."""
+    started = time.monotonic()
     ip, error = rotate.probe_exit_ip()
+    diagnostics.log_internal_request(
+        "rotate_probe", bool(ip), "ok" if ip else "error", time.monotonic() - started, config.ROTATE_IP_ECHO_URL, error
+    )
     if ip:
         diagnostics.log_rotate_ip(ip, "probe")
     return {

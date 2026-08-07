@@ -232,6 +232,52 @@ visitor_counts = dict(
 # Detailed per-status-code counts, e.g. {"200": 1234, "429": 12, ...}.
 status_codes_detailed = dict()
 
+# --- Who produced this status code? ------------------------------------------
+# The same codes as above, split by ORIGIN. Without this split a wall of 429s is
+# unreadable: it could mean Roblox is rate-limiting us (which risks the account
+# and needs the request rate cut) or that we are rate-limiting callers (which is
+# the system working). Those two readings call for opposite actions, so they are
+# counted apart:
+#
+#   Roblox    - a status Roblox actually returned to us upstream.
+#   Roxy      - a status WE generated without touching Roblox: throttles, blocks,
+#               filters, pause, probe rejections, budget refusals, our own 500s.
+#   Relay     - a status we returned to a caller that was Roblox's answer passed
+#               through. Deliberately its own bucket rather than folded into
+#               Roblox: "what Roblox told us" and "what the caller received" are
+#               not the same list (an upstream 404 reaches the caller as a 500),
+#               and Roxy + Relay together are exactly what callers experienced.
+#   Internal  - upstream statuses from Roxy's OWN calls (token validation, the
+#               rotation probe). Real traffic to Roblox, but not on behalf of a
+#               caller, so it must not be mistaken for user-serving load.
+STATUS_SOURCES = ("Roblox", "Roxy", "Relay", "Internal")
+status_sources = dict({name: dict() for name in STATUS_SOURCES})
+
+# Every refusal Roxy issues, keyed by the RULE that produced it rather than by
+# the status code it happened to use. Several distinct decisions all answer 429
+# (per-IP throttle, throttle-all, per-endpoint rule, header filter), so the code
+# alone cannot tell you which one is firing — this can.
+#   reason -> {Count, Status, Category, FirstSeen, LastSeen, LastIP, LastPath, LastDetail, IPs{}}
+refusals = dict()
+
+# Per-client-IP activity: the "who is hammering me" view. Endpoints/Statuses are
+# capped per record; Minutes is a short per-minute ring so a request RATE can be
+# derived rather than only a lifetime total (a caller that sent 50k requests
+# yesterday and none today should not outrank one sending 50/s right now).
+ip_activity = dict()
+
+# The same, keyed by the Roblox-Id header — the PLACE the request came from.
+# This is the identity that matters: a Roblox experience is served from hundreds
+# of rotating game-server IPs, so per-IP counts scatter one caller across the
+# table while this collapses it back into a single, blockable row.
+callers = dict()
+
+# Roxy's OWN upstream calls (token validation, rotation probe), by call site.
+# Kept apart from user-serving traffic so "is our token check still working?" is
+# answerable without reading it out of the same counters callers move.
+#   purpose -> {Count, Failed, FirstSeen, LastSeen, LastStatus, LastError, LastEndpoint, TotalTime}
+internal_requests = dict()
+
 # Endpoint popularity: "service.roblox.com/path" -> {Count, LastRequestTime, Methods: {GET: n, ...}}.
 endpoints = dict()
 
@@ -366,21 +412,54 @@ def _cap(setting_name: str, fallback: int) -> int:
 # union, which is exactly how the data file grew until the workers were
 # OOM-killed. Nothing here may grow without a ceiling.
 #
-#   cap      how many entries may survive (None = the store itself isn't capped,
-#            only its children)
-#   by       which entries win when trimming:
-#              "count"  - busiest first (records with a Count field)
-#              "recent" - newest first (records with a timestamp field)
-#              "value"  - plain numeric leaves, largest first
-#   time     the record's timestamp field, used by "recent" and as a tiebreak
-#   children (key, cap, by) trimmed inside every surviving record
+#   cap       how many entries may survive (None = the store itself isn't capped,
+#             only its children)
+#   by        which entries win when trimming:
+#               "count"  - busiest first (records with a Count field)
+#               "recent" - newest first (records with a timestamp field)
+#               "value"  - plain numeric leaves, largest first
+#   time      the record's timestamp field, used by "recent" and as a tiebreak
+#   children  (key, cap, by) trimmed inside every surviving record
+#   own       (key, cap, by) trimmed on the STORE itself, for stores that are one
+#             fixed record rather than a map of many (status_sources, retry_counts)
+#   minutes   (key, keep_minutes) per-record minute-bucket maps, pruned by AGE.
+#             Ranking these by count would keep the busiest minute forever and
+#             evict this minute, which is the opposite of what a rate needs.
 def _caps() -> dict:
     endpoint_cap = _cap("max_endpoint_records", config.MAX_ENDPOINT_RECORDS)
     ips = ("IPs", config.MAX_IPS_PER_ATTEMPT_RECORD, "value")
     value_cap = _cap("max_header_value_records", config.MAX_HEADER_VALUE_RECORDS)
     fingerprint_children = (("Values", value_cap, "count"),)
+    per_endpoint = config.ACTIVITY_ENDPOINTS_PER_RECORD
+    activity_children = (
+        ("Endpoints", per_endpoint, "value"),
+        ("Statuses", config.MAX_STATUS_CODES, "value"),
+        ("Methods", 16, "value"),
+        ("Outcomes", 32, "value"),
+    )
     return {
         "exploit_summary": dict(cap=config.MAX_EXPLOIT_SUMMARY, by="count", time="LastSeen"),
+        "refusals": dict(cap=config.MAX_REFUSAL_RECORDS, by="count", time="LastSeen", children=(ips,)),
+        "internal_requests": dict(cap=config.MAX_INTERNAL_REQUEST_RECORDS, by="count", time="LastSeen"),
+        "status_sources": dict(
+            cap=None,
+            by="value",
+            own=tuple((name, config.MAX_STATUS_CODES, "value") for name in STATUS_SOURCES),
+        ),
+        "ip_activity": dict(
+            cap=_cap("max_ip_activity_records", config.MAX_IP_ACTIVITY_RECORDS),
+            by="count",
+            time="LastSeen",
+            children=activity_children + (("Callers", per_endpoint, "value"),),
+            minutes=(("Minutes", config.ACTIVITY_HISTORY_MINUTES),),
+        ),
+        "callers": dict(
+            cap=_cap("max_caller_records", config.MAX_CALLER_RECORDS),
+            by="count",
+            time="LastSeen",
+            children=activity_children + (("IPs", per_endpoint, "value"),),
+            minutes=(("Minutes", config.ACTIVITY_HISTORY_MINUTES),),
+        ),
         "crawls": dict(cap=_cap("max_crawl_records", config.MAX_CRAWL_RECORDS), by="recent", time="LastRequestTime"),
         "throttled_ips": dict(
             cap=_cap("max_throttle_records", config.MAX_THROTTLE_RECORDS), by="recent", time="LastThrottleTime"
@@ -389,7 +468,10 @@ def _caps() -> dict:
             cap=endpoint_cap,
             by="count",
             time="LastRequestTime",
-            children=(("Concrete", MAX_CONCRETE_PER_TEMPLATE, "count"),),
+            children=(
+                ("Concrete", MAX_CONCRETE_PER_TEMPLATE, "count"),
+                ("IPs", config.MAX_IPS_PER_ENDPOINT_RECORD, "value"),
+            ),
         ),
         "blocked_endpoint_attempts": dict(cap=endpoint_cap, by="count", time="LastRequestTime", children=(ips,)),
         "rate_limited_attempts": dict(cap=endpoint_cap, by="count", time="LastRequestTime", children=(ips,)),
@@ -419,10 +501,14 @@ def _caps() -> dict:
         # Newest-first: an exploiter who stopped is less interesting than one
         # still knocking, and a spoofed-IP flood must not push the live one out.
         "tarpit_ips": dict(cap=config.MAX_TARPIT_IP_RECORDS, by="recent", time="LastRequestTime"),
+        # `own`, not `children`: retry_counts is a single record ({Total, ByStatusCode,
+        # Reasons}), not a map of them, so the caps belong on the store itself.
+        # Listing them as `children` looked right and silently did nothing —
+        # the per-worker maps were capped on write but their merged union was not.
         "retry_counts": dict(
             cap=None,
             by="count",
-            children=(
+            own=(
                 ("ByStatusCode", config.MAX_STATUS_CODES, "value"),
                 ("Reasons", config.MAX_RETRY_REASONS, "value"),
             ),
@@ -484,10 +570,17 @@ def _trim_all(container) -> int:
         if not isinstance(store, dict):
             continue
         removed += _trim_store(store, spec.get("cap"), spec["by"], spec.get("time", ""))
+        for child_key, child_cap, child_by in spec.get("own", ()):
+            if isinstance(store.get(child_key), dict):
+                removed += _trim_store(store[child_key], child_cap, child_by, "LastSeen")
         for child_key, child_cap, child_by in spec.get("children", ()):
             for record in store.values():
                 if isinstance(record, dict) and isinstance(record.get(child_key), dict):
                     removed += _trim_store(record[child_key], child_cap, child_by, "LastSeen")
+        for child_key, keep_minutes in spec.get("minutes", ()):
+            for record in store.values():
+                if isinstance(record, dict) and isinstance(record.get(child_key), dict):
+                    _prune_minute_store(record[child_key], keep_minutes)
     for name, keep in _MINUTE_STORES.items():
         _prune_minute_store(container.get(name), keep())
     return removed
@@ -586,24 +679,76 @@ def log_exploit_attempt(ip: str, reason: str, user_agent: str):
                 exploit_summary.pop(least, None)
 
 
-def log_endpoint(path: str, method: str, last_headers: str = "", last_ip: str = ""):
+def _endpoint_recent_cap() -> int:
+    configured = _cap("endpoint_recent_requests", config.ENDPOINT_RECENT_REQUESTS)
+    return max(0, min(config.MAX_ENDPOINT_RECENT_REQUESTS, configured))
+
+
+def _attach_last_request(record: dict, now: float, method: str, detail: dict):
+    """Stamp the 'what did this endpoint last receive' fields onto a record.
+
+    Applied to the TEMPLATE as well as the concrete path. It used to be applied
+    only to concrete paths, and only when the template had actually collapsed an
+    ID — which meant that an endpoint with no ID in its path (users.roblox.com
+    /v1/users, the busiest one there is) could never show who called it or with
+    what. The endpoints under the heaviest traffic were precisely the ones the
+    dashboard had nothing to say about.
+    """
+    record["LastMethod"] = method
+    for key, value in detail.items():
+        if value not in (None, ""):
+            record[f"Last{key}"] = value
+    cap = _endpoint_recent_cap()
+    if not cap:
+        record.pop("Recent", None)
+        return
+    # Newest last, matching the append/pop(0) convention used by every other ring
+    # here; the cross-worker merge re-sorts by Date and re-caps (see _merge_list).
+    recent = record.setdefault("Recent", [])
+    if not isinstance(recent, list):
+        recent = record["Recent"] = []
+    recent.append(dict(detail, Id=_event_id(), Date=now, Method=method))
+    while len(recent) > cap:
+        recent.pop(0)
+
+
+def log_endpoint(path: str, method: str, last_headers: str = "", last_ip: str = "", **detail):
     """Record which Roblox endpoint was requested, keeping the most-frequent ones.
 
     Paths are grouped under an ID-collapsed template so volatile IDs don't blow
     up cardinality; the real paths seen under each template are kept (capped) so
-    the dashboard can drill into the specific IDs — and each concrete path keeps
-    the last sanitized headers/IP that were sent to it.
+    the dashboard can drill into the specific IDs.
+
+    Both the template AND the concrete path keep the last request seen, plus a
+    short ring of recent ones (`Recent`) and the distinct client IPs that reached
+    them — so "what is actually being asked of this endpoint, by whom" is
+    answerable from the endpoint table itself rather than by waiting for the live
+    feed to happen to catch another one.
 
     `last_headers` is a pre-sanitized JSON string (secrets already redacted by the
     caller); stored as-is so the cross-worker merge treats it as last-writer-wins.
+    `detail` carries the rest (Query, Body, Status, Outcome, UserAgent, CallerId…).
     """
     # Strip query string and normalize so similar paths group together.
-    path = (path or "").split("?", 1)[0].strip("/")
+    raw = path or ""
+    query = raw.split("?", 1)[1] if "?" in raw else ""
+    path = raw.split("?", 1)[0].strip("/")
     if not path:
         return
     template = _templatize(path)
     cap = _cap("max_endpoint_records", config.MAX_ENDPOINT_RECORDS)
     now = time.time()
+    body_cap = config.MAX_ENDPOINT_RECENT_BODY
+    last = dict(detail)
+    if last_headers:
+        last["Headers"] = last_headers
+    if last_ip:
+        last["IP"] = last_ip
+    if query:
+        last["Query"] = query[:body_cap]
+    for key in ("Body", "Response"):
+        if last.get(key):
+            last[key] = str(last[key])[:body_cap]
     with _state_lock:
         record = endpoints.get(template)
         if record:
@@ -616,6 +761,12 @@ def log_endpoint(path: str, method: str, last_headers: str = "", last_ip: str = 
                 least = min(endpoints.items(), key=lambda kv: kv[1]["Count"])[0]
                 endpoints.pop(least, None)
             record = endpoints[template] = dict(Count=1, LastRequestTime=now, Methods={method: 1}, Concrete={})
+        _attach_last_request(record, now, method, last)
+        if last_ip:
+            ips = record.setdefault("IPs", {})
+            ips[last_ip] = ips.get(last_ip, 0) + 1
+            if len(ips) > config.MAX_IPS_PER_ENDPOINT_RECORD:
+                ips.pop(min(ips.items(), key=lambda kv: kv[1])[0], None)
         # Track the concrete path only when the template actually collapsed an ID.
         if template != path:
             concrete = record.setdefault("Concrete", {})
@@ -624,16 +775,12 @@ def log_endpoint(path: str, method: str, last_headers: str = "", last_ip: str = 
                 c["Count"] += 1
                 c["LastRequestTime"] = now
                 c["Methods"][method] = c["Methods"].get(method, 0) + 1
-                if last_headers:
-                    c["LastHeaders"] = last_headers
-                    c["LastIP"] = last_ip
             else:
                 if len(concrete) >= MAX_CONCRETE_PER_TEMPLATE:
                     least = min(concrete.items(), key=lambda kv: kv[1]["Count"])[0]
                     concrete.pop(least, None)
-                concrete[path] = dict(
-                    Count=1, LastRequestTime=now, Methods={method: 1}, LastHeaders=last_headers, LastIP=last_ip
-                )
+                c = concrete[path] = dict(Count=1, LastRequestTime=now, Methods={method: 1})
+            _attach_last_request(c, now, method, last)
 
 
 def log_blocked_endpoint(path: str, method: str, ip: str, pattern: str):
@@ -731,6 +878,233 @@ def _snippet_for(header_name: str, text: str) -> str:
         return "[redacted]"
     text = str(text or "")
     return text if len(text) <= 120 else text[:120] + "…"
+
+
+# --- Who is calling, and what did we do about it -----------------------------
+# One call per proxied request (log_traffic) maintains two parallel views of the
+# same event, keyed on the two identities a caller has:
+#
+#   ip_activity  keyed on the client IP. Accurate, but a single Roblox experience
+#       talks to us from hundreds of rotating game-server IPs, so one caller
+#       shows up as a hundred small rows and the real volume is invisible.
+#   callers      keyed on the Roblox-Id header, i.e. the PLACE the request came
+#       from. This is the row that names one experience, survives its IPs
+#       churning, and is the thing actually worth blocking. It is also
+#       self-reported, so it is evidence rather than proof — which is why both
+#       views exist rather than just the convenient one.
+#
+# Both keep a short per-minute ring so a RATE can be shown next to the total.
+# Totals alone rank a caller that sent 50k requests yesterday above one sending
+# 50/second right now, which is exactly backwards during an incident.
+def _activity_record(now: float) -> dict:
+    return dict(
+        Count=0,
+        Refused=0,
+        FirstSeen=now,
+        LastSeen=now,
+        Methods={},
+        Endpoints={},
+        Statuses={},
+        Outcomes={},
+        Minutes={},
+    )
+
+
+def _bump_capped(store: dict, key: str, cap: int, amount: int = 1):
+    """Increment a {key: count} map, evicting the smallest entry past `cap`."""
+    if not key:
+        return
+    store[key] = store.get(key, 0) + amount
+    if len(store) > cap:
+        store.pop(min(store.items(), key=lambda kv: kv[1])[0], None)
+
+
+def _bump_activity(store: dict, key: str, cap: int, now: float, fields: dict, cross_key: str, cross_value: str):
+    """Fold one request into one activity record (ip_activity or callers)."""
+    record = store.get(key)
+    if record is None:
+        if len(store) >= cap:
+            # Least busy goes first: under a spoofed-IP flood the rows worth
+            # keeping are the ones sending volume, not the freshest arrival.
+            store.pop(min(store.items(), key=lambda kv: kv[1].get("Count", 0))[0], None)
+        record = store[key] = _activity_record(now)
+    record["Count"] += 1
+    record["LastSeen"] = now
+    if fields.get("Refused"):
+        record["Refused"] = record.get("Refused", 0) + 1
+    per_record = config.ACTIVITY_ENDPOINTS_PER_RECORD
+    _bump_capped(record.setdefault("Methods", {}), fields.get("Method", ""), 16)
+    _bump_capped(record.setdefault("Endpoints", {}), fields.get("Endpoint", ""), per_record)
+    _bump_capped(record.setdefault("Statuses", {}), str(fields.get("Status", "")), config.MAX_STATUS_CODES)
+    _bump_capped(record.setdefault("Outcomes", {}), fields.get("Outcome", ""), 32)
+    if cross_value:
+        _bump_capped(record.setdefault(cross_key, {}), cross_value, per_record)
+    if fields.get("UserAgent"):
+        record["LastUserAgent"] = str(fields["UserAgent"])[:200]
+    minutes = record.setdefault("Minutes", {})
+    bucket = str(int(now // 60))
+    if bucket not in minutes:
+        _prune_minute_store(minutes, config.ACTIVITY_HISTORY_MINUTES)
+    minutes[bucket] = minutes.get(bucket, 0) + 1
+
+
+# Outcomes that are NOT us turning a caller away. "served" is obvious; an
+# upstream failure is one too — Roblox broke, we relayed it. Counting those as
+# refusals would make a Roblox outage look like the caller being blocked, which
+# is the wrong thing to conclude about the caller and the wrong thing to fix.
+NON_REFUSAL_OUTCOMES = ("", "served", "upstream_failed")
+
+
+def log_traffic(ip: str, caller_id: str, method: str, endpoint: str, status, outcome: str, user_agent: str = ""):
+    """Record one proxied request against its client IP and its Roblox place.
+
+    Called for EVERY request that reaches the proxy route, including refusals —
+    a caller that is being blocked is exactly the one worth counting.
+    """
+    now = time.time()
+    ip = (ip or "unknown")[:64]
+    caller_id = str(caller_id or "")[:64]
+    endpoint = (endpoint or "").split("?", 1)[0].strip("/")[:200]
+    fields = {
+        "Method": (method or "?")[:12],
+        "Endpoint": _templatize(endpoint) if endpoint else "",
+        "Status": status,
+        "Outcome": (outcome or "")[:40],
+        "Refused": outcome not in NON_REFUSAL_OUTCOMES,
+        "UserAgent": user_agent,
+    }
+    ip_cap = _cap("max_ip_activity_records", config.MAX_IP_ACTIVITY_RECORDS)
+    caller_cap = _cap("max_caller_records", config.MAX_CALLER_RECORDS)
+    with _state_lock:
+        _bump_activity(ip_activity, ip, ip_cap, now, fields, "Callers", caller_id)
+        if caller_id:
+            _bump_activity(callers, caller_id, caller_cap, now, fields, "IPs", ip)
+
+
+def _rate_over(minutes: dict, window: int, now: float) -> int:
+    """Requests in the last `window` minutes, from a per-minute ring."""
+    if not isinstance(minutes, dict):
+        return 0
+    cutoff = int(now // 60) - window + 1
+    return sum(int(n or 0) for key, n in minutes.items() if str(key).isdigit() and int(key) >= cutoff)
+
+
+def _summarise_activity(store: dict) -> dict:
+    """The poll-sized view of an activity store: totals, rates, and the shape of
+    the traffic — but not the full per-endpoint/per-IP breakdowns, which are
+    fetched on demand. Sending those on every poll is what would make this table
+    expensive enough to be worth not having."""
+    now = time.time()
+    out = {}
+    for key, record in store.items():
+        minutes = record.get("Minutes", {})
+        top = max(record.get("Endpoints", {}).items(), key=lambda kv: kv[1], default=("", 0))
+        out[key] = {
+            "Count": int(record.get("Count", 0) or 0),
+            "Refused": int(record.get("Refused", 0) or 0),
+            "FirstSeen": record.get("FirstSeen", 0),
+            "LastSeen": record.get("LastSeen", 0),
+            "Rate1": _rate_over(minutes, 1, now),
+            "Rate5": _rate_over(minutes, 5, now),
+            "Rate60": _rate_over(minutes, 60, now),
+            "TopEndpoint": top[0],
+            "EndpointCount": len(record.get("Endpoints", {})),
+            "PeerCount": len(record.get("Callers", record.get("IPs", {})) or {}),
+            "UserAgent": record.get("LastUserAgent", ""),
+        }
+    return out
+
+
+def get_activity_detail(kind: str, key: str) -> dict:
+    """The full breakdown for one IP or one caller (lazy drill-down)."""
+    store = callers if kind == "caller" else ip_activity
+    with _state_lock:
+        record = copy.deepcopy(store.get(str(key)) or {})
+    now = time.time()
+    minutes = record.get("Minutes", {})
+    ordered = lambda m: dict(sorted((m or {}).items(), key=lambda kv: kv[1], reverse=True)[:50])  # noqa: E731
+    return {
+        "Kind": kind,
+        "Key": key,
+        "Count": int(record.get("Count", 0) or 0),
+        "Refused": int(record.get("Refused", 0) or 0),
+        "FirstSeen": record.get("FirstSeen", 0),
+        "LastSeen": record.get("LastSeen", 0),
+        "UserAgent": record.get("LastUserAgent", ""),
+        "Methods": ordered(record.get("Methods")),
+        "Endpoints": ordered(record.get("Endpoints")),
+        "Statuses": ordered(record.get("Statuses")),
+        "Outcomes": ordered(record.get("Outcomes")),
+        "Peers": ordered(record.get("Callers") if kind == "ip" else record.get("IPs")),
+        "Rates": {
+            "1": _rate_over(minutes, 1, now),
+            "5": _rate_over(minutes, 5, now),
+            "15": _rate_over(minutes, 15, now),
+            "60": _rate_over(minutes, 60, now),
+        },
+        # The raw ring, so the dashboard can draw the caller's own traffic shape.
+        "Minutes": {k: v for k, v in (minutes or {}).items() if str(k).isdigit()},
+    }
+
+
+def log_refusal(reason: str, status, ip: str = "", path: str = "", category: str = "", detail: str = ""):
+    """Record a refusal Roxy issued itself, keyed by the rule that produced it.
+
+    Four different decisions answer 429 and three answer 4xx generally, so the
+    status code cannot identify which one fired. This can, which turns "we are
+    returning a lot of 429s" into "the per-endpoint rule on X is doing it".
+    """
+    reason = (reason or "Unknown")[:120]
+    now = time.time()
+    ip = (ip or "")[:64]
+    with _state_lock:
+        record = refusals.get(reason)
+        if record is None:
+            if len(refusals) >= config.MAX_REFUSAL_RECORDS:
+                refusals.pop(min(refusals.items(), key=lambda kv: kv[1].get("Count", 0))[0], None)
+            record = refusals[reason] = dict(Count=0, FirstSeen=now, IPs={})
+        record["Count"] += 1
+        record["LastSeen"] = now
+        record["Status"] = str(status)
+        record["Category"] = (category or "")[:40]
+        if ip:
+            record["LastIP"] = ip
+            _bump_capped(record.setdefault("IPs", {}), ip, config.MAX_IPS_PER_ATTEMPT_RECORD)
+        if path:
+            record["LastPath"] = str(path).split("?", 1)[0][:200]
+        if detail:
+            record["LastDetail"] = str(detail)[:500]
+
+
+def log_internal_request(purpose: str, ok: bool, status="", duration: float = 0.0, endpoint: str = "", error: str = ""):
+    """Record one of Roxy's OWN upstream calls (token validation, rotation probe).
+
+    These never pass through the proxy route, so no block/throttle/filter rule
+    can touch them — but that was previously true only by construction and
+    invisible on the dashboard, which is why "did my endpoint block break the
+    token health check?" was unanswerable. Now it is: this table names every
+    internal call site and shows whether it is still succeeding.
+    """
+    purpose = (purpose or "unknown")[:60]
+    now = time.time()
+    with _state_lock:
+        record = internal_requests.get(purpose)
+        if record is None:
+            if len(internal_requests) >= config.MAX_INTERNAL_REQUEST_RECORDS:
+                internal_requests.pop(min(internal_requests.items(), key=lambda kv: kv[1].get("Count", 0))[0], None)
+            record = internal_requests[purpose] = dict(Count=0, Failed=0, FirstSeen=now, TotalTime=0.0)
+        record["Count"] += 1
+        record["LastSeen"] = now
+        record["TotalTime"] = float(record.get("TotalTime", 0) or 0) + max(0.0, float(duration or 0))
+        record["LastStatus"] = str(status)
+        if endpoint:
+            record["LastEndpoint"] = str(endpoint).split("?", 1)[0][:200]
+        if ok:
+            record["LastSuccessAt"] = now
+        else:
+            record["Failed"] = record.get("Failed", 0) + 1
+            record["LastErrorAt"] = now
+            record["LastError"] = str(error or status)[:200]
 
 
 def log_budget_rejection():
@@ -910,25 +1284,34 @@ def reset_method_counters():
         proxy_health["Tokens"]["ExpiredCount"] = 0
 
 
-def log_error(signature: str, detail: str = ""):
+def log_error(signature: str, detail: str = "", source: str = "Roxy"):
     """Record a server/upstream error, deduped by signature with a frequency count.
+
+    `source` says whose fault it is — "Roxy" for a failure in our own code,
+    "Roblox" for an upstream one, "Internal" for a failure of one of our own
+    outbound calls. Without it the error log answers "what broke" but not "is
+    this mine to fix", which is the first question asked of it.
 
     Distinct errors are kept until the admin clears them (capped only to guard
     against an attacker deliberately generating unbounded error variety)."""
     signature = (signature or "Unknown error")[:200]
+    source = source if source in STATUS_SOURCES else "Roxy"
     now = time.time()
     with _state_lock:
         rec = errors.get(signature)
         if rec:
             rec["Count"] += 1
             rec["LastSeen"] = now
+            rec["Source"] = source  # String leaf: the merge treats it as last-writer-wins.
             if detail:
                 rec["LastDetail"] = str(detail)[:2000]
         else:
             if len(errors) >= _cap("max_error_records", config.MAX_ERROR_RECORDS):
                 least = min(errors.items(), key=lambda kv: kv[1]["Count"])[0]
                 errors.pop(least, None)
-            errors[signature] = dict(Count=1, FirstSeen=now, LastSeen=now, LastDetail=str(detail)[:2000])
+            errors[signature] = dict(
+                Count=1, FirstSeen=now, LastSeen=now, LastDetail=str(detail)[:2000], Source=source
+            )
 
 
 def _bump_fingerprint(store: dict, key: str, cap: int) -> dict | None:
@@ -1301,16 +1684,34 @@ def _cap_counter_map(store: dict, cap: int):
             store.pop(key, None)
 
 
-def log_status_code(status_code: int):
+def log_status_code(status_code: int, source: str = "Roblox"):
+    """Count one status code, and count it again under WHO produced it.
+
+    `source` is one of STATUS_SOURCES. The combined Roblox totals stay in
+    status_codes_detailed (unchanged, so everything reading it keeps working);
+    the split is what makes a wall of 429s legible — see the STATUS_SOURCES
+    comment for why the distinction is the whole point.
+
+    Only "Roblox" counts toward the 2xx/4xx headline totals, which have always
+    meant "how did Roblox answer us". Our own refusals are counted separately;
+    folding them in would let a burst of our own throttling read as Roblox
+    starting to reject us, which is the single most expensive thing to get wrong
+    here — it is the difference between "ignore" and "cut the request rate now".
+    """
+    source = source if source in STATUS_SOURCES else "Roblox"
+    code = str(status_code)
     with _state_lock:
-        if 200 <= status_code < 300:
-            status_code_counts["2xx"] += 1
-        elif 400 <= status_code < 500:
-            status_code_counts["4xx"] += 1
-        # Detailed per-code breakdown (covers 1xx/3xx/5xx too).
-        code = str(status_code)
-        status_codes_detailed[code] = status_codes_detailed.get(code, 0) + 1
-        _cap_counter_map(status_codes_detailed, config.MAX_STATUS_CODES)
+        if source == "Roblox":
+            if 200 <= status_code < 300:
+                status_code_counts["2xx"] += 1
+            elif 400 <= status_code < 500:
+                status_code_counts["4xx"] += 1
+            # Detailed per-code breakdown (covers 1xx/3xx/5xx too).
+            status_codes_detailed[code] = status_codes_detailed.get(code, 0) + 1
+            _cap_counter_map(status_codes_detailed, config.MAX_STATUS_CODES)
+        bucket = status_sources.setdefault(source, {})
+        bucket[code] = bucket.get(code, 0) + 1
+        _cap_counter_map(bucket, config.MAX_STATUS_CODES)
 
 
 def log_proxy_request(method: str, duration: float, success: bool = True):
@@ -1438,15 +1839,41 @@ def _summarise_user_agents(store: dict) -> dict:
 
 
 def _summarise_endpoints(store: dict) -> dict:
+    """Endpoint rows for the poll: enough to identify the last caller inline, with
+    the bulky parts (recent-request ring, full headers, concrete paths) left to
+    the drill-down. LastIP/LastStatus are cheap and are what the table is read
+    for, so they travel with the row rather than costing an extra fetch."""
     return {
         template: {
             "Count": rec.get("Count", 0),
             "LastRequestTime": rec.get("LastRequestTime", 0),
             "Methods": dict(rec.get("Methods", {})),
             "ConcreteCount": len(rec.get("Concrete", {})),
+            "LastIP": rec.get("LastIP", ""),
+            "LastMethod": rec.get("LastMethod", ""),
+            "LastStatus": rec.get("LastStatus", ""),
+            "LastOutcome": rec.get("LastOutcome", ""),
+            "LastCallerId": rec.get("LastCallerId", ""),
+            "IPCount": len(rec.get("IPs", {})),
+            "RecentCount": len(rec.get("Recent", []) or []),
+            "HasDetail": bool(rec.get("LastHeaders") or rec.get("Recent")),
         }
         for template, rec in store.items()
     }
+
+
+def _recent_view(record: dict, limit: int) -> list:
+    """A record's recent-request ring, newest first."""
+    recent = record.get("Recent")
+    if not isinstance(recent, list):
+        return []
+    ordered = sorted(recent, key=lambda item: item.get("Date", 0) if isinstance(item, dict) else 0, reverse=True)
+    return ordered[:limit]
+
+
+def _last_request_view(record: dict) -> dict:
+    """Everything stamped onto a record by _attach_last_request, in one blob."""
+    return {key[4:]: value for key, value in record.items() if key.startswith("Last") and key != "LastRequestTime"}
 
 
 def get_header_values(blocked: bool, name: str, limit: int = 200) -> dict:
@@ -1480,13 +1907,32 @@ def get_user_agent_detail(blocked: bool, user_agent: str) -> dict:
     }
 
 
-def get_endpoint_detail(template: str, limit: int = 100) -> dict:
-    """The concrete paths recorded under one endpoint template, busiest first."""
+def get_endpoint_detail(template: str, limit: int = 100, concrete_path: str = "") -> dict:
+    """One endpoint's drill-down: its concrete paths, who has been calling it, and
+    the last few requests it actually received (headers, query, body, response).
+
+    `concrete_path` narrows the recent-request ring and last-request blob to a
+    single concrete path under the template, so a specific ID can be inspected
+    without the template's other IDs mixed in.
+    """
     with _state_lock:
         rec = copy.deepcopy(endpoints.get(template) or {})
     concrete = rec.get("Concrete", {})
     ordered = sorted(concrete.items(), key=lambda kv: kv[1].get("Count", 0), reverse=True)[:limit]
-    return {"Template": template, "Total": len(concrete), "Concrete": dict(ordered)}
+    target = concrete.get(concrete_path) if concrete_path else rec
+    target = target if isinstance(target, dict) else {}
+    ips = sorted((rec.get("IPs") or {}).items(), key=lambda kv: kv[1], reverse=True)[:50]
+    return {
+        "Template": template,
+        "ConcretePath": concrete_path,
+        "Total": len(concrete),
+        "Concrete": dict(ordered),
+        "Count": int(target.get("Count", 0) or 0),
+        "Last": _last_request_view(target),
+        "Recent": _recent_view(target, _endpoint_recent_cap()),
+        "IPs": dict(ips),
+        "IPCount": len(rec.get("IPs", {})),
+    }
 
 
 _last_flush_at = 0.0
@@ -1530,6 +1976,9 @@ def get_diagnostics(force_flush: bool = False) -> dict:
                 "RequestCounts": request_counts,
                 "StatusCodeCounts": status_code_counts,
                 "StatusCodesDetailed": status_codes_detailed,
+                "StatusSources": status_sources,
+                "Refusals": refusals,
+                "InternalRequests": internal_requests,
                 "ProxyRequestCounts": proxy_request_counts,
                 "MethodTimings": method_timings,
                 "ProxyHealth": proxy_health,
@@ -1537,6 +1986,8 @@ def get_diagnostics(force_flush: bool = False) -> dict:
                 "RequestFailures": request_failures,
                 "RotateIps": list(reversed(rotate_ips)),  # Most-recent first.
                 "Crawls": crawls,
+                "IpActivity": _summarise_activity(ip_activity),
+                "Callers": _summarise_activity(callers),
                 "Endpoints": _summarise_endpoints(endpoints),
                 "BlockedEndpointAttempts": blocked_endpoint_attempts,
                 "RateLimitedAttempts": rate_limited_attempts,
@@ -1617,6 +2068,11 @@ _PERSISTED_NAMES = (
     "request_counts",
     "status_code_counts",
     "status_codes_detailed",
+    "status_sources",
+    "refusals",
+    "ip_activity",
+    "callers",
+    "internal_requests",
     "proxy_request_counts",
     "method_timings",
     "method_stats",
@@ -1672,6 +2128,7 @@ CLEAR_TARGETS = {
         "request_counts",
         "status_code_counts",
         "status_codes_detailed",
+        "status_sources",
         "method_stats",
         "token_usage",
         "retry_counts",
@@ -1680,6 +2137,10 @@ CLEAR_TARGETS = {
         "token_budget",
         "token_budget_minutes",
     ),
+    "refusals": ("refusals",),
+    "ip_activity": ("ip_activity",),
+    "callers": ("callers",),
+    "internal_requests": ("internal_requests",),
     # Proxy timings clear INDEPENDENTLY of the request counters above.
     "proxy_timings": ("proxy_request_counts", "method_timings"),
     "request_failures": ("request_failures",),
@@ -1795,6 +2256,10 @@ _LIST_CAP_SETTINGS = {
     "login_attempts": ("max_login_records", config.MAX_LOGIN_RECORDS),
     "live_requests": ("max_live_requests", config.MAX_LIVE_REQUESTS),
     "rotate_ips": (None, config.MAX_ROTATE_IPS),
+    # Per-endpoint recent-request rings, nested inside the endpoints store. They
+    # reach the merge as an ordinary list value, so they get the same union +
+    # dedupe-by-Id + cap treatment as the top-level event lists for free.
+    "Recent": ("endpoint_recent_requests", config.ENDPOINT_RECENT_REQUESTS),
 }
 
 
