@@ -4,6 +4,78 @@
 Action runs it, and `app/` (including the new `gunicorn.conf.py`) lands in
 `~/Roxy`. Nothing below is needed for a normal deploy.
 
+---
+
+## If `~/UpdateBuild.sh` has gone missing
+
+**You should not need to do anything — just push.** The workflow now reinstalls
+the script from the repo when it is absent, so the next push to `main` repairs
+itself.
+
+### Why it went missing
+
+The old `UpdateBuild.sh` moved itself out of the way before it had a
+replacement:
+
+```bash
+mv ~/UpdateBuild.sh ~/UpdateBuildOld.sh          # line 31: home now has no script
+mv roxy/Tooling/UpdateBuild.sh ~                 # line 32: fails if the clone failed
+...
+rm ~/UpdateBuildOld.sh                           # line 56: runs anyway — backup destroyed
+```
+
+It ran without `set -e`, so a single failed `git clone` carried straight on
+through all three. It also deleted `~/Roxy` and `~/SiteEnv` at the *top* of the
+script, before fetching anything. Replaying that exact scenario against the two
+versions:
+
+```
+        exit  ~/UpdateBuild.sh  backup  ~/Roxy  ~/SiteEnv  ~/Tooling
+OLD     0     gone              gone    gone    gone       gone
+NEW     128   intact            n/a     intact  intact     intact
+```
+
+`exit 0` is the worst part: the Action reported a green tick while the server
+had been emptied.
+
+### Manual recovery, if you would rather not wait for a push
+
+```bash
+git clone --depth 1 https://github.com/CeaselessQuokka/roxy /tmp/roxy-fix
+cp /tmp/roxy-fix/Tooling/UpdateBuild.sh ~/UpdateBuild.sh
+chmod +x ~/UpdateBuild.sh
+rm -rf /tmp/roxy-fix
+bash ~/UpdateBuild.sh          # rebuilds ~/Roxy, ~/SiteEnv and ~/Tooling
+```
+
+That one command restores everything: the script re-clones, rebuilds the
+virtualenv, redeploys `app/`, and restarts the service.
+
+### What stops it recurring
+
+- `set -euo pipefail` and an `ERR` trap that rolls `~/Roxy` and `~/SiteEnv` back
+  and restarts the service.
+- Nothing live is touched until the clone has been fetched **and verified**
+  (`app/`, `requirements.txt` and both `Tooling/` scripts must be present).
+- The new virtualenv is built alongside the old one and swapped, so a `pip`
+  failure can no longer leave the site without an interpreter.
+- The self-update renames the new script *onto* `~/UpdateBuild.sh`. `rename(2)`
+  is atomic, so the path is never empty — not even for an instant.
+- A deploy that ends with the service down exits non-zero, so the Action goes
+  red instead of hiding it.
+
+All of the above is covered by `tests/deploy_test.sh`, which runs the real
+script against a fake home and a fake remote with `sudo`/`systemctl`/`python3`
+stubbed, so nothing on your machine is touched:
+
+```bash
+bash tests/deploy_test.sh
+```
+
+It checks a clean deploy, the self-update, a first-ever deploy onto a bare home,
+and three failure paths (clone fails, `pip` fails, clone is malformed) — each
+asserting that `~/UpdateBuild.sh` survives and the previous build keeps serving.
+
 The steps here are **one-time**, because `UpdateBuild.sh` cannot write to
 `/etc/systemd` or `/etc/nginx`. Do them once and every future push is unchanged.
 

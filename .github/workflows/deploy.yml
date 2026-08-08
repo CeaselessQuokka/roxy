@@ -17,4 +17,20 @@ jobs:
           username: ${{ secrets.LIGHTSAIL_USER }}
           key: ${{ secrets.LIGHTSAIL_SSH_KEY }}
           script: |
+            set -euo pipefail
+
+            # Bootstrap. UpdateBuild.sh updates itself, so if a deploy ever dies
+            # partway the server can be left without it -- and then every future
+            # deploy fails here, on the one file that could have fixed things.
+            # Fetching it when it is missing makes that recoverable by pushing
+            # instead of by hand. Normal runs skip this entirely.
+            if [ ! -f ~/UpdateBuild.sh ]; then
+              echo "==> ~/UpdateBuild.sh is missing; reinstalling it from the repo."
+              rm -rf ~/.deploy-bootstrap
+              git clone --quiet --depth 1 https://github.com/CeaselessQuokka/roxy ~/.deploy-bootstrap
+              cp ~/.deploy-bootstrap/Tooling/UpdateBuild.sh ~/UpdateBuild.sh
+              chmod +x ~/UpdateBuild.sh
+              rm -rf ~/.deploy-bootstrap
+            fi
+
             bash ~/UpdateBuild.sh
