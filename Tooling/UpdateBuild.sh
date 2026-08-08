@@ -3,6 +3,15 @@
 # Deploys the newest build from GitHub. Run by .github/workflows/deploy.yml as
 # `bash ~/UpdateBuild.sh` on every push to main.
 #
+# Re-exec under bash if started with `sh UpdateBuild.sh`. Ubuntu's /bin/sh is
+# dash, which has no `set -o pipefail`, so the script would abort on the first
+# line of its own safety setup with a bare "Illegal option -o pipefail" — and
+# typing `sh script.sh` is the natural thing to do when you are poking at a
+# broken deploy by hand. Must come before any bash-only syntax.
+if [ -z "${BASH_VERSION:-}" ]; then
+	exec bash "$0" "$@"
+fi
+#
 # This script updates ITSELF, and that is the part worth being careful about:
 # the previous version moved the running script out of the way
 # (`mv ~/UpdateBuild.sh ~/UpdateBuildOld.sh`) before it had the replacement in
@@ -48,7 +57,10 @@ BUILD_DIR=~/Build
 # Retired copies, kept until the very end so a late failure can still roll back.
 OLD_SITE="$DEPLOY_TO.old"
 OLD_VENV="$VENV.old"
-NEW_VENV="$VENV.new"
+# Hash of the requirements the current venv was built from, so an unchanged
+# dependency list skips the rebuild entirely — that is the slowest part of a
+# deploy and the one most likely to fail (it is the only step needing PyPI).
+REQ_STAMP="$VENV/.requirements.sha256"
 
 log() { echo "==> $*"; }
 fail() { echo "!!! $*" >&2; }
@@ -87,7 +99,7 @@ rollback() {
 	if [ -f "$SCRIPT_PATH.bak" ] && [ ! -f "$SCRIPT_PATH" ]; then
 		mv "$SCRIPT_PATH.bak" "$SCRIPT_PATH" 2>/dev/null || true
 	fi
-	rm -rf "$NEW_VENV" "$BUILD_DIR" 2>/dev/null || true
+	rm -rf "$BUILD_DIR" 2>/dev/null || true
 	start_service
 	fail "Previous build restored. The site should be back up; nothing was upgraded."
 	exit "$code"
@@ -112,14 +124,29 @@ for required in "$SITE_CODE_ROOT" "requirements.txt" "Tooling/UpdateBuild.sh" "T
 done
 log "Build verified."
 
-# --- 2. Build the new virtualenv alongside the old one -----------------------
-# Alongside, not in place: a pip failure used to leave the site with no
-# interpreter at all, because the old venv had already been deleted.
-log "Creating fresh environment."
-rm -rf "$NEW_VENV"
-python3 -m venv "$NEW_VENV"
-"$NEW_VENV"/bin/pip install --quiet --upgrade pip
-"$NEW_VENV"/bin/pip install --quiet -r "$SRC/requirements.txt"
+# --- 2. Decide whether the virtualenv needs rebuilding -----------------------
+# A venv bakes its own absolute path into the shebang of every console script,
+# so it CANNOT be built somewhere else and moved into place — ~/SiteEnv/bin/
+# gunicorn would still point at the path it was created under, and the service
+# would fail to start with "bad interpreter". It is therefore always created at
+# its final path, and the old one is moved aside (never the new one) so a
+# failure can put it back where its shebangs already expect to be.
+#
+# Rebuilding is skipped entirely when requirements.txt is unchanged, which keeps
+# the slowest and least reliable step out of the downtime window on the deploys
+# that do not need it — which is nearly all of them.
+NEW_REQ_HASH=$(sha256sum "$SRC/requirements.txt" | cut -d' ' -f1)
+REBUILD_VENV=1
+if [ -f "$REQ_STAMP" ] && [ -x "$VENV/bin/python" ]; then
+	if [ "$(cat "$REQ_STAMP")" = "$NEW_REQ_HASH" ]; then
+		REBUILD_VENV=0
+	fi
+fi
+if [ "$REBUILD_VENV" = "1" ]; then
+	log "Dependencies changed (or no usable environment) — will rebuild it."
+else
+	log "Dependencies unchanged — keeping the existing environment."
+fi
 
 # --- 3. Update the tooling that lives outside the app ------------------------
 # ~/Build is deleted at the end, so without this the systemd and nginx configs
@@ -164,11 +191,22 @@ sudo rm -rf "$OLD_SITE" "$OLD_VENV"
 if [ -d "$DEPLOY_TO" ]; then
 	mv "$DEPLOY_TO" "$OLD_SITE"
 fi
-if [ -d "$VENV" ]; then
-	mv "$VENV" "$OLD_VENV"
-fi
 mv "$SRC/$SITE_CODE_ROOT" "$DEPLOY_TO"
-mv "$NEW_VENV" "$VENV"
+
+if [ "$REBUILD_VENV" = "1" ]; then
+	log "Creating fresh environment."
+	# Retire the old one first, then build at the FINAL path — see the note in
+	# step 2 for why the new venv can never be built elsewhere and moved in.
+	if [ -d "$VENV" ]; then
+		mv "$VENV" "$OLD_VENV"
+	fi
+	python3 -m venv "$VENV"
+	"$VENV"/bin/pip install --quiet -r "$SRC/requirements.txt"
+	# Stamp it only after the install succeeded, so a half-built environment is
+	# never mistaken for a complete one on the next deploy.
+	echo "$NEW_REQ_HASH" > "$REQ_STAMP"
+fi
+
 # Past deploys used `sudo mv`, which could leave a root-owned tree behind for a
 # service that runs as this user. Normalise it either way.
 sudo chown -R "$(id -un):$(id -gn)" "$DEPLOY_TO" 2>/dev/null || true

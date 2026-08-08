@@ -1,3 +1,7 @@
 env2/
 Unused/
 app/__pycache__/
+# The production virtualenv name. Never belongs in the repo, but it is easy to
+# create one here by accident while testing the deploy script.
+SiteEnv/
+Build/

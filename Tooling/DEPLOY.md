@@ -48,6 +48,11 @@ rm -rf /tmp/roxy-fix
 bash ~/UpdateBuild.sh          # rebuilds ~/Roxy, ~/SiteEnv and ~/Tooling
 ```
 
+Run it with `bash`, not `sh`. Ubuntu's `/bin/sh` is dash, which has no
+`set -o pipefail` — the script now re-execs itself under bash if you forget, but
+older copies sitting on the server will just fail with
+`set: Illegal option -o pipefail`.
+
 That one command restores everything: the script re-clones, rebuilds the
 virtualenv, redeploys `app/`, and restarts the service.
 
@@ -57,8 +62,12 @@ virtualenv, redeploys `app/`, and restarts the service.
   and restarts the service.
 - Nothing live is touched until the clone has been fetched **and verified**
   (`app/`, `requirements.txt` and both `Tooling/` scripts must be present).
-- The new virtualenv is built alongside the old one and swapped, so a `pip`
-  failure can no longer leave the site without an interpreter.
+- The virtualenv is rebuilt **only when `requirements.txt` changes**, and always
+  directly at `~/SiteEnv` — never built elsewhere and moved. A venv bakes its own
+  absolute path into the shebang of every console script, so a relocated one
+  leaves `~/SiteEnv/bin/gunicorn` pointing at a directory that no longer exists
+  and systemd fails with "bad interpreter". On a rebuild the *old* venv is moved
+  aside instead, so rolling back puts it back at the path its shebangs expect.
 - The self-update renames the new script *onto* `~/UpdateBuild.sh`. `rename(2)`
   is atomic, so the path is never empty — not even for an instant.
 - A deploy that ends with the service down exits non-zero, so the Action goes
