@@ -171,6 +171,7 @@ TARPIT_SLOT_GRACE = 15  # Seconds a lease may outlive its hold before it's recla
 TARPIT_MAX_CAPACITY_FRACTION = 0.5
 TARPIT_FALLBACK_SLOTS = 16  # Assumed workers x threads when the real figure can't be read.
 MAX_TARPIT_IP_RECORDS = 200  # Distinct tarpitted IPs kept for the per-IP breakdown.
+MAX_TARPIT_REASON_RECORDS = 200  # Distinct "which rule caused this hold" records kept.
 MAX_TARPIT_ARRIVALS = 2000  # Distinct IPs whose last arrival time is kept (for the gap measurement).
 TARPIT_HISTORY_MINUTES = 1500  # Per-minute hold buckets retained (~25h), for the request-frequency trend.
 # Which refusals may be held. Each is an independent on/off setting

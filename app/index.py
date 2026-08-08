@@ -644,14 +644,46 @@ _UNIVERSE_DETAIL_URL = "games.roblox.com/v1/games"
 
 
 def _lookup_json(url: str, params: dict = None):
-    """Fetch one public Roblox JSON endpoint through the proxy stack. Returns (data, error)."""
+    """Fetch one public Roblox JSON endpoint for the admin lookup. Returns (data, error).
+
+    Tries the proxy stack first, so the request goes out through rotation when
+    that is available and our own IP stays out of it. Falls back to a direct
+    call if routing has nothing to offer — which is precisely the situation this
+    tool is used in: you want to identify whoever is hammering you at the moment
+    the token budget is spent and every method is busy, and a lookup that only
+    works when nothing is wrong is a lookup that never works when it matters.
+
+    The fallback is safe to make directly: these endpoints are public, take no
+    credentials, and are called once per admin click, so they cost the token
+    budget nothing and cannot look like bot traffic.
+    """
     ok, body = proxy.request(url, method="get", headers={}, params=params or {})
     if not ok:
-        return None, str(body)[:300]
+        body, error = _lookup_direct(url, params)
+        if error:
+            return None, error
     try:
         return json.loads(body), ""
     except (ValueError, TypeError):
         return None, "Upstream returned a non-JSON body"
+
+
+def _lookup_direct(url: str, params: dict = None):
+    """Last-resort direct fetch for the admin lookup. Returns (body, error)."""
+    started = time.monotonic()
+    try:
+        resp = proxy.requests.get(f"https://{url}", params=params or {}, timeout=proxy._timeout())
+    except Exception as error:
+        diagnostics.log_internal_request(
+            "admin_lookup", False, "error", time.monotonic() - started, url, f"{type(error).__name__}: {error}"
+        )
+        return "", f"{type(error).__name__}: {error}"[:300]
+    ok = resp.status_code == 200
+    diagnostics.log_internal_request("admin_lookup", ok, resp.status_code, time.monotonic() - started, url)
+    diagnostics.log_status_code(resp.status_code, source="Internal")
+    if not ok:
+        return "", f"Roblox returned HTTP {resp.status_code}"
+    return resp.text, ""
 
 
 @app.route("/admin/lookup/place", methods=["POST"], endpoint="admin_lookup_place")
@@ -1360,16 +1392,20 @@ def proxy_page(dst: str):
     # Token safety budget — so the real routing behavior is still exercised.
     bypass = ctx.bypass = runtime.is_throttle_bypassed(ip)
 
-    def hold(category: str):
+    def hold(category: str, reason: str = ""):
         """Sit on a refusal before answering it (see tarpit.py).
 
         Placed immediately before the error is built, so the caller receives the
         byte-identical response they always did — just later. Bypass IPs are
         never held: that allowlist is how the admin tests against their own
         server, and a 20-second wait per probe would make that useless.
+
+        `reason` identifies the SPECIFIC rule, not just its kind: with several
+        filters armed, "a filter caught something" is not an answer to "which
+        one is doing this?".
         """
         if not bypass:
-            tarpit.hold(ip, category)
+            tarpit.hold(ip, category, reason)
 
     # Global throttle-all: a softer alternative to a full pause. Every IP is
     # rate-limited to a configurable N requests per P seconds; requests within
@@ -1379,7 +1415,8 @@ def proxy_page(dst: str):
         allowed, retry_in = throttle.check_global_throttle(ip)
         if not allowed:
             diagnostics.log_throttle_all_drop()
-            hold("throttle_all")
+            limits = runtime.get_throttle_all_state()
+            hold("throttle_all", f"Global limit {limits.get('Limit')} per {limits.get('Period')}s")
             return refuse(
                 jsonify(runtime.throttle_all_message()),
                 429,
@@ -1388,7 +1425,11 @@ def proxy_page(dst: str):
             )
 
     if not bypass and throttle.is_throttled(ip):
-        hold("throttle")
+        hold(
+            "throttle",
+            f"Per-IP limit {runtime.get_setting('allowed_requests_per_minute', config.ALLOWED_REQUESTS_PER_MINUTE)} "
+            f"per {runtime.get_setting('throttle_reset_duration', config.THROTTLE_RESET_DURATION)}s",
+        )
         resp, status = throttled_response(ip)
         _record_outcome(ctx, status, "throttled", reason="Per-IP rate limit")
         return resp, status
@@ -1398,12 +1439,12 @@ def proxy_page(dst: str):
 
     if dst != escape(dst):
         diagnostics.log_exploit_attempt(ip, f'Invalid URL: "{dst}"', user_agent)
-        hold("probe")
+        hold("probe", "Invalid URL (unsafe characters)")
         return refuse(jsonify("Invalid URL"), 404, "probe", reason="Invalid URL", category="probe")
 
     if not validate_url(dst):
         diagnostics.log_exploit_attempt(ip, f'Non-Roblox URL: "{dst}"', user_agent)
-        hold("probe")
+        hold("probe", f"Non-Roblox URL: {dst.split('/', 1)[0][:60]}")
         return refuse(jsonify("Not a Roblox URL"), 404, "probe", reason="Non-Roblox URL", category="probe")
 
     # Roxy does not support authenticated requests: reject and log any attempt to
@@ -1411,7 +1452,7 @@ def proxy_page(dst: str):
     auth_attempt = _detect_auth_attempt(request.headers)
     if auth_attempt:
         diagnostics.log_exploit_attempt(ip, f"Sent a ROBLOSECURITY token ({auth_attempt})", user_agent)
-        hold("auth_attempt")
+        hold("auth_attempt", auth_attempt)
         return refuse(
             jsonify("Requests requiring authentication are not allowed with this proxy."),
             400,
@@ -1439,7 +1480,10 @@ def proxy_page(dst: str):
             last_ip=ip,
         )
         reset_in = runtime.get_setting("throttle_reset_duration", config.THROTTLE_RESET_DURATION)
-        hold("header_rule")
+        # Name the filter AND what it matched on, so a row in the tarpit table is
+        # actionable without cross-referencing the Request Filters list.
+        matched = header_rule.get("MatchedHeader", "?")
+        hold("header_rule", f"Filter {header_rule.get('Id', '?')} (matched {matched})")
         custom = str(header_rule.get("Message", "")).strip()
         if custom:
             resp, status = jsonify(custom), 429
@@ -1454,7 +1498,7 @@ def proxy_page(dst: str):
     block = runtime.match_endpoint_block(dst)
     if block:
         diagnostics.log_blocked_endpoint(dst, request.method, ip, block.get("Pattern", ""))
-        hold("blocked_endpoint")
+        hold("blocked_endpoint", f"Block rule: {block.get('Pattern', '?')}")
         message = str(block.get("Message", "")).strip() or "This endpoint is currently blocked."
         return refuse(
             jsonify(message),
@@ -1469,7 +1513,7 @@ def proxy_page(dst: str):
         endpoint_allowed, endpoint_retry, endpoint_pattern = throttle.check_endpoint_limit(ip, dst)
         if not endpoint_allowed:
             diagnostics.log_rate_limited_endpoint(dst, request.method, ip, endpoint_pattern)
-            hold("endpoint_rule")
+            hold("endpoint_rule", f"Rate rule: {endpoint_pattern}")
             rule = runtime.match_endpoint_rule(dst) or {}
             custom = str(rule.get("Message", "")).strip()
             message = custom or f"This endpoint is rate-limited for you; try again in {endpoint_retry} seconds."

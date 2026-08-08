@@ -2726,6 +2726,76 @@ check("Both lookup hops go through the proxy stack", len(lookup_calls) == 2, loo
 r = client.post("/admin/lookup/place", headers={**IP_MAIN, "Accept": "application/json"}, json={"id": "not-a-number"})
 check("A non-numeric ID is rejected, not proxied", r.status_code == 400, r.status_code)
 
+# The lookup has to work when the proxy path CANNOT serve — which is exactly
+# when it is reached for: you identify whoever is hammering you at the moment
+# the token budget is spent and every method is busy. A tool that only works
+# while nothing is wrong never works when it matters.
+direct_calls = []
+
+
+def fake_direct(url, headers=None, params=None, cookies=None, proxies=None, timeout=None):
+    direct_calls.append(url)
+    if "universes/v1/places" in url:
+        return FakeUpstreamResponse(text='{"universeId": 9583680112}')
+    return FakeUpstreamResponse(
+        text='{"data":[{"id":9583680112,"rootPlaceId":120336171476147,"name":"Fallback Experience",'
+        '"description":"","playing":0,"visits":5,"maxPlayers":30,"favoritedCount":0,'
+        '"creator":{"id":904709930,"name":"Slushy Delight","type":"Group","hasVerifiedBadge":false}}]}'
+    )
+
+
+proxy_module.set_tokens([])  # no token
+rotate_module._proxy_url = ""  # and no rotation: routing has nothing to offer
+proxy_module.requests.get = fake_direct
+lookup_calls.clear()
+r = client.post(
+    "/admin/lookup/place", headers={**IP_MAIN, "Accept": "application/json"}, json={"id": "120336171476147"}
+)
+proxy_module.requests.get = fake_get
+payload = r.get_json()
+check("A lookup still works with no upstream method available", r.status_code == 200, (r.status_code, payload))
+check("...by falling back to a direct call", len(direct_calls) == 2, direct_calls)
+check("...and still names the owner", payload.get("CreatorName") == "Slushy Delight", payload)
+check("...and the owner type", payload.get("CreatorType") == "Group", payload)
+check("The fallback is recorded as an internal request", "admin_lookup" in diag()["InternalRequests"])
+check("...and counted as Internal, not as caller traffic", "admin_lookup" not in diag()["IpActivity"])
+fresh_upstream()
+enable_rotation()
+
+print("\n== Tarpit holds name the rule that caused them ==")
+clear_all_diag()
+fresh_upstream()
+runtime.set_setting("tarpit_enabled", 1)
+runtime.set_setting("tarpit_min_seconds", 0)
+runtime.set_setting("tarpit_max_seconds", 1)
+for name in ("tarpit_on_probe", "tarpit_on_blocked_endpoint", "tarpit_on_header_rule"):
+    runtime.set_setting(name, 1)
+runtime.block_endpoint("badges.roblox.com", "test")
+client.post(
+    "/admin/headers/rule",
+    headers=IP_MAIN,
+    json={"header": "X-Test", "scope": "value", "mode": "contains", "needle": "trip"},
+)
+api_client.get("/not-roblox.example.com/x", headers={"X-Forwarded-For": "10.61.0.1"})
+api_client.get("/badges.roblox.com/v1/x", headers={"X-Forwarded-For": "10.61.0.2"})
+api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.61.0.3", "X-Test": "trip"})
+reasons = diag()["TarpitReasons"]
+labels = {v.get("Reason", "") for v in reasons.values()}
+cats = {v.get("Category", "") for v in reasons.values()}
+check("A held probe names the URL it rejected", any("not-roblox.example.com" in r for r in labels), labels)
+check("A held block names the pattern", any("badges.roblox.com" in r for r in labels), labels)
+check("A held filter names the rule and what it matched", any("X-Test" in r for r in labels), labels)
+check("...across all three categories", {"probe", "blocked_endpoint", "header_rule"} <= cats, cats)
+first = next(iter(reasons.values()))
+check("A reason records how long it held them", first.get("TotalHeld", 0) >= 0, first)
+check("...and which IPs it caught", bool(first.get("IPs")), first)
+client.post("/admin/data/clear", headers={**IP_MAIN, "Accept": "application/json"}, json={"target": "tarpit"})
+check("Tarpit reasons clear with the rest of the tarpit stats", not diag()["TarpitReasons"], diag()["TarpitReasons"])
+runtime.set_setting("tarpit_enabled", 0)
+runtime.unblock_endpoint("badges.roblox.com")
+for existing in list(runtime.get_header_rules()):
+    client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": existing})
+
 clear_all_diag()
 reset_routing()
 runtime.set_setting("allowed_requests_per_minute", _PRIOR_RPM)

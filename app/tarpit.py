@@ -197,8 +197,13 @@ def active_holds() -> int:
     return sum(1 for expires in slots.values() if float(expires or 0) > now)
 
 
-def hold(ip: str, category: str) -> float:
+def hold(ip: str, category: str, reason: str = "") -> float:
     """Delay a refusal that is about to be returned. Returns the seconds held (0 if not).
+
+    `reason` names the specific rule that caused this hold (which filter, which
+    blocked pattern, which probe). The category alone says a filter caught
+    something but not which one, and with several armed at once that is the only
+    question worth asking of the row.
 
     Call this immediately BEFORE building the error response, never while holding
     a lock, and never on a path that reaches Roblox.
@@ -217,7 +222,7 @@ def hold(ip: str, category: str) -> float:
         # At capacity: refuse instantly, exactly as before the tarpit existed.
         # Counted, because a rising number here is the signal that the cap (not
         # the caller) is what's limiting the tarpit.
-        diagnostics.log_tarpit_skipped(ip, category, gap, now)
+        diagnostics.log_tarpit_skipped(ip, category, gap, now, reason)
         return 0.0
     started = time.monotonic()
     try:
@@ -227,7 +232,7 @@ def hold(ip: str, category: str) -> float:
         _release(lease)
     # Recorded against the ARRIVAL time, not the release time, so the measured
     # interval between a caller's requests isn't distorted by how long we held them.
-    diagnostics.log_tarpit(ip, category, held, gap, now)
+    diagnostics.log_tarpit(ip, category, held, gap, now, reason)
     return held
 
 

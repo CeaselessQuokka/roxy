@@ -956,6 +956,37 @@
 								Per caller. <strong>Avg gap</strong> is the mean time between that IP's requests — the
 								number that tells you whether they are backing off.
 							</p>
+							<h3 class="card__title">Why each hold happened</h3>
+							<p class="form__hint">
+								The specific rule behind every hold — which filter, which blocked pattern, which
+								probe — rather than only its category.
+							</p>
+							<div class="table-wrap">
+								<table id="tarpitReasonsTable" class="table">
+									<thead>
+										<tr>
+											<th scope="col" data-sort="category" data-sort-type="text">Category</th>
+											<th scope="col" data-sort="reason" data-sort-type="text">Rule</th>
+											<th
+												scope="col"
+												data-sort="held"
+												data-sort-type="num"
+												data-sort-default="desc"
+											>
+												Held
+											</th>
+											<th scope="col" data-sort="skipped" data-sort-type="num">Skipped</th>
+											<th scope="col" data-sort="wasted" data-sort-type="num">Time Wasted</th>
+											<th scope="col" data-sort="ips" data-sort-type="num">IPs</th>
+											<th scope="col" data-sort="lastip" data-sort-type="text">Last IP</th>
+											<th scope="col" data-sort="last" data-sort-type="num">Last Held</th>
+										</tr>
+									</thead>
+									<tbody></tbody>
+								</table>
+							</div>
+
+							<h3 class="card__title">Callers held</h3>
 							<div class="table-wrap">
 								<table id="tarpitIpsTable" class="table">
 									<thead>
@@ -1451,8 +1482,6 @@
 							</table>
 						</div>
 					</div>
-				</section>
-
 					<div class="card">
 						<h3 class="card__title">Who returned it?</h3>
 						<p class="form__hint">
@@ -1461,26 +1490,26 @@
 							callers</em> (the system working). The table above counts Roblox's answers only.
 						</p>
 						<div id="statusSourceVerdict" class="callout callout--muted">—</div>
-						<div class="kpi-grid kpi-grid--compact">
-							<article class="kpi">
-								<div class="kpi__label">429s from Roblox</div>
+						<div class="grid grid--kpis">
+							<article class="card kpi">
+								<h4 class="kpi__title">429s from Roblox</h4>
 								<div class="kpi__value" id="src_roblox_429">0</div>
-								<div class="kpi__hint">Roblox throttling us</div>
+								<div class="kpi__meta">Roblox throttling us</div>
 							</article>
-							<article class="kpi">
-								<div class="kpi__label">429s from Roxy</div>
+							<article class="card kpi">
+								<h4 class="kpi__title">429s from Roxy</h4>
 								<div class="kpi__value" id="src_roxy_429">0</div>
-								<div class="kpi__hint">Us throttling callers</div>
+								<div class="kpi__meta">Us throttling callers</div>
 							</article>
-							<article class="kpi">
-								<div class="kpi__label">5xx from Roblox</div>
+							<article class="card kpi">
+								<h4 class="kpi__title">5xx from Roblox</h4>
 								<div class="kpi__value" id="src_roblox_5xx">0</div>
-								<div class="kpi__hint">Upstream failures</div>
+								<div class="kpi__meta">Upstream failures</div>
 							</article>
-							<article class="kpi">
-								<div class="kpi__label">5xx from Roxy</div>
+							<article class="card kpi">
+								<h4 class="kpi__title">5xx from Roxy</h4>
 								<div class="kpi__value" id="src_roxy_5xx">0</div>
-								<div class="kpi__hint">Our own failures</div>
+								<div class="kpi__meta">Our own failures</div>
 							</article>
 						</div>
 						<div class="table-wrap">

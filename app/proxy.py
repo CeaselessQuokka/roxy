@@ -111,6 +111,11 @@ def internal_endpoints() -> list[dict]:
         {"Purpose": "token_validate", "URL": TOKEN_PROBE_URL, "What": "Is this auth token still alive?"},
         {"Purpose": "token_check", "URL": TOKEN_PROBE_URL, "What": "Admin health check / force revalidate"},
         {"Purpose": "rotate_probe", "URL": config.ROTATE_IP_ECHO_URL, "What": "Which exit IP is rotation giving us?"},
+        {
+            "Purpose": "admin_lookup",
+            "URL": "apis.roblox.com + games.roblox.com (public)",
+            "What": "Identify an experience — only when the proxy path is unavailable",
+        },
     ]
 
 

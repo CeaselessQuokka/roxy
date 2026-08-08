@@ -360,6 +360,15 @@ tarpit_stats = dict(
 
 tarpit_ips = dict()  # ip -> {Count, Skipped, TotalHeld, TotalGap, Gaps, Min, Max, FirstSeen, LastRequestTime}
 
+# Why each hold happened, at rule granularity rather than category granularity.
+# "header_rule" tells you a filter caught something; it does not tell you WHICH
+# filter, and with several armed at once that is the only question worth asking
+# of the row. Keyed "category|reason" and kept as its own top-level store so it
+# inherits the ordinary cap + cross-worker merge rules rather than needing
+# special handling three levels deep inside tarpit_stats.
+#   "category|reason" -> {Category, Reason, Count, Skipped, TotalHeld, FirstSeen, LastRequestTime, LastIP, IPs}
+tarpit_reasons = dict()
+
 # Per-minute tarpit arrivals: {"<epoch_minute>": {"Count": n, "Held": seconds}}.
 tarpit_minutes = dict()
 
@@ -501,6 +510,12 @@ def _caps() -> dict:
         # Newest-first: an exploiter who stopped is less interesting than one
         # still knocking, and a spoofed-IP flood must not push the live one out.
         "tarpit_ips": dict(cap=config.MAX_TARPIT_IP_RECORDS, by="recent", time="LastRequestTime"),
+        "tarpit_reasons": dict(
+            cap=config.MAX_TARPIT_REASON_RECORDS,
+            by="count",
+            time="LastRequestTime",
+            children=(("IPs", config.MAX_IPS_PER_ATTEMPT_RECORD, "value"),),
+        ),
         # `own`, not `children`: retry_counts is a single record ({Total, ByStatusCode,
         # Reasons}), not a map of them, so the caps belong on the store itself.
         # Listing them as `children` looked right and silently did nothing —
@@ -1519,7 +1534,30 @@ def _bump_span(record: dict, seconds: float):
         record["Max"] = seconds
 
 
-def _log_tarpit_event(ip: str, category: str, held: float, gap: float, arrived: float, skipped: bool):
+def _log_tarpit_reason(category: str, reason: str, ip: str, held: float, arrived: float, skipped: bool):
+    """Record WHICH rule caused a hold, not just what kind of rule it was."""
+    reason = (reason or "").strip()[:160]
+    if not reason:
+        return
+    key = f"{category}|{reason}"
+    record = tarpit_reasons.get(key)
+    if record is None:
+        if len(tarpit_reasons) >= config.MAX_TARPIT_REASON_RECORDS:
+            tarpit_reasons.pop(min(tarpit_reasons.items(), key=lambda kv: kv[1].get("Count", 0))[0], None)
+        record = tarpit_reasons[key] = dict(
+            Category=category, Reason=reason, Count=0, Skipped=0, TotalHeld=0.0, FirstSeen=arrived, IPs={}
+        )
+    record["LastRequestTime"] = max(float(record.get("LastRequestTime", 0) or 0), arrived)
+    record["LastIP"] = ip
+    _bump_capped(record.setdefault("IPs", {}), ip, config.MAX_IPS_PER_ATTEMPT_RECORD)
+    if skipped:
+        record["Skipped"] = int(record.get("Skipped", 0) or 0) + 1
+    else:
+        record["Count"] = int(record.get("Count", 0) or 0) + 1
+        record["TotalHeld"] = float(record.get("TotalHeld", 0) or 0) + held
+
+
+def _log_tarpit_event(ip: str, category: str, held: float, gap: float, arrived: float, skipped: bool, reason: str = ""):
     """Record one tarpit-eligible refusal.
 
     `arrived` is when the request LANDED, not when we let go of it — so the
@@ -1530,6 +1568,7 @@ def _log_tarpit_event(ip: str, category: str, held: float, gap: float, arrived: 
     ip = (ip or "unknown")[:64]
     category = (category or "other")[:40]
     with _state_lock:
+        _log_tarpit_reason(category, reason, ip, held, arrived, skipped)
         tarpit_stats["LastRequestTime"] = max(float(tarpit_stats.get("LastRequestTime", 0) or 0), arrived)
         if not tarpit_stats.get("FirstSeen"):
             tarpit_stats["FirstSeen"] = arrived
@@ -1578,18 +1617,18 @@ def _log_tarpit_event(ip: str, category: str, held: float, gap: float, arrived: 
         entry["Held"] = float(entry.get("Held", 0) or 0) + held
 
 
-def log_tarpit(ip: str, category: str, held: float, gap: float, arrived: float):
+def log_tarpit(ip: str, category: str, held: float, gap: float, arrived: float, reason: str = ""):
     """A refusal that was held open for `held` seconds."""
-    _log_tarpit_event(ip, category, held, gap, arrived, skipped=False)
+    _log_tarpit_event(ip, category, held, gap, arrived, skipped=False, reason=reason)
 
 
-def log_tarpit_skipped(ip: str, category: str, gap: float, arrived: float):
+def log_tarpit_skipped(ip: str, category: str, gap: float, arrived: float, reason: str = ""):
     """A refusal that WOULD have been held, but every tarpit slot was taken.
 
     Tracked separately and deliberately: if this number climbs, the limit on the
     tarpit is our own concurrency cap, not the caller's patience.
     """
-    _log_tarpit_event(ip, category, 0.0, gap, arrived, skipped=True)
+    _log_tarpit_event(ip, category, 0.0, gap, arrived, skipped=True, reason=reason)
 
 
 def _tarpit_rate(minutes: int) -> dict:
@@ -2004,6 +2043,7 @@ def get_diagnostics(force_flush: bool = False) -> dict:
                 "ThrottleAllDrops": throttle_drops.get("Count", 0),
                 "TarpitStats": tarpit_stats,
                 "TarpitIps": tarpit_ips,
+                "TarpitReasons": tarpit_reasons,
                 "Errors": errors,
                 "HeaderNames": _summarise_header_names(header_names),
                 "UserAgents": _summarise_user_agents(user_agents),
@@ -2095,6 +2135,7 @@ _PERSISTED_NAMES = (
     "throttle_drops",
     "tarpit_stats",
     "tarpit_ips",
+    "tarpit_reasons",
     "tarpit_minutes",
     "errors",
     "header_names",
@@ -2151,7 +2192,7 @@ CLEAR_TARGETS = {
     "header_blocked_attempts": ("header_blocked_attempts",),
     "pause_drops": ("pause_drops",),
     "throttle_drops": ("throttle_drops",),
-    "tarpit": ("tarpit_stats", "tarpit_ips", "tarpit_minutes"),
+    "tarpit": ("tarpit_stats", "tarpit_ips", "tarpit_reasons", "tarpit_minutes"),
     "live": ("live_requests",),
     "logins": ("login_attempts",),
     "crawls": ("crawls",),

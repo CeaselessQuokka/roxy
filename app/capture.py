@@ -242,7 +242,10 @@ def get_state() -> dict:
     records = _store.read().get("Records")
     records = records if isinstance(records, dict) else {}
     now = time.time()
-    live = [r for r in records.values() if isinstance(r, dict) and (not ttl or now - float(r.get("Date", 0) or 0) <= ttl)]
+    def alive(record):
+        return isinstance(record, dict) and (not ttl or now - float(record.get("Date", 0) or 0) <= ttl)
+
+    live = [r for r in records.values() if alive(r)]
     used = sum(int(r.get("Bytes", 0) or 0) for r in live)
     oldest = min((float(r.get("Date", 0) or 0) for r in live), default=0.0)
     return {

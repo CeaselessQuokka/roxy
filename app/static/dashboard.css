@@ -1844,10 +1844,6 @@ body {
 	}
 }
 
-.kpi-grid--compact {
-	grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-	margin-bottom: var(--pad-3);
-}
 .card--wide {
 	grid-column: 1 / -1;
 }
@@ -1890,4 +1886,17 @@ body {
 }
 .form__field--half {
 	flex: 1 1 120px;
+}
+
+/* A grid item's default minimum size is its CONTENT's minimum, not zero — so a
+   wide table stretches its card past the section instead of scrolling inside
+   .table-wrap, and the whole page picks up a horizontal scrollbar. Sections are
+   grids, so their children need this to be allowed to shrink and let the
+   table-wrap's own overflow do its job. Only bites once a table gets wide
+   enough, which is why it surfaced with the eight-column caller tables. */
+.section > * {
+	min-width: 0;
+}
+.table-wrap {
+	max-width: 100%;
 }

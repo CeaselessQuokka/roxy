@@ -311,10 +311,17 @@ const print = console.log;
 	// Every dashboard request goes through api(): it tags itself as JSON so the
 	// server answers 401 (not a redirect) when the session has died.
 	async function api(path, opts = {}) {
-		const res = await fetch(path, {
-			...opts,
-			headers: { Accept: "application/json", ...(opts.headers || {}) },
-		});
+		// A JSON body needs the JSON content type or Flask's get_json(silent=True)
+		// returns None and the handler sees an EMPTY request — which surfaces as a
+		// confusing validation error ("enter a numeric ID", "missing match text")
+		// about a field the caller did in fact send. Every existing call site set
+		// this by hand; setting it here means a new one cannot forget.
+		const headers = { Accept: "application/json", ...(opts.headers || {}) };
+		const hasContentType = Object.keys(headers).some(k => k.toLowerCase() === "content-type");
+		if (opts.body !== undefined && opts.body !== null && !hasContentType) {
+			headers["Content-Type"] = "application/json";
+		}
+		const res = await fetch(path, { ...opts, headers });
 		if (res.status === 401) {
 			sessionExpired();
 			throw new Error("Session expired");
@@ -2985,6 +2992,7 @@ const print = console.log;
 		if (d.TarpitRates) renderTarpit._rates = d.TarpitRates;
 		const stats = renderTarpit._stats || {};
 		const ips = renderTarpit._ips || {};
+		if (d.TarpitReasons) renderTarpit._reasons = d.TarpitReasons;
 		const rates = renderTarpit._rates || [];
 		const state = d.Tarpit || renderTarpit._state || {};
 		if (d.Tarpit) renderTarpit._state = d.Tarpit;
@@ -3108,6 +3116,37 @@ const print = console.log;
 					]),
 				);
 			}
+		}
+
+		const reasonBody = $("#tarpitReasonsTable tbody");
+		if (reasonBody) {
+			const reasons = Object.values(renderTarpit._reasons || {});
+			reasonBody.innerHTML = "";
+			if (!reasons.length) {
+				reasonBody.appendChild(tr(["No holds recorded yet.", "", "", "", "", "", "", ""]));
+			} else {
+				for (const info of reasons) {
+					const held = Number(info.Count || 0);
+					const wasted = Number(info.TotalHeld || 0);
+					const ips = info.IPs ? Object.keys(info.IPs).length : 0;
+					const cat = document.createElement("span");
+					cat.className = "badge badge--muted";
+					cat.textContent = TARPIT_CATEGORY_LABELS[info.Category] || info.Category || "—";
+					const row = tr([
+						sortable(cat, info.Category || ""),
+						sortable(info.Reason || "—", info.Reason || ""),
+						fmtCount(held),
+						fmtCount(info.Skipped),
+						sortable(fmtSeconds(wasted), wasted),
+						fmtCount(ips),
+						sortable(info.LastIP || "—", info.LastIP || ""),
+						tsNode(info.LastRequestTime),
+					]);
+					row.children[6].className = "mono";
+					reasonBody.appendChild(row);
+				}
+			}
+			sortTable("#tarpitReasonsTable");
 		}
 
 		const ipBody = $("#tarpitIpsTable tbody");
@@ -4644,6 +4683,7 @@ const print = console.log;
 		"#rotateIpsTable",
 		"#storeSizesTable",
 		"#tarpitCategoryTable",
+		"#tarpitReasonsTable",
 		"#tarpitIpsTable",
 	];
 
