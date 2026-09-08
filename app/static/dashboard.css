@@ -1021,6 +1021,10 @@ body {
 }
 .gauge__fill {
 	height: 100%;
+	/* The starting width lives here rather than in a style="" attribute: the
+	   dashboard CSP is style-src 'self', so an inline one is discarded and the
+	   bar starts full-width for the moment before JS sets it. */
+	width: 0;
 	border-radius: 999px;
 	background: linear-gradient(90deg, color-mix(in oklab, var(--color-success) 70%, black 30%), var(--color-success));
 	transition: width var(--dur-med) var(--easing);
@@ -1899,4 +1903,89 @@ body {
 }
 .table-wrap {
 	max-width: 100%;
+}
+
+/* --- Paging long tables ---------------------------------------------------
+   Sits BELOW the table's scroll wrapper rather than inside it, so a wide table
+   scrolling horizontally never carries its own pager off-screen with it. */
+.pager {
+	display: flex;
+	align-items: center;
+	gap: var(--pad-1);
+	flex-wrap: wrap;
+	margin-top: var(--pad-2);
+	padding-top: var(--pad-2);
+	border-top: 1px dashed var(--color-outline);
+}
+.pager[hidden] {
+	display: none;
+}
+.pager__status {
+	color: var(--color-text-muted);
+	font-size: var(--fs-sm);
+	margin-right: auto;
+	font-variant-numeric: tabular-nums;
+}
+.pager__size {
+	margin-left: var(--pad-1);
+}
+.pager__size .select-inline__label {
+	font-size: var(--fs-xs);
+}
+
+/* --- Response cache ------------------------------------------------------- */
+.text-ok {
+	color: var(--color-success);
+	font-weight: 600;
+}
+/* Cache keys are long by nature (host + path + every query parameter). Clamped
+   so one entry can never widen the table past its card; the full key is on the
+   row's title and in the inspector. */
+.cache-key {
+	display: inline-block;
+	max-width: 46ch;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	vertical-align: bottom;
+}
+.cache-inspector {
+	margin-top: var(--pad-3);
+	padding: var(--pad-3);
+	border: 1px solid var(--color-outline-strong);
+	border-radius: var(--radius-sm);
+	background: var(--color-surface1);
+}
+.cache-inspector__head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--pad-2);
+	margin-bottom: var(--pad-2);
+	word-break: break-all;
+}
+.cache-inspector__body {
+	margin: var(--pad-2) 0 0;
+	padding: var(--pad-2);
+	max-height: 340px;
+	overflow: auto;
+	background: var(--color-surface0);
+	border: 1px solid var(--color-outline);
+	border-radius: var(--radius-sm);
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: var(--fs-xs);
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+/* A setting that has been moved off its shipped default. Marked rather than
+   merely listed: with sixty of them, "what have I actually changed here?" is
+   the question asked most often and was previously unanswerable. */
+.setting--changed td:first-child {
+	border-left: 3px solid var(--color-primary);
+	padding-left: calc(var(--pad-2) - 3px);
+}
+.setting__default {
+	margin-left: var(--pad-1);
+	opacity: 0.75;
 }

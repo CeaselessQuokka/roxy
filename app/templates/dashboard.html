@@ -83,6 +83,7 @@
 				<ul class="nav__list">
 					<li><a class="nav__link is-active" href="#section-overview">Overview</a></li>
 					<li><a class="nav__link" href="#section-controls">Service Controls</a></li>
+					<li><a class="nav__link" href="#section-cache">Response Cache</a></li>
 					<li><a class="nav__link" href="#section-traffic">Traffic</a></li>
 					<li><a class="nav__link" href="#section-live">Live Requests</a></li>
 					<li><a class="nav__link" href="#section-callers">Callers &amp; Top Talkers</a></li>
@@ -187,6 +188,19 @@
 							<h3 class="kpi__title">robots.txt Crawls</h3>
 							<div class="kpi__value" id="robots_page_visits">0</div>
 							<div class="kpi__meta">Total crawls to the robots.txt file</div>
+						</article>
+
+						<article
+							class="card kpi"
+							aria-live="polite"
+							title="Requests answered from the response cache — Roblox never received these."
+						>
+							<h3 class="kpi__title">Served From Cache</h3>
+							<div class="kpi__value" id="kpi_cache_saved">0</div>
+							<div class="kpi__meta">
+								Hit rate: <span id="kpi_cache_rate">—</span> •
+								<a href="#section-cache">Response Cache →</a>
+							</div>
 						</article>
 
 						<article class="card kpi" aria-live="polite">
@@ -300,6 +314,350 @@
 								</button>
 							</div>
 						</article>
+					</div>
+				</section>
+
+				<!-- Response cache: the one control that is not keyed on who is asking -->
+				<section id="section-cache" class="section" aria-labelledby="cacheHeading">
+					<div class="section__header">
+						<h2 id="cacheHeading" class="section__title">Response Cache</h2>
+						<div class="section__actions">
+							<span id="cacheStatusChip" class="chip">Off</span>
+							<span id="cacheSavedChip" class="chip chip--muted">0 requests saved</span>
+							<button id="clearCacheStatsBtn" type="button" class="btn btn--outline btn--sm">
+								Clear stats
+							</button>
+						</div>
+					</div>
+
+					<div class="card">
+						<p class="form__hint">
+							When the same request comes in again, answer it from what we already fetched instead of
+							asking Roblox. This is the only control here that is <strong>not keyed on who is
+							asking</strong> — and that is exactly why it works on the traffic the others cannot touch:
+							a Roblox experience polling one endpoint reaches us from hundreds of game-server IPs, so
+							every per-IP limit sees a first-time caller, while Roblox sees one proxy asking the same
+							question hundreds of times and rate-limits us for it.
+						</p>
+						<p class="form__hint">
+							Bodies are held in a small <strong>per-worker memory tier</strong> (fast, and the tier that
+							could run the box out of memory, so it is kept deliberately small) backed by a
+							<strong>sharded disk store</strong> shared by every worker. Both are bounded by entry
+							count, total bytes and age at once. A response larger than the body cap is
+							<em>not cached at all</em> rather than cached truncated.
+						</p>
+					</div>
+
+					<div class="grid grid--kpis">
+						<article class="card kpi" title="Share of cacheable requests answered without touching Roblox.">
+							<h3 class="kpi__title">Hit Rate</h3>
+							<div class="kpi__value" id="cache_hit_rate">—</div>
+							<div class="kpi__meta">
+								Last 5m: <span id="cache_rate_5">—</span> • Last hour: <span id="cache_rate_60">—</span>
+								• Last 24h: <span id="cache_rate_1440">—</span><br />
+								<span id="cache_hit_counts" class="text-dim">—</span>
+							</div>
+						</article>
+						<article
+							class="card kpi"
+							title="Requests Roblox never received because we answered them ourselves."
+						>
+							<h3 class="kpi__title">Requests Roblox Never Saw</h3>
+							<div class="kpi__value" id="cache_saved">0</div>
+							<div class="kpi__meta">
+								Fresh hits: <span id="cache_hits">0</span> • Stale rescues:
+								<span id="cache_stale">0</span> • Collapsed: <span id="cache_coalesced">0</span><br />
+								Bytes served from cache: <span id="cache_bytes_served">0</span>
+							</div>
+						</article>
+						<article class="card kpi" title="What the shared disk store is holding, against its ceilings.">
+							<h3 class="kpi__title">Stored Responses</h3>
+							<div class="kpi__value" id="cache_entries">0</div>
+							<div class="kpi__meta">
+								<span id="cache_bytes">0 B</span> of <span id="cache_max_bytes">0 B</span> •
+								<span id="cache_max_entries">0</span> max<br />
+								Evicted to stay in budget: <span id="cache_evictions">0</span>
+							</div>
+						</article>
+						<article
+							class="card kpi"
+							title="This worker's in-memory tier — multiply by the fleet size for the real resident cost."
+						>
+							<h3 class="kpi__title">Memory Tier</h3>
+							<div class="kpi__value" id="cache_mem_entries">0</div>
+							<div class="kpi__meta">
+								<span id="cache_mem_bytes">0 B</span> of <span id="cache_mem_max">0 B</span> per
+								worker<br />
+								Oldest entry: <span id="cache_window">—</span>
+							</div>
+						</article>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Settings</h3>
+						<div class="form__row">
+							<label class="switch">
+								<input type="checkbox" id="cacheEnabled" />
+								<span class="switch__label">Caching enabled</span>
+							</label>
+							<label class="switch">
+								<input type="checkbox" id="cacheDiskEnabled" />
+								<span class="switch__label">Keep a shared disk copy</span>
+							</label>
+						</div>
+						<form id="cacheForm" class="form">
+							<div class="form__row">
+								<div class="form__field">
+									<label class="form__label" for="cacheTtl">Default TTL (s)</label>
+									<input id="cacheTtl" class="input" type="number" min="0" max="86400" />
+								</div>
+								<div class="form__field">
+									<label class="form__label" for="cacheStale">Serve stale for (s)</label>
+									<input id="cacheStale" class="input" type="number" min="0" max="86400" />
+								</div>
+								<div class="form__field">
+									<label class="form__label" for="cacheErrorTtl">Cache 404/403 for (s)</label>
+									<input id="cacheErrorTtl" class="input" type="number" min="0" max="3600" />
+								</div>
+								<div class="form__field">
+									<label class="form__label" for="cacheMaxBody">Max body cached (bytes)</label>
+									<input id="cacheMaxBody" class="input" type="number" min="0" />
+								</div>
+							</div>
+							<div class="form__row">
+								<div class="form__field">
+									<label class="form__label" for="cacheMaxEntries">Disk: max entries</label>
+									<input id="cacheMaxEntries" class="input" type="number" min="0" />
+								</div>
+								<div class="form__field">
+									<label class="form__label" for="cacheMaxBytes">Disk: max bytes</label>
+									<input id="cacheMaxBytes" class="input" type="number" min="0" />
+								</div>
+								<div class="form__field">
+									<label class="form__label" for="cacheMemEntries">Memory: max entries</label>
+									<input id="cacheMemEntries" class="input" type="number" min="0" />
+								</div>
+								<div class="form__field">
+									<label class="form__label" for="cacheMemBytes">Memory: max bytes</label>
+									<input id="cacheMemBytes" class="input" type="number" min="0" />
+								</div>
+								<div class="spacer"></div>
+								<button type="submit" class="btn btn--filled">Save</button>
+							</div>
+							<p class="form__hint">
+								<strong>Serve stale</strong> is the setting that matters most while Roblox is
+								rate-limiting you: past its TTL an entry is still handed to callers when the upstream
+								request fails, so their number goes slightly out of date instead of turning into an
+								error. The memory ceilings are <strong>per worker</strong> — four workers means four
+								copies, so multiply before sizing them against the box's RAM.
+							</p>
+						</form>
+						<h3 class="card__title">Behaviour</h3>
+						<div class="tarpit-cats">
+							<label class="tarpit-cat">
+								<input type="checkbox" class="cache-opt" data-setting="cache_serve_throttled" />
+								<span class="tarpit-cat__text">
+									<strong>Answer throttled callers from cache</strong>
+									<span class="text-dim"
+										>They keep working and Roblox still never sees it. Off by default: it does
+										weaken a limit you set on purpose.</span
+									>
+								</span>
+							</label>
+							<label class="tarpit-cat">
+								<input type="checkbox" class="cache-opt" data-setting="cache_coalesce" />
+								<span class="tarpit-cat__text">
+									<strong>Collapse simultaneous identical requests</strong>
+									<span class="text-dim"
+										>One upstream call, everyone else waits for its answer — otherwise a cold cache
+										produces the very burst it exists to prevent.</span
+									>
+								</span>
+							</label>
+							<label class="tarpit-cat">
+								<input type="checkbox" class="cache-opt" data-setting="cache_post_requests" />
+								<span class="tarpit-cat__text">
+									<strong>Also cache POST requests</strong>
+									<span class="text-dim"
+										>⚠ Keyed on the body. Roblox uses some POSTs as batch lookups; caching one that
+										is a real write would replay a stale answer.</span
+									>
+								</span>
+							</label>
+							<label class="tarpit-cat">
+								<input type="checkbox" class="cache-opt" data-setting="cache_respect_no_cache" />
+								<span class="tarpit-cat__text">
+									<strong>Honour Cache-Control from the caller</strong>
+									<span class="text-dim"
+										>⚠ Hands whoever is flooding you a one-header way straight back to
+										Roblox.</span
+									>
+								</span>
+							</label>
+						</div>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Per-Endpoint Rules</h3>
+						<p class="form__hint">
+							Override the default TTL for one endpoint. Most specific pattern wins, exactly like the
+							block and rate rules — so a broad <code>games.roblox.com</code> rule can set a house
+							default and one concrete path can still opt out of it. A TTL of
+							<strong>0 means never cache this endpoint</strong>, which is how you exclude something
+							without turning the whole cache off.
+						</p>
+						<form id="cacheRuleForm" class="form">
+							<div class="form__row">
+								<input
+									id="cacheRulePattern"
+									class="input"
+									type="text"
+									placeholder="e.g. games.roblox.com/v1/games/votes"
+									required
+								/>
+								<input
+									id="cacheRuleTtl"
+									class="input input--w130"
+									type="number"
+									min="0"
+									max="86400"
+									value="300"
+									aria-label="TTL in seconds"
+								/>
+								<select
+									id="cacheRuleType"
+									class="input input--select input--w120"
+									aria-label="Match type"
+								>
+									<option value="glob">Wildcard</option>
+									<option value="regex">Regex</option>
+								</select>
+								<input id="cacheRuleNote" class="input" type="text" placeholder="Note (optional)" />
+								<button type="submit" class="btn btn--filled">Add rule</button>
+							</div>
+						</form>
+						<div class="table-wrap">
+							<table id="cacheRulesTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col" data-sort="pattern" data-sort-type="text">Pattern</th>
+										<th scope="col" data-sort="type" data-sort-type="text">Type</th>
+										<th scope="col" data-sort="ttl" data-sort-type="num" data-sort-default="desc">
+											TTL
+										</th>
+										<th scope="col" data-sort="note" data-sort-type="text">Note</th>
+										<th scope="col" data-sort="added" data-sort-type="num">Added</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Cached Responses</h3>
+						<p class="form__hint">
+							Everything currently held, newest hits first. Loaded on demand and paged on the server —
+							these entries carry response bodies, so shipping them all here to render twenty rows would
+							move megabytes every few seconds. A body is only fetched when you open one.
+						</p>
+						<div class="form__row">
+							<input
+								id="cacheSearch"
+								class="input input--filter"
+								type="search"
+								placeholder="Search cached keys, e.g. votes or universeIds=99675…"
+								aria-label="Search the cache"
+							/>
+							<select
+								id="cacheSort"
+								class="input input--select input--w170"
+								aria-label="Sort cache entries"
+							>
+								<option value="hits">Most hits</option>
+								<option value="stored">Newest first</option>
+								<option value="expires">Expiring soonest</option>
+								<option value="bytes">Largest first</option>
+								<option value="key">Key (A–Z)</option>
+							</select>
+							<select
+								id="cachePageSize"
+								class="input input--select input--w110"
+								aria-label="Entries per page"
+							>
+								<option value="10">10</option>
+								<option value="25" selected>25</option>
+								<option value="50">50</option>
+								<option value="100">100</option>
+							</select>
+							<button id="cacheRefreshBtn" type="button" class="btn btn--outline">⟳ Refresh</button>
+							<div class="spacer"></div>
+							<button id="cachePurgeMatchBtn" type="button" class="btn btn--outline" hidden>
+								Purge matching
+							</button>
+							<button id="cachePurgeExpiredBtn" type="button" class="btn btn--outline">
+								Purge expired
+							</button>
+							<button id="cachePurgeAllBtn" type="button" class="btn btn--warning">Purge all</button>
+						</div>
+						<div class="table-wrap">
+							<table id="cacheEntriesTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Key</th>
+										<th scope="col">Size</th>
+										<th scope="col">Hits</th>
+										<th scope="col">Age</th>
+										<th scope="col">Expires</th>
+										<th scope="col">Rule</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
+						<div class="pager">
+							<span class="pager__status" id="cachePageStatus">Not loaded yet</span>
+							<button id="cachePrevBtn" type="button" class="btn btn--outline btn--sm">Previous</button>
+							<button id="cacheNextBtn" type="button" class="btn btn--outline btn--sm">Next</button>
+						</div>
+						<div id="cacheInspector" hidden></div>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Where The Cache Is Working</h3>
+						<p class="form__hint">
+							Per endpoint. A row with thousands of misses and no hits is the interesting one: it means
+							the caller is varying its query every time, and it is a rule — or a block — worth writing.
+						</p>
+						<input
+							id="cacheEndpointFilter"
+							class="input input--filter"
+							type="search"
+							placeholder="Filter endpoints…"
+							aria-label="Filter cached endpoints"
+						/>
+						<div class="table-wrap">
+							<table id="cacheEndpointsTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col" data-sort="endpoint" data-sort-type="text">Endpoint</th>
+										<th scope="col" data-sort="hits" data-sort-type="num" data-sort-default="desc">
+											Hits
+										</th>
+										<th scope="col" data-sort="misses" data-sort-type="num">Misses</th>
+										<th scope="col" data-sort="rate" data-sort-type="num">Hit Rate</th>
+										<th scope="col" data-sort="stale" data-sort-type="num">Stale Rescues</th>
+										<th scope="col" data-sort="skipped" data-sort-type="num">Not Cached</th>
+										<th scope="col" data-sort="bytes" data-sort-type="num">Served</th>
+										<th scope="col" data-sort="last" data-sort-type="num">Last Hit</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
 					</div>
 				</section>
 
@@ -2049,6 +2407,7 @@
 					<div class="section__header">
 						<h2 id="settingsHeading" class="section__title">Runtime Settings</h2>
 						<div class="section__actions">
+							<span id="settingsChangedChip" class="chip chip--muted">0 changed from default</span>
 							<button id="reloadSettings" class="btn btn--outline">Reload</button>
 						</div>
 					</div>
@@ -2057,6 +2416,19 @@
 							These values are what the server's internals are actually using right now. Changes apply
 							immediately (no restart) and persist to disk. "Updated" shows when each was last changed.
 						</p>
+						<div class="form__row">
+							<input
+								id="settingsFilter"
+								class="input input--filter"
+								type="search"
+								placeholder="Find a setting — try cache, tarpit, throttle…"
+								aria-label="Filter settings"
+							/>
+							<label class="switch">
+								<input type="checkbox" id="settingsChangedOnly" />
+								<span class="switch__label">Only what I have changed</span>
+							</label>
+						</div>
 						<form id="settingsForm" class="form">
 							<div class="table-wrap">
 								<table id="settingsTable" class="table">
@@ -2067,6 +2439,7 @@
 											<th scope="col">New Value</th>
 											<th scope="col">Range</th>
 											<th scope="col">Updated</th>
+											<th scope="col"></th>
 										</tr>
 									</thead>
 									<tbody>
@@ -2155,7 +2528,7 @@
 							<h3 class="kpi__title">Token Safety Budget</h3>
 							<div class="kpi__value" id="budget_value">— / —</div>
 							<div class="gauge">
-								<div id="budget_gauge" class="gauge__fill" style="width: 0%"></div>
+								<div id="budget_gauge" class="gauge__fill"></div>
 							</div>
 							<div class="kpi__meta">
 								Window: <span id="budget_window">—</span>s • Resets in:
@@ -2175,7 +2548,7 @@
 								     something new is growing without a limit. -->
 								Stats file: <span id="persist_size">—</span>
 								<div class="gauge" aria-hidden="true">
-									<div class="gauge__fill" id="persist_gauge" style="width: 1%"></div>
+									<div class="gauge__fill" id="persist_gauge"></div>
 								</div>
 								<span id="persist_file" class="persist-file">—</span>
 								<span id="persist_error" class="persist-error"></span>

@@ -250,7 +250,11 @@ status_codes_detailed = dict()
 #   Internal  - upstream statuses from Roxy's OWN calls (token validation, the
 #               rotation probe). Real traffic to Roblox, but not on behalf of a
 #               caller, so it must not be mistaken for user-serving load.
-STATUS_SOURCES = ("Roblox", "Roxy", "Relay", "Internal")
+#   Cache     - answers served from the response cache. Its own bucket because
+#               these are the requests Roblox NEVER SAW: folding them into Relay
+#               would make the cache invisible in exactly the table where "how
+#               much of our traffic still reaches Roblox?" is asked.
+STATUS_SOURCES = ("Roblox", "Roxy", "Relay", "Internal", "Cache")
 status_sources = dict({name: dict() for name in STATUS_SOURCES})
 
 # Every refusal Roxy issues, keyed by the RULE that produced it rather than by
@@ -317,6 +321,49 @@ live_requests = list()
 # Proxied requests per minute bucket: {"<epoch_minute>": {"Successful": n, "Failed": n}}.
 # Keys are strings because the JSON persistence round-trip stringifies them anyway.
 traffic_minutes = dict()
+
+# --- Response cache ----------------------------------------------------------
+# What the cache is doing FOR us, as opposed to what it is holding (that lives
+# in cache.py's own files). Kept here so it merges across workers and clears
+# with everything else: a hit rate measured on one of four workers is a quarter
+# of an answer.
+#   Hits      - answered from a fresh cached entry.
+#   Stale     - answered from an EXPIRED entry because the upstream failed. The
+#               number that says how often the cache saved a visible outage.
+#   Misses    - had to ask Roblox.
+#   Stores    - responses written into the cache.
+#   Coalesced - collapsed into another thread's in-flight fetch of the same key.
+#   Skipped   - cacheable-looking requests a rule or a size cap declined to cache.
+#   Evictions - entries dropped to stay inside the ceilings; rising means the
+#               cache is too small for the traffic, which is worth seeing.
+#   Saved     - upstream requests Roblox never received (Hits + Stale + Coalesced).
+cache_stats = dict(
+    {
+        "Hits": 0,
+        "Stale": 0,
+        "Misses": 0,
+        "Stores": 0,
+        "Coalesced": 0,
+        "Skipped": 0,
+        "Evictions": 0,
+        "Bypassed": 0,
+        "BytesServed": 0,
+        "LastHit": 0,
+        "LastMiss": 0,
+    }
+)
+
+# Per-endpoint-template cache effectiveness, so "which endpoint is the cache
+# actually saving me on?" is answerable — and so is its opposite, an endpoint
+# with thousands of misses and no hits, which is a caller varying its query and
+# a rule worth writing.
+#   template -> {Hits, Stale, Misses, Stores, Skipped, Bytes, LastHit, LastSeen}
+cache_endpoints = dict()
+
+# Per-minute hit/miss buckets, for the hit-rate trend. Age-pruned like the other
+# minute stores: a lifetime hit rate cannot show that a rule you just added is
+# working, and that is the only question anyone asks of it.
+cache_minutes = dict()
 
 # Requests refused because the internal token hit its safety budget.
 token_budget = dict({"Rejections": 0})
@@ -469,6 +516,7 @@ def _caps() -> dict:
             children=activity_children + (("IPs", per_endpoint, "value"),),
             minutes=(("Minutes", config.ACTIVITY_HISTORY_MINUTES),),
         ),
+        "cache_endpoints": dict(cap=endpoint_cap, by="count", time="LastSeen"),
         "crawls": dict(cap=_cap("max_crawl_records", config.MAX_CRAWL_RECORDS), by="recent", time="LastRequestTime"),
         "throttled_ips": dict(
             cap=_cap("max_throttle_records", config.MAX_THROTTLE_RECORDS), by="recent", time="LastThrottleTime"
@@ -534,6 +582,7 @@ def _caps() -> dict:
 # Minute-bucketed stores are bounded by age rather than by rank.
 _MINUTE_STORES = {
     "traffic_minutes": lambda: config.TRAFFIC_HISTORY_MINUTES,
+    "cache_minutes": lambda: config.CACHE_HISTORY_MINUTES,
     "token_budget_minutes": lambda: config.MAX_BUDGET_MINUTES,
     "tarpit_minutes": lambda: config.TARPIT_HISTORY_MINUTES,
 }
@@ -1120,6 +1169,85 @@ def log_internal_request(purpose: str, ok: bool, status="", duration: float = 0.
             record["Failed"] = record.get("Failed", 0) + 1
             record["LastErrorAt"] = now
             record["LastError"] = str(error or status)[:200]
+
+
+# --- Response cache ----------------------------------------------------------
+# Every cache decision is counted three ways at once: globally (is the cache
+# working?), per endpoint (where is it working?) and per minute (is it working
+# NOW?). One call site does all three so a new outcome cannot be added to one
+# view and quietly missing from the other two.
+CACHE_EVENTS = ("Hits", "Stale", "Misses", "Stores", "Coalesced", "Skipped", "Bypassed")
+
+# Which of those meant Roblox never received a request. Kept as a named set
+# rather than inferred, because "saved" is the headline number and it should be
+# impossible to change the event list without deciding what it does to it.
+CACHE_SAVING_EVENTS = ("Hits", "Stale", "Coalesced")
+
+
+def log_cache_event(event: str, path: str = "", body_bytes: int = 0):
+    """Record one cache decision. `event` is one of CACHE_EVENTS."""
+    if event not in CACHE_EVENTS:
+        return
+    now = time.time()
+    minute = str(int(now // 60))
+    template = _templatize(path) if path else ""
+    with _state_lock:
+        cache_stats[event] = int(cache_stats.get(event, 0) or 0) + 1
+        if event in CACHE_SAVING_EVENTS:
+            cache_stats["BytesServed"] = int(cache_stats.get("BytesServed", 0) or 0) + max(0, int(body_bytes or 0))
+            cache_stats["LastHit"] = now
+        elif event == "Misses":
+            cache_stats["LastMiss"] = now
+        bucket = cache_minutes.setdefault(minute, {"Hits": 0, "Misses": 0})
+        if event in CACHE_SAVING_EVENTS:
+            bucket["Hits"] = int(bucket.get("Hits", 0) or 0) + 1
+        elif event == "Misses":
+            bucket["Misses"] = int(bucket.get("Misses", 0) or 0) + 1
+        _prune_minute_store(cache_minutes, config.CACHE_HISTORY_MINUTES)
+        if not template:
+            return
+        record = cache_endpoints.setdefault(
+            template,
+            {"Hits": 0, "Stale": 0, "Misses": 0, "Stores": 0, "Skipped": 0, "Bytes": 0, "LastHit": 0, "LastSeen": 0},
+        )
+        record[event] = int(record.get(event, 0) or 0) + 1
+        record["LastSeen"] = now
+        # Count is what the generic cap ranks records by, so an endpoint that is
+        # busy in the cache survives trimming for the same reason a busy endpoint
+        # does anywhere else here.
+        record["Count"] = int(record.get("Count", 0) or 0) + 1
+        if event in CACHE_SAVING_EVENTS:
+            record["LastHit"] = now
+            record["Bytes"] = int(record.get("Bytes", 0) or 0) + max(0, int(body_bytes or 0))
+        _trim_store(cache_endpoints, _cap("max_endpoint_records", config.MAX_ENDPOINT_RECORDS), "count", "LastSeen")
+
+
+def log_cache_evictions(count: int):
+    """Entries the cache dropped to stay inside its ceilings. Rising steadily
+    means the cache is too small for the traffic — which is a tuning signal, not
+    an error, and is only visible if it is counted."""
+    if count <= 0:
+        return
+    with _state_lock:
+        cache_stats["Evictions"] = int(cache_stats.get("Evictions", 0) or 0) + int(count)
+
+
+def cache_rate(minutes: int) -> dict:
+    """Hits/misses over the last N minutes, plus the hit rate.
+
+    A lifetime hit rate cannot answer "is the rule I just added working?" — the
+    denominator is every request since the counters were cleared. This can.
+    """
+    now = int(time.time() // 60)
+    hits = misses = 0
+    with _state_lock:
+        for offset in range(minutes):
+            bucket = cache_minutes.get(str(now - offset))
+            if isinstance(bucket, dict):
+                hits += int(bucket.get("Hits", 0) or 0)
+                misses += int(bucket.get("Misses", 0) or 0)
+    total = hits + misses
+    return {"Minutes": minutes, "Hits": hits, "Misses": misses, "Rate": (hits / total) if total else 0.0}
 
 
 def log_budget_rejection():
@@ -2036,6 +2164,13 @@ def get_diagnostics(force_flush: bool = False) -> dict:
                 "LiveRequests": list(reversed(live_requests)),  # Most-recent first.
                 "Tokens": _tokens_view(),
                 "TrafficMinutes": traffic_minutes,
+                "CacheStats": cache_stats,
+                "CacheEndpoints": cache_endpoints,
+                "CacheMinutes": cache_minutes,
+                # The hit rate over three windows. The lifetime figure alone
+                # cannot show that a TTL change just took effect, which is the
+                # only reason anyone looks at a hit rate while tuning one.
+                "CacheRates": [cache_rate(5), cache_rate(60), cache_rate(1440)],
                 "TokenBudgetRejections": token_budget.get("Rejections", 0),
                 "BudgetPeak1h": _budget_peak_since(60),
                 "BudgetPeak24h": _budget_peak_since(1440),
@@ -2131,6 +2266,9 @@ _PERSISTED_NAMES = (
     "traffic_minutes",
     "token_budget",
     "token_budget_minutes",
+    "cache_stats",
+    "cache_endpoints",
+    "cache_minutes",
     "pause_drops",
     "throttle_drops",
     "tarpit_stats",
@@ -2193,6 +2331,7 @@ CLEAR_TARGETS = {
     "pause_drops": ("pause_drops",),
     "throttle_drops": ("throttle_drops",),
     "tarpit": ("tarpit_stats", "tarpit_ips", "tarpit_reasons", "tarpit_minutes"),
+    "cache": ("cache_stats", "cache_endpoints", "cache_minutes"),
     "live": ("live_requests",),
     "logins": ("login_attempts",),
     "crawls": ("crawls",),

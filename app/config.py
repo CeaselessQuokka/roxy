@@ -103,9 +103,41 @@ WORKERS_FILE = os.environ.get("ROXY_WORKERS_FILE", "/etc/roxy/roxy_workers.json"
 # Keeping it separate means it is bounded by its own byte budget + TTL, can be
 # dropped at any moment, and can never contribute to the stats file growing.
 CAPTURE_FILE = os.environ.get("ROXY_CAPTURE_FILE", "/etc/roxy/roxy_capture.json")
+# Cached upstream responses (see cache.py). A DIRECTORY rather than a file:
+# the store is split into CACHE_SHARDS files so one lookup parses a sixteenth of
+# it and one store rewrites a sixteenth of it. A single file would have to be
+# read whole to answer one request, which would cost more memory than the cache
+# saves — the exact failure this feature exists to avoid.
+CACHE_DIR = os.environ.get("ROXY_CACHE_DIR", "/etc/roxy/cache")
 # Hard cap on distinct IPs tracked in the throttle file so a spoofed-IP flood
 # can't bloat it; the oldest (least-recently-seen) entry is evicted past this.
 MAX_TRACKED_THROTTLE_IPS = 20000
+
+# --- Response cache ----------------------------------------------------------
+# The answer to a caller that asks the same question hundreds of times: serve it
+# from what we already have instead of asking Roblox again. Every number here is
+# a live setting (cache_*) — these are only the defaults a fresh install boots
+# with. See cache.py for why the store is sharded and bounded three ways.
+CACHE_SHARDS = 16  # Files the disk tier is split across. Changing this orphans existing shards.
+CACHE_TTL_SECONDS = 60  # Default lifetime of a cached response; per-endpoint rules override it.
+CACHE_ERROR_TTL_SECONDS = 0  # Lifetime for cacheable upstream errors (404/403/400/410). 0 = don't cache them.
+CACHE_MAX_ENTRIES = 3000  # Entries the disk tier may hold in total.
+CACHE_MAX_BYTES = 32 * 1024 * 1024  # Total disk budget; oldest entries evicted past it.
+CACHE_MAX_BODY = 256 * 1024  # A response larger than this is NOT cached (never truncated — see cache.store).
+# The memory tier is per WORKER, so its ceiling is multiplied by the fleet size
+# (4 x 8 MB = 32 MB resident worst case). Kept deliberately small: this is the
+# only tier that can put the box under memory pressure.
+CACHE_MEMORY_ENTRIES = 400
+CACHE_MEMORY_BYTES = 8 * 1024 * 1024
+# How long past expiry an entry may still be served when the upstream FAILS.
+# This is what turns "Roblox rate-limited us" from an outage the caller sees
+# into a slightly stale number they don't.
+CACHE_STALE_SECONDS = 600
+CACHE_COALESCE_WAIT_MS = 1500  # How long a second caller waits for an in-flight fetch of the same key.
+CACHE_PAGE_MAX = 200  # Ceiling on one page of the dashboard's cache browser.
+MAX_CACHE_RULES = 200  # Distinct per-endpoint cache rules (pattern -> TTL) retained.
+DEFAULT_CACHE_RULE_TTL = 300  # Default TTL offered when adding a rule from the dashboard.
+CACHE_HISTORY_MINUTES = 180  # Per-minute hit/miss buckets retained, for the hit-rate trend.
 
 # --- Upstream method routing (Token / Rotate) ---
 # A request picks one method by weighted random among those currently available.

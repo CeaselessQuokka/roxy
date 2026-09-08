@@ -97,6 +97,14 @@ _endpoint_blocks = dict()  # pattern -> {"Added": ts, "Note": str}
 # --- Per-endpoint per-IP rate rules -----------------------------------------
 _endpoint_rules = dict()  # pattern -> {"Limit": int, "Period": int, "Added": ts}
 
+# --- Per-endpoint cache rules -----------------------------------------------
+# How long a given endpoint's response may be reused, overriding the default
+# cache TTL. A rule of 0 means "never cache this", which is the only way to
+# exclude one endpoint without turning the whole cache off — so the rules list
+# is both the allow-longer and the deny list.
+# pattern -> {"TTL": int, "Type": glob|regex, "Note": str, "Added": ts}
+_cache_rules = dict()
+
 # --- Header block rules -----------------------------------------------------
 # Deny a request outright based on its headers (e.g. exploit fingerprints like
 # "Xeno"). id -> {"Scope": key|value|either, "Mode": contains|exact,
@@ -160,6 +168,49 @@ _settings = {
     "capture_max_bytes": _setting(config.CAPTURE_MAX_BYTES, 0, 64 * 1024 * 1024, "int"),
     "capture_max_body": _setting(config.CAPTURE_MAX_BODY, 0, 512 * 1024, "int"),
     "capture_ttl_seconds": _setting(config.CAPTURE_TTL_SECONDS, 0, 86400, "int"),
+    # --- Response cache -----------------------------------------------------
+    # Serve a repeat request from what we already fetched instead of asking
+    # Roblox again. The single most effective control against a caller polling
+    # one endpoint from hundreds of game-server IPs, because it is the only one
+    # that is not keyed on the caller's identity. See cache.py.
+    "cache_enabled": _setting(1, 0, 1, "int"),
+    # Default lifetime. A per-endpoint cache rule overrides it, including a rule
+    # of 0 seconds, which is how one endpoint is excluded from caching.
+    "cache_ttl_seconds": _setting(config.CACHE_TTL_SECONDS, 0, 86400, "int"),
+    # Cacheable upstream ERRORS (404/403/400/410). 0 = never. Worth raising when
+    # something is hammering a path Roblox answers 404 to: the answer is stable
+    # and re-asking for it costs exactly as much as re-asking for a real one.
+    "cache_error_ttl_seconds": _setting(config.CACHE_ERROR_TTL_SECONDS, 0, 3600, "int"),
+    # The disk tier's ceilings (shared by every worker).
+    "cache_disk_enabled": _setting(1, 0, 1, "int"),
+    "cache_max_entries": _setting(config.CACHE_MAX_ENTRIES, 0, 100000, "int"),
+    "cache_max_bytes": _setting(config.CACHE_MAX_BYTES, 0, 512 * 1024 * 1024, "int"),
+    # Responses bigger than this are not cached at all. They are never stored
+    # truncated: half a JSON body served as if whole is worse than no cache.
+    "cache_max_body": _setting(config.CACHE_MAX_BODY, 0, 4 * 1024 * 1024, "int"),
+    # The memory tier is PER WORKER, so multiply these by the fleet size when
+    # sizing them against the box's RAM. This is the tier that can OOM us.
+    "cache_memory_entries": _setting(config.CACHE_MEMORY_ENTRIES, 0, 20000, "int"),
+    "cache_memory_bytes": _setting(config.CACHE_MEMORY_BYTES, 0, 128 * 1024 * 1024, "int"),
+    # How long past expiry an entry may still answer a caller when the upstream
+    # request FAILED. Turns a Roblox rate-limit into a slightly stale number
+    # instead of an error the caller sees. 0 = never serve stale.
+    "cache_stale_seconds": _setting(config.CACHE_STALE_SECONDS, 0, 86400, "int"),
+    # Answer a rate-limited caller from the cache instead of 429ing them. Off by
+    # default because it weakens a limit the admin set deliberately; on, it is
+    # the kindest possible throttle — the flooding game keeps working and Roblox
+    # still never sees the traffic.
+    "cache_serve_throttled": _setting(0, 0, 1, "int"),
+    # Collapse concurrent requests for one uncached key into a single upstream
+    # call, instead of letting a cold cache produce the very burst it prevents.
+    "cache_coalesce": _setting(1, 0, 1, "int"),
+    "cache_coalesce_wait_ms": _setting(config.CACHE_COALESCE_WAIT_MS, 0, 10000, "int"),
+    # Also cache POST (keyed on a hash of the body). Off by default: a POST is a
+    # write by convention, and Roblox's batch-lookup POSTs are the exception.
+    "cache_post_requests": _setting(0, 0, 1, "int"),
+    # Honour Cache-Control: no-cache from the CALLER. Off by default — it hands
+    # whoever is flooding us a one-header way straight back to Roblox.
+    "cache_respect_no_cache": _setting(0, 0, 1, "int"),
     # Automatically stop enumerating a header's values once it proves to be
     # unique-per-request (see config.AUTO_IGNORE_*). 1 = on.
     "auto_ignore_high_cardinality": _setting(1, 0, 1, "int"),
@@ -331,6 +382,9 @@ def _restore_from(data: dict):
     rules = data.get("EndpointRules", {})
     if isinstance(rules, dict):
         replace_in_place(_endpoint_rules, {str(k): dict(v) for k, v in rules.items() if isinstance(v, dict)})
+    cache_rules = data.get("CacheRules", {})
+    if isinstance(cache_rules, dict):
+        replace_in_place(_cache_rules, {str(k): dict(v) for k, v in cache_rules.items() if isinstance(v, dict)})
     header_rules = data.get("HeaderRules", {})
     if isinstance(header_rules, dict):
         replace_in_place(_header_rules, {str(k): dict(v) for k, v in header_rules.items() if isinstance(v, dict)})
@@ -713,6 +767,82 @@ def match_endpoint_rule(path: str):
                 best["Pattern"] = pattern
                 best_score = score
     return best
+
+
+# --- Per-endpoint cache rules -----------------------------------------------
+def get_cache_rules() -> dict:
+    _maybe_reload()
+    return {k: dict(v) for k, v in _cache_rules.items()}
+
+
+def set_cache_rule(pattern: str, ttl, kind: str = "glob", note: str = "") -> tuple[bool, str]:
+    """Set how long one endpoint's responses may be cached.
+
+    A TTL of 0 is meaningful and supported: it is how a single endpoint is
+    excluded from caching while the cache stays on everywhere else. That is why
+    this validates against >= 0 rather than >= 1 like the rate rules do.
+    """
+    kind = "regex" if kind == "regex" else "glob"
+    pattern = normalize_pattern(pattern, kind)
+    if not pattern:
+        return False, "Empty endpoint pattern"
+    if kind == "regex" and not valid_regex(pattern):
+        return False, "Invalid regular expression"
+    try:
+        ttl = int(ttl)
+    except (TypeError, ValueError):
+        return False, "TTL must be a whole number of seconds"
+    if ttl < 0 or ttl > 86400:
+        return False, "TTL must be between 0 and 86400 seconds"
+    if pattern not in _cache_rules and len(_cache_rules) >= config.MAX_CACHE_RULES:
+        return False, "Too many cache rules"
+
+    def change():
+        _cache_rules[pattern] = {"TTL": ttl, "Type": kind, "Note": str(note)[:200], "Added": time.time()}
+
+    _persist_change(change)
+    return True, "Success"
+
+
+def clear_cache_rule(pattern: str) -> tuple[bool, str]:
+    candidates = {(pattern or "").strip(), _norm(pattern), _norm_regex(pattern)}
+
+    def change():
+        for key in candidates:
+            _cache_rules.pop(key, None)
+
+    _persist_change(change)
+    return True, "Success"
+
+
+def match_cache_rule(path: str):
+    """The most specific cache rule matching a path (with its "Pattern"), or None.
+
+    Same "most specific wins" ordering as the block and rate rules, so a broad
+    `games.roblox.com` rule can set a house default and one concrete path can
+    still opt out of it.
+    """
+    _maybe_reload()
+    if not _cache_rules:
+        return None
+    p = _norm(path)
+    best = None
+    best_score = None
+    for pattern, rule in _cache_rules.items():
+        kind = rule.get("Type", "glob")
+        if _matches(pattern, p, kind):
+            score = _specificity(pattern, kind)
+            if best_score is None or score > best_score:
+                best = dict(rule, Pattern=pattern)
+                best_score = score
+    return best
+
+
+def path_matches(pattern: str, path: str, kind: str = "glob") -> bool:
+    """Public form of the endpoint-pattern matcher, so other modules (cache
+    purges) can reuse the exact glob/regex semantics the rules are written in
+    rather than approximating them with a second implementation."""
+    return _matches(pattern, _norm(path) if kind != "regex" else _norm_regex(path), kind)
 
 
 # --- Headers whose values are not enumerated --------------------------------
@@ -1126,6 +1256,7 @@ def _serialize_unlocked() -> dict:
         "ThrottleBypassIps": {k: dict(v) for k, v in _throttle_bypass_ips.items()},
         "EndpointBlocks": {k: dict(v) for k, v in _endpoint_blocks.items()},
         "EndpointRules": {k: dict(v) for k, v in _endpoint_rules.items()},
+        "CacheRules": {k: dict(v) for k, v in _cache_rules.items()},
         "HeaderRules": {k: dict(v) for k, v in _header_rules.items()},
         "IgnoredValueHeaders": {k: dict(v) for k, v in _ignored_value_headers.items()},
         "InvalidationTokens": dict(_invalidation_tokens),

@@ -2,6 +2,7 @@ import logging
 import logging.handlers
 
 import auth
+import cache
 import capture
 import challenge
 import config
@@ -414,6 +415,8 @@ def admin_diagnostics():
     }
     data["Persistence"] = storage.get_status()
     data["Capture"] = capture.get_state()
+    data["Cache"] = cache.get_state()
+    data["CacheRules"] = runtime.get_cache_rules()
     data["InternalEndpoints"] = proxy.internal_endpoints()
     data["IgnoredValueHeaders"] = runtime.get_ignored_value_headers()
     data["TrustedDevices"] = runtime.get_trusted_device_count()
@@ -623,6 +626,147 @@ def admin_clear_captures():
     capture.reset()
     diagnostics.clear_stats(diagnostics.CLEAR_TARGETS["live"])
     return jsonify({"Message": "Live feed and captured bodies cleared"}), 200
+
+
+# --- Response cache -----------------------------------------------------------
+# The cache browser is served from its own endpoints rather than from the
+# diagnostics poll, for one reason: entries carry BODIES. Folding them into the
+# poll would move megabytes every few seconds to render twenty rows, so the
+# listing is paged server-side and a body is only fetched when the admin opens
+# one.
+@app.route("/admin/cache/entries", methods=["GET"], endpoint="admin_cache_entries")
+@requires_admin
+def admin_cache_entries():
+    args = request.args
+    try:
+        offset = int(args.get("offset", 0))
+        limit = int(args.get("limit", 25))
+    except (TypeError, ValueError):
+        return jsonify("Offset and limit must be whole numbers"), 400
+    page = cache.list_entries(
+        query=args.get("q", ""),
+        offset=offset,
+        limit=limit,
+        sort=args.get("sort", "hits"),
+        order=args.get("order", "desc"),
+    )
+    page["State"] = cache.get_state()
+    return jsonify(page), 200
+
+
+@app.route("/admin/cache/entry", methods=["GET"], endpoint="admin_cache_entry")
+@requires_admin
+def admin_cache_entry():
+    entry = cache.get_entry(request.args.get("id", ""))
+    if entry is None:
+        return jsonify("That entry has expired or been evicted"), 404
+    return jsonify(entry), 200
+
+
+@app.route("/admin/cache/purge", methods=["POST"], endpoint="admin_cache_purge")
+@requires_admin
+def admin_cache_purge():
+    """Drop cache entries: one by id, everything matching an endpoint pattern,
+    everything expired, or the lot."""
+    data = get_json_dict() or {}
+    if data.get("all"):
+        removed = cache.clear()
+        return jsonify({"Removed": removed, "Scope": "all", "State": cache.get_state()}), 200
+    if data.get("expired"):
+        removed = cache.purge_expired()
+        return jsonify({"Removed": removed, "Scope": "expired", "State": cache.get_state()}), 200
+    pattern = str(data.get("pattern", "") or "").strip()
+    if pattern:
+        kind = "regex" if data.get("type") == "regex" else "glob"
+        if kind == "regex" and not runtime.valid_regex(runtime.normalize_pattern(pattern, kind)):
+            return jsonify("Invalid regular expression"), 400
+        removed = cache.purge_pattern(pattern, kind)
+        return jsonify({"Removed": removed, "Scope": pattern, "State": cache.get_state()}), 200
+    entry_id = str(data.get("id", "") or "").strip()
+    if not entry_id:
+        return jsonify("Nothing to purge: pass an id, a pattern, expired or all"), 400
+    ok = cache.purge_entry(entry_id)
+    return jsonify({"Removed": 1 if ok else 0, "Scope": entry_id, "State": cache.get_state()}), 200
+
+
+@app.route("/admin/cache/refresh", methods=["POST"], endpoint="admin_cache_refresh")
+@requires_admin
+def admin_cache_refresh():
+    """Re-fetch one cached entry from Roblox right now and replace it.
+
+    Deliberately a separate action from purging: purging leaves the next caller
+    to pay for the refill, which under a flood means the flood pays for it at a
+    moment of its choosing. This refills it on the admin's request instead, and
+    reports what came back.
+    """
+    data = get_json_dict() or {}
+    entry = cache.get_entry(str(data.get("id", "") or ""))
+    if entry is None:
+        return jsonify("That entry has expired or been evicted"), 404
+    path = str(entry.get("Path", ""))
+    if not validate_url(path):
+        return jsonify("That entry's URL is no longer proxyable"), 400
+    if str(entry.get("Method", "GET")).upper() != "GET":
+        # A POST entry is identified by a hash of its body, and the body is not
+        # kept — so it cannot be replayed. Purging it is the honest option.
+        return jsonify("Only GET entries can be refetched; purge this one instead"), 400
+    # The params the key was built from, stored with the entry precisely so this
+    # does not have to parse them back out of the display key.
+    params = entry.get("Params") or {}
+    headers = dict(get_fake_headers())
+    trace = {}
+    successful, body = proxy.request(
+        path, method=entry.get("Method", "GET"), headers=headers, params=params, trace=trace
+    )
+    if not successful:
+        # The old copy is deliberately left in place: a failed refetch should not
+        # cost the admin the answer they already had.
+        return jsonify({"OK": False, "Message": "Upstream refused; the entry was left alone", "Trace": trace}), 200
+    ttl, rule = cache.ttl_for(path, trace.get("UpstreamStatus", ""), True)
+    key = {
+        "Id": entry.get("Id"),
+        "Key": entry.get("Key"),
+        "Path": path,
+        "Method": entry.get("Method", "GET"),
+        "Params": params,
+    }
+    stored = cache.store(
+        key,
+        body,
+        ttl or runtime.get_setting("cache_ttl_seconds", config.CACHE_TTL_SECONDS),
+        successful=True,
+        upstream_status=trace.get("UpstreamStatus", ""),
+        upstream_method=trace.get("Method", ""),
+        rule=rule,
+    )
+    return jsonify({"OK": bool(stored), "Entry": cache.get_entry(entry.get("Id", "")), "Trace": trace}), 200
+
+
+@app.route("/admin/cache/rule", methods=["POST"], endpoint="admin_set_cache_rule")
+@requires_admin
+def admin_set_cache_rule():
+    data = get_json_dict()
+    if data is None or "pattern" not in data:
+        return jsonify("Missing pattern"), 400
+    ok, message = runtime.set_cache_rule(
+        data.get("pattern", ""),
+        data.get("ttl", config.DEFAULT_CACHE_RULE_TTL),
+        kind=data.get("type", "glob"),
+        note=data.get("note", ""),
+    )
+    if not ok:
+        return jsonify({"Message": message}), 400
+    return jsonify({"Message": message, "CacheRules": runtime.get_cache_rules()}), 200
+
+
+@app.route("/admin/cache/rule/clear", methods=["POST"], endpoint="admin_clear_cache_rule")
+@requires_admin
+def admin_clear_cache_rule():
+    data = get_json_dict()
+    if data is None or "pattern" not in data:
+        return jsonify("Missing pattern"), 400
+    runtime.clear_cache_rule(data.get("pattern", ""))
+    return jsonify({"Message": "Success", "CacheRules": runtime.get_cache_rules()}), 200
 
 
 @app.route("/admin/workers/reset", methods=["POST"], endpoint="admin_reset_workers")
@@ -1301,6 +1445,11 @@ def _record_outcome(ctx: RequestContext, status: int, outcome: str, **extra):
                 Duration=round(ctx.elapsed(), 4),
                 Bypass=ctx.bypass,
                 CaptureId=capture_id,
+                # Whether this answer came from the cache, and how old it was.
+                # Without it the feed cannot distinguish the request Roblox
+                # served from the ninety identical ones it never saw.
+                Cache=extra.get("cache", ""),
+                CacheAge=extra.get("cache_age", ""),
             )
         )
     except Exception:
@@ -1364,6 +1513,184 @@ def throttled_response(ip: str, reset_in=None):
     return _with_throttle_headers(resp, ip, Roxy_Throttle_Reset=reset_in, Roxy_Throttled="True"), 429
 
 
+# --- Response cache -----------------------------------------------------------
+# The cache sits between the last refusal check and the upstream call, and it is
+# the ONLY control here that is not keyed on who is asking. That is the point: a
+# Roblox experience polling one endpoint arrives from hundreds of game-server
+# IPs, so every per-IP limit sees a first-time caller — while Roblox sees one
+# proxy asking the same question hundreds of times and rate-limits us for it.
+# Answering the repeat from what we already fetched fixes the only side of that
+# we control. See cache.py.
+def _query_params() -> tuple:
+    """The upstream query params, and whether the caller asked for pretty JSON.
+
+    `prettyprint` is Roxy's own option and is stripped before anything else sees
+    it — so it never reaches Roblox and never splits one cached answer into two
+    entries that differ only by formatting.
+    """
+    params = request.args.to_dict(flat=False)
+    pretty_values = params.pop("prettyprint", None)
+    return params, bool(pretty_values) and str(pretty_values[-1]).lower() == "true"
+
+
+def _cache_key_for(dst: str, params: dict, body):
+    """The cache slot for this request, or None if it must not be cached."""
+    try:
+        if not cache.is_enabled() or not cache.method_allowed(request.method):
+            return None
+        return cache.make_key(request.method, dst, params, body if request.method != "GET" else None)
+    except Exception:
+        return None  # A cache that cannot compute a key simply doesn't cache.
+
+
+def _pretty(body: str, pretty_print: bool) -> str:
+    if not pretty_print or body is None:
+        return body
+    try:
+        return json.dumps(json.loads(body), indent=4)
+    except (ValueError, TypeError):
+        return body
+
+
+def _proxy_response(body: str, user_agent: str):
+    """The response object for a proxied body.
+
+    Identical whether the body came from Roblox a moment ago or from the cache:
+    a caller must not be able to tell the difference from the payload, only from
+    the Roxy-Cache header they can safely ignore.
+    """
+    if is_browser(user_agent):
+        # Humans get readable, HTML-escaped output (escaping also blocks any
+        # script content in an upstream body from executing on Roxy's origin).
+        return app.response_class(f"<pre>{escape(body)}</pre>", mimetype="text/html")
+    # API consumers get the raw upstream body passed through untouched.
+    return app.response_class(body, mimetype="application/json")
+
+
+def _serve_from_cache(ctx: RequestContext, entry: dict, pretty_print: bool, verdict: str):
+    """Answer this request from a cached entry, recorded exactly like a live one.
+
+    `verdict` is what the Roxy-Cache header says and what the live feed shows:
+    HIT (fresh), STALE (expired, but the upstream just failed), or COALESCED
+    (another thread was already fetching this key and we used its answer).
+    """
+    body = _pretty(entry.get("Body", ""), pretty_print)
+    successful = bool(entry.get("Successful", True))
+    status = 200 if successful else 500
+    age = int(cache.age_of(entry))
+    resp = _proxy_response(body, ctx.user_agent)
+    _with_throttle_headers(
+        resp,
+        ctx.ip,
+        Roxy_Cache=verdict,
+        Roxy_Cache_Age=str(age),
+        Roxy_Cache_TTL=str(int(entry.get("TTL", 0) or 0)),
+    )
+    event = "Stale" if verdict == "STALE" else ("Coalesced" if verdict == "COALESCED" else "Hits")
+    diagnostics.log_cache_event(event, ctx.path, int(entry.get("Bytes", 0) or 0))
+    cache.record_hit(entry.get("Id", ""))
+    # Counted as a served request: the caller got an answer, so the request
+    # counters and the traffic chart must show it. It is deliberately NOT fed to
+    # the upstream timing stats — nothing upstream happened, and a few hundred
+    # zero-millisecond "upstream calls" would make those numbers meaningless.
+    diagnostics.log_request(ctx.method, successful)
+    diagnostics.log_endpoint(
+        ctx.path,
+        ctx.method,
+        json.dumps(sanitize_headers(ctx.headers)),
+        ctx.ip,
+        Query=ctx.query,
+        Body="",
+        Status=status,
+        UpstreamStatus=entry.get("UpstreamStatus", ""),
+        UpstreamMethod="cache",
+        Outcome="served",
+        UserAgent=ctx.user_agent,
+        CallerId=ctx.caller_id,
+    )
+    _record_outcome(
+        ctx,
+        status,
+        "served",
+        # Its own status source, so "how much of our traffic still reaches
+        # Roblox?" stays answerable once the cache is doing its job.
+        source="Cache",
+        trace={"Method": "cache", "UpstreamStatus": entry.get("UpstreamStatus", "")},
+        response_body=body,
+        cache=verdict,
+        cache_age=age,
+    )
+    return resp, status
+
+
+def _store_in_cache(ctx: RequestContext, key: dict, dst: str, successful: bool, body, trace: dict):
+    """Cache what the upstream just returned, if policy allows it.
+
+    Two kinds of answer are storable and one is not:
+
+      A 200 is stored for the default TTL, or whatever a per-endpoint cache rule
+      says (including 0, which means "never cache this endpoint").
+
+      A definitive upstream ERROR (404/403/400/410) is stored only when error
+      caching is switched on AND Roblox is the one who said no — a request that
+      failed because every upstream method was busy carries OUR message, not
+      Roblox's, and caching that would serve our own outage back for minutes.
+
+      Anything else (429, 5xx, timeouts) is never cached: those are transient,
+      and pinning one would keep an outage alive long after it ended.
+    """
+    try:
+        upstream_status = trace.get("UpstreamStatus", "")
+        if not successful and trace.get("Outcome") != "upstream_rejected":
+            return
+        ttl, rule = cache.ttl_for(dst, upstream_status, successful)
+        if ttl <= 0:
+            diagnostics.log_cache_event("Skipped", dst)
+            return
+        stored = cache.store(
+            key,
+            body,
+            ttl,
+            successful=successful,
+            upstream_status=upstream_status,
+            upstream_method=trace.get("Method", ""),
+            rule=rule,
+        )
+        # store() returns None when the body is over cache_max_body. That is a
+        # refusal to cache, not a failure, and it is counted so an endpoint that
+        # is never cacheable is visible instead of merely absent.
+        diagnostics.log_cache_event("Stores" if stored else "Skipped", dst, int((stored or {}).get("Bytes", 0)))
+    except Exception:
+        pass  # Caching must never be able to fail a request it is only speeding up.
+
+
+def _cached_answer_for_throttled(ctx: RequestContext, dst: str):
+    """A cached answer for a caller we were about to rate-limit, or None.
+
+    Off by default (cache_serve_throttled). On, it is the kindest throttle there
+    is: the caller keeps working, and Roblox still never sees the request — the
+    limit was only ever there to protect the upstream, and a cache hit doesn't
+    touch it. It stays opt-in because it does weaken a limit the admin set
+    deliberately, and that should be their call rather than a side effect of
+    turning caching on.
+    """
+    if not runtime.get_setting("cache_serve_throttled", 0) or not cache.is_enabled():
+        return None
+    if not validate_url(dst):
+        return None
+    try:
+        params, pretty_print = _query_params()
+        key = _cache_key_for(dst, params, ctx.body)
+        if key is None:
+            return None
+        entry = cache.get(key)
+        if entry is None or not cache.is_fresh(entry):
+            return None
+        return _serve_from_cache(ctx, entry, pretty_print, "HIT")
+    except Exception:
+        return None  # Falling back to the ordinary 429 is always safe.
+
+
 # Handle proxying.
 @app.route("/<path:dst>", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
 def proxy_page(dst: str):
@@ -1425,6 +1752,11 @@ def proxy_page(dst: str):
             )
 
     if not bypass and throttle.is_throttled(ip):
+        # Before refusing: if the answer is already in the cache, giving it to
+        # them costs nothing and Roblox still never sees the request. Opt-in.
+        cached = _cached_answer_for_throttled(ctx, dst)
+        if cached is not None:
+            return cached
         hold(
             "throttle",
             f"Per-IP limit {runtime.get_setting('allowed_requests_per_minute', config.ALLOWED_REQUESTS_PER_MINUTE)} "
@@ -1543,12 +1875,29 @@ def proxy_page(dst: str):
     )
 
     # Preserve repeated query params (e.g. ?ids=1&ids=2); requests encodes lists.
-    params = request.args.to_dict(flat=False)
-    # Strip Roxy's own option BEFORE proxying so it never reaches Roblox.
-    pretty_values = params.pop("prettyprint", None)
-    pretty_print = bool(pretty_values) and str(pretty_values[-1]).lower() == "true"
+    # `prettyprint` is Roxy's own option and is stripped here so it never reaches
+    # Roblox and never splits one cached answer into two formatting variants.
+    params, pretty_print = _query_params()
 
     data = ctx.body if request.method in ("POST", "PATCH", "PUT", "DELETE") else None
+
+    # --- Cache lookup --------------------------------------------------------
+    # Placed after every refusal check and before the upstream call, so the
+    # cache changes only WHERE an allowed answer comes from — never who is
+    # allowed to have one.
+    cache_key = _cache_key_for(dst, params, data)
+    stale_entry = None
+    if cache_key is not None:
+        if cache.wants_fresh(request.headers):
+            diagnostics.log_cache_event("Bypassed", dst)
+        else:
+            entry = cache.get(cache_key)
+            if entry is not None:
+                if cache.is_fresh(entry):
+                    return _serve_from_cache(ctx, entry, pretty_print, "HIT")
+                # Expired. Held on to anyway: if the upstream is about to refuse
+                # us, a slightly old answer is a far better reply than an error.
+                stale_entry = entry if cache.is_servable_stale(entry) else None
 
     # Remove/overwrite headers that could cause issues or identify us/the visitor.
     headers = {}
@@ -1560,33 +1909,53 @@ def proxy_page(dst: str):
         headers[key] = value
     headers.update(get_fake_headers())
 
+    # Only one thread per worker fetches a given key at a time; the rest wait
+    # briefly and use its answer. A cold cache under a flood would otherwise
+    # produce exactly the burst the cache exists to prevent.
+    owns_fetch, waiter = (True, None)
+    if cache_key is not None:
+        owns_fetch, waiter = cache.begin_fetch(cache_key)
+        if not owns_fetch:
+            shared = cache.await_fetch(cache_key, waiter)
+            if shared is not None:
+                return _serve_from_cache(ctx, shared, pretty_print, "COALESCED")
+
     # Handle proxying the request. `trace` comes back describing what actually
     # happened upstream — which method served it, Roblox's own status, how many
     # attempts — none of which the (successful, response) pair can express.
     trace = {}
-    successful, response = proxy.request(
-        str(escape(dst)),
-        method=request.method,
-        headers=headers,
-        params=params,
-        data=data,
-        trace=trace,
-    )
-    if successful and response is not None and pretty_print:
-        try:
-            response = json.dumps(json.loads(response), indent=4)
-        except (ValueError, TypeError):
-            pass
+    try:
+        if cache_key is not None:
+            diagnostics.log_cache_event("Misses", dst)
+        successful, response = proxy.request(
+            str(escape(dst)),
+            method=request.method,
+            headers=headers,
+            params=params,
+            data=data,
+            trace=trace,
+        )
+        # Stored BEFORE prettyprinting, so one cached body serves both callers
+        # who asked for formatted JSON and callers who did not.
+        if cache_key is not None:
+            _store_in_cache(ctx, cache_key, dst, successful, response, trace)
+    finally:
+        # Only the owner releases the key; a waiter that timed out and went
+        # upstream itself must not free someone else's slot.
+        if cache_key is not None and owns_fetch:
+            cache.end_fetch(cache_key)
+
+    # The upstream refused us but we still hold a recent answer: serve it rather
+    # than passing a Roblox rate-limit through to a caller who only wants a
+    # number. This is the failure mode the cache is most valuable in.
+    if not successful and stale_entry is not None:
+        return _serve_from_cache(ctx, stale_entry, pretty_print, "STALE")
+
+    response = _pretty(response, pretty_print) if successful else response
     response = response if response is not None else "Internal Server Error"
     status = 200 if successful else 500
-    if is_browser(user_agent):
-        # Humans get readable, HTML-escaped output (escaping also blocks any
-        # script content in an upstream body from executing on Roxy's origin).
-        resp = app.response_class(f"<pre>{escape(response)}</pre>", mimetype="text/html")
-    else:
-        # API consumers get the raw upstream body passed through untouched.
-        resp = app.response_class(response, mimetype="application/json")
-    _with_throttle_headers(resp, ip)
+    resp = _proxy_response(response, user_agent)
+    _with_throttle_headers(resp, ip, Roxy_Cache="MISS" if cache_key is not None else "OFF")
     outcome = "served" if successful else "upstream_failed"
     # Recorded AFTER the upstream call so the endpoint row carries what came back,
     # not just what went out — the answer is usually the interesting half.
@@ -1615,6 +1984,7 @@ def proxy_page(dst: str):
         source="Roxy" if not successful else "Relay",
         trace=trace,
         response_body=response,
+        cache="MISS" if cache_key is not None else "",
     )
     return resp, status
 

@@ -241,6 +241,239 @@ const print = console.log;
 		for (const sel of SORT_STATE.keys()) sortTable(sel);
 	}
 
+	// -----------------------------
+	// Paging long lists
+	// -----------------------------
+	// Several of these tables are genuinely long — Top Talkers holds up to 400
+	// IPs, user-agents up to a thousand — and rendering every row of every one of
+	// them on one page is what made this dashboard tiring to read rather than
+	// informative.
+	//
+	// Paging is applied to the RENDERED rows rather than to the data, for the
+	// same reason sorting is (see above): thirty renderers build their rows in
+	// thirty different ways, and threading a page window through all of them
+	// would be thirty chances to get it wrong. So a renderer still builds every
+	// row, the sorter still orders the whole set — which is what makes "top 25 by
+	// requests" mean what it says — and this hides everything past the window.
+	//
+	// The pager bar is created in JS and inserted after the table, so adding a
+	// table to PAGED_TABLES is the entire cost of paging it: no markup changes,
+	// and no renderer needs to know it is being paged.
+	const PAGE_SIZES = [10, 25, 50, 100, 250];
+	const DEFAULT_PAGE_SIZE = 25;
+	const PAGERS = new Map(); // key -> {size, shown, container, itemSel, bar, status, more, all}
+
+	function pagerStorageKey(key) {
+		return `roxy.pager.${key}`;
+	}
+
+	function readPagerSize(key) {
+		try {
+			// Explicitly against null: an absent key gives null, and Number(null)
+			// is 0 — which is the stored value meaning "show everything", so
+			// reading it loosely turned every unset pager into no pager at all.
+			const raw = localStorage.getItem(pagerStorageKey(key));
+			if (raw !== null) {
+				const saved = Number(raw);
+				if (saved === 0 || PAGE_SIZES.includes(saved)) return saved; // 0 = "All"
+			}
+		} catch {
+			/* private mode / storage disabled — the default is fine */
+		}
+		return DEFAULT_PAGE_SIZE;
+	}
+
+	function writePagerSize(key, size) {
+		try {
+			localStorage.setItem(pagerStorageKey(key), String(size));
+		} catch {
+			/* not being able to remember the choice is not worth an error */
+		}
+	}
+
+	// The rows a pager acts on, with detail/expansion rows welded to the row they
+	// belong to — hiding a parent while leaving its breakdown behind would be
+	// worse than not paging at all.
+	function pagerGroups(state) {
+		const container = $(state.containerSel);
+		if (!container) return [];
+		const groups = [];
+		for (const el of Array.from(container.children)) {
+			if (state.isDetail(el) && groups.length) groups[groups.length - 1].push(el);
+			else groups.push([el]);
+		}
+		return groups;
+	}
+
+	function applyPager(key) {
+		const state = PAGERS.get(key);
+		if (!state) return;
+		const groups = pagerGroups(state);
+		const total = groups.length;
+		const size = state.size || 0;
+		// The window is deliberately STICKY across re-renders. The dashboard
+		// re-polls every few seconds, and a page that silently collapsed back to
+		// twenty-five rows while being read would be worse than no paging.
+		const shown = !size || state.showAll ? total : Math.min(state.shown || size, total);
+		groups.forEach((group, index) => {
+			const visible = index < shown;
+			for (const el of group) el.hidden = !visible;
+		});
+		// Only shown when it is actually holding something back. A pager under
+		// four rows is clutter, and "Showing 4 of 4" is not information.
+		const worthPaging = Boolean(size) && total > size;
+		state.bar.hidden = !worthPaging;
+		if (!worthPaging) return;
+		state.status.textContent = `Showing ${fmtCount(shown)} of ${fmtCount(total)}`;
+		const remaining = total - shown;
+		state.more.hidden = remaining <= 0;
+		state.more.textContent = `Show ${fmtCount(Math.min(remaining, size || remaining))} more`;
+		state.all.hidden = remaining <= 0;
+		state.all.textContent = `Show all ${fmtCount(total)}`;
+	}
+
+	function buildPagerBar(key, state) {
+		const bar = document.createElement("div");
+		bar.className = "pager";
+		bar.hidden = true;
+
+		const status = document.createElement("span");
+		status.className = "pager__status";
+
+		const more = document.createElement("button");
+		more.type = "button";
+		more.className = "btn btn--outline btn--sm";
+		more.addEventListener("click", () => {
+			state.shown = (state.shown || state.size) + (state.size || 0);
+			applyPager(key);
+		});
+
+		const all = document.createElement("button");
+		all.type = "button";
+		all.className = "btn btn--ghost btn--sm";
+		all.addEventListener("click", () => {
+			state.showAll = true;
+			applyPager(key);
+		});
+
+		const label = document.createElement("label");
+		label.className = "select-inline pager__size";
+		const labelText = document.createElement("span");
+		labelText.className = "select-inline__label";
+		labelText.textContent = "Rows";
+		const select = document.createElement("select");
+		select.className = "input input--select input--w110";
+		select.setAttribute("aria-label", "Rows per page");
+		for (const size of PAGE_SIZES) {
+			const option = document.createElement("option");
+			option.value = String(size);
+			option.textContent = String(size);
+			select.appendChild(option);
+		}
+		const allOption = document.createElement("option");
+		allOption.value = "0";
+		allOption.textContent = "All";
+		select.appendChild(allOption);
+		select.value = String(state.size);
+		select.addEventListener("change", () => {
+			state.size = Number(select.value) || 0;
+			state.shown = state.size;
+			state.showAll = false;
+			writePagerSize(key, state.size);
+			applyPager(key);
+		});
+		label.append(labelText, select);
+
+		bar.append(status, more, all, label);
+		state.bar = bar;
+		state.status = status;
+		state.more = more;
+		state.all = all;
+		return bar;
+	}
+
+	// `key` is the container selector for tables; `opts.after` names the element
+	// the bar is inserted after (defaults to the table's scroll wrapper, so the
+	// bar sits outside the horizontal scroll and stays reachable).
+	function initPager(key, containerSel, opts = {}) {
+		if (PAGERS.has(key)) return;
+		const container = $(containerSel);
+		if (!container) return;
+		const anchor = opts.anchor ? container.closest(opts.anchor) : container;
+		if (!anchor || !anchor.parentNode) return;
+		const size = readPagerSize(key);
+		const state = {
+			containerSel,
+			size,
+			shown: size,
+			isDetail: opts.isDetail || (el => el.dataset && el.dataset.sortSkip === "1"),
+		};
+		PAGERS.set(key, state);
+		anchor.parentNode.insertBefore(buildPagerBar(key, state), anchor.nextSibling);
+		watchPager(key, state);
+	}
+
+	// Re-page whenever a renderer rebuilds the rows. An observer rather than a
+	// call at the end of every renderer: the filter boxes re-render their table
+	// directly, without going through refreshAll, and a pager that only worked on
+	// the poll would show an unpaged wall of rows the moment anything was typed.
+	// Only childList is watched — applyPager toggles `hidden`, an ATTRIBUTE
+	// change, so it cannot retrigger itself.
+	function watchPager(key, state) {
+		const container = $(state.containerSel);
+		if (!container || typeof MutationObserver !== "function") return;
+		const observer = new MutationObserver(() => {
+			if (state.pending) return;
+			state.pending = true;
+			// Next microtask, so a renderer appending row by row is measured once
+			// when it has finished rather than once per row.
+			Promise.resolve().then(() => {
+				state.pending = false;
+				applyPager(key);
+			});
+		});
+		observer.observe(container, { childList: true });
+	}
+
+	function applyAllPagers() {
+		for (const key of PAGERS.keys()) applyPager(key);
+	}
+
+	// Tables long enough to be worth paging. Anything not listed renders in full,
+	// which is right for the short ones — a pager under four rows is clutter.
+	const PAGED_TABLES = [
+		"#talkersTable",
+		"#callersTable",
+		"#refusalsTable",
+		"#throttleWatchTable",
+		"#statusDetailedTable",
+		"#requestFailuresTable",
+		"#blockedAttemptsTable",
+		"#rateLimitedAttemptsTable",
+		"#headerBlockedTable",
+		"#headerNamesTable",
+		"#userAgentsTable",
+		"#blockedHeaderNamesTable",
+		"#blockedUserAgentsTable",
+		"#errorsTable",
+		"#probeTable",
+		"#exploitSummaryTable",
+		"#crawlsTable",
+		"#throttledTable",
+		"#loginsTable",
+		"#tarpitIpsTable",
+		"#tarpitReasonsTable",
+		"#rotateIpsTable",
+		"#cacheEndpointsTable",
+	];
+
+	function initAllPagers() {
+		for (const sel of PAGED_TABLES) initPager(sel, `${sel} tbody`, { anchor: ".table-wrap" });
+		// The live feed is a list of cards rather than a table, so it pages on its
+		// own children with no detail rows to keep together.
+		initPager("#liveFeed", "#liveFeed", { isDetail: () => false });
+	}
+
 	function escapeHtml(s) {
 		return String(s)
 			.replaceAll("&", "&amp;")
@@ -381,6 +614,15 @@ const print = console.log;
 		const sc = d.StatusCodeCounts || {};
 		setText("kpi_2xx", String(sc["2xx"] || 0));
 		setText("kpi_4xx", String(sc["4xx"] || 0));
+
+		// How much of the traffic above never reached Roblox. Belongs on the
+		// Overview because it is the number that says whether the single most
+		// effective defence against being rate-limited is currently working.
+		const stats = d.CacheStats || {};
+		const served = Number(stats.Hits || 0) + Number(stats.Stale || 0) + Number(stats.Coalesced || 0);
+		const upstream = Number(stats.Misses || 0);
+		setText("kpi_cache_saved", fmtCount(served));
+		setText("kpi_cache_rate", served + upstream ? pct(served / (served + upstream)) : "—");
 	}
 
 	function renderPageVisits(d) {
@@ -1982,6 +2224,7 @@ const print = console.log;
 			(oc && oc !== "served"
 				? `<span class="badge badge--${outcomeClass(oc)}">${escapeHtml(OUTCOME_LABELS[oc] || oc)}</span>`
 				: "") +
+			cacheBadge(item) +
 			`<span class="live-item__url">${escapeHtml(item.URL || "")}</span>` +
 			`<span class="live-item__meta">${escapeHtml(item.IP || "")}${
 				item.CallerId ? ` • place ${escapeHtml(item.CallerId)}` : ""
@@ -2007,6 +2250,26 @@ const print = console.log;
 		return card;
 	}
 
+	// HIT/STALE/COALESCED mark a request Roblox never received; MISS marks one it
+	// did. A blank verdict means the request was never cacheable in the first
+	// place (a refusal, a non-Roblox URL, caching off) and claiming otherwise on
+	// the card would be worse than saying nothing.
+	const CACHE_BADGES = {
+		HIT: ["ok", "Answered from cache — Roblox never saw this request"],
+		STALE: ["warn", "Answered from an EXPIRED cached copy because the upstream refused us"],
+		COALESCED: ["ok", "Collapsed into another request already fetching the same key"],
+		MISS: ["muted", "Not in the cache; this one went to Roblox"],
+	};
+
+	function cacheBadge(item) {
+		const verdict = String(item.Cache || "");
+		const spec = CACHE_BADGES[verdict];
+		if (!spec) return "";
+		const age = Number(item.CacheAge);
+		const title = spec[1] + (verdict !== "MISS" && Number.isFinite(age) ? ` (${age}s old)` : "");
+		return `<span class="badge badge--${spec[0]}" title="${escapeHtml(title)}">⚡${escapeHtml(verdict)}</span>`;
+	}
+
 	function liveMetaBlock(item) {
 		const wrap = document.createElement("div");
 		const rows = [
@@ -2014,6 +2277,12 @@ const print = console.log;
 			["Outcome", OUTCOME_LABELS[item.Outcome] || item.Outcome || "—"],
 			["Refused because", item.Reason || "—"],
 			["Answered by", item.Source === "Relay" ? "Roblox (relayed)" : item.Source || "—"],
+			[
+				"Cache",
+				item.Cache
+					? `${item.Cache}${item.Cache !== "MISS" && item.CacheAge !== "" ? ` (${item.CacheAge}s old)` : ""}`
+					: "not cacheable",
+			],
 			["Roblox status", item.UpstreamStatus === "" || item.UpstreamStatus == null ? "—" : item.UpstreamStatus],
 			["Upstream method", item.UpstreamMethod || "—"],
 			["Upstream error", item.UpstreamError || "—"],
@@ -2322,12 +2591,14 @@ const print = console.log;
 		Relay: "Roblox → caller (relayed)",
 		Roxy: "Roxy (our own refusals)",
 		Internal: "Our own probes",
+		Cache: "Cache → caller (Roblox never saw it)",
 	};
 	const SOURCE_HINTS = {
 		Roblox: "What Roblox actually answered our upstream calls with. 429s here mean WE are being rate-limited.",
 		Relay: "Statuses we passed back to callers that came from Roblox.",
 		Roxy: "Statuses we generated ourselves: throttles, blocks, filters, pause, our own errors.",
 		Internal: "Statuses from Roxy's own calls (token validation, rotation probe) — not user traffic.",
+		Cache: "Answers served from the response cache. Every one of these is a request Roblox never received.",
 	};
 
 	function renderStatusSources(d) {
@@ -2612,6 +2883,21 @@ const print = console.log;
 		tarpit_on_endpoint_rule: "Tarpit: endpoint rate rules (1/0)",
 		tarpit_on_blocked_endpoint: "Tarpit: blocked endpoints (1/0)",
 		tarpit_on_auth_attempt: "Tarpit: ROBLOSECURITY attempts (1/0)",
+		cache_enabled: "Response cache enabled (1/0)",
+		cache_ttl_seconds: "Cache: default TTL (s)",
+		cache_error_ttl_seconds: "Cache: 404/403 TTL (s, 0 = never)",
+		cache_stale_seconds: "Cache: serve stale for (s)",
+		cache_disk_enabled: "Cache: keep a shared disk copy (1/0)",
+		cache_max_entries: "Cache: max entries (disk)",
+		cache_max_bytes: "Cache: max bytes (disk)",
+		cache_max_body: "Cache: largest body cached (bytes)",
+		cache_memory_entries: "Cache: max entries (per worker)",
+		cache_memory_bytes: "Cache: max bytes (per worker)",
+		cache_serve_throttled: "Cache: answer throttled callers (1/0)",
+		cache_coalesce: "Cache: collapse simultaneous fetches (1/0)",
+		cache_coalesce_wait_ms: "Cache: how long a follower waits (ms)",
+		cache_post_requests: "Cache: also cache POST (1/0)",
+		cache_respect_no_cache: "Cache: honour caller Cache-Control (1/0)",
 	};
 
 	// Group settings so the (long) list is navigable. Any key not listed falls
@@ -2635,6 +2921,26 @@ const print = console.log;
 				"tarpit_on_endpoint_rule",
 				"tarpit_on_blocked_endpoint",
 				"tarpit_on_auth_attempt",
+			],
+		],
+		[
+			"Response cache",
+			[
+				"cache_enabled",
+				"cache_ttl_seconds",
+				"cache_error_ttl_seconds",
+				"cache_stale_seconds",
+				"cache_disk_enabled",
+				"cache_max_entries",
+				"cache_max_bytes",
+				"cache_max_body",
+				"cache_memory_entries",
+				"cache_memory_bytes",
+				"cache_serve_throttled",
+				"cache_coalesce",
+				"cache_coalesce_wait_ms",
+				"cache_post_requests",
+				"cache_respect_no_cache",
 			],
 		],
 		["Upstream & retries", ["request_timeout", "max_retries_per_request"]],
@@ -2672,10 +2978,25 @@ const print = console.log;
 		return groups;
 	}
 
+	// Sixty-odd settings is more than a flat list is good for during an incident,
+	// so the table is searchable, marks the values that have been moved off their
+	// shipped default, and can put any one of them back with a click. Matching is
+	// over the key AND its label AND its group, because "cache" and "how long a
+	// response is kept" are both reasonable things to type looking for one row.
+	function settingMatches(key, label, group, needle) {
+		if (!needle) return true;
+		return `${key} ${label} ${group}`.toLowerCase().includes(needle);
+	}
+
+	function isSettingChanged(info) {
+		return info && info.default !== undefined && Number(info.value) !== Number(info.default);
+	}
+
 	function renderSettings(d) {
 		const tbody = $("#settingsTable tbody");
 		if (!tbody) return;
-		const settings = d.Settings || {};
+		if (d.Settings) renderSettings._last = d.Settings;
+		const settings = renderSettings._last || {};
 		// Never clobber the table while the admin is mid-edit (auto-refresh would
 		// otherwise wipe their typing every 5 seconds).
 		const editing = tbody.contains(document.activeElement) || tbody.querySelector("input[data-dirty='1']");
@@ -2688,27 +3009,50 @@ const print = console.log;
 			}
 			return;
 		}
+		const needle = ($("#settingsFilter")?.value || "").trim().toLowerCase();
+		const changedOnly = Boolean($("#settingsChangedOnly")?.checked);
+		const changedCount = Object.values(settings).filter(isSettingChanged).length;
+		setText("settingsChangedChip", `${fmtCount(changedCount)} changed from default`);
+		$("#settingsChangedChip")?.classList.toggle("chip--ok", changedCount > 0);
+
 		tbody.innerHTML = "";
+		let rendered = 0;
 		for (const [groupLabel, keys] of groupedSettingKeys(settings)) {
+			const visible = keys.filter(
+				key =>
+					settingMatches(key, SETTING_LABELS[key] || key, groupLabel, needle) &&
+					(!changedOnly || isSettingChanged(settings[key])),
+			);
+			if (!visible.length) continue;
 			const headRow = document.createElement("tr");
 			headRow.className = "settings-group";
 			const headTd = document.createElement("td");
-			headTd.colSpan = 5;
+			headTd.colSpan = 6;
 			headTd.innerHTML = `<strong>${escapeHtml(groupLabel)}</strong>`;
 			headRow.appendChild(headTd);
 			tbody.appendChild(headRow);
 
-			for (const key of keys) {
+			for (const key of visible) {
 				const info = settings[key];
+				const changed = isSettingChanged(info);
 				const row = document.createElement("tr");
+				if (changed) row.classList.add("setting--changed");
 
 				const tdName = document.createElement("td");
 				tdName.textContent = SETTING_LABELS[key] || key;
+				// The raw key is what the code, the docs and every error message
+				// call it, so it stays reachable on hover.
 				tdName.title = key;
 
 				const tdCurrent = document.createElement("td");
 				tdCurrent.textContent = String(info.value);
 				tdCurrent.dataset.current = "1";
+				if (changed) {
+					const badge = document.createElement("span");
+					badge.className = "badge badge--muted setting__default";
+					badge.textContent = `default ${info.default}`;
+					tdCurrent.append(" ", badge);
+				}
 
 				const tdInput = document.createElement("td");
 				const input = document.createElement("input");
@@ -2729,10 +3073,42 @@ const print = console.log;
 				const tdUpdated = document.createElement("td");
 				tdUpdated.appendChild(info.updated ? tsNode(info.updated) : document.createTextNode("—"));
 
-				[tdName, tdCurrent, tdInput, tdRange, tdUpdated].forEach(td => row.appendChild(td));
+				const tdReset = document.createElement("td");
+				if (changed) {
+					const reset = document.createElement("button");
+					reset.type = "button";
+					reset.className = "btn btn--ghost btn--xs";
+					reset.textContent = "Reset";
+					reset.title = `Put ${key} back to its default of ${info.default}`;
+					reset.addEventListener("click", () => resetSetting(key, info.default));
+					tdReset.appendChild(reset);
+				}
+
+				[tdName, tdCurrent, tdInput, tdRange, tdUpdated, tdReset].forEach(td => row.appendChild(td));
 				tbody.appendChild(row);
+				rendered += 1;
 			}
 		}
+		if (!rendered) tbody.appendChild(tr(["No setting matches that.", "", "", "", "", ""]));
+	}
+
+	async function resetSetting(key, value) {
+		try {
+			const res = await api("/admin/settings", {
+				method: "POST",
+				body: JSON.stringify({ settings: { [key]: value } }),
+			});
+			if (!res.ok) throw new Error(String(res.status));
+			showToast(`${key} back to its default (${value})`);
+			refreshAll(true);
+		} catch {
+			showToast("Could not reset that setting");
+		}
+	}
+
+	for (const sel of ["#settingsFilter", "#settingsChangedOnly"]) {
+		$(sel)?.addEventListener("input", () => renderSettings({}));
+		$(sel)?.addEventListener("change", () => renderSettings({}));
 	}
 
 	// The admin-authored reply a refused caller receives. Rendered dimmed when
@@ -3290,6 +3666,7 @@ const print = console.log;
 			renderEndpointRules(d);
 			renderThrottleBypass(d);
 			renderTarpit(d);
+			renderCache(d);
 			renderHeaderRules(d);
 			renderTesterSamples();
 			renderBlockedAttempts(d);
@@ -3307,6 +3684,9 @@ const print = console.log;
 			// just been rebuilt from scratch, and the sort the admin chose has to
 			// survive that or it is useless on live data.
 			sortAllTables();
+			// Paging comes after sorting on purpose: the window has to be the top
+			// N of the ORDER the admin chose, not the first N the renderer built.
+			applyAllPagers();
 			setText("lastUpdatedChip", "Updated: just now");
 			if (!silent) showToast("Dashboard updated");
 		} catch (err) {
@@ -4140,6 +4520,548 @@ const print = console.log;
 	});
 
 	// -----------------------------
+	// Response cache
+	// -----------------------------
+	// Two halves with different costs. The STATS half rides the ordinary
+	// diagnostics poll — counters and per-endpoint rows are small and merge
+	// across workers like everything else. The ENTRY BROWSER does not: entries
+	// carry response bodies, so it is fetched on demand, paged on the server, and
+	// a body is only pulled when a row is opened.
+	function pct(value) {
+		return `${Math.round((Number(value) || 0) * 100)}%`;
+	}
+
+	function renderCache(d) {
+		if (d.Cache) renderCache._state = d.Cache;
+		if (d.CacheStats) renderCache._stats = d.CacheStats;
+		if (d.CacheRates) renderCache._rates = d.CacheRates;
+		if (d.CacheEndpoints) renderCache._endpoints = d.CacheEndpoints;
+		if (d.CacheRules) renderCache._rules = d.CacheRules;
+		const state = renderCache._state || {};
+		const stats = renderCache._stats || {};
+		const rates = renderCache._rates || [];
+
+		const hits = Number(stats.Hits || 0);
+		const stale = Number(stats.Stale || 0);
+		const coalesced = Number(stats.Coalesced || 0);
+		const misses = Number(stats.Misses || 0);
+		const saved = hits + stale + coalesced;
+		const total = saved + misses;
+
+		const chip = $("#cacheStatusChip");
+		if (chip) {
+			const on = Boolean(state.Enabled);
+			chip.textContent = on ? `Caching on • ${state.TTL}s default` : "Caching off";
+			chip.classList.toggle("chip--ok", on);
+			chip.classList.toggle("chip--danger", !on);
+		}
+		setText("cacheSavedChip", `${fmtCount(saved)} request${saved === 1 ? "" : "s"} Roblox never saw`);
+
+		setText("cache_hit_rate", total ? pct(saved / total) : "—");
+		setText("cache_hit_counts", `${fmtCount(saved)} served here • ${fmtCount(misses)} went upstream`);
+		const windowRate = index => (rates[index] ? pct(rates[index].Rate) : "—");
+		setText("cache_rate_5", windowRate(0));
+		setText("cache_rate_60", windowRate(1));
+		setText("cache_rate_1440", windowRate(2));
+
+		setText("cache_saved", fmtCount(saved));
+		setText("cache_hits", fmtCount(hits));
+		setText("cache_stale", fmtCount(stale));
+		setText("cache_coalesced", fmtCount(coalesced));
+		setText("cache_bytes_served", fmtBytes(stats.BytesServed));
+
+		setText("cache_entries", fmtCount(state.Entries));
+		setText("cache_bytes", fmtBytes(state.Bytes));
+		setText("cache_max_bytes", fmtBytes(state.MaxBytes));
+		setText("cache_max_entries", fmtCount(state.MaxEntries));
+		setText("cache_evictions", fmtCount(stats.Evictions));
+
+		const memory = state.Memory || {};
+		setText("cache_mem_entries", fmtCount(memory.Count));
+		setText("cache_mem_bytes", fmtBytes(memory.Bytes));
+		setText("cache_mem_max", fmtBytes(memory.MaxBytes));
+		setText("cache_window", state.OldestAt ? timeAgo(state.OldestAt) : "—");
+
+		renderCacheControls(state);
+		renderCacheRules(renderCache._rules || {});
+		renderCacheEndpoints(renderCache._endpoints || {});
+	}
+
+	// The controls are only redrawn while the admin is NOT editing them: the
+	// poll runs every few seconds and would otherwise wipe a half-typed number.
+	function renderCacheControls(state) {
+		const settings = (lastDiagnostics && lastDiagnostics.Settings) || {};
+		const value = key => (settings[key] ? settings[key].value : undefined);
+		const toggle = (sel, on) => {
+			const el = $(sel);
+			if (el && el !== document.activeElement) el.checked = Boolean(on);
+		};
+		toggle("#cacheEnabled", state.Enabled);
+		toggle("#cacheDiskEnabled", state.DiskEnabled);
+		for (const box of $$(".cache-opt")) {
+			if (box !== document.activeElement) box.checked = Boolean(value(box.dataset.setting));
+		}
+		const form = $("#cacheForm");
+		if (!form || form.contains(document.activeElement)) return;
+		const set = (sel, v) => {
+			const el = $(sel);
+			if (el && v !== undefined) el.value = String(v);
+		};
+		set("#cacheTtl", value("cache_ttl_seconds"));
+		set("#cacheStale", value("cache_stale_seconds"));
+		set("#cacheErrorTtl", value("cache_error_ttl_seconds"));
+		set("#cacheMaxBody", value("cache_max_body"));
+		set("#cacheMaxEntries", value("cache_max_entries"));
+		set("#cacheMaxBytes", value("cache_max_bytes"));
+		set("#cacheMemEntries", value("cache_memory_entries"));
+		set("#cacheMemBytes", value("cache_memory_bytes"));
+	}
+
+	function ttlCell(seconds) {
+		const n = Number(seconds || 0);
+		const span = document.createElement("span");
+		if (!n) {
+			span.className = "text-warn";
+			span.textContent = "never cache";
+			span.title = "A TTL of 0 excludes this endpoint from caching entirely";
+		} else {
+			span.textContent = fmtDuration(n);
+		}
+		span.dataset.sortValue = String(n);
+		return span;
+	}
+
+	function renderCacheRules(rules) {
+		const tbody = $("#cacheRulesTable tbody");
+		if (!tbody) return;
+		// Adopt the payload as the new truth. Without this, adding a rule drew the
+		// row and the very next render — the purge that follows it — drew the
+		// stale cached copy straight back over the top of it.
+		if (rules) renderCache._rules = rules;
+		const entries = Object.entries(renderCache._rules || {});
+		tbody.innerHTML = "";
+		if (!entries.length) {
+			tbody.appendChild(tr(["No rules — every cacheable endpoint uses the default TTL.", "", "", "", "", ""]));
+			return;
+		}
+		for (const [pattern, info] of entries) {
+			const remove = document.createElement("button");
+			remove.className = "btn btn--outline btn--sm";
+			remove.textContent = "Remove";
+			remove.addEventListener("click", () => clearCacheRule(pattern));
+			const row = tr([
+				sortable(pattern, pattern),
+				typeBadge(info),
+				ttlCell(info.TTL),
+				info.Note || "—",
+				tsNode(info.Added),
+				remove,
+			]);
+			row.children[0].className = "mono";
+			tbody.appendChild(row);
+		}
+	}
+
+	function renderCacheEndpoints(data) {
+		const tbody = $("#cacheEndpointsTable tbody");
+		if (!tbody) return;
+		const q = ($("#cacheEndpointFilter")?.value || "").trim().toLowerCase();
+		const rows = Object.entries(data || {}).filter(([key]) => !q || key.toLowerCase().includes(q));
+		tbody.innerHTML = "";
+		if (!rows.length) {
+			tbody.appendChild(tr([q ? "No matches." : "Nothing has been cached yet.", "", "", "", "", "", "", "", ""]));
+			return;
+		}
+		for (const [endpoint, info] of rows) {
+			const hits = Number(info.Hits || 0) + Number(info.Stale || 0);
+			const misses = Number(info.Misses || 0);
+			const rate = hits + misses ? hits / (hits + misses) : 0;
+			const rateSpan = document.createElement("span");
+			rateSpan.textContent = hits + misses ? pct(rate) : "—";
+			// A near-zero hit rate on a busy endpoint is the actionable case: the
+			// caller is varying its query, so caching cannot help until a rule does.
+			if (hits + misses >= 20 && rate < 0.1) rateSpan.className = "text-warn";
+			else if (rate >= 0.5) rateSpan.className = "text-ok";
+			rateSpan.dataset.sortValue = String(rate);
+
+			const rule = document.createElement("button");
+			rule.className = "btn btn--ghost btn--xs";
+			rule.textContent = "Rule";
+			rule.title = "Write a cache rule for this endpoint";
+			rule.addEventListener("click", () => prefillCacheRule(endpoint));
+			const purge = document.createElement("button");
+			purge.className = "btn btn--ghost btn--xs";
+			purge.textContent = "Purge";
+			purge.title = "Drop every cached response for this endpoint";
+			purge.addEventListener("click", () => purgeCache({ pattern: endpoint }, `Purged ${endpoint}`));
+			const actions = document.createElement("div");
+			actions.className = "row-actions";
+			actions.append(rule, purge);
+
+			const row = tr([
+				sortable(endpoint, endpoint),
+				fmtCount(info.Hits),
+				fmtCount(misses),
+				rateSpan,
+				fmtCount(info.Stale),
+				fmtCount(info.Skipped),
+				sortable(fmtBytes(info.Bytes), info.Bytes || 0),
+				tsNode(info.LastHit),
+				actions,
+			]);
+			row.children[0].className = "mono";
+			tbody.appendChild(row);
+		}
+	}
+
+	// --- The entry browser (fetched on demand, paged on the server) -----------
+	const cacheBrowser = { offset: 0, limit: 25, total: 0, loaded: false, loading: false };
+
+	async function loadCacheEntries(reset = false) {
+		if (cacheBrowser.loading) return;
+		if (reset) cacheBrowser.offset = 0;
+		const tbody = $("#cacheEntriesTable tbody");
+		if (!tbody) return;
+		cacheBrowser.loading = true;
+		const query = $("#cacheSearch")?.value.trim() || "";
+		const sort = $("#cacheSort")?.value || "hits";
+		cacheBrowser.limit = Number($("#cachePageSize")?.value) || 25;
+		const purgeMatch = $("#cachePurgeMatchBtn");
+		if (purgeMatch) purgeMatch.hidden = !query;
+		try {
+			const params = new URLSearchParams({
+				q: query,
+				offset: String(cacheBrowser.offset),
+				limit: String(cacheBrowser.limit),
+				sort,
+			});
+			const res = await api(`/admin/cache/entries?${params.toString()}`);
+			if (!res.ok) throw new Error(String(res.status));
+			const page = await res.json();
+			cacheBrowser.total = Number(page.Total || 0);
+			cacheBrowser.loaded = true;
+			renderCacheEntries(page);
+			if (page.State) renderCache({ Cache: page.State });
+		} catch {
+			tbody.innerHTML = "";
+			tbody.appendChild(tr(["Could not load the cache.", "", "", "", "", "", ""]));
+		} finally {
+			cacheBrowser.loading = false;
+		}
+	}
+
+	function renderCacheEntries(page) {
+		const tbody = $("#cacheEntriesTable tbody");
+		if (!tbody) return;
+		const entries = page.Entries || [];
+		tbody.innerHTML = "";
+		if (!entries.length) {
+			tbody.appendChild(
+				tr([page.Query ? "No cached entry matches that." : "The cache is empty.", "", "", "", "", "", ""]),
+			);
+		}
+		for (const entry of entries) {
+			const key = document.createElement("span");
+			key.className = "mono cache-key";
+			key.textContent = entry.Key || "";
+			key.title = entry.Key || "";
+
+			const expires = document.createElement("span");
+			const remaining = Math.max(0, (Number(entry.ExpiresAt) || 0) - Date.now() / 1000);
+			if (!entry.Fresh) {
+				expires.className = "text-warn";
+				expires.textContent = "expired";
+				expires.title = "Still served if Roblox refuses us, while it is inside the stale window";
+			} else {
+				expires.textContent = `in ${fmtDuration(remaining)}`;
+			}
+
+			const actions = document.createElement("div");
+			actions.className = "row-actions";
+			const inspect = document.createElement("button");
+			inspect.className = "btn btn--ghost btn--xs";
+			inspect.textContent = "Inspect";
+			inspect.addEventListener("click", () => inspectCacheEntry(entry.Id));
+			const refresh = document.createElement("button");
+			refresh.className = "btn btn--ghost btn--xs";
+			refresh.textContent = "Refresh";
+			refresh.title = "Fetch this from Roblox now and replace the stored copy";
+			refresh.addEventListener("click", e => refreshCacheEntry(e.currentTarget, entry.Id));
+			const purge = document.createElement("button");
+			purge.className = "btn btn--ghost btn--xs";
+			purge.textContent = "Purge";
+			purge.addEventListener("click", () => purgeCache({ id: entry.Id }, "Entry purged"));
+			actions.append(inspect, refresh, purge);
+
+			const row = tr([
+				key,
+				sortable(fmtBytes(entry.Bytes), entry.Bytes),
+				fmtCount(entry.Hits),
+				sortable(fmtDuration(entry.Age), entry.Age),
+				expires,
+				entry.Rule || "default",
+				actions,
+			]);
+			if (!entry.Successful) row.classList.add("row--emph");
+			tbody.appendChild(row);
+		}
+		const first = page.Total ? page.Offset + 1 : 0;
+		const last = page.Offset + entries.length;
+		setText(
+			"cachePageStatus",
+			`Showing ${fmtCount(first)}–${fmtCount(last)} of ${fmtCount(page.Total)}` +
+				(page.Query ? ` matching “${page.Query}”` : "") +
+				` • ${fmtCount(page.FreshCount)} still fresh`,
+		);
+		const prev = $("#cachePrevBtn");
+		const next = $("#cacheNextBtn");
+		if (prev) prev.disabled = page.Offset <= 0;
+		if (next) next.disabled = last >= page.Total;
+	}
+
+	async function inspectCacheEntry(id) {
+		const box = $("#cacheInspector");
+		if (!box) return;
+		box.hidden = false;
+		box.innerHTML = '<div class="text-muted">Loading the stored response…</div>';
+		try {
+			const res = await api(`/admin/cache/entry?id=${encodeURIComponent(id)}`);
+			const data = await res.json();
+			if (!res.ok) {
+				box.innerHTML = `<div class="callout callout--warn">${escapeHtml(String(data))}</div>`;
+				return;
+			}
+			let body = data.Body || "";
+			try {
+				body = JSON.stringify(JSON.parse(body), null, 2);
+			} catch {
+				/* not JSON — show it exactly as it was stored */
+			}
+			box.innerHTML =
+				'<div class="cache-inspector">' +
+				`<div class="cache-inspector__head"><strong class="mono">${escapeHtml(data.Key || "")}</strong>` +
+				'<button type="button" class="btn btn--ghost btn--xs" data-close-inspector>Close</button></div>' +
+				'<dl class="lookup__grid">' +
+				[
+					["Stored", toTS(data.StoredAt)],
+					["Expires", toTS(data.ExpiresAt)],
+					["TTL", fmtDuration(data.TTL)],
+					["Age", fmtDuration(data.Age)],
+					[
+						"State",
+						data.Fresh
+							? "fresh"
+							: data.ServableStale
+								? "expired (still usable if Roblox fails)"
+								: "expired",
+					],
+					["Hits", fmtCount(data.Hits)],
+					["Size", `${fmtBytes(data.Bytes)} (body ${fmtCount(data.BodyLength)} chars)`],
+					["Fetched via", data.UpstreamMethod || "—"],
+					["Roblox said", data.UpstreamStatus || "—"],
+					["Rule", data.Rule || "default TTL"],
+				]
+					.map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`)
+					.join("") +
+				"</dl>" +
+				`<pre class="cache-inspector__body">${escapeHtml(body)}</pre>` +
+				"</div>";
+			box.querySelector("[data-close-inspector]")?.addEventListener("click", () => {
+				box.hidden = true;
+				box.innerHTML = "";
+			});
+		} catch {
+			box.innerHTML = '<div class="callout callout--bad">Could not load that entry.</div>';
+		}
+	}
+
+	async function refreshCacheEntry(btn, id) {
+		await withBusy(btn, "…", async () => {
+			try {
+				const res = await api("/admin/cache/refresh", { method: "POST", body: JSON.stringify({ id }) });
+				const data = await res.json();
+				if (!res.ok) throw new Error(String(data));
+				showToast(data.OK ? "Refetched from Roblox" : data.Message || "Upstream refused; entry left alone");
+				loadCacheEntries();
+			} catch {
+				showToast("Could not refresh that entry");
+			}
+		});
+	}
+
+	async function purgeCache(payload, message) {
+		try {
+			const res = await api("/admin/cache/purge", { method: "POST", body: JSON.stringify(payload) });
+			const data = await res.json();
+			if (!res.ok) throw new Error(String(data));
+			showToast(`${message} (${fmtCount(data.Removed)} entr${data.Removed === 1 ? "y" : "ies"})`);
+			if (data.State) renderCache({ Cache: data.State });
+			loadCacheEntries(true);
+		} catch {
+			showToast("Purge failed");
+		}
+	}
+
+	function prefillCacheRule(pattern) {
+		const input = $("#cacheRulePattern");
+		if (input) input.value = pattern;
+		document.getElementById("section-cache")?.scrollIntoView({ behavior: "smooth", block: "start" });
+		input?.focus();
+	}
+
+	async function saveCacheSettings(settings, message) {
+		try {
+			const res = await api("/admin/settings", { method: "POST", body: JSON.stringify({ settings }) });
+			const data = await res.json();
+			if (!res.ok) throw new Error(String(res.status));
+			const failures = Object.entries(data.Results || {}).filter(([, msg]) => msg !== "Success");
+			if (failures.length) throw new Error(failures.map(([key, msg]) => `${key}: ${msg}`).join(", "));
+			showToast(message);
+		} catch (err) {
+			showToast("Could not save: " + err.message);
+		}
+		refreshAll(true);
+	}
+
+	async function clearCacheRule(pattern) {
+		try {
+			const res = await api("/admin/cache/rule/clear", { method: "POST", body: JSON.stringify({ pattern }) });
+			const data = await res.json();
+			if (!res.ok) throw new Error(String(res.status));
+			renderCacheRules(data.CacheRules || {});
+			showToast("Cache rule removed");
+			loadCacheEntries(true);
+		} catch {
+			showToast("Could not remove that rule");
+		}
+	}
+
+	$("#cacheEnabled")?.addEventListener("change", e =>
+		saveCacheSettings({ cache_enabled: e.target.checked ? 1 : 0 }, e.target.checked ? "Caching on" : "Caching off"),
+	);
+	$("#cacheDiskEnabled")?.addEventListener("change", e =>
+		saveCacheSettings(
+			{ cache_disk_enabled: e.target.checked ? 1 : 0 },
+			e.target.checked ? "Entries are shared on disk" : "Memory-only caching",
+		),
+	);
+	$$(".cache-opt").forEach(box =>
+		box.addEventListener("change", () =>
+			saveCacheSettings({ [box.dataset.setting]: box.checked ? 1 : 0 }, box.checked ? "Turned on" : "Turned off"),
+		),
+	);
+
+	$("#cacheForm")?.addEventListener("submit", e => {
+		e.preventDefault();
+		saveCacheSettings(
+			{
+				cache_ttl_seconds: Number($("#cacheTtl")?.value),
+				cache_stale_seconds: Number($("#cacheStale")?.value),
+				cache_error_ttl_seconds: Number($("#cacheErrorTtl")?.value),
+				cache_max_body: Number($("#cacheMaxBody")?.value),
+				cache_max_entries: Number($("#cacheMaxEntries")?.value),
+				cache_max_bytes: Number($("#cacheMaxBytes")?.value),
+				cache_memory_entries: Number($("#cacheMemEntries")?.value),
+				cache_memory_bytes: Number($("#cacheMemBytes")?.value),
+			},
+			"Cache settings saved",
+		);
+	});
+
+	$("#cacheRuleForm")?.addEventListener("submit", async e => {
+		e.preventDefault();
+		const pattern = $("#cacheRulePattern")?.value.trim();
+		if (!pattern) return;
+		try {
+			const res = await api("/admin/cache/rule", {
+				method: "POST",
+				body: JSON.stringify({
+					pattern,
+					ttl: Number($("#cacheRuleTtl")?.value || 0),
+					type: $("#cacheRuleType")?.value || "glob",
+					note: $("#cacheRuleNote")?.value.trim() || "",
+				}),
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(data.Message || String(res.status));
+			renderCacheRules(data.CacheRules || {});
+			$("#cacheRulePattern").value = "";
+			$("#cacheRuleNote").value = "";
+			showToast("Cache rule added");
+			// The rule changes what MAY be cached, not what already is, so the
+			// existing entries are dropped rather than left contradicting it.
+			purgeCache({ pattern }, "Rule added; existing entries dropped");
+		} catch (err) {
+			showToast("Cache rule failed: " + err.message);
+		}
+	});
+
+	$("#cacheRefreshBtn")?.addEventListener("click", e =>
+		withBusy(e.currentTarget, "Loading…", () => loadCacheEntries(true)),
+	);
+	$("#cacheSearch")?.addEventListener("input", () => {
+		clearTimeout(loadCacheEntries._t);
+		loadCacheEntries._t = setTimeout(() => loadCacheEntries(true), 250);
+	});
+	$("#cacheSort")?.addEventListener("change", () => loadCacheEntries(true));
+	$("#cachePageSize")?.addEventListener("change", () => loadCacheEntries(true));
+	$("#cachePrevBtn")?.addEventListener("click", () => {
+		cacheBrowser.offset = Math.max(0, cacheBrowser.offset - cacheBrowser.limit);
+		loadCacheEntries();
+	});
+	$("#cacheNextBtn")?.addEventListener("click", () => {
+		if (cacheBrowser.offset + cacheBrowser.limit >= cacheBrowser.total) return;
+		cacheBrowser.offset += cacheBrowser.limit;
+		loadCacheEntries();
+	});
+	$("#cachePurgeMatchBtn")?.addEventListener("click", () => {
+		const query = $("#cacheSearch")?.value.trim();
+		if (!query) return;
+		if (!confirm(`Drop every cached response whose endpoint matches "${query}"?`)) return;
+		purgeCache({ pattern: query }, "Matching entries purged");
+	});
+	$("#cachePurgeExpiredBtn")?.addEventListener("click", () =>
+		purgeCache({ expired: true }, "Expired entries purged"),
+	);
+	$("#cachePurgeAllBtn")?.addEventListener("click", () => {
+		if (!confirm("Empty the whole cache? The next request for each key goes to Roblox.")) return;
+		purgeCache({ all: true }, "Cache emptied");
+	});
+	$("#cacheEndpointFilter")?.addEventListener("input", () => renderCacheEndpoints(renderCache._endpoints || {}));
+	$("#clearCacheStatsBtn")?.addEventListener("click", e =>
+		withBusy(e.currentTarget, "Clearing…", async () => {
+			try {
+				const res = await api("/admin/data/clear", {
+					method: "POST",
+					body: JSON.stringify({ target: "cache" }),
+				});
+				if (!res.ok) throw new Error(String(res.status));
+				showToast("Cache stats cleared (the stored responses are untouched)");
+				refreshAll(true);
+			} catch {
+				showToast("Could not clear the cache stats");
+			}
+		}),
+	);
+
+	// The browser is loaded the first time the section is actually looked at, so
+	// a dashboard opened on the Overview never pays for a full cache scan.
+	function watchCacheSection() {
+		const section = document.getElementById("section-cache");
+		if (!section || typeof IntersectionObserver !== "function") {
+			loadCacheEntries(true);
+			return;
+		}
+		const observer = new IntersectionObserver(
+			entries => {
+				if (entries.some(entry => entry.isIntersecting) && !cacheBrowser.loaded) loadCacheEntries(true);
+			},
+			{ rootMargin: "200px" },
+		);
+		observer.observe(section);
+	}
+
+	// -----------------------------
 	// Tarpit controls
 	// -----------------------------
 	async function saveTarpitSettings(settings, message) {
@@ -4607,7 +5529,19 @@ const print = console.log;
 
 		if (robloxLimited > 0) {
 			level = "bad";
-			notes.push(`Roblox has rate-limited us ${fmtCount(robloxLimited)} time(s) — reduce upstream volume.`);
+			// The banner used to say only "reduce upstream volume", which is the
+			// diagnosis, not an action. The cache is the action — so say what it
+			// is already doing, or that it is switched off while this is happening.
+			const cacheOn = Boolean(d.Cache?.Enabled);
+			const stats = d.CacheStats || {};
+			const saved = Number(stats.Hits || 0) + Number(stats.Stale || 0) + Number(stats.Coalesced || 0);
+			notes.push(
+				`Roblox has rate-limited us ${fmtCount(robloxLimited)} time(s). ` +
+					(cacheOn
+						? `The cache has already kept ${fmtCount(saved)} request(s) away from them — raise the TTL ` +
+							"on the busiest endpoint to keep more."
+						: "The response cache is OFF; turning it on is the fastest way to cut upstream volume."),
+			);
 		}
 		const rate = Number(topCaller?.[1]?.Rate1 || 0);
 		if (rate >= 120) {
@@ -4638,9 +5572,13 @@ const print = console.log;
 		banner.hidden = level === "ok" && !notes.length;
 		banner.className = `threat-banner threat-banner--${level}`;
 		const label = level === "bad" ? "Needs attention" : level === "warn" ? "Worth a look" : "All clear";
+		// Point the link at whatever the banner is complaining about: sending
+		// someone to Top Talkers when the problem is that Roblox is refusing US
+		// is a wasted click at the moment they can least afford one.
+		const target = robloxLimited > 0 ? "#section-cache" : "#section-callers";
 		banner.innerHTML =
 			`<strong>${label}</strong> ${escapeHtml(notes.join(" "))}` +
-			(level !== "ok" ? ' <a href="#section-callers">Investigate →</a>' : "");
+			(level !== "ok" ? ` <a href="${target}">Investigate →</a>` : "");
 	}
 
 	// -----------------------------
@@ -4685,6 +5623,8 @@ const print = console.log;
 		"#tarpitCategoryTable",
 		"#tarpitReasonsTable",
 		"#tarpitIpsTable",
+		"#cacheRulesTable",
+		"#cacheEndpointsTable",
 	];
 
 	function initAllSortables() {
@@ -4778,6 +5718,8 @@ const print = console.log;
 	// Initial load
 	function boot() {
 		initAllSortables();
+		initAllPagers();
+		watchCacheSection();
 		refreshAll(true);
 	}
 	document.addEventListener("DOMContentLoaded", boot);

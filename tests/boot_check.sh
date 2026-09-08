@@ -21,6 +21,7 @@ ROXY_FILE_ROOT="$SANDBOX" ROXY_DATA_FILE="$SANDBOX/data.json" \
 	ROXY_COORD_FILE="$SANDBOX/coord.json" ROXY_STATE_FILE="$SANDBOX/state.json" \
 	ROXY_TARPIT_FILE="$SANDBOX/tarpit.json" ROXY_WORKERS_FILE="$SANDBOX/workers.json" \
 	ROXY_CAPTURE_FILE="$SANDBOX/capture.json" \
+	ROXY_CACHE_DIR="$SANDBOX/cache" \
 	../env2/bin/python -c "import index; index.app.run(port=5099)" > /tmp/roxy_boot.log 2>&1 &
 SERVER_PID=$!
 sleep 3

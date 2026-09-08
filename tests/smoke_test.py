@@ -29,6 +29,8 @@ os.environ["ROXY_COORD_FILE"] = os.path.join(sandbox, "roxy_coord.json")
 os.environ["ROXY_TARPIT_FILE"] = os.path.join(sandbox, "roxy_tarpit.json")
 os.environ["ROXY_WORKERS_FILE"] = os.path.join(sandbox, "roxy_workers.json")
 os.environ["ROXY_CAPTURE_FILE"] = os.path.join(sandbox, "roxy_capture.json")
+# The response cache is a DIRECTORY of shard files, not a single file.
+os.environ["ROXY_CACHE_DIR"] = os.path.join(sandbox, "cache")
 # Rotation proxy is configured from the start (only "token"/"rotate" methods
 # exist now, so most fallback tests need Rotate available); specific sections
 # temporarily remove/restore this file to test the disabled/unavailable cases.
@@ -2203,6 +2205,7 @@ for existing in list(runtime.get_header_rules()):
 # =============================================================================
 # Diagnostics overhaul: attribution, caller identity, capture, rule messages
 # =============================================================================
+import cache as cache_module  # noqa: E402
 import capture as capture_module  # noqa: E402
 import workers as workers_module  # noqa: E402
 
@@ -2215,6 +2218,12 @@ def diag():
 def clear_all_diag():
     diag_module.clear_stats(diag_module.CLEAR_ALL_NAMES)
     capture_module.reset()
+    # The response cache is ON by default, so a section that re-requests a URL an
+    # earlier section already fetched would be served from cache and see no
+    # upstream call at all — which reads as "the proxy stopped working" rather
+    # than "the cache worked". Sections that mean to test the cache turn it on
+    # explicitly.
+    cache_module.clear()
 
 
 IP_ATT = {"X-Forwarded-For": "10.55.0.1"}
@@ -2237,6 +2246,7 @@ def fresh_upstream():
     proxy_module.requests.request = fake_upstream
     proxy_module.set_tokens(["FAKE_TOKEN_AAA"])
     reset_routing()
+    cache_module.clear()  # A cached 200 would hide whatever the section is about to break.
 
 print("\n== Status codes are attributed to whoever produced them ==")
 reset_routing()
@@ -2795,6 +2805,326 @@ runtime.set_setting("tarpit_enabled", 0)
 runtime.unblock_endpoint("badges.roblox.com")
 for existing in list(runtime.get_header_rules()):
     client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": existing})
+
+# =============================================================================
+# Response cache
+# =============================================================================
+print("\n== Response cache: a repeat request never reaches Roblox ==")
+fresh_upstream()
+clear_all_diag()
+runtime.set_setting("cache_enabled", 1)
+runtime.set_setting("cache_ttl_seconds", 60)
+runtime.set_setting("cache_max_body", config.CACHE_MAX_BODY)
+# A fresh IP: 10.70.0.1 is deliberately left throttled by the cross-worker test.
+IP_CACHE = {"X-Forwarded-For": "10.72.0.1"}
+VOTES = "/games.roblox.com/v1/games/votes?universeIds=9967558039"
+
+before = len(upstream_calls)
+first = api_client.get(VOTES, headers=IP_CACHE)
+second = api_client.get(VOTES, headers=IP_CACHE)
+check("First request is served", first.status_code == 200, first.status_code)
+check("...and marked as a cache MISS", first.headers.get("Roxy-Cache") == "MISS", first.headers.get("Roxy-Cache"))
+check("Second identical request is served", second.status_code == 200, second.status_code)
+check("...from the cache", second.headers.get("Roxy-Cache") == "HIT", second.headers.get("Roxy-Cache"))
+check("...with the byte-identical body", second.data == first.data, second.data[:60])
+check("...and Roblox was only asked once", len(upstream_calls) - before == 1, len(upstream_calls) - before)
+check("A hit reports the entry's age", second.headers.get("Roxy-Cache-Age") is not None, dict(second.headers))
+
+stats = diag()["CacheStats"]
+check("The hit is counted", stats.get("Hits") == 1, stats)
+check("...and so is the miss", stats.get("Misses") == 1, stats)
+check("...and the store", stats.get("Stores") == 1, stats)
+sources = diag()["StatusSources"]
+check("A cached answer is attributed to the cache, not to Roblox", sources["Cache"].get("200") == 1, sources)
+check("...so Roblox's column still counts only what Roblox answered", sources["Roblox"].get("200") == 1, sources)
+endpoints = diag()["CacheEndpoints"]
+votes_row = endpoints.get("games.roblox.com/v1/games/votes", {})
+check("Per-endpoint cache stats name the endpoint", bool(votes_row), list(endpoints))
+check("...and record its hit", votes_row.get("Hits") == 1, votes_row)
+
+print("\n== Cache keys: what counts as the same request ==")
+before = len(upstream_calls)
+api_client.get("/games.roblox.com/v1/games/votes?universeIds=1&other=2", headers=IP_CACHE)
+api_client.get("/games.roblox.com/v1/games/votes?other=2&universeIds=1", headers=IP_CACHE)
+check("Query parameter ORDER does not split the cache", len(upstream_calls) - before == 1, len(upstream_calls) - before)
+before = len(upstream_calls)
+api_client.get("/games.roblox.com/v1/games/votes?universeIds=999", headers=IP_CACHE)
+check("A different query is a different entry", len(upstream_calls) - before == 1, len(upstream_calls) - before)
+before = len(upstream_calls)
+pretty = api_client.get(VOTES + "&prettyprint=true", headers=IP_CACHE)
+check("prettyprint reuses the cached body", len(upstream_calls) - before == 0, len(upstream_calls) - before)
+check("...and is still formatted", b"\n" in pretty.data, pretty.data[:60])
+check("...from a cache hit", pretty.headers.get("Roxy-Cache") == "HIT", pretty.headers.get("Roxy-Cache"))
+
+print("\n== Per-endpoint cache rules (including 'never cache this') ==")
+fresh_upstream()
+clear_all_diag()
+r = client.post(
+    "/admin/cache/rule",
+    headers=IP_MAIN,
+    json={"pattern": "users.roblox.com/v1/never", "ttl": 0, "note": "test"},
+)
+check("A cache rule can be added", r.status_code == 200, r.status_code)
+check("...and is listed", "users.roblox.com/v1/never" in r.get_json()["CacheRules"], r.get_json())
+before = len(upstream_calls)
+api_client.get("/users.roblox.com/v1/never", headers=IP_CACHE)
+api_client.get("/users.roblox.com/v1/never", headers=IP_CACHE)
+check("A TTL of 0 means never cache", len(upstream_calls) - before == 2, len(upstream_calls) - before)
+check("...and the skip is counted", diag()["CacheStats"].get("Skipped", 0) >= 1, diag()["CacheStats"])
+client.post("/admin/cache/rule", headers=IP_MAIN, json={"pattern": "users.roblox.com/v1/long", "ttl": 3600})
+before = len(upstream_calls)
+api_client.get("/users.roblox.com/v1/long", headers=IP_CACHE)
+api_client.get("/users.roblox.com/v1/long", headers=IP_CACHE)
+check("A rule with a TTL caches that endpoint", len(upstream_calls) - before == 1, len(upstream_calls) - before)
+entries = client.get("/admin/cache/entries?q=v1/long", headers=IP_MAIN).get_json()["Entries"]
+check("...for the rule's TTL, not the default", entries and entries[0]["TTL"] == 3600, entries)
+check("...and the entry names the rule that decided it", entries[0]["Rule"] == "users.roblox.com/v1/long", entries[0])
+r = client.post("/admin/cache/rule/clear", headers=IP_MAIN, json={"pattern": "users.roblox.com/v1/never"})
+check("A cache rule can be removed", "users.roblox.com/v1/never" not in r.get_json()["CacheRules"], r.get_json())
+client.post("/admin/cache/rule/clear", headers=IP_MAIN, json={"pattern": "users.roblox.com/v1/long"})
+
+print("\n== A stale answer beats an error when Roblox refuses ==")
+fresh_upstream()
+clear_all_diag()
+runtime.set_setting("cache_ttl_seconds", 1)
+runtime.set_setting("cache_stale_seconds", 600)
+STALE_URL = "/games.roblox.com/v1/games/stale-test"
+warm = api_client.get(STALE_URL, headers=IP_CACHE)
+check("The entry is warmed from a live upstream", warm.status_code == 200, warm.status_code)
+# Sleep past the entry's real expiry rather than a fixed interval: the TTL is a
+# live setting, and a hard-coded pause that is only just longer than it makes
+# this section a coin flip on a loaded machine.
+_warm_entry = cache_module.get(cache_module.make_key("GET", "games.roblox.com/v1/games/stale-test", {}))
+time.sleep(max(0.2, float(_warm_entry["ExpiresAt"]) - time.time() + 0.3))
+proxy_module.requests.request = failing_upstream  # Roblox now refuses everything.
+stale = api_client.get(STALE_URL, headers=IP_CACHE)
+check("An expired entry still answers when the upstream fails", stale.status_code == 200, stale.status_code)
+check("...marked STALE so it is never mistaken for fresh", stale.headers.get("Roxy-Cache") == "STALE", dict(stale.headers))
+check("...with the last good body", stale.data == warm.data, stale.data[:60])
+check("...counted separately from ordinary hits", diag()["CacheStats"].get("Stale", 0) >= 1, diag()["CacheStats"])
+runtime.set_setting("cache_stale_seconds", 0)
+after_off = api_client.get(STALE_URL, headers=IP_CACHE)
+check("With the stale window at 0 the failure is passed through", after_off.status_code == 500, after_off.status_code)
+runtime.set_setting("cache_stale_seconds", config.CACHE_STALE_SECONDS)
+runtime.set_setting("cache_ttl_seconds", 60)
+fresh_upstream()
+
+print("\n== What the cache refuses to store ==")
+clear_all_diag()
+runtime.set_setting("cache_max_body", 5)
+before = len(upstream_calls)
+api_client.get("/games.roblox.com/v1/games/too-big", headers=IP_CACHE)
+api_client.get("/games.roblox.com/v1/games/too-big", headers=IP_CACHE)
+check("A body over the size cap is never cached", len(upstream_calls) - before == 2, len(upstream_calls) - before)
+check("...rather than cached truncated", diag()["CacheStats"].get("Skipped", 0) >= 1, diag()["CacheStats"])
+runtime.set_setting("cache_max_body", config.CACHE_MAX_BODY)
+
+clear_all_diag()
+cache_module.clear()
+proxy_module.requests.request = failing_upstream  # 429s: transient, must never be cached.
+api_client.get("/games.roblox.com/v1/games/rate-limited", headers=IP_CACHE)
+second429 = api_client.get("/games.roblox.com/v1/games/rate-limited", headers=IP_CACHE)
+check("A 429 from Roblox is never cached", second429.headers.get("Roxy-Cache") == "MISS", dict(second429.headers))
+check("...so nothing is stored to replay the outage from", cache_module.get_state()["Entries"] == 0, cache_module.get_state())
+fresh_upstream()
+
+clear_all_diag()
+cache_module.clear()
+
+
+def upstream_404(method, url, headers=None, params=None, data=None, cookies=None, timeout=None, proxies=None):
+    upstream_calls.append({"method": method, "url": url, "headers": headers or {}, "params": params or {}})
+    return FakeUpstreamResponse(status=404, text='{"errors":[]}')
+
+
+proxy_module.requests.request = upstream_404
+before = len(upstream_calls)
+api_client.get("/games.roblox.com/v1/games/missing", headers=IP_CACHE)
+api_client.get("/games.roblox.com/v1/games/missing", headers=IP_CACHE)
+check("A 404 is not cached by default", len(upstream_calls) - before == 2, len(upstream_calls) - before)
+check("...so nothing is stored for it", cache_module.get_state()["Entries"] == 0, cache_module.get_state())
+runtime.set_setting("cache_error_ttl_seconds", 60)
+clear_all_diag()
+first404 = api_client.get("/games.roblox.com/v1/games/missing-two", headers=IP_CACHE)
+second404 = api_client.get("/games.roblox.com/v1/games/missing-two", headers=IP_CACHE)
+check("With error caching on, a 404 is reused", second404.headers.get("Roxy-Cache") == "HIT", dict(second404.headers))
+check("...and the caller still sees the same answer", second404.data == first404.data, second404.data[:60])
+runtime.set_setting("cache_error_ttl_seconds", 0)
+fresh_upstream()
+
+print("\n== POST caching is opt-in and keyed on the body ==")
+clear_all_diag()
+before = len(upstream_calls)
+api_client.post("/users.roblox.com/v1/usernames/users", headers=IP_CACHE, json={"usernames": ["a"]})
+api_client.post("/users.roblox.com/v1/usernames/users", headers=IP_CACHE, json={"usernames": ["a"]})
+check("POST is not cached by default", len(upstream_calls) - before == 2, len(upstream_calls) - before)
+runtime.set_setting("cache_post_requests", 1)
+clear_all_diag()
+before = len(upstream_calls)
+api_client.post("/users.roblox.com/v1/usernames/users", headers=IP_CACHE, json={"usernames": ["a"]})
+api_client.post("/users.roblox.com/v1/usernames/users", headers=IP_CACHE, json={"usernames": ["a"]})
+check("With it on, an identical POST body is reused", len(upstream_calls) - before == 1, len(upstream_calls) - before)
+before = len(upstream_calls)
+api_client.post("/users.roblox.com/v1/usernames/users", headers=IP_CACHE, json={"usernames": ["b"]})
+check("...and a different body is a different entry", len(upstream_calls) - before == 1, len(upstream_calls) - before)
+runtime.set_setting("cache_post_requests", 0)
+
+print("\n== The cache survives losing the memory tier (it is on disk, shared) ==")
+fresh_upstream()
+clear_all_diag()
+DISK_URL = "/thumbnails.roblox.com/v1/disk-test"
+api_client.get(DISK_URL, headers=IP_CACHE)
+cache_module._mem_clear()  # Simulate the worker that answers next never having seen it.
+cache_module._index_forget()
+before = len(upstream_calls)
+from_disk = api_client.get(DISK_URL, headers=IP_CACHE)
+check("A cold worker finds the entry on disk", from_disk.headers.get("Roxy-Cache") == "HIT", dict(from_disk.headers))
+check("...without asking Roblox again", len(upstream_calls) - before == 0, len(upstream_calls) - before)
+runtime.set_setting("cache_disk_enabled", 0)
+cache_module._mem_clear()
+before = len(upstream_calls)
+api_client.get(DISK_URL, headers=IP_CACHE)
+check("With the disk tier off, a cold memory tier is a miss", len(upstream_calls) - before == 1, len(upstream_calls) - before)
+runtime.set_setting("cache_disk_enabled", 1)
+
+print("\n== Answering a throttled caller from cache (opt-in) ==")
+fresh_upstream()
+clear_all_diag()
+cache_module.clear()
+THROTTLED_IP = {"X-Forwarded-For": "10.72.9.9"}
+THROTTLE_URL = "/games.roblox.com/v1/games/throttle-cache"
+runtime.set_setting("cache_serve_throttled", 0)
+runtime.set_setting("allowed_requests_per_minute", 1)
+runtime.set_setting("throttle_reset_duration", 60)
+# A cache HIT still counts toward the per-IP limit — the cache decides where an
+# allowed answer comes from, never who is allowed one — so the quota runs out
+# whether the answers came from Roblox or from us.
+refused = None
+for _ in range(4):
+    refused = api_client.get(THROTTLE_URL, headers=THROTTLED_IP)
+    if refused.status_code == 429:
+        break
+check("A throttled caller is refused by default", refused.status_code == 429, refused.status_code)
+runtime.set_setting("cache_serve_throttled", 1)
+served = api_client.get(THROTTLE_URL, headers=THROTTLED_IP)
+check("With the setting on they get the cached answer instead", served.status_code == 200, served.status_code)
+check("...from the cache", served.headers.get("Roxy-Cache") == "HIT", dict(served.headers))
+uncached = api_client.get("/games.roblox.com/v1/games/not-warmed", headers=THROTTLED_IP)
+check("...but an uncached path is still refused", uncached.status_code == 429, uncached.status_code)
+runtime.set_setting("cache_serve_throttled", 0)
+runtime.set_setting("allowed_requests_per_minute", 100000)
+
+print("\n== Cache off means every request goes upstream ==")
+fresh_upstream()
+clear_all_diag()
+runtime.set_setting("cache_enabled", 0)
+before = len(upstream_calls)
+off = api_client.get("/games.roblox.com/v1/games/no-cache", headers=IP_CACHE)
+api_client.get("/games.roblox.com/v1/games/no-cache", headers=IP_CACHE)
+check("Nothing is cached while the cache is off", len(upstream_calls) - before == 2, len(upstream_calls) - before)
+check("...and the header says so", off.headers.get("Roxy-Cache") == "OFF", off.headers.get("Roxy-Cache"))
+runtime.set_setting("cache_enabled", 1)
+
+print("\n== Browsing, inspecting and purging the cache ==")
+fresh_upstream()
+clear_all_diag()
+cache_module.clear()
+for index_id in range(8):
+    api_client.get(f"/games.roblox.com/v1/games/browse?id={index_id}", headers=IP_CACHE)
+api_client.get("/badges.roblox.com/v1/badges/keep", headers=IP_CACHE)
+page = client.get("/admin/cache/entries?limit=3", headers=IP_MAIN).get_json()
+check("The browser pages the entry list", len(page["Entries"]) == 3, page["Entries"])
+check("...and reports the true total", page["Total"] == 9, page["Total"])
+page_two = client.get("/admin/cache/entries?limit=3&offset=3", headers=IP_MAIN).get_json()
+check("...with a second page of different entries", {e["Id"] for e in page_two["Entries"]}.isdisjoint({e["Id"] for e in page["Entries"]}), page_two["Entries"])
+check("...and carries the store's state alongside", page["State"]["Entries"] >= 1, page["State"])
+check("A listed entry never carries its body", "Body" not in page["Entries"][0], page["Entries"][0])
+found = client.get("/admin/cache/entries?q=badges", headers=IP_MAIN).get_json()
+check("The list can be searched by key", found["Total"] == 1, found)
+entry_id = found["Entries"][0]["Id"]
+full = client.get(f"/admin/cache/entry?id={entry_id}", headers=IP_MAIN)
+check("One entry can be inspected in full", full.status_code == 200, full.status_code)
+check("...including its body", full.get_json().get("Body") == '{"ok":true}', full.get_json())
+r = client.post("/admin/cache/purge", headers=IP_MAIN, json={"id": entry_id})
+check("A single entry can be purged", r.status_code == 200, r.status_code)
+check("...and is gone", client.get(f"/admin/cache/entry?id={entry_id}", headers=IP_MAIN).status_code == 404)
+r = client.post("/admin/cache/purge", headers=IP_MAIN, json={"pattern": "games.roblox.com/v1/games/browse"})
+check("A whole endpoint can be purged by pattern", r.get_json()["Removed"] == 8, r.get_json())
+check("...leaving the rest alone", client.get("/admin/cache/entries", headers=IP_MAIN).get_json()["Total"] == 0, "browse entries were the only ones left")
+api_client.get("/games.roblox.com/v1/games/purge-all", headers=IP_CACHE)
+r = client.post("/admin/cache/purge", headers=IP_MAIN, json={"all": True})
+check("The whole cache can be emptied", r.get_json()["Removed"] >= 1, r.get_json())
+check("...and reads as empty afterwards", client.get("/admin/cache/entries", headers=IP_MAIN).get_json()["Total"] == 0)
+r = client.post("/admin/cache/purge", headers=IP_MAIN, json={})
+check("A purge with no target is rejected rather than guessed at", r.status_code == 400, r.status_code)
+
+print("\n== Refetching one entry on demand ==")
+fresh_upstream()
+clear_all_diag()
+cache_module.clear()
+REFRESH_URL = "/games.roblox.com/v1/games/refresh-me?universeIds=1&universeIds=2&note=a%3Db"
+api_client.get(REFRESH_URL, headers=IP_CACHE)
+entry = client.get("/admin/cache/entries?q=refresh-me", headers=IP_MAIN).get_json()["Entries"][0]
+check("A stored entry keeps the params it was built from", True, entry["Key"])
+before = len(upstream_calls)
+r = client.post("/admin/cache/refresh", headers=IP_MAIN, json={"id": entry["Id"]})
+check("Refresh refetches from Roblox", r.status_code == 200 and r.get_json().get("OK") is True, r.get_json())
+check("...costing exactly one upstream call", len(upstream_calls) - before == 1, len(upstream_calls) - before)
+sent = upstream_calls[-1]["params"]
+check("...with the repeated query values intact", sent.get("universeIds") == ["1", "2"], sent)
+check(
+    "...including a value containing an '=' (never re-parsed out of the key)",
+    sent.get("note") == ["a=b"],
+    sent,
+)
+after = client.get("/admin/cache/entries?q=refresh-me", headers=IP_MAIN).get_json()["Entries"][0]
+check(
+    "...and the stored copy is the new one",
+    after["StoredAt"] > entry["StoredAt"] and after["ExpiresAt"] > entry["ExpiresAt"],
+    (entry["StoredAt"], after["StoredAt"]),
+)
+r = client.post("/admin/cache/refresh", headers=IP_MAIN, json={"id": "not-a-real-id"})
+check("Refreshing a vanished entry is a 404, not a crash", r.status_code == 404, r.status_code)
+
+print("\n== A ceiling of zero holds nothing, rather than holding everything ==")
+fresh_upstream()
+clear_all_diag()
+cache_module.clear()
+runtime.set_setting("cache_max_bytes", 0)
+api_client.get("/games.roblox.com/v1/games/zero-budget", headers=IP_CACHE)
+check("Nothing reaches the disk store with a zero byte budget", cache_module.get_state()["Entries"] == 0, cache_module.get_state())
+runtime.set_setting("cache_max_bytes", config.CACHE_MAX_BYTES)
+runtime.set_setting("cache_max_entries", 0)
+api_client.get("/games.roblox.com/v1/games/zero-entries", headers=IP_CACHE)
+check("...nor with a zero entry budget", cache_module.get_state()["Entries"] == 0, cache_module.get_state())
+runtime.set_setting("cache_max_entries", config.CACHE_MAX_ENTRIES)
+cache_module.clear()
+
+print("\n== Purging a malformed id is refused, not crashed on ==")
+r = client.post("/admin/cache/purge", headers=IP_MAIN, json={"id": "../../etc/passwd"})
+check("A malformed cache id is handled", r.status_code == 200, r.status_code)
+check("...and removes nothing", r.get_json()["Removed"] == 0, r.get_json())
+
+print("\n== Cache state and rates reach the dashboard ==")
+fresh_upstream()
+clear_all_diag()
+cache_module.clear()
+api_client.get("/games.roblox.com/v1/games/state-test", headers=IP_CACHE)
+api_client.get("/games.roblox.com/v1/games/state-test", headers=IP_CACHE)
+d = client.get("/admin/diagnostics?flush=1", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+check("The dashboard is told the cache is on", d["Cache"]["Enabled"] is True, d["Cache"])
+check("...how many entries it holds", d["Cache"]["Entries"] >= 1, d["Cache"])
+check("...and against which ceilings", d["Cache"]["MaxBytes"] > 0 and d["Cache"]["MaxEntries"] > 0, d["Cache"])
+check("...including the per-worker memory tier", d["Cache"]["Memory"]["Count"] >= 1, d["Cache"]["Memory"])
+check("The hit rate is reported over several windows", len(d["CacheRates"]) == 3, d.get("CacheRates"))
+check("...and the recent window sees the hit", d["CacheRates"][0]["Hits"] >= 1, d["CacheRates"])
+check("Cache rules are sent to the dashboard", isinstance(d.get("CacheRules"), dict), type(d.get("CacheRules")))
+check("A cached answer is flagged in the live feed", any(i.get("Cache") == "HIT" for i in d["LiveRequests"]), [i.get("Cache") for i in d["LiveRequests"]][:5])
+r = client.post("/admin/data/clear", headers={**IP_MAIN, "Accept": "application/json"}, json={"target": "cache"})
+check("Cache stats clear on their own", r.status_code == 200, r.status_code)
+check("...zeroing the counters", diag()["CacheStats"].get("Hits") == 0, diag()["CacheStats"])
+check("...without emptying the store itself", cache_module.get_state()["Entries"] >= 1, cache_module.get_state())
+cache_module.clear()
 
 clear_all_diag()
 reset_routing()
