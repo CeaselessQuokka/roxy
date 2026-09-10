@@ -1053,7 +1053,7 @@ def _rate_over(minutes: dict, window: int, now: float) -> int:
     return sum(int(n or 0) for key, n in minutes.items() if str(key).isdigit() and int(key) >= cutoff)
 
 
-def _summarise_activity(store: dict) -> dict:
+def _summarize_activity(store: dict) -> dict:
     """The poll-sized view of an activity store: totals, rates, and the shape of
     the traffic — but not the full per-endpoint/per-IP breakdowns, which are
     fetched on demand. Sending those on every poll is what would make this table
@@ -1971,10 +1971,10 @@ def _tokens_view() -> list:
 # --- Dashboard views ---------------------------------------------------------
 # The dashboard polls often, so what it receives has to stay small. The bulky
 # parts of each record -- a header's distinct values, a user-agent's last full
-# header dump, an endpoint template's concrete paths -- are summarised here and
+# header dump, an endpoint template's concrete paths -- are summarized here and
 # fetched on demand by the drill-down endpoints below. This keeps the poll
 # response roughly two orders of magnitude smaller than the underlying state.
-def _summarise_header_names(store: dict) -> dict:
+def _summarize_header_names(store: dict) -> dict:
     out = {}
     for name, rec in store.items():
         seen = int(rec.get("Count", 0) or 0)
@@ -1993,7 +1993,7 @@ def _summarise_header_names(store: dict) -> dict:
     return out
 
 
-def _summarise_user_agents(store: dict) -> dict:
+def _summarize_user_agents(store: dict) -> dict:
     return {
         ua: {
             "Count": rec.get("Count", 0),
@@ -2005,7 +2005,7 @@ def _summarise_user_agents(store: dict) -> dict:
     }
 
 
-def _summarise_endpoints(store: dict) -> dict:
+def _summarize_endpoints(store: dict) -> dict:
     """Endpoint rows for the poll: enough to identify the last caller inline, with
     the bulky parts (recent-request ring, full headers, concrete paths) left to
     the drill-down. LastIP/LastStatus are cheap and are what the table is read
@@ -2153,9 +2153,9 @@ def get_diagnostics(force_flush: bool = False) -> dict:
                 "RequestFailures": request_failures,
                 "RotateIps": list(reversed(rotate_ips)),  # Most-recent first.
                 "Crawls": crawls,
-                "IpActivity": _summarise_activity(ip_activity),
-                "Callers": _summarise_activity(callers),
-                "Endpoints": _summarise_endpoints(endpoints),
+                "IpActivity": _summarize_activity(ip_activity),
+                "Callers": _summarize_activity(callers),
+                "Endpoints": _summarize_endpoints(endpoints),
                 "BlockedEndpointAttempts": blocked_endpoint_attempts,
                 "RateLimitedAttempts": rate_limited_attempts,
                 "HeaderBlockedAttempts": header_blocked_attempts,
@@ -2180,10 +2180,10 @@ def get_diagnostics(force_flush: bool = False) -> dict:
                 "TarpitIps": tarpit_ips,
                 "TarpitReasons": tarpit_reasons,
                 "Errors": errors,
-                "HeaderNames": _summarise_header_names(header_names),
-                "UserAgents": _summarise_user_agents(user_agents),
-                "BlockedHeaderNames": _summarise_header_names(blocked_header_names),
-                "BlockedUserAgents": _summarise_user_agents(blocked_user_agents),
+                "HeaderNames": _summarize_header_names(header_names),
+                "UserAgents": _summarize_user_agents(user_agents),
+                "BlockedHeaderNames": _summarize_header_names(blocked_header_names),
+                "BlockedUserAgents": _summarize_user_agents(blocked_user_agents),
                 "ServerTime": time.time(),
                 "WorkerStartedAt": _started_at,
                 # Tarpit arrival rate over three windows. Comparing them is the
@@ -2466,7 +2466,7 @@ def _merge_list(key, shared_list, local_list):
     for item in combined:
         if isinstance(item, dict) and item.get("Id"):
             sig = ("id", item["Id"])
-        else:  # Pre-upgrade records have no Id; fall back to the old behaviour.
+        else:  # Pre-upgrade records have no Id; fall back to the old behavior.
             sig = ("raw", json.dumps(item, sort_keys=True, separators=(",", ":"), default=str))
         if sig in seen:
             continue

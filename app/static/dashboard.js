@@ -76,7 +76,25 @@ const print = console.log;
 		const m = Math.floor((s % 3600) / 60);
 		if (d) return `${d}d ${h}h`;
 		if (h) return `${h}h ${m}m`;
-		return `${m}m ${s % 60}s`;
+		// Plain "45s" rather than "0m 45s": every duration on this page under a
+		// minute was reading as a zero-something.
+		return m ? `${m}m ${s % 60}s` : `${s}s`;
+	}
+
+	// A duration in words, for the explanations. fmtDuration is built for table
+	// columns, where "9m 51s" is right; in a sentence it reads as shorthand.
+	function fmtSpan(seconds) {
+		const total = Math.max(0, Math.round(Number(seconds) || 0));
+		const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+		if (total < 60) return plural(total, "second");
+		if (total < 3600) {
+			const minutes = Math.floor(total / 60);
+			const rest = total % 60;
+			return rest ? `${plural(minutes, "minute")} ${rest}s` : plural(minutes, "minute");
+		}
+		const hours = Math.floor(total / 3600);
+		const minutes = Math.floor((total % 3600) / 60);
+		return minutes ? `${plural(hours, "hour")} ${minutes}m` : plural(hours, "hour");
 	}
 
 	// Graceful text setter
@@ -109,7 +127,7 @@ const print = console.log;
 	// different ways (chevrons, badges, inline buttons, nested detail rows), and
 	// threading a sort key through every one of them would be thirty chances to
 	// get it subtly wrong. Reading the rows back gives every table the same
-	// behaviour from one implementation.
+	// behavior from one implementation.
 	//
 	// Two rules keep it honest:
 	//   - a <td> may carry data-sort-value to sort by something other than its
@@ -239,6 +257,136 @@ const print = console.log;
 	// Re-apply every table's sort after a render pass.
 	function sortAllTables() {
 		for (const sel of SORT_STATE.keys()) sortTable(sel);
+	}
+
+	// -----------------------------
+	// Inline help
+	// -----------------------------
+	// Every explanation on this page is a data-help attribute, shown in ONE
+	// floating tooltip parented to <body>. Two reasons it is not the native
+	// title="": a native tooltip takes a second to appear, wraps badly and
+	// truncates the two-sentence explanations most of these need; and a CSS-only
+	// tooltip would be clipped by .table-wrap, which is exactly where the column
+	// headers that most need explaining live.
+	//
+	// Positioning goes through the CSSOM (el.style.x), which the page's CSP
+	// allows — a style="" attribute would be discarded.
+	const helpTip = document.createElement("div");
+	helpTip.className = "help-tip";
+	helpTip.hidden = true;
+	helpTip.setAttribute("role", "tooltip");
+	document.body.appendChild(helpTip);
+
+	function showHelp(target) {
+		const text = target.dataset.help;
+		if (!text) return;
+		// textContent, never innerHTML: some of these quote caller-supplied
+		// names, and a tooltip is not a place to start trusting them.
+		helpTip.textContent = text;
+		// Park it off-screen to measure, so it can never flash at its old
+		// position before the new one is worked out.
+		helpTip.style.left = "0px";
+		helpTip.style.top = "-9999px";
+		helpTip.hidden = false;
+		const anchor = target.getBoundingClientRect();
+		const tip = helpTip.getBoundingClientRect();
+		const margin = 12;
+		const left = Math.max(margin, Math.min(anchor.left, window.innerWidth - tip.width - margin));
+		// Below by default, above when there is no room — so help on a row near
+		// the bottom of a long table is still readable.
+		let top = anchor.bottom + 8;
+		if (top + tip.height > window.innerHeight - margin) top = anchor.top - tip.height - 8;
+		// Final clamp into the viewport. Neither branch above can guarantee it on
+		// its own for a very tall tooltip against a short window.
+		top = Math.min(Math.max(margin, top), Math.max(margin, window.innerHeight - tip.height - margin));
+		helpTip.style.left = `${Math.round(left)}px`;
+		helpTip.style.top = `${Math.round(top)}px`;
+	}
+
+	function hideHelp() {
+		helpTip.hidden = true;
+	}
+
+	const helpTarget = node => (node && node.closest ? node.closest("[data-help]") : null);
+	document.addEventListener("mouseover", e => {
+		const target = helpTarget(e.target);
+		if (target) showHelp(target);
+	});
+	document.addEventListener("mouseout", e => {
+		if (helpTarget(e.target)) hideHelp();
+	});
+	// Keyboard parity: a help marker is focusable, so tabbing to it explains it.
+	document.addEventListener("focusin", e => {
+		const target = helpTarget(e.target);
+		if (target) showHelp(target);
+	});
+	document.addEventListener("focusout", hideHelp);
+	document.addEventListener("keydown", e => {
+		if (e.key === "Escape") hideHelp();
+	});
+	document.addEventListener("click", e => {
+		if (!helpTarget(e.target)) hideHelp();
+	});
+	// Capture phase so scrolling INSIDE a .table-wrap dismisses it too; the
+	// tooltip is position:fixed and would otherwise hang over unrelated content.
+	window.addEventListener("scroll", hideHelp, true);
+
+	// A "?" marker for content built in JS. Markup that is written by hand puts
+	// data-help straight on the element instead.
+	function helpDot(text) {
+		const dot = document.createElement("span");
+		dot.className = "help";
+		dot.dataset.help = text;
+		dot.tabIndex = 0;
+		dot.setAttribute("role", "note");
+		dot.setAttribute("aria-label", `Help: ${text}`);
+		dot.textContent = "?";
+		// A marker sits inside things that do something when clicked — a sortable
+		// column header, a switch. Reading the explanation must not also flip the
+		// switch or re-sort the table underneath it.
+		dot.addEventListener("click", e => {
+			e.preventDefault();
+			e.stopPropagation();
+			showHelp(dot); // Also the only way to reach these on a touch screen.
+		});
+		dot.addEventListener("keydown", e => {
+			if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+		});
+		return dot;
+	}
+
+	// Give every explanation a visible "?" so it can be found rather than
+	// stumbled upon. Hover alone is not discoverable, and the whole point of
+	// these is to be seen by someone who does not already know the word.
+	//
+	// Skipped for form controls and buttons: a marker inside a button reads as
+	// part of the label, and those already invite a hover.
+	function decorateHelp() {
+		for (const el of $$("[data-help]")) {
+			// One tooltip at a time: a native title="" on the same element would
+			// show the browser's own, a second later, saying nearly the same thing.
+			if (el.title) el.removeAttribute("title");
+			if (el.classList.contains("help") || el.querySelector(":scope > .help")) continue;
+			const tag = el.tagName;
+			if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || tag === "BUTTON") continue;
+			// A KPI card carries the explanation; its heading is where the marker
+			// belongs, so the card itself stays a clean block of numbers.
+			const host = el.classList.contains("kpi") ? el.querySelector(".kpi__title") : el;
+			if (!host || host.querySelector(":scope > .help")) continue;
+			if (tag === "LABEL" && !el.classList.contains("switch")) continue;
+			host.appendChild(helpDot(el.dataset.help));
+		}
+	}
+
+	// Attach help to a table's column headers by their data-sort key, so a
+	// renderer does not have to know anything about it.
+	function annotateHeaders(tableSel, helpByKey) {
+		const table = $(tableSel);
+		if (!table) return;
+		for (const th of $$("thead th[data-sort]", table)) {
+			const text = helpByKey[th.dataset.sort];
+			if (text && !th.dataset.help) th.dataset.help = text;
+		}
 	}
 
 	// -----------------------------
@@ -617,7 +765,7 @@ const print = console.log;
 
 		// How much of the traffic above never reached Roblox. Belongs on the
 		// Overview because it is the number that says whether the single most
-		// effective defence against being rate-limited is currently working.
+		// effective defense against being rate-limited is currently working.
 		const stats = d.CacheStats || {};
 		const served = Number(stats.Hits || 0) + Number(stats.Stale || 0) + Number(stats.Coalesced || 0);
 		const upstream = Number(stats.Misses || 0);
@@ -2770,7 +2918,7 @@ const print = console.log;
 					["Visits", fmtCount(data.Visits)],
 					["Playing now", fmtCount(data.Playing)],
 					["Max players", fmtCount(data.MaxPlayers)],
-					["Favourites", fmtCount(data.FavoritedCount)],
+					["Favorites", fmtCount(data.FavoritedCount)],
 				]
 					.map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`)
 					.join("") +
@@ -2897,7 +3045,206 @@ const print = console.log;
 		cache_coalesce: "Cache: collapse simultaneous fetches (1/0)",
 		cache_coalesce_wait_ms: "Cache: how long a follower waits (ms)",
 		cache_post_requests: "Cache: also cache POST (1/0)",
-		cache_respect_no_cache: "Cache: honour caller Cache-Control (1/0)",
+		cache_respect_no_cache: "Cache: honor caller Cache-Control (1/0)",
+	};
+
+	// A plain-language explanation for every setting, shown on the "?" next to
+	// its name. The labels alone assume you already know what a "danger zone" or
+	// a "tarpit" is; these are for when you do not. Anything without an entry
+	// falls back to showing its raw key, which is what the code calls it.
+	const SETTING_HELP = {
+		// --- Throttling -----------------------------------------------------
+		allowed_requests_per_minute:
+			"How many requests one IP address may make before it starts getting turned away.\n\n" +
+			"Works together with the setting below: 10 requests per 50 seconds means an IP gets 10, " +
+			"then waits out the rest of the 50 seconds.\n\n" +
+			"Remember that one Roblox game reaches you from hundreds of IPs, so this limits each of " +
+			"its servers separately, not the game as a whole.",
+		throttle_reset_duration:
+			"The length of the window the allowance above is measured over, in seconds.\n\n" +
+			"50 means the count resets 50 seconds after an IP's first request in that window.",
+		stale_ip_duration:
+			"How long an idle IP is remembered before it is forgotten entirely, in seconds.\n\n" +
+			"Only affects memory use — a forgotten IP simply starts with a clean allowance next time.",
+		global_throttle_limit:
+			"When Throttle-All is switched on, this is how many requests EACH IP gets per window.\n\n" +
+			"1 is a very hard limit and is meant as an emergency brake — a gentler alternative to " +
+			"pausing the proxy outright.",
+		global_throttle_period: "The window the Throttle-All limit above is measured over, in seconds.",
+
+		// --- Upstream -------------------------------------------------------
+		request_timeout:
+			"How long to wait for Roblox to answer before giving up on a request, in seconds.\n\n" +
+			"A timeout is the slowest thing this proxy does, so a high number here ties up a worker " +
+			"for that long. 15 is a sensible balance.",
+		max_retries_per_request: "How many times a single request may be retried after a failure before giving up.",
+
+		// --- Token budget ---------------------------------------------------
+		token_budget_requests:
+			"A hard ceiling on how many requests may go to Roblox using your account token, per window.\n\n" +
+			"Roblox flags accounts that burst. Once this ceiling is reached, further requests are " +
+			"answered with a friendly try-later error rather than touching Roblox at all — so the " +
+			"account is protected even under a flood.",
+		token_budget_window:
+			"The window the token ceiling above is measured over, in seconds. 95 requests per 65s stays comfortably " +
+			"under a 100-per-minute detection threshold.",
+		token_expiration_cooldown:
+			"After a token gets rate-limited or looks expired, how long to wait before testing it " +
+			"against Roblox again, in seconds.",
+
+		// --- Method mix -----------------------------------------------------
+		token_weight:
+			"How often to send a request using your account token, relative to the rotating proxy.\n\n" +
+			"These are weights, not percentages: token 75 and rotate 25 means roughly three requests " +
+			"through your account for every one through a rotating IP. Set one to 0 to stop using it.",
+		rotate_weight:
+			"How often to send a request through the rotating proxy (a different exit IP each time), " +
+			"relative to your account token.\n\n" +
+			"Rotating IPs are not tied to your account, so they carry no risk of getting it flagged — " +
+			"but they cost money per request and Roblox may treat unfamiliar IPs more harshly.",
+		token_danger_zone:
+			"Once your token has used this many requests in its window, the mix starts shifting " +
+			"automatically toward the rotating proxy.\n\n" +
+			"It is an early warning zone below the hard ceiling: instead of running full speed into " +
+			"the limit and then stopping dead, traffic eases off it as the limit approaches.",
+		rotate_enabled: "Whether the rotating proxy may be used at all. 1 = yes, 0 = no.",
+		rotate_cooldown:
+			"If the rotating proxy fails several times in a row, stop using it for this many seconds.\n\n" +
+			"Stops a broken or unpaid proxy service from swallowing requests over and over.",
+		rotate_max_failures: "How many failures in a row it takes to trigger that cooldown.",
+
+		// --- Tarpit ---------------------------------------------------------
+		tarpit_enabled:
+			"Whether to make refused callers WAIT for their error instead of getting it instantly. " +
+			"1 = on, 0 = off.\n\n" +
+			"Most exploit scripts send one request at a time, so a caller stuck waiting cannot send " +
+			"its next one. The delay costs them time instead of costing you a retry storm.",
+		tarpit_min_seconds: "The shortest a held request is made to wait, in seconds.",
+		tarpit_max_seconds:
+			"The longest a held request is made to wait, in seconds.\n\n" +
+			"Each hold is a random length between the minimum and this, because a fixed delay is " +
+			"learnable — a caller could simply set a shorter timeout and stop waiting.",
+		tarpit_max_concurrent:
+			"How many requests may be held at once across the whole server. THE safety valve.\n\n" +
+			"A held request occupies one of the server's request slots for the entire hold, and there " +
+			"are only so many. Set this too high and the tarpit starves your real traffic instead of " +
+			"the exploiter. Past the cap, callers are refused instantly exactly as before.",
+		tarpit_on_header_rule:
+			"Hold callers caught by a Request Filter — traffic you fingerprinted yourself. The safest kind to hold.",
+		tarpit_on_probe:
+			"Hold requests for URLs that are not Roblox at all (scanners, junk paths). Never a real caller.",
+		tarpit_on_throttle:
+			"Hold callers who merely went over your per-IP rate limit. ⚠ This also catches ordinary users who were " +
+			"just a bit fast.",
+		tarpit_on_throttle_all: "Hold callers turned away by Throttle-All. ⚠ Also catches ordinary users.",
+		tarpit_on_endpoint_rule: "Hold callers who hit a per-endpoint rate rule. ⚠ Also catches ordinary users.",
+		tarpit_on_blocked_endpoint:
+			"Hold callers asking for an endpoint you blocked. ⚠ May catch someone who simply wanted that endpoint.",
+		tarpit_on_auth_attempt:
+			"Hold callers who tried to send a Roblox login cookie. Never valid here, but sometimes an honest mistake.",
+
+		// --- Response cache -------------------------------------------------
+		cache_enabled:
+			"The master switch for the response cache. 1 = answer repeat requests from a saved copy, 0 = forward " +
+			"everything to Roblox.",
+		cache_ttl_seconds:
+			"How long a saved answer counts as current, in seconds — its TTL.\n\n" +
+			"60 means one request to Roblox per minute per distinct question, however many callers ask " +
+			"in between. 0 means nothing is saved unless a per-endpoint rule says so.",
+		cache_error_ttl_seconds:
+			"How long to keep Roblox's definite refusals (404 not found, 403 forbidden), in seconds.\n\n" +
+			"Worth setting if something hammers a URL Roblox always 404s. Temporary failures (429, 500) " +
+			"are never saved — that would keep an outage alive after Roblox recovered. 0 = off.",
+		cache_stale_seconds:
+			"How long past its TTL a saved answer may still be used, but ONLY when the fresh request " +
+			"to Roblox fails.\n\n" +
+			"This is what hides a Roblox rate-limit from your callers: they get a slightly old number " +
+			"instead of an error. 0 turns it off.",
+		cache_disk_enabled:
+			"Whether saved answers are also written to a shared set of files on disk. 1 = yes.\n\n" +
+			"The disk copy is what lets all your workers share one cache and keep it across a restart. " +
+			"Off means memory only: each worker keeps its own, and all of it is lost on restart.",
+		cache_max_entries:
+			"How many saved answers the shared disk store may hold. Past this, the oldest are thrown out.",
+		cache_max_bytes:
+			"How much disk space saved answers may take up in total. 33554432 is 32 MB.\n\n" +
+			"Setting this (or the entry count) to 0 turns the disk copy off rather than making it unlimited.",
+		cache_max_body:
+			"Answers larger than this are not saved at all, in bytes. 262144 is 256 KB.\n\n" +
+			"They are never saved half-way: half a JSON document is a wrong answer, not a cheap one.",
+		cache_memory_entries:
+			"How many saved answers each worker keeps in memory for instant access.\n\n" +
+			"PER WORKER — with four workers, 400 here means up to 1,600 copies held in memory.",
+		cache_memory_bytes:
+			"Memory budget for saved answers, per worker. 8388608 is 8 MB.\n\n" +
+			"Multiply by your worker count for the real cost. This is the number that decides whether " +
+			"the cache could run the server out of memory, which is why it is kept small.",
+		cache_serve_throttled:
+			"Answer a rate-limited caller from the cache instead of refusing them. 1 = on.\n\n" +
+			"Costs Roblox nothing, so the limit was not protecting anything in that case. Off by " +
+			"default because it does soften a limit you set deliberately.",
+		cache_coalesce:
+			"When several callers ask for the same uncached thing at the same instant, send ONE " +
+			"request to Roblox and give its answer to all of them. 1 = on.\n\n" +
+			"Without this, an empty cache produces exactly the burst the cache exists to prevent.",
+		cache_coalesce_wait_ms:
+			"How long the other callers wait for that single request to come back, in milliseconds.\n\n" +
+			"If it takes longer, they go to Roblox themselves rather than being held up.",
+		cache_post_requests:
+			"Also cache POST requests, keyed on their body. 1 = on.\n\n" +
+			"Some Roblox POST endpoints are really batch lookups and are safe to cache; others are " +
+			"real writes, and caching one of those would replay an old answer. Off by default.",
+		cache_respect_no_cache:
+			"Let a caller skip the cache by sending Cache-Control: no-cache. 1 = on.\n\n" +
+			"⚠ The caller flooding you can send that header too, which puts them straight back " +
+			"through to Roblox. Off by default for that reason.",
+
+		// --- Diagnostics + records -------------------------------------------
+		activity_tracking:
+			"Whether to track who is calling (the Callers and Top Talkers tables). 1 = on. Turning it off saves a " +
+			"little work per request and blinds those tables.",
+		capture_enabled:
+			"Whether to keep the full request and response bodies behind the live feed. 1 = on. Without it the feed " +
+			"still shows what happened, just not the contents.",
+		capture_max_records: "How many request/response body pairs to keep.",
+		capture_max_bytes: "Total size those saved bodies may take up.",
+		capture_max_body:
+			"How much of a single body to keep. Anything longer is cut short, which is fine here — this is for " +
+			"reading, not for serving.",
+		capture_ttl_seconds:
+			"How long a captured body is kept before it is dropped regardless of the limits above, in seconds.",
+		diagnostics_flush_interval:
+			"How often this dashboard is allowed to combine every worker's statistics, in seconds.\n\n" +
+			"Combining them is the most expensive thing the app does, and the page polls far faster " +
+			"than the numbers meaningfully change. Pressing Refresh always forces a fresh combine.",
+		autosave_interval: "How often statistics are written to disk, in seconds.",
+		endpoint_recent_requests:
+			"How many recent requests each endpoint remembers, so you can see what it is actually being asked for.",
+		auto_ignore_high_cardinality:
+			"Automatically stop listing a header's values once it proves to have a different value " +
+			"on every request. 1 = on.\n\n" +
+			"Some headers (trace IDs) are unique every time, so listing them is unbounded work with " +
+			"nothing to learn. Reversible from the Request Fingerprints section.",
+		max_live_requests: "How many recent requests the live feed keeps.",
+		max_exploit_records: "How many recent probe/exploit attempts to keep.",
+		max_login_records: "How many admin login attempts to keep.",
+		max_crawl_records: "How many crawler visits to keep.",
+		max_throttle_records: "How many throttled-IP records to keep.",
+		max_endpoint_records: "How many distinct endpoints to track. The busiest are kept when this is exceeded.",
+		max_header_name_records: "How many distinct header names to track across all requests.",
+		max_header_value_records: "How many distinct values to remember per header name.",
+		max_user_agent_records: "How many distinct User-Agent strings to track.",
+		max_error_records: "How many distinct error signatures to keep in the error log.",
+		max_ip_activity_records: "How many distinct client IPs to track in Top Talkers.",
+		max_caller_records: "How many distinct Roblox places to track in Callers.",
+
+		// --- Email + login ---------------------------------------------------
+		email_cooldown:
+			"Minimum gap between 'a token expired' emails, in seconds. Stops one problem from producing a mailbox " +
+			"full of alerts.",
+		error_email_cooldown: "Minimum gap between error-notification emails, in seconds.",
+		two_fa_expiration: "How long an emailed 2FA code stays valid, in seconds.",
+		challenge_expiration: "How long a login challenge stays valid, in seconds.",
 	};
 
 	// Group settings so the (long) list is navigable. Any key not listed falls
@@ -3043,6 +3390,9 @@ const print = console.log;
 				// The raw key is what the code, the docs and every error message
 				// call it, so it stays reachable on hover.
 				tdName.title = key;
+				// Falling back to the key rather than to nothing: "what is this
+				// actually called?" is a real question even where the label is clear.
+				tdName.appendChild(helpDot(SETTING_HELP[key] || `Setting name: ${key}`));
 
 				const tdCurrent = document.createElement("td");
 				tdCurrent.textContent = String(info.value);
@@ -4582,9 +4932,102 @@ const print = console.log;
 		setText("cache_mem_max", fmtBytes(memory.MaxBytes));
 		setText("cache_window", state.OldestAt ? timeAgo(state.OldestAt) : "—");
 
+		renderCacheTimeline(state);
 		renderCacheControls(state);
 		renderCacheRules(renderCache._rules || {});
 		renderCacheEndpoints(renderCache._endpoints || {});
+	}
+
+	// The worked example under "What happens to one request". Rendered rather
+	// than written into the template so it uses the admin's ACTUAL numbers: the
+	// difference between "keep for 60s, serve expired for 600s" and "keep for
+	// 3600s, serve expired for 0" is the whole behavior of the feature, and a
+	// fixed example that disagrees with the settings above it teaches the wrong
+	// thing.
+	function timelineStep(box, at, parts) {
+		const when = document.createElement("span");
+		when.className = "timeline__at";
+		when.textContent = at;
+		const what = document.createElement("div");
+		what.className = "timeline__what";
+		for (const part of parts) {
+			if (typeof part === "string") {
+				what.appendChild(document.createTextNode(part));
+			} else if (part.verdict) {
+				const badge = document.createElement("span");
+				badge.className = `badge badge--${part.tone || "muted"}`;
+				badge.textContent = part.verdict;
+				what.appendChild(badge);
+			} else if (part.strong) {
+				const strong = document.createElement("strong");
+				strong.textContent = part.strong;
+				what.appendChild(strong);
+			}
+		}
+		box.append(when, what);
+	}
+
+	function renderCacheTimeline(state) {
+		const box = $("#cacheTimeline");
+		if (!box) return;
+		box.innerHTML = "";
+		const ttl = Number(state.TTL || 0);
+		const stale = Number(state.StaleGrace || 0);
+		if (!state.Enabled) {
+			timelineStep(box, "always", [
+				"Caching is switched off, so every request is forwarded to Roblox — including the ",
+				{ strong: "hundredth identical one" },
+				". Turn it on above to change that.",
+			]);
+			return;
+		}
+		if (!ttl) {
+			timelineStep(box, "always", [
+				'"Keep answers for" is 0, so nothing is saved by default and every request goes to Roblox. ',
+				"Only endpoints given their own rule below are cached.",
+			]);
+			return;
+		}
+		const ttlLabel = fmtSpan(ttl);
+		timelineStep(box, "0s", [
+			"Nobody has asked this before, so there is nothing to reuse: ",
+			{ verdict: "MISS", tone: "muted" },
+			". We ask Roblox once, pass the answer back, and keep a copy.",
+		]);
+		timelineStep(box, `up to ${ttlLabel}`, [
+			"Everyone else asking the same question gets that copy: ",
+			{ verdict: "HIT", tone: "ok" },
+			". ",
+			{ strong: "Roblox hears nothing" },
+			", however many times they ask — one caller or ten thousand.",
+		]);
+		timelineStep(box, ttlLabel, [
+			"The copy is now ",
+			{ strong: "expired" },
+			". We stop treating it as current, but we do not throw it away yet.",
+		]);
+		if (stale) {
+			timelineStep(box, `just after ${ttlLabel}`, [
+				"The next person to ask sends us back to Roblox. If Roblox answers, we save the new copy and count a ",
+				{ verdict: "MISS", tone: "muted" },
+				". If Roblox refuses us — rate-limited, or down — we hand over the expired copy anyway: ",
+				{ verdict: "STALE", tone: "warn" },
+				". The caller gets a slightly old number instead of an error, and never knows anything went wrong.",
+			]);
+			timelineStep(box, fmtSpan(ttl + stale), [
+				`That is ${ttlLabel} + ${fmtSpan(stale)}. The copy is now older than the serve-expired ` +
+					"window, so it is no longer used even as a fallback. ",
+				"From here on, a request that Roblox refuses becomes a real error for the caller.",
+			]);
+		} else {
+			timelineStep(box, `just after ${ttlLabel}`, [
+				"The next person to ask sends us back to Roblox. If Roblox answers, we save the new copy and count a ",
+				{ verdict: "MISS", tone: "muted" },
+				". If Roblox refuses us, the caller gets the error — because ",
+				{ strong: '"Serve expired for" is 0' },
+				". Raising it would let them keep getting the last good answer instead.",
+			]);
+		}
 	}
 
 	// The controls are only redrawn while the admin is NOT editing them: the
@@ -4625,7 +5068,7 @@ const print = console.log;
 			span.textContent = "never cache";
 			span.title = "A TTL of 0 excludes this endpoint from caching entirely";
 		} else {
-			span.textContent = fmtDuration(n);
+			span.textContent = fmtSpan(n);
 		}
 		span.dataset.sortValue = String(n);
 		return span;
@@ -5582,6 +6025,103 @@ const print = console.log;
 	}
 
 	// -----------------------------
+	// Column help
+	// -----------------------------
+	// Attached once at boot, by the header's sort key. Kept here rather than in
+	// the template because the same column name means the same thing in several
+	// tables, and saying it once is how they stay consistent.
+	const COLUMN_HELP = {
+		"#cacheEndpointsTable": {
+			endpoint:
+				"The Roblox endpoint, with ID-looking parts collapsed together — so every\nrequest for a different " +
+				"game's votes shows up as one row.",
+			hits:
+				"How many requests for this endpoint were answered from the cache.\nRoblox never received any of " +
+				"these.",
+			misses: "How many had to be fetched from Roblox because we had no current copy.",
+			rate:
+				"Hits as a share of all requests for this endpoint.\n\nA busy endpoint with a rate near 0% is the " +
+				"one worth acting on: it means\nevery caller is asking a slightly different question (a different " +
+				"game ID,\nsay), so there is nothing to reuse. Either that caller is doing something\nunusual, or " +
+				"the endpoint needs a longer TTL to give repeats a chance.",
+			stale:
+				"How many times an EXPIRED copy of this endpoint was handed over because\nRoblox refused the fresh " +
+				"request. Each one is an error a caller did not see.",
+			skipped:
+				"Requests for this endpoint that were deliberately not cached — the response\nwas bigger than the " +
+				"size cap, or a rule sets its TTL to 0.",
+			bytes:
+				"Total size of everything served from cache for this endpoint. Roughly the\nbandwidth Roblox did not " +
+				"have to send us.",
+			last: "When this endpoint was last answered from the cache.",
+		},
+		"#cacheRulesTable": {
+			pattern:
+				"Which endpoints this rule covers. 'Wildcard' patterns use * for one path\nsegment and automatically " +
+				"cover everything nested underneath.",
+			type:
+				"Wildcard is the simple form (games.roblox.com/v1/games/*/votes).\nRegex is the full-power form, for " +
+				"when a wildcard cannot express it.",
+			ttl:
+				"How long a response from these endpoints stays usable before we go back to\nRoblox. 'never cache' " +
+				"(0) excludes the endpoint entirely.",
+			note: "Your own reminder of why this rule exists. Never sent anywhere.",
+			added: "When you created this rule.",
+		},
+		"#talkersTable": {
+			key:
+				"The IP address the request arrived from. One Roblox game reaches you from\nhundreds of these, which " +
+				"is why the Callers table above is usually the more\nuseful view.",
+			count: "Total requests from this IP since the counters were last cleared.",
+			rate:
+				"Requests in the LAST MINUTE. This is the number an incident is judged on —\na caller that sent " +
+				"50,000 requests yesterday and none today should not\noutrank one sending 50 a second right now.",
+			refused:
+				"How many of this IP's requests were turned away (throttled, blocked,\nfiltered) rather than " +
+				"answered.",
+			endpoint: "The endpoint this IP asks for most often.",
+			peers: "How many distinct Roblox places (games) requests from this IP claimed to\ncome from.",
+			last: "When this IP was last seen.",
+		},
+		"#callersTable": {
+			key:
+				"The Roblox place ID the request said it came from, taken from the Roblox-Id\nheader that Roblox " +
+				"stamps on every HttpService request.\n\nThis is self-reported, so treat it as evidence rather than " +
+				"proof — but it is\nthe only identifier that stays the same as a game's server IPs churn, " +
+				"which\nmakes it the one worth writing a block rule against.",
+			count: "Total requests from this place since the counters were last cleared.",
+			rate:
+				"Requests in the LAST MINUTE from this place — the number that says whether\nsomething is happening " +
+				"right now.",
+			refused: "How many of this place's requests were turned away rather than answered.",
+			endpoint: "The endpoint this place asks for most often.",
+			peers:
+				"How many distinct IP addresses this place reached you from. A big number is\nnormal: Roblox runs " +
+				"one game across many servers.",
+			last: "When this place was last seen.",
+		},
+		"#refusalsTable": {
+			reason:
+				"The specific rule that turned the request away. Several different rules all\nanswer with a 429, so " +
+				"the status code alone cannot tell you which one fired —\nthis can.",
+			status: "The status code the caller received.",
+			count: "How many requests this rule has refused.",
+			ips: "How many distinct IPs this rule has refused.",
+			last: "When it last fired.",
+		},
+		"#statusSourceTable": {
+			source:
+				"WHO produced this status code. 'Roblox' is what Roblox answered us,\n'Roxy' is a refusal we " +
+				"generated ourselves, 'Relay' is Roblox's answer passed\nthrough to the caller, and 'Cache' is an " +
+				"answer Roblox never saw.",
+		},
+	};
+
+	function annotateAllHeaders() {
+		for (const [sel, help] of Object.entries(COLUMN_HELP)) annotateHeaders(sel, help);
+	}
+
+	// -----------------------------
 	// Sortable table registration
 	// -----------------------------
 	// Registered once at boot. Tables that render as a plain list of rows use the
@@ -5719,6 +6259,8 @@ const print = console.log;
 	function boot() {
 		initAllSortables();
 		initAllPagers();
+		annotateAllHeaders();
+		decorateHelp(); // After annotateAllHeaders, so the column help gets a marker too.
 		watchCacheSection();
 		refreshAll(true);
 	}

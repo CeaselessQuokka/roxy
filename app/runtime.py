@@ -208,7 +208,7 @@ _settings = {
     # Also cache POST (keyed on a hash of the body). Off by default: a POST is a
     # write by convention, and Roblox's batch-lookup POSTs are the exception.
     "cache_post_requests": _setting(0, 0, 1, "int"),
-    # Honour Cache-Control: no-cache from the CALLER. Off by default — it hands
+    # Honor Cache-Control: no-cache from the CALLER. Off by default — it hands
     # whoever is flooding us a one-header way straight back to Roblox.
     "cache_respect_no_cache": _setting(0, 0, 1, "int"),
     # Automatically stop enumerating a header's values once it proves to be

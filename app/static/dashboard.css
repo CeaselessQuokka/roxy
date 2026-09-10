@@ -1493,7 +1493,7 @@ body {
    REQUEST-FILTER TESTER VERDICT
    ============================= */
 /* The whole point of the tester is a yes/no you can read at a glance, so the
-   verdict is colour-coded rather than being another row in a table. */
+   verdict is color-coded rather than being another row in a table. */
 .tester-verdict {
 	margin-top: var(--pad-3);
 	padding: var(--pad-3);
@@ -1579,7 +1579,7 @@ body {
    23) THREAT BANNER
    ============================= */
 /* One line at the very top answering "is anything wrong right now?". Sits above
-   the pause/throttle banners because it summarises them along with everything
+   the pause/throttle banners because it summarizes them along with everything
    else. */
 .threat-banner {
 	position: sticky;
@@ -1988,4 +1988,122 @@ body {
 .setting__default {
 	margin-left: var(--pad-1);
 	opacity: 0.75;
+}
+
+/* --- Inline help ----------------------------------------------------------
+   A "?" the reader can hover or tab to. The tooltip itself is one element on
+   <body>, positioned with fixed coordinates so it is never clipped by the
+   .table-wrap a column header sits inside. */
+.help {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex: none;
+	width: 15px;
+	height: 15px;
+	margin-left: 6px;
+	border: 1px solid var(--color-outline-strong);
+	border-radius: 999px;
+	color: var(--color-text-muted);
+	font-size: 10px;
+	font-weight: 700;
+	line-height: 1;
+	cursor: help;
+	vertical-align: middle;
+	user-select: none;
+	transition: color var(--dur-fast) var(--easing), border-color var(--dur-fast) var(--easing);
+}
+.help:hover,
+.help:focus-visible {
+	border-color: var(--color-primary);
+	color: var(--color-primary);
+	outline: none;
+}
+/* Headers already show a pointer for sorting; everything else that carries an
+   explanation gets the help cursor so it reads as hoverable. */
+[data-help]:not(th):not(.help) {
+	cursor: help;
+}
+.help-tip {
+	position: fixed;
+	z-index: 1000;
+	max-width: min(460px, calc(100vw - 24px));
+	padding: 10px 12px;
+	border: 1px solid var(--color-outline-strong);
+	border-radius: var(--radius-sm);
+	background: var(--color-surface3);
+	color: var(--color-text);
+	font-size: var(--fs-sm);
+	line-height: 1.5;
+	/* The explanations are written with real line breaks; keep them. */
+	white-space: pre-line;
+	box-shadow: 0 10px 30px rgba(var(--shadow-color), 0.5);
+	pointer-events: none;
+}
+.help-tip[hidden] {
+	display: none;
+}
+
+/* --- Glossary + worked example -------------------------------------------
+   Both exist because the cache's vocabulary (hit, TTL, stale, evicted) is the
+   part people get stuck on, and a definition sitting next to the control it
+   governs beats one buried in a paragraph. */
+.glossary {
+	display: grid;
+	grid-template-columns: minmax(80px, max-content) 1fr;
+	gap: var(--pad-1) var(--pad-3);
+	margin: 0 0 var(--pad-3);
+	font-size: var(--fs-sm);
+}
+.glossary dt {
+	font-weight: 700;
+	color: var(--color-primary);
+}
+.glossary dd {
+	margin: 0;
+	color: var(--color-text-dim);
+	line-height: 1.5;
+}
+.glossary dd strong {
+	color: var(--color-text);
+}
+.timeline {
+	display: grid;
+	grid-template-columns: max-content 1fr;
+	gap: var(--pad-2) var(--pad-3);
+	align-items: baseline;
+	margin-top: var(--pad-2);
+}
+.timeline__at {
+	padding: 2px 10px;
+	border: 1px solid var(--color-outline);
+	border-radius: 999px;
+	background: var(--color-surface3);
+	color: var(--color-text);
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: var(--fs-xs);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+.timeline__what {
+	color: var(--color-text-dim);
+	font-size: var(--fs-sm);
+	line-height: 1.6;
+}
+.timeline__what strong {
+	color: var(--color-text);
+}
+.timeline__what .badge {
+	margin: 0 2px;
+}
+@media (max-width: 760px) {
+	.glossary,
+	.timeline {
+		grid-template-columns: 1fr;
+		gap: 2px;
+	}
+	.timeline__at {
+		justify-self: start;
+		margin-top: var(--pad-2);
+	}
 }

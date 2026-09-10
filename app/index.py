@@ -585,7 +585,7 @@ def admin_endpoint_concrete():
     Everything bulky about an endpoint lives here rather than in the poll — the
     recent-request ring carries headers, query strings and body previews, which
     would multiply the dashboard's poll payload by the endpoint count if it
-    travelled with it.
+    traveled with it.
     """
     template = request.args.get("template", "")
     if not template:

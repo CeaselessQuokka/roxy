@@ -2339,7 +2339,7 @@ runtime.set_setting("endpoint_recent_requests", 2)
 for _ in range(5):
     api_client.get("/games.roblox.com/v1/games", headers=IP_ATT)
 detail = diag_module.get_endpoint_detail("games.roblox.com/v1/games")
-check("The recent-request ring honours its cap", len(detail["Recent"]) == 2, len(detail["Recent"]))
+check("The recent-request ring honors its cap", len(detail["Recent"]) == 2, len(detail["Recent"]))
 runtime.set_setting("endpoint_recent_requests", config.ENDPOINT_RECENT_REQUESTS)
 
 print("\n== Who is calling: per-IP and per-place activity ==")
@@ -2533,7 +2533,7 @@ client.post(
     },
 )
 r = api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.59.0.2", "Roblox-Id": PLACE})
-check("...but a filter message is honoured when set", r.get_json() == "Contact the proxy owner about your usage.", r.get_json())
+check("...but a filter message is honored when set", r.get_json() == "Contact the proxy owner about your usage.", r.get_json())
 for existing in list(runtime.get_header_rules()):
     client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": existing})
 

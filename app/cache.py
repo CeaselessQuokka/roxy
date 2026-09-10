@@ -265,7 +265,7 @@ def ttl_for(path: str, upstream_status, successful: bool) -> tuple:
 def wants_fresh(headers) -> bool:
     """Whether the caller asked to skip the cache.
 
-    Off by default, and that default is deliberate: honouring Cache-Control from
+    Off by default, and that default is deliberate: honoring Cache-Control from
     the request hands the caller who is flooding us a one-header way around the
     very thing stopping them from reaching Roblox. It exists for the admin who
     wants a cooperative integration to be able to force a refresh.

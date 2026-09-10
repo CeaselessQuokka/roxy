@@ -219,7 +219,7 @@ def heartbeat():
             workers = data["Workers"] = {}
         _prune(workers, now)
         _sync_service_identity(data, now, workers)
-        # Read the counters INSIDE the mutator, after honouring any reset another
+        # Read the counters INSIDE the mutator, after honoring any reset another
         # worker issued. Sampling them before this would write the pre-reset
         # numbers straight back over the reset that just happened.
         _apply_reset_epoch(float(data.get("ResetEpoch", 0) or 0))

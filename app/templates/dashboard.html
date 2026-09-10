@@ -142,49 +142,65 @@
 					</div>
 
 					<div class="grid grid--kpis">
-						<article class="card kpi" aria-live="polite">
+						<article class="card kpi" aria-live="polite"
+							data-help="Every request this proxy has handled since the counters were last cleared, successful or not.&#10;&#10;Includes requests answered from the cache, so this is 'work done', not 'requests sent to Roblox'."
+						>
 							<h3 class="kpi__title">Total Requests</h3>
 							<div class="kpi__value" id="kpi_total_requests">0</div>
-							<div class="kpi__meta">Sum of Successful + Failed across methods</div>
+							<div class="kpi__meta">Everything handled, successful or not</div>
 						</article>
 
-						<article class="card kpi" aria-live="polite">
+						<article class="card kpi" aria-live="polite"
+							data-help="How many times ROBLOX answered one of our requests successfully.&#10;&#10;Deliberately counts only what Roblox said, not what your callers received — so a burst of your own refusals can never look like Roblox starting to fail."
+						>
 							<h3 class="kpi__title">2xx Success</h3>
 							<div class="kpi__value" id="kpi_2xx">0</div>
-							<div class="kpi__meta">From StatusCodeCounts["2xx"]</div>
+							<div class="kpi__meta">Times Roblox answered us successfully</div>
 						</article>
 
-						<article class="card kpi" aria-live="polite">
+						<article class="card kpi" aria-live="polite"
+							data-help="How many times Roblox answered one of our requests with a client error — 404 not found, 403 forbidden, 429 rate-limited.&#10;&#10;429s here are the important ones: they mean Roblox is rate-limiting YOU. The Status Codes section breaks this down by who produced it."
+						>
 							<h3 class="kpi__title">4xx Client Errors</h3>
 							<div class="kpi__value" id="kpi_4xx">0</div>
-							<div class="kpi__meta">From StatusCodeCounts["4xx"]</div>
+							<div class="kpi__meta">Times Roblox refused one of our requests</div>
 						</article>
 
-						<article class="card kpi" aria-live="polite">
+						<article class="card kpi" aria-live="polite"
+							data-help="Visits to the website itself (not the proxy) from something that looks like a real browser."
+						>
 							<h3 class="kpi__title">Human Visitors</h3>
 							<div class="kpi__value" id="kpi_human">0</div>
-							<div class="kpi__meta">Visitors with browser-like User-Agents</div>
+							<div class="kpi__meta">Website visits from a real browser</div>
 						</article>
 
-						<article class="card kpi" aria-live="polite">
+						<article class="card kpi" aria-live="polite"
+							data-help="Visits to the website from something that looks automated — a search engine, a scraper, a script. Judged from the User-Agent it sent, which anyone can lie about."
+						>
 							<h3 class="kpi__title">Crawler Visitors</h3>
 							<div class="kpi__value" id="kpi_crawler">0</div>
-							<div class="kpi__meta">Likely bots / automated clients</div>
+							<div class="kpi__meta">Website visits from bots and scripts</div>
 						</article>
 
-						<article class="card kpi" aria-live="polite">
+						<article class="card kpi" aria-live="polite"
+							data-help="How many times the public home page has been loaded."
+						>
 							<h3 class="kpi__title">Home Page Visits</h3>
 							<div class="kpi__value" id="home_page_visits">0</div>
 							<div class="kpi__meta">Total visits to the home page</div>
 						</article>
 
-						<article class="card kpi" aria-live="polite">
+						<article class="card kpi" aria-live="polite"
+							data-help="How many times the admin login page has been loaded. Your own visits are not counted once your browser has logged in successfully at least once."
+						>
 							<h3 class="kpi__title">Admin Page Visits</h3>
 							<div class="kpi__value" id="admin_page_visits">0</div>
 							<div class="kpi__meta">Total visits to the admin page</div>
 						</article>
 
-						<article class="card kpi" aria-live="polite">
+						<article class="card kpi" aria-live="polite"
+							data-help="How many times robots.txt has been fetched. Almost entirely search engines checking what they are allowed to index."
+						>
 							<h3 class="kpi__title">robots.txt Crawls</h3>
 							<div class="kpi__value" id="robots_page_visits">0</div>
 							<div class="kpi__meta">Total crawls to the robots.txt file</div>
@@ -193,7 +209,7 @@
 						<article
 							class="card kpi"
 							aria-live="polite"
-							title="Requests answered from the response cache — Roblox never received these."
+							data-help="Requests answered from your own saved copy instead of being forwarded to Roblox.&#10;&#10;Every one of these is a request that could not have counted against you. The hit rate underneath is the share of cacheable traffic this covers."
 						>
 							<h3 class="kpi__title">Served From Cache</h3>
 							<div class="kpi__value" id="kpi_cache_saved">0</div>
@@ -203,16 +219,22 @@
 							</div>
 						</article>
 
-						<article class="card kpi" aria-live="polite">
+						<article class="card kpi" aria-live="polite"
+							data-help="Proxied requests in the last 60 minutes — the number that says whether this is busy right now, rather than how busy it has ever been."
+						>
 							<h3 class="kpi__title">Requests (Last Hour)</h3>
 							<div class="kpi__value" id="kpi_hour_requests">0</div>
 							<div class="kpi__meta">Proxied requests in the last 60 minutes</div>
 						</article>
 
-						<article class="card kpi" aria-live="polite">
-							<h3 class="kpi__title">Failures (Last Hour)</h3>
+						<article class="card kpi" aria-live="polite"
+							data-help="Requests in the last 60 minutes that could not be answered successfully, whether Roblox refused them or every route was unavailable."
+						>
+							<h3 class="kpi__title"
+							data-help="Stops the proxy answering requests at all — callers get a 'down for maintenance' error while the website itself stays up.&#10;&#10;This is the heavy option. Throttle-All next to it is the gentler one, and the response cache usually solves the problem that makes you reach for either."
+						>Failures (Last Hour)</h3>
 							<div class="kpi__value" id="kpi_hour_failed">0</div>
-							<div class="kpi__meta">Non-200 upstream results in the last 60 minutes</div>
+							<div class="kpi__meta">Requests we could not answer in the last 60 minutes</div>
 						</article>
 					</div>
 				</section>
@@ -224,7 +246,9 @@
 					</div>
 					<div class="grid grid--cards">
 						<article class="card">
-							<h3 class="card__title">Pause</h3>
+							<h3 class="card__title"
+							data-help="Squeezes EVERY caller down to a few requests each, instead of stopping them completely.&#10;&#10;A softer emergency brake than pausing: legitimate callers keep working, just slowly, while whatever is flooding you loses most of its throughput."
+						>Pause</h3>
 							<p class="form__hint">
 								Rejects all proxy requests with a 503. The message below is returned to users; leave it
 								blank for the default (<em>Service down for maintenance.</em>). Use the
@@ -274,7 +298,9 @@
 						</article>
 
 						<article class="card card--wide" id="throttleWatch" hidden>
-							<h3 class="card__title">Who is being throttled right now</h3>
+							<h3 class="card__title"
+							data-help="A browser you mark as trusted can log in with just your username and password for 30 days, skipping the emailed 2FA code.&#10;&#10;Revoke them all if you ever lose a device."
+						>Who is being throttled right now</h3>
 							<p class="form__hint">
 								Live while throttle-all is on: the callers actually being turned away, what they are
 								asking for and how fast. <strong id="throttleWatchDrops">0</strong> request(s) dropped so
@@ -303,7 +329,7 @@
 							<h3 class="card__title">Trusted Devices</h3>
 							<p class="form__hint">
 								A trusted device skips the email 2FA step for 30 days (you still enter your
-								username/password). Tick <em>Trust this device</em> on the login screen to enrol the
+								username/password). Check <em>Trust this device</em> on the login screen to enroll the
 								browser you're on. This browser is currently:
 								<strong id="trustedThisDevice">—</strong>.
 							</p>
@@ -322,34 +348,103 @@
 					<div class="section__header">
 						<h2 id="cacheHeading" class="section__title">Response Cache</h2>
 						<div class="section__actions">
-							<span id="cacheStatusChip" class="chip">Off</span>
-							<span id="cacheSavedChip" class="chip chip--muted">0 requests saved</span>
-							<button id="clearCacheStatsBtn" type="button" class="btn btn--outline btn--sm">
+							<span
+								id="cacheStatusChip"
+								class="chip"
+								data-help="Whether the cache is on, and how long a saved answer stays current by default."
+								>Off</span
+							>
+							<span
+								id="cacheSavedChip"
+								class="chip chip--muted"
+								data-help="Requests you answered yourself instead of forwarding to Roblox. Every one of these is a request that could not have counted against you."
+								>0 requests saved</span
+							>
+							<button
+								id="clearCacheStatsBtn"
+								type="button"
+								class="btn btn--outline btn--sm"
+								data-help="Reset the hit/miss counters back to zero. The saved answers themselves are left alone — use Purge all further down for those."
+							>
 								Clear stats
 							</button>
 						</div>
 					</div>
 
 					<div class="card">
+						<h3 class="card__title">What this does</h3>
 						<p class="form__hint">
-							When the same request comes in again, answer it from what we already fetched instead of
-							asking Roblox. This is the only control here that is <strong>not keyed on who is
-							asking</strong> — and that is exactly why it works on the traffic the others cannot touch:
-							a Roblox experience polling one endpoint reaches us from hundreds of game-server IPs, so
-							every per-IP limit sees a first-time caller, while Roblox sees one proxy asking the same
-							question hundreds of times and rate-limits us for it.
+							When two callers ask the same question, ask Roblox once and give both of them the same
+							answer. That is the whole idea.
 						</p>
 						<p class="form__hint">
-							Bodies are held in a small <strong>per-worker memory tier</strong> (fast, and the tier that
-							could run the box out of memory, so it is kept deliberately small) backed by a
-							<strong>sharded disk store</strong> shared by every worker. Both are bounded by entry
-							count, total bytes and age at once. A response larger than the body cap is
-							<em>not cached at all</em> rather than cached truncated.
+							It is the only control on this page that <strong>is not based on who is asking</strong>,
+							which is why it reaches traffic the others cannot. A Roblox game contacts you from
+							hundreds of different server IPs, so every per-IP rate limit sees a brand-new caller and
+							waves it through. Roblox, on its side, sees one proxy asking the same question hundreds of
+							times — and rate-limits you for it. Answering the repeats yourself is the only part of
+							that you control.
 						</p>
+
+						<h3 class="card__title">The words used on this page</h3>
+						<dl class="glossary">
+							<dt>Hit</dt>
+							<dd>
+								We already had the answer and handed over our copy.
+								<strong>Roblox never heard about this request.</strong>
+							</dd>
+							<dt>Miss</dt>
+							<dd>
+								We did not have it, so we asked Roblox, passed the answer on, and kept a copy for next
+								time. <strong>This is the one that costs you a request to Roblox.</strong>
+							</dd>
+							<dt>TTL</dt>
+							<dd>
+								Short for <em>time to live</em> — how long a saved answer counts as current. With a TTL
+								of 60 seconds, the first person to ask sends one request to Roblox and everyone asking
+								in the next minute gets that same saved copy.
+							</dd>
+							<dt>Expired</dt>
+							<dd>
+								A saved answer whose TTL has run out. We no longer treat it as current, so the next
+								person to ask sends us back to Roblox for a fresh one.
+							</dd>
+							<dt>Stale</dt>
+							<dd>
+								An expired answer that we handed over <em>anyway</em>, because the fresh request to
+								Roblox failed. A slightly out-of-date number beats an error — see
+								<strong>Serve stale for</strong> below.
+							</dd>
+							<dt>Entry</dt>
+							<dd>
+								One saved answer, for one exact question. <code>?universeIds=123</code> and
+								<code>?universeIds=456</code> are two different questions, so two entries.
+							</dd>
+							<dt>Evicted</dt>
+							<dd>
+								Thrown out early — before its TTL ran out — because the cache had hit its size limit
+								and needed the room.
+							</dd>
+							<dt>Purge</dt>
+							<dd>
+								Delete a saved answer on purpose, right now. The next person to ask for it goes to
+								Roblox.
+							</dd>
+						</dl>
+
+						<h3 class="card__title">What happens to one request, using your current settings</h3>
+						<p class="form__hint">
+							A caller asks for <code>games.roblox.com/v1/games/votes?universeIds=9967558039</code>, and
+							keeps asking. This updates as you change the settings below.
+						</p>
+						<div id="cacheTimeline" class="timeline"></div>
 					</div>
 
 					<div class="grid grid--kpis">
-						<article class="card kpi" title="Share of cacheable requests answered without touching Roblox.">
+						<article
+							class="card kpi"
+							data-help="Of every request that could have been cached, the share answered from your own copy.&#10;&#10;90% means only one request in ten reached Roblox. The three short windows underneath are what tell you whether a change you just made is working — the all-time figure is too slow to move to show that."
+						>
 							<h3 class="kpi__title">Hit Rate</h3>
 							<div class="kpi__value" id="cache_hit_rate">—</div>
 							<div class="kpi__meta">
@@ -360,7 +455,7 @@
 						</article>
 						<article
 							class="card kpi"
-							title="Requests Roblox never received because we answered them ourselves."
+							data-help="Every request answered from your own copy instead of being forwarded: fresh hits, stale rescues, and requests folded into another one that was already fetching the same thing.&#10;&#10;This is the number that decides whether Roblox rate-limits you."
 						>
 							<h3 class="kpi__title">Requests Roblox Never Saw</h3>
 							<div class="kpi__value" id="cache_saved">0</div>
@@ -370,7 +465,10 @@
 								Bytes served from cache: <span id="cache_bytes_served">0</span>
 							</div>
 						</article>
-						<article class="card kpi" title="What the shared disk store is holding, against its ceilings.">
+						<article
+							class="card kpi"
+							data-help="How many saved answers exist on disk right now, and how much room they take up.&#10;&#10;'Evicted' counts the ones thrown out early to stay inside those limits. If it climbs steadily, the cache is too small for your traffic and answers are being discarded before they get reused."
+						>
 							<h3 class="kpi__title">Stored Responses</h3>
 							<div class="kpi__value" id="cache_entries">0</div>
 							<div class="kpi__meta">
@@ -381,7 +479,7 @@
 						</article>
 						<article
 							class="card kpi"
-							title="This worker's in-memory tier — multiply by the fleet size for the real resident cost."
+							data-help="Saved answers held in memory by THIS worker, for instant access with no disk read.&#10;&#10;Your server runs several workers and each keeps its own copies, so multiply this by the worker count for the true memory cost. That is why the memory limits are set low."
 						>
 							<h3 class="kpi__title">Memory Tier</h3>
 							<div class="kpi__value" id="cache_mem_entries">0</div>
@@ -396,115 +494,210 @@
 					<div class="card">
 						<h3 class="card__title">Settings</h3>
 						<div class="form__row">
-							<label class="switch">
+							<label
+								class="switch"
+								data-help="The master switch. Off means every request goes to Roblox, exactly as it did before this feature existed."
+							>
 								<input type="checkbox" id="cacheEnabled" />
 								<span class="switch__label">Caching enabled</span>
 							</label>
-							<label class="switch">
+							<label
+								class="switch"
+								data-help="Saved answers live in each worker's memory AND in a shared set of files on disk.&#10;&#10;The disk copy is what lets all your workers share one cache and keep it across a restart. Turn this off to keep everything in memory only: slightly faster, but each worker then has its own separate cache and all of it is lost when the server restarts."
+							>
 								<input type="checkbox" id="cacheDiskEnabled" />
-								<span class="switch__label">Keep a shared disk copy</span>
+								<span class="switch__label">Keep a shared copy on disk</span>
 							</label>
 						</div>
 						<form id="cacheForm" class="form">
 							<div class="form__row">
 								<div class="form__field">
-									<label class="form__label" for="cacheTtl">Default TTL (s)</label>
+									<label class="form__label" for="cacheTtl">
+										Keep answers for (seconds)
+										<span
+											class="help"
+											tabindex="0"
+											role="note"
+											data-help="How long a saved answer counts as current — the TTL.&#10;&#10;Example: 60 means one request to Roblox per minute per distinct question, no matter how many callers ask in between. Raise it to cut Roblox traffic further; lower it if callers need fresher numbers.&#10;&#10;0 means nothing is saved by default, and only endpoints with their own rule below get cached."
+											>?</span
+										>
+									</label>
 									<input id="cacheTtl" class="input" type="number" min="0" max="86400" />
 								</div>
 								<div class="form__field">
-									<label class="form__label" for="cacheStale">Serve stale for (s)</label>
+									<label class="form__label" for="cacheStale">
+										Serve expired for (seconds)
+										<span
+											class="help"
+											tabindex="0"
+											role="note"
+											data-help="How long past the TTL an answer may STILL be handed over — but only when the fresh request to Roblox fails.&#10;&#10;Example: keep for 60, serve expired for 600. After a minute we go back to Roblox. If Roblox is rate-limiting us, callers keep getting the last good answer for up to ten more minutes instead of errors.&#10;&#10;This is the setting that hides an outage from your callers. 0 turns it off, and a failed request becomes an error straight away."
+											>?</span
+										>
+									</label>
 									<input id="cacheStale" class="input" type="number" min="0" max="86400" />
 								</div>
 								<div class="form__field">
-									<label class="form__label" for="cacheErrorTtl">Cache 404/403 for (s)</label>
+									<label class="form__label" for="cacheErrorTtl">
+										Keep 404s for (seconds)
+										<span
+											class="help"
+											tabindex="0"
+											role="note"
+											data-help="Normally only successful answers are saved. This also saves Roblox's definite refusals — 404 not found, 403 forbidden — for this long.&#10;&#10;Worth setting if something is hammering a URL that Roblox always 404s: re-asking costs you exactly as much as a real request does.&#10;&#10;Temporary failures (429 rate-limited, 500 server error) are NEVER saved, because that would keep an outage alive after Roblox recovered. 0 = do not save refusals."
+											>?</span
+										>
+									</label>
 									<input id="cacheErrorTtl" class="input" type="number" min="0" max="3600" />
 								</div>
 								<div class="form__field">
-									<label class="form__label" for="cacheMaxBody">Max body cached (bytes)</label>
+									<label class="form__label" for="cacheMaxBody">
+										Largest answer saved (bytes)
+										<span
+											class="help"
+											tabindex="0"
+											role="note"
+											data-help="Answers bigger than this are not saved at all.&#10;&#10;They are never saved half-way: half a JSON document is a wrong answer, not a cheap one.&#10;&#10;262144 bytes is 256 KB, which is far larger than any normal Roblox API response."
+											>?</span
+										>
+									</label>
 									<input id="cacheMaxBody" class="input" type="number" min="0" />
 								</div>
 							</div>
 							<div class="form__row">
 								<div class="form__field">
-									<label class="form__label" for="cacheMaxEntries">Disk: max entries</label>
+									<label class="form__label" for="cacheMaxEntries">
+										Disk: how many answers
+										<span
+											class="help"
+											tabindex="0"
+											role="note"
+											data-help="How many saved answers the shared disk store may hold in total. Past this, the oldest are thrown out to make room — that shows up as 'Evicted' above."
+											>?</span
+										>
+									</label>
 									<input id="cacheMaxEntries" class="input" type="number" min="0" />
 								</div>
 								<div class="form__field">
-									<label class="form__label" for="cacheMaxBytes">Disk: max bytes</label>
+									<label class="form__label" for="cacheMaxBytes">
+										Disk: total size (bytes)
+										<span
+											class="help"
+											tabindex="0"
+											role="note"
+											data-help="How much disk space the saved answers may take up altogether. Past it, the oldest are thrown out.&#10;&#10;33554432 bytes is 32 MB. Setting either disk limit to 0 turns the disk copy off entirely rather than making it unlimited."
+											>?</span
+										>
+									</label>
 									<input id="cacheMaxBytes" class="input" type="number" min="0" />
 								</div>
 								<div class="form__field">
-									<label class="form__label" for="cacheMemEntries">Memory: max entries</label>
+									<label class="form__label" for="cacheMemEntries">
+										Memory: how many answers
+										<span
+											class="help"
+											tabindex="0"
+											role="note"
+											data-help="How many answers each worker keeps in memory for instant access.&#10;&#10;This is PER WORKER. With four workers, 400 here means up to 1,600 copies held in memory across the server."
+											>?</span
+										>
+									</label>
 									<input id="cacheMemEntries" class="input" type="number" min="0" />
 								</div>
 								<div class="form__field">
-									<label class="form__label" for="cacheMemBytes">Memory: max bytes</label>
+									<label class="form__label" for="cacheMemBytes">
+										Memory: total size (bytes)
+										<span
+											class="help"
+											tabindex="0"
+											role="note"
+											data-help="Memory budget for saved answers, per worker.&#10;&#10;Multiply by your worker count for the real cost: 8 MB each across four workers is 32 MB of the server's RAM. This is the number that decides whether the cache could run the box out of memory, which is why it is deliberately small.&#10;&#10;8388608 bytes is 8 MB."
+											>?</span
+										>
+									</label>
 									<input id="cacheMemBytes" class="input" type="number" min="0" />
 								</div>
 								<div class="spacer"></div>
 								<button type="submit" class="btn btn--filled">Save</button>
 							</div>
-							<p class="form__hint">
-								<strong>Serve stale</strong> is the setting that matters most while Roblox is
-								rate-limiting you: past its TTL an entry is still handed to callers when the upstream
-								request fails, so their number goes slightly out of date instead of turning into an
-								error. The memory ceilings are <strong>per worker</strong> — four workers means four
-								copies, so multiply before sizing them against the box's RAM.
-							</p>
 						</form>
-						<h3 class="card__title">Behaviour</h3>
+
+						<h3 class="card__title">Behavior</h3>
 						<div class="tarpit-cats">
 							<label class="tarpit-cat">
 								<input type="checkbox" class="cache-opt" data-setting="cache_serve_throttled" />
 								<span class="tarpit-cat__text">
-									<strong>Answer throttled callers from cache</strong>
-									<span class="text-dim"
-										>They keep working and Roblox still never sees it. Off by default: it does
-										weaken a limit you set on purpose.</span
-									>
+									<strong>Answer rate-limited callers from the cache anyway</strong>
+									<span class="text-dim">
+										If a caller has used up its request allowance but you already have the answer
+										it wants, hand it over instead of a "slow down" error. Roblox still never sees
+										the request, so the limit was not protecting anything in that case.<br />
+										<em>Example:</em> a game hits your 10-per-minute limit on its 11th vote check.
+										With this on, it still gets the vote count — from your copy. With it off, it
+										gets a 429 and probably retries.<br />
+										Off by default, because it does soften a limit you set deliberately.
+									</span>
 								</span>
 							</label>
 							<label class="tarpit-cat">
 								<input type="checkbox" class="cache-opt" data-setting="cache_coalesce" />
 								<span class="tarpit-cat__text">
-									<strong>Collapse simultaneous identical requests</strong>
-									<span class="text-dim"
-										>One upstream call, everyone else waits for its answer — otherwise a cold cache
-										produces the very burst it exists to prevent.</span
-									>
+									<strong>Ask Roblox once when several callers want the same missing thing</strong>
+									<span class="text-dim">
+										If 30 requests for the same uncached page arrive in the same instant, send one
+										to Roblox and give its answer to the other 29.<br />
+										Without this, an empty cache produces exactly the burst the cache exists to
+										prevent — which is the worst possible moment for one.
+									</span>
 								</span>
 							</label>
 							<label class="tarpit-cat">
 								<input type="checkbox" class="cache-opt" data-setting="cache_post_requests" />
 								<span class="tarpit-cat__text">
 									<strong>Also cache POST requests</strong>
-									<span class="text-dim"
-										>⚠ Keyed on the body. Roblox uses some POSTs as batch lookups; caching one that
-										is a real write would replay a stale answer.</span
-									>
+									<span class="text-dim">
+										GET requests are always cacheable. POST usually means "change something", so it
+										is left alone unless you turn this on.<br />
+										<em>The catch:</em> some Roblox POST endpoints are really batch lookups (asking
+										about 50 users in one request) and are perfectly safe to cache. Others are real
+										writes, and caching one of those would replay an old answer to a caller
+										expecting a fresh one. Turn this on only if you know which you are dealing
+										with.
+									</span>
 								</span>
 							</label>
 							<label class="tarpit-cat">
 								<input type="checkbox" class="cache-opt" data-setting="cache_respect_no_cache" />
 								<span class="tarpit-cat__text">
-									<strong>Honour Cache-Control from the caller</strong>
-									<span class="text-dim"
-										>⚠ Hands whoever is flooding you a one-header way straight back to
-										Roblox.</span
-									>
+									<strong>Let callers skip the cache with a header</strong>
+									<span class="text-dim">
+										A caller that sends <code>Cache-Control: no-cache</code> gets a fresh answer
+										from Roblox instead of your saved copy.<br />
+										<em>Careful:</em> the caller flooding you can send that header too, and it puts
+										them straight back through to Roblox. Off by default for exactly that reason —
+										turn it on only for an integration you trust.
+									</span>
 								</span>
 							</label>
 						</div>
 					</div>
 
 					<div class="card">
-						<h3 class="card__title">Per-Endpoint Rules</h3>
+						<h3 class="card__title">Rules for specific endpoints</h3>
 						<p class="form__hint">
-							Override the default TTL for one endpoint. Most specific pattern wins, exactly like the
-							block and rate rules — so a broad <code>games.roblox.com</code> rule can set a house
-							default and one concrete path can still opt out of it. A TTL of
-							<strong>0 means never cache this endpoint</strong>, which is how you exclude something
-							without turning the whole cache off.
+							Give one endpoint a different lifetime from the default. Most-specific pattern wins, so a
+							broad <code>games.roblox.com</code> rule can set a house default while one exact path
+							overrides it.
+						</p>
+						<p class="form__hint">
+							A lifetime of <strong>0 means never cache this endpoint</strong> — that is how you exclude
+							something without switching the whole cache off.
+						</p>
+						<p class="form__hint">
+							<em>Examples:</em> <code>games.roblox.com/v1/games/votes</code> at
+							<code>600</code> — vote counts barely move, so one request to Roblox every ten minutes is
+							plenty. <code>games.roblox.com/v1/games/*/servers</code> at <code>0</code> — a live server
+							list is worthless if it is even slightly out of date, so never save it.
 						</p>
 						<form id="cacheRuleForm" class="form">
 							<div class="form__row">
@@ -513,6 +706,7 @@
 									class="input"
 									type="text"
 									placeholder="e.g. games.roblox.com/v1/games/votes"
+									data-help="The endpoint to cover. Leave the https:// off. A * stands in for one part of the path, and a pattern automatically covers everything nested underneath it."
 									required
 								/>
 								<input
@@ -522,17 +716,25 @@
 									min="0"
 									max="86400"
 									value="300"
-									aria-label="TTL in seconds"
+									aria-label="Lifetime in seconds"
+									data-help="Seconds to keep answers from this endpoint. 0 means never cache it."
 								/>
 								<select
 									id="cacheRuleType"
 									class="input input--select input--w120"
 									aria-label="Match type"
+									data-help="Wildcard is the simple form and what you want almost always. Regex is the full-power form, for a pattern a wildcard cannot express."
 								>
 									<option value="glob">Wildcard</option>
 									<option value="regex">Regex</option>
 								</select>
-								<input id="cacheRuleNote" class="input" type="text" placeholder="Note (optional)" />
+								<input
+									id="cacheRuleNote"
+									class="input"
+									type="text"
+									placeholder="Note (optional)"
+									data-help="A reminder to yourself about why this rule exists. Private — never sent to anyone."
+								/>
 								<button type="submit" class="btn btn--filled">Add rule</button>
 							</div>
 						</form>
@@ -543,7 +745,7 @@
 										<th scope="col" data-sort="pattern" data-sort-type="text">Pattern</th>
 										<th scope="col" data-sort="type" data-sort-type="text">Type</th>
 										<th scope="col" data-sort="ttl" data-sort-type="num" data-sort-default="desc">
-											TTL
+											Keep for
 										</th>
 										<th scope="col" data-sort="note" data-sort-type="text">Note</th>
 										<th scope="col" data-sort="added" data-sort-type="num">Added</th>
@@ -556,30 +758,31 @@
 					</div>
 
 					<div class="card">
-						<h3 class="card__title">Cached Responses</h3>
+						<h3 class="card__title">Saved answers</h3>
 						<p class="form__hint">
-							Everything currently held, newest hits first. Loaded on demand and paged on the server —
-							these entries carry response bodies, so shipping them all here to render twenty rows would
-							move megabytes every few seconds. A body is only fetched when you open one.
+							Everything you are currently holding — one row per distinct question. Loaded only when you
+							look at it, and fetched a page at a time, because these rows carry whole response bodies.
 						</p>
 						<div class="form__row">
 							<input
 								id="cacheSearch"
 								class="input input--filter"
 								type="search"
-								placeholder="Search cached keys, e.g. votes or universeIds=99675…"
+								placeholder="Search saved answers, e.g. votes or universeIds=99675…"
 								aria-label="Search the cache"
+								data-help="Matches anywhere in the saved question — the endpoint or any part of the query string."
 							/>
 							<select
 								id="cacheSort"
 								class="input input--select input--w170"
 								aria-label="Sort cache entries"
+								data-help="'Most hits' puts the answers that are saving you the most work first — usually the ones worth giving a longer lifetime."
 							>
 								<option value="hits">Most hits</option>
 								<option value="stored">Newest first</option>
 								<option value="expires">Expiring soonest</option>
 								<option value="bytes">Largest first</option>
-								<option value="key">Key (A–Z)</option>
+								<option value="key">Question (A–Z)</option>
 							</select>
 							<select
 								id="cachePageSize"
@@ -591,26 +794,66 @@
 								<option value="50">50</option>
 								<option value="100">100</option>
 							</select>
-							<button id="cacheRefreshBtn" type="button" class="btn btn--outline">⟳ Refresh</button>
+							<button id="cacheRefreshBtn" type="button" class="btn btn--outline">⟳ Reload list</button>
 							<div class="spacer"></div>
-							<button id="cachePurgeMatchBtn" type="button" class="btn btn--outline" hidden>
+							<button
+								id="cachePurgeMatchBtn"
+								type="button"
+								class="btn btn--outline"
+								data-help="Delete every saved answer whose endpoint matches what you typed in the search box."
+								hidden
+							>
 								Purge matching
 							</button>
-							<button id="cachePurgeExpiredBtn" type="button" class="btn btn--outline">
+							<button
+								id="cachePurgeExpiredBtn"
+								type="button"
+								class="btn btn--outline"
+								data-help="Delete the answers that are already past their lifetime. Harmless: they were only being kept in case Roblox refused a fresh request."
+							>
 								Purge expired
 							</button>
-							<button id="cachePurgeAllBtn" type="button" class="btn btn--warning">Purge all</button>
+							<button
+								id="cachePurgeAllBtn"
+								type="button"
+								class="btn btn--warning"
+								data-help="Empty the cache completely. The next request for each question goes to Roblox, so expect a brief spike in upstream traffic afterwards."
+							>
+								Purge all
+							</button>
 						</div>
 						<div class="table-wrap">
 							<table id="cacheEntriesTable" class="table">
 								<thead>
 									<tr>
-										<th scope="col">Key</th>
-										<th scope="col">Size</th>
-										<th scope="col">Hits</th>
-										<th scope="col">Age</th>
-										<th scope="col">Expires</th>
-										<th scope="col">Rule</th>
+										<th
+											scope="col"
+											data-help="The exact question this answer is for: the method, the endpoint, and every query parameter. Change any part of it and it is a different question with its own saved answer."
+										>
+											Question
+										</th>
+										<th scope="col" data-help="How much room this saved answer takes up.">Size</th>
+										<th
+											scope="col"
+											data-help="How many times this saved answer has been handed to a caller. Each one is a request Roblox never received."
+										>
+											Times reused
+										</th>
+										<th scope="col" data-help="How long ago this answer was fetched from Roblox.">
+											Age
+										</th>
+										<th
+											scope="col"
+											data-help="When this answer stops counting as current. After that, the next request goes to Roblox — unless Roblox refuses, in which case this copy is used anyway while it is inside the serve-expired window."
+										>
+											Current until
+										</th>
+										<th
+											scope="col"
+											data-help="Which rule decided this answer's lifetime. 'default' means it used the default setting rather than a rule of its own."
+										>
+											Rule
+										</th>
 										<th scope="col"></th>
 									</tr>
 								</thead>
@@ -626,10 +869,17 @@
 					</div>
 
 					<div class="card">
-						<h3 class="card__title">Where The Cache Is Working</h3>
+						<h3 class="card__title"
+							data-help="Turns a Roblox place ID into the actual game and its owner.&#10;&#10;Every request from a Roblox game carries the ID of the place it came from. Paste one here to find out whose game is calling you."
+						>Where the cache is working</h3>
 						<p class="form__hint">
-							Per endpoint. A row with thousands of misses and no hits is the interesting one: it means
-							the caller is varying its query every time, and it is a rule — or a block — worth writing.
+							One row per endpoint, so you can see where the saving actually comes from.
+						</p>
+						<p class="form__hint">
+							<strong>The row worth acting on</strong> is a busy one with a hit rate near zero. That
+							means every caller is asking a slightly different question, so there is nothing to reuse —
+							either give the endpoint a longer lifetime so repeats have a chance to line up, or go and
+							look at who is generating all those unique requests.
 						</p>
 						<input
 							id="cacheEndpointFilter"
@@ -644,9 +894,9 @@
 									<tr>
 										<th scope="col" data-sort="endpoint" data-sort-type="text">Endpoint</th>
 										<th scope="col" data-sort="hits" data-sort-type="num" data-sort-default="desc">
-											Hits
+											Answered by us
 										</th>
-										<th scope="col" data-sort="misses" data-sort-type="num">Misses</th>
+										<th scope="col" data-sort="misses" data-sort-type="num">Went to Roblox</th>
 										<th scope="col" data-sort="rate" data-sort-type="num">Hit Rate</th>
 										<th scope="col" data-sort="stale" data-sort-type="num">Stale Rescues</th>
 										<th scope="col" data-sort="skipped" data-sort-type="num">Not Cached</th>
@@ -758,7 +1008,9 @@
 					</div>
 
 					<div class="card">
-						<h3 class="card__title">Identify an experience</h3>
+						<h3 class="card__title"
+							data-help="One row per calling GAME.&#10;&#10;This is usually the view you want: a Roblox game reaches you from hundreds of rotating server IPs, so the same caller is one row here and a hundred rows in Top Talkers below."
+						>Identify an experience</h3>
 						<p class="form__hint">
 							Roblox stamps the calling place ID on every <code>HttpService</code> request as the
 							<code>Roblox-Id</code> header. Paste one here to find out which experience it is and who
@@ -788,7 +1040,9 @@
 					</div>
 
 					<div class="card">
-						<h3 class="card__title">Callers (by Roblox place ID)</h3>
+						<h3 class="card__title"
+							data-help="The same traffic seen by IP address instead of by game.&#10;&#10;Precise, but noisy for Roblox callers. Use it for anything that is NOT a game: scripts, scrapers, your own testing."
+						>Callers (by Roblox place ID)</h3>
 						<p class="form__hint">
 							One row per calling experience. This is the identity worth acting on: a Roblox game reaches
 							us from hundreds of rotating server IPs, so the same caller is one row here and a hundred
@@ -1249,7 +1503,9 @@
 					</div>
 
 					<div class="grid grid--kpis">
-						<article class="card kpi">
+						<article class="card kpi"
+							data-help="How many refused callers have been made to WAIT for their error instead of getting it instantly.&#10;&#10;'Skipped' is the number to watch: it counts the ones let go instantly because the server had no spare slots to hold them in. If it is climbing, the capacity cap is the limit, not the exploiter."
+						>
 							<h3 class="kpi__title">Requests Held</h3>
 							<div class="kpi__value" id="tarpit_count">0</div>
 							<div class="kpi__meta">
@@ -1258,7 +1514,9 @@
 								<span id="tarpit_capacity">0</span>
 							</div>
 						</article>
-						<article class="card kpi" title="How long each held caller waited, on average.">
+						<article class="card kpi"
+							data-help="How long a held caller waits, on average.&#10;&#10;Each hold is a random length within the range you set, because a fixed delay is learnable — a caller could just set a shorter timeout and stop waiting."
+						>
 							<h3 class="kpi__title">Average Hold</h3>
 							<div class="kpi__value" id="tarpit_avg">—</div>
 							<div class="kpi__meta">
@@ -1268,7 +1526,8 @@
 						</article>
 						<article
 							class="card kpi"
-							title="Mean seconds between one tarpitted caller's successive requests. If the tarpit is working, the recent window should be LONGER than the lifetime figure."
+						
+							data-help="The average gap between one held caller's requests — the number that says whether holding them is actually slowing them down.&#10;&#10;Compare the recent windows with the all-time figure: if the tarpit is working, the recent gap should be LONGER."
 						>
 							<h3 class="kpi__title">Time Between Requests</h3>
 							<div class="kpi__value" id="tarpit_gap">—</div>
@@ -1278,7 +1537,9 @@
 								<span id="tarpit_trend" class="text-dim">—</span>
 							</div>
 						</article>
-						<article class="card kpi">
+						<article class="card kpi"
+							data-help="How many requests were held recently, so you can see whether this is happening now or happened days ago."
+						>
 							<h3 class="kpi__title">Held In Last Hour</h3>
 							<div class="kpi__value" id="tarpit_hour">0</div>
 							<div class="kpi__meta">
@@ -1849,22 +2110,34 @@
 						</p>
 						<div id="statusSourceVerdict" class="callout callout--muted">—</div>
 						<div class="grid grid--kpis">
-							<article class="card kpi">
+							<article
+								class="card kpi"
+								data-help="Times ROBLOX told US to slow down.&#10;&#10;This is the number that matters most on the whole dashboard: it means your account or IP is being rate-limited. The fix is to send Roblox fewer requests — which is exactly what the response cache does."
+							>
 								<h4 class="kpi__title">429s from Roblox</h4>
 								<div class="kpi__value" id="src_roblox_429">0</div>
 								<div class="kpi__meta">Roblox throttling us</div>
 							</article>
-							<article class="card kpi">
+							<article
+								class="card kpi"
+								data-help="Times WE told a caller to slow down.&#10;&#10;The opposite situation, and usually a sign the system is working: your own rate limits doing their job. Counted separately because the two look identical in a raw log and call for opposite reactions."
+							>
 								<h4 class="kpi__title">429s from Roxy</h4>
 								<div class="kpi__value" id="src_roxy_429">0</div>
 								<div class="kpi__meta">Us throttling callers</div>
 							</article>
-							<article class="card kpi">
+							<article
+								class="card kpi"
+								data-help="Times Roblox's own servers failed on us.&#10;&#10;Nothing you can fix — but if the cache is set to serve expired answers, your callers may not have noticed."
+							>
 								<h4 class="kpi__title">5xx from Roblox</h4>
 								<div class="kpi__value" id="src_roblox_5xx">0</div>
 								<div class="kpi__meta">Upstream failures</div>
 							</article>
-							<article class="card kpi">
+							<article
+								class="card kpi"
+								data-help="Times this proxy itself failed — a bug, or every route to Roblox being unavailable at once.&#10;&#10;The Error Log section has the details."
+							>
 								<h4 class="kpi__title">5xx from Roxy</h4>
 								<div class="kpi__value" id="src_roxy_5xx">0</div>
 								<div class="kpi__meta">Our own failures</div>
@@ -2464,7 +2737,8 @@
 					<div class="grid grid--kpis">
 						<article
 							class="card kpi"
-							title="Requests sent to Roblox with our own .ROBLOSECURITY, from this server's static IP."
+						
+							data-help="Requests sent to Roblox using your account's login token, from this server's fixed IP.&#10;&#10;Reliable and free, but it is your account taking the risk: too many too fast and Roblox rate-limits or flags it. That is what the Token Safety Budget protects."
 						>
 							<h3 class="kpi__title">Token</h3>
 							<div class="kpi__value" id="health_token">—</div>
@@ -2482,7 +2756,8 @@
 
 						<article
 							class="card kpi"
-							title="Requests sent through the rotating proxy (DataImpulse). Each request uses a fresh exit IP, hiding our static IP."
+						
+							data-help="Requests sent through a rotating proxy service, which gives each one a different exit IP.&#10;&#10;Not tied to your account, so it carries no risk of getting it flagged — but it costs money per request, which is why it is not used for everything."
 						>
 							<h3 class="kpi__title">Rotate (IP rotation)</h3>
 							<div class="kpi__value" id="health_rotate">—</div>
@@ -2498,7 +2773,9 @@
 							</div>
 						</article>
 
-						<article class="card kpi">
+						<article class="card kpi"
+							data-help="How many Roblox account tokens are loaded and currently working.&#10;&#10;A token that gets rate-limited is set aside and retested a little later, so this number dipping and recovering is normal. It reaching zero is not."
+						>
 							<h3 class="kpi__title">Tokens Loaded</h3>
 							<div class="kpi__value" id="health_tokens_count">0</div>
 							<div class="kpi__meta">
@@ -2509,7 +2786,8 @@
 
 						<article
 							class="card kpi"
-							title="How long the service has been up. Individual workers are recycled underneath it, which is why their own uptimes differ — see the Workers table below."
+						
+							data-help="How long the proxy has been running since it last restarted.&#10;&#10;The individual workers restart on their own periodically, which is deliberate — this figure tracks the service as a whole, not any one of them."
 						>
 							<h3 class="kpi__title">Service Uptime</h3>
 							<div class="kpi__value" id="health_uptime">—</div>
@@ -2523,7 +2801,8 @@
 
 						<article
 							class="card kpi"
-							title="Hard safety cap on the internal token so Roxy never looks like a bot burst to Roblox. Tunable in Settings."
+						
+							data-help="How much of your account's request allowance is used up in the current window.&#10;&#10;This is a limit YOU set, well below where Roblox would start objecting. Requests past it are answered with a try-later error rather than being sent, so the account is protected even under a flood."
 						>
 							<h3 class="kpi__title">Token Safety Budget</h3>
 							<div class="kpi__value" id="budget_value">— / —</div>
@@ -2538,7 +2817,9 @@
 							</div>
 						</article>
 
-						<article class="card kpi">
+						<article class="card kpi"
+							data-help="Whether statistics are being written to disk successfully, and how large that file has grown.&#10;&#10;The size is the early-warning signal for the kind of runaway growth that once ran this server out of memory."
+						>
 							<h3 class="kpi__title">Persistence</h3>
 							<div class="kpi__value" id="persist_status">—</div>
 							<div class="kpi__meta">
