@@ -135,6 +135,15 @@ CACHE_MEMORY_BYTES = 8 * 1024 * 1024
 CACHE_STALE_SECONDS = 600
 CACHE_COALESCE_WAIT_MS = 1500  # How long a second caller waits for an in-flight fetch of the same key.
 CACHE_PAGE_MAX = 200  # Ceiling on one page of the dashboard's cache browser.
+# Query parameters stripped before a cache key is built. A caller that appends a
+# changing value to every request — a timestamp, a random cache-buster — makes
+# every request a unique key, so the cache stores constantly and can never hit.
+# Nothing is stripped by default: dropping a parameter that DOES change the
+# answer would serve one caller another's data, so this is deliberately the
+# admin's decision, per name, with the dashboard pointing out the candidates.
+MAX_CACHE_IGNORED_PARAMS = 50
+# Offered as suggestions in the dashboard, never applied on their own.
+SUGGESTED_CACHE_IGNORED_PARAMS = ("t", "_", "ts", "cb", "cachebust", "cache_bust", "rand", "random", "nocache", "v")
 MAX_CACHE_RULES = 200  # Distinct per-endpoint cache rules (pattern -> TTL) retained.
 DEFAULT_CACHE_RULE_TTL = 300  # Default TTL offered when adding a rule from the dashboard.
 CACHE_HISTORY_MINUTES = 180  # Per-minute hit/miss buckets retained, for the hit-rate trend.

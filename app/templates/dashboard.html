@@ -247,9 +247,10 @@
 					</div>
 					<div class="grid grid--cards">
 						<article class="card">
-							<h3 class="card__title"
-							data-help="Squeezes EVERY caller down to a few requests each, instead of stopping them completely.&#10;&#10;A softer emergency brake than pausing: legitimate callers keep working, just slowly, while whatever is flooding you loses most of its throughput."
-						>Pause</h3>
+							<h3
+								class="card__title"
+								data-help="Stops the proxy answering requests at all — callers get a 'down for maintenance' error while the website itself stays up.&#10;&#10;This is the heavy option. Throttle-All next to it is the gentler one, and the response cache usually solves the problem that makes you reach for either."
+							>Pause</h3>
 							<p class="form__hint">
 								Rejects all proxy requests with a 503. The message below is returned to users; leave it
 								blank for the default (<em>Service down for maintenance.</em>). Use the
@@ -268,7 +269,10 @@
 						</article>
 
 						<article class="card">
-							<h3 class="card__title">Throttle All</h3>
+							<h3
+								class="card__title"
+								data-help="Squeezes EVERY caller down to a few requests each, instead of stopping them completely.&#10;&#10;A softer emergency brake than pausing: legitimate callers keep working, just slowly, while whatever is flooding you loses most of its throughput."
+							>Throttle All</h3>
 							<p class="form__hint">
 								A softer alternative to pausing: every IP is limited to
 								<strong><span id="ta_limit_display">1</span></strong> request(s) per
@@ -299,9 +303,10 @@
 						</article>
 
 						<article class="card card--wide" id="throttleWatch" hidden>
-							<h3 class="card__title"
-							data-help="A browser you mark as trusted can log in with just your username and password for 30 days, skipping the emailed 2FA code.&#10;&#10;Revoke them all if you ever lose a device."
-						>Who is being throttled right now</h3>
+							<h3
+								class="card__title"
+								data-help="While Throttle-All is on, this is who is being turned away, what they are asking for and how fast.&#10;&#10;It is here so the brake can be judged and released, rather than left on out of caution."
+							>Who is being throttled right now</h3>
 							<p class="form__hint">
 								Live while throttle-all is on: the callers actually being turned away, what they are
 								asking for and how fast. <strong id="throttleWatchDrops">0</strong> request(s) dropped so
@@ -327,7 +332,10 @@
 						</article>
 
 						<article class="card">
-							<h3 class="card__title">Trusted Devices</h3>
+							<h3
+								class="card__title"
+								data-help="A browser you mark as trusted can log in with just your username and password for 30 days, skipping the emailed 2FA code.&#10;&#10;Revoke them all if you ever lose a device."
+							>Trusted Devices</h3>
 							<p class="form__hint">
 								A trusted device skips the email 2FA step for 30 days (you still enter your
 								username/password). Check <em>Trust this device</em> on the login screen to enroll the
@@ -371,6 +379,8 @@
 							</button>
 						</div>
 					</div>
+
+					<div id="cacheDiskWarning" class="callout callout--bad" hidden></div>
 
 					<div class="card">
 						<h3 class="card__title">What this does</h3>
@@ -863,6 +873,11 @@
 						</div>
 						<div class="pager">
 							<span class="pager__status" id="cachePageStatus">Not loaded yet</span>
+							<span
+								id="cacheLoadedStamp"
+								class="text-muted"
+								data-help="This list refreshes with the rest of the dashboard while you are looking at it.&#10;&#10;Ages and countdowns are worked out when it loads, so they move as it reloads."
+							></span>
 							<button id="cachePrevBtn" type="button" class="btn btn--outline btn--sm">Previous</button>
 							<button id="cacheNextBtn" type="button" class="btn btn--outline btn--sm">Next</button>
 						</div>
@@ -870,8 +885,89 @@
 					</div>
 
 					<div class="card">
-						<h3 class="card__title"
-							data-help="Turns a Roblox place ID into the actual game and its owner.&#10;&#10;Every request from a Roblox game carries the ID of the place it came from. Paste one here to find out whose game is calling you."
+						<h3
+							class="card__title"
+							data-help="The one cache failure that looks exactly like success on every other number.&#10;&#10;A caller that adds a changing value to each request makes every request a different question, so entries pile up and the hit count never moves."
+						>Why isn't something being reused?</h3>
+						<p class="form__hint">
+							A caller that adds a changing value to every request — a timestamp, a random number — makes
+							each request a <strong>different question</strong>. Entries pile up, the Stores counter
+							climbs, and the hit count never moves, because no two requests ever ask the same thing.
+						</p>
+						<p class="form__hint">
+							Each row below is one endpoint path. Many saved answers behind one path with no reuse is
+							the giveaway, and the parameter doing it is named — <strong>Ignore</strong> leaves it out
+							of the cache key so those requests collapse back into one.
+						</p>
+						<div class="form__row">
+							<button id="cacheSpreadBtn" type="button" class="btn btn--outline">⟳ Check now</button>
+							<span id="cacheSpreadStamp" class="form__hint mb-0"></span>
+						</div>
+						<div class="table-wrap">
+							<table id="cacheSpreadTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Endpoint</th>
+										<th
+											scope="col"
+											data-help="How many separate saved answers exist behind this one path.&#10;&#10;If this is large and the reuse count is zero, the requests differ only by something that should not be part of the key."
+										>
+											Saved answers
+										</th>
+										<th scope="col">Times reused</th>
+										<th
+											scope="col"
+											data-help="The query parameter with the most different values across those entries.&#10;&#10;When it has about as many values as there are entries, it is what is splitting them apart."
+										>
+											Parameter splitting them
+										</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
+						<h3 class="card__title">Parameters left out of the cache key</h3>
+						<p class="form__hint">
+							Requests that differ only by one of these are treated as the same question.
+							<strong>Only add a parameter that does not change the answer</strong> — ignoring one that
+							does would hand one caller another's data. Adding or removing one empties the cache, since
+							everything already stored was keyed the old way.
+						</p>
+						<form id="ignoreParamForm" class="form">
+							<div class="form__row">
+								<input
+									id="ignoreParamName"
+									class="input input--w220"
+									type="text"
+									placeholder="Parameter name, e.g. t"
+									data-help="The exact name as it appears in the query string. Case-sensitive."
+									required
+								/>
+								<input id="ignoreParamNote" class="input" type="text" placeholder="Note (private)" />
+								<button type="submit" class="btn btn--filled">Ignore it</button>
+							</div>
+							<p class="form__hint" id="ignoreParamSuggestions"></p>
+						</form>
+						<div class="table-wrap">
+							<table id="ignoredParamsTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col">Parameter</th>
+										<th scope="col">Note</th>
+										<th scope="col">Added</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
+					</div>
+
+					<div class="card">
+						<h3
+							class="card__title"
+							data-help="One row per endpoint, so you can see where the saving actually comes from.&#10;&#10;A busy row with a hit rate near zero is the one to act on — it means every caller is asking a slightly different question, so there is nothing to reuse."
 						>Where the cache is working</h3>
 						<p class="form__hint">
 							One row per endpoint, so you can see where the saving actually comes from.
@@ -1396,8 +1492,9 @@
 					</div>
 
 					<div class="card">
-						<h3 class="card__title"
-							data-help="One row per calling GAME.&#10;&#10;This is usually the view you want: a Roblox game reaches you from hundreds of rotating server IPs, so the same caller is one row here and a hundred rows in Top Talkers below."
+						<h3
+							class="card__title"
+							data-help="Turns a Roblox place ID into the actual game and its owner.&#10;&#10;Every request from a Roblox game carries the ID of the place it came from. Paste one here to find out whose game is calling you."
 						>Identify an experience</h3>
 						<p class="form__hint">
 							Roblox stamps the calling place ID on every <code>HttpService</code> request as the
@@ -1428,8 +1525,9 @@
 					</div>
 
 					<div class="card">
-						<h3 class="card__title"
-							data-help="The same traffic seen by IP address instead of by game.&#10;&#10;Precise, but noisy for Roblox callers. Use it for anything that is NOT a game: scripts, scrapers, your own testing."
+						<h3
+							class="card__title"
+							data-help="One row per calling GAME.&#10;&#10;This is usually the view you want: a Roblox game reaches you from hundreds of rotating server IPs, so the same caller is one row here and a hundred rows in Top Talkers below."
 						>Callers (by Roblox place ID)</h3>
 						<p class="form__hint">
 							One row per calling experience. This is the identity worth acting on: a Roblox game reaches
@@ -1470,7 +1568,10 @@
 					</div>
 
 					<div class="card">
-						<h3 class="card__title">Top Talkers (by IP)</h3>
+						<h3
+							class="card__title"
+							data-help="The same traffic seen by IP address instead of by game.&#10;&#10;Precise, but noisy for Roblox callers. Use it for anything that is NOT a game: scripts, scrapers, your own testing."
+						>Top Talkers (by IP)</h3>
 						<p class="form__hint">
 							The same traffic keyed on the client IP. Precise, but noisy for Roblox callers — use it for
 							anything that is not a game (scripts, scrapers, your own testing).

@@ -4063,6 +4063,18 @@ const print = console.log;
 			renderTarpit(d);
 			renderCache(d);
 			renderThrottleRules(d);
+			// The entry list is fetched separately (it reads every shard), so it
+			// has to be told to refresh — otherwise its ages and countdowns sit
+			// at whatever they were when the section was first opened. Only
+			// while it is on screen; off screen it costs nothing.
+			cacheBrowser.visible = cacheSectionVisible();
+			if (cacheBrowser.visible && !cacheBrowser.loading) {
+				loadCacheEntries();
+				// Grouping every entry is heavier than a page of them, so the
+				// diagnosis refreshes on its own slower beat rather than on
+				// every poll.
+				if (Date.now() / 1000 - (renderCacheSpread._at || 0) > CACHE_SPREAD_INTERVAL) loadCacheSpread();
+			}
 			renderHeaderRules(d);
 			renderTesterSamples();
 			renderBlockedAttempts(d);
@@ -5601,10 +5613,201 @@ const print = console.log;
 		setText("cache_window", state.OldestAt ? timeAgo(state.OldestAt) : "—");
 
 		renderCacheTimeline(state);
+		renderCacheDiskHealth(state);
 		renderCacheControls(state);
 		renderCacheRules(renderCache._rules || {});
 		renderCacheEndpoints(renderCache._endpoints || {});
+		if (d.CacheIgnoredParams) renderCache._ignored = d.CacheIgnoredParams;
+		renderIgnoredParams(renderCache._ignored || {});
 	}
+
+	// The shared disk store failing is the one cache problem that hides itself:
+	// every worker keeps its own private copies, so requests still get answered
+	// and the counters still climb — the hit rate is just a quarter of what it
+	// should be and the entry list shows whichever worker happened to answer.
+	// Nothing about that reads as broken, so it has to be said out loud.
+	function renderCacheDiskHealth(state) {
+		const box = $("#cacheDiskWarning");
+		if (!box) return;
+		const disk = state.Disk || {};
+		const broken = Boolean(state.DiskEnabled) && disk.OK === false;
+		box.hidden = !broken;
+		if (!broken) return;
+		const reason = disk.Writable === false
+			? `Roxy cannot write to <code>${escapeHtml(disk.Dir || "")}</code>.`
+			: `Writing to <code>${escapeHtml(disk.Dir || "")}</code> is failing.`;
+		box.innerHTML =
+			"<strong>The shared cache store is not working.</strong> " +
+			reason +
+			" Saved answers are being kept in each worker's memory instead, so they are not shared " +
+			"between workers and are lost on restart — which is why the hit rate is lower than it " +
+			"should be and this list looks incomplete." +
+			(disk.Error ? `<br /><span class="mono">${escapeHtml(disk.Error)}</span>` : "") +
+			"<br />Fix the directory's permissions, or turn off " +
+			'<strong>Keep a shared copy on disk</strong> above to run memory-only on purpose.';
+	}
+
+	function renderIgnoredParams(ignored) {
+		const tbody = $("#ignoredParamsTable tbody");
+		if (!tbody) return;
+		const entries = Object.entries(ignored || {});
+		tbody.innerHTML = "";
+		if (!entries.length) {
+			tbody.appendChild(tr(["Nothing ignored — every query parameter is part of the key.", "", "", ""]));
+			return;
+		}
+		for (const [name, info] of entries) {
+			const remove = document.createElement("button");
+			remove.className = "btn btn--ghost btn--xs";
+			remove.textContent = "Stop ignoring";
+			remove.addEventListener("click", () => setIgnoredParam(name, true));
+			const row = tr([sortable(name, name), info.Note || "—", tsNode(info.Added), remove]);
+			row.children[0].className = "mono";
+			tbody.appendChild(row);
+		}
+	}
+
+	async function setIgnoredParam(name, remove) {
+		if (remove && !confirm(`Put "${name}" back into the cache key? This empties the cache.`)) return;
+		try {
+			const res = await api("/admin/cache/ignore_param", {
+				method: "POST",
+				body: JSON.stringify({
+					name,
+					remove: Boolean(remove),
+					note: $("#ignoreParamNote")?.value.trim() || "",
+				}),
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(data.Message || String(res.status));
+			renderCache._ignored = data.Ignored;
+			renderIgnoredParams(data.Ignored);
+			showToast(
+				remove
+					? `"${name}" is part of the cache key again (${fmtCount(data.Purged)} entries dropped)`
+					: `"${name}" is now ignored (${fmtCount(data.Purged)} entries dropped so it takes effect)`,
+				4200,
+			);
+			if ($("#ignoreParamName")) $("#ignoreParamName").value = "";
+			if ($("#ignoreParamNote")) $("#ignoreParamNote").value = "";
+			loadCacheSpread();
+			loadCacheEntries(true);
+			refreshAll(true);
+		} catch (err) {
+			showToast("Could not change that: " + err.message, 4200);
+		}
+	}
+
+	$("#ignoreParamForm")?.addEventListener("submit", e => {
+		e.preventDefault();
+		const name = $("#ignoreParamName")?.value.trim();
+		if (name) setIgnoredParam(name, false);
+	});
+
+	// --- Why isn't something being reused? -----------------------------------
+	function renderCacheSpread(data) {
+		const tbody = $("#cacheSpreadTable tbody");
+		if (!tbody) return;
+		const groups = data.Groups || [];
+		setText("cacheSpreadStamp", `Checked ${timeAgo(Date.now() / 1000)}`);
+		renderCacheSpread._at = Date.now() / 1000;
+		const suggestions = $("#ignoreParamSuggestions");
+		if (suggestions) {
+			const already = new Set(Object.keys(data.Ignored || {}));
+			const free = (data.Suggested || []).filter(name => !already.has(name));
+			suggestions.innerHTML = free.length
+				? "Commonly used as cache-busters: " +
+					free.map(name => `<code>${escapeHtml(name)}</code>`).join(", ") +
+					". Only ignore one you know does not change the answer."
+				: "";
+		}
+		tbody.innerHTML = "";
+		if (!groups.length) {
+			tbody.appendChild(tr(["Nothing stored yet, so there is nothing to diagnose.", "", "", "", ""]));
+			return;
+		}
+		for (const group of groups) {
+			const path = document.createElement("span");
+			path.className = "mono cache-key";
+			path.textContent = group.Path;
+			path.title = group.Key;
+
+			const entries = document.createElement("span");
+			entries.textContent = fmtCount(group.Entries);
+			if (group.Suspect) entries.className = "text-bad";
+
+			const hits = document.createElement("span");
+			hits.textContent = fmtCount(group.Hits);
+			if (!group.Hits && group.Entries > 1) hits.className = "text-warn";
+
+			const varying = document.createElement("span");
+			if (group.Varying && group.Varying.length) {
+				varying.innerHTML =
+					group.Varying
+						.map(
+							p =>
+								`<span class="mono">${escapeHtml(p.Name)}</span> ` +
+								`<span class="text-dim">(${fmtCount(p.Values)} values)</span>`,
+						)
+						.join(", ") +
+					(group.Suspect
+						? ' <span class="text-bad">— splitting these apart for nothing</span>'
+						: group.Hits
+							? ' <span class="text-dim">— and they are being reused, so this is fine</span>'
+							: "");
+			} else {
+				varying.className = "text-muted";
+				varying.textContent = "no query parameters";
+			}
+
+			const actions = document.createElement("div");
+			actions.className = "row-actions";
+			// The one-click path is deliberately offered ONLY for a parameter
+			// that is splitting entries apart AND producing no reuse. On the row
+			// above, `universeIds` is also the most-varying parameter — and it
+			// is the whole question being asked. Offering to ignore it next to a
+			// healthy hit rate would be inviting someone to hand one caller
+			// another caller's data. Anything else can still be typed into the
+			// form below, which spells out that risk.
+			if (group.Suspect && group.SuspectParam) {
+				const ignore = document.createElement("button");
+				ignore.className = "btn btn--outline btn--xs";
+				ignore.textContent = `Ignore "${group.SuspectParam}"`;
+				ignore.title = `Leave ${group.SuspectParam} out of the cache key so these collapse into one entry`;
+				ignore.addEventListener("click", () => setIgnoredParam(group.SuspectParam, false));
+				actions.appendChild(ignore);
+			}
+			actions.appendChild(
+				fpButton("Purge", "Drop every saved answer for this path", () =>
+					purgeCache({ pattern: group.Path }, `Purged ${group.Path}`),
+				),
+			);
+
+			const row = tr([path, entries, hits, varying, actions]);
+			if (group.Suspect) row.classList.add("row--emph");
+			tbody.appendChild(row);
+		}
+	}
+
+	// Seconds between automatic re-checks while the section is on screen.
+	const CACHE_SPREAD_INTERVAL = 30;
+
+	async function loadCacheSpread() {
+		const tbody = $("#cacheSpreadTable tbody");
+		if (!tbody) return;
+		try {
+			const res = await api("/admin/cache/spread?limit=25");
+			if (!res.ok) throw new Error(String(res.status));
+			renderCacheSpread(await res.json());
+		} catch {
+			tbody.innerHTML = "";
+			tbody.appendChild(tr(["Could not check the cache.", "", "", "", ""]));
+		}
+	}
+
+	$("#cacheSpreadBtn")?.addEventListener("click", e =>
+		withBusy(e.currentTarget, "Checking…", () => loadCacheSpread()),
+	);
 
 	// The worked example under "What happens to one request". Rendered rather
 	// than written into the template so it uses the admin's ACTUAL numbers: the
@@ -5826,7 +6029,11 @@ const print = console.log;
 	}
 
 	// --- The entry browser (fetched on demand, paged on the server) -----------
-	const cacheBrowser = { offset: 0, limit: 25, total: 0, loaded: false, loading: false };
+	// `visible` is what makes the list refresh with the rest of the dashboard.
+	// Scanning every shard on each poll regardless would be wasteful, and not
+	// scanning at all left ages and countdowns frozen at whatever they were when
+	// the section first scrolled into view — which reads as a broken cache.
+	const cacheBrowser = { offset: 0, limit: 25, total: 0, loaded: false, loading: false, visible: false };
 
 	async function loadCacheEntries(reset = false) {
 		if (cacheBrowser.loading) return;
@@ -5928,6 +6135,7 @@ const print = console.log;
 		const next = $("#cacheNextBtn");
 		if (prev) prev.disabled = page.Offset <= 0;
 		if (next) next.disabled = last >= page.Total;
+		setText("cacheLoadedStamp", `loaded ${timeAgo(Date.now() / 1000)}`);
 	}
 
 	async function inspectCacheEntry(id) {
@@ -6155,21 +6363,48 @@ const print = console.log;
 		}),
 	);
 
-	// The browser is loaded the first time the section is actually looked at, so
-	// a dashboard opened on the Overview never pays for a full cache scan.
-	function watchCacheSection() {
+	// Is the cache section on screen? Measured rather than observed.
+	//
+	// This used to be an IntersectionObserver, which in a hidden or backgrounded
+	// tab can fire nothing at all — not even its initial callback. The panels
+	// then never load, and an empty cache browser is indistinguishable from a
+	// cache that is not storing anything. getBoundingClientRect is synchronous
+	// and cannot be deferred, so it always answers.
+	function cacheSectionVisible() {
 		const section = document.getElementById("section-cache");
-		if (!section || typeof IntersectionObserver !== "function") {
-			loadCacheEntries(true);
-			return;
-		}
-		const observer = new IntersectionObserver(
-			entries => {
-				if (entries.some(entry => entry.isIntersecting) && !cacheBrowser.loaded) loadCacheEntries(true);
-			},
-			{ rootMargin: "200px" },
-		);
-		observer.observe(section);
+		if (!section) return false;
+		const rect = section.getBoundingClientRect();
+		// A margin either side, so it starts loading just before it is reached.
+		return rect.bottom > -200 && rect.top < window.innerHeight + 200;
+	}
+
+	// Loaded the first time the section is actually looked at, so a dashboard
+	// left open on the Overview never pays for a full scan of every shard.
+	function watchCacheSection() {
+		let pending = false;
+		const check = () => {
+			pending = false;
+			const visible = cacheSectionVisible();
+			const appeared = visible && !cacheBrowser.visible;
+			cacheBrowser.visible = visible;
+			if (!appeared) return;
+			// Every time it comes into view, not only the first: an admin who
+			// scrolled away, changed something and came back should be looking
+			// at the result, not at what it said ten minutes ago.
+			if (!cacheBrowser.loaded) loadCacheEntries(true);
+			loadCacheSpread();
+		};
+		const schedule = () => {
+			if (pending) return;
+			pending = true;
+			setTimeout(check, 150);
+		};
+		// A scroll listener as well as the poll, because auto-refresh defaults to
+		// off: without it, scrolling to the section would show nothing until the
+		// admin thought to press Refresh.
+		window.addEventListener("scroll", schedule, { passive: true });
+		window.addEventListener("resize", schedule, { passive: true });
+		check();
 	}
 
 	// -----------------------------
@@ -6835,6 +7070,8 @@ const print = console.log;
 		"#cacheEndpointsTable",
 		"#strikeBoardTable",
 		"#uaRulesTable",
+		"#cacheSpreadTable",
+		"#ignoredParamsTable",
 	];
 
 	function initAllSortables() {

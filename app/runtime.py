@@ -123,6 +123,15 @@ _throttle_tiers = [dict(tier) for tier in config.DEFAULT_THROTTLE_TIERS]
 #                Note, Enabled, Added}
 _user_agent_rules = dict()
 
+# --- Query parameters ignored when building a cache key ---------------------
+# For the caller that appends a changing value to every request. Without this
+# the cache stores a new entry every time and never once serves one, which on
+# the dashboard looks exactly like a cache that is working — entries climbing,
+# hits flat. name -> {"Added": ts, "Note": str}
+# Empty by default: ignoring a parameter that genuinely changes the answer
+# would hand one caller another's data, so each name is an explicit decision.
+_cache_ignored_params = dict()
+
 # --- Header block rules -----------------------------------------------------
 # Deny a request outright based on its headers (e.g. exploit fingerprints like
 # "Xeno"). id -> {"Scope": key|value|either, "Mode": contains|exact,
@@ -417,6 +426,11 @@ def _restore_from(data: dict):
     ua_rules = data.get("UserAgentRules", {})
     if isinstance(ua_rules, dict):
         replace_in_place(_user_agent_rules, {str(k): dict(v) for k, v in ua_rules.items() if isinstance(v, dict)})
+    ignored_params = data.get("CacheIgnoredParams", {})
+    if isinstance(ignored_params, dict):
+        replace_in_place(
+            _cache_ignored_params, {str(k): dict(v) for k, v in ignored_params.items() if isinstance(v, dict)}
+        )
     tiers = data.get("ThrottleTiers")
     if isinstance(tiers, list):
         # Absent means "never configured", so the seeded ladder stands; present
@@ -874,6 +888,41 @@ def match_cache_rule(path: str):
                 best = dict(rule, Pattern=pattern)
                 best_score = score
     return best
+
+
+def get_cache_ignored_params() -> dict:
+    _maybe_reload()
+    return {k: dict(v) for k, v in _cache_ignored_params.items()}
+
+
+def cache_ignored_param_names() -> frozenset:
+    """Just the names, for the cache key builder. Hot path: called once per
+    cacheable request, so it does no more work than the reload check every
+    other reader here already does."""
+    _maybe_reload()
+    return frozenset(_cache_ignored_params)
+
+
+def add_cache_ignored_param(name: str, note: str = "") -> tuple[bool, str]:
+    name = (name or "").strip()[:80]
+    if not name:
+        return False, "Enter a query parameter name"
+    if name not in _cache_ignored_params and len(_cache_ignored_params) >= config.MAX_CACHE_IGNORED_PARAMS:
+        return False, "Too many ignored parameters"
+
+    def change():
+        _cache_ignored_params[name] = {"Added": time.time(), "Note": str(note)[:200]}
+
+    _persist_change(change)
+    return True, "Success"
+
+
+def remove_cache_ignored_param(name: str) -> tuple[bool, str]:
+    def change():
+        _cache_ignored_params.pop((name or "").strip(), None)
+
+    _persist_change(change)
+    return True, "Success"
 
 
 def path_matches(pattern: str, path: str, kind: str = "glob") -> bool:
@@ -1527,6 +1576,7 @@ def _serialize_unlocked() -> dict:
         "EndpointRules": {k: dict(v) for k, v in _endpoint_rules.items()},
         "CacheRules": {k: dict(v) for k, v in _cache_rules.items()},
         "UserAgentRules": {k: dict(v) for k, v in _user_agent_rules.items()},
+        "CacheIgnoredParams": {k: dict(v) for k, v in _cache_ignored_params.items()},
         "ThrottleTiers": [dict(t) for t in _throttle_tiers],
         "HeaderRules": {k: dict(v) for k, v in _header_rules.items()},
         "IgnoredValueHeaders": {k: dict(v) for k, v in _ignored_value_headers.items()},

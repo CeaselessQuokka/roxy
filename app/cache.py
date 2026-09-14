@@ -126,6 +126,76 @@ MAX_PENDING_HITS = 5000  # Bound the buffer itself; past this the oldest deltas 
 _inflight_lock = threading.Lock()
 _inflight = {}
 
+# --- Disk-tier health --------------------------------------------------------
+# LockedJSON.update() swallows an OSError and quietly applies the change to a
+# throwaway dict so the request still flows. That is the right call for a
+# counter — but for the cache it means a directory the service cannot write
+# turns the shared store into four private in-memory ones, the hit rate
+# collapses to whatever one worker manages on its own, and NOTHING anywhere
+# says so. The dashboard showed "0 stored responses" next to a Stores counter
+# climbing, which is a contradiction with no explanation attached.
+#
+# So every store confirms its own write landed, and what it finds is reported.
+_health_lock = threading.Lock()
+_health = {"Writes": 0, "Failures": 0, "LastWriteAt": 0.0, "LastError": "", "LastErrorAt": 0.0}
+
+
+def _record_write(ok: bool, error: str = ""):
+    with _health_lock:
+        if ok:
+            _health["Writes"] += 1
+            _health["LastWriteAt"] = time.time()
+        else:
+            _health["Failures"] += 1
+            _health["LastError"] = str(error)[:300]
+            _health["LastErrorAt"] = time.time()
+
+
+def disk_status() -> dict:
+    """Whether the shared disk tier is actually usable, and what went wrong.
+
+    Checked rather than assumed: the failure mode this exists for is silent by
+    construction, and "is the directory writable?" is one stat call.
+    """
+    directory = config.CACHE_DIR
+    exists = os.path.isdir(directory)
+    writable = False
+    error = ""
+    try:
+        if exists:
+            writable = os.access(directory, os.W_OK | os.X_OK)
+        else:
+            # Not created yet is normal before the first store; what matters is
+            # whether its parent would let us create it.
+            parent = os.path.dirname(directory.rstrip("/")) or "/"
+            writable = os.path.isdir(parent) and os.access(parent, os.W_OK | os.X_OK)
+    except OSError as problem:
+        error = f"{type(problem).__name__}: {problem}"
+    with _health_lock:
+        health = dict(_health)
+    shards = 0
+    try:
+        if exists:
+            shards = sum(1 for name in os.listdir(directory) if name.startswith("shard_") and name.endswith(".json"))
+    except OSError:
+        pass
+    return {
+        "Dir": directory,
+        "Exists": exists,
+        "Writable": bool(writable),
+        "ShardFiles": shards,
+        "Error": error or health["LastError"],
+        "LastErrorAt": health["LastErrorAt"],
+        "LastWriteAt": health["LastWriteAt"],
+        "Writes": health["Writes"],
+        "Failures": health["Failures"],
+        # The one sentence the dashboard needs: is the shared store working?
+        # A past failure does not count against it once a write has succeeded
+        # since — otherwise fixing the permissions leaves the warning up until
+        # the next restart, and a warning that will not clear gets ignored.
+        "OK": bool(writable) and (health["Failures"] == 0 or health["LastWriteAt"] >= health["LastErrorAt"]),
+    }
+
 # Statuses that may be cached when error caching is switched on. 429 and 5xx are
 # deliberately absent: they are transient upstream failures, and caching one
 # would pin the outage in place long after Roblox had recovered.
@@ -158,23 +228,37 @@ def _limits() -> dict:
 
 
 # --- Keys --------------------------------------------------------------------
-def canonical_query(params) -> str:
+def canonical_query(params, ignored=frozenset()) -> str:
     """A stable text form of the query string.
 
     Parameter NAMES are sorted so ?a=1&b=2 and ?b=2&a=1 are one cache entry;
     repeated VALUES keep their order, because ?ids=1&ids=2 and ?ids=2&ids=1 can
     legitimately come back differently ordered and collapsing them would hand a
     caller someone else's ordering.
+
+    `ignored` names parameters left out of the key entirely — see
+    runtime.get_cache_ignored_params. A caller that appends a timestamp to every
+    request otherwise produces a brand-new key every time, so the cache fills up
+    and never once serves anything out of it.
     """
     if not params:
         return ""
     parts = []
     for name in sorted(params):
+        if name in ignored:
+            continue
         value = params[name]
         values = value if isinstance(value, (list, tuple)) else [value]
         for item in values:
             parts.append(f"{name}={item}")
     return "&".join(parts)
+
+
+def ignored_params() -> frozenset:
+    try:
+        return runtime.cache_ignored_param_names()
+    except Exception:
+        return frozenset()
 
 
 def readable_key(method: str, path: str, params, body=None) -> str:
@@ -187,7 +271,7 @@ def readable_key(method: str, path: str, params, body=None) -> str:
     host, _, rest = (path or "").partition("/")
     normalized = f"{host.lower()}/{rest}" if rest else host.lower()
     key = f"{(method or 'GET').upper()} {normalized}"
-    query = canonical_query(params)
+    query = canonical_query(params, ignored_params())
     if query:
         key += f"?{query}"
     if body:
@@ -212,8 +296,11 @@ def make_key(method: str, path: str, params, body=None) -> dict:
     would quietly corrupt any value containing an "=" or an "&".
     """
     readable = readable_key(method, path, params, body)
+    skip = ignored_params()
     kept = {}
     for name, value in (params or {}).items():
+        if name in skip:
+            continue  # Not part of the key, so not part of what a refetch sends.
         values = value if isinstance(value, (list, tuple)) else [value]
         kept[str(name)] = [str(item) for item in values]
     return {
@@ -360,20 +447,53 @@ def memory_state() -> dict:
 
 
 # --- Shard index -------------------------------------------------------------
+def _shard_signature(shard: str):
+    """A value that changes whenever a shard file's contents could have changed.
+
+    Nanosecond mtime AND size, not the float mtime this used to compare. Two
+    reasons, both of which produced a key that was on disk being reported as
+    absent — a MISS on an entry we were holding all along:
+
+      Granularity. A float mtime can round to the same value for two writes in
+      the same second, and four workers writing sixteen shards hit that
+      constantly. The nanosecond field does not, and the size is a second
+      witness for the rare case where it somehow did.
+
+      Staleness. See _index_remember: the signature has to be taken BEFORE the
+      read it describes, never after.
+    """
+    try:
+        stat = os.stat(_shard_path(shard))
+        return (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return (0, 0)
+
+
 def _index_says_absent(shard: str, entry_id: str) -> bool:
     """True when this worker can prove the key is not on disk without a parse."""
     with _index_lock:
         cached = _index.get(shard)
     if not cached:
         return False
-    if cached["MTime"] != _shard(shard).mtime():
+    if cached["Signature"] != _shard_signature(shard):
         return False  # Someone wrote to the shard; what we remember may be short.
     return entry_id not in cached["Keys"]
 
 
-def _index_remember(shard: str, keys):
+def _index_remember(shard: str, keys, signature=None):
+    """Remember which keys a shard held, against the signature it had AT THE TIME.
+
+    `signature` must be sampled BEFORE the read that produced `keys`. Sampling
+    it afterwards records a newer file against an older key set, so a key
+    another worker added in between is then treated as proven-absent until the
+    shard happens to change again — which, for a quiet shard, can be a very long
+    time. That is a cached entry that exists and is never once served.
+    """
     with _index_lock:
-        _index[shard] = {"MTime": _shard(shard).mtime(), "Keys": set(keys)}
+        _index[shard] = {
+            "Signature": _shard_signature(shard) if signature is None else signature,
+            "Keys": set(keys),
+        }
 
 
 def _index_forget(shard: str = None):
@@ -463,14 +583,17 @@ def get(key: dict):
     shard = _shard_of(entry_id)
     if _index_says_absent(shard, entry_id):
         return None
+    # Sampled first, so a write that lands during the read is recorded as a
+    # signature mismatch (re-read next time) rather than as fresh knowledge.
+    signature = _shard_signature(shard)
     try:
         records = _shard(shard).read().get("Records")
     except Exception:
         return None
     if not isinstance(records, dict):
-        _index_remember(shard, ())
+        _index_remember(shard, (), signature)
         return None
-    _index_remember(shard, records.keys())
+    _index_remember(shard, records.keys(), signature)
     entry = records.get(entry_id)
     if not isinstance(entry, dict):
         return None
@@ -578,11 +701,23 @@ def store(key: dict, body, ttl: int, **fields):
         outcome["Evicted"] = _prune(records, now, max_entries, max_bytes)
         outcome["Records"] = dict(records)
 
+    # Sampled before the write so the two can be compared afterwards.
+    before = _shard_signature(shard)
     try:
         _shard(shard).update(mutate)
-    except Exception:
+    except Exception as problem:
+        _record_write(False, problem)
         return entry  # It is still in memory; the disk tier missing one entry is survivable.
-    if outcome["Records"] is not None:
+    # LockedJSON reports success even when it fell back to mutating a throwaway
+    # dict, so "did it raise?" is not the question. Nor is "does the file
+    # exist?" — a shard written successfully last week still exists after a
+    # store that failed today. A real write always changes the signature and a
+    # failed one never does, which is the only reliable answer available here.
+    # Without it, a cache directory the service cannot write looks, from every
+    # counter on the dashboard, exactly like a working one.
+    landed = _shard_signature(shard) != before
+    _record_write(landed, "" if landed else f"{_shard_path(shard)} was not written (check permissions)")
+    if outcome["Records"] is not None and landed:
         _index_remember(shard, outcome["Records"].keys())
         _write_meta(shard, outcome["Records"])
     if outcome["Evicted"]:
@@ -663,6 +798,11 @@ def _all_records() -> dict:
     return out
 
 
+# Bounds on the key-spread scan: it groups every entry in the store, and the
+# point is to notice a runaway parameter, not to enumerate its values.
+MAX_SPREAD_VALUES = 500
+MIN_SPREAD_ENTRIES = 5  # Below this, "many keys, no hits" is just a quiet endpoint.
+
 SORT_FIELDS = {
     "hits": lambda e: int(e.get("Hits", 0) or 0),
     "bytes": lambda e: int(e.get("Bytes", 0) or 0),
@@ -724,6 +864,78 @@ def list_entries(query: str = "", offset: int = 0, limit: int = 50, sort: str = 
         "Order": order,
         "FreshCount": sum(1 for row in rows if row["Fresh"]),
     }
+
+
+def key_spread(limit: int = 25) -> list:
+    """Endpoints that are filling the cache without ever being served from it.
+
+    This is the diagnostic for the one failure that looks identical to success
+    on every other number: a caller that appends a changing value to each
+    request — a timestamp, a random cache-buster — makes every request a
+    different key. Entries climb, Stores climbs, and the hit count stays at
+    zero, because no two requests ever ask the same question.
+
+    Grouping by method + path (query excluded) makes it obvious: one path with
+    four hundred entries behind it and no hits is not a busy endpoint, it is one
+    parameter that should not be part of the key. So the varying parameter is
+    named too, which turns "why is this not working" into one click.
+    """
+    flush_hits()
+    groups = {}
+    records = _all_records()
+    with _mem_lock:
+        for entry_id, entry in _mem.items():
+            records.setdefault(entry_id, entry)
+    for entry in records.values():
+        path = str(entry.get("Path", ""))
+        key = f"{entry.get('Method', 'GET')} {path.split('?', 1)[0]}"
+        group = groups.setdefault(
+            key,
+            {"Key": key, "Path": path.split("?", 1)[0], "Method": entry.get("Method", "GET"),
+             "Entries": 0, "Hits": 0, "Bytes": 0, "Params": {}},
+        )
+        group["Entries"] += 1
+        group["Hits"] += int(entry.get("Hits", 0) or 0)
+        group["Bytes"] += int(entry.get("Bytes", 0) or 0)
+        for name, values in (entry.get("Params") or {}).items():
+            seen = group["Params"].setdefault(str(name), set())
+            if len(seen) <= MAX_SPREAD_VALUES:
+                seen.add("\u0000".join(str(v) for v in values))
+
+    rows = []
+    for group in groups.values():
+        # A parameter with (nearly) as many distinct values as there are entries
+        # is the one splitting them apart. Reported with its count so the admin
+        # can judge it rather than take our word for it.
+        varying = sorted(
+            ({"Name": name, "Values": len(values)} for name, values in group["Params"].items()),
+            key=lambda item: item["Values"],
+            reverse=True,
+        )
+        top = varying[0] if varying else None
+        rows.append(
+            {
+                "Key": group["Key"],
+                "Path": group["Path"],
+                "Method": group["Method"],
+                "Entries": group["Entries"],
+                "Hits": group["Hits"],
+                "Bytes": group["Bytes"],
+                "Varying": varying[:4],
+                # Only flagged when a single parameter explains nearly all of the
+                # spread AND the entries are not being reused. Two entries and no
+                # hits is a quiet endpoint, not a problem.
+                "Suspect": bool(
+                    top
+                    and group["Entries"] >= MIN_SPREAD_ENTRIES
+                    and top["Values"] >= group["Entries"] * 0.8
+                    and group["Hits"] <= group["Entries"] * 0.1
+                ),
+                "SuspectParam": top["Name"] if top else "",
+            }
+        )
+    rows.sort(key=lambda row: (row["Suspect"], row["Entries"]), reverse=True)
+    return rows[: max(1, int(limit))]
 
 
 def get_entry(entry_id: str):
@@ -889,9 +1101,21 @@ def get_state() -> dict:
     total = sum(int(s.get("Bytes", 0) or 0) for s in shards.values())
     oldest = min((float(s.get("Oldest", 0) or 0) for s in shards.values() if s.get("Oldest")), default=0.0)
     memory = memory_state()
+    disk = disk_status()
+    # "0 stored responses" next to a climbing Stores counter is a contradiction,
+    # and it is what a broken disk tier looks like from here — the entries are
+    # real, they are just in this worker's memory and nowhere else. Say so
+    # rather than reporting a zero that reads as "nothing is being cached".
+    memory_only = disk_enabled() and not disk["OK"]
+    if memory_only and not count:
+        count, total = memory["Count"], memory["Bytes"]
     return {
         "Enabled": is_enabled(),
         "DiskEnabled": disk_enabled(),
+        "Disk": disk,
+        # True when entries exist but only inside individual workers, so the
+        # admin knows why the hit rate is a quarter of what it should be.
+        "MemoryOnly": memory_only,
         "Entries": count,
         "Bytes": total,
         "MaxEntries": limits["MaxEntries"],

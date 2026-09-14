@@ -3174,6 +3174,35 @@ r = client.post("/admin/cache/rule/clear", headers=IP_MAIN, json={"pattern": "us
 check("A cache rule can be removed", "users.roblox.com/v1/never" not in r.get_json()["CacheRules"], r.get_json())
 client.post("/admin/cache/rule/clear", headers=IP_MAIN, json={"pattern": "users.roblox.com/v1/long"})
 
+print("\n== An expired answer is refetched, not reused ==")
+# The point of a TTL: once it lapses the next caller gets CURRENT data, and the
+# stale copy is only ever a fallback for an upstream that refused us.
+fresh_upstream()
+clear_all_diag()
+cache_module.clear()
+runtime.set_setting("cache_ttl_seconds", 1)
+EXPIRY_URL = "/games.roblox.com/v1/games/expiry-test"
+_expiry_key = cache_module.make_key("GET", "games.roblox.com/v1/games/expiry-test", {})
+first = api_client.get(EXPIRY_URL, headers=IP_CACHE)
+check("The first request is fetched", first.headers.get("Roxy-Cache") == "MISS", first.headers.get("Roxy-Cache"))
+check("...and the second is reused", api_client.get(EXPIRY_URL, headers=IP_CACHE).headers.get("Roxy-Cache") == "HIT")
+_entry = cache_module.get(_expiry_key)
+time.sleep(max(0.4, float(_entry["ExpiresAt"]) - time.time() + 0.5))
+before = len(upstream_calls)
+after_expiry = api_client.get(EXPIRY_URL, headers=IP_CACHE)
+check("Once it expires the next caller goes to Roblox", len(upstream_calls) - before == 1, len(upstream_calls) - before)
+check(
+    "...counted as a miss, not served stale",
+    after_expiry.headers.get("Roxy-Cache") == "MISS",
+    after_expiry.headers.get("Roxy-Cache"),
+)
+check("...and the refreshed copy is reused again", api_client.get(EXPIRY_URL, headers=IP_CACHE).headers.get("Roxy-Cache") == "HIT")
+check(
+    "...with the clock restarted, not carried over",
+    cache_module.get(_expiry_key)["ExpiresAt"] > _entry["ExpiresAt"],
+)
+runtime.set_setting("cache_ttl_seconds", 60)
+
 print("\n== A stale answer beats an error when Roblox refuses ==")
 fresh_upstream()
 clear_all_diag()
@@ -3395,6 +3424,110 @@ print("\n== Purging a malformed id is refused, not crashed on ==")
 r = client.post("/admin/cache/purge", headers=IP_MAIN, json={"id": "../../etc/passwd"})
 check("A malformed cache id is handled", r.status_code == 200, r.status_code)
 check("...and removes nothing", r.get_json()["Removed"] == 0, r.get_json())
+
+print("\n== A caller that varies its query is diagnosed, not just endured ==")
+fresh_upstream()
+clear_all_diag()
+cache_module.clear()
+runtime.set_setting("cache_ttl_seconds", 300)
+BUSTED = "/games.roblox.com/v1/games/9583680112/votes?t="
+before = len(upstream_calls)
+for i in range(6):
+    api_client.get(BUSTED + str(1000 + i), headers=IP_CACHE)
+check("Every request is a fresh key, so every one goes upstream", len(upstream_calls) - before == 6, len(upstream_calls) - before)
+r = client.get("/admin/cache/spread", headers=IP_MAIN)
+check("The spread report loads", r.status_code == 200, r.status_code)
+group = [g for g in r.get_json()["Groups"] if "9583680112" in g["Path"]][0]
+check("...grouping the entries behind one path", group["Entries"] == 6, group)
+check("...noticing they are never reused", group["Hits"] == 0, group)
+check("...flagging it as the problem it is", group["Suspect"] is True, group)
+check("...and naming the parameter doing it", group["SuspectParam"] == "t", group)
+check("...with a count you can sanity-check", group["Varying"][0] == {"Name": "t", "Values": 6}, group["Varying"])
+
+print("\n== Ignoring that parameter makes the endpoint cacheable ==")
+r = client.post("/admin/cache/ignore_param", headers=IP_MAIN, json={"name": "t", "note": "cache buster"})
+check("A parameter can be left out of the key", r.status_code == 200, r.status_code)
+check("...and is listed", "t" in r.get_json()["Ignored"], r.get_json())
+check("...emptying the cache so it takes effect now", r.get_json()["Purged"] >= 6, r.get_json())
+before = len(upstream_calls)
+verdicts = [api_client.get(BUSTED + str(2000 + i), headers=IP_CACHE).headers.get("Roxy-Cache") for i in range(6)]
+check("Six differently-busted requests now collapse into one", len(upstream_calls) - before == 1, len(upstream_calls) - before)
+check("...the first a miss and the rest hits", verdicts == ["MISS"] + ["HIT"] * 5, verdicts)
+entries = client.get("/admin/cache/entries?q=9583680112", headers=IP_MAIN).get_json()
+check("...stored under a single key with the parameter gone", entries["Total"] == 1, entries["Total"])
+check("...and that key does not mention it", "t=" not in entries["Entries"][0]["Key"], entries["Entries"][0]["Key"])
+
+# A parameter that genuinely selects the answer must still split the cache.
+before = len(upstream_calls)
+api_client.get("/games.roblox.com/v1/games/votes?universeIds=111&t=9", headers=IP_CACHE)
+api_client.get("/games.roblox.com/v1/games/votes?universeIds=222&t=9", headers=IP_CACHE)
+check("A meaningful parameter still separates two questions", len(upstream_calls) - before == 2, len(upstream_calls) - before)
+
+r = client.post("/admin/cache/ignore_param", headers=IP_MAIN, json={"name": "t", "remove": True})
+check("It can be put back into the key", "t" not in r.get_json()["Ignored"], r.get_json())
+before = len(upstream_calls)
+api_client.get(BUSTED + "3001", headers=IP_CACHE)
+api_client.get(BUSTED + "3002", headers=IP_CACHE)
+check("...and the requests separate again", len(upstream_calls) - before == 2, len(upstream_calls) - before)
+r = client.post("/admin/cache/ignore_param", headers=IP_MAIN, json={"name": ""})
+check("An empty parameter name is rejected", r.status_code == 400, r.status_code)
+
+print("\n== The shared disk store reports its own health ==")
+cache_module.clear()
+state = cache_module.get_state()
+check("A working store says so", state["Disk"]["OK"] is True, state["Disk"])
+check("...and is not flagged as memory-only", state["MemoryOnly"] is False, state)
+check("The dashboard is told where it lives", state["Disk"]["Dir"] == config.CACHE_DIR, state["Disk"])
+
+_cache_mode = os.stat(config.CACHE_DIR).st_mode
+os.chmod(config.CACHE_DIR, 0o555)  # The shape a wrong owner gives you on a real box.
+cache_module._index_forget()
+api_client.get("/games.roblox.com/v1/games/unwritable", headers=IP_CACHE)
+broken = cache_module.get_state()
+check("A store it cannot write to is detected", broken["Disk"]["OK"] is False, broken["Disk"])
+check("...saying the directory is not writable", broken["Disk"]["Writable"] is False, broken["Disk"])
+check("...and naming the file it failed on", "shard_" in broken["Disk"]["Error"], broken["Disk"]["Error"])
+check("...flagged as memory-only rather than as an empty cache", broken["MemoryOnly"] is True, broken)
+check(
+    "...reporting the entries that DO exist, in memory",
+    broken["Entries"] >= 1,
+    broken["Entries"],
+)
+os.chmod(config.CACHE_DIR, _cache_mode)
+api_client.get("/games.roblox.com/v1/games/writable-again", headers=IP_CACHE)
+check(
+    "...and stops complaining once it can write again",
+    cache_module.get_state()["Disk"]["OK"] is True,
+    cache_module.get_state()["Disk"],
+)
+cache_module.clear()
+
+print("\n== The shard index cannot report a stored key as absent ==")
+# The index lets a miss skip the file read. Its signature has to change whenever
+# the file could have, or a key another worker stored is treated as proven-absent
+# and that entry is never once served.
+cache_module.clear()
+_key = cache_module.make_key("GET", "games.roblox.com/v1/games/index-test", {})
+cache_module.store(_key, '{"ok":true}', 300)
+_shard = cache_module._shard_of(_key["Id"])
+check("A stored key is found", cache_module.get(_key) is not None)
+cache_module._mem_clear()
+check("...from disk with the memory tier empty", cache_module.get(_key) is not None)
+# Simulate another worker adding a key without this one noticing.
+_other = cache_module.make_key("GET", "games.roblox.com/v1/games/index-other", {})
+cache_module._index_remember(_shard, [_key["Id"]])  # a deliberately short index
+cache_module.store(_other, '{"ok":true}', 300)
+cache_module._mem_clear()
+check(
+    "A key added after the index was built is still found",
+    cache_module.get(_other) is not None,
+    "the index claimed it was absent",
+)
+_sig = cache_module._shard_signature(_shard)
+check("A shard signature is content-sensitive", _sig != (0, 0), _sig)
+check("...and a missing shard has none", cache_module._shard_signature("nope") == (0, 0))
+cache_module.clear()
+runtime.set_setting("cache_ttl_seconds", 60)
 
 print("\n== Cache state and rates reach the dashboard ==")
 fresh_upstream()

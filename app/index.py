@@ -417,6 +417,7 @@ def admin_diagnostics():
     data["Capture"] = capture.get_state()
     data["Cache"] = cache.get_state()
     data["CacheRules"] = runtime.get_cache_rules()
+    data["CacheIgnoredParams"] = runtime.get_cache_ignored_params()
     data["ThrottleTiers"] = runtime.get_throttle_tiers()
     data["UserAgentRules"] = runtime.get_user_agent_rules()
     # A short leaderboard rather than the whole table: this rides the regular
@@ -832,6 +833,63 @@ def admin_cache_refresh():
         rule=rule,
     )
     return jsonify({"OK": bool(stored), "Entry": cache.get_entry(entry.get("Id", "")), "Trace": trace}), 200
+
+
+@app.route("/admin/cache/spread", methods=["GET"], endpoint="admin_cache_spread")
+@requires_admin
+def admin_cache_spread():
+    """Which endpoints are filling the cache without ever being served from it.
+
+    Its own endpoint rather than part of the poll because it groups every entry
+    in the store — the same reason the browser is paged.
+    """
+    try:
+        limit = int(request.args.get("limit", 25))
+    except (TypeError, ValueError):
+        limit = 25
+    return (
+        jsonify(
+            {
+                "Groups": cache.key_spread(limit),
+                "Ignored": runtime.get_cache_ignored_params(),
+                "Suggested": list(config.SUGGESTED_CACHE_IGNORED_PARAMS),
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/admin/cache/ignore_param", methods=["POST"], endpoint="admin_cache_ignore_param")
+@requires_admin
+def admin_cache_ignore_param():
+    """Leave a query parameter out of the cache key, or put it back.
+
+    Purges afterwards on purpose: every entry already stored was keyed WITH the
+    parameter, so leaving them would mean the change appears to do nothing until
+    they all expire.
+    """
+    data = get_json_dict()
+    if data is None or "name" not in data:
+        return jsonify("Missing name"), 400
+    name = str(data.get("name", "") or "").strip()
+    if data.get("remove"):
+        ok, message = runtime.remove_cache_ignored_param(name)
+    else:
+        ok, message = runtime.add_cache_ignored_param(name, data.get("note", ""))
+    if not ok:
+        return jsonify({"Message": message}), 400
+    removed = cache.clear() if data.get("purge", True) else 0
+    return (
+        jsonify(
+            {
+                "Message": message,
+                "Ignored": runtime.get_cache_ignored_params(),
+                "Purged": removed,
+                "State": cache.get_state(),
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/admin/cache/rule", methods=["POST"], endpoint="admin_set_cache_rule")
