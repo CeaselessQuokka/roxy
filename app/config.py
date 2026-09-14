@@ -216,6 +216,7 @@ TARPIT_CATEGORIES = (
     "endpoint_rule",  # A per-endpoint rate rule.
     "blocked_endpoint",  # A blocked endpoint.
     "auth_attempt",  # Tried to smuggle a ROBLOSECURITY cookie.
+    "user_agent_rule",  # Caught by a per-User-Agent rate rule. Off by default: these are usually cooperative bots.
 )
 
 # --- Worker registry ---------------------------------------------------------
@@ -226,6 +227,70 @@ TARPIT_CATEGORIES = (
 WORKER_HEARTBEAT_INTERVAL = 10  # In seconds, how often a worker refreshes its registry entry.
 WORKER_STALE_AFTER = 45  # In seconds without a heartbeat before a worker is considered gone.
 MAX_TRACKED_WORKERS = 64  # Hard ceiling on registry entries.
+
+# --- Escalating throttle (repeat offenders) ----------------------------------
+# A caller who trips the per-IP limit once is probably just fast. A caller who
+# trips it again and again is not, and giving them the identical short timeout
+# every time teaches them nothing: they simply wait it out and carry on.
+#
+# So each throttle is a STRIKE, and the ladder below says what each successive
+# strike costs. The multiplier scales the normal throttle duration, and the
+# message is what that caller is told — which is the part that actually changes
+# behavior, because a scraper's author reads it. Past the last rung, the last
+# rung repeats.
+#
+# Editable live from the dashboard; these are only what a fresh install ships.
+DEFAULT_THROTTLE_TIERS = (
+    {
+        "Multiplier": 1.0,
+        "Message": "Too many requests — please slow down.",
+        "Note": "First strike: probably just fast.",
+    },
+    {
+        "Multiplier": 2.0,
+        "Message": "You are about to be severely throttled. Please respect the proxy's limits.",
+        "Note": "Second strike: a warning they can still act on.",
+    },
+    {
+        "Multiplier": 4.0,
+        "Message": (
+            "You have been harshly throttled due to bot behavior. The proxy is happy for you to "
+            "scrape data, but please respect its limits. If you need more request bandwidth, "
+            "contact CeaselessQuokka."
+        ),
+        "Note": "Third strike: says what to do about it.",
+    },
+    {
+        "Multiplier": 8.0,
+        "Message": (
+            "You are still ignoring the proxy's limits, so the wait has been extended again. "
+            "Contact CeaselessQuokka if you need more request bandwidth."
+        ),
+        "Note": "Fourth strike and beyond: the last rung repeats.",
+    },
+)
+MAX_THROTTLE_TIERS = 12  # Rungs the ladder may have. More than this is a configuration no one can reason about.
+MAX_THROTTLE_MULTIPLIER = 1000  # Ceiling on one rung, so a typo cannot mean a caller is blocked for a week.
+# How long of good behavior it takes to drop ONE rung. Strikes have to fade or
+# a caller who misbehaved once in March is still on the top rung in June.
+THROTTLE_STRIKE_DECAY = 1800  # In seconds.
+MAX_TRACKED_STRIKE_TIERS = 32  # Distinct rungs tracked in the dashboard's per-tier stats.
+
+# --- Per-User-Agent throttle rules -------------------------------------------
+# A rate limit aimed at one CLIENT rather than at one IP or one endpoint. The
+# case it exists for: a scraper that is not malicious and does not deserve a
+# block, but is not respecting the limits either. A rule can either allow it a
+# burst (N requests per P seconds) or force a minimum gap between its requests,
+# and answers it with a message written for that specific bot.
+MAX_USER_AGENT_RULES = 100
+USER_AGENT_RULE_MODES = ("contains", "exact", "regex")  # How the needle is matched.
+USER_AGENT_RULE_KINDS = ("burst", "cooldown")  # N per period, or a minimum gap between requests.
+USER_AGENT_RULE_SCOPES = ("ip", "global")  # Budget per calling IP, or one budget shared by every IP using that UA.
+DEFAULT_USER_AGENT_RULE_LIMIT = 10
+DEFAULT_USER_AGENT_RULE_PERIOD = 60
+DEFAULT_USER_AGENT_RULE_COOLDOWN = 2.0  # Seconds between requests, for a "cooldown" rule.
+MAX_USER_AGENT_RULE_COOLDOWN = 3600.0
+MAX_USER_AGENT_NEEDLE = 200  # Characters of the match text kept.
 
 # --- Global throttle-all defaults ---
 # When the admin enables "throttle all", each IP is limited to this many requests

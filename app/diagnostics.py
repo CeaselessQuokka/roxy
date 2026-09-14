@@ -365,6 +365,21 @@ cache_endpoints = dict()
 # working, and that is the only question anyone asks of it.
 cache_minutes = dict()
 
+# --- Escalating throttle -----------------------------------------------------
+# How often each rung of the ladder has been reached. The shape of this is the
+# answer to "is escalation actually working?": a healthy proxy has a fat rung 1
+# and almost nothing above it, because the first warning worked. A fat top rung
+# means the messages are not landing and the ladder needs a harder rung — or
+# that caller needs blocking rather than slowing.
+#   "3" -> {Count, Strikes, Multiplier, FirstSeen, LastSeen, LastIP, IPs{}}
+throttle_tiers = dict()
+
+# Per-User-Agent rate rules: how often each one has actually fired.
+#   rule_id -> {Count, Allowed, FirstSeen, LastSeen, LastIP, Needle, Kind, IPs{}}
+# "Allowed" matters as much as "Count": a rule that refuses nothing is either
+# generous enough to be pointless or is matching a bot that already behaves.
+user_agent_rule_hits = dict()
+
 # Requests refused because the internal token hit its safety budget.
 token_budget = dict({"Rejections": 0})
 
@@ -517,6 +532,8 @@ def _caps() -> dict:
             minutes=(("Minutes", config.ACTIVITY_HISTORY_MINUTES),),
         ),
         "cache_endpoints": dict(cap=endpoint_cap, by="count", time="LastSeen"),
+        "throttle_tiers": dict(cap=config.MAX_TRACKED_STRIKE_TIERS, by="count", time="LastSeen", children=(ips,)),
+        "user_agent_rule_hits": dict(cap=config.MAX_USER_AGENT_RULES, by="count", time="LastSeen", children=(ips,)),
         "crawls": dict(cap=_cap("max_crawl_records", config.MAX_CRAWL_RECORDS), by="recent", time="LastRequestTime"),
         "throttled_ips": dict(
             cap=_cap("max_throttle_records", config.MAX_THROTTLE_RECORDS), by="recent", time="LastThrottleTime"
@@ -1248,6 +1265,64 @@ def cache_rate(minutes: int) -> dict:
                 misses += int(bucket.get("Misses", 0) or 0)
     total = hits + misses
     return {"Minutes": minutes, "Hits": hits, "Misses": misses, "Rate": (hits / total) if total else 0.0}
+
+
+def log_throttle_tier(tier: int, ip: str, strikes: int, multiplier: float):
+    """Record that a caller reached rung `tier` of the escalation ladder."""
+    if tier <= 0:
+        return
+    now = time.time()
+    key = str(int(tier))
+    ip = (ip or "unknown")[:64]
+    with _state_lock:
+        record = throttle_tiers.setdefault(
+            key,
+            {"Count": 0, "Strikes": 0, "Multiplier": 0.0, "FirstSeen": now, "LastSeen": 0, "LastIP": "", "IPs": {}},
+        )
+        record["Count"] += 1
+        # The highest strike count seen at this rung, which is how you tell a
+        # rung that repeats (everyone past the top of the ladder lands here)
+        # from one that callers pass through once.
+        record["Strikes"] = max(int(record.get("Strikes", 0) or 0), int(strikes))
+        record["Multiplier"] = float(multiplier)
+        record["LastSeen"] = now
+        record["LastIP"] = ip
+        record["IPs"][ip] = int(record["IPs"].get(ip, 0)) + 1
+        _trim_store(record["IPs"], config.MAX_IPS_PER_ATTEMPT_RECORD, "value")
+        _trim_store(throttle_tiers, config.MAX_TRACKED_STRIKE_TIERS, "count", "LastSeen")
+
+
+def log_user_agent_rule(rule: dict, ip: str, allowed: bool):
+    """Record one decision made by a per-User-Agent rate rule."""
+    rule_id = str((rule or {}).get("Id", ""))[:64]
+    if not rule_id:
+        return
+    now = time.time()
+    ip = (ip or "unknown")[:64]
+    with _state_lock:
+        record = user_agent_rule_hits.setdefault(
+            rule_id,
+            {
+                "Count": 0,
+                "Allowed": 0,
+                "Refused": 0,
+                "FirstSeen": now,
+                "LastSeen": 0,
+                "LastIP": "",
+                "Needle": "",
+                "Kind": "",
+                "IPs": {},
+            },
+        )
+        record["Count"] += 1
+        record["Allowed" if allowed else "Refused"] += 1
+        record["LastSeen"] = now
+        record["LastIP"] = ip
+        record["Needle"] = str(rule.get("Needle", ""))[:200]
+        record["Kind"] = str(rule.get("Kind", ""))[:16]
+        record["IPs"][ip] = int(record["IPs"].get(ip, 0)) + 1
+        _trim_store(record["IPs"], config.MAX_IPS_PER_ATTEMPT_RECORD, "value")
+        _trim_store(user_agent_rule_hits, config.MAX_USER_AGENT_RULES, "count", "LastSeen")
 
 
 def log_budget_rejection():
@@ -2164,6 +2239,8 @@ def get_diagnostics(force_flush: bool = False) -> dict:
                 "LiveRequests": list(reversed(live_requests)),  # Most-recent first.
                 "Tokens": _tokens_view(),
                 "TrafficMinutes": traffic_minutes,
+                "ThrottleTierHits": throttle_tiers,
+                "UserAgentRuleHits": user_agent_rule_hits,
                 "CacheStats": cache_stats,
                 "CacheEndpoints": cache_endpoints,
                 "CacheMinutes": cache_minutes,
@@ -2269,6 +2346,8 @@ _PERSISTED_NAMES = (
     "cache_stats",
     "cache_endpoints",
     "cache_minutes",
+    "throttle_tiers",
+    "user_agent_rule_hits",
     "pause_drops",
     "throttle_drops",
     "tarpit_stats",
@@ -2332,6 +2411,7 @@ CLEAR_TARGETS = {
     "throttle_drops": ("throttle_drops",),
     "tarpit": ("tarpit_stats", "tarpit_ips", "tarpit_reasons", "tarpit_minutes"),
     "cache": ("cache_stats", "cache_endpoints", "cache_minutes"),
+    "throttle_rules": ("throttle_tiers", "user_agent_rule_hits"),
     "live": ("live_requests",),
     "logins": ("login_attempts",),
     "crawls": ("crawls",),

@@ -497,10 +497,15 @@ IP_HDR = {"X-Forwarded-For": "10.7.7.1"}
 n = len(upstream_calls)
 r = api_client.get("/games.roblox.com/v1/games/1/votes", headers={**IP_HDR, "Xeno-Fingerprint": "9b6c6e24"})
 check("Header rule blocks request with Xeno-* header (key match) -> disguised 429", r.status_code == 429, r.status_code)
+# The property being protected is stronger than "the word throttled appears":
+# a filtered caller's body must be EXACTLY what a genuinely throttled caller
+# gets, so nothing about the response can reveal that they were fingerprinted.
 check(
-    "Header-blocked body looks like a throttle (no reason leaked)",
-    b"throttled" in r.data and b"eader" not in r.data,
-    r.data[:80],
+    "Header-blocked body is exactly what a real throttle says (no reason leaked)",
+    r.get_json() == runtime.throttle_tier_for(1)["Message"]
+    and b"eader" not in r.data
+    and b"xeno" not in r.data.lower(),
+    r.data[:120],
 )
 check("Header-blocked response disguised as throttled", r.headers.get("Roxy-Throttled") == "True", dict(r.headers))
 check("Header-blocked request never hit upstream", len(upstream_calls) == n, len(upstream_calls) - n)
@@ -2517,7 +2522,11 @@ client.post(
     json={"header": "Roblox-Id", "scope": "value", "mode": "exact", "needle": PLACE},
 )
 r = api_client.get("/games.roblox.com/v1/games", headers={"X-Forwarded-For": "10.59.0.1", "Roblox-Id": PLACE})
-check("A filtered caller still sees a plain throttle by default", "throttled" in r.get_data(as_text=True).lower(), r.get_data(as_text=True))
+check(
+    "A filtered caller still sees a plain throttle by default",
+    r.get_json() == runtime.throttle_tier_for(1)["Message"],
+    r.get_data(as_text=True),
+)
 for existing in list(runtime.get_header_rules()):
     client.post("/admin/headers/rule/clear", headers=IP_MAIN, json={"id": existing})
 
@@ -2809,6 +2818,288 @@ for existing in list(runtime.get_header_rules()):
 # =============================================================================
 # Response cache
 # =============================================================================
+# =============================================================================
+# Escalating throttle + per-User-Agent rules
+# =============================================================================
+print("\n== Escalating throttle: each strike costs more than the last ==")
+fresh_upstream()
+clear_all_diag()
+runtime.set_setting("cache_enabled", 0)  # A cache HIT would answer before the throttle could bite.
+runtime.set_setting("throttle_escalation_enabled", 1)
+runtime.set_setting("throttle_strike_decay_seconds", 3600)
+runtime.set_setting("allowed_requests_per_minute", 2)
+runtime.set_setting("throttle_reset_duration", 10)
+LADDER = [
+    {"Multiplier": 1, "Message": "Too many requests"},
+    {"Multiplier": 2, "Message": "You are about to get severely throttled"},
+    {"Multiplier": 4, "Message": "You have been harshly throttled due to bot behavior"},
+]
+r = client.post("/admin/throttle/tiers", headers=IP_MAIN, json={"tiers": LADDER})
+check("The escalation ladder can be replaced", r.status_code == 200, r.status_code)
+check("...and reads back with its rungs in order", [t["Multiplier"] for t in r.get_json()["Tiers"]] == [1, 2, 4], r.get_json())
+
+IP_ESC = {"X-Forwarded-For": "10.77.0.1"}
+_PRIOR_STALE = runtime.get_setting("stale_ip_duration")
+
+
+def earn_a_throttle(headers):
+    """Spend the allowance until the proxy refuses, and return that refusal."""
+    for _ in range(12):
+        resp = api_client.get("/games.roblox.com/v1/games/escalate", headers=headers)
+        if resp.status_code == 429:
+            return resp
+    return resp
+
+
+first = earn_a_throttle(IP_ESC)
+check("A first offense is refused", first.status_code == 429, first.status_code)
+check("...with the first rung's message", first.get_json() == "Too many requests", first.get_json())
+first_wait = int(first.headers.get("Roxy-Throttle-Reset", 0))
+check("...and a Retry-After a normal client can obey", first.headers.get("Retry-After") is not None, dict(first.headers))
+check("...for roughly the plain duration", 5 <= first_wait <= 10, first_wait)
+
+throttle_module.reset_throttle("10.77.0.1")  # Serve the timeout instantly so the test can carry on.
+second = earn_a_throttle(IP_ESC)
+check("A second offense escalates the message", second.get_json() == "You are about to get severely throttled", second.get_json())
+second_wait = int(second.headers.get("Roxy-Throttle-Reset", 0))
+check("...and roughly doubles the wait", second_wait > first_wait, (first_wait, second_wait))
+
+throttle_module.reset_throttle("10.77.0.1")
+third = earn_a_throttle(IP_ESC)
+check(
+    "A third offense reaches the harshest rung",
+    third.get_json() == "You have been harshly throttled due to bot behavior",
+    third.get_json(),
+)
+third_wait = int(third.headers.get("Roxy-Throttle-Reset", 0))
+check("...with a longer wait again", third_wait > second_wait, (second_wait, third_wait))
+
+throttle_module.reset_throttle("10.77.0.1")
+fourth = earn_a_throttle(IP_ESC)
+check("Past the end of the ladder the last rung repeats", fourth.get_json() == third.get_json(), fourth.get_json())
+
+state = throttle_module.get_throttle_state("10.77.0.1")
+check("The caller's strike count is tracked", state["Strikes"] == 4, state)
+check("...and pinned to the top rung", state["Tier"] == 3, state)
+
+board = client.get("/admin/throttle/strikes", headers=IP_MAIN).get_json()["Strikes"]
+mine = [row for row in board if row["IP"] == "10.77.0.1"]
+check("The strike board names the offender", len(mine) == 1, board)
+check("...with their rung and multiplier", mine[0]["Tier"] == 3 and mine[0]["Multiplier"] == 4, mine[0])
+tiers_seen = diag()["ThrottleTierHits"]
+check("Each rung reached is counted", set(tiers_seen) == {"1", "2", "3"}, list(tiers_seen))
+check("...and the repeating rung counts twice", tiers_seen["3"]["Count"] == 2, tiers_seen["3"])
+check("...naming who reached it", "10.77.0.1" in tiers_seen["3"]["IPs"], tiers_seen["3"])
+
+print("\n== Strikes can be forgiven, and fade on their own ==")
+r = client.post("/admin/throttle/strikes/clear", headers=IP_MAIN, json={"ip": "10.77.0.1"})
+check("An IP's strikes can be forgiven", r.get_json()["Forgiven"] == 1, r.get_json())
+check("...leaving them on a clean sheet", throttle_module.get_throttle_state("10.77.0.1")["Strikes"] == 0)
+throttle_module.reset_throttle("10.77.0.1")
+after_forgiveness = earn_a_throttle(IP_ESC)
+check("...so their next offense is a first offense again", after_forgiveness.get_json() == "Too many requests", after_forgiveness.get_json())
+
+# Decay is applied on READ, so a strike aged past the decay window is already gone.
+_entry = {"Strikes": 3, "LastStrikeAt": time.time() - 7200}
+check("A strike fades after good behavior", throttle_module.effective_strikes(_entry, time.time(), 3600) == 1, _entry)
+check("...and never goes below zero", throttle_module.effective_strikes(_entry, time.time(), 60) == 0, _entry)
+check("...but stands while the decay window is off", throttle_module.effective_strikes(_entry, time.time(), 0) == 3, _entry)
+
+print("\n== A strike outlives the request counters that earned it ==")
+# The per-IP entry is swept once the caller goes quiet for stale_ip_duration,
+# purely to keep the shared file small. If that took the strikes with it, a bot
+# that waited out its timeout and paused for a minute would come back with a
+# clean sheet and the ladder could never climb past its first rung.
+throttle_module.clear_strikes()
+runtime.set_setting("stale_ip_duration", 1)
+IP_PATIENT = {"X-Forwarded-For": "10.77.0.9"}
+earn_a_throttle(IP_PATIENT)
+check("The patient caller has a strike", throttle_module.get_throttle_state("10.77.0.9")["Strikes"] == 1)
+time.sleep(2.5)  # Comfortably past stale_ip_duration: their counters are now sweepable.
+throttle_module._prune_once()
+check(
+    "...which survives the stale sweep",
+    throttle_module.get_throttle_state("10.77.0.9")["Strikes"] == 1,
+    throttle_module.get_throttle_state("10.77.0.9"),
+)
+throttle_module.reset_throttle("10.77.0.9")
+patient = earn_a_throttle(IP_PATIENT)
+check("...so pausing does not reset them to a first offense", patient.get_json() != "Too many requests", patient.get_json())
+# An IP with no strikes left is still swept, so this cannot grow without bound.
+# Forgiving rather than waiting out the decay keeps the assertion about the
+# sweep itself instead of about how long a sleep the machine managed.
+throttle_module.clear_strikes("10.77.0.9")
+time.sleep(2.5)
+throttle_module._prune_once()
+check(
+    "An idle caller with no strikes left is swept as before",
+    throttle_module._ip_entry("10.77.0.9") is None,
+    throttle_module._ip_entry("10.77.0.9"),
+)
+runtime.set_setting("stale_ip_duration", _PRIOR_STALE)
+
+print("\n== Escalation can be switched off entirely ==")
+throttle_module.clear_strikes()
+runtime.set_setting("throttle_escalation_enabled", 0)
+IP_FLAT = {"X-Forwarded-For": "10.77.0.2"}
+flat_first = earn_a_throttle(IP_FLAT)
+flat_wait = int(flat_first.headers.get("Roxy-Throttle-Reset", 0))
+throttle_module.reset_throttle("10.77.0.2")
+flat_second = earn_a_throttle(IP_FLAT)
+check("With escalation off, a repeat offense is not punished harder", int(flat_second.headers.get("Roxy-Throttle-Reset", 0)) <= flat_wait + 1, (flat_wait, flat_second.headers.get("Roxy-Throttle-Reset")))
+check("...and the plain message is used", "throttled" in flat_second.get_data(as_text=True).lower(), flat_second.get_data(as_text=True))
+runtime.set_setting("throttle_escalation_enabled", 1)
+
+print("\n== An empty ladder means every throttle is the plain one ==")
+client.post("/admin/throttle/tiers", headers=IP_MAIN, json={"tiers": []})
+throttle_module.clear_strikes()
+IP_NOLADDER = {"X-Forwarded-For": "10.77.0.3"}
+plain = earn_a_throttle(IP_NOLADDER)
+check("No rungs configured still refuses correctly", plain.status_code == 429, plain.status_code)
+check("...with the built-in message", "throttled" in plain.get_data(as_text=True).lower(), plain.get_data(as_text=True))
+r = client.post("/admin/throttle/tiers", headers=IP_MAIN, json={"tiers": [{"Multiplier": -1, "Message": "x"}]})
+check("A nonsense multiplier is rejected, not stored", r.status_code == 400, r.status_code)
+check("...saying which rung is wrong", "Rung 1" in r.get_json()["Message"], r.get_json())
+client.post("/admin/throttle/tiers", headers=IP_MAIN, json={"tiers": LADDER})
+
+print("\n== Per-User-Agent rules: a burst allowance ==")
+fresh_upstream()
+clear_all_diag()
+throttle_module.clear_strikes()
+runtime.set_setting("allowed_requests_per_minute", 100000)
+runtime.set_setting("user_agent_rules_enabled", 1)
+r = client.post(
+    "/admin/throttle/user_agent",
+    headers=IP_MAIN,
+    json={
+        "needle": "GreedyScraper",
+        "mode": "contains",
+        "kind": "burst",
+        "limit": 2,
+        "period": 60,
+        "message": "Please slow down, GreedyScraper.",
+        "note": "friendly but fast",
+    },
+)
+check("A User-Agent rule can be added", r.status_code == 200, r.status_code)
+BURST_ID = r.get_json()["Id"]
+check("...and comes back with an id to edit it by", bool(BURST_ID), r.get_json())
+
+BOT = {"X-Forwarded-For": "10.78.0.1", "User-Agent": "GreedyScraper/1.0"}
+codes = [api_client.get("/games.roblox.com/v1/games/ua", headers=BOT).status_code for _ in range(4)]
+check("The rule allows its burst then refuses", codes == [200, 200, 429, 429], codes)
+refused = api_client.get("/games.roblox.com/v1/games/ua", headers=BOT)
+check("...with the rule's own message", refused.get_json() == "Please slow down, GreedyScraper.", refused.get_json())
+check("...and a Retry-After", int(refused.headers.get("Retry-After", 0)) > 0, dict(refused.headers))
+check("...flagged as a client limit, not a plain throttle", refused.headers.get("Roxy-Client-Limited") == "True", dict(refused.headers))
+
+other = api_client.get("/games.roblox.com/v1/games/ua", headers={"X-Forwarded-For": "10.78.0.2", "User-Agent": "Roblox/Linux"})
+check("A different client is untouched by the rule", other.status_code == 200, other.status_code)
+
+hits = diag()["UserAgentRuleHits"]
+check("Rule activity is recorded", BURST_ID in hits, list(hits))
+check("...splitting allowed from refused", hits[BURST_ID]["Allowed"] == 2 and hits[BURST_ID]["Refused"] >= 2, hits[BURST_ID])
+
+print("\n== Per-User-Agent rules: a per-request cooldown ==")
+client.post("/admin/throttle/user_agent/remove", headers=IP_MAIN, json={"id": BURST_ID})
+r = client.post(
+    "/admin/throttle/user_agent",
+    headers=IP_MAIN,
+    json={"needle": "SlowBot", "kind": "cooldown", "cooldown": 1, "message": "One request per second, please."},
+)
+COOLDOWN_ID = r.get_json()["Id"]
+SLOW = {"X-Forwarded-For": "10.78.0.3", "User-Agent": "SlowBot/2.0"}
+check("The first request through a cooldown rule is allowed", api_client.get("/games.roblox.com/v1/games/cd", headers=SLOW).status_code == 200)
+blocked = api_client.get("/games.roblox.com/v1/games/cd", headers=SLOW)
+check("...an immediate second one is not", blocked.status_code == 429, blocked.status_code)
+check("...with the rule's message", blocked.get_json() == "One request per second, please.", blocked.get_json())
+# A bot that ignores the cooldown and hammers must not extend its own wait
+# forever; the timer is set by the last SERVED request, never by a refusal.
+for _ in range(3):
+    api_client.get("/games.roblox.com/v1/games/cd", headers=SLOW)
+time.sleep(1.8)  # Well past the 1s cooldown; a tighter margin is a coin flip here.
+check("Waiting out the cooldown lets it through again", api_client.get("/games.roblox.com/v1/games/cd", headers=SLOW).status_code == 200)
+
+print("\n== User-Agent rules: scope, editing and the off switch ==")
+r = client.post(
+    "/admin/throttle/user_agent",
+    headers=IP_MAIN,
+    json={"id": COOLDOWN_ID, "needle": "SlowBot", "kind": "burst", "limit": 1, "period": 60, "message": "edited"},
+)
+check("A rule can be edited in place", r.status_code == 200 and r.get_json()["Id"] == COOLDOWN_ID, r.get_json())
+rules = r.get_json()["UserAgentRules"]
+check("...keeping its id and taking the new settings", rules[COOLDOWN_ID]["Kind"] == "burst" and rules[COOLDOWN_ID]["Limit"] == 1, rules[COOLDOWN_ID])
+check("...without creating a second rule", len(rules) == 1, rules)
+
+# A "global" rule pools every IP behind one budget — the only thing that works
+# on a bot that rotates addresses.
+client.post(
+    "/admin/throttle/user_agent",
+    headers=IP_MAIN,
+    json={"id": COOLDOWN_ID, "needle": "RotatingBot", "kind": "burst", "limit": 1, "period": 60, "scope": "global"},
+)
+first_ip = api_client.get("/games.roblox.com/v1/games/g", headers={"X-Forwarded-For": "10.78.1.1", "User-Agent": "RotatingBot"})
+second_ip = api_client.get("/games.roblox.com/v1/games/g", headers={"X-Forwarded-For": "10.78.1.2", "User-Agent": "RotatingBot"})
+check("A global rule is not fooled by a new IP", (first_ip.status_code, second_ip.status_code) == (200, 429), (first_ip.status_code, second_ip.status_code))
+
+client.post(
+    "/admin/throttle/user_agent",
+    headers=IP_MAIN,
+    json={"id": COOLDOWN_ID, "needle": "RotatingBot", "kind": "burst", "limit": 1, "period": 60, "scope": "global", "enabled": False},
+)
+check("A disabled rule stops applying", api_client.get("/games.roblox.com/v1/games/g", headers={"X-Forwarded-For": "10.78.1.3", "User-Agent": "RotatingBot"}).status_code == 200)
+
+print("\n== Testing a User-Agent rule before it goes live ==")
+client.post(
+    "/admin/throttle/user_agent",
+    headers=IP_MAIN,
+    json={"id": COOLDOWN_ID, "needle": "RotatingBot", "kind": "burst", "limit": 1, "period": 60, "enabled": True},
+)
+r = client.post(
+    "/admin/throttle/user_agent/test",
+    headers=IP_MAIN,
+    json={"user_agent": "RotatingBot/3.1", "draft": {"needle": "python-requests", "kind": "cooldown", "cooldown": 5}},
+)
+report = r.get_json()
+check("The tester says which saved rule would catch a client", report["Limited"] is True, report)
+check("...and names it", report["LimitedBy"]["Needle"] == "RotatingBot", report["LimitedBy"])
+check("An unsaved draft is judged too", report["Draft"]["Valid"] is True and report["Draft"]["Matched"] is False, report["Draft"])
+bad = client.post(
+    "/admin/throttle/user_agent/test",
+    headers=IP_MAIN,
+    json={"user_agent": "x", "draft": {"needle": "(", "mode": "regex"}},
+)
+check("...and an invalid draft is explained, not saved", bad.get_json()["Draft"]["Valid"] is False, bad.get_json()["Draft"])
+
+r = client.post("/admin/throttle/user_agent", headers=IP_MAIN, json={"needle": "", "kind": "burst"})
+check("A rule with no match text is rejected", r.status_code == 400, r.status_code)
+r = client.post("/admin/throttle/user_agent", headers=IP_MAIN, json={"needle": "x", "kind": "cooldown", "cooldown": 0})
+check("A zero cooldown is rejected", r.status_code == 400, r.status_code)
+
+runtime.set_setting("user_agent_rules_enabled", 0)
+check(
+    "The master switch stops every rule at once",
+    api_client.get("/games.roblox.com/v1/games/g", headers={"X-Forwarded-For": "10.78.1.4", "User-Agent": "RotatingBot"}).status_code == 200,
+)
+runtime.set_setting("user_agent_rules_enabled", 1)
+client.post("/admin/throttle/user_agent/remove", headers=IP_MAIN, json={"id": COOLDOWN_ID})
+check("Rules can be removed", client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"}).get_json()["UserAgentRules"] == {}, "rules remain")
+
+r = client.post("/admin/data/clear", headers={**IP_MAIN, "Accept": "application/json"}, json={"target": "throttle_rules"})
+check("Throttle rule stats clear on their own", r.status_code == 200, r.status_code)
+check("...zeroing both stores", not diag()["ThrottleTierHits"] and not diag()["UserAgentRuleHits"], diag()["ThrottleTierHits"])
+
+print("\n== The dashboard is told about both ==")
+d = client.get("/admin/diagnostics?flush=1", headers={**IP_MAIN, "Accept": "application/json"}).get_json()
+check("The escalation ladder reaches the dashboard", len(d["ThrottleTiers"]) == 3, d.get("ThrottleTiers"))
+check("The User-Agent rules reach it", isinstance(d.get("UserAgentRules"), dict), type(d.get("UserAgentRules")))
+check("So does the strike board", isinstance(d.get("StrikeBoard"), list), type(d.get("StrikeBoard")))
+
+throttle_module.clear_strikes()
+runtime.set_setting("allowed_requests_per_minute", 100000)
+runtime.set_setting("throttle_reset_duration", 50)
+runtime.set_setting("cache_enabled", 1)
+
 print("\n== Response cache: a repeat request never reaches Roblox ==")
 fresh_upstream()
 clear_all_diag()

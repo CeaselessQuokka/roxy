@@ -105,6 +105,24 @@ _endpoint_rules = dict()  # pattern -> {"Limit": int, "Period": int, "Added": ts
 # pattern -> {"TTL": int, "Type": glob|regex, "Note": str, "Added": ts}
 _cache_rules = dict()
 
+# --- Escalating throttle ladder ---------------------------------------------
+# What each successive throttle costs the same caller. Rung N applies to their
+# Nth strike; past the end, the last rung repeats. Each rung carries the
+# MESSAGE that caller is told, which is the part that actually changes behavior
+# — a scraper's author reads the error body, not the status code.
+# [{"Multiplier": float, "Message": str, "Note": str}, ...]
+# Seeded at import so a fresh install escalates sensibly before anything is
+# saved; a stored ladder replaces it wholesale, including an empty one (which
+# means "every throttle is the plain default", and is a legitimate choice).
+_throttle_tiers = [dict(tier) for tier in config.DEFAULT_THROTTLE_TIERS]
+
+# --- Per-User-Agent throttle rules ------------------------------------------
+# A limit aimed at one CLIENT rather than one IP or one endpoint, for the bot
+# that is not malicious enough to block but is not respecting the limits
+# either. id -> {Needle, Mode, Scope, Kind, Limit, Period, Cooldown, Message,
+#                Note, Enabled, Added}
+_user_agent_rules = dict()
+
 # --- Header block rules -----------------------------------------------------
 # Deny a request outright based on its headers (e.g. exploit fingerprints like
 # "Xeno"). id -> {"Scope": key|value|either, "Mode": contains|exact,
@@ -168,6 +186,17 @@ _settings = {
     "capture_max_bytes": _setting(config.CAPTURE_MAX_BYTES, 0, 64 * 1024 * 1024, "int"),
     "capture_max_body": _setting(config.CAPTURE_MAX_BODY, 0, 512 * 1024, "int"),
     "capture_ttl_seconds": _setting(config.CAPTURE_TTL_SECONDS, 0, 86400, "int"),
+    # --- Escalating throttle ------------------------------------------------
+    # Whether a repeat offender's throttle gets longer each time. Off means
+    # every throttle is the plain duration above, however often they earn one.
+    "throttle_escalation_enabled": _setting(1, 0, 1, "int"),
+    # How long of good behavior it takes to drop ONE rung of the ladder.
+    # Without decay, a caller who misbehaved once is on the top rung forever.
+    "throttle_strike_decay_seconds": _setting(config.THROTTLE_STRIKE_DECAY, 0, 604800, "int"),
+    # --- Per-User-Agent rules -----------------------------------------------
+    # Master switch for the User-Agent rate rules. Each rule also has its own
+    # enable toggle, so this is the "stop all of them at once" control.
+    "user_agent_rules_enabled": _setting(1, 0, 1, "int"),
     # --- Response cache -----------------------------------------------------
     # Serve a repeat request from what we already fetched instead of asking
     # Roblox again. The single most effective control against a caller polling
@@ -385,6 +414,15 @@ def _restore_from(data: dict):
     cache_rules = data.get("CacheRules", {})
     if isinstance(cache_rules, dict):
         replace_in_place(_cache_rules, {str(k): dict(v) for k, v in cache_rules.items() if isinstance(v, dict)})
+    ua_rules = data.get("UserAgentRules", {})
+    if isinstance(ua_rules, dict):
+        replace_in_place(_user_agent_rules, {str(k): dict(v) for k, v in ua_rules.items() if isinstance(v, dict)})
+    tiers = data.get("ThrottleTiers")
+    if isinstance(tiers, list):
+        # Absent means "never configured", so the seeded ladder stands; present
+        # but empty means the admin deliberately flattened it.
+        _throttle_tiers.clear()
+        _throttle_tiers.extend(dict(t) for t in tiers if isinstance(t, dict))
     header_rules = data.get("HeaderRules", {})
     if isinstance(header_rules, dict):
         replace_in_place(_header_rules, {str(k): dict(v) for k, v in header_rules.items() if isinstance(v, dict)})
@@ -845,6 +883,237 @@ def path_matches(pattern: str, path: str, kind: str = "glob") -> bool:
     return _matches(pattern, _norm(path) if kind != "regex" else _norm_regex(path), kind)
 
 
+# --- Escalating throttle ladder ---------------------------------------------
+def get_throttle_tiers() -> list:
+    _maybe_reload()
+    return [dict(tier) for tier in _throttle_tiers]
+
+
+def escalation_enabled() -> bool:
+    return bool(get_setting("throttle_escalation_enabled", 1))
+
+
+def _clean_tier(raw, index: int) -> dict:
+    """One validated rung. Raises ValueError with a message meant for the admin."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"Rung {index + 1} is not an object")
+    try:
+        multiplier = float(raw.get("Multiplier", 1))
+    except (TypeError, ValueError):
+        raise ValueError(f"Rung {index + 1}: the multiplier must be a number")
+    if multiplier <= 0 or multiplier > config.MAX_THROTTLE_MULTIPLIER:
+        raise ValueError(f"Rung {index + 1}: the multiplier must be between 0 and {config.MAX_THROTTLE_MULTIPLIER}")
+    return {
+        "Multiplier": multiplier,
+        "Message": _clean_message(raw.get("Message", "")),
+        "Note": str(raw.get("Note", ""))[:200],
+    }
+
+
+def set_throttle_tiers(tiers) -> tuple[bool, str]:
+    """Replace the whole ladder.
+
+    Whole-list rather than one rung at a time, because the rungs are ORDERED and
+    the order is the meaning: editing rung 2 and reordering the ladder are the
+    same operation to the admin, and splitting them into separate endpoints
+    would make the common case (drag this one up) the awkward one.
+    """
+    if not isinstance(tiers, list):
+        return False, "Expected a list of rungs"
+    if len(tiers) > config.MAX_THROTTLE_TIERS:
+        return False, f"At most {config.MAX_THROTTLE_TIERS} rungs"
+    try:
+        cleaned = [_clean_tier(raw, index) for index, raw in enumerate(tiers)]
+    except ValueError as error:
+        return False, str(error)
+
+    def change():
+        _throttle_tiers.clear()
+        _throttle_tiers.extend(cleaned)
+
+    _persist_change(change)
+    return True, "Success"
+
+
+def throttle_tier_for(strikes: int) -> dict:
+    """The rung that applies to a caller's `strikes`-th throttle (1-based).
+
+    Past the end of the ladder the LAST rung repeats, rather than wrapping back
+    to the start or escalating forever: a caller who has ignored the final
+    warning should keep getting the final warning, and an unbounded multiplier
+    is a ban with extra steps.
+    """
+    tiers = get_throttle_tiers()
+    if not tiers or strikes < 1:
+        return {"Multiplier": 1.0, "Message": "", "Note": "", "Index": 0}
+    index = min(int(strikes), len(tiers)) - 1
+    return dict(tiers[index], Index=index + 1)
+
+
+# --- Per-User-Agent throttle rules ------------------------------------------
+def get_user_agent_rules() -> dict:
+    _maybe_reload()
+    return {k: dict(v) for k, v in _user_agent_rules.items()}
+
+
+def user_agent_rules_enabled() -> bool:
+    return bool(get_setting("user_agent_rules_enabled", 1))
+
+
+def normalize_user_agent_rule(data: dict) -> tuple[dict | None, str]:
+    """Validate + canonicalize one rule. Returns (rule, error_message).
+
+    Shared by the save path and the dry-run tester, so a rule the tester says
+    would match is byte-for-byte the rule that gets saved.
+    """
+    needle = str(data.get("needle", "") or "").strip()[: config.MAX_USER_AGENT_NEEDLE]
+    if not needle:
+        return None, "Enter the User-Agent text to match"
+    mode = str(data.get("mode", "contains") or "contains").strip().lower()
+    if mode not in config.USER_AGENT_RULE_MODES:
+        return None, f"Match mode must be one of: {', '.join(config.USER_AGENT_RULE_MODES)}"
+    if mode == "regex" and not valid_regex(needle):
+        return None, "Invalid regular expression"
+    kind = str(data.get("kind", "burst") or "burst").strip().lower()
+    if kind not in config.USER_AGENT_RULE_KINDS:
+        return None, f"Limit type must be one of: {', '.join(config.USER_AGENT_RULE_KINDS)}"
+    scope = str(data.get("scope", "ip") or "ip").strip().lower()
+    if scope not in config.USER_AGENT_RULE_SCOPES:
+        return None, f"Scope must be one of: {', '.join(config.USER_AGENT_RULE_SCOPES)}"
+    try:
+        limit = int(data.get("limit", config.DEFAULT_USER_AGENT_RULE_LIMIT))
+        period = int(data.get("period", config.DEFAULT_USER_AGENT_RULE_PERIOD))
+        cooldown = float(data.get("cooldown", config.DEFAULT_USER_AGENT_RULE_COOLDOWN))
+    except (TypeError, ValueError):
+        return None, "Limit, period and cooldown must be numbers"
+    if kind == "burst":
+        if limit < 1 or limit > 100000:
+            return None, "Burst allowance must be between 1 and 100000"
+        if period < 1 or period > 86400:
+            return None, "Burst window must be between 1 and 86400 seconds"
+    else:
+        if cooldown <= 0 or cooldown > config.MAX_USER_AGENT_RULE_COOLDOWN:
+            return None, f"Cooldown must be between 0 and {config.MAX_USER_AGENT_RULE_COOLDOWN} seconds"
+    return (
+        {
+            "Needle": needle,
+            "Mode": mode,
+            "Scope": scope,
+            "Kind": kind,
+            "Limit": limit,
+            "Period": period,
+            "Cooldown": round(cooldown, 3),
+            "Message": _clean_message(data.get("message", "")),
+            "Note": str(data.get("note", "") or "")[:200],
+            "Enabled": bool(data.get("enabled", True)),
+        },
+        "",
+    )
+
+
+def set_user_agent_rule(data: dict) -> tuple[bool, str, str]:
+    """Create a rule, or replace one by id. Returns (ok, message, rule_id).
+
+    The id is random rather than derived from the rule's contents, which is what
+    makes a rule EDITABLE: changing the match text of a content-keyed rule would
+    silently create a second rule and leave the first one running.
+    """
+    rule, error = normalize_user_agent_rule(data or {})
+    if rule is None:
+        return False, error, ""
+    rule_id = str((data or {}).get("id", "") or "").strip()[:32]
+    existing = _user_agent_rules.get(rule_id) if rule_id else None
+    if not rule_id or existing is None:
+        if len(_user_agent_rules) >= config.MAX_USER_AGENT_RULES:
+            return False, "Too many User-Agent rules", ""
+        rule_id = secrets.token_hex(4)
+    rule["Added"] = float(existing.get("Added", 0)) if existing else time.time()
+    rule["Updated"] = time.time()
+
+    def change():
+        _user_agent_rules[rule_id] = rule
+
+    _persist_change(change)
+    return True, "Success", rule_id
+
+
+def remove_user_agent_rule(rule_id: str) -> tuple[bool, str]:
+    def change():
+        _user_agent_rules.pop(str(rule_id or ""), None)
+
+    _persist_change(change)
+    return True, "Success"
+
+
+def _user_agent_matches(rule: dict, user_agent: str) -> bool:
+    needle = str(rule.get("Needle", ""))
+    if not needle:
+        return False
+    mode = rule.get("Mode", "contains")
+    if mode == "regex":
+        try:
+            return _compile_header_regex(needle).search(user_agent or "") is not None
+        except re.error:
+            return False
+    target = (user_agent or "").lower()
+    if mode == "exact":
+        return target == needle.lower()
+    return needle.lower() in target
+
+
+def match_user_agent_rule(user_agent: str):
+    """The first enabled rule this User-Agent trips, with its "Id", or None.
+
+    First match rather than most specific: unlike an endpoint path there is no
+    meaningful specificity ordering between two substrings of a User-Agent, so
+    the rule that fires is simply the one listed first — which the admin can
+    see, and reorder by removing and re-adding.
+    """
+    _maybe_reload()
+    if not _user_agent_rules or not user_agent_rules_enabled():
+        return None
+    for rule_id, rule in _user_agent_rules.items():
+        if not rule.get("Enabled", True):
+            continue
+        if _user_agent_matches(rule, user_agent):
+            return dict(rule, Id=rule_id)
+    return None
+
+
+def explain_user_agent_rules(user_agent: str, draft: dict = None) -> dict:
+    """Dry-run every saved rule (and an optional unsaved draft) against one
+    User-Agent, so "will this rule catch the bot I am looking at?" is answerable
+    before it is saved rather than after it has caught the wrong client."""
+    _maybe_reload()
+    results = []
+    first_hit = None
+    for rule_id, rule in _user_agent_rules.items():
+        matched = _user_agent_matches(rule, user_agent)
+        enabled = bool(rule.get("Enabled", True))
+        entry = dict(rule, Id=rule_id, Matched=matched, Enabled=enabled, IsFirstMatch=False)
+        if matched and enabled and first_hit is None:
+            first_hit = entry
+            entry["IsFirstMatch"] = True
+        results.append(entry)
+    draft_result = None
+    if draft:
+        rule, error = normalize_user_agent_rule(draft)
+        if rule is None:
+            draft_result = {"Valid": False, "Error": error}
+        else:
+            draft_result = {
+                "Valid": True,
+                "Error": "",
+                **rule,
+                "Matched": _user_agent_matches(rule, user_agent),
+                # A rule listed earlier already answers this caller, so adding
+                # the draft would change nothing for it.
+                "AlreadyMatched": first_hit is not None,
+            }
+    return {"UserAgent": user_agent, "Limited": first_hit is not None, "LimitedBy": first_hit,
+            "Rules": results, "Draft": draft_result}
+
+
 # --- Headers whose values are not enumerated --------------------------------
 def get_ignored_value_headers() -> dict:
     _maybe_reload()
@@ -1257,6 +1526,8 @@ def _serialize_unlocked() -> dict:
         "EndpointBlocks": {k: dict(v) for k, v in _endpoint_blocks.items()},
         "EndpointRules": {k: dict(v) for k, v in _endpoint_rules.items()},
         "CacheRules": {k: dict(v) for k, v in _cache_rules.items()},
+        "UserAgentRules": {k: dict(v) for k, v in _user_agent_rules.items()},
+        "ThrottleTiers": [dict(t) for t in _throttle_tiers],
         "HeaderRules": {k: dict(v) for k, v in _header_rules.items()},
         "IgnoredValueHeaders": {k: dict(v) for k, v in _ignored_value_headers.items()},
         "InvalidationTokens": dict(_invalidation_tokens),

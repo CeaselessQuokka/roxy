@@ -2107,3 +2107,9 @@ body {
 		margin-top: var(--pad-2);
 	}
 }
+
+/* A rule that is saved but switched off. Dimmed rather than hidden: "why is
+   this not firing?" is answered by seeing it there, greyed. */
+.is-disabled td {
+	opacity: 0.55;
+}

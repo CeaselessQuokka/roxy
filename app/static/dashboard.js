@@ -613,6 +613,7 @@ const print = console.log;
 		"#tarpitReasonsTable",
 		"#rotateIpsTable",
 		"#cacheEndpointsTable",
+		"#strikeBoardTable",
 	];
 
 	function initAllPagers() {
@@ -2289,6 +2290,7 @@ const print = console.log;
 		endpoint_rule: "Endpoint rate rule",
 		header_rule: "Request filter",
 		auth_attempt: "Auth attempt rejected",
+		user_agent_rule: "Client rate rule",
 		probe: "Probe rejected",
 		paused: "Paused",
 		ignored_path: "Ignored path",
@@ -3008,6 +3010,15 @@ const print = console.log;
 		max_user_agent_records: "User-agents kept",
 		max_error_records: "Error signatures kept",
 		auto_ignore_high_cardinality: "Auto-ignore unique-per-request headers (1 = on)",
+		activity_tracking: "Track who is calling (1/0)",
+		endpoint_recent_requests: "Recent requests kept per endpoint",
+		max_ip_activity_records: "IPs tracked in Top Talkers",
+		max_caller_records: "Places tracked in Callers",
+		capture_enabled: "Keep request/response bodies (1/0)",
+		capture_max_records: "Captured bodies kept",
+		capture_max_bytes: "Captured bodies: total size (bytes)",
+		capture_max_body: "Captured bodies: size of each (bytes)",
+		capture_ttl_seconds: "Captured bodies: max age (s)",
 		diagnostics_flush_interval: "Dashboard merge interval (s)",
 		max_endpoint_records: "Endpoint records kept",
 		token_budget_requests: "Token budget: max requests",
@@ -3031,6 +3042,10 @@ const print = console.log;
 		tarpit_on_endpoint_rule: "Tarpit: endpoint rate rules (1/0)",
 		tarpit_on_blocked_endpoint: "Tarpit: blocked endpoints (1/0)",
 		tarpit_on_auth_attempt: "Tarpit: ROBLOSECURITY attempts (1/0)",
+		tarpit_on_user_agent_rule: "Tarpit: client rate rules (1/0)",
+		throttle_escalation_enabled: "Escalating throttle enabled (1/0)",
+		throttle_strike_decay_seconds: "Strikes: drop a rung after (s)",
+		user_agent_rules_enabled: "Client (User-Agent) rules enabled (1/0)",
 		cache_enabled: "Response cache enabled (1/0)",
 		cache_ttl_seconds: "Cache: default TTL (s)",
 		cache_error_ttl_seconds: "Cache: 404/403 TTL (s, 0 = never)",
@@ -3142,6 +3157,23 @@ const print = console.log;
 			"Hold callers asking for an endpoint you blocked. ⚠ May catch someone who simply wanted that endpoint.",
 		tarpit_on_auth_attempt:
 			"Hold callers who tried to send a Roblox login cookie. Never valid here, but sometimes an honest mistake.",
+		tarpit_on_user_agent_rule:
+			"Hold callers caught by a client (User-Agent) rate rule. ⚠ These are usually cooperative " +
+			"bots being asked to slow down, and holding one punishes a client that would have obeyed anyway.",
+		throttle_escalation_enabled:
+			"Whether a repeat offender's throttle gets longer each time. 1 = on.\n\n" +
+			"Each throttle is a strike, and the ladder on the Throttle Rules page decides what the next " +
+			"one costs and what that caller is told. Off means everyone gets the same short wait however " +
+			"often they earn it.",
+		throttle_strike_decay_seconds:
+			"How long of good behavior it takes a caller to drop ONE rung of the escalation ladder, in " +
+			"seconds.\n\n" +
+			"1800 means half an hour without being throttled moves someone from rung 3 to rung 2. 0 turns " +
+			"decay off, so strikes last until you forgive them by hand.",
+		user_agent_rules_enabled:
+			"Master switch for the client (User-Agent) rate rules. 1 = on.\n\n" +
+			"Each rule also has its own toggle; this is the one that stops all of them at once without " +
+			"deleting anything.",
 
 		// --- Response cache -------------------------------------------------
 		cache_enabled:
@@ -3253,7 +3285,19 @@ const print = console.log;
 		["Routing & method mix", ["token_weight", "rotate_weight", "token_danger_zone"]],
 		["IP rotation", ["rotate_enabled", "rotate_cooldown", "rotate_max_failures"]],
 		["Token safety budget", ["token_budget_requests", "token_budget_window", "token_expiration_cooldown"]],
-		["Throttling", ["allowed_requests_per_minute", "throttle_reset_duration", "stale_ip_duration", "global_throttle_limit", "global_throttle_period"]],
+		[
+			"Throttling",
+			[
+				"allowed_requests_per_minute",
+				"throttle_reset_duration",
+				"stale_ip_duration",
+				"global_throttle_limit",
+				"global_throttle_period",
+				"throttle_escalation_enabled",
+				"throttle_strike_decay_seconds",
+				"user_agent_rules_enabled",
+			],
+		],
 		[
 			"Tarpit (slow refusals)",
 			[
@@ -3268,6 +3312,7 @@ const print = console.log;
 				"tarpit_on_endpoint_rule",
 				"tarpit_on_blocked_endpoint",
 				"tarpit_on_auth_attempt",
+				"tarpit_on_user_agent_rule",
 			],
 		],
 		[
@@ -4017,6 +4062,7 @@ const print = console.log;
 			renderThrottleBypass(d);
 			renderTarpit(d);
 			renderCache(d);
+			renderThrottleRules(d);
 			renderHeaderRules(d);
 			renderTesterSamples();
 			renderBlockedAttempts(d);
@@ -4868,6 +4914,628 @@ const print = console.log;
 			runFilterTest();
 		}
 	});
+
+	// -----------------------------
+	// Throttle rules
+	// -----------------------------
+	// Two features that share a section because they answer the same question
+	// from opposite ends: what do you do about a caller who is too fast?
+	//
+	//   The escalation ladder handles the one you do not know. Each throttle is
+	//   a strike, and the next one costs more — and says more.
+	//
+	//   Client rules handle the one you DO know: a named bot that is welcome to
+	//   scrape but not at that speed, given a lane of its own.
+	//
+	// The ladder is edited as a whole list rather than row by row, because its
+	// rungs are ordered and the order is the meaning. `tierDraft` holds the
+	// admin's in-progress edits so the five-second poll cannot type over them.
+	let tierDraft = null;
+
+	function renderEscalationTimeline(tiers, base) {
+		const box = $("#escalationTimeline");
+		if (!box) return;
+		box.innerHTML = "";
+		if (!renderThrottleRules._enabled) {
+			timelineStep(box, "always", [
+				"Escalation is off, so every throttle lasts ",
+				{ strong: fmtSpan(base) },
+				" no matter how many times the same caller earns one. The ladder below is kept, just unused.",
+			]);
+			return;
+		}
+		if (!tiers.length) {
+			timelineStep(box, "always", [
+				"The ladder is empty, so every throttle is the plain ",
+				{ strong: fmtSpan(base) },
+				" one. Add a rung below to make a repeat offender wait longer than a first-timer.",
+			]);
+			return;
+		}
+		tiers.forEach((tier, index) => {
+			const multiplier = Number(tier.Multiplier) || 1;
+			const ordinal = index === 0 ? "1st" : index === 1 ? "2nd" : index === 2 ? "3rd" : `${index + 1}th`;
+			const label = `${ordinal} strike`;
+			const parts = [
+				"Waits ",
+				{ strong: fmtSpan(base * multiplier) },
+				` (${multiplier}× the normal ${fmtSpan(base)}) and is told: `,
+			];
+			const quote = String(tier.Message || "").trim();
+			parts.push(quote ? `“${quote}”` : "nothing in particular — this rung has no message.");
+			timelineStep(box, label, parts);
+		});
+		const decay = Number(renderThrottleRules._decay || 0);
+		timelineStep(box, "after that", [
+			"The last rung repeats, so a caller who ignores the final warning keeps getting it. ",
+			decay
+				? `Behaving for ${fmtSpan(decay)} drops them back down one rung at a time.`
+				: "Decay is off, so strikes stay until you forgive them by hand.",
+		]);
+	}
+
+	function renderThrottleRules(d) {
+		if (d.ThrottleTiers) renderThrottleRules._tiers = d.ThrottleTiers;
+		if (d.UserAgentRules) renderThrottleRules._rules = d.UserAgentRules;
+		if (d.StrikeBoard) renderThrottleRules._board = d.StrikeBoard;
+		if (d.UserAgentRuleHits) renderThrottleRules._hits = d.UserAgentRuleHits;
+		const settings = (lastDiagnostics && lastDiagnostics.Settings) || {};
+		const value = (key, fallback) => (settings[key] ? Number(settings[key].value) : fallback);
+		renderThrottleRules._enabled = Boolean(value("throttle_escalation_enabled", 1));
+		renderThrottleRules._decay = value("throttle_strike_decay_seconds", 0);
+		const base = value("throttle_reset_duration", 50);
+		const tiers = renderThrottleRules._tiers || [];
+		const rules = renderThrottleRules._rules || {};
+
+		const chip = $("#escalationChip");
+		if (chip) {
+			chip.textContent = renderThrottleRules._enabled
+				? `Escalation on • ${tiers.length} rung${tiers.length === 1 ? "" : "s"}`
+				: "Escalation off";
+			chip.classList.toggle("chip--ok", renderThrottleRules._enabled);
+			chip.classList.toggle("chip--danger", !renderThrottleRules._enabled);
+		}
+		const active = Object.values(rules).filter(rule => rule.Enabled !== false).length;
+		setText("uaRulesChip", `${fmtCount(active)} client rule${active === 1 ? "" : "s"} active`);
+
+		// Never redraw a control the admin is currently typing into.
+		const toggle = (sel, on) => {
+			const el = $(sel);
+			if (el && el !== document.activeElement) el.checked = Boolean(on);
+		};
+		toggle("#escalationEnabled", renderThrottleRules._enabled);
+		toggle("#uaRulesEnabled", value("user_agent_rules_enabled", 1));
+		const decayInput = $("#strikeDecay");
+		if (decayInput && decayInput !== document.activeElement) decayInput.value = String(renderThrottleRules._decay);
+
+		renderEscalationTimeline(tierDraft || tiers, base);
+		renderTiers(tierDraft || tiers, base);
+		renderStrikeBoard(renderThrottleRules._board || []);
+		renderUserAgentRules(rules, renderThrottleRules._hits || {});
+	}
+
+	function tierInput(row, field, value, type) {
+		const input = document.createElement("input");
+		input.className = "input";
+		input.type = type;
+		if (type === "number") {
+			input.min = "0.1";
+			input.step = "0.1";
+		}
+		input.value = String(value ?? "");
+		input.dataset.tierField = field;
+		// Any keystroke promotes the rendered ladder to a draft, which is what
+		// stops the poll from redrawing over half-finished edits.
+		input.addEventListener("input", () => {
+			tierDraft = readTiers();
+			markTiersDirty(true);
+		});
+		row.appendChild(document.createElement("td")).appendChild(input);
+		return input;
+	}
+
+	function readTiers() {
+		return $$("#tiersTable tbody tr[data-tier-row]").map(row => ({
+			Multiplier: Number(row.querySelector('[data-tier-field="Multiplier"]')?.value) || 1,
+			Message: row.querySelector('[data-tier-field="Message"]')?.value || "",
+			Note: row.querySelector('[data-tier-field="Note"]')?.value || "",
+		}));
+	}
+
+	function markTiersDirty(dirty) {
+		const hint = $("#tiersHint");
+		if (hint) {
+			hint.textContent = dirty ? "Unsaved changes." : "";
+			hint.classList.toggle("text-warn", Boolean(dirty));
+		}
+		const save = $("#saveTiersBtn");
+		if (save) save.classList.toggle("btn--filled", true);
+	}
+
+	function renderTiers(tiers, base) {
+		const tbody = $("#tiersTable tbody");
+		if (!tbody) return;
+		// Mid-edit: leave the DOM exactly as the admin left it.
+		if (tbody.contains(document.activeElement)) return;
+		tbody.innerHTML = "";
+		if (!tiers.length) {
+			tbody.appendChild(tr(["No rungs — every throttle is the plain one.", "", "", "", ""]));
+			return;
+		}
+		tiers.forEach((tier, index) => {
+			const row = document.createElement("tr");
+			row.dataset.tierRow = String(index);
+
+			const label = document.createElement("td");
+			const multiplier = Number(tier.Multiplier) || 1;
+			label.appendChild(sortable(`Rung ${index + 1}`, index));
+			const wait = document.createElement("div");
+			wait.className = "text-dim";
+			wait.textContent = `waits ${fmtSpan(base * multiplier)}`;
+			label.appendChild(wait);
+			row.appendChild(label);
+
+			tierInput(row, "Multiplier", multiplier, "number");
+			tierInput(row, "Message", tier.Message || "", "text");
+			tierInput(row, "Note", tier.Note || "", "text");
+
+			const actions = document.createElement("td");
+			const remove = document.createElement("button");
+			remove.type = "button";
+			remove.className = "btn btn--ghost btn--xs";
+			remove.textContent = "Remove";
+			remove.addEventListener("click", () => {
+				const next = readTiers();
+				next.splice(index, 1);
+				tierDraft = next;
+				renderTiers(next, base);
+				renderEscalationTimeline(next, base);
+				markTiersDirty(true);
+			});
+			actions.appendChild(remove);
+			row.appendChild(actions);
+			tbody.appendChild(row);
+		});
+	}
+
+	async function saveTiers(tiers) {
+		try {
+			const res = await api("/admin/throttle/tiers", { method: "POST", body: JSON.stringify({ tiers }) });
+			const data = await res.json();
+			if (!res.ok) throw new Error(data.Message || String(res.status));
+			tierDraft = null;
+			renderThrottleRules._tiers = data.Tiers;
+			markTiersDirty(false);
+			showToast("Escalation ladder saved");
+			refreshAll(true);
+		} catch (err) {
+			showToast("Could not save the ladder: " + err.message, 4200);
+		}
+	}
+
+	$("#addTierBtn")?.addEventListener("click", () => {
+		const next = readTiers();
+		const last = next[next.length - 1];
+		// A new rung defaults to twice the previous one, which is the shape
+		// almost every ladder wants and saves typing the obvious thing.
+		next.push({ Multiplier: last ? (Number(last.Multiplier) || 1) * 2 : 1, Message: "", Note: "" });
+		tierDraft = next;
+		renderThrottleRules({});
+		markTiersDirty(true);
+	});
+	$("#saveTiersBtn")?.addEventListener("click", () => saveTiers(readTiers()));
+	$("#resetTiersBtn")?.addEventListener("click", () => {
+		if (!confirm("Replace the ladder with the shipped default rungs?")) return;
+		tierDraft = null;
+		saveTiers(DEFAULT_TIERS);
+	});
+	$("#escalationEnabled")?.addEventListener("change", e =>
+		saveThrottleSetting(
+			{ throttle_escalation_enabled: e.target.checked ? 1 : 0 },
+			e.target.checked ? "Repeat offenders now escalate" : "Every throttle is now the same length",
+		),
+	);
+	$("#uaRulesEnabled")?.addEventListener("change", e =>
+		saveThrottleSetting(
+			{ user_agent_rules_enabled: e.target.checked ? 1 : 0 },
+			e.target.checked ? "Client rules active" : "Client rules paused",
+		),
+	);
+	$("#saveStrikeDecay")?.addEventListener("click", () =>
+		saveThrottleSetting({ throttle_strike_decay_seconds: Number($("#strikeDecay")?.value) }, "Decay saved"),
+	);
+
+	// The ladder this proxy ships with, for the Restore defaults button. Kept in
+	// step with config.DEFAULT_THROTTLE_TIERS by the smoke suite.
+	const DEFAULT_TIERS = [
+		{ Multiplier: 1, Message: "Too many requests — please slow down.", Note: "First strike: probably just fast." },
+		{
+			Multiplier: 2,
+			Message: "You are about to be severely throttled. Please respect the proxy's limits.",
+			Note: "Second strike: a warning they can still act on.",
+		},
+		{
+			Multiplier: 4,
+			Message:
+				"You have been harshly throttled due to bot behavior. The proxy is happy for you to scrape data, " +
+				"but please respect its limits. If you need more request bandwidth, contact CeaselessQuokka.",
+			Note: "Third strike: says what to do about it.",
+		},
+		{
+			Multiplier: 8,
+			Message:
+				"You are still ignoring the proxy's limits, so the wait has been extended again. " +
+				"Contact CeaselessQuokka if you need more request bandwidth.",
+			Note: "Fourth strike and beyond: the last rung repeats.",
+		},
+	];
+
+	async function saveThrottleSetting(settings, message) {
+		try {
+			const res = await api("/admin/settings", { method: "POST", body: JSON.stringify({ settings }) });
+			const data = await res.json();
+			if (!res.ok) throw new Error(String(res.status));
+			const failures = Object.entries(data.Results || {}).filter(([, msg]) => msg !== "Success");
+			if (failures.length) throw new Error(failures.map(([key, msg]) => `${key}: ${msg}`).join(", "));
+			showToast(message);
+		} catch (err) {
+			showToast("Could not save: " + err.message);
+		}
+		refreshAll(true);
+	}
+
+	// --- Who is escalating ----------------------------------------------------
+	function renderStrikeBoard(board) {
+		const tbody = $("#strikeBoardTable tbody");
+		if (!tbody) return;
+		setText("strikeBoardTotal", `${fmtCount(board.length)} caller${board.length === 1 ? "" : "s"}`);
+		tbody.innerHTML = "";
+		if (!board.length) {
+			tbody.appendChild(tr(["Nobody is carrying strikes right now.", "", "", "", "", "", ""]));
+			return;
+		}
+		for (const row of board) {
+			const strikes = document.createElement("span");
+			strikes.textContent = fmtCount(row.Strikes);
+			// Colored by how far up the ladder they are, not by a fixed number:
+			// the top rung means something different on a 3-rung ladder than on
+			// a 10-rung one.
+			const tiers = (renderThrottleRules._tiers || []).length || 1;
+			if (row.Tier >= tiers) strikes.className = "text-bad";
+			else if (row.Tier > 1) strikes.className = "text-warn";
+			strikes.dataset.sortValue = String(row.Strikes);
+
+			const status = document.createElement("span");
+			if (row.Throttled) {
+				status.className = "text-warn";
+				status.textContent = `serving ${fmtSpan(row.ResetIn)}`;
+				status.dataset.sortValue = String(row.ResetIn);
+			} else {
+				status.className = "text-muted";
+				status.textContent = "free to call";
+				status.dataset.sortValue = "0";
+			}
+
+			const forgive = document.createElement("button");
+			forgive.className = "btn btn--ghost btn--xs";
+			forgive.textContent = "Forgive";
+			forgive.title = "Wipe this caller's strike history";
+			forgive.addEventListener("click", () => forgiveStrikes(row.IP));
+			const filter = fpButton("Filter feed", "Show this caller's requests in the live feed", () =>
+				filterLiveBy(row.IP),
+			);
+			const actions = document.createElement("div");
+			actions.className = "row-actions";
+			actions.append(forgive, filter);
+
+			const tierCell = sortable(`${row.Tier} of ${tiers}`, row.Tier);
+			tierCell.title = String(row.Message || "").trim() || "This rung has no message.";
+			const tableRow = tr([
+				sortable(row.IP, row.IP),
+				strikes,
+				tierCell,
+				status,
+				sortable(row.DecaysIn ? fmtSpan(row.DecaysIn) : "never", row.DecaysIn),
+				tsNode(row.LastStrikeAt),
+				actions,
+			]);
+			tableRow.children[0].className = "mono";
+			tbody.appendChild(tableRow);
+		}
+	}
+
+	async function forgiveStrikes(ip) {
+		try {
+			const res = await api("/admin/throttle/strikes/clear", {
+				method: "POST",
+				body: JSON.stringify(ip ? { ip } : {}),
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(String(res.status));
+			showToast(ip ? `${ip} is back on a clean sheet` : `Forgave ${fmtCount(data.Forgiven)} caller(s)`);
+			refreshAll(true);
+		} catch {
+			showToast("Could not forgive that caller");
+		}
+	}
+
+	$("#forgiveAllBtn")?.addEventListener("click", () => {
+		if (!confirm("Wipe every caller's strike history? Their current timeouts still run out normally.")) return;
+		forgiveStrikes("");
+	});
+
+	// --- Client rules ---------------------------------------------------------
+	function uaLimitLabel(rule) {
+		return rule.Kind === "cooldown"
+			? `1 per ${fmtSpan(Number(rule.Cooldown) || 0)}`
+			: `${fmtCount(rule.Limit)} per ${fmtSpan(Number(rule.Period) || 0)}`;
+	}
+
+	function renderUserAgentRules(rules, hits) {
+		const tbody = $("#uaRulesTable tbody");
+		if (!tbody) return;
+		const entries = Object.entries(rules || {});
+		tbody.innerHTML = "";
+		if (!entries.length) {
+			tbody.appendChild(tr(["No client rules — every caller uses the ordinary limits.", "", "", "", "", "", ""]));
+			return;
+		}
+		for (const [ruleId, rule] of entries) {
+			const stats = hits[ruleId] || {};
+			const enabled = rule.Enabled !== false;
+
+			const needle = document.createElement("span");
+			needle.className = "mono";
+			needle.textContent = rule.Needle || "";
+			const needleCell = document.createElement("span");
+			needleCell.appendChild(needle);
+			if (rule.Mode && rule.Mode !== "contains") {
+				const badge = document.createElement("span");
+				badge.className = "badge badge--method";
+				badge.textContent = rule.Mode;
+				needleCell.append(" ", badge);
+			}
+			if (!enabled) {
+				const off = document.createElement("span");
+				off.className = "badge badge--muted";
+				off.textContent = "off";
+				needleCell.append(" ", off);
+			}
+			needleCell.dataset.sortValue = rule.Needle || "";
+
+			const counts = document.createElement("span");
+			const allowed = Number(stats.Allowed || 0);
+			const refused = Number(stats.Refused || 0);
+			counts.textContent = `${fmtCount(allowed)} / ${fmtCount(refused)}`;
+			if (refused) counts.className = "text-warn";
+			counts.dataset.sortValue = String(allowed + refused);
+
+			const edit = document.createElement("button");
+			edit.className = "btn btn--ghost btn--xs";
+			edit.textContent = "Edit";
+			edit.addEventListener("click", () => editUserAgentRule(ruleId, rule));
+			const toggleBtn = document.createElement("button");
+			toggleBtn.className = "btn btn--ghost btn--xs";
+			toggleBtn.textContent = enabled ? "Disable" : "Enable";
+			toggleBtn.title = enabled
+				? "Stop applying this rule, without deleting it"
+				: "Start applying this rule again";
+			toggleBtn.addEventListener("click", () =>
+				submitUserAgentRule(
+					{ ...ruleToPayload(rule), id: ruleId, enabled: !enabled },
+					enabled ? "Rule disabled" : "Rule enabled",
+				),
+			);
+			const remove = document.createElement("button");
+			remove.className = "btn btn--ghost btn--xs";
+			remove.textContent = "Remove";
+			remove.addEventListener("click", () => removeUserAgentRule(ruleId, rule.Needle));
+			const actions = document.createElement("div");
+			actions.className = "row-actions";
+			actions.append(edit, toggleBtn, remove);
+
+			const row = tr([
+				needleCell,
+				sortable(uaLimitLabel(rule), rule.Kind || ""),
+				sortable(rule.Scope === "global" ? "shared" : "per IP", rule.Scope || "ip"),
+				messageCell({ Message: rule.Message }),
+				counts,
+				tsNode(stats.LastSeen),
+				actions,
+			]);
+			if (!enabled) row.classList.add("is-disabled");
+			tbody.appendChild(row);
+		}
+	}
+
+	const ruleToPayload = rule => ({
+		needle: rule.Needle,
+		mode: rule.Mode,
+		kind: rule.Kind,
+		scope: rule.Scope,
+		limit: rule.Limit,
+		period: rule.Period,
+		cooldown: rule.Cooldown,
+		message: rule.Message,
+		note: rule.Note,
+	});
+
+	function uaFormPayload() {
+		return {
+			id: $("#uaRuleId")?.value || "",
+			needle: $("#uaRuleNeedle")?.value.trim() || "",
+			mode: $("#uaRuleMode")?.value || "contains",
+			kind: $("#uaRuleKind")?.value || "burst",
+			scope: $("#uaRuleScope")?.value || "ip",
+			limit: Number($("#uaRuleLimit")?.value) || 1,
+			period: Number($("#uaRulePeriod")?.value) || 60,
+			cooldown: Number($("#uaRuleCooldown")?.value) || 1,
+			message: $("#uaRuleMessage")?.value.trim() || "",
+			note: $("#uaRuleNote")?.value.trim() || "",
+			enabled: true,
+		};
+	}
+
+	function syncUaKindFields() {
+		const cooldown = $("#uaRuleKind")?.value === "cooldown";
+		const burstFields = $("#uaBurstFields");
+		const cooldownFields = $("#uaCooldownFields");
+		if (burstFields) burstFields.hidden = cooldown;
+		if (cooldownFields) cooldownFields.hidden = !cooldown;
+	}
+	$("#uaRuleKind")?.addEventListener("change", syncUaKindFields);
+	syncUaKindFields();
+
+	function editUserAgentRule(ruleId, rule) {
+		$("#uaRuleId").value = ruleId;
+		$("#uaRuleNeedle").value = rule.Needle || "";
+		$("#uaRuleMode").value = rule.Mode || "contains";
+		$("#uaRuleKind").value = rule.Kind || "burst";
+		$("#uaRuleScope").value = rule.Scope || "ip";
+		$("#uaRuleLimit").value = String(rule.Limit ?? 10);
+		$("#uaRulePeriod").value = String(rule.Period ?? 60);
+		$("#uaRuleCooldown").value = String(rule.Cooldown ?? 2);
+		$("#uaRuleMessage").value = rule.Message || "";
+		$("#uaRuleNote").value = rule.Note || "";
+		syncUaKindFields();
+		setText("uaRuleSubmit", "Save changes");
+		const cancel = $("#uaRuleCancel");
+		if (cancel) cancel.hidden = false;
+		$("#uaRuleNeedle")?.focus();
+	}
+
+	function resetUaForm() {
+		$("#uaRuleId").value = "";
+		$("#uaRuleForm")?.reset();
+		syncUaKindFields();
+		setText("uaRuleSubmit", "Add rule");
+		const cancel = $("#uaRuleCancel");
+		if (cancel) cancel.hidden = true;
+	}
+	$("#uaRuleCancel")?.addEventListener("click", resetUaForm);
+
+	async function submitUserAgentRule(payload, message) {
+		try {
+			const res = await api("/admin/throttle/user_agent", { method: "POST", body: JSON.stringify(payload) });
+			const data = await res.json();
+			if (!res.ok) throw new Error(data.Message || String(res.status));
+			renderThrottleRules._rules = data.UserAgentRules;
+			renderUserAgentRules(data.UserAgentRules, renderThrottleRules._hits || {});
+			showToast(message);
+			resetUaForm();
+			refreshAll(true);
+		} catch (err) {
+			showToast("Could not save the rule: " + err.message, 4200);
+		}
+	}
+
+	$("#uaRuleForm")?.addEventListener("submit", e => {
+		e.preventDefault();
+		const payload = uaFormPayload();
+		if (!payload.needle) return;
+		submitUserAgentRule(payload, payload.id ? "Rule updated" : "Rule added");
+	});
+
+	async function removeUserAgentRule(ruleId, label) {
+		if (!confirm(`Remove the client rule for "${label}"?`)) return;
+		try {
+			const res = await api("/admin/throttle/user_agent/remove", {
+				method: "POST",
+				body: JSON.stringify({ id: ruleId }),
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(String(res.status));
+			renderThrottleRules._rules = data.UserAgentRules;
+			renderUserAgentRules(data.UserAgentRules, renderThrottleRules._hits || {});
+			showToast("Rule removed");
+			refreshAll(true);
+		} catch {
+			showToast("Could not remove that rule");
+		}
+	}
+
+	// --- Dry run --------------------------------------------------------------
+	$("#uaTestForm")?.addEventListener("submit", async e => {
+		e.preventDefault();
+		const box = $("#uaTestResult");
+		const userAgent = $("#uaTestValue")?.value.trim();
+		if (!userAgent || !box) return;
+		box.hidden = false;
+		box.innerHTML = '<div class="text-muted">Testing…</div>';
+		const payload = { user_agent: userAgent };
+		if ($("#uaTestDraft")?.checked && $("#uaRuleNeedle")?.value.trim()) payload.draft = uaFormPayload();
+		try {
+			const res = await api("/admin/throttle/user_agent/test", { method: "POST", body: JSON.stringify(payload) });
+			const data = await res.json();
+			if (!res.ok) {
+				box.innerHTML = `<div class="callout callout--bad">${escapeHtml(String(data))}</div>`;
+				return;
+			}
+			renderUaTestResult(box, data);
+		} catch {
+			box.innerHTML = '<div class="callout callout--bad">Could not run the test.</div>';
+		}
+	});
+
+	function renderUaTestResult(box, data) {
+		const verdict = data.Limited
+			? `<div class="tester-verdict tester-verdict--blocked"><div class="tester-verdict__headline">` +
+				`This client would be rate-limited</div><div class="tester-verdict__detail">by the rule matching ` +
+				`<code>${escapeHtml(data.LimitedBy.Needle)}</code> — ${escapeHtml(uaLimitLabel(data.LimitedBy))}` +
+				`</div></div>`
+			: `<div class="tester-verdict tester-verdict--allowed"><div class="tester-verdict__headline">` +
+				`No client rule applies</div><div class="tester-verdict__detail">This caller gets the ordinary ` +
+				`per-IP limits.</div></div>`;
+		const rows = (data.Rules || [])
+			.map(rule => {
+				const state = !rule.Enabled
+					? '<span class="badge badge--muted">off</span>'
+					: rule.IsFirstMatch
+						? '<span class="badge badge--warn">this one applies</span>'
+						: rule.Matched
+							? '<span class="badge badge--muted">also matches</span>'
+							: '<span class="text-muted">no match</span>';
+				return (
+					`<li><span class="mono">${escapeHtml(rule.Needle || "")}</span>` +
+					`<span>${state}</span></li>`
+				);
+			})
+			.join("");
+		let draft = "";
+		if (data.Draft) {
+			draft = data.Draft.Valid
+				? `<div class="callout ${data.Draft.Matched ? "callout--warn" : "callout--muted"}">` +
+					`The rule you are writing <strong>${data.Draft.Matched ? "would" : "would not"}</strong> ` +
+					`catch this client.` +
+					(data.Draft.Matched && data.Draft.AlreadyMatched
+						? " A rule listed above already covers it, so adding this would change nothing for this caller."
+						: "") +
+					"</div>"
+				: `<div class="callout callout--bad">The rule you are writing is not valid: ` +
+					`${escapeHtml(data.Draft.Error)}</div>`;
+		}
+		box.innerHTML =
+			verdict +
+			draft +
+			(rows ? `<div class="detail-block"><div class="detail-block__title">Every saved rule</div>` +
+				`<ul class="detail-list">${rows}</ul></div>` : "");
+	}
+
+	$("#clearThrottleStatsBtn")?.addEventListener("click", e =>
+		withBusy(e.currentTarget, "Clearing…", async () => {
+			try {
+				const res = await api("/admin/data/clear", {
+					method: "POST",
+					body: JSON.stringify({ target: "throttle_rules" }),
+				});
+				if (!res.ok) throw new Error(String(res.status));
+				showToast("Throttle rule stats cleared");
+				refreshAll(true);
+			} catch {
+				showToast("Could not clear the stats");
+			}
+		}),
+	);
 
 	// -----------------------------
 	// Response cache
@@ -6165,6 +6833,8 @@ const print = console.log;
 		"#tarpitIpsTable",
 		"#cacheRulesTable",
 		"#cacheEndpointsTable",
+		"#strikeBoardTable",
+		"#uaRulesTable",
 	];
 
 	function initAllSortables() {

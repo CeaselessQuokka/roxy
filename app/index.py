@@ -417,6 +417,12 @@ def admin_diagnostics():
     data["Capture"] = capture.get_state()
     data["Cache"] = cache.get_state()
     data["CacheRules"] = runtime.get_cache_rules()
+    data["ThrottleTiers"] = runtime.get_throttle_tiers()
+    data["UserAgentRules"] = runtime.get_user_agent_rules()
+    # A short leaderboard rather than the whole table: this rides the regular
+    # poll, and the question it answers ("who is escalating right now?") is
+    # about the worst few, not about everyone who has ever been fast.
+    data["StrikeBoard"] = throttle.strike_board(25)
     data["InternalEndpoints"] = proxy.internal_endpoints()
     data["IgnoredValueHeaders"] = runtime.get_ignored_value_headers()
     data["TrustedDevices"] = runtime.get_trusted_device_count()
@@ -626,6 +632,92 @@ def admin_clear_captures():
     capture.reset()
     diagnostics.clear_stats(diagnostics.CLEAR_TARGETS["live"])
     return jsonify({"Message": "Live feed and captured bodies cleared"}), 200
+
+
+# --- Throttle escalation + per-client rules -----------------------------------
+@app.route("/admin/throttle/tiers", methods=["GET", "POST"], endpoint="admin_throttle_tiers")
+@requires_admin
+def admin_throttle_tiers():
+    """Read or replace the escalation ladder.
+
+    The whole ladder at once, because its rungs are ORDERED and the order is the
+    meaning — editing a rung and moving it are the same action to the admin.
+    """
+    if request.method == "GET":
+        return jsonify({"Tiers": runtime.get_throttle_tiers()}), 200
+    data = get_json_dict()
+    if data is None or "tiers" not in data:
+        return jsonify("Missing tiers"), 400
+    ok, message = runtime.set_throttle_tiers(data.get("tiers"))
+    if not ok:
+        return jsonify({"Message": message}), 400
+    return jsonify({"Message": message, "Tiers": runtime.get_throttle_tiers()}), 200
+
+
+@app.route("/admin/throttle/strikes", methods=["GET"], endpoint="admin_throttle_strikes")
+@requires_admin
+def admin_throttle_strikes():
+    """Who is currently carrying strikes, worst first."""
+    try:
+        limit = int(request.args.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    return jsonify({"Strikes": throttle.strike_board(limit), "Tiers": runtime.get_throttle_tiers()}), 200
+
+
+@app.route("/admin/throttle/strikes/clear", methods=["POST"], endpoint="admin_clear_strikes")
+@requires_admin
+def admin_clear_strikes():
+    """Forgive one IP's escalation history, or everyone's.
+
+    Escalation is sticky on purpose, so there has to be an undo for the evening
+    you load-test your own proxy from your own address.
+    """
+    data = get_json_dict() or {}
+    ip = str(data.get("ip", "") or "").strip()
+    forgiven = throttle.clear_strikes(ip or None)
+    return jsonify({"Forgiven": forgiven, "Scope": ip or "all"}), 200
+
+
+@app.route("/admin/throttle/user_agent", methods=["POST"], endpoint="admin_set_user_agent_rule")
+@requires_admin
+def admin_set_user_agent_rule():
+    """Create a rule, or edit one in place by passing its id."""
+    data = get_json_dict()
+    if data is None:
+        return jsonify("Invalid request"), 400
+    ok, message, rule_id = runtime.set_user_agent_rule(data)
+    if not ok:
+        return jsonify({"Message": message}), 400
+    return jsonify({"Message": message, "Id": rule_id, "UserAgentRules": runtime.get_user_agent_rules()}), 200
+
+
+@app.route("/admin/throttle/user_agent/remove", methods=["POST"], endpoint="admin_remove_user_agent_rule")
+@requires_admin
+def admin_remove_user_agent_rule():
+    data = get_json_dict()
+    if data is None or "id" not in data:
+        return jsonify("Missing id"), 400
+    runtime.remove_user_agent_rule(data.get("id", ""))
+    return jsonify({"Message": "Success", "UserAgentRules": runtime.get_user_agent_rules()}), 200
+
+
+@app.route("/admin/throttle/user_agent/test", methods=["POST"], endpoint="admin_test_user_agent_rule")
+@requires_admin
+def admin_test_user_agent_rule():
+    """Dry-run the rules against a User-Agent, including an unsaved draft.
+
+    Answers "will this catch the bot I am looking at, and does it catch anything
+    I did not mean to?" BEFORE the rule is live, rather than after it has started
+    limiting the wrong client.
+    """
+    data = get_json_dict()
+    if data is None:
+        return jsonify("Invalid request"), 400
+    user_agent = str(data.get("user_agent", "") or "")
+    if not user_agent:
+        return jsonify("Paste a User-Agent to test against"), 400
+    return jsonify(runtime.explain_user_agent_rules(user_agent, data.get("draft"))), 200
 
 
 # --- Response cache -----------------------------------------------------------
@@ -1500,17 +1592,60 @@ def _with_throttle_headers(resp, ip: str, **extra):
     return resp
 
 
-def throttled_response(ip: str, reset_in=None):
+def throttled_response(ip: str, reset_in=None, state: dict = None):
     """The standard 'you've been throttled' 429. Reused for header-rule blocks so a
     blocked exploiter sees an ordinary rate-limit message and can't tell they were
-    filtered (it's indistinguishable from a real throttle)."""
+    filtered (it's indistinguishable from a real throttle).
+
+    The BODY comes from whichever rung of the escalation ladder this caller is
+    on, because that is the part of a 429 anyone actually reads. A first offense
+    gets "slow down"; a caller on their fifth gets told, in words, that they are
+    being treated as a bot and who to talk to about it. Both carry the same
+    status code and the same headers, so nothing about the shape of the response
+    reveals the ladder to someone probing it.
+    """
+    state = state if state is not None else throttle.get_throttle_state(ip)
     if reset_in is None:
-        reset_in = throttle.get_throttle_reset_time_left(ip)
-    allowed = runtime.get_setting("allowed_requests_per_minute", config.ALLOWED_REQUESTS_PER_MINUTE)
-    resp = jsonify(
-        f"You have been throttled; try again in {reset_in} seconds (you get ~{allowed} requests per ~minute)."
+        reset_in = state.get("ResetIn", 0) or throttle.get_throttle_reset_time_left(ip)
+    message = str(state.get("Message", "") or "").strip()
+    if not message:
+        # No ladder configured (or escalation off): the plain, factual refusal.
+        allowed = runtime.get_setting("allowed_requests_per_minute", config.ALLOWED_REQUESTS_PER_MINUTE)
+        message = f"You have been throttled; try again in {reset_in} seconds (you get ~{allowed} requests per ~minute)."
+    resp = jsonify(message)
+    extra = {"Roxy_Throttle_Reset": reset_in, "Roxy_Throttled": "True"}
+    # Retry-After is the standard header a well-built client already honors, so
+    # a cooperative scraper backs off correctly without reading our JSON at all.
+    resp.headers["Retry-After"] = str(max(1, int(reset_in or 1)))
+    return _with_throttle_headers(resp, ip, **extra), 429
+
+
+def user_agent_limited_response(ip: str, rule: dict, retry_after: int):
+    """The refusal for a caller caught by a per-User-Agent rate rule.
+
+    Deliberately NOT disguised as the ordinary throttle: these rules exist for
+    bots that are cooperative but too fast, and the whole point is to tell them
+    exactly what the limit is so they can obey it. Hiding that would be working
+    against the goal.
+    """
+    kind = rule.get("Kind", "burst")
+    if kind == "cooldown":
+        detail = f"This client is limited to one request every {rule.get('Cooldown', 0)}s."
+    else:
+        detail = f"This client is limited to {rule.get('Limit', 0)} requests per {rule.get('Period', 0)}s."
+    message = str(rule.get("Message", "") or "").strip() or f"{detail} Try again in {retry_after} seconds."
+    resp = jsonify(message)
+    resp.headers["Retry-After"] = str(max(1, int(retry_after or 1)))
+    return (
+        _with_throttle_headers(
+            resp,
+            ip,
+            Roxy_Throttle_Reset=retry_after,
+            Roxy_Throttled="True",
+            Roxy_Client_Limited="True",
+        ),
+        429,
     )
-    return _with_throttle_headers(resp, ip, Roxy_Throttle_Reset=reset_in, Roxy_Throttled="True"), 429
 
 
 # --- Response cache -----------------------------------------------------------
@@ -1762,9 +1897,40 @@ def proxy_page(dst: str):
             f"Per-IP limit {runtime.get_setting('allowed_requests_per_minute', config.ALLOWED_REQUESTS_PER_MINUTE)} "
             f"per {runtime.get_setting('throttle_reset_duration', config.THROTTLE_RESET_DURATION)}s",
         )
-        resp, status = throttled_response(ip)
-        _record_outcome(ctx, status, "throttled", reason="Per-IP rate limit")
+        state = throttle.get_throttle_state(ip)
+        resp, status = throttled_response(ip, state=state)
+        _record_outcome(
+            ctx,
+            status,
+            "throttled",
+            reason="Per-IP rate limit",
+            # The rung is recorded so the live feed can distinguish a caller on
+            # their first strike from one who has ignored four warnings.
+            detail=f"Strike {state.get('Strikes', 0)} (tier {state.get('Tier', 0)})" if state.get("Tier") else "",
+        )
         return resp, status
+
+    # Per-User-Agent rate rules: a limit aimed at one CLIENT rather than at an
+    # IP or an endpoint. Placed after the per-IP throttle (so the general limit
+    # still applies first) and before anything is counted, so a refused request
+    # does not also burn the caller's ordinary allowance.
+    if not bypass:
+        ua_allowed, ua_retry, ua_rule = throttle.check_user_agent_rule(ip, user_agent)
+        if ua_rule is not None:
+            diagnostics.log_user_agent_rule(ua_rule, ip, ua_allowed)
+        if not ua_allowed:
+            label = ua_rule.get("Needle", "?")
+            hold("user_agent_rule", f"User-Agent rule: {label}")
+            resp, status = user_agent_limited_response(ip, ua_rule, ua_retry)
+            _record_outcome(
+                ctx,
+                status,
+                "user_agent_rule",
+                reason=f"User-Agent rule: {label}",
+                category="user_agent_rule",
+                detail=f"{ua_rule.get('Kind', '')} rule, retry in {ua_retry}s",
+            )
+            return resp, status
 
     if dst in path_ignore_set:
         return refuse(jsonify("Not Found"), 404, "ignored_path")

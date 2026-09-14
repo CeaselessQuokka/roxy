@@ -84,6 +84,7 @@
 					<li><a class="nav__link is-active" href="#section-overview">Overview</a></li>
 					<li><a class="nav__link" href="#section-controls">Service Controls</a></li>
 					<li><a class="nav__link" href="#section-cache">Response Cache</a></li>
+					<li><a class="nav__link" href="#section-throttle-rules">Throttle Rules</a></li>
 					<li><a class="nav__link" href="#section-traffic">Traffic</a></li>
 					<li><a class="nav__link" href="#section-live">Live Requests</a></li>
 					<li><a class="nav__link" href="#section-callers">Callers &amp; Top Talkers</a></li>
@@ -911,6 +912,393 @@
 					</div>
 				</section>
 
+				<!-- Escalating throttles + per-client limits -->
+				<section id="section-throttle-rules" class="section" aria-labelledby="throttleRulesHeading">
+					<div class="section__header">
+						<h2 id="throttleRulesHeading" class="section__title">Throttle Rules</h2>
+						<div class="section__actions">
+							<span
+								id="escalationChip"
+								class="chip"
+								data-help="Whether repeat offenders get progressively longer timeouts. Off means everyone gets the same short wait however many times they earn it."
+								>Escalation off</span
+							>
+							<span
+								id="uaRulesChip"
+								class="chip chip--muted"
+								data-help="How many per-User-Agent rate rules are currently switched on."
+								>0 client rules</span
+							>
+							<button
+								id="clearThrottleStatsBtn"
+								type="button"
+								class="btn btn--outline btn--sm"
+								data-help="Reset the counters on this page. The rules themselves, and callers' current strike counts, are left alone."
+							>
+								Clear stats
+							</button>
+						</div>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">What this does</h3>
+						<p class="form__hint">
+							The plain per-IP limit treats every offender the same: go too fast, wait a few seconds,
+							carry on. For someone who is merely quick that is exactly right. For a bot that trips the
+							limit every single window, it teaches the wrong lesson — that waiting it out works.
+						</p>
+						<p class="form__hint">
+							So each throttle is a <strong>strike</strong>, and the ladder below decides what the next
+							one costs. A multiplier stretches the wait; the message is what that caller is
+							<em>told</em>, which is the part that actually changes anything — the author of a scraper
+							reads the error body, not the status code.
+						</p>
+						<p class="form__hint">
+							Underneath, <strong>client rules</strong> solve a different problem: a bot that is not
+							malicious enough to block but is not respecting the limits either. Match it by its
+							User-Agent and give it a lane of its own — a burst allowance, or a fixed gap between
+							requests — with a message written for that specific bot.
+						</p>
+
+						<h3 class="card__title">The words used on this page</h3>
+						<dl class="glossary">
+							<dt>Strike</dt>
+							<dd>
+								One throttle earned. The count is what decides how hard the <em>next</em> one is, so it
+								is what makes a repeat offender different from someone who was briefly fast.
+							</dd>
+							<dt>Rung</dt>
+							<dd>
+								One step of the ladder. Rung 1 applies to a caller's first strike, rung 2 to their
+								second, and so on. Past the last rung, the last rung repeats.
+							</dd>
+							<dt>Multiplier</dt>
+							<dd>
+								How much longer that rung's timeout is than the normal one. With a 50-second default,
+								<code>×4</code> means a 200-second wait.
+							</dd>
+							<dt>Decay</dt>
+							<dd>
+								Strikes fade with good behavior. After the quiet period set below, a caller drops one
+								rung — so a single bad afternoon does not follow them forever.
+							</dd>
+							<dt>Burst</dt>
+							<dd>
+								A client rule shape: <em>N requests per P seconds</em>. Right for a scraper that works
+								in batches and then sleeps.
+							</dd>
+							<dt>Cooldown</dt>
+							<dd>
+								The other shape: <em>a minimum gap between requests</em>. Right for a bot that hammers
+								steadily — it turns "as fast as I can" into a fixed, predictable rate.
+							</dd>
+						</dl>
+
+						<h3 class="card__title">What happens to a repeat offender, using your current ladder</h3>
+						<div id="escalationTimeline" class="timeline"></div>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Escalation ladder</h3>
+						<p class="form__hint">
+							Edit any rung in place, then <strong>Save ladder</strong>. Rungs apply in order, so the top
+							row is a caller's first strike. Only the per-IP throttle escalates — the global
+							throttle-all and the per-endpoint rules are unaffected.
+						</p>
+						<div class="form__row">
+							<label
+								class="switch"
+								data-help="Off means every throttle is the plain duration, however many times the same caller earns one. The ladder below is kept, just unused."
+							>
+								<input type="checkbox" id="escalationEnabled" />
+								<span class="switch__label">Escalation enabled</span>
+							</label>
+							<div class="form__field">
+								<label class="form__label" for="strikeDecay">
+									Drop a rung after (seconds of good behavior)
+									<span
+										class="help"
+										tabindex="0"
+										role="note"
+										data-help="How long a caller has to behave before they fall one rung.&#10;&#10;Example: 1800 means half an hour of not being throttled moves someone from rung 3 back to rung 2, and another half hour to rung 1.&#10;&#10;0 turns decay off entirely, so strikes are permanent until you forgive them by hand — which is rarely what you want."
+										>?</span
+									>
+								</label>
+								<input id="strikeDecay" class="input input--w170" type="number" min="0" max="604800" />
+							</div>
+							<div class="spacer"></div>
+							<button id="saveStrikeDecay" type="button" class="btn btn--tonal">Save</button>
+						</div>
+						<div class="table-wrap">
+							<table id="tiersTable" class="table">
+								<thead>
+									<tr>
+										<th
+											scope="col"
+											data-help="Which strike this rung applies to. Rung 1 is a caller's first offense."
+										>
+											Rung
+										</th>
+										<th
+											scope="col"
+											data-help="How much longer this rung's timeout is than the normal throttle duration. 1 means the normal wait, 4 means four times as long."
+										>
+											Multiplier
+										</th>
+										<th
+											scope="col"
+											data-help="What the caller is told. This is the part that actually changes behavior — write it for a person reading an error, not for a log."
+										>
+											Message shown to the caller
+										</th>
+										<th scope="col" data-help="A private reminder for you. Never sent to anyone.">
+											Note
+										</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
+						<div class="form__row form__row--end">
+							<span id="tiersHint" class="form__hint mb-0"></span>
+							<div class="spacer"></div>
+							<button id="addTierBtn" type="button" class="btn btn--outline">Add a rung</button>
+							<button id="resetTiersBtn" type="button" class="btn btn--outline">Restore defaults</button>
+							<button id="saveTiersBtn" type="button" class="btn btn--filled">Save ladder</button>
+						</div>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Who is escalating right now</h3>
+						<p class="form__hint">
+							Callers currently carrying strikes, worst first. <strong>Forgive</strong> wipes one
+							caller's history — the undo for the evening you load-tested your own proxy.
+						</p>
+						<div class="form__row">
+							<span id="strikeBoardTotal" class="chip">0 callers</span>
+							<div class="spacer"></div>
+							<button
+								id="forgiveAllBtn"
+								type="button"
+								class="btn btn--outline"
+								data-help="Wipe every caller's strike history, putting everyone back on rung 1. Their current timeouts still run out normally."
+							>
+								Forgive everyone
+							</button>
+						</div>
+						<div class="table-wrap">
+							<table id="strikeBoardTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col" data-sort="ip" data-sort-type="text">Caller</th>
+										<th
+											scope="col"
+											data-sort="strikes"
+											data-sort-type="num"
+											data-sort-default="desc"
+											data-help="How many throttles this caller has earned, after decay has worn the older ones off."
+										>
+											Strikes
+										</th>
+										<th
+											scope="col"
+											data-sort="tier"
+											data-sort-type="num"
+											data-help="Which rung of the ladder their next throttle will use."
+										>
+											Rung
+										</th>
+										<th
+											scope="col"
+											data-sort="status"
+											data-sort-type="text"
+											data-help="Whether they are serving a timeout at this moment, and how much of it is left."
+										>
+											Status
+										</th>
+										<th
+											scope="col"
+											data-sort="decay"
+											data-sort-type="num"
+											data-help="How long until they drop a rung, if they stop now."
+										>
+											Drops a rung in
+										</th>
+										<th scope="col" data-sort="last" data-sort-type="num">Last strike</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Client rules (by User-Agent)</h3>
+						<p class="form__hint">
+							For the bot you do not want to ban, but do want to slow down. Rules are checked in the
+							order they are listed and the first match wins.
+						</p>
+						<p class="form__hint">
+							<em>Examples:</em> <code>python-requests</code> as a <strong>cooldown</strong> of
+							<code>2</code> — a script using the default library gets one request every two seconds.
+							<code>GreedyScraper</code> as a <strong>burst</strong> of <code>30</code> per
+							<code>60</code> — a known scraper gets a half-minute's work then waits.
+						</p>
+						<div class="form__row">
+							<label
+								class="switch"
+								data-help="Stops every client rule at once without deleting any of them. Each rule also has its own on/off switch in the table below."
+							>
+								<input type="checkbox" id="uaRulesEnabled" />
+								<span class="switch__label">Client rules enabled</span>
+							</label>
+						</div>
+						<form id="uaRuleForm" class="form">
+							<input type="hidden" id="uaRuleId" value="" />
+							<div class="form__row">
+								<input
+									id="uaRuleNeedle"
+									class="input"
+									type="text"
+									placeholder="User-Agent text, e.g. python-requests"
+									data-help="The text to look for in the caller's User-Agent header. With 'contains' you only need a distinctive fragment — 'python-requests' catches 'python-requests/2.31.0'."
+									required
+								/>
+								<select
+									id="uaRuleMode"
+									class="input input--select input--w130"
+									aria-label="Match mode"
+									data-help="'Contains' looks for your text anywhere in the User-Agent and is what you want almost always. 'Exact' matches the whole string. 'Regex' is the full-power form."
+								>
+									<option value="contains">Contains</option>
+									<option value="exact">Exact</option>
+									<option value="regex">Regex</option>
+								</select>
+								<select
+									id="uaRuleKind"
+									class="input input--select input--w150"
+									aria-label="Limit type"
+									data-help="Burst: N requests per P seconds — good for a bot that works in batches.&#10;Cooldown: a minimum gap between requests — good for a bot that hammers steadily."
+								>
+									<option value="burst">Burst allowance</option>
+									<option value="cooldown">Cooldown between requests</option>
+								</select>
+								<select
+									id="uaRuleScope"
+									class="input input--select input--w150"
+									aria-label="Scope"
+									data-help="Per IP: each address using this client gets its own allowance. The safe default.&#10;&#10;Shared: every address using this User-Agent draws on ONE allowance. The only thing that works on a bot that rotates IPs — but it also means one abuser of a common User-Agent slows down everyone else using it."
+								>
+									<option value="ip">Per IP</option>
+									<option value="global">Shared by all IPs</option>
+								</select>
+							</div>
+							<div class="form__row" id="uaBurstFields">
+								<div class="form__field">
+									<label class="form__label" for="uaRuleLimit">Requests allowed</label>
+									<input id="uaRuleLimit" class="input" type="number" min="1" value="10" />
+								</div>
+								<div class="form__field">
+									<label class="form__label" for="uaRulePeriod">Per (seconds)</label>
+									<input id="uaRulePeriod" class="input" type="number" min="1" value="60" />
+								</div>
+							</div>
+							<div class="form__row" id="uaCooldownFields" hidden>
+								<div class="form__field">
+									<label class="form__label" for="uaRuleCooldown">Seconds between requests</label>
+									<input
+										id="uaRuleCooldown"
+										class="input"
+										type="number"
+										min="0.1"
+										step="0.1"
+										value="2"
+									/>
+								</div>
+							</div>
+							<div class="form__row">
+								<input
+									id="uaRuleMessage"
+									class="input"
+									type="text"
+									placeholder="Message for this client (optional)"
+									data-help="What this bot is told when it goes too fast. Unlike a request filter, saying so is the POINT here — a cooperative bot can only respect a limit it has been told about. Leave it empty for an automatic description of the limit."
+								/>
+								<input
+									id="uaRuleNote"
+									class="input input--w220"
+									type="text"
+									placeholder="Note (private)"
+								/>
+								<button type="submit" class="btn btn--filled" id="uaRuleSubmit">Add rule</button>
+								<button type="button" class="btn btn--outline" id="uaRuleCancel" hidden>Cancel</button>
+							</div>
+						</form>
+						<div class="table-wrap">
+							<table id="uaRulesTable" class="table">
+								<thead>
+									<tr>
+										<th scope="col" data-sort="needle" data-sort-type="text">Matches</th>
+										<th scope="col" data-sort="kind" data-sort-type="text">Limit</th>
+										<th
+											scope="col"
+											data-sort="scope"
+											data-sort-type="text"
+											data-help="Whether each IP gets its own allowance, or all of them share one."
+										>
+											Scope
+										</th>
+										<th scope="col" data-sort="message" data-sort-type="text">Message</th>
+										<th
+											scope="col"
+											data-sort="hits"
+											data-sort-type="num"
+											data-sort-default="desc"
+											data-help="How many requests this rule has judged, and how many of those it turned away. A rule that refuses nothing is either generous enough to be pointless, or is matching a bot that already behaves."
+										>
+											Allowed / refused
+										</th>
+										<th scope="col" data-sort="last" data-sort-type="num">Last seen</th>
+										<th scope="col"></th>
+									</tr>
+								</thead>
+								<tbody></tbody>
+							</table>
+						</div>
+					</div>
+
+					<div class="card">
+						<h3 class="card__title">Try a User-Agent against these rules</h3>
+						<p class="form__hint">
+							Paste a User-Agent from the live feed or the fingerprints table to see which rule would
+							catch it — <strong>before</strong> a rule goes live and starts limiting the wrong client.
+						</p>
+						<form id="uaTestForm" class="form">
+							<div class="form__row">
+								<input
+									id="uaTestValue"
+									class="input"
+									type="text"
+									placeholder="e.g. python-requests/2.31.0"
+									aria-label="User-Agent to test"
+									required
+								/>
+								<label
+									class="switch"
+									data-help="Also judges whatever is currently typed into the form above, so you can check a rule before saving it."
+								>
+									<input type="checkbox" id="uaTestDraft" checked />
+									<span class="switch__label">Include the rule I am writing</span>
+								</label>
+								<button type="submit" class="btn btn--filled">Test</button>
+							</div>
+						</form>
+						<div id="uaTestResult" hidden></div>
+					</div>
+				</section>
+
 				<!-- Traffic chart -->
 				<section id="section-traffic" class="section" aria-labelledby="trafficHeading">
 					<div class="section__header">
@@ -1497,6 +1885,16 @@
 									<span class="tarpit-cat__text">
 										<strong>Sent a ROBLOSECURITY cookie</strong>
 										<span class="text-dim">Never valid here, but sometimes a genuine mistake.</span>
+									</span>
+								</label>
+								<label class="tarpit-cat">
+									<input type="checkbox" class="tarpit-cat__box" data-category="user_agent_rule" />
+									<span class="tarpit-cat__text">
+										<strong>Hit a client (User-Agent) rule</strong>
+										<span class="text-dim"
+											>⚠ These are usually cooperative bots being asked to slow down. Holding them
+											punishes a client that would have obeyed the limit anyway.</span
+										>
 									</span>
 								</label>
 						</div>
