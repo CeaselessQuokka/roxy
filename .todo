@@ -1,0 +1,29 @@
+actionable detailed diagnostics as a proxy progresses, and make a suggestion based off of that diagnostic to change config settings, add to filters, remove fromt filters, etc., or at least a detailed diagnostic that I can give you to adjust in the future or me. But it would be nice if it could do it in real-time basically. A simple way to view "recommended changes" that show what config setting to set to, what filter to add or remove, change tarpit in what, stuff like that. Because right now "Roblox has rate-limited us 579 time(s). The cache has already kept 21,889 request(s) away from them — raise the TTL on the busiest endpoint to keep more." is saying this, meaning we still are getting really rate limited by Roblox and it's not even 50k requests.
+
+Can you please remake this site to be absolutely bulletproof in security, have truly in depth, easy to use, dashboard. That gives every necessary statistic, a way to view everything, just a truly groundbreaking dashboard and insight system so I can see what is going on with the proxy. 
+
+Here is the key to the server for you to run commands: ""
+
+please denote everything you change, what files you add, remove, change, what settings you use and why (like the spec files for the www service to restart it, the nginx config, etc. I want to see what makes a truly bulletproof, smart website all the way through. I want this to be the best, smartest, safest, proxy there is for Roblox requests. I want it modern, powerful, intuitive, secure, clean, organized. I want to truly learn from this codebase. Please remake it using FastAPI (and I believe Uvicorn)? I want to learn FastAPI, Uvicorn, correct web habits, tarpits, admin controls, diagnostics. But everything on steroids
+
+The admin dashboard should be a revolutionary dashboard in terms of diagnostics, utility, UX/QoL, functionality, and visual appearance. We want something beautiful, intuitive to look at and understand
+
+Note: there should only be one active token, if we rotate roblox tokens, roblox will severely throttle or even ban our ip
+
+We are using dataimpulse I believe it's called for IP rotation every now and then (note we should *never* send our token over the IP rotators, just let that be request directly to them) I want to make sure how much we are using so it'd be nice if we tracked it on our end so I can see how much we are sending and adjust how often we hit AI rotation instead just in case we are using too much data
+
+This needs to work with multiple threads, so we have to have a file that we keep the mind in size of, but we have a of disk space, but want to make sure the file is efficient to read and write to avoid major slow downs and such
+
+The included next-gen diagnostic suggestions should look into high request fill times, us being rejected, server errors, potential bot attacks, etc.; I want to also have a way to help with spam protection, if some starts spam requesting over an amount of time. Also a way for an LLM to be able to easily review all suggestions and potential issues (like a json file of this data so it can make any changes to code it think it needs to based off the diagnostics). Stuff like this to make this a super powerful site, with next-universlal-defacto level admin panel with actional diagnostics that truly, in time, reads all data to make powerful, in depth, config and maybe other suggestions. I want to be able to edit anything, easily, and with complete understanding of what this setting does and what it will do if i lower it, higher it, set it so some other dropdown value, etc..
+
+I want everything beautifully organganized and intuitive
+
+Please make a genuinely useful, and detailed "Check Proxy Health" button
+
+No emdashes
+
+Everything in USA English spelling
+
+Everything must be explained down to the T so an admin knows how to use the dashboard and its tools, and the users know how to use the proxy
+
+Have Opus or something going through the entire site and have it do a Remake plan with all the existing features but more and better, and then give that to Fable 5.1 to implement AND iterate on
