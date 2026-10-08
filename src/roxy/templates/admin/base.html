@@ -1,0 +1,108 @@
+{#-
+  Base layout of every admin dashboard page (plan 14.1, 14.4 to 14.10, 9.2).
+
+  What this is
+    The page shell: head (styles, the import map, the one entry module), the skip link, the sidebar, the top bar,
+    the service banners, the page header with "How to read this page", the content block, and the page-wide
+    overlays (command palette, shortcuts, session-expired dialog, drawer, toasts, phone menu, pause and
+    emergency-limit dialogs). Pages extend it and fill `content`.
+
+  Why it exists
+    Every page must look, behave and announce itself the same way, and the security rules of plan 9.2 must hold on
+    all of them: the only scripts are module scripts carrying this response's CSP nonce (`csp_nonce`); vendored
+    libraries load through an import map that pins their SRI hashes (static/vendor/VERSIONS.md); no template has an
+    inline `style` attribute or an inline event handler; the CSRF token reaches scripts only through the
+    `csrf-token` meta tag (BREACH-masked per response by the server, plan 9.6) and is sent back as X-CSRF-Token.
+
+  How it works (context contract; every key is optional and has a safe default)
+    page        {"id": nav id from admin/_layout/nav.html, "title", "purpose": one sentence, "how_to_read": text}
+    admin       {"username"}
+    csrf_token  the masked CSRF token for this response
+    session     {"heartbeat_s": 30, "activity_window_s": 60, "heartbeat_url", "login_url": "/admin"}
+    theme       "dark" (default) | "light" | "system";   density: "comfortable" | "dense"
+    time        {"range": "24h", "compare": "off|prev|week|month|year", "from", "to"}
+    status      service state for the banners and top bar buttons (see admin/_layout/banners.html)
+    recs        {"open": n, "critical": n}
+    urls        {"pause", "throttle_all", "stream", "palette", "health_run", "llm_export", "logout", "prefs"}
+    glossary    term id -> {"term", "definition"} (components/glossary.html)
+    env_name, version
+    Blocks: `title`, `page_actions` (buttons in the page header), `how_to_read` (the panel body), `content`.
+
+  What to read next
+    admin/_layout/*.html (each piece of the shell), components/*.html (the macros pages use),
+    static/js/app.js (what boots on every page), and src/roxy/admin/gallery.py (a page that uses everything).
+-#}
+{%- set sess = session if session is defined and session else {} -%}
+{%- set u = urls if urls is defined and urls else {} -%}
+{%- set VENDOR = {
+  "htmx": ("vendor/htmx-2.0.11/htmx.esm.js", "sha384-MGpLJI+YdNF+gTEwPJkKrb2WL70Ce3qnYw+YP2Hy3U+AX6oRl45HdZa9/W/7ROZr"),
+  "alpine": ("vendor/alpine-csp-3.17.4/module.esm.min.js", "sha384-1iUT5Gr1H+nzOhvZHzMtH1F8+Hn/P6+jPCmpGGd++NA0IS5o7zN7GzlQsckdJqMa"),
+  "uplot": ("vendor/uplot-1.6.32/uPlot.esm.js", "sha384-iUdBlEO5qc07+gOz+3rq/Besyud+KVIxM+xJEuUBObxLG3C/Dlkz8OYuPUcPrCGP"),
+} -%}
+{%- set UPLOT_CSS = ("vendor/uplot-1.6.32/uPlot.min.css", "sha384-IfV0B7MIOYuO95kO9G5ySKPz/85zqFNOAs8iy4tkK5zd9izhJAB8b7lHrwYqqmYE") -%}
+{%- set MODULES = ["app", "htmx_setup", "net", "session", "sse", "live_tail", "palette", "charts", "tables", "theme",
+                   "tooltip", "toast", "dialog", "format", "components", "dom"] -%}
+{%- set imports = {} -%}
+{%- for name in MODULES %}{% set _ = imports.update({"roxy/" ~ name: static_url("js/" ~ name ~ ".js")}) %}{% endfor -%}
+{%- set integrity = {} -%}
+{%- for name, pair in VENDOR.items() %}{% set _ = imports.update({"vendor/" ~ name: static_url(pair[0])}) %}{% set _ = integrity.update({static_url(pair[0]): pair[1]}) %}{% endfor -%}
+<!doctype html>
+<html lang="en" data-theme="{{ theme|default('dark') }}" data-density="{{ density|default('comfortable') }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="dark light">
+  <meta name="csrf-token" content="{{ csrf_token|default('') }}">
+  <title>{% block title %}{{ page.title if page is defined and page else "Dashboard" }}{% endblock %} | Roxy Admin</title>
+  <link rel="stylesheet" href="{{ static_url('css/tokens.css') }}">
+  <link rel="stylesheet" href="{{ static_url(UPLOT_CSS[0]) }}" integrity="{{ UPLOT_CSS[1] }}">
+  <link rel="stylesheet" href="{{ static_url('css/layout.css') }}">
+  <link rel="stylesheet" href="{{ static_url('css/components.css') }}">
+  <link rel="stylesheet" href="{{ static_url('css/print.css') }}" media="print">
+  <script type="importmap" nonce="{{ csp_nonce }}">{{ {"imports": imports, "integrity": integrity}|tojson }}</script>
+  <script type="module" nonce="{{ csp_nonce }}" src="{{ static_url('js/app.js') }}"></script>
+</head>
+<body class="app"
+      data-heartbeat-s="{{ sess.heartbeat_s or 30 }}" data-activity-window-s="{{ sess.activity_window_s or 60 }}"
+      data-heartbeat-url="{{ sess.heartbeat_url or '/admin/api/v1/auth/heartbeat' }}" data-login-url="{{ sess.login_url or '/admin' }}"
+      {% if u.stream %}data-stream-url="{{ u.stream }}" {% endif %}{% if u.prefs %}data-prefs-url="{{ u.prefs }}" {% endif %}data-page="{{ page.id if page is defined and page else '' }}">
+  <a class="skip-link" href="#main">Skip to the main content</a>
+  {% include "admin/_layout/icons.html" %}
+  <div class="shell" data-shell>
+    {% include "admin/_layout/sidebar.html" %}
+    <div class="shell__main">
+      {% include "admin/_layout/topbar.html" %}
+      {% include "admin/_layout/banners.html" %}
+      <main class="main" id="main" tabindex="-1">
+        {% block page_header %}
+        <header class="page-header">
+          <div class="page-header__titles">
+            <h1 class="page-header__title">{{ page.title if page is defined and page else "Roxy" }}</h1>
+            {% if page is defined and page and page.purpose %}<p class="page-header__purpose">{{ page.purpose }}</p>{% endif %}
+          </div>
+          <div class="page-header__actions">{% block page_actions %}{% endblock %}</div>
+        </header>
+        <details class="how-to-read" id="how-to-read" data-remember="how-to-read:{{ page.id if page is defined and page else 'page' }}">
+          <summary><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-book"></use></svg><span>How to read this page</span><svg class="icon how-to-read__chevron" aria-hidden="true" focusable="false"><use href="#i-chevron-down"></use></svg></summary>
+          <div class="how-to-read__body prose">
+            {% block how_to_read %}<p>{{ page.how_to_read if page is defined and page and page.how_to_read else "Hover or focus any underlined term or question mark for a plain-language definition." }}</p>{% endblock %}
+          </div>
+        </details>
+        {% endblock %}
+        {% block content %}{% endblock %}
+      </main>
+      <footer class="app-footer">
+        <span>Roxy{% if version is defined and version %} {{ version }}{% endif %}</span>
+        <a href="/admin/help">Help</a>
+        <button type="button" class="link-btn" data-shortcuts-open>Keyboard shortcuts</button>
+      </footer>
+    </div>
+  </div>
+  {% include "admin/_layout/mobile_nav.html" %}
+  {% include "admin/_layout/palette.html" %}
+  {% include "admin/_layout/shortcuts.html" %}
+  {% include "admin/_layout/control_dialogs.html" %}
+  {% include "admin/_layout/overlays.html" %}
+</body>
+</html>

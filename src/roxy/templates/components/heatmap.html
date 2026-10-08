@@ -1,0 +1,62 @@
+{#-
+  Heatmap with its own table alternative (plan 14.5: "hour of day by weekday, and endpoint by time").
+
+  What: `heatmap(id, title, rows, cols, values)` draws a grid of colored cells where darker means more, with a
+  "Show numbers" switch that turns the same grid into a readable number table.
+  Why: a picture of 168 cells is useless to a screen reader, and a second hidden table drifts from the picture.
+  Here the picture IS a real <table> with row and column headers and the number in every cell (visually hidden
+  until "Show numbers" is on), so assistive technology always reads the exact data the eye sees (plan 14.9).
+  How: each value maps to one of 9 color levels, `heat-0` (zero) to `heat-8` (the maximum), from the --heat-* tokens;
+  levels are classes, never inline styles (the CSP forbids those). `col_labels_every` shows every Nth column label
+  so 24 hours fit on a phone; the other labels stay available to screen readers. Hovering a cell shows its exact
+  value (`data-tip`, static/js/tooltip.js).
+-#}
+{% from "components/badges.html" import help_dot %}
+{% from "components/format.html" import num %}
+
+{% macro heatmap(id, title, rows, cols, values, unit="requests", summary="", help=None, level=3,
+                 corner="", col_labels_every=1) -%}
+{%- set ns = namespace(hi=0) -%}
+{%- for row in values -%}{%- for v in row -%}{%- if v is not none and v > ns.hi -%}{%- set ns.hi = v -%}{%- endif -%}{%- endfor -%}{%- endfor -%}
+<figure class="heatmap" id="{{ id }}" aria-labelledby="{{ id }}-title">
+  <figcaption class="heatmap__head">
+    <span class="chart__titles">
+      <h{{ level }} class="chart__title" id="{{ id }}-title">{{ title }}</h{{ level }}>
+      {% if help %}{{ help_dot(title, help) }}{% endif %}
+    </span>
+    <button type="button" class="btn btn--sm btn--ghost" data-heatmap-numbers aria-pressed="false" aria-controls="{{ id }}-table">Show numbers</button>
+  </figcaption>
+  {% if summary %}<p class="heatmap__summary" id="{{ id }}-summary">{{ summary }}</p>{% endif %}
+  <div class="table-scroll heatmap__scroll" tabindex="0" role="region" aria-labelledby="{{ id }}-title">
+    <table class="heatmap__table" id="{{ id }}-table"{% if summary %} aria-describedby="{{ id }}-summary"{% endif %}>
+      <caption class="sr-only">{{ title }}, {{ unit }} per cell</caption>
+      <thead>
+        <tr>
+          <td class="heatmap__corner">{{ corner }}</td>
+          {% for c in cols %}
+          <th scope="col" class="heatmap__col{% if loop.index0 % col_labels_every %} heatmap__col--minor{% endif %}"><span>{{ c }}</span></th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        {% set row_index = loop.index0 %}
+        <tr>
+          <th scope="row" class="heatmap__row">{{ r }}</th>
+          {% for v in values[row_index] %}
+          {%- if v is none or v <= 0 or ns.hi <= 0 -%}{%- set lvl = 0 -%}
+          {%- else -%}{%- set lvl = [[((v / ns.hi) * 8)|round(0, "ceil")|int, 1]|max, 8]|min -%}{%- endif -%}
+          <td class="heat heat-{{ lvl }}" data-tip="{{ r }}, {{ cols[loop.index0] }}: {{ num(v) }} {{ unit }}"><span class="heat__value">{{ num(v) }}</span></td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="heatmap__legend" aria-hidden="true">
+    <span>Fewer</span>
+    {% for lvl in range(9) %}<span class="heat-swatch heat-{{ lvl }}"></span>{% endfor %}
+    <span>More (up to {{ num(ns.hi) }} {{ unit }})</span>
+  </div>
+</figure>
+{%- endmacro %}

@@ -1,0 +1,68 @@
+{#-
+  Navigation model: the one list of dashboard pages, their groups, icons and shortcuts.
+
+  What: `NAV` (groups of pages, in sidebar order), `PAGES` (the same pages flattened), `RANGES` (time range presets,
+  plan 14.2) and `COMPARES` (comparison choices), plus `page_href(id)`.
+  Why: the sidebar, the phone menu, the command palette and the shortcut overlay must list the same pages with the
+  same names; one list here means they can never disagree. Page ids are the anchors of DESIGN.md section 9.
+  How: imported with `{% from "admin/_layout/nav.html" import NAV, PAGES, RANGES, COMPARES, page_href %}`.
+  Page URLs are `/admin/<id>`; `keys` are the plan 14.6 "g" shortcuts.
+-#}
+{% set NAV = [
+  {"id": "monitor", "label": "Monitor", "items": [
+    {"id": "overview", "label": "Overview", "icon": "overview", "keys": "g o",
+     "about": "Status, key numbers and what needs attention"},
+    {"id": "recommendations", "label": "Recommendations", "icon": "bulb", "keys": "g r",
+     "about": "Evidence-backed changes you can preview, apply and undo"},
+    {"id": "traffic", "label": "Traffic", "icon": "activity", "keys": "",
+     "about": "Requests, bytes, status codes and trends over time"},
+    {"id": "live", "label": "Live", "icon": "live", "keys": "g l",
+     "about": "Every request as it happens"}]},
+  {"id": "upstream-group", "label": "Upstream", "items": [
+    {"id": "upstream", "label": "Upstream", "icon": "upstream", "keys": "g u",
+     "about": "Roblox health, 429s, buckets, breakers and cooldowns"},
+    {"id": "egress", "label": "Egress", "icon": "globe", "keys": "",
+     "about": "Direct, credential and rotator usage and quota"},
+    {"id": "cache", "label": "Cache", "icon": "database", "keys": "g c",
+     "about": "Hit ratio, rules, the cache browser and purges"},
+    {"id": "endpoints", "label": "Endpoints", "icon": "endpoints", "keys": "",
+     "about": "Every endpoint template with volume, 429s and latency"}]},
+  {"id": "defense", "label": "Defense", "items": [
+    {"id": "clients", "label": "Clients", "icon": "users", "keys": "",
+     "about": "Places and IPs, their rates, refusals and bot scores"},
+    {"id": "protection", "label": "Protection", "icon": "shield", "keys": "g p",
+     "about": "Throttles, bans, filters, spam detectors and the tarpit"},
+    {"id": "security", "label": "Security", "icon": "lock", "keys": "",
+     "about": "Logins, probes, fingerprints and sessions"}]},
+  {"id": "operate", "label": "Operate", "items": [
+    {"id": "health", "label": "Health", "icon": "heart", "keys": "",
+     "about": "Run the health check and compare runs"},
+    {"id": "settings", "label": "Settings", "icon": "sliders", "keys": "g s",
+     "about": "Every runtime setting with history and import or export"},
+    {"id": "credential", "label": "Credential", "icon": "key", "keys": "",
+     "about": "The one Roblox credential: status, budget and allowlist"},
+    {"id": "data", "label": "Data", "icon": "disk", "keys": "",
+     "about": "Storage, retention, resets, backups and exports"},
+    {"id": "audit", "label": "Audit", "icon": "clipboard", "keys": "",
+     "about": "Who changed what, when and why"},
+    {"id": "system", "label": "System", "icon": "server", "keys": "",
+     "about": "Workers, leader, jobs, errors and versions"}]}
+] %}
+
+{% set HELP_PAGE = {"id": "help", "label": "Help", "icon": "help", "keys": "",
+                    "about": "Admin guide, glossary and keyboard shortcuts"} %}
+
+{% set PAGES = (NAV|map(attribute="items")|sum(start=[])) + [HELP_PAGE] %}
+
+{% set RANGES = [
+  ("live", "Live", "Last 15 minutes, streaming"), ("1h", "1 hour", "Last hour"), ("6h", "6 hours", "Last 6 hours"),
+  ("24h", "24 hours", "Last 24 hours"), ("7d", "7 days", "Last 7 days"), ("30d", "30 days", "Last 30 days"),
+  ("90d", "90 days", "Last 90 days"), ("1y", "1 year", "Last year"), ("all", "All", "All time")
+] %}
+
+{% set COMPARES = [
+  ("off", "No comparison"), ("prev", "Previous period"), ("week", "Same period last week"),
+  ("month", "Same period last month"), ("year", "Same period last year")
+] %}
+
+{% macro page_href(id) -%}/admin/{{ id }}{%- endmacro %}

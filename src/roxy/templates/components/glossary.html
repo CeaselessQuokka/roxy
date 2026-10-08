@@ -1,0 +1,21 @@
+{#-
+  Glossary term (plan 14.5 and 14.7).
+
+  What: `term("cooldown")` renders the word with a dotted underline; hovering or focusing it shows the definition,
+  and clicking opens the term's entry on the Help page (`/admin/help#term-cooldown`).
+  Why: plan principle P2: nothing on screen is jargon without a definition one hover away. The definitions come
+  from ONE file, docs/glossary.yml, so the tooltip, the Help page and the plan's glossary say the same thing.
+  How: the page context provides `glossary` (term id -> {"term", "definition"}), loaded by
+  `roxy.admin.gallery.load_glossary()`; import this file `with context` so the macro can see it, or pass
+  `entries=` explicitly. The definition rides in `data-def`, and static/js/tooltip.js shows it in the shared tooltip
+  (connected with aria-describedby while visible). An unknown id renders the plain text, never a broken link.
+-#}
+{% macro term(id, text=None, entries=None, help_href="/admin/help") -%}
+{%- set source = entries if entries is not none else (glossary if glossary is defined else {}) -%}
+{%- set entry = source.get(id) if source else None -%}
+{%- if entry -%}
+<a class="gloss" href="{{ help_href }}#term-{{ id }}" data-def="{{ entry.definition }}">{{ text or entry.term }}</a>
+{%- else -%}
+<span class="gloss gloss--unknown">{{ text or id }}</span>
+{%- endif -%}
+{%- endmacro %}

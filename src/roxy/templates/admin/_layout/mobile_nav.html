@@ -1,0 +1,60 @@
+{#-
+  Phone navigation (plan 14.8): a bottom bar with the three things the owner must reach in one tap from a phone
+  (Overview, Recommendations, Health) plus Menu, which opens a bottom sheet with every page and the emergency limit.
+
+  Only shown below the phone breakpoint (layout.css); every target is at least 44 by 44 px. The sheet is a modal
+  <dialog> opened by static/js/dialog.js, so it traps focus and closes with Escape or a tap outside.
+  Context: `page.id`, `recs`, `status`, `theme`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "admin/_layout/nav.html" import NAV, HELP_PAGE, page_href %}
+{% set current = page.id if page is defined and page else "" %}
+{% set rc = recs if recs is defined and recs else {} %}
+{% set st = status if status is defined and status else {} %}
+<nav class="mobile-nav" aria-label="Quick navigation">
+  <a class="mobile-nav__item" href="{{ page_href('overview') }}"{% if current == "overview" %} aria-current="page"{% endif %}>{{ icon("overview") }}<span>Overview</span></a>
+  <a class="mobile-nav__item" href="{{ page_href('recommendations') }}"{% if current == "recommendations" %} aria-current="page"{% endif %}>
+    {{ icon("bulb") }}<span>Advice<span class="sr-only"> (recommendations){% if rc.open %}, {{ rc.open }} open{% endif %}</span></span>
+    {% if rc.open %}<span class="count-badge count-badge--dot{% if rc.critical %} count-badge--bad{% endif %}" aria-hidden="true">{{ rc.open }}</span>{% endif %}
+  </a>
+  <a class="mobile-nav__item" href="{{ page_href('health') }}"{% if current == "health" %} aria-current="page"{% endif %}>{{ icon("heart") }}<span>Health</span></a>
+  <button type="button" class="mobile-nav__item" data-dialog-open="nav-sheet" aria-haspopup="dialog">{{ icon("menu") }}<span>Menu</span></button>
+</nav>
+
+<dialog class="sheet" id="nav-sheet" aria-labelledby="nav-sheet-title">
+  <div class="sheet__grip" aria-hidden="true"></div>
+  <header class="sheet__head">
+    <h2 class="sheet__title" id="nav-sheet-title">Menu</h2>
+    <button type="button" class="icon-btn" data-dialog-close aria-label="Close the menu">{{ icon("x") }}</button>
+  </header>
+  <div class="sheet__body">
+    <div class="sheet__actions">
+      <button type="button" class="btn{% if st.throttle_all %} btn--warn-soft{% endif %}" data-dialog-open="dlg-throttle-all" aria-haspopup="dialog">{{ icon("gauge") }}<span>Emergency limit{% if st.throttle_all %} (on){% endif %}</span></button>
+      <button type="button" class="btn" data-palette-open aria-haspopup="dialog">{{ icon("search") }}<span>Search</span></button>
+    </div>
+    {% for group in NAV %}
+    <h3 class="sheet__group" id="sheet-{{ group.id }}">{{ group.label }}</h3>
+    <ul class="sheet__list" aria-labelledby="sheet-{{ group.id }}">
+      {% for item in group["items"] %}
+      <li><a class="sheet__link" href="{{ page_href(item.id) }}"{% if item.id == current %} aria-current="page"{% endif %}>{{ icon(item.icon) }}<span>{{ item.label }}</span></a></li>
+      {% endfor %}
+    </ul>
+    {% endfor %}
+    <ul class="sheet__list">
+      <li><a class="sheet__link" href="{{ page_href(HELP_PAGE.id) }}"{% if current == "help" %} aria-current="page"{% endif %}>{{ icon("help") }}<span>Help</span></a></li>
+    </ul>
+    <div class="sheet__theme" role="group" aria-labelledby="sheet-theme-label">
+      <p class="field__label" id="sheet-theme-label">Theme</p>
+      <div class="segmented segmented--full">
+        {% for value, label, ic in [("system", "System", "monitor"), ("dark", "Dark", "moon"), ("light", "Light", "sun")] %}
+        <button type="button" class="segmented__item" data-theme-set="{{ value }}" aria-pressed="{{ 'true' if (theme|default('dark')) == value else 'false' }}">{{ icon(ic) }}<span>{{ label }}</span></button>
+        {% endfor %}
+      </div>
+    </div>
+    <form class="sheet__account" method="post" data-logout
+          action="{{ (urls.logout if urls is defined and urls and urls.logout) or '/admin/api/v1/auth/logout' }}">
+      <p class="muted">Signed in as <strong>{{ admin.username if admin is defined and admin else "admin" }}</strong></p>
+      <button type="submit" class="btn">{{ icon("logout") }}<span>Log out</span></button>
+    </form>
+  </div>
+</dialog>

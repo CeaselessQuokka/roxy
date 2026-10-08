@@ -19,7 +19,8 @@ How it works
     and change responses by wrapping `send` (to add headers to the `http.response.start` message) or `receive`
     (to count body bytes as they arrive, so a 2 GiB upload is refused after 2 MiB instead of being buffered).
     Facts they learn are stored in `scope["state"]` (`request.state` in a route): `request_id`, `received_ms`,
-    `peer_ip`, `client_ip`, `csp_nonce`, `deadline_at`, `app_ms`.
+    `peer_ip`, `client_ip`, `csp_nonce`, `deadline_at`, `app_ms`. The request id middleware also counts the
+    request in this worker's fleet counters (`count_request`; the proxy route counts its own share as `proxied`).
     Pure ASGI is used instead of Starlette's `BaseHTTPMiddleware`, which runs the app in a separate task and
     buffers through a memory stream: more overhead per request, and it breaks context variables and streaming.
 
@@ -73,6 +74,18 @@ _NGINX_REQUEST_ID = re.compile(rb"[0-9a-f]{32}")
 # --- request id ----------------------------------------------------------------------------------------------------
 
 
+def worker_counters(scope: Scope) -> Any:
+    """This worker's fleet counters (`ctx.heartbeat.counters`, plan row 122), or None before the lifespan made them."""
+    return getattr(getattr(get_app_context(scope), "heartbeat", None), "counters", None)
+
+
+def count_request(scope: Scope) -> None:
+    """Count one request this worker answered (v1 `workers.count_request`, every response including errors)."""
+    counters = worker_counters(scope)
+    if counters is not None:
+        counters.requests += 1  # plain int on the event loop thread: no lock needed
+
+
 class RequestIdMiddleware:
     """Gives every request a ULID, stores it in the state and the log context, and sends `Roxy-Request-Id`."""
 
@@ -92,6 +105,7 @@ class RequestIdMiddleware:
             return
         clock = self._clock(scope)
         request_id = new_request_id(clock)
+        count_request(scope)
         state = get_state(scope)
         state["request_id"] = request_id
         state["received_ms"] = clock.now_ms()

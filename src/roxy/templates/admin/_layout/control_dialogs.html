@@ -1,0 +1,60 @@
+{#-
+  The two global service controls from the top bar, banners, bottom sheet and palette: Pause (parity rows 42, 114)
+  and the Emergency Limit, which is throttle-all (rows 49, 115). Each opens a confirm dialog that says in plain
+  words what will happen, takes the caller-facing message (v1 kept one for each) and a reason for the audit log.
+
+  Posts (form fields, with the X-CSRF-Token header from htmx):
+    urls.pause         paused=1|0, message, reason
+    urls.throttle_all  enabled=1|0, limit, period, message, reason
+  A successful answer should send `HX-Refresh: true` (the banners and buttons change everywhere) or a toast.
+  Context: `status`, `urls`.
+-#}
+{% from "components/dialog.html" import confirm_dialog %}
+{% set st = status if status is defined and status else {} %}
+{% set u = urls if urls is defined and urls else {} %}
+{% if st.paused %}
+{{ confirm_dialog("dlg-pause", "Resume the proxy?", u.pause or "/admin/api/v1/proxy/pause", confirm_label="Resume proxy",
+                  consequences=["Proxy requests are answered normally again, from the cache or from Roblox.",
+                                "The pause banner disappears on every open dashboard within a few seconds."],
+                  reason=True, hidden={"paused": "0"}) }}
+{% else %}
+{% call confirm_dialog("dlg-pause", "Pause the proxy?", u.pause or "/admin/api/v1/proxy/pause", confirm_label="Pause proxy",
+                       danger=True, reason=True, hidden={"paused": "1"},
+                       consequences=["Every proxy request is refused with 503 Service Unavailable and the message below, until you resume.",
+                                     "Cached answers are not served while paused, and nothing is sent to Roblox for callers.",
+                                     "The dashboard, the health check and Roxy's own probes keep working."]) %}
+  <div class="field">
+    <label class="field__label" for="dlg-pause-message">Message shown to callers <span class="muted">(optional)</span></label>
+    <input class="input" id="dlg-pause-message" name="message" maxlength="300" value="{{ st.pause_reason or '' }}" placeholder="Service down for maintenance." aria-describedby="dlg-pause-message-hint">
+    <p class="field__hint" id="dlg-pause-message-hint">Leave it empty for the default message, Service down for maintenance.</p>
+  </div>
+{% endcall %}
+{% endif %}
+
+{% if st.throttle_all %}
+{{ confirm_dialog("dlg-throttle-all", "Turn off the emergency limit?", u.throttle_all or "/admin/api/v1/proxy/throttle-all",
+                  confirm_label="Turn it off", reason=True, hidden={"enabled": "0"},
+                  consequences=["Callers go back to the normal per-IP limits.",
+                                "The count of refused requests stays in the history; the banner disappears."]) }}
+{% else %}
+{% call confirm_dialog("dlg-throttle-all", "Turn on the emergency limit?", u.throttle_all or "/admin/api/v1/proxy/throttle-all",
+                       confirm_label="Turn on the limit", danger=True, reason=True, hidden={"enabled": "1"},
+                       consequences=["Every IP may make at most the number of requests below per period; the rest get 429 with the message.",
+                                     "A softer alternative to pausing: allowed requests are still answered.",
+                                     "Per-IP and per-endpoint limits still apply; bypass IPs are not limited."]) %}
+  <div class="field-row">
+    <div class="field">
+      <label class="field__label" for="dlg-limit-limit">Requests per IP</label>
+      <input class="input input--num" id="dlg-limit-limit" name="limit" inputmode="numeric" value="{{ st.throttle_limit or 1 }}" required aria-required="true">
+    </div>
+    <div class="field">
+      <label class="field__label" for="dlg-limit-period">Per (seconds)</label>
+      <input class="input input--num" id="dlg-limit-period" name="period" inputmode="numeric" value="{{ st.throttle_period or 60 }}" required aria-required="true">
+    </div>
+  </div>
+  <div class="field">
+    <label class="field__label" for="dlg-limit-message">Message shown to callers <span class="muted">(optional)</span></label>
+    <input class="input" id="dlg-limit-message" name="message" maxlength="300" value="{{ st.throttle_reason or '' }}" placeholder="High load; please slow down.">
+  </div>
+{% endcall %}
+{% endif %}

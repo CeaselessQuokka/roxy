@@ -1,0 +1,21 @@
+# roxy-deploy-alert.path: sends the "deploy failed" alert when deploy.sh records a failure (plan 17.4, 17.7).
+#
+# deploy.sh runs as an unprivileged deploy user that may not read the mail credentials or start units other than
+# roxy@blue and roxy@green (plan 9.14). On a failure it writes /var/lib/roxy-deploy/last_failure.json; this path
+# unit notices the new file and starts roxy-alert@deploy-failure.service, which reads it and sends
+# "Roxy: deploy <short sha> failed at step <n>". The alert works even when the release that failed is broken.
+
+[Unit]
+# Shown in `systemctl list-units`.
+Description=Watch for failed Roxy deploys
+
+[Path]
+# Fires when the file is written and closed or moved into place (deploy.sh writes a temporary file and renames
+# it, so a half-written file is never read).
+PathChanged=/var/lib/roxy-deploy/last_failure.json
+# The alert unit to start; the instance name tells alert_on_failure.py to read the deploy failure record.
+Unit=roxy-alert@deploy-failure.service
+
+[Install]
+# Watch from boot on.
+WantedBy=paths.target

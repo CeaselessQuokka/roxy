@@ -1,0 +1,225 @@
+"""Public markers can never switch an egress off: probes for plan C2 item 5 and 19.5 item 2b.
+
+What this is
+    Probes that try to trip the leak guard (which disables the direct or rotator egress fleet-wide until an admin
+    re-enables it) with text any anonymous caller can type: every 24+ character window of the public
+    `TOKEN_PREFIX` warning, of `.ROBLOSECURITY=` followed by it, in every ASCII case, raw and percent-encoded, in
+    the URL, a header and the body; through the guard's matcher, through the real egress clients, and through
+    the whole app. Two probes (strict xfail, finding F1) show that a credential stored with its cookie name in
+    front (`.ROBLOSECURITY=_|WARNING...`, the form browser tools copy) makes that public text "secret", so any
+    caller can disable every egress.
+
+Why it exists
+    The leak guard's trip is deliberately drastic (C2 item 4). That makes it a denial of service lever unless the
+    matcher only ever matches text that is really secret. `LeakMatcher` strips the public prefix with
+    `str.removeprefix(TOKEN_PREFIX)`, which works only when the stored value starts with exactly that text.
+
+How it works
+    The egress-level probes build `EgressClients` over the test databases with the development override pointing
+    at a loopback mock (nothing leaves the machine). The app-level probes use `confinement_harness.running_app`.
+    A trip is detected by `CredentialLeakBlocked`, `egress.tripped(...)` and the guard counters.
+
+What to read next
+    `src/roxy/egress/credential.py` (`LeakMatcher`, `_validate_value`), `src/roxy/egress/guard.py`,
+    `src/roxy/abuse/checks/auth_smuggling.py` (the ingress half), `tests/security/test_credential_suite.py`.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+import pytest
+from confinement_harness import ADMIN, load_fixture, running_app
+
+from roxy.core.clock import SYSTEM_CLOCK
+from roxy.core.reasons import Egress
+from roxy.core.redact import ROBLOX_COOKIE_NAME, TOKEN_PREFIX, SecretRegistry
+from roxy.egress.clients import EgressClients
+from roxy.egress.errors import AuthSmugglingBlocked
+from roxy.egress.models import OutboundRequest
+
+harness = load_fixture("recording_proxy")
+TIMEOUT = httpx.Timeout(5.0)
+COOKIE_PAIR = ROBLOX_COOKIE_NAME + "="
+PUBLIC_TEXTS = (TOKEN_PREFIX, COOKIE_PAIR + TOKEN_PREFIX, "Cookie: " + COOKIE_PAIR + TOKEN_PREFIX)
+FRAGMENT = "Sharing-this-will-allow-someone-to-log-in"
+"""41 characters of the public warning: no full `TOKEN_PREFIX`, no `.ROBLOSECURITY=`, so ingress lets it pass."""
+
+
+def public_windows() -> Iterator[str]:
+    """Every window of 24, 25, 31 and 48 characters (and the whole text) of each public string."""
+    seen: set[str] = set()
+    for text in PUBLIC_TEXTS:
+        for size in (24, 25, 31, 48, len(text)):
+            for start in range(0, max(1, len(text) - size + 1)):
+                window = text[start : start + size]
+                if len(window) >= 24 and window not in seen:
+                    seen.add(window)
+                    yield window
+
+
+def spellings(text: str) -> tuple[str, ...]:
+    """The text as typed, in both ASCII cases, percent-encoded, and fully percent-encoded."""
+    full = "".join(f"%{byte:02X}" for byte in text.encode())
+    return (text, text.lower(), text.upper(), quote(text, safe=""), full)
+
+
+def out(url: str, method: str = "GET", **kwargs: Any) -> OutboundRequest:
+    return OutboundRequest(method, url, kwargs.pop("headers", {}), kwargs.pop("content", None), TIMEOUT, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _clean_registry() -> Iterator[None]:
+    SecretRegistry.clear()
+    yield
+    SecretRegistry.clear()
+
+
+@pytest.fixture
+def mock() -> Iterator[Any]:
+    with harness.MockUpstream() as server:
+        server.routes["/v1/users/authenticated"] = harness.MockResponse(body=b'{"id": 1}')
+        yield server
+
+
+@pytest.fixture
+async def make_egress(env: Any, dbs: Any, mock: Any) -> AsyncIterator[Callable[..., Awaitable[EgressClients]]]:
+    built: list[EgressClients] = []
+
+    async def factory(**options: Any) -> EgressClients:
+        clients = EgressClients(
+            env=env,
+            settings=options.pop("settings", harness.FakeSettings()),
+            dbs=dbs,
+            clock=SYSTEM_CLOCK,
+            worker_id=f"markers-{len(built)}",
+            environ={"ROXY_TEST_UPSTREAM_BASE": mock.base_url, **options.pop("environ", {})},
+            **options,
+        )
+        built.append(clients)
+        await clients.start()
+        return clients
+
+    yield factory
+    for clients in built:
+        await clients.aclose()
+
+
+# ----------------------------------------------------------------------------------------- normal configuration
+
+
+async def test_public_text_is_never_a_leak_for_the_matcher(make_egress: Any) -> None:
+    """C2 item 5: no window of the public warning or of `.ROBLOSECURITY=<warning>`, in any spelling, matches."""
+    egress = await make_egress()
+    matcher = egress.credential.leak_matcher()
+    assert matcher.active  # the fake credential (prefix plus a secret part) is loaded
+    hits = [
+        spelling
+        for window in public_windows()
+        for spelling in spellings(window)
+        if matcher.matches(spelling.encode()) or matcher.matches(b"x=" + spelling.encode() + b"&y=1")
+    ]
+    assert hits == []
+
+
+async def test_public_text_through_both_egresses_never_disables_them(make_egress: Any, mock: Any) -> None:
+    """The same public text in the URL, a header and the body of real direct and rotator sends: at most an
+    auth smuggling refusal (the full marker), never a leak trip, and both egresses stay enabled."""
+    windows = [*[w for w in public_windows() if len(w) in (24, 31)][::7], FRAGMENT, TOKEN_PREFIX]
+    with harness.RecordingProxy(upstream=mock.address) as proxy:
+        egress = await make_egress(environ={"ROXY_TEST_ROTATOR_PROXY": proxy.url_with_auth("dpuser", "dppw1")})
+        for kind in (Egress.DIRECT, Egress.ROTATOR):
+            sent = refused = 0
+            for window in windows:
+                encoded = quote(window, safe="")
+                for request in (
+                    out(f"https://games.roblox.com/v1/games?note={encoded}"),
+                    out("https://games.roblox.com/v1/x", "POST", content=json.dumps({"n": window}).encode()),
+                    out(
+                        "https://games.roblox.com/v1/x", "POST", content=b"{}", headers={"Content-Type": f"x/{encoded}"}
+                    ),
+                ):
+                    try:
+                        await egress.send(kind, request)
+                        sent += 1
+                    except AuthSmugglingBlocked:
+                        refused += 1
+            assert egress.guard_stats[kind].leak_trips == 0, kind
+            assert egress.is_enabled(kind) == (True, ""), kind
+            assert sent > 0, kind
+            assert refused > 0, kind  # the full marker is still refused: the battery reached the marker check
+
+
+async def test_public_fragments_from_a_caller_never_disable_an_egress(
+    env: Any, credentials_dir: Path, fake_secrets: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through the app: a caller puts 24+ character pieces of the public warning in the query, the body and the
+    path. Ingress lets them through (they are not the full marker), the guard must not treat them as a leak."""
+    async with running_app(env, credentials_dir, fake_secrets, monkeypatch) as run:
+        await run.activate_credential()
+        fragments = [FRAGMENT, TOKEN_PREFIX[2:40], TOKEN_PREFIX[40:-2], TOKEN_PREFIX.lower()[5:60]]
+        for fragment in fragments:
+            run.clock.advance(5)
+            await run.get("/games.roblox.com/v1/games", params={"universeIds": "1", "note": fragment})
+            run.clock.advance(5)
+            await run.request("POST", "/games.roblox.com/v1/games/list", content=json.dumps({"n": fragment}).encode())
+            run.clock.advance(5)
+            await run.get(f"/games.roblox.com/v1/{quote(fragment, safe='')}")
+        assert not run.ctx.egress.tripped(Egress.DIRECT)
+        assert not run.ctx.egress.tripped(Egress.ROTATOR)
+        assert run.ctx.egress.guard_stats[Egress.DIRECT].leak_trips == 0
+        assert len(run.mock.requests) > len(fragments)  # the requests really went out
+
+
+# ------------------------------------------------------------------------------------------- finding F1
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "F1: a credential stored with its cookie name in front (.ROBLOSECURITY=_|WARNING...) is accepted, and "
+        "LeakMatcher.removeprefix(TOKEN_PREFIX) then keeps the public warning text as 'secret': any caller can "
+        "trip the leak guard with public text and disable the direct, then the rotator egress"
+    ),
+)
+async def test_pasted_cookie_pair_keeps_public_text_public(
+    env: Any, credentials_dir: Path, fake_secrets: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bootstrap file holds the cookie as browser tools copy it (`.ROBLOSECURITY=<value>`). An anonymous
+    caller then sends 41 characters of the public warning in a query string, twice."""
+    pasted = COOKIE_PAIR + fake_secrets["roblox_credential"]
+    async with running_app(env, credentials_dir, fake_secrets, monkeypatch, credential_file_text=pasted) as run:
+        assert run.ctx.egress.credential.status().present  # the pair is accepted as the credential
+        statuses = []
+        for _ in range(2):  # the second request is routed to the rotator once direct is switched off
+            run.clock.advance(5)
+            response = await run.get("/games.roblox.com/v1/games", params={"universeIds": "1", "note": FRAGMENT})
+            statuses.append(response.status_code)
+        tripped = (run.ctx.egress.tripped(Egress.DIRECT), run.ctx.egress.tripped(Egress.ROTATOR))
+        assert (tripped, statuses) == ((False, False), [200, 200])
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="F1: CredentialManager.replace accepts `.ROBLOSECURITY=<value>`, and the bad value stays in the matcher",
+)
+async def test_ui_replace_with_cookie_pair_keeps_public_text_public(
+    make_egress: Any, fake_secrets: dict[str, str]
+) -> None:
+    """The admin pastes the pair on the Credential page, then fixes it by pasting the bare value: public text must
+    never match, during the mistake or after the fix (replaced values stay in the matcher, by design)."""
+    egress = await make_egress()
+    pasted = COOKIE_PAIR + fake_secrets["roblox_credential"]
+    try:
+        await egress.credential.replace(pasted, ADMIN, reason="pasted from the browser")
+    except ValueError:
+        return  # refusing (or normalizing) the pair is an acceptable fix
+    during = egress.credential.leak_matcher().matches(FRAGMENT.encode())
+    await egress.credential.replace(fake_secrets["roblox_credential"], ADMIN, reason="fixed")
+    after = egress.credential.leak_matcher().matches(FRAGMENT.encode())
+    assert (during, after) == (False, False)

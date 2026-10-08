@@ -110,6 +110,40 @@ per-phase progress notes and the full parity list are added as the phases land.
 - **Place clients have their own cap.** Client compaction keeps `max_caller_records` place rows per bucket and
   `max_ip_activity_records` IP rows (plan 6.10, 15.3 I).
 
+## Progress notes per phase
+
+### Phase -1 (Tier 0): v1 hotfix, 2026-10-07
+
+- Built on branch `hotfix/v1-phase-minus-1` (commit 3453d66), kept apart from v2 and not merged: a push to `main`
+  deploys v1, so the owner reviews `HOTFIX_NOTES.md` on that branch first.
+- What it does: the credential goes only with GET requests whose exact outbound host and path are on a new allowlist
+  (empty by default) and with Roxy's own probes, carrying only Roxy's fixed header set; every requests session has
+  `trust_env = False`; no fallback to the other method on a 429; `Retry-After` opens a cooldown shared by all workers;
+  cookie responses are never cached; shadow mode (off) for the D1 measurement.
+- Gate: v1 smoke suite 1018 checks, including 135 wire-level credential invariant checks, all passing; the remaining
+  intermittent failures are older timing checks (the WSL clock steps back about 0.9 s every 31 s) and one random-weight
+  check, both pre-existing.
+- Reviews: a correctness reviewer found an allowlist bypass through `%3F` and `%23` in paths and unnormalized cooldown
+  keys (fixed); a defensive verification pass found forwarded caller headers on cookie calls, non-exact allowlist
+  matching and two exposure paths (fixed).
+
+### P0 to P2: skeleton, storage, control plane, 2026-10-07
+
+- Built: the app factory, worker class, internal Unix socket app, lifespan, middleware, logging with redaction, the
+  style checker and word list, CI and a disabled deploy workflow (P0); four WAL databases with writer threads and read
+  pools, the full 6.2 schema, leases with fencing, leader election, heartbeat, batch writer and retention (P1); the
+  settings catalog (495 settings, 50 insight rules, generated `docs/SETTINGS.md`), runtime store with hot reload,
+  audited settings service, rules store and CRUD, and the shared matcher with v1 parity tests (P2).
+- Gate: 3054 tests pass (unit and multi-process with real processes); ruff, ruff format, mypy (strict on core,
+  storage, config, rules) and the style check are clean; `check_style.py REMAKE_PLAN.md` passes; the app boots under
+  gunicorn with `RoxyUvicornWorker` and serves the internal socket while `/internal/version` is 404 on TCP.
+- Reviews: three adversarial reviewers (multi-process, security, spec) filed 33 findings; all were fixed with tests
+  (see "Fix pass after the P0 to P2 reviews" above).
+- Deviations: `roxy.asgi:app` is a small dispatcher that sends requests arriving on the internal Unix socket to the
+  internal app and everything else to `create_app()` (the public app has no `/internal` routes). Bandit's B608 is
+  owned by ruff's identical S608 rule, with every interpolated identifier annotated inline.
+- Open: the CSP Playwright spike (P0 gate item) moves to P11, where the vendored scripts exist.
+
 ## Writing style (plan C5)
 
 - The v1 test suites kept under `tests/` (`smoke_test.py`, `deploy_test.sh`, `boot_check.sh`) are scanned by

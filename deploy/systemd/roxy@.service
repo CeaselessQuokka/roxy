@@ -1,0 +1,191 @@
+# roxy@.service: one color of Roxy v2 (instance "blue" or "green") running under gunicorn (plan 17.1).
+#
+# Installed as /etc/systemd/system/roxy@.service (deploy/install-system.sh). deploy.sh starts the idle color,
+# switches nginx to it, then stops the old one, so both instances run for a few minutes during a deploy and share
+# /var/lib/roxy (leader election, limits and buckets live in the shared SQLite files, plan 5.6).
+# Every directive says why it is here, as plan 17.1 and 18.1 item 8 require. Memory numbers follow DESIGN.md
+# section 0 (909 MB server, no swap), not the 2 GB numbers in plan 6.1 and 17.1.
+
+[Unit]
+# Names the color in `systemctl status`, `systemctl list-units` and alert emails.
+Description=Roxy (%i)
+# Start only after the network is configured (network.target only means the stack exists, not that an address is
+# assigned); Roxy talks to Roblox as soon as it starts.
+After=network-online.target
+# Pull in network-online.target, so the After= above has something to wait for.
+Wants=network-online.target
+# A crash loop must end in the `failed` state so OnFailure= fires: at most 5 starts in 300 s. v1 had
+# StartLimitIntervalSec=0, which on systemd older than 254 meant the alert never fired (v1 notes, section 10).
+StartLimitIntervalSec=300
+# The number of starts allowed inside StartLimitIntervalSec before systemd gives up and marks the unit failed.
+StartLimitBurst=5
+# Email and webhook when this color fails (OnFailure= belongs in [Unit]; systemd ignores it in [Service]).
+# %n is the full unit name, so the alert names roxy@blue.service or roxy@green.service.
+OnFailure=roxy-alert@%n.service
+
+[Service]
+# gunicorn tells systemd "ready" over sd_notify once its master has bound the listeners and started the workers,
+# so `systemctl restart` returns after the pre-start migrations and a real start (or reports the failure); the
+# deploy health gate then waits until the app itself answers ready on the internal socket.
+Type=notify
+# Only the gunicorn master may send sd_notify messages; a worker cannot claim readiness or change the main PID.
+NotifyAccess=main
+# A dedicated unprivileged account (new in v2; v1 ran as the login user ubuntu). nginx reaches the app over
+# loopback TCP, so no shared group with nginx is needed.
+User=roxy
+# The account's own group; the deploy user is a member so it can use the internal socket (mode 0660).
+Group=roxy
+# The release this color serves: a symlink deploy.sh points at /opt/roxy/releases/<sha> before a restart.
+# gunicorn.conf.py and the app are read relative to it, and the app derives its version from the target.
+WorkingDirectory=/opt/roxy/releases/current-%i
+# Shared non-secret configuration (0640 root:roxy). Secrets are never environment variables (plan 9.8).
+EnvironmentFile=/etc/roxy/roxy.env
+# Per-color values, read after roxy.env so they win: ROXY_COLOR, ROXY_BIND (127.0.0.1:8001 or 127.0.0.1:8002) and
+# ROXY_INTERNAL_SOCKET. There is no Environment=ROXY_BIND=...${PORT} line on purpose: systemd does not expand
+# variables from an EnvironmentFile inside Environment= values (plan 17.1).
+EnvironmentFile=/etc/roxy/%i.env
+# Hints written by roxy-nginx-apply from the installed nginx (ROXY_NGINX_WORKER_PROCESSES and
+# ROXY_NGINX_WORKER_CONNECTIONS, plan 15.3 L). The leading "-" makes it optional: before the first nginx apply
+# the file does not exist yet, and the app only uses it for a consistency check (H-NGINX).
+EnvironmentFile=-/etc/roxy/nginx-hints.env
+# Secrets as systemd credentials (plan 9.8): systemd copies each file into a private tmpfs that only this service
+# can read and sets $CREDENTIALS_DIRECTORY; they never appear in the environment or on a command line. Every
+# source file must exist (systemd refuses to start otherwise); an optional one (alert_webhook_url, or rotator_url
+# when the rotator is not used) is created empty, and an empty credential means "not configured".
+# The bootstrap .ROBLOSECURITY value (read only by egress/credential.py, plan C2).
+LoadCredential=roblox_credential:/etc/roxy/credentials/roblox_credential
+# The DataImpulse gateway URL with its username and password (egress/rotator.py).
+LoadCredential=rotator_url:/etc/roxy/credentials/rotator_url
+# The Gmail app password for alert email (notify/mail.py).
+LoadCredential=smtp_password:/etc/roxy/credentials/smtp_password
+# Alert recipient and sender addresses, one per line with to: and from: prefixes.
+LoadCredential=alert_emails:/etc/roxy/credentials/alert_emails
+# Optional webhook URL for alerts (a bearer secret, so a credential and never an env var, D14).
+LoadCredential=alert_webhook_url:/etc/roxy/credentials/alert_webhook_url
+# 32-byte key that encrypts the UI-replaced credential and rotator URL in control.db.
+LoadCredential=credential_encryption_key:/etc/roxy/credentials/credential_encryption_key
+# 32-byte key that encrypts TOTP secrets in control.db.
+LoadCredential=totp_encryption_key:/etc/roxy/credentials/totp_encryption_key
+# 32-byte HMAC key for client IP hashing (plan 9.15, 12.3).
+LoadCredential=ip_hash_key:/etc/roxy/credentials/ip_hash_key
+# Before gunicorn: snapshot control.db when this release has pending expand migrations, then apply them, as the
+# roxy user that owns the files (deploy/prestart.py explains why this is the deploy's step 3). A failure here
+# fails the start, so the deploy health gate fails cleanly and the old color keeps serving.
+ExecStartPre=/opt/roxy/releases/current-%i/.venv/bin/python /opt/roxy/releases/current-%i/deploy/prestart.py
+# gunicorn from the release's own virtual environment, with the config file from the same release.
+# roxy.asgi:app is the listener dispatcher: public app on TCP, internal app on the Unix socket (plan 5.8).
+ExecStart=/opt/roxy/releases/current-%i/.venv/bin/gunicorn -c deploy/gunicorn.conf.py roxy.asgi:app
+# Graceful reload: gunicorn re-reads its config, starts new workers and lets the old ones finish their requests.
+ExecReload=/bin/kill -HUP $MAINPID
+# SIGTERM goes to the master only; it stops accepting, lets workers finish in-flight requests and SWR refreshes
+# (graceful_timeout 30) and runs the lifespan shutdown that flushes metrics and releases leases. Anything still
+# alive when TimeoutStopSec runs out gets SIGKILL, master and workers alike.
+KillMode=mixed
+# The signal for a stop: gunicorn treats SIGTERM as a graceful shutdown.
+KillSignal=SIGTERM
+# 45 s: longer than gunicorn's graceful_timeout (30 s), so systemd never kills a worker gunicorn is still draining
+# (v1 had 20 s against 30 s, plan 2.4).
+TimeoutStopSec=45
+# Starting includes the pre-start migration; a large expand migration on metrics.db can take minutes on this
+# small server, and a start that times out would be reported as a failed deploy.
+TimeoutStartSec=300
+# Restart after a crash, an OOM kill or a failed start, but not after a clean stop (deploy.sh stops the old
+# color on purpose and it must stay stopped).
+Restart=on-failure
+# Wait 3 s between restarts, so a crash loop does not spin the CPU and the start limit above can trip.
+RestartSec=3
+# systemd creates /var/lib/roxy owned by roxy, for the four databases, snapshots and exports (plan 6.1).
+StateDirectory=roxy
+# Owner full access, group roxy read only (the deploy reads nothing here, the audit reads metadata), others none.
+StateDirectoryMode=0750
+# /var/log/roxy owned by roxy, only used if file logs are ever turned on (logs go to the journal by default).
+LogsDirectory=roxy
+# /run/roxy-<color>, created at start and removed at stop, holding internal.sock and gunicorn.ctl (plan 5.8).
+RuntimeDirectory=roxy-%i
+# 0750: the roxy group (the deploy user) may reach the sockets inside; nobody else may even list them.
+RuntimeDirectoryMode=0750
+# Files the service creates are never world-readable (0640 files, 0750 directories).
+UMask=0027
+# Account memory per unit so MemoryHigh and MemoryMax apply and the System page can read memory.current.
+MemoryAccounting=yes
+# Above 320 MB the kernel reclaims this color's memory aggressively before anything is killed. Sized for the
+# 909 MB server without swap (DESIGN.md section 0): two colors overlap during a deploy, and both together must
+# leave room for nginx and the operating system.
+MemoryHigh=320M
+# The hard ceiling: past 420 MB the kernel OOM-kills inside this unit only, and Restart= brings it back.
+MemoryMax=420M
+# At most 256 processes and threads: fork-bomb containment (2 workers with their thread pools need far fewer).
+TasksMax=256
+# Many concurrent sockets per worker (async connections, tarpit holds, upstream pools).
+LimitNOFILE=65536
+# No setuid or file capability can raise privileges, ever.
+NoNewPrivileges=yes
+# A private /tmp and /var/tmp, invisible to other services and removed at stop.
+PrivateTmp=yes
+# No access to hardware devices; /dev only has the pseudo devices (null, zero, urandom, shm).
+PrivateDevices=yes
+# The whole filesystem is read-only for this service, except the paths named in ReadWritePaths and the
+# State, Logs and Runtime directories above.
+ProtectSystem=strict
+# /home, /root and /run/user are invisible; code lives in /opt and state in /var/lib.
+ProtectHome=yes
+# Only the state directory is writable; the code directory is NOT (v1 could write its own code, plan 2.4).
+ReadWritePaths=/var/lib/roxy
+# No writes to /proc/sys or /sys kernel tunables.
+ProtectKernelTunables=yes
+# No kernel module loading or unloading.
+ProtectKernelModules=yes
+# No access to the kernel log buffer.
+ProtectKernelLogs=yes
+# The cgroup tree is read-only (Roxy only reads its own memory.current and cpu.stat).
+ProtectControlGroups=yes
+# No changes to the system clock.
+ProtectClock=yes
+# No changes to the hostname.
+ProtectHostname=yes
+# Other users' processes are invisible in /proc.
+ProtectProc=invisible
+# /proc only shows process directories; /proc/meminfo and /proc/loadavg are hidden, so CPU and memory for the
+# System page come from this unit's own cgroup files (plan 17.1).
+ProcSubset=pid
+# Only IPv4, IPv6 (Roblox, SMTP, the rotator) and Unix sockets (the internal socket, the journal) may be opened.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# No new user, mount, network or other namespaces.
+RestrictNamespaces=yes
+# No realtime scheduling (a runaway realtime thread could starve the machine).
+RestrictRealtime=yes
+# No setuid or setgid files can be created.
+RestrictSUIDSGID=yes
+# The execution domain (personality) cannot be changed.
+LockPersonality=yes
+# System V IPC objects and POSIX message queues of the roxy user are removed when the service stops.
+RemoveIPC=yes
+# No memory that is both writable and executable. Verified compatible with uvloop, zstandard, argon2-cffi and
+# cryptography by tests/deploy/test_deploy_units.py (the app boots under it with systemd-run --user).
+MemoryDenyWriteExecute=yes
+# Allow the system calls a normal service needs...
+SystemCallFilter=@system-service
+# ...minus privileged ones (mounting, rebooting, changing users) and resource limit changes.
+SystemCallFilter=~@privileged @resources
+# ...but with the chown family allowed again: gunicorn chown()s its Unix socket to its own user and group right
+# after binding it. For an unprivileged process that is a no-op, yet ~@privileged removes the system call and
+# the filter would kill the master on its first start (found by tests/deploy/test_deploy_units.py). Giving a
+# file to another user still needs CAP_CHOWN, which this service does not have.
+SystemCallFilter=@chown
+# A system call outside the filter fails with "Operation not permitted" instead of killing the process silently
+# with SIGSYS, so a future library change shows up as a Python traceback in the journal.
+SystemCallErrorNumber=EPERM
+# Only native x86-64 system calls; blocks the 32-bit ABI as a way around the filter above.
+SystemCallArchitectures=native
+# No capabilities at all, not even in the bounding set (the service never needs root powers).
+CapabilityBoundingSet=
+# And none handed to the process at start.
+AmbientCapabilities=
+# IPAddressDeny= and IPAddressAllow= are not set: Roblox addresses change too often to pin (plan 17.1 documents
+# the optional egress restriction).
+# The journal tag, so `journalctl -t roxy-blue` shows one color.
+SyslogIdentifier=roxy-%i
+
+# No [Install] section on purpose: neither color is ever enabled. Which color should run after a reboot changes
+# with every deploy, and the deploy user may not run `systemctl enable` (plan 9.14). roxy-boot.service starts the
+# color nginx points at instead, so `systemctl enable roxy@blue` fails loudly rather than starting the wrong one.

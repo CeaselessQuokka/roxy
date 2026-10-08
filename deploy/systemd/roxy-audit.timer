@@ -1,0 +1,21 @@
+# roxy-audit.timer: runs the permission audit every 6 hours (plan 17.1).
+
+[Unit]
+# Shown in `systemctl list-timers`.
+Description=Roxy permission audit every 6 hours
+
+[Timer]
+# 5 minutes after boot, so the System page has a fresh result soon after a restart.
+OnBootSec=5min
+# Then every 6 hours after the previous run finished.
+OnUnitInactiveSec=6h
+# Spread the start a little so it never lines up with the backup or other timers.
+RandomizedDelaySec=5min
+# Precision of a minute is enough.
+AccuracySec=1m
+# The service this timer starts.
+Unit=roxy-audit.service
+
+[Install]
+# Active from boot once enabled.
+WantedBy=timers.target

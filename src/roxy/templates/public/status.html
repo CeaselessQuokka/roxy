@@ -1,0 +1,70 @@
+{#
+	The public status page `/status` (plan 16.1). Deliberately coarse: one of four states, 24 hourly cells, and
+	plain-language notes. No counts, no IP addresses, no internal names (plan 16.1: nothing that helps attackers).
+	Colors are never the only signal: every state also has its own fill pattern and height in site.css (the legend
+	swatches show the same patterns), and every cell has a text label for screen readers and a tooltip.
+#}
+{% extends "public/base.html" %}
+{% block head %}
+		<title>Roxy Status</title>
+		<meta name="description" content="Is Roxy up? The current state of the Roxy proxy for Roblox web APIs and the last 24 hours." />
+		<meta name="robots" content="index, follow" />
+		<link rel="canonical" href="{{ canonical_origin }}/status" />
+{% endblock %}
+{% block content %}
+			<h1>Roxy status</h1>
+
+			<section class="status-banner state-{{ view.state.value }}" aria-labelledby="current-state">
+				<h2 id="current-state"><span class="dot" aria-hidden="true"></span>{{ view.label }}</h2>
+				<p>{{ view.message }}</p>
+				<p class="muted">Updated <time datetime="{{ view.updated_iso }}">{{ view.updated }}</time>.</p>
+			</section>
+
+			<section class="card" aria-labelledby="history">
+				<h2 id="history">Last 24 hours</h2>
+				<ol class="uptime" aria-label="One cell per hour, oldest first">
+					{% for cell in view.hours %}
+					<li class="cell cell-{{ cell.state }}" title="{{ cell.label }}: {{ cell.text }}"><span class="visually-hidden">{{ cell.label }}: {{ cell.text }}</span></li>
+					{% endfor %}
+				</ol>
+				<p class="uptime-axis" aria-hidden="true"><span>24 hours ago</span><span>Now</span></p>
+				<ul class="legend">
+					{% for state, text in legend %}
+					<li><span class="swatch cell-{{ state }}" aria-hidden="true"></span>{{ text }}</li>
+					{% endfor %}
+				</ul>
+			</section>
+
+			<section class="card" aria-labelledby="notes">
+				<h2 id="notes">Notes</h2>
+				<ul>
+					<li>
+						<strong>Caching:</strong>
+						{% if cache_enabled %}
+						on. Popular answers are reused for about {{ cache_ttl_text }}, so data can be a little old.
+						{% else %}
+						off right now, so every request goes to Roblox.
+						{% endif %}
+					</li>
+					<li>
+						<strong>Rate limits from Roblox:</strong>
+						{% if view.rate_limited is none %}
+						unknown right now.
+						{% elif view.rate_limited %}
+						Roblox is asking Roxy to slow down on some endpoints. You may get older cached answers
+						(<code>Roxy-Cache: STALE</code>) or <code>429</code> with <code>Retry-After</code> for a while.
+						{% else %}
+						none active right now.
+						{% endif %}
+					</li>
+					<li>
+						<strong>Your limit:</strong> {{ limits.requests_text }} every
+						{{ limits.window_text }} per IP address. {{ limits.cache_hits_rule }}
+					</li>
+				</ul>
+				<p>
+					Monitors can poll <a href="/health"><code>/health</code></a> for JSON. The
+					<a href="/docs#7-status-codes-and-what-to-do">guide</a> explains every status code.
+				</p>
+			</section>
+{% endblock %}

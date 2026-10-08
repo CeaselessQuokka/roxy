@@ -1,0 +1,184 @@
+{#-
+  Setting control (plan 14.5 and 15.2): the one editor for a runtime setting, on the Settings page and inline on
+  every feature page.
+
+  What
+    `setting_control(spec, value, save_url="/admin/...", meta={...}, history_url=...)` renders a self-contained
+    form for one `SettingSpec` (roxy/config/spec.py): label, copyable key, the right input for the type (number with
+    unit and range slider, switch, select with option descriptions, duration and size inputs that accept "90s",
+    "15m" or "64 MiB"), default badge, risk badge, "what happens if" text, inline validation, and Save with a
+    reason. "Reset to default" fills in the default (parity row 124); nothing is saved until Save.
+  Why
+    Plan principle P3: the setting's metadata is declared once in Python and every editor is generated from it, so
+    the UI can never offer a value the server does not know. A high-risk value (a `high_risk_if` condition of the
+    spec) needs a reason and an explicit "I understand" before it can be saved (plan 15.1), and the server checks
+    the same rule again, so the browser is a convenience, never the guard.
+  How
+    The form posts with htmx (`hx-post` = save_url, `hx-swap="outerHTML"`): fields `key`, `value` (for a switch the
+    LAST `value` wins: a hidden "0" followed by the checkbox "1"), `reason` and `confirm_high_risk`. The server
+    validates with `roxy.config.catalog.validate_value` and answers with this macro again: `saved=True` after a
+    save, or `error="..."` with the submitted text kept in `value`. Client behavior (dirty state, live validation,
+    slider sync, duration and size previews, the risk warning) is the `settingControl` Alpine component in
+    static/js/components.js, which reads the data-* attributes below; it never evaluates strings as code.
+    meta: {"changed_at": "2026-10-07 14:02", "changed_by": "owner", "reason": "..."} or None.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import risk_badge, default_badge, apply_badge %}
+{% from "components/format.html" import num, bytes as fmt_bytes %}
+
+{%- set _DURATION_UNIT_MS = {"ms": 1, "milliseconds": 1, "seconds": 1000, "s": 1000, "minutes": 60000,
+                             "hours": 3600000} -%}
+
+{% macro _unit_label(spec) -%}
+{%- if spec.unit.startswith("percent") -%}%{{ spec.unit[7:] }}
+{%- elif spec.type == "duration" and not spec.unit -%}seconds
+{%- else -%}{{ spec.unit }}{%- endif -%}
+{%- endmacro %}
+
+{% macro _raw(spec, value) -%}
+{%- if value is none -%}
+{%- elif spec.type in ("list[str]", "list[int]", "list[cidr]") -%}{{ value|join("\n") }}
+{%- elif spec.type == "bool" -%}{{ 1 if value else 0 }}
+{%- else -%}{{ value }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro display_value(spec, value) -%}
+{%- if value is none -%}not set
+{%- elif spec.type == "bool" -%}{{ "On" if value else "Off" }}
+{%- elif spec.type == "enum" -%}
+  {%- set ns = namespace(label=value) -%}{%- for o in spec.options %}{% if o.value == value %}{% set ns.label = o.label %}{% endif %}{% endfor -%}{{ ns.label }}
+{%- elif spec.type in ("list[str]", "list[int]", "list[cidr]") -%}{{ value|join(", ") if value else "empty" }}
+{%- elif spec.type == "bytes" -%}{{ fmt_bytes(value) }}
+{%- elif spec.type in ("int", "float", "percent", "duration") -%}{{ num(value, 0 if value is integer else 2) }}{% if spec.unit %}{{ "" if _unit_label(spec).startswith("%") else " " }}{{ _unit_label(spec) }}{% endif %}
+{%- else -%}{{ value }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro setting_control(spec, value, save_url, meta=None, history_url=None, error=None, saved=False,
+                         prefix="set", submitted=None) -%}
+{%- set fid = prefix ~ "-" ~ spec.key -%}
+{%- set shown = submitted if submitted is not none else _raw(spec, value) -%}
+{%- set is_default = value == spec.default -%}
+{%- set risk = namespace(why=None) -%}
+{%- for cond in spec.high_risk_if %}{% if risk.why is none and cond.matches(value) %}{% set risk.why = cond.why %}{% endif %}{% endfor -%}
+{%- set conds = [] -%}
+{%- for cond in spec.high_risk_if %}{% set _ = conds.append({"op": cond.op.value, "value": cond.value, "why": cond.why}) %}{% endfor -%}
+{%- set option_text = {} -%}
+{%- for o in spec.options %}{% set _ = option_text.update({o.value: o.description}) %}{% endfor -%}
+{%- set described = fid ~ "-desc " ~ fid ~ "-hint " ~ fid ~ "-error" -%}
+{%- set numeric = spec.type in ("int", "float", "percent") -%}
+<form class="setting{% if risk.why %} setting--risky{% endif %}" id="{{ fid }}" hx-post="{{ save_url }}" hx-target="this" hx-swap="outerHTML"
+      novalidate x-data="settingControl" data-setting-key="{{ spec.key }}" data-type="{{ spec.type }}"
+      data-label="{{ spec.label }}" data-unit="{{ _unit_label(spec) }}"
+      {% if spec.min is not none %}data-min="{{ spec.min }}" {% endif %}{% if spec.max is not none %}data-max="{{ spec.max }}" {% endif %}
+      {% if spec.step is not none %}data-step="{{ spec.step }}" {% endif %}{% if spec.max_length %}data-max-length="{{ spec.max_length }}" {% endif %}
+      data-unit-ms="{{ _DURATION_UNIT_MS.get(spec.unit, 1000) }}" data-initial="{{ _raw(spec, value) }}" data-default="{{ _raw(spec, spec.default) }}"
+      data-risk-conds='{{ conds|tojson }}' data-options='{{ option_text|tojson }}' data-server-error="{{ error or '' }}">
+  <input type="hidden" name="key" value="{{ spec.key }}">
+  <div class="setting__head">
+    <label class="setting__label" for="{{ fid }}-value">{{ spec.label }}</label>
+    <span class="setting__badges">
+      {{ default_badge(is_default, display_value(spec, spec.default)) }}
+      {% if spec.risk != "low" or risk.why %}{{ risk_badge("high" if risk.why else spec.risk) }}{% endif %}
+      {% if spec.apply == "restart" %}{{ apply_badge("restart") }}{% endif %}
+    </span>
+  </div>
+  <p class="setting__key"><code>{{ spec.key }}</code><button type="button" class="icon-btn icon-btn--sm" data-copy="{{ spec.key }}" aria-label="Copy the setting key {{ spec.key }}">{{ icon("copy") }}</button></p>
+  <p class="setting__desc" id="{{ fid }}-desc">{{ spec.description }}</p>
+
+  <div class="setting__control">
+    {% if spec.type == "bool" %}
+    <label class="switch">
+      <input type="hidden" name="value" value="0">
+      <input type="checkbox" role="switch" class="switch__input" id="{{ fid }}-value" name="value" value="1"{% if shown == "1" %} checked{% endif %}
+             data-setting-input x-on:change="onInput" aria-describedby="{{ described }}">
+      <span class="switch__track" aria-hidden="true"><span class="switch__thumb"></span></span>
+      <span class="switch__on">On</span><span class="switch__off">Off</span>
+    </label>
+    {% elif spec.type == "enum" %}
+    <select class="input" id="{{ fid }}-value" name="value" data-setting-input x-on:change="onInput" aria-describedby="{{ fid }}-option {{ described }}">
+      {% for o in spec.options %}<option value="{{ o.value }}"{% if o.value == shown %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
+    </select>
+    <p class="setting__option" id="{{ fid }}-option" x-text="optionText">{{ option_text.get(shown, "") }}</p>
+    {% elif spec.type in ("list[str]", "list[int]", "list[cidr]") %}
+    <textarea class="input mono" id="{{ fid }}-value" name="value" rows="4" spellcheck="false" data-setting-input x-on:input="onInput" aria-describedby="{{ described }}">{{ shown }}</textarea>
+    {% elif spec.type == "string" %}
+    <input class="input" type="text" id="{{ fid }}-value" name="value" value="{{ shown }}"{% if spec.max_length %} maxlength="{{ spec.max_length }}"{% endif %} spellcheck="false" data-setting-input x-on:input="onInput" aria-describedby="{{ described }}">
+    {% else %}
+    <div class="setting__numeric">
+      {% if numeric and spec.min is not none and spec.max is not none and ((spec.max - spec.min) / (spec.step or 1)) <= 100000 %}
+      <input type="range" class="range" min="{{ spec.min }}" max="{{ spec.max }}" step="{{ spec.step or 'any' }}" value="{{ value if value is number else spec.default }}"
+             data-setting-slider x-on:input="onSlide" aria-label="{{ spec.label }} (slider)" tabindex="-1">
+      {% endif %}
+      <span class="input-unit">
+        <input class="input input--num" type="text" id="{{ fid }}-value" name="value" value="{{ shown }}"
+               inputmode="{{ 'decimal' if spec.type in ('float', 'percent') else ('numeric' if spec.type == 'int' else 'text') }}"
+               autocomplete="off" spellcheck="false" data-setting-input x-on:input="onInput" aria-describedby="{{ fid }}-preview {{ described }}">
+        {% if _unit_label(spec) %}<span class="input-unit__unit">{{ _unit_label(spec) }}</span>{% endif %}
+      </span>
+    </div>
+    {% endif %}
+  </div>
+
+  <p class="setting__preview" id="{{ fid }}-preview" x-text="preview" aria-live="polite"></p>
+  <p class="setting__hint" id="{{ fid }}-hint">
+    {%- if spec.type == "duration" -%}Accepts 90, 90s, 15m or 2h. {% elif spec.type == "bytes" %}Accepts 65536, 64 KiB or 1 GiB. {% endif -%}
+    {%- if spec.min is not none and spec.max is not none -%}Allowed {{ display_value(spec, spec.min) }} to {{ display_value(spec, spec.max) }}.
+    {%- elif spec.max_length and spec.type == "string" -%}Up to {{ num(spec.max_length) }} characters.
+    {%- elif spec.type in ("list[str]", "list[int]", "list[cidr]") -%}One entry per line.{%- endif %}
+    Default {{ display_value(spec, spec.default) }}.
+  </p>
+  <p class="setting__error" id="{{ fid }}-error" role="alert" x-text="error"{% if not error %} hidden{% endif %} x-bind:hidden="!error">{{ error or "" }}</p>
+  <div class="setting__risk" role="alert"{% if not risk.why %} hidden{% endif %} x-bind:hidden="!riskWhy">
+    {{ icon("alert-octagon") }}<span><strong>High-risk value.</strong> <span x-text="riskWhy">{{ risk.why or "" }}</span></span>
+  </div>
+
+  <details class="setting__what">
+    <summary>What happens if I change this?</summary>
+    <div class="setting__what-body">
+      {% if spec.type == "bool" %}
+      <p><strong>Turned on:</strong> {{ spec.if_enabled or spec.description }}</p>
+      <p><strong>Turned off:</strong> {{ spec.if_disabled or "The feature stops." }}</p>
+      {% elif spec.type == "enum" %}
+      <dl class="setting__options">
+        {% for o in spec.options %}<dt>{{ o.label }}{% if o.value == spec.default %} <span class="muted">(default)</span>{% endif %}</dt><dd>{{ o.description }}</dd>{% endfor %}
+      </dl>
+      {% else %}
+      {% if spec.if_raised %}<p><strong>Raised:</strong> {{ spec.if_raised }}</p>{% endif %}
+      {% if spec.if_lowered %}<p><strong>Lowered:</strong> {{ spec.if_lowered }}</p>{% endif %}
+      {% endif %}
+      {% if spec.high_risk_if %}
+      <p class="setting__danger-title"><strong>High risk when:</strong></p>
+      <ul class="setting__danger">{% for c in spec.high_risk_if %}<li>{{ c.why }}</li>{% endfor %}</ul>
+      {% endif %}
+      {% if spec.notes %}<p class="muted">{{ spec.notes }}</p>{% endif %}
+      {% if spec.related_settings %}<p class="setting__related">Related: {% for key in spec.related_settings %}<a href="/admin/settings?q={{ key }}"><code>{{ key }}</code></a>{{ ", " if not loop.last }}{% endfor %}</p>{% endif %}
+    </div>
+  </details>
+
+  <div class="setting__save" x-show="dirty" x-cloak>
+    <div class="field setting__reason">
+      <label class="field__label" for="{{ fid }}-reason">Reason <span class="muted" x-show="!highRisk">(optional, saved in the audit log)</span><span x-show="highRisk">(required for a high-risk value)</span></label>
+      <input class="input" type="text" id="{{ fid }}-reason" name="reason" maxlength="500" autocomplete="off" x-bind:required="highRisk">
+    </div>
+    <label class="check setting__confirm" x-show="highRisk"><input type="checkbox" name="confirm_high_risk" value="1" x-bind:required="highRisk"><span>I understand the risk described above</span></label>
+    <div class="setting__buttons">
+      <button type="submit" class="btn btn--primary" x-bind:disabled="invalid">{{ icon("check") }}<span>Save</span></button>
+      <button type="button" class="btn btn--ghost" x-on:click="revert">Cancel</button>
+    </div>
+  </div>
+
+  <footer class="setting__foot">
+    <span class="setting__meta">
+      {% if saved %}<span class="setting__saved" role="status">{{ icon("check-circle") }}Saved</span>{% endif %}
+      {% if meta %}Changed {{ meta.changed_at }} by {{ meta.changed_by }}{% if meta.reason %}: <q>{{ meta.reason }}</q>{% endif %}
+      {% else %}{{ "Never changed from the default." if is_default else "Changed from the default." }}{% endif %}
+    </span>
+    <span class="setting__links">
+      {% if history_url %}<a href="{{ history_url }}">{{ icon("history") }}History</a>{% endif %}
+      <button type="button" class="link-btn" x-on:click="resetToDefault"{% if is_default %} disabled{% endif %}>{{ icon("reset") }}Reset to default</button>
+    </span>
+  </footer>
+</form>
+{%- endmacro %}

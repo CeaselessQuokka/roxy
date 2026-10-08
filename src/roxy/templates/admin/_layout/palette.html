@@ -1,0 +1,59 @@
+{#-
+  Command palette (plan 14.6): Ctrl+K or / opens it; type to jump to any page, setting, endpoint, client or
+  recommendation, or to run an action.
+
+  The static items (every page from admin/_layout/nav.html and the global actions) are rendered here, so the
+  palette works the moment the page loads; static/js/palette.js filters them as you type and, when `urls.palette`
+  is set, also asks the server for matching settings, endpoints, clients and recommendations (JSON, at most 20).
+  It is an ARIA combobox: the input owns a listbox, arrow keys move the active option (aria-activedescendant),
+  Enter follows it, Escape closes. Actions either link somewhere (`data-href`), open a dialog (`data-open`), or
+  post with htmx (`data-post`, which adds the CSRF header).
+  Context: `urls` {palette, health_run, llm_export}.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "admin/_layout/nav.html" import PAGES, page_href %}
+{% set u = urls if urls is defined and urls else {} %}
+<dialog class="palette" id="palette" aria-label="Command palette"{% if u.palette %} data-search-url="{{ u.palette }}"{% endif %}>
+  <div class="palette__search">
+    {{ icon("search") }}
+    <input class="palette__input" id="palette-input" type="text" role="combobox" aria-expanded="true" aria-controls="palette-list"
+           aria-autocomplete="list" aria-activedescendant="" aria-label="Search pages, settings, endpoints and actions"
+           placeholder="Jump to a page, setting, endpoint or action" autocomplete="off" spellcheck="false">
+    <button type="button" class="palette__close" data-dialog-close aria-label="Close the command palette"><kbd>Esc</kbd></button>
+  </div>
+  <ul class="palette__list" id="palette-list" role="listbox" aria-label="Results">
+    {% for p in PAGES %}
+    <li class="palette__item" role="option" id="pal-page-{{ p.id }}" aria-selected="false" data-group="Pages"
+        data-href="{{ page_href(p.id) }}" data-search="{{ p.label|lower }} {{ p.about|lower }} {{ p.id }}"{% if p["keys"] %} data-keys="{{ p['keys'] }}"{% endif %}>
+      {{ icon(p.icon) }}<span class="palette__label">{{ p.label }}</span><span class="palette__hint">{{ p.about }}</span>{% if p["keys"] %}<span class="keys">{% for k in p["keys"].split(" ") %}<kbd>{{ k }}</kbd>{% endfor %}</span>{% endif %}
+    </li>
+    {% endfor %}
+    <li class="palette__item" role="option" id="pal-act-health" aria-selected="false" data-group="Actions"
+        {% if u.health_run %}data-post="{{ u.health_run }}"{% else %}data-href="{{ page_href('health') }}?run=1"{% endif %} data-search="run health check test probe">
+      {{ icon("heart") }}<span class="palette__label">Run health check</span><span class="palette__hint">Checks every part of Roxy in about a minute</span>
+    </li>
+    <li class="palette__item" role="option" id="pal-act-pause" aria-selected="false" data-group="Actions" data-open="dlg-pause" data-search="pause resume proxy stop maintenance">
+      {{ icon("pause") }}<span class="palette__label">Pause or resume the proxy</span><span class="palette__hint">Asks for confirmation first</span>
+    </li>
+    <li class="palette__item" role="option" id="pal-act-limit" aria-selected="false" data-group="Actions" data-open="dlg-throttle-all" data-search="emergency limit throttle all slow down">
+      {{ icon("gauge") }}<span class="palette__label">Emergency limit (throttle-all)</span><span class="palette__hint">Limit every IP at once</span>
+    </li>
+    <li class="palette__item" role="option" id="pal-act-purge" aria-selected="false" data-group="Actions" data-href="{{ page_href('cache') }}#purge" data-search="purge cache host clear">
+      {{ icon("database") }}<span class="palette__label">Purge cache for a host</span><span class="palette__hint">Opens the cache purge card</span>
+    </li>
+    <li class="palette__item" role="option" id="pal-act-llm" aria-selected="false" data-group="Actions" data-href="{{ u.llm_export or (page_href('data') ~ '#exports') }}" data-search="export llm json diagnostics">
+      {{ icon("download") }}<span class="palette__label">Export LLM JSON</span><span class="palette__hint">A redacted snapshot to paste into an assistant</span>
+    </li>
+    <li class="palette__item" role="option" id="pal-act-theme" aria-selected="false" data-group="Actions" data-action="theme" data-search="theme dark light toggle colors">
+      {{ icon("moon") }}<span class="palette__label">Switch theme</span><span class="palette__hint">Dark, light or follow the system</span>
+    </li>
+    <li class="palette__item" role="option" id="pal-act-keys" aria-selected="false" data-group="Actions" data-open="shortcuts" data-search="keyboard shortcuts help keys">
+      {{ icon("keyboard") }}<span class="palette__label">Keyboard shortcuts</span><span class="keys"><kbd>?</kbd></span>
+    </li>
+  </ul>
+  <p class="palette__empty" data-palette-empty hidden>No matches. Try a page name, a setting key or part of an endpoint.</p>
+  <p class="sr-only" aria-live="polite" data-palette-status></p>
+  <footer class="palette__foot" aria-hidden="true">
+    <span><kbd>Up</kbd><kbd>Down</kbd> move</span><span><kbd>Enter</kbd> open</span><span><kbd>Esc</kbd> close</span>
+  </footer>
+</dialog>

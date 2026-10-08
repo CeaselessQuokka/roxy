@@ -1,0 +1,378 @@
+# roxy.conf.template: the nginx site for Roxy v2 (plan 17.2). Every directive says why it is here.
+#
+# This is a TEMPLATE. roxy-nginx-apply (a root-owned wrapper, plan 9.14) takes it from the verified commit on main,
+# renders it for the installed nginx version and the site origin, writes /etc/nginx/sites-available/roxy-v2.conf,
+# runs `nginx -t` and reloads. Rendering rules (deploy/tools/roxy-nginx-apply, function render_site):
+#   NAME in double braces         replaced by a value (host names and paths, validated before use)
+#   #@if nginx >= X.Y.Z / #@else / #@endif
+#                                 keeps one branch of lines, by the installed nginx version, so `nginx -t` passes on
+#                                 the Ubuntu 22.04 distro nginx (1.18) and on 24.04 (1.24) and later.
+# Directives that Ubuntu's /etc/nginx/nginx.conf already sets at http level (gzip, ssl_protocols, keepalive_timeout,
+# access_log) are set inside the server blocks here: repeating them at http level would make `nginx -t` fail with
+# "directive is duplicate", and a server-level value overrides the http-level one.
+# worker_processes 2 and worker_connections 4096 belong in /etc/nginx/nginx.conf (main and events context, which a
+# site file cannot set); deploy/README.md says how, and roxy-nginx-apply reports the installed values to the app.
+
+# --- http level: shared zones, log formats and the active color ---------------------------------------------------
+
+# The upstream pool roxy_app and the variable $roxy_active_color, from whichever color file the symlink points at
+# (blue or green). roxy-switch-color repoints the symlink and reloads nginx: that is the blue/green switch.
+include {{NGINX_DIR}}/roxy-active-upstream.conf;
+
+# Per-client rate limits, all keyed by the binary client address (4 or 16 bytes, so a zone holds many clients).
+# Separate zones, so the owner's dashboard is never throttled by the login guard (plan 17.2).
+# Public traffic: 20 requests per second per IP, with a burst (below); floods are dropped before Python runs.
+limit_req_zone $binary_remote_addr zone=perip:10m rate=20r/s;
+# Login and kill-switch pages: 2 per second per IP (password guessing is slow on purpose).
+limit_req_zone $binary_remote_addr zone=adminauth:1m rate=2r/s;
+# The rest of the dashboard: 30 per second per IP (HTMX fragments, heartbeats, parallel chart queries).
+limit_req_zone $binary_remote_addr zone=admin:2m rate=30r/s;
+# Browser CSP violation reports: 1 per second per IP (a public endpoint that writes to the database).
+limit_req_zone $binary_remote_addr zone=cspreport:1m rate=1r/s;
+# Concurrent connections per IP (limit below): bounds how many sockets one attacker can hold in the tarpit.
+limit_conn_zone $binary_remote_addr zone=connperip:10m;
+
+# Structured JSON access log with the request id (sent to the app as X-Request-Id), upstream time, status and bytes.
+# escape=json makes every value a valid JSON string, whatever the client sent.
+log_format roxy_json escape=json '{"time":"$time_iso8601","request_id":"$request_id","remote_addr":"$remote_addr",'
+    '"method":"$request_method","uri":"$request_uri","status":"$status","bytes_sent":"$bytes_sent",'
+    '"request_time":"$request_time","upstream_time":"$upstream_response_time","host":"$host",'
+    '"user_agent":"$http_user_agent"}';
+# The same without the query string, for /admin (dashboard queries can name IPs and filters; plan 17.2).
+log_format roxy_json_noquery escape=json '{"time":"$time_iso8601","request_id":"$request_id",'
+    '"remote_addr":"$remote_addr","method":"$request_method","uri":"$uri","status":"$status",'
+    '"bytes_sent":"$bytes_sent","request_time":"$request_time","upstream_time":"$upstream_response_time",'
+    '"host":"$host","user_agent":"$http_user_agent"}';
+
+# --- default servers: anything that is not our host name ---------------------------------------------------------
+
+# Plain HTTP to the bare IP or an unknown Host header: close the connection without a reply (444). Scanners get
+# nothing, and our site is never served under a name we did not choose.
+server {
+    # IPv4, port 80, the default for requests no other server_name matches.
+    listen 80 default_server;
+    # The same for IPv6.
+    listen [::]:80 default_server;
+    # A name no real request carries.
+    server_name _;
+    # Hide the nginx version on every response (and in error pages).
+    server_tokens off;
+    # Scans are noise in the access log.
+    access_log off;
+    # 444: nginx closes the connection without sending anything.
+    return 444;
+}
+
+# HTTPS to an unknown name (SNI): refuse the TLS handshake itself.
+server {
+#@if nginx >= 1.25.1
+    # IPv4, port 443, the default for unknown names (since nginx 1.25.1 HTTP/2 is a per-server `http2 on`, which
+    # this server does not need: it never completes a handshake).
+    listen 443 ssl default_server;
+    # The same for IPv6.
+    listen [::]:443 ssl default_server;
+#@else
+    # IPv4, port 443, the default for unknown names; before nginx 1.25.1 HTTP/2 is a listen parameter.
+    listen 443 ssl http2 default_server;
+    # The same for IPv6.
+    listen [::]:443 ssl http2 default_server;
+#@endif
+    # A name no real request carries.
+    server_name _;
+    # Hide the nginx version.
+    server_tokens off;
+    # Scans are noise in the access log.
+    access_log off;
+#@if nginx >= 1.19.4
+    # Refuse the handshake for unknown names; no certificate is needed, so no snakeoil certificate (nginx 1.19.4+).
+    ssl_reject_handshake on;
+#@else
+    # nginx before 1.19.4 cannot refuse a handshake, so this server presents the site certificate and then closes
+    # the connection without a reply.
+    ssl_certificate {{CERT_DIR}}/fullchain.pem;
+    # The key for the certificate above.
+    ssl_certificate_key {{CERT_DIR}}/privkey.pem;
+    # Close without a reply.
+    return 444;
+#@endif
+}
+
+# --- HTTP to our names: redirect to HTTPS ------------------------------------------------------------------------
+
+# Plain HTTP for our own names: only certificate challenges and a redirect.
+server {
+    # IPv4 port 80 for our names.
+    listen 80;
+    # IPv6 port 80 for our names.
+    listen [::]:80;
+    # The canonical host and its www alias (from ROXY_SITE_ORIGIN at render time).
+    server_name {{SERVER_NAMES}};
+    # Hide the nginx version.
+    server_tokens off;
+    # Plain HTTP requests are only redirects; their log lines add nothing.
+    access_log off;
+
+    # Let's Encrypt HTTP-01 challenges for certificate renewal with `certbot renew --webroot -w /var/www/letsencrypt`
+    # (certbot's nginx plugin also works; it adds its own temporary location).
+    location ^~ /.well-known/acme-challenge/ {
+        # Challenge files are written here by certbot.
+        root /var/www/letsencrypt;
+        # Challenge responses are plain text.
+        default_type text/plain;
+    }
+
+    # Everything else goes to HTTPS on the canonical host. The host is fixed at render time, never the
+    # attacker-supplied $host (v1 redirected to $host, plan 2.4).
+    location / {
+        # Permanent redirect, keeping the path and query.
+        return 301 https://{{CANONICAL_HOST}}$request_uri;
+    }
+}
+
+# --- HTTPS: the site ----------------------------------------------------------------------------------------------
+
+# The site itself: TLS for our names, every location of the app.
+server {
+#@if nginx >= 1.25.1
+    # IPv4 port 443 with TLS.
+    listen 443 ssl;
+    # IPv6 port 443 with TLS.
+    listen [::]:443 ssl;
+    # HTTP/2 for browsers and clients that offer it (a server directive since nginx 1.25.1).
+    http2 on;
+#@else
+    # IPv4 port 443 with TLS and HTTP/2 (before nginx 1.25.1 HTTP/2 is a listen parameter; `http2 on` does not
+    # exist there, which is why v1's config failed `nginx -t` on the distro nginx).
+    listen 443 ssl http2;
+    # IPv6 port 443 with TLS and HTTP/2.
+    listen [::]:443 ssl http2;
+#@endif
+    # The canonical host and its www alias.
+    server_name {{SERVER_NAMES}};
+    # Hide the nginx version in headers and error pages.
+    server_tokens off;
+
+    # Certbot's certificate for the site (renewed by certbot.timer).
+    ssl_certificate {{CERT_DIR}}/fullchain.pem;
+    # The private key for the certificate above.
+    ssl_certificate_key {{CERT_DIR}}/privkey.pem;
+    # Modern protocols only.
+    ssl_protocols TLSv1.2 TLSv1.3;
+    # Mozilla's "intermediate" cipher list. The DHE suites stay unused because no ssl_dhparam is set, which keeps
+    # every handshake on ECDHE (forward secret and fast).
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+    # Let the client pick among these (all strong); Mozilla's guidance for the intermediate profile.
+    ssl_prefer_server_ciphers off;
+    # Resume TLS sessions from a 10 MB cache shared by all nginx workers (about 40000 sessions). The zone has its
+    # own name so it can never clash with another site's ssl_session_cache of a different size.
+    ssl_session_cache shared:roxy_ssl:10m;
+    # Cached sessions live one day.
+    ssl_session_timeout 1d;
+    # No session tickets: a ticket key that never rotates would undo forward secrecy.
+    ssl_session_tickets off;
+    # OCSP stapling is not configured: Let's Encrypt ended OCSP in 2025 and its certificates carry no OCSP URL.
+
+    # HSTS on every response from this server (see the snippet for why it is repeated in some locations).
+    include {{NGINX_DIR}}/snippets/roxy-security-headers.conf;
+
+    # Bodies up to 2 MB, matching the app's max_body_bytes (plan 9.12).
+    client_max_body_size 2m;
+    # Slowloris defense: a client must keep sending its body...
+    client_body_timeout 10s;
+    # ...and its headers, or the connection is closed.
+    client_header_timeout 10s;
+    # A client that stops reading a response for 30 s is dropped.
+    send_timeout 30s;
+    # Header buffers matching the app's header limits (8 KB per header line).
+    large_client_header_buffers 4 8k;
+    # Idle client connections are kept 30 s for reuse.
+    keepalive_timeout 30s;
+    # And reused for up to 1000 requests.
+    keepalive_requests 1000;
+
+    # Over a rate limit or connection limit, answer 429 (Too Many Requests), not nginx's default 503.
+    limit_req_status 429;
+    # The same status for the connection limit.
+    limit_conn_status 429;
+    # At most 50 concurrent connections per client IP, bounding tarpit socket use per attacker (plan 10.6).
+    limit_conn connperip 50;
+
+    # Compress public responses...
+    gzip on;
+    # ...of these types (text/html is always included by nginx, so listing it would only warn).
+    gzip_types application/json text/css application/javascript image/svg+xml;
+    # Tiny responses are not worth compressing.
+    gzip_min_length 1024;
+    # Tell caches the body depends on Accept-Encoding.
+    gzip_vary on;
+
+    # HTTP/1.1 to the app, required for upstream keepalive.
+    proxy_http_version 1.1;
+    # Clear the Connection header so nginx keeps the upstream connection open (keepalive).
+    proxy_set_header Connection "";
+    # The host the client asked for (only our server_names reach this server).
+    proxy_set_header Host $host;
+    # Append the client address; the app trusts only the rightmost hop from a trusted proxy (plan 9.11).
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # https, so the app knows the original scheme.
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # nginx's request id, so access log lines and app log lines can be joined.
+    proxy_set_header X-Request-Id $request_id;
+    # Fail fast when the app is not listening.
+    proxy_connect_timeout 5s;
+    # Longer than the app's request deadline (60 s, request_deadline_s), so the app always answers first with a
+    # meaningful status (plan 5.2).
+    proxy_read_timeout 100s;
+    # The same bound for sending a request body to the app.
+    proxy_send_timeout 100s;
+    # Less fingerprinting: never pass these upstream headers on.
+    proxy_hide_header X-Powered-By;
+    # (the app sends no Server header; this keeps it that way if a library ever adds one)
+    proxy_hide_header Server;
+
+    # The structured access log; query strings are omitted for /admin locations (their own access_log below).
+    access_log {{LOG_DIR}}/roxy.access.log roxy_json;
+    # Warnings and worse only.
+    error_log {{LOG_DIR}}/roxy.error.log warn;
+
+    # Everything else (the proxy, the public pages): the per-IP limit with a burst, then the app.
+    location / {
+        # 20 r/s per IP with bursts of 100 answered without delay; beyond that 429.
+        limit_req zone=perip burst=100 nodelay;
+        # To the active color.
+        proxy_pass http://roxy_app;
+    }
+
+    # The health endpoint: quiet monitors (polled every 30 s) would flood the access log.
+    location = /health {
+        # The same per-IP limit as `/`: every call reads the databases and the app has no limiter of its own on this
+        # route, so a flood must be dropped here, before Python runs (plan 17.2). Monitors are far below it.
+        limit_req zone=perip burst=100 nodelay;
+        # No log lines for health polls.
+        access_log off;
+        # To the active color.
+        proxy_pass http://roxy_app;
+    }
+
+    # Internal endpoints exist only on each color's Unix socket (plan 5.8); this makes the 404 explicit, even if a
+    # future app version mistakenly routed /internal on TCP.
+    location ^~ /internal/ {
+        # Not found, without touching the app.
+        return 404;
+    }
+
+    # The bare /internal path as well.
+    location = /internal {
+        # Not found, without touching the app.
+        return 404;
+    }
+
+    # Static assets with content-hashed names, served by nginx from the active color's release (plan 17.2).
+    # scripts/build_static.py writes build/public/static/<dir>/<name>.<hash>.<ext> into each release; a name that is
+    # not there (an asset requested by a page from the previous release during a switch) falls back to the app,
+    # which serves the current file with no-cache.
+    location ^~ /static/ {
+        # The active release: $roxy_active_color comes from the active upstream file.
+        root {{RELEASES_DIR}}/current-$roxy_active_color/build/public;
+        # The hashed file if this release has it, otherwise the app.
+        try_files $uri @roxy_static_fallback;
+        # One year: a hashed name never changes content.
+        expires 1y;
+        # Browsers may skip revalidation entirely for hashed assets.
+        add_header Cache-Control "public, immutable";
+        # nginx serves these bytes itself, so the app's nosniff header is not there to protect them.
+        add_header X-Content-Type-Options "nosniff" always;
+        # This location has its own add_header, so HSTS must be included again (see the snippet).
+        include {{NGINX_DIR}}/snippets/roxy-security-headers.conf;
+    }
+
+    # Asset names this release does not have go to the app (development parity, old hashes during a switch).
+    location @roxy_static_fallback {
+        # The per-IP limit of `/`: made-up asset names are an easy way to make every request reach the app. (The
+        # /static/ location itself has no limit, so this is the first limit such a request meets.)
+        limit_req zone=perip burst=100 nodelay;
+        # To the active color, which answers with no-cache for a stale hash.
+        proxy_pass http://roxy_app;
+    }
+
+    # The admin login page.
+    location = /admin {
+        # The login guard: 2 r/s per IP, bursts of 10.
+        limit_req zone=adminauth burst=10 nodelay;
+        # No compression for admin responses (BREACH defense in depth, plan 9.6).
+        gzip off;
+        # Log without query strings.
+        access_log {{LOG_DIR}}/roxy.access.log roxy_json_noquery;
+        # Optional admin IP allowlist (D6), off unless /etc/nginx/roxy-admin-access.conf exists (allow and deny
+        # lines mirroring the app's admin allowlist). A wildcard include that matches nothing is not an error.
+        include {{NGINX_DIR}}/roxy-admin-access*.conf;
+        # To the active color.
+        proxy_pass http://roxy_app;
+    }
+
+    # The login and second factor API.
+    location ^~ /admin/api/v1/auth/ {
+        # The same login guard as the login page.
+        limit_req zone=adminauth burst=10 nodelay;
+        # No compression for admin responses (BREACH).
+        gzip off;
+        # Log without query strings.
+        access_log {{LOG_DIR}}/roxy.access.log roxy_json_noquery;
+        # Optional admin IP allowlist (D6).
+        include {{NGINX_DIR}}/roxy-admin-access*.conf;
+        # To the active color.
+        proxy_pass http://roxy_app;
+    }
+
+    # The emailed one-time kill switch, /admin/invalidate/<token>.
+    location ^~ /admin/invalidate/ {
+        # The login guard: the token in the path is the only credential, so guessing is throttled.
+        limit_req zone=adminauth burst=10 nodelay;
+        # The token is in the path; it must never be written to disk (it is also stored hashed, row 99). v1 logged it.
+        access_log off;
+        # The error log too: a rate limited request ("limiting requests ... request: GET /admin/invalidate/<token>")
+        # or an upstream error quotes the request line, so this location's errors go nowhere.
+        error_log /dev/null;
+        # No compression for admin responses (BREACH).
+        gzip off;
+        # No admin allowlist here on purpose: the owner must be able to kill sessions from any network.
+        # To the active color.
+        proxy_pass http://roxy_app;
+    }
+
+    # Server-Sent Events for the live dashboard.
+    location = /admin/api/v1/stream {
+        # Events must reach the browser immediately, not when a buffer fills.
+        proxy_buffering off;
+        # No compression for admin responses (BREACH), and gzip would buffer the stream.
+        gzip off;
+        # Log without query strings.
+        access_log {{LOG_DIR}}/roxy.access.log roxy_json_noquery;
+        # Optional admin IP allowlist (D6). No limit_req: one long-lived request per open dashboard.
+        include {{NGINX_DIR}}/roxy-admin-access*.conf;
+        # To the active color (the 100 s read timeout applies between events; the stream sends keepalives).
+        proxy_pass http://roxy_app;
+    }
+
+    # The rest of the dashboard and the admin API.
+    location ^~ /admin/ {
+        # 30 r/s per IP with bursts of 120, so a full dashboard load (many parallel fragments) is never throttled.
+        limit_req zone=admin burst=120 nodelay;
+        # No compression for admin responses (BREACH).
+        gzip off;
+        # Log without query strings.
+        access_log {{LOG_DIR}}/roxy.access.log roxy_json_noquery;
+        # Optional admin IP allowlist (D6).
+        include {{NGINX_DIR}}/roxy-admin-access*.conf;
+        # To the active color.
+        proxy_pass http://roxy_app;
+    }
+
+    # Browser CSP violation reports (public, unauthenticated, plan 9.2).
+    location = /csp-report {
+        # 1 r/s per IP, bursts of 5 queued (not answered early): reports are never urgent.
+        limit_req zone=cspreport burst=5;
+        # To the active color.
+        proxy_pass http://roxy_app;
+    }
+}

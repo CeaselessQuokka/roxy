@@ -1,0 +1,910 @@
+/*
+ * Layout: the base element styles and the dashboard shell (plan 14.1, 14.8, 14.9).
+ *
+ * What this is
+ *   Element defaults (type, links, focus), the app shell (sidebar, top bar, banners, main area, footer), the page
+ *   header with its "How to read this page" panel, grid helpers, and the phone layout (bottom bar instead of the
+ *   sidebar, two KPI tiles per row, 44 px touch targets).
+ *
+ * Why it exists
+ *   Every page shares this frame, so it lives in one file that components.css never has to know about. The rules
+ *   that protect keyboard users live here too: a visible focus ring on every control (WCAG 2.4.7), a skip link,
+ *   and scroll padding so a focused element is never hidden under the sticky top bar (WCAG 2.4.11).
+ *
+ * How it works
+ *   The shell is a two-column CSS grid (sidebar, main). The sidebar collapses to icons when the shell has
+ *   data-sidebar="collapsed" (set by static/js/app.js and remembered per browser) and always below 1100 px. Below
+ *   760 px the sidebar disappears and the bottom bar (.mobile-nav) takes over. Only tokens from tokens.css are used.
+ *
+ * What to read next
+ *   static/css/components.css, then templates/admin/base.html.
+ */
+
+/* ------------------------------------------------------------------------------------------- base */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  scroll-padding-top: calc(var(--topbar-h) + var(--sp-4));  /* focus never lands under the sticky bar (2.4.11) */
+  scroll-padding-bottom: var(--sp-4);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--fs-2);
+  line-height: var(--lh);
+  font-variant-numeric: tabular-nums;  /* every number lines up in columns (plan 14.4) */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  margin: 0;
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-tight);
+  letter-spacing: -0.01em;
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  text-underline-offset: 3px;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code, kbd, pre, samp, .mono {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+img, svg {
+  max-width: 100%;
+}
+
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: var(--sp-4) 0;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+[x-cloak] {
+  display: none !important;  /* Alpine removes x-cloak once a component is ready */
+}
+
+/* One focus style for everything that can take focus from the keyboard (WCAG 2.4.7, 2.4.13 style ring). */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+.skip-link {
+  position: absolute;
+  top: var(--sp-2);
+  left: var(--sp-2);
+  z-index: 1000;
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--radius);
+  background: var(--accent-bg);
+  color: var(--on-accent);
+  font-weight: var(--fw-semibold);
+  transform: translateY(-200%);
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+/* ------------------------------------------------------------------------------------------- shell */
+.shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.shell__main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.main {
+  flex: 1;
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--sp-6) var(--sp-6) var(--sp-10);
+}
+
+.main:focus {
+  outline: none;
+}
+
+/* ------------------------------------------------------------------------------------------- sidebar */
+.sidebar {
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  border-right: 1px solid var(--border);
+  background: var(--surface-1);
+  z-index: 20;
+}
+
+.sidebar__brand {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  height: var(--topbar-h);
+  padding: 0 var(--sp-3) 0 var(--sp-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--text);
+  font-weight: var(--fw-semibold);
+  font-size: var(--fs-3);
+  min-height: var(--target-min);
+}
+
+.brand:hover {
+  text-decoration: none;
+}
+
+.brand__mark {
+  width: 24px;
+  height: 24px;
+  color: var(--accent);
+}
+
+.brand__tag {
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-medium);
+}
+
+.sidebar__scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--sp-3) var(--sp-2);
+  scrollbar-width: thin;
+}
+
+.nav-group + .nav-group {
+  margin-top: var(--sp-4);
+}
+
+.nav-group__title {
+  padding: 0 var(--sp-3) var(--sp-1);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-medium);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.nav-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.nav-link {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 34px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  font-weight: var(--fw-medium);
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.nav-link:hover {
+  background: var(--surface-3);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.nav-link[aria-current="page"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.nav-link[aria-current="page"]::before {
+  content: "";
+  position: absolute;
+  left: -8px;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+}
+
+.nav-link__icon {
+  flex: none;
+  width: 18px;
+  height: 18px;
+}
+
+.nav-link__label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.sidebar__foot {
+  padding: var(--sp-2);
+  border-top: 1px solid var(--border);
+}
+
+.sidebar__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3) var(--sp-1);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.env-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin: 0 5px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+
+.env-dot--development {
+  background: var(--warn);
+}
+
+/* Collapsed sidebar: icons only; labels stay as accessible names and appear as tooltips. Same rules under
+   1100 px wide, where there is no room for labels. */
+.shell[data-sidebar="collapsed"] {
+  grid-template-columns: var(--sidebar-w-collapsed) minmax(0, 1fr);
+}
+
+.shell[data-sidebar="collapsed"] .nav-link__label,
+.shell[data-sidebar="collapsed"] .brand__name,
+.shell[data-sidebar="collapsed"] .brand__tag,
+.shell[data-sidebar="collapsed"] .nav-group__title,
+.shell[data-sidebar="collapsed"] .count-badge {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.shell[data-sidebar="collapsed"] .sidebar__brand {
+  flex-direction: column;
+  justify-content: center;
+  height: auto;
+  min-height: var(--topbar-h);
+  padding: var(--sp-2) 0;
+}
+
+.shell[data-sidebar="collapsed"] .nav-link {
+  justify-content: center;
+  padding: 0;
+}
+
+.shell[data-sidebar="collapsed"] .nav-group + .nav-group {
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--border);
+}
+
+.shell[data-sidebar="collapsed"] .sidebar__meta {
+  justify-content: center;
+}
+
+@media (max-width: 1100px) {
+  .shell {
+    grid-template-columns: var(--sidebar-w-collapsed) minmax(0, 1fr);
+  }
+
+  .nav-link__label,
+  .brand__name,
+  .brand__tag,
+  .nav-group__title,
+  .sidebar .count-badge {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .sidebar__brand {
+    justify-content: center;
+    padding: 0;
+  }
+
+  .sidebar__collapse {
+    display: none;
+  }
+
+  .nav-link {
+    justify-content: center;
+    padding: 0;
+  }
+
+  .nav-group + .nav-group {
+    margin-top: var(--sp-2);
+    padding-top: var(--sp-2);
+    border-top: 1px solid var(--border);
+  }
+
+  .sidebar__meta {
+    justify-content: center;
+  }
+}
+
+/* ------------------------------------------------------------------------------------------- top bar */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: var(--topbar-h);
+  padding: 0 var(--sp-6);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-1);
+}
+
+/* Controls never shrink below their size (a squeezed button is a too-small target); the spacer absorbs the rest,
+   and narrower screens drop words before they drop controls (rules below and in the phone section). */
+.topbar > * {
+  flex-shrink: 0;
+}
+
+/* The range <details> is the one item allowed to give way: in mobile emulation Chrome sizes a closed <details>
+   flex item to the whole free width, which pushed Pause off a phone screen. */
+.topbar > .range {
+  flex: 0 1 auto;
+  width: fit-content;
+  min-width: 0;
+}
+
+.topbar__brand {
+  display: none;
+}
+
+.topbar__spacer {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+@media (max-width: 1400px) {
+  .range__compare-text {
+    display: none;
+  }
+
+  .topbar .search-btn {
+    min-width: 200px;
+  }
+}
+
+@media (max-width: 1240px) {
+  .topbar .search-btn {
+    justify-content: center;
+    min-width: 0;
+    width: 36px;
+    padding: 0;
+  }
+
+  .topbar .search-btn__text,
+  .topbar .search-btn__keys {
+    display: none;
+  }
+
+  /* Icon only, but the words stay as the button's accessible name. */
+  .topbar__limit > span:not(.badge) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+.range__button {
+  gap: var(--sp-2);
+}
+
+.range__short {
+  display: none;
+}
+
+.range__compare {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding-left: var(--sp-2);
+  border-left: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.topbar__pause-short {
+  display: none;
+}
+
+/* ------------------------------------------------------------------------------------------- banners */
+.banners {
+  display: grid;
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-6);
+  border-bottom: 1px solid var(--border);
+}
+
+.banner--bad {
+  background: var(--bad-soft);
+}
+
+.banner--warn {
+  background: var(--warn-soft);
+}
+
+.banner__icon {
+  flex: none;
+  width: 20px;
+  height: 20px;
+}
+
+.banner--bad .banner__icon {
+  color: var(--bad);
+}
+
+.banner--warn .banner__icon {
+  color: var(--warn);
+}
+
+.banner__text {
+  flex: 1;
+  min-width: 0;
+}
+
+.banner__title {
+  font-weight: var(--fw-semibold);
+}
+
+.banner__text p + p {
+  color: var(--text-muted);
+}
+
+.banner__text strong {
+  color: var(--text);
+}
+
+/* ------------------------------------------------------------------------------------------- page header */
+.page-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-3);
+}
+
+.page-header__title {
+  font-size: var(--fs-5);
+}
+
+.page-header__purpose {
+  margin-top: var(--sp-1);
+  color: var(--text-muted);
+  font-size: var(--fs-3);
+}
+
+.page-header__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.page-header__actions:empty {
+  display: none;
+}
+
+.how-to-read {
+  margin-bottom: var(--sp-6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-1);
+}
+
+.how-to-read > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 40px;
+  padding: 0 var(--sp-4);
+  color: var(--text-muted);
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+  list-style: none;
+}
+
+.how-to-read > summary::-webkit-details-marker {
+  display: none;
+}
+
+.how-to-read > summary:hover {
+  color: var(--text);
+}
+
+.how-to-read__chevron {
+  margin-left: auto;
+  transition: transform var(--dur) var(--ease);
+}
+
+.how-to-read[open] .how-to-read__chevron {
+  transform: rotate(180deg);
+}
+
+.how-to-read__body {
+  padding: 0 var(--sp-4) var(--sp-4);
+  max-width: 80ch;
+}
+
+/* ------------------------------------------------------------------------------------------- grids */
+.stack > * + * {
+  margin-top: var(--sp-4);
+}
+
+.stack-lg > * + * {
+  margin-top: var(--sp-6);
+}
+
+.cluster {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.grid {
+  display: grid;
+  gap: var(--sp-4);
+}
+
+.grid--2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.grid--3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.grid--4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.grid--main-side {
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+}
+
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(208px, 1fr));
+  gap: var(--sp-3);
+}
+
+@media (max-width: 1280px) {
+  .grid--4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .grid--3,
+  .grid--main-side {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 900px) {
+  .grid--2,
+  .grid--4 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ------------------------------------------------------------------------------------------- footer */
+.app-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-6);
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+/* ------------------------------------------------------------------------------------------- phone (plan 14.8) */
+.mobile-nav {
+  display: none;
+}
+
+@media (max-width: 760px) {
+  /* The bottom bar covers the last 64 px of the screen: keyboard focus scrolls clear of it (WCAG 2.4.11). */
+  html {
+    scroll-padding-bottom: calc(var(--mobile-nav-h) + var(--sp-4) + env(safe-area-inset-bottom));
+  }
+
+  .shell,
+  .shell[data-sidebar="collapsed"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sidebar {
+    display: none;
+  }
+
+  .topbar {
+    gap: var(--sp-1);
+    padding: 0 var(--sp-3);
+  }
+
+  .topbar__brand {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--target-touch);
+    height: var(--target-touch);
+    margin-left: calc(-1 * var(--sp-2));
+  }
+
+  .range__long,
+  .range__compare,
+  .search-btn__text,
+  .search-btn__keys,
+  .topbar__health,
+  .topbar__limit,
+  .topbar__recs,
+  .topbar__pause-long,
+  .live-pill__text {
+    display: none !important;
+  }
+
+  .range__short,
+  .topbar__pause-short {
+    display: inline;
+  }
+
+  /* The account menu moves into the bottom sheet; search becomes a 44 px icon button. */
+  .topbar .user-menu {
+    display: none;
+  }
+
+  .topbar .search-btn {
+    justify-content: center;
+    min-width: 0;
+    width: var(--target-touch);
+    min-height: var(--target-touch);
+    padding: 0;
+    border-color: transparent;
+    background: transparent;
+  }
+
+  .topbar .search-btn .icon {
+    width: 20px;
+    height: 20px;
+  }
+
+  .topbar .btn,
+  .range__button {
+    min-height: var(--target-touch);
+    padding: 0 10px;
+  }
+
+  .topbar .live-pill {
+    padding: 0 8px;
+  }
+
+  .main {
+    padding: var(--sp-4) var(--sp-4) calc(var(--mobile-nav-h) + var(--sp-8) + env(safe-area-inset-bottom));
+  }
+
+  .banner {
+    flex-wrap: wrap;
+    padding: var(--sp-3) var(--sp-4);
+  }
+
+  .page-header__title {
+    font-size: var(--fs-4);
+  }
+
+  .page-header__purpose {
+    font-size: var(--fs-2);
+  }
+
+  .kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));  /* two tiles per row on a phone (plan 14.8) */
+    gap: var(--sp-2);
+  }
+
+  .app-footer {
+    padding: var(--sp-4) var(--sp-4) calc(var(--mobile-nav-h) + var(--sp-4) + env(safe-area-inset-bottom));
+  }
+
+  .mobile-nav {
+    position: fixed;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 40;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    min-height: var(--mobile-nav-h);
+    padding: var(--sp-1) var(--sp-2) env(safe-area-inset-bottom);
+    border-top: 1px solid var(--border);
+    background: var(--surface-1);
+  }
+
+  .mobile-nav__item {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-height: var(--target-touch);
+    padding: var(--sp-1);
+    border: 0;
+    border-radius: var(--radius);
+    background: none;
+    color: var(--text-muted);
+    font-size: var(--fs-1);
+    font-weight: var(--fw-medium);
+  }
+
+  .mobile-nav__item:hover {
+    text-decoration: none;
+  }
+
+  .mobile-nav__item[aria-current="page"] {
+    color: var(--accent);
+  }
+
+  .mobile-nav__item .icon {
+    width: 22px;
+    height: 22px;
+  }
+
+  .mobile-nav__item .count-badge {
+    position: absolute;
+    top: 2px;
+    left: calc(50% + 6px);
+  }
+}
+
+/* Touch screens get 44 px targets everywhere, whatever their width (plan 14.8). */
+@media (pointer: coarse) {
+  .nav-link,
+  .btn,
+  .icon-btn,
+  .menu__item,
+  .input,
+  .search-btn,
+  .segmented__item,
+  .pill-radio span,
+  .legend-item,
+  .link-btn,
+  .th-sort,
+  .chip-select select,
+  .avatar-btn,
+  .how-to-read > summary,
+  .details-summary {
+    min-height: var(--target-touch);
+  }
+
+  .icon-btn,
+  .icon-btn--sm,
+  .avatar-btn,
+  .help-dot {
+    min-width: var(--target-touch);
+  }
+
+  .help-dot {
+    height: var(--target-touch);
+  }
+}

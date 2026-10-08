@@ -1,0 +1,239 @@
+{#
+	The home page `/` (plan 16.1). The head keeps v1's SEO data exactly (title, the three description texts,
+	keywords, robots, theme color, canonical link, Open Graph and Twitter tags, JSON-LD); tests compare them with
+	the v1 template in tests/fixtures/v1/home_page.html. Section ids are v1's, so old links such as
+	`/#tokenSafetyHeading` still land on the right heading. Texts that name people, prices or hosting facts come
+	from the `site_*` settings (D18) and are already escaped HTML; every limit comes from the live settings.
+	The Luau snippets (`examples.*`) are the files in templates/public/examples/, highlighted on the server by
+	pages.home_examples() into complete `<pre><code class="language-luau hl">` blocks (escaped, no inline style).
+#}
+{% extends "public/base.html" %}
+{% block head %}
+		<title>Roxy: Free Proxy for Roblox Web APIs</title>
+		<meta
+			name="description"
+			content="Roxy is a free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Call any public Roblox endpoint from HttpService by prefixing it with roxytheproxy.com; supports GET, POST, PATCH, PUT and DELETE."
+		/>
+		<meta
+			name="keywords"
+			content="Roblox proxy, Roblox API proxy, free Roblox proxy, RoProxy alternative, HttpService proxy, Roblox web API, Roblox HttpService CORS, no login Roblox proxy"
+		/>
+		<meta name="robots" content="index, follow" />
+		<meta name="theme-color" content="#0b0f14" />
+		<link rel="canonical" href="https://roxytheproxy.com/" />
+		<!-- Open Graph / social -->
+		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content="Roxy Proxy" />
+		<meta property="og:title" content="Roxy: Free Proxy for Roblox Web APIs" />
+		<meta
+			property="og:description"
+			content="A free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Prefix any Roblox endpoint with roxytheproxy.com and call it from HttpService."
+		/>
+		<meta property="og:url" content="https://roxytheproxy.com/" />
+		<meta property="og:image" content="{{ canonical_origin }}{{ static_url('public/roxy_icon.png') }}" />
+		<meta name="twitter:card" content="summary" />
+		<meta name="twitter:title" content="Roxy: Free Proxy for Roblox Web APIs" />
+		<meta
+			name="twitter:description"
+			content="A free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Prefix any Roblox endpoint with roxytheproxy.com and call it from HttpService."
+		/>
+		<meta name="twitter:image" content="{{ canonical_origin }}{{ static_url('public/roxy_icon.png') }}" />
+{% endblock %}
+{% block head_extra %}
+		<script type="application/ld+json" nonce="{{ csp_nonce }}">
+			{
+				"@context": "https://schema.org",
+				"@type": "WebApplication",
+				"name": "Roxy",
+				"url": "https://roxytheproxy.com/",
+				"description": "A free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Prefix any public Roblox endpoint with roxytheproxy.com and call it from Roblox's HttpService.",
+				"applicationCategory": "DeveloperApplication",
+				"operatingSystem": "Any",
+				"offers": {
+					"@type": "Offer",
+					"price": "0",
+					"priceCurrency": "USD"
+				}
+			}
+		</script>
+{% endblock %}
+{% block content %}
+			<section class="hero" aria-labelledby="page-title">
+				<h1 id="page-title">Roxy Proxy</h1>
+				<p class="tagline">A free, fast proxy for public Roblox web APIs. No login, no ROBLOSECURITY token, no API key.</p>
+				<p class="actions">
+					<a class="button button-primary" href="/docs">Read the user guide</a>
+					{% if status_enabled %}
+					<a class="button" href="/status">Check the status</a>
+					{% endif %}
+				</p>
+			</section>
+
+			<section class="card" aria-labelledby="titleHeader">
+				<details open>
+					<summary><h2 id="titleHeader">Welcome to Roxy!</h2></summary>
+					<div class="card-body">
+						<p class="lead">
+							<strong>Roxy</strong> is a free proxy for Roblox web APIs. Roblox game servers cannot call
+							<code>*.roblox.com</code> from <code>HttpService</code>, so Roxy makes the call for you and returns
+							Roblox's answer. It caches popular answers and shares Roblox's rate limits fairly between every game
+							that uses it.
+						</p>
+						<p class="note">
+							The person who made
+							<a href="https://devforum.roblox.com/t/roproxycom-a-free-rotating-proxy-for-roblox-apis/1508367">Roproxy</a>
+							has a <a href="https://github.com/askfalse/roproxy-lite">GitHub</a> available to make your own proxy. So if
+							you are looking for this option, it exists and is your safest option for using a proxy.
+						</p>
+						<p>
+							Why did I make Roxy? Because
+							<a href="https://devforum.roblox.com/t/roproxycom-a-free-rotating-proxy-for-roblox-apis/1508367">Roproxy</a>
+							throttles about 60 seconds per request, and I wanted something a bit faster for my own projects. I
+							figured if I'm going to make the proxy anyway, I may as well share it.
+						</p>
+						<p>
+							Found a problem or a security issue? Please tell {{ contact_name }}. White Hats can read about
+							vulnerability reporting and rewards <a href="#tokenSafetyHeading">below</a>.
+						</p>
+					</div>
+				</details>
+			</section>
+
+			<section class="card" aria-labelledby="getExampleHeading">
+				<details open>
+					<summary><h2 id="getExampleHeading">Quick start (30 seconds)</h2></summary>
+					<div class="card-body">
+						<p>
+							Use Roxy exactly like the Roblox API: put <code>https://roxytheproxy.com/</code> in front of the Roblox
+							host. For example:
+						</p>
+						<pre><code>https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&amp;page=1&amp;itemsPerPage=100&amp;isEditable=true</code></pre>
+						<p>
+							That works in a browser, and from a server <code>Script</code> with <code>HttpService</code> (turn on
+							<strong>Allow HTTP Requests</strong> in Game Settings, Security). Every example here is complete,
+							typed Luau that passes the type checker in <code>--!strict</code> mode; values that never change are
+							declared with <code>const</code>.
+						</p>
+						{{ examples.get_async }}
+						<p>
+							<code>GetAsync</code> raises an error for anything but success. To read the status code and wait as
+							long as Roxy asks you to, use <code>RequestAsync</code>:
+						</p>
+						{{ examples.request_async }}
+						<p>
+							Adding <code>&amp;prettyprint=true</code> (or <code>?prettyprint=true</code> when there is no other
+							parameter) makes the JSON easier to read in a browser. It is specific to Roxy and works for every
+							request type:
+						</p>
+						<pre><code>https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&amp;page=1&amp;itemsPerPage=100&amp;isEditable=true&amp;prettyprint=true</code></pre>
+						<p>More examples, including batch lookups and a reusable module with caching, are in the <a href="/docs#3-examples-in-luau">user guide</a>.</p>
+					</div>
+				</details>
+			</section>
+
+			<section class="card" aria-labelledby="limits">
+				<h2 id="limits">Limits at a glance</h2>
+				<ul class="facts">
+					<li>
+						<strong>{{ limits.requests_text }} every {{ limits.window_text }}</strong>
+						per IP address. {{ limits.pacing_rule }} {{ limits.cache_hits_rule }}
+					</li>
+					<li>
+						<strong>Flood limit: {{ limits.flood_text }} per minute</strong> per IP
+						address, counting every request, cached or not. Normal games never get near it.
+					</li>
+					{% if limits.place_limit_enabled %}
+					<li>
+						<strong>{{ limits.place_text }} per minute per experience</strong>,
+						{{ limits.place_limit_scope }}.
+					</li>
+					{% endif %}
+					<li>
+						Over a limit, Roxy answers <code>429</code> with a <code>Retry-After</code> header. Wait that many
+						seconds; retrying sooner makes the wait longer.
+					</li>
+					<li>
+						<strong>Tip:</strong> your own cache is the best way to stay under the limit. An answer your game
+						already has costs no request at all.
+					</li>
+				</ul>
+				<p class="muted">These numbers come from Roxy's live settings. The <a href="/docs#4-limits">guide</a> explains how they work.</p>
+			</section>
+
+			<section class="card" aria-labelledby="generalTipsHeader">
+				<details open>
+					<summary><h2 id="generalTipsHeader">General Tips (Highly Recommended Reading)</h2></summary>
+					<div class="card-body">
+						<p class="note">
+							Roxy is for <strong>public, unauthenticated</strong> Roblox web API calls only; it does not support
+							requests that need you to be logged in, and it will reject any request that looks like it carries a
+							Roblox <code>.ROBLOSECURITY</code> cookie. Never send your <code>ROBLOSECURITY</code> token to Roxy (or
+							to any third-party proxy). More info <a href="#tokenSafetyHeading">below</a> for why.
+						</p>
+						<p>
+							It is highly encouraged to have caching on your end to make fewer requests, and also have instant
+							responses. Batch endpoints that take a list of ids turn many requests into one.
+						</p>
+						<p>If you use <code>RequestAsync</code>, Roblox gives you the response headers. These are the most useful ones Roxy adds:</p>
+						<ul>
+							<li><code>Roxy-Requests-Left</code>: How many more requests you have until you get throttled.</li>
+							<li><code>Roxy-Throttle-Reset</code>: How many seconds until your request pool resets.</li>
+							<li><code>Roxy-Throttled</code>: Whether or not you have been throttled.</li>
+							<li><code>Retry-After</code>: How many seconds to wait before trying again, on <code>429</code> and <code>503</code> answers.</li>
+							<li><code>Roxy-Cache</code>: Whether the answer came from Roxy's cache (<code>HIT</code>) or from Roblox (<code>MISS</code>).</li>
+							<li><code>Roxy-Paused</code>: Only present when the proxy is temporarily paused for maintenance.</li>
+							<li><code>Roxy-Blocked</code>: Only present when the endpoint you requested has been blocked by the admin.</li>
+							<li><code>Roxy-Endpoint-Limited</code>: Only present when a per-endpoint rate limit rejected your request.</li>
+						</ul>
+						<p>Every header is described in the <a href="/docs#6-response-headers-reference">guide</a>.</p>
+					</div>
+				</details>
+			</section>
+
+			<section class="card" aria-labelledby="otherMethodsHeading">
+				<details open>
+					<summary><h2 id="otherMethodsHeading">POST / PATCH / PUT / DELETE Requests</h2></summary>
+					<div class="card-body">
+						<p class="note">
+							Most (if not all) <code>POST</code>/<code>PATCH</code>/<code>PUT</code>/<code>DELETE</code> endpoints on
+							Roblox's API require you to be logged in. Roxy
+							<a href="#tokenSafetyHeading">does not support authenticated requests</a>, so these methods only work
+							against the small number of public, unauthenticated endpoints Roblox exposes, such as batch lookups. If
+							you need to write data as a specific account, you'll need to call Roblox directly with your own
+							authenticated client, and unfortunately that isn't something Roxy can do for you.
+						</p>
+						<p>
+							The calling convention is the same as <code>GET</code>, with a different <code>Method</code> and a JSON
+							<code>Body</code>. This batch lookup is public, so it works through Roxy:
+						</p>
+						{{ examples.post_batch }}
+					</div>
+				</details>
+			</section>
+
+			<section class="card" aria-labelledby="tokenSafetyHeading">
+				<h2 id="tokenSafetyHeading">No Login Required &amp; White Hats</h2>
+				<div class="site-text warning">
+					{{ white_hats_html }}
+				</div>
+				<hr />
+				<div class="site-text">
+					{{ bug_bounty_html }}
+				</div>
+				<p>How to report a vulnerability is explained in the <a href="/docs#11-security-reports-and-bug-bounty">guide</a>.</p>
+			</section>
+
+			<section class="card" aria-labelledby="internalsHeading">
+				<h2 id="internalsHeading">Roxy Internals</h2>
+				<div class="site-text">
+					{{ hosting_html }}
+				</div>
+			</section>
+
+			<section class="card" aria-labelledby="supportHeading">
+				<h2 id="supportHeading">Support Me</h2>
+				<div class="site-text">
+					{{ support_html }}
+				</div>
+			</section>
+{% endblock %}

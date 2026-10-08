@@ -1,0 +1,25 @@
+{#-
+  Empty state (plan 14.5).
+
+  What: `empty_state(title, body, icon_name, tone, doc_href)` explains why a chart, table or list is empty and what
+  will fill it, for example "No 429s from Roblox in this range. Good." with a link to the docs.
+  Why: a blank box makes people wonder whether the page is broken. Saying why it is empty (and whether that is
+  good news) turns "nothing" into information.
+  How: tone "good" uses the ok color and a check icon, "neutral" stays quiet, "info" points to what to do next.
+-#}
+{% from "components/icon.html" import icon %}
+
+{% macro empty_state(title, body=None, icon_name="inbox", tone="neutral", doc_href=None, doc_label="Learn more",
+                     action_label=None, action_href=None) -%}
+<div class="empty empty--{{ tone }}">
+  <span class="empty__icon">{{ icon("check-circle" if tone == "good" and icon_name == "inbox" else icon_name) }}</span>
+  <p class="empty__title">{{ title }}</p>
+  {% if body %}<p class="empty__body">{{ body }}</p>{% endif %}
+  {% if doc_href or action_href %}
+  <p class="empty__links">
+    {% if action_href %}<a class="btn btn--sm" href="{{ action_href }}">{{ action_label }}</a>{% endif %}
+    {% if doc_href %}<a href="{{ doc_href }}">{{ doc_label }}</a>{% endif %}
+  </p>
+  {% endif %}
+</div>
+{%- endmacro %}

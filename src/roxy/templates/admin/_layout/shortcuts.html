@@ -1,0 +1,48 @@
+{#-
+  Keyboard shortcuts overlay (plan 14.6): opened with ? (or from the account menu and the palette), lists every
+  shortcut so they are discoverable. Shortcuts never fire while you type in a field (static/js/palette.js).
+  The footer switch turns the single-key shortcuts off (WCAG 2.1.4, Level A: speech input and unsteady hands
+  trigger them by accident); static/js/palette.js remembers the choice in this browser and keeps every switch with
+  `data-shortcuts-toggle` (this one and the account menu's) in step. Ctrl+K needs a modifier, so it stays on.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "admin/_layout/nav.html" import PAGES %}
+<dialog class="dialog shortcuts" id="shortcuts" aria-labelledby="shortcuts-title">
+  <header class="dialog__head">
+    <h2 class="dialog__title" id="shortcuts-title">{{ icon("keyboard", cls="dialog__title-icon") }}Keyboard shortcuts</h2>
+    {#- autofocus: opening the list must not put focus on the switch below, where Space would turn it off -#}
+    <button type="button" class="icon-btn" data-dialog-close aria-label="Close" autofocus>{{ icon("x") }}</button>
+  </header>
+  <div class="dialog__body shortcuts__body">
+    <section aria-labelledby="sc-general">
+      <h3 class="shortcuts__group" id="sc-general">General</h3>
+      <dl class="shortcuts__list">
+        <div><dt><kbd>Ctrl</kbd><kbd>K</kbd> or <kbd>/</kbd></dt><dd>Open the command palette</dd></div>
+        <div><dt><kbd>?</kbd></dt><dd>Show this list</dd></div>
+        <div><dt><kbd>Esc</kbd></dt><dd>Close a dialog, menu or the palette</dd></div>
+        <div><dt><kbd>T</kbd></dt><dd>Cycle the time range</dd></div>
+        <div><dt><kbd>C</kbd></dt><dd>Turn the comparison on or off</dd></div>
+      </dl>
+    </section>
+    <section aria-labelledby="sc-go">
+      <h3 class="shortcuts__group" id="sc-go">Go to a page (press G, then the letter)</h3>
+      <dl class="shortcuts__list">
+        {% for p in PAGES if p["keys"] %}
+        <div><dt>{% for k in p["keys"].split(" ") %}<kbd>{{ k|upper }}</kbd>{% endfor %}</dt><dd>{{ p.label }}</dd></div>
+        {% endfor %}
+      </dl>
+    </section>
+    <section aria-labelledby="sc-lists">
+      <h3 class="shortcuts__group" id="sc-lists">Live tail and tables</h3>
+      <dl class="shortcuts__list">
+        <div><dt><kbd>Up</kbd><kbd>Down</kbd></dt><dd>Move between rows</dd></div>
+        <div><dt><kbd>Enter</kbd></dt><dd>Open the row's details</dd></div>
+        <div><dt><kbd>P</kbd></dt><dd>Pause or resume the live tail</dd></div>
+      </dl>
+    </section>
+  </div>
+  <div class="dialog__foot shortcuts__foot">
+    <label class="check"><input type="checkbox" data-shortcuts-toggle checked aria-describedby="sc-switch-hint"><span>Single-key shortcuts</span></label>
+    <p class="field__hint" id="sc-switch-hint">Turn them off if keys fire by accident, for example with speech input. Ctrl+K still opens the palette. Remembered in this browser.</p>
+  </div>
+</dialog>

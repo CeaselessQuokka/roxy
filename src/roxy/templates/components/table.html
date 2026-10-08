@@ -1,0 +1,158 @@
+{#-
+  Top-N table shell with server-side paging, sorting, search, filter chips, column chooser and export (plan 14.5).
+
+  What
+    `data_table(id, columns, rows, src=..., total=..., page=..., size=..., sort=..., dir=...)` renders one
+    self-contained table block. Every control re-asks the server through htmx: the server answers with the same
+    macro for the new page, and htmx swaps the whole block (`outerHTML` on `#id`). The same macro serves the first
+    page render and every fragment, so the two can never drift.
+  Why
+    Dashboard tables can have millions of rows (endpoint records, clients); only the server can sort and page them
+    honestly (v1 sorted rendered rows in the browser, so "top 25" meant "top 25 of what was sent"). Paging sizes
+    10, 25, 50, 100 and 250 are kept from v1, and the choices a person makes (rows per page, hidden columns) are
+    remembered per table in this browser by static/js/tables.js.
+  How
+    State lives in one form (`#id-state`): q, filters, and hidden page, size, sort and dir inputs. The search box
+    asks after a short pause; selects ask on change; sort headers, the pager and the rows-per-page select set the
+    hidden inputs and submit the form (tables.js), so there is exactly one request shape:
+    `GET src?q=&page=&size=&sort=&dir=&<filter>=`. Row cells carry `data-label` so phones can show each row as a
+    card with the key columns (`key_col`) and open the rest in the drawer (plan 14.8).
+
+    columns: [{"key", "label", "num": bool, "sortable": bool (default true), "key_col": bool, "help": str,
+               "hidden": bool (hidden by default), "mono": bool}]
+    rows:    [{"id": str, "drawer": url or None, "cells": {key: value | {"text", "href", "tone", "mono", "sub"}}}]
+             (a cell `href` becomes a link only when it is a path on this site, format.html `local_href`)
+    filters: [{"name", "label", "value", "options": [[value, label], ...]}]
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import help_dot %}
+{% from "components/format.html" import num, local_href %}
+{% from "components/empty.html" import empty_state %}
+
+{% macro _cell(column, value) -%}
+{%- if value is mapping -%}
+  {%- set href = local_href(value.href) if value.href else "" -%}
+  {%- if href -%}<a href="{{ href }}" class="{% if value.mono or column.mono %}mono{% endif %}">{{ value.text }}</a>
+  {%- elif value.tone -%}<span class="tone tone--{{ value.tone }}">{{ value.text }}</span>
+  {%- else -%}<span class="{% if value.mono or column.mono %}mono{% endif %}">{{ value.text }}</span>
+  {%- endif -%}
+  {%- if value.sub %}<span class="dt__sub">{{ value.sub }}</span>{% endif -%}
+{%- elif value is none -%}<span class="muted">n/a</span>
+{%- elif column.num and value is number -%}{{ num(value) }}
+{%- elif column.mono -%}<span class="mono">{{ value }}</span>
+{%- else -%}{{ value }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro data_table(id, columns, rows, src="", total=None, page=1, size=25, sort=None, dir="desc", q="",
+                    filters=(), export_url=None, sizes=(10, 25, 50, 100, 250), empty=None, caption=None,
+                    searchable=True, search_label="Search", search_placeholder="Search", show_caption=False) -%}
+{%- set total = total if total is not none else rows|length -%}
+{%- set pages = [((total + size - 1) // size), 1]|max -%}
+{%- set first_row = 0 if total == 0 else (page - 1) * size + 1 -%}
+{%- set last_row = [page * size, total]|min -%}
+{%- set params = {"q": q, "page": page, "size": size, "sort": sort or "", "dir": dir} -%}
+{%- for f in filters %}{% set _ = params.update({f.name: f.value or ""}) %}{% endfor -%}
+<div class="dt" id="{{ id }}" data-dt data-dt-id="{{ id }}" data-dt-src="{{ src }}">
+  <div class="dt__toolbar">
+    <form class="dt__state" id="{{ id }}-state" data-dt-state role="search" aria-label="{{ caption or 'Table' }}: search and filters"
+          hx-get="{{ src }}" hx-target="#{{ id }}" hx-swap="outerHTML" hx-indicator="#{{ id }}"
+          hx-trigger="submit, change, input changed delay:400ms from:#{{ id }}-q">
+      {% if searchable %}
+      <label class="sr-only" for="{{ id }}-q">{{ search_label }}</label>
+      <span class="input-icon">{{ icon("search") }}<input type="search" id="{{ id }}-q" name="q" value="{{ q }}" placeholder="{{ search_placeholder }}" autocomplete="off" spellcheck="false"></span>
+      {% endif %}
+      {% for f in filters %}
+      <label class="chip-select">
+        <span class="chip-select__label">{{ f.label }}</span>
+        <select name="{{ f.name }}" aria-label="Filter by {{ f.label|lower }}">
+          {% for value, text in f.options %}<option value="{{ value }}"{% if value == (f.value or "") %} selected{% endif %}>{{ text }}</option>{% endfor %}
+        </select>
+      </label>
+      {% endfor %}
+      <input type="hidden" name="page" value="{{ page }}" data-dt-field="page">
+      <input type="hidden" name="size" value="{{ size }}" data-dt-field="size">
+      <input type="hidden" name="sort" value="{{ sort or '' }}" data-dt-field="sort">
+      <input type="hidden" name="dir" value="{{ dir }}" data-dt-field="dir">
+    </form>
+    <div class="dt__tools">
+      <details class="menu" data-menu>
+        <summary class="btn btn--sm btn--ghost">{{ icon("columns") }}<span>Columns</span></summary>
+        <div class="menu__panel menu__panel--end" role="group" aria-label="Columns to show">
+          {% for c in columns %}
+          <label class="check"><input type="checkbox" data-dt-col="{{ c.key }}"{% if not c.hidden %} checked{% endif %}{% if loop.first %} disabled{% endif %}><span>{{ c.label }}</span></label>
+          {% endfor %}
+        </div>
+      </details>
+      {% if export_url %}
+      <details class="menu" data-menu>
+        <summary class="btn btn--sm btn--ghost">{{ icon("download") }}<span>Export</span></summary>
+        <div class="menu__panel menu__panel--end">
+          {% set export_params = params.copy() %}{% set _ = export_params.pop("page") %}{% set _ = export_params.pop("size") %}
+          <a class="menu__item" href="{{ export_url }}?{{ dict(export_params, format='csv')|urlencode }}" download>CSV (spreadsheet safe)</a>
+          <a class="menu__item" href="{{ export_url }}?{{ dict(export_params, format='json')|urlencode }}" download>JSON</a>
+        </div>
+      </details>
+      {% endif %}
+    </div>
+  </div>
+  <div class="dt__scroll" tabindex="0" role="region" aria-labelledby="{{ id }}-caption">
+    <table class="dt__table">
+      <caption id="{{ id }}-caption" class="{% if caption and show_caption %}dt__caption{% else %}sr-only{% endif %}">{{ caption or "Table" }}<span class="sr-only">, {{ first_row }} to {{ last_row }} of {{ total }} rows{% if sort %}, sorted by {{ sort }} {{ "ascending" if dir == "asc" else "descending" }}{% endif %}</span></caption>
+      <thead>
+        <tr>
+          {% for c in columns %}
+          {%- set sorted_here = (sort == c.key) -%}
+          <th scope="col" data-col="{{ c.key }}" class="{% if c.num %}num{% endif %}"{% if c.hidden %} hidden{% endif %}{% if c.sortable is not defined or c.sortable %} aria-sort="{{ ('ascending' if dir == 'asc' else 'descending') if sorted_here else 'none' }}"{% endif %}>
+            {%- if c.sortable is not defined or c.sortable -%}
+            <button type="button" class="th-sort" data-dt-sort="{{ c.key }}" data-dt-next-dir="{{ ('desc' if dir == 'asc' else 'asc') if sorted_here else ('asc' if not c.num else 'desc') }}">
+              <span>{{ c.label }}</span>{{ icon("chevron-up" if sorted_here and dir == "asc" else "chevron-down", cls="th-sort__icon" ~ (" is-active" if sorted_here else "")) }}
+            </button>
+            {%- else -%}<span class="th-label">{{ c.label }}</span>{%- endif -%}
+            {%- if c.help %}{{ help_dot(c.label, c.help) }}{% endif -%}
+          </th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr{% if row.drawer %} data-drawer-src="{{ row.drawer }}"{% endif %} data-row-id="{{ row.id or loop.index }}">
+          {% for c in columns %}
+          {%- set value = row.cells.get(c.key) -%}
+          <td data-col="{{ c.key }}" data-label="{{ c.label }}" class="{% if c.num %}num{% endif %}"{% if c.key_col or loop.first %} data-key{% endif %}{% if c.hidden %} hidden{% endif %}>
+            {%- if loop.first and not (value is mapping and value.href and local_href(value.href)) -%}
+            <button type="button" class="link-btn" data-dt-open>{{ _cell(c, value) }}</button>
+            {%- else -%}{{ _cell(c, value) }}{%- endif -%}
+          </td>
+          {% endfor %}
+        </tr>
+        {% else %}
+        <tr class="dt__empty-row">
+          <td colspan="{{ columns|length }}">
+            {% if empty %}{{ empty_state(empty.title, empty.body, empty.icon or "inbox", empty.tone or "neutral", empty.doc_href, empty.doc_label or "Learn more") }}
+            {% else %}{{ empty_state("Nothing to show", "No rows match this range and these filters.") }}{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="dt__foot">
+    <p class="dt__count">{% if total %}Showing <strong>{{ num(first_row) }}</strong> to <strong>{{ num(last_row) }}</strong> of <strong>{{ num(total) }}</strong>{% else %}No rows{% endif %}</p>
+    <label class="dt__size">
+      <span>Rows</span>
+      <select data-dt-size aria-label="Rows per page">
+        {% for s in sizes %}<option value="{{ s }}"{% if s == size %} selected{% endif %}>{{ s }}</option>{% endfor %}
+      </select>
+    </label>
+    <nav class="pager" aria-label="{{ caption or 'Table' }}: pages">
+      <button type="button" class="icon-btn icon-btn--sm" data-dt-page="1" aria-label="First page"{% if page <= 1 %} disabled{% endif %}>{{ icon("chevron-left") }}{{ icon("chevron-left", cls="icon--stack") }}</button>
+      <button type="button" class="icon-btn icon-btn--sm" data-dt-page="{{ page - 1 }}" aria-label="Previous page"{% if page <= 1 %} disabled{% endif %}>{{ icon("chevron-left") }}</button>
+      <span class="pager__pos">Page {{ page }} of {{ pages }}</span>
+      <button type="button" class="icon-btn icon-btn--sm" data-dt-page="{{ page + 1 }}" aria-label="Next page"{% if page >= pages %} disabled{% endif %}>{{ icon("chevron-right") }}</button>
+      <button type="button" class="icon-btn icon-btn--sm" data-dt-page="{{ pages }}" aria-label="Last page"{% if page >= pages %} disabled{% endif %}>{{ icon("chevron-right") }}{{ icon("chevron-right", cls="icon--stack") }}</button>
+    </nav>
+  </div>
+  <div class="dt__progress" aria-hidden="true"></div>
+</div>
+{%- endmacro %}

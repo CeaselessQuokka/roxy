@@ -1,0 +1,33 @@
+{#
+	The user guide `/docs` (plan 16.2): docs/USER_GUIDE.md rendered by roxy/public/pages.py (markdown-it, raw HTML
+	escaped, heading anchors, live values already inserted and escaped), with a sticky table of contents built
+	from its h2 and h3 headings. The script adds a Copy button to every code block.
+#}
+{% extends "public/base.html" %}
+{% block head %}
+		<title>Roxy User Guide</title>
+		<meta
+			name="description"
+			content="How to call Roblox web APIs through Roxy from HttpService: URL format, Luau examples, live limits, caching, every Roxy response header and status code, privacy and security reports."
+		/>
+		<meta name="robots" content="index, follow" />
+		<link rel="canonical" href="{{ canonical_origin }}/docs" />
+{% endblock %}
+{% block main_class %} wide{% endblock %}
+{% block content %}
+			<div class="docs-layout">
+				<nav class="toc" aria-label="Contents">
+					<details open>
+						<summary>Contents</summary>
+						<ol>
+							{% for entry in toc %}
+							<li class="toc-level-{{ entry.level }}"><a href="#{{ entry.anchor }}">{{ entry.title }}</a></li>
+							{% endfor %}
+						</ol>
+					</details>
+				</nav>
+				<article class="doc">
+{{ guide_html }}
+				</article>
+			</div>
+{% endblock %}

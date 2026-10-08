@@ -1,0 +1,19 @@
+# roxy-audit.path: runs the permission audit after every deploy (plan 17.4 step 9).
+#
+# deploy.sh records the deployed commit in /var/lib/roxy-deploy/deployed_version as its last step. The deploy user
+# may not start roxy-audit.service itself (the sudo rules allow only the two wrappers and the roxy@ colors, plan
+# 9.14), so this path unit notices the new file and starts the audit.
+
+[Unit]
+# Shown in `systemctl list-units`.
+Description=Run the Roxy permission audit after a deploy
+
+[Path]
+# Fires when deploy.sh moves a new deployed_version into place.
+PathChanged=/var/lib/roxy-deploy/deployed_version
+# The audit service to start.
+Unit=roxy-audit.service
+
+[Install]
+# Watch from boot on.
+WantedBy=paths.target

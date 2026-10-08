@@ -70,6 +70,10 @@ SKIPPED_RELATIVE_PATHS = frozenset(
         ".venv",
         ".remake",  # working notes of the remake run
         "tests/fixtures/v1",  # v1 data used as test input; must stay byte-identical to v1
+        # Third-party libraries vendored byte for byte (their SRI hashes are recorded in VERSIONS.md); editing
+        # them to satisfy our style rules would break the integrity check and fork the library.
+        "src/roxy/static/vendor",
+        "tests/e2e/vendor",
         # The v1 test suites under tests/ (smoke_test.py, deploy_test.sh, boot_check.sh) are scanned like
         # everything else: plan C5 has no exception for them, and their dashes were only in comments.
     }

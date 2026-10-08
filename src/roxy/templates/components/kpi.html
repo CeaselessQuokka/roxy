@@ -1,0 +1,34 @@
+{#-
+  KPI tile (plan 14.5): value, unit, delta against the comparison period, sparkline, status, help, drill-down.
+
+  What: `kpi_tile("Roblox 429s", "12", delta=-38.0, good="down", spark=[...], status="ok", href="/admin/upstream")`.
+  Put tiles inside `<div class="kpi-grid">` (4 to 6 per row on a desktop, 2 per row on a phone, plan 14.8).
+  Why: a tile answers three questions at a glance: how much, better or worse than before, and is it fine. The
+  status uses color AND an icon with words (plan 14.9), the delta says "an improvement" or "getting worse" to
+  screen readers, and the whole tile is one link to the chart that explains the number.
+  How: `value` is pre-formatted text (use components/format.html); `status` is ok, warn, bad or info and adds a
+  colored edge plus `status_label`; `baseline` is an optional reference line such as "v1 baseline 116".
+  The stretched link covers the tile, while the help button stays on top of it and keeps working.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import delta as delta_badge, help_dot, TONE_ICONS %}
+{% from "components/chart.html" import sparkline %}
+
+{% macro kpi_tile(label, value, unit="", delta=None, good="up", compare_label="vs the previous period", spark=None,
+                  spark_compare=None, status=None, status_label=None, help=None, href=None, baseline=None,
+                  level=3, id=None) -%}
+<article class="kpi{% if status %} kpi--{{ status }}{% endif %}{% if href %} kpi--link{% endif %}"{% if id %} id="{{ id }}"{% endif %}>
+  <header class="kpi__head">
+    <h{{ level }} class="kpi__label">{{ label }}</h{{ level }}>
+    {% if help %}{{ help_dot(label, help) }}{% endif %}
+  </header>
+  <p class="kpi__value"><span class="kpi__number">{{ value }}</span>{% if unit %}<span class="kpi__unit">{{ unit }}</span>{% endif %}</p>
+  <div class="kpi__meta">
+    {% if delta is not none %}{{ delta_badge(delta, good, compare_label) }}{% endif %}
+    {% if status and status_label %}<span class="kpi__status kpi__status--{{ status }}">{{ icon(TONE_ICONS.get(status, "info")) }}{{ status_label }}</span>{% endif %}
+    {% if baseline %}<span class="kpi__baseline">{{ baseline }}</span>{% endif %}
+  </div>
+  {% if spark %}<div class="kpi__spark">{{ sparkline(spark, spark_compare, label=label ~ " trend", tone=status or "accent") }}</div>{% endif %}
+  {% if href %}<a class="kpi__link" href="{{ href }}"><span class="sr-only">Open the {{ label }} chart</span></a>{% endif %}
+</article>
+{%- endmacro %}

@@ -1,0 +1,42 @@
+{#-
+  Page-wide overlays: the session-expired dialog (parity row 119), the details drawer, and the regions toasts and
+  announcements are written into.
+
+  Session expired: static/js/session.js opens it when any request (htmx, a fetch, the SSE stream) answers 401. It is
+  an alertdialog with "Log in again" focused; after a short countdown it goes to the login page (v1 did the same),
+  unless the admin chooses "Stay on this page" (for example to copy unsaved text), which stops the countdown
+  (WCAG 2.2.1: a time limit the user can turn off).
+  Drawer: a modal side panel for row details and dry runs, filled by htmx from `data-drawer-src` (or built from a
+  table row by static/js/tables.js); on a phone it rises from the bottom.
+  Toasts: static/js/toast.js puts toasts in `#toasts` and announces them in the polite or assertive live region.
+  `#toasts`, the two live regions and `#roxy-tip` move into whichever modal dialog is open and back here when it
+  closes (static/js/dom.js overlay layer): outside an open modal they would be drawn under it and hidden from
+  screen readers. The session-expired alert opens on top of any open dialog without closing it.
+  Context: `session` {login_url}.
+-#}
+{% from "components/icon.html" import icon %}
+{% set sess = session if session is defined and session else {} %}
+<dialog class="dialog session-expired" id="session-expired" role="alertdialog" aria-modal="true"
+        aria-labelledby="session-expired-title" aria-describedby="session-expired-desc">
+  <div class="session-expired__icon">{{ icon("lock") }}</div>
+  <h2 class="dialog__title" id="session-expired-title">Session expired</h2>
+  <p id="session-expired-desc">You were away for a while, or this session was signed out from somewhere else, so it ended for your safety. Anything not saved on this page is lost.</p>
+  <p class="session-expired__count muted" data-session-countdown></p>
+  <div class="dialog__foot session-expired__foot">
+    <button type="button" class="btn btn--ghost" data-session-stay>Stay on this page</button>
+    <a class="btn btn--primary" href="{{ sess.login_url or '/admin' }}" data-session-login>{{ icon("user") }}<span>Log in again</span></a>
+  </div>
+</dialog>
+
+<dialog class="drawer" id="drawer" aria-labelledby="drawer-title">
+  <header class="drawer__head">
+    <h2 class="drawer__title" id="drawer-title">Details</h2>
+    <button type="button" class="icon-btn" data-dialog-close aria-label="Close the details">{{ icon("x") }}</button>
+  </header>
+  <div class="drawer__body" id="drawer-body"></div>
+</dialog>
+
+<div class="toasts" id="toasts" role="region" aria-label="Notifications"></div>
+<div class="sr-only" id="sr-polite" aria-live="polite" aria-atomic="true"></div>
+<div class="sr-only" id="sr-assertive" aria-live="assertive" aria-atomic="true"></div>
+<div class="tip" id="roxy-tip" role="tooltip" hidden></div>

@@ -1,0 +1,107 @@
+{#-
+  Top bar (plan 14.1): time range and comparison, live indicator, search and command palette, recommendations,
+  Health, Pause and Emergency Limit, and the account menu.
+
+  The time range is a plain GET form (plan 14.2: range and comparison live in the URL so views are shareable);
+  static/js/app.js keeps the page's other query parameters when it is applied. Pause and Emergency Limit open the
+  confirm dialogs in admin/_layout/control_dialogs.html. On a phone the bar keeps the brand, the range, search and
+  Pause; Health and the menu move to the bottom bar (plan 14.8: pause, recommendations and health in one tap).
+  Context: `time` {range, compare, from, to}, `status` {paused, throttle_all, ...}, `recs` {open, critical},
+  `admin` {username}, `theme`, `density`, `urls` {logout}, `csrf_token`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "admin/_layout/nav.html" import RANGES, COMPARES, page_href %}
+{% set t = time if time is defined and time else {} %}
+{% set range_id = t.range or "24h" %}
+{% set compare_id = t.compare or "off" %}
+{% set st = status if status is defined and status else {} %}
+{% set rc = recs if recs is defined and recs else {} %}
+{% set ns = namespace(range_label="Custom range", range_short=range_id) %}
+{% for value, short, long in RANGES %}{% if value == range_id %}{% set ns.range_label = long %}{% set ns.range_short = short %}{% endif %}{% endfor %}
+<header class="topbar" role="banner">
+  <a class="topbar__brand" href="{{ page_href('overview') }}" aria-label="Roxy overview">{{ icon("logo", cls="brand__mark") }}</a>
+
+  <details class="popover range" data-menu>
+    <summary class="btn btn--ghost range__button">
+      {{ icon("calendar") }}
+      <span class="range__text"><span class="range__long">{{ ns.range_label }}</span><span class="range__short">{{ ns.range_short }}</span></span>
+      {% if compare_id != "off" %}<span class="range__compare">{{ icon("compare") }}<span class="sr-only">, compared with </span><span class="range__compare-text">{% for v, l in COMPARES %}{% if v == compare_id %}{{ l|lower }}{% endif %}{% endfor %}</span></span>{% endif %}
+      {{ icon("chevron-down", cls="range__chevron") }}
+    </summary>
+    <form class="popover__panel range__panel" method="get" data-range-form>
+      <fieldset class="range__presets">
+        <legend class="field__label">Time range</legend>
+        <div class="range__grid">
+          {% for value, short, long in RANGES %}
+          <label class="pill-radio"><input type="radio" name="range" value="{{ value }}"{% if value == range_id %} checked{% endif %}><span title="{{ long }}">{{ "Live" if value == "live" else ("All" if value == "all" else value) }}</span></label>
+          {% endfor %}
+          <label class="pill-radio"><input type="radio" name="range" value="custom"{% if range_id == "custom" %} checked{% endif %}><span>Custom</span></label>
+        </div>
+      </fieldset>
+      <fieldset class="range__custom">
+        <legend class="field__label">Custom range</legend>
+        <label class="field__inline"><span>From</span><input class="input" type="datetime-local" name="from" value="{{ t.get('from') or '' }}"></label>
+        <label class="field__inline"><span>To</span><input class="input" type="datetime-local" name="to" value="{{ t.get('to') or '' }}"></label>
+      </fieldset>
+      <fieldset class="range__compares">
+        <legend class="field__label">Compare with <span class="muted">(dashed line on charts, C toggles)</span></legend>
+        {% for value, label in COMPARES %}
+        <label class="radio"><input type="radio" name="compare" value="{{ value }}"{% if value == compare_id %} checked{% endif %}><span>{{ label }}</span></label>
+        {% endfor %}
+      </fieldset>
+      <div class="popover__foot">
+        <span class="muted">T cycles the range</span>
+        <button type="submit" class="btn btn--primary btn--sm">Apply</button>
+      </div>
+    </form>
+  </details>
+
+  <span class="live-pill" data-live-indicator data-state="off" title="Live updates">
+    <span class="live-pill__dot" aria-hidden="true"></span><span class="live-pill__text" data-live-text>Live off</span>
+  </span>
+
+  <span class="topbar__spacer"></span>
+
+  <button type="button" class="search-btn" data-palette-open aria-keyshortcuts="Control+K /" aria-haspopup="dialog" aria-label="Search or jump to">
+    {{ icon("search") }}<span class="search-btn__text">Search or jump to</span><span class="keys search-btn__keys"><kbd>Ctrl</kbd><kbd>K</kbd></span>
+  </button>
+
+  <a class="icon-btn topbar__recs" href="{{ page_href('recommendations') }}"
+     aria-label="Recommendations: {{ rc.open or 0 }} open{% if rc.critical %}, {{ rc.critical }} critical{% endif %}">
+    {{ icon("bell") }}{% if rc.open %}<span class="count-badge count-badge--dot{% if rc.critical %} count-badge--bad{% endif %}" aria-hidden="true">{{ rc.open }}</span>{% endif %}
+  </a>
+
+  <a class="btn btn--ghost topbar__health" href="{{ page_href('health') }}">{{ icon("heart") }}<span>Health</span></a>
+
+  <button type="button" class="btn topbar__pause{% if st.paused %} btn--bad-soft{% endif %}" data-dialog-open="dlg-pause" aria-haspopup="dialog">
+    {{ icon("play" if st.paused else "pause") }}<span class="topbar__pause-long">{{ "Resume proxy" if st.paused else "Pause proxy" }}</span><span class="topbar__pause-short">{{ "Resume" if st.paused else "Pause" }}</span>
+  </button>
+
+  <button type="button" class="btn topbar__limit{% if st.throttle_all %} btn--warn-soft{% endif %}" data-dialog-open="dlg-throttle-all" aria-haspopup="dialog">
+    {{ icon("gauge") }}<span>Emergency limit</span>{% if st.throttle_all %}<span class="badge badge--warn">On</span>{% endif %}
+  </button>
+
+  <details class="menu user-menu" data-menu>
+    <summary class="avatar-btn" aria-label="Account and display preferences">
+      <span class="avatar" aria-hidden="true">{{ ((admin.username if admin is defined and admin else "admin")[:2])|upper }}</span>
+    </summary>
+    <div class="menu__panel menu__panel--end user-menu__panel">
+      <p class="user-menu__who">Signed in as <strong>{{ admin.username if admin is defined and admin else "admin" }}</strong></p>
+      <div class="user-menu__group" role="group" aria-labelledby="theme-label">
+        <p class="field__label" id="theme-label">Theme</p>
+        <div class="segmented">
+          {% for value, label, ic in [("system", "System", "monitor"), ("dark", "Dark", "moon"), ("light", "Light", "sun")] %}
+          <button type="button" class="segmented__item" data-theme-set="{{ value }}" aria-pressed="{{ 'true' if (theme|default('dark')) == value else 'false' }}">{{ icon(ic) }}<span>{{ label }}</span></button>
+          {% endfor %}
+        </div>
+      </div>
+      <label class="check user-menu__density"><input type="checkbox" data-density-toggle{% if density|default("comfortable") == "dense" %} checked{% endif %}><span>Dense tables</span></label>
+      <label class="check user-menu__density"><input type="checkbox" data-shortcuts-toggle checked><span>Single-key shortcuts</span></label>
+      <button type="button" class="menu__item" data-shortcuts-open>{{ icon("keyboard") }}<span>Keyboard shortcuts</span><kbd>?</kbd></button>
+      <a class="menu__item" href="{{ page_href('help') }}">{{ icon("book") }}<span>Help and glossary</span></a>
+      <form method="post" action="{{ (urls.logout if urls is defined and urls and urls.logout) or '/admin/api/v1/auth/logout' }}" class="user-menu__logout" data-logout>
+        <button type="submit" class="menu__item">{{ icon("logout") }}<span>Log out</span></button>
+      </form>
+    </div>
+  </details>
+</header>

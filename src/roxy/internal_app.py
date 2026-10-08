@@ -2,7 +2,7 @@
 
 What this is
     `create_internal_app(public_app)` builds a tiny Starlette app with three routes:
-        GET  /internal/version  -> {"Version", "PackageVersion", "Color", "WorkerId", "Env"}
+        GET  /internal/version  -> {"Version", "PackageVersion", "Color", "WorkerId", "Env", "ConfigVersion"}
         GET  /internal/ready    -> 200 when this worker is ready and its databases answer, else 503
         POST /internal/flush    -> flush this worker's buffered metrics now
     `ListenerDispatcher` is the top-level ASGI app gunicorn serves (`roxy.asgi:app`): it sends each connection
@@ -121,6 +121,9 @@ async def version(request: Request) -> JSONResponse:
             "Color": getattr(ctx, "color", None) or getattr(env, "color", None),
             "WorkerId": getattr(ctx, "worker_id", None),
             "Env": getattr(env, "env", None),
+            # The `config_version` this worker's settings and rules snapshots were built from: lets the deploy
+            # tools and the multi-process tests see that a change reached every worker (plan 5.7, within 2 s).
+            "ConfigVersion": getattr(getattr(ctx, "settings", None), "version", None),
         }
     )
 

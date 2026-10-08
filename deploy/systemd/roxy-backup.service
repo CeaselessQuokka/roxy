@@ -1,0 +1,89 @@
+# roxy-backup.service: the nightly backup of control.db and metrics.db (plan 17.1, 17.5).
+#
+# Started by roxy-backup.timer. Runs /usr/local/lib/roxy/backup.sh (source: deploy/tools/backup.sh), which copies
+# each database with SQLite's VACUUM INTO, verifies the copy with PRAGMA integrity_check, compresses it with zstd,
+# encrypts it with age when a recipient is configured, keeps 14 daily and 8 weekly backups in /var/backups/roxy,
+# and optionally pushes it off the box with rclone (D15). cache.db is never backed up (disposable). Backups never
+# contain the encryption keys (plan 9.8 key escrow). Every directive says why it is here.
+
+[Unit]
+# Shown in `systemctl list-units` and alert emails.
+Description=Roxy nightly backup
+# A failed backup sends "Roxy DOWN: roxy-backup.service failed on <host>" like any failed unit; the app also
+# raises "Roxy: backup failed" or "no backup for <hours> h" from the status file (H-BACKUP).
+OnFailure=roxy-alert@%n.service
+# Wait for the network, which only the optional rclone push needs.
+After=network-online.target
+# Pull in network-online.target so the ordering above is meaningful.
+Wants=network-online.target
+
+[Service]
+# Runs to completion and exits.
+Type=oneshot
+# The script from the root-owned tools directory (never from a release, which the deploy user can change).
+ExecStart=/usr/local/lib/roxy/backup.sh
+# Optional settings: ROXY_BACKUP_REMOTE (the rclone remote name only), ROXY_BACKUP_HOT, ROXY_BACKUP_AGE_RECIPIENTS
+# and ROXY_STATE_DIR. The leading "-" keeps the backup running when the file is missing.
+EnvironmentFile=-/etc/roxy/roxy.env
+# The rclone remote configuration with its access keys, only when off-box backups are used (plan 9.8). It is the
+# only secret this unit reads; an empty file means no off-box copy.
+LoadCredential=rclone_config:/etc/roxy/credentials/rclone_config
+# Root, because it reads the roxy user's databases and writes the root-only /var/backups/roxy (0700, plan 17.3).
+User=root
+# Below the capabilities root normally has: read and write other users' files (the databases, SQLite's -shm file,
+# and creating the root-owned audit/ directory inside the roxy user's state directory), and give files their
+# group (the status file and its directory are root:roxy).
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER
+# Everything read-only except the backup directory and the state directory (SQLite readers of a WAL database
+# write its shared memory file, and the status file for the health check lives in /var/lib/roxy/audit).
+ProtectSystem=strict
+# The two writable paths named above. The "-" makes the state directory optional: before the first deploy has
+# started a color it may not exist, and a missing path would fail the unit (status 226) and send a false alert;
+# backup.sh then finds no database and exits cleanly.
+ReadWritePaths=/var/backups/roxy -/var/lib/roxy
+# Home directories are invisible.
+ProtectHome=yes
+# A private /tmp for the restore test.
+PrivateTmp=yes
+# No hardware devices.
+PrivateDevices=yes
+# No privilege escalation.
+NoNewPrivileges=yes
+# No kernel tunables, modules or log buffer.
+ProtectKernelTunables=yes
+# No kernel module loading.
+ProtectKernelModules=yes
+# No kernel log access.
+ProtectKernelLogs=yes
+# The cgroup tree is read-only.
+ProtectControlGroups=yes
+# No clock changes.
+ProtectClock=yes
+# No hostname changes.
+ProtectHostname=yes
+# rclone needs IPv4 and IPv6; nothing else needs more than Unix sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# No new namespaces.
+RestrictNamespaces=yes
+# No realtime scheduling.
+RestrictRealtime=yes
+# No setuid or setgid files.
+RestrictSUIDSGID=yes
+# The execution domain cannot be changed.
+LockPersonality=yes
+# Normal service system calls only.
+SystemCallFilter=@system-service
+# Native system call ABI only.
+SystemCallArchitectures=native
+# New files are private to root by default (the script sets each mode explicitly as well).
+UMask=0077
+# Be gentle with the 2 vCPU server: lowest CPU priority...
+Nice=10
+# ...and idle disk priority, so the backup never slows requests.
+IOSchedulingClass=idle
+# Copies and zstd stay small; this cap protects the 909 MB server if something goes wrong.
+MemoryMax=250M
+# A backup that takes longer than an hour is stuck; fail it so the alert fires.
+TimeoutStartSec=3600
+# The journal tag.
+SyslogIdentifier=roxy-backup

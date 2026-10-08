@@ -1,0 +1,112 @@
+{#-
+  CSP spike page (plan 9.2, "P0 spike, blocking for P11"), served only by the e2e test app (tests/e2e/conftest.py).
+
+  It loads the three vendored libraries exactly the way the dashboard does (an import map carrying SRI hashes, one
+  module script with the response nonce, no inline handlers, no inline styles), then exercises the features most
+  likely to break a strict CSP: htmx indicators, swaps and settling, Alpine directives (x-data, x-show,
+  x-transition, x-bind, x-text, x-model, x-for, x-ref, x-effect, x-cloak), and uPlot with its own live legend.
+  `?sri=bad` serves the same page with a wrong hash for htmx, to prove the browser refuses a modified file.
+  test_csp_spike.py drives it and requires zero violations.
+-#}
+{%- set htmx_url = static_url("vendor/htmx-2.0.11/htmx.esm.js") -%}
+{%- set imports = {"vendor/htmx": htmx_url,
+                   "vendor/alpine": static_url("vendor/alpine-csp-3.17.4/module.esm.min.js"),
+                   "vendor/uplot": static_url("vendor/uplot-1.6.32/uPlot.esm.js")} -%}
+{%- set integrity = {
+  htmx_url: "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" if bad_sri else "sha384-MGpLJI+YdNF+gTEwPJkKrb2WL70Ce3qnYw+YP2Hy3U+AX6oRl45HdZa9/W/7ROZr",
+  static_url("vendor/alpine-csp-3.17.4/module.esm.min.js"): "sha384-1iUT5Gr1H+nzOhvZHzMtH1F8+Hn/P6+jPCmpGGd++NA0IS5o7zN7GzlQsckdJqMa",
+  static_url("vendor/uplot-1.6.32/uPlot.esm.js"): "sha384-iUdBlEO5qc07+gOz+3rq/Besyud+KVIxM+xJEuUBObxLG3C/Dlkz8OYuPUcPrCGP"} -%}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CSP spike | Roxy</title>
+  <link rel="stylesheet" href="{{ static_url('vendor/uplot-1.6.32/uPlot.min.css') }}" integrity="sha384-IfV0B7MIOYuO95kO9G5ySKPz/85zqFNOAs8iy4tkK5zd9izhJAB8b7lHrwYqqmYE">
+  <style nonce="{{ csp_nonce }}">
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    [x-cloak] { display: none !important; }
+    .htmx-indicator { opacity: 0; }
+    .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { opacity: 1; }
+    .on { outline: 2px solid green; }
+  </style>
+  <script type="importmap" nonce="{{ csp_nonce }}">{{ {"imports": imports, "integrity": integrity}|tojson }}</script>
+  <script nonce="{{ csp_nonce }}">
+    window.__spike = { htmx: false, alpine: false, uplot: false };
+  </script>
+  {#- htmx must be configured BEFORE it starts (at DOMContentLoaded), so it is imported statically by its own
+      module, exactly like static/js/htmx_setup.js. A first version imported it with `await import()`; htmx then
+      started before the config was applied and injected its indicator <style> without a nonce: one style-src-elem
+      violation, which is how this spike found the rule. -#}
+  <script type="module" nonce="{{ csp_nonce }}">
+    import htmx from "vendor/htmx";
+    const nonce = document.querySelector("script[nonce]").nonce;
+    Object.assign(htmx.config, {
+      allowEval: false, allowScriptTags: false, includeIndicatorStyles: false, historyCacheSize: 0,
+      selfRequestsOnly: true, attributesToSettle: ["class", "width", "height"],
+      inlineScriptNonce: nonce, inlineStyleNonce: nonce,
+    });
+    document.addEventListener("htmx:configRequest", (e) => { e.detail.headers["X-CSRF-Token"] = "spike"; });
+    window.__spike.htmx = Boolean(htmx.version);
+  </script>
+  <script type="module" nonce="{{ csp_nonce }}">
+    const { default: Alpine } = await import("vendor/alpine");
+    Alpine.data("spikeBox", () => ({
+      open: false,
+      text: "typed",
+      items: ["alpha", "beta", "gamma"],
+      count: 0,
+      toggle() { this.open = !this.open; },
+      add() { this.items.push(`item ${this.items.length + 1}`); },
+      init() { this.count = 1; },
+    }));
+    Alpine.start();
+    window.__spike.alpine = true;
+    const { default: uPlot } = await import("vendor/uplot");
+    const now = Math.floor(Date.now() / 1000);
+    const xs = Array.from({ length: 60 }, (_, i) => now - (59 - i) * 60);
+    const a = xs.map((_, i) => 50 + 30 * Math.sin(i / 6));
+    const b = xs.map((_, i) => 20 + 10 * Math.cos(i / 5));
+    window.__plot = new uPlot({
+      width: 640, height: 260,
+      legend: { show: true, live: true },
+      cursor: { drag: { x: true, y: false, setScale: true } },
+      series: [{}, { label: "Requests", stroke: "#3987e5", fill: "rgba(57,135,229,0.12)" },
+               { label: "Upstream", stroke: "#e0662f", dash: [5, 4] }],
+    }, [xs, a, b], document.getElementById("plot"));
+    window.__spike.uplot = true;
+  </script>
+</head>
+<body>
+  <h1>CSP spike</h1>
+
+  <section id="htmx-demo">
+    <h2>htmx</h2>
+    <button type="button" id="load" hx-get="/admin/_spike/fragment?n=1" hx-target="#out" hx-swap="innerHTML" hx-indicator="#spinner">Load fragment</button>
+    <span id="spinner" class="htmx-indicator">Loading</span>
+    <div id="out"></div>
+    <div id="auto" hx-get="/admin/_spike/fragment?n=9" hx-trigger="load" hx-swap="outerHTML"></div>
+  </section>
+
+  <section id="alpine-demo" x-data="spikeBox" x-cloak>
+    <h2>Alpine</h2>
+    <button type="button" id="toggle" x-on:click="toggle" x-bind:aria-expanded="open" x-bind:class="{ on: open }">Toggle</button>
+    <p id="shown" x-show="open" x-transition>Now you see me</p>
+    <span id="state" x-text="open ? 'open' : 'closed'"></span>
+    <label>Text <input id="model" x-model="text"></label>
+    <span id="echo" x-text="text"></span>
+    <ul id="list"><template x-for="item in items" :key="item"><li x-text="item"></li></template></ul>
+    <button type="button" id="add" x-on:click="add">Add item</button>
+    {#- Alpine's CSP build refuses property assignments on DOM objects (`$refs.x.dataset.y = ...` raised "Property
+        assignments on DOM objects are prohibited in the CSP build" in the first run), so effects assign component
+        state only. -#}
+    <span id="count" x-ref="count" x-effect="count = items.length" x-text="count"></span>
+    <span id="refs" x-text="$refs.count.id"></span>
+  </section>
+
+  <section id="uplot-demo">
+    <h2>uPlot</h2>
+    <div id="plot"></div>
+  </section>
+</body>
+</html>

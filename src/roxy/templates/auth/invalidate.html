@@ -1,0 +1,48 @@
+{% extends "auth/base.html" %}
+{% block title %}Roxy: Invalidate Admin Sessions{% endblock %}
+{% block page %}invalidate{% endblock %}
+{# No script at all on this page (as in v1): a plain form POST does the work. #}
+{% block scripts %}{% endblock %}
+{% block content %}
+<h1 class="auth-title">Roxy Admin</h1>
+
+{% if state == "done" %}
+  {% if all_sessions %}
+  <p class="auth-hint">
+    <strong>Done.</strong> Every admin session has been signed out. Any device that was logged in will need the
+    full password and second factor to get back in.
+  </p>
+  {% else %}
+  <p class="auth-hint">
+    <strong>Done.</strong> Every admin session that was not opened with a passkey has been signed out.
+  </p>
+  {% endif %}
+  {% if revoke_trusted %}
+  <p class="auth-hint">Trusted devices were revoked too, so no browser can skip the second factor any more.</p>
+  {% endif %}
+{% elif state == "failed" %}
+  <p class="auth-error" role="alert">
+    This link is no longer valid. It may already have been used, or it may have expired.
+  </p>
+  <p class="auth-hint">
+    If you still think someone else is signed in, log in and use “Sign out everywhere” and “Revoke all trusted
+    devices” on the Security page.
+  </p>
+{% else %}
+  <p class="auth-hint">
+    This signs out every admin session immediately. Use it if the login alert you received was not you.
+  </p>
+  {# The token is used by this POST, never by loading the page: mail scanners and link previewers open links. #}
+  <form method="post" action="/admin/invalidate/{{ token }}" class="auth-form">
+    <div class="auth-check">
+      <input id="all-sessions" name="all_sessions" type="checkbox" value="1" checked>
+      <label for="all-sessions">Sign out every admin session (unchecked: only sessions that did not use a passkey)</label>
+    </div>
+    <div class="auth-check">
+      <input id="revoke-trusted" name="revoke_trusted" type="checkbox" value="1" checked>
+      <label for="revoke-trusted">Also revoke every trusted device (they will need the second factor again)</label>
+    </div>
+    <button type="submit" class="auth-button">Sign out all admin sessions</button>
+  </form>
+{% endif %}
+{% endblock %}

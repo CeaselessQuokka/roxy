@@ -1,0 +1,57 @@
+{% extends "auth/base.html" %}
+{% block title %}Roxy: Set Up Your Authenticator{% endblock %}
+{% block page %}enroll{% endblock %}
+{% block content %}
+<h1 class="auth-title">Set up your authenticator app</h1>
+{% if bootstrap %}
+<p class="auth-hint">
+  Welcome back, {{ username }}. Roxy now requires an authenticator app (a 6-digit code that changes every 30
+  seconds) for every admin login. This one-time step replaces the emailed code you just used.
+</p>
+{% else %}
+<p class="auth-hint">
+  Setting up a new authenticator replaces the current one and creates a new set of recovery codes. The old
+  authenticator and the old recovery codes stop working once you confirm.
+</p>
+{% endif %}
+
+<section id="enroll-start" class="auth-step">
+  <p class="auth-hint">You need an authenticator app on your phone or in your password manager (for example Google
+    Authenticator, Microsoft Authenticator, 1Password or Bitwarden).</p>
+  <button id="enroll-start-button" type="button" class="auth-button">Show the QR code</button>
+  <p id="enroll-start-error" class="auth-error" role="alert" hidden></p>
+</section>
+
+<section id="enroll-scan" class="auth-step" hidden>
+  <h2 class="auth-subtitle" tabindex="-1" id="enroll-scan-title">Scan the code</h2>
+  <ol class="auth-list">
+    <li>Open your authenticator app and add a new account.</li>
+    <li>Scan this QR code. If you cannot scan it, type the key shown below it instead.</li>
+    <li>Enter the 6-digit code the app shows.</li>
+  </ol>
+  <div class="auth-qr"><img id="enroll-qr" alt="QR code for your authenticator app" width="240" height="240"></div>
+  <p class="auth-hint">Key: <code id="enroll-secret" class="auth-secret"></code></p>
+  <form id="enroll-form" class="auth-form" novalidate>
+    <label for="enroll-code">6-digit code from the app</label>
+    <input id="enroll-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6"
+           spellcheck="false">
+    <p id="enroll-error" class="auth-error" role="alert" hidden></p>
+    <button id="enroll-confirm" type="submit" class="auth-button">Confirm</button>
+  </form>
+</section>
+
+<section id="enroll-codes" class="auth-step" hidden>
+  <h2 class="auth-subtitle" tabindex="-1" id="enroll-codes-title">Save your recovery codes</h2>
+  <p class="auth-hint">
+    If you lose your phone, each of these codes lets you log in once instead of the authenticator app. They are
+    shown only now: store them somewhere safe, such as a password manager.
+  </p>
+  <ol id="recovery-list" class="auth-codes"></ol>
+  <div class="auth-actions">
+    <button id="codes-copy" type="button" class="auth-button auth-secondary">Copy the codes</button>
+    <button id="passkey-add" type="button" class="auth-button auth-secondary">Also add a passkey (optional)</button>
+  </div>
+  <p id="enroll-status" class="auth-hint" aria-live="polite"></p>
+  <a id="enroll-continue" class="auth-button auth-link-button" href="/admin/dashboard">Continue to the dashboard</a>
+</section>
+{% endblock %}

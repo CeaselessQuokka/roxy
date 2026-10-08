@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Roxy: Free Proxy for Roblox Web APIs</title>
+		<meta
+			name="description"
+			content="Roxy is a free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Call any public Roblox endpoint from HttpService by prefixing it with roxytheproxy.com; supports GET, POST, PATCH, PUT and DELETE."
+		/>
+		<meta
+			name="keywords"
+			content="Roblox proxy, Roblox API proxy, free Roblox proxy, RoProxy alternative, HttpService proxy, Roblox web API, Roblox HttpService CORS, no login Roblox proxy"
+		/>
+		<meta name="robots" content="index, follow" />
+		<meta name="theme-color" content="#0b0f14" />
+		<link rel="canonical" href="https://roxytheproxy.com/" />
+		<!-- Open Graph / social -->
+		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content="Roxy Proxy" />
+		<meta property="og:title" content="Roxy: Free Proxy for Roblox Web APIs" />
+		<meta
+			property="og:description"
+			content="A free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Prefix any Roblox endpoint with roxytheproxy.com and call it from HttpService."
+		/>
+		<meta property="og:url" content="https://roxytheproxy.com/" />
+		<meta property="og:image" content="https://roxytheproxy.com/{{ static_url('roxy_icon.png').lstrip('/') }}" />
+		<meta name="twitter:card" content="summary" />
+		<meta name="twitter:title" content="Roxy: Free Proxy for Roblox Web APIs" />
+		<meta
+			name="twitter:description"
+			content="A free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Prefix any Roblox endpoint with roxytheproxy.com and call it from HttpService."
+		/>
+		<meta name="twitter:image" content="https://roxytheproxy.com/{{ static_url('roxy_icon.png').lstrip('/') }}" />
+		<link rel="stylesheet" href="{{ static_url('home_page.css') }}" />
+		<link rel="icon" type="image/x-icon" href="{{ static_url('roxy_favicon.png') }}" />
+		<script type="application/ld+json">
+			{
+				"@context": "https://schema.org",
+				"@type": "WebApplication",
+				"name": "Roxy",
+				"url": "https://roxytheproxy.com/",
+				"description": "A free, fast proxy for public Roblox web APIs, no login or ROBLOSECURITY token required. Prefix any public Roblox endpoint with roxytheproxy.com and call it from Roblox's HttpService.",
+				"applicationCategory": "DeveloperApplication",
+				"operatingSystem": "Any",
+				"offers": {
+					"@type": "Offer",
+					"price": "0",
+					"priceCurrency": "USD"
+				}
+			}
+		</script>
+	</head>
+	<body class="app app--dark" data-theme="dark">
+		<header class="app-bar" role="banner">
+			<h1 class="app-title">Roxy Proxy</h1>
+		</header>
+
+		<main class="main" role="main">
+			<section class="section collapsible-block" aria-labelledby="titleHeader">
+				<div class="section__header">
+					<h2 id="titleHeader" class="section__title">Welcome to Roxy!</h2>
+					<button
+						class="btn btn--tonal collapsible-toggle"
+						type="button"
+						data-target="titleSection"
+						aria-expanded="true"
+					>
+						Collapse
+					</button>
+				</div>
+				<div id="titleSection" class="collapsible is-open">
+					<i>There are examples below this section if you want to skip the yap.</i>
+					<p class="lead">
+						<strong>Roxy</strong> is a free proxy for Roblox web APIs. The code for Roxy is planned to be
+						made open source in the future. Right now the code may not be 100% secure, so I am afraid to
+						release it publicly and someone uses it and runs into issues, or a bad actor uses it and
+						exploits the server with a vulnerability I did not foresee (not to mention the code is pretty
+						hideous because this is my first project like this). I am still learning web development, so if
+						you find any security issues or just general issues, please let me know! If you're a White Hat,
+						refer to the bottom of the page for more info on vulnerability reporting and rewards.
+					</p>
+					<p class="light--warning">
+						The person who made
+						<a
+							href="https://devforum.roblox.com/t/roproxycom-a-free-rotating-proxy-for-roblox-apis/1508367"
+							target="_blank"
+							>Roproxy</a
+						>
+						has a <a href="https://github.com/askfalse/roproxy-lite" target="_blank">GitHub</a> available to
+						make your own proxy. So if you are looking for this option, it exists and is your safest option
+						for using a proxy.
+					</p>
+					<p class="lead">
+						Why did I make Roxy? Because
+						<a
+							href="https://devforum.roblox.com/t/roproxycom-a-free-rotating-proxy-for-roblox-apis/1508367"
+							target="_blank"
+							>Roproxy</a
+						>
+						throttles about 60 seconds per request. Thus I wanted something a bit faster for my own
+						projects. Specifically my
+						<a
+							href="https://devforum.roblox.com/t/bundle-and-characteroutfit-inserter-free-plugin/3972083"
+							target="_blank"
+							>Bundle and Character/Outfit Inserter (shameful plug(in))</a
+						>
+						plugin as of right now. I figured if I'm going to make the proxy anyway, I may as well share it.
+						My general rule of thumb for most things I make really, haha.
+					</p>
+				</div>
+			</section>
+
+			<!-- General Tips -->
+			<section class="section collapsible-block" aria-labelledby="generalTipsHeader">
+				<div class="section__header">
+					<h2 id="generalTipsHeader" class="section__title">General Tips (Highly Recommended Reading)</h2>
+					<button
+						class="btn btn--tonal collapsible-toggle"
+						type="button"
+						data-target="generalTips"
+						aria-expanded="true"
+					>
+						Collapse
+					</button>
+				</div>
+				<div id="generalTips" class="collapsible is-open">
+					<p class="light--warning">
+						Roxy is for <strong>public, unauthenticated</strong> Roblox web API calls only; it does not
+						support requests that need you to be logged in, and it will reject any request that resembles
+						anything that looks like a Roblox <code>.ROBLOSECURITY</code> cookie.
+						Never send your <code>ROBLOSECURITY</code> token to Roxy
+						(or to any third-party proxy). More info <a href="#tokenSafetyHeading">below</a> for why.
+					</p>
+					<p class="light--warning">
+						If you use RequestAsync, Roblox gives you the response headers. These are the custom headers that Roxy adds:
+						<ul>
+							<li><code>Roxy-Requests-Left</code>: How many more requests you have until you get throttled.
+							<li><code>Roxy-Throttle-Reset</code>: How many seconds until your request pool resets.
+							<li><code>Roxy-Throttled</code>: Whether or not you have been throttled.
+							<li><code>Roxy-Paused</code>: Only present when the proxy is temporarily paused for maintenance.
+							<li><code>Roxy-Blocked</code>: Only present when the endpoint you requested has been blocked by the admin.
+							<li><code>Roxy-Endpoint-Limited</code>: Only present when a per-endpoint rate limit rejected your request.
+						</ul>
+					</p>
+					<p>
+						You get around 10 requests every 50 seconds. The window opens on your first request and closes 50 seconds
+						later no matter how many requests you make in between, so <code>Roxy-Throttle-Reset</code> always tells you
+						exactly how long the wait is.
+						<br /><br />
+						It is highly encouraged to have caching on your end to make less requests, and also have instant responses.
+					</p>
+				</div>
+			</section>
+
+			<!-- Prettyprint Example -->
+			<section class="section collapsible-block" aria-labelledby="getExampleHeading">
+				<div class="section__header">
+					<h2 id="getExampleHeading" class="section__title">
+						Example: GET Request (and prettyprint example)
+					</h2>
+					<button
+						class="btn btn--tonal collapsible-toggle"
+						type="button"
+						data-target="getExample"
+						aria-expanded="true"
+					>
+						Collapse
+					</button>
+				</div>
+				<div id="getExample" class="collapsible is-open">
+					<i>
+						Note: Roxy supports <strong>GET</strong>, <strong>POST</strong>, <strong>PATCH</strong>,
+						<strong>PUT</strong>, and <strong>DELETE</strong> requests. </i
+					><br />
+					<br />
+					<p>
+						You can use Roxy exactly like the Roblox API, just prefix your Roblox endpoint with
+						<code>https://roxytheproxy.com/</code>. For example:
+					</p>
+					<pre
+						class="example"
+					><code>https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&page=1&itemsPerPage=100&isEditable=true</code></pre>
+					<p>In the case of that user ID, you will get something that looks like this:</p>
+					<pre
+						class="output"
+					><code>{"data":[{"id":152266819767,"name":"X","isEditable":true,"outfitType":"Avatar"},{"id":26926749690,"name":"I","isEditable":true,"outfitType":"Avatar"},{"id":11706768233,"name":"H","isEditable":true,"outfitType":"Avatar"},{"id":7277992048,"name":"A","isEditable":true,"outfitType":"Avatar"},{"id":3977261404,"name":"B","isEditable":true,"outfitType":"Avatar"},{"id":87611659,"name":"F","isEditable":true,"outfitType":"Avatar"},{"id":87610579,"name":"G","isEditable":true,"outfitType":"Avatar"}],"paginationToken":""}</code></pre>
+					<p>
+						That will work if you put it in the browser's URL, but you can also do this from Roblox using
+						HttpService (which is probably what you're here for)
+					</p>
+					<pre
+						class="example"
+					><code>local URL = "https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&page=1&itemsPerPage=100&isEditable=true"
+print(HttpService:GetAsync(URL))</code></pre>
+					<p>
+						Adding <code>&prettyprint=true</code> makes the JSON easier to read (this is specific to Roxy,
+						and also works for all request types).
+					</p>
+
+					<h3>Pretty-printed GET</h3>
+					<pre
+						class="example"
+					><code>https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&page=1&itemsPerPage=100&isEditable=true&prettyprint=true</code></pre>
+
+					<pre class="output"><code>{
+    "data": [
+        { "id": 152266819767, "name": "X", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 26926749690,  "name": "I", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 11706768233,  "name": "H", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 7277992048,   "name": "A", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 3977261404,   "name": "B", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 87611659,     "name": "F", "isEditable": true, "outfitType": "Avatar" },
+        { "id": 87610579,     "name": "G", "isEditable": true, "outfitType": "Avatar" }
+    ],
+    "paginationToken": ""
+}</code></pre>
+				</div>
+			</section>
+
+			<!-- Other HTTP Methods -->
+			<section class="section collapsible-block" aria-labelledby="otherMethodsHeading">
+				<div class="section__header">
+					<h2 id="otherMethodsHeading" class="section__title">POST / PATCH / PUT / DELETE Requests</h2>
+					<button
+						class="btn btn--tonal collapsible-toggle"
+						type="button"
+						data-target="otherMethodsExample"
+						aria-expanded="true"
+					>
+						Collapse
+					</button>
+				</div>
+				<div id="otherMethodsExample" class="collapsible is-open">
+					<p class="light--warning">
+						Most (if not all) <code>POST</code>/<code>PATCH</code>/<code>PUT</code>/<code>DELETE</code> endpoints on
+						Roblox's API require you to be logged in. Roxy
+						<a href="#tokenSafetyHeading">does not support authenticated requests</a>, so these methods
+						only work against the small number of public, unauthenticated write endpoints Roblox exposes (again, if any).
+						If you need to write data as a specific account, you'll need to call Roblox directly with
+						your own authenticated client, and unfortunately that isn't something Roxy can do for you.
+					</p>
+					<p>The calling convention is the same as <code>GET</code>, just with a different <code>Method</code>:</p>
+					<pre
+						class="example"
+					><code>HttpService:RequestAsync({
+	Url = "https://roxytheproxy.com/" .. endpointPath,
+	Method = "POST", -- or "PATCH", "PUT", "DELETE"
+	Headers = { ["Content-Type"] = "application/json" },
+	Body = HttpService:JSONEncode({ --[[ your payload ]] }),
+})</code></pre>
+				</div>
+			</section>
+
+			<!-- Safety & White Hat Info -->
+			<section class="section safety">
+				<h2 id="tokenSafetyHeading" class="section__title">No Login Required & White Hats</h2>
+				<p>
+					Roxy is built for <strong>public, unauthenticated</strong> Roblox web API calls only; it does not
+					support requests that require you to be logged in, and it will refuse any request that
+					carries anything that looks like a real Roblox
+					<code>.ROBLOSECURITY</code> session cookie.
+				</p>
+				<p class="warning">
+					<strong
+						>Never send your <code>ROBLOSECURITY</code> token to Roxy, or to any third-party proxy.
+						Sharing it lets someone log in as you and take your account, Robux, and items; no exceptions,
+						no matter how trustworthy a service looks or claims to be. Even a secure, open-source server
+						can't prove what's actually running on it. The only safe token is one you never send.
+					</strong>
+				</p>
+				<hr />
+				<p>
+					If you're a <strong>White Hat</strong> and find a vulnerability, I'm offering rewards from
+					<strong>$10-$250 USD</strong> depending on severity. Any serious exploit report is always paid and
+					appreciated. I'm still learning web development, so there may be a lot of issues.
+				</p>
+			</section>
+
+			<!-- Roxy Internals -->
+			<section class="section internals">
+				<h2 class="section__title">Roxy Internals</h2>
+				<p>
+					Roxy was made using Python and Flask. It is hosted using the second tier option of Lightsail on AWS.
+					Which means there is 2TB of transfer data per month. So if the site goes down that is probably why.
+					Hopefully 2TB is enough, but I will monitor.
+				</p>
+				<p>
+					If you're curious how much Roxy costs to maintain: as of right now, 7 USD per month (for the Lightsail instance) +
+					15 USD per year (for the domain). Which comes out to be exactly $99 per year.
+				</p>
+			</section>
+
+			<!-- Support -->
+			<section class="section support">
+				<h2 class="section__title">Support Me</h2>
+				<p>
+					You never have to donate or pay anything; just using anything I make is enough support for me.
+					If you ever make something with something I create, please tag me in it, I'd love to see it! :D
+				</p>
+			</section>
+		</main>
+		<footer class="footer" role="contentinfo">
+			<small>Roxy Proxy 2025-Present</small>
+		</footer>
+
+		<script src="{{ static_url('home_page.js') }}"></script>
+	</body>
+</html>

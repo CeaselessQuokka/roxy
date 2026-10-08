@@ -15,6 +15,8 @@ import httpx
 import pytest
 from fastapi import Depends, FastAPI
 
+from roxy.config.audit import Actor
+from roxy.config.settings_service import SettingsService
 from roxy.deps import get_db, require_admin, require_csrf
 from roxy.internal_app import ListenerDispatcher, listener_kind
 from roxy.lifespan import AppContext
@@ -29,8 +31,13 @@ STARTUP_ORDER = [
     "cache_db_check",
     "settings",
     "rules",
+    "alerts",
     "clients",
     "recorder",
+    "upstream",
+    "cache",
+    "abuse",
+    "error_hooks",
     "heartbeat",
     "leader",
     "jobs",
@@ -176,9 +183,8 @@ async def test_internal_only_on_unix_socket_with_real_uvicorn(env: Any) -> None:
     port = tcp.getsockname()[1]
     uds = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     uds.bind(str(socket_path))
-    config = uvicorn.Config(
-        create_asgi_app(env), lifespan="on", log_config=None, proxy_headers=False, server_header=False
-    )
+    asgi_app = create_asgi_app(env)
+    config = uvicorn.Config(asgi_app, lifespan="on", log_config=None, proxy_headers=False, server_header=False)
     server = uvicorn.Server(config)
     task = asyncio.create_task(server.serve(sockets=[tcp, uds]))
     try:
@@ -187,6 +193,12 @@ async def test_internal_only_on_unix_socket_with_real_uvicorn(env: Any) -> None:
                 break
             await asyncio.sleep(0.01)
         assert server.started
+        # `/internal/version` on the public port is an ordinary unknown path there: the proxy route refuses it as
+        # not a Roblox URL, and the wired abuse pipeline would hold that probe in the tarpit for 8 to 20 s first.
+        ctx = asgi_app.public.state.ctx
+        await SettingsService(ctx.dbs.control, runtime=ctx.settings).update(
+            {"tarpit_enabled": 0}, Actor("admin", "test"), "no tarpit hold in this test"
+        )
         async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=str(socket_path))) as internal:
             version = await internal.get("http://roxy/internal/version")
             ready = await internal.get("http://roxy/internal/ready")

@@ -1,0 +1,85 @@
+{#-
+  Recommendation card (plan 14.5 and 11.2): severity, title, explanation, evidence mini-chart, changes diff, actions.
+
+  What: `recommendation_card(rec)` renders one finding of the recommendations engine with Apply (a confirm dialog
+  showing exactly what changes), Preview (the dry run, opened in the drawer), Snooze and Dismiss.
+  Why: a recommendation is only trustworthy when it shows its evidence and its exact diff before anything is
+  applied (plan principle P5). Severity is a badge with an icon and a word, never color alone.
+  How: `rec` is a mapping shaped like the plan 11.2 object, plus display fields the page prepares:
+    {"id", "rule_id", "family", "severity": "critical|warn|info", "confidence", "title", "explanation",
+     "evidence": {"label", "values": [...], "note"}, "changes": [{"label", "key", "before", "after"}],
+     "expected_impact", "age", "safe_auto",
+     "urls": {"apply", "preview", "snooze", "dismiss"}}
+  Every action posts with htmx (the X-CSRF-Token header is added globally); the server answers with a toast
+  trigger and, for apply, a refreshed card.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import severity_badge, badge %}
+{% from "components/chart.html" import sparkline %}
+{% from "components/diff.html" import diff_fields %}
+{% from "components/dialog.html" import confirm_dialog %}
+
+{% macro recommendation_card(rec, level=3) -%}
+{%- set rid = "rec-" ~ rec.id -%}
+<article class="rec rec--{{ rec.severity }}" id="{{ rid }}" aria-labelledby="{{ rid }}-title">
+  <header class="rec__head">
+    {{ severity_badge(rec.severity) }}
+    <span class="rec__family">{{ rec.family|capitalize }}</span>
+    <code class="rec__rule">{{ rec.rule_id }}</code>
+    {% if rec.confidence %}<span class="rec__confidence">{{ rec.confidence|capitalize }} confidence</span>{% endif %}
+    {% if rec.age %}<span class="rec__age">{{ icon("clock") }}{{ rec.age }}</span>{% endif %}
+  </header>
+  <h{{ level }} class="rec__title" id="{{ rid }}-title">{{ rec.title }}</h{{ level }}>
+  <p class="rec__why">{{ rec.explanation }}</p>
+  <div class="rec__body">
+    {% if rec.evidence %}
+    <div class="rec__evidence">
+      <p class="rec__label">{{ rec.evidence.label }}</p>
+      {{ sparkline(rec.evidence["values"], label=rec.evidence.label, width=200, height=40, tone="bad" if rec.severity == "critical" else ("warn" if rec.severity == "warn" else "accent")) }}
+      {% if rec.evidence.note %}<p class="rec__note">{{ rec.evidence.note }}</p>{% endif %}
+    </div>
+    {% endif %}
+    {% if rec.changes %}
+    <div class="rec__changes">
+      <p class="rec__label">Proposed changes</p>
+      {{ diff_fields(rec.changes, caption="Changes proposed by " ~ rec.rule_id) }}
+    </div>
+    {% endif %}
+  </div>
+  {% if rec.expected_impact %}<p class="rec__impact">{{ icon("sparkle") }}<span><strong>Expected:</strong> {{ rec.expected_impact }}</span></p>{% endif %}
+  <footer class="rec__actions">
+    {% if rec.changes %}<button type="button" class="btn btn--primary" data-dialog-open="{{ rid }}-apply" aria-haspopup="dialog">{{ icon("check") }}<span>Apply</span></button>{% endif %}
+    {% if rec.urls.preview %}<button type="button" class="btn" data-drawer-src="{{ rec.urls.preview }}" data-drawer-title="Dry run: {{ rec.title }}">{{ icon("eye") }}<span>Preview</span></button>{% endif %}
+    <details class="menu" data-menu>
+      <summary class="btn btn--ghost">{{ icon("clock") }}<span>Snooze</span></summary>
+      <div class="menu__panel" role="group" aria-label="Snooze for">
+        {% for value, text in [("1h", "1 hour"), ("1d", "1 day"), ("1w", "1 week")] %}
+        <button type="button" class="menu__item" hx-post="{{ rec.urls.snooze }}" hx-vals='{"for": "{{ value }}"}' hx-swap="none">{{ text }}</button>
+        {% endfor %}
+      </div>
+    </details>
+    <button type="button" class="btn btn--ghost" data-dialog-open="{{ rid }}-dismiss" aria-haspopup="dialog">{{ icon("x") }}<span>Dismiss</span></button>
+    {% if rec.safe_auto %}{{ badge("Safe to auto-apply", "ok", "check-circle") }}{% endif %}
+  </footer>
+  {% if rec.changes %}
+  {% call confirm_dialog(rid ~ "-apply", "Apply this recommendation?", rec.urls.apply, confirm_label="Apply changes",
+                         body="These changes are applied together, audited, and can be undone from the history.",
+                         reason=True) %}
+    {{ diff_fields(rec.changes, caption="Changes to apply", show_caption=True) }}
+  {% endcall %}
+  {% endif %}
+  {% call confirm_dialog(rid ~ "-dismiss", "Dismiss this recommendation?", rec.urls.dismiss, confirm_label="Dismiss",
+                         body="It will not come back for the same finding for 7 days unless it gets more severe.",
+                         reason=True, reason_required=True) %}
+    <div class="field">
+      <label class="field__label" for="{{ rid }}-dismiss-why">Why</label>
+      <select class="input" id="{{ rid }}-dismiss-why" name="why">
+        <option value="not_accurate">Not accurate</option>
+        <option value="intended">Intended behavior</option>
+        <option value="manual">I will handle it manually</option>
+        <option value="other">Other (say why below)</option>
+      </select>
+    </div>
+  {% endcall %}
+</article>
+{%- endmacro %}

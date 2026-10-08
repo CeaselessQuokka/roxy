@@ -1,0 +1,444 @@
+# Roxy glossary: every term the dashboard, the guides and the plan use, each with a plain definition.
+#
+# What this is
+#   The single source for glossary tooltips in the dashboard (templates/components/glossary.html), the glossary on
+#   the Help page, and the plan's section 21 (plan 14.7: help text comes from one place). Loaded by
+#   roxy.admin.gallery.load_glossary().
+# Why it exists
+#   Plan principle P2: nothing on screen is jargon without a definition one hover away. Definitions are one or two
+#   plain sentences written for the owner, not for engineers.
+# How it works
+#   `terms` is a list. Each entry has:
+#     id          stable lowercase id used in links (/admin/help#term-<id>) and in term("id") calls
+#     term        the words as shown (plan 21 terms keep the plan's exact spelling, slashes included)
+#     definition  one or two sentences, US spelling, no dash characters (plan C5)
+#     source      plan (plan section 21), dashboard (the v1 dashboard's own glossaries, kept for parity row 87),
+#                 or roxy (terms the v2 dashboard adds)
+#   tests/unit/ui/test_ui_static.py checks that every plan 21 term is here, that ids are unique, and that each
+#   definition is one or two sentences.
+# What to read next
+#   REMAKE_PLAN.md section 21, templates/components/glossary.html.
+
+version: 1
+terms:
+  # ------------------------------------------------------------------------------------------ plan section 21
+  - id: mfa
+    term: 2FA / MFA
+    definition: A second proof of identity after the password, such as a code from an authenticator app, a passkey, a recovery code, or (optionally) an emailed code.
+    source: plan
+  - id: adaptive-rate
+    term: Adaptive rate
+    definition: How Roxy tunes the pace of calls to each Roblox endpoint by itself. It cuts the rate by 30% after a Roblox 429 and raises it by 10% after a clean day with real demand.
+    source: plan
+  - id: aimd
+    term: AIMD
+    definition: Additive increase, multiplicative decrease. Roxy slowly allows more requests at once while things go well and cuts the number sharply on trouble (optional, off by default).
+    source: plan
+  - id: allowlist-denylist
+    term: Allowlist / denylist
+    definition: An allowlist names things that are explicitly permitted; a denylist names things that are always refused.
+    source: plan
+  - id: argon2id
+    term: argon2id
+    definition: A modern password hashing method that is deliberately slow and memory hungry, so guessing passwords from a stolen database is very expensive.
+    source: plan
+  - id: asgi
+    term: ASGI
+    definition: The standard way async Python web servers and web apps talk to each other. Uvicorn speaks it to FastAPI, the framework Roxy is built on.
+    source: plan
+  - id: audit-log
+    term: Audit log
+    definition: An append-only record of who changed what, when, from where, and why. Every admin action and every security-relevant automatic action is written to it.
+    source: plan
+  - id: auth-class
+    term: Auth class
+    definition: Whether a cached or coalesced answer was fetched anonymously (anon) or with the credential (cred). The two are never mixed, so an answer meant for the account never reaches other callers.
+    source: plan
+  - id: avoided-upstream-call
+    term: Avoided upstream call
+    definition: A caller request Roxy answered without asking Roblox. It is counted honestly as caller requests minus the upstream calls made for them, background refreshes included.
+    source: plan
+  - id: ban
+    term: Ban
+    definition: A temporary or permanent refusal of one client, such as an IP address, an IP range, a place, or a user agent.
+    source: plan
+  - id: breaker
+    term: Breaker (circuit breaker)
+    definition: A switch that stops calls to an endpoint that keeps failing, then lets one test request through after a pause to see whether it has recovered.
+    source: plan
+  - id: bucket
+    term: Bucket (token bucket, GCRA)
+    definition: A rate limiter that allows a steady rate of requests plus a small burst. Roxy keeps one per endpoint, host and egress so it never calls Roblox faster than planned.
+    source: plan
+  - id: bypass
+    term: Bypass
+    definition: An allowlisted IP address that skips rate limits. It is never exempt from blocks, bans, filters or a pause.
+    source: plan
+  - id: cache-key
+    term: Cache key
+    definition: The normalized identity of a request (method, host, path and the query values that matter) used to find a saved answer.
+    source: plan
+  - id: coalescing
+    term: Coalescing (single-flight)
+    definition: When many callers ask for the same uncached answer at the same moment, Roxy makes one call to Roblox and gives everyone the same answer.
+    source: plan
+  - id: cooldown
+    term: Cooldown
+    definition: A period during which Roxy will not contact an endpoint or egress at all, usually set from the Retry-After header of a Roblox 429.
+    source: plan
+  - id: credential
+    term: Credential
+    definition: The single Roblox .ROBLOSECURITY cookie Roxy owns. It is used only for Roxy's own probes and an explicit allowlist, and it never travels through the rotator.
+    source: plan
+  - id: csp
+    term: CSP
+    definition: Content Security Policy, a set of browser rules sent with every page. Roxy's policy only runs scripts that carry a secret per-response value, so injected scripts cannot run.
+    source: plan
+  - id: csrf
+    term: CSRF
+    definition: Cross-site request forgery, where another website tricks your browser into acting on Roxy. It is prevented with a per-session token and same-origin checks on every change.
+    source: plan
+  - id: rotator
+    term: DataImpulse / rotator
+    definition: A paid rotating residential proxy service Roxy can use as an alternate exit for anonymous requests. Every byte through it costs money, so it is used only when the direct path cannot be.
+    source: plan
+  - id: direct-path
+    term: Direct path
+    definition: Anonymous requests sent to Roblox from the server's own IP address, without the credential and without the rotator.
+    source: plan
+  - id: egress
+    term: Egress
+    definition: The path a request leaves Roxy through on its way to Roblox. The three egresses are direct, credential and rotator.
+    source: plan
+  - id: epoch
+    term: Epoch (fencing token)
+    definition: A number that goes up every time leadership changes hands. A leader's writes carry it, so an old leader that wakes up late cannot overwrite newer data.
+    source: plan
+  - id: endpoint-template
+    term: Endpoint template
+    definition: A Roblox path with its ids replaced by placeholders, for example games.roblox.com/v1/games/{universeId}/votes, so all requests of one kind are counted together.
+    source: plan
+  - id: latency
+    term: Fill time / latency
+    definition: How long a request takes to answer. p50, p95 and p99 are the times under which 50%, 95% and 99% of requests finished.
+    source: plan
+  - id: fingerprint
+    term: Fingerprint
+    definition: The recorded header names, header values and user agents of requests, used to recognize clients and spot tools pretending to be something else.
+    source: plan
+  - id: gcra
+    term: GCRA
+    definition: Generic Cell Rate Algorithm, an efficient way to run a token bucket that stores only one timestamp per limit.
+    source: plan
+  - id: half-open
+    term: Half-open
+    definition: The breaker state that lets a single test request through to check whether a failing endpoint has recovered.
+    source: plan
+  - id: hsts
+    term: HSTS
+    definition: A response header that tells browsers to use HTTPS only for this site, so a connection can never be quietly downgraded.
+    source: plan
+  - id: htmx
+    term: HTMX
+    definition: A small library that lets buttons and forms fetch finished HTML from the server and swap it into the page, so the dashboard needs very little JavaScript.
+    source: plan
+  - id: internal-bind
+    term: Internal bind
+    definition: A private Unix socket per color for deploy and admin tooling endpoints. nginx never forwards to it, so it is unreachable from the internet.
+    source: plan
+  - id: leader
+    term: Leader
+    definition: The one worker process that runs scheduled jobs, such as rollups and probes, chosen through a lease so the jobs never run twice.
+    source: plan
+  - id: lease
+    term: Lease
+    definition: A time-limited lock stored in the database. Whoever holds it must renew it, and if they stop, someone else can take it over.
+    source: plan
+  - id: negative-caching
+    term: Negative caching
+    definition: Remembering failures such as 404 and 429 for a short while, so the same failing request is not sent to Roblox again and again.
+    source: plan
+  - id: passkey
+    term: Passkey (WebAuthn)
+    definition: A phishing-resistant login that uses a key stored on your device and unlocked with your fingerprint, face or PIN.
+    source: plan
+  - id: place
+    term: Place / Roblox-Id
+    definition: The Roblox experience a game server request says it comes from, sent in the Roblox-Id header. It is a claim, so Roxy never bans a place automatically.
+    source: plan
+  - id: probe
+    term: Probe
+    definition: A request that looks like scanning or attacking, such as a path that is not a Roblox URL or one with unsafe characters.
+    source: plan
+  - id: recommendation
+    term: Recommendation
+    definition: A suggested change backed by evidence, with a preview of its effect, one-click apply, and undo.
+    source: plan
+  - id: reservation
+    term: Reservation
+    definition: Booking a future slot in every relevant rate bucket at once and waiting until then. A request that gives up returns its slot.
+    source: plan
+  - id: retry-after
+    term: Retry-After
+    definition: A response header that says how many seconds to wait before trying again. Roxy honors it from Roblox and sends it to callers it refuses.
+    source: plan
+  - id: rollup
+    term: Rollup
+    definition: Pre-summed metrics for a time bucket (a minute, hour, day or month), so long-range charts load quickly.
+    source: plan
+  - id: shadow-comparison
+    term: Shadow comparison
+    definition: A measurement made before the switch to v2 that replays a small sample of credential calls anonymously, to see which endpoints behave the same without the credential.
+    source: plan
+  - id: sse
+    term: SSE
+    definition: Server-Sent Events, a one-way live stream from the server to the browser. The Live page and the live indicator use it.
+    source: plan
+  - id: ssrf
+    term: SSRF
+    definition: Server-side request forgery, tricking a server into calling places it should not. Roxy only ever calls allowed Roblox hosts over HTTPS.
+    source: plan
+  - id: stale-if-error
+    term: Stale-if-error
+    definition: Serving an expired saved answer when Roblox fails, because a slightly old answer is better than an error.
+    source: plan
+  - id: stale-while-revalidate
+    term: Stale-while-revalidate (SWR)
+    definition: Serving a slightly expired answer instantly while fetching a fresh one in the background for the next caller.
+    source: plan
+  - id: strike
+    term: Strike / rung / multiplier / decay
+    definition: The terms of escalating throttles. Each violation is a strike, the strike count picks a rung of the ladder, the rung's multiplier lengthens the wait, and decay forgives strikes over time.
+    source: plan
+  - id: systemd-credential
+    term: systemd credential
+    definition: A secret file that systemd hands privately to the service when it starts, readable only by that service.
+    source: plan
+  - id: tarpit
+    term: Tarpit
+    definition: A deliberately slow refusal that wastes an abuser's time while costing Roxy almost nothing.
+    source: plan
+  - id: throttle-all
+    term: Throttle-all
+    definition: An emergency strict per-IP limit applied to everyone at once. The dashboard calls it the emergency limit.
+    source: plan
+  - id: totp
+    term: TOTP
+    definition: A time-based one-time password, the six-digit code from an authenticator app that changes every 30 seconds.
+    source: plan
+  - id: ttl
+    term: TTL
+    definition: Time to live, how long a saved answer counts as current. With a TTL of 60 seconds, the first caller sends one request to Roblox and everyone in the next minute gets that copy.
+    source: plan
+  - id: uvicorn-gunicorn
+    term: Uvicorn / gunicorn
+    definition: Uvicorn runs the async web app; gunicorn supervises several Uvicorn worker processes and restarts any that fail.
+    source: plan
+  - id: wal
+    term: WAL
+    definition: SQLite's write-ahead log mode, which lets many readers work while one writer writes.
+    source: plan
+  - id: worker
+    term: Worker
+    definition: One server process handling requests. Roxy runs two by default, and every limit holds however many there are.
+    source: plan
+
+  # ------------------------------------------------------------------------------------------ v1 dashboard glossaries
+  - id: hit
+    term: Hit
+    definition: Roxy already had the answer and handed over its saved copy. Roblox never heard about this request.
+    source: dashboard
+  - id: miss
+    term: Miss
+    definition: Roxy did not have the answer, so it asked Roblox, passed the answer on, and kept a copy for next time. A miss is the one that costs a request to Roblox.
+    source: dashboard
+  - id: expired
+    term: Expired
+    definition: A saved answer whose TTL has run out. It no longer counts as current, so the next caller sends Roxy back to Roblox for a fresh one.
+    source: dashboard
+  - id: stale
+    term: Stale
+    definition: An expired answer that Roxy handed over anyway because the fresh request to Roblox failed or was not allowed yet. A slightly old number beats an error.
+    source: dashboard
+  - id: cache-entry
+    term: Entry
+    definition: One saved answer for one exact question. ?universeIds=123 and ?universeIds=456 are two different questions, so they are two entries.
+    source: dashboard
+  - id: evicted
+    term: Evicted
+    definition: Thrown out of the cache before its TTL ran out, because the cache reached its size limit and needed the room.
+    source: dashboard
+  - id: purge
+    term: Purge
+    definition: Deleting saved answers on purpose, right now. The next caller who asks for one goes to Roblox.
+    source: dashboard
+  - id: rung
+    term: Rung
+    definition: One step of the throttle ladder. Rung 1 applies to a caller's first strike, rung 2 to the second, and past the last rung the last one repeats.
+    source: dashboard
+  - id: multiplier
+    term: Multiplier
+    definition: How much longer a rung's timeout is than the normal one. With a 50 second default, a multiplier of 4 means a 200 second wait.
+    source: dashboard
+  - id: decay
+    term: Decay
+    definition: Strikes fade with good behavior. After a quiet period a caller drops one rung, so a single bad afternoon does not follow them forever.
+    source: dashboard
+  - id: burst
+    term: Burst
+    definition: A limit shaped as N requests per P seconds. It suits a client that works in batches and then sleeps.
+    source: dashboard
+
+  # ------------------------------------------------------------------------------------------ Roxy dashboard terms
+  - id: refusal
+    term: Refusal
+    definition: A request Roxy answered itself with an error instead of serving it, for example because of a throttle, a ban or a blocked endpoint. Every refusal carries a reason code.
+    source: roxy
+  - id: reason-code
+    term: Reason code
+    definition: The short fixed name of why Roxy did what it did with a request, such as cache_hit, throttle or upstream_5xx. Charts and filters group by it.
+    source: roxy
+  - id: pause
+    term: Pause
+    definition: Turning the proxy off for callers without stopping the site. Every proxy request gets 503 with your message until you resume.
+    source: roxy
+  - id: emergency-limit
+    term: Emergency limit
+    definition: The dashboard's name for throttle-all, a strict per-IP limit applied to every caller at once. It is a softer alternative to pausing.
+    source: roxy
+  - id: throttle
+    term: Throttle
+    definition: The per-IP rate limit. A caller over it gets 429 with Retry-After and a strike, and repeat offenders wait longer.
+    source: roxy
+  - id: place-limit
+    term: Place limit
+    definition: A rate limit per Roblox experience (place) and caller network, so one huge game cannot use all of Roxy. It only observes and recommends until you turn it on.
+    source: roxy
+  - id: bot-score
+    term: Bot score
+    definition: A 0 to 100 estimate of how likely a client is an automated tool rather than a Roblox game server or a person, built from header and timing clues.
+    source: roxy
+  - id: challenge
+    term: Challenge
+    definition: An optional small puzzle a browser must solve before its requests are served, which costs real browsers nothing noticeable and slows bulk scrapers.
+    source: roxy
+  - id: spam-detector
+    term: Spam detector
+    definition: A rule that watches a sliding window of a client's requests for one abusive pattern, such as cache busting or enumerating ids, and then warns, throttles or bans.
+    source: roxy
+  - id: endpoint-block
+    term: Endpoint block
+    definition: A rule that refuses every request to a matching Roblox path, for example an endpoint that should never be proxied.
+    source: roxy
+  - id: endpoint-rule
+    term: Endpoint rule
+    definition: A rate limit for one matching Roblox path, separate from the per-IP throttle.
+    source: roxy
+  - id: request-filter
+    term: Request filter
+    definition: A rule that refuses requests whose header names or values match a pattern, also called a header rule.
+    source: roxy
+  - id: ua-rule
+    term: UA rule
+    definition: A rule that limits or refuses requests by their User-Agent header, the name a client gives for itself.
+    source: roxy
+  - id: ignored-path
+    term: Ignored path
+    definition: A path that Roxy answers with a quiet 404 without counting it as a probe, such as favicon.ico requests from browsers.
+    source: roxy
+  - id: ignored-param
+    term: Ignored parameter
+    definition: A query parameter left out of the cache key because it does not change the answer, so requests that differ only by it share one saved copy.
+    source: roxy
+  - id: key-spread
+    term: Key spread
+    definition: How many different cache keys one endpoint produces. A huge spread usually means a parameter that changes every time, which defeats the cache.
+    source: roxy
+  - id: revalidating
+    term: Revalidating
+    definition: A saved answer served right away while a fresh copy is fetched in the background (stale-while-revalidate).
+    source: roxy
+  - id: stale-during-cooldown
+    term: Stale during cooldown
+    definition: Serving an expired saved answer while Roblox has asked Roxy to wait, instead of refusing the caller.
+    source: roxy
+  - id: auth-smuggling
+    term: Auth smuggling
+    definition: A caller trying to send a Roblox login cookie or token through Roxy. Roxy refuses it with 400 before anything leaves the server.
+    source: roxy
+  - id: leak-guard
+    term: Leak guard
+    definition: The check on every anonymous outgoing request that refuses to send it if it contains the credential, and switches that egress off until an admin turns it back on.
+    source: roxy
+  - id: dry-run
+    term: Dry run
+    definition: A preview of what a change would have done, replayed over recent sampled traffic, without changing anything.
+    source: roxy
+  - id: auto-apply
+    term: Auto-apply
+    definition: An optional mode where recommendations marked safe apply themselves within strict bounds and roll back if the numbers get worse. It is off by default.
+    source: roxy
+  - id: annotation
+    term: Annotation
+    definition: A marker on a chart at the moment a setting changed or an incident began, linked to its audit entry, so you can see cause and effect.
+    source: roxy
+  - id: comparison-period
+    term: Comparison period
+    definition: The earlier stretch of time a chart or KPI is compared with, such as the previous period or the same period last week, drawn as a dashed line.
+    source: roxy
+  - id: percentile
+    term: Percentile (p50, p95, p99)
+    definition: The value below which that share of measurements fall. A p95 latency of 200 ms means 95% of requests finished within 200 ms.
+    source: roxy
+  - id: visitor
+    term: Visitor (human, crawler)
+    definition: Someone loading Roxy's public web pages rather than using the proxy. Visits are classified as a human browser, a crawler, or unknown.
+    source: roxy
+  - id: health-check
+    term: Health check
+    definition: A run of Roxy's built-in checks over every part of the system, from storage to each egress, with a pass, warn or fail for each and a fix for every failure.
+    source: roxy
+  - id: llm-export
+    term: LLM export
+    definition: A redacted JSON snapshot of Roxy's settings, metrics and findings that you can paste into an AI assistant for advice. It never contains secrets.
+    source: roxy
+  - id: fleet
+    term: Fleet
+    definition: All Roxy worker processes currently running, including both colors during a deploy.
+    source: roxy
+  - id: retention
+    term: Retention
+    definition: How long each kind of stored data is kept before it is deleted or summed into coarser rollups.
+    source: roxy
+  - id: capture
+    term: Capture
+    definition: A short-lived, redacted copy of a request and its response kept for debugging. Captures expire after minutes.
+    source: roxy
+  - id: trace
+    term: Trace
+    definition: The step-by-step record of what Roxy did with one request, from the abuse checks through the cache to each upstream attempt.
+    source: roxy
+  - id: request-id
+    term: Request id
+    definition: The unique id Roxy gives every request and returns in the Roxy-Request-Id header, so one request can be found in the logs and the Live page.
+    source: roxy
+  - id: upstream
+    term: Upstream
+    definition: Roblox's servers, from Roxy's point of view. An upstream call is one request Roxy sends to Roblox.
+    source: roxy
+  - id: caller
+    term: Caller
+    definition: Whoever sends a request to Roxy, usually a Roblox game server.
+    source: roxy
+  - id: queue-wait
+    term: Queue wait
+    definition: Time a request spent waiting for its turn in the rate buckets before it was sent to Roblox.
+    source: roxy
+  - id: quota
+    term: Quota
+    definition: The amount of rotator traffic your DataImpulse plan includes each month. Roxy projects when you will reach it and can stop the rotator before you go over.
+    source: roxy
+  - id: delta
+    term: Delta
+    definition: The change of a number compared with the comparison period, shown as an arrow and a percent. The arrow shows which way it moved, and the color and the words say whether that is an improvement.
+    source: roxy

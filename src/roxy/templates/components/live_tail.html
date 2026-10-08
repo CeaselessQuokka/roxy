@@ -1,0 +1,66 @@
+{#-
+  Live tail shell (plan 14.5 and 14.11): the real-time request list on the Live page.
+
+  What: `live_tail(id, stream_url, detail_url="/admin/api/v1/live/{id}")` renders the frame; static/js/live_tail.js
+  fills it from the Server-Sent Events stream (static/js/sse.js), drawing only the rows on screen (a virtualized
+  list), so thousands of rows cost the same as twenty.
+  Why: a busy proxy produces more rows than anyone can read, so the list pauses while the pointer is over it (and
+  with the Pause button or the P key), filters narrow it, and arrow keys move between rows with Enter opening the
+  full trace in the drawer. Screen readers are not flooded: the list itself is not a live region; a polite summary
+  ("12 new requests") is announced at most every 10 seconds (plan 14.9).
+  How: filters are plain selects and inputs read by live_tail.js (they also go to the server as query parameters
+  when the stream reconnects, so sampling happens on the server, plan 14.11). The tail keeps at most `max_rows`
+  rows in memory and counts what it dropped while paused (plan P9: bounded everything).
+-#}
+{% from "components/icon.html" import icon %}
+
+{% set _OUTCOMES = [("", "Any outcome"), ("served_upstream", "Served by Roblox"), ("served_cache", "Served from cache"),
+                    ("refused", "Refused by Roxy"), ("failed", "Failed")] %}
+{% set _EGRESS = [("", "Any egress"), ("direct", "Direct"), ("rotator", "Rotator"), ("credential", "Credential"), ("none", "None")] %}
+{% set _CACHE = [("", "Any cache state"), ("HIT", "Hit"), ("MISS", "Miss"), ("STALE", "Stale"), ("REVALIDATING", "Revalidating"),
+                 ("COALESCED", "Coalesced"), ("OFF", "Off")] %}
+{% set _STATUS = [("", "Any status"), ("2xx", "2xx"), ("3xx", "3xx"), ("4xx", "4xx"), ("429", "429 only"), ("5xx", "5xx")] %}
+
+{% macro _select(name, label, options) -%}
+<label class="chip-select"><span class="chip-select__label">{{ label }}</span>
+  <select name="{{ name }}" data-tail-filter="{{ name }}" aria-label="Filter by {{ label|lower }}">
+    {% for value, text in options %}<option value="{{ value }}">{{ text }}</option>{% endfor %}
+  </select>
+</label>
+{%- endmacro %}
+
+{% macro live_tail(id, stream_url, detail_url=None, title="Live requests", level=2, max_rows=1000) -%}
+<section class="tail card" id="{{ id }}" data-live-tail data-stream-url="{{ stream_url }}"{% if detail_url %} data-detail-url="{{ detail_url }}"{% endif %}
+         data-max-rows="{{ max_rows }}" aria-labelledby="{{ id }}-title">
+  <header class="card__head tail__head">
+    <div class="card__titles">
+      <h{{ level }} class="card__title" id="{{ id }}-title">{{ title }}</h{{ level }}>
+      <span class="tail__state" data-tail-state role="status">Connecting</span>
+    </div>
+    <div class="card__actions">
+      <span class="tail__count muted" data-tail-count>0 rows</span>
+      <button type="button" class="btn btn--sm" data-tail-pause aria-pressed="false">{{ icon("pause") }}<span>Pause</span></button>
+      <button type="button" class="btn btn--sm btn--ghost" data-tail-clear>{{ icon("x") }}<span>Clear</span></button>
+    </div>
+  </header>
+  <form class="tail__filters" data-tail-filters role="search" aria-label="{{ title }}: filters">
+    {{ _select("outcome", "Outcome", _OUTCOMES) }}
+    {{ _select("status", "Status", _STATUS) }}
+    {{ _select("egress", "Egress", _EGRESS) }}
+    {{ _select("cache", "Cache", _CACHE) }}
+    <label class="sr-only" for="{{ id }}-client">Client (IP or place id)</label>
+    <span class="input-icon">{{ icon("users") }}<input type="search" id="{{ id }}-client" data-tail-filter="client" placeholder="Client IP or place" autocomplete="off" spellcheck="false"></span>
+    <label class="sr-only" for="{{ id }}-endpoint">Endpoint contains</label>
+    <span class="input-icon">{{ icon("endpoints") }}<input type="search" id="{{ id }}-endpoint" data-tail-filter="endpoint" placeholder="Endpoint contains" autocomplete="off" spellcheck="false"></span>
+  </form>
+  <div class="tail__cols" aria-hidden="true">
+    <span>Time</span><span>Status</span><span>Outcome</span><span>Egress</span><span>Cache</span><span class="num">Latency</span><span>Client</span><span>Endpoint</span>
+  </div>
+  <div class="tail__viewport" data-tail-viewport tabindex="0" role="region"
+       aria-label="{{ title }}. Arrow keys move between rows, Enter opens the details, P pauses.">
+    <div class="tail__spacer" data-tail-spacer data-list-label="{{ title }}"></div>
+  </div>
+  <p class="tail__empty" data-tail-empty>Waiting for requests. New requests appear here the moment Roxy handles them.</p>
+  <p class="sr-only" aria-live="polite" data-tail-announce></p>
+</section>
+{%- endmacro %}

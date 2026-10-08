@@ -1,0 +1,69 @@
+{% extends "auth/base.html" %}
+{% block title %}Roxy Admin Login{% endblock %}
+{% block page %}login{% endblock %}
+{% block content %}
+<h1 class="auth-title">Roxy Admin</h1>
+
+<form id="login-form" class="auth-form" novalidate>
+  <label for="username">Username</label>
+  <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none"
+         spellcheck="false" maxlength="64" placeholder="Enter username" required>
+
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024"
+         placeholder="Enter password" required>
+
+  {% if trusted_devices_enabled %}
+  <div class="auth-check">
+    <input id="trust-device" type="checkbox">
+    <label for="trust-device">Trust this device for {{ trusted_device_days }} days (skip the second factor)</label>
+  </div>
+  {% endif %}
+
+  <p id="login-error" class="auth-error" role="alert" hidden></p>
+  <button id="login-submit" type="submit" class="auth-button">Login</button>
+</form>
+
+<section id="mfa" class="auth-mfa" hidden>
+  <h2 id="mfa-title" class="auth-subtitle" tabindex="-1">Two-Factor Authentication</h2>
+  <p id="mfa-hint" class="auth-hint">Enter the 6-digit code from your authenticator app.</p>
+
+  <fieldset id="mfa-methods" class="auth-methods" hidden>
+    <legend>Choose a second factor</legend>
+    <div class="auth-radio" data-method="totp">
+      <input type="radio" name="mfa-method" id="method-totp" value="totp">
+      <label for="method-totp">Authenticator app</label>
+    </div>
+    <div class="auth-radio" data-method="passkey">
+      <input type="radio" name="mfa-method" id="method-passkey" value="passkey">
+      <label for="method-passkey">Passkey</label>
+    </div>
+    <div class="auth-radio" data-method="recovery">
+      <input type="radio" name="mfa-method" id="method-recovery" value="recovery">
+      <label for="method-recovery">Recovery code</label>
+    </div>
+    <div class="auth-radio" data-method="email">
+      <input type="radio" name="mfa-method" id="method-email" value="email">
+      <label for="method-email">Emailed code</label>
+    </div>
+  </fieldset>
+
+  <form id="mfa-form" class="auth-form" novalidate>
+    <div id="mfa-code-group">
+      <label for="mfa-code" id="mfa-code-label">Code</label>
+      <input id="mfa-code" type="text" inputmode="numeric" autocomplete="one-time-code" autocapitalize="characters"
+             spellcheck="false" maxlength="64">
+    </div>
+    <p id="mfa-countdown" class="auth-hint" aria-live="polite"></p>
+    <p id="mfa-error" class="auth-error" role="alert" hidden></p>
+    <div class="auth-actions">
+      <button id="mfa-submit" type="submit" class="auth-button">Verify</button>
+      <button id="passkey-button" type="button" class="auth-button" hidden>Use a passkey</button>
+      <button id="mfa-resend" type="button" class="auth-button auth-secondary" hidden>Send a new code</button>
+      <button id="mfa-cancel" type="button" class="auth-button auth-secondary">Cancel</button>
+    </div>
+  </form>
+</section>
+
+<noscript><p class="auth-error">This page needs JavaScript to sign in.</p></noscript>
+{% endblock %}

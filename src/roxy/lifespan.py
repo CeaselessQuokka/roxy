@@ -14,10 +14,18 @@ Why it exists
 How it works
     Startup order (DESIGN.md section 1): env -> logging -> open databases -> schema check of control, hot and
     metrics (or development auto-migrate) -> cache.db quick check and rebuild, then its schema check -> settings
-    -> rules -> egress clients -> recorder and batch writer -> heartbeat -> leader loop -> config watcher -> SSE
-    tail. Each step is a small function; each step that acquires something registers its cleanup on an
-    `AsyncExitStack`, so shutdown runs the cleanups in exactly the reverse order, and a failure halfway through
-    startup still cleans up what was already opened.
+    -> rules -> alerts (the notifier) -> egress clients -> recorder and batch writer -> upstream service -> cache
+    -> abuse pipeline -> error hooks -> heartbeat -> leader loop and jobs -> config watcher -> SSE tail. Each step
+    is a small function; each step that acquires something registers its cleanup on an `AsyncExitStack`, so
+    shutdown runs the cleanups in exactly the reverse order, and a failure halfway through startup still cleans
+    up what was already opened.
+    The request path packages come in dependency order: the notifier first (the egress reports leak trips to it),
+    the egress before the recorder (whatever its accounting buffered meanwhile is handed over), the recorder
+    before upstream, cache and abuse (each keeps a reference to it), upstream before the cache (the cache fetches
+    through it), and the abuse pipeline last, because the proxy route answers 503 `degraded` until `ctx.abuse`
+    exists, so a half-built worker never serves. Shutdown therefore stops the abuse loops first, flushes the
+    cache, stops upstream, then flushes the recorder synchronously (after its loop has stopped, so the final
+    write sees every number), closes the egress clients and finally the notifier.
     cache.db is checked before anything reads it: a damaged file must be rebuilt (plan 5.5), not reported as a
     schema problem, and it must not be open in this worker when it is renamed aside.
     A database below `REQUIRED_SCHEMA` stops the worker with a clear `schema_too_old` log line: the exception
@@ -31,9 +39,12 @@ How it works
     the worker exits with an ordinary error status (`roxy.worker` maps it), so gunicorn simply starts a new one.
     Steps for packages built in later phases are marked "Hook (Pn)". Packages that exist are wired; until a
     package exists its step logs that it was skipped, so the skeleton app still starts.
+    Error hooks (`core/errors.py`) live on the app, not the context, and an app can run its lifespan more than
+    once (tests do): they are installed once per app and look up the current context when they run.
 
 What to read next
-    `roxy/main.py` (how the app is assembled), `roxy/storage/db.py` and `roxy/scheduler/leader.py`.
+    `roxy/main.py` (how the app is assembled), `roxy/storage/db.py` and `roxy/scheduler/leader.py`, then the
+    request path: `roxy/proxy/router.py`.
 """
 
 from __future__ import annotations
@@ -69,17 +80,16 @@ if TYPE_CHECKING:
     from roxy.abuse.pipeline import AbusePipeline
     from roxy.cache.service import CacheService
     from roxy.config.runtime import RuntimeSettings
+    from roxy.egress.clients import EgressClients
+    from roxy.metrics.live import EventTail
     from roxy.metrics.recorder import MetricsRecorder
+    from roxy.notify.notifier import Notifier
     from roxy.rules.store import RulesStore
     from roxy.scheduler.heartbeat import HeartbeatReporter
-    from roxy.scheduler.jobs import JobRunner
+    from roxy.scheduler.jobs import JobRegistry, JobRunner
     from roxy.scheduler.leader import LeaderElector
     from roxy.storage.db import Databases
     from roxy.upstream.service import UpstreamService
-
-    # DESIGN.md names these classes but not their modules yet; typed loosely until P3 and the notify agent land.
-    EgressClients = Any
-    Notifier = Any
 
 log = logging.getLogger("roxy.lifespan")
 
@@ -173,6 +183,8 @@ class AppContext:
     ip_hash_key: bytes | None = None  # the `ip_hash_key` credential (plan 12.3), None when not configured
     ready: bool = False  # True once startup finished; False again as soon as shutdown begins
     startup_steps: list[str] = field(default_factory=list)  # step names in the order they ran (tests, /internal)
+    # Added by the wave 2 wiring:
+    live_tail: EventTail | None = None  # the per-worker `events` tail the SSE endpoints subscribe to (plan 14.11)
 
 
 class CatalogDefaultsSettings:
@@ -494,10 +506,171 @@ async def _start_heartbeat_and_leader(ctx: AppContext, stack: AsyncExitStack) ->
 
             # `setting` lets the daily job read `maintenance_hour` and `ui_timezone` live on every run.
             register(registry, ctx.dbs, policy, state_dir=ctx.env.state_dir, setting=settings.get)
-        # Hook (P7, P10, P2): metrics rollups, insights, probes and alert digests register their jobs here.
+        _register_package_jobs(ctx, registry)
+        # Hook (P10, P2): insights, health check auto-runs and alert digests register their jobs here.
         runner = jobs_mod.JobRunner(registry, elector, ctx.clock, worker_id=ctx.worker_id)
         ctx.jobs = runner
         _start_loop(ctx, stack, "jobs", runner.run)
+
+
+CREDENTIAL_LIVENESS_JOB = "credential_liveness"
+
+
+def _register_package_jobs(ctx: AppContext, registry: JobRegistry) -> None:
+    """Leader jobs of the request path packages: metrics compaction and caps, the adaptive rate increase, and
+    the scheduled credential liveness probe (plan 5.6). Each is skipped while its package is not wired."""
+    metrics_jobs = optional_import("roxy.metrics.jobs")
+    if metrics_jobs is not None and ctx.recorder is not None:
+        rules = ctx.rules
+        metrics_jobs.register_metrics_jobs(
+            registry,
+            ctx.dbs,
+            ctx.settings.get,
+            ignore_header=metrics_jobs.rules_ignore_header(ctx.dbs.control, clock=ctx.clock, store=rules),
+            # `RulesStore.snapshot` is a property (the compiled rules of the current config_version).
+            ignored_headers=lambda: rules.snapshot.ignored_value_headers if rules is not None else (),
+        )
+    upstream_jobs = optional_import("roxy.upstream.jobs")
+    if upstream_jobs is not None and ctx.upstream is not None:
+        upstream_jobs.register_upstream_jobs(registry, ctx.upstream)
+    jobs_mod = optional_import("roxy.scheduler.jobs")
+    if jobs_mod is None or ctx.egress is None or ctx.upstream is None:
+        return
+    egress, upstream, settings = ctx.egress, ctx.upstream, ctx.settings
+
+    def liveness_interval_s() -> float:
+        # Read live before every scheduling decision; 0 turns the scheduled probe off.
+        return float(settings.get("credential_probe_interval_min")) * 60.0
+
+    async def liveness(job_ctx: Any) -> dict[str, Any]:
+        # Paced by the reserved probe sub-bucket (row 28): the upstream layer's fetcher, never the bare client.
+        result = await egress.credential.probe("liveness", fetch=upstream.credential_probe_fetch)
+        return {"outcome": result.outcome, "status_code": result.status_code}
+
+    registry.add(
+        jobs_mod.Job(
+            CREDENTIAL_LIVENESS_JOB,
+            liveness_interval_s,
+            liveness,
+            leader_only=True,
+            run_at_start=False,
+            description="Check that the Roblox credential still works (one account call, plan 5.6 and 13.2).",
+        )
+    )
+
+
+async def _start_alerts(ctx: AppContext, stack: AsyncExitStack) -> None:
+    """Step: the notifier (`notify/notifier.py`), closed last among the request path packages."""
+    notifier_mod = optional_import("roxy.notify.notifier")
+    if notifier_mod is None or ctx.dbs is None:
+        log.info("notifier_not_built")
+        return
+    ctx.alerts = notifier_mod.build_notifier(ctx)
+    stack.push_async_callback(ctx.alerts.aclose)
+
+
+async def _start_egress(ctx: AppContext, stack: AsyncExitStack) -> None:
+    """Step "clients": the three egress clients (P3, `egress/clients.py`) and their per-worker refresh loop."""
+    egress_mod = optional_import("roxy.egress.clients")
+    if egress_mod is None or ctx.dbs is None:
+        log.info("egress_not_built")
+        return
+    ctx.egress = await egress_mod.build_egress_clients(ctx)
+    stack.push_async_callback(ctx.egress.aclose)
+    _start_loop(ctx, stack, "egress_refresh", ctx.egress.run)
+
+
+def _start_recorder(ctx: AppContext, stack: AsyncExitStack) -> None:
+    """Step "recorder": the metrics recorder and its flush loop (P7, `metrics/recorder.py`).
+
+    `close` (a synchronous final flush) is registered BEFORE the loop, so on shutdown the loop stops first and the
+    final write then contains every number, including the minute still open.
+    """
+    recorder_mod = optional_import("roxy.metrics.recorder")
+    if recorder_mod is None or ctx.dbs is None:
+        log.info("recorder_not_built")
+        return
+    recorder = recorder_mod.build_recorder(ctx)
+    ctx.recorder = recorder
+    stack.callback(recorder.close)
+    _start_loop(ctx, stack, "metrics_flush", recorder.run)
+    accounting = getattr(ctx.egress, "accounting", None)
+    if accounting is not None:
+        # Usage the egress measured before the recorder existed (its own startup self-tests) is not lost.
+        for usage in accounting.drain():
+            recorder.record_egress_usage(usage)
+
+
+def _start_upstream(ctx: AppContext, stack: AsyncExitStack) -> None:
+    """Step "upstream": the `UpstreamService` (P4) and its availability mirror loop."""
+    service_mod = optional_import("roxy.upstream.service")
+    if service_mod is None or ctx.dbs is None or ctx.egress is None:
+        log.info("upstream_not_built")
+        return
+    ctx.upstream = service_mod.UpstreamService(ctx)
+    _start_loop(ctx, stack, "upstream_mirror", ctx.upstream.run_mirror)
+
+
+async def _start_cache(ctx: AppContext, stack: AsyncExitStack) -> None:
+    """Step "cache": the `CacheService` (P5); `close` flushes buffered hit counts at shutdown."""
+    cache_mod = optional_import("roxy.cache.service")
+    if cache_mod is None or ctx.dbs is None:
+        log.info("cache_not_built")
+        return
+    cache = cache_mod.CacheService.from_context(ctx)
+    await _retry_unavailable("cache", cache.start)
+    ctx.cache = cache
+    stack.push_async_callback(cache.close)
+
+
+async def _start_abuse(ctx: AppContext, stack: AsyncExitStack) -> None:
+    """Step "abuse": `abuse.pipeline.install` builds `ctx.abuse`, loads the switches and starts its loops (P6)."""
+    pipeline_mod = optional_import("roxy.abuse.pipeline")
+    if pipeline_mod is None or ctx.dbs is None:
+        log.info("abuse_not_built")
+        return
+    await pipeline_mod.install(ctx, stack)
+
+
+def _install_error_hooks(app: FastAPI) -> None:
+    """Attach the metrics and alert sides of `core/errors.py` hooks, once per app (see the module docstring).
+
+    The hooks read `app.state.ctx` when an error happens, so a second lifespan run on the same app (a test) reaches
+    the new recorder and notifier instead of the closed ones.
+    """
+    hooks = getattr(app.state, "error_hooks", None)
+    if hooks is None or getattr(app.state, "error_hooks_wired", False):
+        return
+    app.state.error_hooks_wired = True
+
+    def current(name: str) -> Any:
+        return getattr(getattr(app.state, "ctx", None), name, None)
+
+    events_mod = optional_import("roxy.metrics.security_events")
+    if events_mod is not None:
+        events_mod.install_error_hooks(hooks, lambda: current("recorder"))
+    notifier_mod = optional_import("roxy.notify.notifier")
+    if notifier_mod is not None:
+
+        def alert_on_error(event: Any) -> None:
+            notifier = current("alerts")
+            if notifier is None:
+                return
+            alert = notifier_mod.error_alert(event, str(getattr(notifier, "site_origin", "")))
+            if alert is not None:
+                notifier.notify(alert)  # fire and forget: the error answer has already been sent
+
+        hooks.add("server_error", alert_on_error)
+
+
+def _start_live_tail(ctx: AppContext, stack: AsyncExitStack) -> None:
+    """Step "sse_tail": one `events` tail per worker for the SSE endpoints (plan 5.6, 14.11)."""
+    live_mod = optional_import("roxy.metrics.live")
+    if live_mod is None or ctx.dbs is None:
+        log.info("live_tail_not_built")
+        return
+    ctx.live_tail = live_mod.EventTail(ctx.dbs.metrics)
+    _start_loop(ctx, stack, "sse_tail", ctx.live_tail.run)
 
 
 def _start_config_watcher(ctx: AppContext, stack: AsyncExitStack) -> None:
@@ -587,17 +760,26 @@ async def _startup(app: FastAPI, env: EnvSettings, clock: Clock, stack: AsyncExi
     app.state.ctx = ctx
     _setup_ip_hashing(ctx)
 
+    with _step(steps, "alerts"):
+        await _start_alerts(ctx, stack)
     with _step(steps, "clients"):
-        pass  # Hook (P3): ctx.egress = build EgressClients (egress/clients.py); register `aclose` on the stack.
+        await _retry_unavailable("clients", lambda: _start_egress(ctx, stack))
     with _step(steps, "recorder"):
-        pass  # Hook (P7): ctx.recorder = MetricsRecorder + BatchWriter; start its flush loop with _start_loop and
-        # register a synchronous `flush_now()` on the stack so shutdown never loses buffered metrics.
+        _start_recorder(ctx, stack)
+    with _step(steps, "upstream"):
+        _start_upstream(ctx, stack)
+    with _step(steps, "cache"):
+        await _start_cache(ctx, stack)
+    with _step(steps, "abuse"):
+        await _start_abuse(ctx, stack)
+    with _step(steps, "error_hooks"):
+        _install_error_hooks(app)
     if dbs is not None:
         await _start_heartbeat_and_leader(ctx, stack)
     with _step(steps, "config_watcher"):
         _start_config_watcher(ctx, stack)
     with _step(steps, "sse_tail"):
-        pass  # Hook (P11): _start_loop(ctx, stack, "sse_tail", ...) for the live tail fan-out (plan 14.11).
+        _start_live_tail(ctx, stack)
     ctx.ready = True
     log.info("worker_ready", extra={"fields": {"worker_id": worker_id, "steps": steps, "release": ctx.release}})
     return ctx

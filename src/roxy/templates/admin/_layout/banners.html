@@ -1,0 +1,37 @@
+{#-
+  Service state banners (parity rows 114 and 115): shown on every page while the proxy is paused or the
+  emergency limit (throttle-all) is on, with the refusals counted since that state began and when it began.
+
+  Context: `status` {paused, paused_since, paused_since_iso, pause_reason, pause_drops, throttle_all,
+  throttle_all_since, throttle_all_since_iso, throttle_limit, throttle_period, throttle_reason, throttle_drops}.
+  Times are pre-formatted by the page ("14:02, 12 minutes ago"); counts are numbers.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num %}
+{% set st = status if status is defined and status else {} %}
+{% if st.paused or st.throttle_all %}
+<div class="banners">
+  {% if st.paused %}
+  <section class="banner banner--bad" aria-labelledby="banner-pause-title">
+    {{ icon("pause", cls="banner__icon") }}
+    <div class="banner__text">
+      <p class="banner__title" id="banner-pause-title">The proxy is paused.</p>
+      <p><strong>{{ num(st.pause_drops or 0) }}</strong> requests refused with 503{% if st.paused_since %} since {% if st.paused_since_iso %}<time datetime="{{ st.paused_since_iso }}">{{ st.paused_since }}</time>{% else %}{{ st.paused_since }}{% endif %}{% endif %}.
+        Callers see: <q>{{ st.pause_reason or "Service down for maintenance." }}</q></p>
+    </div>
+    <button type="button" class="btn btn--sm btn--bad" data-dialog-open="dlg-pause" aria-haspopup="dialog">{{ icon("play") }}<span>Resume proxy</span></button>
+  </section>
+  {% endif %}
+  {% if st.throttle_all %}
+  <section class="banner banner--warn" aria-labelledby="banner-limit-title">
+    {{ icon("gauge", cls="banner__icon") }}
+    <div class="banner__text">
+      <p class="banner__title" id="banner-limit-title">The emergency limit is on: each IP may make {{ num(st.throttle_limit or 1) }} request{{ "s" if (st.throttle_limit or 1) != 1 }} per {{ num(st.throttle_period or 60) }} seconds.</p>
+      <p><strong>{{ num(st.throttle_drops or 0) }}</strong> requests over the limit refused with 429{% if st.throttle_all_since %} since {% if st.throttle_all_since_iso %}<time datetime="{{ st.throttle_all_since_iso }}">{{ st.throttle_all_since }}</time>{% else %}{{ st.throttle_all_since }}{% endif %}{% endif %}.
+        {% if st.throttle_reason %}Callers see: <q>{{ st.throttle_reason }}</q>{% endif %}</p>
+    </div>
+    <button type="button" class="btn btn--sm btn--warn" data-dialog-open="dlg-throttle-all" aria-haspopup="dialog">{{ icon("x") }}<span>Turn off</span></button>
+  </section>
+  {% endif %}
+</div>
+{% endif %}

@@ -1,0 +1,88 @@
+{#-
+  Charts: the server-drawn sparkline and the time-series chart container (plan 14.5).
+
+  What
+    `sparkline(values)` draws a tiny trend line as inline SVG on the server: no script, prints well, and is ready
+    on first paint. `timeseries(id, title, spec=..., src=...)` renders the container that static/js/charts.js turns
+    into a uPlot chart with drag-to-zoom (plus zoom buttons, because dragging must never be the only way, WCAG
+    2.5.7), a crosshair readout of every series, legend toggles, a dashed comparison overlay and annotation
+    markers.
+  Why
+    Charts must be readable without color and without a mouse (plan 14.9): every chart has a plain-language summary
+    (the plot's accessible name), a data table alternative inside <details>, and a visible list of annotations.
+  How
+    The chart spec travels as JSON in a single-quoted `data-spec` attribute (`tojson` escapes quotes and angle
+    brackets, so this is safe), or is fetched from `src`. Spec shape (all times are UNIX seconds):
+      {"x": [t0, t1, ...],
+       "series": [{"label": "Requests in", "values": [...], "color": 1, "kind": "line|area|bars",
+                   "stack": "group id or null", "compare": [...same length, optional...]}],
+       "compare_label": "Previous period",
+       "annotations": [{"t": t, "iso": "2026-10-07T14:02:00Z", "when": "14:02", "kind": "config|incident",
+                        "label": "cache_ttl_seconds 300 to 600", "href": "/admin/audit#..."}],
+       "y": {"unit": "req/min", "min": 0, "format": "count|bytes|percent|ms"},
+       "summary": "one sentence for screen readers"}
+    An annotation `href` must be a path on this site (format.html `local_href`); anything else shows as text.
+    `color` is a series slot 1 to 8 (tokens --series-1..8, fixed order, never cycled). Server-rendered fragments
+    never contain <script> (plan 9.2), which is why data is an attribute and not an inline JSON script.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import help_dot %}
+{% from "components/format.html" import local_href %}
+
+{#- Polyline points for `values` scaled into a width x height box with `lo` and `span` shared across lines. -#}
+{% macro _points(values, lo, span, width, height) -%}
+{%- set n = values|length -%}
+{%- for v in values -%}{{ "%.2f"|format((loop.index0 * width / ((n - 1) if n > 1 else 1))) }},{{ "%.2f"|format(height - 2 - ((v - lo) / span) * (height - 4)) }}{{ " " if not loop.last }}{%- endfor -%}
+{%- endmacro %}
+
+{% macro sparkline(values, compare=None, label="Trend", width=120, height=32, tone="accent") -%}
+{%- if values and values|length > 1 -%}
+{%- set pool = (values|list) + ((compare|list) if compare else []) -%}
+{%- set lo = pool|min -%}{%- set hi = pool|max -%}
+{%- set span = (hi - lo) if hi != lo else 1 -%}
+{%- set line = _points(values, lo, span, width, height) -%}
+<svg class="spark spark--{{ tone }}" viewBox="0 0 {{ width }} {{ height }}" preserveAspectRatio="none" role="img" aria-label="{{ label }}: from {{ values[0] }} to {{ values[-1] }}, lowest {{ values|min }}, highest {{ values|max }}">
+  <path class="spark__area" d="M0,{{ height }} L{{ line|replace(' ', ' L') }} L{{ width }},{{ height }} Z"></path>
+  {% if compare and compare|length > 1 %}<polyline class="spark__compare" points="{{ _points(compare, lo, span, width, height) }}"></polyline>{% endif %}
+  <polyline class="spark__line" points="{{ line }}"></polyline>
+</svg>
+{%- else -%}
+<span class="spark spark--empty" aria-hidden="true"></span>
+{%- endif -%}
+{%- endmacro %}
+
+{#- size: "sm" (160 px plot), "md" (240 px), "lg" (320 px). -#}
+{% macro timeseries(id, title, spec=None, src=None, summary="", help=None, size="md", level=3, table=None,
+                    annotations=None) -%}
+<figure class="chart" id="{{ id }}" data-chart{% if src %} data-src="{{ src }}"{% endif %}{% if spec %} data-spec='{{ spec|tojson }}'{% endif %} aria-labelledby="{{ id }}-title">
+  <figcaption class="chart__head">
+    <span class="chart__titles">
+      <h{{ level }} class="chart__title" id="{{ id }}-title">{{ title }}</h{{ level }}>
+      {% if help %}{{ help_dot(title, help) }}{% endif %}
+    </span>
+    <span class="chart__tools" role="toolbar" aria-label="{{ title }}: zoom">
+      <button type="button" class="icon-btn icon-btn--sm" data-chart-zoom="in" aria-label="Zoom in on {{ title }}">{{ icon("zoom-in") }}</button>
+      <button type="button" class="icon-btn icon-btn--sm" data-chart-zoom="out" aria-label="Zoom out on {{ title }}">{{ icon("zoom-out") }}</button>
+      <button type="button" class="icon-btn icon-btn--sm" data-chart-zoom="reset" aria-label="Show the whole range of {{ title }}">{{ icon("reset") }}</button>
+    </span>
+  </figcaption>
+  <div class="chart__legend" data-chart-legend role="group" aria-label="{{ title }}: series (press to show or hide)"></div>
+  <div class="chart__plot chart__plot--{{ size }}" data-chart-plot role="img" aria-label="{{ summary or title }}">
+    <p class="chart__loading">Loading chart</p>
+  </div>
+  {% set notes = annotations if annotations is not none else ((spec or {}).get("annotations") or []) %}
+  {% if notes %}
+  <ul class="chart__notes" aria-label="{{ title }}: marked events">
+    {% for note in notes %}
+    <li class="chart__note chart__note--{{ note.kind or 'config' }}">{{ icon("flag") }}{% if note.iso %}<time datetime="{{ note.iso }}">{{ note.when or note.iso }}</time>{% elif note.when %}<span>{{ note.when }}</span>{% endif %}{% set note_href = local_href(note.href) if note.href else "" %}{% if note_href %}<a href="{{ note_href }}">{{ note.label }}</a>{% else %}<span>{{ note.label }}</span>{% endif %}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  <details class="chart__table">
+    <summary>Show the data as a table</summary>
+    <div class="table-scroll" data-chart-table tabindex="0" role="region" aria-label="{{ title }}: data table">
+      {% if table %}{{ table }}{% else %}<p class="muted">The table appears once the chart has loaded.</p>{% endif %}
+    </div>
+  </details>
+</figure>
+{%- endmacro %}

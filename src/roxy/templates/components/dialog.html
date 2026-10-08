@@ -1,0 +1,63 @@
+{#-
+  Confirm dialog with plain-language consequences and type-to-confirm (plan 14.5).
+
+  What
+    `confirm_dialog("dlg-purge", "Purge the whole cache?", action="/admin/api/v1/cache/purge", danger=True,
+    consequences=[...], type_to_confirm="purge")` renders a native <dialog>. Open it with any button carrying
+    `data-dialog-open="dlg-purge"`; static/js/dialog.js opens it as a modal, traps focus (the browser does that for
+    modal dialogs), closes on Escape or Cancel, and gives focus back to the button that opened it.
+  Why
+    A destructive action deserves one deliberate pause that says what will happen in plain words. Typing a word
+    (type-to-confirm) is reserved for actions that cannot be undone, so it never becomes a habit people click
+    through. A reason field feeds the audit log (plan 9.7).
+  How
+    The form posts with htmx (`hx-post`, or `method="delete"` etc.), so the X-CSRF-Token header is added by
+    static/js/htmx_setup.js. The server answers 2xx (the dialog closes; an `HX-Trigger` header can show a toast) or
+    an error (the dialog stays open and shows the message). The confirm button stays disabled until the typed text
+    matches, through the `typeConfirm` Alpine component (static/js/components.js). Extra fields can be passed with
+    `{% call confirm_dialog(...) %}<label>...</label>{% endcall %}`.
+-#}
+{% from "components/icon.html" import icon %}
+
+{% macro confirm_dialog(id, title, action, method="post", confirm_label="Confirm", danger=False, consequences=(),
+                        body=None, type_to_confirm=None, reason=False, reason_required=False, hidden=None) -%}
+<dialog class="dialog{% if danger %} dialog--danger{% endif %}" id="{{ id }}" aria-labelledby="{{ id }}-title" aria-describedby="{{ id }}-desc">
+  <form class="dialog__form" hx-{{ method }}="{{ action }}" hx-swap="none" data-dialog-form
+        x-data="typeConfirm" x-on:reset="clear" data-expected="{{ type_to_confirm or '' }}">
+    <header class="dialog__head">
+      <h2 class="dialog__title" id="{{ id }}-title">{% if danger %}{{ icon("alert-triangle", cls="dialog__title-icon") }}{% endif %}{{ title }}</h2>
+      <button type="button" class="icon-btn" data-dialog-close aria-label="Close">{{ icon("x") }}</button>
+    </header>
+    <div class="dialog__body">
+      <div id="{{ id }}-desc">
+        {% if body %}<p>{{ body }}</p>{% endif %}
+        {% if consequences %}
+        <p class="dialog__label">What happens</p>
+        <ul class="dialog__consequences">{% for c in consequences %}<li>{{ c }}</li>{% endfor %}</ul>
+        {% endif %}
+      </div>
+      {% for name, value in (hidden or {}).items() %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
+      {{ caller() if caller is defined else "" }}
+      {% if reason %}
+      <div class="field">
+        <label class="field__label" for="{{ id }}-reason">Reason{% if not reason_required %} <span class="muted">(optional, saved in the audit log)</span>{% endif %}</label>
+        <textarea class="input" id="{{ id }}-reason" name="reason" rows="2" maxlength="500"{% if reason_required %} required aria-required="true"{% endif %}></textarea>
+      </div>
+      {% endif %}
+      {% if type_to_confirm %}
+      <div class="field">
+        <label class="field__label" for="{{ id }}-confirm">Type <strong class="mono">{{ type_to_confirm }}</strong> to confirm</label>
+        <input class="input mono" id="{{ id }}-confirm" name="confirm_text" autocomplete="off" spellcheck="false" autocapitalize="off"
+               x-on:input="onType" aria-describedby="{{ id }}-confirm-hint">
+        <p class="field__hint" id="{{ id }}-confirm-hint">This cannot be undone, so the button stays off until the text matches.</p>
+      </div>
+      {% endif %}
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    </div>
+    <footer class="dialog__foot">
+      <button type="button" class="btn btn--ghost" data-dialog-close>Cancel</button>
+      <button type="submit" class="btn {{ 'btn--danger' if danger else 'btn--primary' }}" x-bind:disabled="blocked">{{ confirm_label }}</button>
+    </footer>
+  </form>
+</dialog>
+{%- endmacro %}

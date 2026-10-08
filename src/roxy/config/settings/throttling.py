@@ -229,19 +229,20 @@ SETTINGS: list[SettingSpec] = [
         group=Group.THROTTLING,
         label="Count cache hits toward the per-IP limit",
         type=SettingType.BOOL,
-        default=0,
+        default=1,
         description=(
             "Whether a request answered from Roxy's own cache uses up part of the caller's per-IP allowance. "
-            "Cache hits cost Roblox nothing, so by default only requests that need a fetch from Roblox count. "
-            "The flood limit still counts every request."
+            "A cache hit costs Roblox nothing, but it still costs Roxy CPU, bandwidth and server time, so by "
+            "default every request counts, cached or not. The flood limit also counts every request."
         ),
         if_enabled=(
-            "Every request counts, cached or not (the v1 behavior), so callers polling popular, already cached "
-            "endpoints get 429s for answers that never touched Roblox."
+            "Every request counts, cached or not (the v1 behavior and the default), so each caller's allowance "
+            "reflects the full load it puts on Roxy."
         ),
         if_disabled=(
-            "Only requests that are not served from cache count, so callers reading cached data keep working; "
-            "the flood limit (300 per minute by default) still caps how fast one IP can send."
+            "Only requests that are not served from cache count, so callers polling popular cached endpoints can "
+            "send more before being throttled; the flood limit (300 per minute by default) still caps how fast "
+            "one IP can send."
         ),
         risk=Risk.LOW,
         related_settings=(
@@ -251,7 +252,10 @@ SETTINGS: list[SettingSpec] = [
             "cache_serve_throttled",
         ),
         pages=(_THROTTLE,),
-        notes="Owner decision D10. In v1 every request counted, cached or not.",
+        notes=(
+            "Owner decision D10, changed by the owner on 2026-10-07: cache hits count because serving them costs "
+            "Roxy resources (the plan's recommended default was 0). In v1 every request counted, cached or not."
+        ),
     ),
     SettingSpec(
         key="stale_ip_duration",
