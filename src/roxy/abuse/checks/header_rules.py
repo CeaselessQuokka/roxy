@@ -9,8 +9,10 @@ Why it exists
     `Roxy-Throttle-Reset` equal to `throttle_reset_duration`), so the tool author cannot tell a filter caught them.
 
 How it works
-    The rule is found before the transaction (no I/O); the disguised body is rendered after it, because it depends
-    on the client's strikes, which the transaction read. A custom message is sent as is with `Roxy-Refusal:
+    The rule is found before the transaction (no I/O), but only once the cheap limiters admitted the request when
+    regex rules exist (`uses_patterns`, see `roxy/abuse/pipeline.py`); the disguised body is rendered after the
+    transaction (`checks/base.py redisguise`), because it depends on the client's strikes and penalty, which the
+    transaction read. A custom message is sent as is with `Roxy-Refusal:
     header_rule` (v2 adds `Retry-After`, v1 bug B8). Neither form counts toward the per-IP limit or adds a strike
     (v1). Tarpit category `header_rule` (on by default) with v1's reason `Filter <id> (matched <Header>)`. Bypass
     does not skip it.
@@ -23,15 +25,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from roxy.abuse.checks.base import (
-    Check,
-    Facts,
-    LimitSpec,
-    TxState,
-    disguised_throttle,
-    refusal_headers,
-    with_trio,
-)
+from roxy.abuse.checks.base import Check, Facts, LimitSpec, disguised_throttle, refusal_headers
 from roxy.abuse.header_rules import header_pairs, header_rule_message, match_header_rule
 from roxy.abuse.messages import REASON_HEADER_RULE
 from roxy.abuse.verdict import TRUE, Refuse, title_case_header
@@ -43,6 +37,7 @@ class HeaderRuleCheck(Check):
     position = 150
     label = "Request filters (header rules)"
     tarpit_category = "header_rule"
+    uses_patterns = True
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
         if not facts.rules.enabled_header_rules:
@@ -76,22 +71,8 @@ class HeaderRuleCheck(Check):
             detail=detail,
         )
 
-    async def check(self, req: Any, tx: TxState) -> Refuse | None:
-        refusal = tx.static.get(self.name)
-        if refusal is None:
-            return None
-        if refusal.disguised and tx.facts is not None:
-            # Re-render with the client's real strikes (read by the transaction), exactly like v1's disguise.
-            refusal = disguised_throttle(
-                tx.facts,
-                reason=ReasonCode.HEADER_RULE,
-                check=self.name,
-                strikes=tx.strikes,
-                tarpit_category=self.tarpit_category,
-                detail=refusal.detail,
-            )
-            return refusal  # a disguised refusal carries the complete genuine-throttle header set already
-        return with_trio(refusal, tx)
+    # `check` is the base class's: a disguised refusal is rendered again with the client's real strikes and
+    # penalty (read by the transaction), exactly like v1's disguise; a custom message gets the per-IP trio.
 
 
 __all__ = ["HeaderRuleCheck"]

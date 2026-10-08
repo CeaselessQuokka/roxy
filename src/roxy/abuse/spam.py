@@ -32,6 +32,18 @@ How it works
       `recommend` (an event the recommendations engine turns into ABUSE-SPAM). Collateral protection: a trusted Roblox
       game server (`roxy/abuse/bot.py`) is never banned (it gets a strike instead), places and the distributed
       detector only ever recommend, and bypass entries are never counted.
+    - Bounds (plan P9). Some subjects are keyed by values the CALLER chooses (`Roblox-Id` place ids, path-derived
+      templates, the User-Agent hash), so one client could otherwise add a row per request. Per client and per
+      `CHOSEN_WINDOW_S`, each such family (places, enum templates, distributed template and User-Agent pairs) takes at
+      most `MAX_CHOSEN_PER_CLIENT` distinct values; further values are FOLDED into one `(other)` subject of that
+      family instead of dropped, so a client cannot hide traffic by spending its quota on decoys first (its requests
+      are still counted, only coarser). The table as a whole keeps at most `MAX_SPAM_ROWS` counter rows: when a flush
+      goes over, rows are evicted oldest first in `EVICTION_TIERS` order: first the rows that can only lead to a
+      recommendation (the caller-chosen families and `bust`), then the `req` and `ref` rows every client has, and
+      only then the rare `probe` and `auth` rows that lead to a ban. Signal rows of one `ip:` key are created and
+      refreshed only by that client's own requests, so decoys (from the client itself or from many addresses) push
+      out decoys first, never an older probe or auth record; a client that keeps sending keeps its rows fresh.
+      Active flags are capped at `MAX_ACTIVE_FLAGS`.
 
 What to read next
     `roxy/abuse/bans.py` (automatic bans), then `roxy/abuse/checks/spam.py` (the refusal).
@@ -45,6 +57,7 @@ import logging
 import re
 import sqlite3
 import zlib
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
@@ -52,6 +65,7 @@ from typing import Any, Final
 from roxy.abuse.bans import create_auto_ban, ua_hash
 from roxy.abuse.throttle import add_strike_in
 from roxy.core.clock import Clock
+from roxy.core.scope import catalog_default
 from roxy.rules.service import RulesService
 from roxy.storage.db import Database, SharedStateUnavailable
 
@@ -78,6 +92,29 @@ MAX_SET_PER_BUCKET: Final = 1024
 MAX_ACTIVE_FLAGS: Final = 10_000
 BUST_MIN_REQUESTS: Final = 200
 DIST_MIN_REQUESTS: Final = 1000
+MAX_CHOSEN_PER_CLIENT: Final = 8
+"""Distinct caller-chosen values (places, enum templates, dist pairs) one client adds per family per window."""
+CHOSEN_WINDOW_S: Final = 3600
+"""The window of `MAX_CHOSEN_PER_CLIENT`; a client gets a fresh quota after it."""
+MAX_TRACKED_CLIENTS: Final = 20_000
+"""Clients whose chosen-value quota one worker remembers (least recently seen forgotten first)."""
+OVERFLOW: Final = "(other)"
+"""The folded value of a family once a client's quota is spent (module docstring, bounds)."""
+MAX_SPAM_ROWS: Final = 50_000
+"""Counter rows (flags excluded) `spam_windows` may hold; a flush over it evicts (module docstring, bounds)."""
+EVICT_BATCH: Final = 1_000
+"""Rows evicted below the cap at once, so eviction runs rarely instead of on every flush."""
+CHOSEN_SUBJECT_SQL: Final = (
+    "(subject LIKE 'req|place:%' OR subject LIKE 'ref|place:%' OR subject LIKE 'enum|%' OR subject LIKE 'dist|%')"
+)
+"""Counter rows keyed by caller-chosen values."""
+EVICTION_TIERS: Final[tuple[str, ...]] = (
+    f"({CHOSEN_SUBJECT_SQL} OR subject LIKE 'bust|%')",
+    "(subject LIKE 'req|%' OR subject LIKE 'ref|%')",
+    "(subject NOT LIKE 'flag|%')",
+)
+"""Eviction order (module docstring, bounds): rows that can only lead to a recommendation, then the rate and refusal
+rows every client has, and only then the rare probe and auth rows that lead to a ban. Oldest first in each tier."""
 _DIGITS = re.compile(r"^[0-9]{1,20}$")
 
 EventSink = Callable[[str, str, Mapping[str, Any]], None]
@@ -103,6 +140,14 @@ class _Pending:
     counts: dict[int, int] = field(default_factory=dict)
     sets: dict[int, set[str]] = field(default_factory=dict)
     game_server: bool = False
+
+
+@dataclass(slots=True)
+class _Quota:
+    """One client's caller-chosen values in the current window, per family (each at most MAX_CHOSEN_PER_CLIENT)."""
+
+    start: int
+    families: dict[str, set[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,8 +180,16 @@ class Flag:
     refuses: bool
 
 
+def _live(values: Mapping[str, Any], key: str, fallback: Any = None) -> Any:
+    """The live value, else the catalog default (plan 15.1), else `fallback` for a key the catalog lacks."""
+    if key in values:
+        return values[key]
+    default = catalog_default(key)
+    return fallback if default is None else default
+
+
 def _setting(values: Mapping[str, Any], detector: str, name: str, default: Any) -> Any:
-    return values.get(f"spam_{detector}_{name}", default)
+    return _live(values, f"spam_{detector}_{name}", default)
 
 
 def _window(values: Mapping[str, Any], detector: str) -> int:
@@ -227,7 +280,10 @@ class SpamDetectors:
         self.events = events
         self._pending: dict[str, _Pending] = {}
         self._flags: dict[str, Flag] = {}
+        self._quotas: OrderedDict[str, _Quota] = OrderedDict()
         self.dropped = 0
+        self.folded = 0  # caller-chosen values counted under `(other)` because the client's quota was spent
+        self.evicted = 0  # rows removed to keep `spam_windows` under MAX_SPAM_ROWS
         self.flushes = 0
         self.detections_total = 0
 
@@ -281,7 +337,7 @@ class SpamDetectors:
     ) -> None:
         """Count one finished request for every enabled detector (memory only; bypass entries are never counted)."""
         values = self._values()
-        if bypass or not bool(values.get("spam_enabled", 0)):
+        if bypass or not bool(_live(values, "spam_enabled")):
             return
         now_s = int(self.clock.now())
         who = f"ip:{limit_key}"
@@ -290,23 +346,45 @@ class SpamDetectors:
             slot = self._pending.get(f"req|{who}")
             if slot is not None:
                 slot.game_server = True
-        if place_id:
-            self._count(values, "rate", f"place:{place_id}", now_s)
+        place = self._chosen(limit_key, "place", place_id, now_s) if place_id else None
+        if place:
+            self._count(values, "rate", f"place:{place}", now_s)
         if refused:
             self._count(values, "refused", who, now_s)
-            if place_id:
-                self._count(values, "refused", f"place:{place_id}", now_s)
+            if place:
+                self._count(values, "refused", f"place:{place}", now_s)
         if probe:
             self._count(values, "probe", who, now_s)
         if auth:
             self._count(values, "auth", who, now_s)
         ids = [part for part in path.split("/") if _DIGITS.match(part)]
         if ids and template:
-            self._count(values, "enum", f"{who}|{template}", now_s, "/".join(ids))
+            enum_template = self._chosen(limit_key, "enum", template, now_s)
+            self._count(values, "enum", f"{who}|{enum_template}", now_s, "/".join(ids))
         fingerprint = template + "?" + "&".join(f"{k}={v}" for k, v in sorted(query)) if query else template
         self._count(values, "bust", who, now_s, _short_hash(fingerprint) if query else None)
         if template:
-            self._count(values, "dist", f"{template}|{ua_hash(user_agent)}", now_s, _short_hash(limit_key))
+            pair = self._chosen(limit_key, "dist", f"{template}|{ua_hash(user_agent)}", now_s)
+            self._count(values, "dist", pair if pair != OVERFLOW else f"{OVERFLOW}|{OVERFLOW}", now_s,
+                        _short_hash(limit_key))  # fmt: skip
+
+    def _chosen(self, limit_key: str, family: str, value: str, now_s: int) -> str:
+        """`value`, or `OVERFLOW` once this client used its quota of distinct values in `family` (module docstring)."""
+        quota = self._quotas.get(limit_key)
+        if quota is None or now_s - quota.start >= CHOSEN_WINDOW_S:
+            quota = _Quota(now_s)
+            self._quotas[limit_key] = quota
+            while len(self._quotas) > MAX_TRACKED_CLIENTS:
+                self._quotas.popitem(last=False)
+        self._quotas.move_to_end(limit_key)
+        seen = quota.families.setdefault(family, set())
+        if value in seen:
+            return value
+        if len(seen) >= MAX_CHOSEN_PER_CLIENT:
+            self.folded += 1
+            return OVERFLOW
+        seen.add(value)
+        return value
 
     # ---- the flagged clients ----
 
@@ -326,6 +404,7 @@ class SpamDetectors:
         self, conn: sqlite3.Connection, batch: dict[str, _Pending], values: Mapping[str, Any], now_s: int
     ) -> tuple[list[Detection], list[Flag]]:
         detections: list[Detection] = []
+        inserted = 0
         for subject, pending in batch.items():
             signal, _, who = subject.partition("|")
             detector = DETECTOR_OF.get(signal)
@@ -341,6 +420,7 @@ class SpamDetectors:
                 else min(MAX_SET_PER_BUCKET, int(float(_setting(values, detector, "threshold", 0))) + 1)
             )
             row = conn.execute("SELECT buckets_json FROM spam_windows WHERE subject = ?", (subject,)).fetchone()
+            inserted += row is None
             try:
                 data = json.loads(row[0]) if row is not None else {}
             except (TypeError, ValueError):
@@ -371,10 +451,48 @@ class SpamDetectors:
                         f"SPAM-{detector.upper()}: {value:g} in {window} s (threshold {threshold:g})",
                     )
                 )
-        claimed = [d for d in detections if self._claim(conn, d, values, now_s)]
+        if inserted:
+            self.evicted += self._evict(conn)
         self._drop_expired_flags(conn, now_s)
+        claimed: list[Detection] = []
+        room = MAX_ACTIVE_FLAGS - self._count_flags(conn) if detections else 0
+        for detection in detections:
+            acted, created = self._claim(conn, detection, values, now_s, can_create=room > 0)
+            room -= created
+            if acted:
+                claimed.append(detection)
         flags = self._read_flags(conn, now_s)
         return claimed, flags
+
+    @staticmethod
+    def _count_flags(conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT count(*) FROM spam_windows WHERE subject >= ? AND subject < ?",
+            (FLAG_PREFIX, FLAG_PREFIX + "\U0010ffff"),
+        ).fetchone()
+        return int(row[0])
+
+    @classmethod
+    def _evict(cls, conn: sqlite3.Connection) -> int:
+        """Keep the counter rows under `MAX_SPAM_ROWS` (module docstring, bounds); returns how many were removed."""
+        total = int(conn.execute("SELECT count(*) FROM spam_windows").fetchone()[0])
+        over = total - cls._count_flags(conn) - MAX_SPAM_ROWS
+        if over <= 0:
+            return 0
+        target = over + EVICT_BATCH
+        removed = 0
+        # Tier by tier (EVICTION_TIERS), oldest first; flags never (they expire on their own and have their own cap).
+        for where in EVICTION_TIERS:
+            if removed >= target:
+                break
+            cursor = conn.execute(
+                f"DELETE FROM spam_windows WHERE subject IN (SELECT subject FROM spam_windows WHERE {where} "  # noqa: S608  # constant clauses only
+                "ORDER BY updated_at LIMIT ?)",
+                (target - removed,),
+            )
+            removed += max(0, int(cursor.rowcount))
+        log.warning("spam_windows_evicted", extra={"fields": {"rows": removed, "cap": MAX_SPAM_ROWS}})
+        return removed
 
     @staticmethod
     def _drop_expired_flags(conn: sqlite3.Connection, now_s: int) -> None:
@@ -392,8 +510,17 @@ class SpamDetectors:
             return "strike"  # collateral protection: never ban a trusted game server (plan 10.3)
         return detection.action
 
-    def _claim(self, conn: sqlite3.Connection, detection: Detection, values: Mapping[str, Any], now_s: int) -> bool:
-        """Insert or refresh this detection's flag; True only for the worker that created it (acts once)."""
+    def _claim(
+        self,
+        conn: sqlite3.Connection,
+        detection: Detection,
+        values: Mapping[str, Any],
+        now_s: int,
+        *,
+        can_create: bool = True,
+    ) -> tuple[bool, bool]:
+        """Insert or refresh this detection's flag. Returns `(acted, created)`: `acted` only for the worker that
+        created the active flag (it acts once), `created` when a new flag row was added (the flag cap counts it)."""
         action = self._effective_action(detection)
         refuses = action in ("strike", "tarpit") and detection.limit_key is not None
         until = now_s + (FLAG_REFUSE_S if refuses else detection.window_s)
@@ -406,7 +533,10 @@ class SpamDetectors:
             except (TypeError, ValueError, AttributeError):
                 active = False
         if active and not refuses:
-            return False
+            return False, False
+        if row is None and not can_create:
+            self.dropped += 1  # MAX_ACTIVE_FLAGS reached: this detection waits until older flags expire
+            return False, False
         payload = json.dumps(
             {"until": until, "action": action, "refuses": int(refuses), "evidence": detection.evidence},
             separators=(",", ":"),
@@ -418,10 +548,10 @@ class SpamDetectors:
             (subject, payload, now_s),
         )
         if active:
-            return False  # refreshed an active refusing flag; the action already happened
+            return False, False  # refreshed an active refusing flag; the action already happened
         if action == "strike" and detection.limit_key is not None:
-            add_strike_in(conn, detection.limit_key, now_s, float(values.get("throttle_strike_decay_seconds", 1800)))
-        return True
+            add_strike_in(conn, detection.limit_key, now_s, float(_live(values, "throttle_strike_decay_seconds")))
+        return True, row is None
 
     @staticmethod
     def _read_flags(conn: sqlite3.Connection, now_s: int) -> list[Flag]:

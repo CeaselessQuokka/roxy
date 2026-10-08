@@ -373,3 +373,60 @@ def test_roblox_error_codes_stay_readable() -> None:
     assert is_secret_field("code", 123456)
     assert is_secret_field("code", "abcd-efgh-ijkl")
     assert is_secret_field("password", "")
+
+
+# --- labels (finding F4) -------------------------------------------------------------------------------------------
+
+
+def test_redact_label_keeps_ordinary_labels_exactly() -> None:
+    """Endpoint templates, hosts and place ids that hold no secret come back unchanged (v1 templating parity)."""
+    from roxy.core.redact import redact_label
+
+    SecretRegistry.register("roblox_credential", fake_credential())
+    for label in (
+        "games.roblox.com/v1/games/{gameId}/servers/Public",
+        "avatar.roblox.com/v2/avatar/users/{userId}/outfits",
+        "thumbnails.roblox.com",
+        "1818",
+        "(not_roblox)",
+        "",
+    ):
+        assert redact_label(label) == label
+
+
+def test_redact_label_scrubs_a_credential_piece_and_markers() -> None:
+    from roxy.core.redact import redact_label
+
+    credential = fake_credential()
+    SecretRegistry.register("roblox_credential", credential)
+    piece = credential[len(TOKEN_PREFIX) + 30 : len(TOKEN_PREFIX) + 70]
+    assert piece not in redact_label(f"games.roblox.com/v1/x.{piece}")
+    assert piece.lower() not in redact_label(f"{piece.lower()}.roblox.com")
+    assert piece not in redact_label(piece)  # a Roblox-Id header holding only the piece
+    assert redact_label(piece) == MASK
+    assert redact_label(f"games.roblox.com/v1/{TOKEN_PREFIX}abc") == f"games.roblox.com/v1/{MASK}"
+
+
+def test_redact_label_memory_follows_the_registry() -> None:
+    """An answer remembered before a secret was registered is never reused after: a label that was clean must be
+    scrubbed once it holds a piece of the newly registered credential (a replace)."""
+    from roxy.core.redact import redact_label
+
+    credential = fake_credential()
+    piece = credential[len(TOKEN_PREFIX) + 10 : len(TOKEN_PREFIX) + 50]
+    label = f"games.roblox.com/v1/x.{piece}"
+    assert redact_label(label) == label  # nothing registered yet: an ordinary label, remembered
+    SecretRegistry.register("roblox_credential", credential)
+    assert piece not in redact_label(label)
+
+
+def test_redact_label_memory_is_bounded() -> None:
+    from roxy.core import redact
+
+    cache = redact._LabelCache(4)
+    for n in range(50):
+        assert cache.redact(f"label-{n}") == f"label-{n}"
+        assert len(cache._state[1]) <= 4
+    long_text = "x" * (redact.LABEL_CACHE_MAX_CHARS + 1)
+    assert cache.redact(long_text) == long_text
+    assert long_text not in cache._state[1]  # long texts are redacted every time, never remembered

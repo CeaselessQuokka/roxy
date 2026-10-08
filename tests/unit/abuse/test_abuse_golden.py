@@ -296,10 +296,24 @@ async def test_throttled_cache_serve_flag(pipeline_with: Callable[..., AbusePipe
     assert refusal.allow_fresh_cache_serve
 
 
-async def test_fresh_cache_hits_are_not_counted_by_default(pipeline_with: Callable[..., AbusePipeline]) -> None:
+async def test_fresh_cache_hits_count_by_default(pipeline_with: Callable[..., AbusePipeline]) -> None:
+    """The owner reversed D10 (2026-10-07): a cache hit still costs Roxy resources, so it counts toward the limit."""
     pipeline = pipeline_with()
+    for left in range(9, -1, -1):
+        hit = await allow(pipeline, FakeReq(fresh_cache_hit=True))
+        assert hit.headers["Roxy-Requests-Left"] == str(left)
+    refusal = await refuse(pipeline, FakeReq(fresh_cache_hit=True))  # the 11th cache hit is throttled like any request
+    assert refusal.reason is ReasonCode.THROTTLE
+    assert refusal.allow_fresh_cache_serve is False  # cache_serve_throttled is off by default
+    assert (await refuse(pipeline)).reason is ReasonCode.THROTTLE  # and so is the next ordinary request
+
+
+async def test_fresh_cache_hits_are_not_counted_with_the_setting_off(
+    pipeline_with: Callable[..., AbusePipeline],
+) -> None:
+    pipeline = pipeline_with({"throttle_count_cache_hits": 0})
     for _ in range(40):
-        await allow(pipeline, FakeReq(fresh_cache_hit=True))  # D10
+        await allow(pipeline, FakeReq(fresh_cache_hit=True))
     first = await allow(pipeline)
     assert first.headers["Roxy-Requests-Left"] == "9"
 

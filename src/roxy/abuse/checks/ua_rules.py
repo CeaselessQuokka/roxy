@@ -13,7 +13,9 @@ How it works
     `period`; cooldown: one request per `cooldown` seconds (a refused retry does not move the clock). Refusal 429:
     the rule's message or v1's default text; `Retry-After`, `Roxy-Throttle-Reset` (the same seconds),
     `Roxy-Throttled: True`, `Roxy-Client-Limited: True`. Tarpit category `user_agent_rule`. Bypass entries skip it.
-    The pipeline counts every evaluated rule as a hit, allowed or refused (row 76).
+    The pipeline counts every evaluated rule as a hit, allowed or refused (row 76), also as an aggregated
+    `ua_rule_hit` event for the metrics. Matching can run admin regexes (`uses_patterns`), so while regex rules
+    exist it runs only for a request the cheaper limiters before it admitted (`roxy/abuse/pipeline.py`).
 
 What to read next
     `roxy/abuse/ua_rules.py`, then `roxy/abuse/checks/ignored_paths.py`.
@@ -37,6 +39,7 @@ class UaRuleCheck(Check):
     kind = "limiter"
     skipped_by_bypass = True
     tarpit_category = "user_agent_rule"
+    uses_patterns = True
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
         rule = match_ua_rule(facts.rules, req.user_agent, enabled=facts.bool("user_agent_rules_enabled", True))

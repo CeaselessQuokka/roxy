@@ -285,6 +285,10 @@ class FakeRecorder:
         self.events: list[tuple[str, str, str, dict[str, Any]]] = []
         self.rows_429: list[dict[str, Any]] = []
         self.internal: list[dict[str, Any]] = []
+        self.retries: list[dict[str, Any]] = []
+
+    def record_retry(self, **row: Any) -> None:
+        self.retries.append(row)
 
     def record_event(self, event_type: str, severity: str, reason: str, detail: dict[str, Any]) -> None:
         self.events.append((event_type, severity, reason, detail))

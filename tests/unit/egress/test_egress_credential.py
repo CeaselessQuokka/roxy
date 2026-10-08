@@ -37,6 +37,7 @@ from roxy.egress.credential import (
     CredentialStateError,
     CredentialValueError,
     retry_after_seconds,
+    secret_spans,
 )
 from roxy.egress.crypto import load_encryption_key
 from roxy.egress.errors import CredentialUnavailable, TargetNotAllowed
@@ -204,6 +205,56 @@ async def test_replace_accepts_one_string_only(env: Any, dbs: Any, settings: Any
             await m.replace(bad_text, ADMIN)
 
 
+async def test_cookie_pair_in_the_bootstrap_file_is_used_as_the_bare_value(
+    env: Any, dbs: Any, settings: Any, secret: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding F1: the file holds `.ROBLOSECURITY=<value>` (any case, what browser tools copy). Roxy uses the bare
+    value, sends the cookie name exactly once, logs the fix without the value, and never watches public text."""
+    (env.credentials_dir / "roblox_credential").write_text(f" .roblosecurity={secret}\n", encoding="utf-8")
+    m = manager(env, dbs, settings)
+    with caplog.at_level(logging.INFO, logger="roxy.egress.credential"):
+        await m.start()
+    assert m.status().fingerprint == m.fingerprint_of(secret)
+    assert m.status().problem is None
+    removed = [record for record in caplog.records if record.msg == "credential_cookie_name_removed"]
+    assert [getattr(record, "fields", {}) for record in removed] == [{"source": "bootstrap"}]
+    logged = caplog.text + json.dumps([getattr(record, "fields", {}) for record in caplog.records], default=str)
+    assert secret[-24:] not in logged
+    await make_active(m)
+    request = httpx.Request("GET", "https://users.roblox.com/v1/users/authenticated")
+    await m.authorize(request, logical_url=request.url, probe=False)
+    assert request.headers["Cookie"] == f".ROBLOSECURITY={secret}"
+    assert m.leak_matcher().matches(secret.encode())
+    assert not m.leak_matcher().matches(TOKEN_PREFIX.encode())
+    assert not m.leak_matcher().matches((".ROBLOSECURITY=" + TOKEN_PREFIX).lower().encode())
+
+
+async def test_replace_normalizes_the_cookie_pair_and_refuses_a_second_name(env: Any, dbs: Any, settings: Any) -> None:
+    m = manager(env, dbs, settings)
+    await m.start()
+    status = await m.replace(".ROBLOSECURITY=" + NEW_VALUE, ADMIN, reason="pasted from the browser")
+    assert status.fingerprint == m.fingerprint_of(NEW_VALUE)
+    for bad in (".ROBLOSECURITY=.ROBLOSECURITY=" + NEW_VALUE, NEW_VALUE + ".roblosecurity", ".ROBLOSECURITY="):
+        with pytest.raises(CredentialValueError):
+            await m.replace(bad, ADMIN)
+    assert m.status().fingerprint == m.fingerprint_of(NEW_VALUE)
+
+
+def test_secret_spans_leave_out_public_text_anywhere() -> None:
+    secret = "S3CRETPART" * 5
+    prefix = len(TOKEN_PREFIX)
+    assert secret_spans(TOKEN_PREFIX + secret) == [(prefix, prefix + len(secret))]
+    pair = ".ROBLOSECURITY=" + TOKEN_PREFIX
+    assert secret_spans(pair + secret) == [(len(pair), len(pair) + len(secret))]
+    assert secret_spans(secret + TOKEN_PREFIX) == [(0, len(secret))]
+    assert secret_spans(secret[:20] + TOKEN_PREFIX.lower() + secret[20:]) == [(0, 20), (20 + prefix, 50 + prefix)]
+    assert secret_spans(TOKEN_PREFIX) == []
+    assert secret_spans(TOKEN_PREFIX[30:70]) == []  # any 12+ character piece of the warning is public
+    assert secret_spans("items.|_") == []  # a short leftover that the warning contains as a whole
+    # Fewer than 12 characters of the warning next to the secret stay secret: the secret is never cut short.
+    assert secret_spans("_|WARNING:-" + secret) == [(0, 11 + len(secret))]
+
+
 async def test_replace_needs_the_encryption_key(env: Any, dbs: Any, settings: Any) -> None:
     (env.credentials_dir / "credential_encryption_key").unlink()
     m = manager(env, dbs, settings)
@@ -253,6 +304,51 @@ async def test_cooldown_is_fleet_wide_and_never_shortened(env: Any, dbs: Any, se
     assert worker_b.available()  # the cooldown ended on its own; status was never "expired"
     with pytest.raises(ValueError):
         await worker_a.set_cooldown(10, "made_up")
+
+
+async def test_cooldown_survives_a_hot_outage_and_is_shared_when_hot_recovers(
+    env: Any, dbs: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding UP-COOLDOWN-LOST, C7: a 429 cooldown that hot.db could not record stays in force in this worker,
+    is not forgotten when a later refresh reads hot.db's (older) row, and reaches hot.db (and so every worker)
+    with the first refresh that can write."""
+    clock = FakeClock(1_760_000_000.0)
+    worker_a = manager(env, dbs, settings, clock=clock)
+    worker_b = manager(env, dbs, settings, worker="w2", clock=clock)
+    await worker_a.start()
+    await worker_b.start()
+    await make_active(worker_a)
+    real_write = dbs.hot.write
+    broken = {"on": True}
+
+    async def write(fn: Any, **kwargs: Any) -> Any:
+        if broken["on"]:
+            raise SharedStateUnavailable("hot", "attempt to write a readonly database")
+        return await real_write(fn, **kwargs)
+
+    monkeypatch.setattr(dbs.hot, "write", write)
+    assert await worker_a.set_cooldown(60, "retry_after") == 60
+    assert not worker_a.available()
+    clock.advance(5)
+    # hot.db reads fine but would not take the row: the kept cooldown is merged with hot.db's, never forgotten.
+    assert await worker_a.refresh()
+    assert worker_a.status().status == "cooling_down"
+    assert worker_a.cooldown_remaining() == pytest.approx(55, abs=0.01)
+    request = httpx.Request("GET", "https://users.roblox.com/v1/users/authenticated")
+    with pytest.raises(CredentialUnavailable) as raised:
+        await worker_a.authorize(request, logical_url=request.url, probe=False)
+    assert (raised.value.why, raised.value.retry_after_s) == ("cooling_down", 55)
+    assert "cookie" not in request.headers
+    await worker_b.refresh()
+    assert worker_b.available()  # not shared yet: C7 allows the process-local fallback meanwhile
+    broken["on"] = False
+    assert await worker_a.refresh()  # the first refresh that can write shares it
+    await worker_b.refresh()
+    assert worker_b.status().status == "cooling_down"
+    assert worker_b.cooldown_remaining() == pytest.approx(55, abs=0.01)
+    clock.advance(56)
+    await worker_a.refresh()
+    assert worker_a.available()
 
 
 async def test_authorize_attaches_the_cookie_only_to_listed_https_hosts(

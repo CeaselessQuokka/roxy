@@ -177,6 +177,7 @@ class PerIpResult:
     rung: Rung
     penalty_s: int = 0
     new_strike: bool = False
+    punished: bool = False  # refused by the limit itself: the client has just become throttled (v1 `punish`)
     ban_minutes: int | None = None
     limiter_row: LimiterRow | None = None  # write when the request is admitted (or for a fixed-mode penalty)
     strike_row: StrikeRow | None = None  # write whenever set (refusals that change strikes or penalties)
@@ -267,6 +268,7 @@ def evaluate_per_ip(policy: PerIpPolicy, row: LimiterRow, srow: StrikeRow, now_m
         rung=rung if rung.index else rung_for(policy.ladder, max(1, strikes)),
         penalty_s=penalty_s,
         new_strike=policy.escalation,
+        punished=True,
         ban_minutes=ban_minutes,
         limiter_row=limiter_row,
         strike_row=new_srow,

@@ -243,7 +243,41 @@ async def test_gate_failure_degrades_open_but_dedupes_per_worker(fake_clock: Fak
     assert (await notifier.send(alert)).skipped == "deduped"
 
 
-async def test_no_channel_configured(fake_clock: FakeClock) -> None:
+async def test_gate_failure_keeps_this_workers_share_of_the_hourly_cap(fake_clock: FakeClock) -> None:
+    """Finding ALERT-CAP: while the shared gate is down, each worker still applies the hourly cap, at its share
+    (`alert_rate_limit_per_hour // ROXY_WORKERS`), and the next mail in a new hour says what was held back."""
+
+    class BrokenDb:
+        async def write(self, fn: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("database is closed")
+
+    mail = RecordingTransport()
+    notifier = Notifier(
+        hot_db=BrokenDb(),
+        settings=Settings(),
+        site_origin="https://roxy.example",
+        mail=MailSender(CONFIG, transport=mail),
+        webhook=None,
+        clock=fake_clock,
+        workers=4,
+    )
+    cap = int(Settings().get("alert_rate_limit_per_hour"))
+    from roxy.notify.alerts import Alert
+
+    results = [
+        await notifier.send(
+            Alert(type="error", severity="critical", subject=f"s{n}", summary="x", cooldown_key=f"k{n}")
+        )
+        for n in range(cap)
+    ]
+    share = cap // 4
+    assert sum(1 for r in results if r.sent) == share
+    assert sum(1 for r in results if r.skipped == "capped") == cap - share
+    fake_clock.advance(3600)
+    later = await notifier.send(make_alert("db_integrity", summary="bad"))
+    assert later.sent == ("email",)
+    assert later.suppressed == cap - share
+    assert f"Suppressed since last alert: {cap - share}" in mail.bodies()[-1]
     notifier = Notifier(hot_db=None, settings=Settings(), site_origin="x", mail=None, webhook=None, clock=fake_clock)
     assert (await notifier.send(make_alert("disk", summary="s", pct=1))).skipped == "no_channel"
 
@@ -253,6 +287,7 @@ def test_build_notifier_reads_credentials(credentials_dir: Path, tmp_path: Path)
         def __init__(self, directory: Path) -> None:
             self.credentials_dir = directory
             self.site_origin = "https://roxy.example"
+            self.workers = 3
 
     class Ctx:
         def __init__(self, directory: Path) -> None:
@@ -268,6 +303,7 @@ def test_build_notifier_reads_credentials(credentials_dir: Path, tmp_path: Path)
     assert notifier.mail is not None
     assert notifier.mail.config.to_addr == "owner@example.invalid"
     assert notifier.webhook is not None  # the fake URL is http on loopback
+    assert notifier.workers == 3  # ROXY_WORKERS: the fallback gate's share of the hourly cap
     empty = build_notifier(Ctx(tmp_path))
     assert empty.mail is None
     assert empty.webhook is None

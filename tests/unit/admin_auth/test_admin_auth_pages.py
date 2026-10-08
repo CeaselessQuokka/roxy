@@ -83,17 +83,25 @@ async def test_allowlist_hides_admin_with_a_plain_404(harness: AuthHarness) -> N
     await harness.allow_admin_cidr("198.51.100.0/24")
     await harness.set_settings(admin_allowlist_enabled=1)
     outside = {"X-Forwarded-For": "203.0.113.9"}
+    # What a path that does not exist answers: v1's `admin_not_found` for pages (plan 4.1 row 15), the DESIGN.md
+    # section 13 error object under the versioned API.
+    unknown_page = await harness.http.get("/admin/does-not-exist", headers=outside)
+    unknown_api = await harness.http.get(f"{API}/does-not-exist", headers=outside)
+    assert unknown_page.status_code == unknown_api.status_code == 404
+    assert unknown_page.content == b'"Not Found"\n'
+    assert unknown_api.json() == {"error": {"code": "not_found", "message": "Not found.", "fields": {}}}
     for response in (
         await harness.http.get("/admin", headers=outside),
         await harness.http.post(f"{API}/login", json={"username": "a", "password": "b"}, headers=outside),
         await harness.http.get(f"{API}/session", headers={**harness.headers(), **outside}),
         await harness.http.get("/admin/invalidate/not-a-valid-token", headers=outside),
     ):
+        # A hidden route answers byte for byte what a missing one at the same place answers, or the allowlist
+        # would tell an outsider which admin paths exist.
+        missing = unknown_api if response.url.path.startswith(API) else unknown_page
         assert response.status_code == 404
-        assert response.json() == {"detail": "Not Found"}  # the same answer as a path that does not exist
-    unknown = await harness.http.get("/admin/does-not-exist", headers=outside)
-    assert unknown.status_code == 404
-    assert unknown.json() == {"detail": "Not Found"}
+        assert response.content == missing.content, response.url.path
+        assert response.headers["content-type"] == missing.headers["content-type"] == "application/json"
     # A valid kill-switch link still works from anywhere (the owner may be on mobile data).
     assert (await harness.http.get(path, headers=outside)).status_code == 200
     inside = {"X-Forwarded-For": "198.51.100.20"}

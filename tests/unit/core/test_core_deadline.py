@@ -80,5 +80,6 @@ async def test_inner_timeout_is_a_bug_not_a_deadline(make_app: Any, client_for: 
     async with client_for(slow_app(make_app, deadline_s=30)) as client:
         response = await client.get("/inner-timeout")
     assert response.status_code == 500
-    assert response.text == "Internal Server Error"
+    assert response.content == b'"Internal Server Error"\n'  # v1's jsonify form (plan 7.13 "as v1")
+    assert response.headers["content-type"].split(";")[0] == "application/json"
     assert "roxy-refusal" not in response.headers

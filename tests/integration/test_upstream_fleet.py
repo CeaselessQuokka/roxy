@@ -201,3 +201,43 @@ async def test_5xx_retried_with_backoff_within_deadline(dbs: Any, second_dbs: An
     assert (failed.status, failed.reason, failed.retry_after_s) == (503, ReasonCode.UPSTREAM_5XX, 5)
     assert route.call_count == 1
     await egress.http.aclose()
+
+
+async def test_429_during_a_hot_outage_reaches_every_worker_once_hot_recovers(
+    dbs: Any, second_dbs: Any, clock: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding UP-COOLDOWN-LOST with two workers (C6, C7): worker A sees a 429 while hot.db takes no writes and
+    keeps the cooldown in memory; once hot.db takes writes again A shares it, and worker B (its own connections,
+    the same files) refuses the endpoint too, without calling Roblox."""
+    from roxy.storage.db import SharedStateUnavailable
+
+    egress_a = fakes.FakeEgress(lambda e, out: fakes.answer(429, b"{}", {"retry-after": "60"}))
+    egress_b = fakes.FakeEgress()
+    a, b = pair(dbs, second_dbs, clock, egress_a, egress_b, rotator_enabled=0)
+    real_write = dbs.hot.write
+    broken = {"on": False}
+
+    async def write(fn: Any, **kwargs: Any) -> Any:
+        if broken["on"]:
+            raise SharedStateUnavailable("hot", "attempt to write a readonly database")
+        return await real_write(fn, **kwargs)
+
+    monkeypatch.setattr(dbs.hot, "write", write)
+
+    def limited(e: Egress, out: Any) -> Any:
+        broken["on"] = True  # hot.db stops taking writes while Roblox answers
+        return fakes.answer(429, b"{}", {"retry-after": "60"})
+
+    egress_a.handler = limited
+    first = await get(a)
+    assert (first.reason, first.retry_after_s) == (ReasonCode.UPSTREAM_COOLDOWN, 60)
+    assert len(a.local_cooldowns) == 1
+    before_b = await get(b)  # nothing shared yet: B may still call (C7 allows the per-worker fallback meanwhile)
+    assert before_b.status == 200
+    broken["on"] = False
+    clock.advance(5)
+    assert await a.flush_local_cooldowns() == 1  # what A's mirror loop (or its next request) does
+    calls_b = len(egress_b.calls)
+    after = await get(b)
+    assert (after.status, after.reason, after.retry_after_s) == (429, ReasonCode.UPSTREAM_COOLDOWN, 55)
+    assert len(egress_b.calls) == calls_b

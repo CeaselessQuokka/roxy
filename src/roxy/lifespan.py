@@ -26,6 +26,12 @@ How it works
     exists, so a half-built worker never serves. Shutdown therefore stops the abuse loops first, flushes the
     cache, stops upstream, then flushes the recorder synchronously (after its loop has stopped, so the final
     write sees every number), closes the egress clients and finally the notifier.
+    Stopping has a time limit from outside: gunicorn kills a worker `graceful_timeout` (30 s) after asking it to
+    stop. Two things keep the shutdown inside it. First, `begin_drain` (called by `roxy.worker` as soon as uvicorn
+    starts shutting down, before it waits for open requests) drops readiness and wakes every tarpit hold, so held
+    refusals are answered at once instead of keeping uvicorn waiting for up to 55 s; uvicorn's own wait is capped
+    below `graceful_timeout` too (`roxy.worker`). Second, every cleanup step shares `SHUTDOWN_BUDGET_S`
+    (`shutdown_time_left`), so a loop stuck on a busy database cannot push the final flush past the kill.
     cache.db is checked before anything reads it: a damaged file must be rebuilt (plan 5.5), not reported as a
     schema problem, and it must not be open in this worker when it is renamed aside.
     A database below `REQUIRED_SCHEMA` stops the worker with a clear `schema_too_old` log line: the exception
@@ -52,6 +58,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextlib
+import contextvars
 import importlib
 import logging
 import os
@@ -94,10 +101,64 @@ if TYPE_CHECKING:
 log = logging.getLogger("roxy.lifespan")
 
 LOOP_STOP_TIMEOUT_S = 10.0
-"""How long shutdown waits for a background loop to finish its own cleanup (release a lease, delete a row)."""
+"""How long shutdown waits for a background loop to finish its own cleanup (release a lease, delete a row), at
+most; the whole shutdown is also held to `SHUTDOWN_BUDGET_S`."""
 
 TASK_DRAIN_TIMEOUT_S = 25.0
-"""How long shutdown lets one-shot jobs (stale-while-revalidate refreshes) finish; below graceful_timeout (30)."""
+"""How long shutdown lets one-shot jobs (stale-while-revalidate refreshes) finish, at most; in practice what is left
+of `SHUTDOWN_BUDGET_S` (those jobs already ran during uvicorn's graceful wait for open requests)."""
+
+SHUTDOWN_BUDGET_S = 8.0
+"""Every cleanup step of the lifespan shutdown together (final metrics flush, leader lease release, closing the
+clients and databases) must fit in this. `roxy.worker` sets uvicorn's graceful wait for open requests to gunicorn's
+`graceful_timeout` minus this budget and a margin, so gunicorn never kills a worker before its shutdown ran."""
+
+SHUTDOWN_MIN_STEP_S = 0.1
+"""A step still gets this long when the budget is spent (a healthy loop stops in milliseconds)."""
+
+_shutdown_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "roxy_shutdown_deadline", default=None
+)
+# Set by the lifespan when its shutdown starts. A ContextVar, not a global: the exit stack's cleanups run in the
+# lifespan's own task, so they see the deadline of their app (tests run several apps in one process).
+
+
+def shutdown_time_left(cap_s: float) -> float:
+    """How long the next shutdown step may take: `cap_s`, cut to what is left of `SHUTDOWN_BUDGET_S`."""
+    deadline = _shutdown_deadline.get()
+    if deadline is None:
+        return cap_s
+    return max(SHUTDOWN_MIN_STEP_S, min(cap_s, deadline - time.monotonic()))
+
+
+def begin_drain(app: Any) -> None:
+    """The server began to shut down: let go of every connection held open on purpose, then let uvicorn wait.
+
+    Called by `roxy.worker` before uvicorn waits for open requests (and before the lifespan shutdown runs). A
+    tarpit hold may last up to 55 s, longer than gunicorn's `graceful_timeout` (30 s): without this, uvicorn would
+    wait for it until gunicorn killed the worker, and the lifespan shutdown (final metrics flush, leader lease
+    release) would never run. So readiness drops at once and the tarpit answers every held refusal now
+    (`Tarpit.wake_all`; a context without an abuse pipeline is simply skipped). Never raises.
+    """
+    public = getattr(app, "public", app)  # roxy.asgi serves a ListenerDispatcher that wraps the public app
+    ctx = getattr(getattr(public, "state", None), "ctx", None)
+    if ctx is None:
+        return
+    try:
+        ctx.ready = False  # the deploy gate stops sending work here
+        tarpit = getattr(getattr(ctx, "abuse", None), "tarpit", None)
+        wake = getattr(tarpit, "wake_all", None)
+        if callable(wake):
+            wake()
+        log.info("worker_draining", extra={"fields": {"worker_id": ctx.worker_id, "tarpit_woken": callable(wake)}})
+    except Exception:
+        log.exception("worker_drain_failed")
+
+
+async def _stop_tasks(tasks: TaskSupervisor) -> None:
+    """Shutdown step: drain one-shot jobs within what is left of the budget, then cancel every task."""
+    await tasks.stop(drain_timeout_s=shutdown_time_left(TASK_DRAIN_TIMEOUT_S))
+
 
 CACHE_INIT_LEASE = "cache_init"
 CACHE_INIT_TTL_MS = 60_000
@@ -292,7 +353,7 @@ def _start_loop(
     async def stop_loop() -> None:
         stop.set()
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=LOOP_STOP_TIMEOUT_S)
+            await asyncio.wait_for(asyncio.shield(task), timeout=shutdown_time_left(LOOP_STOP_TIMEOUT_S))
         except TimeoutError:
             log.warning("loop_stop_timeout", extra={"fields": {"task": name}})
             await ctx.tasks.cancel(name)
@@ -743,7 +804,7 @@ async def _startup(app: FastAPI, env: EnvSettings, clock: Clock, stack: AsyncExi
     tasks = TaskSupervisor(clock=clock)
     # Registered early, so it unwinds LATE: after every loop below has been stopped gracefully, it drains one-shot
     # jobs and cancels anything left, before the databases close.
-    stack.push_async_callback(tasks.stop, drain_timeout_s=TASK_DRAIN_TIMEOUT_S)
+    stack.push_async_callback(_stop_tasks, tasks)
     ctx = AppContext(
         env=env,
         clock=clock,
@@ -792,12 +853,15 @@ def build_lifespan(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        _shutdown_deadline.set(None)  # a lifespan run again in the same task starts without an old deadline
         async with AsyncExitStack() as stack:
             ctx = await startup(app, env, clock or SYSTEM_CLOCK, stack)
             try:
                 yield
             finally:
                 ctx.ready = False  # readiness drops first, so the deploy gate stops sending work here
+                # Every cleanup below shares one budget, so the whole shutdown fits in gunicorn's graceful_timeout.
+                _shutdown_deadline.set(time.monotonic() + SHUTDOWN_BUDGET_S)
                 log.info("worker_stopping", extra={"fields": {"worker_id": ctx.worker_id}})
         log.info("worker_stopped", extra={"fields": {"worker_id": ctx.worker_id}})
 

@@ -255,13 +255,16 @@ class _PatternRow(Protocol):
     def enabled(self) -> bool: ...
 
 
-def _index[R: _PatternRow](rows: Iterable[R], *, on_timeout: bool = False) -> PatternIndex[R]:
+def _index[R: _PatternRow](rows: Iterable[R], *, on_timeout: bool = False, exact: bool = False) -> PatternIndex[R]:
     """Enabled rows only, sorted by specificity (then id) so the first match is v1's winner.
 
     `on_timeout=True` for rules that refuse or limit traffic: a pattern match cut off by the regex timeout then
-    counts as a match, so a slow pattern can never be used to slip past them (security review M4).
+    counts as a match, so a slow pattern can never be used to slip past them (security review M4). `exact=True`
+    for the credential allowlist: a row grants exactly the paths it names, never the paths below them (F3).
     """
-    return PatternIndex(((row.id, row.pattern, row.type, row) for row in rows if row.enabled), on_timeout=on_timeout)
+    return PatternIndex(
+        ((row.id, row.pattern, row.type, row) for row in rows if row.enabled), on_timeout=on_timeout, exact=exact
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,7 +307,8 @@ class RulesSnapshot:
         set_(self, "endpoint_limit_index", _index(self.endpoint_limits, on_timeout=True))
         set_(self, "cache_rule_index", _index(self.cache_rules))
         set_(self, "routing_index", _index(self.routing_rules))
-        set_(self, "credential_index", _index(self.credential_allowlist))
+        # Least privilege for the one credential (C1, D1): exact grants, and a timed-out match never grants it.
+        set_(self, "credential_index", _index(self.credential_allowlist, exact=True))
         set_(
             self,
             "ignored_path_index",
@@ -347,8 +351,9 @@ class RulesSnapshot:
     def credential_rule_for(self, target: str, method: str) -> CredentialAllowlistRow | None:
         """The allowlist entry letting `method` on `target` use the credential, or None (plan 7.2 step 1).
 
-        The most specific matching entry decides: if it does not list the method, the answer is None (a less
-        specific entry never widens a more specific one).
+        Entries match exactly (`rules/match.py`, finding F3): `economy.roblox.com/v1/user/currency` grants that
+        path only, not `/v1/user/currency/<anything>`. The most specific matching entry decides: if it does not
+        list the method, the answer is None (a less specific entry never widens a more specific one).
         """
         rule = self.credential_index.best(target)
         if rule is None or method.upper() not in rule.methods:

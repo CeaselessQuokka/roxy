@@ -275,33 +275,35 @@ async def test_single_flight_table_is_bounded(dbs: Any) -> None:
 # --- shared tables a caller can add rows to ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ingress finding: abuse/spam.py keys spam_windows rows by caller-chosen values (Roblox-Id place ids, the "
-        "User-Agent hash per template, path-derived templates) for every request, refused ones included; rows are "
-        "pruned only after 24 h idle and nothing caps the count, so one client adds rows at request rate"
-    ),
-)
 async def test_one_client_cannot_grow_spam_windows_without_bound(dbs: Any, fake_clock: FakeClock) -> None:
+    """Caller-chosen values (place ids, User-Agent hashes, path templates and ids) are capped per client; the rest
+    is folded into one `(other)` subject per family, so the client's traffic is still counted, never dropped."""
     spam = SpamDetectors(CatalogSettings(), dbs.hot, fake_clock)
-    for n in range(1_000):
-        spam.observe(
-            limit_key=CLIENT_IP,
-            place_id=f"{1_000_000 + n}",
-            template="games.roblox.com/v1/games",
-            path="/v1/games",
-            query=[],
-            user_agent=f"Roblox/WinInet {n}",
-            refused=True,  # already refused (flood): still observed
-            probe=False,
-            auth=False,
-            game_server=False,
-            bypass=False,
-        )
-    await spam.flush()
+    for minute in range(3):  # several flushes: the per-client cap holds across them, not just within one
+        for n in range(1_000):
+            spam.observe(
+                limit_key=CLIENT_IP,
+                place_id=f"{1_000_000 + minute * 1_000 + n}",
+                template=f"games.roblox.com/v1/x{minute}-{n % 50}",
+                path=f"/v1/games/{n}",
+                query=[],
+                user_agent=f"Roblox/WinInet {n}",
+                refused=True,  # already refused (flood): still observed
+                probe=False,
+                auth=False,
+                game_server=False,
+                bypass=False,
+            )
+        await spam.flush()
+        fake_clock.advance(60)
     rows = dbs.hot.read_sync(lambda conn: conn.execute("SELECT count(*) FROM spam_windows").fetchone()[0])
-    assert rows <= 64, f"one client created {rows} spam_windows rows in one flush"
+    assert rows <= 64, f"one client created {rows} spam_windows rows"
+    folded = dbs.hot.read_sync(
+        lambda conn: conn.execute("SELECT buckets_json FROM spam_windows WHERE subject = ?", ("req|place:(other)",))
+        .fetchone()
+    )  # fmt: skip
+    assert folded is not None  # the client's place traffic over the cap is counted, coarser
+    assert spam.folded > 0
 
 
 # --- tarpit slots -----------------------------------------------------------------------------------------------------

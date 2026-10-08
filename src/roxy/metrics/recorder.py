@@ -6,7 +6,8 @@ What this is
     plus `record_event`, `record_upstream_429`, `record_internal_call`, `record_background_fetch`,
     `record_retry`, `record_egress_usage`, `record_error`, `record_fingerprint`, `record_capture`,
     `record_sample`, and the public-site and security helpers (`record_visit`, `record_probe`, `record_login`,
-    `record_crawl`, `record_throttled`). Nothing here touches SQLite on the request path.
+    `record_crawl`, `record_throttled`). Nothing here touches SQLite on the request path, and nothing heavier
+    than a dict update runs there: capture rows are built on their own thread (`capture.CaptureEncoder`).
 
 Why it exists
     Plan 6.3: writing a row per request would make every request wait for the disk and multiply write
@@ -16,6 +17,9 @@ Why it exists
     fail open (C7): every `record_*` swallows its own errors and counts them, and never raises into a request.
 
 How it works
+    - Caller-supplied labels (template, host, place id, event reasons) are scrubbed like a log line before they
+      become dimensions, event columns, samples or Live fields (`scrub_labels`, `core/redact.py redact_label`;
+      plan C1 and 9.15): none of these passes the log filter. Ordinary values are unchanged.
     - Dimensions (plan 6.2) are bounded before they are hashed: hosts and templates through `VocabularyGate`s
       (64 hosts, 2,000 templates per worker; the rest become `other`), statuses outside the usual set become 0
       ("other"), unknown methods `OTHER`. `dim_hash` is the first 8 bytes of BLAKE2b over the dimension values,
@@ -56,10 +60,18 @@ from typing import Any
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.core.iphash import ip_hash
 from roxy.core.reasons import AuthClass, CacheState, Egress, Outcome, ReasonCode, Source
-from roxy.core.redact import is_sensitive_key, redact_text
+from roxy.core.redact import is_sensitive_key, redact_label, redact_text
 from roxy.metrics import histograms, security_events, visitors
 from roxy.metrics.activity import ip_key, place_key
-from roxy.metrics.capture import CaptureInput, CapturePolicy, CaptureRow, make_row, write_captures
+from roxy.metrics.capture import (
+    CaptureEncoder,
+    CaptureInput,
+    CapturePolicy,
+    CaptureRow,
+    make_row,
+    trim_input,
+    write_captures,
+)
 from roxy.metrics.fingerprints import FingerprintAggregator, FingerprintItem, write_fingerprints
 from roxy.metrics.live import LIVE_EVENT, LIVE_EVENTS_PER_SECOND, LiveRing, RateGate, live_entry
 from roxy.metrics.rollups import ClientDelta, EgressDelta, RollupDelta, write_clients, write_egress_usage, write_rollups
@@ -330,12 +342,20 @@ class MetricsRecorder:
         self._last_vocab_refresh: float | None = None
         # Counters for the System page (per worker; exact values are not critical).
         self.capture_errors = 0
+        self.capture_dropped = 0
         self.record_errors = 0
         self.events_aggregated = 0
         self.live_sampled_out = 0
         self.rollup_overflow = 0
         self.dims_last_minute = 0
         self._register_kinds()
+        # Capture rows are built on the encoder's thread (LOOP-1). `make_row` is looked up when each capture is
+        # built, so it stays this module's name for the function (tests wrap it to see which thread runs it).
+        self.captures = CaptureEncoder(
+            lambda row: self.batch.add(KIND_CAPTURES, row),
+            encode=lambda inp, policy: make_row(inp, policy),
+            on_error=self._capture_failed,
+        )
 
     # ------------------------------------------------------------------------------------------- settings
 
@@ -402,14 +422,16 @@ class MetricsRecorder:
         host = (host or "").strip().lower()
         if not host or len(host) > 64 or not (host == "roblox.com" or host.endswith(".roblox.com")):
             return OTHER  # not a Roblox host: attacker supplied, never its own dimension value
-        return self.hosts.admit(host)
+        # A label like "<credential piece>.roblox.com" is still a caller's text: scrub it like a log line (C1).
+        return self.hosts.admit(redact_label(host))
 
     def _bounded_template(self, template: str, host: str) -> str:
         if template in PROBLEM_TEMPLATES:
             return template  # "(not_roblox)" and friends: a fixed, bounded set chosen by the proxy (plan P9)
         if host == OTHER or not template:
             return OTHER
-        return self.templates.admit(template)
+        # Templates from `template_for` are already scrubbed; producers that pass their own are scrubbed here.
+        return self.templates.admit(redact_label(template))
 
     def _dims(
         self,
@@ -468,6 +490,7 @@ class MetricsRecorder:
         """
         capture_id = ""
         try:
+            ev = scrub_labels(ev)
             cfg = self.config()
             minute = int(ev.at_ms) // 60_000 * 60
             dims = self._dims(
@@ -642,10 +665,14 @@ class MetricsRecorder:
         aggregate: bool = False,
         summary_detail: Mapping[str, Any] | None = None,
     ) -> bool:
-        """Queue one event row, or add it to the per-minute sums. Returns True when written individually."""
-        reason_text = None if reason is None else str(reason)[:MAX_SIGNATURE_CHARS]
-        template = endpoint_template[:255] if endpoint_template else None
-        place_text = str(place)[:64] if place else None
+        """Queue one event row, or add it to the per-minute sums. Returns True when written individually.
+
+        The label columns (reason, place, template) may hold caller text (a header name, a crawled path, the
+        `Roblox-Id` header), so they are scrubbed like a log line; `detail` is scrubbed when it is written.
+        """
+        reason_text = None if reason is None else redact_label(str(reason))[:MAX_SIGNATURE_CHARS]
+        template = redact_label(endpoint_template)[:255] if endpoint_template else None
+        place_text = redact_label(str(place))[:64] if place else None
         if not aggregate:
             budget_key = (event_type, reason_text or "")
             gate = self._budgets.get(budget_key)
@@ -1034,21 +1061,38 @@ class MetricsRecorder:
             self._count_error("record_fingerprint")
 
     def record_capture(self, inp: CaptureInput, *, outcome: str | None = None) -> str:
-        """Capture one request's bodies if the policy wants it. Returns the capture id or "". Never raises (127)."""
+        """Capture one request's bodies if the policy wants it. Returns the capture id or "". Never raises (127).
+
+        Only the cheap part runs here, on the caller's thread: the policy decision and `trim_input`. Redaction,
+        JSON and zstd run on the `CaptureEncoder` thread (LOOP-1); a full encoder queue drops the capture and
+        counts it (`capture_dropped`) instead of making the request wait.
+        """
         try:
             policy = self.config().capture
             if not policy.wants(outcome if outcome is not None else inp.outcome, self._rng):
                 return ""
-            row = make_row(inp, policy)
-            self.batch.add(KIND_CAPTURES, row)
+            if not self.captures.submit(trim_input(inp, policy), policy):
+                self.capture_dropped += 1
+                self._event(
+                    _now_ms(self.clock), CAPTURE_ERROR_EVENT, "warn", None, {"reason": "encoder_queue_full"},
+                    aggregate=True,
+                )  # fmt: skip
+                if self.capture_dropped == 1 or self.capture_dropped % 1000 == 0:
+                    log.warning("capture_dropped", extra={"fields": {"capture_dropped": self.capture_dropped}})
+                return ""
             return inp.request_id
         except Exception:
-            self.capture_errors += 1
-            with contextlib.suppress(Exception):
-                self._event(_now_ms(self.clock), CAPTURE_ERROR_EVENT, "warn", None, None, aggregate=True)
-            if self.capture_errors == 1 or self.capture_errors % 1000 == 0:
-                log.warning("capture_failed", extra={"fields": {"capture_errors": self.capture_errors}}, exc_info=True)
+            self._capture_failed(None)
             return ""
+
+    def _capture_failed(self, exc: BaseException | None) -> None:
+        """A capture that could not be built (here or on the encoder thread): counted, logged, never raised."""
+        self.capture_errors += 1
+        with contextlib.suppress(Exception):
+            self._event(_now_ms(self.clock), CAPTURE_ERROR_EVENT, "warn", None, None, aggregate=True)
+        if self.capture_errors == 1 or self.capture_errors % 1000 == 0:
+            info = exc if exc is not None else True
+            log.warning("capture_failed", extra={"fields": {"capture_errors": self.capture_errors}}, exc_info=info)
 
     def record_sample(self, row: SampleRow) -> None:
         """Queue one explicit `request_samples` row (record_outcome samples proxied requests by itself)."""
@@ -1149,12 +1193,18 @@ class MetricsRecorder:
     # ------------------------------------------------------------------------------------------ lifecycle
 
     async def flush(self) -> Any:
-        """Write everything collected so far (one transaction for metrics.db)."""
+        """Write everything collected so far (one transaction for metrics.db).
+
+        Captures still on the encoder thread are waited for first (bounded, without blocking the loop), so a
+        capture lands in the same flush as the numbers of its request.
+        """
+        await self.captures.drain()
         return await self.batch.flush()
 
     def close(self) -> Any:
         """Shutdown: write everything, including the minute still open, synchronously (lifespan cleanup)."""
         self._closing = True
+        self.captures.close()
         return self.batch.flush_now()
 
     async def refresh_vocabulary(self) -> None:
@@ -1207,6 +1257,8 @@ class MetricsRecorder:
             "worker_id": self.worker_id,
             "metrics_dropped": self.batch.dropped,
             "capture_errors": self.capture_errors,
+            "capture_dropped": self.capture_dropped,
+            "capture_encoder": self.captures.stats(),
             "record_errors": self.record_errors,
             "events_aggregated": self.events_aggregated,
             "live_sampled_out": self.live_sampled_out,
@@ -1220,6 +1272,22 @@ class MetricsRecorder:
             "pending": pending,
             "batch": batch,
         }
+
+
+def scrub_labels(ev: OutcomeEvent) -> OutcomeEvent:
+    """`ev` with its caller-supplied labels (template, host, place id) scrubbed like a log line (plan C1, 9.15).
+
+    These three become metric dimensions, client rows, event columns, request samples and Live fields, none of
+    which passes the log filter, so a credential piece in a path segment or the `Roblox-Id` header must be removed
+    here. Ordinary values come back unchanged (and the same event object is returned), so v1 templates and place
+    ids are stored exactly as before.
+    """
+    template = redact_label(ev.endpoint_template) if ev.endpoint_template else ev.endpoint_template
+    host = redact_label(ev.host) if ev.host else ev.host
+    place = redact_label(ev.place_id) if ev.place_id else ev.place_id
+    if template == ev.endpoint_template and host == ev.host and place == ev.place_id:
+        return ev
+    return replace(ev, endpoint_template=template, host=host, place_id=place)
 
 
 def _complete_capture(capture: CaptureInput, ev: OutcomeEvent) -> CaptureInput:

@@ -18,14 +18,17 @@ Why it exists
         characters, so every pattern is first rewritten by `rules/re_compat.py` into `regex` source that matches
         exactly what `re` matched (the one approximation, a case-insensitive backreference, is documented there);
       * new admin patterns are refused when they are longer than 500 characters or have a shape that can take
-        exponential or high polynomial time to fail (plan 9.9): a variable repeat inside a repeated group
+        exponential or polynomial time to fail (plan 9.9): a variable repeat inside a repeated group
         (`(a+)+`, `(a{1,10}){1,10}`), alternatives that can start with the same character inside a repeat
         (`(a|aa)+`), more than `MAX_UNBOUNDED_REPEATS` unbounded repeats counting how often an enclosing group
-        repeats them (`(.*,){5}`), or a glob with more than `MAX_GLOB_WILDCARDS_PER_SEGMENT` wildcards in one
-        path segment. Stored v1 patterns are not judged again (they keep matching), so the timeout stays the
-        backstop. A match that times out counts as "no match" by default; rules that refuse or limit traffic
-        pass `on_timeout=True` so a slow pattern cannot be used to slip past them (fail closed), and
-        `regex_budget()` caps the total regex time one request may spend.
+        repeats them (`(.*,){5}`), any regex whose worst case on a 4096 character caller input is over the
+        `rules/regex_cost.py` budget (two repeats that trade characters, such as `a.*a.*b`, or a repeat that an
+        unanchored search can restart inside of, such as `x+y`), or a glob with more than
+        `MAX_GLOB_WILDCARDS_PER_SEGMENT` wildcards in one path segment or two in a segment that is not the last.
+        Stored v1 patterns are not judged again (they keep matching), so the timeout stays the backstop. A match
+        that times out counts as "no match" by default; rules that refuse or limit traffic pass `on_timeout=True`
+        so a slow pattern cannot be used to slip past them (fail closed), and `regex_budget()` caps the total
+        regex time one request may spend.
 
 How it works
     Glob patterns (the default `type`):
@@ -44,6 +47,10 @@ How it works
         so text the two engines read differently (POSIX classes such as `[[:alpha:]]`, fuzzy matching such as
         `a{e<=1}`, Unicode `\\w` and case rules) keeps exactly its `re` meaning. Globs go through the same
         translation (v1 compiled them with `re` too).
+    The credential allowlist is the one exception (lead decision on finding F3, plan C1 and D1: least privilege,
+    fail closed): its rows are compiled `exact`, so a glob grants only the path it spells out (plus the same path
+    with one trailing slash; `*` still covers one segment) and a regex must match the whole target (`fullmatch`).
+    A row that should cover the paths below it says so with an explicit wildcard (`.../currency/*`) or regex.
     Both kinds are case-insensitive. When several rules match, the highest `specificity` wins: for globs the
     tuple (number of `/`, length minus number of `*`), for regexes (number of `/`, length). On a tie the rule
     inserted first wins (v1 compared with a strict greater-than in insertion order), which v2 reproduces by
@@ -53,7 +60,8 @@ How it works
 
 What to read next
     `roxy/rules/store.py` (the compiled, immutable rules snapshot that uses `PatternIndex`), then
-    `roxy/rules/service.py` (where `validate_pattern` guards every write).
+    `roxy/rules/service.py` (where `validate_pattern` guards every write) and `roxy/rules/regex_cost.py` (the
+    worst-case cost model for new regexes).
 """
 
 from __future__ import annotations
@@ -73,6 +81,7 @@ from typing import Any, Literal, Protocol
 
 import regex
 
+from roxy.rules import regex_cost
 from roxy.rules.re_compat import UnsupportedPattern, re_compatible_source
 
 log = logging.getLogger(__name__)
@@ -187,15 +196,19 @@ def specificity(pattern: str, type: str = "glob") -> tuple[int, int]:
     return (pattern.count("/"), len(pattern) - pattern.count("*"))
 
 
-def glob_to_regex_source(pattern: str) -> str:
-    """The regular expression text a glob compiles to (v1 `_compile_pattern`, plus wildcard-run collapsing)."""
+def glob_to_regex_source(pattern: str, *, subpaths: bool = True) -> str:
+    """The regular expression text a glob compiles to (v1 `_compile_pattern`, plus wildcard-run collapsing).
+
+    `subpaths=False` is the exact form used by the credential allowlist (lead decision F3): the glob names only
+    the paths it spells out (and the same path with one trailing slash); a `*` still covers one segment.
+    """
     base = pattern.rstrip("/")
     # Escape everything literally, then turn each escaped `*` (re.escape writes it as `\*`) back into a
     # single-segment wildcard. The stdlib `re.escape` is used on purpose: it is what v1 used, and its output is
     # valid for the `regex` module too.
     escaped = re.escape(base).replace(r"\*", _WILDCARD)
     escaped = _WILDCARD_RUN.sub(lambda _m: _WILDCARD, escaped)
-    return rf"^{escaped}(?:/.*)?$"
+    return rf"^{escaped}(?:/.*)?$" if subpaths else rf"^{escaped}/?$"
 
 
 def _python_re_compile(pattern: str) -> re.Pattern[str] | None:
@@ -376,13 +389,20 @@ _BUDGET: ContextVar[_Budget | None] = ContextVar("roxy_regex_budget", default=No
 
 
 @contextlib.contextmanager
-def regex_budget(seconds: float = REGEX_REQUEST_BUDGET_S) -> Iterator[None]:
+def regex_budget(seconds: float = REGEX_REQUEST_BUDGET_S, *, fresh: bool = False) -> Iterator[None]:
     """Cap the total time every pattern match inside this block may take together (per request, plan 9.9).
 
     Each match still has its own `REGEX_MATCH_TIMEOUT_S`; once the budget is spent, further matches are not run
     and are answered as timeouts (each caller's `on_timeout` decides what that means). A context variable, so
-    concurrent requests on one event loop each have their own budget.
+    concurrent requests on one event loop each have their own budget. Inside a block that already has a budget,
+    a nested `regex_budget()` keeps that one: every phase of one request (cache peek, abuse checks, upstream
+    routing) shares a single budget instead of each starting a fresh one.
+    `fresh=True` always starts a new budget, for work that is not the current request's: a background task
+    copies the context of the request that started it, and must not inherit (or spend) that request's budget.
     """
+    if _BUDGET.get() is not None and not fresh:
+        yield
+        return
     token = _BUDGET.set(_Budget(seconds))
     try:
         yield
@@ -428,16 +448,19 @@ class CompiledPattern:
     """One stored pattern, compiled once and reused for every request.
 
     `matches(target)` takes an already normalized target (see `normalize_target`). A pattern that is empty or
-    does not compile never matches, exactly like v1 (which caught `re.error` and returned False).
+    does not compile never matches, exactly like v1 (which caught `re.error` and returned False). An `exact`
+    pattern (the credential allowlist only) must cover the WHOLE target: a glob gets no implicit subpaths and a
+    regex is matched with `fullmatch` instead of `search`.
     """
 
-    __slots__ = ("_rx", "kind", "pattern", "specificity")
+    __slots__ = ("_rx", "exact", "kind", "pattern", "specificity")
 
-    def __init__(self, pattern: str, kind: PatternKind, rx: regex.Pattern[str] | None) -> None:
+    def __init__(self, pattern: str, kind: PatternKind, rx: regex.Pattern[str] | None, *, exact: bool = False) -> None:
         self.pattern = pattern
         self.kind: PatternKind = kind
         self.specificity: tuple[int, int] = specificity(pattern, kind)
         self._rx = rx
+        self.exact = exact
 
     @property
     def valid(self) -> bool:
@@ -454,9 +477,13 @@ class CompiledPattern:
         rx = self._rx
         if rx is None:
             return False
+        if self.kind == "regex":
+            # v1: regexes use search (the admin anchors them); an exact (allowlist) regex must cover the whole path.
+            run = rx.fullmatch if self.exact else rx.search
+        else:
+            run = rx.match  # globs carry their own ^...$
         try:
-            # v1: regexes use search (the admin anchors them), globs carry their own ^...$ and use match.
-            found = _run_with_timeout(rx.search if self.kind == "regex" else rx.match, target)
+            found = _run_with_timeout(run, target)
         except TimeoutError:
             # The counter and log make the bad rule visible on the System page.
             _record_timeout(f"pattern:{self.kind}", self.pattern, len(target))
@@ -464,20 +491,22 @@ class CompiledPattern:
         return found is not None
 
     def __repr__(self) -> str:
-        return f"CompiledPattern({self.pattern!r}, {self.kind!r})"
+        return f"CompiledPattern({self.pattern!r}, {self.kind!r}{', exact' if self.exact else ''})"
 
 
 @lru_cache(maxsize=COMPILE_CACHE_SIZE)
-def compile_pattern(pattern: str, type: str = "glob") -> CompiledPattern:
+def compile_pattern(pattern: str, type: str = "glob", *, exact: bool = False) -> CompiledPattern:
     """Compile a stored pattern of the given rule type (v1 `_compile_pattern` plus the `_matches` guards).
 
     The pattern is used as stored; normalize it with `normalize_pattern` (or `validate_pattern`) at write time.
+    `exact=True` is the credential allowlist's least-privilege form (see `CompiledPattern`); every other rule
+    family keeps the v1 semantics.
     """
     kind = kind_of(type)
     if not pattern:
-        return CompiledPattern(pattern, kind, None)
-    re_source = pattern if kind == "regex" else glob_to_regex_source(pattern)
-    return CompiledPattern(pattern, kind, compile_like_re(re_source))
+        return CompiledPattern(pattern, kind, None, exact=exact)
+    re_source = pattern if kind == "regex" else glob_to_regex_source(pattern, subpaths=not exact)
+    return CompiledPattern(pattern, kind, compile_like_re(re_source), exact=exact)
 
 
 def compile_like_re(pattern: str) -> regex.Pattern[str] | None:
@@ -565,14 +594,17 @@ class PatternIndex[T]:
     Entries are sorted by (specificity descending, id ascending), so the FIRST entry that matches is exactly
     the rule v1 would have chosen. Build it once when the snapshot loads; matching then costs one compiled
     regex per rule until the first hit. `on_timeout` is what a timed-out match counts as (see
-    `CompiledPattern.matches`): True for rules that refuse or limit traffic, so they fail closed.
+    `CompiledPattern.matches`): True for rules that refuse or limit traffic, so they fail closed. `exact=True`
+    compiles every pattern in its exact form (the credential allowlist, lead decision F3).
     """
 
     __slots__ = ("_entries", "on_timeout")
 
-    def __init__(self, entries: Iterable[tuple[int, str, str, T]], *, on_timeout: bool = False) -> None:
+    def __init__(
+        self, entries: Iterable[tuple[int, str, str, T]], *, on_timeout: bool = False, exact: bool = False
+    ) -> None:
         built = [
-            IndexEntry(rule_id, compile_pattern(pattern, rule_type), value)
+            IndexEntry(rule_id, compile_pattern(pattern, rule_type, exact=exact), value)
             for rule_id, pattern, rule_type, value in entries
         ]
         built.sort(key=lambda entry: (-entry.compiled.specificity[0], -entry.compiled.specificity[1], entry.id))
@@ -867,13 +899,19 @@ def validate_regex(pattern: str, *, max_length: int = MAX_PATTERN_LENGTH) -> str
     why = slow_shape(pattern)
     if why is not None:
         raise PatternValidationError(why)
+    # Polynomial shapes (two repeats that trade characters, a repeat a search can restart inside of): the cost
+    # model must finish a 4096 character worst case well inside the per-match timeout (ingress review).
+    why = regex_cost.cost_problem(pattern)
+    if why is not None:
+        raise PatternValidationError(why)
     return pattern
 
 
-def validate_pattern(pattern: str | None, type: str = "glob") -> str:
+def validate_pattern(pattern: str | None, type: str = "glob", *, exact: bool = False) -> str:
     """Normalize and validate an endpoint pattern for storage; return the stored form.
 
     Error texts for the cases v1 also refused are v1's ("Empty endpoint pattern", "Invalid regular expression").
+    `exact=True` validates for the exact form the credential allowlist compiles to (see `CompiledPattern`).
     """
     kind = kind_of(type)
     normalized = normalize_pattern(pattern, kind)
@@ -887,10 +925,21 @@ def validate_pattern(pattern: str | None, type: str = "glob") -> str:
         raise PatternValidationError("Endpoint pattern contains a control character")
     if len(_GLOB_WILDCARD_RUN.findall(normalized)) > MAX_GLOB_WILDCARDS:
         raise PatternValidationError(f"Endpoint pattern has more than {MAX_GLOB_WILDCARDS} wildcards")
-    if any(len(_GLOB_WILDCARD_RUN.findall(part)) > MAX_GLOB_WILDCARDS_PER_SEGMENT for part in normalized.split("/")):
+    segments = normalized.rstrip("/").split("/")
+    if any(len(_GLOB_WILDCARD_RUN.findall(part)) > MAX_GLOB_WILDCARDS_PER_SEGMENT for part in segments):
         raise PatternValidationError(
             f"Endpoint pattern has more than {MAX_GLOB_WILDCARDS_PER_SEGMENT} wildcards in one path segment; "
             "wildcards in the same segment can take a very long time to fail on a long path"
+        )
+    # Two wildcards in one segment trade characters: where more text must still match after that segment, a
+    # failing match tries every split of a long segment between them (about 30 ms on 4096 characters). In the last
+    # segment nothing after them can fail, except in the exact form, which must end there.
+    crowded = segments if exact else segments[:-1]
+    if any(len(_GLOB_WILDCARD_RUN.findall(part)) > 1 for part in crowded):
+        where = "one path segment" if exact else "one path segment before the last one"
+        raise PatternValidationError(
+            f"Endpoint pattern has two wildcards in {where}; a failing match can try every way to split a long "
+            "segment between them, so use one wildcard per segment (or a regular expression)"
         )
     return normalized
 

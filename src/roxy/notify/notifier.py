@@ -19,8 +19,11 @@ How it works
     2. Channels: email when the mail credentials exist; webhook when `alert_webhook_enabled` = 1 and the
        `alert_webhook_url` credential exists; intersected with the alert's own channels.
     3. Gate (`gate.decide`, one hot.db transaction): dedupe by cooldown key, then the hourly cap per channel.
-       If hot.db cannot be written, a per-worker in-memory gate is used instead (plan C7: alerts degrade open
-       rather than go silent, but still never repeat within a worker).
+       If hot.db cannot be written, `gate.MemoryGate` applies the same rules in this worker's memory instead
+       (plan C7: alerts degrade open rather than go silent). The hourly cap still holds, at this worker's share
+       (`alert_rate_limit_per_hour // ROXY_WORKERS`, at least 1), so the fleet stays within the setting; dedupe
+       becomes per worker, so each worker may then send its own copy of an alert, at most once per cooldown key
+       per gap.
     4. Render: every user-influenced text (summary, field names and values, the subject's parameters, a body
        override) goes through `redact_text`. The kill-switch link of the login alert is the one link that may
        carry a token (plan 17.7), so it is protected from the redaction pass that would otherwise mask it.
@@ -51,6 +54,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from roxy.config.constants import SMTP_TIMEOUT_S
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.core.redact import MASK, is_secret_field, redact_text
+from roxy.core.scope import catalog_default
 from roxy.notify import gate
 from roxy.notify.alerts import ALERT_SPECS, SEVERITIES, Alert, SendResult, make_alert
 from roxy.notify.mail import MailError, MailSender, load_mail_config
@@ -191,8 +195,10 @@ class Notifier:
         clock: Clock = SYSTEM_CLOCK,
         tasks: Any | None = None,
         send_timeout_s: float = SEND_TIMEOUT_S,
+        workers: int = 1,
     ) -> None:
         self._db = hot_db
+        self.workers = max(1, int(workers))  # ROXY_WORKERS: the fallback gate's share of the hourly cap
         self._settings = settings
         self.site_origin = site_origin
         self.mail = mail
@@ -208,10 +214,13 @@ class Notifier:
     # ------------------------------------------------------------------------------------------ settings
 
     def _setting(self, key: str) -> Any:
+        """The live setting; without a settings store, the catalog default (the table below only as a last resort,
+        for a build where the catalog does not have the key)."""
         try:
             return self._settings.get(key)
         except (KeyError, AttributeError, LookupError):
-            return _SETTING_DEFAULTS.get(key)
+            found = catalog_default(key)
+            return found if found is not None else _SETTING_DEFAULTS.get(key)
 
     def _cooldown_for(self, alert: Alert) -> int:
         spec = ALERT_SPECS.get(alert.type)
@@ -240,7 +249,7 @@ class Notifier:
     async def _decide(self, alert: Alert, channels: list[str], now: int) -> gate.GateDecision:
         cooldown_s = self._cooldown_for(alert)
         uncapped = alert.always_send or alert.type == "leak_guard"
-        cap = int(self._setting("alert_rate_limit_per_hour") or 20)
+        cap = int(self._setting("alert_rate_limit_per_hour") or _SETTING_DEFAULTS["alert_rate_limit_per_hour"])
         if self._db is not None:
             try:
                 decision: gate.GateDecision = await self._db.write(
@@ -258,9 +267,16 @@ class Notifier:
                 return decision
             except Exception as exc:  # SharedStateUnavailable or a closed database: degrade open (plan C7)
                 log.warning("alert_gate_unavailable", extra={"fields": {"error": type(exc).__name__}})
-        if self._memory_gate.allow(alert.cooldown_key, cooldown_s, now):
-            return gate.GateDecision(allowed=tuple(channels), suppressed=dict.fromkeys(channels, 0))
-        return gate.GateDecision(allowed=(), deduped=True)
+        # The same rules in this worker's memory: dedupe per worker (each worker may send its own copy, at most
+        # once per cooldown key per gap) and this worker's share of the hourly cap, so the fleet stays within it.
+        return self._memory_gate.decide(
+            cooldown_key=alert.cooldown_key,
+            cooldown_s=cooldown_s,
+            channels=channels,
+            cap=gate.worker_share(cap, self.workers),
+            uncapped=uncapped,
+            now=now,
+        )
 
     async def send(self, alert: Alert) -> SendResult:
         """Gate, render and deliver one alert; returns what happened. Never raises for a delivery problem."""
@@ -426,6 +442,7 @@ def build_notifier(ctx: Any) -> Notifier:
         webhook=WebhookSender(url) if url else None,
         clock=getattr(ctx, "clock", SYSTEM_CLOCK),
         tasks=getattr(ctx, "tasks", None),
+        workers=int(getattr(ctx.env, "workers", 1) or 1),
     )
 
 

@@ -236,22 +236,23 @@ async def test_bypass_caller_refused_by_a_filter_is_never_held(
     assert sleep.calls == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ingress finding: bans and the deny list (position 20) refuse before the bypass marker (position 30) "
-        "runs, so req.bypass stays False and the router tarpits a bypass caller (tarpit_on_ban defaults to 1), "
-        "against plan 10.6 and DESIGN 11.1 (bypass never held)"
-    ),
-)
 @pytest.mark.parametrize("subject", ["ban", "deny_list"])
 async def test_bypass_caller_refused_by_a_ban_is_never_held(dbs: Any, fake_clock: FakeClock, subject: str) -> None:
+    """Bans and the deny list (position 20) refuse before the bypass marker (position 30); the pipeline marks
+    bypass before any check, so the router still knows not to hold the caller (plan 10.6, DESIGN 11.1)."""
     entries = [BYPASS, DENY] if subject == "deny_list" else [BYPASS]
     bans = BanIndex([BAN]) if subject == "ban" else BanIndex()
     app, sleep = proxy_app(dbs, fake_clock, rules(access=AccessLists.build(entries), bans=bans))
-    status, _, _, _ = await raw_asgi_request(app, b"/games.roblox.com/v1/games", headers=headers())
-    assert status == 429  # the disguised ban or deny refusal
+    status, response_headers, _, _ = await raw_asgi_request(app, b"/games.roblox.com/v1/games", headers=headers())
+    assert status == 429  # the disguised ban or deny refusal: the ban still wins over the bypass entry
+    assert response_headers.get(b"roxy-refusal") == b"throttle"
     assert sleep.calls == [], f"a bypass caller was held for {sleep.calls} s"
+    # Control: without the bypass entry the same refusal IS held (tarpit_on_ban is on by default).
+    app, sleep = proxy_app(
+        dbs, fake_clock, rules(access=AccessLists.build([e for e in entries if e is not BYPASS]), bans=bans)
+    )
+    await raw_asgi_request(app, b"/games.roblox.com/v1/games", headers=headers())
+    assert len(sleep.calls) == 1
 
 
 # --- end to end: a filtered request is never answered with content ---------------------------------------------------
@@ -279,26 +280,27 @@ class FreshCache:
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ingress finding: with cache_serve_throttled on, a per-IP throttle refusal (position 70) carries "
-        "allow_fresh_cache_serve and wins before the header filter, auth smuggling and endpoint block checks, so "
-        "the router serves cached content to a request one of those filters refuses (v1 step 4a had the same flaw)"
-    ),
+REGEX_HEADER_RULE = HeaderRuleRow(
+    id=2, canonical_key="|either|regex|xeno", scope="either", mode="regex", needle="^xeno-fingerprint$"
 )
+
+
 @pytest.mark.parametrize(
     ("snapshot_kwargs", "path", "extra"),
     [
         ({"header_rules": (HEADER_RULE,)}, b"/games.roblox.com/v1/games", ((b"xeno-fingerprint", b"1"),)),
+        ({"header_rules": (REGEX_HEADER_RULE,)}, b"/games.roblox.com/v1/games", ((b"xeno-fingerprint", b"1"),)),
         ({"endpoint_blocks": (BLOCK,)}, b"/games.roblox.com/v1/blocked", ()),
         ({}, b"/games.roblox.com/v1/games", ((b"x-roblox-token", b""),)),
     ],
-    ids=["header_rule", "endpoint_block", "auth_smuggling"],
+    ids=["header_rule", "regex_header_rule", "endpoint_block", "auth_smuggling"],
 )
 async def test_a_throttled_request_a_filter_refuses_is_never_served_from_cache(
     dbs: Any, fake_clock: FakeClock, snapshot_kwargs: dict[str, Any], path: bytes, extra: tuple[Any, ...]
 ) -> None:
+    """With cache_serve_throttled on, a throttle refusal carries `allow_fresh_cache_serve`, but only when no later
+    check would refuse the request: content never reaches a request a filter refuses. The answer is still the
+    throttle refusal (v1's order of answers; v1 step 4a served the cache before the filters ran)."""
     cache = FreshCache()
     app, _sleep = proxy_app(
         dbs,
@@ -311,5 +313,10 @@ async def test_a_throttled_request_a_filter_refuses_is_never_served_from_cache(
     )
     first, _, _, _ = await raw_asgi_request(app, b"/games.roblox.com/v1/other", headers=headers())
     assert first == 200  # spends the per-IP allowance
-    status, _, body, _ = await raw_asgi_request(app, path, headers=headers(*extra))
+    status, response_headers, body, _ = await raw_asgi_request(app, path, headers=headers(*extra))
     assert b"cached" not in body, f"a filtered request got cached content ({status})"
+    assert status == 429
+    assert response_headers.get(b"roxy-refusal") == b"throttle"
+    # Control: the same throttled caller WITHOUT the filtered trait is still served from the fresh entry.
+    status, _, body, _ = await raw_asgi_request(app, b"/games.roblox.com/v1/games", headers=headers())
+    assert (status, body) == (200, b'{"cached":true}')

@@ -184,7 +184,9 @@ def retry_after_seconds(
         case RetryAfterRule.CREDENTIAL:
             if credential_rejected:
                 return REJECTED_CREDENTIAL_RETRY_AFTER_S
-            return _whole_seconds(cooldown_s) or REJECTED_CREDENTIAL_RETRY_AFTER_S
+            # The cooldown's remaining time, else when the credential manager said it could be tried again
+            # (`soonest_s`, for example 10 s while shared state is unreadable), else 300.
+            return _whole_seconds(cooldown_s) or _whole_seconds(soonest_s) or REJECTED_CREDENTIAL_RETRY_AFTER_S
     return None  # pragma: no cover - the match above is exhaustive
 
 

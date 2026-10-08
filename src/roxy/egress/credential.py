@@ -19,6 +19,10 @@ How it works
          start (first non-empty line; extra lines are discarded and logged, masked: one slot, never a list).
          A bootstrap value whose fingerprint is in `credential_meta.superseded_fingerprints_json` is never used
          again: a UI replacement supersedes it, and only the audited "delete UI value" action un-supersedes it.
+    Both sources go through `_validate_value`, which also removes a leading `.ROBLOSECURITY=`: browser tools copy
+    the cookie as that pair, and the pair is unambiguous (a cookie value never starts with its own name), so Roxy
+    stores, fingerprints and sends the bare value instead of refusing it. A value that still names the cookie after
+    that is refused. The removal is logged without the value.
     Fingerprints are HMAC-SHA256 with a key derived from `credential_encryption_key`, so they identify a value
     without revealing it and cannot be checked offline.
     Status is `unknown` (never probed), `active`, `rejected`, or (computed) `cooling_down` while the fleet-wide
@@ -26,15 +30,20 @@ How it works
     run while `unknown` or `rejected` (that is how a status is established) but never during a cooldown.
     Changes bump `service_state.credential_version`; every worker refreshes once a second and, before every
     credential request, re-reads the version, status and cooldown, so a replacement or a 429 cooldown applies
-    fleet-wide at once. If control.db or hot.db cannot be read the credential is not used (C7).
+    fleet-wide at once. If control.db or hot.db cannot be read the credential is not used (C7). A cooldown that
+    hot.db could not record (the 429 arrived during an outage) is kept in this worker's memory, merged with hot.db's
+    row on every refresh, and written to hot.db by the first refresh that can write.
     `authorize(request)` is the only place the cookie is attached: after those checks, after validating that the
     target is https on an allowed Roblox host, as a per-request `Cookie` header (no cookie jar anywhere).
     `observe_set_cookie` sees `Set-Cookie` headers the credential client dropped; a `.ROBLOSECURITY` one means
     Roblox rotated the cookie: Roxy does not store it, it writes an audit row and raises the critical alert.
-    `LeakMatcher` holds keyed hashes of 12 and 24 character pieces of the secret part (after the public
-    `TOKEN_PREFIX`), never the pieces, and finds any 24+ character run of the secret in a byte string by
-    sampling every 13th position (see `matches`). It covers the current value, the bootstrap value, recently
-    replaced values and rotated cookies Roblox sent.
+    `LeakMatcher` holds keyed hashes of 12 and 24 character pieces of the secret parts of each value, never the
+    pieces, and finds any 24+ character run of a secret part in a byte string by sampling every 13th position (see
+    `matches`). The secret parts are what is left after removing public text wherever it sits in the value (any
+    run of 12 or more characters that the public `TOKEN_PREFIX` warning or `.ROBLOSECURITY=<warning>` contains,
+    see `secret_spans`), so whatever was stored, text any caller can type never trips the leak guard (plan C2
+    item 5). It covers the current value, the bootstrap value, recently replaced values and rotated cookies
+    Roblox sent.
 
 What to read next
     `roxy/egress/guard.py` (how the matcher is used), `roxy/egress/clients.py` (the credential client), and
@@ -133,18 +142,38 @@ class CredentialStateError(RuntimeError):
     """The requested credential action does not apply to the current state (for example no UI value to delete)."""
 
 
-def _validate_value(value: object) -> str:
-    """The cleaned credential text, or an error. Lists, tuples and multi-line text are refused (C1: one slot)."""
+_COOKIE_PAIR_PREFIX = ROBLOX_COOKIE_NAME.lower() + "="
+
+
+def _clean_value(value: object) -> tuple[str, bool]:
+    """The cleaned credential text and whether a leading `.ROBLOSECURITY=` was removed, or an error.
+
+    Lists, tuples and multi-line text are refused (C1: one slot). The cookie pair form browser tools copy
+    (`.ROBLOSECURITY=<value>`) is normalized to the bare value: the stored value is what Roxy puts after
+    `.ROBLOSECURITY=` in the Cookie header, so keeping the name would send it twice and Roblox would reject it.
+    """
     if not isinstance(value, str):
         raise TypeError("the credential is exactly one string; no API accepts a list of credentials (plan C1)")
     text = value.strip()
     if "\n" in text or "\r" in text:
         raise CredentialValueError("one credential only: the value must be a single line (plan C1)")
+    named = text[: len(_COOKIE_PAIR_PREFIX)].lower() == _COOKIE_PAIR_PREFIX
+    if named:
+        text = text[len(_COOKIE_PAIR_PREFIX) :].strip()
+    if ROBLOX_COOKIE_NAME.lower() in text.lower():
+        raise CredentialValueError(
+            "the value still contains the cookie name .ROBLOSECURITY; paste only the text after the equals sign"
+        )
     if len(text) < MIN_VALUE_LENGTH or len(text) > MAX_VALUE_LENGTH:
         raise CredentialValueError(f"a credential is between {MIN_VALUE_LENGTH} and {MAX_VALUE_LENGTH} characters")
     if any(ord(ch) < 0x21 or ord(ch) > 0x7E or ch in _FORBIDDEN_VALUE_CHARS for ch in text):
         raise CredentialValueError("the value has characters a cookie value cannot hold")
-    return text
+    return text, named
+
+
+def _validate_value(value: object) -> str:
+    """The cleaned credential text (see `_clean_value`), or an error."""
+    return _clean_value(value)[0]
 
 
 def _read_bootstrap_file(credentials_dir: Path | None) -> tuple[str | None, int]:
@@ -218,11 +247,64 @@ class CredentialSlot:
 
 # --- the leak matcher ---------------------------------------------------------------------------------------------
 
+PUBLIC_TEXTS: tuple[bytes, ...] = tuple(
+    text.lower().encode("ascii") for text in (TOKEN_PREFIX, f"{ROBLOX_COOKIE_NAME}={TOKEN_PREFIX}")
+)
+"""Text any caller can type: the public warning Roblox puts in front of every cookie, and the cookie pair form.
+Lowercased, because the matcher folds ASCII case."""
+
+PUBLIC_RUN = 12
+"""A run of at least this many characters of a stored value that public text contains is public, wherever it sits
+in the value. Shorter runs are ignored: any 1 to 11 characters of a random secret can appear in the warning by
+chance, and treating them as public would cut the real secret into pieces too small to watch."""
+
+
+def _is_public(piece: bytes) -> bool:
+    return any(piece in text for text in PUBLIC_TEXTS)
+
+
+def secret_spans(value: str) -> list[tuple[int, int]]:
+    """The `(start, end)` byte spans of `value` (UTF-8) that are secret: everything outside public runs.
+
+    Finds, for each position, the longest run starting there that public text contains (at least `PUBLIC_RUN`
+    long) and marks it public. A suffix of a public run is itself public, so each new run only has to be extended
+    past the end of the previous one: the scan does about one substring test per byte. A span that public text
+    contains as a whole (a short leftover such as `items.|_`) is dropped too.
+    """
+    data = value.encode("utf-8", "replace").lower()
+    size = len(data)
+    public = bytearray(size)
+    end = 0  # the end of the last public run found
+    for start in range(size - PUBLIC_RUN + 1):
+        stop = max(end, start + PUBLIC_RUN)
+        if not _is_public(data[start:stop]):
+            continue
+        while stop < size and _is_public(data[start : stop + 1]):
+            stop += 1
+        public[start:stop] = b"\x01" * (stop - start)
+        end = stop
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while start < size:
+        if public[start]:
+            start += 1
+            continue
+        stop = start
+        while stop < size and not public[stop]:
+            stop += 1
+        if not _is_public(data[start:stop]):
+            spans.append((start, stop))
+        start = stop
+    return spans
+
 
 class LeakMatcher:
     """Finds the credential, or any run of 24+ of its characters, in bytes, without holding the secret.
 
-    Correctness of the sampling: if the data holds a run of the secret of length >= 24 starting at offset `s`,
+    Only the secret parts of each value are watched (`secret_spans`): public text is never "secret", whatever was
+    stored, so a caller who types the public warning can never trip the guard (plan C2 item 5, finding F1).
+
+    Correctness of the sampling: if the data holds a run of a secret part of length >= 24 starting at offset `s`,
     then some multiple `p` of 13 lies in `[s, s + 12]`, so `data[p:p+12]` lies inside the run and is a 12
     character piece of the secret (a "probe" hit). The 24 character windows starting at `p-12 .. p` include the
     one starting at `s`, which is a 24 character piece of the secret (a "window" hit). Both sets hold keyed
@@ -243,18 +325,22 @@ class LeakMatcher:
         self._whole: dict[int, set[bytes]] = {}
         self._count = 0
         for value in values:
-            # Only the part after the public TOKEN_PREFIX is secret; pieces of the prefix are public text.
-            secret = value.removeprefix(TOKEN_PREFIX).encode("utf-8", "replace").lower()
-            if len(secret) < self.MIN_SECRET:
-                continue
-            self._count += 1
-            if len(secret) < self.WINDOW:
-                self._whole.setdefault(len(secret), set()).add(self._hash(secret))
-                continue
-            for start in range(len(secret) - self.PROBE + 1):
-                self._short.add(self._hash(secret[start : start + self.PROBE]))
-            for start in range(len(secret) - self.WINDOW + 1):
-                self._long.add(self._hash(secret[start : start + self.WINDOW]))
+            data = value.encode("utf-8", "replace").lower()
+            for start, end in secret_spans(value):
+                self._watch(data[start:end])
+
+    def _watch(self, secret: bytes) -> None:
+        """Add the hashes of one secret part (already ASCII lowercased)."""
+        if len(secret) < self.MIN_SECRET:
+            return
+        self._count += 1
+        if len(secret) < self.WINDOW:
+            self._whole.setdefault(len(secret), set()).add(self._hash(secret))
+            return
+        for start in range(len(secret) - self.PROBE + 1):
+            self._short.add(self._hash(secret[start : start + self.PROBE]))
+        for start in range(len(secret) - self.WINDOW + 1):
+            self._long.add(self._hash(secret[start : start + self.WINDOW]))
 
     def _hash(self, data: bytes) -> bytes:
         return hashlib.blake2b(data, key=self._key, digest_size=8).digest()
@@ -485,6 +571,9 @@ class CredentialManager:
         self._meta: dict[str, Any] = {}
         self._ui_present = False
         self._cooldown_until_ms = 0
+        # A cooldown opened while hot.db could not be written: (until_ms, source). Honored here until hot.db takes
+        # it, so a refresh that reads hot.db's (older) row never forgets it (C7, finding UP-COOLDOWN-LOST).
+        self._pending_cooldown: tuple[int, str] | None = None
         self._problem: str | None = None
         self._degraded = False
         self._started = False
@@ -523,11 +612,14 @@ class CredentialManager:
             )
         if value is not None:
             try:
-                self._bootstrap = _validate_value(value)
+                self._bootstrap, named = _clean_value(value)
             except (TypeError, CredentialValueError) as exc:
                 self._bootstrap_problem = "bootstrap_invalid"
                 log.error("credential_bootstrap_invalid", extra={"fields": {"error": str(exc)[:120]}})
             else:
+                if named:
+                    # The file holds the pair browser tools copy; the bare value is used. Never log the value.
+                    log.warning("credential_cookie_name_removed", extra={"fields": {"source": "bootstrap"}})
                 self._bootstrap_fp = fingerprint(self._bootstrap, self._fp_key)
                 SecretRegistry.register(CREDENTIAL_SECRET_NAME, self._bootstrap)
         try:
@@ -615,6 +707,7 @@ class CredentialManager:
     async def refresh(self, *, force: bool = False) -> bool:
         """Re-read version, metadata and cooldown (and the stored value when the version moved). False when shared
         state was unreadable: the credential is then unusable until a read succeeds (C7)."""
+        await self._share_pending_cooldown()
         try:
             await self._load(force=force)
         except SharedStateUnavailable as exc:
@@ -625,9 +718,28 @@ class CredentialManager:
         self._degraded = False
         return True
 
+    async def _share_pending_cooldown(self) -> None:
+        """Write a cooldown kept in memory during a hot.db outage into hot.db, once hot.db takes writes again."""
+        pending = self._pending_cooldown
+        if pending is None:
+            return
+        until_ms, source = pending
+        now_ms = self._clock.now_ms()
+        if until_ms <= now_ms:
+            self._pending_cooldown = None
+            return
+        try:
+            await self._dbs.hot.write(lambda conn: self._write_cooldown(conn, until_ms, source, now_ms))
+        except SharedStateUnavailable:
+            return  # still unwritable: it stays in memory and keeps blocking the credential in this worker
+        if self._pending_cooldown == pending:
+            self._pending_cooldown = None
+        log.info("credential_cooldown_shared", extra={"fields": {"remaining_s": round((until_ms - now_ms) / 1000)}})
+
     def _apply(self, version: int, meta: dict[str, Any], store: Any, cooldown_until_ms: int) -> None:
         self._meta = meta
-        self._cooldown_until_ms = cooldown_until_ms
+        pending = self._pending_cooldown[0] if self._pending_cooldown is not None else 0
+        self._cooldown_until_ms = max(cooldown_until_ms, pending)
         if store is not _UNCHANGED:
             self._resolve_slot(store, meta)
         self._version = version
@@ -742,6 +854,7 @@ class CredentialManager:
 
     async def _authoritative_check(self, *, probe: bool) -> None:
         """Re-read shared state and raise `CredentialUnavailable` unless the credential may be used right now."""
+        await self._share_pending_cooldown()
         try:
             await self._load(force=False)
         except SharedStateUnavailable as exc:
@@ -842,8 +955,9 @@ class CredentialManager:
     async def set_cooldown(self, seconds: float, source: str) -> float:
         """Open (or extend) the fleet-wide credential cooldown; returns the seconds remaining.
 
-        Never shortens an existing cooldown. If hot.db cannot be written the cooldown still applies in this
-        worker, and the credential is treated as unavailable until shared state is readable again (C7).
+        Never shortens an existing cooldown. If hot.db cannot be written the cooldown is kept in this worker's
+        memory, blocks the credential here (every refresh merges it with hot.db's row), and is written to hot.db
+        by the next refresh that can write (C7: the credential is not used inside Roblox's Retry-After).
         """
         if source not in COOLDOWN_SOURCES:
             raise ValueError(f"cooldown source must be one of {', '.join(COOLDOWN_SOURCES)}")
@@ -851,21 +965,13 @@ class CredentialManager:
         now_ms = self._clock.now_ms()
         until_ms = now_ms + span_ms
 
-        def write(conn: sqlite3.Connection) -> int:
-            row = conn.execute("SELECT until_ms FROM cooldown WHERE key = ?", (COOLDOWN_KEY,)).fetchone()
-            target = max(until_ms, int(row[0]) if row is not None else 0)
-            conn.execute(
-                "INSERT INTO cooldown (key, until_ms, source, set_at, hits) VALUES (?, ?, ?, ?, 1) "
-                "ON CONFLICT(key) DO UPDATE SET until_ms = excluded.until_ms, source = excluded.source, "
-                "set_at = excluded.set_at, hits = cooldown.hits + 1",
-                (COOLDOWN_KEY, target, source, now_ms // 1000),
-            )
-            return target
-
         try:
-            until_ms = await self._dbs.hot.write(write)
+            until_ms = await self._dbs.hot.write(lambda conn: self._write_cooldown(conn, until_ms, source, now_ms))
         except SharedStateUnavailable as exc:
             self._degraded = True
+            kept = self._pending_cooldown
+            if kept is None or kept[0] < until_ms:
+                self._pending_cooldown = (until_ms, source)
             log.error("credential_cooldown_not_shared", extra={"fields": {"error": str(exc)[:200]}})
         self._cooldown_until_ms = max(self._cooldown_until_ms, until_ms)
         remaining = self.cooldown_remaining()
@@ -883,6 +989,19 @@ class CredentialManager:
                 cooldown_s=600,
             )
         return remaining
+
+    @staticmethod
+    def _write_cooldown(conn: sqlite3.Connection, until_ms: int, source: str, now_ms: int) -> int:
+        """Open or extend the fleet-wide `credential` cooldown row (never shortened); returns its end."""
+        row = conn.execute("SELECT until_ms FROM cooldown WHERE key = ?", (COOLDOWN_KEY,)).fetchone()
+        target = max(until_ms, int(row[0]) if row is not None else 0)
+        conn.execute(
+            "INSERT INTO cooldown (key, until_ms, source, set_at, hits) VALUES (?, ?, ?, ?, 1) "
+            "ON CONFLICT(key) DO UPDATE SET until_ms = excluded.until_ms, source = excluded.source, "
+            "set_at = excluded.set_at, hits = cooldown.hits + 1",
+            (COOLDOWN_KEY, target, source, now_ms // 1000),
+        )
+        return target
 
     async def mark_rejected(self, reason: str, *, request_id: str | None = None) -> None:
         """Mark the credential rejected (after the upstream layer's confirming probe, plan 7.9) and alert."""
@@ -1092,8 +1211,11 @@ class CredentialManager:
         self, value: str, actor: Actor, *, reason: str | None = None, request_id: str | None = None
     ) -> CredentialStatus:
         """Replace the credential with `value` (the audited admin action of plan C1). The old value stops being
-        used everywhere at once (version bump), and the bootstrap value is superseded for good."""
-        text = _validate_value(value)
+        used everywhere at once (version bump), and the bootstrap value is superseded for good. A pasted
+        `.ROBLOSECURITY=<value>` pair is stored as the bare value (`_clean_value`)."""
+        text, named = _clean_value(value)
+        if named:
+            log.info("credential_cookie_name_removed", extra={"fields": {"source": "ui", "by": actor.label}})
         if self._key is None:
             raise CredentialStateError("credential_encryption_key is not configured, so a UI value cannot be stored")
         new_fp = fingerprint(text, self._fp_key)
@@ -1224,7 +1346,10 @@ class CredentialManager:
         if value is None:
             value = TOKEN_PREFIX + secrets.token_hex(64).upper()
             matcher = LeakMatcher((value,))
-        secret = value.removeprefix(TOKEN_PREFIX)
+        # The piece comes from the longest secret part, the text the matcher really watches (never public text).
+        raw = value.encode("utf-8", "replace")
+        first, last = max(secret_spans(value), key=lambda span: span[1] - span[0], default=(0, len(raw)))
+        secret = raw[first:last].decode("utf-8", "replace")
         start = max(0, len(secret) // 3)
         piece = secret[start : start + 30]
         requests = (
@@ -1259,4 +1384,5 @@ __all__ = [
     "bump_version",
     "read_version",
     "retry_after_seconds",
+    "secret_spans",
 ]

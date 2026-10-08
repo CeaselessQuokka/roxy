@@ -15,7 +15,8 @@ Why it exists
 
 How it works (one fetch)
     1. Normalize the target (`host`, `/path`, endpoint template, URL with the caller's query in order) and read
-       the settings and rules snapshots once.
+       the settings and rules snapshots once. The credential allowlist (exact grants) and routing rule lookups
+       run under `regex_budget` (plan 9.9); a match cut off by it never grants the credential.
     2. Route (`_route`): one hot.db READ gives every relevant cooldown, breaker and bucket TAT; `routing.decide`
        picks an egress; `buckets.reserve` takes the slot in ONE hot.db WRITE transaction that also inserts the
        single-flight lease (when the cache passed a hook), re-checks cooldowns, takes the half-open probe lease of
@@ -26,7 +27,8 @@ How it works (one fetch)
        Content-Type, a safe forwarded Accept and a cached CSRF token for write methods), with timeouts clipped to
        the request deadline. A CSRF 403 is retried once with the new token (a new bucket slot); a 3xx is followed
        here, not by the egress, so every hop takes a bucket slot, and only to an allowed Roblox host (on the
-       credential path, only to an allowlisted one).
+       credential path, only to an allowlisted one); a Location that does not parse is simply not followed.
+       A CSRF retry is recorded for the Upstream page (`record_retry`, row 117).
     5. Classify (`status.py`), apply the side effects in at most one more hot.db transaction (`effects.py`, skipped
        for a plain success), then: log Roblox 429s (`record_upstream_429`), rotate a burned rotator session, lower
        the attributed bucket rate, set the credential cooldown, and decide by the 7.9 table whether to retry.
@@ -34,7 +36,11 @@ How it works (one fetch)
        jitter backoff, and only while the request deadline allows. A 429 is never retried at once; with
        `fallback_on_429=1` one retry on the OTHER anonymous egress is allowed, never onto the credential.
     C7: if hot.db cannot be used, the request is not sent unpaced and the credential is never used; the answer is
-    the `degraded` row (503, Retry-After 10), or stale data from the cache layer.
+    the `degraded` row (503, Retry-After 10), or stale data from the cache layer. If hot.db stops taking writes
+    after Roblox answered, the answer is still Roblox's, and a 429's cooldown is kept in this worker's memory
+    (`LocalCooldowns`), honored by every routing decision here and written to hot.db (for every worker) as soon as
+    a write succeeds (`flush_local_cooldowns`, from the next fetch or the mirror loop). A credential refused at
+    send time answers with the wait the credential manager gave, not a fixed 300 s.
 
 What to read next
     `roxy/upstream/routing.py`, `roxy/upstream/buckets.py`, `roxy/upstream/effects.py`, then the cache layer's
@@ -63,6 +69,7 @@ import httpx
 from roxy.core.clock import Clock
 from roxy.core.ids import new_request_id
 from roxy.core.reasons import AuthClass, Egress, ReasonCode
+from roxy.rules.match import regex_budget
 from roxy.storage.db import Database, SharedStateUnavailable
 from roxy.upstream import aimd, breaker, buckets, cooldowns, csrf, deadlines, messages, routing
 from roxy.upstream.adaptive import (
@@ -91,6 +98,7 @@ from roxy.upstream.queue import Priority, WaitQueue
 from roxy.upstream.routing import CredentialRule, EgressAvailability, RouteDecision, RouteRequest
 from roxy.upstream.status import (
     NEGATIVE_CACHE_STATUSES,
+    SUCCESS_LIKE,
     AttemptKind,
     RetryRule,
     classify_exception,
@@ -304,6 +312,9 @@ class _RunState:
     exclude: set[Egress] = field(default_factory=set)
     last_failure: UpstreamResult | None = None
     reroutes: int = 0
+    # Why the credential refused this request at send time and for how long (its `CredentialUnavailable`), so the
+    # 503 carries the cooldown's real remaining time instead of the fixed 300 (wire report).
+    credential_refusal: tuple[str, int | None] | None = None
 
 
 @dataclass(slots=True)
@@ -453,6 +464,8 @@ class UpstreamService:
         self._cfg: tuple[Any, UpstreamConfig] | None = None
         self._mirror_cooldowns: dict[str, int] = {}  # key -> until_ms (active cooldowns, refreshed in the background)
         self._mirror_breakers: dict[str, float] = {}  # key -> reopen time in seconds (open breakers)
+        # Cooldowns of 429s that arrived while hot.db could not be written (C7): honored here, written later.
+        self.local_cooldowns = cooldowns.LocalCooldowns()
         self._background: set[asyncio.Task[Any]] = set()
         if adaptive_writer is None:
             from roxy.rules.service import RulesService  # local: keeps importing this module light
@@ -555,6 +568,23 @@ class UpstreamService:
         except Exception:  # an alerting problem must never fail the caller's answer
             log.warning("all_unavailable_alert_failed", exc_info=True)
 
+    def _record_retry(self, call: _Call, egress: Egress, status: int | None) -> None:
+        """Row 117: one CSRF retry, under v1's own reason text (v1 counted only this retry, `log_retry`)."""
+        recorder = getattr(self._ctx, "recorder", None)
+        record = getattr(recorder, "record_retry", None)
+        if not callable(record):
+            return
+        try:
+            record(
+                status=status,
+                reason="CSRF token refresh",
+                egress=egress.value,
+                endpoint_template=call.template,
+                at_ms=self._now_ms(),
+            )
+        except Exception:  # metrics degrade open (plan C7)
+            log.warning("upstream_retry_record_failed", exc_info=True)
+
     def _record_429(self, call: _Call, egress: Egress, exchange: _Exchange, retry_after_s: float | None) -> None:
         recorder = getattr(self._ctx, "recorder", None)
         if recorder is None:
@@ -652,7 +682,7 @@ class UpstreamService:
         rules = self._rules()
         egresses = [Egress.DIRECT, Egress.ROTATOR]
         method = str(getattr(req, "method", "GET")).upper()
-        if rules is not None and rules.credential_rule_for(target, method) is not None:
+        if rules is not None and self._credential_row(rules, target, method) is not None:
             egresses = [Egress.CREDENTIAL]  # an allowlisted endpoint is only ever fetched with the credential
         enabled_list = [egress for egress in egresses if self._egress_enabled(egress, cfg)[0]]
         if not enabled_list:
@@ -697,10 +727,32 @@ class UpstreamService:
             return cooling, {str(key): float(at) for key, at in open_rows}
 
         self._mirror_cooldowns, self._mirror_breakers = await self.hot.read(read)
+        local = self.local_cooldowns.pending(now_ms)
+        self._note_cooldowns({row.key: row.until_ms for row in local}, now_ms)
+
+    async def flush_local_cooldowns(self) -> int:
+        """Write the cooldowns this worker kept in memory during a hot.db outage into hot.db (C7).
+
+        Returns how many were written. Raises `SharedStateUnavailable` while hot.db still cannot be written (the
+        cooldowns stay in memory and keep being honored by this worker).
+        """
+        now_ms = self._now_ms()
+        rows = self.local_cooldowns.pending(now_ms)
+        if not rows:
+            return 0
+        written = await self.hot.write(
+            functools.partial(cooldowns.write_local, rows=rows, now_ms=now_ms), busy_timeout_ms=HOT_BUSY_TIMEOUT_MS
+        )
+        self.local_cooldowns.forget(rows)
+        log.info("upstream_local_cooldowns_shared", extra={"fields": {"written": written}})
+        return int(written)
 
     async def run_mirror(self, stop: asyncio.Event, interval_s: float = 0.5) -> None:
-        """Per-worker loop for the lifespan: keep the availability mirror fresh until `stop` is set."""
+        """Per-worker loop for the lifespan: keep the availability mirror fresh until `stop` is set, and share the
+        cooldowns kept in memory during a hot.db outage as soon as hot.db can be written."""
         while not stop.is_set():
+            with contextlib.suppress(SharedStateUnavailable):  # still unwritable: they stay in memory, honored here
+                await self.flush_local_cooldowns()
             with contextlib.suppress(SharedStateUnavailable):  # keep the last mirror; fetch reads hot.db itself
                 await self.refresh_mirror()
             with contextlib.suppress(TimeoutError):
@@ -715,6 +767,7 @@ class UpstreamService:
         counts = await self.hot.write(clear)
         self._mirror_cooldowns.clear()
         self._mirror_breakers.clear()
+        self.local_cooldowns = cooldowns.LocalCooldowns()
         return counts
 
     async def bucket_snapshot(self, limit: int = 500) -> list[buckets.BucketState]:
@@ -763,6 +816,21 @@ class UpstreamService:
         trace.outcome = result.reason.value
         return result
 
+    @staticmethod
+    def _credential_row(rules: Any, target: str, method: str) -> Any:
+        """The credential allowlist row for `target`, matched under the request's regex budget (plan 9.9).
+
+        A match cut off by the timeout or a spent budget never grants the credential (fail closed, C1).
+        """
+        with regex_budget():
+            return rules.credential_rule_for(target, method)
+
+    @staticmethod
+    def _routing_row(rules: Any, target: str) -> Any:
+        """The routing rule for `target`, under the request's regex budget (a cut-off match means no rule)."""
+        with regex_budget():
+            return rules.routing_rule_for(target)
+
     def _normalize(self, req: Any) -> tuple[str, str, str, str, str]:
         host = str(req.host).strip().lower().rstrip(".")
         raw_path = str(req.path or "/")
@@ -782,13 +850,16 @@ class UpstreamService:
         host, path, template, url, target = self._normalize(req)
         method = str(req.method).upper()
         credential_rule: CredentialRule | None = None
-        if mode == "internal_cred":
-            # Roxy's own credential probe: the credential or nothing (never anonymous instead, never cached).
-            credential_rule = CredentialRule(0, cache_private=True, identical_anonymous=False)
-        elif mode == CALLER and rules is not None:
-            row = rules.credential_rule_for(target, method)
-            credential_rule = CredentialRule.from_row(row) if row is not None else None
-        routing_row = rules.routing_rule_for(target) if rules is not None and mode != "internal_cred" else None
+        routing_row: Any = None
+        with regex_budget():  # both lookups share one budget (and the request's, when the caller opened one)
+            if mode == "internal_cred":
+                # Roxy's own credential probe: the credential or nothing (never anonymous instead, never cached).
+                credential_rule = CredentialRule(0, cache_private=True, identical_anonymous=False)
+            elif mode == CALLER and rules is not None:
+                row = self._credential_row(rules, target, method)
+                credential_rule = CredentialRule.from_row(row) if row is not None else None
+            if rules is not None and mode != "internal_cred":
+                routing_row = self._routing_row(rules, target)
         call = _Call(
             req=req,
             method=method,
@@ -905,6 +976,13 @@ class UpstreamService:
             tats=buckets.read_tats(conn, tat_keys),
         )
 
+    def _merge_local(self, rows: dict[str, CooldownRow], keys: Sequence[str], now_ms: int) -> None:
+        """Add this worker's in-memory cooldowns (C7) to `rows` read from hot.db; the later end wins."""
+        for key, row in self.local_cooldowns.active(keys, now_ms).items():
+            shared = rows.get(key)
+            if shared is None or shared.until_ms < row.until_ms:
+                rows[key] = row
+
     def _availability_of(
         self,
         call: _Call,
@@ -946,6 +1024,10 @@ class UpstreamService:
     async def _route(self, call: _Call, state: _RunState) -> _Routed | UpstreamResult:
         """Pick an egress and reserve its slot (plan 7.2 and 7.3). Retries a few times if the snapshot raced."""
         last_denial: tuple[float, str] | None = None
+        if len(self.local_cooldowns):
+            # Cooldowns kept in memory during a hot.db outage: share them first if hot.db takes writes again.
+            with contextlib.suppress(SharedStateUnavailable):
+                await self.flush_local_cooldowns()
         for _round in range(MAX_ROUTE_ROUNDS):
             candidates = self._candidates(call, state)
             specs = {egress: self._specs(call, egress) for egress in candidates}
@@ -956,6 +1038,7 @@ class UpstreamService:
             snap = await self.hot.read(
                 functools.partial(self._read_snapshot, ckeys=ckeys, bkeys=bkeys, tat_keys=tat_keys, now_ms=now_ms)
             )
+            self._merge_local(snap.cooldowns, ckeys, now_ms)
             self._note_cooldowns({key: row.until_ms for key, row in snap.cooldowns.items()}, now_ms)
             states = {egress: self._availability_of(call, egress, specs[egress], snap, now_ms) for egress in candidates}
             max_wait_ms = self._max_wait_ms(call, state)
@@ -980,21 +1063,24 @@ class UpstreamService:
     async def _route_request(self, call: _Call, state: _RunState, max_wait_ms: float) -> RouteRequest:
         cfg = call.cfg
         usable = rejected = False
+        cooldown_s = 0.0
         if call.credential_rule is not None and Egress.CREDENTIAL not in state.exclude:
             if call.mode == "internal_cred":
                 on, _ = self._egress_enabled(Egress.CREDENTIAL, cfg, PURPOSE_CREDENTIAL_PROBE)
                 remaining = await call_optional(
                     getattr(self._egress, "credential", None), "cooldown_remaining", default=0.0
                 )
-                usable = on and float(remaining or 0.0) <= 0
+                cooldown_s = float(remaining or 0.0)
+                usable = on and cooldown_s <= 0
             else:
                 view = await credential_view(self._egress, setting_enabled=cfg.credential_enabled)
-                usable, rejected = view.usable, view.rejected
+                usable, rejected, cooldown_s = view.usable, view.rejected, view.cooldown_s
         return RouteRequest(
             method=call.method,
             credential_rule=call.credential_rule,
             credential_usable=usable,
             credential_rejected=rejected,
+            credential_cooldown_s=cooldown_s,
             routing_mode=call.routing_mode,
             direct_weight=cfg.direct_weight,
             rotator_weight=cfg.rotator_weight,
@@ -1009,9 +1095,12 @@ class UpstreamService:
         cfg = call.cfg
         ckeys = self._ckeys(call.host, call.template, egress)
         bkeys = breaker.breaker_keys(call.host, call.template, egress)
+        # Copied here, on the event loop: the guards run on the database writer thread (C7 in-memory cooldowns).
+        local = dict(self.local_cooldowns.active(ckeys, self._now_ms()))
 
         def cooldown_guard(conn: sqlite3.Connection, now_ms: int) -> GuardDenial | None:
             active = cooldowns.read_active(conn, ckeys, now_ms)
+            active.update({key: row for key, row in local.items() if row.active(now_ms) and key not in active})
             if not active:
                 return None
             row = max(active.values(), key=lambda item: item.until_ms)
@@ -1135,6 +1224,8 @@ class UpstreamService:
         ckeys = self._ckeys(call.host, call.template, routed.egress)
         bkeys = [k for k in breaker.breaker_keys(call.host, call.template, routed.egress) if k not in routed.probe_keys]
         now_ms = self._now_ms()
+        if self.local_cooldowns.active(ckeys, now_ms):
+            return "blocked"  # a 429 seen by this worker during a hot.db outage (C7)
 
         def recheck(conn: sqlite3.Connection) -> bool:
             if cooldowns.read_active(conn, ckeys, now_ms):
@@ -1237,6 +1328,12 @@ class UpstreamService:
             elapsed = (self._mono() - started) * 1000
             if kind is None:
                 raise
+            if egress is Egress.CREDENTIAL and kind is AttemptKind.EGRESS_DISABLED:
+                retry_after = getattr(exc, "retry_after_s", None)
+                state.credential_refusal = (
+                    str(getattr(exc, "why", "") or "unavailable"),
+                    int(retry_after) if isinstance(retry_after, int | float) else None,
+                )
             if policy_for(kind).sent:
                 state.calls += 1
                 state.upstream_ms += elapsed
@@ -1310,11 +1407,18 @@ class UpstreamService:
         return True
 
     def _redirect_url(self, call: _Call, egress: Egress, current_url: str, exchange: _Exchange) -> str | None:
-        """Where a 3xx may be followed: an allowed Roblox host, GET or HEAD, credential only within the allowlist."""
+        """Where a 3xx may be followed: an allowed Roblox host, GET or HEAD, credential only within the allowlist.
+
+        None means "do not follow", never an exception: a Location that does not even parse (`//[`) is refused
+        like any other target outside the allowlist (ingress review).
+        """
         location = exchange.headers.get("location", "").strip()
         if not location or call.method not in routing.CREDENTIAL_METHODS:
             return None
-        target = urljoin(current_url, location)
+        try:
+            target = urljoin(current_url, location)
+        except ValueError:  # an unparsable Location (for example an unclosed IPv6 bracket)
+            return None
         cfg = call.cfg
         if not is_roblox_https_url(target, cfg.allowed_hosts if cfg.strict_hosts else None):
             return None
@@ -1322,7 +1426,7 @@ class UpstreamService:
             parts = urlsplit(target)
             new_target = f"{(parts.hostname or '').lower()}{parts.path or '/'}"
             if call.mode != "internal_cred" and (
-                call.rules is None or call.rules.credential_rule_for(new_target, call.method) is None
+                call.rules is None or self._credential_row(call.rules, new_target, call.method) is None
             ):
                 return None  # never carry the credential off the allowlist (plan C2 item 7)
             if call.mode == "internal_cred" and new_target != call.rules_target:
@@ -1371,6 +1475,7 @@ class UpstreamService:
                     return self._failure(ReasonCode.UPSTREAM_BUSY, call.trace, state, soonest_s=1.0)
                 headers["x-csrf-token"] = token
                 csrf_retried = True
+                self._record_retry(call, egress, exchange.status)  # row 117, like v1's log_retry(403, ...)
                 exchange = await self._send(
                     call, egress, url, call.method, headers, body, exchange.session_id, state, csrf_retry=True
                 )
@@ -1380,6 +1485,9 @@ class UpstreamService:
             if exchange.kind is AttemptKind.REDIRECT and hops < MAX_REDIRECT_HOPS:
                 target = self._redirect_url(call, egress, url, exchange)
                 if target is None:
+                    # Not followed (malformed, not an allowed Roblox host, off the allowlist): Roblox's own 3xx
+                    # answer goes back like any other answer, after the normal bookkeeping below.
+                    call.trace.note("redirect not followed")
                     break
                 new_host = (urlsplit(target).hostname or call.host).lower()
                 if not await self._extra_slot(call, routed, state, new_host):
@@ -1427,9 +1535,20 @@ class UpstreamService:
         effects: CallEffects | None = None
         if should_record(facts, routed.breakers_seen, now_s):
             config = EffectsConfig(cooldown=cfg.cooldown, breaker=cfg.breaker, aimd=cfg.aimd)
-            effects = await self.hot.write(
-                lambda conn: apply_call_outcome(conn, facts, config, self._now_ms(), self._rng)
-            )
+            try:
+                effects = await self.hot.write(
+                    lambda conn: apply_call_outcome(conn, facts, config, self._now_ms(), self._rng)
+                )
+            except SharedStateUnavailable as exc:
+                # C7: Roblox answered, but hot.db cannot be written. Breaker counts are lost and a held probe or
+                # AIMD lease expires on its own; a 429's cooldown is NOT lost (finding UP-COOLDOWN-LOST).
+                log.warning(
+                    "upstream_effects_not_shared",
+                    extra={"fields": {"error": str(exc)[:200], "kind": kind.value, "egress": routed.egress.value}},
+                )
+                effects = self._local_effects(facts, cfg)
+                await self._side_effects_outside(call, routed, exchange, kind, retry_after, effects)
+                return effects
             now_ms = self._now_ms()
             seconds = effects.cooldown_s or 0.0
             self._note_cooldowns({key: now_ms + int(seconds * 1000) for key in effects.cooldown_keys}, now_ms)
@@ -1454,6 +1573,48 @@ class UpstreamService:
                 )
         await self._side_effects_outside(call, routed, exchange, kind, retry_after, effects)
         return effects
+
+    def _local_effects(self, facts: CallFacts, cfg: UpstreamConfig) -> CallEffects | None:
+        """The cooldown hot.db could not record, kept in this worker's memory (plan 7.5 and C7); None if none.
+
+        A 429: same length rule as the shared path (Retry-After, x-ratelimit-reset, else the default), as a first
+        429 (the streak lives in hot.db). Direct and credential 429s cool the endpoint down for that egress, and a
+        credential 429 also the credential itself; a rotator 429 only rotates its session (the distinct-exit rule
+        needs the shared exit records, plan 7.5). Host escalation and adaptive rates wait for hot.db.
+        Any other answer that says `x-ratelimit-remaining: 0` cools the endpoint down until the reset, as
+        `effects.apply_call_outcome` would have.
+        """
+        now_ms = self._now_ms()
+        limit = facts.ratelimit
+        if facts.kind is not AttemptKind.RATE_LIMITED:
+            if facts.kind not in SUCCESS_LIKE or limit is None or not limit.exhausted or limit.reset_s is None:
+                return None
+            key = cooldowns.endpoint_key(facts.template, facts.egress)
+            row = self.local_cooldowns.remember(
+                key, cfg.cooldown.clamp(limit.reset_s), cooldowns.CooldownSource.RATELIMIT_RESET, now_ms
+            )
+            self._note_cooldowns({row.key: row.until_ms}, now_ms)
+            return CallEffects(cooldown_s=row.remaining_s(now_ms), cooldown_source=row.source, cooldown_keys=[key])
+        if facts.egress not in (Egress.DIRECT, Egress.CREDENTIAL):
+            return None
+        seconds, source = cooldowns.cooldown_duration(facts.retry_after_s, facts.ratelimit, 1, cfg.cooldown, self._rng)
+        rows = [
+            self.local_cooldowns.remember(cooldowns.endpoint_key(facts.template, facts.egress), seconds, source, now_ms)
+        ]
+        if facts.egress is Egress.CREDENTIAL:
+            credential_s, credential_source = cooldowns.cooldown_duration(
+                facts.retry_after_s, facts.ratelimit, 1, cfg.cooldown, self._rng, credential=True
+            )
+            rows.append(
+                self.local_cooldowns.remember(cooldowns.CREDENTIAL_KEY, credential_s, credential_source, now_ms)
+            )
+        self._note_cooldowns({row.key: row.until_ms for row in rows}, now_ms)
+        longest = max(rows, key=lambda row: row.until_ms)
+        return CallEffects(
+            cooldown_s=longest.remaining_s(now_ms),
+            cooldown_source=longest.source,
+            cooldown_keys=[row.key for row in rows],
+        )
 
     async def _side_effects_outside(
         self,
@@ -1669,13 +1830,26 @@ class UpstreamService:
         call.trace.note(decision.note)
         if decision.cooldown_source:
             call.trace.cooldown_source = decision.cooldown_source
+        cooldown_s = decision.retry_after_s
+        soonest_s = decision.retry_after_s
+        rejected = reason is ReasonCode.CREDENTIAL_UNAVAILABLE and "rejected" in decision.note
+        refusal = state.credential_refusal
+        if reason is ReasonCode.CREDENTIAL_UNAVAILABLE and cooldown_s is None and refusal is not None:
+            # Refused at send time: answer with what the credential manager said (a cooldown's real remaining
+            # time, 10 s while shared state is unreadable), not the fixed 300 s meant for a rejected credential.
+            why, hint = refusal
+            rejected = rejected or why == "rejected"
+            if why == "cooling_down":
+                cooldown_s = None if hint is None else float(hint)
+            soonest_s = None if hint is None else float(hint)
+            call.trace.note(f"credential refused at send time: {why}")
         return self._failure(
             reason,
             call.trace,
             state,
-            cooldown_s=decision.retry_after_s,
-            soonest_s=decision.retry_after_s,
-            credential_rejected=reason is ReasonCode.CREDENTIAL_UNAVAILABLE and "rejected" in decision.note,
+            cooldown_s=cooldown_s,
+            soonest_s=soonest_s,
+            credential_rejected=rejected,
             cooldown_source=decision.cooldown_source,
         )
 

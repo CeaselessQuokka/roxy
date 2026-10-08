@@ -294,7 +294,8 @@ SETTINGS: list[SettingSpec] = [
         if_disabled=(
             "Memory only: each worker keeps its own small cache (cache_memory_entries, cache_memory_bytes), so the "
             "same request is fetched once per worker, far fewer entries fit, and everything is lost on restart "
-            "or deploy. Useful only while cache.db is failing."
+            "or deploy. Concurrent requests for one missing entry are still coalesced fleet-wide while cache.db "
+            "can be written (short-lived single-flight handoff rows). Useful only while cache.db is failing."
         ),
         risk=Risk.MEDIUM,
         high_risk_if=(

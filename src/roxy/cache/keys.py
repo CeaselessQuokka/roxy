@@ -64,6 +64,10 @@ KEY_ID_LENGTH: Final = 24
 MARKER_SUFFIX: Final = " !429"
 """Appended to a key's text to name its per-key Roblox 429 marker (plan 7.7), a separate row from the entry."""
 
+HANDOFF_SUFFIX: Final = " !flight"
+"""Appended to a key's text to name its single-flight handoff row (`cache/service.py`), a separate short-lived row
+that carries an answer too big for the hot.db lease row to followers in other workers. Lookups never read it."""
+
 CRED_SUFFIX: Final = " @cred"
 """Appended to the key text of a request that uses the credential path (plan 6.9)."""
 
@@ -130,6 +134,12 @@ class CacheKey:
     def marker_id(self) -> str:
         """The id of this key's Roblox 429 marker row."""
         return key_id(self.text + MARKER_SUFFIX)
+
+    @property
+    def handoff_id(self) -> str:
+        """The id of this key's single-flight handoff row: an answer too big for the lease row that followers in
+        other workers read once (never a lookup result, never served as a cache hit)."""
+        return key_id(self.text + HANDOFF_SUFFIX)
 
 
 def key_id(text: str) -> str:
@@ -303,6 +313,7 @@ def pairs_from_mapping(params: Mapping[str, Sequence[str] | str]) -> list[tuple[
 __all__ = [
     "CASEFOLD_PATH_FLAG",
     "CRED_SUFFIX",
+    "HANDOFF_SUFFIX",
     "KEY_ID_LENGTH",
     "MARKER_SUFFIX",
     "SORT_CSV_FLAG",

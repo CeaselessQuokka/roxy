@@ -20,6 +20,9 @@ How it works
     longer word. Examples in this file keep the brackets, so it passes its own check. Before the word rules run,
     text matched by the file's [exceptions] section (URLs, identifiers such as asyncio's `Task.cancel[l]ed()`) is
     blanked out.
+    Walking a directory skips generated directories, the v1 source and the third-party libraries vendored byte
+    for byte (`SKIPPED_RELATIVE_PATHS` gives the reason for each entry); a file named on the command line is
+    always checked.
     The script uses only the standard library, so it runs with any Python 3.12, with or without the project
     environment. `roxy/core/style_guard.py` loads this file to apply the same rules to rendered pages in tests.
 
@@ -70,10 +73,11 @@ SKIPPED_RELATIVE_PATHS = frozenset(
         ".venv",
         ".remake",  # working notes of the remake run
         "tests/fixtures/v1",  # v1 data used as test input; must stay byte-identical to v1
-        # Third-party libraries vendored byte for byte (their SRI hashes are recorded in VERSIONS.md); editing
-        # them to satisfy our style rules would break the integrity check and fork the library.
+        # Third-party libraries vendored byte for byte. Their text is not ours to rewrite: editing them to satisfy
+        # our style rules would fork the library, and for the served ones (htmx, Alpine, uPlot) it would also break
+        # the SRI hashes recorded in src/roxy/static/vendor/VERSIONS.md, so browsers would refuse the files.
         "src/roxy/static/vendor",
-        "tests/e2e/vendor",
+        "tests/e2e/vendor",  # axe-core, used only by the accessibility tests, copied unchanged from its release
         # The v1 test suites under tests/ (smoke_test.py, deploy_test.sh, boot_check.sh) are scanned like
         # everything else: plan C5 has no exception for them, and their dashes were only in comments.
     }

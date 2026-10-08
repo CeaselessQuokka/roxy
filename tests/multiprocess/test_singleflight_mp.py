@@ -50,7 +50,10 @@ class RecordingUpstream(FakeUpstream):
         self.label = label
         self.mode = mode
 
-    async def fetch(self, req: Any, *, priority: Any, stale_available: bool, purpose: str = "caller") -> FakeResult:
+    async def fetch(
+        self, req: Any, *, priority: Any, stale_available: bool, purpose: str = "caller", lease: Any = None
+    ) -> FakeResult:
+        await self.take_lease(lease)  # like the real upstream: the lease first, then (only if won) the call
         fd = os.open(self.calls_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             os.write(fd, f"{self.label}\n".encode())
@@ -94,6 +97,9 @@ async def _child_main(
 
         results = await asyncio.gather(*(one() for _ in range(REQUESTS_PER_PROCESS)))
         out.put(("done", label, results))
+        # A worker's graceful shutdown (lifespan close): the owner's store and outcome publish, which run after
+        # its own callers were answered, land before the process exits.
+        await service.close()
     finally:
         dbs.cache.close_sync()
         dbs.hot.close_sync()

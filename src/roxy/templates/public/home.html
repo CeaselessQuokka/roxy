@@ -5,7 +5,9 @@
 	`/#tokenSafetyHeading` still land on the right heading. Texts that name people, prices or hosting facts come
 	from the `site_*` settings (D18) and are already escaped HTML; every limit comes from the live settings.
 	The Luau snippets (`examples.*`) are the files in templates/public/examples/, highlighted on the server by
-	pages.home_examples() into complete `<pre><code class="language-luau hl">` blocks (escaped, no inline style).
+	pages.home_examples() into complete `<pre tabindex="0"><code class="language-luau hl">` blocks (escaped, no
+	inline style). Every `<pre>` is a tab stop, because a block that scrolls sideways must be reachable with the
+	keyboard (WCAG 2.1.1).
 #}
 {% extends "public/base.html" %}
 {% block head %}
@@ -107,12 +109,13 @@
 							Use Roxy exactly like the Roblox API: put <code>https://roxytheproxy.com/</code> in front of the Roblox
 							host. For example:
 						</p>
-						<pre><code>https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&amp;page=1&amp;itemsPerPage=100&amp;isEditable=true</code></pre>
+						<pre tabindex="0"><code>https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&amp;page=1&amp;itemsPerPage=100&amp;isEditable=true</code></pre>
 						<p>
 							That works in a browser, and from a server <code>Script</code> with <code>HttpService</code> (turn on
 							<strong>Allow HTTP Requests</strong> in Game Settings, Security). Every example here is complete,
-							typed Luau that passes the type checker in <code>--!strict</code> mode; values that never change are
-							declared with <code>const</code>.
+							typed Luau that passes the type checker in <code>--!strict</code> mode; names that are never
+							assigned again are declared with <code>const</code> (if your Studio does not accept it yet, write
+							<code>local</code> instead).
 						</p>
 						{{ examples.get_async }}
 						<p>
@@ -125,7 +128,7 @@
 							parameter) makes the JSON easier to read in a browser. It is specific to Roxy and works for every
 							request type:
 						</p>
-						<pre><code>https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&amp;page=1&amp;itemsPerPage=100&amp;isEditable=true&amp;prettyprint=true</code></pre>
+						<pre tabindex="0"><code>https://roxytheproxy.com/avatar.roblox.com/v2/avatar/users/29371917/outfits?outfitType=Avatar&amp;page=1&amp;itemsPerPage=100&amp;isEditable=true&amp;prettyprint=true</code></pre>
 						<p>More examples, including batch lookups and a reusable module with caching, are in the <a href="/docs#3-examples-in-luau">user guide</a>.</p>
 					</div>
 				</details>
@@ -154,7 +157,8 @@
 					</li>
 					<li>
 						<strong>Tip:</strong> your own cache is the best way to stay under the limit. An answer your game
-						already has costs no request at all.
+						already has costs no request at all{% if limits.cache_hits_count %}, while asking Roxy again counts
+						even when Roxy answers from its cache{% endif %}.
 					</li>
 				</ul>
 				<p class="muted">These numbers come from Roxy's live settings. The <a href="/docs#4-limits">guide</a> explains how they work.</p>

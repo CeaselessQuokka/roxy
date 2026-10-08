@@ -93,7 +93,8 @@ async def test_unhandled_exception_is_the_7_13_500(make_app: Any, client_for: An
     async with client_for(app) as client:
         response = await client.get("/boom")
     assert response.status_code == 500
-    assert response.text == "Internal Server Error"
+    assert response.content == b'"Internal Server Error"\n'  # v1's jsonify form (plan 7.13 "as v1")
+    assert response.headers["content-type"].split(";")[0] == "application/json"
     assert response.headers["retry-after"] == "5"
     assert response.headers["x-content-type-options"] == "nosniff"
     assert "something broke" not in response.text  # never leak exception text to callers

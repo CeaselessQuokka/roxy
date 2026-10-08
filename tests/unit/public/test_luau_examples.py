@@ -91,11 +91,10 @@ def test_example_is_strict_typed_and_global_free(example: Example) -> None:
     lines = example.source.splitlines()
     assert lines[0] == "--!strict", "strict mode must be the first line, or Studio ignores it"
     code = without_comments(example.source)
-    # Constants and services are `const` (Luau const bindings); nothing is assigned as a global at the top level
-    # (strict mode, checked below by luau-analyze, also reports any unknown global inside a function).
-    assert "const " in code
+    # Nothing is assigned as a global at the top level (strict mode, checked below by luau-analyze, also reports
+    # any unknown global inside a function).
     assert not re.search(r"^[A-Za-z_]\w*\s*=(?!=)", code, re.MULTILINE), "a global assignment"
-    assert not re.search(r"^function \w+\s*\(", code, re.MULTILINE), "functions are local or module fields"
+    assert not re.search(r"^function \w+\s*\(", code, re.MULTILINE), "functions are const or module fields"
     # Every function signature is typed: each parameter has an annotation, and named functions declare a return.
     for match in re.finditer(r"\bfunction\s*([\w.:]*)\s*\(([^)]*)\)(\s*:)?", code):
         for parameter in filter(None, (part.strip() for part in match.group(2).split(","))):
@@ -105,7 +104,70 @@ def test_example_is_strict_typed_and_global_free(example: Example) -> None:
     if "RequestAsync" in code or "GetAsync" in code:
         assert "pcall(" in code, "HttpService calls raise on failure, so every example wraps them in pcall"
     if "JSONDecode" in code:
-        assert re.search(r"pcall\(function\(\): \w+|: \w+ = result\.value", code), "decoded JSON gets a named type"
+        assert re.search(r"pcall\(function\(\): \w+", code), "the decoding pcall names the type of its result"
+    # Decoded JSON is checked before use: whoever reads `.data` first confirms it is a table.
+    if re.search(r"\.data\b", code):
+        assert re.search(r'typeof\([\w.]+\.data\) ~= "table"', code), "decoded JSON is used without a check"
+    # `any` appears only where a comment explains why (JSONDecode returns it; a module cannot know each shape).
+    if re.search(r"\bany\b", code):
+        assert "`any`" in example.source, "an `any` without a comment saying why"
+
+
+DECLARATION = re.compile(r"^\t*(?P<keyword>local|const)\s+(?:function\s+)?(?P<names>[\w\s,:{}\[\]?]+?)\s*(?:=|\(|$)")
+
+
+def declarations(code: str) -> list[tuple[str, list[str], bool]]:
+    """Every `local` or `const` declaration, at any depth: (keyword, names, is_function)."""
+    found = []
+    for line in code.splitlines():
+        match = DECLARATION.match(line)
+        if match is None:
+            continue
+        names = [part.split(":", 1)[0].strip() for part in match.group("names").split(",")]
+        found.append((match.group("keyword"), names, " function " in f" {line.strip()} "))
+    return found
+
+
+def is_reassigned(code: str, name: str) -> bool:
+    """True when `name` is assigned again after its declaration (`name = `, `name += `, `name ..= `...)."""
+    return re.search(rf"^\t*{re.escape(name)}\s*(?:[-+*/%^]|\.\.|//)?=(?!=)", code, re.MULTILINE) is not None
+
+
+@pytest.mark.parametrize("example", ALL_EXAMPLES, ids=lambda example: example.name)
+def test_const_for_every_binding_that_never_changes(example: Example) -> None:
+    """Owner request 2026-10-07: `const` wherever a name is never assigned again (services, URLs, limits, module
+    tables, functions, values inside functions), `local` only for names that change, UPPER_SNAKE_CASE for true
+    constants (top-level numbers and strings)."""
+    code = without_comments(example.source)
+    found = declarations(code)
+    assert any(keyword == "const" for keyword, *_ in found)
+    assert sum(len(names) for _, names, _ in found) >= 3, "the declaration scan found too little"
+    for keyword, names, is_function in found:
+        for name in names:
+            if keyword == "local":
+                assert not is_function, f"{example.name}: `local function {name}` is never reassigned; use const"
+                assert is_reassigned(code, name), f"{example.name}: `local {name}` never changes; use const"
+            else:
+                assert not is_reassigned(code, name), f"{example.name}: const {name} is assigned again"
+            if re.fullmatch(r"[A-Z][A-Z0-9_]+", name):
+                assert keyword == "const", f"{example.name}: {name} looks like a constant but is not const"
+    for match in re.finditer(r'^const (\w+)\s*=\s*(?:-?\d|"|\{ ")', code, re.MULTILINE):
+        assert re.fullmatch(r"[A-Z][A-Z0-9_]+", match.group(1)), f"{example.name}: constant {match.group(1)}"
+
+
+@pytest.mark.parametrize("example", ALL_EXAMPLES, ids=lambda example: example.name)
+def test_roblox_conventions(example: Example) -> None:
+    """GetService once at the top, task.wait never the old wait, and Retry-After capped (no endless waiting)."""
+    code = without_comments(example.source)
+    services = re.findall(r'GetService\("(\w+)"\)', code)
+    assert len(services) == len(set(services)), "each service is fetched once"
+    for line in code.splitlines():
+        if "GetService(" in line:
+            assert re.match(r'^const (\w+) = game:GetService\("\1"\)$', line), f"GetService at the top: {line}"
+    assert not re.search(r"(?<![.\w])(wait|delay|spawn)\(", code), "use task.wait, task.delay, task.spawn"
+    if "Retry-After" in code and "retryWaitSeconds" in code:
+        assert "MAX_WAIT_SECONDS" in code, "a Retry-After wait is capped"
+    assert not re.search(r"\bwhile true do\b", code), "no busy loops"
 
 
 @pytest.mark.parametrize("example", ALL_EXAMPLES, ids=lambda example: example.name)
@@ -181,8 +243,8 @@ def test_examples_pass_luau_analyze_in_strict_mode(tmp_path: Path, solver: str) 
                 problems.append(f"unparsed output: {raw}")
             continue
         line = example_line(int(match.group("line")))
-        example = files.get(Path(match.group("file")).name)
-        where = example.name if example is not None else match.group("file")
+        reported = files.get(Path(match.group("file")).name)
+        where = reported.name if reported is not None else match.group("file")
         message = match.group("message")
         keep_continuation = True
         if line is None:

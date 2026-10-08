@@ -98,7 +98,7 @@ async def test_credential_allowlist_checks_the_method(dbs: Any, service: RulesSe
         ADMIN,
     )
     await service.create(
-        "credential_allowlist", {"pattern": "economy.roblox.com/v1/user", "cache_private": True}, ADMIN
+        "credential_allowlist", {"pattern": "economy.roblox.com/v1/user/*", "cache_private": True}, ADMIN
     )
     snapshot = _snapshot(dbs)
     rule = snapshot.credential_rule_for("users.roblox.com/v1/users/authenticated", "head")
@@ -108,6 +108,44 @@ async def test_credential_allowlist_checks_the_method(dbs: Any, service: RulesSe
     assert snapshot.credential_rule_for("economy.roblox.com/v1/user/currency", "HEAD") is None
     assert snapshot.credential_rule_for("economy.roblox.com/v1/user/currency", "GET") is not None
     assert snapshot.credential_rule_for("games.roblox.com/v1/games", "GET") is None
+
+
+async def test_credential_allowlist_grants_exactly_what_a_row_names(dbs: Any, service: RulesService) -> None:
+    """Lead decision F3: no implicit subpaths for the allowlist (globs), whole-path matches for regexes; a row
+    that wants the paths below it says so with an explicit wildcard. Other tables keep v1's subpath rule."""
+    rows = [
+        {"pattern": "economy.roblox.com/v1/user/currency", "cache_private": True},
+        {"pattern": "economy.roblox.com/v1/groups/*", "cache_private": True},
+        {"pattern": r"economy\.roblox\.com/v1/bundles/\d+", "type": "regex", "cache_private": True},
+        {"pattern": r"economy\.roblox\.com/v1/assets/\d+(?:/.*)?", "type": "regex", "cache_private": True},
+    ]
+    for row in rows:
+        await service.create("credential_allowlist", row, ADMIN)
+    await service.create("rules_cache", {"pattern": "economy.roblox.com/v1/user/currency", "ttl": 60}, ADMIN)
+    snapshot = _snapshot(dbs)
+    granted = {
+        "economy.roblox.com/v1/user/currency": True,
+        "/economy.roblox.com/v1/user/currency/": True,  # the same path with one trailing slash
+        "ECONOMY.ROBLOX.COM/V1/USER/CURRENCY": True,
+        "economy.roblox.com/v1/user/currency/history": False,
+        "economy.roblox.com/v1/user/currency/history/transactions": False,
+        "economy.roblox.com/v1/user/currencyx": False,
+        "economy.roblox.com/v1/user": False,
+        "economy.roblox.com/v1/groups/7": True,  # explicit wildcard: one segment below
+        "economy.roblox.com/v1/groups": False,
+        "economy.roblox.com/v1/groups/7/roles": False,
+        "economy.roblox.com/v1/bundles/12": True,
+        "economy.roblox.com/v1/bundles/12/details": False,  # a regex must match the whole path
+        "economy.roblox.com/v1/bundles/12x": False,
+        "x.economy.roblox.com/v1/bundles/12": False,
+        "economy.roblox.com/v1/assets/5": True,
+        "economy.roblox.com/v1/assets/5/owners/page/2": True,  # the regex says so explicitly
+        "economy.roblox.com/v1/assets/5x": False,
+    }
+    seen = {target: snapshot.credential_rule_for(target, "GET") is not None for target in granted}
+    assert seen == granted
+    # Every other rule family keeps v1's implicit subpath rule (plan 4.8 row 111).
+    assert snapshot.cache_rule_for("economy.roblox.com/v1/user/currency/history") is not None
 
 
 def test_cidr_set_prefers_the_most_specific_active_network() -> None:

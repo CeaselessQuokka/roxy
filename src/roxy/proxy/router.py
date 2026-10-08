@@ -20,24 +20,41 @@ How it works
        row 1, v1 parity). DESIGN 11.1 placed it after the abuse verdict; it runs first so an OPTIONS for an odd
        path can never be counted or logged as a probe by the URL checks.
     3. `validate.parse_target` parses the RAW path and query (never raises) and a `ProxyRequest` is built. HEAD
-       becomes GET with `is_head=True`.
+       becomes GET with `is_head=True`. The `Roblox-Id` place claim is scrubbed with `redact_label` here, once,
+       because it becomes hot.db keys (place limits, spam windows) where no log filter looks.
     4. For a valid target, `ctx.cache.peek(req)` (memory and cache.db only, never upstream) sets `cache_key` and
-       `fresh_cache_hit`, so the per-IP throttle can skip cache hits (plan D10).
+       `fresh_cache_hit`. The abuse checks need that answer only for the throttled cache serve
+       (`cache_serve_throttled` on) or when an admin sets `throttle_count_cache_hits` to 0 (by default cache hits
+       count, owner decision 2026-10-07 reversing D10); only then does the peek run before the verdict. Otherwise
+       it runs after an Allow, so a refused caller costs no cache read and no cache rule match. Steps 4 to 6 share
+       one `regex_budget` (plan 9.9): the cache policy, every abuse pattern check and the upstream's allowlist and
+       routing matches of one request together spend at most `REGEX_REQUEST_BUDGET_S`.
     5. `ctx.abuse.evaluate(req)` returns Allow or Refuse. Refuse: optionally serve a throttled caller from a fresh
-       cache entry (`allow_fresh_cache_serve`), else ask the tarpit for a plan (never for bypass callers; the
-       refusal's `detail` is the v1 per-hold reason), hold or jitter (`await plan.wait()`) or drip (a streaming
-       response), and release the slot in `finally`. The one HTML refusal (the challenge page) is switched back to
-       the page CSP, because its script runs with this response's nonce (`req.csp_nonce`).
+       cache entry (`allow_fresh_cache_serve`, which the pipeline grants only when no later filter refuses the
+       request), else ask the tarpit for a plan (never for bypass callers, whatever check refused them: the
+       pipeline marks `req.bypass` before any check runs; the refusal's `detail` is the v1 per-hold reason), hold or
+       jitter (`await plan.wait()`) or drip (a streaming response), and release the slot in `finally`. The one HTML
+       refusal (the challenge page) is switched back to the page CSP, because its script runs with this response's
+       nonce (`req.csp_nonce`).
     6. Allow: an invalid target is refused even if the pipeline let it through (defense in depth: the SSRF guard
        must not depend on another module's check order). Then `ctx.cache.serve(req, peek)` returns the result
-       (falling back to `ctx.upstream.fetch` only while no cache service exists).
+       (falling back to `ctx.upstream.fetch` only while no cache service exists). A pacing failure that tells the
+       caller to wait (`Retry-After` on a Roblox cooldown, upstream busy or queue full answer) is handed to
+       `tarpit.plan_cooldown_retry`, which remembers it fleet-wide and, when this answer is itself a retry of the
+       same key inside an earlier `Retry-After`, holds it with the `jitter` type (`upstream_cooldown_retry`, plan
+       10.6; off by default).
     7. `respond.render` builds the answer; `ctx.recorder.record_outcome(event)` runs exactly once per request
        (for a drip, when the stream ends), with a `CaptureInput` when the recorder takes one (its capture policy
-       decides whether the bodies are kept). An exception still propagates to the middleware, which answers 500
-       (or the deadline middleware 504), but the fallback outcome record (`internal_error` or `deadline`) is
-       written here first, because only this flow knows the request's endpoint and cache facts (DESIGN 7).
+       decides whether the bodies are kept). `message_source` tells whose words the caller got (row 116): a
+       refusal's `custom` or `default`, `roxy` for a 7.13 failure text Roxy wrote, `roblox` for an error answer that
+       carries Roblox's own body. An exception still propagates to the middleware, which answers 500 (or the
+       deadline middleware 504), but the fallback outcome record (`internal_error` or `deadline`) is written here
+       first, because only this flow knows the request's endpoint and cache facts (DESIGN 7).
     Fail closed (plan C7): no context or no abuse pipeline means 503 `degraded` for valid targets (invalid ones
     are still refused with their own 404); shared state that cannot be read or written is 503 `degraded`.
+    `/internal` and everything under it exist only on the internal Unix socket app; a request for them that reaches
+    this public app gets v1's JSON `"Not Found"` 404 at once: no proxy pipeline, no tarpit, not counted as proxied
+    (nginx answers 404 for `/internal/` in production before Roxy sees it).
 
 What to read next
     `roxy/proxy/validate.py`, `roxy/proxy/respond.py`, then `roxy/abuse/pipeline.py` and `roxy/cache/service.py`.
@@ -62,9 +79,12 @@ from starlette.routing import Match, Route, Router
 from starlette.types import Scope
 
 from roxy.core.client_ip import UNKNOWN_IP, limit_key
+from roxy.core.errors import not_found_response
 from roxy.core.reasons import AuthClass, Egress, Outcome, ReasonCode, Source
+from roxy.core.redact import redact_label
 from roxy.core.scope import catalog_default, get_app_context, get_state
 from roxy.core.security_headers import KIND_PAGE, STATE_CSP_NONCE, STATE_RESPONSE_KIND, is_admin_path, mark_proxied
+from roxy.internal_app import is_internal_path
 from roxy.lifespan import optional_import
 from roxy.proxy import respond, scrub, validate
 from roxy.proxy.context import (
@@ -75,6 +95,7 @@ from roxy.proxy.context import (
     is_browser,
     problem_template,
 )
+from roxy.rules.match import regex_budget
 from roxy.storage.db import SharedStateUnavailable
 
 log = logging.getLogger("roxy.proxy.router")
@@ -83,6 +104,11 @@ PROXY_ROUTE_PATH = "/{path:path}"
 
 CACHE_ERRORS: tuple[type[BaseException], ...] = (SharedStateUnavailable, sqlite3.Error, OSError)
 """Failures of the disposable cache tier that turn a peek into a miss instead of failing the request."""
+
+RETRY_PACING_REASONS: frozenset[ReasonCode] = frozenset(
+    {ReasonCode.UPSTREAM_COOLDOWN, ReasonCode.UPSTREAM_BUSY, ReasonCode.QUEUE_OVERFLOW}
+)
+"""Failure answers whose `Retry-After` paces the caller: a retry inside it is `upstream_cooldown_retry` (10.6)."""
 
 _FALLBACK_SETTINGS: dict[str, Any] = {
     "strict_host_allowlist": True,
@@ -115,6 +141,16 @@ def allowed_hosts(ctx: Any) -> frozenset[str]:
         name = str(entry).strip().lower()
         hosts.add(name[:-1] if name.endswith(".") else name)
     return frozenset(hosts)
+
+
+def peek_before_verdict(ctx: Any) -> bool:
+    """True when an abuse check reads the cache's answer (`fresh_cache_hit`), so the peek must come first.
+
+    Only two settings make a check look at it: `throttle_count_cache_hits` at 0 (fresh hits neither counted nor
+    refused) and `cache_serve_throttled` at 1 (a throttled caller served from a fresh entry, plan row 60). Both
+    are read live with their catalog defaults (1 and 0), so by default the peek waits for an Allow.
+    """
+    return not bool(setting(ctx, "throttle_count_cache_hits")) or bool(setting(ctx, "cache_serve_throttled"))
 
 
 def caller_headers(scope: Mapping[str, Any]) -> tuple[dict[str, str], list[str]]:
@@ -227,7 +263,9 @@ class ProxyFlow:
         client = scope.get("client")
         client_ip = str(self.state.get("client_ip") or (client[0] if client else UNKNOWN_IP))
         user_agent = headers.get("user-agent", "")
-        place_id = headers.get("roblox-id", "").strip()[:MAX_PLACE_ID] or None
+        # `Roblox-Id` is a caller claim that becomes hot.db keys (place limits, spam windows, place bans) where no log
+        # filter looks: scrubbed like a log line (plan C1, 9.15), so a credential piece in it is never stored.
+        place_id = redact_label(headers.get("roblox-id", "").strip()[:MAX_PLACE_ID]) or None
         received_monotonic = float(self.state.get("received_monotonic") or time.monotonic())
         deadline_at = self.state.get("deadline_at")
         if deadline_at is None:
@@ -271,8 +309,13 @@ class ProxyFlow:
         )
 
     async def handle(self, req: ProxyRequest) -> Response:
-        """Steps 3 to 7 for a context that exists."""
-        peek = await self.peek(req) if req.target_problem is None else None
+        """Steps 4 to 7 for a context that exists, every pattern match under one request budget (plan 9.9)."""
+        with regex_budget():
+            return await self._handle(req)
+
+    async def _handle(self, req: ProxyRequest) -> Response:
+        early = req.target_problem is None and peek_before_verdict(self.ctx)
+        peek = await self.peek(req) if early else None
         abuse = getattr(self.ctx, "abuse", None)
         if abuse is None:
             if req.target_problem is not None:
@@ -288,8 +331,17 @@ class ProxyFlow:
                 extra={"fields": {"problem": req.target_problem.value, "detail": req.target_detail}},
             )
             return await self.refuse(req, respond.target_refusal(req.target_problem), peek)
+        if peek is None:
+            peek = await self.peek(req)  # the late peek (step 4): only an allowed request pays for the cache read
         result = await self.serve(req, peek)
-        return await self.finish(req, self.render(req, result, extra_headers=getattr(verdict, "headers", None)), result)
+        rendered = self.render(req, result, extra_headers=getattr(verdict, "headers", None))
+        plan = await self.cooldown_retry_plan(req, rendered)
+        if plan is not None:
+            try:
+                await _maybe_await(plan.wait())  # jitter: a retry inside the Retry-After it was given (10.6)
+            finally:
+                await _release(plan)
+        return await self.finish(req, rendered, result)
 
     async def peek(self, req: ProxyRequest) -> Any:
         """Step 3: the cache's view of this key (no upstream call). The cache is disposable: errors are misses."""
@@ -372,6 +424,24 @@ class ProxyFlow:
             return await tarpit.plan(category, req)
         except SharedStateUnavailable:
             return None  # C7: without shared state the tarpit never holds; the refusal itself still works
+
+    async def cooldown_retry_plan(self, req: ProxyRequest, rendered: respond.Rendered) -> Any:
+        """The `upstream_cooldown_retry` hold for a pacing failure, or None (see step 6 of the module docstring)."""
+        if req.bypass or rendered.outcome is not Outcome.FAILED or rendered.reason not in RETRY_PACING_REASONS:
+            return None
+        planner = getattr(getattr(getattr(self.ctx, "abuse", None), "tarpit", None), "plan_cooldown_retry", None)
+        given = rendered.header(respond.RETRY_AFTER)
+        if planner is None or given is None or not given.isdigit() or int(given) <= 0:
+            return None
+        cache_key = req.cache_key
+        key_id = cache_key if isinstance(cache_key, str) else getattr(cache_key, "id", None)
+        key = str(key_id) if key_id else f"{req.caller_method} {req.target}?{req.raw_query}"  # "the same key"
+        try:
+            return await planner(
+                req, key=key, retry_after_s=int(given), reason=f"Retry inside Retry-After ({rendered.reason.value})"
+            )
+        except SharedStateUnavailable:
+            return None  # C7: without shared state the tarpit never holds
 
     # --- answers ------------------------------------------------------------------------------------------------
 
@@ -485,6 +555,27 @@ def capture_input(req: ProxyRequest, rendered: respond.Rendered, result: Any) ->
     )
 
 
+MESSAGE_SOURCE_ROXY = "roxy"
+MESSAGE_SOURCE_ROBLOX = "roblox"
+_ROBLOX_BODY_SOURCES = frozenset({Source.ROBLOX, Source.RELAY, Source.CACHE})
+
+
+def message_source(rendered: respond.Rendered, refusal: Any) -> str:
+    """Whose words the caller got (parity row 116, v1 `reason_counts` "Roxy text" against "Roblox body").
+
+    A refusal: its own `custom` or `default`. A failure Roxy wrote (a plan 7.13 text): `roxy`. Any other error
+    answer (status 400 or more) carries Roblox's own body, live, reshaped or from the cache: `roblox`. A success
+    has no message: "".
+    """
+    if refusal is not None:
+        return str(getattr(refusal, "message_source", "") or "")
+    if rendered.outcome is Outcome.FAILED:
+        return MESSAGE_SOURCE_ROXY
+    if rendered.status >= 400 and rendered.source in _ROBLOX_BODY_SOURCES:
+        return MESSAGE_SOURCE_ROBLOX
+    return ""
+
+
 def _trace_count(result: Any, name: str) -> int:
     value = getattr(getattr(result, "trace", None), name, 0)
     return int(value) if isinstance(value, int) else 0
@@ -546,7 +637,7 @@ def build_outcome_event(
         if age is not None and rendered.cache_state in respond.CACHE_SERVE_STATES
         else None,
         "upstream_error": str(getattr(getattr(result, "trace", None), "upstream_error", "") or ""),
-        "message_source": str(getattr(refusal, "message_source", "") or "") if refusal is not None else "",
+        "message_source": message_source(rendered, refusal),
         "check": str(getattr(refusal, "check", "") or "") if refusal is not None else "",
         "cache_key_id": getattr(cache_key, "id", None),
         "body_hash": getattr(cache_key, "body_hash", None),
@@ -566,6 +657,11 @@ def build_outcome_event(
 
 async def proxy_endpoint(request: Request) -> Response:
     """The catch-all proxy endpoint (a plain Starlette endpoint: no dependency injection on the hot path)."""
+    path = str(request.scope.get("path", ""))
+    if is_internal_path(path):
+        # Defense in depth: the public app's first route (`internal_app.PublicInternalNotFound`) already answers
+        # /internal; an app that mounts this router alone still never holds or proxies it (a plain 404).
+        return not_found_response(path, headers={"Cache-Control": respond.CACHE_CONTROL_VALUE})
     mark_proxied(request.scope)  # sandbox CSP on every proxy answer, refusals included (plan 9.2)
     ctx = get_app_context(request.scope)
     counters = getattr(getattr(ctx, "heartbeat", None), "counters", None)
@@ -577,8 +673,9 @@ async def proxy_endpoint(request: Request) -> Response:
 class ProxyRoute(Route):
     """The catch-all route, except `/admin` and everything under it.
 
-    The admin surface must never fall into the proxy pipeline, even for an admin path no admin route claims (the
-    admin router answers those with its own JSON 404, plan row 15), whatever order routes end up in.
+    The admin surface must never fall into the proxy pipeline, even for an admin path no admin route claims (that
+    path gets the admin side's 404, plan row 15, never a proxy refusal or a tarpit hold), whatever order routes end
+    up in.
     """
 
     def matches(self, scope: Scope) -> tuple[Match, Scope]:

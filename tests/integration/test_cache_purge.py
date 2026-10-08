@@ -48,8 +48,11 @@ def service_for(
 
 
 async def call(service: CacheService, target: str) -> ServeResult:
+    """One request, then wait for its background cache.db write (callers never wait for it)."""
     req = make_request(target)
-    return await service.serve(req, await service.peek(req))
+    result = await service.serve(req, await service.peek(req))
+    await service.settle()
+    return result
 
 
 async def populate(service: CacheService, clock: FakeClock) -> None:

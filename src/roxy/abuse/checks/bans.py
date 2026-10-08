@@ -14,8 +14,12 @@ How it works
     - With `ban_disguise_as_throttle` (default on) the refusal is byte-identical to an ordinary throttle refusal
       (`Roxy-Refusal: throttle`), so the abuser does not learn they are banned; otherwise 403 `Access denied.` with
       `Roxy-Refusal: banned` (or `deny_list`). The deny list follows the same switch (a v2 decision: the list is a
-      permanent ban by network).
-    - Every ban hit is counted in memory and flushed to `bans.hits` in batches. Tarpit category `ban`.
+      permanent ban by network). The disguise is rendered after the transaction with the client's real strikes and
+      penalty (`checks/base.py redisguise`): a client on rung 3 keeps getting the rung 3 text once banned, exactly
+      what a genuine throttle refusal would say at that moment.
+    - Every ban hit is counted in memory and flushed to `bans.hits` in batches. Tarpit category `ban`, never for a
+      caller on the bypass list (the pipeline marks bypass before any check, so the router knows it whichever check
+      refuses).
 
 What to read next
     `roxy/abuse/bans.py`, then `roxy/abuse/checks/bypass.py` (the next check).

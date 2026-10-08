@@ -6,9 +6,9 @@ What this is
     sampled. `test_credential_activity_leaves_no_trace` exercises everything Roxy itself does with the credential
     (probe, an allowlisted credential request, Roblox rotating the cookie, an admin replace, the guard
     self-test) plus ordinary caller traffic on all three egresses, then scans every byte the service wrote.
-    `test_injected_credential_piece_is_scrubbed_everywhere` (strict xfail, finding F4) has a caller send a piece
-    of the credential in places that are not request content (a path segment that is not id-shaped, the
-    `Roblox-Id` header) and shows it surviving unredacted into metric dimensions and the Live feed.
+    `test_injected_credential_piece_is_scrubbed_everywhere` (finding F4) has a caller send a piece of the
+    credential in places that are not request content (a path segment that is not id-shaped, a host label, the
+    User-Agent, the `Roblox-Id` header) and scans every record written about those requests.
 
 Why it exists
     The credential has many ways to reach a record: a third-party library logging a request at DEBUG, a traceback,
@@ -164,40 +164,49 @@ async def test_credential_activity_leaves_no_trace(
     assert scan(blobs, values) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "F4: a credential piece a caller puts in a non id-shaped path segment or in the Roblox-Id header is kept "
-        "unredacted in metric dimensions (endpoint_template, place) and the Live feed's template and place fields"
-    ),
-)
+def injections(piece: str) -> list[tuple[str, str, dict[str, str], dict[str, Any]]]:
+    """Requests that carry a credential piece outside request content: a query value, a header and a JSON body,
+    a path segment that is not id-shaped (kept as written by the templating), a host label, a User-Agent, and the
+    `Roblox-Id` header, which becomes the place id."""
+    return [
+        ("GET", f"/games.roblox.com/v1/games?universeIds=1&k={piece}", {}, {}),
+        ("POST", "/games.roblox.com/v1/games/list", {"X-Note": piece}, {"content": json.dumps({"k": piece})}),
+        ("GET", f"/games.roblox.com/v1/x.{piece}", {}, {}),
+        ("GET", f"/{piece.lower()}.roblox.com/v1/games", {}, {}),
+        ("GET", "/games.roblox.com/v1/games?universeIds=4", {"User-Agent": f"Roblox/{piece}"}, {}),
+        ("GET", "/games.roblox.com/v1/games?universeIds=3", {"Roblox-Id": piece}, {}),
+    ]
+
+
 async def test_injected_credential_piece_is_scrubbed_everywhere(
     env: Any, credentials_dir: Path, fake_secrets: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan 19.7: inject the secret into requests, then every log, capture, Live row and metrics row is clean.
-    (The guard refuses to send such a request, so this is about what Roxy RECORDS about it.)"""
+    """Finding F4 (fixed). Plan 19.7: inject the secret into requests, then every log line, capture, Live row and
+    database byte (metrics.db dimensions, client rows, events and samples; hot.db abuse keys; control.db; cache.db)
+    is clean. The guard refuses to send such a request, so this is about what Roxy RECORDS about it: the endpoint
+    template (`metrics/templating.py`), the place id (`proxy/router.py`) and every label the recorder, the Live
+    feed and captures store are scrubbed with `redact_label`."""
     stream = io.StringIO()
     monkeypatch.setattr(sys, "stderr", stream)
     piece = secret_part(fake_secrets["roblox_credential"])[30:70]
+    sent = injections(piece)
     async with running_app(env, credentials_dir, fake_secrets, monkeypatch) as run:
         await capture_everything(run)
-        injected = [
-            ("GET", f"/games.roblox.com/v1/games?universeIds=1&k={piece}", {}, {}),
-            ("POST", "/games.roblox.com/v1/games/list", {"X-Note": piece}, {"content": json.dumps({"k": piece})}),
-            ("GET", f"/games.roblox.com/v1/x.{piece}", {}, {}),
-            ("GET", "/games.roblox.com/v1/games?universeIds=3", {"Roblox-Id": piece}, {}),
-            ("GET", "/games.roblox.com/v1/games?universeIds=4", {"User-Agent": f"Roblox/{piece}"}, {}),
-        ]
-        for method, path, headers, kwargs in injected:
+        for method, path, headers, kwargs in sent:
             run.clock.advance(5)
             await run.request(method, path, headers=headers, **kwargs)
         await run.ctx.recorder.flush()
-        live = json.dumps(run.ctx.recorder.live.snapshot(limit=5000), default=str)
-        captured = json.dumps(captures(run), default=str)
-    metrics = database_bytes(env.state_dir)
-    found = scan(
-        {"live ring": live, "captures": captured, "log stream": stream.getvalue(), **metrics},
-        {"injected piece": TOKEN_PREFIX + piece},
-    )
-    assert run.ctx.egress.tripped(Egress.DIRECT)  # the guard did its job: nothing was sent
-    assert found == []
+        ring = run.ctx.recorder.live.snapshot(limit=5000)
+        decoded = captures(run)
+        assert run.ctx.egress.tripped(Egress.DIRECT)  # the guard did its job: nothing was sent
+    # Not vacuous: every injected request was recorded, in the Live ring and as a capture.
+    assert len(ring) >= len(sent), ring
+    assert len(decoded) >= len(sent), len(decoded)
+    blobs: dict[str, bytes | str] = {
+        "live ring": json.dumps(ring, default=str),
+        "captures": json.dumps(decoded, default=str),
+        "log stream": stream.getvalue(),
+        **database_bytes(env.state_dir),
+    }
+    assert {"hot.db", "metrics.db"} <= set(blobs)
+    assert scan(blobs, {"injected piece": TOKEN_PREFIX + piece}) == []

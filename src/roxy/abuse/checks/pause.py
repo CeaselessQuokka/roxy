@@ -5,8 +5,9 @@ What this is
 
 Why it exists
     Maintenance needs a switch that stops all proxying at once with an honest answer: v1's 503 with the admin's
-    reason or `Service down for maintenance.`, plus `Roxy-Paused: True`. v2 adds `Retry-After` (plan 7.13: the time
-    to the scheduled end, or 60 s) so well-behaved clients know when to come back.
+    reason or the default text, now the live setting `pause_message_default` (plan 7.13 and 15.3 K; its catalog
+    default is v1's `Service down for maintenance.`), plus `Roxy-Paused: True`. v2 adds `Retry-After` (plan 7.13: the
+    time to the scheduled end, or 60 s) so well-behaved clients know when to come back.
 
 How it works
     Reads the worker's cached pause state (`roxy/abuse/state.py`), so a paused request costs no database write.
@@ -35,7 +36,7 @@ class PauseCheck(Check):
         state = facts.services.switches.pause
         if not state.active(facts.now):
             return None
-        text, source = state.message(facts.now)
+        text, source = state.message(facts.now, facts.setting("pause_message_default"))
         return Refuse(
             status=503,
             body=text,

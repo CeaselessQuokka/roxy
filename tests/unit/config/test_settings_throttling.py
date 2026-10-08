@@ -69,12 +69,13 @@ ABUSE_KEYS = {
 
 EXPECTED_KEYS = THROTTLING_KEYS | ABUSE_KEYS
 
-# v2 defaults from plan 15.3 E (DESIGN.md section 0 overrides none of these).
+# v2 defaults from plan 15.3 E. DESIGN.md section 0 overrides one: the owner reversed D10 on 2026-10-07, so
+# `throttle_count_cache_hits` is 1 (cache hits count, because serving them still costs Roxy resources).
 EXPECTED_DEFAULTS = {
     "allowed_requests_per_minute": 10,
     "throttle_reset_duration": 50,
     "throttle_window_mode": "gcra",
-    "throttle_count_cache_hits": 0,
+    "throttle_count_cache_hits": 1,
     "stale_ip_duration": 60,
     "throttle_escalation_enabled": 1,
     "throttle_strike_decay_seconds": 1800,

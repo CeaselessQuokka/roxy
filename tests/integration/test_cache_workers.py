@@ -58,8 +58,11 @@ def worker(
 
 
 async def call(service: CacheService, target: str = VOTES, **kwargs: Any) -> ServeResult:
+    """One request, then wait for its background cache.db write and outcome publish (callers never wait)."""
     req = make_request(target, **kwargs)
-    return await service.serve(req, await service.peek(req))
+    result = await service.serve(req, await service.peek(req))
+    await service.settle()
+    return result
 
 
 async def test_a_store_in_one_worker_is_a_hit_in_another(dbs: Any, second_dbs: Any, clock: FakeClock) -> None:

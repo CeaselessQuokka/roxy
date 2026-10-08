@@ -4,9 +4,11 @@ What this is
     `FloodCheck` (plan 10.1: `flood_limit_per_minute`, default 300). A GCRA limit of N per 60 s per client key.
 
 Why it exists
-    The per-IP throttle deliberately ignores cache hits (D10: they cost Roblox nothing). Without a second, much
-    higher ceiling, a client hammering one cached URL could still use all of a worker's capacity. The flood limit is
-    that ceiling; legitimate clients never come near it.
+    The per-IP throttle is the fairness limit, and an admin can tune it per deployment (for example
+    `throttle_count_cache_hits` = 0 stops counting cache hits there; the default 1 counts them, because a cache hit
+    still costs Roxy resources). The flood limit is the absolute ceiling under all of that: a client hammering one
+    URL can never use all of a worker's capacity whatever the per-IP settings say, and legitimate clients never come
+    near it. A client it refuses runs none of the costly pattern checks (admin regexes) after it.
 
 How it works
     One limiter row `flood:<limit_key>` evaluated in the pipeline's single hot.db transaction. Unlike the other

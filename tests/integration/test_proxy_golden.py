@@ -526,11 +526,13 @@ ROWS: list[RowGolden] = [
         served(b"", status=204),
         *_same(Expect(204, b"", None, {**TRIO_TEXT, "Roxy-Cache": "MISS", "Roxy-Upstream-Status": "204"})),
     ),
+    # Compat on: v1 (pipeline.md section 7 step 4, bug B1) sent a Roblox 4xx as 500 carrying Roblox's own body,
+    # labeled application/json; the setting exists to reproduce v1, so only the status changes (lead decision).
     RowGolden(
         "roblox_404_live",
         served(NOT_FOUND_BODY, status=404, reason=ReasonCode.UPSTREAM_4XX),
         Expect(404, NOT_FOUND_BODY, JSON, {**TRIO_TEXT, "Roxy-Cache": "MISS", "Roxy-Upstream-Status": "404"}),
-        Expect(500, FAILED, TEXT, {**TRIO_TEXT, "Roxy-Cache": "MISS", "Roxy-Upstream-Status": "404"}),
+        Expect(500, NOT_FOUND_BODY, JSON, {**TRIO_TEXT, "Roxy-Cache": "MISS", "Roxy-Upstream-Status": "404"}),
     ),
     RowGolden(
         "roblox_400_live",
@@ -538,7 +540,9 @@ ROWS: list[RowGolden] = [
         Expect(
             400, b'{"errors":[{"code":1}]}', JSON, {**TRIO_TEXT, "Roxy-Cache": "MISS", "Roxy-Upstream-Status": "400"}
         ),
-        Expect(500, FAILED, TEXT, {**TRIO_TEXT, "Roxy-Cache": "MISS", "Roxy-Upstream-Status": "400"}),
+        Expect(
+            500, b'{"errors":[{"code":1}]}', JSON, {**TRIO_TEXT, "Roxy-Cache": "MISS", "Roxy-Upstream-Status": "400"}
+        ),
     ),
     RowGolden(
         "roblox_404_cached",
@@ -563,10 +567,10 @@ ROWS: list[RowGolden] = [
                 "Roxy-Upstream-Status": "404",
             },
         ),
-        Expect(
+        Expect(  # cached Roblox 404s replay as 500 exactly as v1 did: Roblox's body under the 500
             500,
-            FAILED,
-            TEXT,
+            NOT_FOUND_BODY,
+            JSON,
             {
                 **TRIO_TEXT,
                 "Roxy-Cache": "HIT",
@@ -863,7 +867,8 @@ ROWS: list[RowGolden] = [
     RowGolden(
         "internal_error",
         failure(ReasonCode.INTERNAL_ERROR, status=500, cache_state=CacheState.NA),
-        *_same(Expect(500, b"Internal Server Error", TEXT, {**TRIO_TEXT, "Retry-After": "5"})),
+        # v1 `jsonify("Internal Server Error")`: the JSON string and a newline (plan 7.13 "as v1").
+        *_same(Expect(500, b'"Internal Server Error"\n', JSON, {**TRIO_TEXT, "Retry-After": "5"})),
     ),
 ]
 
@@ -913,6 +918,22 @@ async def test_deadline_row_from_the_core_middleware_matches(golden: SimpleNames
     event = golden.ctx.recorder.events[0]
     assert (event.status, event.reason, event.outcome) == (504, ReasonCode.DEADLINE, Outcome.FAILED)
     assert event.endpoint_template == "games.roblox.com/v1/games"
+
+
+async def test_unhandled_error_from_the_core_middleware_matches(golden: SimpleNamespace) -> None:
+    """The 500 written by `core/errors.py` for an exception that escapes the flow carries the same bytes as the 7.13
+    `internal_error` row: v1's `jsonify("Internal Server Error")`, whichever layer answers."""
+    golden.ctx.cache = Cache(RuntimeError("a bug in the cache layer"))
+    response = await golden.call("GET", GAMES)
+    row = next(row for row in ROWS if row.id == "internal_error").compat_off
+    assert response.status_code == row.status == 500
+    assert response.content == row.body == b'"Internal Server Error"\n'
+    assert response.headers["content-type"] == row.content_type == JSON
+    assert response.headers["Retry-After"] == "5"
+    assert "roxy-refusal" not in response.headers
+    assert b"a bug" not in response.content  # never the exception text
+    [event] = golden.ctx.recorder.events
+    assert (event.status, event.reason) == (500, ReasonCode.INTERNAL_ERROR)
 
 
 # --- caller-visible features (rows 2, 3, 4, 10, 1) ------------------------------------------------------------------

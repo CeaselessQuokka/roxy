@@ -11,8 +11,9 @@ Why it exists
 How it works
     A flag lasts 10 s and is refreshed each second the detector still fires, so the refusals stop shortly after the
     client calms down. The refusal is disguised as an ordinary throttle (a detector is a heuristic; telling an
-    abuser which heuristic caught them helps them evade it); the true reason `spam` is recorded. Tarpit category
-    `spam` (on by default). Bypass entries skip it.
+    abuser which heuristic caught them helps them evade it), rendered after the transaction with the client's real
+    strikes and penalty (`checks/base.py redisguise`); the true reason `spam` is recorded. Tarpit category `spam`
+    (on by default). Bypass entries skip it.
 
 What to read next
     `roxy/abuse/spam.py` (the detectors and their actions), then `roxy/abuse/checks/throttle_all.py`.

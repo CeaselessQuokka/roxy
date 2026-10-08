@@ -15,10 +15,8 @@ import httpx
 import pytest
 from fastapi import Depends, FastAPI
 
-from roxy.config.audit import Actor
-from roxy.config.settings_service import SettingsService
 from roxy.deps import get_db, require_admin, require_csrf
-from roxy.internal_app import ListenerDispatcher, listener_kind
+from roxy.internal_app import ListenerDispatcher, PublicInternalNotFound, is_internal_path, listener_kind
 from roxy.lifespan import AppContext
 from roxy.main import create_app, create_asgi_app
 from roxy.worker import RoxyUvicornWorker
@@ -132,11 +130,33 @@ async def test_startup_refused_when_schema_is_too_old(env: Any) -> None:
             pass
 
 
-async def test_public_app_has_no_internal_routes(app: FastAPI, client: httpx.AsyncClient) -> None:
-    assert not [route for route in app.routes if getattr(route, "path", "").startswith("/internal")]
-    for path in ("/internal/version", "/internal/ready"):
-        assert (await client.get(path)).status_code == 404
-    assert (await client.post("/internal/flush")).status_code in (404, 405)
+async def test_public_app_answers_internal_paths_with_a_fixed_404(app: FastAPI, client: httpx.AsyncClient) -> None:
+    """Plan 5.8 and the lead decision: on the public port every `/internal` path is an immediate 404 with v1's
+    `"Not Found"` body, from one fixed route placed first; it never reaches the proxy pipeline or the tarpit."""
+    internal_routes = [route for route in app.routes if getattr(route, "path", "").startswith("/internal")]
+    assert internal_routes == [app.routes[0]]
+    assert isinstance(app.routes[0], PublicInternalNotFound)
+    counters = app.state.ctx.heartbeat.counters
+    proxied = counters.proxied
+    for method, path in (
+        ("GET", "/internal/version"),
+        ("GET", "/internal/ready"),
+        ("POST", "/internal/flush"),
+        ("GET", "/internal"),
+        ("DELETE", "/internal/anything/below"),
+        ("PROPFIND", "/internal/version"),  # a method no route declares: still the same 404
+    ):
+        response = await client.request(method, path)
+        assert response.status_code == 404, (method, path)
+        assert response.content == b'"Not Found"\n'
+        assert response.headers["content-type"] == "application/json"
+        assert "roxy-refusal" not in response.headers  # not a proxy refusal
+        assert len(response.headers["roxy-request-id"]) == 26  # the middleware stack still ran
+    assert counters.proxied == proxied  # no request reached the proxy route
+    assert is_internal_path("/internal")
+    assert is_internal_path("/internal/")
+    assert not is_internal_path("/internals")  # the exact prefix only
+    assert not is_internal_path("/Internal/version")
 
 
 def test_listener_kind() -> None:
@@ -193,22 +213,23 @@ async def test_internal_only_on_unix_socket_with_real_uvicorn(env: Any) -> None:
                 break
             await asyncio.sleep(0.01)
         assert server.started
-        # `/internal/version` on the public port is an ordinary unknown path there: the proxy route refuses it as
-        # not a Roblox URL, and the wired abuse pipeline would hold that probe in the tarpit for 8 to 20 s first.
-        ctx = asgi_app.public.state.ctx
-        await SettingsService(ctx.dbs.control, runtime=ctx.settings).update(
-            {"tarpit_enabled": 0}, Actor("admin", "test"), "no tarpit hold in this test"
-        )
+        assert isinstance(asgi_app, ListenerDispatcher)
+        public: Any = asgi_app.public
+        ctx = public.state.ctx
+        assert ctx.settings.bool("tarpit_enabled")  # the default: a probe on the public port would be held
         async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=str(socket_path))) as internal:
             version = await internal.get("http://roxy/internal/version")
             ready = await internal.get("http://roxy/internal/ready")
-        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as public:
+        # The public port answers `/internal` at once (the tarpit holds a probe 8 to 20 s, far past this timeout).
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as public:
             hidden = await public.get("/internal/version")
             home = await public.get("/")
         assert version.status_code == 200
         assert version.json()["Color"] == "dev"
         assert ready.status_code == 200
         assert hidden.status_code == 404
+        assert hidden.content == b'"Not Found"\n'
+        assert "roxy-refusal" not in hidden.headers
         assert home.status_code == 200
         assert "server" not in home.headers
     finally:
@@ -240,8 +261,41 @@ async def test_admin_guards_fail_closed(env: Any) -> None:
 
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        assert (await client.get("/admin/api/v1/probe")).status_code == 404
+        guarded = await client.get("/admin/api/v1/probe")
+        missing = await client.get("/admin/api/v1/not-a-route")
+        assert guarded.status_code == missing.status_code == 404
+        assert guarded.content == missing.content  # the fail-closed guard looks exactly like a missing route
+        assert missing.json() == {"error": {"code": "not_found", "message": "Not found.", "fields": {}}}
+        # Routes added after create_app win over the admin catch-all: the guard answers, not the 404.
         assert (await client.post("/admin/api/v1/write")).status_code == 403
+
+
+async def test_unknown_admin_paths_get_the_v1_not_found(env: Any) -> None:
+    """Plan 4.1 row 15 (v1 `admin_not_found`): an admin path nothing serves is 404 `"Not Found"` plus a newline,
+    for every method, and never a probe; real admin routes keep their answers (including 405 for another method)."""
+    app = create_app(env)
+    seen: list[Any] = []
+    app.state.error_hooks.add("client_error", seen.append)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        for method, path in (
+            ("GET", "/admin/does-not-exist"),
+            ("POST", "/admin/old/bookmark"),
+            ("DELETE", "/admin/"),
+            ("PROPFIND", "/admin/x"),
+            ("GET", "/admin/apix/v1"),
+        ):
+            response = await client.request(method, path)
+            assert response.status_code == 404, (method, path)
+            assert response.content == b'"Not Found"\n'
+            assert response.headers["content-type"] == "application/json"
+            assert response.headers["cache-control"] == "no-store"
+        api = await client.get("/admin/api/v1/no/such/endpoint")
+        assert api.status_code == 404
+        assert api.json() == {"error": {"code": "not_found", "message": "Not found.", "fields": {}}}  # DESIGN 13
+        assert (await client.request("PUT", "/admin/enroll")).status_code == 405  # a real route, another method
+    await asyncio.sleep(0)  # let any background hook task run
+    assert [event.path for event in seen] == ["/admin/enroll"]  # only the 405 is a client error, never the 404s
 
 
 def test_get_db_rejects_unknown_names() -> None:

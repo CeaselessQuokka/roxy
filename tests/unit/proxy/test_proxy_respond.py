@@ -143,6 +143,71 @@ def test_failure_text_is_never_prettified_or_wrapped(fakes: Any) -> None:
     assert rendered.content_type == "text/plain; charset=utf-8"
 
 
+@pytest.mark.parametrize("compat", [False, True])
+def test_internal_error_row_is_v1_jsonify(fakes: Any, compat: bool) -> None:
+    """v1 answered every unhandled error with `jsonify("Internal Server Error")` (plan 7.13 "as v1"): the same
+    bytes the unhandled error middleware sends, whatever compat says (the row is not collapsible)."""
+    rendered = respond.render(
+        fakes.make_req(prettyprint=True, is_browser=True),
+        respond.failure_result(ReasonCode.INTERNAL_ERROR),
+        compat_collapse=compat,
+    )
+    assert (rendered.status, rendered.body, rendered.content_type) == (
+        500,
+        b'"Internal Server Error"\n',
+        "application/json",
+    )
+    assert rendered.header("Retry-After") == "5"
+    assert rendered.header("Roxy-Refusal") is None
+
+
+ROBLOX_404_BODY = json.dumps({"errors": [{"code": 0, "message": "NotFound"}]}, separators=(",", ":")).encode()
+
+
+def test_r4_compat_collapse_keeps_robloxs_body_like_v1(fakes: Any) -> None:
+    """Spec review R4 (F8) and the lead decision: v1 (pipeline.md section 7 step 4, bug B1) sent a Roblox 404 to
+    the caller as 500 WITH Roblox's body, labeled application/json; compat mode reproduces exactly that."""
+    result = fakes.served(ROBLOX_404_BODY, status=404, reason=ReasonCode.UPSTREAM_4XX, content_type="application/json")
+    rendered = respond.render(fakes.make_req(), result, compat_collapse=True)
+    assert rendered.status == 500
+    assert rendered.body == ROBLOX_404_BODY
+    assert rendered.content_type == "application/json"
+    assert rendered.collapsed is True
+    assert rendered.header("Roxy-Upstream-Status") == "404"
+    assert rendered.header("Roxy-Refusal") is None
+    off = respond.render(fakes.make_req(), result, compat_collapse=False)  # D4, the default: the real status
+    assert (off.status, off.body, off.collapsed) == (404, ROBLOX_404_BODY, False)
+
+
+def test_compat_collapse_of_a_4xx_is_never_prettified_but_keeps_the_browser_view(fakes: Any) -> None:
+    """v1 pretty printed successes only, and showed every body (errors too) to a browser as escaped `<pre>`."""
+    result = fakes.served(ROBLOX_404_BODY, status=404, reason=ReasonCode.UPSTREAM_4XX)
+    pretty = respond.render(fakes.make_req(prettyprint=True), result, compat_collapse=True)
+    assert (pretty.status, pretty.body) == (500, ROBLOX_404_BODY)
+    browser = respond.render(fakes.make_req(is_browser=True), result, compat_collapse=True)
+    assert browser.status == 500
+    assert browser.content_type == "text/html; charset=utf-8"
+    assert browser.body == respond.html_pre(ROBLOX_404_BODY)
+    text = fakes.served(b"gone", status=410, reason=ReasonCode.UPSTREAM_4XX, content_type="text/plain")
+    replayed = respond.render(fakes.make_req(), text, compat_collapse=True)
+    assert (replayed.status, replayed.body, replayed.content_type) == (500, b"gone", "text/plain")  # row 4
+
+
+def test_compat_collapse_of_a_5xx_uses_the_failure_text(fakes: Any) -> None:
+    """Plan 7.13 compat note: a Roblox 5xx, 502 and 504 become 500 with `Upstream request failed; ...`."""
+    served_5xx = fakes.served(b'{"errors":[]}', status=503, reason=ReasonCode.UPSTREAM_4XX)
+    rendered = respond.render(fakes.make_req(), served_5xx, compat_collapse=True)
+    assert (rendered.status, rendered.body, rendered.content_type) == (
+        500,
+        respond.UPSTREAM_FAILED_TEXT.encode(),
+        "text/plain; charset=utf-8",
+    )
+    timeout = respond.render(
+        fakes.make_req(), respond.failure_result(ReasonCode.UPSTREAM_TIMEOUT), compat_collapse=True
+    )
+    assert (timeout.status, timeout.body) == (500, respond.UPSTREAM_FAILED_TEXT.encode())
+
+
 @pytest.mark.parametrize("status", [204, 304])
 def test_no_body_statuses(fakes: Any, status: int) -> None:
     rendered = respond.render(fakes.make_req(prettyprint=True, is_browser=True), fakes.served(body=b"", status=status))

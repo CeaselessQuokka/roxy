@@ -4,8 +4,8 @@ What this is
     Repository-level checks over deploy/**, scripts/smoke_remote.py, scripts/build_static.py and tests/deploy:
     every Python file opens with the four-part teaching docstring (plan P7) and every shell script with the same
     four parts as a comment, every env example line has its reason, nothing has an em or en dash or a British
-    spelling (plan C5, scripts/check_style.py), files have Unix line endings, the programs are executable, and
-    shellcheck finds nothing in the shell scripts.
+    spelling (plan C5, scripts/check_style.py), files have Unix line endings, the programs are executable (on disk
+    and as mode 100755 in the git index), and shellcheck finds nothing in the shell scripts.
 
 Why it exists
     Deploy files are read by the owner at 3 a.m. during an incident; the reason for each line has to be next to it.
@@ -103,6 +103,25 @@ def test_programs_are_executable() -> None:
     for path in EXECUTABLES:
         if path.is_file():
             assert os.access(path, os.X_OK), f"{path} must be executable (chmod 0755)"
+
+
+def test_programs_are_executable_in_the_git_index() -> None:
+    """The commit is what the server checks out, so the index must say 100755 too. An editor on Windows can save
+    the file without the bit, and a commit made from Windows git can record 100644 even when the Linux file is
+    0755; `git update-index --chmod=+x <path>` repairs the index without a commit."""
+    git = find_tool("git")
+    if git is None:
+        pytest.skip("git is not installed")
+    files = [str(path.relative_to(REPO)) for path in EXECUTABLES if path.is_file()]
+    result = subprocess.run(
+        [git, "ls-files", "-s", "--", *files], cwd=REPO, capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0:
+        pytest.skip(f"not a git work tree: {result.stderr.strip()[:200]}")
+    modes = {line.split("\t", 1)[1]: line.split()[0] for line in result.stdout.splitlines() if "\t" in line}
+    wrong = {name: mode for name, mode in modes.items() if mode != "100755"}
+    assert wrong == {}, f"index modes must be 100755 (git update-index --chmod=+x): {wrong}"
+    assert set(modes) <= set(files)  # untracked new programs are checked once they are added
 
 
 def test_style_check_passes() -> None:

@@ -5,8 +5,9 @@ What this is
     abuse pipeline, recorder) with `respx` playing Roblox, and make a shared database read-only while it serves.
     They check what C7 promises when shared state cannot be written: the credential is not used, the tarpit does
     not hold, the per-IP limiter falls back to `limit / workers` in memory, and metrics degrade open (keep serving,
-    flag the gap, write the numbers once the database is back). One test reproduces a finding and is marked
-    `xfail(strict=True)` with the finding id.
+    flag the gap, write the numbers once the database is back). Two tests reproduced findings of the review
+    (UP-COOLDOWN-LOST: `test_review_429_during_hot_outage_still_cools_down`; ALERT-CAP:
+    `test_review_readonly_hot_alert_cap_still_holds`); both are fixed, so no test here is marked `xfail` any more.
 
 Why it exists
     The package tests fake `SharedStateUnavailable` at one call site at a time. A read-only file fails every write
@@ -190,16 +191,14 @@ async def test_review_readonly_hot_credential_never_used(app: App) -> None:
     assert route.calls[0].request.headers.get("cookie") == f".ROBLOSECURITY={app.credential}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding UP-COOLDOWN-LOST: a 429 that arrives while hot.db cannot be written raises out of "
-    "UpstreamService._after_call before any cooldown is kept (not even the credential manager's local one), so "
-    "the next request after hot.db recovers goes to Roblox again inside its Retry-After",
-)
 @pytest.mark.parametrize("path", ["credential", "anonymous"])
 async def test_review_429_during_hot_outage_still_cools_down(app: App, path: str) -> None:
     """Plan 7.5 and 7.9: Roblox says 429 with Retry-After 60 at the moment hot.db becomes read-only. Once hot.db
-    is back (and long before 60 s passed), the endpoint must not be contacted again through that path."""
+    is back (and long before 60 s passed), the endpoint must not be contacted again through that path.
+
+    Finding UP-COOLDOWN-LOST (fixed): the cooldown used to be lost with the failed hot.db write. Now the caller
+    gets the cooldown answer, the worker keeps the cooldown in memory (upstream and credential manager), and the
+    next request shares it to hot.db for every worker before deciding, so it is refused with the time left."""
     calls: list[bool] = []
     hot = app.ctx.dbs.hot
 
@@ -219,7 +218,9 @@ async def test_review_429_during_hot_outage_still_cools_down(app: App, path: str
         # A POST is not cacheable here (cache_post_requests = allowlist), so no single-flight lease is involved.
         app.roblox.route(host=GAMES, path="/v1/games/multiget").mock(side_effect=answer)
         first = await app.post(f"/{GAMES}/v1/games/multiget", json.dumps({"ids": [1]}).encode())
-    assert first.status_code in (429, 503)
+    # The caller learns about the 429 (never `degraded`: Roblox did answer), with Roblox's own wait.
+    assert (first.status_code, first.headers.get("retry-after")) == (429, "60")
+    assert first.headers.get("roxy-refusal") == "upstream_cooldown"
     read_only(hot, False)
     app.clock.advance(5)  # 5 s later: still well inside Roblox's Retry-After of 60 s
     if path == "credential":
@@ -228,20 +229,31 @@ async def test_review_429_during_hot_outage_still_cools_down(app: App, path: str
         second = await app.post(f"/{GAMES}/v1/games/multiget", json.dumps({"ids": [1]}).encode())
     print(f"\n{path}: first {first.status_code}, second {second.status_code}, calls {calls}")
     assert len(calls) == 1, f"Roblox was called again inside its Retry-After: {calls}"
+    expected = (503, "credential_unavailable") if path == "credential" else (429, "upstream_cooldown")
+    assert (second.status_code, second.headers.get("roxy-refusal")) == expected
+    assert second.headers.get("retry-after") == "55"  # the cooldown's real remaining time
+    # hot.db took the cooldown when it came back, so every other worker honors it too.
+    egress = "credential" if path == "credential" else "direct"
+    template = f"{ECONOMY}{CURRENCY}" if path == "credential" else f"{GAMES}/v1/games/multiget"
+
+    def keys(conn: Any) -> set[str]:
+        return {row[0] for row in conn.execute("SELECT key FROM cooldown WHERE until_ms > ?", (app.clock.now_ms(),))}
+
+    shared = await hot.read(keys)
+    assert any(key.startswith("endpoint:") and key.endswith(f":{egress}") and template in key for key in shared)
+    if path == "credential":
+        assert "credential" in shared
 
 
 # -------------------------------------------------------------------------------------------------- alerts
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding ALERT-CAP: while hot.db cannot be written the notifier falls back to MemoryGate, which only "
-    "dedupes by cooldown key: the per-channel hourly cap (alert_rate_limit_per_hour) is not applied at all, and "
-    "each worker would send its own copies",
-)
 async def test_review_readonly_hot_alert_cap_still_holds(app: App) -> None:
-    """Plan 17.7: at most `alert_rate_limit_per_hour` messages per channel per hour (leak guard trips excepted).
-    With hot.db read-only, 25 distinct warning alerts must still produce at most 20 mails."""
+    """Finding ALERT-CAP (fixed). Plan 17.7: at most `alert_rate_limit_per_hour` messages per channel per hour
+    (leak guard trips excepted). With hot.db read-only every worker falls back to its in-memory gate, which keeps
+    the cap at its share (`cap // ROXY_WORKERS`), so 25 distinct alerts per worker on 2 workers still produce at
+    most `cap` mails for the fleet; dedupe becomes per worker (each worker may send one copy per cooldown key);
+    the next mail after the hour reports what was held back; a leak guard trip is never held back."""
     from pydantic import SecretStr
 
     from roxy.admin.auth.testing import RecordingTransport
@@ -249,24 +261,57 @@ async def test_review_readonly_hot_alert_cap_still_holds(app: App) -> None:
     from roxy.notify.mail import MailConfig, MailSender
     from roxy.notify.notifier import Notifier
 
-    transport = RecordingTransport()
+    workers = int(app.ctx.env.workers)
+    assert workers == 2
+    transport = RecordingTransport()  # one owner mailbox for the whole fleet
     config = MailConfig(to_addr="owner@example.invalid", from_addr="alerts@example.invalid", password=SecretStr("x"))
-    notifier = Notifier(
-        hot_db=app.ctx.dbs.hot,
-        settings=app.ctx.settings,
-        site_origin="http://localhost",
-        mail=MailSender(config, transport=transport),
-        webhook=None,
-        clock=app.clock,
-    )
+
+    def worker_notifier() -> Notifier:
+        return Notifier(
+            hot_db=app.ctx.dbs.hot,
+            settings=app.ctx.settings,
+            site_origin="http://localhost",
+            mail=MailSender(config, transport=transport),
+            webhook=None,
+            clock=app.clock,
+            workers=workers,
+        )
+
+    fleet = [worker_notifier() for _ in range(workers)]
     cap = int(app.ctx.settings.get("alert_rate_limit_per_hour"))
     read_only(app.ctx.dbs.hot, True)
-    for n in range(cap + 5):
+    for notifier in fleet:
+        for n in range(cap + 5):
+            alert = Alert(
+                type="error", severity="critical", subject=f"Roxy: review {n}", summary="x", cooldown_key=f"r:{n}"
+            )
+            await notifier.send(alert)
+    print(f"\ncap {cap}, workers {workers}, mails sent {len(transport.messages)}")
+    assert len(transport.messages) <= cap, "the fleet stays within alert_rate_limit_per_hour"
+    assert len(transport.messages) == workers * (cap // workers), "each worker used its whole share, no more"
+
+    # Per worker dedupe: inside the cooldown, a key every worker has already sent goes out from nobody.
+    for notifier in fleet:
+        again = Alert(type="error", severity="critical", subject="Roxy: again", summary="x", cooldown_key="r:0")
+        assert (await notifier.send(again)).skipped == "deduped"
+    transport.messages.clear()
+    app.clock.advance(3600)  # a new hourly window
+    # In the new window each worker sends again, and its first mail reports what its cap held back.
+    for notifier in fleet:
         await notifier.send(
-            Alert(type="error", severity="critical", subject=f"Roxy: review {n}", summary="x", cooldown_key=f"r:{n}")
+            Alert(type="error", severity="critical", subject="Roxy: new", summary="x", cooldown_key="n")
         )
-    print(f"\ncap {cap}, mails sent {len(transport.messages)}")
-    assert len(transport.messages) <= cap
+    new = [body for body in transport.bodies() if "Suppressed since last alert" in body]
+    assert new, transport.subjects()
+    assert sum(1 for s in transport.subjects() if s == "Roxy: new") == workers  # one copy per worker, at most
+
+    # The leak guard is never held back, even with every worker's cap used up.
+    for _ in range(cap):
+        await fleet[0].send(Alert(type="error", severity="critical", subject="Roxy: fill", summary="x"))
+    leak = await fleet[0].send(
+        Alert(type="leak_guard", severity="critical", subject="Roxy SECURITY: credential leak blocked", summary="x")
+    )
+    assert leak.sent == ("email",)
 
 
 # ------------------------------------------------------------------------------------------------- metrics

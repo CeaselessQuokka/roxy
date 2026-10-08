@@ -268,6 +268,26 @@ async def test_exit_ip_probe_errors_and_recent_ips(env: Any, dbs: Any, settings:
     assert parse_exit_ip(b"") == ("", "IP-echo response had no IP")
 
 
+@pytest.mark.parametrize("text", ["", "\n", "  \n\t\n"], ids=["empty", "newline", "blank"])
+async def test_an_empty_rotator_url_file_means_not_configured(
+    env: Any, dbs: Any, settings: Any, caplog: pytest.LogCaptureFixture, text: str
+) -> None:
+    """Lead notes: an EMPTY optional credential file (what the installer writes when the owner has no rotator) is
+    "not configured", never an error: no problem flag, no error log, the rotator simply is not a candidate."""
+    (env.credentials_dir / "rotator_url").write_text(text, encoding="utf-8")
+    pool, made = make_pool(env, dbs, settings)
+    with caplog.at_level("INFO", logger="roxy.egress.rotator"):
+        await pool.start()
+    assert not pool.configured()
+    assert pool.url_source() is None
+    assert pool.masked_url() == ""
+    assert pool.availability() == (False, "rotator_not_configured", None)
+    assert [record for record in caplog.records if record.levelname in ("ERROR", "CRITICAL")] == []
+    probe = await pool.exit_ip_probe()
+    assert (probe.configured, probe.error) == (False, "Rotation proxy is not configured.")
+    assert made == []
+
+
 async def test_failure_streak_parks_the_rotator_fleet_wide(env: Any, dbs: Any, settings: Any) -> None:
     settings.set("rotator_max_failures", 3)
     settings.set("rotator_cooldown_s", 60)

@@ -35,6 +35,12 @@ How it works
       header, never the body pages.
     - Disk health counts writes and failures per worker (parity row 64); `ok` turns true again after a later
       successful write, like v1.
+    - The service puts an entry in the memory tier before its caller is answered and writes the cache.db row
+      afterwards (`write_shared`, from the single-flight tail), so a locked cache.db never delays an answer.
+    - Single-flight handoff rows (key text ending in ` !flight`) carry an answer too big for the hot.db lease row
+      to followers in other workers. They are read by id without entering the memory tier (`read_handoff`),
+      are never a lookup result, live a few seconds, and are deleted with the other dead rows (`remove_dead`,
+      which also runs while the disk tier is switched off).
 
 What to read next
     `roxy/cache/service.py` (who calls what, and when), then `roxy/storage/db.py` (the threads behind
@@ -59,6 +65,7 @@ from typing import Any, Final
 
 import zstandard
 
+from roxy.cache.keys import HANDOFF_SUFFIX
 from roxy.core.clock import Clock
 from roxy.core.reasons import AuthClass
 from roxy.rules.match import compile_pattern, kind_of, normalize_glob, normalize_regex, validate_pattern
@@ -888,17 +895,20 @@ class SharedTier:
         return await self.db.read(run)
 
     async def spread_rows(self, max_rows: int) -> list[tuple[str, str, str, str | None, int, int]]:
-        """`(method, host, path, params_json, hits, bytes)` of up to `max_rows` content entries (no markers)."""
+        """`(method, host, path, params_json, hits, bytes)` of up to `max_rows` content entries (no markers, no
+        single-flight handoff rows: both repeat an entry's parameters and would count one key twice)."""
         sql = (
             f"SELECT method, host, path, params_json, hits, {SIZE_SQL} FROM entries "  # noqa: S608  # constants
-            "WHERE generation >= ? AND NOT (negative = 1 AND status = 429) ORDER BY rowid DESC LIMIT ?"
+            "WHERE generation >= ? AND NOT (negative = 1 AND status = 429) AND substr(key, -?) != ? "
+            "ORDER BY rowid DESC LIMIT ?"
         )
 
         def run(conn: sqlite3.Connection) -> list[tuple[str, str, str, str | None, int, int]]:
             floor, _stamp = _generation(conn)
+            params = (floor, len(HANDOFF_SUFFIX), HANDOFF_SUFFIX, max_rows)
             return [
                 (str(r[0]), str(r[1]), str(r[2]), r[3], int(r[4] or 0), int(r[5] or 0))
-                for r in conn.execute(sql, (floor, max_rows)).fetchall()
+                for r in conn.execute(sql, params).fetchall()
             ]
 
         return await self.db.read(run)
@@ -1037,9 +1047,28 @@ class CacheStore:
     async def put(self, entry: CacheEntry, *, disk: bool, compress: bool, req_body: bytes | None = None) -> bool:
         """Store in memory, and in cache.db when `disk`; True only when the cache.db write landed."""
         self.memory.put(entry)
-        if not disk or self.shared is None:
+        if not disk:
+            return False
+        return await self.write_shared(entry, compress=compress, req_body=req_body)
+
+    async def write_shared(self, entry: CacheEntry, *, compress: bool, req_body: bytes | None = None) -> bool:
+        """Write one row to cache.db only (the service already put the entry in memory before answering).
+        Never raises; False when there is no shared tier or the write failed (recorded in disk health)."""
+        if self.shared is None:
             return False
         return await self.shared.write(entry, compress=compress, req_body=req_body)
+
+    async def read_handoff(self, entry_id: str) -> CacheEntry | None:
+        """A single-flight handoff row straight from cache.db, never promoted into the memory tier (a big body
+        read once by followers must not push the hot entries out). None when missing or unreadable."""
+        if self.shared is None:
+            return None
+        try:
+            result = await self.shared.read([entry_id])
+        except (SharedStateUnavailable, sqlite3.Error) as exc:
+            self.shared.health.failed(f"{type(exc).__name__}: {exc}", self._clock.now(), read=True)
+            return None
+        return result.entries.get(entry_id)
 
     def record_hit(self, entry_id: str, now: float) -> None:
         self.hits.record(entry_id, int(now))
@@ -1118,10 +1147,17 @@ class CacheStore:
         """Delete rows whose stale window ended, then evict down to the budgets (one worker at a time)."""
         if self.shared is None:
             return EvictionReport()
-        dead = await self.shared.delete_where("stale_until <= ?", (int(now),))
+        dead = await self.remove_dead(now)
         report = await self.shared.evict(max_entries=max_entries, max_bytes=max_bytes, policy=policy, now=now)
         report.dead = dead
         return report
+
+    async def remove_dead(self, now: float) -> int:
+        """Delete rows whose stale window ended (expired entries, markers and single-flight handoff rows). Also run
+        while the disk tier is switched off, because handoff rows are still written then."""
+        if self.shared is None:
+            return 0
+        return await self.shared.delete_where("stale_until <= ?", (int(now),))
 
 
 __all__ = [

@@ -98,12 +98,16 @@ def test_live_limits_texts(catalog_get: Callable[..., Callable[[str], Any]]) -> 
     assert (limits.requests_per_window, limits.window_seconds, limits.flood_per_minute) == (10, 50, 300)
     assert limits.pace_seconds == "5"
     assert "every 5 seconds" in limits.pacing_rule
-    # Owner change 2026-10-07 (D10 reversed): cache hits count by default, and the page says why.
+    # Owner change 2026-10-07 (D10 reversed): every request counts by default, cached or not, and the page says
+    # why: a cache hit still costs Roxy CPU, memory and bandwidth, and one allowance per caller keeps Roxy fair.
     assert limits.cache_hits_count is True
-    assert "Every request counts toward this limit, including requests Roxy answers from its cache" in (
-        limits.cache_hits_rule
-    )
-    assert "it still costs Roxy" in limits.cache_hits_rule
+    assert limits.cache_hits_rule.startswith("Every request counts toward this limit, cached or not.")
+    assert pages.CACHE_HITS_WHY in limits.cache_hits_rule
+    for reason in ("CPU, memory and bandwidth", "one shared allowance per caller", "fair for everyone"):
+        assert reason in pages.CACHE_HITS_WHY
+    assert limits.cache_hits_faq.startswith("Every request counts toward your per-IP limit, cached or not")
+    assert pages.CACHE_HITS_WHY in limits.cache_hits_faq
+    assert "do not count" not in limits.cache_hits_rule + limits.cache_hits_faq
     assert "currently off" in limits.place_limit_rule
 
     other = pages.live_limits(
@@ -118,10 +122,12 @@ def test_live_limits_texts(catalog_get: Callable[..., Callable[[str], Any]]) -> 
     )
     assert other.pace_seconds == "2.5"
     assert "closes 10 seconds later" in other.pacing_rule
-    # An admin may still switch counting off; the sentence then says so, and that the flood limit still counts.
-    assert "do not count toward this limit right now" in other.cache_hits_rule
+    # An admin may still switch counting off; the sentences then say so, and that the flood limit still counts.
+    assert "Right now, requests Roxy answers from its cache do not count toward this limit" in other.cache_hits_rule
     assert "flood limit" in other.cache_hits_rule
-    assert "Every request counts" not in other.cache_hits_rule
+    assert "do not count toward your per-IP limit right now" in other.cache_hits_faq
+    assert "Every request counts" not in other.cache_hits_rule + other.cache_hits_faq
+    assert pages.CACHE_HITS_WHY not in other.cache_hits_rule + other.cache_hits_faq
     assert "1,500 requests per minute" in other.place_limit_rule
     assert "counted for each network its servers use" in other.place_limit_rule  # place_limit_key=place_prefix
     shared = pages.live_limits(catalog_get(place_limit_enabled=1, place_limit_key="place"))

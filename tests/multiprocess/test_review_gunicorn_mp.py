@@ -4,9 +4,10 @@ What this is
     Tests that run tests/multiprocess/review_gunicorn_driver.py inside `unshare -rn` (a namespace with nothing but
     loopback) and assert on the JSON it prints:
     - while another process holds hot.db's write lock, two real workers keep one client within the fleet limit
-      (C7 degraded share `limit / workers`), never send the credential, and (finding HOT-HOL) answer slowly;
-    - (finding SHUTDOWN-HOLD) a stop while the tarpit holds a request: gunicorn kills the worker after its 30 s
-      graceful timeout, so the lifespan shutdown (final metrics flush, leader lease release) never runs.
+      (C7 degraded share `limit / workers`), never send the credential, and (finding HOT-HOL, fixed) still answer
+      promptly;
+    - (finding SHUTDOWN-HOLD) a stop while the tarpit holds a request: the hold is woken and answered at once, and
+      the lifespan shutdown (final metrics flush, leader lease release) runs well before gunicorn's 30 s kill.
 
 Why it exists
     Plan 19.3 and 19.10 row 5 ("lifespan flushes on shutdown") need real workers: uvicorn's graceful wait, the
@@ -14,8 +15,8 @@ Why it exists
 
 How it works
     Same harness as tests/multiprocess/test_gunicorn_mp.py: fake credentials without the mail password and the
-    webhook, the driver in a private network namespace, one JSON object back. Tests that reproduce a finding are
-    `xfail(strict=True)` with the finding id in the reason.
+    webhook, the driver in a private network namespace, one JSON object back. Tests that reproduced a finding name
+    its id; both findings are fixed, so no test is marked `xfail` any more.
 
 What to read next
     tests/multiprocess/review_gunicorn_driver.py, roxy/worker.py, deploy/gunicorn.conf.py, roxy/abuse/tarpit.py.
@@ -110,30 +111,30 @@ def test_review_gunicorn_locked_hot_db_keeps_fleet_limits(tmp_path: Path, creden
 
 
 @pytest.mark.timeout(240)
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding HOT-HOL: with hot.db write-locked, 24 cache hits on 2 real workers take seconds each (every "
-    "abuse transaction waits its 0.5 s busy budget in turn on the single writer thread)",
-)
 def test_review_gunicorn_locked_hot_db_answers_stay_prompt(tmp_path: Path, credentials_dir: Path) -> None:
+    """Finding HOT-HOL (fixed in `storage/db.py`): with hot.db write-locked, 24 concurrent cache hits on 2 real
+    workers each wait at most about one 0.5 s abuse budget (a deadline from enqueue time), never 0.5 s per queued
+    job in turn, and the degraded limiter still holds one client to the fleet limit."""
     out = _run("hot_locked", tmp_path, credentials_dir, 2, timeout_s=220)
     assert out["answer_s"]["slowest"] < 2.0, out["answer_s"]
+    assert out["answer_s"]["median"] < 1.0, out["answer_s"]
+    assert out["one_client_admitted"] <= 10
 
 
 @pytest.mark.timeout(240)
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding SHUTDOWN-HOLD: uvicorn waits without limit for a tarpit-held connection (no "
-    "timeout_graceful_shutdown), gunicorn kills the worker after graceful_timeout (30 s), and the lifespan "
-    "shutdown (final metrics flush, leader lease release) never runs",
-)
 def test_review_gunicorn_stop_during_a_tarpit_hold_still_flushes(tmp_path: Path, credentials_dir: Path) -> None:
-    """Plan 19.10 row 5 ("lifespan flushes on shutdown"), 10.6 (holds up to 55 s) and deploy/gunicorn.conf.py
-    (graceful_timeout 30): a stop while one probe is held for 45 s must still end with the lifespan shutdown: every
-    answered request recorded, the held caller answered, the leader lease released."""
+    """Finding SHUTDOWN-HOLD (fixed). Plan 19.10 row 5 ("lifespan flushes on shutdown"), 10.6 (holds up to 55 s) and
+    deploy/gunicorn.conf.py (graceful_timeout 30): a stop while one probe is held for 45 s answers the held caller at
+    once with its normal refusal (the probe's 404 "Not a Roblox URL": `roxy.worker` calls `lifespan.begin_drain`
+    when shutdown starts, which wakes every hold through `Tarpit.wake_all`), then runs the lifespan shutdown well
+    inside gunicorn's graceful_timeout: every answered request recorded (the held one too), the leader lease
+    released. (If a hold were not woken, uvicorn's own wait is capped at 30 - 8 - 2 = 20 s: tests/unit/
+    test_worker_shutdown.py.)"""
     out = _run("shutdown_hold", tmp_path, credentials_dir, 1, timeout_s=220)
     assert out["answered_before_stop"] == 10
+    assert out["held_client_saw"].startswith("status 404"), out["held_client_saw"]
     assert out["lifespan_shutdown_ran"], out.get("log_tail", "")[-2000:]
     assert out["recorded"] == out["proxy_requests_sent"]
     assert out["leader_lease_released"]
-    assert out["held_client_saw"].startswith("status 404")
+    assert out["stop_code"] == 0, out.get("log_tail", "")[-2000:]
+    assert out["stop_s"] < 5.0, out["stop_s"]  # about as long as the requests in flight, not uvicorn's 20 s cap

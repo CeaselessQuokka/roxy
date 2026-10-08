@@ -15,10 +15,17 @@ Why it exists
 How it works
     - `prepare(req, facts)` returns None (nothing to do), a `Refuse` (a decision that needs no shared state: a
       ban, a probe, a block), or a `LimitSpec`. Preparing stops at the first `Refuse`: later checks cannot matter.
+      A check that matches admin patterns (`uses_patterns`: User-Agent rules, header filters, endpoint blocks and
+      rate rules, where an admin regex can cost up to the request's regex budget) may be prepared only after the
+      cheap limiters before it admitted the request (see `roxy/abuse/pipeline.py`).
     - The pipeline evaluates the collected `LimitSpec`s in order inside one transaction and stores a `LimitOutcome`
       per check in `TxState.outcomes`; the static refusal sits in `TxState.static`.
     - `check(req, tx)` turns that into the final `Refuse` (adding the per-IP header trio) or None. The first check
-      in position order that refuses decides the verdict.
+      in position order that refuses decides the verdict. A disguised static refusal (a ban, a spam flag, a header
+      filter without a message) is rendered again here with the client's real strikes and penalty, read by the
+      transaction, so it carries exactly what a genuine throttle refusal for that client would carry right now.
+    - Settings missing from the snapshot fall back to the catalog default (`Facts.setting`), never to a second,
+      inline copy of the default.
 
 What to read next
     `roxy/abuse/checks/__init__.py` (the ordered list), then `roxy/abuse/pipeline.py` (the transaction).
@@ -26,6 +33,7 @@ What to read next
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -45,9 +53,15 @@ from roxy.abuse.verdict import (
     Refuse,
 )
 from roxy.core.reasons import ReasonCode
+from roxy.core.scope import catalog_default
 from roxy.rules.store import RulesSnapshot
 
 Algo = Literal["gcra", "fixed", "cooldown", "per_ip"]
+
+
+def live_setting(values: Mapping[str, Any], key: str) -> Any:
+    """`values[key]`, or the catalog default when the snapshot lacks the key (never an inline second default)."""
+    return values[key] if key in values else catalog_default(key)
 
 
 @dataclass(slots=True)
@@ -69,6 +83,15 @@ class Facts:
     probe_signature: str | None = None
     score_cache: int | None = None
     pairs_cache: list[tuple[str, str]] | None = None
+
+    # `setting` and `flag` come first: below them `int`, `bool` and `str` name methods inside the class body.
+    def setting(self, key: str) -> Any:
+        """The live value, or the catalog default when the snapshot lacks the key (plan 15.1)."""
+        return live_setting(self.values, key)
+
+    def flag(self, key: str) -> bool:
+        """A 0/1 switch read like `setting` (catalog default when missing)."""
+        return bool(self.setting(key))
 
     def int(self, key: str, default: int = 0) -> int:
         value = self.values.get(key, default)
@@ -121,6 +144,7 @@ class TxState:
     static: dict[str, Refuse] = field(default_factory=dict)
     trio: tuple[int, int, bool] = (0, 0, False)  # (requests left, reset seconds, throttled) for headers
     strikes: int = 0  # the client's current (decayed) strikes, for disguised bodies
+    penalty_wait_ms: int = 0  # how long the client's current throttle penalty still runs (0: not penalized)
     degraded: bool = False
     stopped_at: str | None = None
     facts: Facts | None = None  # the request facts, for refusals that are rendered after the transaction
@@ -135,6 +159,8 @@ class Check:
     skipped_by_bypass: bool = False
     tarpit_category: str | None = None
     kind: Literal["static", "limiter", "marker"] = "static"
+    uses_patterns: bool = False
+    """True when `prepare` matches admin patterns (regex capable): deferred until the cheap limiters admit."""
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
         return None
@@ -143,6 +169,8 @@ class Check:
         refusal = tx.static.get(self.name)
         if refusal is None:
             return None
+        if refusal.disguised:
+            return redisguise(refusal, tx)
         return with_trio(refusal, tx)
 
     def describe(self) -> dict[str, Any]:
@@ -154,6 +182,7 @@ class Check:
             "kind": self.kind,
             "skipped_by_bypass": self.skipped_by_bypass,
             "tarpit_category": self.tarpit_category,
+            "uses_patterns": self.uses_patterns,
         }
 
 
@@ -189,6 +218,7 @@ def disguised_throttle(
     reason: ReasonCode,
     check: str,
     strikes: int = 0,
+    penalty_wait_ms: int = 0,
     tarpit_category: str | None,
     detail: str,
 ) -> Refuse:
@@ -197,18 +227,23 @@ def disguised_throttle(
     v1's disguised header filter: the rung message for the client's current strikes (rung 1 for a clean client), or
     the plain fallback text, with `Retry-After` and `Roxy-Throttle-Reset` equal to `throttle_reset_duration`.
     v2 also sends `Roxy-Requests-Left: 0` and `Roxy-Refusal: throttle`, exactly what a genuine throttle refusal
-    carries, so nothing in the response tells the client which rule caught it.
+    carries, so nothing in the response tells the client which rule caught it. A client whose throttle penalty is
+    still running (`penalty_wait_ms`) is told the time left on it, as a genuine refusal would tell it right now.
     """
     window = max(1, facts.int("throttle_reset_duration", 50))
+    retry, reset = window, window
+    if penalty_wait_ms > 0:
+        # The same rounding as `throttle.evaluate_per_ip` uses for a client that is still penalized.
+        retry, reset = max(1, math.ceil(penalty_wait_ms / 1000)), max(1, penalty_wait_ms // 1000)
     rung = rung_for(facts.ladder, max(1, strikes))
     text = rung.message.strip()
     source: MessageSource = "custom" if text else "default"
     if not text:
-        text = throttle_fallback(window, facts.int("allowed_requests_per_minute", 10))
+        text = throttle_fallback(reset, facts.int("allowed_requests_per_minute", 10))
     headers = {
-        H_RETRY_AFTER: str(window),
+        H_RETRY_AFTER: str(retry),
         H_REQUESTS_LEFT: "0",
-        H_THROTTLE_RESET: str(window),
+        H_THROTTLE_RESET: str(reset),
         H_THROTTLED: TRUE,
         H_REFUSAL: ReasonCode.THROTTLE.value,
     }
@@ -225,6 +260,25 @@ def disguised_throttle(
     )
 
 
+def redisguise(refusal: Refuse, tx: TxState) -> Refuse:
+    """A disguised refusal rendered again with the client's real strikes and penalty, read by the transaction.
+
+    Prepared refusals are built before the transaction runs, so they cannot know the client's ladder rung; this
+    is the same final step for every disguised refusal (bans, the deny list, spam flags, header filters).
+    """
+    if tx.facts is None:
+        return refusal  # no transaction facts (a test calling `check` directly): the prepared form stands
+    return disguised_throttle(
+        tx.facts,
+        reason=refusal.reason,
+        check=refusal.check,
+        strikes=tx.strikes,
+        penalty_wait_ms=tx.penalty_wait_ms,
+        tarpit_category=refusal.tarpit_category,
+        detail=refusal.detail,
+    )
+
+
 __all__ = [
     "Algo",
     "Check",
@@ -233,6 +287,8 @@ __all__ = [
     "LimitSpec",
     "TxState",
     "disguised_throttle",
+    "live_setting",
+    "redisguise",
     "refusal_headers",
     "trio_headers",
     "with_trio",

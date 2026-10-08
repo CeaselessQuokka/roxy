@@ -12,7 +12,8 @@ How it works
     v1 (which built them directly): `Roxy-Requests-Left` (the per-IP value), `Roxy-Throttle-Reset` (the rule window's
     remaining seconds), `Roxy-Throttled: True`, `Roxy-Endpoint-Limited: True`; v2 adds `Retry-After` (v1 bug B16:
     none, and "try again in 0 seconds" was possible). Tarpit category `endpoint_rule` with v1's reason
-    `Rate rule: <pattern>`. Bypass entries skip it.
+    `Rate rule: <pattern>`. Bypass entries skip it. A rule can be an admin regex (`uses_patterns`), so while regex
+    rules exist it is matched only for a request the cheap limiters admitted.
 
 What to read next
     `roxy/abuse/endpoint_rules.py`, then `roxy/abuse/pipeline.py`.
@@ -36,6 +37,7 @@ class EndpointRuleCheck(Check):
     kind = "limiter"
     skipped_by_bypass = True
     tarpit_category = "endpoint_rule"
+    uses_patterns = True
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
         if not facts.rules.endpoint_limits:

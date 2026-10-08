@@ -9,9 +9,9 @@ What this is
 
 Why it exists
     The package tests prove each mechanism on its own; these tests attack the seams between processes and the
-    failure paths (plan 19.3, C7). A test that reproduces a finding of the review is marked
-    `xfail(strict=True, reason="finding <id>: ...")`: it shows as XFAIL while the defect exists and fails as XPASS
-    once it is fixed, which tells the fixer to delete the marker.
+    failure paths (plan 19.3, C7). A test that reproduced a finding of the review names the finding id in its
+    docstring. Every such finding is fixed (wave 2 fix pass 1), so the tests run as ordinary tests that pin the
+    corrected behavior; none is marked `xfail` any more.
 
 How it works
     `_hold_hot_lock` (a child process) keeps hot.db write-locked until told to stop. Abuse, tarpit, cache and
@@ -173,15 +173,10 @@ def _pipeline(hot: Database, workers: int, limit: int = 10, window: int = 50) ->
 # ============================================================ C7: hot.db write-locked by another process
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding HOT-HOL: a short busy budget (TX_BUSY_TIMEOUT_MS 500) is spent per queued job on the single "
-    "writer thread and never opens the busy circuit, so N concurrent requests wait about N x 0.5 s before the C7 "
-    "fallback answers",
-)
 async def test_review_locked_hot_db_abuse_decisions_stay_prompt(paths: dict[str, str], procs: list[Any]) -> None:
     """C7: while another process holds hot.db, every request must still get its verdict promptly from the
-    per-worker degraded limiter. 16 requests arrive together (a modest burst for one worker)."""
+    per-worker degraded limiter. 16 requests arrive together (a modest burst for one worker). Finding HOT-HOL (fixed
+    in `storage/db.py`): a short busy budget is a deadline from enqueue time, so the queue cannot add N x 0.5 s."""
     lock = _lock_hot(procs, paths["hot"])
     hot = Database("hot", paths["hot"])
     pipeline = _pipeline(hot, workers=2)
@@ -200,6 +195,8 @@ async def test_review_locked_hot_db_abuse_decisions_stay_prompt(paths: dict[str,
     assert pipeline.degraded
     print(f"\nslowest verdict {max(finished):.2f} s, median {sorted(finished)[8]:.2f} s")
     assert max(finished) < 2.0, f"the last of 16 verdicts took {max(finished):.2f} s"
+    assert sorted(finished)[8] < 1.0, "the median verdict waited more than one 0.5 s budget"
+    assert hot.stats.deadline_failures >= 1  # the queued jobs gave up at their deadline instead of waiting in turn
 
 
 def _degraded_worker(hot_path: str, count: int, start: Any, out: Any) -> None:
@@ -243,17 +240,13 @@ def test_review_locked_hot_db_per_ip_limit_is_limit_over_workers_fleet_wide(
     assert sum(admitted for admitted, _, _ in results) <= 10
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding DEGRADED-REFILL: entering degraded mode starts every client from an empty in-memory row, so a "
-    "client that already used its whole allowance in hot.db gets limit / workers more per worker in the same "
-    "window (hot.db is still READABLE under a write lock, but the degraded walk never reads the shared row)",
-)
 async def test_review_entering_degraded_mode_does_not_refill_the_allowance(
     paths: dict[str, str], procs: list[Any]
 ) -> None:
     """C7 says the fallback is conservative. A client that sent its 10 allowed requests through hot.db must not be
-    admitted again inside the same 50 s window just because hot.db became write-locked."""
+    admitted again inside the same 50 s window just because hot.db became write-locked (finding DEGRADED-REFILL,
+    fixed: the degraded walk starts from the shared row, which stays readable under another process's write lock).
+    Concurrent requests of the client in one worker must not all start from that same row either."""
     hot = Database("hot", paths["hot"])
     pipeline = _pipeline(hot, workers=2)
     try:
@@ -263,6 +256,16 @@ async def test_review_entering_degraded_mode_does_not_refill_the_allowance(
         lock = _lock_hot(procs, paths["hot"])
         try:
             degraded = [isinstance(await pipeline.evaluate(_Req()), Allow) for _ in range(5)]
+            # A second client with half its allowance used in hot.db before the lock: 8 concurrent requests in
+            # degraded mode admit at most what is left of a 5-per-50 s share, never 5 more per request batch.
+            other = "198.51.100.77"
+        finally:
+            lock.stop()
+        for _ in range(5):
+            assert isinstance(await pipeline.evaluate(_Req(other)), Allow)
+        lock = _lock_hot(procs, paths["hot"])
+        try:
+            burst = await asyncio.gather(*(pipeline.evaluate(_Req(other)) for _ in range(8)))
         finally:
             lock.stop()
     finally:
@@ -270,6 +273,9 @@ async def test_review_entering_degraded_mode_does_not_refill_the_allowance(
     assert pipeline.degraded
     print(f"\nadmitted after the switch to degraded mode: {sum(degraded)} of 5")
     assert sum(degraded) == 0
+    admitted = sum(isinstance(verdict, Allow) for verdict in burst)
+    print(f"admitted in a concurrent degraded burst after 5 shared requests: {admitted} of 8")
+    assert admitted <= 2  # GCRA at 5 per 50 s from a row 5 requests deep (out of 10): at most 2 more fit
 
 
 async def test_review_locked_hot_db_tarpit_never_holds(paths: dict[str, str], procs: list[Any]) -> None:
@@ -432,7 +438,10 @@ class _CountingUpstream(FakeUpstream):
         self.calls_file = calls_file
         self.label = label
 
-    async def fetch(self, req: Any, *, priority: Any, stale_available: bool, purpose: str = "caller") -> Any:
+    async def fetch(
+        self, req: Any, *, priority: Any, stale_available: bool, purpose: str = "caller", lease: Any = None
+    ) -> Any:
+        await self.take_lease(lease)  # like the real upstream: the single-flight lease first, the call only if won
         fd = os.open(self.calls_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             os.write(fd, f"{self.label}\n".encode())
@@ -472,6 +481,9 @@ async def _flight_main(
 
         results = await asyncio.gather(*(one() for _ in range(3)))
         out.put(("done", label, results))
+        # A worker's graceful shutdown (lifespan close): the owner's store and outcome publish, which run after
+        # its own callers were answered, land before the process exits.
+        await service.close()
     finally:
         dbs.cache.close_sync()
         dbs.hot.close_sync()
@@ -487,11 +499,6 @@ def _collect(out: Any, kind: str, count: int, timeout: float = 90.0) -> list[tup
     return got
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding SF-NOSTORE: an owner answer that is neither stored nor small enough to share (NOSTORE) makes "
-    "every follower process compete again and call upstream itself, one process after another",
-)
 @pytest.mark.parametrize(
     "settings",
     [{"cache_max_body": 4096}, {"cache_disk_enabled": 0}],
@@ -500,9 +507,9 @@ def _collect(out: Any, kind: str, count: int, timeout: float = 90.0) -> list[tup
 def test_review_unstored_large_answer_costs_one_upstream_call(
     settings: dict[str, Any], paths: dict[str, str], procs: list[Any], tmp_path: Path
 ) -> None:
-    """Plan 6.9 and 19.2: N concurrent requests for one key over 4 processes cause exactly 1 upstream call, also
-    when the owner's 16 KiB answer cannot be stored in cache.db (too big for `cache_max_body`, or the shared tier
-    is off)."""
+    """Finding SF-NOSTORE, plan 6.9 and 19.2: N concurrent requests for one key over 4 processes cause exactly 1
+    upstream call, also when the owner's 16 KiB answer cannot be stored in cache.db (too big for
+    `cache_max_body`, or the shared tier is off): it reaches the other processes through a handoff row."""
     calls_file = str(tmp_path / "calls.txt")
     go, out = CTX.Event(), CTX.Queue()
     for index in range(4):
@@ -517,68 +524,98 @@ def test_review_unstored_large_answer_costs_one_upstream_call(
     print(f"\nupstream calls {len(calls)} for {len(results)} requests: {calls}")
     assert {status for _, status in results} == {200}
     assert len(calls) == 1
+    states = sorted(state for state, _ in results)
+    assert states == ["COALESCED"] * 11 + ["MISS"]  # every follower got the one answer, none fetched its own
+    conn = sqlite3.connect(paths["cache"])
+    try:  # the answer itself was never stored as a cache entry (only the short-lived handoff row exists)
+        rows = conn.execute("SELECT key FROM entries WHERE substr(key, -8) != ' !flight'").fetchall()
+    finally:
+        conn.close()
+    assert rows == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding SF-ORPHAN: when the owner cannot publish its outcome (hot.db busy for 1 s), its lease stays "
-    "live until the owner deadline (36 s by default), so every request for the key in that time follows a flight "
-    "that already ended: it waits for the expiry before a new flight starts, or gets 503 coalesce_timeout when its "
-    "own wait is shorter",
-)
 async def test_review_unpublished_outcome_does_not_block_the_key(paths: dict[str, str], procs: list[Any]) -> None:
-    """The owner's fetch finishes (Roblox failed) while another process holds hot.db for 2 s, so the owner's
-    outcome cannot be written into its lease row. A request for the same key after hot.db is free again must be
-    answered at once (a new flight or the owner's answer), not after the owner deadline."""
-    settings = {  # owner deadline 0.5 + 2 x 1 + 0.5 = 3 s, so the test stays short; production is 36 s
+    """Finding SF-ORPHAN. The owner's fetch finishes (Roblox failed) while another process holds hot.db for about
+    2 s, so the owner's outcome cannot be written into its lease row in time (its first publish attempt gives up
+    after 1 s, and the one second linger passes). The owner's caller is answered at once anyway. Once hot.db is
+    free, a new request for the key in the owner's worker AND one in another worker are answered at once (a new
+    flight, or the owner's outcome when its retried publish lands), never after the owner deadline and never with
+    503 coalesce_timeout; the other worker never calls upstream itself."""
+    settings = {  # owner deadline 0.5 + 10 x 1 + 0.5 = 11 s, and followers give up after 5 s: a regression fails fast
         "queue_wait_interactive_ms": 500,
-        "request_timeout": 2,
+        "request_timeout": 10,
         "upstream_max_attempts": 1,
         "backoff_cap_ms": 500,
+        "cache_coalesce_wait_ms": 5000,
     }
+
+    def failing(req: Any, n: int) -> Any:
+        return failure(ReasonCode.UPSTREAM_5XX, 503, retry_after_s=5)
+
+    def worker(name: str, upstream: FakeUpstream) -> tuple[CacheService, Any]:
+        dbs = SimpleNamespace(cache=Database("cache", paths["cache"]), hot=Database("hot", paths["hot"]))
+        service = CacheService(
+            dbs=dbs,
+            settings=FakeSettings(settings),
+            rules=StaticRules(),
+            clock=SystemClock(),
+            upstream=upstream,
+            worker_id=name,
+        )
+        return service, dbs
+
     gate = asyncio.Event()
-    upstream = FakeUpstream(lambda req, n: failure(ReasonCode.UPSTREAM_5XX, 503, retry_after_s=5), gate=gate)
-    dbs = SimpleNamespace(cache=Database("cache", paths["cache"]), hot=Database("hot", paths["hot"]))
-    service = CacheService(
-        dbs=dbs,
-        settings=FakeSettings(settings),
-        rules=StaticRules(),
-        clock=SystemClock(),
-        upstream=upstream,
-        worker_id="review-owner",
-    )
-    await service.start()
+    up_owner, up_other = FakeUpstream(failing, gate=gate), FakeUpstream(failing)
+    owner, owner_dbs = worker("review-owner", up_owner)
+    other, other_dbs = worker("review-other", up_other)
+
+    async def call(service: CacheService) -> Any:
+        req = make_request(TARGET)
+        return await service.serve(req, await service.peek(req))
+
+    await owner.start()
+    await other.start()
     try:
-        first_req = make_request(TARGET)
-        first = asyncio.ensure_future(service.serve(first_req, await service.peek(first_req)))
-        await asyncio.wait_for(upstream.started.wait(), 10)  # the owner holds the lease and is "fetching"
+        first = asyncio.ensure_future(call(owner))
+        await asyncio.wait_for(up_owner.started.wait(), 10)  # the owner holds the lease and is "fetching"
         lock = _lock_hot(procs, paths["hot"])
-        gate.set()
-        answer = await asyncio.wait_for(first, 20)  # its publish waits 1 s for hot.db, then gives up
-        assert answer.status == 503
-        lock.stop()
-        second_req = make_request(TARGET)
+        released = False
+        try:
+            gate.set()
+            opened = time.monotonic()
+            answer = await asyncio.wait_for(first, 20)
+            answered_after = time.monotonic() - opened
+            assert answer.status == 503
+            await asyncio.sleep(2.0)  # hot.db stays locked: the first publish attempt fails, the linger ends
+            lock.stop()
+            released = True
+        finally:
+            if not released:
+                lock.stop()
         started = time.monotonic()
-        second = await service.serve(second_req, await service.peek(second_req))
+        mine, theirs = await asyncio.gather(call(owner), call(other))
         waited = time.monotonic() - started
     finally:
-        await service.close()
-        await dbs.cache.close()
-        await dbs.hot.close()
-    print(f"\nsecond request: {second.status} {second.reason.value} after {waited:.2f} s")
-    assert second.reason is not ReasonCode.COALESCE_TIMEOUT
-    assert waited < 1.0
+        for service, dbs in ((owner, owner_dbs), (other, other_dbs)):
+            await service.close()
+            await dbs.cache.close()
+            await dbs.hot.close()
+    print(
+        f"\nowner answered after {answered_after:.2f} s; then {mine.reason.value} and {theirs.reason.value} after "
+        f"{waited:.2f} s; publish retries {owner.flights.stats.publish_retries}"
+    )
+    assert answered_after < 1.0  # the owner's caller never waits for the publish
+    assert mine.reason is not ReasonCode.COALESCE_TIMEOUT
+    assert theirs.reason is not ReasonCode.COALESCE_TIMEOUT
+    assert (mine.status, theirs.status) == (503, 503)
+    assert waited < 1.5
+    assert up_other.count == 0  # the other worker followed (the retried outcome, or the owner's new flight)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding CACHE-WAIT: the single-flight owner awaits the cache.db write before its caller gets the "
-    "Roblox answer, and each queued write spends its 2 s busy budget in turn, so with cache.db write-locked the "
-    "k-th of N concurrent misses waits about k x 2 s for a disposable cache",
-)
 async def test_review_locked_cache_db_does_not_delay_answers(paths: dict[str, str], procs: list[Any]) -> None:
-    """Plan 6.1 and C7 (the cache is disposable): while another process holds cache.db's write lock, 6 concurrent
-    misses on different keys must still get Roblox's answer promptly; only the caching of it may fail."""
+    """Finding CACHE-WAIT, plan 6.1 and C7 (the cache is disposable): while another process holds cache.db's write
+    lock, 6 concurrent misses on different keys still get Roblox's answer promptly; only the caching of it fails,
+    after the answer, and every failed write is counted. The worker keeps serving the answers from memory."""
     upstream = FakeUpstream()  # answers at once
     dbs = SimpleNamespace(cache=Database("cache", paths["cache"]), hot=Database("hot", paths["hot"]))
     service = CacheService(
@@ -594,22 +631,37 @@ async def test_review_locked_cache_db_does_not_delay_answers(paths: dict[str, st
     started = time.monotonic()
     times: list[float] = []
 
-    async def one(n: int) -> int:
-        req = make_request(f"games.roblox.com/v1/games/votes?universeIds={500 + n}")
+    def target(n: int) -> str:
+        return f"games.roblox.com/v1/games/votes?universeIds={500 + n}"
+
+    async def one(n: int) -> Any:
+        req = make_request(target(n))
         result = await service.serve(req, await service.peek(req))
         times.append(time.monotonic() - started)
-        return result.status
+        return result
 
     try:
-        statuses = await asyncio.gather(*(one(n) for n in range(6)))
+        try:
+            results = await asyncio.gather(*(one(n) for n in range(6)))
+            await asyncio.sleep(3.0)  # cache.db stays locked past every write's 2 s budget: all six writes fail
+        finally:
+            lock.stop()
+        await service.settle()
+        again = await one(0)
+        failures = service.stats.store_failures
+        disk = service.disk_status()
     finally:
-        lock.stop()
         await service.close()
         await dbs.cache.close()
         await dbs.hot.close()
-    print(f"\nanswers after {sorted(round(t, 2) for t in times)} s")
-    assert statuses == [200] * 6
-    assert max(times) < 1.0
+    print(f"\nanswers after {sorted(round(t, 2) for t in times[:6])} s; failed writes {failures}")
+    assert [result.status for result in results] == [200] * 6
+    assert max(times[:6]) < 1.0
+    assert upstream.count == 6
+    assert failures == 6  # counted, never the caller's problem
+    assert disk["Failures"] == 6
+    assert again.cache_state.value == "HIT"  # still served from this worker's memory tier
+    assert upstream.count == 6
 
 
 # ============================================================================== 7.10: breakers are fleet-wide

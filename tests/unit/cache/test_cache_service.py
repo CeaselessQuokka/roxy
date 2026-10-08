@@ -47,9 +47,13 @@ def make_service(
 
 
 async def call(service: CacheService, target: str = VOTES, **kwargs: Any) -> ServeResult:
+    """One request, then wait for its background cache.db write and outcome publish (the caller never waits for
+    those; the tests settle so the next step sees cache.db as a later request would)."""
     req = make_request(target, **kwargs)
     peek = await service.peek(req)
-    return await service.serve(req, peek)
+    result = await service.serve(req, peek)
+    await service.settle()
+    return result
 
 
 @pytest.fixture

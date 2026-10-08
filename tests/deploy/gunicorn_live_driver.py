@@ -233,9 +233,13 @@ def scenario_sockets(work: Path, credentials: Path) -> dict[str, Any]:
     out["ready_body"] = blue.ready()
     out["internal_socket_mode"] = mode(blue.socket)
     out["control_socket_mode"] = mode(blue.run_dir / "gunicorn.ctl")
-    # A fresh worker's first request warms caches and compiles rules, so these get the smoke test's 20 s timeout.
-    status, detail = request(http.client.HTTPConnection("127.0.0.1", blue.port, timeout=20), "GET", "/internal/version")
+    # The public app answers /internal itself, at once (never the proxy pipeline, whose probe tarpit holds 8 to
+    # 20 s), so 5 s is plenty even for a fresh worker's first request.
+    started = time.monotonic()
+    status, detail = request(http.client.HTTPConnection("127.0.0.1", blue.port, timeout=5), "GET", "/internal/version")
+    out["tcp_internal_version_seconds"] = round(time.monotonic() - started, 3)
     out["tcp_internal_version"], out["tcp_internal_version_detail"] = status, detail[:300]
+    # A fresh worker's first page request warms caches and compiles rules: the smoke test's 20 s timeout.
     out["tcp_home"] = request(http.client.HTTPConnection("127.0.0.1", blue.port, timeout=20), "GET", "/")[0]
     out["uds_version"] = request(UnixHTTPConnection(str(blue.socket)), "GET", "/internal/version")
     out["stats"] = blue.ctl("show stats")

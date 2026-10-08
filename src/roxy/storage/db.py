@@ -30,7 +30,16 @@ How it works
       N x 5 s. When a write gives up after the full `busy_timeout`, the database is marked busy for
       `BUSY_CIRCUIT_COOLDOWN_S`: jobs that reach the writer during that time fail at once, and the first job
       after it is the probe that waits the full timeout again. So no caller waits much longer than one
-      `busy_timeout`. A caller on a hot path can also pass a shorter `busy_timeout_ms` to `write`.
+      `busy_timeout`.
+    - A caller on a hot path passes a shorter `busy_timeout_ms` to `write`, and that budget is a DEADLINE measured
+      from the moment the job is queued, not a wait that starts when the writer thread reaches the job. Head of
+      line blocking is the reason: a short budget that restarted per job would make the Nth of N queued hot-path
+      writes wait N x the budget while another process holds the lock (and a 5 s job ahead of it would add 5 s
+      more). So the writer gives a job only what is left of its budget as SQLite's busy timeout, fails a job whose
+      deadline already passed without running it, and the waiting coroutine stops waiting at its deadline: if the
+      job has not started it is canceled (it never runs) and the caller gets `SharedStateUnavailable`; if it is
+      already running, its own busy timeout (the remaining budget) ends it within moments, commit or rollback,
+      so a caller is never told "unavailable" about a write that later commits.
     - Every queue is bounded (plan P9): when more than `MAX_PENDING_JOBS` operations are waiting, new ones fail
       fast with `SharedStateUnavailable` instead of piling up memory.
     - `write_sync` and `read_sync` do the same work on the calling thread, for scripts, migrations and tests.
@@ -306,6 +315,7 @@ class _Job:
     future: concurrent.futures.Future[Any]
     begin: str
     busy_ms: int | None = None  # a shorter busy_timeout for this one job (writer only), None for the profile's
+    deadline: float | None = None  # monotonic time by which a `busy_ms` job must be done waiting (queue included)
 
 
 @dataclass(slots=True)
@@ -320,6 +330,7 @@ class DbStats:
     last_write_ms: float = 0.0
     reconnects: int = 0
     fast_failures: int = 0  # writes refused at once by the busy circuit
+    deadline_failures: int = 0  # hot-path writes whose budget ran out while they waited in the queue
 
 
 class _ConnectionThread(threading.Thread):
@@ -361,6 +372,16 @@ class _ConnectionThread(threading.Thread):
                 db.stats.fast_failures += 1
                 db.stats.unavailable += 1
                 raise SharedStateUnavailable(db.name, f"database is busy (retrying in {remaining:.1f} s)")
+        busy_ms = job.busy_ms
+        if self.role == "writer" and job.deadline is not None and busy_ms is not None:
+            # The budget counts from enqueue time (module docstring): the queue wait is already spent.
+            left_ms = (job.deadline - time.monotonic()) * 1000
+            if left_ms <= 0:
+                db.stats.deadline_failures += 1
+                db.stats.unavailable += 1
+                raise SharedStateUnavailable(db.name, f"write budget of {busy_ms} ms ran out in the queue")
+            # Rounded up to 10 ms, so an uncontended queue (a fraction of a millisecond) keeps the same PRAGMA value.
+            busy_ms = max(1, min(busy_ms, -(-int(left_ms) // 10) * 10))
         if self._conn is None:
             try:
                 self._conn = connect(db.path, db.profile, self.role)
@@ -369,7 +390,7 @@ class _ConnectionThread(threading.Thread):
             self._busy_ms = db.profile.busy_timeout_ms
         full_wait = job.busy_ms is None or job.busy_ms >= db.profile.busy_timeout_ms
         if self.role == "writer":
-            self._set_busy_timeout(db.profile.busy_timeout_ms if job.busy_ms is None else job.busy_ms)
+            self._set_busy_timeout(db.profile.busy_timeout_ms if busy_ms is None else busy_ms)
         try:
             result = db._transact(self._conn, job.fn, job.begin, self.role)
         except SharedStateUnavailable as exc:
@@ -455,12 +476,17 @@ class Database:
         `fn`, never return a cursor). Exceptions roll the transaction back and are re-raised here. Busy, locked
         and I/O errors become `SharedStateUnavailable`. If the awaiting coroutine is canceled before the job
         starts, it never runs; once it started it finishes (commit or rollback), so it is never half applied.
-        `busy_timeout_ms` waits at most that long for another process's lock instead of the profile's 5 s, for a
-        hot path that has a better fallback than waiting (it never opens the busy circuit).
+        `busy_timeout_ms` is a total budget for a hot path that has a better fallback than waiting: measured from
+        this call, it covers the wait in this process's queue AND the wait for another process's lock (instead of
+        the profile's 5 s per job). When it runs out before the job started, the job is canceled and this raises
+        `SharedStateUnavailable` (see the module docstring). A short budget never opens the busy circuit.
         """
         if busy_timeout_ms is not None and busy_timeout_ms < 0:
             raise ValueError("busy_timeout_ms must not be negative")
-        return await self._submit(self._write_q, fn, "BEGIN IMMEDIATE" if immediate else "BEGIN", busy_timeout_ms)
+        deadline = None if busy_timeout_ms is None else time.monotonic() + busy_timeout_ms / 1000
+        return await self._submit(
+            self._write_q, fn, "BEGIN IMMEDIATE" if immediate else "BEGIN", busy_timeout_ms, deadline
+        )
 
     async def read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         """Run `fn(conn)` on a reader thread inside one read transaction (one consistent snapshot)."""
@@ -484,6 +510,7 @@ class Database:
         fn: Callable[[sqlite3.Connection], T],
         begin: str,
         busy_ms: int | None = None,
+        deadline: float | None = None,
     ) -> T:
         future: concurrent.futures.Future[T] = concurrent.futures.Future()
         # Checking `_closed` and enqueuing happen under one lock that close() also takes (see __init__). The lock
@@ -493,12 +520,38 @@ class Database:
                 raise SharedStateUnavailable(self.name, "database is closed")
             self._start_threads_locked()
             try:
-                jobs.put_nowait(_Job(fn, future, begin, busy_ms))
+                jobs.put_nowait(_Job(fn, future, begin, busy_ms, deadline))
             except queue.Full:
                 self.stats.unavailable += 1
                 raise SharedStateUnavailable(self.name, "too many pending operations") from None
-        # wrap_future moves the result from the worker thread back onto this event loop safely.
-        return await asyncio.wrap_future(future)
+        # wrap_future moves the result from the worker thread back onto this event loop safely. Canceling the
+        # awaiting coroutine cancels the wrapper, which cancels a job that has not started (it never runs).
+        waiter = asyncio.wrap_future(future)
+        if deadline is None:
+            return await waiter
+        return await self._await_until(waiter, future, deadline, busy_ms)
+
+    async def _await_until(
+        self,
+        waiter: asyncio.Future[T],
+        future: concurrent.futures.Future[T],
+        deadline: float,
+        busy_ms: int | None,
+    ) -> T:
+        """Wait for a budgeted job; at its deadline cancel it if it has not started (module docstring)."""
+        try:
+            # asyncio.wait (unlike wait_for) does not cancel the job when the time is up: we decide below.
+            await asyncio.wait({waiter}, timeout=max(0.0, deadline - time.monotonic()))
+        except asyncio.CancelledError:
+            waiter.cancel()  # the caller went away: a job that has not started must never run
+            raise
+        if not waiter.done() and future.cancel():
+            # Still queued behind other jobs: it never runs, so "unavailable" is exactly what happened.
+            self.stats.deadline_failures += 1
+            self.stats.unavailable += 1
+            raise SharedStateUnavailable(self.name, f"write budget of {busy_ms} ms ran out in the queue")
+        # Done, or already running with only what was left of the budget as its busy timeout: it ends promptly.
+        return await waiter
 
     def _start_threads_locked(self) -> None:
         """Start the writer and reader threads on first use. The caller holds `_start_lock`."""

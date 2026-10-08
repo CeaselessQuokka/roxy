@@ -150,6 +150,21 @@ def test_directory_walk_skips_v1_and_generated_dirs(cs: ModuleType) -> None:
     assert "src/roxy/core/redact.py" in files
 
 
+def test_directory_walk_skips_only_the_vendored_third_party_libraries(cs: ModuleType) -> None:
+    """Lead decision (spec review F6, C5 exception): vendored libraries are copied byte for byte and never
+    rewritten, so a directory walk skips exactly those two directories, each with its reason in the source; every
+    file of ours next to them is still scanned."""
+    vendored = ("src/roxy/static/vendor", "tests/e2e/vendor")
+    for path in vendored:
+        assert path in cs.SKIPPED_RELATIVE_PATHS
+    files = {cs._relative(p) for p in cs.iter_files([REPO / "src", REPO / "tests"])}
+    for path in vendored:
+        assert not any(f.startswith(path + "/") for f in files), path
+    source = (REPO / "scripts" / "check_style.py").read_text(encoding="utf-8")
+    assert '"tests/e2e/vendor",  # axe-core' in source  # the stated reason stays next to the entry
+    assert any(f.startswith("tests/e2e/") for f in files)  # our own browser tests are still checked
+
+
 def test_default_tree(cs: ModuleType) -> None:
     defaults = {p.name for p in cs.default_paths()}
     assert {"src", "tests", "scripts"} <= defaults

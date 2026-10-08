@@ -9,7 +9,8 @@ Why it exists
 
 How it works
     A v1 fixed window per client key (`tall:<limit_key>`) evaluated in the single hot.db transaction; a refusal counts
-    nothing. Body: the switch's reason or `Service down for maintenance.` (v1). Headers as v1: the per-IP trio, then
+    nothing. Body: the switch's reason or the pause default, the live `pause_message_default` setting (v1 used its
+    one downtime constant for both, B6/B13; the catalog default is that constant). Headers as v1: the per-IP trio, then
     `Roxy-Throttle-Reset` set to the emergency window's remaining seconds and `Roxy-Global-Throttled: True`
     (`Roxy-Throttled` stays the per-IP value, v1 B7). v2 adds `Retry-After` (v1 bug B8). Tarpit category
     `throttle_all`. Bypass entries skip it.
@@ -23,7 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 from roxy.abuse.checks.base import Check, Facts, LimitSpec, TxState, refusal_headers, with_trio
-from roxy.abuse.messages import REASON_GLOBAL
+from roxy.abuse.messages import DEFAULT_DOWNTIME_MESSAGE, REASON_GLOBAL
 from roxy.abuse.throttle_all import KEY_PREFIX
 from roxy.abuse.verdict import TRUE, Refuse
 from roxy.core.reasons import ReasonCode
@@ -51,7 +52,9 @@ class ThrottleAllCheck(Check):
         outcome = tx.outcomes.get(self.name)
         if outcome is None or outcome.admitted:
             return None
-        text, source = outcome.spec.payload.message()
+        text, source = outcome.spec.payload.message(
+            tx.facts.setting("pause_message_default") if tx.facts is not None else DEFAULT_DOWNTIME_MESSAGE
+        )
         refusal = Refuse(
             status=429,
             body=text,

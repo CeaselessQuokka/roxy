@@ -110,6 +110,7 @@ class RouteRequest:
     credential_rule: CredentialRule | None = None  # the allowlist row the request matched (None: not allowlisted)
     credential_usable: bool = False  # credential enabled, active, not cooling down (checked by the caller)
     credential_rejected: bool = False
+    credential_cooldown_s: float = 0.0  # the credential manager's own cooldown (it may know one hot.db does not)
     routing_mode: str | None = None  # the matching routing rule's mode
     direct_weight: float = 100.0
     rotator_weight: float = 0.0
@@ -197,7 +198,7 @@ def _credential_decision(route: RouteRequest, state: EgressAvailability | None) 
             cooldown_source="breaker",
             note="credential breaker open",
         )
-    cooldown = state.cooldown_s if state is not None else 0.0
+    cooldown = max(state.cooldown_s if state is not None else 0.0, route.credential_cooldown_s)
     return RouteDecision(
         None,
         reason=ReasonCode.CREDENTIAL_UNAVAILABLE,

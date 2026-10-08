@@ -3,8 +3,10 @@
 What this is
     Small pure functions that turn text which might contain a secret into text that cannot: `mask_token` and
     `masked_url` (the short labels v1 showed for tokens and proxy URLs), `redact_headers`, `redact_query`,
-    `redact_text`, and `fingerprint` (a keyed hash that identifies a secret without revealing it). Plus
-    `SecretRegistry`, the process-wide list of secret values that must never be printed anywhere.
+    `redact_text`, `redact_label` (the same scrub for short caller-supplied texts that repeat, such as endpoint
+    templates and place ids, with a bounded memory of answers), and `fingerprint` (a keyed hash that identifies a
+    secret without revealing it). Plus `SecretRegistry`, the process-wide list of secret values that must never be
+    printed anywhere.
 
 Why it exists
     Plan 9.15 and C2 item 8: the Roblox credential, the rotator password, session ids, CSRF tokens, TOTP and
@@ -31,6 +33,8 @@ How it works
     decoded text holds something secret, the decoded text is what gets redacted and returned.
     The registry is copy on write: writers build a new immutable snapshot under a lock, readers (the logging filter,
     on any thread) just read the current snapshot, so logging never waits on a lock.
+    Text that never passes through the log filter (metric dimensions, Live rows, event columns, hot.db keys) is
+    scrubbed where it is made: `redact_label` for short repeated values, `redact_text` for the rest.
 
 What to read next
     `roxy/core/logging.py` (the filter that applies `redact_text` to every log record), then
@@ -429,6 +433,60 @@ def redact_path(path: str) -> str:
     """A request path safe to log or store: secret path segments (the kill-switch token) masked, secrets
     scrubbed."""
     return redact_text(path)
+
+
+LABEL_CACHE_ENTRIES = 4096
+"""Distinct labels `redact_label` remembers (plan P9); the whole memory is dropped when it is full."""
+
+LABEL_CACHE_MAX_CHARS = 512
+"""Longer texts are redacted every time and never remembered (they are not labels, and they would cost memory)."""
+
+
+class _LabelCache:
+    """`redact_text` answers for short texts that repeat, valid for one registry snapshot.
+
+    The memory is a pair (snapshot, answers) swapped as one object, so a thread that sees a new snapshot starts an
+    empty memory and can never read an answer computed before a secret was registered (that answer could miss the
+    new secret). Lookups and inserts are single dict operations, atomic under the GIL, so no lock is needed.
+    """
+
+    def __init__(self, entries: int) -> None:
+        self._entries = max(1, entries)
+        self._state: tuple[_Snapshot, dict[str, str]] = (_EMPTY_SNAPSHOT, {})
+
+    def redact(self, text: str) -> str:
+        if len(text) > LABEL_CACHE_MAX_CHARS:
+            return redact_text(text)
+        snapshot = SecretRegistry.snapshot()
+        state = self._state
+        if state[0] is not snapshot:
+            state = (snapshot, {})
+            self._state = state
+        answers = state[1]
+        cleaned = answers.get(text)
+        if cleaned is None:
+            cleaned = redact_text(text)
+            if len(answers) >= self._entries:
+                answers.clear()  # bounded: forgetting only costs a recomputation
+            answers[text] = cleaned
+        return cleaned
+
+
+_LABELS = _LabelCache(LABEL_CACHE_ENTRIES)
+
+
+def redact_label(text: str) -> str:
+    """`redact_text` for caller-supplied labels that repeat: endpoint templates, hosts, place ids, reason names.
+
+    Such a text becomes a metric dimension, a Live row field, an event column or part of a hot.db key, where the
+    log filter never sees it, so it must be scrubbed exactly like a log line (plan C1, 9.15): a credential piece a
+    caller put in a path segment or in the `Roblox-Id` header must never be stored. The answer for an ordinary
+    label is the label itself, unchanged. Answers are remembered per registry snapshot (`_LabelCache`), so the
+    request path pays one dict lookup for a label it has seen before.
+    """
+    if not text:
+        return text
+    return _LABELS.redact(text)
 
 
 def redact_query(query: str) -> str:

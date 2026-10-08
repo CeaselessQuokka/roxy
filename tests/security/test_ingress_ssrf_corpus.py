@@ -386,16 +386,12 @@ def test_property_redirect_check_agrees_with_httpx(location: str) -> None:
 # --- the upstream layer's redirect helper on a malformed Location -----------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ingress finding: upstream/service.py _redirect_url calls urljoin() unguarded; a Location such as `//[` "
-        "raises ValueError, which aborts the attempt after Roblox answered (no _after_call bookkeeping) and turns "
-        "the caller's answer into a logged 500 internal_error"
-    ),
-)
-@pytest.mark.parametrize("location", ["//[", "https://[x/", "http://[::1"])
+@pytest.mark.parametrize("location", ["//[", "https://[x/", "http://[::1", "https://games.roblox.com:99999/x"])
 def test_malformed_redirect_location_is_refused_not_raised(location: str) -> None:
+    """Ingress finding (fixed): `_redirect_url` used to call urljoin() unguarded, so a Location such as `//[`
+    raised after Roblox answered, skipping the call's bookkeeping and answering 500. It is now "do not follow";
+    the service relays Roblox's own 3xx (`tests/unit/upstream/test_upstream_service.py`
+    `test_malformed_redirect_location_is_answered_not_raised` runs the whole fetch)."""
     service = object.__new__(UpstreamService)  # the helper reads only its arguments
     call = SimpleNamespace(
         method="GET",

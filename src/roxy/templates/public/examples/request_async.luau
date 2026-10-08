@@ -23,8 +23,8 @@ export type GamesResponse = {
 }
 
 -- Header names can arrive in any letter case, so compare them in lower case.
-local function getHeader(headers: { [string]: string }, name: string): string?
-	local wanted = string.lower(name)
+const function getHeader(headers: { [string]: string }, name: string): string?
+	const wanted = string.lower(name)
 	for key, value in headers do
 		if string.lower(key) == wanted then
 			return value
@@ -35,16 +35,16 @@ end
 
 -- Retry-After when it is a usable number, otherwise the fallback, plus random jitter, so that many
 -- servers told to wait do not all come back at the same moment.
-local function retryWaitSeconds(headers: { [string]: string }): number
-	local retryAfter = tonumber(getHeader(headers, "Retry-After"))
-	local seconds = if retryAfter and retryAfter >= 0 then retryAfter else FALLBACK_WAIT_SECONDS
+const function retryWaitSeconds(headers: { [string]: string }): number
+	const retryAfter = tonumber(getHeader(headers, "Retry-After"))
+	const seconds = if retryAfter and retryAfter >= 0 then retryAfter else FALLBACK_WAIT_SECONDS
 	return seconds + math.random() * MAX_JITTER_SECONDS
 end
 
-local function fetchGame(universeId: number): GameDetails?
-	local url = `{ROXY_URL}games.roblox.com/v1/games?universeIds={universeId}`
+const function fetchGame(universeId: number): GameDetails?
+	const url = `{ROXY_URL}games.roblox.com/v1/games?universeIds={universeId}`
 	for attempt = 1, MAX_ATTEMPTS do
-		local sent, response = pcall(function()
+		const sent, response = pcall(function()
 			return HttpService:RequestAsync({ Url = url, Method = "GET" })
 		end)
 		if not sent then
@@ -54,16 +54,17 @@ local function fetchGame(universeId: number): GameDetails?
 		end
 
 		if response.StatusCode == 200 then
-			local decoded, games = pcall(function(): GamesResponse
+			-- JSONDecode returns `any`: the return type names the shape, and the check confirms it before use.
+			const decoded, games = pcall(function(): GamesResponse
 				return HttpService:JSONDecode(response.Body or "")
 			end)
-			if not decoded then
-				warn("The answer was not valid JSON:", games)
+			if not decoded or typeof(games) ~= "table" or typeof(games.data) ~= "table" then
+				warn("The answer was not the JSON this script expects")
 				return nil
 			end
 			return games.data[1] -- nil when no experience has this universe id
 		elseif response.StatusCode == 429 or response.StatusCode == 503 then
-			local waitSeconds = retryWaitSeconds(response.Headers)
+			const waitSeconds = retryWaitSeconds(response.Headers)
 			if attempt == MAX_ATTEMPTS or waitSeconds > MAX_WAIT_SECONDS then
 				warn(`Roxy asked to wait {math.ceil(waitSeconds)} seconds; giving up for now`)
 				return nil
@@ -78,7 +79,7 @@ local function fetchGame(universeId: number): GameDetails?
 	return nil
 end
 
-local details = fetchGame(UNIVERSE_ID)
+const details = fetchGame(UNIVERSE_ID)
 if details then
 	print(`{details.name}: {details.playing} playing, {details.visits} visits`)
 end

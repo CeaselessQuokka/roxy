@@ -19,8 +19,10 @@ How it works
     - The recorder appends each entry to the ring and queues it as a `live` event, at most
       `LIVE_EVENTS_PER_SECOND` per worker (plan 14.11: sampled above 50 per second); entries beyond that stay in
       the ring and are counted as sampled out, so the database write rate stays bounded during a flood.
-    - Live rows hold no bodies and no headers (those are in captures, when captured); the URL, query, User-Agent
-      and upstream error are redacted.
+    - Live rows hold no bodies and no headers (those are in captures, when captured); every caller-supplied
+      field is scrubbed like a log line: the URL, query, User-Agent and upstream error with `redact_text`, the
+      template, host and place id with `redact_label` (a credential piece in a path segment or in the
+      `Roblox-Id` header must not reach the Live feed, plan C1 and 9.15).
     - `EventTail.poll_once` reads at most `batch` rows with `id > last_id` in one read transaction. Each
       subscriber has a bounded queue (plan P9); a slow subscriber loses its oldest items and the loss is counted
       and reported to it, instead of growing memory.
@@ -43,7 +45,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from roxy.core.redact import redact_query, redact_text
+from roxy.core.redact import redact_label, redact_query, redact_text
 
 if TYPE_CHECKING:
     from roxy.metrics.recorder import OutcomeEvent
@@ -79,13 +81,13 @@ def live_entry(ev: OutcomeEvent, capture_id: str = "") -> dict[str, Any]:
         "method": ev.method[:12],
         "url": redact_text(url)[:MAX_URL_CHARS],
         "query": redact_query(ev.query)[:MAX_QUERY_CHARS] if ev.query else "",
-        "template": ev.endpoint_template,
-        "host": ev.host,
+        "template": redact_label(ev.endpoint_template),
+        "host": redact_label(ev.host),
         "status": int(ev.status),
         "outcome": str(ev.outcome),
         "reason": str(ev.reason),
         "source": str(ev.source),
-        "place": ev.place_id,
+        "place": redact_label(ev.place_id) if ev.place_id else ev.place_id,
         "user_agent": redact_text(ev.user_agent)[:MAX_UA_CHARS] if ev.user_agent else "",
         "upstream_status": ev.upstream_status,
         "egress": str(ev.egress),

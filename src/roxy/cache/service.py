@@ -2,9 +2,12 @@
 
 What this is
     `CacheService` (DESIGN 11.2), one per worker at `ctx.cache`. `peek(req)` reads the memory tier and cache.db
-    (never upstream) so the throttle can tell cache hits apart (plan D10). `serve(req, peek)` returns a
-    `ServeResult` for every `Roxy-Cache` state. `purge(scope, actor)` removes entries fleet-wide (plan 6.5, 6.8).
-    `start()` adds the per-worker loops (generation watch, hit flush, eviction) and `close()` flushes.
+    (never upstream) and marks `req.fresh_cache_hit`, which the abuse checks use only when an admin turned
+    `throttle_count_cache_hits` off (cache hits count toward the per-IP limit by default: plan D10 as the Roxy
+    owner reversed it on 2026-10-07) or `cache_serve_throttled` on. `serve(req, peek)` returns a `ServeResult`
+    for every `Roxy-Cache` state. `purge(scope, actor)` removes entries fleet-wide (plan 6.5, 6.8). `start()`
+    adds the per-worker loops (generation watch, hit flush, eviction) and `close()` lets pending stores land, then
+    flushes.
 
 Why it exists
     The cache is Roxy's strongest defense against Roblox rate limits: it is the only control that works however
@@ -23,12 +26,24 @@ How it works
     - Expired within the stale window while the upstream reports the endpoint cooling down or its breaker
       open: `STALE` without contacting Roblox (`Roxy-Upstream-Cooldown`).
     - Otherwise one fleet single-flight fetch (interactive priority, or the shorter "stale available" class).
-      The owner stores the answer (`store_decision`) and answers `MISS`; followers get `COALESCED` (the stored
-      entry, or the owner's shared answer); a failure with a stale entry becomes `STALE` (`cache_stale_error`,
+      The single-flight lease rides in the upstream's bucket reservation transaction (`lease=`, plan 6.3 and
+      7.3); a lost lease (`SingleFlightLost`) makes this request a follower. The owner answers `MISS` as soon as
+      Roblox answered: the entry goes into this worker's memory tier at once, and the cache.db write (bounded:
+      at most `MAX_PENDING_WRITES` at a time, failures and skips counted) happens afterwards in the flight's
+      background tail, so a locked cache.db never delays a caller (C7, the cache is disposable). Followers get
+      `COALESCED` (the stored entry, or the owner's shared answer: inline in the lease row when small, else in a
+      short-lived cache.db handoff row); a failure with a stale entry becomes `STALE` (`cache_stale_error`,
       `stale_after_failure`); a follower whose wait ends gets the stale entry or 503 `coalesce_timeout` with
       the owner's remaining deadline as Retry-After. Followers never call upstream after an owner failure.
     Every refetch of a key that had a body before feeds `change_observations` (identical body or not) for TTL
-    tuning (F10). An answer fetched with the credential is never stored or shared under an anonymous key.
+    tuning (F10). An answer fetched with the credential belongs to its own request alone (plan 6.9, C2): when the
+    upstream used the credential for a key that is not a credential key (the rules moved between the peek and the
+    routing), the answer is never stored, never handed to a follower in this worker or another (they compete
+    again and make their own call), and never served stale or by a refresh.
+    Pattern matching runs under `roxy.rules.match.regex_budget` (plan 9.9): the policy lookup in `peek` (cache
+    rules and the credential allowlist), the availability check and every upstream call made for a request, so a
+    stored slow regex costs at most the budget, never one timeout per rule. Budgets nest: inside the router's
+    request budget these blocks spend from it instead of starting their own.
 
 What to read next
     `roxy/cache/keys.py`, `roxy/cache/policy.py`, `roxy/cache/store.py`, `roxy/upstream/singleflight.py` and
@@ -40,15 +55,17 @@ from __future__ import annotations
 import contextlib
 import copy
 import dataclasses
+import functools
 import inspect
 import logging
 import math
+import sqlite3
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
 
-from roxy.cache.keys import MARKER_SUFFIX, VARY_HEADERS, CacheKey, assert_forward_list, build_key
+from roxy.cache.keys import HANDOFF_SUFFIX, MARKER_SUFFIX, VARY_HEADERS, CacheKey, assert_forward_list, build_key
 from roxy.cache.policy import CacheSettings, RequestPolicy, StoreDecision, StoreKind, request_policy, store_decision
 from roxy.cache.spread import DEFAULT_MAX_ROWS, SpreadGroup, compute_spread, rows_from_db, thresholds
 from roxy.cache.store import CacheEntry, CacheStore, EvictionReport, PurgeScope
@@ -56,16 +73,21 @@ from roxy.cache.swr import SwrRefresher
 from roxy.config.constants import CACHE_PAGE_MAX
 from roxy.core.clock import Clock
 from roxy.core.reasons import AuthClass, CacheState, Egress, Outcome, ReasonCode, Source
+from roxy.rules.match import regex_budget
 from roxy.rules.store import RulesSnapshot
 from roxy.storage import leases
 from roxy.storage.db import SharedStateUnavailable
+from roxy.upstream.buckets import LeaseHook
 from roxy.upstream.messages import BUSY_MESSAGE, MESSAGE_CONTENT_TYPE
 from roxy.upstream.queue import Priority
+from roxy.upstream.service import SingleFlightLost
 from roxy.upstream.singleflight import (
     SHARE_BODY_MAX,
+    Deferred,
     FlightOutcome,
     FlightResult,
     FlightStart,
+    LeaseLost,
     OutcomeKind,
     Role,
     SingleFlight,
@@ -87,6 +109,15 @@ MAX_FLIGHT_ROUNDS: Final = 2
 DETACHED_GRACE_S: Final = 5.0
 PASS_HEADERS: Final = ("retry-after", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset")
 """Upstream response headers kept in a `ServeResult` (the plan 9.13 outbound allowlist, `proxy/scrub.py`)."""
+MAX_PENDING_WRITES: Final = 32
+"""cache.db writes one worker keeps waiting at once (plan P9). They run after the caller was answered; beyond
+this a store is skipped and counted (`store_skipped`), so a locked cache.db cannot pile up bodies in memory."""
+HANDOFF_BODY_MAX: Final = 8 * 1024 * 1024
+"""Largest answer passed to followers in other workers through a cache.db handoff row (the top of the
+`cache_max_body` range). Bigger answers publish `nostore` and those followers compete again."""
+HANDOFF_TTL_S: Final = 10
+"""How long a handoff row is kept: followers read it within the outcome's one second linger; the maintenance
+pass deletes it once this has passed."""
 
 
 class RulesProvider(Protocol):
@@ -176,6 +207,14 @@ class CacheStats:
     evictions: int = 0
     dead_removed: int = 0
     purges: int = 0
+    private: int = 0
+    """Credential answers for a non-credential key, kept to their own request (plan 6.9)."""
+    store_failures: int = 0
+    """cache.db writes that failed after the caller was answered (the answer itself was never affected)."""
+    store_skipped: int = 0
+    """cache.db writes skipped because `MAX_PENDING_WRITES` were already waiting."""
+    handoffs: int = 0
+    """Answers too big for the lease row, passed to other workers through a cache.db handoff row."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +239,21 @@ class _OwnerValue:
     entry: CacheEntry | None
     decision: StoreDecision | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    private: bool = False
+    """The answer belongs to the owner's own request (`_private_to`): never handed to a follower."""
+
+
+def _private_to(result: Any, key: CacheKey) -> bool:
+    """True when `result` was fetched with the credential for a key that is not a credential key.
+
+    The upstream routes with its own read of the rules, so an allowlist row added (or a regex timing out
+    differently) between `peek` and the fetch can send an anonymous key's request with the credential. Such an
+    answer is its own request's alone (plan 6.9, C2): never stored, coalesced or stale-served to anyone else.
+    """
+    return (
+        AuthClass(getattr(result, "auth_class", AuthClass.ANON)) is AuthClass.CRED
+        and key.auth_class is not AuthClass.CRED
+    )
 
 
 class _LazyUpstream:
@@ -317,6 +371,7 @@ class CacheService:
         self.flights = SingleFlight(self._hot, clock, worker_id)
         self.swr = SwrRefresher(tasks, lambda: self._cs().swr_max_inflight)
         self.stats = CacheStats()
+        self._pending_writes = 0  # cache.db writes waiting right now (bounded by MAX_PENDING_WRITES)
         self._cs_cache: tuple[Any, CacheSettings] | None = None
         # Plan 9.13: every forwarded caller header must vary the key. Checked once, at startup.
         forward = forwarded_headers if forwarded_headers is not None else _scrub_forward_list()
@@ -350,12 +405,18 @@ class CacheService:
         self._tasks.start("cache_maintenance", self.maintain, interval_s=MAINTENANCE_CHECK_S, run_immediately=False)
 
     async def close(self) -> None:
-        """Flush buffered hits (shutdown) and stop any flight still running."""
-        await self.flush()
+        """Shutdown: give pending stores and outcome publishes a moment to land, stop any flight still running,
+        then flush buffered hits (their rows now exist)."""
         await self.flights.close()
+        await self.flush()
 
     async def flush(self) -> int:
         return await self.store.flush()
+
+    async def settle(self, timeout_s: float = 10.0) -> None:
+        """Wait (at most `timeout_s`) until every answered request's cache.db write and outcome publish are done.
+        Requests never wait for this; tests and admin views that read cache.db right after a request do."""
+        await self.flights.settle(timeout_s)
 
     # ---- settings and rules ----
 
@@ -377,12 +438,20 @@ class CacheService:
 
     async def peek(self, req: Any) -> CachePeek:
         """Memory tier, then cache.db; never upstream (DESIGN 11.1 step 3). Sets `req.cache_key` and
-        `req.fresh_cache_hit`. A broken cache.db read is a miss, never an error."""
+        `req.fresh_cache_hit`. A broken cache.db read is a miss, never an error.
+
+        The router runs this before the abuse verdict only when a check reads `fresh_cache_hit`
+        (`throttle_count_cache_hits` off or `cache_serve_throttled` on), else after an Allow. Either way the
+        pattern matches share one `regex_budget` (plan 9.9; the router's request budget when it opened one). A
+        cache rule or allowlist match cut off by the budget counts as no match (no rule, anonymous), which only
+        ever grants less.
+        """
         cs = self._cs()
         now = self._clock.now()
         snapshot = self._snapshot()
         headers = getattr(req, "headers", None) or {}
-        policy = request_policy(req.method, _target_of(req), headers, cs, snapshot)
+        with regex_budget():
+            policy = request_policy(req.method, _target_of(req), headers, cs, snapshot)
         if not policy.cacheable:
             self._mark(req, None, False)
             return CachePeek(key=None, policy=policy, now=now, generation=self.store.floor)
@@ -483,8 +552,23 @@ class CacheService:
         return await self._fetch(req, peek, cs, stale)
 
     async def _fetch_uncached(self, req: Any) -> ServeResult:
-        result = await self._upstream.fetch(req, priority=Priority.INTERACTIVE, stale_available=False, purpose="caller")
+        result = await self._call_upstream(req, priority=Priority.INTERACTIVE, stale_available=False, purpose="caller")
         return self._from_upstream(result, CacheState.OFF, None)
+
+    async def _call_upstream(
+        self, req: Any, *, priority: Priority, stale_available: bool, purpose: str, lease: LeaseHook | None = None
+    ) -> Any:
+        """One upstream fetch. The single-flight lease hook (when this request competes for one) goes into the
+        upstream's reservation transaction; a lost lease becomes `LeaseLost` for the flight to follow the winner.
+        The upstream's allowlist and routing matches share one regex budget (plan 9.9)."""
+        extra: dict[str, Any] = {"lease": lease} if lease is not None else {}
+        try:
+            with regex_budget():
+                return await self._upstream.fetch(
+                    req, priority=priority, stale_available=stale_available, purpose=purpose, **extra
+                )
+        except SingleFlightLost as exc:
+            raise LeaseLost(str(exc)) from exc
 
     async def _cooldown_remaining(self, req: Any) -> int | None:
         """Seconds until the endpoint can be asked again when the upstream says no egress is available now."""
@@ -492,7 +576,8 @@ class CacheService:
         if not callable(check):
             return None
         try:
-            info = check(req)
+            with regex_budget():  # availability matches the credential allowlist (plan 9.9)
+                info = check(req)
             if inspect.isawaitable(info):
                 info = await info
         except Exception:
@@ -516,17 +601,22 @@ class CacheService:
         if remaining is not None:
             wait_s = max(0.0, min(wait_s, remaining - FOLLOWER_DEADLINE_HEADROOM_S))
 
-        async def fetch(start: FlightStart) -> tuple[_OwnerValue, FlightOutcome]:
+        async def fetch(start: FlightStart) -> tuple[_OwnerValue, FlightOutcome | Deferred]:
             if start.takeover:
                 # The previous owner may have stored the answer before it died or gave up: never call twice.
                 now = self._clock.now()
                 existing = await self.store.get(key.id, now=now, disk=cs.disk_enabled)
-                if existing is not None and existing.is_fresh(now) and existing.auth_class == key.auth_class:
-                    return _OwnerValue(None, existing), self._stored_outcome(existing)
-            result = await self._upstream.fetch(
-                req, priority=priority, stale_available=stale is not None, purpose="caller"
+                if (
+                    existing is not None
+                    and existing.is_fresh(now)
+                    and existing.auth_class == key.auth_class
+                    and not existing.is_marker
+                ):
+                    return _OwnerValue(None, existing), self._existing_outcome(key, existing, cs)
+            result = await self._call_upstream(
+                req, priority=priority, stale_available=stale is not None, purpose="caller", lease=start.lease
             )
-            return await self._absorb(req, peek, result, cs)
+            return self._absorb(req, peek, result, cs)
 
         for _round in range(MAX_FLIGHT_ROUNDS):
             flight = await self.flights.run(
@@ -535,6 +625,7 @@ class CacheService:
                 owner_deadline_s=cs.owner_deadline_s,
                 wait_s=wait_s,
                 enabled=peek.policy.coalesce,
+                hooked=True,
             )
             served = await self._serve_flight(flight, key, stale)
             if served is not None:
@@ -562,7 +653,9 @@ class CacheService:
             return self._timeout_result(key, flight.retry_after_s or 1)
         outcome = flight.outcome
         if value is not None:  # a follower of an owner in this process: use its objects directly
-            if value.entry is not None:
+            if value.private or (value.result is not None and _private_to(value.result, key)):
+                return None  # the owner's credential answer is its own (plan 6.9): compete again, fetch our own
+            if value.entry is not None and value.entry.auth_class == key.auth_class:
                 self.stats.coalesced += 1
                 return self._from_entry(value.entry, CacheState.COALESCED, ReasonCode.CACHE_COALESCED, now)
             if value.result is not None:
@@ -588,10 +681,16 @@ class CacheService:
             self.stats.coalesced += 1
             return self._from_entry(entry, CacheState.COALESCED, ReasonCode.CACHE_COALESCED, now)
         if outcome.kind is OutcomeKind.SHARED and outcome.status is not None:
+            body = outcome.body
+            if not body and outcome.entry_id is not None:  # too big for the lease row: read the handoff row
+                handoff = await self.store.read_handoff(outcome.entry_id)
+                if handoff is None or handoff.auth_class != key.auth_class or handoff.stored_at != outcome.stored_at:
+                    return None  # gone (purged) or replaced by a newer flight: one more flight
+                body = handoff.body
             return self._from_shared(
                 key,
                 outcome.status,
-                outcome.body,
+                body,
                 outcome.content_type,
                 outcome.reason or ReasonCode.UPSTREAM_OK.value,
                 outcome.upstream_status,
@@ -604,22 +703,24 @@ class CacheService:
 
     # ---- the owner's work ----
 
-    async def _absorb(
+    def _absorb(
         self, req: Any, peek: CachePeek, result: Any, cs: CacheSettings
-    ) -> tuple[_OwnerValue, FlightOutcome]:
-        """Store what should be stored (policy), record change observations, and say what followers get."""
+    ) -> tuple[_OwnerValue, FlightOutcome | Deferred]:
+        """Decide what to keep (policy), put it in this worker's memory tier, record change observations, and
+        hand the flight a `Deferred` outcome whose `finish` (run after the caller was answered) writes cache.db
+        and says what followers in other workers get. No I/O here: the owner's answer never waits for cache.db."""
         key = peek.key
         if key is None:  # owners always have a key
             raise RuntimeError("a cache owner needs a cache key")
+        if _private_to(result, key):
+            self.stats.private += 1
+            return _OwnerValue(result, None, None, private=True), FlightOutcome(OutcomeKind.PRIVATE)
         decision = store_decision(result, peek.policy, cs)
         now = self._clock.now()
         entry: CacheEntry | None = None
-        stored = False
         if decision.kind is not StoreKind.NONE:
             entry = self._make_entry(key, peek.policy, result, decision, now, peek.generation)
-            body = getattr(req, "body", None) or b""
-            req_body = body if key.method == "POST" and body and decision.kind is StoreKind.ENTRY else None
-            stored = await self.store.put(entry, disk=cs.shared_tier_on, compress=cs.compress, req_body=req_body)
+            self.store.memory.put(entry)  # this worker serves it at once; the cache.db row follows in the tail
             if decision.kind is StoreKind.MARKER:
                 self.stats.markers += 1
             else:
@@ -628,7 +729,146 @@ class CacheService:
         elif decision.skipped:
             self.stats.skipped += 1
         content = entry if entry is not None and decision.kind is not StoreKind.MARKER else None
-        return _OwnerValue(result, content, decision), self._outcome_for(result, key, content, stored)
+        body = getattr(req, "body", None) or b""
+        req_body = body if key.method == "POST" and body and decision.kind is StoreKind.ENTRY else None
+        finish = functools.partial(self._finish, key, result, entry, content is not None, req_body, cs, peek.generation)
+        return _OwnerValue(result, content, decision), Deferred(finish)
+
+    async def _finish(
+        self,
+        key: CacheKey,
+        result: Any,
+        entry: CacheEntry | None,
+        is_content: bool,
+        req_body: bytes | None,
+        cs: CacheSettings,
+        generation: int,
+    ) -> FlightOutcome:
+        """The owner's tail: write the cache.db row, then say what followers in other workers get."""
+        attempted = stored = False
+        if entry is not None and cs.shared_tier_on:
+            attempted = True
+            stored = await self._write_shared(entry, cs.compress, req_body)
+        if is_content and entry is not None and stored:
+            return self._stored_outcome(entry)
+        return await self._share(
+            key,
+            status=int(result.status),
+            reason=ReasonCode(result.reason).value,
+            body=bytes(result.body or b""),
+            content_type=result.content_type,
+            upstream_status=result.upstream_status,
+            retry_after_s=_seconds(result.retry_after_s),
+            cooldown_s=_seconds(result.cooldown_s),
+            egress=str(getattr(result, "egress", "") or ""),
+            generation=generation,
+            cs=cs,
+            handoff_ok=not (attempted and not stored),  # cache.db just refused a write: do not wait on it again
+        )
+
+    async def _share(
+        self,
+        key: CacheKey,
+        *,
+        status: int,
+        reason: str,
+        body: bytes,
+        content_type: str | None,
+        upstream_status: int | None,
+        retry_after_s: int | None,
+        cooldown_s: int | None,
+        egress: str,
+        generation: int,
+        cs: CacheSettings,
+        handoff_ok: bool,
+    ) -> FlightOutcome:
+        """An answer that is not (or not yet) a cache.db entry, as a `shared` outcome: the body inline when it
+        fits the lease row, else in a handoff row (finding SF-NOSTORE: followers never compete again only because
+        an answer was big or the disk tier is off). `nostore` only when even the handoff row cannot be written."""
+        fields: dict[str, Any] = {
+            "status": status,
+            "reason": reason,
+            "content_type": content_type,
+            "upstream_status": upstream_status,
+            "retry_after_s": retry_after_s,
+            "cooldown_s": cooldown_s,
+        }
+        if len(body) <= SHARE_BODY_MAX:
+            return FlightOutcome(OutcomeKind.SHARED, body=body, **fields)
+        if handoff_ok and len(body) <= HANDOFF_BODY_MAX:
+            handoff = self._handoff_entry(key, status, body, content_type, egress, generation)
+            if await self._write_shared(handoff, cs.compress, None):
+                self.stats.handoffs += 1
+                return FlightOutcome(OutcomeKind.SHARED, entry_id=handoff.id, stored_at=handoff.stored_at, **fields)
+        return FlightOutcome(OutcomeKind.NOSTORE, status=status, reason=reason)
+
+    async def _write_shared(self, entry: CacheEntry, compress: bool, req_body: bytes | None) -> bool:
+        """One cache.db write after the caller was answered, bounded by `MAX_PENDING_WRITES` per worker. A skip
+        or a failure is counted; the answer was already served either way."""
+        if self.store.shared is None:
+            return False
+        if self._pending_writes >= MAX_PENDING_WRITES:
+            self.stats.store_skipped += 1
+            return False
+        self._pending_writes += 1
+        try:
+            written = await self.store.write_shared(entry, compress=compress, req_body=req_body)
+        finally:
+            self._pending_writes -= 1
+        if not written:
+            self.stats.store_failures += 1
+        return written
+
+    def _handoff_entry(
+        self, key: CacheKey, status: int, body: bytes, content_type: str | None, egress: str, generation: int
+    ) -> CacheEntry:
+        """The short-lived row that carries a big answer to followers in other workers (never a lookup result:
+        its id is `key.handoff_id`, it is already expired, and it is negative so nothing serves it as content)."""
+        now = int(self._clock.now())
+        return CacheEntry(
+            id=key.handoff_id,
+            key=key.text + HANDOFF_SUFFIX,
+            auth_class=key.auth_class,
+            method=key.method,
+            host=key.host,
+            path=key.path,
+            status=status,
+            body=body,
+            content_type=content_type,
+            stored_at=now,
+            expires_at=now,
+            stale_until=now + HANDOFF_TTL_S,
+            ttl=0,
+            params=key.params,
+            stripped=key.stripped,
+            egress=egress or None,
+            negative=True,
+            generation=generation,
+        )
+
+    def _existing_outcome(self, key: CacheKey, entry: CacheEntry, cs: CacheSettings) -> FlightOutcome | Deferred:
+        """What followers get when a takeover found the answer already cached: the cache.db entry when the shared
+        tier holds it, else the entry itself shared like a fresh answer (it may live only in this worker's memory)."""
+        if cs.shared_tier_on:
+            return self._stored_outcome(entry)
+        reason = ReasonCode.UPSTREAM_4XX if 400 <= entry.status < 500 else ReasonCode.UPSTREAM_OK
+        return Deferred(
+            functools.partial(
+                self._share,
+                key,
+                status=entry.status,
+                reason=reason.value,
+                body=entry.body,
+                content_type=entry.content_type,
+                upstream_status=entry.status,
+                retry_after_s=None,
+                cooldown_s=None,
+                egress=entry.egress or "",
+                generation=entry.generation,
+                cs=cs,
+                handoff_ok=True,
+            )
+        )
 
     def _make_entry(
         self,
@@ -669,26 +909,6 @@ class CacheService:
     def _stored_outcome(self, entry: CacheEntry) -> FlightOutcome:
         return FlightOutcome(OutcomeKind.STORED, status=entry.status, entry_id=entry.id, stored_at=entry.stored_at)
 
-    def _outcome_for(self, result: Any, key: CacheKey, entry: CacheEntry | None, stored: bool) -> FlightOutcome:
-        if entry is not None and stored:
-            return self._stored_outcome(entry)
-        if AuthClass(result.auth_class) == AuthClass.CRED and key.auth_class != AuthClass.CRED:
-            return FlightOutcome(OutcomeKind.NOSTORE)  # never hand a credential answer to anonymous followers
-        body = bytes(result.body or b"")
-        reason = ReasonCode(result.reason).value
-        if len(body) > SHARE_BODY_MAX:
-            return FlightOutcome(OutcomeKind.NOSTORE, status=int(result.status), reason=reason)
-        return FlightOutcome(
-            OutcomeKind.SHARED,
-            status=int(result.status),
-            reason=reason,
-            body=body,
-            content_type=result.content_type,
-            upstream_status=result.upstream_status,
-            retry_after_s=_seconds(result.retry_after_s),
-            cooldown_s=_seconds(result.cooldown_s),
-        )
-
     def _observe_change(self, req: Any, peek: CachePeek, entry: CacheEntry, now: float) -> None:
         """A refetch of a key that had a body: was the new body identical? (TTL tuning, plan F10)."""
         previous = peek.previous
@@ -708,13 +928,20 @@ class CacheService:
             return
         detached = _detached(req, cs.owner_deadline_s + DETACHED_GRACE_S)
 
-        async def fetch(start: FlightStart) -> tuple[_OwnerValue, FlightOutcome]:
-            result = await self._upstream.fetch(
-                detached, priority=Priority.BACKGROUND, stale_available=True, purpose="swr_refresh"
-            )
-            return await self._absorb(detached, peek, result, cs)
+        async def fetch(start: FlightStart) -> tuple[_OwnerValue, FlightOutcome | Deferred]:
+            # The refresh task copied the context of the request that started it: its own regex budget (plan
+            # 9.9), never what is left of that request's, which may already be spent.
+            with regex_budget(fresh=True):
+                result = await self._call_upstream(
+                    detached,
+                    priority=Priority.BACKGROUND,
+                    stale_available=True,
+                    purpose="swr_refresh",
+                    lease=start.lease,
+                )
+            return self._absorb(detached, peek, result, cs)
 
-        flight = await self.flights.try_lead(key.flight_key, fetch, owner_deadline_s=cs.owner_deadline_s)
+        flight = await self.flights.try_lead(key.flight_key, fetch, owner_deadline_s=cs.owner_deadline_s, hooked=True)
         if flight is None:
             self.stats.refresh_skipped += 1
             return
@@ -979,9 +1206,10 @@ class CacheService:
         return report
 
     async def maintain(self) -> EvictionReport | None:
-        """The eviction pass, at most once a minute fleet-wide (a hot.db lease that is left to expire)."""
+        """The eviction pass, at most once a minute fleet-wide (a hot.db lease that is left to expire). While the
+        disk tier is off only dead rows are removed (single-flight handoff rows are still written then)."""
         cs = self._cs()
-        if not cs.disk_enabled or self.store.shared is None:
+        if self.store.shared is None:
             return None
         if self._hot is not None:
             holder, now_ms = self._worker_id, self._clock.now_ms()
@@ -999,6 +1227,13 @@ class CacheService:
                     return None
             except SharedStateUnavailable:
                 return None
+        if not cs.disk_enabled:
+            try:
+                dead = await self.store.remove_dead(self._clock.now())
+            except (SharedStateUnavailable, sqlite3.Error):
+                return None  # the disk tier is off, often because cache.db is failing: nothing to report
+            self.stats.dead_removed += dead
+            return EvictionReport(dead=dead)
         report = await self.store.maintain(
             max_entries=cs.max_entries, max_bytes=cs.max_bytes, policy=cs.eviction_policy, now=self._clock.now()
         )
@@ -1118,6 +1353,8 @@ class CacheService:
             },
             "Generation": self.store.floor,
             "Inflight": self.flights.inflight(),
+            "Finishing": self.flights.tails(),
+            "PendingWrites": self._pending_writes,
             "Refreshing": self.swr.active(),
             "PendingHits": len(self.store.hits),
             "Stats": dataclasses.asdict(self.stats),

@@ -213,3 +213,42 @@ def test_active_rows(dbs: Any) -> None:
     rows = dbs.hot.read_sync(lambda c: cooldowns.active_rows(c, NOW_MS + 1))
     assert [row.key for row in rows] == ["endpoint:games.roblox.com/v1/a:direct"]
     assert dbs.hot.read_sync(lambda c: cooldowns.active_rows(c, NOW_MS + 31_000)) == []
+
+
+# --- cooldowns kept in memory while hot.db cannot be written (C7, finding UP-COOLDOWN-LOST) ------------------------
+
+
+def test_local_cooldowns_keep_the_longest_and_drop_ended_ones() -> None:
+    kept = cooldowns.LocalCooldowns()
+    first = kept.remember("endpoint:a:direct", 30, CooldownSource.RETRY_AFTER, NOW_MS)
+    assert kept.remember("endpoint:a:direct", 5, CooldownSource.DEFAULT, NOW_MS) == first  # never shortened
+    longer = kept.remember("endpoint:a:direct", 60, CooldownSource.DEFAULT, NOW_MS)
+    assert longer.until_ms == NOW_MS + 60_000
+    assert kept.active(["endpoint:a:direct", "egress:direct"], NOW_MS) == {"endpoint:a:direct": longer}
+    assert kept.active(["endpoint:a:direct"], NOW_MS + 60_000) == {}
+    assert kept.pending(NOW_MS + 60_000) == []
+    assert len(kept) == 0
+
+
+def test_local_cooldowns_are_bounded() -> None:
+    kept = cooldowns.LocalCooldowns()
+    for index in range(cooldowns.MAX_LOCAL_COOLDOWNS + 25):
+        kept.remember(f"endpoint:t{index}:direct", 10 + index, CooldownSource.DEFAULT, NOW_MS)
+    assert len(kept) == cooldowns.MAX_LOCAL_COOLDOWNS
+    assert not kept.active(["endpoint:t0:direct"], NOW_MS)  # the one ending soonest went first
+
+
+def test_write_local_never_shortens_a_shared_row(dbs: Any) -> None:
+    kept = cooldowns.LocalCooldowns()
+    kept.remember("endpoint:a:direct", 30, CooldownSource.RETRY_AFTER, NOW_MS)
+    kept.remember("endpoint:b:direct", 30, CooldownSource.RETRY_AFTER, NOW_MS)
+    dbs.hot.write_sync(
+        lambda conn: cooldowns.open_cooldown(conn, "endpoint:a:direct", 90, CooldownSource.DEFAULT, NOW_MS, 1)
+    )
+    rows = kept.pending(NOW_MS + 1000)
+    written = dbs.hot.write_sync(lambda conn: cooldowns.write_local(conn, rows, NOW_MS + 1000))
+    assert written == 2
+    stored = dict(read_rows(dbs.hot, "SELECT key, until_ms FROM cooldown ORDER BY key"))
+    assert stored == {"endpoint:a:direct": NOW_MS + 90_000, "endpoint:b:direct": NOW_MS + 30_000}
+    kept.forget(rows)
+    assert len(kept) == 0

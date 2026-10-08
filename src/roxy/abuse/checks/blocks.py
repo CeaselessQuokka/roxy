@@ -9,7 +9,8 @@ Why it exists
 
 How it works
     Matched against `host/path` (normalized like v1). Tarpit category `blocked_endpoint` with v1's reason
-    `Block rule: <pattern>`. Applies to bypass entries too (only their tarpit hold is skipped).
+    `Block rule: <pattern>`. Applies to bypass entries too (only their tarpit hold is skipped). A block can be an
+    admin regex (`uses_patterns`), so while regex rules exist it runs only for a request the cheap limiters admitted.
 
 What to read next
     `roxy/abuse/blocks.py`, then `roxy/abuse/checks/endpoint_rules.py`.
@@ -31,6 +32,7 @@ class BlockCheck(Check):
     position = 160
     label = "Endpoint blocks"
     tarpit_category = "blocked_endpoint"
+    uses_patterns = True
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
         if not facts.rules.endpoint_blocks:

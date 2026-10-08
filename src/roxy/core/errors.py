@@ -6,7 +6,9 @@ What this is
     list of callbacks later phases attach to: probe logging for client errors (status below 500), the errors
     table and alert emails for server errors, and the fallback outcome record. `install_exception_handlers`
     registers FastAPI handlers so `HTTPException` 4xx (404 for unknown paths, 405, 422) reach the probe hook.
-    `send_plain_response` is the small helper every middleware uses to answer on its own.
+    `send_plain_response` and `send_response` are the small helpers every middleware uses to answer on its own.
+    `v1_json_body` is v1's `jsonify(text)` wire form, and `not_found_response` is the one "nothing here" answer
+    for the admin area and for `/internal` on the public port.
 
 Why it exists
     v1's `@app.errorhandler(Exception)` did two jobs: record client errors as probes, and email the admin about
@@ -14,6 +16,13 @@ Why it exists
     `Roxy-Request-Id` and no security headers. Catching here, just inside the request id middleware, keeps both,
     and the hooks keep this module free of imports from metrics and notify (which are built later and depend on
     core, not the other way round).
+    The 500 body keeps v1's wire form: v1 answered `jsonify("Internal Server Error")`, a JSON string plus a
+    newline labeled `application/json` (plan 7.13 asks for the text "as v1"; LEAD_NOTES decision 2 keeps every
+    `jsonify` answer in that form).
+    A 404 under `/admin` has exactly one wire form per area, whoever writes it: v1's `"Not Found"` plus a newline
+    for pages (parity row 15), and the DESIGN.md section 13 error object under `/admin/api/v1`. The admin
+    network allowlist (D6) hides real routes with a plain 404 that must be byte for byte the answer for a path
+    that does not exist, or the hiding would be detectable; rendering both here makes that true by construction.
 
 How it works
     The middleware watches whether the response has started. If an exception arrives before that, it sends the
@@ -22,18 +31,24 @@ How it works
     so the server closes the connection rather than pretend the truncated response was complete. Hooks may be
     plain functions or coroutines; each runs with a short timeout and its own exceptions are logged, never
     raised, because error handling must not fail in a new way while handling an error.
+    The `HTTPException` handler answers as FastAPI would, except a plain 404 (`detail` "Not Found") on an admin
+    path, which gets `not_found_response(path)`. Client errors still reach the probe hook: an allowlist refusal is
+    worth recording. The admin catch-all route (`roxy/admin/router.py`) and the public `/internal` guard
+    (`roxy/internal_app.py`) answer with `not_found_response` directly and run no hook: v1 never logged a typo in
+    an admin URL as a probe, and the deploy's own checks of `/internal` are not attacks.
 
 What to read next
     `roxy/core/deadline.py` and `roxy/core/middleware.py` (the other answers Roxy writes itself), then
-    `roxy/metrics/security_events.py` and `roxy/notify/gate.py`, which register hooks.
+    `roxy/metrics/security_events.py` and `roxy/notify/gate.py`, which register hooks, and `roxy/admin/router.py`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,7 +60,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from roxy.core.reasons import REFUSAL_HEADER, ReasonCode
 from roxy.core.redact import redact_path
-from roxy.core.security_headers import baseline_headers, standalone_headers
+from roxy.core.security_headers import baseline_headers, is_admin_path, standalone_headers
 
 _log = logging.getLogger("roxy.core.errors")
 
@@ -55,6 +70,44 @@ HOOK_TIMEOUT_S = 2.0
 _MAX_HOOKS_PER_KIND = 16
 
 PLAIN_TEXT = "text/plain; charset=utf-8"
+JSON_TYPE = "application/json"  # what v1's jsonify sent: no charset parameter
+
+NOT_FOUND_TEXT = "Not Found"
+"""v1's 404 text (`jsonify("Not Found")`), also Starlette's default `HTTPException(404)` detail."""
+
+ADMIN_API_PREFIX = "/admin/api/v1"
+"""The versioned admin API (plan D9, DESIGN.md section 13): its errors use the section 13 error object."""
+
+ADMIN_API_NOT_FOUND_CODE = "not_found"
+ADMIN_API_NOT_FOUND_MESSAGE = "Not found."
+
+
+def v1_json_body(text: str) -> bytes:
+    """v1 `jsonify(text)`: the JSON string (ASCII, non-ASCII as \\uXXXX escapes) followed by a newline."""
+    return (json.dumps(str(text)) + "\n").encode("ascii")
+
+
+def is_admin_api_path(path: str) -> bool:
+    """True for `/admin/api/v1` and everything under `/admin/api/v1/`."""
+    return path == ADMIN_API_PREFIX or path.startswith(ADMIN_API_PREFIX + "/")
+
+
+def admin_api_error_body(code: str, message: str, fields: Mapping[str, str] | None = None) -> bytes:
+    """The DESIGN.md section 13 error object: `{"error": {"code", "message", "fields"}}`, compact JSON."""
+    error = {"code": code, "message": message, "fields": dict(fields or {})}
+    return json.dumps({"error": error}, separators=(",", ":")).encode("ascii")
+
+
+def not_found_payload(path: str) -> bytes:
+    """The 404 body for `path`: the section 13 error object under `/admin/api/v1`, else v1's `"Not Found"`."""
+    if is_admin_api_path(path):
+        return admin_api_error_body(ADMIN_API_NOT_FOUND_CODE, ADMIN_API_NOT_FOUND_MESSAGE)
+    return v1_json_body(NOT_FOUND_TEXT)
+
+
+def not_found_response(path: str, headers: Mapping[str, str] | None = None) -> Response:
+    """The one "nothing here" answer for `path` (see the module docstring): 404, `application/json`."""
+    return Response(content=not_found_payload(path), status_code=404, media_type=JSON_TYPE, headers=headers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,9 +259,24 @@ async def send_plain_response(
     504): the response then gets the full set, CSP and the `/admin` headers included (`standalone_headers`).
     Without it only the baseline is added, which suits answers sent inside that middleware (it adds the rest).
     """
-    payload = body.encode("utf-8")
+    await send_response(
+        send, status, body.encode("utf-8"), content_type=PLAIN_TEXT, headers=headers, reason=reason, scope=scope
+    )
+
+
+async def send_response(
+    send: Send,
+    status: int,
+    payload: bytes,
+    *,
+    content_type: str,
+    headers: Sequence[tuple[str, str]] = (),
+    reason: ReasonCode | None = None,
+    scope: Scope | None = None,
+) -> None:
+    """Send a complete response of `content_type` with security headers (see `send_plain_response`)."""
     raw: list[tuple[bytes, bytes]] = [
-        (b"content-type", PLAIN_TEXT.encode("latin-1")),
+        (b"content-type", content_type.encode("latin-1")),
         (b"content-length", str(len(payload)).encode("latin-1")),
     ]
     security = standalone_headers(scope) if scope is not None else baseline_headers()
@@ -248,10 +316,11 @@ class UnhandledErrorMiddleware:
                 # connection so the caller sees a broken response, not a complete-looking one.
                 await emit_server_error(scope, event_from_scope(scope, 500, reason=ReasonCode.INTERNAL_ERROR, exc=exc))
                 raise
-            await send_plain_response(
+            await send_response(
                 send,
                 500,
-                INTERNAL_ERROR_BODY,
+                v1_json_body(INTERNAL_ERROR_BODY),  # v1 `jsonify("Internal Server Error")`, plan 7.13
+                content_type=JSON_TYPE,
                 headers=[("Retry-After", str(INTERNAL_ERROR_RETRY_AFTER_S))],
                 scope=scope,  # this answer is built outside SecurityHeadersMiddleware
             )
@@ -259,11 +328,19 @@ class UnhandledErrorMiddleware:
 
 
 async def _http_exception_handler(request: Request, exc: Exception) -> Response:
-    """FastAPI handler for `HTTPException`: probe-log client errors, then answer exactly as FastAPI would."""
+    """FastAPI handler for `HTTPException`: probe-log client errors, then answer as FastAPI would.
+
+    One exception: a plain 404 under `/admin` (an allowlist refusal, a guard without a context, a route not
+    found) is answered with `not_found_response`, byte for byte the answer for an admin path that does not exist.
+    """
     from fastapi.exception_handlers import http_exception_handler  # local import: core stays usable without it
 
     assert isinstance(exc, StarletteHTTPException)
-    response = await http_exception_handler(request, exc)
+    path = str(request.scope.get("path", ""))
+    if exc.status_code == 404 and exc.detail == NOT_FOUND_TEXT and is_admin_path(path):
+        response = not_found_response(path, headers=exc.headers)
+    else:
+        response = await http_exception_handler(request, exc)
     if exc.status_code < 500:
         detail = f"HTTP {exc.status_code} via {request.method} {request.url.path}"[:200]
         reason = ReasonCode.METHOD_NOT_ALLOWED if exc.status_code == 405 else None

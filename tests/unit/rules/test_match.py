@@ -562,7 +562,7 @@ def test_nested_quantifiers_are_refused(pattern: str) -> None:
         r"(?:ab)+",
         r"(a{2})+",
         r"(a+){3}",
-        r"[a-z]+/[0-9]*",
+        r"^[a-z]+/[0-9]*",  # unanchored, `[a-z]+` could be restarted at every position of a run (test_regex_cost)
         r"(?i)roblox(?=\.com)",
     ],
 )
@@ -732,7 +732,76 @@ def test_ordinary_regexes_stay_valid(pattern: str) -> None:
 def test_glob_wildcards_per_segment_are_capped() -> None:
     with pytest.raises(PatternValidationError, match="one path segment"):
         validate_pattern("games.roblox.com/v1/*-*-*-x", "glob")
-    assert validate_pattern("games.roblox.com/v1/*-*/x/*", "glob")
+    # Two wildcards share a segment only in the last one, where nothing after them can fail (ingress review: a
+    # middle segment `*-*` needs about 30 ms to fail on a 4096 character segment).
+    with pytest.raises(PatternValidationError, match="before the last one"):
+        validate_pattern("games.roblox.com/v1/*-*/x/*", "glob")
+    assert validate_pattern("games.roblox.com/v1/x/*-*", "glob") == "games.roblox.com/v1/x/*-*"
+    assert validate_pattern("games.roblox.com/*/x/*", "glob") == "games.roblox.com/*/x/*"
+    # The credential allowlist's exact form must end at its last segment, so even there one wildcard per segment.
+    with pytest.raises(PatternValidationError, match="two wildcards in one path segment"):
+        validate_pattern("economy.roblox.com/v1/*-*", "glob", exact=True)
+    assert validate_pattern("economy.roblox.com/v1/*/x", "glob", exact=True) == "economy.roblox.com/v1/*/x"
+
+
+def test_exact_patterns_grant_no_implicit_subpath() -> None:
+    """The credential allowlist's form (lead decision F3): no `(?:/.*)?` tail for globs, `fullmatch` for regexes."""
+    glob = compile_pattern("economy.roblox.com/v1/user/currency", "glob", exact=True)
+    assert glob.matches("economy.roblox.com/v1/user/currency")
+    assert glob.matches("economy.roblox.com/v1/user/currency/")
+    assert not glob.matches("economy.roblox.com/v1/user/currency/history")
+    assert compile_pattern("economy.roblox.com/v1/user/currency", "glob").matches(
+        "economy.roblox.com/v1/user/currency/history"
+    )  # every other table keeps v1's subpath rule
+    star = compile_pattern("economy.roblox.com/v1/user/*", "glob", exact=True)
+    assert star.matches("economy.roblox.com/v1/user/currency")
+    assert not star.matches("economy.roblox.com/v1/user/currency/history")
+    regex_exact = compile_pattern(r"economy\.roblox\.com/v1/assets/\d+", "regex", exact=True)
+    assert regex_exact.matches("economy.roblox.com/v1/assets/12")
+    assert not regex_exact.matches("economy.roblox.com/v1/assets/12/owners")
+    assert not regex_exact.matches("x.economy.roblox.com/v1/assets/12")
+    assert compile_pattern(r"economy\.roblox\.com/v1/assets/\d+", "regex").matches("x.economy.roblox.com/v1/assets/12")
+    index = PatternIndex([(1, "economy.roblox.com/v1/user/currency", "glob", "row")], exact=True)
+    assert index.best("economy.roblox.com/v1/user/currency/x") is None
+    assert index.best("/Economy.Roblox.com/v1/user/currency") == "row"
+
+
+def test_nested_regex_budget_keeps_the_outer_one() -> None:
+    """One budget per request: a phase that opens `regex_budget()` inside another keeps the outer budget."""
+    pattern = r"^(a|aa)+$"
+    target = "a" * 32 + "!a"
+    compiled = compile_pattern(pattern, "regex")
+    with match.regex_budget(0.06):
+        compiled.matches(target)
+        compiled.matches(target)  # the outer budget is now spent
+        with match.regex_budget(10.0):  # a nested phase does not get a fresh budget
+            started = time.monotonic()
+            assert compiled.matches(target, on_timeout=True)
+            assert time.monotonic() - started < 0.02
+
+
+async def test_a_fresh_budget_ignores_the_spent_one_it_was_started_from() -> None:
+    """A background task (an SWR refresh) copies the context of the request that started it; `fresh=True` gives
+    it a budget of its own, and the request's budget is still the spent one when the block ends.
+
+    The request's budget is spent by construction (0 s), not by timing slow matches: how much of a budget a
+    timed-out match uses depends on the engine's timer granularity, which made a timing-based setup flaky."""
+    import asyncio
+
+    fast = compile_pattern("games", "regex")
+
+    async def background() -> tuple[bool, bool]:
+        spent = fast.matches("games.roblox.com", on_timeout=False)  # the inherited budget: answered as a timeout
+        with match.regex_budget(fresh=True):
+            own = fast.matches("games.roblox.com", on_timeout=False)
+        return spent, own
+
+    with match.regex_budget(0.0):  # the request's budget, already spent
+        assert not fast.matches("games.roblox.com", on_timeout=False)
+        spent, own = await asyncio.get_running_loop().create_task(background())
+        assert not fast.matches("games.roblox.com", on_timeout=False)  # still spent for the request itself
+    assert (spent, own) == (False, True)
+    assert fast.matches("games.roblox.com")  # outside every budget the pattern simply matches
 
 
 def test_a_timeout_fails_closed_for_blocks() -> None:

@@ -22,6 +22,7 @@ What to read next
 
 from __future__ import annotations
 
+import html
 import re
 import shutil
 import subprocess
@@ -130,7 +131,8 @@ def test_guide_has_the_luau_examples(guide_text: str) -> None:
     assert "math.random() * MAX_JITTER_SECONDS" in guide_text
     assert "HttpService:GetAsync(OUTFITS_URL)" in guide_text  # quick reads with GetAsync
     assert "HttpService:JSONEncode(request)" in guide_text  # POST batch lookup
-    assert "HEADER_NAMES" in guide_text and '"Roxy-Requests-Left"' in guide_text  # reading Roxy headers
+    assert "HEADER_NAMES" in guide_text  # reading Roxy headers
+    assert '"Roxy-Requests-Left"' in guide_text
     assert "return RoxyClient" in guide_text  # the reusable module
     assert "require(ServerScriptService.RoxyClient)" in guide_text  # and how to use it
     assert guide_text.count("```luau\n--!strict\n") == 6
@@ -140,19 +142,35 @@ def test_guide_has_the_luau_examples(guide_text: str) -> None:
 def test_guide_explains_strict_mode_and_const(guide_text: str) -> None:
     chapter = guide_text.split("## 3. Examples in Luau", 1)[1].split("### ", 1)[0]
     assert "`--!strict`" in chapter
-    assert "`const`" in chapter and "can never be assigned again" in chapter
+    assert "declared with `const` (Luau 0.711 and later)" in chapter  # the release that added const
+    assert "refuses any later\nassignment" in chapter
+    assert "`local` tells you at a\nglance what can change" in chapter
     assert "UPPER_SNAKE_CASE" in chapter
-    assert "write `local` in its place" in chapter  # the way out for a Studio without const
+    assert "write `local` in its place (`local function` for `const function`)" in chapter  # older Studio builds
+    assert "`JSONDecode` returns `any`" in chapter  # why decoded JSON is checked before use
 
 
 def test_guide_says_every_request_counts_and_why(catalog_get: Callable[..., Getter]) -> None:
-    """Owner change 2026-10-07 (D10 reversed): cache hits count toward the per-IP limit by default."""
+    """Owner change 2026-10-07 (D10 reversed): every request counts toward the per-IP limit, cached or not."""
     page = flat(rendered_guide(catalog_get()))
+    why = html.escape(pages.CACHE_HITS_WHY, quote=True)  # as the page carries it ("Roxy&#x27;s")
     limits = page.split('id="4-limits"', 1)[1].split('id="5-caching"', 1)[0]
-    assert "Every request counts toward this limit, including requests Roxy answers from its cache" in limits
-    assert "it still costs Roxy processing time and bandwidth" in limits
+    assert "Every request counts toward this limit, cached or not." in limits
+    assert why in limits
     assert "your own cache is the best way to stay under the limit" in limits
+    faq = page.split('id="why-do-i-get-429-when-i-barely-send-anything"', 1)[1].split("<h3", 1)[0]
+    assert "Every request counts toward your per-IP limit, cached or not (chapter 4)." in faq
+    assert why in faq
     assert "do not count" not in page
+
+
+def test_guide_follows_the_cache_hit_setting(catalog_get: Callable[..., Getter]) -> None:
+    """An admin can still switch counting off; then neither chapter 4 nor the FAQ may claim cache hits count."""
+    page = flat(rendered_guide(catalog_get(throttle_count_cache_hits=0)))
+    assert "Every request counts" not in page
+    assert "CPU, memory and bandwidth" not in page
+    assert "requests Roxy answers from its cache do not count toward this limit" in page
+    assert "do not count toward your per-IP limit right now" in page
 
 
 def test_guide_markers_are_all_known_and_settings_exist() -> None:
@@ -208,20 +226,38 @@ def test_luau_fences_are_highlighted_and_escaped() -> None:
     hostile = 'local x = "</code></pre><script>alert(1)</script>" -- <img src=x onerror=y>'
     rendered = render_guide(f"# T\n\n```luau\n{hostile}\n```\n\n```lua\nprint(1)\n```\n\n```text\nlocal y = 1\n```\n")
     body = str(rendered.html({}))
-    assert '<pre><code class="language-luau hl"><span class="k">local</span> x <span class="o">=</span>' in body
+    assert (
+        '<pre tabindex="0"><code class="language-luau hl"><span class="k">local</span> x <span class="o">=</span>'
+        in body
+    )
     assert '<span class="s">"&lt;/code&gt;&lt;/pre&gt;&lt;script&gt;alert(1)&lt;/script&gt;"</span>' in body
     assert '<span class="c">-- &lt;img src=x onerror=y&gt;</span>' in body
-    assert "<script>" not in body and "<img" not in body
-    assert '<pre><code class="language-lua hl"><span class="b">print</span>(<span class="n">1</span>)' in body
-    assert '<pre><code class="language-text">local y = 1\n</code></pre>' in body  # other fences stay plain
+    assert "<script>" not in body
+    assert "<img" not in body
+    assert (
+        '<pre tabindex="0"><code class="language-lua hl"><span class="b">print</span>(<span class="n">1</span>)' in body
+    )
+    assert '<pre tabindex="0"><code class="language-text">local y = 1\n</code></pre>' in body  # other fences stay plain
     assert_style_clean(body, "highlighted fences")
 
 
 def test_every_guide_example_is_highlighted(catalog_get: Callable[..., Getter]) -> None:
     page = rendered_guide(catalog_get())
-    assert page.count('<pre><code class="language-luau hl">') == 6
+    assert page.count('<pre tabindex="0"><code class="language-luau hl">') == 6
     assert '<span class="k">const</span> <span class="b">HttpService</span>' in page
+    assert '<span class="k">const function</span> getHeader(' in page
+    assert '<span class="k">export type</span> <span class="t">GameDetails</span>' in page
     assert "style=" not in page
+
+
+def test_every_code_block_is_keyboard_focusable(catalog_get: Callable[..., Getter]) -> None:
+    """A code block scrolls sideways on long lines, so it must be a tab stop (WCAG 2.1.1, axe
+    scrollable-region-focusable): fences of every language and indented blocks alike."""
+    page = rendered_guide(catalog_get())
+    assert page.count("<pre") == page.count(pages.PRE_OPEN) > 6
+    body = str(render_guide("# T\n\n    indented code\n\n```\nplain fence\n```\n").html({}))
+    assert '<pre tabindex="0"><code>indented code\n</code></pre>' in body
+    assert '<pre tabindex="0"><code>plain fence\n</code></pre>' in body
 
 
 def test_headings_get_unique_ids_and_anchor_links() -> None:

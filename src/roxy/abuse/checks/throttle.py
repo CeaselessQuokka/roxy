@@ -9,13 +9,17 @@ Why it exists
     (v1 B8), and tell the caller precisely when to come back.
 
 How it works
-    - Skipped for bypass entries, and for fresh cache hits while `throttle_count_cache_hits` is 0 (D10): such a
-      request is neither counted nor refused.
+    - Skipped for bypass entries. Fresh cache hits count like every other request (`throttle_count_cache_hits`,
+      default 1: the owner reversed D10 on 2026-10-07, because serving a cache hit still costs Roxy resources);
+      with the setting at 0 a fresh cache hit is neither counted nor refused.
     - Refusal: 429 with the ladder rung's message for the client's strikes, or v1's fallback text when the ladder is
       empty or the rung has no message; `Retry-After` (the GCRA wait or the rung's penalty, whichever is longer),
       `Roxy-Throttle-Reset`, `Roxy-Throttled: True`, `Roxy-Requests-Left: 0`. Tarpit category `throttle`.
     - With `cache_serve_throttled` the refusal carries `allow_fresh_cache_serve`, and the router answers from a fresh
-      cached copy instead (row 60).
+      cached copy instead (row 60), unless a check after this one (a header filter, auth smuggling, an endpoint
+      block, any static refusal) would refuse the request: the pipeline then clears the flag and the caller gets
+      this throttle refusal (v1 step 4a served the cache before those filters ran; v2 never serves content to a
+      request a filter refuses).
 
 What to read next
     `roxy/abuse/throttle.py`, then `roxy/abuse/checks/place_limit.py`.
@@ -43,11 +47,10 @@ class ThrottleCheck(Check):
         policy = facts.per_ip
         if policy is None:
             return None
-        if getattr(req, "fresh_cache_hit", False) and not facts.bool("throttle_count_cache_hits", False):
-            return None  # D10: a fresh cache hit costs Roblox nothing, so it is neither counted nor refused
+        if getattr(req, "fresh_cache_hit", False) and not facts.flag("throttle_count_cache_hits"):
+            return None  # the admin chose not to count fresh cache hits: neither counted nor refused
         payload = {
-            "serve_from_cache": facts.bool("cache_serve_throttled", False)
-            and bool(getattr(req, "fresh_cache_hit", False))
+            "serve_from_cache": facts.flag("cache_serve_throttled") and bool(getattr(req, "fresh_cache_hit", False))
         }
         return LimitSpec(
             self.name,

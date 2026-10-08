@@ -31,7 +31,9 @@ MAX_STATE_REASON: Final = 300
 # --- v1 texts (pipeline.md section 18, abuse.md section 5) ------------------------------------------------------------
 
 DEFAULT_DOWNTIME_MESSAGE: Final = "Service down for maintenance."
-"""Pause AND throttle-all default (v1 bug B6/B13 kept for parity: throttle-all without a reason says this too)."""
+"""The catalog default of the live setting `pause_message_default`, which is the pause AND the throttle-all default
+(v1 bug B6/B13 kept for parity: throttle-all without a reason says the pause text too). Only a fallback: the checks
+pass the live setting."""
 
 THROTTLE_FALLBACK: Final = (
     "You have been throttled; try again in {reset_in} seconds (you get ~{allowed} requests per ~minute)."
@@ -83,6 +85,11 @@ def clean_admin_message(value: object, limit: int = MAX_RULE_MESSAGE) -> str:
     return str(value or "").strip()[:limit].strip()
 
 
+def downtime_default(setting_value: object) -> str:
+    """The live `pause_message_default` cleaned like an admin message; an empty value falls back to the catalog's."""
+    return clean_admin_message(setting_value, MAX_STATE_REASON) or DEFAULT_DOWNTIME_MESSAGE
+
+
 def throttle_fallback(reset_in: int, allowed: int) -> str:
     """The per-IP text used when the ladder is empty or the rung has no message."""
     return THROTTLE_FALLBACK.format(reset_in=reset_in, allowed=allowed)
@@ -112,6 +119,7 @@ __all__ = [
     "UA_BURST_DEFAULT",
     "UA_COOLDOWN_DEFAULT",
     "clean_admin_message",
+    "downtime_default",
     "throttle_fallback",
     "ua_default",
 ]

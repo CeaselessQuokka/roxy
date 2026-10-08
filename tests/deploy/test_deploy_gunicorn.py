@@ -52,6 +52,17 @@ def load_conf(monkeypatch: pytest.MonkeyPatch, **env: str) -> ModuleType:
     return load_script(DEPLOY / "gunicorn.conf.py", f"gunicorn_conf_{abs(hash(tuple(env.items())))}")
 
 
+def listeners(conf: ModuleType) -> list[str]:
+    """Both plan 5.8 listeners, however the config opens them: both in `bind`, or the TCP address in `bind` (each
+    worker opening its own with `reuse_port`) and the internal Unix socket that the master creates once
+    (`INTERNAL_SOCKET`). The live `sockets` test proves the socket really exists with mode 0660."""
+    found = list(conf.bind)
+    internal = getattr(conf, "INTERNAL_SOCKET", None)
+    if internal is not None and f"unix:{internal}" not in found:
+        found.append(f"unix:{internal}")
+    return found
+
+
 # ------------------------------------------------------------------------------------------ gunicorn.conf.py
 
 
@@ -66,7 +77,13 @@ def test_settings_follow_plan_5_2(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     )
     assert conf.worker_class == "roxy.worker.RoxyUvicornWorker"
     assert conf.workers == 2
-    assert conf.bind == ["127.0.0.1:8002", "unix:/run/roxy-green/internal.sock"]
+    assert listeners(conf) == ["127.0.0.1:8002", "unix:/run/roxy-green/internal.sock"]
+    # Each worker opens its own TCP listener (SO_REUSEPORT) so the kernel spreads connections; the Unix socket
+    # cannot be shared that way, so it stays out of `bind` and the master's hooks create and hand it out.
+    assert conf.reuse_port is True
+    assert conf.bind == ["127.0.0.1:8002"]
+    assert conf.INTERNAL_SOCKET == "/run/roxy-green/internal.sock"
+    assert all(callable(getattr(conf, hook)) for hook in ("on_starting", "post_fork", "on_exit"))
     assert 0o777 & ~conf.umask == 0o660, "the internal socket is created 0660"
     assert conf.timeout == 30
     assert conf.graceful_timeout == 30
@@ -100,6 +117,7 @@ def test_every_setting_is_a_real_gunicorn_setting_and_commented() -> None:
     assert {
         "worker_class",
         "workers",
+        "reuse_port",
         "bind",
         "umask",
         "timeout",
@@ -153,7 +171,7 @@ def test_low_memory_marker_is_per_color(monkeypatch: pytest.MonkeyPatch, tmp_pat
 
 def test_internal_socket_default_is_per_color(monkeypatch: pytest.MonkeyPatch) -> None:
     conf = load_conf(monkeypatch, ROXY_COLOR="blue")
-    assert conf.bind[1] == "unix:/run/roxy-blue/internal.sock"
+    assert listeners(conf)[1] == "unix:/run/roxy-blue/internal.sock"
     assert conf.control_socket == "/run/roxy-blue/gunicorn.ctl"
 
 
@@ -314,6 +332,8 @@ def test_gunicorn_listeners_sockets_and_graceful_stop(tmp_path: Path, credential
     assert out["internal_socket_mode"] == "0660"
     assert out["control_socket_mode"] == "0660"
     assert out["tcp_internal_version"] == 404, "internal endpoints never answer on the public port"
+    assert out["tcp_internal_version_detail"] == '"Not Found"\n', "the public app's own 404, not a proxy refusal"
+    assert out["tcp_internal_version_seconds"] < 5, "answered at once, never held by the tarpit"
     assert out["uds_version"][0] == 200
     assert json.loads(out["uds_version"][1])["Color"] == "blue"
     assert out["tcp_home"] == 200

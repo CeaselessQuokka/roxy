@@ -35,6 +35,7 @@ What to read next
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import secrets
@@ -485,7 +486,8 @@ class RulesService:
         """Validate and insert one rule. Raises RuleValidationError, RuleConflict or RuleCapReached."""
         spec = self.table(table)
         reason_text = check_reason(table, reason)
-        columns = to_columns(spec, self._validate(spec, row))
+        # Validation compiles regexes and runs the write-time cost model (rules/regex_cost.py): off the event loop.
+        columns = to_columns(spec, await asyncio.to_thread(self._validate, spec, row))
         now = int(self._clock.now())
         change = await self._db.write(
             lambda conn: self._create_in(conn, spec, dict(columns), actor, reason_text, request_id, now)

@@ -16,7 +16,10 @@ How it works
        size limits, timing (`core/middleware.py` explains each).
     3. FastAPI's built-in docs are OFF: `/docs` is the public user guide (plan 16.1), and the admin API schema
        must not be public.
-    4. Routers are included in a fixed order, the proxy catch-all last so it never shadows a real page. A
+    4. The first route is `internal_app.PublicInternalNotFound`: `/internal` and everything under it answer an
+       immediate 404 (v1's `"Not Found"` body) on the public port, as nginx does in production, so the proxy
+       catch-all never treats an internal path as a target to refuse and tarpit (plan 5.8).
+    5. Routers are included in a fixed order, the proxy catch-all last so it never shadows a real page. A
        router module exposes `router` (an `APIRouter`, or a Starlette `Router` for the plain proxy endpoint).
        Modules not written yet are skipped; until the public pages exist a placeholder answers `/`.
 
@@ -42,6 +45,7 @@ from roxy.core.errors import install_exception_handlers
 from roxy.core.middleware import build_middleware
 from roxy.core.security_headers import get_nonce
 from roxy.core.templating import STATIC_DIR, STATIC_URL_PREFIX, AssetHasher, HashedStaticFiles, Templates
+from roxy.internal_app import ListenerDispatcher, PublicInternalNotFound, create_internal_app
 from roxy.lifespan import build_lifespan, optional_import
 
 log = logging.getLogger("roxy.main")
@@ -110,6 +114,8 @@ def create_app(env: EnvSettings | None = None, *, clock: Clock | None = None) ->
     )
     app.state.env = env
     install_exception_handlers(app)
+    # Before every other route: an internal path on the public port is a fixed 404, never a proxy target.
+    app.router.routes.append(PublicInternalNotFound())
     hasher = AssetHasher(STATIC_DIR)
     app.state.templates = Templates(hasher=hasher)
     # nginx serves /static/ in production (plan 17.2); this mount gives development and tests the same URLs.
@@ -122,8 +128,6 @@ def create_app(env: EnvSettings | None = None, *, clock: Clock | None = None) ->
 
 def create_asgi_app(env: EnvSettings | None = None, *, clock: Clock | None = None) -> ASGIApp:
     """The object gunicorn serves: the public app on TCP, the internal app on the Unix socket (plan 5.8)."""
-    from roxy.internal_app import ListenerDispatcher, create_internal_app
-
     env = env or EnvSettings()
     public = create_app(env, clock=clock)
     return ListenerDispatcher(public=public, internal=create_internal_app(public), internal_socket=env.internal_socket)

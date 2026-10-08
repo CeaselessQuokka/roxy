@@ -20,8 +20,10 @@ How it works
       opaque token (at least 24 characters of `[A-Za-z0-9_-]` with at least one digit). An id segment becomes
       `{name}`, where the name comes from the previous raw segment lowercased (`users` gives `{userId}`,
       `games` gives `{gameId}`, anything else `{id}`). The table is `_ID_COLLECTION_NAMES` below.
-    - `template_for` drops the query, strips leading and trailing slashes like v1's `log_endpoint`, and caps the
-      result at `MAX_TEMPLATE_CHARS` so an attacker-made path cannot produce an unbounded dimension value.
+    - `template_for` drops the query, strips leading and trailing slashes like v1's `log_endpoint`, scrubs the
+      result with the log redaction (`core/redact.py redact_label`: a route word is kept as written, so a secret
+      a caller hides in one must not survive into stored dimensions; ordinary templates are unchanged), and caps it
+      at `MAX_TEMPLATE_CHARS` so an attacker-made path cannot produce an unbounded dimension value.
     - `VocabularyGate(limit)` admits new values while it has room and maps everything else to `other`. Each
       worker refreshes its gate every hour from the trailing 24 h of rollups (`queries.top_templates`), so the
       busiest templates keep their names, values with no traffic for a day free their place, and a flood of
@@ -37,6 +39,8 @@ from __future__ import annotations
 import re
 import threading
 from collections.abc import Iterable
+
+from roxy.core.redact import redact_label
 
 TEMPLATE_VERSION = 1
 """Version of the templating algorithm. Bump it only together with a data migration (plan 14.3)."""
@@ -120,19 +124,24 @@ def template_for(host: str, path: str) -> str:
     """The endpoint template of a request to `host` + `path` (`ProxyRequest.template`, plan 6.2 dimension).
 
     `path` may start with `/` and may carry a query; both are removed as in v1. A path that already starts
-    with the host (v1 passed `dst`, the whole `host/path`) is not doubled.
+    with the host (v1 passed `dst`, the whole `host/path`) is not doubled. The template is then scrubbed like a
+    log line (`redact_label`): a path segment that is not id-shaped stays as it is, so a caller who puts a
+    credential piece there (`/v1/x.<piece>`) would otherwise have it stored in every metric row, Live row, event
+    and hot.db key that carries the template (plan C1, 9.15). Ordinary paths are returned exactly as v1 made them.
     """
     cleaned = clean_path(path)
     host = host.strip().strip("/")
     if host and cleaned != host and not cleaned.startswith(host + "/"):
         cleaned = f"{host}/{cleaned}" if cleaned else host
-    return templatize(cleaned)[:MAX_TEMPLATE_CHARS]
+    return redact_label(templatize(cleaned))[:MAX_TEMPLATE_CHARS]
 
 
 def remap_templates(examples: dict[str, str]) -> dict[str, str]:
     """For a future data migration: old template -> new template, by re-templating one concrete example of each
     (plan 14.3). Templates whose example produces the same text map to themselves."""
-    return {old: templatize(clean_path(example))[:MAX_TEMPLATE_CHARS] for old, example in examples.items()}
+    return {
+        old: redact_label(templatize(clean_path(example)))[:MAX_TEMPLATE_CHARS] for old, example in examples.items()
+    }
 
 
 class VocabularyGate:

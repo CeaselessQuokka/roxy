@@ -150,6 +150,21 @@ async def test_redirect_off_allowlist_not_followed(service: UpstreamService, egr
     assert "location" not in result.headers  # never relayed toward a caller
 
 
+@pytest.mark.parametrize("location", ["//[", "https://[x/", "http://[::1", "https://games.roblox.com:99999/x"])
+async def test_malformed_redirect_location_is_answered_not_raised(
+    service: UpstreamService, egress: FakeEgress, ctx: Any, location: str
+) -> None:
+    """Ingress review: a Location that does not parse is a redirect not followed. Roblox's own 3xx goes back (the
+    "Roblox answered" row of 7.13) after the normal bookkeeping; it is never a 500 internal_error."""
+    egress.handler = lambda e, out: answer(302, b"moved", {"location": location})
+    result = await fetch(service)
+    assert (result.status, result.reason, result.calls, result.attempts) == (302, ReasonCode.UPSTREAM_OK, 1, 1)
+    assert result.body == b"moved"
+    assert "redirect not followed" in result.trace.notes
+    assert len(egress.calls) == 1
+    assert "location" not in result.headers
+
+
 async def test_redirect_hops_capped_at_three(service: UpstreamService, egress: FakeEgress) -> None:
     egress.handler = lambda e, out: answer(302, b"", {"location": "https://games.roblox.com/v1/loop"})
     result = await fetch(service)
@@ -385,6 +400,11 @@ async def test_csrf_handshake_with_cached_token(service: UpstreamService, egress
     assert len(egress.calls) == 2
     assert first.trace.retries == 1
     assert first.calls == 2
+    # Row 117: the retry is recorded with v1's reason text (v1 `log_retry(403, "CSRF token refresh")`).
+    retries = ctx.recorder.retries
+    assert [(r["status"], r["reason"], r["egress"], r["endpoint_template"]) for r in retries] == [
+        (403, "CSRF token refresh", "direct", TEMPLATE)
+    ]
     # Both calls took a bucket slot: the endpoint bucket advanced by two intervals (120/min = 500 ms each).
     tats = ctx.dbs.hot.read_sync(lambda conn: buckets.read_tats(conn, [f"endpoint:{TEMPLATE}"]))
     assert tats[f"endpoint:{TEMPLATE}"] == pytest.approx(ctx.clock.now_ms() + 1000, abs=5)
@@ -595,6 +615,202 @@ async def test_credential_401_not_confirmed_keeps_credential(
     for _ in range(30):
         await asyncio.sleep(0.01)
     assert egress.credential.rejections == []
+
+
+async def test_allowlist_and_routing_matches_share_one_regex_budget(
+    service: UpstreamService, egress: FakeEgress, rules: Any
+) -> None:
+    """Ingress review (plan 9.9): stored slow allowlist and routing regexes (imported, never judged again) cost a
+    crafted request at most the regex budget, and a cut-off allowlist match never grants the credential."""
+    import time
+
+    from roxy.rules.match import REGEX_REQUEST_BUDGET_S, regex_timeouts_total
+    from roxy.rules.models import CredentialAllowlistRow, RoutingRuleRow
+
+    slow = r"x+x+x+y"  # refused for new rules (rules/regex_cost.py), but a stored row keeps matching
+    rules.credential_rows.extend(
+        CredentialAllowlistRow(id=i, pattern=slow + "(?:q)?" * i, type="regex", methods="GET", cache_private=True)
+        for i in range(1, 9)
+    )
+    rules.routing_rows.extend(
+        RoutingRuleRow(id=i, pattern=slow + "(?:r)?" * i, type="regex", mode="rotator_only") for i in range(1, 9)
+    )
+    rules.rebuild()
+    before = regex_timeouts_total()
+    started = time.perf_counter()
+    result = await fetch(service, path="/" + "x" * 3000, query=[])
+    elapsed = time.perf_counter() - started
+    assert elapsed < REGEX_REQUEST_BUDGET_S + 0.25, f"{elapsed * 1000:.0f} ms of regex time"
+    assert regex_timeouts_total() > before  # the slow rows really were tried (the probe is not vacuous)
+    assert result.auth_class is AuthClass.ANON
+    assert Egress.CREDENTIAL not in egress.egresses()
+
+
+class CredentialUnavailable(EgressDisabled):
+    """The egress package's refusal at send time (mapped by its base class name, like the real one)."""
+
+    def __init__(self, why: str, retry_after_s: int | None) -> None:
+        super().__init__(why)
+        self.why = why
+        self.retry_after_s = retry_after_s
+
+
+@pytest.mark.parametrize(
+    ("why", "hint", "expected"),
+    [("cooling_down", 42, 42), ("degraded", 10, 10), ("rejected", 300, 300), ("not_confirmed", None, 300)],
+)
+async def test_credential_refused_at_send_time_answers_its_own_retry_after(
+    service: UpstreamService, egress: FakeEgress, rules: Any, why: str, hint: int | None, expected: int
+) -> None:
+    """Wire report: the credential manager refused at the last moment (its own authoritative check). The 503 says
+    when to come back from what it said (a cooldown's real remaining time), not a fixed 300 s; still never
+    anonymous instead (plan 6.9)."""
+    rules.allow_credential("games.roblox.com/v1/games")
+    egress.handler = lambda e, out: CredentialUnavailable(why, hint)
+    result = await fetch(service)
+    assert (result.status, result.reason, result.retry_after_s) == (503, ReasonCode.CREDENTIAL_UNAVAILABLE, expected)
+    assert egress.egresses() == [Egress.CREDENTIAL]
+    assert result.cooldown_s == (expected if why == "cooling_down" else None)
+
+
+async def test_credential_cooling_down_in_the_manager_only_answers_its_remaining_time(
+    service: UpstreamService, egress: FakeEgress, rules: Any
+) -> None:
+    """The manager may know a cooldown hot.db does not (kept in memory during an outage): routing uses it too."""
+    rules.allow_credential("games.roblox.com/v1/games")
+    egress.credential.cooldown = 37.2
+    result = await fetch(service)
+    assert (result.status, result.reason, result.retry_after_s) == (503, ReasonCode.CREDENTIAL_UNAVAILABLE, 38)
+    assert egress.calls == []
+
+
+def break_hot_writes(ctx: Any, monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
+    """Make hot.db refuse every write while `state["broken"]` is True (reads keep working, like a read-only file)."""
+    from roxy.storage.db import SharedStateUnavailable
+
+    state = {"broken": False}
+    real_write = ctx.dbs.hot.write
+
+    async def write(fn: Any, **kwargs: Any) -> Any:
+        if state["broken"]:
+            raise SharedStateUnavailable("hot", "attempt to write a readonly database")
+        return await real_write(fn, **kwargs)
+
+    monkeypatch.setattr(ctx.dbs.hot, "write", write)
+    return state
+
+
+@pytest.mark.parametrize("allowlisted", [False, True], ids=["direct", "credential"])
+async def test_429_during_a_hot_outage_still_cools_down(
+    service: UpstreamService,
+    egress: FakeEgress,
+    rules: Any,
+    ctx: Any,
+    clock: Any,
+    settings: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    allowlisted: bool,
+) -> None:
+    """Finding UP-COOLDOWN-LOST (plan 7.5, C7): Roblox says 429 with Retry-After 60 just as hot.db stops taking
+    writes. The caller gets the cooldown answer (not `degraded`), the cooldown is kept in this worker, the next
+    request inside the 60 s never reaches Roblox through that path, and the row reaches hot.db (for every worker)
+    once it can. The rotator is off, so "that path" is the only one (with it on, it would take over by design)."""
+    settings.set(rotator_enabled=0)
+    if allowlisted:
+        rules.allow_credential("games.roblox.com/v1/games")
+    hot = break_hot_writes(ctx, monkeypatch)
+
+    def handler(e: Egress, out: Any) -> Any:
+        hot["broken"] = True  # hot.db goes read-only while Roblox is answering
+        return answer(429, b"{}", {"retry-after": "60"})
+
+    egress.handler = handler
+    first = await fetch(service)
+    assert (first.status, first.reason, first.upstream_status) == (429, ReasonCode.UPSTREAM_COOLDOWN, 429)
+    assert first.retry_after_s == 60
+    egress_used = Egress.CREDENTIAL if allowlisted else Egress.DIRECT
+    assert egress.egresses() == [egress_used]
+    kept = {row.key for row in service.local_cooldowns.pending(clock.now_ms())}
+    assert f"endpoint:{TEMPLATE}:{egress_used.value}" in kept
+    if allowlisted:
+        assert "credential" in kept
+        assert egress.credential.cooldowns == [(60.0, "retry_after")]  # the manager keeps its own copy too
+    # Still read-only five seconds later: nothing reaches Roblox, the answer says how long is left.
+    clock.advance(5)
+    second = await fetch(service)
+    assert len(egress.calls) == 1
+    assert second.status in (429, 503)
+    assert second.retry_after_s == 55
+    # hot.db recovers: the next request shares the cooldown fleet-wide first, and still does not call Roblox.
+    hot["broken"] = False
+    clock.advance(5)
+    third = await fetch(service)
+    assert len(egress.calls) == 1
+    assert third.retry_after_s == 50
+    rows = {row[0]: row[1] for row in read_rows(ctx.dbs.hot, "SELECT key, until_ms FROM cooldown")}
+    assert rows[f"endpoint:{TEMPLATE}:{egress_used.value}"] == pytest.approx(clock.now_ms() + 50_000, abs=5)
+    assert len(service.local_cooldowns) == 0
+    # After Retry-After the endpoint is used again.
+    egress.handler = lambda e, out: answer(200, b"{}")
+    clock.advance(51)
+    assert (await fetch(service)).status == 200
+    assert len(egress.calls) == 2
+
+
+async def test_exhausted_rate_limit_during_a_hot_outage_still_pauses_the_endpoint(
+    service: UpstreamService, egress: FakeEgress, ctx: Any, clock: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan 7.5: a 200 that says `x-ratelimit-remaining: 0` stops calls until the reset, outage or not."""
+    settings.set(rotator_enabled=0)
+    hot = break_hot_writes(ctx, monkeypatch)
+
+    def handler(e: Egress, out: Any) -> Any:
+        hot["broken"] = True
+        return answer(200, b"{}", {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "30"})
+
+    egress.handler = handler
+    first = await fetch(service)
+    assert (first.status, first.cooldown_s) == (200, 30)
+    clock.advance(1)
+    second = await fetch(service)
+    assert (second.status, second.reason, second.retry_after_s) == (429, ReasonCode.UPSTREAM_COOLDOWN, 29)
+    assert len(egress.calls) == 1
+
+
+async def test_local_cooldowns_are_shared_by_the_mirror_loop_and_never_shorten_a_row(
+    service: UpstreamService, ctx: Any, clock: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = clock.now_ms()
+    key = f"endpoint:{TEMPLATE}:direct"
+    service.local_cooldowns.remember(key, 30, "retry_after", now)
+    hot = break_hot_writes(ctx, monkeypatch)
+    hot["broken"] = True
+    stop = asyncio.Event()
+    loop = asyncio.ensure_future(service.run_mirror(stop, interval_s=0.01))
+    await asyncio.sleep(0.05)
+    assert len(service.local_cooldowns) == 1  # still unwritable: kept, and visible to `availability`
+    assert "direct cooling down" in service.availability(request(service)).reasons
+    ctx.dbs.hot.write_sync(
+        lambda conn: conn.execute(
+            "INSERT INTO cooldown (key, until_ms, source, set_at, hits) VALUES (?, ?, 'retry_after', 0, 1)",
+            (key, now + 90_000),
+        )
+    )
+    hot["broken"] = False
+    for _ in range(100):
+        if not len(service.local_cooldowns):
+            break
+        await asyncio.sleep(0.01)
+    stop.set()
+    await loop
+    assert len(service.local_cooldowns) == 0
+    assert read_rows(ctx.dbs.hot, "SELECT until_ms FROM cooldown WHERE key = ?", (key,)) == [(now + 90_000,)]
+
+
+async def test_reset_state_forgets_local_cooldowns(service: UpstreamService, clock: Any) -> None:
+    service.local_cooldowns.remember(f"endpoint:{TEMPLATE}:direct", 30, "retry_after", clock.now_ms())
+    await service.reset_state()
+    assert len(service.local_cooldowns) == 0
 
 
 # --- single-flight lease hook, availability, reset ------------------------------------------------------------------

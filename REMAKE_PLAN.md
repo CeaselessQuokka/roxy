@@ -67,7 +67,7 @@ Style rules that apply to this document AND to every artifact the rewrite produc
 | D7 | Auto-apply safe recommendations | Off by default. When on, only rules marked `safe_auto` apply, with guardrails and automatic rollback. | Owner should first see the engine is trustworthy. | PENDING |
 | D8 | Request/response body capture | On, with stronger redaction, 15 minute TTL, 64 MiB cap, and sampling of served (non-refused) requests at 20%. Refusals always captured. | Capture is valuable for debugging but stores caller payloads. | PENDING |
 | D9 | Keep old admin API paths as aliases? | No. The dashboard is rebuilt, so the new versioned API under `/admin/api/v1` replaces them. Capabilities are preserved, not URLs. Public URLs (`/`, `/health`, `/robots.txt`, `/sitemap.xml`, `/favicon.ico`, `/<sub>.roblox.com/...`, `/admin`, `/admin/invalidate/<token>`) stay identical. | Old JSON shapes were shaped by the old monolithic poll. | PENDING |
-| D10 | Do cache hits count toward a caller's per-IP throttle? | No (`throttle_count_cache_hits=0`). Cache hits cost Roblox nothing. A separate, much higher "flood" limit still counts every request. | Today callers get 429s for answers that never touched Roblox. | PENDING |
+| D10 | Do cache hits count toward a caller's per-IP throttle? | No (`throttle_count_cache_hits=0`). Cache hits cost Roblox nothing. A separate, much higher "flood" limit still counts every request. | Today callers get 429s for answers that never touched Roblox. | Decided by the owner on 2026-10-07: Yes, cache hits count (`throttle_count_cache_hits=1`), because serving a cache hit still costs Roxy resources. The flood limit still counts every request. |
 | D11 | Per-experience (Roblox-Id / place) limits | Observe and recommend only (`place_limit_enabled=0`), with a default limit ready (600 requests per minute per place) for when the owner turns it on. | One experience spans hundreds of game-server IPs; per-IP limits cannot bound it, but enforcing blindly could break a legitimate large game. | PENDING |
 | D12 | DataImpulse plan details | Owner fills in `rotator_quota_gb_per_month` and `rotator_price_per_gb_usd`. Placeholders: 0 (unknown, projections show bytes only). | Needed for quota alerts and cost projection. | PENDING |
 | D13 | When may the rotator be used? | Only for anonymous requests, and only when the direct path is cooling down, its bucket is empty, or a per-endpoint rule says "prefer rotator". Default share when everything is healthy: 0%. | Every rotator byte costs money and rotator IPs are often already rate-limited. | PENDING |
@@ -2141,7 +2141,7 @@ Notation: "v1 -> v2" shows the old default and the new default (same value means
 | `allowed_requests_per_minute` (label "Requests per window") | Per-IP requests per window | 10 -> 10 | 1 to 100000 | Friendlier to callers, more load | Stricter | Live |
 | `throttle_reset_duration` | Window length and base throttle duration (s) | 50 -> 50 | 1 to 86400 | Longer windows and penalties | Shorter | Live |
 | `throttle_window_mode` (new) | Window algorithm | fixed -> `gcra` | `fixed`: v1 behavior, a full allowance at each window start, so edge bursts of up to 2x are possible; `gcra`: smooth pacing with a burst equal to the limit, no window-edge doubling (10.2) | n/a | n/a | Live |
-| `throttle_count_cache_hits` (new) | Cache hits count toward per-IP limit | 1 (implicit) -> 0 | 0, 1 | n/a | n/a | Live |
+| `throttle_count_cache_hits` (new) | Cache hits count toward per-IP limit | 1 (implicit) -> 1 (D10, owner 2026-10-07) | 0, 1 | n/a | n/a | Live |
 | `stale_ip_duration` | Forget idle IPs without strikes (s) | 60 -> 60 | 1 to 86400 | Longer memory | Shorter | Live |
 | `throttle_escalation_enabled` | Strike ladder | 1 -> 1 | 0, 1 | n/a | 0 uses plain duration | Live |
 | `throttle_strike_decay_seconds` | Good behavior to lose one strike | 1800 -> 1800 | 0 (never) to 604800 | Strikes last longer | Forgiven sooner | Live |
@@ -2585,7 +2585,7 @@ Test `test_v1_home_links_survive` extracts every outbound `href` from the v1 tem
    end
    ```
    Plus examples for `GetAsync`, POST batch lookups with `JSONEncode`, reading `Roxy-*` headers, and a reusable module with caching and backoff.
-4. **Limits.** Per-IP requests per window (live numbers), what counts (cache hits do not, D10), the flood limit, place-level fairness if enabled, how escalation works (each repeated violation lengthens the throttle; good behavior forgives strikes).
+4. **Limits.** Per-IP requests per window (live numbers), what counts (every request, cache hits included, D10 as the owner decided it), the flood limit, place-level fairness if enabled, how escalation works (each repeated violation lengthens the throttle; good behavior forgives strikes).
 5. **Caching.** Roxy caches many responses; `Roxy-Cache` tells you HIT, MISS, REVALIDATING, STALE, COALESCED; `Roxy-Cache-Age` and `Roxy-Cache-TTL`. Why data can be up to N seconds old and how to avoid cache-busting params (they are ignored anyway).
 6. **Response headers reference.** Every `Roxy-*` header and `Retry-After` with meaning.
 7. **Status codes and what to do.**

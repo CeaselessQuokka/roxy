@@ -216,6 +216,15 @@ def test_credential_keys_never_share_an_id_with_anonymous_ones() -> None:
     assert anon.marker_id not in {anon.id, cred.id}
 
 
+def test_handoff_rows_have_their_own_id_per_key_and_auth_class() -> None:
+    """A single-flight handoff row never shares an id with an entry or a marker, of either auth class."""
+    anon = build_key("GET", "users.roblox.com", "v1/users", [("a", "1")], None)
+    cred = build_key("GET", "users.roblox.com", "v1/users", [("a", "1")], None, auth_class=AuthClass.CRED)
+    ids = {anon.id, anon.marker_id, anon.handoff_id, cred.id, cred.marker_id, cred.handoff_id}
+    assert len(ids) == 6
+    assert anon.handoff_id == build_key("GET", "users.roblox.com", "v1/users", [("a", "1")], None).handoff_id
+
+
 _TEXT = st.text(alphabet="ab=&%#?^@ ,~.-_1é", max_size=4)
 
 

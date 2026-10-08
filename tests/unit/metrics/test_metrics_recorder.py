@@ -272,11 +272,12 @@ async def test_capture_through_record_outcome(
     assert live == ("REQ1",)
 
 
-def test_capture_errors_never_fail_the_request(
+async def test_capture_errors_never_fail_the_request(
     recorder: MetricsRecorder,
     make_event: Callable[..., OutcomeEvent],
     monkeypatch: pytest.MonkeyPatch,
     presets: dict[str, Any],
+    metrics_rows: Rows,
 ) -> None:
     import roxy.metrics.recorder as mod
     from roxy.metrics.capture import CaptureInput
@@ -286,10 +287,19 @@ def test_capture_errors_never_fail_the_request(
 
     monkeypatch.setattr(mod, "make_row", broken)
     ev = make_event(**presets["refused"])
-    assert recorder.record_outcome(ev, capture=CaptureInput(request_id="X", at_ms=ev.at_ms)) == ""
+    # The capture is accepted at once (its id goes to the Live row); building it fails on the encoder thread.
+    assert recorder.record_outcome(ev, capture=CaptureInput(request_id="X", at_ms=ev.at_ms)) == "X"
+    await recorder.flush()
     assert recorder.capture_errors == 1
     assert recorder.record_errors == 0
     assert recorder.stats()["capture_errors"] == 1
+    assert metrics_rows("SELECT count(*) FROM captures") == [(0,)]
+    assert metrics_rows("SELECT sum(requests) FROM rollup_minute") == [(1,)]  # the request itself was counted
+    # A failure before the capture is queued (on the caller's thread) returns no capture id at all.
+    monkeypatch.setattr(mod, "trim_input", broken)
+    assert recorder.record_outcome(make_event(**presets["refused"]), capture=CaptureInput("Y", ev.at_ms)) == ""
+    assert recorder.capture_errors == 2
+    assert recorder.record_errors == 0
 
 
 async def test_samples_only_for_proxied_requests(

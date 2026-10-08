@@ -27,6 +27,7 @@ import json
 import socketserver
 import ssl
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -59,9 +60,11 @@ class FakeColor:
             "/": (200, {"Content-Type": "text/html; charset=utf-8"}, b"<html>home</html>"),
             "/health": (200, {"Content-Type": "application/json"}, b'{"Status":"ok"}'),
             "/admin": (200, {"Content-Type": "text/html; charset=utf-8"}, b"<html>login</html>"),
-            "/internal/version": (404, {}, b"Not Found"),
+            # The public app's own 404 for /internal (src/roxy/internal_app.py): v1's "Not Found", at once.
+            "/internal/version": (404, {"Content-Type": "application/json"}, b'"Not Found"\n'),
             "/static/css/app.0123456789.css": (200, {"Content-Type": "text/css"}, b"body{}"),
         }
+        self.delays: dict[str, float] = {}  # seconds the TCP side waits before answering a path
         self.proxy_states = ["MISS", "HIT"]
         self.version = SHA
         self.color = "green"
@@ -73,6 +76,7 @@ def make_handler(fake: FakeColor, *, internal: bool) -> type[http.server.BaseHTT
         def do_GET(self) -> None:
             if not internal:
                 fake.seen_hosts.append(self.headers.get("Host", ""))
+                time.sleep(fake.delays.get(self.path, 0.0))
             if internal:
                 body = json.dumps({"Version": fake.version, "Color": fake.color}).encode()
                 self.reply(200, {"Content-Type": "application/json"}, body)
@@ -166,6 +170,13 @@ def test_healthy_color_passes(smoke: ModuleType, color: Any, release: Path) -> N
     ("break_it", "check"),
     [
         (lambda f: f.answers.update({"/internal/version": (200, {}, b"{}")}), "internal_hidden"),
+        # /internal reached the proxy pipeline: refused as a probe instead of the app's own 404.
+        (
+            lambda f: f.answers.update(
+                {"/internal/version": (404, {"Roxy-Refusal": "not_roblox"}, b'"Not a Roblox URL"\n')}
+            ),
+            "internal_hidden",
+        ),
         (lambda f: setattr(f, "version", "f" * 40), "internal_version"),
         (lambda f: setattr(f, "color", "blue"), "internal_version"),
         (lambda f: f.answers.update({"/": (500, {}, b"")}), "home"),
@@ -184,6 +195,25 @@ def test_each_check_fails_when_its_condition_breaks(
     found = results(smoke, target, release)
     assert found[check][0] == "FAIL", found
     assert [name for name, (status, _) in found.items() if status == "FAIL"] == [check]
+
+
+def test_internal_hidden_fails_fast_when_the_answer_is_held(
+    smoke: ModuleType, color: Any, release: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held /internal answer (the probe tarpit holds 8 to 20 s) fails the check after its short timeout instead
+    of stalling the deploy; the 404 itself would look right. The timeout is scaled down for the test."""
+    import httpx
+
+    fake, target = color
+    assert smoke.INTERNAL_HIDDEN_TIMEOUT.read <= 5.0  # well under the tarpit's 8 s minimum hold
+    monkeypatch.setattr(smoke, "INTERNAL_HIDDEN_TIMEOUT", httpx.Timeout(0.3))
+    fake.delays["/internal/version"] = 1.0
+    started = time.monotonic()
+    found = results(smoke, target, release)
+    assert found["internal_hidden"][0] == "FAIL", found["internal_hidden"]
+    assert "Timeout" in found["internal_hidden"][1]
+    assert [name for name, (status, _) in found.items() if status == "FAIL"] == ["internal_hidden"]
+    assert time.monotonic() - started < 10
 
 
 def test_strict_cache_needs_a_hit(smoke: ModuleType, color: Any, release: Path) -> None:

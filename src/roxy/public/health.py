@@ -19,7 +19,11 @@ Why it exists
 How it works
     - `DataBytes`: the bytes the four SQLite databases use on disk (main file plus WAL), `DataLimitBytes`: the
       `storage_total_budget_gb` setting in bytes. v1 measured its single JSON data file against 24 MiB; the
-      meaning ("how full is the store that predicts trouble") is the same.
+      meaning ("how full is the store that predicts trouble") is the same. Measuring means a `stat` per file,
+      and on a stalled disk (the C7 situation) a `stat` can block for seconds, which on the event loop would
+      freeze every request of the worker. So the sizes are measured on a daemon thread, reused for
+      `SIZE_FRESH_S`, and awaited for at most `SIZE_WAIT_S`: when the disk is slow, `/health` answers at once
+      with the last size it knows (`cached_data_bytes`), and the late measurement is used by a later call.
     - `PersistenceOK`: every database answers a trivial read within 2 s and the store is within its budget.
     - `Paused`: the pause switch as the abuse pipeline sees it (refreshed every second from control.db).
     - `Degraded` codes: `starting` (the worker has no finished context), `shared_state` (a database did not
@@ -37,10 +41,14 @@ What to read next
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
 import sqlite3
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
@@ -71,18 +79,119 @@ def _setting(ctx: Any, key: str) -> Any:
     return catalog_default(key)
 
 
-def data_bytes(ctx: Any) -> int:
-    """Bytes the databases use on disk (main files and write-ahead logs); 0 for files that do not exist."""
+def _database_paths(ctx: Any) -> tuple[str, ...]:
     dbs = getattr(ctx, "dbs", None)
-    total = 0
     if dbs is None:
-        return 0
-    for db in dbs.all():
-        path = Path(db.path)
+        return ()
+    return tuple(str(db.path) for db in dbs.all())
+
+
+def measure_bytes(paths: tuple[str, ...]) -> int:
+    """Bytes the database files use on disk (main files and write-ahead logs); 0 for files that do not exist.
+
+    Blocking file system calls: run on a measurement thread (`_start_measurement`), never on the event loop.
+    """
+    total = 0
+    for name in paths:
+        path = Path(name)
         for suffix in DB_SUFFIXES:
             with contextlib.suppress(OSError):
                 total += (path.with_name(path.name + suffix)).stat().st_size
     return total
+
+
+def data_bytes(ctx: Any) -> int:
+    """Bytes the databases use on disk, measured now (blocking: for threads and scripts, not the event loop)."""
+    return measure_bytes(_database_paths(ctx))
+
+
+@dataclass
+class _Sizes:
+    """What this process last measured for one set of database files, and the measurement in flight."""
+
+    value: int = 0
+    measured_at: float | None = None  # time.monotonic() of the last finished measurement
+    pending: concurrent.futures.Future[int] | None = None
+
+
+SIZE_FRESH_S: Final = 10.0
+"""A measured size is reused for this long (the monitor polls every 30 s; the budget changes slowly)."""
+
+SIZE_WAIT_S: Final = 0.25
+"""How long `/health` waits for a new measurement before answering with the last known size."""
+
+MAX_SIZE_ENTRIES: Final = 8
+"""Database sets remembered (one per app in this process: one in production, a few in tests); plan P9."""
+
+_SIZES: dict[tuple[str, ...], _Sizes] = {}
+
+
+def _start_measurement(paths: tuple[str, ...]) -> concurrent.futures.Future[int]:
+    """Measure on a new daemon thread. Each set of files has at most one measurement in flight, so a stalled disk
+    holds at most `MAX_SIZE_ENTRIES` threads, never the event loop. Daemon (not a ThreadPoolExecutor, whose threads
+    are joined at interpreter exit): a `stat` stuck on a dead disk must not keep a stopping worker alive."""
+    future: concurrent.futures.Future[int] = concurrent.futures.Future()
+
+    def run() -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(measure_bytes(paths))
+        except BaseException as exc:  # handed to the waiting side, which keeps the last known size
+            future.set_exception(exc)
+
+    threading.Thread(target=run, name="roxy-health-size", daemon=True).start()
+    return future
+
+
+def _sizes_for(paths: tuple[str, ...]) -> _Sizes:
+    state = _SIZES.get(paths)
+    if state is None:
+        while len(_SIZES) >= MAX_SIZE_ENTRIES:
+            _SIZES.pop(next(iter(_SIZES)))  # the oldest set (dicts keep insertion order)
+        state = _SIZES[paths] = _Sizes()
+    return state
+
+
+def _adopt(state: _Sizes, now: float) -> None:
+    """Take the finished measurement's result, if there is one."""
+    future = state.pending
+    if future is None or not future.done():
+        return
+    state.pending = None
+    with contextlib.suppress(Exception):
+        state.value = int(future.result())
+        state.measured_at = now
+
+
+async def cached_data_bytes(ctx: Any, *, wait_s: float = SIZE_WAIT_S) -> int:
+    """`DataBytes` without touching the disk on the event loop (finding LOOP-2).
+
+    A size measured in the last `SIZE_FRESH_S` is returned as is. Otherwise one measurement is started on the
+    size thread (never two at once for the same files) and awaited for at most `wait_s`, polling so the loop keeps
+    serving; if it is not done by then (a stalled disk), the last known size is returned and the measurement is
+    picked up by a later call when it finishes. Before the first measurement ever finishes the answer is 0.
+    """
+    paths = _database_paths(ctx)
+    if not paths:
+        return 0
+    state = _sizes_for(paths)
+    now = time.monotonic()
+    _adopt(state, now)
+    if state.measured_at is not None and now - state.measured_at < SIZE_FRESH_S:
+        return state.value
+    if state.pending is None:
+        try:
+            state.pending = _start_measurement(paths)
+        except RuntimeError:  # no new thread (interpreter shutting down): answer with what we know
+            return state.value
+    deadline = now + max(0.0, wait_s)
+    # Polling on purpose: the result comes from another thread, and a wake-up callback per waiting request would
+    # pile up on a measurement that never finishes (a dead disk); a short poll costs nothing and holds nothing.
+    while state.pending is not None and not state.pending.done() and time.monotonic() < deadline:  # noqa: ASYNC110
+        await asyncio.sleep(0.005)
+    _adopt(state, time.monotonic())
+    return state.value
 
 
 async def databases_answer(ctx: Any) -> bool:
@@ -131,7 +240,7 @@ async def health_body(ctx: Any) -> dict[str, Any]:
     """The `/health` document for this worker (see the module docstring for every key)."""
     started = ctx is not None and bool(getattr(ctx, "ready", False))
     answers = await databases_answer(ctx) if started else False
-    used = data_bytes(ctx) if started else 0
+    used = await cached_data_bytes(ctx) if started else 0
     try:
         limit = int(float(_setting(ctx, "storage_total_budget_gb") or 0) * GIB)
     except (TypeError, ValueError):
@@ -183,4 +292,13 @@ async def health_other_methods() -> Response:
     )
 
 
-__all__ = ["data_bytes", "databases_answer", "health_body", "jsonify_bytes", "paused", "router"]
+__all__ = [
+    "cached_data_bytes",
+    "data_bytes",
+    "databases_answer",
+    "health_body",
+    "jsonify_bytes",
+    "measure_bytes",
+    "paused",
+    "router",
+]

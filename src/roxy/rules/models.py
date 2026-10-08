@@ -158,12 +158,12 @@ def _unchanged(info: ValidationInfo, *fields: str) -> bool:
     return all(name in unchanged for name in fields)
 
 
-def _checked_pattern(value: str, info: ValidationInfo) -> str:
+def _checked_pattern(value: str, info: ValidationInfo, *, exact: bool = False) -> str:
     kind: str = info.data.get("type", "glob")
     if _unchanged(info, "pattern", "type"):
         return normalize_pattern(value, kind)  # stored earlier (maybe imported from v1): normalize, never re-judge
     try:
-        return validate_pattern(value, kind)
+        return validate_pattern(value, kind, exact=exact)
     except PatternValidationError as exc:
         raise ValueError(exc.message) from None
 
@@ -417,13 +417,22 @@ class UpstreamLimitIn(_Model):
 
 
 class CredentialAllowlistIn(_PatternModel):
-    """An endpoint that may use the credential (D1, 9.13). GET and HEAD only; `cache_private` has no default."""
+    """An endpoint that may use the credential (D1, 9.13). GET and HEAD only; `cache_private` has no default.
+
+    The pattern grants exactly the endpoint it names: no implicit subpaths for a glob, a whole-path match for a
+    regex (finding F3). Paths below it need an explicit wildcard (`.../currency/*`) or a regex that says so.
+    """
 
     methods: tuple[str, ...] = ("GET",)
     cache_private: bool
     identical_anonymous: bool = False
     note: Note = ""
     enabled: bool = True
+
+    @field_validator("pattern")
+    @classmethod
+    def _pattern(cls, value: str, info: ValidationInfo) -> str:
+        return _checked_pattern(value, info, exact=True)  # judged in the exact form the allowlist matches with
 
     @field_validator("methods", mode="before")
     @classmethod

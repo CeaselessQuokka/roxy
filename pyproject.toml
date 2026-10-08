@@ -125,4 +125,7 @@ exclude_dirs = ["tests", "app", "Tooling", "Unused", "env2"]
 # interpolates an identifier (a table or column name from a module constant or the RULE_TABLES registry; values are
 # always bound parameters) carries an inline `noqa: S608` with its reason, reviewed by the lead. Keeping one owner for
 # the rule avoids two different suppression syntaxes on the same line.
-skips = ["B608"]
+# B610 and B704 follow the same rule. B610 is Django's `QuerySet.extra()` check and only ever matches anyio's
+# `stream.extra(...)` attribute lookups in `egress/metering.py` (ruff S610 owns it); B704 flags `Markup(...)`, and
+# every such call in `public/` wraps text that was escaped first, each with a reviewed `noqa: S704` reason.
+skips = ["B608", "B610", "B704"]

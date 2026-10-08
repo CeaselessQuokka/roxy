@@ -27,8 +27,8 @@ export type UsernamesResponse = {
 }
 
 -- Header names can arrive in any letter case, so compare them in lower case.
-local function getHeader(headers: { [string]: string }, name: string): string?
-	local wanted = string.lower(name)
+const function getHeader(headers: { [string]: string }, name: string): string?
+	const wanted = string.lower(name)
 	for key, value in headers do
 		if string.lower(key) == wanted then
 			return value
@@ -38,17 +38,17 @@ local function getHeader(headers: { [string]: string }, name: string): string?
 end
 
 -- Retry-After when it is a usable number, otherwise the fallback, plus random jitter.
-local function retryWaitSeconds(headers: { [string]: string }): number
-	local retryAfter = tonumber(getHeader(headers, "Retry-After"))
-	local seconds = if retryAfter and retryAfter >= 0 then retryAfter else FALLBACK_WAIT_SECONDS
+const function retryWaitSeconds(headers: { [string]: string }): number
+	const retryAfter = tonumber(getHeader(headers, "Retry-After"))
+	const seconds = if retryAfter and retryAfter >= 0 then retryAfter else FALLBACK_WAIT_SECONDS
 	return seconds + math.random() * MAX_JITTER_SECONDS
 end
 
-local function lookUpUsers(usernames: { string }): { UserByName }?
-	local request: UsernamesRequest = { usernames = usernames, excludeBannedUsers = true }
-	local body = HttpService:JSONEncode(request)
+const function lookUpUsers(usernames: { string }): { UserByName }?
+	const request: UsernamesRequest = { usernames = usernames, excludeBannedUsers = true }
+	const body = HttpService:JSONEncode(request)
 	for attempt = 1, MAX_ATTEMPTS do
-		local sent, response = pcall(function()
+		const sent, response = pcall(function()
 			return HttpService:RequestAsync({
 				Url = USERNAMES_URL,
 				Method = "POST", -- PATCH, PUT and DELETE work the same way
@@ -62,16 +62,17 @@ local function lookUpUsers(usernames: { string }): { UserByName }?
 		end
 
 		if response.StatusCode == 200 then
-			local decoded, result = pcall(function(): UsernamesResponse
+			-- JSONDecode returns `any`: the return type names the shape, and the check confirms it before use.
+			const decoded, result = pcall(function(): UsernamesResponse
 				return HttpService:JSONDecode(response.Body or "")
 			end)
-			if not decoded then
-				warn("The answer was not valid JSON:", result)
+			if not decoded or typeof(result) ~= "table" or typeof(result.data) ~= "table" then
+				warn("The answer was not the JSON this script expects")
 				return nil
 			end
 			return result.data
 		elseif response.StatusCode == 429 or response.StatusCode == 503 then
-			local waitSeconds = retryWaitSeconds(response.Headers)
+			const waitSeconds = retryWaitSeconds(response.Headers)
 			if attempt == MAX_ATTEMPTS or waitSeconds > MAX_WAIT_SECONDS then
 				warn(`Roxy asked to wait {math.ceil(waitSeconds)} seconds; giving up for now`)
 				return nil
@@ -85,7 +86,7 @@ local function lookUpUsers(usernames: { string }): { UserByName }?
 	return nil
 end
 
-local users = lookUpUsers({ "Roblox", "builderman" })
+const users = lookUpUsers({ "Roblox", "builderman" })
 if users then
 	for _, user in users do
 		print(`{user.requestedUsername} is user {user.id} ({user.displayName})`)

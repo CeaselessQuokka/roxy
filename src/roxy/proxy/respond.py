@@ -24,16 +24,24 @@ How it works
     `Roxy-Refusal: <reason>` only when the refusal does not name itself and is not disguised. Never wrapped in
     HTML, never pretty printed (v1 parity); the challenge page is the one refusal that is HTML itself.
     Failures (a 7.13 row): the row gives the status (or the real Roblox 5xx), the fixed text, `Retry-After`, and
-    whether `Roxy-Refusal` and `Roxy-Upstream-Cooldown` are sent. The text is sent as `text/plain; charset=utf-8`.
+    whether `Roxy-Refusal` and `Roxy-Upstream-Cooldown` are sent. The text is sent as `text/plain; charset=utf-8`
+    (v1 sent these as raw text labeled JSON), except the `internal_error` row: v1 answered every unhandled error
+    with `jsonify("Internal Server Error")`, so that row is the JSON string plus a newline, the same bytes the
+    unhandled error middleware sends (`core/errors.py`).
     Served answers: the real upstream status (D4), the upstream body pretty printed when `?prettyprint=true`, then
     for a browser (`context.is_browser`) a textual body is wrapped as `<pre>` with v1's markupsafe escaping and
     sent as HTML; a non-browser gets `application/json` for JSON (v1's exact type, no charset) or the real
     upstream `Content-Type` replayed otherwise (plan row 4). Headers: the abuse pipeline's (the throttle snapshot
     trio), `Roxy-Cache` with `Roxy-Cache-Age` and `Roxy-Cache-TTL` for cache serves, `Roxy-Upstream-Status`,
     `Roxy-Upstream-Cooldown`, and the plan 9.13 safe upstream headers (`scrub.safe_response_headers`).
-    With `compat_collapse_upstream_errors` on, every Roblox 4xx (live or cached), every Roblox 5xx, and the 502
-    and 504 rows become 500 with `Upstream request failed; please try again later.` (plan 7.13 and the setting's
-    help text); Roxy's own refusals and the 429 and 503 rows are unchanged, and `Retry-After` is still sent.
+    With `compat_collapse_upstream_errors` on (v1's behavior, for old scripts), every Roblox 4xx (live or cached)
+    reaches the caller exactly as v1 sent it: status 500 with Roblox's own body and content type, never pretty
+    printed (v1 pretty printed only successes), still shown as `<pre>` to a browser (v1 used the same view for
+    errors). v1 never replaced a Roblox error body with its own text (v1 notes pipeline.md section 7 step 4, bug
+    B1), and the setting exists to reproduce v1, so its body wins over plan 7.13's compat note, which assumed v1
+    sent the failure text. Every Roblox 5xx and the 502 and 504 rows become 500 with `Upstream request failed;
+    please try again later.` as plan 7.13 says. Roxy's own refusals and the 429 and 503 rows are unchanged, and
+    `Retry-After` is still sent. Off (plan D4, the default) passes the real status.
     Header names keep their canonical casing (`Roxy-Cache`, `Retry-After`) because Starlette would lowercase them:
     they are appended to `raw_headers` directly. The router marks every proxy response as proxied content, so the
     security middleware sends `Content-Security-Policy: default-src 'none'; sandbox` (plan 9.2), and the HTML view
@@ -61,7 +69,7 @@ from starlette.responses import Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from roxy.core.deadline import DEADLINE_BODY
-from roxy.core.errors import INTERNAL_ERROR_BODY
+from roxy.core.errors import INTERNAL_ERROR_BODY, v1_json_body
 from roxy.core.reasons import REFUSAL_HEADER, AuthClass, CacheState, Egress, Outcome, ReasonCode, Source
 from roxy.proxy import scrub
 from roxy.proxy.context import ProxyRequest
@@ -200,6 +208,8 @@ class FailureRow:
     cooldown_header: bool = False
     collapsible: bool = False
     """True when `compat_collapse_upstream_errors` turns this row into a 500 (Roblox 5xx, 502, 504)."""
+    json_string: bool = False
+    """True when v1 sent this text with `jsonify` (a JSON string plus a newline, `application/json`)."""
 
 
 FAILURE_ROWS: dict[ReasonCode, FailureRow] = {
@@ -220,7 +230,7 @@ FAILURE_ROWS: dict[ReasonCode, FailureRow] = {
     ReasonCode.DEGRADED: FailureRow(503, UPSTREAM_BUSY_TEXT, 10),
     # Not a 7.13 row: the leak guard disabled an egress mid-request. Treated like `egress_disabled`.
     ReasonCode.LEAK_BLOCKED: FailureRow(503, UPSTREAM_BUSY_TEXT, 60),
-    ReasonCode.INTERNAL_ERROR: FailureRow(500, INTERNAL_ERROR_TEXT, 5, refusal_header=False),
+    ReasonCode.INTERNAL_ERROR: FailureRow(500, INTERNAL_ERROR_TEXT, 5, refusal_header=False, json_string=True),
 }
 """Plan 7.13, the rows whose body Roxy writes. Served rows (2xx, 4xx, cache serves) pass the upstream body."""
 
@@ -325,7 +335,7 @@ def _header_safe(name: str, value: str) -> bool:
 
 def refusal_body(text: str) -> bytes:
     """v1 `jsonify(text)`: the JSON string (ASCII, non-ASCII as \\uXXXX) followed by a newline."""
-    return (json.dumps(str(text)) + "\n").encode("ascii")
+    return v1_json_body(text)
 
 
 def pretty_json(body: bytes) -> bytes:
@@ -558,10 +568,11 @@ def render_failure(
     if row.refusal_header:
         headers.set(REFUSAL_HEADER, reason.value)
     _common_tail(headers, req, cors_any_origin)
+    as_json = row.json_string and not collapsed
     return Rendered(
         status=status,
-        body=text.encode("utf-8"),
-        content_type=TEXT_TYPE,
+        body=refusal_body(text) if as_json else text.encode("utf-8"),
+        content_type=JSON_TYPE if as_json else TEXT_TYPE,
         headers=headers.items(),
         outcome=Outcome.FAILED,
         reason=reason,
@@ -587,13 +598,18 @@ def render_served(
     source = Source(getattr(result, "source", Source.ROBLOX))
     collapsed = compat_collapse and status >= 400
     transformed = False
-    if collapsed:
-        # v1 never relayed a Roblox error status: 4xx (cached ones included) and 5xx became 500 (plan 7.13).
+    if collapsed and status >= 500:
+        # A Roblox 5xx served as such: plan 7.13's compat note gives it v1's failure text.
         status, body, content_type = 500, UPSTREAM_FAILED_TEXT.encode("utf-8"), TEXT_TYPE
     elif status < 200 or status in NO_BODY_STATUSES:
         body, content_type = b"", None
     else:
-        if req.prettyprint:
+        if collapsed:
+            # v1 never relayed a Roblox error status (bug B1): a 4xx, live or cached, reached the caller as 500
+            # carrying Roblox's own body. Compat mode exists to reproduce that, so only the status changes, and
+            # the body is not pretty printed (v1 pretty printed successes only).
+            status = 500
+        elif req.prettyprint:
             pretty = pretty_json(body)
             transformed = pretty != body
             body = pretty

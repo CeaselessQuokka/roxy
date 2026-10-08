@@ -11,8 +11,11 @@ Why it exists
     recycling and its event loop stall watchdog. Each setting is a decision with a reason, and the plan asks for
     every line to be commented (5.2, 18.1 item 8). Three choices matter most:
     - Two listeners: the loopback TCP port nginx proxies to, and the internal Unix socket for the deploy health
-      gate (plan 5.8). The socket must be mode 0660 so the deploy user (group roxy) can connect and nobody else
-      can; gunicorn creates it with `umask` applied, so the umask below sets that mode.
+      gate (plan 5.8). Every worker opens its own TCP listener (`reuse_port`), so the kernel spreads nginx's
+      connections evenly over the workers instead of piling them onto one; the Unix socket cannot be shared that
+      way, so the master creates it once (`on_starting`) and hands it to every worker (`post_fork`). The socket
+      must be mode 0660 so the deploy user (group roxy) can connect and nobody else can; it is created with
+      `umask` applied, so the umask below sets that mode.
     - Low-memory deploy mode (DESIGN.md section 0): on the 909 MB server a deploy may start the idle color with
       one worker and add the rest after the old color stopped. deploy.sh asks for that with a small marker file;
       this file reads it.
@@ -123,12 +126,28 @@ worker_class = "roxy.worker.RoxyUvicornWorker"
 # for 1 here and adds the rest after the old color stopped (DESIGN.md section 0).
 workers = start_workers(_full_workers, _marker)
 
-# Two listeners (plan 5.8): the loopback TCP address nginx proxies to (ROXY_BIND, 127.0.0.1:8001 for blue and
-# 127.0.0.1:8002 for green), and the internal Unix socket that only the deploy and ctl.py use. The ASGI
-# dispatcher in roxy/asgi.py sends Unix socket requests to the internal app; nginx never proxies to the socket.
-bind = [env_text("ROXY_BIND", "127.0.0.1:8001"), f"unix:{_internal_socket}"]
+# Each worker opens its own listener on the TCP address with SO_REUSEPORT, and the kernel hands every new
+# connection to one of them by a hash of the client's address and port, so connections spread evenly. With one
+# listener shared by all workers (gunicorn's default), the worker that went idle last accepts nearly every
+# connection: 4 workers took 70/10/0/0 of 80 fresh connections and 130/30/0/0 of the requests on a 16-connection
+# keep-alive pool (what nginx keeps open), against 21/21/21/17 and 60/59/36/5 with this setting. Trade-offs: a
+# second master started on the same port (same user) would share it silently instead of failing to bind, and
+# connections still waiting in a stopping worker's accept queue are reset (Linux moves them to another worker when
+# net.ipv4.tcp_migrate_req=1), so a single-worker color briefly refuses connections while its worker recycles.
+reuse_port = True
 
-# gunicorn applies this umask while it creates the Unix socket, so the socket is 0777 & ~0117 = 0660: the roxy
+# The loopback TCP address nginx proxies to (ROXY_BIND, 127.0.0.1:8001 for blue and 127.0.0.1:8002 for green),
+# opened by every worker itself (reuse_port). The second listener, the internal Unix socket that only the deploy
+# and ctl.py use (plan 5.8), is not listed here: SO_REUSEPORT does not apply to Unix sockets (newer kernels refuse
+# it, and older ones would let each worker replace the socket file of the one before), so the master creates it
+# once in on_starting and every worker accepts on that one shared socket (post_fork). The ASGI dispatcher in
+# roxy/asgi.py sends Unix socket requests to the internal app; nginx never proxies to the socket.
+bind = [env_text("ROXY_BIND", "127.0.0.1:8001")]
+
+INTERNAL_SOCKET = _internal_socket
+"""The internal Unix socket path (ROXY_INTERNAL_SOCKET, /run/roxy-<color>/internal.sock by default)."""
+
+# The master applies this umask while it creates the Unix socket, so the socket is 0777 & ~0117 = 0660: the roxy
 # user and the roxy group (the deploy user is a member) may connect, everyone else is refused. The runtime
 # directory around it is 0750 (RuntimeDirectoryMode), a second fence.
 umask = 0o117
@@ -140,6 +159,9 @@ timeout = 30
 
 # How long workers get to finish in-flight requests and SWR refreshes on a reload or stop. systemd's
 # TimeoutStopSec (45) is longer, so systemd never kills a worker that gunicorn is still draining (v1 had 20 < 30).
+# The worker class splits it (roxy/worker.py): uvicorn waits at most 30 - 8 - 2 = 20 s for open requests (tarpit
+# holds, up to 55 s, are answered at once when shutdown starts), then the lifespan shutdown gets its 8 s budget
+# (final metrics flush, leader lease release), and 2 s are left before gunicorn would kill the worker.
 graceful_timeout = 30
 
 # Idle keep-alive for nginx's upstream connections. uvicorn takes the real value from the worker class
@@ -191,6 +213,48 @@ worker_tmp_dir = memory_tmp_dir()
 # ------------------------------------------------------------------------------------------------ hooks
 
 
+def internal_listener(server: Any) -> Any:
+    """gunicorn's own Unix socket listener for `INTERNAL_SOCKET`, created with `umask` (mode 0660).
+
+    gunicorn's socket helper sets SO_REUSEPORT whenever the config says `reuse_port`, which a Unix socket refuses,
+    so it gets a settings object of its own that says no.
+    """
+    from types import SimpleNamespace
+
+    from gunicorn import sock
+
+    settings = SimpleNamespace(
+        umask=umask, uid=server.cfg.uid, gid=server.cfg.gid, backlog=server.cfg.backlog, reuse_port=False
+    )
+    return sock.UnixSocket(INTERNAL_SOCKET, settings, server.log)
+
+
+def on_starting(server: Any) -> None:
+    """Create the internal Unix socket once, in the master, before any worker exists (see `bind`).
+
+    gunicorn keeps it in its listener list (logged as "Listening at", closed when the master stops) and, because
+    the list is not empty, creates no other master listener; with `reuse_port` the workers open the TCP listener.
+    """
+    server.LISTENERS = [internal_listener(server)]
+
+
+def post_fork(server: Any, worker: Any) -> None:
+    """Give each new worker the master's internal Unix socket next to its own TCP listener."""
+    for listener in server.LISTENERS:
+        if listener not in worker.sockets:
+            worker.sockets.append(listener)
+
+
+def on_exit(server: Any) -> None:
+    """Remove the internal socket file (gunicorn leaves Unix socket files in place when `reuse_port` is on)."""
+    path = Path(INTERNAL_SOCKET)
+    try:
+        if path.is_socket():
+            path.unlink()
+    except OSError as exc:
+        _warn(f"could not remove {path}: {exc}")
+
+
 def when_ready(server: Any) -> None:
     """Log the effective settings once the master listens, so the journal shows which mode this start used."""
     mode = "low-memory" if workers < _full_workers else "normal"
@@ -200,5 +264,5 @@ def when_ready(server: Any) -> None:
         workers,
         _full_workers,
         mode,
-        ",".join(bind),
+        ",".join([*bind, f"unix:{INTERNAL_SOCKET}"]),
     )

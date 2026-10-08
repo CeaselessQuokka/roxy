@@ -15,8 +15,9 @@ Why it exists
 How it works
     `FakeUpstream(responder)` calls `responder(req, call_number)` for each fetch (or returns a 200 with a
     numbered body by default), optionally after waiting for `gate` (an asyncio.Event) or `delay_s`, and records
-    `(priority, stale_available, purpose)` per call. `availability` answers from `cooldown_s`: None means every
-    egress is available. Nothing here opens a socket.
+    `(priority, stale_available, purpose)` per call. Like the real upstream it takes the single-flight lease
+    passed as `lease=` before "calling" (`take_lease`; a lost lease raises `SingleFlightLost` and is not a call).
+    `availability` answers from `cooldown_s`: None means every egress is available. Nothing here opens a socket.
 
 What to read next
     `roxy/cache/service.py` (what these fakes stand in for) and `tests/unit/cache/`.
@@ -139,12 +140,29 @@ class FakeUpstream:
         self.calls: list[FakeCall] = []
         self.cooldown_s: float | None = None
         self.started = asyncio.Event()
+        self.leases_lost = 0
 
     @property
     def count(self) -> int:
         return len(self.calls)
 
-    async def fetch(self, req: Any, *, priority: Any, stale_available: bool, purpose: str = "caller") -> FakeResult:
+    async def take_lease(self, lease: Any) -> None:
+        """What the real upstream does with `lease=` inside its reservation: take the single-flight lease or
+        raise `SingleFlightLost` (nothing is "sent" then). Here the hook runs in a hot.db transaction of its own
+        (`FlightLease.claim_alone`), so cross-worker tests coalesce exactly like production."""
+        if lease is None:
+            return
+        claim = getattr(lease, "claim_alone", None)
+        if claim is not None and not await claim():
+            from roxy.upstream.service import SingleFlightLost  # local: keeps importing the fakes light
+
+            self.leases_lost += 1
+            raise SingleFlightLost("fake upstream: the single-flight lease belongs to another flight")
+
+    async def fetch(
+        self, req: Any, *, priority: Any, stale_available: bool, purpose: str = "caller", lease: Any = None
+    ) -> FakeResult:
+        await self.take_lease(lease)
         number = len(self.calls) + 1
         self.calls.append(FakeCall(int(priority), stale_available, purpose, _url_of(req)))
         self.started.set()

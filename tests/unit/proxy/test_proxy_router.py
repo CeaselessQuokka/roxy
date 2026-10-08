@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+import pytest
 
 from roxy.core.reasons import CacheState, Egress, Outcome, ReasonCode
 from roxy.proxy import respond
@@ -202,6 +203,9 @@ async def test_tarpit_without_shared_state_never_holds(proxy_client: httpx.Async
 
 
 async def test_throttled_caller_served_from_fresh_cache(proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any) -> None:
+    # The pipeline grants `allow_fresh_cache_serve` only with `cache_serve_throttled` on, which also makes the
+    # router peek before the verdict (it needs `fresh_cache_hit`).
+    ctx.settings = fakes.FakeSettings(cache_serve_throttled=1)
     refusal = respond.Refusal(
         429,
         "Too many requests; please slow down.",
@@ -222,6 +226,61 @@ async def test_throttled_caller_served_from_fresh_cache(proxy_client: httpx.Asyn
     assert ctx.abuse.tarpit.asked == []
     [event] = ctx.recorder.events
     assert event.reason is ReasonCode.THROTTLED_CACHE
+
+
+def _track_order(ctx: Any) -> list[str]:
+    """Wrap the fake pipeline's `evaluate` and the fake cache's `peek` so the test sees their order."""
+    order: list[str] = []
+    evaluate, peek = ctx.abuse.evaluate, ctx.cache.peek
+
+    async def tracked_evaluate(req: Any) -> Any:
+        order.append("verdict")
+        return await evaluate(req)
+
+    async def tracked_peek(req: Any) -> Any:
+        order.append("peek")
+        return await peek(req)
+
+    ctx.abuse.evaluate = tracked_evaluate
+    ctx.cache.peek = tracked_peek
+    return order
+
+
+async def test_by_default_the_cache_is_peeked_only_after_an_allow(
+    proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any
+) -> None:
+    """With the catalog defaults (cache hits count, no throttled cache serve) no abuse check reads the cache, so the
+    peek waits for the verdict: a refused caller costs no cache read and no cache rule match (plan 9.9)."""
+    order = _track_order(ctx)
+    response = await proxy_client.get(GAMES)
+    assert response.status_code == 200
+    assert order == ["verdict", "peek"]
+    assert ctx.cache.served == ctx.abuse.seen
+    assert ctx.abuse.seen[0].cache_key == "key-1"  # the late peek still marks the request for the outcome record
+
+    ctx.abuse = fakes.FakeAbuse(respond.Refusal(429, "Too many requests; please slow down.", ReasonCode.THROTTLE))
+    ctx.cache = fakes.FakeCache()
+    order = _track_order(ctx)
+    assert (await proxy_client.get(GAMES)).status_code == 429
+    assert order == ["verdict"]
+    assert ctx.cache.peeked == []
+    assert ctx.cache.served == []
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"throttle_count_cache_hits": 0}, {"cache_serve_throttled": 1}], ids=["hits_not_counted", "serve"]
+)
+async def test_the_cache_is_peeked_before_the_verdict_when_a_check_reads_it(
+    proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any, overrides: dict[str, int]
+) -> None:
+    """`fresh_cache_hit` matters to the per-IP throttle (hits not counted) and to the throttled cache serve: then
+    the peek runs first, once, and the allowed request is served from that same peek."""
+    ctx.settings = fakes.FakeSettings(**overrides)
+    ctx.cache = fakes.FakeCache(peek_result=fakes.FakePeek(key="k", fresh=object()))
+    order = _track_order(ctx)
+    assert (await proxy_client.get(GAMES)).status_code == 200
+    assert order == ["peek", "verdict"]
+    assert ctx.abuse.seen[0].fresh_cache_hit is True
 
 
 async def test_throttled_without_fresh_entry_is_refused(proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any) -> None:
@@ -283,7 +342,9 @@ async def test_unhandled_error_is_recorded_once_by_the_router(proxy_client: http
     ctx.cache.serve = broken
     response = await proxy_client.get(GAMES)
     assert response.status_code == 500
-    assert response.content == b"Internal Server Error"
+    # The middleware owns the body (core/errors.py): v1's `jsonify("Internal Server Error")` form.
+    assert response.content == b'"Internal Server Error"\n'
+    assert response.headers["content-type"].split(";")[0] == "application/json"
     # The middleware answers 500; the flow writes the fallback outcome itself, exactly once (DESIGN 7).
     assert len(ctx.recorder.events) == 1
     event = ctx.recorder.events[0]
@@ -332,8 +393,8 @@ async def test_settings_are_live(proxy_client: httpx.AsyncClient, ctx: Any, fake
     ctx.settings.overrides["compat_collapse_upstream_errors"] = 1
     ctx.cache.result = fakes.served(b'{"errors":[]}', status=404, reason=ReasonCode.UPSTREAM_4XX)
     collapsed = await proxy_client.get("/www.roblox.com/home")
-    assert collapsed.status_code == 500
-    assert collapsed.content == respond.UPSTREAM_FAILED_TEXT.encode()
+    assert collapsed.status_code == 500  # the live setting reached respond: v1's collapse (lead decision on F8)
+    assert collapsed.content == b'{"errors":[]}'  # with Roblox's own body, exactly as v1 sent it
 
 
 async def test_methods_outside_the_list_are_405(proxy_client: httpx.AsyncClient, ctx: Any) -> None:
@@ -431,3 +492,138 @@ async def test_capture_input_handed_to_a_capturing_recorder(proxy_client: httpx.
     assert capture.request_body == b'{"usernames":["a"]}'
     assert capture.response_body == b'{"data":[]}'
     assert capture.url == "users.roblox.com/v1/usernames/users"
+
+
+# --- /internal on the public app (lead decision: v1's JSON 404, no pipeline, no tarpit) -------------------------------
+
+
+async def test_internal_paths_on_the_public_app_are_a_plain_404(
+    proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any
+) -> None:
+    ctx.abuse.tarpit = fakes.FakeTarpit(fakes.FakePlan("hold"))
+    for method, path in (("GET", "/internal"), ("GET", "/internal/version"), ("POST", "/internal/flush")):
+        response = await proxy_client.request(method, path)
+        assert response.status_code == 404
+        assert response.content == b'"Not Found"\n'
+        assert response.headers["content-type"] == "application/json"
+        assert "Roxy-Refusal" not in response.headers
+    assert ctx.abuse.seen == []  # never the proxy pipeline
+    assert ctx.abuse.tarpit.asked == []  # never held
+    assert ctx.recorder.events == []
+    # A path that only starts with the same letters is an ordinary (refused) proxy path.
+    assert (await proxy_client.get("/internals/x")).status_code == 404
+    assert len(ctx.abuse.seen) == 1
+
+
+# --- message_source for failures (parity row 116) ---------------------------------------------------------------------
+
+
+async def test_message_source_tells_roxy_text_from_roblox_body(
+    proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any
+) -> None:
+    ctx.cache.result = respond.failure_result(ReasonCode.UPSTREAM_TIMEOUT)
+    assert (await proxy_client.get(GAMES)).status_code == 504
+    ctx.cache.result = fakes.served(b'{"errors":[{"code":0}]}', status=404, reason=ReasonCode.UPSTREAM_4XX)
+    assert (await proxy_client.get(GAMES)).status_code == 404
+    ctx.cache.result = fakes.served()
+    assert (await proxy_client.get(GAMES)).status_code == 200
+    timeout, relayed, ok = ctx.recorder.events
+    assert timeout.message_source == "roxy"  # a plan 7.13 text Roxy wrote
+    assert relayed.message_source == "roblox"  # Roblox's own error body
+    assert ok.message_source == ""
+
+
+# --- upstream_cooldown_retry: the router hands pacing failures to the tarpit (plan 10.6) ------------------------------
+
+
+class RetryTarpit:
+    """`tarpit.plan_cooldown_retry` stand-in: records every call and returns `plan` (None: no hold)."""
+
+    def __init__(self, plan: Any) -> None:
+        self.plan_value = plan
+        self.calls: list[dict[str, Any]] = []
+        self.asked: list[Any] = []
+
+    async def plan(self, category: str, req: Any, *, reason: str = "") -> Any:
+        self.asked.append(category)
+        return None
+
+    async def plan_cooldown_retry(self, req: Any, *, key: str, retry_after_s: float, reason: str = "") -> Any:
+        self.calls.append({"key": key, "retry_after_s": retry_after_s, "reason": reason, "bypass": req.bypass})
+        return self.plan_value
+
+
+def cooldown_result(retry_after_s: int = 30) -> Any:
+    return respond.failure_result(
+        ReasonCode.UPSTREAM_COOLDOWN, retry_after_s=retry_after_s, cooldown_s=retry_after_s, upstream_status=429
+    )
+
+
+async def test_a_pacing_failure_is_offered_to_the_cooldown_retry_tarpit(
+    proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any
+) -> None:
+    plan = fakes.FakePlan("jitter")
+    ctx.abuse.tarpit = RetryTarpit(plan)
+    ctx.cache.result = cooldown_result(30)
+    response = await proxy_client.get(GAMES)
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "30"
+    [call] = ctx.abuse.tarpit.calls
+    assert call["key"] == "key-1"  # the cache key id: "the same key"
+    assert call["retry_after_s"] == 30
+    assert call["reason"] == "Retry inside Retry-After (upstream_cooldown)"
+    assert plan.waited == 1
+    assert plan.released == 1
+    assert len(ctx.recorder.events) == 1
+
+
+async def test_cooldown_retry_is_never_asked_for_served_answers_or_bypass_callers(
+    proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any
+) -> None:
+    ctx.abuse.tarpit = RetryTarpit(fakes.FakePlan("jitter"))
+    assert (await proxy_client.get(GAMES)).status_code == 200  # served: never tarpitted
+    ctx.cache.result = respond.failure_result(ReasonCode.UPSTREAM_TIMEOUT)
+    assert (await proxy_client.get(GAMES)).status_code == 504  # a failure that paces nobody
+    ctx.cache.result = cooldown_result()
+    original = ctx.abuse.evaluate
+
+    async def bypassing(req: Any) -> Any:
+        req.bypass = True
+        return await original(req)
+
+    ctx.abuse.evaluate = bypassing
+    assert (await proxy_client.get(GAMES)).status_code == 429
+    assert ctx.abuse.tarpit.calls == []
+
+
+async def test_cooldown_retry_without_shared_state_never_holds(proxy_client: httpx.AsyncClient, ctx: Any) -> None:
+    class Broken(RetryTarpit):
+        async def plan_cooldown_retry(self, req: Any, **kwargs: Any) -> Any:
+            raise SharedStateUnavailable("hot", "locked")
+
+    ctx.abuse.tarpit = Broken(None)
+    ctx.cache.result = cooldown_result()
+    assert (await proxy_client.get(GAMES)).status_code == 429  # C7: the answer still goes out, unheld
+
+
+# --- the Roblox-Id place claim is scrubbed before it can become a hot.db key (plan C1, 9.15) -------------------------
+
+
+async def test_a_credential_piece_in_roblox_id_never_reaches_the_request(
+    proxy_client: httpx.AsyncClient, ctx: Any
+) -> None:
+    import secrets
+
+    from roxy.core.redact import SecretRegistry
+
+    secret = secrets.token_hex(40)  # a fake credential made at runtime
+    SecretRegistry.register("router_test_credential", secret, match_substrings=True)  # like the credential
+    try:
+        await proxy_client.get(GAMES, headers={"Roblox-Id": secret[:40]})
+        await proxy_client.get(GAMES, headers={"Roblox-Id": " 4483381587 "})
+    finally:
+        SecretRegistry.unregister("router_test_credential")
+    scrubbed, plain = ctx.abuse.seen
+    assert scrubbed.place_id
+    assert secret[:24] not in scrubbed.place_id
+    assert plain.place_id == "4483381587"  # an ordinary place id is unchanged

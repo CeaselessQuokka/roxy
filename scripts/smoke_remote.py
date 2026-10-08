@@ -7,7 +7,8 @@ What this is
       home              GET / on the color's TCP port is 200 HTML
       health            GET /health is 200
       admin_login       GET /admin (the login page) is 200 HTML
-      internal_hidden   GET /internal/version on the TCP port is 404 (internal endpoints exist only on the socket)
+      internal_hidden   GET /internal/version on the TCP port is an immediate 404 from the app itself (internal
+                        endpoints exist only on the socket; the path never reaches the proxy pipeline)
       proxy             a proxy request goes through the whole pipeline twice; the second answer carries a
                         Roxy-Cache header (with --strict-cache it must be a cache hit)
       static            a content-hashed asset from the release's static manifest is 200 on the TCP port and, when
@@ -48,6 +49,8 @@ import httpx
 CACHE_HITS = frozenset({"HIT", "REVALIDATING", "COALESCED", "STALE"})
 DEFAULT_PROXY_PATH = "/users.roblox.com/v1/users/1"
 TIMEOUT = httpx.Timeout(20.0, connect=5.0)
+INTERNAL_HIDDEN_TIMEOUT = httpx.Timeout(5.0)
+"""The public app answers /internal at once; the probe tarpit (if the path ever reached the proxy) holds 8 s or more."""
 RELEASE_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -172,8 +175,12 @@ def run_checks(
             return "200 text/html"
 
         def internal_hidden() -> str:
-            response = tcp.get("/internal/version")
+            # A timeout here (httpx.ReadTimeout, a FAIL) or a Roxy-Refusal header means /internal reached the proxy
+            # pipeline and its tarpit instead of the public app's own 404 (src/roxy/internal_app.py).
+            response = tcp.get("/internal/version", timeout=INTERNAL_HIDDEN_TIMEOUT)
             assert response.status_code == 404, f"status {response.status_code}; internal endpoints must be 404 on TCP"
+            refusal = response.headers.get("roxy-refusal")
+            assert refusal is None, f"refused by the proxy pipeline ({refusal}); /internal must never reach it"
             return "404 on the TCP port"
 
         def proxy() -> str:

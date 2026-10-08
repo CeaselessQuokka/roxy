@@ -308,7 +308,7 @@ terms:
     source: roxy
   - id: throttle
     term: Throttle
-    definition: The per-IP rate limit. A caller over it gets 429 with Retry-After and a strike, and repeat offenders wait longer.
+    definition: The per-IP rate limit, which by default counts every request, cache hits included, because serving a cache hit still costs Roxy. A caller over it gets 429 with Retry-After and a strike, and repeat offenders wait longer.
     source: roxy
   - id: place-limit
     term: Place limit

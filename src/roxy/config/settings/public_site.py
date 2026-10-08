@@ -100,8 +100,9 @@ SETTINGS: list[SettingSpec] = [
         max_length=300,
         description=(
             "The text callers receive, with HTTP status 503, while the proxy is paused and the admin did not type "
-            "a specific reason in the pause dialog. Game developers see it in their scripts' error output, so keep "
-            "it short and plain."
+            "a specific reason in the pause dialog. Throttle-all turned on without a reason sends the same text "
+            "with its own refusal, as v1 did. Game developers see it in their scripts' error output, so keep it "
+            "short and plain."
         ),
         pages=("topbar#pause",),
         risk=Risk.LOW,
@@ -126,11 +127,11 @@ SETTINGS: list[SettingSpec] = [
         ),
         pages=_PUBLIC_SITE,
         if_enabled=(
-            "Every Roblox 4xx, Roblox 5xx, 502 and 504 becomes a 500 with the text 'Upstream request failed; "
-            "please try again later.', and cached Roblox 404s replay as 500, exactly as in v1. Old scripts that "
-            "only check for 200 or 500 keep working, but they usually retry at once, which sends more traffic to "
-            "Roblox and causes more 429s. Roxy's own refusals (throttles, pause, invalid URLs) are unchanged, and "
-            "Retry-After is still sent."
+            "Every Roblox 4xx, live or cached, reaches callers as a 500 that still carries Roblox's own body and "
+            "content type, exactly as in v1. Every Roblox 5xx, 502 and 504 becomes a 500 with the text 'Upstream "
+            "request failed; please try again later.'. Old scripts that only check for 200 or 500 keep working, "
+            "but they usually retry at once, which sends more traffic to Roblox and causes more 429s. Roxy's own "
+            "refusals (throttles, pause, invalid URLs) are unchanged, and Retry-After is still sent."
         ),
         if_disabled=(
             "Callers see the real upstream status (404 stays 404, 429 stays 429 with Retry-After) plus a "
@@ -141,7 +142,8 @@ SETTINGS: list[SettingSpec] = [
         apply=Apply.LIVE,
         notes=(
             "Owner decision D4: real upstream status by default. v1 always behaved as if this were on. The full "
-            "status mapping is plan 7.13."
+            "status mapping is plan 7.13; its compat note gives a Roblox 4xx the failure text, but v1 relayed "
+            "Roblox's body under the 500, and this setting exists to reproduce v1 (a lead decision)."
         ),
     ),
     SettingSpec(

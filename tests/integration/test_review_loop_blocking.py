@@ -16,9 +16,9 @@ Why it exists
 How it works
     Every probe records `(kind, detail, roxy frame)` when it runs on the loop thread while `LoopWatch.active` is set
     (startup and shutdown are excluded: no request is served then). The assertions are per kind: no SQLite statement,
-    no argon2 call and no zstd work on a large body may run on the loop. A known violation is marked `xfail(strict)`
-    with the finding id, so it shows as XFAIL now and fails loudly (XPASS) once fixed, telling the fixer to remove
-    the marker.
+    no argon2 call and no zstd work on a large body may run on the loop. The violations the review found (LOOP-1,
+    capture rows built on the loop; LOOP-2, `/health` file size calls on the loop) are fixed, so every assertion
+    holds and no test is marked `xfail`.
 
 What to read next
     `roxy/storage/db.py` (the thread model), `roxy/metrics/capture.py` (finding LOOP-1), `roxy/cache/store.py`.
@@ -72,6 +72,14 @@ class LoopWatch:
     phase: str = ""
     hits: list[tuple[str, str, str, str]] = field(default_factory=list)  # (phase, kind, detail, where)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Every call of a wrapped codec on ANY thread: name -> (calls, largest input in bytes). Proves the work the
+    # loop must not do really happened somewhere (so a passing "not on the loop" check is not vacuous).
+    anywhere: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+    def count(self, name: str, size: int) -> None:
+        with self.lock:
+            calls, largest = self.anywhere.get(name, (0, 0))
+            self.anywhere[name] = (calls + 1, max(largest, size))
 
     def on_loop(self) -> bool:
         return self.active and threading.get_ident() == self.loop_thread
@@ -120,8 +128,10 @@ def _install_probes(monkeypatch: pytest.MonkeyPatch, watch: LoopWatch) -> None:
         original = getattr(module, name)
 
         def wrapped(*args: Any, **kwargs: Any) -> Any:
+            size = size_of(*args, **kwargs)
+            watch.count(f"{module.__name__}.{name}", size)
             if watch.on_loop():
-                watch.record("zstd", f"{module.__name__}.{name} {size_of(*args, **kwargs)} bytes", _roxy_frame())
+                watch.record("zstd", f"{module.__name__}.{name} {size} bytes", _roxy_frame())
             return original(*args, **kwargs)
 
         monkeypatch.setattr(module, name, wrapped)
@@ -227,18 +237,21 @@ async def test_review_cache_bodies_are_not_compressed_on_the_loop(watched: tuple
     assert cache_codec == [], cache_codec[:10]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding LOOP-1: capture rows (redaction, JSON and zstd of up to 2 x capture_max_body) are built on the "
-    "event loop thread in MetricsRecorder.record_capture",
-)
 async def test_review_large_capture_is_not_encoded_on_the_loop(watched: tuple[Any, LoopWatch, Any]) -> None:
+    """Finding LOOP-1 (fixed): capture rows (redaction, JSON and zstd of up to 2 x capture_max_body) are built on
+    the recorder's encoder thread. The captures were really built (large ones included), just not on the loop."""
     harness, watch, roblox = watched
     await _drive(harness, watch, roblox)
     watch.active = False
     print("\nzstd and capture work on the loop thread:", watch.of("zstd"))
-    large = [hit for hit in watch.of("zstd") if "make_row" in hit[2] and int(hit[2].split()[1]) > LARGE_BODY]
-    assert large == [], large[:5]
+    print("capture rows built anywhere (calls, largest input):", watch.anywhere.get("roxy.metrics.recorder.make_row"))
+    on_loop = [hit for hit in watch.of("zstd") if "make_row" in hit[2]]
+    assert on_loop == [], on_loop[:5]  # not even small ones: every capture row is built off the loop
+    calls, largest = watch.anywhere.get("roxy.metrics.recorder.make_row", (0, 0))
+    assert calls >= 5, "every served request and refusal was captured (capture_sample_served_pct=100)"
+    assert largest > LARGE_BODY, "the 600 KiB refusal body was captured (cut to capture_max_body) off the loop"
+    captured = await harness.ctx.dbs.metrics.read(lambda conn: conn.execute("SELECT count(*) FROM captures").fetchone())
+    assert captured[0] >= calls, "every capture built on the encoder thread reached metrics.db in the flush"
 
 
 async def test_review_proxy_path_makes_no_file_system_call_on_the_loop(watched: tuple[Any, LoopWatch, Any]) -> None:
@@ -248,18 +261,69 @@ async def test_review_proxy_path_makes_no_file_system_call_on_the_loop(watched: 
     assert watch.of("file", "proxy") == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding LOOP-2: GET /health stats every database file and WAL (public/health.py data_bytes) on the "
-    "event loop thread on every call; on a disk that stalls (the C7 situation) the whole worker freezes",
-)
 async def test_review_health_makes_no_file_system_call_on_the_loop(watched: tuple[Any, LoopWatch, Any]) -> None:
+    """Finding LOOP-2 (fixed): /health measures the database files on a thread and reuses the size briefly."""
     harness, watch, _roblox = watched
     watch.active, watch.phase = True, "health"
+    sizes = []
     for _ in range(3):
         response = await harness.http.get("/health", headers={"X-Forwarded-For": "203.0.113.13"})
         assert response.status_code == 200
+        sizes.append(response.json()["DataBytes"])
     watch.active = False
     hits = watch.of("file", "health")
     print("\n/health file system calls on the loop thread:", len(hits), sorted({h[3] for h in hits}))
     assert hits == []
+    assert sizes[-1] > 0, sizes  # the sizes really were measured (off the loop)
+
+
+async def test_review_health_answers_at_once_while_the_disk_stalls(
+    watched: tuple[Any, LoopWatch, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding LOOP-2: with every `stat` of the database files stuck (a stalled disk), /health still answers
+    within its budget with the last size it knows, and the worker keeps serving other requests meanwhile."""
+    import asyncio
+    import time
+
+    from roxy.public import health
+
+    harness, _watch, _roblox = watched
+    first = await harness.http.get("/health")
+    known = first.json()["DataBytes"]
+    assert known > 0
+    release = threading.Event()
+    real_measure = health.measure_bytes
+
+    def stuck(paths: tuple[str, ...]) -> int:
+        release.wait(30)  # the disk does not answer until the test lets it
+        return real_measure(paths) + 1
+
+    monkeypatch.setattr(health, "measure_bytes", stuck)
+    monkeypatch.setattr(health, "SIZE_FRESH_S", 0.0)  # every call wants a new measurement
+    try:
+        started = time.monotonic()
+        answers = [await harness.http.get("/health") for _ in range(4)]
+        elapsed = time.monotonic() - started
+        assert [a.status_code for a in answers] == [200] * 4
+        assert [a.json()["DataBytes"] for a in answers] == [known] * 4  # the last known size
+        assert elapsed < 4 * (health.SIZE_WAIT_S + 0.5), elapsed  # each answer waited at most its budget
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(ticker())
+        await harness.http.get("/health")
+        task.cancel()
+        assert ticks >= 5, "the event loop kept running while /health waited for the stalled measurement"
+    finally:
+        release.set()
+    for _ in range(100):  # the late measurement is adopted by a later call once the disk answers
+        if (await harness.http.get("/health")).json()["DataBytes"] != known:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        raise AssertionError("the finished measurement was never used")

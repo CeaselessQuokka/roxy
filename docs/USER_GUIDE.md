@@ -47,12 +47,18 @@ Rules:
 All examples run in a server `Script` or `ModuleScript`. Turn on **Allow HTTP Requests** in Game Settings,
 Security, first. `HttpService` cannot be used from a `LocalScript`.
 
-Every example is complete and passes Luau's type checker in strict mode. Each one starts with `--!strict`, so
-Studio checks the types as you edit; gives the parts of Roblox's JSON it reads a named type (`export type`); and
-wraps every `HttpService` call in `pcall`, because those calls raise an error instead of returning one. Values
-that never change, such as the base URL, the limits and the services, are declared with `const`, Luau's
-declaration for a name that can never be assigned again, and constants have UPPER_SNAKE_CASE names. If your
-Studio does not accept `const` yet, write `local` in its place; nothing else changes.
+Every example is complete and passes Luau's type checker in strict mode with no warnings. Each one starts with
+`--!strict`, so Studio checks the types as you edit; gives every function typed parameters and a return type;
+gives the parts of Roblox's JSON it reads a named type (`export type`) and checks them before using them, because
+`JSONDecode` returns `any`, which the type checker cannot check for you; and wraps every `HttpService` call in
+`pcall`, because those calls raise an error instead of returning one.
+
+Names that are never assigned again are declared with `const` (Luau 0.711 and later), so Luau refuses any later
+assignment to them: the services, the URLs and limits, the module table, the functions, and most values inside
+functions. The few names that do change (a counter, the time to wait next) use `local`, so `local` tells you at a
+glance what can change. True constants, such as URLs and limits, have UPPER_SNAKE_CASE
+names; services, modules and types use PascalCase, and everything else camelCase. If your Studio does not accept
+`const` yet, write `local` in its place (`local function` for `const function`); nothing else changes.
 
 ### Read the status code with RequestAsync
 
@@ -86,8 +92,8 @@ export type GamesResponse = {
 }
 
 -- Header names can arrive in any letter case, so compare them in lower case.
-local function getHeader(headers: { [string]: string }, name: string): string?
-	local wanted = string.lower(name)
+const function getHeader(headers: { [string]: string }, name: string): string?
+	const wanted = string.lower(name)
 	for key, value in headers do
 		if string.lower(key) == wanted then
 			return value
@@ -98,16 +104,16 @@ end
 
 -- Retry-After when it is a usable number, otherwise the fallback, plus random jitter, so that many
 -- servers told to wait do not all come back at the same moment.
-local function retryWaitSeconds(headers: { [string]: string }): number
-	local retryAfter = tonumber(getHeader(headers, "Retry-After"))
-	local seconds = if retryAfter and retryAfter >= 0 then retryAfter else FALLBACK_WAIT_SECONDS
+const function retryWaitSeconds(headers: { [string]: string }): number
+	const retryAfter = tonumber(getHeader(headers, "Retry-After"))
+	const seconds = if retryAfter and retryAfter >= 0 then retryAfter else FALLBACK_WAIT_SECONDS
 	return seconds + math.random() * MAX_JITTER_SECONDS
 end
 
-local function fetchGame(universeId: number): GameDetails?
-	local url = `{ROXY_URL}games.roblox.com/v1/games?universeIds={universeId}`
+const function fetchGame(universeId: number): GameDetails?
+	const url = `{ROXY_URL}games.roblox.com/v1/games?universeIds={universeId}`
 	for attempt = 1, MAX_ATTEMPTS do
-		local sent, response = pcall(function()
+		const sent, response = pcall(function()
 			return HttpService:RequestAsync({ Url = url, Method = "GET" })
 		end)
 		if not sent then
@@ -117,16 +123,17 @@ local function fetchGame(universeId: number): GameDetails?
 		end
 
 		if response.StatusCode == 200 then
-			local decoded, games = pcall(function(): GamesResponse
+			-- JSONDecode returns `any`: the return type names the shape, and the check confirms it before use.
+			const decoded, games = pcall(function(): GamesResponse
 				return HttpService:JSONDecode(response.Body or "")
 			end)
-			if not decoded then
-				warn("The answer was not valid JSON:", games)
+			if not decoded or typeof(games) ~= "table" or typeof(games.data) ~= "table" then
+				warn("The answer was not the JSON this script expects")
 				return nil
 			end
 			return games.data[1] -- nil when no experience has this universe id
 		elseif response.StatusCode == 429 or response.StatusCode == 503 then
-			local waitSeconds = retryWaitSeconds(response.Headers)
+			const waitSeconds = retryWaitSeconds(response.Headers)
 			if attempt == MAX_ATTEMPTS or waitSeconds > MAX_WAIT_SECONDS then
 				warn(`Roxy asked to wait {math.ceil(waitSeconds)} seconds; giving up for now`)
 				return nil
@@ -141,7 +148,7 @@ local function fetchGame(universeId: number): GameDetails?
 	return nil
 end
 
-local details = fetchGame(UNIVERSE_ID)
+const details = fetchGame(UNIVERSE_ID)
 if details then
 	print(`{details.name}: {details.playing} playing, {details.visits} visits`)
 end
@@ -170,17 +177,20 @@ export type OutfitsResponse = {
 }
 
 -- One pcall covers both ways this can fail: GetAsync raising, and JSONDecode meeting text that is not JSON.
-local ok, result = pcall(function(): OutfitsResponse
+-- JSONDecode returns `any`, so the function's return type names the shape, and the check below confirms it.
+const ok, result = pcall(function(): OutfitsResponse
 	return HttpService:JSONDecode(HttpService:GetAsync(OUTFITS_URL))
 end)
 
-if ok then
+if not ok then
+	-- GetAsync cannot show the status code or Retry-After; RequestAsync can.
+	warn("Roxy request failed:", result)
+elseif typeof(result) ~= "table" or typeof(result.data) ~= "table" then
+	warn("The answer was not the JSON this script expects")
+else
 	for _, outfit in result.data do
 		print(outfit.id, outfit.name)
 	end
-else
-	-- GetAsync cannot show the status code or Retry-After; RequestAsync can.
-	warn("Roxy request failed:", result)
 end
 ```
 
@@ -219,8 +229,8 @@ export type UsernamesResponse = {
 }
 
 -- Header names can arrive in any letter case, so compare them in lower case.
-local function getHeader(headers: { [string]: string }, name: string): string?
-	local wanted = string.lower(name)
+const function getHeader(headers: { [string]: string }, name: string): string?
+	const wanted = string.lower(name)
 	for key, value in headers do
 		if string.lower(key) == wanted then
 			return value
@@ -230,17 +240,17 @@ local function getHeader(headers: { [string]: string }, name: string): string?
 end
 
 -- Retry-After when it is a usable number, otherwise the fallback, plus random jitter.
-local function retryWaitSeconds(headers: { [string]: string }): number
-	local retryAfter = tonumber(getHeader(headers, "Retry-After"))
-	local seconds = if retryAfter and retryAfter >= 0 then retryAfter else FALLBACK_WAIT_SECONDS
+const function retryWaitSeconds(headers: { [string]: string }): number
+	const retryAfter = tonumber(getHeader(headers, "Retry-After"))
+	const seconds = if retryAfter and retryAfter >= 0 then retryAfter else FALLBACK_WAIT_SECONDS
 	return seconds + math.random() * MAX_JITTER_SECONDS
 end
 
-local function lookUpUsers(usernames: { string }): { UserByName }?
-	local request: UsernamesRequest = { usernames = usernames, excludeBannedUsers = true }
-	local body = HttpService:JSONEncode(request)
+const function lookUpUsers(usernames: { string }): { UserByName }?
+	const request: UsernamesRequest = { usernames = usernames, excludeBannedUsers = true }
+	const body = HttpService:JSONEncode(request)
 	for attempt = 1, MAX_ATTEMPTS do
-		local sent, response = pcall(function()
+		const sent, response = pcall(function()
 			return HttpService:RequestAsync({
 				Url = USERNAMES_URL,
 				Method = "POST", -- PATCH, PUT and DELETE work the same way
@@ -254,16 +264,17 @@ local function lookUpUsers(usernames: { string }): { UserByName }?
 		end
 
 		if response.StatusCode == 200 then
-			local decoded, result = pcall(function(): UsernamesResponse
+			-- JSONDecode returns `any`: the return type names the shape, and the check confirms it before use.
+			const decoded, result = pcall(function(): UsernamesResponse
 				return HttpService:JSONDecode(response.Body or "")
 			end)
-			if not decoded then
-				warn("The answer was not valid JSON:", result)
+			if not decoded or typeof(result) ~= "table" or typeof(result.data) ~= "table" then
+				warn("The answer was not the JSON this script expects")
 				return nil
 			end
 			return result.data
 		elseif response.StatusCode == 429 or response.StatusCode == 503 then
-			local waitSeconds = retryWaitSeconds(response.Headers)
+			const waitSeconds = retryWaitSeconds(response.Headers)
 			if attempt == MAX_ATTEMPTS or waitSeconds > MAX_WAIT_SECONDS then
 				warn(`Roxy asked to wait {math.ceil(waitSeconds)} seconds; giving up for now`)
 				return nil
@@ -277,7 +288,7 @@ local function lookUpUsers(usernames: { string }): { UserByName }?
 	return nil
 end
 
-local users = lookUpUsers({ "Roblox", "builderman" })
+const users = lookUpUsers({ "Roblox", "builderman" })
 if users then
 	for _, user in users do
 		print(`{user.requestedUsername} is user {user.id} ({user.displayName})`)
@@ -302,8 +313,8 @@ const URL = "https://roxytheproxy.com/games.roblox.com/v1/games?universeIds=1"
 const HEADER_NAMES = { "Roxy-Requests-Left", "Roxy-Throttle-Reset", "Roxy-Cache", "Roxy-Cache-Age", "Roxy-Request-Id" }
 
 -- Header names can arrive in any letter case, so compare them in lower case.
-local function getHeader(headers: { [string]: string }, name: string): string?
-	local wanted = string.lower(name)
+const function getHeader(headers: { [string]: string }, name: string): string?
+	const wanted = string.lower(name)
 	for key, value in headers do
 		if string.lower(key) == wanted then
 			return value
@@ -312,7 +323,7 @@ local function getHeader(headers: { [string]: string }, name: string): string?
 	return nil
 end
 
-local sent, response = pcall(function()
+const sent, response = pcall(function()
 	return HttpService:RequestAsync({ Url = URL, Method = "GET" })
 end)
 
@@ -349,7 +360,8 @@ const MAX_WAIT_SECONDS = 120 -- give up instead of waiting longer than this
 const MAX_BACKOFF_SECONDS = 30
 const MAX_JITTER_SECONDS = 2
 
--- What getJson returns: the decoded JSON, or the reason there is none.
+-- What getJson returns: the decoded JSON, or the reason there is none. `value` is `any` on purpose: the
+-- module cannot know each endpoint's shape, so the caller checks the parts it reads and names their type.
 export type Result = { ok: true, value: any } | { ok: false, message: string }
 
 type CacheEntry = {
@@ -357,15 +369,15 @@ type CacheEntry = {
 	value: any,
 }
 
-local RoxyClient = {}
+const RoxyClient = {}
 
-local cache: { [string]: CacheEntry } = {}
+const cache: { [string]: CacheEntry } = {}
 local cacheSize = 0
 local blockedUntil = 0 -- after Roxy asks every caller to wait, no request is sent before this os.time()
 
 -- Header names can arrive in any letter case, so compare them in lower case.
-local function getHeader(headers: { [string]: string }, name: string): string?
-	local wanted = string.lower(name)
+const function getHeader(headers: { [string]: string }, name: string): string?
+	const wanted = string.lower(name)
 	for key, value in headers do
 		if string.lower(key) == wanted then
 			return value
@@ -375,18 +387,18 @@ local function getHeader(headers: { [string]: string }, name: string): string?
 end
 
 -- Retry-After when it is a usable number, otherwise the fallback, plus random jitter.
-local function retryWaitSeconds(headers: { [string]: string }): number
-	local retryAfter = tonumber(getHeader(headers, "Retry-After"))
-	local seconds = if retryAfter and retryAfter >= 0 then retryAfter else FALLBACK_WAIT_SECONDS
+const function retryWaitSeconds(headers: { [string]: string }): number
+	const retryAfter = tonumber(getHeader(headers, "Retry-After"))
+	const seconds = if retryAfter and retryAfter >= 0 then retryAfter else FALLBACK_WAIT_SECONDS
 	return seconds + math.random() * MAX_JITTER_SECONDS
 end
 
 -- Exponential backoff with full jitter: a random wait of up to 2, 4, 8... seconds, at most MAX_BACKOFF_SECONDS.
-local function backoffSeconds(attempt: number): number
+const function backoffSeconds(attempt: number): number
 	return math.random() * math.min(MAX_BACKOFF_SECONDS, 2 ^ attempt)
 end
 
-local function remember(path: string, value: any): ()
+const function remember(path: string, value: any): ()
 	if cache[path] == nil then
 		cacheSize += 1
 		if cacheSize > MAX_CACHE_ENTRIES then
@@ -400,7 +412,7 @@ end
 -- Fetches a Roblox path such as "games.roblox.com/v1/games?universeIds=1" through Roxy and decodes the JSON.
 -- Waits while Roxy has asked to slow down, retries failures with backoff, and never retries other 4xx answers.
 function RoxyClient.getJson(path: string): Result
-	local cached = cache[path]
+	const cached = cache[path]
 	if cached and cached.expiresAt > os.time() then
 		return { ok = true, value = cached.value }
 	end
@@ -408,19 +420,19 @@ function RoxyClient.getJson(path: string): Result
 	local lastError = "no attempt was made"
 	local delaySeconds = 0
 	for attempt = 1, MAX_ATTEMPTS do
-		local waitSeconds = math.max(delaySeconds, blockedUntil - os.time())
+		const waitSeconds = math.max(delaySeconds, blockedUntil - os.time())
 		if waitSeconds > 0 then
 			task.wait(waitSeconds)
 		end
 
-		local sent, response = pcall(function()
+		const sent, response = pcall(function()
 			return HttpService:RequestAsync({ Url = BASE_URL .. path, Method = "GET" })
 		end)
 		if not sent then
 			lastError = `the request could not be sent: {response}`
 			delaySeconds = backoffSeconds(attempt)
 		elseif response.StatusCode == 200 then
-			local decoded, value = pcall(function(): any
+			const decoded, value = pcall(function(): any
 				return HttpService:JSONDecode(response.Body or "")
 			end)
 			if not decoded then
@@ -429,7 +441,7 @@ function RoxyClient.getJson(path: string): Result
 			remember(path, value)
 			return { ok = true, value = value }
 		elseif response.StatusCode == 429 or response.StatusCode == 503 then
-			local retrySeconds = retryWaitSeconds(response.Headers)
+			const retrySeconds = retryWaitSeconds(response.Headers)
 			if retrySeconds > MAX_WAIT_SECONDS then
 				return { ok = false, message = `Roxy asked to wait {math.ceil(retrySeconds)} seconds` }
 			end
@@ -438,8 +450,8 @@ function RoxyClient.getJson(path: string): Result
 			lastError = `HTTP {response.StatusCode}`
 		elseif response.StatusCode >= 500 then
 			-- Roblox or Roxy is failing: honor Retry-After when sent, and wait a little longer each time.
-			local retryAfter = tonumber(getHeader(response.Headers, "Retry-After")) or 0
-			delaySeconds = retryAfter + backoffSeconds(attempt)
+			const retryAfter = tonumber(getHeader(response.Headers, "Retry-After")) or 0
+			delaySeconds = math.min(retryAfter, MAX_WAIT_SECONDS) + backoffSeconds(attempt)
 			lastError = `HTTP {response.StatusCode}`
 		else
 			-- Any other code (400, 403, 404...): the request itself is wrong, and sending it again will not help.
@@ -473,14 +485,17 @@ export type GamesResponse = {
 	data: { GameDetails },
 }
 
-local result = RoxyClient.getJson(`games.roblox.com/v1/games?universeIds={UNIVERSE_ID}`)
-if result.ok then
-	local games: GamesResponse = result.value
+const result = RoxyClient.getJson(`games.roblox.com/v1/games?universeIds={UNIVERSE_ID}`)
+if not result.ok then
+	warn("Roxy request failed:", result.message)
+elseif typeof(result.value) ~= "table" or typeof(result.value.data) ~= "table" then
+	warn("The answer was not the JSON this script expects")
+else
+	-- The check above confirmed the parts this script reads, so the `any` value can take its named type.
+	const games: GamesResponse = result.value
 	for _, details in games.data do
 		print(`{details.name}: {details.playing} playing`)
 	end
-else
-	warn("Roxy request failed:", result.message)
 end
 ```
 
@@ -640,10 +655,9 @@ Yes. There is no account, key or payment.
 
 ### Why do I get 429 when I barely send anything?
 
-Your requests share an IP address with everything else your server sends, and possibly with other servers, and
-chapter 4 says which requests count (by default every one, including those Roxy answers from its cache). Read
-`Roxy-Requests-Left` and `Retry-After`, keep answers in your own cache instead of asking again, and use batch
-endpoints.
+{{ cache_hits_faq }} Your requests also share an IP address with everything else your server sends, and
+possibly with other servers. Read `Roxy-Requests-Left` and `Retry-After`, keep answers in your own cache instead
+of asking again (an answer your game already has costs no request at all), and use batch endpoints.
 
 ### Why is the data a little old?
 

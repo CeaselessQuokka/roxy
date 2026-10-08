@@ -125,7 +125,8 @@ async def test_allowlisted_get_uses_the_credential_and_never_anonymous(wired: An
     mock.routes["/v1/users/authenticated"] = harness.MockResponse(body=json.dumps({"id": 42}).encode())
     manager = wired._ctx.egress.credential
     await manager.probe("admin_check", fetch=wired.credential_probe_fetch)
-    wired._ctx.rules.allow_credential("users.roblox.com/v1/users")
+    # Allowlist rows grant exactly what they name (finding F3): `/v1/users/1` needs the explicit wildcard.
+    wired._ctx.rules.allow_credential("users.roblox.com/v1/users/*")
     mock.routes["/v1/users/1"] = harness.MockResponse(body=b'{"id":1}')
     result = await get(wired, host="users.roblox.com", path="/v1/users/1", query=[])
     assert (result.status, result.egress, result.auth_class) == (200, Egress.CREDENTIAL, AuthClass.CRED)

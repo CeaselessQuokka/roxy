@@ -7,7 +7,8 @@ What this is
     plan 7.13 row (with `compat_collapse_upstream_errors` off and on where it changes the answer), the cache states
     HIT, MISS, REVALIDATING, STALE (after a failure and during a cooldown), COALESCED, negative caching and the POST
     allowlist, plan 19.5 item 4 (the end-to-end recording proxy) and item 10
-    (`test_cred_response_never_served_to_other_auth_class`) through the full app.
+    (`test_cred_response_never_served_to_other_auth_class`) through the full app, and the two answers that must
+    never enter the proxy pipeline: an unknown admin path (row 15) and `/internal` on the public port.
 
 Why it exists
     Each package has unit tests against fakes of its neighbors; only this module proves the real objects fit
@@ -17,7 +18,7 @@ Why it exists
 How it works
     The `e2e` fixture builds the app with a `FakeClock` (cache lifetimes, cooldowns and limiter windows move only
     when a test advances it), removes the mail and webhook credentials (alerts go to the log only), and turns the
-    tarpit off (a refusal would otherwise be held 8 to 20 s; one test turns it on with a short hold). Every request
+    tarpit off (a refusal would otherwise be held 8 to 20 s; the tests about the tarpit turn it on). Every request
     gets its own client address through `X-Forwarded-For` (the peer is the trusted loopback proxy), so one test's
     per-IP limiter never touches another request unless the test wants it to. Settings change through the real
     `SettingsService` and rules through the real `RulesService`; both are live at once on the writing worker.
@@ -497,6 +498,64 @@ async def test_public_health_and_post_health(e2e: E2E) -> None:
     assert post.content == wire("Not a Roblox URL")
 
 
+async def test_r2_unknown_admin_path_is_v1_not_found_and_not_a_probe(e2e: E2E, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec review R2 (F2), plan 4.1 row 15: v1's `admin_not_found` answers an admin path nothing serves with 404
+    `"Not Found"` plus a newline and never logs it as a probe (a typo or an old bookmark is not an attack). Under
+    the versioned admin API the same miss is the DESIGN.md section 13 error object."""
+    probes: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(e2e.ctx.recorder, "record_probe", lambda *args, **kwargs: probes.append(args))
+    before = len(e2e.ctx.recorder.live)
+    for method in ("GET", "POST", "PATCH", "PUT", "DELETE"):  # the methods v1's catch-all declared
+        response = await e2e.request(method, "/admin/anything/here")
+        assert response.status_code == 404, method
+        assert response.content == b'"Not Found"\n'
+        assert response.headers["content-type"] == JSON
+        assert "roxy-refusal" not in response.headers  # never the proxy pipeline
+    api = await e2e.get("/admin/api/v1/no-such-area")
+    assert api.status_code == 404
+    assert api.json() == {"error": {"code": "not_found", "message": "Not found.", "fields": {}}}
+    await asyncio.sleep(0.05)  # a probe hook would run as a background task after the answer
+    assert probes == []
+    assert len(e2e.ctx.recorder.live) == before  # no proxy outcome either
+    login = await e2e.get("/admin")
+    assert login.status_code == 200  # the real admin route still wins over the catch-all
+
+
+async def test_internal_paths_on_the_public_port_are_an_instant_404(e2e: E2E, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lead decision (plan 5.8): `/internal` on the public app is an immediate 404 with v1's `"Not Found"` body,
+    never tarpitted, never in the proxy pipeline, even with the tarpit on (the internal Unix socket app is apart)."""
+    await e2e.settings(tarpit_enabled=1)  # catalog default hold: 8 to 20 s for a probe
+    asked: list[str] = []
+    original = e2e.ctx.abuse.tarpit.plan
+
+    async def spy(category: str, req: Any, **kwargs: Any) -> Any:
+        asked.append(category)
+        return await original(category, req, **kwargs)
+
+    monkeypatch.setattr(e2e.ctx.abuse.tarpit, "plan", spy)
+    evaluated: list[Any] = []
+    evaluate = e2e.ctx.abuse.evaluate
+
+    async def seen(req: Any) -> Any:
+        evaluated.append(req)
+        return await evaluate(req)
+
+    monkeypatch.setattr(e2e.ctx.abuse, "evaluate", seen)
+    before = len(e2e.ctx.recorder.live)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    for method, path in (("GET", "/internal/version"), ("POST", "/internal/flush"), ("GET", "/internal")):
+        response = await e2e.request(method, path)
+        assert response.status_code == 404, path
+        assert response.content == b'"Not Found"\n'
+        assert response.headers["content-type"] == JSON
+        assert "roxy-refusal" not in response.headers
+    assert loop.time() - started < 2  # no hold (a probe hold is 8 s at least)
+    assert asked == []  # the tarpit was never consulted
+    assert evaluated == []  # nor the abuse pipeline
+    assert len(e2e.ctx.recorder.live) == before
+
+
 # ====================================================================================================== plan 7.13
 
 
@@ -539,8 +598,8 @@ async def test_row_roblox_4xx(e2e: E2E, compat: int) -> None:
     e2e.route(GAMES, "/v1/games/votes").mock(return_value=httpx.Response(400, content=body))
     response = await e2e.get(f"/{GAMES}/v1/games/votes?universeIds=1")
     if compat:
-        assert response.status_code == 500
-        assert response.content == FAILED
+        # v1 (bug B1): a Roblox 4xx reached the caller as 500 with Roblox's own body, labeled application/json.
+        expect(response, 500, body, {**ALLOWED, "Roxy-Cache": "MISS", "Roxy-Upstream-Status": "400"}, JSON)
     else:
         expect(response, 400, body, {**ALLOWED, "Roxy-Cache": "MISS", "Roxy-Upstream-Status": "400"}, None)
 
@@ -793,7 +852,8 @@ async def test_row_internal_error_is_recorded_once(e2e: E2E, monkeypatch: pytest
     before = len(e2e.ctx.recorder.live)
     response = await e2e.get(games())
     assert response.status_code == 500
-    assert response.content == b"Internal Server Error"
+    assert response.content == wire("Internal Server Error")  # v1 jsonify, plan 7.13 "as v1"
+    assert response.headers["content-type"] == JSON
     assert response.headers["retry-after"] == "5"
     assert len(e2e.ctx.recorder.live) == before + 1
     assert (e2e.last()["reason"], e2e.last()["status"]) == ("internal_error", 500)
@@ -803,19 +863,25 @@ async def test_row_internal_error_is_recorded_once(e2e: E2E, monkeypatch: pytest
 
 
 async def test_cache_miss_then_hit(e2e: E2E) -> None:
+    """D10 as the owner decided it on 2026-10-07 (`throttle_count_cache_hits` = 1, the default): a cache hit uses up
+    the caller's per-IP allowance like any other request, because serving it still costs Roxy CPU, bandwidth and
+    time. One client: the miss leaves 9 of 10 (GCRA, 10 per 50 s, so 5 s until the next slot frees), the hit 8
+    (10 s). Turning the setting off makes the next hit free: the trio stays where the hit left it."""
     route = e2e.route(GAMES, GAMES_PATH).mock(return_value=json_response({"data": [1]}))
-    first = await e2e.get(games())
-    second = await e2e.get(games())
-    assert roxy_headers(first)["roxy-cache"] == "MISS"
-    expect(
-        second,
-        200,
-        b'{"data":[1]}',
-        {**UNCOUNTED, "Roxy-Requests-Left": "10", "Roxy-Cache": "HIT", "Roxy-Cache-Age": "0", "Roxy-Cache-TTL": "300"},
-        JSON,
-    )
+    ip = e2e.ip()
+    first = await e2e.get(games(), ip=ip)
+    second = await e2e.get(games(), ip=ip)
+    expect(first, 200, b'{"data":[1]}', {**ALLOWED, "Roxy-Cache": "MISS", "Roxy-Upstream-Status": "200"}, JSON)
+    hit = {"Roxy-Cache": "HIT", "Roxy-Cache-Age": "0", "Roxy-Cache-TTL": "300"}
+    counted = {"Roxy-Requests-Left": "8", "Roxy-Throttle-Reset": "10", "Roxy-Throttled": "False"}
+    expect(second, 200, b'{"data":[1]}', {**counted, **hit}, JSON)
     assert route.call_count == 1
     assert e2e.last()["reason"] == "cache_hit"
+
+    await e2e.settings(throttle_count_cache_hits=0)  # the plan's original D10 recommendation, still available
+    third = await e2e.get(games(), ip=ip)
+    expect(third, 200, b'{"data":[1]}', {**counted, **hit}, JSON)  # not counted: still 8 left
+    assert route.call_count == 1
 
 
 async def test_cache_revalidating(e2e: E2E) -> None:

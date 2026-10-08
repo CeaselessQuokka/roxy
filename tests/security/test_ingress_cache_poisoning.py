@@ -378,22 +378,19 @@ def test_policy_auth_class_follows_the_allowlist_and_private_is_never_keyed() ->
     assert store_decision(leaked, anon, cs).why == "auth_class_mismatch"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ingress finding: a same-worker single-flight follower is handed the owner's credential answer for an "
-        "anonymous key (cache/service.py _serve_flight uses value.result without the auth-class check that "
-        "_outcome_for applies to followers in other workers)"
-    ),
-)
 async def test_same_worker_follower_never_receives_a_credential_answer_for_an_anonymous_key(dbs: Any) -> None:
-    """Defense in depth (cache/service.py docstring: "An answer fetched with the credential is never stored or
-    shared under an anonymous key"). The trigger in production is any disagreement between the cache's policy
-    (rules at peek time) and the upstream's routing (rules at fetch time): for example a `cache_private` allowlist
-    row added between the two, or an allowlist regex cut off by the match timeout in one place and not the other.
-    The cross-worker version of this probe passes (`test_cache_workers.py`); the same-worker one does not."""
+    """Defense in depth (cache/service.py docstring: an answer fetched with the credential belongs to its own
+    request). The trigger in production is any disagreement between the cache's policy (rules at peek time) and
+    the upstream's routing (rules at fetch time): for example a `cache_private` allowlist row added between the two,
+    or an allowlist regex cut off by the match timeout in one place and not the other. The follower joined the
+    owner's flight in the same worker; when the owner's answer comes back with the credential, the follower makes
+    its own call (anonymous here, the rules have settled) instead of receiving it. Fixed ingress finding (F2)."""
     gate = asyncio.Event()
-    upstream = FakeUpstream(lambda req, n: ok('{"robux":"secret"}', auth_class=AuthClass.CRED), gate=gate)
+
+    def respond(req: Any, n: int) -> Any:
+        return ok('{"robux":"secret"}', auth_class=AuthClass.CRED) if n == 1 else ok('{"robux":"public"}')
+
+    upstream = FakeUpstream(respond, gate=gate)
     service = CacheService(
         dbs=dbs,
         settings=FakeSettings(),
@@ -412,7 +409,13 @@ async def test_same_worker_follower_never_receives_a_credential_answer_for_an_an
     follower = asyncio.create_task(call())
     await asyncio.sleep(0.05)
     gate.set()
-    await owner
+    first = await owner
     other = await follower
-    assert other.cache_state is not CacheState.COALESCED or b"secret" not in other.body
+    await service.settle()
+    assert b"secret" in first.body
     assert b"secret" not in other.body
+    assert other.cache_state is CacheState.MISS  # its own call, not a coalesced copy
+    assert upstream.count == 2
+    later = await call()  # and nothing the credential answered is stored or served to a later request
+    assert b"secret" not in later.body
+    assert later.cache_state is CacheState.HIT

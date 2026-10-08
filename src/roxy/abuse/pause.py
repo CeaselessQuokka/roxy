@@ -14,7 +14,9 @@ Why it exists
 How it works
     - Paused when the manual switch is on, or when `scheduled_start <= now < scheduled_end`.
     - Message: the manual reason (kept across toggles, like v1, and replaced only when a new reason is given), the
-      scheduled reason during a scheduled window, else `Service down for maintenance.`; cut to 300 characters.
+      scheduled reason during a scheduled window, else the live setting `pause_message_default` (catalog default
+      `Service down for maintenance.`, v1's constant), which the check passes in; cut to 300 characters.
+      Throttle-all without a reason shares that default (v1 used one constant for both, v1 notes B6/B13).
     - `Retry-After` (plan 7.13): seconds to `scheduled_end` during a scheduled window, else 60.
     - `since` is when the manual pause began (a new marker each time it is switched on), so the top-bar banner can
       count drops "since the state began" from the metrics rollups (row 114).
@@ -32,7 +34,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Final
 
-from roxy.abuse.messages import DEFAULT_DOWNTIME_MESSAGE, MAX_STATE_REASON, clean_admin_message
+from roxy.abuse.messages import DEFAULT_DOWNTIME_MESSAGE, MAX_STATE_REASON, clean_admin_message, downtime_default
 from roxy.abuse.state import read_state_value, write_state_value
 from roxy.abuse.verdict import MessageSource
 from roxy.config.audit import Actor
@@ -87,13 +89,13 @@ class PauseState:
         """Whether proxy requests are refused with 503 right now."""
         return self.paused or self.in_scheduled_window(now)
 
-    def message(self, now: float) -> tuple[str, MessageSource]:
-        """`(text, message_source)` for the 503 body."""
+    def message(self, now: float, default: str = DEFAULT_DOWNTIME_MESSAGE) -> tuple[str, MessageSource]:
+        """`(text, message_source)` for the 503 body; `default` is the live `pause_message_default` setting."""
         if not self.paused and self.in_scheduled_window(now):
             text = clean_admin_message(self.scheduled_reason or self.reason, MAX_STATE_REASON)
         else:
             text = clean_admin_message(self.reason, MAX_STATE_REASON)
-        return (text, "custom") if text else (DEFAULT_DOWNTIME_MESSAGE, "default")
+        return (text, "custom") if text else (downtime_default(default), "default")
 
     def retry_after(self, now: float) -> int:
         """Plan 7.13: seconds to the scheduled end during a scheduled window, else 60."""

@@ -1,4 +1,4 @@
-"""The abuse pipeline: runs every check in order and decides `Allow` or `Refuse` with ONE hot.db transaction.
+"""The abuse pipeline: runs every check in order and decides `Allow` or `Refuse` with ONE hot.db write transaction.
 
 What this is
     `AbusePipeline.evaluate(req) -> Allow | Refuse` (DESIGN.md 7 and 11.5), the object stored at `ctx.abuse`, plus
@@ -11,23 +11,42 @@ Why it exists
     separately from the check, so the crossing request leaked through). Plan 6.3 requires every limiter of a request
     (flood, throttle-all, per-IP and strikes, place, User-Agent rule, endpoint rule) to be evaluated and updated in a
     single `BEGIN IMMEDIATE` transaction, committing only what the outcome requires, and plan C7 requires sane limits
-    when that transaction cannot run.
+    when that transaction cannot run. v1 also refused a throttled caller before it ran any regex; an admin regex can
+    cost up to the request's regex budget (plan 9.9), so a flood of refused requests must not pay it each time.
 
 How it works
+    0. Bypass is resolved first (`req.bypass`), before any check, so the router knows a caller is on the bypass list
+       whichever check refuses it (bans and the deny list come before the bypass marker in the order, and a bypass
+       caller is never held by the tarpit, plan 10.6).
     1. Prepare: walk the checks in position order (`checks/__init__.py`). Each returns nothing, a refusal that needs
-       no shared state (pause, ban, probe, block, ...), or a `LimitSpec`. Bypass-skipped checks are not prepared once
-       the bypass marker has set `req.bypass`. Preparing stops at the first refusal: nothing after it can matter.
-    2. Transaction: one `hot.write` loads every needed `limiter` row and the client's `strikes` row, evaluates the
+       no shared state (pause, ban, probe, block, ...), or a `LimitSpec`. Bypass-skipped checks are not prepared for
+       a bypass caller. Preparing stops at the first refusal: nothing after it can matter.
+    2. Cheap limiters first. While the rules contain admin regexes (User-Agent rules, header filters, endpoint blocks
+       or rate rules of type regex), preparing stops before the first check that matches patterns (`uses_patterns`).
+       One READ of the cheap limiters' rows predicts their verdict: if they refuse (flood, throttle-all, per-IP,
+       place), the write transaction runs for them alone and no pattern is ever matched; if they admit, the pattern
+       checks are prepared and the single write transaction below runs as usual. A prediction that the write then
+       contradicts (another worker moved a row in between) costs at most one extra transaction: the provisional one
+       commits nothing when everything admitted. Without regex rules there is no read and no split.
+    3. Transaction: one `hot.write` loads every needed `limiter` row and the client's `strikes` row, evaluates the
        limiters in order, and stops at the first refusal. Commit rule: the flood counter always (it counts every
        request); the refusing limiter's own consequences (a strike, a penalty); and the admitted limiters' counts only
        when nothing refused. A request refused later therefore spends no rate budget (plan 6.3; v1 spent UA and
-       throttle-all budgets on requests it then refused). The per-IP header trio comes from the same rows.
-    3. Verdict: ask each prepared check, in order, for its refusal; the first one wins. Otherwise `Allow` with the trio.
-    4. Afterwards (memory only): statistics, spam detector and bot tracker observations, and a ladder ban if a rung
-       with action `ban` was reached.
+       throttle-all budgets on requests it then refused). The per-IP header trio comes from the same rows. The write
+       has a 500 ms budget counted from when it was queued (`storage/db.py`), so a locked hot.db degrades promptly.
+    4. Verdict: ask each prepared check, in order, for its refusal; the first one wins (disguised refusals are
+       rendered with the client's real strikes, `checks/base.py redisguise`). Otherwise `Allow` with the trio. A
+       throttle refusal that may be answered from a fresh cache entry (`cache_serve_throttled`) keeps that permission
+       only when no later check would refuse the request (a header filter, auth smuggling, a block, any static
+       refusal): content is never served to a filtered request. The answer stays the throttle refusal (v1's order).
+    5. Afterwards (memory only): statistics, spam detector and bot tracker observations, aggregated metrics events
+       (`ua_rule_hit`, `throttle_tier`), `record_throttled` for a client that just became throttled, and a ladder ban
+       if a rung with action `ban` was reached.
     C7: if the transaction raises `SharedStateUnavailable`, the same walk runs on per-worker memory with every limit
-    divided by the number of workers (`ROXY_WORKERS`), logged once per streak as degraded. The tarpit fails closed on
-    its own (no lease, no hold).
+    divided by the number of workers (`ROXY_WORKERS`), logged once per streak as degraded. A key this worker has no
+    memory row for starts from the shared row as last read from hot.db (readable in WAL mode even while another
+    process holds the write lock), so entering degraded mode never refills a client's allowance; memory is cleared
+    when hot.db works again. The tarpit fails closed on its own (no lease, no hold).
 
 What to read next
     `roxy/abuse/checks/base.py` (the check contract), `roxy/abuse/limiter.py` and `roxy/abuse/throttle.py` (the
@@ -48,6 +67,7 @@ from typing import Any, Final
 
 from roxy.abuse.bans import BanHits, create_ladder_ban
 from roxy.abuse.bot import ClientTracker, has_game_server_signature, query_fingerprint
+from roxy.abuse.bypass import is_bypassed
 from roxy.abuse.challenge import challenge_key
 from roxy.abuse.checks import default_checks
 from roxy.abuse.checks.base import Check, Facts, LimitOutcome, LimitSpec, TxState, trio_headers
@@ -88,7 +108,7 @@ from roxy.storage.db import Database, SharedStateUnavailable
 log = logging.getLogger(__name__)
 
 TX_BUSY_TIMEOUT_MS: Final = 500
-"""How long the abuse transaction waits for another process's write lock before degrading (C7) instead."""
+"""The abuse transaction's total budget (queue wait included) before it degrades (C7) instead of waiting longer."""
 SPAM_FLUSH_INTERVAL_S: Final = 1.0
 SWITCH_REFRESH_INTERVAL_S: Final = 1.0
 BAN_HITS_FLUSH_INTERVAL_S: Final = 5.0
@@ -96,6 +116,13 @@ MAX_BACKGROUND_BANS: Final = 32
 MAX_UA_HIT_RECORDS: Final = 200
 MAX_TIER_RECORDS: Final = 32
 PROBE_REASONS: Final = frozenset({ReasonCode.UNSAFE_URL, ReasonCode.NOT_ROBLOX, ReasonCode.HOST_NOT_ALLOWED})
+UA_RULE_HIT_EVENT: Final = "ua_rule_hit"
+"""Aggregated metrics event: one User-Agent rule evaluated (detail `rule_id`, `result` allowed or refused)."""
+TIER_EVENT: Final = "throttle_tier"
+"""Aggregated metrics event: a new strike put a client on a ladder rung (detail `tier`)."""
+
+Shared = tuple[dict[str, LimiterRow], dict[str, StrikeRow]]
+"""Limiter rows and strike rows as read from hot.db (a seed for degraded mode, an input for the prediction)."""
 
 
 @dataclass(slots=True)
@@ -109,6 +136,7 @@ class AbuseStats:
     tier_hits: dict[int, int] = field(default_factory=dict)  # ladder rung -> new strikes reaching it
     degraded_requests: int = 0
     ladder_bans: int = 0
+    pattern_checks_skipped: int = 0  # requests a cheap limiter refused before any admin regex ran
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -119,6 +147,7 @@ class AbuseStats:
             "tier_hits": dict(self.tier_hits),
             "degraded_requests": self.degraded_requests,
             "ladder_bans": self.ladder_bans,
+            "pattern_checks_skipped": self.pattern_checks_skipped,
         }
 
 
@@ -127,6 +156,16 @@ class _Walk:
     state: TxState
     limiter_writes: list[LimiterRow]
     strike_writes: list[StrikeRow]
+
+
+@dataclass(slots=True)
+class _Prep:
+    """The prepare walk: what was prepared, the limiter specs, the first static refusal, the checks deferred."""
+
+    prepared: list[Check] = field(default_factory=list)
+    specs: list[LimitSpec] = field(default_factory=list)
+    static: tuple[str, Refuse] | None = None
+    rest: list[Check] = field(default_factory=list)  # pattern checks, prepared only once the cheap limiters admit
 
 
 def _decide(spec: LimitSpec, row: LimiterRow, limit: int, now_ms: int) -> RateDecision:
@@ -146,11 +185,14 @@ def walk_limiters(
     *,
     divisor: int = 1,
     refused_after: bool = False,
+    provisional: bool = False,
 ) -> _Walk:
     """Evaluate the limiters in order and decide what to write (pure; shared by hot.db and degraded mode).
 
     `divisor` > 1 divides every limit (degraded mode, plan C7). `refused_after` says a check after these limiters
-    refuses the request anyway (a probe, a block): the admitted counts are then not committed either. See the
+    refuses the request anyway (a probe, a block): the admitted counts are then not committed either. `provisional`
+    says more limiters may follow (the cheap ones run first, step 2 of the module docstring): when everything here
+    admits, NOTHING is written, not even the flood count, because the full walk that follows writes it. See the
     module docstring for the commit rule.
     """
     outcomes: dict[str, LimitOutcome] = {}
@@ -190,7 +232,9 @@ def walk_limiters(
         if not outcome.admitted:
             refused_at = spec.check
             break
-    if refused_at is None and not refused_after:
+    if refused_at is None and provisional:
+        writes = []  # nothing decided yet: the full walk after the pattern checks writes everything
+    elif refused_at is None and not refused_after:
         writes.extend(pending)
     state = TxState(outcomes=outcomes, stopped_at=refused_at)
     if trio_policy is not None:
@@ -208,7 +252,24 @@ def walk_limiters(
         else:
             state.trio = peek_per_ip(policy, rows.get(policy.key) or LimiterRow(policy.key), srow, now_ms)
             state.strikes = effective_strikes(srow.strikes, srow.last_strike_at, now_s, policy.decay_s)
+        final = next((row for row in strike_writes if row.key == policy.key), srow)
+        if final.exists:
+            state.penalty_wait_ms = max(0, final.throttled_until * 1000 - now_ms)
     return _Walk(state, writes, strike_writes)
+
+
+def slow_patterns(rules: RulesSnapshot) -> bool:
+    """Whether the snapshot has admin regexes the pattern checks would run (the costly kind, plan 9.9).
+
+    Globs and plain text needles are validated to stay cheap, so only `regex` rules make the pipeline evaluate the
+    cheap limiters first (module docstring, step 2).
+    """
+    return (
+        any(str(rule.mode) == "regex" for rule in rules.enabled_ua_rules)
+        or any(str(rule.mode) == "regex" for rule in rules.enabled_header_rules)
+        or any(row.enabled and str(row.type) == "regex" for row in rules.endpoint_blocks)
+        or any(row.enabled and str(row.type) == "regex" for row in rules.endpoint_limits)
+    )
 
 
 class AbusePipeline:
@@ -256,6 +317,7 @@ class AbusePipeline:
         self._memory_rows: MemoryRowStore[LimiterRow] = MemoryRowStore()
         self._memory_strikes: MemoryRowStore[StrikeRow] = MemoryRowStore()
         self._background: set[asyncio.Task[Any]] = set()
+        self._slow: tuple[RulesSnapshot, bool] | None = None  # `slow_patterns` of the last snapshot seen
 
     @classmethod
     def from_context(cls, ctx: Any) -> AbusePipeline:
@@ -329,6 +391,15 @@ class AbusePipeline:
             probe_signature=probe_signature(path),
         )
 
+    def _has_slow_patterns(self, rules: RulesSnapshot) -> bool:
+        """`slow_patterns(rules)`, computed once per rules snapshot (snapshots are immutable)."""
+        cached = self._slow
+        if cached is not None and cached[0] is rules:
+            return cached[1]
+        value = slow_patterns(rules)
+        self._slow = (rules, value)
+        return value
+
     # ---- the request path ----
 
     async def evaluate(self, req: Any) -> Verdict:
@@ -338,37 +409,79 @@ class AbusePipeline:
         now = self.clock.now()
         now_ms = self.clock.now_ms()
         facts = self._facts(req, values, rules, now, now_ms)
-        prepared: list[Check] = []
-        specs: list[LimitSpec] = []
-        static: tuple[str, Refuse] | None = None
+        if not getattr(req, "bypass", False) and is_bypassed(rules, facts.ip, now):
+            req.bypass = True  # step 0: known before bans refuse, so a bypass caller is never held (plan 10.6)
+        bypass = bool(getattr(req, "bypass", False))
         with regex_budget():  # every pattern match of this request shares one time budget (plan 9.9)
-            for check in self.checks:
-                if check.skipped_by_bypass and getattr(req, "bypass", False):
-                    continue
-                result = check.prepare(req, facts)
-                prepared.append(check)
-                if isinstance(result, Refuse):
-                    static = (check.name, result)
+            prep = _Prep()
+            self._prepare(req, facts, self.checks, prep, defer_patterns=self._has_slow_patterns(rules))
+            tx = await self._settle(req, facts, prep, bypass)
+            tx.facts = facts
+            if prep.static is not None:
+                tx.static[prep.static[0]] = prep.static[1]
+            refused: Refuse | None = None
+            for check in prep.prepared:
+                refused = await check.check(req, tx)
+                if refused is not None:
                     break
-                if isinstance(result, LimitSpec):
-                    specs.append(result)
-        tx = await self._transaction(specs, facts, bool(getattr(req, "bypass", False)), static is not None)
-        tx.facts = facts
-        if static is not None:
-            tx.static[static[0]] = static[1]
-        verdict: Verdict | None = None
-        for check in prepared:
-            refusal = await check.check(req, tx)
-            if refusal is not None:
-                verdict = refusal
-                break
-        if verdict is None:
-            verdict = Allow(headers=trio_headers(tx))
+            serve_cached = refused is not None and refused.allow_fresh_cache_serve
+            if serve_cached and refused is not None and self._later_check_refuses(req, facts, refused, prep, tx):
+                refused.allow_fresh_cache_serve = False  # never serve content to a request a filter refuses
+        verdict: Verdict = refused if refused is not None else Allow(headers=trio_headers(tx))
         self._after(req, facts, tx, verdict)
         return verdict
 
+    @staticmethod
+    def _prepare(req: Any, facts: Facts, checks: Sequence[Check], prep: _Prep, *, defer_patterns: bool) -> None:
+        """Step 1 (and, for deferred pattern checks, the second half of step 2) of the module docstring."""
+        for index, check in enumerate(checks):
+            if check.skipped_by_bypass and getattr(req, "bypass", False):
+                continue
+            if defer_patterns and check.uses_patterns:
+                prep.rest = list(checks[index:])
+                return
+            result = check.prepare(req, facts)
+            prep.prepared.append(check)
+            if isinstance(result, Refuse):
+                prep.static = (check.name, result)
+                return
+            if isinstance(result, LimitSpec):
+                prep.specs.append(result)
+
+    async def _settle(self, req: Any, facts: Facts, prep: _Prep, bypass: bool) -> TxState:
+        """Steps 2 and 3: the cheap limiters first when pattern checks were deferred, then the one transaction."""
+        if prep.rest:
+            refused = await self._cheap_first(prep.specs, facts, bypass)
+            if refused is not None:
+                self.stats.pattern_checks_skipped += 1
+                return refused  # a cheap limiter refused: decided with one write, no admin regex ever ran
+            rest, prep.rest = prep.rest, []
+            self._prepare(req, facts, rest, prep, defer_patterns=False)
+        return await self._transaction(prep.specs, facts, bypass, prep.static is not None)
+
+    async def _cheap_first(self, specs: list[LimitSpec], facts: Facts, bypass: bool) -> TxState | None:
+        """The cheap limiters' verdict when one of them refuses (that transaction is final), else None."""
+        if not specs:
+            return None
+        policy = None if bypass else facts.per_ip
+        keys = [spec.key for spec in specs] + ([policy.key] if policy is not None else [])
+        seed = await self._read_shared(keys, [policy.key] if policy is not None else [])
+        if seed is not None:
+            predicted = walk_limiters(specs, seed[0], seed[1], policy, facts.now_ms)
+            if predicted.state.stopped_at is None:
+                return None  # they admit on the shared rows: prepare the pattern checks, then one transaction
+        state = await self._transaction(specs, facts, bypass, provisional=True, seed=seed)
+        return state if state.stopped_at is not None else None
+
     async def _transaction(
-        self, specs: list[LimitSpec], facts: Facts, bypass: bool, refused_after: bool = False
+        self,
+        specs: list[LimitSpec],
+        facts: Facts,
+        bypass: bool,
+        refused_after: bool = False,
+        *,
+        provisional: bool = False,
+        seed: Shared | None = None,
     ) -> TxState:
         policy = None if bypass else facts.per_ip
         # v1: a bypass entry is never counted, so its headers always show the full allowance.
@@ -381,16 +494,13 @@ class AbusePipeline:
             if self.hot_db is None:
                 raise SharedStateUnavailable("hot", "no hot.db in this process")
             walk = await self.hot_db.write(
-                lambda conn: self._tx(conn, specs, policy, facts.now_ms, refused_after),
+                lambda conn: self._tx(conn, specs, policy, facts.now_ms, refused_after, provisional),
                 busy_timeout_ms=TX_BUSY_TIMEOUT_MS,
             )
-            if self.degraded:
-                self.degraded = False
-                log.info("abuse_degraded_recovered")
-                self._event("abuse_degraded_recovered", "info", {})
+            self._recovered()
             state = walk.state
         except SharedStateUnavailable as exc:
-            state = self._degraded_walk(specs, policy, facts.now_ms, exc, refused_after)
+            state = await self._degraded_walk(specs, policy, facts.now_ms, exc, refused_after, provisional, seed)
         if bypass:
             state.trio = bypass_trio
         return state
@@ -402,26 +512,48 @@ class AbusePipeline:
         policy: PerIpPolicy | None,
         now_ms: int,
         refused_after: bool = False,
+        provisional: bool = False,
     ) -> _Walk:
         keys = [spec.key for spec in specs]
         if policy is not None:
             keys.append(policy.key)
         rows = load_rows(conn, keys)
         strikes = load_strike_rows(conn, [policy.key]) if policy is not None else {}
-        walk = walk_limiters(specs, rows, strikes, policy, now_ms, refused_after=refused_after)
+        walk = walk_limiters(specs, rows, strikes, policy, now_ms, refused_after=refused_after, provisional=provisional)
         save_rows(conn, walk.limiter_writes, now_ms // 1000)
         save_strike_rows(conn, walk.strike_writes)
         return walk
 
-    def _degraded_walk(
+    def _recovered(self) -> None:
+        """A write worked: leave degraded mode and forget the memory rows (the next streak starts from hot.db)."""
+        if not self.degraded:
+            return
+        self.degraded = False
+        self._memory_rows.clear()
+        self._memory_strikes.clear()
+        log.info("abuse_degraded_recovered")
+        self._event("abuse_degraded_recovered", "info", {})
+
+    async def _read_shared(self, keys: list[str], strike_keys: list[str]) -> Shared | None:
+        """Limiter and strike rows from hot.db with a READ (works while another process holds the write lock)."""
+        if self.hot_db is None or not (keys or strike_keys):
+            return None
+        try:
+            return await self.hot_db.read(lambda conn: (load_rows(conn, keys), load_strike_rows(conn, strike_keys)))
+        except SharedStateUnavailable:
+            return None
+
+    async def _degraded_walk(
         self,
         specs: list[LimitSpec],
         policy: PerIpPolicy | None,
         now_ms: int,
         exc: SharedStateUnavailable,
         refused_after: bool = False,
+        provisional: bool = False,
+        seed: Shared | None = None,
     ) -> TxState:
-        """C7: the same decision on this worker's memory at `limit / workers`."""
+        """C7: the same decision on this worker's memory at `limit / workers`, starting from the shared rows."""
         if not self.degraded:
             self.degraded = True
             log.warning(
@@ -430,12 +562,43 @@ class AbusePipeline:
             )
             self._event("abuse_degraded", "critical", {"error": str(exc)[:200], "workers": self.workers})
         self.stats.degraded_requests += 1
-        keys = [spec.key for spec in specs] + ([policy.key] if policy is not None else [])
-        rows = {key: self._memory_rows.get(key) or LimiterRow(key) for key in keys}
+        keys = list(dict.fromkeys([spec.key for spec in specs] + ([policy.key] if policy is not None else [])))
+        strike_keys = [policy.key] if policy is not None else []
+        missing = [key for key in keys if self._memory_rows.get(key) is None]
+        strike_missing = [key for key in strike_keys if self._memory_strikes.get(key) is None]
+        shared: Shared | None = seed
+        if shared is None and (missing or strike_missing):
+            # A client already over its allowance in hot.db must not get a fresh one here (C7 is conservative).
+            shared = await self._read_shared(missing, strike_missing)
+        # No await from here on: reading memory, the walk and writing memory are one step of this worker's event
+        # loop, so concurrent requests of one client never all start from the same row (each sees the last write).
+        shared_rows, shared_strikes = shared if shared is not None else ({}, {})
+        rows: dict[str, LimiterRow] = {}
+        for key in keys:
+            row = self._memory_rows.get(key)
+            if row is None:
+                row = shared_rows.get(key) or LimiterRow(key)
+                if row.exists:
+                    self._memory_rows.put(key, row)
+            rows[key] = row
         strikes: dict[str, StrikeRow] = {}
-        if policy is not None:
-            strikes[policy.key] = self._memory_strikes.get(policy.key) or StrikeRow(policy.key)
-        walk = walk_limiters(specs, rows, strikes, policy, now_ms, divisor=self.workers, refused_after=refused_after)
+        for key in strike_keys:
+            srow = self._memory_strikes.get(key)
+            if srow is None:
+                srow = shared_strikes.get(key) or StrikeRow(key)
+                if srow.exists:
+                    self._memory_strikes.put(key, srow)
+            strikes[key] = srow
+        walk = walk_limiters(
+            specs,
+            rows,
+            strikes,
+            policy,
+            now_ms,
+            divisor=self.workers,
+            refused_after=refused_after,
+            provisional=provisional,
+        )
         for row in walk.limiter_writes:
             self._memory_rows.put(row.key, row)
         for srow in walk.strike_writes:
@@ -444,19 +607,53 @@ class AbusePipeline:
         return walk.state
 
     async def _peek(self, policy: PerIpPolicy | None, now_ms: int) -> TxState:
-        """The trio for a refusal decided before any limiter ran (pause, ban): one read, no write."""
+        """The trio for a refusal decided before any limiter ran (pause, ban): one read, no write.
+
+        While degraded, this worker's memory rows are the truth (they include what it admitted since hot.db stopped
+        accepting writes); otherwise hot.db, and memory again if hot.db cannot even be read.
+        """
         if policy is None:
             return TxState()
-        try:
-            if self.hot_db is None:
-                raise SharedStateUnavailable("hot", "no hot.db in this process")
-            rows, strikes = await self.hot_db.read(
-                lambda conn: (load_rows(conn, [policy.key]), load_strike_rows(conn, [policy.key]))
+        shared: Shared | None = None
+        if self.degraded:
+            memory_row = self._memory_rows.get(policy.key)
+            memory_strike = self._memory_strikes.get(policy.key)
+            if memory_row is not None or memory_strike is not None:
+                shared = (
+                    {policy.key: memory_row or LimiterRow(policy.key)},
+                    {policy.key: memory_strike or StrikeRow(policy.key)},
+                )
+        if shared is None:
+            shared = await self._read_shared([policy.key], [policy.key])
+        if shared is None:
+            shared = (
+                {policy.key: self._memory_rows.get(policy.key) or LimiterRow(policy.key)},
+                {policy.key: self._memory_strikes.get(policy.key) or StrikeRow(policy.key)},
             )
-        except SharedStateUnavailable:
-            rows = {policy.key: self._memory_rows.get(policy.key) or LimiterRow(policy.key)}
-            strikes = {policy.key: self._memory_strikes.get(policy.key) or StrikeRow(policy.key)}
-        return walk_limiters([], rows, strikes, policy, now_ms).state
+        return walk_limiters([], shared[0], shared[1], policy, now_ms).state
+
+    def _later_check_refuses(self, req: Any, facts: Facts, verdict: Refuse, prep: _Prep, tx: TxState) -> bool:
+        """Whether a static check after `verdict.check` would refuse this request (step 4 of the module docstring).
+
+        Static checks are the filters (challenge, bot score, ignored path, probes, auth smuggling, header filters,
+        blocks); rate limits after the throttle are not consulted, as v1 step 4a skipped them. Preparing is pure
+        (no I/O), so this costs at most the pattern matching an admitted request would pay anyway.
+        """
+        position = next((check.position for check in self.checks if check.name == verdict.check), None)
+        if position is None:
+            return True  # an unknown refusing check: fail closed, no content
+        later = [check for check in self.checks if check.position > position]
+        if any(check.name in tx.static for check in later):
+            return True
+        prepared = {check.name for check in prep.prepared}
+        for check in later:
+            if check.kind != "static" or check.name in prepared:
+                continue
+            if check.skipped_by_bypass and getattr(req, "bypass", False):
+                continue
+            if isinstance(check.prepare(req, facts), Refuse):
+                return True
+        return False
 
     def _after(self, req: Any, facts: Facts, tx: TxState, verdict: Verdict) -> None:
         """Statistics and memory-only observations; never raises (metrics never fail a request)."""
@@ -479,11 +676,17 @@ class AbusePipeline:
             if rule_id in stats.ua_rule_hits or len(stats.ua_rule_hits) < MAX_UA_HIT_RECORDS:
                 entry = stats.ua_rule_hits.setdefault(rule_id, [0, 0])
                 entry[0 if ua.admitted else 1] += 1
+            self._aggregate(
+                UA_RULE_HIT_EVENT, {"rule_id": rule_id, "result": "allowed" if ua.admitted else "refused"}, facts
+            )
         per_ip = next((o.per_ip for o in tx.outcomes.values() if o.per_ip is not None), None)
         if per_ip is not None and per_ip.new_strike and per_ip.rung.index:
             tier = per_ip.rung.index
             if tier in stats.tier_hits or len(stats.tier_hits) < MAX_TIER_RECORDS:
                 stats.tier_hits[tier] = stats.tier_hits.get(tier, 0) + 1
+            self._aggregate(TIER_EVENT, {"tier": tier}, facts)
+        if per_ip is not None and per_ip.punished:
+            self._throttled(facts.ip or facts.limit_key, per_ip.rung.index, per_ip.strikes)
         if per_ip is not None and not per_ip.admitted and per_ip.ban_minutes:
             self._ladder_ban(facts.limit_key, per_ip.ban_minutes, per_ip.rung.index, int(facts.now))
         reason = verdict.reason if isinstance(verdict, Refuse) else None
@@ -541,6 +744,28 @@ class AbusePipeline:
         except Exception:
             log.exception("abuse_event_failed", extra={"fields": {"kind": kind}})
 
+    def _aggregate(self, kind: str, detail: Mapping[str, Any], facts: Facts) -> None:
+        """A counter event summed per minute by the recorder (`record_event(..., aggregate=True)`, DESIGN 11.9)."""
+        record = getattr(self.recorder, "record_event", None)
+        if record is None:
+            return
+        try:
+            record(kind, "info", None, dict(detail), at_ms=facts.now_ms, aggregate=True)
+        except TypeError:
+            return  # a recorder without the keyword arguments (tests, older builds): counted in `stats` only
+        except Exception:
+            log.exception("abuse_event_failed", extra={"fields": {"kind": kind}})
+
+    def _throttled(self, ip: str, tier: int, strikes: int) -> None:
+        """`record_throttled`: a client that just became throttled (v1 `throttled_ips`, plan row 80)."""
+        record = getattr(self.recorder, "record_throttled", None)
+        if record is None:
+            return
+        try:
+            record(ip, tier=tier or None, strikes=strikes)
+        except Exception:
+            log.exception("abuse_event_failed", extra={"fields": {"kind": "throttled"}})
+
     # ---- admin and lifecycle ----
 
     def describe(self) -> list[dict[str, Any]]:
@@ -582,4 +807,15 @@ async def install(ctx: Any, stack: AsyncExitStack) -> AbusePipeline:
     return pipeline
 
 
-__all__ = ["AbusePipeline", "AbuseStats", "Allow", "Refuse", "Verdict", "install", "walk_limiters"]
+__all__ = [
+    "TIER_EVENT",
+    "UA_RULE_HIT_EVENT",
+    "AbusePipeline",
+    "AbuseStats",
+    "Allow",
+    "Refuse",
+    "Verdict",
+    "install",
+    "slow_patterns",
+    "walk_limiters",
+]

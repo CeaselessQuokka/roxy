@@ -29,6 +29,8 @@ How it works
       (expiring after `rotator_cooldown_window_s`); only when `rotator_cooldown_distinct_exits` (3) different exits
       are recorded for a template does `endpoint:<template>:rotator` cool down. The lease table is reused because
       it already is "a named row that expires" with a counting helper and a pruning job; no new table is needed.
+    - hot.db cannot be written (plan C7): `LocalCooldowns` keeps the cooldown of a 429 in the worker's memory,
+      routing honors it, and `write_local` puts it into hot.db once a write succeeds again.
 
 What to read next
     `roxy/upstream/effects.py` (where these are applied after each call), `roxy/upstream/breaker.py`, and
@@ -362,6 +364,73 @@ def active_rows(conn: sqlite3.Connection, now_ms: int, limit: int = 1000) -> lis
     return [_to_row(row) for row in rows]
 
 
+MAX_LOCAL_COOLDOWNS: Final = 1000
+"""Per-worker bound on cooldowns kept in memory while hot.db cannot be written (plan P9)."""
+
+
+class LocalCooldowns:
+    """Cooldowns this worker opened while hot.db could not be written (plan C7, finding UP-COOLDOWN-LOST).
+
+    A 429 that arrives during a hot.db outage must still stop the next request inside Roblox's Retry-After. Its
+    cooldown is kept here, honored by every routing decision of this worker, and written to hot.db (never
+    shortening a row that is there) as soon as a write succeeds, so the other workers honor it from then on.
+    Entries that ended are dropped; at most `MAX_LOCAL_COOLDOWNS` are kept (the one ending soonest goes first).
+    Used only from the event loop thread: callers copy what a database thread needs (`active`) before handing it
+    over.
+    """
+
+    __slots__ = ("_rows",)
+
+    def __init__(self) -> None:
+        self._rows: dict[str, CooldownRow] = {}
+
+    def remember(self, key: str, seconds: float, source: CooldownSource | str, now_ms: int) -> CooldownRow:
+        """Keep a cooldown on `key` for `seconds` (an existing longer one wins); returns the row kept."""
+        until_ms = now_ms + math.ceil(max(0.0, seconds) * 1000)
+        existing = self._rows.get(key)
+        if existing is not None and existing.until_ms >= until_ms:
+            return existing
+        row = CooldownRow(key, until_ms, CooldownSource(source).value, now_ms / 1000, 1)
+        self._rows[key] = row
+        self._prune(now_ms)
+        return row
+
+    def _prune(self, now_ms: int) -> None:
+        self._rows = {key: row for key, row in self._rows.items() if row.until_ms > now_ms}
+        while len(self._rows) > MAX_LOCAL_COOLDOWNS:
+            soonest = min(self._rows.values(), key=lambda row: row.until_ms)
+            del self._rows[soonest.key]
+
+    def active(self, keys: Iterable[str], now_ms: int) -> dict[str, CooldownRow]:
+        """The kept cooldowns among `keys` that have not ended at `now_ms`."""
+        return {key: row for key in keys if (row := self._rows.get(key)) is not None and row.active(now_ms)}
+
+    def pending(self, now_ms: int) -> list[CooldownRow]:
+        """Every kept cooldown that has not ended (to write to hot.db)."""
+        self._prune(now_ms)
+        return list(self._rows.values())
+
+    def forget(self, rows: Iterable[CooldownRow]) -> None:
+        """Drop rows that are now in hot.db (unless a longer one replaced them meanwhile)."""
+        for row in rows:
+            if self._rows.get(row.key) == row:
+                del self._rows[row.key]
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+
+def write_local(conn: sqlite3.Connection, rows: Iterable[CooldownRow], now_ms: int) -> int:
+    """Write cooldowns kept in memory into hot.db (one transaction); an active longer row is never shortened."""
+    written = 0
+    for row in rows:
+        if row.until_ms <= now_ms:
+            continue
+        open_cooldown(conn, row.key, (row.until_ms - now_ms) / 1000, row.source, now_ms, max(1, row.hits))
+        written += 1
+    return written
+
+
 def clear_all(conn: sqlite3.Connection) -> int:
     """Delete every cooldown and every rotator exit record (the "reset upstream state" action, row 34).
 
@@ -377,11 +446,13 @@ def clear_all(conn: sqlite3.Connection) -> int:
 __all__ = [
     "CREDENTIAL_KEY",
     "JITTER_FRACTION",
+    "MAX_LOCAL_COOLDOWNS",
     "ROTATOR_EXIT_HOLDER",
     "ROTATOR_EXIT_PREFIX",
     "CooldownPolicy",
     "CooldownRow",
     "CooldownSource",
+    "LocalCooldowns",
     "OpenedCooldown",
     "RateLimitInfo",
     "active_rows",
@@ -401,4 +472,5 @@ __all__ = [
     "record_rotator_exit_429",
     "repeat_count",
     "rotator_exit_prefix",
+    "write_local",
 ]

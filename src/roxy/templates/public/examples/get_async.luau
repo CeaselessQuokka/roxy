@@ -16,15 +16,18 @@ export type OutfitsResponse = {
 }
 
 -- One pcall covers both ways this can fail: GetAsync raising, and JSONDecode meeting text that is not JSON.
-local ok, result = pcall(function(): OutfitsResponse
+-- JSONDecode returns `any`, so the function's return type names the shape, and the check below confirms it.
+const ok, result = pcall(function(): OutfitsResponse
 	return HttpService:JSONDecode(HttpService:GetAsync(OUTFITS_URL))
 end)
 
-if ok then
+if not ok then
+	-- GetAsync cannot show the status code or Retry-After; RequestAsync can.
+	warn("Roxy request failed:", result)
+elseif typeof(result) ~= "table" or typeof(result.data) ~= "table" then
+	warn("The answer was not the JSON this script expects")
+else
 	for _, outfit in result.data do
 		print(outfit.id, outfit.name)
 	end
-else
-	-- GetAsync cannot show the status code or Retry-After; RequestAsync can.
-	warn("Roxy request failed:", result)
 end

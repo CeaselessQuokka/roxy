@@ -14,9 +14,11 @@ How it works
     - While on, each client key gets `global_throttle_limit` requests per `global_throttle_period` seconds in a v1
       fixed window (limiter rows `tall:<limit_key>`, evaluated in the pipeline's single hot.db transaction). Bypass
       entries skip it (v1).
-    - The refusal is 429 with the stored reason, or `Service down for maintenance.` when none was given (v1 kept the
-      pause text here too, bug B6; parity). `Roxy-Throttle-Reset` is the emergency window's remaining time and
-      `Roxy-Global-Throttled: True`; `Roxy-Throttled` and `Roxy-Requests-Left` stay the per-IP values (v1 B7).
+    - The refusal is 429 with the stored reason, or the pause default (the live `pause_message_default` setting,
+      `Service down for maintenance.` unless the admin changed it) when none was given: v1 used its one downtime
+      constant for both (bug B6/B13, kept for parity). `Roxy-Throttle-Reset` is the emergency window's remaining
+      time and `Roxy-Global-Throttled: True`; `Roxy-Throttled` and `Roxy-Requests-Left` stay the per-IP values (v1
+      B7).
     - Enabling records a new `since` marker (row 115). v1 deleted the drop counter instead; v2 keeps the history in
       the metrics rollups and the banner counts `throttle_all` refusals from the marker.
 
@@ -30,7 +32,7 @@ import sqlite3
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Final
 
-from roxy.abuse.messages import DEFAULT_DOWNTIME_MESSAGE, MAX_STATE_REASON, clean_admin_message
+from roxy.abuse.messages import DEFAULT_DOWNTIME_MESSAGE, MAX_STATE_REASON, clean_admin_message, downtime_default
 from roxy.abuse.state import read_state_value, write_state_value
 from roxy.abuse.verdict import MessageSource
 from roxy.config.audit import Actor
@@ -63,10 +65,10 @@ class ThrottleAllState:
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
 
-    def message(self) -> tuple[str, MessageSource]:
-        """`(text, message_source)` of the 429 body."""
+    def message(self, default: str = DEFAULT_DOWNTIME_MESSAGE) -> tuple[str, MessageSource]:
+        """`(text, message_source)` of the 429 body; `default` is the live `pause_message_default` setting."""
         text = clean_admin_message(self.reason, MAX_STATE_REASON)
-        return (text, "custom") if text else (DEFAULT_DOWNTIME_MESSAGE, "default")
+        return (text, "custom") if text else (downtime_default(default), "default")
 
 
 async def set_throttle_all(

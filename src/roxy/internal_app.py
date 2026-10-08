@@ -7,18 +7,27 @@ What this is
         POST /internal/flush    -> flush this worker's buffered metrics now
     `ListenerDispatcher` is the top-level ASGI app gunicorn serves (`roxy.asgi:app`): it sends each connection
     to the public app or to the internal app depending on WHICH SOCKET it arrived on.
+    `PublicInternalNotFound` is the one `/internal` route of the PUBLIC app: a fixed 404 for `/internal` and
+    everything under it, whatever the method.
 
 Why it exists
     Plan 5.8: nginx connects from 127.0.0.1, so "the peer is loopback" is true for every internet request nginx
     forwards, and must never authorize anything. The deploy still needs to ask a color "are you ready, which
     version are you?" before switching traffic to it (plan 17.4 step 5). The answer is a second listener that
-    nginx never proxies: a Unix socket in `/run/roxy-<color>/` (mode 0660, group roxy). The public app has no
-    `/internal` routes at all, so there is nothing to reach on the TCP port even by mistake.
+    nginx never proxies: a Unix socket in `/run/roxy-<color>/` (mode 0660, group roxy). The public app serves no
+    internal endpoint, so there is nothing to reach on the TCP port even by mistake.
+    Without its own `/internal` route the public app would hand `/internal/version` to the proxy catch-all,
+    which refuses it as "Not a Roblox URL" only after the abuse pipeline and the probe tarpit (8 to 20 s), and
+    the deploy's own check that the endpoint is hidden (`scripts/smoke_remote.py internal_hidden`) would wait
+    that long on every deploy. So the public app answers at once, as nginx does for `location /internal/` in
+    production: 404 with v1's JSON body `"Not Found"` and a newline, no proxy pipeline, no tarpit, and no probe
+    record (only the deploy tools on the server itself can reach a color's TCP port directly).
 
 How it works
-    gunicorn binds both addresses (`bind = [ROXY_BIND, "unix:" + ROXY_INTERNAL_SOCKET]` in
-    `deploy/gunicorn.conf.py`) and every worker serves both. The ASGI scope says which listener a request came
-    in on. Verified by experiment with gunicorn 26.2, uvicorn-worker 0.4 and uvicorn 0.54 (P0 report):
+    Every worker serves both listeners (`deploy/gunicorn.conf.py`): each opens its own TCP listener on
+    `ROXY_BIND` (`reuse_port`), and the master creates the internal Unix socket `ROXY_INTERNAL_SOCKET` once and
+    hands it to every worker. The ASGI scope says which listener a request came in on. Verified by experiment
+    with gunicorn 26.2, uvicorn-worker 0.4 and uvicorn 0.54 (P0 report):
         TCP listener:   scope["server"] == ("127.0.0.1", 18931),            scope["client"] == ("127.0.0.1", 57846)
         Unix listener:  scope["server"] == ("/tmp/.../internal.sock", None), scope["client"] is None
     (uvicorn's `get_local_addr` returns `(path, None)` for a Unix socket; plain `uvicorn --uds` behaves the same.)
@@ -29,6 +38,10 @@ How it works
     `/internal/flush` is a POST with no CSRF token on purpose: only processes in the `roxy` group can open the
     socket, and there are no browsers or cookies on it. Each request reaches ONE worker; `scripts/ctl.py`
     repeats the call to reach the others.
+    `PublicInternalNotFound` is a plain Starlette route that `roxy/main.py` puts FIRST in the public app, so no
+    other route (the proxy catch-all above all) ever sees an `/internal` path there. It matches every method and
+    answers with `core/errors.py: not_found_response`; the middleware stack still adds the request id and the
+    security headers.
 
 What to read next
     `roxy/asgi.py` (the object gunicorn imports), `deploy/gunicorn.conf.py`, then `scripts/smoke_remote.py`.
@@ -42,15 +55,41 @@ import sqlite3
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.datastructures import URLPath
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import BaseRoute, Match, NoMatchFound, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from roxy import __version__
+from roxy.core.errors import not_found_response
 
 READY_CHECK_TIMEOUT_S = 2.0
 FLUSH_TIMEOUT_S = 10.0
+
+INTERNAL_PREFIX = "/internal"
+
+
+def is_internal_path(path: str) -> bool:
+    """True for `/internal` and everything under `/internal/` (but not `/internals`)."""
+    return path == INTERNAL_PREFIX or path.startswith(INTERNAL_PREFIX + "/")
+
+
+class PublicInternalNotFound(BaseRoute):
+    """The public app's only `/internal` route: an immediate 404 for every method (see the module docstring)."""
+
+    path = INTERNAL_PREFIX  # for route listings; matching uses `is_internal_path`, not a path pattern
+
+    def matches(self, scope: Scope) -> tuple[Match, Scope]:
+        if scope.get("type") == "http" and is_internal_path(str(scope.get("path", ""))):
+            return Match.FULL, {}
+        return Match.NONE, {}
+
+    def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
+        raise NoMatchFound(name, path_params)  # nothing links to it
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await not_found_response(str(scope.get("path", "")))(scope, receive, send)
 
 
 def listener_kind(scope: Scope, internal_socket: str | os.PathLike[str] | None) -> str:

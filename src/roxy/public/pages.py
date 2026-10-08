@@ -35,7 +35,8 @@ How it works
       announces the title once), a section link; they also feed the sticky table of contents. Table alignment
       becomes CSS classes instead of inline `style` attributes (the CSP allows no inline styles). ```lua and
       ```luau fences are colored on the server by `roxy/public/luau_highlight.py` (escaped text in spans with
-      one-letter classes; no script and no inline style needed). Live values are
+      one-letter classes; no script and no inline style needed), and every code block opens with `PRE_OPEN`, a
+      `<pre>` that is a keyboard tab stop because it scrolls sideways on long lines (WCAG 2.1.1). Live values are
       written in the file as `{{ name }}`; the rendered HTML is split at those markers once, and each request only
       joins the parts with values from `GUIDE_VALUES`: plain values are escaped, and the few sentences that need a
       link or code formatting are `Markup` built here with every setting value escaped inside.
@@ -212,6 +213,13 @@ def count_text(value: Any, singular: str, plural: str | None = None) -> str:
     return with_unit(fmt_int(value), singular, plural)
 
 
+CACHE_HITS_WHY: Final = (
+    "An answer from Roxy's cache spares Roblox, but it still costs Roxy CPU, memory and bandwidth, and one shared "
+    "allowance per caller keeps Roxy fair for everyone."
+)
+"""Why cache hits count toward the per-IP limit (owner, 2026-10-07), in every public text that says they do."""
+
+
 @dataclass(frozen=True, slots=True)
 class LiveLimits:
     """The caller limits as a visitor should read them, built from one settings snapshot."""
@@ -264,17 +272,25 @@ class LiveLimits:
     def cache_hits_rule(self) -> str:
         """Whether cache hits use up the per-IP allowance (`throttle_count_cache_hits`, owner decision D10).
 
-        The owner changed the default to "count" on 2026-10-07: a cached answer costs Roblox nothing, but serving
-        it still costs Roxy, so the sentence says why. The other wording stays for an admin who turns it off.
+        The owner reversed D10 on 2026-10-07: every request counts by default, cache hits included, because
+        serving a cache hit still costs Roxy, and the sentence says so and why. The other wording stays true for
+        an admin who switches counting off.
         """
         if self.cache_hits_count:
-            return (
-                "Every request counts toward this limit, including requests Roxy answers from its cache: a cached "
-                "answer costs Roblox nothing, but it still costs Roxy processing time and bandwidth."
-            )
+            return f"Every request counts toward this limit, cached or not. {CACHE_HITS_WHY}"
         return (
-            "Requests Roxy answers from its cache do not count toward this limit right now, because they cost "
-            "Roblox nothing; they still count toward the flood limit."
+            "Right now, requests Roxy answers from its cache do not count toward this limit; every request still "
+            "counts toward the flood limit."
+        )
+
+    @property
+    def cache_hits_faq(self) -> str:
+        """The first sentences of the FAQ "Why do I get 429 when I barely send anything?"."""
+        if self.cache_hits_count:
+            return f"Every request counts toward your per-IP limit, cached or not (chapter 4). {CACHE_HITS_WHY}"
+        return (
+            "Requests Roxy answers from its cache do not count toward your per-IP limit right now, but every other "
+            "request does (chapter 4)."
         )
 
     @property
@@ -392,6 +408,7 @@ GUIDE_VALUES: Final[dict[str, Callable[[Getter], str]]] = {
     "window_length": lambda g: count_text(g("throttle_reset_duration"), "second"),
     "pacing_rule": lambda g: live_limits(g).pacing_rule,
     "cache_hits_rule": lambda g: live_limits(g).cache_hits_rule,
+    "cache_hits_faq": lambda g: live_limits(g).cache_hits_faq,
     "flood_requests": lambda g: count_text(g("flood_limit_per_minute"), "request"),
     "ipv6_rule": lambda g: live_limits(g).ipv6_rule,
     "place_limit_rule": lambda g: live_limits(g).place_limit_rule,
@@ -575,9 +592,14 @@ def _plain_text(inline: Token) -> str:
 HIGHLIGHTED_LANGUAGES: Final = frozenset({"lua", "luau"})
 """Fence languages rendered with Luau highlighting (```lua and ```luau); every other fence stays plain text."""
 
+PRE_OPEN: Final = '<pre tabindex="0">'
+"""How every code block opens. A `<pre>` scrolls sideways when a line is long, and a region that scrolls must be
+reachable with the keyboard (WCAG 2.1.1; axe rule scrollable-region-focusable), so each one is a tab stop."""
+
 
 def code_block(code: str, language: str) -> Markup:
-    """A highlighted Luau block: `<pre><code class="language-luau hl">` around `luau_highlight.highlight`.
+    """A highlighted Luau block: `<pre tabindex="0"><code class="language-luau hl">` around
+    `luau_highlight.highlight`.
 
     `language` must be one of `HIGHLIGHTED_LANGUAGES` (a constant, so it needs no escaping); the code is escaped
     by the highlighter piece by piece.
@@ -585,18 +607,29 @@ def code_block(code: str, language: str) -> Markup:
     if language not in HIGHLIGHTED_LANGUAGES:
         raise ValueError(f"not a highlighted language: {language!r}")
     return Markup(  # noqa: S704 (constant markup around highlight(), which escapes every piece of the code)
-        f'<pre><code class="language-{language} {SCOPE_CLASS}">{highlight(code)}</code></pre>'
+        f'{PRE_OPEN}<code class="language-{language} {SCOPE_CLASS}">{highlight(code)}</code></pre>'
     )
 
 
+def _focusable_pre(rendered: str) -> str:
+    """markdown-it's own `<pre>` opening tag replaced by `PRE_OPEN` (it always starts its code blocks with one)."""
+    return PRE_OPEN + rendered.removeprefix("<pre>") if rendered.startswith("<pre>") else rendered
+
+
 def _render_fence(self: RendererHTML, tokens: Sequence[Token], idx: int, options: Any, env: Any) -> str:
-    """markdown-it's fence rule with Luau highlighting for ```lua and ```luau; other fences render as before."""
+    """markdown-it's fence rule with Luau highlighting for ```lua and ```luau; other fences render as before, as
+    keyboard-focusable blocks."""
     token = tokens[idx]
     words = token.info.split()
     language = words[0].lower() if words else ""
     if language in HIGHLIGHTED_LANGUAGES:
         return f"{code_block(token.content, language)}\n"
-    return RendererHTML.fence(self, tokens, idx, options, env)
+    return _focusable_pre(RendererHTML.fence(self, tokens, idx, options, env))
+
+
+def _render_indented_code(self: RendererHTML, tokens: Sequence[Token], idx: int, options: Any, env: Any) -> str:
+    """markdown-it's rule for indented code blocks, as a keyboard-focusable block."""
+    return _focusable_pre(RendererHTML.code_block(self, tokens, idx, options, env))
 
 
 def _markdown() -> MarkdownIt:
@@ -604,6 +637,7 @@ def _markdown() -> MarkdownIt:
     # (rule C5 bans the dash characters it would produce). linkify=False: only explicit links become links.
     md = MarkdownIt("commonmark", {"html": False, "typographer": False, "linkify": False}).enable("table")
     md.add_render_rule("fence", _render_fence)
+    md.add_render_rule("code_block", _render_indented_code)
     return md
 
 

@@ -76,6 +76,9 @@ def test_retry_after_values() -> None:
     assert retry_after_seconds(ReasonCode.CREDENTIAL_UNAVAILABLE, cooldown_s=44) == 44
     assert retry_after_seconds(ReasonCode.CREDENTIAL_UNAVAILABLE) == 300
     assert retry_after_seconds(ReasonCode.CREDENTIAL_UNAVAILABLE, cooldown_s=44, credential_rejected=True) == 300
+    # Refused at send time with the manager's own wait (10 s while shared state is unreadable): that wait.
+    assert retry_after_seconds(ReasonCode.CREDENTIAL_UNAVAILABLE, soonest_s=10) == 10
+    assert retry_after_seconds(ReasonCode.CREDENTIAL_UNAVAILABLE, soonest_s=10, credential_rejected=True) == 300
     assert retry_after_seconds(ReasonCode.EGRESS_DISABLED) == 60
     assert retry_after_seconds(ReasonCode.DEGRADED) == 10
     assert retry_after_seconds(ReasonCode.UPSTREAM_OK) is None

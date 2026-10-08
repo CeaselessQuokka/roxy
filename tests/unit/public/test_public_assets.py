@@ -3,7 +3,8 @@
 What this is
     Unit tests over the files in `roxy/static/public/` and `roxy/templates/public/base.html`: the favicon and the
     Open Graph image are small, the heading anchors in the guide are readable (WCAG 1.4.3), every Luau highlight
-    color keeps 4.5:1 against the code background in both themes, every state of the status bar differs by more
+    color keeps 4.5:1 against the code background in both themes (here and through `scripts/check_contrast.py
+    --public`, which checks every color pair of the public site), every state of the status bar differs by more
     than its color (WCAG 1.4.1 and 1.4.11), and a copy is announced to screen readers through one polite live
     region (WCAG 4.1.3).
 
@@ -25,9 +26,12 @@ What to read next
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import struct
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -161,6 +165,38 @@ def test_highlight_colors_meet_the_text_contrast_minimum(theme: str) -> None:
     background = tokens(theme)["code-bg"]
     ratios = {css_class: contrast(resolve(value, theme), background) for css_class, value in highlight_rules().items()}
     assert min(ratios.values()) >= 4.5, ratios
+
+
+def load_contrast_script() -> ModuleType:
+    """scripts/check_contrast.py, loaded by path (it is a standalone script, not a package module)."""
+    path = Path(__file__).resolve().parents[3] / "scripts" / "check_contrast.py"
+    spec = importlib.util.spec_from_file_location("roxy_script_check_contrast_public", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_contrast_script_passes_the_public_palette(capsys: pytest.CaptureFixture[str]) -> None:
+    """`scripts/check_contrast.py --public`: every pair site.css uses, both themes, highlight colors included."""
+    script = load_contrast_script()
+    results = script.check_public((STATIC / "site.css").read_text(encoding="utf-8"))
+    assert [result for result in results if not result.ok] == []
+    assert {result.theme for result in results} == {"light", "dark"}
+    checked = {(result.foreground, result.background) for result in results}
+    for value in highlight_rules().values():  # every color a `.hl .x` rule uses is held to 4.5:1 on --code-bg
+        assert (value.removeprefix("var(--").removesuffix(")"), "code-bg") in checked
+    assert script.main(["--public", "--failures-only"]) == 0
+    assert "0 failing" in capsys.readouterr().out
+
+
+def test_contrast_script_catches_a_weak_highlight_color() -> None:
+    script = load_contrast_script()
+    css = (STATIC / "site.css").read_text(encoding="utf-8").replace("--hl-comment: #59636f;", "--hl-comment: #9aa3ad;")
+    failing = [result for result in script.check_public(css) if not result.ok]
+    assert [(result.theme, result.foreground) for result in failing] == [("light", "hl-comment")]
 
 
 def test_highlight_colors_are_tokens_set_for_both_themes() -> None:

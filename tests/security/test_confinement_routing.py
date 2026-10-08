@@ -21,8 +21,9 @@ How it works
     path: an allowlisted endpoint that tells the caller whether it saw the cookie, redirects (carrying `via=` in
     the target query so a followed hop is recognizable), a CSRF challenge, a 429 and a 500. A request "may" carry
     the cookie only when it is a GET to an allowlisted endpoint (or Roxy's own probe), straight from the server
-    (no `X-Exit-Ip`), never a redirect hop. `test_allowlist_row_grants_only_its_endpoint` documents finding F3
-    (strict xfail until the lead decides).
+    (no `X-Exit-Ip`), never a redirect hop. `test_allowlist_row_grants_only_its_endpoint` and
+    `test_allowlist_subpaths_need_an_explicit_wildcard` pin finding F3 as the lead decided it: a row grants exactly
+    the endpoints it names (no implicit subpaths; a regex row must match the whole path).
 
 What to read next
     `src/roxy/upstream/routing.py` and `service.py` (`_candidates`, `_redirect_url`), `src/roxy/egress/clients.py`
@@ -278,26 +279,58 @@ async def test_rotator_only_rules_everywhere_never_carry_the_cookie(
         assert len(cred) == 2  # GET and HEAD (cache_private: every caller request makes its own credential call)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "F3: a credential_allowlist row inherits the shared glob matcher's implicit subpath rule "
-        "(`^pattern(?:/.*)?$`), so a row for one endpoint also sends the credential to every endpoint below it"
-    ),
-)
+def caller_cookie_paths(run: AppRun) -> list[str]:
+    """The paths (no query) of every caller request the mock saw with the cookie (Roxy's own probe left out)."""
+    return [r.path.split("?")[0] for r in run.cookie_requests() if r.path.split("?")[0] != PROBE_PATH]
+
+
 async def test_allowlist_row_grants_only_its_endpoint(
     env: Any, credentials_dir: Path, fake_secrets: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Least privilege for D1 rows: allowlisting `economy.roblox.com/v1/user/currency` must not also hand the cookie
-    to `/v1/user/currency/<anything>`, which Roblox serves as different endpoints."""
+    """Least privilege for D1 rows (finding F3, lead decision: exact grants): allowlisting
+    `economy.roblox.com/v1/user/currency` hands the cookie to that endpoint only, never to
+    `/v1/user/currency/<anything>`, which Roblox serves as different endpoints. Those go out anonymously."""
     async with running_app(env, credentials_dir, fake_secrets, monkeypatch) as run:
         install_routes(run)
         await run.activate_credential()
         await run.rule("credential_allowlist", {"pattern": f"{ECONOMY}{CURRENCY}", "cache_private": True})
-        response = await run.get(f"/{ECONOMY}{CURRENCY}/history/transactions")
-        assert response.status_code == 200
-        leaked = [r.path for r in run.cookie_requests() if r.path.startswith(CURRENCY + "/history")]
-        assert leaked == []
+        for path in (f"{CURRENCY}/history/transactions", f"{CURRENCY}/x", f"{CURRENCY}x", CURRENCY):
+            run.clock.advance(5)
+            response = await run.get(f"/{ECONOMY}{path}")
+            assert response.status_code == 200, path
+        assert caller_cookie_paths(run) == [CURRENCY]
+        seen = [r.path.split("?")[0] for r in run.mock_requests()]
+        assert f"{CURRENCY}/history/transactions" in seen  # it was fetched, just anonymously
+        assert proxy_problems(run) == []
+
+
+async def test_allowlist_subpaths_need_an_explicit_wildcard(
+    env: Any, credentials_dir: Path, fake_secrets: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other form of F3: a row that wants the paths below it says so, with a glob wildcard (one segment) or a
+    regex that matches the whole path. Everything a row does not name stays anonymous."""
+    async with running_app(env, credentials_dir, fake_secrets, monkeypatch) as run:
+        install_routes(run)
+        await run.activate_credential()
+        await run.rule("credential_allowlist", {"pattern": f"{ECONOMY}{CURRENCY}/*", "cache_private": True})
+        regex_rows = (r"economy\.roblox\.com/v1/assets/\d+(?:/.*)?", r"economy\.roblox\.com/v1/bundles/\d+")
+        for pattern in regex_rows:
+            await run.rule("credential_allowlist", {"pattern": pattern, "type": "regex", "cache_private": True})
+        expected = {
+            f"{CURRENCY}/history": True,  # the explicit wildcard: one segment below
+            f"{CURRENCY}/history/transactions": False,
+            CURRENCY: False,  # `currency/*` does not name `currency` itself
+            "/v1/assets/5": True,
+            "/v1/assets/5/owners/page": True,  # the regex says so
+            "/v1/assets/5x": False,  # a regex row must match the whole path
+            "/v1/bundles/7": True,
+            "/v1/bundles/7/details": False,
+        }
+        for path in expected:
+            run.clock.advance(5)
+            assert (await run.get(f"/{ECONOMY}{path}")).status_code == 200, path
+        assert sorted(caller_cookie_paths(run)) == sorted(path for path, granted in expected.items() if granted)
+        assert proxy_problems(run) == []
 
 
 PROXY_VARIABLES = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")

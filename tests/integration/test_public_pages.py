@@ -236,7 +236,7 @@ async def test_internal_links_resolve(client: httpx.AsyncClient) -> None:
 
 async def test_home_luau_examples_are_highlighted_and_copy_exactly(client: httpx.AsyncClient) -> None:
     text = (await client.get("/")).text
-    blocks = re.findall(r'<pre><code class="language-luau hl">(.*?)</code></pre>', text, re.DOTALL)
+    blocks = re.findall(r'<pre tabindex="0"><code class="language-luau hl">(.*?)</code></pre>', text, re.DOTALL)
     assert len(blocks) == len(pages.HOME_EXAMPLE_NAMES)
     for block, name in zip(blocks, pages.HOME_EXAMPLE_NAMES, strict=True):
         assert '<span class="k">const</span>' in block
@@ -244,7 +244,7 @@ async def test_home_luau_examples_are_highlighted_and_copy_exactly(client: httpx
         copied = html.unescape(re.sub(r"<[^>]+>", "", block))
         assert copied == (pages.HOME_EXAMPLES_DIR / f"{name}.luau").read_text(encoding="utf-8"), name
     # Every other code block on the home page is a URL to open in a browser, not Luau.
-    for other in re.findall(r"<pre><code>(.*?)</code></pre>", text, re.DOTALL):
+    for other in re.findall(r'<pre tabindex="0"><code>(.*?)</code></pre>', text, re.DOTALL):
         assert other.startswith("https://roxytheproxy.com/"), other[:80]
 
 
@@ -308,14 +308,27 @@ async def test_live_limits_render_from_settings(app: FastAPI, client: httpx.Asyn
     status = re.sub(r"\s+", " ", (await client.get("/status")).text)
     assert "25 requests every 75 seconds per IP address" in status
 
-    # Owner change 2026-10-07 (D10 reversed): cache hits count by default; an admin can still switch that off.
-    flat_home = re.sub(r"\s+", " ", home)
-    assert "Every request counts toward this limit, including requests Roxy answers from its cache" in flat_home
-    assert "your own cache is the best way to stay under the limit" in flat_home
+    # Owner change 2026-10-07 (D10 reversed): every request counts toward the per-IP limit, cached or not, and
+    # every public page that states the limit says so and why. An admin can still switch counting off.
+    readable = {
+        "home": re.sub(r"\s+", " ", html.unescape(home)),
+        "docs": re.sub(r"\s+", " ", html.unescape(docs)),
+        "status": html.unescape(status),
+    }
+    for name, text in readable.items():
+        assert "Every request counts toward this limit, cached or not." in text, name
+        assert pages.CACHE_HITS_WHY in text, name
+        assert "do not count" not in text, name
+    assert "Every request counts toward your per-IP limit, cached or not (chapter 4)." in readable["docs"]  # FAQ
+    assert "your own cache is the best way to stay under the limit" in readable["home"]
+    assert "asking Roxy again counts even when Roxy answers from its cache" in readable["home"]
     await update_settings(app, {"throttle_window_mode": "fixed", "throttle_count_cache_hits": 0})
     home = (await client.get("/")).text
     assert "closes 75 seconds later" in home
-    assert "do not count toward this limit right now" in re.sub(r"\s+", " ", home)
+    flat_off = re.sub(r"\s+", " ", html.unescape(home))
+    assert "requests Roxy answers from its cache do not count toward this limit" in flat_off
+    assert "asking Roxy again counts" not in flat_off
+    assert pages.CACHE_HITS_WHY not in flat_off
 
     home = re.sub(r"\s+", " ", (await client.get("/")).text)
     assert "counted for each network its servers use" in home  # place_limit_key = place_prefix (default)
@@ -339,7 +352,9 @@ async def test_docs_page_renders_the_guide(client: httpx.AsyncClient) -> None:
     assert '<a href="#4-limits">4. Limits</a>' in response.text
     assert '<h2 id="7-status-codes-and-what-to-do">' in response.text
     assert 'class="anchor" href="#12-faq"' in response.text
-    assert response.text.count('<pre><code class="language-luau hl">') == 6  # every example, colored on the server
+    assert (
+        response.text.count('<pre tabindex="0"><code class="language-luau hl">') == 6
+    )  # every example, colored on the server
     assert "{{" not in response.text
     assert (await client.head("/docs")).status_code == 200
 

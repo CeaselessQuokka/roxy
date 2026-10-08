@@ -232,8 +232,9 @@ SETTINGS: list[SettingSpec] = [
         default=1,
         description=(
             "Whether a request answered from Roxy's own cache uses up part of the caller's per-IP allowance. "
-            "A cache hit costs Roblox nothing, but it still costs Roxy CPU, bandwidth and server time, so by "
-            "default every request counts, cached or not. The flood limit also counts every request."
+            "A cache hit costs Roblox nothing, but it still costs Roxy CPU, memory, bandwidth and server time, "
+            "and one shared allowance per caller keeps Roxy fair for everyone, so by default every request "
+            "counts, cached or not. The flood limit also counts every request."
         ),
         if_enabled=(
             "Every request counts, cached or not (the v1 behavior and the default), so each caller's allowance "

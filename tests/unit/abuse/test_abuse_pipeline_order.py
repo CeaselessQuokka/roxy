@@ -67,6 +67,13 @@ def test_describe_lists_every_check(make_pipeline: Callable[..., AbusePipeline])
         "kind": "static",
         "skipped_by_bypass": False,
         "tarpit_category": None,
+        "uses_patterns": False,
+    }
+    assert {d["name"] for d in described if d["uses_patterns"]} == {
+        "user_agent_rule",
+        "header_rule",
+        "endpoint_blocked",
+        "endpoint_rule",
     }
 
 

@@ -179,6 +179,13 @@ def test_credential_cooldown_retry_after() -> None:
     assert (decision.reason, decision.retry_after_s) == (ReasonCode.CREDENTIAL_UNAVAILABLE, 42)
 
 
+def test_credential_manager_cooldown_retry_after() -> None:
+    """The manager's own cooldown (kept in memory while hot.db could not record it) sets the answer's wait."""
+    route = RouteRequest(method="GET", credential_rule=RULE, credential_usable=False, credential_cooldown_s=37.5)
+    decision = decide(route, ALL)
+    assert (decision.reason, decision.retry_after_s) == (ReasonCode.CREDENTIAL_UNAVAILABLE, 37.5)
+
+
 def test_credential_bucket_busy() -> None:
     states = dict(ALL) | {Egress.CREDENTIAL: EgressAvailability(Egress.CREDENTIAL, bucket_wait_s=30)}
     decision = decide(RouteRequest(method="GET", credential_rule=RULE, credential_usable=True, max_wait_s=4), states)
