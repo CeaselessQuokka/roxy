@@ -1,0 +1,24 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: presence.roblox.com}
+case: warn
+name: presence_slow
+description: >
+  The presence POST probe answers 200 JSON after 1,500 ms. 13.2 H-REACH: under 2,000 ms (and not under 800 ms)
+  gives warn.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:presence.roblox.com":
+      status: 200
+      json: {userPresences: [{userPresenceType: 0, lastLocation: "Website", userId: 1}]}
+      latency_ms: 1500
+      expect_request: {via: direct, method: POST}
+expect:
+  status: warn
+  value: {present: true}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  calls:
+    "probe:presence.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}

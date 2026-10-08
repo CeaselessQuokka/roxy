@@ -1,0 +1,72 @@
+# SYS-WORKER-SAT just under its thresholds (85% CPU for 10 minutes).
+#
+#   worker 4101: 84% CPU for the last 30 minutes (50% before): high and steady, but under 85%
+#   worker 4102: a 7 minute spike at 95%, after 40%: over 85% but for less than 10 minutes; its 10 minute average is
+#                (3 x 40 + 7 x 95) / 10 = 78.5%
+#   fleet average over the last 10 minutes: 81.25%
+#
+# Nothing is saturated under a sustained reading or an average reading. The variants lower one threshold at a time
+# past the evidence; whether the rule then reports per worker or for the fleet, it must fire.
+
+format: roxy.insight_fixture/1
+rule: SYS-WORKER-SAT
+case: under_threshold
+description: >
+  One worker sits at 84% CPU for half an hour and the other had a 7 minute spike to 95%. Neither is above 85% for
+  10 minutes, so SYS-WORKER-SAT must not fire; lowering the CPU threshold to 80% or the window to 5 minutes must make
+  it fire.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  workers:
+    - pid: 4101
+      started_at: "-2d"
+      last_seen: "-2s"
+      requests: 1840000
+      proxied: 1210000
+      loop_lag_ms_p99: 22
+      open_conns: 150
+      worker_id: "roxy-test:4101:a1b2c3d4"
+      hostname: "roxy-test"
+      color: blue
+      master_pid: 4100
+      is_leader: 1
+      x_cpu_pct: 84
+      history:
+        - {window: ["-60m", "-30m"], cpu_pct: 50, loop_lag_ms_p99: 10, open_conns: 120}
+        - {window: ["-30m", "0m"], cpu_pct: 84, loop_lag_ms_p99: 22, open_conns: 150}
+    - pid: 4102
+      started_at: "-2d"
+      last_seen: "-3s"
+      requests: 1795000
+      proxied: 1180000
+      loop_lag_ms_p99: 28
+      open_conns: 140
+      worker_id: "roxy-test:4102:e5f6a7b8"
+      hostname: "roxy-test"
+      color: blue
+      master_pid: 4100
+      is_leader: 0
+      x_cpu_pct: 95
+      history:
+        - {window: ["-60m", "-7m"], cpu_pct: 40, loop_lag_ms_p99: 9, open_conns: 110}
+        - {window: ["-7m", "0m"], cpu_pct: 95, loop_lag_ms_p99: 28, open_conns: 140}
+
+expect:
+  fires: false
+
+variants:
+  - case: cpu_pct_lowered
+    description: At 80%, worker 4101 (84% for 30 minutes) is saturated.
+    settings: {insight_sys_worker_sat_cpu_pct: 80}
+    expect:
+      fires: true
+      recommendations:
+        - {changes_required: [{kind: manual}]}
+  - case: window_lowered
+    description: With a 5 minute window, worker 4102 (95% for the last 7 minutes) is saturated.
+    settings: {insight_sys_worker_sat_window_min: 5}
+    expect:
+      fires: true
+      recommendations:
+        - {changes_required: [{kind: manual}]}

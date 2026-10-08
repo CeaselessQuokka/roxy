@@ -1,0 +1,69 @@
+format: roxy.health_fixture/1
+check: H-BANS
+case: fail
+name: ban_covers_bypass
+description: >
+  SPAM-REFUSED auto-banned 198.51.100.0/29 half an hour ago, and that range contains the bypass entry
+  198.51.100.7/32 (bans are checked before bypass, DESIGN.md 11.1 step 4, so the load test box is now refused). 13.2 H-BANS: a ban
+  covering a bypass IP is conflicting, which gives fail, with the Protection page as the fix. Variants replace
+  the conflicting ban: one on the IP the admin signed in from 3 hours ago (the allowlisted 198.51.100.10), and
+  one on place 1000000001, the top place by served traffic over the last day (60% of it, banned 10 minutes ago).
+  Both are conflicts too.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  tables:
+    access_list:
+      - {id: 1, kind: bypass, cidr: "198.51.100.7/32", note: "Load test box", expires_at: "+20h", created_by: admin, created_at: "-4h"}
+      - {id: 2, kind: allow_admin, cidr: "198.51.100.10/32", note: "Owner", expires_at: null, created_by: admin, created_at: "-90d"}
+    bans:
+      - &ban_spam {id: 1, subject_type: ip, subject: "203.0.113.66", reason_code: spam, reason_text: "SPAM-RATE: five times the per-IP limit for ten minutes", created_at: "-20m", expires_at: "+40m", created_by: "auto:spam_rate", hits: 340, last_hit_at: "-1m"}
+      - &ban_range {id: 2, subject_type: cidr, subject: "192.0.2.128/25", reason_code: banned, reason_text: "Scraper fleet in one hosting range; reviewed.", created_at: "-10d", expires_at: null, created_by: admin, hits: 12000, last_hit_at: "-2h"}
+      - {id: 6, subject_type: cidr, subject: "198.51.100.0/29", reason_code: spam, reason_text: "SPAM-REFUSED: 200 refusals in 10 minutes", created_at: "-30m", expires_at: "+30m", created_by: "auto:spam_refused", hits: 75, last_hit_at: "-2m"}
+  state:
+    admin_logins:
+      - {at: "-3h", ip: "198.51.100.10", username: owner, successful: true, method: totp}
+  profiles:
+    served: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: 150, user_agent: "Roblox/Linux"}
+  traffic:
+    - name: games_by_place
+      profile: served
+      endpoint_template: games.roblox.com/v1/games
+      window: ["-24h", "-10m"]
+      per_minute: 2
+      clients: {cidr: "203.0.113.0/26", count: 40}
+      places: ["1000000001", "1000000001", "1000000001", "1000000002", "1000000003"]
+    - name: games_by_place_recent
+      profile: served
+      endpoint_template: games.roblox.com/v1/games
+      window: ["-10m", "0m"]
+      per_minute: 2
+      clients: {cidr: "203.0.113.0/26", count: 40}
+      places: ["1000000002", "1000000003"]
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)protection"}
+  credential_calls: {eq: 0}
+variants:
+  - case: fail
+    name: ban_covers_admin_ip
+    inputs:
+      tables:
+        bans:
+          - *ban_spam
+          - *ban_range
+          - {id: 7, subject_type: ip, subject: "198.51.100.10", reason_code: spam, reason_text: "SPAM-PROBE: 5 probes in 10 minutes", created_at: "-25m", expires_at: "+35m", created_by: "auto:spam_probe", hits: 4, last_hit_at: "-20m"}
+    expect:
+      status: fail
+      explanation: {present: true}
+  - case: fail
+    name: ban_covers_top_place
+    inputs:
+      tables:
+        bans:
+          - *ban_spam
+          - *ban_range
+          - {id: 8, subject_type: place, subject: "1000000001", reason_code: banned, reason_text: "Mistaken place ban", created_at: "-10m", expires_at: null, created_by: admin, hits: 20, last_hit_at: "-1m"}
+    expect:
+      status: fail
+      explanation: {present: true}

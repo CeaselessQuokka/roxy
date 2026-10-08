@@ -1,0 +1,22 @@
+format: roxy.health_fixture/1
+check: H-WAL
+case: warn
+name: 100_mib
+description: >
+  metrics.db-wal has grown to 100 MiB (a long reader kept PASSIVE checkpoints from resetting it); the others
+  are 4 MiB each, 112 MiB in total. 13.2 H-WAL: under 256 MiB (and not under 64 MiB) gives warn.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    disk:
+      total_bytes: 40000000000
+      free_bytes: 20000000000
+      files:
+        "control.db": {bytes: 60000000, wal_bytes: 4194304}
+        "hot.db": {bytes: 8000000, wal_bytes: 4194304}
+        "metrics.db": {bytes: 2000000000, wal_bytes: 104857600}
+        "cache.db": {bytes: 500000000, wal_bytes: 4194304}
+expect:
+  status: warn
+  explanation: {present: true}
+  credential_calls: {eq: 0}

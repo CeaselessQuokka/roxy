@@ -1,0 +1,28 @@
+format: roxy.health_fixture/1
+check: H-CONFIG
+case: warn
+name: unknown_stored_key
+description: >
+  control.db holds an override for `diagnostics_flush_interval`, a v1 setting that v2 replaced with
+  metrics_flush_interval_ms and that is not a v2 alias (left by a hand edit of an old import). The runtime
+  ignores it and logs a warning (config/runtime.py), so nothing is misconfigured, but the stored row is not a
+  setting within the catalog. Everything else is valid and every rule compiles. Assumption: 13.2 does not say
+  which issues are "warnings" and which are "errors"; an ignored unknown key changes no behavior, so this
+  fixture treats it as a warning (warn), with the Settings page as the fix.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    cache_ttl_seconds: 300
+  tables:
+    rules_cache:
+      - {id: 1, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-30d"}
+  state:
+    raw:
+      control:
+        settings:
+          - {key: diagnostics_flush_interval, value_json: "10", updated_at: "-200d", updated_by: import}
+expect:
+  status: warn
+  explanation: {present: true}
+  fix_link: {regex: "(?i)setting"}
+  credential_calls: {eq: 0}

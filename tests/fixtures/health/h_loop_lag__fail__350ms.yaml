@@ -1,0 +1,47 @@
+format: roxy.health_fixture/1
+check: H-LOOP-LAG
+case: fail
+name: 350ms
+description: >
+  Over the last 5 minutes one worker's event loop lag p99 is 350 ms (synchronous work on the loop). 13.2
+  H-LOOP-LAG: 200 ms or more gives fail.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    ROXY_WORKERS: "2"
+  state:
+    workers:
+      - pid: 41001
+        worker_id: "roxy-test:41001:a1b2c3d4"
+        hostname: roxy-test
+        color: blue
+        master_pid: 41000
+        started_at: "-2d"
+        last_seen: "-1s"
+        loop_lag_ms_p99: 35
+        open_conns: 40
+        is_leader: 1
+        version: "3f9c2a1"
+        x_self: true
+        history:
+          - {window: ["-30m", "-5m"], cpu_pct: 30, loop_lag_ms_p99: 25, open_conns: 40}
+          - {window: ["-5m", "0m"], cpu_pct: 32, loop_lag_ms_p99: 35, open_conns: 40}
+      - pid: 41002
+        worker_id: "roxy-test:41002:b2c3d4e5"
+        hostname: roxy-test
+        color: blue
+        master_pid: 41000
+        started_at: "-2d"
+        last_seen: "-2s"
+        loop_lag_ms_p99: 350
+        open_conns: 38
+        is_leader: 0
+        version: "3f9c2a1"
+        history:
+          - {window: ["-30m", "-5m"], cpu_pct: 35, loop_lag_ms_p99: 40, open_conns: 37}
+          - {window: ["-5m", "0m"], cpu_pct: 90, loop_lag_ms_p99: 350, open_conns: 38}
+expect:
+  status: fail
+  value: {gte: 200}
+  explanation: {present: true}
+  credential_calls: {eq: 0}

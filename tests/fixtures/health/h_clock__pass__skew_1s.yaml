@@ -1,0 +1,22 @@
+format: roxy.health_fixture/1
+check: H-CLOCK
+case: pass
+name: skew_1s
+description: >
+  Roblox's Date header is one second behind the fake clock (HTTP dates have one second resolution, so about
+  1 s of skew), and timedatectl reports NTP synchronized. 13.2 H-CLOCK: under 2 s gives pass. Which Roblox URL
+  the check reads the Date header from is the implementer's choice, so the answer is mocked under `any_roblox`.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    any_roblox:
+      status: 200
+      headers: {date: "-1s", content-type: "application/json"}
+      json: {data: []}
+      latency_ms: 60
+  timedatectl:
+    show: {NTPSynchronized: "yes", NTP: "yes", Timezone: "UTC"}
+expect:
+  status: pass
+  value: {lt: 2}
+  credential_calls: {eq: 0}

@@ -1,0 +1,20 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: users.roblox.com}
+case: fail
+name: users_timeout
+description: >
+  The users probe times out. 13.2 H-REACH: failure gives fail. A timeout may be retried once under the 7.9
+  policy, so one or two calls, never through the credential.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:users.roblox.com": {error: timeout}
+expect:
+  status: fail
+  value: {present: true}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  calls:
+    "probe:users.roblox.com": {count: {between: [1, 2]}}
+  credential_calls: {eq: 0}

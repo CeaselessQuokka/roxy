@@ -1,0 +1,31 @@
+format: roxy.health_fixture/1
+check: H-CRED-COOLDOWN
+case: warn
+name: short_cooldown
+description: >
+  A credential 429 with Retry-After 60 arrived 15 s ago, so 45 s of credential cooldown remain. 13.2
+  H-CRED-COOLDOWN: under 60 s gives warn, with the Upstream page as the fix. The variant sits on the edge: 59 s
+  remaining is still under 60 s.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    credential: {present: true, status: cooling_down, status_at: "-15s", set_at: "-20d", account_id: "1000001"}
+    cooldowns:
+      - {key: credential, until: "+45s", source: retry_after, set_at: "-15s", hits: 1}
+expect:
+  status: warn
+  value: {between: [44, 46]}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  credential_calls: {eq: 0}
+variants:
+  - case: warn
+    name: edge_59s
+    inputs:
+      state:
+        cooldowns:
+          - {key: credential, until: "+59s", source: retry_after, set_at: "-1s", hits: 1}
+    expect:
+      status: warn
+      value: {between: [58, 59.99]}
+      explanation: {present: true}

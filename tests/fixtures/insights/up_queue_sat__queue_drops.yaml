@@ -1,0 +1,109 @@
+# UP-QUEUE-SAT through queue drops (format: README.md in this directory).
+#
+# 11.5: "Queue drops > 0.5% or p95 queue wait > 2 s"; evidence: queue metrics; change: "Raise TTLs on top miss
+# endpoints; raise bucket only if 429-free headroom exists"; confidence medium. The param text defines drops as
+# requests dropped from the upstream queue "as a share of all requests that needed an upstream call". 11.5 gives
+# the rule no window; the condition here holds evenly over the whole last hour, so any window up to 60 minutes
+# sees the same shares.
+#
+#   per minute, last 60 minutes                       requests
+#   headshot misses served after queueing             110        queue wait p95 ~1.5 s (under 2 s)
+#   games misses                                      20
+#   headshot queue_overflow (queue cap, 429)          1          0.76% of requests that needed a call
+#   headshot upstream_busy (no slot in time, 429)     1          0.76%; both together 1.5%
+#   cache hits                                        300        (never needed a call)
+#
+# The headshot endpoint had Roblox 429s three hours ago, so there is no 429-free headroom: no bucket may be
+# raised. The fix is a longer TTL on the top miss endpoint (headshot), and no global queue or bucket setting.
+
+format: roxy.insight_fixture/1
+rule: UP-QUEUE-SAT
+case: queue_drops
+description: >
+  Demand for avatar headshots runs above the endpoint's bucket, and 1.5% of requests that needed an upstream call
+  were dropped from the queue (half for the queue cap, half for no slot in time). The rule must recommend a
+  longer TTL for the headshot endpoint and must not raise its bucket, which had Roblox 429s today.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 120, stale_ttl: 60, methods: "GET", origin: admin, created_at: "-30d"}
+    - {id: 2, pattern: "games.roblox.com/v1/games", type: glob, ttl: 60, stale_ttl: 30, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS"}
+  dropped: {egress: none, outcome: failed, status: 429, source: roxy, cache_state: "MISS", error: true}
+  games: {endpoint_template: games.roblox.com/v1/games}
+
+traffic:
+  - {name: headshot_hit, profile: hit, window: ["-60m", "0m"], per_minute: 200}
+  - {name: games_hit, profile: [hit, games], window: ["-60m", "0m"], per_minute: 100}
+  - name: headshot_miss_queued
+    profile: miss
+    window: ["-60m", "0m"]
+    per_minute: 110
+    queue_wait_ms: {p50: 300, p95: 1400, p99: 1900}
+    latency_ms: {p50: 500, p95: 1650, p99: 2150}
+  - {name: games_miss, profile: [miss, games], window: ["-60m", "0m"], per_minute: 20, latency_ms: {p50: 150, p95: 400, p99: 800}}
+  - {name: headshot_queue_overflow, profile: dropped, reason: queue_overflow, window: ["-60m", "0m"], per_minute: 1, latency_ms: 5}
+  - {name: headshot_upstream_busy, profile: dropped, reason: upstream_busy, window: ["-60m", "0m"], per_minute: 1, latency_ms: 4000, queue_wait_ms: 4000}
+
+events:
+  upstream_429:
+    - {window: ["-180m", "-175m"], total: 8, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, retry_after_s: 30}
+
+state:
+  buckets:
+    - bucket_key: "endpoint:thumbnails.roblox.com/v1/users/avatar-headshot"
+      per_min: 120
+      burst: 10
+      fill_pct: 100
+      history:
+        - {window: ["-180m", "-175m"], fill_pct_peak: 100, attempts: 600, rejections: 20}
+        - {window: ["-60m", "0m"], fill_pct_peak: 100, attempts: 6720, rejections: 120}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      upstream_calls: 7800
+      by_reason: {queue_overflow: 60, upstream_busy: 60, upstream_ok: 7800, cache_hit: 18000}
+    - window: ["-24h", "0m"]
+      roblox_429: 8
+
+  fires: true
+  others: forbid
+  recommendations:
+    - confidence: medium
+      family: upstream
+      change_kinds_required: [rule_upsert]
+      change_kinds_forbidden: [bucket_override, routing_rule, ban_add, credential_allowlist_remove]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["thumbnails.roblox.com/v1/users/avatar-headshot"]}}
+          current: {ttl: 120}
+          proposed: {ttl: {gt: 120}}
+      changes_forbidden:
+        - kind: setting
+          key:
+            in: [endpoint_bucket_default_per_min, endpoint_bucket_default_burst, host_bucket_default_per_min,
+                 global_bucket_per_min, direct_bucket_per_min, queue_max_length, queue_wait_interactive_ms,
+                 queue_wait_stale_ms, cache_ttl_seconds]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_queue_sat_enabled: 0}
+    expect: {fires: false}
+  - case: drop_pct_2
+    description: Drops of 1.5% are under a 2% threshold, and the p95 queue wait (about 1.5 s) is under 2 s.
+    settings: {insight_up_queue_sat_drop_pct: 2}
+    expect: {fires: false}

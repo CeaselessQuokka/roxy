@@ -1,0 +1,75 @@
+# UP-QUEUE-SAT just under both of its tests (format: README.md in this directory).
+#
+# 11.5: "Queue drops > 0.5% or p95 queue wait > 2 s". Over the whole last hour, evenly:
+#
+#   requests that needed an upstream call   7,470 (headshot 6,600, games 840, dropped 30)
+#   dropped from the queue (queue_overflow) 30 = 0.40%
+#   queue wait of headshot misses           no wait above 1,950 ms; histogram p95 inside the (1500, 2000] ms
+#                                           bucket, so it can never read above 2,000 ms
+#
+# Variants lower each threshold below the evidence; each must fire.
+
+format: roxy.insight_fixture/1
+rule: UP-QUEUE-SAT
+case: just_under
+description: >
+  The headshot endpoint queues a little (no wait reaches 2 s) and 0.4% of requests that needed an upstream call
+  were dropped for the queue cap. Both are under their thresholds, so the rule stays quiet.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 120, stale_ttl: 60, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS"}
+  games: {endpoint_template: games.roblox.com/v1/games}
+
+traffic:
+  - {name: headshot_hit, profile: hit, window: ["-60m", "0m"], per_minute: 150}
+  - name: headshot_miss_queued
+    profile: miss
+    window: ["-60m", "0m"]
+    per_minute: 110
+    queue_wait_ms: {p50: 600, p95: 1750, p99: 1950}
+    latency_ms: {p50: 800, p95: 1980, p99: 2200}
+  - {name: games_miss, profile: [miss, games], window: ["-60m", "0m"], per_minute: 14, latency_ms: {p50: 150, p95: 400, p99: 800}}
+  - name: headshot_queue_overflow
+    window: ["-60m", "0m"]
+    # One drop every other minute, so any part of the hour has the same share.
+    series: [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+             1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]
+    egress: none
+    outcome: failed
+    reason: queue_overflow
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    error: true
+    latency_ms: 5
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      upstream_calls: 7440
+      by_reason: {queue_overflow: 30, upstream_busy: 0, upstream_ok: 7440}
+
+  fires: false
+
+variants:
+  - case: drop_pct_0_3
+    description: 0.40% of requests that needed a call were dropped, above a 0.3% threshold.
+    settings: {insight_up_queue_sat_drop_pct: 0.3}
+    expect: {fires: true}
+  - case: p95_wait_1200
+    description: The p95 queue wait (inside the 1.5 to 2 s bucket) is above a 1.2 s threshold.
+    settings: {insight_up_queue_sat_p95_wait_ms: 1200}
+    expect: {fires: true}

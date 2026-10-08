@@ -1,0 +1,35 @@
+format: roxy.health_fixture/1
+check: H-CACHE-HIT
+case: pass
+name: 33_percent_avoided
+description: >
+  In the last hour 6,000 caller requests needed 4,020 upstream calls, so 1,980 calls (33%) were avoided (plan
+  P6: requests minus upstream calls). 13.2 H-CACHE-HIT: over 30% gives pass. The two hours before were nearly
+  uncached (5%) and are outside the one-hour window.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  traffic_defaults:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    user_agent: "Roblox/Linux"
+  profiles:
+    hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: 4}
+    miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 150, p95: 400, p99: 700}}
+  traffic:
+    - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 1500}
+    - {name: badges_hit, profile: hit, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-60m", "0m"], total: 480}
+    - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2520}
+    - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 1500}
+    - {name: games_hit_earlier, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-180m", "-60m"], total: 120}
+    - {name: games_miss_earlier, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-180m", "-60m"], total: 2280}
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 6000
+      upstream_calls: 4020
+      avoided_calls: 1980
+    - window: ["-180m", "-60m"]
+      requests: 2400
+      avoided_calls: 120
+  status: pass
+  value: {gt: 30, lt: 36}
+  credential_calls: {eq: 0}

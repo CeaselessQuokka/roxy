@@ -1,0 +1,102 @@
+# CACHE-LOW-HIT stays quiet when each endpoint misses one threshold by a little
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Endpoint in top 10 by requests with hit ratio < 30% over 1 h" (insight_cache_low_hit_top_n 10,
+# _max_hit_ratio_pct 30, _window_min 60).
+#
+#   endpoint (last 60 min)                                  requests  rank  hit ratio
+#   thumbnails.roblox.com/v1/users/avatar-headshot             4,000     1    80%
+#   games.roblox.com/v1/games/votes                            3,000     2    31%   <- just above 30%
+#   ... eight healthy endpoints (50% to 80%) ...                          3-10
+#   develop.roblox.com/v1/universes/{universeId}/places          600    11     8%   <- busy, but 11th
+#   avatar.roblox.com/v1/users/{userId}/avatar                   300    12    70%
+#
+# The variants move one threshold just past the data and must make exactly that endpoint fire.
+
+format: roxy.insight_fixture/1
+rule: CACHE-LOW-HIT
+case: below_thresholds
+description: >
+  The votes endpoint has a 31% hit ratio (threshold below 30%) and the develop endpoint, at 8%, is the 11th
+  busiest (threshold top 10). Nothing may fire at the defaults; lowering either test by one step fires only the
+  endpoint that sits next to it.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 6, pattern: "groups.roblox.com/v1/groups/*", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 7, pattern: "badges.roblox.com/v1/badges/*", type: glob, ttl: 3600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 8, pattern: "users.roblox.com/v1/users/*", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 3200}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 800}
+  - {name: votes_hit, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 930}
+  - {name: votes_miss, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 2070}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2100}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 700}
+  - {name: group_hit, profile: hit, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-60m", "0m"], total: 1500}
+  - {name: group_miss, profile: miss, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-60m", "0m"], total: 500}
+  - {name: user_hit, profile: hit, endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], total: 1260}
+  - {name: user_miss, profile: miss, endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], total: 540}
+  - {name: badge_hit, profile: hit, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-60m", "0m"], total: 1200}
+  - {name: badge_miss, profile: miss, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-60m", "0m"], total: 300}
+  - {name: search_hit, profile: hit, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], total: 720}
+  - {name: search_miss, profile: miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], total: 480}
+  - {name: friends_hit, profile: hit, endpoint_template: "friends.roblox.com/v1/users/{userId}/friends/count", window: ["-60m", "0m"], total: 650}
+  - {name: friends_miss, profile: miss, endpoint_template: "friends.roblox.com/v1/users/{userId}/friends/count", window: ["-60m", "0m"], total: 350}
+  - {name: groups_v2_hit, profile: hit, endpoint_template: groups.roblox.com/v2/groups, window: ["-60m", "0m"], total: 450}
+  - {name: groups_v2_miss, profile: miss, endpoint_template: groups.roblox.com/v2/groups, window: ["-60m", "0m"], total: 450}
+  - {name: economy_hit, profile: hit, endpoint_template: "economy.roblox.com/v2/assets/{assetId}/details", window: ["-60m", "0m"], total: 560}
+  - {name: economy_miss, profile: miss, endpoint_template: "economy.roblox.com/v2/assets/{assetId}/details", window: ["-60m", "0m"], total: 240}
+  - {name: develop_hit, profile: hit, endpoint_template: "develop.roblox.com/v1/universes/{universeId}/places", window: ["-60m", "0m"], total: 48}
+  - {name: develop_miss, profile: miss, endpoint_template: "develop.roblox.com/v1/universes/{universeId}/places", window: ["-60m", "0m"], total: 552}
+  - {name: avatar_hit, profile: hit, endpoint_template: "avatar.roblox.com/v1/users/{userId}/avatar", window: ["-60m", "0m"], total: 210}
+  - {name: avatar_miss, profile: miss, endpoint_template: "avatar.roblox.com/v1/users/{userId}/avatar", window: ["-60m", "0m"], total: 90}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 19900
+      upstream_calls: 7072
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games/votes}
+      requests: 3000
+      served_cache: 930
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: "develop.roblox.com/v1/universes/{universeId}/places"}
+      requests: 600
+      served_cache: 48
+  fires: false
+
+variants:
+  - case: max_hit_ratio_32
+    description: A 32% threshold makes the 31% votes endpoint low-hit; develop is still outside the top 10.
+    settings: {insight_cache_low_hit_max_hit_ratio_pct: 32}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "games.roblox.com/v1/games/votes", severity: any, family: cache}
+  - case: top_n_11
+    description: Checking the 11 busiest endpoints reaches develop (8%); votes is still above 30%.
+    settings: {insight_cache_low_hit_top_n: 11}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "develop.roblox.com/v1/universes/", severity: any, family: cache}

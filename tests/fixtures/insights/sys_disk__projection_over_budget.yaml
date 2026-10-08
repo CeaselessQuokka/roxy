@@ -1,0 +1,74 @@
+# SYS-DISK, second condition: "30-day projection over budget" (11.5; storage_total_budget_gb = 12).
+#
+# Roxy's storage is 7.0e9 bytes today (58% of 12 GB, 54% read as GiB: under 70%), with a large disk mostly free, but
+# metrics.db has grown by 0.25e9 bytes a day for two weeks (3.5e9 -> 5.25e9 -> 7.0e9, a straight line). Carried 30
+# days forward that is 7.0e9 + 30 x 0.25e9 = 14.5e9, over the budget under either reading of GB.
+#
+# The variant raises the budget to 20 GB: 14.5e9 then fits and today's use is 35%.
+
+format: roxy.insight_fixture/1
+rule: SYS-DISK
+case: projection_over_budget
+description: >
+  Storage is at 58% of the budget but has grown 0.25e9 bytes a day for two weeks, so it will pass the 12 GB budget
+  within 30 days. SYS-DISK must fire with lower retention, a larger budget or a manual step, and not as safe to
+  auto-apply.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  disk:
+    total_bytes: 200000000000
+    free_bytes: 150000000000
+    files:
+      "metrics.db": {bytes: 6100000000, wal_bytes: 50000000}
+      "cache.db": {bytes: 500000000, wal_bytes: 40000000}
+      "control.db": {bytes: 30000000, wal_bytes: 4000000}
+      "hot.db": {bytes: 20000000, wal_bytes: 6000000}
+      "exports": {bytes: 100000000, wal_bytes: 0}
+      "snapshots": {bytes: 150000000, wal_bytes: 0}
+    tables:
+      "metrics.rollup_minute": 3900000000
+      "metrics.request_samples": 1500000000
+      "metrics.events": 500000000
+      "cache.entries": 480000000
+    growth:
+      - {at: "-14d", total_bytes: 3500000000}
+      - {at: "-7d", total_bytes: 5250000000}
+      - {at: "now", total_bytes: 7000000000}
+    dims_per_minute_7d_avg: 900
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-DISK
+      severity: any
+      family: system
+      safe_auto: false
+      changes_required:
+        - any_of:
+            - kind: setting
+              key:
+                in: [retention_minute_days, retention_hour_days, retention_day_days, retention_client_minute_days,
+                     retention_client_hour_days, retention_client_day_days, retention_events_days,
+                     retention_upstream_429_days, retention_errors_days, retention_fingerprints_days,
+                     retention_snapshots_days, retention_exports_days, request_sample_hours, request_sample_max_rows,
+                     events_max_rows]
+            - {kind: setting, key: storage_total_budget_gb, current: 12, proposed: {gt: 12}}
+            - {kind: manual}
+      changes_forbidden:
+        - {kind: setting, key: storage_total_budget_gb, proposed: {lt: 12}}
+        - {kind: setting, key: retention_minute_days, proposed: {gt: 14}}
+        - {kind: setting, key: retention_hour_days, proposed: {gt: 400}}
+        - {kind: setting, key: request_sample_hours, proposed: {gt: 24}}
+      change_kinds_forbidden: [bucket_override, rule_upsert, rule_delete, ban_add, bypass_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_disk_enabled: 0}
+    expect: {fires: false}
+  - case: budget_raised
+    description: With a 20 GB budget the 30-day projection (14.5e9) fits and today's use is 35%.
+    settings: {storage_total_budget_gb: 20}
+    expect: {fires: false}

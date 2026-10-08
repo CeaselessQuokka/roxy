@@ -1,0 +1,83 @@
+# CACHE-LOW-HIT ignores a low hit ratio that ended before its window
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "... hit ratio < 30% over 1 h" (insight_cache_low_hit_window_min 60).
+#
+#   games.roblox.com/v1/games/votes, 3,000 requests per hour throughout:
+#     -180m to -60m   hit ratio 10% (a cache-busting script ran, then was fixed at -60m)
+#     -60m to now     hit ratio 60%
+#   last 60 min: 60%; last 120 min: 2,100 / 6,000 = 35%; last 180 min: 2,400 / 9,000 = 26.7%.
+#
+# Nothing fires with the 60 minute window or a 120 minute one; a 180 minute window covers the bad stretch.
+
+format: roxy.insight_fixture/1
+rule: CACHE-LOW-HIT
+case: outside_window
+description: >
+  The votes endpoint had a 10% hit ratio for two hours, but it recovered an hour ago (60% since). Measured over
+  the default 60 minutes it is healthy, so nothing may fire; the window variants show the rule really measures
+  over insight_cache_low_hit_window_min.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 6, pattern: "groups.roblox.com/v1/groups/*", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 7, pattern: "badges.roblox.com/v1/badges/*", type: glob, ttl: 3600, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: votes_hit_busted, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-180m", "-60m"], total: 600}
+  - {name: votes_miss_busted, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-180m", "-60m"], total: 5400}
+  - {name: votes_hit_fixed, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 1800}
+  - {name: votes_miss_fixed, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 1200}
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-180m", "0m"], total: 9600}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-180m", "0m"], total: 2400}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-180m", "0m"], total: 6300}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-180m", "0m"], total: 2100}
+  - {name: group_hit, profile: hit, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-180m", "0m"], total: 4500}
+  - {name: group_miss, profile: miss, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-180m", "0m"], total: 1500}
+  - {name: badge_hit, profile: hit, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-180m", "0m"], total: 3600}
+  - {name: badge_miss, profile: miss, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-180m", "0m"], total: 900}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games/votes}
+      requests: 3000
+      served_cache: 1800
+    - window: ["-120m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games/votes}
+      requests: 6000
+      served_cache: 2100
+    - window: ["-180m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games/votes}
+      requests: 9000
+      served_cache: 2400
+  fires: false
+
+variants:
+  - case: window_120
+    description: Over 120 minutes the votes hit ratio is 35%, still above 30%.
+    settings: {insight_cache_low_hit_window_min: 120}
+    expect: {fires: false}
+  - case: window_180
+    description: Over 180 minutes the votes hit ratio is 26.7%, so it fires for votes only.
+    settings: {insight_cache_low_hit_window_min: 180}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "games.roblox.com/v1/games/votes", severity: any, family: cache}

@@ -1,0 +1,23 @@
+format: roxy.health_fixture/1
+check: H-ROTATOR-SESSION
+case: fail
+name: probe_failure
+description: >
+  The template is set, but the IP echo through the rotator cannot connect. 13.2 H-ROTATOR-SESSION: probe
+  failure gives fail. The check may stop after the first failed request, so one to three calls.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    rotator_enabled: 1
+    rotator_weight: 25
+    rotator_session_mode: sticky_until_429
+    rotator_session_username_template: "{user}__sessid-{session}"
+  upstream:
+    ip_echo: {error: connect}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)egress"}
+  calls:
+    ip_echo: {count: {between: [1, 3]}}
+  credential_calls: {eq: 0}

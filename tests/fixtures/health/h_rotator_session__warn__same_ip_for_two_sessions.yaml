@@ -1,0 +1,28 @@
+format: roxy.health_fixture/1
+check: H-ROTATOR-SESSION
+case: warn
+name: same_ip_for_two_sessions
+description: >
+  The template is set, but both session ids get the same exit IP (198.51.100.31): the provider ignores the
+  session parameter, so sticky_until_429 cannot drop a burned exit. 13.2 H-ROTATOR-SESSION: same IP for
+  different sessions gives warn, with the Egress page as the fix.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    rotator_enabled: 1
+    rotator_weight: 25
+    rotator_session_mode: sticky_until_429
+    rotator_session_username_template: "{user}__sessid-{session}"
+  upstream:
+    ip_echo:
+      status: 200
+      exit_ip_by_session: ["198.51.100.31", "198.51.100.31"]
+      latency_ms: 500
+      expect_request: {via: rotator, method: GET}
+expect:
+  status: warn
+  explanation: {present: true}
+  fix_link: {regex: "(?i)egress"}
+  calls:
+    ip_echo: {count: 3, via: rotator}
+  credential_calls: {eq: 0}

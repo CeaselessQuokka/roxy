@@ -1,0 +1,126 @@
+# CACHE-LOW-HIT fires on a busy read-only POST batch lookup that is never cached
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Endpoint in top 10 by requests with hit ratio < 30% over 1 h"; change "...; for POST batch, enable
+# POST caching per rule".
+#
+#   POST catalog.roblox.com/v1/catalog/items/details: 2,500 requests in the last hour (rank 2), every one sent to
+#   Roblox. cache_post_requests is at its default `allowlist`, but this batch lookup is not one of the built-in
+#   POST lookups (config/defaults.py POST_CACHE_ALLOWLIST) and no cache rule lists POST for it, so every request
+#   is `Roxy-Cache: OFF`.
+#
+# Reading of the row (report to the lead if the rule author disagrees): the metrics catalog's hit ratio leaves
+# OFF requests out of the denominator, which would make this endpoint's ratio undefined and the row's own POST
+# batch remedy unreachable. For this rule a busy endpoint that is never answered from the cache has a hit ratio
+# of 0 (the 11.6 fixture reads it the same way: "hit ratio 0%, POST caching off").
+#
+# Expected change: a cache rule for that endpoint that lists POST (with `allowlist`, a rule that lists POST is
+# what enables POST caching for one endpoint, 15.3 D). No setting change is needed or allowed: never
+# `cache_post_requests = all`, which would cache every POST, writes included.
+
+format: roxy.insight_fixture/1
+rule: CACHE-LOW-HIT
+case: fires_post_batch
+description: >
+  The read-only POST batch lookup catalog.roblox.com/v1/catalog/items/details is the second busiest endpoint and
+  is never cached (no rule lists POST for it). The rule must report it with a per-endpoint cache rule allowing
+  POST, and must not touch cache_post_requests.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 6, pattern: "groups.roblox.com/v1/groups/*", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 7, pattern: "badges.roblox.com/v1/badges/*", type: glob, ttl: 3600, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 2400}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 600}
+  - name: item_details_post
+    endpoint_template: catalog.roblox.com/v1/catalog/items/details
+    method: POST
+    window: ["-60m", "0m"]
+    total: 2500
+    egress: direct
+    outcome: served_upstream
+    reason: upstream_ok
+    status: 200
+    source: relay
+    cache_state: "OFF"
+    latency_ms: {p50: 210, p95: 520, p99: 980}
+    bytes: {caller_in: 340, caller_out: 5200, upstream_in: 5300, upstream_out: 760}
+    samples: {key_space: item_details, keys: 120, body_change_interval_s: 1800}
+  - {name: votes_hit, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 1300}
+  - {name: votes_miss, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 700}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 1400}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 400}
+  - {name: group_hit, profile: hit, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-60m", "0m"], total: 900}
+  - {name: group_miss, profile: miss, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-60m", "0m"], total: 300}
+  - {name: badge_hit, profile: hit, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-60m", "0m"], total: 800}
+  - {name: badge_miss, profile: miss, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-60m", "0m"], total: 200}
+
+events:
+  change_observations:
+    # Identical answers on refetch: the batch is cacheable in practice (90%).
+    - {endpoint_template: catalog.roblox.com/v1/catalog/items/details, day: "2026-10-06", refetches: 41000, identical_bodies: 36900}
+    - {endpoint_template: catalog.roblox.com/v1/catalog/items/details, day: "2026-10-07", refetches: 25000, identical_bodies: 22500}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 11500
+      upstream_calls: 4700
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: catalog.roblox.com/v1/catalog/items/details, method: POST}
+      requests: 2500
+      upstream_calls: 2500
+      served_cache: 0
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CACHE-LOW-HIT
+      subject_contains: "catalog.roblox.com/v1/catalog/items/details"
+      severity: any
+      family: cache
+      confidence: {ne: high}     # no key split: the requests are simply never cached
+      evidence:
+        metrics:
+          cache_hit_ratio: 0
+      change_kinds_required: [rule_upsert]
+      change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, credential_allowlist_remove, routing_rule, host_add, bucket_override, ignored_param_add]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["catalog.roblox.com/v1/catalog/items/details"]}}
+          current: null
+          proposed:
+            methods: {contains_all: [POST]}
+            ttl: {gte: 1}
+      changes_forbidden:
+        - {kind: setting, key: cache_post_requests}
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_max_entries, cache_max_bytes, cache_enabled]}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cache_low_hit_enabled: 0}
+    expect: {fires: false}
+  - case: top_n_one
+    description: Only the single busiest endpoint (headshots, 80%) is checked; the batch lookup is second.
+    settings: {insight_cache_low_hit_top_n: 1}
+    expect: {fires: false}

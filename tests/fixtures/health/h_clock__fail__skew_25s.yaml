@@ -1,0 +1,22 @@
+format: roxy.health_fixture/1
+check: H-CLOCK
+case: fail
+name: skew_25s
+description: >
+  Roblox's Date header is 25 s behind the fake clock (the server clock runs fast) and NTP is not synchronized.
+  13.2 H-CLOCK: 10 s or more gives fail. Skew this large breaks TOTP windows and makes Retry-After dates wrong.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    any_roblox:
+      status: 200
+      headers: {date: "-25s", content-type: "application/json"}
+      json: {data: []}
+      latency_ms: 60
+  timedatectl:
+    show: {NTPSynchronized: "no", NTP: "no", Timezone: "UTC"}
+expect:
+  status: fail
+  value: {gte: 10}
+  explanation: {present: true}
+  credential_calls: {eq: 0}

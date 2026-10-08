@@ -1,0 +1,26 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: translations.roblox.com}
+case: warn
+name: translations_head_slow
+description: >
+  The HEAD / probe for translations.roblox.com answers 404 (an expected status for a HEAD-only host) after
+  1,400 ms. The 13.2 H-REACH latency bands apply to every host, so under 2,000 ms (and not under 800 ms) gives
+  warn.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    allowed_roblox_hosts: [games.roblox.com, users.roblox.com, thumbnails.roblox.com, presence.roblox.com, translations.roblox.com]
+  upstream:
+    "probe:translations.roblox.com":
+      status: 404
+      latency_ms: 1400
+      expect_request: {via: direct, method: HEAD}
+expect:
+  status: warn
+  value: {present: true}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  calls:
+    "probe:translations.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}

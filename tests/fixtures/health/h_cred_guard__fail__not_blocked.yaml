@@ -1,0 +1,24 @@
+format: roxy.health_fixture/1
+check: H-CRED-GUARD
+case: fail
+name: not_blocked
+description: >
+  The fault `leak_guard_bypassed` makes the guard's matcher never match, so the synthetic credential-bearing
+  rotator request is not blocked (it is still never sent). 13.2 H-CRED-GUARD: not blocked is a critical fail
+  (plan C2), with the "Leak guard" runbook as the fix.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    rotator_enabled: 1
+    rotator_weight: 25
+  state:
+    credential: {present: true, status: active, status_at: "-25m", set_at: "-20d", account_id: "1000001"}
+  faults:
+    leak_guard_bypassed: true
+expect:
+  status: fail
+  critical: true
+  explanation: {present: true}
+  fix_link: {regex: "(?i)leak"}
+  credential_calls: {eq: 0}
+  no_calls_to: [ip_echo]

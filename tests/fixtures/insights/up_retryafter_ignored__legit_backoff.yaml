@@ -1,0 +1,103 @@
+# UP-RETRYAFTER-IGNORED must stay quiet for a big game whose servers back off (format: README.md here).
+#
+# The rule is about ONE client retrying ONE key early (11.5: "same client retries the same key"). Here 60 game
+# servers of one popular experience all want the same key (the same universe list) while it cools down. Each
+# server asks once, then retries three times about a minute apart: a sane client backoff that is shorter than
+# the 300 s Retry-After but nothing like a tight loop.
+#
+#   per server: 4 requests inside the Retry-After, 3 early retries      servers_wait (240 requests, 60 servers)
+#   on the key as a whole: 240 requests, 180 early retries               (aggregated over clients: far above 20)
+#   after the cooldown every server is served                            servers_back
+#
+# Counting per key instead of per client, or per place (all 60 servers share place 1000000021), would fire.
+# The `min_retries_2` variant shows the rule does see the per-client retries when the minimum is that low.
+
+format: roxy.insight_fixture/1
+rule: UP-RETRYAFTER-IGNORED
+case: legit_backoff
+description: >
+  Sixty servers of one game each make three early retries of the same cooling-down key, about a minute apart.
+  No single client comes near 20 early retries in 10 minutes, so the rule must not fire, even though the key
+  as a whole sees 180 early retries.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_enabled: 0
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  places: ["1000000021"]
+  endpoint_template: games.roblox.com/v1/games
+
+profiles:
+  cooldown_429:
+    egress: none
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    error: true
+    latency_ms: 2
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 150, p95: 400, p99: 800}}
+
+traffic:
+  - name: trigger_429
+    client_ip: "203.0.113.100"
+    window: ["-9m", "-8m"]
+    total: 1
+    egress: direct
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    upstream_429: {egress: direct, retry_after_s: 300}
+    samples: {key_space: shared_key, keys: 1}
+  - name: servers_wait
+    profile: cooldown_429
+    clients: {cidr: "203.0.113.0/26", count: 60}
+    window: ["-8m", "-4m"]
+    total: 240                # server j gets requests n = j, j + 60, j + 120, j + 180: one per minute
+    samples: {key_space: shared_key, keys: 1}
+  - name: servers_back
+    profile: miss
+    clients: {cidr: "203.0.113.0/26", count: 60}
+    window: ["-3m", "-2m"]
+    total: 60
+    samples: {key_space: shared_key, keys: 1}
+  - name: other_miss
+    profile: miss
+    clients: {cidr: "198.51.100.0/26", count: 30}
+    places: ["1000000031", "1000000032"]
+    endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+    window: ["-60m", "0m"]
+    per_minute: 15
+
+state:
+  cooldowns:
+    - {key: "endpoint:games.roblox.com/v1/games:direct", until: "-210s", source: retry_after, set_at: "-510s", hits: 1}
+  settings_history:
+    - {at: "-30d", key: rotator_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "No rotator plan yet."}
+
+expect:
+  data_checks:
+    - window: ["-10m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games, reason: upstream_cooldown}
+      requests: 241
+      roblox_429: 1
+    - window: ["-10m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games, reason: upstream_ok}
+      requests: 60
+
+  fires: false
+
+variants:
+  - case: min_retries_2
+    description: Each server's 3 early retries pass a minimum of 2, so the per-client count is really there.
+    settings: {insight_up_retryafter_ignored_min_retries: 2}
+    expect: {fires: true}

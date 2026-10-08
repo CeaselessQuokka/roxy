@@ -1,0 +1,22 @@
+format: roxy.health_fixture/1
+check: H-CLOCK
+case: warn
+name: skew_6s
+description: >
+  Roblox's Date header is 6 s ahead of the fake clock (the server clock is 6 s slow). 13.2 H-CLOCK: under 10 s
+  (and not under 2 s) gives warn.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    any_roblox:
+      status: 200
+      headers: {date: "+6s", content-type: "application/json"}
+      json: {data: []}
+      latency_ms: 60
+  timedatectl:
+    show: {NTPSynchronized: "yes", NTP: "yes", Timezone: "UTC"}
+expect:
+  status: warn
+  value: {gte: 2, lt: 10}
+  explanation: {present: true}
+  credential_calls: {eq: 0}

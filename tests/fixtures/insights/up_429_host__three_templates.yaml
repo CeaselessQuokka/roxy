@@ -1,0 +1,161 @@
+# UP-429-HOST: Roblox 429s on three endpoints of one host within 15 minutes (format: README.md here).
+#
+# 11.5: ">= 3 templates of one host with 429s in 15 min"; evidence: per-template counts; change: "Lower the host
+# bucket; shift share to rotator if healthy and within quota"; confidence medium. The rotator is switched off
+# here (rotator_enabled = 0), so the only allowed fix is the host bucket.
+#
+#   host                  templates with 429s in the last 15 min               result
+#   games.roblox.com      /v1/games (14), /v1/games/votes (9),                 3 templates: fires
+#                         /v1/games/{gameId}/favorites/count (4)
+#   thumbnails.roblox.com /v1/users/avatar-headshot (5), /v1/batch (3)         2 templates: quiet
+#   users.roblox.com      /v1/users/{userId} (6)                               1 template: quiet
+#
+# adaptive_rate_enabled = 0 keeps every bucket at its default (host 240 per minute), so `current` is known.
+
+format: roxy.insight_fixture/1
+rule: UP-429-HOST
+case: three_templates
+description: >
+  Between 12 and 3 minutes ago Roblox answered three different games.roblox.com endpoints with 429, while two
+  thumbnails endpoints and one users endpoint also saw a few. Only games.roblox.com has three or more templates
+  with 429s, so the rule must recommend lowering the host:games.roblox.com bucket (and nothing for the other
+  hosts, no endpoint buckets, no global defaults). The rotator is off, so no share may move to it.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  adaptive_rate_enabled: 0
+  rotator_enabled: 0
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games", type: glob, ttl: 120, stale_ttl: 60, methods: "GET", origin: admin, created_at: "-30d"}
+    - {id: 2, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, stale_ttl: 120, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 150, p95: 400, p99: 800}}
+  stale_429:
+    egress: direct
+    outcome: served_cache
+    reason: cache_stale_error
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    latency_ms: {p50: 90, p95: 200, p99: 350}
+    upstream_429: {egress: direct, retry_after_s: 15}
+  busy_429:
+    egress: direct
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    latency_ms: {p50: 90, p95: 200, p99: 350}
+    upstream_429: {egress: direct, retry_after_s: 15}
+
+traffic:
+  # --- games.roblox.com: three templates with 429s ------------------------------------------------------------
+  - {name: games_list_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 1000}
+  - {name: games_list_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  - {name: games_list_429, profile: stale_429, endpoint_template: games.roblox.com/v1/games, window: ["-12m", "-3m"], total: 14}
+  - {name: votes_hit, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 800}
+  - {name: votes_miss, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 500}
+  - {name: votes_429, profile: stale_429, endpoint_template: games.roblox.com/v1/games/votes, window: ["-12m", "-3m"], total: 9}
+  - {name: favorites_miss, profile: miss, endpoint_template: "games.roblox.com/v1/games/{gameId}/favorites/count", window: ["-60m", "0m"], total: 300}
+  - {name: favorites_429, profile: busy_429, endpoint_template: "games.roblox.com/v1/games/{gameId}/favorites/count", window: ["-12m", "-3m"], total: 4}
+
+  # --- thumbnails.roblox.com: two templates with 429s ---------------------------------------------------------
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 1500}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 500}
+  - {name: headshot_429, profile: stale_429, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-12m", "-3m"], total: 5}
+  - {name: thumb_batch_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/batch, method: POST, cache_state: "OFF", window: ["-60m", "0m"], total: 300}
+  - {name: thumb_batch_429, profile: busy_429, endpoint_template: thumbnails.roblox.com/v1/batch, method: POST, cache_state: "OFF", window: ["-12m", "-3m"], total: 3}
+
+  # --- users.roblox.com: one template with 429s ---------------------------------------------------------------
+  - {name: user_miss, profile: miss, endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], total: 400}
+  - {name: user_429, profile: busy_429, endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-12m", "-3m"], total: 6}
+
+state:
+  cooldowns:
+    # Plan 7.5 host escalation already happened once (3 templates within 60 s); it is over.
+    - {key: "host:games.roblox.com:direct", until: "-3m", source: retry_after, set_at: "-4m", hits: 3}
+  settings_history:
+    - {at: "-30d", key: adaptive_rate_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Hold bucket rates steady during the cutover."}
+    - {at: "-30d", key: rotator_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "No rotator plan yet."}
+
+expect:
+  data_checks:
+    - window: ["-15m", "0m"]
+      where: {host: games.roblox.com}
+      roblox_429: 27
+    - window: ["-15m", "0m"]
+      where: {endpoint_template: "games.roblox.com/v1/games/{gameId}/favorites/count"}
+      roblox_429: 4
+    - window: ["-15m", "0m"]
+      where: {host: thumbnails.roblox.com}
+      roblox_429: 8
+    - window: ["-15m", "0m"]
+      where: {host: users.roblox.com}
+      roblox_429: 6
+    - window: ["-60m", "-15m"]
+      roblox_429: 0
+
+  fires: true
+  others: forbid
+  recommendations:
+    - subject_contains: "games.roblox.com"
+      confidence: medium
+      family: upstream
+      change_kinds_required: [bucket_override]
+      change_kinds_forbidden: [routing_rule, rule_delete, ban_add, filter_add, credential_allowlist_remove]
+      changes_required:
+        - kind: bucket_override
+          bucket_key: "host:games.roblox.com"
+          current: {per_min: 240}
+          proposed: {per_min: {lt: 240, gte: 1}}
+      changes_forbidden:
+        - kind: bucket_override
+          bucket_key: {ne: "host:games.roblox.com"}
+        - kind: setting
+          key:
+            in: [host_bucket_default_per_min, host_bucket_default_burst, endpoint_bucket_default_per_min,
+                 global_bucket_per_min, direct_bucket_per_min, rotator_weight, rotator_enabled, direct_weight]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_429_host_enabled: 0}
+    expect: {fires: false}
+  - case: min_templates_4
+    description: games.roblox.com has three templates with 429s, one short of a minimum of four.
+    settings: {insight_up_429_host_min_templates: 4}
+    expect: {fires: false}
+  - case: min_templates_2
+    description: At two templates thumbnails.roblox.com joins games.roblox.com; users.roblox.com (one template) does not.
+    settings: {insight_up_429_host_min_templates: 2}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "games.roblox.com"
+          changes_required:
+            - {kind: bucket_override, bucket_key: "host:games.roblox.com", proposed: {per_min: {lt: 240}}}
+        - subject_contains: "thumbnails.roblox.com"
+          changes_required:
+            - {kind: bucket_override, bucket_key: "host:thumbnails.roblox.com", proposed: {per_min: {lt: 240}}}
+  - case: window_excludes_episode
+    description: The 429s stopped 3 minutes ago; a 2 minute window holds none of them.
+    settings: {insight_up_429_host_window_min: 2}
+    expect: {fires: false}

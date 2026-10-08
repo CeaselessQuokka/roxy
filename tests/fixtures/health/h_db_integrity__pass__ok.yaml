@@ -1,0 +1,14 @@
+format: roxy.health_fixture/1
+check: H-DB-INTEGRITY
+case: pass
+name: ok
+description: >
+  `PRAGMA quick_check` returns "ok" on control.db and hot.db. 13.2 H-DB-INTEGRITY: ok gives pass. There is no
+  warn state for this check (13.2 lists n/a).
+now: "2026-10-07T15:00:00Z"
+inputs:
+  databases:
+    quick_check: {control: "ok", hot: "ok"}
+expect:
+  status: pass
+  credential_calls: {eq: 0}

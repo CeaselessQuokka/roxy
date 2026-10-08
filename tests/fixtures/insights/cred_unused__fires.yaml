@@ -1,0 +1,105 @@
+# CRED-UNUSED fires for a credential allowlist entry whose endpoint answers identically without the credential
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Anonymous calls to the same template succeed with same body"; evidence "Comparison"; change "Remove
+# from credential allowlist"; confidence Medium. Thresholds: insight_cred_unused_min_comparisons 20,
+# _identical_pct 100.
+#
+# Comparisons are side-by-side answers to the same request on both paths (state.x_credential_comparisons, see the
+# README extensions; 11.5 does not say where they come from or over what window, so all of them fall in the last
+# 40 minutes, inside any window a rule could choose).
+#
+#   allowlist row                                         comparisons  identical  anonymous answer
+#   1  games.roblox.com/v1/games/*/favorites/count                 40   40 (100%)  200, same body      -> remove
+#   2  economy.roblox.com/v1/users/*/currency                      30    0 (0%)    401 (needs login)   -> keep
+#
+# Removing an allowlist entry lowers account risk (fewer calls carry the credential); the currency endpoint
+# really needs the credential and must stay.
+
+format: roxy.insight_fixture/1
+rule: CRED-UNUSED
+case: fires
+description: >
+  The favorites count endpoint is on the credential allowlist, but in 40 of 40 comparisons the anonymous path
+  returned the same body. The rule must propose removing that allowlist row only, and keep the currency row, whose
+  anonymous answers are 401.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  credential_allowlist:
+    - {id: 1, pattern: "games.roblox.com/v1/games/*/favorites/count", type: glob, methods: "GET", cache_private: 1, identical_anonymous: 0, note: "Added during an anonymous outage.", created_at: "-30d", created_by: admin}
+    - {id: 2, pattern: "economy.roblox.com/v1/users/*/currency", type: glob, methods: "GET", cache_private: 1, identical_anonymous: 0, note: "Owner's own balance widget.", created_at: "-30d", created_by: admin}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  cred_miss: {auth_class: cred, egress: credential, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 160, p95: 420, p99: 800}, bytes: {caller_in: 0, caller_out: 300, upstream_in: 420, upstream_out: 650}}
+
+traffic:
+  # Both rows are cache_private, so every caller request is its own credential call (6.9).
+  - {name: favorites_cred, profile: cred_miss, endpoint_template: "games.roblox.com/v1/games/{universeId}/favorites/count", window: ["-60m", "0m"], per_minute: 16}
+  - {name: currency_cred, profile: cred_miss, endpoint_template: "economy.roblox.com/v1/users/{userId}/currency", window: ["-60m", "0m"], per_minute: 2}
+
+state:
+  credential:
+    present: true
+    status: active
+    status_at: "-30d"
+    set_at: "-30d"
+    account_id: "1000001"
+  x_credential_comparisons:
+    - {window: ["-40m", "0m"], per_minute: 1, endpoint_template: "games.roblox.com/v1/games/{universeId}/favorites/count", method: GET, anon_status: 200, cred_status: 200, identical: true}
+    - {window: ["-30m", "0m"], per_minute: 1, endpoint_template: "economy.roblox.com/v1/users/{userId}/currency", method: GET, anon_status: 401, cred_status: 200, identical: false}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      where: {auth_class: cred}
+      requests: 1080
+      upstream_calls: 1080
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CRED-UNUSED
+      subject_contains: "favorites/count"
+      severity: any
+      family: credential
+      confidence: medium
+      change_kinds_required: [credential_allowlist_remove]
+      change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, host_add, bucket_override, routing_rule, ignored_param_add]
+      changes_required:
+        - kind: credential_allowlist_remove
+          match: {pattern: {matches_targets: ["games.roblox.com/v1/games/1000000801/favorites/count"]}}
+      changes_forbidden:
+        - {kind: credential_allowlist_remove, match: {pattern: {matches_targets: ["economy.roblox.com/v1/users/1000000001/currency"]}}}
+        - {kind: setting, key: {in: [credential_enabled, credential_bucket_per_min, credential_probe_interval_min]}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cred_unused_enabled: 0}
+    expect: {fires: false}
+  - case: min_comparisons_41
+    description: 41 comparisons needed; the favorites row has 40.
+    settings: {insight_cred_unused_min_comparisons: 41}
+    expect: {fires: false}
+  - case: identical_pct_50
+    description: Even a 50% identical requirement leaves the currency row alone (0 of 30 identical).
+    settings: {insight_cred_unused_identical_pct: 50}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "favorites/count", severity: any}
+  - case: severity_override_warn
+    description: insight_cred_unused_severity replaces the computed severity.
+    settings: {insight_cred_unused_severity: warn}
+    expect:
+      fires: true
+      recommendations:
+        - {subject_contains: "favorites/count", severity: warn}

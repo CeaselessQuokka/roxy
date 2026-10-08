@@ -1,0 +1,104 @@
+# UP-CHALLENGE: Roblox answers rotator calls with challenge or block pages (format: README.md here).
+#
+# 11.5: "Responses with a challenge header or an HTML body on a JSON endpoint, > 5 in 15 min"; evidence: endpoint,
+# egress, sample (redacted); change: "Manual: lower rates for that egress; prefer the other anonymous egress for
+# the endpoint (routing_rule)"; confidence medium. The fixture reads "Manual" as: lowering the egress rate is
+# advice for the admin (a `manual` change, optional here), never an automatic setting change; the routing rule is
+# the concrete change and it must point the endpoint at the OTHER anonymous egress (direct), never the credential.
+#
+#   GET catalog.roblox.com/v1/search/items, 14 to 6 minutes ago
+#   rotator: 12 x 403 with a challenge header + 6 x 200 with an HTML page    events.upstream_attempts (18 rows)
+#   direct: every call answers JSON 200                                       search_direct
+#
+# 18 is well above 5 under either reading of the threshold ("> 5" in the table, `min_pages` = 5).
+
+format: roxy.insight_fixture/1
+rule: UP-CHALLENGE
+case: rotator_challenge_pages
+description: >
+  The rotator's exits start getting Roblox challenge pages on catalog search: 18 in eight minutes, while the
+  direct path answers normally. The rule must recommend a routing rule that prefers direct (or keeps the endpoint
+  on direct) for catalog search only, and no automatic rate or weight setting change.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_enabled: 1
+  rotator_weight: 50
+  rotator_quota_gb_per_month: 20
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: catalog.roblox.com/v1/search/items
+  outcome: served_upstream
+  source: relay
+  cache_state: "MISS"
+
+profiles:
+  ok: {reason: upstream_ok, status: 200, latency_ms: {p50: 160, p95: 420, p99: 800}}
+
+traffic:
+  - {name: search_direct, profile: ok, egress: direct, window: ["-60m", "0m"], per_minute: 20}
+  - {name: search_rotator_ok, profile: ok, egress: rotator, window: ["-60m", "0m"], per_minute: 15}
+  - name: search_rotator_challenge
+    egress: rotator
+    window: ["-14m", "-6m"]
+    total: 12
+    reason: upstream_4xx
+    status: 403
+    latency_ms: {p50: 300, p95: 600, p99: 900}
+  - name: search_rotator_html
+    egress: rotator
+    window: ["-14m", "-6m"]
+    total: 6
+    reason: upstream_ok          # a 200 whose body is an HTML block page, not the JSON the endpoint returns
+    status: 200
+    latency_ms: {p50: 300, p95: 600, p99: 900}
+
+events:
+  upstream_attempts:
+    - {window: ["-14m", "-6m"], total: 12, endpoint_template: catalog.roblox.com/v1/search/items, egress: rotator, attempt: 1, status: 403, kind: first, challenge: true, html_body: true, exit_id: "exit-7"}
+    - {window: ["-14m", "-6m"], total: 6, endpoint_template: catalog.roblox.com/v1/search/items, egress: rotator, attempt: 1, status: 200, kind: first, challenge: false, html_body: true, exit_id: "exit-9"}
+
+expect:
+  data_checks:
+    - window: ["-15m", "0m"]
+      where: {egress: rotator, status: 403}
+      requests: 12
+    - window: ["-60m", "-15m"]
+      where: {status: 403}
+      requests: 0
+
+  fires: true
+  others: forbid
+  recommendations:
+    - subject_contains: "catalog.roblox.com/v1/search/items"
+      confidence: medium
+      family: upstream
+      change_kinds_required: [routing_rule]
+      change_kinds_forbidden: [setting, bucket_override, credential_allowlist_remove, ban_add]
+      changes_required:
+        - kind: routing_rule
+          match: {pattern: {matches_targets: ["catalog.roblox.com/v1/search/items"]}}
+          proposed: {mode: {in: [prefer_direct, direct_only]}}
+      changes_forbidden:
+        - kind: routing_rule
+          proposed: {mode: {in: [prefer_rotator, rotator_only]}}
+        - kind: routing_rule
+          match: {pattern: {matches_targets: ["games.roblox.com/v1/games", "thumbnails.roblox.com/v1/users/avatar-headshot"]}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_challenge_enabled: 0}
+    expect: {fires: false}
+  - case: min_pages_30
+    description: 18 challenge or block pages are below a minimum of 30.
+    settings: {insight_up_challenge_min_pages: 30}
+    expect: {fires: false}
+  - case: window_5_after_pages
+    description: The pages stopped 6 minutes ago; a 5 minute window holds none.
+    settings: {insight_up_challenge_window_min: 5}
+    expect: {fires: false}

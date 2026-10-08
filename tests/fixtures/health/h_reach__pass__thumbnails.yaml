@@ -1,0 +1,22 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: thumbnails.roblox.com}
+case: pass
+name: thumbnails
+description: >
+  The thumbnails probe (13.4: GET /v1/users/avatar-headshot?userIds=<public user id>&size=48x48&format=Png)
+  answers 200 JSON in 310 ms. 13.2 H-REACH: expected status and under 800 ms gives pass.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:thumbnails.roblox.com":
+      status: 200
+      json: {data: [{targetId: 1, state: "Completed", imageUrl: "https://cdn.test/fixture/headshot-48.png"}]}
+      latency_ms: 310
+      expect_request: {via: direct, method: GET, headers_absent: [cookie]}
+expect:
+  status: pass
+  value: {present: true}
+  calls:
+    "probe:thumbnails.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}

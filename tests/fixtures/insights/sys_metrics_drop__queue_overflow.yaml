@@ -1,0 +1,74 @@
+# SYS-METRICS-DROP: "any dropped items" (11.5; no threshold, only the _enabled and _severity settings).
+#
+# The batch writer drops the oldest low-priority items when a worker's queue passes metrics_queue_max (DESIGN 2,
+# `metrics_dropped` counter). The counter has no table in schema version 1, so it comes from
+# `state.metrics_pipeline.dropped` (provider seam): 1,240 items dropped in the hour before now, during a burst of
+# 900 requests a minute.
+#
+# 11.5's change: "raise metrics_queue_max or flush interval". metrics_queue_max may only go up and must stay out of
+# its high-risk range (over 200,000); the flush interval may move either way (11.5 does not say which direction, and
+# a shorter interval drains the queue sooner). Global settings: never safe_auto.
+
+format: roxy.insight_fixture/1
+rule: SYS-METRICS-DROP
+case: queue_overflow
+description: >
+  The metrics queue dropped 1,240 items in the last hour during a traffic burst. SYS-METRICS-DROP must recommend a
+  larger metrics_queue_max (not past 200,000) or a different flush interval, and not as safe to auto-apply.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  legit:
+    clients: {cidr: "203.0.113.0/24", count: 200}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: burst_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 720}
+  - {name: burst_miss, profile: [miss, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 180}
+
+state:
+  metrics_pipeline: {dropped: 1240}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 54000}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-METRICS-DROP
+      severity: any
+      family: system
+      confidence: high
+      safe_auto: false
+      changes_required:
+        - any_of:
+            - {kind: setting, key: metrics_queue_max, current: 50000, proposed: {gt: 50000, lte: 200000}}
+            - {kind: setting, key: metrics_flush_interval_ms, current: 2000}
+      changes_forbidden:
+        - {kind: setting, key: metrics_queue_max, proposed: {lte: 50000}}
+        - {kind: setting, key: metrics_queue_max, proposed: {gt: 200000}}
+        - {kind: setting, key: {in: [activity_tracking, capture_enabled, request_sample_pct]}}
+      change_kinds_forbidden: [bucket_override, rule_upsert, rule_delete, ban_add, bypass_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_metrics_drop_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_sys_metrics_drop_severity replaces the computed severity.
+    settings: {insight_sys_metrics_drop_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: critical}

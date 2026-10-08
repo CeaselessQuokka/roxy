@@ -1,0 +1,92 @@
+# CRED-ROTATOR-GUARD fires on a single leak guard trip
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Any trip"; evidence "Request id, caller"; change "Manual: investigate code path (critical)";
+# confidence High. No thresholds (15.3 J2: only _enabled and _severity).
+#
+#   Five minutes ago the leak guard under the rotator client found the real credential in an outgoing request's
+#   headers and refused to send it (plan C2: the credential never travels through the rotator). The caller got
+#   503 (7.13 row for leak_blocked) and no upstream call was made, so the OutcomeEvent has egress `none`; the
+#   egress that was about to be used is in the event detail.
+#   The trip is recorded twice, as production would: the caller's OutcomeEvent (reason leak_blocked) and an
+#   `events` row of type `leak_guard` (provisional name, README extensions) with the request id.
+#
+# A trip means a code path tried to put the credential on an anonymous egress: only a code investigation fixes
+# it, so the change is `manual`, the severity is critical, and nothing may be applied automatically.
+
+format: roxy.insight_fixture/1
+rule: CRED-ROTATOR-GUARD
+case: fires
+description: >
+  The leak guard blocked one rotator request carrying the real credential five minutes ago. The rule must fire
+  as critical with a manual investigation step only.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 30}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 10}
+  - name: leak_trip
+    endpoint_template: games.roblox.com/v1/games/votes
+    window: ["-6m", "-5m"]
+    total: 1
+    client_ip: "198.51.100.23"
+    egress: none
+    outcome: failed
+    reason: leak_blocked
+    status: 503
+    source: roxy
+    cache_state: "MISS"
+    error: true
+    latency_ms: 4
+    bytes: {caller_in: 0, caller_out: 70}
+
+events:
+  security:
+    - at: "-6m"
+      type: leak_guard
+      severity: critical
+      reason_code: leak_blocked
+      ip: "198.51.100.23"
+      endpoint_template: games.roblox.com/v1/games/votes
+      detail: {egress: rotator, location: header, purpose: caller, request_id: "fires-leak_trip-0"}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      by_reason: {leak_blocked: 1}
+      failed: 1
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CRED-ROTATOR-GUARD
+      severity: critical
+      family: credential
+      confidence: high
+      safe_auto: false
+      change_kinds_required: [manual]
+      change_kinds_forbidden: [setting, bucket_override, rule_upsert, rule_delete, filter_add, filter_remove, ban_add, ban_remove, bypass_add, bypass_remove, ignored_param_add, tarpit_category, routing_rule, credential_allowlist_remove, host_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cred_rotator_guard_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_warn
+    description: insight_cred_rotator_guard_severity replaces even a critical computed severity.
+    settings: {insight_cred_rotator_guard_severity: warn}
+    expect:
+      fires: true
+      recommendations:
+        - {severity: warn, change_kinds_required: [manual]}

@@ -1,0 +1,106 @@
+# UP-LATENCY where the rotator is the slow path (format: README.md in this directory).
+#
+# 11.5: "if the rotator is slow: prefer direct for those endpoints" (a `routing_rule`, per endpoint). Catalog
+# search is split evenly between direct (fast) and the rotator (slow exits); games goes direct only. The required
+# change is a routing rule that keeps catalog search on direct (prefer_direct or direct_only). A TTL or SWR change
+# for the same endpoint may come along (upstream time dominates); a bucket change, a rotator routing preference,
+# or a global weight or timeout change may not.
+#
+#   last 30 minutes, upstream-going    calls   rollup histogram p95 / p99
+#   catalog search, direct             900     ~500 / ~900
+#   catalog search, rotator            900     ~4,980 / ~7,360
+#   games, direct                      600     ~490 / ~830
+#   all together                       2,400   ~4,370 / ~6,290
+
+format: roxy.insight_fixture/1
+rule: UP-LATENCY
+case: rotator_slow
+description: >
+  Catalog search calls through the rotator take five seconds at p95 while the same endpoint answers in half a
+  second on direct. The rule must recommend preferring direct for catalog search (a routing rule for that
+  endpoint), and no bucket, weight or timeout change.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_enabled: 1
+  rotator_weight: 100
+  rotator_quota_gb_per_month: 20
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "catalog.roblox.com/v1/search/items", type: glob, ttl: 120, stale_ttl: 60, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  outcome: served_upstream
+  reason: upstream_ok
+  status: 200
+  source: relay
+  cache_state: "MISS"
+
+profiles:
+  search: {endpoint_template: catalog.roblox.com/v1/search/items}
+  games: {endpoint_template: games.roblox.com/v1/games}
+  fast: {egress: direct, latency_ms: {p50: 200, p95: 500, p99: 900}}
+  slow_rotator: {egress: rotator, latency_ms: {p50: 1800, p95: 4800, p99: 7000}}
+
+traffic:
+  - {name: search_direct, profile: [search, fast], window: ["-60m", "0m"], per_minute: 30}
+  - {name: search_rotator, profile: [search, slow_rotator], window: ["-60m", "0m"], per_minute: 30}
+  - {name: games_direct, profile: [games, fast], window: ["-60m", "0m"], per_minute: 20, latency_ms: {p50: 150, p95: 400, p99: 800}}
+  - name: search_hit
+    profile: search
+    window: ["-60m", "0m"]
+    per_minute: 60
+    egress: none
+    outcome: served_cache
+    reason: cache_hit
+    source: cache
+    cache_state: "HIT"
+    latency_ms: 3
+
+state:
+  settings_history:
+    - {at: "-5d", key: rotator_weight, old: 0, new: 100, source: admin, changed_by: admin, reason: "Spread load across exits."}
+
+expect:
+  data_checks:
+    - window: ["-30m", "0m"]
+      where: {egress: rotator}
+      upstream_calls: 900
+    - window: ["-30m", "0m"]
+      where: {egress: direct}
+      upstream_calls: 1500
+
+  fires: true
+  others: forbid
+  recommendations:
+    - confidence: medium
+      family: upstream
+      change_kinds_required: [routing_rule]
+      change_kinds_forbidden: [bucket_override, ban_add, credential_allowlist_remove]
+      changes_required:
+        - kind: routing_rule
+          match: {pattern: {matches_targets: ["catalog.roblox.com/v1/search/items"]}}
+          proposed: {mode: {in: [prefer_direct, direct_only]}}
+      changes_forbidden:
+        - kind: routing_rule
+          proposed: {mode: {in: [prefer_rotator, rotator_only]}}
+        - kind: setting
+          key:
+            in: [request_timeout, endpoint_bucket_default_per_min, host_bucket_default_per_min, global_bucket_per_min,
+                 direct_bucket_per_min, rotator_bucket_per_min, direct_weight]
+        - {kind: setting, key: rotator_weight, proposed: {gte: 100}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_latency_enabled: 0}
+    expect: {fires: false}
+  - case: thresholds_raised
+    description: A p95 limit of 8,000 ms and a p99 limit of 12,000 ms are above what any slice of the data shows.
+    settings: {insight_up_latency_p95_ms: 8000, insight_up_latency_p99_ms: 12000}
+    expect: {fires: false}

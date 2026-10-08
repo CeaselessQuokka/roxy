@@ -1,0 +1,35 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: games.roblox.com}
+case: warn
+name: games_slow
+description: >
+  The games probe answers the expected 200 JSON with `data`, but takes 1,950 ms. 13.2 H-REACH: under 2,000 ms
+  (and not under 800 ms) gives warn, with the Upstream page as the fix. The variant is the lower edge: exactly
+  800 ms is not under 800 ms, so it warns too.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:games.roblox.com":
+      status: 200
+      json: {data: [{id: 1, rootPlaceId: 2, name: "Fixture Experience", playing: 12}]}
+      latency_ms: 1950
+      expect_request: {via: direct, method: GET}
+expect:
+  status: warn
+  value: {present: true}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  calls:
+    "probe:games.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}
+variants:
+  - case: warn
+    name: games_edge_800ms
+    inputs:
+      upstream:
+        "probe:games.roblox.com":
+          latency_ms: 800
+    expect:
+      status: warn
+      explanation: {present: true}

@@ -1,0 +1,25 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: translations.roblox.com}
+case: pass
+name: translations_head
+description: >
+  translations.roblox.com is an allowed host with no named probe in 13.4, so its probe is "HEAD /": any status
+  below 500 within the timeout means reachable. It answers 404 (the API host has nothing at /) in 150 ms, so
+  13.2 H-REACH gives pass (expected status and under 800 ms). The host list is set explicitly so the fixture
+  does not depend on which default hosts the implementer keeps (9.10).
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    allowed_roblox_hosts: [games.roblox.com, users.roblox.com, thumbnails.roblox.com, presence.roblox.com, translations.roblox.com]
+  upstream:
+    "probe:translations.roblox.com":
+      status: 404
+      latency_ms: 150
+      expect_request: {via: direct, method: HEAD, headers_absent: [cookie]}
+expect:
+  status: pass
+  value: {present: true}
+  calls:
+    "probe:translations.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}

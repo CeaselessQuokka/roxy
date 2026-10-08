@@ -1,0 +1,35 @@
+# SYS-METRICS-DROP must stay quiet when nothing was dropped, even under the same burst as
+# sys_metrics_drop__queue_overflow (900 requests a minute). "Any dropped items" has no lower value than one, so zero
+# is the just-under case.
+
+format: roxy.insight_fixture/1
+rule: SYS-METRICS-DROP
+case: no_drops
+description: >
+  A busy hour in which the metrics queue kept up and dropped nothing. SYS-METRICS-DROP must not fire.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  legit:
+    clients: {cidr: "203.0.113.0/24", count: 200}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: burst_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 720}
+  - {name: burst_miss, profile: [miss, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 180}
+
+state:
+  metrics_pipeline: {dropped: 0}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 54000}
+  fires: false

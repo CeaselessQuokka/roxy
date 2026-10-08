@@ -1,0 +1,83 @@
+# SEC-DEFAULTS: "any setting at a `high` risk value" (11.5; no threshold). High-risk values are the catalog's
+# `high_risk_if` conditions (roxy/config/spec.py RiskCondition); no catalog default is a high-risk value.
+#
+#   setting                                value     high-risk condition    expected
+#   public_cors_allow_any_origin           1         eq 1                   recommendation: back to 0
+#   spam_dry_run                           0         eq 0                   recommendation: back to 1
+#   flood_limit_per_minute                 20000     gte 10000              recommendation: under 10000
+#   insight_cred_rotator_guard_enabled     0         eq 0                   recommendation: back to 1 (generated
+#                                                                           per-rule settings count too)
+#   place_limit_enabled                    1         none (medium risk)     none
+#   allowed_requests_per_minute            50        gte 1000               none (not high)
+#
+# One recommendation per setting (subject = the setting key), each with exactly one `setting` change to a value that
+# is not high risk. Security settings and global values: never safe_auto.
+
+format: roxy.insight_fixture/1
+rule: SEC-DEFAULTS
+case: risky_values
+description: >
+  Four settings sit at high-risk values (open CORS, armed spam bans, a very loose flood limit, the leak guard rule
+  switched off) next to two non-default but safe ones. SEC-DEFAULTS must raise one recommendation per risky setting,
+  each restoring a value outside the high-risk range, and none for the safe ones.
+now: "2026-10-07T15:00:00Z"
+
+settings:
+  public_cors_allow_any_origin: 1
+  spam_dry_run: 0
+  flood_limit_per_minute: 20000
+  insight_cred_rotator_guard_enabled: 0
+  place_limit_enabled: 1
+  allowed_requests_per_minute: 50
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SEC-DEFAULTS
+      subject_contains: "public_cors_allow_any_origin"
+      severity: any
+      family: security
+      confidence: high
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: setting, key: public_cors_allow_any_origin, current: 1, proposed: 0}
+    - rule_id: SEC-DEFAULTS
+      subject_contains: "spam_dry_run"
+      severity: any
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: setting, key: spam_dry_run, current: 0, proposed: 1}
+    - rule_id: SEC-DEFAULTS
+      subject_contains: "flood_limit_per_minute"
+      severity: any
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: setting, key: flood_limit_per_minute, current: 20000, proposed: {lt: 10000, gte: 10}}
+    - rule_id: SEC-DEFAULTS
+      subject_contains: "insight_cred_rotator_guard_enabled"
+      severity: any
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: setting, key: insight_cred_rotator_guard_enabled, current: 0, proposed: 1}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule (itself a high-risk value, but the rule is off).
+    settings: {insight_sec_defaults_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_warn
+    description: insight_sec_defaults_severity replaces the computed severity of every recommendation.
+    settings: {insight_sec_defaults_severity: warn}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "public_cors_allow_any_origin", severity: warn}
+        - {subject_contains: "spam_dry_run", severity: warn}
+        - {subject_contains: "flood_limit_per_minute", severity: warn}
+        - {subject_contains: "insight_cred_rotator_guard_enabled", severity: warn}

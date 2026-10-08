@@ -1,0 +1,95 @@
+format: roxy.health_fixture/1
+check: H-ERR-RATE
+case: pass
+name: 0_3_percent
+description: >
+  In the last 15 minutes 15 of 5,000 caller requests got a 5xx (10 upstream 503s after retries, 5 internal
+  errors): 0.3%. 13.2 H-ERR-RATE: caller-facing 5xx under 0.5% gives pass. Two kinds of trouble are present but
+  are not caller-facing 5xx and must not count: 75 stale serves after a Roblox 503 (the caller got 200) and 60
+  of Roxy's own 429 answers during a cooldown. Counting every `error: true` event instead would give 3%. The 45
+  minutes before had a 4% 5xx rate (600 timeouts) and are outside the window. Excluding cache hits from the
+  denominator would give 0.43%, still a pass.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  traffic_defaults:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    user_agent: "Roblox/Linux"
+  profiles:
+    hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: 4}
+    miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 150, p95: 400, p99: 700}}
+    stale_after_503:
+      egress: direct
+      outcome: served_cache
+      reason: cache_stale_error
+      status: 200
+      source: cache
+      cache_state: "STALE"
+      upstream_calls: 1
+      upstream_status: 503
+      error: true
+      latency_ms: 120
+    cooldown_no_stale:
+      egress: direct
+      outcome: failed
+      reason: upstream_cooldown
+      status: 429
+      source: roxy
+      cache_state: "MISS"
+      upstream_calls: 1
+      upstream_status: 429
+      error: true
+      latency_ms: 85
+      upstream_429: {egress: direct, retry_after_s: 30}
+    upstream_503:
+      egress: direct
+      outcome: failed
+      reason: upstream_5xx
+      status: 503
+      source: roxy
+      cache_state: "MISS"
+      upstream_calls: 2
+      upstream_status: 503
+      error: true
+      latency_ms: 650
+    internal_500:
+      egress: none
+      outcome: failed
+      reason: internal_error
+      status: 500
+      source: roxy
+      cache_state: "NA"
+      upstream_calls: 0
+      error: true
+      latency_ms: 3
+    timeout_504:
+      egress: direct
+      outcome: failed
+      reason: upstream_timeout
+      status: 504
+      source: roxy
+      cache_state: "MISS"
+      upstream_calls: 2
+      error: true
+      latency_ms: 30500
+  traffic:
+    - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], total: 1500}
+    - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], total: 3350}
+    - {name: catalog_cooldown_429, profile: cooldown_no_stale, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-15m", "0m"], total: 60}
+    - {name: groups_stale_503, profile: stale_after_503, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-15m", "0m"], total: 75}
+    - {name: groups_503, profile: upstream_503, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-15m", "0m"], total: 10}
+    - {name: games_500, profile: internal_500, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], total: 5}
+    - {name: games_hit_earlier, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "-15m"], total: 4500}
+    - {name: games_miss_earlier, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "-15m"], total: 9900}
+    - {name: games_timeout_earlier, profile: timeout_504, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "-15m"], total: 600}
+expect:
+  data_checks:
+    - window: ["-15m", "0m"]
+      requests: 5000
+      errors: 150
+      by_reason: {upstream_5xx: 10, internal_error: 5, cache_stale_error: 75, upstream_cooldown: 60}
+    - window: ["-60m", "-15m"]
+      requests: 15000
+      by_reason: {upstream_timeout: 600}
+  status: pass
+  value: {lt: 0.5}
+  credential_calls: {eq: 0}

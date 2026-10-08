@@ -1,0 +1,124 @@
+# UP-BUCKET-TUNE, too tight: real demand above a bucket that has been 429-free (format: README.md here).
+#
+# 11.5: "Too tight: 24 h with zero 429s and bucket rejections > 1% of attempts (real demand above the cap)";
+# change: "bucket_override: raise by 10% ... for that key only. A bucket that never saturates is never raised";
+# confidence medium. Params: clean_hours 24, rejection_pct 1, raise_pct 10.
+#
+#   bucket                                     rate      last 24 h (state.buckets history)
+#   endpoint:thumbnails.roblox.com/v1/batch    60/min    attempts 87,840, rejections 1,440 (1.64%), fill 100%
+#   endpoint:games.roblox.com/v1/games         120/min   (default) peak fill 55%, no rejections: never raised
+#
+# No Roblox 429 anywhere in the last 7 days. Bucket rejections are not stored in any schema version 1 table, so
+# the 24 hour figures come from the bucket history (README "Provider seams"); traffic covers only the last hour
+# and matches the last history entry. adaptive_rate_enabled = 0, so the controller is not already raising the
+# bucket itself (7.3 bounded probing) and the override row stays as the admin set it.
+
+format: roxy.insight_fixture/1
+rule: UP-BUCKET-TUNE
+case: too_tight
+description: >
+  The thumbnails batch endpoint's bucket, set to 60 per minute by an admin, turns away 1.6% of attempts while
+  Roblox has not sent a single 429 in a week. The rule must propose raising that bucket by 10% (to 66 per
+  minute) and must not touch the games bucket, which never fills, or any global default.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  adaptive_rate_enabled: 0
+
+tables:
+  upstream_limits:
+    - {bucket_key: "endpoint:thumbnails.roblox.com/v1/batch", per_min: 60, burst: 10, origin: admin, note: "Set during an old incident.", updated_at: "-10d", updated_by: admin}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+
+profiles:
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 200, p95: 500, p99: 900}}
+  batch: {endpoint_template: thumbnails.roblox.com/v1/batch, method: POST, cache_state: "OFF"}
+
+traffic:
+  - {name: batch_ok, profile: [miss, batch], window: ["-60m", "0m"], per_minute: 60, queue_wait_ms: {p50: 300, p95: 900, p99: 1500}}
+  - name: batch_busy
+    profile: batch
+    window: ["-60m", "0m"]
+    per_minute: 1
+    egress: none
+    outcome: failed
+    reason: upstream_busy
+    status: 429
+    source: roxy
+    error: true
+    latency_ms: 4000
+    queue_wait_ms: 4000
+  - {name: games_ok, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 30}
+
+state:
+  buckets:
+    - bucket_key: "endpoint:thumbnails.roblox.com/v1/batch"
+      per_min: 60
+      burst: 10
+      fill_pct: 100
+      history:
+        - {window: ["-24h", "-60m"], fill_pct_peak: 100, attempts: 84180, rejections: 1380}
+        - {window: ["-60m", "0m"], fill_pct_peak: 100, attempts: 3660, rejections: 60}
+    - bucket_key: "endpoint:games.roblox.com/v1/games"
+      per_min: 120
+      burst: 10
+      fill_pct: 20
+      history:
+        - {window: ["-24h", "-60m"], fill_pct_peak: 55, attempts: 41400, rejections: 0}
+        - {window: ["-60m", "0m"], fill_pct_peak: 40, attempts: 1800, rejections: 0}
+  settings_history:
+    - {at: "-30d", key: adaptive_rate_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Bucket rates by hand for now."}
+
+expect:
+  data_checks:
+    - window: ["-7d", "0m"]
+      roblox_429: 0
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: thumbnails.roblox.com/v1/batch}
+      requests: 3660
+      upstream_calls: 3600
+      by_reason: {upstream_busy: 60}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - subject_contains: "thumbnails.roblox.com/v1/batch"
+      confidence: medium
+      family: upstream
+      change_kinds_required: [bucket_override]
+      change_kinds_forbidden: [setting, routing_rule, ban_add, credential_allowlist_remove]
+      exact_changes: true
+      changes_required:
+        - kind: bucket_override
+          bucket_key: "endpoint:thumbnails.roblox.com/v1/batch"
+          current: {per_min: 60}
+          proposed: {per_min: {between: [65, 67]}}     # +10%: 66
+      changes_forbidden:
+        - kind: bucket_override
+          bucket_key: {ne: "endpoint:thumbnails.roblox.com/v1/batch"}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_bucket_tune_enabled: 0}
+    expect: {fires: false}
+  - case: rejection_pct_2
+    description: Rejections of 1.64% of attempts are below a 2% threshold.
+    settings: {insight_up_bucket_tune_rejection_pct: 2}
+    expect: {fires: false}
+  - case: raise_pct_20
+    description: The raise step follows insight_up_bucket_tune_raise_pct (60 + 20% = 72).
+    settings: {insight_up_bucket_tune_raise_pct: 20}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - kind: bucket_override
+              bucket_key: "endpoint:thumbnails.roblox.com/v1/batch"
+              proposed: {per_min: {between: [71, 73]}}

@@ -1,0 +1,65 @@
+# SYS-LOOP-LAG just under its threshold (p99 above 100 ms for 5 minutes).
+#
+#   worker 4201: p99 lag 95 ms for the last 30 minutes (15 ms before): high, steady, just under 100 ms
+#   worker 4202: a 3 minute stall at 300 ms from 14:20 to 14:23 UTC, 12 ms ever since: shorter than 5 minutes and
+#                over long before the current window
+#
+# Under any reading of the current 5 minute window (sustained, average or p99 of the window) nothing is over 100 ms.
+# The variant lowers the threshold to 90 ms, which worker 4201 exceeds for its whole 30 minutes.
+
+format: roxy.insight_fixture/1
+rule: SYS-LOOP-LAG
+case: under_threshold
+description: >
+  One worker runs at 95 ms p99 loop lag and the other had a short stall 40 minutes ago. SYS-LOOP-LAG must not fire;
+  at a 90 ms threshold it must.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  workers:
+    - pid: 4201
+      started_at: "-1d"
+      last_seen: "-2s"
+      requests: 920000
+      proxied: 610000
+      loop_lag_ms_p99: 95
+      open_conns: 120
+      worker_id: "roxy-test:4201:0a1b2c3d"
+      hostname: "roxy-test"
+      color: green
+      master_pid: 4200
+      is_leader: 1
+      x_cpu_pct: 60
+      history:
+        - {window: ["-60m", "-30m"], cpu_pct: 45, loop_lag_ms_p99: 15, open_conns: 110}
+        - {window: ["-30m", "0m"], cpu_pct: 60, loop_lag_ms_p99: 95, open_conns: 120}
+    - pid: 4202
+      started_at: "-1d"
+      last_seen: "-1s"
+      requests: 905000
+      proxied: 600000
+      loop_lag_ms_p99: 12
+      open_conns: 115
+      worker_id: "roxy-test:4202:4e5f6a7b"
+      hostname: "roxy-test"
+      color: green
+      master_pid: 4200
+      is_leader: 0
+      x_cpu_pct: 44
+      history:
+        - {window: ["-60m", "-40m"], cpu_pct: 44, loop_lag_ms_p99: 12, open_conns: 110}
+        - {window: ["-40m", "-37m"], cpu_pct: 70, loop_lag_ms_p99: 300, open_conns: 130}
+        - {window: ["-37m", "0m"], cpu_pct: 44, loop_lag_ms_p99: 12, open_conns: 115}
+
+expect:
+  fires: false
+
+variants:
+  - case: p99_ms_lowered
+    description: At 90 ms, worker 4201 (95 ms for 30 minutes) is lagging.
+    settings: {insight_sys_loop_lag_p99_ms: 90}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {safe_auto: false}

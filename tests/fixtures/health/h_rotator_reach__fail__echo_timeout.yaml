@@ -1,0 +1,34 @@
+format: roxy.health_fixture/1
+check: H-ROTATOR-REACH
+case: fail
+name: echo_timeout
+description: >
+  The IP echo through the rotator times out. 13.2 H-ROTATOR-REACH: failure gives fail. The variant has a working
+  echo but the rotator switched off (rotator_enabled = 0) while rotator_weight is still 25: routing expects a
+  rotator that is not there, which 13.2 lists as fail ("disabled while weight > 0").
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    rotator_enabled: 1
+    rotator_weight: 25
+  upstream:
+    ip_echo: {error: timeout}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)egress"}
+  credential_calls: {eq: 0}
+variants:
+  - case: fail
+    name: disabled_while_weight_25
+    inputs:
+      settings:
+        rotator_enabled: 0
+      upstream:
+        ip_echo:
+          - {status: 200, exit_ip: "198.51.100.23", latency_ms: 450}
+    expect:
+      status: fail
+      explanation: {present: true}
+      fix_link: {regex: "(?i)egress"}
+      credential_calls: {eq: 0}

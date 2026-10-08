@@ -1,0 +1,113 @@
+# UP-4XX-SPIKE: Roblox starts refusing an anonymous endpoint (format: README.md in this directory).
+#
+# 11.5: "On one template, the Roblox 403, 401 or 400 rate over 30 min exceeds 3x its 7-day baseline and at least
+# 20 responses (min 100 calls); excludes CSRF challenges". Change: "if both [paths] fail: block the endpoint with
+# a clear message, or add a negative cache rule (negative_ttl) so callers stop paying for the error"; confidence
+# medium.
+#
+#   template                                                     7-day baseline       last 30 minutes
+#   inventory.roblox.com/v1/users/{userId}/items/Asset/{assetId} 25% (403: private)   90% (52 x 401 + 2 x 403 of
+#                                                                                     60 calls per minute)
+#   users.roblox.com/v1/users/{userId}                           25% (400)            25% (steady: must not fire)
+#
+# 90% is above 3 x 25% = 75% (and above 3 x 27.8% = 83.4% if the baseline includes the last 30 minutes), with
+# 1,620 rejections and 1,800 calls. The inventory endpoint is not on the credential allowlist and nothing shows it
+# working with the credential, so the anonymous path is the only path and it fails: the fixture reads that as the
+# "both fail" branch. The remedy is endpoint-scoped (a block or a negative cache rule matching this template);
+# no setting, no allowlist change, no other endpoint.
+
+format: roxy.insight_fixture/1
+rule: UP-4XX-SPIKE
+case: anonymous_401_spike
+description: >
+  For a week a public inventory endpoint answered about a quarter of calls with 403 (private inventories). For
+  the last 30 minutes Roblox has answered 90% of them with 401 or 403. The rule must recommend, for that
+  endpoint only, either an endpoint block with a clear message or a negative cache rule, and must leave the
+  steadily failing users endpoint alone.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  egress: direct
+  outcome: served_upstream
+  source: relay
+  cache_state: "MISS"
+  latency_ms: {p50: 150, p95: 400, p99: 800}
+
+profiles:
+  inv: {endpoint_template: "inventory.roblox.com/v1/users/{userId}/items/Asset/{assetId}"}
+  usr: {endpoint_template: "users.roblox.com/v1/users/{userId}"}
+  ok: {reason: upstream_ok, status: 200}
+  r400: {reason: upstream_4xx, status: 400}
+  r401: {reason: upstream_4xx, status: 401}
+  r403: {reason: upstream_4xx, status: 403}
+
+traffic:
+  # --- 7-day baseline (up to 30 minutes ago) ------------------------------------------------------------------
+  - {name: inv_ok_base, profile: [inv, ok], window: ["-7d", "-30m"], per_minute: 3}
+  - {name: inv_403_base, profile: [inv, r403], window: ["-7d", "-30m"], per_minute: 1}
+  - {name: usr_ok_base, profile: [usr, ok], window: ["-7d", "-30m"], per_minute: 3}
+  - {name: usr_400_base, profile: [usr, r400], window: ["-7d", "-30m"], per_minute: 1}
+  # --- Last 30 minutes ----------------------------------------------------------------------------------------
+  - {name: inv_ok_recent, profile: [inv, ok], window: ["-30m", "0m"], per_minute: 6}
+  - {name: inv_403_recent, profile: [inv, r403], window: ["-30m", "0m"], per_minute: 2}
+  - {name: inv_401_recent, profile: [inv, r401], window: ["-30m", "0m"], per_minute: 52}
+  - {name: usr_ok_recent, profile: [usr, ok], window: ["-30m", "0m"], per_minute: 3}
+  - {name: usr_400_recent, profile: [usr, r400], window: ["-30m", "0m"], per_minute: 1}
+
+expect:
+  data_checks:
+    - window: ["-30m", "0m"]
+      where: {endpoint_template: "inventory.roblox.com/v1/users/{userId}/items/Asset/{assetId}"}
+      upstream_calls: 1800
+      by_reason: {upstream_4xx: 1620, upstream_ok: 180}
+    - window: ["-7d", "-30m"]
+      where: {endpoint_template: "inventory.roblox.com/v1/users/{userId}/items/Asset/{assetId}"}
+      upstream_calls: 40200
+      by_reason: {upstream_4xx: 10050}
+    - window: ["-30m", "0m"]
+      where: {endpoint_template: "users.roblox.com/v1/users/{userId}", status: 400}
+      requests: 30
+
+  fires: true
+  others: forbid
+  recommendations:
+    - subject_contains: "inventory.roblox.com/v1/users/{userId}/items"
+      confidence: medium
+      family: upstream
+      change_kinds_forbidden: [setting, credential_allowlist_remove, bucket_override, routing_rule, ban_add]
+      changes_required:
+        - any_of:
+            - kind: rule_upsert
+              table: rules_cache
+              match: {pattern: {matches_targets: ["inventory.roblox.com/v1/users/1000000001/items/Asset/2000000001"]}}
+              proposed: {negative_ttl: {gte: 1}}
+            - kind: rule_upsert
+              table: rules_endpoint_block
+              match: {pattern: {matches_targets: ["inventory.roblox.com/v1/users/1000000001/items/Asset/2000000001"]}}
+      changes_forbidden:
+        - kind: rule_upsert
+          match:
+            pattern:
+              matches_targets: ["users.roblox.com/v1/users/1000000001", "inventory.roblox.com/v2/users/1000000001/inventory/8"]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_4xx_spike_enabled: 0}
+    expect: {fires: false}
+  - case: baseline_multiple_4
+    description: 90% is 3.6 times a 25% baseline (3.2 times 27.8%), below a multiple of 4.
+    settings: {insight_up_4xx_spike_baseline_multiple: 4}
+    expect: {fires: false}
+  - case: min_responses_2000
+    description: 1,620 rejections in the window are below a minimum of 2,000.
+    settings: {insight_up_4xx_spike_min_responses: 2000}
+    expect: {fires: false}
+  - case: min_calls_2000
+    description: 1,800 calls in the window are below a minimum of 2,000.
+    settings: {insight_up_4xx_spike_min_calls: 2000}
+    expect: {fires: false}

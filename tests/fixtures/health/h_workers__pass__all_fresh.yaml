@@ -1,0 +1,36 @@
+format: roxy.health_fixture/1
+check: H-WORKERS
+case: pass
+name: all_fresh
+description: >
+  Four workers are expected (ROXY_WORKERS = 4) and four heartbeat rows were written in the last 5 s (fresh means
+  seen within 20 s). Two older rows belong to workers that gunicorn recycled hours ago (ROXY_MAX_REQUESTS); they
+  are stale but expected, because rows are pruned only after a day, and they must not count against the fleet.
+  13.2 H-WORKERS: all fresh gives pass. The variant is the production default of two workers.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    ROXY_WORKERS: "4"
+  state:
+    workers:
+      - {pid: 41001, worker_id: "roxy-test:41001:a1b2c3d4", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-1s", requests: 52000, proxied: 30100, loop_lag_ms_p99: 6, open_conns: 40, inflight_upstream: 2, is_leader: 1, version: "3f9c2a1", x_self: true}
+      - {pid: 41002, worker_id: "roxy-test:41002:b2c3d4e5", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-2s", requests: 51800, proxied: 29900, loop_lag_ms_p99: 7, open_conns: 38, inflight_upstream: 1, is_leader: 0, version: "3f9c2a1"}
+      - {pid: 41003, worker_id: "roxy-test:41003:c3d4e5f6", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-3h", last_seen: "-4s", requests: 3100, proxied: 1800, loop_lag_ms_p99: 5, open_conns: 35, inflight_upstream: 0, is_leader: 0, version: "3f9c2a1"}
+      - {pid: 41004, worker_id: "roxy-test:41004:d4e5f6a7", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-9h", last_seen: "-3s", requests: 9800, proxied: 5600, loop_lag_ms_p99: 6, open_conns: 41, inflight_upstream: 1, is_leader: 0, version: "3f9c2a1"}
+      - {pid: 40990, worker_id: "roxy-test:40990:e5f6a7b8", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-3h", requests: 20000, proxied: 11500, loop_lag_ms_p99: 6, open_conns: 0, inflight_upstream: 0, is_leader: 0, version: "3f9c2a1"}
+      - {pid: 40991, worker_id: "roxy-test:40991:f6a7b8c9", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-9h", requests: 20000, proxied: 11400, loop_lag_ms_p99: 5, open_conns: 0, inflight_upstream: 0, is_leader: 0, version: "3f9c2a1"}
+expect:
+  status: pass
+  credential_calls: {eq: 0}
+variants:
+  - case: pass
+    name: two_workers_default
+    inputs:
+      env:
+        ROXY_WORKERS: "2"
+      state:
+        workers:
+          - {pid: 41001, worker_id: "roxy-test:41001:a1b2c3d4", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-1s", loop_lag_ms_p99: 6, open_conns: 40, is_leader: 1, version: "3f9c2a1", x_self: true}
+          - {pid: 41002, worker_id: "roxy-test:41002:b2c3d4e5", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-2s", loop_lag_ms_p99: 7, open_conns: 38, is_leader: 0, version: "3f9c2a1"}
+    expect:
+      status: pass

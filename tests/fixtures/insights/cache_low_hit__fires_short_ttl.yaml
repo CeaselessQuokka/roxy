@@ -1,0 +1,142 @@
+# CACHE-LOW-HIT fires on a busy endpoint whose cache rule lifetime is far too short
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Endpoint in top 10 by requests with hit ratio < 30% over 1 h"; change "See CACHE-TTL-TUNE and
+# CACHE-KEYSPLIT"; confidence "High if key split detected" (so not high here: there is no key split).
+#
+#   games.roblox.com/v1/games: 2,800 requests in the last hour (rank 3), 560 HIT and 2,240 MISS = 20% hit ratio.
+#   Cache rule 4 gives it a 15 s lifetime (an admin typo for 150 or 1500). Its cache entries are reused (hits on
+#   every entry, distinct universeIds that repeat), so the keys are not split.
+#   Request samples (key_space games, 50 keys, body changes every 600 s per key) feed the 11.3 TTL tuner, which
+#   measures about 600 s between body changes (a scratch tuner over these samples: median 587 s), so the
+#   CACHE-TTL-TUNE side of the change is "raise rule 4 to the measured interval".
+#
+# Expected: one recommendation for games.roblox.com/v1/games that raises the lifetime of the existing rule (an
+# update of rule 4, not a new rule and not the global cache_ttl_seconds), with confidence other than high.
+
+format: roxy.insight_fixture/1
+rule: CACHE-LOW-HIT
+case: fires_short_ttl
+description: >
+  games.roblox.com/v1/games is the third busiest endpoint with a 20% hit ratio because its cache rule keeps
+  answers for only 15 s, while the bodies change about every 600 s. The keys are reused, not split. The rule must
+  report this endpoint alone and propose a longer lifetime on that endpoint's rule, measured by the TTL tuner.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 300, stale_ttl: 60, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 2, pattern: "catalog.roblox.com/v1/search/items", type: glob, ttl: 120, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, stale_ttl: 120, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 15, methods: "GET", origin: admin, created_at: "-3d", note: "game details"}
+    - {id: 6, pattern: "groups.roblox.com/v1/groups/*", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 7, pattern: "badges.roblox.com/v1/badges/*", type: glob, ttl: 3600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 8, pattern: "users.roblox.com/v1/users/*", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  games: {endpoint_template: games.roblox.com/v1/games, samples: {key_space: games, keys: 50, body_change_interval_s: 600}}
+
+traffic:
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 3200}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 800}
+  - {name: votes_hit, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 1650}
+  - {name: votes_miss, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 1350}
+  - {name: games_hit, profile: [hit, games], window: ["-60m", "0m"], total: 560}
+  - {name: games_miss, profile: [miss, games], window: ["-60m", "0m"], total: 2240}
+  - {name: group_hit, profile: hit, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-60m", "0m"], total: 1500}
+  - {name: group_miss, profile: miss, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-60m", "0m"], total: 500}
+  - {name: user_hit, profile: hit, endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], total: 1260}
+  - {name: user_miss, profile: miss, endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], total: 540}
+  - {name: badge_hit, profile: hit, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-60m", "0m"], total: 1200}
+  - {name: badge_miss, profile: miss, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-60m", "0m"], total: 300}
+  - {name: search_hit, profile: hit, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], total: 720}
+  - {name: search_miss, profile: miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], total: 480}
+
+state:
+  cache:
+    entries:
+      # games.roblox.com/v1/games entries: distinct universeIds, each reused (hits), lifetime 15 s.
+      - {id: "b6c0e43b4ddd88297a6a653e", key: "GET games.roblox.com/v1/games?universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-1m", expires_at: "-1m", stale_until: "+9m", ttl: 15, rule_id: 4, egress: "direct", hits: 2, body_len: 900, bytes: 1100}
+      - {id: "a27c75bd36ddcc384609fcda", key: "GET games.roblox.com/v1/games?universeIds=1000000502", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000502\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-6m", expires_at: "-6m", stale_until: "+4m", ttl: 15, rule_id: 4, egress: "direct", hits: 1, body_len: 900, bytes: 1100}
+      - {id: "e638cd0b9c3538f00a3b35e0", key: "GET games.roblox.com/v1/games?universeIds=1000000503", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000503\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-11m", expires_at: "-11m", stale_until: "-1m", ttl: 15, rule_id: 4, egress: "direct", hits: 3, body_len: 900, bytes: 1100}
+      - {id: "04e6df2d60f0c73f8968d04c", key: "GET games.roblox.com/v1/games?universeIds=1000000504", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000504\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-4m", expires_at: "-4m", stale_until: "+6m", ttl: 15, rule_id: 4, egress: "direct", hits: 1, body_len: 900, bytes: 1100}
+      - {id: "3504d805730077096fd4ed34", key: "GET games.roblox.com/v1/games?universeIds=1000000505", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000505\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-9m", expires_at: "-9m", stale_until: "+1m", ttl: 15, rule_id: 4, egress: "direct", hits: 2, body_len: 900, bytes: 1100}
+      - {id: "b0aedb2df4066430c89ea9a5", key: "GET games.roblox.com/v1/games?universeIds=1000000506", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000506\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-2m", expires_at: "-2m", stale_until: "+8m", ttl: 15, rule_id: 4, egress: "direct", hits: 2, body_len: 900, bytes: 1100}
+      - {id: "539c7f90c0e58a8395034996", key: "GET games.roblox.com/v1/games?universeIds=1000000507", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000507\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-7m", expires_at: "-7m", stale_until: "+3m", ttl: 15, rule_id: 4, egress: "direct", hits: 1, body_len: 900, bytes: 1100}
+      - {id: "de0cb71803461751c2cf8291", key: "GET games.roblox.com/v1/games?universeIds=1000000508", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000508\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-12m", expires_at: "-12m", stale_until: "-2m", ttl: 15, rule_id: 4, egress: "direct", hits: 3, body_len: 900, bytes: 1100}
+      - {id: "3944593e94b7b1e28b11aede", key: "GET games.roblox.com/v1/games?universeIds=1000000509", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000509\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-5m", expires_at: "-5m", stale_until: "+5m", ttl: 15, rule_id: 4, egress: "direct", hits: 2, body_len: 900, bytes: 1100}
+      - {id: "aca0c18cd0b37e8da897d12c", key: "GET games.roblox.com/v1/games?universeIds=1000000510", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000510\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-10m", expires_at: "-10m", stale_until: "-0m", ttl: 15, rule_id: 4, egress: "direct", hits: 1, body_len: 900, bytes: 1100}
+
+events:
+  change_observations:
+    # Consistent with refetches about every 80 s per key against a body that changes every 600 s.
+    - {endpoint_template: games.roblox.com/v1/games, day: "2026-10-06", refetches: 52000, identical_bodies: 45100}
+    - {endpoint_template: games.roblox.com/v1/games, day: "2026-10-07", refetches: 32000, identical_bodies: 27750}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 16300
+      upstream_calls: 6210
+      served_cache: 10090
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games}
+      requests: 2800
+      served_cache: 560
+      upstream_calls: 2240
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CACHE-LOW-HIT
+      subject_contains: "games.roblox.com/v1/games"
+      severity: any
+      family: cache
+      confidence: {ne: high}     # no key split detected
+      evidence:
+        metrics:
+          cache_hit_ratio: {between: [0.19, 0.21]}
+      change_kinds_required: [rule_upsert]
+      change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, credential_allowlist_remove, routing_rule, host_add, bucket_override, ignored_param_add]
+      changes_required:
+        # Raise the lifetime of rule 4 to the tuner's measurement (about 600 s; never above ttl_tuner_max_s).
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["games.roblox.com/v1/games"]}}
+          current: {ttl: 15}
+          proposed: {ttl: {between: [450, 750]}}
+      changes_forbidden:
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_stale_seconds, cache_max_entries, cache_max_bytes, cache_enabled]}
+        # The votes rule (id 1) is healthy and more specific; it must not be touched.
+        - {kind: rule_upsert, table: rules_cache, current: {id: 1}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cache_low_hit_enabled: 0}
+    expect: {fires: false}
+  - case: max_hit_ratio_below_evidence
+    description: With the threshold at 15%, a 20% hit ratio is not low.
+    settings: {insight_cache_low_hit_max_hit_ratio_pct: 15}
+    expect: {fires: false}
+  - case: tuner_cap
+    description: ttl_tuner_max_s caps the proposed lifetime even though the tuner measures about 600 s.
+    settings: {ttl_tuner_max_s: 300}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "games.roblox.com/v1/games"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, table: rules_cache, current: {ttl: 15}, proposed: {ttl: {gt: 15, lte: 300}}}

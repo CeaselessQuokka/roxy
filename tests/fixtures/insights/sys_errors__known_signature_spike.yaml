@@ -1,0 +1,115 @@
+# SYS-ERRORS, second condition: "a known signature whose hourly count exceeds 5x its 7-day hourly baseline" (11.5;
+# insight_sys_errors_baseline_multiple = 5).
+#
+#   signature                             baseline (7 days)            last hour   ratio
+#   TimeoutError at rotator.py:188        every 30 minutes = 2/hour    25          12.5x (11.7x if the baseline
+#                                                                                  includes the last hour)
+#   ConnectionResetError at smtp.py:97    every 30 minutes = 2/hour    8           4.0x (3.9x)
+#
+# Both signatures are weeks old, so neither is "new". The baseline occurrences use the `every` row generator (README
+# "Extensions"), which spreads them evenly so an hourly mean and an hourly median agree. Neither error reaches
+# callers as a 500.
+#
+#   variant baseline_multiple_raised (15): 12.5x is under 15x, nothing fires
+#   variant baseline_multiple_lowered (3): the SMTP signature (4x) fires too
+
+format: roxy.insight_fixture/1
+rule: SYS-ERRORS
+case: known_signature_spike
+description: >
+  A rotator timeout that normally happens twice an hour happened 25 times in the last hour, while an SMTP reset rose
+  from 2 to 8. SYS-ERRORS must raise one manual recommendation for the rotator timeout only (12.5x against 4x, with a
+  5x threshold).
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 200}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 66}
+
+events:
+  errors:
+    - signature: "TimeoutError at rotator.py:188"
+      count: 2425
+      first_seen: "-40d"
+      last_seen: "-2130s"
+      source: roxy
+      last_detail: "rotator exit IP probe"
+      module_line: "rotator.py:188"
+      traceback_redacted: |
+        File "roxy/egress/rotator.py", line 188, in exit_ip_probe
+          response = await self._client.get(url, timeout=timeout)
+        TimeoutError
+      occurrences:
+        - {window: ["-7d", "-60m"], every: "30m"}
+        - {window: ["-60m", "0m"], total: 25}
+    - signature: "ConnectionResetError at smtp.py:97"
+      count: 1310
+      first_seen: "-25d"
+      last_seen: "-3150s"
+      source: roxy
+      last_detail: "alert email NOOP"
+      module_line: "smtp.py:97"
+      traceback_redacted: |
+        File "roxy/notify/smtp.py", line 97, in send
+          await client.noop()
+        ConnectionResetError: [Errno 104] Connection reset by peer
+      occurrences:
+        - {window: ["-7d", "-60m"], every: "30m"}
+        - {window: ["-60m", "0m"], total: 8}
+
+expect:
+  data_checks:
+    - {window: ["-15m", "0m"], requests: 3990, failed: 0}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-ERRORS
+      subject_contains: "rotator.py:188"
+      severity: any
+      family: system
+      confidence: high
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: manual}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_errors_enabled: 0}
+    expect: {fires: false}
+  - case: baseline_multiple_raised
+    description: At 15x neither signature (12.5x and 4x) is spiking.
+    settings: {insight_sys_errors_baseline_multiple: 15}
+    expect: {fires: false}
+  - case: baseline_multiple_lowered
+    description: At 3x the SMTP reset (4x) is a spike as well.
+    settings: {insight_sys_errors_baseline_multiple: 3}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "rotator.py:188", changes_required: [{kind: manual}]}
+        - {subject_contains: "smtp.py:97", changes_required: [{kind: manual}]}
+  - case: severity_override_critical
+    description: insight_sys_errors_severity replaces the computed severity.
+    settings: {insight_sys_errors_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "rotator.py:188", severity: critical}

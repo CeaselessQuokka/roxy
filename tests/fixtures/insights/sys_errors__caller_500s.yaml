@@ -1,0 +1,105 @@
+# SYS-ERRORS, third condition: "caller-facing 500s > 0.5% over 15 min" (11.5; insight_sys_errors_caller_500_pct =
+# 0.5, insight_sys_errors_window_min = 15).
+#
+# A known bug in the response builder (ValueError at respond.py:341, seen for 20 days) turns some requests into
+# Roxy's own 500 (`internal_error`). It normally hits one request every 2 minutes (0.19% of traffic). From 14:45 to
+# 14:55 UTC it hit 4 requests a minute:
+#
+#   last 15 minutes   4,030 requests, 40 internal_error 500s = 0.99%   (threshold 0.5%)
+#   last 5 minutes    1,330 requests, 0 internal_error 500s
+#   signature         last hour 23 + 40 = 63 against a baseline of 30 an hour: 2.1x (under 5x), not new
+#
+# So only the caller-facing condition holds, and only over the 15 minute window. The traffic of the error matches its
+# occurrences exactly (one 500 per occurrence, every 2 minutes before the burst).
+#
+#   variant caller_500_pct_raised (1.5): 0.99% is acceptable
+#   variant window_shortened (5): the last 5 minutes are clean
+
+format: roxy.insight_fixture/1
+rule: SYS-ERRORS
+case: caller_500s
+description: >
+  For ten minutes Roxy's own 500s rose to 4 a minute, 0.99% of the requests in the last 15 minutes, from a known bug
+  that is not otherwise spiking past 5x. SYS-ERRORS must raise one manual recommendation.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  internal_error: {egress: none, outcome: failed, reason: internal_error, status: 500, source: roxy, cache_state: "NA", upstream_calls: 0, error: true, latency_ms: 4, bytes: {caller_in: 0, caller_out: 60}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 200}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 66}
+  - name: bug_baseline           # one every 2 minutes, matching the occurrences below
+    profile: [internal_error, legit]
+    endpoint_template: "users.roblox.com/v1/users/{userId}"
+    window: ["-60m", "-15m"]
+    series: [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+  - {name: bug_burst, profile: [internal_error, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-15m", "-5m"], per_minute: 4}
+
+events:
+  errors:
+    - signature: "ValueError at respond.py:341"
+      count: 12000
+      first_seen: "-20d"
+      last_seen: "-5m"
+      source: roxy
+      last_detail: "GET users.roblox.com/v1/users/{userId}"
+      module_line: "respond.py:341"
+      traceback_redacted: |
+        File "roxy/proxy/respond.py", line 341, in build
+          length = int(result.upstream_headers["content-length"])
+        ValueError: invalid literal for int() with base 10: ''
+      occurrences:
+        - {window: ["-7d", "-15m"], every: "2m"}
+        - {window: ["-15m", "-5m"], per_minute: 4}
+
+expect:
+  data_checks:
+    - {window: ["-15m", "0m"], requests: 4030, by_reason: {internal_error: 40}}
+    - {window: ["-5m", "0m"], requests: 1330, failed: 0}
+    - {window: ["-60m", "-15m"], by_reason: {internal_error: 23}}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-ERRORS
+      severity: any
+      family: system
+      confidence: high
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: manual}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_errors_enabled: 0}
+    expect: {fires: false}
+  - case: caller_500_pct_raised
+    description: At 1.5%, 0.99% of caller-facing 500s is acceptable, and the signature is neither new nor spiking.
+    settings: {insight_sys_errors_caller_500_pct: 1.5}
+    expect: {fires: false}
+  - case: window_shortened
+    description: Over the last 5 minutes there were no 500s at all.
+    settings: {insight_sys_errors_window_min: 5}
+    expect: {fires: false}
+  - case: severity_override_warn
+    description: insight_sys_errors_severity replaces the computed severity.
+    settings: {insight_sys_errors_severity: warn}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: warn}

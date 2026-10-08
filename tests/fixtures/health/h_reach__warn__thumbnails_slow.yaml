@@ -1,0 +1,24 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: thumbnails.roblox.com}
+case: warn
+name: thumbnails_slow
+description: >
+  The thumbnails probe answers 200 JSON after 1,200 ms. 13.2 H-REACH: under 2,000 ms (and not under 800 ms)
+  gives warn.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:thumbnails.roblox.com":
+      status: 200
+      json: {data: [{targetId: 1, state: "Completed", imageUrl: "https://cdn.test/fixture/headshot-48.png"}]}
+      latency_ms: 1200
+      expect_request: {via: direct, method: GET}
+expect:
+  status: warn
+  value: {present: true}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  calls:
+    "probe:thumbnails.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}

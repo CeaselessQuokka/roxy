@@ -1,0 +1,122 @@
+# FILTER-COLLATERAL: "a rule refuses requests from places whose other traffic is > 95% served" (11.5;
+# insight_filter_collateral_served_pct = 95).
+#
+# Three days ago the admin blocked avatar.roblox.com/v1/users/*/avatar to stop an avatar scraper. The block also
+# refuses two real experiences that use that endpoint:
+#
+#   place        clients                      refused by the block   other traffic   served share of other traffic
+#   1000000201   25 game servers, Roblox UA   300                    6,060           6,000 / 6,060 = 99.0%
+#   1000000202   25 game servers, Roblox UA   150                    3,000           2,910 / 3,000 = 97.0%
+#   1000000203   10 scrapers, python UA       500                    1,200           720 / 1,200 = 60.0%
+#
+# "Other traffic" is everything from that place that this rule did not refuse; its refusals are ordinary per-IP
+# throttling for the two games and the UA rule for the scrapers. The UA rule (python-requests) refuses only place
+# 1000000203, whose other traffic is 720 / 1,220 = 59% served, so the UA rule is not collateral damage.
+#
+# The endpoint block is the only filter that refuses with `endpoint_blocked` and the UA rule the only one with
+# `user_agent_rule`, so attributing refusals to rules is unambiguous. 11.5's change: "narrow or remove the rule".
+
+format: roxy.insight_fixture/1
+rule: FILTER-COLLATERAL
+case: endpoint_block_hits_games
+description: >
+  An endpoint block meant for a scraper also refuses two experiences whose other traffic is 99% and 97% served.
+  FILTER-COLLATERAL must raise one recommendation to narrow or remove that block, and must not touch the UA rule that
+  only refuses the scrapers.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  rules_endpoint_block:
+    - {id: 1, pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob, note: "Block avatar scraping", message: "This endpoint is not available through Roxy.", enabled: 1, created_at: "-3d", created_by: admin, x_last_hit_at: "-1m"}
+  rules_user_agent:
+    - {id: "c0ffee01", needle: "python-requests", mode: contains, kind: burst, scope: ip, limit: 5, period: 60, position: 1, enabled: 1, created_at: "-60d", created_by: admin, x_last_hit_at: "-1m"}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  blocked: {egress: none, outcome: refused, reason: endpoint_blocked, status: 403, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 120}, endpoint_template: "avatar.roblox.com/v1/users/{userId}/avatar"}
+  ua_refused: {egress: none, outcome: refused, reason: user_agent_rule, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  place_201: {clients: {cidr: "203.0.113.0/27", count: 25}, place_id: "1000000201", user_agent: "Roblox/Linux"}
+  place_202: {clients: {cidr: "203.0.113.32/27", count: 25}, place_id: "1000000202", user_agent: "Roblox/WinInet"}
+  place_203: {clients: {cidr: "192.0.2.0/28", count: 10}, place_id: "1000000203", user_agent: "python-requests/2.31.0"}
+
+traffic:
+  - {name: p201_hit, profile: [hit, place_201], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 80}
+  - {name: p201_miss, profile: [miss, place_201], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 20}
+  - {name: p201_throttled, profile: [throttled, place_201], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 1}
+  - {name: p201_blocked, profile: [blocked, place_201], window: ["-60m", "0m"], per_minute: 5}
+  - {name: p202_hit, profile: [hit, place_202], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: p202_miss, profile: [miss, place_202], endpoint_template: "thumbnails.roblox.com/v1/users/avatar-headshot", window: ["-60m", "0m"], total: 510}
+  - {name: p202_throttled, profile: [throttled, place_202], endpoint_template: "thumbnails.roblox.com/v1/users/avatar-headshot", window: ["-60m", "0m"], total: 90}
+  - {name: p202_blocked, profile: [blocked, place_202], window: ["-60m", "0m"], total: 150}
+  - {name: p203_miss, profile: [miss, place_203], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 12}
+  - {name: p203_ua_refused, profile: [ua_refused, place_203], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 8}
+  - {name: p203_blocked, profile: [blocked, place_203], window: ["-60m", "0m"], total: 500}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/27", count: 25}, bot_score: 7}
+    - {clients: {cidr: "203.0.113.32/27", count: 25}, bot_score: 9}
+    - {clients: {cidr: "192.0.2.0/28", count: 10}, bot_score: 88}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 11210}
+    - {window: ["-60m", "0m"], where: {place_id: "1000000201"}, requests: 6360, by_reason: {endpoint_blocked: 300, throttle: 60}}
+    - {window: ["-60m", "0m"], where: {place_id: "1000000202"}, requests: 3150, by_reason: {endpoint_blocked: 150, throttle: 90}}
+    - {window: ["-60m", "0m"], where: {place_id: "1000000203"}, requests: 1700, by_reason: {endpoint_blocked: 500, user_agent_rule: 480}}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: FILTER-COLLATERAL
+      severity: any
+      family: filter
+      confidence: medium
+      changes_required:
+        - any_of:
+            - {kind: rule_upsert, table: rules_endpoint_block, match: {pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob}}
+            - {kind: rule_delete, table: rules_endpoint_block, match: {pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob}}
+            - {kind: filter_remove, table: rules_endpoint_block, match: {pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob}}
+      changes_forbidden:
+        - any_of:
+            - {kind: rule_upsert, table: rules_user_agent}
+            - {kind: rule_delete, table: rules_user_agent}
+            - {kind: filter_remove, table: rules_user_agent}
+      change_kinds_forbidden: [setting, ban_add, ban_remove, bypass_add, filter_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_filter_collateral_enabled: 0}
+    expect: {fires: false}
+  - case: served_pct_100
+    description: No place can have more than 100% of its other traffic served, so nothing qualifies.
+    settings: {insight_filter_collateral_served_pct: 100}
+    expect: {fires: false}
+  - case: served_pct_98
+    description: At 98% only place 1000000201 (99.0%) still counts as legitimate collateral, which is enough to flag the block.
+    settings: {insight_filter_collateral_served_pct: 98}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - any_of:
+                - {kind: rule_upsert, table: rules_endpoint_block, match: {pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob}}
+                - {kind: rule_delete, table: rules_endpoint_block, match: {pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob}}
+                - {kind: filter_remove, table: rules_endpoint_block, match: {pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob}}
+  - case: severity_override_critical
+    description: insight_filter_collateral_severity replaces the computed severity.
+    settings: {insight_filter_collateral_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: critical}

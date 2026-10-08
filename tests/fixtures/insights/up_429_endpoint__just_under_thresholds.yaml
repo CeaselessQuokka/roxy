@@ -1,0 +1,154 @@
+# UP-429-ENDPOINT just under both of its tests (format: README.md in this directory).
+#
+# 11.5: ">= 20 Roblox 429s in 1 h on one template, or > 2% of its upstream calls". The rule fires when EITHER test
+# passes, so a quiet scenario must be under both on every template:
+#
+#   template                                  429s in the last 60 min   upstream calls   share
+#   games.roblox.com/v1/games/votes           19 (one under 20)         1,000            1.9% (19 of 981 ok: 1.94%)
+#   catalog.roblox.com/v1/search/items        15                        900              1.67%
+#   users.roblox.com/v1/users (POST)          0 (80 between 180 and 140 minutes ago)
+#
+# votes also had 30 429s between 110 and 80 minutes ago, outside the default 60 minute window; the
+# `window_120_includes_older_429s` variant brings them in (49 >= 20). Every 429 was served stale, so callers saw
+# none of them. The variants pin each threshold from below.
+
+format: roxy.insight_fixture/1
+rule: UP-429-ENDPOINT
+case: just_under_thresholds
+description: >
+  Two endpoints get a trickle of Roblox 429s in the last hour, each under 20 responses and under 2% of its
+  upstream calls, and a third had a burst three hours ago. Nothing passes either test inside the 60 minute
+  window, so the rule must stay quiet; lowering any one threshold just below the evidence must make it fire for
+  the right endpoint only.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 300, stale_ttl: 60, methods: "GET", origin: admin, created_at: "-30d"}
+    - {id: 2, pattern: "catalog.roblox.com/v1/search/items", type: glob, ttl: 120, stale_ttl: 60, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004"]
+
+profiles:
+  hit:
+    egress: none
+    outcome: served_cache
+    reason: cache_hit
+    status: 200
+    source: cache
+    cache_state: "HIT"
+    latency_ms: {p50: 3, p95: 9, p99: 20}
+  miss:
+    egress: direct
+    outcome: served_upstream
+    reason: upstream_ok
+    status: 200
+    source: relay
+    cache_state: "MISS"
+    latency_ms: {p50: 140, p95: 380, p99: 750}
+  stale_429:
+    egress: direct
+    outcome: served_cache
+    reason: cache_stale_error
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    latency_ms: {p50: 90, p95: 200, p99: 350}
+    upstream_429: {egress: direct, retry_after_s: 10}
+
+traffic:
+  # --- The last hour ------------------------------------------------------------------------------------------
+  - {name: votes_hit, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 2000}
+  - {name: votes_miss, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 981}
+  - {name: votes_429, profile: stale_429, endpoint_template: games.roblox.com/v1/games/votes, window: ["-45m", "-26m"], per_minute: 1}
+  - {name: search_hit, profile: hit, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], total: 1500}
+  - {name: search_miss, profile: miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], total: 885}
+  - {name: search_429, profile: stale_429, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-40m", "-25m"], per_minute: 1}
+  - {name: users_miss, profile: miss, endpoint_template: users.roblox.com/v1/users, method: POST, cache_state: "OFF", window: ["-60m", "0m"], total: 600}
+
+  # --- Older history ------------------------------------------------------------------------------------------
+  - {name: votes_miss_older, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-120m", "-60m"], total: 1170}
+  - {name: votes_429_older, profile: stale_429, endpoint_template: games.roblox.com/v1/games/votes, window: ["-110m", "-80m"], per_minute: 1}
+  - {name: users_miss_older, profile: miss, endpoint_template: users.roblox.com/v1/users, method: POST, cache_state: "OFF", window: ["-180m", "-60m"], total: 1200}
+  - name: users_429_older
+    endpoint_template: users.roblox.com/v1/users
+    method: POST
+    window: ["-180m", "-140m"]
+    total: 80
+    egress: direct
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "OFF"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    upstream_429: {egress: direct, retry_after_s: 30}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games/votes}
+      upstream_calls: 1000
+      roblox_429: 19
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: catalog.roblox.com/v1/search/items}
+      upstream_calls: 900
+      roblox_429: 15
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: users.roblox.com/v1/users}
+      roblox_429: 0
+    - window: ["-60m", "0m"]
+      roblox_429: 34
+    - window: ["-120m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games/votes}
+      roblox_429: 49
+    - window: ["-180m", "0m"]
+      roblox_429: 144
+
+  fires: false
+
+variants:
+  - case: min_429s_19
+    description: The count test is ">= min_429s"; at 19, votes (19) fires and catalog search (15, 1.67%) does not.
+    settings: {insight_up_429_endpoint_min_429s: 19}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "games.roblox.com/v1/games/votes"}
+  - case: share_1_8_pct
+    description: At 1.8%, votes (1.9% of its calls) passes the share test and catalog search (1.67%) does not.
+    settings: {insight_up_429_endpoint_share_pct: 1.8}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "games.roblox.com/v1/games/votes"}
+  - case: share_1_5_pct
+    description: At 1.5% both endpoints pass the share test; users (no 429s in the window) still does not.
+    settings: {insight_up_429_endpoint_share_pct: 1.5}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "games.roblox.com/v1/games/votes"}
+        - {subject_contains: "catalog.roblox.com/v1/search/items"}
+  - case: window_120_includes_older_429s
+    description: >
+      A 120 minute window adds the 30 older votes 429s (49 >= 20). The users burst ended 140 minutes ago and stays
+      outside; catalog search keeps 15 429s over more calls.
+    settings: {insight_up_429_endpoint_window_min: 120}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "games.roblox.com/v1/games/votes"}

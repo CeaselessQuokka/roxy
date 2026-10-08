@@ -1,0 +1,99 @@
+# UP-BUCKET-TUNE just under its raise threshold, plus a bucket that never saturates (README.md here).
+#
+# 11.5: "Too tight: 24 h with zero 429s and bucket rejections > 1% of attempts"; "A bucket that never saturates is
+# never raised". No Roblox 429 in the last 48 hours, so the too-loose branch has nothing to work on either.
+#
+#   bucket                                     rate            last 24 h (state.buckets history)
+#   endpoint:thumbnails.roblox.com/v1/batch    110/min (admin) attempts 159,840, rejections 1,440 (0.90%)
+#   endpoint:games.roblox.com/v1/games         120/min         peak fill 55%, no rejections
+#
+# The `rejection_pct_0_8` variant raises the batch bucket by 10% (to 121) and still never the games bucket.
+
+format: roxy.insight_fixture/1
+rule: UP-BUCKET-TUNE
+case: just_under
+description: >
+  The thumbnails batch bucket turns away 0.9% of attempts during a 429-free day, just under the 1% that marks real
+  demand above the cap, and the games bucket never fills. The rule must stay quiet.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  adaptive_rate_enabled: 0
+
+tables:
+  upstream_limits:
+    - {bucket_key: "endpoint:thumbnails.roblox.com/v1/batch", per_min: 110, burst: 10, origin: admin, updated_at: "-10d", updated_by: admin}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+
+profiles:
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 200, p95: 500, p99: 900}}
+  batch: {endpoint_template: thumbnails.roblox.com/v1/batch, method: POST, cache_state: "OFF"}
+
+traffic:
+  - {name: batch_ok, profile: [miss, batch], window: ["-60m", "0m"], per_minute: 110}
+  - name: batch_busy
+    profile: batch
+    window: ["-60m", "0m"]
+    per_minute: 1
+    egress: none
+    outcome: failed
+    reason: upstream_busy
+    status: 429
+    source: roxy
+    error: true
+    latency_ms: 4000
+    queue_wait_ms: 4000
+  - {name: games_ok, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 30}
+
+state:
+  buckets:
+    - bucket_key: "endpoint:thumbnails.roblox.com/v1/batch"
+      per_min: 110
+      burst: 10
+      fill_pct: 100
+      history:
+        - {window: ["-24h", "-60m"], fill_pct_peak: 100, attempts: 153180, rejections: 1380}
+        - {window: ["-60m", "0m"], fill_pct_peak: 100, attempts: 6660, rejections: 60}
+    - bucket_key: "endpoint:games.roblox.com/v1/games"
+      per_min: 120
+      burst: 10
+      fill_pct: 20
+      history:
+        - {window: ["-24h", "-60m"], fill_pct_peak: 55, attempts: 41400, rejections: 0}
+        - {window: ["-60m", "0m"], fill_pct_peak: 40, attempts: 1800, rejections: 0}
+  settings_history:
+    - {at: "-30d", key: adaptive_rate_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Bucket rates by hand for now."}
+
+expect:
+  data_checks:
+    - window: ["-48h", "0m"]
+      roblox_429: 0
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: thumbnails.roblox.com/v1/batch}
+      requests: 6660
+      by_reason: {upstream_busy: 60}
+
+  fires: false
+
+variants:
+  - case: rejection_pct_0_8
+    description: 0.90% rejections pass a 0.8% threshold for the batch bucket; the games bucket never saturates.
+    settings: {insight_up_bucket_tune_rejection_pct: 0.8}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "thumbnails.roblox.com/v1/batch"
+          changes_required:
+            - kind: bucket_override
+              bucket_key: "endpoint:thumbnails.roblox.com/v1/batch"
+              current: {per_min: 110}
+              proposed: {per_min: {between: [120, 122]}}
+          changes_forbidden:
+            - kind: bucket_override
+              bucket_key: "endpoint:games.roblox.com/v1/games"

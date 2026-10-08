@@ -1,0 +1,22 @@
+format: roxy.health_fixture/1
+check: H-DISK
+case: fail
+name: 6_percent_free
+description: >
+  The state volume has 2.4 GB free of 40 GB: 6%. 13.2 H-DISK: 10% free or less gives fail.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    disk:
+      total_bytes: 40000000000
+      free_bytes: 2400000000
+      files:
+        "control.db": {bytes: 60000000, wal_bytes: 4194304}
+        "hot.db": {bytes: 8000000, wal_bytes: 4194304}
+        "metrics.db": {bytes: 2000000000, wal_bytes: 4194304}
+        "cache.db": {bytes: 500000000, wal_bytes: 4194304}
+expect:
+  status: fail
+  value: {lte: 10}
+  explanation: {present: true}
+  credential_calls: {eq: 0}

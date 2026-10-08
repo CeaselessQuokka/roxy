@@ -1,0 +1,19 @@
+format: roxy.health_fixture/1
+check: H-CRED-COOLDOWN
+case: pass
+name: no_cooldown
+description: >
+  The credential cooldown from an old 429 ended 10 minutes ago (the row stays until the hot.db prune removes
+  it), so the remaining credential cooldown is 0. A cooldown on an anonymous endpoint (games list on direct) is
+  active right now and must not count: H-CRED-COOLDOWN measures only the fleet-wide `credential` key (7.5).
+  13.2: 0 gives pass. No Roblox call is needed.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    credential: {present: true, status: active, status_at: "-10m", set_at: "-20d", account_id: "1000001"}
+    cooldowns:
+      - {key: credential, until: "-10m", source: retry_after, set_at: "-11m", hits: 1}
+      - {key: "endpoint:games.roblox.com/v1/games:direct", until: "+120s", source: retry_after, set_at: "-10s", hits: 3}
+expect:
+  status: pass
+  credential_calls: {eq: 0}

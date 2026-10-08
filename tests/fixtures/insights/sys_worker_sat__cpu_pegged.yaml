@@ -1,0 +1,100 @@
+# SYS-WORKER-SAT: "CPU > 85% for 10 min or open connections near limits" (11.5; insight_sys_worker_sat_cpu_pct = 85,
+# insight_sys_worker_sat_window_min = 10).
+#
+# Worker CPU has no column in worker_heartbeat (schema version 1), so it comes from `x_cpu_pct` (now) and `history`
+# (per stretch; production reads the cgroup cpu.stat, plan 17.1), the provider seam. Both workers of the blue color
+# have run at 94% and 92% CPU for the last 12 minutes (a traffic surge after a popular game update), after 42% and 40%
+# before that. Reading used: the CPU stays above the threshold for the whole window (sustained); the fleet average
+# over the last 10 minutes (93%) is over 85% too, so an average-based rule agrees.
+#
+#   variant window_raised (15 min): the last 15 minutes include 3 minutes at 42%/40%, so CPU was not above 85% for
+#   15 minutes, and the 15 minute averages (83.6% and 82.0%) are under 85% as well.
+#
+# The "open connections near limits" condition is not exercised: 11.5 names no limit to be near, so open_conns stays
+# at ordinary values (100 to 180 per worker) in every SYS-WORKER-SAT fixture.
+#
+# 11.5's change: "raise ROXY_WORKERS (restart) or investigate". ROXY_WORKERS is an environment variable, not a
+# catalog setting, so the change is `manual`; no runtime setting is changed.
+
+format: roxy.insight_fixture/1
+rule: SYS-WORKER-SAT
+case: cpu_pegged
+description: >
+  Both workers have been above 90% CPU for 12 minutes. SYS-WORKER-SAT must raise a manual recommendation (more
+  workers after a restart, or investigate) and must not change any runtime setting.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  workers:
+    - pid: 4101
+      started_at: "-2d"
+      last_seen: "-2s"
+      rss: 210000000
+      requests: 1840000
+      proxied: 1210000
+      loop_lag_ms_p99: 35
+      open_conns: 180
+      inflight_upstream: 14
+      worker_id: "roxy-test:4101:a1b2c3d4"
+      hostname: "roxy-test"
+      color: blue
+      master_pid: 4100
+      version: "2.0.0+fixture"
+      is_leader: 1
+      x_cpu_pct: 94
+      history:
+        - {window: ["-60m", "-12m"], cpu_pct: 42, loop_lag_ms_p99: 9, open_conns: 110}
+        - {window: ["-12m", "0m"], cpu_pct: 94, loop_lag_ms_p99: 35, open_conns: 180}
+    - pid: 4102
+      started_at: "-2d"
+      last_seen: "-3s"
+      rss: 205000000
+      requests: 1795000
+      proxied: 1180000
+      loop_lag_ms_p99: 31
+      open_conns: 176
+      inflight_upstream: 12
+      worker_id: "roxy-test:4102:e5f6a7b8"
+      hostname: "roxy-test"
+      color: blue
+      master_pid: 4100
+      version: "2.0.0+fixture"
+      is_leader: 0
+      x_cpu_pct: 92
+      history:
+        - {window: ["-60m", "-12m"], cpu_pct: 40, loop_lag_ms_p99: 8, open_conns: 104}
+        - {window: ["-12m", "0m"], cpu_pct: 92, loop_lag_ms_p99: 31, open_conns: 176}
+
+expect:
+  fires: true
+  others: allow                # one fleet-wide or one per-worker recommendation are both acceptable
+  recommendations:
+    - rule_id: SYS-WORKER-SAT
+      severity: any
+      family: system
+      confidence: medium
+      safe_auto: false
+      changes_required:
+        - {kind: manual}
+      change_kinds_forbidden: [setting, bucket_override, rule_upsert, rule_delete, ban_add, bypass_add, tarpit_category]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_worker_sat_enabled: 0}
+    expect: {fires: false}
+  - case: cpu_pct_raised
+    description: At 96% neither worker (94% and 92%) is saturated.
+    settings: {insight_sys_worker_sat_cpu_pct: 96}
+    expect: {fires: false}
+  - case: window_raised
+    description: Fifteen minutes of saturation are required and the surge has lasted twelve.
+    settings: {insight_sys_worker_sat_window_min: 15}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_sys_worker_sat_severity replaces the computed severity.
+    settings: {insight_sys_worker_sat_severity: critical}
+    expect:
+      fires: true
+      recommendations:
+        - {severity: critical}

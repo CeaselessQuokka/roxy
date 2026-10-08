@@ -1,0 +1,220 @@
+# UP-429-ENDPOINT on a GET endpoint that already has a short cache rule (format: README.md in this directory).
+#
+# 11.5 row: ">= 20 Roblox 429s in 1 h on one template, or > 2% of its upstream calls" fires; the change is a
+# bucket_override for that endpoint to 80% of the highest 429-free sustained rate (never a global default), a
+# higher cache rule TTL from the TTL tuner, and SWR for it; "High when n >= 50". 11.2 says a recommendation whose
+# changes are all scoped to one endpoint is safe_auto, which is exactly its own UP-429-ENDPOINT example.
+#
+#   fact                                              where it comes from here
+#   300 Roblox 429s on GET games.../votes in 60 min   votes_stale_429 (every 429 served stale, upstream_429 rows)
+#   4,150 upstream calls on the endpoint (7.2% 429)   1,800 + 600 + 850 + 300 + 600 (see data_checks)
+#   highest 429-free sustained rate 90 per minute     votes_miss_sustained: 20 minutes at 90, zero 429s
+#   80% of that is 72 per minute                      so the override must be at most 72 (default bucket 120)
+#   bodies change every 300 s per key                 samples on the ok misses, 60 keys; the tuner gives ~300 s
+#   current rule TTL 30 s, no SWR                     tables.rules_cache id 1
+#
+# adaptive_rate_enabled = 0 keeps the endpoint bucket at the 120 per minute default (no upstream_limits row), so
+# `current` is known. fallback_on_429 stays at its default 0, so the rule has nothing to say about it.
+
+format: roxy.insight_fixture/1
+rule: UP-429-ENDPOINT
+case: get_raise_ttl
+description: >
+  A busy game starts polling GET games.roblox.com/v1/games/votes harder. The endpoint has a 30 s cache rule
+  with no stale-while-revalidate, and between 25 and 15 minutes ago Roblox answered 300 of its direct calls with
+  429 (all hidden from callers by stale serves). The rule must recommend, for that endpoint only, a longer TTL
+  from the tuner (about 300 s), SWR, and an endpoint bucket override at or below 80% of the 90 per minute it
+  sustained without 429s. Every change is scoped to one endpoint, so the recommendation is safe_auto.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  adaptive_rate_enabled: 0
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 30, stale_ttl: 0, methods: "GET", origin: admin, created_at: "-30d"}
+    - {id: 2, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, stale_ttl: 120, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit:
+    egress: none
+    outcome: served_cache
+    reason: cache_hit
+    status: 200
+    source: cache
+    cache_state: "HIT"
+    latency_ms: {p50: 3, p95: 9, p99: 20}
+    bytes: {caller_in: 0, caller_out: 900}
+  miss:
+    egress: direct
+    outcome: served_upstream
+    reason: upstream_ok
+    status: 200
+    source: relay
+    cache_state: "MISS"
+    latency_ms: {p50: 140, p95: 380, p99: 750}
+    bytes: {caller_in: 0, caller_out: 900, upstream_in: 1000, upstream_out: 380}
+  votes:
+    endpoint_template: games.roblox.com/v1/games/votes
+  votes_samples:
+    samples: {key_space: votes, keys: 60, body_change_interval_s: 300}
+
+traffic:
+  # --- GET games.roblox.com/v1/games/votes ------------------------------------------------------------------
+  - {name: votes_hit_early, profile: [hit, votes], window: ["-60m", "-40m"], per_minute: 150}
+  - name: votes_miss_sustained
+    profile: [miss, votes, votes_samples]
+    window: ["-60m", "-40m"]
+    per_minute: 90            # 20 minutes at 90 calls per minute with zero 429s
+  - {name: votes_hit_quiet, profile: [hit, votes], window: ["-40m", "-25m"], per_minute: 80}
+  - {name: votes_miss_quiet, profile: [miss, votes, votes_samples], window: ["-40m", "-25m"], per_minute: 40}
+  - {name: votes_hit_episode, profile: [hit, votes], window: ["-25m", "-15m"], per_minute: 150}
+  - {name: votes_miss_episode, profile: [miss, votes, votes_samples], window: ["-25m", "-15m"], per_minute: 85}
+  - name: votes_stale_429
+    profile: [votes]
+    window: ["-25m", "-15m"]
+    per_minute: 30            # 115 calls per minute in the episode; Roblox answers 30 of them with 429
+    egress: direct
+    outcome: served_cache
+    reason: cache_stale_error
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    latency_ms: {p50: 90, p95: 200, p99: 350}
+    bytes: {caller_in: 0, caller_out: 900, upstream_in: 150, upstream_out: 380}
+    upstream_429: {egress: direct, retry_after_s: 20, ratelimit_headers: {x-ratelimit-remaining: "0"}}
+  - name: votes_stale_cooldown
+    profile: [votes]
+    window: ["-25m", "-15m"]
+    per_minute: 20            # served stale during the cooldown without contacting Roblox
+    egress: none
+    outcome: served_cache
+    reason: cache_stale_cooldown
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    latency_ms: {p50: 3, p95: 9, p99: 20}
+    bytes: {caller_in: 0, caller_out: 900}
+  - {name: votes_hit_tail, profile: [hit, votes], window: ["-15m", "0m"], per_minute: 80}
+  - {name: votes_miss_tail, profile: [miss, votes, votes_samples], window: ["-15m", "0m"], per_minute: 40}
+
+  # --- Other traffic, no 429s ---------------------------------------------------------------------------------
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], per_minute: 120}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], per_minute: 20}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 15}
+
+state:
+  buckets:
+    - bucket_key: "endpoint:games.roblox.com/v1/games/votes"
+      per_min: 120             # endpoint_bucket_default_per_min; no upstream_limits row
+      burst: 10
+      fill_pct: 6
+      history:
+        - {window: ["-60m", "-40m"], fill_pct_peak: 70, attempts: 1800, rejections: 0}
+        - {window: ["-40m", "-25m"], fill_pct_peak: 30, attempts: 600, rejections: 0}
+        - {window: ["-25m", "-15m"], fill_pct_peak: 100, attempts: 1150, rejections: 0}
+        - {window: ["-15m", "0m"], fill_pct_peak: 30, attempts: 600, rejections: 0}
+  cooldowns:
+    - {key: "endpoint:games.roblox.com/v1/games/votes:direct", until: "-14m", source: retry_after, set_at: "-15m", hits: 300}
+  settings_history:
+    - {at: "-30d", key: adaptive_rate_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Hold bucket rates steady during the cutover."}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games/votes}
+      requests: 11250
+      upstream_calls: 4150
+      roblox_429: 300
+      stale_after_failure: 300
+      by_reason: {cache_stale_cooldown: 200, cache_hit: 6900, upstream_ok: 3850}
+    - window: ["-60m", "0m"]
+      roblox_429: 300
+      refused: 0
+      failed: 0
+    - window: ["-60m", "-40m"]
+      where: {endpoint_template: games.roblox.com/v1/games/votes, egress: direct}
+      upstream_calls: 1800
+      roblox_429: 0
+
+  fires: true
+  others: forbid
+  recommendations:
+    - subject_contains: "games.roblox.com/v1/games/votes"
+      severity: any
+      confidence: high          # 300 >= insight_up_429_endpoint_high_confidence_n (50)
+      family: upstream
+      safe_auto: true           # every change is scoped to this one endpoint (11.2)
+      evidence:
+        metrics:
+          roblox_429: 300
+          share_of_all_roblox_429: 1
+      change_kinds_required: [rule_upsert, bucket_override]
+      change_kinds_forbidden: [setting, ban_add, filter_add, bypass_add, routing_rule, credential_allowlist_remove]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["games.roblox.com/v1/games/votes"]}}
+          current: {ttl: 30, stale_ttl: 0}
+          proposed:
+            ttl: {between: [240, 360]}    # the tuner's median change interval, 300 s
+            stale_ttl: {gte: 1}
+        - kind: bucket_override
+          bucket_key: "endpoint:games.roblox.com/v1/games/votes"
+          current: {per_min: 120}
+          proposed: {per_min: {between: [45, 72]}, burst: {lte: 10}}
+      changes_forbidden:
+        - kind: rule_upsert
+          match: {pattern: {matches_targets: ["games.roblox.com/v1/games", "thumbnails.roblox.com/v1/users/avatar-headshot"]}}
+        - kind: bucket_override
+          bucket_key: {ne: "endpoint:games.roblox.com/v1/games/votes"}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_429_endpoint_enabled: 0}
+    expect: {fires: false}
+  - case: thresholds_above_evidence
+    description: 300 429s is below a minimum of 400, and a 7.2% share is below 8.5%, so neither test passes.
+    settings: {insight_up_429_endpoint_min_429s: 400, insight_up_429_endpoint_share_pct: 8.5}
+    expect: {fires: false}
+  - case: count_at_minimum_is_enough
+    description: The count test is ">= min_429s"; 300 429s with the minimum at exactly 300 fires (share test out of reach).
+    settings: {insight_up_429_endpoint_min_429s: 300, insight_up_429_endpoint_share_pct: 50}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "games.roblox.com/v1/games/votes"}
+  - case: count_one_above_evidence
+    description: One more than the evidence (301) with the share test out of reach stays quiet.
+    settings: {insight_up_429_endpoint_min_429s: 301, insight_up_429_endpoint_share_pct: 50}
+    expect: {fires: false}
+  - case: share_test_alone
+    description: With the count test out of reach, 7.2% of calls answered 429 is above a 7% share threshold.
+    settings: {insight_up_429_endpoint_min_429s: 100000, insight_up_429_endpoint_share_pct: 7}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "games.roblox.com/v1/games/votes"}
+  - case: window_shorter_than_episode_age
+    description: The 429s ended 15 minutes ago; a 10 minute look-back window contains none of them.
+    settings: {insight_up_429_endpoint_window_min: 10}
+    expect: {fires: false}
+  - case: severity_override_warn
+    description: insight_up_429_endpoint_severity replaces the computed severity.
+    settings: {insight_up_429_endpoint_severity: warn}
+    expect:
+      fires: true
+      recommendations:
+        - {subject_contains: "games.roblox.com/v1/games/votes", severity: warn}

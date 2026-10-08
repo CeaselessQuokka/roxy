@@ -1,0 +1,44 @@
+format: roxy.health_fixture/1
+check: H-429-RATE
+case: warn
+name: 1_2_percent
+description: >
+  In the last 15 minutes Roblox answered 36 of 3,000 upstream calls with 429 (1.2%). 13.2 H-429-RATE: under 2%
+  (and not under 0.5%) gives warn, with Recommendations as the fix. Measured against all 5,000 requests the
+  rate would be 0.72%, still a warning.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  traffic_defaults:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    user_agent: "Roblox/Linux"
+  profiles:
+    hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: 4}
+    miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 150, p95: 400, p99: 700}}
+    stale_after_429:
+      egress: direct
+      outcome: served_cache
+      reason: cache_stale_error
+      status: 200
+      source: cache
+      cache_state: "STALE"
+      upstream_calls: 1
+      upstream_status: 429
+      error: true
+      latency_ms: 90
+      upstream_429: {egress: direct, retry_after_s: 30}
+  traffic:
+    - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], total: 2000}
+    - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], total: 1500}
+    - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-15m", "0m"], total: 1464}
+    - {name: catalog_429, profile: stale_after_429, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-15m", "0m"], total: 36}
+expect:
+  data_checks:
+    - window: ["-15m", "0m"]
+      requests: 5000
+      upstream_calls: 3000
+      roblox_429: 36
+  status: warn
+  value: {gte: 0.5, lt: 2}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)recommendation"}
+  credential_calls: {eq: 0}

@@ -1,0 +1,22 @@
+format: roxy.health_fixture/1
+check: H-CLOCK
+case: pass
+name: timedatectl_unreadable
+description: >
+  The Date header agrees with the fake clock, and `timedatectl show` cannot be read under the service sandbox.
+  13.2 reads NTP status only "if readable", so an unreadable timedatectl does not change the result: under 2 s
+  of skew gives pass.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    any_roblox:
+      status: 200
+      headers: {date: "now", content-type: "application/json"}
+      json: {data: []}
+      latency_ms: 60
+  timedatectl:
+    error: {returncode: 1, stderr: "Failed to connect to bus: Permission denied"}
+expect:
+  status: pass
+  value: {lt: 2}
+  credential_calls: {eq: 0}

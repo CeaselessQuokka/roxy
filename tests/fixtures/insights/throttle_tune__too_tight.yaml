@@ -1,0 +1,104 @@
+# THROTTLE-TUNE, "too tight" branch: "> 5% of distinct legitimate IPs (bot score < bot_score_legit_max) throttled per
+# day" (11.5; insight_throttle_tune_legit_throttled_pct = 5, bot_score_legit_max = 30).
+#
+#   clients                         bot score   distinct   throttled at least once today   share
+#   game servers 203.0.113.1-200    12          200        16 (203.0.113.1 to .16)          8.0%   legitimate
+#   scrapers 192.0.2.1-10           90          10         10                               n/a    not legitimate
+#
+# Over the 24 hours each game server sends about 200 requests (the pool is cycled evenly). After a game update at
+# 05:00 UTC, 16 of them burst for an hour and were each refused 30 times by the per-IP limit (10 per 50 s); the
+# scrapers are refused all day long but are not legitimate, so they do not count. 16 / 200 = 8% is over 5%.
+#
+# Expected change: loosen the per-IP limit (allowed_requests_per_minute up, or throttle_reset_duration down), staying
+# below the high-risk value of allowed_requests_per_minute (1000). A global setting: never safe_auto. 11.5 also says
+# "suggest place limits", which may come as an extra change.
+
+format: roxy.insight_fixture/1
+rule: THROTTLE-TUNE
+case: too_tight
+description: >
+  Over the last day 8% of the legitimate game servers (16 of 200, bot score 12) were throttled at least once, while
+  the throttled scrapers do not count. THROTTLE-TUNE must recommend a looser per-IP limit, not a stricter one, and not
+  as safe to auto-apply.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  game_servers:
+    clients: {cidr: "203.0.113.0/24", count: 200}
+    places: ["1000000051", "1000000052", "1000000053", "1000000054", "1000000055", "1000000056"]
+    user_agent: "Roblox/Linux"
+  bursting_servers:
+    clients: {cidr: "203.0.113.0/24", count: 16}
+    places: ["1000000051"]
+    user_agent: "Roblox/Linux"
+  scrapers: {clients: {cidr: "192.0.2.0/28", count: 10}, user_agent: "python-requests/2.31.0"}
+
+traffic:
+  - {name: game_hit, profile: [hit, game_servers], endpoint_template: games.roblox.com/v1/games, window: ["-24h", "0m"], total: 28800}
+  - {name: game_miss, profile: [miss, game_servers], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-24h", "0m"], total: 11520}
+  - {name: burst_throttled, profile: [throttled, bursting_servers], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-10h", "-9h"], per_minute: 8}
+  - {name: scraper_served, profile: [miss, scrapers], endpoint_template: "catalog.roblox.com/v1/search/items", window: ["-24h", "0m"], total: 2880}
+  - {name: scraper_throttled, profile: [throttled, scrapers], endpoint_template: "catalog.roblox.com/v1/search/items", window: ["-24h", "0m"], total: 14400}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/24", count: 200}, bot_score: 12}
+    - {clients: {cidr: "192.0.2.0/28", count: 10}, bot_score: 90}
+
+expect:
+  data_checks:
+    - {window: ["-24h", "0m"], requests: 58080, refused: 14880}
+    - {window: ["-10h", "-9h"], where: {client_ip: "203.0.113.1"}, refused: 30}
+    - {window: ["-10h", "-9h"], where: {client_ip: "203.0.113.16"}, refused: 30}
+    - {window: ["-24h", "0m"], where: {client_ip: "203.0.113.17"}, refused: 0}
+    - {window: ["-24h", "0m"], where: {client_ip: "203.0.113.200"}, requests: 201, refused: 0}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: THROTTLE-TUNE
+      severity: any
+      family: abuse
+      confidence: medium
+      safe_auto: false
+      changes_required:
+        - any_of:
+            - {kind: setting, key: allowed_requests_per_minute, current: 10, proposed: {gt: 10, lt: 1000}}
+            - {kind: setting, key: throttle_reset_duration, current: 50, proposed: {lt: 50}}
+      changes_forbidden:
+        - {kind: setting, key: allowed_requests_per_minute, proposed: {lt: 10}}
+        - {kind: setting, key: allowed_requests_per_minute, proposed: {gte: 1000}}
+        - {kind: setting, key: throttle_reset_duration, proposed: {gt: 50}}
+        - kind: setting
+          key: {in: [flood_limit_per_minute, global_bucket_per_min, direct_bucket_per_min, endpoint_bucket_default_per_min, host_bucket_default_per_min]}
+      change_kinds_forbidden: [ban_add, bypass_add, filter_add, bucket_override]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_throttle_tune_enabled: 0}
+    expect: {fires: false}
+  - case: legit_throttled_pct_raised
+    description: At 10%, 8% of legitimate addresses throttled is acceptable; nothing here is "too loose" either.
+    settings: {insight_throttle_tune_legit_throttled_pct: 10}
+    expect: {fires: false}
+  - case: legit_band_below_scores
+    description: With bot_score_legit_max at 10 no client (scores 12 and 90) counts as legitimate, so no legitimate share exists.
+    settings: {bot_score_legit_max: 10}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_throttle_tune_severity replaces the computed severity.
+    settings: {insight_throttle_tune_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: critical}

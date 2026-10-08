@@ -1,0 +1,100 @@
+# UP-QUEUE-SAT through long queue waits, with 429-free headroom (format: README.md in this directory).
+#
+# 11.5: "Queue drops > 0.5% or p95 queue wait > 2 s"; change: "Raise TTLs on top miss endpoints; raise bucket
+# only if 429-free headroom exists". Nothing is dropped here, but requests for the headshot endpoint wait long
+# for a slot: the rollup histogram p95 queue wait of requests that went upstream is about 2.9 s (about 2.8 s if
+# cache hits, which never queue, were counted in). Over the last 24 hours there were no Roblox 429s at all and
+# the endpoint bucket was full and turning requests away, so a raise of THAT bucket is allowed (not required);
+# a raise of any other bucket or of a global default is not. A longer TTL on the headshot endpoint is required.
+#
+#   per minute, last 60 minutes     requests   queue wait
+#   headshot misses                 110        p50 ~1.2 s, p95 ~2.9 s
+#   games misses                    20         none
+#   cache hits                      60
+
+format: roxy.insight_fixture/1
+rule: UP-QUEUE-SAT
+case: long_waits
+description: >
+  Requests for avatar headshots wait about 3 s at p95 for an upstream slot, with no drops and no Roblox 429s in
+  the last day. The rule must recommend a longer TTL for the headshot endpoint; it may also raise that endpoint's
+  bucket (there is 429-free headroom), but no other bucket and no global default.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 120, stale_ttl: 60, methods: "GET", origin: admin, created_at: "-30d"}
+    - {id: 2, pattern: "games.roblox.com/v1/games", type: glob, ttl: 60, stale_ttl: 30, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS"}
+  games: {endpoint_template: games.roblox.com/v1/games}
+
+traffic:
+  - {name: headshot_hit, profile: hit, window: ["-60m", "0m"], per_minute: 40}
+  - {name: games_hit, profile: [hit, games], window: ["-60m", "0m"], per_minute: 20}
+  - name: headshot_miss_queued
+    profile: miss
+    window: ["-60m", "0m"]
+    per_minute: 110
+    queue_wait_ms: {p50: 1200, p90: 2400, p95: 2800, p99: 3600}
+    latency_ms: {p50: 1400, p90: 2600, p95: 3000, p99: 3850}
+  - {name: games_miss, profile: [miss, games], window: ["-60m", "0m"], per_minute: 20, latency_ms: {p50: 150, p95: 400, p99: 800}}
+
+state:
+  buckets:
+    - bucket_key: "endpoint:thumbnails.roblox.com/v1/users/avatar-headshot"
+      per_min: 120
+      burst: 10
+      fill_pct: 100
+      history:
+        - {window: ["-24h", "-1h"], fill_pct_peak: 100, attempts: 158700, rejections: 4800}
+        - {window: ["-60m", "0m"], fill_pct_peak: 100, attempts: 6600, rejections: 0}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      upstream_calls: 7800
+      by_reason: {upstream_ok: 7800, cache_hit: 3600}
+    - window: ["-24h", "0m"]
+      roblox_429: 0
+
+  fires: true
+  others: forbid
+  recommendations:
+    - confidence: medium
+      family: upstream
+      change_kinds_required: [rule_upsert]
+      change_kinds_forbidden: [routing_rule, ban_add, credential_allowlist_remove]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["thumbnails.roblox.com/v1/users/avatar-headshot"]}}
+          current: {ttl: 120}
+          proposed: {ttl: {gt: 120}}
+      changes_forbidden:
+        - kind: bucket_override
+          bucket_key: {ne: "endpoint:thumbnails.roblox.com/v1/users/avatar-headshot"}
+        - kind: setting
+          key:
+            in: [endpoint_bucket_default_per_min, endpoint_bucket_default_burst, host_bucket_default_per_min,
+                 global_bucket_per_min, direct_bucket_per_min, queue_max_length, queue_wait_interactive_ms,
+                 cache_ttl_seconds]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_queue_sat_enabled: 0}
+    expect: {fires: false}
+  - case: p95_wait_5000
+    description: The p95 queue wait (about 2.9 s) is under a 5 s threshold, and nothing was dropped.
+    settings: {insight_up_queue_sat_p95_wait_ms: 5000}
+    expect: {fires: false}

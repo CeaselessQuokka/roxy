@@ -1,0 +1,74 @@
+# UP-CSRF-LOOP just under its threshold (format: README.md in this directory).
+#
+# 11.5: "CSRF retries > 20% of write requests (POST, PATCH, PUT, DELETE) over 30 min". Here Roblox rotates its
+# token often enough that 18% of writes need a handshake, on both write templates alike, and every retry succeeds
+# (no second 403):
+#
+#   template (POST)                                  writes   CSRF retries   share
+#   presence.roblox.com/v1/presence/users            600      108            18%
+#   catalog.roblox.com/v1/catalog/items/details      400      72             18%
+#   all writes                                       1,000    180            18%
+#
+# The same share per template and overall, so it does not matter which one the rule measures. The `retry_pct_15`
+# variant must fire.
+
+format: roxy.insight_fixture/1
+rule: UP-CSRF-LOOP
+case: just_under
+description: >
+  18% of anonymous writes need a CSRF handshake, the retry always succeeds, and no request gets a second 403.
+  That is under the 20% threshold, so the rule stays quiet; a 15% threshold makes it fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  egress: direct
+  outcome: served_upstream
+  reason: upstream_ok
+  status: 200
+  source: relay
+  latency_ms: {p50: 150, p95: 400, p99: 800}
+
+profiles:
+  pres: {endpoint_template: presence.roblox.com/v1/presence/users, method: POST, cache_state: "OFF"}
+  details: {endpoint_template: catalog.roblox.com/v1/catalog/items/details, method: POST, cache_state: "OFF"}
+  csrf: {upstream_calls: 2, latency_ms: {p50: 320, p95: 750, p99: 1300}}
+
+traffic:
+  - {name: pres_ok, profile: pres, window: ["-30m", "0m"], total: 492}
+  - {name: pres_csrf, profile: [pres, csrf], window: ["-30m", "0m"], total: 108}
+  - {name: details_ok, profile: details, window: ["-30m", "0m"], total: 328}
+  - {name: details_csrf, profile: [details, csrf], window: ["-30m", "0m"], total: 72}
+  - {name: games_get, endpoint_template: games.roblox.com/v1/games, cache_state: "MISS", window: ["-30m", "0m"], per_minute: 40}
+
+events:
+  upstream_attempts:
+    - {window: ["-30m", "0m"], total: 108, endpoint_template: presence.roblox.com/v1/presence/users, egress: direct, attempt: 1, status: 403, kind: first}
+    - {window: ["-30m", "0m"], total: 108, endpoint_template: presence.roblox.com/v1/presence/users, egress: direct, attempt: 1, status: 200, kind: csrf_retry}
+    - {window: ["-30m", "0m"], total: 72, endpoint_template: catalog.roblox.com/v1/catalog/items/details, egress: direct, attempt: 1, status: 403, kind: first}
+    - {window: ["-30m", "0m"], total: 72, endpoint_template: catalog.roblox.com/v1/catalog/items/details, egress: direct, attempt: 1, status: 200, kind: csrf_retry}
+
+expect:
+  data_checks:
+    - window: ["-30m", "0m"]
+      where: {method: POST}
+      requests: 1000
+      upstream_calls: 1180
+      by_reason: {upstream_ok: 1000}
+
+  fires: false
+
+variants:
+  - case: retry_pct_15
+    description: 18% of writes needing a CSRF retry is above a 15% threshold.
+    settings: {insight_up_csrf_loop_retry_pct: 15}
+    expect:
+      fires: true
+      recommendations:
+        - changes_required:
+            - {kind: setting, key: csrf_token_cache_s, current: 600, proposed: {lt: 600}}
+          changes_forbidden:
+            - {kind: rule_upsert, table: rules_endpoint_block}

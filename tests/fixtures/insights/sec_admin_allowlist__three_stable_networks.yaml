@@ -1,0 +1,102 @@
+# SEC-ADMIN-ALLOWLIST: "all logins in 30 days from <= 3 networks and allowlist off" (11.5;
+# insight_sec_admin_allowlist_max_networks = 3, insight_sec_admin_allowlist_days = 30; admin_allowlist_enabled = 0).
+#
+# Admin logins are `login` events (`state.admin_logins`, stored with security_events.login_detail). In the last 30
+# days every SUCCESSFUL login came from one of three networks:
+#
+#   network                    addresses                       successful logins   where
+#   198.51.100.0/24            198.51.100.10, 198.51.100.12    38                  home
+#   203.0.113.0/24             203.0.113.40                    5                   office
+#   192.0.2.0/24               192.0.2.60, 192.0.2.61          4                   phone hotspot
+#
+# Also in the data, and NOT the admin's networks:
+#   - 4 failed password attempts from 2001:db8:bad:1::7 and 2001:db8:bad:2::9 (someone guessing); failed attempts
+#     are not "logins", and allowlisting the guesser's network would defeat the purpose
+#   - one successful login 40 days ago from 2001:db8:77::5, outside the 30 day window (the days_raised variant uses it)
+#
+# "Network" is not defined by 11.5. The fixture keeps every reading consistent: the three IPv4 networks are distinct
+# /24s and distinct /16s, and the two IPv6 addresses are only in the failed attempts or outside the window.
+#
+# Expected change: turn admin_allowlist_enabled on and add an `allow_admin` access_list entry covering each of the
+# three networks (README "Extensions": access_list rows are matched on `kind` and `cidr`). A security setting: never
+# safe_auto. 11.5 says confidence Low.
+
+format: roxy.insight_fixture/1
+rule: SEC-ADMIN-ALLOWLIST
+case: three_stable_networks
+description: >
+  For 30 days every successful admin login came from one of three networks while the admin allowlist is off.
+  SEC-ADMIN-ALLOWLIST must recommend enabling it with entries for those three networks only, never for the address
+  that failed to log in or for a CIDR wider than /16.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  admin_logins:
+    - {window: ["-29d", "-1d"], every: "1d", ip: "198.51.100.10", username: owner, successful: true, method: totp}
+    - {window: ["-29d", "0m"], every: "3d", ip: "198.51.100.12", username: owner, successful: true, method: totp}
+    - {window: ["-28d", "-3d"], every: "5d", ip: "203.0.113.40", username: owner, successful: true, method: passkey}
+    - {at: "-20d", ip: "192.0.2.60", username: owner, successful: true, method: totp}
+    - {at: "-12d", ip: "192.0.2.60", username: owner, successful: true, method: totp}
+    - {at: "-4d", ip: "192.0.2.61", username: owner, successful: true, method: totp}
+    - {at: "-2h", ip: "192.0.2.61", username: owner, successful: true, method: trusted_device}
+    - {at: "-10d", ip: "2001:db8:bad:1::7", username: admin, successful: false, method: password}
+    - {at: "-10d", ip: "2001:db8:bad:1::7", username: admin, successful: false, method: password}
+    - {at: "-6d", ip: "2001:db8:bad:2::9", username: root, successful: false, method: password}
+    - {at: "-6d", ip: "2001:db8:bad:2::9", username: owner, successful: false, method: password}
+    - {at: "-40d", ip: "2001:db8:77::5", username: owner, successful: true, method: totp}
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SEC-ADMIN-ALLOWLIST
+      severity: any
+      family: security
+      confidence: low
+      safe_auto: false
+      changes_required:
+        - {kind: setting, key: admin_allowlist_enabled, current: 0, proposed: 1}
+        - any_of:
+            - {kind: rule_upsert, table: access_list, proposed: {kind: allow_admin, cidr: {regex: '^198\.51\.100\.'}}}
+            - {kind: filter_add, table: access_list, proposed: {kind: allow_admin, cidr: {regex: '^198\.51\.100\.'}}}
+        - any_of:
+            - {kind: rule_upsert, table: access_list, proposed: {kind: allow_admin, cidr: {regex: '^203\.0\.113\.'}}}
+            - {kind: filter_add, table: access_list, proposed: {kind: allow_admin, cidr: {regex: '^203\.0\.113\.'}}}
+        - any_of:
+            - {kind: rule_upsert, table: access_list, proposed: {kind: allow_admin, cidr: {regex: '^192\.0\.2\.'}}}
+            - {kind: filter_add, table: access_list, proposed: {kind: allow_admin, cidr: {regex: '^192\.0\.2\.'}}}
+      changes_forbidden:
+        - any_of:
+            - {kind: rule_upsert, table: access_list, proposed: {cidr: {regex: '(?i)^2001:db8:(bad|77):'}}}
+            - {kind: filter_add, table: access_list, proposed: {cidr: {regex: '(?i)^2001:db8:(bad|77):'}}}
+            - {kind: rule_upsert, table: access_list, proposed: {cidr: {regex: '^[0-9.]+/([0-9]|1[0-5])$'}}}
+            - {kind: filter_add, table: access_list, proposed: {cidr: {regex: '^[0-9.]+/([0-9]|1[0-5])$'}}}
+            - {kind: rule_upsert, table: access_list, proposed: {kind: {in: [bypass, deny]}}}
+            - {kind: filter_add, table: access_list, proposed: {kind: {in: [bypass, deny]}}}
+      change_kinds_forbidden: [bypass_add, ban_add, ban_remove, rule_delete]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sec_admin_allowlist_enabled: 0}
+    expect: {fires: false}
+  - case: max_networks_lowered
+    description: With at most 2 networks allowed, three networks are too many to recommend an allowlist.
+    settings: {insight_sec_admin_allowlist_max_networks: 2}
+    expect: {fires: false}
+  - case: days_raised
+    description: Over 45 days the login from 2001:db8:77::5 (40 days ago) adds a fourth network.
+    settings: {insight_sec_admin_allowlist_days: 45}
+    expect: {fires: false}
+  - case: allowlist_already_on
+    description: The rule is only for an allowlist that is off.
+    settings: {admin_allowlist_enabled: 1}
+    expect: {fires: false}
+  - case: severity_override_warn
+    description: insight_sec_admin_allowlist_severity replaces the computed severity.
+    settings: {insight_sec_admin_allowlist_severity: warn}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: warn}

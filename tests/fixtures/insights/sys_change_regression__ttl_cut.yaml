@@ -1,0 +1,106 @@
+# SYS-CHANGE-REGRESSION: "within 30 min of a change, error, 429 or p95 latency worse by > 25% vs the prior 2 h
+# baseline" (11.5; insight_sys_change_regression_worse_pct = 25, _watch_min = 30, _baseline_h = 2).
+#
+# 20 minutes ago (14:40 UTC) the admin cut the default cache TTL from 120 s to 30 s. More requests now miss the
+# cache, so more reach Roblox, and Roblox rate-limits more of them:
+#
+#   metric                          baseline (12:40 to 14:40)   since the change (14:40 to 15:00)   change
+#   Roblox 429s per upstream call   24 / 4,824 = 0.50%          22 / 1,122 = 1.96%                  +294%
+#   Roblox 429s per minute          0.2                         1.1                                 +450%
+#   caller errors per request       24 / 12,024 = 0.20%         22 / 2,022 = 1.09%                  +445%
+#   p95 latency                     about 340 ms                about 360 ms                        about +5%
+#
+# Every reading of "worse" (rate or count, 429s or errors) is far over 25% and under 500%, which the
+# worse_pct_raised variant uses. The change is recorded in `state.settings_history` (which also writes the audit row
+# and the chart annotation).
+#
+# 11.5's change: "revert the change (one click)": exactly cache_ttl_seconds 30 -> 120. A global setting: never
+# safe_auto.
+
+format: roxy.insight_fixture/1
+rule: SYS-CHANGE-REGRESSION
+case: ttl_cut
+description: >
+  Twenty minutes after the default cache TTL was cut from 120 s to 30 s, the Roblox 429 rate and the caller error rate
+  are four to five times their 2 hour baseline. SYS-CHANGE-REGRESSION must recommend reverting exactly that change.
+now: "2026-10-07T15:00:00Z"
+
+settings:
+  cache_ttl_seconds: 30
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+  endpoint_template: games.roblox.com/v1/games
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+  user_agent: "Roblox/Linux"
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  roblox_429:
+    egress: direct
+    outcome: failed
+    reason: upstream_cooldown       # plan 7.13 "Roblox 429 or cooldown with no stale": the caller gets 429
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    latency_ms: {p50: 90, p95: 220, p99: 400}
+    bytes: {caller_in: 0, caller_out: 75, upstream_in: 150, upstream_out: 420}
+    upstream_429: {egress: direct, retry_after_s: 30}
+
+traffic:
+  - {name: before_hit, profile: hit, window: ["-140m", "-20m"], per_minute: 60}
+  - {name: before_miss, profile: miss, window: ["-140m", "-20m"], per_minute: 40}
+  - {name: before_429, profile: roblox_429, window: ["-140m", "-20m"], total: 24}
+  - {name: after_hit, profile: hit, window: ["-20m", "0m"], per_minute: 45}
+  - {name: after_miss, profile: miss, window: ["-20m", "0m"], per_minute: 55}
+  - {name: after_429, profile: roblox_429, window: ["-20m", "0m"], total: 22}
+
+state:
+  settings_history:
+    - {at: "-20m", key: cache_ttl_seconds, old: 120, new: 30, source: admin, changed_by: admin, reason: "Fresher player counts on the lobby board."}
+
+expect:
+  data_checks:
+    - {window: ["-140m", "-20m"], requests: 12024, upstream_calls: 4824, roblox_429: 24, errors: 24}
+    - {window: ["-20m", "0m"], requests: 2022, upstream_calls: 1122, roblox_429: 22, errors: 22}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-CHANGE-REGRESSION
+      severity: any
+      family: system
+      confidence: medium
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: setting, key: cache_ttl_seconds, current: 30, proposed: 120}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_change_regression_enabled: 0}
+    expect: {fires: false}
+  - case: worse_pct_raised
+    description: At 500% no metric is worse enough (the largest change is +450%).
+    settings: {insight_sys_change_regression_worse_pct: 500}
+    expect: {fires: false}
+  - case: watch_window_shortened
+    description: With a 15 minute watch window the change (20 minutes ago) is no longer being watched.
+    settings: {insight_sys_change_regression_watch_min: 15}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_sys_change_regression_severity replaces the computed severity.
+    settings: {insight_sys_change_regression_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: critical}

@@ -1,0 +1,138 @@
+# FILTER-ADD: "same IP refused > 1000 times per hour for 3 h" (11.5; insight_filter_add_refusals_per_hour = 1000,
+# insight_filter_add_hours = 3).
+#
+#   client         refused per hour, by hour (12:00, 13:00, 14:00 UTC)   expected
+#   192.0.2.150    1,320   1,320   1,320                                   recommendation (all three hours over 1000)
+#   192.0.2.151    0       1,440   1,440                                   none (only two hours)
+#   192.0.2.152    900     900     900                                     none (under 1000 every hour)
+#   40 game servers, never refused                                         none
+#
+# Reading used: more than 1,000 refusals in EACH of the last 3 hours. 192.0.2.151 also stays out if a rule averages
+# over the 3 hours (960 per hour), and 192.0.2.150 stays out of a 4 hour test either way (990 per hour on average
+# over 4 hours, and no refusals at all before 12:00). The windows sit on whole hours (now is 15:00), and each client's rate is constant
+# inside an hour, so "per hour" means the same with clock hours or rolling 60 minute windows. Each client also gets its 12
+# requests per minute served (the per-IP limit of 10 per 50 s); the rest of its requests are refused with
+# `throttle`.
+#
+# 11.5's change is "add temporary ban or tarpit throttle category": a ban must be temporary (expires_at set) and on
+# this address only; a tarpit category change must be the throttle category (tarpit_on_throttle, off by default).
+
+format: roxy.insight_fixture/1
+rule: FILTER-ADD
+case: persistent_refused_client
+description: >
+  One curl client has been refused 1,320 times in each of the last three hours. FILTER-ADD must recommend a temporary
+  ban on that address or the throttle tarpit category, and nothing for a client refused for only two hours or one
+  refused 900 times an hour.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+  c150: {client_ip: "192.0.2.150", user_agent: "curl/8.5.0", endpoint_template: "users.roblox.com/v1/users/{userId}"}
+  c151: {client_ip: "192.0.2.151", user_agent: "curl/8.5.0", endpoint_template: "users.roblox.com/v1/users/{userId}"}
+  c152: {client_ip: "192.0.2.152", user_agent: "Go-http-client/1.1", endpoint_template: "catalog.roblox.com/v1/search/items"}
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-180m", "0m"], per_minute: 30}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-180m", "0m"], per_minute: 8}
+  - {name: c150_served, profile: [miss, c150], window: ["-180m", "0m"], per_minute: 12}
+  - {name: c150_throttled, profile: [throttled, c150], window: ["-180m", "0m"], per_minute: 22}
+  - {name: c151_served, profile: [miss, c151], window: ["-120m", "0m"], per_minute: 12}
+  - {name: c151_throttled, profile: [throttled, c151], window: ["-120m", "0m"], per_minute: 24}
+  - {name: c152_served, profile: [miss, c152], window: ["-180m", "0m"], per_minute: 12}
+  - {name: c152_throttled, profile: [throttled, c152], window: ["-180m", "0m"], per_minute: 15}
+
+state:
+  client_scores:
+    - {ip: "192.0.2.150", bot_score: 71}
+    - {ip: "192.0.2.151", bot_score: 71}
+    - {ip: "192.0.2.152", bot_score: 66}
+    - {clients: {cidr: "203.0.113.0/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - {window: ["-180m", "0m"], requests: 22140, refused: 9540}
+    - {window: ["-180m", "-120m"], where: {client_ip: "192.0.2.150"}, refused: 1320}
+    - {window: ["-120m", "-60m"], where: {client_ip: "192.0.2.150"}, refused: 1320}
+    - {window: ["-60m", "0m"], where: {client_ip: "192.0.2.150"}, refused: 1320}
+    - {window: ["-180m", "-120m"], where: {client_ip: "192.0.2.151"}, requests: 0}
+    - {window: ["-120m", "0m"], where: {client_ip: "192.0.2.151"}, refused: 2880}
+    - {window: ["-60m", "0m"], where: {client_ip: "192.0.2.152"}, refused: 900}
+    - {window: ["-180m", "0m"], where: {client_ip: "203.0.113.1"}, refused: 0}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: FILTER-ADD
+      subject_contains: "192.0.2.150"
+      severity: any
+      family: filter
+      confidence: medium
+      changes_required:
+        - any_of:
+            - {kind: ban_add, proposed: {subject_type: ip, subject: "192.0.2.150", expires_at: {present: true}}}
+            - {kind: tarpit_category, category: throttle, proposed: 1}
+      changes_forbidden:
+        - {kind: ban_add, proposed: {subject: {in: ["192.0.2.151", "192.0.2.152"]}}}
+        - {kind: ban_add, proposed: {subject: {regex: '^203\.0\.113\.'}}}
+        - {kind: ban_add, proposed: {expires_at: null}}          # "temporary ban": never permanent
+        - {kind: ban_add, proposed: {subject_type: {in: [cidr, place, ua_hash]}}}
+        - kind: tarpit_category
+          category: {in: [header_rule, probe, throttle_all, endpoint_rule, blocked_endpoint, auth_attempt, user_agent_rule, ban, spam, upstream_cooldown_retry]}
+        - kind: setting
+          key: {in: [allowed_requests_per_minute, throttle_reset_duration, flood_limit_per_minute, throttle_window_mode]}
+      change_kinds_forbidden: [bypass_add, bypass_remove, ban_remove, bucket_override, rule_delete, filter_remove, host_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_filter_add_enabled: 0}
+    expect: {fires: false}
+  - case: refusals_threshold_raised
+    description: At 1,400 refusals per hour no client qualifies (192.0.2.150 has 1,320; 192.0.2.151 has 1,440 but for two hours only).
+    settings: {insight_filter_add_refusals_per_hour: 1400}
+    expect: {fires: false}
+  - case: hours_raised
+    description: Four hours are required and the data holds only three hours of refusals.
+    settings: {insight_filter_add_hours: 4}
+    expect: {fires: false}
+  - case: hours_lowered
+    description: With two hours required, 192.0.2.151 (two hours at 1,440) qualifies as well.
+    settings: {insight_filter_add_hours: 2}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "192.0.2.150", severity: any}
+        - {subject_contains: "192.0.2.151", severity: any}
+  - case: refusals_threshold_lowered
+    description: >
+      At 800 refusals per hour, 192.0.2.152 (900 per hour for three hours) qualifies as well. `others` is allowed
+      here only because a rule that averages over the 3 hours would also include 192.0.2.151 (960 per hour on
+      average); the base case already proves the legitimate clients stay out.
+    settings: {insight_filter_add_refusals_per_hour: 800}
+    expect:
+      fires: true
+      others: allow
+      recommendations:
+        - {subject_contains: "192.0.2.150", severity: any}
+        - {subject_contains: "192.0.2.152", severity: any}
+  - case: severity_override_warn
+    description: insight_filter_add_severity replaces the computed severity.
+    settings: {insight_filter_add_severity: warn}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "192.0.2.150", severity: warn}

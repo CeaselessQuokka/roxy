@@ -1,0 +1,197 @@
+# FILTER-REMOVE: "rule with zero hits for 30 days, bypass entry unused 7 days or never-expiring, ban whose subject is a
+# top legitimate place" (11.5; insight_filter_remove_idle_rule_days = 30, insight_filter_remove_idle_bypass_days = 7).
+#
+# Rule and bypass hit history has no table in schema version 1, so it travels as `x_last_hit_at` on each row (the
+# provider seam; null means never hit since the row was created). Bans have real `hits` and `last_hit_at` columns.
+#
+#   object                                              age     last hit   expected
+#   UA rule a1b2c3d4 "OldScraperBot"                    120 d   45 d ago   remove (idle 45 > 30 days)
+#   UA rule a1b2c3d5 "python-requests"                  100 d   1 min ago  keep (refusing a scraper right now)
+#   header rule x-scanner / sqlmap                      90 d    2 d ago    keep
+#   endpoint block economy.roblox.com/v1/purchases/*    200 d   never      remove (no hit in 200 days)
+#   endpoint block trades.roblox.com/v1/trades/*        10 d    never      keep (too young to be idle for 30 days)
+#   bypass 198.51.100.20/32 (expires in 20 d)           12 d    9 d ago    remove or shorten (unused 9 > 7 days)
+#   bypass 198.51.100.21/32 (expires in 20 d)           12 d    1 h ago    keep
+#   ban place 1000000101 (permanent, admin, 6 h old)    6 h     1 min ago  remove: the top legitimate place
+#   ban place 1000000199 (permanent, admin)             30 d    3 d ago    keep (no legitimate traffic)
+#   ban ip 192.0.2.180 (temporary)                      5 d     1 min ago  keep
+#
+# Place 1000000101 is the busiest experience: for the 18 hours before the ban its 25 game servers (Roblox UA, bot
+# score 7) sent 21,600 requests, all served, five times any other place; since the ban 3,240 of its requests were
+# refused. The 11.5 row's remedy for every object is "remove or set expiry"; one recommendation per object.
+#
+# Change shapes (README "Extensions"): rows of rules_user_agent are matched by `id`, endpoint blocks by
+# `{pattern, type}`, access_list rows by `{kind, cidr}`, bans by `{subject_type, subject}`.
+
+format: roxy.insight_fixture/1
+rule: FILTER-REMOVE
+case: stale_filters
+description: >
+  A UA rule idle for 45 days, an endpoint block never hit in 200 days, a bypass entry unused for 9 days and a
+  permanent ban on the busiest legitimate place, next to filters that are young or in active use. FILTER-REMOVE must
+  raise exactly four recommendations (one per stale or harmful object), each removing it (or, for the bypass entry,
+  setting an expiry), and leave everything else alone.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  rules_user_agent:
+    - {id: "a1b2c3d4", needle: "OldScraperBot", mode: contains, kind: burst, scope: ip, limit: 1, period: 3600, position: 1, enabled: 1, created_at: "-120d", created_by: admin, x_last_hit_at: "-45d"}
+    - {id: "a1b2c3d5", needle: "python-requests", mode: contains, kind: burst, scope: ip, limit: 5, period: 60, position: 2, enabled: 1, created_at: "-100d", created_by: admin, x_last_hit_at: "-1m"}
+  rules_header:
+    - {id: 1, canonical_key: "x-scanner|value|contains|sqlmap", scope: value, mode: contains, needle: "sqlmap", header: "x-scanner", enabled: 1, created_at: "-90d", created_by: admin, x_last_hit_at: "-2d"}
+  rules_endpoint_block:
+    - {id: 1, pattern: "economy.roblox.com/v1/purchases/*", type: glob, message: "Purchases are not available through Roxy.", enabled: 1, created_at: "-200d", created_by: admin, x_last_hit_at: null}
+    - {id: 2, pattern: "trades.roblox.com/v1/trades/*", type: glob, message: "Trades are not available through Roxy.", enabled: 1, created_at: "-10d", created_by: admin, x_last_hit_at: null}
+  access_list:
+    - {id: 1, kind: bypass, cidr: "198.51.100.20/32", note: "Load test box", expires_at: "+20d", created_by: admin, created_at: "-12d", x_last_hit_at: "-9d"}
+    - {id: 2, kind: bypass, cidr: "198.51.100.21/32", note: "Uptime monitor", expires_at: "+20d", created_by: admin, created_at: "-12d", x_last_hit_at: "-1h"}
+  bans:
+    - {id: 1, subject_type: place, subject: "1000000101", reason_code: manual, reason_text: "Suspected scraper using this place id.", created_at: "-6h", expires_at: null, created_by: admin, hits: 3240, last_hit_at: "-1m"}
+    - {id: 2, subject_type: place, subject: "1000000199", reason_code: manual, reason_text: "Spoofed place id seen in probes.", created_at: "-30d", expires_at: null, created_by: admin, hits: 12, last_hit_at: "-3d"}
+    - {id: 3, subject_type: ip, subject: "192.0.2.180", reason_code: manual, reason_text: "Scraper.", created_at: "-5d", expires_at: "+2d", created_by: admin, hits: 900, last_hit_at: "-1m"}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  banned: {egress: none, outcome: refused, reason: banned, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  ua_refused: {egress: none, outcome: refused, reason: user_agent_rule, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  place_101_servers:
+    clients: {cidr: "203.0.113.0/27", count: 25}
+    place_id: "1000000101"
+    user_agent: "Roblox/Linux"
+  other_places:
+    clients: {cidr: "203.0.113.64/27", count: 25}
+    places: ["1000000102", "1000000103", "1000000104", "1000000105", "1000000106"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: place_101_hit, profile: [hit, place_101_servers], endpoint_template: games.roblox.com/v1/games, window: ["-24h", "-6h"], per_minute: 15}
+  - {name: place_101_miss, profile: [miss, place_101_servers], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-24h", "-6h"], per_minute: 5}
+  - {name: place_101_banned, profile: [banned, place_101_servers], endpoint_template: games.roblox.com/v1/games, window: ["-6h", "0m"], per_minute: 9}
+  - {name: other_hit, profile: [hit, other_places], endpoint_template: games.roblox.com/v1/games, window: ["-24h", "0m"], per_minute: 7}
+  - {name: other_miss, profile: [miss, other_places], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-24h", "0m"], per_minute: 3}
+  - {name: banned_scraper, profile: banned, client_ip: "192.0.2.180", user_agent: "Go-http-client/1.1", endpoint_template: "catalog.roblox.com/v1/search/items", window: ["-60m", "0m"], per_minute: 2}
+  - {name: python_scraper, profile: ua_refused, client_ip: "192.0.2.181", user_agent: "python-requests/2.31.0", endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-30m", "0m"], per_minute: 2}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/27", count: 25}, bot_score: 7}
+    - {clients: {cidr: "203.0.113.64/27", count: 25}, bot_score: 9}
+    - {ip: "192.0.2.180", bot_score: 90}
+    - {ip: "192.0.2.181", bot_score: 88}
+
+expect:
+  data_checks:
+    - {window: ["-24h", "-6h"], where: {place_id: "1000000101"}, requests: 21600, refused: 0}
+    - {window: ["-6h", "0m"], where: {place_id: "1000000101"}, refused: 3240, by_reason: {banned: 3240}}
+    - {window: ["-24h", "0m"], where: {place_id: "1000000102"}, requests: 2880}
+    - {window: ["-24h", "0m"], requests: 39420}
+
+  fires: true
+  others: forbid
+  recommendations:
+    # 1. The idle UA rule.
+    - rule_id: FILTER-REMOVE
+      severity: any
+      family: filter
+      confidence: high
+      exact_changes: true
+      changes_required:
+        - any_of:
+            - {kind: rule_delete, table: rules_user_agent, match: {id: "a1b2c3d4"}}
+            - {kind: filter_remove, table: rules_user_agent, match: {id: "a1b2c3d4"}}
+    # 2. The endpoint block never hit in 200 days.
+    - rule_id: FILTER-REMOVE
+      severity: any
+      confidence: high
+      exact_changes: true
+      changes_required:
+        - any_of:
+            - {kind: rule_delete, table: rules_endpoint_block, match: {pattern: "economy.roblox.com/v1/purchases/*", type: glob}}
+            - {kind: filter_remove, table: rules_endpoint_block, match: {pattern: "economy.roblox.com/v1/purchases/*", type: glob}}
+    # 3. The bypass entry unused for 9 days: remove it, or set an (earlier) expiry.
+    - rule_id: FILTER-REMOVE
+      subject_contains: "198.51.100.20"
+      severity: any
+      confidence: high
+      exact_changes: true
+      changes_required:
+        - any_of:
+            - {kind: bypass_remove, match: {kind: bypass, cidr: "198.51.100.20/32"}}
+            - {kind: rule_delete, table: access_list, match: {kind: bypass, cidr: "198.51.100.20/32"}}
+            - {kind: rule_upsert, table: access_list, match: {kind: bypass, cidr: "198.51.100.20/32"}, proposed: {expires_at: {present: true}}}
+            - {kind: bypass_add, proposed: {kind: bypass, cidr: "198.51.100.20/32", expires_at: {present: true}}}
+    # 4. The permanent ban on the busiest legitimate place.
+    - rule_id: FILTER-REMOVE
+      subject_contains: "1000000101"
+      severity: any
+      confidence: high
+      exact_changes: true
+      changes_required:
+        - {kind: ban_remove, match: {subject_type: place, subject: "1000000101"}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_filter_remove_enabled: 0}
+    expect: {fires: false}
+  - case: idle_rule_days_raised
+    description: >
+      With 60 idle days required, the UA rule (idle 45 days) is no longer stale; the endpoint block (200 days), the
+      bypass entry and the place ban still are.
+    settings: {insight_filter_remove_idle_rule_days: 60}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - any_of:
+                - {kind: rule_delete, table: rules_endpoint_block, match: {pattern: "economy.roblox.com/v1/purchases/*", type: glob}}
+                - {kind: filter_remove, table: rules_endpoint_block, match: {pattern: "economy.roblox.com/v1/purchases/*", type: glob}}
+        - subject_contains: "198.51.100.20"
+        - subject_contains: "1000000101"
+          changes_required:
+            - {kind: ban_remove, match: {subject_type: place, subject: "1000000101"}}
+  - case: idle_bypass_days_raised
+    description: With 14 unused days required, the bypass entry (unused 9 days) is no longer stale; the other three still are.
+    settings: {insight_filter_remove_idle_bypass_days: 14}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - any_of:
+                - {kind: rule_delete, table: rules_user_agent, match: {id: "a1b2c3d4"}}
+                - {kind: filter_remove, table: rules_user_agent, match: {id: "a1b2c3d4"}}
+        - changes_required:
+            - any_of:
+                - {kind: rule_delete, table: rules_endpoint_block, match: {pattern: "economy.roblox.com/v1/purchases/*", type: glob}}
+                - {kind: filter_remove, table: rules_endpoint_block, match: {pattern: "economy.roblox.com/v1/purchases/*", type: glob}}
+        - subject_contains: "1000000101"
+          changes_required:
+            - {kind: ban_remove, match: {subject_type: place, subject: "1000000101"}}
+  - case: idle_thresholds_raised_past_evidence
+    description: >
+      With 365 idle days for rules and 30 for bypass entries, only the place ban remains: it is harmful, not idle,
+      and no idle threshold applies to it.
+    settings: {insight_filter_remove_idle_rule_days: 365, insight_filter_remove_idle_bypass_days: 30}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "1000000101"
+          changes_required:
+            - {kind: ban_remove, match: {subject_type: place, subject: "1000000101"}}
+  - case: severity_override_info
+    description: insight_filter_remove_severity replaces the computed severity of every recommendation.
+    settings: {insight_filter_remove_severity: info}
+    expect:
+      fires: true
+      recommendations:
+        - {subject_contains: "1000000101", severity: info}
+        - {subject_contains: "198.51.100.20", severity: info}

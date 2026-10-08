@@ -1,0 +1,28 @@
+format: roxy.health_fixture/1
+check: H-ENV-PROXY
+case: warn
+name: set_but_ignored
+description: >
+  A host-wide proxy setting leaked into the service environment (HTTPS_PROXY and HTTP_PROXY are set), but every
+  client is built with trust_env false, so no request goes through that proxy. 13.2 H-ENV-PROXY: set but
+  ignored gives warn, with the ops docs as the fix. The variant sets ALL_PROXY too: still only a warning.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    HTTPS_PROXY: "http://proxy.test:3128"
+    HTTP_PROXY: "http://proxy.test:3128"
+    clients_trust_env: false
+expect:
+  status: warn
+  explanation: {present: true}
+  fix_link: {present: true}
+  credential_calls: {eq: 0}
+variants:
+  - case: warn
+    name: all_proxy_also_set
+    inputs:
+      env:
+        ALL_PROXY: "socks5://proxy.test:1080"
+    expect:
+      status: warn
+      explanation: {present: true}

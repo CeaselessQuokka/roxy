@@ -1,0 +1,57 @@
+# EGR-CALIBRATE stays quiet when the provider figure is within 10% of Roxy's estimate
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Admin-entered provider figure differs > 10%" (insight_egr_calibrate_diff_pct 10.0).
+#
+#   Estimate mode, the same cycle as egr_calibrate__fires_estimate_mode.yaml: 9,996,000,000 bytes estimated
+#   (2,376,000,000 of it overhead on 396,000 connections at 6,000 bytes).
+#   Provider figure: 10,900,000,000 bytes. Difference 904,000,000: 9.04% of Roxy's figure, 8.29% of the provider's.
+#   Under 10% either way; over 8% either way. At 8% the constant that closes the gap is
+#   6,000 + 904,000,000 / 396,000 = 8,283 bytes.
+
+format: roxy.insight_fixture/1
+rule: EGR-CALIBRATE
+case: below_threshold
+description: >
+  The provider billed 10.9 GB for a cycle Roxy estimated at 10.0 GB: a 9% difference, inside the 10% tolerance,
+  so nothing may fire. At an 8% tolerance it must propose about 8,283 bytes of overhead per connection.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_quota_gb_per_month: 20
+  rotator_billing_day: 1
+  rotator_enabled: 0
+
+state:
+  settings_history:
+    - {at: "-15h", key: rotator_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Pause the rotator while checking the bill."}
+  egress:
+    metering_mode: estimate
+    provider_reported_bytes: 10900000000
+    provider_reported_at: "-1h"
+    usage:
+      - {egress: rotator, granularity: day, at: "2026-10-01", requests: 66000, req_bytes: 165000000, resp_bytes: 1105000000, overhead_bytes: 396000000}
+      - {egress: rotator, granularity: day, at: "2026-10-02", requests: 66000, req_bytes: 165000000, resp_bytes: 1105000000, overhead_bytes: 396000000}
+      - {egress: rotator, granularity: day, at: "2026-10-03", requests: 66000, req_bytes: 165000000, resp_bytes: 1105000000, overhead_bytes: 396000000}
+      - {egress: rotator, granularity: day, at: "2026-10-04", requests: 66000, req_bytes: 165000000, resp_bytes: 1105000000, overhead_bytes: 396000000}
+      - {egress: rotator, granularity: day, at: "2026-10-05", requests: 66000, req_bytes: 165000000, resp_bytes: 1105000000, overhead_bytes: 396000000}
+      - {egress: rotator, granularity: day, at: "2026-10-06", requests: 66000, req_bytes: 165000000, resp_bytes: 1105000000, overhead_bytes: 396000000}
+      # The previous cycle is not part of the comparison.
+      - {egress: rotator, granularity: day, at: "2026-09-30", requests: 90000, req_bytes: 225000000, resp_bytes: 1500000000, overhead_bytes: 540000000}
+
+expect:
+  fires: false
+
+variants:
+  - case: diff_pct_8
+    description: An 8% tolerance is exceeded by the 9.04% (or 8.29%) gap.
+    settings: {insight_egr_calibrate_diff_pct: 8}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - severity: any
+          safe_auto: false
+          changes_required:
+            - {kind: setting, key: rotator_tls_overhead_bytes, current: 6000, proposed: {between: [7500, 9000]}}

@@ -1,0 +1,72 @@
+# SEC-BYPASS-FOREVER: "bypass with no expiry" (11.5; no threshold, any such entry).
+#
+#   access_list entry                      kind          expires     last hit     expected
+#   198.51.100.30/32 "load test runner"    bypass        never       2 h ago      recommendation: set an expiry
+#   198.51.100.31/32 "uptime monitor"      bypass        in 12 h     1 min ago    none (has an expiry)
+#   203.0.113.0/24                         allow_admin   never       n/a          none (not a bypass entry)
+#   192.0.2.0/28 "scanner range"           deny          never       n/a          none (not a bypass entry)
+#
+# The never-expiring bypass entry was added 90 days ago for a load test and is still used. 11.5's change is "set
+# expiry", so the entry must get an expiry, not be deleted (it is in use), and nothing else may change. Bypass last
+# use has no column, so it is `x_last_hit_at` (provider seam).
+
+format: roxy.insight_fixture/1
+rule: SEC-BYPASS-FOREVER
+case: load_test_entry
+description: >
+  A bypass entry added 90 days ago has no expiry. SEC-BYPASS-FOREVER must raise one recommendation that sets an expiry
+  on that entry and leaves the expiring bypass entry, the admin allowlist entry and the deny entry alone.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  access_list:
+    - {id: 1, kind: bypass, cidr: "198.51.100.30/32", note: "Load test runner", expires_at: null, created_by: admin, created_at: "-90d", x_last_hit_at: "-2h"}
+    - {id: 2, kind: bypass, cidr: "198.51.100.31/32", note: "Uptime monitor", expires_at: "+12h", created_by: admin, created_at: "-12h", x_last_hit_at: "-1m"}
+    - {id: 3, kind: allow_admin, cidr: "203.0.113.0/24", note: "Office", expires_at: null, created_by: admin, created_at: "-60d"}
+    - {id: 4, kind: deny, cidr: "192.0.2.0/28", note: "Scanner range", expires_at: null, created_by: admin, created_at: "-30d"}
+
+traffic_defaults:
+  auth_class: anon
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: load_test, profile: hit, client_ip: "198.51.100.30", user_agent: "k6/0.52.0", bypass: true, endpoint_template: games.roblox.com/v1/games, window: ["-180m", "-120m"], per_minute: 50}
+  - {name: monitor, profile: miss, client_ip: "198.51.100.31", user_agent: "uptime-probe/1.0", bypass: true, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 1}
+  - {name: legit, profile: hit, clients: {cidr: "203.0.113.64/26", count: 40}, user_agent: "Roblox/Linux", bypass: false, endpoint_template: games.roblox.com/v1/games, window: ["-180m", "0m"], per_minute: 40}
+
+expect:
+  data_checks:
+    - {window: ["-180m", "-120m"], where: {client_ip: "198.51.100.30"}, requests: 3000}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SEC-BYPASS-FOREVER
+      subject_contains: "198.51.100.30"
+      severity: any
+      family: security
+      confidence: high
+      exact_changes: true
+      changes_required:
+        - any_of:
+            - {kind: rule_upsert, table: access_list, match: {kind: bypass, cidr: "198.51.100.30/32"}, proposed: {expires_at: {present: true}}}
+            - {kind: bypass_add, proposed: {kind: bypass, cidr: "198.51.100.30/32", expires_at: {present: true}}}
+      change_kinds_forbidden: [bypass_remove, rule_delete, ban_add, setting]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sec_bypass_forever_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_sec_bypass_forever_severity replaces the computed severity.
+    settings: {insight_sec_bypass_forever_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "198.51.100.30", severity: critical}

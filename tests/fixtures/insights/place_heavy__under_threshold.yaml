@@ -1,0 +1,52 @@
+# PLACE-HEAVY just under its threshold: the busiest place made 38% of the upstream calls in the last hour (40%
+# needed), steadily for the whole hour. The variant lowers the threshold to 35%.
+
+format: roxy.insight_fixture/1
+rule: PLACE-HEAVY
+case: under_threshold
+description: >
+  The busiest experience made 2,280 of 6,000 upstream calls (38%) in the last hour, under the 40% threshold.
+  PLACE-HEAVY must not fire; at 35% it must flag that place.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  place_301: {clients: {cidr: "203.0.113.0/27", count: 20}, place_id: "1000000301", user_agent: "Roblox/Linux"}
+  other_places:
+    clients: {cidr: "203.0.113.64/26", count: 40}
+    places: ["1000000302", "1000000303", "1000000304", "1000000305", "1000000306", "1000000307", "1000000308", "1000000309", "1000000310"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: p301_miss, profile: [miss, place_301], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 38}
+  - {name: p301_hit, profile: [hit, place_301], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 30}
+  - {name: others_miss, profile: [miss, other_places], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 62}
+  - {name: others_hit, profile: [hit, other_places], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 100}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/27", count: 20}, bot_score: 8}
+    - {clients: {cidr: "203.0.113.64/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], upstream_calls: 6000}
+    - {window: ["-60m", "0m"], where: {place_id: "1000000301"}, upstream_calls: 2280}
+  fires: false
+
+variants:
+  - case: share_pct_lowered
+    description: At 35% the 38% place is dominant.
+    settings: {insight_place_heavy_share_pct: 35}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "1000000301"
+          change_kinds_forbidden: [ban_add]

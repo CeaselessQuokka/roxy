@@ -1,0 +1,115 @@
+# UP-CSRF-LOOP through its second signal: the retry gets another 403 with a new token (README.md here).
+#
+# 11.5: "... or the same request getting a second 403 with a new x-csrf-token". This branch has no threshold.
+# The retry share stays low (90 of 1,040 writes, 8.7%), so only the second signal can fire the rule:
+#
+#   template (POST)                                  writes   CSRF retries   outcome
+#   presence.roblox.com/v1/presence/users            1,000    50             retry succeeds (200)
+#   catalog.roblox.com/v1/catalog/items/details      40       40             retry gets a second 403 with a NEW
+#                                                                            token; the caller gets that 403
+#
+# The catalog writes go through the rotator (rotator_only routing rule, per_request sessions), so the token
+# fetched on one exit is rejected on the next: callers can never succeed anonymously this way. 11.5 allows a lower
+# csrf_token_cache_s or blocking writes to that template; a block, if proposed, must cover only the catalog
+# template. The `retry_pct_50` variant proves the second-403 branch does not depend on retry_pct.
+
+format: roxy.insight_fixture/1
+rule: UP-CSRF-LOOP
+case: second_403
+description: >
+  Every POST to catalog item details made through the rotator gets a 403 CSRF challenge, and the retry with the
+  new token gets a second 403 with yet another token. The share of writes needing a retry is only 8.7%, but the
+  second 403 alone must fire the rule, with either a lower csrf_token_cache_s or a block scoped to that template.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_enabled: 1
+  rotator_session_mode: per_request
+
+tables:
+  rules_routing:
+    - {id: 1, pattern: "catalog.roblox.com/v1/catalog/items/details", type: glob, mode: rotator_only, created_at: "-5d", created_by: admin}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  method: POST
+  cache_state: "OFF"
+  source: relay
+  latency_ms: {p50: 150, p95: 400, p99: 800}
+
+profiles:
+  pres: {endpoint_template: presence.roblox.com/v1/presence/users, egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200}
+  details_loop:
+    endpoint_template: catalog.roblox.com/v1/catalog/items/details
+    egress: rotator
+    outcome: served_upstream
+    reason: upstream_4xx
+    status: 403
+    upstream_calls: 2
+    latency_ms: {p50: 900, p95: 1800, p99: 2600}
+
+traffic:
+  - {name: pres_ok, profile: pres, window: ["-30m", "0m"], total: 950}
+  - {name: pres_csrf_ok, profile: pres, window: ["-30m", "0m"], total: 50, upstream_calls: 2}
+  - {name: details_loop, profile: details_loop, window: ["-30m", "0m"], total: 40}
+  - name: games_get
+    endpoint_template: games.roblox.com/v1/games
+    method: GET
+    egress: direct
+    outcome: served_upstream
+    reason: upstream_ok
+    status: 200
+    cache_state: "MISS"
+    window: ["-30m", "0m"]
+    per_minute: 40
+
+events:
+  upstream_attempts:
+    # pres_csrf_ok: challenge, then success with the token.
+    - {window: ["-30m", "0m"], total: 50, endpoint_template: presence.roblox.com/v1/presence/users, egress: direct, attempt: 1, status: 403, kind: first}
+    - {window: ["-30m", "0m"], total: 50, endpoint_template: presence.roblox.com/v1/presence/users, egress: direct, attempt: 1, status: 200, kind: csrf_retry}
+    # details_loop: challenge, then a second challenge with a new token on another exit.
+    - {window: ["-30m", "0m"], total: 40, endpoint_template: catalog.roblox.com/v1/catalog/items/details, egress: rotator, attempt: 1, status: 403, kind: first, exit_id: "exit-a"}
+    - {window: ["-30m", "0m"], total: 40, endpoint_template: catalog.roblox.com/v1/catalog/items/details, egress: rotator, attempt: 1, status: 403, kind: csrf_retry, exit_id: "exit-b"}
+
+expect:
+  data_checks:
+    - window: ["-30m", "0m"]
+      where: {method: POST}
+      requests: 1040
+      upstream_calls: 1130
+    - window: ["-30m", "0m"]
+      where: {endpoint_template: catalog.roblox.com/v1/catalog/items/details}
+      requests: 40
+      upstream_calls: 80
+      by_reason: {upstream_4xx: 40}
+
+  fires: true
+  others: forbid               # presence (5% retries, every retry succeeds) must not get its own recommendation
+  recommendations:
+    - confidence: medium
+      family: upstream
+      change_kinds_forbidden: [ban_add, bucket_override, credential_allowlist_remove]
+      changes_required:
+        - any_of:
+            - {kind: setting, key: csrf_token_cache_s, current: 600, proposed: {lt: 600}}
+            - kind: rule_upsert
+              table: rules_endpoint_block
+              match: {pattern: {matches_targets: ["catalog.roblox.com/v1/catalog/items/details"]}}
+      changes_forbidden:
+        - kind: rule_upsert
+          table: rules_endpoint_block
+          match: {pattern: {matches_targets: ["presence.roblox.com/v1/presence/users", "games.roblox.com/v1/games"]}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_csrf_loop_enabled: 0}
+    expect: {fires: false}
+  - case: retry_pct_50
+    description: The second-403 signal has no threshold, so raising retry_pct does not silence it.
+    settings: {insight_up_csrf_loop_retry_pct: 50}
+    expect: {fires: true}

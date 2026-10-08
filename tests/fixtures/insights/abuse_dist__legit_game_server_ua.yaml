@@ -1,0 +1,56 @@
+# ABUSE-DIST must stay quiet when SPAM-DIST fires on legitimate Roblox game servers.
+#
+# Roblox game servers all send the same User-Agent, so a popular experience trips SPAM-DIST by design: here 200
+# game servers of 12 experiences poll games.roblox.com/v1/games at 300 requests per minute between them (1,500 per 5
+# minutes, 200 addresses, one UA hash), and the detector writes a `spam_detected` event every 5 minutes. Every one of
+# those clients is legitimate by the plan's own measures: Roblox UA with place ids (the game-server signature, 10.7),
+# bot score 9 (under bot_score_legit_max = 30), normal per-address rates, nothing refused.
+#
+# Recommending a global UA rule against "Roblox/Linux" here would refuse every game server Roxy serves. Plan 10.3's
+# collateral protection says one experience's traffic must not block the others and that game servers are never
+# banned, so the rule must recognize a detection made only of legitimate game-server clients and raise nothing.
+# (Assumption beyond the literal 11.5 row "SPAM-DIST fired"; reported to the lead.)
+
+format: roxy.insight_fixture/1
+rule: ABUSE-DIST
+case: legit_game_server_ua
+description: >
+  SPAM-DIST fires every 5 minutes on 200 legitimate game servers that share the Roblox UA (bot score 9, place ids,
+  everything served). ABUSE-DIST must not fire, because its only remedy would refuse every game server.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  game_servers:
+    clients: {cidr: "203.0.113.0/24", count: 200}
+    places: ["1000000031", "1000000032", "1000000033", "1000000034", "1000000035", "1000000036",
+             "1000000037", "1000000038", "1000000039", "1000000040", "1000000041", "1000000042"]
+    user_agent: "Roblox/Linux"
+    endpoint_template: games.roblox.com/v1/games
+
+traffic:
+  - {name: game_hit, profile: [hit, game_servers], window: ["-60m", "0m"], per_minute: 255}
+  - {name: game_miss, profile: [miss, game_servers], window: ["-60m", "0m"], per_minute: 45}
+
+events:
+  security:
+    # One detection per 5 minute window, as the detector claims them: rows at -55m, -50m, ..., -5m (11 rows).
+    # `game_server` is false because spam.py only tracks the game-server flag on per-address subjects, never on the
+    # template|UA subject of SPAM-DIST; the rule has to judge the clients itself (scores, place ids, UA).
+    - {window: ["-55m", "0m"], every: "5m", type: spam_detected, severity: info, reason_code: SPAM-DIST, endpoint_template: games.roblox.com/v1/games, detail: {detector: SPAM-DIST, subject: "games.roblox.com/v1/games|e2d0257916c14b0b", value: 200, threshold: 50, window_s: 300, action: recommend, configured_action: recommend, game_server: false, evidence: "200 addresses with one User-Agent sent 1500 requests in 300 s"}}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/24", count: 200}, bot_score: 9}
+
+expect:
+  data_checks:
+    - {window: ["-5m", "0m"], requests: 1500, refused: 0}
+    - {window: ["-60m", "0m"], requests: 18000, upstream_calls: 2700}
+  fires: false

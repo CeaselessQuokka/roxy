@@ -1,0 +1,28 @@
+format: roxy.health_fixture/1
+check: H-TLS-PUBLIC
+case: warn
+name: 8_days
+description: >
+  The public certificate expires in 8 days: Certbot renewal has been failing for weeks. 13.2 H-TLS-PUBLIC: more
+  than 7 days (and not more than 21) gives warn, with the "Certificate" runbook as the fix. The variant is the
+  upper edge: exactly 21 days is not more than 21, so it warns too.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  tls:
+    origin: {days_left: 8, handshake_ms: 40}
+expect:
+  status: warn
+  value: {gt: 7, lte: 21}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)certificate"}
+  credential_calls: {eq: 0}
+variants:
+  - case: warn
+    name: edge_21_days
+    inputs:
+      tls:
+        origin: {days_left: 21}
+    expect:
+      status: warn
+      value: {gt: 20, lte: 21}
+      explanation: {present: true}

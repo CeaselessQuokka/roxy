@@ -1,0 +1,62 @@
+format: roxy.health_fixture/1
+check: H-LATENCY
+case: pass
+name: p95_just_under_1000ms
+description: >
+  Over the last 15 minutes the upstream calls have a p95 of about 900 ms (every call is at most 1,000 ms, so the
+  fixed latency buckets put the p95 inside the 750 to 1,000 ms bucket). 13.2 H-LATENCY: p95 under 1,000 ms gives
+  pass. The 45 minutes before that window were slow (p95 about 4,000 ms) and must not count: the window is the
+  last 15 minutes only. Cache hits are included as ordinary traffic; counting them or not does not change the
+  band.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  traffic_defaults:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    user_agent: "Roblox/Linux"
+    places: ["1000000001", "1000000002", "1000000003"]
+  profiles:
+    hit:
+      egress: none
+      outcome: served_cache
+      reason: cache_hit
+      status: 200
+      source: cache
+      cache_state: "HIT"
+      latency_ms: {p50: 3, p95: 9, p99: 20}
+      bytes: {caller_in: 0, caller_out: 1800}
+    miss:
+      egress: direct
+      outcome: served_upstream
+      reason: upstream_ok
+      status: 200
+      source: relay
+      cache_state: "MISS"
+      upstream_calls: 1
+      bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}
+  traffic:
+    - name: games_miss_recent
+      profile: miss
+      endpoint_template: games.roblox.com/v1/games
+      window: ["-15m", "0m"]
+      per_minute: 40
+      latency_ms: {p0: 60, p50: 400, p90: 760, p95: 900, p99: 990, p100: 1000}
+    - {name: games_hit_recent, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], per_minute: 25}
+    - name: games_miss_earlier_slow
+      profile: miss
+      endpoint_template: games.roblox.com/v1/games
+      window: ["-60m", "-15m"]
+      per_minute: 40
+      latency_ms: {p0: 150, p50: 800, p90: 3200, p95: 4000, p99: 6000, p100: 7000}
+    - {name: games_hit_earlier, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "-15m"], per_minute: 25}
+expect:
+  data_checks:
+    - window: ["-15m", "0m"]
+      requests: 975
+      upstream_calls: 600
+      served_upstream: 600
+    - window: ["-60m", "-15m"]
+      requests: 2925
+      upstream_calls: 1800
+  status: pass
+  value: {lt: 1000}
+  credential_calls: {eq: 0}

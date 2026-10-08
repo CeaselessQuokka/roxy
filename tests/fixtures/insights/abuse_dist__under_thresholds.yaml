@@ -1,0 +1,56 @@
+# ABUSE-DIST just under the SPAM-DIST thresholds (spam_dist_threshold = 50 addresses, more than 1000 requests per
+# 5 minutes, 15.3 E2), so the detector never fired and there is no `spam_detected` event:
+#
+#   group   addresses   UA              template                                        per 5 minutes   misses
+#   A       45          okhttp/4.12.0   users.roblox.com/v1/users/{userId}              1,600           address count
+#   B       80          Dalvik/2.1.0    thumbnails.roblox.com/v1/users/avatar-headshot   900            request count
+#
+# A rule that recomputes the detector from traffic reaches the same answer.
+
+format: roxy.insight_fixture/1
+rule: ABUSE-DIST
+case: under_thresholds
+description: >
+  One swarm has enough requests but only 45 addresses, another has 80 addresses but only 900 requests per 5 minutes.
+  SPAM-DIST did not fire for either, so ABUSE-DIST must not fire.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+  group_a:
+    clients: {cidr: "198.51.100.0/26", count: 45}
+    user_agent: "okhttp/4.12.0"
+    endpoint_template: "users.roblox.com/v1/users/{userId}"
+  group_b:
+    clients: {cidr: "198.51.100.128/25", count: 80}
+    user_agent: "Dalvik/2.1.0"
+    endpoint_template: "thumbnails.roblox.com/v1/users/avatar-headshot"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  - {name: group_a_miss, profile: [miss, group_a], window: ["-15m", "0m"], per_minute: 320}
+  - {name: group_b_miss, profile: [miss, group_b], window: ["-15m", "0m"], per_minute: 120}
+  - {name: group_b_hit, profile: [hit, group_b], window: ["-15m", "0m"], per_minute: 60}
+
+state:
+  client_scores:
+    - {clients: {cidr: "198.51.100.0/26", count: 45}, bot_score: 64}
+    - {clients: {cidr: "198.51.100.128/25", count: 80}, bot_score: 52}
+    - {clients: {cidr: "203.0.113.0/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - {window: ["-5m", "0m"], where: {endpoint_template: "users.roblox.com/v1/users/{userId}"}, requests: 1600}
+    - {window: ["-5m", "0m"], where: {endpoint_template: "thumbnails.roblox.com/v1/users/avatar-headshot"}, requests: 900}
+  fires: false

@@ -1,0 +1,81 @@
+# ABUSE-SPAM must stay quiet when every client stays just under the detectors and auto-bans are not repeated.
+#
+#   192.0.2.90   54 requests per minute, all served (44 cache hits, 10 misses): 540 per 10 minutes, under the
+#                SPAM-RATE limit of 600 (5 x 10 / 50 x 600). Cache hits do not count toward the per-IP limit
+#                (throttle_count_cache_hits = 0), so it is never refused.
+#   192.0.2.91   27 requests per minute: 12 served and 15 refused, so 150 refusals per 10 minutes (SPAM-REFUSED
+#                limit 200) and 270 requests per 10 minutes.
+#   192.0.2.92   ONE automatic ban (SPAM-PROBE) 20 days ago, long expired: not "repeated".
+#
+# No detector fired, so there is no `spam_would_ban` event. A rule that recomputes the detectors from traffic sees the
+# same thing: every value is under its threshold.
+
+format: roxy.insight_fixture/1
+rule: ABUSE-SPAM
+case: under_threshold
+description: >
+  Two busy clients sit at 90% of SPAM-RATE and 75% of SPAM-REFUSED for a whole hour, and one address was banned
+  automatically once, 20 days ago. Nothing would have been banned and nothing was banned twice, so ABUSE-SPAM must
+  not fire.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  bans:
+    - {id: 1, subject_type: ip, subject: "192.0.2.92", reason_code: spam_probe, reason_text: "SPAM-PROBE: 5 probes in 600 s, limit 5", created_at: "-20d", expires_at: "-28740m", created_by: "auto:spam_probe", hits: 2, last_hit_at: "-28790m"}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+  busy_cached:
+    client_ip: "192.0.2.90"
+    place_id: "1000000007"
+    user_agent: "Roblox/Linux"
+    endpoint_template: games.roblox.com/v1/games
+  persistent:
+    client_ip: "192.0.2.91"
+    user_agent: "Go-http-client/1.1"
+    endpoint_template: "groups.roblox.com/v1/groups/{groupId}"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  - {name: busy_hit, profile: [hit, busy_cached], window: ["-60m", "0m"], per_minute: 44}
+  - {name: busy_miss, profile: [miss, busy_cached], window: ["-60m", "0m"], per_minute: 10}
+  - {name: persistent_served, profile: [miss, persistent], window: ["-60m", "0m"], per_minute: 12}
+  - {name: persistent_throttled, profile: [throttled, persistent], window: ["-60m", "0m"], per_minute: 15}
+
+events:
+  security:
+    - {at: "-20d", type: spam_ban, severity: warning, reason_code: SPAM-PROBE, ip: "192.0.2.92", detail: {detector: SPAM-PROBE, subject: "ip:192.0.2.92", value: 5, threshold: 5, window_s: 600, action: ban, configured_action: ban, game_server: false, evidence: "5 probes in 600 s, limit 5", ban_minutes: 60}}
+
+state:
+  client_scores:
+    - {ip: "192.0.2.90", bot_score: 14}
+    - {ip: "192.0.2.91", bot_score: 58}
+    - {ip: "192.0.2.92", bot_score: 62}
+    - {clients: {cidr: "203.0.113.0/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - window: ["-10m", "0m"]
+      where: {client_ip: "192.0.2.90"}
+      requests: 540
+      refused: 0
+    - window: ["-10m", "0m"]
+      where: {client_ip: "192.0.2.91"}
+      requests: 270
+      refused: 150
+    - window: ["-60m", "0m"]
+      requests: 7860
+      refused: 900
+  fires: false

@@ -1,0 +1,121 @@
+# UP-LATENCY where requests wait in Roxy's queue, on a bucket that had 429s today (README.md in this directory).
+#
+# 11.5: "If queue wait dominates: raise TTL and SWR for the endpoints that queue most (fewer calls need slots);
+# raise a bucket only when it has had zero 429s for 24 h (UP-BUCKET-TUNE evidence), never as a latency fix
+# alone". The endpoint that queues has had Roblox 429s five hours ago, so raising its bucket (or any bucket, or
+# a global bucket default) is forbidden; the fix is a longer TTL and SWR on its cache rule.
+#
+# Last 30 minutes, GET thumbnails.roblox.com/v1/users/avatar-headshot (endpoint bucket 120 per minute, demand
+# above it): 3,450 calls whose time is mostly queue wait (Roblox itself answers in about 200 to 250 ms; every
+# call's queue wait is its latency minus that), plus 90 requests refused as upstream_busy after waiting 4 s.
+# games.roblox.com adds 600 normal calls. Percentiles as the rollup histograms report them are in the
+# data_checks comment below.
+
+format: roxy.insight_fixture/1
+rule: UP-LATENCY
+case: queue_dominated_recent_429s
+description: >
+  The avatar headshot endpoint runs at its 120 per minute bucket and requests wait over 2 s in Roxy's queue
+  before a fast Roblox answer. The bucket had Roblox 429s five hours ago, so the rule must recommend a longer TTL
+  and SWR for that endpoint only and must not raise any bucket.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 120, stale_ttl: 0, methods: "GET", origin: admin, created_at: "-30d"}
+    - {id: 2, pattern: "games.roblox.com/v1/games", type: glob, ttl: 60, stale_ttl: 30, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS"}
+  headshot: {endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot}
+  games: {endpoint_template: games.roblox.com/v1/games}
+
+traffic:
+  - {name: headshot_hit, profile: [hit, headshot], window: ["-60m", "0m"], per_minute: 200}
+  - name: headshot_miss_queued
+    profile: [miss, headshot]
+    window: ["-30m", "0m"]
+    per_minute: 115
+    queue_wait_ms: {p50: 1200, p95: 2600, p99: 3400}
+    latency_ms: {p50: 1400, p95: 2850, p99: 3650}
+  - name: headshot_busy
+    profile: headshot
+    window: ["-30m", "0m"]
+    per_minute: 3
+    egress: none
+    outcome: failed
+    reason: upstream_busy
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    error: true
+    latency_ms: 4000
+    queue_wait_ms: 4000
+  - {name: headshot_miss_before, profile: [miss, headshot], window: ["-60m", "-30m"], per_minute: 90, latency_ms: {p50: 200, p95: 450, p99: 800}}
+  - {name: games_miss, profile: [miss, games], window: ["-60m", "0m"], per_minute: 20, latency_ms: {p50: 150, p95: 400, p99: 800}}
+
+events:
+  upstream_429:
+    - {window: ["-300m", "-290m"], total: 12, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, retry_after_s: 30}
+
+state:
+  buckets:
+    - bucket_key: "endpoint:thumbnails.roblox.com/v1/users/avatar-headshot"
+      per_min: 120
+      burst: 10
+      fill_pct: 100
+      history:
+        - {window: ["-300m", "-290m"], fill_pct_peak: 100, attempts: 1200, rejections: 40}
+        - {window: ["-60m", "-30m"], fill_pct_peak: 80, attempts: 2700, rejections: 0}
+        - {window: ["-30m", "0m"], fill_pct_peak: 100, attempts: 3540, rejections: 90}
+
+expect:
+  data_checks:
+    # Upstream-going requests in the last 30 minutes: 3,450 headshot + 600 games = 4,050 calls. Their rollup
+    # histogram percentiles: latency p95 ~2,940 ms, p99 ~4,450 ms; queue wait p95 ~2,870 ms (headshot alone:
+    # latency p95 ~2,970, p99 ~4,530; queue wait p95 ~2,910).
+    - window: ["-30m", "0m"]
+      where: {egress: direct}
+      upstream_calls: 4050
+    - window: ["-24h", "0m"]
+      where: {endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot}
+      roblox_429: 12
+    - window: ["-30m", "0m"]
+      by_reason: {upstream_busy: 90}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - confidence: medium
+      family: upstream
+      change_kinds_required: [rule_upsert]
+      change_kinds_forbidden: [bucket_override, routing_rule, ban_add, credential_allowlist_remove]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["thumbnails.roblox.com/v1/users/avatar-headshot"]}}
+          current: {ttl: 120, stale_ttl: 0}
+          proposed: {ttl: {gt: 120}, stale_ttl: {gte: 1}}
+      changes_forbidden:
+        - kind: setting
+          key:
+            in: [endpoint_bucket_default_per_min, endpoint_bucket_default_burst, host_bucket_default_per_min,
+                 global_bucket_per_min, direct_bucket_per_min, queue_wait_interactive_ms, queue_max_length,
+                 request_timeout]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_latency_enabled: 0}
+    expect: {fires: false}
+  - case: thresholds_raised
+    description: A p95 limit of 3,500 ms and a p99 limit of 5,000 ms are above what the histograms show.
+    settings: {insight_up_latency_p95_ms: 3500, insight_up_latency_p99_ms: 5000}
+    expect: {fires: false}

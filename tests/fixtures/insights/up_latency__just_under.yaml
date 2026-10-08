@@ -1,0 +1,80 @@
+# UP-LATENCY just under both latency thresholds (format: README.md in this directory).
+#
+# 11.5: "p95 upstream latency > 1500 ms or p99 > 4000 ms over 30 min (min 200 calls)". Percentiles come from the
+# rollup histograms (plan 6.4 buckets: ... 1000, 1500, 2000, 3000, 5000 ms), interpolated inside a bucket. A p99
+# "just under 4000" is not expressible: any p99 inside the (3000, 5000] bucket can interpolate above 4000. So the
+# scenario keeps the p95 inside the (1000, 1500] bucket (it reads at most 1500, never above) and the p99 inside
+# (2000, 3000]:
+#
+#   last 30 minutes, upstream-going    calls    histogram p50 / p95 / p99
+#   games + avatar, both endpoints     3,000    ~300 / ~1,480 / ~2,680  (each endpoint alone: the same;
+#                                               with cache hits wrongly counted in: p95 ~1,370, p99 ~2,490)
+#
+# Half an hour earlier the avatar endpoint had a slow patch (p95 ~3,000 ms), outside the 30 minute window; the
+# `window_60` variant brings it in.
+
+format: roxy.insight_fixture/1
+rule: UP-LATENCY
+case: just_under
+description: >
+  Roblox is a little slow: the upstream p95 reads about 1,480 ms and the p99 about 2,680 ms over the last 30
+  minutes, under the 1,500 and 4,000 ms thresholds, so the rule stays quiet. Lowering either threshold just below
+  the evidence, or widening the window to include an earlier slow patch, makes it fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob, ttl: 60, stale_ttl: 0, methods: "GET", origin: admin, created_at: "-30d"}
+    - {id: 2, pattern: "games.roblox.com/v1/games", type: glob, ttl: 60, stale_ttl: 30, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS"}
+  avatar: {endpoint_template: "avatar.roblox.com/v1/users/{userId}/avatar"}
+  games: {endpoint_template: games.roblox.com/v1/games}
+  a_bit_slow: {latency_ms: {p50: 250, p95: 1300, p99: 2800}}
+
+traffic:
+  - {name: avatar_hit, profile: [hit, avatar], window: ["-60m", "0m"], per_minute: 30}
+  - {name: games_hit, profile: [hit, games], window: ["-60m", "0m"], per_minute: 30}
+  - {name: avatar_slow_patch, profile: [miss, avatar], window: ["-60m", "-30m"], per_minute: 50, latency_ms: {p50: 1500, p95: 3000, p99: 4500}}
+  - {name: games_miss_before, profile: [miss, games], window: ["-60m", "-30m"], per_minute: 50, latency_ms: {p50: 250, p95: 1300, p99: 2800}}
+  - {name: avatar_miss, profile: [miss, avatar, a_bit_slow], window: ["-30m", "0m"], per_minute: 50}
+  - {name: games_miss, profile: [miss, games, a_bit_slow], window: ["-30m", "0m"], per_minute: 50}
+
+expect:
+  data_checks:
+    - window: ["-30m", "0m"]
+      where: {egress: direct}
+      upstream_calls: 3000
+    - window: ["-60m", "-30m"]
+      where: {egress: direct}
+      upstream_calls: 3000
+
+  fires: false
+
+variants:
+  - case: p95_1200
+    description: The p95 (about 1,480 ms) is above a 1,200 ms limit.
+    settings: {insight_up_latency_p95_ms: 1200}
+    expect: {fires: true}
+  - case: p99_2400
+    description: The p99 (about 2,680 ms) is above a 2,400 ms limit.
+    settings: {insight_up_latency_p99_ms: 2400}
+    expect: {fires: true}
+  - case: window_60
+    description: A 60 minute window includes the avatar endpoint's slow patch.
+    settings: {insight_up_latency_window_min: 60}
+    expect:
+      fires: true
+      recommendations:
+        - changes_required:
+            - kind: rule_upsert
+              table: rules_cache
+              match: {pattern: {matches_targets: ["avatar.roblox.com/v1/users/1000000001/avatar"]}}

@@ -1,0 +1,61 @@
+# CRED-PROBE-COST stays quiet at exactly its budget, and does not count anonymous probes
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Internal credential calls > insight_cred_probe_cost_max_per_hour (6) in an hour".
+#
+#   Defaults: credential_probe_interval_min 30, health_auto_include_credential 0.
+#   Credential calls (egress credential), last 3 hours:
+#     scheduled liveness probes at -170m, -140m, -110m, -80m, -50m, -20m
+#     one manual health run at -35m: 1 credential call (plus 20 anonymous probe calls on the direct egress)
+#     an admin clicked "Check credential" three times at -15m, -14m and -13m
+#   Last 60 minutes (also the clock hour 14:00 to 15:00): 2 + 1 + 3 = 6 credential calls, not more than 6.
+#   No 60 minute stretch in the 3 hours holds more than 6. With the anonymous probes counted it would be 26.
+
+format: roxy.insight_fixture/1
+rule: CRED-PROBE-COST
+case: at_threshold
+description: >
+  Roxy made exactly 6 credential calls in the last hour (two scheduled probes, one health check, three admin
+  checks) plus 20 anonymous health probes. Six is not more than the budget of 6 and anonymous calls do not count,
+  so nothing may fire; with a budget of 5 it must fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+events:
+  internal_calls:
+    - {at: "-170m", purpose: credential_probe, trigger: scheduled, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+    - {at: "-140m", purpose: credential_probe, trigger: scheduled, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+    - {at: "-110m", purpose: credential_probe, trigger: scheduled, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+    - {at: "-80m", purpose: credential_probe, trigger: scheduled, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+    - {at: "-50m", purpose: credential_probe, trigger: scheduled, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+    - {at: "-20m", purpose: credential_probe, trigger: scheduled, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+    - {at: "-35m", purpose: health, trigger: health, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+    - {window: ["-35m", "-34m"], total: 20, purpose: health, trigger: health, egress: direct, endpoint_template: games.roblox.com/v1/games, status: 200}
+    - {at: "-15m", purpose: credential_probe, trigger: admin, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+    - {at: "-14m", purpose: credential_probe, trigger: admin, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+    - {at: "-13m", purpose: credential_probe, trigger: admin, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+
+state:
+  credential:
+    present: true
+    status: active
+    status_at: "-30d"
+    set_at: "-30d"
+    account_id: "1000001"
+
+expect:
+  fires: false
+
+variants:
+  - case: max_per_hour_5
+    description: With a budget of 5 per hour, 6 calls fire the rule.
+    settings: {insight_cred_probe_cost_max_per_hour: 5}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - severity: any
+          family: credential
+          safe_auto: false
+          changes_forbidden:
+            - {kind: setting, key: {in: [credential_enabled, insight_cred_probe_cost_max_per_hour]}}

@@ -1,0 +1,82 @@
+# EGR-BURN stays quiet when the projection is just under 90% of the quota
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Projected cycle usage > 90% of quota" (insight_egr_burn_projected_pct 90).
+#
+#   Quota 20 GB, billing day 1 (cycle 2026-10-01 to 2026-11-01, 31 days), rotator_weight 50.
+#   Flat usage since 2026-09-29: 394,000 bytes per minute (567.36 MB per day).
+#     projection: 567.36 MB x 31 days = 17,588.2 MB = 87.9% of the quota (85.1% if a method assumed 30 days)
+#   A threshold of 80% is exceeded whichever way the cycle length is counted.
+
+format: roxy.insight_fixture/1
+rule: EGR-BURN
+case: below_threshold
+description: >
+  The rotator is on course for 17.6 GB of a 20 GB quota (87.9%), just under the 90% threshold, so nothing may
+  fire. At an 80% threshold it must fire with a remedy that lowers rotator use.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_quota_gb_per_month: 20
+  rotator_billing_day: 1
+  rotator_weight: 50
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  direct_miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1600, upstream_in: 1730, upstream_out: 270}}
+  rotator_miss: {egress: rotator, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 420, p95: 1100, p99: 2000}, bytes: {caller_in: 0, caller_out: 1600, upstream_in: 1730, upstream_out: 270}}
+
+traffic:
+  - {name: search_rotator, profile: rotator_miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], per_minute: 100}
+  - {name: games_rotator, profile: rotator_miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 60}
+  - {name: headshot_rotator, profile: rotator_miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], per_minute: 37}
+  - {name: search_direct, profile: direct_miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], per_minute: 200}
+  - {name: games_direct, profile: direct_miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 120}
+
+state:
+  settings_history:
+    - {at: "-12d", key: rotator_weight, old: 0, new: 50, source: admin, changed_by: admin, reason: "Spread load across exit addresses."}
+  egress:
+    metering_mode: socket
+    usage:
+      # Day rows: 283,680 requests, 77,760,000 request bytes and 489,600,000 response bytes per day.
+      - {egress: rotator, granularity: day, at: "2026-09-29", requests: 283680, req_bytes: 77760000, resp_bytes: 489600000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-09-30", requests: 283680, req_bytes: 77760000, resp_bytes: 489600000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-01", requests: 283680, req_bytes: 77760000, resp_bytes: 489600000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-02", requests: 283680, req_bytes: 77760000, resp_bytes: 489600000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-03", requests: 283680, req_bytes: 77760000, resp_bytes: 489600000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-04", requests: 283680, req_bytes: 77760000, resp_bytes: 489600000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-05", requests: 283680, req_bytes: 77760000, resp_bytes: 489600000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-06", requests: 283680, req_bytes: 77760000, resp_bytes: 489600000, overhead_bytes: 0}
+      - {egress: rotator, granularity: minute, window: ["-900m", "0m"], per_minute: 1, requests: 197, req_bytes: 54000, resp_bytes: 340000, overhead_bytes: 0}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      where: {egress: rotator}
+      requests: 11820
+  fires: false
+
+variants:
+  - case: projected_pct_80
+    description: At 80% of quota the 87.9% projection fires.
+    settings: {insight_egr_burn_projected_pct: 80}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - severity: any
+          family: egress
+          safe_auto: false
+          changes_required:
+            - any_of:
+                - {kind: setting, key: rotator_weight, current: 50, proposed: {lt: 50}}
+                - {kind: setting, key: rotator_daily_cap_mb, current: 0, proposed: {gt: 0}}
+          changes_forbidden:
+            - {kind: setting, key: rotator_quota_gb_per_month}

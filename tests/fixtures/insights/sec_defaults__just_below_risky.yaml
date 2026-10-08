@@ -1,0 +1,38 @@
+# SEC-DEFAULTS must stay quiet when settings are changed but sit exactly at, or just inside, the edge of their
+# high-risk range. Each value below is the closest value that is NOT high risk under the catalog's `high_risk_if`
+# condition (roxy/config/spec.py RiskCondition.matches):
+#
+#   setting                          value     high-risk condition
+#   tarpit_max_capacity_fraction     0.4       gt 0.4
+#   allowed_requests_per_minute      999       gte 1000
+#   flood_limit_per_minute           9999      gte 10000
+#   metrics_queue_max                200000    gt 200000
+#   admin_session_idle_timeout_s     14400     gt 14400
+#   cache_ttl_seconds                3600      eq 0 or gt 3600
+#   upstream_max_attempts            3         gte 4
+#   retention_minute_days            30        gt 30
+#   place_limit_enabled              1         none (medium risk only)
+#
+# A rule that compared with `>=` where the catalog says `>` (or used "differs from the default") would fire here.
+
+format: roxy.insight_fixture/1
+rule: SEC-DEFAULTS
+case: just_below_risky
+description: >
+  Nine settings moved away from their defaults, each to the last value before its high-risk range. None is at a high
+  risk value, so SEC-DEFAULTS must not fire.
+now: "2026-10-07T15:00:00Z"
+
+settings:
+  tarpit_max_capacity_fraction: 0.4
+  allowed_requests_per_minute: 999
+  flood_limit_per_minute: 9999
+  metrics_queue_max: 200000
+  admin_session_idle_timeout_s: 14400
+  cache_ttl_seconds: 3600
+  upstream_max_attempts: 3
+  retention_minute_days: 30
+  place_limit_enabled: 1
+
+expect:
+  fires: false

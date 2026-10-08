@@ -1,0 +1,116 @@
+# UP-4XX-SPIKE just under each of its three tests, plus CSRF handshakes that must not count (README.md here).
+#
+# 11.5: "the Roblox 403, 401 or 400 rate over 30 min exceeds 3x its 7-day baseline and at least 20 responses
+# (min 100 calls); excludes CSRF challenges". Each template below fails exactly one test:
+#
+#   template                                       baseline  last 30 min                         fails
+#   inventory.../items/Asset/{assetId}             25%       1,260 of 1,800 (70%)                multiple: 70% < 75%
+#                                                                                                (< 80.8% with the
+#                                                                                                window in the baseline)
+#   users.roblox.com/v1/users/{userId}             0%        19 x 400 of 150 calls               min_responses (20)
+#   groups.roblox.com/v1/groups/{groupId}          0%        45 x 403 of 90 calls                min_calls (100)
+#   presence.roblox.com/v1/presence/users (POST)   0%        180 of 600 writes needed a CSRF     CSRF is excluded
+#                                                            handshake (403 + x-csrf-token, then 200)
+#
+# The CSRF handshakes never reach the caller (each request is one 200 with 2 upstream calls); the first call's 403
+# is visible only in events.upstream_attempts. Each variant lowers one threshold just enough for one template.
+
+format: roxy.insight_fixture/1
+rule: UP-4XX-SPIKE
+case: just_under_thresholds
+description: >
+  Three endpoints show more Roblox rejections than usual, but each misses one of the three tests (rise over
+  baseline, minimum rejections, minimum calls), and a write endpoint goes through many CSRF handshakes, which the
+  rule excludes. The rule must stay quiet; lowering any one threshold makes exactly one endpoint fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  egress: direct
+  outcome: served_upstream
+  source: relay
+  cache_state: "MISS"
+  latency_ms: {p50: 150, p95: 400, p99: 800}
+
+profiles:
+  inv: {endpoint_template: "inventory.roblox.com/v1/users/{userId}/items/Asset/{assetId}"}
+  usr: {endpoint_template: "users.roblox.com/v1/users/{userId}"}
+  grp: {endpoint_template: "groups.roblox.com/v1/groups/{groupId}"}
+  pres: {endpoint_template: presence.roblox.com/v1/presence/users, method: POST, cache_state: "OFF"}
+  ok: {reason: upstream_ok, status: 200}
+  r400: {reason: upstream_4xx, status: 400}
+  r403: {reason: upstream_4xx, status: 403}
+
+traffic:
+  # --- 7-day baselines ----------------------------------------------------------------------------------------
+  - {name: inv_ok_base, profile: [inv, ok], window: ["-7d", "-30m"], per_minute: 3}
+  - {name: inv_403_base, profile: [inv, r403], window: ["-7d", "-30m"], per_minute: 1}
+  - {name: usr_ok_base, profile: [usr, ok], window: ["-7d", "-30m"], per_minute: 1}
+  - {name: grp_ok_base, profile: [grp, ok], window: ["-7d", "-30m"], per_minute: 1}
+  - {name: pres_ok_base, profile: [pres, ok], window: ["-7d", "-30m"], per_minute: 1}
+  # --- Last 30 minutes ----------------------------------------------------------------------------------------
+  - {name: inv_ok_recent, profile: [inv, ok], window: ["-30m", "0m"], per_minute: 18}
+  - {name: inv_403_recent, profile: [inv, r403], window: ["-30m", "0m"], per_minute: 42}
+  - {name: usr_ok_recent, profile: [usr, ok], window: ["-30m", "0m"], total: 131}
+  - {name: usr_400_recent, profile: [usr, r400], window: ["-30m", "0m"], total: 19}
+  - {name: grp_ok_recent, profile: [grp, ok], window: ["-30m", "0m"], total: 45}
+  - {name: grp_403_recent, profile: [grp, r403], window: ["-30m", "0m"], total: 45}
+  - {name: pres_ok_recent, profile: [pres, ok], window: ["-30m", "0m"], total: 420}
+  - {name: pres_csrf_recent, profile: [pres, ok], window: ["-30m", "0m"], total: 180, upstream_calls: 2}
+
+events:
+  upstream_attempts:
+    # pres_csrf_recent: 180 requests, each a 403 CSRF challenge then the same call with the token.
+    - {window: ["-30m", "0m"], total: 180, endpoint_template: presence.roblox.com/v1/presence/users, egress: direct, attempt: 1, status: 403, kind: first}
+    - {window: ["-30m", "0m"], total: 180, endpoint_template: presence.roblox.com/v1/presence/users, egress: direct, attempt: 1, status: 200, kind: csrf_retry}
+
+expect:
+  data_checks:
+    - window: ["-30m", "0m"]
+      where: {endpoint_template: "inventory.roblox.com/v1/users/{userId}/items/Asset/{assetId}"}
+      upstream_calls: 1800
+      by_reason: {upstream_4xx: 1260}
+    - window: ["-30m", "0m"]
+      where: {endpoint_template: "users.roblox.com/v1/users/{userId}"}
+      upstream_calls: 150
+      by_reason: {upstream_4xx: 19}
+    - window: ["-30m", "0m"]
+      where: {endpoint_template: "groups.roblox.com/v1/groups/{groupId}"}
+      upstream_calls: 90
+      by_reason: {upstream_4xx: 45}
+    - window: ["-30m", "0m"]
+      where: {endpoint_template: presence.roblox.com/v1/presence/users}
+      requests: 600
+      upstream_calls: 780
+      by_reason: {upstream_4xx: 0}
+
+  fires: false
+
+variants:
+  - case: baseline_multiple_2_5
+    description: 70% exceeds 2.5 times the inventory baseline (62.5%, or 67.3% with the window included).
+    settings: {insight_up_4xx_spike_baseline_multiple: 2.5}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "inventory.roblox.com/v1/users/{userId}/items"}
+  - case: min_responses_19
+    description: The users endpoint's 19 rejections meet a minimum of 19 ("at least" N responses).
+    settings: {insight_up_4xx_spike_min_responses: 19}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "users.roblox.com/v1/users/{userId}"}
+  - case: min_calls_90
+    description: The groups endpoint's 90 calls meet a minimum of 90 ("min 100 calls" is inclusive).
+    settings: {insight_up_4xx_spike_min_calls: 90}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "groups.roblox.com/v1/groups/{groupId}"}

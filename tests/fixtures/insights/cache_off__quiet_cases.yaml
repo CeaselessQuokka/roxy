@@ -1,0 +1,64 @@
+# CACHE-OFF stays quiet when the cache is on but its shared disk tier is off
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "cache_enabled=0 with traffic". Its switch is cache_enabled only.
+#
+#   cache_enabled = 1, cache_disk_enabled = 0: the shared cache.db tier is off, so each worker caches in memory
+#   only. That is a legitimate low-disk setup (15.3 D: "0 = memory only per worker"), and the traffic shows the
+#   cache working (65% of requests answered from memory). "The cache is turned off" is not true here.
+#   An old episode is also present: cache_enabled was 0 for 20 minutes two days ago (no traffic is kept from
+#   then), and it is back on.
+
+format: roxy.insight_fixture/1
+rule: CACHE-OFF
+case: quiet_cases
+description: >
+  The cache master switch is on (only the shared disk tier is off) and requests are being answered from the
+  memory tier, so CACHE-OFF must not fire. A brief cache_enabled = 0 episode two days ago, already reverted, must
+  not fire it either.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  cache_enabled: 1
+  cache_disk_enabled: 0
+
+tables:
+  rules_cache:
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 2, p95: 6, p99: 15}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-2h", "0m"], per_minute: 26}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-2h", "0m"], per_minute: 10}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-2h", "0m"], per_minute: 13}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-2h", "0m"], per_minute: 11}
+
+state:
+  settings_history:
+    - {at: "-30d", key: cache_disk_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Memory tier only on the small server."}
+    - {at: "-2d", key: cache_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Quick test."}
+    - {at: "-47h", key: cache_enabled, old: 0, new: 1, source: admin, changed_by: admin, reason: "Test done."}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 3600
+      served_cache: 2340
+  fires: false
+
+variants:
+  - case: severity_forced
+    description: Forcing a severity does not make a quiet rule fire.
+    settings: {insight_cache_off_severity: critical}
+    expect: {fires: false}

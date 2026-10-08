@@ -1,0 +1,74 @@
+# UP-BREAKER-FLAP just under its threshold (format: README.md in this directory).
+#
+# 11.5: "> 6 openings per hour on one key". The catalog search breaker opened every 13 minutes for three hours
+# (13 openings): the last hour holds 5, and no 60 minute stretch, fixed or sliding, can hold more than 5 (5 x 13 =
+# 65 > 60). The fixture never sits at exactly 6, so "> 6" and ">= openings_per_hour" agree. A threshold of 4
+# (variant) fires under either reading (5 in the last hour, 4.33 per hour over three).
+
+format: roxy.insight_fixture/1
+rule: UP-BREAKER-FLAP
+case: just_under
+description: >
+  A Roblox endpoint has occasional failure bursts and its breaker opens about four or five times an hour. That is
+  under the threshold of more than six openings per hour, so the rule stays quiet.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: catalog.roblox.com/v1/search/items
+
+traffic:
+  - name: search_ok
+    window: ["-180m", "0m"]
+    per_minute: 40
+    egress: direct
+    outcome: served_upstream
+    reason: upstream_ok
+    status: 200
+    source: relay
+    cache_state: "MISS"
+    latency_ms: {p50: 200, p95: 500, p99: 900}
+  - name: search_5xx
+    window: ["-180m", "0m"]
+    total: 65
+    egress: direct
+    outcome: failed
+    reason: upstream_5xx
+    status: 503
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 503
+    upstream_calls: 2
+    error: true
+    latency_ms: {p50: 900, p95: 2000, p99: 2400}
+
+state:
+  breakers:
+    - key: "endpoint:catalog.roblox.com/v1/search/items:direct"
+      state: closed
+      opened_at: "-8m"
+      half_open_at: "-450s"
+      failures: 0
+      successes: 0
+      window_start: "-7m"
+      openings: ["-164m", "-151m", "-138m", "-125m", "-112m", "-99m", "-86m", "-73m", "-60m", "-47m", "-34m", "-21m", "-8m"]
+
+expect:
+  data_checks:
+    - window: ["-180m", "0m"]
+      by_reason: {upstream_5xx: 65}
+
+  fires: false
+
+variants:
+  - case: openings_per_hour_4
+    description: Five openings in the last hour (4.33 per hour over three) pass a threshold of 4.
+    settings: {insight_up_breaker_flap_openings_per_hour: 4}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "catalog.roblox.com/v1/search/items"}

@@ -1,0 +1,100 @@
+# ABUSE-DIST: "SPAM-DIST fired" (11.5). SPAM-DIST (10.3, 15.3 E2) is "> 50 IPs, one UA hash, > 1000 requests per
+# 5 minutes on one template"; its action is `recommend`, so a detection is a `spam_detected` event
+# (roxy/abuse/spam.py) whose subject is "<template>|<ua_hash>".
+#
+# For the last 15 minutes 120 addresses in 198.51.100.0/25 have walked users.roblox.com/v1/users/{userId} with the
+# same UA (okhttp/4.12.0) at 400 requests per minute: 2,000 per 5 minutes. Each address sends only about 3.3 per
+# minute, under the per-IP limit of 12 per minute, which is why no per-IP control refuses them. The detector fired
+# three times (one detection per 5 minute window).
+#
+# 11.5's change is "UA rule with global scope, or enable throttle-all temporarily". Throttle-all is service state,
+# not a catalog setting, so it can only appear as a `manual` change; a UA rule must be global (scope `global` in
+# rules_user_agent) and must not match the Roblox game-server UA. Banning 120 addresses is not on the row.
+
+format: roxy.insight_fixture/1
+rule: ABUSE-DIST
+case: distributed_burst
+description: >
+  120 addresses sharing one okhttp UA send 2,000 requests per 5 minutes to one users endpoint while staying under the
+  per-IP limit, and SPAM-DIST fired three times. ABUSE-DIST must raise one recommendation: a global-scope UA rule for
+  that UA or a manual throttle-all step, never a ban and never a rule that would also hit the Roblox UA.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+  swarm:
+    clients: {cidr: "198.51.100.0/25", count: 120}
+    user_agent: "okhttp/4.12.0"
+    endpoint_template: "users.roblox.com/v1/users/{userId}"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  - {name: swarm_miss, profile: [miss, swarm], window: ["-15m", "0m"], per_minute: 320}
+  - {name: swarm_hit, profile: [hit, swarm], window: ["-15m", "0m"], per_minute: 80}
+
+events:
+  security:
+    - {at: "-11m", type: spam_detected, severity: info, reason_code: SPAM-DIST, endpoint_template: "users.roblox.com/v1/users/{userId}", detail: {detector: SPAM-DIST, subject: "users.roblox.com/v1/users/{userId}|4db9c447c8a3cccc", value: 120, threshold: 50, window_s: 300, action: recommend, configured_action: recommend, game_server: false, evidence: "120 addresses with one User-Agent sent 2000 requests in 300 s"}}
+    - {at: "-6m", type: spam_detected, severity: info, reason_code: SPAM-DIST, endpoint_template: "users.roblox.com/v1/users/{userId}", detail: {detector: SPAM-DIST, subject: "users.roblox.com/v1/users/{userId}|4db9c447c8a3cccc", value: 120, threshold: 50, window_s: 300, action: recommend, configured_action: recommend, game_server: false, evidence: "120 addresses with one User-Agent sent 2000 requests in 300 s"}}
+    - {at: "-1m", type: spam_detected, severity: info, reason_code: SPAM-DIST, endpoint_template: "users.roblox.com/v1/users/{userId}", detail: {detector: SPAM-DIST, subject: "users.roblox.com/v1/users/{userId}|4db9c447c8a3cccc", value: 120, threshold: 50, window_s: 300, action: recommend, configured_action: recommend, game_server: false, evidence: "120 addresses with one User-Agent sent 2000 requests in 300 s"}}
+
+state:
+  client_scores:
+    - {clients: {cidr: "198.51.100.0/25", count: 120}, bot_score: 64}
+    - {clients: {cidr: "203.0.113.0/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - window: ["-5m", "0m"]
+      where: {endpoint_template: "users.roblox.com/v1/users/{userId}"}
+      requests: 2000
+      upstream_calls: 1600
+      refused: 0
+    - {window: ["-60m", "0m"], requests: 9000}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: ABUSE-DIST
+      severity: any
+      family: abuse
+      confidence: medium
+      changes_required:
+        - any_of:
+            - {kind: filter_add, table: rules_user_agent, proposed: {needle: {regex: '(?i)okhttp'}, scope: global}}
+            - {kind: rule_upsert, table: rules_user_agent, proposed: {needle: {regex: '(?i)okhttp'}, scope: global}}
+            - {kind: manual}
+      changes_forbidden:
+        - any_of:
+            - {kind: filter_add, table: rules_user_agent, proposed: {needle: {regex: '(?i)roblox'}}}
+            - {kind: rule_upsert, table: rules_user_agent, proposed: {needle: {regex: '(?i)roblox'}}}
+            - {kind: filter_add, table: rules_user_agent, proposed: {scope: ip}}
+            - {kind: rule_upsert, table: rules_user_agent, proposed: {scope: ip}}
+        - kind: setting
+          key: {in: [allowed_requests_per_minute, throttle_reset_duration, flood_limit_per_minute, user_agent_rules_enabled]}
+      change_kinds_forbidden: [ban_add, bypass_add, bypass_remove, ban_remove, bucket_override, host_add, rule_delete, filter_remove]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule even though SPAM-DIST fired.
+    settings: {insight_abuse_dist_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_abuse_dist_severity replaces the computed severity.
+    settings: {insight_abuse_dist_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: critical}

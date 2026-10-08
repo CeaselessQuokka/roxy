@@ -1,0 +1,93 @@
+# UP-5XX just under its minimum sample size (format: README.md in this directory).
+#
+# 11.5: "5xx rate > 5% over 10 min (min 100 calls)". At night traffic is thin: in the last 10 minutes there were
+# 80 caller requests and 90 upstream calls, 30 of them 5xx (33% of calls, 25% of requests). The rate is far over
+# 5%, but 90 calls (80 requests) is under the 100 call minimum, so the rule must wait for more evidence. With a
+# minimum of 80 (variant), both counts qualify and it fires.
+#
+#   last 10 minutes, GET games.roblox.com/v1/games
+#   night_ok        60 requests, 60 calls
+#   night_failed    10 requests, 20 calls (503 twice)
+#   night_stale     10 requests, 10 calls (503, served stale)
+
+format: roxy.insight_fixture/1
+rule: UP-5XX
+case: quiet_period_below_min_calls
+description: >
+  A third of the few upstream calls made in a quiet night-time window got a Roblox 503, but there were only 90
+  calls in the last 10 minutes, under the 100 call minimum, so the rule stays quiet.
+now: "2026-10-07T07:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games", type: glob, ttl: 60, stale_ttl: 30, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/28", count: 6}
+  places: ["1000000001"]
+  endpoint_template: games.roblox.com/v1/games
+
+profiles:
+  ok: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 150, p95: 400, p99: 800}}
+
+traffic:
+  - {name: night_ok_before, profile: ok, window: ["-60m", "-10m"], per_minute: 8}
+  - {name: night_ok, profile: ok, window: ["-10m", "0m"], total: 60}
+  - name: night_failed
+    window: ["-10m", "0m"]
+    total: 10
+    egress: direct
+    outcome: failed
+    reason: upstream_5xx
+    status: 503
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 503
+    upstream_calls: 2
+    error: true
+    latency_ms: {p50: 900, p95: 2200, p99: 2600}
+  - name: night_stale
+    window: ["-10m", "0m"]
+    total: 10
+    egress: direct
+    outcome: served_cache
+    reason: cache_stale_error
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    upstream_status: 503
+    upstream_calls: 1
+    error: true
+    latency_ms: {p50: 400, p95: 700, p99: 900}
+
+events:
+  upstream_attempts:
+    - {window: ["-10m", "0m"], total: 20, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: 503, kind: first}
+    - {window: ["-10m", "0m"], total: 10, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: 503, kind: retry_5xx}
+
+expect:
+  data_checks:
+    - window: ["-10m", "0m"]
+      requests: 80
+      upstream_calls: 90
+      by_reason: {upstream_5xx: 10, cache_stale_error: 10}
+    - window: ["-60m", "-10m"]
+      by_reason: {upstream_5xx: 0, cache_stale_error: 0}
+
+  fires: false
+
+variants:
+  - case: min_calls_80
+    description: 90 calls (80 requests) meet a minimum of 80, and a third of the calls were 5xx.
+    settings: {insight_up_5xx_min_calls: 80}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - kind: rule_upsert
+              table: rules_cache
+              match: {pattern: {matches_targets: ["games.roblox.com/v1/games"]}}
+              proposed: {stale_ttl: {gt: 30}}

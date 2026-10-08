@@ -1,0 +1,29 @@
+format: roxy.health_fixture/1
+check: H-LEADER
+case: pass
+name: renewed_jobs_on_time
+description: >
+  The `leader` lease is held by a fresh worker and expires in 12 s; with the 15 s TTL that means it was renewed
+  3 s ago. Every leader job started within its own interval. 13.2 H-LEADER: renewed under 10 s and jobs on time
+  gives pass.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    ROXY_WORKERS: "2"
+  state:
+    workers:
+      - {pid: 41001, worker_id: "roxy-test:41001:a1b2c3d4", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-1s", loop_lag_ms_p99: 6, open_conns: 40, is_leader: 1, version: "3f9c2a1"}
+      - {pid: 41002, worker_id: "roxy-test:41002:b2c3d4e5", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-2s", loop_lag_ms_p99: 7, open_conns: 38, is_leader: 0, version: "3f9c2a1", x_self: true}
+    leader:
+      holder: "roxy-test:41001:a1b2c3d4"
+      expires: "+12s"
+      epoch: 7
+      x_jobs:
+        - {name: retention, interval_s: 600, last_started_at: "-4m", last_finished_at: "-4m", last_ok: true}
+        - {name: hot_prune, interval_s: 60, last_started_at: "-40s", last_finished_at: "-40s", last_ok: true}
+        - {name: wal_checkpoint_passive, interval_s: 300, last_started_at: "-3m", last_finished_at: "-3m", last_ok: true}
+        - {name: daily_maintenance, interval_s: 300, last_started_at: "-2m", last_finished_at: "-2m", last_ok: true}
+        - {name: file_retention, interval_s: 600, last_started_at: "-7m", last_finished_at: "-7m", last_ok: true}
+expect:
+  status: pass
+  credential_calls: {eq: 0}

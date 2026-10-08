@@ -1,0 +1,133 @@
+# CACHE-KEYSPLIT stays quiet when each split group misses one threshold by a little
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "v1 Suspect rule (>= 5 entries, top param >= 80% distinct, hits <= 10%)"
+# (insight_cache_keysplit_min_entries 5, _distinct_pct 80, _max_hit_pct 10).
+#
+#   group                                  entries  top parameter  distinct      hits        misses
+#   GET games.roblox.com/v1/games/votes          4  `_`            4 (100%)      0           entries (>= 5)
+#   GET catalog.roblox.com/v1/search/items      24  `t`            19 (79.2%)    0           distinct (>= 80%)
+#   GET games.roblox.com/v1/games               10  `cb`           10 (100%)     2 (20%)     hits (<= 10%)
+#
+# All three parameters are cache busters (a timestamp, a minute stamp that some callers share, a random number),
+# so when a variant moves a threshold past the data, ignoring that parameter is the right fix. In the search
+# group five entries repeat a `t` value and differ only in `limit` (10 instead of 30), which is why only 19 of
+# the 24 `t` values are distinct.
+
+format: roxy.insight_fixture/1
+rule: CACHE-KEYSPLIT
+case: below_thresholds
+description: >
+  Three cache-busted groups, each just inside one of the three v1 Suspect limits: 4 entries, 79% distinct, 20%
+  hits. Nothing may fire at the defaults; each variant fires exactly the group next to the threshold it moves,
+  with that group's busting parameter as the ignored parameter.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 2, pattern: "catalog.roblox.com/v1/search/items", type: glob, ttl: 120, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: votes_miss, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-15m", "0m"], total: 4}
+  - {name: search_miss, profile: miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-20m", "0m"], total: 24}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], total: 2}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], total: 10}
+
+state:
+  cache:
+    entries:
+      - {id: "2ac7587a1475b292cce5ec31", key: "GET games.roblox.com/v1/games/votes?_=1791384480000&universeIds=1000000101", method: "GET", host: "games.roblox.com", path: "v1/games/votes", params_json: "{\"params\":[[\"universeIds\",\"1000000101\"],[\"_\",\"1791384480000\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-1m", expires_at: "+4m", stale_until: "+14m", ttl: 300, rule_id: 1, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "cd7f9379563dfa5a3d966190", key: "GET games.roblox.com/v1/games/votes?_=1791384487919&universeIds=1000000101", method: "GET", host: "games.roblox.com", path: "v1/games/votes", params_json: "{\"params\":[[\"universeIds\",\"1000000101\"],[\"_\",\"1791384487919\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-6m", expires_at: "-1m", stale_until: "+9m", ttl: 300, rule_id: 1, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "77bde55dd9ebca7173ea7aaa", key: "GET games.roblox.com/v1/games/votes?_=1791384495838&universeIds=1000000101", method: "GET", host: "games.roblox.com", path: "v1/games/votes", params_json: "{\"params\":[[\"universeIds\",\"1000000101\"],[\"_\",\"1791384495838\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-11m", expires_at: "-6m", stale_until: "+4m", ttl: 300, rule_id: 1, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "10bc588b91f5c1b3a3b12c9d", key: "GET games.roblox.com/v1/games/votes?_=1791384503757&universeIds=1000000101", method: "GET", host: "games.roblox.com", path: "v1/games/votes", params_json: "{\"params\":[[\"universeIds\",\"1000000101\"],[\"_\",\"1791384503757\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-4m", expires_at: "+1m", stale_until: "+11m", ttl: 300, rule_id: 1, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "fdb2b47e036515c86c0ae4c4", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791383880", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791383880\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-1m", expires_at: "+1m", stale_until: "+11m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "256c69248e7beea955be1179", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791383940", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791383940\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-6m", expires_at: "-4m", stale_until: "+6m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "144ec94208568cda27498b99", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384000", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384000\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-11m", expires_at: "-9m", stale_until: "+1m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "240e48c527f5acbd0a743e77", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384060", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384060\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-4m", expires_at: "-2m", stale_until: "+8m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "928b640c9a7c1e2e9f2490dc", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384120", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384120\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-9m", expires_at: "-7m", stale_until: "+3m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "ab09272c6d8c7ee72173b56a", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384180", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384180\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-2m", expires_at: "+0m", stale_until: "+10m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "38968a91152739f8f5a216b5", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384240", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384240\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-7m", expires_at: "-5m", stale_until: "+5m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "29e84be713a670484305226f", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384300", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384300\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-12m", expires_at: "-10m", stale_until: "-0m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "06353c3254eaaaf454caa474", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384360", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384360\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-5m", expires_at: "-3m", stale_until: "+7m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "f4d3854f6343d7a2c327baef", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384420", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384420\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-10m", expires_at: "-8m", stale_until: "+2m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "b5a84c553e8b39b50968a126", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384480", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384480\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-3m", expires_at: "-1m", stale_until: "+9m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "707814fea3d85e4632db6f91", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384540", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384540\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-8m", expires_at: "-6m", stale_until: "+4m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "0be1c1a4e1dd67feea6f8743", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384600", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384600\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-1m", expires_at: "+1m", stale_until: "+11m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "e3294d5b4ef64723fc7c25ad", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384660", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384660\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-6m", expires_at: "-4m", stale_until: "+6m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "0e4294e54362247214d0c161", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384720", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384720\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-11m", expires_at: "-9m", stale_until: "+1m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "efd3cfd04b9ac23d165109e4", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384780", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384780\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-4m", expires_at: "-2m", stale_until: "+8m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "b56ae033ba5406f9da9b8ee8", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384840", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384840\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-9m", expires_at: "-7m", stale_until: "+3m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "e1edd3ceabf8974ba8170047", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384900", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384900\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-2m", expires_at: "+0m", stale_until: "+10m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "7fa9b2d6f241e8cbe9ffd26d", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30&t=1791384960", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"],[\"t\",\"1791384960\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-7m", expires_at: "-5m", stale_until: "+5m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "a9c4c351f47049806b021d31", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=10&t=1791383880", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"10\"],[\"t\",\"1791383880\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-12m", expires_at: "-10m", stale_until: "-0m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "f9e4f16e9b01ff5c5972d6e2", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=10&t=1791383940", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"10\"],[\"t\",\"1791383940\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-5m", expires_at: "-3m", stale_until: "+7m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "d3df514e724c7393c1e585d2", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=10&t=1791384000", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"10\"],[\"t\",\"1791384000\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-10m", expires_at: "-8m", stale_until: "+2m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "d15a531614b3e963e6e8d0db", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=10&t=1791384060", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"10\"],[\"t\",\"1791384060\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-3m", expires_at: "-1m", stale_until: "+9m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "d6543efda875293b6fd5e87e", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=10&t=1791384120", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"10\"],[\"t\",\"1791384120\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-8m", expires_at: "-6m", stale_until: "+4m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "c415fdfd227636e81a4dd27b", key: "GET games.roblox.com/v1/games?cb=48213&universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"],[\"cb\",\"48213\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-1m", expires_at: "+4m", stale_until: "+14m", ttl: 300, rule_id: 4, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "f9c77f2cdf5996518ac260b7", key: "GET games.roblox.com/v1/games?cb=49190&universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"],[\"cb\",\"49190\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-6m", expires_at: "-1m", stale_until: "+9m", ttl: 300, rule_id: 4, egress: "direct", hits: 1, body_len: 900, bytes: 1100}
+      - {id: "0a73d39db865a3030ce3cefc", key: "GET games.roblox.com/v1/games?cb=50167&universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"],[\"cb\",\"50167\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-11m", expires_at: "-6m", stale_until: "+4m", ttl: 300, rule_id: 4, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "1ddaa82a0cf02e6468a4560d", key: "GET games.roblox.com/v1/games?cb=51144&universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"],[\"cb\",\"51144\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-4m", expires_at: "+1m", stale_until: "+11m", ttl: 300, rule_id: 4, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "2db0b91c0eccbf67ca898f69", key: "GET games.roblox.com/v1/games?cb=52121&universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"],[\"cb\",\"52121\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-9m", expires_at: "-4m", stale_until: "+6m", ttl: 300, rule_id: 4, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "b3bdb95467c0d6cbb1bdeeef", key: "GET games.roblox.com/v1/games?cb=53098&universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"],[\"cb\",\"53098\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-2m", expires_at: "+3m", stale_until: "+13m", ttl: 300, rule_id: 4, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "99fc0e4ff9c80be50bd128ab", key: "GET games.roblox.com/v1/games?cb=54075&universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"],[\"cb\",\"54075\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-7m", expires_at: "-2m", stale_until: "+8m", ttl: 300, rule_id: 4, egress: "direct", hits: 1, body_len: 900, bytes: 1100}
+      - {id: "2144ce57a9c2237b5062112c", key: "GET games.roblox.com/v1/games?cb=55052&universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"],[\"cb\",\"55052\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-12m", expires_at: "-7m", stale_until: "+3m", ttl: 300, rule_id: 4, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "1f1cbdacda81981a07ae109a", key: "GET games.roblox.com/v1/games?cb=56029&universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"],[\"cb\",\"56029\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-5m", expires_at: "+0m", stale_until: "+10m", ttl: 300, rule_id: 4, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "6299c772d811d955ba491f75", key: "GET games.roblox.com/v1/games?cb=57006&universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"],[\"cb\",\"57006\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-10m", expires_at: "-5m", stale_until: "+5m", ttl: 300, rule_id: 4, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+
+expect:
+  fires: false
+
+variants:
+  - case: min_entries_4
+    description: Four entries are enough; the votes group (`_` 100% distinct, no hits) is flagged.
+    settings: {insight_cache_keysplit_min_entries: 4}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "games.roblox.com/v1/games/votes"
+          severity: any
+          changes_required:
+            - {kind: ignored_param_add, proposed: {name: "_"}}
+          changes_forbidden:
+            - {kind: ignored_param_add, proposed: {name: {ne: "_"}}}
+  - case: distinct_pct_79
+    description: 79% distinct is enough; the search group (`t` 19 of 24) is flagged.
+    settings: {insight_cache_keysplit_distinct_pct: 79}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "catalog.roblox.com/v1/search/items"
+          severity: any
+          changes_required:
+            - {kind: ignored_param_add, proposed: {name: "t"}}
+          changes_forbidden:
+            - {kind: ignored_param_add, proposed: {name: {in: [keyword, limit]}}}
+  - case: max_hit_pct_20
+    description: Up to 20% hits allowed; the games group (`cb`, 2 hits in 10 entries) is flagged.
+    settings: {insight_cache_keysplit_max_hit_pct: 20}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "games.roblox.com/v1/games"
+          severity: any
+          changes_required:
+            - {kind: ignored_param_add, proposed: {name: "cb"}}
+          changes_forbidden:
+            - {kind: ignored_param_add, proposed: {name: universeIds}}

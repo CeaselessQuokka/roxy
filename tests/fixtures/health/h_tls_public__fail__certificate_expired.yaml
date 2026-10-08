@@ -1,0 +1,16 @@
+format: roxy.health_fixture/1
+check: H-TLS-PUBLIC
+case: fail
+name: certificate_expired
+description: >
+  The public certificate has already expired, so the handshake to the public origin fails verification. 13.2
+  H-TLS-PUBLIC: lower than 7 days gives fail; an expired certificate is the extreme of that.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  tls:
+    origin: {error: expired}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)certificate"}
+  credential_calls: {eq: 0}

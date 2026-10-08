@@ -1,0 +1,41 @@
+format: roxy.health_fixture/1
+check: H-CRED-AUTH
+case: fail
+name: rejected_401
+description: >
+  The credential probe gets 401: Roblox no longer accepts the credential. 13.2 H-CRED-AUTH: 401 or 403 gives
+  fail, with the Credential page and the "Credential rejected" runbook as the fix. 7.9 allows one confirming
+  probe before marking the credential rejected, so at most two credential calls.
+now: "2026-10-07T15:00:00Z"
+run: {trigger: manual}
+inputs:
+  state:
+    credential: {present: true, status: active, status_at: "-25m", set_at: "-20d", account_id: "1000001"}
+  upstream:
+    "https://users.roblox.com/v1/users/authenticated":
+      status: 401
+      json: {errors: [{code: 0, message: "Unauthorized"}]}
+      latency_ms: 110
+      expect_request: {via: credential, method: GET}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)credential"}
+  calls:
+    "https://users.roblox.com/v1/users/authenticated": {count: {between: [1, 2]}, via: credential}
+  credential_calls: {between: [1, 2]}
+variants:
+  - case: fail
+    name: rejected_403
+    inputs:
+      upstream:
+        "https://users.roblox.com/v1/users/authenticated":
+          status: 403
+          json: {errors: [{code: 0, message: "Forbidden"}]}
+          latency_ms: 110
+          expect_request: {via: credential, method: GET}
+    expect:
+      status: fail
+      explanation: {present: true}
+      fix_link: {regex: "(?i)credential"}
+      credential_calls: {between: [1, 2]}

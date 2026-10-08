@@ -1,0 +1,20 @@
+format: roxy.health_fixture/1
+check: H-DNS
+case: pass
+name: fast_public
+description: >
+  Every allowed host resolves to public addresses (documentation ranges count as public through the classifier
+  seam), and the slowest answer takes 85 ms. 13.2 H-DNS: under 100 ms gives pass. The host list is set to four
+  hosts so the fixture can name every lookup.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    allowed_roblox_hosts: [games.roblox.com, users.roblox.com, thumbnails.roblox.com, presence.roblox.com]
+  dns:
+    games.roblox.com: {answers: ["192.0.2.10", "2001:db8::10"], latency_ms: 18}
+    users.roblox.com: {answers: ["192.0.2.11"], latency_ms: 85}
+    thumbnails.roblox.com: {answers: ["198.51.100.40", "198.51.100.41"], latency_ms: 22}
+    presence.roblox.com: {answers: ["203.0.113.12"], latency_ms: 31}
+expect:
+  status: pass
+  credential_calls: {eq: 0}

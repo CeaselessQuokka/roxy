@@ -1,0 +1,341 @@
+# Plan 11.6 "before and after", reproduced as fixture data (format: tests/fixtures/insights/README.md).
+#
+# The v1 banner said "Roblox has rate-limited us 579 time(s)" with no window, no endpoint and no button. The v2
+# card for the same situation is one UP-429-ENDPOINT recommendation. Every number on the 11.6 card is built into
+# the data below, and `data_checks` proves the data says what the card says before any rule runs:
+#
+#   card says                                      where it comes from here
+#   412 x 429 from 14:00 to 15:00 UTC              users_batch_429_* generators (317 + 95), egress direct
+#   71% of all 429s                                412 of 580 (the other 168 are on catalog search)
+#   2,940 upstream calls to this endpoint          2,433 single-call requests + 317 + 95 x 2 (rotator retry)
+#   hit ratio 0%, POST caching off                 cache_post_requests = off, every request cache_state OFF
+#   96% of refetches over 24 h identical           events.change_observations (2,928 of 3,050)
+#   23% of those 429s retried on the rotator       95 of 412 (fallback_on_429 = 1)
+#   bucket fill peaked at 100%                     state.buckets history (episode: about 116 calls per
+#                                                  minute against 120 per minute, burst 10)
+#   average Retry-After 30 s                       every upstream_429 row has retry_after_s 30
+#   avoided 8,120 of 19,300 requests (42%)         19,300 requests, 11,180 upstream calls, no refusals
+#   640 stale-after-failure serves                 168 (catalog search, 429) + 472 (games list, 503)
+#   bucket 120 -> 90 per minute                    default endpoint bucket (no upstream_limits row); the
+#                                                  highest 429-free sustained rate is 112 per minute
+#                                                  (16 minutes, zero 429s), and 80% of 112 is 89.6
+#   TTL 600 s                                      request samples: bodies change every 600 s per key; the
+#                                                  11.3 tuner (pooled, per-key or midpoint median) gives 600
+#   about 2,500 fewer calls per hour               11.3 cache replay over the samples: 2,485 at TTL 600
+#
+# Plan conflict resolved here (report it, do not "fix" it by editing this file): 11.6 predates the v2 enum for
+# `cache_post_requests` (15.3 D). "POST caching is off" can only mean `cache_post_requests = off` in v2, and with
+# `off` a cache rule that allows POST has no effect ("Never cache POST responses"). 11.5 says "if POST batch,
+# enable POST caching for it", so the recommendation must also move `cache_post_requests` from `off` to
+# `allowlist` (never to `all`). The three changes printed on the 11.6 card are required, plus that fourth one.
+#
+# Scenario choices that keep the numbers stable: `adaptive_rate_enabled` = 0 (otherwise the adaptive controller
+# would already have cut the endpoint bucket after the first 429, and the "current" value would not be 120);
+# `seed_defaults` false (v1 had no default cache rules, so the users batch rule is new, `current: null`).
+
+format: roxy.insight_fixture/1
+rule: UP-429-ENDPOINT
+case: before_after_11_6
+description: >
+  One hour in which Roblox answers 412 POST users.roblox.com/v1/users calls on the direct path with 429. The
+  endpoint is never cached because POST caching is off, Roxy retries 23% of those 429s on the rotator because
+  fallback_on_429 was left on after an old incident, and its bucket is the global default of 120 per minute.
+  The rule must produce the 11.6 card: critical, high confidence, scoped to that endpoint, with the cache rule,
+  the fallback_on_429 revert and an endpoint-only bucket override, and it must not be safe to auto-apply.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  fallback_on_429: 1
+  cache_post_requests: "off"
+  adaptive_rate_enabled: 0
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-60d"}
+    - {id: 2, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-60d"}
+    - {id: 3, pattern: "groups.roblox.com/v1/groups/*", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-60d"}
+    - {id: 4, pattern: "badges.roblox.com/v1/badges/*", type: glob, ttl: 3600, methods: "GET", origin: admin, created_at: "-60d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+  bypass: false
+  error: false
+
+profiles:
+  # Outcome shapes.
+  hit:
+    egress: none
+    outcome: served_cache
+    reason: cache_hit
+    status: 200
+    source: cache
+    cache_state: "HIT"
+    upstream_calls: 0
+    latency_ms: {p50: 3, p95: 9, p99: 20}
+    bytes: {caller_in: 0, caller_out: 1800}
+  miss:
+    egress: direct
+    outcome: served_upstream
+    reason: upstream_ok
+    status: 200
+    source: relay
+    cache_state: "MISS"
+    upstream_calls: 1
+    latency_ms: {p50: 140, p95: 380, p99: 750}
+    bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}
+  stale_after_failure:
+    egress: direct
+    outcome: served_cache
+    reason: cache_stale_error
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    upstream_calls: 1
+    error: true
+    latency_ms: {p50: 120, p95: 300, p99: 600}
+    bytes: {caller_in: 0, caller_out: 1800, upstream_in: 150, upstream_out: 420}
+  # The endpoint under test: a read-only batch lookup sent as POST, never cached today.
+  users_batch:
+    endpoint_template: users.roblox.com/v1/users
+    host: users.roblox.com
+    method: POST
+    cache_state: "OFF"
+    bytes: {caller_in: 260, caller_out: 2400, upstream_in: 2300, upstream_out: 700}
+    latency_ms: {p50: 180, p95: 450, p99: 900}
+    samples: {key_space: users_batch, keys: 60, body_change_interval_s: 600}
+
+traffic:
+  # --- POST users.roblox.com/v1/users: 2,845 requests, 2,940 upstream calls, 412 Roblox 429s -----------------
+  - name: users_batch_ok_sustained
+    profile: [miss, users_batch]
+    window: ["-60m", "-44m"]
+    per_minute: 112           # 16 minutes at 112 per minute with zero 429s: the highest 429-free sustained rate
+  - name: users_batch_ok_quiet
+    profile: [miss, users_batch]
+    window: ["-44m", "-12m"]
+    per_minute: 12            # with 60 sample keys, each key is fetched every 300 s, a divisor of the 600 s change
+  - name: users_batch_ok_episode
+    profile: [miss, users_batch]
+    window: ["-12m", "-6m"]
+    total: 185
+  - name: users_batch_429_no_retry
+    profile: [users_batch]
+    window: ["-12m", "-6m"]
+    total: 317
+    egress: direct
+    outcome: failed
+    reason: upstream_cooldown  # plan 7.13 row "Roblox 429 or cooldown with no stale": caller gets 429
+    status: 429
+    source: roxy
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    latency_ms: {p50: 90, p95: 220, p99: 400}
+    bytes: {caller_in: 260, caller_out: 75, upstream_in: 150, upstream_out: 700}
+    upstream_429:
+      egress: direct
+      retry_after_s: 30
+      ratelimit_headers: {x-ratelimit-remaining: "0", x-ratelimit-reset: "30"}
+  - name: users_batch_429_rotator_retry
+    profile: [users_batch]
+    window: ["-12m", "-6m"]
+    total: 95                  # 23% of the 412 direct 429s, retried once on the rotator (fallback_on_429 = 1)
+    egress: rotator            # egress of the final attempt
+    outcome: served_upstream
+    reason: upstream_ok
+    status: 200
+    source: relay
+    upstream_status: 200
+    upstream_calls: 2          # the direct call that got 429 plus the rotator retry
+    latency_ms: {p50: 650, p95: 1400, p99: 2200}
+    bytes: {caller_in: 260, caller_out: 2400, upstream_in: 1225, upstream_out: 700}   # per call, x2
+    upstream_429:
+      egress: direct           # the 429 happened on the first (direct) attempt
+      retry_after_s: 30
+      ratelimit_headers: {x-ratelimit-remaining: "0", x-ratelimit-reset: "30"}
+  - name: users_batch_ok_tail
+    profile: [miss, users_batch]
+    window: ["-6m", "0m"]
+    per_minute: 12
+
+  # --- GET catalog.roblox.com/v1/search/items: the other 168 Roblox 429s (29% of all), served stale -----------
+  - {name: catalog_search_hit, profile: hit, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], total: 600}
+  - {name: catalog_search_miss, profile: miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], total: 1032}
+  - name: catalog_search_stale_429
+    profile: stale_after_failure
+    endpoint_template: catalog.roblox.com/v1/search/items
+    window: ["-60m", "0m"]
+    total: 168
+    upstream_status: 429
+    upstream_429:
+      egress: direct
+      retry_after_s: 30
+
+  # --- Other GET traffic, no 429s ----------------------------------------------------------------------------
+  - {name: games_list_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 3000}
+  - {name: games_list_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 1528}
+  - {name: games_list_stale_503, profile: stale_after_failure, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 472, upstream_status: 503}
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 2615}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 2000}
+  - {name: votes_hit, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 1000}
+  - {name: votes_miss, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 1000}
+  - {name: group_hit, profile: hit, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-60m", "0m"], total: 500}
+  - {name: group_miss, profile: miss, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-60m", "0m"], total: 1040}
+  - {name: badge_hit, profile: hit, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-60m", "0m"], total: 500}
+  - {name: badge_miss, profile: miss, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-60m", "0m"], total: 1000}
+
+events:
+  change_observations:
+    # 96% of refetches over the last 24 h returned an identical body (2,928 of 3,050).
+    - {endpoint_template: users.roblox.com/v1/users, day: "2026-10-06", refetches: 1800, identical_bodies: 1728}
+    - {endpoint_template: users.roblox.com/v1/users, day: "2026-10-07", refetches: 1250, identical_bodies: 1200}
+
+state:
+  buckets:
+    - bucket_key: "endpoint:users.roblox.com/v1/users"
+      per_min: 120             # endpoint_bucket_default_per_min; there is no upstream_limits row
+      burst: 10
+      fill_pct: 9
+      history:
+        - {window: ["-60m", "-44m"], fill_pct_peak: 94, attempts: 1792, rejections: 0}
+        - {window: ["-44m", "-12m"], fill_pct_peak: 12, attempts: 384, rejections: 0}
+        - {window: ["-12m", "-6m"], fill_pct_peak: 100, attempts: 692, rejections: 0}
+        - {window: ["-6m", "0m"], fill_pct_peak: 11, attempts: 72, rejections: 0}
+  cooldowns:
+    # The last Retry-After cooldown from the episode, already over (rows stay until pruned).
+    - {key: "endpoint:users.roblox.com/v1/users:direct", until: "-5m", source: retry_after, set_at: "-6m", hits: 412}
+  settings_history:
+    - {at: "-40d", key: adaptive_rate_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Pin bucket rates while comparing with v1."}
+    - {at: "-40d", key: cache_post_requests, old: "allowlist", new: "off", source: admin, changed_by: admin, reason: "Match v1, which never cached POST."}
+    - {at: "-9d", key: fallback_on_429, old: 0, new: 1, source: admin, changed_by: admin, reason: "Incident: retry 429s on the rotator until Roblox recovers."}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 19300
+      upstream_calls: 11180
+      avoided_calls: 8120
+      roblox_429: 580
+      stale_after_failure: 640
+      refused: 0
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: users.roblox.com/v1/users, method: POST}
+      requests: 2845
+      upstream_calls: 2940
+      roblox_429: 412
+      served_cache: 0
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: users.roblox.com/v1/users, egress: rotator}
+      requests: 95
+      upstream_calls: 190
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: catalog.roblox.com/v1/search/items}
+      requests: 1800
+      upstream_calls: 1200
+      roblox_429: 168
+
+  fires: true
+  others: forbid               # only the two endpoints with 429s may get an UP-429-ENDPOINT recommendation
+  recommendations:
+    - rule_id: UP-429-ENDPOINT
+      subject_contains: "users.roblox.com/v1/users"
+      severity: critical
+      confidence: high         # 412 >= insight_up_429_endpoint_high_confidence_n (50)
+      family: upstream
+      safe_auto: false         # 11.2: a `setting` change (fallback_on_429) is global, so never safe_auto
+      evidence:
+        metrics:
+          roblox_429: 412
+          share_of_all_roblox_429: {between: [0.70, 0.72]}
+          cache_hit_ratio: 0
+      change_kinds_required: [rule_upsert, setting, bucket_override]
+      change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, credential_allowlist_remove]
+      changes_required:
+        # 1. Cache rule users.roblox.com/v1/users that allows POST, TTL from the tuner (600 s), SWR on (11.6 shows
+        #    "methods GET and POST" and stale-while-revalidate 120 s; the spec only requires POST and SWR > 0).
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["users.roblox.com/v1/users"]}}
+          current: null
+          proposed:
+            methods: {contains_all: [POST]}
+            ttl: {between: [540, 660]}
+            stale_ttl: {gte: 1}
+        # 2. fallback_on_429: 1 -> 0.
+        - {kind: setting, key: fallback_on_429, current: 1, proposed: 0}
+        # 3. Endpoint bucket for this template only: 120 -> 80% of the highest 429-free sustained rate (89.6).
+        #    The lower bound allows any "sustained" window up to 30 minutes.
+        - kind: bucket_override
+          bucket_key: "endpoint:users.roblox.com/v1/users"
+          current: {per_min: 120}
+          proposed: {per_min: {between: [45, 90]}, burst: {lte: 10}}
+        # 4. Needed in v2 for change 1 to take effect (see the plan conflict note at the top of this file).
+        - {kind: setting, key: cache_post_requests, current: "off", proposed: "allowlist"}
+      changes_forbidden:
+        # Never a global default (11.5 row, 11.2 note).
+        - kind: setting
+          key:
+            in: [endpoint_bucket_default_per_min, endpoint_bucket_default_burst, host_bucket_default_per_min,
+                 host_bucket_default_burst, global_bucket_per_min, direct_bucket_per_min, cache_ttl_seconds,
+                 cache_swr_seconds]
+        - {kind: setting, key: cache_post_requests, proposed: "all"}
+        - kind: bucket_override
+          bucket_key: {ne: "endpoint:users.roblox.com/v1/users"}
+      dry_run:
+        available: true
+        # 11.3 cache replay over the 2,845 samples: 2,479 to 2,545 avoided for TTL 540 to 660 (2,485 at 600),
+        # "about 2,500 fewer upstream calls per hour". Bounds are that range widened by 10% (19.10).
+        avoided_calls: {between: [2230, 2800]}
+    - rule_id: UP-429-ENDPOINT
+      subject_contains: "catalog.roblox.com/v1/search/items"
+      severity: any
+      changes_forbidden:
+        - {kind: setting, key: cache_post_requests}
+        - kind: setting
+          key: {in: [endpoint_bucket_default_per_min, host_bucket_default_per_min, global_bucket_per_min]}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule even with this much evidence.
+    settings: {insight_up_429_endpoint_enabled: 0}
+    expect: {fires: false}
+  - case: thresholds_above_evidence
+    description: Both tests raised above what either endpoint shows (412 and 168 429s, both 14% of calls).
+    settings: {insight_up_429_endpoint_min_429s: 500, insight_up_429_endpoint_share_pct: 20}
+    expect: {fires: false}
+  - case: count_threshold_between_endpoints
+    description: A count threshold of 200 keeps the users endpoint (412) and drops catalog search (168, 14% < 20%).
+    settings: {insight_up_429_endpoint_min_429s: 200, insight_up_429_endpoint_share_pct: 20}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "users.roblox.com/v1/users", severity: any}
+  - case: share_threshold_only
+    description: With the count test out of reach, the share test alone (14% > 2%) still fires for both endpoints.
+    settings: {insight_up_429_endpoint_min_429s: 100000}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "users.roblox.com/v1/users", severity: any}
+        - {subject_contains: "catalog.roblox.com/v1/search/items", severity: any}
+  - case: severity_override_info
+    description: insight_up_429_endpoint_severity replaces the computed severity.
+    settings: {insight_up_429_endpoint_severity: info}
+    expect:
+      fires: true
+      recommendations:
+        - {subject_contains: "users.roblox.com/v1/users", severity: info}
+        - {subject_contains: "catalog.roblox.com/v1/search/items", severity: info}
+  - case: confidence_needs_more_evidence
+    description: Raising high_confidence_n above 412 must lower the confidence without changing whether it fires.
+    settings: {insight_up_429_endpoint_high_confidence_n: 1000}
+    expect:
+      fires: true
+      recommendations:
+        - {subject_contains: "users.roblox.com/v1/users", severity: any, confidence: {ne: high}}

@@ -1,0 +1,28 @@
+format: roxy.health_fixture/1
+check: H-CRED-AUTH
+case: warn
+name: rate_limited
+description: >
+  The credential probe gets 429 with Retry-After 30. The account is rate limited, not expired, so 13.2
+  H-CRED-AUTH says warn (not fail, and not critical). One credential call only: a 429 is never retried on the
+  credential path (7.9).
+now: "2026-10-07T15:00:00Z"
+run: {trigger: manual}
+inputs:
+  state:
+    credential: {present: true, status: active, status_at: "-25m", set_at: "-20d", account_id: "1000001"}
+  upstream:
+    "https://users.roblox.com/v1/users/authenticated":
+      status: 429
+      headers: {retry-after: "30"}
+      json: {errors: [{code: 0, message: "Too many requests"}]}
+      latency_ms: 90
+      expect_request: {via: credential, method: GET}
+expect:
+  status: warn
+  critical: false
+  explanation: {present: true}
+  fix_link: {regex: "(?i)credential"}
+  calls:
+    "https://users.roblox.com/v1/users/authenticated": {count: 1, via: credential}
+  credential_calls: {eq: 1}

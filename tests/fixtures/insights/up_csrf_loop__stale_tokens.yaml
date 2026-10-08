@@ -1,0 +1,107 @@
+# UP-CSRF-LOOP: cached CSRF tokens go stale, so many writes need a second call (format: README.md here).
+#
+# 11.5: "CSRF retries > 20% of write requests (POST, PATCH, PUT, DELETE) over 30 min, or the same request
+# getting a second 403 with a new x-csrf-token"; evidence: templates, retry counts, token cache age; change:
+# "Lower csrf_token_cache_s (stale tokens), or block writes to that template if callers cannot succeed
+# anonymously"; confidence medium. Here every retried write succeeds, so callers CAN succeed anonymously: the
+# change is the lower token cache time (a global setting, so not safe_auto) and no block.
+#
+#   window          writes (POST presence)   needed a CSRF retry   GET requests
+#   -30m to now     600                      180 (30%)             3,000 (no CSRF; not write requests)
+#   -60m to -30m    600                      30 (5%)               3,000
+#
+# Over the 30 minute window the share of writes is 30% (5% if GETs were wrongly counted too). Over 60 minutes
+# it would be 210 / 1,200 = 17.5%, which the `window_60` variant uses. csrf_token_cache_s was raised to 1800 s
+# two weeks ago; Roblox rotates tokens sooner, so cached ones are rejected.
+
+format: roxy.insight_fixture/1
+rule: UP-CSRF-LOOP
+case: stale_tokens
+description: >
+  After csrf_token_cache_s was raised to 30 minutes, 30% of anonymous POSTs to the presence endpoint in the last
+  half hour got a 403 CSRF challenge on the cached token and had to be sent again. The rule must recommend a
+  lower csrf_token_cache_s, not as safe_auto, and must not block the endpoint (the retried writes succeed).
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  csrf_token_cache_s: 1800
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  egress: direct
+  outcome: served_upstream
+  reason: upstream_ok
+  status: 200
+  source: relay
+  latency_ms: {p50: 150, p95: 400, p99: 800}
+
+profiles:
+  pres: {endpoint_template: presence.roblox.com/v1/presence/users, method: POST, cache_state: "OFF"}
+  pres_csrf: {upstream_calls: 2, latency_ms: {p50: 320, p95: 750, p99: 1300}}
+  get_hit: {endpoint_template: games.roblox.com/v1/games, egress: none, outcome: served_cache, reason: cache_hit, source: cache, cache_state: "HIT", latency_ms: 3}
+  get_miss: {endpoint_template: games.roblox.com/v1/games, cache_state: "MISS"}
+
+traffic:
+  - {name: pres_ok_older, profile: pres, window: ["-60m", "-30m"], total: 570}
+  - {name: pres_csrf_older, profile: [pres, pres_csrf], window: ["-60m", "-30m"], total: 30}
+  - {name: pres_ok_recent, profile: pres, window: ["-30m", "0m"], total: 420}
+  - {name: pres_csrf_recent, profile: [pres, pres_csrf], window: ["-30m", "0m"], total: 180}
+  - {name: get_hit, profile: get_hit, window: ["-60m", "0m"], per_minute: 70}
+  - {name: get_miss, profile: get_miss, window: ["-60m", "0m"], per_minute: 30}
+
+events:
+  upstream_attempts:
+    # pres_csrf_older and pres_csrf_recent: a 403 CSRF challenge on the cached token, then the same call with the
+    # new token (same attempt number, plan 7.9 "once, same egress").
+    - {window: ["-60m", "-30m"], total: 30, endpoint_template: presence.roblox.com/v1/presence/users, egress: direct, attempt: 1, status: 403, kind: first}
+    - {window: ["-60m", "-30m"], total: 30, endpoint_template: presence.roblox.com/v1/presence/users, egress: direct, attempt: 1, status: 200, kind: csrf_retry}
+    - {window: ["-30m", "0m"], total: 180, endpoint_template: presence.roblox.com/v1/presence/users, egress: direct, attempt: 1, status: 403, kind: first}
+    - {window: ["-30m", "0m"], total: 180, endpoint_template: presence.roblox.com/v1/presence/users, egress: direct, attempt: 1, status: 200, kind: csrf_retry}
+
+state:
+  settings_history:
+    - {at: "-14d", key: csrf_token_cache_s, old: 600, new: 1800, source: admin, changed_by: admin, reason: "Fewer CSRF handshakes."}
+
+expect:
+  data_checks:
+    - window: ["-30m", "0m"]
+      where: {method: POST}
+      requests: 600
+      upstream_calls: 780
+    - window: ["-60m", "-30m"]
+      where: {method: POST}
+      requests: 600
+      upstream_calls: 630
+    - window: ["-30m", "0m"]
+      where: {method: GET}
+      requests: 3000
+
+  fires: true
+  others: forbid
+  recommendations:
+    - confidence: medium
+      family: upstream
+      safe_auto: false
+      change_kinds_forbidden: [ban_add, bucket_override, routing_rule, credential_allowlist_remove]
+      changes_required:
+        - {kind: setting, key: csrf_token_cache_s, current: 1800, proposed: {lt: 1800, gte: 0}}
+      changes_forbidden:
+        - {kind: rule_upsert, table: rules_endpoint_block}
+        - {kind: setting, key: csrf_token_cache_s, proposed: {gte: 1800}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_csrf_loop_enabled: 0}
+    expect: {fires: false}
+  - case: retry_pct_35
+    description: 30% of writes needing a CSRF retry is below a threshold of 35%.
+    settings: {insight_up_csrf_loop_retry_pct: 35}
+    expect: {fires: false}
+  - case: window_60
+    description: Over 60 minutes the share is 210 / 1,200 = 17.5%, below 20%.
+    settings: {insight_up_csrf_loop_window_min: 60}
+    expect: {fires: false}

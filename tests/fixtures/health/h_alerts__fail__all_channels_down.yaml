@@ -1,0 +1,33 @@
+format: roxy.health_fixture/1
+check: H-ALERTS
+case: fail
+name: all_channels_down
+description: >
+  SMTP connect times out and the Discord webhook's metadata GET answers 404 (the webhook was deleted). No alert
+  could reach the owner. 13.2 H-ALERTS: all down gives fail, with Settings > Alerts as the fix. The variant has
+  email as the only channel, and SMTP refuses the connection: the only channel down is all channels down.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    alert_webhook_enabled: 1
+  alerts:
+    smtp: {connect: timeout, login: failed, noop: failed}
+    webhooks:
+      - {provider: discord, get_status: 404}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)alert"}
+  credential_calls: {eq: 0}
+variants:
+  - case: fail
+    name: email_only_refused
+    inputs:
+      settings:
+        alert_webhook_enabled: 0
+      alerts:
+        smtp: {connect: refused, login: failed, noop: failed}
+        webhooks: []
+    expect:
+      status: fail
+      explanation: {present: true}

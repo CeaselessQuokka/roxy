@@ -1,0 +1,49 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: games.roblox.com}
+case: fail
+name: games_503
+description: >
+  The games probe answers 503 (Roblox outage). 13.2 H-REACH: anything other than the expected status (and not a
+  429) is a failure, so fail. A 5xx may be retried once under the 7.9 policy, so one or two calls. Variants
+  (each replaces the whole response by writing it as a one-item list): a timeout fails the same way; and a 200
+  that takes 2,100 ms is neither under 800 ms (pass) nor under 2,000 ms (warn), so by the 13.2 bands it fails
+  (interpretation noted in the fixture report).
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:games.roblox.com":
+      status: 503
+      body: "Service Unavailable"
+      latency_ms: 120
+      expect_request: {via: direct, method: GET}
+expect:
+  status: fail
+  value: {present: true}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  calls:
+    "probe:games.roblox.com": {count: {between: [1, 2]}}
+  credential_calls: {eq: 0}
+variants:
+  - case: fail
+    name: games_timeout
+    inputs:
+      upstream:
+        "probe:games.roblox.com":
+          - {error: timeout}
+    expect:
+      status: fail
+      explanation: {present: true}
+      credential_calls: {eq: 0}
+  - case: fail
+    name: games_200_after_2100ms
+    inputs:
+      upstream:
+        "probe:games.roblox.com":
+          - status: 200
+            json: {data: [{id: 1, rootPlaceId: 2, name: "Fixture Experience", playing: 12}]}
+            latency_ms: 2100
+    expect:
+      status: fail
+      explanation: {present: true}

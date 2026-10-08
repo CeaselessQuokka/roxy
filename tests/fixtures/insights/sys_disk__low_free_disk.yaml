@@ -1,0 +1,71 @@
+# SYS-DISK, third condition: "free disk < 15%" (11.5; insight_sys_disk_free_disk_pct = 15).
+#
+# The state volume is 40e9 bytes with 4.4e9 free (11%), filled by things outside Roxy's databases (old log archives
+# and backups). Roxy itself is small: 3.0e9 bytes, 25% of the 12 GB budget, growing 0.1e9 in 30 days, so the budget
+# and projection conditions are false.
+#
+# Raising storage_total_budget_gb frees nothing on a full disk, so it is forbidden here; lowering retention or a
+# manual step (VACUUM, clearing old archives) is what helps. Never safe_auto.
+
+format: roxy.insight_fixture/1
+rule: SYS-DISK
+case: low_free_disk
+description: >
+  Only 11% of the state volume is free although Roxy's own storage is small and steady. SYS-DISK must fire and
+  propose lower retention or a manual clean-up, not a larger budget.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  disk:
+    total_bytes: 40000000000
+    free_bytes: 4400000000
+    files:
+      "metrics.db": {bytes: 2400000000, wal_bytes: 40000000}
+      "cache.db": {bytes: 450000000, wal_bytes: 30000000}
+      "control.db": {bytes: 30000000, wal_bytes: 4000000}
+      "hot.db": {bytes: 20000000, wal_bytes: 6000000}
+      "exports": {bytes: 20000000, wal_bytes: 0}
+    tables:
+      "metrics.rollup_minute": 1500000000
+      "metrics.request_samples": 600000000
+      "metrics.events": 250000000
+      "cache.entries": 430000000
+    growth:
+      - {at: "-30d", total_bytes: 2900000000}
+      - {at: "now", total_bytes: 3000000000}
+    dims_per_minute_7d_avg: 280
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-DISK
+      severity: any
+      family: system
+      safe_auto: false
+      changes_required:
+        - any_of:
+            - kind: setting
+              key:
+                in: [retention_minute_days, retention_hour_days, retention_day_days, retention_client_minute_days,
+                     retention_client_hour_days, retention_client_day_days, retention_events_days,
+                     retention_upstream_429_days, retention_errors_days, retention_fingerprints_days,
+                     retention_snapshots_days, retention_exports_days, request_sample_hours, request_sample_max_rows,
+                     events_max_rows]
+            - {kind: manual}
+      changes_forbidden:
+        - {kind: setting, key: storage_total_budget_gb, proposed: {gt: 12}}
+        - {kind: setting, key: retention_minute_days, proposed: {gt: 14}}
+        - {kind: setting, key: retention_hour_days, proposed: {gt: 400}}
+        - {kind: setting, key: retention_events_days, proposed: {gt: 90}}
+      change_kinds_forbidden: [bucket_override, rule_upsert, rule_delete, ban_add, bypass_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_disk_enabled: 0}
+    expect: {fires: false}
+  - case: free_disk_pct_lowered
+    description: At a 10% floor the 11% free is acceptable, and the other two conditions are false.
+    settings: {insight_sys_disk_free_disk_pct: 10}
+    expect: {fires: false}

@@ -1,0 +1,18 @@
+format: roxy.health_fixture/1
+check: H-CACHE-RW
+case: warn
+name: slow_round_trip
+description: >
+  Each cache step (write, read, delete) takes 30 ms on the fake clock, so the round trip takes about 90 ms
+  (150 ms even if the check uses five steps, and 30 ms if it reports the slowest single step). 13.2 H-CACHE-RW:
+  under 200 ms (and not under 20 ms) gives warn, with the System page as the fix.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  faults:
+    cache_rw_latency_ms: 30
+expect:
+  status: warn
+  value: {gte: 20, lt: 200}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)system"}
+  credential_calls: {eq: 0}

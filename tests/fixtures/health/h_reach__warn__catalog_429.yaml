@@ -1,0 +1,25 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: catalog.roblox.com}
+case: warn
+name: catalog_429
+description: >
+  The catalog search probe (13.4: /v1/search/items?Keyword=hat&Limit=10) is the one 13.4 expects to be rate
+  limited at times: "200 JSON (or 429, warn)". A fast 429 gives warn.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:catalog.roblox.com":
+      status: 429
+      headers: {retry-after: "60"}
+      json: {errors: [{code: 0, message: "Too many requests"}]}
+      latency_ms: 70
+      expect_request: {via: direct, method: GET}
+expect:
+  status: warn
+  value: {regex: "429"}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  calls:
+    "probe:catalog.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}

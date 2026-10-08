@@ -1,0 +1,47 @@
+format: roxy.health_fixture/1
+check: H-BANS
+case: pass
+name: no_conflicts
+description: >
+  Active bans: an auto ban on one abusive IP, a reviewed /25, a reviewed place, and a /8 range that carries a
+  reason (bans have no note column; reason_text is the note). None covers the bypass entry (198.51.100.7), the
+  admin's address (the allowlisted 198.51.100.10, which signed in 3 hours ago) or the top places by served
+  traffic over the last day (1000000001, 1000000002). An EXPIRED ban on the bypass IP is kept for evidence (6.10)
+  and must not count: only active bans can conflict. The /8 is larger than /16 but has a note, so it is not
+  suspicious. 13.2 H-BANS: 0 issues gives pass. (10.0.0.0/8 stands in for a wide hosting range: documentation
+  ranges are all /24, and a private range names no real system.)
+now: "2026-10-07T15:00:00Z"
+inputs:
+  tables:
+    access_list:
+      - {id: 1, kind: bypass, cidr: "198.51.100.7/32", note: "Load test box", expires_at: "+20h", created_by: admin, created_at: "-4h"}
+      - {id: 2, kind: allow_admin, cidr: "198.51.100.10/32", note: "Owner", expires_at: null, created_by: admin, created_at: "-90d"}
+    bans:
+      - {id: 1, subject_type: ip, subject: "203.0.113.66", reason_code: spam, reason_text: "SPAM-RATE: five times the per-IP limit for ten minutes", created_at: "-20m", expires_at: "+40m", created_by: "auto:spam_rate", hits: 340, last_hit_at: "-1m"}
+      - {id: 2, subject_type: cidr, subject: "192.0.2.128/25", reason_code: banned, reason_text: "Scraper fleet in one hosting range; reviewed.", created_at: "-10d", expires_at: null, created_by: admin, hits: 12000, last_hit_at: "-2h"}
+      - {id: 3, subject_type: place, subject: "1000000099", reason_code: banned, reason_text: "Place used only for scraping; reviewed.", created_at: "-5d", expires_at: null, created_by: admin, hits: 900, last_hit_at: "-3h"}
+      - {id: 4, subject_type: ip, subject: "198.51.100.7", reason_code: spam, reason_text: "Auto ban from before the bypass entry existed.", created_at: "-3d", expires_at: "-2d", created_by: "auto:spam_rate", hits: 50, last_hit_at: "-2d"}
+      - {id: 5, subject_type: cidr, subject: "10.0.0.0/8", reason_code: banned, reason_text: "Hosting provider range that only ever sent scrapers; reviewed with the owner.", created_at: "-1h", expires_at: null, created_by: admin, hits: 0, last_hit_at: null}
+  state:
+    admin_logins:
+      - {at: "-3h", ip: "198.51.100.10", username: owner, successful: true, method: totp}
+  profiles:
+    served: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: 150, user_agent: "Roblox/Linux"}
+  traffic:
+    - name: games_by_place
+      profile: served
+      endpoint_template: games.roblox.com/v1/games
+      window: ["-24h", "-10m"]
+      per_minute: 2
+      clients: {cidr: "203.0.113.0/26", count: 40}
+      places: ["1000000001", "1000000001", "1000000001", "1000000002", "1000000003"]
+    - name: games_by_place_recent
+      profile: served
+      endpoint_template: games.roblox.com/v1/games
+      window: ["-10m", "0m"]
+      per_minute: 2
+      clients: {cidr: "203.0.113.0/26", count: 40}
+      places: ["1000000002", "1000000003"]
+expect:
+  status: pass
+  credential_calls: {eq: 0}

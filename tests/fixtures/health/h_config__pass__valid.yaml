@@ -1,0 +1,30 @@
+format: roxy.health_fixture/1
+check: H-CONFIG
+case: pass
+name: valid
+description: >
+  Several overrides, all inside their catalog bounds and consistent with each other (tarpit min 8 <= max 20,
+  credential probe reserve 2 < credential bucket 20, request_deadline_s 60 within 90), and every rule compiles
+  (glob and regex cache rules, a glob endpoint block, an endpoint bucket override). 13.2 H-CONFIG: 0 issues gives
+  pass.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    cache_ttl_seconds: 300
+    allowed_requests_per_minute: 20
+    tarpit_min_seconds: 8
+    tarpit_max_seconds: 20
+    credential_bucket_per_min: 20
+    credential_probe_reserved_per_min: 2
+    request_deadline_s: 60
+  tables:
+    rules_cache:
+      - {id: 1, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-30d"}
+      - {id: 2, pattern: "^badges\\.roblox\\.com/v1/badges/\\d+$", type: regex, ttl: 3600, methods: "GET", origin: admin, created_at: "-30d"}
+    rules_endpoint_block:
+      - {id: 1, pattern: "auth.roblox.com/v2/login*", type: glob, note: "Login endpoints are never proxied.", created_at: "-60d", created_by: admin}
+    upstream_limits:
+      - {bucket_key: "endpoint:users.roblox.com/v1/users", per_min: 90, burst: 10, origin: admin, updated_at: "-2d", updated_by: admin}
+expect:
+  status: pass
+  credential_calls: {eq: 0}

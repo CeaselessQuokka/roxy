@@ -1,0 +1,44 @@
+# CACHE-OFF stays quiet when the cache is off but no caller traffic is flowing
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "cache_enabled=0 with traffic". The second half of the condition is the one tested here.
+#
+#   A staging server set up two days ago with cache_enabled = 0, and no caller has used it since (no OutcomeEvents
+#   at all). The only upstream calls are Roxy's own scheduled health checks every 6 hours, which are internal calls
+#   (source `internal`, zero caller requests, plan P6) and are not caller traffic.
+#
+# 11.5 does not say over which window "with traffic" is measured; with no caller request in the last 48 hours the
+# answer is the same for any window up to two days.
+
+format: roxy.insight_fixture/1
+rule: CACHE-OFF
+case: no_traffic
+description: >
+  The cache is off on an idle staging server: no caller requests in two days, only Roxy's own health checks.
+  Turning the cache on would avoid nothing, so CACHE-OFF must not fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  cache_enabled: 0
+
+events:
+  internal_calls:
+    - {at: "-23h", purpose: health, trigger: health, egress: direct, endpoint_template: games.roblox.com/v1/games, status: 200}
+    - {at: "-23h", purpose: health, trigger: health, egress: direct, endpoint_template: "users.roblox.com/v1/users/{userId}", status: 200}
+    - {at: "-17h", purpose: health, trigger: health, egress: direct, endpoint_template: games.roblox.com/v1/games, status: 200}
+    - {at: "-17h", purpose: health, trigger: health, egress: direct, endpoint_template: "users.roblox.com/v1/users/{userId}", status: 200}
+    - {at: "-11h", purpose: health, trigger: health, egress: direct, endpoint_template: games.roblox.com/v1/games, status: 200}
+    - {at: "-11h", purpose: health, trigger: health, egress: direct, endpoint_template: "users.roblox.com/v1/users/{userId}", status: 200}
+    - {at: "-5h", purpose: health, trigger: health, egress: direct, endpoint_template: games.roblox.com/v1/games, status: 200}
+    - {at: "-5h", purpose: health, trigger: health, egress: direct, endpoint_template: "users.roblox.com/v1/users/{userId}", status: 200}
+
+state:
+  settings_history:
+    - {at: "-2d", key: cache_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Staging: measure raw upstream behavior."}
+
+expect:
+  data_checks:
+    - window: ["-48h", "0m"]
+      requests: 0
+  fires: false

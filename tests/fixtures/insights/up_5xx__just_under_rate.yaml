@@ -1,0 +1,139 @@
+# UP-5XX just under its rate threshold (format: README.md in this directory).
+#
+# 11.5: "5xx rate > 5% over 10 min (min 100 calls)". A mild Roblox wobble hits every endpoint alike, so the
+# per-endpoint and overall rates are the same. For each endpoint, per 1,000 requests in the last 10 minutes:
+#
+#   965 answered first time (1 call)       15 failed after two 503s (2 calls, both 5xx)
+#   10 got a 503 then a 200 (2 calls)      10 got a 503 and were served stale (1 call)
+#
+#   = 1,025 calls of which 50 were 5xx: 4.88% of calls. Of requests, 2.5% ended in a 5xx (failed or stale)
+#     and 3.5% saw one at all. Every reading is under 5%.
+#
+#   endpoint                               requests   calls   5xx calls
+#   games.roblox.com/v1/games              1,000      1,025   50
+#   thumbnails.../avatar-headshot          600        615     30
+#   users.roblox.com/v1/users/{userId}     400        410     20
+#
+# Half an hour ago games.roblox.com had a real outage (400 of 1,000 requests failed after two 503s), now outside
+# the 10 minute window; the `window_30` variant brings it back in.
+
+format: roxy.insight_fixture/1
+rule: UP-5XX
+case: just_under_rate
+description: >
+  Roblox answers just under 5% of calls with 503 across every endpoint, and an earlier outage on the games
+  endpoint ended 20 minutes ago. Nothing exceeds 5% in the last 10 minutes, so the rule stays quiet; a 1.5%
+  threshold or a 30 minute window makes it fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games", type: glob, ttl: 60, stale_ttl: 30, methods: "GET", origin: admin, created_at: "-30d"}
+    - {id: 2, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, stale_ttl: 120, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: games.roblox.com/v1/games
+
+profiles:
+  ok: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 150, p95: 400, p99: 800}}
+  failed_5xx:
+    egress: direct
+    outcome: failed
+    reason: upstream_5xx
+    status: 503
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 503
+    upstream_calls: 2
+    error: true
+    latency_ms: {p50: 900, p95: 2200, p99: 2600}
+  retry_ok: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 2, latency_ms: {p50: 700, p95: 1500, p99: 2000}}
+  stale_5xx:
+    egress: direct
+    outcome: served_cache
+    reason: cache_stale_error
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    upstream_status: 503
+    upstream_calls: 1
+    error: true
+    latency_ms: {p50: 400, p95: 700, p99: 900}
+  thumbs: {endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot}
+  users: {endpoint_template: "users.roblox.com/v1/users/{userId}"}
+
+traffic:
+  # --- Earlier outage on games, then normal traffic ---------------------------------------------------------
+  - {name: games_ok_outage, profile: ok, window: ["-30m", "-20m"], total: 600}
+  - {name: games_failed_outage, profile: failed_5xx, window: ["-30m", "-20m"], total: 400}
+  - {name: thumbs_ok_older, profile: [ok, thumbs], window: ["-30m", "-10m"], total: 1200}
+  - {name: users_ok_older, profile: [ok, users], window: ["-30m", "-10m"], total: 800}
+  - {name: games_ok_middle, profile: ok, window: ["-20m", "-10m"], total: 1000}
+  # --- The last 10 minutes ----------------------------------------------------------------------------------
+  - {name: games_ok, profile: ok, window: ["-10m", "0m"], total: 965}
+  - {name: games_failed, profile: failed_5xx, window: ["-10m", "0m"], total: 15}
+  - {name: games_retry_ok, profile: retry_ok, window: ["-10m", "0m"], total: 10}
+  - {name: games_stale, profile: stale_5xx, window: ["-10m", "0m"], total: 10}
+  - {name: thumbs_ok, profile: [ok, thumbs], window: ["-10m", "0m"], total: 579}
+  - {name: thumbs_failed, profile: [failed_5xx, thumbs], window: ["-10m", "0m"], total: 9}
+  - {name: thumbs_retry_ok, profile: [retry_ok, thumbs], window: ["-10m", "0m"], total: 6}
+  - {name: thumbs_stale, profile: [stale_5xx, thumbs], window: ["-10m", "0m"], total: 6}
+  - {name: users_ok, profile: [ok, users], window: ["-10m", "0m"], total: 386}
+  - {name: users_failed, profile: [failed_5xx, users], window: ["-10m", "0m"], total: 6}
+  - {name: users_retry_ok, profile: [retry_ok, users], window: ["-10m", "0m"], total: 4}
+  - {name: users_stale, profile: [stale_5xx, users], window: ["-10m", "0m"], total: 4}
+
+events:
+  upstream_attempts:
+    # The 5xx calls of the last 10 minutes: failed (two 503s), retry_ok (503 then 200), stale (one 503).
+    - {window: ["-10m", "0m"], total: 30, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: 503, kind: first}
+    - {window: ["-10m", "0m"], total: 15, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: 503, kind: retry_5xx}
+    - {window: ["-10m", "0m"], total: 10, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: 200, kind: retry_5xx}
+    - {window: ["-10m", "0m"], total: 18, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, attempt: 1, status: 503, kind: first}
+    - {window: ["-10m", "0m"], total: 9, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, attempt: 2, status: 503, kind: retry_5xx}
+    - {window: ["-10m", "0m"], total: 6, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, attempt: 2, status: 200, kind: retry_5xx}
+    - {window: ["-10m", "0m"], total: 12, endpoint_template: "users.roblox.com/v1/users/{userId}", egress: direct, attempt: 1, status: 503, kind: first}
+    - {window: ["-10m", "0m"], total: 6, endpoint_template: "users.roblox.com/v1/users/{userId}", egress: direct, attempt: 2, status: 503, kind: retry_5xx}
+    - {window: ["-10m", "0m"], total: 4, endpoint_template: "users.roblox.com/v1/users/{userId}", egress: direct, attempt: 2, status: 200, kind: retry_5xx}
+    # The earlier outage: 400 requests, 503 twice each.
+    - {window: ["-30m", "-20m"], total: 400, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: 503, kind: first}
+    - {window: ["-30m", "-20m"], total: 400, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: 503, kind: retry_5xx}
+
+expect:
+  data_checks:
+    - window: ["-10m", "0m"]
+      requests: 2000
+      upstream_calls: 2050
+      by_reason: {upstream_5xx: 30, cache_stale_error: 20}
+    - window: ["-10m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games}
+      requests: 1000
+      upstream_calls: 1025
+    - window: ["-30m", "-20m"]
+      where: {endpoint_template: games.roblox.com/v1/games}
+      upstream_calls: 1400
+      by_reason: {upstream_5xx: 400}
+
+  fires: false
+
+variants:
+  - case: rate_pct_1_5
+    description: Every reading of the rate (4.88% of calls, 2.5% or 3.5% of requests) is above 1.5%.
+    settings: {insight_up_5xx_rate_pct: 1.5}
+    expect: {fires: true}
+  - case: window_30
+    description: >
+      A 30 minute window includes the earlier outage: 900 of 6,450 calls (14%) and 450 of 6,000 requests (7.5%)
+      were 5xx overall, and 850 of 3,425 calls (24.8%) on games.
+    settings: {insight_up_5xx_window_min: 30}
+    expect:
+      fires: true
+      recommendations:
+        - changes_required:
+            - kind: rule_upsert
+              table: rules_cache
+              match: {pattern: {matches_targets: ["games.roblox.com/v1/games"]}}

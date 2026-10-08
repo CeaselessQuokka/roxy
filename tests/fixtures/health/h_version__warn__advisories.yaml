@@ -1,0 +1,15 @@
+format: roxy.health_fixture/1
+check: H-VERSION
+case: warn
+name: advisories
+description: >
+  The running release matches the deployed SHA, but the audit recorded at deploy lists 2 known vulnerabilities
+  in dependencies. 13.2 H-VERSION: advisories give warn, with the deploy docs as the fix.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  version: {running_sha: "3f9c2a1", deployed_sha: "3f9c2a1", advisories: 2}
+expect:
+  status: warn
+  explanation: {present: true}
+  fix_link: {regex: "(?i)deploy"}
+  credential_calls: {eq: 0}

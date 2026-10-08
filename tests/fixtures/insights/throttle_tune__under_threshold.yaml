@@ -1,0 +1,65 @@
+# THROTTLE-TUNE just under the "too tight" threshold (5% of legitimate addresses throttled in a day).
+#
+# Same day as throttle_tune__too_tight, but only 9 of the 200 legitimate game servers burst after the update: 9 / 200
+# = 4.5%. The scrapers are still refused all day and still do not count. Nothing hogs upstream slots and nobody gets
+# `upstream_busy`, so the "too loose" branch does not apply either. The variant lowers the threshold to 4%.
+
+format: roxy.insight_fixture/1
+rule: THROTTLE-TUNE
+case: under_threshold
+description: >
+  4.5% of the legitimate game servers (9 of 200) were throttled at least once today, under the 5% threshold, and no
+  client hogs upstream slots. THROTTLE-TUNE must not fire; at a 4% threshold it must recommend a looser limit.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  game_servers:
+    clients: {cidr: "203.0.113.0/24", count: 200}
+    places: ["1000000051", "1000000052", "1000000053", "1000000054", "1000000055", "1000000056"]
+    user_agent: "Roblox/Linux"
+  bursting_servers:
+    clients: {cidr: "203.0.113.0/24", count: 9}
+    places: ["1000000051"]
+    user_agent: "Roblox/Linux"
+  scrapers: {clients: {cidr: "192.0.2.0/28", count: 10}, user_agent: "python-requests/2.31.0"}
+
+traffic:
+  - {name: game_hit, profile: [hit, game_servers], endpoint_template: games.roblox.com/v1/games, window: ["-24h", "0m"], total: 28800}
+  - {name: game_miss, profile: [miss, game_servers], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-24h", "0m"], total: 11520}
+  - {name: burst_throttled, profile: [throttled, bursting_servers], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-10h", "-9h"], total: 270}
+  - {name: scraper_served, profile: [miss, scrapers], endpoint_template: "catalog.roblox.com/v1/search/items", window: ["-24h", "0m"], total: 2880}
+  - {name: scraper_throttled, profile: [throttled, scrapers], endpoint_template: "catalog.roblox.com/v1/search/items", window: ["-24h", "0m"], total: 14400}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/24", count: 200}, bot_score: 12}
+    - {clients: {cidr: "192.0.2.0/28", count: 10}, bot_score: 90}
+
+expect:
+  data_checks:
+    - {window: ["-24h", "0m"], requests: 57870, refused: 14670}
+    - {window: ["-10h", "-9h"], where: {client_ip: "203.0.113.9"}, refused: 30}
+    - {window: ["-24h", "0m"], where: {client_ip: "203.0.113.10"}, refused: 0}
+  fires: false
+
+variants:
+  - case: legit_throttled_pct_lowered
+    description: At 4%, 4.5% of legitimate addresses throttled is too many and the rule asks for a looser limit.
+    settings: {insight_throttle_tune_legit_throttled_pct: 4}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - safe_auto: false
+          changes_required:
+            - any_of:
+                - {kind: setting, key: allowed_requests_per_minute, current: 10, proposed: {gt: 10, lt: 1000}}
+                - {kind: setting, key: throttle_reset_duration, current: 50, proposed: {lt: 50}}

@@ -1,0 +1,25 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: translations.roblox.com}
+case: fail
+name: translations_head_502
+description: >
+  The HEAD / probe for translations.roblox.com answers 502. A HEAD-only host passes on any status below 500
+  (13.4), so a 5xx is a failure: 13.2 H-REACH gives fail.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    allowed_roblox_hosts: [games.roblox.com, users.roblox.com, thumbnails.roblox.com, presence.roblox.com, translations.roblox.com]
+  upstream:
+    "probe:translations.roblox.com":
+      status: 502
+      latency_ms: 80
+      expect_request: {via: direct, method: HEAD}
+expect:
+  status: fail
+  value: {present: true}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  calls:
+    "probe:translations.roblox.com": {count: {between: [1, 2]}}
+  credential_calls: {eq: 0}

@@ -1,0 +1,47 @@
+# PLACE-HEAVY must stay quiet when a big experience is served mostly from cache.
+#
+#   place                    requests          upstream calls
+#   1000000301 (20 servers)  16,800 (70%)      1,200 (25%)
+#   1000000302 to 310         7,200 (30%)      3,600 (75%)
+#
+# The 11.5 signal is the share of UPSTREAM CALLS, not of requests: a popular game whose lookups are cached costs
+# Roblox little and takes few upstream slots. A rule that measured request share would fire here by mistake.
+
+format: roxy.insight_fixture/1
+rule: PLACE-HEAVY
+case: cache_absorbs_big_game
+description: >
+  One experience sends 70% of all requests but, thanks to the cache, only 25% of the upstream calls. PLACE-HEAVY
+  measures upstream calls, so it must not fire.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  place_301: {clients: {cidr: "203.0.113.0/27", count: 20}, place_id: "1000000301", user_agent: "Roblox/Linux"}
+  other_places:
+    clients: {cidr: "203.0.113.64/26", count: 40}
+    places: ["1000000302", "1000000303", "1000000304", "1000000305", "1000000306", "1000000307", "1000000308", "1000000309", "1000000310"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: p301_hit, profile: [hit, place_301], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 260}
+  - {name: p301_miss, profile: [miss, place_301], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 20}
+  - {name: others_hit, profile: [hit, other_places], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 60}
+  - {name: others_miss, profile: [miss, other_places], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 60}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/27", count: 20}, bot_score: 8}
+    - {clients: {cidr: "203.0.113.64/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 24000, upstream_calls: 4800}
+    - {window: ["-60m", "0m"], where: {place_id: "1000000301"}, requests: 16800, upstream_calls: 1200}
+  fires: false

@@ -1,0 +1,22 @@
+format: roxy.health_fixture/1
+check: H-SYSTEMD
+case: fail
+name: unit_failed
+description: >
+  blue serves normally, but roxy@green is in the `failed` state: an earlier start went into a crash loop and hit
+  the start limit (StartLimitBurst 5, 17.1), so systemd gave up on it. 13.2 H-SYSTEMD: failed gives fail; a
+  failed unit needs `systemctl reset-failed` and a look at its journal before the next deploy can use that
+  color.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    ROXY_COLOR: blue
+  systemd:
+    show:
+      "roxy@blue": {ActiveState: active, NRestarts: "0", ExecMainStartTimestamp: "-2d"}
+      "roxy@green": {ActiveState: failed, NRestarts: "5", ExecMainStartTimestamp: "-40m"}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)runbook"}
+  credential_calls: {eq: 0}

@@ -1,0 +1,67 @@
+# ABUSE-SPAM must stay quiet on a busy but legitimate hour.
+#
+#   120 game servers   60 requests per minute between them, 70% cache hits, 6 places, Roblox UA; each server is
+#                      refused about once an hour by the per-IP limit (normal fairness, far from any detector)
+#   198.51.100.7       a load-test runner on the bypass list (with an expiry): 300 requests per minute, all served.
+#                      Bypass entries are never counted by the detectors (roxy/abuse/spam.py `observe`), so a rule
+#                      that recomputed SPAM-RATE from traffic without honoring `bypass` would fire here by mistake
+#                      (3,000 requests per 10 minutes against a limit of 600).
+#   192.0.2.250        a permanent ban the admin created by hand months ago (created_by admin, not auto:): a manual
+#                      ban is not an "auto-ban", and one ban is not "repeated" anyway.
+#
+# No detection events exist.
+
+format: roxy.insight_fixture/1
+rule: ABUSE-SPAM
+case: legit_traffic
+description: >
+  A busy hour of game-server traffic, a bypassed load-test runner far above the per-IP rates, and one old manual ban.
+  None of it is spam: ABUSE-SPAM must not fire.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  access_list:
+    - {id: 1, kind: bypass, cidr: "198.51.100.7/32", note: "Load test runner, this afternoon only", expires_at: "+3h", created_by: admin, created_at: "-2h", x_last_hit_at: "-1m"}
+  bans:
+    - {id: 1, subject_type: ip, subject: "192.0.2.250", reason_code: manual, reason_text: "Scanner seen in the access log.", created_at: "-90d", expires_at: null, created_by: admin, hits: 41, last_hit_at: "-12d"}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  game_servers:
+    clients: {cidr: "203.0.113.0/25", count: 120}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+  load_test:
+    client_ip: "198.51.100.7"
+    user_agent: "k6/0.52.0"
+    bypass: true
+
+traffic:
+  - {name: game_hit, profile: [hit, game_servers], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 42}
+  - {name: game_miss, profile: [miss, game_servers], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 18}
+  - {name: game_throttled, profile: [throttled, game_servers], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 2}
+  - {name: load_test_hit, profile: [hit, load_test], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 270}
+  - {name: load_test_miss, profile: [miss, load_test], endpoint_template: "thumbnails.roblox.com/v1/users/avatar-headshot", window: ["-60m", "0m"], per_minute: 30}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/25", count: 120}, bot_score: 6}
+    - {ip: "198.51.100.7", bot_score: 45}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 21720
+      refused: 120
+    - window: ["-10m", "0m"]
+      where: {client_ip: "198.51.100.7"}
+      requests: 3000
+      refused: 0
+  fires: false

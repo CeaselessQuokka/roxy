@@ -1,0 +1,23 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: presence.roblox.com}
+case: fail
+name: presence_500
+description: >
+  The presence POST probe answers 500. 13.2 H-REACH: not the expected status gives fail.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:presence.roblox.com":
+      status: 500
+      json: {errors: [{code: 0, message: "InternalServerError"}]}
+      latency_ms: 95
+      expect_request: {via: direct, method: POST}
+expect:
+  status: fail
+  value: {present: true}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  calls:
+    "probe:presence.roblox.com": {count: {between: [1, 2]}}
+  credential_calls: {eq: 0}

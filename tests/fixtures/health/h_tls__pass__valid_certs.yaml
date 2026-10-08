@@ -1,0 +1,19 @@
+format: roxy.health_fixture/1
+check: H-TLS
+case: pass
+name: valid_certs
+description: >
+  The TLS handshake to every allowed host succeeds and the soonest certificate expiry is 15 days away. 13.2
+  H-TLS: ok and more than 14 days gives pass (15 is the closest whole day above the edge).
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    allowed_roblox_hosts: [games.roblox.com, users.roblox.com, thumbnails.roblox.com, presence.roblox.com]
+  tls:
+    games.roblox.com: {days_left: 61, handshake_ms: 45}
+    users.roblox.com: {days_left: 15, handshake_ms: 52}
+    thumbnails.roblox.com: {days_left: 74, handshake_ms: 48}
+    presence.roblox.com: {days_left: 33, handshake_ms: 50}
+expect:
+  status: pass
+  credential_calls: {eq: 0}

@@ -1,0 +1,22 @@
+format: roxy.health_fixture/1
+check: H-BACKUP
+case: pass
+name: 20h
+description: >
+  The nightly backup finished 20 hours ago and the last monthly restore test passed. 13.2 H-BACKUP: under 26 h
+  gives pass. The variant is the edge: a backup 25 h old (a night that ran late) still passes.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  backup: {last_backup_at: "-20h", restore_test: pass}
+expect:
+  status: pass
+  value: {lt: 26}
+  credential_calls: {eq: 0}
+variants:
+  - case: pass
+    name: edge_25h
+    inputs:
+      backup: {last_backup_at: "-25h"}
+    expect:
+      status: pass
+      value: {lt: 26}

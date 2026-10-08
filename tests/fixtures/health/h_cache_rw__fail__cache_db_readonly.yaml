@@ -1,0 +1,17 @@
+format: roxy.health_fixture/1
+check: H-CACHE-RW
+case: fail
+name: cache_db_readonly
+description: >
+  cache.db refuses writes (the fault `cache_db_readonly`, as with a full or read-only volume). The round trip
+  cannot complete, so 13.2 H-CACHE-RW gives fail, with the System page as the fix. The check reports the
+  failure; it does not raise.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  faults:
+    cache_db_readonly: true
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)system"}
+  credential_calls: {eq: 0}

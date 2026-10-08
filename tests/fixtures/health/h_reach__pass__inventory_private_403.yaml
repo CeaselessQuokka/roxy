@@ -1,0 +1,23 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: inventory.roblox.com}
+case: pass
+name: inventory_private_403
+description: >
+  The inventory probe (13.4: /v1/users/<id>/items/Asset/<id>/is-owned) answers 403 because the public user's
+  inventory is private. 13.4 lists "200 or 403" as expected for this host, so 403 in 260 ms is a pass, not a
+  failure.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:inventory.roblox.com":
+      status: 403
+      json: {errors: [{code: 0, message: "Inventory is private"}]}
+      latency_ms: 260
+      expect_request: {via: direct, method: GET, headers_absent: [cookie]}
+expect:
+  status: pass
+  value: {present: true}
+  calls:
+    "probe:inventory.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}

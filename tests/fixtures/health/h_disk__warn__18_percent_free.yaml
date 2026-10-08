@@ -1,0 +1,34 @@
+format: roxy.health_fixture/1
+check: H-DISK
+case: warn
+name: 18_percent_free
+description: >
+  The state volume has 7.2 GB free of 40 GB: 18%. 13.2 H-DISK: over 10% (and not over 25%) gives warn. The
+  variant is the upper edge: exactly 25% free is not over 25%, so it warns too.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    disk:
+      total_bytes: 40000000000
+      free_bytes: 7200000000
+      files:
+        "control.db": {bytes: 60000000, wal_bytes: 4194304}
+        "hot.db": {bytes: 8000000, wal_bytes: 4194304}
+        "metrics.db": {bytes: 2000000000, wal_bytes: 4194304}
+        "cache.db": {bytes: 500000000, wal_bytes: 4194304}
+expect:
+  status: warn
+  value: {gt: 10, lte: 25}
+  explanation: {present: true}
+  credential_calls: {eq: 0}
+variants:
+  - case: warn
+    name: edge_25_percent
+    inputs:
+      state:
+        disk:
+          free_bytes: 10000000000
+    expect:
+      status: warn
+      value: {gt: 24.9, lte: 25}
+      explanation: {present: true}

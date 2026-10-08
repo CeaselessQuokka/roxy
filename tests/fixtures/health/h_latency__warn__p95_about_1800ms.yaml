@@ -1,0 +1,47 @@
+format: roxy.health_fixture/1
+check: H-LATENCY
+case: warn
+name: p95_about_1800ms
+description: >
+  Over the last 15 minutes the upstream calls have a p95 of about 1,800 ms and none takes longer than 2,400 ms,
+  so the bucketed p95 lies between 1,500 and 2,000 ms. 13.2 H-LATENCY: under 2,500 ms (and not under 1,000 ms)
+  gives warn. If cache hits were mixed into the percentile the p95 would still be above 1,500 ms.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  traffic_defaults:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    user_agent: "Roblox/Linux"
+  profiles:
+    hit:
+      egress: none
+      outcome: served_cache
+      reason: cache_hit
+      status: 200
+      source: cache
+      cache_state: "HIT"
+      latency_ms: {p50: 3, p95: 9, p99: 20}
+    miss:
+      egress: direct
+      outcome: served_upstream
+      reason: upstream_ok
+      status: 200
+      source: relay
+      cache_state: "MISS"
+      upstream_calls: 1
+  traffic:
+    - name: games_miss_recent
+      profile: miss
+      endpoint_template: games.roblox.com/v1/games
+      window: ["-15m", "0m"]
+      per_minute: 40
+      latency_ms: {p0: 80, p50: 500, p90: 1400, p95: 1800, p99: 2300, p100: 2400}
+    - {name: games_hit_recent, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], per_minute: 25}
+expect:
+  data_checks:
+    - window: ["-15m", "0m"]
+      requests: 975
+      upstream_calls: 600
+  status: warn
+  value: {gte: 1000, lt: 2500}
+  explanation: {present: true}
+  credential_calls: {eq: 0}

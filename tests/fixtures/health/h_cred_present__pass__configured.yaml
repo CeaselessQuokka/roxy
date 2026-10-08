@@ -1,0 +1,21 @@
+format: roxy.health_fixture/1
+check: H-CRED-PRESENT
+case: pass
+name: configured
+description: >
+  The one Roblox credential is configured and was last seen active. 13.2 H-CRED-PRESENT: present gives pass.
+  The check reads configuration only, so it makes no credential call (13.3 budget).
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    credential:
+      present: true
+      status: active
+      status_at: "-25m"
+      set_at: "-20d"
+      account_id: "1000001"
+      probes:
+        - {at: "-25m", kind: scheduled, status: 200, result: ok}
+expect:
+  status: pass
+  credential_calls: {eq: 0}

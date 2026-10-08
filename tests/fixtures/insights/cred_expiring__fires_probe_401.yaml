@@ -1,0 +1,67 @@
+# CRED-EXPIRING fires when the credential's liveness probe is rejected with 401
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Probe 401/403, or account warning in response"; evidence "Probe history"; change "Manual: renew
+# credential (never auto-switch)"; confidence High. No thresholds (15.3 J2: only _enabled and _severity).
+#
+#   The credential (set 60 days ago, synthetic account 1000001) passed its scheduled liveness probe every 30
+#   minutes until 40 minutes ago; the probe 10 minutes ago got 401, so credential_meta.status is `rejected`
+#   (egress/credential.py records the result `rejected_401`).
+#
+# The only acceptable change is `manual`: Roxy never switches, replaces or disables the credential by itself
+# (plan C1), and never sends credential traffic anywhere else.
+
+format: roxy.insight_fixture/1
+rule: CRED-EXPIRING
+case: fires_probe_401
+description: >
+  The scheduled credential probe was answered 401 ten minutes ago after a day of successful probes. The rule must
+  fire with a manual "renew the credential" change and no automatic change of any kind.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+state:
+  credential:
+    present: true
+    status: rejected
+    status_at: "-10m"
+    set_at: "-60d"
+    account_id: "1000001"
+    probes:
+      - {at: "-190m", kind: liveness, status: 200, result: ok}
+      - {at: "-160m", kind: liveness, status: 200, result: ok}
+      - {at: "-130m", kind: liveness, status: 200, result: ok}
+      - {at: "-100m", kind: liveness, status: 200, result: ok}
+      - {at: "-70m", kind: liveness, status: 200, result: ok}
+      - {at: "-40m", kind: liveness, status: 200, result: ok}
+      - {at: "-10m", kind: liveness, status: 401, result: rejected_401}
+
+events:
+  internal_calls:
+    - {at: "-40m", purpose: credential_probe, trigger: scheduled, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+    - {at: "-10m", purpose: credential_probe, trigger: scheduled, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 401}
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CRED-EXPIRING
+      severity: any
+      family: credential
+      confidence: high
+      safe_auto: false
+      change_kinds_required: [manual]
+      change_kinds_forbidden: [setting, bucket_override, rule_upsert, rule_delete, filter_add, filter_remove, ban_add, ban_remove, bypass_add, bypass_remove, ignored_param_add, tarpit_category, routing_rule, credential_allowlist_remove, host_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cred_expiring_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_cred_expiring_severity replaces the computed severity.
+    settings: {insight_cred_expiring_severity: critical}
+    expect:
+      fires: true
+      recommendations:
+        - {severity: critical, change_kinds_required: [manual]}

@@ -1,0 +1,95 @@
+# UP-UA-EXPERIMENT: the alternative upstream User-Agent gets clearly fewer 429s (format: README.md here).
+#
+# 11.5: "Runs when ua_experiment_enabled = 1: splits direct traffic between two UA profiles by key hash for
+# ua_experiment_days (7)"; evidence: 429 rate per UA with confidence interval; change: "Choose the better UA as
+# direct_user_agent"; "Medium once n >= 10,000 calls per arm". direct_user_agent is a global setting, so the
+# recommendation is not safe_auto.
+#
+#   arm (state.ua_experiment)                           calls    Roblox 429s   rate
+#   current direct_user_agent (browser UA)              61,200   428           0.70%
+#   ua_experiment_alt_user_agent "Roxy/2 (+https://roxy.test)"  59,800   90    0.15%
+#
+# The experiment started 7 days ago (settings history). Both arms pass 10,000 calls; the difference is far outside
+# any reasonable confidence interval (two-proportion z of about 14).
+
+format: roxy.insight_fixture/1
+rule: UP-UA-EXPERIMENT
+case: alt_ua_wins
+description: >
+  After a 7 day split of direct traffic, the alternative User-Agent drew 0.15% Roblox 429s against 0.70% for
+  the current one, with about 60,000 calls per arm. The rule must recommend making the alternative the
+  direct_user_agent, with medium confidence and not as safe_auto.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  ua_experiment_enabled: 1
+  ua_experiment_days: 7
+  direct_user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+  ua_experiment_alt_user_agent: "Roxy/2 (+https://roxy.test)"
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+
+traffic:
+  - name: games_miss
+    endpoint_template: games.roblox.com/v1/games
+    window: ["-60m", "0m"]
+    per_minute: 12
+    egress: direct
+    outcome: served_upstream
+    reason: upstream_ok
+    status: 200
+    source: relay
+    cache_state: "MISS"
+    latency_ms: {p50: 150, p95: 400, p99: 800}
+
+state:
+  ua_experiment:
+    arms:
+      - {user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36", calls: 61200, roblox_429: 428}
+      - {user_agent: "Roxy/2 (+https://roxy.test)", calls: 59800, roblox_429: 90}
+  settings_history:
+    - {at: "-7d", key: ua_experiment_enabled, old: 0, new: 1, source: admin, changed_by: admin, reason: "D23: measure which UA Roblox limits less."}
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - confidence: medium
+      family: upstream
+      safe_auto: false
+      change_kinds_required: [setting]
+      changes_required:
+        - kind: setting
+          key: direct_user_agent
+          current: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+          proposed: "Roxy/2 (+https://roxy.test)"
+      changes_forbidden:
+        - kind: setting
+          key: {in: [rotator_weight, direct_weight, global_bucket_per_min, direct_bucket_per_min, endpoint_bucket_default_per_min]}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_ua_experiment_enabled: 0}
+    expect: {fires: false}
+  - case: experiment_switched_off
+    description: The rule runs only while ua_experiment_enabled = 1 (11.5).
+    settings: {ua_experiment_enabled: 0}
+    expect: {fires: false}
+  - case: min_calls_per_arm_60000
+    description: The alternative arm's 59,800 calls are below a minimum of 60,000 per arm.
+    settings: {insight_up_ua_experiment_min_calls_per_arm: 60000}
+    expect: {fires: false}
+  - case: min_calls_per_arm_59800
+    description: Both arms have at least 59,800 calls ("n >= N per arm").
+    settings: {insight_up_ua_experiment_min_calls_per_arm: 59800}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - {kind: setting, key: direct_user_agent, proposed: "Roxy/2 (+https://roxy.test)"}

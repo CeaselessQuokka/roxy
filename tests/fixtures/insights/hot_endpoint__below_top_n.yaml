@@ -1,0 +1,85 @@
+# HOT-ENDPOINT stays quiet when the new endpoint without a rule is sixth, one place outside the top 5
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Endpoint enters top 5 by upstream calls with no cache rule" (insight_hot_endpoint_top_n 5).
+#
+#   endpoint (upstream calls, last 60 min)            calls  rank  cache rule  traffic since
+#   thumbnails.roblox.com/v1/users/avatar-headshot     2,040     1  3           -4h
+#   games.roblox.com/v1/games                          1,620     2  4           -4h
+#   groups.roblox.com/v1/groups/{groupId}              1,200     3  6           -4h
+#   catalog.roblox.com/v1/search/items                 1,080     4  2           -4h
+#   users.roblox.com/v1/users/{userId}                   960     5  8           -4h
+#   thumbnails.roblox.com/v1/games/icons                 700     6  none        -50m  <- new, no rule, 6th
+#   badges.roblox.com/v1/badges/{badgeId}                480     7  7           -4h
+
+format: roxy.insight_fixture/1
+rule: HOT-ENDPOINT
+case: below_top_n
+description: >
+  The new icons endpoint has no cache rule but is the sixth busiest by upstream calls, so nothing may fire at the
+  default top 5. With top_n 6 it must fire for that endpoint only.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 2, pattern: "catalog.roblox.com/v1/search/items", type: glob, ttl: 120, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 6, pattern: "groups.roblox.com/v1/groups/*", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 7, pattern: "badges.roblox.com/v1/badges/*", type: glob, ttl: 3600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 8, pattern: "users.roblox.com/v1/users/*", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-4h", "0m"], per_minute: 100}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-4h", "0m"], per_minute: 34}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-4h", "0m"], per_minute: 60}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-4h", "0m"], per_minute: 27}
+  - {name: group_hit, profile: hit, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-4h", "0m"], per_minute: 40}
+  - {name: group_miss, profile: miss, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-4h", "0m"], per_minute: 20}
+  - {name: search_hit, profile: hit, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-4h", "0m"], per_minute: 12}
+  - {name: search_miss, profile: miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-4h", "0m"], per_minute: 18}
+  - {name: user_hit, profile: hit, endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-4h", "0m"], per_minute: 30}
+  - {name: user_miss, profile: miss, endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-4h", "0m"], per_minute: 16}
+  - {name: icons_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/games/icons, window: ["-50m", "0m"], per_minute: 6}
+  - name: icons_miss
+    profile: miss
+    endpoint_template: thumbnails.roblox.com/v1/games/icons
+    window: ["-50m", "0m"]
+    per_minute: 14
+    samples: {key_space: icons, keys: 28, body_change_interval_s: 960}
+  - {name: badge_hit, profile: hit, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-4h", "0m"], per_minute: 40}
+  - {name: badge_miss, profile: miss, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-4h", "0m"], per_minute: 8}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: thumbnails.roblox.com/v1/games/icons}
+      upstream_calls: 700
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: "users.roblox.com/v1/users/{userId}"}
+      upstream_calls: 960
+  fires: false
+
+variants:
+  - case: top_n_6
+    description: Checking the six busiest endpoints reaches the icons endpoint.
+    settings: {insight_hot_endpoint_top_n: 6}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "thumbnails.roblox.com/v1/games/icons"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, table: rules_cache, current: null, match: {pattern: {matches_targets: ["thumbnails.roblox.com/v1/games/icons"]}}}

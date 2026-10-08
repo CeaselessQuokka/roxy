@@ -1,0 +1,13 @@
+format: roxy.health_fixture/1
+check: H-VERSION
+case: pass
+name: match_clean
+description: >
+  The running release is the SHA the last deploy recorded, and the dependency audit recorded at that deploy
+  found no known vulnerabilities. 13.2 H-VERSION: match and clean gives pass.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  version: {running_sha: "3f9c2a1", deployed_sha: "3f9c2a1", advisories: 0}
+expect:
+  status: pass
+  credential_calls: {eq: 0}

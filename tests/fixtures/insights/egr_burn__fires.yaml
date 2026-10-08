@@ -1,0 +1,130 @@
+# EGR-BURN fires when the rotator is on course to use more than 90% of this cycle's quota
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Projected cycle usage > 90% of quota"; evidence "Projection, top endpoints by bytes"; change "Lower
+# rotator weight, raise TTL on named endpoints, set daily cap"; confidence High. Threshold:
+# insight_egr_burn_projected_pct 90. Plan 8.4: projection from the trailing 7 days plus the current-cycle rate.
+#
+#   Quota 20 GB per month (decimal GB, the provider's unit), billing day 1: the cycle is 2026-10-01 00:00 UTC to
+#   2026-11-01 00:00 UTC (31 days); at now (2026-10-07 15:00) 6.625 days have passed.
+#   rotator_weight = 50 since 12 days ago (direct_weight 100), so a third of the weighted share goes to the rotator.
+#   Usage is the same every minute since 2026-09-29: 520,000 bytes per minute (748.8 MB per day), socket metering.
+#     cycle so far: 6 days x 748.8 MB + 900 minutes today x 0.52 MB = 4,960.8 MB
+#     projection: 748.8 MB x 31 days = 23,212.8 MB = 116% of the quota
+#   Because the rate is flat over the trailing 7 days and the cycle, every projection method in 8.4 agrees.
+#   Last 60 min of rotator traffic by endpoint: catalog search 7,800 calls, games 4,800, headshots 3,000, at 2,000
+#   bytes per call (the same 520,000 bytes per minute).
+#
+# Every 11.5 remedy here is a global setting, so the recommendation is never safe to auto-apply, and Roxy never
+# changes the quota itself (11.4).
+
+format: roxy.insight_fixture/1
+rule: EGR-BURN
+case: fires
+description: >
+  At the current flat rate the rotator will use 23.2 GB of a 20 GB quota this cycle (116%). The rule must fire with
+  a remedy from 11.5 (lower rotator_weight or set a daily cap), never raise the weight, the hard stop or the quota,
+  and must not be safe to auto-apply.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_quota_gb_per_month: 20
+  rotator_billing_day: 1
+  rotator_weight: 50
+  rotator_price_per_gb_usd: 3.5
+
+tables:
+  rules_cache:
+    - {id: 2, pattern: "catalog.roblox.com/v1/search/items", type: glob, ttl: 60, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  direct_miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1600, upstream_in: 1730, upstream_out: 270}}
+  rotator_miss: {egress: rotator, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 420, p95: 1100, p99: 2000}, bytes: {caller_in: 0, caller_out: 1600, upstream_in: 1730, upstream_out: 270}}
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1600}}
+
+traffic:
+  - {name: search_rotator, profile: rotator_miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], per_minute: 130}
+  - {name: games_rotator, profile: rotator_miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 80}
+  - {name: headshot_rotator, profile: rotator_miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], per_minute: 50}
+  - {name: search_direct, profile: direct_miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], per_minute: 260}
+  - {name: games_direct, profile: direct_miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 160}
+  - {name: headshot_direct, profile: direct_miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], per_minute: 100}
+  - {name: search_hit, profile: hit, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], per_minute: 200}
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], per_minute: 400}
+
+state:
+  settings_history:
+    - {at: "-12d", key: rotator_weight, old: 0, new: 50, source: admin, changed_by: admin, reason: "Spread load across exit addresses."}
+    - {at: "-60d", key: rotator_quota_gb_per_month, old: 0, new: 20, source: admin, changed_by: admin, reason: "DataImpulse plan."}
+  egress:
+    metering_mode: socket
+    usage:
+      # Day rows: 374,400 requests, 100,800,000 request bytes and 648,000,000 response bytes per day.
+      - {egress: rotator, granularity: day, at: "2026-09-29", requests: 374400, req_bytes: 100800000, resp_bytes: 648000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-09-30", requests: 374400, req_bytes: 100800000, resp_bytes: 648000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-01", requests: 374400, req_bytes: 100800000, resp_bytes: 648000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-02", requests: 374400, req_bytes: 100800000, resp_bytes: 648000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-03", requests: 374400, req_bytes: 100800000, resp_bytes: 648000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-04", requests: 374400, req_bytes: 100800000, resp_bytes: 648000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-05", requests: 374400, req_bytes: 100800000, resp_bytes: 648000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-06", requests: 374400, req_bytes: 100800000, resp_bytes: 648000000, overhead_bytes: 0}
+      # Today, one minute row per minute since 00:00 UTC.
+      - {egress: rotator, granularity: minute, window: ["-900m", "0m"], per_minute: 1, requests: 260, req_bytes: 70000, resp_bytes: 450000, overhead_bytes: 0}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      where: {egress: rotator}
+      requests: 15600
+      upstream_calls: 15600
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: EGR-BURN
+      severity: any
+      family: egress
+      confidence: high
+      safe_auto: false
+      change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, host_add, bucket_override, credential_allowlist_remove, ignored_param_add]
+      changes_required:
+        - any_of:
+            - {kind: setting, key: rotator_weight, current: 50, proposed: {lt: 50}}
+            - {kind: setting, key: rotator_daily_cap_mb, current: 0, proposed: {gt: 0}}
+      changes_forbidden:
+        - {kind: setting, key: rotator_quota_gb_per_month}
+        - {kind: setting, key: rotator_weight, proposed: {gte: 50}}
+        - {kind: setting, key: rotator_hard_stop_pct, proposed: {gt: 100}}
+        - {kind: setting, key: direct_weight, proposed: {lt: 100}}
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, credential_enabled]}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_egr_burn_enabled: 0}
+    expect: {fires: false}
+  - case: projected_pct_120
+    description: At 120% of quota, a 116% projection is not enough.
+    settings: {insight_egr_burn_projected_pct: 120}
+    expect: {fires: false}
+  - case: quota_unknown
+    description: With no quota set (0, "unknown"), there is nothing to project against.
+    settings: {rotator_quota_gb_per_month: 0}
+    expect: {fires: false}
+  - case: severity_override_info
+    description: insight_egr_burn_severity replaces the computed severity.
+    settings: {insight_egr_burn_severity: info}
+    expect:
+      fires: true
+      recommendations:
+        - {severity: info}

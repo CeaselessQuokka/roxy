@@ -1,0 +1,20 @@
+format: roxy.health_fixture/1
+check: H-TLS
+case: warn
+name: cert_expiring
+description: >
+  Every handshake succeeds, but the certificate served for users.roblox.com expires in 9 days. 13.2 H-TLS: under
+  14 days gives warn.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    allowed_roblox_hosts: [games.roblox.com, users.roblox.com, thumbnails.roblox.com, presence.roblox.com]
+  tls:
+    games.roblox.com: {days_left: 61, handshake_ms: 45}
+    users.roblox.com: {days_left: 9, handshake_ms: 52}
+    thumbnails.roblox.com: {days_left: 74, handshake_ms: 48}
+    presence.roblox.com: {days_left: 33, handshake_ms: 50}
+expect:
+  status: warn
+  explanation: {present: true}
+  credential_calls: {eq: 0}

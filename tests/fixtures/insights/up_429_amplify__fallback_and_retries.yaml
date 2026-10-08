@@ -1,0 +1,176 @@
+# UP-429-AMPLIFY: retries multiply calls while Roblox is rate-limiting (format: README.md in this directory).
+#
+# 11.5: "Upstream calls per caller request > 1.3 during 429 episodes"; evidence: attempts histogram; change: "Set
+# fallback_on_429=0, lower upstream_max_attempts"; confidence high. Both are global settings, so never safe_auto.
+#
+# The 429 episode is the 10 minutes from -20m to -10m (the only minutes with Roblox 429s). In it, on
+# GET games.roblox.com/v1/games:
+#
+#   generator             requests  calls each  what happened
+#   amp_fallback_ok       300       2           direct 429, retried on the rotator (fallback_on_429 = 1), 200
+#   amp_fallback_429      100       2           direct 429, rotator 429 too, caller gets 429
+#   amp_5xx_retry         100       3           Roblox 503 under load, 3 attempts (upstream_max_attempts = 3)
+#   amp_ok                100       1           answered first time
+#   hits (two endpoints)  200       0
+#
+# Calls per caller request in the episode: 1,200 / 600 requests that went upstream = 2.0 (1,200 / 800 = 1.5 if
+# cache hits are counted too; 800 / 400 = 2.0 over the requests that got a 429). Every reading is above 1.3.
+# events.upstream_attempts holds the per-call rows (README "Extensions") for the attempts histogram.
+
+format: roxy.insight_fixture/1
+rule: UP-429-AMPLIFY
+case: fallback_and_retries
+description: >
+  During a 10 minute Roblox overload, fallback_on_429 = 1 sends every direct 429 to the rotator and
+  upstream_max_attempts = 3 retries every 503 twice, so Roxy makes two calls per caller request that goes
+  upstream. The rule must recommend fallback_on_429 1 -> 0 and a lower upstream_max_attempts, with high
+  confidence, and not safe_auto.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  fallback_on_429: 1
+  upstream_max_attempts: 3
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games", type: glob, ttl: 60, stale_ttl: 0, methods: "GET", origin: admin, created_at: "-30d"}
+    - {id: 2, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, stale_ttl: 120, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004"]
+  endpoint_template: games.roblox.com/v1/games
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 150, p95: 400, p99: 800}}
+
+traffic:
+  # --- Before the episode ---------------------------------------------------------------------------------------
+  - {name: games_hit_before, profile: hit, window: ["-60m", "-20m"], per_minute: 20}
+  - {name: games_miss_before, profile: miss, window: ["-60m", "-20m"], per_minute: 10}
+  - {name: headshot_hit_before, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "-20m"], per_minute: 30}
+  - {name: headshot_miss_before, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "-20m"], per_minute: 10}
+
+  # --- The 429 episode --------------------------------------------------------------------------------------------
+  - name: amp_fallback_ok
+    window: ["-20m", "-10m"]
+    total: 300
+    egress: rotator              # final attempt
+    outcome: served_upstream
+    reason: upstream_ok
+    status: 200
+    source: relay
+    cache_state: "MISS"
+    upstream_calls: 2
+    latency_ms: {p50: 700, p95: 1500, p99: 2300}
+    upstream_429: {egress: direct, retry_after_s: 30}
+  - name: amp_fallback_429
+    window: ["-20m", "-10m"]
+    total: 100
+    egress: rotator
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 429
+    upstream_calls: 2
+    error: true
+    latency_ms: {p50: 650, p95: 1300, p99: 2000}
+    upstream_429: {egress: direct, retry_after_s: 30}   # the rotator's 429 is in events.upstream_429
+  - name: amp_5xx_retry
+    window: ["-20m", "-10m"]
+    total: 100
+    egress: direct
+    outcome: failed
+    reason: upstream_5xx
+    status: 503
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 503
+    upstream_calls: 3
+    error: true
+    latency_ms: {p50: 2400, p95: 4200, p99: 5200}
+  - {name: amp_ok, profile: miss, window: ["-20m", "-10m"], total: 100}
+  - {name: games_hit_episode, profile: hit, window: ["-20m", "-10m"], total: 100}
+  - {name: headshot_hit_episode, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-20m", "-10m"], total: 100}
+
+  # --- After the episode ----------------------------------------------------------------------------------------
+  - {name: games_hit_after, profile: hit, window: ["-10m", "0m"], per_minute: 20}
+  - {name: games_miss_after, profile: miss, window: ["-10m", "0m"], per_minute: 10}
+  - {name: headshot_hit_after, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-10m", "0m"], per_minute: 30}
+  - {name: headshot_miss_after, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-10m", "0m"], per_minute: 10}
+
+events:
+  upstream_429:
+    # The second 429 of each amp_fallback_429 request, from a rotator exit.
+    - {window: ["-20m", "-10m"], total: 100, endpoint_template: games.roblox.com/v1/games, egress: rotator, retry_after_s: 30}
+  upstream_attempts:
+    # amp_fallback_ok (300 requests, 2 calls each)
+    - {window: ["-20m", "-10m"], total: 300, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: 429, kind: first}
+    - {window: ["-20m", "-10m"], total: 300, endpoint_template: games.roblox.com/v1/games, egress: rotator, attempt: 2, status: 200, kind: fallback_429}
+    # amp_fallback_429 (100 requests, 2 calls each)
+    - {window: ["-20m", "-10m"], total: 100, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: 429, kind: first}
+    - {window: ["-20m", "-10m"], total: 100, endpoint_template: games.roblox.com/v1/games, egress: rotator, attempt: 2, status: 429, kind: fallback_429}
+    # amp_5xx_retry (100 requests, 3 calls each)
+    - {window: ["-20m", "-10m"], total: 100, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: 503, kind: first}
+    - {window: ["-20m", "-10m"], total: 100, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: 503, kind: retry_5xx}
+    - {window: ["-20m", "-10m"], total: 100, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 3, status: 503, kind: retry_5xx}
+
+state:
+  settings_history:
+    - {at: "-12d", key: fallback_on_429, old: 0, new: 1, source: admin, changed_by: admin, reason: "Incident: retry 429s on the rotator."}
+    - {at: "-12d", key: upstream_max_attempts, old: 2, new: 3, source: admin, changed_by: admin, reason: "Incident: Roblox 503s."}
+
+expect:
+  data_checks:
+    - window: ["-20m", "-10m"]
+      requests: 800
+      upstream_calls: 1200
+      roblox_429: 500
+      by_reason: {upstream_ok: 400, upstream_cooldown: 100, upstream_5xx: 100, cache_hit: 200}
+    - window: ["-20m", "-10m"]
+      where: {egress: rotator}
+      requests: 400
+      upstream_calls: 800
+      roblox_429: 100
+    - window: ["-60m", "-20m"]
+      roblox_429: 0
+      upstream_calls: 800
+    - window: ["-10m", "0m"]
+      roblox_429: 0
+
+  fires: true
+  others: forbid
+  recommendations:
+    - confidence: high
+      family: upstream
+      safe_auto: false
+      change_kinds_required: [setting]
+      change_kinds_forbidden: [routing_rule, ban_add, filter_add, credential_allowlist_remove]
+      changes_required:
+        - {kind: setting, key: fallback_on_429, current: 1, proposed: 0}
+        - {kind: setting, key: upstream_max_attempts, current: 3, proposed: {lt: 3, gte: 1}}
+      changes_forbidden:
+        - {kind: setting, key: upstream_max_attempts, proposed: {gte: 3}}
+        - {kind: setting, key: {in: [rotator_weight, direct_weight, global_bucket_per_min, direct_bucket_per_min]}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_429_amplify_enabled: 0}
+    expect: {fires: false}
+  - case: calls_per_request_4
+    description: No reading of the episode reaches 4 calls per request (at most 3, on the 503 retries alone).
+    settings: {insight_up_429_amplify_calls_per_request: 4.0}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_up_429_amplify_severity replaces the computed severity.
+    settings: {insight_up_429_amplify_severity: critical}
+    expect:
+      fires: true
+      recommendations:
+        - {severity: critical}

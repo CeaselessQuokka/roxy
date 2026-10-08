@@ -1,0 +1,26 @@
+format: roxy.health_fixture/1
+check: H-BACKUP
+case: fail
+name: 80h
+description: >
+  The newest backup is 80 hours old. 13.2 H-BACKUP: 72 h or older gives fail, with the "Backups" runbook as the
+  fix. The variant has never completed a backup (`last_backup_at: null`) and never run a restore test: "never"
+  also gives fail.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  backup: {last_backup_at: "-80h", restore_test: pass}
+expect:
+  status: fail
+  value: {gte: 72}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)backup"}
+  credential_calls: {eq: 0}
+variants:
+  - case: fail
+    name: never
+    inputs:
+      backup: {last_backup_at: null, restore_test: never}
+    expect:
+      status: fail
+      explanation: {present: true}
+      fix_link: {regex: "(?i)backup"}

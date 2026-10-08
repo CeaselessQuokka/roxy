@@ -1,0 +1,70 @@
+# ABUSE-BOT just under each threshold.
+#
+#   client        UA                    bot score            requests in the hour       fails which test
+#   192.0.2.43    Go-http-client/1.1    92 (bot-like)        480 (under 500)            request count
+#   192.0.2.44    Dalvik/2.1.0          78 (under 80)        2,000                      score
+#
+# Neither threshold value is hit exactly (11.5 says "> 80" and "> 500", the catalog text says "at or above"), so the
+# expectation holds under either reading. The variants lower one threshold at a time and check that exactly the
+# client held back by that threshold appears.
+
+format: roxy.insight_fixture/1
+rule: ABUSE-BOT
+case: under_thresholds
+description: >
+  A bot-like client that stays just under 500 requests per hour and a heavy client whose bot score is just under 80.
+  ABUSE-BOT must not fire; lowering either threshold below the evidence must make exactly that client appear.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+  almost_heavy_bot: {client_ip: "192.0.2.43", user_agent: "Go-http-client/1.1", endpoint_template: "catalog.roblox.com/v1/search/items"}
+  heavy_almost_bot: {client_ip: "192.0.2.44", user_agent: "Dalvik/2.1.0", endpoint_template: "thumbnails.roblox.com/v1/users/avatar-headshot"}
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  - {name: almost_heavy_bot_miss, profile: [miss, almost_heavy_bot], window: ["-60m", "0m"], per_minute: 8}
+  - {name: heavy_almost_bot_hit, profile: [hit, heavy_almost_bot], window: ["-60m", "0m"], total: 1580}
+  - {name: heavy_almost_bot_miss, profile: [miss, heavy_almost_bot], window: ["-60m", "0m"], total: 420}
+
+state:
+  client_scores:
+    - {ip: "192.0.2.43", bot_score: 92}
+    - {ip: "192.0.2.44", bot_score: 78}
+    - {clients: {cidr: "203.0.113.0/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], where: {client_ip: "192.0.2.43"}, requests: 480}
+    - {window: ["-60m", "0m"], where: {client_ip: "192.0.2.44"}, requests: 2000}
+    - {window: ["-60m", "0m"], requests: 5480, refused: 0}
+  fires: false
+
+variants:
+  - case: request_threshold_lowered
+    description: At 400 requests per hour the score-92 client (480 requests) qualifies; the score-78 client still does not.
+    settings: {insight_abuse_bot_min_requests_per_hour: 400}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "192.0.2.43", severity: any}
+  - case: score_threshold_lowered
+    description: With bot_score_abuse_min at 75 the 2,000-request client (score 78) qualifies; the 480-request client still does not.
+    settings: {bot_score_abuse_min: 75}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "192.0.2.44", severity: any}

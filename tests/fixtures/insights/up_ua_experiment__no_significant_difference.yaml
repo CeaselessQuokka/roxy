@@ -1,0 +1,39 @@
+# UP-UA-EXPERIMENT with enough calls but no real difference between the arms (README.md in this directory).
+#
+# 11.5's evidence is the "429 rate per UA with confidence interval" and the impact is "Lower 429 rate,
+# measured". Here both arms are past 10,000 calls and their rates are within noise of each other:
+#
+#   arm                                   calls    Roblox 429s   rate
+#   current direct_user_agent             30,400   122           0.401%
+#   "Roxy/2 (+https://roxy.test)"         30,100   115           0.382%
+#
+# (two-proportion z of about 0.4; the 95% intervals overlap almost entirely). There is no better UA to choose, so
+# the fixture expects no recommendation at all. Assumption, stated for the rule author: the rule recommends a
+# switch only when the better arm's interval excludes the other arm's rate (or an equivalent significance test at
+# the 95% level), and it does not open an informational card for an inconclusive experiment.
+
+format: roxy.insight_fixture/1
+rule: UP-UA-EXPERIMENT
+case: no_significant_difference
+description: >
+  After a week each User-Agent has about 30,000 calls and nearly the same 429 rate (0.40% against 0.38%). The
+  difference is noise, so the rule must not recommend switching direct_user_agent.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  ua_experiment_enabled: 1
+  ua_experiment_days: 7
+  direct_user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+  ua_experiment_alt_user_agent: "Roxy/2 (+https://roxy.test)"
+
+state:
+  ua_experiment:
+    arms:
+      - {user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36", calls: 30400, roblox_429: 122}
+      - {user_agent: "Roxy/2 (+https://roxy.test)", calls: 30100, roblox_429: 115}
+  settings_history:
+    - {at: "-7d", key: ua_experiment_enabled, old: 0, new: 1, source: admin, changed_by: admin, reason: "D23: measure which UA Roblox limits less."}
+
+expect:
+  fires: false

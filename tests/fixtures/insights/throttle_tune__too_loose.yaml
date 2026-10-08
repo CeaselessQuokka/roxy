@@ -1,0 +1,91 @@
+# THROTTLE-TUNE, "too loose" branch: "a few IPs take most of the upstream slots while others get upstream_busy"
+# (11.5).
+#
+# Three days ago the per-IP limit was raised from 10 to 600 requests per 50 s to help one partner. In the last hour:
+#
+#   clients                         requests   upstream calls   share of upstream calls   upstream_busy
+#   3 stats collectors              27,000     27,000           81.8%                     0
+#   100 game servers                14,400      6,000           18.2%                     2,400 (16.7% of their requests)
+#
+# 11.5 gives no numbers for "a few" and "most"; this fixture is far past any reasonable reading (3 of 103 addresses,
+# 82% of the calls, one in six requests of everyone else failing with `upstream_busy`). The rule must tighten the
+# per-IP limit (allowed_requests_per_minute down, or the window longer), never raise a bucket (that would trade
+# `upstream_busy` for Roblox 429s) and never loosen the limit further. A global setting: never safe_auto.
+
+format: roxy.insight_fixture/1
+rule: THROTTLE-TUNE
+case: too_loose
+description: >
+  With the per-IP limit at 600 per window, three addresses take 82% of the upstream calls while one in six requests
+  from 100 game servers fails with upstream_busy. THROTTLE-TUNE must recommend a tighter per-IP limit, without raising
+  any upstream bucket, and not as safe to auto-apply.
+now: "2026-10-07T15:00:00Z"
+
+settings:
+  allowed_requests_per_minute: 600
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  busy: {egress: none, outcome: failed, reason: upstream_busy, status: 503, source: roxy, cache_state: "MISS", upstream_calls: 0, error: true, latency_ms: {p50: 2000, p95: 2500, p99: 3000}, queue_wait_ms: {p50: 2000, p95: 2500, p99: 3000}, bytes: {caller_in: 0, caller_out: 120}}
+  collectors: {clients: {list: ["198.51.100.50", "198.51.100.51", "198.51.100.52"]}, user_agent: "StatsCollector/2.0"}
+  game_servers:
+    clients: {cidr: "203.0.113.0/25", count: 100}
+    places: ["1000000061", "1000000062", "1000000063", "1000000064", "1000000065", "1000000066"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: collectors_miss, profile: [miss, collectors], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 450}
+  - {name: game_hit, profile: [hit, game_servers], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 100}
+  - {name: game_miss, profile: [miss, game_servers], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 100}
+  - {name: game_busy, profile: [busy, game_servers], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 40}
+
+state:
+  settings_history:
+    - {at: "-3d", key: allowed_requests_per_minute, old: 10, new: 600, source: admin, changed_by: admin, reason: "Partner integration needs more requests."}
+  client_scores:
+    - {clients: {list: ["198.51.100.50", "198.51.100.51", "198.51.100.52"]}, bot_score: 55}
+    - {clients: {cidr: "203.0.113.0/25", count: 100}, bot_score: 10}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 41400, upstream_calls: 33000, by_reason: {upstream_busy: 2400}}
+    - {window: ["-60m", "0m"], where: {client_ip: "198.51.100.50"}, upstream_calls: 9000}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: THROTTLE-TUNE
+      severity: any
+      family: abuse
+      confidence: medium
+      safe_auto: false
+      changes_required:
+        - any_of:
+            - {kind: setting, key: allowed_requests_per_minute, current: 600, proposed: {lt: 600}}
+            - {kind: setting, key: throttle_reset_duration, current: 50, proposed: {gt: 50}}
+      changes_forbidden:
+        - {kind: setting, key: allowed_requests_per_minute, proposed: {gt: 600}}
+        - {kind: setting, key: throttle_reset_duration, proposed: {lt: 50}}
+        - kind: setting
+          key: {in: [global_bucket_per_min, direct_bucket_per_min, endpoint_bucket_default_per_min, host_bucket_default_per_min, queue_max_length]}
+      change_kinds_forbidden: [bucket_override, ban_add, bypass_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_throttle_tune_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_info
+    description: insight_throttle_tune_severity replaces the computed severity.
+    settings: {insight_throttle_tune_severity: info}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: info}

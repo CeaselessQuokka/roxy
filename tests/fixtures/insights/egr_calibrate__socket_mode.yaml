@@ -1,0 +1,71 @@
+# EGR-CALIBRATE with exact socket metering: the gap is real but the overhead constant is not the fix
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Admin-entered provider figure differs > 10%"; change "Adjust rotator_tls_overhead_bytes". Plan 8.6
+# qualifies it: "with the stream wrapper active, a gap usually means unmetered traffic such as exit IP probes
+# from outside Roxy, or a billing rule; with the fallback estimate it adjusts rotator_tls_overhead_bytes".
+#
+#   Metering is in `socket` mode: every byte on the wire to the gateway is counted and overhead_bytes is 0.
+#   rotator_tls_overhead_bytes is used only by the fallback estimate, so changing it would change nothing.
+#   Cycle since 2026-10-01: 9,996,000,000 bytes metered; provider figure 11,600,000,000 (16.0% more).
+#
+# Reading of the row (report to the lead if the rule author disagrees): the rule still fires (the figures
+# disagree by more than 10%), with a `manual` change (look for traffic outside Roxy or a provider billing rule),
+# and must not propose the overhead constant.
+
+format: roxy.insight_fixture/1
+rule: EGR-CALIBRATE
+case: socket_mode
+description: >
+  With exact socket metering, the provider billed 16% more than Roxy counted. The rule must fire with a manual
+  investigation step and must not propose rotator_tls_overhead_bytes, which socket metering does not use.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_quota_gb_per_month: 20
+  rotator_billing_day: 1
+  rotator_enabled: 0
+
+state:
+  settings_history:
+    - {at: "-15h", key: rotator_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Pause the rotator while checking the bill."}
+  egress:
+    metering_mode: socket
+    provider_reported_bytes: 11600000000
+    provider_reported_at: "-1h"
+    usage:
+      - {egress: rotator, granularity: day, at: "2026-10-01", requests: 66000, req_bytes: 165000000, resp_bytes: 1501000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-02", requests: 66000, req_bytes: 165000000, resp_bytes: 1501000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-03", requests: 66000, req_bytes: 165000000, resp_bytes: 1501000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-04", requests: 66000, req_bytes: 165000000, resp_bytes: 1501000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-05", requests: 66000, req_bytes: 165000000, resp_bytes: 1501000000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-06", requests: 66000, req_bytes: 165000000, resp_bytes: 1501000000, overhead_bytes: 0}
+      # The previous cycle is not part of the comparison.
+      - {egress: rotator, granularity: day, at: "2026-09-30", requests: 90000, req_bytes: 225000000, resp_bytes: 2040000000, overhead_bytes: 0}
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: EGR-CALIBRATE
+      severity: any
+      family: egress
+      confidence: high
+      safe_auto: false
+      change_kinds_required: [manual]
+      change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, host_add, bucket_override, credential_allowlist_remove, ignored_param_add, rule_upsert, routing_rule]
+      changes_forbidden:
+        - {kind: setting, key: rotator_tls_overhead_bytes}
+        - kind: setting
+          key: {in: [rotator_quota_gb_per_month, rotator_weight, rotator_enabled, rotator_hard_stop_pct, rotator_daily_cap_mb, rotator_billing_day]}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_egr_calibrate_enabled: 0}
+    expect: {fires: false}
+  - case: diff_pct_20
+    description: A 20% difference is needed; the gap is 16.0% of Roxy's figure.
+    settings: {insight_egr_calibrate_diff_pct: 20}
+    expect: {fires: false}
