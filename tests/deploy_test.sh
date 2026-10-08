@@ -8,7 +8,7 @@
 #
 # The second is the one the previous version got wrong, and getting it wrong
 # cost the server its deploy script, its virtualenv, its ~/Tooling and its
-# running app — while reporting success. Every failure path here exists because
+# running app, while reporting success. Every failure path here exists because
 # that actually happened.
 #
 # Run:  bash tests/deploy_test.sh
@@ -91,7 +91,7 @@ esac
 exit 0
 EOF
 	# A venv that is cheap to make. It records the path it was built at and bakes
-	# that path into its console scripts' shebangs, exactly as a real venv does —
+	# that path into its console scripts' shebangs, exactly as a real venv does,
 	# which is what makes the "built elsewhere then moved" bug detectable here.
 	cat > "$HOME_DIR/bin/python3" <<'EOF'
 #!/bin/bash
@@ -106,7 +106,7 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "venv" ]; then
 exit 0
 PIP
   # gunicorn is what the systemd unit actually execs, so ITS shebang is the one
-  # that breaks if the venv is relocated after creation — that is what
+  # that breaks if the venv is relocated after creation; that is what
   # venv_is_usable inspects.
   printf '#!%s/bin/python\nexit 0\n' "$3" > "$3/bin/gunicorn"
   chmod +x "$3/bin/python" "$3/bin/pip" "$3/bin/gunicorn"

@@ -1,36 +1,69 @@
-name: Deploy to Lightsail
+# Deploy Roxy v2 to production (plan 17.4).
+#
+# SHIPS DISABLED. The deploy job below has `if: false` and must keep it until the owner has run the cutover in
+# MIGRATION.md and removes that one line as its last step. While v1 is live, a v2 commit on main must never
+# deploy, and the v1 deploy (Tooling/UpdateBuild.sh over SSH) must never run against the v2 tree. That is why this
+# file replaces the v1 workflow instead of sitting next to it.
+#
+# When enabled: every push to main runs CI first (this workflow calls ci.yml), then one deploy at a time
+# (`concurrency`) connects over SSH with a pinned host key and runs deploy/deploy.sh <sha> on the server, which
+# builds the release, migrates, starts the idle color, gates on its health, and switches nginx (plan 17.4).
+
+name: Deploy
 
 on:
   push:
     branches:
       - main
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
+permissions:
+  contents: read
 
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false # never interrupt a deploy halfway; the next one waits
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy to production
+    needs: ci
+    # Disabled until cutover. See MIGRATION.md ("Enable the deploy workflow"): remove this line only then.
+    if: false
+    runs-on: ubuntu-24.04
+    environment: production # add required reviewers in the repository settings if wanted (plan 9.14)
+    timeout-minutes: 30
     steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Run deploy.sh on the server
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          ROXY_SHA: ${{ github.sha }}
+          ROXY_REPO: ${{ github.repository }}
         with:
           host: ${{ secrets.LIGHTSAIL_HOST }}
           username: ${{ secrets.LIGHTSAIL_USER }}
           key: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          # The server's host key fingerprint, so a machine pretending to be the server is refused (plan 9.14).
+          fingerprint: ${{ secrets.LIGHTSAIL_HOST_FINGERPRINT }}
+          envs: ROXY_SHA,ROXY_REPO
+          command_timeout: 25m
           script: |
-            set -euo pipefail
+            set -Eeuo pipefail
+            # Where deploy/deploy.sh is installed on the server (must match the install step in MIGRATION.md).
+            DEPLOY_SH=/opt/roxy/deploy.sh
 
-            # Bootstrap. UpdateBuild.sh updates itself, so if a deploy ever dies
-            # partway the server can be left without it -- and then every future
-            # deploy fails here, on the one file that could have fixed things.
-            # Fetching it when it is missing makes that recoverable by pushing
-            # instead of by hand. Normal runs skip this entirely.
-            if [ ! -f ~/UpdateBuild.sh ]; then
-              echo "==> ~/UpdateBuild.sh is missing; reinstalling it from the repo."
-              rm -rf ~/.deploy-bootstrap
-              git clone --quiet --depth 1 https://github.com/CeaselessQuokka/roxy ~/.deploy-bootstrap
-              cp ~/.deploy-bootstrap/Tooling/UpdateBuild.sh ~/UpdateBuild.sh
-              chmod +x ~/UpdateBuild.sh
-              rm -rf ~/.deploy-bootstrap
+            # Bootstrap (v1 parity): if deploy.sh is missing on the server, install it from the pushed commit
+            # first, so a deploy that died halfway can be repaired by pushing instead of by hand.
+            if [ ! -x "$DEPLOY_SH" ]; then
+              echo "==> $DEPLOY_SH is missing; installing it from $ROXY_SHA."
+              tmp="$(mktemp -d)"
+              trap 'rm -rf "$tmp"' EXIT
+              git clone --quiet --no-checkout "https://github.com/${ROXY_REPO}.git" "$tmp/repo"
+              git -C "$tmp/repo" checkout --quiet "$ROXY_SHA" -- deploy/deploy.sh
+              install -m 0755 "$tmp/repo/deploy/deploy.sh" "$DEPLOY_SH"
             fi
 
-            bash ~/UpdateBuild.sh
+            "$DEPLOY_SH" "$ROXY_SHA"

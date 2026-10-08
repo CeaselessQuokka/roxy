@@ -1,0 +1,151 @@
+# Continuous integration for Roxy v2 (plan 9.14 and 17.4).
+#
+# What runs: ruff (lint and format), mypy, pytest (unit, integration, security), the writing style check
+# (scripts/check_style.py on the v2 tree and on REMAKE_PLAN.md), the generated settings reference check
+# (scripts/gen_settings_docs.py --check), bandit, pip-audit and gitleaks.
+# How: uv installs exactly what uv.lock pins (`uv sync --frozen`), so CI tests what production runs.
+# Hardening: every third-party action is pinned by full commit SHA (a tag can be moved, a commit cannot), the
+# token can only read the repository, and checkout does not leave credentials in .git/config.
+# Main is checked by deploy.yml, which calls this workflow before its (disabled) deploy job, so pushes to main do
+# not run CI twice.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - main
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.12.23"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: Lint, types and style
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Ruff lint
+        run: uv run --frozen ruff check src tests scripts
+      - name: Ruff format
+        run: uv run --frozen ruff format --check src tests scripts
+      - name: Mypy
+        run: uv run --frozen mypy
+      - name: Writing style (v2 tree)
+        run: uv run --frozen python scripts/check_style.py
+      - name: Writing style (REMAKE_PLAN.md, the P0 gate)
+        run: uv run --frozen python scripts/check_style.py REMAKE_PLAN.md
+      - name: Settings reference is current (docs/SETTINGS.md, plan 15.2)
+        run: uv run --frozen python scripts/gen_settings_docs.py --check
+
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Pytest (unit, integration, security)
+        # Only the suites that exist yet; the conftest socket guard blocks every non-loopback connection.
+        run: |
+          suites=""
+          for suite in tests/unit tests/integration tests/security; do
+            if [ -d "$suite" ]; then suites="$suites $suite"; fi
+          done
+          uv run --frozen pytest $suites
+
+  security:
+    name: Bandit and pip-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Bandit (fail on medium severity or higher)
+        run: uv run --frozen bandit -c pyproject.toml -r src -ll
+      - name: pip-audit (fail on known vulnerabilities that have a fixed version)
+        # pip-audit fails on any known vulnerability; the plan asks to fail only when a fix exists (9.14), so the
+        # JSON report is filtered: fixable findings fail the job, unfixable ones are shown as warnings.
+        run: |
+          uv run --frozen pip-audit --skip-editable --format json --output pip-audit.json || true
+          python3 - <<'PY'
+          import json
+          import sys
+
+          with open("pip-audit.json", encoding="utf-8") as handle:
+              report = json.load(handle)
+          fixable, unfixable = [], []
+          for dep in report.get("dependencies", []):
+              for vuln in dep.get("vulns", []):
+                  row = (dep["name"], dep.get("version", "?"), vuln.get("id", "?"), vuln.get("fix_versions") or [])
+                  (fixable if row[3] else unfixable).append(row)
+          for name, version, vid, fixes in fixable:
+              print(f"::error::{name} {version}: {vid} is fixed in {', '.join(fixes)}")
+          for name, version, vid, _ in unfixable:
+              print(f"::warning::{name} {version}: {vid} has no fixed version yet")
+          print(f"pip-audit: {len(fixable)} fixable, {len(unfixable)} without a fix")
+          sys.exit(1 if fixable else 0)
+          PY
+
+  gitleaks:
+    name: Gitleaks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0 # the scan reads the commits of this push or pull request
+          persist-credentials: false
+      - name: Install gitleaks
+        # Built from source at a pinned version: the Go checksum database verifies the module download, so a
+        # tampered release cannot slip in, and no third-party action needs extra token permissions.
+        run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
+      - name: Scan the new commits for secrets
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            range="$BASE..$HEAD"
+          elif [ -n "$BEFORE" ] && ! printf '%s' "$BEFORE" | grep -qx '0*' && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..$SHA"
+          else
+            range="$SHA~1..$SHA"
+          fi
+          echo "Scanning $range"
+          "$(go env GOPATH)/bin/gitleaks" git --redact --no-banner --verbose --log-opts="$range" .

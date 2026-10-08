@@ -1,2 +1,128 @@
-[tool.black]
+# Project metadata and tool configuration for Roxy v2.
+#
+# Dependencies are locked with uv (uv.lock records exact versions and hashes), and the deploy installs
+# them with `uv sync --frozen`, so production runs exactly what CI tested. Start reading at src/roxy/__init__.py.
+
+[project]
+name = "roxy"
+version = "2.0.0"
+description = "Roxy: a Roblox web API proxy that is safe for its operator, kind to Roblox, and fully observable."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+dependencies = [
+    "fastapi>=0.115",
+    "starlette>=0.40",
+    "uvicorn[standard]>=0.30",
+    "uvicorn-worker>=0.2",
+    "gunicorn>=23.0",
+    "httpx[http2]>=0.27",
+    "brotli>=1.1",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "jinja2>=3.1",
+    "argon2-cffi>=23.1",
+    "pyotp>=2.9",
+    "webauthn>=2.2",
+    "itsdangerous>=2.2",
+    "aiosmtplib>=3.0",
+    "zstandard>=0.23",
+    "regex>=2024.7.24",
+    "cryptography>=43",
+    "anyio>=4.4",
+    "python-multipart>=0.0.9",
+    "segno>=1.6",
+    "markdown-it-py>=3.0",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
+    "respx>=0.21",
+    "hypothesis>=6.112",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "bandit>=1.7.9",
+    "pip-audit>=2.7",
+    "jsonschema>=4.23",
+    "types-pyyaml>=6.0",
+    "types-regex>=2024.7.24",
+    "trustme>=1.1",
+    "locust>=2.31",
+    "playwright>=1.47",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/roxy"]
+
+[tool.ruff]
 line-length = 120
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+extend-exclude = ["app", "Tooling", "Unused", "env2", ".remake", "tests/smoke_test.py", "tests/fixtures/v1"]
+
+[tool.ruff.lint]
+# E/F/W: pyflakes and pycodestyle; I: import order; B: bugbear (likely bugs); S: bandit-style security
+# checks; ASYNC: blocking calls inside async functions; UP: modern syntax; RUF: ruff's own checks.
+select = ["E", "F", "W", "I", "B", "S", "ASYNC", "UP", "RUF", "C4", "SIM", "PT", "T20"]
+ignore = [
+    "S101",   # assert is how pytest works; production code avoids it by convention, reviewed in review
+    "S311",   # random is used for jitter and sampling only, never for secrets (secrets uses `secrets`)
+    "RUF001", # ambiguous unicode in strings: the style checker already bans the dash characters we care about
+    "RUF002",
+    "RUF003",
+    "RUF012", # mutable class attributes are fine for Pydantic and constant tables
+    "SIM108", # ternaries are not always clearer than if/else in teaching code
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "T20", "PT011", "B017", "SIM117"]
+"scripts/**" = ["T20", "S603", "S607"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["roxy"]
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["roxy.core.*", "roxy.egress.*", "roxy.storage.*", "roxy.config.*", "roxy.upstream.*", "roxy.rules.*"]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Only test_*.py: the v1 suite tests/smoke_test.py runs itself on import and must never be collected.
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+timeout = 120
+addopts = "-ra --strict-markers"
+markers = [
+    "multiprocess: spawns real worker processes (slower)",
+    "live: talks to real external services; only with ROXY_LIVE_TESTS=1, never in CI",
+    "e2e: browser tests with Playwright",
+    "load: load tests",
+    "deploy: deploy script sandbox tests",
+]
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "app", "Tooling", "Unused", "env2"]
+# B608 (SQL built from strings) is the same check as ruff's S608, which runs on every commit. Each place that
+# interpolates an identifier (a table or column name from a module constant or the RULE_TABLES registry; values are
+# always bound parameters) carries an inline `noqa: S608` with its reason, reviewed by the lead. Keeping one owner for
+# the rule avoids two different suppression syntaxes on the same line.
+skips = ["B608"]

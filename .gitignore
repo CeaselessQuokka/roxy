@@ -5,3 +5,24 @@ app/__pycache__/
 # create one here by accident while testing the deploy script.
 SiteEnv/
 Build/
+
+# v2 local development
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+/var/
+/tmp/
+*.db
+*.db-wal
+*.db-shm
+# Working notes for the remake run (v1 behavior notes, agent briefs). Not part of the product.
+.remake/
+# Playwright artifacts
+test-results/
+playwright-report/
