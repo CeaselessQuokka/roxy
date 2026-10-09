@@ -75,6 +75,7 @@ import httpx
 from roxy.core.clock import Clock
 from roxy.core.ids import new_request_id
 from roxy.core.reasons import AuthClass, Egress, ReasonCode
+from roxy.metrics.recorder import note_attempts, note_reservation
 from roxy.proxy.validate import parse_redirect
 from roxy.rules.match import regex_budget
 from roxy.storage.db import Database, SharedStateUnavailable
@@ -168,6 +169,14 @@ FORWARDED_ACCEPT: Final = frozenset({"application/json", "*/*"})
 
 _ROBLOX_HOST = re.compile(r"(?:[a-z0-9-]+\.)*roblox\.com")
 CALLER: Final = "caller"
+PROBE_TRIGGERS: Final[Mapping[str, str]] = {
+    "liveness": "scheduled",
+    "health": "health",
+    "admin_check": "admin",
+    "confirm_401": "upstream",
+}
+"""The trigger recorded with a credential probe of each `CredentialManager.probe` kind (CRED-PROBE-COST groups
+the account's calls by it: `scheduled`, `health`, `admin`; a 401 confirmation is started by an upstream answer)."""
 
 
 class SingleFlightLost(Exception):
@@ -659,13 +668,15 @@ class UpstreamService:
         use_credential: bool = False,
         body: bytes | None = None,
         priority: Priority = Priority.INTERNAL,
+        trigger: str = "",
     ) -> UpstreamResult:
         """Roxy's own call (a probe, a lookup) through the same buckets, cooldowns and breakers (rows 28, 29).
 
         Internal calls never pass the proxy pipeline (pause, blocks, throttles do not apply, v1 parity) but always
         pay their way in the buckets. `use_credential=True` sends through the credential path only (GET or HEAD,
         the reserved probe sub-bucket), never anonymously instead; otherwise the call is anonymous and never
-        uses the credential.
+        uses the credential. `trigger` (`scheduled`, `health`, `admin`, ...) is recorded with the call, so
+        CRED-PROBE-COST can say which kind of probe spends the account's budget.
         """
         cfg = self.config()
         allowed = cfg.allowed_hosts if cfg.strict_hosts else None
@@ -694,7 +705,7 @@ class UpstreamService:
         mode: Mode = "internal_cred" if use_credential else "internal_anon"
         started = self._mono()
         result = await self._guarded(request, Priority(priority), purpose, None, trace, mode)
-        self._record_internal(purpose, request, result, (self._mono() - started) * 1000)
+        self._record_internal(purpose, request, result, (self._mono() - started) * 1000, trigger=trigger)
         return result
 
     def availability(self, req: UpstreamRequest) -> Availability:
@@ -846,6 +857,8 @@ class UpstreamService:
             log.exception("upstream_fetch_failed", extra={"fields": {"purpose": purpose}})
             result = self._failure(ReasonCode.INTERNAL_ERROR, trace, state)
         trace.outcome = result.reason.value
+        if mode == CALLER:  # calls by attempt for caller traffic and its refreshes (UP-429-AMPLIFY, UP-CSRF-LOOP)
+            note_attempts(self._ctx, str(getattr(req, "template", "") or ""), trace)
         return result
 
     @staticmethod
@@ -1210,6 +1223,7 @@ class UpstreamService:
             guards=self._guards(call, egress, holder, probes, slots),
             routed_for=routed_for,
         )
+        note_reservation(self._ctx, specs, outcome)  # bucket fill and rejection history (UP-BUCKET-TUNE, row 77)
         if outcome.lease_lost:
             raise SingleFlightLost(call.template)
         if outcome.grant is None:
@@ -1806,7 +1820,7 @@ class UpstreamService:
         manager = getattr(self._egress, "credential", None)
         probe = getattr(manager, "probe", None)
         if callable(probe):
-            await maybe_await(probe("confirm_401", fetch=self.credential_probe_fetch))
+            await maybe_await(probe("confirm_401", fetch=self.probe_fetch_for("confirm_401")))
             return
         from roxy.upstream import internal  # local: internal.py imports this module
 
@@ -1817,16 +1831,24 @@ class UpstreamService:
                     manager, "mark_rejected", f"401 on {template[:120]} confirmed by a probe ({verdict.status})"
                 )
 
-    async def credential_probe_fetch(self, url: str) -> ProbeResponse:
+    async def credential_probe_fetch(self, url: str, *, trigger: str = "") -> ProbeResponse:
         """The egress `ProbeFetch` hook: one credential probe call through the buckets (rows 25 and 28).
 
         Paced by the reserved `egress:credential:probe` sub-bucket at internal priority, honoring cooldowns and
         breakers. Returns the raw answer for the credential manager to interpret; raises the egress package's
         `CredentialUnavailable` when no slot is available, and `UpstreamTimeout` or `UpstreamConnectError` when
-        Roblox could not be reached, exactly as a direct send would.
+        Roblox could not be reached, exactly as a direct send would. `trigger` is recorded with the call (see
+        `probe_fetch_for`, which callers use to name it).
         """
-        result = await self.internal_fetch("credential_probe", "GET", url, use_credential=True)
+        result = await self.internal_fetch("credential_probe", "GET", url, use_credential=True, trigger=trigger)
         return probe_response(result)
+
+    def probe_fetch_for(self, kind: str) -> Callable[[str], Awaitable[ProbeResponse]]:
+        """`credential_probe_fetch` with the trigger of a probe `kind` (`PROBE_TRIGGERS`) bound, for
+        `CredentialManager.probe(kind, fetch=...)`: the scheduled liveness probe records `scheduled`, the health
+        check `health`, the dashboard's checks `admin`."""
+        trigger = PROBE_TRIGGERS.get(kind, kind[:32])
+        return functools.partial(self.credential_probe_fetch, trigger=trigger)
 
     # ------------------------------------------------------------------------------------------------- results
 
@@ -1995,7 +2017,9 @@ class UpstreamService:
             cooldown_source=decision.cooldown_source,
         )
 
-    def _record_internal(self, purpose: str, req: _InternalRequest, result: UpstreamResult, elapsed_ms: float) -> None:
+    def _record_internal(
+        self, purpose: str, req: _InternalRequest, result: UpstreamResult, elapsed_ms: float, *, trigger: str = ""
+    ) -> None:
         """Parity rows 28, 68, 72: Roxy's own calls are counted under the `internal` source, never as callers."""
         recorder = getattr(self._ctx, "recorder", None)
         if recorder is None:
@@ -2016,6 +2040,7 @@ class UpstreamService:
                 calls=result.calls,
                 bytes_in=result.bytes_in,
                 bytes_out=result.bytes_out,
+                trigger=trigger,
             )
         except Exception:  # metrics degrade open (plan C7)
             log.warning("internal_call_record_failed", exc_info=True)

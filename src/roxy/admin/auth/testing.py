@@ -358,10 +358,17 @@ class AuthHarness:
 
 
 def ensure_auth_routes(app: Any) -> None:
-    """Include the auth router unless the admin router already did (it will once `roxy/admin/router.py` exists)."""
+    """Include the auth router unless the admin router already did (it does in every app `create_app` builds).
+
+    FastAPI keeps an included router's routes nested (it no longer copies them into `app.router.routes`), so the
+    login route is looked for with `iter_route_contexts`, which walks the nested routers; a flat look missed it and
+    included the auth router a second time.
+    """
+    from fastapi.routing import iter_route_contexts
+
     from roxy.admin.auth.routes import router
 
-    if not any(getattr(route, "path", None) == LOGIN_PATH for route in app.router.routes):
+    if not any(str(context.path or "") == LOGIN_PATH for context in iter_route_contexts(app.router.routes)):
         app.include_router(router)
 
 

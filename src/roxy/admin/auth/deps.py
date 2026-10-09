@@ -23,8 +23,11 @@ How it works
          `Session expired` (v1 text), pages a 302 to `/admin`; the dead cookie is cleared either way.
       5. A bootstrap session (D5 first login) may only enroll: elsewhere API paths get 403 and pages a 302 to
          `/admin/enroll`.
-      6. `fresh_mfa` without a recent second factor: 403 `Re-authentication required` with `Roxy-Reauth:
-         required`, so the dashboard can ask for the code and retry.
+      6. `fresh_mfa` without a recent second factor: `ReauthRequired`, 403 with the header `Roxy-Reauth:
+         required` and the DESIGN.md section 13 error code `reauth_required` (lead decision: both signals), so the
+         dashboard can ask for the code and retry. The exception carries `error_code`, `error_message` and
+         `error_fields`; the admin API route class (`admin/api/common.py AdminApiRoute`) answers it as the section
+         13 object `{"error": {"code": "reauth_required", ...}}`.
       7. Activity: only real use extends the session (plan 9.6). A state-changing request is use; a page load is
          use only when the browser says a person started it (`Sec-Fetch-Mode: navigate` with `Sec-Fetch-User:
          ?1`). Polling, HTMX refreshes and the live tail are not, so an unattended tab still expires. The
@@ -63,6 +66,9 @@ STATE_COOKIE = "admin_session_cookie"
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 SESSION_EXPIRED_TEXT = "Session expired"
 REAUTH_TEXT = "Re-authentication required"
+REAUTH_CODE = "reauth_required"
+REAUTH_MESSAGE = "Confirm it is you: enter a current code from your authenticator app, then try again."
+REAUTH_HEADER = "Roxy-Reauth"
 ENROLL_TEXT = "Finish enrolling your authenticator app first."
 FORBIDDEN_TEXT = "Forbidden"
 ENROLL_PATHS = frozenset(
@@ -89,6 +95,22 @@ class AdminPrincipal:
     mfa_at: int
     ip: str
     ua: str
+
+
+class ReauthRequired(HTTPException):
+    """403 for a sensitive action without a fresh second factor (plan 9.6; the lead's re-auth contract).
+
+    Two signals, so any client recognizes it: the header `Roxy-Reauth: required` and the DESIGN.md section 13 error
+    object with code `reauth_required`. `error_code`, `error_message` and `error_fields` are the section 13 parts;
+    `detail` keeps the old text for a handler that only knows `HTTPException`.
+    """
+
+    error_code = REAUTH_CODE
+
+    def __init__(self) -> None:
+        super().__init__(status_code=403, detail=REAUTH_TEXT, headers={REAUTH_HEADER: "required"})
+        self.error_message = REAUTH_MESSAGE
+        self.error_fields: dict[str, str] = {}
 
 
 def get_ctx_or_none(request: Request) -> Any | None:
@@ -202,7 +224,7 @@ def require_admin(
             raise HTTPException(status_code=302, detail=ENROLL_TEXT, headers={"Location": "/admin/enroll"})
         auth = get_auth(request)
         if scope == "fresh_mfa" and not record.is_fresh(ctx.clock.now(), ctx.settings.int("admin_reauth_window_s")):
-            raise HTTPException(status_code=403, detail=REAUTH_TEXT, headers={"Roxy-Reauth": "required"})
+            raise ReauthRequired()
         if activity == "auto" and is_user_activity(request):
             try:
                 await auth.touch_session(record)
@@ -263,6 +285,7 @@ def masked_csrf(request: Request) -> str | None:
 __all__ = [
     "AdminPrincipal",
     "AdminScope",
+    "ReauthRequired",
     "get_auth",
     "masked_csrf",
     "request_info",

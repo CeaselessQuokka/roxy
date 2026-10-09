@@ -36,6 +36,13 @@ How it works
     - Honest numbers (P6): caller requests carry `upstream_calls`; background refreshes add upstream calls with
       zero requests (`record_background_fetch`); Roxy's own probes are rows with source `internal`
       (`record_internal_call`), reported separately. `metrics/catalog.py` has the exact definitions.
+    - Insight history (schema version 2, plan 11.1 and 11.5): bucket fill and rejections per minute
+      (`record_reservation`, `record_bucket`), worker samples (`record_worker_sample`), shared cache stores,
+      evictions and eviction passes (`record_cache_store`, `record_cache_eviction`, `record_eviction_pass`), rule
+      hits (`record_rule_hit`), error occurrences per minute (inside `record_error`) and upstream calls by attempt
+      (`record_attempts`, `record_attempt`). They are summed in bounded maps and written by one batch kind,
+      `metrics.insight_history`, with upserts that add up across workers. The `note_*` module functions are the
+      one-line producer hooks: they find the recorder and never raise.
     - `run(stop)` flushes on the configured interval and refreshes the vocabulary gates hourly. At shutdown the
       lifespan calls `aclose(budget_s=...)` after that loop stopped: one final flush, including the minute still
       open, so a recycle never loses buffered numbers. It never blocks the event loop and never outlives its
@@ -67,7 +74,7 @@ from typing import Any, TypeVar, cast
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.core.iphash import ip_hash
 from roxy.core.reasons import AuthClass, CacheState, Egress, Outcome, ReasonCode, Source
-from roxy.core.redact import is_sensitive_key, redact_label, redact_text
+from roxy.core.redact import MASK, is_secret_field, is_sensitive_key, redact_label, redact_text
 from roxy.metrics import histograms, security_events, visitors
 from roxy.metrics.activity import ip_key, place_key
 from roxy.metrics.capture import (
@@ -126,12 +133,19 @@ FINAL_FLUSH_GRACE_S = 0.5
 timeout is what was left of the budget, so it ends within moments)."""
 ENCODER_SHUTDOWN_SHARE = 0.25
 """Part of the `aclose` budget queued captures may take to be built before the final write."""
+MAX_HISTORY_KEYS = 20_000
+"""Distinct keys held per insight history map between two flushes (plan P9); beyond it a sample is dropped and
+counted in `history_dropped` (metrics degrade open, C7)."""
+MAX_EVICTION_PASSES = 256
+"""Eviction pass rows held between two flushes (one pass a minute fleet-wide, so this never fills in practice)."""
+MAX_HISTORY_LABEL_CHARS = 255
 
 # Batch kinds and their priorities (higher survives longer when the queue is full).
 KIND_ROLLUPS = "metrics.rollups"
 KIND_EGRESS = "metrics.egress_usage"
 KIND_429 = "metrics.upstream_429"
 KIND_CLIENTS = "metrics.clients"
+KIND_HISTORY = "metrics.insight_history"
 KIND_ERRORS = "metrics.errors"
 KIND_EVENTS = "metrics.events"
 KIND_AGG_EVENTS = "metrics.events_aggregated"
@@ -144,6 +158,7 @@ PRIORITIES: dict[str, int] = {
     KIND_EGRESS: 95,
     KIND_429: 90,
     KIND_CLIENTS: 70,
+    KIND_HISTORY: 68,
     KIND_ERRORS: 65,
     KIND_EVENTS: 60,
     KIND_AGG_EVENTS: 55,
@@ -251,6 +266,19 @@ class ErrorDelta:
     last_detail: str
     module_line: str
     traceback: str
+
+
+@dataclass(slots=True)
+class HistoryItem:
+    """One row of an insight history table (schema version 2): `table` names it, `key` and `values` fill it.
+
+    `write_history` turns it into an upsert: counts add up, peaks and maxima keep the larger value, so two workers
+    writing the same minute end with the fleet total (C6).
+    """
+
+    table: str
+    key: tuple[Any, ...]
+    values: tuple[Any, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,6 +412,15 @@ class MetricsRecorder:
         self._egress: dict[tuple[int, str], list[int]] = {}
         self._agg_events: dict[tuple[Any, ...], int] = {}
         self._errors: dict[str, ErrorDelta] = {}
+        # Insight history (schema version 2), each map bounded by MAX_HISTORY_KEYS.
+        self._bucket_minutes: dict[tuple[int, str], list[float]] = {}  # [attempts, rejections, fill_pct_peak]
+        self._worker_minutes: dict[tuple[int, str], list[Any]] = {}  # [samples, cpu_sum, cpu_max, lag, conns, rss]
+        self._cache_minutes: dict[int, list[float]] = {}  # [stores, evictions, young, age_sum, young_age_sum]
+        self._eviction_passes: list[tuple[int, int, int, int, int]] = []
+        self._rule_hits: dict[tuple[str, str], list[int]] = {}  # [hits, first_hit_at, last_hit_at]
+        self._error_minutes: dict[tuple[str, int], int] = {}
+        self._attempt_minutes: dict[tuple[Any, ...], int] = {}
+        self.history_dropped = 0
         self._budgets: dict[tuple[str, str], RateGate] = {}
         self._live_gate = RateGate(LIVE_EVENTS_PER_SECOND, LIVE_EVENTS_PER_SECOND, self.clock.monotonic)
         self._closing = False
@@ -444,6 +481,7 @@ class MetricsRecorder:
         )
         b.register(KIND_429, metrics, _write_429, priority=PRIORITIES[KIND_429])
         b.register(KIND_CLIENTS, metrics, write_clients, priority=PRIORITIES[KIND_CLIENTS], source=self._drain_clients)
+        b.register(KIND_HISTORY, metrics, write_history, priority=PRIORITIES[KIND_HISTORY], source=self._drain_history)
         b.register(KIND_ERRORS, metrics, _write_errors, priority=PRIORITIES[KIND_ERRORS], source=self._drain_errors)
         b.register(KIND_EVENTS, metrics, write_events, priority=PRIORITIES[KIND_EVENTS])
         b.register(
@@ -913,11 +951,13 @@ class MetricsRecorder:
         at_ms: int | None = None,
         elapsed_ms: float | None = None,
         endpoint: str = "",
+        trigger: str = "",
     ) -> None:
         """One of Roxy's own upstream calls (probes, lookups): source `internal`, zero caller requests (P6).
 
         `elapsed_ms` is accepted as another name for `duration_ms`, and `endpoint` (a URL without its query, as
-        the upstream service reports it) fills `host` and `endpoint_template` when those are not given.
+        the upstream service reports it) fills `host` and `endpoint_template` when those are not given. `trigger`
+        says what started the call (`scheduled`, `health`, `admin`; CRED-PROBE-COST groups probes by it).
         """
         try:
             if elapsed_ms is not None:
@@ -961,8 +1001,17 @@ class MetricsRecorder:
                 detail["endpoint"] = endpoint_template[:200]
             if error:
                 detail["error"] = redact_text(error)[:200]
+            if trigger:
+                detail["trigger"] = str(trigger)[:32]
+            if str(egress) == Egress.CREDENTIAL.value or str(auth_class) == AuthClass.CRED.value:
+                detail["egress"] = Egress.CREDENTIAL.value
+            summary: dict[str, Any] = {"ok": bool(ok)}
+            if trigger:
+                summary["trigger"] = detail["trigger"]
+            if "egress" in detail:
+                summary["egress"] = detail["egress"]
             self._event(when, INTERNAL_CALL_EVENT, "info" if ok else "warn", purpose[:60], detail,
-                        summary_detail={"ok": bool(ok)})  # fmt: skip
+                        summary_detail=summary)  # fmt: skip
         except Exception:
             self._count_error("record_internal_call")
 
@@ -1085,6 +1134,8 @@ class MetricsRecorder:
                     entry.module_line = module_line[:200]
                 if traceback:
                     entry.traceback = traceback
+                # When it happened, per minute (SYS-ERRORS compares the last hour with a 7-day hourly baseline).
+                self._bump_locked(self._error_minutes, (sig, now // 60 * 60), 1)
         except Exception:
             self._count_error("record_error")
 
@@ -1152,6 +1203,288 @@ class MetricsRecorder:
             self.batch.add(KIND_SAMPLES, row)
         except Exception:
             self._count_error("record_sample")
+
+    # --- insight history (schema version 2; plan 11.1, 11.5) ---
+
+    def _bump_locked(self, table: dict[Any, int], key: Any, count: int) -> None:
+        """Add `count` under `key` of a bounded counter map; caller holds `_lock`."""
+        if key not in table and len(table) >= MAX_HISTORY_KEYS:
+            self.history_dropped += 1
+            return
+        table[key] = table.get(key, 0) + int(count)
+
+    def _minute_s(self, at_ms: int | None) -> int:
+        when = int(at_ms if at_ms is not None else _now_ms(self.clock))
+        return when // 60_000 * 60
+
+    def record_bucket(
+        self, bucket_key: str, *, attempts: int = 1, rejected: int = 0, fill_pct: float = 0.0, at_ms: int | None = None
+    ) -> None:
+        """One reservation against an upstream bucket (plan 7.3): attempts, rejections and the fill it saw."""
+        try:
+            key = (self._minute_s(at_ms), str(bucket_key)[:MAX_HISTORY_LABEL_CHARS])
+            with self._lock:
+                acc = self._bucket_minutes.get(key)
+                if acc is None:
+                    if len(self._bucket_minutes) >= MAX_HISTORY_KEYS:
+                        self.history_dropped += 1
+                        return
+                    acc = self._bucket_minutes[key] = [0, 0, 0.0]
+                acc[0] += max(0, int(attempts))
+                acc[1] += max(0, int(rejected))
+                acc[2] = max(acc[2], min(100.0, max(0.0, float(fill_pct))))
+        except Exception:
+            self._count_error("record_bucket")
+
+    def record_reservation(self, specs: Iterable[Any], outcome: Any, *, now_ms: int | None = None) -> None:
+        """A whole multi-bucket reservation (`upstream/buckets.py reserve`): one attempt on every bucket, the fill
+        each bucket had after a grant, and a rejection on the bucket that bound a denial (its fill is 100%).
+
+        A guard refusal (cooldown, breaker) or a lost lease asked no bucket, so it is not counted.
+        """
+        try:
+            from roxy.upstream.buckets import gcra_fill  # local import: the upstream package imports metrics
+
+            grant = getattr(outcome, "grant", None)
+            denial = getattr(outcome, "denial", None)
+            if grant is None and denial is None:
+                return
+            at = int(now_ms if now_ms is not None else getattr(grant, "now_ms", None) or _now_ms(self.clock))
+            after = {key: tat for key, _interval, _before, tat in getattr(grant, "advanced", ())}
+            binding = getattr(denial, "binding_key", "") if denial is not None else ""
+            for spec in specs:
+                if grant is not None:
+                    fill = gcra_fill(after.get(spec.key, 0.0), spec, at) * 100.0
+                    self.record_bucket(spec.key, fill_pct=fill, at_ms=at)
+                else:
+                    refused = spec.key == binding
+                    self.record_bucket(spec.key, rejected=int(refused), fill_pct=100.0 if refused else 0.0, at_ms=at)
+        except Exception:
+            self._count_error("record_reservation")
+
+    def record_worker_sample(
+        self,
+        *,
+        worker_id: str | None = None,
+        cpu_pct: float | None = None,
+        loop_lag_ms_p99: float | None = None,
+        open_conns: int | None = None,
+        rss: int | None = None,
+        at_ms: int | None = None,
+    ) -> None:
+        """One worker sample (SYS-WORKER-SAT, SYS-LOOP-LAG). Hook for the heartbeat; the minute keeps the mean CPU,
+        the largest loop lag and connection count, and the last RSS."""
+        try:
+            key = (self._minute_s(at_ms), (worker_id or self.worker_id or "worker")[:MAX_HISTORY_LABEL_CHARS])
+            with self._lock:
+                acc = self._worker_minutes.get(key)
+                if acc is None:
+                    if len(self._worker_minutes) >= MAX_HISTORY_KEYS:
+                        self.history_dropped += 1
+                        return
+                    acc = self._worker_minutes[key] = [0, 0.0, None, None, None, None]
+                if cpu_pct is not None:
+                    acc[0] += 1
+                    acc[1] += float(cpu_pct)
+                    acc[2] = float(cpu_pct) if acc[2] is None else max(acc[2], float(cpu_pct))
+                if loop_lag_ms_p99 is not None:
+                    acc[3] = float(loop_lag_ms_p99) if acc[3] is None else max(acc[3], float(loop_lag_ms_p99))
+                if open_conns is not None:
+                    acc[4] = int(open_conns) if acc[4] is None else max(acc[4], int(open_conns))
+                if rss is not None:
+                    acc[5] = int(rss)
+        except Exception:
+            self._count_error("record_worker_sample")
+
+    def _cache_minute(self, at_ms: int | None) -> list[float] | None:
+        """The accumulator of one cache minute; caller holds `_lock`."""
+        minute = self._minute_s(at_ms)
+        acc = self._cache_minutes.get(minute)
+        if acc is None:
+            if len(self._cache_minutes) >= MAX_HISTORY_KEYS:
+                self.history_dropped += 1
+                return None
+            acc = self._cache_minutes[minute] = [0, 0, 0, 0.0, 0.0]
+        return acc
+
+    def record_cache_store(self, count: int = 1, *, at_ms: int | None = None) -> None:
+        """Entries written to the shared cache tier (cache.db), the denominator of CACHE-PRESSURE."""
+        try:
+            with self._lock:
+                acc = self._cache_minute(at_ms)
+                if acc is not None:
+                    acc[0] += max(0, int(count))
+        except Exception:
+            self._count_error("record_cache_store")
+
+    def record_cache_eviction(self, *, age_s: float, ttl_s: float, count: int = 1, at_ms: int | None = None) -> None:
+        """Entries evicted for space (not expiry); young ones (age below their TTL) mean the cache is too small."""
+        try:
+            n = max(0, int(count))
+            young = float(age_s) < float(ttl_s)
+            with self._lock:
+                acc = self._cache_minute(at_ms)
+                if acc is not None:
+                    acc[1] += n
+                    acc[3] += float(age_s) * n
+                    if young:
+                        acc[2] += n
+                        acc[4] += float(age_s) * n
+        except Exception:
+            self._count_error("record_cache_eviction")
+
+    def record_eviction_ages(
+        self,
+        *,
+        evicted: int,
+        young: int,
+        age_s_total: float,
+        young_age_s_total: float,
+        at_ms: int | None = None,
+    ) -> None:
+        """The evicted entries of one eviction pass, summed (the same minute sums `record_cache_eviction` adds per
+        entry): how many, how many were young (evicted before their TTL ran out), and their summed ages."""
+        try:
+            n = max(0, int(evicted))
+            if n <= 0:
+                return
+            with self._lock:
+                acc = self._cache_minute(at_ms)
+                if acc is not None:
+                    acc[1] += n
+                    acc[2] += min(n, max(0, int(young)))
+                    acc[3] += max(0.0, float(age_s_total))
+                    acc[4] += max(0.0, float(young_age_s_total))
+        except Exception:
+            self._count_error("record_eviction_ages")
+
+    def record_eviction_pass(self, report: Any, *, at_s: int | None = None) -> None:
+        """One maintenance pass of the shared cache tier (`cache/store.py EvictionReport`), kept when it evicted."""
+        try:
+            evicted = int(getattr(report, "evicted", 0) or 0)
+            if evicted <= 0:
+                return
+            row = (
+                int(at_s if at_s is not None else self.clock.now()),
+                int(getattr(report, "entries_before", 0) or 0),
+                int(getattr(report, "bytes_before", 0) or 0),
+                evicted,
+                int(getattr(report, "freed_bytes", 0) or 0),
+            )
+            with self._lock:
+                if len(self._eviction_passes) >= MAX_EVICTION_PASSES:
+                    self.history_dropped += 1
+                    return
+                self._eviction_passes.append(row)
+        except Exception:
+            self._count_error("record_eviction_pass")
+
+    def record_rule_hit(self, table: str, key: Any, *, count: int = 1, at_s: int | None = None) -> None:
+        """A rule row matched a request (FILTER-REMOVE idle time, SEC-BYPASS-FOREVER last hit)."""
+        try:
+            now = int(at_s if at_s is not None else self.clock.now())
+            slot = (str(table)[:64], str(key)[:MAX_HISTORY_LABEL_CHARS])
+            with self._lock:
+                acc = self._rule_hits.get(slot)
+                if acc is None:
+                    if len(self._rule_hits) >= MAX_HISTORY_KEYS:
+                        self.history_dropped += 1
+                        return
+                    acc = self._rule_hits[slot] = [0, now, now]
+                acc[0] += max(0, int(count))
+                acc[1] = min(acc[1], now)
+                acc[2] = max(acc[2], now)
+        except Exception:
+            self._count_error("record_rule_hit")
+
+    def record_attempt(
+        self,
+        *,
+        endpoint_template: str,
+        egress: Egress | str,
+        attempt: int,
+        kind: str,
+        status: int | None,
+        challenge: bool = False,
+        html_body: bool = False,
+        exit_id: str = "",
+        count: int = 1,
+        at_ms: int | None = None,
+    ) -> None:
+        """One upstream HTTP call by attempt (first, csrf_retry, fallback_429, retry_5xx, redirect)."""
+        try:
+            template = redact_label(str(endpoint_template or OTHER))[:MAX_HISTORY_LABEL_CHARS]
+            key = (
+                self._minute_s(at_ms),
+                template,
+                str(egress)[:16],
+                max(1, int(attempt)),
+                str(kind)[:32],
+                int(status) if status is not None else -1,
+                1 if challenge else 0,
+                1 if html_body else 0,
+                str(exit_id or "")[:32],
+            )
+            with self._lock:
+                self._bump_locked(self._attempt_minutes, key, max(0, int(count)))
+        except Exception:
+            self._count_error("record_attempt")
+
+    def record_attempts(self, endpoint_template: str, trace: Any, *, at_ms: int | None = None) -> None:
+        """Every call of one upstream trace (`upstream/trace.py Trace.calls`), classified by attempt kind.
+
+        A CSRF retry repeats its attempt's number; a call after another attempt is `fallback_429` when the call
+        before it was answered 429, otherwise `retry_5xx` (a 5xx, timeout or connect retry); a redirect hop is
+        `redirect`. Rotator calls carry the session hash of the trace as `exit_id`.
+        """
+        try:
+            calls = list(getattr(trace, "calls", ()) or ())
+            identity = str(getattr(trace, "egress_identity", "") or "")
+            exit_id = identity.split(":", 1)[1] if identity.startswith("rotator:") else ""
+            previous: Any = None
+            for call in calls:
+                if getattr(call, "csrf_retry", False):
+                    kind = "csrf_retry"
+                elif getattr(call, "redirect_hop", 0):
+                    kind = "redirect"
+                elif int(getattr(call, "number", 1) or 1) <= 1 or previous is None:
+                    kind = "first"
+                elif getattr(previous, "status", None) == 429:
+                    kind = "fallback_429"
+                else:
+                    kind = "retry_5xx"
+                egress = str(getattr(call, "egress", "") or "none")
+                self.record_attempt(
+                    endpoint_template=endpoint_template,
+                    egress=egress,
+                    attempt=int(getattr(call, "number", 1) or 1),
+                    kind=kind,
+                    status=getattr(call, "status", None),
+                    exit_id=exit_id if egress == Egress.ROTATOR.value else "",
+                    at_ms=at_ms,
+                )
+                previous = call
+        except Exception:
+            self._count_error("record_attempts")
+
+    def _drain_history(self) -> list[HistoryItem]:
+        with self._lock:
+            buckets, self._bucket_minutes = self._bucket_minutes, {}
+            workers, self._worker_minutes = self._worker_minutes, {}
+            caches, self._cache_minutes = self._cache_minutes, {}
+            passes, self._eviction_passes = self._eviction_passes, []
+            hits, self._rule_hits = self._rule_hits, {}
+            errors, self._error_minutes = self._error_minutes, {}
+            attempts, self._attempt_minutes = self._attempt_minutes, {}
+        out: list[HistoryItem] = []
+        out += [HistoryItem("bucket_minute", key, tuple(v)) for key, v in buckets.items()]
+        out += [HistoryItem("worker_minute", key, tuple(v)) for key, v in workers.items()]
+        out += [HistoryItem("cache_minute", (minute,), tuple(v)) for minute, v in caches.items()]
+        out += [HistoryItem("cache_eviction_passes", (), row) for row in passes]
+        out += [HistoryItem("rule_hits", key, tuple(v)) for key, v in hits.items()]
+        out += [HistoryItem("error_minute", key, (n,)) for key, n in errors.items()]
+        out += [HistoryItem("upstream_attempt_minute", key, (n,)) for key, n in attempts.items()]
+        return out
 
     # --- public site and security (rows 13, 19, 51, 80, 97, 130) ---
 
@@ -1362,6 +1695,7 @@ class MetricsRecorder:
             "events_aggregated": self.events_aggregated,
             "live_sampled_out": self.live_sampled_out,
             "rollup_overflow": self.rollup_overflow,
+            "history_dropped": self.history_dropped,
             "dims_last_minute": self.dims_last_minute,
             "templates_known": len(self.templates),
             "templates_rejected": self.templates.rejected,
@@ -1423,12 +1757,162 @@ def build_recorder(ctx: Any) -> MetricsRecorder:
     )
 
 
+# ------------------------------------------------------------------------------- one-line producer hooks
+#
+# Producers call these with one line each (`note_reservation(self._ctx, specs, outcome)`): they find the recorder
+# (an `AppContext`, a recorder, or None), call it, and never raise into the request (metrics degrade open, C7).
+
+
+def _recorder_of(owner: Any) -> Any:
+    if owner is None:
+        return None
+    if isinstance(owner, MetricsRecorder):
+        return owner
+    return getattr(owner, "recorder", None)
+
+
+def note_reservation(owner: Any, specs: Iterable[Any], outcome: Any) -> None:
+    """Upstream bucket reservation (`upstream/service.py _reserve`): attempts, rejections, fill per bucket."""
+    record = getattr(_recorder_of(owner), "record_reservation", None)
+    if record is not None:
+        with contextlib.suppress(Exception):
+            record(specs, outcome)
+
+
+def note_attempts(owner: Any, endpoint_template: str, trace: Any) -> None:
+    """Every call of one finished upstream fetch (`upstream/service.py _guarded`)."""
+    record = getattr(_recorder_of(owner), "record_attempts", None)
+    if record is not None:
+        with contextlib.suppress(Exception):
+            record(endpoint_template or OTHER, trace)
+
+
+def note_cache_store(owner: Any, written: bool) -> None:
+    """One entry written to cache.db (`cache/service.py _write_shared`)."""
+    record = getattr(_recorder_of(owner), "record_cache_store", None)
+    if record is not None and written:
+        with contextlib.suppress(Exception):
+            record(1)
+
+
+def note_eviction_pass(owner: Any, report: Any) -> None:
+    """One eviction pass of cache.db (`cache/service.py maintain`)."""
+    record = getattr(_recorder_of(owner), "record_eviction_pass", None)
+    if record is not None:
+        with contextlib.suppress(Exception):
+            record(report)
+
+
+def note_eviction_ages(owner: Any, report: Any) -> None:
+    """The ages of one pass's evicted entries (`cache/service.py maintain`; CACHE-PRESSURE "young evictions")."""
+    record = getattr(_recorder_of(owner), "record_eviction_ages", None)
+    if record is not None and int(getattr(report, "evicted", 0) or 0) > 0:
+        with contextlib.suppress(Exception):
+            record(
+                evicted=int(report.evicted),
+                young=int(getattr(report, "young", 0) or 0),
+                age_s_total=float(getattr(report, "age_s_total", 0.0) or 0.0),
+                young_age_s_total=float(getattr(report, "young_age_s_total", 0.0) or 0.0),
+            )
+
+
+def note_rule_hit(owner: Any, table: str, key: Any) -> None:
+    """A rule row matched a request (abuse checks)."""
+    record = getattr(_recorder_of(owner), "record_rule_hit", None)
+    if record is not None:
+        with contextlib.suppress(Exception):
+            record(table, key)
+
+
 # ------------------------------------------------------------------------------------------- writers
+
+_HISTORY_SQL: dict[str, str] = {
+    "bucket_minute": (
+        "INSERT INTO bucket_minute (bucket_start, bucket_key, attempts, rejections, fill_pct_peak) "
+        "VALUES (?, ?, ?, ?, ?) ON CONFLICT (bucket_start, bucket_key) DO UPDATE SET "
+        "attempts = attempts + excluded.attempts, rejections = rejections + excluded.rejections, "
+        "fill_pct_peak = max(fill_pct_peak, excluded.fill_pct_peak)"
+    ),
+    "worker_minute": (
+        "INSERT INTO worker_minute (bucket_start, worker_id, samples, cpu_pct_sum, cpu_pct_max, loop_lag_ms_p99, "
+        "open_conns, rss) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bucket_start, worker_id) DO UPDATE SET "
+        "samples = samples + excluded.samples, cpu_pct_sum = cpu_pct_sum + excluded.cpu_pct_sum, "
+        "cpu_pct_max = max(coalesce(cpu_pct_max, excluded.cpu_pct_max), coalesce(excluded.cpu_pct_max, cpu_pct_max)), "
+        "loop_lag_ms_p99 = max(coalesce(loop_lag_ms_p99, excluded.loop_lag_ms_p99), "
+        "coalesce(excluded.loop_lag_ms_p99, loop_lag_ms_p99)), "
+        "open_conns = max(coalesce(open_conns, excluded.open_conns), coalesce(excluded.open_conns, open_conns)), "
+        "rss = coalesce(excluded.rss, rss)"
+    ),
+    "cache_minute": (
+        "INSERT INTO cache_minute (bucket_start, stores, evictions, young_evictions, evicted_age_s_sum, "
+        "young_age_s_sum) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (bucket_start) DO UPDATE SET "
+        "stores = stores + excluded.stores, evictions = evictions + excluded.evictions, "
+        "young_evictions = young_evictions + excluded.young_evictions, "
+        "evicted_age_s_sum = evicted_age_s_sum + excluded.evicted_age_s_sum, "
+        "young_age_s_sum = young_age_s_sum + excluded.young_age_s_sum"
+    ),
+    "cache_eviction_passes": (
+        "INSERT INTO cache_eviction_passes (at, entries_before, bytes_before, evicted, freed_bytes) "
+        "VALUES (?, ?, ?, ?, ?)"
+    ),
+    "rule_hits": (
+        "INSERT INTO rule_hits (table_name, rule_key, hits, first_hit_at, last_hit_at) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT (table_name, rule_key) DO UPDATE SET hits = hits + excluded.hits, "
+        "first_hit_at = min(coalesce(first_hit_at, excluded.first_hit_at), excluded.first_hit_at), "
+        "last_hit_at = max(coalesce(last_hit_at, excluded.last_hit_at), excluded.last_hit_at)"
+    ),
+    "error_minute": (
+        "INSERT INTO error_minute (signature, bucket_start, count) VALUES (?, ?, ?) "
+        "ON CONFLICT (signature, bucket_start) DO UPDATE SET count = count + excluded.count"
+    ),
+    "upstream_attempt_minute": (
+        "INSERT INTO upstream_attempt_minute (bucket_start, endpoint_template, egress, attempt, kind, status, "
+        "challenge, html_body, exit_id, count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bucket_start, "
+        "endpoint_template, egress, attempt, kind, status, challenge, html_body, exit_id) DO UPDATE SET "
+        "count = count + excluded.count"
+    ),
+}
+
+
+def write_history(conn: Any, items: list[HistoryItem]) -> None:
+    """Batch writer handler for every insight history table (one statement per table, upserts add up)."""
+    grouped: dict[str, list[tuple[Any, ...]]] = {}
+    for item in items:
+        if item.table in _HISTORY_SQL:
+            grouped.setdefault(item.table, []).append((*item.key, *item.values))
+    for table, rows in grouped.items():
+        conn.executemany(_HISTORY_SQL[table], rows)
 
 
 def _detail_json(detail: Mapping[str, Any]) -> str:
     text = json.dumps(dict(detail), sort_keys=True, separators=(",", ":"), default=str, ensure_ascii=False)
     return text
+
+
+_SCRUB_MAX_DEPTH = 8
+"""How deep `_scrub_detail` walks a detail document; anything deeper is replaced (details are small and flat)."""
+
+
+def _scrub_detail(value: Any, depth: int = 0) -> Any:
+    """One detail value with every secret replaced, structure kept (the fallback of `_bounded_detail`).
+
+    Strings go through `redact_text`, keys too, and a value under a secret-shaped field name (`is_secret_field`)
+    becomes `[redacted]`, whatever its type, exactly what `redact_text` does to a `"name": value` pair in text.
+    """
+    if depth > _SCRUB_MAX_DEPTH:
+        return MASK
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            secret = is_secret_field(name, item) and item not in (None, "")
+            out[redact_text(name)] = MASK if secret else _scrub_detail(item, depth + 1)
+        return out
+    if isinstance(value, list | tuple):
+        return [_scrub_detail(item, depth + 1) for item in value]
+    return value
 
 
 def _bounded_detail(record: EventRecord) -> str | None:
@@ -1439,7 +1923,16 @@ def _bounded_detail(record: EventRecord) -> str | None:
         return None
     text = _detail_json(detail)
     # Event details may hold caller supplied text; scrub secrets and cap the size (plan P9).
-    text = redact_text(text)
+    redacted = redact_text(text)
+    if redacted != text:
+        # Redacting the serialized text can cut through the JSON syntax: `{"pass": 6}` (a count under a key that
+        # reads as a secret) became `{"pass": [redacted]}`, which the live tail and the SSE stream then read as
+        # `{}`. When that happens the detail is scrubbed value by value instead, so the stored text is always JSON.
+        try:
+            json.loads(redacted)
+        except ValueError:
+            redacted = _detail_json(_scrub_detail(detail))
+    text = redacted
     if len(text) > MAX_DETAIL_CHARS:
         text = _detail_json({"truncated": True, "count": int(record.count), "text": text[:MAX_DETAIL_CHARS]})
     return text

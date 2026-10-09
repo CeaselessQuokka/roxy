@@ -464,6 +464,87 @@ _SPECS: tuple[MetricSpec, ...] = (
         "events",
         ("overview#visitors",),
     ),
+    # --- insight history (schema version 2, `metrics/read_history.py`) ---
+    MetricSpec(
+        "bucket_attempts",
+        "Bucket reservations",
+        "count",
+        "How many upstream calls asked one pacing bucket for a slot.",
+        "Sum of `bucket_minute.attempts` for the bucket key: one per reservation that reached the buckets "
+        "(a cooldown or open breaker refusal asks no bucket and is not counted).",
+        "bucket_minute",
+        ("upstream#buckets",),
+    ),
+    MetricSpec(
+        "bucket_rejections",
+        "Bucket rejections",
+        "count",
+        "Upstream calls refused because this bucket had no slot within the allowed queue wait: real demand above "
+        "the bucket's rate.",
+        "Sum of `bucket_minute.rejections`: reservations denied with this bucket as the binding one.",
+        "bucket_minute",
+        ("upstream#buckets",),
+        better="lower",
+    ),
+    MetricSpec(
+        "bucket_fill_peak_pct",
+        "Bucket fill peak",
+        "percent",
+        "The fullest the bucket's burst was seen in the time range: 100 means callers had to wait for a slot.",
+        "Largest `bucket_minute.fill_pct_peak`: the burst share in use right after a granted reservation, or 100 "
+        "for a denial that this bucket caused.",
+        "bucket_minute",
+        ("upstream#buckets",),
+    ),
+    MetricSpec(
+        "worker_cpu_pct",
+        "Worker CPU",
+        "percent",
+        "CPU use of a worker process, as a share of the CPU time it can get.",
+        "`worker_minute.cpu_pct_sum / samples` per minute (the mean of the samples the worker reported).",
+        "worker_minute",
+        ("system#metrics-pipeline",),
+        better="lower",
+    ),
+    MetricSpec(
+        "cache_young_evictions",
+        "Evictions before expiry",
+        "count",
+        "Cached answers thrown out to make room while they were still fresh: a sign the cache is too small.",
+        "Sum of `cache_minute.young_evictions`: entries evicted for space whose age was below their lifetime "
+        "(entries removed because they expired are not counted).",
+        "cache_minute",
+        ("cache#settings",),
+        better="lower",
+    ),
+    MetricSpec(
+        "cache_stores",
+        "Entries stored",
+        "count",
+        "Answers written to the shared cache tier.",
+        "Sum of `cache_minute.stores`: successful writes to cache.db (memory-only answers are not counted).",
+        "cache_minute",
+        ("cache#settings",),
+    ),
+    MetricSpec(
+        "error_occurrences",
+        "Error occurrences",
+        "count",
+        "How often one of Roxy's own error signatures happened.",
+        "Sum of `error_minute.count` for the signature: one per error recorded (`record_error`).",
+        "error_minute, errors",
+        ("system#metrics-pipeline",),
+        better="lower",
+    ),
+    MetricSpec(
+        "upstream_attempts",
+        "Upstream calls by attempt",
+        "calls",
+        "Every call to Roblox, split into first calls, CSRF retries, 429 fallbacks, other retries and redirects.",
+        "Sum of `upstream_attempt_minute.count`, grouped by `kind`.",
+        "upstream_attempt_minute",
+        ("upstream#retries",),
+    ),
 )
 
 METRICS: Final[dict[str, MetricSpec]] = {spec.key: spec for spec in _SPECS}

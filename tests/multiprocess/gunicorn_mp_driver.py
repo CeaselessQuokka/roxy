@@ -27,6 +27,10 @@ How it works
       across both, and the other color takes over when the leading color stops.
     - `cooldown_429` (n workers): plan 19.10 row 7. The mock answers the first call of an endpoint with 429 and
       `Retry-After: 30`; traffic continues at 4 requests per second for 92 s with distinct keys.
+    - `wave3_jobs` (n workers): the recommendations, health and LLM export leader jobs are registered and run on
+      exactly one leader (read from the job status the leader publishes), the hourly export file is written, the
+      admin API schema refuses an anonymous caller and lists every area for an admin signed in through the real
+      password and TOTP steps, and no job fails.
     Requests go out on fresh connections (no keep-alive), so the kernel spreads them over the workers.
 
 What to read next
@@ -63,6 +67,10 @@ VENV_BIN = REPO / ".venv" / "bin"
 NETS = ("192.0.2", "198.51.100", "203.0.113")  # documentation ranges (RFC 5737)
 SINGLE_FLIGHT_UNIVERSE = "4242"
 COOLDOWN_SETTLE_S = 1.5
+QUIET_BACKGROUND: dict[str, Any] = {"health_auto_interval_h": 0}
+"""Settings for scenarios that count every upstream call of one endpoint: the leader's scheduled health run (it
+probes a public URL on every Roblox host, plan 13.4; its first poll comes 5 minutes after the job runner starts)
+is switched off, so no background probe can ever land in a counted window."""
 """Slack around cooldown edges: the cooldown is kept in wall-clock milliseconds, and the WSL wall clock steps."""
 
 
@@ -459,9 +467,12 @@ async def versions(master: Master, *, need: int, rounds: int = 20) -> list[dict[
 
 
 def reload_lines(master: Master, version: int) -> dict[int, float]:
-    """pid -> wall time each worker logged `settings_reloaded` for `version` (JSON log lines carry pid and ts)."""
-    from datetime import datetime
+    """pid -> the monotonic time each worker logged `settings_reloaded` for `version` (`monotonic_s`).
 
+    CLOCK_MONOTONIC is one clock for every process of the host, so the delay from the driver's own `monotonic()`
+    is exact even while the wall clock steps (WSL steps back about 0.9 s every 31 s; the log's `ts` is wall time,
+    and a step between the write and a log line once made a measured delay negative).
+    """
     seen: dict[int, float] = {}
     try:
         text = master.log.read_text(errors="replace")
@@ -473,7 +484,7 @@ def reload_lines(master: Master, version: int) -> dict[int, float]:
         with contextlib.suppress(ValueError, KeyError, TypeError):
             entry = json.loads(line)
             if int(entry.get("version", -1)) == version:
-                seen.setdefault(int(entry["pid"]), datetime.fromisoformat(entry["ts"]).timestamp())
+                seen.setdefault(int(entry["pid"]), float(entry["monotonic_s"]))
     return seen
 
 
@@ -546,9 +557,9 @@ async def fleet_traffic(master: Master, env: Mapping[str, str], mock: MockRoblox
         out["proxied_by_worker"] = await proxied_by_worker(master, sent)
 
         # 4. A settings change reaches every worker within 2 s. Each worker logs `settings_reloaded` with its pid
-        # when its watcher picks the change up; the internal socket also reports each worker's ConfigVersion.
+        # and its monotonic time when its watcher picks the change up; the internal socket also reports each
+        # worker's ConfigVersion.
         before = await versions(master, need=workers)
-        written_wall = time.time()
         written_at = time.monotonic()
         new_version = await asyncio.to_thread(change_setting, env, "public_cors_allow_any_origin", 1)
         await asyncio.sleep(max(0.0, 2.0 - (time.monotonic() - written_at)))
@@ -564,9 +575,7 @@ async def fleet_traffic(master: Master, env: Mapping[str, str], mock: MockRoblox
             "workers_after": len({row["worker"] for row in after}),
             "versions_after": sorted({row["version"] for row in after}),
             "workers_reloaded": len(pids & set(reloaded)),
-            "slowest_reload_s": round(
-                max((reloaded[pid] - written_wall for pid in pids & set(reloaded)), default=-1), 3
-            ),
+            "slowest_reload_s": round(max((reloaded[pid] - written_at for pid in pids & set(reloaded)), default=-1), 3),
             "cors_after": sum(1 for r in responses if r.headers.get("access-control-allow-origin") == "*"),
             "cors_checked": len(responses),
         }
@@ -582,7 +591,7 @@ def scenario_fleet(work: Path, credentials: Path, workers: int) -> dict[str, Any
     groups = template_for("groups.roblox.com", "/v1/groups/1")
     prepare_state(
         env,
-        {"rotator_enabled": 0, "tarpit_enabled": 0},
+        {"rotator_enabled": 0, "tarpit_enabled": 0, **QUIET_BACKGROUND},
         [("upstream_limits", {"bucket_key": f"endpoint:{groups}", "per_min": 6, "burst": 2})],
     )
     master = Master("dev", work, env, workers)
@@ -662,6 +671,7 @@ def scenario_cooldown_429(work: Path, credentials: Path, workers: int) -> dict[s
             "tarpit_enabled": 0,
             "endpoint_bucket_default_per_min": 60,
             "endpoint_bucket_default_burst": 5,
+            **QUIET_BACKGROUND,
         },
         [],
     )
@@ -732,10 +742,140 @@ async def paced_traffic(master: Master, out: dict[str, Any]) -> int:
     return len(results)
 
 
+WAVE3_LEADER_JOBS = (
+    "insights_evaluate",
+    "insights_triggers",
+    "insights_history_prune",
+    "insights_anomalies",
+    "insights_watch",
+    "insights_auto_apply",
+    "health_scheduled_run",
+    "health_publish_jobs",
+    "llm_export_file",
+)
+"""The leader jobs the wave 3b wiring adds (`lifespan._register_wave3_jobs`)."""
+
+
+def job_status(env: Mapping[str, str]) -> dict[str, dict[str, Any]]:
+    """The leader's job status as `health_publish_jobs` published it in metrics.db (`health_job_status`)."""
+    rows = query(
+        env["ROXY_METRICS_DB"],
+        "SELECT name, interval_s, last_started_at, last_finished_at, last_ok, holder FROM health_job_status",
+    )
+    keys = ("interval_s", "last_started_at", "last_finished_at", "last_ok", "holder")
+    return {str(row[0]): dict(zip(keys, row[1:], strict=True)) for row in rows}
+
+
+async def wave3_jobs_settle(env: Mapping[str, str], timeout_s: float = 100.0) -> dict[str, dict[str, Any]]:
+    """Poll the published job status until the evaluation and the export file job have each finished once."""
+    deadline = time.monotonic() + timeout_s
+    status: dict[str, dict[str, Any]] = {}
+    while time.monotonic() < deadline:
+        with contextlib.suppress(sqlite3.Error):
+            status = job_status(env)
+        done = all(status.get(name, {}).get("last_finished_at") for name in ("insights_evaluate", "llm_export_file"))
+        if set(WAVE3_LEADER_JOBS) <= set(status) and done:
+            return status
+        await asyncio.sleep(1.0)
+    return status
+
+
+def make_test_admin(env: Mapping[str, str], credentials: Path) -> Any:
+    """An admin with a password and a TOTP secret, written straight to control.db (`make_admin`, test helper)."""
+    from roxy.admin.auth import totp
+    from roxy.admin.auth.testing import make_admin
+    from roxy.storage.db import Database
+
+    cipher = totp.load_cipher(credentials)
+    assert cipher is not None, "the test credentials have no totp_encryption_key"
+    db = Database("control", Path(env["ROXY_CONTROL_DB"]))
+    try:
+        return make_admin(db, cipher=cipher, now=int(time.time()))
+    finally:
+        db.close_sync()
+
+
+def admin_openapi(master: Master, env: Mapping[str, str], admin: Any) -> dict[str, Any]:
+    """Sign in through the real password and TOTP steps on the TCP port, then read `/admin/api/v1/openapi.json`.
+
+    The session cookie is `Secure`, which httpx never sends over plain http, so it is read from `Set-Cookie` and
+    sent by hand (the server only reads the cookie; HTTPS is nginx's job in production).
+    """
+    from roxy.admin.auth import totp
+    from roxy.admin.auth.testing import LOGIN_PATH, MFA_PATH, TEST_UA
+
+    base = f"http://127.0.0.1:{master.port}"
+    headers = {"Origin": env["ROXY_SITE_ORIGIN"], "Sec-Fetch-Site": "same-origin", "User-Agent": TEST_UA}
+    with httpx.Client(base_url=base, timeout=20, trust_env=False) as client:
+        first = client.post(LOGIN_PATH, json={"username": admin.username, "password": admin.password}, headers=headers)
+        if first.status_code != 200:
+            return {"login": first.status_code, "body": first.text[:200]}
+        code = totp.code_at(admin.totp_secret, time.time())
+        second = client.post(
+            MFA_PATH, json={"transaction": first.json()["Transaction"], "method": "totp", "code": code}, headers=headers
+        )
+        cookie = next(
+            (part.split(";", 1)[0] for part in second.headers.get_list("set-cookie") if "roxy_session=" in part), ""
+        )
+        if second.status_code != 200 or not cookie:
+            return {"login": second.status_code, "body": second.text[:200]}
+        answer = client.get("/admin/api/v1/openapi.json", headers={**headers, "Cookie": cookie})
+        if answer.status_code != 200:
+            return {"login": 200, "openapi": answer.status_code, "body": answer.text[:200]}
+        document = answer.json()
+        paths = document.get("paths", {})
+        prefixes = sorted({path.split("/")[4] for path in paths if path.count("/") >= 4})
+        tags = sorted({tag for item in paths.values() for op in item.values() for tag in op.get("tags", [])})
+        return {"login": 200, "openapi": 200, "paths": len(paths), "prefixes": prefixes, "tags": tags}
+
+
+def scenario_wave3_jobs(work: Path, credentials: Path, workers: int) -> dict[str, Any]:
+    """The wave 3b leader jobs are registered in every worker and run on exactly one leader (plan 5.6, C6)."""
+    mock = MockRoblox(default_behavior).start()
+    env = base_env(work, credentials, mock)
+    prepare_state(env, {"rotator_enabled": 0, "tarpit_enabled": 0}, [])
+    admin = make_test_admin(env, credentials)
+    master = Master("dev", work, env, workers)
+    out: dict[str, Any] = {"workers": workers}
+    try:
+        master.start()
+        out["ready"] = master.wait_ready()
+        if not out["ready"]:
+            out["log_tail"] = master.log_tail()
+            return out
+        pids = {row["pid"] for row in master.worker_rows()}
+        out["worker_pids"] = len(pids)
+        out["leader"] = asyncio.run(wait_one_leader(env, pids))
+        leaders = [row["worker_id"] for row in master.worker_rows() if row["is_leader"]]
+        out["leader_worker_id"] = leaders[0] if len(leaders) == 1 else None
+        status = asyncio.run(wave3_jobs_settle(env))
+        out["jobs"] = {name: status.get(name) for name in WAVE3_LEADER_JOBS}
+        out["holders"] = sorted({str(row.get("holder")) for row in status.values()})
+        exports = Path(env["ROXY_STATE_DIR"]) / "exports"
+        out["export_files"] = sorted(path.name for path in exports.glob("roxy-llm-export*.json"))
+        # The admin API schema is for signed-in admins only, also through real gunicorn workers.
+        response = httpx.get(f"http://127.0.0.1:{master.port}/admin/api/v1/openapi.json", timeout=10, trust_env=False)
+        out["openapi_anonymous"] = {"status": response.status_code, "body": response.text[:200]}
+        out["openapi_admin"] = admin_openapi(master, env, admin)
+        text = master.log.read_text(errors="replace")
+        out["job_failures"] = [
+            line[:300] for line in text.splitlines() if '"job_failed"' in line or '"job_timeout"' in line
+        ]
+        out["tracebacks"] = text.count("Traceback")
+        out["stop_code"], out["stop_s"] = master.stop()
+        out["heartbeats_after_stop"] = len(heartbeats(env))
+        out["log_tail"] = master.log_tail()
+        return out
+    finally:
+        master.kill()
+        mock.stop()
+
+
 SCENARIOS: dict[str, Callable[[Path, Path, int], dict[str, Any]]] = {
     "fleet": scenario_fleet,
     "two_masters": scenario_two_masters,
     "cooldown_429": scenario_cooldown_429,
+    "wave3_jobs": scenario_wave3_jobs,
 }
 
 

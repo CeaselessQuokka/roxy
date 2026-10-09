@@ -5,7 +5,9 @@ What this is
       `users.roblox.com/v1/users/authenticated`), at most one at a time in the whole fleet (a hot.db lease), read
       as alive, rate limited, rejected or error.
     - `PlaceLookup`: the admin "Identify an experience" lookup (place -> universe -> game details), with v1's
-      messages and a 10 minute per-worker cache of successful answers (parity row 38).
+      messages and a 10 minute per-worker cache of successful answers (parity row 38). `place_lookup_for(service)`
+      is the one instance of a worker (both lookup routes and the Clients tables share its cache), and `peek`
+      reads a cached answer without any upstream call (names in tables).
     - `internal_endpoints(...)` and `INTERNAL_NOTE`: what the Upstream page lists as Roxy's own calls (row 29).
 
 Why it exists
@@ -32,6 +34,7 @@ from __future__ import annotations
 
 import json
 import time
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Final
@@ -183,6 +186,13 @@ class PlaceLookup:
             return None, "Upstream returned a non-JSON body"
         return payload, ""
 
+    def peek(self, place_id: str, kind: str = "place") -> dict[str, Any] | None:
+        """A cached successful answer for `place_id`, or None; never calls upstream (tables show known names)."""
+        hit = self._cache.get((kind, place_id))
+        if hit is None or self._now() - hit[0] >= self._ttl_s:
+            return None
+        return dict(hit[1])
+
     async def lookup(self, raw_id: object, kind: object = "place") -> LookupResult:
         """v1 flow (index.py:983-1037): validate, resolve the universe, load the game, shape the answer."""
         raw = str(raw_id if raw_id is not None else "").strip()
@@ -245,6 +255,20 @@ class PlaceLookup:
         return LookupResult(200, result)
 
 
+_LOOKUPS: weakref.WeakKeyDictionary[Any, PlaceLookup] = weakref.WeakKeyDictionary()
+"""One `PlaceLookup` per `UpstreamService` (so per worker, and it goes away with the app's service)."""
+
+
+def place_lookup_for(service: Any) -> PlaceLookup:
+    """This worker's `PlaceLookup` for `service` (created on first use). `/lookup/place`, `/clients/lookup` and the
+    Clients tables all use it, so a lookup made on one page names the place on the others too."""
+    found = _LOOKUPS.get(service)
+    if found is None:
+        found = PlaceLookup(service)
+        _LOOKUPS[service] = found
+    return found
+
+
 __all__ = [
     "CREDENTIAL_PROBE_LEASE",
     "INTERNAL_NOTE",
@@ -255,6 +279,7 @@ __all__ = [
     "LookupResult",
     "PlaceLookup",
     "internal_endpoints",
+    "place_lookup_for",
     "probe_credential",
     "probe_verdict",
 ]

@@ -1,0 +1,56 @@
+# CACHE-TTL-TUNE leaves an admin's "never cache" rule alone, and lowers an endpoint that has no rule (added by the
+# rule author; README "ground rules").
+#
+#   template                                          rule (ttl)          last 24 h                 expected
+#   presence.roblox.com/v1/presence/users             1 (0: never cache)  2,000 refetches, 100%     nothing (TTL 0 is an
+#                                                                                                    admin decision)
+#   friends.roblox.com/v1/users/{userId}/friends/count none (120 s)       400 refetches, 30%        a new rule, TTL < 120 s
+#
+# The presence observations predate the TTL 0 rule (the admin turned caching off after they were collected). The
+# friends endpoint runs at the global cache_ttl_seconds (120 s) and only 30% of its refetches were identical, so the
+# rule proposes a shorter lifetime on a new rule for that template (one wildcard segment), never a global change.
+
+format: roxy.insight_fixture/1
+rule: CACHE-TTL-TUNE
+case: never_cache_rule
+description: >
+  A presence endpoint whose refetches were all identical has a TTL 0 rule (the admin chose never to cache it), and a
+  friends count endpoint without a rule changes its body on 70% of refetches. The rule must not touch the presence
+  rule and must propose a new, shorter-lived rule for the friends endpoint only.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "presence.roblox.com/v1/presence/users", type: glob, ttl: 0, methods: "GET", origin: admin, created_at: "-2d"}
+
+events:
+  change_observations:
+    - {endpoint_template: presence.roblox.com/v1/presence/users, day: "2026-10-07", refetches: 2000, identical_bodies: 2000}
+    - {endpoint_template: "friends.roblox.com/v1/users/{userId}/friends/count", day: "2026-10-07", refetches: 400, identical_bodies: 120}
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CACHE-TTL-TUNE
+      subject_contains: "friends.roblox.com/v1/users/"
+      family: cache
+      confidence: high
+      change_kinds_required: [rule_upsert]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["friends.roblox.com/v1/users/1000000301/friends/count"]}}
+          current: null
+          proposed: {ttl: {gte: 1, lt: 120}}
+      changes_forbidden:
+        - {kind: rule_upsert, current: {id: 1}}
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_stale_seconds, ttl_tuner_max_s]}
+
+variants:
+  - case: lower_threshold_25
+    description: With "shorter" only below 25% identical, 30% is not enough, and the presence rule stays untouched.
+    settings: {insight_cache_ttl_tune_identical_lower_pct: 25}
+    expect: {fires: false}

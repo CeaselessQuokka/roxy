@@ -32,10 +32,12 @@ How it works
     plain functions or coroutines; each runs with a short timeout and its own exceptions are logged, never
     raised, because error handling must not fail in a new way while handling an error.
     The `HTTPException` handler answers as FastAPI would, except a plain 404 (`detail` "Not Found") on an admin
-    path, which gets `not_found_response(path)`. Client errors still reach the probe hook: an allowlist refusal is
-    worth recording. The admin catch-all route (`roxy/admin/router.py`) and the public `/internal` guard
-    (`roxy/internal_app.py`) answer with `not_found_response` directly and run no hook: v1 never logged a typo in
-    an admin URL as a probe, and the deploy's own checks of `/internal` are not attacks.
+    path, which gets `not_found_response(path)`, and the section 13 shapes (`section13_exception_body`): an
+    exception carrying `error_code` on an admin path, and the admin guards' 401, 403 and 503 on `/admin/api/v1`
+    (DESIGN.md 13, so one admin API speaks one error format). Client errors still reach the probe hook: an
+    allowlist refusal is worth recording. The admin catch-all route (`roxy/admin/router.py`) and the public
+    `/internal` guard (`roxy/internal_app.py`) answer with `not_found_response` directly and run no hook: v1 never
+    logged a typo in an admin URL as a probe, and the deploy's own checks of `/internal` are not attacks.
 
 What to read next
     `roxy/core/deadline.py` and `roxy/core/middleware.py` (the other answers Roxy writes itself), then
@@ -334,18 +336,63 @@ class UnhandledErrorMiddleware:
             await emit_server_error(scope, event_from_scope(scope, 500, reason=ReasonCode.INTERNAL_ERROR, exc=exc))
 
 
+GUARD_ERROR_CODES: Mapping[int, str] = {401: "unauthorized", 403: "forbidden", 503: "unavailable"}
+"""Section 13 codes of the admin guards' own answers on `/admin/api/v1` (DESIGN.md 13): not signed in (401), a
+CSRF or origin refusal (403) and shared state that cannot be read (503). The allowlist 404 already has its form."""
+
+ENROLL_HEADER = "Roxy-Enroll"
+ENROLL_CODE = "enrollment_required"
+"""The 403 that asks a bootstrap session to finish enrolling its authenticator (it carries `Roxy-Enroll`)."""
+
+MAX_GUARD_MESSAGE_CHARS = 500
+"""A section 13 message built here is Roxy's own text; the cut only bounds an unexpected long detail."""
+
+
+def _plain_text(value: Any) -> str:
+    """A message for a section 13 body: Roxy's own text as a string, bounded."""
+    return ("" if value is None else str(value))[:MAX_GUARD_MESSAGE_CHARS]
+
+
+def section13_exception_body(exc: StarletteHTTPException, path: str) -> bytes | None:
+    """The section 13 body for an `HTTPException` on an admin path, or None to answer as FastAPI does.
+
+    - An exception that carries a string `error_code` (an API `ApiError`, the guards' `ReauthRequired`) on any
+      `/admin` path: `{"error": {code, error_message, error_fields}}`. The auth routes' fresh-MFA 403 gets
+      `reauth_required` here, the same as the area routes (common's request 1).
+    - The guards' own 401, 403 and 503 on `/admin/api/v1` (DESIGN.md 13): codes from `GUARD_ERROR_CODES`
+      (`enrollment_required` for the 403 that asks to finish enrolling), message the guard's own text, for
+      example `{"error": {"code": "unauthorized", "message": "Session expired", "fields": {}}}`.
+    Headers (the cleared session cookie, `Roxy-Reauth`, `Retry-After`) are kept by the caller.
+    """
+    code = getattr(exc, "error_code", None)
+    if isinstance(code, str) and code and is_admin_path(path):
+        fields = getattr(exc, "error_fields", None)
+        clean = {str(k)[:120]: _plain_text(v) for k, v in dict(fields or {}).items()} if fields else None
+        return admin_api_error_body(code, _plain_text(getattr(exc, "error_message", exc.detail)), clean)
+    if is_admin_api_path(path) and exc.status_code in GUARD_ERROR_CODES:
+        headers = {name.lower() for name in (exc.headers or {})}
+        guard_code = ENROLL_CODE if ENROLL_HEADER.lower() in headers else GUARD_ERROR_CODES[exc.status_code]
+        return admin_api_error_body(guard_code, _plain_text(exc.detail))
+    return None
+
+
 async def _http_exception_handler(request: Request, exc: Exception) -> Response:
     """FastAPI handler for `HTTPException`: probe-log client errors, then answer as FastAPI would.
 
-    One exception: a plain 404 under `/admin` (an allowlist refusal, a guard without a context, a route not
-    found) is answered with `not_found_response`, byte for byte the answer for an admin path that does not exist.
+    Two exceptions: a plain 404 under `/admin` (an allowlist refusal, a guard without a context, a route not
+    found) is answered with `not_found_response`, byte for byte the answer for an admin path that does not exist;
+    and an exception with a section 13 shape (`section13_exception_body`: one carrying `error_code`, or a guard's
+    401, 403 or 503 on `/admin/api/v1`) is answered with the DESIGN.md section 13 error object.
     """
     from fastapi.exception_handlers import http_exception_handler  # local import: core stays usable without it
 
     assert isinstance(exc, StarletteHTTPException)
     path = str(request.scope.get("path", ""))
-    if exc.status_code == 404 and exc.detail == NOT_FOUND_TEXT and is_admin_path(path):
+    body = section13_exception_body(exc, path)
+    if body is None and exc.status_code == 404 and exc.detail == NOT_FOUND_TEXT and is_admin_path(path):
         response = not_found_response(path, headers=exc.headers)
+    elif body is not None:
+        response = Response(content=body, status_code=exc.status_code, media_type=JSON_TYPE, headers=exc.headers)
     else:
         response = await http_exception_handler(request, exc)
     if exc.status_code < 500:

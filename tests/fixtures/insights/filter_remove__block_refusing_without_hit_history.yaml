@@ -1,0 +1,61 @@
+# FILTER-REMOVE when the rule hit history is missing but the rollups show the filter refusing (added by the
+# rules_abuse_system author, P10).
+#
+# Until the abuse layer records hits for endpoint blocks (P10 integrator request), `rule_hits` has no row for them.
+# FILTER-REMOVE must not call a block idle while the rollups show `endpoint_blocked` refusals on a template its pattern
+# matches:
+#
+#   endpoint block                               created   hit history   endpoint_blocked refusals (last hour)   expected
+#   1 trades.roblox.com/v1/trades/*              60 d      none          120 on trades.roblox.com/v1/trades/{id}  keep
+#   2 economy.roblox.com/v1/purchases/*          60 d      none          none                                    remove
+#
+# Both rows are older than the 30 day idle threshold.
+
+format: roxy.insight_fixture/1
+rule: FILTER-REMOVE
+case: block_refusing_without_hit_history
+description: >
+  Two endpoint blocks created 60 days ago have no hit history; one refuses requests every minute, the other never did.
+  FILTER-REMOVE must recommend removing only the one that never refused anything.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  rules_endpoint_block:
+    - {id: 1, pattern: "trades.roblox.com/v1/trades/*", type: glob, message: "Trades are not available through Roxy.", enabled: 1, created_at: "-60d", created_by: admin, x_last_hit_at: null}
+    - {id: 2, pattern: "economy.roblox.com/v1/purchases/*", type: glob, message: "Purchases are not available through Roxy.", enabled: 1, created_at: "-60d", created_by: admin, x_last_hit_at: null}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  blocked: {egress: none, outcome: refused, reason: endpoint_blocked, status: 403, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 120}}
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+
+traffic:
+  - {name: trades_blocked, profile: blocked, client_ip: "192.0.2.190", user_agent: "python-requests/2.31.0", endpoint_template: "trades.roblox.com/v1/trades/{tradeId}", window: ["-60m", "0m"], per_minute: 2}
+  - {name: legit_hit, profile: hit, clients: {cidr: "203.0.113.0/26", count: 40}, place_id: "1000000001", user_agent: "Roblox/Linux", endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 20}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], by_reason: {endpoint_blocked: 120}}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: FILTER-REMOVE
+      severity: any
+      family: filter
+      confidence: high
+      exact_changes: true
+      changes_required:
+        - any_of:
+            - {kind: rule_delete, table: rules_endpoint_block, match: {pattern: "economy.roblox.com/v1/purchases/*", type: glob}}
+            - {kind: filter_remove, table: rules_endpoint_block, match: {pattern: "economy.roblox.com/v1/purchases/*", type: glob}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_filter_remove_enabled: 0}
+    expect: {fires: false}

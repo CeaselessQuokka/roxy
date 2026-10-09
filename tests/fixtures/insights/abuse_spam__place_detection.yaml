@@ -1,0 +1,68 @@
+# ABUSE-SPAM for a detection whose subject is a place, not an address (added by the rules_abuse_system author, P10).
+#
+# Place subjects (`place:<id>`) only ever recommend (roxy/abuse/spam.py: "places and fleet-wide subjects only ever
+# recommend", plan 10.3), so SPAM-RATE writes `spam_detected` events for place 1000000009. 11.5's ABUSE-SPAM remedies
+# are "add ban, enable detector action, or add tarpit category", but place ids are claims anyone can send, so a ban
+# on the place is never proposed: the recommendation is a manual review of that place. The 40 game servers of other
+# places get nothing.
+
+format: roxy.insight_fixture/1
+rule: ABUSE-SPAM
+case: place_detection
+description: >
+  SPAM-RATE flagged place 1000000009 three times in the last hour (places only recommend). ABUSE-SPAM must raise one
+  manual recommendation for that place and never propose a ban of any kind.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+  busy_place:
+    clients: {cidr: "203.0.113.64/27", count: 20}
+    place_id: "1000000009"
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: busy_hit, profile: [hit, busy_place], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 120}
+
+events:
+  security:
+    - {at: "-40m", type: spam_detected, severity: info, reason_code: SPAM-RATE, detail: {detector: SPAM-RATE, subject: "place:1000000009", value: 1200, threshold: 600, window_s: 600, action: recommend, configured_action: ban, game_server: false, evidence: "SPAM-RATE: 1200 in 600 s (threshold 600)"}}
+    - {at: "-25m", type: spam_detected, severity: info, reason_code: SPAM-RATE, detail: {detector: SPAM-RATE, subject: "place:1000000009", value: 1200, threshold: 600, window_s: 600, action: recommend, configured_action: ban, game_server: false, evidence: "SPAM-RATE: 1200 in 600 s (threshold 600)"}}
+    - {at: "-10m", type: spam_detected, severity: info, reason_code: SPAM-RATE, detail: {detector: SPAM-RATE, subject: "place:1000000009", value: 1200, threshold: 600, window_s: 600, action: recommend, configured_action: ban, game_server: false, evidence: "SPAM-RATE: 1200 in 600 s (threshold 600)"}}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/26", count: 40}, bot_score: 8}
+    - {clients: {cidr: "203.0.113.64/27", count: 20}, bot_score: 9}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], where: {place_id: "1000000009"}, requests: 7200}
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: ABUSE-SPAM
+      subject_contains: "1000000009"
+      severity: any
+      family: abuse
+      confidence: medium
+      safe_auto: false
+      changes_required:
+        - {kind: manual}
+      change_kinds_forbidden: [ban_add, ban_remove, bypass_add, setting, tarpit_category]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_abuse_spam_enabled: 0}
+    expect: {fires: false}

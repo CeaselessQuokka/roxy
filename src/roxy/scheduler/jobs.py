@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -165,6 +166,23 @@ class JobStatus:
 
 
 _HISTORY = 20
+
+MAX_RESULT_CHARS = 2000
+"""`status()` shows a job's last result when its JSON form fits in this many characters (plan P9: the System page
+and the published leader status stay small); a larger result is summarized as `{"truncated": true, "chars": n}`."""
+
+
+def bounded_result(value: Any) -> Any:
+    """A job's last result as plain JSON values, or a short summary when it is too large to show (`status()`)."""
+    if value is None:
+        return None
+    try:
+        text = json.dumps(value, default=str, sort_keys=True)
+    except (TypeError, ValueError):
+        return {"truncated": True, "chars": None}
+    if len(text) > MAX_RESULT_CHARS:
+        return {"truncated": True, "chars": len(text)}
+    return json.loads(text)
 
 
 class JobRunner:
@@ -337,6 +355,7 @@ class JobRunner:
                     "last_duration_ms": s.last_duration_ms,
                     "last_ok": s.last_ok,
                     "last_error": s.last_error,
+                    "last_result": bounded_result(s.last_result),
                     "next_due_in_s": max(0.0, s.next_due_mono - mono),
                 }
             )

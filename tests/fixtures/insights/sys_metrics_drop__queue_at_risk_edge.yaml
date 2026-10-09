@@ -1,0 +1,40 @@
+# SYS-METRICS-DROP when the queue is already at the edge of its high-risk range (added by the rules_abuse_system
+# author, P10).
+#
+# metrics_queue_max is 200,000, the largest value that is not high risk (gt 200,000 is). Doubling it would cross into
+# the high-risk range, so the rule proposes the other 11.5 remedy instead: a shorter metrics_flush_interval_ms (the
+# queue drains twice as often). 300 items dropped in the hour before now (provider seam).
+
+format: roxy.insight_fixture/1
+rule: SYS-METRICS-DROP
+case: queue_at_risk_edge
+description: >
+  The metrics queue dropped 300 items while metrics_queue_max is already 200,000. SYS-METRICS-DROP must not push the
+  queue into its high-risk range and must propose a shorter flush interval instead.
+now: "2026-10-07T15:00:00Z"
+
+settings:
+  metrics_queue_max: 200000
+
+state:
+  metrics_pipeline: {dropped: 300}
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-METRICS-DROP
+      severity: any
+      family: system
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: setting, key: metrics_flush_interval_ms, current: 2000, proposed: {lt: 2000, gte: 250}}
+      changes_forbidden:
+        - {kind: setting, key: metrics_queue_max}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_metrics_drop_enabled: 0}
+    expect: {fires: false}

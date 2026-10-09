@@ -18,7 +18,10 @@
  *   comments starting with ":"; a blank line ends one event. Reconnects wait the server's `retry` value, or an
  *   exponential backoff from 1 to 30 seconds with jitter (so many tabs do not reconnect in lockstep), reset once a
  *   connection has delivered events. A 401 raises `roxy:unauthorized` and stops for good; this traffic never counts
- *   as session activity on the server (plan 9.6).
+ *   as session activity on the server (plan 9.6). The server's two control events: `unauthorized` (the session
+ *   ended while the stream was open; the server closes it) is handled like that 401, without a reconnect that could
+ *   only fail; `gap` (a resume could not replay everything that was missed) is passed on like any event, so each
+ *   consumer reloads or marks what it shows (`roxy:sse:gap` on the page-wide stream).
  *
  * What to read next
  *   static/js/live_tail.js (the main consumer), roxy/admin/sse.py (the server side, P11 part two).
@@ -178,6 +181,15 @@ export class EventStream {
   }
 
   dispatch(event) {
+    if (event.type === "unauthorized") {
+      // The session ended mid-stream (roxy/admin/sse.py): stop for good and show the sign-in overlay once.
+      this.stopped = true;
+      window.clearTimeout(this.timer);
+      if (this.controller) this.controller.abort();
+      this.setState("expired");
+      signalUnauthorized("sse");
+      return;
+    }
     const raw = event.data.join("\n");
     let data = raw;
     try {

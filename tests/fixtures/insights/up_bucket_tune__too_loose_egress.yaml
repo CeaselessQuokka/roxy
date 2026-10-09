@@ -1,0 +1,111 @@
+# UP-BUCKET-TUNE, too loose, where the 7.3 correlation check blames the whole egress (format: README.md here).
+#
+# Added by the UP-* rule author (the committed fixtures cover the endpoint and host attributions only).
+# 7.3: "if 429s appear across hosts on one egress within 60 s, it opens an egress cooldown and lowers nothing per
+# endpoint". Twenty minutes ago two hosts got Roblox 429s on the direct path, 30 seconds apart:
+#
+#   direct, games.roblox.com/v1/games                        at -19m45s and -19m15s
+#   direct, thumbnails.roblox.com/v1/users/avatar-headshot   at -18m45s and -18m15s
+#
+# Two hosts within 60 s means the server IP itself is limited, so the 429s belong to the `egress:direct` bucket,
+# whose rate is the setting direct_bucket_per_min (300 by default; there is no upstream_limits row for egress
+# buckets, plan 7.3 table). The proposal is that setting lowered by 30% to 210, a global setting, so not safe_auto;
+# no endpoint or host bucket may change.
+
+format: roxy.insight_fixture/1
+rule: UP-BUCKET-TUNE
+case: too_loose_egress
+description: >
+  Roblox rate-limited two different hosts on the direct path within 30 seconds. The rule must attribute the 429s
+  to the direct egress and propose lowering direct_bucket_per_min by 30% (300 to 210), with no endpoint or host
+  bucket change, and not as safe_auto.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  adaptive_rate_enabled: 0
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+
+profiles:
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 200, p95: 500, p99: 900}}
+  stale_429:
+    egress: direct
+    outcome: served_cache
+    reason: cache_stale_error
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    upstream_429: {egress: direct, retry_after_s: 20}
+
+traffic:
+  - {name: games_ok, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 80}
+  - {name: headshot_ok, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], per_minute: 60}
+  - {name: games_429, profile: stale_429, endpoint_template: games.roblox.com/v1/games, window: ["-20m", "-19m"], total: 2}
+  - {name: headshot_429, profile: stale_429, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-19m", "-18m"], total: 2}
+
+state:
+  settings_history:
+    - {at: "-30d", key: adaptive_rate_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Bucket rates by hand for now."}
+
+expect:
+  data_checks:
+    - window: ["-20m", "-18m"]
+      where: {egress: direct}
+      roblox_429: 4
+    - window: ["-20m", "-19m"]
+      where: {host: games.roblox.com}
+      roblox_429: 2
+    - window: ["-48h", "0m"]
+      roblox_429: 4
+
+  fires: true
+  others: forbid
+  recommendations:
+    - subject_contains: "egress:direct"
+      confidence: medium
+      family: upstream
+      safe_auto: false
+      change_kinds_required: [setting]
+      change_kinds_forbidden: [bucket_override, routing_rule, ban_add]
+      exact_changes: true
+      changes_required:
+        - {kind: setting, key: direct_bucket_per_min, current: 300, proposed: {between: [208, 212]}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_bucket_tune_enabled: 0}
+    expect: {fires: false}
+  - case: lower_pct_50
+    description: The cut follows insight_up_bucket_tune_lower_pct (300 - 50% = 150).
+    settings: {insight_up_bucket_tune_lower_pct: 50}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - {kind: setting, key: direct_bucket_per_min, proposed: {between: [148, 152]}}
+  - case: escalation_window_10
+    description: >
+      With a 10 second escalation window the two hosts' 429s (at least 30 s apart) are no longer neighbors, so
+      each endpoint's own bucket is blamed instead of the egress (120 - 30% = 84).
+    settings: {cooldown_host_escalation_window_s: 10}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "games.roblox.com/v1/games"
+          changes_required:
+            - {kind: bucket_override, bucket_key: "endpoint:games.roblox.com/v1/games", proposed: {per_min: {between: [83, 85]}}}
+        - subject_contains: "avatar-headshot"
+          changes_required:
+            - kind: bucket_override
+              bucket_key: "endpoint:thumbnails.roblox.com/v1/users/avatar-headshot"
+              proposed: {per_min: {between: [83, 85]}}

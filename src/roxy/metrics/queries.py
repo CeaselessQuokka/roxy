@@ -612,12 +612,21 @@ def _window_dict(window: Window) -> dict[str, Any]:
 
 
 def reset_annotations(conn: sqlite3.Connection, start: int, end: int) -> list[dict[str, Any]]:
-    """Reset markers inside `[start, end)`: a KPI over such a window covers partial data (plan 6.8)."""
+    """Reset markers that touch `[start, end)`: a KPI over such a window covers partial data (plan 6.8).
+
+    A reset of one instant (`until` NULL) counts when it lies inside the window; a ranged reset (its deleted range
+    `[at, until)`, `metrics/annotate.py`) counts when that range overlaps the window, so a window strictly
+    inside a deleted range is flagged too.
+    """
     rows = conn.execute(
-        "SELECT id, at, label, audit_id FROM annotations WHERE kind = 'reset' AND at >= ? AND at < ? ORDER BY at",
-        (start, end),
+        "SELECT id, at, until, label, audit_id FROM annotations WHERE kind = 'reset' AND at < ? "
+        "AND (CASE WHEN until IS NULL THEN at >= ? ELSE until > ? END) ORDER BY at LIMIT 100",
+        (end, start, start),
     ).fetchall()
-    return [{"id": r["id"], "at": r["at"], "label": r["label"], "audit_id": r["audit_id"]} for r in rows]
+    return [
+        {"id": r["id"], "at": r["at"], "until": r["until"], "label": r["label"], "audit_id": r["audit_id"]}
+        for r in rows
+    ]
 
 
 def chart_annotations(conn: sqlite3.Connection, start: int, end: int, limit: int = 500) -> list[dict[str, Any]]:

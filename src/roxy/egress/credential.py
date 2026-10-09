@@ -1244,6 +1244,9 @@ class CredentialManager:
             # If hot.db is busy now, the lease simply expires on its own after ttl_ms.
             with contextlib.suppress(SharedStateUnavailable):
                 await self._dbs.hot.write(lambda conn: leases.release(conn, PROBE_LEASE, holder, delete=True))
+        # Probe history for the recommendation rules (CRED-EXPIRING, CRED-PROBE-COST): kind, outcome, status only.
+        self._events.event("credential_probe", "info", "credential", {"kind": kind, "result": result.outcome,
+                                                                       "status": result.status_code})  # fmt: skip
         return result
 
     async def _run_probe(self, kind: str, fetch: ProbeFetch, now: int, started: float) -> ProbeResult:

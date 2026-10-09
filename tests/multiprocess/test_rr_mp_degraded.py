@@ -21,8 +21,9 @@ Why it exists
 
 How it works
     `_lock_hot` starts a child process that holds `BEGIN IMMEDIATE` on hot.db until released. Requests come from one
-    client address (TEST-NET-3). Clocks are real; every window is far longer than the test, so the WSL wall clock
-    steps cannot change a verdict.
+    client address (TEST-NET-3). Clocks are real; every window is far longer than the test, and each pipeline holds
+    its limiter time across a wall clock step back (`AbusePipeline.steady_now_ms`; before it, WSL's 0.9 s steps made
+    a 4-worker GCRA run admit 11 of 12 now and then), so the WSL wall clock steps cannot change a verdict.
 
 What to read next
     `roxy/abuse/pipeline.py` (`_degraded_walk`, `_claim`, `merge_pending`), `roxy/abuse/limiter.py`

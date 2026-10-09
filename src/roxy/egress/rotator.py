@@ -99,6 +99,11 @@ class RotatorStateError(RuntimeError):
     """The requested rotator action does not apply (no key to store a UI value, nothing to revert)."""
 
 
+class RotatorUrlError(ValueError):
+    """A gateway URL that does not parse. Its message describes the expected shape and never quotes the value (the
+    URL carries the provider password), so the admin API can show it as the 422 `invalid_url` field message."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProxyEndpoint:
     """A parsed gateway URL. `render` builds the URL for one session user name."""
@@ -118,21 +123,21 @@ class ProxyEndpoint:
 
 
 def parse_proxy_url(url: str) -> ProxyEndpoint:
-    """Parse and validate a gateway URL (scheme, host and port required, no path). Raises ValueError."""
+    """Parse and validate a gateway URL (scheme, host and port required, no path). Raises `RotatorUrlError`."""
     text = url.strip()
     if not text or len(text) > MAX_URL_LENGTH or any(ch in text for ch in "\r\n\t "):
-        raise ValueError("the rotator URL must be one line without spaces")
+        raise RotatorUrlError("the rotator URL must be one line without spaces")
     parts = urlsplit(text)
     if parts.scheme not in _PROXY_SCHEMES:
-        raise ValueError("the rotator URL must start with http://, https:// or socks5://")
+        raise RotatorUrlError("the rotator URL must start with http://, https:// or socks5://")
     try:
         port = parts.port
     except ValueError as exc:
-        raise ValueError("the rotator URL has an invalid port") from exc
+        raise RotatorUrlError("the rotator URL has an invalid port") from exc
     if not parts.hostname or port is None:
-        raise ValueError("the rotator URL needs a host and a port")
+        raise RotatorUrlError("the rotator URL needs a host and a port")
     if parts.path not in ("", "/") or parts.query or parts.fragment:
-        raise ValueError("the rotator URL must not have a path or query")
+        raise RotatorUrlError("the rotator URL must not have a path or query")
     return ProxyEndpoint(
         scheme=parts.scheme,
         username=unquote(parts.username or ""),
@@ -910,6 +915,7 @@ __all__ = [
     "RotatorLease",
     "RotatorPool",
     "RotatorStateError",
+    "RotatorUrlError",
     "RotatorUsage",
     "cycle_start_for",
     "mask_ip",

@@ -1,0 +1,109 @@
+# UP-CHALLENGE on the direct path while the rotator is available (format: README.md in this directory).
+#
+# Added by the UP-* rule author (the committed fixtures cover challenges on the rotator only).
+# 11.5: "Manual: lower rates for that egress; prefer the other anonymous egress for the endpoint (routing_rule)".
+# Here Roblox challenges the server IP itself on catalog search, so "the other anonymous egress" is the rotator:
+#
+#   GET catalog.roblox.com/v1/search/items, 14 to 6 minutes ago
+#   direct: 12 x 403 with a challenge header (and an HTML body)     events.upstream_attempts
+#   rotator: enabled, 20 GB monthly quota, 0.3 GB used this cycle   settings, state.egress.usage
+#
+# The routing rule must prefer the rotator for catalog search only, never the credential, and no automatic rate or
+# weight setting may change. With the rotator switched off or out of quota (variants) no other anonymous egress
+# can take the endpoint, so the only change is a manual one.
+
+format: roxy.insight_fixture/1
+rule: UP-CHALLENGE
+case: direct_challenged_rotator_available
+description: >
+  Roblox answers catalog search calls from the server IP with challenge pages: 12 in eight minutes. The rotator is
+  enabled and well inside its quota, so the rule must recommend a prefer_rotator routing rule for catalog search
+  only; with the rotator off or over quota it must fall back to a manual change.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_enabled: 1
+  rotator_weight: 0
+  rotator_quota_gb_per_month: 20
+  rotator_billing_day: 1
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: catalog.roblox.com/v1/search/items
+  egress: direct
+  outcome: served_upstream
+  source: relay
+  cache_state: "MISS"
+  latency_ms: {p50: 160, p95: 420, p99: 800}
+
+traffic:
+  - {name: search_direct, reason: upstream_ok, status: 200, window: ["-60m", "0m"], per_minute: 20}
+  - {name: search_challenge, reason: upstream_4xx, status: 403, window: ["-14m", "-6m"], total: 12}
+  - {name: games_direct, endpoint_template: games.roblox.com/v1/games, reason: upstream_ok, status: 200, window: ["-60m", "0m"], per_minute: 10}
+
+events:
+  upstream_attempts:
+    - {window: ["-14m", "-6m"], total: 12, endpoint_template: catalog.roblox.com/v1/search/items, egress: direct, attempt: 1, status: 403, kind: first, challenge: true, html_body: true}
+
+state:
+  egress:
+    usage:
+      - {egress: rotator, granularity: day, at: "2026-10-01", requests: 40000, req_bytes: 30000000, resp_bytes: 250000000, overhead_bytes: 20000000}
+  settings_history:
+    - {at: "-20d", key: rotator_quota_gb_per_month, old: 0, new: 20, source: admin, changed_by: admin, reason: "Plan purchased."}
+
+expect:
+  data_checks:
+    - window: ["-15m", "0m"]
+      where: {egress: direct, status: 403}
+      requests: 12
+    - window: ["-60m", "-15m"]
+      where: {status: 403}
+      requests: 0
+
+  fires: true
+  others: forbid
+  recommendations:
+    - subject_contains: "catalog.roblox.com/v1/search/items"
+      confidence: medium
+      family: upstream
+      change_kinds_required: [routing_rule]
+      change_kinds_forbidden: [setting, bucket_override, credential_allowlist_remove, ban_add, manual]
+      changes_required:
+        - kind: routing_rule
+          match: {pattern: {matches_targets: ["catalog.roblox.com/v1/search/items"]}}
+          proposed: {mode: {in: [prefer_rotator, rotator_only]}}
+      changes_forbidden:
+        - kind: routing_rule
+          proposed: {mode: {in: [prefer_direct, direct_only]}}
+        - kind: routing_rule
+          match: {pattern: {matches_targets: ["games.roblox.com/v1/games"]}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_challenge_enabled: 0}
+    expect: {fires: false}
+  - case: rotator_switched_off
+    description: With the rotator off no other anonymous egress can take the endpoint; the change is manual.
+    settings: {rotator_enabled: 0}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "catalog.roblox.com/v1/search/items"
+          change_kinds_required: [manual]
+          change_kinds_forbidden: [routing_rule, setting]
+  - case: rotator_over_quota
+    description: A 0.2 GB quota is below the 0.3 GB already used this cycle, so the rotator cannot take it either.
+    settings: {rotator_quota_gb_per_month: 0.2}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "catalog.roblox.com/v1/search/items"
+          change_kinds_required: [manual]
+          change_kinds_forbidden: [routing_rule, setting]

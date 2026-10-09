@@ -41,6 +41,8 @@ from typing import Any
 
 import pytest
 
+from roxy.admin.api import API_MODULES
+
 REPO = Path(__file__).resolve().parents[2]
 DRIVER = Path(__file__).with_name("gunicorn_mp_driver.py")
 
@@ -141,7 +143,7 @@ def test_gunicorn_fleet_limits_hold(tmp_path: Path, credentials_dir: Path, worke
     # A settings change written by one process is live in every worker within 2 s (each worker logs the reload).
     reload = out["reload"]
     assert reload["workers_reloaded"] == workers, reload
-    assert 0 <= reload["slowest_reload_s"] <= 2.0, reload
+    assert 0 <= reload["slowest_reload_s"] <= 2.0, reload  # monotonic: a wall clock step cannot skew it
     assert all(version < reload["new_version"] for version in reload["old_versions_before"]), reload
     assert reload["versions_after"] == [reload["new_version"]], reload
     assert reload["cors_after"] == reload["cors_checked"], reload
@@ -186,3 +188,36 @@ def test_gunicorn_mock_429_retry_after_30(tmp_path: Path, credentials_dir: Path)
     assert out["cookie_calls"] == 0  # zero cascades onto the credential
     assert out["stop_code"] == 0, log
     assert out["recorded"] == out["sent"], (out["recorded"], out["sent"])
+
+
+@pytest.mark.timeout(300)
+def test_gunicorn_wave3_jobs_run_on_one_leader(tmp_path: Path, credentials_dir: Path) -> None:
+    """Wave 3b wiring under real gunicorn with 2 workers: every recommendations, health and LLM export job is in the
+    leader's job set, the one leader runs them (the published status names one holder, the lease holder), the
+    first evaluation and the hourly export file finish without a failure, and the admin API schema is refused to a
+    caller who is not signed in."""
+    out = run_driver("wave3_jobs", tmp_path, credentials_dir, 2, timeout_s=280)
+    log = out.get("log_tail", "")
+    assert out["ready"], log
+    assert out["worker_pids"] == 2, log
+    assert out["leader"]["leaders"] == 1, (out["leader"], log)
+    assert out["leader"]["lease_holder_is_the_leader"], (out["leader"], log)
+    missing = [name for name, row in out["jobs"].items() if row is None]
+    assert missing == [], (missing, log)
+    assert out["holders"] == [out["leader_worker_id"]], (out["holders"], log)
+    for name in ("insights_evaluate", "llm_export_file", "health_publish_jobs"):
+        assert out["jobs"][name]["last_ok"] == 1, (name, out["jobs"][name], log)
+    assert out["jobs"]["insights_evaluate"]["interval_s"] == 30.0  # insights_interval_s, catalog default
+    assert out["jobs"]["health_scheduled_run"]["interval_s"] == 300.0  # polls; runs every health_auto_interval_h
+    assert out["jobs"]["llm_export_file"]["interval_s"] == 3600.0
+    assert "roxy-llm-export.json" in out["export_files"], out["export_files"]
+    assert out["openapi_anonymous"]["status"] == 401, out["openapi_anonymous"]
+    assert '"unauthorized"' in out["openapi_anonymous"]["body"]
+    schema = out["openapi_admin"]  # signed in through the real password and TOTP steps
+    assert schema.get("openapi") == 200, schema
+    assert set(schema["prefixes"]) >= {"settings", "recommendations", "health", "export", "stream"}, schema
+    assert len(schema["tags"]) == len(API_MODULES) + 1, schema["tags"]  # every area plus the stream
+    assert schema["paths"] >= 200, schema
+    assert out["job_failures"] == [], out["job_failures"]
+    assert out["stop_code"] == 0, log
+    assert out["heartbeats_after_stop"] == 0

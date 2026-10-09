@@ -548,6 +548,23 @@ class SettingsService:
         return result
 
 
+FINGERPRINT_CONTEXT: Final = "settings-fingerprint"
+"""`derived_key` context of the key that fingerprints sensitive setting values in history and audit rows."""
+
+
+def service_for(ctx: Any) -> SettingsService:
+    """The settings service of a worker's `AppContext`: its control.db, runtime settings and clock, with sensitive
+    values fingerprinted under a key derived from the `ip_hash_key` credential when it exists, so the same value
+    has the same fingerprint in every worker and across restarts (without the credential each service draws a
+    random key). Every writer of settings in a running worker (the settings API, the Protection page, applied
+    recommendations) builds its service here, so their history and audit rows compare."""
+    from roxy.core.iphash import derived_key  # local import: the core helper is only needed with a context
+
+    key = getattr(ctx, "ip_hash_key", None)
+    fingerprint_key = derived_key(key, FINGERPRINT_CONTEXT) if key else None
+    return SettingsService(ctx.dbs.control, runtime=ctx.settings, clock=ctx.clock, fingerprint_key=fingerprint_key)
+
+
 # --- helpers (pure functions over a connection, usable inside other transactions) ------------------------------------
 
 
@@ -647,6 +664,7 @@ def _parse_document(document: Any) -> tuple[Mapping[str, Any], bool]:
 
 __all__ = [
     "EXPORT_SCHEMA",
+    "FINGERPRINT_CONTEXT",
     "RESET",
     "HistoryEntry",
     "HistoryNotFound",
@@ -658,4 +676,5 @@ __all__ = [
     "UpdateResult",
     "check_reason",
     "check_source",
+    "service_for",
 ]

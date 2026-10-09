@@ -127,6 +127,10 @@ async def test_maintenance_removes_dead_rows_first_then_evicts_cold_entries(dbs:
     assert report.entries_before == 6
     assert report.evicted == 2
     assert report.entries_after == 4
+    # Both were evicted about 2 s after they were stored, long before their TTL ran out: young evictions, the
+    # CACHE-PRESSURE signal (plan 11.5), computed from each row's `stored_at` and `ttl`.
+    assert report.young == 2
+    assert report.age_s_total == report.young_age_s_total == pytest.approx(4.0, abs=1.0)
     survivors = {
         row[0] for row in dbs.cache.read_sync(lambda conn: conn.execute("SELECT path FROM entries").fetchall())
     }

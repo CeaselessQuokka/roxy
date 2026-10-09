@@ -443,12 +443,22 @@ def test_migrate_is_idempotent_and_records_versions(env) -> None:
     dbs = open_databases(env)
     try:
         first = migrate_all(dbs)
-        assert all(len(ran) == 1 for ran in first.values())
+        # Every expand migration of each database runs once, in order (metrics.db has four since wave 3b).
+        assert {name: [m.version for m in ran] for name, ran in first.items()} == {
+            name: list(range(1, REQUIRED_SCHEMA[name] + 1)) for name in DB_NAMES
+        }
         second = migrate_all(dbs)
         assert all(ran == [] for ran in second.values())
         rows = dbs.control.read_sync(lambda c: c.execute("SELECT version, name FROM schema_version").fetchall())
         assert [tuple(r) for r in rows] == [(1, "initial")]
-        assert check_schema(dbs) == {"control": 1, "hot": 1, "metrics": 1, "cache": 1}
+        metrics_rows = dbs.metrics.read_sync(lambda c: c.execute("SELECT version, name FROM schema_version").fetchall())
+        assert [tuple(r) for r in metrics_rows] == [
+            (1, "initial"),
+            (2, "insight_history"),
+            (3, "health_details"),
+            (4, "annotation_range"),
+        ]
+        assert check_schema(dbs) == REQUIRED_SCHEMA
     finally:
         dbs.close_all_sync()
 
@@ -471,9 +481,11 @@ def test_concurrent_migrations_apply_each_file_once(tmp_path: Path) -> None:
         t.join(30)
     assert not errors
     for name in DB_NAMES:
-        assert sum(len(r[name]) for r in results) == 1
+        # Each migration file ran exactly once across the four racing runners.
+        applied = sorted(m.version for r in results for m in r[name])
+        assert applied == list(range(1, REQUIRED_SCHEMA[name] + 1))
         conn = sqlite3.connect(str(paths[name]))
-        assert conn.execute("SELECT count(*) FROM schema_version").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM schema_version").fetchone()[0] == REQUIRED_SCHEMA[name]
         conn.close()
 
 
@@ -486,7 +498,7 @@ def test_check_schema_refuses_old_databases(env) -> None:
         assert "--expand" in str(info.value)
         migrate_all(dbs)
         with pytest.raises(SchemaTooOld):
-            check_schema(dbs, required={"control": 2, "hot": 1, "metrics": 1, "cache": 1})
+            check_schema(dbs, required={**REQUIRED_SCHEMA, "control": REQUIRED_SCHEMA["control"] + 1})
     finally:
         dbs.close_all_sync()
 

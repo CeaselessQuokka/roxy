@@ -102,6 +102,8 @@ async function post(path, body) {
 
 function serverText(data, fallback) {
   if (typeof data === "string" && data) return data;
+  // The admin API's error object (DESIGN.md section 13), for example an expired session or a re-auth request.
+  if (data && data.error && typeof data.error.message === "string" && data.error.message) return data.error.message;
   if (data && typeof data.detail === "string") return data.detail;
   return fallback;
 }

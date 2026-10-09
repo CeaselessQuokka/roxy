@@ -44,6 +44,7 @@ from roxy.admin.auth.deps import (
     STATE_COOKIE,
     STATE_SESSION,
     AdminPrincipal,
+    ReauthRequired,
     client_ip,
     get_auth,
     get_ctx_or_none,
@@ -480,12 +481,17 @@ async def api_reauth_passkey_options(
 
 
 def _require_enroll_rights(request: Request, record: sessions.SessionRecord) -> None:
-    """A bootstrap session may enroll; anyone else replacing their authenticator needs a fresh second factor."""
+    """A bootstrap session may enroll; anyone else replacing their authenticator needs a fresh second factor.
+
+    The refusal is the guards' own `ReauthRequired` (an `HTTPException`, so it passes the routes' `except
+    AuthError`): the `Roxy-Reauth: required` header plus the section 13 body with code `reauth_required`, the same
+    answer every other fresh-MFA refusal gives (DESIGN.md 13).
+    """
     if record.mfa_level == "bootstrap":
         return
     auth = get_auth(request)
     if not record.is_fresh(auth.clock.now(), int(auth.settings.int("admin_reauth_window_s"))):
-        raise AuthError(403, "Re-authentication required", headers={"Roxy-Reauth": "required"})
+        raise ReauthRequired()
 
 
 @router.post(f"{API}/totp/enroll/start")

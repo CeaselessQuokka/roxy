@@ -86,6 +86,7 @@ from roxy.cache.swr import SwrRefresher
 from roxy.config.constants import CACHE_PAGE_MAX
 from roxy.core.clock import Clock
 from roxy.core.reasons import AuthClass, CacheState, Egress, Outcome, ReasonCode, Source
+from roxy.metrics.recorder import note_cache_store, note_eviction_ages, note_eviction_pass
 from roxy.rules.match import regex_budget
 from roxy.rules.store import RulesSnapshot
 from roxy.storage import leases
@@ -898,6 +899,7 @@ class CacheService:
             written = await self.store.write_shared(entry, compress=compress, req_body=req_body)
         finally:
             self._pending_writes -= 1
+        note_cache_store(self._recorder, written)  # stores per minute, the CACHE-PRESSURE denominator
         if not written:
             self.stats.store_failures += 1
         return written
@@ -1323,6 +1325,8 @@ class CacheService:
         )
         self.stats.evictions += report.evicted
         self.stats.dead_removed += report.dead
+        note_eviction_pass(self._recorder, report)  # which cap forced evictions (CACHE-PRESSURE)
+        note_eviction_ages(self._recorder, report)  # how many of them were still young (CACHE-PRESSURE)
         if report.evicted or report.dead:
             fields = dataclasses.asdict(report)
             log.info("cache_maintenance", extra={"fields": fields})

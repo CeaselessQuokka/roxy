@@ -4,7 +4,8 @@ What this is
     Playwright tests for behaviors the P11 design review found broken, each written so it fails on the code before
     the fix: tooltips, toasts and announcements while a modal dialog is open; focus never hidden under the phone
     bottom bar; an off switch for single-key shortcuts and a guard for unsaved edits; charts and live tails released
-    when they leave the page; live tail text filters debounced; the palette following only local links; the CSRF
+    when they leave the page; live tail text filters debounced; the stream's `gap` and `unauthorized` events
+    (marked on the tail; every stream stops with no reconnect); the palette following only local links; the CSRF
     token refresh and the re-authentication signal; logout and drawer load errors; the session-expired overlay
     leaving other dialogs alone; Escape on a tooltip inside a dialog; reduced motion; real shadows; and heartbeats
     when the heartbeat interval is longer than the activity window.
@@ -389,6 +390,41 @@ def test_live_tail_text_filters_reconnect_once_after_typing(ui_server: Any, open
     filtered = [url for url in urls[mark:] if "endpoint=" in url]
     assert len(filtered) == 1, filtered
     assert "endpoint=games" in filtered[0]
+
+
+def test_live_tail_marks_a_gap_and_stops_for_good_on_unauthorized(ui_server: Any, open_page: Any, wait_js: Any) -> None:
+    """The server's two control events (roxy/admin/sse.py): `gap` is shown on the tail, `unauthorized` stops every
+    stream at once and opens the sign-in overlay, with no reconnect that could only fail."""
+    record = open_page(color_scheme="dark", reduced_motion="no-preference", **DESKTOP)
+    page = record.page
+    live = {"request_id": "r1", "status": 200, "outcome": "served_cache", "endpoint": "games.roblox.com/v1/games"}
+    gap = {"after_id": "0", "resumed_to": "1", "position": "1"}
+    unauthorized = {"status": 401, "code": "unauthorized", "message": "Session expired"}
+    frames = "".join(
+        [
+            "retry: 200" + "\n\n",
+            "event: live" + "\n" + "id: 1" + "\n" + "data: " + json.dumps(live) + "\n\n",
+            "event: gap" + "\n" + "id: 2" + "\n" + "data: " + json.dumps(gap) + "\n\n",
+            "event: unauthorized" + "\n" + "data: " + json.dumps(unauthorized) + "\n\n",
+        ]
+    )
+    streams: list[str] = []
+
+    def stream(route: Any) -> None:
+        streams.append(route.request.url)
+        route.fulfill(status=200, headers={"Content-Type": "text/event-stream"}, body=frames)
+
+    page.route(re.compile(r".*/admin/_gallery/stream(\?.*)?$"), stream)
+    response = page.goto(f"{ui_server.base_url}{GALLERY}?theme=dark")
+    assert response is not None
+    assert response.ok
+    wait_js(page, "document.documentElement.dataset.ready === '1'")
+    page.wait_for_selector("#session-expired[open]")
+    wait_js(page, "document.querySelector('#gallery-tail [data-tail-count]').textContent.includes('missed')")
+    assert page.text_content("#gallery-tail [data-tail-state]") == "Signed out"
+    seen = len(streams)
+    page.wait_for_timeout(1500)  # `retry: 200` would have reconnected several times by now
+    assert len(streams) == seen, streams
 
 
 # ------------------------------------------------------------------------------------------- links and requests

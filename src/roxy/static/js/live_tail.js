@@ -97,10 +97,12 @@ class LiveTail {
     this.render = rafThrottle(() => this.draw());
     this.paramsTimer = 0;
     this.destroyed = false;
+    this.gap = false;  // a reconnect could not replay every missed request (the server's `gap` event)
 
     this.stream = new EventStream(root.dataset.streamUrl, {
       onEvent: (event) => {
         if (event.type === "live" || event.type === "message") this.add(normalize(event.data));
+        else if (event.type === "gap") this.markGap();
       },
       onState: (state) => {
         this.connection = state;
@@ -133,6 +135,7 @@ class LiveTail {
         this.rows = [];
         this.waiting = [];
         this.dropped = 0;
+        this.gap = false;
         this.active = -1;
         this.draw();
         this.updateState();
@@ -257,8 +260,15 @@ class LiveTail {
       let count = `${fmtNumber(this.rows.length)} row${this.rows.length === 1 ? "" : "s"}`;
       if (this.waiting.length) count += `, ${fmtNumber(this.waiting.length)} waiting`;
       if (this.dropped) count += `, ${fmtNumber(this.dropped)} dropped`;
+      if (this.gap) count += ", some missed while reconnecting";
       this.countLabel.textContent = count;
     }
+  }
+
+  /** The server could not replay everything missed during a reconnect: say so instead of implying a full list. */
+  markGap() {
+    this.gap = true;
+    this.updateState();
   }
 
   announce() {

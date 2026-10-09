@@ -1,0 +1,83 @@
+# PLACE-HEAVY when the endpoint the dominant place calls already has an endpoint rule (added by the rules_abuse_system
+# author, P10).
+#
+#   place                    upstream calls in the hour       share
+#   1000000301 (20 servers)  6,000 (100 a minute, users)      62.5%
+#   1000000302 to 310        3,600 together                   37.5%
+#
+# An admin rule already limits users.roblox.com/v1/users/* per IP. A second rule with the same pattern would be refused
+# (rules/models.py: one winning rule per pattern), and silently rewriting the admin's rule would be surprising, so the
+# rule falls back to the other 11.5 remedy: turn the place limit on (keyed by place_prefix, the forger-safe default).
+# Upstream use per place comes from the request samples production records (`request_sample_pct` 100).
+
+format: roxy.insight_fixture/1
+rule: PLACE-HEAVY
+case: endpoint_rule_exists
+description: >
+  One experience made 62.5% of the upstream calls in the last hour on an endpoint that already has an admin endpoint
+  rule. PLACE-HEAVY must propose turning on the place limit, never a ban and never a second rule for that pattern.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  rules_endpoint_limit:
+    - {id: 1, pattern: "users.roblox.com/v1/users/*", type: glob, scope: ip, limit: 120, period: 60, enabled: 1, created_at: "-30d", created_by: admin}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  place_301: {clients: {cidr: "203.0.113.0/27", count: 20}, place_id: "1000000301", user_agent: "Roblox/Linux"}
+  other_places:
+    clients: {cidr: "203.0.113.64/26", count: 40}
+    places: ["1000000302", "1000000303", "1000000304", "1000000305", "1000000306", "1000000307", "1000000308", "1000000309", "1000000310"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: p301_miss, profile: [miss, place_301], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 100}
+  - {name: others_miss, profile: [miss, other_places], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 60}
+  - {name: others_hit, profile: [hit, other_places], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 40}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/27", count: 20}, bot_score: 8}
+    - {clients: {cidr: "203.0.113.64/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], upstream_calls: 9600, requests: 12000}
+    - {window: ["-60m", "0m"], where: {place_id: "1000000301"}, upstream_calls: 6000}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: PLACE-HEAVY
+      subject_contains: "1000000301"
+      severity: any
+      family: abuse
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: setting, key: place_limit_enabled, current: 0, proposed: 1}
+      changes_forbidden:
+        - {kind: setting, key: place_limit_key, proposed: place}
+      change_kinds_forbidden: [ban_add, rule_upsert, filter_add, bucket_override]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_place_heavy_enabled: 0}
+    expect: {fires: false}
+  - case: place_limit_already_on
+    description: With the place limit already on, nothing can be applied; the rule asks for a manual review.
+    settings: {place_limit_enabled: 1}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "1000000301"
+          changes_required: [{kind: manual}]
+          change_kinds_forbidden: [ban_add, setting]

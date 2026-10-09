@@ -18,6 +18,9 @@ How it works
       on the next beat by zeroing its in-memory counters.
     - Loop lag: a background coroutine sleeps 250 ms at a time and records how much later than asked it woke
       up. A blocked loop (synchronous SQLite, CPU work) shows up here long before gunicorn's 30 s watchdog.
+    - Worker history: each beat also hands its CPU share (`CpuMeter`), loop lag p99, open connections and RSS to
+      `on_sample` (the recorder's `record_worker_sample`), the per-minute history SYS-WORKER-SAT and SYS-LOOP-LAG
+      read (plan 11.5).
 
 What to read next
     `roxy/scheduler/jobs.py`, then the System page API (`roxy/admin/api/system.py`).
@@ -102,6 +105,30 @@ def read_rss_bytes() -> int | None:
         return None
 
 
+class CpuMeter:
+    """This process's CPU use since the previous reading, in percent of one core (all threads: the event loop plus
+    the SQLite writer and reader threads), for the per-minute worker history (SYS-WORKER-SAT, plan 11.5).
+
+    `time.process_time()` is the process's user plus system CPU seconds, so no file under /proc or the cgroup has to
+    be read; dividing its growth by the monotonic time between two readings gives the share of one core.
+    """
+
+    def __init__(
+        self, *, clock: Callable[[], float] = time.monotonic, cpu: Callable[[], float] = time.process_time
+    ) -> None:
+        self._clock = clock
+        self._cpu = cpu
+        self._last: tuple[float, float] | None = None
+
+    def read(self) -> float | None:
+        """Percent of one core used since the last call; None on the first call (nothing to compare with yet)."""
+        now, used = self._clock(), self._cpu()
+        last, self._last = self._last, (now, used)
+        if last is None or now - last[0] <= 0:
+            return None
+        return round(max(0.0, (used - last[1]) / (now - last[0]) * 100.0), 1)
+
+
 class LoopLagMonitor:
     """Measures event loop lag: how much later than requested a short sleep returns. Bounded sample window."""
 
@@ -175,6 +202,8 @@ class HeartbeatReporter:
         is_leader: Callable[[], bool] | None = None,
         cache_generation: Callable[[], int | None] | None = None,
         rss: Callable[[], int | None] = read_rss_bytes,
+        on_sample: Callable[[dict[str, Any]], None] | None = None,
+        cpu: CpuMeter | None = None,
     ) -> None:
         self.metrics = metrics
         self.info = info
@@ -186,6 +215,10 @@ class HeartbeatReporter:
         self._is_leader = is_leader
         self._cache_generation = cache_generation
         self._rss = rss
+        # `on_sample(values)` receives this worker's vital signs on every beat, whether or not the row could be
+        # written: the lifespan hands them to `MetricsRecorder.record_worker_sample` (the per-minute worker history).
+        self._on_sample = on_sample
+        self.cpu = cpu or CpuMeter()
         self.beats = 0
         self.failures = 0
 
@@ -222,9 +255,26 @@ class HeartbeatReporter:
         if stored_reset_at and stored_reset_at > local:
             self.counters.reset(stored_reset_at)
 
+    def _sample(self, row: dict[str, Any]) -> None:
+        """Hand this beat's vital signs to `on_sample` (never raises: a metrics hook never stops the heartbeat)."""
+        if self._on_sample is None:
+            return
+        try:
+            self._on_sample(
+                {
+                    "cpu_pct": self.cpu.read(),
+                    "loop_lag_ms_p99": row["lag"],
+                    "open_conns": row["open_conns"],
+                    "rss": row["rss"],
+                }
+            )
+        except Exception:
+            log.warning("heartbeat_sample_failed", exc_info=True)
+
     async def beat(self) -> None:
         """Write one heartbeat. Raises `SharedStateUnavailable` if metrics.db cannot be written."""
         row = self._row()
+        self._sample(row)
         stored = await self.metrics.write(lambda conn: self._write(conn, row))
         self._adopt_reset(stored)
         self.beats += 1

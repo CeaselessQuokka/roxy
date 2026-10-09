@@ -597,6 +597,20 @@ class EvictionReport:
     bytes_before: int = 0
     entries_after: int = 0
     bytes_after: int = 0
+    young: int = 0  # evicted before their TTL ran out: the cache is too small for what it is asked to keep
+    age_s_total: float = 0.0  # summed age (now minus stored_at) of every evicted entry
+    young_age_s_total: float = 0.0  # the same for the young ones
+
+
+@dataclass(frozen=True, slots=True)
+class Victim:
+    """One entry an eviction round chose: its id, size, age (seconds since it was stored) and whether it was young
+    (evicted before its TTL ran out)."""
+
+    id: str
+    size: int
+    age_s: float
+    young: bool
 
 
 def _generation(conn: sqlite3.Connection) -> tuple[int, int]:
@@ -816,23 +830,29 @@ class SharedTier:
             victims = await self._victims(policy, max(0, count - goal_entries), max(0, size - goal_bytes), now)
             if not victims:
                 break
-            removed = await self.delete_ids([victim_id for victim_id, _size in victims])
-            freed = sum(victim_size for _id, victim_size in victims)
+            removed = await self.delete_ids([victim.id for victim in victims])
+            freed = sum(victim.size for victim in victims)
             count = max(0, count - removed)
             size = max(0, size - freed)
             report.evicted += removed
             report.freed_bytes += freed
+            # Ages for CACHE-PRESSURE (plan 11.5): an entry evicted before its TTL ran out was still wanted.
+            for victim in victims:
+                report.age_s_total += victim.age_s
+                if victim.young:
+                    report.young += 1
+                    report.young_age_s_total += victim.age_s
             await asyncio.sleep(0)  # let requests run between rounds
         report.entries_after, report.bytes_after = count, size
         return report
 
-    async def _victims(self, policy: str, need_entries: int, need_bytes: int, now: float) -> list[tuple[str, int]]:
+    async def _victims(self, policy: str, need_entries: int, need_bytes: int, now: float) -> list[Victim]:
         want = max(need_entries, 1)
         lru_only = policy == "lru"
         limit = min(MAX_EVICT_CANDIDATES, max(want, 64) if lru_only else max(want * 4, 256))
-        select = f"SELECT id, {SIZE_SQL}, hits, last_hit_at FROM entries"  # noqa: S608  # module constants
+        select = f"SELECT id, {SIZE_SQL}, hits, last_hit_at, stored_at, ttl FROM entries"  # noqa: S608  # constants
 
-        def run(conn: sqlite3.Connection) -> list[tuple[str, int, int, int]]:
+        def run(conn: sqlite3.Connection) -> list[tuple[str, int, int, int, int, int]]:
             # The last_hit_at index gives the least recently used rows without sorting the table.
             rows = conn.execute(f"{select} ORDER BY last_hit_at LIMIT ?", (limit,)).fetchall()
             if policy == "lfu":
@@ -840,7 +860,10 @@ class SharedTier:
                 if low is not None:
                     start = random.randint(int(low), int(high))  # a random window: an LFU sample
                     rows += conn.execute(f"{select} WHERE rowid >= ? ORDER BY rowid LIMIT ?", (start, limit)).fetchall()
-            return [(str(r[0]), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0)) for r in rows]
+            return [
+                (str(r[0]), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0), int(r[4] or 0), int(r[5] or 0))
+                for r in rows
+            ]
 
         rows = await self.db.read(run)
         unique = list({row[0]: row for row in rows}.values())
@@ -848,12 +871,13 @@ class SharedTier:
             unique.sort(key=lambda row: (row[2], row[3]))
         elif not lru_only:  # hybrid: hits that fade with an hourly half-life, least valuable first
             unique.sort(key=lambda row: (row[2] * 0.5 ** (max(0.0, now - row[3]) / HYBRID_HALF_LIFE_S), row[3]))
-        chosen: list[tuple[str, int]] = []
+        chosen: list[Victim] = []
         freed = 0
-        for entry_id, entry_size, _hits, _last in unique:
+        for entry_id, entry_size, _hits, _last, stored_at, ttl in unique:
             if len(chosen) >= need_entries and freed >= need_bytes:
                 break
-            chosen.append((entry_id, entry_size))
+            age = max(0.0, now - stored_at)
+            chosen.append(Victim(entry_id, entry_size, age, ttl > 0 and age < ttl))
             freed += entry_size
         return chosen
 

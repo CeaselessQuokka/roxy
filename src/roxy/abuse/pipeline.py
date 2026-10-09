@@ -114,6 +114,7 @@ from roxy.abuse.verdict import Allow, Refuse, Verdict, raw_path, request_target
 from roxy.core.client_ip import limit_key as compute_limit_key
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.core.reasons import ReasonCode
+from roxy.metrics.recorder import note_rule_hit
 from roxy.rules.match import regex_budget
 from roxy.rules.service import RulesService
 from roxy.rules.store import RulesSnapshot
@@ -384,6 +385,7 @@ class AbusePipeline:
         self.control_db = control_db
         self.metrics_db = metrics_db  # worker heartbeats: the live fleet size, the C7 divisor
         self.clock = clock
+        self._last_now_ms = 0  # the newest limiter time this pipeline used (`steady_now_ms`)
         self.worker_id = worker_id
         self.workers = max(1, int(workers))
         self.recorder = recorder
@@ -495,12 +497,27 @@ class AbusePipeline:
 
     # ---- the request path ----
 
+    def steady_now_ms(self) -> int:
+        """The clock's milliseconds, never below the last value this pipeline decided with.
+
+        Limiter rows hold wall-clock times (they are shared through hot.db by every process), and a wall clock can
+        step back (an NTP step; WSL steps about 0.9 s back every 31 s). GCRA grants a burst against a theoretical
+        arrival time, so a step back between two requests of one burst made the last request of a granted
+        allowance look early and refused it. Holding the last time until the clock catches up keeps every decision
+        of this worker on one forward timeline; a forward jump is taken at once.
+        """
+        now_ms = int(self.clock.now_ms())
+        if now_ms < self._last_now_ms:
+            return self._last_now_ms
+        self._last_now_ms = now_ms
+        return now_ms
+
     async def evaluate(self, req: Any) -> Verdict:
         """Decide one request (see the module docstring). Never raises for shared-state trouble (C7)."""
         values = self._values()
         rules = self._rules_snapshot()
         now = self.clock.now()
-        now_ms = self.clock.now_ms()
+        now_ms = self.steady_now_ms()  # limiter time never steps back inside this worker
         facts = self._facts(req, values, rules, now, now_ms)
         if not getattr(req, "bypass", False) and is_bypassed(rules, facts.ip, now):
             req.bypass = True  # step 0: known before bans refuse, so a bypass caller is never held (plan 10.6)
@@ -755,7 +772,7 @@ class AbusePipeline:
             pending = self._claim_batch(MERGE_BATCH)
             if pending is None:
                 break
-            now_ms = self.clock.now_ms()
+            now_ms = self.steady_now_ms()
             size = len(pending)
             try:
                 job = functools.partial(self._merge_job, pending=pending, now_ms=now_ms)
@@ -999,6 +1016,7 @@ class AbusePipeline:
             self._aggregate(
                 UA_RULE_HIT_EVENT, {"rule_id": rule_id, "result": "allowed" if ua.admitted else "refused"}, facts
             )
+            note_rule_hit(self.recorder, "rules_user_agent", rule_id)  # last hit per rule row (FILTER-REMOVE)
         per_ip = next((o.per_ip for o in tx.outcomes.values() if o.per_ip is not None), None)
         if per_ip is not None and per_ip.new_strike and per_ip.rung.index:
             tier = per_ip.rung.index

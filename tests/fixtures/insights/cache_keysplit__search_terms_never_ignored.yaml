@@ -1,0 +1,82 @@
+# CACHE-KEYSPLIT reports, but never ignores, a parameter that carries real data
+# (format: tests/fixtures/insights/README.md). Added by the rules_cache_egress author (P10).
+#
+# 11.5 row: "v1 Suspect rule (>= 5 entries, top param >= 80% distinct, hits <= 10%) or SPAM-BUST"; change "Add
+# ignored param (one click), or normalization rule (sort id lists)".
+#
+#   GET catalog.roblox.com/v1/search/items: 7 cache entries, 0 hits. The most varied parameter, `keyword`, has 7
+#   distinct values (100%), so the v1 Suspect test flags the group. But the values are search terms (hat, sword,
+#   wings, ...): different keywords are different answers. Ignoring `keyword` would answer every search with the
+#   first one's results, for every caller, until the entry expires.
+#
+# Reading of the row (the rule author's): the one-click "ignored param" fix is only for a parameter shaped like a
+# cache buster (a timestamp, a random number or token, never an id name); any other Suspect parameter is reported
+# with a manual check. Entry ids are the first 24 hex characters of the SHA-256 of the key text that
+# cache/keys.py build_key makes (checked with build_key when the file was written).
+
+format: roxy.insight_fixture/1
+rule: CACHE-KEYSPLIT
+case: search_terms_never_ignored
+description: >
+  The catalog search endpoint's cache entries each hold a different search term and none was hit, which the v1
+  Suspect rule flags. Search terms are real data, so the rule must fire with a manual check only and never propose
+  ignoring `keyword` or any other parameter.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 2, pattern: "catalog.roblox.com/v1/search/items", type: glob, ttl: 120, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+
+profiles:
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: search_miss, profile: miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-15m", "0m"], total: 7}
+
+state:
+  cache:
+    entries:
+      - {id: "15fbace1d7ff0f75478d5ee9", key: "GET catalog.roblox.com/v1/search/items?keyword=hat&limit=30", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"hat\"],[\"limit\",\"30\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-1m", expires_at: "+1m", stale_until: "+11m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "ef9f14fe942ca2d0cf365527", key: "GET catalog.roblox.com/v1/search/items?keyword=sword&limit=30", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"sword\"],[\"limit\",\"30\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-3m", expires_at: "-1m", stale_until: "+9m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "125a1837d0db1e0587edd712", key: "GET catalog.roblox.com/v1/search/items?keyword=wings&limit=30", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"wings\"],[\"limit\",\"30\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-5m", expires_at: "-3m", stale_until: "+7m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "d456ebf4f6067af3ab52d24e", key: "GET catalog.roblox.com/v1/search/items?keyword=crown&limit=30", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"crown\"],[\"limit\",\"30\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-7m", expires_at: "-5m", stale_until: "+5m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "2a20b189da1e33ce24241c7d", key: "GET catalog.roblox.com/v1/search/items?keyword=shield&limit=30", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"shield\"],[\"limit\",\"30\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-9m", expires_at: "-7m", stale_until: "+3m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "9ecc2f827adfd58d3fda87a4", key: "GET catalog.roblox.com/v1/search/items?keyword=cape&limit=30", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"cape\"],[\"limit\",\"30\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-11m", expires_at: "-9m", stale_until: "+1m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "3dd6db1b33989cd0898bab97", key: "GET catalog.roblox.com/v1/search/items?keyword=boots&limit=30", method: "GET", host: "catalog.roblox.com", path: "v1/search/items", params_json: "{\"params\":[[\"keyword\",\"boots\"],[\"limit\",\"30\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-13m", expires_at: "-11m", stale_until: "-1m", ttl: 120, rule_id: 2, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+
+expect:
+  data_checks:
+    - window: ["-15m", "0m"]
+      where: {endpoint_template: catalog.roblox.com/v1/search/items}
+      requests: 7
+      upstream_calls: 7
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CACHE-KEYSPLIT
+      subject_contains: "catalog.roblox.com/v1/search/items"
+      severity: any
+      family: cache
+      safe_auto: false
+      change_kinds_required: [manual]
+      change_kinds_forbidden: [ignored_param_add, rule_upsert, ban_add, filter_add, bypass_add, tarpit_category, routing_rule, host_add, bucket_override]
+      changes_forbidden:
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_max_entries, cache_max_bytes, cache_enabled]}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cache_keysplit_enabled: 0}
+    expect: {fires: false}
+  - case: min_entries_8
+    description: Eight entries needed; the search group has seven.
+    settings: {insight_cache_keysplit_min_entries: 8}
+    expect: {fires: false}

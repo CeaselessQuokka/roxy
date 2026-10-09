@@ -1,0 +1,80 @@
+# SYS-ERRORS, a known signature that comes back after a quiet week (added by the rule author; README "ground rules").
+#
+# 11.5: "a known signature whose hourly count exceeds 5x its 7-day hourly baseline". This signature is 20 days old
+# (not new), last happened 10 days ago (12 times that day), and was silent for the whole 7-day baseline, so its
+# baseline is 0 an hour. Three occurrences in the last hour exceed any multiple of 0: the rule reads that as a
+# spike ("back after a quiet week"), whatever `baseline_multiple` is.
+#
+#   signature                 baseline (7 days)   last hour   expected
+#   OSError at backup.py:41   0 an hour           3           recommendation (any multiple)
+#
+# Roxy's own 500s stay at zero, so the caller-facing condition is false.
+
+format: roxy.insight_fixture/1
+rule: SYS-ERRORS
+case: quiet_week_then_back
+description: >
+  An old disk error in the snapshot job, silent for ten days, happened three times in the last hour. SYS-ERRORS must
+  raise one manual recommendation for it: with a baseline of zero, the hourly count exceeds every multiple of it.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  client_ip: "203.0.113.20"
+  user_agent: "Roblox/Linux"
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: 3}
+
+traffic:
+  - {name: legit_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 50}
+
+events:
+  errors:
+    - signature: "OSError at backup.py:41"
+      count: 15
+      first_seen: "-20d"
+      last_seen: "-20m"
+      source: roxy
+      last_detail: "snapshot write"
+      module_line: "backup.py:41"
+      traceback_redacted: |
+        File "roxy/storage/backup.py", line 41, in snapshot
+          shutil.copyfile(src, dst)
+        OSError: [Errno 28] No space left on device
+      occurrences:
+        - {window: ["-10d", "-9d"], every: "2h"}
+        - {window: ["-40m", "-10m"], every: "10m"}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 3000, failed: 0}
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-ERRORS
+      subject_contains: "backup.py:41"
+      family: system
+      confidence: high
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: manual}
+      evidence:
+        metrics:
+          occurrences_last_hour: 3
+          baseline_per_hour: 0
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_errors_enabled: 0}
+    expect: {fires: false}
+  - case: any_multiple_of_zero
+    description: Even the largest multiple (1000) is exceeded by 3 occurrences against a baseline of 0.
+    settings: {insight_sys_errors_baseline_multiple: 1000}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "backup.py:41"}

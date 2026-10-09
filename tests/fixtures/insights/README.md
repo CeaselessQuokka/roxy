@@ -547,3 +547,64 @@ avoids the boundary wherever two readings could differ):
   caller (`upstream_5xx`, `source: relay`) are UP-5XX's concern.
 - Admin "logins" (SEC-ADMIN-ALLOWLIST) are successful logins; failed attempts never define the admin's networks.
 - A rule (FILTER-COLLATERAL) is a row of a filter table; the per-IP throttle and bans are not rules there.
+
+## Extensions (added by the P10 harness author)
+
+Added after the sections above, as the ground rules ask; no existing field changes meaning.
+
+**The loader.** `tests/insights/harness.py` implements this document. `run_case(name, case=None)` runs one case of
+any file by name (the stem, the file name, or a path), `run_fixture(name)` runs the file and every variant, and
+`fixture_ids(prefixes)` gives the pytest ids `<stem>` and `<stem>[<case>]`. `dry_check(name)` validates a file and
+its `data_checks` without databases. The rule is evaluated through `InsightsEngine.evaluate_rule`, the leader path.
+
+**Where data without a version 1 table goes.** Schema version 2 (`storage/migrations/metrics/0002_insight_history.sql`)
+added tables for most of the provider seams, so the loader writes them where production writes them:
+
+| Fixture field | Destination (read model in `roxy/metrics/read_history.py`) |
+|---|---|
+| `state.buckets[].history` | metrics `bucket_minute`: each stretch's `attempts` and `rejections` spread over its minutes like a traffic `total`, `fill_pct_peak` on every minute |
+| `state.workers[].history` | metrics `worker_minute`, one row per minute of each stretch; `x_cpu_pct` reaches the providers as a row extra of `worker_heartbeat` |
+| `state.cache.stores`, `evictions`, `passes` | metrics `cache_minute` and `cache_eviction_passes` |
+| `events.errors[].occurrences` | metrics `error_minute` (per signature and minute), not `events` rows of type `error` |
+| `events.upstream_attempts` | metrics `upstream_attempt_minute` through `MetricsRecorder.record_attempt` (`status: null` is stored as -1) |
+| `x_last_hit_at` on table rows | metrics `rule_hits` (`table_name`, `rule_key` is the row's primary key); null writes no row |
+| `state.egress.provider_reported_bytes` | metrics `egress_provider_reports`, and the providers' `egress_metering()` |
+| `state.breakers[].openings` | metrics `events` of type `breaker_open`, detail `{key}` (the type `upstream/service.py` records) |
+| `state.credential.probes` | metrics `events` of type `credential_probe`, detail `{kind, status, result}` (`egress/credential.py`) |
+| `events.internal_calls[].trigger` | the `trigger` field of the `internal_call` event detail |
+
+Everything else in "Provider seams" (disk, DNS and the address classifier, tarpit totals, bot scores, the UA
+experiment, the metrics drop counter, metering mode, `x_` sections and other `x_` columns) reaches rules through
+`InsightContext.providers` (`roxy/insights/context.py InsightProviders`).
+
+**Recorder settings during a load.** Request samples come only from `samples` side outputs (the recorder's own
+sampling is off while a fixture loads), and the Live feed rows (`events` of type `live`) are not written; no rule
+reads them. Day and month `egress_usage` buckets are floored in UTC.
+
+## Extensions (added by the rules_abuse_system author)
+
+Added after the sections above, as the ground rules ask; no existing field changes meaning.
+
+**Production request sampling for PLACE-HEAVY and THROTTLE-TUNE.** These two rules measure upstream use per place and
+per client from `request_samples`, which production writes for every proxied request (`request_sample_pct`, default
+100). Fixtures of these rules (`tests/insights/harness.py RECORDER_SAMPLED_RULES`) therefore load with the recorder's
+own sampling at the fixture's `request_sample_pct`, exactly as production records them; the rows hold the fixture
+recorder's client hash (`ip_hash` with the test key), the place id, the egress and the cache state of each request.
+Such fixtures must not use `samples` side outputs (a test enforces it), so the two sources never mix. Every other
+rule's fixtures load as before.
+
+**Where the abuse, system and security rules read their data.** No new fixture section is needed:
+
+| Rule | Fixture fields it reads |
+|---|---|
+| ABUSE-SPAM | `events.security` (`spam_would_ban`, `spam_detected`; detector and subject from `detail`), `tables.bans` (`created_by: auto:<detector>` marks an automatic ban), traffic per client |
+| ABUSE-DIST | `events.security` `spam_detected` with `detail.detector: SPAM-DIST`, traffic per client (the clients whose busiest endpoint is the detection's template), `state.client_scores`, and `state.raw.metrics.fingerprint_user_agents` for the User-Agent text |
+| ABUSE-BOT, FILTER-ADD | traffic per client (`client_ip`), `state.client_scores`, `tables.access_list` (bypass entries are skipped), `tables.bans` (banned clients are skipped) |
+| FILTER-REMOVE | `x_last_hit_at` on filter and access list rows; without it, endpoint and header filters also count a refusal of their reason in the rollups as a hit, and a bypass entry counts traffic from inside its CIDR as use |
+| FILTER-COLLATERAL | traffic refused per place and reason (the recorder's refusal events) and place totals |
+| TARPIT-TUNE, SYS-DISK, SYS-METRICS-DROP | `state.tarpit`, `state.disk`, `state.metrics_pipeline` (provider seams) |
+| SYS-WORKER-SAT, SYS-LOOP-LAG | `state.workers[].history` (metrics `worker_minute`) |
+| SYS-CHANGE-REGRESSION | `state.settings_history` and traffic before and after the change |
+| SYS-HEALTH-FAIL | `state.health` |
+| SEC-ADMIN-ALLOWLIST | `state.admin_logins` |
+| SEC-BYPASS-FOREVER, SEC-DEFAULTS | `tables.access_list`, `settings` |

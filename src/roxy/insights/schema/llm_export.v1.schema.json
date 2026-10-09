@@ -1,0 +1,3428 @@
+{
+  "$defs": {
+    "AnomalyItem": {
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "At"
+        },
+        "baseline": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Baseline"
+        },
+        "metric": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Metric"
+        },
+        "observed": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Observed"
+        },
+        "window": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Window"
+        },
+        "zscore": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Zscore"
+        }
+      },
+      "required": [
+        "at",
+        "metric",
+        "baseline",
+        "observed",
+        "zscore",
+        "window"
+      ],
+      "title": "AnomalyItem",
+      "type": "object"
+    },
+    "Capacity": {
+      "additionalProperties": false,
+      "properties": {
+        "databases": {
+          "items": {
+            "$ref": "#/$defs/DatabaseSize"
+          },
+          "title": "Databases",
+          "type": "array"
+        },
+        "disk_free_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Disk Free Bytes"
+        },
+        "disk_total_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Disk Total Bytes"
+        },
+        "metrics_pipeline": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Metrics Pipeline",
+          "type": "object"
+        },
+        "metrics_pipeline_scope": {
+          "enum": [
+            "this_worker",
+            "unavailable"
+          ],
+          "title": "Metrics Pipeline Scope",
+          "type": "string"
+        },
+        "saturation": {
+          "items": {
+            "$ref": "#/$defs/SaturationRow"
+          },
+          "title": "Saturation",
+          "type": "array"
+        },
+        "workers": {
+          "items": {
+            "$ref": "#/$defs/WorkerRow"
+          },
+          "title": "Workers",
+          "type": "array"
+        }
+      },
+      "required": [
+        "workers",
+        "saturation",
+        "databases",
+        "disk_total_bytes",
+        "disk_free_bytes",
+        "metrics_pipeline",
+        "metrics_pipeline_scope"
+      ],
+      "title": "Capacity",
+      "type": "object"
+    },
+    "CatalogEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "reasons": {
+          "items": {
+            "enum": [
+              "changed",
+              "recommendation",
+              "potential_issue"
+            ],
+            "type": "string"
+          },
+          "title": "Reasons",
+          "type": "array"
+        },
+        "spec": {
+          "additionalProperties": true,
+          "title": "Spec",
+          "type": "object"
+        }
+      },
+      "required": [
+        "key",
+        "reasons",
+        "spec"
+      ],
+      "title": "CatalogEntry",
+      "type": "object"
+    },
+    "ChangeItem": {
+      "additionalProperties": false,
+      "description": "One proposed change (plan 11.2): kind, what it touches, current and proposed values.",
+      "properties": {
+        "bucket_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "category": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Category"
+        },
+        "current": {
+          "title": "Current"
+        },
+        "key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Key"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "match": {
+          "title": "Match"
+        },
+        "proposed": {
+          "title": "Proposed"
+        },
+        "table": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Table"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "key",
+        "table",
+        "bucket_key",
+        "category",
+        "match",
+        "current",
+        "proposed",
+        "text"
+      ],
+      "title": "ChangeItem",
+      "type": "object"
+    },
+    "ChangeRow": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Action"
+        },
+        "after": {
+          "title": "After"
+        },
+        "at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "At"
+        },
+        "before": {
+          "title": "Before"
+        },
+        "by": {
+          "title": "By",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "integer"
+        },
+        "kind": {
+          "enum": [
+            "setting",
+            "rule"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Target"
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "at",
+        "target",
+        "action",
+        "before",
+        "after",
+        "by",
+        "reason",
+        "source"
+      ],
+      "title": "ChangeRow",
+      "type": "object"
+    },
+    "ClientRow": {
+      "additionalProperties": false,
+      "properties": {
+        "bot_score": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Bot Score"
+        },
+        "bytes": {
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "client": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Client"
+        },
+        "rate1": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Rate1"
+        },
+        "rate5": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Rate5"
+        },
+        "rate60": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Rate60"
+        },
+        "refused": {
+          "title": "Refused",
+          "type": "integer"
+        },
+        "refused_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Refused Pct"
+        },
+        "requests": {
+          "title": "Requests",
+          "type": "integer"
+        },
+        "served": {
+          "title": "Served",
+          "type": "integer"
+        },
+        "top_endpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "user_agent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "client",
+        "requests",
+        "refused",
+        "served",
+        "bytes",
+        "refused_pct",
+        "rate1",
+        "rate5",
+        "rate60",
+        "top_endpoint",
+        "user_agent",
+        "bot_score"
+      ],
+      "title": "ClientRow",
+      "type": "object"
+    },
+    "CodeMap": {
+      "additionalProperties": false,
+      "description": "Modules with their first docstring line and public symbols at the running version (plan 12.3).",
+      "properties": {
+        "modules": {
+          "items": {
+            "$ref": "#/$defs/CodeModule"
+          },
+          "title": "Modules",
+          "type": "array"
+        },
+        "root": {
+          "title": "Root",
+          "type": "string"
+        },
+        "symbols_included": {
+          "title": "Symbols Included",
+          "type": "boolean"
+        },
+        "truncated": {
+          "title": "Truncated",
+          "type": "boolean"
+        },
+        "version": {
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "root",
+        "symbols_included",
+        "truncated",
+        "modules"
+      ],
+      "title": "CodeMap",
+      "type": "object"
+    },
+    "CodeModule": {
+      "additionalProperties": false,
+      "properties": {
+        "doc": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Doc"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "symbols": {
+          "items": {
+            "$ref": "#/$defs/CodeSymbol"
+          },
+          "title": "Symbols",
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "doc",
+        "symbols"
+      ],
+      "title": "CodeModule",
+      "type": "object"
+    },
+    "CodeSymbol": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "function",
+            "class",
+            "method"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "line": {
+          "title": "Line",
+          "type": "integer"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "kind",
+        "line"
+      ],
+      "title": "CodeSymbol",
+      "type": "object"
+    },
+    "ConfigSection": {
+      "additionalProperties": false,
+      "properties": {
+        "credential": {
+          "$ref": "#/$defs/CredentialInfo"
+        },
+        "invalid_overrides": {
+          "title": "Invalid Overrides",
+          "type": "integer"
+        },
+        "overridden": {
+          "title": "Overridden",
+          "type": "integer"
+        },
+        "rotator": {
+          "$ref": "#/$defs/RotatorInfo"
+        },
+        "settings": {
+          "items": {
+            "$ref": "#/$defs/SettingEntry"
+          },
+          "title": "Settings",
+          "type": "array"
+        },
+        "shown": {
+          "enum": [
+            "all",
+            "overridden"
+          ],
+          "title": "Shown",
+          "type": "string"
+        },
+        "total": {
+          "title": "Total",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "overridden",
+        "shown",
+        "invalid_overrides",
+        "settings",
+        "credential",
+        "rotator"
+      ],
+      "title": "ConfigSection",
+      "type": "object"
+    },
+    "CredentialInfo": {
+      "additionalProperties": false,
+      "description": "The one Roblox credential, as facts only (never a value, a masked suffix or a fingerprint).",
+      "properties": {
+        "present": {
+          "title": "Present",
+          "type": "boolean"
+        },
+        "set_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Set At"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "present",
+        "status",
+        "set_at"
+      ],
+      "title": "CredentialInfo",
+      "type": "object"
+    },
+    "DatabaseSize": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "shm_bytes": {
+          "title": "Shm Bytes",
+          "type": "integer"
+        },
+        "wal_bytes": {
+          "title": "Wal Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "bytes",
+        "wal_bytes",
+        "shm_bytes"
+      ],
+      "title": "DatabaseSize",
+      "type": "object"
+    },
+    "DegradedItem": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "title": "Detail"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "State"
+        },
+        "subsystem": {
+          "title": "Subsystem",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subsystem",
+        "state",
+        "detail"
+      ],
+      "title": "DegradedItem",
+      "type": "object"
+    },
+    "EgressSection": {
+      "additionalProperties": false,
+      "properties": {
+        "rotator": {
+          "$ref": "#/$defs/RotatorBudget"
+        },
+        "window_bytes": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "propertyNames": {
+            "enum": [
+              "none",
+              "direct",
+              "credential",
+              "rotator"
+            ]
+          },
+          "title": "Window Bytes",
+          "type": "object"
+        }
+      },
+      "required": [
+        "window_bytes",
+        "rotator"
+      ],
+      "title": "EgressSection",
+      "type": "object"
+    },
+    "EndpointRow": {
+      "additionalProperties": false,
+      "properties": {
+        "cache_rule_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cache Rule Id"
+        },
+        "cache_stale_ttl_s": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cache Stale Ttl S"
+        },
+        "cache_ttl_s": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cache Ttl S"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/UntrustedRef"
+        },
+        "hit_ratio": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Hit Ratio"
+        },
+        "p50_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "P50 Ms"
+        },
+        "p95_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "P95 Ms"
+        },
+        "p99_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "P99 Ms"
+        },
+        "requests": {
+          "title": "Requests",
+          "type": "integer"
+        },
+        "roblox_429": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Roblox 429"
+        },
+        "upstream_calls": {
+          "title": "Upstream Calls",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "endpoint",
+        "requests",
+        "upstream_calls",
+        "hit_ratio",
+        "roblox_429",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "cache_rule_id",
+        "cache_ttl_s",
+        "cache_stale_ttl_s"
+      ],
+      "title": "EndpointRow",
+      "type": "object"
+    },
+    "ErrorRow": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "title": "Count",
+          "type": "integer"
+        },
+        "count_in_window": {
+          "title": "Count In Window",
+          "type": "integer"
+        },
+        "first_seen": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "First Seen"
+        },
+        "last_seen": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Seen"
+        },
+        "module_line": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Module Line"
+        },
+        "sample": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "signature": {
+          "$ref": "#/$defs/UntrustedRef"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Source"
+        }
+      },
+      "required": [
+        "signature",
+        "count",
+        "count_in_window",
+        "first_seen",
+        "last_seen",
+        "source",
+        "module_line",
+        "sample"
+      ],
+      "title": "ErrorRow",
+      "type": "object"
+    },
+    "ErrorSample": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "title": "Count",
+          "type": "integer"
+        },
+        "frames": {
+          "title": "Frames",
+          "type": "integer"
+        },
+        "module_line": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Module Line"
+        },
+        "signature": {
+          "$ref": "#/$defs/UntrustedRef"
+        },
+        "traceback": {
+          "items": {
+            "$ref": "#/$defs/UntrustedRef"
+          },
+          "title": "Traceback",
+          "type": "array"
+        }
+      },
+      "required": [
+        "signature",
+        "count",
+        "module_line",
+        "frames",
+        "traceback"
+      ],
+      "title": "ErrorSample",
+      "type": "object"
+    },
+    "EvidenceSection": {
+      "additionalProperties": false,
+      "properties": {
+        "details": {
+          "title": "Details"
+        },
+        "links": {
+          "items": {
+            "$ref": "#/$defs/UntrustedRef"
+          },
+          "title": "Links",
+          "type": "array"
+        },
+        "metrics": {
+          "items": {
+            "$ref": "#/$defs/MetricItem"
+          },
+          "title": "Metrics",
+          "type": "array"
+        },
+        "sample_size": {
+          "title": "Sample Size",
+          "type": "integer"
+        },
+        "window_from": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Window From"
+        },
+        "window_to": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Window To"
+        }
+      },
+      "required": [
+        "window_from",
+        "window_to",
+        "metrics",
+        "sample_size",
+        "links",
+        "details"
+      ],
+      "title": "EvidenceSection",
+      "type": "object"
+    },
+    "FleetColor": {
+      "additionalProperties": false,
+      "properties": {
+        "color": {
+          "title": "Color",
+          "type": "string"
+        },
+        "fresh_workers": {
+          "title": "Fresh Workers",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "color",
+        "fresh_workers"
+      ],
+      "title": "FleetColor",
+      "type": "object"
+    },
+    "HeaderItem": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Name"
+        },
+        "value": {
+          "title": "Value"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "title": "HeaderItem",
+      "type": "object"
+    },
+    "HealthIssue": {
+      "additionalProperties": false,
+      "properties": {
+        "check_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Check Id"
+        },
+        "critical": {
+          "title": "Critical",
+          "type": "boolean"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "integer"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "check_id",
+        "status",
+        "critical",
+        "run_id"
+      ],
+      "title": "HealthIssue",
+      "type": "object"
+    },
+    "HealthLatest": {
+      "additionalProperties": false,
+      "properties": {
+        "finished_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Finished At"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/$defs/HealthResultItem"
+          },
+          "title": "Results",
+          "type": "array"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "integer"
+        },
+        "shown": {
+          "enum": [
+            "all",
+            "not_passing"
+          ],
+          "title": "Shown",
+          "type": "string"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Started At"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "State"
+        },
+        "summary": {
+          "title": "Summary"
+        },
+        "trigger": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Trigger"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Version"
+        }
+      },
+      "required": [
+        "run_id",
+        "trigger",
+        "state",
+        "started_at",
+        "finished_at",
+        "version",
+        "summary",
+        "shown",
+        "results"
+      ],
+      "title": "HealthLatest",
+      "type": "object"
+    },
+    "HealthResultItem": {
+      "additionalProperties": false,
+      "description": "One check of the latest run; Roxy's catalog text inline, what the check found as a reference.",
+      "properties": {
+        "check_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Check Id"
+        },
+        "critical": {
+          "title": "Critical",
+          "type": "boolean"
+        },
+        "detail": {
+          "title": "Detail"
+        },
+        "explanation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Explanation"
+        },
+        "finding": {
+          "items": {
+            "$ref": "#/$defs/UntrustedRef"
+          },
+          "title": "Finding",
+          "type": "array"
+        },
+        "fix_link": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Fix Link"
+        },
+        "measured": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Measured"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "threshold": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Threshold"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Unit"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "check_id",
+        "title",
+        "status",
+        "critical",
+        "measured",
+        "unit",
+        "threshold",
+        "explanation",
+        "finding",
+        "fix_link",
+        "value",
+        "detail"
+      ],
+      "title": "HealthResultItem",
+      "type": "object"
+    },
+    "InsightRuleItem": {
+      "additionalProperties": false,
+      "properties": {
+        "changed": {
+          "title": "Changed",
+          "type": "boolean"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "family": {
+          "title": "Family",
+          "type": "string"
+        },
+        "params": {
+          "items": {
+            "$ref": "#/$defs/RuleParam"
+          },
+          "title": "Params",
+          "type": "array"
+        },
+        "rule_id": {
+          "title": "Rule Id",
+          "type": "string"
+        },
+        "severity": {
+          "title": "Severity",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule_id",
+        "family",
+        "title",
+        "enabled",
+        "severity",
+        "changed",
+        "params"
+      ],
+      "title": "InsightRuleItem",
+      "type": "object"
+    },
+    "Meta": {
+      "additionalProperties": false,
+      "description": "What this file is: schema, version, window, time zone, fleet, uptime and how IP addresses are shown.",
+      "properties": {
+        "catalog_version": {
+          "title": "Catalog Version",
+          "type": "string"
+        },
+        "config_version": {
+          "title": "Config Version",
+          "type": "integer"
+        },
+        "detail": {
+          "enum": [
+            "summary",
+            "full"
+          ],
+          "title": "Detail",
+          "type": "string"
+        },
+        "fleet_uptime_s": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Fleet Uptime S"
+        },
+        "generated_at": {
+          "title": "Generated At",
+          "type": "string"
+        },
+        "generated_by": {
+          "enum": [
+            "api",
+            "leader",
+            "cli",
+            "test"
+          ],
+          "title": "Generated By",
+          "type": "string"
+        },
+        "ip_addresses": {
+          "enum": [
+            "raw",
+            "hashed_stable",
+            "hashed_one_time"
+          ],
+          "title": "Ip Addresses",
+          "type": "string"
+        },
+        "limits": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Limits",
+          "type": "object"
+        },
+        "notes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Notes",
+          "type": "array"
+        },
+        "roxy_version": {
+          "title": "Roxy Version",
+          "type": "string"
+        },
+        "rules_version": {
+          "title": "Rules Version",
+          "type": "integer"
+        },
+        "schema_minor": {
+          "title": "Schema Minor",
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": "roxy.llm_export/1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "timezone": {
+          "title": "Timezone",
+          "type": "string"
+        },
+        "uptime_s": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Uptime S"
+        },
+        "window": {
+          "$ref": "#/$defs/WindowInfo"
+        },
+        "worker_count": {
+          "$ref": "#/$defs/WorkerCount"
+        }
+      },
+      "required": [
+        "schema_version",
+        "schema_minor",
+        "generated_at",
+        "generated_by",
+        "roxy_version",
+        "detail",
+        "window",
+        "timezone",
+        "worker_count",
+        "uptime_s",
+        "fleet_uptime_s",
+        "ip_addresses",
+        "config_version",
+        "rules_version",
+        "catalog_version",
+        "limits",
+        "notes"
+      ],
+      "title": "Meta",
+      "type": "object"
+    },
+    "MetricItem": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Name"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Unit"
+        },
+        "value": {
+          "title": "Value"
+        }
+      },
+      "required": [
+        "name",
+        "value",
+        "unit"
+      ],
+      "title": "MetricItem",
+      "type": "object"
+    },
+    "OpenIssues": {
+      "additionalProperties": false,
+      "properties": {
+        "breakers": {
+          "items": {
+            "$ref": "#/$defs/StateIssue"
+          },
+          "title": "Breakers",
+          "type": "array"
+        },
+        "cooldowns": {
+          "items": {
+            "$ref": "#/$defs/StateIssue"
+          },
+          "title": "Cooldowns",
+          "type": "array"
+        },
+        "degraded": {
+          "items": {
+            "$ref": "#/$defs/DegradedItem"
+          },
+          "title": "Degraded",
+          "type": "array"
+        },
+        "health": {
+          "items": {
+            "$ref": "#/$defs/HealthIssue"
+          },
+          "title": "Health",
+          "type": "array"
+        },
+        "switches": {
+          "$ref": "#/$defs/Switches"
+        }
+      },
+      "required": [
+        "health",
+        "breakers",
+        "cooldowns",
+        "degraded",
+        "switches"
+      ],
+      "title": "OpenIssues",
+      "type": "object"
+    },
+    "ParityRow": {
+      "additionalProperties": false,
+      "properties": {
+        "note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Note"
+        },
+        "row": {
+          "title": "Row",
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "covered",
+            "partial",
+            "changed",
+            "missing",
+            "unknown"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "tests": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Tests",
+          "type": "array"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "row",
+        "title",
+        "status",
+        "note",
+        "tests"
+      ],
+      "title": "ParityRow",
+      "type": "object"
+    },
+    "ParityStatus": {
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "title": "Available",
+          "type": "boolean"
+        },
+        "counts": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Counts",
+          "type": "object"
+        },
+        "rows": {
+          "items": {
+            "$ref": "#/$defs/ParityRow"
+          },
+          "title": "Rows",
+          "type": "array"
+        },
+        "shown": {
+          "enum": [
+            "all",
+            "not_covered"
+          ],
+          "title": "Shown",
+          "type": "string"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source"
+        }
+      },
+      "required": [
+        "available",
+        "source",
+        "counts",
+        "shown",
+        "rows"
+      ],
+      "title": "ParityStatus",
+      "type": "object"
+    },
+    "PotentialIssue": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "setting_high_risk",
+            "setting_near_risky",
+            "cap_over_80_pct",
+            "rule_zero_hits",
+            "health_config",
+            "dismissed_not_accurate"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "subject": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Subject"
+        },
+        "value": {
+          "title": "Value"
+        }
+      },
+      "required": [
+        "kind",
+        "subject",
+        "message",
+        "value"
+      ],
+      "title": "PotentialIssue",
+      "type": "object"
+    },
+    "RecommendationItem": {
+      "additionalProperties": false,
+      "description": "One recommendation (plan 11.2); its subject and texts can quote caller strings, so they are references.",
+      "properties": {
+        "changes": {
+          "items": {
+            "$ref": "#/$defs/ChangeItem"
+          },
+          "title": "Changes",
+          "type": "array"
+        },
+        "computed_severity": {
+          "title": "Computed Severity",
+          "type": "string"
+        },
+        "confidence": {
+          "title": "Confidence",
+          "type": "string"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created At"
+        },
+        "dismissed_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Dismissed Reason"
+        },
+        "dry_run_available": {
+          "title": "Dry Run Available",
+          "type": "boolean"
+        },
+        "evidence": {
+          "$ref": "#/$defs/EvidenceSection"
+        },
+        "expected_impact": {
+          "items": {
+            "$ref": "#/$defs/UntrustedRef"
+          },
+          "title": "Expected Impact",
+          "type": "array"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expires At"
+        },
+        "explanation": {
+          "items": {
+            "$ref": "#/$defs/UntrustedRef"
+          },
+          "title": "Explanation",
+          "type": "array"
+        },
+        "family": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Family"
+        },
+        "fingerprint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Fingerprint"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Id"
+        },
+        "risk": {
+          "title": "Risk",
+          "type": "string"
+        },
+        "rule_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Rule Id"
+        },
+        "safe_auto": {
+          "title": "Safe Auto",
+          "type": "boolean"
+        },
+        "severity": {
+          "title": "Severity",
+          "type": "string"
+        },
+        "snoozed_until": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Snoozed Until"
+        },
+        "state": {
+          "title": "State",
+          "type": "string"
+        },
+        "subject": {
+          "$ref": "#/$defs/UntrustedRef"
+        },
+        "title": {
+          "$ref": "#/$defs/UntrustedRef"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Updated At"
+        }
+      },
+      "required": [
+        "id",
+        "rule_id",
+        "family",
+        "fingerprint",
+        "state",
+        "severity",
+        "computed_severity",
+        "confidence",
+        "risk",
+        "safe_auto",
+        "dry_run_available",
+        "subject",
+        "title",
+        "explanation",
+        "expected_impact",
+        "evidence",
+        "changes",
+        "created_at",
+        "updated_at",
+        "expires_at",
+        "snoozed_until",
+        "dismissed_reason"
+      ],
+      "title": "RecommendationItem",
+      "type": "object"
+    },
+    "RollupBucket": {
+      "additionalProperties": false,
+      "properties": {
+        "avoided_upstream_calls": {
+          "title": "Avoided Upstream Calls",
+          "type": "integer"
+        },
+        "caller_bytes_in": {
+          "title": "Caller Bytes In",
+          "type": "integer"
+        },
+        "caller_bytes_out": {
+          "title": "Caller Bytes Out",
+          "type": "integer"
+        },
+        "p50_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "P50 Ms"
+        },
+        "p95_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "P95 Ms"
+        },
+        "p99_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "P99 Ms"
+        },
+        "requests": {
+          "title": "Requests",
+          "type": "integer"
+        },
+        "roblox_429_by_egress": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "propertyNames": {
+            "enum": [
+              "none",
+              "direct",
+              "credential",
+              "rotator"
+            ]
+          },
+          "title": "Roblox 429 By Egress",
+          "type": "object"
+        },
+        "rotator_bytes": {
+          "title": "Rotator Bytes",
+          "type": "integer"
+        },
+        "start": {
+          "title": "Start",
+          "type": "string"
+        },
+        "status_5xx": {
+          "title": "Status 5Xx",
+          "type": "integer"
+        },
+        "timeouts": {
+          "title": "Timeouts",
+          "type": "integer"
+        },
+        "upstream_bytes_in": {
+          "title": "Upstream Bytes In",
+          "type": "integer"
+        },
+        "upstream_bytes_out": {
+          "title": "Upstream Bytes Out",
+          "type": "integer"
+        },
+        "upstream_calls": {
+          "title": "Upstream Calls",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start",
+        "requests",
+        "avoided_upstream_calls",
+        "upstream_calls",
+        "roblox_429_by_egress",
+        "status_5xx",
+        "timeouts",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "caller_bytes_in",
+        "caller_bytes_out",
+        "upstream_bytes_in",
+        "upstream_bytes_out",
+        "rotator_bytes"
+      ],
+      "title": "RollupBucket",
+      "type": "object"
+    },
+    "Rollups": {
+      "additionalProperties": false,
+      "properties": {
+        "buckets": {
+          "items": {
+            "$ref": "#/$defs/RollupBucket"
+          },
+          "title": "Buckets",
+          "type": "array"
+        },
+        "unit": {
+          "enum": [
+            "hour",
+            "day"
+          ],
+          "title": "Unit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "unit",
+        "buckets"
+      ],
+      "title": "Rollups",
+      "type": "object"
+    },
+    "RotatorBudget": {
+      "additionalProperties": false,
+      "description": "This billing cycle of the rotator (plan 8.4): used, projected with its band, quota and cost.",
+      "properties": {
+        "configured": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Configured"
+        },
+        "cost_so_far_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cost So Far Usd"
+        },
+        "cycle_end": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cycle End"
+        },
+        "cycle_start": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cycle Start"
+        },
+        "projected_cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Projected Cost Usd"
+        },
+        "projected_pct_of_quota": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Projected Pct Of Quota"
+        },
+        "projection": {
+          "$ref": "#/$defs/RotatorProjection"
+        },
+        "quota_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Quota Bytes"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "remaining_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Remaining Bytes"
+        },
+        "today_bytes": {
+          "title": "Today Bytes",
+          "type": "integer"
+        },
+        "usable": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Usable"
+        },
+        "used_bytes": {
+          "title": "Used Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "configured",
+        "usable",
+        "reason",
+        "cycle_start",
+        "cycle_end",
+        "used_bytes",
+        "today_bytes",
+        "quota_bytes",
+        "remaining_bytes",
+        "projection",
+        "projected_pct_of_quota",
+        "cost_so_far_usd",
+        "projected_cost_usd"
+      ],
+      "title": "RotatorBudget",
+      "type": "object"
+    },
+    "RotatorInfo": {
+      "additionalProperties": false,
+      "description": "The rotator gateway as its host name only (the URL carries a password).",
+      "properties": {
+        "configured": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Configured"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Host"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source"
+        }
+      },
+      "required": [
+        "configured",
+        "host",
+        "source"
+      ],
+      "title": "RotatorInfo",
+      "type": "object"
+    },
+    "RotatorProjection": {
+      "additionalProperties": false,
+      "description": "`egress/read_state.project_cycle`: the end-of-cycle estimate with its 90 percent band when there is one.",
+      "properties": {
+        "band": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Band"
+        },
+        "band_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Band Reason"
+        },
+        "cycle_rate_bytes_per_day": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cycle Rate Bytes Per Day"
+        },
+        "days_elapsed": {
+          "title": "Days Elapsed",
+          "type": "number"
+        },
+        "days_left": {
+          "title": "Days Left",
+          "type": "number"
+        },
+        "high_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "High Bytes"
+        },
+        "low_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Low Bytes"
+        },
+        "projected_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Projected Bytes"
+        },
+        "rate_bytes_per_day": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Rate Bytes Per Day"
+        },
+        "trailing_days": {
+          "title": "Trailing Days",
+          "type": "integer"
+        },
+        "trailing_rate_bytes_per_day": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Trailing Rate Bytes Per Day"
+        },
+        "used_bytes": {
+          "title": "Used Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "used_bytes",
+        "days_elapsed",
+        "days_left",
+        "trailing_days",
+        "trailing_rate_bytes_per_day",
+        "cycle_rate_bytes_per_day",
+        "rate_bytes_per_day",
+        "projected_bytes",
+        "low_bytes",
+        "high_bytes",
+        "band",
+        "band_reason"
+      ],
+      "title": "RotatorProjection",
+      "type": "object"
+    },
+    "RuleParam": {
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "title": "Default"
+        },
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "unit": {
+          "title": "Unit",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value"
+        }
+      },
+      "required": [
+        "name",
+        "key",
+        "value",
+        "default",
+        "unit"
+      ],
+      "title": "RuleParam",
+      "type": "object"
+    },
+    "RuleTableSection": {
+      "additionalProperties": false,
+      "description": "One rule table: its rows with outside text referenced, IP addresses hashed.",
+      "properties": {
+        "cap": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cap"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "rows": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Rows",
+          "type": "array"
+        },
+        "table": {
+          "title": "Table",
+          "type": "string"
+        },
+        "total": {
+          "title": "Total",
+          "type": "integer"
+        },
+        "truncated": {
+          "title": "Truncated",
+          "type": "boolean"
+        },
+        "withheld": {
+          "title": "Withheld",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "table",
+        "label",
+        "total",
+        "cap",
+        "truncated",
+        "withheld",
+        "rows"
+      ],
+      "title": "RuleTableSection",
+      "type": "object"
+    },
+    "RulesSection": {
+      "additionalProperties": false,
+      "properties": {
+        "tables": {
+          "items": {
+            "$ref": "#/$defs/RuleTableSection"
+          },
+          "title": "Tables",
+          "type": "array"
+        },
+        "version": {
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "version",
+        "tables"
+      ],
+      "title": "RulesSection",
+      "type": "object"
+    },
+    "SaturationRow": {
+      "additionalProperties": false,
+      "properties": {
+        "cpu_pct_avg": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cpu Pct Avg"
+        },
+        "cpu_pct_max": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cpu Pct Max"
+        },
+        "loop_lag_ms_p99_max": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Loop Lag Ms P99 Max"
+        },
+        "minutes": {
+          "title": "Minutes",
+          "type": "integer"
+        },
+        "pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pid"
+        },
+        "rss_max": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Rss Max"
+        }
+      },
+      "required": [
+        "pid",
+        "minutes",
+        "cpu_pct_avg",
+        "cpu_pct_max",
+        "loop_lag_ms_p99_max",
+        "rss_max"
+      ],
+      "title": "SaturationRow",
+      "type": "object"
+    },
+    "SettingEntry": {
+      "additionalProperties": false,
+      "description": "One runtime setting: value, default, when and by which kind of actor it last changed.",
+      "properties": {
+        "apply": {
+          "title": "Apply",
+          "type": "string"
+        },
+        "changed_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Changed At"
+        },
+        "changed_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Changed By"
+        },
+        "default": {
+          "title": "Default"
+        },
+        "group": {
+          "title": "Group",
+          "type": "string"
+        },
+        "high_risk_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "High Risk Reason"
+        },
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "overridden": {
+          "title": "Overridden",
+          "type": "boolean"
+        },
+        "risk": {
+          "title": "Risk",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value"
+        }
+      },
+      "required": [
+        "key",
+        "group",
+        "value",
+        "default",
+        "overridden",
+        "changed_at",
+        "changed_by",
+        "risk",
+        "high_risk_reason",
+        "apply"
+      ],
+      "title": "SettingEntry",
+      "type": "object"
+    },
+    "StateIssue": {
+      "additionalProperties": false,
+      "description": "An open breaker or an active cooldown (`kind`, `egress` and `target` from `upstream/read_state.describe_key`).",
+      "properties": {
+        "egress": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Egress"
+        },
+        "failures": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Failures"
+        },
+        "hits": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Hits"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "remaining_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Remaining S"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source"
+        },
+        "state": {
+          "title": "State",
+          "type": "string"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Target"
+        }
+      },
+      "required": [
+        "kind",
+        "egress",
+        "target",
+        "state",
+        "failures",
+        "remaining_s",
+        "hits",
+        "source"
+      ],
+      "title": "StateIssue",
+      "type": "object"
+    },
+    "Switches": {
+      "additionalProperties": false,
+      "properties": {
+        "paused": {
+          "title": "Paused",
+          "type": "boolean"
+        },
+        "throttle_all": {
+          "title": "Throttle All",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "paused",
+        "throttle_all"
+      ],
+      "title": "Switches",
+      "type": "object"
+    },
+    "TopClients": {
+      "additionalProperties": false,
+      "properties": {
+        "ips": {
+          "items": {
+            "$ref": "#/$defs/ClientRow"
+          },
+          "title": "Ips",
+          "type": "array"
+        },
+        "places": {
+          "items": {
+            "$ref": "#/$defs/ClientRow"
+          },
+          "title": "Places",
+          "type": "array"
+        },
+        "user_agents": {
+          "items": {
+            "$ref": "#/$defs/UserAgentRow"
+          },
+          "title": "User Agents",
+          "type": "array"
+        }
+      },
+      "required": [
+        "places",
+        "ips",
+        "user_agents"
+      ],
+      "title": "TopClients",
+      "type": "object"
+    },
+    "TopEndpoints": {
+      "additionalProperties": false,
+      "properties": {
+        "by_requests": {
+          "items": {
+            "$ref": "#/$defs/EndpointRow"
+          },
+          "title": "By Requests",
+          "type": "array"
+        },
+        "by_upstream_calls": {
+          "items": {
+            "$ref": "#/$defs/EndpointRow"
+          },
+          "title": "By Upstream Calls",
+          "type": "array"
+        }
+      },
+      "required": [
+        "by_requests",
+        "by_upstream_calls"
+      ],
+      "title": "TopEndpoints",
+      "type": "object"
+    },
+    "UntrustedItem": {
+      "additionalProperties": false,
+      "description": "One attacker-controllable string: redacted, IP addresses hashed, cut to 200 characters, controls escaped.",
+      "properties": {
+        "id": {
+          "pattern": "^u[0-9]{1,6}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "pattern": "^[a-z_]{1,40}$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "length": {
+          "minimum": 0,
+          "title": "Length",
+          "type": "integer"
+        },
+        "truncated": {
+          "title": "Truncated",
+          "type": "boolean"
+        },
+        "untrusted_text": {
+          "title": "Untrusted Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "untrusted_text",
+        "length",
+        "truncated"
+      ],
+      "title": "UntrustedItem",
+      "type": "object"
+    },
+    "UntrustedRef": {
+      "additionalProperties": false,
+      "description": "A reference to one entry of `untrusted`: the outside text is never inlined next to Roxy's own words.",
+      "properties": {
+        "untrusted_ref": {
+          "pattern": "^(u[0-9]{1,6}|omitted)$",
+          "title": "Untrusted Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "untrusted_ref"
+      ],
+      "title": "UntrustedRef",
+      "type": "object"
+    },
+    "Upstream429Row": {
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "At"
+        },
+        "egress": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Egress"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/UntrustedRef"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            }
+          ],
+          "title": "Host"
+        },
+        "ratelimit_headers": {
+          "items": {
+            "$ref": "#/$defs/HeaderItem"
+          },
+          "title": "Ratelimit Headers",
+          "type": "array"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Request Id"
+        },
+        "retry_after_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Retry After S"
+        }
+      },
+      "required": [
+        "at",
+        "endpoint",
+        "host",
+        "egress",
+        "retry_after_s",
+        "ratelimit_headers",
+        "request_id"
+      ],
+      "title": "Upstream429Row",
+      "type": "object"
+    },
+    "UserAgentRow": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "title": "Count",
+          "type": "integer"
+        },
+        "first_seen": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "First Seen"
+        },
+        "last_seen": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Seen"
+        },
+        "ua_hash": {
+          "title": "Ua Hash",
+          "type": "string"
+        },
+        "user_agent": {
+          "$ref": "#/$defs/UntrustedRef"
+        }
+      },
+      "required": [
+        "user_agent",
+        "ua_hash",
+        "count",
+        "first_seen",
+        "last_seen"
+      ],
+      "title": "UserAgentRow",
+      "type": "object"
+    },
+    "WindowInfo": {
+      "additionalProperties": false,
+      "description": "The window the export covers (UTC times).",
+      "properties": {
+        "end": {
+          "title": "End",
+          "type": "string"
+        },
+        "granularity": {
+          "title": "Granularity",
+          "type": "string"
+        },
+        "key": {
+          "enum": [
+            "24h",
+            "7d",
+            "30d"
+          ],
+          "title": "Key",
+          "type": "string"
+        },
+        "rollup_unit": {
+          "enum": [
+            "hour",
+            "day"
+          ],
+          "title": "Rollup Unit",
+          "type": "string"
+        },
+        "start": {
+          "title": "Start",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "start",
+        "end",
+        "granularity",
+        "rollup_unit"
+      ],
+      "title": "WindowInfo",
+      "type": "object"
+    },
+    "WorkerCount": {
+      "additionalProperties": false,
+      "properties": {
+        "colors": {
+          "items": {
+            "$ref": "#/$defs/FleetColor"
+          },
+          "title": "Colors",
+          "type": "array"
+        },
+        "expected_per_color": {
+          "title": "Expected Per Color",
+          "type": "integer"
+        },
+        "fresh": {
+          "title": "Fresh",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "expected_per_color",
+        "fresh",
+        "colors"
+      ],
+      "title": "WorkerCount",
+      "type": "object"
+    },
+    "WorkerRow": {
+      "additionalProperties": false,
+      "properties": {
+        "color": {
+          "title": "Color",
+          "type": "string"
+        },
+        "inflight_upstream": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Inflight Upstream"
+        },
+        "is_leader": {
+          "title": "Is Leader",
+          "type": "boolean"
+        },
+        "loop_lag_ms_p99": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Loop Lag Ms P99"
+        },
+        "open_connections": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Open Connections"
+        },
+        "pid": {
+          "title": "Pid",
+          "type": "integer"
+        },
+        "proxied": {
+          "title": "Proxied",
+          "type": "integer"
+        },
+        "requests": {
+          "title": "Requests",
+          "type": "integer"
+        },
+        "rss_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Rss Bytes"
+        },
+        "uptime_s": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Uptime S"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/UntrustedRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Version"
+        }
+      },
+      "required": [
+        "pid",
+        "color",
+        "is_leader",
+        "uptime_s",
+        "rss_bytes",
+        "loop_lag_ms_p99",
+        "open_connections",
+        "inflight_upstream",
+        "requests",
+        "proxied",
+        "version"
+      ],
+      "title": "WorkerRow",
+      "type": "object"
+    }
+  },
+  "$id": "urn:roxy:schema:llm_export:1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The plan 12.3 document. Every string under `untrusted` came from outside Roxy; see `instructions` rule 0.",
+  "properties": {
+    "anomalies": {
+      "items": {
+        "$ref": "#/$defs/AnomalyItem"
+      },
+      "title": "Anomalies",
+      "type": "array"
+    },
+    "capacity": {
+      "$ref": "#/$defs/Capacity"
+    },
+    "catalog": {
+      "items": {
+        "$ref": "#/$defs/CatalogEntry"
+      },
+      "title": "Catalog",
+      "type": "array"
+    },
+    "changes": {
+      "items": {
+        "$ref": "#/$defs/ChangeRow"
+      },
+      "title": "Changes",
+      "type": "array"
+    },
+    "code_map": {
+      "$ref": "#/$defs/CodeMap"
+    },
+    "config": {
+      "$ref": "#/$defs/ConfigSection"
+    },
+    "egress": {
+      "$ref": "#/$defs/EgressSection"
+    },
+    "error_samples": {
+      "items": {
+        "$ref": "#/$defs/ErrorSample"
+      },
+      "title": "Error Samples",
+      "type": "array"
+    },
+    "errors": {
+      "items": {
+        "$ref": "#/$defs/ErrorRow"
+      },
+      "title": "Errors",
+      "type": "array"
+    },
+    "health_latest": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HealthLatest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "insight_rule_config": {
+      "items": {
+        "$ref": "#/$defs/InsightRuleItem"
+      },
+      "title": "Insight Rule Config",
+      "type": "array"
+    },
+    "instructions": {
+      "title": "Instructions",
+      "type": "string"
+    },
+    "meta": {
+      "$ref": "#/$defs/Meta"
+    },
+    "open_issues": {
+      "$ref": "#/$defs/OpenIssues"
+    },
+    "parity_status": {
+      "$ref": "#/$defs/ParityStatus"
+    },
+    "potential_issues": {
+      "items": {
+        "$ref": "#/$defs/PotentialIssue"
+      },
+      "title": "Potential Issues",
+      "type": "array"
+    },
+    "recommendations": {
+      "items": {
+        "$ref": "#/$defs/RecommendationItem"
+      },
+      "title": "Recommendations",
+      "type": "array"
+    },
+    "rollups": {
+      "$ref": "#/$defs/Rollups"
+    },
+    "rules": {
+      "$ref": "#/$defs/RulesSection"
+    },
+    "schema_minor": {
+      "title": "Schema Minor",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": "roxy.llm_export/1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "top_clients": {
+      "$ref": "#/$defs/TopClients"
+    },
+    "top_endpoints": {
+      "$ref": "#/$defs/TopEndpoints"
+    },
+    "untrusted": {
+      "items": {
+        "$ref": "#/$defs/UntrustedItem"
+      },
+      "title": "Untrusted",
+      "type": "array"
+    },
+    "upstream_429_samples": {
+      "items": {
+        "$ref": "#/$defs/Upstream429Row"
+      },
+      "title": "Upstream 429 Samples",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "schema_minor",
+    "meta",
+    "instructions",
+    "config",
+    "rules",
+    "recommendations",
+    "open_issues",
+    "anomalies",
+    "rollups",
+    "top_endpoints",
+    "top_clients",
+    "errors",
+    "upstream_429_samples",
+    "egress",
+    "capacity",
+    "changes",
+    "catalog",
+    "insight_rule_config",
+    "health_latest",
+    "error_samples",
+    "parity_status",
+    "potential_issues",
+    "code_map",
+    "untrusted"
+  ],
+  "title": "LlmExport",
+  "type": "object"
+}

@@ -15,9 +15,10 @@ How it works
     Startup order (DESIGN.md section 1): env -> logging -> open databases -> schema check of control, hot and
     metrics (or development auto-migrate) -> cache.db quick check and rebuild, then its schema check -> settings
     -> rules -> alerts (the notifier) -> egress clients -> recorder and batch writer -> upstream service -> cache
-    -> abuse pipeline -> error hooks -> heartbeat -> leader loop and jobs -> config watcher -> SSE tail. Each step
-    is a small function; each step that acquires something registers its cleanup on an `AsyncExitStack`, so
-    shutdown runs the cleanups in exactly the reverse order, and a failure halfway through startup still cleans
+    -> abuse pipeline -> error hooks -> insights (the recommendations engine, its actions, the auto-applier and the
+    health runner) -> heartbeat (with the loop lag monitor) -> leader loop and jobs -> config watcher -> SSE tail.
+    Each step is a small function; each step that acquires something registers its cleanup on an `AsyncExitStack`,
+    so shutdown runs the cleanups in exactly the reverse order, and a failure halfway through startup still cleans
     up what was already opened.
     The request path packages come in dependency order: the notifier first (the egress reports leak trips to it),
     the egress before the recorder (whatever its accounting buffered meanwhile is handed over), the recorder
@@ -90,11 +91,15 @@ if TYPE_CHECKING:
     from roxy.cache.service import CacheService
     from roxy.config.runtime import RuntimeSettings
     from roxy.egress.clients import EgressClients
+    from roxy.health.runner import HealthRunner
+    from roxy.insights.actions import RecommendationActions
+    from roxy.insights.autoapply import AutoApplier
+    from roxy.insights.engine import InsightsEngine
     from roxy.metrics.live import EventTail
     from roxy.metrics.recorder import MetricsRecorder
     from roxy.notify.notifier import Notifier
     from roxy.rules.store import RulesStore
-    from roxy.scheduler.heartbeat import HeartbeatReporter
+    from roxy.scheduler.heartbeat import HeartbeatReporter, LoopLagMonitor
     from roxy.scheduler.jobs import JobRegistry, JobRunner
     from roxy.scheduler.leader import LeaderElector
     from roxy.storage.db import Databases
@@ -278,6 +283,12 @@ class AppContext:
     startup_steps: list[str] = field(default_factory=list)  # step names in the order they ran (tests, /internal)
     # Added by the wave 2 wiring:
     live_tail: EventTail | None = None  # the per-worker `events` tail the SSE endpoints subscribe to (plan 14.11)
+    # Added by the wave 3b wiring (step "insights"; every worker builds them, only the leader runs their jobs):
+    insights: InsightsEngine | None = None  # the recommendations engine (plan 11.1)
+    insight_actions: RecommendationActions | None = None  # apply, undo, snooze, dismiss (plan 11.3)
+    auto_apply: AutoApplier | None = None  # the D7 auto-apply mode and its watch windows (plan 11.4)
+    health: HealthRunner | None = None  # Check Proxy Health (plan 13.1)
+    loop_lag: LoopLagMonitor | None = None  # event loop lag samples for the heartbeat and H-LOOP-LAG
 
 
 class CatalogDefaultsSettings:
@@ -578,8 +589,20 @@ async def _start_heartbeat_and_leader(ctx: AppContext, stack: AsyncExitStack) ->
         info = heartbeat_mod.WorkerInfo.current(
             ctx.worker_id, ctx.color, ctx.started_at, max_requests=ctx.env.max_requests, version=ctx.release
         )
+        # Loop lag (plan 5.6): sampled every 250 ms, reported as a p99 in the heartbeat row (H-LOOP-LAG reads it).
+        lag = heartbeat_mod.LoopLagMonitor()
+        ctx.loop_lag = lag
+        _start_loop(ctx, stack, "loop_lag", lag.run)
+        recorder = ctx.recorder
+        worker_id = ctx.worker_id
+
+        def worker_sample(values: dict[str, Any]) -> None:
+            # The per-minute worker history (SYS-WORKER-SAT, SYS-LOOP-LAG); in memory, flushed with the metrics.
+            if recorder is not None:
+                recorder.record_worker_sample(worker_id=worker_id, **values)
+
         reporter = heartbeat_mod.HeartbeatReporter(
-            ctx.dbs.metrics, info, ctx.clock, is_leader=lambda: elector.is_leader
+            ctx.dbs.metrics, info, ctx.clock, is_leader=lambda: elector.is_leader, lag=lag, on_sample=worker_sample
         )
         ctx.heartbeat = reporter
         _start_loop(ctx, stack, "heartbeat", reporter.run)
@@ -600,7 +623,7 @@ async def _start_heartbeat_and_leader(ctx: AppContext, stack: AsyncExitStack) ->
             # `setting` lets the daily job read `maintenance_hour` and `ui_timezone` live on every run.
             register(registry, ctx.dbs, policy, state_dir=ctx.env.state_dir, setting=settings.get)
         _register_package_jobs(ctx, registry)
-        # Hook (P10, P2): insights, health check auto-runs and alert digests register their jobs here.
+        _register_wave3_jobs(ctx, registry)
         runner = jobs_mod.JobRunner(registry, elector, ctx.clock, worker_id=ctx.worker_id)
         ctx.jobs = runner
         _start_loop(ctx, stack, "jobs", runner.run)
@@ -637,7 +660,7 @@ def _register_package_jobs(ctx: AppContext, registry: JobRegistry) -> None:
 
     async def liveness(job_ctx: Any) -> dict[str, Any]:
         # Paced by the reserved probe sub-bucket (row 28): the upstream layer's fetcher, never the bare client.
-        result = await egress.credential.probe("liveness", fetch=upstream.credential_probe_fetch)
+        result = await egress.credential.probe("liveness", fetch=upstream.probe_fetch_for("liveness"))
         return {"outcome": result.outcome, "status_code": result.status_code}
 
     registry.add(
@@ -650,6 +673,58 @@ def _register_package_jobs(ctx: AppContext, registry: JobRegistry) -> None:
             description="Check that the Roblox credential still works (one account call, plan 5.6 and 13.2).",
         )
     )
+
+
+def _register_wave3_jobs(ctx: AppContext, registry: JobRegistry) -> None:
+    """Jobs of the diagnostics and admin packages (P9, P10), each skipped while its package is not wired.
+
+    Leader-only: the recommendations engine (`insights_*`: evaluation every `insights_interval_s`, early runs on
+    trigger events, anomalies, history pruning, and the D7 auto-apply and watch jobs), Check Proxy Health
+    (`health_scheduled_run` polls every 5 minutes and runs every `health_auto_interval_h` hours;
+    `health_publish_jobs` publishes the leader's job status every 30 s for H-LEADER) and the hourly LLM export file
+    (`llm_export_file`). Per worker: `admin_requests_watch` (every second), which carries out a forced flush or an
+    in-memory reset an admin asked for in another worker. Intervals are read live from the catalog settings where
+    one exists, so a settings change applies without a restart.
+    """
+    insights_mod = optional_import("roxy.insights")
+    if insights_mod is not None and ctx.insights is not None:
+        insights_mod.register_jobs(registry, ctx.insights, actions=ctx.insight_actions, auto=ctx.auto_apply)
+    health_mod = optional_import("roxy.health.runner")
+    if health_mod is not None and ctx.health is not None:
+        health_mod.register_jobs(registry, ctx)
+    llm_mod = optional_import("roxy.insights.llm_export")
+    if llm_mod is not None and ctx.recorder is not None:
+        llm_mod.register_jobs(registry, ctx)
+    system_api = optional_import("roxy.admin.api.system")
+    if system_api is not None:
+        system_api.register_jobs(registry, ctx)
+
+
+def _start_insights(ctx: AppContext) -> None:
+    """Step "insights": the recommendations engine, its audited actions, the auto-applier and the health runner.
+
+    Every worker builds them, because the Recommendations and Health APIs answer from any worker; only the leader
+    runs their jobs (registered in the jobs step). The actions write through the same settings service the
+    settings API uses (`settings_service.service_for`: sensitive values fingerprinted with the shared key), so an
+    applied recommendation leaves the same audit trail as a manual edit.
+    """
+    engine_mod = optional_import("roxy.insights.engine")
+    if engine_mod is None or ctx.dbs is None or ctx.rules is None:
+        log.info("insights_not_built")
+        return
+    actions_mod = optional_import("roxy.insights.actions")
+    autoapply_mod = optional_import("roxy.insights.autoapply")
+    engine = engine_mod.InsightsEngine.from_context(ctx)
+    ctx.insights = engine
+    if actions_mod is not None:
+        ctx.insight_actions = actions_mod.RecommendationActions.from_context(ctx, engine)
+        if autoapply_mod is not None:
+            ctx.auto_apply = autoapply_mod.AutoApplier(
+                engine=engine, actions=ctx.insight_actions, notifier=ctx.alerts, clock=ctx.clock
+            )
+    health_mod = optional_import("roxy.health.runner")
+    if health_mod is not None:
+        ctx.health = health_mod.runner_for(ctx)
 
 
 async def _start_alerts(ctx: AppContext, stack: AsyncExitStack) -> None:
@@ -868,6 +943,8 @@ async def _startup(app: FastAPI, env: EnvSettings, clock: Clock, stack: AsyncExi
         await _start_abuse(ctx, stack)
     with _step(steps, "error_hooks"):
         _install_error_hooks(app)
+    with _step(steps, "insights"):
+        _start_insights(ctx)
     if dbs is not None:
         await _start_heartbeat_and_leader(ctx, stack)
     with _step(steps, "config_watcher"):

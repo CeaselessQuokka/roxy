@@ -36,6 +36,7 @@ STARTUP_ORDER = [
     "cache",
     "abuse",
     "error_hooks",
+    "insights",
     "heartbeat",
     "leader",
     "jobs",

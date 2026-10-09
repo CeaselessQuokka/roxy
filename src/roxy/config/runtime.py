@@ -40,6 +40,7 @@ import inspect
 import json
 import logging
 import sqlite3
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from types import MappingProxyType
 from typing import Any, Final, Protocol
@@ -333,7 +334,14 @@ class RuntimeSettings:
             self._snapshot = new
             changed = new.changed_keys(old)
         if changed:
-            log.info("settings_reloaded", extra={"fields": {"version": new.version, "changed": sorted(changed)[:50]}})
+            # `monotonic_s` (CLOCK_MONOTONIC, the same clock in every process of the host) lets a test or an operator
+            # time how long a change took to reach each worker even while the wall clock steps.
+            fields = {
+                "version": new.version,
+                "changed": sorted(changed)[:50],
+                "monotonic_s": round(time.monotonic(), 3),
+            }
+            log.info("settings_reloaded", extra={"fields": fields})
             await self._notify(new, changed)
         return new
 

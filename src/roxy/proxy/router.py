@@ -37,7 +37,9 @@ How it works
        refusal (the challenge page) is switched back to the page CSP, because its script runs with this response's
        nonce (`req.csp_nonce`).
     6. Allow: an invalid target is refused even if the pipeline let it through (defense in depth: the SSRF guard
-       must not depend on another module's check order). Then `ctx.cache.serve(req, peek)` returns the result
+       must not depend on another module's check order). The request's header names, values and User-Agent are
+       counted (`record_fingerprint`, parity row 79; a request filter's refusal counts as a blocked fingerprint,
+       row 134). Then `ctx.cache.serve(req, peek)` returns the result
        (falling back to `ctx.upstream.fetch` only while no cache service exists). A pacing failure that tells the
        caller to wait (`Retry-After` on a Roblox cooldown, upstream busy or queue full answer) is handed to
        `tarpit.plan_cooldown_retry`, which remembers it fleet-wide and, when this answer is itself a retry of the
@@ -66,6 +68,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import functools
+import hashlib
 import inspect
 import logging
 import sqlite3
@@ -336,6 +339,9 @@ class ProxyFlow:
                 extra={"fields": {"problem": req.target_problem.value, "detail": req.target_detail}},
             )
             return await self.refuse(req, respond.target_refusal(req.target_problem), peek)
+        # Passed every check: its header names, values and User-Agent are counted (parity row 79, v1 logged them
+        # right before the cache lookup and the upstream call).
+        self.note_fingerprint(req)
         if peek is None:
             peek = await self.peek(req)  # the late peek (step 4): only an allowed request pays for the cache read
         result = await self.serve(req, peek)
@@ -391,6 +397,8 @@ class ProxyFlow:
             reason = ReasonCode.THROTTLED_CACHE if rendered.outcome is Outcome.SERVED_CACHE else None
             return await self.finish(req, rendered, result, reason=reason)
         self.refusal = refusal
+        if getattr(refusal, "reason", None) == ReasonCode.HEADER_RULE:
+            self.note_fingerprint(req, blocked=True)  # a request filter's catch: the blocked fingerprints (row 134)
         rendered = respond.render_refusal(req, refusal, cors_any_origin=self.cors_any_origin)
         if rendered.page:
             # Roxy's own HTML page (the challenge): its script runs under the page CSP and this response's nonce.
@@ -447,6 +455,21 @@ class ProxyFlow:
             )
         except SharedStateUnavailable:
             return None  # C7: without shared state the tarpit never holds
+
+    def note_fingerprint(self, req: ProxyRequest, *, blocked: bool = False) -> None:
+        """Count this request's header names, values and User-Agent (v1 `log_request_fingerprint`).
+
+        Every request that passed every check (parity row 79) and, as a blocked fingerprint, every request a
+        request filter refused (row 134). In memory, flushed with the other metrics; the recorder hashes secret
+        values and skips ignored headers. Never raises: metrics never fail a request.
+        """
+        record = getattr(getattr(self.ctx, "recorder", None), "record_fingerprint", None)
+        if record is None:
+            return
+        try:
+            record(list(req.headers.items()), req.user_agent or None, blocked=blocked)
+        except Exception:
+            log.exception("record_fingerprint_failed")
 
     # --- answers ------------------------------------------------------------------------------------------------
 
@@ -586,6 +609,27 @@ def message_source(rendered: respond.Rendered, refusal: Any) -> str:
     return ""
 
 
+BODY_HASH_CHARS = 16
+"""Hex characters of a response body's SHA-256 kept in a request sample (the fixture format of plan 11.3)."""
+
+
+def fetched_body_hash(rendered: respond.Rendered, result: Any) -> str | None:
+    """The hash of the body this request fetched from Roblox, for the request sample, or None.
+
+    The CACHE-TTL-TUNE estimate and the 11.3 dry run compare the bodies Roblox returned for one key over time: the
+    same hash twice means the body did not change. So only an answer this request fetched itself counts: served
+    from upstream, at least one upstream call, a 2xx. A cache serve, a refusal or a failure has no fetched body.
+    (Before the wave 3b integration the sample held the cache key's hash of a POST request body instead.)
+    """
+    if rendered.outcome is not Outcome.SERVED_UPSTREAM or int(getattr(result, "upstream_calls", 0) or 0) < 1:
+        return None
+    status = getattr(result, "upstream_status", None) or rendered.status
+    body = getattr(result, "body", None)
+    if not 200 <= int(status) < 300 or not isinstance(body, bytes | bytearray | memoryview):
+        return None
+    return hashlib.sha256(body).hexdigest()[:BODY_HASH_CHARS]
+
+
 def _trace_count(result: Any, name: str) -> int:
     value = getattr(getattr(result, "trace", None), name, 0)
     return int(value) if isinstance(value, int) else 0
@@ -650,7 +694,7 @@ def build_outcome_event(
         "message_source": message_source(rendered, refusal),
         "check": str(getattr(refusal, "check", "") or "") if refusal is not None else "",
         "cache_key_id": getattr(cache_key, "id", None),
-        "body_hash": getattr(cache_key, "body_hash", None),
+        "body_hash": fetched_body_hash(rendered, result),
     }
     event_class = _event_class()
     if dataclasses.is_dataclass(event_class):
