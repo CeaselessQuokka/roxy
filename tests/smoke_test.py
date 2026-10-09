@@ -3554,5 +3554,87 @@ clear_all_diag()
 reset_routing()
 runtime.set_setting("allowed_requests_per_minute", _PRIOR_RPM)
 
+print("\n== Timestamps never compound across workers, and NaN never reaches the dashboard ==")
+# Four workers flushing the cache's LastHit in turn, as gunicorn's do. The merge
+# used to add timestamps like counters; with three or more workers the value
+# swung with a growing amplitude until it overflowed to inf, then NaN, and the
+# NaN in /admin/diagnostics blanked the whole dashboard (browsers reject it).
+_t0 = time.time() - 3600
+_shared = {"cache_stats": {"LastHit": _t0, "LastMiss": _t0}, "cache_endpoints": {"/v1/games": {"Hits": 0, "LastHit": _t0, "LastSeen": _t0}}}
+_adopted = [json.loads(json.dumps(_shared)) for _ in range(4)]
+_ok = True
+for _step in range(6000):
+    _w = _step % 4
+    _local = json.loads(json.dumps(_adopted[_w]))
+    _hit = _t0 + _step * 0.5
+    _local["cache_stats"]["LastHit"] = _hit
+    _local["cache_endpoints"]["/v1/games"]["LastHit"] = _hit
+    _local["cache_endpoints"]["/v1/games"]["Hits"] += 1
+    _shared = diag_module._merge_stats(_shared, _local, _adopted[_w])
+    _adopted[_w] = json.loads(json.dumps(_shared))
+    _ok = _ok and _shared["cache_stats"]["LastHit"] == _hit
+check("Four workers flushing LastHit in turn keep it equal to the newest hit", _ok, _shared["cache_stats"])
+check("...for the per-endpoint LastHit too", _shared["cache_endpoints"]["/v1/games"]["LastHit"] == _t0 + 5999 * 0.5, _shared["cache_endpoints"])
+check("...while the hit counter still adds up across workers", _shared["cache_endpoints"]["/v1/games"]["Hits"] == 6000, _shared["cache_endpoints"])
+_shared = diag_module._merge_stats(
+    {"cache_stats": {"LastHit": float("nan"), "Hits": float("nan")}},
+    {"cache_stats": {"LastHit": _t0, "Hits": 5}},
+    {"cache_stats": {"LastHit": _t0, "Hits": 5}},
+)
+check("A NaN already in the shared file does not survive a merge", _shared["cache_stats"]["LastHit"] == _t0, _shared["cache_stats"])
+check("...even in a counter", _shared["cache_stats"]["Hits"] == 0, _shared["cache_stats"])
+_damaged = {
+    "cache_stats": {"LastHit": float("inf"), "LastMiss": -5.0, "Hits": 7},
+    "cache_endpoints": {"/v1/x": {"LastHit": float("nan"), "LastSeen": 1e300, "FirstSeen": _t0, "Bytes": float("-inf")}},
+    "live_requests": [{"Date": float("nan"), "Path": "/x"}],
+}
+diag_module._scrub_numbers(_damaged, time.time())
+check(
+    "A data file damaged by the old merge is repaired when a worker loads it",
+    _damaged["cache_stats"] == {"LastHit": 0, "LastMiss": 0, "Hits": 7}
+    and _damaged["cache_endpoints"]["/v1/x"] == {"LastHit": 0, "LastSeen": 0, "FirstSeen": _t0, "Bytes": 0}
+    and _damaged["live_requests"][0]["Date"] == 0,
+    _damaged,
+)
+
+
+def _strict_json(raw):
+    def _reject(token):
+        raise ValueError(f"non-JSON token {token}")
+
+    return json.loads(raw, parse_constant=_reject)
+
+
+with diag_module._state_lock:
+    diag_module.cache_endpoints["/v1/nan-test"] = {"Hits": 1, "LastHit": float("nan"), "LastSeen": time.time()}
+    diag_module.cache_stats["LastHit"] = float("nan")
+r = client.get("/admin/diagnostics?flush=1", headers={**IP_MAIN, "Accept": "application/json"})
+try:
+    _d = _strict_json(r.get_data(as_text=True))
+    _parsed = True
+except ValueError as exc:
+    _d, _parsed = {}, False
+    print("   ", exc)
+check("/admin/diagnostics stays valid JSON when a stat holds NaN", r.status_code == 200 and _parsed, r.status_code)
+_lh = _d.get("CacheStats", {}).get("LastHit")
+check(
+    "...and the damaged LastHit reads as a real time or never",
+    _lh is None or (isinstance(_lh, (int, float)) and 0 <= _lh <= time.time() + 5),
+    _d.get("CacheStats"),
+)
+_orig_get = diag_module.get_diagnostics
+diag_module.get_diagnostics = lambda force_flush=False: {**_orig_get(force_flush=force_flush), "Probe": float("inf")}
+try:
+    r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/json"})
+    try:
+        _d = _strict_json(r.get_data(as_text=True))
+        _parsed = True
+    except ValueError:
+        _d, _parsed = {}, False
+finally:
+    diag_module.get_diagnostics = _orig_get
+check("Any other non-finite number is sent as null instead of breaking the page", _parsed and _d.get("Probe") is None, r.status_code)
+clear_all_diag()
+
 print(f"\n{'=' * 40}\nRESULT: {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

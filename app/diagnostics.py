@@ -3,6 +3,7 @@ import copy
 import hashlib
 import itertools
 import json
+import math
 import re
 import secrets
 import threading
@@ -2509,8 +2510,72 @@ def restore(data: dict):
 # Min/Max/Last* fields combine idempotently; recent-event lists union + dedup + cap.
 _baseline = None
 
-_MAX_KEYS = {"Max", "LastRequestTime", "LastThrottleTime", "LastSeen", "LastSuccessAt", "LastErrorAt", "LastUsedAt"}
+# Every timestamp MUST be listed here (or in _MIN_KEYS). A number that is not
+# falls through to the additive branch of _merge_value, which treats it as a
+# counter: each flush adds that worker's movement since its own last flush. For
+# a timestamp that is not a slow drift. With several workers flushing in turn,
+# every flush adds a difference of values the others already moved, and the
+# result swings back and forth with a growing amplitude until the float
+# overflows to inf; inf - inf is NaN, `NaN or 0` is NaN, so it then sticks and
+# is persisted. Python writes it into the JSON as a bare NaN, which browsers
+# refuse to parse -- that is how the cache's LastHit/LastMiss (added after this
+# list was written) took the whole dashboard down. The time checks below also
+# undo values that were damaged before this was fixed.
+_MAX_KEYS = {
+    "Max",
+    "LastRequestTime",
+    "LastThrottleTime",
+    "LastSeen",
+    "LastSuccessAt",
+    "LastErrorAt",
+    "LastUsedAt",
+    "LastHit",
+    "LastMiss",
+}
 _MIN_KEYS = {"Min", "FirstSeen"}
+# The wall-clock subset of those two sets: a value no real clock can produce
+# (negative, NaN/inf, or further ahead than any clock correction) is damage,
+# and is dropped to 0, which the dashboard shows as "never".
+_TIME_KEYS = (_MAX_KEYS | _MIN_KEYS) - {"Max", "Min"}
+_TIME_FUTURE_SLACK = 86400.0
+
+
+def _finite(value):
+    """`value`, or 0 when it is a float that is NaN or +/-inf (never real data)."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return 0
+    return value
+
+
+def _plausible_time(value, now):
+    """A timestamp field's value if a real clock could have produced it, else 0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(value) or value < 0 or value > now + _TIME_FUTURE_SLACK:
+        return 0
+    return value
+
+
+def _scrub_numbers(obj, now):
+    """Repair damaged numbers in loaded stats, in place: NaN/inf anywhere become
+    0, and timestamp fields outside what a clock can produce become 0. Run on
+    what a worker loads from disk, so a file written before the merge fix (or by
+    any future bug) cannot keep poisoning the dashboard."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                _scrub_numbers(v, now)
+            elif k in _TIME_KEYS:
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    obj[k] = _plausible_time(v, now)
+            elif isinstance(v, float) and not math.isfinite(v):
+                obj[k] = 0
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            if isinstance(v, (dict, list)):
+                _scrub_numbers(v, now)
+            elif isinstance(v, float) and not math.isfinite(v):
+                obj[i] = 0
 _LIST_CAP_SETTINGS = {
     "exploit_attempts": ("max_exploit_records", config.MAX_EXPLOIT_RECORDS),
     "login_attempts": ("max_login_records", config.MAX_LOGIN_RECORDS),
@@ -2571,15 +2636,23 @@ def _merge_value(key, shared_v, local_v, base_v):
         return merged
     if isinstance(local_v, list):
         return _merge_list(key, shared_v if isinstance(shared_v, list) else [], local_v)
+    if key in _TIME_KEYS:
+        now = time.time()
+        shared_t, local_t = _plausible_time(shared_v, now), _plausible_time(local_v, now)
+        if key in _MIN_KEYS:
+            candidates = [v for v in (shared_t, local_t) if v]
+            return min(candidates) if candidates else 0
+        return max(shared_t, local_t)
     if key in _MAX_KEYS:
-        return max(shared_v or 0, local_v or 0)
+        return max(_finite(shared_v or 0), _finite(local_v or 0))
     if key in _MIN_KEYS:
-        candidates = [v for v in (shared_v, local_v) if v]
+        candidates = [v for v in (_finite(shared_v), _finite(local_v)) if v]
         return min(candidates) if candidates else 0
     if isinstance(local_v, bool):
         return bool(shared_v) or local_v
     if isinstance(local_v, (int, float)):
-        return (shared_v or 0) + (local_v - (base_v or 0))
+        # A NaN on either side would otherwise survive forever (`NaN or 0` is NaN).
+        return _finite(_finite(shared_v or 0) + (_finite(local_v) - _finite(base_v or 0)))
     return local_v
 
 
@@ -2669,6 +2742,7 @@ def _bootstrap():
         key_epochs = diag.get("KeyClearEpochs", {})
         if isinstance(key_epochs, dict):
             _applied_key_clear_epochs.update({str(k): float(v) for k, v in key_epochs.items()})
+        _scrub_numbers(diag, time.time())  # Repair NaN/inf and impossible timestamps on disk.
         restore(diag)  # Also re-applies every cap to what was on disk.
     _baseline = serialize()  # Loaded state is the baseline so the first flush only adds new events.
     storage.start_autosave(_flush)

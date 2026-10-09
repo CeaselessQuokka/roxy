@@ -11,6 +11,7 @@ import functools
 import hmac
 import json
 import mail
+import math
 import os
 import proxy
 import re
@@ -390,6 +391,34 @@ def admin_heartbeat():
     )
 
 
+def _json_safe(value):
+    """A copy of `value` with every NaN/inf float replaced by None."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _strict_jsonify(data):
+    """jsonify that never emits NaN or Infinity.
+
+    Python's json writes a non-finite float as a bare NaN/Infinity token, which
+    is not JSON: the browser's parser rejects the WHOLE response, so one damaged
+    number blanks every tile on the dashboard. The normal case costs nothing
+    extra (allow_nan=False only raises when such a value exists); only then is
+    the payload walked and the bad values sent as null.
+    """
+    try:
+        body = app.json.dumps(data, allow_nan=False)
+    except ValueError:
+        _logger.warning("Diagnostics held NaN/inf numbers; they were sent as null")
+        body = app.json.dumps(_json_safe(data))
+    return app.response_class(f"{body}\n", mimetype=app.json.mimetype)
+
+
 @app.route("/admin/diagnostics", methods=["GET"], endpoint="admin_diagnostics")
 @requires_admin
 def admin_diagnostics():
@@ -428,7 +457,7 @@ def admin_diagnostics():
     data["IgnoredValueHeaders"] = runtime.get_ignored_value_headers()
     data["TrustedDevices"] = runtime.get_trusted_device_count()
     data["TrustedThisDevice"] = runtime.is_trusted_device(request.cookies.get(TRUSTED_DEVICE_COOKIE, ""))
-    return jsonify(data)
+    return _strict_jsonify(data)
 
 
 @app.route("/admin/tokens", methods=["POST"], endpoint="admin_set_tokens")
