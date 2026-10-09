@@ -16,8 +16,10 @@ How it works
     - Message: the manual reason (kept across toggles, like v1, and replaced only when a new reason is given), the
       scheduled reason during a scheduled window, else the live setting `pause_message_default` (catalog default
       `Service down for maintenance.`, v1's constant), which the check passes in; cut to 300 characters.
-      Throttle-all without a reason shares that default (v1 used one constant for both, v1 notes B6/B13).
-    - `Retry-After` (plan 7.13): seconds to `scheduled_end` during a scheduled window, else 60.
+      Throttle-all without a reason shares that default (v1 used one constant for both, v1 notes B6/B13). A
+      reason is checked when it is written: an em or en dash or a control character is refused (plan C5,
+      `messages.checked_state_reason`), as for every other admin text callers receive.
+    - `Retry-After` (plan 7.13): seconds to `scheduled_end` during a scheduled window, rounded up, else 60.
     - `since` is when the manual pause began (a new marker each time it is switched on), so the top-bar banner can
       count drops "since the state began" from the metrics rollups (row 114).
     - Each writer runs in ONE control.db transaction: read the old state, write the new one, append an audit row,
@@ -29,12 +31,19 @@ What to read next
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Final
 
-from roxy.abuse.messages import DEFAULT_DOWNTIME_MESSAGE, MAX_STATE_REASON, clean_admin_message, downtime_default
+from roxy.abuse.messages import (
+    DEFAULT_DOWNTIME_MESSAGE,
+    MAX_STATE_REASON,
+    checked_state_reason,
+    clean_admin_message,
+    downtime_default,
+)
 from roxy.abuse.state import read_state_value, write_state_value
 from roxy.abuse.verdict import MessageSource
 from roxy.config.audit import Actor
@@ -98,9 +107,13 @@ class PauseState:
         return (text, "custom") if text else (downtime_default(default), "default")
 
     def retry_after(self, now: float) -> int:
-        """Plan 7.13: seconds to the scheduled end during a scheduled window, else 60."""
+        """Plan 7.13: seconds to the scheduled end during a scheduled window, else 60.
+
+        Rounded UP (at least 1), like every other v2 `Retry-After`: 59.5 s left is 60, so a caller that waits
+        exactly as told finds the window over instead of a second 503.
+        """
         if not self.paused and self.in_scheduled_window(now) and self.scheduled_end is not None:
-            return max(1, int(self.scheduled_end - now))
+            return max(1, math.ceil(self.scheduled_end - now))
         return DEFAULT_RETRY_AFTER_S
 
     def active_since(self, now: float) -> float:
@@ -146,14 +159,16 @@ async def set_pause(
     """Switch the manual pause on or off (None toggles), optionally replacing the reason (v1 `/admin/proxy/toggle`).
 
     Switching it on records a new `since` marker, so the drop counter of the banner restarts (v1 cleared
-    `pause_drops`; v2 keeps history in the rollups and counts from the marker, row 114).
+    `pause_drops`; v2 keeps history in the rollups and counts from the marker, row 114). Raises ValueError for a
+    reason with an em or en dash or a control character (plan C5), before anything is written.
     """
+    stored = checked_state_reason(reason) if reason is not None else None
 
     def change(before: PauseState, now: float) -> PauseState:
         target = (not before.paused) if paused is None else bool(paused)
         after = replace(before, paused=target)
-        if reason is not None:
-            after = replace(after, reason=clean_admin_message(reason, MAX_STATE_REASON))
+        if stored is not None:
+            after = replace(after, reason=stored)
         if target and not before.paused:
             after = replace(after, since=now)
         if not target:
@@ -173,16 +188,20 @@ async def schedule_pause(
     reason: str = "",
     request_id: str | None = None,
 ) -> PauseState:
-    """Schedule a maintenance window `[start, end)` (Unix seconds). Raises ValueError for an empty window."""
+    """Schedule a maintenance window `[start, end)` (Unix seconds).
+
+    Raises ValueError for an empty window, or for a reason with an em or en dash or a control character (C5).
+    """
     if int(end) <= int(start):
         raise ValueError("The scheduled pause must end after it starts")
+    stored = checked_state_reason(reason)
 
     def change(before: PauseState, _now: float) -> PauseState:
         return replace(
             before,
             scheduled_start=int(start),
             scheduled_end=int(end),
-            scheduled_reason=clean_admin_message(reason, MAX_STATE_REASON),
+            scheduled_reason=stored,
             scheduled_by=actor.label[:64],
         )
 

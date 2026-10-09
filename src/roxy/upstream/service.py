@@ -26,9 +26,11 @@ How it works (one fetch)
     4. Send through the egress (which adds its API-shaped header profile; upstream adds only the body's
        Content-Type, a safe forwarded Accept and a cached CSRF token for write methods), with timeouts clipped to
        the request deadline. A CSRF 403 is retried once with the new token (a new bucket slot); a 3xx is followed
-       here, not by the egress, so every hop takes a bucket slot, and only to an allowed Roblox host (on the
-       credential path, only to an allowlisted one); a Location that does not parse is simply not followed.
-       A CSRF retry is recorded for the Upstream page (`record_retry`, row 117).
+       here, not by the egress, so every hop takes a bucket slot, and only to a URL that passes the same checks as
+       a caller's own path (`proxy/validate.py parse_redirect`: an allowed Roblox host, no encoded slash or
+       dot segment) and, on the credential path, whose decoded path the allowlist grants; a Location that does
+       not parse or pass is simply not followed. A CSRF retry is recorded for the Upstream page (`record_retry`,
+       row 117).
     5. Classify (`status.py`), apply the side effects in at most one more hot.db transaction (`effects.py`, skipped
        for a plain success), then: log Roblox 429s (`record_upstream_429`), rotate a burned rotator session, lower
        the attributed bucket rate, set the credential cooldown, and decide by the 7.9 table whether to retry.
@@ -36,11 +38,15 @@ How it works (one fetch)
        jitter backoff, and only while the request deadline allows. A 429 is never retried at once; with
        `fallback_on_429=1` one retry on the OTHER anonymous egress is allowed, never onto the credential.
     C7: if hot.db cannot be used, the request is not sent unpaced and the credential is never used; the answer is
-    the `degraded` row (503, Retry-After 10), or stale data from the cache layer. If hot.db stops taking writes
-    after Roblox answered, the answer is still Roblox's, and a 429's cooldown is kept in this worker's memory
-    (`LocalCooldowns`), honored by every routing decision here and written to hot.db (for every worker) as soon as
-    a write succeeds (`flush_local_cooldowns`, from the next fetch or the mirror loop). A credential refused at
-    send time answers with the wait the credential manager gave, not a fixed 300 s.
+    the `degraded` row (503, Retry-After 10), or stale data from the cache layer. Once Roblox answered, the answer
+    is Roblox's, whatever hot.db does: the writes after the call (its effects, a CSRF token, refunds) wait at most
+    `HOT_SIDE_WRITE_BUDGET_MS` for another process's lock, a 429's cooldown that could not be written is kept in
+    this worker's memory (`LocalCooldowns`), honored by every routing decision here and written to hot.db (for
+    every worker) as soon as a write succeeds (`flush_local_cooldowns`, from the next fetch or the mirror loop),
+    and a retry that hot.db cannot pace is not made: the caller gets Roblox's own 5xx, timeout or connect answer,
+    never `degraded` (findings mp-7, mp-8). A request canceled while its reservation is being written gives back
+    what that write granted (finding mp-9). A credential refused at send time answers with the wait the
+    credential manager gave, not a fixed 300 s.
 
 What to read next
     `roxy/upstream/routing.py`, `roxy/upstream/buckets.py`, `roxy/upstream/effects.py`, then the cache layer's
@@ -62,13 +68,14 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal, Protocol
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 
 from roxy.core.clock import Clock
 from roxy.core.ids import new_request_id
 from roxy.core.reasons import AuthClass, Egress, ReasonCode
+from roxy.proxy.validate import parse_redirect
 from roxy.rules.match import regex_budget
 from roxy.storage.db import Database, SharedStateUnavailable
 from roxy.upstream import aimd, breaker, buckets, cooldowns, csrf, deadlines, messages, routing
@@ -82,7 +89,7 @@ from roxy.upstream.adaptive import (
 from roxy.upstream.adaptive import increase_job as adaptive_increase_job
 from roxy.upstream.backoff import DecorrelatedJitter
 from roxy.upstream.breaker import BreakerPolicy, BreakerRow
-from roxy.upstream.buckets import BucketDefaults, BucketSpec, Grant, GuardDenial, LeaseHook
+from roxy.upstream.buckets import BucketDefaults, BucketSpec, Grant, GuardDenial, LeaseHook, ReserveOutcome
 from roxy.upstream.cooldowns import CooldownPolicy, CooldownRow
 from roxy.upstream.effects import CallEffects, CallFacts, EffectsConfig, apply_call_outcome, should_record
 from roxy.upstream.egress_port import (
@@ -123,6 +130,13 @@ __all__ = [
 
 HOT_BUSY_TIMEOUT_MS: Final = 2000
 """The reservation waits at most 2 s for hot.db's write lock before answering `degraded` (plan C7)."""
+
+HOT_SIDE_WRITE_BUDGET_MS: Final = 500
+"""Most a request-path hot.db write that has a fallback waits for another process's lock (finding mp-7): the call's
+effects after Roblox answered (a cooldown it cannot write is kept in memory), sharing a CSRF token, refunding an
+unused slot, releasing a reservation (it expires on its own), sharing cooldowns kept in memory. Roblox's answer is
+already in hand or the request is going nowhere, so the caller never waits out SQLite's 5 s busy timeout; 0.5 s is
+the abuse pipeline's own budget and covers ordinary contention between workers (each write takes milliseconds)."""
 
 MAX_MIRROR_ENTRIES: Final = 5000
 """Per-worker bound on the availability mirror (active cooldowns are far fewer in practice)."""
@@ -202,6 +216,11 @@ class UpstreamResult:
     cacheable: bool = False
     negative_ttl_s: int | None = None
     cooldown_source: str = ""  # added: why a cooldown answer lasts as long as it does (Upstream page explainer)
+    private: bool = False
+    """Fetched with the credential under a `cache_private` allowlist row, or with no row (probes): the answer
+    belongs to its own request and is never stored or handed to a follower (plan 6.9, 9.13; review finding cred-4).
+    Only the upstream knows the row it actually routed under; the cache also re-reads the row when the answer
+    arrives (`CacheService._row_now_private`)."""
 
     @property
     def ok(self) -> bool:
@@ -239,6 +258,7 @@ class UpstreamConfig:
     negative_429: bool
     allowed_hosts: frozenset[str]
     strict_hosts: bool
+    max_url_length: int
     credential_probe_url: str
     defaults: BucketDefaults
     cooldown: CooldownPolicy
@@ -266,6 +286,7 @@ class UpstreamConfig:
             negative_429=bool(get("cache_negative_429")),
             allowed_hosts=frozenset(str(h).strip().lower().rstrip(".") for h in (get("allowed_roblox_hosts") or ())),
             strict_hosts=bool(get("strict_host_allowlist")),
+            max_url_length=int(get("max_url_length")),
             credential_probe_url=str(get("credential_probe_url")),
             defaults=BucketDefaults.from_settings(settings),
             cooldown=CooldownPolicy.from_settings(settings),
@@ -315,6 +336,9 @@ class _RunState:
     # Why the credential refused this request at send time and for how long (its `CredentialUnavailable`), so the
     # 503 carries the cooldown's real remaining time instead of the fixed 300 (wire report).
     credential_refusal: tuple[str, int | None] | None = None
+    # hot.db refused the effects write of a call Roblox answered: a retry could not be paced either, so none is
+    # made and Roblox's answer goes back (findings mp-7 and mp-8, plan C7).
+    shared_unwritable: bool = False
 
 
 @dataclass(slots=True)
@@ -730,18 +754,19 @@ class UpstreamService:
         local = self.local_cooldowns.pending(now_ms)
         self._note_cooldowns({row.key: row.until_ms for row in local}, now_ms)
 
-    async def flush_local_cooldowns(self) -> int:
+    async def flush_local_cooldowns(self, *, budget_ms: int = HOT_BUSY_TIMEOUT_MS) -> int:
         """Write the cooldowns this worker kept in memory during a hot.db outage into hot.db (C7).
 
         Returns how many were written. Raises `SharedStateUnavailable` while hot.db still cannot be written (the
-        cooldowns stay in memory and keep being honored by this worker).
+        cooldowns stay in memory and keep being honored by this worker). A fetch passes the short
+        `HOT_SIDE_WRITE_BUDGET_MS` (the mirror loop shares them anyway); the loop waits the reservation's budget.
         """
         now_ms = self._now_ms()
         rows = self.local_cooldowns.pending(now_ms)
         if not rows:
             return 0
         written = await self.hot.write(
-            functools.partial(cooldowns.write_local, rows=rows, now_ms=now_ms), busy_timeout_ms=HOT_BUSY_TIMEOUT_MS
+            functools.partial(cooldowns.write_local, rows=rows, now_ms=now_ms), busy_timeout_ms=budget_ms
         )
         self.local_cooldowns.forget(rows)
         log.info("upstream_local_cooldowns_shared", extra={"fields": {"written": written}})
@@ -809,7 +834,14 @@ class UpstreamService:
             raise
         except SharedStateUnavailable as exc:
             log.warning("upstream_degraded", extra={"fields": {"error": str(exc)[:200], "purpose": purpose}})
-            result = self._failure(ReasonCode.DEGRADED, trace, state)
+            if state.last_failure is not None:
+                # Roblox already answered this request (a 5xx, a timeout, a 429 before a fallback) and only the
+                # next attempt could not be paced: the caller gets Roblox's answer, never `degraded` (finding mp-8,
+                # D4, the rule UP-COOLDOWN-LOST set for a 429).
+                trace.note("hot.db unavailable for the next attempt: the last upstream answer goes back")
+                result = state.last_failure
+            else:
+                result = self._failure(ReasonCode.DEGRADED, trace, state)
         except Exception:
             log.exception("upstream_fetch_failed", extra={"fields": {"purpose": purpose}})
             result = self._failure(ReasonCode.INTERNAL_ERROR, trace, state)
@@ -905,6 +937,8 @@ class UpstreamService:
                     return result
                 if egress is Egress.CREDENTIAL and not (credential_rule and credential_rule.identical_anonymous):
                     return result  # an allowlisted endpoint never falls back to anonymous (plan 6.9)
+                if state.shared_unwritable:
+                    return result  # the fallback could not be paced (C7): Roblox's 429 goes back as it is
                 state.exclude.update({egress, Egress.CREDENTIAL})  # never onto the credential (plan 7.9)
                 state.last_failure = result
                 trace.note(f"429 on {egress.value}: one retry on another anonymous egress (fallback_on_429)")
@@ -912,6 +946,11 @@ class UpstreamService:
             if rule is RetryRule.BACKOFF:
                 state.last_failure = result
                 if state.attempts >= cfg.max_attempts:
+                    return result
+                if state.shared_unwritable:
+                    # hot.db refused this call's effects, so a retry could not take a bucket slot either (C7: never
+                    # unpaced); waiting for the lock would only delay Roblox's answer (findings mp-7, mp-8).
+                    trace.note(f"{kind.value} on {egress.value}: no retry while hot.db cannot be written")
                     return result
                 delay_s = backoff.next_s()
                 remaining = self._left_s(req)
@@ -1025,9 +1064,10 @@ class UpstreamService:
         """Pick an egress and reserve its slot (plan 7.2 and 7.3). Retries a few times if the snapshot raced."""
         last_denial: tuple[float, str] | None = None
         if len(self.local_cooldowns):
-            # Cooldowns kept in memory during a hot.db outage: share them first if hot.db takes writes again.
+            # Cooldowns kept in memory during a hot.db outage: share them first if hot.db takes writes again (a
+            # short budget: they are honored here either way, and the mirror loop keeps trying).
             with contextlib.suppress(SharedStateUnavailable):
-                await self.flush_local_cooldowns()
+                await self.flush_local_cooldowns(budget_ms=HOT_SIDE_WRITE_BUDGET_MS)
         for _round in range(MAX_ROUTE_ROUNDS):
             candidates = self._candidates(call, state)
             specs = {egress: self._specs(call, egress) for egress in candidates}
@@ -1148,15 +1188,27 @@ class UpstreamService:
         probes: list[str] = []
         slots: list[str] = []
         background = buckets.BACKGROUND_GLOBAL_LIMIT if call.priority is Priority.BACKGROUND else None
-        outcome = await buckets.reserve(
-            self.hot,
+
+        def routed_for(grant: Grant) -> _Routed:
+            # `probes` and `slots` were filled by the guards inside the transaction that produced `grant`.
+            return _Routed(
+                egress=egress,
+                specs=specs,
+                grant=grant,
+                holder=holder,
+                probe_keys=tuple(probes),
+                aimd_key=aimd.aimd_key(call.host, egress) if slots else None,
+                aimd_slot=slots[0] if slots else None,
+                breakers_seen=dict(snap.breakers),
+            )
+
+        outcome = await self._reserve_shielded(
             specs,
-            now_ms=self._now_ms,
             max_wait_ms=max_wait_ms,
             background_global_limit=background,
             lease_hook=state.lease,
             guards=self._guards(call, egress, holder, probes, slots),
-            busy_timeout_ms=HOT_BUSY_TIMEOUT_MS,
+            routed_for=routed_for,
         )
         if outcome.lease_lost:
             raise SingleFlightLost(call.template)
@@ -1168,19 +1220,62 @@ class UpstreamService:
             denial = outcome.denial
             return (denial.retry_after_ms, denial.reason) if denial is not None else (1000.0, "busy")
         state.lease = None  # the single-flight lease is in: never insert it again for this fetch
-        return _Routed(
-            egress=egress,
-            specs=specs,
-            grant=outcome.grant,
-            holder=holder,
-            probe_keys=tuple(probes),
-            aimd_key=aimd.aimd_key(call.host, egress) if slots else None,
-            aimd_slot=slots[0] if slots else None,
-            breakers_seen=dict(snap.breakers),
+        return routed_for(outcome.grant)
+
+    async def _reserve_shielded(
+        self,
+        specs: tuple[BucketSpec, ...],
+        *,
+        max_wait_ms: float,
+        guards: Sequence[buckets.Guard],
+        routed_for: Callable[[Grant], _Routed],
+        background_global_limit: float | None = None,
+        lease_hook: LeaseHook | None = None,
+    ) -> ReserveOutcome:
+        """`buckets.reserve` that never keeps what it took when the caller is canceled while it runs (finding mp-9).
+
+        `Database.write` lets a job that already started run to its COMMIT when the waiting coroutine is canceled
+        (a write is never half applied). A request canceled during its reservation (the deadline middleware's
+        `asyncio.timeout`, a shutdown) therefore used to keep its bucket slots, a half-open breaker's fleet-wide
+        probe lease, an AIMD slot and the single-flight lease, for a call it never made (plan 7.3: a canceled
+        reservation is refunded). The write runs as its own task: on cancellation this waits for it (at most its
+        `HOT_BUSY_TIMEOUT_MS` budget, a second cancellation included), gives back whatever it granted, and only
+        then lets the cancellation go on, so the single-flight layer also sees the final `granted` state of its
+        lease hook and abandons that lease (`singleflight._drive_hooked`).
+        """
+        task = asyncio.ensure_future(
+            buckets.reserve(
+                self.hot,
+                specs,
+                now_ms=self._now_ms,
+                max_wait_ms=max_wait_ms,
+                background_global_limit=background_global_limit,
+                lease_hook=lease_hook,
+                guards=guards,
+                busy_timeout_ms=HOT_BUSY_TIMEOUT_MS,
+            )
         )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.wait({task})
+                except asyncio.CancelledError:
+                    continue  # canceled again: the bookkeeping still comes first (bounded by the write budget)
+            if not task.cancelled() and task.exception() is None:
+                grant = task.result().grant
+                if grant is not None:
+                    await self._release_shielded(routed_for(grant), refund=True)
+            raise
 
     async def _release(self, routed: _Routed, *, refund: bool) -> None:
-        """Give back what a reservation holds when no call will use it (refund, probe lease, AIMD slot)."""
+        """Give back what a reservation holds when no call will use it (refund, probe lease, AIMD slot).
+
+        Budgeted and never raising (finding mp-7): if hot.db stays locked, the slot simply stays taken until its
+        time passes and a probe lease or AIMD slot expires on its own TTL, which is what C7 allows; the request
+        must not wait out SQLite's 5 s busy timeout for bookkeeping.
+        """
         aimd_policy = self.config().aimd
 
         def undo(conn: sqlite3.Connection) -> None:
@@ -1192,7 +1287,10 @@ class UpstreamService:
             if routed.aimd_slot is not None and routed.aimd_key is not None:
                 aimd.release(conn, routed.aimd_key, routed.aimd_slot, routed.holder, None, aimd_policy, now_ms)
 
-        await self.hot.write(undo)
+        try:
+            await self.hot.write(undo, busy_timeout_ms=HOT_SIDE_WRITE_BUDGET_MS)
+        except SharedStateUnavailable as exc:
+            log.warning("upstream_release_not_shared", extra={"fields": {"error": str(exc)[:200]}})
 
     async def _release_shielded(self, routed: _Routed, *, refund: bool) -> None:
         """`_release` that completes even while the calling task is being canceled."""
@@ -1385,14 +1483,18 @@ class UpstreamService:
             credential_probe=call.mode == "internal_cred",
         )
         holder = self.new_holder()
-        outcome = await buckets.reserve(
-            self.hot,
-            specs,
-            now_ms=self._now_ms,
-            max_wait_ms=self._max_wait_ms(call, state),
-            guards=self._guards(call, routed.egress, holder, [], [])[:1],  # cooldowns only: the call is under way
-            busy_timeout_ms=HOT_BUSY_TIMEOUT_MS,
-        )
+        try:
+            outcome = await self._reserve_shielded(
+                specs,
+                max_wait_ms=self._max_wait_ms(call, state),
+                guards=self._guards(call, routed.egress, holder, [], [])[:1],  # cooldowns only: the call is under way
+                routed_for=lambda grant: _Routed(routed.egress, specs, grant, holder),
+            )
+        except SharedStateUnavailable:
+            # No slot can be taken (C7: never unpaced): this extra call is not made, and Roblox's answer so far
+            # (its 3xx, or the CSRF challenge) is what the caller gets, never `degraded`.
+            call.trace.note("hot.db unavailable: no slot for the extra call")
+            return False
         if outcome.grant is None:
             return False
         extra = _Routed(routed.egress, specs, outcome.grant, holder)
@@ -1407,24 +1509,35 @@ class UpstreamService:
         return True
 
     def _redirect_url(self, call: _Call, egress: Egress, current_url: str, exchange: _Exchange) -> str | None:
-        """Where a 3xx may be followed: an allowed Roblox host, GET or HEAD, credential only within the allowlist.
+        """Where a 3xx may be followed: GET or HEAD only, and only a URL a caller could have asked for directly.
 
-        None means "do not follow", never an exception: a Location that does not even parse (`//[`) is refused
-        like any other target outside the allowlist (ingress review).
+        Every hop is re-validated with the caller path's own checks (`proxy/validate.py parse_redirect`, which
+        resolves the Location and runs `parse_upstream_url`; plan 9.10 "redirects are re-validated"): https on port
+        443, an allowed Roblox host, and a path without encoded slashes, `%`, `?` or `#` in a segment and without
+        `.` or `..` segments (v1 bug B4). The credential allowlist is matched on the hop's decoded, normalized
+        target, exactly as a caller path is, and the URL followed is the one rebuilt from that parse, so what is
+        fetched is what was checked (finding cred-3: the raw, still encoded path let a `*` or `(?:/.*)?` grant
+        `.../%2E%2E/%2E%2E/v2/secret`, which a server that decodes before removing dot segments serves as an
+        endpoint no row names). None means "do not follow", never an exception: a Location that does not even
+        parse (`//[`) is the `unsafe_url` problem of `parse_redirect` (ingress review).
         """
         location = exchange.headers.get("location", "").strip()
         if not location or call.method not in routing.CREDENTIAL_METHODS:
             return None
-        try:
-            target = urljoin(current_url, location)
-        except ValueError:  # an unparsable Location (for example an unclosed IPv6 bracket)
-            return None
         cfg = call.cfg
-        if not is_roblox_https_url(target, cfg.allowed_hosts if cfg.strict_hosts else None):
+        parsed = parse_redirect(
+            current_url,
+            location,
+            call.method,
+            allowed_hosts=cfg.allowed_hosts,
+            strict_host_allowlist=cfg.strict_hosts,
+            max_url_length=cfg.max_url_length,
+        )
+        if not parsed.ok:
             return None
+        target = parsed.upstream_url
         if egress is Egress.CREDENTIAL:
-            parts = urlsplit(target)
-            new_target = f"{(parts.hostname or '').lower()}{parts.path or '/'}"
+            new_target = parsed.target  # host plus the decoded, normalized path (what every rule matches)
             if call.mode != "internal_cred" and (
                 call.rules is None or self._credential_row(call.rules, new_target, call.method) is None
             ):
@@ -1467,8 +1580,10 @@ class UpstreamService:
                     break
                 ttl = call.cfg.csrf_ttl_s
                 now_s = self.clock.now()
-                await self.hot.write(
-                    functools.partial(csrf.store_token, identity=identity, token=token, ttl_s=ttl, now_s=now_s)
+                await self._side_write(
+                    functools.partial(csrf.store_token, identity=identity, token=token, ttl_s=ttl, now_s=now_s),
+                    call,
+                    "CSRF token not shared",
                 )
                 if not await self._extra_slot(call, routed, state, call.host):
                     await self._after_call(call, routed, exchange, state, AttemptKind.CSRF_CHALLENGE)
@@ -1480,7 +1595,9 @@ class UpstreamService:
                     call, egress, url, call.method, headers, body, exchange.session_id, state, csrf_retry=True
                 )
                 if exchange.status == 403 and has_csrf_token(exchange.headers):
-                    await self.hot.write(lambda conn: csrf.forget_token(conn, identity))
+                    await self._side_write(
+                        functools.partial(csrf.forget_token, identity=identity), call, "CSRF token not forgotten"
+                    )
                 continue
             if exchange.kind is AttemptKind.REDIRECT and hops < MAX_REDIRECT_HOPS:
                 target = self._redirect_url(call, egress, url, exchange)
@@ -1501,7 +1618,11 @@ class UpstreamService:
             break
         if not policy_for(exchange.kind).sent and not csrf_retried and hops == 0:
             # Nothing reached Roblox (egress disabled, guard refusal): the slot was not used, give it back.
-            await self.hot.write(functools.partial(buckets.refund_in, grant=routed.grant, now_ms=self._now_ms()))
+            await self._side_write(
+                functools.partial(buckets.refund_in, grant=routed.grant, now_ms=self._now_ms()),
+                call,
+                "unused slot not refunded",
+            )
         effects = await self._after_call(call, routed, exchange, state, exchange.kind)
         result = self._result(call, routed, exchange, effects, state)
         kind = exchange.kind
@@ -1536,16 +1657,21 @@ class UpstreamService:
         if should_record(facts, routed.breakers_seen, now_s):
             config = EffectsConfig(cooldown=cfg.cooldown, breaker=cfg.breaker, aimd=cfg.aimd)
             try:
+                # Budgeted (finding mp-7): Roblox already answered, so the caller (and every follower of its flight)
+                # never waits out SQLite's 5 s busy timeout for this bookkeeping; the fallback is just below.
                 effects = await self.hot.write(
-                    lambda conn: apply_call_outcome(conn, facts, config, self._now_ms(), self._rng)
+                    lambda conn: apply_call_outcome(conn, facts, config, self._now_ms(), self._rng),
+                    busy_timeout_ms=HOT_SIDE_WRITE_BUDGET_MS,
                 )
             except SharedStateUnavailable as exc:
                 # C7: Roblox answered, but hot.db cannot be written. Breaker counts are lost and a held probe or
-                # AIMD lease expires on its own; a 429's cooldown is NOT lost (finding UP-COOLDOWN-LOST).
+                # AIMD lease expires on its own; a 429's cooldown is NOT lost (finding UP-COOLDOWN-LOST), and no
+                # retry is made, since it could not be paced either (finding mp-8).
                 log.warning(
                     "upstream_effects_not_shared",
                     extra={"fields": {"error": str(exc)[:200], "kind": kind.value, "egress": routed.egress.value}},
                 )
+                state.shared_unwritable = True
                 effects = self._local_effects(facts, cfg)
                 await self._side_effects_outside(call, routed, exchange, kind, retry_after, effects)
                 return effects
@@ -1573,6 +1699,18 @@ class UpstreamService:
                 )
         await self._side_effects_outside(call, routed, exchange, kind, retry_after, effects)
         return effects
+
+    async def _side_write(self, fn: Callable[[sqlite3.Connection], Any], call: _Call, what: str) -> None:
+        """A request-path hot.db write with a fallback (a CSRF token, a refund): budgeted, never raising.
+
+        If hot.db stays locked past `HOT_SIDE_WRITE_BUDGET_MS`, the write is skipped (a token is not shared, a slot
+        expires on its own) and the request goes on (finding mp-7).
+        """
+        try:
+            await self.hot.write(fn, busy_timeout_ms=HOT_SIDE_WRITE_BUDGET_MS)
+        except SharedStateUnavailable as exc:
+            call.trace.note(f"{what} (hot.db unavailable)")
+            log.warning("upstream_side_write_skipped", extra={"fields": {"what": what, "error": str(exc)[:200]}})
 
     def _local_effects(self, facts: CallFacts, cfg: UpstreamConfig) -> CallEffects | None:
         """The cooldown hot.db could not record, kept in this worker's memory (plan 7.5 and C7); None if none.
@@ -1717,6 +1855,7 @@ class UpstreamService:
                 cooldown_source=source,
             )
             result.auth_class = auth
+            result.private = private
             if call.cfg.negative_429 and not private and result.cooldown_s:
                 result.negative_ttl_s = result.cooldown_s
             return result
@@ -1730,6 +1869,7 @@ class UpstreamService:
                 upstream_retry_after_s=upstream_retry,
             )
             result.auth_class = auth
+            result.private = private
             return result
         if kind in (
             AttemptKind.TIMEOUT,
@@ -1741,6 +1881,7 @@ class UpstreamService:
         ):
             result = self._failure(policy_for(kind).reason, call.trace, state, egress=egress)
             result.auth_class = auth
+            result.private = private
             return result
         # Roblox answered: pass the answer on with its real status (2xx, 3xx not followed, 4xx other than 429).
         status = int(exchange.status or 502)
@@ -1771,6 +1912,7 @@ class UpstreamService:
             trace=call.trace,
             cacheable=200 <= status < 300 and not private,
             negative_ttl_s=negative,
+            private=private,
         )
 
     def _failure(

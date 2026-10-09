@@ -370,13 +370,48 @@ async def test_startup_fails_without_the_user_guide(env: Any, tmp_path: Path, mo
             pass
 
 
-async def test_docs_answers_503_if_the_guide_disappears(
+async def test_docs_is_served_from_memory_after_startup(
     app: FastAPI, client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Never a 404 (which the error handler would log as a probe on every visit): the fault is Roxy's."""
+    """The lifespan renders the guide once, on a thread, and `/docs` serves that copy without touching the disk
+    (review findings public-2 and mp-5), so a file that disappears after startup changes nothing. A worker that never
+    loaded the guide (only an app whose lifespan did not run) answers 503: never a 404, which the error handler
+    would log as a probe on every visit, because the fault is Roxy's."""
+    assert isinstance(getattr(app.state, pages.GUIDE_STATE_ATTRIBUTE), pages.RenderedGuide)
     monkeypatch.setattr(pages, "USER_GUIDE_PATH", tmp_path / "gone.md")
     response = await client.get("/docs")
-    assert response.status_code == 503
+    assert response.status_code == 200
+    assert '<a href="#4-limits">4. Limits</a>' in response.text
+
+    setattr(app.state, pages.GUIDE_STATE_ATTRIBUTE, None)  # as if the lifespan had never loaded it
+    assert (await client.get("/docs")).status_code == 503
+
+
+async def test_other_spellings_of_the_page_paths_redirect_to_the_page(app: FastAPI, client: httpx.AsyncClient) -> None:
+    """Review finding public-5: `/docs/` and friends get a 308 to the page instead of the proxy's `not_roblox`
+    refusal (a tarpitted probe that counts toward a spam ban); the query string is kept."""
+    await update_settings(app, {"tarpit_enabled": 0})  # the paths left to the proxy below would be held 8 to 20 s
+    for path, target in (
+        ("/docs/", "/docs"),
+        ("/status/", "/status"),
+        ("/Docs", "/docs"),
+        ("/STATUS//", "/status"),
+        ("/docs/?q=a%20b&x=1", "/docs?q=a%20b&x=1"),
+    ):
+        for method in ("GET", "HEAD"):
+            response = await client.request(method, path)
+            assert response.status_code == 308, (method, path)
+            assert response.headers["location"] == target, (method, path)
+            assert "roxy-refusal" not in response.headers
+    followed = await client.get("/docs/", follow_redirects=True)
+    assert followed.status_code == 200
+    assert str(followed.url).endswith("/docs")
+    # Nothing else changes: the canonical paths are the pages, and other paths and methods go where they went.
+    assert (await client.get("/docs")).status_code == 200
+    for method, path in (("POST", "/docs/"), ("GET", "/docs/extra"), ("GET", "/robots.txt/")):
+        assert (await client.request(method, path)).status_code != 308, (method, path)
+    for path in ("/docs", "/status", "/docs/x", "/statusx", "/", "/docs.html"):
+        assert pages.canonical_page_path(path) is None, path
 
 
 async def test_guide_describes_refusal_bodies_as_they_are_sent(app: FastAPI, client: httpx.AsyncClient) -> None:

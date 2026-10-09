@@ -152,8 +152,8 @@
 					</li>
 					{% endif %}
 					<li>
-						Over a limit, Roxy answers <code>429</code> with a <code>Retry-After</code> header. Wait that many
-						seconds; retrying sooner makes the wait longer.
+						Over a limit, Roxy answers <code>429</code> with a <code>Retry-After</code> header.
+						{{ limits.retry_rule }}
 					</li>
 					<li>
 						<strong>Tip:</strong> your own cache is the best way to stay under the limit. An answer your game

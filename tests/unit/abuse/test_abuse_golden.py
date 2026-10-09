@@ -109,6 +109,16 @@ async def test_pause_skips_shared_state_entirely(
     assert rows == 0  # a paused request never takes the write lock
 
 
+GENUINE_THROTTLE_HEADERS = [
+    ("Roxy-Requests-Left", "0"),
+    ("Roxy-Throttle-Reset", "50"),
+    ("Roxy-Throttled", "True"),
+    ("Retry-After", "50"),
+    ("Roxy-Refusal", "throttle"),
+]
+"""A clean client's genuine per-IP throttle refusal headers, in wire order (`test_per_ip_throttle`)."""
+
+
 # --- 2 bans and deny list ---------------------------------------------------------------------------------------------
 
 
@@ -120,13 +130,7 @@ async def test_ban_disguised_as_throttle(
     refusal = await refuse(pipeline)
     assert refusal.status == 429
     assert refusal.body == RUNG1
-    assert refusal.headers == {
-        "Retry-After": "50",
-        "Roxy-Requests-Left": "0",
-        "Roxy-Throttle-Reset": "50",
-        "Roxy-Throttled": "True",
-        "Roxy-Refusal": "throttle",
-    }
+    assert list(refusal.headers.items()) == GENUINE_THROTTLE_HEADERS  # values and wire order (finding spec-1)
     assert refusal.reason is ReasonCode.BANNED
     assert refusal.disguised
     assert refusal.tarpit_category == "ban"
@@ -254,13 +258,14 @@ async def test_per_ip_throttle(pipeline_with: Callable[..., AbusePipeline], mode
     refusal = await refuse(pipeline)
     assert refusal.status == 429
     assert refusal.encoded_body() == b'"Too many requests; please slow down."\n'
-    assert refusal.headers == {
-        "Roxy-Requests-Left": "0",
-        "Roxy-Throttle-Reset": "50",
-        "Roxy-Throttled": "True",
-        "Retry-After": "50",
-        "Roxy-Refusal": "throttle",
-    }
+    # The wire order too: every disguised refusal must reproduce it exactly (finding spec-1).
+    assert list(refusal.headers.items()) == [
+        ("Roxy-Requests-Left", "0"),
+        ("Roxy-Throttle-Reset", "50"),
+        ("Roxy-Throttled", "True"),
+        ("Retry-After", "50"),
+        ("Roxy-Refusal", "throttle"),
+    ]
     assert refusal.tarpit_category == "throttle"
     assert refusal.detail == "Per-IP limit 10 per 50s"
     assert refusal.penalty_retry_after_s == 50
@@ -487,13 +492,7 @@ async def test_header_filter_disguised(
     refusal = await refuse(pipeline, req)
     assert refusal.status == 429
     assert refusal.body == RUNG1  # byte identical to a genuine throttle refusal for a clean client
-    assert refusal.headers == {
-        "Retry-After": "50",
-        "Roxy-Requests-Left": "0",
-        "Roxy-Throttle-Reset": "50",
-        "Roxy-Throttled": "True",
-        "Roxy-Refusal": "throttle",
-    }
+    assert list(refusal.headers.items()) == GENUINE_THROTTLE_HEADERS  # values and wire order (finding spec-1)
     assert "xeno" not in str(refusal.headers).lower()
     assert refusal.reason is ReasonCode.HEADER_RULE
     assert refusal.disguised

@@ -104,13 +104,21 @@ ACCEPTED_BUT_SLOW: list[tuple[str, str]] = [
 ]
 
 
+LONG_TARGET = 8192 - len("user-agent")
+"""The longest User-Agent a caller can send under the default `max_header_bytes` (8 KiB per header line), and about
+the longest path under the catalog maximum of `max_url_length`: what the cost model sizes inputs at (INGRESS-2)."""
+
 # Patterns the validator still accepts that come closest to its cost budget (`rules/regex_cost.py`), each with its
-# slowest known caller input. They must stay accepted (the budget is not "refuse everything") and fast.
+# slowest known caller input of `LONG_TARGET` characters. They must stay accepted (the budget is not "refuse
+# everything") and fast. The four near-budget patterns of fix pass 1 (`users/\d+/.*friends`, `catalog.*search`,
+# `^\w+\W`, `^Mozilla/5\.0 \(.*\) AppleWebKit/.*Chrome/\d+`) took 10 to 20 ms on 8 KiB once inputs were sized
+# honestly, and are refused now (tests/unit/rules/test_regex_cost.py REFUSED).
 NEAR_BUDGET: list[tuple[str, str]] = [
-    (r"users/\d+/.*friends", "users/1/" * (MAX_TARGET // 8) + "friend"),
-    (r"catalog.*search", "catalog" * (MAX_TARGET // 7) + "searc"),
-    (r"^\w+\W", "a" * MAX_TARGET),
-    (r"^Mozilla/5\.0 \(.*\) AppleWebKit/.*Chrome/\d+", "Mozilla/5.0 (" + ") AppleWebKit/" * (MAX_TARGET // 15)),
+    (r"\d{1,3}\d{1,3}x", "1" * LONG_TARGET),
+    (r"[a-z]{3,8}\d{2,4}x", "a" * LONG_TARGET),
+    (r"x{1,100}y", "x" * LONG_TARGET),
+    ("[a-z]?" * 6 + "[0-9]", "a" * LONG_TARGET),
+    (r"^catalog.*search", "catalog" * (LONG_TARGET // 7) + "searc"),
 ]
 
 

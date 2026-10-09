@@ -131,14 +131,19 @@ def _int_or_none(value: Any) -> int | None:
 
 
 def page_path(url: Any) -> str:
-    """The path of a page URL with the query and fragment removed and secret segments masked."""
+    """The path of a page URL with the query and fragment removed and secret segments masked.
+
+    The path is cut to twice the stored length BEFORE it is redacted, so an anonymous report pays a bounded amount
+    of scrubbing whatever it sends (review finding public-4). Safe: whatever survives the final cut lies inside the
+    redacted prefix, with room for a whole 24 character credential window around it.
+    """
     if not isinstance(url, str) or not url:
         return ""
     try:
         parts = urlsplit(url)
     except ValueError:
         return ""
-    return _cut(redact_path(parts.path or "/"))
+    return _cut(redact_path((parts.path or "/")[: 2 * MAX_FIELD_CHARS]))
 
 
 def blocked_resource(value: Any) -> str:

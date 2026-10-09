@@ -39,7 +39,7 @@ class FloodCheck(Check):
     tarpit_category = "throttle"
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
-        limit = facts.int("flood_limit_per_minute", 300)
+        limit = facts.int("flood_limit_per_minute")
         return LimitSpec(self.name, f"flood:{facts.limit_key}", "gcra", limit=limit, window_s=60, always_commit=True)
 
     async def check(self, req: Any, tx: TxState) -> Refuse | None:

@@ -328,9 +328,15 @@ _MAX_DECODE_ROUNDS = 2
 # `scheme://user:password@` in any URL (the rotator URL embeds its password this way). Greedy up to the LAST "@"
 # before the path, so a password that itself contains "@" is removed whole.
 _USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{0,15}://)[^\s/\"'<>]+@")
-# Whole header lines whose value is secret, for logged raw requests.
+# Whole header lines whose value is secret, for logged raw requests. Linear time on any text (findings INGRESS-1
+# and public-4): with MULTILINE, `^` matches after every line break, so the spaces around the name and the colon
+# are `[^\S\n]*` (any whitespace except a line break) and can never run on into the following lines. With `\s*`
+# there, text made of n line breaks (a caller's `%0A` run, decoded) cost about n * n / 2 steps on the event loop.
+# One folded continuation line (`Cookie:` then a line starting with a space) is still covered by the bounded
+# `(?:\n[^\S\n]+)?`.
 _HEADER_LINE_RE = re.compile(
-    r"(?im)^(\s*(?:cookie|set-cookie|authorization|proxy-authorization|x-csrf-token|x-roblox-token)\s*:\s*)(\S.*)$"
+    r"(?im)^([^\S\n]*(?:cookie|set-cookie|authorization|proxy-authorization|x-csrf-token|x-roblox-token)"
+    r"[^\S\n]*:[^\S\n]*(?:\n[^\S\n]+)?)(\S.*)$"
 )
 # `key=value`, `key: value`, `"key": "value"` and `'key': 'value'` pairs. The callback decides by the key name.
 _PAIR_RE = re.compile(
@@ -522,6 +528,10 @@ def _as_text(value: str | bytes) -> str:
     return value.decode("latin-1") if isinstance(value, bytes) else str(value)
 
 
+REDACTED_HEADER_NAME = "[redacted-header-{n}]"
+"""What `redact_headers` stores in place of a header NAME that holds a secret (numbered, so two stay apart)."""
+
+
 def redact_headers(
     headers: Mapping[str, str] | Mapping[bytes, bytes] | Iterable[tuple[str | bytes, str | bytes]],
     *,
@@ -531,6 +541,9 @@ def redact_headers(
 
     Accepts a mapping or (name, value) pairs, with str or ASGI bytes. Secret header names lose their whole value;
     every other value is scrubbed with `redact_text`. `max_value_length` clips long values (captures use 2000).
+    A header NAME is caller text too (any HTTP token, so 40 characters of the credential make a valid name, and
+    caller headers are never forwarded, so the leak guard never sees them): a name that `redact_label` changes is
+    replaced by `[redacted-header-N]` and its value by `[redacted]` (finding cred-8, plan 9.15).
     """
     pairs: Iterable[tuple[str | bytes, str | bytes]]
     if isinstance(headers, Mapping):
@@ -538,8 +551,13 @@ def redact_headers(
     else:
         pairs = headers
     out: dict[str, str] = {}
+    hidden = 0
     for raw_name, raw_value in pairs:
         name = _as_text(raw_name)
+        if redact_label(name) != name:
+            hidden += 1
+            out[REDACTED_HEADER_NAME.format(n=hidden)] = MASK
+            continue
         if is_sensitive_key(name):
             out[name] = MASK
             continue

@@ -83,7 +83,7 @@ def test_settings_follow_plan_5_2(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert conf.reuse_port is True
     assert conf.bind == ["127.0.0.1:8002"]
     assert conf.INTERNAL_SOCKET == "/run/roxy-green/internal.sock"
-    assert all(callable(getattr(conf, hook)) for hook in ("on_starting", "post_fork", "on_exit"))
+    assert all(callable(getattr(conf, hook)) for hook in ("on_starting", "pre_fork", "post_fork", "on_exit"))
     assert 0o777 & ~conf.umask == 0o660, "the internal socket is created 0660"
     assert conf.timeout == 30
     assert conf.graceful_timeout == 30

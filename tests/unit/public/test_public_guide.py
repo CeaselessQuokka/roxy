@@ -394,6 +394,57 @@ def test_guide_says_when_strikes_never_fade(catalog_get: Callable[..., Getter]) 
     assert "Strikes do not fade on their own right now" in never
 
 
+def test_guide_follows_the_strike_settings(catalog_get: Callable[..., Getter]) -> None:
+    """Review finding public-7: the ladder and retry sentences follow `throttle_escalation_enabled` and
+    `throttle_strike_on_retry` (and say what `abuse/throttle.py` does with each combination)."""
+    default = flat(rendered_guide(catalog_get()))
+    assert "each strike makes the next wait longer (by default 1, 2, 4 and then 8 times the window)" in default
+    assert "Retrying while you are throttled can add a strike, so always wait for <code>Retry-After</code>." in default
+    assert "Respect <code>Retry-After</code>. Retrying sooner only makes the wait longer." in default
+
+    no_retry = flat(rendered_guide(catalog_get(throttle_strike_on_retry=0)))
+    assert "each strike makes the next wait longer" in no_retry
+    assert "can add a strike" not in no_retry
+    assert "Retrying while you are throttled adds no strike right now" in no_retry
+    assert "Retrying sooner only makes the wait longer" not in no_retry
+    assert "Requests sent sooner are only refused." in no_retry
+
+    for mode, wait in (("fixed", "for one window (1 second)"), ("gcra", "only until your allowance has room again")):
+        off = flat(
+            rendered_guide(
+                catalog_get(throttle_escalation_enabled=0, throttle_window_mode=mode, throttle_reset_duration=1)
+            )
+        )
+        assert "Right now repeated violations do not make the wait longer" in off
+        assert f"each time, Roxy refuses your requests {wait}." in off
+        assert "each strike" not in off
+        assert "add a strike" not in off  # retry strikes need escalation (abuse/throttle.py)
+        assert "fades after" not in off  # no strikes are added, so their decay is not worth a sentence
+        assert "Requests sent sooner are only refused." in off
+
+
+def test_guide_follows_the_capture_settings(catalog_get: Callable[..., Getter]) -> None:
+    """Review finding public-8: chapter 10 opens with what is kept while capture is on (the shipped default, D8)."""
+    on = flat(rendered_guide(catalog_get()))
+    assert "Roxy also keeps the bodies of some requests and answers for a short time" in on
+    assert "body capture is currently <strong>on</strong>" in on
+    assert "It covers refused requests and about 20% of served requests" in on
+    assert "every captured body is deleted after 15 minutes." in on
+    assert "not normally kept" not in on
+    off = flat(rendered_guide(catalog_get(capture_enabled=0)))
+    assert "Request and answer bodies are not kept: body capture is currently <strong>off</strong>." in off
+    assert "Roxy also keeps the bodies" not in off
+    refusals_only = flat(rendered_guide(catalog_get(capture_sample_served_pct=0)))
+    assert "It covers refused requests only," in refusals_only
+
+
+def test_guide_states_the_url_limit_and_its_414(catalog_get: Callable[..., Getter]) -> None:
+    """Review finding public-9: chapter 2 gives the live `max_url_length`, and chapter 7 has Roxy's own 414."""
+    page = flat(rendered_guide(catalog_get(max_url_length=2048)))
+    assert "may be up to 2,048 characters long; a longer one is answered with <code>414</code>." in page
+    assert "<td>414</td>" in page
+
+
 def test_guide_links_to_status_only_while_it_is_enabled(catalog_get: Callable[..., Getter]) -> None:
     enabled = rendered_guide(catalog_get())
     disabled = rendered_guide(catalog_get(public_status_page_enabled=0))

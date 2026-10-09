@@ -26,7 +26,9 @@ How it works
       `authfail:<key>:<random>` with `window_start` = the attempt time in seconds. All slots of one key share a
       prefix, so they are read with one primary key range scan. At most `max_failures` slots exist per key.
     - The global guard is the single row `global`: a one-minute window start and the attempts counted in it.
-    - Bounded (plan P9): rows older than an hour are pruned by the leader (`storage/retention.py`), and when the
+    - Bounded (plan P9): rows older than the longest window the catalog accepts (a day,
+      `storage/retention.py LOGIN_WINDOW_MAX_S`, and never less than the live window) are pruned by the leader, so
+      pruning never shortens a lockout (review finding AUTH-1), and when the
       table passes `MAX_TRACKED_LOGIN_IPS` rows the oldest slots are dropped at insert time.
 
 What to read next

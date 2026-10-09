@@ -86,6 +86,61 @@ def without_comments(source: str) -> str:
     return "\n".join(line.split("--", 1)[0] for line in source.splitlines())
 
 
+HTTP_CALL = re.compile(r"\bHttpService:(\w+)\(")
+
+
+def pcall_blocks(lines: list[str]) -> list[tuple[int, int]]:
+    """`(first, last)` line indexes of every `pcall(function ... end)` block. The examples indent with tabs, so a
+    block ends at the first later line with the opening line's indentation that starts with `end)` (or on the
+    opening line itself, for a one-line block)."""
+    blocks = []
+    for first, line in enumerate(lines):
+        if "pcall(function" not in line:
+            continue
+        if re.search(r"\bend\)", line.split("pcall(function", 1)[1]):
+            blocks.append((first, first))
+            continue
+        indent = len(line) - len(line.lstrip("\t"))
+        closing = "\t" * indent + "end)"  # exactly this indentation: a deeper `end)` closes an inner block
+        last = next((index for index in range(first + 1, len(lines)) if lines[index].startswith(closing)), None)
+        assert last is not None, f"no end) closes the pcall on line {first + 1}"
+        blocks.append((first, last))
+    return blocks
+
+
+def http_calls_outside_pcall(code: str) -> list[str]:
+    """Every `HttpService:Method(` call on a line outside all pcall blocks, as `line: Method`."""
+    lines = code.splitlines()
+    blocks = pcall_blocks(lines)
+    return [
+        f"{index + 1}: {match.group(1)}"
+        for index, line in enumerate(lines)
+        for match in HTTP_CALL.finditer(line)
+        if not any(first <= index <= last for first, last in blocks)
+    ]
+
+
+def test_the_pcall_scan_sees_what_it_should() -> None:
+    """Guards the scan above, so the convention test cannot pass by finding nothing."""
+    code = without_comments(
+        "const ok, value = pcall(function(): string\n"
+        "\treturn HttpService:GetAsync(URL)\n"
+        "end)\n"
+        "const body = HttpService:JSONEncode(x)\n"
+        "const one = pcall(function(): string return HttpService:UrlEncode(x) end)\n"
+        "const function f(): ()\n"
+        "\tconst done, answer = pcall(function(): string\n"
+        "\t\tconst text = HttpService:JSONEncode(x) -- inside, three lines from the end\n"
+        "\t\tconst more = 1\n"
+        "\t\tconst still = 2\n"
+        "\t\treturn HttpService:PostAsync(URL, text)\n"
+        "\tend)\n"
+        "\tprint(HttpService:JSONEncode(answer))\n"
+        "end\n"
+    )
+    assert http_calls_outside_pcall(code) == ["4: JSONEncode", "13: JSONEncode"]
+
+
 @pytest.mark.parametrize("example", ALL_EXAMPLES, ids=lambda example: example.name)
 def test_example_is_strict_typed_and_global_free(example: Example) -> None:
     lines = example.source.splitlines()
@@ -95,12 +150,16 @@ def test_example_is_strict_typed_and_global_free(example: Example) -> None:
     # any unknown global inside a function).
     assert not re.search(r"^[A-Za-z_]\w*\s*=(?!=)", code, re.MULTILINE), "a global assignment"
     assert not re.search(r"^function \w+\s*\(", code, re.MULTILINE), "functions are const or module fields"
-    # Every function signature is typed: each parameter has an annotation, and named functions declare a return.
+    # Every function signature is typed, as chapter 3 promises: each parameter has an annotation, and every
+    # function declares a return type, the anonymous ones handed to pcall included (review finding public-6).
     for match in re.finditer(r"\bfunction\s*([\w.:]*)\s*\(([^)]*)\)(\s*:)?", code):
         for parameter in filter(None, (part.strip() for part in match.group(2).split(","))):
             assert ":" in parameter, (example.name, match.group(0))
-        if match.group(1):
-            assert match.group(3), f"{example.name}: {match.group(0)} has no return type"
+        assert match.group(3), f"{example.name}: {match.group(0)} has no return type"
+    # Every HttpService call sits inside a `pcall(function ... end)` block, as chapter 3 promises: those calls
+    # raise instead of returning an error (JSONEncode too, for a value JSON cannot hold).
+    outside = http_calls_outside_pcall(code)
+    assert outside == [], f"{example.name}: HttpService calls outside pcall: {outside}"
     if "RequestAsync" in code or "GetAsync" in code:
         assert "pcall(" in code, "HttpService calls raise on failure, so every example wraps them in pcall"
     if "JSONDecode" in code:

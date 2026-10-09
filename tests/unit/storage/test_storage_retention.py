@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import sqlite3
@@ -11,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from roxy.config.catalog import CATALOG
 from roxy.storage import retention
 from roxy.storage.retention import (
     HOT_TASKS,
@@ -455,6 +457,98 @@ def test_daily_truncate_due() -> None:
     )
     assert not busy[0]
     assert daily_truncate_due(at, maintenance_hour=9, tz_name="Not/AZone", last_run_day=None)[0]  # falls back to UTC
+
+
+# --- rows that enforce a limit outlive the limit's longest period (findings AUTH-1, AUTH-2) ---------------------------
+
+
+def test_login_failure_slots_outlive_the_longest_lockout_window(dbs) -> None:
+    """AUTH-1: no admin_login_window_s the catalog accepts is longer than what retention keeps."""
+    assert RetentionPolicy().login_failures_idle_s >= CATALOG["admin_login_window_s"].max
+    assert CATALOG["admin_login_window_s"].max == retention.LOGIN_WINDOW_MAX_S
+
+    def fill(conn: sqlite3.Connection) -> None:
+        for age in (2 * 3600, DAY - 60, DAY + 60):
+            conn.execute(
+                "INSERT INTO login_failures (subject, count, window_start) VALUES (?, 1, ?)",
+                (f"authfail:192.0.2.0/24|abc:{age}", int(NOW - age)),
+            )
+
+    dbs.hot.write_sync(fill)
+    assert _loop(dbs.hot, retention.prune_login_failures, RetentionPolicy()) == 1  # only the one past a day
+    # A policy with a shorter idle still keeps every slot the live window counts: the 2 h old slot stays inside a
+    # 3 h window, the almost day-old one goes.
+    short = RetentionPolicy(login_failures_idle_s=3600, admin_login_window_s=3 * 3600)
+    assert _loop(dbs.hot, retention.prune_login_failures, short) == 1
+    assert _loop(dbs.hot, retention.prune_login_failures, RetentionPolicy(login_failures_idle_s=3600)) == 1
+
+
+def test_policy_from_settings_reads_the_live_lockout_window() -> None:
+    policy = RetentionPolicy.from_settings({"admin_login_window_s": 7200}.get)
+    assert policy.admin_login_window_s == 7200
+    assert policy.login_failures_idle_s == retention.LOGIN_WINDOW_MAX_S
+
+
+def test_alert_dedupe_rows_outlive_the_longest_alert_cooldown(dbs) -> None:
+    """AUTH-2: `alert:` rows stay 45 days, the hourly cap rows a day, and the table has a row cap."""
+
+    def fill(conn: sqlite3.Connection) -> None:
+        rows = [
+            ("alert:quota:95:1", int(NOW - 2 * DAY)),  # a rotator quota alert two days into its cooldown: kept
+            ("alert:old", int(NOW - 46 * DAY)),  # past every cooldown: pruned
+            ("cap:email", int(NOW - 2 * DAY)),  # an hourly cap window from two days ago: pruned
+            ("capdrop:email", int(NOW - 600)),  # recent: kept
+        ]
+        conn.executemany("INSERT INTO email_gate (key, last_sent_at) VALUES (?, ?)", rows)
+
+    dbs.hot.write_sync(fill)
+    assert _loop(dbs.hot, retention.prune_email_gate, RetentionPolicy()) == 2
+    keys = dbs.hot.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT key FROM email_gate")))
+    assert keys == ["alert:quota:95:1", "capdrop:email"]
+    capped = RetentionPolicy(email_gate_max_rows=1)
+    assert _loop(dbs.hot, retention.prune_email_gate, capped) == 1  # the oldest goes first
+    keys = dbs.hot.read_sync(lambda c: [r[0] for r in c.execute("SELECT key FROM email_gate")])
+    assert keys == ["capdrop:email"]
+
+
+def _constant(node: ast.expr) -> float | None:
+    """The value of a constant number expression such as `40 * 86_400`, else None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int | float) and not isinstance(node.value, bool):
+        return float(node.value)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult | ast.Add):
+        left, right = _constant(node.left), _constant(node.right)
+        if left is None or right is None:
+            return None
+        return left * right if isinstance(node.op, ast.Mult) else left + right
+    return None
+
+
+def test_every_alert_cooldown_fits_in_the_alert_gate_retention() -> None:
+    """The dedupe row must outlive every cooldown an alert can ask for: the alert table, the cooldown settings at
+    their catalog maximum, and every literal `cooldown_s=` handed to an alert in the source (the rotator quota alert
+    passes 40 days)."""
+    from roxy.notify.alerts import ALERT_SPECS
+    from roxy.notify.gate import ALERT_PREFIX
+
+    assert ALERT_PREFIX == retention.ALERT_GATE_PREFIX
+    keep = RetentionPolicy().email_gate_alert_idle_s
+    assert keep == retention.ALERT_GATE_KEEP_S
+    cooldowns = [float(spec.cooldown_s or 0) for spec in ALERT_SPECS.values()]
+    cooldowns += [
+        float(CATALOG[spec.cooldown_setting].max or 0) for spec in ALERT_SPECS.values() if spec.cooldown_setting
+    ]
+    src = Path(retention.__file__).resolve().parents[1]
+    literal: list[tuple[str, float]] = []
+    for path in sorted(src.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and any(k.arg == "cooldown_key" for k in node.keywords):
+                for keyword in node.keywords:
+                    value = _constant(keyword.value) if keyword.arg == "cooldown_s" else None
+                    if value is not None:
+                        literal.append((path.name, value))
+    assert any(name == "rotator.py" for name, _ in literal), "the scan sees the rotator quota alert"
+    cooldowns += [value for _, value in literal]
+    assert max(cooldowns) <= keep, f"an alert cooldown of {max(cooldowns)} s outlives its dedupe row ({keep} s)"
 
 
 def test_prune_directory_by_age_count_and_bytes(tmp_path: Path) -> None:

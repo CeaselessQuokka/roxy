@@ -17,7 +17,9 @@ Why it exists
 How it works
     `serve` walks this table, top to bottom (plan 7.6, 7.7, 6.9):
     - No key (cache off, method not cacheable, a `cache_private` credential endpoint): upstream directly, `OFF`.
-    - Fresh entry: `HIT` (a cached 400/403/404/410 replays its status, reason `cache_negative`).
+    - Fresh entry: `HIT` (a cached 400/403/404/410 replays its status, reason `cache_negative`). Fresh means
+      fresh when `peek` read it: the abuse verdict in between may have admitted the request only as a cache hit,
+      so an entry that expired during the verdict is still served, never fetched (finding INGRESS-3).
     - A live per-key 429 marker: the stale entry (`STALE`, `cache_stale_cooldown`) or 429 with Retry-After
       (`upstream_cooldown`, `MISS`), without contacting Roblox.
     - Expired within the SWR window (`cache_swr_seconds`, or the rule's `stale_ttl`): served at once as
@@ -35,11 +37,14 @@ How it works
       short-lived cache.db handoff row); a failure with a stale entry becomes `STALE` (`cache_stale_error`,
       `stale_after_failure`); a follower whose wait ends gets the stale entry or 503 `coalesce_timeout` with
       the owner's remaining deadline as Retry-After. Followers never call upstream after an owner failure.
+      Followers in other workers also look in cache.db while the owner's outcome is late (`_stored_answer`,
+      plan 6.9 step 4), so an owner that stored its answer but never published it still answers them.
     Every refetch of a key that had a body before feeds `change_observations` (identical body or not) for TTL
-    tuning (F10). An answer fetched with the credential belongs to its own request alone (plan 6.9, C2): when the
-    upstream used the credential for a key that is not a credential key (the rules moved between the peek and the
-    routing), the answer is never stored, never handed to a follower in this worker or another (they compete
-    again and make their own call), and never served stale or by a refresh.
+    tuning (F10). An answer fetched with the credential belongs to its own request alone (plan 6.9, C2) when the
+    rules moved between the peek and the routing: the upstream used the credential for a key that is not a
+    credential key, or fetched it under an allowlist row that is `cache_private` (`UpstreamResult.private`, or the
+    row as it is when the answer arrives). Such an answer is never stored, never handed to a follower in this
+    worker or another (they compete again and make their own call), and never served stale or by a refresh.
     Pattern matching runs under `roxy.rules.match.regex_budget` (plan 9.9): the policy lookup in `peek` (cache
     rules and the credential allowlist), the availability check and every upstream call made for a request, so a
     stored slow regex costs at most the budget, never one timeout per rule. Budgets nest: inside the router's
@@ -65,7 +70,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
 
-from roxy.cache.keys import HANDOFF_SUFFIX, MARKER_SUFFIX, VARY_HEADERS, CacheKey, assert_forward_list, build_key
+from roxy.cache.keys import (
+    HANDOFF_SUFFIX,
+    MARKER_SUFFIX,
+    VARY_HEADERS,
+    CacheKey,
+    assert_forward_list,
+    build_key,
+    canonical_method,
+)
 from roxy.cache.policy import CacheSettings, RequestPolicy, StoreDecision, StoreKind, request_policy, store_decision
 from roxy.cache.spread import DEFAULT_MAX_ROWS, SpreadGroup, compute_spread, rows_from_db, thresholds
 from roxy.cache.store import CacheEntry, CacheStore, EvictionReport, PurgeScope
@@ -118,6 +131,10 @@ HANDOFF_BODY_MAX: Final = 8 * 1024 * 1024
 HANDOFF_TTL_S: Final = 10
 """How long a handoff row is kept: followers read it within the outcome's one second linger; the maintenance
 pass deletes it once this has passed."""
+STORE_CHECK_MARGIN_S: Final = 1
+"""A follower that looks in cache.db for its owner's answer (`_stored_answer`) accepts rows stored at most this
+many whole seconds before its own request began (timestamps are whole seconds and the wall clock can step back a
+little); anything older was not fetched for this request."""
 
 
 class RulesProvider(Protocol):
@@ -244,16 +261,18 @@ class _OwnerValue:
 
 
 def _private_to(result: Any, key: CacheKey) -> bool:
-    """True when `result` was fetched with the credential for a key that is not a credential key.
+    """True when `result` was fetched with the credential and belongs to its own request alone (plan 6.9, C2):
+    the key is not a credential key, or the upstream fetched it under a `cache_private` allowlist row (or none),
+    which it reports as `result.private`.
 
-    The upstream routes with its own read of the rules, so an allowlist row added (or a regex timing out
-    differently) between `peek` and the fetch can send an anonymous key's request with the credential. Such an
-    answer is its own request's alone (plan 6.9, C2): never stored, coalesced or stale-served to anyone else.
+    The upstream routes with its own read of the rules, so an allowlist row added, changed to `cache_private` (or a
+    regex timing out differently) between `peek` and the fetch can send the request with the credential under a
+    privacy the key does not show (findings F2 and cred-4). Such an answer is never stored, coalesced, revalidated
+    or stale-served to anyone else.
     """
-    return (
-        AuthClass(getattr(result, "auth_class", AuthClass.ANON)) is AuthClass.CRED
-        and key.auth_class is not AuthClass.CRED
-    )
+    if AuthClass(getattr(result, "auth_class", AuthClass.ANON)) is not AuthClass.CRED:
+        return False
+    return key.auth_class is not AuthClass.CRED or bool(getattr(result, "private", False))
 
 
 class _LazyUpstream:
@@ -518,7 +537,11 @@ class CacheService:
         now = self._clock.now()
         policy = peek.policy
         fresh = peek.fresh
-        if fresh is not None and fresh.is_fresh(now):
+        if fresh is not None:
+            # Served even if it expired since the peek (finding INGRESS-3). The abuse verdict between the two may
+            # have let this request through, uncounted, or answered a throttled caller, only because the peek saw
+            # a fresh hit (`fresh_cache_hit`); a fresh check against the later clock would turn that request into
+            # an upstream call the limiter never allowed. The overrun is the verdict's own budget (one hot.db write).
             self.stats.hits += 1
             reason = ReasonCode.CACHE_NEGATIVE if fresh.negative else ReasonCode.CACHE_HIT
             return self._from_entry(fresh, CacheState.HIT, reason, now)
@@ -600,6 +623,10 @@ class CacheService:
         remaining = _deadline_remaining(req)
         if remaining is not None:
             wait_s = max(0.0, min(wait_s, remaining - FOLLOWER_DEADLINE_HEADROOM_S))
+        since = int(self._clock.now()) - STORE_CHECK_MARGIN_S
+
+        async def stored(final: bool) -> FlightOutcome | None:
+            return await self._stored_answer(key, cs, since, final=final)
 
         async def fetch(start: FlightStart) -> tuple[_OwnerValue, FlightOutcome | Deferred]:
             if start.takeover:
@@ -626,12 +653,54 @@ class CacheService:
                 wait_s=wait_s,
                 enabled=peek.policy.coalesce,
                 hooked=True,
+                check=stored,
             )
             served = await self._serve_flight(flight, key, stale)
             if served is not None:
                 return served
         self.stats.coalesce_timeouts += 1
         return self._timeout_result(key, 1)
+
+    async def _stored_answer(
+        self, key: CacheKey, cs: CacheSettings, since: int, *, final: bool
+    ) -> FlightOutcome | None:
+        """Where a follower looks when the owner's outcome is late (plan 6.9 step 4 polls cache.db; finding mp-12).
+
+        The owner writes cache.db before it publishes, so an owner whose publish never landed (hot.db busy, then
+        its worker stopped or was killed) has still left its answer here: the fresh entry, as a `stored` outcome,
+        or on the last look before a timeout its handoff row (a big unstored answer), as a `shared` one. Only rows
+        written since `since` (the request's start minus `STORE_CHECK_MARGIN_S`) count, so a caller that asked for
+        a fresh copy (`Cache-Control: no-cache`) never gets an older entry this way. Read errors are a miss.
+        """
+        now = self._clock.now()
+        entry = await self.store.get(key.id, now=now, disk=cs.disk_enabled)
+        if (
+            entry is not None
+            and entry.is_fresh(now)
+            and entry.auth_class == key.auth_class
+            and not entry.is_marker
+            and entry.stored_at >= since
+        ):
+            return self._stored_outcome(entry)
+        if not final:
+            return None  # handoff rows hold up to 8 MiB: read one only instead of answering 503
+        handoff = await self.store.read_handoff(key.handoff_id)
+        if (
+            handoff is None
+            or handoff.auth_class != key.auth_class
+            or handoff.stored_at < since
+            or now >= handoff.stale_until
+        ):
+            return None
+        reason = ReasonCode.UPSTREAM_4XX if 400 <= handoff.status < 500 else ReasonCode.UPSTREAM_OK
+        return FlightOutcome(
+            OutcomeKind.SHARED,
+            status=handoff.status,
+            reason=reason.value,
+            body=handoff.body,
+            content_type=handoff.content_type,
+            upstream_status=handoff.status,
+        )
 
     async def _serve_flight(
         self, flight: FlightResult[_OwnerValue], key: CacheKey, stale: CacheEntry | None
@@ -712,7 +781,7 @@ class CacheService:
         key = peek.key
         if key is None:  # owners always have a key
             raise RuntimeError("a cache owner needs a cache key")
-        if _private_to(result, key):
+        if _private_to(result, key) or self._row_now_private(req, result):
             self.stats.private += 1
             return _OwnerValue(result, None, None, private=True), FlightOutcome(OutcomeKind.PRIVATE)
         decision = store_decision(result, peek.policy, cs)
@@ -733,6 +802,20 @@ class CacheService:
         req_body = body if key.method == "POST" and body and decision.kind is StoreKind.ENTRY else None
         finish = functools.partial(self._finish, key, result, entry, content is not None, req_body, cs, peek.generation)
         return _OwnerValue(result, content, decision), Deferred(finish)
+
+    def _row_now_private(self, req: Any, result: Any) -> bool:
+        """A credential answer whose allowlist row is `cache_private` (or gone) in the rules as they are now.
+
+        Defense in depth for `_private_to` (finding cred-4): when an admin marks an endpoint private while a flight
+        runs (the reason the switch exists), the answer is kept to its own request even if the upstream fetched it
+        just before the change. A match cut off by the regex budget finds no row and counts as private, which only
+        ever shares less. Anonymous answers are never private.
+        """
+        if AuthClass(getattr(result, "auth_class", AuthClass.ANON)) is not AuthClass.CRED:
+            return False
+        with regex_budget():  # the allowlist may hold regex rows (plan 9.9); nested in the request's budget
+            row = self._snapshot().credential_rule_for(_target_of(req), canonical_method(str(req.method)))
+        return row is None or bool(row.cache_private)
 
     async def _finish(
         self,
@@ -930,7 +1013,8 @@ class CacheService:
 
         async def fetch(start: FlightStart) -> tuple[_OwnerValue, FlightOutcome | Deferred]:
             # The refresh task copied the context of the request that started it: its own regex budget (plan
-            # 9.9), never what is left of that request's, which may already be spent.
+            # 9.9), never what is left of that request's, which may already be spent. `_absorb` matches the
+            # credential allowlist again (`_row_now_private`), so it runs inside the same budget.
             with regex_budget(fresh=True):
                 result = await self._call_upstream(
                     detached,
@@ -939,7 +1023,7 @@ class CacheService:
                     purpose="swr_refresh",
                     lease=start.lease,
                 )
-            return self._absorb(detached, peek, result, cs)
+                return self._absorb(detached, peek, result, cs)
 
         flight = await self.flights.try_lead(key.flight_key, fetch, owner_deadline_s=cs.owner_deadline_s, hooked=True)
         if flight is None:

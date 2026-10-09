@@ -180,20 +180,26 @@ class Flag:
     refuses: bool
 
 
-def _live(values: Mapping[str, Any], key: str, fallback: Any = None) -> Any:
-    """The live value, else the catalog default (plan 15.1), else `fallback` for a key the catalog lacks."""
+def _live(values: Mapping[str, Any], key: str) -> Any:
+    """The live value, else the catalog default (plan 15.1). A key the catalog lacks is a bug: KeyError.
+
+    Never a second, inline copy of a default: every `spam_<detector>_<name>` setting is in the catalog
+    (`config/settings/spam.py`, plan 15.3 E2).
+    """
     if key in values:
         return values[key]
     default = catalog_default(key)
-    return fallback if default is None else default
+    if default is None:
+        raise KeyError(f"{key} has no value: it is not a catalog setting")
+    return default
 
 
-def _setting(values: Mapping[str, Any], detector: str, name: str, default: Any) -> Any:
-    return _live(values, f"spam_{detector}_{name}", default)
+def _setting(values: Mapping[str, Any], detector: str, name: str) -> Any:
+    return _live(values, f"spam_{detector}_{name}")
 
 
 def _window(values: Mapping[str, Any], detector: str) -> int:
-    return max(10, int(_setting(values, detector, "window_s", 600)))
+    return max(10, int(_setting(values, detector, "window_s")))
 
 
 def _in_window(start: int, size: int, now_s: int, window_s: int) -> bool:
@@ -213,10 +219,10 @@ def evaluate_row(
     for start, members in sets.items():
         if _in_window(start, size, now_s, window):
             distinct |= members
-    threshold = float(_setting(values, detector, "threshold", 0))
+    threshold = float(_setting(values, detector, "threshold"))
     if detector == "rate":
-        per_s = int(values.get("allowed_requests_per_minute", 10)) / max(
-            1, int(values.get("throttle_reset_duration", 50))
+        per_s = int(_live(values, "allowed_requests_per_minute")) / max(
+            1, int(_live(values, "throttle_reset_duration"))
         )
         limit = threshold * per_s * window
         return total > limit, float(total), limit
@@ -308,7 +314,7 @@ class SpamDetectors:
         return pending
 
     def _count(self, values: Mapping[str, Any], detector: str, who: str, now_s: int, value: str | None = None) -> None:
-        if not bool(_setting(values, detector, "enabled", 0)):
+        if not bool(_setting(values, detector, "enabled")):
             return
         slot = self._slot(f"{SIGNAL_OF[detector]}|{who}")
         if slot is None:
@@ -417,7 +423,7 @@ class SpamDetectors:
             cap = (
                 MAX_SET_PER_BUCKET
                 if detector == "bust"
-                else min(MAX_SET_PER_BUCKET, int(float(_setting(values, detector, "threshold", 0))) + 1)
+                else min(MAX_SET_PER_BUCKET, int(float(_setting(values, detector, "threshold"))) + 1)
             )
             row = conn.execute("SELECT buckets_json FROM spam_windows WHERE subject = ?", (subject,)).fetchone()
             inserted += row is None
@@ -432,11 +438,11 @@ class SpamDetectors:
                 "updated_at = excluded.updated_at",
                 (subject, json.dumps(merged, separators=(",", ":")), now_s),
             )
-            if not bool(_setting(values, detector, "enabled", 0)):
+            if not bool(_setting(values, detector, "enabled")):
                 continue
             fired, value, threshold = evaluate_row(detector, merged, values, now_s)
             if fired:
-                action = str(_setting(values, detector, "action", "recommend"))
+                action = str(_setting(values, detector, "action"))
                 if detector in RECOMMEND_ONLY or not who.startswith("ip:"):
                     action = "recommend"  # places and fleet-wide subjects only ever recommend (plan 10.3)
                 detections.append(
@@ -617,7 +623,7 @@ class SpamDetectors:
             "evidence": detection.evidence,
         }
         if action == "ban" and detection.limit_key is not None:
-            if bool(values.get("spam_dry_run", 1)):
+            if bool(_live(values, "spam_dry_run")):
                 self._event("spam_would_ban", "warning", detail)
                 return
             if self.rules_service is not None and self.control_db is not None:
@@ -628,8 +634,8 @@ class SpamDetectors:
                         limit_key=detection.limit_key,
                         detector=f"spam_{detection.detector}",
                         reason_text=detection.evidence,
-                        base_minutes=int(_setting(values, detection.detector, "ban_minutes", 0)),
-                        max_minutes=int(_setting(values, detection.detector, "ban_max_minutes", 0)),
+                        base_minutes=int(_setting(values, detection.detector, "ban_minutes")),
+                        max_minutes=int(_setting(values, detection.detector, "ban_max_minutes")),
                         now=now_s,
                     )
                 except Exception:  # a failed ban must never stop the flush loop; it is logged and retried next time

@@ -57,7 +57,7 @@ class HeaderRuleCheck(Check):
                 tarpit_category=self.tarpit_category,
                 detail=detail,
             )
-        window = max(1, facts.int("throttle_reset_duration", 50))
+        window = max(1, facts.int("throttle_reset_duration"))
         return Refuse(
             status=429,
             body=message,

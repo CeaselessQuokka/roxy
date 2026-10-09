@@ -253,13 +253,22 @@ ODD_SHAPES: dict[str, tuple[str, tuple[str, ...]]] = {
     "prefix_in_the_middle": (SECRET_PART[:60] + TOKEN_PREFIX + SECRET_PART[60:], (SECRET_PART[:60], SECRET_PART[60:])),
     "prefix_twice": (TOKEN_PREFIX + TOKEN_PREFIX + SECRET_PART, (SECRET_PART,)),
     "lowercase_prefix": (TOKEN_PREFIX.lower() + SECRET_PART, (SECRET_PART,)),
+    # Review finding cred-1: encoded copies (what encodeURIComponent and cookie tools produce, or Roblox's own
+    # Set-Cookie may carry); the value is classified in its canonical, decoded form.
+    "encoded_prefix": (quote(TOKEN_PREFIX, safe="-_.!~*'()") + SECRET_PART, (SECRET_PART,)),
+    "fully_encoded": ("".join(f"%{b:02X}" for b in (TOKEN_PREFIX + SECRET_PART).encode()), (SECRET_PART,)),
+    "partly_encoded": (TOKEN_PREFIX.replace(":", "%3A") + SECRET_PART, (SECRET_PART,)),
+    "encoded_twice": (quote(quote(TOKEN_PREFIX, safe=""), safe="") + SECRET_PART, (SECRET_PART,)),
+    "short_leftover_between_warnings": (TOKEN_PREFIX + "ODDLEFT10X" + TOKEN_PREFIX + SECRET_PART, (SECRET_PART,)),
 }
 
 
 @pytest.mark.parametrize("shape", list(ODD_SHAPES), ids=list(ODD_SHAPES))
 def test_matcher_ignores_public_text_wherever_it_is_stored(shape: str) -> None:
-    """Whatever a stored value looks like (rotated cookies Roblox sends are not validated, and a matcher keeps old
-    values), no window of the public text matches, while every 24 character window of each secret piece does."""
+    """Whatever a stored value looks like (rotated cookies Roblox sends are not validated, a matcher keeps old
+    values, and a value may be stored percent-encoded), no window of the public text matches, nor any short
+    fragment of it in any spelling (finding cred-1: `_|WARNING:` became `_%7CWARNING%3A` in the URL), while every
+    24 character window of each secret piece does."""
     value, pieces = ODD_SHAPES[shape]
     matcher = LeakMatcher((value,))
     hits = [
@@ -269,6 +278,13 @@ def test_matcher_ignores_public_text_wherever_it_is_stored(shape: str) -> None:
         if matcher.matches(spelling.encode()) or matcher.matches(b"x=" + spelling.encode() + b"&y=1")
     ]
     assert hits == []
+    short = [
+        spelling
+        for fragment in ("_|WARNING:", "items.|_", "-DO-NOT-SHARE", "ODDLEFT10X", "ODDLEFT10X_|WARNING:")
+        for spelling in spellings(fragment)
+        if matcher.matches(b"note=" + spelling.encode())
+    ]
+    assert short == []
     for piece in pieces:
         for size in (24, 31):
             for start in range(0, len(piece) - size + 1, 5):

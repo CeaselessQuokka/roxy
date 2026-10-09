@@ -39,6 +39,9 @@ Rules:
 - `?prettyprint=true` (or `&prettyprint=true` after other parameters) formats JSON with indentation, for reading
   in a browser. Roxy removes it before calling Roblox, so it changes how the answer looks, never what it says.
 - `GET`, `HEAD`, `POST`, `PATCH`, `PUT` and `DELETE` are forwarded. `OPTIONS` is answered by Roxy itself.
+- The part of the URL after `roxytheproxy.com` (the path and the query string together) may be up to
+  {{ max_url_length }} long; a longer one is answered with `414`. Split a long list of ids over several
+  requests, or use a POST batch endpoint (chapter 3).
 - Request bodies may be up to {{ max_body_kib }} KiB. A request that takes longer than
   {{ request_deadline }} in total is answered with `504`.
 
@@ -91,6 +94,13 @@ export type GamesResponse = {
 	data: { GameDetails },
 }
 
+-- The parts of a RequestAsync answer that this script reads.
+type HttpResponse = {
+	StatusCode: number,
+	Headers: { [string]: string },
+	Body: string?,
+}
+
 -- Header names can arrive in any letter case, so compare them in lower case.
 const function getHeader(headers: { [string]: string }, name: string): string?
 	const wanted = string.lower(name)
@@ -113,7 +123,7 @@ end
 const function fetchGame(universeId: number): GameDetails?
 	const url = `{ROXY_URL}games.roblox.com/v1/games?universeIds={universeId}`
 	for attempt = 1, MAX_ATTEMPTS do
-		const sent, response = pcall(function()
+		const sent, response = pcall(function(): HttpResponse
 			return HttpService:RequestAsync({ Url = url, Method = "GET" })
 		end)
 		if not sent then
@@ -228,6 +238,13 @@ export type UsernamesResponse = {
 	data: { UserByName },
 }
 
+-- The parts of a RequestAsync answer that this script reads.
+type HttpResponse = {
+	StatusCode: number,
+	Headers: { [string]: string },
+	Body: string?,
+}
+
 -- Header names can arrive in any letter case, so compare them in lower case.
 const function getHeader(headers: { [string]: string }, name: string): string?
 	const wanted = string.lower(name)
@@ -248,9 +265,10 @@ end
 
 const function lookUpUsers(usernames: { string }): { UserByName }?
 	const request: UsernamesRequest = { usernames = usernames, excludeBannedUsers = true }
-	const body = HttpService:JSONEncode(request)
 	for attempt = 1, MAX_ATTEMPTS do
-		const sent, response = pcall(function()
+		const sent, response = pcall(function(): HttpResponse
+			-- JSONEncode raises for a value JSON cannot hold, so it runs inside the pcall too.
+			const body = HttpService:JSONEncode(request)
 			return HttpService:RequestAsync({
 				Url = USERNAMES_URL,
 				Method = "POST", -- PATCH, PUT and DELETE work the same way
@@ -312,6 +330,12 @@ const HttpService = game:GetService("HttpService")
 const URL = "https://roxytheproxy.com/games.roblox.com/v1/games?universeIds=1"
 const HEADER_NAMES = { "Roxy-Requests-Left", "Roxy-Throttle-Reset", "Roxy-Cache", "Roxy-Cache-Age", "Roxy-Request-Id" }
 
+-- The parts of a RequestAsync answer that this script reads.
+type HttpResponse = {
+	StatusCode: number,
+	Headers: { [string]: string },
+}
+
 -- Header names can arrive in any letter case, so compare them in lower case.
 const function getHeader(headers: { [string]: string }, name: string): string?
 	const wanted = string.lower(name)
@@ -323,7 +347,7 @@ const function getHeader(headers: { [string]: string }, name: string): string?
 	return nil
 end
 
-const sent, response = pcall(function()
+const sent, response = pcall(function(): HttpResponse
 	return HttpService:RequestAsync({ Url = URL, Method = "GET" })
 end)
 
@@ -367,6 +391,13 @@ export type Result = { ok: true, value: any } | { ok: false, message: string }
 type CacheEntry = {
 	expiresAt: number,
 	value: any,
+}
+
+-- The parts of a RequestAsync answer that this script reads.
+type HttpResponse = {
+	StatusCode: number,
+	Headers: { [string]: string },
+	Body: string?,
 }
 
 const RoxyClient = {}
@@ -425,7 +456,7 @@ function RoxyClient.getJson(path: string): Result
 			task.wait(waitSeconds)
 		end
 
-		const sent, response = pcall(function()
+		const sent, response = pcall(function(): HttpResponse
 			return HttpService:RequestAsync({ Url = BASE_URL .. path, Method = "GET" })
 		end)
 		if not sent then
@@ -516,10 +547,8 @@ cached or not. It is a safety net against floods; normal games never get near it
 {{ place_limit_rule }} An experience is identified by the `Roblox-Id` header that Roblox adds to requests from its
 game servers.
 
-When you go over a limit, Roxy answers `429 Too Many Requests` with a `Retry-After` header. If you keep hitting
-the limit, each repeated violation is a strike, and each strike makes the next wait longer (by default 1, 2, 4
-and then 8 times the window). {{ strike_decay_rule }} Retrying while you are throttled can add a strike, so
-always wait for `Retry-After`.
+When you go over a limit, Roxy answers `429 Too Many Requests` with a `Retry-After` header.
+{{ escalation_rule }}
 
 During an incident the admin can switch on an emergency limit for everyone ({{ emergency_requests }} per
 {{ emergency_period }} per IP address while it is on). Those refusals carry `Roxy-Global-Throttled`.
@@ -583,6 +612,7 @@ game.
 | 403 | Endpoint blocked by Roxy (`Roxy-Blocked`) or Roblox refused | Do not retry; check the message |
 | 404 | Not found at Roblox, or not a supported Roblox URL | Check the URL format |
 | 413, 431 | Request too large | Send smaller bodies or fewer headers |
+| 414 | URL too long (chapter 2 gives the limit) | Send fewer ids per request, or use a POST batch endpoint |
 | 429 | Rate limited by Roxy (your client) or Roblox is rate-limiting (`Roxy-Upstream-Cooldown`) | Wait `Retry-After` seconds; add your own caching |
 | 500 | Unexpected Roxy error, or a Roblox 500 passed through (`Roxy-Upstream-Status: 500`) | Retry later with backoff |
 | 502 | Roxy could not connect to Roblox, or a Roblox 502 passed through | Retry with backoff after `Retry-After` |
@@ -592,7 +622,8 @@ game.
 Roxy's own refusals (such as your limit's `429`, or `404` for a URL that is not Roblox's) have a JSON string as
 the body, such as `"Too many requests; please slow down."` followed by a line break, sent as `application/json`;
 `HttpService:JSONDecode(response.Body)` gives you the message text. When Roxy could not get an answer from Roblox
-(for example `502` or `504`), the body is a short plain text message instead. Either way `print(response.Body)`
+(for example `502` or `504`), or refuses a request for its size (`413`, `414` or `431`), the body is a short
+plain text message instead. Either way `print(response.Body)`
 tells you what happened. Other codes from Roblox (for example `401` or `410`) are passed through with Roblox's own
 body and the `Roxy-Upstream-Status` header.
 
@@ -601,7 +632,7 @@ body and the `Roxy-Upstream-Status` header.
 - Cache answers in your game. Most data does not change every second, and an answer you already have costs
   nothing.
 - Batch requests: one request for 50 ids instead of 50 requests.
-- Respect `Retry-After`. Retrying sooner only makes the wait longer.
+- {{ retry_tip }}
 - Add random jitter to retries, so your servers do not all retry at the same moment.
 - Never send cookies, tokens or passwords. Roxy refuses them, and no proxy should ever see them.
 - Let Roblox identify your experience: Roblox adds the `Roblox-Id` header to game server requests on its own;
@@ -629,10 +660,7 @@ How long it is kept:
 - notable events, such as refusals, bans and probes: {{ events_retention }};
 - a small sample of individual requests (no bodies), used to tune caching: {{ request_sample_retention }}.
 
-Bodies are not normally kept. For debugging, Roxy can briefly keep the body of some requests and answers: body
-capture is currently **{{ capture_state }}**. When it is on, it covers refusals and about
-{{ capture_sample_pct }}% of served requests, anything that looks like a secret is removed first, and every
-captured body is deleted after {{ capture_retention }}.
+{{ capture_rule }}
 
 Only Roxy's admin can see this data, and it is used only to run and protect the service. Never put personal
 data in a URL you send through Roxy.

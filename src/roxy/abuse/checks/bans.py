@@ -57,7 +57,7 @@ class BansCheck(Check):
         return None
 
     def _refuse(self, facts: Facts, reason: ReasonCode, detail: str) -> Refuse:
-        if facts.bool("ban_disguise_as_throttle", True):
+        if facts.bool("ban_disguise_as_throttle"):
             return disguised_throttle(
                 facts, reason=reason, check=self.name, tarpit_category=self.tarpit_category, detail=detail
             )

@@ -139,6 +139,8 @@ DISABLED_KEY_PREFIX = "egress_disabled:"
 """control.db `service_state` keys `egress_disabled:direct` and `egress_disabled:rotator`: a leak guard trip."""
 
 PROXY_ENV_VARS = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")
+KEYLOG_ENV_VAR = "SSLKEYLOGFILE"
+"""Read by CPython's `ssl.create_default_context` itself; the egress clients switch it off (finding cred-6)."""
 REFRESH_INTERVAL_S = 1.0
 STALE_REFRESH_S = 2.0
 _SEEN_STREAMS_MAX = 512
@@ -990,24 +992,43 @@ class EgressClients:
         return SelfTestResult("H-CRED-GUARD", "pass", "blocked", "every synthetic leak was refused in-process", facts)
 
     def self_test_env_proxy(self, environ: Mapping[str, str] | None = None) -> SelfTestResult:
-        """H-ENV-PROXY: proxy variables must be unset, or at least ignored by every client."""
+        """H-ENV-PROXY: proxy variables must be unset, or at least ignored by every client.
+
+        `SSLKEYLOGFILE` is checked too (finding cred-6): the egress clients switch the key log off
+        (`metering.tls_context`), so a client whose TLS context still names a key log file fails like a client
+        that honors a proxy; and the variable being set at all fails, because other TLS connections of the process
+        (mail, webhook) would write their session keys, which hold the SMTP password and the webhook token.
+        """
         source = os.environ if environ is None else environ  # the real service environment by default
         names = sorted({name.upper() for name in PROXY_ENV_VARS if (source.get(name) or "").strip()})
+        keylog_set = bool((source.get(KEYLOG_ENV_VAR) or "").strip())
         honoring: list[str] = []
         for label, client in (("direct", self.direct_client), ("credential", self.credential_client)):
             try:
                 assert_no_proxy(client)
             except EgressConfigError:
                 honoring.append(label)
+            if client.metering.keylog_file() is not None and label not in honoring:
+                honoring.append(label)
         sample = self._make_rotator_client("http://127.0.0.1:9", "self-test", False)
         try:
-            if sample.http.trust_env:
+            if sample.http.trust_env or sample.metering.keylog_file() is not None:
                 honoring.append("rotator")
         finally:
             self._close_soon(sample)
-        facts: dict[str, object] = {"variables_set": names, "clients_honoring": honoring}
+        facts: dict[str, object] = {"variables_set": names, "clients_honoring": honoring, "keylog_set": keylog_set}
         if honoring:
-            return SelfTestResult("H-ENV-PROXY", "fail", ", ".join(honoring), "clients honor proxy settings", facts)
+            return SelfTestResult(
+                "H-ENV-PROXY", "fail", ", ".join(honoring), "clients honor proxy or key log settings", facts
+            )
+        if keylog_set:
+            return SelfTestResult(
+                "H-ENV-PROXY",
+                "fail",
+                KEYLOG_ENV_VAR,
+                "SSLKEYLOGFILE is set: TLS session keys may be written to a file; remove it from the environment",
+                facts,
+            )
         if names:
             return SelfTestResult("H-ENV-PROXY", "warn", ", ".join(names), "set in the environment but ignored", facts)
         return SelfTestResult("H-ENV-PROXY", "pass", "unset", "no proxy variables in the service environment", facts)

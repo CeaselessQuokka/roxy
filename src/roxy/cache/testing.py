@@ -63,6 +63,8 @@ class FakeResult:
     trace: Any = None
     cacheable: bool = True
     negative_ttl_s: int | None = None
+    private: bool = False
+    """The upstream fetched it with the credential under a `cache_private` allowlist row (or none): plan 6.9."""
 
 
 def ok(body: bytes | str = b"{}", *, status: int = 200, **fields: Any) -> FakeResult:

@@ -11,6 +11,9 @@ Why it exists
 How it works
     - httpx with `trust_env=False`: proxy variables and `.netrc` in the environment are ignored, so an alert can
       never be routed through some proxy the environment happens to name (the same rule as every Roxy client).
+    - The TLS context comes from `egress.metering.tls_context`, the one the egress clients use: httpx's certifi
+      bundle with the key log switched off, because CPython copies `SSLKEYLOGFILE` into every default context
+      whatever `trust_env` says, and those session keys protect the URL's token (review finding cred-6).
     - Redirects are not followed (a redirect could send the payload somewhere else), the timeout is short, and
       any status other than 2xx is a failure.
     - Only https URLs are accepted, plus http to a loopback address (a local relay; tests).
@@ -31,6 +34,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from roxy.core.redact import SecretRegistry
+from roxy.egress.metering import tls_context
 
 log = logging.getLogger("roxy.notify.webhook")
 
@@ -84,8 +88,10 @@ class WebhookSender:
     def __init__(self, url: str, *, client: httpx.AsyncClient | None = None, timeout_s: float = TIMEOUT_S) -> None:
         self._url = url
         self._own_client = client is None
-        # trust_env=False: never pick up HTTPS_PROXY or .netrc from the environment.
-        self._client = client or httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=timeout_s)
+        # trust_env=False: never pick up HTTPS_PROXY or .netrc from the environment; `tls_context` never logs keys.
+        self._client = client or httpx.AsyncClient(
+            trust_env=False, follow_redirects=False, timeout=timeout_s, verify=tls_context(True)
+        )
 
     def __repr__(self) -> str:
         return "WebhookSender(<url hidden>)"

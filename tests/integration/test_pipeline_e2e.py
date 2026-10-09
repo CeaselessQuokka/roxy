@@ -984,6 +984,29 @@ async def test_cache_negative_entries(e2e: E2E) -> None:
     assert e2e.last()["reason"] == "cache_negative"
 
 
+async def test_compat_prettyprint_follows_v1_for_live_and_cached_4xx(e2e: E2E) -> None:
+    """Finding spec-6: in compat mode v1 pretty printed a live answer only when the call succeeded, but every cache
+    serve, negative entries included (`_serve_from_cache`). So a live 404 is raw under 500, the same 404 from the
+    cache is pretty printed under 500, and a cache serve without `?prettyprint=true` is raw (stored bodies never
+    are pretty)."""
+    await e2e.settings(compat_collapse_upstream_errors=1)
+    body = b'{"errors":[{"code":1,"message":"NotFound"}]}'
+    path = "/users.roblox.com/v1/users/404404"
+    route = e2e.route("users.roblox.com", "/v1/users/404404").mock(return_value=httpx.Response(404, content=body))
+    live = await e2e.get(f"{path}?prettyprint=true")
+    expect(live, 500, body, {**ALLOWED, "Roxy-Cache": "MISS", "Roxy-Upstream-Status": "404"}, JSON)
+    cached = await e2e.get(f"{path}?prettyprint=true")
+    assert cached.status_code == 500
+    assert cached.content == json.dumps(json.loads(body), indent=4).encode()
+    assert cached.headers["content-type"] == JSON
+    assert roxy_headers(cached)["roxy-cache"] == "HIT"
+    assert e2e.last()["reason"] == "cache_negative"
+    raw = await e2e.get(path)
+    assert (raw.status_code, raw.content) == (500, body)
+    assert roxy_headers(raw)["roxy-cache"] == "HIT"
+    assert route.call_count == 1
+
+
 async def test_cache_post_allowlist(e2e: E2E) -> None:
     batch = e2e.route("thumbnails.roblox.com", "/v1/batch").mock(return_value=json_response({"data": ["t"]}))
     payload = [{"requestId": "1", "targetId": 1, "type": "Avatar", "size": "48x48"}]

@@ -19,10 +19,13 @@ How it works
          start (first non-empty line; extra lines are discarded and logged, masked: one slot, never a list).
          A bootstrap value whose fingerprint is in `credential_meta.superseded_fingerprints_json` is never used
          again: a UI replacement supersedes it, and only the audited "delete UI value" action un-supersedes it.
-    Both sources go through `_validate_value`, which also removes a leading `.ROBLOSECURITY=`: browser tools copy
-    the cookie as that pair, and the pair is unambiguous (a cookie value never starts with its own name), so Roxy
-    stores, fingerprints and sends the bare value instead of refusing it. A value that still names the cookie after
-    that is refused. The removal is logged without the value.
+    Both sources go through `_clean_value`, which first percent-decodes the value (`canonical_bytes`: tools built on
+    JavaScript's `encodeURIComponent` copy `_%7CWARNING%3A...`, and Roblox's front end unescapes cookie values, so
+    both spellings are the same cookie), then removes a leading `.ROBLOSECURITY=`: browser tools copy the cookie as
+    that pair, and the pair is unambiguous (a cookie value never starts with its own name), so Roxy stores,
+    fingerprints and sends the canonical bare value instead of refusing it. A value that still names the cookie
+    after that is refused, and so is one with fewer than 24 characters of its own besides the public warning (the
+    leak guard could not watch it). Both fixes are logged without the value.
     Fingerprints are HMAC-SHA256 with a key derived from `credential_encryption_key`, so they identify a value
     without revealing it and cannot be checked offline.
     Status is `unknown` (never probed), `active`, `rejected`, or (computed) `cooling_down` while the fleet-wide
@@ -34,16 +37,20 @@ How it works
     hot.db could not record (the 429 arrived during an outage) is kept in this worker's memory, merged with hot.db's
     row on every refresh, and written to hot.db by the first refresh that can write.
     `authorize(request)` is the only place the cookie is attached: after those checks, after validating that the
-    target is https on an allowed Roblox host, as a per-request `Cookie` header (no cookie jar anywhere).
+    target is https on an allowed Roblox host, and after the leak guard's own inspection of the request (a caller
+    who sends a 24+ character piece of the credential on an allowlisted endpoint is refused as auth smuggling, so
+    the piece is never sent next to the cookie nor stored in a cache key, finding cred-5), as a per-request
+    `Cookie` header (no cookie jar anywhere).
     `observe_set_cookie` sees `Set-Cookie` headers the credential client dropped; a `.ROBLOSECURITY` one means
     Roblox rotated the cookie: Roxy does not store it, it writes an audit row and raises the critical alert.
     `LeakMatcher` holds keyed hashes of 12 and 24 character pieces of the secret parts of each value, never the
     pieces, and finds any 24+ character run of a secret part in a byte string by sampling every 13th position (see
-    `matches`). The secret parts are what is left after removing public text wherever it sits in the value (any
-    run of 12 or more characters that the public `TOKEN_PREFIX` warning or `.ROBLOSECURITY=<warning>` contains,
-    see `secret_spans`), so whatever was stored, text any caller can type never trips the leak guard (plan C2
-    item 5). It covers the current value, the bootstrap value, recently replaced values and rotated cookies
-    Roblox sent.
+    `matches`). The secret parts are what is left of the canonical (percent-decoded) value after removing public
+    text wherever it sits (any run of 12 or more characters that the public `TOKEN_PREFIX` warning or
+    `.ROBLOSECURITY=<warning>` contains, see `secret_spans`), and only parts of 24 or more characters are watched:
+    whatever was stored and however it was encoded, text any caller can type never trips the leak guard (plan C2
+    item 5, findings F1 and cred-1). It covers the current value, the bootstrap value, recently replaced values and
+    rotated cookies Roblox sent.
 
 What to read next
     `roxy/egress/guard.py` (how the matcher is used), `roxy/egress/clients.py` (the credential client), and
@@ -66,7 +73,8 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
+from urllib.parse import unquote_to_bytes
 
 import httpx
 
@@ -84,6 +92,7 @@ from roxy.core.redact import (
 )
 from roxy.egress.crypto import SealError, derive_key, seal, unseal
 from roxy.egress.errors import (
+    AuthSmugglingBlocked,
     CredentialUnavailable,
     EgressDisabled,
     EgressError,
@@ -92,6 +101,7 @@ from roxy.egress.errors import (
     UpstreamTimeout,
 )
 from roxy.egress.events import EventSink
+from roxy.egress.guard import Verdict, inspect_request
 from roxy.egress.models import PURPOSE_CREDENTIAL_PROBE, EgressResponse, OutboundRequest
 from roxy.egress.targets import check_roblox_target, endpoint_label, is_loopback_host
 from roxy.storage import leases
@@ -116,6 +126,17 @@ MAX_EXTRA_VALUES = 3
 _MAX_BOOTSTRAP_FILE_BYTES = 64 * 1024
 _FORBIDDEN_VALUE_CHARS = frozenset(';,"\\')
 _KIND = re.compile(r"[a-z][a-z0-9_]{0,31}")
+
+DECODE_ROUNDS = 4
+"""Most rounds of percent-decoding that turn a value into its canonical form (`canonical_bytes`). A value still
+encoded after that is refused as a credential (no tool encodes a cookie four times)."""
+
+_PERCENT_ESCAPE = re.compile(rb"%[0-9A-Fa-f]{2}")
+
+HOT_WRITE_BUDGET_MS = 500
+"""How long a hot.db write on a request path (the cooldown after a 429, sharing a cooldown kept in memory) waits for
+another process's lock before the cooldown stays in this worker's memory instead (finding mp-7): Roblox already
+answered, so the caller must not wait out SQLite's 5 s busy timeout."""
 
 COOLDOWN_SOURCES = ("retry_after", "ratelimit_reset", "breaker", "default")
 """Allowed `cooldown.source` values (the hot.db CHECK constraint)."""
@@ -145,18 +166,59 @@ class CredentialStateError(RuntimeError):
 _COOKIE_PAIR_PREFIX = ROBLOX_COOKIE_NAME.lower() + "="
 
 
-def _clean_value(value: object) -> tuple[str, bool]:
-    """The cleaned credential text and whether a leading `.ROBLOSECURITY=` was removed, or an error.
+def canonical_bytes(value: str) -> bytes:
+    """`value` as UTF-8 bytes, percent-decoded until nothing changes (at most `DECODE_ROUNDS` rounds).
 
-    Lists, tuples and multi-line text are refused (C1: one slot). The cookie pair form browser tools copy
-    (`.ROBLOSECURITY=<value>`) is normalized to the bare value: the stored value is what Roxy puts after
-    `.ROBLOSECURITY=` in the Cookie header, so keeping the name would send it twice and Roblox would reject it.
+    This is what a cookie value means: Roblox's front end unescapes cookie values, so `_%7CWARNING%3A...` (what
+    tools built on `encodeURIComponent` copy) and `_|WARNING:...` (what Roblox sets and browsers send) are the same
+    cookie. The leak matcher classifies and watches this form (finding cred-1): encoded PUBLIC text becomes plain
+    public text that `secret_spans` recognizes, and the secret loses nothing, because the guard decodes every part
+    of a request before matching too (`guard._variants`).
+    """
+    data = value.encode("utf-8", "replace")
+    for _ in range(DECODE_ROUNDS):
+        if not _PERCENT_ESCAPE.search(data):
+            break
+        data = unquote_to_bytes(data)
+    return data
+
+
+class _Cleaned(NamedTuple):
+    """A credential value after `_clean_value`, and which fixes were applied (for the log, never the value)."""
+
+    text: str
+    named: bool  # a leading `.ROBLOSECURITY=` was removed
+    decoded: bool  # the value was percent-encoded and is stored decoded
+
+
+def _clean_value(value: object) -> _Cleaned:
+    """The cleaned (canonical) credential text and the fixes applied, or an error.
+
+    Lists, tuples and multi-line text are refused (C1: one slot). A percent-encoded value is decoded to its
+    canonical form (`canonical_bytes`), so the stored, fingerprinted, sent and watched value is the one Roblox
+    itself issues, however a tool spelled it. The cookie pair form browser tools copy (`.ROBLOSECURITY=<value>`) is
+    normalized to the bare value: the stored value is what Roxy puts after `.ROBLOSECURITY=` in the Cookie header,
+    so keeping the name would send it twice and Roblox would reject it. A value whose own (non-public) text has no
+    run of `LeakMatcher.WINDOW` characters is refused: it is not a whole Roblox cookie, and the leak guard could not
+    watch it (plan C2 item 4).
     """
     if not isinstance(value, str):
         raise TypeError("the credential is exactly one string; no API accepts a list of credentials (plan C1)")
     text = value.strip()
     if "\n" in text or "\r" in text:
         raise CredentialValueError("one credential only: the value must be a single line (plan C1)")
+    raw = text.encode("utf-8", "replace")
+    canonical = canonical_bytes(text)
+    if _PERCENT_ESCAPE.search(canonical):
+        raise CredentialValueError(
+            f"the value is still percent-encoded after {DECODE_ROUNDS} rounds of decoding; paste the cookie value "
+            "as the browser shows it"
+        )
+    decoded = canonical != raw
+    try:
+        text = canonical.decode("ascii").strip()
+    except UnicodeDecodeError:
+        raise CredentialValueError("the value has characters a cookie value cannot hold") from None
     named = text[: len(_COOKIE_PAIR_PREFIX)].lower() == _COOKIE_PAIR_PREFIX
     if named:
         text = text[len(_COOKIE_PAIR_PREFIX) :].strip()
@@ -168,12 +230,17 @@ def _clean_value(value: object) -> tuple[str, bool]:
         raise CredentialValueError(f"a credential is between {MIN_VALUE_LENGTH} and {MAX_VALUE_LENGTH} characters")
     if any(ord(ch) < 0x21 or ord(ch) > 0x7E or ch in _FORBIDDEN_VALUE_CHARS for ch in text):
         raise CredentialValueError("the value has characters a cookie value cannot hold")
-    return text, named
+    if not any(end - start >= LeakMatcher.WINDOW for start, end in secret_spans(text)):
+        raise CredentialValueError(
+            f"the value has fewer than {LeakMatcher.WINDOW} characters of its own besides the public warning text; "
+            "paste the whole cookie value"
+        )
+    return _Cleaned(text, named, decoded)
 
 
 def _validate_value(value: object) -> str:
     """The cleaned credential text (see `_clean_value`), or an error."""
-    return _clean_value(value)[0]
+    return _clean_value(value).text
 
 
 def _read_bootstrap_file(credentials_dir: Path | None) -> tuple[str | None, int]:
@@ -264,14 +331,16 @@ def _is_public(piece: bytes) -> bool:
 
 
 def secret_spans(value: str) -> list[tuple[int, int]]:
-    """The `(start, end)` byte spans of `value` (UTF-8) that are secret: everything outside public runs.
+    """The `(start, end)` spans of `canonical_bytes(value)` that are secret: everything outside public runs.
 
-    Finds, for each position, the longest run starting there that public text contains (at least `PUBLIC_RUN`
-    long) and marks it public. A suffix of a public run is itself public, so each new run only has to be extended
-    past the end of the previous one: the scan does about one substring test per byte. A span that public text
-    contains as a whole (a short leftover such as `items.|_`) is dropped too.
+    The value is classified in its canonical (percent-decoded) form, so public text a tool stored encoded
+    (`_%7CWARNING%3A`) is recognized as public too (finding cred-1); for a value that was not encoded the spans
+    are byte offsets into `value` itself. Finds, for each position, the longest run starting there that public
+    text contains (at least `PUBLIC_RUN` long) and marks it public. A suffix of a public run is itself public, so
+    each new run only has to be extended past the end of the previous one: the scan does about one substring test
+    per byte. A span that public text contains as a whole (a short leftover such as `items.|_`) is dropped too.
     """
-    data = value.encode("utf-8", "replace").lower()
+    data = canonical_bytes(value).lower()
     size = len(data)
     public = bytearray(size)
     end = 0  # the end of the last public run found
@@ -301,42 +370,43 @@ def secret_spans(value: str) -> list[tuple[int, int]]:
 class LeakMatcher:
     """Finds the credential, or any run of 24+ of its characters, in bytes, without holding the secret.
 
-    Only the secret parts of each value are watched (`secret_spans`): public text is never "secret", whatever was
-    stored, so a caller who types the public warning can never trip the guard (plan C2 item 5, finding F1).
+    Only the secret parts of each value's canonical form are watched (`secret_spans`): public text is never
+    "secret", whatever was stored and however it was encoded, so a caller who types the public warning can never
+    trip the guard (plan C2 item 5, findings F1 and cred-1). A secret part shorter than `WINDOW` is not watched on
+    its own: what sits next to it is public text a caller can type, so watching the short part whole (as an earlier
+    version did) let a misclassified leftover such as an encoded `_|WARNING:` become a trip wire, and the plan's
+    unit of a leak is a run of 24 characters. Stored credentials always hold a longer part (`_clean_value` refuses
+    any that do not), so this only skips fragments of odd values Roblox sent.
 
     Correctness of the sampling: if the data holds a run of a secret part of length >= 24 starting at offset `s`,
     then some multiple `p` of 13 lies in `[s, s + 12]`, so `data[p:p+12]` lies inside the run and is a 12
     character piece of the secret (a "probe" hit). The 24 character windows starting at `p-12 .. p` include the
     one starting at `s`, which is a 24 character piece of the secret (a "window" hit). Both sets hold keyed
-    BLAKE2b hashes with a random per-process key, so the matcher cannot be turned back into the secret.
+    BLAKE2b hashes with a random per-process key, so the matcher cannot be turned back into the secret. The cost is
+    one hash per 13 bytes of data plus a few per probe hit, whatever was stored.
     """
 
     WINDOW = 24
     PROBE = 12
     STEP = WINDOW - PROBE + 1  # 13
-    MIN_SECRET = 8
 
-    __slots__ = ("_count", "_key", "_long", "_short", "_whole")
+    __slots__ = ("_count", "_key", "_long", "_short")
 
     def __init__(self, values: Iterable[str]) -> None:
         self._key = secrets.token_bytes(16)
         self._short: set[bytes] = set()
         self._long: set[bytes] = set()
-        self._whole: dict[int, set[bytes]] = {}
         self._count = 0
         for value in values:
-            data = value.encode("utf-8", "replace").lower()
+            data = canonical_bytes(value).lower()
             for start, end in secret_spans(value):
                 self._watch(data[start:end])
 
     def _watch(self, secret: bytes) -> None:
-        """Add the hashes of one secret part (already ASCII lowercased)."""
-        if len(secret) < self.MIN_SECRET:
+        """Add the hashes of one secret part (canonical, ASCII lowercased); parts under `WINDOW` are skipped."""
+        if len(secret) < self.WINDOW:
             return
         self._count += 1
-        if len(secret) < self.WINDOW:
-            self._whole.setdefault(len(secret), set()).add(self._hash(secret))
-            return
         for start in range(len(secret) - self.PROBE + 1):
             self._short.add(self._hash(secret[start : start + self.PROBE]))
         for start in range(len(secret) - self.WINDOW + 1):
@@ -356,18 +426,13 @@ class LeakMatcher:
             return False
         folded = (data.encode("utf-8", "replace") if isinstance(data, str) else bytes(data)).lower()
         size = len(folded)
-        if self._long:
-            for probe in range(0, size - self.PROBE + 1, self.STEP):
-                if self._hash(folded[probe : probe + self.PROBE]) not in self._short:
-                    continue
-                first = max(0, probe - (self.WINDOW - self.PROBE))
-                last = min(probe, size - self.WINDOW)
-                for start in range(first, last + 1):
-                    if self._hash(folded[start : start + self.WINDOW]) in self._long:
-                        return True
-        for length, hashes in self._whole.items():
-            for start in range(size - length + 1):
-                if self._hash(folded[start : start + length]) in hashes:
+        for probe in range(0, size - self.PROBE + 1, self.STEP):
+            if self._hash(folded[probe : probe + self.PROBE]) not in self._short:
+                continue
+            first = max(0, probe - (self.WINDOW - self.PROBE))
+            last = min(probe, size - self.WINDOW)
+            for start in range(first, last + 1):
+                if self._hash(folded[start : start + self.WINDOW]) in self._long:
                     return True
         return False
 
@@ -612,13 +677,17 @@ class CredentialManager:
             )
         if value is not None:
             try:
-                self._bootstrap, named = _clean_value(value)
+                cleaned = _clean_value(value)
             except (TypeError, CredentialValueError) as exc:
                 self._bootstrap_problem = "bootstrap_invalid"
                 log.error("credential_bootstrap_invalid", extra={"fields": {"error": str(exc)[:120]}})
             else:
-                if named:
-                    # The file holds the pair browser tools copy; the bare value is used. Never log the value.
+                self._bootstrap = cleaned.text
+                # The file holds an encoded copy or the pair browser tools copy; the canonical bare value is used.
+                # Never log the value.
+                if cleaned.decoded:
+                    log.warning("credential_value_decoded", extra={"fields": {"source": "bootstrap"}})
+                if cleaned.named:
                     log.warning("credential_cookie_name_removed", extra={"fields": {"source": "bootstrap"}})
                 self._bootstrap_fp = fingerprint(self._bootstrap, self._fp_key)
                 SecretRegistry.register(CREDENTIAL_SECRET_NAME, self._bootstrap)
@@ -729,7 +798,10 @@ class CredentialManager:
             self._pending_cooldown = None
             return
         try:
-            await self._dbs.hot.write(lambda conn: self._write_cooldown(conn, until_ms, source, now_ms))
+            # Budgeted: this runs before every credential request (`authorize`), which must not wait out a lock.
+            await self._dbs.hot.write(
+                lambda conn: self._write_cooldown(conn, until_ms, source, now_ms), busy_timeout_ms=HOT_WRITE_BUDGET_MS
+            )
         except SharedStateUnavailable:
             return  # still unwritable: it stays in memory and keeps blocking the credential in this worker
         if self._pending_cooldown == pending:
@@ -892,11 +964,42 @@ class CredentialManager:
         test_target = self._allow_loopback_target and is_loopback_host(actual.host)
         if not (same_target or test_target):
             raise TargetNotAllowed(Egress.CREDENTIAL, "the request does not go to the checked Roblox host")
+        self._refuse_smuggled(request)
         value = self._slot._reveal_credential()
         if value is None:
             raise CredentialUnavailable("absent", 300)
         # One header per request from the slot: every worker uses exactly the current value (C2 item 7).
         request.headers["Cookie"] = f"{ROBLOX_COOKIE_NAME}={value}"
+
+    def _refuse_smuggled(self, request: httpx.Request) -> None:
+        """The leak guard's inspection, on the credential path, before the cookie is attached (finding cred-5).
+
+        The credential client has no guard transport (it carries the cookie by design), so without this a caller
+        who already holds a piece of the credential could send it in the query of an allowlisted endpoint: it would
+        go to Roblox next to the cookie and into the cache key text stored in cache.db. A piece of the credential
+        (or a public marker) is refused as auth smuggling: nothing is sent, nothing is stored, and the egress stays
+        enabled (no trip: the credential path never carries anonymous traffic to disable).
+        """
+        try:
+            body = request.content
+        except httpx.RequestNotRead:  # Roxy's own requests always carry bytes; a stream cannot be inspected
+            raise AuthSmugglingBlocked(Egress.CREDENTIAL, "uninspectable_body", "body") from None
+        max_body = int(self._setting("max_body_bytes", 2 * 1024 * 1024))
+        inspection = inspect_request(request, body, self._matcher, max_body)
+        if inspection.verdict is Verdict.CLEAN:
+            return
+        marker = "credential_piece" if inspection.verdict is Verdict.LEAK else inspection.marker
+        log.warning(
+            "credential_request_refused",
+            extra={"fields": {"marker": marker, "location": inspection.location}},
+        )
+        self._events.event(
+            "auth_smuggling_blocked",
+            "warn",
+            "auth_smuggling",
+            {"egress": Egress.CREDENTIAL.value, "marker": marker, "location": inspection.location},
+        )
+        raise AuthSmugglingBlocked(Egress.CREDENTIAL, marker, inspection.location)
 
     async def observe_set_cookie(self, set_cookie_values: list[str], *, endpoint: str) -> None:
         """React to `Set-Cookie` headers the credential client dropped (plan C1: rotation is never stored)."""
@@ -904,9 +1007,11 @@ class CredentialManager:
         for raw in set_cookie_values:
             name, sep, rest = raw.partition("=")
             if sep and name.strip().lower() == ROBLOX_COOKIE_NAME.lower():
-                candidate = rest.split(";", 1)[0].strip().strip('"')
+                candidate = rest.split(";", 1)[0].strip().strip('"')[:MAX_VALUE_LENGTH]
                 if candidate:
-                    rotated = candidate
+                    # Canonical form, as for a pasted value (finding cred-1): Roblox may write the cookie encoded,
+                    # and the encoded public warning must not become "secret" in the matcher.
+                    rotated = canonical_bytes(candidate).decode("utf-8", "replace")
         if rotated is None:
             return
         rotated_fp = fingerprint(rotated, self._fp_key)
@@ -966,7 +1071,11 @@ class CredentialManager:
         until_ms = now_ms + span_ms
 
         try:
-            until_ms = await self._dbs.hot.write(lambda conn: self._write_cooldown(conn, until_ms, source, now_ms))
+            # Budgeted (finding mp-7): this runs right after Roblox answered a credential call with a 429, and the
+            # caller's answer waits for it; a lock held longer keeps the cooldown in memory (below) instead.
+            until_ms = await self._dbs.hot.write(
+                lambda conn: self._write_cooldown(conn, until_ms, source, now_ms), busy_timeout_ms=HOT_WRITE_BUDGET_MS
+            )
         except SharedStateUnavailable as exc:
             self._degraded = True
             kept = self._pending_cooldown
@@ -1212,12 +1321,20 @@ class CredentialManager:
     ) -> CredentialStatus:
         """Replace the credential with `value` (the audited admin action of plan C1). The old value stops being
         used everywhere at once (version bump), and the bootstrap value is superseded for good. A pasted
-        `.ROBLOSECURITY=<value>` pair is stored as the bare value (`_clean_value`)."""
-        text, named = _clean_value(value)
-        if named:
+        `.ROBLOSECURITY=<value>` pair or a percent-encoded copy is stored as the canonical bare value
+        (`_clean_value`). The new value is registered as a secret BEFORE the audit row is written, so a reason that
+        repeats it (a paste into the wrong box) is redacted like every other mention (finding cred-2)."""
+        cleaned = _clean_value(value)
+        text = cleaned.text
+        if cleaned.decoded:
+            log.info("credential_value_decoded", extra={"fields": {"source": "ui", "by": actor.label}})
+        if cleaned.named:
             log.info("credential_cookie_name_removed", extra={"fields": {"source": "ui", "by": actor.label}})
         if self._key is None:
             raise CredentialStateError("credential_encryption_key is not configured, so a UI value cannot be stored")
+        # Registered first: `audit.record` redacts the reason with `redact_text`, which only knows registered secrets.
+        # Registering a value whose write then fails is harmless (it only widens what logs and records scrub).
+        SecretRegistry.register(CREDENTIAL_SECRET_NAME, text)
         new_fp = fingerprint(text, self._fp_key)
         nonce, ciphertext = seal(self._key, text.encode("utf-8"), STORE_AAD)
         after = {"fingerprint": new_fp, "masked": mask_token(text)}
@@ -1254,7 +1371,6 @@ class CredentialManager:
             return bump_version(conn, VERSION_KEY, now)
 
         await self._dbs.control.write(write)
-        SecretRegistry.register(CREDENTIAL_SECRET_NAME, text)
         await self.refresh(force=True)
         self._events.event("credential_replaced", "info", "credential", {"fingerprint": new_fp, "by": actor.label})
         return self.status()
@@ -1347,7 +1463,7 @@ class CredentialManager:
             value = TOKEN_PREFIX + secrets.token_hex(64).upper()
             matcher = LeakMatcher((value,))
         # The piece comes from the longest secret part, the text the matcher really watches (never public text).
-        raw = value.encode("utf-8", "replace")
+        raw = canonical_bytes(value)
         first, last = max(secret_spans(value), key=lambda span: span[1] - span[0], default=(0, len(raw)))
         secret = raw[first:last].decode("utf-8", "replace")
         start = max(0, len(secret) // 3)
@@ -1371,7 +1487,11 @@ __all__ = [
     "BOOTSTRAP_FILE_NAME",
     "COOLDOWN_KEY",
     "COOLDOWN_SOURCES",
+    "DECODE_ROUNDS",
+    "HOT_WRITE_BUDGET_MS",
     "PROBE_LEASE",
+    "PUBLIC_RUN",
+    "PUBLIC_TEXTS",
     "VERSION_KEY",
     "CredentialManager",
     "CredentialSlot",
@@ -1382,6 +1502,7 @@ __all__ = [
     "LeakMatcher",
     "ProbeResult",
     "bump_version",
+    "canonical_bytes",
     "read_version",
     "retry_after_seconds",
     "secret_spans",

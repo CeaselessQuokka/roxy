@@ -119,7 +119,8 @@ async def _scenario(recorder: MetricsRecorder, make_event: Make, presets: dict[s
         recorder.record_outcome(make_event(**presets["refused"]))
     recorder.record_outcome(
         make_event(
-            outcome=Outcome.SERVED_CACHE,
+            # Exactly what `proxy/router.py` records for a local OPTIONS answer (`respond.options_rendered`).
+            outcome=Outcome.SERVED_UPSTREAM,
             reason=ReasonCode.OPTIONS_LOCAL,
             method="OPTIONS",
             status=204,
@@ -153,6 +154,8 @@ async def test_avoided_calls_are_honest(
     totals = recorder.dbs.metrics.read_sync(lambda c: q.totals_sync(c, w))
     assert totals["requests"] == 10 + 30 + 5 + 7 + 1
     assert totals["demand"] == 10 + 30 + 5  # refusals and the local OPTIONS answer are not demand
+    assert totals["served_upstream"] == 10  # the local OPTIONS answer is not "Served from Roblox" (P6, spec-7)
+    assert totals["served_cache"] == 30 + 5
     caller_calls = 12 + 5 + 3  # misses with retries, stale-after-failure attempts, background refreshes
     assert totals["upstream_calls"] == caller_calls
     assert totals["internal_calls"] == 4  # probes reported separately

@@ -150,6 +150,68 @@ async def test_redirect_off_allowlist_not_followed(service: UpstreamService, egr
     assert "location" not in result.headers  # never relayed toward a caller
 
 
+@pytest.mark.parametrize(
+    "location",
+    [
+        "/v1/games/%2E%2E/%2E%2E/v2/secret",  # encoded dot segments (v1 bug B4)
+        "/v1/%2E%2E%2Fv2%2Fsecret",  # encoded slashes
+        "/v1/x%3Fy",  # an encoded `?` inside a segment
+        "/v1/x%25y",  # double encoding
+        "/v1/a b",  # a space: not a URL any caller could send
+    ],
+)
+async def test_redirect_hop_must_pass_the_caller_path_checks(
+    service: UpstreamService, egress: FakeEgress, location: str
+) -> None:
+    """Finding cred-3: every hop goes through `proxy/validate.py parse_redirect` (then `parse_upstream_url`), the
+    checks a caller's own path gets (plan 9.10 "redirects are re-validated"); a hop that fails them is not
+    followed, Roblox's 3xx goes back."""
+    egress.handler = lambda e, out: answer(302, b"", {"location": location})
+    result = await fetch(service)
+    assert (result.status, len(egress.calls)) == (302, 1)
+    assert "redirect not followed" in result.trace.notes
+
+
+async def test_a_followed_hop_is_the_url_that_was_checked(service: UpstreamService, egress: FakeEgress) -> None:
+    """The URL fetched is rebuilt from the validated parse: dot segments resolved, the query kept in order."""
+
+    def handler(e: Egress, out: Any) -> Any:
+        if "/v1/games" in out.url:
+            return answer(302, b"", {"location": "../v2/./next?b=2&a=1"})
+        return answer(200, b"{}")
+
+    egress.handler = handler
+    result = await fetch(service)
+    assert result.status == 200
+    assert [out.url for _, out in egress.calls][1] == "https://games.roblox.com/v2/next?b=2&a=1"
+
+
+@pytest.mark.parametrize(
+    ("location", "followed"),
+    [
+        ("/v1/games/next", True),  # granted by the row's single-segment wildcard
+        ("/v1/games/%2E%2E%2Fsecret", False),  # the raw text matched `*`; decoded it is not a valid path at all
+        ("/v1/games/a/b", False),  # two segments: the exact row does not grant it
+    ],
+)
+async def test_credential_hop_is_matched_on_its_decoded_path(
+    service: UpstreamService, egress: FakeEgress, rules: Any, location: str, followed: bool
+) -> None:
+    """Finding cred-3: the allowlist sees the hop's decoded, normalized target, as it sees a caller path, so the
+    cookie never follows a hop its rows do not name (C2 item 7, F3 exact grants)."""
+    rules.allow_credential("games.roblox.com/v1/games/*")
+
+    def handler(e: Egress, out: Any) -> Any:
+        if out.url.startswith("https://games.roblox.com/v1/games/start"):
+            return answer(302, b"", {"location": location})
+        return answer(200, b"{}")
+
+    egress.handler = handler
+    result = await fetch(service, path="/v1/games/start", query=[])
+    assert egress.egresses() == [Egress.CREDENTIAL] * (2 if followed else 1)
+    assert result.status == (200 if followed else 302)
+
+
 @pytest.mark.parametrize("location", ["//[", "https://[x/", "http://[::1", "https://games.roblox.com:99999/x"])
 async def test_malformed_redirect_location_is_answered_not_raised(
     service: UpstreamService, egress: FakeEgress, ctx: Any, location: str
@@ -527,6 +589,7 @@ async def test_allowlisted_get_uses_credential(
     assert egress.egresses() == [Egress.CREDENTIAL]
     assert result.auth_class is AuthClass.CRED
     assert result.cacheable is False  # cache_private: never stored
+    assert result.private is True  # and never handed to a single-flight follower (finding cred-4, request U1)
     assert egress.calls[0][1].purpose == "caller"
     tats = dbs_tats(ctx, ["egress:credential", "egress:credential:probe"])
     assert "egress:credential" in tats
@@ -542,6 +605,23 @@ async def test_allowlisted_not_private_is_cacheable(service: UpstreamService, ru
     result = await fetch(service)
     assert result.cacheable is True
     assert result.auth_class is AuthClass.CRED
+    assert result.private is False
+
+
+async def test_private_follows_the_row_the_answer_was_fetched_under(
+    service: UpstreamService, egress: FakeEgress, rules: Any
+) -> None:
+    """Finding cred-4 (request U1): only the upstream knows the allowlist row it routed under, so it reports a
+    credential answer fetched under a `cache_private` row as `private`, failures included (a 429, a 5xx), and the
+    cache keeps such an answer to its own request. Anonymous answers are never private."""
+    result = await fetch(service)
+    assert (result.egress, result.private) == (Egress.DIRECT, False)
+    rules.allow_credential("games.roblox.com/v1/games", cache_private=True)
+    egress.handler = lambda e, out: answer(503, b"busy")
+    failed = await fetch(service)
+    assert failed.egress is Egress.CREDENTIAL
+    assert failed.reason is ReasonCode.UPSTREAM_5XX
+    assert failed.private is True
 
 
 async def test_allowlisted_post_never_uses_credential(service: UpstreamService, egress: FakeEgress, rules: Any) -> None:
@@ -775,6 +855,104 @@ async def test_exhausted_rate_limit_during_a_hot_outage_still_pauses_the_endpoin
     second = await fetch(service)
     assert (second.status, second.reason, second.retry_after_s) == (429, ReasonCode.UPSTREAM_COOLDOWN, 29)
     assert len(egress.calls) == 1
+
+
+async def test_5xx_during_a_hot_outage_answers_robloxs_status_without_a_retry(
+    service: UpstreamService, egress: FakeEgress, ctx: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Findings mp-7 and mp-8: Roblox says 503 as hot.db stops taking writes. A retry could not be paced (C7), so
+    none is made: the caller gets Roblox's 503 at once, never `degraded` and never after a wait for the lock."""
+    hot = break_hot_writes(ctx, monkeypatch)
+
+    def handler(e: Egress, out: Any) -> Any:
+        hot["broken"] = True
+        return answer(503, b"{}")
+
+    egress.handler = handler
+    result = await fetch(service)
+    assert (result.status, result.reason, result.upstream_status) == (503, ReasonCode.UPSTREAM_5XX, 503)
+    assert len(egress.calls) == 1
+    assert any("no retry while hot.db cannot be written" in note for note in result.trace.notes)
+
+
+async def test_a_retry_that_cannot_reserve_keeps_robloxs_answer(
+    service: UpstreamService, egress: FakeEgress, ctx: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding mp-8: the first 503's effects were written, then hot.db stops taking writes during the backoff, so
+    the retry's reservation fails: Roblox's own 503 goes back (D4), not the `degraded` row."""
+    hot = break_hot_writes(ctx, monkeypatch)
+    egress.handler = lambda e, out: answer(503, b"{}")
+    real_sleep = service._sleep
+
+    async def sleep_then_break(seconds: float) -> None:
+        hot["broken"] = True
+        await real_sleep(seconds)
+
+    monkeypatch.setattr(service, "_sleep", sleep_then_break)
+    result = await fetch(service)
+    assert (result.status, result.reason, result.upstream_status) == (503, ReasonCode.UPSTREAM_5XX, 503)
+    assert len(egress.calls) == 1
+
+
+async def test_every_hot_write_of_a_fetch_has_a_budget(
+    service: UpstreamService, egress: FakeEgress, ctx: Any, rules: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding mp-7: no hot.db write on a request path waits out SQLite's 5 s busy timeout. A 429, a 5xx with its
+    retry, a CSRF challenge and a credential 429 each take every write with a budget."""
+    budgets: list[int | None] = []
+    real_write = ctx.dbs.hot.write
+
+    async def write(fn: Any, **kwargs: Any) -> Any:
+        budgets.append(kwargs.get("busy_timeout_ms"))
+        return await real_write(fn, **kwargs)
+
+    monkeypatch.setattr(ctx.dbs.hot, "write", write)
+    answers = iter([answer(429, b"", {"retry-after": "5"}), answer(503, b""), answer(200, b"{}")])
+    egress.handler = lambda e, out: next(answers)
+    await fetch(service)
+    await fetch(service, path="/v1/other")
+    tokens = iter([answer(403, b"", {"x-csrf-token": "t1"}), answer(200, b"{}")])
+    egress.handler = lambda e, out: next(tokens)
+    await fetch(service, method="POST", body=b"{}", path="/v1/write")
+    assert budgets
+    assert None not in budgets, budgets
+
+
+async def test_a_reservation_canceled_while_it_is_written_is_refunded(
+    service: UpstreamService, egress: FakeEgress, ctx: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding mp-9 (plan 7.3): the request is canceled while its reservation write is still running (a started
+    write always commits). The request gives back what that write granted before the cancellation goes on, so no
+    bucket stays reserved for a call that was never made."""
+    settings.set(endpoint_bucket_default_per_min=6, endpoint_bucket_default_burst=1)
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    real_write = ctx.dbs.hot.write
+    writes = 0
+
+    async def slow_first_write(fn: Any, **kwargs: Any) -> Any:
+        nonlocal writes
+        writes += 1
+        if writes == 1:  # the reservation: as if another process held the lock for a while
+            started.set()
+            await gate.wait()
+        return await real_write(fn, **kwargs)
+
+    monkeypatch.setattr(ctx.dbs.hot, "write", slow_first_write)
+    task = asyncio.ensure_future(fetch(service))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0.01)
+    assert not task.done()  # it waits for its own reservation before the cancellation goes on
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert egress.calls == []
+    assert writes >= 2  # the reservation, then the refund
+    now_ms = service.clock.now_ms()
+    tats = read_rows(ctx.dbs.hot, "SELECT bucket_key, tat_ms FROM upstream_bucket")
+    assert tats  # the reservation did commit
+    assert [key for key, tat in tats if float(tat) > now_ms + 1000] == []
 
 
 async def test_local_cooldowns_are_shared_by_the_mirror_loop_and_never_shorten_a_row(

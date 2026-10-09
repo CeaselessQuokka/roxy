@@ -11,7 +11,7 @@ Why it exists
     The owner asked for colored Luau on the home page and in the user guide (2026-10-07). The strict CSP (plan
     9.2) allows no third-party scripts and no inline styles, and a highlighter running in the browser would add a
     script and its weight to every visit. Highlighting on the server costs nothing per visit: the guide is
-    rendered once per file version and the home examples once per process. It also works without JavaScript and
+    rendered and the home examples highlighted once per process, at startup. It also works without JavaScript and
     keeps the markup small: one-letter class names whose colors live in site.css, for both themes, and one span
     for a run of neighboring tokens of the same kind.
 

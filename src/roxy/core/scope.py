@@ -3,7 +3,7 @@
 What this is
     `get_state(scope)` returns the per-request state dict (the same object `request.state` wraps),
     `get_app_context(scope)` the worker's `AppContext` (or None before the lifespan has built it), and
-    `setting_int` / `setting_float` a live runtime setting with a safe fallback.
+    `setting_int` / `setting_float` / `setting_bool` a live runtime setting with a safe fallback.
 
 Why it exists
     Roxy's middleware is written as plain ASGI callables (no `BaseHTTPMiddleware`), because those add no extra task
@@ -91,3 +91,11 @@ def setting_float(scope: MutableMapping[str, Any], key: str, fallback: float) ->
 def setting_int(scope: MutableMapping[str, Any], key: str, fallback: int) -> int:
     """An integer runtime setting: live value, else catalog default, else `fallback`."""
     return int(setting_float(scope, key, fallback))
+
+
+def setting_bool(scope: MutableMapping[str, Any], key: str, fallback: bool) -> bool:
+    """A switch setting (stored as a bool or as 0 and 1): live value, else catalog default, else `fallback`."""
+    for candidate in (_live_value(scope, key), catalog_default(key)):
+        if isinstance(candidate, bool | int | float):
+            return bool(candidate)
+    return bool(fallback)

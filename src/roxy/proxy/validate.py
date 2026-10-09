@@ -363,16 +363,29 @@ def parse_upstream_url(
 def parse_redirect(
     current_url: str,
     location: str,
+    method: str = "GET",
     *,
     allowed_hosts: Collection[str] | None = None,
     strict_host_allowlist: bool = True,
+    max_url_length: int = DEFAULT_MAX_URL_LENGTH,
 ) -> TargetParse:
     """Re-validate a redirect (plan 7.9 and 9.10): resolve `location` against the current URL, then check it.
 
     A relative `Location` stays on the current host; `//evil.example/x` resolves to another host and is refused.
+    Like every function here it never raises: `urljoin` raises `ValueError` for a Location that does not even parse
+    (`//[`, an unclosed IPv6 bracket), and that is the `unsafe_url` problem "unparsable URL". The upstream layer
+    follows every 3xx hop through this function, with the live `max_url_length` (review findings cred-3 and the
+    ingress review's unguarded `urljoin`).
     """
+    try:
+        joined = urljoin(current_url, location.strip())
+    except ValueError:
+        parts = _Parts(method=(method or "GET").upper(), raw_query="", target=location.strip()[:MAX_LOGGED_TARGET])
+        return parts.result(ReasonCode.UNSAFE_URL, "unparsable URL")
     return parse_upstream_url(
-        urljoin(current_url, location.strip()),
+        joined,
+        method,
         allowed_hosts=allowed_hosts,
         strict_host_allowlist=strict_host_allowlist,
+        max_url_length=max_url_length,
     )

@@ -21,7 +21,9 @@ How it works
     - Special rules: the audit log keeps at least 400 days and can only be deleted through its prune gate (the
       triggers in control/0001_initial.sql check SQLite's own clock); `settings_history` never loses the newest
       row of any key; open recommendations are never pruned; the `leader` lease row is never pruned, so its epoch
-      (fencing token) keeps counting up.
+      (fencing token) keeps counting up. Rows that enforce a limit outlive the longest period the limit can
+      have: an alert dedupe row outlives the longest alert cooldown (`ALERT_GATE_KEEP_S`), a login failure slot the
+      longest lockout window the catalog accepts (`LOGIN_WINDOW_MAX_S`), so pruning never reopens either early.
 
 What to read next
     `roxy/scheduler/jobs.py` (`register_storage_jobs` wires these to the leader), then
@@ -44,6 +46,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from roxy.config.catalog import CATALOG
 from roxy.storage.db import Database, Databases
 
 log = logging.getLogger(__name__)
@@ -63,6 +66,29 @@ NEVER_PRUNED_LEASES = frozenset({"leader"})
 
 INCREMENTAL_VACUUM_PAGES = 2000
 """Pages returned to the file system per `incremental_vacuum` step (plan 6.5)."""
+
+ALERT_GATE_KEEP_S = 45 * DAY_S
+"""How long an alert dedupe row (`email_gate` key `alert:<cooldown key>`) is kept after the alert last went out.
+
+Longer than any alert cooldown Roxy uses (the rotator quota alert waits up to 40 days, one per billing cycle, plan
+17.7), so retention never re-opens a cooldown early. The hourly cap rows keep the one day idle."""
+
+ALERT_GATE_PREFIX = "alert:"
+"""`notify/gate.py ALERT_PREFIX` (repeated here: storage sits below notify and must not import it)."""
+
+_PREFIX_END = "\U0010ffff"  # largest code point: `key < prefix + this` closes a primary key range scan
+
+
+def _catalog_max(key: str, fallback: int) -> int:
+    """The largest value a catalog setting accepts: a retention bound that must cover any live value of it."""
+    spec = CATALOG.get(key)
+    maximum = getattr(spec, "max", None) if spec is not None else None
+    return int(maximum) if isinstance(maximum, int | float) else fallback
+
+
+LOGIN_WINDOW_MAX_S = _catalog_max("admin_login_window_s", DAY_S)
+"""The longest login lockout window an admin may configure (plan 15.3 G, 86400 s): failure slots are kept at least
+this long, so no live window ever loses a failure it still counts (the lockout itself drops older ones)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +141,11 @@ class RetentionPolicy:
     breaker_idle_s: int = DAY_S
     aimd_idle_s: int = DAY_S
     job_runs_days: int = 7
-    email_gate_idle_s: int = DAY_S
-    login_failures_idle_s: int = 3600
+    email_gate_idle_s: int = DAY_S  # the hourly cap rows (`cap:`, `capdrop:`)
+    email_gate_alert_idle_s: int = ALERT_GATE_KEEP_S  # alert dedupe rows: longer than any alert cooldown
+    email_gate_max_rows: int = 10_000
+    login_failures_idle_s: int = LOGIN_WINDOW_MAX_S  # never shorter than any lockout window (plan 9.5, 15.3 G)
+    admin_login_window_s: int = 0  # the live lockout window (from_settings); the prune keeps at least this too
     spam_windows_idle_s: int = DAY_S
     # files
     retention_exports_days: int = 14
@@ -839,20 +868,63 @@ def prune_job_runs(conn: sqlite3.Connection, now_s: float, policy: RetentionPoli
 
 
 def prune_email_gate(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
-    """`email_gate`: keys not sent for a day (every alert cooldown is far shorter)."""
-    return delete_batch(
-        conn, "email_gate", "key", "last_sent_at < ?", (int(now_s - policy.email_gate_idle_s),), "last_sent_at", limit
+    """`email_gate`, in three steps, at most `limit` rows in all:
+
+    1. Alert dedupe rows (`alert:<cooldown key>`) not sent for `email_gate_alert_idle_s` (45 days): longer than any
+       alert cooldown (the rotator quota alert waits up to 40 days), so the fleet-wide dedupe of plan 17.7 holds for
+       the whole cooldown. A one day idle would let a long cooldown alert out again after a day.
+    2. Every other row (the hourly cap rows `cap:` and `capdrop:`, useful for an hour) not touched for a day.
+    3. The oldest rows beyond `email_gate_max_rows` (plan P9: the alert keys are bounded too).
+    """
+    low, high = ALERT_GATE_PREFIX, ALERT_GATE_PREFIX + _PREFIX_END
+    deleted = delete_batch(
+        conn,
+        "email_gate",
+        "key",
+        "key >= ? AND key < ? AND last_sent_at < ?",
+        (low, high, int(now_s - max(policy.email_gate_alert_idle_s, policy.email_gate_idle_s))),
+        "last_sent_at",
+        limit,
     )
+    if deleted < limit:
+        deleted += delete_batch(
+            conn,
+            "email_gate",
+            "key",
+            "NOT (key >= ? AND key < ?) AND last_sent_at < ?",
+            (low, high, int(now_s - policy.email_gate_idle_s)),
+            "last_sent_at",
+            limit - deleted,
+        )
+    if deleted < limit:
+        deleted += prune_age_then_cap(
+            conn,
+            "email_gate",
+            key="key",
+            time_col="last_sent_at",
+            cutoff=None,
+            cap=max(1, policy.email_gate_max_rows),
+            limit=limit - deleted,
+        )
+    return deleted
 
 
 def prune_login_failures(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
-    """`login_failures`: windows that started long before the lockout window."""
+    """`login_failures`: failure slots older than any lockout window can count, and the stale global row.
+
+    The idle is `login_failures_idle_s` (the largest `admin_login_window_s` the catalog accepts, a day) and never
+    less than the live window: pruning a slot still inside the configured window would reset the lockout early and
+    hand an attacker `admin_login_max_failures` new guesses (plan 9.5, C6). The table stays bounded anyway: the
+    lockout drops slots older than its window on every attempt and trims the oldest beyond
+    `MAX_TRACKED_LOGIN_IPS` rows at insert time (`admin/auth/lockout.py`).
+    """
+    idle_s = max(policy.login_failures_idle_s, policy.admin_login_window_s)
     return delete_batch(
         conn,
         "login_failures",
         "subject",
         "window_start < ?",
-        (int(now_s - policy.login_failures_idle_s),),
+        (int(now_s - idle_s),),
         "window_start",
         limit,
     )

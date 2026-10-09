@@ -42,6 +42,11 @@ How it works
        - Followers in other processes poll the lease row with a backoff from 25 ms doubling to 250 ms until it
          carries an outcome, expires, or their own wait ends (step 4). They never call upstream after an owner
          failure: they receive its `shared` outcome (step 6).
+       - A follower whose lease row still says "in progress" after `STORE_CHECK_AFTER_S` also looks where the
+         owner stores its answer (`check`, the cache's cache.db read: plan 6.9 step 4 polls cache.db), every
+         `STORE_CHECK_EVERY_S` and once more when its wait ends. The owner stores before it publishes, so an owner
+         whose publish never landed (hot.db busy, then its worker stopped or was killed) still answers the
+         followers that were waiting for it (finding mp-12), instead of leaving them on `coalesce_timeout`.
        - Crash: a row that expired (plus a 250 ms margin for clock steps) without an outcome means the owner
          died. The followers then compete again; the lease insert repeats what it read (compare and swap inside
          `BEGIN IMMEDIATE`), so exactly one of them takes over and fetches; the rest follow the new flight
@@ -108,6 +113,12 @@ PUBLISH_RETRY_MAX_S: Final = 1.0
 """Backoff between attempts to publish an outcome that hot.db refused (busy), until the lease would expire."""
 TAIL_FINISH_TIMEOUT_S: Final = 10.0
 """Upper bound on a deferred outcome (the cache.db store plus a handoff write, each with its own busy budget)."""
+STORE_CHECK_AFTER_S: Final = 1.0
+"""How long a follower waits on a live lease before it also looks in the owner's store (`check`). An owner that
+is alive publishes within milliseconds of its store, so a flight shorter than this costs followers no extra read."""
+STORE_CHECK_EVERY_S: Final = 0.5
+"""How often a follower looks in the owner's store after `STORE_CHECK_AFTER_S` (one read per waiting key and
+worker: same-worker requests share one follower loop)."""
 
 _SELECT_LEASE: Final = "SELECT holder, expires_ms, payload_json FROM lease WHERE name = ?"
 
@@ -341,6 +352,10 @@ class FlightResult[T]:
 type FetchFn[T] = Callable[[FlightStart], Awaitable[tuple[T, FlightOutcome | Deferred]]]
 """The owner's work: fetch and say what followers should get. Returns `(value, outcome or Deferred)`."""
 
+type StoreCheck = Callable[[bool], Awaitable[FlightOutcome | None]]
+"""A follower's look at where the owner stores its answer, called with `final` (True for the last look before a
+timeout). Returns a `stored` or `shared` outcome for an answer found there, else None. Never called by owners."""
+
 type _Tail = Callable[[bool], Coroutine[Any, Any, None]]
 """A flight's background tail, called with `retry` (False when the tail table is full)."""
 
@@ -388,6 +403,8 @@ class SingleFlightStats:
     publish_retries: int = 0
     publish_failures: int = 0
     tails_inline: int = 0
+    store_answers: int = 0
+    """Followers answered from the owner's store (`check`) because its outcome was not published in time."""
 
 
 class _Flight[T]:
@@ -421,6 +438,15 @@ def _flight_payload(flight_id: str) -> str:
     return json.dumps({"f": flight_id}, separators=(",", ":"))
 
 
+def _consume_result(task: asyncio.Future[Any]) -> None:
+    """Done callback of a shielded write: mark its exception as seen. When the awaiting side was canceled (worker
+    shutdown), nobody else reads it, and asyncio would log "Task exception was never retrieved" at error level. A
+    publish that fails then changes nothing: the row still looks in progress, and followers find the answer in the
+    owner's store (`check`) or take the lease over once it expires."""
+    if not task.cancelled():
+        task.exception()
+
+
 def _read_row(conn: sqlite3.Connection, name: str) -> tuple[str, int, str | None] | None:
     row = conn.execute(_SELECT_LEASE, (name,)).fetchone()
     if row is None:
@@ -443,12 +469,16 @@ class SingleFlight:
         takeover_margin_ms: int = TAKEOVER_MARGIN_MS,
         max_flights: int = MAX_FLIGHTS,
         max_tails: int = MAX_TAILS,
+        store_check_after_s: float = STORE_CHECK_AFTER_S,
+        store_check_every_s: float = STORE_CHECK_EVERY_S,
     ) -> None:
         self._hot = hot
         self._clock = clock
         self._holder = holder
         self._poll_start = poll_start_s
         self._poll_max = poll_max_s
+        self._check_after = store_check_after_s
+        self._check_every = store_check_every_s
         self._linger_ms = linger_ms
         self._margin_ms = takeover_margin_ms
         self._max_flights = max_flights
@@ -470,9 +500,11 @@ class SingleFlight:
         wait_s: float,
         enabled: bool = True,
         hooked: bool = False,
+        check: StoreCheck | None = None,
     ) -> FlightResult[T]:
         """Fetch `key` once for every concurrent caller (module docstring). Exceptions from `fetch` propagate to
-        every caller of the same flight in this process; followers elsewhere compete again."""
+        every caller of the same flight in this process; followers elsewhere compete again. `check` is where a
+        follower looks when the owner's outcome is late (the owner's store; module docstring)."""
         started = time.monotonic()
         if not enabled:
             self.stats.solo += 1
@@ -488,12 +520,14 @@ class SingleFlight:
                 if len(self._flights) >= self._max_flights and key not in self._flights:
                     self.stats.solo += 1
                     return await self._solo(fetch, takeover, degraded=True)
-                flight = self._start(key, fetch, owner_deadline_s, wait_until, takeover, lead_only=False, hooked=hooked)
+                flight = self._start(
+                    key, fetch, owner_deadline_s, wait_until, takeover, lead_only=False, hooked=hooked, check=check
+                )
                 result: FlightResult[Any] = await asyncio.shield(flight.future)
             else:
                 waited = await self._wait_local(flight, wait_until)
                 if waited is None:
-                    return self._timeout(flight, started)
+                    return await self._timed_out(flight, started, check)
                 result = waited
             waited_s = time.monotonic() - started
             if result.role is Role.OWNER:
@@ -514,7 +548,7 @@ class SingleFlight:
             # Compete again: the outcome could not be shared, the owner gave up, or our driver's wait (not ours)
             # ended. Bounded by our own wait.
             if time.monotonic() >= wait_until:
-                return self._timeout(flight, started)
+                return await self._timed_out(flight, started, check)
             takeover = True
             self.stats.takeovers += 1
 
@@ -527,7 +561,7 @@ class SingleFlight:
             self.stats.skipped += 1
             return None
         flight: _Flight[T] = self._start(
-            key, fetch, owner_deadline_s, time.monotonic(), False, lead_only=True, hooked=hooked
+            key, fetch, owner_deadline_s, time.monotonic(), False, lead_only=True, hooked=hooked, check=None
         )
         result = await asyncio.shield(flight.future)
         if result.role is Role.SKIPPED:
@@ -584,12 +618,13 @@ class SingleFlight:
         *,
         lead_only: bool,
         hooked: bool,
+        check: StoreCheck | None,
     ) -> _Flight[T]:
         loop = asyncio.get_running_loop()
         flight: _Flight[T] = _Flight(loop.create_future())
         self._flights[key] = flight
         flight.task = loop.create_task(
-            self._drive(key, flight, fetch, owner_deadline_s, wait_until, takeover, lead_only, hooked),
+            self._drive(key, flight, fetch, owner_deadline_s, wait_until, takeover, lead_only, hooked, check),
             name=f"roxy:singleflight:{key[:24]}",
         )
         return flight
@@ -622,6 +657,30 @@ class SingleFlight:
             retry_after_s=self._remaining_s(flight.lease_expires_ms),
         )
 
+    async def _timed_out(self, flight: _Flight[Any], started: float, check: StoreCheck | None) -> FlightResult[Any]:
+        """This call's wait ended while another worker's owner still works: one last look in the owner's store
+        (its answer may be there although its outcome was never published), else `Role.TIMEOUT`."""
+        found = await self._check_store(check, final=True)
+        if found is not None:
+            self.stats.followed_remote += 1
+            return FlightResult(Role.FOLLOWER, found, None, waited_s=time.monotonic() - started)
+        return self._timeout(flight, started)
+
+    async def _check_store(self, check: StoreCheck | None, *, final: bool) -> FlightOutcome | None:
+        """Run a follower's `check`. Only a `stored` or `shared` outcome answers; a failed look is "nothing there"
+        (the store is disposable, C7)."""
+        if check is None:
+            return None
+        try:
+            found = await check(final)
+        except Exception:
+            log.exception("singleflight_store_check_failed")
+            return None
+        if found is None or found.kind not in LINGERING:
+            return None
+        self.stats.store_answers += 1
+        return found
+
     def _remaining_s(self, expires_ms: int | None) -> int:
         if expires_ms is None:
             return 1
@@ -645,11 +704,12 @@ class SingleFlight:
         takeover: bool,
         lead_only: bool,
         hooked: bool,
+        check: StoreCheck | None,
     ) -> None:
         try:
             try:
                 drive = self._drive_hooked if hooked else self._drive_claimed
-                result, tail = await drive(key, flight, fetch, owner_deadline_s, wait_until, takeover, lead_only)
+                result, tail = await drive(key, flight, fetch, owner_deadline_s, wait_until, takeover, lead_only, check)
             except asyncio.CancelledError:
                 if not flight.future.done():
                     flight.future.cancel()
@@ -683,6 +743,7 @@ class SingleFlight:
         wait_until: float,
         takeover: bool,
         lead_only: bool,
+        check: StoreCheck | None,
     ) -> tuple[FlightResult[T], _Tail | None]:
         """Claim mode: take the lease in a transaction of its own, then fetch."""
         name = LEASE_PREFIX + key
@@ -705,7 +766,7 @@ class SingleFlight:
                 return FlightResult(Role.SKIPPED, None, None), None
             if claim.outcome is not None:  # a flight that just finished: its outcome answers us too
                 return FlightResult(Role.FOLLOWER, claim.outcome, None), None
-            followed = await self._follow(name, flight, wait_until)
+            followed = await self._follow(name, flight, wait_until, check)
             if followed is not None:
                 return followed, None
             takeover = True  # the owner died or its row vanished: compete for it
@@ -719,6 +780,7 @@ class SingleFlight:
         wait_until: float,
         takeover: bool,
         lead_only: bool,
+        check: StoreCheck | None,
     ) -> tuple[FlightResult[T], _Tail | None]:
         """Hooked mode: look, then fetch with the lease hook (the upstream inserts it with its bucket slots)."""
         name = LEASE_PREFIX + key
@@ -733,7 +795,7 @@ class SingleFlight:
                 flight.lease_expires_ms = seen.expires_ms
                 if lead_only:
                     return FlightResult(Role.SKIPPED, None, None), None
-                followed = await self._follow(name, flight, wait_until)
+                followed = await self._follow(name, flight, wait_until, check)
                 if followed is not None:
                     return followed, None
                 takeover = True
@@ -759,7 +821,7 @@ class SingleFlight:
                 self.stats.leases_lost += 1
                 if lead_only:
                     return FlightResult(Role.SKIPPED, None, None), None
-                followed = await self._follow(name, flight, wait_until)
+                followed = await self._follow(name, flight, wait_until, check)
                 if followed is not None:
                     return followed, None
                 takeover = True
@@ -926,7 +988,9 @@ class SingleFlight:
             ).rowcount
 
         # Shielded: a shutdown cancel during the write must not leave followers waiting for the full deadline.
-        await asyncio.shield(self._hot.write(run, busy_timeout_ms=LEASE_BUSY_TIMEOUT_MS))
+        write = asyncio.ensure_future(self._hot.write(run, busy_timeout_ms=LEASE_BUSY_TIMEOUT_MS))
+        write.add_done_callback(_consume_result)  # nobody awaits it after a cancel: never "never retrieved"
+        await asyncio.shield(write)
 
     async def _publish(self, publish: _Publish, outcome: FlightOutcome, *, retry: bool, answered_ms: int) -> None:
         """Publish with a backoff while hot.db is busy, until it lands or the lease would expire on its own (then
@@ -959,12 +1023,19 @@ class SingleFlight:
                 "singleflight_publish_failed", extra={"fields": {"lease": publish.name[:40], "error": str(exc)[:200]}}
             )
 
-    async def _follow[T](self, name: str, flight: _Flight[T], wait_until: float) -> FlightResult[T] | None:
-        """Poll the lease row with backoff (plan 6.9 step 4). None means "compete for the lease now"."""
+    async def _follow[T](
+        self, name: str, flight: _Flight[T], wait_until: float, check: StoreCheck | None = None
+    ) -> FlightResult[T] | None:
+        """Poll the lease row with backoff (plan 6.9 step 4), and the owner's store (`check`) once the flight has
+        run `STORE_CHECK_AFTER_S` (module docstring). None means "compete for the lease now"."""
         delay = self._poll_start
+        next_check = time.monotonic() + self._check_after
         while True:
             remaining = wait_until - time.monotonic()
             if remaining <= 0:
+                found = await self._check_store(check, final=True)
+                if found is not None:
+                    return FlightResult(Role.FOLLOWER, found, None)
                 return FlightResult(Role.TIMEOUT, None, None, retry_after_s=self._remaining_s(flight.lease_expires_ms))
             await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, self._poll_max)
@@ -972,21 +1043,30 @@ class SingleFlight:
                 return None
             try:
                 row = await self._hot.read(lambda conn: _read_row(conn, name))
+                readable = True
             except (SharedStateUnavailable, sqlite3.Error):
-                continue  # cannot see the row right now; keep waiting until our deadline
-            if row is None:
+                row, readable = None, False  # cannot see the row right now; keep waiting until our deadline
+            if readable and row is None:
                 return None
-            holder, expires_ms, text = row
-            if holder == self._holder and text is not None and self._unpublished.get(name) == text:
-                return None  # our own finished flight: no outcome will help us more than competing now
-            flight.lease_expires_ms = expires_ms
-            outcome = _parse_payload(text)
-            if outcome is not None:
-                # Any outcome the owner published answers its followers, even if its linger just ended: a
-                # follower never goes upstream after an owner failure because its poll came late (step 6).
-                return FlightResult(Role.FOLLOWER, outcome, None)
-            if expires_ms + self._margin_ms <= self._clock.now_ms():
-                return None  # expired without an outcome: the owner crashed
+            if row is not None:
+                holder, expires_ms, text = row
+                if holder == self._holder and text is not None and self._unpublished.get(name) == text:
+                    return None  # our own finished flight: no outcome will help us more than competing now
+                flight.lease_expires_ms = expires_ms
+                outcome = _parse_payload(text)
+                if outcome is not None:
+                    # Any outcome the owner published answers its followers, even if its linger just ended: a
+                    # follower never goes upstream after an owner failure because its poll came late (step 6).
+                    return FlightResult(Role.FOLLOWER, outcome, None)
+                if expires_ms + self._margin_ms <= self._clock.now_ms():
+                    return None  # expired without an outcome: the owner crashed
+            # Still in progress as far as the row says. The owner stores before it publishes, so look there too
+            # (finding mp-12: an owner whose publish never landed, then whose worker stopped, still answers us).
+            if check is not None and time.monotonic() >= next_check:
+                next_check = time.monotonic() + self._check_every
+                found = await self._check_store(check, final=False)
+                if found is not None:
+                    return FlightResult(Role.FOLLOWER, found, None)
 
 
 __all__ = [
@@ -995,6 +1075,8 @@ __all__ = [
     "LINGERING",
     "OUTCOME_LINGER_MS",
     "SHARE_BODY_MAX",
+    "STORE_CHECK_AFTER_S",
+    "STORE_CHECK_EVERY_S",
     "Deferred",
     "FetchFn",
     "FlightLease",
@@ -1006,4 +1088,5 @@ __all__ = [
     "Role",
     "SingleFlight",
     "SingleFlightStats",
+    "StoreCheck",
 ]

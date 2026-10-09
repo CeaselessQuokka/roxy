@@ -17,6 +17,11 @@ How it works
     - The password is registered with the log redaction filter (`SecretRegistry`) the moment it is read, and is
       held as a `SecretStr`, whose repr never shows it.
     - Headers cannot be injected: CR and LF in a subject become spaces before the message is built.
+    - The TLS context is aiosmtplib's own default (the system CA store, hostname checked) with the key log switched
+      off: CPython's `ssl.create_default_context` copies the `SSLKEYLOGFILE` environment variable into the context,
+      and a debugging leftover in the service environment would write the session keys that protect the app
+      password to a file (review finding cred-6, plan C2 item 2: environment settings are ignored). It is built on a
+      thread, because loading the CA store reads files.
     - `transport` can be replaced (tests pass a function that records messages); nothing in a test ever opens a
       connection to a mail server (plan 19.12).
 
@@ -26,7 +31,9 @@ What to read next
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import ssl
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -106,13 +113,25 @@ def load_mail_config(credentials_dir: Path | None) -> MailConfig | None:
     return MailConfig(to_addr=to_addr, from_addr=from_addr, password=SecretStr(password))
 
 
+def smtp_tls_context() -> ssl.SSLContext:
+    """aiosmtplib's default client context (system CA store, certificates and hostname checked), never logging keys.
+
+    `ssl.create_default_context` takes `SSLKEYLOGFILE` from the environment by itself; `None` switches it off.
+    """
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    context.keylog_filename = None  # type: ignore[assignment]  # None turns key logging off (CPython docs)
+    return context
+
+
 async def smtp_transport(message: EmailMessage, config: MailConfig) -> None:
     """Send through the real SMTP server (implicit TLS, login, send, quit), bounded by `SMTP_TIMEOUT_S`."""
+    context = await asyncio.to_thread(smtp_tls_context)  # loading the CA store reads files: never on the loop
     await aiosmtplib.send(
         message,
         hostname=config.host,
         port=config.port,
         use_tls=True,
+        tls_context=context,
         username=config.from_addr,
         password=config.password.get_secret_value(),
         timeout=SMTP_TIMEOUT_S,

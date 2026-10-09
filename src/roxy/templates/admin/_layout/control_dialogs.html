@@ -7,7 +7,11 @@
     urls.pause         paused=1|0, message, reason
     urls.throttle_all  enabled=1|0, limit, period, message, reason
   A successful answer should send `HX-Refresh: true` (the banners and buttons change everywhere) or a toast.
-  Context: `status`, `urls`.
+  Context: `status`, `urls`. An empty message sends the live `pause_message_default` setting, for a pause and for
+  the emergency limit alike (v1 used one downtime text for both). Both message fields name it from
+  `status.pause_default` (built by `roxy.admin.gallery.caller_texts`, see admin/_layout/banners.html); plan 15.6
+  makes this dialog the setting's home, and the template keeps no copy of its text (plan P3), so without the key
+  the hint names the setting instead of quoting it.
 -#}
 {% from "components/dialog.html" import confirm_dialog %}
 {% set st = status if status is defined and status else {} %}
@@ -25,8 +29,8 @@
                                      "The dashboard, the health check and Roxy's own probes keep working."]) %}
   <div class="field">
     <label class="field__label" for="dlg-pause-message">Message shown to callers <span class="muted">(optional)</span></label>
-    <input class="input" id="dlg-pause-message" name="message" maxlength="300" value="{{ st.pause_reason or '' }}" placeholder="Service down for maintenance." aria-describedby="dlg-pause-message-hint">
-    <p class="field__hint" id="dlg-pause-message-hint">Leave it empty for the default message, Service down for maintenance.</p>
+    <input class="input" id="dlg-pause-message" name="message" maxlength="300" value="{{ st.pause_reason or '' }}"{% if st.pause_default %} placeholder="{{ st.pause_default }}"{% endif %} aria-describedby="dlg-pause-message-hint">
+    <p class="field__hint" id="dlg-pause-message-hint">Leave it empty to send the default pause message{% if st.pause_default %}: <q>{{ st.pause_default }}</q>{% endif %}.</p>
   </div>
 {% endcall %}
 {% endif %}
@@ -54,7 +58,8 @@
   </div>
   <div class="field">
     <label class="field__label" for="dlg-limit-message">Message shown to callers <span class="muted">(optional)</span></label>
-    <input class="input" id="dlg-limit-message" name="message" maxlength="300" value="{{ st.throttle_reason or '' }}" placeholder="High load; please slow down.">
+    <input class="input" id="dlg-limit-message" name="message" maxlength="300" value="{{ st.throttle_reason or '' }}"{% if st.pause_default %} placeholder="{{ st.pause_default }}"{% endif %} aria-describedby="dlg-limit-message-hint">
+    <p class="field__hint" id="dlg-limit-message-hint">Leave it empty to send the default pause message{% if st.pause_default %}: <q>{{ st.pause_default }}</q>{% endif %}.</p>
   </div>
 {% endcall %}
 {% endif %}

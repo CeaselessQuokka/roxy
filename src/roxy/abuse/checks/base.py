@@ -93,19 +93,29 @@ class Facts:
         """A 0/1 switch read like `setting` (catalog default when missing)."""
         return bool(self.setting(key))
 
-    def int(self, key: str, default: int = 0) -> int:
-        value = self.values.get(key, default)
-        return int(value) if value is not None else default
+    def required(self, key: str) -> Any:
+        """`setting`, but a key with no value at all (not in the snapshot, not in the catalog) raises KeyError.
 
-    def float(self, key: str, default: float = 0.0) -> float:
-        value = self.values.get(key, default)
-        return float(value) if value is not None else default
+        Every tunable lives in `config/catalog.py`, so a missing one is a bug to fix there, never a reason for a
+        second, inline default here (plan P3, 15.1).
+        """
+        value = self.setting(key)
+        if value is None:
+            raise KeyError(f"{key} has no value: it is not a catalog setting")
+        return value
 
-    def bool(self, key: str, default: bool = False) -> bool:
-        return bool(self.values.get(key, default))
+    # The typed readers go through `required`: no call site passes (or can pass) its own default.
+    def int(self, key: str) -> int:
+        return int(self.required(key))
 
-    def str(self, key: str, default: str = "") -> str:
-        return str(self.values.get(key, default))
+    def float(self, key: str) -> float:
+        return float(self.required(key))
+
+    def bool(self, key: str) -> bool:
+        return bool(self.required(key))
+
+    def str(self, key: str) -> str:
+        return str(self.required(key))
 
 
 @dataclass(slots=True)
@@ -205,6 +215,22 @@ def with_trio(refusal: Refuse, tx: TxState) -> Refuse:
     return refusal
 
 
+def throttle_refusal_headers(retry_after_s: int, reset_s: int) -> dict[str, str]:
+    """The headers of a per-IP throttle refusal, in the order a genuine one reaches the wire.
+
+    One builder for the genuine refusal (`checks/throttle.py`, which then adds the trio with `with_trio`, whose
+    keys come first) and every disguised one (`disguised_throttle`): a client reading raw headers (`curl -i`, any
+    HTTP library) sees the order too, so the two must agree on order as well as on values (plan 10.5).
+    """
+    return {
+        H_REQUESTS_LEFT: "0",
+        H_THROTTLE_RESET: str(int(reset_s)),
+        H_THROTTLED: TRUE,
+        H_RETRY_AFTER: str(int(retry_after_s)),
+        H_REFUSAL: ReasonCode.THROTTLE.value,
+    }
+
+
 def refusal_headers(reason: ReasonCode, **extra: str | int) -> dict[str, str]:
     """`Roxy-Refusal: <reason>` plus extra headers (keyword names use `_` for `-`, like v1's helper)."""
     headers = {name.replace("_", "-"): str(value) for name, value in extra.items()}
@@ -227,10 +253,11 @@ def disguised_throttle(
     v1's disguised header filter: the rung message for the client's current strikes (rung 1 for a clean client), or
     the plain fallback text, with `Retry-After` and `Roxy-Throttle-Reset` equal to `throttle_reset_duration`.
     v2 also sends `Roxy-Requests-Left: 0` and `Roxy-Refusal: throttle`, exactly what a genuine throttle refusal
-    carries, so nothing in the response tells the client which rule caught it. A client whose throttle penalty is
-    still running (`penalty_wait_ms`) is told the time left on it, as a genuine refusal would tell it right now.
+    carries, in the same order (`throttle_refusal_headers`), so nothing in the response tells the client which rule
+    caught it. A client whose throttle penalty is still running (`penalty_wait_ms`) is told the time left on it, as
+    a genuine refusal would tell it right now.
     """
-    window = max(1, facts.int("throttle_reset_duration", 50))
+    window = max(1, facts.int("throttle_reset_duration"))
     retry, reset = window, window
     if penalty_wait_ms > 0:
         # The same rounding as `throttle.evaluate_per_ip` uses for a client that is still penalized.
@@ -239,20 +266,13 @@ def disguised_throttle(
     text = rung.message.strip()
     source: MessageSource = "custom" if text else "default"
     if not text:
-        text = throttle_fallback(reset, facts.int("allowed_requests_per_minute", 10))
-    headers = {
-        H_RETRY_AFTER: str(retry),
-        H_REQUESTS_LEFT: "0",
-        H_THROTTLE_RESET: str(reset),
-        H_THROTTLED: TRUE,
-        H_REFUSAL: ReasonCode.THROTTLE.value,
-    }
+        text = throttle_fallback(reset, facts.int("allowed_requests_per_minute"))
     return Refuse(
         status=429,
         body=text,
         reason=reason,
         check=check,
-        headers=headers,
+        headers=throttle_refusal_headers(retry, reset),
         tarpit_category=tarpit_category,
         disguised=True,
         message_source=source,
@@ -290,6 +310,7 @@ __all__ = [
     "live_setting",
     "redisguise",
     "refusal_headers",
+    "throttle_refusal_headers",
     "trio_headers",
     "with_trio",
 ]

@@ -179,8 +179,9 @@ def test_r4_compat_collapse_keeps_robloxs_body_like_v1(fakes: Any) -> None:
     assert (off.status, off.body, off.collapsed) == (404, ROBLOX_404_BODY, False)
 
 
-def test_compat_collapse_of_a_4xx_is_never_prettified_but_keeps_the_browser_view(fakes: Any) -> None:
-    """v1 pretty printed successes only, and showed every body (errors too) to a browser as escaped `<pre>`."""
+def test_compat_collapse_of_a_live_4xx_is_not_prettified_but_keeps_the_browser_view(fakes: Any) -> None:
+    """v1's live path pretty printed only a successful call, and showed every body (errors too) to a browser as
+    escaped `<pre>`. A cached 4xx is pretty printed: `test_rr_spec_compat_pretty.py` (finding spec-6)."""
     result = fakes.served(ROBLOX_404_BODY, status=404, reason=ReasonCode.UPSTREAM_4XX)
     pretty = respond.render(fakes.make_req(prettyprint=True), result, compat_collapse=True)
     assert (pretty.status, pretty.body) == (500, ROBLOX_404_BODY)

@@ -47,6 +47,7 @@ from roxy.public.pages import (
     compute_status,
     is_degraded,
     parse_pause_state,
+    parse_throttle_all,
     read_metrics,
     read_rate_limited,
 )
@@ -92,6 +93,22 @@ def stored(**fields: Any) -> str:
 )
 def test_parse_pause_state(value: str | None, expected: SiteState | None) -> None:
     assert parse_pause_state(value, NOW) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, False),
+        ("", False),
+        ("not json", False),
+        ("[1]", False),
+        ('{"enabled": false, "since": 0}', False),
+        ('{"enabled": true, "reason": "incident", "since": 1760000000}', True),
+        ('{"enabled": true, "since": "garbage"}', False),  # unreadable: the proxy's own check decides, not the page
+    ],
+)
+def test_parse_throttle_all(value: str | None, expected: bool) -> None:
+    assert parse_throttle_all(value) is expected
 
 
 def test_parse_pause_state_agrees_with_the_proxy_pause_check() -> None:
@@ -302,6 +319,37 @@ async def test_compute_status_degraded_by_recent_failures(dbs: Any, seed: Callab
     view = await compute_status(StubCtx(dbs), NOW)
     assert view.state is SiteState.DEGRADED
     assert view.hours[-1].state == "degraded"
+
+
+def _set_throttle_all(dbs: Any, enabled: bool) -> None:
+    """Store a throttle-all record in the format of `roxy.abuse.throttle_all` (`ThrottleAllState.to_json`)."""
+    from roxy.abuse.throttle_all import STATE_KEY, ThrottleAllState
+
+    value = json.dumps(ThrottleAllState(enabled=enabled, reason="x", since=NOW if enabled else 0.0).to_json())
+    dbs.control.write_sync(
+        lambda conn: conn.execute(
+            "INSERT INTO service_state (key, value_json, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+            (STATE_KEY, value, int(NOW)),
+        )
+    )
+
+
+async def test_throttle_all_makes_the_status_degraded_and_says_so(dbs: Any) -> None:
+    """Review finding public-3: while the emergency limit refuses every caller, the page is not "operational"."""
+    _set_throttle_all(dbs, True)
+    view = await compute_status(StubCtx(dbs), NOW)
+    assert view.state is SiteState.DEGRADED
+    assert view.emergency_limit is True
+    _set_pause(dbs, paused=True)  # a pause still wins: the proxy answers 503 before throttle-all refuses
+    paused = await compute_status(StubCtx(dbs), NOW)
+    assert paused.state is SiteState.PAUSED
+    assert paused.emergency_limit is True
+    _set_pause(dbs)
+    _set_throttle_all(dbs, False)
+    view = await compute_status(StubCtx(dbs), NOW)
+    assert view.state is SiteState.OPERATIONAL
+    assert view.emergency_limit is False
 
 
 async def test_pause_wins_over_degraded(dbs: Any, seed: Callable[..., None]) -> None:

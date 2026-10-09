@@ -42,8 +42,8 @@ class ThrottleAllCheck(Check):
         state = facts.services.switches.throttle_all
         if not state.enabled:
             return None
-        limit = max(1, facts.int("global_throttle_limit", 1))
-        period = max(1, facts.int("global_throttle_period", 60))
+        limit = max(1, facts.int("global_throttle_limit"))
+        period = max(1, facts.int("global_throttle_period"))
         return LimitSpec(
             self.name, f"{KEY_PREFIX}{facts.limit_key}", "fixed", limit=limit, window_s=period, payload=state
         )

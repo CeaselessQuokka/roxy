@@ -49,7 +49,7 @@ class EndpointRuleCheck(Check):
             rule,
             limit_key=facts.limit_key,
             place_id=getattr(req, "place_id", None),
-            allowed_per_ip=facts.int("allowed_requests_per_minute", 10),
+            allowed_per_ip=facts.int("allowed_requests_per_minute"),
         )
         return LimitSpec(self.name, key, "fixed", limit=limit, window_s=period, payload=rule)
 

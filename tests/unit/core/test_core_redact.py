@@ -430,3 +430,35 @@ def test_redact_label_memory_is_bounded() -> None:
     long_text = "x" * (redact.LABEL_CACHE_MAX_CHARS + 1)
     assert cache.redact(long_text) == long_text
     assert long_text not in cache._state[1]  # long texts are redacted every time, never remembered
+
+
+# --- header names (finding cred-8) ---------------------------------------------------------------------------------
+
+
+def test_redact_headers_hides_a_header_name_that_holds_a_secret() -> None:
+    """A header NAME is caller text: one holding a credential piece (or a public marker) is replaced by a numbered
+    placeholder with a masked value; ordinary names and their values are kept as sent."""
+    credential = fake_credential()
+    SecretRegistry.register("roblox_credential", credential)
+    piece = credential[len(TOKEN_PREFIX) + 30 : len(TOKEN_PREFIX) + 70]
+    out = redact_headers(
+        [
+            (f"X-{piece}", "1"),
+            ("Accept", "*/*"),
+            (f"X-{piece.lower()}-B".encode(), b"secret-value-2"),
+            ("Cookie", "a=b"),
+        ]
+    )
+    assert out == {
+        "[redacted-header-1]": MASK,
+        "Accept": "*/*",
+        "[redacted-header-2]": MASK,
+        "Cookie": MASK,
+    }
+    assert piece.lower() not in repr(out).lower()
+
+
+def test_redact_headers_keeps_ordinary_names_exactly() -> None:
+    SecretRegistry.register("roblox_credential", fake_credential())
+    headers = {"User-Agent": "Roblox/WinInet", "X-Request-Id": "abc", "Content-Type": "application/json"}
+    assert redact_headers(headers) == headers

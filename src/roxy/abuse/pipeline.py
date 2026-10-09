@@ -43,10 +43,17 @@ How it works
        (`ua_rule_hit`, `throttle_tier`), `record_throttled` for a client that just became throttled, and a ladder ban
        if a rung with action `ban` was reached.
     C7: if the transaction raises `SharedStateUnavailable`, the same walk runs on per-worker memory with every limit
-    divided by the number of workers (`ROXY_WORKERS`), logged once per streak as degraded. A key this worker has no
-    memory row for starts from the shared row as last read from hot.db (readable in WAL mode even while another
-    process holds the write lock), so entering degraded mode never refills a client's allowance; memory is cleared
-    when hot.db works again. The tarpit fails closed on its own (no lease, no hold).
+    divided by the live fleet (`ROXY_WORKERS`, or more when the heartbeats show more workers, as during a blue/green
+    deploy), logged once per streak as degraded. The shares add up to at most the limit (C6): `limit // workers`,
+    so a limit smaller than the fleet gives this worker a share of 0 and its requests are refused until hot.db works
+    again (fail closed, with no strike: the outage is Roxy's, not the client's). A key this worker has no memory
+    row for in this streak starts from the shared row as read from hot.db now (readable in WAL mode even while
+    another process holds the write lock), so entering degraded mode never refills a client's allowance. Leaving it
+    never refills one either: every row decided in memory stays until hot.db has it. The first successful
+    transaction that touches a key merges that key's memory rows into the shared rows before it decides (the later
+    GCRA time, the fixed-window counts added, the larger strikes and the later penalty, `merge_limiter_row` and
+    `merge_strike_row`), and a background task merges the rest in batches. The tarpit fails closed on its own (no
+    lease, no hold).
 
 What to read next
     `roxy/abuse/checks/base.py` (the check contract), `roxy/abuse/limiter.py` and `roxy/abuse/throttle.py` (the
@@ -56,6 +63,7 @@ What to read next
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import random
 import sqlite3
@@ -70,9 +78,10 @@ from roxy.abuse.bot import ClientTracker, has_game_server_signature, query_finge
 from roxy.abuse.bypass import is_bypassed
 from roxy.abuse.challenge import challenge_key
 from roxy.abuse.checks import default_checks
-from roxy.abuse.checks.base import Check, Facts, LimitOutcome, LimitSpec, TxState, trio_headers
+from roxy.abuse.checks.base import Check, Facts, LimitOutcome, LimitSpec, TxState, live_setting, trio_headers
 from roxy.abuse.checks.probe import probe_signature
 from roxy.abuse.limiter import (
+    DegradedEntry,
     LimiterRow,
     MemoryRowStore,
     RateDecision,
@@ -81,7 +90,9 @@ from roxy.abuse.limiter import (
     fixed,
     gcra,
     load_rows,
+    merge_limiter_row,
     save_rows,
+    unshared,
 )
 from roxy.abuse.spam import SpamDetectors
 from roxy.abuse.state import SwitchesCache
@@ -93,7 +104,10 @@ from roxy.abuse.throttle import (
     evaluate_per_ip,
     ladder_from,
     load_strike_rows,
+    merge_strike_row,
     peek_per_ip,
+    peek_unshared,
+    refuse_unshared,
     save_strike_rows,
 )
 from roxy.abuse.verdict import Allow, Refuse, Verdict, raw_path, request_target
@@ -103,6 +117,7 @@ from roxy.core.reasons import ReasonCode
 from roxy.rules.match import regex_budget
 from roxy.rules.service import RulesService
 from roxy.rules.store import RulesSnapshot
+from roxy.scheduler.heartbeat import HEARTBEAT_INTERVAL_S, fresh_counts
 from roxy.storage.db import Database, SharedStateUnavailable
 
 log = logging.getLogger(__name__)
@@ -120,6 +135,14 @@ UA_RULE_HIT_EVENT: Final = "ua_rule_hit"
 """Aggregated metrics event: one User-Agent rule evaluated (detail `rule_id`, `result` allowed or refused)."""
 TIER_EVENT: Final = "throttle_tier"
 """Aggregated metrics event: a new strike put a client on a ladder rung (detail `tier`)."""
+MERGE_BATCH: Final = 256
+"""Degraded rows merged into hot.db per background transaction after a C7 outage (short transactions, plan 6.3)."""
+MERGE_RETRY_S: Final = 1.0
+"""After a background merge could not write, the next one waits at least this long."""
+MERGE_CLOSE_WAIT_S: Final = 2.0
+"""At shutdown, how long the last merge of degraded rows may take (inside the lifespan's 8 s budget)."""
+FLEET_REFRESH_INTERVAL_S: Final = HEARTBEAT_INTERVAL_S
+"""How often the live fleet size (the C7 divisor) is read back from the heartbeats."""
 
 Shared = tuple[dict[str, LimiterRow], dict[str, StrikeRow]]
 """Limiter rows and strike rows as read from hot.db (a seed for degraded mode, an input for the prediction)."""
@@ -135,6 +158,7 @@ class AbuseStats:
     ua_rule_hits: dict[str, list[int]] = field(default_factory=dict)  # rule id -> [allowed, refused]
     tier_hits: dict[int, int] = field(default_factory=dict)  # ladder rung -> new strikes reaching it
     degraded_requests: int = 0
+    degraded_merged: int = 0  # memory rows written into hot.db after a C7 outage
     ladder_bans: int = 0
     pattern_checks_skipped: int = 0  # requests a cheap limiter refused before any admin regex ran
 
@@ -146,6 +170,7 @@ class AbuseStats:
             "ua_rule_hits": {k: {"allowed": v[0], "refused": v[1]} for k, v in self.ua_rule_hits.items()},
             "tier_hits": dict(self.tier_hits),
             "degraded_requests": self.degraded_requests,
+            "degraded_merged": self.degraded_merged,
             "ladder_bans": self.ladder_bans,
             "pattern_checks_skipped": self.pattern_checks_skipped,
         }
@@ -156,6 +181,49 @@ class _Walk:
     state: TxState
     limiter_writes: list[LimiterRow]
     strike_writes: list[StrikeRow]
+
+
+@dataclass(slots=True)
+class _Pending:
+    """Degraded rows claimed for one merge into hot.db (C7 recovery): limiter and strike entries by key."""
+
+    rows: dict[str, DegradedEntry[LimiterRow]] = field(default_factory=dict)
+    strikes: dict[str, DegradedEntry[StrikeRow]] = field(default_factory=dict)
+    decay_s: float = 0.0
+
+    def __len__(self) -> int:
+        return len(self.rows) + len(self.strikes)
+
+
+def merge_pending_rows(
+    conn: sqlite3.Connection,
+    rows: dict[str, LimiterRow],
+    strikes: dict[str, StrikeRow],
+    pending: _Pending,
+    now_ms: int,
+) -> None:
+    """Merge claimed degraded entries into the rows just loaded from hot.db, and write what changed (C7 recovery).
+
+    `rows` and `strikes` are updated in place, so a walk that follows decides on the merged rows. A merged row is
+    written even when the walk that follows writes nothing (a refusal): what the worker counted while degraded
+    must reach hot.db either way.
+    """
+    changed_rows: list[LimiterRow] = []
+    for key, entry in pending.rows.items():
+        loaded = rows.get(key) or LimiterRow(key)
+        merged = merge_limiter_row(loaded, entry, now_ms)
+        if merged != loaded:
+            rows[key] = merged
+            changed_rows.append(merged)
+    save_rows(conn, changed_rows, now_ms // 1000)
+    changed_strikes: list[StrikeRow] = []
+    for key, sentry in pending.strikes.items():
+        loaded_strike = strikes.get(key) or StrikeRow(key)
+        merged_strike = merge_strike_row(loaded_strike, sentry, now_ms // 1000, pending.decay_s)
+        if merged_strike != loaded_strike:
+            strikes[key] = merged_strike
+            changed_strikes.append(merged_strike)
+    save_strike_rows(conn, changed_strikes)
 
 
 @dataclass(slots=True)
@@ -189,11 +257,13 @@ def walk_limiters(
 ) -> _Walk:
     """Evaluate the limiters in order and decide what to write (pure; shared by hot.db and degraded mode).
 
-    `divisor` > 1 divides every limit (degraded mode, plan C7). `refused_after` says a check after these limiters
-    refuses the request anyway (a probe, a block): the admitted counts are then not committed either. `provisional`
-    says more limiters may follow (the cheap ones run first, step 2 of the module docstring): when everything here
-    admits, NOTHING is written, not even the flood count, because the full walk that follows writes it. See the
-    module docstring for the commit rule.
+    `divisor` > 1 divides every limit (degraded mode, plan C7): each limiter gets `limit // divisor` on this worker,
+    and a share of 0 refuses without counting (`limiter.unshared`, `throttle.refuse_unshared`); a cooldown is one
+    request per period, so its share is 0 whenever the divisor is above 1. `refused_after` says a check after these
+    limiters refuses the request anyway (a probe, a block): the admitted counts are then not committed either.
+    `provisional` says more limiters may follow (the cheap ones run first, step 2 of the module docstring): when
+    everything here admits, NOTHING is written, not even the flood count, because the full walk that follows writes
+    it. See the module docstring for the commit rule.
     """
     outcomes: dict[str, LimitOutcome] = {}
     pending: list[LimiterRow] = []
@@ -205,10 +275,13 @@ def walk_limiters(
         row = rows.get(spec.key) or LimiterRow(spec.key)
         if spec.algo == "per_ip" and spec.per_ip is not None:
             policy = spec.per_ip
-            if divisor > 1:
-                policy = replace(policy, limit=degraded_limit(policy.limit, divisor))
             srow = strikes.get(spec.key) or StrikeRow(spec.key)
-            result = evaluate_per_ip(policy, row, srow, now_ms)
+            share = degraded_limit(policy.limit, divisor) if divisor > 1 else policy.limit
+            if share > 0:
+                limited = policy if share == policy.limit else replace(policy, limit=share)
+                result = evaluate_per_ip(limited, row, srow, now_ms)
+            else:
+                result = refuse_unshared(policy, row, srow, now_ms)  # fail closed (C7), no strike
             outcome = LimitOutcome(
                 spec, result.admitted, result.remaining, result.reset_s, result.retry_after_s, per_ip=result
             )
@@ -221,8 +294,15 @@ def walk_limiters(
                 if result.limiter_row is not None:
                     writes.append(result.limiter_row)
         else:
-            limit = degraded_limit(spec.limit, divisor) if divisor > 1 else spec.limit
-            decision = _decide(spec, row, limit, now_ms)
+            limit = spec.limit
+            if divisor > 1:
+                limit = degraded_limit(1 if spec.algo == "cooldown" else spec.limit, divisor)
+            if limit > 0:
+                decision = _decide(spec, row, limit, now_ms)
+            elif spec.algo == "cooldown":
+                decision = unshared(row, 1, spec.cooldown_s)
+            else:
+                decision = unshared(row, spec.limit, spec.window_s)
             outcome = LimitOutcome(
                 spec, decision.admitted, decision.remaining, decision.reset_s, decision.retry_after_s, row=decision.row
             )
@@ -238,7 +318,8 @@ def walk_limiters(
         writes.extend(pending)
     state = TxState(outcomes=outcomes, stopped_at=refused_at)
     if trio_policy is not None:
-        policy = trio_policy if divisor <= 1 else replace(trio_policy, limit=degraded_limit(trio_policy.limit, divisor))
+        share = degraded_limit(trio_policy.limit, divisor) if divisor > 1 else trio_policy.limit
+        policy = trio_policy if share in (0, trio_policy.limit) else replace(trio_policy, limit=share)
         srow = strikes.get(policy.key) or StrikeRow(policy.key)
         now_s = now_ms // 1000
         if (
@@ -250,7 +331,10 @@ def walk_limiters(
             state.trio = (result.remaining, result.reset_s, not result.admitted)
             state.strikes = result.strikes
         else:
-            state.trio = peek_per_ip(policy, rows.get(policy.key) or LimiterRow(policy.key), srow, now_ms)
+            if share > 0:
+                state.trio = peek_per_ip(policy, rows.get(policy.key) or LimiterRow(policy.key), srow, now_ms)
+            else:
+                state.trio = peek_unshared(policy, srow, now_ms)
             state.strikes = effective_strikes(srow.strikes, srow.last_strike_at, now_s, policy.decay_s)
         final = next((row for row in strike_writes if row.key == policy.key), srow)
         if final.exists:
@@ -292,11 +376,13 @@ class AbusePipeline:
         tarpit_sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         rng: random.Random | None = None,
+        metrics_db: Database | None = None,
     ) -> None:
         self.settings = settings
         self.rules = rules
         self.hot_db = hot_db
         self.control_db = control_db
+        self.metrics_db = metrics_db  # worker heartbeats: the live fleet size, the C7 divisor
         self.clock = clock
         self.worker_id = worker_id
         self.workers = max(1, int(workers))
@@ -314,8 +400,13 @@ class AbusePipeline:
         self.challenge_key = challenge_key(ip_hash_key) if ip_hash_key else None
         self.stats = AbuseStats()
         self.degraded = False
-        self._memory_rows: MemoryRowStore[LimiterRow] = MemoryRowStore()
-        self._memory_strikes: MemoryRowStore[StrikeRow] = MemoryRowStore()
+        self.fleet_size: int | None = None  # live workers of both colors, from the heartbeats (None: unknown)
+        # C7 memory: what this worker decided while hot.db could not be written, kept until merged into hot.db.
+        self._memory_rows: MemoryRowStore[DegradedEntry[LimiterRow]] = MemoryRowStore()
+        self._memory_strikes: MemoryRowStore[DegradedEntry[StrikeRow]] = MemoryRowStore()
+        self._streak = 0  # counts degraded streaks; an entry from an earlier streak is rebased on hot.db first
+        self._merge_task: asyncio.Task[int] | None = None
+        self._merge_not_before = 0.0  # monotonic time before which no new background merge starts
         self._background: set[asyncio.Task[Any]] = set()
         self._slow: tuple[RulesSnapshot, bool] | None = None  # `slow_patterns` of the last snapshot seen
 
@@ -335,6 +426,7 @@ class AbusePipeline:
             recorder=ctx.recorder,
             rules_service=service,
             ip_hash_key=getattr(ctx, "ip_hash_key", None),
+            metrics_db=getattr(dbs, "metrics", None) if dbs is not None else None,
         )
 
     # ---- inputs ----
@@ -353,23 +445,24 @@ class AbusePipeline:
 
     def _facts(self, req: Any, values: Mapping[str, Any], rules: RulesSnapshot, now: float, now_ms: int) -> Facts:
         ip = str(getattr(req, "client_ip", "") or "")
-        key = str(getattr(req, "limit_key", "") or "") or compute_limit_key(
-            ip, int(values.get("ipv6_limit_prefix", 64))
-        )
+
+        def value(name: str) -> Any:
+            return live_setting(values, name)  # the catalog default when the snapshot lacks it (no inline copy)
+
+        key = str(getattr(req, "limit_key", "") or "") or compute_limit_key(ip, int(value("ipv6_limit_prefix")))
         ladder = ladder_from(rules.throttle_tiers)
-        mode = str(values.get("throttle_window_mode", "gcra"))
         policy = PerIpPolicy(
             key=key,
-            mode="fixed" if mode == "fixed" else "gcra",
-            limit=max(1, int(values.get("allowed_requests_per_minute", 10))),
-            window_s=max(1, int(values.get("throttle_reset_duration", 50))),
-            escalation=bool(values.get("throttle_escalation_enabled", 1)),
-            decay_s=max(0, int(values.get("throttle_strike_decay_seconds", 1800))),
+            mode="fixed" if str(value("throttle_window_mode")) == "fixed" else "gcra",
+            limit=max(1, int(value("allowed_requests_per_minute"))),
+            window_s=max(1, int(value("throttle_reset_duration"))),
+            escalation=bool(value("throttle_escalation_enabled")),
+            decay_s=max(0, int(value("throttle_strike_decay_seconds"))),
             ladder=ladder,
-            strike_on_retry=bool(values.get("throttle_strike_on_retry", 1)),
+            strike_on_retry=bool(value("throttle_strike_on_retry")),
         )
         path = raw_path(req)
-        cidrs = values.get("roblox_egress_cidrs") or ()
+        cidrs = value("roblox_egress_cidrs") or ()
         return Facts(
             now=now,
             now_ms=now_ms,
@@ -467,7 +560,8 @@ class AbusePipeline:
         keys = [spec.key for spec in specs] + ([policy.key] if policy is not None else [])
         seed = await self._read_shared(keys, [policy.key] if policy is not None else [])
         if seed is not None:
-            predicted = walk_limiters(specs, seed[0], seed[1], policy, facts.now_ms)
+            rows, strikes = self._overlay(seed, facts.now_ms, policy)  # rows not merged yet count as merged
+            predicted = walk_limiters(specs, rows, strikes, policy, facts.now_ms)
             if predicted.state.stopped_at is None:
                 return None  # they admit on the shared rows: prepare the pattern checks, then one transaction
         state = await self._transaction(specs, facts, bypass, provisional=True, seed=seed)
@@ -490,17 +584,28 @@ class AbusePipeline:
             return TxState(trio=bypass_trio)
         if not specs:
             return await self._peek(policy, facts.now_ms)
+        # Rows this worker decided while degraded and hot.db does not have yet ride along in this transaction.
+        pending = self._claim([spec.key for spec in specs], policy)
+        written = False
         try:
             if self.hot_db is None:
                 raise SharedStateUnavailable("hot", "no hot.db in this process")
             walk = await self.hot_db.write(
-                lambda conn: self._tx(conn, specs, policy, facts.now_ms, refused_after, provisional),
+                lambda conn: self._tx(conn, specs, policy, facts.now_ms, refused_after, provisional, pending),
                 busy_timeout_ms=TX_BUSY_TIMEOUT_MS,
             )
-            self._recovered()
-            state = walk.state
+            written = True
         except SharedStateUnavailable as exc:
+            self._release(pending, merged=False)
             state = await self._degraded_walk(specs, policy, facts.now_ms, exc, refused_after, provisional, seed)
+        else:
+            self._release(pending, merged=True)
+            self._recovered()
+            self._schedule_merge()
+            state = walk.state
+        finally:
+            if not written:
+                self._release(pending, merged=False)  # an unexpected error: the rows stay pending (idempotent)
         if bypass:
             state.trio = bypass_trio
         return state
@@ -513,26 +618,200 @@ class AbusePipeline:
         now_ms: int,
         refused_after: bool = False,
         provisional: bool = False,
+        pending: _Pending | None = None,
     ) -> _Walk:
         keys = [spec.key for spec in specs]
         if policy is not None:
             keys.append(policy.key)
         rows = load_rows(conn, keys)
         strikes = load_strike_rows(conn, [policy.key]) if policy is not None else {}
+        if pending is not None:
+            merge_pending_rows(conn, rows, strikes, pending, now_ms)  # C7 recovery: decide on the merged rows
         walk = walk_limiters(specs, rows, strikes, policy, now_ms, refused_after=refused_after, provisional=provisional)
         save_rows(conn, walk.limiter_writes, now_ms // 1000)
         save_strike_rows(conn, walk.strike_writes)
         return walk
 
+    # ---- C7: degraded mode and the way back ----
+
+    def _divisor(self) -> int:
+        """The C7 divisor: `ROXY_WORKERS`, or the live fleet when the heartbeats show more (both colors in a deploy)."""
+        return max(self.workers, self.fleet_size or 0)
+
+    def _decay_s(self, policy: PerIpPolicy | None) -> float:
+        if policy is not None:
+            return float(policy.decay_s)
+        return float(max(0, int(live_setting(self._values(), "throttle_strike_decay_seconds"))))
+
+    def _claim(self, keys: Sequence[str], policy: PerIpPolicy | None) -> _Pending | None:
+        """The pending degraded entries of these keys, marked as carried by one merge (None when there are none).
+
+        Called only on the event loop. Entries this worker never changed (seeds) carry nothing and are dropped.
+        """
+        if not (len(self._memory_rows) or len(self._memory_strikes)):
+            return None
+        pending = _Pending(decay_s=self._decay_s(policy))
+        for key in dict.fromkeys([*keys, *([policy.key] if policy is not None else [])]):
+            entry = self._memory_rows.get(key)
+            if entry is not None and not entry.claimed:
+                if entry.changed:
+                    entry.claimed = True
+                    pending.rows[key] = entry
+                elif not self.degraded:
+                    self._memory_rows.discard(key, entry)
+        if policy is not None:
+            sentry = self._memory_strikes.get(policy.key)
+            if sentry is not None and not sentry.claimed:
+                if sentry.changed:
+                    sentry.claimed = True
+                    pending.strikes[policy.key] = sentry
+                elif not self.degraded:
+                    self._memory_strikes.discard(policy.key, sentry)
+        return pending if len(pending) else None
+
+    def _claim_batch(self, limit: int) -> _Pending | None:
+        """Up to `limit` pending entries, oldest first, for one background merge transaction."""
+        pending = _Pending(decay_s=self._decay_s(None))
+        for key, entry in self._memory_rows.items():
+            if len(pending) >= limit:
+                break
+            if entry.claimed:
+                continue
+            if not entry.changed:
+                self._memory_rows.discard(key, entry)
+                continue
+            entry.claimed = True
+            pending.rows[key] = entry
+        for key, sentry in self._memory_strikes.items():
+            if len(pending) >= limit:
+                break
+            if sentry.claimed:
+                continue
+            if not sentry.changed:
+                self._memory_strikes.discard(key, sentry)
+                continue
+            sentry.claimed = True
+            pending.strikes[key] = sentry
+        return pending if len(pending) else None
+
+    def _release(self, pending: _Pending | None, *, merged: bool) -> None:
+        """After a merge transaction: forget the entries hot.db now has, or give them back to be merged later.
+
+        An entry a degraded walk replaced meanwhile (a newer object under the same key) is kept either way; it
+        holds everything the old one did, so merging it again can only count more, never less (conservative).
+        """
+        if pending is None:
+            return
+        for key, entry in pending.rows.items():
+            entry.claimed = False
+            if merged:
+                self._memory_rows.discard(key, entry)
+        for key, sentry in pending.strikes.items():
+            sentry.claimed = False
+            if merged:
+                self._memory_strikes.discard(key, sentry)
+        if merged:
+            self.stats.degraded_merged += len(pending)
+        pending.rows.clear()
+        pending.strikes.clear()
+
     def _recovered(self) -> None:
-        """A write worked: leave degraded mode and forget the memory rows (the next streak starts from hot.db)."""
+        """A write worked: leave degraded mode. Unchanged seeds are dropped; changed rows wait for their merge."""
         if not self.degraded:
             return
         self.degraded = False
-        self._memory_rows.clear()
-        self._memory_strikes.clear()
-        log.info("abuse_degraded_recovered")
-        self._event("abuse_degraded_recovered", "info", {})
+        for key, entry in self._memory_rows.items():
+            if not entry.changed and not entry.claimed:
+                self._memory_rows.discard(key, entry)
+        for key, sentry in self._memory_strikes.items():
+            if not sentry.changed and not sentry.claimed:
+                self._memory_strikes.discard(key, sentry)
+        pending = len(self._memory_rows) + len(self._memory_strikes)
+        log.info("abuse_degraded_recovered", extra={"fields": {"pending_rows": pending}})
+        self._event("abuse_degraded_recovered", "info", {"pending_rows": pending})
+
+    def _schedule_merge(self) -> None:
+        """Start the background merge of the remaining degraded rows, unless one runs or there is nothing to do."""
+        if self.degraded or not (len(self._memory_rows) or len(self._memory_strikes)):
+            return
+        if self._merge_task is not None and not self._merge_task.done():
+            return
+        if self.monotonic() < self._merge_not_before:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._merge_task = loop.create_task(self.merge_pending())
+
+    async def merge_pending(self, *, even_if_degraded: bool = False) -> int:
+        """Write every pending degraded row into hot.db, `MERGE_BATCH` per transaction. Returns how many were merged.
+
+        Stops at the first write that fails (the pipeline is then degraded again, or will be: the rows stay in
+        memory, where the degraded walk keeps using them). Never raises.
+        """
+        merged = 0
+        while self.hot_db is not None and (even_if_degraded or not self.degraded):
+            pending = self._claim_batch(MERGE_BATCH)
+            if pending is None:
+                break
+            now_ms = self.clock.now_ms()
+            size = len(pending)
+            try:
+                job = functools.partial(self._merge_job, pending=pending, now_ms=now_ms)
+                await self.hot_db.write(job, busy_timeout_ms=TX_BUSY_TIMEOUT_MS)
+            except SharedStateUnavailable:
+                self._release(pending, merged=False)
+                self._merge_not_before = self.monotonic() + MERGE_RETRY_S
+                break
+            except Exception:
+                self._release(pending, merged=False)
+                self._merge_not_before = self.monotonic() + MERGE_RETRY_S
+                log.exception("abuse_degraded_merge_failed")
+                break
+            self._release(pending, merged=True)
+            merged += size
+        if merged:
+            log.info("abuse_degraded_merged", extra={"fields": {"rows": merged}})
+        return merged
+
+    @staticmethod
+    def _merge_job(conn: sqlite3.Connection, pending: _Pending, now_ms: int) -> None:
+        rows = load_rows(conn, pending.rows)
+        strikes = load_strike_rows(conn, pending.strikes)
+        merge_pending_rows(conn, rows, strikes, pending, now_ms)
+
+    def _overlay(self, shared: Shared, now_ms: int, policy: PerIpPolicy | None) -> Shared:
+        """`shared` with this worker's pending degraded rows merged in (in memory only, for a read-only view)."""
+        rows, strikes = dict(shared[0]), dict(shared[1])
+        if not (len(self._memory_rows) or len(self._memory_strikes)):
+            return rows, strikes
+        for key in list(rows):
+            entry = self._memory_rows.get(key)
+            if entry is not None and entry.changed:
+                rows[key] = merge_limiter_row(rows[key], entry, now_ms)
+        decay_s = self._decay_s(policy)
+        for key in list(strikes):
+            sentry = self._memory_strikes.get(key)
+            if sentry is not None and sentry.changed:
+                strikes[key] = merge_strike_row(strikes[key], sentry, now_ms // 1000, decay_s)
+        return rows, strikes
+
+    async def refresh_fleet_size(self) -> None:
+        """Background loop: the live workers of both colors from metrics.db heartbeats (the C7 divisor, plan C6).
+
+        A failed read keeps the last value: a larger divisor is only more conservative.
+        """
+        if self.metrics_db is None:
+            return
+        now = self.clock.now()
+        try:
+            counts = await self.metrics_db.read(lambda conn: fresh_counts(conn, now))
+        except (SharedStateUnavailable, sqlite3.Error) as exc:
+            log.debug("abuse_fleet_size_unavailable", extra={"fields": {"error": str(exc)[:200]}})
+            return
+        total = sum(counts.values())
+        self.fleet_size = total if total > 0 else None
 
     async def _read_shared(self, keys: list[str], strike_keys: list[str]) -> Shared | None:
         """Limiter and strike rows from hot.db with a READ (works while another process holds the write lock)."""
@@ -542,6 +821,49 @@ class AbusePipeline:
             return await self.hot_db.read(lambda conn: (load_rows(conn, keys), load_strike_rows(conn, strike_keys)))
         except SharedStateUnavailable:
             return None
+
+    @staticmethod
+    def _algos(specs: Sequence[LimitSpec], policy: PerIpPolicy | None) -> dict[str, str]:
+        """Key to merge rule (`gcra`, `fixed` or `cooldown`) for every limiter row this request touches."""
+        algos: dict[str, str] = {}
+        for spec in specs:
+            if spec.algo == "per_ip":
+                algos[spec.key] = spec.per_ip.mode if spec.per_ip is not None else "gcra"
+            else:
+                algos[spec.key] = spec.algo
+        if policy is not None:
+            algos.setdefault(policy.key, policy.mode)
+        return algos
+
+    def _memory_row(self, key: str, algo: str, shared: LimiterRow | None, now_ms: int) -> LimiterRow:
+        """This worker's row for `key` in the current streak, starting from (or rebased on) the shared row."""
+        entry = self._memory_rows.get(key)
+        if entry is not None and entry.streak == self._streak:
+            return entry.row
+        base = shared or LimiterRow(key)
+        if entry is None:
+            entry = DegradedEntry(base, base, algo, self._streak)
+        else:
+            # Left from an earlier streak and not merged yet: keep what this worker counted then, on top of the
+            # shared row as it is now (which may hold what other workers counted since).
+            entry = DegradedEntry(merge_limiter_row(base, entry, now_ms), base, entry.algo, self._streak)
+        if entry.row.exists or entry.changed:
+            self._memory_rows.put(key, entry)
+        return entry.row
+
+    def _memory_strike(self, key: str, shared: StrikeRow | None, now_s: int, decay_s: float) -> StrikeRow:
+        """`_memory_row` for the client's strike row."""
+        entry = self._memory_strikes.get(key)
+        if entry is not None and entry.streak == self._streak:
+            return entry.row
+        base = shared or StrikeRow(key)
+        if entry is None:
+            entry = DegradedEntry(base, base, "strikes", self._streak)
+        else:
+            entry = DegradedEntry(merge_strike_row(base, entry, now_s, decay_s), base, "strikes", self._streak)
+        if entry.row.exists or entry.changed:
+            self._memory_strikes.put(key, entry)
+        return entry.row
 
     async def _degraded_walk(
         self,
@@ -553,19 +875,26 @@ class AbusePipeline:
         provisional: bool = False,
         seed: Shared | None = None,
     ) -> TxState:
-        """C7: the same decision on this worker's memory at `limit / workers`, starting from the shared rows."""
+        """C7: the same decision on this worker's memory at `limit // fleet`, starting from the shared rows."""
         if not self.degraded:
             self.degraded = True
+            self._streak += 1
+            divisor = self._divisor()
             log.warning(
                 "abuse_degraded",
-                extra={"fields": {"error": str(exc)[:200], "workers": self.workers, "mode": "limit / workers"}},
+                extra={"fields": {"error": str(exc)[:200], "workers": divisor, "mode": "limit // workers"}},
             )
-            self._event("abuse_degraded", "critical", {"error": str(exc)[:200], "workers": self.workers})
+            self._event("abuse_degraded", "critical", {"error": str(exc)[:200], "workers": divisor})
         self.stats.degraded_requests += 1
-        keys = list(dict.fromkeys([spec.key for spec in specs] + ([policy.key] if policy is not None else [])))
+        algos = self._algos(specs, policy)
         strike_keys = [policy.key] if policy is not None else []
-        missing = [key for key in keys if self._memory_rows.get(key) is None]
-        strike_missing = [key for key in strike_keys if self._memory_strikes.get(key) is None]
+        decay_s = self._decay_s(policy)
+
+        def stale(entry: DegradedEntry[Any] | None) -> bool:
+            return entry is None or entry.streak != self._streak
+
+        missing = [key for key in algos if stale(self._memory_rows.get(key))]
+        strike_missing = [key for key in strike_keys if stale(self._memory_strikes.get(key))]
         shared: Shared | None = seed
         if shared is None and (missing or strike_missing):
             # A client already over its allowance in hot.db must not get a fresh one here (C7 is conservative).
@@ -573,64 +902,55 @@ class AbusePipeline:
         # No await from here on: reading memory, the walk and writing memory are one step of this worker's event
         # loop, so concurrent requests of one client never all start from the same row (each sees the last write).
         shared_rows, shared_strikes = shared if shared is not None else ({}, {})
-        rows: dict[str, LimiterRow] = {}
-        for key in keys:
-            row = self._memory_rows.get(key)
-            if row is None:
-                row = shared_rows.get(key) or LimiterRow(key)
-                if row.exists:
-                    self._memory_rows.put(key, row)
-            rows[key] = row
-        strikes: dict[str, StrikeRow] = {}
-        for key in strike_keys:
-            srow = self._memory_strikes.get(key)
-            if srow is None:
-                srow = shared_strikes.get(key) or StrikeRow(key)
-                if srow.exists:
-                    self._memory_strikes.put(key, srow)
-            strikes[key] = srow
+        rows = {key: self._memory_row(key, algo, shared_rows.get(key), now_ms) for key, algo in algos.items()}
+        strikes = {
+            key: self._memory_strike(key, shared_strikes.get(key), now_ms // 1000, decay_s) for key in strike_keys
+        }
         walk = walk_limiters(
             specs,
             rows,
             strikes,
             policy,
             now_ms,
-            divisor=self.workers,
+            divisor=self._divisor(),
             refused_after=refused_after,
             provisional=provisional,
         )
         for row in walk.limiter_writes:
-            self._memory_rows.put(row.key, row)
+            entry = self._memory_rows.get(row.key)
+            base = entry.seed if entry is not None else LimiterRow(row.key)
+            self._memory_rows.put(row.key, DegradedEntry(row, base, algos.get(row.key, "gcra"), self._streak))
         for srow in walk.strike_writes:
-            self._memory_strikes.put(srow.key, srow)
+            sentry = self._memory_strikes.get(srow.key)
+            sbase = sentry.seed if sentry is not None else StrikeRow(srow.key)
+            self._memory_strikes.put(srow.key, DegradedEntry(srow, sbase, "strikes", self._streak))
         walk.state.degraded = True
         return walk.state
 
     async def _peek(self, policy: PerIpPolicy | None, now_ms: int) -> TxState:
         """The trio for a refusal decided before any limiter ran (pause, ban): one read, no write.
 
-        While degraded, this worker's memory rows are the truth (they include what it admitted since hot.db stopped
-        accepting writes); otherwise hot.db, and memory again if hot.db cannot even be read.
+        While degraded, this worker's memory rows of the current streak are the truth (they include what it
+        admitted since hot.db stopped accepting writes); otherwise hot.db with any rows not merged yet added, and
+        memory again if hot.db cannot even be read.
         """
         if policy is None:
             return TxState()
-        shared: Shared | None = None
-        if self.degraded:
-            memory_row = self._memory_rows.get(policy.key)
-            memory_strike = self._memory_strikes.get(policy.key)
-            if memory_row is not None or memory_strike is not None:
-                shared = (
-                    {policy.key: memory_row or LimiterRow(policy.key)},
-                    {policy.key: memory_strike or StrikeRow(policy.key)},
-                )
-        if shared is None:
-            shared = await self._read_shared([policy.key], [policy.key])
-        if shared is None:
-            shared = (
-                {policy.key: self._memory_rows.get(policy.key) or LimiterRow(policy.key)},
-                {policy.key: self._memory_strikes.get(policy.key) or StrikeRow(policy.key)},
-            )
-        return walk_limiters([], shared[0], shared[1], policy, now_ms).state
+        key = policy.key
+        entry, sentry = self._memory_rows.get(key), self._memory_strikes.get(key)
+        divisor = self._divisor() if self.degraded else 1
+        current = [e for e in (entry, sentry) if e is not None and e.streak == self._streak]
+        if self.degraded and current:
+            rows = {key: entry.row if entry is not None else LimiterRow(key)}
+            strikes = {key: sentry.row if sentry is not None else StrikeRow(key)}
+            return walk_limiters([], rows, strikes, policy, now_ms, divisor=divisor).state
+        shared = await self._read_shared([key], [key])
+        if shared is not None:
+            rows, strikes = self._overlay(shared, now_ms, policy)
+        else:
+            rows = {key: entry.row if entry is not None else LimiterRow(key)}
+            strikes = {key: sentry.row if sentry is not None else StrikeRow(key)}
+        return walk_limiters([], rows, strikes, policy, now_ms, divisor=divisor).state
 
     def _later_check_refuses(self, req: Any, facts: Facts, verdict: Refuse, prep: _Prep, tx: TxState) -> bool:
         """Whether a static check after `verdict.check` would refuse this request (step 4 of the module docstring).
@@ -782,14 +1102,23 @@ class AbusePipeline:
         tasks.start("abuse_spam_flush", self.spam.flush, interval_s=SPAM_FLUSH_INTERVAL_S)
         tasks.start("abuse_switches", self.switches.refresh_if_changed, interval_s=SWITCH_REFRESH_INTERVAL_S)
         tasks.start("abuse_ban_hits", self.flush_ban_hits, interval_s=BAN_HITS_FLUSH_INTERVAL_S)
+        tasks.start("abuse_fleet_size", self.refresh_fleet_size, interval_s=FLEET_REFRESH_INTERVAL_S)
 
     async def aclose(self) -> None:
-        """Shutdown: flush what is buffered (best effort) and wait briefly for background bans."""
+        """Shutdown: flush what is buffered and merge degraded rows into hot.db (best effort), wait for bans."""
         for flush in (self.spam.flush, self.flush_ban_hits):
             try:
                 await flush()
             except Exception:
                 log.exception("abuse_close_flush_failed")
+        if self._merge_task is not None and not self._merge_task.done():
+            await asyncio.wait({self._merge_task}, timeout=MERGE_CLOSE_WAIT_S)
+        if len(self._memory_rows) or len(self._memory_strikes):
+            # What this worker counted during an outage must outlive it: one more try, even if the last write failed.
+            try:
+                await asyncio.wait_for(self.merge_pending(even_if_degraded=True), timeout=MERGE_CLOSE_WAIT_S)
+            except TimeoutError:
+                log.warning("abuse_degraded_merge_unfinished_at_close")
         if self._background:
             await asyncio.wait(set(self._background), timeout=5)
 
@@ -808,6 +1137,7 @@ async def install(ctx: Any, stack: AsyncExitStack) -> AbusePipeline:
 
 
 __all__ = [
+    "MERGE_BATCH",
     "TIER_EVENT",
     "UA_RULE_HIT_EVENT",
     "AbusePipeline",
@@ -816,6 +1146,7 @@ __all__ = [
     "Refuse",
     "Verdict",
     "install",
+    "merge_pending_rows",
     "slow_patterns",
     "walk_limiters",
 ]

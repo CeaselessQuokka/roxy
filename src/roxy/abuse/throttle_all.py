@@ -16,7 +16,8 @@ How it works
       entries skip it (v1).
     - The refusal is 429 with the stored reason, or the pause default (the live `pause_message_default` setting,
       `Service down for maintenance.` unless the admin changed it) when none was given: v1 used its one downtime
-      constant for both (bug B6/B13, kept for parity). `Roxy-Throttle-Reset` is the emergency window's remaining
+      constant for both (bug B6/B13, kept for parity). The reason is checked when it is written (no em or en
+      dash, plan C5, `messages.checked_state_reason`). `Roxy-Throttle-Reset` is the emergency window's remaining
       time and `Roxy-Global-Throttled: True`; `Roxy-Throttled` and `Roxy-Requests-Left` stay the per-IP values (v1
       B7).
     - Enabling records a new `since` marker (row 115). v1 deleted the drop counter instead; v2 keeps the history in
@@ -32,7 +33,13 @@ import sqlite3
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Final
 
-from roxy.abuse.messages import DEFAULT_DOWNTIME_MESSAGE, MAX_STATE_REASON, clean_admin_message, downtime_default
+from roxy.abuse.messages import (
+    DEFAULT_DOWNTIME_MESSAGE,
+    MAX_STATE_REASON,
+    checked_state_reason,
+    clean_admin_message,
+    downtime_default,
+)
 from roxy.abuse.state import read_state_value, write_state_value
 from roxy.abuse.verdict import MessageSource
 from roxy.config.audit import Actor
@@ -83,16 +90,18 @@ async def set_throttle_all(
     """Switch throttle-all on or off (None toggles), optionally replacing the reason (v1 `/admin/proxy/throttle_all`).
 
     The limit and period are ordinary settings (`global_throttle_limit`, `global_throttle_period`) changed through
-    the settings service, which reports invalid values instead of ignoring them (v1 bug B16).
+    the settings service, which reports invalid values instead of ignoring them (v1 bug B16). Raises ValueError for
+    a reason with an em or en dash or a control character (plan C5), before anything is written.
     """
     now = clock.now()
+    stored = checked_state_reason(reason) if reason is not None else None
 
     def write(conn: sqlite3.Connection) -> ThrottleAllState:
         before = ThrottleAllState.from_json(read_state_value(conn, STATE_KEY))
         target = (not before.enabled) if enabled is None else bool(enabled)
         after = replace(before, enabled=target)
-        if reason is not None:
-            after = replace(after, reason=clean_admin_message(reason, MAX_STATE_REASON))
+        if stored is not None:
+            after = replace(after, reason=stored)
         if target and not before.enabled:
             after = replace(after, since=now)  # a new "since" marker every time it is switched on (row 115)
         if not target:

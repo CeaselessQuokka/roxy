@@ -46,8 +46,9 @@ How it works
     7. `respond.render` builds the answer; `ctx.recorder.record_outcome(event)` runs exactly once per request
        (for a drip, when the stream ends), with a `CaptureInput` when the recorder takes one (its capture policy
        decides whether the bodies are kept). `message_source` tells whose words the caller got (row 116): a
-       refusal's `custom` or `default`, `roxy` for a 7.13 failure text Roxy wrote, `roblox` for an error answer that
-       carries Roblox's own body. An exception still propagates to the middleware, which answers 500 (or the
+       refusal's `custom` or `default` (a refusal the upstream layer returned, such as an egress host refusal, is
+       `default`), `roxy` for a 7.13 failure text Roxy wrote, `roblox` for an error answer that carries Roblox's
+       own body. An exception still propagates to the middleware, which answers 500 (or the
        deadline middleware 504), but the fallback outcome record (`internal_error` or `deadline`) is written here
        first, because only this flow knows the request's endpoint and cache facts (DESIGN 7).
     Fail closed (plan C7): no context or no abuse pipeline means 503 `degraded` for valid targets (invalid ones
@@ -79,6 +80,7 @@ from starlette.routing import Match, Route, Router
 from starlette.types import Scope
 
 from roxy.core.client_ip import UNKNOWN_IP, limit_key
+from roxy.core.deadline import STATE_COMPAT_COLLAPSE
 from roxy.core.errors import not_found_response
 from roxy.core.reasons import AuthClass, Egress, Outcome, ReasonCode, Source
 from roxy.core.redact import redact_label
@@ -219,6 +221,9 @@ class ProxyFlow:
         self.recorded = False
         self.refusal: Any = None  # the refusal being answered, for the outcome record (check, message source)
         self.compat_collapse = bool(setting(ctx, "compat_collapse_upstream_errors"))
+        # The deadline middleware answers with the same choice this flow renders and records with, so the wire
+        # and the outcome record agree even if the setting changes mid-request (review finding spec-5).
+        self.state[STATE_COMPAT_COLLAPSE] = self.compat_collapse
         self.cors_any_origin = bool(setting(ctx, "public_cors_allow_any_origin"))
 
     # --- steps --------------------------------------------------------------------------------------------------
@@ -555,6 +560,7 @@ def capture_input(req: ProxyRequest, rendered: respond.Rendered, result: Any) ->
     )
 
 
+MESSAGE_SOURCE_DEFAULT = "default"
 MESSAGE_SOURCE_ROXY = "roxy"
 MESSAGE_SOURCE_ROBLOX = "roblox"
 _ROBLOX_BODY_SOURCES = frozenset({Source.ROBLOX, Source.RELAY, Source.CACHE})
@@ -563,12 +569,16 @@ _ROBLOX_BODY_SOURCES = frozenset({Source.ROBLOX, Source.RELAY, Source.CACHE})
 def message_source(rendered: respond.Rendered, refusal: Any) -> str:
     """Whose words the caller got (parity row 116, v1 `reason_counts` "Roxy text" against "Roblox body").
 
-    A refusal: its own `custom` or `default`. A failure Roxy wrote (a plan 7.13 text): `roxy`. Any other error
-    answer (status 400 or more) carries Roblox's own body, live, reshaped or from the cache: `roblox`. A success
-    has no message: "".
+    A refusal: its own `custom` or `default`. A refusal the cache or upstream layer returned as a result (a public
+    credential marker at the egress guard, an egress host refusal; DESIGN 11.9 "Rows outside plan 7.13") has no
+    refusal object, and its text is always Roxy's built-in v1 text: `default`. A failure Roxy wrote (a plan 7.13
+    text): `roxy`. Any other error answer (status 400 or more) carries Roblox's own body, live, reshaped or from the
+    cache: `roblox`. A success has no message: "".
     """
     if refusal is not None:
-        return str(getattr(refusal, "message_source", "") or "")
+        return str(getattr(refusal, "message_source", "") or "") or MESSAGE_SOURCE_DEFAULT
+    if rendered.outcome is Outcome.REFUSED:
+        return MESSAGE_SOURCE_DEFAULT
     if rendered.outcome is Outcome.FAILED:
         return MESSAGE_SOURCE_ROXY
     if rendered.status >= 400 and rendered.source in _ROBLOX_BODY_SOURCES:

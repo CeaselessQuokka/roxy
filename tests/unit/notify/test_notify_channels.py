@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import ssl
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -11,6 +13,7 @@ import respx
 
 from roxy.admin.auth.testing import RecordingTransport
 from roxy.core.redact import SecretRegistry, redact_text
+from roxy.notify import mail as mail_module
 from roxy.notify.mail import MailError, MailSender, load_mail_config, parse_alert_emails
 from roxy.notify.webhook import WebhookError, WebhookSender, acceptable_url, load_webhook_url
 
@@ -93,4 +96,38 @@ async def test_webhook_posts_json_and_reports_failures() -> None:
         with pytest.raises(WebhookError):
             await sender.send({"content": "hi"})
     assert "abc" not in repr(sender)
+    await sender.aclose()
+
+
+async def test_alert_channels_never_log_tls_keys(
+    monkeypatch: pytest.MonkeyPatch, credentials_dir: Path, tmp_path: Path
+) -> None:
+    """Review finding cred-6, notify side: `SSLKEYLOGFILE` in the environment never reaches a channel's TLS context.
+
+    CPython's `ssl.create_default_context` copies the variable into `keylog_filename` by itself, so both channels
+    build their own context: the mail session protects the app password, the webhook session the URL's token.
+    """
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "keys.log"))
+    assert ssl.create_default_context().keylog_filename == str(tmp_path / "keys.log")  # the premise
+
+    assert mail_module.smtp_tls_context().keylog_filename is None
+    assert mail_module.smtp_tls_context().verify_mode == ssl.CERT_REQUIRED
+    sent: dict[str, Any] = {}
+
+    async def fake_send(message: Any, **kwargs: Any) -> None:
+        sent.update(kwargs)
+
+    monkeypatch.setattr(mail_module.aiosmtplib, "send", fake_send)  # nothing ever connects to a mail server
+    config = load_mail_config(credentials_dir)
+    assert config is not None
+    await mail_module.smtp_transport(MailSender(config).build("s", "b"), config)
+    assert isinstance(sent["tls_context"], ssl.SSLContext)
+    assert sent["tls_context"].keylog_filename is None
+    assert sent["tls_context"].check_hostname
+    SecretRegistry.unregister("smtp_password")
+
+    sender = WebhookSender("http://127.0.0.1:9/fake-webhook/abc")
+    pool_context = sender._client._transport._pool._ssl_context  # type: ignore[attr-defined]  # httpx internals
+    assert pool_context.keylog_filename is None
+    assert pool_context.verify_mode == ssl.CERT_REQUIRED
     await sender.aclose()

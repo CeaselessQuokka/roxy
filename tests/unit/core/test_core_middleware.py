@@ -246,3 +246,28 @@ async def test_kill_switch_token_is_masked_in_error_events(make_app: Any, client
     assert token not in events[0].path
     assert token not in events[0].detail
     assert events[0].path.startswith("/admin/invalidate/")
+
+
+def test_error_events_scrub_a_bounded_prefix_of_the_path(monkeypatch: Any) -> None:
+    """Review findings INGRESS-1 and public-4 (defense in depth): a 414 is answered before every rate limit, so an
+    error event cuts the path and the detail to `MAX_EVENT_PATH_CHARS` BEFORE scrubbing them, whatever the caller
+    sent; a secret near the start is still masked."""
+    from roxy.core import errors
+
+    seen: list[int] = []
+    real = errors.redact_path
+
+    def counting(text: str) -> str:
+        seen.append(len(text))
+        return real(text)
+
+    monkeypatch.setattr(errors, "redact_path", counting)
+    token = "A" * 43
+    path = f"/admin/invalidate/{token}/" + "%0A" * 6000
+    scope = {"type": "http", "method": "GET", "path": path, "headers": [], "state": {}}
+    event = errors.event_from_scope(scope, 414, detail=path)
+    assert seen
+    assert max(seen) <= errors.MAX_EVENT_PATH_CHARS
+    assert len(event.path) <= errors.MAX_EVENT_PATH_CHARS
+    assert token not in event.path
+    assert token not in event.detail

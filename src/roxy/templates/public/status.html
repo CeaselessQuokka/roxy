@@ -1,6 +1,8 @@
 {#
 	The public status page `/status` (plan 16.1). Deliberately coarse: one of four states, 24 hourly cells, and
 	plain-language notes. No counts, no IP addresses, no internal names (plan 16.1: nothing that helps attackers).
+	While the emergency limit (throttle-all) is on, "Your limit" states that limit: it is what every caller is held
+	to, and its refusals already name it (`Roxy-Global-Throttled`), so saying so reveals nothing new.
 	Colors are never the only signal: every state also has its own fill pattern and height in site.css (the legend
 	swatches show the same patterns), and every cell has a text label for screen readers and a tooltip.
 #}
@@ -57,10 +59,20 @@
 						none active right now.
 						{% endif %}
 					</li>
+					{% if view.emergency_limit %}
+					<li>
+						<strong>Your limit right now:</strong> {{ limits.emergency_text }} per IP address, counting
+						every request. Roxy's emergency limit for everyone is on, and its refusals carry
+						<code>Roxy-Global-Throttled</code>. The usual limit of {{ limits.requests_text }} every
+						{{ limits.window_text }} still applies, and it is the only one again once the emergency limit is
+						off.
+					</li>
+					{% else %}
 					<li>
 						<strong>Your limit:</strong> {{ limits.requests_text }} every
 						{{ limits.window_text }} per IP address. {{ limits.cache_hits_rule }}
 					</li>
+					{% endif %}
 				</ul>
 				<p>
 					Monitors can poll <a href="/health"><code>/health</code></a> for JSON. The

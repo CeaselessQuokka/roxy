@@ -29,9 +29,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from roxy.abuse.checks.base import Check, Facts, LimitSpec, TxState, refusal_headers, with_trio
+from roxy.abuse.checks.base import Check, Facts, LimitSpec, TxState, throttle_refusal_headers, with_trio
 from roxy.abuse.messages import REASON_PER_IP, throttle_fallback
-from roxy.abuse.verdict import TRUE, MessageSource, Refuse
+from roxy.abuse.verdict import MessageSource, Refuse
 from roxy.core.reasons import ReasonCode
 
 
@@ -76,13 +76,8 @@ class ThrottleCheck(Check):
             body=text,
             reason=ReasonCode.THROTTLE,
             check=self.name,
-            headers=refusal_headers(
-                ReasonCode.THROTTLE,
-                Retry_After=result.retry_after_s,
-                Roxy_Requests_Left=0,
-                Roxy_Throttle_Reset=result.reset_s,
-                Roxy_Throttled=TRUE,
-            ),
+            # The one builder disguised refusals use too: same headers, same order on the wire (plan 10.5).
+            headers=throttle_refusal_headers(result.retry_after_s, result.reset_s),
             tarpit_category=self.tarpit_category,
             message_source=source,
             allow_fresh_cache_serve=bool(outcome.spec.payload and outcome.spec.payload.get("serve_from_cache")),

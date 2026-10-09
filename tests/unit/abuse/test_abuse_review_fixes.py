@@ -147,7 +147,8 @@ async def test_disguise_matches_a_genuine_refusal_of_a_penalized_client(
     assert disguised.reason in (ReasonCode.BANNED, ReasonCode.SPAM)
     assert disguised.disguised
     assert disguised.body == genuine.body == THROTTLE_TIERS[1].message
-    assert disguised.headers == genuine.headers
+    # Same headers, same values AND the same order (finding spec-1: a client reading raw headers sees the order).
+    assert list(disguised.headers.items()) == list(genuine.headers.items())
     assert disguised.headers["Retry-After"] == "77"
 
 
@@ -275,7 +276,7 @@ async def test_a_wrong_prediction_still_runs_every_filter(
 # --- degraded mode starts from the shared rows (C7, DEGRADED-REFILL) -------------------------------------------------
 
 
-async def test_degraded_walk_starts_from_the_shared_row_and_forgets_memory_on_recovery(
+async def test_degraded_walk_starts_from_the_shared_row_and_merges_memory_on_recovery(
     make_pipeline: Callable[..., AbusePipeline], dbs: Any
 ) -> None:
     pipeline = make_pipeline(workers=2)
@@ -293,11 +294,20 @@ async def test_degraded_walk_starts_from_the_shared_row_and_forgets_memory_on_re
         assert pipeline.degraded
     finally:
         dbs.hot.write = real_write
-    assert len(pipeline._memory_rows) > 0
+    assert len(pipeline._memory_strikes) == 1  # the strike earned while degraded waits for hot.db (finding mp-1)
     other = FakeReq(client_ip="198.51.100.4", limit_key="198.51.100.4")
-    await allow(pipeline, other)  # a working write: degraded mode ends and memory is forgotten
+    await allow(pipeline, other)  # a working write: degraded mode ends; the background merge writes the rest
     assert not pipeline.degraded
+    assert pipeline._merge_task is not None
+    await pipeline._merge_task
+    await pipeline.merge_pending()  # nothing left: the background merge took every row
     assert len(pipeline._memory_rows) == 0
+    assert len(pipeline._memory_strikes) == 0
+    strikes = dbs.hot.read_sync(
+        lambda conn: conn.execute("SELECT strikes FROM strikes WHERE ip = ?", (CLIENT_IP,)).fetchone()
+    )
+    assert strikes is not None
+    assert int(strikes[0]) == 1  # hot.db now has the strike earned during the outage
 
 
 # --- metrics events (wire report open issue) --------------------------------------------------------------------------

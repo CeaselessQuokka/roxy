@@ -95,6 +95,33 @@ async def test_miss_then_hit(dbs: Any, clock: FakeClock) -> None:
     assert service.stats.stores == 1
 
 
+@pytest.mark.parametrize("negative", [False, True], ids=["content", "negative"])
+async def test_a_peeked_fresh_entry_is_served_even_if_it_expired_since(
+    dbs: Any, clock: FakeClock, negative: bool
+) -> None:
+    """Finding INGRESS-3: the abuse verdict runs between `peek` and `serve` and may admit (or answer) a request
+    only because the peek saw a fresh hit. `serve` serves that entry even if it expired during the verdict; it
+    never turns such a request into an upstream call. A later request peeks again and sees the expiry."""
+    responder = (lambda req, n: roblox_error(404)) if negative else None
+    upstream = FakeUpstream(responder)
+    service = make_service(dbs, clock, upstream)
+    first = await call(service)
+    req = make_request(VOTES)
+    peek = await service.peek(req)
+    assert peek.fresh is not None
+    assert req.fresh_cache_hit
+    clock.advance(peek.fresh.expires_at - clock.now() + 0.4)  # it expired while the (slow) verdict ran
+    assert not peek.fresh.is_fresh(clock.now())
+    served = await service.serve(req, peek)
+    assert (served.cache_state, served.status, served.body) == (CacheState.HIT, first.status, first.body)
+    assert served.reason is (ReasonCode.CACHE_NEGATIVE if negative else ReasonCode.CACHE_HIT)
+    assert served.upstream_calls == 0
+    assert upstream.count == 1
+    again = await call(service)  # a new request: its own peek no longer finds a fresh entry
+    assert again.cache_state is not CacheState.HIT
+    await service.swr.drain()
+
+
 async def test_hit_from_shared_tier_after_memory_loss(dbs: Any, clock: FakeClock) -> None:
     upstream = FakeUpstream()
     service = make_service(dbs, clock, upstream)

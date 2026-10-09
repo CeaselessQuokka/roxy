@@ -6,15 +6,18 @@ What this is
     that honors Last-Event-ID, a heartbeat counter, a 401 for the session-expired overlay, a slow fragment for the
     htmx indicator, and a CSV export. `include_gallery(target, env)` adds the router only when ROXY_ENV is
     "development"; every route also answers 404 outside development, so a mistaken include cannot expose it.
-    `load_glossary()` reads docs/glossary.yml and `diff_lines()` builds the input of the line diff viewer; the
-    dashboard pages (P11 part two) use both too. `find_glossary()` locates the glossary in a source checkout and
-    in a release installed with `uv sync --no-editable` (see "How it works").
+    `load_glossary()` reads docs/glossary.yml, `diff_lines()` builds the input of the line diff viewer, and
+    `caller_texts()` builds the caller texts of the shell's `status` context (what paused or emergency-limited
+    callers get); the dashboard pages (P11 part two) use all three too. `find_glossary()` locates the glossary in a
+    source checkout and in a release installed with `uv sync --no-editable` (see "How it works").
 
 Why it exists
     The design system (templates/components, static/css, static/js) is built before the pages that use it. The
     gallery is where it is reviewed by eye in both themes and at phone width, checked with axe-core, and where the
     CSP spike proves the whole stack runs under the strict policy of plan 9.2 (tests/e2e). Nothing here touches
-    real data: every number is generated from a fixed seed, and the save endpoints change nothing. It is not
+    real data: every number is generated from a fixed seed, and the save endpoints change nothing (the one live
+    value is the `pause_message_default` setting, read so the shell's pause dialog quotes what callers would
+    really get, exactly as every dashboard page will). It is not
     behind admin login because it holds no data and exists only in development; the admin router (P9) includes it
     through `include_gallery`, and the security route discovery test lists it as development-only.
 
@@ -29,6 +32,9 @@ How it works
     that deploy/deploy.sh installed into `<release>/.venv/lib/python3.12/site-packages` (5 levels up; `git
     archive` ships docs/), and a copy packaged inside roxy itself would win if a build ever adds one. This is the
     same rule `roxy/public/pages.py` uses for docs/USER_GUIDE.md, so a release has one convention for its docs.
+    `caller_texts` asks `PauseState.message`, `ThrottleAllState.message` and `abuse.messages.downtime_default`,
+    the very code that writes the 503 and 429 bodies, so the banners and dialogs cannot drift from what callers
+    get when an admin changes `pause_message_default` (plan P3: one source of truth, no copy in a template).
 
 What to read next
     templates/admin/_gallery/index.html (the page), templates/admin/base.html (the shell contract),
@@ -58,6 +64,9 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from roxy import __version__
+from roxy.abuse.messages import downtime_default
+from roxy.abuse.pause import PauseState
+from roxy.abuse.throttle_all import ThrottleAllState
 from roxy.config.catalog import CATALOG, SettingValidationError, validate_value
 from roxy.config.spec import SettingSpec
 
@@ -188,6 +197,32 @@ def diff_lines(before: str, after: str, context: int = 3) -> list[dict[str, Any]
         rows += [{"op": "delete", "old": i + 1, "new": None, "text": old[i]} for i in range(i1, i2)]
         rows += [{"op": "insert", "old": None, "new": j + 1, "text": new[j]} for j in range(j1, j2)]
     return rows
+
+
+def caller_texts(
+    pause: PauseState, throttle_all: ThrottleAllState, *, now: float, pause_message_default: object
+) -> dict[str, str]:
+    """The caller texts of the shell's `status` context (admin/_layout/banners.html, control_dialogs.html).
+
+    `pause_message_default` is the LIVE setting value (`ctx.settings.get("pause_message_default")`). The result:
+    `pause_message`, the 503 text a paused caller gets at `now` (the reason, the scheduled reason inside a scheduled
+    window, else the default); `throttle_message`, the 429 text of the emergency limit (its reason, else the same
+    default, v1 B6); and `pause_default`, the default exactly as it is sent when a message is left empty.
+    """
+    default = downtime_default(pause_message_default)  # cleaned like the refusal path; empty means the catalog's
+    return {
+        "pause_message": pause.message(now, default)[0],
+        "pause_default": default,
+        "throttle_message": throttle_all.message(default)[0],
+    }
+
+
+def _live_setting(request: Request, key: str) -> Any:
+    """`key` from this worker's live settings; its catalog default in a bare app that has no settings store."""
+    settings = getattr(getattr(request.app.state, "ctx", None), "settings", None)
+    if settings is None:
+        return CATALOG[key].default
+    return settings.get(key)
 
 
 def _stats(request: Request) -> dict[str, Any]:
@@ -645,6 +680,9 @@ def _page_context(request: Request) -> dict[str, Any]:
     now = int(time.time()) // 600 * 600
     specs = _chart_specs(now)
     action = f"{GALLERY_PREFIX}/action"
+    pause_default = _live_setting(request, "pause_message_default")
+    sample_pause = PauseState(paused=True, reason="Back in about 10 minutes.")
+    sample_limit = ThrottleAllState(enabled=True, reason="High load; please slow down.")
     return {
         "page": {
             "id": "gallery",
@@ -663,18 +701,23 @@ def _page_context(request: Request) -> dict[str, Any]:
         "theme": theme,
         "density": density,
         "time": {"range": query.get("range", "24h"), "compare": query.get("compare", "prev")},
-        "status": {"paused": False, "throttle_all": False},
+        "status": {
+            "paused": False,
+            "throttle_all": False,
+            **caller_texts(PauseState(), ThrottleAllState(), now=now, pause_message_default=pause_default),
+        },
         "sample_status": {
             "paused": True,
             "paused_since": "14:02 UTC, 12 minutes ago",
-            "pause_reason": "Back in about 10 minutes.",
+            "pause_reason": sample_pause.reason,
             "pause_drops": 1843,
             "throttle_all": True,
             "throttle_all_since": "13:40 UTC, 34 minutes ago",
             "throttle_limit": 30,
             "throttle_period": 60,
-            "throttle_reason": "High load; please slow down.",
+            "throttle_reason": sample_limit.reason,
             "throttle_drops": 412,
+            **caller_texts(sample_pause, sample_limit, now=now, pause_message_default=pause_default),
         },
         "recs": {"open": 3, "critical": 1},
         "urls": {

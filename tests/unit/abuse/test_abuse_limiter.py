@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from roxy.abuse.limiter import (
+    DegradedEntry,
     LimiterRow,
     MemoryRowStore,
     cooldown,
@@ -13,6 +14,8 @@ from roxy.abuse.limiter import (
     fixed_peek,
     gcra,
     gcra_peek,
+    merge_limiter_row,
+    unshared,
 )
 
 T0 = 1_760_000_000_000  # milliseconds
@@ -126,11 +129,108 @@ def test_cooldown_retry_uses_a_true_ceiling() -> None:
     assert cooldown(first.row, 2.0, T0 + 1000).retry_after_s == 1
 
 
-def test_degraded_limit_is_limit_over_workers_at_least_one() -> None:
+def test_degraded_limit_is_limit_floor_divided_by_workers() -> None:
+    """C6 and C7 (finding mp-2): the shares of all workers add up to at most the limit, so a share may be 0."""
     assert degraded_limit(10, 2) == 5
     assert degraded_limit(10, 4) == 2
-    assert degraded_limit(1, 4) == 1
+    assert degraded_limit(3, 2) == 1
+    assert degraded_limit(1, 2) == 0  # a limit smaller than the fleet: this worker refuses (fail closed)
+    assert degraded_limit(1, 4) == 0
     assert degraded_limit(10, 0) == 10
+    for limit in range(1, 12):
+        for workers in (1, 2, 3, 4, 8):
+            assert degraded_limit(limit, workers) * workers <= limit
+
+
+def test_unshared_refuses_without_counting_and_names_the_configured_pace() -> None:
+    row = LimiterRow("k", tat_ms=T0, exists=True)
+    decision = unshared(row, 1, 60)
+    assert not decision.admitted
+    assert decision.row is row  # nothing counted
+    assert (decision.retry_after_s, decision.reset_s, decision.remaining) == (60, 60, 0)
+    assert unshared(row, 10, 50).retry_after_s == 5
+    assert unshared(row, 7, 60).retry_after_s == 9  # a true ceiling, at least 1
+    assert unshared(row, 1000, 1).retry_after_s == 1
+
+
+# --- merging degraded rows back into hot.db (finding mp-1) -----------------------------------------------------------
+
+
+def test_degraded_gcra_merge_keeps_the_later_tat() -> None:
+    seed = LimiterRow("k", tat_ms=T0 + 1_000, exists=True)
+    memory = LimiterRow("k", tat_ms=T0 + 300_000, exists=True)
+    entry = DegradedEntry(memory, seed, "gcra")
+    assert entry.changed
+    assert merge_limiter_row(LimiterRow("k"), entry, T0).tat_ms == T0 + 300_000  # hot.db lost the row: memory
+    assert merge_limiter_row(seed, entry, T0).tat_ms == T0 + 300_000
+    later = LimiterRow("k", tat_ms=T0 + 400_000, exists=True)
+    assert merge_limiter_row(later, entry, T0) == later  # hot.db moved further: nothing to add
+    unchanged = DegradedEntry(seed, seed, "gcra")
+    assert not unchanged.changed
+
+
+def test_degraded_gcra_merge_never_admits_more_than_the_fleet_limit() -> None:
+    """Two workers each spend their share (5 of 10 per 300 s) from the same seed; after both merges the shared
+    row admits nothing more until the pace allows it, exactly like one shared row that saw all 10."""
+    limit, window = 10, 300
+    seed = LimiterRow("k")
+    shared = seed
+    for _ in range(2):  # two workers, each on its own memory row at the degraded share
+        row = seed
+        for _ in range(degraded_limit(limit, 2)):
+            decision = gcra(row, degraded_limit(limit, 2), window, T0)
+            assert decision.admitted
+            row = decision.row
+        assert not gcra(row, degraded_limit(limit, 2), window, T0).admitted
+        shared = merge_limiter_row(shared, DegradedEntry(row, seed, "gcra"), T0)
+    assert not gcra(shared, limit, window, T0).admitted
+    one_row = seed
+    for _ in range(limit):
+        one_row = gcra(one_row, limit, window, T0).row
+    assert shared.tat_ms >= one_row.tat_ms
+
+
+def test_degraded_fixed_merge_adds_what_each_worker_counted() -> None:
+    end = T0 + 60_000
+    seed = LimiterRow("k", window_start=T0, count=3, tat_ms=end, exists=True)
+    worker_a = DegradedEntry(LimiterRow("k", window_start=T0, count=5, tat_ms=end, exists=True), seed, "fixed")
+    worker_b = DegradedEntry(LimiterRow("k", window_start=T0, count=4, tat_ms=end, exists=True), seed, "fixed")
+    shared = merge_limiter_row(seed, worker_a, T0 + 1_000)
+    shared = merge_limiter_row(shared, worker_b, T0 + 1_000)
+    assert (shared.count, shared.window_start, shared.tat_ms) == (3 + 2 + 1, T0, end)
+    # A window that is over counts nothing any more.
+    assert merge_limiter_row(seed, worker_a, end + 1) == seed
+    # No running shared window: the worker's own window (started in degraded mode) is the whole story.
+    fresh = DegradedEntry(LimiterRow("k", window_start=T0, count=2, tat_ms=end, exists=True), LimiterRow("k"), "fixed")
+    assert merge_limiter_row(LimiterRow("k"), fresh, T0) == fresh.row
+    # Two different running windows: the counts add up over the longer window.
+    other = LimiterRow("k", window_start=T0 - 30_000, count=4, tat_ms=T0 + 30_000, exists=True)
+    merged = merge_limiter_row(other, fresh, T0)
+    assert (merged.count, merged.window_start, merged.tat_ms) == (6, T0, end)
+
+
+def test_degraded_cooldown_merge_keeps_the_latest_request() -> None:
+    first = cooldown(LimiterRow("k"), 2.0, T0).row
+    later = cooldown(LimiterRow("k"), 2.0, T0 + 5_000).row
+    merged = merge_limiter_row(first, DegradedEntry(later, LimiterRow("k"), "cooldown"), T0 + 5_000)
+    assert (merged.window_start, merged.tat_ms) == (later.window_start, later.tat_ms)
+    assert not cooldown(merged, 2.0, T0 + 5_500).admitted
+
+
+def test_memory_row_store_discard_and_items() -> None:
+    store: MemoryRowStore[list[int]] = MemoryRowStore(max_rows=4)
+    first, second = [1], [2]
+    store.put("a", first)
+    store.put("b", second)
+    assert store.items() == [("a", first), ("b", second)]
+    store.discard("a", [1])  # an equal but different object: kept
+    assert store.get("a") is first
+    store.put("b", [3])
+    store.discard("b", second)  # replaced meanwhile: the newer row is kept
+    assert store.get("b") == [3]
+    store.discard("a", first)
+    assert store.get("a") is None
+    assert len(store) == 1
 
 
 def test_memory_row_store_is_bounded_lru() -> None:

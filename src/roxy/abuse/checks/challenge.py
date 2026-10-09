@@ -49,7 +49,7 @@ def bot_score(req: Any, facts: Facts) -> int:
             game_server=facts.game_server,
             header_names=list(getattr(req, "header_names_in_order", ()) or ()),
         )
-        weights = {name: facts.float(f"bot_weight_{name}", 0.0) for name in SIGNALS}
+        weights = {name: facts.float(f"bot_weight_{name}") for name in SIGNALS}
         facts.score_cache = score(signals, weights)
     return facts.score_cache
 
@@ -62,13 +62,13 @@ class ChallengeCheck(Check):
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
         key = facts.services.challenge_key
-        if not facts.bool("challenge_enabled", False) or key is None or not getattr(req, "is_browser", False):
+        if not facts.bool("challenge_enabled") or key is None or not getattr(req, "is_browser", False):
             return None
-        if bot_score(req, facts) < facts.int("challenge_trigger_score", 80):
+        if bot_score(req, facts) < facts.int("challenge_trigger_score"):
             return None
         headers = getattr(req, "headers", {}) or {}
-        bits = facts.int("challenge_difficulty_bits", 18)
-        max_age = facts.int("challenge_cookie_minutes", 30) * 60
+        bits = facts.int("challenge_difficulty_bits")
+        max_age = facts.int("challenge_cookie_minutes") * 60
         solved = verify_cookie(
             key,
             cookie_from_header(headers.get("cookie")),
@@ -101,7 +101,7 @@ class BotScoreCheck(Check):
     tarpit_category = "ban"
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
-        threshold = facts.int("bot_score_block_threshold", 0)
+        threshold = facts.int("bot_score_block_threshold")
         if threshold <= 0:
             return None
         value = bot_score(req, facts)

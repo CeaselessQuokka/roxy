@@ -40,11 +40,11 @@ from roxy.abuse.messages import (
 from roxy.abuse.verdict import Refuse, title_case_header
 from roxy.core.reasons import ReasonCode
 from roxy.core.redact import ROBLOX_COOKIE_NAME, TOKEN_PREFIX
+from roxy.core.scope import catalog_default
 
 _PREFIX: Final = TOKEN_PREFIX.lower()
 _COOKIE: Final = ROBLOX_COOKIE_NAME.lower()
 _COOKIE_ASSIGN: Final = _COOKIE + "="
-DEFAULT_MAX_BODY_BYTES: Final = 2 * 1024 * 1024
 
 
 def _has_marker(text: str) -> bool:
@@ -59,8 +59,14 @@ def _cookie_names(cookie_header: str) -> Iterable[str]:
             yield name
 
 
-def detect_auth_attempt(req: Any, max_body_bytes: int = DEFAULT_MAX_BODY_BYTES) -> str | None:
-    """The v1 style reason string when the request carries a Roblox login marker, else None."""
+def detect_auth_attempt(req: Any, max_body_bytes: int | None = None) -> str | None:
+    """The v1 style reason string when the request carries a Roblox login marker, else None.
+
+    `max_body_bytes` bounds the body scan; None reads the catalog default of the `max_body_bytes` setting (the
+    check passes the live value).
+    """
+    if max_body_bytes is None:
+        max_body_bytes = int(catalog_default("max_body_bytes") or 0)
     headers: dict[str, str] = getattr(req, "headers", {}) or {}
     names = list(getattr(req, "header_names_in_order", None) or headers)
     for name in names:
@@ -95,7 +101,7 @@ class AuthSmugglingCheck(Check):
     tarpit_category = "auth_attempt"
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
-        reason = detect_auth_attempt(req, facts.int("max_body_bytes", DEFAULT_MAX_BODY_BYTES))
+        reason = detect_auth_attempt(req, facts.int("max_body_bytes"))
         if reason is None:
             return None
         return Refuse(

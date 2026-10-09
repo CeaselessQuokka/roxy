@@ -22,8 +22,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
+import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -33,14 +36,17 @@ from roxy.core.clock import SYSTEM_CLOCK, FakeClock
 from roxy.core.reasons import Egress
 from roxy.core.redact import TOKEN_PREFIX
 from roxy.egress.credential import (
+    HOT_WRITE_BUDGET_MS,
     CredentialManager,
     CredentialStateError,
     CredentialValueError,
+    LeakMatcher,
+    canonical_bytes,
     retry_after_seconds,
     secret_spans,
 )
 from roxy.egress.crypto import load_encryption_key
-from roxy.egress.errors import CredentialUnavailable, TargetNotAllowed
+from roxy.egress.errors import AuthSmugglingBlocked, CredentialUnavailable, TargetNotAllowed
 from roxy.egress.events import EventSink
 from roxy.egress.models import EgressResponse
 from roxy.storage.db import SharedStateUnavailable
@@ -546,3 +552,158 @@ def test_retry_after_parsing() -> None:
     assert retry_after_seconds("garbage", 0.0) is None
     assert retry_after_seconds(None, 0.0) is None
     assert retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT", 1445412500.0) == 0.0
+
+
+# --- review round: encoded values (cred-1), audit order (cred-2), the credential path's own guard (cred-5) -------
+
+
+def encode_uri_component(value: str) -> str:
+    """What JavaScript's `encodeURIComponent` (and cookie tools built on it) makes of a cookie value."""
+    return quote(value, safe="-_.!~*'()")
+
+
+def test_canonical_form_decodes_every_spelling() -> None:
+    value = TOKEN_PREFIX + "S3CRETPART" * 6
+    assert canonical_bytes(value) == value.encode()
+    assert canonical_bytes(encode_uri_component(value)) == value.encode()
+    assert canonical_bytes(quote(quote(value, safe=""), safe="")) == value.encode()  # encoded twice
+    assert canonical_bytes("100%sure") == b"100%sure"  # not an escape: left alone
+
+
+def test_secret_spans_classify_the_canonical_form() -> None:
+    """Finding cred-1: the encoded head `_%7CWARNING%3A` is public text, not a 14 character "secret part"."""
+    secret = "S3CRETPART" * 5
+    prefix = len(TOKEN_PREFIX)
+    for spelling in (encode_uri_component(TOKEN_PREFIX), quote(TOKEN_PREFIX, safe=""), TOKEN_PREFIX.lower()):
+        assert secret_spans(spelling + secret) == [(prefix, prefix + len(secret))], spelling
+    assert secret_spans(encode_uri_component(TOKEN_PREFIX)) == []
+
+
+def test_short_leftovers_are_never_watched_whole() -> None:
+    """A part shorter than 24 characters next to public text is not watched on its own (it was a trip wire when it
+    was misclassified public text); the long secret part is still watched, raw and lowercased."""
+    secret = "LONGSECRETPART" + "0123456789ABCDEF" * 4
+    matcher = LeakMatcher((TOKEN_PREFIX + "SHORTPART1" + TOKEN_PREFIX + secret,))
+    assert matcher.active
+    assert not matcher.matches(b"q=SHORTPART1")
+    assert not matcher.matches(b"q=_|WARNING:SHORTPART1")
+    assert matcher.matches(b"q=" + secret[3:30].lower().encode())
+
+
+async def test_encoded_bootstrap_value_is_stored_decoded(
+    env: Any, dbs: Any, settings: Any, secret: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Finding cred-1: an encodeURIComponent copy in the bootstrap file is the same cookie; Roxy stores,
+    fingerprints, sends and watches its canonical form, logs the fix without the value, and public text stays
+    public."""
+    (env.credentials_dir / "roblox_credential").write_text(encode_uri_component(secret) + "\n", encoding="utf-8")
+    m = manager(env, dbs, settings)
+    with caplog.at_level(logging.INFO, logger="roxy.egress.credential"):
+        await m.start()
+    assert m.status().fingerprint == m.fingerprint_of(secret)
+    decoded = [record for record in caplog.records if record.msg == "credential_value_decoded"]
+    assert [getattr(record, "fields", {}) for record in decoded] == [{"source": "bootstrap"}]
+    assert secret[-24:] not in caplog.text
+    await make_active(m)
+    request = httpx.Request("GET", "https://users.roblox.com/v1/users/authenticated")
+    await m.authorize(request, logical_url=request.url, probe=False)
+    assert request.headers["Cookie"] == f".ROBLOSECURITY={secret}"
+    for fragment in ("_|WARNING:", "_%7CWARNING%3A", encode_uri_component(TOKEN_PREFIX)[:40]):
+        assert not m.leak_matcher().matches(fragment.encode())
+    assert m.leak_matcher().matches(secret[-40:].encode())
+
+
+async def test_replace_decodes_an_encoded_paste_and_refuses_odd_values(env: Any, dbs: Any, settings: Any) -> None:
+    m = manager(env, dbs, settings)
+    await m.start()
+    status = await m.replace(encode_uri_component(NEW_VALUE), ADMIN, reason="pasted from a cookie tool")
+    assert status.fingerprint == m.fingerprint_of(NEW_VALUE)
+    too_short = TOKEN_PREFIX + "ONLY20CHARACTERSHERE"  # long enough overall, but nearly all of it public text
+    over_encoded = NEW_VALUE
+    for _ in range(6):
+        over_encoded = quote(over_encoded, safe="")
+    for bad in (too_short, over_encoded, quote(NEW_VALUE + ";x", safe="")):
+        with pytest.raises(CredentialValueError):
+            await m.replace(bad, ADMIN)
+    assert m.status().fingerprint == m.fingerprint_of(NEW_VALUE)
+
+
+async def test_rotated_cookie_is_watched_in_its_canonical_form(env: Any, dbs: Any, settings: Any, secret: str) -> None:
+    """Finding cred-1, no admin action: Roblox answers with a refreshed cookie written encoded. The matcher watches
+    its secret, never its encoded public warning; the same cookie re-sent encoded is not a new rotation."""
+    notifier = Notifier()
+    m = manager(env, dbs, settings, notifier)
+    await m.start()
+    rotated = TOKEN_PREFIX + "REFRESHEDBYROBLOX" + "5A" * 120
+    header = f".ROBLOSECURITY={encode_uri_component(rotated)}; domain=.roblox.com; path=/; secure; HttpOnly"
+    await m.observe_set_cookie([header], endpoint="users.roblox.com/v1/users/authenticated")
+    assert m.leak_matcher().matches(rotated[-40:].encode())
+    assert not m.leak_matcher().matches(b"note=_%7CWARNING%3A")
+    assert not m.leak_matcher().matches(encode_uri_component(TOKEN_PREFIX).encode())
+    await m.observe_set_cookie([f".ROBLOSECURITY={secret}"], endpoint="users.roblox.com/x")  # the slot's own value
+    assert len(notifier.alerts) == 1
+
+
+async def test_replace_reason_is_redacted_with_the_new_value_registered_first(
+    env: Any, dbs: Any, settings: Any
+) -> None:
+    """Finding cred-2: the new value is registered before the audit row is written, so a reason that repeats it
+    (a paste into the wrong box) is stored redacted, also for a bare value without the public warning."""
+    m = manager(env, dbs, settings)
+    await m.start()
+    bare = "BAREVALUE" + "C0FFEE42" * 20
+    await m.replace(bare, ADMIN, reason=f"new cookie {bare}")
+    row = audit_rows(dbs)[-1]
+    assert row["action"] == "credential.replace"
+    assert bare[10:34] not in str(row["reason"])
+    assert "[redacted]" in str(row["reason"])
+
+
+async def test_authorize_refuses_a_piece_of_the_credential_before_the_cookie(
+    env: Any, dbs: Any, settings: Any, secret: str
+) -> None:
+    """Finding cred-5: the credential client has no guard transport, so `authorize` runs the guard's inspection
+    before it attaches the cookie: a piece of the credential (or a public marker) in the request is refused as
+    auth smuggling, the cookie is never attached, and nothing trips."""
+    m = manager(env, dbs, settings)
+    await m.start()
+    await make_active(m)
+    piece = secret.removeprefix(TOKEN_PREFIX)[20:60]
+    for url in (
+        f"https://users.roblox.com/v1/users/authenticated?k={piece}",
+        f"https://users.roblox.com/v1/users/authenticated?k={quote(piece.lower(), safe='')}",
+        "https://users.roblox.com/v1/users/authenticated?k=.roblosecurity",
+    ):
+        request = httpx.Request("GET", url)
+        with pytest.raises(AuthSmugglingBlocked) as refused:
+            await m.authorize(request, logical_url=request.url, probe=False)
+        assert refused.value.location == "url"
+        assert "cookie" not in request.headers
+    clean = httpx.Request("GET", "https://users.roblox.com/v1/users/authenticated?k=plain")
+    await m.authorize(clean, logical_url=clean.url, probe=False)
+    assert clean.headers["Cookie"] == f".ROBLOSECURITY={secret}"
+
+
+async def test_set_cooldown_never_waits_out_a_locked_hot_db(env: Any, dbs: Any, settings: Any) -> None:
+    """Finding mp-7: the cooldown after a credential 429 waits at most `HOT_WRITE_BUDGET_MS` for another
+    process's lock; it is then kept in this worker's memory, blocking the credential here, until hot.db takes it."""
+    m = manager(env, dbs, settings)
+    await m.start()
+    await make_active(m)
+    holder = sqlite3.connect(dbs.hot.path, isolation_level=None, timeout=30)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.monotonic()
+        remaining = await m.set_cooldown(60, "retry_after")
+        waited = time.monotonic() - started
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert waited < HOT_WRITE_BUDGET_MS / 1000 + 1.0
+    assert remaining == pytest.approx(60, abs=2)
+    assert not m.available()
+    await m.refresh()  # hot.db takes writes again: the kept cooldown is shared
+    shared = dbs.hot.read_sync(
+        lambda conn: conn.execute("SELECT until_ms FROM cooldown WHERE key = 'credential'").fetchone()
+    )
+    assert shared is not None

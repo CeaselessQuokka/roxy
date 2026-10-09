@@ -17445,7 +17445,7 @@ Controls the status code callers get when Roblox fails or rejects a request. Off
 | Step | none |
 | If raised | n/a |
 | If lowered | n/a |
-| If enabled | Every Roblox 4xx, live or cached, reaches callers as a 500 that still carries Roblox's own body and content type, exactly as in v1. Every Roblox 5xx, 502 and 504 becomes a 500 with the text 'Upstream request failed; please try again later.'. Old scripts that only check for 200 or 500 keep working, but they usually retry at once, which sends more traffic to Roblox and causes more 429s. Roxy's own refusals (throttles, pause, invalid URLs) are unchanged, and Retry-After is still sent. |
+| If enabled | Every Roblox 4xx, live or cached, reaches callers as a 500 that still carries Roblox's own body and content type, exactly as in v1: with ?prettyprint=true a 4xx answered from the cache is pretty printed and a live one is not, as v1 did. Every Roblox 5xx, 502 and 504 becomes a 500 with the text 'Upstream request failed; please try again later.'. Old scripts that only check for 200 or 500 keep working, but they usually retry at once, which sends more traffic to Roblox and causes more 429s. Roxy's own refusals (throttles, pause, invalid URLs) are unchanged, and Retry-After is still sent. |
 | If disabled | Callers see the real upstream status (404 stays 404, 429 stays 429 with Retry-After) plus a Roxy-Upstream-Status header, so well-written scripts can wait the right amount of time instead of retrying immediately. |
 | Risk | medium |
 | High risk when | none |

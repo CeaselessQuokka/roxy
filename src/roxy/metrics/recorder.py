@@ -36,8 +36,13 @@ How it works
     - Honest numbers (P6): caller requests carry `upstream_calls`; background refreshes add upstream calls with
       zero requests (`record_background_fetch`); Roxy's own probes are rows with source `internal`
       (`record_internal_call`), reported separately. `metrics/catalog.py` has the exact definitions.
-    - `run(stop)` flushes on the configured interval and refreshes the vocabulary gates hourly; `close()` flushes
-      synchronously at shutdown (lifespan) so a recycle never loses buffered numbers.
+    - `run(stop)` flushes on the configured interval and refreshes the vocabulary gates hourly. At shutdown the
+      lifespan calls `aclose(budget_s=...)` after that loop stopped: one final flush, including the minute still
+      open, so a recycle never loses buffered numbers. It never blocks the event loop and never outlives its
+      budget, because every write of that flush carries what is left of the budget as its busy budget
+      (`_ShutdownBudgetTarget`): a metrics.db locked by another process costs the budget, not SQLite's 5 s per
+      write, and the numbers that could not be written are lost (metrics degrade open, C7; finding mp-6).
+      `close()` is the synchronous form for scripts and tests.
 
 What to read next
     `roxy/metrics/rollups.py` (what a flush writes and how the leader compacts it), `roxy/storage/batch.py`,
@@ -52,10 +57,12 @@ import hashlib
 import json
 import logging
 import random
+import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, TypeVar, cast
 
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.core.iphash import ip_hash
@@ -78,9 +85,11 @@ from roxy.metrics.rollups import ClientDelta, EgressDelta, RollupDelta, write_cl
 from roxy.metrics.samples import SampleRow, should_sample, write_samples
 from roxy.metrics.templating import MAX_HOSTS, MAX_TEMPLATES, OTHER, TEMPLATE_VERSION, VocabularyGate, template_for
 from roxy.storage.batch import BatchWriter
-from roxy.storage.db import Databases
+from roxy.storage.db import Database, Databases
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 # --- bounds (plan P9) -------------------------------------------------------------------------------------------
 
@@ -109,6 +118,14 @@ EVENT_RATE = 0.5
 MAX_DETAIL_CHARS = 4000
 MAX_SIGNATURE_CHARS = 200
 VOCABULARY_REFRESH_S = 3600.0
+FINAL_FLUSH_MAX_S = 4.0
+"""Most the shutdown flush (`aclose`) may take: about half of the lifespan's 8 s shutdown budget, so the steps after
+it (closing the egress clients, the notifier and the databases) keep time too."""
+FINAL_FLUSH_GRACE_S = 0.5
+"""How long `aclose` still waits for a write that started just before its budget ran out (that write's own busy
+timeout is what was left of the budget, so it ends within moments)."""
+ENCODER_SHUTDOWN_SHARE = 0.25
+"""Part of the `aclose` budget queued captures may take to be built before the final write."""
 
 # Batch kinds and their priorities (higher survives longer when the queue is full).
 KIND_ROLLUPS = "metrics.rollups"
@@ -299,6 +316,37 @@ class _ClientAgg:
     endpoints: dict[str, int] = field(default_factory=dict)
 
 
+class _ShutdownBudgetTarget:
+    """metrics.db as the batch writer sees it: ordinary writes pass straight through; while `deadline` is set (the
+    shutdown flush, `MetricsRecorder.aclose`) every write carries what is left until then as its busy budget.
+
+    `Database.write(busy_timeout_ms=N)` treats N as one deadline from the call, queue wait and lock wait together,
+    and a write still queued at it never runs (`storage/db.py`). Without it a metrics.db locked by another process
+    (the other color's rollup, a backup) holds each write for SQLite's whole `busy_timeout` (5 s), past the lifespan
+    shutdown budget (finding mp-6). Everything else (`name`, `read`, `write_sync`, ...) is the real database.
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+        self.name = db.name
+        self.deadline: float | None = None  # time.monotonic() value; None outside the shutdown flush
+
+    async def write(
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        immediate: bool = True,
+        busy_timeout_ms: int | None = None,
+    ) -> T:
+        deadline = self.deadline
+        if busy_timeout_ms is None and deadline is not None:
+            busy_timeout_ms = max(0, int((deadline - time.monotonic()) * 1000))
+        return await self.db.write(fn, immediate=immediate, busy_timeout_ms=busy_timeout_ms)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.db, name)
+
+
 class MetricsRecorder:
     """Per-worker metrics: in-memory aggregation flushed through a `BatchWriter` (see the module docstring)."""
 
@@ -386,7 +434,9 @@ class MetricsRecorder:
     # ----------------------------------------------------------------------------------------- batch kinds
 
     def _register_kinds(self) -> None:
-        metrics = self.dbs.metrics
+        # Every kind writes through the shutdown budget wrapper (`aclose`); it is the real metrics.db otherwise.
+        self._metrics_target = _ShutdownBudgetTarget(self.dbs.metrics)
+        metrics = cast(Database, self._metrics_target)
         b = self.batch
         b.register(KIND_ROLLUPS, metrics, write_rollups, priority=PRIORITIES[KIND_ROLLUPS], source=self._drain_rollups)
         b.register(
@@ -527,7 +577,9 @@ class MetricsRecorder:
             self._record_live(ev, capture_id)
             if ev.outcome in (Outcome.REFUSED, Outcome.FAILED):
                 self._record_refusal_event(ev, dims[0])
-            if should_sample(str(ev.outcome), cfg.request_sample_pct, self._rng):
+            # A local OPTIONS answer never reached the cache or Roblox: not a proxied request to sample (spec-7).
+            local = ev.reason == ReasonCode.OPTIONS_LOCAL
+            if not local and should_sample(str(ev.outcome), cfg.request_sample_pct, self._rng):
                 self.batch.add(KIND_SAMPLES, self._sample_row(ev, dims[0]))
         except Exception:
             self._count_error("record_outcome")
@@ -1202,10 +1254,51 @@ class MetricsRecorder:
         return await self.batch.flush()
 
     def close(self) -> Any:
-        """Shutdown: write everything, including the minute still open, synchronously (lifespan cleanup)."""
+        """Write everything, including the minute still open, synchronously (scripts and tests; the server's
+        lifespan uses `aclose`, which never blocks the event loop)."""
         self._closing = True
         self.captures.close()
         return self.batch.flush_now()
+
+    async def aclose(self, *, budget_s: float = FINAL_FLUSH_MAX_S) -> Any:
+        """Shutdown (lifespan): the final flush, including the minute still open, within `budget_s` seconds.
+
+        Captures still on the encoder thread get a part of the budget, then everything queued is written with
+        every write's busy budget cut to what is left (`_ShutdownBudgetTarget`), so a locked metrics.db costs at most
+        `budget_s` and the event loop never waits on SQLite. Numbers that cannot be written in time are lost and
+        counted in `metrics_final_flush_incomplete` (metrics degrade open, C7). Returns the flush result, or None
+        when even the backstop timeout ran out. Never raises.
+        """
+        self._closing = True
+        budget = max(0.0, float(budget_s))
+        deadline = time.monotonic() + budget
+        try:
+            await self.captures.drain(min(ENCODER_SHUTDOWN_SHARE * budget, budget))
+            # The encoder thread may still be building one capture; joining it must not hold the loop.
+            await asyncio.to_thread(self.captures.close, max(0.0, deadline - time.monotonic()) / 2)
+        except Exception:
+            log.exception("capture_encoder_close_failed")
+        self._metrics_target.deadline = deadline
+        result: Any = None
+        try:
+            # The busy budgets end the writes by the deadline; this timeout is only a backstop for a write that
+            # had started just before it (its own busy timeout is what was left, so it ends at once).
+            result = await asyncio.wait_for(
+                self.batch.flush(), timeout=max(0.0, deadline - time.monotonic()) + FINAL_FLUSH_GRACE_S
+            )
+        except TimeoutError:
+            log.warning("metrics_final_flush_timeout", extra={"fields": {"budget_s": round(budget, 3)}})
+        except Exception:
+            log.exception("metrics_final_flush_failed")
+        finally:
+            self._metrics_target.deadline = None
+        left = self.batch.queued()
+        if left or result is None or getattr(result, "failed_dbs", None):
+            log.warning(
+                "metrics_final_flush_incomplete",
+                extra={"fields": {"items_not_written": left, "budget_s": round(budget, 3)}},
+            )
+        return result
 
     async def refresh_vocabulary(self) -> None:
         """Reset the template and host gates to the busiest values of the trailing 24 h (plan 6.2)."""
@@ -1223,10 +1316,16 @@ class MetricsRecorder:
         self._last_vocab_refresh = self.clock.monotonic()
 
     async def run(self, stop: asyncio.Event) -> None:
-        """Flush every `metrics_flush_interval_ms` and refresh the vocabulary hourly until `stop` is set."""
+        """Flush every `metrics_flush_interval_ms` and refresh the vocabulary hourly until `stop` is set.
+
+        A stop request ends the loop without one more flush: the final flush is `aclose` (or `close`), which runs
+        right after with the shutdown budget, so a locked metrics.db is not waited for twice (finding mp-6).
+        """
         while not stop.is_set():
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=self.config().flush_interval_s)
+            if stop.is_set():
+                return
             try:
                 await self.flush()
             except Exception:
@@ -1311,8 +1410,8 @@ def _complete_capture(capture: CaptureInput, ev: OutcomeEvent) -> CaptureInput:
 def build_recorder(ctx: Any) -> MetricsRecorder:
     """The worker's recorder from its `AppContext` (lifespan step "recorder", DESIGN.md section 1).
 
-    Start `recorder.run(stop)` as a background loop and call `recorder.close()` at shutdown, after that loop has
-    stopped, so the last seconds of numbers are written synchronously.
+    Start `recorder.run(stop)` as a background loop and await `recorder.aclose(budget_s=...)` at shutdown, after that
+    loop has stopped, so the last seconds of numbers are written within the shutdown budget.
     """
     return MetricsRecorder(
         ctx.dbs,

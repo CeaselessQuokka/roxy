@@ -5,7 +5,9 @@ What this is
     owner answers before its cache.db write (finding CACHE-WAIT), the writes waiting at once are bounded and their
     failures counted, an answer too big for the lease row reaches other workers through a handoff row (finding
     SF-NOSTORE), the upstream receives the single-flight lease hook and a lost lease makes the request a follower
-    (plan 6.3 and 7.3), and the policy lookup in `peek` runs under one regex budget (plan 9.9).
+    (plan 6.3 and 7.3), and the policy lookup in `peek` runs under one regex budget (plan 9.9). From the review
+    round: followers in other workers read the owner's stored answer from cache.db when its outcome never arrives
+    (finding mp-12), and a credential answer fetched under a `cache_private` row reaches nobody else (cred-4).
 
 Why it exists
     Each behavior is a contract other packages rely on: the router never waits for a disposable cache, the
@@ -25,6 +27,7 @@ What to read next
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import time
 from collections.abc import Iterator
@@ -37,11 +40,11 @@ from roxy.cache.keys import HANDOFF_SUFFIX
 from roxy.cache.service import HANDOFF_TTL_S, CacheService, ServeResult
 from roxy.cache.testing import FakeSettings, FakeUpstream, StaticRules, make_request, ok, rules_snapshot
 from roxy.core.clock import FakeClock
-from roxy.core.reasons import CacheState, ReasonCode
+from roxy.core.reasons import AuthClass, CacheState, Egress, ReasonCode
 from roxy.rules.match import REGEX_REQUEST_BUDGET_S, regex_timeouts_total
 from roxy.rules.models import CacheRuleRow
 from roxy.rules.store import RulesSnapshot
-from roxy.storage.db import open_databases
+from roxy.storage.db import SharedStateUnavailable, open_databases
 from roxy.upstream.singleflight import LEASE_PREFIX, SHARE_BODY_MAX, FlightLease, FlightOutcome, OutcomeKind
 
 VOTES = "games.roblox.com/v1/games/votes?universeIds=7"
@@ -297,3 +300,126 @@ async def test_peek_policy_lookup_runs_under_one_regex_budget(dbs: Any, clock: F
     assert regex_timeouts_total() > before
     assert peek.key is not None  # a rule cut off by the budget is "no rule": the default policy applies
     assert elapsed < REGEX_REQUEST_BUDGET_S + 0.25, f"peek took {elapsed * 1000:.0f} ms"
+
+
+# --- followers read cache.db when the owner's outcome is late (plan 6.9 step 4, finding mp-12) ------------------
+
+
+def never_publishes(service: CacheService, monkeypatch: pytest.MonkeyPatch) -> None:
+    """hot.db refuses every outcome publish of this worker (busy), as when it stays locked until the worker stops."""
+
+    async def busy(*_args: Any) -> None:
+        raise SharedStateUnavailable("hot", "database is locked")
+
+    monkeypatch.setattr(service.flights, "_publish_once", busy)
+
+
+async def wait_for_rows(dbs: Any, count: int) -> None:
+    for _ in range(200):
+        if len(rows(dbs)) >= count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"cache.db never held {count} rows")
+
+
+async def test_follower_serves_the_owners_stored_entry_when_its_outcome_never_arrives(
+    dbs: Any, second_dbs: Any, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = asyncio.Event()
+    owner_up, follower_up = FakeUpstream(gate=gate), FakeUpstream()
+    owner = worker(dbs, clock, owner_up, "w1")
+    follower = worker(second_dbs, clock, follower_up, "w2")
+    never_publishes(owner, monkeypatch)
+    first = asyncio.create_task(call(owner))
+    await owner_up.started.wait()
+    second = asyncio.create_task(call(follower))
+    await asyncio.sleep(0.1)
+    gate.set()
+    mine = await first
+    await wait_for_rows(dbs, 1)  # the owner's tail stored the entry; its publish keeps failing
+    theirs = await asyncio.wait_for(second, 3)  # long before the follower's own wait (the owner deadline) ends
+    assert (mine.cache_state, theirs.cache_state) == (CacheState.MISS, CacheState.COALESCED)
+    assert theirs.body == mine.body
+    assert follower_up.count == 0
+    assert follower.flights.stats.store_answers == 1
+    await owner.flights.close(grace_s=0.1)
+
+
+async def test_follower_never_takes_an_older_entry_from_cache_db_for_a_fresh_copy_request(
+    dbs: Any, second_dbs: Any, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller that sent `Cache-Control: no-cache` (honored) follows a flight that fetches a fresh copy. The
+    entry already in cache.db is older than its request, so looking there never answers it with that entry."""
+    settings = {"cache_respect_no_cache": 1, "cache_coalesce_wait_ms": 1500}
+    gate = asyncio.Event()
+    owner_up, follower_up = FakeUpstream(), FakeUpstream()
+    owner = worker(dbs, clock, owner_up, "w1", **settings)
+    follower = worker(second_dbs, clock, follower_up, "w2", **settings)
+    old = await call(owner)
+    await owner.settle()
+    clock.advance(30)  # still fresh (lifetime 120 s), but stored well before the next requests
+    never_publishes(owner, monkeypatch)
+    owner_up.gate = gate
+    fresh_copy = {"Cache-Control": "no-cache"}
+    first = asyncio.create_task(owner.serve(make_request(VOTES, headers=fresh_copy)))
+    await asyncio.sleep(0.1)
+    assert owner_up.count == 2  # the owner fetches a fresh copy and holds the lease
+    req = make_request(VOTES, headers=fresh_copy)
+    theirs = await follower.serve(req, await follower.peek(req))
+    assert theirs.reason is ReasonCode.COALESCE_TIMEOUT  # the old entry was there all along, and refused
+    assert theirs.body != old.body
+    assert follower_up.count == 0
+    assert follower.flights.stats.store_answers == 0
+    gate.set()
+    await first
+    await owner.flights.close(grace_s=0.1)
+
+
+# --- credential answers fetched under a cache_private row stay private (finding cred-4) --------------------------
+
+
+CURRENCY = "economy.roblox.com/v1/user/currency"
+
+
+@pytest.mark.parametrize("how", ["upstream_says_private", "row_flipped_before_the_answer"])
+async def test_answer_fetched_under_a_private_row_is_never_coalesced(
+    dbs: Any, second_dbs: Any, clock: FakeClock, how: str
+) -> None:
+    """The request peeked a shared allowlist row (a credential key that may coalesce), but the answer came back
+    private: the upstream fetched it under a `cache_private` row (`UpstreamResult.private`), or the row is private
+    by the time the answer arrives. Nobody else gets it: not a follower in this worker, not one in another, not
+    the store. Each request makes its own credential call."""
+    rules = StaticRules(rules_snapshot(credential_allowlist=[{"pattern": CURRENCY, "cache_private": 0}]))
+    private_rules = rules_snapshot(credential_allowlist=[{"pattern": CURRENCY, "cache_private": 1}], version=2)
+    flag = how == "upstream_says_private"
+    numbers = itertools.count(1)  # one numbering across both workers' upstreams
+
+    def answer(req: Any, n: int) -> Any:
+        body = f'{{"robux":"secret {next(numbers)}"}}'
+        return ok(body, auth_class=AuthClass.CRED, egress=Egress.CREDENTIAL, private=flag)
+
+    gate = asyncio.Event()
+    owner_up, other_up = FakeUpstream(answer, gate=gate), FakeUpstream(answer)
+
+    def cred_worker(db: Any, upstream: FakeUpstream, name: str) -> CacheService:
+        return CacheService(
+            dbs=db, settings=FakeSettings(), rules=rules, clock=clock, upstream=upstream, worker_id=name
+        )
+
+    owner, other = cred_worker(dbs, owner_up, "w1"), cred_worker(second_dbs, other_up, "w2")
+    first = asyncio.create_task(call(owner, CURRENCY))
+    await owner_up.started.wait()
+    local = asyncio.create_task(call(owner, CURRENCY))
+    remote = asyncio.create_task(call(other, CURRENCY))
+    await asyncio.sleep(0.1)
+    if not flag:
+        rules.snapshot = private_rules  # an admin marks the endpoint private while the flight runs
+    gate.set()
+    results = await asyncio.wait_for(asyncio.gather(first, local, remote), 5)
+    await owner.settle()
+    await other.settle()
+    assert [r.cache_state for r in results] == [CacheState.MISS] * 3
+    assert len({r.body for r in results}) == 3  # three answers, each its own request's
+    assert owner_up.count + other_up.count == 3
+    assert owner.stats.private + other.stats.private == 3
+    assert rows(dbs) == []  # never stored

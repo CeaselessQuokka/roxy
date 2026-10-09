@@ -21,10 +21,11 @@ Why it exists
         exponential or polynomial time to fail (plan 9.9): a variable repeat inside a repeated group
         (`(a+)+`, `(a{1,10}){1,10}`), alternatives that can start with the same character inside a repeat
         (`(a|aa)+`), more than `MAX_UNBOUNDED_REPEATS` unbounded repeats counting how often an enclosing group
-        repeats them (`(.*,){5}`), any regex whose worst case on a 4096 character caller input is over the
-        `rules/regex_cost.py` budget (two repeats that trade characters, such as `a.*a.*b`, or a repeat that an
-        unanchored search can restart inside of, such as `x+y`), or a glob with more than
-        `MAX_GLOB_WILDCARDS_PER_SEGMENT` wildcards in one path segment or two in a segment that is not the last.
+        repeats them (`(.*,){5}`), any regex whose worst case on an 8192 character caller input is over the
+        `rules/regex_cost.py` budget (two repeats that trade characters, such as `a.*a.*b` or a chain of short
+        ones such as `\\w{0,10}\\w{0,10}\\d`, or a repeat that an unanchored search can restart inside of, such as
+        `x+y`), or a glob with more than `MAX_GLOB_WILDCARDS_PER_SEGMENT` wildcards in one path segment, two in a
+        segment that is not the last, or a glob whose compiled regex is over the same budget (`*a*b`).
         Stored v1 patterns are not judged again (they keep matching), so the timeout stays the backstop. A match
         that times out counts as "no match" by default; rules that refuse or limit traffic pass `on_timeout=True`
         so a slow pattern cannot be used to slip past them (fail closed), and `regex_budget()` caps the total
@@ -899,8 +900,9 @@ def validate_regex(pattern: str, *, max_length: int = MAX_PATTERN_LENGTH) -> str
     why = slow_shape(pattern)
     if why is not None:
         raise PatternValidationError(why)
-    # Polynomial shapes (two repeats that trade characters, a repeat a search can restart inside of): the cost
-    # model must finish a 4096 character worst case well inside the per-match timeout (ingress review).
+    # Polynomial shapes (two repeats that trade characters, a chain of short ones, a repeat a search can restart
+    # inside of): the cost model must finish an 8192 character worst case well inside the per-match timeout
+    # (ingress review, finding INGRESS-2).
     why = regex_cost.cost_problem(pattern)
     if why is not None:
         raise PatternValidationError(why)
@@ -933,13 +935,23 @@ def validate_pattern(pattern: str | None, type: str = "glob", *, exact: bool = F
         )
     # Two wildcards in one segment trade characters: where more text must still match after that segment, a
     # failing match tries every split of a long segment between them (about 30 ms on 4096 characters). In the last
-    # segment nothing after them can fail, except in the exact form, which must end there.
+    # segment only text after the second one can fail (checked by the cost model below), except in the exact
+    # form, which must end there.
     crowded = segments if exact else segments[:-1]
     if any(len(_GLOB_WILDCARD_RUN.findall(part)) > 1 for part in crowded):
         where = "one path segment" if exact else "one path segment before the last one"
         raise PatternValidationError(
             f"Endpoint pattern has two wildcards in {where}; a failing match can try every way to split a long "
             "segment between them, so use one wildcard per segment (or a regular expression)"
+        )
+    # Then the regex budget every new regex meets, on the regex the glob compiles to (finding INGRESS-2): two
+    # wildcards in the last segment are fine when nothing after them can fail (`*-*`), but text after the second
+    # one (`*a*b`) makes a failing match try every split of the segment between them.
+    if regex_cost.cost_problem(glob_to_regex_source(normalized, subpaths=not exact)) is not None:
+        raise PatternValidationError(
+            "Endpoint pattern has two wildcards in one segment with more text after the second one; a failing match "
+            f"can try every way to split a long segment between them (too long on a path of {regex_cost.TARGET_LENGTH} "
+            "characters), so use one wildcard per segment (or a regular expression)"
         )
     return normalized
 

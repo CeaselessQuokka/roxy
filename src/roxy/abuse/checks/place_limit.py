@@ -48,12 +48,12 @@ class PlaceLimitCheck(Check):
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
         place = getattr(req, "place_id", None)
-        if not place or not facts.bool("place_limit_enabled", False):
+        if not place or not facts.bool("place_limit_enabled"):
             return None
         key = f"place:{place}"
-        if facts.str("place_limit_key", "place_prefix") == "place_prefix":
+        if facts.str("place_limit_key") == "place_prefix":
             key += "|" + caller_network(facts.ip, facts.limit_key)
-        limit = max(1, facts.int("place_limit_per_minute", 600))
+        limit = max(1, facts.int("place_limit_per_minute"))
         return LimitSpec(self.name, key, "gcra", limit=limit, window_s=60)
 
     async def check(self, req: Any, tx: TxState) -> Refuse | None:

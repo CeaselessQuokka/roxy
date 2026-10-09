@@ -21,7 +21,9 @@
     session     {"heartbeat_s": 30, "activity_window_s": 60, "heartbeat_url", "login_url": "/admin"}
     theme       "dark" (default) | "light" | "system";   density: "comfortable" | "dense"
     time        {"range": "24h", "compare": "off|prev|week|month|year", "from", "to"}
-    status      service state for the banners and top bar buttons (see admin/_layout/banners.html)
+    status      service state for the banners, top bar buttons and pause dialogs (see admin/_layout/banners.html);
+                the caller texts `pause_message`, `pause_default` and `throttle_message` come from
+                `roxy.admin.gallery.caller_texts` with the live `pause_message_default`, never from a template
     recs        {"open": n, "critical": n}
     urls        {"pause", "throttle_all", "stream", "palette", "health_run", "llm_export", "logout", "prefs"}
     glossary    term id -> {"term", "definition"} (components/glossary.html)

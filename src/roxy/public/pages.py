@@ -4,9 +4,11 @@ What this is
     `router`, with every public route except `/health` (`public/health.py`) and `/csp-report`
     (`public/csp_report.py`): `/` (home), `/docs` (`docs/USER_GUIDE.md` rendered to HTML), `/status` (coarse public
     state), `/robots.txt`, `/sitemap.xml` and `/favicon.ico` (plan 16.1, parity rows 12, 13 and 19). Each answers
-    GET and HEAD. Also the small pure helpers the routes are built from, so tests can call them directly:
-    `render_site_text`, `find_user_guide`, `render_guide`, `home_examples`, `code_block`, `live_limits`,
-    `count_text`, `parse_pause_state`, `classify_hour`, `read_rate_limited` and `build_sitemap`.
+    GET and HEAD, and other spellings of the two page paths (`/docs/`, `/Status`) get a 308 to the page. Also the
+    small pure helpers the routes are built from, so tests can call them directly: `render_site_text`,
+    `find_user_guide`, `render_guide`, `home_examples`, `code_block`, `live_limits`, `count_text`,
+    `parse_pause_state`, `parse_throttle_all`, `classify_hour`, `read_rate_limited`, `canonical_page_path` and
+    `build_sitemap`.
 
 Why it exists
     v1's home page hard-coded "10 requests every 50 seconds" and "made using Python and Flask", and both drifted
@@ -19,6 +21,14 @@ Why it exists
     no IP addresses (plan 16.1).
 
 How it works
+    - No disk on the event loop: a page is answered on the loop thread, and one blocking `stat` or `open` there
+      stalls every request of the worker (the proxy's included) for as long as the disk does. So the router's
+      lifespan (`load_public_content`) does all the file work once, on a thread, before the first request: it
+      renders the guide (kept in `app.state.public_guide`), highlights the home snippets, reads robots.txt, finds
+      the build date, compiles the public and sign-in templates and hashes every asset (`Templates.warm`,
+      `core/templating.py`). Requests then read memory only. These files change only with a release, and a
+      release starts new workers.
+      In an app whose lifespan did not run, the first request does the same work on a thread (`_cached_value`).
     - Settings: each request takes one immutable snapshot of the runtime settings (`ctx.settings.snapshot()`),
       so every number on a page comes from the same moment; before the lifespan has built the context the
       catalog defaults are used. Counts are worded through `count_text`, so a limit of 1 reads "1 request".
@@ -28,8 +38,9 @@ How it works
     - The guide: `find_user_guide` looks for `docs/USER_GUIDE.md` in the nearest directory at or above the roxy
       package, which covers a source checkout and a release installed with `uv sync --no-editable` (the package
       then sits in `<release>/.venv/lib/python3.12/site-packages`). The router's lifespan refuses to start a
-      worker without it, so a release missing the guide fails the deploy health gate instead of answering 404.
-      It is rendered once per file version with markdown-it (CommonMark plus tables, raw HTML disabled, so any
+      worker without it, so a release missing the guide fails the deploy health gate instead of answering 404,
+      and keeps the rendered guide in memory for the life of the worker (a file that disappears later changes
+      nothing). It is rendered with markdown-it (CommonMark plus tables, raw HTML disabled, so any
       HTML in the file is escaped, and "smart" typography disabled, so `--` can never turn into a dash character
       that rule C5 bans). Each h2 and h3 gets an id and, next to it (outside the heading, so a screen reader
       announces the title once), a section link; they also feed the sticky table of contents. Table alignment
@@ -43,12 +54,20 @@ How it works
     - Home examples: the Luau snippets on `/` live in `templates/public/examples/*.luau` (the guide repeats each one
       word for word, and tests type check them with luau-analyze); `home_examples` highlights them once per
       process, at startup.
+    - Texts that depend on a setting are built here, never written as fixed sentences: the limits, the strike
+      ladder and the retry rule (`throttle_escalation_enabled`, `throttle_strike_on_retry`), the URL length, body
+      capture, CORS and the status page links all follow their settings.
     - Status: pause and scheduled maintenance come from control.db `service_state` (key `pause`), parsed by
-      `roxy.abuse.pause.PauseState`, the same rule the proxy's pause check uses; recent failures and the hourly
+      `roxy.abuse.pause.PauseState`, the same rule the proxy's pause check uses, and the emergency limit from the
+      same read (key `throttle_all`, `roxy.abuse.throttle_all.ThrottleAllState`): while it is on the page says
+      degraded and states the emergency limit as the caller's limit; recent failures and the hourly
       bar from the metrics rollups; and "Roblox is rate limiting" from active hot.db `cooldown` rows that Roblox's
       429 answers opened on a caller path (direct or rotator), matched with `roxy.upstream.cooldowns`' own key
       builders. Shared state that cannot be read shows as degraded (plan C7). The result is cached per worker for
       `STATUS_CACHE_S` seconds, so a crowd refreshing `/status` costs one set of reads.
+    - Other spellings of a page path (`/docs/`, `/Docs`, `/STATUS/`) get a 308 to the page (`PageAliasRoute`).
+      Without that route the proxy catch-all would read `/docs/` as a request for the host `docs`: a `not_roblox`
+      probe, held by the tarpit and counted toward a spam ban of a visitor who only added a slash.
     - Visits: GET requests to a page call `ctx.recorder.record_visit(page, user_agent)` when the recorder has
       that method; the recorder classifies the visitor itself (`roxy/metrics/visitors.py`, parity row 19).
       robots.txt and sitemap.xml also call `record_crawl(client_ip, path, user_agent)` (the v1 crawl log). HEAD
@@ -56,7 +75,7 @@ How it works
     - robots.txt is served byte for byte from v1 (kept as `templates/public/robots.txt`); sitemap.xml keeps
       v1's bytes for `/` and adds `/docs` and `/status` (only while that page is enabled), with `lastmod` set to
       the build date: the newest modification time of the public templates, assets, this module and the guide,
-      which is the install time of a release.
+      which is the install time of a release. Both are read once per process, at startup.
 
 What to read next
     `roxy/templates/public/base.html` (the page shell and its nonce script tag), `docs/USER_GUIDE.md`,
@@ -86,13 +105,18 @@ from typing import Any, Final
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.routing import APIRoute
 from markdown_it import MarkdownIt
 from markdown_it.renderer import RendererHTML
 from markdown_it.token import Token
 from markupsafe import Markup
+from starlette.routing import Match
+from starlette.types import Receive, Scope, Send
 
 from roxy.abuse.pause import PauseState
+from roxy.abuse.throttle_all import STATE_KEY as THROTTLE_ALL_STATE_KEY
+from roxy.abuse.throttle_all import ThrottleAllState
 from roxy.core.reasons import Egress
 from roxy.core.scope import catalog_default
 from roxy.core.templating import STATIC_DIR, TEMPLATES_DIR, Templates
@@ -127,7 +151,7 @@ def find_user_guide(package_dir: Path = PACKAGE_DIR) -> Path | None:
 
 USER_GUIDE_PATH: Final = find_user_guide() or PACKAGE_DIR.parents[1] / GUIDE_RELATIVE_PATH
 """The guide this process serves. When no copy exists it names where a checkout would keep it, and
-`require_user_guide` refuses to start the worker."""
+`load_public_content` refuses to start the worker."""
 PUBLIC_TEMPLATES_DIR: Final = TEMPLATES_DIR / "public"
 PUBLIC_STATIC_DIR: Final = STATIC_DIR / "public"
 FAVICON_PATH: Final = PUBLIC_STATIC_DIR / "roxy_favicon.png"
@@ -233,6 +257,10 @@ class LiveLimits:
     place_limit_per_minute: int
     place_limit_per_network: bool
     ipv6_prefix: int
+    escalation: bool  # throttle_escalation_enabled: repeated violations are strikes that lengthen the next wait
+    strike_on_retry: bool  # throttle_strike_on_retry: a retry while throttled adds a strike (needs escalation)
+    emergency_requests: int  # global_throttle_limit (throttle-all)
+    emergency_period_seconds: int  # global_throttle_period
 
     @property
     def requests_text(self) -> str:
@@ -241,6 +269,31 @@ class LiveLimits:
     @property
     def window_text(self) -> str:
         return count_text(self.window_seconds, "second")
+
+    @property
+    def emergency_text(self) -> str:
+        """The emergency limit (throttle-all): `global_throttle_limit` per `global_throttle_period`."""
+        return (
+            f"{count_text(self.emergency_requests, 'request')} every "
+            f"{count_text(self.emergency_period_seconds, 'second')}"
+        )
+
+    @property
+    def retry_strikes(self) -> bool:
+        """True when retrying while throttled lengthens the next wait (`abuse/throttle.py`: both settings on)."""
+        return self.escalation and self.strike_on_retry
+
+    @property
+    def retry_rule(self) -> str:
+        """The home page's sentence after "Over a limit, Roxy answers 429 with a Retry-After header."."""
+        if self.retry_strikes:
+            return "Wait that many seconds; retrying sooner makes the wait longer."
+        if self.escalation:
+            return (
+                "Wait that many seconds: requests sent sooner are refused, and going over the limit again makes the "
+                "next wait longer."
+            )
+        return "Wait that many seconds: requests sent sooner are refused."
 
     @property
     def flood_text(self) -> str:
@@ -336,6 +389,10 @@ def live_limits(get: Getter) -> LiveLimits:
         place_limit_per_minute=_int(get("place_limit_per_minute")),
         place_limit_per_network=str(get("place_limit_key")) == "place_prefix",
         ipv6_prefix=_int(get("ipv6_limit_prefix")),
+        escalation=bool(get("throttle_escalation_enabled")),
+        strike_on_retry=bool(get("throttle_strike_on_retry")),
+        emergency_requests=_int(get("global_throttle_limit")),
+        emergency_period_seconds=_int(get("global_throttle_period")),
     )
 
 
@@ -353,6 +410,77 @@ def strike_decay_rule(get: Getter) -> str:
     if seconds <= 0:
         return "Strikes do not fade on their own right now; only Roxy's admin can forgive them."
     return f"Good behavior forgives strikes: one strike fades after {_minutes_text(seconds)} without a new one."
+
+
+_RETRY_AFTER: Final = "<code>Retry-After</code>"
+
+
+def escalation_rule(get: Getter) -> str:
+    """Chapter 4: what repeated violations and early retries cost, for the live strike settings.
+
+    Follows `abuse/throttle.py`: with `throttle_escalation_enabled` each refusal by the limit is a strike that
+    lengthens the next penalty (the default ladder waits 1, 2, 4, then 8 windows) and strikes fade per
+    `throttle_strike_decay_seconds`; `throttle_strike_on_retry` adds a strike for a retry while throttled (only
+    with escalation). Without escalation no strike is added: `fixed` mode refuses for one window, `gcra` mode
+    only until the allowance has room again. Constant markup; the only values inside are escaped.
+    """
+    limits = live_limits(get)
+    if not limits.escalation:
+        if limits.smooth_pacing:
+            wait = "only until your allowance has room again"
+        else:
+            wait = f"for one window ({html.escape(limits.window_text)})"
+        return Markup(  # noqa: S704 (constant markup; the one value is escaped)
+            "Right now repeated violations do not make the wait longer: each time, Roxy refuses your requests "
+            f"{wait}. Requests sent before {_RETRY_AFTER} has passed are refused, so always wait for it."
+        )
+    if limits.retry_strikes:
+        retry = f"Retrying while you are throttled can add a strike, so always wait for {_RETRY_AFTER}."
+    else:
+        retry = (
+            "Retrying while you are throttled adds no strike right now, but those requests are refused, so always "
+            f"wait for {_RETRY_AFTER}."
+        )
+    return Markup(  # noqa: S704 (constant markup; the decay sentence is escaped)
+        "If you keep hitting the limit, each repeated violation is a strike, and each strike makes the next wait "
+        "longer (by default 1, 2, 4 and then 8 times the window). "
+        f"{html.escape(strike_decay_rule(get), quote=False)} {retry}"
+    )
+
+
+def retry_tip(get: Getter) -> str:
+    """The good citizen checklist's `Retry-After` bullet (chapter 8), for the live strike settings."""
+    if live_limits(get).retry_strikes:
+        return Markup(f"Respect {_RETRY_AFTER}. Retrying sooner only makes the wait longer.")  # noqa: S704 (constant)
+    return Markup(f"Respect {_RETRY_AFTER}. Requests sent sooner are only refused.")  # noqa: S704 (constant)
+
+
+def capture_rule(get: Getter) -> str:
+    """Chapter 10's paragraph about request and answer bodies (`capture_enabled`, owner decision D8).
+
+    Body capture is on by default, so the paragraph opens with what is kept, not with "bodies are not kept".
+    Refusals are always captured while it is on; `capture_sample_served_pct` of served requests are sampled; each
+    capture is deleted after `capture_ttl_seconds`. Constant markup; every value inside is escaped.
+    """
+    percent = float(get("capture_sample_served_pct"))
+    covers = (
+        f"refused requests and about {html.escape(fmt_number(percent))}% of served requests"
+        if percent > 0
+        else "refused requests only"
+    )
+    details = (
+        f"anything that looks like a secret is removed first, and every captured body is deleted after "
+        f"{html.escape(_minutes_text(get('capture_ttl_seconds')))}"
+    )
+    if bool(get("capture_enabled")):
+        return Markup(  # noqa: S704 (constant markup; the values are escaped)
+            "Roxy also keeps the bodies of some requests and answers for a short time, for debugging: body capture "
+            f"is currently <strong>on</strong>. It covers {covers}, {details}."
+        )
+    return Markup(  # noqa: S704 (constant markup; the values are escaped)
+        "Request and answer bodies are not kept: body capture is currently <strong>off</strong>. If Roxy's admin "
+        f"turns it on for debugging, it covers {covers}, {details}."
+    )
 
 
 def cors_rule_item(get: Getter) -> str:
@@ -412,7 +540,7 @@ GUIDE_VALUES: Final[dict[str, Callable[[Getter], str]]] = {
     "flood_requests": lambda g: count_text(g("flood_limit_per_minute"), "request"),
     "ipv6_rule": lambda g: live_limits(g).ipv6_rule,
     "place_limit_rule": lambda g: live_limits(g).place_limit_rule,
-    "strike_decay_rule": strike_decay_rule,
+    "escalation_rule": escalation_rule,
     "emergency_requests": lambda g: count_text(g("global_throttle_limit"), "request"),
     "emergency_period": lambda g: count_text(g("global_throttle_period"), "second"),
     # Caching (chapter 5).
@@ -421,8 +549,10 @@ GUIDE_VALUES: Final[dict[str, Callable[[Getter], str]]] = {
     "cache_stale": lambda g: count_text(g("cache_stale_seconds"), "second"),
     # Requests (chapters 2 and 7).
     "max_body_kib": lambda g: fmt_int(_int(g("max_body_bytes")) // 1024),
+    "max_url_length": lambda g: count_text(g("max_url_length"), "character"),
     "request_deadline": lambda g: count_text(g("request_deadline_s"), "second"),
     # What Roxy will not do and the checklist (chapters 8 and 9).
+    "retry_tip": retry_tip,
     "cors_rule_item": cors_rule_item,
     "status_tip": status_tip,
     # Privacy (chapter 10).
@@ -431,9 +561,7 @@ GUIDE_VALUES: Final[dict[str, Callable[[Getter], str]]] = {
     "client_day_retention": lambda g: count_text(g("retention_client_day_days"), "day"),
     "events_retention": lambda g: count_text(g("retention_events_days"), "day"),
     "request_sample_retention": lambda g: count_text(g("request_sample_hours"), "hour"),
-    "capture_state": lambda g: _on_off(g("capture_enabled")),
-    "capture_retention": lambda g: _minutes_text(g("capture_ttl_seconds")),
-    "capture_sample_pct": lambda g: fmt_number(float(g("capture_sample_served_pct"))),
+    "capture_rule": capture_rule,
     # Contact and FAQ (chapters 11 and 12).
     "contact_name": lambda g: str(g("site_contact_name")),
     "cors_faq": cors_faq,
@@ -729,7 +857,10 @@ _guide_cache: dict[Path, tuple[int, int, RenderedGuide]] = {}
 
 def load_guide(path: Path | None = None) -> RenderedGuide | None:
     """The rendered guide (`USER_GUIDE_PATH` by default), re-rendered only when the file changes (cached per
-    path; one entry per file). None when the file cannot be read."""
+    path; one entry per file). None when the file cannot be read.
+
+    Blocking (it stats and may read and render the file): the routes never call it on the event loop. The
+    lifespan runs it on a thread and keeps the result in `app.state.public_guide` (see `served_guide`)."""
     path = USER_GUIDE_PATH if path is None else path
     try:
         stat = path.stat()
@@ -751,6 +882,25 @@ def load_guide(path: Path | None = None) -> RenderedGuide | None:
             _guide_cache.clear()  # bounded (plan P9); only tests ever render more than one file
         _guide_cache[path] = (stat.st_mtime_ns, stat.st_size, rendered)
     return rendered
+
+
+GUIDE_STATE_ATTRIBUTE: Final = "public_guide"
+"""Where the lifespan keeps the rendered guide: `app.state.public_guide` (one per app, for the worker's life)."""
+
+
+async def served_guide(request: Request) -> RenderedGuide | None:
+    """The guide this app serves, from memory.
+
+    The lifespan stores it at startup. An app whose lifespan did not run loads it once on a worker thread and
+    stores it the same way. None only when the guide was never loaded and cannot be read now.
+    """
+    guide = getattr(request.app.state, GUIDE_STATE_ATTRIBUTE, None)
+    if isinstance(guide, RenderedGuide):
+        return guide
+    guide = await asyncio.to_thread(load_guide)
+    if guide is not None:
+        setattr(request.app.state, GUIDE_STATE_ATTRIBUTE, guide)
+    return guide
 
 
 def guide_values(get: Getter, names: Sequence[str] | None = None) -> dict[str, str]:
@@ -780,9 +930,20 @@ def build_time() -> float:
     return newest or time.time()
 
 
-def build_date() -> str:
-    """The build date as the sitemap writes it (W3C date, UTC): `YYYY-MM-DD`."""
-    return datetime.fromtimestamp(build_time(), UTC).strftime("%Y-%m-%d")
+def build_date(seconds: float | None = None) -> str:
+    """The build date as the sitemap writes it (W3C date, UTC): `YYYY-MM-DD` (of `build_time()` by default)."""
+    return datetime.fromtimestamp(build_time() if seconds is None else seconds, UTC).strftime("%Y-%m-%d")
+
+
+async def _cached_value[T](fn: functools._lru_cache_wrapper[T]) -> T:
+    """The value of a zero-argument `functools.cache` function, without file work on the event loop.
+
+    The lifespan fills these caches at startup, so this is normally one dictionary lookup. In an app whose
+    lifespan did not run, the first call computes the value on a worker thread instead.
+    """
+    if fn.cache_info().currsize:
+        return fn()
+    return await asyncio.to_thread(fn)
 
 
 # --- robots.txt and sitemap.xml -----------------------------------------------------------------------------------
@@ -981,10 +1142,28 @@ def read_metrics(conn: sqlite3.Connection, now_s: float) -> tuple[dict[int, Tall
     return hours, _tally(recent_row) if recent_row is not None else Tally()
 
 
-def read_pause_value(conn: sqlite3.Connection) -> str | None:
-    """The raw pause record from control.db, or None when there is none."""
-    row = conn.execute("SELECT value_json FROM service_state WHERE key = ?", (PAUSE_STATE_KEY,)).fetchone()
-    return None if row is None else str(row[0])
+def read_switches(conn: sqlite3.Connection) -> tuple[str | None, str | None]:
+    """The raw pause and throttle-all records from control.db, in one read: `(pause, throttle_all)`."""
+    rows = conn.execute(
+        "SELECT key, value_json FROM service_state WHERE key IN (?, ?)", (PAUSE_STATE_KEY, THROTTLE_ALL_STATE_KEY)
+    ).fetchall()
+    found = {str(row[0]): str(row[1]) for row in rows}
+    return found.get(PAUSE_STATE_KEY), found.get(THROTTLE_ALL_STATE_KEY)
+
+
+def parse_throttle_all(value_json: str | None) -> bool:
+    """True while the emergency limit (throttle-all) is on, from its `service_state` record.
+
+    Parsed by `ThrottleAllState`, the type the switch writes and the proxy's throttle-all check reads, so the page
+    states the emergency limit exactly while the proxy enforces it. A record that cannot be read counts as off
+    here (the proxy's own check is what refuses requests).
+    """
+    if not value_json:
+        return False
+    try:
+        return ThrottleAllState.from_json(json.loads(value_json)).enabled
+    except (ValueError, TypeError, RecursionError):
+        return False
 
 
 _KEY_WILDCARD: Final = "\x00"
@@ -1046,6 +1225,7 @@ class StatusView:
     hours: tuple[HourCell, ...]
     rate_limited: bool | None  # None when hot.db could not be read
     computed_at: float
+    emergency_limit: bool = False  # throttle-all is on: every caller is held to the emergency limit
 
     @property
     def label(self) -> str:
@@ -1078,18 +1258,23 @@ def _egress_unavailable(ctx: Any) -> bool:
 
 
 async def compute_status(ctx: Any, now_s: float) -> StatusView:
-    """Read pause state, recent failures, hourly history and cooldowns, and boil them down to a `StatusView`."""
+    """Read pause and throttle-all state, recent failures, hourly history and cooldowns, and boil them down to a
+    `StatusView`. While the emergency limit is on (and Roxy is not paused) the state is degraded: every caller is
+    refused far more than usual, which is what that state tells visitors."""
     current_hour = int(now_s // 3600) * 3600
     starts = [current_hour - (HOURS_SHOWN - 1 - offset) * 3600 for offset in range(HOURS_SHOWN)]
     dbs = getattr(ctx, "dbs", None)
     degraded = ctx is None or dbs is None or not bool(getattr(ctx, "ready", True))
     pause_state: SiteState | None = None
+    emergency = False
     hours: dict[int, Tally] = {}
     recent = Tally()
     rate_limited: bool | None = None
     if dbs is not None:
         try:
-            pause_state = parse_pause_state(await dbs.control.read(read_pause_value), now_s)
+            pause_value, throttle_all_value = await dbs.control.read(read_switches)
+            pause_state = parse_pause_state(pause_value, now_s)
+            emergency = parse_throttle_all(throttle_all_value)
         except Exception:
             degraded = True  # control.db unreadable: shared state is in trouble (plan C7)
             log.warning("public_status_control_read_failed", exc_info=True)
@@ -1102,11 +1287,11 @@ async def compute_status(ctx: Any, now_s: float) -> StatusView:
         except Exception:
             degraded = True  # hot.db unreadable: limiters run on their in-memory fallback (plan C7)
             log.warning("public_status_hot_read_failed", exc_info=True)
-    if is_degraded(recent) or _egress_unavailable(ctx):
+    if is_degraded(recent) or _egress_unavailable(ctx) or emergency:
         degraded = True
     state = pause_state or (SiteState.DEGRADED if degraded else SiteState.OPERATIONAL)
     cells = tuple(HourCell(start, classify_hour(hours.get(start))) for start in starts)
-    return StatusView(state=state, hours=cells, rate_limited=rate_limited, computed_at=now_s)
+    return StatusView(state=state, hours=cells, rate_limited=rate_limited, computed_at=now_s, emergency_limit=emergency)
 
 
 class StatusCache:
@@ -1179,28 +1364,54 @@ class UserGuideMissing(RuntimeError):
     """The worker cannot serve `/docs`: `docs/USER_GUIDE.md` was not found next to the installed package."""
 
 
+ANONYMOUS_TEMPLATE_PREFIXES: Final = ("public/", "auth/")
+"""The templates anyone on the internet can make a worker render: these pages and the admin sign-in pages. They are
+compiled at startup; the dashboard's own templates (behind the sign-in) compile on their first render instead,
+which keeps a worker's startup about 150 ms shorter (`Templates.warm` gives the numbers)."""
+
+
+def _read_public_files(templates: Templates | None) -> None:
+    """Every file read the public pages need, done once (blocking: the lifespan runs it on a thread).
+
+    The home snippets, robots.txt and the build date fill their `functools.cache`; `Templates.warm` compiles the
+    anonymous templates and freezes the asset hashes. A missing snippet or robots.txt raises OSError, which fails
+    startup.
+    """
+    home_examples()
+    robots_bytes()
+    build_time()
+    if templates is not None:
+        templates.warm(templates.page_templates(ANONYMOUS_TEMPLATE_PREFIXES))
+
+
 @asynccontextmanager
-async def require_user_guide(app: Any) -> AsyncIterator[None]:
-    """Router lifespan: refuse to start a worker that cannot serve the user guide.
+async def load_public_content(app: Any) -> AsyncIterator[None]:
+    """Router lifespan: load everything the public pages serve into memory, and refuse to start without the guide.
 
     FastAPI runs a router's lifespan inside the application's own (after `roxy/lifespan.py` has started the
     worker). Raising here fails the worker's startup, so a release without its guide never passes the deploy
     health gate and is rolled back, instead of answering 404 on `/docs` (logged as a probe) for its whole life.
-    Rendering the guide here also warms the cache, so the first visitor does not pay for it. The home page's
-    highlighted Luau snippets are built here too, for the same two reasons (a missing file raises OSError).
+    The rendered guide is kept in `app.state.public_guide`; the home page's highlighted Luau snippets, robots.txt,
+    the build date, the compiled public and sign-in templates and the asset hashes are loaded too (a missing file
+    raises OSError).
+    All of it runs on a worker thread, so the event loop never waits for the disk (module docstring), and the
+    first visitor does not pay for it either.
     """
-    if load_guide() is None:
+    guide = await asyncio.to_thread(load_guide)
+    if guide is None:
         log.critical("user_guide_missing", extra={"fields": {"path": str(USER_GUIDE_PATH)}})
         raise UserGuideMissing(
             f"{GUIDE_RELATIVE_PATH.as_posix()} was not found in {PACKAGE_DIR} or the {GUIDE_SEARCH_PARENTS} "
             "directories above it, so /docs cannot be served. A release must include docs/ (deploy/deploy.sh "
             "exports the whole tree with git archive)."
         )
-    home_examples()
+    setattr(app.state, GUIDE_STATE_ATTRIBUTE, guide)
+    templates = getattr(app.state, "templates", None)
+    await asyncio.to_thread(_read_public_files, templates if isinstance(templates, Templates) else None)
     yield
 
 
-router = APIRouter(lifespan=require_user_guide)
+router = APIRouter(lifespan=load_public_content)
 
 _guide_missing_logged = False
 
@@ -1212,7 +1423,7 @@ async def home(request: Request) -> Response:
     context = {
         **common_context(get, PAGE_HOME),
         "limits": live_limits(get),
-        "examples": home_examples(),
+        "examples": await _cached_value(home_examples),
         "contact_name": str(get("site_contact_name")),
         "white_hats_html": render_site_text(str(get("site_white_hats_text"))),
         "bug_bounty_html": render_site_text(str(get("site_bug_bounty_text"))),
@@ -1228,10 +1439,10 @@ async def home(request: Request) -> Response:
 async def docs(request: Request) -> Response:
     """The user guide (`docs/USER_GUIDE.md`) with live values, a table of contents and heading anchors."""
     global _guide_missing_logged
-    guide = load_guide()
+    guide = await served_guide(request)
     if guide is None:
-        # Startup checked the file, so it vanished since. 503 (Roxy's fault, never logged as a probe the way a
-        # 404 is), and one ERROR line per process instead of one per visit.
+        # Only an app whose startup did not load the guide gets here (the lifespan refuses to start without it).
+        # 503 (Roxy's fault, never logged as a probe the way a 404 is), and one ERROR line per process.
         if not _guide_missing_logged:
             _guide_missing_logged = True
             log.error("user_guide_missing", extra={"fields": {"path": str(USER_GUIDE_PATH)}})
@@ -1272,7 +1483,7 @@ async def status(request: Request) -> Response:
 @router.api_route("/robots.txt", methods=["GET", "HEAD"], include_in_schema=False)
 async def robots_txt(request: Request) -> Response:
     """v1's robots.txt, byte for byte; logs the crawl and counts the visit like v1."""
-    response = Response(content=robots_bytes(), media_type="text/plain; charset=utf-8")
+    response = Response(content=await _cached_value(robots_bytes), media_type="text/plain; charset=utf-8")
     await record_crawl(request)
     await record_visit(request, PAGE_ROBOTS)
     return response
@@ -1282,7 +1493,8 @@ async def robots_txt(request: Request) -> Response:
 async def sitemap_xml(request: Request) -> Response:
     """The sitemap with `/`, `/docs` and (while enabled) `/status`, `lastmod` from the build date."""
     get = settings_getter(request)
-    body = build_sitemap(build_date(), include_status=bool(get("public_status_page_enabled")))
+    lastmod = build_date(await _cached_value(build_time))
+    body = build_sitemap(lastmod, include_status=bool(get("public_status_page_enabled")))
     response = Response(content=body, media_type="application/xml; charset=utf-8")
     await record_crawl(request)
     await record_visit(request, PAGE_SITEMAP)
@@ -1291,5 +1503,68 @@ async def sitemap_xml(request: Request) -> Response:
 
 @router.api_route("/favicon.ico", methods=["GET", "HEAD"], include_in_schema=False)
 async def favicon(request: Request) -> Response:
-    """The PNG favicon at the path browsers ask for by default (v1 served the same PNG; no logging, like v1)."""
+    """The PNG favicon at the path browsers ask for by default (v1 served the same PNG; no logging, like v1).
+
+    `FileResponse` checks and reads the file on worker threads, never on the event loop."""
     return FileResponse(FAVICON_PATH, media_type="image/png", headers={"cache-control": FAVICON_CACHE_CONTROL})
+
+
+# --- other spellings of the page paths ----------------------------------------------------------------------------
+
+CANONICAL_PAGE_PATHS: Final = ("/docs", "/status")
+"""The page paths that get an alias route. `/` needs none, and the crawler files are fetched by exact name."""
+ALIAS_METHODS: Final = frozenset({"GET", "HEAD"})
+ALIAS_STATUS: Final = 308
+"""Permanent Redirect: browsers and crawlers remember the canonical address (and, unlike 301, the method stays)."""
+
+
+def canonical_page_path(path: str) -> str | None:
+    """`/docs/`, `/Docs` or `/STATUS//` -> `/docs` or `/status`; None for every other path, the canonical one too."""
+    candidate = path.rstrip("/").lower()
+    if candidate in CANONICAL_PAGE_PATHS and path != candidate:
+        return candidate
+    return None
+
+
+def page_alias_redirect(scope: Scope) -> Response:
+    """The 308 to the canonical page path, keeping the query string (the target is always a local path)."""
+    target = canonical_page_path(str(scope.get("path", ""))) or "/"
+    query = bytes(scope.get("query_string") or b"").decode("latin-1")
+    # RedirectResponse percent-encodes the Location value, so caller bytes can never add a header line.
+    return RedirectResponse(f"{target}?{query}" if query else target, status_code=ALIAS_STATUS)
+
+
+class PageAliasRoute(APIRoute):
+    """GET and HEAD of another spelling of a page path (`/docs/`, `/Status`): a 308 to the page.
+
+    The proxy catch-all would otherwise read `/docs/` as a request for the host `docs`: a `not_roblox` refusal,
+    held by the tarpit (`tarpit_on_probe`) and counted by the spam probe detector, so a visitor who reloads a link
+    with a trailing slash could ban their own address (and their game's play tests) from the proxy. Other methods
+    and every other path are left to the routes after this one.
+    """
+
+    def matches(self, scope: Scope) -> tuple[Match, Scope]:
+        if scope.get("type") != "http" or scope.get("method") not in ALIAS_METHODS:
+            return Match.NONE, {}
+        if canonical_page_path(str(scope.get("path", ""))) is None:
+            return Match.NONE, {}
+        return Match.FULL, {}
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Answered here, without dependencies: there is nothing to resolve.
+        await page_alias_redirect(scope)(scope, receive, send)
+
+
+async def page_alias(request: Request) -> Response:
+    """The alias route's endpoint (what `PageAliasRoute.handle` sends)."""
+    return page_alias_redirect(request.scope)
+
+
+router.add_api_route(
+    "/{alias:path}",  # for route listings; matching uses `canonical_page_path`, not this pattern
+    page_alias,
+    methods=sorted(ALIAS_METHODS),
+    include_in_schema=False,
+    name="public_page_alias",
+    route_class_override=PageAliasRoute,
+)

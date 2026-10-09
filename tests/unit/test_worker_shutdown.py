@@ -150,14 +150,15 @@ async def test_a_stuck_loop_cannot_push_the_final_flush_past_the_budget(
         await asyncio.sleep(3600)  # never looks at `stop`
 
     closed: list[bool] = []
-    real_close = MetricsRecorder.close
+    real_aclose = MetricsRecorder.aclose
 
-    def close(self: MetricsRecorder) -> Any:
+    async def aclose(self: MetricsRecorder, *, budget_s: float = 4.0) -> Any:
+        # The lifespan awaits the budgeted `aclose` (review finding mp-6); `close` stays for scripts and tests.
         closed.append(True)
-        return real_close(self)
+        return await real_aclose(self, budget_s=budget_s)
 
     monkeypatch.setattr(MetricsRecorder, "run", stuck)
-    monkeypatch.setattr(MetricsRecorder, "close", close)
+    monkeypatch.setattr(MetricsRecorder, "aclose", aclose)
     app = create_app(env)
     context = app.router.lifespan_context(app)
     await context.__aenter__()

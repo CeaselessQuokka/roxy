@@ -35,13 +35,17 @@ How it works
     trio), `Roxy-Cache` with `Roxy-Cache-Age` and `Roxy-Cache-TTL` for cache serves, `Roxy-Upstream-Status`,
     `Roxy-Upstream-Cooldown`, and the plan 9.13 safe upstream headers (`scrub.safe_response_headers`).
     With `compat_collapse_upstream_errors` on (v1's behavior, for old scripts), every Roblox 4xx (live or cached)
-    reaches the caller exactly as v1 sent it: status 500 with Roblox's own body and content type, never pretty
-    printed (v1 pretty printed only successes), still shown as `<pre>` to a browser (v1 used the same view for
-    errors). v1 never replaced a Roblox error body with its own text (v1 notes pipeline.md section 7 step 4, bug
-    B1), and the setting exists to reproduce v1, so its body wins over plan 7.13's compat note, which assumed v1
-    sent the failure text. Every Roblox 5xx and the 502 and 504 rows become 500 with `Upstream request failed;
-    please try again later.` as plan 7.13 says. Roxy's own refusals and the 429 and 503 rows are unchanged, and
-    `Retry-After` is still sent. Off (plan D4, the default) passes the real status.
+    reaches the caller exactly as v1 sent it: status 500 with Roblox's own body and content type, still shown as
+    `<pre>` to a browser (v1 used the same view for errors). `?prettyprint=true` follows v1 as well, and v1 had two
+    rules: a live answer was pretty printed only when the upstream call succeeded, so a live 4xx stays raw, while
+    `_serve_from_cache` pretty printed every entry it served, negative ones included (v1 notes pipeline.md 7.2), so
+    a 4xx answered from the cache (`Roxy-Cache` HIT, REVALIDATING, STALE or COALESCED, the states that were
+    cache serves in v1 too) is pretty printed before the browser view. v1 never replaced a Roblox error body with
+    its own text (v1 notes pipeline.md section 7 step 4, bug B1), and the setting exists to reproduce v1, so its
+    body wins over plan 7.13's compat note, which assumed v1 sent the failure text. Every Roblox 5xx and the 502
+    and 504 rows become 500 with `Upstream request failed; please try again later.` as plan 7.13 says. Roxy's own
+    refusals and the 429 and 503 rows are unchanged, and `Retry-After` is still sent. Off (plan D4, the default)
+    passes the real status and pretty prints every Roblox body, live or cached, 2xx or 4xx.
     Header names keep their canonical casing (`Roxy-Cache`, `Retry-After`) because Starlette would lowercase them:
     they are appended to `raw_headers` directly. The router marks every proxy response as proxied content, so the
     security middleware sends `Content-Security-Policy: default-src 'none'; sandbox` (plan 9.2), and the HTML view
@@ -596,6 +600,7 @@ def render_served(
     body = _as_bytes(result.body)
     content_type: str | None = getattr(result, "content_type", None)
     source = Source(getattr(result, "source", Source.ROBLOX))
+    cache_state = CacheState(getattr(result, "cache_state", CacheState.NA))
     collapsed = compat_collapse and status >= 400
     transformed = False
     if collapsed and status >= 500:
@@ -606,10 +611,13 @@ def render_served(
     else:
         if collapsed:
             # v1 never relayed a Roblox error status (bug B1): a 4xx, live or cached, reached the caller as 500
-            # carrying Roblox's own body. Compat mode exists to reproduce that, so only the status changes, and
-            # the body is not pretty printed (v1 pretty printed successes only).
+            # carrying Roblox's own body. Compat mode exists to reproduce that, so the status changes and the
+            # body stays Roblox's.
             status = 500
-        elif req.prettyprint:
+        # Prettyprint in compat mode follows v1's two paths: the live path pretty printed only a successful call
+        # (so a live 4xx stays raw), `_serve_from_cache` pretty printed every entry it served (so a cached 4xx is
+        # pretty). Outside compat mode every Roblox body is pretty printed, live or cached.
+        if req.prettyprint and (not collapsed or cache_state in CACHE_SERVE_STATES):
             pretty = pretty_json(body)
             transformed = pretty != body
             body = pretty
@@ -638,7 +646,7 @@ def render_served(
         outcome=Outcome(getattr(result, "outcome", Outcome.SERVED_UPSTREAM)),
         reason=reason,
         source=source,
-        cache_state=CacheState(getattr(result, "cache_state", CacheState.NA)),
+        cache_state=cache_state,
         collapsed=collapsed,
     )
 

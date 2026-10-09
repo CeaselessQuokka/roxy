@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_S = 5.0
 HEARTBEAT_STALE_S = 20.0
+REMOVE_BUSY_BUDGET_MS = 1000  # the shutdown delete of this worker's row: a stale row expires by itself in 20 s
 """A worker whose row is older than this is counted as gone (four missed beats)."""
 
 
@@ -235,14 +236,19 @@ class HeartbeatReporter:
         self.beats += 1
 
     async def remove(self) -> None:
-        """Delete this worker's row (clean shutdown), so the fleet count drops at once instead of after 20 s."""
+        """Delete this worker's row (clean shutdown), so the fleet count drops at once instead of after 20 s.
+
+        The delete waits at most `REMOVE_BUSY_BUDGET_MS` for a locked metrics.db: it runs inside the 8 s shutdown
+        budget, before the final metrics flush, and the row goes stale by itself after 20 s anyway (review finding
+        mp-6: with metrics.db locked, the unbudgeted delete took 5 s of that budget).
+        """
         pid = self.info.pid
 
         def delete_row(conn: sqlite3.Connection) -> None:
             conn.execute("DELETE FROM worker_heartbeat WHERE pid = ?", (pid,))
 
         try:
-            await self.metrics.write(delete_row)
+            await self.metrics.write(delete_row, busy_timeout_ms=REMOVE_BUSY_BUDGET_MS)
         except SharedStateUnavailable as exc:
             log.warning("heartbeat_remove_failed", extra={"fields": {"error": str(exc)}})
 

@@ -91,12 +91,18 @@ def _clean_secret_registry() -> Iterator[None]:
 
 @pytest.fixture
 def restore_logging() -> Iterator[None]:
-    """Undo `configure_logging` after a test: handlers and levels of the root and pinned loggers."""
+    """Undo `configure_logging` after a test: handlers and levels of the root and pinned loggers. A background
+    handler the test installed is closed, so its writer thread ends with the test."""
+    from roxy.core.logging import BackgroundStreamHandler
+
     root = logging.getLogger()
     handlers = list(root.handlers)
     level = root.level
     pinned = {name: logging.getLogger(name).level for name in ("httpx", "httpcore", "h2", "hpack", "aiosmtplib")}
     yield
+    for handler in root.handlers:
+        if handler not in handlers and isinstance(handler, BackgroundStreamHandler):
+            handler.close()
     root.handlers[:] = handlers
     root.setLevel(level)
     for name, value in pinned.items():

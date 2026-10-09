@@ -17,8 +17,12 @@ Why it exists
     client addresses, scrubs the rest with `redact_text`, and decides auto-ignore centrally from the shared table.
 
 How it works
-    - Per header pair: the name is lowercased and cut to 120 characters (v1). Values of ignored headers (the
-      `ignored_value_headers` table, through the rules snapshot) are not recorded; the name still is.
+    - Per header pair: the name is lowercased and cut to 120 characters (v1). A header name is caller text too
+      (any HTTP token, so 40 characters of the credential make a valid name, and caller headers are never
+      forwarded, so the leak guard never sees them): a name that `redact_label` changes is stored as `fp:` plus
+      the keyed hash of the whole name, and its values only as hashes (finding cred-7, plan 9.15). Values of
+      ignored headers (the `ignored_value_headers` table, through the rules snapshot) are not recorded; the name
+      still is.
     - Stored value: `(empty)` for an empty value; `fp:` plus 12 hex characters of a keyed hash for sensitive
       headers (HMAC with the `ip_hash_key` credential when present, else SHA-256 like v1); otherwise the first
       200 characters, run through `redact_text` once per distinct value at flush time (a value that redaction
@@ -46,7 +50,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from roxy.core.redact import is_sensitive_key, redact_text
+from roxy.core.redact import is_sensitive_key, redact_label, redact_text
 
 MAX_NAME_CHARS = 120
 MAX_VALUE_CHARS = 200
@@ -94,6 +98,18 @@ def value_for_storage(name_lower: str, value: str, key: bytes | None = None) -> 
     return value[:MAX_VALUE_CHARS]
 
 
+def name_for_storage(raw_name: str, key: bytes | None = None) -> tuple[str, bool]:
+    """`(stored name, hidden)` for one header name: lowercased and cut to `MAX_NAME_CHARS` (v1), or, when the name
+    holds something secret-shaped, `fp:` plus the keyed hash of the whole lowercased name (`hidden` True).
+
+    Judged before the cut, so a credential piece that straddles character 120 is still found.
+    """
+    name = str(raw_name).lower()
+    if name and redact_label(name) != name:
+        return value_hash_text(name, key), True
+    return name[:MAX_NAME_CHARS], False
+
+
 def row_hash(*parts: str) -> str:
     """Primary key of a value or UA row: SHA-256 of the parts joined by NUL, first 32 hex characters."""
     return hashlib.sha256("\x00".join(parts).encode("utf-8", "replace")).hexdigest()[:32]
@@ -131,13 +147,19 @@ class FingerprintAggregator:
         """Count one request's headers and User-Agent."""
         with self._lock:
             for raw_name, raw_value in pairs:
-                name = str(raw_name).lower()[:MAX_NAME_CHARS]
+                name, hidden = name_for_storage(raw_name, self.hash_key)
                 if not name:
                     continue
                 self._bump(self._names, name, now_s, MAX_PENDING_NAMES)
                 if name in ignored:
                     continue
-                stored = value_for_storage(name, str(raw_value), self.hash_key)
+                value = str(raw_value)
+                # A secret-shaped name makes its value suspect too: store it only as a hash.
+                stored = (
+                    value_hash_text(value, self.hash_key)
+                    if hidden and value
+                    else value_for_storage(name, value, self.hash_key)
+                )
                 self._bump(self._values, (name, stored), now_s, MAX_PENDING_VALUES)
             ua = (user_agent or NO_USER_AGENT)[:MAX_UA_CHARS]
             self._bump(self._uas, ua, now_s, MAX_PENDING_USER_AGENTS)

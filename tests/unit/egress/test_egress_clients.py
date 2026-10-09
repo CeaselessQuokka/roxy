@@ -312,6 +312,40 @@ async def test_rotator_sessions_through_a_forward_proxy(
         assert any(ex.username and "sessid-" in ex.username for ex in proxy.exchanges)
 
 
+async def test_no_egress_client_logs_tls_keys(
+    make_egress: Any, override: dict[str, str], monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Finding cred-6: CPython's `ssl.create_default_context` copies SSLKEYLOGFILE into the context whatever
+    httpx's `trust_env` says; every egress TLS context (direct, credential, rotator, a test's own context) has its
+    key log switched off, and the H-ENV-PROXY self-test fails while the variable is set."""
+    import ssl
+
+    from roxy.egress.clients import make_credential_client
+    from roxy.egress.metering import tls_context
+
+    monkeypatch.setenv("SSLKEYLOGFILE", str(tmp_path / "keys.log"))
+    assert ssl.create_default_context().keylog_filename  # the environment really is read by CPython
+    egress = await make_egress(environ=override)
+    rotator = egress._make_rotator_client("http://127.0.0.1:9", "keylog", False)
+    built = make_credential_client()
+    try:
+        for client in (egress.direct_client, egress.credential_client, rotator, built):
+            assert client.metering.keylog_file() is None
+            assert client.http._transport is not None
+    finally:
+        await rotator.aclose()
+        await built.aclose()
+    assert tls_context(ssl.create_default_context()).keylog_filename is None  # a passed-in context too
+    check = egress.self_test_env_proxy({"SSLKEYLOGFILE": str(tmp_path / "keys.log")})
+    assert (check.status, check.value) == ("fail", "SSLKEYLOGFILE")
+    assert egress.self_test_env_proxy({}).status == "pass"
+    egress.credential_client.metering.tls.keylog_filename = str(tmp_path / "late.log")
+    honoring = egress.self_test_env_proxy({})
+    assert honoring.status == "fail"
+    assert "credential" in honoring.value
+    egress.credential_client.metering.tls.keylog_filename = None
+
+
 async def test_self_tests(make_egress: Any, override: dict[str, str], env: Any) -> None:
     egress = await make_egress(environ=override)
     guard = await egress.self_test_leak_guard()

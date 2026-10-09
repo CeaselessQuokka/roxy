@@ -16,6 +16,15 @@ Why it exists
       way, so the master creates it once (`on_starting`) and hands it to every worker (`post_fork`). The socket
       must be mode 0660 so the deploy user (group roxy) can connect and nobody else can; it is created with
       `umask` applied, so the umask below sets that mode.
+    - A taken port fails loudly. With `reuse_port` the master binds nothing itself, so on its own it would never
+      learn that the port is in use: a second master on a served port (the other color with a copy-pasted
+      ROXY_BIND, a manual start) would quietly share it, and a port another program holds would leave a READY
+      master whose workers fail to bind and are respawned forever (finding mp-3). So `on_starting` first checks
+      the TCP address with a plain bind (no SO_REUSEPORT, so ANY listener on it refuses us) and exits with status 1
+      when it is taken, before systemd hears READY, the way gunicorn fails without `reuse_port`; and `pre_fork`
+      checks again before every new worker (with SO_REUSEPORT, so only a foreign listener refuses us) and stops
+      the master instead of starting a worker that cannot bind. Without ROXY_BIND each color takes its own port
+      from `COLOR_PORTS` (finding mp-4), never blue's.
     - Low-memory deploy mode (DESIGN.md section 0): on the 909 MB server a deploy may start the idle color with
       one worker and add the rest after the old color stopped. deploy.sh asks for that with a small marker file;
       this file reads it.
@@ -37,7 +46,9 @@ What to read next
 
 from __future__ import annotations
 
+import errno
 import os
+import socket
 import sys
 import time
 from pathlib import Path
@@ -105,6 +116,29 @@ def start_workers(full: int, marker: Path, *, now: float | None = None) -> int:
     return int(text)
 
 
+COLOR_PORTS = {"blue": 8001, "green": 8002}
+"""Each color's loopback port, the same as deploy/nginx/roxy-upstream-<color>.conf (`server 127.0.0.1:800x`)."""
+
+DEFAULT_PORT = 8001
+"""The port of a color not in `COLOR_PORTS` (development, "dev")."""
+
+
+def default_bind(color: str) -> str:
+    """The TCP address a color listens on when ROXY_BIND is missing: its own port, never the other color's."""
+    return f"127.0.0.1:{COLOR_PORTS.get(color, DEFAULT_PORT)}"
+
+
+def resolve_bind(color: str) -> str:
+    """ROXY_BIND, or the color's own address with a warning (a missing line in /etc/roxy/<color>.env)."""
+    configured = env_text("ROXY_BIND", "")
+    if configured:
+        return configured
+    fallback = default_bind(color)
+    if color in COLOR_PORTS:
+        _warn(f"ROXY_BIND is not set for color {color}; using {fallback}")
+    return fallback
+
+
 # --------------------------------------------------------------------------------------- derived values
 
 _color = env_text("ROXY_COLOR", "dev")
@@ -130,19 +164,21 @@ workers = start_workers(_full_workers, _marker)
 # connection to one of them by a hash of the client's address and port, so connections spread evenly. With one
 # listener shared by all workers (gunicorn's default), the worker that went idle last accepts nearly every
 # connection: 4 workers took 70/10/0/0 of 80 fresh connections and 130/30/0/0 of the requests on a 16-connection
-# keep-alive pool (what nginx keeps open), against 21/21/21/17 and 60/59/36/5 with this setting. Trade-offs: a
-# second master started on the same port (same user) would share it silently instead of failing to bind, and
-# connections still waiting in a stopping worker's accept queue are reset (Linux moves them to another worker when
-# net.ipv4.tcp_migrate_req=1), so a single-worker color briefly refuses connections while its worker recycles.
+# keep-alive pool (what nginx keeps open), against 21/21/21/17 and 60/59/36/5 with this setting. A second master
+# started on a port already in use would share it silently, so on_starting and pre_fork refuse a taken port (module
+# docstring). Trade-off: connections still waiting in a stopping worker's accept queue are reset (Linux moves them
+# to another worker when net.ipv4.tcp_migrate_req=1), so a single-worker color briefly refuses connections while its
+# worker recycles.
 reuse_port = True
 
-# The loopback TCP address nginx proxies to (ROXY_BIND, 127.0.0.1:8001 for blue and 127.0.0.1:8002 for green),
-# opened by every worker itself (reuse_port). The second listener, the internal Unix socket that only the deploy
-# and ctl.py use (plan 5.8), is not listed here: SO_REUSEPORT does not apply to Unix sockets (newer kernels refuse
-# it, and older ones would let each worker replace the socket file of the one before), so the master creates it
-# once in on_starting and every worker accepts on that one shared socket (post_fork). The ASGI dispatcher in
-# roxy/asgi.py sends Unix socket requests to the internal app; nginx never proxies to the socket.
-bind = [env_text("ROXY_BIND", "127.0.0.1:8001")]
+# The loopback TCP address nginx proxies to (ROXY_BIND; without it the color's own port, 127.0.0.1:8001 for blue
+# and 127.0.0.1:8002 for green, so green never lands on blue's port), opened by every worker itself (reuse_port).
+# The second listener, the internal Unix socket that only the deploy and ctl.py use (plan 5.8), is not listed here:
+# SO_REUSEPORT does not apply to Unix sockets (newer kernels refuse it, and older ones would let each worker replace
+# the socket file of the one before), so the master creates it once in on_starting and every worker accepts on that
+# one shared socket (post_fork). The ASGI dispatcher in roxy/asgi.py sends Unix socket requests to the internal app;
+# nginx never proxies to the socket.
+bind = [resolve_bind(_color)]
 
 INTERNAL_SOCKET = _internal_socket
 """The internal Unix socket path (ROXY_INTERNAL_SOCKET, /run/roxy-<color>/internal.sock by default)."""
@@ -212,6 +248,66 @@ worker_tmp_dir = memory_tmp_dir()
 
 # ------------------------------------------------------------------------------------------------ hooks
 
+BIND_CHECK_ATTEMPTS = 5
+"""How often `on_starting` tries a taken port, one second apart, before giving up (gunicorn's own bind retries)."""
+
+
+def tcp_addresses(server: Any) -> list[tuple[str, int]]:
+    """The TCP addresses of `bind` as gunicorn parsed them (Unix and file descriptor entries are skipped)."""
+    found: list[tuple[str, int]] = []
+    for address in server.cfg.address:
+        if isinstance(address, tuple) and len(address) >= 2:
+            found.append((str(address[0]), int(address[1])))
+    return found
+
+
+def port_problem(host: str, port: int, *, shared: bool) -> OSError | None:
+    """Try to bind `host:port` on a throwaway socket; the error, or None when the bind worked (nothing listens).
+
+    SO_REUSEADDR is set, as gunicorn sets it, so connections of an earlier run still in TIME_WAIT never count as
+    "in use". `shared=False` leaves SO_REUSEPORT off: every listener on the port then refuses the bind, the
+    SO_REUSEPORT listeners of another master included (Linux allows a shared port only when every socket asks
+    for it). `shared=True` sets it: our own workers' listeners are accepted, a foreign listener still refuses.
+    The socket never listens and is closed at once, so it can never take a connection.
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    probe = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if shared and hasattr(socket, "SO_REUSEPORT"):
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        probe.bind((host, port))
+    except OSError as exc:
+        return exc
+    finally:
+        probe.close()
+    return None
+
+
+def check_ports_free(server: Any, *, attempts: int = BIND_CHECK_ATTEMPTS, delay_s: float = 1.0) -> None:
+    """Exit with status 1 when another listener holds a TCP address of `bind` (see the module docstring).
+
+    Runs in the master before any worker exists and before gunicorn tells systemd READY, so the unit fails, the
+    deploy or roxy-boot sees it, and the OnFailure alert fires, as gunicorn behaves without `reuse_port`.
+    """
+    for host, port in tcp_addresses(server):
+        for attempt in range(max(1, attempts)):
+            problem = port_problem(host, port, shared=False)
+            if problem is None:
+                break
+            if problem.errno == errno.EADDRINUSE and attempt + 1 < attempts:
+                time.sleep(delay_s)  # a master of this color that is still stopping may hold it for a moment
+                continue
+            server.log.error(
+                "Connection in use: %s:%d is already served by another listener (%s); refusing to share it. "
+                "Check ROXY_BIND in /etc/roxy/%s.env and that no other master of this port runs.",
+                host,
+                port,
+                problem.strerror or problem,
+                _color,
+            )
+            sys.exit(1)
+
 
 def internal_listener(server: Any) -> Any:
     """gunicorn's own Unix socket listener for `INTERNAL_SOCKET`, created with `umask` (mode 0660).
@@ -230,12 +326,31 @@ def internal_listener(server: Any) -> Any:
 
 
 def on_starting(server: Any) -> None:
-    """Create the internal Unix socket once, in the master, before any worker exists (see `bind`).
+    """Refuse a taken TCP port, then create the internal Unix socket once, in the master, before any worker exists.
 
-    gunicorn keeps it in its listener list (logged as "Listening at", closed when the master stops) and, because
-    the list is not empty, creates no other master listener; with `reuse_port` the workers open the TCP listener.
+    The port check is skipped for a master re-executed by USR2 (`master_pid` set), whose parent legitimately still
+    serves the port. gunicorn keeps the Unix socket in its listener list (logged as "Listening at", closed when the
+    master stops) and, because the list is not empty, creates no other master listener; with `reuse_port` the
+    workers open the TCP listener.
     """
+    if not getattr(server, "master_pid", 0):
+        check_ports_free(server)
     server.LISTENERS = [internal_listener(server)]
+
+
+def pre_fork(server: Any, worker: Any) -> None:
+    """Before each new worker: stop the master if a foreign listener took the TCP port meanwhile.
+
+    The worker would fail to bind, exit 1 and be started again, forever, behind a master systemd believes is fine
+    (finding mp-3). The check sets SO_REUSEPORT, so this master's own workers' listeners never trip it.
+    """
+    from gunicorn.errors import HaltServer
+
+    for host, port in tcp_addresses(server):
+        problem = port_problem(host, port, shared=True)
+        if problem is not None:
+            server.log.error("Cannot start a worker: %s:%d is not usable (%s)", host, port, problem.strerror or problem)
+            raise HaltServer(f"{host}:{port} is held by another listener", 1)
 
 
 def post_fork(server: Any, worker: Any) -> None:

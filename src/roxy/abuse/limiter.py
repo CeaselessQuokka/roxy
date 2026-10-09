@@ -4,8 +4,10 @@ What this is
     Pure functions that decide "admit or refuse" for one limiter row at one instant and say what the row becomes:
     `gcra` (the default per-IP algorithm and the flood and place limits), `fixed` (v1's window, kept for parity and
     used by throttle-all, endpoint rules and User-Agent burst rules), `cooldown` (User-Agent cooldown rules), the
-    matching `*_peek` helpers for response headers, `load_rows` / `save_rows` for SQL, and `MemoryRowStore`, the
-    bounded in-memory table used when hot.db is unavailable (plan C7).
+    matching `*_peek` helpers for response headers, `load_rows` / `save_rows` for SQL, and for plan C7 (hot.db
+    unavailable) `MemoryRowStore` (the bounded in-memory table), `degraded_limit` and `unshared` (a worker's share
+    of a limit, and the refusal when that share is 0) and `merge_limiter_row` (adding what a worker counted in
+    memory to the shared row once hot.db works again).
 
 Why it exists
     "L requests per W seconds" has two classic implementations. A fixed window gives everyone a full allowance at
@@ -190,8 +192,9 @@ def save_rows(conn: sqlite3.Connection, rows: Iterable[LimiterRow], now_s: int) 
 class MemoryRowStore[T]:
     """A bounded least-recently-used map from key to row, private to one worker process.
 
-    Used when hot.db cannot be written: every limiter then runs on this worker's own copy at `limit / workers`, so
-    the fleet as a whole still enforces roughly the configured limit (conservative: never more).
+    Used when hot.db cannot be written: every limiter then runs on this worker's own copy at `limit // workers`
+    (`degraded_limit`), so the fleet as a whole still enforces at most the configured limit (conservative: never
+    more). What it decides there stays (`DegradedEntry`) until it is merged into hot.db.
     """
 
     __slots__ = ("_rows", "max_rows")
@@ -212,6 +215,15 @@ class MemoryRowStore[T]:
         while len(self._rows) > self.max_rows:
             self._rows.popitem(last=False)
 
+    def discard(self, key: str, row: T) -> None:
+        """Remove `key` only while it still holds this very object (a newer row put meanwhile is kept)."""
+        if self._rows.get(key) is row:
+            del self._rows[key]
+
+    def items(self) -> list[tuple[str, T]]:
+        """A snapshot of every entry, oldest first (does not change the recency order)."""
+        return list(self._rows.items())
+
     def __len__(self) -> int:
         return len(self._rows)
 
@@ -219,13 +231,86 @@ class MemoryRowStore[T]:
         self._rows.clear()
 
 
+@dataclass(slots=True)
+class DegradedEntry[T]:
+    """A row this worker decided on while hot.db could not be written (plan C7), kept until hot.db has it.
+
+    `row` is the current memory row; `seed` is the shared row it started from (as read from hot.db; `exists=False`
+    when there was none), so a merge adds only what THIS worker counted; `algo` says how to merge (`gcra`, `fixed`,
+    `cooldown`, or `strikes` for a strike row); `streak` is the degraded streak that last read the shared row; and
+    `claimed` marks an entry a merge transaction is carrying right now, so two merges never carry it at once.
+    """
+
+    row: T
+    seed: T
+    algo: str
+    streak: int = 0
+    claimed: bool = False
+
+    @property
+    def changed(self) -> bool:
+        """Whether this worker decided anything on the row (an unchanged seed has nothing to merge)."""
+        return bool(self.row != self.seed)
+
+
+def merge_limiter_row(shared: LimiterRow, entry: DegradedEntry[LimiterRow], now_ms: int) -> LimiterRow:
+    """The shared row once what this worker counted while degraded is added to it (plan C6 and C7).
+
+    Conservative: the result never admits more than either side would.
+    - GCRA and cooldown: the later TAT (and the later last request). A worker's degraded interval is at least
+      `workers` times the real one (its share is at most `limit / workers`), so the latest TAT of any worker is at
+      least the TAT the whole fleet's admits would have produced on one shared row.
+    - Fixed window: the shared count plus what this worker counted in a window that is still running (its count
+      minus the seed's count in the same window), over the longer of the two windows. A window that is over counts
+      nothing any more.
+    """
+    memory = entry.row
+    if not memory.exists:
+        return shared
+    if entry.algo in ("gcra", "cooldown"):
+        if not shared.exists:
+            return memory
+        return replace(
+            shared,
+            tat_ms=max(shared.tat_ms, memory.tat_ms),
+            window_start=max(shared.window_start, memory.window_start),
+            count=max(shared.count, memory.count),
+        )
+    if now_ms > memory.tat_ms:
+        return shared  # this worker's window is over: nothing it counted still limits anyone
+    seed = entry.seed
+    same_window = seed.exists and seed.window_start == memory.window_start and seed.tat_ms == memory.tat_ms
+    counted = max(0, memory.count - (seed.count if same_window else 0))
+    if not shared.exists or now_ms > shared.tat_ms:
+        return memory  # no running shared window: this worker's own window (seed included) is the whole story
+    if memory.tat_ms > shared.tat_ms:
+        return replace(shared, window_start=memory.window_start, tat_ms=memory.tat_ms, count=shared.count + counted)
+    return replace(shared, count=shared.count + counted)
+
+
 def degraded_limit(limit: int, workers: int) -> int:
-    """C7: the per-worker share of a limit while shared state is unavailable (at least 1)."""
-    return max(1, int(limit) // max(1, int(workers)))
+    """C7: this worker's share of a limit while shared state is unavailable: `limit // workers`, which may be 0.
+
+    The shares of all workers add up to at most the limit (C6: per-worker memory never multiplies a limit). A share
+    of 0 (a limit smaller than the fleet, such as 1 request per minute with 2 workers) means this worker refuses
+    that limiter's requests until hot.db works again: fail closed (C7), see `unshared`.
+    """
+    return max(0, int(limit)) // max(1, int(workers))
+
+
+def unshared(row: LimiterRow, limit: int, window_s: float) -> RateDecision:
+    """The decision of a limiter whose degraded share is 0 on this worker: refused, nothing counted.
+
+    The client is told to come back after the configured pace (`window / limit`, at least 1 s): by then hot.db
+    may work again, or the request may reach another worker.
+    """
+    retry = max(1, math.ceil(max(float(window_s), 0.001) / max(1, int(limit)) - _EPSILON))
+    return RateDecision(False, 0, retry, retry, row)
 
 
 __all__ = [
     "GCRA_SLACK_MS",
+    "DegradedEntry",
     "LimiterRow",
     "MemoryRowStore",
     "RateDecision",
@@ -237,5 +322,7 @@ __all__ = [
     "gcra_params",
     "gcra_peek",
     "load_rows",
+    "merge_limiter_row",
     "save_rows",
+    "unshared",
 ]

@@ -122,3 +122,54 @@ def test_auto_ignore_needs_five_hundred_requests(dbs: Any) -> None:
         agg.add([("X-Rare", f"u{i}")], "UA", NOW)
     _write(dbs, agg, cap=100)
     assert dbs.metrics.read_sync(lambda c: fp.auto_ignore_candidates(c, value_cap=100)) == []
+
+
+# --- header names (finding cred-7) -------------------------------------------------------------------------------
+
+
+def _credential_piece() -> str:
+    """Register a fake credential and return 40 characters of its secret part (a valid HTTP token)."""
+    import secrets
+
+    from roxy.core.redact import SecretRegistry
+
+    credential = TOKEN_PREFIX + "FAKE" + secrets.token_hex(60).upper()
+    SecretRegistry.register("roblox_credential", credential)
+    return credential[len(TOKEN_PREFIX) + 20 : len(TOKEN_PREFIX) + 60]
+
+
+def test_a_secret_shaped_header_name_is_stored_as_its_hash(dbs: Any) -> None:
+    """A header NAME is caller text: one holding a credential piece is stored as `fp:` plus its keyed hash, and its
+    values only as hashes; ordinary names are lowercased and kept."""
+    piece = _credential_piece()
+    key = b"k" * 32
+    agg = fp.FingerprintAggregator(key)
+    secret_name = f"X-{piece}"
+    agg.add([(secret_name, "plain-value"), ("Accept", "*/*")], "UA", NOW)
+    agg.add([(secret_name.lower(), "other")], "UA", NOW)  # the same name in other case: the same hash
+    _write(dbs, agg)
+    names = dbs.metrics.read_sync(
+        lambda c: {str(r[0]): int(r[1]) for r in c.execute("SELECT name, count FROM fingerprint_headers")}
+    )
+    hidden = fp.value_hash_text(secret_name.lower(), key)
+    assert names == {"accept": 1, hidden: 2}
+    values = dbs.metrics.read_sync(
+        lambda c: [(str(r[0]), str(r[1])) for r in c.execute("SELECT name, value FROM fingerprint_values")]
+    )
+    assert ("accept", "*/*") in values
+    assert {value for name, value in values if name == hidden} == {
+        fp.value_hash_text("plain-value", key),
+        fp.value_hash_text("other", key),
+    }
+    assert piece.lower() not in (repr(names) + repr(values)).lower()
+
+
+def test_a_long_name_is_judged_before_it_is_cut() -> None:
+    """A credential piece that starts before character 120 and ends after it is still found (judged whole)."""
+    piece = _credential_piece()
+    stored, hidden = fp.name_for_storage("x-" + "a" * 100 + piece)
+    assert hidden
+    assert stored.startswith("fp:")
+    plain, hidden_plain = fp.name_for_storage("X-" + "b" * 200)
+    assert not hidden_plain
+    assert plain == ("x-" + "b" * 200)[: fp.MAX_NAME_CHARS]

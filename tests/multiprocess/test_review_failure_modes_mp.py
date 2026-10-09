@@ -696,13 +696,37 @@ class ScaledClock:
         await asyncio.sleep(max(0.0, seconds) / SPEED)
 
 
-class _FailingRoblox:
-    """`ctx.egress`: direct only; 503 for the first `FAIL_FOR_S` fake seconds; every call recorded in mock.db."""
+class _BreakerLog:
+    """What one worker process saw, kept in memory and written to mock.db once, after the run.
 
-    def __init__(self, mock_path: str, worker: str, clock: ScaledClock) -> None:
-        self.conn = sqlite3.connect(mock_path, timeout=30, isolation_level=None)
+    The mock must not block the event loop: a synchronous SQLite insert per call (with a commit and an fsync, while
+    the other process inserts into the same file) stalled the loop between a reservation and its send, so a call
+    reserved before the breaker opened could be sent well after it, which the test then read as a call through an
+    open breaker (a flake seen in the review round gate). Real egress sends are async and never do that.
+    """
+
+    def __init__(self, worker: str, clock: ScaledClock) -> None:
         self.worker = worker
         self.clock = clock
+        self.calls: list[tuple[int, str, int]] = []
+        self.events: list[tuple[int, str, str]] = []
+
+    def write(self, mock_path: str) -> None:
+        conn = sqlite3.connect(mock_path, timeout=30, isolation_level=None)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.executemany("INSERT INTO calls (at_ms, worker, status) VALUES (?, ?, ?)", self.calls)
+            conn.executemany("INSERT INTO events (at_ms, worker, type) VALUES (?, ?, ?)", self.events)
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+
+class _FailingRoblox:
+    """`ctx.egress`: direct only; 503 for the first `FAIL_FOR_S` fake seconds; every call kept in the `_BreakerLog`."""
+
+    def __init__(self, log: _BreakerLog) -> None:
+        self.log = log
         self.credential = None
         self.rotator = None
         self.headers = None
@@ -711,10 +735,27 @@ class _FailingRoblox:
         return egress is Egress.DIRECT, ""
 
     async def send(self, egress: Egress, out: Any) -> _EgressReply:
-        at_ms = self.clock.now_ms()
+        at_ms = self.log.clock.now_ms()
         status = 503 if at_ms < int((BASE_EPOCH + FAIL_FOR_S) * 1000) else 200
-        self.conn.execute("INSERT INTO calls (at_ms, worker, status) VALUES (?, ?, ?)", (at_ms, self.worker, status))
+        self.log.calls.append((at_ms, self.log.worker, status))
         return _EgressReply(status, httpx.Headers({"content-type": "application/json"}), b"{}")
+
+
+class _BreakerEventRecorder(_NullRecorder):
+    """`ctx.recorder` for the breaker test: keeps each breaker transition with the shared clock's time.
+
+    The upstream records a transition right after the hot.db write that made it commits, so the first `breaker_open`
+    row is when the breaker really opened for the fleet. The fifth failing call's send time is only an estimate of
+    it: that call's own bookkeeping write lands later, after the answer, and how much later depends on how busy
+    hot.db and the machine are.
+    """
+
+    def __init__(self, log: _BreakerLog) -> None:
+        self.log = log
+
+    def record_event(self, event_type: str, *args: Any, **kwargs: Any) -> None:
+        if event_type.startswith("breaker_"):
+            self.log.events.append((self.log.clock.now_ms(), self.log.worker, event_type))
 
 
 async def _breaker_worker(paths: dict[str, str], mock_path: str, name: str, mono0: float) -> None:
@@ -730,13 +771,14 @@ async def _breaker_worker(paths: dict[str, str], mock_path: str, name: str, mono
     dbs = open_databases(env)
     settings = await load_runtime_settings(dbs, clock)
     rules = await load_rules_store(dbs, clock)
+    log = _BreakerLog(name, clock)
     ctx = SimpleNamespace(
         clock=clock,
         dbs=dbs,
         settings=settings,
         rules=rules,
-        egress=_FailingRoblox(mock_path, name, clock),
-        recorder=_NullRecorder(),
+        egress=_FailingRoblox(log),
+        recorder=_BreakerEventRecorder(log),
         worker_id=name,
         tasks=None,
     )
@@ -764,6 +806,7 @@ async def _breaker_worker(paths: dict[str, str], mock_path: str, name: str, mono
         await asyncio.gather(*list(tasks), return_exceptions=True)
     finally:
         await dbs.close_all()
+        log.write(mock_path)
 
 
 def _breaker_main(paths: dict[str, str], mock_path: str, name: str, mono0: float) -> None:
@@ -797,6 +840,7 @@ def test_review_breaker_opens_and_probes_fleet_wide(paths: dict[str, str], procs
     mock = sqlite3.connect(mock_path, isolation_level=None)
     mock.execute("PRAGMA journal_mode=WAL")
     mock.execute("CREATE TABLE calls (id INTEGER PRIMARY KEY, at_ms INTEGER, worker TEXT, status INTEGER)")
+    mock.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, at_ms INTEGER, worker TEXT, type TEXT)")
     mock.close()
 
     mono0 = time.monotonic() + 1.5  # both processes start their fake time at the same instant
@@ -810,14 +854,21 @@ def test_review_breaker_opens_and_probes_fleet_wide(paths: dict[str, str], procs
 
     mock = sqlite3.connect(mock_path)
     calls = mock.execute("SELECT at_ms, worker, status FROM calls ORDER BY at_ms").fetchall()
+    opens = [row[0] for row in mock.execute("SELECT at_ms FROM events WHERE type = 'breaker_open' ORDER BY at_ms")]
     mock.close()
     assert len(calls) >= 5
     assert {call[1] for call in calls[:5]} == {"a", "b"}  # both processes fed the breaker
-    opened_at = calls[4][0]  # the fifth failure opened the breaker (a few calls may already be on the wire)
+    assert opens, "the breaker never opened"
+    # The time the breaker really opened for the fleet: the commit of the write that counted the fifth failure,
+    # recorded by the upstream right after it (`_BreakerEventRecorder`). The fifth call's own send time used to stand
+    # in for it, but that call's bookkeeping lands after its answer, so calls the still closed breaker admitted
+    # meanwhile were counted as calls through an open breaker (a flake in the review round gate).
+    opened_at = opens[0]
+    assert len([call for call in calls if call[0] <= opened_at]) >= 5  # it opened on the fifth failure, not before
     settle_ms = 1000  # fake ms (0.1 s real): calls reserved before the breaker opened may still land
     half_open_ms = opened_at + BREAKER_OPEN_S * 1000
     during = [call for call in calls if opened_at + settle_ms < call[0] < half_open_ms - 1500]
     assert during == [], f"calls while the breaker was open: {during[:5]}"
     probes = [call for call in calls if call[0] >= half_open_ms - 1500]
-    print(f"\ncalls={len(calls)} open_window_calls={len(during)} probes={probes}")
+    print(f"\ncalls={len(calls)} open_window_calls={len(during)} probes={probes} open_lag_ms={opened_at - calls[4][0]}")
     assert len(probes) == 1, probes  # one probe for the fleet; its failure reopened the breaker for 60 s

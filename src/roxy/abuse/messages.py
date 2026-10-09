@@ -14,6 +14,8 @@ How it works
     Plain constants plus small formatting helpers. Admin-authored messages (rule messages, pause and throttle-all
     reasons, ladder rungs) are used as stored after `clean_admin_message` (v1 `_clean_message`: trimmed, at most 400
     characters; reasons 300); an empty result falls back to the default text, exactly as v1 did at refusal time.
+    Pause and throttle-all reasons are also checked when they are written (`checked_state_reason`: no em or en
+    dash, plan C5), like every other admin text a caller can receive.
 
 What to read next
     `roxy/abuse/verdict.py` (how a text becomes a response body), then `roxy/abuse/checks/` (who uses which text).
@@ -24,6 +26,7 @@ from __future__ import annotations
 from typing import Final
 
 from roxy.config.constants import MAX_RULE_MESSAGE
+from roxy.rules.models import check_admin_text
 
 MAX_STATE_REASON: Final = 300
 """v1 cut pause and throttle-all reasons to 300 characters (runtime.py:526, 565)."""
@@ -85,6 +88,16 @@ def clean_admin_message(value: object, limit: int = MAX_RULE_MESSAGE) -> str:
     return str(value or "").strip()[:limit].strip()
 
 
+def checked_state_reason(value: object) -> str:
+    """A pause or throttle-all reason as the switch writers store it: cut like v1, then checked like rule messages.
+
+    The reason becomes every caller's 503 or 429 body, so plan C5 applies: `rules/models.py check_admin_text`
+    refuses an em or en dash and control characters with a ValueError (the admin API answers it as a 400, like a
+    rule message). Length is not refused: v1 cut reasons to 300 characters, and so does this.
+    """
+    return check_admin_text(clean_admin_message(value, MAX_STATE_REASON), MAX_STATE_REASON, "The reason")
+
+
 def downtime_default(setting_value: object) -> str:
     """The live `pause_message_default` cleaned like an admin message; an empty value falls back to the catalog's."""
     return clean_admin_message(setting_value, MAX_STATE_REASON) or DEFAULT_DOWNTIME_MESSAGE
@@ -118,6 +131,7 @@ __all__ = [
     "THROTTLE_FALLBACK",
     "UA_BURST_DEFAULT",
     "UA_COOLDOWN_DEFAULT",
+    "checked_state_reason",
     "clean_admin_message",
     "downtime_default",
     "throttle_fallback",

@@ -147,8 +147,10 @@ _SPECS: tuple[MetricSpec, ...] = (
         "served_upstream",
         "Served from Roblox",
         "requests",
-        "Requests answered with a fresh response from Roblox.",
-        "Sum of `requests` where outcome is `served_upstream`.",
+        "Requests answered with a fresh response from Roblox. OPTIONS requests, which Roxy answers itself without "
+        "contacting Roblox, are not counted.",
+        "Sum of `requests` where outcome is `served_upstream` and the reason is not `options_local` (the router "
+        "records a local OPTIONS answer with outcome `served_upstream`, the closest value of the closed enum).",
         _ROLLUPS,
         ("traffic#requests",),
     ),

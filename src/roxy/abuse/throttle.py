@@ -5,6 +5,8 @@ What this is
     change; `peek_per_ip` gives the `Roxy-Requests-Left` / `Roxy-Throttle-Reset` / `Roxy-Throttled` trio without
     counting. The ladder helpers (`Rung`, `ladder_from`, `rung_for`, `effective_strikes`, `decays_in`) implement
     plan 10.4, and `strike_board`, `forgive` and `throttle_watch` serve the Protection page (rows 41 and 118).
+    For plan C7, `refuse_unshared` and `peek_unshared` answer a worker whose degraded share of the limit is 0, and
+    `merge_strike_row` adds a strike or penalty earned in memory to hot.db once it can be written again.
 
 Why it exists
     v1 checked "is this IP throttled?" at the top of the request and counted the request at the bottom, in two
@@ -39,7 +41,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
-from roxy.abuse.limiter import LimiterRow, RateDecision, fixed, fixed_peek, gcra, gcra_peek
+from roxy.abuse.limiter import DegradedEntry, LimiterRow, RateDecision, fixed, fixed_peek, gcra, gcra_peek
 from roxy.storage.db import Database
 
 # --- the ladder ------------------------------------------------------------------------------------------------------
@@ -254,9 +256,12 @@ def evaluate_per_ip(policy: PerIpPolicy, row: LimiterRow, srow: StrikeRow, now_m
         new_srow = replace(srow, throttled_until=math.ceil((now_ms + penalty_ms) / 1000), exists=True)
     limiter_row: LimiterRow | None = None
     if policy.mode == "fixed" and penalty_ms > 0:
-        # The window now ends with the penalty, so a fresh allowance starts when the penalty is over (v1).
+        # The window now ends with the penalty, so a fresh allowance starts when the penalty is over (v1). The
+        # count stays at least the limit ("full"); a count already above it (a degraded worker's share, C7) is
+        # kept, so merging that row into hot.db later still adds everything it counted.
         end = now_ms + penalty_ms
-        limiter_row = replace(row, window_start=end - window_ms, count=policy.limit, tat_ms=end, exists=True)
+        full = max(row.count, policy.limit)
+        limiter_row = replace(row, window_start=end - window_ms, count=full, tat_ms=end, exists=True)
     penalty_s = math.ceil(penalty_ms / 1000)
     return PerIpResult(
         admitted=False,
@@ -285,6 +290,68 @@ def peek_per_ip(policy: PerIpPolicy, row: LimiterRow, srow: StrikeRow, now_ms: i
     else:
         remaining, reset = gcra_peek(row, policy.limit, policy.window_s, now_ms)
     return remaining, reset, False
+
+
+# --- degraded mode (plan C7) -----------------------------------------------------------------------------------------
+
+
+def unshared_wait_s(policy: PerIpPolicy) -> int:
+    """The wait a client is told when this worker's degraded share of the per-IP limit is 0: the configured pace."""
+    return max(1, math.ceil(policy.window_s / max(1, policy.limit)))
+
+
+def refuse_unshared(policy: PerIpPolicy, row: LimiterRow, srow: StrikeRow, now_ms: int) -> PerIpResult:
+    """C7 when this worker's share of the limit is 0 (`limiter.degraded_limit`): refuse without counting.
+
+    No strike and no penalty: the refusal comes from Roxy's own outage, not from anything the client did. A client
+    that is already penalized gets exactly what `evaluate_per_ip` answers a penalized client.
+    """
+    if srow.exists and srow.throttled_until * 1000 > now_ms:
+        return evaluate_per_ip(policy, row, srow, now_ms)
+    strikes = effective_strikes(srow.strikes, srow.last_strike_at, now_ms // 1000, policy.decay_s)
+    wait = unshared_wait_s(policy)
+    return PerIpResult(
+        admitted=False,
+        remaining=0,
+        reset_s=wait,
+        retry_after_s=wait,
+        throttled=True,
+        strikes=strikes,
+        rung=rung_for(policy.ladder, max(1, strikes)),
+    )
+
+
+def peek_unshared(policy: PerIpPolicy, srow: StrikeRow, now_ms: int) -> tuple[int, int, bool]:
+    """`peek_per_ip` for a worker whose degraded share is 0: nothing left here (unless a penalty says more)."""
+    penalty_until_ms = srow.throttled_until * 1000
+    if srow.exists and penalty_until_ms > now_ms:
+        return 0, int((penalty_until_ms - now_ms) // 1000), True
+    return 0, unshared_wait_s(policy), True
+
+
+def merge_strike_row(shared: StrikeRow, entry: DegradedEntry[StrikeRow], now_s: int, decay_s: float) -> StrikeRow:
+    """The shared strike row once a worker's degraded strike row is added to it (C7 recovery).
+
+    The larger decayed strike count, the later last strike, the higher rung and the later penalty end: a strike or
+    penalty earned while hot.db could not be written still counts once it can, and nothing earned elsewhere is lost.
+    """
+    memory = entry.row
+    if not memory.exists:
+        return shared
+    if not shared.exists:
+        return memory
+    strikes = max(
+        effective_strikes(shared.strikes, shared.last_strike_at, now_s, decay_s),
+        effective_strikes(memory.strikes, memory.last_strike_at, now_s, decay_s),
+    )
+    return replace(
+        shared,
+        strikes=strikes,
+        last_strike_at=max(shared.last_strike_at, memory.last_strike_at),
+        tier=max(shared.tier, memory.tier),
+        throttled_until=max(shared.throttled_until, memory.throttled_until),
+        exists=True,
+    )
 
 
 # --- admin views (rows 41 and 118) -----------------------------------------------------------------------------------
@@ -388,9 +455,13 @@ __all__ = [
     "forgive",
     "ladder_from",
     "load_strike_rows",
+    "merge_strike_row",
     "peek_per_ip",
+    "peek_unshared",
+    "refuse_unshared",
     "rung_for",
     "save_strike_rows",
     "strike_board",
     "throttle_watch",
+    "unshared_wait_s",
 ]

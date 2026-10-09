@@ -68,6 +68,12 @@ INTERNAL_ERROR_BODY = "Internal Server Error"
 INTERNAL_ERROR_RETRY_AFTER_S = 5
 HOOK_TIMEOUT_S = 2.0
 _MAX_HOOKS_PER_KIND = 16
+MAX_EVENT_PATH_CHARS = 2048
+"""How much of a path (and detail) an error event keeps, cut BEFORE redaction so the work per event is bounded.
+
+A 414 is answered before every rate limit, so its full decoded path (up to nginx's request line limit) must not
+cost more scrubbing than a page view (review findings INGRESS-1 and public-4). Cutting first is safe: a credential
+piece cut short of the 24 character window is not a leak, and a longer one before the cut is still found."""
 
 PLAIN_TEXT = "text/plain; charset=utf-8"
 JSON_TYPE = "application/json"  # what v1's jsonify sent: no charset parameter
@@ -177,17 +183,18 @@ def event_from_scope(
     """Build an `ErrorEvent` from what the middleware stack stored in `scope["state"]`.
 
     The path (and the detail, which usually repeats it) is redacted here, so no hook, log line or errors table row
-    ever holds a secret path segment such as the kill-switch token of `/admin/invalidate/<token>` (plan D9).
+    ever holds a secret path segment such as the kill-switch token of `/admin/invalidate/<token>` (plan D9). Both
+    are cut to `MAX_EVENT_PATH_CHARS` first, so the scrubbing work per event is bounded.
     """
     state = scope.get("state") or {}
     return ErrorEvent(
         status=status,
         reason=reason,
-        detail=redact_path(detail),
+        detail=redact_path(detail[:MAX_EVENT_PATH_CHARS]),
         request_id=state.get("request_id"),
         client_ip=state.get("client_ip"),
         method=str(scope.get("method", "")),
-        path=redact_path(str(scope.get("path", ""))),
+        path=redact_path(str(scope.get("path", ""))[:MAX_EVENT_PATH_CHARS]),
         user_agent=_header(scope, b"user-agent")[:512],
         exc=exc,
     )

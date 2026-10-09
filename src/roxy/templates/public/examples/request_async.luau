@@ -22,6 +22,13 @@ export type GamesResponse = {
 	data: { GameDetails },
 }
 
+-- The parts of a RequestAsync answer that this script reads.
+type HttpResponse = {
+	StatusCode: number,
+	Headers: { [string]: string },
+	Body: string?,
+}
+
 -- Header names can arrive in any letter case, so compare them in lower case.
 const function getHeader(headers: { [string]: string }, name: string): string?
 	const wanted = string.lower(name)
@@ -44,7 +51,7 @@ end
 const function fetchGame(universeId: number): GameDetails?
 	const url = `{ROXY_URL}games.roblox.com/v1/games?universeIds={universeId}`
 	for attempt = 1, MAX_ATTEMPTS do
-		const sent, response = pcall(function()
+		const sent, response = pcall(function(): HttpResponse
 			return HttpService:RequestAsync({ Url = url, Method = "GET" })
 		end)
 		if not sent then

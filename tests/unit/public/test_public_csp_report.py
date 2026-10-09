@@ -165,6 +165,23 @@ def test_field_helpers() -> None:
     assert len(page_path(long)) <= 256
 
 
+def test_page_path_scrubs_a_bounded_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review finding public-4 (defense in depth): an anonymous report's path is cut to twice the stored length
+    BEFORE it is scrubbed, so a document-uri full of `%0A` costs a bounded amount of redaction work."""
+    from roxy.public import csp_report
+
+    seen: list[int] = []
+    real = csp_report.redact_path
+
+    def counting(text: str) -> str:
+        seen.append(len(text))
+        return real(text)
+
+    monkeypatch.setattr(csp_report, "redact_path", counting)
+    assert page_path("https://roxytheproxy.com/" + "%0A" * 2700).startswith("/")
+    assert seen == [2 * csp_report.MAX_FIELD_CHARS]
+
+
 def test_report_signature_names_identical_reports_alike() -> None:
     [first] = extract_reports(LEGACY, CONTENT_TYPE_CSP_REPORT)
     [again] = extract_reports(json.loads(json.dumps(LEGACY)), CONTENT_TYPE_CSP_REPORT)

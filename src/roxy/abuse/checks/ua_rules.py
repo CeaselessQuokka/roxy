@@ -42,7 +42,7 @@ class UaRuleCheck(Check):
     uses_patterns = True
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
-        rule = match_ua_rule(facts.rules, req.user_agent, enabled=facts.bool("user_agent_rules_enabled", True))
+        rule = match_ua_rule(facts.rules, req.user_agent, enabled=facts.bool("user_agent_rules_enabled"))
         if rule is None:
             return None
         limit = ua_limit(rule, facts.limit_key)

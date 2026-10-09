@@ -26,6 +26,13 @@ export type UsernamesResponse = {
 	data: { UserByName },
 }
 
+-- The parts of a RequestAsync answer that this script reads.
+type HttpResponse = {
+	StatusCode: number,
+	Headers: { [string]: string },
+	Body: string?,
+}
+
 -- Header names can arrive in any letter case, so compare them in lower case.
 const function getHeader(headers: { [string]: string }, name: string): string?
 	const wanted = string.lower(name)
@@ -46,9 +53,10 @@ end
 
 const function lookUpUsers(usernames: { string }): { UserByName }?
 	const request: UsernamesRequest = { usernames = usernames, excludeBannedUsers = true }
-	const body = HttpService:JSONEncode(request)
 	for attempt = 1, MAX_ATTEMPTS do
-		const sent, response = pcall(function()
+		const sent, response = pcall(function(): HttpResponse
+			-- JSONEncode raises for a value JSON cannot hold, so it runs inside the pcall too.
+			const body = HttpService:JSONEncode(request)
 			return HttpService:RequestAsync({
 				Url = USERNAMES_URL,
 				Method = "POST", -- PATCH, PUT and DELETE work the same way

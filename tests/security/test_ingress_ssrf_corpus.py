@@ -395,7 +395,7 @@ def test_malformed_redirect_location_is_refused_not_raised(location: str) -> Non
     service = object.__new__(UpstreamService)  # the helper reads only its arguments
     call = SimpleNamespace(
         method="GET",
-        cfg=SimpleNamespace(allowed_hosts=DEFAULT_ALLOWED_HOSTS, strict_hosts=True),
+        cfg=SimpleNamespace(allowed_hosts=DEFAULT_ALLOWED_HOSTS, strict_hosts=True, max_url_length=4096),
         mode="caller",
         rules=None,
         rules_target="games.roblox.com/v1/games",
@@ -404,3 +404,22 @@ def test_malformed_redirect_location_is_refused_not_raised(location: str) -> Non
     current = "https://games.roblox.com/v1/games"
     target = service._redirect_url(call, Egress.DIRECT, current, exchange)  # type: ignore[arg-type]
     assert target is None
+
+
+@pytest.mark.parametrize("location", ["//[", "https://[x/", "http://[::1", "https://games.roblox.com:99999/x"])
+def test_parse_redirect_never_raises_on_a_malformed_location(location: str) -> None:
+    """`parse_redirect` keeps the module's "never raises" promise: `urljoin` raises `ValueError` for `//[`, and
+    that is the `unsafe_url` problem "unparsable URL" (or another refusal), never an exception."""
+    result = parse_redirect("https://games.roblox.com/v1/games", location)
+    assert not result.ok
+    assert result.problem is not None
+
+
+def test_parse_redirect_honors_the_live_url_length() -> None:
+    """A hop is judged with the live `max_url_length`, as a caller's own path is (review round, integrator)."""
+    location = "/v1/games?universeIds=" + "1," * 100
+    current = "https://games.roblox.com/v1/games"
+    assert parse_redirect(current, location).ok
+    refused = parse_redirect(current, location, "HEAD", max_url_length=64)
+    assert refused.problem is ReasonCode.UNSAFE_URL
+    assert refused.method == "HEAD"

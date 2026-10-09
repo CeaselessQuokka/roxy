@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import time
 
 from roxy.core.clock import FakeClock
 from roxy.scheduler.heartbeat import (
     HEARTBEAT_STALE_S,
+    REMOVE_BUSY_BUDGET_MS,
     HeartbeatReporter,
     LoopLagMonitor,
     WorkerCounters,
@@ -149,3 +151,22 @@ def test_beat_sync_and_rss(dbs, fake_clock: FakeClock) -> None:
     assert dbs.metrics.read_sync(lambda c: c.execute("SELECT count(*) FROM worker_heartbeat").fetchone()[0]) == 1
     rss = read_rss_bytes()
     assert rss is None or rss > 0
+
+
+async def test_remove_never_waits_out_a_locked_metrics_db(dbs, fake_clock: FakeClock) -> None:
+    """Review finding mp-6 (request 5): the shutdown delete of this worker's row waits at most
+    `REMOVE_BUSY_BUDGET_MS` for another process's lock, so it cannot spend the 8 s shutdown budget the final
+    metrics flush needs. The row then goes stale by itself."""
+    reporter = HeartbeatReporter(dbs.metrics, _info(31, "dev", fake_clock.now()), fake_clock, rss=lambda: None)
+    reporter.beat_sync()
+    holder = sqlite3.connect(dbs.metrics.path, isolation_level=None, timeout=30)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.monotonic()
+        await reporter.remove()  # logs heartbeat_remove_failed, never raises
+        waited = time.monotonic() - started
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert waited < REMOVE_BUSY_BUDGET_MS / 1000 + 1.0, waited
+    assert dbs.metrics.read_sync(lambda c: c.execute("SELECT count(*) FROM worker_heartbeat").fetchone()[0]) == 1

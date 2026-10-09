@@ -316,6 +316,30 @@ def socket_metering_enabled() -> bool:
     return _socket_metering_ok is not False
 
 
+def tls_context(verify: ssl.SSLContext | bool = True) -> ssl.SSLContext:
+    """The TLS context of an egress transport: certifi's CA bundle, and never a key log file (finding cred-6).
+
+    `trust_env=False` keeps httpx from reading `SSL_CERT_FILE` and `SSL_CERT_DIR`, but CPython's own
+    `ssl.create_default_context` copies the `SSLKEYLOGFILE` environment variable into `keylog_filename` (unless
+    Python runs with `-E`). With that variable left in the service environment (a debugging leftover), every TLS
+    session of the credential client would write its secrets to a file, and anyone who can read it and capture
+    traffic recovers `Cookie: .ROBLOSECURITY=<value>`. So the context is built here and its key log is switched
+    off, also on a context a test passes in (plan C2 item 2: environment settings are ignored).
+    """
+    if isinstance(verify, ssl.SSLContext):
+        context = verify
+    elif verify:
+        import certifi  # httpx's own CA bundle (a dependency of httpx)
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    else:  # verification off (loopback tests only): what httpx builds for verify=False
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    context.keylog_filename = None  # type: ignore[assignment]  # None turns key logging off (CPython docs)
+    return context
+
+
 class MeteringTransport(httpx.AsyncHTTPTransport):
     """An httpx transport whose sockets are metered. `proxy` set means a forward proxy (the rotator only)."""
 
@@ -329,9 +353,12 @@ class MeteringTransport(httpx.AsyncHTTPTransport):
         verify: ssl.SSLContext | bool = True,
         socket_metering: bool | None = None,
     ) -> None:
-        # trust_env=False: SSL_CERT_FILE, SSLKEYLOGFILE and friends from the environment are ignored, like the
-        # proxy variables on the client (plan C2 item 2).
-        super().__init__(verify=verify, trust_env=False, http1=True, http2=http2, limits=limits, proxy=proxy, retries=0)
+        # trust_env=False: SSL_CERT_FILE, SSL_CERT_DIR and the proxy variables are ignored (plan C2 item 2), and
+        # `tls_context` switches off the key log file CPython itself takes from SSLKEYLOGFILE (finding cred-6).
+        self.tls = tls_context(verify)
+        super().__init__(
+            verify=self.tls, trust_env=False, http1=True, http2=http2, limits=limits, proxy=proxy, retries=0
+        )
         self.meter = meter
         self.proxy_configured = proxy is not None
         self.mode = MeteringMode.ESTIMATE
@@ -340,6 +367,10 @@ class MeteringTransport(httpx.AsyncHTTPTransport):
         if wanted and pool is not None and hasattr(pool, "_network_backend"):
             pool._network_backend = MeteredNetworkBackend(meter)
             self.mode = MeteringMode.SOCKET
+
+    def keylog_file(self) -> str | None:
+        """The key log file this transport's TLS context writes to (None: no TLS secrets ever leave the process)."""
+        return getattr(self.tls, "keylog_filename", None)
 
     def pool_is_proxy(self) -> bool:
         """True when the connection pool forwards through a proxy (or cannot be inspected, which counts as unsafe)."""
@@ -520,4 +551,5 @@ __all__ = [
     "reset_self_test",
     "run_self_test",
     "socket_metering_enabled",
+    "tls_context",
 ]

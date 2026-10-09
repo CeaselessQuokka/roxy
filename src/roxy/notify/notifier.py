@@ -23,7 +23,9 @@ How it works
        (plan C7: alerts degrade open rather than go silent). The hourly cap still holds, at this worker's share
        (`alert_rate_limit_per_hour // ROXY_WORKERS`, at least 1), so the fleet stays within the setting; dedupe
        becomes per worker, so each worker may then send its own copy of an alert, at most once per cooldown key
-       per gap.
+       per gap. What the memory gate decided is merged into hot.db (`gate.merge`, inside the next shared
+       decision's transaction, and retried every `GATE_SYNC_RETRY_S` in the background until it lands), so the
+       shared gate counts the outage's alerts for the rest of the hour (finding mp-10).
     4. Render: every user-influenced text (summary, field names and values, the subject's parameters, a body
        override) goes through `redact_text`. The kill-switch link of the login alert is the one link that may
        carry a token (plan 17.7), so it is protected from the redaction pass that would otherwise mask it.
@@ -44,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import traceback
 from collections.abc import Coroutine
 from datetime import UTC, datetime
@@ -68,6 +71,10 @@ SEND_TIMEOUT_S = float(SMTP_TIMEOUT_S + 5)
 TASK_TIMEOUT_S = 2 * SEND_TIMEOUT_S + 5
 MAX_IN_FLIGHT = 16
 GATE_BUSY_TIMEOUT_MS = 1000
+GATE_SYNC_RETRY_S = 5.0
+"""How often the notifier retries merging what its memory gate decided into hot.db while no alert does it."""
+GATE_SYNC_GIVE_UP_S = float(gate.CAP_WINDOW_S)
+"""After this long the retry stops: the hourly window it protects is over (the next shared decision still merges)."""
 MAX_FIELDS = 12
 MAX_EVIDENCE = 5
 MAX_VALUE_CHARS = 300
@@ -208,8 +215,10 @@ class Notifier:
         self._send_timeout_s = send_timeout_s
         self._memory_gate = gate.MemoryGate()
         self._inflight: set[asyncio.Task[Any]] = set()
+        self._sync_task: asyncio.Task[None] | None = None
         self._closed = False
         self.dropped = 0  # fire-and-forget alerts dropped because MAX_IN_FLIGHT were already running
+        self.gate_merges = 0  # journals of the memory gate merged into hot.db
 
     # ------------------------------------------------------------------------------------------ settings
 
@@ -246,30 +255,46 @@ class Notifier:
 
     # ------------------------------------------------------------------------------------------ sending
 
+    def _cap(self) -> int:
+        return int(self._setting("alert_rate_limit_per_hour") or _SETTING_DEFAULTS["alert_rate_limit_per_hour"])
+
     async def _decide(self, alert: Alert, channels: list[str], now: int) -> gate.GateDecision:
         cooldown_s = self._cooldown_for(alert)
         uncapped = alert.always_send or alert.type == "leak_guard"
-        cap = int(self._setting("alert_rate_limit_per_hour") or _SETTING_DEFAULTS["alert_rate_limit_per_hour"])
+        cap = self._cap()
         if self._db is not None:
-            try:
-                decision: gate.GateDecision = await self._db.write(
-                    lambda conn: gate.decide(
-                        conn,
-                        cooldown_key=alert.cooldown_key,
-                        cooldown_s=cooldown_s,
-                        channels=channels,
-                        cap=cap,
-                        uncapped=uncapped,
-                        now=now,
-                    ),
-                    busy_timeout_ms=GATE_BUSY_TIMEOUT_MS,
+            # What the memory gate decided during an outage goes into the same transaction, BEFORE this decision,
+            # so the shared cap and dedupe count it (finding mp-10).
+            journal = self._memory_gate.take_journal()
+            reported = dict(self._memory_gate.reported)
+            share = gate.worker_share(cap, self.workers)
+
+            def merge_and_decide(conn: Any) -> tuple[gate.GateDecision, dict[str, int]]:
+                done = gate.merge(conn, journal, now=now, workers=self.workers, share=share, reported=reported)
+                decision = gate.decide(
+                    conn,
+                    cooldown_key=alert.cooldown_key,
+                    cooldown_s=cooldown_s,
+                    channels=channels,
+                    cap=cap,
+                    uncapped=uncapped,
+                    now=now,
                 )
-                return decision
+                return decision, done
+
+            try:
+                result: tuple[gate.GateDecision, dict[str, int]] = await self._db.write(
+                    merge_and_decide, busy_timeout_ms=GATE_BUSY_TIMEOUT_MS
+                )
             except Exception as exc:  # SharedStateUnavailable or a closed database: degrade open (plan C7)
+                self._memory_gate.restore_journal(journal)
                 log.warning("alert_gate_unavailable", extra={"fields": {"error": type(exc).__name__}})
+            else:
+                self._journal_merged(journal, result[1])
+                return result[0]
         # The same rules in this worker's memory: dedupe per worker (each worker may send its own copy, at most
         # once per cooldown key per gap) and this worker's share of the hourly cap, so the fleet stays within it.
-        return self._memory_gate.decide(
+        decision = self._memory_gate.decide(
             cooldown_key=alert.cooldown_key,
             cooldown_s=cooldown_s,
             channels=channels,
@@ -277,6 +302,57 @@ class Notifier:
             uncapped=uncapped,
             now=now,
         )
+        self._schedule_gate_sync()
+        return decision
+
+    def _journal_merged(self, journal: gate.GateJournal, reported: dict[str, int]) -> None:
+        self._memory_gate.merged(reported)
+        if not journal.empty():
+            self.gate_merges += 1
+            log.info("alert_gate_journal_merged", extra={"fields": {"channels": sorted(journal.sends)}})
+
+    async def sync_gate(self) -> bool:
+        """Merge what the memory gate decided into hot.db now (no alert needed). True when nothing is left."""
+        if self._db is None or self._memory_gate.journal_empty():
+            return True
+        journal = self._memory_gate.take_journal()
+        reported = dict(self._memory_gate.reported)
+        share = gate.worker_share(self._cap(), self.workers)
+        now = int(self._clock.now())
+        try:
+            done: dict[str, int] = await self._db.write(
+                lambda conn: gate.merge(conn, journal, now=now, workers=self.workers, share=share, reported=reported),
+                busy_timeout_ms=GATE_BUSY_TIMEOUT_MS,
+            )
+        except Exception:
+            self._memory_gate.restore_journal(journal)
+            return False
+        self._journal_merged(journal, done)
+        return True
+
+    def _schedule_gate_sync(self) -> None:
+        """Start the background merge retry once (it ends when the journal is merged or the notifier closes)."""
+        if self._db is None or self._closed or (self._sync_task is not None and not self._sync_task.done()):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._sync_task = loop.create_task(self._gate_sync_loop(), name="roxy:alert-gate-sync")
+
+    async def _gate_sync_loop(self) -> None:
+        """Retry `sync_gate` every `GATE_SYNC_RETRY_S`, so a worker that sends no further alert still reports its
+        outage sends (and releases its reservation) within seconds of hot.db coming back. Bounded in time."""
+        started = time.monotonic()
+        try:
+            while not self._closed and time.monotonic() - started < GATE_SYNC_GIVE_UP_S:
+                await asyncio.sleep(GATE_SYNC_RETRY_S)
+                if self._closed or await self.sync_gate():
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("alert_gate_sync_failed")
 
     async def send(self, alert: Alert) -> SendResult:
         """Gate, render and deliver one alert; returns what happened. Never raises for a delivery problem."""
@@ -370,6 +446,8 @@ class Notifier:
     async def aclose(self) -> None:
         """Stop accepting alerts, give running ones a moment, and close the webhook client."""
         self._closed = True
+        if self._sync_task is not None and not self._sync_task.done():
+            self._sync_task.cancel()
         await self.drain()
         for task in list(self._inflight):
             if not task.done():

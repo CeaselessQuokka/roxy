@@ -6,12 +6,18 @@ import io
 import json
 import logging
 import secrets
+import threading
+import time
 
 import pytest
 
 from roxy.core.logging import (
+    MAX_FIELD_CHARS,
     THIRD_PARTY_PINNED,
+    BackgroundLogWriter,
+    BackgroundStreamHandler,
     configure_logging,
+    flush_logging,
     get_logger,
     redact_fields,
     request_id_var,
@@ -157,3 +163,131 @@ def test_redact_fields_nested() -> None:
 def test_unknown_level_rejected() -> None:
     with pytest.raises(ValueError):
         configure_logging("loud", stream=io.StringIO())
+
+
+# --- background writing (finding mp-11) --------------------------------------------------------------------------
+
+
+class StalledStream(io.StringIO):
+    """A stream whose `write` waits until `release` is set, like a pipe whose reader (journald) paused."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+        self.entered = threading.Event()
+
+    def write(self, text: str) -> int:
+        self.entered.set()
+        self.release.wait(10)
+        return super().write(text)
+
+
+def test_background_logging_never_waits_for_a_stalled_stream() -> None:
+    stream = StalledStream()
+    configure_logging("info", stream=stream, background=True)
+    log = logging.getLogger("roxy.test")
+    secret = TOKEN_PREFIX + "BG" + secrets.token_hex(40).upper()
+    started = time.perf_counter()
+    for n in range(200):
+        log.warning("slow", extra={"fields": {"n": n, "cookie": secret, "note": f"value {secret}"}})
+    elapsed = time.perf_counter() - started
+    assert stream.entered.wait(2)  # the writer thread is stuck in write(), not the logging thread
+    assert elapsed < 1.0, f"200 log calls took {elapsed:.2f} s while the stream was stalled"
+    assert stream.getvalue() == ""
+    stream.release.set()
+    assert flush_logging(5.0)
+    out = lines(stream)
+    assert [line["n"] for line in out] == list(range(200))  # every line, in order
+    assert secret not in stream.getvalue()  # scrubbed before it was queued
+    assert all(line["cookie"] == MASK for line in out)
+
+
+def test_background_queue_is_bounded_and_reports_what_it_dropped() -> None:
+    stream = StalledStream()
+    writer = BackgroundLogWriter(stream, max_lines=5, max_bytes=10_000)
+    assert writer.put("first")
+    assert stream.entered.wait(2)  # the thread holds "first" and waits in write()
+    accepted = [writer.put(f"line {n}") for n in range(12)]
+    assert accepted == [True] * 5 + [False] * 7  # never waits: a full queue drops the line
+    assert writer.dropped == 7
+    stream.release.set()
+    assert writer.flush(5.0)
+    assert writer.put("after")
+    assert writer.flush(5.0)
+    text = stream.getvalue().splitlines()
+    assert text[0] == "first"
+    report = json.loads(text[1])  # reported before the next batch, as soon as the stream takes lines again
+    assert (report["event"], report["count"], report["level"]) == ("log_lines_dropped", 7, "warning")
+    assert text[2:] == ["line 0", "line 1", "line 2", "line 3", "line 4", "after"]
+    assert writer.close(1.0)
+    assert not writer.put("closed")
+
+
+def test_background_queue_is_bounded_by_bytes_too() -> None:
+    stream = StalledStream()
+    writer = BackgroundLogWriter(stream, max_lines=100, max_bytes=100)
+    assert writer.put("a" * 60)
+    assert stream.entered.wait(2)  # taken by the thread, which waits in write()
+    assert writer.put("b" * 60)
+    assert not writer.put("c" * 60)  # 120 characters would be waiting
+    assert (writer.pending(), writer.dropped) == (1, 1)
+    stream.release.set()
+    assert writer.close(5.0)
+
+
+def test_flush_and_close_wait_at_most_their_timeout() -> None:
+    stream = StalledStream()
+    writer = BackgroundLogWriter(stream)
+    writer.put("stuck")
+    assert stream.entered.wait(2)
+    started = time.perf_counter()
+    assert not writer.flush(0.2)
+    assert not writer.close(0.2)
+    assert time.perf_counter() - started < 1.0
+    stream.release.set()  # let the thread finish its write and end
+
+
+def test_a_broken_stream_is_counted_never_raised() -> None:
+    stream = io.StringIO()
+    stream.close()
+    writer = BackgroundLogWriter(stream)
+    assert writer.put("lost")
+    assert writer.flush(2.0)
+    assert writer.write_errors == 1
+    writer.close(1.0)
+
+
+def test_background_lines_carry_the_request_id_of_the_logging_task() -> None:
+    stream = io.StringIO()
+    configure_logging("info", stream=stream, background=True)
+    token = request_id_var.set("01REQUESTIDFORBACKGROUND00")
+    try:
+        logging.getLogger("roxy.test").info("inside")
+    finally:
+        request_id_var.reset(token)
+    assert flush_logging(2.0)
+    assert lines(stream)[0]["request_id"] == "01REQUESTIDFORBACKGROUND00"
+
+
+def test_replacing_a_background_handler_stops_its_writer() -> None:
+    first = io.StringIO()
+    old = configure_logging("info", stream=first, background=True)
+    logging.getLogger("roxy.test").info("one")
+    configure_logging("info", stream=io.StringIO(), background=True)
+    assert isinstance(old, BackgroundStreamHandler)
+    assert [line["event"] for line in lines(first)] == ["one"]  # written before the old handler stopped
+    thread = old.writer._thread
+    assert thread is not None
+    thread.join(2)
+    assert not thread.is_alive()
+
+
+def test_long_fields_are_cut_before_redaction() -> None:
+    stream = io.StringIO()
+    configure_logging("info", stream=stream)
+    secret = TOKEN_PREFIX + "LONG" + secrets.token_hex(40).upper()
+    logging.getLogger("roxy.test").info("big", extra={"fields": {"path": f"/x {secret} " + "a" * 100_000}})
+    path = str(lines(stream)[0]["path"])
+    assert len(path) < MAX_FIELD_CHARS + 40
+    assert path.endswith("chars]")
+    assert secret not in path

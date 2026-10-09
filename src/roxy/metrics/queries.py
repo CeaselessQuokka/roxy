@@ -90,7 +90,12 @@ MEASURES: tuple[tuple[str, str], ...] = (
         "sum(CASE WHEN d.outcome != 'refused' AND d.reason_code != 'options_local' AND d.source != 'internal' "
         "THEN r.requests ELSE 0 END)",
     ),
-    ("served_upstream", "sum(CASE WHEN d.outcome = 'served_upstream' THEN r.requests ELSE 0 END)"),
+    # A local OPTIONS answer is recorded as `served_upstream` (the closest outcome of the closed enum) with reason
+    # `options_local`; nothing went to Roblox, so it is not "Served from Roblox" (P6, finding spec-7).
+    (
+        "served_upstream",
+        "sum(CASE WHEN d.outcome = 'served_upstream' AND d.reason_code != 'options_local' THEN r.requests ELSE 0 END)",
+    ),
     ("served_cache", "sum(CASE WHEN d.outcome = 'served_cache' THEN r.requests ELSE 0 END)"),
     ("refused", "sum(CASE WHEN d.outcome = 'refused' THEN r.requests ELSE 0 END)"),
     ("failed", "sum(CASE WHEN d.outcome = 'failed' THEN r.requests ELSE 0 END)"),

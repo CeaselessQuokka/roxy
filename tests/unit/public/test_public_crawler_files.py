@@ -135,6 +135,24 @@ def test_live_limits_texts(catalog_get: Callable[..., Callable[[str], Any]]) -> 
     assert "network" not in shared.place_limit_scope
 
 
+def test_live_limits_retry_and_emergency_texts(catalog_get: Callable[..., Callable[[str], Any]]) -> None:
+    """The home page's retry sentence follows the strike settings (review finding public-7), and the emergency
+    limit reads like the normal one, singular for one (the status page states it while throttle-all is on)."""
+    default = pages.live_limits(catalog_get())
+    assert default.retry_strikes is True
+    assert default.retry_rule == "Wait that many seconds; retrying sooner makes the wait longer."
+    assert default.emergency_text == "1 request every 60 seconds"  # catalog defaults 1 / 60
+    no_retry = pages.live_limits(catalog_get(throttle_strike_on_retry=0))
+    assert no_retry.retry_strikes is False
+    assert "retrying sooner" not in no_retry.retry_rule
+    assert "going over the limit again makes the next wait longer" in no_retry.retry_rule
+    off = pages.live_limits(catalog_get(throttle_escalation_enabled=0))  # retry strikes need escalation
+    assert off.retry_strikes is False
+    assert off.retry_rule == "Wait that many seconds: requests sent sooner are refused."
+    other = pages.live_limits(catalog_get(global_throttle_limit=3, global_throttle_period=1))
+    assert other.emergency_text == "3 requests every 1 second"
+
+
 def test_number_formatting() -> None:
     assert pages.fmt_int(1234567) == "1,234,567"
     assert pages.fmt_number(5.0) == "5"

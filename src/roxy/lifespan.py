@@ -24,8 +24,10 @@ How it works
     before upstream, cache and abuse (each keeps a reference to it), upstream before the cache (the cache fetches
     through it), and the abuse pipeline last, because the proxy route answers 503 `degraded` until `ctx.abuse`
     exists, so a half-built worker never serves. Shutdown therefore stops the abuse loops first, flushes the
-    cache, stops upstream, then flushes the recorder synchronously (after its loop has stopped, so the final
-    write sees every number), closes the egress clients and finally the notifier.
+    cache, stops upstream, then runs the recorder's final flush (after its loop has stopped, so the final write
+    sees every number; `MetricsRecorder.aclose`, which never blocks the loop and gives a locked metrics.db only
+    what is left of the budget), closes the egress clients, the notifier and the databases (also within the
+    budget), and last waits, on a thread, for the background log writer to write what it still holds.
     Stopping has a time limit from outside: gunicorn kills a worker `graceful_timeout` (30 s) after asking it to
     stop. Two things keep the shutdown inside it. First, `begin_drain` (called by `roxy.worker` as soon as uvicorn
     starts shutting down, before it waits for open requests) drops readiness and wakes every tarpit hold, so held
@@ -77,7 +79,7 @@ from roxy import __version__
 from roxy.config.env import EnvSettings, removed_env_vars_present
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.core.iphash import ip_hash, load_ip_hash_key
-from roxy.core.logging import configure_logging, set_ip_hasher
+from roxy.core.logging import configure_logging, flush_logging, set_ip_hasher
 from roxy.core.redact import SecretRegistry
 from roxy.core.tasks import TaskSupervisor
 
@@ -115,6 +117,13 @@ clients and databases) must fit in this. `roxy.worker` sets uvicorn's graceful w
 
 SHUTDOWN_MIN_STEP_S = 0.1
 """A step still gets this long when the budget is spent (a healthy loop stops in milliseconds)."""
+
+DB_CLOSE_TIMEOUT_S = 5.0
+"""How long shutdown waits for the databases to close, at most (cut to what is left of the budget). Their writer
+threads finish the job they run first; a close that takes longer goes on in its thread while the worker exits."""
+
+LOG_FLUSH_TIMEOUT_S = 1.0
+"""How long the last shutdown step waits for the background log writer to write queued lines (with the budget)."""
 
 _shutdown_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "roxy_shutdown_deadline", default=None
@@ -158,6 +167,29 @@ def begin_drain(app: Any) -> None:
 async def _stop_tasks(tasks: TaskSupervisor) -> None:
     """Shutdown step: drain one-shot jobs within what is left of the budget, then cancel every task."""
     await tasks.stop(drain_timeout_s=shutdown_time_left(TASK_DRAIN_TIMEOUT_S))
+
+
+async def _close_recorder(recorder: MetricsRecorder) -> None:
+    """Shutdown step: the final metrics flush, within what is left of the budget (finding mp-6).
+
+    `MetricsRecorder.aclose` never blocks the event loop and gives every write the remaining budget as its busy
+    budget, so a metrics.db locked by another process costs this step's share of the budget, not SQLite's 5 s per
+    write; what cannot be written in time is lost (metrics degrade open, plan C7).
+    """
+    recorder_mod = optional_import("roxy.metrics.recorder")
+    cap = float(getattr(recorder_mod, "FINAL_FLUSH_MAX_S", 4.0))
+    try:
+        await recorder.aclose(budget_s=shutdown_time_left(cap))
+    except Exception:
+        log.exception("recorder_close_failed")
+
+
+async def _close_databases(dbs: Databases) -> None:
+    """Shutdown step (the last of the stack): close every database within what is left of the budget."""
+    try:
+        await asyncio.wait_for(dbs.close_all(), timeout=shutdown_time_left(DB_CLOSE_TIMEOUT_S))
+    except TimeoutError:
+        log.warning("databases_close_timeout", extra={"fields": {"timeout_s": DB_CLOSE_TIMEOUT_S}})
 
 
 CACHE_INIT_LEASE = "cache_init"
@@ -373,7 +405,7 @@ async def _open_databases(env: EnvSettings, stack: AsyncExitStack) -> Databases 
         log.warning("storage_not_built", extra={"fields": {"step": "databases"}})
         return None
     dbs = cast("Databases", db_module.open_databases(env))
-    stack.push_async_callback(dbs.close_all)
+    stack.push_async_callback(_close_databases, dbs)
     return dbs
 
 
@@ -644,8 +676,8 @@ async def _start_egress(ctx: AppContext, stack: AsyncExitStack) -> None:
 def _start_recorder(ctx: AppContext, stack: AsyncExitStack) -> None:
     """Step "recorder": the metrics recorder and its flush loop (P7, `metrics/recorder.py`).
 
-    `close` (a synchronous final flush) is registered BEFORE the loop, so on shutdown the loop stops first and the
-    final write then contains every number, including the minute still open.
+    The final flush (`_close_recorder`, budgeted, never blocking the loop) is registered BEFORE the loop, so on
+    shutdown the loop stops first and the final write then contains every number, including the minute still open.
     """
     recorder_mod = optional_import("roxy.metrics.recorder")
     if recorder_mod is None or ctx.dbs is None:
@@ -653,7 +685,7 @@ def _start_recorder(ctx: AppContext, stack: AsyncExitStack) -> None:
         return
     recorder = recorder_mod.build_recorder(ctx)
     ctx.recorder = recorder
-    stack.callback(recorder.close)
+    stack.push_async_callback(_close_recorder, recorder)
     _start_loop(ctx, stack, "metrics_flush", recorder.run)
     accounting = getattr(ctx.egress, "accounting", None)
     if accounting is not None:
@@ -781,7 +813,8 @@ async def _startup(app: FastAPI, env: EnvSettings, clock: Clock, stack: AsyncExi
     with _step(steps, "env"):
         removed = removed_env_vars_present()
     with _step(steps, "logging"):
-        configure_logging(env.log_level, static_fields={"color": env.color, "pid": os.getpid()})
+        # background=True: lines are written by a thread, so a slow journald never freezes the event loop (mp-11).
+        configure_logging(env.log_level, static_fields={"color": env.color, "pid": os.getpid()}, background=True)
         log.info(
             "worker_starting",
             extra={"fields": {"worker_id": worker_id, "env": env.env, "color": env.color, "version": __version__}},
@@ -854,15 +887,20 @@ def build_lifespan(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _shutdown_deadline.set(None)  # a lifespan run again in the same task starts without an old deadline
-        async with AsyncExitStack() as stack:
-            ctx = await startup(app, env, clock or SYSTEM_CLOCK, stack)
-            try:
-                yield
-            finally:
-                ctx.ready = False  # readiness drops first, so the deploy gate stops sending work here
-                # Every cleanup below shares one budget, so the whole shutdown fits in gunicorn's graceful_timeout.
-                _shutdown_deadline.set(time.monotonic() + SHUTDOWN_BUDGET_S)
-                log.info("worker_stopping", extra={"fields": {"worker_id": ctx.worker_id}})
-        log.info("worker_stopped", extra={"fields": {"worker_id": ctx.worker_id}})
+        try:
+            async with AsyncExitStack() as stack:
+                ctx = await startup(app, env, clock or SYSTEM_CLOCK, stack)
+                try:
+                    yield
+                finally:
+                    ctx.ready = False  # readiness drops first, so the deploy gate stops sending work here
+                    # Every cleanup below shares one budget, so the whole shutdown fits in gunicorn's graceful_timeout.
+                    _shutdown_deadline.set(time.monotonic() + SHUTDOWN_BUDGET_S)
+                    log.info("worker_stopping", extra={"fields": {"worker_id": ctx.worker_id}})
+            log.info("worker_stopped", extra={"fields": {"worker_id": ctx.worker_id}})
+        finally:
+            # Last: the lines the background writer still holds (the shutdown's own included) reach the journal
+            # within what is left of the budget; waited for on a thread, never on the loop.
+            await asyncio.to_thread(flush_logging, shutdown_time_left(LOG_FLUSH_TIMEOUT_S))
 
     return lifespan

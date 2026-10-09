@@ -10,6 +10,7 @@ publish retries, and taking over this worker's own finished but unpublished flig
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -27,6 +28,7 @@ from roxy.upstream.singleflight import (
     OutcomeKind,
     Role,
     SingleFlight,
+    _Publish,
 )
 
 
@@ -572,3 +574,167 @@ async def test_hooked_try_lead_skips_a_live_lease(hot: Database, other_hot: Data
     assert led is not None
     assert led.role is Role.OWNER
     assert refresh.calls == 1
+
+
+# --- followers look in the owner's store when its outcome is late (plan 6.9 step 4, finding mp-12) -------------
+
+
+class StoreLook:
+    """A follower's `check`: records each look and answers once `stored` is set (or only on the final look)."""
+
+    def __init__(self, *, final_only: bool = False, broken: bool = False) -> None:
+        self.looks: list[bool] = []
+        self.stored = asyncio.Event()
+        self.final_only = final_only
+        self.broken = broken
+        self.answer = FlightOutcome(OutcomeKind.STORED, status=200, entry_id="s" * 24, stored_at=1)
+
+    async def __call__(self, final: bool) -> FlightOutcome | None:
+        self.looks.append(final)
+        if self.broken:
+            raise RuntimeError("cache.db is gone")
+        if self.final_only and not final:
+            return None
+        return self.answer if self.stored.is_set() else None
+
+
+def _never_publishes(side: SingleFlight, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def busy(*_args: Any) -> None:
+        raise SharedStateUnavailable("hot", "database is locked")
+
+    monkeypatch.setattr(side, "_publish_once", busy)
+
+
+@pytest.mark.parametrize("hooked", [True, False], ids=["hooked", "claimed"])
+async def test_follower_finds_the_answer_in_the_owners_store_when_no_outcome_is_published(
+    hot: Database, other_hot: Database, monkeypatch: pytest.MonkeyPatch, hooked: bool
+) -> None:
+    """The owner stored its answer but its publish never lands (hot.db busy, then its worker went away): the
+    follower elsewhere still gets the stored answer from the store, long before its own wait would end."""
+    owner_side = _flight(hot, "w1")
+    follower_side = SingleFlight(
+        other_hot,
+        SystemClock(),
+        "w2",
+        poll_start_s=0.01,
+        poll_max_s=0.05,
+        store_check_after_s=0.1,
+        store_check_every_s=0.05,
+    )
+    _never_publishes(owner_side, monkeypatch)
+    gate = asyncio.Event()
+    owner_fetch = Hooked(hot, SystemClock(), _shared(body=b"stored too"), gate=gate) if hooked else Counter(gate=gate)
+    owner = asyncio.create_task(owner_side.run("k", owner_fetch, owner_deadline_s=30, wait_s=30, hooked=hooked))
+    await owner_fetch.entered.wait()
+    look = StoreLook()
+    follower_fetch = Hooked(other_hot, SystemClock()) if hooked else Counter()
+    follower = asyncio.create_task(
+        follower_side.run("k", follower_fetch, owner_deadline_s=30, wait_s=20, hooked=hooked, check=look)
+    )
+    await asyncio.sleep(0.3)
+    assert look.looks  # it looks while the row says "in progress" ...
+    assert not any(look.looks)  # ... never as the final look, and finds nothing yet
+    gate.set()
+    await owner
+    look.stored.set()  # the owner's tail wrote cache.db; its publish keeps failing
+    result = await asyncio.wait_for(follower, 2)
+    assert result.role is Role.FOLLOWER
+    assert result.outcome == look.answer
+    assert follower_fetch.calls == 0  # never upstream
+    assert follower_side.stats.store_answers == 1
+    row = lease_row(hot)
+    assert row is not None
+    assert _parse_outcome(row[2]) is None  # the row still looks in progress: the answer came from the store
+    await owner_side.close(grace_s=0.1)
+
+
+def _parse_outcome(text: str | None) -> FlightOutcome | None:
+    doc = json.loads(text or "{}")
+    return FlightOutcome.from_doc(doc.get("o"))
+
+
+async def test_followers_do_not_look_in_the_store_while_the_owner_answers_in_time(
+    hot: Database, other_hot: Database
+) -> None:
+    """A flight shorter than `STORE_CHECK_AFTER_S` (the normal case) costs its followers no store read."""
+    owner_side, follower_side = _flight(hot, "w1"), _flight(other_hot, "w2")
+    gate = asyncio.Event()
+    owner_fetch = Hooked(hot, SystemClock(), _shared(body=b"published"), gate=gate)
+    owner = asyncio.create_task(owner_side.run("k", owner_fetch, owner_deadline_s=10, wait_s=10, hooked=True))
+    await owner_fetch.entered.wait()
+    look = StoreLook()
+    follower = asyncio.create_task(
+        follower_side.run(
+            "k", Hooked(other_hot, SystemClock()), owner_deadline_s=10, wait_s=10, hooked=True, check=look
+        )
+    )
+    await asyncio.sleep(0.1)
+    gate.set()
+    await owner
+    result = await asyncio.wait_for(follower, 2)
+    assert result.outcome is not None
+    assert result.outcome.body == b"published"
+    assert look.looks == []
+    assert follower_side.stats.store_answers == 0
+
+
+async def test_follower_looks_in_the_store_once_more_before_it_times_out(hot: Database, other_hot: Database) -> None:
+    """Plan 6.9 step 5 only after a last look: a short wait (shorter than `STORE_CHECK_AFTER_S`) still finds an
+    answer the owner stored without publishing it; with nothing there, it is the usual TIMEOUT."""
+    owner_side, follower_side = _flight(hot, "w1"), _flight(other_hot, "w2")
+    gate = asyncio.Event()
+    owner_fetch = Counter(gate=gate)
+    owner = asyncio.create_task(owner_side.run("k", owner_fetch, owner_deadline_s=30, wait_s=30))
+    await owner_fetch.entered.wait()
+    found = StoreLook(final_only=True)
+    found.stored.set()
+    result = await follower_side.run("k", Counter(), owner_deadline_s=30, wait_s=0.2, check=found)
+    assert result.role is Role.FOLLOWER
+    assert result.outcome == found.answer
+    assert found.looks == [True]
+    empty = StoreLook()
+    nothing = await follower_side.run("k", Counter(), owner_deadline_s=30, wait_s=0.2, check=empty)
+    assert nothing.role is Role.TIMEOUT
+    assert empty.looks == [True]
+    gate.set()
+    await owner
+
+
+async def test_a_failing_store_look_is_nothing_found(hot: Database, other_hot: Database) -> None:
+    owner_side, follower_side = _flight(hot, "w1"), _flight(other_hot, "w2")
+    gate = asyncio.Event()
+    owner_fetch = Counter(gate=gate)
+    owner = asyncio.create_task(owner_side.run("k", owner_fetch, owner_deadline_s=30, wait_s=30))
+    await owner_fetch.entered.wait()
+    broken = StoreLook(broken=True)
+    result = await follower_side.run("k", Counter(), owner_deadline_s=30, wait_s=0.2, check=broken)
+    assert result.role is Role.TIMEOUT  # the store is disposable: a broken look never fails the request
+    assert broken.looks == [True]
+    assert follower_side.stats.store_answers == 0
+    gate.set()
+    await owner
+
+
+async def test_a_canceled_publish_never_leaves_an_unretrieved_exception(
+    hot: Database, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shutdown cancels a tail while its shielded publish is still being written; when that write then fails,
+    nobody awaits it. Its exception must still be consumed, or asyncio logs "Task exception was never retrieved"
+    at error level on every recycle while hot.db is busy."""
+    side = _flight(hot, "w1")
+
+    async def slow_refusal(*_args: Any, **_kwargs: Any) -> Any:
+        await asyncio.sleep(0.1)
+        raise SharedStateUnavailable("hot", "database is locked")
+
+    monkeypatch.setattr(hot, "write", slow_refusal)
+    publish = _Publish(LEASE_PREFIX + "k", json.dumps({"f": "x"}), "x", SystemClock().now_ms() + 10_000)
+    task = asyncio.create_task(side._publish_once(publish, _shared()))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.2)  # the shielded write fails after its awaiter is gone
+    gc.collect()
+    await asyncio.sleep(0)
+    assert not [r for r in caplog.records if "never retrieved" in r.getMessage()]
