@@ -26,6 +26,13 @@ How it works
       transaction, so it carries exactly what a genuine throttle refusal for that client would carry right now.
     - Settings missing from the snapshot fall back to the catalog default (`Facts.setting`), never to a second,
       inline copy of the default.
+    - Rule hits: a check whose decision rests on an admin rule row (an endpoint block, an endpoint rate rule, a
+      header filter, a User-Agent rule, a bypass, deny list or ban entry) reports that row with
+      `facts.note_match(table, row_id)` when it matches, whatever the verdict. The pipeline copies `facts.matches`
+      onto the verdict (`Allow.matches`, `Refuse.matches`) and hands it to the metrics recorder in memory, so the
+      hits ride on the single abuse transaction's request and cost no I/O of their own (FILTER-REMOVE,
+      SEC-BYPASS-FOREVER, plan 10.9 per-rule hit counts). One match per table per request (each table has one
+      winning row per request).
 
 What to read next
     `roxy/abuse/checks/__init__.py` (the ordered list), then `roxy/abuse/pipeline.py` (the transaction).
@@ -58,6 +65,22 @@ from roxy.rules.store import RulesSnapshot
 
 Algo = Literal["gcra", "fixed", "cooldown", "per_ip"]
 
+TABLE_ENDPOINT_BLOCK = "rules_endpoint_block"
+TABLE_ENDPOINT_LIMIT = "rules_endpoint_limit"
+TABLE_HEADER_RULE = "rules_header"
+TABLE_UA_RULE = "rules_user_agent"
+TABLE_ACCESS_LIST = "access_list"
+TABLE_BANS = "bans"
+MATCH_TABLES = (
+    TABLE_ACCESS_LIST,
+    TABLE_BANS,
+    TABLE_UA_RULE,
+    TABLE_HEADER_RULE,
+    TABLE_ENDPOINT_BLOCK,
+    TABLE_ENDPOINT_LIMIT,
+)
+"""The control.db tables whose rows the checks report as matched (`Facts.note_match`; `rules/models.py` names)."""
+
 
 def live_setting(values: Mapping[str, Any], key: str) -> Any:
     """`values[key]`, or the catalog default when the snapshot lacks the key (never an inline second default)."""
@@ -83,6 +106,16 @@ class Facts:
     probe_signature: str | None = None
     score_cache: int | None = None
     pairs_cache: list[tuple[str, str]] | None = None
+    matches: dict[str, str] = field(default_factory=dict)  # control.db table -> the row this request matched
+
+    def note_match(self, table: str, row_id: Any, *, decisive: bool = False) -> None:
+        """A rule row of `table` matched this request (module docstring, "Rule hits"). Memory only, no I/O.
+
+        The first row noted for a table stays, unless a later one is `decisive` (it decided the verdict): a deny
+        entry that refuses an address a bypass entry also covers is the access list row this request counts for.
+        """
+        if row_id is not None and (decisive or table not in self.matches):
+            self.matches[table] = str(row_id)
 
     # `setting` and `flag` come first: below them `int`, `bool` and `str` name methods inside the class body.
     def setting(self, key: str) -> Any:
@@ -300,6 +333,13 @@ def redisguise(refusal: Refuse, tx: TxState) -> Refuse:
 
 
 __all__ = [
+    "MATCH_TABLES",
+    "TABLE_ACCESS_LIST",
+    "TABLE_BANS",
+    "TABLE_ENDPOINT_BLOCK",
+    "TABLE_ENDPOINT_LIMIT",
+    "TABLE_HEADER_RULE",
+    "TABLE_UA_RULE",
     "Algo",
     "Check",
     "Facts",

@@ -1,0 +1,22 @@
+# roxy-backup-request.path: starts the root backup when one is asked for ("back up now", plan 14.1 and 17.5).
+#
+# The service and scripts/ctl.py run as the unprivileged roxy user, which may not start units (plan 9.14). To ask
+# for a backup they write /var/lib/roxy/backup-request (a small JSON file, renamed into place); this path unit
+# then starts roxy-backup.service, the same service the nightly timer starts. backup.sh takes the request file away
+# first thing, so one request is one run and the watch cannot loop; a request made while a backup runs starts one
+# more run after it. A requested run within 10 minutes of the last good backup is skipped (backup.sh records that
+# in audit/backup.json), so a flood of requests cannot keep the server busy with backups.
+
+[Unit]
+# Shown in `systemctl list-units`.
+Description=Start a Roxy backup when one is requested
+
+[Path]
+# Fires while the request file exists, including one written while this unit was not watching (after a reboot).
+PathExists=/var/lib/roxy/backup-request
+# The root backup service to start.
+Unit=roxy-backup.service
+
+[Install]
+# Watch from boot on.
+WantedBy=paths.target

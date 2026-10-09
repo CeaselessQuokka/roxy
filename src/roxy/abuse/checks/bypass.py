@@ -11,7 +11,7 @@ Why it exists
 
 How it works
     Looks the IP up in the snapshot's bypass CIDR index (expiry checked at lookup time). The live feed shows
-    `Bypass: true` from the same flag.
+    `Bypass: true` from the same flag. The matching entry is reported as a rule hit (`facts.note_match`).
 
 What to read next
     `roxy/abuse/bypass.py` (what bypass skips and why), then `roxy/abuse/checks/flood.py`.
@@ -21,8 +21,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from roxy.abuse.bypass import is_bypassed
-from roxy.abuse.checks.base import Check, Facts, LimitSpec
+from roxy.abuse.bypass import bypass_entry
+from roxy.abuse.checks.base import TABLE_ACCESS_LIST, Check, Facts, LimitSpec
 from roxy.abuse.verdict import Refuse
 
 
@@ -33,8 +33,10 @@ class BypassCheck(Check):
     kind = "marker"
 
     def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
-        if is_bypassed(facts.rules, facts.ip, facts.now):
+        entry = bypass_entry(facts.rules, facts.ip, facts.now)
+        if entry is not None:
             req.bypass = True
+            facts.note_match(TABLE_ACCESS_LIST, entry.id)  # the entry's hit (SEC-BYPASS-FOREVER "last hit")
         return None
 
 

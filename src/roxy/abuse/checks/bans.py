@@ -20,6 +20,8 @@ How it works
     - Every ban hit is counted in memory and flushed to `bans.hits` in batches. Tarpit category `ban`, never for a
       caller on the bypass list (the pipeline marks bypass before any check, so the router knows it whichever check
       refuses).
+    - The matching ban or deny list entry is also reported as a rule hit (`facts.note_match`), so the per-minute
+      hit history covers it like every other admin rule row.
 
 What to read next
     `roxy/abuse/bans.py`, then `roxy/abuse/checks/bypass.py` (the next check).
@@ -30,7 +32,15 @@ from __future__ import annotations
 from typing import Any
 
 from roxy.abuse.bans import find_ban
-from roxy.abuse.checks.base import Check, Facts, LimitSpec, disguised_throttle, refusal_headers
+from roxy.abuse.checks.base import (
+    TABLE_ACCESS_LIST,
+    TABLE_BANS,
+    Check,
+    Facts,
+    LimitSpec,
+    disguised_throttle,
+    refusal_headers,
+)
 from roxy.abuse.messages import ACCESS_DENIED, REASON_BAN, REASON_DENY
 from roxy.abuse.verdict import Refuse
 from roxy.core.reasons import ReasonCode
@@ -48,11 +58,13 @@ class BansCheck(Check):
         )
         if ban is not None:
             facts.services.ban_hits.record(ban.id, int(facts.now))
+            facts.note_match(TABLE_BANS, ban.id)
             return self._refuse(
                 facts, ReasonCode.BANNED, REASON_BAN.format(subject_type=ban.subject_type, subject=ban.subject)
             )
         deny = facts.rules.access.deny.match(facts.ip, facts.now) if facts.ip else None
         if deny is not None:
+            facts.note_match(TABLE_ACCESS_LIST, deny.id, decisive=True)  # it refuses, even over a bypass entry
             return self._refuse(facts, ReasonCode.DENY_LIST, REASON_DENY.format(cidr=deny.cidr))
         return None
 

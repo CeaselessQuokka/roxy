@@ -6,10 +6,12 @@ What this is
     texts, settings (`setting`), the rule tables (`rules`, `rule_rows`, `cache_rule_for`, `bucket_limit`), hot.db
     state (cooldowns, breakers, bucket fill), the insight history tables (bucket history, worker samples, cache
     evictions, rule hits, error occurrences, upstream attempts), events, egress usage, anomalies, recent config
-    changes, the latest health run and the credential's metadata. `InsightProviders` is the seam for facts that
-    have no table (disk sizes, DNS answers and the address classifier, tarpit totals, bot scores, the UA
-    experiment, the metrics drop counter, egress metering mode, and `x_` extras); `DefaultProviders` is the
-    production implementation and the fixture harness supplies its own.
+    changes, the latest health run and the credential's metadata, plus the producer history of schema version 5
+    (rule hits per minute, tarpit statistics, recorded bot scores: `rule_hit_counts`, `tarpit_summary`,
+    `recorded_scores`). `InsightProviders` is the seam for facts the fixtures give directly (disk sizes and growth,
+    DNS answers and the address classifier, tarpit totals, bot scores, the UA experiment, the metrics drop counter,
+    egress metering mode, and `x_` extras); `DefaultProviders` is the production implementation and the fixture
+    harness supplies its own.
 
 Why it exists
     Rules must be pure decisions over data (plan 11.1): no rule opens a database, writes anything, or knows how a
@@ -23,6 +25,12 @@ How it works
       result is bounded by the read model it comes from (plan P9).
     - `settings` is the immutable `SettingsSnapshot` of the run and `rules` the `RulesSnapshot`, so all rules of
       one run see the same configuration.
+    - `DefaultProviders` reads what the producers recorded (`metrics/read_producers.py`): tarpit totals and the
+      arrival gaps after a hold and after an instant refusal for the last hour (TARPIT-TUNE), the latest recorded
+      bot score of every client seen in the last 25 hours (ABUSE-BOT, THROTTLE-TUNE, ABUSE-DIST), the items every
+      worker dropped in the last hour (SYS-METRICS-DROP; one worker's lifetime counter only when the table cannot
+      be read), and disk growth, table sizes and rollup rows per minute from the hourly disk samples (SYS-DISK).
+      Each answer is kept `PROVIDER_MEMO_S` seconds, so the rules of one run that ask the same seam cost one read.
 
 What to read next
     `roxy/insights/rules/base.py` (how rules use this), `roxy/metrics/queries.py` and `roxy/metrics/read_history.py`
@@ -32,9 +40,11 @@ What to read next
 from __future__ import annotations
 
 import asyncio
+import copy
 import ipaddress
 import logging
-import os
+import sqlite3
+import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,10 +55,11 @@ from roxy.cache.policy import select_rule
 from roxy.config import read_changes
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.egress import read_credential
-from roxy.metrics import queries, read_history
+from roxy.metrics import disk_history, queries, read_history, read_producers
 from roxy.metrics.queries import Page, Window
 from roxy.rules.models import RULE_TABLES, CacheRuleRow
 from roxy.rules.service import fetch_all
+from roxy.storage.db import SharedStateUnavailable
 from roxy.upstream import breaker, buckets, cooldowns
 from roxy.upstream.buckets import endpoint_bucket_key, host_bucket_key
 
@@ -59,6 +70,17 @@ T = TypeVar("T")
 MAX_GROUPS: Final = 10_000
 """Most groups `by()` returns (40 pages of 250): far above the 2,000-template vocabulary (plan 6.2)."""
 _PAGE: Final = 250
+DAY_S: Final = 86_400
+PROVIDER_MEMO_S: Final = 10.0
+"""How long `DefaultProviders` keeps an answer (one evaluation run asks the same seam from several rules)."""
+TARPIT_WINDOW_S: Final = 3600
+"""TARPIT-TUNE reads the tarpit totals of the last hour (fixture README `state.tarpit`)."""
+PIPELINE_WINDOW_S: Final = 3600
+"""SYS-METRICS-DROP counts the items every worker dropped in the last hour (fixture README)."""
+SCORE_WINDOW_S: Final = 25 * 3600
+"""Recorded bot scores of clients seen in the last 25 hours (THROTTLE-TUNE reads 24 h; one hour of margin)."""
+DIMS_WINDOW_DAYS: Final = 7
+"""SYS-DISK `dims_per_minute_7d_avg`: the mean over the disk samples of the last 7 days."""
 
 
 # --------------------------------------------------------------------------------------------- providers
@@ -118,8 +140,13 @@ class InsightProviders:
 
 
 class DefaultProviders(InsightProviders):
-    """Production providers: what a worker can measure itself. Anything else stays unknown (None) until the
-    module that owns it adds a table or a provider (the fixture format does not change when it does)."""
+    """Production providers: what a worker can measure itself, plus what the producers recorded in metrics.db
+    (module docstring). A fact nothing records stays unknown (None); the fixture format does not change when a
+    module starts recording one.
+
+    `dbs` (the worker's `Databases`) and `clock` default to the recorder's, so `InsightsEngine.from_context` needs
+    no change to read the producer history.
+    """
 
     def __init__(
         self,
@@ -128,37 +155,120 @@ class DefaultProviders(InsightProviders):
         db_paths: Mapping[str, Path] | None = None,
         recorder: Any = None,
         dns_timeout_s: float = 2.0,
+        dbs: Any = None,
+        clock: Clock | None = None,
+        memo_s: float = PROVIDER_MEMO_S,
     ) -> None:
         self.state_dir = state_dir
         self.db_paths = dict(db_paths or {})
         self.recorder = recorder
         self.dns_timeout_s = dns_timeout_s
+        self.dbs = dbs if dbs is not None else getattr(recorder, "dbs", None)
+        self.clock: Clock = clock or getattr(recorder, "clock", None) or SYSTEM_CLOCK
+        self.memo_s = float(memo_s)
+        self._memo: dict[str, tuple[float, Any]] = {}
+
+    # ---- helpers ----
+
+    async def _remember(self, name: str, make: Callable[[], Awaitable[T]]) -> T:
+        """`make()`, kept `memo_s` seconds (monotonic), so the rules of one run asking one seam cost one read."""
+        found = self._memo.get(name)
+        moment = time.monotonic()
+        if found is not None and moment - found[0] < self.memo_s:
+            return found[1]  # type: ignore[no-any-return]
+        value = await make()
+        self._memo[name] = (moment, value)
+        return value
+
+    async def _read_metrics(self, fn: Callable[[Any], T]) -> T | None:
+        """`fn(conn)` on a metrics.db reader, or None when there is no database or it cannot answer (a table a
+        newer migration adds, a locked or missing file): a provider then says "not known here"."""
+        db = getattr(self.dbs, "metrics", None)
+        if db is None:
+            return None
+        try:
+            return await db.read(fn)  # type: ignore[no-any-return]
+        except (SharedStateUnavailable, sqlite3.Error) as exc:
+            log.debug("insights_provider_read_failed", extra={"fields": {"error": f"{type(exc).__name__}: {exc}"}})
+            return None
+
+    # ---- disk (SYS-DISK) ----
 
     def _disk_now(self) -> dict[str, Any] | None:
         if self.state_dir is None:
             return None
-        stat = os.statvfs(self.state_dir)
-        files: dict[str, dict[str, int]] = {}
-        for name, path in self.db_paths.items():
-            size = path.stat().st_size if path.exists() else 0
-            wal = Path(f"{path}-wal")
-            files[f"{name}.db"] = {"bytes": size, "wal_bytes": wal.stat().st_size if wal.exists() else 0}
-        for folder in ("exports", "snapshots"):
-            directory = self.state_dir / folder
-            if directory.is_dir():
-                total = sum(p.stat().st_size for p in directory.rglob("*") if p.is_file())
-                files[folder] = {"bytes": total, "wal_bytes": 0}
+        measure = disk_history.measure_files(self.state_dir, self.db_paths)
         return {
-            "total_bytes": stat.f_blocks * stat.f_frsize,
-            "free_bytes": stat.f_bavail * stat.f_frsize,
-            "files": files,
+            "total_bytes": measure.total_bytes,
+            "free_bytes": measure.free_bytes,
+            "files": measure.files,
             "tables": {},
             "growth": [],
         }
 
-    async def disk(self) -> dict[str, Any] | None:
+    async def _disk(self) -> dict[str, Any] | None:
         # stat() calls touch the disk: on a thread, never on the event loop (AGENT_BRIEF).
-        return await asyncio.to_thread(self._disk_now)
+        current = await asyncio.to_thread(self._disk_now)
+        if current is None:
+            return None
+        now = self.clock.now()
+        since = int(now - disk_history.GROWTH_DAYS * DAY_S)
+        week = int(now - DIMS_WINDOW_DAYS * DAY_S)
+        history = await self._read_metrics(
+            lambda conn: (
+                read_producers.disk_growth(conn, since),
+                read_producers.latest_table_sizes(conn),
+                read_producers.rollup_rows_avg(conn, week),
+            )
+        )
+        if history is None:
+            return current
+        growth, tables, dims = history
+        storage = sum(int(v.get("bytes") or 0) + int(v.get("wal_bytes") or 0) for v in current["files"].values())
+        if growth and now - float(growth[0]["at"]) >= disk_history.MIN_GROWTH_SPAN_S:
+            # The samples plus a point now that equals today's storage (the fixture README growth shape).
+            current["growth"] = [*growth, {"at": int(now), "total_bytes": storage}]
+        current["tables"] = dict(tables.get("tables") or {})
+        current["tables_sampled_at"] = tables.get("at")
+        current["dims_per_minute_7d_avg"] = dims
+        return current
+
+    async def disk(self) -> dict[str, Any] | None:
+        return copy.deepcopy(await self._remember("disk", self._disk))  # a rule may change its copy
+
+    # ---- tarpit (TARPIT-TUNE) ----
+
+    async def _tarpit(self) -> dict[str, Any] | None:
+        now = int(self.clock.now())
+        summary = await self._read_metrics(
+            lambda conn: read_producers.tarpit_summary(conn, now - TARPIT_WINDOW_S, now + 1)
+        )
+        if summary is None:
+            return None
+        return {
+            "eligible_holds": summary["eligible"],
+            "skipped": summary["skipped"],
+            "holds": summary["holds"],
+            "gap_with_hold_s": summary["gap_after_hold_s"],
+            "gap_without_hold_s": summary["gap_after_instant_s"],
+            "mean_hold_s": summary["mean_hold_s"],
+            "p95_hold_s": summary["p95_hold_s"],
+            "by_category": summary["by_category"],
+            "window_s": TARPIT_WINDOW_S,
+        }
+
+    async def tarpit(self) -> dict[str, Any] | None:
+        return copy.deepcopy(await self._remember("tarpit", self._tarpit))
+
+    # ---- bot scores (ABUSE-BOT, THROTTLE-TUNE, ABUSE-DIST) ----
+
+    async def _scores(self) -> dict[str, float]:
+        since = int(self.clock.now()) - SCORE_WINDOW_S
+        found = await self._read_metrics(lambda conn: read_producers.client_scores(conn, since))
+        return {ip: float(value) for ip, value in (found or {}).items()}
+
+    async def client_scores(self) -> dict[str, float]:
+        return dict(await self._remember("scores", self._scores))
 
     async def dns(self, host: str) -> dict[str, Any] | None:
         loop = asyncio.get_running_loop()
@@ -170,7 +280,10 @@ class DefaultProviders(InsightProviders):
         answers = sorted({str(info[4][0]) for info in infos})
         return {"answers": answers, "latency_ms": round((loop.time() - started) * 1000, 1), "error": None}
 
-    async def metrics_pipeline(self) -> dict[str, Any] | None:
+    # ---- metrics drops (SYS-METRICS-DROP) ----
+
+    def _worker_drops(self) -> dict[str, Any] | None:
+        """The fallback: this worker's lifetime counter (scope `worker`), when the fleet table cannot be read."""
         stats = getattr(self.recorder, "stats", None)
         if stats is None:
             return None
@@ -178,6 +291,25 @@ class DefaultProviders(InsightProviders):
             return {"dropped": int(stats().get("metrics_dropped", 0)), "scope": "worker"}
         except Exception:
             return None
+
+    async def _pipeline(self) -> dict[str, Any] | None:
+        now = int(self.clock.now())
+        drops = await self._read_metrics(
+            lambda conn: read_producers.pipeline_drops(conn, now - PIPELINE_WINDOW_S, now + 1)
+        )
+        if drops is None:
+            return self._worker_drops()
+        return {
+            "dropped": drops["dropped"],
+            "scope": "fleet",
+            "window_s": PIPELINE_WINDOW_S,
+            "history_dropped": drops["history_dropped"],
+            "capture_dropped": drops["capture_dropped"],
+            "workers": len(drops["workers"]),
+        }
+
+    async def metrics_pipeline(self) -> dict[str, Any] | None:
+        return copy.deepcopy(await self._remember("pipeline", self._pipeline))
 
 
 # ----------------------------------------------------------------------------------------------- context
@@ -388,6 +520,27 @@ class InsightContext:
         hits = await self.rule_hits(table)
         entry = hits.get((table, str(key)))
         return None if entry is None else entry.get("last_hit_at")
+
+    # ---- producer history (metrics/read_producers.py, schema version 5) ----
+
+    async def rule_hit_counts(self, window: Window, table: str | None = None) -> dict[tuple[str, str], int]:
+        """`{(table, rule key): hits}` in the window, from the per-minute rule hit history (plan 10.9)."""
+        return await self._metrics(
+            ("rule_hit_counts", window, table),
+            lambda c: read_producers.rule_hit_counts(c, window.start, window.end, table),
+        )
+
+    async def tarpit_summary(self, window: Window) -> dict[str, Any]:
+        """Tarpit holds, skips, mean and p95 hold and arrival gaps in the window (`read_producers.tarpit_summary`)."""
+        return await self._metrics(
+            ("tarpit_summary", window), lambda c: read_producers.tarpit_summary(c, window.start, window.end)
+        )
+
+    async def recorded_scores(self, since: float) -> dict[str, int]:
+        """`{client address: bot score}` recorded since `since` (each client's latest hour)."""
+        return await self._metrics(
+            ("recorded_scores", int(since)), lambda c: read_producers.client_scores(c, int(since))
+        )
 
     async def error_signatures(self) -> list[dict[str, Any]]:
         return await self._metrics(("error_signatures",), read_history.error_signatures)

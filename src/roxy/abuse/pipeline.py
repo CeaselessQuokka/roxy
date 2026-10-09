@@ -3,8 +3,8 @@
 What this is
     `AbusePipeline.evaluate(req) -> Allow | Refuse` (DESIGN.md 7 and 11.5), the object stored at `ctx.abuse`, plus
     `install(ctx, stack)`, the lifespan hook that builds it, loads the admin switches and starts its background loops
-    (spam flush every second, switch refresh every second, ban hit flush every 5 s). It also owns the tarpit
-    (`pipeline.tarpit`), the spam detectors, the bot tracker and the per-worker statistics.
+    (spam flush every second, switch refresh every second, ban hit flush every 5 s, bot scores every minute). It
+    also owns the tarpit (`pipeline.tarpit`), the spam detectors, the bot tracker and the per-worker statistics.
 
 Why it exists
     v1 ran its checks inline in one long handler and touched its throttle file several times per request (and
@@ -41,7 +41,12 @@ How it works
        refusal): content is never served to a filtered request. The answer stays the throttle refusal (v1's order).
     5. Afterwards (memory only): statistics, spam detector and bot tracker observations, aggregated metrics events
        (`ua_rule_hit`, `throttle_tier`), `record_throttled` for a client that just became throttled, and a ladder ban
-       if a rung with action `ban` was reached.
+       if a rung with action `ban` was reached. Rule hits: every admin rule row the request matched (the checks
+       report them with `Facts.note_match`; bypass is resolved in step 0) is copied onto the verdict (`matches`) and
+       handed to the metrics recorder, which sums them per rule and minute in memory and writes them with its
+       batch flush. No hot.db or metrics.db write is added to the request.
+    Bot scores: the tracker marks each client seen; the `abuse_bot_scores` loop scores the marked clients once a
+    minute off the request path and records them per client and hour (plan 10.7; ABUSE-BOT, THROTTLE-TUNE).
     C7: if the transaction raises `SharedStateUnavailable`, the same walk runs on per-worker memory with every limit
     divided by the live fleet (`ROXY_WORKERS`, or more when the heartbeats show more workers, as during a blue/green
     deploy), logged once per streak as degraded. The shares add up to at most the limit (C6): `limit // workers`,
@@ -74,11 +79,20 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Final
 
 from roxy.abuse.bans import BanHits, create_ladder_ban
-from roxy.abuse.bot import ClientTracker, has_game_server_signature, query_fingerprint
-from roxy.abuse.bypass import is_bypassed
+from roxy.abuse.bot import SIGNALS, ClientTracker, has_game_server_signature, query_fingerprint
+from roxy.abuse.bypass import bypass_entry
 from roxy.abuse.challenge import challenge_key
 from roxy.abuse.checks import default_checks
-from roxy.abuse.checks.base import Check, Facts, LimitOutcome, LimitSpec, TxState, live_setting, trio_headers
+from roxy.abuse.checks.base import (
+    TABLE_ACCESS_LIST,
+    Check,
+    Facts,
+    LimitOutcome,
+    LimitSpec,
+    TxState,
+    live_setting,
+    trio_headers,
+)
 from roxy.abuse.checks.probe import probe_signature
 from roxy.abuse.limiter import (
     DegradedEntry,
@@ -114,7 +128,7 @@ from roxy.abuse.verdict import Allow, Refuse, Verdict, raw_path, request_target
 from roxy.core.client_ip import limit_key as compute_limit_key
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.core.reasons import ReasonCode
-from roxy.metrics.recorder import note_rule_hit
+from roxy.metrics.recorder import note_client_scores, note_rule_hits
 from roxy.rules.match import regex_budget
 from roxy.rules.service import RulesService
 from roxy.rules.store import RulesSnapshot
@@ -144,6 +158,15 @@ MERGE_CLOSE_WAIT_S: Final = 2.0
 """At shutdown, how long the last merge of degraded rows may take (inside the lifespan's 8 s budget)."""
 FLEET_REFRESH_INTERVAL_S: Final = HEARTBEAT_INTERVAL_S
 """How often the live fleet size (the C7 divisor) is read back from the heartbeats."""
+BOT_SCORE_INTERVAL_S: Final = 60.0
+"""How often the bot scores of the clients seen since the last run are recorded (per client and hour in
+metrics.db; the readers ask about the last hour or day, so a minute of delay costs nothing)."""
+MAX_SCORES_PER_RUN: Final = 5000
+"""Clients scored per run at most (plan P9); the rest keep their mark for the next run, newest first."""
+SCORE_CHUNK: Final = 250
+"""Clients scored between two yields to the event loop (each score is tens of microseconds)."""
+CLOSE_SCORE_LIMIT: Final = 1000
+"""Scores recorded at shutdown at most (inside the lifespan's shutdown budget)."""
 
 Shared = tuple[dict[str, LimiterRow], dict[str, StrikeRow]]
 """Limiter rows and strike rows as read from hot.db (a seed for degraded mode, an input for the prediction)."""
@@ -393,7 +416,9 @@ class AbusePipeline:
         self.monotonic = monotonic
         self.checks: list[Check] = sorted(checks or default_checks(), key=lambda check: check.position)
         self.switches = SwitchesCache(control_db)
-        self.tarpit = Tarpit(settings, hot_db, clock, worker_id, sleep=tarpit_sleep, monotonic=monotonic, rng=rng)
+        self.tarpit = Tarpit(
+            settings, hot_db, clock, worker_id, sleep=tarpit_sleep, monotonic=monotonic, rng=rng, recorder=recorder
+        )
         self.spam = SpamDetectors(
             settings, hot_db, clock, control_db=control_db, rules_service=rules_service, events=self._event
         )
@@ -519,8 +544,10 @@ class AbusePipeline:
         now = self.clock.now()
         now_ms = self.steady_now_ms()  # limiter time never steps back inside this worker
         facts = self._facts(req, values, rules, now, now_ms)
-        if not getattr(req, "bypass", False) and is_bypassed(rules, facts.ip, now):
+        entry = None if getattr(req, "bypass", False) else bypass_entry(rules, facts.ip, now)
+        if entry is not None:
             req.bypass = True  # step 0: known before bans refuse, so a bypass caller is never held (plan 10.6)
+            facts.note_match(TABLE_ACCESS_LIST, entry.id)  # the entry's hit, whichever check decides
         bypass = bool(getattr(req, "bypass", False))
         with regex_budget():  # every pattern match of this request shares one time budget (plan 9.9)
             prep = _Prep()
@@ -538,6 +565,7 @@ class AbusePipeline:
             if serve_cached and refused is not None and self._later_check_refuses(req, facts, refused, prep, tx):
                 refused.allow_fresh_cache_serve = False  # never serve content to a request a filter refuses
         verdict: Verdict = refused if refused is not None else Allow(headers=trio_headers(tx))
+        verdict.matches = dict(facts.matches)  # the rule rows this request matched, whatever the verdict
         self._after(req, facts, tx, verdict)
         return verdict
 
@@ -1016,7 +1044,10 @@ class AbusePipeline:
             self._aggregate(
                 UA_RULE_HIT_EVENT, {"rule_id": rule_id, "result": "allowed" if ua.admitted else "refused"}, facts
             )
-            note_rule_hit(self.recorder, "rules_user_agent", rule_id)  # last hit per rule row (FILTER-REMOVE)
+        if facts.matches:
+            # Every rule row this request matched (blocks, rate rules, header and User-Agent rules, bypass, deny and
+            # ban entries): per rule per minute in memory, flushed by the recorder (FILTER-REMOVE, SEC-BYPASS-FOREVER).
+            note_rule_hits(self.recorder, facts.matches, at_s=int(facts.now))
         per_ip = next((o.per_ip for o in tx.outcomes.values() if o.per_ip is not None), None)
         if per_ip is not None and per_ip.new_strike and per_ip.rung.index:
             tier = per_ip.rung.index
@@ -1053,6 +1084,10 @@ class AbusePipeline:
                 refused=refused,
                 probe=probe,
                 query_fp=query_fingerprint(str(getattr(req, "template", "") or ""), query),
+                ip=facts.ip,
+                user_agent=str(getattr(req, "user_agent", "") or ""),
+                game_server=facts.game_server,
+                header_names=getattr(req, "header_names_in_order", None) or (),
             )
 
     def _ladder_ban(self, limit_key: str, minutes: int, rung: int, now: int) -> None:
@@ -1115,12 +1150,37 @@ class AbusePipeline:
             return 0
         return await self.ban_hits.flush(self.control_db)
 
+    async def record_bot_scores(self, *, limit: int = MAX_SCORES_PER_RUN) -> int:
+        """Background loop: score the clients seen since the last run and hand the scores to the metrics recorder.
+
+        Off the request path (plan 10.7 scores, recorded for ABUSE-BOT, THROTTLE-TUNE and ABUSE-DIST): at most
+        `limit` clients per run, scored in chunks of `SCORE_CHUNK` with a yield to the event loop between chunks, so
+        a busy minute never stalls requests. Each address behind a client key gets the key's score. Returns how many
+        scores were recorded (0 without a recorder: the marks are still cleared, so memory stays bounded).
+        """
+        values = self._values()
+        weights = {name: float(live_setting(values, f"bot_weight_{name}")) for name in SIGNALS}
+        now = self.clock.now()
+        recorded = 0
+        left = max(0, int(limit))
+        while left > 0:
+            batch = self.bot.take_scores(now=now, weights=weights, limit=min(SCORE_CHUNK, left))
+            if not batch:
+                break
+            left -= len(batch)
+            recorded += note_client_scores(
+                self.recorder, [(ip, item.score) for item in batch for ip in item.ips], at_s=now
+            )
+            await asyncio.sleep(0)  # let requests run between chunks
+        return recorded
+
     def start(self, tasks: Any) -> None:
         """Start the background loops on the worker's `TaskSupervisor`."""
         tasks.start("abuse_spam_flush", self.spam.flush, interval_s=SPAM_FLUSH_INTERVAL_S)
         tasks.start("abuse_switches", self.switches.refresh_if_changed, interval_s=SWITCH_REFRESH_INTERVAL_S)
         tasks.start("abuse_ban_hits", self.flush_ban_hits, interval_s=BAN_HITS_FLUSH_INTERVAL_S)
         tasks.start("abuse_fleet_size", self.refresh_fleet_size, interval_s=FLEET_REFRESH_INTERVAL_S)
+        tasks.start("abuse_bot_scores", self.record_bot_scores, interval_s=BOT_SCORE_INTERVAL_S)
 
     async def aclose(self) -> None:
         """Shutdown: flush what is buffered and merge degraded rows into hot.db (best effort), wait for bans."""
@@ -1129,6 +1189,11 @@ class AbusePipeline:
                 await flush()
             except Exception:
                 log.exception("abuse_close_flush_failed")
+        try:
+            # The scores of clients seen since the last run; the recorder's final flush (after this) writes them.
+            await self.record_bot_scores(limit=CLOSE_SCORE_LIMIT)
+        except Exception:
+            log.exception("abuse_close_scores_failed")
         if self._merge_task is not None and not self._merge_task.done():
             await asyncio.wait({self._merge_task}, timeout=MERGE_CLOSE_WAIT_S)
         if len(self._memory_rows) or len(self._memory_strikes):

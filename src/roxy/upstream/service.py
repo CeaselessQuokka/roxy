@@ -31,7 +31,8 @@ How it works (one fetch)
        dot segment) and, on the credential path, whose decoded path the allowlist grants; a Location that does
        not parse or pass is simply not followed. A CSRF retry is recorded for the Upstream page (`record_retry`,
        row 117).
-    5. Classify (`status.py`), apply the side effects in at most one more hot.db transaction (`effects.py`, skipped
+    5. Classify (`status.py`; `pages.py` flags a challenge or an HTML page on a JSON endpoint on the call's trace
+       record, for UP-CHALLENGE), apply the side effects in at most one more hot.db transaction (`effects.py`, skipped
        for a plain success), then: log Roblox 429s (`record_upstream_429`), rotate a burned rotator session, lower
        the attributed bucket rate, set the credential cooldown, and decide by the 7.9 table whether to retry.
     6. Retry only 5xx, timeouts and connect errors, up to `upstream_max_attempts` in total, after a decorrelated
@@ -79,7 +80,7 @@ from roxy.metrics.recorder import note_attempts, note_reservation
 from roxy.proxy.validate import parse_redirect
 from roxy.rules.match import regex_budget
 from roxy.storage.db import Database, SharedStateUnavailable
-from roxy.upstream import aimd, breaker, buckets, cooldowns, csrf, deadlines, messages, routing
+from roxy.upstream import aimd, breaker, buckets, cooldowns, csrf, deadlines, messages, pages, routing
 from roxy.upstream.adaptive import (
     AdaptiveController,
     AdaptivePolicy,
@@ -454,6 +455,12 @@ def template_for(host: str, path: str) -> str:
         with contextlib.suppress(Exception):
             return str(fn(host, path))
     return f"{host}{path}"
+
+
+def _exit_label(egress: Egress, session_id: str | None) -> str:
+    """The exit a rotator call used, as the short hash the trace shows (`""` for the other egresses): a session id
+    selects an exit IP, so it is never stored verbatim (EGR-POOL-BURNED counts calls per exit)."""
+    return short_hash(session_id) if egress is Egress.ROTATOR and session_id else ""
 
 
 def is_roblox_https_url(url: str, allowed: frozenset[str] | None = None) -> bool:
@@ -1457,6 +1464,7 @@ class UpstreamService:
                 error=f"{type(exc).__name__}: {exc}",
                 csrf_retry=csrf_retry,
                 redirect_hop=hop,
+                exit_id=_exit_label(egress, session_id),
             )
             return _Exchange(kind, error=type(exc).__name__, session_id=session_id)
         elapsed = float(getattr(response, "elapsed_ms", 0.0) or (self._mono() - started) * 1000)
@@ -1467,6 +1475,17 @@ class UpstreamService:
         state.upstream_ms += elapsed
         state.bytes_in += int(getattr(response, "bytes_in", 0) or 0)
         state.bytes_out += int(getattr(response, "bytes_out", 0) or 0)
+        body_bytes = bytes(response.body or b"")
+        # A challenge, or an HTML page where the endpoint answers JSON (UP-CHALLENGE): a few header lookups and at
+        # most a short slice of the body, counted per attempt by the metrics recorder.
+        page = pages.classify_page(
+            call.host if hop == 0 else (urlsplit(url).hostname or call.host),
+            status,
+            lowered,
+            body_bytes,
+            accept=str((getattr(call.req, "headers", None) or {}).get("accept", "")),
+        )
+        returned_session = getattr(response, "session_id", None)
         call.trace.record_call(
             egress=egress.value,
             kind=kind.value,
@@ -1476,13 +1495,15 @@ class UpstreamService:
             csrf_retry=csrf_retry,
             redirect_hop=hop,
             queue_wait_ms=state.queue_wait_ms,
+            challenge=page.challenge,
+            html_body=page.html_body,
+            exit_id=_exit_label(egress, str(returned_session) if returned_session else session_id),
         )
-        returned_session = getattr(response, "session_id", None)
         return _Exchange(
             kind,
             status=status,
             headers=lowered,
-            body=bytes(response.body or b""),
+            body=body_bytes,
             session_id=str(returned_session) if returned_session else session_id,
         )
 

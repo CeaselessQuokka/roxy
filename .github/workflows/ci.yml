@@ -1,9 +1,26 @@
-# Continuous integration for Roxy v2 (plan 9.14 and 17.4).
+# Continuous integration for Roxy v2 (plan 9.14, 17.4, 19.9 and the 19.10 acceptance rows).
 #
-# What runs: ruff (lint and format), mypy, pytest (unit, integration, security), the writing style check
-# (scripts/check_style.py on the v2 tree and on REMAKE_PLAN.md), the generated settings reference check
-# (scripts/gen_settings_docs.py --check), bandit, pip-audit and gitleaks.
-# How: uv installs exactly what uv.lock pins (`uv sync --frozen`), so CI tests what production runs.
+# What runs (one job each, in parallel):
+#   lint              ruff (lint and format), mypy, the generated settings reference (gen_settings_docs --check),
+#                     the LLM export schema (regenerated and compared, then checked as a draft 2020-12 schema) and the
+#                     v1 parity table (gen_v1_parity --check: every v1 check mapped, every cited test id collected)
+#   style             scripts/check_style.py on the repository and on REMAKE_PLAN.md, and the tests that check
+#                     rendered pages (public pages, sign-in pages, the user guide, the design system)
+#   unit              tests/unit, tests/health, tests/insights and every other suite without a job of its own
+#   integration       tests/integration
+#   multiprocess      tests/multiprocess (real gunicorn masters with 1, 2 and 4 workers)
+#   security          tests/security and bandit (medium severity or higher fails)
+#   migration         tests/migration (the v1 migrator against fixture trees)
+#   deploy            tests/deploy: the deploy.sh sandbox, units, nginx, wrappers, backups, alerts (plan 19.9)
+#   shellcheck        every deploy shell script (plan 19.9: the v1 backtick bug is what this finds)
+#   config-lint       `nginx -t` with the distro nginx of Ubuntu 22.04 (1.18) and 24.04 (1.24), and
+#                     `systemd-analyze verify` of the units on 24.04, each inside that release's container (19.10 row 17)
+#   e2e               the Playwright suite (design system, CSP spike, axe checks, the public site)
+#   dependency-audit  pip-audit: fails on a known vulnerability that has a fixed version; its counts are this
+#                     workflow's outputs, which deploy.yml hands to deploy.sh for health check H-VERSION
+#   gitleaks          the commits of this push or pull request are scanned for secrets (plan C4)
+# How: uv installs exactly what uv.lock pins (`uv sync --frozen`), so CI tests what production runs. The conftest
+# socket guard fails any test that opens a non-loopback connection (plan 19.12); no test reaches a real service.
 # Hardening: every third-party action is pinned by full commit SHA (a tag can be moved, a commit cannot), the
 # token can only read the repository, and checkout does not leave credentials in .git/config.
 # Main is checked by deploy.yml, which calls this workflow before its (disabled) deploy job, so pushes to main do
@@ -17,6 +34,16 @@ on:
     branches-ignore:
       - main
   workflow_call:
+    outputs:
+      advisories:
+        description: Known advisories in the locked dependencies (pip-audit), recorded at deploy for H-VERSION
+        value: ${{ jobs.dependency-audit.outputs.advisories }}
+      advisories_fixable:
+        description: How many of those have a fixed version (CI fails when this is not zero)
+        value: ${{ jobs.dependency-audit.outputs.fixable }}
+      advisory_ids:
+        description: Their ids, comma separated (at most 50)
+        value: ${{ jobs.dependency-audit.outputs.ids }}
 
 permissions:
   contents: read
@@ -24,12 +51,14 @@ permissions:
 env:
   UV_VERSION: "0.12.23"
   PYTHON_VERSION: "3.12"
+  # Tests never write bytecode next to the sources (the release ships compiled bytecode instead).
+  PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
   lint:
-    name: Lint, types and style
+    name: Lint, types and generated files
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -47,39 +76,31 @@ jobs:
         run: uv run --frozen ruff format --check src tests scripts
       - name: Mypy
         run: uv run --frozen mypy
-      - name: Writing style (v2 tree)
-        run: uv run --frozen python scripts/check_style.py
-      - name: Writing style (REMAKE_PLAN.md, the P0 gate)
-        run: uv run --frozen python scripts/check_style.py REMAKE_PLAN.md
+      - name: Mypy (operator scripts)
+        run: uv run --frozen mypy --strict --follow-imports=silent scripts/ctl.py scripts/shadow_report.py
       - name: Settings reference is current (docs/SETTINGS.md, plan 15.2)
         run: uv run --frozen python scripts/gen_settings_docs.py --check
-
-  test:
-    name: Tests
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: ${{ env.UV_VERSION }}
-          python-version: ${{ env.PYTHON_VERSION }}
-          enable-cache: true
-      - name: Install locked dependencies
-        run: uv sync --frozen
-      - name: Pytest (unit, integration, security)
-        # Only the suites that exist yet; the conftest socket guard blocks every non-loopback connection.
+      - name: LLM export schema is current and a valid draft 2020-12 schema (plan 12.4)
         run: |
-          suites=""
-          for suite in tests/unit tests/integration tests/security; do
-            if [ -d "$suite" ]; then suites="$suites $suite"; fi
-          done
-          uv run --frozen pytest $suites
+          uv run --frozen python -m roxy.insights.llm_export --write-schema "$RUNNER_TEMP/llm_export.v1.schema.json"
+          diff -u src/roxy/insights/schema/llm_export.v1.schema.json "$RUNNER_TEMP/llm_export.v1.schema.json"
+          uv run --frozen python - <<'PY'
+          import json
 
-  security:
-    name: Bandit and pip-audit
+          import jsonschema
+
+          path = "src/roxy/insights/schema/llm_export.v1.schema.json"
+          with open(path, encoding="utf-8") as handle:
+              schema = json.load(handle)
+          jsonschema.Draft202012Validator.check_schema(schema)
+          assert schema["properties"]["schema_version"]["const"] == "roxy.llm_export/1"
+          print(f"{path}: a valid draft 2020-12 schema")
+          PY
+      - name: v1 parity table is complete (tests/V1_PARITY.md, plan 19.11)
+        run: uv run --frozen python scripts/gen_v1_parity.py --check
+
+  style:
+    name: Writing style (repository and rendered pages)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -93,29 +114,328 @@ jobs:
           enable-cache: true
       - name: Install locked dependencies
         run: uv sync --frozen
+      - name: Writing style (v2 tree)
+        run: uv run --frozen python scripts/check_style.py
+      - name: Writing style (REMAKE_PLAN.md, the P0 gate)
+        run: uv run --frozen python scripts/check_style.py REMAKE_PLAN.md
+      - name: Writing style (rendered pages, plan 19.8)
+        # These tests render real pages with the app and run them through roxy/core/style_guard.py, which loads
+        # the same word list as check_style.py. The browser-rendered gallery is checked in the e2e job.
+        run: >-
+          uv run --frozen pytest -q -p no:cacheprovider
+          tests/integration/test_public_pages.py::test_no_dash_characters_in_rendered_pages
+          tests/unit/admin_auth/test_admin_auth_pages.py::test_auth_pages_obey_the_csp_and_the_writing_style
+          tests/unit/public/test_public_guide.py::test_guide_source_passes_the_style_check
+          tests/unit/ui/test_ui_static.py::test_design_system_files_pass_the_style_check
+
+  unit:
+    name: Unit tests (and every suite without a job of its own)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Pytest (unit, health checks, recommendation rules, the LLM export, and any new suite)
+        # Everything under tests/ except the suites the jobs below run, so a new test directory runs here by
+        # default instead of silently never running in CI. tests/load runs on the staging VM (plan 19.4).
+        run: >-
+          uv run --frozen pytest -p no:cacheprovider tests
+          --ignore=tests/integration --ignore=tests/multiprocess --ignore=tests/security --ignore=tests/migration
+          --ignore=tests/deploy --ignore=tests/e2e --ignore=tests/load
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Pytest (integration, respx mock Roblox)
+        run: uv run --frozen pytest -p no:cacheprovider tests/integration
+
+  multiprocess:
+    name: Multi-process tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Pytest (real gunicorn masters, shared SQLite state, plan 19.3)
+        run: uv run --frozen pytest -p no:cacheprovider tests/multiprocess
+
+  security:
+    name: Security tests and bandit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Pytest (security, including the plan 19.5 credential suite)
+        run: uv run --frozen pytest -p no:cacheprovider tests/security
       - name: Bandit (fail on medium severity or higher)
         run: uv run --frozen bandit -c pyproject.toml -r src -ll
+
+  migration:
+    name: Migration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Pytest (the v1 migrator against fixture trees, plan 19.6)
+        run: uv run --frozen pytest -p no:cacheprovider tests/migration
+
+  deploy:
+    name: Deploy sandbox tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install the tools the deploy tests drive (shellcheck, zstd, age, the distro nginx)
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends shellcheck zstd age nginx
+          # The tests run their own nginx in a private prefix; the system one is not needed running.
+          sudo systemctl stop nginx || true
+      - name: Allow unprivileged user namespaces (the live tests run inside `unshare -rn`, loopback only)
+        # Ubuntu 24.04 restricts them through AppArmor; without this the namespaced tests skip themselves.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Pytest (deploy.sh sandbox, units, nginx, wrappers, backups, alerts; plan 19.9)
+        run: uv run --frozen pytest -p no:cacheprovider -rs tests/deploy
+
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends shellcheck
+      - name: Shellcheck the deploy scripts (every severity, plan 19.9)
+        run: |
+          shellcheck --version
+          shellcheck --severity=style deploy/deploy.sh deploy/deploy_rollback.sh deploy/install-system.sh \
+            deploy/tools/backup.sh
+
+  config-lint:
+    name: nginx -t and systemd-analyze (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 ships nginx 1.18 (no `http2 on`, no `ssl_reject_handshake`); the template renders for it.
+          - image: ubuntu:22.04
+            nginx: "1.18"
+            nginx_env: ROXY_TEST_NGINX_118
+            nginx_root: nginx118root
+            systemd: false
+          # Ubuntu 24.04 (the production server) ships nginx 1.24 and systemd 255.
+          - image: ubuntu:24.04
+            nginx: "1.24"
+            nginx_env: ROXY_TEST_NGINX
+            nginx_root: nginxroot
+            systemd: true
+    container:
+      image: ${{ matrix.image }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install the distro nginx (and systemd, for systemd-analyze)
+        env:
+          WITH_SYSTEMD: ${{ matrix.systemd }}
+        run: |
+          apt-get update
+          packages="nginx ca-certificates git"
+          if [ "$WITH_SYSTEMD" = true ]; then packages="$packages systemd"; fi
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages
+          nginx -v
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Point the tests at this release's nginx and its own nginx.conf
+        env:
+          NGINX_ROOT: ${{ matrix.nginx_root }}
+          NGINX_ENV: ${{ matrix.nginx_env }}
+        run: |
+          mkdir -p "$HOME/.local/$NGINX_ROOT/etc/nginx"
+          cp /etc/nginx/nginx.conf /etc/nginx/mime.types "$HOME/.local/$NGINX_ROOT/etc/nginx/"
+          echo "$NGINX_ENV=/usr/sbin/nginx" >> "$GITHUB_ENV"
+      - name: nginx -t accepts the rendered site (nginx ${{ matrix.nginx }})
+        env:
+          NGINX_LABEL: ${{ matrix.nginx }}
+        run: |
+          uv run --frozen pytest -p no:cacheprovider -rA \
+            "tests/deploy/test_deploy_nginx.py::test_nginx_t_accepts_the_rendered_site[nginx-$NGINX_LABEL]" \
+            | tee nginx-t.log
+          # A skipped test (no binary found) would prove nothing: insist on a pass.
+          grep -q "PASSED tests/deploy/test_deploy_nginx.py::test_nginx_t_accepts_the_rendered_site" nginx-t.log
+      - name: systemd-analyze verify and security score of the units
+        if: matrix.systemd
+        run: |
+          uv run --frozen pytest -p no:cacheprovider -rA \
+            tests/deploy/test_deploy_units.py::test_systemd_analyze_verify \
+            tests/deploy/test_deploy_units.py::test_systemd_analyze_verify_catches_mistakes \
+            tests/deploy/test_deploy_units.py::test_exposure_score_is_ok \
+            tests/deploy/test_deploy_backup_request.py::test_systemd_analyze_verify_accepts_the_request_path \
+            | tee systemd.log
+          test "$(grep -c '^PASSED' systemd.log)" -eq 4
+
+  e2e:
+    name: Browser tests (Playwright)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Install Chromium and its system libraries (the version uv.lock pins)
+        run: uv run --frozen playwright install --with-deps chromium
+      - name: Pytest (e2e, the CSP spike, design system, axe, public site and rendered page style)
+        run: uv run --frozen pytest -p no:cacheprovider tests/e2e
+
+  dependency-audit:
+    name: Dependency audit (pip-audit)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      advisories: ${{ steps.audit.outputs.advisories }}
+      fixable: ${{ steps.audit.outputs.fixable }}
+      ids: ${{ steps.audit.outputs.ids }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
       - name: pip-audit (fail on known vulnerabilities that have a fixed version)
+        id: audit
         # pip-audit fails on any known vulnerability; the plan asks to fail only when a fix exists (9.14), so the
-        # JSON report is filtered: fixable findings fail the job, unfixable ones are shown as warnings.
+        # JSON report is filtered: fixable findings fail the job, unfixable ones are shown as warnings. That audit
+        # covers the whole environment CI runs (the dev tools too). The counts that become this workflow's outputs,
+        # which deploy.sh records for health check H-VERSION (plan 13.2), come from a second audit of exactly what a
+        # release installs (`uv sync --no-dev`): the locked production requirements, audited as pinned (no install).
+        # When that second report cannot be read the outputs stay empty and the deploy records "not recorded".
         run: |
           uv run --frozen pip-audit --skip-editable --format json --output pip-audit.json || true
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt --output-file prod-requirements.txt
+          uv run --frozen pip-audit -r prod-requirements.txt --no-deps --disable-pip --format json \
+            --output pip-audit-production.json || true
           python3 - <<'PY'
           import json
+          import os
+          import re
           import sys
 
-          with open("pip-audit.json", encoding="utf-8") as handle:
-              report = json.load(handle)
-          fixable, unfixable = [], []
-          for dep in report.get("dependencies", []):
-              for vuln in dep.get("vulns", []):
-                  row = (dep["name"], dep.get("version", "?"), vuln.get("id", "?"), vuln.get("fix_versions") or [])
-                  (fixable if row[3] else unfixable).append(row)
+
+          def findings(path):
+              with open(path, encoding="utf-8") as handle:
+                  report = json.load(handle)
+              rows = []
+              for dep in report.get("dependencies", []):
+                  for vuln in dep.get("vulns", []):
+                      rows.append((dep["name"], dep.get("version", "?"), vuln.get("id", "?"), vuln.get("fix_versions") or []))
+              return rows
+
+
+          try:
+              everything = findings("pip-audit.json")
+          except (OSError, ValueError, KeyError) as exc:
+              print(f"::error::pip-audit produced no report ({type(exc).__name__})")
+              sys.exit(1)
+          fixable = [row for row in everything if row[3]]
           for name, version, vid, fixes in fixable:
               print(f"::error::{name} {version}: {vid} is fixed in {', '.join(fixes)}")
-          for name, version, vid, _ in unfixable:
-              print(f"::warning::{name} {version}: {vid} has no fixed version yet")
-          print(f"pip-audit: {len(fixable)} fixable, {len(unfixable)} without a fix")
+          for name, version, vid, fixes in everything:
+              if not fixes:
+                  print(f"::warning::{name} {version}: {vid} has no fixed version yet")
+          try:
+              shipped = findings("pip-audit-production.json")
+          except (OSError, ValueError, KeyError) as exc:
+              print(f"::warning::the production audit produced no report ({type(exc).__name__}); not recorded at deploy")
+              shipped = None
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              if shipped is not None:
+                  ids = [vid for _, _, vid, _ in shipped if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", vid)]
+                  out.write(f"advisories={len(shipped)}\n")
+                  out.write(f"fixable={sum(1 for row in shipped if row[3])}\n")
+                  out.write(f"ids={','.join(ids[:50])}\n")
+          print(f"pip-audit: {len(fixable)} fixable, {len(everything) - len(fixable)} without a fix (whole environment)")
+          if shipped is not None:
+              print(f"pip-audit: {len(shipped)} advisories in the production dependencies")
           sys.exit(1 if fixable else 0)
           PY
 

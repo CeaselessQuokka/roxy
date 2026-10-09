@@ -13,7 +13,8 @@ How it works
     remaining seconds), `Roxy-Throttled: True`, `Roxy-Endpoint-Limited: True`; v2 adds `Retry-After` (v1 bug B16:
     none, and "try again in 0 seconds" was possible). Tarpit category `endpoint_rule` with v1's reason
     `Rate rule: <pattern>`. Bypass entries skip it. A rule can be an admin regex (`uses_patterns`), so while regex
-    rules exist it is matched only for a request the cheap limiters admitted.
+    rules exist it is matched only for a request the cheap limiters admitted. The matching rule is reported as a
+    rule hit whether its budget admits or refuses the request (`facts.note_match`).
 
 What to read next
     `roxy/abuse/endpoint_rules.py`, then `roxy/abuse/pipeline.py`.
@@ -23,7 +24,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from roxy.abuse.checks.base import Check, Facts, LimitSpec, TxState, refusal_headers, with_trio
+from roxy.abuse.checks.base import (
+    TABLE_ENDPOINT_LIMIT,
+    Check,
+    Facts,
+    LimitSpec,
+    TxState,
+    refusal_headers,
+    with_trio,
+)
 from roxy.abuse.endpoint_rules import endpoint_limit, endpoint_rule_message, match_endpoint_rule
 from roxy.abuse.messages import REASON_RATE_RULE
 from roxy.abuse.verdict import TRUE, Refuse
@@ -45,6 +54,7 @@ class EndpointRuleCheck(Check):
         rule = match_endpoint_rule(facts.rules, facts.target)
         if rule is None:
             return None
+        facts.note_match(TABLE_ENDPOINT_LIMIT, rule.id)  # matched, whether its budget admits or refuses
         key, limit, period = endpoint_limit(
             rule,
             limit_key=facts.limit_key,

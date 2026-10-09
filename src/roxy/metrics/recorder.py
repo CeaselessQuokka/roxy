@@ -43,6 +43,11 @@ How it works
       (`record_attempts`, `record_attempt`). They are summed in bounded maps and written by one batch kind,
       `metrics.insight_history`, with upserts that add up across workers. The `note_*` module functions are the
       one-line producer hooks: they find the recorder and never raise.
+    - Producer history (schema version 5, `metrics/producers.py`): rule hits per rule and minute (inside
+      `record_rule_hit`), tarpit holds and skips with hold times and arrival gaps (`record_tarpit`), bot scores per
+      client and hour (`record_client_score`), and at every flush the items this worker dropped since the previous
+      flush (a windowed, fleet-wide drop counter once summed over workers). Batch kind `metrics.producers`, its own
+      kind so a problem with these tables never holds up the insight history.
     - `run(stop)` flushes on the configured interval and refreshes the vocabulary gates hourly. At shutdown the
       lifespan calls `aclose(budget_s=...)` after that loop stopped: one final flush, including the minute still
       open, so a recycle never loses buffered numbers. It never blocks the event loop and never outlives its
@@ -88,6 +93,7 @@ from roxy.metrics.capture import (
 )
 from roxy.metrics.fingerprints import FingerprintAggregator, FingerprintItem, write_fingerprints
 from roxy.metrics.live import LIVE_EVENT, LIVE_EVENTS_PER_SECOND, LiveRing, RateGate, live_entry
+from roxy.metrics.producers import ProducerHistory, write_producers
 from roxy.metrics.rollups import ClientDelta, EgressDelta, RollupDelta, write_clients, write_egress_usage, write_rollups
 from roxy.metrics.samples import SampleRow, should_sample, write_samples
 from roxy.metrics.templating import MAX_HOSTS, MAX_TEMPLATES, OTHER, TEMPLATE_VERSION, VocabularyGate, template_for
@@ -146,6 +152,7 @@ KIND_EGRESS = "metrics.egress_usage"
 KIND_429 = "metrics.upstream_429"
 KIND_CLIENTS = "metrics.clients"
 KIND_HISTORY = "metrics.insight_history"
+KIND_PRODUCERS = "metrics.producers"
 KIND_ERRORS = "metrics.errors"
 KIND_EVENTS = "metrics.events"
 KIND_AGG_EVENTS = "metrics.events_aggregated"
@@ -159,6 +166,7 @@ PRIORITIES: dict[str, int] = {
     KIND_429: 90,
     KIND_CLIENTS: 70,
     KIND_HISTORY: 68,
+    KIND_PRODUCERS: 67,
     KIND_ERRORS: 65,
     KIND_EVENTS: 60,
     KIND_AGG_EVENTS: 55,
@@ -228,6 +236,8 @@ class OutcomeEvent:
     cache_key_id: str | None = None  # request samples (24 hex)
     body_hash: str | None = None  # request samples
     capture_id: str = ""
+    # --- added by the wave 3b producers (optional) ---
+    matches: dict[str, str] | None = None  # refusals: the rule rows the abuse verdict matched ({table: row id})
 
 
 @dataclass(slots=True)
@@ -433,6 +443,8 @@ class MetricsRecorder:
         self.live_sampled_out = 0
         self.rollup_overflow = 0
         self.dims_last_minute = 0
+        # Schema version 5 producer history; at each flush it also writes how many items this worker dropped.
+        self.producers = ProducerHistory(clock=self.clock, worker_id=worker_id, counters=self._drop_counters)
         self._register_kinds()
         # Capture rows are built on the encoder's thread (LOOP-1). `make_row` is looked up when each capture is
         # built, so it stays this module's name for the function (tests wrap it to see which thread runs it).
@@ -482,6 +494,9 @@ class MetricsRecorder:
         b.register(KIND_429, metrics, _write_429, priority=PRIORITIES[KIND_429])
         b.register(KIND_CLIENTS, metrics, write_clients, priority=PRIORITIES[KIND_CLIENTS], source=self._drain_clients)
         b.register(KIND_HISTORY, metrics, write_history, priority=PRIORITIES[KIND_HISTORY], source=self._drain_history)
+        b.register(
+            KIND_PRODUCERS, metrics, write_producers, priority=PRIORITIES[KIND_PRODUCERS], source=self.producers.drain
+        )
         b.register(KIND_ERRORS, metrics, _write_errors, priority=PRIORITIES[KIND_ERRORS], source=self._drain_errors)
         b.register(KIND_EVENTS, metrics, write_events, priority=PRIORITIES[KIND_EVENTS])
         b.register(
@@ -691,6 +706,10 @@ class MetricsRecorder:
             detail["egress"] = str(ev.egress)
         if ev.bypass:
             detail["bypass"] = True
+        if ev.matches:
+            # The rule rows the abuse verdict matched (`Refuse.matches`): the attempts tabs can name the rule that
+            # refused without matching the patterns again. Table names are fixed; row ids are short keys.
+            detail["rules"] = {str(t)[:64]: str(k)[:64] for t, k in list(ev.matches.items())[:8]}
         summary = (
             {"status": int(ev.status), "message_source": ev.message_source[:16]}
             if ev.message_source
@@ -1380,7 +1399,8 @@ class MetricsRecorder:
             self._count_error("record_eviction_pass")
 
     def record_rule_hit(self, table: str, key: Any, *, count: int = 1, at_s: int | None = None) -> None:
-        """A rule row matched a request (FILTER-REMOVE idle time, SEC-BYPASS-FOREVER last hit)."""
+        """A rule row matched a request (FILTER-REMOVE idle time, SEC-BYPASS-FOREVER last hit): its lifetime row
+        in `rule_hits` and its minute in `rule_hit_minute` (the hit history of plan 10.9 and FILTER-REMOVE)."""
         try:
             now = int(at_s if at_s is not None else self.clock.now())
             slot = (str(table)[:64], str(key)[:MAX_HISTORY_LABEL_CHARS])
@@ -1389,13 +1409,56 @@ class MetricsRecorder:
                 if acc is None:
                     if len(self._rule_hits) >= MAX_HISTORY_KEYS:
                         self.history_dropped += 1
-                        return
-                    acc = self._rule_hits[slot] = [0, now, now]
-                acc[0] += max(0, int(count))
-                acc[1] = min(acc[1], now)
-                acc[2] = max(acc[2], now)
+                        acc = None
+                    else:
+                        acc = self._rule_hits[slot] = [0, now, now]
+                if acc is not None:
+                    acc[0] += max(0, int(count))
+                    acc[1] = min(acc[1], now)
+                    acc[2] = max(acc[2], now)
+            self.producers.rule_hit(slot[0], slot[1], count, now)
         except Exception:
             self._count_error("record_rule_hit")
+
+    def record_tarpit(
+        self,
+        *,
+        category: str,
+        kind: str,
+        held_s: float = 0.0,
+        skipped: bool = False,
+        gap_s: float = 0.0,
+        after_hold: bool | None = None,
+        at_s: float | None = None,
+    ) -> None:
+        """One tarpit-eligible refusal (plan 10.6, row 78, TARPIT-TUNE): held for `held_s` seconds or skipped (no
+        free slot, or hot.db could not count it), and the client's arrival gap since its previous eligible refusal,
+        split by whether that one was held (`after_hold`). Summed per minute, category and hold type."""
+        try:
+            self.producers.tarpit(
+                category=category,
+                kind=kind,
+                held_s=held_s,
+                skipped=skipped,
+                gap_s=gap_s,
+                after_hold=after_hold,
+                at_s=at_s,
+            )
+        except Exception:
+            self._count_error("record_tarpit")
+
+    def record_client_score(self, client_ip: str, score: int, *, at_s: float | None = None) -> None:
+        """A client's bot score (plan 10.7), keyed like the client tables (`activity.ip_key`), kept per hour."""
+        try:
+            key = ip_key(client_ip)
+            if key:
+                self.producers.client_score(key, score, at_s)
+        except Exception:
+            self._count_error("record_client_score")
+
+    def _drop_counters(self) -> tuple[int, int, int]:
+        """Cumulative drops of this worker: the batch queue, the bounded history maps, the capture encoder."""
+        return (int(self.batch.dropped), int(self.history_dropped + self.producers.dropped), int(self.capture_dropped))
 
     def record_attempt(
         self,
@@ -1435,7 +1498,10 @@ class MetricsRecorder:
 
         A CSRF retry repeats its attempt's number; a call after another attempt is `fallback_429` when the call
         before it was answered 429, otherwise `retry_5xx` (a 5xx, timeout or connect retry); a redirect hop is
-        `redirect`. Rotator calls carry the session hash of the trace as `exit_id`.
+        `redirect`. Rotator calls carry the hash of the session (exit) that call used as `exit_id` (the trace's last
+        identity when the call does not name one). A call the upstream exchange found to be a Roblox challenge or
+        an HTML page on a JSON endpoint (`upstream/pages.py`) carries its `challenge` and `html_body` flags
+        (UP-CHALLENGE).
         """
         try:
             calls = list(getattr(trace, "calls", ()) or ())
@@ -1454,13 +1520,17 @@ class MetricsRecorder:
                 else:
                     kind = "retry_5xx"
                 egress = str(getattr(call, "egress", "") or "none")
+                # The exit this very call used (a retry after a rotation has another), else the trace's last.
+                call_exit = str(getattr(call, "exit_id", "") or "") or exit_id
                 self.record_attempt(
                     endpoint_template=endpoint_template,
                     egress=egress,
                     attempt=int(getattr(call, "number", 1) or 1),
                     kind=kind,
                     status=getattr(call, "status", None),
-                    exit_id=exit_id if egress == Egress.ROTATOR.value else "",
+                    challenge=bool(getattr(call, "challenge", False)),
+                    html_body=bool(getattr(call, "html_body", False)),
+                    exit_id=call_exit if egress == Egress.ROTATOR.value else "",
                     at_ms=at_ms,
                 )
                 previous = call
@@ -1696,6 +1766,7 @@ class MetricsRecorder:
             "live_sampled_out": self.live_sampled_out,
             "rollup_overflow": self.rollup_overflow,
             "history_dropped": self.history_dropped,
+            "producers": self.producers.stats(),
             "dims_last_minute": self.dims_last_minute,
             "templates_known": len(self.templates),
             "templates_rejected": self.templates.rejected,
@@ -1816,12 +1887,43 @@ def note_eviction_ages(owner: Any, report: Any) -> None:
             )
 
 
-def note_rule_hit(owner: Any, table: str, key: Any) -> None:
+def note_rule_hit(owner: Any, table: str, key: Any, *, at_s: int | None = None) -> None:
     """A rule row matched a request (abuse checks)."""
     record = getattr(_recorder_of(owner), "record_rule_hit", None)
     if record is not None:
         with contextlib.suppress(Exception):
-            record(table, key)
+            if at_s is None:
+                record(table, key)
+            else:
+                record(table, key, at_s=at_s)
+
+
+def note_rule_hits(owner: Any, matches: Mapping[str, Any], *, at_s: int | None = None) -> None:
+    """Every rule row one request matched, `{table: row key}` (`abuse/pipeline.py`, one call per request)."""
+    for table, key in matches.items():
+        note_rule_hit(owner, table, key, at_s=at_s)
+
+
+def note_tarpit(owner: Any, **fields: Any) -> None:
+    """One tarpit-eligible refusal, held or skipped (`abuse/tarpit.py`; fields of `record_tarpit`)."""
+    record = getattr(_recorder_of(owner), "record_tarpit", None)
+    if record is not None:
+        with contextlib.suppress(Exception):
+            record(**fields)
+
+
+def note_client_scores(owner: Any, scores: Iterable[tuple[str, int]], *, at_s: float | None = None) -> int:
+    """Bot scores `(client ip, score)` computed by the abuse layer (`abuse/pipeline.py record_bot_scores`).
+    Returns how many were handed over (0 without a recorder)."""
+    record = getattr(_recorder_of(owner), "record_client_score", None)
+    if record is None:
+        return 0
+    count = 0
+    for ip, value in scores:
+        with contextlib.suppress(Exception):
+            record(ip, value, at_s=at_s)
+            count += 1
+    return count
 
 
 # ------------------------------------------------------------------------------------------- writers

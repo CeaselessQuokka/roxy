@@ -103,6 +103,49 @@ sudo systemd-run --wait --pipe --uid=roxy --gid=roxy -p UMask=0027 \
 Running it as `roxy` keeps every database file (and SQLite's `-wal` and `-shm` files) owned by the service. After
 that, roll back only to releases that contain the same migration file.
 
+## Dependency audit at deploy (health check H-VERSION)
+
+CI's `dependency-audit` job runs pip-audit on the locked dependencies; its counts (all known advisories, the ones with
+a fixed version, and their ids) are outputs of `ci.yml`, and `deploy.yml` passes them to `deploy.sh` as
+`ROXY_ADVISORY_COUNT`, `ROXY_ADVISORY_FIXABLE` and `ROXY_ADVISORY_IDS`. Step 9 writes them, with the commit, to
+`/var/lib/roxy-deploy/advisories.json` (0644, read by the service for H-VERSION) and keeps a copy in the release as
+`.roxy-advisories.json`, which a rollback puts back. A deploy started by hand has no CI result, so the record says
+`"count": null, "source": "not_recorded"` and H-VERSION shows "advisories not recorded"; it never guesses a zero. To
+record an audit for a hand deploy, pass the variables yourself (`ROXY_ADVISORY_COUNT=0 /opt/roxy/deploy.sh <sha>`).
+
+## Operator CLI (`scripts/ctl.py`)
+
+For when the dashboard cannot be reached (nginx down, locked out, under attack). Run it as the `roxy` user with the
+live release, for example on blue:
+
+```
+sudo -u roxy /opt/roxy/releases/current-blue/.venv/bin/python /opt/roxy/releases/current-blue/scripts/ctl.py status
+```
+
+| Command | What it does | Door |
+|---|---|---|
+| `status` | Both colors' internal sockets, pause and throttle-all, config version, leader, active bans, last backup | both |
+| `pause [--reason]`, `resume` | The maintenance switch (503 for every proxy request) | databases |
+| `throttle-all on\|off [--reason]` | The emergency per-IP limit | databases |
+| `purge-cache --all --yes \| --host H \| --pattern P [--regex] \| --id ID \| --rule N \| --expired [--preview]` | A fleet-wide cache purge | databases |
+| `reset preview --scope S ...`, then `reset run ... --digest D --reason R [--confirm PHRASE]` | A Data page reset scope (plan 6.8); the run must match the preview | socket |
+| `export-llm --window 7d --detail full --out FILE` | The plan 12 LLM export, written 0600 | socket |
+| `health-run [--check ID ...] [--include-credential]` | Check Proxy Health (exit 1 when a check fails) | socket |
+| `backup-now [--wait SECONDS]` | Writes `/var/lib/roxy/backup-request`; `roxy-backup-request.path` starts `backup.sh` | databases |
+| `leader`, `jobs` | The leader lease and heartbeats, and the leader's published job status | databases |
+| `bans list`, `bans lift ip 192.0.2.1 --reason R` | The ban list; lift every ban of one subject | databases |
+| `flush-metrics` | Every worker flushes its buffered metrics within about a second | databases |
+| `settings show [KEY ...]`, `settings set KEY=VALUE --reason R [--confirm-high-risk]` | Runtime settings, through the settings service | databases |
+
+- Every change is audited as `cli:<your login name>` (the name behind `sudo`), with the reason you give.
+- The database commands refuse to run as anyone but the databases' owner, because SQLite would create `-wal` and
+  `-shm` files the service cannot open.
+- The socket commands need a running color: nginx's color first, then the other one.
+- A reset, a full-detail export and a health run with the credential check also prove they run as `roxy`, through a
+  one-use file in `/var/lib/roxy/ctl-proofs/`. The deploy user can open the socket, but it can never use those three.
+- A factory reset stays dashboard-only (it needs a fresh second factor). Nothing the CLI prints contains a secret.
+- `--json` prints JSON; exit status 0 done, 1 refused or failed, 2 bad arguments, 3 no database or no color answering.
+
 ## Backups and restore
 
 `roxy-backup.timer` runs `backup.sh` nightly at 03:30 (plus up to 15 minutes): control.db and metrics.db (hot.db with
@@ -111,6 +154,12 @@ daily and 8 weekly. To restore: stop both colors, decompress (`zstd -d control.d
 encrypted) into `/var/lib/roxy/`, run `PRAGMA integrity_check`, fix owners (`chown roxy:roxy`, mode 0640), start the
 color nginx points at (`sudo /usr/local/sbin/roxy-switch-color --boot`), and run the health check. The encryption keys are
 never in a backup (plan 9.8): restore `/etc/roxy/credentials/` from the owner's offline copy if the disk was lost.
+
+"Back up now" runs the same full backup on request: the service or `scripts/ctl.py backup-now` (both the `roxy`
+user, which may not start units) writes `/var/lib/roxy/backup-request`, and `roxy-backup-request.path` starts
+`roxy-backup.service`. `backup.sh` removes the request first thing (without following a link the roxy user could
+plant), skips a requested run within 10 minutes of the last good backup (`ROXY_BACKUP_MIN_GAP_S`), and records how it
+answered under `last_request` in `audit/backup.json`. `install-system.sh` enables the path unit with the timers.
 
 ## Running beside v1 during the cutover
 

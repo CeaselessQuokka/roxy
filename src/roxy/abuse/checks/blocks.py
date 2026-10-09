@@ -11,6 +11,7 @@ How it works
     Matched against `host/path` (normalized like v1). Tarpit category `blocked_endpoint` with v1's reason
     `Block rule: <pattern>`. Applies to bypass entries too (only their tarpit hold is skipped). A block can be an
     admin regex (`uses_patterns`), so while regex rules exist it runs only for a request the cheap limiters admitted.
+    The matching block is reported as a rule hit (`facts.note_match`, recorded per minute by the pipeline).
 
 What to read next
     `roxy/abuse/blocks.py`, then `roxy/abuse/checks/endpoint_rules.py`.
@@ -21,7 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from roxy.abuse.blocks import block_message, match_block
-from roxy.abuse.checks.base import Check, Facts, LimitSpec, refusal_headers
+from roxy.abuse.checks.base import TABLE_ENDPOINT_BLOCK, Check, Facts, LimitSpec, refusal_headers
 from roxy.abuse.messages import REASON_BLOCK_RULE
 from roxy.abuse.verdict import TRUE, Refuse
 from roxy.core.reasons import ReasonCode
@@ -40,6 +41,7 @@ class BlockCheck(Check):
         rule = match_block(facts.rules, facts.target)
         if rule is None:
             return None
+        facts.note_match(TABLE_ENDPOINT_BLOCK, rule.id)  # a rule hit (FILTER-REMOVE), memory only
         text, source = block_message(rule)
         return Refuse(
             status=403,

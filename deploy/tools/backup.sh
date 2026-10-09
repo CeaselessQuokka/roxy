@@ -2,7 +2,9 @@
 # backup.sh: the nightly backup of Roxy's databases (roxy-backup.service, plan 17.1 and 17.5).
 #
 # What this is
-#   Installed as /usr/local/lib/roxy/backup.sh (root, 0755) and run as root by roxy-backup.service every night.
+#   Installed as /usr/local/lib/roxy/backup.sh (root, 0755) and run as root by roxy-backup.service every night,
+#   and on request ("back up now" from the dashboard or `scripts/ctl.py backup-now`): the roxy user writes
+#   /var/lib/roxy/backup-request and roxy-backup-request.path starts the same service.
 #   For control.db and metrics.db (and hot.db when ROXY_BACKUP_HOT=1) it makes a consistent copy with SQLite's
 #   VACUUM INTO, checks the copy with PRAGMA integrity_check, compresses it with zstd and tests the compressed
 #   file, encrypts it with age when a recipients file exists, and stores the set in /var/backups/roxy/<date>/
@@ -31,10 +33,17 @@
 #   0750), opened with O_NOFOLLOW and accepted only when root owns it and nobody else can write to it (anything
 #   else there is renamed aside, which moves a link, never its target), and the file is written to a new random
 #   name with O_EXCL and O_NOFOLLOW, given its mode and group through the open file, then renamed into place.
+#   A request is consumed first thing (whatever happens next, one request is one run, so the path unit cannot
+#   loop): the file is read without following a link (at most 4 KiB; only a sanitized "by" and "requested_at" are
+#   kept, since the roxy user wrote it) and removed (unlink, or a descriptor-based tree removal for a directory,
+#   neither of which follows a link). A requested run within ROXY_BACKUP_MIN_GAP_S (10 minutes) of the last good
+#   backup is skipped, so a flood of requests costs one short check each, never a backup each. backup.json records
+#   every answered request under last_request (at, by, requested_at, outcome: ran, skipped_recent or
+#   skipped_no_database).
 #
 # What to read next
-#   deploy/systemd/roxy-backup.service (its sandbox), deploy/README.md (restoring a backup), deploy/prestart.py
-#   (the pre-migration snapshots a deploy takes).
+#   deploy/systemd/roxy-backup.service (its sandbox), deploy/systemd/roxy-backup-request.path (the request),
+#   deploy/README.md (restoring a backup), deploy/prestart.py (the pre-migration snapshots a deploy takes).
 
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -Eeuo pipefail
@@ -59,6 +68,10 @@ RESTORE_TEST_DAYS="${ROXY_BACKUP_RESTORE_TEST_DAYS:-28}"
 DEPLOYED_VERSION="${ROXY_DEPLOYED_VERSION_FILE:-/var/lib/roxy-deploy/deployed_version}"
 # The date of this set (UTC). Overridable so tests can make a month of backups in a second.
 DATE="${ROXY_BACKUP_DATE:-$(date -u +%Y-%m-%d)}"
+# "Back up now": the file roxy-backup-request.path watches, and the shortest gap between a good backup and a
+# requested one (seconds).
+REQUEST_FILE="${ROXY_BACKUP_REQUEST:-$STATE_DIR/backup-request}"
+MIN_GAP_S="${ROXY_BACKUP_MIN_GAP_S:-600}"
 
 STEP="start"
 WORK=""
@@ -67,7 +80,9 @@ log() { printf 'backup: %s\n' "$*"; }
 
 # Read or update the status file the app reads (H-BACKUP), never through a link (see the header).
 #   status_tool due <days>                          prints yes when the monthly restore test is due
-#   status_tool update <kind> <detail> <date> <step> records success, failure or restore_test (other fields stay)
+#   status_tool age                                 prints the seconds since the last good backup (-1: none)
+#   status_tool update <kind> <detail> <date> <step> records success, failure, restore_test or request (the
+#                                                   outcome goes in <step>); other fields stay
 status_tool() {
   "$PYTHON3" -I - "$STATUS_FILE" "$STATUS_GROUP" "$@" <<'PY'
 import calendar, contextlib, grp, json, os, secrets, stat, sys, time
@@ -139,19 +154,29 @@ def read_status(dir_fd):
     return value if isinstance(value, dict) else {}
 
 
-if op == "due":
+def read_at(field):
+    """The Unix time of `<field>.at` in the status file, 0 when there is none."""
     dir_fd = open_dir(repair=False)
     try:
-        entry = read_status(dir_fd).get("restore_test")
+        entry = read_status(dir_fd).get(field)
         last = entry.get("at", "") if isinstance(entry, dict) else ""
     finally:
         if dir_fd is not None:
             os.close(dir_fd)
     try:
-        then = calendar.timegm(time.strptime(last, "%Y-%m-%dT%H:%M:%SZ"))
+        return calendar.timegm(time.strptime(last, "%Y-%m-%dT%H:%M:%SZ"))
     except (ValueError, TypeError):
-        then = 0
+        return 0
+
+
+if op == "due":
+    then = read_at("restore_test")
     print("yes" if time.time() - then >= int(args[0]) * 86400 else "no")
+    sys.exit(0)
+
+if op == "age":
+    then = read_at("last_success")
+    print(max(0, int(time.time() - then)) if then else -1)
     sys.exit(0)
 
 kind, detail, date, step = args
@@ -168,6 +193,9 @@ try:
         status["last_failure"] = {"at": now, "date": date, "step": step, "error": detail[-500:]}
     elif kind == "restore_test":
         status["restore_test"] = dict(json.loads(detail), at=now)
+    elif kind == "request":
+        # A "back up now" request this run answered; for this kind the step argument carries the outcome.
+        status["last_request"] = dict(json.loads(detail), at=now, outcome=step)
     tmp = f".{name}.{secrets.token_hex(8)}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
     try:
@@ -355,9 +383,69 @@ nothing_to_back_up_yet() {
   done
 }
 
+# "Back up now": take the request file away first thing (see the header). Sets REQUESTED (1 when this run answers
+# a request) and REQUEST_INFO (the sanitized {"by", "requested_at"} of the request, as JSON).
+REQUESTED=0
+REQUEST_INFO='{}'
+consume_request() {
+  local info
+  info="$("$PYTHON3" -I - "$REQUEST_FILE" <<'PY'
+import json, os, re, shutil, stat, sys
+
+path = sys.argv[1]
+try:
+    info = os.lstat(path)  # lstat: a link is looked at, never followed
+except FileNotFoundError:
+    sys.exit(0)
+by, requested_at = "unknown", ""
+if stat.S_ISREG(info.st_mode):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as handle:
+            document = json.loads(handle.read(4096).decode("utf-8", "replace") or "{}")
+    except (OSError, ValueError):
+        document = {}
+    if isinstance(document, dict):
+        # The roxy user wrote this file: keep only short, plain words from it.
+        by = re.sub(r"[^A-Za-z0-9:_.@-]", "", str(document.get("by", "")))[:80] or "unknown"
+        requested_at = re.sub(r"[^0-9TZ:-]", "", str(document.get("requested_at", "")))[:20]
+if stat.S_ISDIR(info.st_mode):
+    shutil.rmtree(path)  # descriptor based on Linux: a link inside is removed, never followed
+else:
+    os.unlink(path)
+print(json.dumps({"by": by, "requested_at": requested_at}))
+PY
+)"
+  if [ -n "$info" ]; then
+    REQUESTED=1
+    REQUEST_INFO="$info"
+  fi
+}
+
+# Record how this run answered the request (best effort: the status directory may not exist yet).
+answer_request() {
+  [ "$REQUESTED" = 1 ] || return 0
+  status_tool update request "$REQUEST_INFO" "$DATE" "$1" || true
+}
+
+STEP="request"
+consume_request
+
 if nothing_to_back_up_yet; then
   log "no Roxy v2 database in $STATE_DIR and no deploy recorded yet; nothing to back up yet"
+  answer_request skipped_no_database
   exit 0
+fi
+
+if [ "$REQUESTED" = 1 ]; then
+  last_good_age="$(status_tool age)"
+  if [ "$last_good_age" -ge 0 ] && [ "$last_good_age" -lt "$MIN_GAP_S" ]; then
+    log "a backup finished ${last_good_age} s ago (less than ${MIN_GAP_S} s); this request is answered by it"
+    answer_request skipped_recent
+    exit 0
+  fi
+  log "running a requested backup ($REQUEST_INFO)"
+  answer_request ran
 fi
 
 SET_DIR=""

@@ -18,7 +18,8 @@ How it works
       or an automatic ban on an address the owner explicitly trusts would defeat the entry). It never skips pause,
       bans, the deny list, ignored paths, probes, auth smuggling checks, header filters or endpoint blocks.
     - The lookup is the snapshot's CIDR index with the expiry checked at lookup time, so an entry stops working the
-      second it expires, not at the next reload.
+      second it expires, not at the next reload. `bypass_entry` returns the matching row itself, so every request
+      it covers counts as a hit of that row (recorded by the pipeline, in memory).
     - Writes go through `rules/service.py` (one audited control.db transaction plus a `config_version` bump).
 
 What to read next
@@ -43,6 +44,14 @@ class BypassNeedsConfirmation(ValueError):
 def is_bypassed(snapshot: RulesSnapshot, ip: str, now: float) -> bool:
     """Whether an active (unexpired) bypass entry covers `ip`."""
     return bool(ip) and snapshot.access.bypass.contains(ip, now)
+
+
+def bypass_entry(snapshot: RulesSnapshot, ip: str, now: float) -> Any:
+    """The active bypass entry (`AccessListRow`) that covers `ip`, or None: the row whose hits the pipeline records
+    (SEC-BYPASS-FOREVER "last hit", FILTER-REMOVE "bypass entry unused")."""
+    if not ip:
+        return None
+    return snapshot.access.bypass.match(ip, now)
 
 
 def bypass_expires_at(now: float, default_expiry_h: float, expires_in_h: float | None = None) -> int | None:
@@ -105,6 +114,7 @@ def never_expiring_entries(snapshot: RulesSnapshot) -> list[Any]:
 __all__ = [
     "BypassNeedsConfirmation",
     "add_bypass",
+    "bypass_entry",
     "bypass_expires_at",
     "bypass_my_ip",
     "is_bypassed",

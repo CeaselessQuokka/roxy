@@ -30,7 +30,15 @@ How it works
       sleeps through `hold()`, which races the injected sleep against that wake-up event.
     - The same transaction records the client's arrival time (`limiter` row `tarpit_arrival:<key>`), so the gap
       between one client's tarpit-eligible refusals is measured across all workers (row 78, the true inter-arrival
-      mean). Rows idle for `stale_ip_duration` are pruned, so gaps longer than that read as a first arrival.
+      mean). Rows idle for `stale_ip_duration` are pruned, so gaps longer than that read as a first arrival. The
+      row's `window_start` holds 1 when that arrival was held and 0 when it was answered at once (skipped), so the
+      next arrival's gap is filed as "after a hold" or "after an instant refusal": TARPIT-TUNE compares the two to
+      tell whether holding slows a client down at all. No extra read or write: it is the same row, in the same
+      transaction.
+    - Statistics: `TarpitStats` is this worker's running view (the Protection card), and every held or skipped
+      eligible refusal also goes to the metrics recorder (`note_tarpit`: category, hold type, hold time, the gap
+      and what came before it), summed per minute fleet-wide in `tarpit_minute` and `tarpit_hold_minute` (holds,
+      skips, mean and p95 hold by category; parity row 78, TARPIT-TUNE). Memory only on the request path.
     - `upstream_cooldown_retry` (plan 10.6, 15.3 F) has its own producer, `plan_cooldown_retry`, which the router
       calls when it answers a pacing failure (Roblox cooldown, upstream busy, queue full) with `Retry-After`. While
       the category is on, ONE hot.db write both checks and records "this client was told to wait until T for this
@@ -64,6 +72,7 @@ from typing import Any, Final
 from roxy.config.constants import TARPIT_CATEGORIES
 from roxy.core.clock import Clock
 from roxy.core.scope import catalog_default
+from roxy.metrics.recorder import note_tarpit
 from roxy.storage import leases
 from roxy.storage.db import Database, SharedStateUnavailable
 
@@ -232,6 +241,7 @@ class TarpitPlan:
         holder: str,
         gap_s: float,
         drip_interval_s: float,
+        after_hold: bool | None = None,
     ) -> None:
         self._tarpit = tarpit
         self.kind = kind
@@ -242,6 +252,7 @@ class TarpitPlan:
         self.slot = slot
         self.holder = holder
         self.gap_s = gap_s
+        self.after_hold = after_hold  # whether this client's previous eligible refusal was held (None: unknown)
         self.drip_interval_s = drip_interval_s
         self._started: float | None = None
         self._released = False
@@ -282,6 +293,7 @@ class TarpitPlan:
             return
         self._released = True
         held = 0.0 if self._started is None else max(0.0, self._tarpit.monotonic() - self._started)
+        now = self._tarpit.clock.now()
         self._tarpit.stats.record(
             category=self.category,
             reason=self.reason,
@@ -289,7 +301,16 @@ class TarpitPlan:
             held_s=held,
             skipped=False,
             gap_s=self.gap_s,
-            at=self._tarpit.clock.now(),
+            at=now,
+        )
+        self._tarpit.note(
+            category=self.category,
+            kind=self.kind,
+            held_s=held,
+            skipped=False,
+            gap_s=self.gap_s,
+            after_hold=self.after_hold,
+            at=now,
         )
         await self._tarpit.release_slot(self.slot, self.holder)
 
@@ -307,6 +328,7 @@ class Tarpit:
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         rng: random.Random | None = None,
+        recorder: Any = None,
     ) -> None:
         self.settings = settings
         self.hot_db = hot_db
@@ -315,6 +337,7 @@ class Tarpit:
         self.sleep = sleep
         self.monotonic = monotonic
         self.rng = rng or random.Random()
+        self.recorder = recorder  # the metrics recorder (fleet-wide hold statistics), or None
         self.stats = TarpitStats()
         self._ids = itertools.count(1)
         self.draining = False  # set by `wake_all`: no new holds, running ones end now
@@ -369,6 +392,37 @@ class Tarpit:
         snapshot = self.settings.snapshot()
         return snapshot if isinstance(snapshot, Mapping) else {}
 
+    def note(
+        self,
+        *,
+        category: str,
+        kind: str,
+        held_s: float,
+        skipped: bool,
+        gap_s: float,
+        after_hold: bool | None,
+        at: float,
+    ) -> None:
+        """Hand one held or skipped eligible refusal to the metrics recorder (memory only; never raises)."""
+        note_tarpit(
+            self.recorder,
+            category=category,
+            kind=kind,
+            held_s=held_s,
+            skipped=skipped,
+            gap_s=gap_s,
+            after_hold=after_hold,
+            at_s=at,
+        )
+
+    def _skipped(
+        self, *, category: str, kind: str, reason: str, ip: str, gap_s: float, after_hold: bool | None, now_ms: int
+    ) -> None:
+        """An eligible refusal answered at once (no free slot, or no shared count): both statistics."""
+        at = now_ms / 1000
+        self.stats.record(category=category, reason=reason, ip=ip, held_s=0.0, skipped=True, gap_s=gap_s, at=at)
+        self.note(category=category, kind=kind, held_s=0.0, skipped=True, gap_s=gap_s, after_hold=after_hold, at=at)
+
     def _duration(self, kind: str, values: Mapping[str, Any]) -> float:
         if kind == "jitter":
             low, high = float(values["tarpit_jitter_min_ms"]), float(values["tarpit_jitter_max_ms"])
@@ -414,6 +468,7 @@ class Tarpit:
         slot: str,
         holder: str,
         gap_s: float,
+        after_hold: bool | None = None,
     ) -> TarpitPlan:
         drip_interval_s = max(0.1, float(_setting(values, "tarpit_drip_interval_ms")) / 1000)
         return TarpitPlan(
@@ -427,6 +482,7 @@ class Tarpit:
             holder=holder,
             gap_s=gap_s,
             drip_interval_s=drip_interval_s,
+            after_hold=after_hold,
         )
 
     async def plan(self, category: str, req: Any, *, reason: str = "") -> TarpitPlan | None:
@@ -445,9 +501,10 @@ class Tarpit:
         ttl_ms = self._ttl_ms(values, hold_s)
         slot: str | None = None
         gap_s = 0.0
+        after_hold: bool | None = None
         if self.hot_db is not None:
             try:
-                slot, gap_s = await self.hot_db.write(
+                slot, gap_s, after_hold = await self.hot_db.write(
                     lambda conn: self._admit(conn, ip, holder, cap.effective, ttl_ms, now_ms),
                     busy_timeout_ms=SLOT_BUSY_TIMEOUT_MS,
                 )
@@ -456,13 +513,13 @@ class Tarpit:
                 log.warning("tarpit_slot_unavailable", extra={"fields": {"error": str(exc)[:200]}})
                 slot = None
         if slot is None:
-            self.stats.record(
-                category=category, reason=reason, ip=ip, held_s=0.0, skipped=True, gap_s=gap_s, at=now_ms / 1000
+            self._skipped(
+                category=category, kind=kind, reason=reason, ip=ip, gap_s=gap_s, after_hold=after_hold, now_ms=now_ms
             )
             return None
         return self._make_plan(
             values, kind=kind, hold_s=hold_s, category=category, reason=reason, ip=ip, slot=slot, holder=holder,
-            gap_s=gap_s,
+            gap_s=gap_s, after_hold=after_hold,
         )  # fmt: skip
 
     async def plan_cooldown_retry(
@@ -483,7 +540,7 @@ class Tarpit:
         holder = f"{self.worker_id}#{next(self._ids)}"
         ttl_ms = self._ttl_ms(values, max(0.0, hold_s))
         try:
-            retry, slot, gap_s = await self.hot_db.write(
+            retry, slot, gap_s, after_hold = await self.hot_db.write(
                 lambda conn: self._admit_retry(
                     conn, row_key, fingerprint, until_ms, ip, holder, cap.effective if hold_s > 0 else 0, ttl_ms, now_ms
                 ),
@@ -495,13 +552,14 @@ class Tarpit:
         if not retry or hold_s <= 0:
             return None
         if slot is None:
-            self.stats.record(
-                category=RETRY_CATEGORY, reason=reason, ip=ip, held_s=0.0, skipped=True, gap_s=gap_s, at=now_ms / 1000
-            )
+            self._skipped(
+                category=RETRY_CATEGORY, kind="jitter", reason=reason, ip=ip, gap_s=gap_s, after_hold=after_hold,
+                now_ms=now_ms,
+            )  # fmt: skip
             return None
         return self._make_plan(
             values, kind="jitter", hold_s=hold_s, category=RETRY_CATEGORY, reason=reason, ip=ip, slot=slot,
-            holder=holder, gap_s=gap_s,
+            holder=holder, gap_s=gap_s, after_hold=after_hold,
         )  # fmt: skip
 
     @classmethod
@@ -516,9 +574,9 @@ class Tarpit:
         cap: int,
         ttl_ms: int,
         now_ms: int,
-    ) -> tuple[bool, str | None, float]:
+    ) -> tuple[bool, str | None, float, bool | None]:
         """One transaction: was this key's earlier Retry-After still running? Then claim a hold slot. Either way
-        the row now holds this answer's Retry-After. Returns `(retry, slot, gap_s)`."""
+        the row now holds this answer's Retry-After. Returns `(retry, slot, gap_s, after_hold)`."""
         row = conn.execute("SELECT tat_ms, window_start FROM limiter WHERE bucket_key = ?", (row_key,)).fetchone()
         retry = row is not None and int(row[1]) == fingerprint and int(row[0]) > now_ms
         conn.execute(
@@ -528,26 +586,33 @@ class Tarpit:
             (row_key, until_ms, fingerprint, now_ms // 1000),
         )
         if not retry or cap <= 0:
-            return retry, None, 0.0
-        slot, gap_s = cls._admit(conn, ip, holder, cap, ttl_ms, now_ms)
-        return retry, slot, gap_s
+            return retry, None, 0.0, None
+        slot, gap_s, after_hold = cls._admit(conn, ip, holder, cap, ttl_ms, now_ms)
+        return retry, slot, gap_s, after_hold
 
     @staticmethod
     def _admit(
         conn: sqlite3.Connection, ip: str, holder: str, cap: int, ttl_ms: int, now_ms: int
-    ) -> tuple[str | None, float]:
-        """One transaction: record the arrival (for the gap metric) and claim a slot if one is free."""
+    ) -> tuple[str | None, float, bool | None]:
+        """One transaction: claim a slot if one is free and record the arrival (for the gap metric).
+
+        Returns `(slot or None, gap since the previous eligible refusal in seconds (0: first or forgotten), whether
+        that previous refusal was held (None: no previous one))`. The arrival row's `window_start` remembers whether
+        THIS arrival was held (1) or answered at once (0), for the next arrival's gap.
+        """
         key = ARRIVAL_PREFIX + ip
-        row = conn.execute("SELECT tat_ms FROM limiter WHERE bucket_key = ?", (key,)).fetchone()
+        row = conn.execute("SELECT tat_ms, window_start FROM limiter WHERE bucket_key = ?", (key,)).fetchone()
         previous = int(row[0]) if row is not None else 0
         gap_s = max(0.0, (now_ms - previous) / 1000) if previous else 0.0
+        after_hold = bool(int(row[1] or 0)) if row is not None and previous else None
+        slot = leases.acquire_slot(conn, SLOT_PREFIX, holder, cap, ttl_ms, now_ms)
         conn.execute(
-            "INSERT INTO limiter (bucket_key, tat_ms, window_start, count, updated_at) VALUES (?, ?, 0, 1, ?) "
-            "ON CONFLICT (bucket_key) DO UPDATE SET tat_ms = excluded.tat_ms, count = count + 1, "
-            "updated_at = excluded.updated_at",
-            (key, now_ms, now_ms // 1000),
+            "INSERT INTO limiter (bucket_key, tat_ms, window_start, count, updated_at) VALUES (?, ?, ?, 1, ?) "
+            "ON CONFLICT (bucket_key) DO UPDATE SET tat_ms = excluded.tat_ms, window_start = excluded.window_start, "
+            "count = count + 1, updated_at = excluded.updated_at",
+            (key, now_ms, 1 if slot is not None else 0, now_ms // 1000),
         )
-        return leases.acquire_slot(conn, SLOT_PREFIX, holder, cap, ttl_ms, now_ms), gap_s
+        return slot, gap_s, after_hold
 
     async def release_slot(self, slot: str, holder: str) -> None:
         if self.hot_db is None:

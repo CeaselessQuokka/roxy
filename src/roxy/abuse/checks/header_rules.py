@@ -15,7 +15,8 @@ How it works
     transaction read. A custom message is sent as is with `Roxy-Refusal:
     header_rule` (v2 adds `Retry-After`, v1 bug B8). Neither form counts toward the per-IP limit or adds a strike
     (v1). Tarpit category `header_rule` (on by default) with v1's reason `Filter <id> (matched <Header>)`. Bypass
-    does not skip it.
+    does not skip it. The matching filter is reported as a rule hit under its row id (`facts.note_match`), the key
+    FILTER-REMOVE reads, not the canonical key the tarpit reason shows.
 
 What to read next
     `roxy/abuse/header_rules.py`, then `roxy/abuse/checks/blocks.py`.
@@ -25,7 +26,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from roxy.abuse.checks.base import Check, Facts, LimitSpec, disguised_throttle, refusal_headers
+from roxy.abuse.checks.base import TABLE_HEADER_RULE, Check, Facts, LimitSpec, disguised_throttle, refusal_headers
 from roxy.abuse.header_rules import header_pairs, header_rule_message, match_header_rule
 from roxy.abuse.messages import REASON_HEADER_RULE
 from roxy.abuse.verdict import TRUE, Refuse, title_case_header
@@ -47,6 +48,7 @@ class HeaderRuleCheck(Check):
         hit = match_header_rule(facts.rules, facts.pairs_cache)
         if hit is None:
             return None
+        facts.note_match(TABLE_HEADER_RULE, getattr(hit.rule, "id", None))  # the row id, not its canonical key
         detail = REASON_HEADER_RULE.format(rule_id=hit.rule_id, header=title_case_header(hit.header))
         message = header_rule_message(hit.rule)
         if not message:

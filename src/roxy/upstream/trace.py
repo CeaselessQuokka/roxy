@@ -14,7 +14,10 @@ Why it exists
 
 How it works
     Every call appends an `AttemptRecord` (bounded at `MAX_ATTEMPT_RECORDS`) and overwrites the top-level "last
-    call" fields, clearing the error of a successful call. Upstream headers pass through `core.redact
+    call" fields, clearing the error of a successful call. A call Roblox answered with a challenge or with an HTML
+    page on a JSON endpoint (`upstream/pages.py`) carries the `challenge` and `html_body` flags, which the metrics
+    recorder counts per minute for UP-CHALLENGE; a rotator call carries the short hash of the exit it used (a
+    retry after a rotation uses another exit). Upstream headers pass through `core.redact
     .redact_headers` before they are stored, so cookies, CSRF tokens and anything credential-shaped never reach a
     trace. Session ids of the rotator are shown as a short hash (they select an exit IP).
 
@@ -58,6 +61,9 @@ class AttemptRecord:
     csrf_retry: bool = False
     redirect_hop: int = 0
     queue_wait_ms: float = 0.0
+    challenge: bool = False  # the answer carried a challenge header (`upstream/pages.py`)
+    html_body: bool = False  # the answer was an HTML page on a JSON endpoint
+    exit_id: str = ""  # rotator calls: the short hash of the session (exit) this call used
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +76,8 @@ class AttemptRecord:
             "CsrfRetry": self.csrf_retry,
             "RedirectHop": self.redirect_hop,
             "QueueWaitMs": round(self.queue_wait_ms, 1),
+            "Challenge": self.challenge,
+            "HtmlBody": self.html_body,
         }
 
 
@@ -114,6 +122,9 @@ class Trace:
         csrf_retry: bool = False,
         redirect_hop: int = 0,
         queue_wait_ms: float = 0.0,
+        challenge: bool = False,
+        html_body: bool = False,
+        exit_id: str = "",
     ) -> None:
         """Record one HTTP call (or a call that failed before an answer) and make it the "last call"."""
         clean_error = redact_text(error)[:MAX_ERROR_LENGTH] if error else ""
@@ -138,6 +149,9 @@ class Trace:
                     csrf_retry=csrf_retry,
                     redirect_hop=redirect_hop,
                     queue_wait_ms=queue_wait_ms,
+                    challenge=challenge,
+                    html_body=html_body,
+                    exit_id=exit_id,
                 )
             )
 

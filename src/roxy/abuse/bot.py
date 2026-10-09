@@ -26,6 +26,13 @@ How it works
     workers, but the probe count does, so with N workers it can read up to N times low. The score never limits
     anything by itself unless the admin sets a block or challenge threshold (both off by default).
 
+    Recorded scores (ABUSE-BOT, THROTTLE-TUNE, ABUSE-DIST, the Clients page): the first request of a client in each
+    scoring interval marks it "dirty" and keeps that request's per-request inputs (library User-Agent, game server
+    signature, header order anomaly; a few microseconds, once per client per interval, plus up to
+    `MAX_IPS_PER_CLIENT` addresses behind the key). `take_scores` then scores the dirty clients off the request
+    path (newest first, at most `limit` per call) and clears the mark; the pipeline hands the scores to the metrics
+    recorder, which keeps per client and hour the largest score any worker computed and the latest one.
+
 What to read next
     `roxy/abuse/challenge.py` (the browser proof of work that uses the score), then `roxy/abuse/checks/challenge.py`.
 """
@@ -34,7 +41,7 @@ from __future__ import annotations
 
 import ipaddress
 import itertools
-import statistics
+import math
 import zlib
 from collections import OrderedDict, deque
 from collections.abc import Iterable, Mapping, Sequence
@@ -49,6 +56,8 @@ TIMING_MIN_REQUESTS: Final = 50
 TIMING_CV_THRESHOLD: Final = 0.05
 BUST_WINDOW: Final = 200
 BUST_MIN_REQUESTS: Final = 20
+MAX_IPS_PER_CLIENT: Final = 4
+"""Addresses remembered per client key (an IPv6 prefix groups several); each gets the key's recorded score."""
 
 SIGNALS: Final[tuple[str, ...]] = (
     "library_ua",
@@ -156,6 +165,22 @@ class _Client:
     refusal_buckets: dict[int, list[int]] = field(default_factory=dict)  # bucket start -> [total, refused]
     arrivals: deque[float] = field(default_factory=lambda: deque(maxlen=TIMING_MIN_REQUESTS + 14))
     queries: deque[int] = field(default_factory=lambda: deque(maxlen=BUST_WINDOW))
+    ips: list[str] = field(default_factory=list)  # recent addresses behind this key (bounded)
+    # The per-request signals of the first request since the last recorded score: (library UA, game server
+    # signature, header order anomaly). None: nothing to record (the client is not "dirty").
+    pending: tuple[bool, bool, bool] | None = None
+
+
+def _coefficient_of_variation(values: Sequence[float]) -> float | None:
+    """Population standard deviation over the mean, in plain floats (`statistics.pstdev` uses exact fractions,
+    far slower for a value that only needs comparing with 0.05). None for a mean of 0 or no values."""
+    if not values:
+        return None
+    mean = math.fsum(values) / len(values)
+    if mean <= 0:
+        return None
+    variance = math.fsum((v - mean) ** 2 for v in values) / len(values)
+    return math.sqrt(variance) / mean
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +197,16 @@ class BotSignals:
 
     def as_dict(self) -> dict[str, float]:
         return {name: float(getattr(self, name)) for name in SIGNALS}
+
+
+@dataclass(frozen=True, slots=True)
+class ScoredClient:
+    """One recorded bot score: the client key, the addresses behind it, the score and its signals."""
+
+    key: str
+    ips: tuple[str, ...]
+    score: int
+    signals: BotSignals
 
 
 def score(signals: BotSignals, weights: Mapping[str, float]) -> int:
@@ -210,8 +245,16 @@ class ClientTracker:
         refused: bool,
         probe: bool,
         query_fp: int | None,
+        ip: str | None = None,
+        user_agent: str | None = None,
+        game_server: bool | None = None,
+        header_names: Sequence[str] | None = None,
     ) -> None:
-        """Record one finished request of client `key`."""
+        """Record one finished request of client `key`.
+
+        With `user_agent` given, the client is marked for a recorded score (module docstring): the first request
+        since the last recorded score keeps its per-request signals. `ip` adds the address to the key's bounded list.
+        """
         client = self._get(key, create=True)
         assert client is not None  # created above
         if probe:
@@ -226,18 +269,27 @@ class ClientTracker:
         client.arrivals.append(monotonic)
         if query_fp is not None:
             client.queries.append(query_fp)
+        if ip and ip not in client.ips:
+            client.ips.append(ip)
+            if len(client.ips) > MAX_IPS_PER_CLIENT:
+                del client.ips[0]  # the oldest address behind the key goes first
+        if user_agent is not None and client.pending is None:
+            client.pending = (
+                is_library_ua(user_agent),
+                bool(game_server),
+                header_order_family(list(header_names or ())) is None,
+            )
 
-    def signals(
+    def _signals(
         self,
-        key: str,
+        client: _Client | None,
         *,
         now: float,
-        user_agent: str,
+        library_ua: bool,
         game_server: bool,
-        header_names: Sequence[str],
+        header_anomaly: bool,
     ) -> BotSignals:
-        """The signals for client `key` given its history plus the current request's UA and headers."""
-        client = self._get(key, create=False)
+        """The seven signals from a client's history and one request's per-request inputs."""
         probes = refusals = timing = busting = 0.0
         if client is not None:
             recent_probes = sum(1 for at in client.probes if at >= now - PROBE_WINDOW_S)
@@ -251,21 +303,63 @@ class ClientTracker:
             refusals = refused / total if total else 0.0
             arrivals = list(client.arrivals)
             if len(arrivals) > TIMING_MIN_REQUESTS:
-                gaps = [b - a for a, b in itertools.pairwise(arrivals)]
-                mean = statistics.fmean(gaps)
-                if mean > 0 and statistics.pstdev(gaps) / mean < TIMING_CV_THRESHOLD:
+                variation = _coefficient_of_variation([b - a for a, b in itertools.pairwise(arrivals)])
+                if variation is not None and variation < TIMING_CV_THRESHOLD:
                     timing = 1.0
             if len(client.queries) >= BUST_MIN_REQUESTS:
                 busting = len(set(client.queries)) / len(client.queries)
         return BotSignals(
-            library_ua=1.0 if is_library_ua(user_agent) else 0.0,
+            library_ua=1.0 if library_ua else 0.0,
             no_roblox_signature=0.0 if game_server else 1.0,
             probes=probes,
             refusals=refusals,
             timing=timing,
-            header_order=0.0 if header_order_family(header_names) is not None else 1.0,
+            header_order=1.0 if header_anomaly else 0.0,
             cache_busting=busting,
         )
+
+    def signals(
+        self,
+        key: str,
+        *,
+        now: float,
+        user_agent: str,
+        game_server: bool,
+        header_names: Sequence[str],
+    ) -> BotSignals:
+        """The signals for client `key` given its history plus the current request's UA and headers."""
+        return self._signals(
+            self._get(key, create=False),
+            now=now,
+            library_ua=is_library_ua(user_agent),
+            game_server=game_server,
+            header_anomaly=header_order_family(header_names) is None,
+        )
+
+    def take_scores(self, *, now: float, weights: Mapping[str, float], limit: int) -> list[ScoredClient]:
+        """Score up to `limit` clients marked since the last call (newest first) and clear their mark.
+
+        Runs off the request path (the pipeline's `abuse_bot_scores` loop). A marked client pushed out of the LRU is
+        simply forgotten; one left over beyond `limit` keeps its mark for the next call. Never raises for a client.
+        """
+        out: list[ScoredClient] = []
+        for key in reversed(list(self._clients)):  # most recently used first
+            if len(out) >= max(0, int(limit)):
+                break
+            client = self._clients.get(key)
+            if client is None or client.pending is None:
+                continue
+            library_ua, game_server, header_anomaly = client.pending
+            client.pending = None
+            signals = self._signals(
+                client, now=now, library_ua=library_ua, game_server=game_server, header_anomaly=header_anomaly
+            )
+            out.append(ScoredClient(key, tuple(client.ips) or (key,), score(signals, weights), signals))
+        return out
+
+    def pending(self) -> int:
+        """Clients waiting for a recorded score."""
+        return sum(1 for client in self._clients.values() if client.pending is not None)
 
     def __len__(self) -> int:
         return len(self._clients)
@@ -273,9 +367,11 @@ class ClientTracker:
 
 __all__ = [
     "LIBRARY_UA_MARKERS",
+    "MAX_IPS_PER_CLIENT",
     "SIGNALS",
     "BotSignals",
     "ClientTracker",
+    "ScoredClient",
     "has_game_server_signature",
     "header_order_family",
     "in_networks",

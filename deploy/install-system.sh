@@ -237,7 +237,8 @@ fi
 if [ "$SYSTEM" = 1 ]; then
   systemctl daemon-reload
   systemctl restart systemd-journald
-  systemctl enable --now roxy-backup.timer roxy-audit.timer roxy-audit.path roxy-deploy-alert.path
+  systemctl enable --now roxy-backup.timer roxy-audit.timer roxy-audit.path roxy-deploy-alert.path \
+    roxy-backup-request.path
   systemctl enable roxy-boot.service
 fi
 log "done"

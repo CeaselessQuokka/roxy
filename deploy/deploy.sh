@@ -30,8 +30,11 @@
 #      answered by Roxy v2 itself: during the cutover v1's nginx site can still own the host name).
 #   8. Drain, stop the old color and wait until it is inactive (its shutdown flushes metrics). In low-memory mode,
 #      add workers to the new color through its gunicorn control socket. Keep the newest 5 releases.
-#   9. Record the commit in /var/lib/roxy-deploy/deployed_version (roxy-audit.path then runs the permission
-#      audit) and install this release's deploy scripts as the new /opt/roxy/deploy.sh.
+#   9. Record the dependency audit of this commit in /var/lib/roxy-deploy/advisories.json (health check H-VERSION:
+#      the count CI's pip-audit found, passed by the workflow as ROXY_ADVISORY_COUNT; "not recorded" when the deploy
+#      was started by hand), record the commit in /var/lib/roxy-deploy/deployed_version (roxy-audit.path then runs
+#      the permission audit) and install this release's deploy scripts as the new /opt/roxy/deploy.sh. A rollback
+#      puts back the audit record its release was deployed with.
 #   Safety: `set -Eeuo pipefail`; an ERR trap (inherited by functions and subshells through -E) records the
 #   failing command, and an EXIT trap runs the rollback for ANY non-zero exit, including `set -u` errors and
 #   signals, which an ERR trap alone misses (v1 bug: a failing command inside a function skipped its trap). The
@@ -89,6 +92,11 @@ LOW_MEMORY_MB="${ROXY_LOW_MEMORY_MB:-700}"
 MEMINFO="${ROXY_MEMINFO:-/proc/meminfo}"
 PUBLIC_CHECK="${ROXY_DEPLOY_PUBLIC_CHECK:-1}"
 LOCK_WAIT_S="${ROXY_LOCK_WAIT_S:-0}"
+# The dependency audit of this commit, from CI's pip-audit job (deploy.yml passes them; empty when run by hand):
+# how many known advisories the locked dependencies have, how many of those have a fixed version, and their ids.
+ADVISORY_COUNT="${ROXY_ADVISORY_COUNT:-}"
+ADVISORY_FIXABLE="${ROXY_ADVISORY_FIXABLE:-}"
+ADVISORY_IDS="${ROXY_ADVISORY_IDS:-}"
 
 # uv: interpreters under /opt/roxy/python (the service cannot see /home, ProtectHome=yes), copies instead of
 # links into the user cache, and never a system Python (plan 5.1).
@@ -101,6 +109,8 @@ REQUIRED_PATHS=(pyproject.toml uv.lock src/roxy deploy/deploy.sh deploy/deploy_r
   deploy/prestart.py deploy/nginx/roxy.conf.template scripts/smoke_remote.py scripts/build_static.py)
 RELEASE_STAMP=".roxy-release-complete"
 NGINX_MANIFEST=".roxy-nginx-manifest"
+# The audit record a release was deployed with, kept in the release so a rollback can put it back.
+RELEASE_ADVISORIES=".roxy-advisories.json"
 
 # ----------------------------------------------------------------------------------------------- run state
 
@@ -704,8 +714,75 @@ install_scripts() {
   done
 }
 
+# The dependency audit record of this release for health check H-VERSION, printed as JSON (`{"count": n, ...}`;
+# `"count": null` reads as "not recorded"). The workflow passes CI's pip-audit result; a rollback reuses the record
+# its release was deployed with; anything else is honestly "not recorded", never a guessed zero.
+advisories_json() {
+  local saved="$RELEASE/$RELEASE_ADVISORIES"
+  "$PYTHON3" -I - "${RELEASE##*/}" "$ADVISORY_COUNT" "$ADVISORY_FIXABLE" "$ADVISORY_IDS" "$MODE" "$saved" <<'PY'
+import json, os, re, sys, time
+
+sha, count, fixable, ids, mode, saved = sys.argv[1:7]
+now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+number = re.compile(r"[0-9]{1,6}")
+
+
+def known_ids(text):
+    # Advisory ids only (PYSEC-2024-1, GHSA-xxxx-xxxx-xxxx, CVE-2024-1234): letters, digits, dots and hyphens.
+    found = [part.strip() for part in text.split(",") if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", part.strip())]
+    return found[:50]
+
+
+if number.fullmatch(count.strip()):
+    record = {
+        "count": int(count),
+        "fixable": int(fixable) if number.fullmatch(fixable.strip()) else None,
+        "ids": known_ids(ids),
+        "source": "ci",
+    }
+else:
+    record = None
+    if mode == "rollback":
+        try:
+            with open(saved, "rb") as handle:
+                earlier = json.loads(handle.read(65536))
+        except (OSError, ValueError):
+            earlier = None
+        if isinstance(earlier, dict) and earlier.get("commit") == sha and isinstance(earlier.get("count"), int):
+            record = {key: earlier.get(key) for key in ("count", "fixable", "ids", "source", "recorded_at")}
+            record["restored_by"] = "rollback"
+    if record is None:
+        why = "the deploy was started by hand" if not count.strip() else "the value given was not a count"
+        record = {"count": None, "fixable": None, "ids": [], "source": "not_recorded", "note": why}
+record["commit"] = sha
+record.setdefault("recorded_at", now)
+if record.get("recorded_at") is None:
+    record["recorded_at"] = now
+print(json.dumps(record, indent=2, sort_keys=True))
+PY
+}
+
+record_advisories() {
+  local json count source
+  json="$(advisories_json)" || return 1
+  count="$(printf '%s' "$json" | json_field count || true)"
+  source="$(printf '%s' "$json" | json_field source || true)"
+  if [ "$source" = ci ] && [ "$MODE" = deploy ]; then
+    write_file "$RELEASE/$RELEASE_ADVISORIES" "$json"
+  fi
+  # 0644 in the 0755 deploy state directory: the roxy user (H-VERSION) reads it.
+  write_file "$DEPLOY_STATE_DIR/advisories.json" "$json"
+  if [ -n "$count" ]; then
+    log "Dependency audit recorded: $count known advisories ($source)."
+  else
+    log "Dependency audit not recorded (no CI result was passed to this deploy); H-VERSION will say so."
+  fi
+}
+
 record_deploy() {
   step 9 "recording ${RELEASE##*/}"
+  # Bookkeeping after the switch must never undo a healthy deploy; a missing record shows as "not recorded".
+  record_advisories || fail "Could not record the dependency audit; H-VERSION reports it as not recorded."
   # roxy-audit.path watches this file and runs the permission audit (plan 17.4 step 9).
   write_file "$DEPLOY_STATE_DIR/deployed_version" "${RELEASE##*/}"
   record_result succeeded "none needed"

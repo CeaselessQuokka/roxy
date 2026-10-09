@@ -1,6 +1,7 @@
 # roxy-backup.service: the nightly backup of control.db and metrics.db (plan 17.1, 17.5).
 #
-# Started by roxy-backup.timer. Runs /usr/local/lib/roxy/backup.sh (source: deploy/tools/backup.sh), which copies
+# Started by roxy-backup.timer, and by roxy-backup-request.path when the app or scripts/ctl.py asks for a backup
+# ("back up now"). Runs /usr/local/lib/roxy/backup.sh (source: deploy/tools/backup.sh), which copies
 # each database with SQLite's VACUUM INTO, verifies the copy with PRAGMA integrity_check, compresses it with zstd,
 # encrypts it with age when a recipient is configured, keeps 14 daily and 8 weekly backups in /var/backups/roxy,
 # and optionally pushes it off the box with rclone (D15). cache.db is never backed up (disposable). Backups never

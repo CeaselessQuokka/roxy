@@ -14,8 +14,10 @@ How it works
     the rule's message or v1's default text; `Retry-After`, `Roxy-Throttle-Reset` (the same seconds),
     `Roxy-Throttled: True`, `Roxy-Client-Limited: True`. Tarpit category `user_agent_rule`. Bypass entries skip it.
     The pipeline counts every evaluated rule as a hit, allowed or refused (row 76), also as an aggregated
-    `ua_rule_hit` event for the metrics. Matching can run admin regexes (`uses_patterns`), so while regex rules
-    exist it runs only for a request the cheaper limiters before it admitted (`roxy/abuse/pipeline.py`).
+    `ua_rule_hit` event for the metrics; the matching rule row is also reported as a rule hit (`facts.note_match`)
+    for the per-minute hit history, even when an earlier limiter refused the request first. Matching can run admin
+    regexes (`uses_patterns`), so while regex rules exist it runs only for a request the cheaper limiters before it
+    admitted (`roxy/abuse/pipeline.py`).
 
 What to read next
     `roxy/abuse/ua_rules.py`, then `roxy/abuse/checks/ignored_paths.py`.
@@ -25,7 +27,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from roxy.abuse.checks.base import Algo, Check, Facts, LimitSpec, TxState, refusal_headers, with_trio
+from roxy.abuse.checks.base import (
+    TABLE_UA_RULE,
+    Algo,
+    Check,
+    Facts,
+    LimitSpec,
+    TxState,
+    refusal_headers,
+    with_trio,
+)
 from roxy.abuse.messages import REASON_UA_RULE
 from roxy.abuse.ua_rules import match_ua_rule, ua_limit, ua_message
 from roxy.abuse.verdict import TRUE, Refuse
@@ -45,6 +56,7 @@ class UaRuleCheck(Check):
         rule = match_ua_rule(facts.rules, req.user_agent, enabled=facts.bool("user_agent_rules_enabled"))
         if rule is None:
             return None
+        facts.note_match(TABLE_UA_RULE, rule.id)  # matched, whether its budget admits or refuses
         limit = ua_limit(rule, facts.limit_key)
         algo: Algo = "cooldown" if limit.kind == "cooldown" else "fixed"
         return LimitSpec(

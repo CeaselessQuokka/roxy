@@ -20,6 +20,10 @@ How it works
       as is and must not add `Roxy-Refusal` from `reason`, which would unmask a disguised refusal.
     - `reason` is always the true reason code (metrics, live feed); `disguised` says the caller was told otherwise.
     - `detail` is the v1 tarpit and live-feed reason string (for example `Rate rule: games.roblox.com/v1/*`).
+    - `matches` (on `Allow` and `Refuse`) names every admin rule row the request matched, `{control.db table: row
+      id}` (an endpoint block, a rate rule, a header filter, a User-Agent rule, a bypass, deny or ban entry), whatever
+      the verdict; the pipeline fills it and records the hits (`checks/base.py Facts.note_match`). Never sent to the
+      caller.
 
 What to read next
     `roxy/abuse/messages.py` (every text), then `roxy/abuse/pipeline.py`.
@@ -68,6 +72,7 @@ class Allow:
 
     headers: dict[str, str] = field(default_factory=dict)
     serve_throttled_from_cache: bool = False
+    matches: dict[str, str] = field(default_factory=dict)  # rule rows this request matched (module docstring)
 
 
 @dataclass(slots=True)
@@ -88,6 +93,7 @@ class Refuse:
     # Added by the abuse agent (DESIGN.md: add fields, never rename).
     detail: str = ""
     content_type: str = JSON_CONTENT_TYPE
+    matches: dict[str, str] = field(default_factory=dict)  # rule rows this request matched (module docstring)
 
     def encoded_body(self) -> bytes:
         """The bytes to send: the JSON wire form for every refusal, the page itself for the HTML challenge."""

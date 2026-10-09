@@ -8,6 +8,8 @@
 # When enabled: every push to main runs CI first (this workflow calls ci.yml), then one deploy at a time
 # (`concurrency`) connects over SSH with a pinned host key and runs deploy/deploy.sh <sha> on the server, which
 # builds the release, migrates, starts the idle color, gates on its health, and switches nginx (plan 17.4).
+# CI's dependency audit (pip-audit counts and advisory ids) rides along as ROXY_ADVISORY_* variables; deploy.sh
+# records them in /var/lib/roxy-deploy/advisories.json for health check H-VERSION (plan 13.2).
 
 name: Deploy
 
@@ -42,13 +44,17 @@ jobs:
         env:
           ROXY_SHA: ${{ github.sha }}
           ROXY_REPO: ${{ github.repository }}
+          # CI's pip-audit result for this commit (counts and ids only; deploy.sh validates each one again).
+          ROXY_ADVISORY_COUNT: ${{ needs.ci.outputs.advisories }}
+          ROXY_ADVISORY_FIXABLE: ${{ needs.ci.outputs.advisories_fixable }}
+          ROXY_ADVISORY_IDS: ${{ needs.ci.outputs.advisory_ids }}
         with:
           host: ${{ secrets.LIGHTSAIL_HOST }}
           username: ${{ secrets.LIGHTSAIL_USER }}
           key: ${{ secrets.LIGHTSAIL_SSH_KEY }}
           # The server's host key fingerprint, so a machine pretending to be the server is refused (plan 9.14).
           fingerprint: ${{ secrets.LIGHTSAIL_HOST_FINGERPRINT }}
-          envs: ROXY_SHA,ROXY_REPO
+          envs: ROXY_SHA,ROXY_REPO,ROXY_ADVISORY_COUNT,ROXY_ADVISORY_FIXABLE,ROXY_ADVISORY_IDS
           command_timeout: 25m
           script: |
             set -Eeuo pipefail
