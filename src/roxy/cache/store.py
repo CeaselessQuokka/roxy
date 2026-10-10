@@ -494,6 +494,7 @@ class PurgeKind(StrEnum):
     PATTERN = "pattern"
     EXPIRED = "expired"
     PARAM = "param"
+    SEARCH = "search"  # the cache browser's search text: "Purge matching" (v1 bug 4, finding parity-15)
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,6 +532,11 @@ class PurgeScope:
         return cls(PurgeKind.EXPIRED, include_stale=include_stale)
 
     @classmethod
+    def search(cls, text: str) -> PurgeScope:
+        """Exactly the entries the cache browser lists for search `text` (`cache/read_browser.py`)."""
+        return cls(PurgeKind.SEARCH, text)
+
+    @classmethod
     def param(cls, name: str) -> PurgeScope:
         """Entries affected by adding or removing ignored query parameter `name` (scoped, parity row 54)."""
         return cls(PurgeKind.PARAM, name)
@@ -547,6 +553,10 @@ class PurgeScope:
             raise ValueError("Nothing to purge: pass an id, a pattern, expired or all")
         if kind == PurgeKind.HOST:
             return PurgeScope(kind, text.lower().rstrip("."))
+        if kind == PurgeKind.SEARCH:
+            from roxy.cache import read_browser  # lazy: read_browser imports this module
+
+            return PurgeScope(kind, read_browser.search_text(text))
         if kind == PurgeKind.PATTERN:
             pattern_type = kind_of(self.pattern_type)
             return PurgeScope(kind, validate_pattern(text, pattern_type), pattern_type=pattern_type)
@@ -1154,6 +1164,12 @@ class CacheStore:
                 return target_matches(pattern, pattern_type, f"{row['host']}/{row['path']}")
 
             return await shared.delete_matching("host, path", matches)
+        if kind == PurgeKind.SEARCH:
+            from roxy.cache import read_browser  # lazy: read_browser imports this module
+
+            # The browser's own condition and the generation floor it lists from: one matcher (bug 4).
+            where = f"generation >= ? AND {read_browser.SEARCH_CONDITION}"
+            return await shared.delete_where(where, (floor, *read_browser.search_params(str(scope.value))))
         name = str(scope.value)
         return await shared.delete_matching("params_json", lambda row: _params_mention(row["params_json"], name))
 

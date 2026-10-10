@@ -11,8 +11,18 @@ from typing import Any
 import pytest
 
 from roxy.core.clock import FakeClock
-from roxy.scheduler.jobs import Job, JobRegistry, JobRunner, register_storage_jobs
+from roxy.scheduler.jobs import (
+    SCHEDULE_PREFIX,
+    Job,
+    JobRegistry,
+    JobRunner,
+    read_schedule,
+    record_start,
+    register_storage_jobs,
+    schedule_key,
+)
 from roxy.scheduler.leader import JobContext, LeaderElector, LostLeadership
+from roxy.storage.db import SharedStateUnavailable
 from roxy.storage.retention import RetentionPolicy
 
 
@@ -100,14 +110,174 @@ async def test_non_idempotent_job_runs_once_per_bucket_across_leaders(dbs, fake_
     fake_clock.advance(16)  # a dies; b takes over within the same minute bucket
     await b.tick()
     assert b.is_leader
-    await runner_b.tick()
-    await _settle(runner_b)
+    assert await runner_b.tick() == []  # the fleet schedule: a ran it 16 s ago (finding mpjobs-7)
+    await runner_b.run_job_now("digest")  # forced anyway: the idempotency key still stops a second send
     assert sent == [1]  # b's run of the same bucket was a no-op
     assert runner_b.status()[0]["skipped"] == 1
-    keys = dbs.hot.read_sync(lambda c: [tuple(r) for r in c.execute("SELECT idem_key, epoch FROM job_runs")])
+    keys = dbs.hot.read_sync(
+        lambda c: [tuple(r) for r in c.execute("SELECT idem_key, epoch FROM job_runs WHERE idem_key LIKE 'job:%'")]
+    )
     assert len(keys) == 1
     assert keys[0][0].startswith("job:digest:")
     assert keys[0][1] == 1
+
+
+def _schedule_rows(dbs: Any) -> dict[str, tuple[int, int]]:
+    """`{job name: (epoch, started_at)}` of the fleet schedule rows in hot.db `job_runs`."""
+    rows = dbs.hot.read_sync(
+        lambda c: c.execute(
+            "SELECT idem_key, epoch, started_at FROM job_runs WHERE idem_key LIKE 'schedule:%'"
+        ).fetchall()
+    )
+    return {str(r[0]).removeprefix(SCHEDULE_PREFIX): (int(r[1]), int(r[2])) for r in rows}
+
+
+async def test_a_new_leader_follows_the_fleet_schedule_instead_of_its_own(dbs, fake_clock: FakeClock) -> None:
+    """mpjobs-7: a takeover reruns nothing early. Each job runs one interval after its last start anywhere in the
+    fleet (overdue ones at once); a job no leader ever ran keeps the new leader's own schedule."""
+    calls: list[str] = []
+    registry = JobRegistry()
+    registry.add(_counter_job("hourly", 3600, calls))  # run_at_start: the hourly LLM export shape
+    registry.add(_counter_job("often", 5, calls))
+    registry.add(_counter_job("later", 300, calls, run_at_start=False))
+    a = LeaderElector(dbs.hot, "a", fake_clock)
+    b = LeaderElector(dbs.hot, "b", fake_clock)
+    runner_a = JobRunner(registry, a, fake_clock, worker_id="a")
+    runner_b = JobRunner(registry, b, fake_clock, worker_id="b")
+    started_at = int(fake_clock.now())
+    await a.tick()
+    assert sorted(await runner_a.tick()) == ["hourly", "often"]
+    await _settle(runner_a)
+    assert _schedule_rows(dbs) == {"hourly": (1, started_at), "often": (1, started_at)}
+    assert await runner_b.tick() == []  # a follower runs no leader job
+    fake_clock.advance(16)  # a stops renewing; b takes the lease over (a new epoch)
+    await b.tick()
+    assert b.is_leader
+    assert b.state.epoch == 2
+    assert await runner_b.tick() == ["often"]  # overdue in the fleet; the hourly one ran 16 s ago
+    await _settle(runner_b)
+    status = {row["name"]: row for row in runner_b.status()}
+    assert 3584 - 1 <= status["hourly"]["next_due_in_s"] <= 3584
+    assert 284 - 1 <= status["later"]["next_due_in_s"] <= 300  # no row: one interval after b first looked
+    assert _schedule_rows(dbs)["often"] == (2, started_at + 16)
+    fake_clock.advance(3584)
+    assert sorted(await runner_b.tick()) == ["hourly", "later", "often"]
+    await _settle(runner_b)
+    assert calls.count("hourly:1") == 1
+    assert calls.count("hourly:2") == 1  # once per interval across the fleet
+
+
+async def test_a_new_leader_never_runs_a_job_earlier_than_its_own_schedule(dbs, fake_clock: FakeClock) -> None:
+    """A job that is overdue in the fleet but not yet due here (`run_at_start=False`: one interval after this worker
+    started, the health poll's "never at boot or deploy") waits for this worker's own schedule."""
+    calls: list[str] = []
+    registry = JobRegistry()
+    registry.add(_counter_job("poll", 300, calls, run_at_start=False))
+    a = LeaderElector(dbs.hot, "a", fake_clock)
+    b = LeaderElector(dbs.hot, "b", fake_clock)
+    runner_a = JobRunner(registry, a, fake_clock, worker_id="a")
+    await a.tick()
+    await runner_a.run_job_now("poll")  # the fleet ran it at T0
+    fake_clock.advance(250)
+    await a.tick()  # a leads again for now (a takeover of its own expired lease: a new epoch)
+    runner_b = JobRunner(registry, b, fake_clock, worker_id="b")
+    assert await runner_b.tick() == []  # b starts at T0 + 250: its own first run is due at T0 + 550
+    fake_clock.advance(150)  # T0 + 400: a is gone (its lease ran out at T0 + 265), b takes over
+    await b.tick()
+    assert b.is_leader
+    assert await runner_b.tick() == []  # overdue in the fleet since T0 + 300, but not before b's own T0 + 550
+    fake_clock.advance(150)
+    assert await runner_b.tick() == ["poll"]
+    await _settle(runner_b)
+    assert calls == ["poll:1", f"poll:{b.state.epoch}"]
+
+
+async def test_a_stale_leader_neither_records_nor_runs(dbs, fake_clock: FakeClock) -> None:
+    """The schedule row is a fenced write: a worker that still believes it leads after a takeover runs nothing."""
+    calls: list[str] = []
+    registry = JobRegistry()
+    registry.add(_counter_job("hourly", 3600, calls))
+    registry.add(_counter_job("often", 5, calls))
+    a = LeaderElector(dbs.hot, "a", fake_clock)
+    b = LeaderElector(dbs.hot, "b", fake_clock)
+    runner_a = JobRunner(registry, a, fake_clock, worker_id="a")
+    await a.tick()
+    await runner_a.tick()
+    await _settle(runner_a)
+    fake_clock.advance(16)
+    await b.tick()  # b took over; a has not noticed yet (it did not tick)
+    assert a.is_leader
+    assert b.is_leader
+    assert await runner_a.tick() == ["often"]  # started, then refused by the fence before its function ran
+    await _settle(runner_a)
+    assert calls == ["hourly:1", "often:1"]
+    status = {row["name"]: row for row in runner_a.status()}
+    assert status["often"]["skipped"] == 1
+    assert "lost leadership" in status["often"]["last_error"]
+    assert _schedule_rows(dbs)["often"][0] == 1  # nothing recorded under the stale epoch's later attempt
+
+
+async def test_a_start_stamped_in_the_future_never_delays_a_job_by_more_than_one_interval(
+    dbs, fake_clock: FakeClock
+) -> None:
+    calls: list[str] = []
+    registry = JobRegistry()
+    registry.add(_counter_job("hourly", 3600, calls))
+    future = int(fake_clock.now()) + 10 * 3600  # a row written while some clock ran ahead
+    dbs.hot.write_sync(lambda conn: record_start(conn, "hourly", 1, future))
+    elector = LeaderElector(dbs.hot, "a", fake_clock)
+    runner = JobRunner(registry, elector, fake_clock, worker_id="a")
+    await elector.tick()
+    assert await runner.tick() == []
+    assert runner.status()[0]["next_due_in_s"] == 3600
+    fake_clock.advance(3600)
+    assert await runner.tick() == ["hourly"]
+    await _settle(runner)
+
+
+async def test_leader_jobs_wait_while_the_fleet_schedule_cannot_be_read(dbs, fake_clock: FakeClock) -> None:
+    """hot.db unreadable when this worker becomes the leader: per-worker jobs go on, leader jobs wait one tick and
+    read the schedule again (they need hot.db for their fenced writes anyway)."""
+    calls: list[str] = []
+    registry = JobRegistry()
+    registry.add(_counter_job("leader_job", 60, calls))
+    registry.add(_counter_job("worker_job", 60, calls, leader_only=False))
+    elector = LeaderElector(dbs.hot, "a", fake_clock)
+    runner = JobRunner(registry, elector, fake_clock, worker_id="a")
+    await elector.tick()
+    real_read = dbs.hot.read
+
+    async def broken_read(*_args: Any, **_kwargs: Any) -> Any:
+        raise SharedStateUnavailable("hot", "disk I/O error")
+
+    dbs.hot.read = broken_read
+    try:
+        assert await runner.tick() == ["worker_job"]
+    finally:
+        dbs.hot.read = real_read
+    await _settle(runner)
+    assert await runner.tick() == ["leader_job"]
+    await _settle(runner)
+    assert sorted(calls) == ["leader_job:1", "worker_job:0"]
+
+
+def test_schedule_rows_are_one_per_job_and_read_back_bounded(dbs) -> None:
+    def fill(conn: Any) -> None:
+        for i in range(5):
+            record_start(conn, f"job_{i}", 3, 1_000 + i)
+        record_start(conn, "job_0", 4, 2_000)  # a later start replaces the row (one row per job name)
+        conn.execute("INSERT INTO job_runs (idem_key, epoch, started_at) VALUES ('job:digest:1', 3, 5)")
+
+    dbs.hot.write_sync(fill)
+    assert dbs.hot.read_sync(read_schedule) == {
+        "job_0": 2_000,
+        "job_1": 1_001,
+        "job_2": 1_002,
+        "job_3": 1_003,
+        "job_4": 1_004,
+    }
+    assert len(dbs.hot.read_sync(lambda c: read_schedule(c, limit=2))) == 2
+    assert schedule_key("llm_export_file") == "schedule:llm_export_file"
 
 
 async def test_failures_timeouts_and_lost_leadership_are_recorded(dbs, fake_clock: FakeClock) -> None:

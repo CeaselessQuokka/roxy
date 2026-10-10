@@ -219,7 +219,7 @@ When shared state cannot be read or written (`roxy.storage.db.SharedStateUnavail
 | Credential | Not used; an allowlisted request gets 503 with `Retry-After` (it goes anonymous only when its allowlist row says `identical_anonymous`) | `roxy.egress.credential.CredentialManager.authorize` | `tests/unit/egress/test_egress_credential.py::test_unreadable_shared_state_means_no_credential`, `tests/security/test_confinement_routing.py::test_shared_state_unavailable_never_uses_the_credential` |
 | Tarpit | Never holds; the refusal is instant | `roxy.abuse.tarpit.Tarpit.plan` | `tests/unit/abuse/test_abuse_tarpit.py::test_fails_closed_without_shared_state` |
 | Per-IP limit | Each worker enforces `limit // workers` in memory, merged back into hot.db later | `src/roxy/abuse/pipeline.py`, `roxy.abuse.limiter.degraded_limit` | `tests/integration/test_review_c7_failure_modes.py::test_review_readonly_hot_per_ip_limit_is_limit_over_workers`, `tests/multiprocess/test_rr_mp_degraded.py::test_rr_mp_leaving_degraded_mode_never_refills_the_allowance` |
-| Admin login | Refused with 503 and a clear message | `roxy.admin.auth.flow.UNAVAILABLE_TEXT`, `src/roxy/admin/auth/deps.py` | No dedicated test yet (a known gap) |
+| Admin login | Refused with 503 and a clear message, never a 500 and never a session from a failed step | `roxy.admin.auth.flow.UNAVAILABLE_TEXT`, `src/roxy/admin/auth/deps.py` | `tests/security/test_auth_c7_unavailable.py::test_login_answers_503_within_one_busy_timeout_while_hot_db_is_locked`, `tests/security/test_auth_c7_unavailable.py::test_second_factor_step_answers_503_while_control_db_is_locked`, `tests/security/test_auth_c7_unavailable.py::test_no_login_step_ever_answers_500_when_a_database_refuses` |
 | Upstream pacing | No unpaced call: 503 `degraded`, or stale data | `src/roxy/upstream/service.py` | `tests/integration/test_pipeline_e2e.py::test_row_degraded_shared_state` |
 | Metrics | Degrade open: keep serving, flag the gap | `src/roxy/metrics/recorder.py` | `tests/integration/test_review_c7_failure_modes.py::test_review_readonly_metrics_degrade_open` |
 
@@ -340,6 +340,12 @@ covers your own address needs an explicit confirmation.
   trip, managing passkeys and recovery codes, the admin allowlist, arming the spam auto-ban, the factory reset, the
   full LLM export, and a health run that spends a credential call. The list is pinned by
   `tests/security/test_admin_routes.py::test_fresh_mfa_routes_are_exactly_the_documented_sensitive_ones`.
+- Changing an `admin_security` or `credential` setting, a sensitive setting, `export_include_ips` or
+  `health_auto_include_credential` needs the same fresh second factor, in every settings writer. The rule is judged
+  again inside the settings write transaction on what control.db holds (`roxy.admin.api.settings.WriteRules`), so a
+  worker whose settings copy lags a change made elsewhere (up to a second) cannot let a stale session put an old
+  value back; arming the spam detectors is refused there too unless it comes from the arm route
+  (`tests/integration/admin_api/test_r4_secfix_fresh_mfa_race.py::test_a_stale_session_cannot_switch_the_allowlist_off_through_a_lagging_worker`).
 - The session id rotates at login, enrollment and re-authentication; a planted session id is never adopted. Signing
   out everywhere bumps a session epoch that ends every session at once.
 - Every login sends a "Roxy Admin Login" email with a one-time kill-switch link (`/admin/invalidate/<token>`,

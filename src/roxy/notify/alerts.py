@@ -211,6 +211,16 @@ ALERT_SPECS: dict[str, AlertSpec] = {
             runbook="auto-apply-rollback",
         ),
         AlertSpec(
+            # Plan 11.4 "the admin is notified": the guard metric got worse but the automatic undo was refused (an
+            # admin changed the row during the watch window), so the change is still in place (finding insights-5).
+            "auto_apply_rollback_failed",
+            "Roxy: auto-applied change could not be rolled back",
+            "critical",
+            "rollback_failed:{rec_id}",
+            DAY_S,
+            runbook="auto-apply-rollback",
+        ),
+        AlertSpec(
             "login_global",
             "Roxy: login attempts throttled globally",
             "warn",

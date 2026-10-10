@@ -52,7 +52,7 @@ from typing import Any, Final, TypeVar
 
 from roxy.cache import read_observations
 from roxy.cache.policy import select_rule
-from roxy.config import read_changes
+from roxy.config import catalog, read_changes, read_settings
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.egress import read_credential
 from roxy.metrics import disk_history, queries, read_history, read_producers
@@ -452,6 +452,14 @@ class InsightContext:
             lambda c: read_history.samples_between(c, window.start, window.end, wanted),
         )
 
+    async def refusal_samples(self, window: Window) -> list[dict[str, Any]]:
+        """`refusal_samples` rows in the window, in time order: requests a limiter refused (metrics.db schema 7), the
+        refused part of the stream a limit dry run replays (finding LOGICFIX-5)."""
+        return await self._metrics(
+            ("refusal_samples", window),
+            lambda c: read_history.refusal_samples_between(c, window.start, window.end),
+        )
+
     async def internal_calls(self, window: Window) -> list[dict[str, Any]]:
         return await self._metrics(("internal", window), lambda c: queries.internal_calls(c, window))
 
@@ -608,6 +616,20 @@ class InsightContext:
         return await self._cached(
             ("changes", int(since), int(end)),
             lambda: self.dbs.control.read(lambda c: read_changes.recent_changes(c, since, end)),
+        )
+
+    async def setting_timeline(self, key: str, since: float) -> list[tuple[int, Any]]:
+        """The values setting `key` had from `since` on: `[(from_s, value)]`, oldest first, the first entry the value
+        in force at `since` (`config/read_settings.py value_timeline`; the dry run's sampling rate per sample time,
+        finding LOGICFIX-6)."""
+        spec = catalog.CATALOG[key]
+        default = catalog.DEFAULTS.get(key, spec.default)
+        live = self.setting(key)
+        return await self._cached(
+            ("timeline", key, int(since)),
+            lambda: self.dbs.control.read(
+                lambda c: read_settings.value_timeline(c, key, since, default=default, live=live)
+            ),
         )
 
     async def service_state(self, key: str) -> Any:

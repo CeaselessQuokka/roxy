@@ -28,9 +28,18 @@ How it works (lifecycle, plan 11.1 and 11.3)
     - A fingerprint `applied` or `auto_applied` within the watch window (`auto_apply_watch_minutes`) stays quiet:
       its change is being watched.
     - Anything else opens a new recommendation (`rec_<ulid>`, `expires_at = now + recommendation_expiry_days`).
-    - `open` and `snoozed` rows of a rule that ran successfully whose condition is gone become `resolved`.
+    - `open` and `snoozed` rows of a rule that ran successfully whose condition is gone become `resolved` (a card
+      the `MAX_PER_RULE` cap left out this run still holds, so it is not resolved; `RuleOutcome.held`).
     Every state change is an `events` row of type `recommendation` in the same transaction, so a dashboard never
     sees a state the table does not hold.
+
+Triggers
+    The poll keeps id cursors (the highest `events` and `upstream_429` row ids it has read), never time cursors:
+    each worker's batch writer flushes rows about 2 s after they happen, with their own event time, so a row can
+    land after a poll that already moved past its time; by id it is counted by the next poll whatever its time.
+    `events` ids are never reused (AUTOINCREMENT); `upstream_429` ids are, after a data reset deletes the newest
+    rows, so the poll also remembers the cursor row's time and request id: when that row is gone or another row
+    holds its id, that one poll counts the rows at or after the remembered time (finding LOGICFIX-3).
 
 What to read next
     `roxy/insights/rules/base.py` (rules), `roxy/insights/context.py` (what rules read), `roxy/insights/actions.py`
@@ -94,13 +103,22 @@ TRIGGER_KINDS: Final[frozenset[str]] = frozenset(
 
 @dataclass(slots=True)
 class RuleOutcome:
-    """What one rule produced in one evaluation."""
+    """What one rule produced in one evaluation.
+
+    `recommendations` are at most `MAX_PER_RULE` (the most severe); `held` is every fingerprint the rule reported
+    above its evidence minimum, also those the cap cut, so `persist` never resolves a card whose condition still
+    holds (a cut card keeps its state and evidence until a later run publishes it again, or it expires)."""
 
     rule_id: str
     recommendations: list[Recommendation] = field(default_factory=list)
     skipped: str | None = None  # "insights_disabled", "rule_disabled", "unknown_rule"
     error: str | None = None
     duration_ms: float = 0.0
+    held: frozenset[str] = frozenset()
+
+    def held_fingerprints(self) -> frozenset[str]:
+        """Fingerprints whose condition holds this run (`held`, or the kept recommendations' when unset)."""
+        return self.held or frozenset(rec.fingerprint for rec in self.recommendations)
 
     @property
     def ran(self) -> bool:
@@ -221,10 +239,14 @@ class InsightsEngine:
             return outcome
         finally:
             outcome.duration_ms = round((time.perf_counter() - started) * 1000, 2)
-        outcome.recommendations = self._finalize(rule, ctx, raw)
+        outcome.recommendations, outcome.held = self._finalize(rule, ctx, raw)
         return outcome
 
-    def _finalize(self, rule: Rule, ctx: InsightContext, raw: Iterable[Recommendation]) -> list[Recommendation]:
+    def _finalize(
+        self, rule: Rule, ctx: InsightContext, raw: Iterable[Recommendation]
+    ) -> tuple[list[Recommendation], frozenset[str]]:
+        """The rule's results through the engine pipeline: the `MAX_PER_RULE` most severe, and every fingerprint
+        reported (the cap bounds what is stored and published, never what counts as still true)."""
         forced = str(ctx.setting(f"insight_{rule.slug}_severity"))
         minimum = rule.minimum_evidence(ctx)
         best: dict[str, Recommendation] = {}
@@ -237,8 +259,15 @@ class InsightsEngine:
             rec.computed_severity = rec.severity
             if forced != "auto":
                 rec.severity = forced
-            # 11.2: safe to auto-apply only if the rule allows it and every change is scoped to one row.
-            rec.safe_auto = bool(rule.safe_auto and rec.safe_auto and rec.all_scoped)
+            # 11.2: safe to auto-apply only if the rule allows it and every change is scoped to one row, and a
+            # new pattern rule names exactly one endpoint (a v1 glob also covers every path below it; finding
+            # insights-8). `models.py` cannot hold this check: `simulate` imports `models`.
+            # An update of a template's own legacy glob row counts as wide too (finding LOGICFIX-2); the card then
+            # says why it is not applied automatically.
+            wanted = bool(rule.safe_auto and rec.safe_auto and rec.all_scoped)
+            rec.safe_auto = wanted and all(simulate.endpoint_scoped(change) for change in rec.changes)
+            if wanted and not rec.safe_auto and simulate.WIDE_PATTERN_NOTE not in rec.explanation:
+                rec.explanation = f"{rec.explanation.rstrip()} {simulate.WIDE_PATTERN_NOTE}".strip()
             rec.dry_run_available = simulate.can_simulate(rec)
             if rec.evidence.window_to is None:
                 rec.evidence.window_to = ctx.now
@@ -246,7 +275,7 @@ class InsightsEngine:
             if kept is None or severity_rank(rec.severity) > severity_rank(kept.severity):
                 best[rec.fingerprint] = rec
         ordered = sorted(best.values(), key=lambda r: (-severity_rank(r.severity), r.subject))
-        return ordered[:MAX_PER_RULE]
+        return ordered[:MAX_PER_RULE], frozenset(best)
 
     async def evaluate(
         self, rule_ids: Iterable[str] | None = None, *, now: float | None = None, trigger: str = "schedule"
@@ -301,7 +330,7 @@ class InsightsEngine:
             return None
         when = float(self.clock.now() if now is None else now)
         # Kinds seen during the minimum gap wait here, so a burst starts one run, not none.
-        self._pending_triggers |= await self._trigger_kinds(when)
+        self._pending_triggers |= await self._trigger_kinds()
         kinds = set(self._pending_triggers)
         if not kinds or when - self._last_trigger_run < TRIGGER_MIN_GAP_S:
             return None
@@ -310,16 +339,19 @@ class InsightsEngine:
         wanted = [rid for rid, rule in self.rules.items() if not rule.triggers or rule.triggers & kinds]
         return await self.run_once(now=when, trigger=",".join(sorted(kinds)), job=job, rule_ids=wanted)
 
-    async def _trigger_kinds(self, now: float) -> set[str]:
+    async def _trigger_kinds(self) -> set[str]:
+        """Trigger kinds seen since the previous poll (module docstring "Triggers"); the first poll only sets the
+        cursors. No cursor compares event times."""
         cursor = self._trigger_cursor
         snap = self._settings_snapshot()
         burst = int(snap["insight_up_429_endpoint_min_429s"])  # a "429 burst" is what UP-429-ENDPOINT calls enough
         types = sorted(TRIGGER_EVENT_TYPES)
         after = int(cursor.get("event_id", -1))
-        since_ms = int(cursor.get("since_ms", int(now * 1000)))
+        after_429 = int(cursor.get("upstream_429_id", -1))
+        mark_429 = cursor.get("upstream_429_mark")  # (at_ms, request_id) of the cursor row when it was read
         last_health = int(cursor.get("health_id", -1))
 
-        def read(conn: sqlite3.Connection) -> tuple[int, list[str], int, int, str | None]:
+        def read(conn: sqlite3.Connection) -> tuple[int, list[str], int, Any, int, int, str | None]:
             top = int(conn.execute("SELECT coalesce(max(id), 0) FROM events").fetchone()[0])
             found: list[str] = []
             if after >= 0:
@@ -331,20 +363,57 @@ class InsightsEngine:
                         (after, *types),
                     )
                 ]
-            n429 = int(conn.execute("SELECT count(*) FROM upstream_429 WHERE at_ms >= ?", (since_ms,)).fetchone()[0])
+            # Rows flushed since the last poll, whatever their own time (a range on the primary key; the count
+            # stops at the burst size, the most the decision needs).
+            head = conn.execute("SELECT id, at_ms, request_id FROM upstream_429 ORDER BY id DESC LIMIT 1").fetchone()
+            top_429 = int(head[0]) if head else 0
+            new_mark = (int(head[1]), head[2]) if head else None
+            n429 = 0
+            if after_429 >= 0 and burst > 0:
+                # `upstream_429.id` has no AUTOINCREMENT: after a data reset deleted the newest rows, SQLite gives the
+                # next rows ids at or below the cursor (finding LOGICFIX-3). The cursor row then is gone, or another
+                # row holds its id: for this one poll, rows at or after its time count instead.
+                reused = False
+                if after_429 > 0:
+                    still = conn.execute(
+                        "SELECT at_ms, request_id FROM upstream_429 WHERE id = ?", (after_429,)
+                    ).fetchone()
+                    reused = still is None or mark_429 is None or (int(still[0]), still[1]) != tuple(mark_429)
+                if reused and mark_429 is not None:
+                    n429 = int(
+                        conn.execute(
+                            "SELECT count(*) FROM (SELECT 1 FROM upstream_429 WHERE at_ms >= ? LIMIT ?)",
+                            (int(mark_429[0]), burst),
+                        ).fetchone()[0]
+                    )
+                elif top_429 > after_429:
+                    n429 = int(
+                        conn.execute(
+                            "SELECT count(*) FROM (SELECT 1 FROM upstream_429 WHERE id > ? LIMIT ?)",
+                            (after_429, burst),
+                        ).fetchone()[0]
+                    )
             row = conn.execute("SELECT id, summary FROM health_runs ORDER BY id DESC LIMIT 1").fetchone()
-            return top, found, n429, int(row[0]) if row else 0, (row[1] if row else None)
+            return top, found, top_429, new_mark, n429, int(row[0]) if row else 0, (row[1] if row else None)
 
-        top, found, n429, health_id, summary = await self.dbs.metrics.read(read)
+        top, found, top_429, new_mark, n429, health_id, summary = await self.dbs.metrics.read(read)
         kinds = {TRIGGER_EVENT_TYPES[t] for t in found}
-        if n429 >= burst > 0 and "since_ms" in cursor:
+        if n429 >= burst > 0:
             kinds.add("roblox_429_burst")
         version = getattr(self.settings, "version", None)
         if "config_version" in cursor and version is not None and version != cursor["config_version"]:
             kinds.add("settings_change")
         if last_health >= 0 and health_id > last_health and _health_failed(summary):
             kinds.add("health_fail")
-        cursor.update(event_id=top, since_ms=int(now * 1000), health_id=health_id, config_version=version)
+        # A table emptied by a data reset gives a lower top id: the cursor follows it (with the identity of its row,
+        # so a reset before the next poll is seen even when new rows reused the ids; LOGICFIX-3).
+        cursor.update(
+            event_id=top,
+            upstream_429_id=top_429,
+            upstream_429_mark=new_mark,
+            health_id=health_id,
+            config_version=version,
+        )
         return kinds
 
     # ---- reads for the API and the actions ----
@@ -544,13 +613,12 @@ def persist(
         for row in rows:  # oldest first: the newest row per fingerprint wins
             stored = row_to_recommendation(row)
             latest[stored.fingerprint] = stored
-        seen: set[str] = set()
         for rec in outcome.recommendations:
-            seen.add(rec.fingerprint)
             existing = latest.get(rec.fingerprint)
             _apply_result(conn, rec, existing, now, policy, report, out, clock)
+        held = outcome.held_fingerprints()  # also the ones MAX_PER_RULE cut: still true, so never "resolved"
         for fingerprint, stored in latest.items():
-            if fingerprint in seen or stored.state not in ACTIVE_STATES:
+            if fingerprint in held or stored.state not in ACTIVE_STATES:
                 continue
             stored.state, stored.updated_at = "resolved", now
             write_recommendation(conn, stored)

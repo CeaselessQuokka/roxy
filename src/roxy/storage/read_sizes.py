@@ -5,8 +5,9 @@ What this is
     every table its row count, its bytes on disk (table plus its indexes, from SQLite's `dbstat` virtual table),
     its oldest row, the rows added in the last 7 days and a projection of rows and bytes 30 days from now.
     `file_sizes(paths)` reads the size of each database file and its `-wal` and `-shm` companions.
-    `TABLES` holds what is known about each table (time column, and the retention settings that bound it, plan
-    6.10); tables a later migration adds are measured too, with rows and bytes only.
+    `TABLES` holds what is known about each table (time column, the retention settings that bound it, plan 6.10,
+    the limits the code sets where no setting exists, and the rule in plain English); tables a later migration
+    adds are measured too, with rows and bytes only (finding parity-10 and the producers lane added the rest).
 
 Why it exists
     Plan 6.6 ("The System page shows each table's rows, bytes, oldest row, and projected size in 30 days"), parity
@@ -52,6 +53,10 @@ class TableMeta:
     `time_col` is an indexed column holding when a row was written (`unit` seconds or milliseconds); `age` names
     the `RetentionPolicy` field (= catalog setting) holding its max age and `age_unit_s` that field's unit in
     seconds; `cap` names the policy field holding its row cap. `label` is the plain-English name.
+    Where the code sets a limit no setting holds: `fixed_age_s` (0: expired rows go at the next prune, `time_col`
+    then holds the expiry), `fixed_cap`, and `min_age_s` (an age the setting never goes below). `idle` marks an age
+    that is an idle limit: rows still in use stay however old, so no `pruning_due` is reported from it. `rule` is
+    the retention rule in plain English, for tables whose limit is not one age or cap.
     """
 
     table: str
@@ -61,10 +66,38 @@ class TableMeta:
     age: str | None = None
     age_unit_s: int = DAY_S
     cap: str | None = None
+    fixed_age_s: int | None = None
+    fixed_cap: int | None = None
+    min_age_s: int = 0
+    idle: bool = False
+    rule: str | None = None
 
 
 def _t(table: str, label: str, time_col: str | None = None, **kwargs: Any) -> TableMeta:
     return TableMeta(table, label, time_col, **kwargs)
+
+
+def _idle(table: str, label: str, time_col: str, age: str, **kwargs: Any) -> TableMeta:
+    """A hot.db table pruned by an idle limit in seconds (`age`, a policy field): rows still in use stay."""
+    kwargs.setdefault("rule", _IDLE_HOT)
+    return TableMeta(table, label, time_col, age=age, age_unit_s=1, idle=True, **kwargs)
+
+
+# Limits set by the code (no setting), copied here because the storage layer imports no metrics or insights module;
+# tests/unit/admin_api/test_r3_fix_data_fences.py pins each copy to its source.
+ERROR_MINUTE_KEEP_DAYS: Final = 8  # insights.HISTORY_KEEP_DAYS["error_minute"]
+EVICTION_PASSES_KEEP_DAYS: Final = 14  # insights.HISTORY_KEEP_DAYS["cache_eviction_passes"]
+PROVIDER_REPORTS_KEEP_DAYS: Final = 400  # insights.HISTORY_KEEP_DAYS["egress_provider_reports"]
+SCORE_MIN_KEEP_DAYS: Final = 2  # metrics.jobs.MIN_SCORE_KEEP_DAYS
+SCORE_ROW_CAP: Final = 300_000  # metrics.producers.ROW_CAPS["client_score_hour"]
+DISK_KEEP_DAYS: Final = 90  # metrics.disk_history.DISK_KEEP_DAYS
+DISK_ROW_CAP: Final = 5_000  # metrics.producers.ROW_CAPS["disk_samples"]
+TABLE_SIZES_ROW_CAP: Final = 60_000  # metrics.producers.ROW_CAPS["table_size_samples"]
+AUDIT_MIN_DAYS: Final = 400  # storage.retention.AUDIT_MIN_DAYS
+JOB_STATUS_KEEP_S: Final = DAY_S  # health.store: published rows a day old are deleted
+
+_EXPIRED: Final = "Expired rows are deleted every hour."
+_IDLE_HOT: Final = "Idle rows are deleted every minute (rows still in use stay)."
 
 
 TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
@@ -95,8 +128,25 @@ TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
             age_unit_s=3600,
             cap="request_sample_max_rows",
         ),
-        _t("annotations", "Chart markers", "at", cap="annotations_max_rows"),
-        _t("egress_usage", "Egress byte accounting", "bucket_start"),
+        _t(
+            "refusal_samples",
+            "Limiter refusal samples",
+            "at_ms",
+            unit="ms",
+            age="request_sample_hours",
+            age_unit_s=3600,
+            cap="request_sample_max_rows",
+        ),
+        _t("annotations", "Chart markers", "at", cap="annotations_max_rows", rule="Kept for good, up to the row cap."),
+        _t(
+            "egress_usage",
+            "Egress byte accounting",
+            "bucket_start",
+            rule=(
+                "Minute rows follow retention_minute_days, hour rows retention_hour_days, day and month rows "
+                "retention_day_days (as the rollups)."
+            ),
+        ),
         _t(
             "recommendations",
             "Recommendations",
@@ -106,7 +156,11 @@ TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
         ),
         _t("recommendation_actions", "Recommendation actions", "at", age="retention_recommendations_days"),
         _t("health_runs", "Health check runs", "started_at", age="retention_health_days", cap="health_runs_max"),
-        _t("health_results", "Health check results"),
+        _t(
+            "health_results",
+            "Health check results",
+            rule="Deleted with their health run (retention_health_days, health_runs_max).",
+        ),
         _t("captures", "Captured bodies", "at", age="capture_ttl_seconds", age_unit_s=1, cap="capture_max_records"),
         _t(
             "fingerprint_headers",
@@ -131,18 +185,57 @@ TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
         ),
         _t("errors", "Error signatures", "last_seen", age="retention_errors_days", cap="max_error_records"),
         _t("anomalies", "Detected anomalies", "at", age="retention_anomalies_days", cap="anomalies_max_rows"),
-        _t("worker_heartbeat", "Worker heartbeats", "last_seen", cap="heartbeat_max_rows"),
-        _t("legacy_totals", "Imported v1 lifetime totals"),
-        _t("bucket_minute", "Upstream bucket fill history", "bucket_start"),
-        _t("worker_minute", "Worker CPU and loop lag history", "bucket_start"),
-        _t("cache_minute", "Cache store and eviction history", "bucket_start"),
-        _t("cache_eviction_passes", "Cache eviction passes", "at"),
-        _t("rule_hits", "Rule hit evidence", "last_hit_at"),
-        _t("error_minute", "Error occurrences per minute", "bucket_start"),
-        _t("upstream_attempt_minute", "Upstream attempts per minute", "bucket_start"),
-        _t("egress_provider_reports", "Rotator provider byte reports", "at"),
+        _t(
+            "worker_heartbeat",
+            "Worker heartbeats",
+            "last_seen",
+            age="heartbeat_max_age_s",
+            age_unit_s=1,
+            cap="heartbeat_max_rows",
+        ),
+        _t("legacy_totals", "Imported v1 lifetime totals", rule="A few rows, kept for good."),
+        _t("bucket_minute", "Upstream bucket fill history", "bucket_start", age="retention_minute_days"),
+        _t("worker_minute", "Worker CPU and loop lag history", "bucket_start", age="retention_minute_days"),
+        _t("cache_minute", "Cache store and eviction history", "bucket_start", age="retention_minute_days"),
+        _t("cache_eviction_passes", "Cache eviction passes", "at", fixed_age_s=EVICTION_PASSES_KEEP_DAYS * DAY_S),
+        _t(
+            "rule_hits",
+            "Rule hit evidence",
+            "last_hit_at",
+            age="retention_hour_days",
+            rule="A rule's lifetime hits; deleted once it has not matched for retention_hour_days.",
+        ),
+        _t("error_minute", "Error occurrences per minute", "bucket_start", fixed_age_s=ERROR_MINUTE_KEEP_DAYS * DAY_S),
+        _t("upstream_attempt_minute", "Upstream attempts per minute", "bucket_start", age="retention_minute_days"),
+        _t(
+            "egress_provider_reports",
+            "Rotator provider byte reports",
+            "at",
+            fixed_age_s=PROVIDER_REPORTS_KEEP_DAYS * DAY_S,
+        ),
         _t("recommendation_watches", "Recommendation watch windows", "started_at"),
-        _t("health_job_status", "Published leader job status", "published_at"),
+        _t("health_job_status", "Published leader job status", "published_at", fixed_age_s=JOB_STATUS_KEEP_S),
+        # Schema version 5 (metrics/0005_producer_history.sql), pruned by the leader job `metrics_producer_prune`.
+        _t("rule_hit_minute", "Rule hits per minute", "bucket_start", age="retention_minute_days"),
+        _t("tarpit_minute", "Tarpit holds per minute", "bucket_start", age="retention_minute_days"),
+        _t("tarpit_hold_minute", "Tarpit hold times per minute", "bucket_start", age="retention_minute_days"),
+        _t(
+            "client_score_hour",
+            "Bot scores per client and hour",
+            "bucket_start",
+            age="retention_client_minute_days",
+            min_age_s=SCORE_MIN_KEEP_DAYS * DAY_S,
+            fixed_cap=SCORE_ROW_CAP,
+        ),
+        _t("metrics_pipeline_minute", "Metrics items dropped per minute", "bucket_start", age="retention_minute_days"),
+        _t("disk_samples", "Disk use samples", "at", fixed_age_s=DISK_KEEP_DAYS * DAY_S, fixed_cap=DISK_ROW_CAP),
+        _t(
+            "table_size_samples",
+            "Table size samples",
+            "at",
+            fixed_age_s=DISK_KEEP_DAYS * DAY_S,
+            fixed_cap=TABLE_SIZES_ROW_CAP,
+        ),
     ),
     "control": (
         _t("settings", "Setting overrides"),
@@ -153,22 +246,70 @@ TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
             age="retention_settings_history_days",
             cap="settings_history_max_rows",
         ),
-        _t("audit_log", "Audit log", "at", age="retention_audit_days"),
-        _t("bans", "Bans"),
+        _t("audit_log", "Audit log", "at", age="retention_audit_days", min_age_s=AUDIT_MIN_DAYS * DAY_S),
+        _t(
+            "bans",
+            "Bans",
+            "expires_at",
+            age="retention_expired_bans_days",
+            rule="Expired bans are kept retention_expired_bans_days as evidence; bans without an end stay.",
+        ),
         _t("access_list", "Bypass, admin allowlist and deny list"),
-        _t("admin_sessions", "Admin sessions", "expires_at"),
+        _t("admin_sessions", "Admin sessions", "expires_at", fixed_age_s=0, rule=_EXPIRED),
+        _t("trusted_devices", "Trusted devices", "expires_at", fixed_age_s=0, rule=_EXPIRED),
+        _t("invalidation_tokens", "Session invalidation links", "expires_at", fixed_age_s=0, rule=_EXPIRED),
         _t("admin_prefs", "Admin preferences"),
     ),
     "hot": (
-        _t("limiter", "Rate limiter state", "updated_at"),
-        _t("strikes", "Throttle strikes", "last_strike_at"),
-        _t("lease", "Leases"),
-        _t("job_runs", "Job idempotency keys", "started_at"),
-        _t("email_gate", "Alert dedupe", "last_sent_at", cap="email_gate_max_rows"),
-        _t("spam_windows", "Spam detector windows", "updated_at"),
+        _idle("limiter", "Rate limiter state", "updated_at", "stale_ip_duration"),
+        _idle("strikes", "Throttle strikes", "last_strike_at", "strike_idle_s"),
+        _idle("upstream_bucket", "Upstream buckets", "updated_at", "upstream_bucket_idle_s"),
+        _idle("aimd", "Adaptive concurrency state", "last_change_at", "aimd_idle_s"),
+        _t(
+            "cooldown",
+            "Upstream cooldowns",
+            "until_ms",
+            unit="ms",
+            age="cooldown_grace_s",
+            age_unit_s=1,
+            rule="Deleted cooldown_grace_s after they ended.",
+        ),
+        _idle(
+            "breaker",
+            "Circuit breakers",
+            "window_start",
+            "breaker_idle_s",
+            rule="Closed breakers idle for breaker_idle_s are deleted every minute.",
+        ),
+        _idle(
+            "lease",
+            "Leases",
+            "expires_ms",
+            "expired_lease_grace_s",
+            unit="ms",
+            rule="Expired leases are deleted every minute; the leader lease stays.",
+        ),
+        _t("job_runs", "Job idempotency keys and schedule", "started_at", age="job_runs_days"),
+        _idle(
+            "email_gate",
+            "Alert dedupe",
+            "last_sent_at",
+            "email_gate_idle_s",
+            cap="email_gate_max_rows",
+            rule="Hourly cap rows go after a day idle, alert dedupe rows after 45 days.",
+        ),
+        _idle(
+            "login_failures",
+            "Admin login failures",
+            "window_start",
+            "login_failures_idle_s",
+            rule="Kept at least as long as any lockout window.",
+        ),
+        _idle("spam_windows", "Spam detector windows", "updated_at", "spam_windows_idle_s"),
+        _t("csrf_cache", "Roblox CSRF tokens", "expires_at", fixed_age_s=0, rule="Expired tokens are deleted."),
     ),
     "cache": (
-        _t("entries", "Cached responses", "stored_at"),
+        _t("entries", "Cached responses", "stored_at", rule="Bounded by cache_max_entries and cache_max_bytes."),
         _t("change_observations", "TTL tuning observations", "day", age="change_observations_days"),
     ),
 }
@@ -277,12 +418,24 @@ def measure_table(
             conn.execute(f"SELECT count(*) FROM {quoted} WHERE {column} >= ?", (bound,)).fetchone()[0]  # noqa: S608
         )
     age_value = _limit(limits, meta.age if meta else None)
-    max_age_s = age_value * meta.age_unit_s if meta is not None and age_value else None
-    cap = _limit(limits, meta.cap if meta else None)
+    max_age_s: int | None = None
+    if meta is not None:
+        if age_value:
+            max_age_s = age_value * meta.age_unit_s
+        elif meta.age is None and meta.fixed_age_s is not None:
+            max_age_s = meta.fixed_age_s  # set by the code; 0 means "expired rows go at the next prune"
+        if max_age_s is not None and meta.min_age_s:
+            max_age_s = max(max_age_s, meta.min_age_s)
+    cap = _limit(limits, meta.cap) if meta is not None and meta.cap else (meta.fixed_cap if meta else None)
     status = "ok"
     if cap is not None and cap > 0 and rows > cap:
         status = "over_cap"
-    elif max_age_s and oldest_s is not None and oldest_s < now_s - max_age_s:
+    elif (
+        max_age_s is not None
+        and not (meta is not None and meta.idle)
+        and oldest_s is not None
+        and oldest_s < now_s - max_age_s
+    ):
         status = "pruning_due"
     return {
         "db": db,
@@ -297,6 +450,7 @@ def measure_table(
         "max_age_setting": meta.age if meta else None,
         "row_cap": cap,
         "row_cap_setting": meta.cap if meta else None,
+        "retention_rule": meta.rule if meta else None,
         "retention_status": status,
         "projection_30d": project(
             rows, bytes_, rows_recent=rows_recent, oldest_s=oldest_s, now_s=now_s, max_age_s=max_age_s, cap=cap

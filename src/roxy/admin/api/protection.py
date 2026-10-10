@@ -4,21 +4,24 @@ What this is
     The routes behind plan 14.1 "Protection" and the top-bar switches, in the DESIGN.md section 13 shapes:
       * Switches: pause with a message and a scheduled window, throttle-all with its limit, period and "since"
         marker, each with the text callers get and the refusals since the state began (rows 49, 114, 115); the
-        throttle-all watch (row 135).
+        throttle-all watch with v1's columns (requests and refusals since it began, rates, busiest endpoint, last
+        seen; row 135).
       * Bans with countdowns and evidence; create, lift one, lift a subject; the plan 6.8 "bans only" reset with a
         preview. Deny list, admin allowlist and bypass entries (CIDR, expiry with the `bypass_default_expiry_h`
         default, "never" needs confirmation, "Bypass my IP" with the address Roxy resolved, row 113).
-      * Throttle: every Protection setting (`PATCH /settings`, restricted to settings shown on this page, plus reset
-        to default), the ladder editor with reset to defaults (rows 40, 125), the strike board with forgive one and
-        all (row 41), who is throttled right now (row 118), the throttled history, and the plan 6.8 limiter reset.
+      * Throttle: every Protection setting (`PATCH /settings`, restricted to settings shown on this page, with the
+        settings editor's high-risk confirmation, plus reset to default), the ladder editor with reset to defaults
+        (rows 40, 125), the strike board with forgive one and all (row 41), who is throttled right now (row 118),
+        the throttled history, and the plan 6.8 limiter reset.
       * Rules: User-Agent rules with ordering and the dry-run tester (row 44), request filters with the tester and
         presets (row 45), endpoint blocks and endpoint rules (rows 43, 46) with their attempts tabs (row 75), ignored
-        paths (row 50).
+        paths (row 50). Rule and list rows carry their hits in the range and since they were added (plan 10.9), and
+        `GET /rule-hits` charts one row's hits over time.
       * Detectors and heuristics: spam detector states, dry-run results and the FILTER-COLLATERAL preview required
-        before arming (plan 10.3), the tarpit state with the effective cap fields (row 123), bot heuristics and the
-        challenge state (plan 10.7, 10.8).
-      * The pipeline diagram with per-check refusal counts for the range, the `ua_rule_hit` and `throttle_tier`
-        counters (row 76), and refusals by reason (row 116).
+        before arming (plan 10.3), the tarpit state with the effective cap fields (row 123) and the fleet's hold
+        statistics for the range (row 78), bot heuristics and the challenge state (plan 10.7, 10.8).
+      * The pipeline diagram with per-check refusal counts and per-table rule hits for the range, the `ua_rule_hit`
+        and `throttle_tier` counters (row 76), and refusals by reason (row 116).
 
 Why it exists
     v1 spread these over a dozen `/admin/...` POST endpoints with ad hoc answers. Here every route follows one
@@ -82,6 +85,7 @@ from roxy.abuse.throttle import forgive, ladder_from, strike_board, throttle_wat
 from roxy.abuse.throttle_all import STATE_KEY as THROTTLE_ALL_KEY
 from roxy.abuse.throttle_all import ThrottleAllState, set_throttle_all, throttle_all_watch
 from roxy.abuse.ua_rules import explain_user_agent_rules
+from roxy.admin.api import settings as settings_api
 from roxy.admin.api.common import (
     AdminFreshMfa,
     AdminSession,
@@ -95,9 +99,10 @@ from roxy.admin.api.common import (
     TimeRange,
     TimeRangeDep,
     actor_for,
+    add_caller_text,
     area_router,
-    collect_pages,
     conflict,
+    export_pages,
     export_table,
     not_found,
     page_rows,
@@ -105,6 +110,7 @@ from roxy.admin.api.common import (
     request_id_of,
     require_reason,
     run_mutation,
+    series_answer,
     service_errors,
     table_answer,
     table_params,
@@ -118,7 +124,7 @@ from roxy.config.constants import MAX_REASON_LENGTH, TARPIT_CATEGORIES
 from roxy.config.runtime import bump_config_version
 from roxy.config.settings_service import SettingsService, service_for
 from roxy.deps import get_ctx
-from roxy.metrics import queries, read_protection, security_events
+from roxy.metrics import queries, read_producers, read_protection, security_events
 from roxy.metrics.annotate import insert_annotation
 from roxy.metrics.read_clients import client_totals
 from roxy.metrics.read_protection import CHECK_REASONS
@@ -163,6 +169,30 @@ TARPIT_LABELS: Final[dict[str, str]] = {
     "upstream_cooldown_retry": "Retried inside its Retry-After",
 }
 """The category labels of the tarpit card (v1 `TARPIT_CATEGORY_LABELS`, plus the categories v2 added)."""
+
+HIT_COLUMNS: Final[tuple[Column, ...]] = (
+    Column(
+        "hits",
+        "Hits",
+        "Requests this row matched in the range, whatever the verdict (plan 10.9).",
+        "requests",
+        sortable=False,
+    ),
+    Column("hits_total", "Hits (all time)", "Requests this row matched since it was added.", "requests"),
+    Column("last_hit_at", "Last hit", "When a request last matched this row; empty: never.", "timestamp"),
+)
+"""Per-rule hit columns of the rule and list tables (`metrics/read_protection.py rule_hit_columns`): the hit history
+FILTER-REMOVE and SEC-BYPASS-FOREVER read, shown next to each row."""
+RULE_HIT_TABLES: Final[dict[str, str]] = {
+    "ua-rules": "rules_user_agent",
+    "header-rules": "rules_header",
+    "endpoint-blocks": "rules_endpoint_block",
+    "endpoint-rules": "rules_endpoint_limit",
+    "access": "access_list",
+    "bans": "bans",
+}
+"""`GET /rule-hits` table names (the page's route names) to the rule tables the abuse checks report hits for
+(`abuse/checks/base.py MATCH_TABLES`)."""
 
 
 # =============================================================================================== small helpers
@@ -227,6 +257,18 @@ def _single_order(tq: TableQuery, order: str = "desc") -> None:
 Fetch = Callable[[int, int], Awaitable[tuple[Sequence[Any], int]]]
 
 
+def _with_extra(answer: dict[str, Any], extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    """`answer` with a route's extra fields; an extra `caller_text` is added to the columns the table declared, never
+    put in their place (`common.add_caller_text`, finding secfix-5)."""
+    if extra:
+        fields = dict(extra)
+        caller_text = fields.pop("caller_text", None)
+        answer.update(fields)
+        if caller_text:
+            add_caller_text(answer, caller_text)
+    return answer
+
+
 async def _table_or_export(
     request: Request,
     admin: AdminPrincipal,
@@ -241,13 +283,9 @@ async def _table_or_export(
 ) -> Any:
     """A paged read model as a section 13 table, or every page of it as a CSV or JSON download."""
     if fmt is not None:
-        rows, total = await collect_pages(fetch)
-        return await export_table(request, admin, spec, rows, fmt, total=total, tq=tq, filters=filters, tr=tr)
+        return await export_pages(request, admin, spec, fetch, fmt, tq=tq, filters=filters, tr=tr)
     items, total = await fetch(tq.page, tq.page_size)
-    answer = table_answer(spec, tq, items, total)
-    if extra:
-        answer.update(extra)
-    return answer
+    return _with_extra(table_answer(spec, tq, items, total), extra)
 
 
 async def _list_or_export(
@@ -268,10 +306,19 @@ async def _list_or_export(
         everything, total = page_rows(rows, replace(tq, page=1, page_size=max(1, len(rows))), search_keys=search_keys)
         return await export_table(request, admin, spec, everything, fmt, total=total, tq=tq, filters=filters, tr=tr)
     items, total = page_rows(rows, tq, search_keys=search_keys)
-    answer = table_answer(spec, tq, items, total)
-    if extra:
-        answer.update(extra)
-    return answer
+    return _with_extra(table_answer(spec, tq, items, total), extra)
+
+
+async def _with_rule_hits(ctx: Any, table: str, rows: list[dict[str, Any]], tr: TimeRange) -> None:
+    """Fill `HIT_COLUMNS` on rule or list rows of `table` (keyed by the row id, as the abuse checks report hits)."""
+    start, end = tr.window.start, tr.window.end
+    with service_errors():
+        hits = await ctx.dbs.metrics.read(lambda conn: read_protection.rule_hit_columns(conn, table, start, end))
+    for row in rows:
+        found = hits.get(str(row.get("id")), {})
+        row["hits"] = int(found.get("hits") or 0)
+        row["hits_total"] = int(found.get("hits_total") or 0)
+        row["last_hit_at"] = found.get("last_hit_at")
 
 
 async def _audit_row(
@@ -481,13 +528,15 @@ async def _refresh_switches(ctx: Any) -> None:
 
 
 class ThrottleAllBody(ApiBody):
-    """Switch the emergency limit on or off (`enabled` null toggles); `limit` and `period` are its settings."""
+    """Switch the emergency limit on or off (`enabled` null toggles); `limit` and `period` are its settings (a
+    high-risk value of either needs `confirm_high_risk` and a reason, as in Settings)."""
 
     enabled: bool | None = None
     message: str | None = Field(None, max_length=MAX_REASON_LENGTH)
     limit: int | None = None
     period: int | None = None
     reason: str | None = Field(None, max_length=MAX_REASON_LENGTH)
+    confirm_high_risk: bool = False
 
 
 async def _throttle_all_view(ctx: Any, state: ThrottleAllState) -> dict[str, Any]:
@@ -533,8 +582,16 @@ async def throttle_all_set(
         if value is not None
     }
     if changes:
+        # The settings editor's rules first (finding apisec-4), so a refused value changes nothing at all.
+        await check_settings_change(request, ctx, changes, reason=reason, confirmed=body.confirm_high_risk)
         await run_mutation(
-            _settings_service(ctx).update(changes, actor, reason or "throttle-all limit", request_id=request_id)
+            _settings_service(ctx).update(
+                changes,
+                actor,
+                reason or "throttle-all limit",
+                request_id=request_id,
+                guard=settings_api.write_rules(ctx, admin, confirmed=body.confirm_high_risk),
+            )
         )
     try:
         state = await run_mutation(
@@ -567,9 +624,48 @@ WATCH_ALL_SPEC: Final = TableSpec(
             "seconds",
             sortable=False,
         ),
+        Column(
+            "requests",
+            "Requests",
+            "Requests from this client since throttle-all was switched on (counted from that minute).",
+            "requests",
+            sortable=False,
+        ),
+        Column(
+            "refused",
+            "Refused",
+            "Of those, requests Roxy turned away (throttle-all or any other refusal).",
+            "requests",
+            sortable=False,
+        ),
+        Column(
+            "rate1",
+            "Rate",
+            "Requests in the last 60 seconds (rate5 and rate60: last 5 and 60 minutes).",
+            "count",
+            sortable=False,
+        ),
+        Column("rate5", "Rate (5 min)", "Requests in the last 5 minutes.", "count", sortable=False),
+        Column("rate60", "Rate (60 min)", "Requests in the last 60 minutes.", "count", sortable=False),
+        Column(
+            "top_endpoint",
+            "Top endpoint",
+            "What it asks for most since throttle-all began (each minute's busiest endpoint; caller text).",
+            sortable=False,
+            caller_text=True,
+        ),
+        Column(
+            "last_seen_ms",
+            "Last seen",
+            "Its newest request: exact while its Live rows are kept (15 minutes), else the start of that minute.",
+            "timestamp_ms",
+            sortable=False,
+        ),
     ),
     default_sort="count",
 )
+WATCH_ALL_CALLER_TEXT: Final = ("top_endpoint",)
+WATCH_ACTIVITY_KEYS: Final = ("requests", "refused", "rate1", "rate5", "rate60", "top_endpoint", "last_seen_ms")
 
 
 @router.get("/throttle-all/watch")
@@ -579,20 +675,49 @@ async def throttle_all_watch_table(
     tq: Annotated[TableQuery, Depends(table_params(WATCH_ALL_SPEC))],
     fmt: ExportFormatDep,
 ) -> Any:
-    """Who is hitting the emergency limit right now, fullest first (row 135)."""
+    """Who is hitting the emergency limit right now, fullest first (row 135), with v1's watch columns: requests and
+    refusals since throttle-all began, rates, the busiest endpoint and when it was last seen (finding parity-4).
+
+    The limiter rows (hot.db) pick and order the page; client activity (metrics.db) fills the v1 columns for that
+    page only. A client key that is an IPv6 network has no per-address activity, so those columns are None there.
+    """
     ctx = _ctx(request)
     _single_order(tq)
     limit_setting = int(_setting(ctx, "global_throttle_limit"))
+    period = int(_setting(ctx, "global_throttle_period"))
+    with service_errors():
+        raw = await ctx.dbs.control.read(lambda conn: read_state_value(conn, THROTTLE_ALL_KEY))
+    state = ThrottleAllState.from_json(raw)
+    now = ctx.clock.now()
+    # The "since" marker of the running emergency limit; with it off, the rows left are at most one period old.
+    since = float(state.since) if state.enabled and state.since else now - period
 
     async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
         offset = (page - 1) * size
         data = await throttle_all_watch(
             ctx.dbs.hot, now_ms=ctx.clock.now_ms(), limit_setting=limit_setting, limit=size, offset=offset
         )
-        return data["rows"], int(data["total"])
+        rows = [dict(row) for row in data["rows"]]
+        keys = [str(row["ip"]) for row in rows]
+        activity = await ctx.dbs.metrics.read(
+            lambda conn: read_protection.watch_activity(conn, keys, since=since, now=now)
+        )
+        for row in rows:
+            found = activity.get(str(row["ip"]), {})
+            for key in WATCH_ACTIVITY_KEYS:
+                row[key] = found.get(key)
+        return rows, int(data["total"])
 
     with service_errors():
-        return await _table_or_export(request, admin, WATCH_ALL_SPEC, tq, fmt, fetch)
+        return await _table_or_export(
+            request,
+            admin,
+            WATCH_ALL_SPEC,
+            tq,
+            fmt,
+            fetch,
+            extra={"since": since, "caller_text": list(WATCH_ALL_CALLER_TEXT)},
+        )
 
 
 # =============================================================================================== bans
@@ -868,6 +993,7 @@ ACCESS_SPEC: Final = TableSpec(
         Column("expires_in_s", "Expires in", "Seconds left; empty means never.", "seconds"),
         Column("created_by", "Added by", "Who added the entry."),
         Column("created_at", "Added", "When the entry was added.", "timestamp"),
+        *HIT_COLUMNS,
     ),
     default_sort="created_at",
 )
@@ -952,13 +1078,16 @@ async def access_table(
     request: Request,
     admin: AdminSession,
     kind: Literal["deny", "allow_admin", "bypass"],
+    tr: TimeRangeDep,
     tq: Annotated[TableQuery, Depends(table_params(ACCESS_SPEC))],
     fmt: ExportFormatDep,
 ) -> Any:
-    """The deny list, the admin allowlist (D6) or the bypass list."""
+    """The deny list, the admin allowlist (D6) or the bypass list, each entry with its hits in the range and since
+    it was added (`HIT_COLUMNS`; the admin allowlist is not an abuse check, so its entries record none)."""
     ctx = _ctx(request)
     rows = await _access_rows(ctx, kind)
-    extra: dict[str, Any] = {"kind": kind, "your_ip": admin.ip}
+    await _with_rule_hits(ctx, "access_list", rows, tr)
+    extra: dict[str, Any] = {"kind": kind, "your_ip": admin.ip, "range": tr.info()}
     if kind == "bypass":
         extra["default_expiry_h"] = float(_setting(ctx, "bypass_default_expiry_h"))
     if kind == "allow_admin":
@@ -972,6 +1101,7 @@ async def access_table(
         rows,
         search_keys=("cidr", "note", "created_by"),
         filters={"kind": kind},
+        tr=tr,
         extra=extra,
     )
 
@@ -1085,10 +1215,12 @@ async def access_delete(
 
 
 class SettingsBody(ApiBody):
-    """Changes to settings shown on the Protection page (`{key: value}`); high-risk ones need a reason."""
+    """Changes to settings shown on the Protection page (`{key: value}`); a high-risk value needs a reason and
+    `confirm_high_risk: true`, exactly as in the settings editor (one risk rule for every settings writer)."""
 
     changes: dict[str, Any]
     reason: str | None = Field(None, max_length=MAX_REASON_LENGTH)
+    confirm_high_risk: bool = False
 
     @field_validator("changes")
     @classmethod
@@ -1145,6 +1277,28 @@ def _check_protection_keys(changes: Mapping[str, Any]) -> None:
         raise validation_error(fields, "Some settings cannot be changed here.", code="invalid_settings")
 
 
+async def check_settings_change(
+    request: Request, ctx: Any, changes: Mapping[str, Any], *, reason: str | None, confirmed: bool
+) -> None:
+    """The settings editor's rules for a batch written from this page, in the editor's order.
+
+    A key that needs a fresh second factor (`settings.require_fresh_for`, finding apisec-1: an admin security,
+    credential or sensitive setting) answers 403 `reauth_required` with a stale factor; no Protection setting is one
+    today, so this guards the future. A batch holding a high-risk value (a `high_risk_if` condition of the catalog,
+    or a setting of risk `high`) is refused with 422 `confirmation_required` unless `confirmed`, and with 422 when it
+    has no reason (DESIGN 13.1): the same `admin/api/settings.py preview_changes` and `check_risk` the editor,
+    imports and reverts run, so the Protection page is never a way around them (finding apisec-4). A batch with an
+    unknown or invalid value is left to the settings service, which refuses the whole batch with
+    `invalid_settings` and saves nothing. These are the quick answers from this worker's snapshot; every write here
+    also passes `settings.write_rules` as the service's guard, which judges the same rules again on what control.db
+    holds inside the write (finding secfix-1).
+    """
+    checked = settings_api.preview_changes(changes, ctx.settings.snapshot())
+    if checked["ok"]:
+        await settings_api.require_fresh_for(request, settings_api.changing_keys(checked))
+        settings_api.check_risk(checked["high_risk_keys"], reason=reason or "", confirmed=confirmed)
+
+
 @router.get("/settings")
 async def settings_list(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Every setting shown on the Protection page with its live value, default and risk."""
@@ -1156,12 +1310,20 @@ async def settings_list(request: Request, _admin: AdminSession) -> dict[str, Any
 async def settings_change(
     request: Request, admin: AdminSession, _csrf: CsrfChecked, body: SettingsBody
 ) -> dict[str, Any]:
-    """Change Protection settings through the settings service (validated, audited, `config_version` bumped)."""
+    """Change Protection settings through the settings service (validated, audited, `config_version` bumped).
+
+    A high-risk value needs `confirm_high_risk: true` and a reason (`check_settings_change`), as in Settings.
+    """
     ctx = _ctx(request)
     _check_protection_keys(body.changes)
+    await check_settings_change(request, ctx, body.changes, reason=body.reason, confirmed=body.confirm_high_risk)
     result = await run_mutation(
         _settings_service(ctx).update(
-            body.changes, actor_for(admin), audit_reason(body.reason), request_id=request_id_of(request)
+            body.changes,
+            actor_for(admin),
+            audit_reason(body.reason),
+            request_id=request_id_of(request),
+            guard=settings_api.write_rules(ctx, admin, confirmed=body.confirm_high_risk),
         )
     )
     return {
@@ -1177,13 +1339,20 @@ async def settings_change(
 async def settings_reset(
     request: Request, admin: AdminSession, _csrf: CsrfChecked, body: SettingResetBody
 ) -> dict[str, Any]:
-    """Reset one Protection setting to its default (row 124)."""
+    """Reset one Protection setting to its default (row 124); the editor's fresh-factor rule applies, as in
+    `POST /settings/{key}/reset` (a reset to the catalog default needs no high-risk confirmation there either)."""
     ctx = _ctx(request)
     if body.key not in set(protection_keys()):
         raise validation_error({"key": "Not a Protection setting."}, code="invalid_settings")
+    if ctx.settings.snapshot().is_overridden(body.key):  # the quick answer; the write's guard decides (secfix-1)
+        await settings_api.require_fresh_for(request, [body.key])
     result = await run_mutation(
         _settings_service(ctx).reset_to_default(
-            body.key, actor_for(admin), audit_reason(body.reason), request_id=request_id_of(request)
+            body.key,
+            actor_for(admin),
+            audit_reason(body.reason),
+            request_id=request_id_of(request),
+            guard=settings_api.write_rules(ctx, admin),
         )
     )
     return {
@@ -1643,6 +1812,7 @@ UA_SPEC: Final = TableSpec(
         Column("enabled", "Enabled", "Disabled rules are skipped.", sortable=False),
         Column("allowed", "Allowed", "Requests this rule matched and allowed in the range.", "requests"),
         Column("refused", "Refused", "Requests this rule refused in the range.", "requests"),
+        *HIT_COLUMNS,
     ),
     default_sort="position",
     default_order="asc",
@@ -1709,6 +1879,7 @@ async def ua_rules_table(
         row["allowed"] = counts.get("allowed", 0)
         row["refused"] = counts.get("refused", 0)
         row["last_hit_ms"] = counts.get("last_ms")
+    await _with_rule_hits(ctx, "rules_user_agent", rows, tr)
     extra = {"rules_enabled": bool(_setting(ctx, "user_agent_rules_enabled")), "range": tr.info()}
     return await _list_or_export(
         request, admin, UA_SPEC, tq, fmt, rows, search_keys=("needle", "note", "message", "id"), tr=tr, extra=extra
@@ -1784,6 +1955,7 @@ HEADER_SPEC: Final = TableSpec(
         Column("note", "Note", "Private note.", sortable=False),
         Column("enabled", "Enabled", "Disabled rules are skipped.", sortable=False),
         Column("canonical_key", "Rule key", "header|scope|mode|needle (row 112).", sortable=False),
+        *HIT_COLUMNS,
     ),
     default_sort="id",
     default_order="asc",
@@ -1858,12 +2030,14 @@ def _test_pairs(raw: str | list[list[str]] | dict[str, str]) -> list[tuple[str, 
 async def header_rules_table(
     request: Request,
     admin: AdminSession,
+    tr: TimeRangeDep,
     tq: Annotated[TableQuery, Depends(table_params(HEADER_SPEC))],
     fmt: ExportFormatDep,
 ) -> Any:
-    """Request filters (header rules), first match wins in id order (rows 45, 112)."""
+    """Request filters (header rules), first match wins in id order (rows 45, 112), with their hits."""
     ctx = _ctx(request)
     rows = await _rule_rows(ctx, "rules_header")
+    await _with_rule_hits(ctx, "rules_header", rows, tr)
     return await _list_or_export(
         request,
         admin,
@@ -1872,7 +2046,8 @@ async def header_rules_table(
         fmt,
         rows,
         search_keys=("header", "needle", "note", "message"),
-        extra={"disguised_by_default": True},
+        tr=tr,
+        extra={"disguised_by_default": True, "range": tr.info()},
     )
 
 
@@ -1965,6 +2140,7 @@ BLOCK_SPEC: Final = TableSpec(
         Column("note", "Note", "Private note.", sortable=False),
         Column("enabled", "Enabled", "Disabled blocks are skipped.", sortable=False),
         Column("created_at", "Added", "When the block was added.", "timestamp"),
+        *HIT_COLUMNS,
     ),
     default_sort="created_at",
 )
@@ -1981,13 +2157,20 @@ ENDPOINT_RULE_SPEC: Final = TableSpec(
         Column("note", "Note", "Private note.", sortable=False),
         Column("enabled", "Enabled", "Disabled rules are skipped.", sortable=False),
         Column("created_at", "Added", "When the rule was added.", "timestamp"),
+        *HIT_COLUMNS,
     ),
     default_sort="created_at",
 )
 ATTEMPT_SPEC: Final = TableSpec(
     name="refusal_attempts",
     columns=(
-        Column("path", "Endpoint", "The path asked for (the endpoint template when the detail was folded)."),
+        # The refused path and methods are what the caller sent (caller text, DESIGN 13.1; finding secfix-5).
+        Column(
+            "path",
+            "Endpoint",
+            "The path asked for (the endpoint template when the detail was folded).",
+            caller_text=True,
+        ),
         Column("attempts", "Attempts", "Refusals in the range.", "requests"),
         Column(
             "clients",
@@ -2001,7 +2184,15 @@ ATTEMPT_SPEC: Final = TableSpec(
             "Attempts recorded without a client (folded over the event budget).",
             "requests",
         ),
-        Column("methods", "Methods", "HTTP methods seen.", sortable=False),
+        Column("methods", "Methods", "HTTP methods seen.", sortable=False, caller_text=True),
+        Column(
+            "refused_by",
+            "Refused by",
+            "The rules that refused these attempts, as each refusal recorded them (pattern, or the canonical key of "
+            "a request filter; the id alone once the rule was deleted). Refusals recorded before rules were kept "
+            "with the refusal have none.",
+            sortable=False,
+        ),
         Column(
             "current_rule",
             "Matching rule now",
@@ -2012,6 +2203,25 @@ ATTEMPT_SPEC: Final = TableSpec(
     ),
     default_sort="attempts",
 )
+ATTEMPT_RULE_TABLE: Final[dict[str, str]] = {
+    "endpoint_blocked": "rules_endpoint_block",
+    "endpoint_rule": "rules_endpoint_limit",
+    "header_rule": "rules_header",
+}
+"""The rule table whose rows refused each attempts tab's refusals (the key of a refusal event's `detail.rules`)."""
+
+
+def _rule_label(snapshot: Any, table: str, rule_id: str) -> str:
+    """How an attempts row names a refusing rule: its pattern (a request filter: its canonical key), else its id."""
+    rows = {
+        "rules_endpoint_block": getattr(snapshot, "endpoint_blocks", ()),
+        "rules_endpoint_limit": getattr(snapshot, "endpoint_limits", ()),
+        "rules_header": getattr(snapshot, "header_rules", ()),
+    }.get(table, ())
+    for row in rows:
+        if str(getattr(row, "id", "")) == rule_id:
+            return str(getattr(row, "pattern", None) or getattr(row, "canonical_key", None) or f"#{rule_id}")
+    return f"#{rule_id} (deleted)"
 
 
 class BlockBody(ApiBody):
@@ -2068,9 +2278,14 @@ async def _attempts(
     ctx = _ctx(request)
     start, end = _range_ms(tr)
     snapshot = _rules_snapshot(ctx)
+    rule_table = ATTEMPT_RULE_TABLE.get(reason)
 
     def annotate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for row in rows:
+            # The rules that refused, as the refusal events recorded them (`detail.rules`; the deferred P9 item
+            # "the attempts tabs show the rule that refused at the time").
+            ids = [str(i) for i in row.pop("rule_ids", None) or ()]
+            row["refused_by"] = [_rule_label(snapshot, rule_table, i) for i in ids] if rule_table else []
             # One request's regex budget per path: the rule a request for this path would match today.
             with regex_budget(fresh=True):
                 rule = matcher(snapshot, str(row.get("path") or "").lower()) if matcher else None
@@ -2089,6 +2304,7 @@ async def _attempts(
                 descending=tq.descending,
                 limit=size,
                 offset=(page - 1) * size,
+                rule_table=rule_table,
             )
         )
         rows = await asyncio.to_thread(annotate, list(data["rows"]))  # pattern matching off the event loop
@@ -2104,12 +2320,25 @@ async def _attempts(
 async def blocks_table(
     request: Request,
     admin: AdminSession,
+    tr: TimeRangeDep,
     tq: Annotated[TableQuery, Depends(table_params(BLOCK_SPEC))],
     fmt: ExportFormatDep,
 ) -> Any:
-    """Endpoint blocks (row 46): every matching block refuses with 403."""
-    rows = await _rule_rows(_ctx(request), "rules_endpoint_block")
-    return await _list_or_export(request, admin, BLOCK_SPEC, tq, fmt, rows, search_keys=("pattern", "note", "message"))
+    """Endpoint blocks (row 46): every matching block refuses with 403; each with its hits."""
+    ctx = _ctx(request)
+    rows = await _rule_rows(ctx, "rules_endpoint_block")
+    await _with_rule_hits(ctx, "rules_endpoint_block", rows, tr)
+    return await _list_or_export(
+        request,
+        admin,
+        BLOCK_SPEC,
+        tq,
+        fmt,
+        rows,
+        search_keys=("pattern", "note", "message"),
+        tr=tr,
+        extra={"range": tr.info()},
+    )
 
 
 @router.post("/endpoint-blocks")
@@ -2149,12 +2378,14 @@ async def block_delete(
 async def endpoint_rules_table(
     request: Request,
     admin: AdminSession,
+    tr: TimeRangeDep,
     tq: Annotated[TableQuery, Depends(table_params(ENDPOINT_RULE_SPEC))],
     fmt: ExportFormatDep,
 ) -> Any:
-    """Endpoint rate rules (row 43): the most specific matching rule applies."""
+    """Endpoint rate rules (row 43): the most specific matching rule applies; each with its hits."""
     ctx = _ctx(request)
     rows = await _rule_rows(ctx, "rules_endpoint_limit")
+    await _with_rule_hits(ctx, "rules_endpoint_limit", rows, tr)
     return await _list_or_export(
         request,
         admin,
@@ -2163,7 +2394,8 @@ async def endpoint_rules_table(
         fmt,
         rows,
         search_keys=("pattern", "note", "message"),
-        extra={"per_ip_allowance": int(_setting(ctx, "allowed_requests_per_minute"))},
+        tr=tr,
+        extra={"per_ip_allowance": int(_setting(ctx, "allowed_requests_per_minute")), "range": tr.info()},
     )
 
 
@@ -2280,7 +2512,13 @@ SPAM_EVENTS_SPEC: Final = TableSpec(
             sortable=False,
         ),
         Column("detector", "Detector", "SPAM-RATE, SPAM-PROBE, ...", sortable=False),
-        Column("subject", "Subject", "ip:<client>, place:<id>, or a fleet-wide subject.", sortable=False),
+        Column(
+            "subject",
+            "Subject",
+            "ip:<client>, place:<id>, or a fleet-wide subject (a place id is the caller's Roblox-Id header).",
+            sortable=False,
+            caller_text=True,
+        ),
         Column(
             "action", "Action", "What was done (a trusted game server gets a strike instead of a ban).", sortable=False
         ),
@@ -2424,6 +2662,7 @@ async def spam_arm(request: Request, admin: AdminFreshMfa, _csrf: CsrfChecked, b
             f"{reason} (collateral list {body.confirm_collateral} "
             f"confirmed, {len(preview['legitimate_looking'])} legitimate-looking)",
             request_id=request_id_of(request),
+            guard=settings_api.write_rules(ctx, admin, arming_allowed=True),  # the one route that may arm
         )
     )
     return {
@@ -2451,17 +2690,27 @@ async def spam_disarm(request: Request, admin: AdminSession, _csrf: CsrfChecked,
 
 
 @router.get("/tarpit")
-async def tarpit_state(request: Request, _admin: AdminSession) -> dict[str, Any]:
-    """The tarpit card (row 123): switches, the effective cap and which term clamped it, holds in progress.
+async def tarpit_state(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
+    """The tarpit card (rows 78, 123): switches, the effective cap and which term clamped it, holds in progress,
+    and the hold statistics of the range.
 
     `active_holds` is fleet-wide (hot.db leases, None while hot.db cannot be read); `stats` counts this worker's
-    holds since it started (`stats_scope`), until the stats history of P10 exists.
+    holds since it started (`stats_scope`). `history` is fleet-wide over the range (`metrics/read_producers.py
+    tarpit_summary`, `history_scope`): eligible refusals, holds, skips and the skipped share, mean, p95 and longest
+    hold, by category and by kind, the hold histogram, and the mean arrival gap after a held and after an instant
+    refusal (v1's "Time Between Requests", TARPIT-TUNE's evidence).
     """
     ctx = _ctx(request)
     state: dict[str, Any] = await _abuse(ctx).tarpit.state()
+    start, end = tr.window.start, tr.window.end
+    with service_errors():
+        history = await ctx.dbs.metrics.read(lambda conn: read_producers.tarpit_summary(conn, start, end))
     state["category_labels"] = {name: TARPIT_LABELS.get(name, name) for name in TARPIT_CATEGORIES}
     state["stats_scope"] = "this_worker"
     state["worker_id"] = ctx.worker_id
+    state["history"] = history
+    state["history_scope"] = "fleet"
+    state["range"] = tr.info()
     return state
 
 
@@ -2514,7 +2763,8 @@ async def bot_state(request: Request, _admin: AdminSession, tr: TimeRangeDep) ->
 @router.get("/pipeline")
 async def pipeline_diagram(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """The pipeline diagram (plan 10.9, row 5): every check in order with its refusals in the range, plus the
-    `ua_rule_hit` and `throttle_tier` counters (row 76)."""
+    `ua_rule_hit` and `throttle_tier` counters (row 76) and the rule rows' hits per table in the range
+    (`rule_hits`, whatever the verdict; each table's rows are listed with theirs)."""
     ctx = _ctx(request)
     pipeline = _abuse(ctx)
     start, end = _range_ms(tr)
@@ -2524,6 +2774,7 @@ async def pipeline_diagram(request: Request, _admin: AdminSession, tr: TimeRange
             "hits": read_protection.check_hits(conn, tr.window),
             "ua": read_protection.ua_rule_hits(conn, start, end),
             "tiers": read_protection.tier_hits(conn, start, end),
+            "rule_hits": read_protection.rule_hit_totals(conn, tr.window.start, tr.window.end),
         }
 
     with service_errors():
@@ -2546,17 +2797,101 @@ async def pipeline_diagram(request: Request, _admin: AdminSession, tr: TimeRange
         "checks": checks,
         "ua_rule_hits": {"total": ua_totals, "by_rule": data["ua"]},
         "throttle_tiers": {str(tier): count for tier, count in sorted(data["tiers"].items())},
+        "rule_hits": data["rule_hits"],
         "this_worker": pipeline.stats.snapshot(),
     }
 
 
+@router.get("/rule-hits")
+async def rule_hit_history(
+    request: Request,
+    _admin: AdminSession,
+    tr: TimeRangeDep,
+    table: Annotated[
+        Literal["ua-rules", "header-rules", "endpoint-blocks", "endpoint-rules", "access", "bans"], Query()
+    ],
+    rule_id: Annotated[str, Query(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")],
+) -> dict[str, Any]:
+    """One rule row's hits over the range (plan 10.9 "hit history"; FILTER-REMOVE's evidence), a series answer.
+
+    `table` names the list the row is in (the route name of its table); `rule_id` is the row id the table shows.
+    """
+    ctx = _ctx(request)
+    name = RULE_HIT_TABLES[table]
+    with service_errors():
+        points = await ctx.dbs.metrics.read(
+            lambda conn: read_protection.rule_hit_points(conn, name, rule_id, tr.window)
+        )
+    series = [{"key": "hits", "label": "Hits", "unit": "requests", "points": points}]
+    answer = series_answer(tr, series)
+    answer["table"] = table
+    answer["rule_id"] = rule_id
+    answer["total"] = sum(int(value) for _start, value in points)
+    return answer
+
+
+REFUSALS_SPEC: Final = TableSpec(
+    name="refusal_reasons",
+    columns=(
+        Column("reason", "Reason", "The refusal or failure reason code."),
+        Column("requests", "Count", "Requests refused or failed with this reason in the range (exact).", "requests"),
+        Column("last_status", "Status", "The status code the newest of them got.", ""),
+        Column(
+            "last_path",
+            "Last path",
+            "The path the newest of them asked for (caller text: shown as plain text, never as markup).",
+            sortable=False,
+            caller_text=True,
+        ),
+        Column(
+            "clients",
+            "Unique clients",
+            "Distinct client hashes among them (a lower bound, see unattributed).",
+            "count",
+        ),
+        Column(
+            "unattributed",
+            "Unattributed",
+            "Refusals recorded without a client (folded over the event budget).",
+            "requests",
+        ),
+        Column("first_ms", "First seen", "When the oldest of them was recorded.", "timestamp_ms"),
+        Column("last_ms", "Last seen", "When the newest of them was recorded.", "timestamp_ms"),
+        Column("message_source", "Message", "Custom versus default message counts (row 116).", sortable=False),
+    ),
+    default_sort="requests",
+)
+"""v1's Refusal Reasons columns (plan 14.1 row 10, parity row 72, finding parity-3); the last IP is replaced by the
+distinct client count (plan 9.15, as the attempts tabs, row 75)."""
+CALLER_TEXT_COLUMNS: Final[tuple[str, ...]] = ("last_path",)
+"""Columns whose values are caller text: a page shows them escaped (never as HTML), plan 9.16."""
+
+
 @router.get("/refusals")
-async def refusals(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
-    """Refusals and failures by reason with the custom versus default message split (row 116, v1 section 10)."""
+async def refusals(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(REFUSALS_SPEC))],
+    fmt: ExportFormatDep,
+) -> Any:
+    """Refusals and failures by reason (v1 section 10 "Refusal Reasons", rows 72 and 116): count, the newest status
+    and path, distinct clients, first and last seen, and the custom versus default message split; a section 13
+    table (sorted, searched and paged here, exported as CSV or JSON)."""
     ctx = _ctx(request)
     with service_errors():
         rows = await ctx.dbs.metrics.read(lambda conn: queries.refusal_reasons(conn, tr.window))
-    return {"range": tr.info(), "items": rows}
+    return await _list_or_export(
+        request,
+        admin,
+        REFUSALS_SPEC,
+        tq,
+        fmt,
+        rows,
+        search_keys=("reason", "last_path"),
+        tr=tr,
+        extra={"range": tr.info(), "caller_text": list(CALLER_TEXT_COLUMNS)},
+    )
 
 
 __all__ = ["audit_reason", "protection_keys", "router"]

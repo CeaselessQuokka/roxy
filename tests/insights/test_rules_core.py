@@ -79,11 +79,13 @@ async def test_before_after_11_6_card() -> None:
     assert changes["bucket_override"].current == {"per_min": 120.0, "burst": 10}
     assert changes["bucket_override"].proposed == {"per_min": 89, "burst": 10}  # 80% of 112, the 429-free rate
     assert card.safe_auto is False  # a global setting is part of it (11.2)
-    assert "2,485 fewer upstream calls per hour" in card.expected_impact
+    # 2,485 when every miss stored its answer; a Roblox 429 is never stored (finding insights-6), so a miss or a
+    # refresh answered 429 leaves the key's next request a call too: 30 more (the fixture's range is 2,230 to 2,800).
+    assert "2,455 fewer upstream calls per hour" in card.expected_impact
     state = await loaded("up_429_endpoint__before_after_11_6")
     report = await state.engine.dry_run(card)
     assert report.available
-    assert report.avoided_calls == 2485
+    assert report.avoided_calls == 2455
     assert report.sample_size == 2845
     payload = card.to_payload()
     keys_11_2 = {"id", "rule_id", "family", "severity", "confidence", "title", "explanation", "evidence", "changes"}

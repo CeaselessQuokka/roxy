@@ -183,12 +183,20 @@ if [ -n "$sock" ]; then
 fi
 if [ -n "$resolve" ]; then
   # The public /health through nginx: v2's body has a Degraded list; with the flag public-v1 another nginx site
-  # (v1's, during the cutover) answers with v1's keys only.
+  # (v1's, during the cutover) answers with v1's keys only. The flag file public-v1-after holds N: answers after
+  # the first N come from v1 (a failure late in the watch). slow-public makes every answer take 0.4 s (a busy box).
+  [ -e "$S/flags/slow-public" ] && sleep 0.4
+  late_v1=0
+  if [ -e "$S/flags/public-v1-after" ]; then
+    count=$(( $(cat "$S/public.count" 2>/dev/null || echo 0) + 1 ))
+    echo "$count" >"$S/public.count"
+    [ "$count" -gt "$(cat "$S/flags/public-v1-after")" ] && late_v1=1
+  fi
   c="$(active_color)"
   if [ -n "$c" ] && healthy "$c" && [ ! -e "$S/flags/public-down" ]; then code=200; else code=502; fi
   if [ "$code" != 200 ]; then
     body="<html>502 Bad Gateway</html>"
-  elif [ -e "$S/flags/public-v1" ]; then
+  elif [ -e "$S/flags/public-v1" ] || [ "$late_v1" = 1 ]; then
     body='{"DataBytes":1,"DataLimitBytes":2,"Paused":false,"PersistenceOK":true,"Status":"ok"}'
   else
     body='{"DataBytes":1,"DataLimitBytes":2,"Degraded":[],"Paused":false,"PersistenceOK":true,"Status":"ok"}'

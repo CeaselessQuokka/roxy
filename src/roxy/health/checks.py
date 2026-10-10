@@ -18,6 +18,8 @@ How it works
     - Upstream checks (H-REACH, H-CLOCK) call Roblox through `ctx.upstream.internal_fetch` at internal priority,
       so they wait for bucket slots, honor cooldowns and breakers, and are recorded as Roxy's own calls; they
       never burst. H-CRED-AUTH is the only check that uses the credential, and only through the credential path.
+      Because of that wait, H-CLOCK times Roblox's `Date` header against the middle of the call that returned it
+      (the trace's `duration_ms`), never against the whole fetch, whose bucket wait is Roxy's own queue.
     - Durations are measured with `ctx.clock.monotonic()`, so the fixture harness's fake clock decides them.
     - Anything outside Roxy (DNS, TLS, commands, the public origin, alert channels, status files) is read through
       `env.facts` (`roxy/health/facts.py`), which tests replace.
@@ -35,6 +37,7 @@ import contextlib
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -539,7 +542,37 @@ async def check_reach(env: CheckEnv) -> CheckResult:
     return env.result(status, value, finding=finding, threshold=threshold, measured=elapsed, unit="ms", detail=detail)
 
 
+def _trace_ms(trace: Any, name: str) -> float | None:
+    """A non-negative, finite millisecond field of an upstream `Trace`, or None when it is missing or unusable."""
+    try:
+        value = float(getattr(trace, name))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def call_midpoint(before: float, after: float, call_ms: float | None) -> float:
+    """The wall time halfway through the HTTP call whose answer carried Roblox's `Date` header.
+
+    `internal_fetch` first waits at internal priority for a bucket slot (plan 7.8, up to `queue_wait_internal_ms`,
+    30 s by default), and only then calls Roblox. That wait is Roxy's own queue, not a clock difference: taking
+    the middle of the whole fetch read half of it as skew, so a busy bucket looked like a broken clock (finding
+    insights-12). The trace's `duration_ms` is the last call alone (the one whose headers the trace keeps), so
+    that call began `call_ms` before the fetch returned; it cannot have begun before the fetch did. Without a
+    usable duration the middle of the whole fetch is the best estimate left.
+    """
+    if call_ms is None:
+        return (before + after) / 2
+    sent = max(before, after - call_ms / 1000)
+    return (sent + after) / 2
+
+
 async def check_clock(env: CheckEnv) -> CheckResult:
+    """H-CLOCK: the server clock against Roblox's `Date` header (one probe at internal priority) and NTP status.
+
+    The skew is the middle of the call that returned the header minus the header's time (`call_midpoint`), so the
+    probe's wait for a bucket slot never counts; the Date header itself has whole-second resolution.
+    """
     ntp: bool | None = None
     command = await env.facts.run_command(("timedatectl", "show"), COMMAND_TIMEOUT_S)
     if command.returncode == 0:
@@ -547,21 +580,31 @@ async def check_clock(env: CheckEnv) -> CheckResult:
         if "NTPSynchronized" in props:
             ntp = props["NTPSynchronized"].strip().lower() == "yes"
     skew: float | None = None
+    queue_wait_ms: float | None = None
+    call_ms: float | None = None
     upstream = env.ctx.upstream
     if upstream is not None:
         before = env.now()
         with contextlib.suppress(ValueError):
             result = await upstream.internal_fetch(PROBE_PURPOSE, "GET", probes.CLOCK_PROBE_URL)
             after = env.now()
-            header = result.trace.upstream_headers.get("date") if result.trace is not None else None
+            trace = result.trace
+            header = trace.upstream_headers.get("date") if trace is not None else None
             if header:
                 with contextlib.suppress(TypeError, ValueError, IndexError):
                     moment = parsedate_to_datetime(header)
                     if moment.tzinfo is None:
                         moment = moment.replace(tzinfo=UTC)
-                    skew = (before + after) / 2 - moment.timestamp()
+                    queue_wait_ms = _trace_ms(trace, "queue_wait_ms")
+                    call_ms = _trace_ms(trace, "duration_ms")
+                    skew = call_midpoint(before, after, call_ms) - moment.timestamp()
     ntp_text = {True: "NTP synchronized", False: "NTP not synchronized", None: "NTP status unreadable"}[ntp]
-    detail = {"skew_s": None if skew is None else round(skew, 3), "ntp_synchronized": ntp}
+    detail = {
+        "skew_s": None if skew is None else round(skew, 3),
+        "ntp_synchronized": ntp,
+        "queue_wait_ms": None if queue_wait_ms is None else round(queue_wait_ms, 1),
+        "call_ms": None if call_ms is None else round(call_ms, 1),
+    }
     if skew is None:
         if ntp is False:
             return env.result(Status.WARN, f"no Roblox Date header; {ntp_text}", finding="NTP is off.", detail=detail)
@@ -1862,6 +1905,7 @@ __all__ = [
     "RECOMMENDATION_RULES",
     "SPECS",
     "CheckEnv",
+    "call_midpoint",
     "expand",
     "known_check_id",
     "parse_systemd_time",

@@ -4,16 +4,19 @@ What this is
     The routes behind the Data page (plan 14.1, 6.6, 6.8, 6.10, 17.5; parity rows 83 and 133):
       * `GET /data/storage`: every database file (bytes, WAL) and every table with rows, bytes, oldest row and a
         30 day projection (`storage/read_sizes.py`), the disk budget and its use; `format=csv|json` downloads it.
-      * `GET /data/retention`: the retention settings of plan 6.10 (max ages, row caps, file limits) with their
-        values and each table's state against them; edits go through the settings API.
-      * `GET /data/resets`: every reset scope of plan 6.8, its families and options, and `V1_CLEAR_TARGETS`
-        (where each of v1's 27 clear targets went). `POST /data/resets/preview` answers the exact rows per table
-        and their date range, what is left alone, whether a snapshot will be taken, and the phrase to type for a
-        destructive full reset. `POST /data/resets` runs it (with the preview's digest, a reason, and the typed
-        phrase when one is asked for); `POST /data/resets/factory` runs the factory reset, which also needs a fresh
-        second factor (plan 9.6) and a control.db snapshot.
-      * `GET /data/backups` (the nightly backups recorded by `backup.sh` and the snapshots on this server) and
-        `POST /data/backups` ("back up now": a `VACUUM INTO` snapshot of control.db and metrics.db).
+      * `GET /data/retention`: every setting of the Data page's retention and record cap cards (plan 6.10: max
+        ages, row caps, file limits; the catalog's `data#retention` and `data#record-caps` pages) with their values,
+        and each table's state against its limits; edits go through the settings API.
+      * `GET /data/resets`: every reset scope of plan 6.8, its families (narrower ones name their `parent`) and
+        options, and `V1_CLEAR_TARGETS` (where each of v1's 27 clear targets went; `scope` None: nothing to reset).
+        `POST /data/resets/preview` answers the exact rows per table and their date range, what is left alone,
+        whether a snapshot will be taken, and the phrase to type for a destructive full reset. `POST /data/resets`
+        runs it (with the preview's digest, a reason, and the typed phrase when one is asked for);
+        `POST /data/resets/factory` runs the factory reset, which also needs a fresh second factor (plan 9.6) and a
+        control.db snapshot.
+      * `GET /data/backups` (the nightly backups recorded by `backup.sh`, the last "back up now" request it
+        answered, and the snapshots on this server) and `POST /data/backups` ("back up now": a `VACUUM INTO`
+        snapshot of control.db and metrics.db here, and a request file the root backup's path unit watches).
       * `GET /data/vacuum` (size, reclaimable space and an estimated time per database) and `POST /data/vacuum`.
       * `GET /data/operations/{id}`: the progress or result of a reset, a backup or a VACUUM.
 
@@ -26,28 +29,46 @@ Why it exists
 
 How it works
     * A scope becomes a plan: SQL parts (`Part`: one table, a fixed WHERE clause with bound parameters, the row
-      identity used for batched deletes) plus service actions (a cache purge through `CacheService.purge`, the
-      upstream reset through `UpstreamService.reset_state`, bans and the factory rule reset in one control.db
-      transaction with an audit row and a `config_version` bump, the settings reset through
-      `SettingsService.import_overrides`). Table names and clauses are constants of this module, never request
-      text; request values are always parameters.
+      identity used for batched deletes, and `match`, the same rows as column values for the recorder's reset
+      fence) plus service actions (a cache purge through `CacheService.purge`, the upstream reset through
+      `UpstreamService.reset_state`, bans and the factory rule reset in one control.db transaction with an audit
+      row and a `config_version` bump, the settings reset through `SettingsService.import_overrides`). Table names
+      and clauses are constants of this module, never request text; request values are always parameters. Most
+      parts delete; two rewrite rollup rows instead and keep their request counts: `clear_latency` (the latency
+      family) empties the histograms, `clear_cache_state` (the cache statistics family, v1 "Clear stats") moves the
+      requests of every cache lookup state to `recorder.CLEARED_CACHE_STATE`, merging rows that meet.
     * The preview counts each part (`count(*)`, `min` and `max` of its time column) and the actions' targets, and
       returns a digest of the normalized scope; running a reset requires that digest, so it can only run what was
       previewed. The intent audit row (`data.reset`, with the planned counts) is written before anything is
       deleted, and a refusal to write it (C7) means nothing is deleted (503).
     * The work runs as a background operation (`ctx.tasks.spawn`), so a reset of a large metrics.db is never cut off
       by the request deadline: snapshots first (`VACUUM INTO <state dir>/snapshots/reset-<time>-<db>.db` on a
-      maintenance connection, only of a database that loses rows; cache.db and hot.db are never snapshotted, plan
-      17.5), then batches of 5,000 rows, each its own short write transaction with a yield between batches (the
-      hot path keeps writing), then the `data.reset.done` audit row with the rows deleted per table and the
-      annotation (at the start of a date range, else at the time of the reset). A failure records
-      `data.reset.failed` with what was deleted until then. The POST waits up to `INLINE_WAIT_S` and answers the
-      result, or 202 with the operation id. One reset runs at a time fleet-wide (a hot.db lease). Each worker's
+      maintenance connection, only of a database that loses rows, and only while the snapshots folder stays within
+      `snapshots_max_bytes`; cache.db and hot.db are never snapshotted, plan 17.5). Then the reset fence: a reset
+      that touches metrics.db rows the recorder writes appends a fence to `service_state` (`recorder.RESET_FENCE_KEY`)
+      and flushes this worker's recorder, so no worker's unflushed counts from before the reset are written back
+      afterwards (finding parity-4, v1's `ClearEpochs`). Then the chart marker (`annotations`, kind `reset` when
+      counters go, else `config_change`, P6), written BEFORE the first delete and linked to the intent row, so a
+      reset that fails midway still marks what it deleted (finding mpjobs-4): on success it links to the
+      `data.reset.done` row, on a failure that deleted something it is labeled incomplete and links to the
+      `data.reset.failed` row, and when nothing was deleted it is removed. Then batches of 5,000 rows, each its
+      own short write transaction with a yield between batches (the hot path keeps writing). The POST waits up to
+      `INLINE_WAIT_S` and answers the result, or 202 with the operation id. One reset or backup runs at a time
+      fleet-wide (the hot.db lease `ResetLease`, also taken by the internal socket's resets). Each worker's
       in-memory tarpit counters are cleared through `service_state` (`system.py`).
+    * Back up now takes the same lease and, right after its audited intent, writes `<state dir>/backup-request`
+      (`{requested_at, by, audit_id}`, mode 0640, renamed into place, as `scripts/ctl.py write_backup_request`
+      does), which `roxy-backup-request.path` turns into a run of the root backup; `backup.sh` records what it did
+      with the request under `last_request` in `audit/backup.json`. The request is written whatever the local plan
+      says (finding secfix-4). The on-server copies count what the snapshots folder already holds against
+      `snapshots_max_bytes` and make room by removing Back up now's own oldest copies (`manual-*`; reset and
+      pre-migration snapshots are never removed here); a copy that still does not fit is skipped with its reason
+      (finding apisec-5). 409 `not_feasible` only when neither the request nor any copy could be made.
 
 What to read next
-    `roxy/storage/read_sizes.py`, `roxy/cache/read_purge_counts.py`, `roxy/storage/retention.py`,
-    `roxy/admin/api/system.py` (the per-worker watcher), `roxy/admin/api/common.py`.
+    `roxy/storage/read_sizes.py`, `roxy/metrics/recorder.py` (the reset fences), `roxy/metrics/annotate.py`,
+    `roxy/cache/read_purge_counts.py`, `roxy/storage/retention.py`, `roxy/admin/api/system.py` (the per-worker
+    watcher), `roxy/admin/api/common.py`.
 """
 
 from __future__ import annotations
@@ -64,8 +85,8 @@ import sqlite3
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal
 
@@ -101,8 +122,18 @@ from roxy.core.iphash import ip_hash
 from roxy.core.reasons import Egress
 from roxy.deps import get_ctx
 from roxy.metrics.activity import ip_key, place_key
-from roxy.metrics.annotate import insert_annotation
-from roxy.metrics.rollups import zone
+from roxy.metrics.annotate import delete_annotation, insert_annotation, update_annotation
+from roxy.metrics.histograms import register_sql_functions
+from roxy.metrics.recorder import (
+    CACHE_LOOKUP_STATES,
+    CLEARED_CACHE_STATE,
+    FENCED_TABLES,
+    MAX_FENCE_SELECTORS,
+    MAX_RESET_FENCES,
+    RESET_FENCE_KEY,
+    dims_hash,
+)
+from roxy.metrics.rollups import DIM_COLUMNS, PAIR_CLIENT_TYPE, PAIR_SEPARATOR, ROLLUP_SUMS, zone
 from roxy.rules.match import PatternValidationError
 from roxy.rules.models import RULE_TABLES
 from roxy.storage import leases, read_sizes, retention
@@ -135,12 +166,24 @@ STORAGE_CACHE_ATTRIBUTE: Final = "_admin_data_storage_cache"
 RESET_LEASE: Final = "data_reset"
 RESET_LEASE_TTL_MS: Final = 30 * 60 * 1000
 LEASE_RENEW_S: Final = 60.0
-"""One reset at a time fleet-wide: a hot.db lease, renewed while the operation runs."""
+"""One reset or backup at a time fleet-wide: a hot.db lease, renewed while the operation runs."""
 
 SNAPSHOT_DBS: Final = ("control", "metrics")
 """Databases worth a snapshot (cache.db is disposable and hot.db is short-lived state, plan 17.5)."""
 
 SNAPSHOT_MIN_FREE_BYTES: Final = 64 * 1024 * 1024
+MANUAL_SNAPSHOT_PREFIX: Final = "manual-"
+"""Back up now's own copies: the only snapshots it removes to make room (oldest first)."""
+
+BACKUP_REQUEST_NAME: Final = "backup-request"
+"""`<state dir>/backup-request`, the file `roxy-backup-request.path` watches (same name as `scripts/ctl.py`)."""
+BACKUP_REQUEST_MAX_BYTES: Final = 4096
+"""Most of a pending request file that is read back (`backup.sh` reads the same at most)."""
+
+NON_COUNTER_TABLES: Final = frozenset(
+    {"recommendations", "recommendation_actions", "recommendation_watches", "health_runs", "health_results"}
+)
+"""metrics.db tables that hold no counters a KPI reads: a reset of only these marks charts as `config_change`."""
 VACUUM_BYTES_PER_S: Final = 40 * 1024 * 1024
 """A conservative copy rate for the VACUUM time estimate (SSD on a 2 vCPU server); shown as an estimate."""
 
@@ -162,6 +205,13 @@ ROLLUP_KEY: Final = "bucket_start, dim_hash"
 CLIENTS: Final = ("client_minute", "client_hour", "client_day")
 CLIENT_KEY: Final = "bucket_start, client_type, client_key"
 
+PartAction = Literal["delete", "clear_latency", "clear_cache_state"]
+CHANGE_WORDS: Final[dict[str, str]] = {
+    "clear_latency": "the latency histograms",
+    "clear_cache_state": "the cache state",
+}
+"""How the preview summary names what a rewriting part clears (`total_rows` counts them; `changed_rows` too)."""
+
 
 # ================================================================================================ plan parts
 
@@ -172,7 +222,11 @@ class Part:
 
     `key` is the row identity for batched deletes (`rowid`, or a WITHOUT ROWID table's primary key columns);
     `time_col` and `unit` let a date range apply (a part without one is skipped under a date range);
-    `action` is `delete`, or `clear_latency` (keep the rows, empty their latency and queue wait histograms).
+    `action` is `delete`, `clear_latency` (keep the rows, empty their latency and queue wait histograms) or
+    `clear_cache_state` (keep the requests, move the rows of the cache lookup states to `CLEARED_CACHE_STATE`).
+    `match` says which rows `where` selects as column values (`((column, (value, ...)), ...)`, every column must
+    match), so the recorder can fence its unflushed items the same way (`fence_selectors`); None means "every row"
+    when `where` is "1" and "no fence" otherwise (a test checks every part a fence needs has its `match`).
     """
 
     db: str
@@ -182,18 +236,43 @@ class Part:
     params: tuple[Any, ...] = ()
     time_col: str | None = None
     unit: Literal["s", "ms"] = "s"
-    action: Literal["delete", "clear_latency"] = "delete"
+    action: PartAction = "delete"
+    match: tuple[tuple[str, tuple[Any, ...]], ...] | None = None
 
 
 def _events(*types: str) -> Part:
     marks = ", ".join("?" for _ in types)
-    return Part("metrics", "events", "rowid", f"type IN ({marks})", tuple(types), "at_ms", "ms")
+    return Part(
+        "metrics", "events", "rowid", f"type IN ({marks})", tuple(types), "at_ms", "ms", match=(("type", types),)
+    )
+
+
+def _refusals(*reasons: str) -> Part:
+    """Refusal events with one of `reasons` (the attempts tabs of the Protection page, v1's per-tab clears)."""
+    marks = ", ".join("?" for _ in reasons)
+    return Part(
+        "metrics",
+        "events",
+        "rowid",
+        f"type = 'refusal' AND reason_code IN ({marks})",
+        tuple(reasons),
+        "at_ms",
+        "ms",
+        match=(("type", ("refusal",)), ("reason_code", reasons)),
+    )
 
 
 def _rollups(
-    where: str = "1", params: tuple[Any, ...] = (), action: Literal["delete", "clear_latency"] = "delete"
+    where: str = "1",
+    params: tuple[Any, ...] = (),
+    action: PartAction = "delete",
+    match: tuple[tuple[str, tuple[Any, ...]], ...] | None = None,
 ) -> tuple[Part, ...]:
-    return tuple(Part("metrics", t, ROLLUP_KEY, where, params, "bucket_start", "s", action) for t in ROLLUPS)
+    return tuple(Part("metrics", t, ROLLUP_KEY, where, params, "bucket_start", "s", action, match) for t in ROLLUPS)
+
+
+_LOOKUP_STATES_SQL: Final = ", ".join(f"'{state}'" for state in CACHE_LOOKUP_STATES)
+"""The cache lookup states as SQL literals (module constants of the recorder, never request text)."""
 
 
 ATTEMPT_KEY: Final = "bucket_start, endpoint_template, egress, attempt, kind, status, challenge, html_body, exit_id"
@@ -207,7 +286,11 @@ def _dims(where: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Family:
-    """A metric family of plan 6.8 and the card that shows it."""
+    """A metric family of plan 6.8 and the card that shows it.
+
+    `parent` names the family a narrower one is part of: v1 cleared each attempts tab, the throttled clients and the
+    throttle rule hits on their own (parity-9, C3), so those clears map to part of the plan 6.8 family.
+    """
 
     name: str
     label: str
@@ -215,6 +298,7 @@ class Family:
     parts: tuple[Part, ...]
     memory: tuple[str, ...] = ()
     note: str = ""
+    parent: str | None = None
 
 
 FAMILIES: Final[dict[str, Family]] = {
@@ -234,7 +318,7 @@ FAMILIES: Final[dict[str, Family]] = {
             "latency",
             "Latency",
             "traffic#latency",
-            _rollups("latency_hist IS NOT NULL OR queue_wait_hist IS NOT NULL", action="clear_latency"),
+            _rollups("latency_hist IS NOT NULL OR queue_wait_hist IS NOT NULL", action="clear_latency", match=()),
             note="Request counts are kept; only the latency and queue wait histograms are emptied.",
         ),
         Family(
@@ -242,14 +326,19 @@ FAMILIES: Final[dict[str, Family]] = {
             "Cache statistics",
             "cache#stats",
             (
-                *_rollups(_dims("outcome = 'served_cache'")),
+                *_rollups(
+                    _dims(f"cache_state IN ({_LOOKUP_STATES_SQL})"),
+                    action="clear_cache_state",
+                    match=(("cache_state", CACHE_LOOKUP_STATES),),
+                ),
                 Part("metrics", "cache_minute", "rowid", time_col="bucket_start"),
                 Part("metrics", "cache_eviction_passes", "rowid", time_col="at"),
                 Part("cache", "change_observations", "endpoint_template, day", time_col="day"),
             ),
             note=(
-                "Requests answered from the cache leave every chart, so Traffic totals drop by them too. Cached "
-                "entries are kept (use the cache scope to remove them)."
+                "Hits, misses, stale and coalesced answers are cleared together, as v1's Clear stats did: hit ratios "
+                "start again from the next lookup. The requests stay in every Traffic total (their cache state "
+                "reads cleared). Cached entries are kept (use the cache scope to remove them)."
             ),
         ),
         Family(
@@ -283,11 +372,29 @@ FAMILIES: Final[dict[str, Family]] = {
                     "bucket_key >= ? AND bucket_key < ?",
                     ("tarpit_arrival:", "tarpit_arrival:" + _PREFIX_END),
                 ),
+                Part("metrics", "tarpit_minute", "bucket_start, category, kind", time_col="bucket_start"),
+                Part("metrics", "tarpit_hold_minute", "bucket_start, category, bound_ms", time_col="bucket_start"),
             ),
             memory=("tarpit",),
             note="Each worker's tarpit counters (kept in memory) are cleared within a few seconds.",
         ),
         Family("throttle", "Throttle", "protection#throttle", (_events("throttle_tier", "ua_rule_hit", "throttled"),)),
+        Family(
+            "throttle_rule_hits",
+            "Throttle rule hits",
+            "protection#throttle",
+            (_events("throttle_tier", "ua_rule_hit"),),
+            parent="throttle",
+            note="Ladder rung and User-Agent rule hit counts (v1 throttle_rules); the throttled clients list stays.",
+        ),
+        Family(
+            "throttled_clients",
+            "Throttled clients",
+            "protection#throttle-history",
+            (_events("throttled"),),
+            parent="throttle",
+            note="The clients that became throttled (v1 throttled); rung and rule hit counts stay.",
+        ),
         Family(
             "fingerprints",
             "Fingerprints",
@@ -304,7 +411,11 @@ FAMILIES: Final[dict[str, Family]] = {
             "activity",
             "Client activity",
             "clients#activity",
-            tuple(Part("metrics", t, CLIENT_KEY, time_col="bucket_start") for t in CLIENTS),
+            (
+                *(Part("metrics", t, CLIENT_KEY, time_col="bucket_start") for t in CLIENTS),
+                Part("metrics", "client_score_hour", "bucket_start, client_key", time_col="bucket_start"),
+            ),
+            note="Bot scores per client and hour go too.",
         ),
         Family(
             "errors",
@@ -321,10 +432,34 @@ FAMILIES: Final[dict[str, Family]] = {
         Family("visits", "Visits", "overview#visitors", (_events("visit"),)),
         Family("refusals", "Refusals", "protection#refusals", (_events("refusal"),)),
         Family(
+            "endpoint_block_attempts",
+            "Endpoint block attempts",
+            "protection#endpoint-blocks",
+            (_refusals("endpoint_blocked"),),
+            parent="refusals",
+            note="Only refusals by an endpoint block (v1 blocked_attempts); they also leave the Refusals card.",
+        ),
+        Family(
+            "endpoint_rule_attempts",
+            "Endpoint rule attempts",
+            "protection#endpoint-rules",
+            (_refusals("endpoint_rule"),),
+            parent="refusals",
+            note="Only refusals by an endpoint rule (v1 rate_limited_attempts); they also leave the Refusals card.",
+        ),
+        Family(
+            "header_rule_attempts",
+            "Request filter attempts",
+            "protection#header-rules",
+            (_refusals("header_rule"),),
+            parent="refusals",
+            note="Only refusals by a request filter (v1 header_blocked_attempts); they also leave the Refusals card.",
+        ),
+        Family(
             "internal_calls",
             "Internal calls",
             "upstream#internal-calls",
-            (*_rollups(_dims("source = 'internal'")), _events("internal_call")),
+            (*_rollups(_dims("source = 'internal'"), match=(("source", ("internal",)),)), _events("internal_call")),
         ),
         Family(
             "live",
@@ -334,13 +469,19 @@ FAMILIES: Final[dict[str, Family]] = {
         ),
     )
 }
-"""Plan 6.8 "Metric family" resets: name -> family (tables, card, notes)."""
+"""Plan 6.8 "Metric family" resets: name -> family (tables, card, notes), plus the narrower families of v1's
+separate clears (each names its `parent`)."""
 
 STATISTICS_EXTRA: Final[tuple[Part, ...]] = (
     Part("metrics", "events", "rowid", time_col="at_ms", unit="ms"),
     Part("metrics", "request_samples", "rowid", time_col="at_ms", unit="ms"),
+    Part("metrics", "refusal_samples", "rowid", time_col="at_ms", unit="ms"),
     Part("metrics", "anomalies", "rowid", time_col="at"),
     Part("metrics", "rule_hits", "table_name, rule_key"),
+    Part("metrics", "rule_hit_minute", "bucket_start, table_name, rule_key", time_col="bucket_start"),
+    Part("metrics", "metrics_pipeline_minute", "bucket_start, worker_id", time_col="bucket_start"),
+    Part("metrics", "disk_samples", "at", time_col="at"),
+    Part("metrics", "table_size_samples", "at, db, table_name", time_col="at"),
     Part("metrics", "worker_minute", "bucket_start, worker_id", time_col="bucket_start"),
     Part("metrics", "egress_provider_reports", "rowid", time_col="at"),
     Part("metrics", "recommendation_actions", "rowid", time_col="at"),
@@ -413,33 +554,54 @@ V1_CLEAR_TARGETS: Final[dict[str, dict[str, Any]]] = {
         "families": ["traffic"],
         "note": "Endpoint popularity is read from traffic rows; the endpoint scope resets one template.",
     },
-    "blocked_attempts": {"scope": "family", "families": ["refusals"], "note": "Endpoint block refusals."},
-    "rate_limited_attempts": {"scope": "family", "families": ["refusals"], "note": "Endpoint rule refusals."},
-    "header_blocked_attempts": {"scope": "family", "families": ["refusals"], "note": "Request filter refusals."},
-    "pause_drops": {
+    "blocked_attempts": {
         "scope": "family",
-        "families": ["refusals"],
-        "note": "The pause banner counts from the moment the pause began, so no reset is needed (parity row 114).",
+        "families": ["endpoint_block_attempts"],
+        "note": "Endpoint block refusals only; the other attempts tabs stay.",
+    },
+    "rate_limited_attempts": {
+        "scope": "family",
+        "families": ["endpoint_rule_attempts"],
+        "note": "Endpoint rule refusals only; the other attempts tabs stay.",
+    },
+    "header_blocked_attempts": {
+        "scope": "family",
+        "families": ["header_rule_attempts"],
+        "note": "Request filter refusals only; the other attempts tabs stay.",
+    },
+    "pause_drops": {
+        "scope": None,
+        "families": [],
+        "note": "Nothing to reset: the pause banner counts from the moment the pause began (parity row 114).",
     },
     "throttle_drops": {
-        "scope": "family",
-        "families": ["refusals"],
-        "note": "Enabling throttle-all starts a new count by itself (parity row 115).",
+        "scope": None,
+        "families": [],
+        "note": "Nothing to reset: enabling throttle-all starts a new count by itself (parity row 115).",
     },
     "tarpit": {"scope": "family", "families": ["tarpit"]},
-    "cache": {"scope": "family", "families": ["cache_stats"], "note": "Statistics only, as in v1; entries stay."},
-    "throttle_rules": {"scope": "family", "families": ["throttle"], "note": "Ladder rung and UA rule hit counts."},
+    "cache": {
+        "scope": "family",
+        "families": ["cache_stats"],
+        "note": "Statistics only, as in v1: hits, misses, stale and coalesced together; requests and entries stay.",
+    },
+    "throttle_rules": {
+        "scope": "family",
+        "families": ["throttle_rule_hits"],
+        "note": "Ladder rung and UA rule hit counts; the throttled clients list stays.",
+    },
     "live": {"scope": "family", "families": ["live"], "note": "Captured bodies go too, as in v1."},
     "logins": {"scope": "family", "families": ["logins"]},
     "crawls": {"scope": "family", "families": ["crawls"]},
-    "throttled": {"scope": "family", "families": ["throttle"]},
+    "throttled": {"scope": "family", "families": ["throttled_clients"], "note": "The throttled clients list only."},
     "visits": {"scope": "family", "families": ["visits"]},
     "errors": {"scope": "family", "families": ["errors"]},
     "fingerprints": {"scope": "family", "families": ["fingerprints"]},
     "blocked_fingerprints": {"scope": "family", "families": ["fingerprints"], "note": "One family in v2."},
     "all": {"scope": "everything", "note": "Plus the worker request counts: System > Reset counts."},
 }
-"""Where every v1 `POST /admin/data/clear` target went (plan 6.8 last paragraph; v1 notes diagnostics.md 14)."""
+"""Where every v1 `POST /admin/data/clear` target went (plan 6.8 last paragraph; v1 notes diagnostics.md 14).
+`scope` None: v2 counts it from a moment that moves by itself, so there is nothing to reset (the note says why)."""
 
 
 # ================================================================================================ bodies
@@ -509,6 +671,12 @@ class ResetPlan:
         canonical = json.dumps(self.descriptor, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
+    @property
+    def counters(self) -> bool:
+        """Whether this reset takes counters away (its chart marker is then a `reset`, which KPIs read as partial
+        data; any other reset marks a `config_change`, P6 and DESIGN.md 14.2)."""
+        return any(p.db == "metrics" and p.table not in NON_COUNTER_TABLES for p in self.parts)
+
 
 def _fail(field_name: str, message: str) -> common.ApiError:
     return common.validation_error({field_name: message}, "The reset scope is not valid.", code="invalid_scope")
@@ -550,7 +718,28 @@ def _client_parts(kind: str, raw: str, ctx: Any) -> tuple[list[Part], dict[str, 
         lk = limit_key(normalized, int(ctx.settings.get("ipv6_limit_prefix")))
         keys = sorted({key, lk})
         where_ip = "client_type = 'ip' AND client_key = ?"
-        parts = [Part("metrics", t, CLIENT_KEY, where_ip, (key,), "bucket_start") for t in CLIENTS]
+        ip_match = (("client_type", ("ip",)), ("client_key", (key,)))
+        parts = [Part("metrics", t, CLIENT_KEY, where_ip, (key,), "bucket_start", match=ip_match) for t in CLIENTS]
+        # The pairs this address is part of (`<ip>|<place>` rows, finding parity-7): a key prefix range.
+        where_pair = "client_type = 'pair' AND client_key >= ? AND client_key < ?"
+        prefix = f"{key}{PAIR_SEPARATOR}"
+        pair_match = (("client_type", (PAIR_CLIENT_TYPE,)), ("pair_ip", (key,)))
+        parts.extend(
+            Part("metrics", t, CLIENT_KEY, where_pair, (prefix, prefix + _PREFIX_END), "bucket_start", match=pair_match)
+            for t in CLIENTS
+        )
+        # Bot scores are kept per address (the same `activity.ip_key` as the client tables).
+        parts.append(
+            Part(
+                "metrics",
+                "client_score_hour",
+                "bucket_start, client_key",
+                "client_key = ?",
+                (key,),
+                "bucket_start",
+                match=(("client_key", (key,)),),
+            )
+        )
         parts.append(Part("hot", "strikes", "ip", "ip IN (?, ?)", (keys[0], keys[-1])))
         exact = (lk, f"flood:{lk}", f"tall:{lk}", f"tarpit_arrival:{key}")
         where = (
@@ -571,8 +760,18 @@ def _client_parts(kind: str, raw: str, ctx: Any) -> tuple[list[Part], dict[str, 
         parts.append(Part("hot", "limiter", "bucket_key", where, params))
         hash_key = getattr(ctx, "ip_hash_key", None)
         if hash_key:
+            hashed = ip_hash(normalized, hash_key)
             parts.append(
-                Part("metrics", "events", "rowid", "ip_hash = ?", (ip_hash(normalized, hash_key),), "at_ms", "ms")
+                Part(
+                    "metrics",
+                    "events",
+                    "rowid",
+                    "ip_hash = ?",
+                    (hashed,),
+                    "at_ms",
+                    "ms",
+                    match=(("ip_hash", (hashed,)),),
+                )
             )
         else:
             notes.append("Events cannot be matched to this address without the ip_hash_key credential; they stay.")
@@ -582,7 +781,25 @@ def _client_parts(kind: str, raw: str, ctx: Any) -> tuple[list[Part], dict[str, 
     if not place:
         raise _fail("client", "Give a place id (the Roblox-Id header value).")
     where_place = "client_type = 'place' AND client_key = ?"
-    parts = [Part("metrics", t, CLIENT_KEY, where_place, (place,), "bucket_start") for t in CLIENTS]
+    place_match = (("client_type", ("place",)), ("client_key", (place,)))
+    parts = [Part("metrics", t, CLIENT_KEY, where_place, (place,), "bucket_start", match=place_match) for t in CLIENTS]
+    # The pairs this place is part of: a pair key splits at its first separator (`rollups.split_pair`).
+    where_pair = (
+        "client_type = 'pair' AND instr(client_key, ?) > 0 AND substr(client_key, instr(client_key, ?) + 1) = ?"
+    )
+    pair_match = (("client_type", (PAIR_CLIENT_TYPE,)), ("pair_place", (place,)))
+    parts.extend(
+        Part(
+            "metrics",
+            t,
+            CLIENT_KEY,
+            where_pair,
+            (PAIR_SEPARATOR, PAIR_SEPARATOR, place),
+            "bucket_start",
+            match=pair_match,
+        )
+        for t in CLIENTS
+    )
     suffix = f"|place:{place}"
     where = (
         "bucket_key = ? OR (bucket_key >= ? AND bucket_key < ?) "
@@ -590,7 +807,7 @@ def _client_parts(kind: str, raw: str, ctx: Any) -> tuple[list[Part], dict[str, 
     )
     params = (f"place:{place}", f"place:{place}|", f"place:{place}|{_PREFIX_END}", len(suffix), suffix)
     parts.append(Part("hot", "limiter", "bucket_key", where, params))
-    parts.append(Part("metrics", "events", "rowid", "place = ?", (place,), "at_ms", "ms"))
+    parts.append(Part("metrics", "events", "rowid", "place = ?", (place,), "at_ms", "ms", match=(("place", (place,)),)))
     return parts, {"client_type": "place", "client": place}, notes
 
 
@@ -645,9 +862,19 @@ def build_plan(body: ResetBody, ctx: Any, now: float) -> ResetPlan:
         keys = tuple(cooldowns.endpoint_key(template, egress) for egress in Egress)
         marks = ", ".join("?" for _ in keys)
         plan = ResetPlan(scope, f"endpoint {template}", {**descriptor, "template": template})
+        same_template = (("endpoint_template", (template,)),)
         plan.parts = [
-            *_rollups(_dims("endpoint_template = ?"), (template,)),
-            Part("metrics", "upstream_429", "rowid", "endpoint_template = ?", (template,), "at_ms", "ms"),
+            *_rollups(_dims("endpoint_template = ?"), (template,), match=same_template),
+            Part(
+                "metrics",
+                "upstream_429",
+                "rowid",
+                "endpoint_template = ?",
+                (template,),
+                "at_ms",
+                "ms",
+                match=same_template,
+            ),
             Part("hot", "cooldown", "key", f"key IN ({marks})", keys),
             Part("hot", "breaker", "key", f"key IN ({marks})", keys),
         ]
@@ -856,28 +1083,98 @@ def _disk_free(state_dir: Path) -> int:
         return 0
 
 
-def snapshot_feasibility(ctx: Any, names: Sequence[str]) -> list[dict[str, Any]]:
+def _snapshot_entries(folder: Path) -> list[tuple[float, int, Path]]:
+    """`(mtime, bytes, path)` of every regular file in the snapshots folder, oldest first (links are not followed)."""
+    found: list[tuple[float, int, Path]] = []
+    if folder.is_dir():
+        for entry in os.scandir(folder):
+            if entry.is_file(follow_symlinks=False):
+                info = entry.stat(follow_symlinks=False)
+                found.append((info.st_mtime, info.st_size, Path(entry.path)))
+    found.sort()
+    return found
+
+
+def _database_need(ctx: Any, name: str) -> int:
+    """An upper bound of one `VACUUM INTO` copy: the file plus its WAL (the copy holds only the live pages)."""
+    db = ctx.dbs.get(name)
+    size = read_sizes.file_sizes([Path(db.path)])[Path(db.path).name]
+    return int(size["bytes"] + size["wal_bytes"])
+
+
+def snapshot_feasibility(
+    ctx: Any, names: Sequence[str], *, held: int | None = None, room: int = 0
+) -> list[dict[str, Any]]:
     """Whether a `VACUUM INTO` snapshot of each database can be taken now (plan 6.8 "where feasible").
 
-    It reads file and disk sizes: call it on a worker thread (`asyncio.to_thread`).
+    `snapshots_max_bytes` is the total all snapshots may use together (plan 6.10), so the copies count against it
+    with what the folder already `held` (read from the folder when None) minus `room` (bytes the caller removes
+    first), and each feasible copy counts against the next one; the free disk must keep `SNAPSHOT_MIN_FREE_BYTES`
+    after all of them (finding apisec-5). It reads file and disk sizes: call it on a worker thread.
     """
     budget = int(ctx.settings.get("snapshots_max_bytes"))
-    free = _disk_free(Path(ctx.env.state_dir))
+    free = _disk_free(Path(ctx.env.state_dir)) + max(0, room)
+    if held is None:
+        held = sum(size for _mtime, size, _path in _snapshot_entries(snapshot_dir(ctx)))
+    in_folder = max(0, held - max(0, room))
+    planned = 0
     out = []
     for name in names:
-        db = ctx.dbs.get(name)
-        size = read_sizes.file_sizes([Path(db.path)])[Path(db.path).name]
-        need = size["bytes"] + size["wal_bytes"]
+        need = _database_need(ctx, name)
         if budget <= 0:
             reason, ok = "Snapshots are turned off (snapshots_max_bytes is 0).", False
         elif need > budget:
             reason, ok = f"The database ({need} bytes) is larger than snapshots_max_bytes ({budget}).", False
-        elif free < need + SNAPSHOT_MIN_FREE_BYTES:
+        elif in_folder + planned + need > budget:
+            reason, ok = (
+                f"The snapshots folder holds {in_folder} bytes; a copy of {need} bytes would pass snapshots_max_bytes "
+                f"({budget}). Older snapshots leave after retention_snapshots_days, or raise the cap.",
+                False,
+            )
+        elif free < planned + need + SNAPSHOT_MIN_FREE_BYTES:
             reason, ok = "Not enough free disk space for a copy.", False
         else:
             reason, ok = "", True
+            planned += need
         out.append({"db": name, "bytes": need, "feasible": ok, "reason": reason})
     return out
+
+
+def backup_plan(ctx: Any, names: Sequence[str]) -> tuple[list[dict[str, Any]], list[Path]]:
+    """Back up now's feasibility, and the oldest manual copies to remove first so the new set fits the cap.
+
+    Only `manual-*` snapshots are ever removed here (reset and pre-migration snapshots stay, whatever their age);
+    when even removing every manual copy leaves no room, nothing is removed and the plan says why. A thread call.
+    """
+    entries = _snapshot_entries(snapshot_dir(ctx))
+    held = sum(size for _mtime, size, _path in entries)
+    budget = int(ctx.settings.get("snapshots_max_bytes"))
+    need = sum(_database_need(ctx, name) for name in names)
+    manual = [(size, path) for _mtime, size, path in entries if path.name.startswith(MANUAL_SNAPSHOT_PREFIX)]
+    remove: list[Path] = []
+    room = 0
+    while manual and held - room + need > budget:
+        size, path = manual.pop(0)
+        remove.append(path)
+        room += size
+    plan = snapshot_feasibility(ctx, names, held=held, room=room)
+    if not all(item["feasible"] for item in plan):
+        return snapshot_feasibility(ctx, names, held=held), []
+    return plan, remove
+
+
+def _remove_snapshots(paths: Sequence[Path]) -> list[str]:
+    """Delete the named snapshot files (never following a link); returns the names removed. A thread call."""
+    removed: list[str] = []
+    for path in paths:
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            path.unlink()
+            removed.append(path.name)
+        except FileNotFoundError:
+            continue
+    return removed
 
 
 async def preview_plan(ctx: Any, plan: ResetPlan, now: float) -> dict[str, Any]:
@@ -945,7 +1242,10 @@ async def preview_plan(ctx: Any, plan: ResetPlan, now: float) -> dict[str, Any]:
     total = sum(int(t["rows"]) for t in tables)
     oldest = min((t["oldest"] for t in tables if t.get("oldest") is not None), default=None)
     newest = max((t["newest"] for t in tables if t.get("newest") is not None), default=None)
-    deleted_tables = sum(1 for t in tables if t["rows"])
+    deleted_tables = sum(1 for t in tables if t["rows"] and t["action"] == "delete")
+    deleted_rows = sum(int(t["rows"]) for t in tables if t["action"] == "delete")
+    changed = [t for t in tables if t["rows"] and t["action"] != "delete"]
+    changed_rows = sum(int(t["rows"]) for t in changed)
     span = ""
     if plan.range is not None:
         span = f" between {_day(plan.range[0], ctx)} and {_day(plan.range[1], ctx)}"
@@ -959,9 +1259,17 @@ async def preview_plan(ctx: Any, plan: ResetPlan, now: float) -> dict[str, Any]:
         rows_by_db[table["db"]] = rows_by_db.get(table["db"], 0) + int(table["rows"])
     wanted = [name for name in plan.snapshot_dbs if rows_by_db.get(name, 0) > 0 or (plan.factory and name == "control")]
     snapshots = await asyncio.to_thread(snapshot_feasibility, ctx, wanted)
-    rows_word = "row" if total == 1 else "rows"
-    tables_word = "table" if deleted_tables == 1 else "tables"
-    summary = f"This will delete {total:,} {rows_word} from {deleted_tables} {tables_word}{span}."
+    steps = []
+    if deleted_rows or not changed_rows:
+        rows_word = "row" if deleted_rows == 1 else "rows"
+        tables_word = "table" if deleted_tables == 1 else "tables"
+        steps.append(f"delete {deleted_rows:,} {rows_word} from {deleted_tables} {tables_word}")
+    if changed_rows:
+        what = sorted({CHANGE_WORDS.get(str(t["action"]), "the values") for t in changed})
+        rows_word = "row" if changed_rows == 1 else "rows"
+        tables_word = "table" if len(changed) == 1 else "tables"
+        steps.append(f"clear {' and '.join(what)} of {changed_rows:,} {rows_word} in {len(changed)} {tables_word}")
+    summary = f"This will {' and '.join(steps)}{span}."
     if plan.leaves:
         summary += f" Not affected: {'; '.join(plan.leaves)}."
     return {
@@ -969,6 +1277,7 @@ async def preview_plan(ctx: Any, plan: ResetPlan, now: float) -> dict[str, Any]:
         "label": plan.label,
         "summary": summary,
         "total_rows": total,
+        "changed_rows": changed_rows,
         "tables": tables,
         "actions": actions,
         "range": None if plan.range is None else {"from": plan.range[0], "to": plan.range[1]},
@@ -1138,11 +1447,77 @@ def _delete_batch(conn: sqlite3.Connection, part: Part, where: str, params: tupl
             "AND (latency_hist IS NOT NULL OR queue_wait_hist IS NOT NULL) LIMIT ?)"
         )
         return int(conn.execute(sql, (*params, limit)).rowcount)
+    if part.action == "clear_cache_state":
+        return _clear_cache_state_batch(conn, part, where, params, limit)
     return retention.delete_batch(conn, part.table, part.key, where, params, part.key, limit)
 
 
-class _Lease:
-    """The fleet-wide reset lease (hot.db), renewed while the operation runs."""
+_DIM_SELECT: Final = f"SELECT {', '.join(DIM_COLUMNS)} FROM dims WHERE dim_hash = ?"  # noqa: S608 (module constants)
+_DIM_INSERT: Final = (
+    f"INSERT OR IGNORE INTO dims (dim_hash, {', '.join(DIM_COLUMNS)}) "  # noqa: S608 (module constants)
+    f"VALUES ({', '.join('?' for _ in range(1 + len(DIM_COLUMNS)))})"
+)
+_CACHE_STATE_INDEX: Final = DIM_COLUMNS.index("cache_state")
+_ZONED_ROLLUPS: Final = frozenset({"rollup_day", "rollup_month"})
+"""Rollup levels whose rows carry the zone they were computed in (`tz`, plan 6.4); a moved row keeps it."""
+
+
+def _clear_cache_state_batch(
+    conn: sqlite3.Connection, part: Part, where: str, params: tuple[Any, ...], limit: int
+) -> int:
+    """Move at most `limit` rollup rows of a cache lookup state to `CLEARED_CACHE_STATE` (cache statistics reset).
+
+    Each row goes to the same dimensions with the cache state cleared (its `dims` row added when new) and is added
+    to a row already there (counters summed, histograms merged), exactly like two workers flushing one minute; the
+    old row is deleted. Requests, bytes, calls and latency stay where they were in every total (parity-8).
+    """
+    register_sql_functions(conn)  # roxy_hist_merge, for rows that meet
+    table = part.table  # a module constant (ROLLUPS)
+    zoned = ", tz" if table in _ZONED_ROLLUPS else ""
+    sums = ", ".join(ROLLUP_SUMS)
+    rows = conn.execute(
+        f"SELECT bucket_start, dim_hash FROM {table} WHERE ({where}) LIMIT ?",  # noqa: S608 (module constants)
+        (*params, limit),
+    ).fetchall()
+    if not rows:
+        return 0
+    moved: dict[int, int] = {}
+    for dim_hash in {int(row[1]) for row in rows}:
+        found = conn.execute(_DIM_SELECT, (dim_hash,)).fetchone()
+        if found is None:
+            continue  # a rollup row without its dimensions: left alone (it cannot be told apart)
+        dims = list(found)
+        dims[_CACHE_STATE_INDEX] = CLEARED_CACHE_STATE
+        cleared = tuple(dims)
+        new_hash = dims_hash(cleared)
+        conn.execute(_DIM_INSERT, (new_hash, *cleared))
+        moved[dim_hash] = new_hash
+    upsert = (
+        f"INSERT INTO {table} (bucket_start, dim_hash, {sums}, latency_hist, queue_wait_hist{zoned}) "  # noqa: S608
+        f"SELECT bucket_start, ?, {sums}, latency_hist, queue_wait_hist{zoned} FROM {table} "
+        "WHERE bucket_start = ? AND dim_hash = ? "
+        "ON CONFLICT (bucket_start, dim_hash) DO UPDATE SET "
+        + ", ".join(f"{column} = {column} + excluded.{column}" for column in ROLLUP_SUMS)
+        + ", latency_hist = roxy_hist_merge(latency_hist, excluded.latency_hist), "
+        "queue_wait_hist = roxy_hist_merge(queue_wait_hist, excluded.queue_wait_hist)"
+    )
+    delete = f"DELETE FROM {table} WHERE bucket_start = ? AND dim_hash = ?"  # noqa: S608 (module constants)
+    count = 0
+    for bucket_start, dim_hash in rows:
+        target = moved.get(int(dim_hash))
+        if target is None:
+            continue
+        conn.execute(upsert, (target, bucket_start, dim_hash))
+        conn.execute(delete, (bucket_start, dim_hash))
+        count += 1
+    return count
+
+
+class ResetLease:
+    """The fleet-wide lease (hot.db `RESET_LEASE`) one data reset or backup holds, renewed while it runs.
+
+    Public because the internal socket's operator resets (`internal_app.py`) take the same lease: one reset or
+    backup at a time, from the dashboard or from `scripts/ctl.py`."""
 
     def __init__(self, ctx: Any, holder: str) -> None:
         self.ctx = ctx
@@ -1173,7 +1548,7 @@ class _Lease:
             await self.ctx.dbs.hot.write(lambda conn: leases.release(conn, RESET_LEASE, self.holder))
 
 
-async def _run_part(ctx: Any, op: Operation, lease: _Lease, part: Part, window: tuple[int, int] | None) -> int:
+async def _run_part(ctx: Any, op: Operation, lease: ResetLease, part: Part, window: tuple[int, int] | None) -> int:
     clause = part_clause(part, window)
     if clause is None:
         return 0
@@ -1219,15 +1594,151 @@ def _control_reset(
     return counts
 
 
+def fence_selectors(plan: ResetPlan) -> list[dict[str, Any]]:
+    """The reset fence of a plan: what every worker's recorder must drop or rewrite from its unflushed items.
+
+    One selector per metrics.db part on a table the recorder writes (`recorder.FENCED_TABLES`; the four rollup
+    levels are one, `rollup_minute`, the only level the recorder writes). A part whose `where` is not "1" needs its
+    `match`, else it gets no selector (a test pins that every such part of every scope has one). Under a date range
+    a part without a time column does not apply, as in `part_clause`.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for part in plan.parts:
+        if part.db != "metrics":
+            continue
+        table = "rollup_minute" if part.table in ROLLUPS else part.table
+        if table not in FENCED_TABLES:
+            continue
+        match = part.match
+        if match is None:
+            if part.where != "1":
+                continue
+            match = ()
+        selector: dict[str, Any] = {
+            "table": table,
+            "action": part.action,
+            "match": {column: list(values) for column, values in match},
+        }
+        if plan.range is not None:
+            if part.time_col is None:
+                continue
+            selector["range"] = list(plan.range)
+        identity = json.dumps(selector, sort_keys=True, default=str)
+        if identity not in seen:
+            seen.add(identity)
+            out.append(selector)
+    if len(out) > MAX_FENCE_SELECTORS:  # never in practice: then fence whole tables (more is dropped, never less)
+        tables = sorted({str(s["table"]) for s in out})
+        out = [{"table": t, "action": "delete", "match": {}} for t in tables][:MAX_FENCE_SELECTORS]
+    return out
+
+
+def _append_fence(conn: sqlite3.Connection, selectors: list[dict[str, Any]], now_ms: int) -> int:
+    """Append one fence to `service_state[RESET_FENCE_KEY]` (the newest `MAX_RESET_FENCES` kept); returns its seq."""
+    row = conn.execute("SELECT value_json FROM service_state WHERE key = ?", (RESET_FENCE_KEY,)).fetchone()
+    document: Any = {}
+    if row is not None:
+        with contextlib.suppress(ValueError, TypeError):
+            document = json.loads(row[0])
+    if not isinstance(document, dict):
+        document = {}
+    fences = [f for f in document.get("fences") or [] if isinstance(f, dict)]
+    try:
+        seq = int(document.get("seq", 0)) + 1
+    except (TypeError, ValueError):
+        seq = 1
+    seq = max([seq, *(int(f.get("seq", 0)) + 1 for f in fences if isinstance(f.get("seq"), int))])
+    fences = [*fences[-(MAX_RESET_FENCES - 1) :], {"seq": seq, "at_ms": int(now_ms), "selectors": selectors}]
+    conn.execute(
+        "INSERT INTO service_state (key, value_json, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+        (RESET_FENCE_KEY, json.dumps({"seq": seq, "fences": fences}, separators=(",", ":")), int(now_ms) // 1000),
+    )
+    return seq
+
+
+async def fence_pending_counts(ctx: Any, plan: ResetPlan) -> dict[str, Any] | None:
+    """Keep every worker's unflushed counts from before this reset out of the tables it resets (finding parity-4).
+
+    Writes the fence (control.db; a failure stops the reset before anything is deleted), tells this worker's
+    recorder, and flushes it: what this worker gathered until now is either dropped by the fence or written now and
+    deleted by the reset, and everything it counts afterwards is kept. Other workers see the fence inside their
+    next flush transaction (`metrics/recorder.py ResetFences`). Raises `SharedStateUnavailable` when this worker's
+    flush could not write metrics.db (its counts would come back after the reset).
+    """
+    selectors = fence_selectors(plan)
+    if not selectors:
+        return None
+    now_ms = int(ctx.clock.now_ms())
+    seq: int = await ctx.dbs.control.write(lambda conn: _append_fence(conn, selectors, now_ms))
+    recorder = getattr(ctx, "recorder", None)
+    flushed = False
+    if recorder is not None and hasattr(recorder, "note_reset_fence"):
+        recorder.note_reset_fence(seq)
+        result = await recorder.flush()
+        if "metrics" in (getattr(result, "failed_dbs", None) or ()):
+            raise SharedStateUnavailable("metrics", "this worker's unflushed counts could not be written first")
+        flushed = True
+    return {"seq": seq, "selectors": len(selectors), "flushed_this_worker": flushed}
+
+
+def marker_tables(plan: ResetPlan) -> list[str]:
+    """What a reset's marker says it touched (`metrics/annotate.py` `tables`): `<db>.<table>` for deleted rows,
+    `#latency` and `#cache_state` suffixes for rollup rows whose histograms or cache state were cleared."""
+    suffix = {"clear_latency": "#latency", "clear_cache_state": "#cache_state"}
+    names = [f"{p.db}.{p.table}{suffix.get(p.action, '')}" for p in plan.parts]
+    if plan.cache_scope is not None:
+        names.append("cache.entries")
+    if plan.bans_where is not None:
+        names.append("control.bans")
+    if plan.upstream_reset:
+        names.extend(f"hot.{p.table}" for p in UPSTREAM_PARTS)
+    if plan.factory:
+        names.extend(f"control.{name}" for name in RULE_TABLES)
+        names.append("control.settings")
+    return list(dict.fromkeys(names))
+
+
+async def _write_marker(ctx: Any, plan: ResetPlan, audit_id: int | None) -> int:
+    """The chart marker of a reset, before anything is deleted (finding mpjobs-4): at the start of a date range
+    (with its end), else now; kind `reset` when counters go (KPIs then show the partial-data notice), naming what
+    it touches so only the numbers of those tables get the notice (finding parity-12's `reset_tables`)."""
+    at = plan.range[0] if plan.range is not None else int(ctx.clock.now())
+    until = plan.range[1] if plan.range is not None else None  # a ranged reset marks the whole deleted range
+    kind = "reset" if plan.counters else "config_change"
+    label = f"Data reset: {plan.label}"[:MAX_LABEL_CHARS]
+    tables = marker_tables(plan)
+
+    def write(conn: sqlite3.Connection) -> int:
+        return insert_annotation(conn, int(at), kind, label, audit_id, until=until, tables=tables)
+
+    marker: int = await ctx.dbs.metrics.write(write)
+    return marker
+
+
+def _keep_marker(part: Part, marker: int | None) -> Part:
+    """An `annotations` part that leaves this reset's own marker alone (the everything and factory resets)."""
+    if marker is None or part.table != "annotations":
+        return part
+    return replace(part, where=f"({part.where}) AND id != ?", params=(*part.params, marker))
+
+
 async def execute_reset(
-    ctx: Any, op: Operation, plan: ResetPlan, actor: Actor, reason: str, request_id: str | None, lease: _Lease
+    ctx: Any, op: Operation, plan: ResetPlan, actor: Actor, reason: str, request_id: str | None, lease: ResetLease
 ) -> dict[str, Any]:
-    """Run a reset plan holding `lease` (released at the end). Returns the rows changed per table."""
+    """Run a reset plan holding `lease` (released at the end). Returns the rows changed per table.
+
+    Order: snapshots, the reset fence (`fence_pending_counts`), the chart marker, then the deletes; see the module
+    docstring. `op.audit_id` is the intent row the marker links to until the reset ends.
+    """
     target = f"operation:{op.id}"
     started = time.perf_counter()
     deleted: dict[str, int] = {}
     snapshots: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    fence: dict[str, Any] | None = None
+    marker: int | None = None
     try:
         now = ctx.clock.now()
         op.step = "snapshot"
@@ -1238,6 +1749,10 @@ async def execute_reset(
                 skipped.append({"db": item["db"], "reason": item["reason"]})
                 continue
             snapshots.append(await take_snapshot(ctx, item["db"], "reset", now))
+        op.step = "fence"
+        fence = await fence_pending_counts(ctx, plan)
+        op.step = "marker"
+        marker = await _write_marker(ctx, plan, op.audit_id)  # metrics.db refusing it means nothing is deleted
         if plan.bans_where is not None or plan.factory:
             op.step = "rules"
             control = await ctx.dbs.control.write(
@@ -1274,7 +1789,7 @@ async def execute_reset(
             deleted["hot.breaker"] = int(counts.get("breakers", 0))
         for part in plan.parts:
             op.step = f"{part.db}.{part.table}"
-            rows = await _run_part(ctx, op, lease, part, plan.range)
+            rows = await _run_part(ctx, op, lease, _keep_marker(part, marker), plan.range)
             label = f"{part.db}.{part.table}"
             deleted[label] = deleted.get(label, 0) + rows
             await lease.keep()
@@ -1291,9 +1806,25 @@ async def execute_reset(
             "deleted": deleted,
             "step": op.step,
             "error": common.clean_message(f"{type(exc).__name__}: {exc}", 300),
+            "fence": fence,
         }
+        failed_id: int | None = None
         with contextlib.suppress(Exception):
-            await _audit(ctx, actor, AUDIT_RESET_FAILED, target, failure, reason, request_id)
+            failed_id = await _audit(ctx, actor, AUDIT_RESET_FAILED, target, failure, reason, request_id)
+        if marker is not None:
+            # Rows already gone keep their marker, so every chart and KPI over them still says "data reset"
+            # (plan 6.8, finding mpjobs-4); a reset that changed nothing leaves no marker behind. Best effort.
+            marker_id = marker
+            changed = sum(deleted.values()) > 0
+            incomplete = f"Data reset (incomplete): {plan.label}"[:MAX_LABEL_CHARS]
+
+            def settle(conn: sqlite3.Connection) -> bool:
+                if changed:
+                    return update_annotation(conn, marker_id, audit_id=failed_id, label=incomplete)
+                return delete_annotation(conn, marker_id)
+
+            with contextlib.suppress(Exception):
+                await ctx.dbs.metrics.write(settle)
         raise
     finally:
         await lease.release()
@@ -1307,20 +1838,15 @@ async def execute_reset(
         "range": None if plan.range is None else {"from": plan.range[0], "to": plan.range[1]},
         "duration_ms": duration_ms,
         "intent_audit_id": op.audit_id,
+        "fence": fence,
     }
     done_id = await _audit(ctx, actor, AUDIT_RESET_DONE, target, outcome, reason, request_id)
-    at = plan.range[0] if plan.range is not None else int(ctx.clock.now())
-    until = plan.range[1] if plan.range is not None else None  # a ranged reset marks the whole deleted range
-    label = f"Data reset: {plan.label}"[:MAX_LABEL_CHARS]
-
-    def annotate(conn: sqlite3.Connection) -> int:
-        return insert_annotation(conn, int(at), "reset", label, done_id, until=until)
-
-    annotation_id = None
-    with contextlib.suppress(SharedStateUnavailable):
-        annotation_id = await ctx.dbs.metrics.write(annotate)
+    if marker is not None:
+        marker_id = marker
+        with contextlib.suppress(SharedStateUnavailable):  # else the marker keeps linking to the intent row
+            await ctx.dbs.metrics.write(lambda conn: update_annotation(conn, marker_id, audit_id=done_id))
     op.step = "done"
-    return {**outcome, "audit_id": done_id, "annotation_id": annotation_id}
+    return {**outcome, "audit_id": done_id, "annotation_id": marker}
 
 
 # ================================================================================================ routes: resets
@@ -1336,7 +1862,9 @@ async def reset_scopes(_admin: AdminSession) -> dict[str, Any]:
                 "name": f.name,
                 "label": f.label,
                 "card": f.card,
+                "parent": f.parent,
                 "tables": sorted({p.table for p in f.parts}),
+                "actions": sorted({p.action for p in f.parts}),
                 "note": f.note,
             }
             for f in FAMILIES.values()
@@ -1379,9 +1907,11 @@ async def _run_reset(request: Request, body: RunResetBody, admin: Any) -> Any:
     actor = actor_for(admin)
     request_id = request_id_of(request)
     op = Operation(_new_id("reset"), "reset", plan.label, now)
-    lease = _Lease(ctx, f"{ctx.worker_id}:{op.id}")
+    lease = ResetLease(ctx, f"{ctx.worker_id}:{op.id}")
     if not await common.run_mutation(lease.acquire()):
-        raise common.conflict("Another data reset is running; wait for it to finish.", code="reset_in_progress")
+        raise common.conflict(
+            "Another data reset or backup is running; wait for it to finish.", code="reset_in_progress"
+        )
     intent = {
         "scope": plan.descriptor,
         "label": plan.label,
@@ -1558,28 +2088,41 @@ RETENTION_FILE_SETTINGS: Final = (
     "storage_total_budget_gb",
     "maintenance_hour",
 )
+RETENTION_CARDS: Final = ("data#retention", "data#record-caps")
+"""The Data page cards whose settings the retention view lists (plan 6.10: every limit is shown there)."""
+
+
+def retention_setting_keys() -> list[str]:
+    """Every setting the retention view shows, in catalog order (finding parity-10): each catalog key whose pages
+    name a `RETENTION_CARDS` card, then any other Data page setting a table's limit names, then the file limits."""
+    keys = [key for key, spec in catalog.CATALOG.items() if any(page in RETENTION_CARDS for page in spec.pages)]
+    for metas in read_sizes.TABLES.values():
+        for meta in metas:
+            for name in (meta.age, meta.cap):
+                spec = catalog.CATALOG.get(name) if name else None
+                if spec is not None and name not in keys and any(p.startswith("data#") for p in spec.pages):
+                    keys.append(str(name))
+    keys.extend(name for name in RETENTION_FILE_SETTINGS if name not in keys)
+    return keys
 
 
 @router.get("/retention")
 async def retention_view(request: Request, _admin: AdminSession) -> dict[str, Any]:
-    """The plan 6.10 retention settings with their values, and each table's state against them."""
+    """Every retention and record cap setting with its value, and each table's state against its limits."""
     ctx = get_ctx(request)
     data = await common.run_mutation(measure_storage(ctx))
     snapshot = ctx.settings.snapshot()
-    keys: list[str] = []
-    for metas in read_sizes.TABLES.values():
-        for meta in metas:
-            keys.extend(name for name in (meta.age, meta.cap) if name and name not in keys)
-    keys.extend(name for name in RETENTION_FILE_SETTINGS if name not in keys)
     settings = []
-    for key in keys:
+    for key in retention_setting_keys():
         spec = catalog.CATALOG.get(key)
         if spec is None:
             continue
+        card = next((page.split("#", 1)[1] for page in spec.pages if page in RETENTION_CARDS), "retention")
         settings.append(
             {
                 "key": key,
                 "label": spec.label,
+                "card": card,
                 "value": snapshot[key],
                 "default": catalog.DEFAULTS.get(key, spec.default),
                 "unit": spec.unit,
@@ -1600,11 +2143,16 @@ async def retention_view(request: Request, _admin: AdminSession) -> dict[str, An
             "max_age_setting": t["max_age_setting"],
             "row_cap": t["row_cap"],
             "row_cap_setting": t["row_cap_setting"],
+            "rule": t.get("retention_rule"),
             "status": t["retention_status"],
         }
         for database in data["databases"]
         for t in database.get("tables", [])
-        if t.get("max_age_setting") or t.get("row_cap_setting")
+        if t.get("max_age_setting")
+        or t.get("row_cap_setting")
+        or t.get("max_age_s") is not None
+        or t.get("row_cap") is not None
+        or t.get("retention_rule")
     ]
     return {
         "settings": settings,
@@ -1658,57 +2206,166 @@ def _backup_status(state_dir: Path) -> dict[str, Any]:
         },
         "last_failure": document.get("last_failure") if isinstance(document.get("last_failure"), dict) else None,
         "restore_test": document.get("restore_test") if isinstance(document.get("restore_test"), dict) else None,
+        # What backup.sh did with the last "back up now" request (ran, skipped_recent, skipped_no_database).
+        "last_request": _request_view(document.get("last_request")),
     }
+
+
+def _request_view(raw: Any) -> dict[str, Any] | None:
+    """A request record (`backup.sh` or the pending file) with only its known, bounded, plain fields."""
+    if not isinstance(raw, dict):
+        return None
+    view: dict[str, Any] = {}
+    for key in ("at", "requested_at", "by", "outcome"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            view[key] = common.clean_message(value, 80)  # written by the roxy user: caller text, shown as text
+        elif isinstance(value, int | float) and not isinstance(value, bool):
+            view[key] = value
+    audit_id = raw.get("audit_id")
+    if isinstance(audit_id, int) and not isinstance(audit_id, bool):
+        view["audit_id"] = audit_id
+    return view
+
+
+def _pending_request(state_dir: Path) -> dict[str, Any] | None:
+    """The request file still waiting for the root backup, read without following a link (at most 4 KiB)."""
+    path = state_dir / BACKUP_REQUEST_NAME
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            raw = handle.read(BACKUP_REQUEST_MAX_BYTES)
+    except OSError:
+        return None
+    try:
+        return _request_view(json.loads(raw.decode("utf-8", "replace")))
+    except ValueError:
+        return {"unreadable": True}
+
+
+def write_backup_request(state_dir: Path, by: str, audit_id: int | None, requested_at: float) -> dict[str, Any]:
+    """Write `<state dir>/backup-request` for `roxy-backup-request.path` (as `scripts/ctl.py write_backup_request`).
+
+    A new file (O_EXCL, never following a link, mode 0640) is renamed into place, so the path unit only ever sees
+    a complete request. A thread call; never raises (the snapshot on this server is still taken).
+    """
+    target = state_dir / BACKUP_REQUEST_NAME
+    tmp = state_dir / f".{BACKUP_REQUEST_NAME}.{secrets.token_hex(4)}.tmp"
+    stamp = datetime.fromtimestamp(float(requested_at), UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    document = {"requested_at": stamp, "by": by, "audit_id": audit_id}
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(tmp, flags, 0o640)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(document, handle)
+                handle.write("\n")
+            os.replace(tmp, target)  # PathExists= sees the complete file only
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
+    except OSError as exc:
+        return {"written": False, "file": BACKUP_REQUEST_NAME, "error": type(exc).__name__}
+    return {"written": True, "file": BACKUP_REQUEST_NAME, "requested_at": stamp}
 
 
 @router.get("/backups")
 async def backups(request: Request, _admin: AdminSession) -> dict[str, Any]:
-    """The nightly backups (as `backup.sh` recorded them) and the snapshots on this server."""
+    """The nightly backups (as `backup.sh` recorded them, with its last answered request), a request still
+    waiting for it, and the snapshots on this server."""
     ctx = get_ctx(request)
     state_dir = Path(ctx.env.state_dir)
     nightly = await asyncio.to_thread(_backup_status, state_dir)
+    pending = await asyncio.to_thread(_pending_request, state_dir)
     snapshots = await asyncio.to_thread(_snapshot_files, state_dir / "snapshots")
     return {
         "nightly": nightly,
+        "last_request": nightly.get("last_request"),
+        "pending_request": pending,
         "snapshots": snapshots,
         "snapshots_bytes": sum(item["bytes"] for item in snapshots),
         "snapshots_max_bytes": int(ctx.settings.get("snapshots_max_bytes")),
         "snapshots_keep_days": int(ctx.settings.get("retention_snapshots_days")),
         "note": (
-            "Back up now makes a snapshot on this server (VACUUM INTO, kept like reset snapshots). The nightly "
-            "backup (roxy-backup.service) also compresses, checks and optionally encrypts and copies the set."
+            "Back up now asks the nightly backup (roxy-backup.service) to run now; that one compresses, checks and "
+            "optionally encrypts and copies the set, and skips a request within 10 minutes of its last good run. "
+            "It also makes a snapshot on this server where one fits (VACUUM INTO, kept like reset snapshots; it "
+            "replaces its own oldest copies when the folder would pass snapshots_max_bytes, and skips a copy that "
+            "still does not fit, saying why)."
         ),
     }
 
 
 @router.post("/backups", response_model=None)
 async def back_up_now(request: Request, body: ReasonBody, admin: AdminSession, _csrf: CsrfChecked) -> Any:
-    """Back up now: a `VACUUM INTO` snapshot of control.db and metrics.db in the snapshots folder (audited)."""
+    """Back up now: a request for the root backup, and `VACUUM INTO` snapshots of control.db and metrics.db where
+    they fit `snapshots_max_bytes` and the free disk (audited; one backup or reset at a time fleet-wide).
+
+    The request for the root backup (compressed, checked, optionally encrypted and copied off the server) is the
+    backup; the on-server copies are a convenience. So the request is written whatever the local plan says, right
+    after the audited intent, and a copy that does not fit is skipped with its reason in the result, as a reset
+    skips its snapshot (finding secfix-4: with snapshots turned off, a folder full of reset snapshots or a nearly
+    full disk, the button used to answer 409 before it asked the root backup). 409 `not_feasible` only when neither
+    the request nor any copy could be made. The folder still never passes its cap (finding apisec-5)."""
     ctx = get_ctx(request)
-    plan = await asyncio.to_thread(snapshot_feasibility, ctx, list(SNAPSHOT_DBS))
-    blocked = [item for item in plan if not item["feasible"]]
-    if blocked:
-        raise common.conflict(" ".join(f"{item['db']}: {item['reason']}" for item in blocked), code="not_feasible")
     actor = actor_for(admin)
     reason = common.require_reason(body.reason, required=False)
     request_id = request_id_of(request)
     now = ctx.clock.now()
     op = Operation(_new_id("backup"), "backup", "back up now", now)
-    op.audit_id = await _audit(
-        ctx, actor, AUDIT_BACKUP, f"operation:{op.id}", {"databases": list(SNAPSHOT_DBS)}, reason, request_id
-    )
+    lease = ResetLease(ctx, f"{ctx.worker_id}:{op.id}")
+    if not await common.run_mutation(lease.acquire()):
+        raise common.conflict("Another backup or data reset is running; wait for it to finish.", code="run_in_progress")
+    state_dir = Path(ctx.env.state_dir)
+    try:
+        plan, replaced = await asyncio.to_thread(backup_plan, ctx, list(SNAPSHOT_DBS))
+        copies = [str(item["db"]) for item in plan if item["feasible"]]
+        skipped = [{"db": item["db"], "reason": item["reason"]} for item in plan if not item["feasible"]]
+        intent = {
+            "databases": copies,
+            "skipped": skipped,
+            "replaces": [path.name for path in replaced],
+            "request_file": BACKUP_REQUEST_NAME,
+        }
+        op.audit_id = await _audit(ctx, actor, AUDIT_BACKUP, f"operation:{op.id}", intent, reason, request_id)
+        op.step = "request"
+        asked = await asyncio.to_thread(write_backup_request, state_dir, actor.label, op.audit_id, now)
+        if not asked["written"] and not copies:
+            why = " ".join(f"{item['db']}: {item['reason']}" for item in skipped)
+            failed = {"request": asked, "skipped": skipped}
+            await _audit(ctx, actor, f"{AUDIT_BACKUP}.failed", f"operation:{op.id}", failed, reason, request_id)
+            raise common.conflict(
+                f"No backup could be asked: the request for the root backup could not be written "
+                f"({asked.get('error', 'unknown error')}) and no snapshot on this server fits. {why}",
+                code="not_feasible",
+            )
+    except BaseException:
+        await lease.release()
+        raise
 
     async def work() -> dict[str, Any]:
-        made = []
-        for name in SNAPSHOT_DBS:
-            op.step = name
-            made.append(await take_snapshot(ctx, name, "manual", now))
-        done_id = await _audit(
-            ctx, actor, f"{AUDIT_BACKUP}.done", f"operation:{op.id}", {"snapshots": made}, reason, request_id
-        )
-        return {"snapshots": made, "audit_id": done_id}
+        try:
+            op.step = "room"
+            removed = await asyncio.to_thread(_remove_snapshots, replaced)
+            made = []
+            for name in copies:
+                op.step = name
+                made.append(await take_snapshot(ctx, name, "manual", now))
+                await lease.keep()
+            outcome = {"snapshots": made, "skipped": skipped, "replaced": removed, "request": asked}
+            done_id = await _audit(
+                ctx, actor, f"{AUDIT_BACKUP}.done", f"operation:{op.id}", outcome, reason, request_id
+            )
+            return {**outcome, "audit_id": done_id}
+        finally:
+            await lease.release()
 
-    return await _start(request, op, work)
+    return await _start(request, op, work, on_refused=lease.release)
 
 
 # ================================================================================================ routes: vacuum
@@ -1802,23 +2459,32 @@ async def run_vacuum(request: Request, body: VacuumBody, admin: AdminSession, _c
 
 
 __all__ = [
+    "BACKUP_REQUEST_NAME",
     "FAMILIES",
     "MEMORY_FAMILIES",
+    "RESET_LEASE",
     "SCOPES",
     "V1_CLEAR_TARGETS",
     "Family",
     "Operation",
     "Part",
     "ResetBody",
+    "ResetLease",
     "ResetPlan",
+    "backup_plan",
     "build_plan",
     "count_part",
     "execute_reset",
+    "fence_pending_counts",
+    "fence_selectors",
+    "marker_tables",
     "measure_storage",
     "part_clause",
     "preview_plan",
+    "retention_setting_keys",
     "router",
     "snapshot_feasibility",
     "take_snapshot",
     "template_regex",
+    "write_backup_request",
 ]

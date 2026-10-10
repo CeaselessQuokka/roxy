@@ -481,8 +481,13 @@ class BatchWriter:
         while not stop.is_set():
             with contextlib.suppress(TimeoutError):  # the normal case: the interval passed without a stop request
                 await asyncio.wait_for(stop.wait(), timeout=max(0.05, interval_s()))
+            stopping = stop.is_set()
             try:
                 await self.flush()
+                if not stopping and stop.is_set():
+                    # The stop came while that flush ran: an item added meanwhile (after the flush drained the
+                    # queues) gets the promised last flush instead of being left behind.
+                    await self.flush()
             except Exception:
                 log.exception("batch_flush_loop_error")
 

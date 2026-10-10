@@ -3,7 +3,9 @@
 What this is
     `browse(conn, ...)` returns one page of cache.db `entries` (no bodies) with each entry's state worked out
     (`fresh`, `stale`, `expired` or `marker`), plus the totals the browser header shows. `entry_state(...)` is the
-    same classification for one row, and `is_handoff_key(key)` tells a handoff row by its key text.
+    same classification for one row, and `is_handoff_key(key)` tells a handoff row by its key text. The search is
+    one condition (`SEARCH_CONDITION`, `search_params`) that the "Purge matching" purge reuses (`purge_scope`), so
+    the purge removes exactly what the search lists (v1 dashboard bug 4, finding parity-15).
 
 Why it exists
     Parity row 66 (browse, search, sort, page, inspect, refresh, purge). `CacheService.list_entries` keeps v1's
@@ -30,7 +32,7 @@ import sqlite3
 from typing import Any, Final
 
 from roxy.cache.keys import HANDOFF_SUFFIX
-from roxy.cache.store import SIZE_SQL
+from roxy.cache.store import SIZE_SQL, PurgeScope
 from roxy.config.constants import CACHE_PAGE_MAX
 
 SORTS: Final[dict[str, str]] = {
@@ -49,6 +51,34 @@ _COLUMNS: Final = (
 )
 _NOT_HANDOFF: Final = "substr(key, -?) != ?"
 MAX_QUERY_CHARS: Final = 200
+
+SEARCH_CONDITION: Final = f"{_NOT_HANDOFF} AND (? = '' OR lower(key) LIKE ? ESCAPE '\\')"
+"""The browser search as one SQL condition (bind `search_params`): the ONE matcher the listing and the "Purge
+matching" purge share (v1 dashboard bug 4, finding parity-15), so a purge removes exactly what the search lists."""
+
+SEARCH_KIND: Final = "search"
+"""The purge kind of "Purge matching" (`cache/store.py PurgeKind.SEARCH`)."""
+
+
+def search_text(query: str) -> str:
+    """The search text as it is matched: trimmed, lowercased, at most `MAX_QUERY_CHARS` characters."""
+    return query.strip().lower()[:MAX_QUERY_CHARS]
+
+
+def search_params(query: str) -> tuple[Any, ...]:
+    """The values `SEARCH_CONDITION` binds, in order, for one search (an empty search matches every row)."""
+    needle = search_text(query)
+    return (len(HANDOFF_SUFFIX), HANDOFF_SUFFIX, needle, _like(needle))
+
+
+def purge_scope(query: str) -> PurgeScope:
+    """The purge that removes exactly the entries `browse(query=query)` lists: kind `search` (`SEARCH_KIND`), which
+    the store runs as `generation >= floor AND SEARCH_CONDITION`, with the same fleet-wide invalidation as every
+    purge. Raises ValueError for an empty search (it would match everything; Purge All has its own confirmation)."""
+    text = search_text(query)
+    if not text:
+        raise ValueError("Give the search text to purge; Purge all has its own confirmation.")
+    return PurgeScope.search(text)
 
 
 def is_handoff_key(key: str | None) -> bool:
@@ -88,11 +118,10 @@ def browse(
     if order is None:
         raise ValueError(f"cannot sort the cache browser by {sort!r}")
     direction = "DESC" if descending else "ASC"
-    needle = query.strip().lower()[:MAX_QUERY_CHARS]
     row = conn.execute("SELECT value FROM generation WHERE id = 1").fetchone()
     floor = int(row[0]) if row is not None else 0
-    where = f"generation >= ? AND {_NOT_HANDOFF} AND (? = '' OR lower(key) LIKE ? ESCAPE '\\')"
-    params: tuple[Any, ...] = (floor, len(HANDOFF_SUFFIX), HANDOFF_SUFFIX, needle, _like(needle))
+    where = f"generation >= ? AND {SEARCH_CONDITION}"
+    params: tuple[Any, ...] = (floor, *search_params(query))
     total, fresh = conn.execute(
         f"SELECT count(*), coalesce(sum(expires_at > ?), 0) FROM entries WHERE {where}",  # noqa: S608 (constants)
         (int(now), *params),
@@ -138,4 +167,14 @@ def browse(
     return {"total": int(total or 0), "fresh": int(fresh or 0), "rows": items}
 
 
-__all__ = ["SORTS", "browse", "entry_state", "is_handoff_key"]
+__all__ = [
+    "SEARCH_CONDITION",
+    "SEARCH_KIND",
+    "SORTS",
+    "browse",
+    "entry_state",
+    "is_handoff_key",
+    "purge_scope",
+    "search_params",
+    "search_text",
+]

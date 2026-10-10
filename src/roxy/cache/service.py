@@ -17,6 +17,9 @@ Why it exists
 How it works
     `serve` walks this table, top to bottom (plan 7.6, 7.7, 6.9):
     - No key (cache off, method not cacheable, a `cache_private` credential endpoint): upstream directly, `OFF`.
+      A POST that is `OFF` only because of `cache_post_requests` still carries the key the cache would use on
+      `req.cache_key` (`CachePeek.off_key`), as its identity for request samples and the dry run; nothing is
+      looked up, served or stored under it.
     - Fresh entry: `HIT` (a cached 400/403/404/410 replays its status, reason `cache_negative`). Fresh means
       fresh when `peek` read it: the abuse verdict in between may have admitted the request only as a cache hit,
       so an entry that expired during the verdict is still served, never fetched (finding INGRESS-3).
@@ -192,6 +195,11 @@ class CachePeek:
     """The purge-all generation seen at lookup; entries stored for this request carry it (plan 6.5)."""
     now: float = 0.0
     bypassed: bool = False
+    off_key: CacheKey | None = None
+    """For a POST the cache has `OFF` only because of `cache_post_requests` (`RequestPolicy.key_when_off`): the key
+    it would use. Never looked up, served or stored under (`key` stays None); `peek` puts it on `req.cache_key` as
+    the request's identity, so request samples, the upstream's User-Agent arm and the retry hold treat the request
+    exactly as a cached POST, and the dry run can replay a POST cache rule over it (finding insights-7)."""
 
     @property
     def state(self) -> CacheState:
@@ -465,6 +473,11 @@ class CacheService:
         pattern matches share one `regex_budget` (plan 9.9; the router's request budget when it opened one). A
         cache rule or allowlist match cut off by the budget counts as no match (no rule, anonymous), which only
         ever grants less.
+
+        A POST that `cache_post_requests` keeps `OFF` still gets the key the cache would use, as `CachePeek.off_key`
+        and `req.cache_key` (its identity, plan 6.2: request samples feed the 11.3 dry run and TTL tuner), and no
+        lookup: `serve` follows `CachePeek.key`, which stays None, so nothing is served or stored under it. Other
+        `OFF` requests (the cache switched off, another method, a `cache_private` credential endpoint) get no key.
         """
         cs = self._cs()
         now = self._clock.now()
@@ -473,19 +486,10 @@ class CacheService:
         with regex_budget():
             policy = request_policy(req.method, _target_of(req), headers, cs, snapshot)
         if not policy.cacheable:
-            self._mark(req, None, False)
-            return CachePeek(key=None, policy=policy, now=now, generation=self.store.floor)
-        key = build_key(
-            req.method,
-            req.host,
-            req.path,
-            list(getattr(req, "query", None) or ()),
-            getattr(req, "body", None) or b"",
-            policy.rule,
-            ignored=snapshot.cache_ignored_params,
-            auth_class=policy.auth_class,
-            vary=_vary_of(req),
-        )
+            off_key = self._key_for(req, policy, snapshot) if policy.key_when_off else None
+            self._mark(req, off_key, False)
+            return CachePeek(key=None, policy=policy, now=now, generation=self.store.floor, off_key=off_key)
+        key = self._key_for(req, policy, snapshot)
         if policy.bypass_lookup:
             self.stats.bypassed += 1
             self._mark(req, key, False)
@@ -514,6 +518,22 @@ class CacheService:
             previous=entry,
             generation=self.store.floor,
             now=now,
+        )
+
+    @staticmethod
+    def _key_for(req: Any, policy: RequestPolicy, snapshot: RulesSnapshot) -> CacheKey:
+        """The request's cache key under `policy.rule` and today's ignored parameters (string work and one SHA-256
+        of a POST body already held in memory; no lookup)."""
+        return build_key(
+            req.method,
+            req.host,
+            req.path,
+            list(getattr(req, "query", None) or ()),
+            getattr(req, "body", None) or b"",
+            policy.rule,
+            ignored=snapshot.cache_ignored_params,
+            auth_class=policy.auth_class,
+            vary=_vary_of(req),
         )
 
     @staticmethod

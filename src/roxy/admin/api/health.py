@@ -261,9 +261,8 @@ async def list_runs(
             rows, total = await ctx.dbs.metrics.read(read(page, size))
             return [_run_item(r) for r in rows], total
 
-        items, total = await common.collect_pages(fetch)
         applied = {k: v for k, v in dataclasses.asdict(filters).items() if v is not None}
-        return await common.export_table(request, admin, RUNS_TABLE, items, fmt, total=total, tq=tq, filters=applied)
+        return await common.export_pages(request, admin, RUNS_TABLE, fetch, fmt, tq=tq, filters=applied)
     with common.service_errors():
         rows, total = await ctx.dbs.metrics.read(read(tq.page, tq.page_size))
     return common.table_answer(RUNS_TABLE, tq, [_run_item(r) for r in rows], total)
@@ -327,7 +326,7 @@ async def latest_run(request: Request, _admin: AdminSession) -> dict[str, Any]:
 
 
 @router.get("/runs/{run_id}")
-async def get_run(request: Request, run_id: int, _admin: AdminSession) -> dict[str, Any]:
+async def get_run(request: Request, run_id: common.RowId, _admin: AdminSession) -> dict[str, Any]:
     """One run: every result in 13.2 order, each failing check's open recommendation, and the change summary."""
     ctx = get_ctx(request)
     return _shape_run(await _run_detail(ctx, run_id))
@@ -336,9 +335,9 @@ async def get_run(request: Request, run_id: int, _admin: AdminSession) -> dict[s
 @router.get("/runs/{run_id}/compare")
 async def compare_runs(
     request: Request,
-    run_id: int,
+    run_id: common.RowId,
     _admin: AdminSession,
-    with_: Annotated[int | None, Query(alias="with", ge=1)] = None,
+    with_: Annotated[int | None, Query(alias="with", ge=1, le=common.MAX_ROW_ID)] = None,
 ) -> dict[str, Any]:
     """What changed between this run and `with` (default: the run before it), check by check."""
     ctx = get_ctx(request)
@@ -356,7 +355,7 @@ async def compare_runs(
 @router.get("/runs/{run_id}/export", response_model=None)
 async def export_run(
     request: Request,
-    run_id: int,
+    run_id: common.RowId,
     admin: AdminSession,
     format_: Annotated[str, Query(alias="format", max_length=8)] = "json",
     focus: Annotated[str | None, Query(max_length=120)] = None,

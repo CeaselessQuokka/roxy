@@ -18,8 +18,10 @@ How it works
     check). `insights_watch` closes auto-apply watch windows (rolling back a change that made a guard metric worse),
     `insights_auto_apply` applies safe low-risk recommendations when `insights_auto_apply` is 1,
     `insights_anomalies` records metric anomalies every 5 minutes, and `insights_history_prune` bounds the schema
-    version 2 history tables. Every job is idempotent by data, so a leadership change never applies or rolls back
-    twice.
+    version 2 history tables. Every job is idempotent by data and passes its leader `JobContext` on: evaluation and
+    pruning write through `fenced_write`, auto-apply claims its idempotency key and fences every apply, and the
+    watch fences every rollback and window close (plan 5.6), so a leadership change never applies or rolls back
+    twice and a deposed leader writes nothing.
 
 What to read next
     `roxy/insights/rules/base.py` (how to write a rule), `roxy/insights/engine.py`, `roxy/insights/actions.py`.

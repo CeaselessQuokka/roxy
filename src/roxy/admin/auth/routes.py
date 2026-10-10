@@ -23,6 +23,10 @@ How it works
       `CsrfToken`, because the CSRF secret is derived from the session id and changes with it.
     - Pages render templates from `templates/auth/` with no inline script or style: one nonce'd module script
       (`static/js/auth.js`) and one stylesheet, so the strict CSP of plan 9.2 holds.
+    - Admin Page Visits (v1 parity, rows 19 and 130): a GET of the login page by a browser without the
+      `roxy_admin_seen` cookie counts one visit and marks the browser (`roxy_admin_counted`); a login from a marked
+      browser that is not a known admin takes that visit back (it was the owner), as v1's `decrement_admin_visit`
+      did, and only then (a login that never loaded the page takes nothing back).
 
 What to read next
     `roxy/admin/auth/flow.py`, `roxy/admin/auth/deps.py`, then `roxy/templates/auth/login.html`.
@@ -55,17 +59,27 @@ from roxy.admin.auth.deps import (
     require_admin,
     require_csrf,
 )
-from roxy.admin.auth.events import REASON_MALFORMED, audit_auth, record_probe
+from roxy.admin.auth.events import (
+    REASON_MALFORMED,
+    audit_auth,
+    discount_admin_visit,
+    record_admin_visit,
+    record_probe,
+)
 from roxy.admin.auth.flow import AuthError, LoginOutcome
 from roxy.admin.auth.responses import (
+    ADMIN_COUNTED_COOKIE,
+    clear_admin_counted_cookie,
     clear_session_cookie,
     error_response,
     read_json_body,
+    set_admin_counted_cookie,
     set_admin_seen_cookie,
     set_session_cookie,
     set_trusted_cookie,
     v1_json,
 )
+from roxy.config.constants import ADMIN_SEEN_COOKIE
 from roxy.core.templating import Templates
 
 log = logging.getLogger("roxy.admin.auth.routes")
@@ -75,6 +89,11 @@ DASHBOARD_PATH = "/admin/dashboard"
 ENROLL_PATH = "/admin/enroll"
 LOGGED_OUT_TEXT = "Logged out"
 NOT_FOUND_TEXT = "Not Found"
+MAX_PATH_ID = 2**62
+"""Largest integer id a path may name (`/passkeys/{passkey_id}`, `/devices/{device_id}`), the same bound as
+`admin.api.common.MAX_ROW_ID`: a larger one is 422, never an `OverflowError` from sqlite3 (a 500 plus an error
+alert). The auth routes are not area routes, so the area routes' `OverflowError` net does not cover them
+(finding apisec-7)."""
 
 router = APIRouter(include_in_schema=False)
 
@@ -161,8 +180,19 @@ def _login_success(request: Request, outcome: LoginOutcome) -> Response:
     set_session_cookie(response, outcome.session_token)
     if outcome.trusted_token:
         set_trusted_cookie(response, outcome.trusted_token, get_auth(request).settings.int("trusted_device_days"))
+    if request.cookies.get(ADMIN_COUNTED_COOKIE):
+        if not _admin_seen(request):
+            # The login page visit this browser made was the owner's own (v1 `decrement_admin_visit`). Only a visit
+            # that was counted is taken back: a login without one (a script, the API) leaves the counter alone.
+            discount_admin_visit(get_ctx_or_none(request))
+        clear_admin_counted_cookie(response)
     set_admin_seen_cookie(response)
     return response
+
+
+def _admin_seen(request: Request) -> bool:
+    """True when this browser has signed in before (`roxy_admin_seen`); its login page visits are not counted."""
+    return bool(request.cookies.get(ADMIN_SEEN_COOKIE))
 
 
 def _login_response(request: Request, outcome: LoginOutcome) -> Response:
@@ -217,7 +247,7 @@ async def login_page(request: Request) -> Response:
         target = ENROLL_PATH if found[0].mfa_level == "bootstrap" else DASHBOARD_PATH
         return RedirectResponse(target, status_code=302)
     settings = ctx.settings
-    return _templates(request).render(
+    response = _templates(request).render(
         request,
         "auth/login.html",
         {
@@ -226,6 +256,13 @@ async def login_page(request: Request) -> Response:
             "email_code_enabled": bool(settings.bool("admin_email_code_enabled")),
         },
     )
+    if request.method == "GET" and not _admin_seen(request):
+        # v1 parity rows 19 and 130: one Admin Page Visit per load by a browser that never signed in (memory only,
+        # summed per minute by the recorder; a recorder problem never fails the page). The marker lets the login
+        # that may follow take this visit back.
+        record_admin_visit(ctx, user_agent=request.headers.get("user-agent"))
+        set_admin_counted_cookie(response)
+    return response
 
 
 @router.get(ENROLL_PATH)
@@ -596,7 +633,7 @@ async def api_passkey_register_verify(
 @router.post(f"{API}/passkeys/{{passkey_id}}/delete")
 async def api_passkey_delete(
     request: Request,
-    passkey_id: Annotated[int, Path(ge=1)],
+    passkey_id: Annotated[int, Path(ge=1, le=MAX_PATH_ID)],
     _principal: AdminFresh,
     _csrf: CsrfChecked,
 ) -> Response:
@@ -673,7 +710,7 @@ async def _revoke_trusted(request: Request, principal: AdminPrincipal, device_id
 @router.post(f"{API}/trusted-devices/{{device_id}}/revoke")
 async def api_trusted_revoke(
     request: Request,
-    device_id: Annotated[int, Path(ge=1)],
+    device_id: Annotated[int, Path(ge=1, le=MAX_PATH_ID)],
     principal: AdminSession,
     _csrf: CsrfChecked,
 ) -> Response:

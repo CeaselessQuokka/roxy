@@ -1,10 +1,13 @@
 """Command line of the load harness: run scenarios in a private network namespace and print a results table.
 
 What this is
-    `python -m load.harness [scenario ...] [--scale X] [--json PATH] [--keep] [--work DIR]`, run from the
-    `tests/` directory of the repository (the scenarios are listed in `scenarios.SCENARIOS`; with no names every
-    one runs, in the order of plan 19.4 followed by the replay). It prints the machine it ran on and one table
-    per scenario, and with `--json` also writes every number to a file.
+    `python -m load.harness [scenario ...] [--scale X] [--json PATH] [--keep] [--work DIR] [--tree DIR]
+    [--set KEY=VALUE ...] [--worker-env KEY=VALUE ...]`, run from the `tests/` directory of the repository (the
+    scenarios are listed in `scenarios.SCENARIOS`; with no names every one runs, in the order of plan 19.4
+    followed by the replay). It prints the machine it ran on and one table per scenario, and with `--json` also
+    writes every number to a file. `--tree` measures another copy of the repository (a `git archive` of the
+    release commit, say) instead of the working tree; `--set` (settings) and `--worker-env` (environment of the
+    workers, never `ROXY_*`) run a "what if", which the table marks as not a reference run.
 
 Why it exists
     Plan 19.4 wants results recorded with the hardware (docs/PERFORMANCE.md). One command that prints exactly the
@@ -54,7 +57,7 @@ def can_unshare() -> bool:
     return result.returncode == 0
 
 
-PATH_OPTIONS: Final = ("--json", "--work")
+PATH_OPTIONS: Final = ("--json", "--work", "--tree")
 
 
 def absolute_paths(argv: list[str]) -> list[str]:
@@ -69,13 +72,28 @@ def absolute_paths(argv: list[str]) -> list[str]:
     return out
 
 
+def option_value(argv: list[str], option: str) -> str | None:
+    """The value of `option` in `argv` (`--x v` or `--x=v`), read before argparse runs; None when absent."""
+    for index, value in enumerate(argv):
+        if value == option and index + 1 < len(argv):
+            return argv[index + 1]
+        if value.startswith(option + "="):
+            return value.split("=", 1)[1]
+    return None
+
+
+def python_path(tree: str | None) -> str:
+    """`tests/` (for the `load` package), after the measured tree's `src/` when `--tree` names one."""
+    return str(TESTS_DIR) if tree is None else f"{Path(tree) / 'src'}{os.pathsep}{TESTS_DIR}"
+
+
 def enter_namespace(argv: list[str]) -> None:
     """Re-run this command inside `unshare -rn` (never returns), or exit when namespaces are not available."""
     if not can_unshare():
         print("load harness: unprivileged user and network namespaces (unshare -rn) are not available", file=sys.stderr)
         sys.exit(EXIT_NO_NAMESPACE)
     argv = absolute_paths(argv)
-    env = {**os.environ, NAMESPACE_ENV: "1", "PYTHONPATH": str(TESTS_DIR)}
+    env = {**os.environ, NAMESPACE_ENV: "1", "PYTHONPATH": python_path(option_value(argv, "--tree"))}
     os.chdir(TESTS_DIR)
     os.execvpe("unshare", ["unshare", "-rn", sys.executable, "-m", "load.harness", *argv], env)
 
@@ -138,6 +156,12 @@ def parse(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--json", type=Path, help="write every number to this file")
     parser.add_argument("--work", type=Path, help="work directory (default: a new temporary directory)")
     parser.add_argument("--keep", action="store_true", help="keep each scenario's state and logs")
+    parser.add_argument(
+        "--tree",
+        type=Path,
+        help="measure the Roxy of this repository copy (its src/ and deploy/; for example a `git archive` of a "
+        "commit) instead of the working tree",
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--steady-rate", type=float, default=200.0, help="requests a second of `steady` (200)")
     parser.add_argument(
@@ -147,12 +171,23 @@ def parse(argv: list[str]) -> argparse.Namespace:
         metavar="KEY=VALUE",
         help="a setting for every scenario, on top of its own (a 'what if' run; the value is read as JSON)",
     )
+    parser.add_argument(
+        "--worker-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="an environment variable for gunicorn and its workers (a 'what if' run; not ROXY_*), for example "
+        "MALLOC_ARENA_MAX=2",
+    )
     args = parser.parse_args(argv)
     unknown = [name for name in args.scenarios if name not in SCENARIOS]
     if unknown:
         parser.error(f"unknown scenario {', '.join(unknown)}; choose from {', '.join(SCENARIOS)}")
+    if args.tree is not None and not (args.tree / "src" / "roxy").is_dir():
+        parser.error(f"--tree {args.tree} has no src/roxy")
     try:
         args.overrides = tuple(setting(text) for text in args.set)
+        args.worker_env = tuple(variable(text) for text in args.worker_env)
     except ValueError as exc:
         parser.error(str(exc))
     return args
@@ -169,6 +204,14 @@ def setting(text: str) -> tuple[str, Any]:
         return key, json.loads(raw)
     except json.JSONDecodeError:
         return key, raw
+
+
+def variable(text: str) -> tuple[str, str]:
+    """`KEY=VALUE` for `--worker-env`; `ROXY_*` is refused (Roxy's own environment is part of the run)."""
+    key, sep, value = text.partition("=")
+    if not sep or not key or not key.replace("_", "").isalnum() or key.upper().startswith("ROXY_"):
+        raise ValueError(f"--worker-env wants KEY=VALUE with a variable that is not ROXY_*, not {text!r}")
+    return key, value
 
 
 def main(argv: list[str]) -> int:
@@ -192,11 +235,14 @@ def main(argv: list[str]) -> int:
         keep=args.keep,
         steady_rate=args.steady_rate,
         overrides=args.overrides,
+        tree=args.tree,
+        worker_env=args.worker_env,
     )
     info = machine()
+    info["tree"] = str(args.tree or "working tree")
     print(f"Roxy load harness: {info['cpu']}, {info['logical_cpus']} logical CPUs, {info['memory_gib']} GiB")
     print(f"kernel {info['kernel']}, Python {info['python']}, {info['packages']}, load {info['load_average_at_start']}")
-    print(f"work directory {work}\n", flush=True)
+    print(f"Roxy measured: {info['tree']}; work directory {work}\n", flush=True)
     report: dict[str, Any] = {"machine": info, "scenarios": {}}
     failed = 0
     for name in names:

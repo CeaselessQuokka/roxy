@@ -273,7 +273,8 @@ async def test_admin_guards_fail_closed(env: Any) -> None:
 
 async def test_unknown_admin_paths_get_the_v1_not_found(env: Any) -> None:
     """Plan 4.1 row 15 (v1 `admin_not_found`): an admin path nothing serves is 404 `"Not Found"` plus a newline,
-    for every method, and never a probe; real admin routes keep their answers (including 405 for another method)."""
+    for every method, and never a probe; real admin routes keep their answers (another method answers like a
+    missing path unless a signed-in admin asks: then 405, finding apisec-3)."""
     app = create_app(env)
     seen: list[Any] = []
     app.state.error_hooks.add("client_error", seen.append)
@@ -294,9 +295,11 @@ async def test_unknown_admin_paths_get_the_v1_not_found(env: Any) -> None:
         api = await client.get("/admin/api/v1/no/such/endpoint")
         assert api.status_code == 404
         assert api.json() == {"error": {"code": "not_found", "message": "Not found.", "fields": {}}}  # DESIGN 13
-        assert (await client.request("PUT", "/admin/enroll")).status_code == 405  # a real route, another method
+        enroll = await client.request("PUT", "/admin/enroll")  # a real route, another method, nobody signed in
+        assert (enroll.status_code, enroll.content) == (404, b'"Not Found"\n')  # the missing path's answer (apisec-3)
     await asyncio.sleep(0)  # let any background hook task run
-    assert [event.path for event in seen] == ["/admin/enroll"]  # only the 405 is a client error, never the 404s
+    # Only the wrong-method answer is a client error (it still runs the hook, as the 405 did), never the 404s.
+    assert [event.path for event in seen] == ["/admin/enroll"]
 
 
 def test_get_db_rejects_unknown_names() -> None:

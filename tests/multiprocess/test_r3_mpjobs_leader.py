@@ -1,18 +1,20 @@
 """Review round 3, lens mpjobs: leader jobs across two real gunicorn masters (a blue/green deploy).
 
 What this is
-    A real-process test (a strict xfail): two gunicorn masters (blue and green, 2 `RoxyUvicornWorker` workers each)
-    share one state directory, as during a deploy. Blue leads and writes the hourly LLM export file at start; green
-    starts; blue stops; green takes the leader lease over. The test watches the export file (each atomic rename
-    makes a new inode) and the job status the leader publishes.
+    A real-process test: two gunicorn masters (blue and green, 2 `RoxyUvicornWorker` workers each) share one state
+    directory, as during a deploy. Blue leads and writes the hourly LLM export file at start; green starts; blue
+    stops; green takes the leader lease over. The test watches the export file (each atomic rename makes a new
+    inode), the fleet schedule row of the export job in hot.db and the job status the leader publishes.
 
 Why it exists
     The lens asks that leader jobs run exactly once per interval across 2 and 4 workers and two masters. The leader
-    lease is fleet-wide (plan 5.6) but each worker's `JobRunner` keeps its own schedule in memory: a worker that
-    becomes the leader runs every job whose first run it had marked due at its own start, at once. So the hourly
+    lease is fleet-wide (plan 5.6), but each worker's `JobRunner` used to keep its own schedule in memory: a worker
+    that became the leader ran every job whose first run it had marked due at its own start, at once. So the hourly
     7 day full export (`llm_export_file`, about a second of CPU and a 0.3 s event loop block at its bounds, see
-    finding mpjobs-6) and the 10 minute history prune run again at every leader change: every deploy, every
-    `max_requests` recycle of the leading worker, every crash.
+    finding mpjobs-6) and the 10 minute history prune ran again at every leader change: every deploy, every
+    `max_requests` recycle of the leading worker, every crash (finding mpjobs-7). The schedule is now fleet-wide:
+    every leader run records its start in hot.db `job_runs` (`schedule:<name>`), and a new leader schedules each
+    job one interval after that start (`roxy/scheduler/jobs.py`).
 
 How it works
     This file is also its own driver: the test runs `unshare -rn python <this file> two_masters_export <work>
@@ -20,8 +22,8 @@ How it works
     `gunicorn_mp_driver.py` (the mock Roblox, the state preparation, `Master`). The driver prints one JSON object.
 
 What to read next
-    `roxy/scheduler/jobs.py` (`JobRunner._status_for`, `due`), `roxy/insights/llm_export.py` (`register_jobs`),
-    `tests/multiprocess/gunicorn_mp_driver.py`.
+    `roxy/scheduler/jobs.py` (`JobRunner.sync_schedule`, `record_start`), `roxy/insights/llm_export.py`
+    (`register_jobs`), `tests/multiprocess/gunicorn_mp_driver.py`.
 """
 
 from __future__ import annotations
@@ -70,11 +72,6 @@ def _quiet_credentials(source: Path, target: Path) -> Path:
 
 
 @pytest.mark.timeout(300)
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding mpjobs-7: each worker keeps its own job schedule, so a leader change reruns the hourly LLM export "
-    "(and every other overdue leader job) at once",
-)
 def test_r3_mpjobs_a_leader_change_does_not_rerun_the_hourly_export(tmp_path: Path, credentials_dir: Path) -> None:
     if not _can_unshare() or not (shutil.which("ip") or Path("/usr/sbin/ip").exists()):
         pytest.skip("needs unprivileged user and network namespaces (unshare -rn) and ip")
@@ -114,6 +111,11 @@ def test_r3_mpjobs_a_leader_change_does_not_rerun_the_hourly_export(tmp_path: Pa
     # Exactly once per interval across the fleet: blue wrote the hourly file a minute ago, so green must not write it
     # again until the hour is up.
     assert out["export_writes"] == 1, (out["export_writes"], out["export_inodes"], log)
+    # The fleet schedule row still names blue's run: green, the leader under a newer epoch, never started the job.
+    schedule = out["export_schedule"]
+    assert schedule is not None, out
+    assert schedule["epoch"] == out["blue_lease_epoch"], (schedule, out["blue_lease_epoch"])
+    assert schedule["epoch"] < out["green_lease_epoch"], out
 
 
 # ============================================================================================== the driver
@@ -160,6 +162,8 @@ def _scenario(work: Path, credentials: Path, workers: int) -> dict[str, Any]:
             time.sleep(0.1)
         out["first_export"] = inodes[0] if inodes else None
         first_at = time.time()
+        blue_lease = d.leader_lease(env)
+        out["blue_lease_epoch"] = blue_lease["epoch"] if blue_lease else None
         green.start()
         out["ready"] = green.wait_ready()
         if not out["ready"]:
@@ -171,10 +175,19 @@ def _scenario(work: Path, credentials: Path, workers: int) -> dict[str, Any]:
         out["after_stop"] = asyncio.run(d.wait_one_leader(env, green_pids, timeout_s=30))
         lease = d.leader_lease(env)
         out["green_holds_the_lease"] = bool(lease and any(f":{pid}:" in lease["holder"] for pid in green_pids))
+        out["green_lease_epoch"] = lease["epoch"] if lease else None
         asyncio.run(watch(25.0))  # well inside the hour that began with blue's export
         out["export_inodes"] = inodes
         out["export_writes"] = len(inodes)
         out["seconds_since_first_export"] = round(time.time() - first_at, 1)
+        out["export_schedule"] = None
+        with contextlib.suppress(sqlite3.Error):
+            rows = d.query(
+                env["ROXY_HOT_DB"],
+                "SELECT epoch, started_at FROM job_runs WHERE idem_key = ?",
+                ("schedule:llm_export_file",),
+            )
+            out["export_schedule"] = {"epoch": rows[0][0], "started_at": rows[0][1]} if rows else None
         with contextlib.suppress(sqlite3.Error):
             status = d.job_status(env)
             out["published"] = {

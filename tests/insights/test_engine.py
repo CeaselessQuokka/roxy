@@ -507,7 +507,7 @@ async def test_auto_apply_watch_and_rollback(world: World) -> None:
     await record_traffic(world, NOW, 30, error_every=2)  # half the requests fail after the change
     world.clock.advance(1801)
     report = await auto.watch()
-    assert report == {"kept": [], "rolled_back": [rec_id]}
+    assert report == {"kept": [], "rolled_back": [rec_id], "rollback_refused": [], "rollback_pending": []}
     assert world.rows()[-1][1] == "rolled_back"
     assert await world.rules.get_row("upstream_limits", f"endpoint:{TEMPLATE}") is None
     assert [a.type for a in notifier.alerts] == ["auto_apply_rollback"]

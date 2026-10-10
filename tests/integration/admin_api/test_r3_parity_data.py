@@ -1,12 +1,15 @@
 """Review round 3, parity lens: v1 clears as v2 resets, and the Data page retention view (plan 6.8, 6.10; row 83).
 
 What this is
-    Strict xfail tests for three defects of the Data area as the parity review found them:
-      * the v1 cache "Clear stats" mapped to the `cache_stats` family leaves the misses behind, so the hit ratio of
-        every window reads 0 percent, and it takes the cached requests out of the Traffic totals;
-      * the v1 per-tab clears of the three attempt logs (and of the pause and throttle-all drop counters) map to the
-        whole `refusals` family, so clearing one tab empties the other two;
-      * the retention view of the Data page leaves out catalog settings whose card is `data#retention`.
+    Tests for defects of the Data area as the parity review found them (they were strict xfails; all are fixed):
+      * parity-8: the v1 cache "Clear stats" mapped to the `cache_stats` family left the misses behind, so the hit
+        ratio of every window read 0 percent, and it took the cached requests out of the Traffic totals. The family
+        now clears the cache state of every lookup (hits, misses, stale, coalesced together) and keeps the requests;
+      * parity-9: the v1 per-tab clears of the three attempt logs (and of the pause and throttle-all drop counters)
+        mapped to the whole `refusals` family, so clearing one tab emptied the other two. Each tab has its own
+        narrower family now, and the drop counters map to "nothing to reset";
+      * parity-10: the retention view of the Data page left out catalog settings whose card is `data#retention`; it
+        now lists every setting of the retention and record cap cards.
 
 Why it exists
     Plan 6.8: every v1 clear target maps onto a reset scope (`data.V1_CLEAR_TARGETS`, served by `GET /data/resets`
@@ -18,7 +21,7 @@ Why it exists
 How it works
     Data is seeded through the real recorder, the reset runs through the real flow (`POST /data/resets/preview`, then
     `POST /data/resets` with the digest, the typed phrase and a reason), and the affected routes are read back. The
-    mapping used is the one the API publishes in `v1_clear_targets`. Each test is `xfail(strict=True)`.
+    mapping used is the one the API publishes in `v1_clear_targets`.
 
 What to read next
     `roxy/admin/api/data.py` (`FAMILIES`, `V1_CLEAR_TARGETS`, `retention_view`), `roxy/storage/read_sizes.py`
@@ -69,10 +72,6 @@ async def run_v1_clear(api: Any, api_json: Any, target: str) -> dict[str, Any]:
     return result
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding parity-8: v1 'Clear stats' (cache) leaves the misses, so the hit ratio reads 0; requests drop",
-)
 async def test_parity_8_clearing_cache_stats_keeps_ratios_honest_and_requests(
     api: Any, api_json: Any, metrics_seed: Any
 ) -> None:
@@ -100,10 +99,6 @@ async def test_parity_8_clearing_cache_stats_keeps_ratios_honest_and_requests(
     assert found == {"hits": 0, "misses": 0, "hour_ratio": None, "requests": 6}, found
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding parity-9: the v1 'blocked_attempts' clear empties the rate-limited and header-blocked tabs too",
-)
 async def test_parity_9_clearing_one_attempts_tab_keeps_the_others(api: Any, api_json: Any, metrics_seed: Any) -> None:
     refused(metrics_seed, 2, ReasonCode.ENDPOINT_BLOCKED, 403, client_ip="203.0.113.91", path="games.roblox.com/v1/a")
     refused(metrics_seed, 1, ReasonCode.ENDPOINT_RULE, 429, client_ip="203.0.113.92", path="economy.roblox.com/v1/b")
@@ -119,16 +114,14 @@ async def test_parity_9_clearing_one_attempts_tab_keeps_the_others(api: Any, api
     assert totals == {"endpoint-blocks": 0, "endpoint-rules": 1, "header-rules": 1}, totals
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding parity-12: a KPI whose comparison window lost data to a reset still shows a numeric delta",
-)
 async def test_parity_12_kpi_delta_over_a_reset_window_is_replaced_by_a_notice(
     api: Any, api_app: Any, api_json: Any, metrics_seed: Any
 ) -> None:
     """Plan 6.8: "a KPI or comparison whose current or comparison window overlaps a reset of its family shows a notice
     ... instead of a misleading delta. Comparison baselines are never synthesized to hide the gap." Here the previous
-    hour's traffic was reset, so "+5 requests versus the previous hour" is exactly the misleading delta."""
+    hour's traffic was reset, so "+5 requests versus the previous hour" is exactly the misleading delta. (The read
+    model's tile notice and the family scoping, a logins reset leaving the request tile alone, are pinned in
+    `tests/unit/metrics/test_metrics_reset_scope.py`.)"""
     now = int(api_app.clock.now())
     metrics_seed.record(5, at_ms=(now - 5400) * 1000)  # inside the previous hour
     metrics_seed.record(5)  # this hour
@@ -141,13 +134,9 @@ async def test_parity_12_kpi_delta_over_a_reset_window_is_replaced_by_a_notice(
     assert kpis["notices"], kpis["notices"]  # the page knows a reset touched the comparison
     tile = next(t for t in kpis["tiles"] if t["key"] == "requests")
     assert tile["value"] == 5
-    assert tile["delta"] is None or bool(tile.get("notice")), tile
+    assert (tile["delta"], tile["delta_pct"]) == (None, None), tile  # no number against an emptied baseline
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding parity-10: the Data page retention view omits catalog settings whose card is data#retention",
-)
 async def test_parity_10_retention_view_lists_every_data_retention_setting(api: Any, api_json: Any) -> None:
     body = api_json(await api.get("data/retention"))
     shown = {item["key"] for item in body["settings"]}

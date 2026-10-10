@@ -511,6 +511,129 @@ def test_alert_dedupe_rows_outlive_the_longest_alert_cooldown(dbs) -> None:
     assert keys == ["capdrop:email"]
 
 
+# --- the strike ladder and the recommendation quiet periods (findings W2H-2, W2H-3) -----------------------------------
+
+
+@pytest.mark.parametrize("decay_s", [0, 1800, 7])
+def test_a_strike_row_is_pruned_exactly_when_the_ladder_no_longer_counts_it(dbs, decay_s: int) -> None:
+    """W2H-2: the prune agrees with `throttle.effective_strikes` on every row whose penalty is over: a row goes
+    exactly when no strike is left, and a penalized row always stays."""
+    from roxy.abuse.throttle import effective_strikes
+
+    now = int(NOW)
+    rows: dict[str, tuple[int, int, int]] = {}  # ip -> (strikes, last_strike_at, throttled_until)
+    for strikes in range(5):
+        for idle in (0, 1, 6, 7, 13, 14, 1799, 1800, 3599, 3600, 7200, 9000, 100_000):
+            rows[f"ended:{strikes}:{idle}"] = (strikes, now - idle, now - 30)
+            rows[f"penalized:{strikes}:{idle}"] = (strikes, now - idle, now + 30)
+    rows["never_struck"] = (2, 0, 0)  # strikes but no last strike time: `effective_strikes` never decays them
+
+    def fill(conn: sqlite3.Connection) -> None:
+        conn.executemany(
+            "INSERT INTO strikes (ip, strikes, last_strike_at, tier, throttled_until) VALUES (?, ?, ?, 0, ?)",
+            [(ip, s, last, until) for ip, (s, last, until) in rows.items()],
+        )
+
+    dbs.hot.write_sync(fill)
+    policy = RetentionPolicy(strike_idle_s=decay_s)
+    _loop(dbs.hot, retention.prune_strikes, policy)
+    kept = set(dbs.hot.read_sync(lambda c: [r[0] for r in c.execute("SELECT ip FROM strikes")]))
+    for ip, (strikes, last, until) in rows.items():
+        left = effective_strikes(strikes, last, now, decay_s)
+        should_stay = until >= now or left > 0
+        assert (ip in kept) == should_stay, (ip, strikes, last, until, left)
+
+
+def test_strike_rows_are_capped_without_lifting_a_penalty(dbs) -> None:
+    """W2H-2: rows that never fade (decay 0) are bounded by `strikes_max_rows`, oldest last strike first; a row
+    still penalized is never dropped, even when the penalized rows alone exceed the cap."""
+    now = int(NOW)
+
+    def fill(conn: sqlite3.Connection) -> None:
+        for i in range(5):  # strikes left, penalty over
+            conn.execute("INSERT INTO strikes VALUES (?, 3, ?, 3, ?)", (f"192.0.2.{i}", now - 1000 + i, now - 10))
+        for i in range(2):  # penalized
+            conn.execute("INSERT INTO strikes VALUES (?, 3, ?, 3, ?)", (f"198.51.100.{i}", now - 5000, now + 600))
+
+    dbs.hot.write_sync(fill)
+    assert RetentionPolicy().strikes_max_rows == 200_000  # plan 15.4 MAX_TRACKED_THROTTLE_IPS
+    assert _loop(dbs.hot, retention.prune_strikes, RetentionPolicy(strike_idle_s=0, strikes_max_rows=3)) == 4
+    kept = dbs.hot.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT ip FROM strikes")))
+    assert kept == ["192.0.2.4", "198.51.100.0", "198.51.100.1"]  # the newest unpenalized row and both penalized
+    assert _loop(dbs.hot, retention.prune_strikes, RetentionPolicy(strike_idle_s=0, strikes_max_rows=1)) == 1
+    kept = dbs.hot.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT ip FROM strikes")))
+    assert kept == ["198.51.100.0", "198.51.100.1"]  # over the cap, but their penalties are not lifted early
+
+
+def _recommendation_rows(conn: sqlite3.Connection, rows: list[tuple[str, str, int]]) -> None:
+    for rec_id, state, updated_at in rows:
+        conn.execute(
+            "INSERT INTO recommendations (id, rule_id, fingerprint, state, severity, payload_json, created_at,"
+            " updated_at) VALUES (?, 'R', ?, ?, 'warn', '{}', 0, ?)",
+            (rec_id, rec_id, state, updated_at),
+        )
+
+
+def test_quiet_recommendations_outlive_the_retention_and_the_others_do_not(dbs) -> None:
+    """W2H-3: a dismissed or rolled back row inside `dismiss_cooldown_days`, or an applied one inside the watch
+    window, survives a retention shorter than that; every other closed row past the retention goes."""
+    now = int(NOW)
+    policy = RetentionPolicy(retention_recommendations_days=1, dismiss_cooldown_days=90, auto_apply_watch_minutes=60)
+    rows = [
+        ("dismissed_quiet", "dismissed", now - 40 * DAY),
+        ("rolled_back_quiet", "rolled_back", now - 89 * DAY),
+        ("dismissed_over", "dismissed", now - 91 * DAY),
+        ("applied_watched", "applied", now - 2 * DAY + 0),  # past the retention, outside the 60 minute watch
+        ("auto_applied_watched", "auto_applied", now - 30 * 60),  # inside the watch (and the retention)
+        ("expired_old", "expired", now - 2 * DAY),
+        ("resolved_old", "resolved", now - 2 * DAY),
+        ("open_old", "open", now - 400 * DAY),
+    ]
+    dbs.metrics.write_sync(lambda conn: _recommendation_rows(conn, rows))
+    assert _loop(dbs.metrics, retention.prune_recommendations, policy) == 4
+    kept = dbs.metrics.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT id FROM recommendations")))
+    assert kept == ["auto_applied_watched", "dismissed_quiet", "open_old", "rolled_back_quiet"]
+    # A quiet period of 0 (the engine reopens at once) protects nothing.
+    zero = RetentionPolicy(retention_recommendations_days=1, dismiss_cooldown_days=0, auto_apply_watch_minutes=60)
+    assert _loop(dbs.metrics, retention.prune_recommendations, zero) == 2
+    kept = dbs.metrics.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT id FROM recommendations")))
+    assert kept == ["auto_applied_watched", "open_old"]
+
+
+def test_the_closed_recommendation_cap_removes_quiet_rows_last(dbs) -> None:
+    """W2H-3 and plan P9: the cap counts every closed row; rows that are not quiet go first (oldest first), and only
+    quiet rows beyond the cap on their own are removed after them."""
+    now = int(NOW)
+    rows = [(f"quiet_{i}", "dismissed", now - 10 * DAY + i) for i in range(3)]
+    rows += [(f"done_{i}", "resolved", now - 60 + i) for i in range(3)]  # newer than the quiet rows
+    rows += [("open_0", "open", now - 5 * DAY)]
+    dbs.metrics.write_sync(lambda conn: _recommendation_rows(conn, rows))
+    capped = RetentionPolicy(recommendations_max_rows=4, dismiss_cooldown_days=30)
+    assert _loop(dbs.metrics, retention.prune_recommendations, capped) == 2
+    kept = dbs.metrics.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT id FROM recommendations")))
+    assert kept == ["done_2", "open_0", "quiet_0", "quiet_1", "quiet_2"]  # the two oldest resolved rows went
+    tight = RetentionPolicy(recommendations_max_rows=2, dismiss_cooldown_days=30)
+    assert _loop(dbs.metrics, retention.prune_recommendations, tight) == 2  # done_2 first, then the oldest quiet one
+    kept = dbs.metrics.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT id FROM recommendations")))
+    assert kept == ["open_0", "quiet_1", "quiet_2"]
+
+
+def test_policy_reads_the_live_quiet_periods_and_states_match_the_engine() -> None:
+    """The quiet periods come from the live settings (W2H-3); a policy without settings keeps the catalog maxima,
+    and the state lists are the engine's own (storage cannot import insights, so they are repeated)."""
+    from roxy.insights.models import ACTIVE_STATES, APPLIED_STATES, QUIET_STATES
+
+    assert set(retention.OPEN_RECOMMENDATION_STATES) == set(ACTIVE_STATES)
+    assert set(retention.QUIET_RECOMMENDATION_STATES) == set(QUIET_STATES)
+    assert set(retention.APPLIED_RECOMMENDATION_STATES) == set(APPLIED_STATES)
+    live = RetentionPolicy.from_settings({"dismiss_cooldown_days": 90, "auto_apply_watch_minutes": 45}.get)
+    assert (live.dismiss_cooldown_days, live.auto_apply_watch_minutes) == (90, 45)
+    default = RetentionPolicy()
+    assert default.dismiss_cooldown_days == CATALOG["dismiss_cooldown_days"].max == retention.DISMISS_COOLDOWN_MAX_DAYS
+    assert default.auto_apply_watch_minutes == CATALOG["auto_apply_watch_minutes"].max
+    assert CATALOG["auto_apply_watch_minutes"].max == retention.WATCH_MAX_MINUTES
+
+
 def _constant(node: ast.expr) -> float | None:
     """The value of a constant number expression such as `40 * 86_400`, else None."""
     if isinstance(node, ast.Constant) and isinstance(node.value, int | float) and not isinstance(node.value, bool):

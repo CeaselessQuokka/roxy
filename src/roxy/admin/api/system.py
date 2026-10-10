@@ -14,7 +14,8 @@ What this is
       * `GET /system/jobs`: every job with its interval and last run, from this worker's runner and from what the
         leader publishes, plus the WAL checkpoint durations.
       * `GET /system/metrics-pipeline`: this worker's metrics queue, drops and flushes, and every database's writer
-        statistics and pending operations; `GET /system/persistence`: file and WAL sizes (parity row 85).
+        statistics and pending operations, plus every worker's drops of the last hour; `GET /system/persistence`:
+        file and WAL sizes (parity row 85), with the disk growth history and the newest table sizes.
       * `GET /system/errors` (signatures, paged, searchable, exportable) and `GET /system/errors/detail?signature=`
         (one signature with its redacted traceback).
       * `GET /system/versions` and `GET /system/environment` (the non-secret environment summary).
@@ -75,7 +76,7 @@ from roxy.config.audit import Actor
 from roxy.config.constants import MAX_REASON_LENGTH
 from roxy.core.redact import masked_url
 from roxy.deps import get_ctx
-from roxy.metrics import queries, read_errors
+from roxy.metrics import queries, read_errors, read_producers
 from roxy.metrics.templating import TEMPLATE_VERSION
 from roxy.scheduler import heartbeat, read_fleet
 from roxy.scheduler.jobs import Job, JobRegistry
@@ -102,6 +103,10 @@ WATCH_INTERVAL_S: Final = 1.0
 FLUSH_TIMEOUT_S: Final = 5.0
 JOB_STATUS_FRESH_S: Final = 180.0
 """Published leader job status older than this is ignored (the leader publishes every 30 s)."""
+GROWTH_DAYS: Final = 30
+"""Days of hourly disk samples the persistence card charts (SYS-DISK projects from the same 30 days)."""
+MAX_GROWTH_SAMPLES: Final = GROWTH_DAYS * 24 + 24
+"""Most samples one answer carries: one an hour over `GROWTH_DAYS`, plus a day of slack (plan P9)."""
 
 LIBRARIES: Final = ("fastapi", "starlette", "uvicorn", "gunicorn", "httpx", "pydantic", "jinja2", "regex")
 CREDENTIAL_NAMES: Final = (
@@ -155,7 +160,7 @@ ERRORS_TABLE: Final = TableSpec(
         Column("last_seen", "Last seen", "When it last happened (Unix seconds).", "s"),
         Column("source", "Source", "Where it was raised (request, job, startup, ...)."),
         Column("module_line", "Where", "The raising frame as module:line.", sortable=False),
-        Column("last_detail", "Last detail", "The last message (redacted).", sortable=False),
+        Column("last_detail", "Last detail", "The last message (redacted).", sortable=False, caller_text=True),
     ),
     default_sort="last_seen",
 )
@@ -533,14 +538,21 @@ def _db_stats(db: Any) -> dict[str, Any]:
 
 @router.get("/metrics-pipeline")
 async def metrics_pipeline(request: Request, _admin: AdminSession) -> dict[str, Any]:
-    """This worker's metrics queue, drops and flushes, and every database writer's statistics (per worker)."""
+    """This worker's metrics queue, drops and flushes, and every database writer's statistics (per worker), plus
+    the items every worker dropped in the last hour (`fleet_drops_last_hour`, SYS-METRICS-DROP's reading)."""
     ctx = get_ctx(request)
     recorder = getattr(ctx, "recorder", None)
     stats = recorder.stats() if recorder is not None else None
     now = int(ctx.clock.now())
     dims = None
+    fleet_drops = None
     with contextlib.suppress(SharedStateUnavailable):
-        dims = await ctx.dbs.metrics.read(lambda conn: queries.dims_per_minute(conn, now - 3600, now))
+        dims, fleet_drops = await ctx.dbs.metrics.read(
+            lambda conn: (
+                queries.dims_per_minute(conn, now - 3600, now),
+                read_producers.pipeline_drops(conn, now - 3600, now + 1),
+            )
+        )
     watcher = getattr(ctx, WATCHER_ATTRIBUTE, None)
     return {
         "worker_id": ctx.worker_id,
@@ -551,6 +563,9 @@ async def metrics_pipeline(request: Request, _admin: AdminSession) -> dict[str, 
             "metrics_queue_max": ctx.settings.get("metrics_queue_max"),
         },
         "dims_per_minute_last_hour": dims,
+        # Every worker's per-minute drop deltas (`metrics_pipeline_minute`), so a drop in another worker shows here.
+        "fleet_drops_last_hour": fleet_drops,
+        "fleet_drops_scope": "fleet",
         "databases": [_db_stats(db) for db in ctx.dbs.all()],
         "forced_flushes_here": watcher.flushes if isinstance(watcher, RequestsWatcher) else None,
     }
@@ -558,16 +573,36 @@ async def metrics_pipeline(request: Request, _admin: AdminSession) -> dict[str, 
 
 @router.get("/persistence")
 async def persistence(request: Request, _admin: AdminSession) -> dict[str, Any]:
-    """Database and WAL file sizes, the schema versions and each writer's health (parity row 85)."""
+    """Database and WAL file sizes, the schema versions and each writer's health (parity row 85), with the disk
+    growth history: Roxy's storage and the free disk sampled hourly by the leader over the last
+    `GROWTH_DAYS` days (`metrics/read_producers.py disk_growth`, the line SYS-DISK projects) and the newest table
+    sizes (sampled every 6 hours)."""
     ctx = get_ctx(request)
     files = await asyncio.to_thread(read_sizes.file_sizes, [Path(db.path) for db in ctx.dbs.all()])
     out = []
     for db in ctx.dbs.all():
         name = Path(db.path).name
         out.append({**_db_stats(db), "file": name, **files.get(name, {})})
+    since = int(ctx.clock.now()) - GROWTH_DAYS * 86_400
+    growth: list[dict[str, Any]] | None = None
+    tables: dict[str, Any] | None = None
+    with contextlib.suppress(SharedStateUnavailable):
+        growth, tables = await ctx.dbs.metrics.read(
+            lambda conn: (
+                read_producers.disk_growth(conn, since, limit=MAX_GROWTH_SAMPLES),
+                read_producers.latest_table_sizes(conn),
+            )
+        )
     return {
         "databases": out,
         "total_bytes": sum(f["bytes"] + f["wal_bytes"] + f["shm_bytes"] for f in files.values()),
+        "growth": growth,
+        "growth_days": GROWTH_DAYS,
+        "growth_note": (
+            "One sample an hour from the leader (the first an hour after it starts leading); None while metrics.db "
+            "is busy."
+        ),
+        "table_sizes": tables,
         "storage_url": f"{common.API_PREFIX}/data/storage",
     }
 
@@ -606,9 +641,8 @@ async def errors(
             rows, total = await ctx.dbs.metrics.read(reader(page, size))
             return list(rows), int(total)
 
-        rows, total = await common.collect_pages(fetch)
         filters = {"source": source} if source else None
-        return await common.export_table(request, admin, ERRORS_TABLE, rows, fmt, total=total, tq=tq, filters=filters)
+        return await common.export_pages(request, admin, ERRORS_TABLE, fetch, fmt, tq=tq, filters=filters)
     rows, total = await run_mutation(ctx.dbs.metrics.read(reader(tq.page, tq.page_size)))
     answer = common.table_answer(ERRORS_TABLE, tq, rows, total)
     answer["sources"] = await ctx.dbs.metrics.read(read_errors.error_sources)

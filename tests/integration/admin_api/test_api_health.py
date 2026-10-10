@@ -126,6 +126,11 @@ async def test_the_credential_check_needs_a_fresh_second_factor(
     api_app: Any, api: Any, api_json: Any, section13: Any
 ) -> None:
     ctx = api_app.ctx
+    # `make_mfa_stale` moves the app's (fake) clock past `admin_reauth_window_s`, which is also past the leader's
+    # first scheduled health poll: the scheduled run would then start and hold the fleet's one-run lease, and the
+    # manual run below would rightly get 409 `run_in_progress` (the review round 3 "flake", 10 of 10 under load).
+    # This test is about the second factor, so scheduled runs are off.
+    await api_app.settings(health_auto_interval_h=0)
     route = api_app.roblox.get("https://users.roblox.com/v1/users/authenticated").mock(
         return_value=httpx.Response(200, json={"id": 1000001, "name": "fixture_user"})
     )

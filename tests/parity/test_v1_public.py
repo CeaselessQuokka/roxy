@@ -14,8 +14,8 @@ Why it exists
 How it works
     The `parity` fixture runs the real app (tests/parity/conftest.py) with the mail transport recorded. Probes are
     sent, the recorder flushed, and the Security page read model (`GET /admin/api/v1/security/probes`) and the
-    recorded mail are read back. Two tests are strict xfails: they fail today for the reason in their marker and
-    turn into errors the day the behavior is fixed, so the marker has to go then.
+    recorded mail are read back. The tests of findings parity-1 and parity-2 were strict xfails until review round
+    3 fixed both; they now pin the fixed behavior.
 
 What to read next
     `roxy/public/pages.py` (which methods `/` answers), `roxy/proxy/router.py` (the catch-all),
@@ -33,21 +33,36 @@ import pytest
 from roxy.core.redact import TOKEN_PREFIX
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "finding parity-1: POST / is answered 404 'Not a Roblox URL' by the proxy catch-all (a not_roblox refusal "
-        "that the tarpit may hold) instead of v1's instant JSON 405 with an Allow header"
-    ),
-)
-async def test_v1_post_to_the_home_page_is_a_json_405_with_allow(parity: Any) -> None:
-    """v1 smoke lines 140 to 142: `POST /` (body `garbage`) gets 405, keeps the `Allow` header, body is JSON."""
-    response = await parity.proxy("POST", "/", content=b"garbage")
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE", "TRACE"])
+async def test_v1_post_to_the_home_page_is_a_json_405_with_allow(parity: Any, method: str) -> None:
+    """v1 smoke lines 140 to 142 and 188 (finding parity-1, fixed): `POST /` (body `garbage`) gets 405, keeps the
+    `Allow` header, the body is JSON, the probe log reads `HTTP 405 via POST /`, and the request never reaches the
+    proxy route (so neither the abuse pipeline nor the tarpit sees it). Every other method but GET, HEAD and OPTIONS
+    gets the same answer."""
+    counters = parity.ctx.heartbeat.counters
+    proxied = counters.proxied
+    probe_ip = parity.ip()
+    response = await parity.proxy(method, "/", ip=probe_ip, content=b"garbage")
     assert response.status_code == 405
-    assert "GET" in response.headers.get("allow", "")
+    assert response.headers.get("allow") == "GET, HEAD, OPTIONS"
     assert response.headers["content-type"].startswith("application/json")
     json.loads(response.content)  # a JSON document, as v1's jsonify sent
     assert "roxy-refusal" not in response.headers  # an answer of the site, not a proxy refusal
+    assert counters.proxied == proxied  # the proxy route never ran
+    await parity.ctx.recorder.flush()
+    admin = await parity.admin()
+    probes = await admin.get("security/probes", params={"ip": probe_ip})
+    assert probes.status_code == 200, probes.text
+    # v1's reason `HTTP 405 via POST /` is kept as a signature plus a target (the B19 fix splits the two).
+    logged = [(item.get("reason"), item.get("target")) for item in probes.json()["items"]]
+    assert (f"HTTP 405 via {method}", "/") in logged, logged
+
+
+async def test_the_home_page_still_answers_get_head_and_options(parity: Any) -> None:
+    """Control for the 405 route: GET and HEAD are the home page, OPTIONS keeps the proxy's local 204."""
+    assert (await parity.http.get("/")).status_code == 200
+    assert (await parity.http.head("/")).status_code == 200
+    assert (await parity.proxy("OPTIONS", "/")).status_code == 204
 
 
 async def test_v1_bot_probes_get_clean_answers_and_never_send_an_alert(parity: Any) -> None:
@@ -60,7 +75,7 @@ async def test_v1_bot_probes_get_clean_answers_and_never_send_an_alert(parity: A
         await parity.http.post("/admin/api/v1/auth/login", content=b"not json", headers=parity.harness.headers()),
         await parity.http.post("/admin/api/v1/auth/login", json=["a", "list"], headers=parity.harness.headers()),
     ]
-    assert [response.status_code for response in answers] == [404, 404, 404, 400, 400]
+    assert [response.status_code for response in answers] == [405, 404, 404, 400, 400]
     assert answers[1].content == b'"Not a Roblox URL"\n'  # POST /health falls to the proxy's 404 (row 129)
     assert answers[2].content == b'"Not a Roblox URL"\n'
     assert answers[2].headers["roxy-throttled"] in ("True", "False")  # v1 line 147: a clean bool string
@@ -68,16 +83,9 @@ async def test_v1_bot_probes_get_clean_answers_and_never_send_an_alert(parity: A
     assert parity.mail.subjects() == []  # HTTP errors below 500 are never emailed
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "finding parity-2: proxy probes (non-Roblox URL, unsafe URL, auth smuggling) feed the spam and bot detectors "
-        "but never reach the Security probe log; only admin login probes and middleware client errors are recorded"
-    ),
-)
 async def test_v1_proxy_probes_reach_the_probe_log(parity: Any) -> None:
     """v1 smoke lines 188 and 1255: a probe through the proxy route (here a non-Roblox URL and a smuggled cookie)
-    is an entry of the exploit log, which v2 shows on the Security page."""
+    is an entry of the exploit log, which v2 shows on the Security page (finding parity-2, fixed)."""
     probe_ip = parity.ip()
     assert (await parity.get("/this-is-not-roblox", ip=probe_ip)).status_code == 404
     smuggled = await parity.get(
@@ -91,6 +99,14 @@ async def test_v1_proxy_probes_reach_the_probe_log(parity: Any) -> None:
     reasons = [str(item.get("reason", "")) for item in probes.json()["items"]]
     assert len(reasons) >= 2, reasons
     assert any("Roblox" in reason for reason in reasons), reasons
+    # v1's texts, with the probed URL in the target column and Roxy's own words as the signature (v1 bug B19).
+    assert set(reasons) == {
+        "Non-Roblox URL",
+        "Sent a ROBLOSECURITY token (a header carried a ROBLOSECURITY-shaped value)",
+    }, reasons
+    targets = {str(item.get("reason")): item.get("target") for item in probes.json()["items"]}
+    assert targets["Non-Roblox URL"] == "this-is-not-roblox"
+    assert "SECRET" not in probes.text
 
 
 async def test_v1_probe_storms_never_break_shared_state_or_the_admin(parity: Any) -> None:

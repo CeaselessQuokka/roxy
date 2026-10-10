@@ -47,7 +47,8 @@ How it works
        10.6; off by default).
     7. `respond.render` builds the answer; `ctx.recorder.record_outcome(event)` runs exactly once per request
        (for a drip, when the stream ends), with a `CaptureInput` when the recorder takes one (its capture policy
-       decides whether the bodies are kept). `message_source` tells whose words the caller got (row 116): a
+       decides whether the bodies are kept). A refusal's record names the rule rows the verdict matched
+       (`refusal_matches`, the refusal event's `rules`). `message_source` tells whose words the caller got (row 116): a
        refusal's `custom` or `default` (a refusal the upstream layer returned, such as an egress host refusal, is
        `default`), `roxy` for a 7.13 failure text Roxy wrote, `roblox` for an error answer that carries Roblox's
        own body. An exception still propagates to the middleware, which answers 500 (or the
@@ -630,6 +631,27 @@ def fetched_body_hash(rendered: respond.Rendered, result: Any) -> str | None:
     return hashlib.sha256(body).hexdigest()[:BODY_HASH_CHARS]
 
 
+MAX_EVENT_MATCHES = 8
+"""Rule rows named on one refusal record (the abuse checks report at most one row per table; the recorder keeps 8)."""
+
+
+def refusal_matches(refusal: Any) -> dict[str, str] | None:
+    """The rule rows the abuse verdict matched, `{control.db table: row id}`, for a refusal's outcome record.
+
+    `Refuse.matches` (the checks' `Facts.note_match`) names the row that refused, a User-Agent rule, a header filter,
+    an endpoint block or rate rule, a ban or deny entry, so the Protection attempts tabs read which rule refused
+    from the refusal event instead of matching the patterns again. Only abuse refusals carry it: an Allow, a cache
+    serve and the proxy's own refusals (`respond.Refusal`) give None. Table names are fixed and row ids are short
+    keys Roxy assigned, never caller text.
+    """
+    if refusal is None:
+        return None
+    matches = getattr(refusal, "matches", None)
+    if not isinstance(matches, Mapping) or not matches:
+        return None
+    return {str(table): str(key) for table, key in list(matches.items())[:MAX_EVENT_MATCHES]}
+
+
 def _trace_count(result: Any, name: str) -> int:
     value = getattr(getattr(result, "trace", None), name, 0)
     return int(value) if isinstance(value, int) else 0
@@ -693,6 +715,7 @@ def build_outcome_event(
         "upstream_error": str(getattr(getattr(result, "trace", None), "upstream_error", "") or ""),
         "message_source": message_source(rendered, refusal),
         "check": str(getattr(refusal, "check", "") or "") if refusal is not None else "",
+        "matches": refusal_matches(refusal),
         "cache_key_id": getattr(cache_key, "id", None),
         "body_hash": fetched_body_hash(rendered, result),
     }

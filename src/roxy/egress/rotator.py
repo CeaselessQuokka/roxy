@@ -17,6 +17,10 @@ How it works
     bootstrap systemd credential `rotator_url` (read once at start; there is no environment variable form because
     the URL embeds a password). It is never logged; `masked_url()` shows `scheme://host:port`. A change bumps
     `service_state.rotator_version`; every worker reloads within a second and retires its old clients.
+    Every URL and its password are registered with `SecretRegistry` (which keeps 3 values per name) under a pair of
+    names per role: offered (`replace_url` and the stored row), bootstrap (once at start) and in use (each time the
+    URL changes). A URL that can be used again (the bootstrap one, through `revert_to_bootstrap`) therefore stays
+    redacted for the worker's whole life, however many URLs the admin tries (finding W2H-1).
     Sessions (`rotator_session_mode`): `per_request` uses one shared client with keep-alive off, so every request
     opens a new CONNECT tunnel and gets a new exit IP; it is the effective mode while
     `rotator_session_username_template` is empty, because the sticky modes need the template to put a session id
@@ -93,6 +97,15 @@ MAX_URL_LENGTH = 2048
 _PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
 _MAX_URL_FILE_BYTES = 8192
 _SHARED = "__per_request__"
+
+# `SecretRegistry` names, one pair (whole URL, password) per role. The registry keeps 3 values per name, so a value
+# that can be used again must not share a name with values the admin can add at will (finding W2H-1).
+OFFERED_SECRET_NAMES = ("rotator_url", "rotator_password")
+"""URLs offered or stored through the Egress page (`replace_url`, the store row loaded by a refresh)."""
+BOOTSTRAP_SECRET_NAMES = ("rotator_url_bootstrap", "rotator_password_bootstrap")
+"""The bootstrap file's URL, registered once at start: `revert_to_bootstrap` can make it the URL in use again."""
+IN_USE_SECRET_NAMES = ("rotator_url_in_use", "rotator_password_in_use")
+"""The URL in use, registered each time it changes, before any client is built with it."""
 
 
 class RotatorStateError(RuntimeError):
@@ -372,15 +385,18 @@ class RotatorPool:
         """Read the bootstrap URL once and load the current state."""
         self._bootstrap_url = await asyncio.to_thread(_read_bootstrap_url, self._credentials_dir)
         if self._bootstrap_url:
-            self._register(self._bootstrap_url)
+            self._register(self._bootstrap_url, BOOTSTRAP_SECRET_NAMES)
         await self.refresh(force=True)
 
-    def _register(self, url: str) -> None:
-        SecretRegistry.register("rotator_url", url)
+    @staticmethod
+    def _register(url: str, names: tuple[str, str] = OFFERED_SECRET_NAMES) -> None:
+        """Register `url` and its password under `names` (one of the role pairs above)."""
+        url_name, password_name = names
+        SecretRegistry.register(url_name, url)
         with contextlib.suppress(ValueError):
             endpoint = parse_proxy_url(url)
             if endpoint.password:
-                SecretRegistry.register("rotator_password", endpoint.password)
+                SecretRegistry.register(password_name, endpoint.password)
 
     def _read_control(self, conn: sqlite3.Connection, known: int, force: bool) -> tuple[int, Any]:
         version = read_version(conn, VERSION_KEY)
@@ -445,6 +461,10 @@ class RotatorPool:
                 self._url_problem = "invalid_url"
                 log.error("rotator_url_invalid", extra={"fields": {"error": str(exc)[:120]}})
                 url = None
+            else:
+                # Known to every redaction point before any client holds it, whichever source it came from
+                # (finding W2H-1: going back to the bootstrap URL left its password unregistered).
+                self._register(url, IN_USE_SECRET_NAMES)
         self._url = url
         self._endpoint = endpoint
         self._url_version += 1
@@ -881,10 +901,16 @@ class RotatorPool:
     async def revert_to_bootstrap(
         self, actor: Actor, *, reason: str | None = None, request_id: str | None = None
     ) -> None:
-        """Delete the UI-set URL so the bootstrap credential is used again (restart needed to re-read the file)."""
+        """Delete the UI-set URL so the bootstrap credential is used again (restart needed to re-read the file).
+
+        The bootstrap URL is registered as a secret again BEFORE the audit row is written, so a reason that repeats
+        its password is redacted however many URLs were tried since this worker started (finding W2H-1).
+        """
         before = self._summary(self._ui_url)
         after = self._summary(self._bootstrap_url)
         now = int(self._clock.now())
+        if self._bootstrap_url:
+            self._register(self._bootstrap_url, BOOTSTRAP_SECRET_NAMES)
 
         def write(conn: sqlite3.Connection) -> None:
             if conn.execute("SELECT 1 FROM rotator_store WHERE id = 1").fetchone() is None:
@@ -907,6 +933,9 @@ async def _close_quietly(client: _Closable) -> None:
 
 
 __all__ = [
+    "BOOTSTRAP_SECRET_NAMES",
+    "IN_USE_SECRET_NAMES",
+    "OFFERED_SECRET_NAMES",
     "PER_REQUEST",
     "STICKY",
     "STICKY_UNTIL_429",

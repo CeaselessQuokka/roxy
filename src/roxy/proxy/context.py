@@ -140,7 +140,9 @@ class ProxyRequest:
     # Added by DESIGN.md section 11.1:
     target_problem: ReasonCode | None = None
     cache_key: Any = None
-    """`cache/keys.py: CacheKey`, set by `cache.peek`."""
+    """`cache/keys.py: CacheKey`, set by `cache.peek` (for a POST kept `OFF` by `cache_post_requests`, the key it
+    would have: its identity for request samples, the User-Agent experiment and the retry hold, never served from;
+    finding insights-7)."""
     fresh_cache_hit: bool = False
     # Added by the proxy package:
     is_head: bool = False

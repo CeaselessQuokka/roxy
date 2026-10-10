@@ -2,8 +2,9 @@
 
 What this is
     `explain_wait(facts)` turns what Roxy kept about one request id (its Live row, the Roblox 429s it met, the 429
-    that opened the cooldown it ran into, and how full its buckets were in that minute) into an ordered list of
-    sentences an admin can act on, plus the numbers behind them. `request_bucket_keys(row)` names the buckets one
+    that opened the cooldown it ran into, how full its buckets were in that minute, and how many calls to its
+    endpoint Roblox answered with a challenge or an HTML page in that minute) into an ordered list of sentences an
+    admin can act on, plus the numbers behind them. `request_bucket_keys(row)` names the buckets one
     request needed (plan 7.3). `REASON_TEXT` is the sentence for every outcome reason (`core/reasons.py`).
 
 Why it exists
@@ -94,6 +95,9 @@ class WaitFacts:
     buckets: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     queue_budget_ms: float | None = None
     capture_available: bool = False
+    flagged_calls: Mapping[str, int] = field(default_factory=dict)
+    """`{calls, challenges, html_bodies}` of the request's endpoint and egress in its minute
+    (`upstream_attempt_minute`, flagged by `upstream/pages.py`); empty when unknown."""
 
 
 def request_bucket_keys(row: Mapping[str, Any]) -> list[str]:
@@ -152,6 +156,7 @@ def explain_wait(facts: WaitFacts) -> dict[str, Any]:
             "waited_ms": None,
             "roblox_429s": [dict(item) for item in facts.roblox_429s],
             "prior_429s": [dict(item) for item in facts.prior_429s],
+            "flagged_calls": {},
             "capture_available": facts.capture_available,
         }
     reason = str(row.get("reason") or "")
@@ -200,6 +205,15 @@ def explain_wait(facts: WaitFacts) -> dict[str, Any]:
         )
     if facts.roblox_429s and reason != ReasonCode.UPSTREAM_COOLDOWN.value:
         reasons.append(f"Roblox answered 429 to {len(facts.roblox_429s)} of its calls.")
+    challenges = int(facts.flagged_calls.get("challenges") or 0)
+    html_bodies = int(facts.flagged_calls.get("html_bodies") or 0)
+    if challenges or html_bodies:
+        reasons.append(
+            f"In that minute {challenges} call(s) to this endpoint through {row.get('egress')} were answered with a "
+            f"challenge and {html_bodies} with an HTML page instead of JSON: Roblox or its CDN may be blocking this "
+            "path. This is inferred from the minute's attempt history, because the flags of one request's calls are "
+            "not stored."
+        )
     if cache in _CACHE_SERVES and outcome != "refused" and waited == 0:
         reasons.append("A cache serve does not wait for Roblox.")
     return {
@@ -209,6 +223,7 @@ def explain_wait(facts: WaitFacts) -> dict[str, Any]:
         "waited_ms": round(waited, 3),
         "roblox_429s": [dict(item) for item in facts.roblox_429s],
         "prior_429s": [dict(item) for item in facts.prior_429s],
+        "flagged_calls": dict(facts.flagged_calls),
         "capture_available": facts.capture_available,
     }
 

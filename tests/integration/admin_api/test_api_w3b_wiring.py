@@ -46,6 +46,7 @@ from roxy.insights.actions import ACTION_LEASE_PREFIX, RecommendationActions
 from roxy.insights.autoapply import AutoApplier
 from roxy.insights.engine import InsightsEngine, write_recommendation
 from roxy.insights.models import Evidence, ProposedChange, Recommendation, make_fingerprint
+from roxy.metrics import jobs as metrics_jobs
 from roxy.metrics.recorder import note_eviction_ages, note_eviction_pass
 from roxy.rules.service import RulesService
 from roxy.scheduler.heartbeat import LoopLagMonitor
@@ -118,6 +119,11 @@ async def test_lifespan_builds_the_wave3_services_and_registers_their_jobs(api_a
     assert jobs["health_scheduled_run"].interval() == 300.0
     assert jobs["health_publish_jobs"].interval() == 30.0
     assert jobs["llm_export_file"].interval() == 3600.0
+    # Review round 3 (lane_producers request 1): the producer history jobs of metrics.db schema 5 are wired, leader
+    # only and never at start (no disk I/O while a worker boots).
+    for name in (metrics_jobs.DISK_HISTORY_JOB, metrics_jobs.PRODUCER_PRUNE_JOB):
+        assert jobs[name].leader_only, name
+        assert not jobs[name].run_at_start, name
 
 
 async def test_job_intervals_follow_their_settings_without_a_restart(api_app: Any) -> None:

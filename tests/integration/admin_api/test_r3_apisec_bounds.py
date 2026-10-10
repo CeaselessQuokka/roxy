@@ -1,21 +1,23 @@
 """Review round 3 (lens apisec): bounds on expensive admin API work, and path ids out of SQLite's range.
 
 What this is
-    Strict-xfail tests for three findings about what one signed-in session can make a 1 GB server do:
-      * apisec-5: `POST /data/backups` ("Back up now") copies control.db and metrics.db with `VACUUM INTO` every
-        time it is called. Its feasibility check compares one database with `snapshots_max_bytes` and the free disk
-        with one more copy, but never counts the snapshots already in the folder, and nothing stops a second call
-        while the first copies. The cap ("Total disk space all safety snapshots may use together") holds only when
-        the `file_retention` job next runs (every 600 s); until then repeated calls fill the state volume down to
-        `SNAPSHOT_MIN_FREE_BYTES` (64 MiB).
-      * apisec-6: every table route's `format=csv|json` download (`common.export_table`) reads up to 50,000 rows
-        into memory and renders the whole file on a worker thread, with no limit on how many run at once. The LLM
-        export caps its builds at 2 per worker (429 above); table exports have no such bound.
-      * apisec-7: an integer path id larger than SQLite's 64-bit range (`/routing-rules/{rule_id}`,
-        `/credential-allowlist/{row_id}`, `/cache/rules/{rule_id}`, `/health/runs/{run_id}`) reaches the database
-        unbounded; sqlite3 raises `OverflowError`, the answer is the unhandled 500 and every such request fires the
-        owner's "Roxy Error" alert (`notify.notifier.error_alert`). Other areas bound the same ids with
-        `Path(ge=1, le=2**62)`.
+    Tests for three findings about what one signed-in session can make a 1 GB server do (strict xfails until
+    review round 3 fixed all three; they now pin the fixed behavior):
+      * apisec-5 (fixed): `POST /data/backups` ("Back up now") copied control.db and metrics.db with `VACUUM INTO`
+        every time it was called, never counting the snapshots already in the folder, and nothing stopped a second
+        call while the first copied, so repeated calls filled the state volume until the `file_retention` job ran.
+        Now the copies count against `snapshots_max_bytes` with the folder, Back up now replaces its own oldest
+        copies to make room (a copy that still does not fit is skipped, and since review round 4, finding
+        secfix-4, the root backup is asked anyway) and takes the data operation lease.
+      * apisec-6 (fixed): every table route's `format=csv|json` download read up to 50,000 rows into memory and
+        rendered the whole file on a worker thread, with no limit on how many ran at once. Now a worker builds at
+        most `common.MAX_CONCURRENT_EXPORTS` (2) downloads at once, from the first read to the last byte sent
+        (the `format` dependency holds a slot), and answers 429 `rate_limited` beyond, as the LLM export does.
+      * apisec-7 (fixed): an integer path id larger than SQLite's 64-bit range (`/routing-rules/{rule_id}`,
+        `/credential-allowlist/{row_id}`, `/cache/rules/{rule_id}`, `/health/runs/{run_id}`) reached the database
+        unbounded; sqlite3 raised `OverflowError`, the answer was the unhandled 500 and every such request fired the
+        owner's "Roxy Error" alert. They are `common.RowId` now (`Path(ge=1, le=2**62)`, 422), and an
+        `OverflowError` anywhere in an area route is a 422 (`common.service_error`).
 
 Why it exists
     Plan P9 (every queue, table and file bounded), 6.6 and 6.10 (snapshots capped), the 1 GB memory budget of
@@ -23,9 +25,10 @@ Why it exists
 
 How it works
     Backups: `snapshots_max_bytes` is set to the whole MiB just above one backup's size, then backups are made
-    one after another; the folder must never hold more than the cap. Exports: `common.render_export` is wrapped so
-    each render waits on an event, six downloads are started at once and the number rendering together is
-    counted. Ids: each route is called with a 26-digit id and must answer a section 13 error below 500.
+    one after another; the folder must never hold more than the cap. Exports: `common.ExportBuilder.add` (every
+    download renders its rows through it, page by page) is wrapped so each render waits on an event, six downloads
+    are started at once and the number rendering together is counted. Ids: each route is called with a 26-digit id
+    and must answer a section 13 error below 500.
 
 What to read next
     `roxy/admin/api/data.py` (`back_up_now`, `snapshot_feasibility`, `take_snapshot`), `roxy/storage/retention.py`
@@ -44,6 +47,8 @@ from typing import Any
 import pytest
 
 from roxy.admin.api import common
+from roxy.config import audit
+from roxy.storage.db import SharedStateUnavailable
 
 MIB = 1024 * 1024
 HUGE_ID = "99999999999999999999999999"
@@ -64,11 +69,9 @@ def _db_bytes(api_app: Any, name: str) -> int:
 # =============================================================================================== apisec-5
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding apisec-5: Back up now ignores the snapshots already on disk, so the folder outgrows the cap",
-)
 async def test_back_up_now_keeps_the_snapshot_folder_within_its_cap(api: Any, api_app: Any) -> None:
+    """apisec-5 (fixed): Back up now counts the folder against `snapshots_max_bytes` and replaces its own oldest
+    copies (`data.backup_plan`), else skips the copy that does not fit; one backup or reset runs at a time."""
     folder = Path(api_app.ctx.env.state_dir) / "snapshots"
     one_backup = _db_bytes(api_app, "control") + _db_bytes(api_app, "metrics")
     cap = -(-one_backup // MIB) * MIB  # the whole MiB just above one backup
@@ -90,28 +93,24 @@ async def test_back_up_now_keeps_the_snapshot_folder_within_its_cap(api: Any, ap
 # =============================================================================================== apisec-6
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding apisec-6: table exports have no concurrency bound; six 50,000-row renders may run at once",
-)
 async def test_table_exports_are_bounded_per_worker(api: Any, api_app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     release = threading.Event()
     lock = threading.Lock()
     state = {"now": 0, "peak": 0}
-    real = common.render_export
+    real = common.ExportBuilder.add
 
-    def held_render(*args: Any, **kwargs: Any) -> Any:
+    def held_add(self: Any, items: Any) -> Any:
         with lock:
             state["now"] += 1
             state["peak"] = max(state["peak"], state["now"])
         try:
             release.wait(timeout=10)
-            return real(*args, **kwargs)
+            return real(self, items)
         finally:
             with lock:
                 state["now"] -= 1
 
-    monkeypatch.setattr(common, "render_export", held_render)
+    monkeypatch.setattr(common.ExportBuilder, "add", held_add)
     tasks = [asyncio.create_task(api.get("audit", params={"format": "csv"})) for _ in range(6)]
     try:
         for _ in range(60):  # 3 s at most: until every download is either rendering (held) or answered
@@ -125,8 +124,29 @@ async def test_table_exports_are_bounded_per_worker(api: Any, api_app: Any, monk
         answers = await asyncio.gather(*tasks)
     refused = [r for r in answers if r.status_code == 429]
     assert all(r.status_code in (200, 429) for r in answers), [r.status_code for r in answers]
-    assert peak <= 2, f"{peak} exports rendered at once; {len(refused)} of 6 refused"
-    assert len(refused) >= 4, f"{len(refused)} of 6 refused while {peak} rendered at once"
+    assert peak <= common.MAX_CONCURRENT_EXPORTS, f"{peak} exports rendered at once; {len(refused)} of 6 refused"
+    assert peak == 2, peak  # the bound is a bound, not a queue of one: two downloads do build side by side
+    assert len(refused) == 4, f"{len(refused)} of 6 refused while {peak} rendered at once"
+    for response in refused:
+        assert response.json()["error"]["code"] == "rate_limited"
+        assert response.headers["retry-after"] == str(common.EXPORT_BUSY_RETRY_S)
+    assert common.export_slots(api_app.app).busy == 0  # every slot is given back once its file is sent
+    again = await api.get("audit", params={"format": "json"})
+    assert again.status_code == 200, again.text[:200]
+
+
+async def test_a_refused_download_gives_its_slot_back(api: Any, api_app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A download that ends in an error (here the audit row cannot be written: 503, no file) frees its slot too."""
+
+    def busy(*_args: Any, **_kwargs: Any) -> int:
+        raise SharedStateUnavailable("control", "simulated lock")
+
+    monkeypatch.setattr(audit, "record", busy)
+    for _ in range(common.MAX_CONCURRENT_EXPORTS + 2):
+        response = await api.get("audit", params={"format": "csv"})
+        assert response.status_code == 503, response.text[:200]
+        assert response.headers.get("content-disposition") is None
+    assert common.export_slots(api_app.app).busy == 0
 
 
 # =============================================================================================== apisec-7
@@ -150,14 +170,38 @@ async def test_bounded_ids_answer_a_section13_error(api: Any) -> None:
     assert response.json()["error"]["code"] == "validation_failed"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding apisec-7: integer path ids above 2**63 reach sqlite3 and answer the unhandled 500 (and an alert)",
-)
 async def test_huge_path_ids_are_refused_without_a_server_error(api: Any) -> None:
     failures: list[str] = []
     for method, path in HUGE_ID_ROUTES:
         response = await api.request(method, path, json={} if method == "DELETE" else None)
         if response.status_code >= 500:
             failures.append(f"{method} {path.split('/')[0]}: {response.status_code}")
+        elif (response.status_code, response.json()["error"]["code"]) != (422, "validation_failed"):
+            failures.append(f"{method} {path}: {response.status_code} {response.text[:120]}")
     assert failures == [], "; ".join(failures)
+    compare = await api.get("health/runs/1/compare", params={"with": HUGE_ID})  # the query id is bounded too
+    assert compare.status_code == 422, compare.text[:200]
+
+
+async def test_an_overflow_in_an_area_route_is_a_422_not_a_500(api: Any, api_app: Any) -> None:
+    """The safety net behind `common.RowId`: an `OverflowError` (sqlite3 binding a too-large number) that reaches
+    an area route's handler is the caller's mistake, never a 500 with an alert."""
+    router = common.area_router("zzoverflow")
+
+    @router.get("/x")
+    async def overflow(_admin: common.AdminSession) -> dict[str, Any]:
+        raise OverflowError("Python int too large to convert to SQLite INTEGER")
+
+    api_app.include(build_api_router_for(router))
+    response = await api.get("zzoverflow/x")
+    assert response.status_code == 422, response.text[:200]
+    assert response.json()["error"] == {"code": "validation_failed", "message": common.TOO_LARGE_MESSAGE, "fields": {}}
+
+
+def build_api_router_for(area: Any) -> Any:
+    """`area` under `/admin/api/v1`, as `roxy.admin.api` mounts a module's router."""
+    from fastapi import APIRouter
+
+    outer = APIRouter(prefix=common.API_PREFIX)
+    outer.include_router(area)
+    return outer

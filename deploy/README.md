@@ -3,7 +3,9 @@
 Everything that runs Roxy on the server lives here: the gunicorn config, the systemd units, the nginx site, the
 blue/green deploy and its rollback, the root wrappers the deploy may call through sudo, backups, alerts and the
 permission audit (plan section 17). Every file explains each setting next to the setting itself. This page is the
-map; `MIGRATION.md` (phase P14) walks through the cutover from v1 step by step.
+map; `MIGRATION.md` (phase P14) walks through the cutover from v1 step by step. When something breaks on the
+server, `docs/RUNBOOKS.md` (the ops docs the alerts and health checks link to) says how to confirm, fix, verify and
+roll back each case; `docs/PERFORMANCE.md` has the load figures and the quiet-machine rerun commands.
 
 ## What is here, and where it goes on the server
 
@@ -32,6 +34,7 @@ map; `MIGRATION.md` (phase P14) walks through the cutover from v1 step by step.
 | `/etc/roxy/` | root:roxy, 0750 | `roxy.env`, `blue.env`, `green.env`, `nginx-hints.env`, `credentials/` (root, 0700; files 0600). While v1 still lives here the directory stays v1's (see "Running beside v1") |
 | `/var/lib/roxy/` | roxy, 0750 | Databases and `snapshots/` (pre-migration copies); created by `install-system.sh` so the root jobs can start before the first deploy |
 | `/var/lib/roxy/audit/` | root:roxy, 0750 | `perms.json` (roxy-audit) and `backup.json` (backup.sh). Root's own directory inside the roxy user's: the root jobs create it and write it without ever following a link the roxy user could plant |
+| `/var/lib/roxy/ctl-proofs/` | roxy, 0700 | One-use proofs `scripts/ctl.py` writes for the internal socket (made on first use). roxy-audit reports any other owner or mode; the service refuses proofs from it then too |
 | `/var/lib/roxy-deploy/` | deploy user, 0755 | Deploy lock, `deployed_version`, `last_deploy.json`, `last_failure.json`, low-memory markers (correction: the plan put `deployed_version` in `/var/lib/roxy`, which the deploy user cannot write) |
 | `/var/lib/roxy-nginx-apply/` | root, 0755 | The wrapper's own git mirror (0700) and `applied.json` |
 | `/run/roxy-blue/`, `/run/roxy-green/` | roxy, 0750 | `internal.sock` and `gunicorn.ctl`, both 0660 |
@@ -68,7 +71,8 @@ map; `MIGRATION.md` (phase P14) walks through the cutover from v1 step by step.
 release and its venv while the live color serves, restart the idle color (its pre-start step snapshots control.db and
 applies the expand migrations as the `roxy` user), wait until its internal socket reports the new version, run
 `scripts/smoke_remote.py`, install the nginx config through `roxy-nginx-apply` if it changed, switch nginx with
-`roxy-switch-color`, watch for 60 s, then stop the old color. The watch checks the new color's internal socket and
+`roxy-switch-color`, watch for 60 s, then stop the old color. The watch makes 12 checks, 5 s apart (a count, not a
+clock reading, so a busy machine or a clock step never shortens it), of the new color's internal socket and
 the public `/health` through nginx, which must be Roxy v2's own answer (it has a `Degraded` key; v1's has not). Any
 failure before the old color stops switches nginx back, re-installs the nginx config the old color ran with (when
 this release had installed its own), and stops the new color; the run exits non-zero and `roxy-deploy-alert.path`
@@ -83,6 +87,9 @@ same code as gunicorn's SIGTTIN handler; the deploy user may not signal the `rox
 
 Rollback: `/opt/roxy/deploy_rollback.sh` goes back to the release the other color last ran, with the same health gate;
 `/opt/roxy/deploy_rollback.sh <sha>` goes to any release still in `/opt/roxy/releases` (the newest five are kept).
+"Newest" is the deploy order: every deploy or rollback that starts a release writes the next number into its
+`.roxy-release-sequence`, so file times (which a clock stepping back can reorder) never decide what is removed; a
+release a color runs is never removed.
 
 ## Contract migrations (by hand, never automatic)
 

@@ -423,7 +423,8 @@ SETTINGS: list[SettingSpec] = [
         description=(
             "How many days closed recommendations (applied, dismissed, expired, resolved or rolled back) and "
             "their action history are kept. Open recommendations are never deleted by age, and at most 50,000 "
-            "are kept in total."
+            "are kept in total. A dismissed or rolled back item is kept at least until its quiet period "
+            "(dismiss_cooldown_days) ends, an applied one through its watch window."
         ),
         pages=(_RETENTION,),
         if_raised="A longer record of what Roxy suggested and what was done about it, at a small disk cost.",

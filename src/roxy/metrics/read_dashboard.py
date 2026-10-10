@@ -6,13 +6,16 @@ What this is
         Overview tile "Roblox 429s per 10,000 caller requests" shows v1's lifetime value next to the live one).
       * `notable_events(conn, start_ms, end_ms, ...)`: the Overview's "recent notable events" (breakers, cooldowns,
         credential and rotator changes, bans, purges, recommendations, health runs), newest first, paged.
-      * `pair_counts(conn, window, first, second)`: requests summed by two dimensions at once (the Traffic page's
-        "who returned it?" table: status code by source, parity rows 68 and 132).
+      * `pair_counts(conn, window, first, second)`: requests summed by two dimensions at once, a generic
+        two-dimension count (the Traffic page's "who returned it?" table now reads `queries.answer_source_counts`,
+        which counts a Roblox 5xx Roxy passed on as Roblox's, finding parity-1).
       * `recent_live(conn, limit, before_id)` and `live_row(conn, request_id, ...)`: the Live view's rows of every
         worker, newest first, and one request's row; `LiveQuery` and `parse_live_query(...)` are the Live view's
         filter, shared by the Live API and the event stream so both drop exactly the same rows.
       * `endpoint_callers(...)` and `endpoint_429s(...)`: who calls one endpoint (request samples) and the Roblox
         429s it drew (the `upstream_429` log).
+      * `endpoint_recency(conn, window, templates)`: v1 Top Endpoints' Methods, Last Request, Last Status and Last
+        Caller columns for one page of templates (rollups, refined by the newest Live row).
       * `visit_series(conn, window)`: visitor classes per bucket (sparklines of the Visitors card, row 130).
       * `heatmap(buckets, values, tz)`: hour of day by weekday, folded from hourly buckets (plan 14.1 Traffic).
       * `sparkline_window(window)`: the same time range at a granularity with at most `SPARK_POINTS` buckets.
@@ -88,6 +91,8 @@ MAX_EVENTS_PAGE: Final = 250
 MAX_LIVE_ROWS: Final = 2000
 """Most live rows one read returns (the Live view shows at most 500; the rest is filter headroom, plan P9)."""
 MAX_CALLERS: Final = 100
+MAX_RECENCY_TEMPLATES: Final = 250
+"""Most templates `endpoint_recency` answers in one call: one table page (`queries.PAGE_SIZES` maximum)."""
 SPARK_POINTS: Final = 61
 """Most points in a KPI sparkline: enough to show a shape, small enough for a tile. 61 keeps the one hour range at
 its own minute buckets (60 whole minutes plus the open one), so its sparkline covers exactly the tile's range."""
@@ -452,6 +457,75 @@ def endpoint_429s(
     return {"total": sum(by_egress.values()), "by_egress": by_egress, "recent": recent}
 
 
+def endpoint_recency(conn: sqlite3.Connection, window: Window, templates: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """v1 Top Endpoints' Methods, Last Request, Last Status and Last Caller for the given templates in `window`
+    (plan 14.1 row 11, parity row 74, finding parity-13). At most `MAX_RECENCY_TEMPLATES` templates (one page).
+
+    Per template: `methods` (`{method: requests}`, busiest first, the v1 `GET:3 POST:1` column), and the newest
+    request in the window: `last_request_ms` with its `last_request_precision`. The rollups give the start of the
+    newest bucket holding one (`minute` for the minute level, which always answers the tail of a window, else
+    `hour`, `day` or `month`); when the newest Live row of the template (kept 15 minutes) lies in the window and in
+    that bucket or later, it gives the exact time (`exact`) and the `last_status`, `last_caller` (the client
+    address, as the Live view shows it) and `last_place` of that request, which the rollups do not keep (None).
+    Reads the same rollup pieces as `queries.endpoint_table`, so the methods sum to the table's requests.
+    """
+    wanted = list(dict.fromkeys(str(t) for t in templates if t))[:MAX_RECENCY_TEMPLATES]
+    if not wanted:
+        return {}
+    marks = ", ".join("?" for _ in wanted)
+    methods: dict[str, dict[str, int]] = {}
+    newest: dict[str, tuple[int, str]] = {}
+    base = queries.BASE_LEVEL[window.granularity]
+    for table, lo, hi in queries.level_pieces(conn, base, window.start, window.end):
+        precision = queries.LEVEL_UNIT[table]
+        rows = conn.execute(
+            f"SELECT d.endpoint_template AS t, d.method AS m, sum(r.requests) AS n, max(r.bucket_start) AS last "  # noqa: S608
+            f"FROM {table} r JOIN dims d ON d.dim_hash = r.dim_hash WHERE r.bucket_start >= ? AND r.bucket_start < ? "
+            f"AND d.endpoint_template IN ({marks}) GROUP BY t, m",
+            (lo, hi, *wanted),
+        ).fetchall()
+        for row in rows:
+            template, count = str(row["t"]), int(row["n"] or 0)
+            if count <= 0:
+                continue
+            per = methods.setdefault(template, {})
+            per[str(row["m"])] = per.get(str(row["m"]), 0) + count
+            last = int(row["last"])
+            if template not in newest or last > newest[template][0]:
+                newest[template] = (last, precision)
+    live = conn.execute(
+        f"SELECT endpoint_template AS t, max(id) AS id, at_ms, detail_json FROM events "  # noqa: S608 (placeholders)
+        f"WHERE type = ? AND endpoint_template IN ({marks}) GROUP BY t",
+        (LIVE_EVENT, *wanted),
+    ).fetchall()
+    latest = {str(row["t"]): (int(row["at_ms"]), _detail(row["detail_json"])) for row in live}
+    out: dict[str, dict[str, Any]] = {}
+    for template in wanted:
+        if template not in methods:
+            continue
+        bucket, precision = newest[template]
+        item: dict[str, Any] = {
+            "methods": dict(sorted(methods[template].items(), key=lambda kv: (-kv[1], kv[0]))),
+            "last_request_ms": bucket * 1000,
+            "last_request_precision": precision,
+            "last_status": None,
+            "last_caller": None,
+            "last_place": None,
+        }
+        found = latest.get(template)
+        if found is not None and bucket * 1000 <= found[0] < window.end * 1000 and found[0] >= window.start * 1000:
+            at_ms, detail = found
+            item.update(
+                last_request_ms=at_ms,
+                last_request_precision="exact",
+                last_status=detail.get("status"),
+                last_caller=detail.get("ip") or None,
+                last_place=detail.get("place") or None,
+            )
+        out[template] = item
+    return out
+
+
 # ---------------------------------------------------------------------------------------------- visits
 
 VISIT_KEYS: Final[tuple[str, ...]] = (
@@ -565,6 +639,7 @@ def next_bucket(start: int, unit: str, tz: str) -> int:
 __all__ = [
     "LEGACY_KEYS",
     "MAX_LIVE_ROWS",
+    "MAX_RECENCY_TEMPLATES",
     "NOTABLE_EVENT_TYPES",
     "SPARK_POINTS",
     "VISIT_KEYS",
@@ -573,6 +648,7 @@ __all__ = [
     "day_start",
     "endpoint_429s",
     "endpoint_callers",
+    "endpoint_recency",
     "heatmap",
     "legacy_baseline",
     "live_row",

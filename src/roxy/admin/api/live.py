@@ -38,7 +38,7 @@ from typing import Annotated, Any, Final
 
 from fastapi import Path, Query, Request
 
-from roxy.admin.api.common import AdminSession, ApiError, area_router, validation_error
+from roxy.admin.api.common import MAX_ROW_ID, AdminSession, ApiError, area_router, validation_error
 from roxy.deps import get_ctx
 from roxy.metrics import read_dashboard
 from roxy.metrics.capture import CAPTURE_EXPIRED_MESSAGE, CAPTURE_OFF_MESSAGE, CapturePolicy, capture_state, get_capture
@@ -89,7 +89,7 @@ async def live_rows(
     endpoint: Text = None,
     q: Text = None,
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
-    before: Annotated[int | None, Query(ge=1)] = None,
+    before: Annotated[int | None, Query(ge=1, le=MAX_ROW_ID)] = None,
 ) -> dict[str, Any]:
     """The newest matching requests of every worker, newest first (see the module docstring)."""
     query = _query(outcome, reason, status, egress, cache, client, endpoint, q)

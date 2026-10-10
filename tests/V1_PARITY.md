@@ -21,17 +21,11 @@ the behavior is fixed. Whoever fixes it removes the marker and runs the script a
 
 | Rows | Covered by v2 tests | Covered with a `tests/parity/` test | Intentionally changed | Empty | Of the covered rows: pinned by an open finding |
 |---|---|---|---|---|---|
-| 781 | 365 | 233 | 183 | 0 | 17 |
+| 781 | 365 | 233 | 183 | 0 | 0 |
 
 ## Open findings
 
-| Finding | Strict xfail test | v1 rows | Reason |
-|---|---|---|---|
-| parity-1 | `tests/parity/test_v1_public.py::test_v1_post_to_the_home_page_is_a_json_405_with_allow` | smoke_test.py:140, smoke_test.py:141, smoke_test.py:142 | finding parity-1: POST / is answered 404 'Not a Roblox URL' by the proxy catch-all (a not_roblox refusal that the tarpit may hold) instead of v1's instant JSON 405 with an Allow header |
-| parity-2 | `tests/parity/test_v1_public.py::test_v1_proxy_probes_reach_the_probe_log` | smoke_test.py:188, smoke_test.py:1255 | finding parity-2: proxy probes (non-Roblox URL, unsafe URL, auth smuggling) feed the spam and bot detectors but never reach the Security probe log; only admin login probes and middleware client errors are recorded |
-| parity-3 | `tests/parity/test_v1_visitors.py::test_v1_anonymous_admin_page_visits_are_counted_and_known_admins_are_not` | smoke_test.py:440, smoke_test.py:445, smoke_test.py:967 | finding parity-3: GET /admin never records an admin page visit (nothing calls record_visit('admin') or record_admin_visit_discount), so the Admin Page Visits tile of rows 19 and 130 always reads 0 |
-| parity-4 | `tests/parity/test_v1_metrics.py::test_v1_a_reset_counter_resumes_from_zero_and_nothing_comes_back` | smoke_test.py:428, smoke_test.py:1333, smoke_test.py:1758 | finding parity-4: a traffic reset deletes the rollup rows but not what the recorder still holds in memory; the next flush writes the counts from before the reset back (v1 ClearEpochs prevented this) |
-| parity-5 | `tests/parity/test_v1_upstream.py::test_v1_egress_health_says_when_it_last_worked_and_what_failed_last` | smoke_test.py:1353, smoke_test.py:1354, smoke_test.py:1355, smoke_test.py:2096, smoke_test.py:2097, smoke_test.py:2103 | finding parity-5: the per-egress health cards (GET /upstream/egress) give counts and rates only; v1's LastSuccessAt, LastErrorAt and LastError (parity row 71) and the last failed status and endpoint of its request failure log (row 72) have no v2 counterpart beyond the 15 minute Live rows |
+None: every covered row passes.
 
 ## tests/smoke_test.py
 
@@ -73,7 +67,7 @@ the behavior is fixed. Whoever fixes it removes the marker and runs the script a
 | smoke_test.py:177 | `Heartbeat reports idle timeout` | Heartbeat JSON has `IdleTimeout == config.ADMIN_SESSION_IDLE_TIMEOUT` (120; payload `{OK, IdleTimeout, HeartbeatInterval}`, `index.py:377-390`). | `tests/unit/admin_auth/test_admin_auth_flow.py::test_heartbeat_extends_only_with_recent_input` |
 | smoke_test.py:184 | `Diagnostics -> 200` | `GET /admin/diagnostics` (JSON) returns 200. | intentionally changed: the one diagnostics document is split into the admin API areas, each with its own read model (plan 14.1, DESIGN 13); covered by `tests/integration/admin_api/test_api_common.py::test_mounted_area_routes_are_live_behind_the_real_guards` |
 | smoke_test.py:187 | `f"Diagnostics payload has {key}"` | Diagnostics JSON has the keys TrafficMinutes, ServerTime, WorkerStartedAt, ExploitSummary, Settings and Pause (one call site, 6 runs). | intentionally changed: the diagnostics keys became admin API areas: traffic series, the worker fleet, the probe log, the settings listing and the pause state (plan 14.1, DESIGN 13); covered by `tests/integration/admin_api/test_api_traffic.py::test_requests_stacked_by_outcome_with_compare`, `tests/integration/admin_api/test_api_system.py::test_fleet_has_the_parity_row_84_fields_and_both_colors`, `tests/integration/admin_api/test_api_security.py::test_probes_ring_summary_and_crawls`, `tests/integration/admin_api/test_api_settings.py::test_listing_has_every_setting_grouped_with_values_and_metadata`, `tests/integration/admin_api/test_api_protection.py::test_pause_message_schedule_and_drops_since` |
-| smoke_test.py:188 | `405 probe was recorded in exploit summary` | `ExploitSummary` has a reason containing `HTTP 405` (the probe from line 140; v1 reason text `HTTP 405 via POST /`, `index.py:2225`). | `tests/parity/test_v1_public.py::test_v1_proxy_probes_reach_the_probe_log`, `tests/unit/core/test_core_middleware.py::test_client_errors_reach_the_probe_hook` |
+| smoke_test.py:188 | `405 probe was recorded in exploit summary` | `ExploitSummary` has a reason containing `HTTP 405` (the probe from line 140; v1 reason text `HTTP 405 via POST /`, `index.py:2225`). | `tests/parity/test_v1_public.py::test_v1_proxy_probes_reach_the_probe_log`, `tests/unit/core/test_core_middleware.py::test_client_errors_reach_the_probe_hook`, `tests/parity/test_v1_public.py::test_v1_post_to_the_home_page_is_a_json_405_with_allow` |
 
 ### S004 Presence-based session expiry (smoke_test.py line 194)
 
@@ -151,8 +145,8 @@ the behavior is fixed. Whoever fixes it removes the marker and runs the script a
 
 | v1 location | v1 check | What it checks | v2 coverage |
 |---|---|---|---|
-| smoke_test.py:440 | `Unknown browser visit counts` | Anonymous `GET /admin` from a fresh client (10.5.5.5) raises `PageVisits.admin` by exactly 1. | `tests/parity/test_v1_visitors.py::test_v1_anonymous_admin_page_visits_are_counted_and_known_admins_are_not` |
-| smoke_test.py:445 | `Known-admin browser visit does NOT count` | A client with cookie `roxy_admin_seen=1` (10.5.5.6) does not raise `PageVisits.admin`. | `tests/parity/test_v1_visitors.py::test_v1_anonymous_admin_page_visits_are_counted_and_known_admins_are_not` |
+| smoke_test.py:440 | `Unknown browser visit counts` | Anonymous `GET /admin` from a fresh client (10.5.5.5) raises `PageVisits.admin` by exactly 1. | `tests/parity/test_v1_visitors.py::test_v1_anonymous_admin_page_visits_are_counted_and_known_admins_are_not`, `tests/parity/test_v1_visitors.py::test_v1_the_owners_first_login_takes_back_its_own_admin_page_visit` |
+| smoke_test.py:445 | `Known-admin browser visit does NOT count` | A client with cookie `roxy_admin_seen=1` (10.5.5.6) does not raise `PageVisits.admin`. | `tests/parity/test_v1_visitors.py::test_v1_anonymous_admin_page_visits_are_counted_and_known_admins_are_not`, `tests/parity/test_v1_visitors.py::test_v1_the_owners_first_login_takes_back_its_own_admin_page_visit` |
 | smoke_test.py:446 | `Login response set the admin-seen cookie` | Login set the `roxy_admin_seen` cookie on the admin client. Passes vacuously if the test client has no `_cookies` attribute. | `tests/parity/test_v1_visitors.py::test_v1_login_marks_the_browser_as_a_known_admin` |
 
 ### S010 Wildcard endpoint blocking (smoke_test.py line 451)

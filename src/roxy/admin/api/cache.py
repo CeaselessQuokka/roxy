@@ -12,7 +12,8 @@ What this is
     * `GET /cache/spread`: the key spread diagnostic (row 65).
     * The browser (row 66): `GET /cache/entries` (search, sort, page), `GET /cache/entries/{id}` (inspect, body
       included), `POST /cache/entries/{id}/refresh` (fetch it from Roblox again, POST entries too, since v2 keeps
-      the request body), and `POST /cache/purge` by id, pattern (glob or regex), host, rule, expired, or all.
+      the request body), and `POST /cache/purge` by id, pattern (glob or regex), host, rule, the browser search
+      (`search`: exactly what the same `q` lists, one shared condition, v1 bug 4), expired, or all.
 
 Why it exists
     The cache is Roxy's strongest defense against Roblox rate limits (plan 2.5), and v1's Response Cache section was
@@ -51,6 +52,7 @@ from urllib.parse import unquote
 from fastapi import Body, Depends, Path, Query, Request
 from pydantic import Field, ValidationError
 
+from roxy.admin.api import common
 from roxy.admin.api.common import (
     AdminSession,
     ApiBody,
@@ -66,6 +68,7 @@ from roxy.admin.api.common import (
     area_router,
     collect_pages,
     conflict,
+    export_pages,
     export_table,
     kpi_from_read_model,
     not_found,
@@ -149,7 +152,7 @@ TILE_KEYS: Final[tuple[str, ...]] = (
 )
 
 ENDPOINT_COLUMNS: Final[tuple[Column, ...]] = (
-    Column("key", "Endpoint", "The endpoint template (ids collapsed into placeholders)."),
+    Column("key", "Endpoint", "The endpoint template (ids collapsed into placeholders).", caller_text=True),
     Column("requests", "Requests", METRICS["requests"].description, "requests"),
     Column("hit_ratio", "Hit ratio", METRICS["hit_ratio"].description, "ratio"),
     Column("cache_hit", "Hits", "Answered from a fresh copy: Roblox never saw these.", "requests"),
@@ -200,7 +203,12 @@ RULE_COLUMNS: Final[tuple[Column, ...]] = (
 RULES_SPEC: Final = TableSpec(name="cache_rules", columns=RULE_COLUMNS, default_sort="id", default_order="asc")
 
 BROWSER_COLUMNS: Final[tuple[Column, ...]] = (
-    Column("key", "Question", "The exact question this answer is for: method, endpoint and every parameter."),
+    Column(
+        "key",
+        "Question",
+        "The exact question this answer is for: method, endpoint and every parameter.",
+        caller_text=True,
+    ),
     Column("status", "Status", "The status Roblox answered with.", sortable=False),
     Column("size", "Size", "Bytes this answer counts against the disk budget.", "bytes"),
     Column("hits", "Times reused", "How many times this answer was handed to a caller.", "count"),
@@ -277,9 +285,10 @@ class IgnoredParamBody(ApiBody):
 
 
 class PurgeBody(ApiBody):
-    """What to purge (row 66). `value` is the id, pattern, host or rule id; `all` needs `confirm: true`."""
+    """What to purge (row 66). `value` is the id, pattern, host, rule id, or the browser's search text (`search`:
+    "Purge matching" removes exactly what `GET /cache/entries?q=` lists, v1 bug 4); `all` needs `confirm: true`."""
 
-    scope: Literal["id", "pattern", "host", "rule", "expired", "all"]
+    scope: Literal["id", "pattern", "host", "rule", "search", "expired", "all"]
     value: str | None = Field(default=None, max_length=MAX_PATTERN_CHARS)
     type: Literal["glob", "regex"] = "glob"
     include_stale: bool = False
@@ -368,6 +377,7 @@ async def cache_stats(request: Request, _admin: AdminSession, tr: TimeRangeDep) 
             "recent": {name: queries.totals_sync(conn, w) for name, w in recent},
             "history": read_history.cache_summary(conn, window.start, window.end),
             "resets": queries.reset_annotations(conn, window.start, window.end),
+            "baseline_resets": queries.reset_annotations(conn, other.start, other.end),
         }
 
     data = await ctx.dbs.metrics.read(read)
@@ -375,7 +385,14 @@ async def cache_stats(request: Request, _admin: AdminSession, tr: TimeRangeDep) 
     tiles = []
     for key in TILE_KEYS:
         delta, delta_pct = _delta(current.get(key), previous.get(key))
-        tiles.append(kpi_from_read_model(key, {"value": current.get(key), "delta": delta, "delta_pct": delta_pct}))
+        tile = {"value": current.get(key), "delta": delta, "delta_pct": delta_pct}
+        # Plan 6.8 (finding LOGICFIX-1): a reset of this tile's data in either window replaces its delta.
+        queries.mark_kpi_partial(tile, key, data["resets"], data["baseline_resets"], tz)
+        tiles.append(kpi_from_read_model(key, tile) | ({"partial": True} if tile.get("partial") else {}))
+    # The page notices: every reset inside the range (as before), and a reset of the comparison window that made a
+    # tile partial (its tile says so; the page names it too).
+    listed = {row.get("id") for row in data["resets"]}
+    reset_rows = [*data["resets"], *queries.touching_resets(data["baseline_resets"], TILE_KEYS, seen=listed)]
     cs = CacheSettings.read(ctx.settings)
     cache = getattr(ctx, "cache", None)
     size: dict[str, Any] = {"rows": None, "bytes": None}
@@ -421,7 +438,7 @@ async def cache_stats(request: Request, _admin: AdminSession, tr: TimeRangeDep) 
             "memory_entries": cs.memory_entries,
             "memory_bytes": cs.memory_bytes,
         },
-        "notices": reset_notices(data["resets"], tz=tz),
+        "notices": reset_notices(reset_rows, tz=tz),
     }
 
 
@@ -503,16 +520,18 @@ async def cache_endpoints(
     if fmt is not None:
 
         async def fetch_all(page: int, size: int) -> tuple[list[Any], int]:
+            # One page at a time, joined with its negative counts and rule columns before the next is read
+            # (finding mpjobs-5: a download holds one page of rows, never the whole table).
             page_spec = dataclasses.replace(tq.metrics_page(), page=page, size=size)
             data = await queries.endpoint_table(db, window, page=page_spec)
-            return list(data["rows"]), int(data["total"])
+            rows = list(data["rows"])
+            counts = await negatives([str(row["key"]) for row in rows])
+            for row in rows:
+                row["negative_hits"] = counts.get(str(row["key"]), 0)
+            _rule_columns(ctx, rows)
+            return rows, int(data["total"])
 
-        rows, total = await collect_pages(fetch_all)
-        counts = await negatives(None)
-        for row in rows:
-            row["negative_hits"] = counts.get(str(row["key"]), 0)
-        _rule_columns(ctx, rows)
-        return await export_table(request, admin, ENDPOINTS_SPEC, rows, fmt, total=total, tq=tq, tr=tr)
+        return await export_pages(request, admin, ENDPOINTS_SPEC, fetch_all, fmt, tq=tq, tr=tr)
     data = await queries.endpoint_table(db, window, page=tq.metrics_page())
     counts = await negatives([str(row["key"]) for row in data["rows"]])
     for row in data["rows"]:
@@ -579,7 +598,7 @@ async def cache_rule_update(
     admin: AdminSession,
     _csrf: CsrfChecked,
     body: CacheRuleUpdate,
-    rule_id: Annotated[int, Path(ge=1)],
+    rule_id: common.RowId,
 ) -> dict[str, Any]:
     """Change a cache rule; by default drop the answers stored under it (and under its new pattern)."""
     ctx = get_ctx(request)
@@ -613,7 +632,7 @@ async def cache_rule_delete(
     request: Request,
     admin: AdminSession,
     _csrf: CsrfChecked,
-    rule_id: Annotated[int, Path(ge=1)],
+    rule_id: common.RowId,
     body: Annotated[RemoveBody | None, Body()] = None,
 ) -> dict[str, Any]:
     """Remove a cache rule; by default drop the answers stored under it (they would keep its lifetime)."""
@@ -1012,10 +1031,11 @@ async def cache_entry_refresh(
 
 @router.post("/purge")
 async def cache_purge(request: Request, admin: AdminSession, _csrf: CsrfChecked, body: PurgeBody) -> dict[str, Any]:
-    """Purge by id, pattern (glob or regex), host, rule, expired, or all (`confirm: true`); audited first."""
+    """Purge by id, pattern (glob or regex), host, rule, the browser search (`search`: exactly the entries the same
+    `q` lists, one shared matcher), expired, or all (`confirm: true`); audited first."""
     reason = require_reason(body.reason, required=False)
     value = (body.value or "").strip()
-    if body.scope in ("id", "pattern", "host", "rule") and not value:
+    if body.scope in ("id", "pattern", "host", "rule", "search") and not value:
         raise validation_error({"value": f"Give the {body.scope} to purge."}, "Nothing to purge.")
     if body.scope == "all" and not body.confirm:
         raise validation_error(
@@ -1034,6 +1054,11 @@ async def cache_purge(request: Request, admin: AdminSession, _csrf: CsrfChecked,
         if not value.isdigit():
             raise validation_error({"value": "A rule id is a whole number."})
         scope = PurgeScope.rule(int(value))
+    elif body.scope == "search":
+        try:
+            scope = read_browser.purge_scope(value)
+        except ValueError as exc:
+            raise validation_error({"value": str(exc)}, "The purge is not valid.") from None
     elif body.scope == "expired":
         scope = PurgeScope.expired(include_stale=body.include_stale)
     else:

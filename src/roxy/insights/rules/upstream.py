@@ -236,8 +236,7 @@ def settings_valid(ctx: InsightContext, changes: Mapping[str, Any]) -> bool:
 
 def routing_change(ctx: InsightContext, template: str, mode: str, note: str) -> ProposedChange | None:
     """A `routing_rule` change that gives `template` the routing `mode` (None when it already has it)."""
-    pattern = simulate.template_pattern(template)
-    own = next((row for row in ctx.rules.routing_rules if row.pattern == pattern), None)
+    own = simulate.own_template_row(ctx.rules.routing_rules, template)
     if own is not None:
         if own.mode == mode and own.enabled:
             return None
@@ -251,12 +250,13 @@ def routing_change(ctx: InsightContext, template: str, mode: str, note: str) -> 
             current=rule_columns(own),
             proposed=proposed,
         )
+    match = simulate.template_match(template)  # exactly this template, never its subtree (insights-8)
     return ProposedChange(
         "routing_rule",
         table="rules_routing",
-        match={"pattern": pattern, "type": "glob"},
+        match=dict(match),
         current=None,
-        proposed={"pattern": pattern, "type": "glob", "mode": mode, "note": note[:200]},
+        proposed={**match, "mode": mode, "note": note[:200]},
     )
 
 
@@ -307,7 +307,6 @@ async def cache_change(
     if raise_swr:
         wanted = max(effective_swr * SWR_RAISE_FACTOR, round(ttl * SWR_SHARE_OF_TTL), 1)
         swr = int(min(MAX_CACHE_RULE_STALE_TTL_S, max(swr, wanted)))
-    pattern = simulate.template_pattern(template)
     base = own if own is not None else covering
     methods = [str(m) for m in base.methods] if base is not None else ["GET"]
     if method not in methods:
@@ -328,14 +327,14 @@ async def cache_change(
         )
     if covering is not None and ttl == current_ttl and swr == rule_swr and method in covering.methods:
         return None
+    match = simulate.template_match(template)  # exactly this template, never its subtree (insights-8)
     return ProposedChange(
         "rule_upsert",
         table="rules_cache",
-        match={"pattern": pattern, "type": "glob"},
+        match=dict(match),
         current=None,
         proposed={
-            "pattern": pattern,
-            "type": "glob",
+            **match,
             "ttl": ttl,
             "stale_ttl": swr,
             "methods": methods_text,
@@ -1218,8 +1217,8 @@ class Up4xxSpike(Rule):
 
     async def _stop_paying(self, ctx: InsightContext, template: str, method: str, status: str) -> ProposedChange:
         """A negative cache rule when the cache can store the refusal (7.7: 400, 403, 404, 410 on GET), else a
-        block of the endpoint with a clear message."""
-        pattern = simulate.template_pattern(template)
+        block of the endpoint with a clear message. New rows name exactly this template (finding insights-8)."""
+        match = simulate.template_match(template)
         if method == "GET" and status.isdigit() and int(status) in CACHEABLE_ERROR_STATUSES:
             covering, own = own_cache_rule(ctx, template)
             effective = int(own.negative_ttl) if own is not None and int(own.negative_ttl) > 0 else 0
@@ -1237,18 +1236,17 @@ class Up4xxSpike(Rule):
                 return ProposedChange(
                     "rule_upsert",
                     table="rules_cache",
-                    match={"pattern": pattern, "type": "glob"},
+                    match=dict(match),
                     current=None,
                     proposed={
-                        "pattern": pattern,
-                        "type": "glob",
+                        **match,
                         "ttl": effective_ttl(ctx, covering),
                         "negative_ttl": negative,
                         "methods": "GET",
                         "origin": "recommendation",
                     },
                 )
-        existing = next((row for row in ctx.rules.endpoint_blocks if row.pattern == pattern), None)
+        existing = simulate.own_template_row(ctx.rules.endpoint_blocks, template)
         message = f"Roblox currently refuses this endpoint ({status}); Roxy blocks it until Roblox accepts it again."
         if existing is not None:
             return ProposedChange(
@@ -1261,9 +1259,9 @@ class Up4xxSpike(Rule):
         return ProposedChange(
             "rule_upsert",
             table="rules_endpoint_block",
-            match={"pattern": pattern, "type": "glob"},
+            match=dict(match),
             current=None,
-            proposed={"pattern": pattern, "type": "glob", "message": message, "note": "UP-4XX-SPIKE"},
+            proposed={**match, "message": message, "note": "UP-4XX-SPIKE"},
         )
 
 
@@ -1392,17 +1390,18 @@ class UpCsrfLoop(Rule):
         evidence.links.append(endpoint_link(template))
         changes: list[ProposedChange] = []
         if never_settles:
-            pattern = simulate.template_pattern(template)
-            existing = next((row for row in ctx.rules.endpoint_blocks if row.pattern == pattern), None)
+            # A block of exactly this template: it must not refuse its siblings (finding insights-8).
+            existing = simulate.own_template_row(ctx.rules.endpoint_blocks, template)
             message = "Roblox does not accept writes to this endpoint through Roxy right now; please try again later."
             if existing is None:
+                match = simulate.template_match(template)
                 changes.append(
                     ProposedChange(
                         "rule_upsert",
                         table="rules_endpoint_block",
-                        match={"pattern": pattern, "type": "glob"},
+                        match=dict(match),
                         current=None,
-                        proposed={"pattern": pattern, "type": "glob", "message": message, "note": "UP-CSRF-LOOP"},
+                        proposed={**match, "message": message, "note": "UP-CSRF-LOOP"},
                     )
                 )
             elif not existing.enabled:

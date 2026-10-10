@@ -4,7 +4,7 @@ What this is
     Ports of v1 smoke lines 2132 to 2139 (S070: `/health` raises the request count but not the proxied count;
     probes, refused or not, raise the proxied count), lines 2261 to 2292 (S072: status codes are attributed to
     whoever produced them) and lines 428 and 1333 (S008 and S044: after a reset of the request counters, counting
-    resumes from zero and nothing from before the reset comes back; a strict xfail, finding parity-4).
+    resumes from zero and nothing from before the reset comes back; finding parity-4, fixed).
 
 Why it exists
     The worker table of the System page (parity row 84) separates requests that reached the proxy route from
@@ -29,7 +29,6 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
-import pytest
 
 from roxy.abuse.throttle_all import set_throttle_all
 from roxy.config.audit import Actor
@@ -71,15 +70,9 @@ async def reset_traffic(admin: Any) -> None:
     assert run.json()["status"] == "done"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "finding parity-4: a traffic reset deletes the rollup rows but not what the recorder still holds in memory; "
-        "the next flush writes the counts from before the reset back (v1 ClearEpochs prevented this)"
-    ),
-)
 async def test_v1_a_reset_counter_resumes_from_zero_and_nothing_comes_back(parity: Any) -> None:
-    """v1 smoke lines 428 and 1333: requests counted before the reset never reappear after it."""
+    """v1 smoke lines 428 and 1333: requests counted before the reset never reappear after it (finding parity-4,
+    fixed by the reset fence: `metrics/recorder.py ResetFences`, `admin/api/data.py fence_pending_counts`)."""
     parity.roblox.route(host="games.roblox.com").mock(return_value=httpx.Response(200, json={"ok": True}))
     for n in range(3):
         assert (await parity.get(f"/games.roblox.com/v1/games?u={n}")).status_code == 200
@@ -92,7 +85,7 @@ async def test_v1_a_reset_counter_resumes_from_zero_and_nothing_comes_back(parit
 
 
 async def test_v1_control_a_reset_after_a_flush_leaves_only_new_requests(parity: Any) -> None:
-    """Control for the strict xfail above: when the recorder had flushed before the reset, the reset deletes those
+    """Control for the test above: when the recorder had flushed before the reset, the reset deletes those
     rows and only the request made afterwards is counted, so the measurement itself is sound."""
     parity.roblox.route(host="games.roblox.com").mock(return_value=httpx.Response(200, json={"ok": True}))
     for n in range(3):

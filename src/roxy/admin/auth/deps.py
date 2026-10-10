@@ -243,6 +243,10 @@ def require_admin(
         return principal
 
     dependency.__name__ = f"require_admin_{scope}"
+    # The guard's options as plain attributes, so the mount checks (`roxy.admin.api.guard_options`) read them
+    # explicitly instead of from the closure: a bootstrap-admitting guard outside enrollment refuses to mount
+    # (finding apisec-9).
+    dependency.__dict__.update(scope=scope, allow_bootstrap=allow_bootstrap, activity=activity)
     return dependency
 
 

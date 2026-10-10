@@ -385,10 +385,13 @@
     },
     "ClientRow": {
       "additionalProperties": false,
+      "description": "One of the top places or addresses of the window. `bot_score` (addresses only) is the plan 10.7 score the\nabuse producers recorded for the address, 0 to 100 (higher looks more automated): the largest of its latest\nrecorded hour in the last 25 hours. It is null when no score is recorded for the address, and for a place.",
       "properties": {
         "bot_score": {
           "anyOf": [
             {
+              "maximum": 100,
+              "minimum": 0,
               "type": "number"
             },
             {

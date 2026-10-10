@@ -10,10 +10,11 @@ What this is
 Why it exists
     The fix tests call `CredentialManager.replace` directly with a bare value. An admin uses the dashboard: the
     paste may be percent-encoded, carry the cookie pair, be lowercased in the reason, or be repeated %XX encoded,
-    and a rotator URL embeds its password percent-encoded. The registry keeps three values per name and registers
-    the bootstrap rotator URL only at start (`RotatorPool.start`), so after three UI replaces the bootstrap value is
-    evicted, and `revert_to_bootstrap` (the Egress page's "use the bootstrap file again") does not register it again:
-    the reason of that revert, and every later redaction, no longer know the gateway password in use.
+    and a rotator URL embeds its password percent-encoded. The registry keeps three values per name; the bootstrap
+    rotator URL used to share its names with every URL tried from the Egress page, so after three UI replaces it was
+    evicted, and the reason of `revert_to_bootstrap` (the Egress page's "use the bootstrap file again"), and every
+    later redaction, no longer knew the gateway password in use. Finding W2H-1, fixed: the bootstrap URL and the URL
+    in use have registry names of their own (`rotator.BOOTSTRAP_SECRET_NAMES`, `IN_USE_SECRET_NAMES`).
 
 How it works
     The shared admin API fixtures (`conftest.py` here): the real app, a signed-in admin (the login gives a fresh
@@ -167,21 +168,17 @@ async def test_cred2_api_rotator_url_password_spellings_never_reach_a_record(
     assert [variant for variant in _variants(blob) if password in variant] == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding W2H-1: after three rotator URL replaces the bootstrap URL is evicted from SecretRegistry and "
-    "revert_to_bootstrap does not register it again, so its gateway password is stored in clear",
-)
 async def test_cred2_reverting_to_the_bootstrap_gateway_keeps_its_password_redacted(
     api_app: Any, api: Any, api_json: Any, fake_secrets: dict[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Three gateway URLs are tried from the Egress page, then the bootstrap file is used again with a reason that
-    repeats its password (a paste into the wrong box). The password in use must stay redacted everywhere."""
+    """Finding W2H-1 (fixed): four gateway URLs are tried from the Egress page (one more than the registry keeps per
+    name), then the bootstrap file is used again with a reason that repeats its password (a paste into the wrong
+    box). The password in use must stay redacted everywhere."""
     caplog.set_level(logging.DEBUG)
     bootstrap_url = fake_secrets["rotator_url"]
     bootstrap_password = bootstrap_url.split("://", 1)[1].rsplit("@", 1)[0].split(":", 1)[1]
     assert redact_text(f"x {bootstrap_password} y") == "x [redacted] y"  # control: known while the worker is fresh
-    for attempt in range(3):
+    for attempt in range(4):
         url = f"http://try{attempt}:fake{secrets.token_hex(10)}@127.0.0.1:9"
         response = await api.put("rotator/url", json={"url": url, "reason": f"attempt {attempt}"})
         assert response.status_code == 200, response.text

@@ -238,7 +238,7 @@ async def check_target(
 
 
 @router.get("/{row_id}")
-async def get_row(request: Request, _admin: AdminSession, row_id: int) -> dict[str, Any]:
+async def get_row(request: Request, _admin: AdminSession, row_id: common.RowId) -> dict[str, Any]:
     """One allowlist row."""
     with common.service_errors():
         row = await rules_service(request).get_row(TABLE, row_id)
@@ -249,7 +249,7 @@ async def get_row(request: Request, _admin: AdminSession, row_id: int) -> dict[s
 
 @router.patch("/{row_id}")
 async def update_row(
-    request: Request, admin: AdminFreshMfa, _csrf: CsrfChecked, row_id: int, body: AllowlistPatch
+    request: Request, admin: AdminFreshMfa, _csrf: CsrfChecked, row_id: common.RowId, body: AllowlistPatch
 ) -> dict[str, Any]:
     """Change an allowlist row (fresh second factor and a reason required; audited).
 
@@ -299,7 +299,7 @@ async def update_row(
 
 @router.delete("/{row_id}")
 async def delete_row(
-    request: Request, admin: AdminSession, _csrf: CsrfChecked, row_id: int, body: DeleteBody | None = None
+    request: Request, admin: AdminSession, _csrf: CsrfChecked, row_id: common.RowId, body: DeleteBody | None = None
 ) -> dict[str, Any]:
     """Remove an allowlist row: the endpoint is never fetched with the credential again (audited)."""
     reason = body.reason if body is not None else ""

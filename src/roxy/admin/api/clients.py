@@ -3,11 +3,13 @@
 What this is
     The routes behind plan 14.1 "Clients" (parity rows 73 and 92):
       * `GET /clients/ips` and `GET /clients/places`: every client in the range with requests, refusals, served
-        answers, bytes, Rate1/5/60 (trailing windows, no flapping at :00), the busiest endpoint; IPs also carry the
-        bot score and whether a ban or bypass entry covers them, places their cached experience name.
+        answers, bytes, Rate1/5/60 (trailing windows, no flapping at :00), the busiest endpoint, when it was last
+        seen and its peer count (v1's "Places" of an IP and "IPs" of a place); IPs also carry the bot score and
+        whether a ban or bypass entry covers them, places their cached experience name.
       * `GET /clients/ips/{ip}` and `GET /clients/places/{place}`: the per-client page: totals, timeline and busiest
         endpoints for the range, the last hour with its rates, refusals by reason, bans, bypass, strikes and the
-        penalty in progress, the bot score with each signal, recent probes and requests.
+        penalty in progress, the bot score with each signal and the recorded fleet score, its peers (the places an
+        IP called as, the IPs a place was called from), recent probes and requests.
       * Actions: ban, bypass and a rule for an IP (a deny list entry); ban and a rule for a place (a request filter
         on its `Roblox-Id` header, v1's "Block" button).
       * `POST /clients/lookup` and `POST /clients/places/{place}/lookup`: "Identify an experience" (row 92), the
@@ -20,13 +22,19 @@ Why it exists
     justify them. Every action goes through the same services as the Protection page (audit row, `config_version`).
 
 How it works
-    - Tables come from `metrics/queries.py client_table` (sorted and paged there); a page's IPs then get their bot
-      score: the per-worker tracker of `abuse/bot.py` (probe, refusal, timing and cache-busting history) plus the
-      User-Agent of the client's newest live row (kept 15 minutes). Without a recent request there is no
-      User-Agent, so the score is `null` with a note instead of a guess; header order is not stored, so that signal
-      reads as "fits a known client" (0). The tracker is this worker's view (`bot_score_scope`).
+    - Tables come from `metrics/queries.py client_table` (sorted and paged there, `last_seen` and `peers` included;
+      finding parity-7); a page's IPs then get their bot score: the per-worker tracker of `abuse/bot.py` (probe,
+      refusal, timing and cache-busting history) plus the User-Agent of the client's newest live row (kept 15
+      minutes). Without a recent request there is no User-Agent; then the score the fleet recorded for the address
+      in the last 25 hours answers (`client_score_hour`, written once a minute off the request path by every worker;
+      `metrics/read_client_extras.recorded_scores`), labeled `bot_score_source: "recorded"`, else it is `null`
+      instead of a guess. Header order is not stored, so that live signal reads as "fits a known client" (0). The
+      tracker is this worker's view (`bot_score_scope`).
     - Client pages read `metrics/read_clients.py` (range totals, timeline, busiest endpoints, refusals by reason),
-      `metrics/activity.py client_detail` (the last hour), the rules snapshot (bans, bypass) and hot.db `strikes`.
+      `metrics/read_client_extras.py` (peers, recorded scores), `metrics/activity.py client_detail` (the last
+      hour), the rules snapshot (bans, bypass) and hot.db `strikes`.
+    - Place ids are the `Roblox-Id` header (caller text), and so are the places in an IP's peer list: answers name
+      such fields in `caller_text`, and a page shows them escaped, never as markup (plan 9.16).
     - Place names in tables come only from the lookup cache (no upstream call per row); a client page offers the
       lookup button instead.
 
@@ -63,9 +71,9 @@ from roxy.admin.api.common import (
     TimeRange,
     TimeRangeDep,
     actor_for,
+    add_caller_text,
     area_router,
-    collect_pages,
-    export_table,
+    export_pages,
     not_found,
     request_id_of,
     run_mutation,
@@ -81,7 +89,7 @@ from roxy.config.constants import MAX_REASON_LENGTH
 from roxy.core.client_ip import limit_key
 from roxy.core.iphash import ip_hash
 from roxy.deps import get_ctx
-from roxy.metrics import queries, read_clients, security_events
+from roxy.metrics import queries, read_client_extras, read_clients, read_producers, security_events
 from roxy.metrics.activity import client_detail
 from roxy.rules.service import RuleChange, RulesService
 from roxy.upstream.internal import LOOKUP_TTL_S, PlaceLookup, place_lookup_for
@@ -95,6 +103,13 @@ MAX_BAN_MINUTES: Final = 365 * 24 * 60
 MAX_EXPIRY_HOURS: Final = 24 * 3650.0
 RECENT_PROBES: Final = 20
 RECENT_REQUESTS: Final = 10
+PEER_ROWS: Final = 50
+"""Peers listed on a client page (the count of all of them is `peers.total`)."""
+SCORE_LOOKBACK_S: Final = 25 * 3600
+"""Recorded bot scores of the last 25 hours answer (the same window the recommendation rules read)."""
+SCORE_HISTORY_HOURS: Final = 168
+"""Most recorded score hours a client page lists (a week of hours)."""
+BOT_SCORE_LIVE_NOTE: Final = "this worker's tracker with the client's newest request of the last 15 minutes"
 PLACE_PATTERN: Final = r"^[0-9]{1,20}$"
 _LOOKUP_KEYS: Final[dict[str, str]] = {
     "Query": "query",
@@ -218,20 +233,24 @@ async def _table(
 
     async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
         wanted = queries.Page(page=page, size=size, sort=tq.sort, descending=tq.descending, search=tq.q)
-        data = await queries.client_table(ctx.dbs.metrics, tr.window, client_type, now=now, page=wanted)
+        data = await queries.client_table(ctx.dbs.metrics, tr.window, client_type, now=now, page=wanted, extras=True)
         rows = [dict(row) for row in data["rows"]]
         await _decorate(ctx, client_type, rows, lookup)
         return rows, int(data["total"])
 
     with service_errors():
         if fmt is not None:
-            rows, total = await collect_pages(fetch)
-            return await export_table(request, admin, spec, rows, fmt, total=total, tq=tq, tr=tr)
+            return await export_pages(request, admin, spec, fetch, fmt, tq=tq, tr=tr)
         items, total = await fetch(tq.page, tq.page_size)
     answer = table_answer(spec, tq, items, total)
     answer["range"] = tr.info()
+    answer["peers_basis"] = read_client_extras.PEERS_BASIS
     if client_type == "ip":
         answer["bot_score_scope"] = "this_worker"
+        answer["bot_score_sources"] = {"this_worker": BOT_SCORE_LIVE_NOTE, "recorded": read_client_extras.SCORE_BASIS}
+        add_caller_text(answer, ["user_agent"])
+    else:
+        add_caller_text(answer, ["key", "name"])
     return answer
 
 
@@ -241,13 +260,23 @@ async def _decorate(ctx: Any, client_type: str, rows: list[dict[str, Any]], look
     now = ctx.clock.now()
     if client_type == "ip":
         keys = [str(row["key"]) for row in rows]
-        live = await ctx.dbs.metrics.read(lambda conn: read_clients.latest_user_agents(conn, keys))
+        since = int(now) - SCORE_LOOKBACK_S
+
+        def read(conn: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+            return read_clients.latest_user_agents(conn, keys), read_client_extras.recorded_scores(conn, keys, since)
+
+        live, recorded = await ctx.dbs.metrics.read(read)
         for row in rows:
             ip = str(row["key"])
             row["banned"] = snapshot.bans.match(ip=ip, place=None, ua_hash=None, now=now) is not None
             row["bypassed"] = snapshot.access.bypass.contains(ip, now)
             row["user_agent"] = (live.get(ip) or {}).get("user_agent")
-            row["bot_score"] = bot_score_for(ctx, ip, live.get(ip))["score"]
+            score = bot_score_for(ctx, ip, live.get(ip))["score"]
+            source: str | None = "this_worker" if score is not None else None
+            if score is None and ip in recorded:
+                score, source = recorded[ip]["score"], "recorded"
+            row["bot_score"] = score
+            row["bot_score_source"] = source
         return
     for row in rows:
         place = str(row["key"])
@@ -268,8 +297,35 @@ IP_SPEC: Final = TableSpec(
         Column("rate1", "Rate1", "Requests in the trailing 60 seconds.", "requests"),
         Column("rate5", "Rate5", "Requests in the trailing 5 minutes.", "requests"),
         Column("rate60", "Rate60", "Requests in the trailing hour.", "requests"),
-        Column("top_endpoint", "Top endpoint", "The busiest endpoint of its busiest minute.", sortable=False),
-        Column("bot_score", "Bot score", "0 to 100; null without a request in the last 15 minutes.", sortable=False),
+        Column(
+            "top_endpoint",
+            "Top endpoint",
+            "The busiest endpoint of its busiest minute.",
+            sortable=False,
+            caller_text=True,
+        ),
+        Column(
+            "last_seen",
+            "Last seen",
+            "Its newest request in the range, to the minute (to the hour or day for older, compacted data).",
+            "timestamp",
+        ),
+        Column(
+            "peers",
+            "Places",
+            "Distinct places (Roblox-Id) it called as in the range: one IP behind many places looks like a scraper "
+            "cycling ids (a lower bound under a flood, see peers_basis).",
+            "count",
+            sortable=False,
+        ),
+        Column(
+            "bot_score",
+            "Bot score",
+            "0 to 100: this worker's view of its last 15 minutes, else the score the fleet recorded in the last 25 "
+            "hours (bot_score_source); null when neither exists.",
+            sortable=False,
+        ),
+        Column("bot_score_source", "Score source", "this_worker, recorded, or null.", sortable=False),
         Column("banned", "Banned", "Whether an active ban covers the address.", sortable=False),
         Column("bypassed", "Bypassed", "Whether a bypass entry covers the address.", sortable=False),
     ),
@@ -278,8 +334,14 @@ IP_SPEC: Final = TableSpec(
 PLACE_SPEC: Final = TableSpec(
     name="client_places",
     columns=(
-        Column("key", "Roblox-Id", "The place id callers sent in the Roblox-Id header (a claim)."),
-        Column("name", "Experience", "Its name, when it was looked up in the last 10 minutes.", sortable=False),
+        Column("key", "Roblox-Id", "The place id callers sent in the Roblox-Id header (a claim).", caller_text=True),
+        Column(
+            "name",
+            "Experience",
+            "Its name, when it was looked up in the last 10 minutes.",
+            sortable=False,
+            caller_text=True,
+        ),
         Column("requests", "Requests", "Requests in the range.", "requests"),
         Column("refused", "Refused", "Requests Roxy refused.", "requests"),
         Column("refused_pct", "Refused %", "Refused share of its requests.", "percent"),
@@ -288,7 +350,27 @@ PLACE_SPEC: Final = TableSpec(
         Column("rate1", "Rate1", "Requests in the trailing 60 seconds.", "requests"),
         Column("rate5", "Rate5", "Requests in the trailing 5 minutes.", "requests"),
         Column("rate60", "Rate60", "Requests in the trailing hour.", "requests"),
-        Column("top_endpoint", "Top endpoint", "The busiest endpoint of its busiest minute.", sortable=False),
+        Column(
+            "top_endpoint",
+            "Top endpoint",
+            "The busiest endpoint of its busiest minute.",
+            sortable=False,
+            caller_text=True,
+        ),
+        Column(
+            "last_seen",
+            "Last seen",
+            "Its newest request in the range, to the minute (to the hour or day for older, compacted data).",
+            "timestamp",
+        ),
+        Column(
+            "peers",
+            "IPs",
+            "Distinct client addresses that sent this place id in the range: one game's servers are many IPs (a "
+            "lower bound under a flood, see peers_basis).",
+            "count",
+            sortable=False,
+        ),
         Column("banned", "Banned", "Whether an active place ban covers it.", sortable=False),
     ),
     default_sort="requests",
@@ -355,8 +437,10 @@ async def ip_page(
     start_ms, end_ms = tr.window.start * 1000, tr.window.end * 1000
     key_bytes = getattr(ctx.recorder, "ip_hash_key", None) or getattr(ctx, "ip_hash_key", None)
     hashed = ip_hash(address, key_bytes) if key_bytes else None
+    since = int(now) - SCORE_LOOKBACK_S
 
     def read(conn: Any) -> dict[str, Any]:
+        pieces = read_clients.client_pieces(conn, tr.window)
         return {
             "range": read_clients.client_range(conn, "ip", address, tr.window),
             "last_hour": client_detail(conn, "ip", address, now),
@@ -367,6 +451,9 @@ async def ip_page(
             "probes": security_events.ring(
                 conn, security_events.PROBE, since_ms=start_ms, until_ms=end_ms, ip=address, limit=RECENT_PROBES
             ),
+            "peers": read_client_extras.peer_list(conn, "ip", address, pieces, limit=PEER_ROWS),
+            "recorded": read_client_extras.recorded_scores(conn, [address], since).get(address),
+            "history": read_producers.client_score_history(conn, address, tr.window.start, limit=SCORE_HISTORY_HOURS),
         }
 
     with service_errors():
@@ -393,9 +480,19 @@ async def ip_page(
         "bypassed": snapshot.access.bypass.contains(address, now),
         "denied": snapshot.access.deny.contains(address, now),
         "strikes": strikes,
-        "bot_score": {**bot_score_for(ctx, address, live[0] if live else None), "scope": "this_worker"},
+        "bot_score": {
+            **bot_score_for(ctx, address, live[0] if live else None),
+            "scope": "this_worker",
+            # The fleet's recorded score (lane_producers request 6): the latest scored hour of the last 25 hours,
+            # and the hours of the range (oldest first), from every worker.
+            "recorded": data["recorded"],
+            "recorded_basis": read_client_extras.SCORE_BASIS,
+            "recorded_history": data["history"],
+        },
+        "peers": data["peers"],
         "recent_probes": data["probes"]["items"],
         "recent_requests": live,
+        "caller_text": ["peers.items.key", "recent_requests"],
     }
 
 
@@ -409,11 +506,13 @@ async def place_page(
     start_ms, end_ms = tr.window.start * 1000, tr.window.end * 1000
 
     def read(conn: Any) -> dict[str, Any]:
+        pieces = read_clients.client_pieces(conn, tr.window)
         return {
             "range": read_clients.client_range(conn, "place", place, tr.window),
             "last_hour": client_detail(conn, "place", place, now),
             "refusals": read_clients.client_refusals(conn, start_ms=start_ms, end_ms=end_ms, place=place),
             "live": read_clients.recent_live(conn, place=place, limit=RECENT_REQUESTS),
+            "peers": read_client_extras.peer_list(conn, "place", place, pieces, limit=PEER_ROWS),
         }
 
     with service_errors():
@@ -433,7 +532,9 @@ async def place_page(
         "refusals": data["refusals"],
         "ban": _ban(ctx.rules.snapshot, now, place=place),
         "lookup": _snake(cached) if cached else None,
+        "peers": data["peers"],
         "recent_requests": data["live"],
+        "caller_text": ["lookup", "recent_requests"],
     }
 
 

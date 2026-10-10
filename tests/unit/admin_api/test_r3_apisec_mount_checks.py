@@ -1,14 +1,14 @@
 """Review round 3 (lens apisec): what the admin API mount checks accept as "the admin guard".
 
 What this is
-    Strict-xfail test for finding apisec-9. `roxy.admin.api.check_route` (used for every area router, the event
-    stream and the P11 pages router) accepts a route when its dependency tree holds a callable named
-    `require_admin_session` or `require_admin_fresh_mfa` from `roxy.admin.auth.deps`. Every instance made by
+    Tests for finding apisec-9 (fixed; it was a strict xfail). `roxy.admin.api.check_route` (used for every area
+    router, the event stream and the P11 pages router) accepted a route when its dependency tree held a callable
+    named `require_admin_session` or `require_admin_fresh_mfa` from `roxy.admin.auth.deps`. Every instance made by
     `require_admin(...)` carries those names, including `require_admin("session", allow_bootstrap=True)`, the
     enrollment guard that admits a bootstrap session (password plus emailed code, before any authenticator is
-    enrolled, D5). A route guarded that way passes the mount check and the route discovery test
-    (`guard_scopes` reports it as `session`), so the checks cannot catch the one guard that must never appear
-    outside the enrollment routes.
+    enrolled, D5). Now the checks read each guard's options (`guard_options`), refuse a guard that admits bootstrap
+    sessions outside `deps.ENROLL_PATHS` (also when its options cannot be read: fail closed), and `guard_scopes`
+    reports such a guard as `bootstrap` too, so the route discovery test sees it.
 
 Why it exists
     DESIGN.md 13.1 makes the mount checks the gate that refuses to start an app with a weaker route, precisely so
@@ -33,9 +33,9 @@ import pytest
 from fastapi import Depends
 from fastapi.routing import APIRoute
 
-from roxy.admin.api import ApiMountError, check_area_router
+from roxy.admin.api import ApiMountError, admits_bootstrap, check_area_router, check_route, guard_options, guard_scopes
 from roxy.admin.api.common import area_router
-from roxy.admin.auth.deps import AdminPrincipal, require_admin
+from roxy.admin.auth.deps import ENROLL_PATHS, AdminPrincipal, require_admin
 
 BOOTSTRAP_OK = require_admin("session", allow_bootstrap=True)
 """Module level on purpose: FastAPI resolves the postponed annotations of a route against its module's globals."""
@@ -54,10 +54,6 @@ def test_an_unguarded_route_is_refused() -> None:
         check_area_router("zzopen", router, seen=set())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding apisec-9: the mount check accepts require_admin('session', allow_bootstrap=True) as the guard",
-)
 def test_a_bootstrap_session_guard_is_refused_outside_enrollment() -> None:
     router = area_router("zzboot")
 
@@ -70,3 +66,38 @@ def test_a_bootstrap_session_guard_is_refused_outside_enrollment() -> None:
     assert route.dependant.dependencies[0].call is BOOTSTRAP_OK  # the guard really is in the tree
     with pytest.raises(ApiMountError):
         check_area_router("zzboot", router, seen=set())
+
+
+def test_guard_options_and_scopes_tell_the_bootstrap_guard_apart() -> None:
+    assert guard_options(BOOTSTRAP_OK) == {"scope": "session", "allow_bootstrap": True, "activity": "auto"}
+    plain = require_admin("session", activity="never")
+    assert guard_options(plain) == {"scope": "session", "allow_bootstrap": False, "activity": "never"}
+    assert guard_options(len) == {}  # not an admin guard
+    assert admits_bootstrap(BOOTSTRAP_OK) is True
+    assert admits_bootstrap(plain) is False
+    assert admits_bootstrap(require_admin("fresh_mfa")) is False
+    router = area_router("zzscopes2")
+
+    @router.get("/x")
+    async def x(_admin: BootstrapAdmin) -> dict[str, Any]:
+        return {}
+
+    route = router.routes[0]
+    assert isinstance(route, APIRoute)
+    assert guard_scopes(route.dependant) == frozenset({"session", "bootstrap"})
+    enroll_path = sorted(ENROLL_PATHS)[0]
+    check_route(route, enroll_path, {"GET"}, module="test", route_class=True)  # the enrollment paths may use it
+
+
+def test_a_guard_whose_options_cannot_be_read_counts_as_admitting_bootstrap() -> None:
+    real = require_admin("session")
+
+    async def require_admin_session(request: Any) -> Any:  # same name and module, but no options to read
+        return await real(request)
+
+    require_admin_session.__module__ = real.__module__
+    assert guard_options(require_admin_session) == {}
+    assert admits_bootstrap(require_admin_session) is True  # fail closed
+    marked = require_admin("session")
+    marked.allow_bootstrap = True  # type: ignore[attr-defined]  # an explicit attribute wins over the closure
+    assert admits_bootstrap(marked) is True

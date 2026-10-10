@@ -5,6 +5,12 @@
 # higher cache rule TTL from the TTL tuner, and SWR for it; "High when n >= 50". 11.2 says a recommendation whose
 # changes are all scoped to one endpoint is safe_auto, which is exactly its own UP-429-ENDPOINT example.
 #
+# Review round 4 (finding LOGICFIX-2, lead refix of 2026-10-09; the one edit to this fixture): the cache rule the
+# card updates is the endpoint's own row, but it is a v1 glob, and a glob also covers every path below
+# games.roblox.com/v1/games/votes, so raising its TTL is not scoped to one endpoint and the card is NOT safe_auto
+# (the engine says so on the card). The 11.2 example is a NEW rule, which a recommendation now writes as an exact
+# regex (insights-8). Everything else this fixture expects is unchanged.
+#
 #   fact                                              where it comes from here
 #   300 Roblox 429s on GET games.../votes in 60 min   votes_stale_429 (every 429 served stale, upstream_429 rows)
 #   4,150 upstream calls on the endpoint (7.2% 429)   1,800 + 600 + 850 + 300 + 600 (see data_checks)
@@ -24,7 +30,8 @@ description: >
   with no stale-while-revalidate, and between 25 and 15 minutes ago Roblox answered 300 of its direct calls with
   429 (all hidden from callers by stale serves). The rule must recommend, for that endpoint only, a longer TTL
   from the tuner (about 300 s), SWR, and an endpoint bucket override at or below 80% of the 90 per minute it
-  sustained without 429s. Every change is scoped to one endpoint, so the recommendation is safe_auto.
+  sustained without 429s. The cache rule it raises is a v1 glob that also covers the paths below the endpoint,
+  so the recommendation is not safe_auto (review round 4, LOGICFIX-2).
 now: "2026-10-07T15:00:00Z"
 seed_defaults: false
 
@@ -153,7 +160,7 @@ expect:
       severity: any
       confidence: high          # 300 >= insight_up_429_endpoint_high_confidence_n (50)
       family: upstream
-      safe_auto: true           # every change is scoped to this one endpoint (11.2)
+      safe_auto: false          # the glob row also covers the paths below the endpoint (11.2, LOGICFIX-2)
       evidence:
         metrics:
           roblox_429: 300

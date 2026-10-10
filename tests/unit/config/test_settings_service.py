@@ -19,6 +19,7 @@ from roxy.config.runtime import RuntimeSettings, load_runtime_settings, read_con
 from roxy.config.settings_service import (
     EXPORT_SCHEMA,
     HistoryNotFound,
+    PendingWrite,
     SettingsService,
     SettingsUpdateError,
     check_reason,
@@ -339,3 +340,38 @@ async def test_sensitive_values_never_reach_history_or_audit(dbs: Any, fake_cloc
     entry = (await service.history())[0]
     with pytest.raises(SettingsUpdateError):
         await service.revert(entry.id, ADMIN, "x")
+
+
+async def test_the_guard_judges_the_keys_control_db_is_about_to_write(
+    dbs: Any, runtime: RuntimeSettings, fake_clock: FakeClock
+) -> None:
+    """Finding secfix-1: a `WriteGuard` sees the dirty keys decided inside the transaction (from control.db, not from
+    a worker snapshot), and whatever it raises refuses the whole write."""
+    other = SettingsService(dbs.control, clock=fake_clock)  # another worker: this runtime does not see its write
+    await other.update({"allowed_requests_per_minute": 20}, ADMIN, "other worker")
+    assert runtime.int("allowed_requests_per_minute") == 10  # this snapshot lags behind
+    service = SettingsService(dbs.control, runtime=runtime, clock=fake_clock)
+    seen: list[PendingWrite] = []
+
+    class Refused(Exception):
+        pass
+
+    def refuse(pending: PendingWrite) -> None:
+        seen.append(pending)
+        raise Refused
+
+    with pytest.raises(Refused):  # 10 is "unchanged" by the snapshot, yet control.db holds 20
+        await service.update(
+            {"allowed_requests_per_minute": 10, "throttle_reset_duration": 50}, ADMIN, "x", guard=refuse
+        )
+    assert dict(seen[0].dirty) == {"allowed_requests_per_minute": (20, 10)}
+    assert seen[0].value("allowed_requests_per_minute") == 20
+    assert seen[0].value("throttle_reset_duration") == 50
+    assert _rows(dbs, "SELECT key, value_json FROM settings") == [("allowed_requests_per_minute", "20")]
+    with pytest.raises(Refused):
+        await service.reset_to_default("allowed_requests_per_minute", ADMIN, "x", guard=refuse)
+    assert dict(seen[1].dirty) == {"allowed_requests_per_minute": (20, 10)}
+    calls = len(seen)
+    result = await service.reset_to_default("throttle_reset_duration", ADMIN, "x", guard=refuse)
+    assert (result.changes, len(seen)) == ((), calls)  # nothing dirty: the guard is not asked
+    assert _rows(dbs, "SELECT key, value_json FROM settings") == [("allowed_requests_per_minute", "20")]

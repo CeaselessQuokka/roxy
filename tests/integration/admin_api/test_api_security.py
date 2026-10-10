@@ -104,9 +104,10 @@ async def test_fingerprints_values_user_agents_blocked_and_ignored_headers(
     assert [(item["value"], item["count"]) for item in values["items"]] == [("two", 2), ("one", 1)]
     agents = ok(await api.get("security/fingerprints/user-agents", params={"q": "roblox"}), api_json)
     assert [(item["user_agent"], item["count"]) for item in agents["items"]] == [("Roblox/WinInet", 2)]
-    blocked = ok(await api.get("security/fingerprints/blocked"), api_json)
-    assert blocked["headers"][0]["name"] == "xeno-fingerprint"
-    assert blocked["user_agents"][0]["user_agent"] == "Xeno/1.0"
+    blocked = ok(await api.get("security/fingerprints/blocked", params={"kind": "header"}), api_json)
+    assert blocked["items"][0]["name"] == "xeno-fingerprint"
+    blocked = ok(await api.get("security/fingerprints/blocked", params={"kind": "user_agent"}), api_json)
+    assert blocked["items"][0]["user_agent"] == "Xeno/1.0"
     ignored = ok(await api.get("security/fingerprints/ignored"), api_json)
     assert "traceparent" in {item["name"] for item in ignored["items"]}  # a shipped default
     added = ok(await api.post("security/fingerprints/ignored", json={"name": "X-Test", "note": "ids"}), api_json)

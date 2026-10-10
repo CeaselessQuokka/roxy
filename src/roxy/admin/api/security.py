@@ -6,8 +6,9 @@ What this is
       * Event logs, paged on the server and exportable (parity rows 80, 97): admin logins and failed logins
         (`result` filter), probes and exploit attempts, the probe summary by signature, crawls by client.
       * Request fingerprints (rows 79, 134): header names with their value statistics, one header's values,
-        User-Agents, the blocked variants (headers and User-Agents of requests a request filter refused), and the
-        ignored headers (values not recorded) with add and remove.
+        User-Agents, the blocked variants (headers and User-Agents of requests a request filter refused, one
+        exportable table), the ignored headers (values not recorded) with add and remove, and v1's per-header
+        "Clear values" and "Remove" (and "Remove" on the Blocked tab), each audited before it deletes.
       * CSP violation reports (plan 9.2), grouped by what was blocked.
       * The admin's own sessions (list, revoke one, revoke the others, sign out everywhere), trusted devices (list,
         revoke one or all), passkeys (list; rename and delete with a fresh second factor) and recovery codes
@@ -63,8 +64,9 @@ from roxy.admin.api.common import (
     TimeRange,
     TimeRangeDep,
     actor_for,
+    add_caller_text,
     area_router,
-    collect_pages,
+    export_pages,
     export_table,
     not_found,
     page_rows,
@@ -81,6 +83,7 @@ from roxy.admin.auth.deps import STATE_SESSION, AdminPrincipal, get_auth, reques
 from roxy.admin.auth.events import audit_auth
 from roxy.admin.auth.flow import AuthError
 from roxy.admin.auth.responses import clear_session_cookie
+from roxy.config import audit
 from roxy.config.constants import MAX_REASON_LENGTH
 from roxy.deps import get_ctx
 from roxy.metrics import read_security, security_events
@@ -142,8 +145,7 @@ async def _paged(
 ) -> Any:
     with service_errors():
         if fmt is not None:
-            rows, total = await collect_pages(fetch)
-            return await export_table(request, admin, spec, rows, fmt, total=total, tq=tq, tr=tr, filters=filters)
+            return await export_pages(request, admin, spec, fetch, fmt, tq=tq, tr=tr, filters=filters)
         items, total = await fetch(tq.page, tq.page_size)
     answer = table_answer(spec, tq, items, total)
     if tr is not None:
@@ -186,21 +188,26 @@ LOGIN_SPEC: Final = TableSpec(
         Column("at_ms", "When", "When the attempt happened (newest first).", "timestamp_ms"),
         Column("ip", "IP", "Where the attempt came from.", ip=True, sortable=False),
         Column("successful", "Successful", "Whether the admin got in.", sortable=False),
-        Column("username", "Username", "The account named (failed attempts may name any).", sortable=False),
+        Column("username", "Username", "The account named (failed attempts may name any).", sortable=False,
+               caller_text=True),
         Column("method", "Method", "The step or factor used.", sortable=False),
         Column("reason", "Result", "success or failure.", sortable=False),
     ),
     default_sort="at_ms",
 )  # fmt: skip
+# The probe log is written by unauthenticated traffic (any scanner on the internet, parity-2), so every text column
+# is caller text; the signature too, because rows recorded before review round 4 (finding secfix-7) may hold the
+# caller's method or path as their signature.
 PROBE_SPEC: Final = TableSpec(
     name="probes",
     columns=(
         Column("at_ms", "When", "When the probe arrived (newest first).", "timestamp_ms"),
         Column("ip", "IP", "Who sent it.", ip=True, sortable=False),
-        Column("reason", "Signature", "The probe signature (v1 reason, without the probed URL).", sortable=False),
-        Column("target", "Target", "What was probed (redacted).", sortable=False),
-        Column("path", "Path", "The path asked for (redacted).", sortable=False),
-        Column("user_agent", "User-Agent", "Its User-Agent.", sortable=False),
+        Column("reason", "Signature", "The probe signature (v1 reason, without the probed URL).", sortable=False,
+               caller_text=True),
+        Column("target", "Target", "What was probed (redacted).", sortable=False, caller_text=True),
+        Column("path", "Path", "The path asked for (redacted).", sortable=False, caller_text=True),
+        Column("user_agent", "User-Agent", "Its User-Agent.", sortable=False, caller_text=True),
         Column("count", "Count", "1, or the number of probes folded into this row over the event budget.", "count",
                sortable=False),
     ),
@@ -209,7 +216,7 @@ PROBE_SPEC: Final = TableSpec(
 SUMMARY_SPEC: Final = TableSpec(
     name="probe_summary",
     columns=(
-        Column("reason", "Signature", "The probe signature."),
+        Column("reason", "Signature", "The probe signature.", caller_text=True),
         Column("count", "Count", "Probes with this signature in the range.", "count"),
         Column("first_ms", "First seen", "The first one in the range.", "timestamp_ms"),
         Column("last_ms", "Last seen", "The latest one.", "timestamp_ms"),
@@ -319,7 +326,7 @@ async def crawls(
 HEADER_SPEC: Final = TableSpec(
     name="fingerprint_headers",
     columns=(
-        Column("name", "Header name", "Lowercase; a secret-shaped name is shown as fp:<hash>."),
+        Column("name", "Header name", "Lowercase; a secret-shaped name is shown as fp:<hash>.", caller_text=True),
         Column("count", "Count", "Requests that carried it.", "count"),
         Column("value_count", "Values", "Distinct values stored (capped per header).", "count"),
         Column("unique_ratio", "Unique ratio", "Stored values per request that carried one (1 means always new).",
@@ -336,7 +343,7 @@ HEADER_SPEC: Final = TableSpec(
 VALUE_SPEC: Final = TableSpec(
     name="fingerprint_values",
     columns=(
-        Column("value", "Value", "Scrubbed; sensitive values are stored as fp:<hash>."),
+        Column("value", "Value", "Scrubbed; sensitive values are stored as fp:<hash>.", caller_text=True),
         Column("count", "Count", "Requests that carried it.", "count"),
         Column("first_seen", "First seen", "First request that carried it.", "timestamp", sortable=False),
         Column("last_seen", "Last seen", "Latest request that carried it.", "timestamp"),
@@ -346,17 +353,42 @@ VALUE_SPEC: Final = TableSpec(
 UA_SPEC: Final = TableSpec(
     name="fingerprint_user_agents",
     columns=(
-        Column("user_agent", "User-Agent", "As sent (scrubbed); (none) for requests without one."),
+        Column("user_agent", "User-Agent", "As sent (scrubbed); (none) for requests without one.", caller_text=True),
         Column("count", "Count", "Requests that sent it.", "count"),
         Column("first_seen", "First seen", "First request.", "timestamp"),
         Column("last_seen", "Last seen", "Latest request.", "timestamp"),
     ),
     default_sort="count",
 )
+BLOCKED_SPEC: Final = TableSpec(
+    name="blocked_fingerprints",
+    columns=(
+        Column("kind", "Type", "header (a header name the refused request carried) or user_agent."),
+        Column(
+            "name",
+            "Header",
+            "The header name, lowercase (caller text; a secret-shaped name was never stored).",
+            caller_text=True,
+        ),
+        Column(
+            "user_agent",
+            "User-Agent",
+            "The User-Agent the refused request sent (caller text, scrubbed).",
+            caller_text=True,
+        ),
+        Column("count", "Count", "Requests a request filter refused with it in the range.", "count"),
+        Column("last_ms", "Last seen", "The latest one in the range.", "timestamp_ms"),
+    ),
+    default_sort="count",
+)
+BLOCKED_CALLER_TEXT: Final = ("name", "user_agent")
+"""Columns of the Blocked tab holding text a caller chose: shown as plain text, never as markup."""
+HEADER_NAME_PATTERN: Final = r"^[^\x00-\x1f\x7f]+$"
+"""A header name in a path: printable characters only (stored names are lowercased and at most 120 characters)."""
 IGNORED_SPEC: Final = TableSpec(
     name="ignored_headers",
     columns=(
-        Column("name", "Header", "Values of this header are not recorded (its count still is)."),
+        Column("name", "Header", "Values of this header are not recorded (its count still is).", caller_text=True),
         Column("why", "Why", "Detected automatically, a default, or added by an admin.", sortable=False),
         Column("note", "Detail", "The note (an automatic entry says how unique its values were).", sortable=False),
     ),
@@ -442,13 +474,27 @@ async def fingerprint_user_agents(
 
 
 @router.get("/fingerprints/blocked")
-async def fingerprint_blocked(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
-    """Header names and User-Agents of requests a request filter refused in the range (row 134, Blocked tab)."""
+async def fingerprint_blocked(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(BLOCKED_SPEC))],
+    fmt: ExportFormatDep,
+    kind: Annotated[Literal["header", "user_agent"] | None, Query()] = None,
+) -> Any:
+    """Header names and User-Agents of requests a request filter refused in the range (row 134, Blocked tab), as
+    one section 13 table (`kind` picks one of the two lists); `format=csv|json` is v1's blocked fingerprints export
+    (finding parity-14). Blocked requests keep no header values, so there are no value rows."""
     ctx = get_ctx(request)
     start, end = tr.window.start * 1000, tr.window.end * 1000
     with service_errors():
-        data = await ctx.dbs.metrics.read(lambda conn: read_security.blocked_fingerprints(conn, start, end))
-    return {"range": tr.info(), **data}
+        found = await ctx.dbs.metrics.read(lambda conn: read_security.blocked_rows(conn, start, end))
+    rows = [row for row in found if kind is None or row["kind"] == kind]
+    answer = await _listed(request, admin, BLOCKED_SPEC, tq, fmt, rows, search_keys=("name", "user_agent"), tr=tr)
+    if isinstance(answer, dict):
+        answer["kind"] = kind
+        add_caller_text(answer, BLOCKED_CALLER_TEXT)
+    return answer
 
 
 @router.get("/fingerprints/ignored")
@@ -532,16 +578,111 @@ async def fingerprint_unignore(
     return _change(change)
 
 
+HeaderName = Annotated[str, Path(min_length=1, max_length=120, pattern=HEADER_NAME_PATTERN)]
+ClearReason = Annotated[str | None, Query(max_length=MAX_REASON_LENGTH)]
+
+
+async def _audit_first(
+    request: Request, admin: AdminPrincipal, action: str, target: str, after: dict[str, Any], reason: str
+) -> int:
+    """The audit row of a fingerprint clear, written BEFORE the delete (plan 9.7 with C7): when control.db cannot
+    take it the answer is 503 and nothing is deleted."""
+    ctx = get_ctx(request)
+    actor = actor_for(admin)
+    request_id = request_id_of(request)
+    now = int(ctx.clock.now())
+
+    def write(conn: sqlite3.Connection) -> int:
+        return audit.record(conn, actor, action, target, None, after, reason or None, request_id, at=now, secret=False)
+
+    with service_errors():
+        audit_id: int = await ctx.dbs.control.write(write)
+    return audit_id
+
+
+@router.delete("/fingerprints/headers/{name}/values")
+async def fingerprint_clear_values(
+    request: Request, admin: AdminSession, _csrf: CsrfChecked, name: HeaderName, reason: ClearReason = None
+) -> dict[str, Any]:
+    """v1 "Clear values" (dashboard.md 4.21, finding parity-11): drop one header's stored values; the header, its
+    count and its recording stay. Audited first (`fingerprints.clear_values`); 404 for a header never recorded."""
+    ctx = get_ctx(request)
+    key = name.lower()
+    text = audit_reason(reason)
+    with service_errors():
+        counts = await ctx.dbs.metrics.read(lambda conn: read_security.header_counts(conn, key))
+    if not counts["headers"] and not counts["values"]:
+        raise not_found("No header with that name is recorded.")
+    audit_id = await _audit_first(
+        request, admin, "fingerprints.clear_values", f"fingerprint_header:{key}", {"values": counts["values"]}, text
+    )
+    with service_errors():
+        removed = await ctx.dbs.metrics.write(
+            lambda conn: read_security.clear_header_values(conn, key), busy_timeout_ms=2000
+        )
+    return {"name": key, "values_removed": removed, "header_kept": bool(counts["headers"]), "audit_id": audit_id}
+
+
+@router.delete("/fingerprints/headers/{name}")
+async def fingerprint_remove_header(
+    request: Request, admin: AdminSession, _csrf: CsrfChecked, name: HeaderName, reason: ClearReason = None
+) -> dict[str, Any]:
+    """v1 "Remove" (dashboard.md 4.21, finding parity-11): drop one header's row and its stored values. Its ignore
+    entry, if any, is a rule and stays; the next request carrying the header records it again. Audited first."""
+    ctx = get_ctx(request)
+    key = name.lower()
+    text = audit_reason(reason)
+    with service_errors():
+        counts = await ctx.dbs.metrics.read(lambda conn: read_security.header_counts(conn, key))
+    if not counts["headers"] and not counts["values"]:
+        raise not_found("No header with that name is recorded.")
+    audit_id = await _audit_first(
+        request, admin, "fingerprints.remove_header", f"fingerprint_header:{key}", counts, text
+    )
+    with service_errors():
+        removed = await ctx.dbs.metrics.write(lambda conn: read_security.remove_header(conn, key), busy_timeout_ms=2000)
+    return {
+        "name": key,
+        "headers_removed": removed["headers"],
+        "values_removed": removed["values"],
+        "audit_id": audit_id,
+    }
+
+
+@router.delete("/fingerprints/blocked/headers/{name}")
+async def fingerprint_remove_blocked_header(
+    request: Request, admin: AdminSession, _csrf: CsrfChecked, name: HeaderName, reason: ClearReason = None
+) -> dict[str, Any]:
+    """v1 "Remove" on the Blocked tab (finding parity-11, the blocked variant): drop one header name's blocked
+    rows. Blocked requests keep no values, so the tab has no "Clear values". Audited first."""
+    ctx = get_ctx(request)
+    key = name.lower()
+    text = audit_reason(reason)
+    with service_errors():
+        requests = await ctx.dbs.metrics.read(lambda conn: read_security.blocked_header_count(conn, key))
+    if not requests:
+        raise not_found("No blocked request carried a header with that name.")
+    audit_id = await _audit_first(
+        request, admin, "fingerprints.remove_blocked_header", f"blocked_header:{key}", {"requests": requests}, text
+    )
+    with service_errors():
+        rows = await ctx.dbs.metrics.write(
+            lambda conn: read_security.remove_blocked_header(conn, key), busy_timeout_ms=2000
+        )
+    return {"name": key, "rows_removed": rows, "requests_removed": requests, "audit_id": audit_id}
+
+
 # =============================================================================================== CSP reports
 
 
 CSP_SPEC: Final = TableSpec(
     name="csp_reports",
     columns=(
-        Column("directive", "Directive", "The CSP directive that refused something.", sortable=False),
-        Column("blocked", "Blocked", "What the browser refused to load or run.", sortable=False),
-        Column("document", "Page", "The page it happened on.", sortable=False),
-        Column("source", "Source file", "The file that tried.", sortable=False),
+        # A CSP report is a POST any browser (or script) can send: every text field is caller text.
+        Column("directive", "Directive", "The CSP directive that refused something.", sortable=False, caller_text=True),
+        Column("blocked", "Blocked", "What the browser refused to load or run.", sortable=False, caller_text=True),
+        Column("document", "Page", "The page it happened on.", sortable=False, caller_text=True),
+        Column("source", "Source file", "The file that tried.", sortable=False, caller_text=True),
         Column("disposition", "Disposition", "enforce or report.", sortable=False),
         Column("count", "Count", "Reports in the range.", "count"),
         Column("last_ms", "Last seen", "The latest report.", "timestamp_ms"),

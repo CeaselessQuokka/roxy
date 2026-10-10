@@ -1,13 +1,13 @@
 """Review round 3 (lens apisec): an open event stream after its network leaves the admin allowlist (D6).
 
 What this is
-    Strict-xfail test for finding apisec-8. The stream (`GET /admin/api/v1/stream`, `admin/sse.py`) checks its
-    caller once, when it opens. Every `SESSION_CHECK_S` it re-reads the session (gone, idle, revoked, past its
-    lifetime: the stream ends with `unauthorized`), but it never asks the admin allowlist again. When the owner
-    switches the allowlist on (or removes a network from it), every other request from that network gets the plain
-    404 at once, while a stream already open from it keeps pushing live rows (client addresses, URLs, User-Agents),
-    `kpi` and alerts until the session itself ends (up to `admin_session_max_age_s`, 12 h, if the session is kept
-    alive elsewhere).
+    Test for finding apisec-8 (fixed; it was a strict xfail). The stream (`GET /admin/api/v1/stream`,
+    `admin/sse.py`) checked its caller once, when it opened. Every `SESSION_CHECK_S` it re-reads the session (gone,
+    idle, revoked, past its lifetime: the stream ends with `unauthorized`), but it never asked the admin allowlist
+    again. When the owner switched the allowlist on (or removed a network from it), every other request from that
+    network got the plain 404 at once, while a stream already open from it kept pushing live rows (client addresses,
+    URLs, User-Agents), `kpi` and alerts until the session itself ended. Now the stream asks the allowlist on every
+    turn of its loop (`Stream._network_allowed`) and ends with no further frame once its network is shut out.
 
 Why it exists
     D6 and plan 9.5: a network that is not listed sees nothing under `/admin`. Turning the allowlist on is how the
@@ -104,10 +104,6 @@ class RawStream:
                     task.cancel()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding apisec-8: an open event stream never re-checks the admin allowlist; a shut-out network streams on",
-)
 async def test_an_open_stream_ends_when_its_network_leaves_the_allowlist(
     api_app: Any, api_admin: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -138,5 +134,7 @@ async def test_an_open_stream_ends_when_its_network_leaves_the_allowlist(
             await asyncio.sleep(0.1)
         sent_after = b"".join(stream.chunks[before:])
         assert stream.ended, f"still streaming {len(sent_after)} bytes later: {sent_after[:160]!r}"
+        assert b"event: unauthorized" not in sent_after  # a shut-out network is told nothing, not even that
+        assert api_app.app.state.sse_hub.local_streams == {}  # the stream gave its slot back
     finally:
         await stream.close()

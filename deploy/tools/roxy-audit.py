@@ -120,6 +120,10 @@ class Layout:
             Expect("/var/lib/roxy/*.db-wal", "file", s, sg, forbidden=0o027, required=False),
             Expect("/var/lib/roxy/*.db-shm", "file", s, sg, forbidden=0o027, required=False),
             Expect("/var/lib/roxy/snapshots", "dir", s, sg, forbidden=0o027, required=False),
+            # scripts/ctl.py makes it on first use. The internal socket accepts a one-use proof from it only while
+            # the service's user owns it and nobody else can write it; 0700 also keeps the proof names private.
+            # Only the directory is audited: the proof files' names are half of a proof and stay out of the report.
+            Expect("/var/lib/roxy/ctl-proofs", "dir", s, None, 0o700, required=False, note="one-use CLI proofs"),
             Expect("/var/backups/roxy", "dir", r, None, 0o700, required=False, note="backups (plan 17.3)"),
             Expect("/usr/local/sbin/roxy-nginx-apply", "file", r, r, 0o755, note="root wrapper (plan 9.14)"),
             Expect("/usr/local/sbin/roxy-switch-color", "file", r, r, 0o755, note="root wrapper (plan 9.14)"),

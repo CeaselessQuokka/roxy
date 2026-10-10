@@ -443,7 +443,7 @@ def test_migrate_is_idempotent_and_records_versions(env) -> None:
     dbs = open_databases(env)
     try:
         first = migrate_all(dbs)
-        # Every expand migration of each database runs once, in order (metrics.db has four since wave 3b).
+        # Every expand migration of each database runs once, in order (metrics.db has six since the wave 3b review).
         assert {name: [m.version for m in ran] for name, ran in first.items()} == {
             name: list(range(1, REQUIRED_SCHEMA[name] + 1)) for name in DB_NAMES
         }
@@ -457,6 +457,9 @@ def test_migrate_is_idempotent_and_records_versions(env) -> None:
             (2, "insight_history"),
             (3, "health_details"),
             (4, "annotation_range"),
+            (5, "producer_history"),
+            (6, "annotation_scope"),
+            (7, "limit_samples"),
         ]
         assert check_schema(dbs) == REQUIRED_SCHEMA
     finally:

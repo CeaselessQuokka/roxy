@@ -25,6 +25,11 @@ How it works
     - `flood` turns on `tarpit_on_throttle`, so throttle and flood refusals are held and the fleet cap is used.
     Client addresses come from ranges that belong to no real system (RFC 5737 and RFC 2544). Latency figures are
     indicative: the client, the mock and both workers share one machine with whatever else runs on it.
+    Times compared across processes (when a request left, when the mock saw a call, the mock's windows) are on the
+    harness clock (`clock.py`); durations are `time.monotonic()`. `replay_numbers` also replays the mock's window
+    over each endpoint's calls (`peak_60s` against `limit_per_min`): how close Roxy came to each threshold, the
+    figure that explains a 429 (or its absence) better than the count alone. The replay writes the mock's call log
+    to `<work>/replay/mock_calls.csv` for analysis after the run.
 
 What to read next
     `harness.py` (the command line and the table), `test_replay_profile.py` (the acceptance test).
@@ -37,7 +42,7 @@ import math
 import shutil
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Final
@@ -56,7 +61,7 @@ from load.fleet import (
     worker_history,
     write_rates,
 )
-from load.mock_roblox import CallRecord, Endpoint, MockRoblox
+from load.mock_roblox import CallRecord, Endpoint, MockRoblox, peak_in_window
 from load.traffic import (
     V1_LIKE_MIX,
     EndpointMix,
@@ -99,6 +104,32 @@ new color gets the same quiet time while the deploy's health gate runs."""
 STEADY_MISS_LATENCY_S: Final = 0.030
 HOLD_MIN_S: Final = 7.5
 """A refusal that took this long was held by the tarpit (the shortest hold is `tarpit_min_seconds`, 8 s)."""
+FLOOD_BURST: Final = 10
+"""The per-IP GCRA at its defaults: `allowed_requests_per_minute` 10 per `throttle_reset_duration` 50 s, so a
+burst of 10 and then one request every 5 s."""
+FLOOD_INTERVAL_S: Final = 5.0
+
+
+def gcra_excess(outcomes: Iterable[Outcome], *, burst: int, interval_s: float) -> int:
+    """The most any address was served above what a GCRA of `burst` and `interval_s` can allow.
+
+    Roxy decides each request somewhere between the moment it was sent and the moment its answer arrived, so for
+    one address every decision falls in `[first sent, last served answer]`, and a GCRA allows at most
+    `burst + floor(span / interval)` requests in a span that long. A flood is answered long after it was sent
+    (holds, queueing), so the span is the measured one, not the flood's planned length. 0 or less: the limit held.
+    """
+    first: dict[str, float] = {}
+    last: dict[str, float] = {}
+    served: Counter[str] = Counter()
+    for o in outcomes:
+        first[o.ip] = min(first.get(o.ip, o.sent), o.sent)
+        if o.status == 200:
+            served[o.ip] += 1
+            last[o.ip] = max(last.get(o.ip, o.done), o.done)
+    return max(
+        (count - (burst + math.floor((last[ip] - first[ip]) / interval_s)) for ip, count in served.items()),
+        default=0,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +146,10 @@ class Options:
     overrides: tuple[tuple[str, Any], ...] = ()
     """Settings applied on top of every scenario's own (`--set key=value`), for "what if" runs. A run with
     overrides is not the reference measurement; the table says which ones applied."""
+    tree: Path | None = None
+    """A copy of the repository whose Roxy is measured (`--tree`); None measures the working tree."""
+    worker_env: tuple[tuple[str, str], ...] = ()
+    """Extra environment variables for gunicorn (`--worker-env`), for "what if" runs like the overrides."""
 
 
 @dataclass(slots=True)
@@ -137,12 +172,15 @@ class System:
     mock: MockRoblox
     sampler: ResourceSampler
     wall_start: float
+    setup: dict[str, float] = field(default_factory=dict)
+    """Seconds spent migrating and seeding the state (`prepare_s`) and starting gunicorn (`ready_s`)."""
 
     def finish(self) -> dict[str, Any]:
-        """Stop gunicorn gracefully (every worker flushes), then read Roxy's own numbers."""
-        code, seconds = self.fleet.stop()
+        """Stop gunicorn gracefully (every worker flushes), then read Roxy's own numbers. The memory sampler stops
+        first, so the timeline ends with the workers still running, not halfway through their exit."""
         self.sampler.stop()
-        out: dict[str, Any] = {"stop_code": code, "stop_s": seconds, "memory": self.sampler.summary()}
+        code, seconds = self.fleet.stop()
+        out: dict[str, Any] = {"stop_code": code, "stop_s": seconds, "memory": self.sampler.summary(), **self.setup}
         out["roxy"] = roxy_totals(self.env, self.wall_start - 120, time.time() + 120)
         out["roblox_429_rows"] = roblox_429_rows(self.env)
         out["upstream_limits"] = [row for row in upstream_limits(self.env) if row["origin"] != "default"]
@@ -157,7 +195,7 @@ class System:
 @contextlib.contextmanager
 def system(
     opts: Options, name: str, endpoints: list[Endpoint], settings: dict[str, Any],
-    rules: Sequence[tuple[str, dict[str, Any]]] = (),
+    rules: Sequence[tuple[str, dict[str, Any]]] = (), *, warmup_s: float = WARMUP_S,
 ) -> Iterator[System]:  # fmt: skip
     """A fresh state directory, the mock, and a ready gunicorn master for one scenario."""
     work = opts.work / name
@@ -167,16 +205,21 @@ def system(
     fleet: Fleet | None = None
     sampler: ResourceSampler | None = None
     try:
-        env = base_env(work, opts.credentials, mock.base, workers=opts.workers)
+        began = time.monotonic()
+        env = base_env(
+            work, opts.credentials, mock.base, workers=opts.workers, tree=opts.tree, extra=dict(opts.worker_env)
+        )
         prepare_state(env, {**settings, **dict(opts.overrides)}, list(rules))
-        fleet = Fleet(work, env)
+        prepared = time.monotonic()
+        fleet = Fleet(work, env, tree=opts.tree)
         fleet.start()
         if not fleet.wait_ready():
             raise NotReady(fleet.log_tail())
         sampler = ResourceSampler(fleet.master_pid).start()
         wall_start = time.time()
-        time.sleep(WARMUP_S)
-        yield System(env, fleet, mock, sampler, wall_start)
+        setup = {"prepare_s": round(prepared - began, 1), "ready_s": round(time.monotonic() - prepared, 1)}
+        time.sleep(warmup_s)
+        yield System(env, fleet, mock, sampler, wall_start, setup)
     finally:
         if sampler is not None:
             sampler.stop()
@@ -240,8 +283,16 @@ def common_rows(result: dict[str, Any], opts: Options | None = None) -> list[Row
     if opts is not None and opts.overrides:
         text = ", ".join(f"{key}={value}" for key, value in opts.overrides)
         overrides.append(("settings overridden (--set)", text, "not the reference run"))
+    if opts is not None and opts.worker_env:
+        text = ", ".join(f"{key}={value}" for key, value in opts.worker_env)
+        overrides.append(("worker environment (--worker-env)", text, "not the reference run"))
     workers = memory["worker_peak_rss_mib"]
     uss = memory["worker_peak_uss_mib"]
+    timeline = memory.get("timeline") or []
+    growth = "n/a"
+    if len(timeline) >= 2:
+        first, last = timeline[0], timeline[-1]
+        growth = f"PSS {first['color_pss_mib']} MiB at {first['s']} s, {last['color_pss_mib']} MiB at {last['s']} s"
     return [
         ("peak RSS per worker", ", ".join(f"{v} MiB" for v in workers) or "n/a", f"USS {uss} MiB"),
         (
@@ -249,6 +300,7 @@ def common_rows(result: dict[str, Any], opts: Options | None = None) -> list[Row
             f"PSS {memory['color_peak_pss_mib']} MiB (RSS sum {memory['color_peak_rss_sum_mib']} MiB)",
             "MemoryHigh 320M, MemoryMax 420M",
         ),
+        ("memory over the run", growth, "a plateau, not steady growth"),
         (
             "event loop lag p99 (worst heartbeat)",
             ", ".join(f"{w['loop_lag_p99_ms_max']} ms" for w in result["workers"].values()) or "n/a",
@@ -560,6 +612,7 @@ def flood(opts: Options, *, addresses: int = 50, rate: float = 1000.0) -> Scenar
     quick = [o for o in outcomes if o.status != 200 and o.latency < HOLD_MIN_S]
     served = [o for o in outcomes if o.status == 200]
     per_ip = Counter(o.ip for o in served)
+    excess = gcra_excess(outcomes, burst=FLOOD_BURST, interval_s=FLOOD_INTERVAL_S)
     sent = [o.sent for o in outcomes]
     out.data = {
         **result,
@@ -571,6 +624,7 @@ def flood(opts: Options, *, addresses: int = 50, rate: float = 1000.0) -> Scenar
         "refusals": refusals(outcomes),
         "served": len(served),
         "served_per_address_max": max(per_ip.values(), default=0),
+        "served_over_gcra_bound_max": excess,
         "tarpit_slots_peak": slots.peak,
         "tarpit_slot_samples": slots.samples,
         "refusals_over_8s": len(slow),
@@ -583,8 +637,6 @@ def flood(opts: Options, *, addresses: int = 50, rate: float = 1000.0) -> Scenar
         "errors": dict(Counter(o.error for o in outcomes if o.error)),
     }
     d = out.data
-    # GCRA 10 per 50 s with a burst of 10, per address: at most 10 + duration / 5 requests served.
-    allowed = 10 + math.floor(duration_s / 5)
     out.rows = [
         ("offered rate", f"{d['offered_rps']} requests/s ({d['planned']:,} planned)", f"{rate:g} requests/s"),
         (
@@ -594,7 +646,11 @@ def flood(opts: Options, *, addresses: int = 50, rate: float = 1000.0) -> Scenar
         ),
         ("answers", str(d["statuses"]), ""),
         ("refusals", str(d["refusals"]), ""),
-        ("served per address (max)", str(d["served_per_address_max"]), f"at most {allowed} (10 per 50 s, burst 10)"),
+        (
+            "served per address (max)",
+            f"{d['served_per_address_max']}; most above the GCRA bound: {d['served_over_gcra_bound_max']}",
+            "bound 10 + span / 5 s (10 per 50 s, burst 10): at most 0 above",
+        ),
         (
             "tarpit holds at once (hot.db slots)",
             f"peak {d['tarpit_slots_peak']} ({d['tarpit_slot_samples']} samples)",
@@ -627,6 +683,9 @@ average; a busy hour at that scale runs above the average, so the replay sends 1
 REPLAY_DURATION_S: Final = 200.0
 REPLAY_ADDRESSES: Final = 300
 """Game server addresses: one experience reaches Roxy from hundreds of servers (D11), each sending 2 a minute."""
+REPLAY_WARMUP_S: Final = 5.0
+"""The replay asserts counts, not latency, so it does not need `WARMUP_S`; the 15 s saved keep the test well
+inside its 5 minute budget on a busy machine."""
 
 
 def replay(opts: Options, *, rate: float = REPLAY_RATE, duration_s: float = REPLAY_DURATION_S) -> ScenarioResult:
@@ -640,16 +699,19 @@ def replay(opts: Options, *, rate: float = REPLAY_RATE, duration_s: float = REPL
         addresses=documentation_addresses(REPLAY_ADDRESSES),
         seed=opts.seed,
     )
-    with system(opts, out.name, endpoints, {}) as sys_:
+    with system(opts, out.name, endpoints, {}, warmup_s=REPLAY_WARMUP_S) as sys_:
         t0, outcomes = run_plan(sys_.fleet.base_url, plan, processes=1, options=ClientOptions(connections=64))
         records = sys_.mock.records()
         result = sys_.finish()
     calls = caller_calls(records, t0 - 1, t0 + duration_s + 60)
+    write_call_log(opts.work / out.name / "mock_calls.csv", records, t0)
     cookie_calls = [r for r in records if r.cookie and r.endpoint != "other"]
-    out.data = {**result, **replay_numbers(plan, outcomes, calls, t0, duration_s)}
+    limits = {item.name: item.limit_per_min for item in V1_LIKE_MIX}
+    out.data = {**result, **replay_numbers(plan, outcomes, calls, t0, duration_s, limits)}
     out.data["cookie_calls_on_caller_endpoints"] = len(cookie_calls)
     d = out.data
     roxy = result["roxy"]
+    closest = d["per_endpoint"].get(d["closest_endpoint"] or "", {})
     out.rows = [
         ("traffic", f"{len(plan):,} requests at {rate:g}/s for {duration_s:g} s from {REPLAY_ADDRESSES} addresses", ""),
         ("answers", str(d["statuses"]), ""),
@@ -673,6 +735,12 @@ def replay(opts: Options, *, rate: float = REPLAY_RATE, duration_s: float = REPL
             "",
         ),
         ("429 times (s after start)", str(d["roblox_429_times_s"][:20]), ""),
+        (
+            "closest to a Roblox threshold",
+            f"{d['closest_endpoint']}: {closest.get('peak_60s')} calls in its busiest 60 s, limit "
+            f"{closest.get('limit_per_min')} (callers asked {closest.get('demand_peak_60s')})",
+            "headroom 0 or more: no 429",
+        ),
         ("adaptive bucket rates", str([f"{r['bucket']} {r['per_min']}/min" for r in result["upstream_limits"]]), ""),
         ("calls with the credential", str(d["cookie_calls_on_caller_endpoints"]), "0 (D1, C2)"),
         ("caller latency", lat(d["latency"]), ""),
@@ -682,9 +750,17 @@ def replay(opts: Options, *, rate: float = REPLAY_RATE, duration_s: float = REPL
     return out
 
 
+def write_call_log(path: Path, records: Iterable[CallRecord], t0: float) -> None:
+    """Every call the mock received, one CSV line each (seconds after `t0`), for analysis after the run."""
+    lines = ["at_s,endpoint,status,cookie"]
+    lines += [f"{record.at - t0:.4f},{record.endpoint},{record.status},{int(record.cookie)}" for record in records]
+    with contextlib.suppress(OSError):
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def replay_numbers(
     plan: Sequence[PlannedRequest], outcomes: Sequence[Outcome], calls: Sequence[CallRecord], t0: float,
-    duration_s: float,
+    duration_s: float, limits: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:  # fmt: skip
     """Demand, upstream calls, 429s and avoided share, overall, per endpoint, per window and for the second half.
 
@@ -728,10 +804,12 @@ def replay_numbers(
             }
         )
     per_endpoint = {}
+    limits = dict(limits or {})
     for name in sorted({request.label for request in plan}):
         mine = [o for o in outcomes if o.label == name]
         mine_calls = [c for c in calls if c.endpoint == name]
         mine_demand = demand_of(mine)
+        peak = peak_in_window([c.at for c in mine_calls])
         per_endpoint[name] = {
             "requests": len(mine),
             "demand": mine_demand,
@@ -741,7 +819,18 @@ def replay_numbers(
             "cache_served_pct": round(from_cache(mine) * 100.0 / mine_demand, 1) if mine_demand else 0.0,
             "deferred": deferred(mine),
             "statuses": statuses(mine),
+            # How close Roxy brought this endpoint to the mock's threshold (calls in the busiest 60 s), and what the
+            # callers alone asked for in their busiest 60 s (what Roblox would have seen without Roxy).
+            "peak_60s": peak,
+            "demand_peak_60s": peak_in_window([r.at for r in plan if r.label == name]),
+            "limit_per_min": limits.get(name),
+            "headroom": None if name not in limits else limits[name] - peak,
         }
+    closest = min(
+        (item for item in per_endpoint.items() if item[1]["headroom"] is not None),
+        key=lambda item: (item[1]["headroom"], item[0]),
+        default=None,
+    )
     return {
         "cache_served": from_cache(outcomes),
         "cache_served_pct": from_cache(outcomes) * 100.0 / demand if demand else 0.0,
@@ -761,6 +850,8 @@ def replay_numbers(
         "avoided_pct": avoided(demand, len(calls)),
         "avoided_pct_second_half": avoided(second_half_demand, second_half_calls),
         "per_endpoint": per_endpoint,
+        "closest_endpoint": None if closest is None else closest[0],
+        "min_headroom": None if closest is None else closest[1]["headroom"],
         "latency": latency_ms(o for o in outcomes if o.status != 0),
         "missing_retry_after": missing_retry_after(outcomes),
         "transport_errors": sum(1 for o in outcomes if o.status == 0),

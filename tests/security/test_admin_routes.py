@@ -192,9 +192,17 @@ def discover(app: Any) -> list[AdminRoute]:
     return list(found.values())
 
 
+CATCH_ALL_NAMES = frozenset({"admin_not_found", "admin_root_not_found"})
+"""The admin catch-all routes (`roxy/admin/router.py`): `/admin/{rest:path}`, and `/admin` for the methods the
+login page does not take. They serve nothing: a missing path's 404, or a wrong method's answer (404 unless a
+signed-in admin asks, then 405)."""
+
+
 def checked(routes: list[AdminRoute]) -> list[AdminRoute]:
-    """The routes the generic checks apply to: not the catch-all, not the development gallery."""
-    return [r for r in routes if r.path != CATCH_ALL and not r.path.startswith(GALLERY)]
+    """The routes the generic checks apply to: not the catch-alls, not the development gallery."""
+    return [
+        r for r in routes if r.path != CATCH_ALL and r.name not in CATCH_ALL_NAMES and not r.path.startswith(GALLERY)
+    ]
 
 
 @dataclass
@@ -294,6 +302,13 @@ def test_unguarded_routes_are_exactly_the_documented_exceptions(site: Site) -> N
     assert unsafe_without_csrf == set()
 
 
+def test_only_the_enrollment_routes_admit_a_bootstrap_session(site: Site) -> None:
+    """Review finding apisec-9: `require_admin("session", allow_bootstrap=True)` (a session before any authenticator
+    is enrolled, D5) guards exactly the enrollment routes; `guard_scopes` reports it as `bootstrap`."""
+    bootstrap = {route.path for route in site.routes if "bootstrap" in route.scopes}
+    assert bootstrap == set(ENROLLMENT), (sorted(bootstrap - set(ENROLLMENT)), sorted(set(ENROLLMENT) - bootstrap))
+
+
 def test_fresh_mfa_routes_are_exactly_the_documented_sensitive_ones(site: Site) -> None:
     fresh = {route.key for route in site.routes if "fresh_mfa" in route.scopes}
     assert fresh == set(SENSITIVE), (sorted(fresh - set(SENSITIVE)), sorted(set(SENSITIVE) - fresh))
@@ -376,6 +391,14 @@ async def test_sensitive_routes_answer_reauth_required_without_a_fresh_second_fa
         ("POST", f"{API}/health/runs", {"json": {"include_credential": True}}, "health run with the credential check"),
         ("GET", f"{API}/export/llm", {"params": {"detail": "full"}}, "full LLM export (plan 12.2)"),
         ("POST", f"{API}/recommendations/{rec_id}/apply", {"json": {"changes_digest": digest}}, "security change"),
+        (
+            "PATCH",
+            f"{API}/settings",
+            {"json": {"changes": {"admin_reauth_window_s": 900}, "reason": "r"}},
+            "admin security setting (apisec-1)",
+        ),
+        ("PUT", f"{API}/settings/admin_allowlist_enabled", {"json": {"value": 1}}, "admin allowlist switch"),
+        ("PUT", f"{API}/settings/credential_enabled", {"json": {"value": 0}}, "credential setting"),
     ]
     token = await harness.csrf()
     site.make_mfa_stale()

@@ -52,7 +52,7 @@ from roxy.storage.db import (
 
 log = logging.getLogger(__name__)
 
-REQUIRED_SCHEMA: dict[str, int] = {"control": 1, "hot": 1, "metrics": 4, "cache": 1}
+REQUIRED_SCHEMA: dict[str, int] = {"control": 1, "hot": 1, "metrics": 7, "cache": 1}
 """The schema version each database must be at (at least) for this release to start. Raise it in the same
 change that adds a migration this release's code depends on (a unit test keeps it equal to the newest expand
 migration)."""

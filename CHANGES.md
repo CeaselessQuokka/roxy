@@ -903,8 +903,9 @@ Luau follow-up of 2026-10-08.
 
 Collected from the twelve builder reports and the integration report of 2026-10-08 and 2026-10-09
 (`.remake/wave3b_reports/`; the long tables named here are in those reports). Module paths are under `src/roxy/`;
-DESIGN.md 13.1 and 14 hold the exact contracts. Wave 3b has not been through its review round yet, so entries may
-still change.
+DESIGN.md 13.1 and 14 hold the exact contracts. The review round of 2026-10-09 and the lanes are recorded in the
+"Review round 3" and "Lanes" subsections at the end (DESIGN.md 14.9); where they differ from the entries before
+them, they win.
 
 #### Plan conflicts resolved by the integration
 
@@ -971,10 +972,13 @@ Code: `admin/api/settings.py`, `audit.py`, `prefs.py`, `data.py`, `export.py` an
 models.
 
 Plan conflicts:
-- **Metric families share rollup rows (6.8 against the v2 schema; P6).** The `traffic`, `cache_stats` (rows with
-  `outcome = 'served_cache'`) and `internal_calls` (rows with `source = 'internal'`) families delete their rows, and
-  the preview says that Traffic totals drop with them; `latency` empties the histogram columns and keeps the counts;
-  upstream call counts are never zeroed on their own, which would inflate "avoided calls".
+- **Metric families share rollup rows (6.8 against the v2 schema; P6).** The `traffic` and `internal_calls` (rows
+  with `source = 'internal'`) families delete their rows, and the preview says that Traffic totals drop with them;
+  `latency` empties the histogram columns and keeps the counts; upstream call counts are never zeroed on their own,
+  which would inflate "avoided calls". Since review round 3 the `cache_stats` family deletes no rollup rows: it
+  moves every cache lookup (hits, misses, stale, revalidating, coalesced) to the cache state `cleared` and keeps
+  the requests in every total, as v1's "Clear stats" did (finding parity-8; C3 and 6.8 "headline KPIs honest"
+  over the 6.8 table's "rows of that family").
 - **"Everything" keeps live state (6.8 "all of metrics.db" against C6).** `dims` (the recorder relies on its rows),
   `worker_heartbeat` and `health_job_status` are kept.
 - **The factory reset keeps admin access and history (6.8 against D6, 9.5 and 9.7).** `access_list` entries of kind
@@ -983,7 +987,12 @@ Plan conflicts:
   has its own `fresh_mfa` route so the mount check sees the guard (9.6).
 - **"Back up now" makes on-server snapshots (14.1 against the unprivileged service, 9.14 and 17.1).** The service
   cannot start the root backup unit, so the button takes `VACUUM INTO` snapshots in `<state dir>/snapshots`
-  (`manual-*`, pruned by `file_retention`); the nightly backups are listed from `audit/backup.json`.
+  (`manual-*`, pruned by `file_retention`); the nightly backups are listed from `audit/backup.json`. Since review
+  round 3 it also asks the root backup to run (`<state dir>/backup-request`, watched by
+  `roxy-backup-request.path`; the Data page shows the last answered and any pending request); its copies count
+  against `snapshots_max_bytes` together with what the folder holds, it replaces only its own oldest copies (409
+  `not_feasible` when that is not enough), and one backup or reset runs at a time fleet-wide (409
+  `run_in_progress`; finding apisec-5).
 - **VACUUM lives on the Data page (6.5 System page against 14.1 Data page, C7).** It needs a typed phrase, and hot.db
   is never offered: its write lock would stall every proxied request.
 - **Snapshots "where feasible" (6.8 against 17.5).** Only databases that lose rows are copied, within
@@ -1057,23 +1066,27 @@ The v1 clear targets map onto the 6.8 scopes as follows (plan 6.8 asks for this 
 | request_failures | family upstream | failures are upstream events |
 | rotate_ips | family egress_usage | v2 never stores exit IPs; egress usage is the stored rotator data |
 | endpoints | family traffic | the endpoint scope resets one template |
-| blocked_attempts | family refusals | endpoint block refusals |
-| rate_limited_attempts | family refusals | endpoint rule refusals |
-| header_blocked_attempts | family refusals | request filter refusals |
-| pause_drops | family refusals | the banner counts from the pause start; no reset needed |
-| throttle_drops | family refusals | enabling throttle-all starts a new count |
+| blocked_attempts | family endpoint_block_attempts | endpoint block refusals only |
+| rate_limited_attempts | family endpoint_rule_attempts | endpoint rule refusals only |
+| header_blocked_attempts | family header_rule_attempts | request filter refusals only |
+| pause_drops | none | nothing to reset: the banner counts from the pause start |
+| throttle_drops | none | nothing to reset: enabling throttle-all starts a new count |
 | tarpit | family tarpit | |
-| cache | family cache_stats | statistics only; entries stay |
-| throttle_rules | family throttle | ladder rung and UA rule hit counts |
+| cache | family cache_stats | hits, misses, stale and coalesced together; requests and entries stay |
+| throttle_rules | family throttle_rule_hits | ladder rung and UA rule hit counts |
 | live | family live | captured bodies too |
 | logins | family logins | |
 | crawls | family crawls | |
-| throttled | family throttle | |
+| throttled | family throttled_clients | the throttled clients list |
 | visits | family visits | |
 | errors | family errors | |
 | fingerprints | family fingerprints | |
 | blocked_fingerprints | family fingerprints | one family in v2 |
 | all | everything | plus System > Reset counts for the worker counters |
+
+The five narrower families (`endpoint_block_attempts`, `endpoint_rule_attempts`, `header_rule_attempts`,
+`throttle_rule_hits`, `throttled_clients`) are parts of the plan 6.8 `refusals` and `throttle` families and name
+their `parent` (finding parity-9, C3).
 
 #### Protection, clients and security (P9; `admin/api/`)
 
@@ -1430,8 +1443,9 @@ Plan conflicts:
   them, and only with `export_include_ips`.
 - **C4.** The rotator appears as its host name only (an IP literal host is null), workers by pid and color, and admin
   allowlist entries are counted, never listed.
-- **Missing sources (P6).** The `top_clients` bot score is null (no production source), and
-  `capacity.metrics_pipeline` is the building worker's counters, labeled `this_worker`. The code map lists public
+- **Missing sources (P6).** `capacity.metrics_pipeline` is the building worker's counters, labeled
+  `this_worker`. (The `top_clients` bot score was null until the producers lane recorded scores; since review
+  round 3 it is the recorded plan 10.7 score, 0 to 100.) The code map lists public
   classes and methods too, with a `kind` (12.3 says "public functions"). The schema is committed as
   `insights/schema/llm_export.v1.schema.json`, and a test checks it equals the models.
 
@@ -1488,6 +1502,366 @@ Deviations:
   `health_auto_interval_h` is above 0), `health_publish_jobs` (30 s) and `llm_export_file` (3600 s); every worker
   runs `admin_requests_watch` (1 s). Intervals are read before every scheduling decision, so a settings change
   applies without a restart.
+
+#### Review round 3: admin API security and bounds (2026-10-09; findings apisec-1 to 9, mpjobs-5)
+
+The review of wave 3b filed 54 findings; the entries of this and the next five subsections are the fixes, the lane
+work and the deviations they brought. Reports: `.remake/wave3b_reports/r3_fix_*.md`, `lane_*.md` and
+`r3_integrate.md`. Where they differ from the entries above, these win.
+
+- **Settings that guard the admin need a fresh second factor (apisec-1; plan 9.6, stricter, never looser).**
+  Changing any `admin_security` or `credential` setting, a sensitive one, or `export_include_ips` through the
+  settings editor, PUT, reset, revert or import needs a second factor entered within `admin_reauth_window_s` (403
+  `reauth_required`), as applying a recommendation did; a stale session can no longer raise the window or switch
+  the admin allowlist off. Previews and editor entries say which keys need it, and recommendations use the same rule
+  (`admin/api/settings.py needs_fresh_mfa`).
+- **Exports never carry a client address while `export_include_ips` is off (apisec-2; plan 9.15, 12.3).** Every cell,
+  not only IP columns: an address in free text (spam subjects, event details, audit targets and previews) becomes
+  `ip:<keyed hash>`, the same hash its IP column gets. A version after a product name (`Chrome/120.0.0.0`) is left
+  alone; any other quad or colon form that parses as an address is replaced (privacy first).
+- **A wrong method on an admin path no longer reveals it (apisec-3; D6, plan 9.5).** Anyone without a signed-in admin
+  session gets the missing path's 404; a signed-in admin gets 405 `method_not_allowed` with `Allow` (a section 13
+  object; it was FastAPI's `{"detail": "Method Not Allowed"}` for everyone). `/admin` itself is covered too
+  (`admin/router.py`).
+- **High-risk Protection settings need the confirmation (apisec-4).** `PATCH /protection/settings` and the
+  throttle-all limit and period need `confirm_high_risk` and a reason, as in Settings (422
+  `confirmation_required`).
+- **Table downloads are bounded (apisec-6, mpjobs-5; plan P9, DESIGN.md section 0).** At most 2 downloads build at once
+  per worker (429 `rate_limited`, `Retry-After: 5`); a file is at most 16 MiB as well as 50,000 rows (the rest is left
+  out and `Roxy-Export-Truncated: true` and JSON `truncated` say so); every table and dataset download reads one page
+  at a time and streams the file (one 50,000-row audit download peaked at 17.7 MiB instead of about 270 MiB).
+  Deviation: before, a download could be as large as its rows made it; the cap is a module constant (lead decision on
+  safety bounds), and a filter or a narrower range exports the rest.
+- **Huge ids are 422, not 500 (apisec-7).** Integer path ids above 2**62 (routing rules, credential allowlist rows,
+  cache rules, health runs and their `with`, passkeys, trusted devices) and the Live `before` cursor are 422
+  `validation_failed`; no error alert fires.
+- **An open event stream ends when the admin allowlist shuts its network out (apisec-8; D6),** within a quarter
+  second of the change reaching the worker, without a further frame.
+- **The mount checks refuse the enrollment guard outside enrollment (apisec-9).** A route guarded by
+  `require_admin("session", allow_bootstrap=True)` refuses to start the app unless it is an enrollment path; the
+  route security test lists such routes (`bootstrap`).
+
+#### Review round 3: numbers, pages and resets (parity lens and the parity table; findings parity-1 to 15)
+
+- **Who returned a Roblox 5xx (parity-1).** A Roblox 5xx passed on after the retries counts as "5xx from Roblox"
+  (Overview, Traffic, upstream cards); "5xx from Roxy" counts only Roxy's own failures (new measure `roxy_5xx`). In
+  the "Who returned it?" table and the source chart such answers are "Roblox to caller (relayed)". The reading is in
+  the read model (`metrics/queries.py ANSWER_SOURCE_SQL`), so rows recorded earlier are read correctly too.
+- **Overview: "Failures (last hour)" (parity-2, v1 tile 11),** right after "Requests (last hour)", with the hour
+  before as its delta; the live stream carries it too. Deviation: it counts failed outcomes (Roxy could not answer),
+  not refusals and not Roblox's own 4xx answers; v1 counted any non-200 Roblox answer as failed, v2 relays a Roblox
+  4xx as an answer (it is in the 4xx tile).
+- **KPI deltas over a reset (parity-12, plan 6.8).** A tile whose own data was reset in its window or comparison window
+  shows the reset notice and `partial: true` and no delta (the two last-hour tiles included); resets of other
+  families leave tiles alone, because reset markers now name what they deleted (metrics.db schema 6,
+  `annotations.reset_tables`); a marker without that list still blanks every delta in its window (the safe
+  reading).
+- **Protection > Refusals has v1's columns (parity-3).** Status (newest), Last path, Unique clients (distinct hashes,
+  a lower bound with an unattributed count), First and Last seen; it is a paged, sortable, exportable table (a shape
+  change from `{range, items}`). v1's "Last IP" is replaced by the client count (plan 9.15).
+- **Throttle-all watch has v1's columns (parity-4, row 135):** Requests, Refused, Rate 1/5/60, Top endpoint and Last
+  seen, counted from the minute throttle-all was switched on (the drops-since rule); an IPv6 network key shows them
+  empty (activity is per address).
+- **Upstream: v1's Request Failures log (parity-5, rows 24 and 72)** at `GET /upstream/failures`. Rows folded over the
+  recorder's event budget keep their reason, count and (since the integration) egress, but not path or error.
+- **Upstream: method health per egress (parity-6, ptable-5, row 71).** Cards and host rows show Failed, last success,
+  last error time and the last error. Deviation: the times have minute (or hour, said so) precision and cover
+  everything kept, not only the range; the exact time is in `last_error.at_ms`.
+- **Clients (parity-7, row 73).** Tables show Last seen (to the minute, coarser for compacted data) and the peer
+  count ("Places" for an IP, "IPs" for a place); client pages list the peers. A new `pair` client row type is
+  stored and capped like IPs (at most `max_ip_activity_records` extra rows per bucket); peer counts are lower
+  bounds under a flood.
+- **Endpoints (parity-13, row 74).** Rows show Methods, Last request (exact while its Live row is kept, else the
+  minute), Last status, Last caller and Last place; status and caller are known only while the newest request's Live
+  row is kept (15 minutes).
+- **Security (parity-11, parity-14, rows 79 and 134).** v1's "Clear values" and "Remove" per header, and "Remove" on
+  the Blocked tab, are routes again, audited first; the Blocked tab is exportable. "Clear values" does not exist on
+  the Blocked tab (blocked requests keep no values). This supersedes the parity table's "no per-header fingerprint
+  clear" reading.
+- **Cache: "Purge matching" purges exactly what the browser search lists (parity-15, v1 bug 4)**, with one shared
+  condition (`scope: search`).
+- **The cache statistics reset keeps the requests (parity-8)**; see "Settings, audit, preferences, data, export and
+  system" above. After it the hit ratio reads null until new lookups, and the cleared lookups show as cache state
+  `cleared`.
+- **Clearing one v1 attempts tab keeps the others (parity-9)**: the five narrower families and the two "nothing to
+  reset" targets of the clear-target table above.
+- **Retention view (parity-10).** Every setting of the Data page's retention and record cap cards is listed with its
+  card, and every bounded table appears with the limits the code sets (fixed ages and caps, the audit log's 400 day
+  minimum) and hot.db idle limits (never reported as pruning due).
+- **Reset fences (parity-4 of the parity table, v1 `ClearEpochs`).** A counter that was reset is never refilled by
+  numbers a worker gathered before the reset but had not flushed yet: each worker drops (or, for latency and cache
+  statistics, rewrites) its unflushed items of the reset family in its next two flushes. At most two flush intervals
+  (4 s by default) of other workers' counts of that family are lost around a reset; the control.db key
+  `metrics_reset_fences` holds the latest 16 resets.
+- **Reset flow (mpjobs-4).** The chart marker is written before anything is deleted; a reset that fails after
+  deleting keeps it, labeled "Data reset (incomplete)" and linked to `data.reset.failed`; one that deleted nothing
+  leaves none. Only resets that delete counters mark `reset`; state resets (bans, cache entries, limiter, upstream,
+  recommendations, health history) mark `config_change` (P6). Families also cover the producer tables: tarpit
+  `tarpit_minute` and `tarpit_hold_minute`, activity `client_score_hour`, "everything" the rest; a single client
+  reset covers its bot scores and its `pair` rows; rule hit history is in no family (deleting it would make
+  FILTER-REMOVE read a filter as never hit).
+- **Security > Probes lists probes through the proxy route (ptable parity-2, rows 51 and 80).** Signatures `Non-Roblox
+  URL` and `Invalid URL` (the probed URL in the target column), `Host not allowed` (new in v2, the URL in the path
+  column) and `Sent a ROBLOSECURITY token (<where>)`. Deviation: when the marker was in a header value, v1 named the
+  header (`"<Name>" header carried ...`); v2 logs `a header carried a ROBLOSECURITY-shaped value`, because a header
+  name is caller text and as a signature it would give every name its own summary row and event budget (v1 B19).
+- **`POST /` is v1's instant 405 again (ptable parity-1).** `POST /` (and PUT, PATCH, DELETE and any other method
+  except GET, HEAD and OPTIONS) answers 405 with `Allow: GET, HEAD, OPTIONS` and a JSON body; it is no longer a
+  `not_roblox` proxy refusal (never tarpitted, not counted as proxied, no `Roxy-Refusal`, no spam probe count), and
+  the probe log shows `HTTP 405 via POST` with target `/`. Deviation: the body is FastAPI's standard `{"detail":"Method
+  Not Allowed"}`, as every other v2 405, where v1 sent the JSON string `"The method is not allowed for the requested
+  URL."`.
+- **Admin Page Visits counts again (ptable parity-3, rows 19 and 130).** A GET of `/admin` by a browser that never
+  signed in counts one visit. New cookie `roxy_admin_counted` (1 day, `Path=/admin`, `Secure; HttpOnly;
+  SameSite=Strict`, a visitor count marker). Deviation: a login takes back only a visit that browser made (v1
+  decremented on every first login and clamped at zero), because v2 sums visits per minute and an unmatched
+  decrement would cancel a real visitor.
+
+#### Review round 3: recommendations, dry runs and the LLM export (findings insights-1 to 14, mpjobs-1 to 8)
+
+- **Auto-apply (D7) respects a rule's off switch** and applies only proposals an evaluation refreshed within two
+  evaluation intervals (insights-3); it never overwrites a value an admin changed after the evaluation: the apply is
+  refused and the next evaluation proposes from the new value, so the 50% step limit is always measured from the
+  live value (insights-4).
+- **D7 rollbacks (insights-5, mpjobs-8).** A rollback that only has to wait (another action holding the
+  recommendation, or a busy hot.db) is retried every watch pass and the window shows "rollback pending"; a rollback
+  refused for good (for example an admin changed the row during the window) closes the window as kept with the
+  reason and sends one critical alert, "Roxy: auto-applied change could not be rolled back". Deviation: a new row in
+  the plan 17.7 alert table (type `auto_apply_rollback_failed`, runbook `auto-apply-rollback`), and no new watch state
+  (the table's CHECK constraint allows only `watching`, `kept`, `rolled_back` and `canceled`).
+- **Auto-apply and its watch are fenced by the leader lease (mpjobs-1, plan 5.6)**, and the auto-apply pass records an
+  idempotency key per interval; a leader that stalled past its lease writes nothing, and a partial apply is put back.
+- **Applying compares the previewed digest again inside the action lease (mpjobs-2)**: an evaluation that rewrote the
+  proposal in between gives 409 `changed_since_preview`, and nothing is applied without its own confirmation or
+  second factor. A busy hot.db during apply, undo, snooze or dismiss is 503 `unavailable` with `Retry-After: 5`
+  (mpjobs-3; it was 409 `wrong_state`, which now means only that another action holds the recommendation). If an
+  apply cannot be recorded, it is undone.
+- **A host suggestion adds its host to the live list (insights-13)**: `host_add`, and every list setting a
+  recommendation changes, is applied and previewed as a delta, so a host the admin removed after the evaluation is
+  never put back.
+- **The engine's early run after a Roblox 429 burst counts rows by arrival (insights-10)**, so a burst flushed late
+  still triggers; **a recommendation left out by the 50 per rule cap stays open (insights-11)** while its rule still
+  reports it.
+- **Dry run (insights-6, 9, 14; plan 11.3, 19.10 row 11).** Answers the cache would not keep (5xx, 429, other statuses)
+  are not stored in the replay, and 400, 403, 404 and 410 are kept for the error lifetime (the 11.6 card's dry run is
+  2,455 avoided calls, not 2,485); below 100% sampling counts are scaled to all requests (`scale` in the preview;
+  limits and buckets are thinned to the sample's share first, `parts` stay sample counts with `not_stored`); the
+  per-IP limit replays `allowed_requests_per_minute` per `throttle_reset_duration`, as production does, and a
+  THROTTLE-TUNE window change and a CACHE-NEG error lifetime change are dry-runnable. The per-IP replay keys by
+  address while the limiter groups IPv6 by prefix, so it is a lower bound (open).
+- **Request samples of POSTs the cache has off by `cache_post_requests` carry the key id the cache would use
+  (insights-7)**, so the 11.6 dry run and the TTL tuner see repeats. Such a POST is treated like a cached POST for
+  everything but caching: the User-Agent experiment assigns its arm per key (was per endpoint template), and a retry
+  inside `Retry-After` is recognized per key, so per body (was per method, target and query; accepted by the
+  integrator). Requests with the cache switched off, other methods and `cache_private` credential endpoints keep no
+  key; CACHE-NEG leaves samples the cache had off out of its count.
+- **Exact new rules (insights-8; plan 11.2 "scoped to one endpoint").** A new rule a recommendation proposes for one
+  endpoint is an anchored regex (`^users\.roblox\.com/v1/users/?$`, placeholders `[^/]{1,512}`), not a v1 glob, which
+  also covers every endpoint below it; this holds for every rule (cache, routing, endpoint block, endpoint limit), and
+  a change that creates a pattern rule is `safe_auto` only when it names exactly one endpoint. Admin and older glob
+  rules for a template are still recognized as its own rule. Deviation from v1's glob-only rules.
+- **LLM export, stricter trust rule (insights-1, insights-2).** Text with free letters is referenced whatever its
+  shape, a parameter name shaped like a rule fingerprint or a ULID included; only fingerprints of Roxy's rules stand
+  inline, and Roxy's own ids only in their id fields; setting values in `potential_issues` are references like in
+  `config`.
+- **LLM export, bot scores and the event loop (producers lane, mpjobs-6).** `top_clients.ips[].bot_score` carries the
+  recorded score (0 to 100 in the schema); a build cleans and splits all outside text on a worker thread and yields
+  between recommendation batches (the event loop is no longer held 0.1 to 0.3 s by a full export).
+- **H-CLOCK no longer counts the probe's bucket wait as clock skew (insights-12)**; a busy hour no longer reads as a
+  broken clock, and the detail shows `queue_wait_ms` and `call_ms`.
+
+#### Review round 3: storage, jobs, credential and the deploy (findings W2H-1 to 3, mpjobs-7)
+
+- **Security fix (W2H-1; C2 item 8, plan 9.15).** The bootstrap Roblox credential and the bootstrap rotator gateway URL
+  and password stay redacted everywhere for the whole life of a worker, however many values are pasted or tried from
+  the dashboard; going back to the bootstrap value (Delete UI value, Use bootstrap URL) no longer stores a reason that
+  repeats it in clear. The value in use is always registered, also after refused pastes.
+- **Strikes are no longer forgiven by retention (W2H-2, plan 10.4, v1 `_prune_once`):** a strike row stays until every
+  strike faded and the penalty ended (decay 0: until an admin forgives). The strikes table is capped at 200,000 rows
+  (plan 15.4 `MAX_TRACKED_THROTTLE_IPS`); rows still penalized are never dropped by the cap.
+- **Quiet recommendations outlive a shorter retention (W2H-3).** A dismissed or rolled back recommendation is kept
+  until its `dismiss_cooldown_days` quiet period ends (an applied one through its watch window), even when
+  `retention_recommendations_days` is shorter; the 50,000 closed-item cap removes such rows last.
+- **Leader jobs run on a fleet-wide schedule (mpjobs-7):** a leader change (deploy, recycle, crash) no longer reruns
+  them, and the hourly LLM export file is written once per hour across blue and green.
+- **Workers need metrics.db schema 6** (`--expand` adds `0005_producer_history` and `0006_annotation_scope`, both
+  expand only; the previous release keeps working on the new file).
+- **Refusal events name the rule rows the abuse verdict matched (`detail.rules`)**, and the Protection attempts tabs
+  show them as "Refused by" next to "Matching rule now" (closes the deferred P9 item "the rule that refused at the
+  time"; refusals recorded before this change name none).
+- **C7 admin login is now proven (docs lane request):** a test locks hot.db or control.db during a login and gets the
+  503 with its clear message within one busy timeout (then at once), never a 500 and never a session from a failed
+  step (`tests/security/test_auth_c7_unavailable.py`).
+- **Deploy: kept releases are the newest five by deploy order** (a sequence number per release), never by file time,
+  so a clock step can no longer remove a newer release; a rollback makes its release the newest. **The watch makes a
+  fixed number of checks** (60 s / 5 s = 12): on a slow machine it may take longer than 60 s, but it is never cut
+  short. **`perms.json` reports a wrong owner or mode on `/var/lib/roxy/ctl-proofs`** (roxy's 0700 directory).
+
+#### Lanes: producers, docs, parity table, tooling and CI, load (2026-10-09)
+
+Producers (`.remake/wave3b_reports/lane_producers.md`):
+- **Six production data gaps are closed:** rule hits for every rule table (not only User-Agent rules), fleet-wide
+  tarpit hold statistics, recorded bot scores, challenge and HTML-body flags per upstream attempt (with the rotator
+  exit each call used), a windowed fleet-wide metrics drop counter and disk growth history (metrics.db schema 5, seven
+  tables). Everything is summed in memory and written by the recorder's batch flush; the only request path change is
+  the tarpit's held flag in the arrival row its transaction already writes. The Protection, Clients, System and
+  Upstream areas show the new data.
+- **What counts as a rule hit (plan 10.9, FILTER-REMOVE).** A request the rule's row matched, whatever the verdict
+  (a User-Agent or endpoint rate rule counts even when its budget admitted the request, or an earlier limiter refused
+  it first); while admin regex rules exist, a request a cheap limiter refused runs no pattern and records no pattern
+  hit (9.9); one row per table per request; a deny entry that refuses an address also covered by a bypass entry
+  gets the `access_list` hit; header rules are keyed by row id. The User-Agent rule hit is now recorded on the match
+  (the aggregated `ua_rule_hit` event keeps its meaning).
+- **TARPIT-TUNE readings.** The arrival gap is the time since the same client's previous tarpit-eligible refusal,
+  filed under "after a hold" or "after an instant refusal"; "instant" covers only eligible refusals that were skipped
+  (tracking refusals in categories that are off would add a hot.db write). Holds are a fixed-bucket histogram per
+  category and minute (0.25 s to 55 s, then overflow; p95 interpolated); a planned hold that never waited counts as 0
+  s; a hot.db outage is a skip with no gap (C7).
+- **Recorded bot scores (plan 10.7).** A client's per-request inputs come from its first request in each 60 s scoring
+  interval; scores are kept per address and hour (largest and latest), at most 5,000 clients per worker per minute,
+  at least 2 days and 300,000 rows; an IPv6 key gives each of its last 4 addresses the key's score; bypass callers are
+  never scored.
+- **Challenge and HTML body (UP-CHALLENGE).** A challenge header (`rblx-challenge-*`, `cf-mitigated: challenge`), or
+  HTML where a JSON endpoint was asked (by the content type or the first 256 bytes); 3xx, 204 and 304 are never
+  flagged; a CDN's HTML 403 or 503 counts as a block page.
+- **SYS-METRICS-DROP** counts every worker's queue overflow and bad items over the last hour and goes quiet an hour
+  after the drops stop. **SYS-DISK `dims_per_minute` (plan conflict: the fixture README against the catalog help).**
+  The catalog wins (P3): minute rollup rows of the last full hour divided by 60, averaged over 7 days. Disk history is
+  one leader sample an hour plus table sizes every 6 hours (from `dbstat`), kept 90 days, first sample one interval
+  after a worker starts leading; a growth line shorter than a day is not used.
+- **Bounds are module constants** (`MAX_PRODUCER_KEYS` 20,000 and the others in `metrics/producers.py`,
+  `metrics/disk_history.py`, `abuse/pipeline.py`); providers remember each answer 10 s.
+
+Docs (`lane_docs.md`): `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/RUNBOOKS.md` and `docs/LEARNING_PATH.md`,
+checked by `tests/unit/test_docs_references.py`; `README.md` now links the guides and `deploy/README.md` the runbooks.
+- **Runbook headings use plan 13.2's short names**, so the health checks' links work with no mapping; each heading
+  names its plan 17.8 title. **38 runbooks instead of 14** (one per alert and per health check link), each with a
+  "Roll back" part.
+- **The "Credential rejected" runbook empties the bootstrap file instead of deleting it** (systemd refuses to start a
+  unit whose `LoadCredential=` file is missing; an empty file reads as "no bootstrap value"); plan C1 says "remove".
+  **Changed credential files are picked up by redeploying the running commit** (no downtime).
+- **Learning path exercises adapted to what exists** (chapter 1 runs the end-to-end test with `-s`, chapter 2 adds a
+  practice route and watches the mount check refuse it, chapter 11 compares two recommendation fixtures, chapter 12
+  runs the deploy sandbox tests). **The vulnerability report section names no contact address** (none exists; the
+  owner should add one). **Memory sizing states only configured bounds**, and now links `docs/PERFORMANCE.md`.
+
+Parity table (`lane_parity_table.md`, plan 19.11): `tests/V1_PARITY.md` has a row for every v1 smoke and deploy check
+(781 rows: 365 covered by existing v2 tests, 233 by a new `tests/parity/` test, 183 intentionally changed, 0 empty,
+0 pinned by an open finding since this round), generated and checked by `scripts/gen_v1_parity.py` (CI runs
+`--check`).
+- Readings recorded as intentional changes: blocked User-Agent drill-down and per-endpoint last headers come from the
+  Live feed and its capture; per-place addresses, User-Agents and statuses come from the place's recent requests (15
+  minute Live rows), per-client endpoint counts are the busiest endpoint of each minute (`top_endpoints_basis`); pause
+  and throttle-all drop counters count from the minute the state began; a stale worker is listed as not fresh
+  instead of hidden; the deploy keeps the newest five releases, builds an environment for every new release and has
+  no home-directory alert script. (The per-header fingerprint clear and the tarpit history readings are superseded by
+  parity-11 and the producers lane above.)
+
+Tooling and CI (`lane_tooling.md`):
+- **`scripts/ctl.py`, the operator CLI.** The plan 5.4 commands (`settings show|set` covers show-setting and
+  set-setting) plus `status`, `reset`, `backup-now`, `leader`, `jobs` and `bans`; `--json` everywhere; every change is
+  audited as `cli:<login name behind sudo>` and every line goes through `redact_text`. Deviation (plan 5.8 "ctl talks
+  to the socket"): control-plane commands write the databases directly through the same services, so they work with
+  every color stopped, and refuse any user but the databases' owner; only `export-llm`, `health-run` and `reset` use
+  the socket.
+- **A one-use proof for the dangerous socket actions (stricter than 5.8's group-only socket).** A reset, a
+  full-detail LLM export and a health run with H-CRED-AUTH need a `Roxy-Ctl-Proof` file that only the state
+  directory's owner can write, so the deploy user can never do them; in the shell it stands in for the dashboard's
+  fresh second factor. The factory reset stays dashboard-only; a CLI health run leaves the credential check out
+  unless `--include-credential` is given; a CLI LLM export says `generated_by: "cli"`, is audited before the bytes
+  leave and is written 0600; `flush-metrics` sets the fleet-wide `flush_requested_at` like the System page.
+- **"Back up now" reaches the root backup** (the earlier plan conflict "makes on-server snapshots" is resolved for the
+  CLI and the dashboard): the roxy user writes `/var/lib/roxy/backup-request`, `roxy-backup-request.path` starts
+  `roxy-backup.service`, and `backup.sh` consumes it, skips within 10 minutes of a good backup and records
+  `last_request`. New state directory entries: `backup-request` and `ctl-proofs/`.
+- **`advisories.json` at deploy (H-VERSION).** Counts come from CI's pip-audit of the production requirements only
+  (`uv export --no-dev`), so a dev-only advisory never makes H-VERSION warn; CI still fails on fixable advisories in
+  the whole environment; a hand deploy records "not recorded", never zero.
+- **CI** (`ci.yml`): the unit job is the catch-all for suites without a job; `systemd-analyze verify` runs in the
+  24.04 container only; container images are pinned by tag, not digest (a digest needs a network lookup); the runner
+  allows unprivileged user namespaces, so the namespaced deploy tests run instead of skipping; CI now runs
+  `tests/deploy` (parity row 102) and `gen_v1_parity.py --check`. CI has not run on GitHub yet. **Shadow week:** not
+  run (D1 = never); `scripts/shadow_report.py` describes what the report would contain.
+
+Load harness (`lane_load.md`, `docs/PERFORMANCE.md`, plan 19.4, 6.7, 19.10 row 7):
+- **A Python harness instead of locust or k6** (plan 19.4): neither can start gunicorn, the mock and temporary state in
+  one private network namespace, read metrics.db or sample worker memory; no new dependency.
+- **Numbers from the WSL 2 development machine, not a staging VM of the production size** (6.7, 19.10): latency
+  figures are indicative; the quiet-machine rerun in `docs/PERFORMANCE.md` is the reference before release. **The
+  flood runs on the app limits only** (no nginx in the harness).
+- **One steady wall clock for client, mock and Roxy** (`tests/load/clock.py`), because WSL 2's CLOCK_MONOTONIC runs
+  about 9.5% fast and Roxy paces by the wall clock; the old harness made the mock 9.5% more lenient, which is why the
+  replay test passed on one run and failed on the next.
+- **Plan 19.10 row 7 test split:** `test_replay_profile.py` is two tests over one harness run; the clean-run and
+  avoided-share checks are strict (49.5 to 49.8% avoided against 40%), and the unchanged 0.1% Roblox 429 assertion is
+  a non-strict xfail for finding LOAD-1: at production defaults v2 gets 2 Roblox 429s in about 1,020 calls (0.196%)
+  in 10 of 10 runs (avatar outfits, busiest 60 s 61 calls against 60), from the adaptive controller cutting the
+  configured rate rather than the measured one and never cutting the burst; over 30 minutes it is 0.095%. A lead
+  decision (LEAD_NOTES). The replay warms up 5 s instead of 20 s to fit the 5 minute budget.
+
+#### Review round 3: integration (2026-10-09)
+
+- **Producer history jobs wired** (`metrics_disk_history` hourly, `metrics_producer_prune` every 600 s, leader only,
+  never at start); until now no disk samples were taken and the schema 5 tables were never pruned.
+- **Every area's table download reads one page at a time** (Traffic, Endpoints, Clients, Security, Protection,
+  Health, System errors, Recommendations and its history, Cache endpoints, and the `upstream_429` dataset), and the
+  `refusal_reasons` and client datasets carry the new columns.
+- **Chart notices for cache numbers** react to a cache statistics reset (hit ratio and the cache state counts), not
+  to resets of other data.
+- **The flaky health API test was a test isolation bug, not a product defect:** moving the fake clock past the
+  re-auth window also made the leader's scheduled health run due, and that run rightly held the one-run lease.
+- See `.remake/wave3b_reports/r3_integrate.md` for every request applied, deferred or rejected.
+
+#### Review round 4: verification of the round 3 fixes (2026-10-09; findings secfix-1 to 7, LOGICFIX-1 to 6)
+
+Two lenses checked the round 3 fixes and filed 13 findings (1 high, 7 medium, 5 low); all are fixed. Report:
+`.remake/wave3b_reports/r4_refix.md`. Where these differ from the entries above, these win.
+
+- **A lagging worker can no longer let a stale session undo a security change (secfix-1, high; plan 9.6, C6).** The
+  fresh second factor, the spam detector arming rule and the high-risk confirmation are judged again inside the
+  settings write, on the keys control.db is about to change; before, a worker whose settings copy was up to a second
+  behind another worker's change judged a request "unchanged" and the write put the old value back (switching the
+  admin allowlist off again, the credential back on, deleting a shortened re-auth window, or arming the spam
+  detectors without the collateral preview). A save can therefore answer 403 `reauth_required` or 422
+  `confirmation_required` for a key the page still showed at its old value.
+- **Scheduled credential health checks need the fresh second factor (secfix-6, DESIGN 14.4)**, like a manual credential
+  run: `health_auto_include_credential` joins `export_include_ips` in the settings that need it.
+- **Exports hide IPv6 clients written after a word (secfix-2, secfix-3; plan 9.15, 12.3).** `ip:2001:db8:1:2::/64`
+  (the spam and abuse subjects, a client's /64 limit key), `bypass:<network>` and `ban:<address>` are masked in every
+  download and in the LLM export (the summary export kept the raw network); one masker serves both now
+  (`core/ipmask.py`). Deviation from round 3: a version after a product name (`Chrome/120.0.0.0`) is kept only in
+  User-Agent columns and fields; anywhere else `<word>/<address>` may be a path and is masked (privacy first).
+- **Back up now always asks the root backup (secfix-4).** The request is written right after the audited intent,
+  whatever the on-server snapshots can do; a copy that does not fit `snapshots_max_bytes` or the free disk is skipped
+  with its reason (`skipped`), and 409 `not_feasible` remains only when neither the request nor any copy could be made.
+- **Every table names its caller-text columns (secfix-5, DESIGN 13.1).** The probe log, admin logins, the Protection
+  attempts tabs, CSP reports, fingerprints, events, audit, recommendations and the rest list `caller_text` from their
+  columns (a discovery test checks every table), so the pages render them as plain text.
+- **A probe flood with a new HTTP method per request is folded (secfix-7, v1 B19).** A client error's signature names
+  one of ten method classes (the standard methods, else `OTHER`); the caller's own method token goes to the redacted
+  target column. Deviation: v1 wrote the raw method in the reason.
+- **KPI deltas over a reset are honest everywhere (LOGICFIX-1, plan 6.8).** The Cache page tiles, the endpoint
+  drill-down totals, the Overview's "rotator bytes today" and the Traffic trends rows show the reset notice and no
+  delta when a reset emptied either window (they computed their own deltas before), and their pages list the reset.
+- **Updating an older glob rule is never auto-applied (LOGICFIX-2, plan 11.2).** A glob also covers every endpoint
+  below it, so a recommendation that changes a template's own v1 glob rule (every rule the migrator imports) is not
+  "scoped to one endpoint": it is not `safe_auto`, and its card says why. Deviation: the independent insights fixture
+  `up_429_endpoint__get_raise_ttl` expected `safe_auto: true` for exactly that update; its expectation was changed (the
+  one edit to that file, with a comment).
+- **The early evaluation after a Roblox 429 burst survives a data reset (LOGICFIX-3).** The trigger poll remembers its
+  cursor row; when a reset removed it (SQLite then reuses the ids), that poll counts by time.
+- **Dry runs (LOGICFIX-4, 5, 6; plan 11.3, 19.10 row 11).** A request Roblox never answered (a connect error or a
+  timeout) is not replayed as a stored answer; limit previews (THROTTLE-TUNE, the place limit, endpoint rules) replay
+  the refused requests too, which production now samples (`refusal_samples`, metrics.db schema 7: refusals by the
+  per-IP throttle and every later check, at `request_sample_pct`, at most 6,000 a minute per worker); each sample
+  counts for 100 / the rate it was taken at (stored on each row since schema 7, else read from the settings history),
+  so lowering `request_sample_pct` no longer inflates the next hour's previews.
+- **Workers need metrics.db schema 7** (`--expand` adds `0007_limit_samples`, expand only; the previous release keeps
+  working on the new file).
+- **Found while gating: the batch writer's loop could leave its last items behind.** When the stop request arrived
+  while a flush ran, an item added after that flush took its batch was never written (`storage/batch.py
+  BatchWriter.run` promised one more flush); it now flushes once more (seen as an intermittent
+  `test_run_loop_flushes_periodically_and_on_stop` under load, now pinned by a deterministic test).
 
 ## Progress notes per phase
 
@@ -1793,20 +2167,60 @@ Deviations:
   `tests/unit/admin_api` 109, `tests/security/test_admin_routes.py` 15. Under real gunicorn (2 workers), an admin
   signed in through the password and TOTP steps gets the OpenAPI document (26 tags, more than 200 paths) and an
   anonymous caller gets 401 `unauthorized`.
-- Reviews: in progress (wave 3b had not been reviewed when this note was written).
+- Reviews (2026-10-09): six lenses reviewed the whole of wave 3b and filed 54 findings, each pinned by a strict
+  xfail test: apisec 9 (1 high, 4 medium, 4 low), insights 14 (1 high, 9 medium, 4 low), mpjobs 8 (1 high, 6
+  medium, 1 low), parity 15 (9 medium, 6 low), the parity table lane 5 (1 medium, 4 low) and the wave 2 highs 3 (2
+  high, 1 medium): 5 high, 30 medium, 19 low. The P9 share: apisec-1 to 9 (fresh second factor for the settings that
+  guard the admin, addresses masked in every exported cell, wrong methods no longer reveal admin paths, the
+  Protection confirmation, bounded Back up now, bounded table downloads, huge ids, the stream's allowlist check, the
+  bootstrap guard mount check), mpjobs-4 and 5 (the reset marker, download memory) and parity-1 to 15 (v1 columns and
+  numbers of the Overview, Traffic, Upstream, Protection, Clients, Endpoints, Security, Cache and Data areas).
+- Fix pass (2026-10-09, nine fixers in parallel, then the integration): all 54 findings fixed, none rejected (two pairs
+  were one defect each: insights-5 with mpjobs-8, parity-6 with the parity table's parity-5); every strict xfail is
+  gone and each test pins the fixed behavior, most of them strengthened; the lanes ran beside it (see "Lanes of wave
+  3b" below). The integration applied or verified every fixer and lane request (46 from the fixers), rejected none,
+  deferred three optional ones and left the load lane's three decisions to the lead (reasons in
+  `.remake/wave3b_reports/r3_integrate.md`); it also wired the producer history jobs, moved every area's download to
+  the page-by-page builder, added metrics.db schema 6 (`annotations.reset_tables`), and found the root cause of the
+  "flaky" health API test (a test isolation bug: the fake clock jump made the scheduled health run due).
+- Gate (2026-10-09, after the fix pass and the integration): the final full run without -x gave 9479 passed, 0
+  failed, 0 errors, 0 skipped and 1 xfailed (the non-strict LOAD-1 marker) in 2305 s (deploy 422, e2e with Playwright
+  77, health 194, insights 883, integration 602, load 23 and 1 xfailed, migration 99, multiprocess 87, parity 49,
+  security 726, unit 6317), against 8823 at the wave 3b gate. `lead_gate.sh` (pytest -x plus the static checks):
+  9479 passed and 1 xfailed in 2319 s; ruff check and format (720 files), mypy (324 files), `check_style.py` for the
+  tree and REMAKE_PLAN.md, `gen_settings_docs.py --check`, `gen_v1_parity.py --check` (781 rows, 0 empty, 0
+  problems) and bandit `-ll` (0 findings; 34 low below it) green. The replay test alone: 1,018 upstream calls, 49.6%
+  avoided, 2 Roblox 429s (0.196%, LOAD-1, at 50.4 s and 157.0 s, avatar outfits 61 calls against 60). The admin API
+  schema lists 225 paths, 271 method and path pairs and 26 tags.
+- Review round 4 (2026-10-09, `.remake/wave3b_reports/r4_refix.md`): two lenses verified the round 3 fixes and filed
+  13 findings, each pinned by a strict xfail; all fixed, none rejected. The P9 share: secfix-1 (high: the fresh
+  factor, arming and confirmation judged inside the settings write, `settings.WriteRules`), secfix-2 (IPv6 subjects
+  masked in every download, one masker `core/ipmask.py`), secfix-4 (Back up now always asks the root backup),
+  secfix-5 (`caller_text` from every table's columns, a discovery test), secfix-6 (`health_auto_include_credential`
+  needs the fresh factor), secfix-7 (probe signatures by method class) and LOGICFIX-1 (reset notices on the Cache
+  tiles, endpoint drill-down, rotator tile and Traffic trends). Found while gating: `BatchWriter.run` could leave the
+  items added during its last flush behind (fixed, deterministic test).
+- Gate (2026-10-09, after review round 4): the full run without -x gave 9539 passed, 0 failed, 0 errors, 0 skipped
+  and 1 xfailed (LOAD-1, non-strict) in 2388 s (deploy 422, e2e with Playwright 77, health 194, insights 890,
+  integration 631, load 23 and 1 xfailed, migration 99, multiprocess 87, parity 57, security 730, unit 6329), against
+  9231 passed, 5 failed and 60 xfailed on 3861e65. `lead_gate.sh` right after: 9539 passed and 1 xfailed with -x in
+  2386 s; ruff check and format (740 files), mypy (325 files), `check_style.py` for the tree and REMAKE_PLAN.md,
+  `gen_settings_docs.py --check`, `gen_v1_parity.py --check` (781 rows, 0 problems) and bandit `-ll` (0 findings; 34
+  low below it) green; all 517 insights fixture cases pass.
 - Deviations: see "Wave 3b (P9 admin API, P10 insights and health)" above.
 - Deferred (each with its reason in `.remake/wave3b_reports/integrate.md`):
   - Service helpers for what the routes compose today in one control.db transaction with `audit.record` and
     `bump_config_version`: `RulesService.delete_where` and `delete_bans`, `throttle.reset_limiter_state`,
     `passkey_rename` and one shared `revoke_sessions`.
-  - Storing the refusal detail in the refusal event, so the attempts tabs can show the rule that refused at the time.
+  - (Done in review round 3: refusal events carry the rule rows that refused, and the attempts tabs show them.)
   - Trace fields on the Live row (`bucket_key`, `cooldown_source`, `egress_identity`), `RotatorPool.session_ages`
     (`GET /egress/sessions` answers `session_lifetimes: null`) and an AIMD history table (`GET /upstream/aimd` has no
     `history`); the routes label what is inferred or missing.
   - A metrics export mode (exports page through 250 rows today).
-  - `deploy/`: a `roxy-backup-request.path` unit, so "Back up now" could start the full root backup.
-  - For P11: the shell's `u.prefs` URL (`/admin/api/v1/prefs`), the table macro's `size` and `dir` against the API's
-    `page_size` and `order`, and the dashboard buttons of the LLM export.
+  - (Done by the tooling lane: `roxy-backup-request.path`; "Back up now" asks the root backup since review round
+    3.)
+  - For P11: every page item is collected in `.remake/P11_INPUTS.md` (the shell's `u.prefs` URL, the table macro's
+    `size` and `dir`, the LLM export buttons, the Help page's runbook URLs and the rest).
 - Open:
   - `UpstreamService.reset_state` clears only this worker's unshared cooldowns; another worker that kept one through
     a hot.db outage writes it back later (a reset epoch honored by the mirror loop would close it).
@@ -1834,7 +2248,8 @@ Deviations:
     SYS-ERRORS), metrics.db schema 2 with nine history tables and the recorder hooks that fill them, and the fixture
     loader and harness. 287 tests; the plan 11.6 card comes out exactly (critical, 412 x 429, 71%, TTL 600 with SWR
     120 on a new GET,POST rule, `fallback_on_429` 1 to 0, `cache_post_requests` off to allowlist, endpoint bucket 120
-    to 89 per minute, dry run 2,485 avoided calls of 2,845 samples, not safe_auto).
+    to 89 per minute, dry run 2,485 avoided calls of 2,845 samples, not safe_auto; 2,455 since review round 3,
+    when the replay stopped storing answers the cache would not keep, finding insights-6).
   - The rules: 14 UP-* rules (173 tests), 15 cache, egress and credential rules (165 tests) and 18 abuse, filter,
     system and security rules (176 tests); with the 3 core rules, all 50 rules of the catalog. Every proposed change
     of the last group is also previewed through the actions module, so the apply path accepts it.
@@ -1858,26 +2273,42 @@ Deviations:
   0.86 s, later runs 0.02 s and 0.08 s, with a worst event loop lag of 84 ms during boot. A state at the previous
   release's schema upgrades with only the three new metrics.db expand migrations, and the previous release's
   statements still work on it (`test_storage_migrate_upgrade.py`).
-- Reviews: in progress (wave 3b had not been reviewed when this note was written).
+- Reviews and fixes (2026-10-09): see the P9 note for the whole review. The P10 share: insights-1 to 14 (the
+  LLM export trust rule, auto-apply guardrails and rollbacks, the dry run's store policy, sampling and windows, exact
+  single-endpoint rules, trigger and cap bookkeeping, H-CLOCK, host deltas) and mpjobs-1, 2, 3, 6, 7 and 8 (fenced
+  auto-apply, the digest checked inside the lease, 503 on a busy hot.db, the export off the event loop, the fleet-wide
+  leader schedule, waiting rollbacks); all fixed. The plan 11.6 dry run is now 2,455 avoided calls (the fixture range
+  is 2,230 to 2,800), and every one of the 162 insights fixture files still passes.
+- Review round 4 (2026-10-09): see the P9 note. The P10 share: secfix-3 (the LLM export masks IPv6 subjects with the
+  shared masker), LOGICFIX-2 (an update of a template's own legacy glob rule is not `safe_auto`, and the card says
+  why; the independent fixture `up_429_endpoint__get_raise_ttl` now expects `safe_auto: false`, its one edit),
+  LOGICFIX-3 (the 429 burst trigger survives a reset that reused ids), LOGICFIX-4 (a request Roblox never answered is
+  not replayed as a stored answer), LOGICFIX-5 (limit dry runs replay the refused requests: metrics.db schema 7
+  `refusal_samples`) and LOGICFIX-6 (each sample counts for the rate it was taken at: `request_samples.sample_pct`,
+  else the settings history); all fixed. `tests/insights` 890 passed; the plan 11.6 dry run is still 2,455 avoided
+  calls.
 - Deviations: see "Wave 3b (P9 admin API, P10 insights and health)" above.
 - Deferred (reasons in `.remake/wave3b_reports/integrate.md`):
   - Transaction-composable service variants (`update_in(conn, ...)` and the like), so apply and undo write in one
     control.db transaction instead of compensating.
-  - Rule hits for endpoint blocks, endpoint rules, header rules and bypass entries (each abuse check would have to
-    return its matched row); FILTER-REMOVE and SEC-BYPASS-FOREVER use fallbacks meanwhile.
-  - Challenge and HTML-body detection in `record_attempt` (UP-CHALLENGE cannot fire in production), a per-arm
-    User-Agent experiment counter, and the 18.4 `credential_comparison` producer (CRED-UNUSED stays quiet).
+  - (Done by the producers lane: rule hits for every rule table and challenge and HTML-body detection.) Still
+    deferred: a per-arm User-Agent experiment counter and the 18.4 `credential_comparison` producer (CRED-UNUSED
+    stays quiet).
   - Catalog additions are lead decisions: `insight_up_timeout_min_calls` (UP-TIMEOUT has no minimum sample) and
     promoting fixed readings to `insight_params`; memoized providers and de-duplicated queries are optional (parity
     tests guard the copies).
-  - `scripts/ctl.py export-llm` with its internal socket route (the plan 12.2 CLI), one owner for the 12.5 block, and
-    `advisories.json` written at deploy (H-VERSION says "not recorded" until then).
+  - One owner for the 12.5 block. (`scripts/ctl.py export-llm` with its internal socket route and `advisories.json`
+    at deploy were built by the tooling lane.)
 - Open:
-  - Production data still missing, so the rules that need it stay quiet or say so and never guess: rule hits other
-    than User-Agent rules, challenge and HTML-body flags, `credential_comparison` events, a bot score source, tarpit
-    hold statistics (TARPIT-TUNE is silent), a per-arm User-Agent counter (UP-UA-EXPERIMENT reads at most 50,000
-    samples), a windowed fleet-wide metrics drop counter (SYS-METRICS-DROP reads one worker's cumulative count and
-    can fire again after an apply until that worker restarts) and disk growth history.
+  - Production data still missing, so the rules that need it stay quiet or say so and never guess:
+    `credential_comparison` events and a per-arm User-Agent counter (UP-UA-EXPERIMENT reads at most 50,000
+    samples). The producers lane closed the other six gaps (rule hits, challenge and HTML-body flags, bot scores,
+    tarpit hold statistics, a windowed fleet-wide drop counter, disk growth history).
+  - The dry run's per-IP replay keys by address while the limiter groups IPv6 by prefix (a lower bound until the
+    samples record the limiter key; since review round 4 it does see the refused requests, up to 6,000 refusal
+    samples a minute per worker); requests while the cache is switched off carry no key id until the dry run models
+    `cache_enabled`; CACHE-NEG still scales its refetch count by the live `request_sample_pct` (its evidence, not the
+    dry run).
   - Every in-process test app's leader runs `insights_evaluate` and `llm_export_file` at start (the suite took about
     3 minutes longer); health checks in in-process tests log `health_check_failed` with a traceback when the socket
     guard refuses their DNS lookups (noise, not failures).
@@ -1890,6 +2321,41 @@ Deviations:
     rollup fallback counts any header refusal as a hit for every header rule; under a spam storm some detections lose
     their subject to the recorder's event budget; the `x-csrf-token` age is not tracked (UP-CSRF-LOOP shows the
     setting).
+
+### Lanes of wave 3b: producers, docs, parity table, tooling and CI, load harness, 2026-10-09
+
+- Producers (`.remake/wave3b_reports/lane_producers.md`): six production data gaps closed (rule hits for every rule
+  table, fleet-wide tarpit hold statistics, recorded bot scores, challenge and HTML-body flags per attempt with the
+  rotator exit each call used, a windowed fleet-wide drop counter, disk growth history), metrics.db schema 5 with
+  seven tables, all summed in memory and written by the batch flush; 61 new tests; the jobs were wired by the
+  integration. Deviations: see "Lanes" under Wave 3b above.
+- Docs (`lane_docs.md`): `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/RUNBOOKS.md` (38 runbooks and a
+  machine-readable link index) and `docs/LEARNING_PATH.md` (the 12 chapters of plan 18.5), checked by
+  `tests/unit/test_docs_references.py` (19 tests: every file, dotted name, test id, route, setting, script flag and
+  anchor the guides name, the link index against the alert catalog and the health checks, and drift against the
+  code). The integration linked the guides from `README.md` and `deploy/README.md` and added the new alert to the
+  runbooks.
+- Parity table (`lane_parity_table.md`, plan 19.11): `tests/V1_PARITY.md` has 781 rows, every v1 smoke check (735
+  call sites) and deploy check (46): 365 covered by existing v2 tests, 233 by 37 new `tests/parity/` tests, 183
+  intentionally changed, 0 empty; the 5 findings it pinned (17 rows) are fixed, so 0 rows are pinned by an open
+  finding. `scripts/gen_v1_parity.py --check` runs in CI.
+- Tooling and CI (`lane_tooling.md`): `scripts/ctl.py` (the operator CLI, 40 tests), `scripts/shadow_report.py` (14),
+  the four operator routes of the internal socket with the one-use state directory proof, `roxy-backup-request.path`
+  (12), `advisories.json` at deploy (14), and a rewritten `ci.yml` (32 workflow tests) whose jobs cover every test
+  directory, `tests/deploy` included (parity row 102). CI has not run on GitHub yet: apt nginx and setup-uv in the
+  containers, `playwright install --with-deps`, pip-audit's flags on the hashed export and the AppArmor sysctl are
+  unproven until the first push.
+- Load harness (`lane_load.md`, `docs/PERFORMANCE.md`): the harness puts client, mock and Roxy on one steady wall
+  clock (the old one ran the mock about 9.5% lenient on WSL, which is why the replay test passed on one run and failed
+  on the next); `pytest tests/load` 23 passed and 1 xfailed. The v1-like replay (10 requests a second, 200 s, cold
+  cache, production defaults): about 1,020 upstream calls, 49.5 to 49.8% of calls avoided (row 7 asks 40%), and 2
+  Roblox 429s (0.196%, against 0.1%) in 10 of 10 runs, all on avatar outfits whose busiest 60 s reached 61 calls
+  against the mock's 60 (finding LOAD-1: the adaptive cut is taken from the configured rate, the burst is never cut;
+  over 20 minutes 0.160% and 0.142%, over 30 minutes 0.095%). A lead decision; the assertion is a non-strict xfail and
+  was not tuned. Also measured on the dev box (indicative): hit p99 26.9 ms and miss overhead p99 78 ms at 200 req/s,
+  a throughput ceiling near 205 req/s from hot.db write lock waits (LOAD-3), and the leader worker growing from 157 to
+  230 MiB over 33 minutes, past `MemoryHigh` under sustained load (LOAD-2). The quiet-machine rerun in
+  `docs/PERFORMANCE.md` is the reference before release.
 
 ## Parity checklist (plan section 4)
 
@@ -1933,7 +2399,7 @@ not store. Wave 3b also added API tests to the covered rows 15, 25, 29, 32, 45, 
 | 16 | Client errors as probes, 5xx emailed | covered | `test_core_middleware.py::test_client_errors_reach_the_probe_hook`, `test_notify_notifier.py::test_unhandled_errors_raise_the_v1_error_alert`, `test_metrics_recorder.py::test_core_error_hooks_record_probes_and_errors` |
 | 17 | Security headers | covered | `test_core_security_headers.py::test_page_csp_is_exactly_the_plan_policy`, `test_core_security_headers.py::test_other_security_headers_on_every_response`, `test_core_security_headers.py::test_hsts_only_when_enabled`, `test_core_security_headers.py::test_proxied_response_gets_sandbox_csp` |
 | 18 | Static asset cache busting | covered | `test_core_templating.py::test_static_url_uses_content_hash`, `test_core_templating.py::test_hashed_static_files_cache_headers`, `test_public_pages.py::test_static_assets_are_hashed_and_immutable` |
-| 19 | Visitor classification | covered | `test_metrics_visitors_catalog.py::test_classify`, `test_metrics_visitors_catalog.py::test_crawler_markers_equal_v1`, `test_metrics_recorder.py::test_visits_and_security_helpers` |
+| 19 | Visitor classification | covered | `test_metrics_visitors_catalog.py::test_classify`, `test_metrics_visitors_catalog.py::test_crawler_markers_equal_v1`, `test_metrics_recorder.py::test_visits_and_security_helpers`, `test_v1_visitors.py::test_v1_anonymous_admin_page_visits_are_counted_and_known_admins_are_not`, `test_v1_visitors.py::test_v1_the_owners_first_login_takes_back_its_own_admin_page_visit` |
 | 20 | Egress paths: direct, credential, rotator | covered | `test_upstream_routing.py::test_default_is_direct_and_rotator_weight_zero_never_wins`, `test_upstream_routing.py::test_routing_never_selects_credential_for_non_allowlisted`, `test_credential_suite.py::test_credential_path_has_no_proxy`, `test_confinement_routing.py::test_caller_traffic_never_carries_the_credential` |
 | 21 | Weighted egress choice and shift | covered | `test_upstream_routing.py::test_weights_split_traffic`, `test_upstream_routing.py::test_direct_shift_toward_rotator`, `test_upstream_routing.py::test_shift_uses_direct_fill` |
 | 22 | Fallback policy, never onto the credential | covered | `test_upstream_no_cascade.py::test_no_cascade_to_the_credential_ever`, `test_upstream_service.py::test_429_fallback_never_onto_credential`, `test_upstream_status_policy.py::test_no_rule_retries_onto_another_egress_immediately_on_429` |
@@ -1965,7 +2431,7 @@ not store. Wave 3b also added API tests to the covered rows 15, 25, 29, 32, 45, 
 | 48 | Login lockout | covered | `test_admin_auth_lockout.py::test_reserve_counts_before_checking_and_refuses_at_the_limit`, `test_auth_lockout.py::test_two_workers_share_one_count`, `test_auth_lockout.py::test_window_slides`, `test_auth_global_guard.py::test_guard_slows_but_never_refuses`, `test_rr_auth_lockout_retention.py::test_lockout_window_longer_than_an_hour_survives_retention` |
 | 49 | Pause with reason and schedule | covered | `test_abuse_golden.py::test_pause_default`, `test_abuse_golden.py::test_pause_reason_and_scheduled_window`, `test_abuse_review_fixes.py::test_r1_pause_message_default_setting_is_used`, `test_abuse_switches_rules.py::test_schedule_and_clear`, `test_migration_service_state.py::test_migration_paused_v1_starts_paused`, `test_rr_spec_pause_retry_after.py::test_spec_9_scheduled_retry_after_covers_the_rest_of_the_window`, `test_rr_spec_state_reasons.py::test_spec_2_switch_reasons_never_store_a_dash` |
 | 50 | Ignored paths | covered | `test_abuse_golden.py::test_ignored_path`, `test_service.py::test_ignored_paths_refuse_roblox_endpoints` |
-| 51 | Probe logging | covered | `test_abuse_golden.py::test_unsafe_url`, `test_abuse_golden.py::test_not_roblox`, `test_metrics_security_events.py::test_probe_signature` |
+| 51 | Probe logging | covered | `test_abuse_golden.py::test_unsafe_url`, `test_abuse_golden.py::test_not_roblox`, `test_metrics_security_events.py::test_probe_signature`, `test_v1_public.py::test_v1_proxy_probes_reach_the_probe_log`, `test_abuse_security_records.py::test_proxy_probes_reach_the_security_probe_log`, `test_v1_public.py::test_v1_post_to_the_home_page_is_a_json_405_with_allow` |
 | 52 | Two cache tiers | covered | `test_cache_store_parts.py::test_memory_tier_lru_and_caps`, `test_cache_purge.py::test_purge_invalidates_memory_tier_in_another_process`, `test_cache_workers.py::test_a_store_in_one_worker_is_a_hit_in_another` |
 | 53 | Cache key format and ids | changed: ambiguous names and values are percent-encoded, POST keys carry the full SHA-256 of the body and forwarded caller headers are part of the key, so those ids differ from v1; plain GET ids are unchanged (sections 3 and 9 over row 53; LEAD_NOTES 9, plan 9.13) | `test_cache_keys.py::test_v1_worked_examples_keep_their_ids`, `test_cache_keys.py::test_cache_key_poisoning_case_lead_notes_9`, `test_cache_keys.py::test_body_hash_is_full_sha256_and_get_bodies_are_ignored`, `test_cache_keys.py::test_key_text_is_one_to_one` |
 | 54 | Ignored cache params | covered | `test_cache_keys.py::test_ignored_params_are_exact_case_sensitive_and_remembered`, `test_cache_service.py::test_ignored_params_share_one_entry`, `test_defaults.py::test_ignored_params_are_the_v1_suggestions_without_v` |
@@ -1980,26 +2446,26 @@ not store. Wave 3b also added API tests to the covered rows 15, 25, 29, 32, 45, 
 | 63 | Buffered hit counting | covered | `test_cache_service.py::test_hits_and_change_observations_are_flushed`, `test_cache_store_parts.py::test_hit_buffer_is_bounded_and_restorable` |
 | 64 | Cache disk health | covered | `test_cache_store_parts.py::test_disk_health_recovers_after_a_later_write`, `test_cache_service.py::test_disk_write_failure_keeps_serving_from_memory`, `test_cache_flights.py::test_failed_cache_db_write_is_counted_and_the_answer_unaffected` |
 | 65 | Key spread diagnostic | covered (the apply route is built, the P11 Recommendations page draws the button; CACHE-KEYSPLIT never proposes ignoring a text or id parameter, see Wave 3b) | `test_cache_spread.py::test_cache_buster_is_suspect_like_v1_smoke`, `test_cache_spread.py::test_large_groups_can_still_be_suspect_b9_fixed`, `test_cache_purge.py::test_admin_views_and_key_spread`, `test_rules_cache_egress.py::test_rule_fixture`, `test_rules_cache_egress.py::test_text_and_id_parameters_are_never_ignored`, `test_rules_cache_egress.py::test_spread_rows_match_the_shared_tier`, `test_api_cache.py::test_key_spread_finds_the_splitting_parameter`, `test_api_recommendations.py::test_apply_then_undo_through_the_audited_services` |
-| 66 | Cache browser, inspect, purge, refresh | partial: P11 (Cache page) | `test_cache_purge.py::test_purge_scopes_report_true_counts`, `test_cache_purge.py::test_purge_host_regex_expired_and_all`, `test_cache_workers.py::test_purge_reaches_the_other_workers_memory_tier`, `test_cache_purge.py::test_admin_views_and_key_spread`, `test_api_cache.py::test_browser_search_sort_page_and_hidden_handoff_rows`, `test_api_cache.py::test_inspect_and_refresh_a_get_entry`, `test_api_cache.py::test_refresh_a_post_entry_resends_its_body`, `test_api_cache.py::test_purge_every_scope_is_audited_first` |
+| 66 | Cache browser, inspect, purge, refresh | partial: P11 (Cache page) | `test_cache_purge.py::test_purge_scopes_report_true_counts`, `test_cache_purge.py::test_purge_host_regex_expired_and_all`, `test_cache_workers.py::test_purge_reaches_the_other_workers_memory_tier`, `test_cache_purge.py::test_admin_views_and_key_spread`, `test_api_cache.py::test_browser_search_sort_page_and_hidden_handoff_rows`, `test_api_cache.py::test_inspect_and_refresh_a_get_entry`, `test_api_cache.py::test_refresh_a_post_entry_resends_its_body`, `test_api_cache.py::test_purge_every_scope_is_audited_first`, `test_r3_parity_cache.py::test_parity_15_purge_matching_purges_exactly_what_the_search_lists`, `test_r3_parity_cache.py::test_parity_15_search_purge_removes_exactly_the_listed_entries_and_nothing_else` |
 | 67 | Cache stats and honest avoided calls | partial: P11 (Cache page) | `test_metrics_queries.py::test_avoided_calls_are_honest`, `test_metrics_recorder.py::test_upstream_429_internal_background_and_egress`, `test_cache_service.py::test_hits_and_change_observations_are_flushed`, `test_api_cache.py::test_stats_are_honest`, `test_api_overview.py::test_kpi_tiles_are_honest_and_carry_sparklines_and_deltas` |
-| 68 | Status codes by source | partial: P11 (Traffic page) | `test_metrics_recorder.py::test_dims_row_holds_every_dimension`, `test_metrics_recorder.py::test_cache_state_and_source_strings`, `test_metrics_queries.py::test_series_reads_compacted_levels_plus_the_tail`, `test_api_traffic.py::test_status_sources_and_the_429_verdict` |
-| 69 | Request counts and traffic over time | partial: P11 (Overview and Traffic pages) | `test_metrics_rollups.py::test_minutes_compact_into_hours_exactly`, `test_metrics_rollups.py::test_days_and_months_in_ui_timezone`, `test_metrics_queries.py::test_comparison_windows`, `test_metrics_pipeline.py::test_flush_loop_compaction_and_queries`, `test_metrics_mp.py::test_metric_totals_equal_requests_sent`, `test_api_traffic.py::test_requests_stacked_by_outcome_with_compare`, `test_api_traffic.py::test_verbs_series_and_table_with_export`, `test_api_traffic.py::test_trend_tables` |
+| 68 | Status codes by source | partial: P11 (Traffic page) | `test_metrics_recorder.py::test_dims_row_holds_every_dimension`, `test_metrics_recorder.py::test_cache_state_and_source_strings`, `test_metrics_queries.py::test_series_reads_compacted_levels_plus_the_tail`, `test_api_traffic.py::test_status_sources_and_the_429_verdict`, `test_r3_parity_overview.py::test_parity_1_a_roblox_5xx_counts_as_5xx_from_roblox` |
+| 69 | Request counts and traffic over time | partial: P11 (Overview and Traffic pages) | `test_metrics_rollups.py::test_minutes_compact_into_hours_exactly`, `test_metrics_rollups.py::test_days_and_months_in_ui_timezone`, `test_metrics_queries.py::test_comparison_windows`, `test_metrics_pipeline.py::test_flush_loop_compaction_and_queries`, `test_metrics_mp.py::test_metric_totals_equal_requests_sent`, `test_api_traffic.py::test_requests_stacked_by_outcome_with_compare`, `test_api_traffic.py::test_verbs_series_and_table_with_export`, `test_api_traffic.py::test_trend_tables`, `test_r3_parity_overview.py::test_parity_2_overview_has_the_v1_failures_last_hour_tile` |
 | 70 | Latency percentiles | partial: P11 (Traffic and Upstream pages) | `test_metrics_histograms.py::test_merge_is_element_wise_addition`, `test_metrics_histograms.py::test_percentile_interpolates_inside_the_bucket`, `test_metrics_histograms.py::test_percentile_error_is_bounded_by_the_bucket_width`, `test_metrics_histograms.py::test_sql_functions_merge_and_sum`, `test_api_traffic.py::test_latency_series_and_splits`, `test_api_upstream.py::test_latency_series_are_percentiles_of_upstream_requests` |
-| 71 | Method health per egress and host | partial: P11 (Upstream page) | `test_metrics_queries.py::test_filters_are_whitelisted`, `test_metrics_queries.py::test_misc_read_models`, `test_metrics_recorder.py::test_errors_are_upserted_and_redacted`, `test_api_upstream.py::test_egress_cards_and_host_table_report_honest_rates` |
-| 72 | Failure, refusal, internal and error logs | partial: P11 (Upstream, Protection and System pages) | `test_metrics_recorder.py::test_refusal_events_are_budgeted_but_counts_stay_exact`, `test_metrics_recorder.py::test_upstream_429_internal_background_and_egress`, `test_metrics_recorder.py::test_errors_are_upserted_and_redacted`, `test_metrics_recorder.py::test_aggregated_events_wait_for_their_minute_to_close`, `test_api_upstream.py::test_retries_and_internal_calls`, `test_api_system.py::test_errors_are_searchable_and_tracebacks_redacted`, `test_api_protection.py::test_bot_pipeline_and_refusals_for_the_range` |
-| 73 | Top talkers and callers with rates | partial: P11 (Clients page) | `test_metrics_clients.py::test_minute_keeps_top_n_and_folds_the_rest`, `test_metrics_clients.py::test_trailing_rate_has_no_minute_boundary_flap`, `test_metrics_queries.py::test_client_table_with_rates`, `test_storage_retention.py::test_place_clients_follow_max_caller_records`, `test_api_clients.py::test_ip_table_rates_flags_bot_score_sort_search_and_export`, `test_api_clients.py::test_place_table_page_actions_and_lookup_cache` |
-| 74 | Endpoint popularity with templating | partial: P11 (Endpoints page; labels scrubbed, C1 over row 74) | `test_metrics_templating.py::test_v1_worked_examples`, `test_metrics_templating.py::test_templatize_equals_v1_on_generated_paths`, `test_metrics_templating.py::test_vocabulary_gate_bounds_distinct_values`, `test_metrics_labels.py::test_template_for_scrubs_a_piece_in_a_route_word`, `test_metrics_queries.py::test_top_n_pages_and_sorts_on_the_server`, `test_api_endpoints.py::test_table_sorts_pages_and_trends`, `test_api_endpoints.py::test_drill_down` |
-| 75 | Blocked and rate-limited attempt logs | partial: P11 (Protection page); the attempts tabs count distinct clients instead of showing the last IP (plan 9.15 over row 75; see Wave 3b) | `test_abuse_pipeline_order.py::test_stats_count_refusals_by_check`, `test_metrics_recorder.py::test_refusal_events_are_budgeted_but_counts_stay_exact`, `test_api_protection.py::test_endpoint_blocks_rules_and_attempts` |
-| 76 | Throttle tier and UA rule hits | partial: P11 (Protection page) | `test_abuse_review_fixes.py::test_record_throttled_and_aggregated_tier_and_ua_rule_events`, `test_api_protection.py::test_ladder_replace_reset_and_tier_hits`, `test_api_protection.py::test_ua_rules_crud_order_hits_and_tester` |
+| 71 | Method health per egress and host | partial: P11 (Upstream page) | `test_metrics_queries.py::test_filters_are_whitelisted`, `test_metrics_queries.py::test_misc_read_models`, `test_metrics_recorder.py::test_errors_are_upserted_and_redacted`, `test_api_upstream.py::test_egress_cards_and_host_table_report_honest_rates`, `test_r3_parity_upstream.py::test_parity_6_egress_cards_carry_v1_method_health`, `test_v1_upstream.py::test_v1_egress_health_says_when_it_last_worked_and_what_failed_last` |
+| 72 | Failure, refusal, internal and error logs | partial: P11 (Upstream, Protection and System pages) | `test_metrics_recorder.py::test_refusal_events_are_budgeted_but_counts_stay_exact`, `test_metrics_recorder.py::test_upstream_429_internal_background_and_egress`, `test_metrics_recorder.py::test_errors_are_upserted_and_redacted`, `test_metrics_recorder.py::test_aggregated_events_wait_for_their_minute_to_close`, `test_api_upstream.py::test_retries_and_internal_calls`, `test_api_system.py::test_errors_are_searchable_and_tracebacks_redacted`, `test_api_protection.py::test_bot_pipeline_and_refusals_for_the_range`, `test_r3_parity_upstream.py::test_parity_5_upstream_failures_log_exists`, `test_r3_parity_protection.py::test_parity_3_refusal_reasons_keep_the_v1_columns` |
+| 73 | Top talkers and callers with rates | partial: P11 (Clients page) | `test_metrics_clients.py::test_minute_keeps_top_n_and_folds_the_rest`, `test_metrics_clients.py::test_trailing_rate_has_no_minute_boundary_flap`, `test_metrics_queries.py::test_client_table_with_rates`, `test_storage_retention.py::test_place_clients_follow_max_caller_records`, `test_api_clients.py::test_ip_table_rates_flags_bot_score_sort_search_and_export`, `test_api_clients.py::test_place_table_page_actions_and_lookup_cache`, `test_r3_parity_clients.py::test_parity_7_client_tables_keep_last_seen_and_peers`, `test_metrics_client_extras.py::test_peer_counts_across_levels_count_each_peer_once`, `test_api_clients.py::test_recorded_fleet_scores_answer_when_no_live_row_exists` |
+| 74 | Endpoint popularity with templating | partial: P11 (Endpoints page; labels scrubbed, C1 over row 74) | `test_metrics_templating.py::test_v1_worked_examples`, `test_metrics_templating.py::test_templatize_equals_v1_on_generated_paths`, `test_metrics_templating.py::test_vocabulary_gate_bounds_distinct_values`, `test_metrics_labels.py::test_template_for_scrubs_a_piece_in_a_route_word`, `test_metrics_queries.py::test_top_n_pages_and_sorts_on_the_server`, `test_api_endpoints.py::test_table_sorts_pages_and_trends`, `test_api_endpoints.py::test_drill_down`, `test_r3_parity_endpoints.py::test_parity_13_endpoint_rows_keep_methods_and_last_request`, `test_r3_parity_endpoints.py::test_parity_13_last_request_falls_back_to_the_rollup_minute` |
+| 75 | Blocked and rate-limited attempt logs | partial: P11 (Protection page); the attempts tabs count distinct clients instead of showing the last IP (plan 9.15 over row 75) and, since review round 3, name the rule that refused (`refused_by`; see Wave 3b) | `test_abuse_pipeline_order.py::test_stats_count_refusals_by_check`, `test_metrics_recorder.py::test_refusal_events_are_budgeted_but_counts_stay_exact`, `test_api_protection.py::test_endpoint_blocks_rules_and_attempts`, `test_abuse_security_records.py::test_a_refusal_event_names_the_rule_that_refused` |
+| 76 | Throttle tier and UA rule hits | partial: P11 (Protection page) | `test_abuse_review_fixes.py::test_record_throttled_and_aggregated_tier_and_ua_rule_events`, `test_api_protection.py::test_ladder_replace_reset_and_tier_hits`, `test_api_protection.py::test_ua_rules_crud_order_hits_and_tester`, `test_producers_rule_hits.py::test_every_matched_rule_row_is_on_the_verdict_and_recorded`, `test_r3_fix_pages_lane.py::test_rule_tables_carry_hits_and_one_rule_has_a_hit_history` |
 | 77 | Budget rejections and peaks | partial: P11 (Upstream page; the bucket fill history is stored since P10) | `test_upstream_buckets.py::test_bucket_states_for_the_dashboard`, `test_upstream_buckets.py::test_fill_levels`, `test_engine.py::test_recorder_history_hooks_and_read_models`, `test_rules_upstream.py::test_up_bucket_tune_numbers_and_safe_auto`, `test_api_upstream.py::test_buckets_show_fill_rates_and_history_and_a_reset_never_refills_them` |
-| 78 | Tarpit stats | partial: P11 (Protection page) and a fleet-wide tarpit statistics history, which P10 did not store (open); the API shows this worker's statistics | `test_abuse_tarpit.py::test_arrival_gap_is_measured_across_refusals`, `test_abuse_tarpit.py::test_over_the_cap_is_instant_and_counted_as_skipped`, `test_ingress_exhaustion.py::test_tarpit_stats_tables_are_bounded`, `test_api_protection.py::test_tarpit_state_has_the_effective_cap_fields` |
-| 79 | Header and User-Agent fingerprints | partial: P11 (Security page) | `test_metrics_fingerprints.py::test_secret_shaped_plain_values_are_stored_hashed`, `test_metrics_fingerprints.py::test_counts_add_up_across_workers_and_values_are_capped_per_header`, `test_metrics_fingerprints.py::test_auto_ignore_is_central_and_not_double_counted`, `test_metrics_jobs.py::test_rules_ignore_header_writes_an_audited_auto_entry`, `test_rr_cred_fingerprint_names.py::test_fingerprint_header_names_never_store_a_credential_piece`, `test_api_security.py::test_fingerprints_values_user_agents_blocked_and_ignored_headers`, `test_api_w3b_wiring.py::test_passing_requests_are_fingerprinted_and_filtered_ones_count_as_blocked` |
-| 80 | Probe, login, crawl and throttled rings | partial: P11 (Security page) | `test_metrics_security_events.py::test_probe_signature`, `test_metrics_security_events.py::test_ring_pages_newest_first_with_filters`, `test_metrics_security_events.py::test_summaries`, `test_metrics_security_events.py::test_login_events_via_recorder`, `test_public_pages.py::test_visits_and_crawls_are_recorded`, `test_api_security.py::test_probes_ring_summary_and_crawls`, `test_api_security.py::test_logins_and_failed_logins`, `test_api_protection.py::test_throttled_history_from_the_throttled_events` |
+| 78 | Tarpit stats | partial: P11 (Protection page); the fleet-wide hold statistics history is stored and served since the producers lane (`GET /protection/tarpit` `history`) | `test_abuse_tarpit.py::test_arrival_gap_is_measured_across_refusals`, `test_abuse_tarpit.py::test_over_the_cap_is_instant_and_counted_as_skipped`, `test_ingress_exhaustion.py::test_tarpit_stats_tables_are_bounded`, `test_api_protection.py::test_tarpit_state_has_the_effective_cap_fields`, `test_producers_tarpit_stats.py::test_holds_are_recorded_with_category_kind_and_hold_time`, `test_producers_tarpit_stats.py::test_skips_and_the_gaps_after_a_hold_and_after_an_instant_refusal`, `test_r3_fix_pages_lane.py::test_tarpit_card_has_the_fleet_hold_statistics_of_the_range` |
+| 79 | Header and User-Agent fingerprints | partial: P11 (Security page) | `test_metrics_fingerprints.py::test_secret_shaped_plain_values_are_stored_hashed`, `test_metrics_fingerprints.py::test_counts_add_up_across_workers_and_values_are_capped_per_header`, `test_metrics_fingerprints.py::test_auto_ignore_is_central_and_not_double_counted`, `test_metrics_jobs.py::test_rules_ignore_header_writes_an_audited_auto_entry`, `test_rr_cred_fingerprint_names.py::test_fingerprint_header_names_never_store_a_credential_piece`, `test_api_security.py::test_fingerprints_values_user_agents_blocked_and_ignored_headers`, `test_api_w3b_wiring.py::test_passing_requests_are_fingerprinted_and_filtered_ones_count_as_blocked`, `test_r3_parity_security.py::test_parity_11_one_headers_values_can_be_cleared_and_the_header_removed` |
+| 80 | Probe, login, crawl and throttled rings | partial: P11 (Security page) | `test_metrics_security_events.py::test_probe_signature`, `test_metrics_security_events.py::test_ring_pages_newest_first_with_filters`, `test_metrics_security_events.py::test_summaries`, `test_metrics_security_events.py::test_login_events_via_recorder`, `test_public_pages.py::test_visits_and_crawls_are_recorded`, `test_api_security.py::test_probes_ring_summary_and_crawls`, `test_api_security.py::test_logins_and_failed_logins`, `test_api_protection.py::test_throttled_history_from_the_throttled_events`, `test_v1_public.py::test_v1_proxy_probes_reach_the_probe_log` |
 | 81 | Live request feed | partial: P11 (Live page) | `test_metrics_live.py::test_tail_delivers_rows_from_any_writer`, `test_metrics_live.py::test_backfill_for_last_event_id`, `test_metrics_live.py::test_filter_covers_every_field`, `test_metrics_pipeline.py::test_live_tail_sees_every_worker`, `test_design_system.py::test_live_tail_streams_pauses_and_resumes_after_last_event_id`, `test_api_live.py::test_rows_newest_first_with_filters`, `test_api_live.py::test_cursor_pages_back_without_gaps`, `test_sse.py::test_kpi_then_filtered_live_rows`, `test_sse_mp.py::test_a_stream_on_worker_a_delivers_what_worker_b_recorded` |
 | 82 | Capture with redaction, TTL and caps | covered | `test_metrics_capture.py::test_headers_query_url_and_bodies_are_redacted`, `test_metrics_capture.py::test_write_enforces_count_bytes_and_ttl`, `test_metrics_capture.py::test_refusals_always_served_sampled`, `test_metrics_capture_encoder.py::test_queue_is_bounded_by_count_and_drops_without_waiting`, `test_review_loop_blocking.py::test_review_large_capture_is_not_encoded_on_the_loop`, `test_rr_cred_capture_header_names.py::test_captured_header_names_never_hold_a_credential_piece` |
-| 83 | Section clears (granular resets) | partial: P11 (Data page and the inline reset menus) | `test_metrics_queries.py::test_kpis_compare_and_reset_notice`, `test_api_data.py::test_family_reset_preview_phrase_snapshot_audit_and_annotation`, `test_api_data.py::test_reset_listing_maps_every_v1_clear_target`, `test_api_data.py::test_date_range_reset_deletes_only_inside_the_range` |
+| 83 | Section clears (granular resets) | partial: P11 (Data page and the inline reset menus) | `test_metrics_queries.py::test_kpis_compare_and_reset_notice`, `test_api_data.py::test_family_reset_preview_phrase_snapshot_audit_and_annotation`, `test_api_data.py::test_reset_listing_maps_every_v1_clear_target`, `test_api_data.py::test_date_range_reset_deletes_only_inside_the_range`, `test_r3_parity_data.py::test_parity_8_clearing_cache_stats_keeps_ratios_honest_and_requests`, `test_r3_parity_data.py::test_parity_9_clearing_one_attempts_tab_keeps_the_others`, `test_r3_parity_data.py::test_parity_12_kpi_delta_over_a_reset_window_is_replaced_by_a_notice`, `test_metrics_reset_scope.py::test_a_reset_of_another_family_leaves_the_tiles_and_the_page_alone`, `test_v1_metrics.py::test_v1_a_reset_counter_resumes_from_zero_and_nothing_comes_back` |
 | 84 | Worker fleet registry | partial: P11 (System page) | `test_scheduler_heartbeat.py::test_beat_writes_the_parity_row_84_fields`, `test_scheduler_heartbeat.py::test_fleet_view_marks_fresh_stale_and_this_worker`, `test_scheduler_heartbeat.py::test_loop_lag_monitor_measures_a_blocked_loop`, `test_scheduler_heartbeat.py::test_beat_sync_and_rss`, `test_api_system.py::test_fleet_has_the_parity_row_84_fields_and_both_colors`, `test_api_w3b_wiring.py::test_the_heartbeat_feeds_the_worker_minute_history` |
-| 85 | Persistence and store sizes | partial: P11 (System and Data pages) | `test_review_loop_blocking.py::test_review_health_answers_at_once_while_the_disk_stalls`, `test_storage_retention.py::test_run_retention_works_in_batches_and_vacuums`, `test_api_system.py::test_metrics_pipeline_and_persistence`, `test_api_data.py::test_storage_has_every_database_and_table_with_a_projection`, `test_api_data.py::test_retention_view_lists_the_settings_and_each_tables_state` |
+| 85 | Persistence and store sizes | partial: P11 (System and Data pages) | `test_review_loop_blocking.py::test_review_health_answers_at_once_while_the_disk_stalls`, `test_storage_retention.py::test_run_retention_works_in_batches_and_vacuums`, `test_api_system.py::test_metrics_pipeline_and_persistence`, `test_api_data.py::test_storage_has_every_database_and_table_with_a_projection`, `test_api_data.py::test_retention_view_lists_the_settings_and_each_tables_state`, `test_r3_fix_pages_lane.py::test_system_shows_fleet_drops_and_the_disk_growth_history`, `test_r3_parity_data.py::test_parity_10_retention_view_lists_every_data_retention_setting` |
 | 86 | Threat banner, now recommendations | partial: P11 (Overview card and Recommendations page) | `test_engine.py::test_lifecycle_open_update_resolve_reopen`, `test_rules_core.py::test_before_after_11_6_card`, `test_api_recommendations.py::test_list_filters_counts_paging_and_export`, `test_api_recommendations.py::test_apply_then_undo_through_the_audited_services`, `test_api_overview.py::test_top_recommendations_most_severe_first` |
 | 87 | Glossary, help dots, setting help, simulations | partial: P11 (pages and simulations) | `test_ui_static.py::test_glossary_has_every_plan_section_21_term`, `test_ui_static.py::test_glossary_includes_the_v1_dashboard_terms`, `test_ui_templates.py::test_setting_control_renders_every_catalog_setting`, `test_design_system.py::test_tooltips_for_help_dots_and_glossary_terms` |
 | 88 | CSV and JSON exports | covered (IP columns are hashed unless `export_include_ips`; see Wave 3b) | `test_ui_gallery.py::test_export_guards_spreadsheet_formulas`, `test_api_common.py::test_csv_and_json_exports_are_guarded_named_and_audited`, `test_api_common.py::test_exports_follow_the_ip_privacy_settings`, `test_api_data.py::test_dataset_exports`, `test_llm_export.py::test_export_of_a_fixture_database_validates_against_the_schema`, `test_llm_export.py::test_injection_fixture_appears_only_under_untrusted`, `test_llm_export.py::test_no_secret_appears_in_the_export`, `test_api_export_llm.py::test_summary_validates_and_every_download_is_audited`, `test_api_export_llm.py::test_the_leader_job_writes_the_hourly_file` |
@@ -2016,13 +2482,13 @@ not store. Wave 3b also added API tests to the covered rows 15, 25, 29, 32, 45, 
 | 99 | Login alert with the kill-switch link | covered | `test_admin_auth_pages.py::test_kill_switch_get_confirms_post_consumes_once`, `test_admin_auth_pages.py::test_kill_switch_can_spare_passkey_sessions`, `test_auth_sessions.py::test_kill_switch_also_revokes_trusted_devices`, `test_notify_notifier.py::test_login_body_keeps_the_kill_switch_link_and_scrubs_the_rest` |
 | 100 | Trusted devices | covered | `test_admin_auth_flow.py::test_trusted_device_skips_only_the_second_factor`, `test_admin_auth_pages.py::test_trusted_devices_list_and_revoke`, `test_admin_auth_parts.py::test_ua_family_ignores_versions_but_not_browsers` |
 | 101 | Logout | covered | `test_admin_auth_pages.py::test_logout_deletes_the_server_side_session`, `test_auth_cookies.py::test_logout_and_dead_sessions_clear_the_cookie` |
-| 102 | Deploy on push, blue/green, gated | partial: P14 (`deploy.yml` stays disabled until the cutover; CI does not run `tests/deploy` yet) | `test_deploy_sh.py::test_v1_1_clean_deploy`, `test_deploy_sh.py::test_failed_health_gate_rolls_back`, `test_deploy_sh.py::test_failure_after_the_switch_switches_back`, `test_deploy_sh.py::test_commit_not_on_main_is_refused`, `test_deploy_sh.py::test_workflow_bootstrap_installs_a_missing_deploy_script` |
+| 102 | Deploy on push, blue/green, gated | partial: P14 (`deploy.yml` stays disabled until the cutover); CI runs `tests/deploy` since the tooling lane | `test_deploy_sh.py::test_v1_1_clean_deploy`, `test_deploy_sh.py::test_failed_health_gate_rolls_back`, `test_deploy_sh.py::test_failure_after_the_switch_switches_back`, `test_deploy_sh.py::test_commit_not_on_main_is_refused`, `test_deploy_sh.py::test_workflow_bootstrap_installs_a_missing_deploy_script`, `test_deploy_ci_workflow.py::test_every_test_directory_runs_in_ci`, `test_deploy_ci_workflow.py::test_deploy_stays_disabled_until_the_cutover` |
 | 103 | Per-release venv | covered | `test_deploy_sh.py::test_v1_7_redeploy_of_a_built_release_reuses_it`, `test_deploy_sh.py::test_v1_8_failed_build_leaves_a_usable_environment`, `test_deploy_sh.py::test_keeps_the_newest_five_releases`, `test_deploy_sh.py::test_release_ships_compiled_bytecode` |
 | 104 | systemd unit hardening | covered | `test_deploy_units.py::test_roxy_unit_has_the_plan_17_1_directive`, `test_deploy_units.py::test_memory_numbers_fit_the_909_mb_server`, `test_deploy_units.py::test_systemd_analyze_verify`, `test_deploy_units.py::test_exposure_score_is_ok`, `test_deploy_units.py::test_app_boots_under_the_unit_sandbox` |
 | 105 | OnFailure alert | covered | `test_deploy_alert.py::test_one_alert_per_unit_per_ten_minutes`, `test_deploy_alert.py::test_redact_removes_secrets`, `test_deploy_alert.py::test_webhook_failure_is_a_failure_too`, `test_deploy_alert.py::test_end_to_end_with_system_python`, `test_deploy_units.py::test_alert_unit` |
 | 106 | nginx config | covered | `test_deploy_nginx.py::test_nginx_t_accepts_the_rendered_site`, `test_deploy_nginx.py::test_every_location_that_reaches_the_app_is_rate_limited`, `test_deploy_nginx.py::test_internal_is_404_and_never_proxied`, `test_deploy_nginx.py::test_kill_switch_token_is_never_logged`, `test_deploy_nginx.py::test_live_floods_never_reach_the_app_unlimited`, `test_deploy_wrappers.py::test_apply_installs_the_verified_files` |
 | 107 | Deploy runbook | partial: P12 part two (`docs/RUNBOOKS.md`) | none yet |
-| 108 | v1 smoke suite, deploy test, boot check | partial: P14 (`tests/V1_PARITY.md`) | `test_deploy_sh.py::test_v1_1_clean_deploy`, `test_deploy_sh.py::test_v1_3_fetch_failure_must_not_brick_the_server`, `test_deploy_smoke_remote.py::test_each_check_fails_when_its_condition_breaks`, `test_check_style.py::test_v1_test_suites_are_scanned_and_clean` |
+| 108 | v1 smoke suite, deploy test, boot check | partial: P14 (the boot check); the smoke suite and deploy test parts are covered by `tests/V1_PARITY.md` (781 rows, 0 empty, checked by `gen_v1_parity.py --check` in CI) | `test_deploy_sh.py::test_v1_1_clean_deploy`, `test_deploy_sh.py::test_v1_3_fetch_failure_must_not_brick_the_server`, `test_deploy_smoke_remote.py::test_each_check_fails_when_its_condition_breaks`, `test_check_style.py::test_v1_test_suites_are_scanned_and_clean`, `test_gen_v1_parity.py::test_the_committed_table_is_complete_current_and_cites_real_tests` |
 | 109 | Secrets as systemd credentials | covered | `test_core_env.py::test_systemd_credentials_directory_wins`, `test_core_env.py::test_no_accessor_for_the_roblox_credential`, `test_migration_credentials.py::test_migration_credential_files_and_modes`, `test_migration_v1_files.py::test_files_listing_outside_root_is_never_followed`, `test_deploy_units.py::test_roxy_unit_lists_and_order` |
 | 110 | Worker recycling | covered | `test_deploy_gunicorn.py::test_settings_follow_plan_5_2`, `test_deploy_gunicorn.py::test_max_requests_zero_disables_recycling` |
 | 111 | Shared matcher semantics | covered (the credential allowlist is exact; see Wave 2) | `test_match.py::test_v1_rule_match_parity`, `test_match.py::test_v1_rule_match_corpus_parity`, `test_match.py::test_v1_best_match_parity`, `test_match.py::test_exact_patterns_grant_no_implicit_subpath` |
@@ -2035,7 +2501,7 @@ not store. Wave 3b also added API tests to the covered rows 15, 25, 29, 32, 45, 
 | 118 | Throttle watch table | partial: P11 (Protection page) | `test_abuse_throttle.py::test_strike_board_forgive_and_watch`, `test_api_protection.py::test_strike_board_forgive_watch_and_export` |
 | 119 | Session-expired overlay | covered | `test_design_system.py::test_session_expired_overlay_on_any_401_and_stay`, `test_design_system.py::test_session_expired_overlay_redirects_to_login`, `test_design_system_robustness.py::test_session_overlay_keeps_other_dialogs_and_ignores_the_palette`, `test_design_system_robustness.py::test_live_tail_marks_a_gap_and_stops_for_good_on_unauthorized` |
 | 120 | `GET /admin` sends a signed-in admin to the dashboard | partial: P11 (the dashboard page it redirects to) | `test_admin_auth_flow.py::test_login_page_and_logged_in_redirect` |
-| 121 | Forced metrics flush | covered | `test_api_system.py::test_forced_flush_writes_this_workers_metrics_and_asks_every_worker`, `test_api_system.py::test_watcher_flushes_and_clears_memory_when_another_worker_asks` |
+| 121 | Forced metrics flush | covered | `test_api_system.py::test_forced_flush_writes_this_workers_metrics_and_asks_every_worker`, `test_api_system.py::test_watcher_flushes_and_clears_memory_when_another_worker_asks`, `test_ctl.py::test_flush_metrics_asks_every_worker` |
 | 122 | Workers "reset counts" | partial: P11 (System page) | `test_scheduler_heartbeat.py::test_reset_counts_is_adopted_by_every_worker`, `test_api_system.py::test_reset_counts_zeroes_every_worker_and_is_audited` |
 | 123 | Tarpit state fields and reasons | covered | `test_abuse_tarpit.py::test_state_fields`, `test_abuse_tarpit.py::test_effective_cap_formula_defaults`, `test_proxy_router.py::test_tarpit_gets_the_v1_reason_string` |
 | 124 | Per-setting "Reset to default" | partial: P11 (settings pages) | `test_settings_service.py::test_reset_to_default`, `test_ui_templates.py::test_setting_control_renders_every_catalog_setting`, `test_api_settings.py::test_put_one_key_and_reset_it_to_default`, `test_api_protection.py::test_protection_settings_patch_reset_and_refusals` |
@@ -2044,12 +2510,12 @@ not store. Wave 3b also added API tests to the covered rows 15, 25, 29, 32, 45, 
 | 127 | Capture never fails a request | covered | `test_metrics_recorder.py::test_record_outcome_never_raises`, `test_metrics_recorder.py::test_capture_errors_never_fail_the_request`, `test_metrics_capture_encoder.py::test_a_failing_capture_is_counted_and_the_thread_goes_on`, `test_proxy_router.py::test_recorder_failure_never_fails_the_request` |
 | 128 | Expired capture message | covered | `test_metrics_capture.py::test_v1_expired_message_is_exact`, `test_metrics_capture.py::test_get_capture_and_expiry`, `test_api_live.py::test_capture_detail_expired_and_not_captured` |
 | 129 | `POST /health` is 404 | covered | `test_pipeline_e2e.py::test_public_health_and_post_health` |
-| 130 | Overview visitor KPIs | partial: P11 | `test_metrics_queries.py::test_drops_since_refusal_reasons_retries_visitors`, `test_metrics_visitors_catalog.py::test_classify`, `test_metrics_recorder.py::test_visits_and_security_helpers`, `test_api_overview.py::test_visitors_card`, `test_api_security.py::test_probes_ring_summary_and_crawls` |
+| 130 | Overview visitor KPIs | partial: P11 | `test_metrics_queries.py::test_drops_since_refusal_reasons_retries_visitors`, `test_metrics_visitors_catalog.py::test_classify`, `test_metrics_recorder.py::test_visits_and_security_helpers`, `test_api_overview.py::test_visitors_card`, `test_api_security.py::test_probes_ring_summary_and_crawls`, `test_v1_visitors.py::test_v1_anonymous_admin_page_visits_are_counted_and_known_admins_are_not`, `test_v1_visitors.py::test_v1_the_owners_first_login_takes_back_its_own_admin_page_visit` |
 | 131 | Proxy timings split toggle | partial: P11 (Traffic page) | `test_metrics_recorder.py::test_dims_row_holds_every_dimension`, `test_api_traffic.py::test_latency_series_and_splits` |
-| 132 | Status codes source split | partial: P11 (Traffic page) | `test_metrics_recorder.py::test_cache_state_and_source_strings`, `test_api_traffic.py::test_status_sources_and_the_429_verdict` |
+| 132 | Status codes source split | partial: P11 (Traffic page) | `test_metrics_recorder.py::test_cache_state_and_source_strings`, `test_api_traffic.py::test_status_sources_and_the_429_verdict`, `test_r3_parity_overview.py::test_parity_1_a_roblox_5xx_counts_as_5xx_from_roblox` |
 | 133 | "What's Being Stored" | partial: P11 (Data page) | `test_api_data.py::test_storage_has_every_database_and_table_with_a_projection` |
-| 134 | Blocked fingerprints | partial: P11 (Security page) | `test_metrics_recorder.py::test_fingerprints_flow_and_blocked_variant`, `test_api_security.py::test_fingerprints_values_user_agents_blocked_and_ignored_headers`, `test_api_w3b_wiring.py::test_passing_requests_are_fingerprinted_and_filtered_ones_count_as_blocked` |
-| 135 | Throttle-all watch | partial: P11 (Protection page) | `test_abuse_switches_rules.py::test_throttle_all_watch`, `test_api_protection.py::test_throttle_all_limit_since_marker_and_watch` |
+| 134 | Blocked fingerprints | partial: P11 (Security page) | `test_metrics_recorder.py::test_fingerprints_flow_and_blocked_variant`, `test_api_security.py::test_fingerprints_values_user_agents_blocked_and_ignored_headers`, `test_api_w3b_wiring.py::test_passing_requests_are_fingerprinted_and_filtered_ones_count_as_blocked`, `test_r3_parity_security.py::test_parity_14_blocked_fingerprints_export_as_csv` |
+| 135 | Throttle-all watch | partial: P11 (Protection page) | `test_abuse_switches_rules.py::test_throttle_all_watch`, `test_api_protection.py::test_throttle_all_limit_since_marker_and_watch`, `test_r3_parity_protection.py::test_parity_4_throttle_all_watch_keeps_the_v1_columns` |
 
 Plan sections 7 and 10, which the rows above lean on: every 7.9 policy row
 (`test_upstream_status_policy.py::test_outcome_policy_row`) and every 7.13 row

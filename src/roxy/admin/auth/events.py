@@ -3,7 +3,8 @@
 What this is
     `audit_auth(conn, action, ...)` writes one `audit_log` row inside the caller's control.db transaction.
     `record_probe` and `record_login` hand security events to the metrics recorder (v1's "exploit log" and admin
-    login list) and always write a structured log line.
+    login list) and always write a structured log line. `record_admin_visit` and `discount_admin_visit` keep v1's
+    Admin Page Visits counter (a visit of the login page by a browser that never signed in, minus the owner's own).
 
 Why it exists
     Plan 9.7: every security-relevant action is audited with actor, IP, target, before and after, reason and
@@ -34,6 +35,7 @@ import sqlite3
 from typing import Any
 
 from roxy.config.audit import Actor, ActorKind, record
+from roxy.metrics.visitors import PAGE_ADMIN
 
 log = logging.getLogger("roxy.admin.auth")
 
@@ -119,3 +121,31 @@ def record_login(ctx: Any, *, ip: str, successful: bool, username: str | None, m
         fn(ip=ip, successful=successful, username=username, method=method)
     except Exception:
         log.debug("auth_login_record_failed", exc_info=True)
+
+
+def record_admin_visit(ctx: Any, *, user_agent: str | None) -> None:
+    """One Admin Page Visit (the Overview Visitors card, parity rows 19 and 130). Best effort, memory only.
+
+    The caller counts only a browser that has never signed in (no `roxy_admin_seen` cookie), as v1 did, so the
+    owner's own visits do not inflate the tile."""
+    recorder = _recorder(ctx)
+    fn = getattr(recorder, "record_visit", None) if recorder is not None else None
+    if fn is None:
+        return
+    try:
+        fn(PAGE_ADMIN, user_agent)
+    except Exception:  # a visit counter must never fail the login page
+        log.debug("auth_admin_visit_record_failed", exc_info=True)
+
+
+def discount_admin_visit(ctx: Any) -> None:
+    """Take back the visit of a browser that just signed in for the first time (v1 `decrement_admin_visit`): it was
+    the owner loading the login page, not a visitor. Best effort, memory only."""
+    recorder = _recorder(ctx)
+    fn = getattr(recorder, "record_admin_visit_discount", None) if recorder is not None else None
+    if fn is None:
+        return
+    try:
+        fn()
+    except Exception:
+        log.debug("auth_admin_visit_discount_failed", exc_info=True)

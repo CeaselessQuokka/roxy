@@ -23,11 +23,10 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
-
 from roxy.metrics import queries
 
 ADMIN_SEEN = "roxy_admin_seen"
+ADMIN_COUNTED = "roxy_admin_counted"
 
 
 async def visits(parity: Any) -> dict[str, int]:
@@ -45,30 +44,61 @@ async def admin_visits(parity: Any) -> int:
 
 
 async def test_v1_control_home_page_visits_reach_the_same_read_model(parity: Any) -> None:
-    """Control for the strict xfail below: the measurement works, a visit of `/` is counted by the same read
+    """Control for the admin visit tests below: the measurement works, a visit of `/` is counted by the same read
     model (v1 smoke line 129 counted home page visits too)."""
     before = (await visits(parity))["home_visits"]
     assert (await parity.http.get("/", headers=parity.harness.headers())).status_code == 200
     assert (await visits(parity))["home_visits"] == before + 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "finding parity-3: GET /admin never records an admin page visit (nothing calls record_visit('admin') or "
-        "record_admin_visit_discount), so the Admin Page Visits tile of rows 19 and 130 always reads 0"
-    ),
-)
 async def test_v1_anonymous_admin_page_visits_are_counted_and_known_admins_are_not(parity: Any) -> None:
-    """v1 smoke lines 440, 445 and 967: a fresh browser loading /admin adds exactly 1, a browser with the
-    `roxy_admin_seen` cookie adds nothing."""
+    """v1 smoke lines 440, 445 and 967 (finding parity-3, fixed): a fresh browser loading /admin adds exactly 1, a
+    browser with the `roxy_admin_seen` cookie adds nothing."""
     before = await admin_visits(parity)
     fresh = parity.harness.new_client()
     assert (await fresh.get("/admin", headers=parity.harness.headers())).status_code == 200
     assert await admin_visits(parity) == before + 1
     known = parity.harness.new_client()
-    known.cookies.set(ADMIN_SEEN, "1", domain="testserver")
-    assert (await known.get("/admin", headers=parity.harness.headers())).status_code == 200
+    # Sent as a header: the standard cookie jar never sends a cookie set by hand for a dotless host like
+    # `testserver` (it matches such hosts as `testserver.local`), so `cookies.set(..., domain=...)` sent nothing.
+    seen = {**parity.harness.headers(), "Cookie": f"{ADMIN_SEEN}=1"}
+    page = await known.get("/admin", headers=seen)
+    assert page.status_code == 200
+    assert ADMIN_COUNTED not in page.headers.get("set-cookie", "")  # a known admin's visit is not marked either
+    assert await admin_visits(parity) == before + 1
+
+
+async def test_v1_the_owners_first_login_takes_back_its_own_admin_page_visit(parity: Any) -> None:
+    """v1 `_complete_login` (`decrement_admin_visit`, smoke line 445): a browser without `roxy_admin_seen` loads
+    /admin (+1) and signs in (-1, it was the owner); once signed in, /admin redirects and counts nothing, and a later
+    login from that browser (it now has the cookie) takes nothing back."""
+    account = parity.harness.admin(username="visitor_owner")
+    before = await admin_visits(parity)
+    browser = parity.harness.new_client()
+    assert (await browser.get("/admin", headers=parity.harness.headers())).status_code == 200
+    assert await admin_visits(parity) == before + 1
+    assert (await parity.harness.login(account, client=browser)).status_code == 200
+    assert browser.cookies.get(ADMIN_SEEN) == "1"
+    assert await admin_visits(parity) == before
+    assert browser.cookies.get(ADMIN_COUNTED) is None  # taken back once, then the marker is gone
+    assert (await browser.get("/admin", headers=parity.harness.headers())).status_code == 302  # signed in
+    assert (await parity.harness.login(account, client=browser)).status_code == 200  # a known browser
+    assert await admin_visits(parity) == before
+
+
+async def test_a_login_that_never_loaded_the_page_takes_no_visit_back(parity: Any) -> None:
+    """v2 refinement of v1's decrement (finding parity-3): v1 clamped its lifetime counter at zero when it took the
+    owner's visit back; v2 sums per minute, so only a visit this browser made is taken back (`roxy_admin_counted`).
+    A stranger's visit stays counted when someone signs in without loading the page (a script, the API)."""
+    before = await admin_visits(parity)
+    stranger = parity.harness.new_client()
+    page = await stranger.get("/admin", headers=parity.harness.headers())
+    assert page.status_code == 200
+    marker = [value for name, value in page.headers.multi_items() if name == "set-cookie" and ADMIN_COUNTED in value]
+    assert marker, page.headers
+    assert all(flag in marker[0].lower() for flag in ("secure", "httponly", "samesite=strict", "path=/admin"))
+    account = parity.harness.admin(username="script_owner")
+    assert (await parity.harness.login(account, client=parity.harness.new_client())).status_code == 200
     assert await admin_visits(parity) == before + 1
 
 

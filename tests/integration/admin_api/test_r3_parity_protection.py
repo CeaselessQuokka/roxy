@@ -1,8 +1,9 @@
 """Review round 3, parity lens: the Protection page tables against v1's sections (plan 14.1 rows 4, 10; rows 72, 135).
 
 What this is
-    Strict xfail tests for the Protection page data the v1 dashboard showed and the v2 API lost: the columns of v1's
-    "Refusal Reasons" section and of the throttle-all watch "Who is being throttled right now".
+    Tests for the Protection page data the v1 dashboard showed and the v2 API had lost (findings parity-3 and
+    parity-4, both fixed in review round 3; they were strict xfails): the columns of v1's "Refusal Reasons" section
+    and of the throttle-all watch "Who is being throttled right now".
 
 Why it exists
     Plan 14.1 maps v1 "Refusal Reasons" (Reason, Count, Status, Last Path, Last IP, Unique IPs, Last Seen) to
@@ -14,7 +15,7 @@ Why it exists
 How it works
     The admin API fixtures (`tests/integration/admin_api/conftest.py`) seed refusals through the real recorder and
     read the routes over HTTP as a signed-in admin. Field names are matched loosely (`pick`), so a fix may choose its
-    own names; the values must carry the v1 meaning. Each test is `xfail(strict=True)` with its finding id.
+    own names; the values must carry the v1 meaning. Each test is named after its finding (`test_parity_N_...`).
 
 What to read next
     `roxy/admin/api/protection.py` (`refusals`, `throttle_all_watch_table`), `roxy/metrics/queries.py`
@@ -60,17 +61,16 @@ def refused(seed: Any, count: int, reason: ReasonCode, status: int, **fields: An
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding parity-3: Protection > Refusals lacks v1's Status, Last Path, Unique IPs and Last Seen columns",
-)
 async def test_parity_3_refusal_reasons_keep_the_v1_columns(
     api: Any, api_app: Any, api_json: Any, metrics_seed: Any
 ) -> None:
+    first_ms = api_app.clock.now_ms()
     refused(metrics_seed, 2, ReasonCode.THROTTLE, 429, client_ip="203.0.113.71", path="games.roblox.com/v1/games/1")
     api_app.clock.advance(2)
     refused(metrics_seed, 1, ReasonCode.THROTTLE, 429, client_ip="203.0.113.72", path="games.roblox.com/v1/games/2")
     last_ms = api_app.clock.now_ms()
+    api_app.clock.advance(1)
+    refused(metrics_seed, 1, ReasonCode.NOT_ROBLOX, 404, client_ip="203.0.113.73", path="example.invalid/<b>x</b>")
     await metrics_seed.flush()
     body = api_json(await api.get("protection/refusals", params={"range": "1h"}))
     item = next(row for row in body["items"] if row["reason"] == "throttle")
@@ -87,16 +87,26 @@ async def test_parity_3_refusal_reasons_keep_the_v1_columns(
         "unique_ips": 2,
         "last_seen_ms": last_ms,
     }, item
+    assert (item["first_ms"], item["unattributed"]) == (first_ms, 0)
+    # A section 13 table: sorted and paged on the server, caller text named, exported like every table.
+    assert body["sort"] == "requests"
+    assert [row["reason"] for row in body["items"]] == ["throttle", "not_roblox"]
+    assert body["caller_text"] == ["last_path"]
+    probe = next(row for row in body["items"] if row["reason"] == "not_roblox")
+    assert probe["last_path"] == "example.invalid/<b>x</b>"  # raw text: the page escapes it, the API never renders
+    by_last = api_json(await api.get("protection/refusals", params={"range": "1h", "sort": "last_ms", "order": "asc"}))
+    assert [row["reason"] for row in by_last["items"]] == ["throttle", "not_roblox"]
+    export = await api.get("protection/refusals", params={"range": "1h", "format": "csv"})
+    assert export.status_code == 200, export.text
+    assert export.text.splitlines()[0].startswith('"Reason","Count","Status","Last path"'), export.text[:200]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding parity-4: the throttle-all watch lacks v1's Refused, Rate, Top Endpoint and Last Seen columns",
-)
 async def test_parity_4_throttle_all_watch_keeps_the_v1_columns(
     api: Any, api_app: Any, api_json: Any, metrics_seed: Any
 ) -> None:
-    """v1's watch answered "the callers actually being turned away, what they are asking for and how fast"."""
+    """v1's watch answered "the callers actually being turned away, what they are asking for and how fast".
+    Finding parity-4 (fixed): the rows carry requests and refusals since the state began, rates, the busiest
+    endpoint and the last seen time from client activity."""
     ip = "203.0.113.9"
     await api.post("protection/throttle-all", json={"enabled": True, "limit": 1, "period": 60, "reason": "attack"})
     now_ms = api_app.clock.now_ms()
@@ -127,3 +137,11 @@ async def test_parity_4_throttle_all_watch_keeps_the_v1_columns(
         "has_rate": True,
         "has_last_seen": True,
     }, row
+    assert (row["requests"], row["last_seen_ms"]) == (5, now_ms), row  # the Live row gives the exact time
+    assert isinstance(row["rate1"], float), row
+    assert isinstance(row["rate60"], float), row
+    assert table["caller_text"] == ["top_endpoint"]
+    export = await api.get("protection/throttle-all/watch", params={"format": "csv"})
+    assert export.status_code == 200, export.text
+    assert "economy.roblox.com/v1/x" in export.text
+    assert ip not in export.text  # the client column is hashed in files that leave the server (plan 9.15)

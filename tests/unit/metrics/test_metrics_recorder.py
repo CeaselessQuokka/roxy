@@ -91,10 +91,15 @@ async def test_client_rows_and_activity_switch(
     recorder.record_outcome(make_event(place_id=None, client_ip=""))
     await recorder.flush()
     rows = metrics_rows(
-        "SELECT client_type, client_key, requests, refused, served, bytes FROM client_minute "
+        "SELECT client_type, client_key, requests, refused, served, bytes, top_endpoint IS NULL FROM client_minute "
         "ORDER BY client_type, client_key"
     )
-    assert rows == [("ip", "203.0.113.9", 2, 1, 1, 1000), ("place", "12345", 2, 1, 1, 1000)]
+    # The pair row keeps which IP called as which place (v1's peer columns, finding parity-7), with no endpoint.
+    assert rows == [
+        ("ip", "203.0.113.9", 2, 1, 1, 1000, 0),
+        ("pair", "203.0.113.9|12345", 2, 1, 1, 1000, 1),
+        ("place", "12345", 2, 1, 1, 1000, 0),
+    ]
     settings.set(activity_tracking=0)
     recorder.record_outcome(make_event(client_ip="198.51.100.1"))
     await recorder.flush()
@@ -324,6 +329,42 @@ async def test_samples_only_for_proxied_requests(
     assert client_hash is not None
     assert len(client_hash) == 16
     assert "203.0.113" not in client_hash
+
+
+async def test_limiter_refusals_are_refusal_samples_bounded_per_minute(
+    dbs: Any,
+    settings_factory: Callable[..., Any],
+    fake_clock: FakeClock,
+    make_event: Callable[..., OutcomeEvent],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 4 (findings LOGICFIX-5 and LOGICFIX-6): a refusal by the per-IP throttle or a later check is a
+    refusal sample with its client hash and rate; an earlier refusal (flood, a ban) is not; a worker keeps at most
+    `MAX_REFUSAL_SAMPLES_PER_MINUTE` a minute; request samples carry the rate they were taken at."""
+    from roxy.metrics import recorder as recorder_module
+
+    monkeypatch.setattr(recorder_module, "MAX_REFUSAL_SAMPLES_PER_MINUTE", 3)
+    rec = MetricsRecorder(dbs, settings_factory(), fake_clock, ip_hash_key=b"k" * 32)
+    refused = {"outcome": Outcome.REFUSED, "status": 429, "source": Source.ROXY, "cache_state": CacheState.NA}
+    rec.record_outcome(make_event(**refused, reason=ReasonCode.FLOOD))  # before the per-IP limiter: not kept
+    rec.record_outcome(make_event(**refused, reason=ReasonCode.BANNED))
+    for _ in range(4):
+        rec.record_outcome(make_event(**refused, reason=ReasonCode.THROTTLE))
+    rec.record_outcome(make_event(**refused, reason=ReasonCode.ENDPOINT_RULE))
+    rec.record_outcome(make_event(cache_key_id="a" * 24))
+    await rec.flush()
+    rows = dbs.metrics.read_sync(
+        lambda c: [tuple(r) for r in c.execute("SELECT reason, client_hash, sample_pct FROM refusal_samples")]
+    )
+    assert [row[0] for row in rows] == ["throttle", "throttle", "throttle"]  # 3 a minute; the rest are counted
+    assert all(row[1] and len(row[1]) == 16 and row[2] == 100.0 for row in rows)
+    assert rec.stats()["refusal_samples_capped"] == 2
+    fake_clock.advance(60)  # a new minute: room again
+    rec.record_outcome(make_event(**refused, reason=ReasonCode.ENDPOINT_RULE))
+    await rec.flush()
+    assert dbs.metrics.read_sync(lambda c: c.execute("SELECT count(*) FROM refusal_samples").fetchone()[0]) == 4
+    rates = dbs.metrics.read_sync(lambda c: [r[0] for r in c.execute("SELECT sample_pct FROM request_samples")])
+    assert rates == [100.0]
 
 
 async def test_fingerprints_flow_and_blocked_variant(

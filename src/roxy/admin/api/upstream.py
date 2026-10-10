@@ -3,8 +3,13 @@
 What this is
     The routes behind the Upstream page (plan 14.1):
       * `GET /egress`: one health card per egress (direct, rotator, credential): calls per minute, the Roblox 429
-        and 5xx rates, p50/p95/p99 latency, the egress bucket's fill, its active cooldowns and open breakers.
+        and 5xx rates, failed requests, timeouts, p50/p95/p99 latency, v1's method health (when it last worked,
+        when it last failed and what that failure was; parity row 71), challenge and HTML answers, the egress
+        bucket's fill, its active cooldowns and open breakers.
       * `GET /hosts`: the same per Roblox host, as a section 13 table (export too).
+      * `GET /failures`: v1's "Request Failures" log (plan 14.1 row 24, parity row 72): failed requests grouped by
+        egress, reason and Roblox's status, with first and last seen and the latest one's details (export too).
+      * `GET /challenges`: answers that were a challenge or an HTML block page, by egress and endpoint.
       * `GET /429-timeline`: Roblox 429s per time bucket for the endpoints with the most 429s, plus the rest.
       * `GET /latency`: p50, p95 and p99 latency (and the p95 queue wait) of requests that went to Roblox.
       * `GET /buckets` and `GET /buckets/history?key=`: every bucket's fill gauge, next free slot and configured
@@ -28,6 +33,8 @@ How it works
     audit row (`upstream.reset_state`, with the exact counts cleared) and a chart marker. Time-ranged reads take
     the section 13 range parameters. Live state (buckets, cooldowns, breakers, AIMD) is read from hot.db, so every
     worker shows the same; a cooldown this worker could not share during a hot.db outage is listed as `local`.
+    Fields holding text a caller chose (paths, endpoint templates, errors quoting them) are named in the answer's
+    `caller_text` list, so the page shows them as plain text.
 
 What to read next
     `roxy/upstream/service.py`, `roxy/upstream/read_trace.py` (the explainer), `roxy/metrics/read_upstream.py`.
@@ -95,13 +102,98 @@ HOSTS_SPEC: Final = TableSpec(
         Column("roblox_5xx", "Roblox 5xx", "Requests that ended with a 5xx Roblox sent.", "count"),
         Column("rate_5xx_pct", "5xx rate", "Roblox 5xx per 100 requests that went to this host.", "pct"),
         Column("timeouts", "Timeouts", "Requests that ended because Roblox did not answer in time.", "count"),
+        Column("failed", "Failed", "Requests to this host Roxy could not answer (any failure reason).", "count"),
         Column("p50_ms", "p50", "Median latency of requests to this host (queue wait included).", "ms"),
         Column("p95_ms", "p95", "95th percentile latency.", "ms"),
         Column("p99_ms", "p99", "99th percentile latency.", "ms"),
         Column("bucket_fill_pct", "Bucket fill", "How much of the host bucket's burst is in use now.", "pct"),
         Column("per_min", "Rate limit", "The host bucket's configured rate.", "per_min"),
+        Column(
+            "last_success_at",
+            "Last success",
+            "Start of the newest minute (or hour, see last_success_precision) with a request Roblox answered, over "
+            "everything kept, not only the range.",
+            "timestamp",
+            sortable=False,
+        ),
+        Column(
+            "last_error_at",
+            "Last error",
+            "Start of the newest minute (or hour) with a failed request, over everything kept.",
+            "timestamp",
+            sortable=False,
+        ),
+        Column(
+            "last_error",
+            "Last error detail",
+            "The newest recorded failure: time, reason, statuses, endpoint and error (path and error are caller text).",
+            sortable=False,
+            caller_text=True,
+        ),
     ),
     default_sort="calls",
+)
+
+CARD_CALLER_TEXT: Final = ("last_error.template", "last_error.path", "last_error.error")
+"""Fields of the cards and host rows holding text a caller chose (a path, or an error quoting it): the page shows
+them as plain text, never as markup."""
+
+FAILURES_SPEC: Final = TableSpec(
+    name="upstream_failures",
+    columns=(
+        Column("egress", "Egress", "The path the failed request took (empty: folded rows, which keep no egress)."),
+        Column("reason", "Reason", "Why it failed (upstream_5xx, upstream_timeout, upstream_connect, ...)."),
+        Column("upstream_status", "Roblox status", "What Roblox answered on the last call (empty: no answer)."),
+        Column("count", "Count", "Failed requests in this group in the range.", "count"),
+        Column(
+            "folded",
+            "Folded",
+            "Of these, requests the recorder folded over its event budget (they keep no egress, path or error).",
+            "count",
+        ),
+        Column("first_ms", "First seen", "The first failure of this group in the range.", "timestamp_ms"),
+        Column("last_ms", "Last seen", "The latest failure of this group in the range.", "timestamp_ms"),
+        Column("last_status", "Last status", "What the caller got on the latest failure.", sortable=False),
+        Column("last_method", "Last method", "The HTTP method of the latest failure.", sortable=False),
+        Column(
+            "last_template",
+            "Last endpoint",
+            "The endpoint template of the latest failure.",
+            sortable=False,
+            caller_text=True,
+        ),
+        Column(
+            "last_path",
+            "Last path",
+            "The path of the latest failure (caller text, redacted).",
+            sortable=False,
+            caller_text=True,
+        ),
+        Column(
+            "last_error",
+            "Last detail",
+            "Roblox's status line or the connection error of the latest failure (redacted).",
+            sortable=False,
+            caller_text=True,
+        ),
+    ),
+    default_sort="count",
+)
+FAILURES_CALLER_TEXT: Final = ("last_template", "last_path", "last_error")
+
+CHALLENGES_SPEC: Final = TableSpec(
+    name="upstream_challenges",
+    columns=(
+        Column("egress", "Egress", "The path the calls took."),
+        Column("template", "Endpoint", "The endpoint template (caller text).", caller_text=True),
+        Column("calls", "Calls", "Upstream calls to this endpoint through this egress in the range.", "count"),
+        Column("challenges", "Challenges", "Answers carrying a challenge (rblx-challenge-*, cf-mitigated).", "count"),
+        Column("html_bodies", "HTML pages", "HTML answers on a JSON endpoint: a block or error page.", "count"),
+        Column(
+            "last_at", "Last flagged", "Start of the newest minute with a flagged answer.", "timestamp", sortable=False
+        ),
+    ),
+    default_sort="challenges",
 )
 
 BUCKETS_SPEC: Final = TableSpec(
@@ -153,6 +245,8 @@ def _health(row: Mapping[str, Any], minutes: float) -> dict[str, Any]:
         "calls": calls,
         "internal_calls": int(row.get("internal_calls") or 0),
         "calls_per_min": round(calls / minutes, 2),
+        "failed": int(row.get("failed") or 0),
+        "rate_failed_pct": _rate(int(row.get("failed") or 0), requests),
         "roblox_429": row.get("roblox_429"),
         "rate_429_pct": _rate(row.get("roblox_429"), calls),
         "roblox_5xx": int(row.get("roblox_5xx") or 0),
@@ -162,6 +256,30 @@ def _health(row: Mapping[str, Any], minutes: float) -> dict[str, Any]:
         "p95_ms": row.get("p95_ms"),
         "p99_ms": row.get("p99_ms"),
         "queue_wait_p95_ms": row.get("queue_wait_p95_ms"),
+    }
+
+
+def _method_health(
+    name: str,
+    successes: Mapping[str, Mapping[str, Any]],
+    failures: Mapping[str, Mapping[str, Any]],
+    errors: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """v1's method health for one egress or host (parity row 71): when it last worked and what failed last.
+
+    `last_success_at` and `last_error_at` are the start of the newest rollup bucket with a success or a failure,
+    over everything kept (not only the range), with the level that answered (`*_precision`: minute while minutes are
+    kept); `last_error` is the newest recorded failure event (exact `at_ms`, reason, statuses, endpoint, error).
+    None means "none kept" (P6), never "never happened".
+    """
+    success = successes.get(name) or {}
+    failure = failures.get(name) or {}
+    return {
+        "last_success_at": success.get("at"),
+        "last_success_precision": success.get("precision"),
+        "last_error_at": failure.get("at"),
+        "last_error_precision": failure.get("precision"),
+        "last_error": dict(errors[name]) if name in errors else None,
     }
 
 
@@ -182,14 +300,26 @@ def _bucket_view(state: Any, configured: Mapping[str, Any]) -> dict[str, Any]:
 
 @router.get("/egress")
 async def egress_cards(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
-    """One health card per egress: traffic and failure rates over the range, plus its live bucket and state."""
+    """One health card per egress: traffic and failure rates over the range, v1's method health (failed count,
+    last success, last error), challenge and HTML answers, plus its live bucket and state."""
     ctx = get_ctx(request)
     upstream = _need(ctx.upstream, "upstream service")
     egress = _need(ctx.egress, "egress layer")
     window = tr.window
     page = queries.Page(size=10, sort="upstream_calls")
-    data = await ctx.dbs.metrics.read(lambda conn: queries.top_n_sync(conn, window, "egress", page=page))
-    rows = {str(row.get("key")): row for row in data["rows"]}
+
+    def read(conn: Any) -> dict[str, Any]:
+        return {
+            "top": queries.top_n_sync(conn, window, "egress", page=page),
+            "successes": read_upstream.last_outcome_at(conn, "egress", "served_upstream"),
+            "failures": read_upstream.last_outcome_at(conn, "egress", "failed"),
+            "errors": read_upstream.last_failure_events(conn, "egress"),
+            "flagged": read_upstream.challenge_counts(conn, window.start, window.end),
+        }
+
+    data = await ctx.dbs.metrics.read(read)
+    rows = {str(row.get("key")): row for row in data["top"]["rows"]}
+    flagged = {str(row["egress"]): row for row in data["flagged"]}
     defaults = BucketDefaults.from_settings(ctx.settings)
     limits = ctx.rules.snapshot
     with common.service_errors():
@@ -211,6 +341,9 @@ async def egress_cards(request: Request, _admin: AdminSession, tr: TimeRangeDep)
                 "disabled_reason": why or None,
                 "leak_guard_tripped": egress.tripped(value) if value is not Egress.CREDENTIAL else False,
                 **_health(rows.get(name, {}), minutes),
+                **_method_health(name, data["successes"], data["failures"], data["errors"]),
+                "challenges": int(flagged.get(name, {}).get("challenges") or 0),
+                "html_bodies": int(flagged.get(name, {}).get("html_bodies") or 0),
                 "bucket": _bucket_view(state, configured)
                 if state is not None
                 else {"key": key, "fill_pct": 0.0, "next_free_in_ms": 0.0, **configured, "stored_per_min": None},
@@ -222,7 +355,12 @@ async def egress_cards(request: Request, _admin: AdminSession, tr: TimeRangeDep)
                 ),
             }
         )
-    return {"range": tr.info(), "items": cards, "settings_card": "upstream#routing"}
+    return {
+        "range": tr.info(),
+        "items": cards,
+        "caller_text": list(CARD_CALLER_TEXT),
+        "settings_card": "upstream#routing",
+    }
 
 
 @router.get("/hosts")
@@ -238,14 +376,23 @@ async def host_table(
     upstream = _need(ctx.upstream, "upstream service")
     window = tr.window
     page = queries.Page(size=MAX_HOSTS, sort="upstream_calls")
-    data = await ctx.dbs.metrics.read(lambda conn: queries.top_n_sync(conn, window, "host", page=page))
+
+    def read(conn: Any) -> dict[str, Any]:
+        return {
+            "top": queries.top_n_sync(conn, window, "host", page=page),
+            "successes": read_upstream.last_outcome_at(conn, "host", "served_upstream"),
+            "failures": read_upstream.last_outcome_at(conn, "host", "failed"),
+            "errors": read_upstream.last_failure_events(conn, "host"),
+        }
+
+    data = await ctx.dbs.metrics.read(read)
     defaults = BucketDefaults.from_settings(ctx.settings)
     limits = ctx.rules.snapshot
     with common.service_errors():
         buckets = {state.key: state for state in await upstream.bucket_snapshot(MAX_BUCKETS)}
     minutes = _elapsed_minutes(tr, ctx.clock.now())
     rows: list[dict[str, Any]] = []
-    for row in data["rows"]:
+    for row in data["top"]["rows"]:
         host = str(row.get("key"))
         key = f"host:{host}"
         state = buckets.get(key)
@@ -253,6 +400,7 @@ async def host_table(
             {
                 "host": host,
                 **_health(row, minutes),
+                **_method_health(host, data["successes"], data["failures"], data["errors"]),
                 "bucket_fill_pct": round(state.fill * 100.0, 1) if state is not None else 0.0,
                 "per_min": read_state.configured_limit(key, defaults, limits)["per_min"],
             }
@@ -262,7 +410,74 @@ async def host_table(
         items, total = common.page_rows(rows, whole, search_keys=("host",))
         return await common.export_table(request, admin, HOSTS_SPEC, items, fmt, total=total, tq=tq, tr=tr)
     items, total = common.page_rows(rows, tq, search_keys=("host",))
-    return common.table_answer(HOSTS_SPEC, tq, items, total) | {"range": tr.info()}
+    answer = common.table_answer(HOSTS_SPEC, tq, items, total) | {
+        "range": tr.info(),
+    }
+    return common.add_caller_text(answer, list(CARD_CALLER_TEXT))
+
+
+# --------------------------------------------------------------------------------------- failures and pages
+
+
+@router.get("/failures")
+async def failure_table(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(FAILURES_SPEC))],
+    fmt: ExportFormatDep,
+    egress: EgressName | None = None,
+) -> Any:
+    """Upstream > Failures (v1 "Request Failures", plan 14.1 row 24, parity row 72): failed requests in the range
+    grouped by egress, reason and Roblox's status, with first and last seen and the latest one's status, endpoint,
+    path and error. Searchable, sortable, exportable (`format=csv|json`)."""
+    ctx = get_ctx(request)
+    start_ms, end_ms = tr.window.start * 1000, tr.window.end * 1000
+    with common.service_errors():
+        found = await ctx.dbs.metrics.read(lambda conn: read_upstream.failure_log(conn, start_ms, end_ms))
+    rows = [row for row in found if egress is None or row["egress"] == egress]
+    search_keys = ("egress", "reason", "last_template", "last_path", "last_error")
+    if fmt is not None:
+        whole = common.TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q)
+        items, total = common.page_rows(rows, whole, search_keys=search_keys)
+        return await common.export_table(
+            request, admin, FAILURES_SPEC, items, fmt, total=total, tq=tq, tr=tr, filters={"egress": egress}
+        )
+    items, total = common.page_rows(rows, tq, search_keys=search_keys)
+    answer = common.table_answer(FAILURES_SPEC, tq, items, total) | {
+        "range": tr.info(),
+        "filters": {"egress": egress},
+        "capped": len(found) >= read_upstream.MAX_FAILURE_GROUPS,
+    }
+    return common.add_caller_text(answer, list(FAILURES_CALLER_TEXT))
+
+
+@router.get("/challenges")
+async def challenge_table(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(CHALLENGES_SPEC))],
+    fmt: ExportFormatDep,
+) -> Any:
+    """Calls Roblox answered with a challenge or an HTML page (a block page) in the range, by egress and endpoint
+    (`upstream/pages.py`; the evidence UP-CHALLENGE reads), most flagged first. Exportable."""
+    ctx = get_ctx(request)
+    start, end = tr.window.start, tr.window.end
+    with common.service_errors():
+        found = await ctx.dbs.metrics.read(
+            lambda conn: read_upstream.challenge_counts(conn, start, end, by_template=True)
+        )
+    if fmt is not None:
+        whole = common.TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q)
+        items, total = common.page_rows(found, whole, search_keys=("egress", "template"))
+        return await common.export_table(request, admin, CHALLENGES_SPEC, items, fmt, total=total, tq=tq, tr=tr)
+    items, total = common.page_rows(found, tq, search_keys=("egress", "template"))
+    answer = common.table_answer(CHALLENGES_SPEC, tq, items, total) | {
+        "range": tr.info(),
+        "basis": "per call, from the minute history of upstream attempts (upstream_attempt_minute)",
+    }
+    return common.add_caller_text(answer, ["template"])
 
 
 # ------------------------------------------------------------------------------------------------- charts
@@ -663,6 +878,18 @@ async def internal_calls(request: Request, _admin: AdminSession, tr: TimeRangeDe
 # ------------------------------------------------------------------------------------------------ trace
 
 
+def _flagged_calls(conn: Any, template: str, egress: str, minute: int) -> dict[str, int]:
+    """Calls to `template` through `egress` in the minute starting at `minute`, and how many of them Roblox
+    answered with a challenge or an HTML page (`read_history.attempt_rows`, one indexed minute)."""
+    rows = read_history.attempt_rows(conn, minute, minute + 60, template)
+    mine = [row for row in rows if not egress or row.get("egress") == egress]
+    return {
+        "calls": sum(int(row["count"]) for row in mine),
+        "challenges": sum(int(row["count"]) for row in mine if row.get("challenge")),
+        "html_bodies": sum(int(row["count"]) for row in mine if row.get("html_body")),
+    }
+
+
 @router.get("/trace/{request_id}")
 async def trace(
     request: Request,
@@ -690,6 +917,7 @@ async def trace(
         own_429s = read_upstream.request_429_rows(conn, clean, start_ms, end_ms)
         prior: list[dict[str, Any]] = []
         buckets: dict[str, dict[str, Any]] = {}
+        flagged: dict[str, int] = {}
         if row is not None:
             at_ms = int(row.get("at_ms") or minted)
             template = str(row.get("template") or "")
@@ -697,6 +925,8 @@ async def trace(
                 prior = read_upstream.recent_429s_for(conn, template, at_ms, lookback_ms)
             minute = (min(at_ms, minted + deadline_s * 1000) // 1000) // 60 * 60
             buckets = read_history.bucket_summary(conn, minute, minute + 60, read_trace.request_bucket_keys(row))
+            if template:
+                flagged = _flagged_calls(conn, template, str(row.get("egress") or ""), minute)
         captured = capture.get_capture(conn, clean, now, ttl_s) is not None
         return read_trace.WaitFacts(
             request_id=clean,
@@ -707,6 +937,7 @@ async def trace(
             buckets=buckets,
             queue_budget_ms=float(settings.get("queue_wait_interactive_ms")),
             capture_available=captured,
+            flagged_calls=flagged,
         )
 
     facts = await ctx.dbs.metrics.read(read)
@@ -714,4 +945,4 @@ async def trace(
     return {"request_id": clean, "minted_at_ms": minted, "live": facts.live, **explanation}
 
 
-__all__ = ["BUCKETS_SPEC", "HOSTS_SPEC", "router"]
+__all__ = ["BUCKETS_SPEC", "CHALLENGES_SPEC", "FAILURES_SPEC", "HOSTS_SPEC", "router"]

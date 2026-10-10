@@ -21,6 +21,7 @@ import pytest
 from roxy.admin import sse
 from roxy.core.reasons import CacheState, Egress, Outcome, ReasonCode, Source
 from roxy.metrics.live import read_after
+from roxy.metrics.queries import LAST_HOUR_KPIS as LAST_HOUR
 
 PATH = "/admin/api/v1/stream"
 REFUSED = {
@@ -245,7 +246,7 @@ async def test_kpi_then_filtered_live_rows(api: Any, metrics_seed: Any) -> None:
     stream = await open_stream(api, {"outcome": "refused", "client": "198.51.100"})
     try:
         kpi = await stream.until(lambda f: f.event == "kpi")
-        assert set(kpi.data["values"]) >= {"requests", "avoided_pct", "roblox_429", "p95_ms", "requests_last_hour"}
+        assert set(kpi.data["values"]) >= {"requests", "avoided_pct", "roblox_429", "p95_ms", *LAST_HOUR}
         assert kpi.data["proxy"] == {"paused": False, "throttle_all": False}
         assert kpi.data["stream"] == {"live_sampled_out": 0, "lost": 0} or "stream" in kpi.data
         metrics_seed.record(1, request_id="S" * 26)

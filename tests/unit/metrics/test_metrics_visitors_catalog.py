@@ -61,7 +61,8 @@ def test_every_kpi_and_measure_has_a_spec() -> None:
         "cache_coalesced",
         "cache_miss",
     }
-    names |= {"p50_ms", "p95_ms", "p99_ms", "hit_ratio", "avoided_pct", "roblox_429_per_10k", "requests_last_hour"}
+    names |= {"p50_ms", "p95_ms", "p99_ms", "hit_ratio", "avoided_pct", "roblox_429_per_10k"}
+    names |= set(queries.LAST_HOUR_KPIS)
     missing = sorted(n for n in names if n not in catalog.METRICS)
     assert missing == []
 

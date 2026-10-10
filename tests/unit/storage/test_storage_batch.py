@@ -265,6 +265,30 @@ async def test_run_loop_flushes_periodically_and_on_stop(dbs) -> None:
     assert writer.flushes >= 2
 
 
+async def test_run_flushes_what_was_added_while_its_last_flush_ran(dbs, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stop request arrives while a flush runs, after that flush drained the queues (the race the loaded full run
+    of review round 4 hit in the test above): the item added meanwhile still gets the last flush `run` promises."""
+    writer = BatchWriter()
+    writer.register("event", dbs.metrics, _events_handler)
+    stop = asyncio.Event()
+    real = writer.flush
+    calls = 0
+
+    async def flush_then_stop() -> Any:
+        nonlocal calls
+        calls += 1
+        done = await real()
+        if calls == 1:
+            writer.add("event", 2)  # added after this flush took its batch
+            stop.set()
+        return done
+
+    monkeypatch.setattr(writer, "flush", flush_then_stop)
+    writer.add("event", 1)
+    await asyncio.wait_for(writer.run(lambda: 0.05, stop), 5)
+    assert _count(dbs.metrics, "events") == 2
+
+
 def test_duplicate_kind_is_rejected(dbs) -> None:
     writer = BatchWriter()
     writer.register("event", dbs.metrics, _events_handler)

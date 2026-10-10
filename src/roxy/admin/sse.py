@@ -37,6 +37,10 @@ How it works
     * Session: every `SESSION_CHECK_S` the stream re-reads its session (without touching it); a session that is
       gone, idle past its timeout, revoked by the kill switch or past its absolute lifetime ends the stream with
       `unauthorized`. A worker that starts draining ends its streams at once, so shutdown never waits on them.
+    * Network: on every turn of its loop (at least every `TICK_S`) the stream asks the admin allowlist (D6) again,
+      with the live settings and rules snapshot, for the address it was opened from; once that network is shut
+      out the stream ends at once with nothing more, as every other `/admin` answer to it is now the plain 404
+      (review finding apisec-8: before, an open stream kept sending live rows to a network the owner had removed).
 
     * Mounting: `roxy.admin.api` builds its router on first use (`api_router`, `MOUNTED`), not at import, so this
       module may be imported before or after the API package; the mount checks see it fully built either way.
@@ -66,6 +70,7 @@ from starlette.responses import StreamingResponse
 
 from roxy.admin.api.common import area_router, rate_limited, unavailable, validation_error
 from roxy.admin.auth import sessions
+from roxy.admin.auth.allowlist import admin_ip_allowed
 from roxy.admin.auth.deps import AdminPrincipal, get_auth, require_admin
 from roxy.admin.auth.flow import AuthError
 from roxy.core.deadline import disable_deadline
@@ -155,6 +160,7 @@ STREAM_KPIS: Final[tuple[str, ...]] = (
     "served_cache",
     "p95_ms",
     "requests_last_hour",
+    "failures_last_hour",
 )
 MAX_EVENT_PARAM: Final = 200
 
@@ -545,6 +551,11 @@ class Stream:
                 out.append(frame("settings_changed", {"config_version": version}))
         return out
 
+    def _network_allowed(self) -> bool:
+        """Whether the admin allowlist still admits the address this stream was opened from (a lookup in this
+        worker's settings and rules snapshots, no I/O, so it runs on every turn of the loop)."""
+        return admin_ip_allowed(self.ctx, self.principal.ip)
+
     async def _session_alive(self) -> bool:
         """Re-read the session without touching it; False once it is gone, expired, idle or revoked."""
         try:
@@ -577,6 +588,8 @@ class Stream:
                 if not getattr(self.ctx, "ready", True):
                     yield comment("server restarting")
                     return
+                if not self._network_allowed():
+                    return  # shut out by the admin allowlist (D6): no further frame, not even `unauthorized`
                 now = mono()
                 if now >= next_session:
                     next_session = now + SESSION_CHECK_S

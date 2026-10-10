@@ -2,7 +2,8 @@
 
 What this is
     `v1_json(value, status)` (the wire form v1's `jsonify` produced), `error_response(AuthError)`,
-    `read_json_body(request, Model)`, and setters for the session, trusted device and `roxy_admin_seen` cookies.
+    `read_json_body(request, Model)`, and setters for the session, trusted device, `roxy_admin_seen` and
+    `roxy_admin_counted` cookies.
 
 Why it exists
     Callers and the v1 login page logic depend on the exact bodies: `"Not Found"`, `"Invalid credentials"`,
@@ -17,7 +18,9 @@ How it works
       `AuthError(400, "Invalid request")`.
     - Cookies: `__Host-roxy_session` (session, no Max-Age) and `__Host-roxy_trusted` (Max-Age = trust lifetime)
       are both `Secure; HttpOnly; SameSite=Strict; Path=/` with no Domain, as the `__Host-` prefix requires.
-      `roxy_admin_seen` (v1 visitor-count marker, not security relevant) keeps v1's flags.
+      `roxy_admin_seen` (v1 visitor-count marker, not security relevant) keeps v1's flags. `roxy_admin_counted`
+      (a day, `Path=/admin`, `Secure; HttpOnly; SameSite=Strict`) marks a browser whose login page visit was
+      counted, so the login that follows takes exactly that visit back (finding parity-3).
 
 What to read next
     `roxy/admin/auth/routes.py` (the callers), then `roxy/admin/auth/sessions.py`.
@@ -97,6 +100,34 @@ def set_trusted_cookie(response: Response, token: str, days: int) -> None:
 
 def clear_trusted_cookie(response: Response) -> None:
     response.delete_cookie(TRUSTED_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+
+
+ADMIN_COUNTED_COOKIE = "roxy_admin_counted"
+"""Marks a browser whose visit of the login page was counted as an Admin Page Visit (finding parity-3). A login from
+that browser takes the visit back once (it was the owner); a login without it takes nothing back, so a script or a
+browser that signs in without loading the page never cancels a real visitor's visit."""
+ADMIN_COUNTED_COOKIE_MAX_AGE_S = 86_400
+"""A day: the login that follows a page load comes within minutes; a visit older than that stays counted."""
+ADMIN_COOKIE_PATH = "/admin"
+"""Only the login page and the auth API under `/admin` ever read it."""
+
+
+def set_admin_counted_cookie(response: Response) -> None:
+    """`roxy_admin_counted=1` on a login page whose visit was counted (a visitor-count marker, not security relevant;
+    flags as strict as the auth cookies anyway)."""
+    response.set_cookie(
+        ADMIN_COUNTED_COOKIE,
+        "1",
+        max_age=ADMIN_COUNTED_COOKIE_MAX_AGE_S,
+        path=ADMIN_COOKIE_PATH,
+        secure=True,
+        httponly=True,
+        samesite="strict",
+    )
+
+
+def clear_admin_counted_cookie(response: Response) -> None:
+    response.delete_cookie(ADMIN_COUNTED_COOKIE, path=ADMIN_COOKIE_PATH, secure=True, httponly=True, samesite="strict")
 
 
 def set_admin_seen_cookie(response: Response) -> None:

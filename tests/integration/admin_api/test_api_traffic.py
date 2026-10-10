@@ -99,12 +99,15 @@ async def test_status_sources_and_the_429_verdict(api: Any, api_app: Any, metric
     body = api_json(await api.get("traffic/status/sources", params={"range": "1h"}))
     pairs = {(row["source"], row["status"]): row["requests"] for row in body["items"]}
     assert pairs[("roxy", 429)] == 2
-    assert pairs[("roxy", 502)] == 1
+    # Roblox's 502 passed on after the retries (`upstream_5xx`): Roblox's status with Roxy's text, so it is
+    # Roblox's (relayed), never "Roxy (its own answers)" (finding parity-1).
+    assert pairs[("relay", 502)] == 1
+    assert ("roxy", 502) not in pairs
     assert pairs[("roblox", 200)] == 4
     assert pairs[("cache", 200)] == 1
     assert body["tiles"]["roxy_429"] == 2
     assert body["tiles"]["roblox_429"] == 0
-    assert body["tiles"]["roxy_5xx"] == 1
+    assert (body["tiles"]["roblox_5xx"], body["tiles"]["roxy_5xx"]) == (1, 0)
     assert body["verdict"]["tone"] == "ok"
     assert "Roxy turning callers away" in body["verdict"]["text"]
     assert {row["source_label"] for row in body["items"]} >= {"Roxy (its own answers)", "Cache to caller"}
@@ -120,7 +123,8 @@ async def test_status_sources_and_the_429_verdict(api: Any, api_app: Any, metric
     assert total(status["roxy_429"]) == 2
     assert total(status["status_2xx"]) == 5
     by_source = series_by_key(api_json(await api.get("traffic/status", params={"range": "1h", "view": "source"})))
-    assert total(by_source["requests:roxy"]) == 3
+    assert total(by_source["requests:roxy"]) == 2
+    assert total(by_source["requests:relay"]) == 1
 
 
 async def test_heatmap_puts_requests_in_their_local_hour(

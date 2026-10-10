@@ -145,6 +145,65 @@ async def test_off_when_disabled_and_for_write_methods(dbs: Any, clock: FakeCloc
     assert upstream.count == 2
 
 
+async def test_post_off_by_cache_post_requests_carries_its_would_be_key(dbs: Any, clock: FakeClock) -> None:
+    """Finding insights-7: while `cache_post_requests` keeps a POST OFF, `peek` still puts the key the cache would
+    use on `req.cache_key` (`CachePeek.off_key`, for request samples and the dry run), with no lookup; nothing is
+    served or stored under it; and it is exactly the key the cache uses once POST caching is on (the rule's
+    normalization flags included). Other OFF requests carry no key."""
+    target = "users.roblox.com/v1/Users/Batch"
+    rule = {"pattern": "users.roblox.com/v1/*", "ttl": 60, "methods": ["POST"], "normalize_flags": ["casefold_path"]}
+    upstream = FakeUpstream()
+
+    def service_with(**settings: Any) -> CacheService:
+        return CacheService(
+            dbs=dbs,
+            settings=FakeSettings(settings),
+            rules=StaticRules(rules_snapshot(cache_rules=[rule])),
+            clock=clock,
+            upstream=upstream,
+            worker_id="w1",
+        )
+
+    def post(body: bytes, method: str = "POST") -> Any:
+        return make_request(target, method=method, body=body, headers={"content-type": "application/json"})
+
+    off = service_with(cache_post_requests="off")
+    keys = []
+    for _ in range(2):
+        req = post(b'{"userIds":[1]}')
+        peek = await off.peek(req)
+        assert peek.key is None
+        assert peek.off_key is not None
+        assert req.cache_key is peek.off_key
+        assert not req.fresh_cache_hit
+        result = await off.serve(req, peek)
+        await off.settle()
+        assert result.cache_state is CacheState.OFF
+        assert result.key_id is None
+        keys.append(peek.off_key.id)
+    assert keys[0] == keys[1]
+    assert upstream.count == 2  # never served from the identity key
+    assert (off.stats.off, off.stats.misses, off.stats.stores) == (2, 0, 0)
+    assert len(off.store.memory) == 0
+    on = service_with(cache_post_requests="allowlist")  # the rule lists POST, so POST caching covers it now
+    peek = await on.peek(post(b'{"userIds":[1]}'))
+    assert peek.key is not None
+    assert peek.off_key is None
+    assert peek.key.id == keys[0]  # the same text: casefold_path applied in both
+    assert "users.roblox.com/v1/users/batch" in peek.key.text
+    other = await off.peek(post(b'{"userIds":[2]}'))
+    assert other.off_key is not None
+    assert other.off_key.id != keys[0]  # one identity per body, like a cached POST
+    for service, req in (
+        (service_with(cache_enabled=0, cache_post_requests="off"), post(b"{}")),
+        (service_with(cache_post_requests="all"), post(b"{}", method="PUT")),
+    ):
+        peek = await service.peek(req)
+        assert peek.key is None
+        assert peek.off_key is None
+        assert req.cache_key is None
+
+
 async def test_negative_entries_replay_their_status(dbs: Any, clock: FakeClock) -> None:
     upstream = FakeUpstream(lambda req, n: roblox_error(404, b'{"errors":[{"code":0}]}'))
     service = make_service(dbs, clock, upstream)

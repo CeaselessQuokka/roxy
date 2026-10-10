@@ -306,17 +306,24 @@ def roblox_429_counts(
 
 
 def upstream_429_rows(
-    conn: sqlite3.Connection, start: int, end: int, template: str | None = None, limit: int | None = None
+    conn: sqlite3.Connection,
+    start: int,
+    end: int,
+    template: str | None = None,
+    limit: int | None = None,
+    *,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
-    """`upstream_429` rows in `[start, end)` (optionally one template), oldest first."""
+    """`upstream_429` rows in `[start, end)` (optionally one template), oldest first (ties by row id, so pages read
+    with `offset` never repeat or skip a row; the `upstream_429` export reads it page by page, finding mpjobs-5)."""
     clause = " AND endpoint_template = ?" if template is not None else ""
     params: list[Any] = [int(start) * 1000, int(end) * 1000]
     if template is not None:
         params.append(template)
     rows = conn.execute(
         "SELECT at_ms, endpoint_template, host, egress, retry_after_s, ratelimit_headers_json, request_id "  # noqa: S608
-        f"FROM upstream_429 WHERE at_ms >= ? AND at_ms < ?{clause} ORDER BY at_ms LIMIT ?",
-        (*params, _bounded(limit)),
+        f"FROM upstream_429 WHERE at_ms >= ? AND at_ms < ?{clause} ORDER BY at_ms, id LIMIT ? OFFSET ?",
+        (*params, _bounded(limit), max(0, int(offset))),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -329,9 +336,22 @@ def samples_between(
     clause = f" AND endpoint_template IN ({', '.join('?' for _ in wanted)})" if wanted else ""
     rows = conn.execute(
         "SELECT id, at_ms, key_id, endpoint_template, method, client_hash, place, cache_state, upstream_status, "  # noqa: S608
-        f"egress, body_hash, bytes, auth_class FROM request_samples WHERE at_ms >= ? AND at_ms < ?{clause} "
+        f"egress, body_hash, bytes, auth_class, sample_pct FROM request_samples WHERE at_ms >= ? AND at_ms < ?{clause} "
         "ORDER BY at_ms, id LIMIT ?",
         (int(start) * 1000, int(end) * 1000, *wanted, _bounded(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def refusal_samples_between(
+    conn: sqlite3.Connection, start: int, end: int, limit: int | None = None
+) -> list[dict[str, Any]]:
+    """`refusal_samples` rows (requests a limiter refused, metrics.db schema 7) in `[start, end)` seconds, in time
+    order: the refused part of the stream a limit dry run replays (`insights/simulate.py _limit_replays`)."""
+    rows = conn.execute(
+        "SELECT id, at_ms, reason, endpoint_template, method, client_hash, place, sample_pct FROM refusal_samples "
+        "WHERE at_ms >= ? AND at_ms < ? ORDER BY at_ms, id LIMIT ?",
+        (int(start) * 1000, int(end) * 1000, _bounded(limit)),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -437,6 +457,7 @@ __all__ = [
     "latest_health_run",
     "latest_provider_report",
     "prune_history",
+    "refusal_samples_between",
     "roblox_429_counts",
     "rule_hits",
     "samples_between",

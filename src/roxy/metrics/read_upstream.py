@@ -7,6 +7,12 @@ What this is
       * `live_row`, `request_429_rows`, `recent_429s_for`: what is known about one request id and the 429 that
         opened the cooldown it met (the "why did this request wait?" explainer, `upstream/read_trace.py`).
       * `recent_events`: newest-first `events` rows of some types (adaptive rate changes, credential probes).
+      * `failure_log`: v1's "Request Failures" log, the `failure` events grouped by egress, reason and Roblox's
+        status (Upstream > Failures, plan 14.1 row 24).
+      * `last_outcome_at`, `last_failure_events`: v1's method health "last success" and "last error" per egress or
+        host (parity row 71), over everything kept rather than the selected range.
+      * `challenge_counts`: answers that were a challenge or an HTML page (`upstream/pages.py`), by egress and
+        endpoint (the UP-CHALLENGE evidence, shown on the page).
       * `attempt_kind_totals`, `exit_status_counts`: upstream calls by attempt kind, and rotator exits by status.
       * `bucket_series`: one upstream bucket's attempts, rejections and fullest fill per chart bucket.
       * `endpoint_bytes`, `bytes_per_call_histogram`: wire bytes per endpoint and per call on one egress.
@@ -50,6 +56,22 @@ MAX_EVENTS: Final = 500
 MAX_EXITS: Final = 100
 MAX_ATTEMPT_GROUPS: Final = 200
 MAX_REQUEST_429S: Final = 16
+MAX_FAILURE_GROUPS: Final = 1000
+"""Most groups the failure log and the per-value "last success / last error" reads return (plan P9)."""
+
+FAILURE_EVENT: Final = "failure"
+"""The event type the recorder writes for every failed request (`metrics/recorder.py FAILURE_EVENT`)."""
+
+LAST_OUTCOME_COLUMNS: Final = ("egress", "host")
+LAST_OUTCOME_LEVELS: Final[tuple[tuple[str, str], ...]] = (
+    ("rollup_minute", "minute"),
+    ("rollup_hour", "hour"),
+    ("rollup_day", "day"),
+    ("rollup_month", "month"),
+)
+"""Rollup levels `last_outcome_at` reads, finest first, with the precision each one gives."""
+
+_COUNT: Final = "sum(coalesce(json_extract(detail_json, '$.count'), 1))"
 
 BYTES_EDGES: Final[tuple[int, ...]] = (
     1024,
@@ -242,6 +264,187 @@ def recent_events(
     return out
 
 
+# --------------------------------------------------------------------------------- failures and method health
+
+
+def failure_log(
+    conn: sqlite3.Connection, start_ms: int, end_ms: int, *, limit: int = MAX_FAILURE_GROUPS
+) -> list[dict[str, Any]]:
+    """Upstream > Failures (v1 "Request Failures", plan 14.1 row 24, parity row 72): the `failure` events of
+    `[start_ms, end_ms)` grouped by (egress, reason code, Roblox's status), busiest group first.
+
+    Each row: `egress`, `reason`, `upstream_status`, `count` (aggregated rows carry their count), `first_ms`,
+    `last_ms`, and the newest event's `last_status` (what the caller got), `last_method`, `last_template`,
+    `last_path` and `last_error` (Roblox's status line or the connection error, redacted when it was recorded).
+    `folded` counts the requests of rows the recorder folded over its event budget: they keep their reason and
+    status but not their egress or path, so they form their own group with `egress` None (P6: unknown, not
+    guessed). At most `limit` groups (P9).
+    """
+    group = (
+        "json_extract(detail_json, '$.egress') AS egress, reason_code AS reason, "
+        "json_extract(detail_json, '$.upstream_status') AS upstream_status"
+    )
+    where = "type = ? AND at_ms >= ? AND at_ms < ?"
+    params = (FAILURE_EVENT, int(start_ms), int(end_ms))
+    bounded = max(1, min(int(limit), MAX_FAILURE_GROUPS))
+    totals = conn.execute(
+        f"SELECT {group}, {_COUNT} AS n, min(at_ms) AS first_ms, max(at_ms) AS last_ms, "  # noqa: S608 (fixed text)
+        f"sum(CASE WHEN json_extract(detail_json, '$.aggregated') THEN coalesce(json_extract(detail_json, "
+        f"'$.count'), 1) ELSE 0 END) AS folded FROM events WHERE {where} "
+        "GROUP BY 1, 2, 3 ORDER BY n DESC, last_ms DESC LIMIT ?",
+        (*params, bounded),
+    ).fetchall()
+    # One max() and no other min() or max(): SQLite takes the bare columns from the newest row of each group.
+    newest = conn.execute(
+        f"SELECT {group}, max(at_ms) AS at_ms, endpoint_template, detail_json FROM events "  # noqa: S608 (fixed)
+        f"WHERE {where} GROUP BY 1, 2, 3",
+        params,
+    ).fetchall()
+    last: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for row in newest:
+        last[(row["egress"], row["reason"], row["upstream_status"])] = {
+            "template": row["endpoint_template"],
+            "detail": _detail(row["detail_json"]),
+        }
+    out: list[dict[str, Any]] = []
+    for row in totals:
+        key = (row["egress"], row["reason"], row["upstream_status"])
+        found = last.get(key, {"template": None, "detail": {}})
+        detail = found["detail"]
+        out.append(
+            {
+                "egress": row["egress"],
+                "reason": row["reason"],
+                "upstream_status": _int_or_none(row["upstream_status"]),
+                "count": int(row["n"] or 0),
+                "folded": int(row["folded"] or 0),
+                "first_ms": int(row["first_ms"]),
+                "last_ms": int(row["last_ms"]),
+                "last_status": _int_or_none(detail.get("status")),
+                "last_method": detail.get("method"),
+                "last_template": found["template"],
+                "last_path": detail.get("path"),
+                "last_error": detail.get("upstream_error"),
+            }
+        )
+    return out
+
+
+def last_outcome_at(conn: sqlite3.Connection, column: str, outcome: str) -> dict[str, dict[str, Any]]:
+    """`{egress or host: {"at": epoch seconds, "precision": level}}`: when each value last had a request with
+    `outcome` (`served_upstream` for "last success", `failed` for "last error"), over everything kept.
+
+    From the rollups, finest level first (minutes are kept `retention_minute_days`, then hours and days): `at` is
+    the start of the newest bucket that holds one, so it is exact to the minute while minutes are kept and says
+    which level answered (`precision`). Each `dims` row is looked up through the `(dim_hash, bucket_start)` index,
+    so the cost is one indexed probe per dimension row, whatever the range. A local OPTIONS answer is never a
+    success (it reached no egress). Parity row 71 (v1 method health LastSuccessAt, LastErrorAt).
+    """
+    if column not in LAST_OUTCOME_COLUMNS:
+        raise ValueError(f"last outcome by {column!r} is not offered")
+    if outcome not in ("served_upstream", "failed"):
+        raise ValueError(f"not an outcome for last_outcome_at: {outcome!r}")
+    found: dict[str, dict[str, Any]] = {}
+    for table, precision in LAST_OUTCOME_LEVELS:
+        # `column` and `table` come from the fixed tuples above; the outcome is bound.
+        rows = conn.execute(
+            f"SELECT d.{column} AS k, max((SELECT max(r.bucket_start) FROM {table} r "  # noqa: S608 (fixed names)
+            f"WHERE r.dim_hash = d.dim_hash)) AS last FROM dims d "
+            f"WHERE d.outcome = ? AND d.reason_code != 'options_local' GROUP BY d.{column} LIMIT ?",
+            (outcome, MAX_FAILURE_GROUPS),
+        ).fetchall()
+        for row in rows:
+            if row["last"] is not None and str(row["k"]) not in found:
+                found[str(row["k"])] = {"at": int(row["last"]), "precision": precision}
+    return found
+
+
+def last_failure_events(conn: sqlite3.Connection, column: str) -> dict[str, dict[str, Any]]:
+    """`{egress or host: the newest failure event's facts}` over every kept `failure` event (v1 "LastError").
+
+    The facts are `at_ms`, `reason`, `status`, `upstream_status`, `method`, `template`, `path` and `error`. Rows
+    the recorder folded over its event budget carry no egress or path and are skipped here; `last_outcome_at`
+    still dates the newest failure exactly to the minute. One scan of the indexed `failure` events (P9: the
+    events table is capped).
+    """
+    if column == "egress":
+        key_sql = "json_extract(detail_json, '$.egress')"
+    elif column == "host":
+        key_sql = "substr(endpoint_template, 1, instr(endpoint_template, '/') - 1)"
+    else:
+        raise ValueError(f"last failure by {column!r} is not offered")
+    rows = conn.execute(
+        f"SELECT {key_sql} AS k, max(at_ms) AS at_ms, reason_code, endpoint_template, detail_json FROM events "  # noqa: S608
+        "WHERE type = ? AND json_extract(detail_json, '$.aggregated') IS NULL GROUP BY k LIMIT ?",
+        (FAILURE_EVENT, MAX_FAILURE_GROUPS),
+    ).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not row["k"]:
+            continue
+        detail = _detail(row["detail_json"])
+        out[str(row["k"])] = {
+            "at_ms": int(row["at_ms"]),
+            "reason": row["reason_code"],
+            "status": _int_or_none(detail.get("status")),
+            "upstream_status": _int_or_none(detail.get("upstream_status")),
+            "method": detail.get("method"),
+            "template": row["endpoint_template"],
+            "path": detail.get("path"),
+            "error": detail.get("upstream_error"),
+        }
+    return out
+
+
+def challenge_counts(
+    conn: sqlite3.Connection, start: int, end: int, *, by_template: bool = False
+) -> list[dict[str, Any]]:
+    """Upstream answers in `[start, end)` that were a challenge or an HTML page on a JSON endpoint (`upstream/
+    pages.py`, recorded per attempt in `upstream_attempt_minute`), by egress (and endpoint template).
+
+    Rows: `egress` (`template`), `calls`, `challenges`, `html_bodies`, `last_at` (start of the newest minute with a
+    flagged answer, None without one). UP-CHALLENGE reads the same columns; this is the page's view of them.
+    """
+    template_sql = "endpoint_template" if by_template else "''"
+    rows = conn.execute(
+        f"SELECT egress, {template_sql} AS template, sum(count) AS calls, "  # noqa: S608 (fixed text)
+        "sum(CASE WHEN challenge = 1 THEN count ELSE 0 END) AS challenges, "
+        "sum(CASE WHEN html_body = 1 THEN count ELSE 0 END) AS html_bodies, "
+        "max(CASE WHEN challenge = 1 OR html_body = 1 THEN bucket_start END) AS last_at "
+        "FROM upstream_attempt_minute WHERE bucket_start >= ? AND bucket_start < ? "
+        "GROUP BY egress, template ORDER BY challenges + html_bodies DESC, calls DESC LIMIT ?",
+        (int(start), int(end), MAX_ATTEMPT_GROUPS),
+    ).fetchall()
+    out = []
+    for r in rows:
+        item: dict[str, Any] = {
+            "egress": str(r["egress"]),
+            "calls": int(r["calls"] or 0),
+            "challenges": int(r["challenges"] or 0),
+            "html_bodies": int(r["html_bodies"] or 0),
+            "last_at": None if r["last_at"] is None else int(r["last_at"]),
+        }
+        if by_template:
+            item["template"] = str(r["template"])
+        out.append(item)
+    return out
+
+
+def _detail(text: Any) -> dict[str, Any]:
+    try:
+        value = json.loads(text) if text else {}
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # --------------------------------------------------------------------------------------------- attempts
 
 
@@ -423,15 +626,21 @@ def values_by_key(rows: Sequence[Mapping[str, Any]], key: str) -> dict[str, Mapp
 
 __all__ = [
     "BYTES_EDGES",
+    "FAILURE_EVENT",
+    "MAX_FAILURE_GROUPS",
     "MAX_SERIES",
     "attempt_kind_totals",
     "bucket_series",
     "bytes_per_call_histogram",
+    "challenge_counts",
     "delete_provider_report",
     "endpoint_bytes",
     "exit_status_counts",
+    "failure_log",
     "insert_annotation",
     "insert_provider_report",
+    "last_failure_events",
+    "last_outcome_at",
     "live_row",
     "recent_429s_for",
     "recent_events",

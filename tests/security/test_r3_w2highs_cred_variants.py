@@ -14,14 +14,14 @@ What this is
         file), after the registry has seen several replaced values.
 
 Why it exists
-    `SecretRegistry` keeps at most `_MAX_VALUES_PER_NAME` (3) values per name, newest first, and the bootstrap value
-    is registered once, when the worker starts (`CredentialManager.start`). `_resolve_slot` registers a UI value each
-    time it loads one, but never the bootstrap value it falls back to, and `delete_ui_value` registers nothing. After
-    three UI replaces in one worker's life (three paste attempts are enough, and every running worker registers each
-    new UI value on its one second refresh), the bootstrap value has been pushed out; going back to it (plan C1: the
-    only way back is deleting the UI value) leaves the credential in use unknown to every redaction point: the audit
-    reason, the log filter, the outcome records, captures and the LLM export (plan 9.15, C2 item 8). The leak guard
-    is not affected (`_rebuild_matcher` always includes the bootstrap value).
+    `SecretRegistry` keeps at most `_MAX_VALUES_PER_NAME` (3) values per name, newest first. The bootstrap value used
+    to share its name with every UI value, was registered once at start, and nothing registered it again: after three
+    UI replaces in one worker's life the bootstrap value was pushed out, and going back to it (plan C1: the only way
+    back is deleting the UI value) left the credential in use unknown to every redaction point: the audit reason, the
+    log filter, the outcome records, captures and the LLM export (plan 9.15, C2 item 8). Finding W2H-1, fixed: the
+    bootstrap value and the value in use now have registry names of their own (`BOOTSTRAP_SECRET_NAME`,
+    `IN_USE_SECRET_NAME`); `tests/unit/egress/test_egress_secret_roles.py` covers every path (replace N times, refused
+    pastes, revert, restart). The leak guard was never affected (`_rebuild_matcher` always includes the bootstrap).
 
 How it works
     The matcher variants call `LeakMatcher` and `inspect_request` directly; the app variants use
@@ -160,23 +160,19 @@ async def test_cred1_variant_pastes_never_let_a_caller_disable_an_egress(
         assert (tripped, trips, set(statuses)) == ((False, False), 0, {200})
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding W2H-1: after three UI replaces the bootstrap credential is evicted from SecretRegistry, and "
-    "going back to it leaves the credential in use unredacted (its delete_ui_value reason is stored in clear)",
-)
 async def test_cred2_going_back_to_the_bootstrap_value_keeps_it_redacted(
     env: Any, credentials_dir: Path, fake_secrets: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """cred-2 variant: the reason of `delete_ui_value` repeats the bootstrap value (a paste into the wrong box), after
-    three replaces in this worker (for example three paste attempts). The credential in use must stay known to the
-    redaction layer, and the audit row must not hold it."""
+    """cred-2 variant (finding W2H-1, fixed): the reason of `delete_ui_value` repeats the bootstrap value (a paste
+    into the wrong box), after four replaces in this worker (for example four paste attempts, one more than the
+    registry keeps per name). The credential in use must stay known to the redaction layer, and the audit row must
+    not hold it."""
     bootstrap = fake_secrets["roblox_credential"]
     bare = secret_part(bootstrap)  # copied without the public warning, so no shape rule can find it
     async with running_app(env, credentials_dir, fake_secrets, monkeypatch) as run:
         manager = run.ctx.egress.credential
         assert redact_text(f"x {bare} y") == "x [redacted] y"  # control: known while the worker is fresh
-        for attempt in range(3):
+        for attempt in range(4):
             pasted = f"PASTEATTEMPT{attempt}" + secrets.token_hex(64).upper()
             await manager.replace(pasted, ADMIN, reason=f"paste attempt {attempt}")
         await manager.delete_ui_value(ADMIN, reason=f"back to the file cookie {bare}")

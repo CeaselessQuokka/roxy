@@ -27,7 +27,9 @@ How it works
       example `demand`, `refused`, `roxy_429`) plus the histogram sums; Python then re-buckets, derives ratios
       and percentiles. Filter and group columns are checked against a fixed list before they reach SQL.
     - Honest definitions (P6) live in `metrics/catalog.py`; this module implements them: `avoided` is demand
-      minus upstream calls for caller traffic; `errors_hidden` counts stale serves after an upstream failure.
+      minus upstream calls for caller traffic; `errors_hidden` counts stale serves after an upstream failure;
+      "who returned it" reads the source through `ANSWER_SOURCE_SQL` (a Roblox 5xx passed on after the retries is
+      Roblox's). A KPI tile over a reset of its own data gets a notice instead of a delta (`kpis_sync`, plan 6.8).
 
 What to read next
     `roxy/metrics/catalog.py` (what each measure means), `roxy/metrics/rollups.py` (how the levels are built).
@@ -42,7 +44,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
-from roxy.metrics import histograms
+from roxy.metrics import annotate, histograms, read_client_extras
 from roxy.metrics.histograms import register_sql_functions
 from roxy.metrics.live import LIVE_EVENT
 from roxy.metrics.rollups import HOUR_S, bucket_floor, bucket_next, zone
@@ -82,6 +84,19 @@ FILTER_COLUMNS: tuple[str, ...] = (
 
 STATUS_CLASSES = {"1xx": (100, 199), "2xx": (200, 299), "3xx": (300, 399), "4xx": (400, 499), "5xx": (500, 599)}
 
+ANSWER_SOURCE_SQL = "(CASE WHEN d.source = 'roxy' AND d.reason_code = 'upstream_5xx' THEN 'relay' ELSE d.source END)"
+"""Who produced the status the caller received (v1 "Who returned it?", parity row 132; finding parity-1).
+
+A Roblox 5xx that survived the allowed retries (`upstream_5xx`, plan 7.13) reaches the caller with Roblox's own status
+and Roxy's retry text, but the request path records it with source `roxy` (the text is Roxy's). The status is
+Roblox's, so every "who returned it" number reads such a row as `relay` (Roblox's answer, reshaped by Roxy): "5xx from
+Roblox" counts it and "5xx from Roxy" (Roxy's own failures) does not. Rows recorded with `roblox` or `relay` keep
+their source."""
+
+GROUP_EXPRESSIONS: dict[str, str] = {"answer_source": ANSWER_SOURCE_SQL}
+"""Computed dimensions that may be grouped on (never filtered): `answer_source` is `source` read through
+`ANSWER_SOURCE_SQL`, the source series of Traffic > Status codes."""
+
 # Conditional sums computed for every bucket and group. Names are fixed; the SQL is a module constant.
 MEASURES: tuple[tuple[str, str], ...] = (
     ("requests", "sum(r.requests)"),
@@ -109,7 +124,12 @@ MEASURES: tuple[tuple[str, str], ...] = (
     ("roxy_429", "sum(CASE WHEN d.status = 429 AND d.source = 'roxy' THEN r.requests ELSE 0 END)"),
     (
         "roblox_5xx",
-        "sum(CASE WHEN d.status BETWEEN 500 AND 599 AND d.source IN ('roblox', 'relay') THEN r.requests ELSE 0 END)",
+        f"sum(CASE WHEN d.status BETWEEN 500 AND 599 AND {ANSWER_SOURCE_SQL} IN ('roblox', 'relay') "
+        "THEN r.requests ELSE 0 END)",
+    ),
+    (
+        "roxy_5xx",
+        f"sum(CASE WHEN d.status BETWEEN 500 AND 599 AND {ANSWER_SOURCE_SQL} = 'roxy' THEN r.requests ELSE 0 END)",
     ),
     ("timeouts", "sum(CASE WHEN d.reason_code = 'upstream_timeout' THEN r.requests ELSE 0 END)"),
     ("paused", "sum(CASE WHEN d.reason_code = 'paused' THEN r.requests ELSE 0 END)"),
@@ -337,7 +357,7 @@ def _measure_rows(
     group_by: str | None,
     time_unit: str | None,
 ) -> list[sqlite3.Row]:
-    if group_by is not None and group_by not in FILTER_COLUMNS:
+    if group_by is not None and group_by not in FILTER_COLUMNS and group_by not in GROUP_EXPRESSIONS:
         raise ValueError(f"unknown group {group_by!r}")
     where, params = _filter_sql(filters)
     if time_unit is None:
@@ -346,7 +366,7 @@ def _measure_rows(
         time_expr = "r.bucket_start - r.bucket_start % 3600"
     else:
         time_expr = "r.bucket_start"  # re-bucketed to local days and longer in Python
-    group_expr = f"d.{group_by}" if group_by else "NULL"
+    group_expr = GROUP_EXPRESSIONS.get(group_by or "") or (f"d.{group_by}" if group_by else "NULL")
     measures = ", ".join(f"{sql} AS {name}" for name, sql in (*MEASURES, *HIST_MEASURES))
     sql = (
         f"SELECT {time_expr} AS b, {group_expr} AS g, {measures} "  # noqa: S608 (identifiers are fixed constants)
@@ -555,6 +575,23 @@ def totals_sync(
     return out
 
 
+def answer_source_counts(conn: sqlite3.Connection, window: Window) -> list[dict[str, Any]]:
+    """Requests by who produced the caller's status and by status (v1 "Who returned it?", rows 68 and 132):
+    `[{source, status, requests}]`, most first. `source` is read through `ANSWER_SOURCE_SQL`, so a Roblox 5xx
+    passed on with Roxy's retry text is Roblox's (`relay`), as the `roblox_5xx` tile counts it."""
+    totals: dict[tuple[str, int], int] = {}
+    for table, lo, hi in level_pieces(conn, BASE_LEVEL[window.granularity], window.start, window.end):
+        sql = (
+            f"SELECT {ANSWER_SOURCE_SQL} AS a, d.status AS b, sum(r.requests) AS n FROM {table} r "  # noqa: S608 (constants)
+            "JOIN dims d ON d.dim_hash = r.dim_hash WHERE r.bucket_start >= ? AND r.bucket_start < ? GROUP BY a, b"
+        )
+        for row in conn.execute(sql, (lo, hi)):
+            key = (str(row["a"]), int(row["b"] or 0))
+            totals[key] = totals.get(key, 0) + int(row["n"] or 0)
+    ordered = sorted(((-n, a, b) for (a, b), n in totals.items() if n))
+    return [{"source": a, "status": b, "requests": -negative} for negative, a, b in ordered]
+
+
 def _delta(current: Any, previous: Any) -> dict[str, Any]:
     if not isinstance(current, int | float) or not isinstance(previous, int | float):
         return {"previous": previous, "delta": None, "delta_pct": None}
@@ -585,21 +622,170 @@ KPI_KEYS: tuple[str, ...] = (
 )
 
 
+ROLLUP_TABLES: tuple[str, ...] = tuple(f"metrics.{table}" for table in LEVEL_ORDER)
+"""The rollup levels as `<db>.<table>` names, the way a reset marker lists what it deleted (`reset_tables`)."""
+KPI_SOURCES: dict[str, tuple[str, ...]] = {
+    "roblox_429": ("metrics.upstream_429",),
+    "roblox_429_per_10k": ("metrics.upstream_429", *ROLLUP_TABLES),
+    "rotator_bytes": ("metrics.egress_usage",),
+}
+"""Tables a KPI tile reads, where it is not only the rollups (every other tile, `requests_last_hour` included)."""
+LATENCY_KPIS: frozenset[str] = frozenset({"p50_ms", "p95_ms", "p99_ms"})
+"""Numbers that read the latency histograms, so a latency-only reset (`<table>#latency`) makes them partial too."""
+LATENCY_PART = "latency"
+CACHE_STATE_KPIS: frozenset[str] = frozenset(
+    {"hit_ratio", "cache_hit", "cache_miss", "cache_stale", "cache_revalidating", "cache_coalesced"}
+)
+"""Numbers that read the rollups' cache lookup states, so a cache statistics reset (`<table>#cache_state`: lookups
+moved to the `cleared` state, requests kept; finding parity-8) makes them partial too."""
+CACHE_STATE_PART = "cache_state"
+LAST_HOUR_KPIS: tuple[str, ...] = ("requests_last_hour", "failures_last_hour")
+"""Tiles of the trailing hour, whatever range is selected (the Overview's v1 tiles 10 and 11)."""
+
+
+def kpi_tables(key: str) -> tuple[str, ...]:
+    """The `<db>.<table>` names KPI tile `key` is computed from."""
+    return KPI_SOURCES.get(key, ROLLUP_TABLES)
+
+
+def reset_touches(row: Mapping[str, Any], tables: Iterable[str], *, latency: bool = False, cache: bool = False) -> bool:
+    """Whether the reset marker `row` (from `reset_annotations`) deleted data a number read from `tables` uses.
+
+    A marker lists what it deleted in `reset_tables`: `<db>.<table>` for deleted rows, `<db>.<table>#latency` for
+    rollup rows whose latency histograms were emptied (their counts kept), which matters only to a `latency`
+    number, and `<db>.<table>#cache_state` for rollup rows whose cache lookup state was cleared (their counts kept),
+    which matters only to a `cache` number (`CACHE_STATE_KPIS`). A marker without that list (written before it
+    existed, or by a writer that does not know) may have touched anything, so it counts (plan 6.8: a misleading delta
+    is worse than a missing one).
+    """
+    scope = row.get("reset_tables")
+    if scope is None:
+        return True
+    wanted = set(tables)
+    for entry in scope:
+        name, _, part = str(entry).partition("#")
+        if name not in wanted:
+            continue
+        if not part or (part == LATENCY_PART and latency) or (part == CACHE_STATE_PART and cache):
+            return True
+    return False
+
+
+def _when(at: Any, tz: str) -> str:
+    return datetime.fromtimestamp(int(at or 0), zone(tz)).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def reset_tile_notice(row: Mapping[str, Any], tz: str, *, comparison: bool) -> str:
+    """The plan 6.8 tile notice for reset marker `row`: dates only (a marker's label may name a client)."""
+    tail = f"this {'comparison' if comparison else 'value'} covers partial data."
+    if row.get("until") is not None:
+        return f"Data from {_when(row.get('at'), tz)} to {_when(row.get('until'), tz)} was reset; {tail}"
+    return f"Data reset on {_when(row.get('at'), tz)}; {tail}"
+
+
+def mark_partial(
+    tile: dict[str, Any],
+    tables: Iterable[str],
+    current: Sequence[Mapping[str, Any]],
+    baseline: Sequence[Mapping[str, Any]],
+    tz: str,
+    *,
+    latency: bool = False,
+    cache: bool = False,
+) -> bool:
+    """Plan 6.8 on one number with a delta: a reset of the data it reads (`tables`, see `reset_touches`) in its own
+    window (`current`, `reset_annotations` rows) or its comparison window (`baseline`) replaces the delta with a
+    notice: `notice` and `partial: true` are set, `delta` and `delta_pct` become null when present, and the baseline
+    `previous` stays as read (never synthesized). Returns whether the number is partial.
+
+    The one helper every delta of the admin API goes through (the Overview tiles in `kpis_sync`, the Cache page
+    tiles, the endpoint drill-down totals, the rotator tile and the Traffic trends; review round 4 finding
+    LOGICFIX-1: those built their deltas outside `kpis_sync` and never asked).
+    """
+    wanted = tuple(tables)
+    mine = [row for row in current if reset_touches(row, wanted, latency=latency, cache=cache)]
+    theirs = [row for row in baseline if reset_touches(row, wanted, latency=latency, cache=cache)]
+    if not mine and not theirs:
+        return False
+    tile["notice"] = reset_tile_notice((mine or theirs)[0], tz, comparison=not mine)
+    tile["partial"] = True
+    if "delta" in tile:
+        tile["delta"] = None
+        tile["delta_pct"] = None
+    return True
+
+
+def mark_kpi_partial(
+    tile: dict[str, Any],
+    key: str,
+    current: Sequence[Mapping[str, Any]],
+    baseline: Sequence[Mapping[str, Any]],
+    tz: str,
+) -> bool:
+    """`mark_partial` for a measure of this module (`key`): the tables it reads (`kpi_tables`), and whether it reads
+    the latency histograms (`LATENCY_KPIS`) or the cache lookup states (`CACHE_STATE_KPIS`)."""
+    return mark_partial(
+        tile, kpi_tables(key), current, baseline, tz, latency=key in LATENCY_KPIS, cache=key in CACHE_STATE_KPIS
+    )
+
+
+def touching_resets(
+    rows: Iterable[Mapping[str, Any]], keys: Iterable[str], *, seen: set[Any] | None = None
+) -> list[Mapping[str, Any]]:
+    """The reset markers among `rows` that touch any of the measures `keys` (each once, by id; `seen` carries the
+    ids already listed across calls): what a page's `notices` should name next to its partial numbers."""
+    names = tuple(keys)
+    tables = {table for key in names for table in kpi_tables(key)}
+    latency = any(key in LATENCY_KPIS for key in names)
+    cache = any(key in CACHE_STATE_KPIS for key in names)
+    seen = set() if seen is None else seen
+    out: list[Mapping[str, Any]] = []
+    for row in rows:
+        if row.get("id") not in seen and reset_touches(row, tables, latency=latency, cache=cache):
+            seen.add(row.get("id"))
+            out.append(row)
+    return out
+
+
 def kpis_sync(conn: sqlite3.Connection, window: Window, *, now: float, compare: str | None = None) -> dict[str, Any]:
-    """KPI tiles (plan 14.1 Overview) with an optional comparison and reset notices (plan 6.8)."""
+    """KPI tiles (plan 14.1 Overview) with an optional comparison and reset notices (plan 6.8).
+
+    Plan 6.8, finding parity-12: a tile whose own window or comparison window overlaps a reset of the data it reads
+    (`reset_touches`) carries a `notice` and `partial: true`, and its `delta` and `delta_pct` are null instead of a
+    misleading number. Other tiles keep their delta. The page `notices` list only resets that touched a tile.
+    The last-hour tiles (`LAST_HOUR_KPIS`: `requests_last_hour`, `failures_last_hour`) are checked over their hour
+    and the hour before (the Overview compares the two).
+    """
     current = totals_sync(conn, window)
     last_hour = Window(int(now) - 3600, int(now) + 1, "minute", window.tz)
     tiles: dict[str, Any] = {key: {"value": current.get(key)} for key in KPI_KEYS}
-    tiles["requests_last_hour"] = {"value": totals_sync(conn, last_hour)["requests"]}
-    notices = reset_annotations(conn, window.start, window.end)
-    result: dict[str, Any] = {"window": _window_dict(window), "tiles": tiles, "notices": notices}
+    hour_totals = totals_sync(conn, last_hour)
+    tiles["requests_last_hour"] = {"value": hour_totals["requests"]}
+    # v1's twin tile (finding parity-2): failed outcomes in the same trailing hour, so the live stream carries it.
+    tiles["failures_last_hour"] = {"value": hour_totals["failed"]}
+    current_resets = reset_annotations(conn, window.start, window.end)
+    baseline_resets: list[dict[str, Any]] = []
+    result: dict[str, Any] = {"window": _window_dict(window), "tiles": tiles}
     if compare:
         other = comparison_window(window, compare)
         previous = totals_sync(conn, other)
         for key in KPI_KEYS:
             tiles[key].update(_delta(current.get(key), previous.get(key)))
         result["compare"] = {"mode": compare, "window": _window_dict(other)}
-        result["notices"] = notices + reset_annotations(conn, other.start, other.end)
+        baseline_resets = reset_annotations(conn, other.start, other.end)
+    for key in KPI_KEYS:
+        mark_kpi_partial(tiles[key], key, current_resets, baseline_resets, window.tz)
+    hour_resets = reset_annotations(conn, last_hour.start - 3600, last_hour.end)
+    for key in LAST_HOUR_KPIS:
+        mark_kpi_partial(tiles[key], key, hour_resets, [], window.tz)
+    every_table = {name for key in (*KPI_KEYS, *LAST_HOUR_KPIS) for name in kpi_tables(key)}
+    seen: set[Any] = set()
+    notices: list[dict[str, Any]] = []
+    for row in (*current_resets, *baseline_resets):
+        if row["id"] not in seen and reset_touches(row, every_table, latency=True):
+            seen.add(row["id"])
+            notices.append(row)
+    result["notices"] = notices
     return result
 
 
@@ -616,15 +802,25 @@ def reset_annotations(conn: sqlite3.Connection, start: int, end: int) -> list[di
 
     A reset of one instant (`until` NULL) counts when it lies inside the window; a ranged reset (its deleted range
     `[at, until)`, `metrics/annotate.py`) counts when that range overlaps the window, so a window strictly
-    inside a deleted range is flagged too.
+    inside a deleted range is flagged too. Each row carries `reset_tables`: what the reset deleted
+    (`annotate.reset_tables_of`), or None when the marker does not say (`reset_touches` then counts it everywhere).
     """
+    scoped = annotate.has_reset_tables(conn)
+    extra = f", {annotate.RESET_TABLES_COLUMN}" if scoped else ""
     rows = conn.execute(
-        "SELECT id, at, until, label, audit_id FROM annotations WHERE kind = 'reset' AND at < ? "
+        f"SELECT id, at, until, label, audit_id{extra} FROM annotations WHERE kind = 'reset' AND at < ? "  # noqa: S608 (fixed column name)
         "AND (CASE WHEN until IS NULL THEN at >= ? ELSE until > ? END) ORDER BY at LIMIT 100",
         (end, start, start),
     ).fetchall()
     return [
-        {"id": r["id"], "at": r["at"], "until": r["until"], "label": r["label"], "audit_id": r["audit_id"]}
+        {
+            "id": r["id"],
+            "at": r["at"],
+            "until": r["until"],
+            "label": r["label"],
+            "audit_id": r["audit_id"],
+            "reset_tables": annotate.reset_tables_of(r[annotate.RESET_TABLES_COLUMN]) if scoped else None,
+        }
         for r in rows
     ]
 
@@ -744,7 +940,18 @@ CLIENT_LEVELS: tuple[tuple[str, str], ...] = (
     ("client_hour", "hour"),
     ("client_minute", "minute"),
 )
-CLIENT_SORTABLE = ("requests", "refused", "served", "bytes", "refused_pct", "rate1", "rate5", "rate60", "key")
+CLIENT_SORTABLE = (
+    "requests",
+    "refused",
+    "served",
+    "bytes",
+    "refused_pct",
+    "rate1",
+    "rate5",
+    "rate60",
+    "last_seen",
+    "key",
+)
 
 
 def _client_watermark_end(conn: sqlite3.Connection, table: str, unit: str, tz: str) -> int | None:
@@ -781,14 +988,24 @@ def client_table_sync(
     *,
     now: float,
     page: Page | None = None,
+    extras: bool = False,
 ) -> dict[str, Any]:
-    """The Clients page table for `ip` or `place`: totals in the window plus Rate1/5/60 (plan 14.1, row 73)."""
+    """The Clients page table for `ip` or `place`: totals in the window plus Rate1/5/60 (plan 14.1, row 73).
+
+    With `extras` (the Clients page and its export), v1's Callers and Top Talkers columns too (finding parity-7):
+    `last_seen` is the start of the newest bucket with a request in the window (the minute for recent traffic; the
+    hour or day where only compacted rows remain), and `peers` the distinct places one IP called as, or the distinct
+    IPs one place was called from, in the window (`read_client_extras.peer_counts`, from the `pair` client rows;
+    None for the folded `other` row). Callers that only need the numbers (insights, health, the Overview, the LLM
+    export) leave it off and pay nothing for them. Sorting by `last_seen` reads it for every row either way.
+    """
     if client_type not in ("ip", "place"):
         raise ValueError("client_type must be 'ip' or 'place'")
     page = page or Page(sort="requests")
     if page.size not in PAGE_SIZES or page.sort not in CLIENT_SORTABLE:
         raise ValueError("invalid page size or sort key")
     acc: dict[str, dict[str, Any]] = {}
+    pieces: list[tuple[str, int, int]] = []
     cursor = window.start
     for table, unit in CLIENT_LEVELS:
         if cursor >= window.end:
@@ -809,6 +1026,8 @@ def client_table_sync(
         if page.search:
             search = " AND instr(lower(client_key), ?) > 0"
             params.append(page.search.lower())
+        # `top_endpoint` is a bare column taken from the row of `max(requests)` (SQLite's min/max rule), so this
+        # statement keeps exactly one max(); `last_seen` is read by `read_client_extras.attach_last_seen`.
         rows = conn.execute(
             f"SELECT client_key, sum(requests) AS requests, sum(refused) AS refused, sum(served) AS served, "  # noqa: S608
             f"sum(bytes) AS bytes, max(requests) AS busiest, top_endpoint FROM {table} "
@@ -826,6 +1045,7 @@ def client_table_sync(
             if int(r["busiest"] or 0) > item["_busiest"]:
                 item["_busiest"] = int(r["busiest"] or 0)
                 item["top_endpoint"] = r["top_endpoint"]
+        pieces.append((table, cursor, hi))
         cursor = hi
     rows_out = []
     for item in acc.values():
@@ -835,9 +1055,18 @@ def client_table_sync(
     needs_rates = page.sort in ("rate1", "rate5", "rate60")
     if needs_rates:
         _attach_rates(conn, client_type, rows_out, now)
+    if page.sort == "last_seen":
+        read_client_extras.attach_last_seen(conn, client_type, rows_out, pieces)
     result = _paged(rows_out, page)
     if not needs_rates:
         _attach_rates(conn, client_type, result["rows"], now)
+    if not extras:
+        return result
+    if page.sort != "last_seen":
+        read_client_extras.attach_last_seen(conn, client_type, result["rows"], pieces)
+    peers = read_client_extras.peer_counts(conn, client_type, [str(row["key"]) for row in result["rows"]], pieces)
+    for row in result["rows"]:
+        row["peers"] = peers.get(str(row["key"]), 0) if row["key"] != read_client_extras.OTHER_KEY else None
     return result
 
 
@@ -887,23 +1116,73 @@ def _event_sum(conn: sqlite3.Connection, event_type: str, start: int, end: int, 
     ).fetchall()
 
 
+_REFUSAL_EVENTS_SQL = "FROM events WHERE type IN ('refusal', 'failure') AND at_ms >= ? AND at_ms < ?"
+"""The refusal and failure events of a window (the recorder's `_record_refusal_event`; `events_type_at` index)."""
+
+
+def _newest_per_reason(conn: sqlite3.Connection, path: str, window: Window) -> dict[str, Any]:
+    """`{reason: value}`: the detail field `path` of the newest refusal or failure event of each reason that has it."""
+    rows = conn.execute(
+        "SELECT reason_code, v FROM (SELECT reason_code, json_extract(detail_json, ?) AS v, "  # noqa: S608 (constant)
+        "row_number() OVER (PARTITION BY reason_code ORDER BY at_ms DESC, id DESC) AS rank "
+        f"{_REFUSAL_EVENTS_SQL} AND json_extract(detail_json, ?) IS NOT NULL) WHERE rank = 1",
+        (path, window.start * 1000, window.end * 1000, path),
+    ).fetchall()
+    return {str(r["reason_code"]): r["v"] for r in rows}
+
+
 def refusal_reasons(conn: sqlite3.Connection, window: Window) -> list[dict[str, Any]]:
     """Refusals and failures by reason code (exact, from rollups) with the custom versus default message split
-    (row 116, from refusal events; aggregated rows carry their count)."""
+    (row 116, from refusal events; aggregated rows carry their count), plus v1's Refusal Reasons columns (plan
+    14.1 row 10, parity row 72, finding parity-3), read from the same events:
+
+    - `last_status` and `last_path`: the newest event's status and path (the path is caller text: show it escaped);
+    - `clients`: distinct client hashes; a lower bound when `unattributed` > 0 (refusals past the recorder's event
+      budget are summed per minute without the client);
+    - `first_ms` and `last_ms`: the oldest and newest event (a summed row carries its minute's start).
+
+    These are None or 0 for a reason whose events were already pruned (`retention_events_days`) while its counts
+    remain in the rollups.
+    """
     data = collect(conn, window, filters={"outcome": ["refused", "failed"]}, group_by="reason_code", bucketed=False)
+    span = (window.start * 1000, window.end * 1000)
     split: dict[str, dict[str, int]] = {}
-    for event_type in ("refusal", "failure"):
+    for r in conn.execute(
+        "SELECT reason_code, coalesce(json_extract(detail_json, '$.message_source'), '') AS src, "
+        f"sum(coalesce(json_extract(detail_json, '$.count'), 1)) AS n {_REFUSAL_EVENTS_SQL} GROUP BY reason_code, src",
+        span,
+    ):
+        found = split.setdefault(str(r["reason_code"]), {})
+        key = str(r["src"]) or "unknown"
+        found[key] = found.get(key, 0) + int(r["n"])
+    facts: dict[str, sqlite3.Row] = {
+        str(r["reason_code"]): r
         for r in conn.execute(
-            "SELECT reason_code, coalesce(json_extract(detail_json, '$.message_source'), '') AS src, "
-            "sum(coalesce(json_extract(detail_json, '$.count'), 1)) AS n FROM events "
-            "WHERE type = ? AND at_ms >= ? AND at_ms < ? GROUP BY reason_code, src",
-            (event_type, window.start * 1000, window.end * 1000),
-        ):
-            split.setdefault(str(r["reason_code"]), {})[str(r["src"]) or "unknown"] = int(r["n"])
+            "SELECT reason_code, count(DISTINCT ip_hash) AS clients, min(at_ms) AS first_ms, max(at_ms) AS last_ms, "
+            "sum(CASE WHEN ip_hash IS NULL THEN coalesce(json_extract(detail_json, '$.count'), 1) ELSE 0 END) "
+            f"AS unattributed {_REFUSAL_EVENTS_SQL} GROUP BY reason_code",
+            span,
+        )
+    }
+    statuses = _newest_per_reason(conn, "$.status", window)
+    paths = _newest_per_reason(conn, "$.path", window)
     out = []
     for (_b, reason), totals in data.items():
+        name = str(reason)
+        fact = facts.get(name)
+        status = statuses.get(name)
         out.append(
-            {"reason": reason, "requests": totals.values["requests"], "message_source": split.get(str(reason), {})}
+            {
+                "reason": reason,
+                "requests": totals.values["requests"],
+                "message_source": split.get(name, {}),
+                "last_status": int(status) if isinstance(status, int | float) else None,
+                "last_path": str(paths[name])[:200] if paths.get(name) is not None else None,
+                "clients": int(fact["clients"] or 0) if fact is not None else 0,
+                "unattributed": int(fact["unattributed"] or 0) if fact is not None else 0,
+                "first_ms": int(fact["first_ms"]) if fact is not None and fact["first_ms"] is not None else None,
+                "last_ms": int(fact["last_ms"]) if fact is not None and fact["last_ms"] is not None else None,
+            }
         )
     out.sort(key=lambda r: -r["requests"])
     return out

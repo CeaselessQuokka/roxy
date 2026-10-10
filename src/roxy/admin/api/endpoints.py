@@ -2,8 +2,9 @@
 
 What this is
     * `GET /endpoints`: every endpoint template with its volume, trend against the comparison period, upstream
-      calls, hit ratio, Roblox 429s and latency percentiles; paged, sorted and searched on the server, filterable
-      by host and method, exportable as CSV or JSON.
+      calls, hit ratio, Roblox 429s and latency percentiles, plus v1 Top Endpoints' methods, last request, last
+      status and last caller; paged, sorted and searched on the server, filterable by host and method, exportable
+      as CSV or JSON.
     * `GET /endpoints/detail?template=...`: the drill-down of one template: totals with deltas, requests by
       outcome and latency over time, its Roblox 429s, who calls it (places and hashed clients over the range,
       addresses and places in the last 15 minutes), the concrete paths behind the template, its most recent
@@ -19,7 +20,8 @@ Why it exists
 
 How it works
     The table is `queries.endpoint_table` (one rollup read); the trend reads the comparison window once for the
-    keys on the page only. The drill-down filters the same read models by `endpoint_template`. Concrete paths and
+    keys on the page only, and `read_dashboard.endpoint_recency` adds the methods and the newest request of the
+    same page in the same read. The drill-down filters the same read models by `endpoint_template`. Concrete paths and
     recent requests come from the live rows (the last 15 minutes, every worker); callers over the whole range come
     from request samples, whose client column holds keyed IP hashes only. "Applies" is decided by the worker's
     rules snapshot with the real matchers (`RulesSnapshot.*_for`), evaluated on the template itself and on the
@@ -48,10 +50,11 @@ from roxy.admin.api.common import (
     TableSpec,
     TimeRange,
     TimeRangeDep,
+    add_caller_text,
     area_router,
-    collect_pages,
-    export_table,
+    export_pages,
     range_info,
+    reset_notices,
     series_answer,
     series_from_read_model,
     table_from_read_model,
@@ -76,7 +79,12 @@ _CONTROL: Final = re.compile(r"[\x00-\x1f\x7f]")
 _METHOD: Final = re.compile(r"[A-Z]{1,12}")
 
 TABLE_COLUMNS: Final[tuple[Column, ...]] = (
-    Column("key", "Endpoint", "The endpoint template: ids and other changing parts collapsed into placeholders."),
+    Column(
+        "key",
+        "Endpoint",
+        "The endpoint template: ids and other changing parts collapsed into placeholders.",
+        caller_text=True,
+    ),
     Column("requests", "Requests", METRICS["requests"].description, "requests"),
     Column("previous_requests", "Previous", "Requests in the comparison period.", "requests", sortable=False),
     Column("trend_pct", "Trend", "Change in requests against the comparison period.", "percent", sortable=False),
@@ -89,8 +97,60 @@ TABLE_COLUMNS: Final[tuple[Column, ...]] = (
     Column("p50_ms", "p50", METRICS["p50_ms"].description, "ms"),
     Column("p95_ms", "p95", METRICS["p95_ms"].description, "ms"),
     Column("p99_ms", "p99", METRICS["p99_ms"].description, "ms"),
+    Column(
+        "methods",
+        "Methods",
+        "Requests per HTTP method in the range, busiest first (v1's `GET:3 POST:1`).",
+        sortable=False,
+        caller_text=True,
+    ),
+    Column(
+        "last_request_ms",
+        "Last request",
+        "When the newest request in the range arrived: exact when its Live row is still kept (15 minutes), else the "
+        "start of its minute or hour (see last_request_precision).",
+        "timestamp_ms",
+        sortable=False,
+    ),
+    Column(
+        "last_request_precision",
+        "Last request precision",
+        "exact, minute, hour, day or month.",
+        sortable=False,
+    ),
+    Column(
+        "last_status",
+        "Last status",
+        "What Roxy answered the newest request with (known while its Live row is kept).",
+        sortable=False,
+    ),
+    Column(
+        "last_caller",
+        "Last caller",
+        "Client address of the newest request (known while its Live row is kept).",
+        ip=True,
+        sortable=False,
+    ),
+    Column(
+        "last_place",
+        "Last place",
+        "Roblox-Id (place) of the newest request, as the caller sent it (caller text).",
+        sortable=False,
+        caller_text=True,
+    ),
 )
 TABLE_SPEC: Final = TableSpec(name="endpoints", columns=TABLE_COLUMNS, default_sort="requests")
+TABLE_CALLER_TEXT: Final = ("key", "last_place")
+"""Columns of the table holding text a caller chose (the template comes from the caller's path): shown as plain
+text, never as markup."""
+RECENCY_KEYS: Final = (
+    "methods",
+    "last_request_ms",
+    "last_request_precision",
+    "last_status",
+    "last_caller",
+    "last_place",
+)
 DETAIL_TOTALS: Final[tuple[str, ...]] = (
     "requests",
     "demand",
@@ -155,6 +215,15 @@ def _trend(current: Any, previous: Any) -> float | None:
     return round((current - previous) * 100.0 / previous, 2)
 
 
+def _with_recency(conn: sqlite3.Connection, window: queries.Window, rows: list[dict[str, Any]]) -> None:
+    """Add v1's Methods, Last Request, Last Status and Last Caller to one page of rows (finding parity-13)."""
+    found = read_dashboard.endpoint_recency(conn, window, [str(row["key"]) for row in rows])
+    for row in rows:
+        extra = found.get(str(row["key"]), {})
+        for key in RECENCY_KEYS:
+            row[key] = extra.get(key, {} if key == "methods" else None)
+
+
 # --------------------------------------------------------------------------------------------- the table
 
 
@@ -171,7 +240,8 @@ async def endpoints_table(
     """Every endpoint template in the range (server-side paging, sorting and search; `host` and `method` filter).
 
     `previous_requests` and `trend_pct` compare with the requested comparison, or the previous period. An export
-    leaves them empty (the trend is read for the shown page only).
+    leaves them empty (the trend is read for the shown page only). Each row also carries v1's Top Endpoints columns
+    (`methods`, `last_request_ms` with its precision, `last_status`, `last_caller`, `last_place`; parity row 74).
     """
     ctx = get_ctx(request)
     db = ctx.dbs.metrics
@@ -180,11 +250,16 @@ async def endpoints_table(
 
         async def fetch(page: int, size: int) -> tuple[list[Any], int]:
             page_spec = replace(tq.metrics_page(), page=page, size=size)
-            data = await queries.endpoint_table(db, tr.window, page=page_spec, filters=filters or None)
+
+            def read_page(conn: sqlite3.Connection) -> dict[str, Any]:
+                data = queries.endpoint_table_sync(conn, tr.window, page=page_spec, filters=filters or None)
+                _with_recency(conn, tr.window, data["rows"])
+                return data
+
+            data = await db.read(read_page)
             return list(data["rows"]), int(data["total"])
 
-        rows, total = await collect_pages(fetch)
-        return await export_table(request, admin, TABLE_SPEC, rows, fmt, total=total, tq=tq, filters=filters, tr=tr)
+        return await export_pages(request, admin, TABLE_SPEC, fetch, fmt, tq=tq, filters=filters, tr=tr)
     other = tr.compare_window or queries.comparison_window(tr.window, "previous")
     window = tr.window
 
@@ -201,6 +276,7 @@ async def endpoints_table(
                 filters={**filters, "endpoint_template": keys},
             )
             previous = {row["key"]: row["requests"] for row in before["rows"]}
+        _with_recency(conn, window, data["rows"])
         return data, previous
 
     data, previous = await db.read(read)
@@ -210,6 +286,7 @@ async def endpoints_table(
     answer = table_from_read_model(TABLE_SPEC, tq, data)
     answer["compare"] = {"mode": tr.compare or "previous", "range": range_info(other)}
     answer["filters"] = filters
+    add_caller_text(answer, TABLE_CALLER_TEXT)
     return answer
 
 
@@ -339,6 +416,8 @@ async def endpoint_detail(
             "callers": read_dashboard.endpoint_callers(conn, name, start_ms, end_ms),
             "upstream_429": read_dashboard.endpoint_429s(conn, name, start_ms, end_ms),
             "recent": queries.endpoint_recent(conn, name, RECENT_MAX),
+            "resets": queries.reset_annotations(conn, window.start, window.end),
+            "baseline_resets": queries.reset_annotations(conn, other.start, other.end),
         }
 
     data = await ctx.dbs.metrics.read(read)
@@ -351,6 +430,10 @@ async def endpoint_detail(
             else None
         )
         totals[key] = {"value": current, "previous": previous, "delta": delta, "delta_pct": _trend(current, previous)}
+        # Plan 6.8 (finding LOGICFIX-1): a reset of what this total reads, in either window, replaces its delta
+        # with a notice (a reset marker names tables, not endpoints, so any such reset counts here).
+        queries.mark_kpi_partial(totals[key], key, data["resets"], data["baseline_resets"], window.tz)
+    reset_rows = queries.touching_resets([*data["resets"], *data["baseline_resets"]], DETAIL_TOTALS)
     by_outcome, latency = await _series(ctx, tr, name)
     recent = list(data["recent"])
     live = _live_summary(recent)
@@ -391,6 +474,7 @@ async def endpoint_detail(
             "keep 15 minutes and at most 50 rows per second per worker.",
             "Callers over the range come from request samples (served and failed requests); clients are shown as "
             "keyed hashes of their addresses.",
+            *reset_notices(reset_rows, tz=window.tz),
         ],
     }
 

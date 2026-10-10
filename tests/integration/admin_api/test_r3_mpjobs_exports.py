@@ -1,12 +1,18 @@
 """Review round 3, lens mpjobs: big exports against the 1 GB box (memory) and the event loop.
 
 What this is
-    Two adversarial tests (strict xfails) against the running app:
+    Two adversarial tests (strict xfails until their findings were fixed) against the running app:
       * a table download (`GET /admin/api/v1/audit?format=csv`) of the audit log at the export row cap, measured
         with `tracemalloc` on the server side only (the ASGI app is driven directly and the body bytes are counted
-        and dropped, so no client copy is measured);
+        and dropped, so no client copy is measured). Finding mpjobs-5, fixed: it held every row, the whole CSV and
+        its bytes (about 270 MiB); now `common.export_pages` reads one page at a time into a file of at most
+        `common.MAX_EXPORT_BYTES` (16 MiB, then `Roxy-Export-Truncated: true`), and a worker builds at most
+        `common.MAX_CONCURRENT_EXPORTS` (2) at once;
       * the LLM export (`build_export`, 7 days, full detail, the hourly file job's build) at its documented bounds
-        (200 recommendations, explanations of at most 4000 characters), with an event loop lag sampler.
+        (200 recommendations, explanations of at most 4000 characters), with an event loop sampler. Finding
+        mpjobs-6, fixed: it scrubbed every recommendation text on the event loop in one pass (0.1 to 0.3 s); now
+        `UntrustedPool.refs` defers the cleaning and splitting to `materialize` on a worker thread and the
+        recommendations are shaped in batches with a yield between them.
 
 Why it exists
     The production box has 909 MB of RAM and no swap, and systemd caps each color (a master and 2 workers) at
@@ -21,12 +27,13 @@ How it works
     The audit log gets 50,000 rule-change rows of about 0.9 KB each (a pattern, a note before and after, a reason),
     well inside the column bounds. The recommendations get 4,000-character explanations, next to a busy week of
     settings and rule edits and recurring errors. The thresholds: one download must stay under 96 MiB of Python
-    allocations (a third of the color's `MemoryHigh` would already be more than a worker's share), and no single
-    event loop stall may reach 50 ms (the H-LOOP-LAG pass band; every other section of the export stays far below
-    it, measured with a stack sampler: only the recommendation texts, scrubbed in one synchronous pass, exceed it).
+    allocations (a third of the color's `MemoryHigh` would already be more than a worker's share). The export may
+    redact or hash no text on the event loop thread at all, and the loop thread's CPU between two ticks of the
+    sampler stays under `LOOP_CPU_LIMIT_S` (twice the H-LOOP-LAG pass band of 50 ms; CPU time, so a busy machine
+    cannot make it pass or fail by preempting the process, as a wall clock stall threshold did).
 
 What to read next
-    `roxy/admin/api/common.py` (`collect_pages`, `render_export`, `export_table`), `roxy/admin/api/audit.py`,
+    `roxy/admin/api/common.py` (`export_pages`, `ExportBuilder`, `export_format`), `roxy/admin/api/audit.py`,
     `roxy/insights/llm_export.py` (`_Build.recommendations`, `UntrustedPool.refs`, `finalize`).
 """
 
@@ -35,22 +42,24 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import threading
 import time
 import tracemalloc
 from typing import Any
 
 import pytest
 
+from roxy.admin.api import common
 from roxy.admin.api.common import export_ip_policy
 from roxy.config.insight_params import INSIGHT_RULES
 from roxy.core.ids import new_id
+from roxy.core.redact import redact_text
 from roxy.insights import llm_export, simulate
 from roxy.insights.engine import write_recommendation
 from roxy.insights.models import Evidence, ProposedChange, Recommendation, make_fingerprint
 
 MIB = 1024 * 1024
 EXPORT_BUDGET_BYTES = 96 * MIB
-LOOP_STALL_LIMIT_S = 0.05  # H-LOOP-LAG's pass band; plan 6.7 wants proxy overhead p99 under 15 ms
 WORDS = [
     "the",
     "cache",
@@ -80,7 +89,7 @@ def _text(n: int, salt: int) -> str:
     return " ".join(out)[:n]
 
 
-async def _drive(app: Any, headers: dict[str, str], path: str, query: bytes) -> tuple[int, int]:
+async def _drive(app: Any, headers: dict[str, str], path: str, query: bytes) -> tuple[int, int, dict[str, str]]:
     """One request straight through the ASGI app; the body is counted and dropped (no client copy)."""
     scope = {
         "type": "http",
@@ -96,7 +105,7 @@ async def _drive(app: Any, headers: dict[str, str], path: str, query: bytes) -> 
         "client": ("127.0.0.1", 50000),
         "server": ("testserver", 443),
     }
-    state: dict[str, Any] = {"status": 0, "bytes": 0, "sent": False}
+    state: dict[str, Any] = {"status": 0, "bytes": 0, "sent": False, "headers": {}}
 
     async def receive() -> dict[str, Any]:
         if not state["sent"]:
@@ -108,19 +117,15 @@ async def _drive(app: Any, headers: dict[str, str], path: str, query: bytes) -> 
     async def send(message: dict[str, Any]) -> None:
         if message["type"] == "http.response.start":
             state["status"] = int(message["status"])
+            state["headers"] = {bytes(k).decode().lower(): bytes(v).decode() for k, v in message.get("headers", [])}
         else:
             state["bytes"] += len(message.get("body", b""))
 
     await app(scope, receive, send)
-    return int(state["status"]), int(state["bytes"])
+    return int(state["status"]), int(state["bytes"]), dict(state["headers"])
 
 
 @pytest.mark.timeout(240)
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding mpjobs-5: a table download holds every row, the whole CSV and its bytes in memory at once "
-    "(about 260 MB for one 50,000-row audit export), with no byte bound and no per-worker limit on concurrent builds",
-)
 async def test_r3_mpjobs_one_table_download_fits_a_workers_memory_share(api: Any, api_app: Any) -> None:
     now = int(api_app.clock.now())
 
@@ -151,23 +156,42 @@ async def test_r3_mpjobs_one_table_download_fits_a_workers_memory_share(api: Any
     gc.collect()
     tracemalloc.start()
     try:
-        status, size = await _drive(api_app.app, headers, "/admin/api/v1/audit", b"format=csv")
+        status, size, sent = await _drive(api_app.app, headers, "/admin/api/v1/audit", b"format=csv")
         _current, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
     assert status == 200
-    assert size > 30 * MIB  # the file itself (about 46 MB at this row width)
-    # Two or three of these at once (a double click, two tabs, two tables) take a worker past its color's MemoryMax.
+    # The whole log would be about 46 MB of CSV: the file is filled up to the byte cap and says it was cut
+    # (mpjobs-5 fix: `common.MAX_EXPORT_BYTES`, pages read one at a time by `common.export_pages`).
+    assert common.MAX_EXPORT_BYTES - MIB < size <= common.MAX_EXPORT_BYTES, size
+    assert sent["content-length"] == str(size)
+    assert sent["roxy-export-truncated"] == "true"
+    assert 0 < int(sent["roxy-export-rows"]) < 50_000
+    # At most `MAX_CONCURRENT_EXPORTS` (2) of these run in a worker at once (apisec-6), so two stay inside a
+    # worker's share of the color's MemoryHigh.
     assert peak < EXPORT_BUDGET_BYTES, f"one download peaked at {peak / MIB:.0f} MiB of Python allocations"
+    assert peak < common.MAX_EXPORT_BYTES + 8 * MIB, f"{peak / MIB:.0f} MiB: more than the file and a page"
+
+
+LOOP_CPU_LIMIT_S = 0.1
+"""Most CPU the event loop thread may spend in one stretch between two ticks of the sampler during an export build:
+twice the H-LOOP-LAG pass band (50 ms). It is CPU time of the loop thread (`time.thread_time`), not wall time, so a
+busy machine that preempts the process does not inflate it; the fixed build stays near a tenth of it."""
 
 
 @pytest.mark.timeout(240)
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding mpjobs-6: the LLM export scrubs every recommendation text on the event loop in one pass, "
-    "a 0.1 to 0.3 s stall at its bounds (the hourly leader job and every API export)",
-)
-async def test_r3_mpjobs_llm_export_never_stalls_the_event_loop(api_app: Any) -> None:
+async def test_r3_mpjobs_llm_export_never_stalls_the_event_loop(api_app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Finding mpjobs-6 (fixed): the export's text scrubbing runs off the event loop, and the loop is never held long.
+
+    Two properties, neither a wall clock threshold (a stall measured in wall time also counts every moment a busy
+    machine preempts the process, which is how this test once passed by luck and could fail by bad luck):
+    - structural: every call of the export's redaction and IP hashing (`llm_export.redact_text`, `mask_ips`)
+      happens on a worker thread, never on the event loop thread (`UntrustedPool.refs` defers, `finalize` cleans);
+    - bounded: the CPU the loop thread spends between two ticks of a 5 ms sampler stays under `LOOP_CPU_LIMIT_S`.
+    The test app's heap is frozen for the garbage collector (`gc.freeze`) during the build: a full collection of
+    the whole test process takes about 100 ms on whichever thread triggers it, and that is the process's heap, not
+    the export's work (a collection during the build then scans only the objects the build made).
+    """
     now = int(api_app.clock.now())
     spec = INSIGHT_RULES["UP-429-ENDPOINT"]
     for i in range(200):  # llm_export.LIMITS["full"].recommendations
@@ -186,7 +210,9 @@ async def test_r3_mpjobs_llm_export_never_stalls_the_event_loop(api_app: Any) ->
         )
         rec.id = new_id("rec", api_app.clock)
         rec.fingerprint = make_fingerprint("UP-429-ENDPOINT", rec.subject)
-        rec.state = "open"
+        # Applied, not open: the test app's leader evaluates UP-429-ENDPOINT at start and resolves its open cards
+        # that the data does not support, racing this seed; the export shapes an applied card the same way.
+        rec.state = "applied"
         rec.created_at = rec.updated_at = now
         rec.expires_at = now + 86_400
         rec.dry_run_available = simulate.can_simulate(rec)
@@ -229,18 +255,34 @@ async def test_r3_mpjobs_llm_export_never_stalls_the_event_loop(api_app: Any) ->
     await api_app.ctx.dbs.metrics.write(errors)
     sources = llm_export.ExportSources.from_context(api_app.ctx)
     hasher, mode = export_ip_policy(api_app.ctx, "r3-mpjobs")
-    worst = 0.0
+    loop_thread = threading.get_ident()
+    calls = {"loop": 0, "worker": 0}
+
+    def watched(function: Any) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            calls["loop" if threading.get_ident() == loop_thread else "worker"] += 1
+            return function(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(llm_export, "redact_text", watched(redact_text))  # the name `llm_export` calls
+    monkeypatch.setattr(llm_export, "mask_ips", watched(llm_export.mask_ips))
+    worst_cpu = worst_wall = 0.0
     done = False
 
     async def sampler() -> None:
-        nonlocal worst
-        last = time.perf_counter()
+        nonlocal worst_cpu, worst_wall
+        last_cpu, last_wall = time.thread_time(), time.perf_counter()
         while not done:
             await asyncio.sleep(0.005)
-            now_s = time.perf_counter()
-            worst = max(worst, now_s - last - 0.005)
-            last = now_s
+            cpu, wall = time.thread_time(), time.perf_counter()
+            # The loop thread's CPU between two ticks is what the other callbacks (the build) ran in one piece.
+            worst_cpu = max(worst_cpu, cpu - last_cpu)
+            worst_wall = max(worst_wall, wall - last_wall - 0.005)
+            last_cpu, last_wall = cpu, wall
 
+    gc.collect()
+    gc.freeze()
     task = asyncio.create_task(sampler())
     try:
         result = await llm_export.build_export(
@@ -249,6 +291,14 @@ async def test_r3_mpjobs_llm_export_never_stalls_the_event_loop(api_app: Any) ->
     finally:
         done = True
         await task
+        gc.unfreeze()
     assert result.content
-    # Every proxied request this worker holds waits out the stall (plan 6.7: proxy overhead p99 under 15 ms).
-    assert worst < LOOP_STALL_LIMIT_S, f"the event loop stalled for {worst * 1000:.0f} ms during one export build"
+    assert len(result.document["recommendations"]) == 200
+    assert all(len(rec["explanation"]) == 20 for rec in result.document["recommendations"])  # 4000 / 200
+    assert calls["worker"] > 0, calls  # the texts were cleaned (on a worker thread)
+    assert calls["loop"] == 0, f"the export redacted or hashed {calls['loop']} texts on the event loop thread"
+    # Every proxied request this worker holds waits while the loop is busy (plan 6.7: proxy overhead p99 under 15 ms).
+    assert worst_cpu < LOOP_CPU_LIMIT_S, (
+        f"the event loop thread ran {worst_cpu * 1000:.0f} ms of CPU in one piece during one export build "
+        f"(worst wall clock stall {worst_wall * 1000:.0f} ms)"
+    )

@@ -10,15 +10,17 @@ What this is
         validation errors as 400 or 422), `service_error` and `run_mutation` / `service_errors` (the services'
         refusals as 422, 409, 404 or 503).
       * Who and what: `actor_for(principal)` (the audit `Actor`), `request_id_of(request)`, `ApiBody` (the base of
-        every request body: unknown fields refused) and `require_reason`.
+        every request body: unknown fields refused), `require_reason` and `RowId` (an integer path id SQLite can
+        hold).
       * Time: `RangeParams`, `range_params`, `build_time_range`, `time_range` and `TimeRangeDep`, all built on
         `metrics.queries.resolve_window`, `comparison_window` and `bucket_starts` (one implementation of windows).
       * Answers: `range_info`, `series_entry`, `series_from_read_model`, `series_answer`, `annotation_entries`,
         `reset_notices`, `kpi_tile`, `kpi_from_read_model`.
       * Tables: `Column`, `TableSpec`, `TableQuery`, `table_params(spec)`, `page_rows`, `table_answer`,
         `table_from_read_model`, `collect_pages`.
-      * Exports: `export_format`, `ExportFormatDep`, `csv_safe`, `csv_bytes`, `render_export`, `export_ip_policy`,
-        `export_table` (CSV or JSON download of any table, formula guarded, IP addresses hashed, audited).
+      * Exports: `export_format`, `ExportFormatDep`, `csv_safe`, `csv_bytes`, `ExportBuilder`, `render_export`,
+        `export_ip_policy`, `mask_ip_text`, `export_table` and `export_pages` (CSV or JSON download of any table,
+        formula guarded, IP addresses hashed, bounded in rows, bytes and concurrent builds, audited).
 
 Why it exists
     DESIGN.md section 13 and plan 14.2, 15.2, 9.6, 9.7, 9.9 and 9.16 set one convention for some twenty API areas:
@@ -47,9 +49,13 @@ How it works
       `month`, `year`). A window that would need more than `queries.MAX_POINTS` buckets is refused up front.
     * Tables: `page` is 1-based, `page_size` one of 10, 25, 50, 100, 250, `sort` one of the table's sortable
       column keys, `order` `asc` or `desc`, `q` at most 200 characters. Missing values sort last in both orders.
-    * Exports: at most `MAX_EXPORT_ROWS` rows, built on a worker thread; columns marked `ip=True` hold keyed hashes
-      unless `export_include_ips` is on (`export_ip_policy`); the audit row (`export.download`) is written before
-      the file is sent, and a failed audit write refuses the download (503) instead of sending an unaudited file.
+    * Exports: at most `MAX_EXPORT_ROWS` rows and `MAX_EXPORT_BYTES` bytes, built as encoded chunks on a worker
+      thread (`export_pages` reads a paged read model one page at a time, so one download never holds every row);
+      at most `MAX_CONCURRENT_EXPORTS` per worker (429 beyond, held from the first read to the last byte sent).
+      Unless `export_include_ips` is on (`export_ip_policy`), columns marked `ip=True` hold keyed hashes and every
+      other cell has its addresses replaced by `ip:<hash>` (`mask_ip_text`); the audit row (`export.download`) is
+      written before the file is sent, and a failed audit write refuses the download (503) instead of sending an
+      unaudited file.
 
 What to read next
     `roxy/admin/api/__init__.py` (how area modules are mounted and checked), `roxy/metrics/queries.py` (the read
@@ -64,19 +70,20 @@ import io
 import json
 import re
 import secrets
-from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
+from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any, Final, Literal
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 from starlette.exceptions import HTTPException
-from starlette.responses import Response
+from starlette.responses import Response, StreamingResponse
 
 from roxy.abuse.bypass import BypassNeedsConfirmation
 from roxy.admin.auth.deps import SAFE_METHODS, AdminPrincipal, require_admin, require_csrf
@@ -85,6 +92,7 @@ from roxy.config.audit import Actor
 from roxy.config.catalog import SettingValidationError
 from roxy.config.constants import MAX_REASON_LENGTH
 from roxy.config.settings_service import HistoryNotFound, SettingsUpdateError
+from roxy.core import ipmask
 from roxy.core.errors import JSON_TYPE, admin_api_error_body
 from roxy.core.iphash import derived_key, ip_hash
 from roxy.core.redact import redact_text
@@ -119,6 +127,12 @@ MAX_FIELDS: Final = 50
 
 MAX_BODY_STRING_CHARS: Final = 8192
 """Longest string any API body field may hold unless its model sets a tighter bound (plan 9.9)."""
+
+MAX_ROW_ID: Final = 2**62
+"""Largest row id a path or query parameter accepts (`RowId`): SQLite integers are 64-bit, and a larger number
+would reach sqlite3 as an `OverflowError` (plan 9.9 "path parameters typed", DESIGN.md 13: never a 500)."""
+
+TOO_LARGE_MESSAGE: Final = "A number in this request is too large."
 
 
 # ================================================================================================= errors
@@ -351,6 +365,10 @@ def service_error(exc: BaseException, extra: ErrorMap | None = None) -> ApiError
         return conflict(str(exc), code="wrong_state")
     if isinstance(exc, SharedStateUnavailable):
         return unavailable(f"The {exc.db_name} database is busy or unavailable right now; try again shortly.")
+    if isinstance(exc, OverflowError):
+        # A safety net behind `RowId`: a number too large for SQLite's 64-bit integers (sqlite3 raises OverflowError
+        # when it binds one) is the caller's mistake, never a server error with an alert.
+        return validation_error({}, TOO_LARGE_MESSAGE)
     return None
 
 
@@ -481,6 +499,12 @@ def require_reason(reason: str | None, *, required: bool, field: str = "reason")
     if required and not text:
         raise validation_error({field: "Give a reason for this change; it is high risk and goes in the audit log."})
     return text
+
+
+RowId = Annotated[int, Path(ge=1, le=MAX_ROW_ID)]
+"""An integer row id in a path (`/routing-rules/{rule_id}`, `/health/runs/{run_id}`): 1 to `MAX_ROW_ID`, else 422
+`validation_failed`. Every integer path id of the API uses it (or the same bounds), so no id reaches SQLite out of
+its range."""
 
 
 # ================================================================================================ time ranges
@@ -772,8 +796,11 @@ def kpi_from_read_model(
     unit: str | None = None,
 ) -> dict[str, Any]:
     """A tile from one `queries.kpis` tile (`value`, and `delta`/`delta_pct` with a comparison); label, unit,
-    help and good direction come from the metric catalog."""
+    help and good direction come from the metric catalog. Without an explicit `notice`, the read model's own tile
+    notice (plan 6.8: a reset touched this tile's data) is the tile's notice, so no caller can drop it."""
     spec = METRICS.get(key)
+    if notice is None:
+        notice = tile.get("notice")
     return kpi_tile(
         key,
         label=label or (spec.label if spec else key),
@@ -802,8 +829,14 @@ _TABLE_NAME_RE: Final = re.compile(r"[a-z][a-z0-9_]{0,47}")
 class Column:
     """One table column: `key` in each item, a `label`, `help` text and a `unit` (`""` for plain text).
 
-    `ip=True` marks a column of client IP addresses: an export replaces them with keyed hashes unless
-    `export_include_ips` is on (see `export_ip_policy`). The dashboard's own answers show them as they are.
+    `ip=True` marks a column of client IP addresses: an export replaces each value with its keyed hash unless
+    `export_include_ips` is on (see `export_ip_policy`); the addresses inside every other cell's text are replaced
+    too (`mask_ip_text`). The dashboard's own answers show them as they are.
+
+    `caller_text=True` marks a column holding text a caller chose (a path, a probed URL, a User-Agent, a header
+    name, an error quoting them): `table_answer` lists it in `caller_text` (DESIGN 13.1), and pages render it as
+    plain text, never markup (plan 9.16). Every column whose key is in `CALLER_TEXT_COLUMN_KEYS` must carry it
+    (a discovery test checks every table, review round 4 finding secfix-5).
     """
 
     key: str
@@ -812,9 +845,32 @@ class Column:
     unit: str = ""
     sortable: bool = True
     ip: bool = False
+    caller_text: bool = False
 
     def info(self) -> dict[str, str]:
         return {"key": self.key, "label": self.label, "help": self.help, "unit": self.unit}
+
+
+CALLER_TEXT_COLUMN_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "path",
+        "last_path",
+        "target",
+        "user_agent",
+        "username",
+        "template",
+        "last_template",
+        "endpoint_template",
+        "top_endpoint",
+        "last_place",
+        "last_error",
+        "detail",
+        "last_detail",
+    }
+)
+"""Column keys that hold caller-chosen text in every table they appear in (a request path, a probed URL, a
+User-Agent, a typed username, an endpoint template built from a caller's path, a place name, an error or event
+detail quoting them). Other columns are marked one by one (a probe signature, a header name, a CSP report field)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -839,6 +895,11 @@ class TableSpec:
     @property
     def sortable(self) -> frozenset[str]:
         return frozenset(c.key for c in self.columns if c.sortable) | frozenset(self.extra_sort_keys)
+
+    @property
+    def caller_text(self) -> tuple[str, ...]:
+        """Keys of the columns holding text a caller chose (`Column.caller_text`), in column order."""
+        return tuple(c.key for c in self.columns if c.caller_text)
 
     def columns_info(self) -> list[dict[str, str]]:
         return [column.info() for column in self.columns]
@@ -941,8 +1002,9 @@ def page_rows(
 
 
 def table_answer(spec: TableSpec, tq: TableQuery, items: Sequence[Any], total: int) -> dict[str, Any]:
-    """`{items, total, page, page_size, sort, order, columns}` (DESIGN.md section 13)."""
-    return {
+    """`{items, total, page, page_size, sort, order, columns}` (DESIGN.md section 13), plus `caller_text` when the
+    table has columns of caller-chosen text (13.1; `Column.caller_text`)."""
+    answer: dict[str, Any] = {
         "items": list(items),
         "total": int(total),
         "page": tq.page,
@@ -951,6 +1013,20 @@ def table_answer(spec: TableSpec, tq: TableQuery, items: Sequence[Any], total: i
         "order": tq.order,
         "columns": spec.columns_info(),
     }
+    if spec.caller_text:
+        answer["caller_text"] = list(spec.caller_text)
+    return answer
+
+
+def add_caller_text(answer: dict[str, Any], keys: Iterable[str]) -> dict[str, Any]:
+    """Add `keys` (field keys, dotted for nested ones) to `answer["caller_text"]`, keeping what is already listed
+    (the table's own columns first), so a route's extra fields never drop a column `table_answer` declared."""
+    merged = [str(key) for key in answer.get("caller_text") or ()]
+    for key in keys:
+        if key not in merged:
+            merged.append(str(key))
+    answer["caller_text"] = merged
+    return answer
 
 
 def table_from_read_model(spec: TableSpec, tq: TableQuery, data: Mapping[str, Any]) -> dict[str, Any]:
@@ -958,25 +1034,55 @@ def table_from_read_model(spec: TableSpec, tq: TableQuery, data: Mapping[str, An
     return table_answer(spec, tq, list(data.get("rows") or []), int(data.get("total") or 0))
 
 
+PageFetch = Callable[[int, int], Awaitable[tuple[Sequence[Any], int]]]
+"""A paged read model: `fetch(page, page_size) -> (items, total)` (pages are 1-based)."""
+
+
+def estimated_bytes(item: Any) -> int:
+    """A cheap estimate of the text one row holds (the size it adds to an export), for `collect_pages`."""
+    if isinstance(item, Mapping):
+        return sum(_value_bytes(value) for value in item.values()) + 4 * len(item)
+    return _value_bytes(item)
+
+
+def _value_bytes(value: Any) -> int:
+    if value is None or isinstance(value, bool | int | float):
+        return 8
+    if isinstance(value, str | bytes):
+        return len(value)
+    return len(repr(value))  # a nested value: rare, and its JSON is about as long as its repr
+
+
 async def collect_pages(
-    fetch: Callable[[int, int], Awaitable[tuple[Sequence[Any], int]]],
+    fetch: PageFetch,
     *,
     page_size: int = max(PAGE_SIZES),
     max_rows: int | None = None,
+    max_bytes: int | None = None,
 ) -> tuple[list[Any], int]:
     """Read every page of a paged read model for an export: `fetch(page, page_size) -> (items, total)`.
 
-    Stops at `max_rows` (default `MAX_EXPORT_ROWS`), at an empty page, or at the total. Returns `(rows, total)`.
+    Stops at `max_rows` (default `MAX_EXPORT_ROWS`), once the rows held reach about `max_bytes` of text (default
+    `MAX_EXPORT_BYTES`, as much as one file can carry, estimated by `estimated_bytes`), at an empty page, or at the
+    total. Returns `(rows, total)`; a cut list keeps the read model's total, so the export says it is truncated.
+    This holds every row it returns: an export of a large paged table should use `export_pages`, which holds one
+    page at a time.
     """
     limit = MAX_EXPORT_ROWS if max_rows is None else max_rows
+    budget = MAX_EXPORT_BYTES if max_bytes is None else max_bytes
     rows: list[Any] = []
     total = 0
+    held = 0
     page = 1
-    while len(rows) < limit:
+    while len(rows) < limit and held < budget:
         items, total = await fetch(page, page_size)
         if not items:
             break
-        rows.extend(items)
+        for item in items:
+            rows.append(item)
+            held += estimated_bytes(item)
+            if held >= budget:
+                break
         if len(rows) >= total:
             break
         page += 1
@@ -988,7 +1094,28 @@ async def collect_pages(
 ExportFormat = Literal["csv", "json"]
 EXPORT_FORMATS: Final[tuple[str, ...]] = ("csv", "json")
 MAX_EXPORT_ROWS: Final = 50_000
-"""Most rows one download carries (plan P9: the 1 GB server builds the file in memory)."""
+"""Most rows one download carries (plan P9)."""
+
+MAX_EXPORT_BYTES: Final = 16 * 1024 * 1024
+"""Largest file one download carries (plan P9; DESIGN.md section 0, a worker's share of the 1 GB server). A file is
+built in memory as encoded chunks, so this is also about the most one download holds: the row that would pass it
+is left out and the download says so (`Roxy-Export-Truncated: true`, JSON `truncated`)."""
+
+MAX_CONCURRENT_EXPORTS: Final = 2
+"""Table downloads one worker reads, builds and sends at once (plan P9, as for the LLM export's builds); one more
+is 429 `rate_limited`. The bound is per worker on purpose: it caps the memory of one process, and each worker (1,
+2 or 4, C6) holds only its own share."""
+
+EXPORT_BUSY_RETRY_S: Final = 5
+EXPORT_BUSY_MESSAGE: Final = "Two downloads are already being built here; try again in a few seconds."
+EXPORT_SLOTS_STATE: Final = "admin_export_slots"
+"""Where a worker's `ExportSlots` lives on `app.state` (one app per worker)."""
+
+EXPORT_PAGE_ROWS: Final = max(PAGE_SIZES)
+"""Rows `export_pages` reads per page: the largest table page."""
+
+JSON_TRAILER_RESERVE: Final = 128
+"""Bytes kept free in a JSON file for its closing `],"total":N,"truncated":B}`, so it never passes the cap."""
 
 FORMULA_PREFIXES: Final = ("=", "+", "-", "@", "\t", "\r")
 """Characters that make a spreadsheet read a cell as a formula (plan 9.16, parity row 88, v1 `toCSVRow`)."""
@@ -997,17 +1124,66 @@ CSV_TYPE: Final = "text/csv; charset=utf-8"
 EXPORT_AUDIT_ACTION: Final = "export.download"
 
 
-async def export_format(
-    format_: Annotated[str | None, Query(alias="format", max_length=8)] = None,
-) -> ExportFormat | None:
-    """`format=csv` or `format=json` turns a table request into a download; absent means the normal answer."""
-    if format_ is None:
+def parse_export_format(raw: str | None) -> ExportFormat | None:
+    """`csv`, `json`, or None for no `format` parameter; anything else is 422 `invalid_format`."""
+    if raw is None:
         return None
-    if format_ == "csv":
+    if raw == "csv":
         return "csv"
-    if format_ == "json":
+    if raw == "json":
         return "json"
     raise validation_error({"format": "Choose csv or json."}, "The export format is not valid.", code="invalid_format")
+
+
+@dataclass(slots=True)
+class ExportSlots:
+    """The table downloads one worker is building or sending (at most `limit`). Used on the event loop only."""
+
+    limit: int = MAX_CONCURRENT_EXPORTS
+    busy: int = 0
+
+    def take(self) -> bool:
+        if self.busy >= self.limit:
+            return False
+        self.busy += 1
+        return True
+
+    def give(self) -> None:
+        self.busy = max(0, self.busy - 1)
+
+
+def export_slots(app: Any) -> ExportSlots:
+    """This worker's `ExportSlots` (created on first use)."""
+    slots = getattr(app.state, EXPORT_SLOTS_STATE, None)
+    if not isinstance(slots, ExportSlots):
+        slots = ExportSlots()
+        setattr(app.state, EXPORT_SLOTS_STATE, slots)
+    return slots
+
+
+async def export_format(
+    request: Request,
+    _admin: AdminSession,
+    format_: Annotated[str | None, Query(alias="format", max_length=8)] = None,
+) -> AsyncIterator[ExportFormat | None]:
+    """`format=csv` or `format=json` turns a table request into a download; absent means the normal answer.
+
+    A download holds one of the worker's `MAX_CONCURRENT_EXPORTS` slots from before its first row is read until its
+    last byte is sent (FastAPI runs the code after `yield` once the response is sent); without a free slot the
+    answer is 429 `rate_limited` with `Retry-After`. The session guard runs first, so a signed-out caller gets 401
+    and never learns whether the slots are busy.
+    """
+    fmt = parse_export_format(format_)
+    if fmt is None:
+        yield None
+        return
+    slots = export_slots(request.app)
+    if not slots.take():
+        raise rate_limited(EXPORT_BUSY_MESSAGE, EXPORT_BUSY_RETRY_S)
+    try:
+        yield fmt
+    finally:
+        slots.give()
 
 
 ExportFormatDep = Annotated[ExportFormat | None, Depends(export_format)]
@@ -1023,11 +1199,14 @@ def _cell_text(value: Any) -> str:
     return str(value).replace("\x00", "")
 
 
+def _formula_guard(text: str) -> str:
+    return "'" + text if text.startswith(FORMULA_PREFIXES) else text
+
+
 def csv_safe(value: Any) -> str:
     """One CSV cell: text form of `value`, with a leading apostrophe when it starts with `=`, `+`, `-`, `@`, a tab
     or a carriage return, so a spreadsheet shows it as text instead of running it (every column, headers too)."""
-    text = _cell_text(value)
-    return "'" + text if text.startswith(FORMULA_PREFIXES) else text
+    return _formula_guard(_cell_text(value))
 
 
 def csv_bytes(columns: Sequence[Column], items: Sequence[Mapping[str, Any]]) -> bytes:
@@ -1044,17 +1223,6 @@ def export_filename(name: str, fmt: ExportFormat, at_ms: int) -> str:
     """`roxy_<table>_<epoch ms>.<csv|json>` (v1's export file names)."""
     safe = re.sub(r"[^a-z0-9_]", "_", name.lower())[:48] or "table"
     return f"roxy_{safe}_{int(at_ms)}.{fmt}"
-
-
-@dataclass(frozen=True, slots=True)
-class ExportFile:
-    """A rendered export: bytes, media type, file name, row count and whether rows were cut at the cap."""
-
-    content: bytes
-    media_type: str
-    filename: str
-    rows: int
-    truncated: bool
 
 
 IpHasher = Callable[[str], str]
@@ -1078,22 +1246,192 @@ def export_ip_policy(ctx: Any, export_id: str) -> tuple[IpHasher | None, IpMode]
     return (lambda ip: ip_hash(ip, one_time)), "hashed_one_time"
 
 
-def _private_items(
-    columns: Sequence[Column], items: Sequence[Mapping[str, Any]], hasher: IpHasher | None
-) -> list[Mapping[str, Any]]:
-    """`items` with every non-empty value of an `ip` column hashed (unchanged when `hasher` is None)."""
-    ip_keys = [column.key for column in columns if column.ip]
-    if hasher is None or not ip_keys:
-        return list(items)
-    out: list[Mapping[str, Any]] = []
-    for item in items:
-        copy = dict(item)
-        for key in ip_keys:
-            value = copy.get(key)
-            if isinstance(value, str) and value:
-                copy[key] = hasher(value)
-        out.append(copy)
-    return out
+# --- client addresses in free text (plan 9.15, 12.3) ---------------------------------------------------------------
+
+IP_TEXT_PREFIX: Final = ipmask.IP_TEXT_PREFIX
+"""How an address in free text is replaced: `ip:<keyed hash>` (the LLM export's form, 14.5)."""
+
+MAX_MASK_DEPTH: Final = 32
+"""Nesting levels `mask_ip_value` walks; a deeper value is masked as its JSON text (plan P9)."""
+
+
+def mask_ip_text(text: str, hasher: IpHasher, *, keep_versions: bool = False) -> str:
+    """`text` with every IPv4 and IPv6 address replaced by `ip:<keyed hash>` (an `ip:` already in front stays one).
+
+    The shared masker of every outside file (`core/ipmask.py`, also the LLM export's): each candidate is checked by
+    `ipaddress` (a time such as `12:30:45` is left alone), an IPv6 client written after a word and a colon
+    (`ip:2001:db8:1:2::/64`, review round 4 finding secfix-2) is found, and the hash is of the address's normal
+    form, so it equals the hash an `ip` column gets for the same client. A version after a product name
+    (`Chrome/120.0.0.0`) is kept only with `keep_versions` (User-Agent columns and keys); anywhere else it may be a
+    path holding an address and is masked. Cheap for text without a dot or a colon.
+    """
+    return ipmask.mask_ip_text(text, hasher, keep_versions=keep_versions)
+
+
+def mask_ip_value(value: Any, hasher: IpHasher, depth: int = 0, *, keep_versions: bool = False) -> Any:
+    """`value` (JSON shapes: strings, numbers, lists, objects) with the addresses in every string and key masked;
+    the values under a User-Agent key (`ipmask.is_user_agent_field`) keep their product versions."""
+    if isinstance(value, str):
+        return mask_ip_text(value, hasher, keep_versions=keep_versions)
+    if isinstance(value, Mapping | list | tuple) and depth >= MAX_MASK_DEPTH:
+        text = json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
+        return mask_ip_text(text, hasher, keep_versions=keep_versions)
+    if isinstance(value, Mapping):
+        return {
+            mask_ip_text(str(key), hasher): mask_ip_value(
+                item, hasher, depth + 1, keep_versions=keep_versions or ipmask.is_user_agent_field(str(key))
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [mask_ip_value(item, hasher, depth + 1, keep_versions=keep_versions) for item in value]
+    return value
+
+
+# --- building a file ------------------------------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class ExportFile:
+    """A rendered export: its encoded chunks (emptied as they are sent), media type, file name, row count, whether
+    rows were left out (row cap, byte cap, or a caller with more rows than it passed) and its size in bytes."""
+
+    chunks: deque[bytes]
+    media_type: str
+    filename: str
+    rows: int
+    truncated: bool
+    size: int
+
+    @property
+    def content(self) -> bytes:
+        """The whole file as one bytes object (tests and small callers; the API streams `chunks`)."""
+        return b"".join(self.chunks)
+
+
+class ExportBuilder:
+    """One export file, built as encoded chunks within `max_rows` rows and `max_bytes` bytes (plan P9).
+
+    `add(items)` renders rows into the file and returns False once a row did not fit (the file is then complete);
+    it is CPU work, so the API calls it on a worker thread, once per page. `finish(total)` closes the file. Cells
+    are the columns of `spec` in order. With an `ip_hasher` (`export_ip_policy`), an `ip` column holds the keyed hash
+    of its address and every other cell has the addresses in its text replaced (`mask_ip_text`), so no client
+    address leaves in free text either: a spam subject `ip:<address>`, an audit preview of a ban, an event detail.
+    CSV cells are quoted and formula guarded (plan 9.16); JSON is `{table, exported_at, columns, items, total,
+    truncated}`, written in that order, so the two counts can close the file.
+    """
+
+    def __init__(
+        self,
+        spec: TableSpec,
+        fmt: ExportFormat,
+        *,
+        at_ms: int,
+        ip_hasher: IpHasher | None = None,
+        max_rows: int = MAX_EXPORT_ROWS,
+        max_bytes: int = MAX_EXPORT_BYTES,
+    ) -> None:
+        self.spec = spec
+        self.fmt: ExportFormat = fmt
+        self.at_ms = int(at_ms)
+        self.ip_hasher = ip_hasher
+        self.max_rows = max_rows
+        self.max_bytes = max_bytes
+        self.chunks: deque[bytes] = deque()
+        self.size = 0
+        self.rows = 0
+        self.full = False
+        """A row was left out because the file reached `max_rows` or `max_bytes`."""
+        self._reserve = JSON_TRAILER_RESERVE if fmt == "json" else 0
+        self._buffer = io.StringIO()
+        self._writer = csv.writer(self._buffer, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+        self._push(self._head())
+
+    def _push(self, data: bytes) -> None:
+        self.chunks.append(data)
+        self.size += len(data)
+
+    def _csv_line(self, cells: Sequence[str]) -> bytes:
+        self._writer.writerow(cells)
+        line = self._buffer.getvalue()
+        self._buffer.seek(0)
+        self._buffer.truncate(0)
+        return line.encode("utf-8")
+
+    def _head(self) -> bytes:
+        if self.fmt == "csv":
+            return self._csv_line([csv_safe(column.label) for column in self.spec.columns])
+        head = {"table": self.spec.name, "exported_at": self.at_ms // 1000, "columns": self.spec.columns_info()}
+        text = json.dumps(head, separators=(",", ":"), ensure_ascii=False)
+        return (text[:-1] + ',"items":[').encode("utf-8")
+
+    def _ip_cell(self, value: Any) -> Any:
+        """An `ip` column's value: the keyed hash of an address string (other shapes masked like free text)."""
+        hasher = self.ip_hasher
+        if hasher is None or value is None or value == "":
+            return value
+        if isinstance(value, str):
+            return hasher(value)
+        return mask_ip_value(jsonable_encoder(value), hasher)
+
+    def _csv_row(self, item: Mapping[str, Any]) -> bytes:
+        hasher = self.ip_hasher
+        cells: list[str] = []
+        for column in self.spec.columns:
+            value = item.get(column.key)
+            if column.ip:
+                text = _cell_text(self._ip_cell(value))
+            else:
+                text = _cell_text(value)
+                if hasher is not None:
+                    text = mask_ip_text(text, hasher, keep_versions=ipmask.is_user_agent_field(column.key))
+            cells.append(_formula_guard(text))
+        return self._csv_line(cells)
+
+    def _json_row(self, item: Mapping[str, Any]) -> bytes:
+        hasher = self.ip_hasher
+        out: dict[str, Any] = {}
+        for column in self.spec.columns:
+            value = jsonable_encoder(item.get(column.key))
+            if column.ip:
+                value = self._ip_cell(value)
+            elif hasher is not None:
+                value = mask_ip_value(value, hasher, keep_versions=ipmask.is_user_agent_field(column.key))
+            out[column.key] = value
+        text = json.dumps(out, separators=(",", ":"), ensure_ascii=False)
+        return (("," if self.rows else "") + text).encode("utf-8")
+
+    def add(self, items: Iterable[Mapping[str, Any]]) -> bool:
+        """Render `items` into the file; False once a row did not fit (the file is then complete)."""
+        if self.full:
+            return False
+        render = self._csv_row if self.fmt == "csv" else self._json_row
+        parts: list[bytes] = []
+        size = self.size
+        for item in items:
+            if self.rows >= self.max_rows:
+                self.full = True
+                break
+            data = render(item)
+            if size + len(data) + self._reserve > self.max_bytes:
+                self.full = True
+                break
+            parts.append(data)
+            size += len(data)
+            self.rows += 1
+        if parts:
+            self._push(b"".join(parts))  # one chunk per page: few, bounded objects
+        return not self.full
+
+    def finish(self, total: int | None = None) -> ExportFile:
+        """Close the file. `total` is how many rows the table holds (the rows added when None)."""
+        count = self.rows if total is None else max(int(total), self.rows)
+        truncated = self.full or count > self.rows
+        if self.fmt == "json":
+            self._push(f'],"total":{count},"truncated":{"true" if truncated else "false"}}}'.encode())
+        media_type = CSV_TYPE if self.fmt == "csv" else JSON_TYPE
+        filename = export_filename(self.spec.name, self.fmt, self.at_ms)
+        return ExportFile(self.chunks, media_type, filename, self.rows, truncated, self.size)
 
 
 def render_export(
@@ -1104,29 +1442,82 @@ def render_export(
     at_ms: int,
     total: int | None = None,
     max_rows: int = MAX_EXPORT_ROWS,
+    max_bytes: int = MAX_EXPORT_BYTES,
     ip_hasher: IpHasher | None = None,
 ) -> ExportFile:
-    """Build the file (pure: no I/O). JSON carries `{table, exported_at, columns, items, total, truncated}`.
+    """Build the file for rows already in memory (pure: no I/O). See `ExportBuilder` for the format and the caps.
 
-    Values of `ip` columns pass through `ip_hasher` when one is given (see `export_ip_policy`).
+    `total` is the table's row count when `items` is not all of it (`len(items)` otherwise).
     """
-    kept = _private_items(spec.columns, items[:max_rows], ip_hasher)
-    truncated = len(items) > max_rows or (total is not None and total > len(kept))
-    if fmt == "csv":
-        content = csv_bytes(spec.columns, kept)
-        media_type = CSV_TYPE
-    else:
-        payload = {
-            "table": spec.name,
-            "exported_at": int(at_ms) // 1000,
-            "columns": spec.columns_info(),
-            "items": [{column.key: item.get(column.key) for column in spec.columns} for item in kept],
-            "total": len(items) if total is None else int(total),
-            "truncated": truncated,
-        }
-        content = json.dumps(jsonable_encoder(payload), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        media_type = JSON_TYPE
-    return ExportFile(content, media_type, export_filename(spec.name, fmt, at_ms), len(kept), truncated)
+    builder = ExportBuilder(spec, fmt, at_ms=at_ms, ip_hasher=ip_hasher, max_rows=max_rows, max_bytes=max_bytes)
+    builder.add(items)
+    return builder.finish(len(items) if total is None else total)
+
+
+@dataclass(frozen=True, slots=True)
+class _ExportStart:
+    at_ms: int
+    request_id: str | None
+    ip_hasher: IpHasher | None
+    ip_mode: IpMode
+
+
+def _start_export(request: Request) -> _ExportStart:
+    ctx = get_ctx(request)
+    request_id = request_id_of(request)
+    hasher, ip_mode = export_ip_policy(ctx, request_id or secrets.token_hex(8))
+    return _ExportStart(int(ctx.clock.now() * 1000), request_id, hasher, ip_mode)
+
+
+async def _drain(chunks: deque[bytes]) -> AsyncIterator[bytes]:
+    """Send a file's chunks, dropping each once it is handed on, so the memory goes as the file goes."""
+    while chunks:
+        yield chunks.popleft()
+
+
+async def _deliver(
+    request: Request,
+    principal: AdminPrincipal,
+    spec: TableSpec,
+    file: ExportFile,
+    fmt: ExportFormat,
+    start: _ExportStart,
+    *,
+    tq: TableQuery | None,
+    filters: Mapping[str, Any] | None,
+    tr: TimeRange | None,
+) -> Response:
+    """Write the audit row, then answer the file (streamed from its chunks)."""
+    ctx = get_ctx(request)
+    details: dict[str, Any] = {
+        "format": fmt,
+        "rows": file.rows,
+        "truncated": file.truncated,
+        "bytes": file.size,
+        "filename": file.filename,
+        "ip_addresses": start.ip_mode,  # every cell may hold an address (masked unless `raw`), not only `ip` columns
+    }
+    if tq is not None:
+        details.update(sort=tq.sort, order=tq.order, q=tq.q)
+    if filters:
+        details["filters"] = dict(filters)
+    if tr is not None:
+        details["range"] = {"key": tr.key, **tr.info()}
+    actor = actor_for(principal)
+    target = f"table:{spec.name}"
+    at = start.at_ms // 1000
+
+    def write(conn: Any) -> int:
+        return audit.record(conn, actor, EXPORT_AUDIT_ACTION, target, None, details, None, start.request_id, at=at)
+
+    with service_errors():
+        await ctx.dbs.control.write(write)
+    response = StreamingResponse(_drain(file.chunks), media_type=file.media_type)
+    response.headers["Content-Length"] = str(file.size)
+    response.headers["Content-Disposition"] = f'attachment; filename="{file.filename}"'
+    response.headers["Roxy-Export-Rows"] = str(file.rows)
+    response.headers["Roxy-Export-Truncated"] = "true" if file.truncated else "false"
+    return _no_store(response)
 
 
 async def export_table(
@@ -1141,53 +1532,76 @@ async def export_table(
     filters: Mapping[str, Any] | None = None,
     tr: TimeRange | None = None,
 ) -> Response:
-    """The download answer for a table: the file, `Content-Disposition`, no-store, and an audit row (plan 9.7).
+    """The download answer for rows already read: the file, `Content-Disposition`, no-store, an audit row (9.7).
 
-    The file is built on a worker thread (50,000 rows of CSV would hold the event loop for a noticeable time),
-    with IP columns hashed per `export_ip_policy`. The audit row (`export.download`, target `table:<name>`, with
-    the format, row count, IP mode, sort, search, filters and range) is written before the file leaves; if
-    control.db cannot take it, the answer is 503 and no file.
+    For small tables (rules, the fleet, one page of a summary). A paged read model should use `export_pages`, which
+    never holds more than one page of rows. The file is built on a worker thread (`render_export`: at most
+    `MAX_EXPORT_ROWS` rows and `MAX_EXPORT_BYTES` bytes, addresses hashed per `export_ip_policy`). The audit row
+    (`export.download`, target `table:<name>`, with the format, row count, size, IP mode, sort, search, filters
+    and range) is written before the file leaves; if control.db cannot take it, the answer is 503 and no file.
     """
-    ctx = get_ctx(request)
-    at_ms = int(ctx.clock.now() * 1000)
-    request_id = request_id_of(request)
-    hasher, ip_mode = export_ip_policy(ctx, request_id or secrets.token_hex(8))
-    file = await asyncio.to_thread(render_export, spec, items, fmt, at_ms=at_ms, total=total, ip_hasher=hasher)
-    details: dict[str, Any] = {"format": fmt, "rows": file.rows, "truncated": file.truncated, "filename": file.filename}
-    if any(column.ip for column in spec.columns):
-        details["ip_addresses"] = ip_mode
-    if tq is not None:
-        details.update(sort=tq.sort, order=tq.order, q=tq.q)
-    if filters:
-        details["filters"] = dict(filters)
-    if tr is not None:
-        details["range"] = {"key": tr.key, **tr.info()}
-    actor = actor_for(principal)
-    target = f"table:{spec.name}"
+    start = _start_export(request)
+    file = await asyncio.to_thread(
+        render_export, spec, items, fmt, at_ms=start.at_ms, total=total, ip_hasher=start.ip_hasher
+    )
+    return await _deliver(request, principal, spec, file, fmt, start, tq=tq, filters=filters, tr=tr)
 
-    def write(conn: Any) -> int:
-        return audit.record(conn, actor, EXPORT_AUDIT_ACTION, target, None, details, None, request_id, at=at_ms // 1000)
 
-    with service_errors():
-        await ctx.dbs.control.write(write)
-    response = Response(content=file.content, media_type=file.media_type)
-    response.headers["Content-Disposition"] = f'attachment; filename="{file.filename}"'
-    response.headers["Roxy-Export-Rows"] = str(file.rows)
-    response.headers["Roxy-Export-Truncated"] = "true" if file.truncated else "false"
-    return _no_store(response)
+async def export_pages(
+    request: Request,
+    principal: AdminPrincipal,
+    spec: TableSpec,
+    fetch: PageFetch,
+    fmt: ExportFormat,
+    *,
+    tq: TableQuery | None = None,
+    filters: Mapping[str, Any] | None = None,
+    tr: TimeRange | None = None,
+    page_size: int = EXPORT_PAGE_ROWS,
+) -> Response:
+    """The download answer for a paged read model (`fetch(page, page_size) -> (items, total)`), as `export_table`.
+
+    Pages are read one at a time and rendered into the file on a worker thread, then dropped, so a download holds
+    at most one page of rows plus the encoded file (at most `MAX_EXPORT_BYTES`); it stops at the total, at an empty
+    page, at `MAX_EXPORT_ROWS` rows or at the byte cap, and the file says when rows were left out.
+    """
+    start = _start_export(request)
+    builder = ExportBuilder(spec, fmt, at_ms=start.at_ms, ip_hasher=start.ip_hasher)
+    seen = total = 0
+    page = 1
+    while builder.rows < builder.max_rows and page <= MAX_PAGE:
+        items, page_total = await fetch(page, page_size)
+        if not items:
+            break  # the last page's total stands (an empty page past the end may not know it)
+        total = int(page_total)
+        seen += len(items)
+        if not await asyncio.to_thread(builder.add, items):
+            break
+        if seen >= total:
+            break
+        page += 1
+    file = await asyncio.to_thread(builder.finish, max(total, seen))
+    return await _deliver(request, principal, spec, file, fmt, start, tq=tq, filters=filters, tr=tr)
 
 
 __all__ = [
     "API_PREFIX",
+    "CALLER_TEXT_COLUMN_KEYS",
     "COMPARE_KEYS",
     "CSV_TYPE",
     "DEFAULT_PAGE_SIZE",
     "DEFAULT_RANGE",
     "EXPORT_AUDIT_ACTION",
+    "EXPORT_BUSY_RETRY_S",
     "EXPORT_FORMATS",
+    "EXPORT_PAGE_ROWS",
     "FORMULA_PREFIXES",
     "GRANULARITY_KEYS",
+    "IP_TEXT_PREFIX",
+    "MAX_CONCURRENT_EXPORTS",
+    "MAX_EXPORT_BYTES",
     "MAX_EXPORT_ROWS",
+    "MAX_ROW_ID",
     "MAX_SEARCH_CHARS",
     "PAGE_SIZES",
     "RANGE_KEYS",
@@ -1200,19 +1614,24 @@ __all__ = [
     "Column",
     "CsrfChecked",
     "ErrorMap",
+    "ExportBuilder",
     "ExportFile",
     "ExportFormat",
     "ExportFormatDep",
+    "ExportSlots",
     "GoodDirection",
     "IpHasher",
     "IpMode",
     "Order",
+    "PageFetch",
     "RangeParams",
+    "RowId",
     "TableQuery",
     "TableSpec",
     "TimeRange",
     "TimeRangeDep",
     "actor_for",
+    "add_caller_text",
     "admin_fresh_mfa",
     "admin_session",
     "annotation_entries",
@@ -1227,16 +1646,22 @@ __all__ = [
     "csv_bytes",
     "csv_safe",
     "error_response",
+    "estimated_bytes",
     "exception_response",
     "export_filename",
     "export_format",
     "export_ip_policy",
+    "export_pages",
+    "export_slots",
     "export_table",
     "forbidden",
     "kpi_from_read_model",
     "kpi_tile",
+    "mask_ip_text",
+    "mask_ip_value",
     "not_found",
     "page_rows",
+    "parse_export_format",
     "parse_instant",
     "range_info",
     "range_params",

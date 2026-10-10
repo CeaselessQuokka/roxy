@@ -11,6 +11,11 @@ What this is
         Attempts", "Rate-Limited Attempts" and "Header-Blocked Attempts" tables, parity row 75), paged in SQL.
       * `spam_events(conn, ...)` and `would_ban_subjects(conn, ...)`: the spam detectors' decisions and dry-run
         results (plan 10.3), the input of the FILTER-COLLATERAL preview.
+      * `watch_activity(conn, keys, since=, now=)`: v1's throttle-all watch columns (requests and refusals since
+        the state began, rates, busiest endpoint, last seen) for one page of watched clients (parity row 135).
+      * `rule_hit_columns`, `rule_hit_totals`, `rule_hit_points`: per-rule hits in a range, the lifetime count and
+        last hit, per-table sums, and one rule's hits over time (plan 10.9; `metrics/read_producers.py` and
+        `metrics/read_history.py` hold the raw reads).
 
 Why it exists
     The admin API stays thin (DESIGN.md section 13): it asks these functions and shapes the answer. Every number
@@ -41,7 +46,10 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
-from roxy.metrics.queries import Window, collect
+from roxy.metrics import read_history, read_producers
+from roxy.metrics.queries import Window, bucket_starts, collect, trailing_rate
+from roxy.metrics.read_clients import client_pieces, latest_user_agents
+from roxy.metrics.rollups import bucket_floor, zone
 
 CHECK_REASONS: Final[dict[str, tuple[str, ...]]] = {
     "pause": ("paused",),
@@ -84,10 +92,126 @@ ATTEMPT_SORTS: Final[dict[str, str]] = {
     "path": "path",
     "unattributed": "unattributed",
 }
+ATTEMPT_RULE_TABLES: Final[frozenset[str]] = frozenset({"rules_endpoint_block", "rules_endpoint_limit", "rules_header"})
+"""The rule tables an attempts tab names the refusing rows of (`abuse/checks/base.py TABLE_*`, the keys of a refusal
+event's `detail.rules`)."""
+MAX_ATTEMPT_RULE_IDS: Final = 8
+"""Most refusing rule ids listed per attempts row (one path is normally refused by one rule)."""
 
 
 def _bounded(limit: int, cap: int = MAX_PAGE_ROWS) -> int:
     return max(1, min(int(limit), cap))
+
+
+# ------------------------------------------------------------------------------------------------ rule hits
+
+
+def rule_hit_columns(conn: sqlite3.Connection, table: str, start: int, end: int) -> dict[str, dict[str, Any]]:
+    """`{rule key: {hits, hits_total, last_hit_at}}` for one rule table (plan 10.9 per-rule hit counts, FILTER-REMOVE
+    "hit history"): hits in `[start, end)` from `rule_hit_minute` (schema 5), and the lifetime count and the last
+    hit (epoch seconds) from `rule_hits`. A hit is a request the rule's row matched, whatever the verdict."""
+    out: dict[str, dict[str, Any]] = {}
+    for (_table, key), hits in read_producers.rule_hit_counts(conn, start, end, table).items():
+        out.setdefault(key, {"hits": 0, "hits_total": 0, "last_hit_at": None})["hits"] = hits
+    for (_table, key), item in read_history.rule_hits(conn, table).items():
+        entry = out.setdefault(key, {"hits": 0, "hits_total": 0, "last_hit_at": None})
+        entry["hits_total"] = int(item.get("hits") or 0)
+        entry["last_hit_at"] = item.get("last_hit_at")
+    return out
+
+
+def rule_hit_totals(conn: sqlite3.Connection, start: int, end: int) -> dict[str, int]:
+    """Rule hits in `[start, end)` summed per rule table (the pipeline diagram's per-table hit counts)."""
+    out: dict[str, int] = {}
+    for (table, _key), hits in read_producers.rule_hit_counts(conn, start, end).items():
+        out[table] = out.get(table, 0) + hits
+    return dict(sorted(out.items()))
+
+
+def rule_hit_points(conn: sqlite3.Connection, table: str, key: str, window: Window) -> list[list[int]]:
+    """One rule row's hits per bucket of `window` (`[[bucket start, hits], ...]`, zeros included), folded from its
+    minutes in `rule_hit_minute` into the window's granularity (local days and longer in its zone)."""
+    starts = bucket_starts(window)
+    index = {start: i for i, start in enumerate(starts)}
+    values = [0] * len(starts)
+    zi = zone(window.tz)
+    for minute, hits in read_producers.rule_hit_series(conn, table, key, window.start, window.end):
+        slot = index.get(bucket_floor(minute, window.granularity, zi))
+        if slot is not None:
+            values[slot] += hits
+    return [[start, value] for start, value in zip(starts, values, strict=True)]
+
+
+# ------------------------------------------------------------------------------------- throttle-all watch
+
+
+def watch_activity(conn: sqlite3.Connection, keys: Sequence[str], *, since: float, now: float) -> dict[str, Any]:
+    """v1's throttle-all watch columns (parity row 135, finding parity-4) for one page of watched client keys.
+
+    Per key: `requests` and `refused` since the throttle-all "since" marker, `rate1`, `rate5` and `rate60` (the
+    trailing-window rates of the Clients tables), `top_endpoint` (the busiest endpoint, each minute's busiest
+    weighted by that minute's requests, as `read_clients.client_range`) and `last_seen_ms` (exact while the
+    client's Live rows are kept, else the start of its newest minute). Client activity is per address: a key that
+    is an IPv6 network (`/` in it) has no activity row and is left out (unknown, P6). Counting starts at the minute
+    the marker falls in, because client rows are per minute (the same rule as the drops-since banner). At most
+    `MAX_PAGE_ROWS` keys (one page).
+    """
+    wanted = [str(key) for key in dict.fromkeys(keys) if key and "/" not in str(key)][:MAX_PAGE_ROWS]
+    if not wanted:
+        return {}
+    start = int(since) - int(since) % 60
+    end = int(now) - int(now) % 60 + 60
+    if end <= start:
+        return {}
+    # The minutes up to the first whole hour, then whole hours where the leader compacted them, then minutes.
+    edge = min(end, start if start % 3600 == 0 else start - start % 3600 + 3600)
+    pieces: list[tuple[str, int, int]] = [("client_minute", start, edge)] if edge > start else []
+    if end > edge:
+        pieces += client_pieces(conn, Window(edge, end, "minute"))
+    marks = ", ".join("?" for _ in wanted)
+    acc: dict[str, dict[str, Any]] = {}
+    for table, lo, hi in pieces:
+        rows = conn.execute(
+            f"SELECT client_key, bucket_start, requests, refused, top_endpoint FROM {table} "  # noqa: S608 (fixed names)
+            f"WHERE client_type = 'ip' AND client_key IN ({marks}) AND bucket_start >= ? AND bucket_start < ?",
+            (*wanted, lo, hi),
+        ).fetchall()
+        for row in rows:
+            item = acc.setdefault(str(row["client_key"]), {"requests": 0, "refused": 0, "last": 0, "endpoints": {}})
+            count = int(row["requests"] or 0)
+            item["requests"] += count
+            item["refused"] += int(row["refused"] or 0)
+            if count:
+                item["last"] = max(item["last"], int(row["bucket_start"]))
+            if row["top_endpoint"]:
+                name = str(row["top_endpoint"])
+                item["endpoints"][name] = item["endpoints"].get(name, 0) + count
+    rates: dict[str, dict[int, int]] = {}
+    for row in conn.execute(
+        f"SELECT client_key, bucket_start, requests FROM client_minute WHERE client_type = 'ip' "  # noqa: S608
+        f"AND client_key IN ({marks}) AND bucket_start >= ?",
+        (*wanted, int(now) - 3660),
+    ):
+        rates.setdefault(str(row["client_key"]), {})[int(row["bucket_start"])] = int(row["requests"] or 0)
+    live = latest_user_agents(conn, wanted)
+    out: dict[str, Any] = {}
+    for key, item in acc.items():
+        endpoints: dict[str, int] = item["endpoints"]
+        minutes = rates.get(key, {})
+        seen = live.get(key)
+        last_ms = item["last"] * 1000 if item["last"] else None
+        if seen is not None and (last_ms is None or int(seen["at_ms"]) >= last_ms):
+            last_ms = int(seen["at_ms"])
+        out[key] = {
+            "requests": item["requests"],
+            "refused": item["refused"],
+            "rate1": trailing_rate(minutes, now, 60),
+            "rate5": trailing_rate(minutes, now, 300),
+            "rate60": trailing_rate(minutes, now, 3600),
+            "top_endpoint": max(endpoints.items(), key=lambda kv: (kv[1], kv[0]))[0] if endpoints else None,
+            "last_seen_ms": last_ms,
+        }
+    return out
 
 
 # ------------------------------------------------------------------------------------------ per-check counts
@@ -205,29 +329,38 @@ def refusal_attempts(
     descending: bool = True,
     limit: int = 25,
     offset: int = 0,
+    rule_table: str | None = None,
 ) -> dict[str, Any]:
     """Refusals with `reason` grouped by path (endpoint template when the detail was folded), paged in SQL.
 
     Rows: `path`, `template`, `attempts`, `clients` (distinct client hashes), `unattributed` (attempts recorded
-    without a client hash: folded over the recorder's budget, or no `ip_hash_key`), `methods`, `last_ms`.
+    without a client hash: folded over the recorder's budget, or no `ip_hash_key`), `methods`, `last_ms`, and with
+    `rule_table` (one of `ATTEMPT_RULE_TABLES`) `rule_ids`: the row ids of that table the refusals recorded as the
+    rule that refused them (`detail.rules`, written since review round 3; at most `MAX_ATTEMPT_RULE_IDS`, older
+    refusals carry none).
     """
     order = ATTEMPT_SORTS.get(sort)
     if order is None:
         raise ValueError(f"cannot sort attempts by {sort!r}")
+    if rule_table is not None and rule_table not in ATTEMPT_RULE_TABLES:
+        raise ValueError(f"no attempts tab reads rule table {rule_table!r}")
     where = "type = ? AND reason_code = ? AND at_ms >= ? AND at_ms < ?"
     params: list[Any] = [REFUSAL_EVENT, reason, int(start_ms), int(end_ms)]
     path_expr = "coalesce(json_extract(detail_json, '$.path'), endpoint_template, '')"
     having = ""
     if search:
         having = " HAVING instr(lower(path), ?) > 0"
+    # The json path is a bound parameter built from an allowlisted table name (never caller text).
+    rule_ids = "group_concat(DISTINCT json_extract(detail_json, ?))" if rule_table is not None else "NULL"
     grouped = (
         f"SELECT {path_expr} AS path, max(endpoint_template) AS template, {_COUNT} AS attempts, "  # noqa: S608  # constant clauses
         "count(DISTINCT ip_hash) AS clients, "
         f"sum(CASE WHEN ip_hash IS NULL THEN coalesce(json_extract(detail_json, '$.count'), 1) ELSE 0 END) "
         "AS unattributed, group_concat(DISTINCT json_extract(detail_json, '$.method')) AS methods, "
-        f"max(at_ms) AS last_ms FROM events WHERE {where} GROUP BY path{having}"
+        f"{rule_ids} AS rule_ids, max(at_ms) AS last_ms FROM events WHERE {where} GROUP BY path{having}"
     )
-    group_params = [*params, search.lower()] if search else params
+    select_params: list[Any] = [f"$.rules.{rule_table}"] if rule_table is not None else []
+    group_params = [*select_params, *params, search.lower()] if search else [*select_params, *params]
     total = int(conn.execute(f"SELECT count(*) FROM ({grouped})", group_params).fetchone()[0])  # noqa: S608
     direction = "DESC" if descending else "ASC"
     rows = conn.execute(
@@ -242,6 +375,7 @@ def refusal_attempts(
             "clients": int(row["clients"] or 0),
             "unattributed": int(row["unattributed"] or 0),
             "methods": sorted(str(m) for m in str(row["methods"] or "").split(",") if m),
+            "rule_ids": sorted({str(i) for i in str(row["rule_ids"] or "").split(",") if i})[:MAX_ATTEMPT_RULE_IDS],
             "last_ms": int(row["last_ms"]) if row["last_ms"] is not None else None,
         }
         for row in rows
@@ -408,10 +542,14 @@ __all__ = [
     "event_counts",
     "recent_live_rows",
     "refusal_attempts",
+    "rule_hit_columns",
+    "rule_hit_points",
+    "rule_hit_totals",
     "spam_counts",
     "spam_events",
     "subject_events",
     "tier_hits",
     "ua_rule_hits",
+    "watch_activity",
     "would_ban_subjects",
 ]

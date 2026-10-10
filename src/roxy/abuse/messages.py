@@ -82,6 +82,22 @@ REASON_BAN: Final = "Ban {subject_type}:{subject}"
 REASON_DENY: Final = "Deny list {cidr}"
 REASON_SPAM: Final = "Spam detector {detector}"
 
+# --- probe log reasons (Security > Probes; v1 `log_exploit_attempt` in index.py; plan rows 51 and 80) -----------------
+
+PROBE_LOG_UNSAFE: Final = 'Invalid URL: "{target}"'
+"""v1's probe log text for unsafe characters; `metrics/security_events.py` keeps `Invalid URL` as the signature and
+moves the target (caller text, redacted) to its own column."""
+PROBE_LOG_NOT_ROBLOX: Final = 'Non-Roblox URL: "{target}"'
+"""v1's probe log text for a URL that is not a Roblox API URL (signature `Non-Roblox URL`, target as above)."""
+PROBE_LOG_HOST: Final = "Host not allowed"
+"""A Roblox-looking host outside `allowed_roblox_hosts` (v2 only: v1 had no host allowlist). Roxy's own words as the
+signature; the probed path is in the path column."""
+PROBE_LOG_AUTH: Final = "Sent a ROBLOSECURITY token ({where})"
+"""v1's probe log text for auth smuggling; `where` is one of the fixed `REASON_AUTH_*` texts."""
+PROBE_LOG_AUTH_HEADER: Final = "a header carried a ROBLOSECURITY-shaped value"
+"""`where` for a marker in a header value. v1 named the header there, but a header name is caller text: every name
+would become its own probe signature and event budget (v1 bug B19), so the probe log keeps Roxy's words only."""
+
 
 def clean_admin_message(value: object, limit: int = MAX_RULE_MESSAGE) -> str:
     """v1 `_clean_message` plus the refusal-time `.strip()`: trimmed text, at most `limit` characters."""

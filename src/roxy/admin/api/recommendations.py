@@ -41,7 +41,12 @@ How it works
       the body carries the digest the preview showed), asks for `confirm_high_risk` and a reason when a setting
       would take a high-risk value (the settings editor's rule, `settings.check_risk`), and asks for a fresh
       second factor (403 `reauth_required`) when a change, or its undo, touches the admin's security: admin
-      security or credential settings, the admin allowlist, or the credential allowlist (plan 9.6, D6, C1).
+      security or credential settings, the admin allowlist, or the credential allowlist (plan 9.6, D6, C1). Those
+      decisions are made on one read of the recommendation, and the action compares the same digest again inside
+      its lease (`expected_digest`), so an evaluation that rewrites the proposal in between is refused (409), never
+      applied without its confirmation or second factor (P4).
+    * Another action holding the recommendation is 409 `wrong_state`; a hot.db that cannot be written is 503
+      `unavailable` with `Retry-After` (C7), never "another request".
     * The dry run replays up to `simulate.MAX_SAMPLES` samples in pure Python, so it runs on a worker thread with
       its own event loop (the event loop of this worker keeps serving), one at a time per worker with a short
       queue (429 beyond it), and its result is kept for `DRY_RUN_CACHE_S` per recommendation and window.
@@ -87,6 +92,7 @@ from roxy.config.spec import Group, InsightRuleSpec, SettingSpec
 from roxy.deps import get_ctx
 from roxy.insights import read_recommendations as reads
 from roxy.insights import simulate
+from roxy.insights.actions import CHANGED_MESSAGE as ACTION_CHANGED_MESSAGE
 from roxy.insights.actions import ActionError, ActionResult, AppliedChange, PreviewItem, RecommendationActions
 from roxy.insights.engine import InsightsEngine, row_to_recommendation
 from roxy.insights.models import (
@@ -134,26 +140,31 @@ MAX_HISTORY_ON_DETAIL: Final = 50
 """Actions shown in the detail drawer (the full list is `GET /{id}/history`)."""
 
 SETTING_TARGET: Final = "setting:"
-SENSITIVE_GROUPS: Final[frozenset[Group]] = frozenset({Group.ADMIN_SECURITY, Group.CREDENTIAL})
-"""Settings whose change (or its undo) needs a fresh second factor when a recommendation makes it (plan 9.6)."""
+SENSITIVE_GROUPS: Final[frozenset[Group]] = settings_api.FRESH_MFA_GROUPS
+"""Settings groups whose change (or its undo) needs a fresh second factor when a recommendation makes it (plan
+9.6). The one rule is `settings.needs_fresh_mfa` (these groups, sensitive settings and `settings.FRESH_MFA_SETTINGS`),
+shared with the settings editor (finding apisec-1), so the two lists can never drift."""
 
 _ACTION_ERRORS: Final[dict[str, tuple[int, str]]] = {
     "not_found": (404, "not_found"),
     "conflict": (409, "wrong_state"),
+    "busy": (409, "wrong_state"),
+    "changed": (409, "changed_since_preview"),
     "superseded": (409, "superseded"),
     "invalid": (422, "invalid_change"),
     "manual": (422, "manual_change"),
 }
-"""`ActionError.code` -> (status, section 13 code)."""
+"""`ActionError.code` -> (status, section 13 code). A busy hot.db is not an `ActionError`: the action raises
+`SharedStateUnavailable`, which `common.service_errors` answers as 503 `unavailable`."""
 
-CHANGED_MESSAGE: Final = "This recommendation changed since you previewed it; review the new changes and apply again."
+CHANGED_MESSAGE: Final = ACTION_CHANGED_MESSAGE
 
 LIST_TABLE: Final = TableSpec(
     name="recommendations",
     columns=(
         Column("id", "Id", "The recommendation's id (rec_...).", sortable=False),
         Column("severity", "Severity", "critical, warn or info (most severe first by default)."),
-        Column("title", "Recommendation", "What the rule found, in one line.", sortable=False),
+        Column("title", "Recommendation", "What the rule found, in one line.", sortable=False, caller_text=True),
         Column("rule_id", "Rule", "The rule that made it (plan 11.5)."),
         Column(
             "family",
@@ -161,7 +172,13 @@ LIST_TABLE: Final = TableSpec(
             "upstream, cache, egress, credential, abuse, filter, system, security, host.",
             sortable=False,
         ),
-        Column("subject", "Subject", "What it is about: an endpoint, a client, a rule row, a setting.", sortable=False),
+        Column(
+            "subject",
+            "Subject",
+            "What it is about: an endpoint, a client, a rule row, a setting.",
+            sortable=False,
+            caller_text=True,
+        ),
         Column("state", "State", "open, snoozed, applied, auto_applied, rolled_back, dismissed, resolved, expired."),
         Column("confidence", "Confidence", "How sure the rule is, from the amount of evidence.", sortable=False),
         Column("risk", "Risk", "How risky the proposed change is.", sortable=False),
@@ -523,7 +540,7 @@ def _sensitive(target: str, before: Any, after: Any) -> bool:
     """
     spec = _spec_of_target(target)
     if spec is not None:
-        return spec.sensitive or spec.group in SENSITIVE_GROUPS
+        return settings_api.needs_fresh_mfa(spec)
     table = target.split(":", 1)[0]
     if table == "access_list":
         return any(isinstance(row, Mapping) and str(row.get("kind")) == "allow_admin" for row in (before, after))
@@ -784,11 +801,12 @@ async def list_recommendations(
 
     with common.service_errors():
         if fmt is not None:
-            rows, total = await common.collect_pages(read_page)
-            items = [card(row_to_recommendation(row)) for row in rows]
-            return await common.export_table(
-                request, admin, LIST_TABLE, items, fmt, total=total, tq=tq, filters=filters.echo()
-            )
+
+            async def cards(page: int, size: int) -> tuple[list[dict[str, Any]], int]:
+                rows, total = await read_page(page, size)
+                return [card(row_to_recommendation(row)) for row in rows], total
+
+            return await common.export_pages(request, admin, LIST_TABLE, cards, fmt, tq=tq, filters=filters.echo())
         rows, total = await read_page(tq.page, tq.page_size)
         facets = await ctx.dbs.metrics.read(reads.facets)
     answer = common.table_answer(LIST_TABLE, tq, [card(row_to_recommendation(row)) for row in rows], total)
@@ -860,10 +878,12 @@ async def global_history(
     echo = {"action": list(actions), "rule": list(rule_ids), "recommendation": recommendation, **bounds}
     with common.service_errors():
         if fmt is not None:
-            rows, total = await common.collect_pages(read_page)
-            return await common.export_table(
-                request, admin, HISTORY_TABLE, [history_item(r) for r in rows], fmt, total=total, tq=tq, filters=echo
-            )
+
+            async def items(page: int, size: int) -> tuple[list[dict[str, Any]], int]:
+                rows, total = await read_page(page, size)
+                return [history_item(row) for row in rows], total
+
+            return await common.export_pages(request, admin, HISTORY_TABLE, items, fmt, tq=tq, filters=echo)
         rows, total = await read_page(tq.page, tq.page_size)
     answer = common.table_answer(HISTORY_TABLE, tq, [history_item(row) for row in rows], total)
     answer["filters"] = echo
@@ -1071,7 +1091,7 @@ async def apply(
     """Apply every change of an open recommendation, exactly as previewed (plan 11.3, P4)."""
     rec = await _get(request, rec_id)
     actions = actions_for(request)
-    items = await _act(actions.preview(rec.id))
+    items = await _act(actions.preview_of(rec))  # the diff of exactly the changes whose digest is compared below
     admin = await _fresh_if(request, admin, bool(sensitive_targets(items)))
     if body.changes_digest != changes_digest(rec.changes):
         raise common.conflict(CHANGED_MESSAGE, code="changed_since_preview")
@@ -1082,8 +1102,16 @@ async def apply(
             {}, "This recommendation proposes no change; there is nothing to apply.", code="nothing_to_apply"
         )
     reason = settings_api.check_risk(risky_keys(items), reason=body.reason, confirmed=body.confirm_high_risk)
+    # The risk and second factor decisions above hold for this digest only; the action checks it again inside the
+    # recommendation's lease, after any evaluation that rewrote the proposal (409 changed_since_preview then).
     result: ActionResult = await _act(
-        actions.apply(rec.id, actor_for(admin), reason, request_id=request_id_of(request))
+        actions.apply(
+            rec.id,
+            actor_for(admin),
+            reason,
+            request_id=request_id_of(request),
+            expected_digest=body.changes_digest,
+        )
     )
     with common.service_errors():
         watch = await get_ctx(request).dbs.metrics.read(lambda conn: reads.watch_of(conn, rec.id))

@@ -112,11 +112,6 @@ def test_auth2_variant_the_rotator_quota_key_outlives_its_40_day_cooldown_and_ca
 # ------------------------------------------------------------------------------------------ the strike ladder
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding W2H-2: prune_strikes deletes a strike row one decay period after its last strike (at once when "
-    "the decay is 0), forgiving every strike the decay still counts",
-)
 @pytest.mark.parametrize(("decay_s", "idle_s"), [(1800, 1860), (0, 600)], ids=["default_decay", "never_decay"])
 def test_w2h2_retention_never_forgives_strikes_the_decay_still_counts(dbs: Any, decay_s: int, idle_s: int) -> None:
     """A client on rung 5 whose penalty ended and who paused `idle_s` seconds: the ladder says 4 strikes are left
@@ -173,11 +168,6 @@ def _recommendation() -> Recommendation:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding W2H-3: prune_recommendations deletes a dismissed or rolled back recommendation before "
-    "dismiss_cooldown_days ends when retention_recommendations_days is shorter, and the engine reopens it",
-)
 @pytest.mark.parametrize("closed_state", ["dismissed", "rolled_back"])
 async def test_w2h3_retention_keeps_a_recommendation_quiet_for_its_whole_quiet_period(
     dbs: Any, closed_state: str

@@ -8775,7 +8775,7 @@ How many days of the Roblox 429 log to keep. Each row is one 'too many requests'
 
 ### `retention_recommendations_days`
 
-How many days closed recommendations (applied, dismissed, expired, resolved or rolled back) and their action history are kept. Open recommendations are never deleted by age, and at most 50,000 are kept in total.
+How many days closed recommendations (applied, dismissed, expired, resolved or rolled back) and their action history are kept. Open recommendations are never deleted by age, and at most 50,000 are kept in total. A dismissed or rolled back item is kept at least until its quiet period (dismiss_cooldown_days) ends, an applied one through its watch window.
 
 | Field | Value |
 |---|---|

@@ -24,16 +24,18 @@ import ipaddress
 import json
 import random
 import re
+import time
 from collections import Counter
 from pathlib import Path
 
 import httpx
 import pytest
 
-from load.client import Outcome, latency_ms, max_overlap, per_second, percentile
-from load.harness import absolute_paths, table
-from load.mock_roblox import TOO_MANY, CallRecord, Endpoint, MockRoblox, SlidingWindow
-from load.scenarios import ABUSE_REFUSALS, PACING_REFUSALS, replay_numbers
+from load import clock
+from load.client import ClientOptions, Outcome, latency_ms, max_overlap, per_second, percentile, run_plan
+from load.harness import absolute_paths, option_value, table, variable
+from load.mock_roblox import TOO_MANY, CallRecord, Endpoint, MockRoblox, SlidingWindow, peak_in_window
+from load.scenarios import ABUSE_REFUSALS, PACING_REFUSALS, gcra_excess, replay_numbers
 from load.traffic import (
     V1_LIKE_MIX,
     MixPicker,
@@ -62,6 +64,56 @@ def test_sliding_window_refuses_the_call_over_the_limit_and_counts_refused_calls
 def test_sliding_window_zero_means_unlimited() -> None:
     window = SlidingWindow(0)
     assert all(window.admit(float(t) / 1000) for t in range(1000))
+
+
+def test_peak_in_window_agrees_with_the_mock_window() -> None:
+    """`peak_in_window` must say "over the limit" exactly when `SlidingWindow` refused a call."""
+    rng = random.Random(9)
+    for _ in range(200):
+        times = sorted(rng.uniform(0, 180) for _ in range(rng.randint(1, 120)))
+        limit = rng.randint(1, 40)
+        window = SlidingWindow(limit, window_s=60)
+        refused = [not window.admit(t) for t in times]
+        assert (peak_in_window(times, 60) > limit) == any(refused), (limit, times)
+    assert peak_in_window([], 60) == 0
+    assert peak_in_window([0.0, 59.9, 60.0], 60) == 2  # a call exactly 60 s later starts a new window
+    assert peak_in_window([5.0, 1.0, 3.0], 60) == 3  # order does not matter
+
+
+# ------------------------------------------------------------------------------------------ the clock
+
+
+def test_harness_clock_never_steps_back_and_follows_the_wall_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    readings = iter([1000.0, 1001.0, 998.2, 999.0, 1001.5, 1002.0])  # a 2.8 s step back after 1001.0
+    monkeypatch.setattr(clock, "_last", 0.0)
+    monkeypatch.setattr(clock, "_wall", lambda: next(readings))
+    assert [clock.now() for _ in range(6)] == [1000.0, 1001.0, 1001.0, 1001.0, 1001.5, 1002.0]
+
+
+async def test_sleep_until_waits_for_the_harness_clock() -> None:
+    target = clock.now() + 0.05
+    await clock.sleep_until(target)
+    assert clock.now() >= target
+    started = time.monotonic()
+    await clock.sleep_until(clock.now() - 10)  # a past instant returns at once
+    assert time.monotonic() - started < 0.05
+
+
+def test_run_plan_starts_every_process_at_one_instant_and_keeps_the_schedule() -> None:
+    """Two spawned client processes check in at the barrier, then send a 1 s plan on schedule to the mock."""
+    mock = MockRoblox([], default_latency_s=0.0).start()  # called directly (no Roxy): every call is "other"
+    try:
+        plan = [PlannedRequest(n * 0.05, "GET", f"/v1/users/{n}", None, "192.0.2.1", "users") for n in range(20)]
+        t0, outcomes = run_plan(mock.base, plan, processes=2, options=ClientOptions(connections=4))
+    finally:
+        mock.stop()
+    assert len(outcomes) == 20
+    assert all(o.status == 200 for o in outcomes)
+    assert all(o.sent >= o.at - 0.001 for o in outcomes)  # never early
+    assert max(o.sent - o.at for o in outcomes) < 0.5  # and not bunched late
+    calls = mock.records()
+    assert len(calls) == 20
+    assert all(-0.01 <= call.at - t0 <= 2.0 for call in calls)  # one time line for client and mock
 
 
 async def test_mock_limits_an_endpoint_and_logs_every_call() -> None:
@@ -244,6 +296,26 @@ def test_replay_numbers_demand_shares_and_429s() -> None:
     assert sum(w["requests"] for w in numbers["timeline"]) == len(outcomes)
     assert "upstream_busy" in PACING_REFUSALS
     assert "upstream_busy" not in ABUSE_REFUSALS
+    assert numbers["per_endpoint"]["a"]["headroom"] is None  # no limits given
+    limited = replay_numbers(plan, outcomes, calls, t0=100.0, duration_s=200, limits={"a": 3})
+    assert limited["per_endpoint"]["a"]["peak_60s"] == 2  # 260 and 261 s share a window; 101 s is alone
+    assert limited["per_endpoint"]["a"]["headroom"] == 1
+    assert (limited["closest_endpoint"], limited["min_headroom"]) == ("a", 1)
+
+
+def test_gcra_excess_uses_the_span_each_address_was_answered_in() -> None:
+    """Burst 2, one more every 5 s: 4 served over a 10 s span is the bound, 5 is one too many."""
+
+    def served(ip: str, sent: float, done: float) -> Outcome:
+        return Outcome(sent, sent, done - sent, 200, "HIT", "", "", "", "a", ip, 0)
+
+    within = [served("192.0.2.1", 0.0, 0.1), served("192.0.2.1", 0.0, 0.2), served("192.0.2.1", 0.0, 5.0)]
+    within.append(served("192.0.2.1", 0.0, 10.0))
+    assert gcra_excess(within, burst=2, interval_s=5.0) == 0
+    over = [*within, served("192.0.2.1", 1.0, 9.0)]
+    assert gcra_excess(over, burst=2, interval_s=5.0) == 1
+    refused = Outcome(0.0, 0.0, 30.0, 429, "", "throttle", "5", "", "a", "192.0.2.2", 0)
+    assert gcra_excess([refused], burst=2, interval_s=5.0) == 0  # nothing served: nothing above the bound
 
 
 # ----------------------------------------------------------------------------------------------- output
@@ -256,6 +328,16 @@ def test_table_aligns_columns() -> None:
     assert lines[2].startswith("a             | 1        | x")
     assert chr(0x2014) not in text  # no em dash (plan C5)
     assert chr(0x2013) not in text  # no en dash
+
+
+def test_worker_env_refuses_roxy_variables() -> None:
+    assert variable("MALLOC_ARENA_MAX=2") == ("MALLOC_ARENA_MAX", "2")
+    for bad in ("ROXY_WORKERS=4", "roxy_env=production", "NOVALUE", "=2", "BAD KEY=1"):
+        with pytest.raises(ValueError):
+            variable(bad)
+    assert option_value(["replay", "--tree", "/x"], "--tree") == "/x"
+    assert option_value(["--tree=/y"], "--tree") == "/y"
+    assert option_value(["replay"], "--tree") is None
 
 
 def test_absolute_paths_rewrites_only_path_options() -> None:

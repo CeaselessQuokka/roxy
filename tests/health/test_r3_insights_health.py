@@ -2,8 +2,9 @@
 
 What this is
     Adversarial tests of `roxy/health/checks.py` and `roxy/health/report.py`: H-CLOCK while its probe waits for a
-    bucket slot at internal priority (strict xfail, one finding), and the "Copy run for LLM" document (checked
-    clean: the 12.5 block wraps it and outside strings sit under `untrusted`).
+    bucket slot at internal priority (finding insights-12, fixed: the skew is read at the middle of the call that
+    returned the Date header), and the "Copy run for LLM" document (checked clean: the 12.5 block wraps it and
+    outside strings sit under `untrusted`).
 
 Why it exists
     Plan 13.2 H-CLOCK measures the skew between the server clock and Roblox's `Date` header (pass under 2 s, fail
@@ -46,19 +47,22 @@ WIRE_S = 0.06
 
 class BusyUpstream:
     """`internal_fetch` as the real service behaves while the games.roblox.com bucket is full: the probe waits for
-    its slot at internal priority, then makes one 60 ms call. Roblox's clock equals the server's."""
+    its slot at internal priority, then makes one 60 ms call. Roblox's clock is `roblox_ahead_s` ahead of the
+    server's (0: the clocks agree)."""
 
-    def __init__(self, clock: FakeClock) -> None:
+    def __init__(self, clock: FakeClock, *, queue_wait_s: float = QUEUE_WAIT_S, roblox_ahead_s: float = 0.0) -> None:
         self.clock = clock
+        self.queue_wait_s = queue_wait_s
+        self.roblox_ahead_s = roblox_ahead_s
 
     async def internal_fetch(self, purpose: str, method: str, url: str, **kwargs: Any) -> Any:
-        self.clock.advance(QUEUE_WAIT_S)  # waiting for a bucket slot (plan 7.8, queue_wait_internal_ms 30 s)
+        self.clock.advance(self.queue_wait_s)  # waiting for a bucket slot (plan 7.8, queue_wait_internal_ms 30 s)
         sent = self.clock.now()
         self.clock.advance(WIRE_S)
-        answered = datetime.fromtimestamp(sent + WIRE_S / 2, UTC)
+        answered = datetime.fromtimestamp(sent + WIRE_S / 2 + self.roblox_ahead_s, UTC)
         trace = Trace(request_id="01J" + "0" * 23, attempts=1, egress="direct", upstream_status=200)
         trace.upstream_headers = {"date": format_datetime(answered, usegmt=True)}
-        trace.queue_wait_ms = QUEUE_WAIT_S * 1000
+        trace.queue_wait_ms = self.queue_wait_s * 1000
         trace.duration_ms = WIRE_S * 1000
         return SimpleNamespace(status=200, upstream_status=200, trace=trace, ok=True)
 
@@ -68,18 +72,43 @@ class Facts:
         return CommandResult(0, "NTPSynchronized=yes\nNTP=yes\n", "")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding insights-12: H-CLOCK counts half of the probe's bucket queue wait as clock skew",
-)
-async def test_r3_insights_clock_skew_ignores_the_probes_queue_wait() -> None:
-    clock = FakeClock(NOW)
-    ctx = SimpleNamespace(upstream=BusyUpstream(clock), clock=clock, settings={}, env=SimpleNamespace(env="production"))
+async def _clock_result(upstream: BusyUpstream) -> Any:
+    ctx = SimpleNamespace(upstream=upstream, clock=upstream.clock, settings={}, env=SimpleNamespace(env="production"))
     spec = checks.CATALOG["H-CLOCK"]
     env = CheckEnv(ctx=ctx, facts=Facts(), spec=spec, params={}, trigger="manual", options=RunOptions())  # type: ignore[arg-type]
-    result = await spec.fn(env)
+    return await spec.fn(env)
+
+
+@pytest.mark.parametrize("queue_wait_s", [0.0, 20.0, 29.5])
+async def test_r3_insights_clock_skew_ignores_the_probes_queue_wait(queue_wait_s: float) -> None:
+    """Finding insights-12 (fixed): the skew is read at the middle of the call that returned the Date header, so
+    a probe that queued for a bucket slot (up to `queue_wait_internal_ms`, 30 s) still reads synchronized clocks
+    as synchronized."""
+    result = await _clock_result(BusyUpstream(FakeClock(NOW), queue_wait_s=queue_wait_s))
     # The clocks agree to within the Date header's one second resolution.
     assert result.status is Status.PASS, f"{result.status.value}: {result.value} (skew {result.detail.get('skew_s')})"
+    assert abs(result.detail["skew_s"]) < 1.0
+    assert result.detail["queue_wait_ms"] == pytest.approx(queue_wait_s * 1000)  # shown, never counted
+    assert result.detail["call_ms"] == pytest.approx(WIRE_S * 1000)
+
+
+@pytest.mark.parametrize(("roblox_ahead_s", "status"), [(6.0, Status.WARN), (-25.0, Status.FAIL)])
+async def test_r3_insights_a_real_skew_still_reads_true_behind_a_queue_wait(
+    roblox_ahead_s: float, status: Status
+) -> None:
+    """The fix removes only the queue wait: a clock that really is 6 s slow (or 25 s fast) still warns (fails)
+    with its own size, whatever the probe waited."""
+    result = await _clock_result(BusyUpstream(FakeClock(NOW), roblox_ahead_s=roblox_ahead_s))
+    assert result.status is status, result.value
+    assert result.detail["skew_s"] == pytest.approx(-roblox_ahead_s, abs=1.0)  # the Date header has 1 s steps
+    assert ("behind" if roblox_ahead_s > 0 else "ahead of") in result.value
+
+
+def test_r3_insights_call_midpoint_bounds() -> None:
+    """Without a usable call duration the middle of the whole fetch is used; a call cannot start before the fetch."""
+    assert checks.call_midpoint(100.0, 120.06, 60.0) == pytest.approx(120.03)
+    assert checks.call_midpoint(100.0, 120.0, None) == pytest.approx(110.0)
+    assert checks.call_midpoint(100.0, 101.0, 5000.0) == pytest.approx(100.5)  # clamped to the fetch's start
 
 
 def test_r3_insights_copy_run_for_llm_is_wrapped_and_confines_outside_text() -> None:

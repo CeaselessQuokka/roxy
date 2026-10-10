@@ -28,7 +28,13 @@ How it works
     history and audit rows and bumps `config_version` in ONE control.db transaction, so every worker reloads within
     a second; its refusals become 422 errors with one message per key (`common.run_mutation`). Before calling it,
     the API refuses a batch that holds a high-risk change without `confirm_high_risk: true` (422
-    `confirmation_required`) or without a reason (422 on `reason`); the service checks the reason again. Reads come
+    `confirmation_required`) or without a reason (422 on `reason`); the service checks the reason again. A change
+    of an `admin_security` or `credential` setting, a sensitive one or `export_include_ips` (`needs_fresh_mfa`)
+    needs a second factor entered within `admin_reauth_window_s` (403 `reauth_required`, plan 9.6), in every
+    writer here (PATCH, PUT, reset, revert, import); previews name those keys (`fresh_mfa_keys`). The quick checks
+    read this worker's snapshot; the same rules run again inside the write transaction on the keys it is about to
+    write (`WriteRules`, a `SettingsService` guard), so a snapshot that lags behind another worker's change never
+    lets a stale session or an arming batch through (finding secfix-1). Reads come
     from this worker's settings snapshot (values), `config/read_settings.py` (history) and
     `metrics/read_recommended_settings.py` (open recommendations). Sensitive settings (`spec.sensitive`) are shown
     as `[redacted]` everywhere, and their history holds only `{fingerprint, masked}` (plan 6.2).
@@ -40,7 +46,8 @@ What to read next
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Annotated, Any, Final
 
 from fastapi import Depends, Path, Query, Request
@@ -61,10 +68,12 @@ from roxy.admin.api.common import (
     run_mutation,
     table_params,
 )
+from roxy.admin.auth.deps import AdminPrincipal, ReauthRequired
+from roxy.admin.auth.sessions import FULL_MFA_LEVELS
 from roxy.config import audit, catalog, read_settings
 from roxy.config.constants import MAX_REASON_LENGTH
 from roxy.config.runtime import same_value, thaw
-from roxy.config.settings_service import RESET, SettingsService, UpdateResult, service_for
+from roxy.config.settings_service import RESET, PendingWrite, SettingsService, UpdateResult, service_for
 from roxy.config.spec import GROUP_LABELS, Apply, Group, Risk, SettingSpec, SettingType
 from roxy.deps import get_ctx
 from roxy.metrics.read_recommended_settings import open_setting_recommendations
@@ -92,6 +101,17 @@ detectors (real bans), which plan 10.3 allows only after the collateral preview:
 the preview's token. Turning the dry run back on (1), resetting it to its default (1) and leaving it as it is are
 always allowed."""
 ARM_ONLY_MESSAGE: Final = "Arm the spam detectors from the Protection page: it first shows who would have been banned."
+FRESH_MFA_GROUPS: Final[frozenset[Group]] = frozenset({Group.ADMIN_SECURITY, Group.CREDENTIAL})
+"""Settings groups whose every change needs a fresh second factor (plan 9.6): `admin_security` decides who may sign
+in and what a session may do (the re-auth window itself, session lifetimes, lockouts, the admin network allowlist),
+`credential` what the one Roblox account is used for (C1, D1)."""
+FRESH_MFA_SETTINGS: Final[frozenset[str]] = frozenset({"export_include_ips", "health_auto_include_credential"})
+"""Single settings outside those groups that need it as well, because each turns on for good what an action guarded
+by the factor does once: `export_include_ips` puts raw client addresses in every download, which the LLM export
+allows only with a fresh second factor (plan 9.15, 12.2); `health_auto_include_credential` makes every scheduled
+Check Proxy Health run call Roblox with the credential (H-CRED-AUTH), which a manual run does only with a fresh
+second factor (DESIGN 14.4, finding secfix-6). Arming the spam detectors (`spam_dry_run` off) is the third such
+switch; it has its own route (`ARM_ONLY_SETTINGS`)."""
 
 HISTORY_TABLE: Final = TableSpec(
     name="settings_history",
@@ -190,6 +210,7 @@ def entry(
         changed=overridden and not same_value(value, default),
         high_risk_reason=None if spec.sensitive else spec.is_high_risk_value(value),
         needs_reason=spec.risk is Risk.HIGH or bool(spec.high_risk_if),
+        needs_fresh_mfa=needs_fresh_mfa(spec),
         updated_at=updated_at if overridden else None,
         updated_by=updated_by if overridden else None,
         last_change=None if last is None else _history_item(last, link=True),
@@ -315,6 +336,7 @@ def preview_changes(changes: Mapping[str, Any], snapshot: Any) -> dict[str, Any]
     ]
     blocked = any(item["status"] in ("invalid", "unknown") for item in items) or bool(cross)
     risky = [item["key"] for item in items if item.get("needs_reason")]
+    fresh = fresh_mfa_keys(sorted(changed))
     return {
         "ok": not blocked,
         "items": items,
@@ -323,8 +345,44 @@ def preview_changes(changes: Mapping[str, Any], snapshot: Any) -> dict[str, Any]
         "reason_required": bool(risky),
         "confirm_required": bool(risky),
         "high_risk_keys": risky,
+        "fresh_mfa_required": bool(fresh),
+        "fresh_mfa_keys": fresh,
         "config_version": snapshot.version,
     }
+
+
+def needs_fresh_mfa(spec: SettingSpec) -> bool:
+    """Whether changing `spec`, either way, needs a second factor entered within `admin_reauth_window_s` (plan 9.6).
+
+    True for a sensitive setting, the `FRESH_MFA_GROUPS` and `FRESH_MFA_SETTINGS`. Every settings writer of the API
+    asks this one question (this editor, PUT, reset, revert and import here; the recommendations API for an apply
+    or an undo), so no path changes these settings with a stale session. Without it a session whose factor went
+    stale could raise `admin_reauth_window_s` and pass every fresh-factor guard again (review finding apisec-1).
+    """
+    return spec.sensitive or spec.group in FRESH_MFA_GROUPS or spec.key in FRESH_MFA_SETTINGS
+
+
+def fresh_mfa_keys(keys: Iterable[str]) -> list[str]:
+    """The keys among `keys` (catalog keys or v1 names) that need a fresh second factor (`needs_fresh_mfa`)."""
+    out: list[str] = []
+    for key in keys:
+        resolved = catalog.resolve_key(str(key))
+        spec = catalog.CATALOG.get(resolved) if resolved else None
+        if spec is not None and needs_fresh_mfa(spec) and spec.key not in out:
+            out.append(spec.key)
+    return out
+
+
+async def require_fresh_for(request: Request, keys: Iterable[str]) -> None:
+    """403 `reauth_required` (with `Roxy-Reauth: required`) unless the second factor is fresh, when any of `keys`
+    needs one (see `needs_fresh_mfa`); nothing is checked for a batch of ordinary settings."""
+    if fresh_mfa_keys(keys):
+        await common.admin_fresh_mfa(request)
+
+
+def changing_keys(preview: Mapping[str, Any]) -> list[str]:
+    """The keys a `preview_changes` answer would actually change (unchanged values need no second factor)."""
+    return [str(item["key"]) for item in preview["items"] if item["status"] == "change"]
 
 
 def check_risk(risky: Sequence[str], *, reason: str, confirmed: bool) -> str:
@@ -357,6 +415,71 @@ def refuse_arming(changes: Mapping[str, Any], snapshot: Any) -> None:
             fields[key] = f"{ARM_ONLY_MESSAGE} ({ARM_ONLY_SETTINGS[key]})"
     if fields:
         raise common.validation_error(fields, ARM_ONLY_MESSAGE, code="confirmation_required")
+
+
+@dataclass(frozen=True, slots=True)
+class WriteRules:
+    """The editor's rules judged again inside the write transaction (a `SettingsService` guard, finding secfix-1).
+
+    The routes first check a request against this worker's settings snapshot (quick answers, the previews). That
+    snapshot may be up to `CONFIG_POLL_INTERVAL_S` behind a change another worker made, while the service writes every
+    key whose value in control.db differs from the request: a stale session could put an `admin_security` value back
+    that "changes nothing" by the snapshot. So the same rules run again on exactly the keys the transaction is about
+    to write (`PendingWrite.dirty`), against what control.db holds:
+      * a key that `needs_fresh_mfa`, unless the second factor was entered within the `admin_reauth_window_s`
+        control.db holds (the value before this write): 403 `reauth_required`;
+      * an `ARM_ONLY_SETTINGS` key going from on to off, unless `arming_allowed` (only the arm route): 422
+        `confirmation_required`;
+      * with `confirmed` False, a high-risk value (`risk_reason`): 422 `confirmation_required`. None means the route
+        decided its confirmation from data that does not lag (a revert's history row, an import preview read from
+        control.db).
+    `factor_age_s` is the age of the session's real second factor in seconds (None for a trusted-device or bootstrap
+    session, which is never fresh).
+    """
+
+    factor_age_s: float | None
+    confirmed: bool | None = None
+    arming_allowed: bool = False
+
+    def fresh(self, pending: PendingWrite) -> bool:
+        """Whether the second factor is fresh by the re-auth window control.db holds."""
+        if self.factor_age_s is None:
+            return False
+        try:
+            window = float(pending.value("admin_reauth_window_s"))
+        except (TypeError, ValueError):
+            return False
+        return self.factor_age_s <= window
+
+    def __call__(self, pending: PendingWrite) -> None:
+        if fresh_mfa_keys(pending.dirty) and not self.fresh(pending):
+            raise ReauthRequired()
+        if not self.arming_allowed:
+            arming = {
+                key: f"{ARM_ONLY_MESSAGE} ({ARM_ONLY_SETTINGS[key]})"
+                for key, (old, new) in pending.dirty.items()
+                if key in ARM_ONLY_SETTINGS and bool(old) and not bool(new)
+            }
+            if arming:
+                raise common.validation_error(arming, ARM_ONLY_MESSAGE, code="confirmation_required")
+        if self.confirmed is False:
+            risky = [
+                key
+                for key, (_old, new) in pending.dirty.items()
+                if key in catalog.CATALOG and risk_reason(catalog.CATALOG[key], new)
+            ]
+            if risky:
+                raise common.validation_error(
+                    dict.fromkeys(risky, CONFIRM_MESSAGE), CONFIRM_MESSAGE, code="confirmation_required"
+                )
+
+
+def write_rules(
+    ctx: Any, admin: AdminPrincipal, *, confirmed: bool | None = None, arming_allowed: bool = False
+) -> WriteRules:
+    """The `WriteRules` of a request by `admin` (the age of its second factor on this worker's clock)."""
+    age = float(ctx.clock.now()) - float(admin.mfa_at) if admin.mfa_level in FULL_MFA_LEVELS else None
+    return WriteRules(age, confirmed=confirmed, arming_allowed=arming_allowed)
 
 
 def _errors_or_none(preview: Mapping[str, Any]) -> None:
@@ -512,9 +635,17 @@ async def update_settings(
     checked = preview_changes(body.changes, ctx.settings.snapshot())
     _errors_or_none(checked)
     refuse_arming(body.changes, ctx.settings.snapshot())
+    await require_fresh_for(request, changing_keys(checked))
     reason = check_risk(checked["high_risk_keys"], reason=body.reason, confirmed=body.confirm_high_risk)
     result = await run_mutation(
-        settings_service(ctx).update(body.changes, actor_for(admin), reason, "admin", request_id=request_id_of(request))
+        settings_service(ctx).update(
+            body.changes,
+            actor_for(admin),
+            reason,
+            "admin",
+            request_id=request_id_of(request),
+            guard=write_rules(ctx, admin, confirmed=body.confirm_high_risk),
+        )
     )
     return result_answer(result)
 
@@ -572,17 +703,8 @@ async def _history_table(
             rows, total = await ctx.dbs.control.read(read(page, size))
             return [_history_item(row, link=False) for row in rows], total
 
-        rows, total = await common.collect_pages(fetch)
-        return await common.export_table(
-            request,
-            admin,
-            HISTORY_TABLE,
-            rows,
-            fmt,
-            total=total,
-            tq=tq,
-            filters={k: v for k, v in filters.items() if v},
-        )
+        kept = {k: v for k, v in filters.items() if v}
+        return await common.export_pages(request, admin, HISTORY_TABLE, fetch, fmt, tq=tq, filters=kept)
     rows, total = await ctx.dbs.control.read(read(tq.page, tq.page_size))
     answer = common.table_answer(HISTORY_TABLE, tq, [_history_item(row, link=True) for row in rows], total)
     answer["filters"] = filters
@@ -630,9 +752,12 @@ async def revert(
             risky.append(spec.key)
         if target is not None:
             refuse_arming({spec.key: target}, ctx.settings.snapshot())
+    await require_fresh_for(request, [str(row["key"])])
     reason = check_risk(risky, reason=body.reason, confirmed=body.confirm_high_risk)
     result = await run_mutation(
-        settings_service(ctx).revert(history_id, actor_for(admin), reason, request_id=request_id_of(request))
+        settings_service(ctx).revert(
+            history_id, actor_for(admin), reason, request_id=request_id_of(request), guard=write_rules(ctx, admin)
+        )
     )
     return {**result_answer(result), "reverted": history_id}
 
@@ -698,6 +823,7 @@ def _import_answer(preview: Any) -> dict[str, Any]:
         "high_risk_keys": risky,
         "reason_required": bool(risky),
         "confirm_required": bool(risky),
+        "fresh_mfa_keys": fresh_mfa_keys(item.key for item in preview.changes),
     }
 
 
@@ -721,12 +847,18 @@ async def import_overrides(
     preview = await run_mutation(service.preview_import(body.document, replace=body.replace))
     answer = _import_answer(preview)
     refuse_arming({key: value for key, value in preview.plan.items() if value is not RESET}, ctx.settings.snapshot())
+    await require_fresh_for(request, [item.key for item in preview.changes])
     reason = check_risk(answer["high_risk_keys"], reason=body.reason, confirmed=body.confirm_high_risk)
     if not reason:  # an import replaces many values at once: plan 15.2 "applies atomically with a reason"
         raise common.validation_error({"reason": "Give a reason for this import; it goes in the audit log."})
     result = await run_mutation(
         service.import_overrides(
-            body.document, actor_for(admin), reason, replace=body.replace, request_id=request_id_of(request)
+            body.document,
+            actor_for(admin),
+            reason,
+            replace=body.replace,
+            request_id=request_id_of(request),
+            guard=write_rules(ctx, admin),
         )
     )
     return {**result_answer(result), "catalog_version_matches": preview.catalog_version_matches}
@@ -778,9 +910,17 @@ async def set_setting(
     checked = preview_changes(changes, ctx.settings.snapshot())
     _errors_or_none(checked)
     refuse_arming(changes, ctx.settings.snapshot())
+    await require_fresh_for(request, changing_keys(checked))
     reason = check_risk(checked["high_risk_keys"], reason=body.reason, confirmed=body.confirm_high_risk)
     result = await run_mutation(
-        settings_service(ctx).update(changes, actor_for(admin), reason, "admin", request_id=request_id_of(request))
+        settings_service(ctx).update(
+            changes,
+            actor_for(admin),
+            reason,
+            "admin",
+            request_id=request_id_of(request),
+            guard=write_rules(ctx, admin, confirmed=body.confirm_high_risk),
+        )
     )
     return result_answer(result)
 
@@ -793,12 +933,20 @@ async def reset_setting(
     admin: AdminSession,
     _csrf: CsrfChecked,
 ) -> dict[str, Any]:
-    """Remove the override so the key follows its catalog default again (parity row 124)."""
+    """Remove the override so the key follows its catalog default again (parity row 124).
+
+    A reset of a key at its default changes nothing and needs no second factor; whether the key has an override is
+    decided inside the write on what control.db holds (`write_rules`), never on this worker's snapshot alone, which
+    may not show an override another worker just wrote (finding secfix-1)."""
     spec = _spec_or_404(key)
     ctx = get_ctx(request)
+    if ctx.settings.snapshot().is_overridden(spec.key):  # the quick answer; the write's guard decides
+        await require_fresh_for(request, [spec.key])
     reason = common.require_reason(body.reason, required=False)
     result = await run_mutation(
-        settings_service(ctx).reset_to_default(spec.key, actor_for(admin), reason, request_id=request_id_of(request))
+        settings_service(ctx).reset_to_default(
+            spec.key, actor_for(admin), reason, request_id=request_id_of(request), guard=write_rules(ctx, admin)
+        )
     )
     return result_answer(result)
 
@@ -823,16 +971,24 @@ async def key_history(
 
 
 __all__ = [
+    "FRESH_MFA_GROUPS",
+    "FRESH_MFA_SETTINGS",
     "HISTORY_TABLE",
     "MAX_CHANGES",
+    "WriteRules",
+    "changing_keys",
     "check_risk",
     "consequence",
     "default_of",
     "entry",
+    "fresh_mfa_keys",
+    "needs_fresh_mfa",
     "preview_changes",
+    "require_fresh_for",
     "result_answer",
     "risk_reason",
     "router",
     "settings_service",
     "shown",
+    "write_rules",
 ]

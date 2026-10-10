@@ -28,6 +28,13 @@ How it works
     leak guard could not watch it). Both fixes are logged without the value.
     Fingerprints are HMAC-SHA256 with a key derived from `credential_encryption_key`, so they identify a value
     without revealing it and cannot be checked offline.
+    Redaction: every value is registered with `SecretRegistry` before anything can print it. The registry keeps 3
+    values per name, so each role has its own name and no role can push another out (finding W2H-1):
+    `roblox_credential_bootstrap` (the file's value, at start), `roblox_credential_in_use` (whatever the slot takes,
+    registered before it holds it), `roblox_credential` (values offered through `replace`, before their audit row)
+    and `roblox_credential_rotated` (cookies Roblox sent). A value that can become the credential in use again (the
+    bootstrap value, through `delete_ui_value`) therefore stays known to every redaction point for the worker's
+    whole life, however many values are pasted in between.
     Status is `unknown` (never probed), `active`, `rejected`, or (computed) `cooling_down` while the fleet-wide
     cooldown row `credential` in hot.db is in the future. Ordinary allowlisted traffic needs `active`; probes may
     run while `unknown` or `rejected` (that is how a status is established) but never during a cooldown.
@@ -118,6 +125,13 @@ VERSION_KEY = "credential_version"
 COOLDOWN_KEY = "credential"
 PROBE_LEASE = "probe:credential"
 ROTATED_SECRET_NAME = "roblox_credential_rotated"  # noqa: S105 (a registry name, not a value)
+BOOTSTRAP_SECRET_NAME = "roblox_credential_bootstrap"  # noqa: S105 (a registry name, not a value)
+"""Registry name of the bootstrap value. Only `start` registers under it (one value per process), so values offered
+later can never push it out of `SecretRegistry`, which keeps 3 values per name (finding W2H-1): `delete_ui_value`
+can make it the credential in use again at any time."""
+IN_USE_SECRET_NAME = "roblox_credential_in_use"  # noqa: S105 (a registry name, not a value)
+"""Registry name of the value the slot holds. Registered each time the slot takes a value, before it holds it, so the
+newest value under this name is always the credential in use, whatever was offered (and refused) since."""
 
 MIN_VALUE_LENGTH = 32
 MAX_VALUE_LENGTH = 4096
@@ -690,7 +704,8 @@ class CredentialManager:
                 if cleaned.named:
                     log.warning("credential_cookie_name_removed", extra={"fields": {"source": "bootstrap"}})
                 self._bootstrap_fp = fingerprint(self._bootstrap, self._fp_key)
-                SecretRegistry.register(CREDENTIAL_SECRET_NAME, self._bootstrap)
+                # Under its own name: UI values registered later can never evict it (finding W2H-1).
+                SecretRegistry.register(BOOTSTRAP_SECRET_NAME, self._bootstrap, match_substrings=True)
         try:
             await self._dbs.control.write(self._sync_bootstrap_meta)
         except SharedStateUnavailable as exc:
@@ -831,8 +846,7 @@ class CredentialManager:
                     self._problem = "ui_value_unreadable"
                     self._slot.clear()
                 else:
-                    SecretRegistry.register(CREDENTIAL_SECRET_NAME, value)
-                    self._slot.set(value, source="ui", value_fingerprint=fingerprint(value, self._fp_key))
+                    self._use(value, source="ui", value_fingerprint=fingerprint(value, self._fp_key))
         elif self._bootstrap is not None and self._bootstrap_fp is not None:
             superseded = _json_list(meta.get("superseded_fingerprints_json"))
             if self._key is None and superseded:
@@ -844,7 +858,7 @@ class CredentialManager:
                 self._problem = "bootstrap_superseded"
                 self._slot.clear()
             else:
-                self._slot.set(self._bootstrap, source="bootstrap", value_fingerprint=self._bootstrap_fp)
+                self._use(self._bootstrap, source="bootstrap", value_fingerprint=self._bootstrap_fp)
         else:
             self._problem = self._bootstrap_problem
             self._slot.clear()
@@ -854,6 +868,19 @@ class CredentialManager:
         self._rebuild_matcher()
         if self._problem in ("bootstrap_superseded", "cannot_verify_bootstrap", "encryption_key_missing"):
             log.error("credential_not_loaded", extra={"fields": {"problem": self._problem}})
+
+    def _use(self, value: str, *, source: str, value_fingerprint: str) -> None:
+        """Put `value` in the slot, registering it as the value in use FIRST (finding W2H-1).
+
+        Every redaction point (the log filter, audit reasons, outcome records, Live rows, captures, events, the
+        LLM export) knows only registered values, and `SecretRegistry` keeps 3 values per name. Registering here,
+        under a name nothing else writes, means the credential in use is always the newest value under
+        `IN_USE_SECRET_NAME`, however many values were pasted (or refused) in between and whichever source it came
+        from. This runs only when the stored state changed (`_load` reads the store when the version moved), so
+        the registry's rebuild is not a per-request cost.
+        """
+        SecretRegistry.register(IN_USE_SECRET_NAME, value, match_substrings=True)
+        self._slot.set(value, source=source, value_fingerprint=value_fingerprint)
 
     def _rebuild_matcher(self) -> None:
         values = tuple(
@@ -1326,7 +1353,9 @@ class CredentialManager:
         used everywhere at once (version bump), and the bootstrap value is superseded for good. A pasted
         `.ROBLOSECURITY=<value>` pair or a percent-encoded copy is stored as the canonical bare value
         (`_clean_value`). The new value is registered as a secret BEFORE the audit row is written, so a reason that
-        repeats it (a paste into the wrong box) is redacted like every other mention (finding cred-2)."""
+        repeats it (a paste into the wrong box) is redacted like every other mention (finding cred-2). It goes under
+        `CREDENTIAL_SECRET_NAME`, the name for offered values; the bootstrap value and the value in use have names
+        of their own, so a run of pastes (even refused ones) never pushes them out of the registry (finding W2H-1)."""
         cleaned = _clean_value(value)
         text = cleaned.text
         if cleaned.decoded:
@@ -1385,10 +1414,15 @@ class CredentialManager:
 
         The status becomes `unknown`: the bootstrap value is not used for traffic until a probe confirms the same
         account (or `confirm_account` accepts a different one after the typed C1 warning in the dashboard).
+        The bootstrap value is registered as a secret again BEFORE the audit row is written, so a reason that
+        repeats it is redacted however many values were replaced since this worker started (finding W2H-1).
         """
         now = int(self._clock.now())
         bootstrap_fp = self._bootstrap_fp
         bootstrap_masked = mask_token(self._bootstrap) if self._bootstrap is not None else None
+        # `start` registered it under its own name already; this keeps the rule local: the value an action switches
+        # to is known to `redact_text` before the action writes anything.
+        SecretRegistry.register(BOOTSTRAP_SECRET_NAME, self._bootstrap, match_substrings=True)
 
         def write(conn: sqlite3.Connection) -> int:
             if conn.execute("SELECT 1 FROM credential_store WHERE id = 1").fetchone() is None:
@@ -1488,10 +1522,12 @@ class CredentialManager:
 
 __all__ = [
     "BOOTSTRAP_FILE_NAME",
+    "BOOTSTRAP_SECRET_NAME",
     "COOLDOWN_KEY",
     "COOLDOWN_SOURCES",
     "DECODE_ROUNDS",
     "HOT_WRITE_BUDGET_MS",
+    "IN_USE_SECRET_NAME",
     "PROBE_LEASE",
     "PUBLIC_RUN",
     "PUBLIC_TEXTS",

@@ -3,8 +3,9 @@
 What this is
     The package every part of Roxy uses to tell the owner something needs attention: `alerts.py` (the catalog of
     alert types with their exact subjects, plan 17.7), `gate.py` (fleet-wide dedupe and the hourly cap, in
-    hot.db), `mail.py` and `webhook.py` (the two channels), and `notifier.py` (`Notifier`, which ties them
-    together and never blocks a request).
+    hot.db), `mail.py` and `webhook.py` (the two channels), `notifier.py` (`Notifier`, which ties them
+    together and never blocks a request), and `producers.py` (the leader jobs that watch numbers and raise the
+    rate, storage, integrity, backup and digest alerts).
 
 Why it exists
     v1 sent mail inline from request threads, deduped per worker process (so two workers sent the same alert

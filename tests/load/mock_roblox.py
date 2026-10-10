@@ -23,9 +23,10 @@ How it works
       `Retry-After` (Roblox's web APIs rarely send one), unless the endpoint sets `retry_after`. An endpoint with
       `always_429` refuses every call (the 19.4 "429 on one endpoint" scenario).
     - Bodies are deterministic JSON of roughly `body_bytes` bytes, so two fetches of one key return the same bytes.
-    - The log is bounded (`MAX_RECORDS`; later calls are counted in `overflow` instead of stored). Times are
-      `time.monotonic()`, which is one clock for every process of the machine, so call times line up with the
-      client's request times.
+    - The log is bounded (`MAX_RECORDS`; later calls are counted in `overflow` instead of stored). Times are the
+      harness clock (`clock.now()`: the wall clock Roxy paces itself by, never stepping back), which every process
+      of the machine shares, so call times line up with the client's request times and a mock "minute" is as
+      long as Roxy's. `peak_in_window` replays the window over a list of call times (how close an endpoint came).
 
 What to read next
     `traffic.py` (where the endpoint table and its thresholds come from), then `fleet.py`.
@@ -39,11 +40,13 @@ import hashlib
 import json
 import re
 import threading
-import time
 from collections import Counter, deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Final
 from urllib.parse import urlsplit
+
+from load import clock
 
 MAX_RECORDS: Final = 1_000_000
 """At most this many calls are kept in the log (plan P9: every list is bounded); the rest are only counted."""
@@ -58,6 +61,20 @@ TEST_HOST_HEADER: Final = "x-roxy-test-host"
 """The header naming the original Roblox host (`roxy/egress/targets.py TEST_HOST_HEADER`, lowercased)."""
 
 _REASONS: Final = {200: "OK", 404: "Not Found", 429: "Too Many Requests"}
+
+
+def peak_in_window(times: Sequence[float], window_s: float = WINDOW_S) -> int:
+    """The most calls that ever sat in one window as `SlidingWindow` counts them: for each call at `t`, the calls in
+    `(t - window_s, t]` (itself included). An endpoint with limit `L` refused a call exactly when this exceeds `L`,
+    so `L - peak_in_window(...)` is how close the endpoint came to Roblox's threshold (its headroom)."""
+    ordered = sorted(times)
+    best = 0
+    first = 0
+    for index, at in enumerate(ordered):
+        while at - ordered[first] >= window_s:  # the mock refuses when `now - oldest < window_s`
+            first += 1
+        best = max(best, index - first + 1)
+    return best
 
 
 class SlidingWindow:
@@ -97,7 +114,7 @@ class Endpoint:
 @dataclass(frozen=True, slots=True)
 class CallRecord:
     at: float
-    """`time.monotonic()` when the request head arrived."""
+    """`clock.now()` (the harness clock) when the request head arrived."""
     endpoint: str
     status: int
     cookie: bool
@@ -136,6 +153,7 @@ class MockRoblox:
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run, name="mock-roblox", daemon=True)
         self._server: asyncio.AbstractServer | None = None
+        self._ticker: asyncio.Future[None] | None = None
 
     # ------------------------------------------------------------------------------------------------ control
 
@@ -177,10 +195,15 @@ class MockRoblox:
         async def serve() -> None:
             self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0, backlog=1024)
             self.port = int(self._server.sockets[0].getsockname()[1])
+            self._ticker = asyncio.ensure_future(clock.tick_forever())  # see clock.tick_forever
             self._ready.set()
 
         self._loop.run_until_complete(serve())
         self._loop.run_forever()
+        if self._ticker is not None:  # stopped: let the ticker see its cancellation before the thread ends
+            self._ticker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                self._loop.run_until_complete(self._ticker)
 
     def _match(self, method: str, host: str, path: str) -> _Compiled | None:
         for item in self._endpoints:
@@ -202,7 +225,7 @@ class MockRoblox:
     def decide(self, method: str, host: str, target: str, cookie: bool) -> tuple[int, dict[str, str], bytes, float]:
         """Status, headers, body and delay for one call; records it. Runs on the server loop thread only (the
         windows need no lock); the log and counters are written under the lock that snapshots read."""
-        now = time.monotonic()
+        now = clock.now()  # Roxy's time line, so the mock's minute is as long as Roxy's (clock.py)
         parts = urlsplit(target)
         item = self._match(method, host, parts.path)
         name = item.spec.name if item is not None else "other"
@@ -264,4 +287,13 @@ class MockRoblox:
                 writer.close()
 
 
-__all__ = ["MAX_RECORDS", "TOO_MANY", "CallRecord", "Endpoint", "MockRoblox", "MockStats", "SlidingWindow"]
+__all__ = [
+    "MAX_RECORDS",
+    "TOO_MANY",
+    "CallRecord",
+    "Endpoint",
+    "MockRoblox",
+    "MockStats",
+    "SlidingWindow",
+    "peak_in_window",
+]

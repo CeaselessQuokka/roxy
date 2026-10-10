@@ -7,7 +7,8 @@ What this is
     throttled, v1 `throttled_ips`). For each: a detail builder, the per-type row cap (`max_*_records`), the
     leader's cap enforcement, and the read models (paged rings and grouped summaries). `install_error_hooks`
     attaches the metrics side of `core/errors.py`: client errors become probes (`HTTP 404 via GET` plus the
-    path as target), server errors become error signatures with `module:line` and a redacted traceback.
+    path as target; the method is a standard one or OTHER, `client_error_reason`, so a caller's own method token is
+    never a signature), server errors become error signatures with `module:line` and a redacted traceback.
 
 Why it exists
     v1 kept 20 of each in memory. v2 keeps thousands on disk, paged and filterable, and fixes v1 bug B19: a
@@ -62,6 +63,38 @@ MAX_UA_CHARS = 400
 # handler's `HTTP <code> via <METHOD> <path>` (index.py:2223): the variable part becomes the target.
 _URL_REASON = re.compile(r'^(Invalid URL|Non-Roblox URL): "(.*)"$', re.DOTALL)
 _HTTP_REASON = re.compile(r"^(HTTP \d{3} via [A-Z]{1,12}) (.*)$", re.DOTALL)
+
+METHOD_CLASSES: frozenset[str] = frozenset(
+    {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
+)
+"""The methods a client error signature names; any other token is `OTHER_METHOD` (finding secfix-7)."""
+OTHER_METHOD = "OTHER"
+MAX_METHOD_CHARS = 32
+"""How much of an unknown method token the target column keeps (redacted, never the signature)."""
+
+
+def method_class(method: str | None) -> str:
+    """The method as a client error signature names it: one of `METHOD_CLASSES`, else `OTHER`.
+
+    The method is the caller's choice (any token). Keyed by the raw method, a flood with a new method per request
+    would mint a new signature, summary row and event budget per request and never be folded (v1 bug B19 again,
+    review round 4 finding secfix-7); a fixed set of ten classes keeps the probe log bounded per attacker effort.
+    """
+    return method if method in METHOD_CLASSES else OTHER_METHOD
+
+
+def client_error_reason(status: int, method: str | None, path: str | None) -> str:
+    """The probe log text of a client error (v1's `HTTP <code> via <METHOD> <path>`, index.py:2223).
+
+    The signature part is `HTTP <status> via <method class>` (Roxy's own status and one of ten classes); the path,
+    and for an `OTHER` method the raw method token in front of it, form the target, which `probe_signature` moves to
+    its own redacted column. `POST /` still logs `HTTP 405 via POST` with target `/`, as v1 did.
+    """
+    cls = method_class(method)
+    target = path or "/"
+    if cls == OTHER_METHOD:
+        target = f"{(method or '?')[:MAX_METHOD_CHARS]} {target}"
+    return f"HTTP {int(status)} via {cls} {target}"[:MAX_REASON_CHARS]
 
 
 def probe_signature(reason: str) -> tuple[str, str]:
@@ -146,7 +179,7 @@ def install_error_hooks(hooks: Any, recorder: Callable[[], Any]) -> None:
         rec = recorder()
         if rec is None:
             return
-        reason = f"HTTP {event.status} via {event.method} {event.path}"[:MAX_REASON_CHARS]
+        reason = client_error_reason(event.status, event.method, event.path)  # signature: status and method class
         rec.record_probe(event.client_ip or "unknown", reason, event.user_agent, event.path)
 
     def server_error(event: Any) -> None:

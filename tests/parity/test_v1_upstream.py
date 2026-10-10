@@ -3,7 +3,7 @@
 What this is
     Ports of v1 smoke line 691 (S016: "Timeouts never email the admin"), lines 2562 to 2569 (S080: "Internal
     probes are exempt from every caller-facing rule") and the method health fields of S069 and S045 (lines 2096,
-    2097, 2103 and 1353 to 1355), which v2 does not show yet (a strict xfail, finding parity-5).
+    2097, 2103 and 1353 to 1355), which the Upstream egress cards carry since finding parity-5 was fixed.
 
 Why it exists
     v1 learned the hard way that a slow Roblox must not flood the owner's inbox: a timeout is an ordinary upstream
@@ -27,7 +27,6 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
-import pytest
 
 from roxy.abuse.pause import set_pause
 from roxy.abuse.throttle_all import set_throttle_all
@@ -82,17 +81,10 @@ async def test_v1_internal_probes_are_exempt_from_every_caller_facing_rule(parit
     assert rows[0][1] is None  # never attributed to a client address (not caller traffic)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "finding parity-5: the per-egress health cards (GET /upstream/egress) give counts and rates only; v1's "
-        "LastSuccessAt, LastErrorAt and LastError (parity row 71) and the last failed status and endpoint of its "
-        "request failure log (row 72) have no v2 counterpart beyond the 15 minute Live rows"
-    ),
-)
 async def test_v1_egress_health_says_when_it_last_worked_and_what_failed_last(parity: Any) -> None:
     """v1 smoke lines 2096, 2097 and 2103 (S069) and 1353 to 1355 (S045): after a success and a Roblox 500, the
-    egress that carried them reports when it last succeeded, when it last failed, and what that failure was."""
+    egress that carried them reports when it last succeeded, when it last failed, and what that failure was
+    (finding parity-5 of the parity table, fixed: `last_success_at`, `last_error_at` and `last_error`)."""
     good = parity.roblox.route(host="games.roblox.com", path="/v1/games").mock(
         return_value=httpx.Response(200, json={"ok": True})
     )
@@ -109,7 +101,10 @@ async def test_v1_egress_health_says_when_it_last_worked_and_what_failed_last(pa
     assert direct["requests"] >= 2  # the counts are there (Requests, Failed, Timeouts are kept) ...
     last_success = [key for key in direct if "last_success" in key]
     last_error = [key for key in direct if "last_error" in key or "last_failure" in key]
-    assert last_success, sorted(direct)  # ... the "when did it last work, what failed last" fields are not
+    assert last_success, sorted(direct)  # ... and so are "when did it last work, what failed last"
     assert last_error, sorted(direct)
     assert "500" in str({key: direct[key] for key in last_error})
     assert "boom" in str({key: direct[key] for key in last_error})
+    assert direct["failed"] >= 1
+    assert direct["last_success_at"] is not None
+    assert direct["last_error"]["reason"] == "upstream_5xx"

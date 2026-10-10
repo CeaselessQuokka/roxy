@@ -93,11 +93,27 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def base_env(work: Path, credentials: Path, mock_base: str, *, workers: int) -> dict[str, str]:
-    """The environment of the gunicorn master (nothing inherited from the caller's shell)."""
+def base_env(
+    work: Path,
+    credentials: Path,
+    mock_base: str,
+    *,
+    workers: int,
+    tree: Path | None = None,
+    extra: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """The environment of the gunicorn master (nothing inherited from the caller's shell).
+
+    `tree`: a copy of the repository (`git archive` of a commit, say) whose `src/roxy` the workers import instead of
+    the installed working tree, so a measurement can name the exact code it measured. `extra`: variables for a
+    "what if" run (`--worker-env`, for example `MALLOC_ARENA_MAX=2`); never `ROXY_*`, which belong to the run.
+    """
     state = work / "state"
     run = work / "run"
+    path = {} if tree is None else {"PYTHONPATH": str(tree / "src")}  # ahead of the editable install's path
     return {
+        **dict(extra or {}),
+        **path,
         "PATH": f"{VENV_BIN}:/usr/bin:/bin",
         "HOME": str(work),
         "LANG": "C.UTF-8",
@@ -174,20 +190,22 @@ def query(path: str, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, 
 class Fleet:
     """One gunicorn master with `deploy/gunicorn.conf.py`: its process, log and addresses."""
 
-    def __init__(self, work: Path, env: Mapping[str, str]) -> None:
+    def __init__(self, work: Path, env: Mapping[str, str], *, tree: Path | None = None) -> None:
         self.work = work
         self.env = dict(env)
         self.workers = int(env["ROXY_WORKERS"])
         self.base_url = "http://" + env["ROXY_BIND"]
         self.log = work / "gunicorn.log"
         self.proc: subprocess.Popen[bytes] | None = None
+        self.tree = tree or REPO
 
     def start(self) -> None:
         handle = open(self.log, "ab")  # noqa: SIM115 (kept open for the child's lifetime)
+        conf = self.tree / GUNICORN_CONF.relative_to(REPO)
         self.proc = subprocess.Popen(
-            [str(VENV_BIN / "gunicorn"), "-c", str(GUNICORN_CONF), "roxy.asgi:app"],
+            [str(VENV_BIN / "gunicorn"), "-c", str(conf), "roxy.asgi:app"],
             env=self.env,
-            cwd=REPO,
+            cwd=self.tree,
             stdout=handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -271,7 +289,14 @@ class ResourceSampler:
       processes counts the shared interpreter and libraries once per process; PSS counts them once in total, so
       the PSS sum is the closest per-process estimate of the color's anonymous and file-backed charge against
       `MemoryHigh` and `MemoryMax` (the cgroup also charges page cache, which no per-process figure shows).
+    Besides the peaks it keeps a timeline (worker RSS and color PSS every `TIMELINE_EVERY_S`), which tells a
+    plateau from steady growth in a long run.
     """
+
+    TIMELINE_EVERY_S: Final = 30.0
+    """One point of the memory timeline every this many seconds (does memory level off, or keep growing?)."""
+    TIMELINE_MAX: Final = 480
+    """At most this many timeline points are kept (4 hours at one every 30 s; plan P9: every list is bounded)."""
 
     def __init__(self, master_pid: int, interval_s: float = 0.5) -> None:
         self.master_pid = master_pid
@@ -279,6 +304,9 @@ class ResourceSampler:
         self.tracks: dict[int, _ProcessTrack] = {}
         self.peak_total_rss = 0
         self.peak_total_pss = 0
+        self.timeline: list[dict[str, Any]] = []
+        self._started = time.monotonic()
+        self._next_point = 0.0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="rss-sampler", daemon=True)
         self._lock = threading.Lock()
@@ -290,8 +318,10 @@ class ResourceSampler:
         except psutil.Error:
             return []
 
-    def sample(self) -> None:
+    def sample(self, *, point: bool = False) -> None:
+        """Read every process once; `point=True` also adds a timeline point whatever the time since the last."""
         rss_total = pss_total = 0
+        workers: list[int] = []
         with self._lock:
             for process, role in self._processes():
                 try:
@@ -303,8 +333,20 @@ class ResourceSampler:
                 track.peak_uss = max(track.peak_uss, int(info.uss))
                 rss_total += int(info.rss)
                 pss_total += int(getattr(info, "pss", info.uss))
+                if role == "worker":
+                    workers.append(int(info.rss))
             self.peak_total_rss = max(self.peak_total_rss, rss_total)
             self.peak_total_pss = max(self.peak_total_pss, pss_total)
+            elapsed = time.monotonic() - self._started
+            if (point or elapsed >= self._next_point) and len(self.timeline) < self.TIMELINE_MAX:
+                self._next_point = elapsed + self.TIMELINE_EVERY_S
+                self.timeline.append(
+                    {
+                        "s": round(elapsed),
+                        "worker_rss_mib": [round(rss / 2**20, 1) for rss in sorted(workers, reverse=True)],
+                        "color_pss_mib": round(pss_total / 2**20, 1),
+                    }
+                )
 
     def mark(self, name: str) -> None:
         """Remember each process's CPU seconds (user plus system) under `name`."""
@@ -336,8 +378,10 @@ class ResourceSampler:
         return self
 
     def stop(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            self._stop.set()
+            self._thread.join(timeout=5)
+            self.sample(point=True)  # one last point, so the timeline reaches the end of the run
 
     def summary(self) -> dict[str, Any]:
         with self._lock:
@@ -351,6 +395,7 @@ class ResourceSampler:
                 "master_peak_rss_mib": round(master / 2**20, 1),
                 "color_peak_rss_sum_mib": round(self.peak_total_rss / 2**20, 1),
                 "color_peak_pss_mib": round(self.peak_total_pss / 2**20, 1),
+                "timeline": list(self.timeline),
             }
 
 

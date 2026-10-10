@@ -133,7 +133,40 @@ async def test_ip_page_totals_timeline_refusals_strikes_probes_and_bot_signals(
     quiet = ok(await api.get("clients/ips/198.51.100.77"), api_json)
     assert quiet["totals"]["requests"] == 0
     assert quiet["bot_score"]["score"] is None  # no recent request: no User-Agent, no guess
+    assert quiet["bot_score"]["recorded"] is None
     section13(await api.get("clients/ips/not-an-ip"), 422, "validation_failed")
+
+
+async def test_recorded_fleet_scores_answer_when_no_live_row_exists(
+    api: Any, api_app: Any, api_json: Any, metrics_seed: Any
+) -> None:
+    """lane_producers request 6: the bot score the fleet recorded (`client_score_hour`, written once a minute by every
+    worker off the request path) answers for an address this worker has no recent request of, labeled `recorded`."""
+    seed_clients(metrics_seed)
+    await metrics_seed.flush()
+    now = int(api_app.clock.now())
+    hour = now - now % 3600
+
+    def recorded(conn: Any) -> None:
+        conn.execute("DELETE FROM events WHERE type = 'live' AND json_extract(detail_json, '$.ip') = ?", (GOOD,))
+        for bucket, top in ((hour - 3600, 90), (hour, 64)):
+            conn.execute(
+                "INSERT INTO client_score_hour (bucket_start, client_key, score_max, score_last, last_at, samples) "
+                "VALUES (?, ?, ?, ?, ?, 3)",
+                (bucket, GOOD, top, top - 4, bucket + 60),
+            )
+
+    await api_app.ctx.dbs.metrics.write(recorded)  # the live rows of GOOD expired (15 minutes)
+    table = ok(await api.get("clients/ips"), api_json)
+    rows = {item["key"]: item for item in table["items"]}
+    assert (rows[GOOD]["bot_score"], rows[GOOD]["bot_score_source"]) == (64, "recorded")  # its latest hour
+    assert rows[BAD]["bot_score_source"] == "this_worker"
+    assert set(table["bot_score_sources"]) == {"this_worker", "recorded"}
+    assert table["caller_text"] == ["top_endpoint", "user_agent"]  # the busiest endpoint is caller text (secfix-5)
+    page = ok(await api.get(f"clients/ips/{GOOD}", params={"range": "24h"}), api_json)
+    assert page["bot_score"]["score"] is None  # no live view in this worker
+    assert page["bot_score"]["recorded"] == {"score": 64, "score_last": 60, "at": hour + 60, "hour": hour}
+    assert [h["score_max"] for h in page["bot_score"]["recorded_history"]] == [90, 64]
 
 
 async def test_ip_actions_ban_bypass_and_deny_rule(api: Any, api_app: Any, api_json: Any, section13: Any) -> None:

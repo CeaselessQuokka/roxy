@@ -54,6 +54,7 @@ RETENTION_OF: Final[dict[str, str]] = {
     "metrics.events": "retention_events_days",
     "metrics.upstream_429": "retention_upstream_429_days",
     "metrics.request_samples": "request_sample_hours",
+    "metrics.refusal_samples": "request_sample_hours",
     "metrics.errors": "retention_errors_days",
     "metrics.fingerprint_values": "retention_fingerprints_days",
     "metrics.fingerprint_user_agents": "retention_fingerprints_days",

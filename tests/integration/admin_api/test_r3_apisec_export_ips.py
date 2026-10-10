@@ -1,12 +1,13 @@
 """Review round 3 (lens apisec): client IP addresses in admin API exports while `export_include_ips` is off.
 
 What this is
-    Strict-xfail tests for finding apisec-2. With `export_include_ips` at its default (0) the catalog promises that
-    "every address is replaced by a keyed hash (HMAC)" in export files (plan 9.15, 12.3; the setting's own help
-    text). The shared export path (`admin/api/common.py export_table`) hashes only the columns a `TableSpec` marks
-    `ip=True`. Client addresses also travel in other columns: the spam detector `subject` (`ip:<client>`), the
-    Overview events `detail`, and the audit log's `target`, `before_preview` and `after_preview` (a ban or an
-    access list row holds the address). Those leave the server raw in CSV and JSON downloads.
+    Tests for finding apisec-2 (fixed; it was a strict xfail). With `export_include_ips` at its default (0) the
+    catalog promises that "every address is replaced by a keyed hash (HMAC)" in export files (plan 9.15, 12.3; the
+    setting's own help text). The shared export path hashed only the columns a `TableSpec` marks `ip=True`, while
+    client addresses also travel in other columns: the spam detector `subject` (`ip:<client>`), the Overview events
+    `detail`, and the audit log's `target`, `before_preview` and `after_preview` (a ban or an access list row holds
+    the address). Now every exported cell has its addresses replaced by `ip:<keyed hash>`
+    (`common.ExportBuilder`, `common.mask_ip_text`), and `export_include_ips` 1 still exports them raw.
 
 Why it exists
     Export files are designed to be copied off the server (shared with a helper, pasted into an AI assistant); the
@@ -21,7 +22,7 @@ How it works
     and searched for the raw address.
 
 What to read next
-    `roxy/admin/api/common.py` (`export_table`, `_private_items`, `export_ip_policy`),
+    `roxy/admin/api/common.py` (`ExportBuilder`, `mask_ip_text`, `export_ip_policy`),
     `roxy/admin/api/protection.py` (`SPAM_EVENTS_SPEC`), `roxy/admin/api/overview.py` (`EVENTS_SPEC`),
     `roxy/admin/api/audit.py` (`AUDIT_TABLE`), `roxy/admin/api/export.py` (`DATASETS`).
 """
@@ -29,8 +30,6 @@ What to read next
 from __future__ import annotations
 
 from typing import Any
-
-import pytest
 
 CLIENT_IP = "198.51.100.77"
 """A documentation address (RFC 5737) standing in for a caller."""
@@ -71,10 +70,6 @@ async def test_marked_ip_columns_are_hashed(api: Any, api_app: Any, metrics_seed
         assert CLIENT_IP not in response.text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding apisec-2: exports hash only ip=True columns; spam subject, event detail and audit rows leak IPs",
-)
 async def test_no_export_carries_a_raw_client_address_while_export_include_ips_is_off(
     api: Any, api_app: Any, metrics_seed: Any
 ) -> None:
@@ -94,3 +89,7 @@ async def test_no_export_carries_a_raw_client_address_while_export_include_ips_i
             if CLIENT_IP in response.text:
                 leaks.append(f"{label} ({fmt})")
     assert leaks == [], f"raw client address {CLIENT_IP} in: {', '.join(leaks)}"
+    await api_app.settings(export_include_ips=1)  # the owner's choice: raw addresses in every file
+    raw = await api.get("audit", params={"format": "csv"})
+    assert raw.status_code == 200
+    assert CLIENT_IP in raw.text

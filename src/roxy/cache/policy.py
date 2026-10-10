@@ -16,7 +16,9 @@ Why it exists
 How it works
     - Methods (parity row 57): GET (and HEAD, which runs as GET) always; POST per `cache_post_requests`: `off`,
       `allowlist` (the built-in read-only batch lookups of `config/defaults.py` plus cache rules that list POST),
-      or `all`; every other method never. A request that is not cacheable is `OFF`.
+      or `all`; every other method never. A request that is not cacheable is `OFF`. A POST that is `OFF` only
+      because of `cache_post_requests` is marked `key_when_off`: it keeps a key as its identity (request samples,
+      the dry run of a POST cache rule) although nothing is served or stored under it.
     - Rules (row 55): the most specific enabled rule that covers the method wins; rules shipped as defaults are
       skipped while `cache_default_rules_enabled` is 0. A rule's `ttl` replaces `cache_ttl_seconds` (0 means
       "never cache this endpoint"), `negative_ttl` replaces `cache_error_ttl_seconds`, and `stale_ttl` replaces
@@ -170,6 +172,11 @@ class RequestPolicy:
     stale_s: int = 0
     coalesce: bool = False
     """Use fleet single-flight. Off when nothing could be stored anyway (a rule with lifetime 0)."""
+    key_when_off: bool = False
+    """OFF only because `cache_post_requests` does not cover this POST. `CacheService.peek` still builds the key the
+    cache would use (with `rule`) as the request's identity, never to serve or store under: request samples carry
+    it, so the dry run and the TTL tuner can replay a POST cache rule (plan 6.2, 11.3, the 11.6 card; finding
+    insights-7)."""
 
     @property
     def stale_window_s(self) -> int:
@@ -237,7 +244,10 @@ def request_policy(
     rule = select_rule(rules, target, verb, cs.default_rules)
     if verb == "POST":
         if not post_allowed(target, rule, cs.post_mode):
-            return RequestPolicy(cacheable=False, off_reason="method", auth_class=auth_class)
+            # A setting away from cacheable: the key is still the request's identity (`key_when_off`).
+            return RequestPolicy(
+                cacheable=False, off_reason="method", auth_class=auth_class, rule=rule, key_when_off=True
+            )
     elif verb != "GET":
         return RequestPolicy(cacheable=False, off_reason="method", auth_class=auth_class)
     ttl = rule.ttl if rule is not None else cs.ttl_s

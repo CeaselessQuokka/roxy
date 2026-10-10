@@ -16,7 +16,9 @@ How it works
       thresholds but fixed choices the plan leaves open, each documented where it is defined.
     - Changes are scoped to one endpoint where the plan allows: a cache rule for that endpoint (`rule_upsert` on
       `rules_cache`, an update of the endpoint's own rule when it has one), an ignored parameter, a normalization
-      flag. Global settings (`cache_enabled`, `cache_max_bytes`, `cache_error_ttl_seconds`) are never `safe_auto`.
+      flag. A new rule names exactly that endpoint (the anchored regex of `simulate.template_match`), because a v1
+      glob would also cover every endpoint below it. Global settings (`cache_enabled`, `cache_max_bytes`,
+      `cache_error_ttl_seconds`) are never `safe_auto`.
     - New cache lifetimes come from the TTL tuner (`insights/simulate.py estimate_change_interval` over request
       samples, capped by `ttl_tuner_max_s`) or, without a measurement, the standard new-rule lifetime
       (`config/constants.py DEFAULT_CACHE_RULE_TTL`, 300 s; the `ttl_tuner_enabled` catalog text).
@@ -128,10 +130,12 @@ def dominant_method(methods: Mapping[Any, Mapping[str, Any]]) -> str:
 
 def rule_for(ctx: InsightContext, template: str, method: str = "GET") -> tuple[Any, Any]:
     """`(the rule the cache applies to this template and method, the rule whose pattern names exactly this
-    template or None)`. The second may be disabled; a second rule with the same pattern would be refused."""
+    template or None)`. The second is the exact pattern a recommendation writes (`simulate.template_match`), else
+    the v1 glob of the template (`simulate.names_template`); it may be disabled, and a second rule with the same
+    pattern would be refused."""
     covering = ctx.cache_rule_for(template, method)
-    pattern = simulate.template_pattern(template)
-    own = next((row for row in ctx.rules.cache_rules if row.pattern == pattern and row.type == "glob"), None)
+    named = [row for row in ctx.rules.cache_rules if simulate.names_template(row.pattern, row.type, template)]
+    own = next((row for row in named if row.type == "regex"), named[0] if named else None)
     return covering, own
 
 
@@ -176,14 +180,19 @@ def rule_change(template: str, own: Any, columns: Mapping[str, Any]) -> Proposed
 
 
 def new_rule(template: str, columns: Mapping[str, Any]) -> ProposedChange:
-    """A new `rules_cache` row for exactly this template (`origin` recommendation)."""
-    pattern = simulate.template_pattern(template)
+    """A new `rules_cache` row for exactly this template (`origin` recommendation).
+
+    Its pattern is the anchored regex of `simulate.template_match`, not the v1 glob: a glob also covers every path
+    below it, so a rule proposed from one endpoint's evidence would give its lifetime to sibling endpoints the
+    evidence never looked at (plan 11.2: a `safe_auto` change is scoped to one endpoint).
+    """
+    match = simulate.template_match(template)
     return ProposedChange(
         "rule_upsert",
         table="rules_cache",
-        match={"pattern": pattern, "type": "glob"},
+        match=dict(match),
         current=None,
-        proposed={"pattern": pattern, "type": "glob", **columns, "origin": "recommendation"},
+        proposed={**match, **columns, "origin": "recommendation"},
     )
 
 
@@ -1160,7 +1169,9 @@ class CacheNeg(Rule):
             and s.get("upstream_status") in statuses
             and str(s.get("egress") or "none") != "none"
         ]
-        replay = simulate.cache_replay(rows, ttl_s=ttl)
+        # Every row is an error answer, so only the error lifetime decides what the cache keeps (a 2xx lifetime is
+        # passed only because 0 would mean "never cache this endpoint").
+        replay = simulate.cache_replay(rows, ttl_s=ttl, negative_ttl_s=ttl)
         avoided = round(replay.avoided_calls * scale)
         return (
             f"About {avoided:,} of the {round(replay.requests * scale):,} repeated error calls of the last hour would "

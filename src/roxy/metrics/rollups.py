@@ -31,7 +31,9 @@ How it works
       where the last old day ended, so no hour is counted twice or lost; older rows keep their old zone (plan 6.4).
     - Client tables: each closed minute keeps its top `max_ip_activity_records` IPs and `max_caller_records`
       places, the rest summed into one `other` row (reusing `storage.retention.cap_client_rows`); only then are
-      minutes rolled into hours and hours into local days, each capped the same way.
+      minutes rolled into hours and hours into local days, each capped the same way. A third type, `pair`
+      (`PAIR_CLIENT_TYPE`, key `<ip>|<place>`), records which IP called as which place (v1's peer columns) and is
+      capped like the IPs.
 
 What to read next
     `roxy/metrics/histograms.py` (the merge function), `roxy/metrics/jobs.py` (the leader job that calls
@@ -203,12 +205,36 @@ def write_rollups(conn: sqlite3.Connection, deltas: list[RollupDelta]) -> None:
     )
 
 
+PAIR_CLIENT_TYPE = "pair"
+"""The third client type: one IP calling as one place (v1's peer columns "IPs" and "Places", finding parity-7).
+
+Pair rows live in the same client tables as `ip` and `place` rows, so the same batch upserts, compaction, top-N caps
+(`max_ip_activity_records` per bucket, the rest folded into `other`), retention and the "client activity" reset cover
+them; a peer count therefore never exceeds what the caps kept (a lower bound under a flood of pairs)."""
+PAIR_SEPARATOR = "|"
+"""Between the IP and the place in a pair key. A normalized address never holds it; a place id (caller text) may,
+so a key is split at the FIRST separator."""
+
+
+def pair_key(ip: str, place: str) -> str | None:
+    """The `pair` client key of one IP and one place, or None when either is missing or the IP holds the separator."""
+    if not ip or not place or PAIR_SEPARATOR in ip:
+        return None
+    return f"{ip}{PAIR_SEPARATOR}{place}"
+
+
+def split_pair(key: str) -> tuple[str, str] | None:
+    """(ip, place) of a pair key, or None for the folded `other` row or any malformed key."""
+    ip, sep, place = str(key).partition(PAIR_SEPARATOR)
+    return (ip, place) if sep and ip and place else None
+
+
 @dataclass(slots=True)
 class ClientDelta:
     """One client's activity in one minute, from one worker."""
 
     bucket_start: int
-    client_type: str  # "ip" or "place"
+    client_type: str  # "ip", "place" or "pair" (`PAIR_CLIENT_TYPE`)
     client_key: str
     requests: int = 0
     refused: int = 0

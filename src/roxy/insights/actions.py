@@ -14,16 +14,29 @@ How it works
     - Every change is validated before anything is written: settings with `catalog.validate_value` and, together,
       the cross-field rules; rule rows with their table's input model. A `manual` change cannot be applied.
     - Changes are applied one service call at a time (each call is one control.db transaction with its audit row
-      and its `config_version` bump). If a later change fails, the ones already applied are reverted in reverse
-      order (compensation), so the recommendation is applied completely or not at all. A single transaction across
-      both services needs transaction-composable service APIs; see the integrator requests in the P10 report.
+      and its `config_version` bump). If a later change fails, or the record of the apply cannot be written, the
+      ones already applied are reverted in reverse order (compensation), so the recommendation is applied
+      completely or not at all. A single transaction across both services needs transaction-composable service
+      APIs; see the integrator requests in the P10 report.
     - What was applied (each change's before and after, the settings history id or the rule key) is stored in the
       `recommendation_actions` row; `undo` reads it back. A setting is superseded when its newest history row is not
       the one the apply wrote; a rule row when it no longer equals what the apply wrote. Undo refuses (409) then.
     - State changes, the action row, the watch window row and the SSE event are one metrics.db transaction.
     - One action at a time per recommendation in the whole fleet: apply, undo, snooze and dismiss each hold the
       hot.db lease `insights:action:<id>` while they read the state and act, so two workers (or a click and the
-      auto-applier) can never apply the same recommendation twice; the second one gets 409 `conflict`.
+      auto-applier) can never apply the same recommendation twice; the second one gets `ActionError("busy")` (409).
+      A hot.db that cannot be written is not a busy lease: `SharedStateUnavailable` propagates (503 in the API, a
+      retry for the watch job; C7).
+    - Exactly what was judged is applied (plan 11.3, P4): `apply(expected_digest=)` compares the stored changes with
+      the digest the admin previewed (or the auto-applier judged) inside the lease, so an evaluation that rewrote
+      the proposal in between is refused (`ActionError("changed")`, 409 `changed_since_preview`).
+    - A list setting change (`host_add` and every `list[...]` setting) is applied as a delta: the items the rule
+      added to the list it saw are added to the live list and the items it dropped are removed, so an admin's later
+      edit of the list is never written over (plan 11.2: `host_add` "adds to `allowed_roblox_hosts`").
+    - With `auto=True` (D7) nothing is applied unless every live value still equals the `current` the rule judged
+      (a setting, a bucket's effective rate, a rule row's columns): the step guardrail was measured from it.
+    - With `fence` (a leader job's context) the lease is taken only while the leader lease is still this run's, and
+      every service write first proves it again with the fencing margin, so a deposed leader writes nothing (5.6).
 
 What to read next
     `roxy/insights/autoapply.py` (D7, which calls `apply` with `auto=True` and `undo` on a regression),
@@ -37,24 +50,28 @@ import json
 import logging
 import secrets
 import sqlite3
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from typing import Any, Final
+from typing import Any, Final, TypeVar
 
 from roxy.config import catalog
 from roxy.config.audit import Actor
 from roxy.config.settings_service import SettingsService, SettingsUpdateError, check_reason, service_for
+from roxy.config.spec import SettingType
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.insights.engine import InsightsEngine, publish, row_to_recommendation, write_recommendation
-from roxy.insights.models import DISMISS_REASONS, SNOOZE_DURATIONS_S, ProposedChange, Recommendation
+from roxy.insights.models import DISMISS_REASONS, SNOOZE_DURATIONS_S, ProposedChange, Recommendation, changes_digest
 from roxy.metrics import queries
 from roxy.metrics.queries import Window
 from roxy.rules.models import RULE_TABLES, row_to_input
 from roxy.rules.service import RulesError, RulesService
+from roxy.scheduler.leader import JobContext, LostLeadership
 from roxy.storage import leases
 from roxy.storage.db import SharedStateUnavailable
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 MAX_REASON_CHARS: Final = 500
 ACTION_LEASE_PREFIX: Final = "insights:action:"
@@ -62,9 +79,15 @@ ACTION_LEASE_TTL_MS: Final = 120_000
 """How long an action may hold its recommendation's lease (an apply is a few service writes; a holder that died
 frees it after this)."""
 BUSY_MESSAGE: Final = "Another request is changing this recommendation right now; reload it and try again."
+CHANGED_MESSAGE: Final = "This recommendation changed since you previewed it; review the new changes and apply again."
+"""`ActionError("changed")`: the stored changes are not the ones the caller judged (409 `changed_since_preview`)."""
 GUARD_METRICS: Final[tuple[str, ...]] = ("error_rate", "roblox_429_rate", "p95_ms", "refused_rate")
 """The guard metrics of plan 11.4, all "lower is better"."""
 _SETTING_KINDS: Final = frozenset({"setting", "host_add", "tarpit_category"})
+_LIST_TYPES: Final = frozenset({SettingType.LIST_STR, SettingType.LIST_INT, SettingType.LIST_CIDR})
+"""Setting types whose recommendation changes are applied as a delta against the live list (`list_delta`)."""
+_BOOKKEEPING_COLUMNS: Final = frozenset({"updated_at", "updated_by", "created_at", "created_by", "hits", "last_hit_at"})
+"""Rule row columns that change on their own (every write, every hit); never part of a comparison."""
 _DELETE_KINDS: Final = frozenset({"rule_delete", "filter_remove", "bypass_remove", "credential_allowlist_remove"})
 _TABLE_OF: Final[dict[str, str]] = {
     "bucket_override": "upstream_limits",
@@ -79,14 +102,67 @@ _TABLE_OF: Final[dict[str, str]] = {
 
 
 class ActionError(Exception):
-    """An action that cannot be done. `code` maps to the API status: not_found 404, conflict and superseded 409,
-    invalid 422, manual 422."""
+    """An action that cannot be done. `code` maps to the API status: `not_found` 404; `conflict` (the
+    recommendation's state does not allow it), `busy` (another holder has its action lease right now: worth a retry),
+    `changed` (not the changes the caller judged) and `superseded` (a value changed since) 409; `invalid` and
+    `manual` 422."""
 
     def __init__(self, code: str, message: str, fields: Mapping[str, str] | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.fields = dict(fields or {})
+
+
+def fenced(fence: JobContext | None) -> bool:
+    """Whether `fence` is a leader job's context whose writes must be fenced (an admin's request passes None; a
+    per-worker or test context has epoch 0)."""
+    return fence is not None and fence.epoch > 0
+
+
+async def still_leader(fence: JobContext | None) -> None:
+    """Raise `LostLeadership` unless `fence` still holds the leader lease with the fencing margin (plan 5.6).
+
+    Called right before each audited service write of a leader job: the services write control.db in their own
+    transactions, so (as for `JobContext.fenced_write` to a file other than hot.db) a takeover could only slip in
+    after this check if the run stalled longer than the margin. Not fenced: does nothing."""
+    if fence is None or not fenced(fence):
+        return
+    if fence.hot is None:
+        raise LostLeadership(f"job {fence.job_name or '?'}: this context has no leader lease to check")
+    await fence.hot.read(fence.assert_still_leader_with_margin)
+
+
+def list_delta(live: Any, seen: Sequence[Any], proposed: Sequence[Any]) -> list[Any]:
+    """A list setting change as a delta: the items the rule added to the list it `seen` are added to the `live`
+    list, the items it dropped are removed from it, and every other live item stays where it is (so an admin's
+    edit made after the evaluation survives; plan 11.2 `host_add` "adds to `allowed_roblox_hosts`")."""
+    added = [item for item in proposed if item not in seen]
+    removed = [item for item in seen if item not in proposed]
+    kept = [item for item in (live or []) if item not in removed]
+    return kept + [item for item in added if item not in kept]
+
+
+def same_value(live: Any, seen: Any) -> bool:
+    """Whether a live value still equals the value a rule saw (numbers by value, a list equal to its comma text)."""
+    if isinstance(live, int | float) and isinstance(seen, int | float):
+        return float(live) == float(seen)
+    if isinstance(live, list | tuple) and isinstance(seen, list | tuple):
+        return [str(v) for v in live] == [str(v) for v in seen]
+    if isinstance(live, list | tuple) and isinstance(seen, str):
+        return ",".join(str(v) for v in live) == seen
+    if isinstance(seen, list | tuple) and isinstance(live, str):
+        return ",".join(str(v) for v in seen) == live
+    return bool(live == seen)
+
+
+def effective_bucket(bucket_key: str | None, row: Mapping[str, Any] | None, snap: Mapping[str, Any]) -> dict[str, Any]:
+    """`{per_min, burst}` a `host:` or `endpoint:` bucket runs at: its `upstream_limits` row, else the catalog
+    default (the same reading as `InsightContext.bucket_limit`, which is what a rule's `current` shows)."""
+    if row is not None:
+        return {"per_min": row.get("per_min"), "burst": row.get("burst")}
+    kind = "endpoint" if str(bucket_key or "").startswith("endpoint:") else "host"
+    return {"per_min": snap.get(f"{kind}_bucket_default_per_min"), "burst": snap.get(f"{kind}_bucket_default_burst")}
 
 
 @dataclass(slots=True)
@@ -192,6 +268,11 @@ class RecommendationActions:
         rec = await self._get(rec_id)
         return await self._preview(rec)
 
+    async def preview_of(self, rec: Recommendation) -> list[PreviewItem]:
+        """The validated diff of a recommendation the caller already read (nothing is written), so a decision made
+        from the diff (high-risk confirmation, fresh second factor) is about exactly the changes the caller holds."""
+        return await self._preview(rec)
+
     async def _preview(self, rec: Recommendation) -> list[PreviewItem]:
         snap = self._snapshot()
         items: list[PreviewItem] = []
@@ -203,7 +284,7 @@ class RecommendationActions:
                 )
                 continue
             if change.kind in _SETTING_KINDS:
-                key, value = self._setting_target(change)
+                key, value = self._setting_target(change, snap)
                 item = PreviewItem(change.kind, f"setting:{key}", snap.get(key), value)
                 try:
                     settings_after[key] = catalog.validate_value(key, value)
@@ -237,38 +318,75 @@ class RecommendationActions:
     # ---- one action at a time ----
 
     @contextlib.asynccontextmanager
-    async def _exclusive(self, rec_id: str) -> AsyncIterator[None]:
-        """Hold the fleet-wide lease of one recommendation while an action reads its state and acts (C6)."""
+    async def _exclusive(self, rec_id: str, fence: JobContext | None = None) -> AsyncIterator[None]:
+        """Hold the fleet-wide lease of one recommendation while an action reads its state and acts (C6).
+
+        A lease another holder has is `ActionError("busy")`; a hot.db that cannot be written raises
+        `SharedStateUnavailable` (it is not "another request"; C7). With a leader job's `fence`, the lease is
+        granted only in a hot.db transaction that also proves the leader lease is still this run's (plan 5.6)."""
         name = f"{ACTION_LEASE_PREFIX}{rec_id}"[:200]
         holder = secrets.token_hex(8)
         now_ms = int(self.clock.now() * 1000)
-        try:
-            grant = await self.dbs.hot.write(
-                lambda conn: leases.acquire(conn, name, holder, ACTION_LEASE_TTL_MS, now_ms)
-            )
-        except SharedStateUnavailable as exc:
-            raise ActionError("conflict", BUSY_MESSAGE) from exc
+
+        def acquire(conn: sqlite3.Connection) -> Any:
+            if fence is not None and fenced(fence):
+                fence.assert_still_leader(conn)  # same transaction: no takeover between the check and the grant
+            return leases.acquire(conn, name, holder, ACTION_LEASE_TTL_MS, now_ms)
+
+        grant = await self.dbs.hot.write(acquire)
         if grant is None:
-            raise ActionError("conflict", BUSY_MESSAGE)
+            raise ActionError("busy", BUSY_MESSAGE)
         try:
             yield
         finally:
             with contextlib.suppress(SharedStateUnavailable):  # otherwise it expires after ACTION_LEASE_TTL_MS
                 await self.dbs.hot.write(lambda conn: leases.release(conn, name, holder, delete=True))
 
+    async def _write_metrics(self, fn: Callable[[sqlite3.Connection], T], fence: JobContext | None) -> T:
+        """One metrics.db write transaction, fenced when a leader job acts (it commits only while it still leads)."""
+        if fence is not None and fenced(fence):
+            return await fence.fenced_write(self.dbs.metrics, fn)
+        result: T = await self.dbs.metrics.write(fn)
+        return result
+
     # ---- apply ----
 
     async def apply(
-        self, rec_id: str, actor: Actor, reason: str = "", *, auto: bool = False, request_id: str | None = None
+        self,
+        rec_id: str,
+        actor: Actor,
+        reason: str = "",
+        *,
+        auto: bool = False,
+        request_id: str | None = None,
+        expected_digest: str | None = None,
+        fence: JobContext | None = None,
     ) -> ActionResult:
-        """Apply every change of an open recommendation, all or nothing (module docstring)."""
-        async with self._exclusive(rec_id):
-            return await self._apply(rec_id, actor, reason, auto=auto, request_id=request_id)
+        """Apply every change of an open recommendation, all or nothing (module docstring).
+
+        `expected_digest` is the `changes_digest` the caller judged (the admin's preview, the auto-applier's
+        guardrails); it is compared inside the lease, so exactly those changes are applied or `ActionError("changed")`
+        is raised. `auto` (D7) also refuses (`superseded`) when a live value is no longer the `current` the rule
+        judged. `fence` is the leader job's context: every write first proves the run still leads (plan 5.6)."""
+        async with self._exclusive(rec_id, fence):
+            return await self._apply(
+                rec_id, actor, reason, auto=auto, request_id=request_id, expected_digest=expected_digest, fence=fence
+            )
 
     async def _apply(
-        self, rec_id: str, actor: Actor, reason: str, *, auto: bool, request_id: str | None
+        self,
+        rec_id: str,
+        actor: Actor,
+        reason: str,
+        *,
+        auto: bool,
+        request_id: str | None,
+        expected_digest: str | None,
+        fence: JobContext | None,
     ) -> ActionResult:
         rec = await self._get(rec_id)
+        if expected_digest is not None and changes_digest(rec.changes) != expected_digest:
+            raise ActionError("changed", CHANGED_MESSAGE)
         if rec.state not in ("open", "snoozed"):
             raise ActionError("conflict", f"This recommendation is {rec.state}; only open ones can be applied")
         if any(change.kind == "manual" for change in rec.changes):
@@ -277,27 +395,25 @@ class RecommendationActions:
         invalid = {item.target: item.message for item in items if not item.valid}
         if invalid:
             raise ActionError("invalid", "A change is no longer valid; nothing was applied", invalid)
+        if auto:
+            snap = self._snapshot()
+            for change, item in zip(rec.changes, items, strict=False):
+                problem = self._stale_problem(change, item.before, snap)
+                if problem is not None:
+                    raise ActionError("superseded", problem)
         text = _reason(reason)
         note = f"recommendation:{rec.id}" + (f" {text}" if text else "")
         source = "auto_apply" if auto else f"recommendation:{rec.id}"
         now = self.clock.now()
         baseline_window = float(self._snapshot()["auto_apply_watch_minutes"]) * 60
         baseline = await self.dbs.metrics.read(lambda c: guard_metrics_sync(c, int(now - baseline_window), int(now)))
-        applied: list[AppliedChange] = []
-        try:
-            for change in rec.changes:
-                applied.append(await self._apply_one(change, actor, note, source, request_id))
-        except Exception as exc:
-            await self._compensate(applied, actor, f"rolled back: {note}"[:MAX_REASON_CHARS])
-            if isinstance(exc, (SettingsUpdateError, RulesError)):
-                raise ActionError("invalid", f"A change was refused; nothing was applied: {exc}") from exc
-            raise
         state = "auto_applied" if auto else "applied"
         action = "auto_apply" if auto else "apply"
-        details = {"changes": [a.to_dict() for a in applied], "reason": text, "baseline": baseline}
         watch_until = now + baseline_window
+        applied: list[AppliedChange] = []
 
         def write(conn: sqlite3.Connection) -> int:
+            details = {"changes": [a.to_dict() for a in applied], "reason": text, "baseline": baseline}
             action_id = _action_row(conn, rec.id, action, now, actor, details)
             rec.state, rec.updated_at = state, now
             write_recommendation(conn, rec)
@@ -311,15 +427,61 @@ class RecommendationActions:
             publish(conn, rec, action, now)
             return action_id
 
-        action_id = await self.dbs.metrics.write(write)
+        try:
+            for change in rec.changes:
+                await still_leader(fence)
+                applied.append(await self._apply_one(change, actor, note, source, request_id))
+            # The record is part of "all or nothing": changes nobody can see or undo must not stay applied.
+            action_id = await self._write_metrics(write, fence)
+        except Exception as exc:
+            # A fence failure compensates too: the action lease keeps this recommendation exclusive, and putting the
+            # before values back leaves nothing half applied for the new leader (or an admin) to trip over.
+            await self._compensate(applied, actor, f"rolled back: {note}"[:MAX_REASON_CHARS])
+            if isinstance(exc, (SettingsUpdateError, RulesError)):
+                raise ActionError("invalid", f"A change was refused; nothing was applied: {exc}") from exc
+            raise
         return ActionResult(rec, action, applied, action_id)
 
-    def _setting_target(self, change: ProposedChange) -> tuple[str, Any]:
+    def _stale_problem(self, change: ProposedChange, before: Any, snap: Mapping[str, Any]) -> str | None:
+        """Why the live value is no longer the `current` the rule judged (auto-apply only), or None.
+
+        `before` is what the preview found live: a setting's value, or the stored row (None when there is none).
+        The D7 step limit was measured from `current`, so a value an admin changed since must not be overwritten by
+        an unattended apply; the next evaluation proposes from the new value."""
+        stale = f"{change.target} changed since the recommendation was evaluated; it waits for a fresh evaluation"
+        if change.kind in _SETTING_KINDS:
+            return None if same_value(before, change.current) else stale
+        if change.kind == "bucket_override":
+            live = effective_bucket(change.bucket_key, before, snap)
+            seen = change.current if isinstance(change.current, Mapping) else {}
+            if not seen:
+                return None if before is None else stale
+            changed = any(not same_value(live.get(col), seen[col]) for col in ("per_min", "burst") if col in seen)
+            return stale if changed else None
+        if not isinstance(change.current, Mapping):
+            return None if before is None else stale  # the rule saw no row; one exists now
+        if before is None:
+            return stale  # the rule saw a row; it is gone
+        proposed = change.proposed if isinstance(change.proposed, Mapping) else {}
+        columns = (set(proposed) or set(change.current)) - _BOOKKEEPING_COLUMNS
+        for column in sorted(columns):
+            if column in change.current and column in before and not same_value(before[column], change.current[column]):
+                return stale
+        return None
+
+    def _setting_target(self, change: ProposedChange, snap: Mapping[str, Any]) -> tuple[str, Any]:
+        """The setting key a change writes and the value it writes there now (a list setting as a delta)."""
         if change.kind == "tarpit_category":
-            return f"tarpit_on_{change.category}", change.proposed
-        if change.kind == "host_add":
-            return str(change.key or "allowed_roblox_hosts"), change.proposed
-        return str(change.key), change.proposed
+            key, value = f"tarpit_on_{change.category}", change.proposed
+        elif change.kind == "host_add":
+            key, value = str(change.key or "allowed_roblox_hosts"), change.proposed
+        else:
+            key, value = str(change.key), change.proposed
+        spec = catalog.CATALOG.get(key)
+        listed = isinstance(change.current, list | tuple) and isinstance(value, list | tuple)
+        if spec is not None and spec.type in _LIST_TYPES and listed:
+            value = list_delta(snap.get(key), list(change.current), list(value))
+        return key, value
 
     @staticmethod
     def _table(change: ProposedChange) -> str:
@@ -372,7 +534,7 @@ class RecommendationActions:
         self, change: ProposedChange, actor: Actor, note: str, source: str, request_id: str | None
     ) -> AppliedChange:
         if change.kind in _SETTING_KINDS:
-            key, value = self._setting_target(change)
+            key, value = self._setting_target(change, self._snapshot())  # a list delta reads the live list now
             result = await self.settings_service.update({key: value}, actor, note, source, request_id=request_id)
             if not result.changes:
                 current = self._snapshot().get(key)
@@ -443,13 +605,22 @@ class RecommendationActions:
         *,
         auto: bool = False,
         result: Mapping[str, Any] | None = None,
+        fence: JobContext | None = None,
     ) -> ActionResult:
-        """Revert exactly what the last apply wrote (module docstring). `auto` marks an automatic rollback."""
-        async with self._exclusive(rec_id):
-            return await self._undo(rec_id, actor, reason, auto=auto, result=result)
+        """Revert exactly what the last apply wrote (module docstring). `auto` marks an automatic rollback; `fence`
+        is the leader job's context (the watch job): every write first proves the run still leads (plan 5.6)."""
+        async with self._exclusive(rec_id, fence):
+            return await self._undo(rec_id, actor, reason, auto=auto, result=result, fence=fence)
 
     async def _undo(
-        self, rec_id: str, actor: Actor, reason: str, *, auto: bool, result: Mapping[str, Any] | None
+        self,
+        rec_id: str,
+        actor: Actor,
+        reason: str,
+        *,
+        auto: bool,
+        result: Mapping[str, Any] | None,
+        fence: JobContext | None,
     ) -> ActionResult:
         rec = await self._get(rec_id)
         if rec.state not in ("applied", "auto_applied"):
@@ -473,6 +644,7 @@ class RecommendationActions:
         for item in applied:
             await self._check_not_superseded(item)
         for item in reversed(applied):
+            await still_leader(fence)
             await self._revert_one(item, actor, note)
         now = self.clock.now()
         action = "auto_rollback" if auto else "undo"
@@ -481,15 +653,18 @@ class RecommendationActions:
             action_id = _action_row(conn, rec.id, action, now, actor, {"reason": text, "result": dict(result or {})})
             rec.state, rec.updated_at = "rolled_back", now
             write_recommendation(conn, rec)
+            # A window still open ends here. One the watch job already closed keeps its verdict (kept, with what it
+            # measured); this later undo is in the action history. The watch job leaves a window open while the
+            # rollback only waits for this lease, so an admin's undo racing it cancels the window, never "kept".
             conn.execute(
                 "UPDATE recommendation_watches SET state = ?, result_json = ? WHERE recommendation_id = ? "
                 "AND state = 'watching'",
-                ("rolled_back" if auto else "canceled", json.dumps(dict(result or {})), rec.id),
+                ("rolled_back" if auto else "canceled", json.dumps(dict(result or {}), default=str), rec.id),
             )
             publish(conn, rec, action, now)
             return action_id
 
-        action_id = await self.dbs.metrics.write(write)
+        action_id = await self._write_metrics(write, fence)
         return ActionResult(rec, action, applied, action_id)
 
     async def _check_not_superseded(self, item: AppliedChange) -> None:
@@ -573,8 +748,7 @@ def _reason(text: str | None) -> str:
 
 def _comparable(row: Mapping[str, Any]) -> dict[str, Any]:
     """A rule row without its bookkeeping columns (updated_at and friends differ after every write)."""
-    skip = {"updated_at", "updated_by", "created_at", "created_by", "hits", "last_hit_at"}
-    return {k: v for k, v in row.items() if k not in skip}
+    return {k: v for k, v in row.items() if k not in _BOOKKEEPING_COLUMNS}
 
 
 def _action_row(
@@ -595,12 +769,19 @@ def load_recommendation(conn: sqlite3.Connection, rec_id: str) -> Recommendation
 
 
 __all__ = [
+    "BUSY_MESSAGE",
+    "CHANGED_MESSAGE",
     "GUARD_METRICS",
     "ActionError",
     "ActionResult",
     "AppliedChange",
     "PreviewItem",
     "RecommendationActions",
+    "effective_bucket",
+    "fenced",
     "guard_metrics_sync",
+    "list_delta",
     "load_recommendation",
+    "same_value",
+    "still_leader",
 ]

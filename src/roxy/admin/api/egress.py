@@ -79,7 +79,7 @@ EgressName = Literal["direct", "rotator", "credential"]
 TOP_SPEC: Final = TableSpec(
     name="egress_top_endpoints",
     columns=(
-        Column("template", "Endpoint", "The endpoint template."),
+        Column("template", "Endpoint", "The endpoint template.", caller_text=True),
         Column(
             "bytes", "Bytes", "Metered wire bytes (request, response, TLS and proxy overhead) in the range.", "bytes"
         ),

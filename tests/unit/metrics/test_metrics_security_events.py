@@ -24,6 +24,19 @@ def test_probe_signature(reason: str, signature: str, target: str) -> None:
     assert se.probe_signature(reason) == (signature, target)
 
 
+def test_a_client_error_signature_names_a_method_class_never_the_callers_token() -> None:
+    """Review round 4, finding secfix-7: the method is the caller's choice, so the signature names one of ten
+    classes and an unknown token goes to the target column (one signature, one event budget, for any flood)."""
+    assert se.probe_signature(se.client_error_reason(405, "POST", "/")) == ("HTTP 405 via POST", "/")  # as v1
+    signatures = set()
+    for token in ("XAA", "xab", "M3THOD", "AVERYLONGMETHODNAMEINDEED", "<b>", ""):
+        signature, target = se.probe_signature(se.client_error_reason(405, token, "/wp-login.php"))
+        signatures.add(signature)
+        assert target == f"{(token or '?')[: se.MAX_METHOD_CHARS]} /wp-login.php"
+    assert signatures == {"HTTP 405 via OTHER"}
+    assert {se.method_class(m) for m in se.METHOD_CLASSES} == set(se.METHOD_CLASSES)
+
+
 def test_probe_detail_redacts_attacker_text() -> None:
     signature, detail = se.probe_detail("198.51.100.1", 'Invalid URL: "a/?token=abcdef123"', "curl", "/a?b=1")
     assert signature == "Invalid URL"

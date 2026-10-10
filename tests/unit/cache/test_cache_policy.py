@@ -75,6 +75,34 @@ def test_post_modes() -> None:
     assert post_allowed(batch, None, "allowlist")
 
 
+def test_a_post_off_by_cache_post_requests_keeps_its_identity() -> None:
+    """Finding insights-7: a POST that only `cache_post_requests` keeps OFF is marked `key_when_off` (with the rule
+    the cache would use), so `CacheService.peek` still builds its key for request samples. Nothing else that is OFF
+    gets one: the cache switched off, another method, a `cache_private` credential endpoint."""
+    batch, other, third = "users.roblox.com/v1/users", "users.roblox.com/v1/something", "users.roblox.com/v1/third"
+    rule_rows = [{"pattern": other, "ttl": 30, "methods": ["GET", "POST"], "normalize_flags": ["casefold_path"]}]
+    rules = rules_snapshot(cache_rules=rule_rows)
+    for target, mode in ((batch, "off"), (other, "off"), (third, "allowlist")):
+        policy = request_policy("POST", target, {}, _cs(cache_post_requests=mode), rules)
+        assert not policy.cacheable
+        assert policy.off_reason == "method"
+        assert policy.key_when_off
+    with_rule = request_policy("POST", other, {}, _cs(cache_post_requests="off"), rules)
+    assert with_rule.rule is not None
+    assert with_rule.rule.ttl == 30  # its normalization flags shape the key exactly as for a cached request
+    assert not request_policy("POST", batch, {}, _cs(), rules).key_when_off  # cacheable: the ordinary key
+    assert not request_policy("POST", other, {}, _cs(), rules).key_when_off
+    assert not request_policy("PUT", batch, {}, _cs(cache_post_requests="all"), rules).key_when_off
+    assert not request_policy("POST", batch, {}, _cs(cache_enabled=0, cache_post_requests="off"), rules).key_when_off
+    private = rules_snapshot(
+        credential_allowlist=[{"pattern": batch, "methods": ["POST"], "cache_private": 1}], cache_rules=rule_rows
+    )
+    assert not request_policy("POST", batch, {}, _cs(cache_post_requests="off"), private).key_when_off
+    # An OFF policy never stores, whatever rule it carries.
+    off = request_policy("POST", other, {}, _cs(cache_post_requests="off"), rules)
+    assert store_decision(ok(), off, _cs()).kind is StoreKind.NONE
+
+
 def test_rule_selection_respects_methods_and_default_switch() -> None:
     rules = rules_snapshot(
         cache_rules=[

@@ -23,21 +23,30 @@ How it works
     - The trust rule. Outside the `untrusted` key a string is only ever one of Roxy's own words (a catalog key, an
       enum value, a rule table column, a string constant of the insights, health, rules, abuse and upstream source,
       the catalog's own text) or a token that cannot carry words (a number, a lowercase hex hash, an ISO time, a
-      ULID, a Roxy id). Every other string (paths, endpoint templates, User-Agents, place ids, error messages,
-      tracebacks, rule patterns, admin notes, recommendation titles, health findings) is stored once in `untrusted`
-      and referenced as `{"untrusted_ref": "u12"}`. Each untrusted entry is redacted, has its IP addresses hashed
-      (unless raw addresses are allowed), holds at most 200 characters and has its control characters escaped
+      hashed address, the fingerprint of a recommendation rule Roxy has). A shape with free letters is never a
+      token whatever it looks like: a caller picks its parameter names, so `DISABLE-LEAK-GUARD:0123456789abcdef`
+      (a fingerprint's shape) is outside text. Roxy's own identifiers (a ULID request id, `rec_<ulid>`) stand inline
+      only in the fields that hold one (`Scrubber.roxy_id`). Every other string (paths, endpoint templates,
+      User-Agents, place ids, parameter names, error messages, tracebacks, rule patterns, admin notes and setting
+      values, recommendation titles, health findings) is stored once in `untrusted` and referenced as
+      `{"untrusted_ref": "u12"}`. Each untrusted entry is redacted, has its IP addresses hashed (unless raw
+      addresses are allowed), holds at most 200 characters and has its control characters escaped
       (`roxy.health.report.escape_untrusted`, the same rule "Copy run for LLM" uses); a longer Roxy text that quotes
       outside strings (a recommendation's explanation) spans consecutive entries instead of being cut. Free-form
-      values (evidence details, rule rows, change values) go through `Scrubber.value`, which applies the rule to
-      every string and every dictionary key.
+      values (evidence details, rule rows, change values, setting values) go through `Scrubber.value`, which applies
+      the rule to every string and every dictionary key.
     - Secrets: the credential appears as `{present, status, set_at}`, the rotator as its host name only, sensitive
       settings as `[redacted]`; workers are named by pid (a host name can carry the server's address).
     - IP addresses are a keyed hash (`common.export_ip_policy`, plan 9.15) unless `export_include_ips` is 1; the
       API never shows raw addresses in the summary detail.
     - Bounds (plan P9): every list has a cap per detail level (`LIMITS`), the untrusted pool too; reads go through
-      the read models on reader threads; the code scan (cached per release), the cleaning of the untrusted
-      entries, the final validation and the serialization run on worker threads, off the event loop.
+      the read models on reader threads; the code scan (cached per release), the cleaning and splitting of every
+      untrusted text, the final validation and the serialization run on worker threads, off the event loop, and the
+      recommendations are shaped in batches with a yield between them (`YIELD_EVERY`).
+    - Bot scores (plan 10.7): `top_clients.ips[].bot_score` is the score the abuse producers recorded for that
+      address (`metrics/read_producers.py client_scores`, the largest of its latest recorded hour in the last
+      `SCORE_WINDOW_S`), read through the insights providers the rules use, or from metrics.db when the build has
+      none; null when the address has no recorded score. Places have no score.
 
 What to read next
     `roxy/admin/api/export_llm.py` (the route), `roxy/health/report.py` (Copy run for LLM), `roxy/core/redact.py`,
@@ -59,13 +68,14 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -81,7 +91,7 @@ from roxy.config import catalog, read_changes
 from roxy.config.audit import ACTOR_KINDS
 from roxy.config.insight_params import INSIGHT_RULES
 from roxy.config.runtime import thaw
-from roxy.core import reasons
+from roxy.core import ipmask, reasons
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.core.redact import masked_url, redact_text
 from roxy.egress import read_credential
@@ -91,7 +101,8 @@ from roxy.health import checks as health_checks
 from roxy.health import store as health_store
 from roxy.health.report import LLM_INSTRUCTIONS, UNTRUSTED_MAX_CHARS, escape_untrusted
 from roxy.insights import models
-from roxy.metrics import queries, read_clients, read_history, read_security, read_upstream
+from roxy.insights.context import SCORE_WINDOW_S
+from roxy.metrics import queries, read_clients, read_history, read_producers, read_security, read_upstream
 from roxy.metrics.queries import Page
 from roxy.rules.match import regex_budget
 from roxy.rules.models import ACCESS_LIST_CAPS, RULE_TABLES
@@ -133,6 +144,11 @@ MAX_TRACEBACK_FRAMES: Final = 20
 MAX_TRACEBACK_LINES: Final = 60
 MAX_CONCURRENT_BUILDS: Final = 2
 """Exports built at once per worker; the API answers 429 beyond it (an export reads every table)."""
+SCORE_HOURS_READ: Final = SCORE_WINDOW_S // 3600 + 1
+"""Hour rows read per listed address for its bot score (one row per address and hour, `client_score_hour`)."""
+YIELD_EVERY: Final = 20
+"""Recommendations shaped between two yields to the event loop (each is a few dozen small dicts; the texts wait for
+the worker thread), so even the 200 of a full export never hold the loop in one piece."""
 
 FILE_NAME: Final = "roxy-llm-export.json"
 DATED_PREFIX: Final = "roxy-llm-export-"
@@ -459,6 +475,10 @@ class TopEndpoints(_Model):
 
 
 class ClientRow(_Model):
+    """One of the top places or addresses of the window. `bot_score` (addresses only) is the plan 10.7 score the
+    abuse producers recorded for the address, 0 to 100 (higher looks more automated): the largest of its latest
+    recorded hour in the last 25 hours. It is null when no score is recorded for the address, and for a place."""
+
     client: Tok
     requests: int
     refused: int
@@ -470,7 +490,7 @@ class ClientRow(_Model):
     rate60: float | None
     top_endpoint: UntrustedRef | None
     user_agent: UntrustedRef | None
-    bot_score: float | None
+    bot_score: Annotated[float, Field(ge=0, le=100)] | None
 
 
 class UserAgentRow(_Model):
@@ -773,15 +793,27 @@ _TOKEN_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
     re.compile(pattern)
     for pattern in (
         r"-?[0-9]{1,20}(?:\.[0-9]{1,12})?",  # a number written as text
-        r"[0-9a-f]{8,64}",  # a hash or fingerprint (lowercase hex)
+        r"[0-9a-f]{8,64}",  # a hash or fingerprint (lowercase hex: the letters a to f spell no instruction)
         r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",  # an ISO time
-        r"[0-9A-HJKMNP-TV-Z]{26}",  # a ULID (request ids)
-        r"[a-z]{2,8}_[0-9A-HJKMNP-TV-Z]{26}",  # a Roxy id such as rec_<ulid>
-        r"[A-Z][A-Z0-9-]{1,40}:[0-9a-f]{16}",  # a recommendation fingerprint
         r"ip:[0-9a-f]{16}",  # a hashed IP address
     )
 )
-"""Tokens that cannot carry words, so they may stand outside `untrusted` whatever their source."""
+"""Tokens that cannot carry words, so they may stand outside `untrusted` whatever their source.
+
+A shape with free letters is never one of them: `DISABLE-LEAK-GUARD:0123456789abcdef` has the shape of a
+recommendation fingerprint and `01KBYPASSTHEGATEANDSENDKEY0` the shape of a ULID, and a caller chooses its query
+parameter names, paths and header values. A fingerprint is trusted only when its rule id part is a rule Roxy has
+(`_FINGERPRINT_RE`, `INSIGHT_RULES`), and Roxy's own identifiers (ULIDs, `rec_<ulid>`) only in the fields that hold
+an identifier Roxy generated (`is_roxy_id`, `Scrubber.roxy_id`)."""
+
+_FINGERPRINT_RE: Final = re.compile(r"([A-Z][A-Z0-9-]{1,40}):[0-9a-f]{16}")
+"""A recommendation fingerprint (`<rule id>:<sha256(subject)[:16]>`, DESIGN 14.3)."""
+_RULE_IDS: Final[frozenset[str]] = frozenset(INSIGHT_RULES)
+_ULID: Final = r"[0-7][0-9A-HJKMNP-TV-Z]{25}"
+"""A ULID (`core/ids.py`): 48 bits of time (so the first character is 0 to 7) and 80 random bits, Crockford base32."""
+ROXY_ID_PREFIXES: Final[tuple[str, ...]] = ("rec",)
+"""Type prefixes of `core/ids.py new_id` that reach the export (`rec_<ulid>`, a recommendation)."""
+_ROXY_ID_RE: Final = re.compile(rf"(?:(?:{'|'.join(ROXY_ID_PREFIXES)})_)?{_ULID}")
 
 _HARVEST: Final[tuple[str, ...]] = (
     "insights/",
@@ -798,45 +830,36 @@ _HARVEST: Final[tuple[str, ...]] = (
 )
 """Source whose string constants count as Roxy's own words (evidence names, units, detail keys, enum values)."""
 
-_IPV4_RE: Final = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
-_IPV6_RUN_RE: Final = re.compile(r"[0-9A-Fa-f:]{2,39}")
-
 
 def is_trusted(text: str, vocabulary: frozenset[str]) -> bool:
-    """Whether `text` may stand outside `untrusted`: one of Roxy's own words, or a token that cannot carry words."""
+    """Whether `text` may stand outside `untrusted`: one of Roxy's own words, or a token that cannot carry words
+    (`_TOKEN_PATTERNS`, or the fingerprint of a recommendation rule Roxy has)."""
     if text == "" or text in vocabulary:
         return True  # equal to one of Roxy's own words, so it is Roxy's text whoever sent it
     if len(text) > MAX_TOKEN_CHARS:
         return False
-    return any(pattern.fullmatch(text) for pattern in _TOKEN_PATTERNS)
+    if any(pattern.fullmatch(text) for pattern in _TOKEN_PATTERNS):
+        return True
+    found = _FINGERPRINT_RE.fullmatch(text)
+    return found is not None and found.group(1) in _RULE_IDS  # the only letters are a rule id of Roxy's
+
+
+def is_roxy_id(text: str) -> bool:
+    """Whether `text` has the shape of an identifier Roxy generates (a ULID, or `rec_<ulid>`). The shape alone is
+    no proof (a ULID's random part can spell words), so only fields that hold an id Roxy made use it."""
+    return bool(_ROXY_ID_RE.fullmatch(text))
 
 
 def mask_ips(text: str, hasher: IpHasher | None) -> str:
-    """`text` with every IPv4 and IPv6 address replaced by `ip:<keyed hash>` (unchanged when `hasher` is None)."""
+    """`text` with every IPv4 and IPv6 address replaced by `ip:<keyed hash>` (unchanged when `hasher` is None).
+
+    The same masker as the admin API's downloads (`core/ipmask.py`): an IPv6 client network written the way Roxy
+    writes it, `ip:2001:db8:1:2::/64`, is found after its word and keeps its `::` (review round 4, finding
+    secfix-3: this copy used to strip the trailing `::` with the leading colon and leave the network raw), and an
+    `ip:` already in front stays one."""
     if hasher is None or not text:
         return text
-
-    def v4(match: re.Match[str]) -> str:
-        candidate = match.group(0)
-        try:
-            ipaddress.IPv4Address(candidate)
-        except ValueError:
-            return candidate
-        return f"ip:{hasher(candidate)}"
-
-    def v6(match: re.Match[str]) -> str:
-        candidate = match.group(0)
-        if candidate.count(":") < 2:
-            return candidate
-        for core in (candidate, candidate.strip(":")):
-            try:
-                ipaddress.IPv6Address(core)
-            except ValueError:
-                continue
-            return candidate.replace(core, f"ip:{hasher(core)}", 1)
-        return candidate
-
-    return _IPV6_RUN_RE.sub(v6, _IPV4_RE.sub(v4, text))
+    return ipmask.mask_ip_text(text, hasher)
 
 
 @dataclass(slots=True)
@@ -849,12 +872,27 @@ class _Entry:
     truncated: bool | None  # None: decided when the text is cleaned
 
 
+@dataclass(slots=True)
+class _Span:
+    """A longer text `refs` was given: split into entries once it is cleaned, in `materialize`."""
+
+    kind: str
+    text: str  # raw, bounded to MAX_SOURCE_CHARS
+    length: int
+    max_chunks: int
+    slots: int  # entries held for it in the pool's limit until it is split (its estimated piece count)
+    refs: list[dict[str, str]]  # the list `refs` returned, filled in place when the span is split
+
+
 class UntrustedPool:
     """Collects outside strings for `untrusted` and hands back references (equal texts share one entry).
 
-    `ref` only reserves an id: the redaction, IP hashing and escaping of the text run in `materialize`, which the
-    export calls on a worker thread, so thousands of entries never hold the event loop. `refs` cleans at once (it
-    must split the cleaned text; it is used for a few long texts only).
+    Nothing is cleaned while the export is built on the event loop: `ref` only reserves an id, and `refs` (a longer
+    text spanning several entries) returns a list that stays empty until the text is cleaned and split. The
+    redaction, IP hashing, splitting and escaping all run in `materialize`, which the export calls on a worker
+    thread (`finalize`), so thousands of entries and long texts never hold the event loop (plan 6.7, mpjobs-6).
+    A pending span holds its estimated number of entries against the limit from the moment `refs` is called, so
+    when the pool fills up, what comes first in the document keeps its entries, as when spans were split at once.
     """
 
     def __init__(self, limit: int, ip_hasher: IpHasher | None) -> None:
@@ -863,6 +901,8 @@ class UntrustedPool:
         self.omitted = 0
         self._entries: list[_Entry] = []
         self._index: dict[tuple[str, str, bool], str] = {}
+        self._spans: list[_Span] = []
+        self._held = 0  # entries pending spans hold (sum of their `slots`)
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -871,12 +911,15 @@ class UntrustedPool:
         # Addresses are hashed and secrets removed BEFORE the text is cut, so a cut can never split one in half.
         return redact_text(mask_ips(text[:MAX_SOURCE_CHARS], self.ip_hasher))
 
+    def _full(self) -> bool:
+        return len(self._entries) + self._held >= self.limit
+
     def _reserve(self, kind: str, text: str, length: int, cleaned: bool, truncated: bool | None) -> dict[str, str]:
         key = (kind, text, cleaned)
         found = self._index.get(key)
         if found is not None:
             return {"untrusted_ref": found}
-        if len(self._entries) >= self.limit:
+        if self._full():
             self.omitted += 1
             return {"untrusted_ref": "omitted"}
         ident = f"u{len(self._entries) + 1}"
@@ -891,19 +934,47 @@ class UntrustedPool:
 
     def refs(self, value: Any, kind: str = "text", max_chunks: int = 20) -> list[dict[str, str]]:
         """A longer Roxy text that quotes outside strings (a recommendation's explanation, a health finding), as
-        consecutive entries of at most 200 characters each, so nothing is lost and no entry is longer."""
+        consecutive entries of at most 200 characters each, so nothing is lost and no entry is longer.
+
+        The returned list is filled by `materialize` (the text must be cleaned before it is split, and cleaning
+        waits for the worker thread); hold on to the list itself, never to a copy of it.
+        """
         text = value if isinstance(value, str) else str(value)
-        clean = self._clean(text)
-        if not clean:
+        if not text:
             return []
+        if self._full():
+            self.omitted += 1
+            return [{"untrusted_ref": "omitted"}]
+        bounded = text[:MAX_SOURCE_CHARS]
+        chunks = max(1, int(max_chunks))
+        slots = min(chunks, math.ceil(len(bounded) / UNTRUSTED_MAX_CHARS))  # cleaning changes the length a little
+        holder: list[dict[str, str]] = []
+        self._spans.append(_Span(kind, bounded, len(text), chunks, slots, holder))
+        self._held += slots
+        return holder
+
+    def _split_spans(self) -> None:
+        """Clean every pending `refs` text, split it into entries and fill the list `refs` returned (once), in the
+        order `refs` was called; each span gives its held slots back just before its pieces are reserved."""
+        spans, self._spans = self._spans, []
         size = UNTRUSTED_MAX_CHARS
-        pieces = [clean[start : start + size] for start in range(0, len(clean), size)]
-        kept = pieces[: max(1, max_chunks)]
-        cut = len(kept) < len(pieces) or len(text) > MAX_SOURCE_CHARS
-        return [self._reserve(kind, piece, len(text), True, cut and i == len(kept) - 1) for i, piece in enumerate(kept)]
+        for span in spans:
+            self._held -= span.slots
+            clean = self._clean(span.text)
+            if not clean:
+                continue
+            pieces = [clean[start : start + size] for start in range(0, len(clean), size)]
+            kept = pieces[: span.max_chunks]
+            cut = len(kept) < len(pieces) or span.length > MAX_SOURCE_CHARS
+            span.refs.extend(
+                self._reserve(span.kind, piece, span.length, True, cut and i == len(kept) - 1)
+                for i, piece in enumerate(kept)
+            )
 
     def materialize(self) -> list[dict[str, Any]]:
-        """The `untrusted` list: every entry redacted, IP addresses hashed, cut to 200 characters, escaped."""
+        """The `untrusted` list: every entry redacted, IP addresses hashed, cut to 200 characters, escaped (the
+        pending `refs` texts are split first). CPU work: call it on a worker thread."""
+        self._split_spans()
         out: list[dict[str, Any]] = []
         for entry in self._entries:
             clean = entry.text if entry.cleaned else self._clean(entry.text)
@@ -946,7 +1017,8 @@ class Scrubber:
         return self.pool.ref(value, kind)
 
     def refs(self, value: Any, kind: str) -> list[dict[str, str]]:
-        """Consecutive references of at most 200 characters each (an empty value gives an empty list)."""
+        """Consecutive references of at most 200 characters each (an empty value gives an empty list), filled when
+        the pool is materialized (`UntrustedPool.refs`)."""
         if value is None or value == "":
             return []
         return self.pool.refs(value, kind, MAX_TEXT_CHUNKS)
@@ -960,6 +1032,17 @@ class Scrubber:
         if value is None:
             return None
         return self.token(value, kind)
+
+    def roxy_id(self, value: Any, kind: str = "id") -> Any:
+        """An identifier Roxy generated itself (a recommendation id, a request id) inline when it has that shape,
+        else a reference. Only for fields Roxy fills with its own ids: never for free-form or caller-derived text."""
+        text = value if isinstance(value, str) else str(value)
+        return text if is_roxy_id(text) else self.pool.ref(text, kind)
+
+    def opt_roxy_id(self, value: Any, kind: str = "id") -> Any:
+        if value is None or value == "":
+            return None
+        return self.roxy_id(value, kind)
 
     def value(self, value: Any, kind: str = "value", depth: int = 0) -> Any:
         """A JSON-shaped copy of `value` with every string (keys included) under the trust rule, bounded."""
@@ -1303,6 +1386,12 @@ def _opt_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _score(value: Any) -> float | None:
+    """A bot score kept inside its 0 to 100 range (plan 10.7), or None."""
+    number = _opt_float(value)
+    return None if number is None else min(100.0, max(0.0, number))
+
+
 def actor_kind(label: Any) -> str | None:
     """`admin:alice` gives `admin`: the export names the kind of actor, never a person or an address."""
     if label is None:
@@ -1423,10 +1512,14 @@ class _Build:
         colors = Counter(_safe_word(row.get("color"), r"[a-z]{1,16}") for row in fresh)
         uptimes = [_int(row.get("uptime_s")) for row in fresh]
         notes = [
-            "Every string that came from outside Roxy (paths, endpoint templates, User-Agents, place ids, error "
-            "messages, rule patterns, admin text, recommendation titles) is under untrusted and referenced by id.",
+            "Every string that came from outside Roxy (paths, endpoint templates, parameter names, User-Agents, place "
+            "ids, error messages, rule patterns, admin text and setting values, recommendation titles) is under "
+            "untrusted and referenced by id, whatever its shape.",
             "Counts in top_clients.user_agents and in errors.count are all time; every other table covers the window.",
             "top_clients.ips[].user_agent is the newest User-Agent of that address in the last 15 minutes (Live rows).",
+            "top_clients.ips[].bot_score is the bot score (0 to 100, higher looks more automated) recorded for that "
+            "address, the largest of its latest hour in the last 25 hours; null when none is recorded. Places have "
+            "no score.",
             "capacity.metrics_pipeline holds the counters of the worker that built this export only.",
         ]
         if self.ip_mode == "raw":
@@ -1642,7 +1735,7 @@ class _Build:
                 }
             )
         return {
-            "id": scrub.token(rec.id, "id"),
+            "id": scrub.roxy_id(rec.id, "id"),
             "rule_id": scrub.token(rec.rule_id, "rule_id"),
             "family": scrub.token(rec.family, "family"),
             "fingerprint": scrub.token(rec.fingerprint, "fingerprint"),
@@ -1694,7 +1787,12 @@ class _Build:
         recent.sort(
             key=lambda r: (r.state not in ("open", "snoozed"), -models.severity_rank(r.severity), -(r.updated_at or 0))
         )
-        return [self._recommendation(rec) for rec in recent[: self.limits.recommendations]]
+        out: list[dict[str, Any]] = []
+        for index, rec in enumerate(recent[: self.limits.recommendations]):
+            if index and index % YIELD_EVERY == 0:
+                await asyncio.sleep(0)  # let the worker serve its requests between batches (plan 6.7)
+            out.append(self._recommendation(rec))
+        return out
 
     # ---- open issues ----
 
@@ -1915,28 +2013,46 @@ class _Build:
             "rate60": _opt_float(row.get("rate60")),
             "top_endpoint": self.scrub.opt_ref(row.get("top_endpoint"), "endpoint"),
             "user_agent": self.scrub.opt_ref(agent.get("user_agent"), "user_agent"),
-            "bot_score": _opt_float(scores.get(key)) if kind == "ip" else None,
+            "bot_score": _score(scores.get(key)) if kind == "ip" else None,
         }
+
+    def _recorded_scores(self, conn: Any, keys: Sequence[str]) -> dict[str, float]:
+        """The recorded bot score of each listed address (`ClientRow.bot_score`), on the reader thread: one indexed
+        read per address (at most `LIMITS.top_clients`), the largest score of its latest hour in the window the
+        rules use (`insights.context.SCORE_WINDOW_S`). An address without a row is left out (null)."""
+        since = int(self.now) - SCORE_WINDOW_S
+        out: dict[str, float] = {}
+        with contextlib.suppress(sqlite3.Error):  # a database without the producer tables yet: no scores
+            for key in keys:
+                if key:
+                    hours = read_producers.client_score_history(conn, key, since, limit=SCORE_HOURS_READ)
+                    if hours:
+                        out[key] = float(hours[-1]["score_max"])
+        return out
 
     async def top_clients(self) -> dict[str, Any]:
         size = self.limits.top_clients
         ua_limit = self.limits.user_agents
 
-        def read(conn: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], Any]:
+        def read(
+            conn: Any,
+        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], Any, dict[str, float]]:
             page = Page(size=size, sort="requests")
             places = queries.client_table_sync(conn, self.win, "place", now=self.now, page=page)["rows"]
             ips = queries.client_table_sync(conn, self.win, "ip", now=self.now, page=page)["rows"]
             agents = read_security.user_agents(conn, limit=ua_limit)["rows"]
+            keys = [str(row.get("key") or "") for row in ips[:size]]
             # The newest User-Agent of each address, from the Live rows of the last 15 minutes.
-            latest = read_clients.latest_user_agents(conn, [str(row.get("key") or "") for row in ips[:size]])
-            return places, ips, agents, latest
+            latest = read_clients.latest_user_agents(conn, keys)
+            return places, ips, agents, latest, self._recorded_scores(conn, keys)
 
-        places, ips, agents, latest = await self.metrics(read)
-        scores: Mapping[str, float] = {}
+        places, ips, agents, latest, recorded = await self.metrics(read)
+        scores: dict[str, float] = dict(recorded)
         providers = self.sources.providers or getattr(self.sources.engine, "providers", None)
         if providers is not None:
+            # The rules' own view wins (the same table in production; a fixture's scores in the insights tests).
             with contextlib.suppress(Exception):
-                scores = await providers.client_scores() or {}
+                scores.update(await providers.client_scores() or {})
         return {
             "places": [self._client(row, "place", scores) for row in places[:size]],
             "ips": [self._client(row, "ip", scores, latest) for row in ips[:size]],
@@ -2019,7 +2135,7 @@ class _Build:
                     "egress": self.scrub.token(row.get("egress") or "", "egress"),
                     "retry_after_s": _opt_float(row.get("retry_after_s")),
                     "ratelimit_headers": headers,
-                    "request_id": self.scrub.opt_token(row.get("request_id"), "request_id"),
+                    "request_id": self.scrub.opt_roxy_id(row.get("request_id"), "request_id"),
                 }
             )
         return out
@@ -2324,17 +2440,20 @@ class _Build:
             value = self.snap[key]
             why = spec.is_high_risk_value(value)
             if why:
-                issues.append({"kind": "setting_high_risk", "subject": key, "message": why, "value": thaw(value)})
+                # An admin may have typed the value (a URL, a message): the trust rule applies, as in `config`.
+                shown = self.scrub.value(thaw(value), "setting_value")
+                issues.append({"kind": "setting_high_risk", "subject": key, "message": why, "value": shown})
                 self.mention(key, "potential_issue")
                 continue
             near = _near_risky(spec, value)
             if near is not None:
+                # `_near_risky` answers only for a number, so the message quotes no text.
                 issues.append(
                     {
                         "kind": "setting_near_risky",
                         "subject": key,
                         "message": f"{key} is {value}, within 10 percent of the risky value {near[0]}: {near[1]}",
-                        "value": thaw(value),
+                        "value": self.scrub.value(thaw(value), "setting_value"),
                     }
                 )
                 self.mention(key, "potential_issue")
@@ -2375,7 +2494,7 @@ class _Build:
                     "subject": self.scrub.token(rec.rule_id, "rule_id"),
                     "message": "An admin dismissed this recommendation as not accurate: the rule may have a bug.",
                     "value": {
-                        "id": self.scrub.token(rec.id, "id"),
+                        "id": self.scrub.roxy_id(rec.id, "id"),
                         "subject": self.scrub.ref(rec.subject, "recommendation_subject"),
                     },
                 }

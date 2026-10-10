@@ -20,10 +20,14 @@ Why it exists
     "Roblox is rate limiting us" (act now) from "Roxy is rate limiting callers" (the system working).
 
 How it works
-    Thin over `metrics/queries.py` (series, totals, top N) and `metrics/read_dashboard.py` (two-dimension counts,
-    the heatmap fold, sparkline windows). Roblox 429s always come from the `upstream_429` log, counted once per
-    upstream attempt, never from caller status codes. Tables page and sort on the server and export as CSV or JSON
-    through the shared `export_table` (audited, formula guarded).
+    Thin over `metrics/queries.py` (series, totals, top N, `answer_source_counts`) and `metrics/read_dashboard.py`
+    (the heatmap fold, sparkline windows). Roblox 429s always come from the `upstream_429` log, counted once per
+    upstream attempt, never from caller status codes. "Who returned it?" reads the source through
+    `queries.ANSWER_SOURCE_SQL`: a Roblox 5xx passed on after the retries (`upstream_5xx`) carries Roblox's status
+    and Roxy's text, so it counts as Roblox's (`relay`), in the table, the source series and the `roblox_5xx` and
+    `roxy_5xx` tiles alike (finding parity-1). A series' reset notices name only resets of the data it reads
+    (`queries.reset_touches`, plan 6.8). Tables page and sort on the server and export as CSV or JSON through the
+    shared `export_table` (audited, formula guarded).
 
 What to read next
     `roxy/admin/api/common.py`, `roxy/metrics/queries.py`, `roxy/admin/api/endpoints.py`.
@@ -48,7 +52,7 @@ from roxy.admin.api.common import (
     TimeRangeDep,
     annotation_entries,
     area_router,
-    collect_pages,
+    export_pages,
     export_table,
     page_rows,
     range_info,
@@ -109,7 +113,11 @@ TREND_PERIODS: Final[tuple[tuple[str, str, str], ...]] = (
 
 SOURCE_LABELS: Final[dict[str, tuple[str, str]]] = {
     "roblox": ("Roblox to caller", "Roblox's own answer, passed to the caller as it came."),
-    "relay": ("Roblox to caller (relayed)", "Roblox's answer passed to the caller after Roxy reformatted it."),
+    "relay": (
+        "Roblox to caller (relayed)",
+        "Roblox's answer passed to the caller after Roxy reformatted it: pretty printed, the browser view, or a "
+        "Roblox server error passed on with Roxy's retry text after the allowed retries.",
+    ),
     "roxy": ("Roxy (its own answers)", "Statuses Roxy produced: refusals, its own errors, pause, limits."),
     "cache": ("Cache to caller", "Answers from Roxy's cache: Roblox never saw these requests."),
     "internal": ("Roxy's own calls", "Roxy's own probes and lookups, not caller traffic."),
@@ -164,8 +172,16 @@ async def _series_answer(
     group_by: str | None = None,
     labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """A section 13 series answer for `metrics` (optionally grouped), with comparison, annotations and notices."""
+    """A section 13 series answer for `metrics` (optionally grouped), with comparison, annotations and notices.
+
+    The plan 6.8 notices name only resets of what the metrics read (`queries.kpi_tables`: the rollups, plus the
+    429 log or the egress usage for the metrics that read those), so clearing the login history never marks a
+    traffic chart as partial.
+    """
     db = ctx.dbs.metrics
+    tables = {name for metric in metrics for name in queries.kpi_tables(metric)}
+    latency = any(metric in LATENCY_METRICS for metric in metrics)
+    cache = any(metric in queries.CACHE_STATE_KPIS for metric in metrics)
     kwargs: dict[str, Any] = {"metrics": list(metrics)}
     if group_by:
         kwargs.update(group_by=group_by, max_groups=MAX_SERIES_GROUPS)
@@ -187,12 +203,13 @@ async def _series_answer(
         return queries.chart_annotations(conn, start, end), queries.reset_annotations(conn, start, end)
 
     annotations, resets = await db.read(marks)
+    touching = [row for row in resets if queries.reset_touches(row, tables, latency=latency, cache=cache)]
     return series_answer(
         tr,
         series,
         compare_series=compare_series,
         annotations=annotation_entries(annotations),
-        notices=reset_notices(resets, tz=tr.window.tz),
+        notices=reset_notices(touching, tz=tr.window.tz),
     )
 
 
@@ -257,8 +274,7 @@ async def _dimension_table(
             data = await queries.top_n(db, tr.window, dimension, page=replace(tq.metrics_page(), page=page, size=size))
             return list(data["rows"]), int(data["total"])
 
-        rows, total = await collect_pages(fetch)
-        return await export_table(request, admin, spec, rows, fmt, total=total, tq=tq, tr=tr)
+        return await export_pages(request, admin, spec, fetch, fmt, tq=tq, tr=tr)
     data = await queries.top_n(db, tr.window, dimension, page=tq.metrics_page())
     return table_from_read_model(spec, tq, data)
 
@@ -282,13 +298,13 @@ async def traffic_status(
     tr: TimeRangeDep,
     view: Annotated[str, Query(max_length=16)] = "class",
 ) -> dict[str, Any]:
-    """Status classes over time (`view=class`, with Roxy's and Roblox's 429s), or requests by source
-    (`view=source`: Roblox, relayed, Roxy, cache, internal)."""
+    """Status classes over time (`view=class`, with Roxy's and Roblox's 429s), or requests by who produced the
+    caller's status (`view=source`: Roblox, relayed, Roxy, cache, internal; `queries.ANSWER_SOURCE_SQL`)."""
     if view not in ("class", "source"):
         raise validation_error({"view": "Choose class or source."}, "The view is not valid.")
     ctx = get_ctx(request)
     if view == "source":
-        return await _series_answer(ctx, tr, ["requests"], group_by="source")
+        return await _series_answer(ctx, tr, ["requests"], group_by="answer_source")
     return await _series_answer(ctx, tr, STATUS_METRICS)
 
 
@@ -317,12 +333,16 @@ async def traffic_status_sources(
     tq: Annotated[TableQuery, Depends(table_params(SOURCES_SPEC))],
     fmt: ExportFormatDep,
 ) -> Any:
-    """Status codes by who produced them (rows 68, 132), with v1's four tiles and the 429 verdict."""
+    """Status codes by who produced them (rows 68, 132), with v1's four tiles and the 429 verdict.
+
+    The table and the tiles read one definition of "who": a Roblox 5xx passed on after the retries is Roblox's
+    (`relay` in the table, counted by `roblox_5xx`), and `roxy_5xx` ("Our own failures") counts only Roxy's own.
+    """
     ctx = get_ctx(request)
     window = tr.window
 
     def read(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        return read_dashboard.pair_counts(conn, window, "source", "status"), queries.totals_sync(conn, window)
+        return queries.answer_source_counts(conn, window), queries.totals_sync(conn, window)
 
     pairs, totals = await ctx.dbs.metrics.read(read)
     rows: list[dict[str, Any]] = [
@@ -338,13 +358,12 @@ async def traffic_status_sources(
         ordered, total = page_rows(rows, _all_rows(tq, len(rows)), search_keys=("source", "source_label"))
         return await export_table(request, admin, SOURCES_SPEC, ordered, fmt, total=total, tq=tq, tr=tr)
     items, total = page_rows(rows, tq, search_keys=("source", "source_label"))
-    roxy_5xx = sum(r["requests"] for r in rows if r["source"] == "roxy" and 500 <= r["status"] <= 599)
     answer = table_answer(SOURCES_SPEC, tq, items, total)
     answer["tiles"] = {
         "roblox_429": totals.get("roblox_429"),
         "roxy_429": totals.get("roxy_429"),
         "roblox_5xx": totals.get("roblox_5xx"),
-        "roxy_5xx": roxy_5xx,
+        "roxy_5xx": totals.get("roxy_5xx"),
     }
     answer["verdict"] = _verdict(totals.get("roblox_429"), int(totals.get("roxy_429") or 0))
     answer["sources"] = {key: {"label": label, "help": hint} for key, (label, hint) in SOURCE_LABELS.items()}
@@ -441,32 +460,38 @@ async def _trend_period(ctx: Any, key: str, label: str, range_key: str) -> dict[
     previous = queries.comparison_window(current, "previous")
     spark_window = read_dashboard.sparkline_window(current)
 
-    def read(conn: sqlite3.Connection) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-        return (
-            queries.totals_sync(conn, current),
-            queries.totals_sync(conn, previous),
-            queries.series_sync(conn, spark_window, metrics=list(TREND_METRICS)),
-        )
+    def read(conn: sqlite3.Connection) -> dict[str, Any]:
+        return {
+            "now": queries.totals_sync(conn, current),
+            "before": queries.totals_sync(conn, previous),
+            "spark": queries.series_sync(conn, spark_window, metrics=list(TREND_METRICS)),
+            "resets": queries.reset_annotations(conn, current.start, current.end),
+            "baseline_resets": queries.reset_annotations(conn, previous.start, previous.end),
+        }
 
-    now_totals, before_totals, spark = await ctx.dbs.metrics.read(read)
+    data = await ctx.dbs.metrics.read(read)
+    now_totals, before_totals, spark = data["now"], data["before"], data["spark"]
     values = (spark.get("groups") or {}).get("all", {})
     rows = []
     for metric in TREND_METRICS:
         spec = METRICS.get(metric)
         delta, delta_pct = _delta(now_totals.get(metric), before_totals.get(metric))
-        rows.append(
-            {
-                "metric": metric,
-                "label": spec.label if spec else metric,
-                "unit": spec.unit if spec else "",
-                "current": now_totals.get(metric),
-                "previous": before_totals.get(metric),
-                "delta": delta,
-                "delta_pct": delta_pct,
-                "good_direction": _good_direction(metric),
-                "sparkline": [[b, v] for b, v in zip(spark["buckets"], values.get(metric, []), strict=False)],
-            }
-        )
+        row = {
+            "metric": metric,
+            "label": spec.label if spec else metric,
+            "unit": spec.unit if spec else "",
+            "current": now_totals.get(metric),
+            "previous": before_totals.get(metric),
+            "delta": delta,
+            "delta_pct": delta_pct,
+            "good_direction": _good_direction(metric),
+            "sparkline": [[b, v] for b, v in zip(spark["buckets"], values.get(metric, []), strict=False)],
+        }
+        # Plan 6.8 (finding LOGICFIX-1): a reset of this metric's data in either period replaces the delta with a
+        # notice (`partial: true`), as the Overview tiles do.
+        queries.mark_kpi_partial(row, metric, data["resets"], data["baseline_resets"], tz)
+        rows.append(row)
+    reset_rows = queries.touching_resets([*data["resets"], *data["baseline_resets"]], TREND_METRICS)
     return {
         "key": key,
         "label": label,
@@ -475,6 +500,7 @@ async def _trend_period(ctx: Any, key: str, label: str, range_key: str) -> dict[
         "sparkline_granularity": spark_window.granularity,
         "sparkline_range": range_info(spark_window),
         "rows": rows,
+        "notices": reset_notices(reset_rows, tz=tz),
     }
 
 

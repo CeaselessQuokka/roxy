@@ -141,12 +141,29 @@ async def test_reset_listing_maps_every_v1_clear_target(api: Any, api_json: Any)
     assert {item["scope"] for item in body["scopes"]} == set(data.SCOPES)
     assert len(data.SCOPES) == 12
     assert {item["name"] for item in body["families"]} == set(data.FAMILIES)
-    assert len(data.FAMILIES) == 17
+    plan_families = [f for f in data.FAMILIES.values() if f.parent is None]
+    assert len(plan_families) == 17  # the plan 6.8 families
+    narrower = {f.name: f.parent for f in data.FAMILIES.values() if f.parent is not None}
+    assert narrower == {  # v1's separate clears (parity-9, C3)
+        "endpoint_block_attempts": "refusals",
+        "endpoint_rule_attempts": "refusals",
+        "header_rule_attempts": "refusals",
+        "throttle_rule_hits": "throttle",
+        "throttled_clients": "throttle",
+    }
+    for name, parent in narrower.items():
+        own = {(p.db, p.table, p.where, p.params) for p in data.FAMILIES[name].parts}
+        whole = data.FAMILIES[str(parent)].parts
+        assert all(p.table in {q.table for q in whole} for p in data.FAMILIES[name].parts), name
+        assert own, name
     assert sorted(body["v1_clear_targets"]) == sorted(V1_TARGETS)
     assert len(V1_TARGETS) == 27
     for target, mapping in body["v1_clear_targets"].items():
-        assert mapping["scope"] in data.SCOPES, target
+        assert mapping["scope"] in data.SCOPES or mapping["scope"] is None, target
         assert set(mapping.get("families", [])) <= set(data.FAMILIES), target
+    nothing = sorted(t for t, m in body["v1_clear_targets"].items() if m["scope"] is None)
+    assert nothing == ["pause_drops", "throttle_drops"]  # counted from a moment that moves by itself
+    assert all(body["v1_clear_targets"][t]["note"].startswith("Nothing to reset") for t in nothing)
 
 
 async def test_family_reset_preview_phrase_snapshot_audit_and_annotation(
@@ -245,20 +262,22 @@ async def test_single_client_reset(api: Any, api_app: Any, api_json: Any, metric
     scope = {"scope": "client", "client_type": "ip", "client": "203.0.113.5"}
     preview = await _preview(api, api_json, scope)
     tables = _tables(preview)
-    assert tables["metrics.client_minute"] == 1
+    assert tables["metrics.client_minute"] == 2  # its own row and its pair with the seeded place (parity-7)
     assert tables["hot.strikes"] == 1
     assert tables["hot.limiter"] == 6
     assert tables["metrics.events"] == 1
     assert preview["confirm_phrase"] is None
     api_json(await _run(api, scope, preview, reason="false positive"))
     assert await _count(api_app.ctx.dbs.metrics, "client_minute", "client_key = '203.0.113.5'") == 0
+    assert await _count(api_app.ctx.dbs.metrics, "client_minute", "client_key LIKE '203.0.113.5|%'") == 0
     assert await _count(api_app.ctx.dbs.metrics, "client_minute", "client_key = '198.51.100.7'") == 1
+    assert await _count(api_app.ctx.dbs.metrics, "client_minute", "client_key = '198.51.100.7|12345'") == 1
     assert await _count(hot, "limiter", "bucket_key LIKE '%203.0.113.5%'") == 0
     assert await _count(hot, "limiter", "bucket_key LIKE '%198.51.100.7%'") == 6
     assert await _count(hot, "strikes") == 1
     assert await _count(api_app.ctx.dbs.metrics, "events", "type = 'refusal'") == 1
     place = await _preview(api, api_json, {"scope": "client", "client_type": "place", "client": "12345"})
-    assert _tables(place)["metrics.client_minute"] == 1  # the seeded place of the other client
+    assert _tables(place)["metrics.client_minute"] == 2  # the seeded place and its pair with the other client
 
 
 async def test_endpoint_reset_covers_rollups_429s_cooldowns_and_cache(

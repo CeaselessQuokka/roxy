@@ -95,7 +95,7 @@ Alert emails link to `/admin/help#runbook-<name>`; health checks link to `/admin
 | `db-integrity` | alert "Roxy: database integrity check failed" | [Database corrupt](#database-corrupt) |
 | `backup` | alerts "Roxy: backup failed" and "Roxy: no backup for <hours> h" | [Backups](#backups) |
 | `health-failures` | alert "Roxy: health check found <n> new failures" | [Health check found new failures](#health-check-found-new-failures) |
-| `auto-apply-rollback` | alert "Roxy: auto-applied change rolled back" | [Auto-applied change rolled back](#auto-applied-change-rolled-back) |
+| `auto-apply-rollback` | alerts "Roxy: auto-applied change rolled back" and "Roxy: auto-applied change could not be rolled back" | [Auto-applied change rolled back](#auto-applied-change-rolled-back) |
 | `login-throttled` | alert "Roxy: login attempts throttled globally" | [Login attempts throttled](#login-attempts-throttled) |
 | `daily-digest` | alert "Roxy daily digest: <n> open recommendations" | [Daily digest](#daily-digest) |
 | `dns` | health check H-DNS | [DNS](#dns) |
@@ -959,7 +959,14 @@ button on the Health page.
 
 ## Auto-applied change rolled back
 
-**Symptoms.** The alert "Roxy: auto-applied change rolled back".
+**Symptoms.** The alert "Roxy: auto-applied change rolled back", or the critical alert "Roxy: auto-applied change
+could not be rolled back".
+
+The alert "Roxy: auto-applied change could not be rolled back" means a guard metric got worse but the automatic undo
+was refused (usually because an admin changed the same row during the watch window), so the change is still in
+place. Open the recommendation, review the watch result (`rollback.reason`), and undo or adjust the row by hand. A
+rollback that only has to wait (another action holds the recommendation, or hot.db is busy) sends no alert: the
+watch shows "rollback pending" and tries again every pass.
 
 **Confirm.** The Recommendations history (`GET /admin/api/v1/recommendations/history`) and the recommendation's own
 history (`GET /admin/api/v1/recommendations/{rec_id}/history`): the change, the guard metric and its before and

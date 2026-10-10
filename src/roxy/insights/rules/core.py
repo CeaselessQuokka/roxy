@@ -102,13 +102,16 @@ def rule_columns(row: Any) -> dict[str, Any]:
 
 
 def own_cache_rule(ctx: InsightContext, template: str) -> tuple[Any, Any]:
-    """`(rule covering the template now, the rule whose pattern names exactly this template or None)`."""
-    pattern = simulate.template_pattern(template)
+    """`(rule covering the template now, the rule whose pattern names exactly this template or None)`.
+
+    The own rule is the covering one when that names the template (`simulate.names_template`: the exact regex
+    a recommendation writes, or the legacy v1 glob), else any row that names it, the exact regex first
+    (`simulate.own_template_row`; finding insights-8).
+    """
     covering = ctx.rules.cache_rule_for(template)
-    own = covering if covering is not None and covering.pattern == pattern else None
-    if own is None:
-        own = next((row for row in ctx.rules.cache_rules if row.pattern == pattern), None)
-    return covering, own
+    if covering is not None and simulate.names_template(covering.pattern, covering.type, template):
+        return covering, covering
+    return covering, simulate.own_template_row(ctx.rules.cache_rules, template)
 
 
 def effective_ttl(ctx: InsightContext, covering: Any) -> int:
@@ -261,19 +264,22 @@ class Up429Endpoint(Rule):
         if method in ("GET", "POST") and method not in methods:
             methods.append(method)
         proposed: dict[str, Any] = {"ttl": int(ttl), "stale_ttl": int(swr), "methods": ",".join(methods)}
-        pattern = simulate.template_pattern(template)
         if base is not None:
             current = rule_columns(base)
             if all(current.get(k) == v for k, v in proposed.items()):
                 return None
             proposed = {k: v for k, v in proposed.items() if current.get(k) != v}
+            match = {"pattern": base.pattern, "type": base.type}  # the own row, as stored
         else:
             current = None
-            proposed = {"pattern": pattern, "type": "glob", **proposed, "origin": "recommendation"}
+            # A new rule for exactly this template (the anchored regex, never the v1 glob that also covers
+            # every path below it; finding insights-8).
+            match = simulate.template_match(template)
+            proposed = {**match, **proposed, "origin": "recommendation"}
         return ProposedChange(
             "rule_upsert",
             table="rules_cache",
-            match={"pattern": pattern, "type": "glob"},
+            match=dict(match),
             current=current,
             proposed=proposed,
         )
@@ -371,7 +377,6 @@ class CacheTtlTune(Rule):
 
     def _change(self, ctx: InsightContext, template: str, ttl: int) -> ProposedChange:
         covering, own = own_cache_rule(ctx, template)
-        pattern = simulate.template_pattern(template)
         if own is not None:
             return ProposedChange(
                 "rule_upsert",
@@ -381,12 +386,13 @@ class CacheTtlTune(Rule):
                 proposed={"ttl": ttl},
             )
         methods = ",".join(covering.methods) if covering is not None else "GET"
+        match = simulate.template_match(template)  # exactly this template (finding insights-8)
         return ProposedChange(
             "rule_upsert",
             table="rules_cache",
-            match={"pattern": pattern, "type": "glob"},
+            match=dict(match),
             current=None,
-            proposed={"pattern": pattern, "type": "glob", "ttl": ttl, "methods": methods, "origin": "recommendation"},
+            proposed={**match, "ttl": ttl, "methods": methods, "origin": "recommendation"},
         )
 
     async def _raise(

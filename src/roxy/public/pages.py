@@ -4,7 +4,8 @@ What this is
     `router`, with every public route except `/health` (`public/health.py`) and `/csp-report`
     (`public/csp_report.py`): `/` (home), `/docs` (`docs/USER_GUIDE.md` rendered to HTML), `/status` (coarse public
     state), `/robots.txt`, `/sitemap.xml` and `/favicon.ico` (plan 16.1, parity rows 12, 13 and 19). Each answers
-    GET and HEAD, and other spellings of the two page paths (`/docs/`, `/Status`) get a 308 to the page. Also the
+    GET and HEAD, every other method on `/` (except OPTIONS) gets an instant JSON 405 with `Allow` (v1's answer to
+    `POST /`), and other spellings of the two page paths (`/docs/`, `/Status`) get a 308 to the page. Also the
     small pure helpers the routes are built from, so tests can call them directly: `render_site_text`,
     `find_user_guide`, `render_guide`, `home_examples`, `code_block`, `live_limits`, `count_text`,
     `parse_pause_state`, `parse_throttle_all`, `classify_hour`, `read_rate_limited`, `canonical_page_path` and
@@ -68,6 +69,9 @@ How it works
     - Other spellings of a page path (`/docs/`, `/Docs`, `/STATUS/`) get a 308 to the page (`PageAliasRoute`).
       Without that route the proxy catch-all would read `/docs/` as a request for the host `docs`: a `not_roblox`
       probe, held by the tarpit and counted toward a spam ban of a visitor who only added a slash.
+    - `POST /` (and PUT, PATCH, DELETE or any other method but GET, HEAD and OPTIONS) gets v1's instant 405 with
+      `Allow: GET, HEAD, OPTIONS` (`HomeMethodRoute`), through the app's client error path, so the probe log reads
+      `HTTP 405 via POST /`; for the same reason as the aliases it never reaches the proxy or the tarpit.
     - Visits: GET requests to a page call `ctx.recorder.record_visit(page, user_agent)` when the recorder has
       that method; the recorder classifies the visitor itself (`roxy/metrics/visitors.py`, parity row 19).
       robots.txt and sitemap.xml also call `record_crawl(client_ip, path, user_agent)` (the v1 crawl log). HEAD
@@ -1433,6 +1437,53 @@ async def home(request: Request) -> Response:
     response = _page(request, "public/home.html", context)
     await record_visit(request, PAGE_HOME)
     return response
+
+
+# --- other methods on the home page -------------------------------------------------------------------------------
+
+HOME_PATH: Final = "/"
+HOME_ANSWERED_METHODS: Final = frozenset({"GET", "HEAD", "OPTIONS"})
+"""Methods `/` answers: GET and HEAD by `home`, OPTIONS by the proxy's local answer (204 with `Allow`)."""
+HOME_ALLOW: Final = "GET, HEAD, OPTIONS"
+"""The `Allow` header of the 405 (v1's Flask answer for `/` listed the same three methods)."""
+
+
+class HomeMethodRoute(APIRoute):
+    """Every other method on `/` (POST, PUT, PATCH, DELETE, TRACE...): an instant 405 with `Allow` (finding
+    parity-1, v1 smoke lines 140 to 142).
+
+    The proxy catch-all also matches `/`, so without this route `POST /` (the request that once flooded the owner
+    with error emails) was a `not_roblox` proxy refusal: it went through the whole abuse pipeline, counted toward the
+    spam probe detector, and the tarpit could hold it for seconds. v1 answered it at once with 405 and a JSON body.
+    Raising `HTTPException` here takes the app's client error path (`core/errors.py`): FastAPI's JSON 405 body,
+    the headers kept, and the probe hook logs `HTTP 405 via POST /` (as v1's exploit log did) after the answer is
+    sent. No body is read, no dependency runs, and nothing reaches the proxy, the abuse pipeline or the tarpit.
+    """
+
+    def matches(self, scope: Scope) -> tuple[Match, Scope]:
+        if scope.get("type") != "http" or scope.get("path") != HOME_PATH:
+            return Match.NONE, {}
+        if scope.get("method") in HOME_ANSWERED_METHODS:
+            return Match.NONE, {}
+        return Match.FULL, {}
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+        raise HTTPException(status_code=405, detail="Method Not Allowed", headers={"Allow": HOME_ALLOW})
+
+
+async def home_method_not_allowed(request: Request) -> Response:
+    """The 405 route's endpoint (for route listings; `HomeMethodRoute.handle` raises before any endpoint runs)."""
+    raise HTTPException(status_code=405, detail="Method Not Allowed", headers={"Allow": HOME_ALLOW})
+
+
+router.add_api_route(
+    HOME_PATH,
+    home_method_not_allowed,
+    methods=["DELETE", "PATCH", "POST", "PUT"],  # for route listings; matching uses `HomeMethodRoute.matches`
+    include_in_schema=False,
+    name="home_method_not_allowed",
+    route_class_override=HomeMethodRoute,
+)
 
 
 @router.api_route("/docs", methods=["GET", "HEAD"], include_in_schema=False)

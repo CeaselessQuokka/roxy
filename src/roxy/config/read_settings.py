@@ -4,7 +4,8 @@ What this is
     `history_page(conn, ...)` returns one page of `settings_history` (sorted, filtered by key, source, actor, a
     search text and a time window) with the total for the pager. `latest_changes(conn)` returns the newest history
     row of every key ("last changed: who, when, why" on each row of the editor, plan 15.2). `history_entry(conn,
-    id)` returns one row. Rows are plain dicts with the JSON columns decoded.
+    id)` returns one row. Rows are plain dicts with the JSON columns decoded. `value_timeline(conn, key, since)`
+    gives the values one key had over a span (the dry run reads `request_sample_pct` per sample time from it).
 
 Why it exists
     Plan 15.2 asks for history per key and globally, with one-click revert, and DESIGN.md section 13 puts read
@@ -166,6 +167,44 @@ def latest_changes(conn: sqlite3.Connection, keys: Iterable[str] | None = None) 
     return out
 
 
+MAX_TIMELINE_ROWS: Final = 1000
+"""Changes of one key `value_timeline` reads (far more than any key changes within a sample window)."""
+
+
+def value_timeline(
+    conn: sqlite3.Connection, key: str, since: float, *, default: Any, live: Any, limit: int = MAX_TIMELINE_ROWS
+) -> list[tuple[int, Any]]:
+    """The values setting `key` had from `since` (Unix seconds) on, from `settings_history`: `[(from_s, value)]`,
+    oldest first, the first entry the value in force at `since`.
+
+    History rows hold overrides (None: the catalog `default`). Without any history row the value is `live` (the
+    worker's current value). The value at a time `t` is the last entry whose `from_s` is at or before `t`.
+    """
+
+    def value(text: str | None) -> Any:
+        decoded = decode_json(text)
+        return default if decoded is None else decoded
+
+    start = int(since)
+    later = conn.execute(
+        "SELECT changed_at, old_json, new_json FROM settings_history WHERE key = ? AND changed_at > ? "
+        "ORDER BY changed_at, id LIMIT ?",
+        (key, start, max(1, min(int(limit), MAX_TIMELINE_ROWS))),
+    ).fetchall()
+    before = conn.execute(
+        "SELECT new_json FROM settings_history WHERE key = ? AND changed_at <= ? ORDER BY changed_at DESC, id DESC "
+        "LIMIT 1",
+        (key, start),
+    ).fetchone()
+    if before is not None:
+        first = value(before[0])
+    elif later:
+        first = value(later[0][1])  # what it was before the first change after `since`
+    else:
+        first = live
+    return [(start, first), *((int(row[0]), value(row[2])) for row in later)]
+
+
 def history_sources(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]]:
     """Distinct sources with their counts (the editor's source filter), most used first."""
     rows = conn.execute(
@@ -179,10 +218,12 @@ __all__ = [
     "HISTORY_SORTS",
     "MAX_LATEST_KEYS",
     "MAX_PAGE_ROWS",
+    "MAX_TIMELINE_ROWS",
     "decode_json",
     "history_entry",
     "history_page",
     "history_row",
     "history_sources",
     "latest_changes",
+    "value_timeline",
 ]

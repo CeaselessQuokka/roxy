@@ -234,7 +234,7 @@ async def check_target(
 
 
 @router.get("/{rule_id}")
-async def get_rule(request: Request, _admin: AdminSession, rule_id: int) -> dict[str, Any]:
+async def get_rule(request: Request, _admin: AdminSession, rule_id: common.RowId) -> dict[str, Any]:
     """One routing rule."""
     with common.service_errors():
         row = await rules_service(request).get_row(TABLE, rule_id)
@@ -245,7 +245,7 @@ async def get_rule(request: Request, _admin: AdminSession, rule_id: int) -> dict
 
 @router.patch("/{rule_id}")
 async def update_rule(
-    request: Request, admin: AdminSession, _csrf: CsrfChecked, rule_id: int, body: RoutingRulePatch
+    request: Request, admin: AdminSession, _csrf: CsrfChecked, rule_id: common.RowId, body: RoutingRulePatch
 ) -> dict[str, Any]:
     """Change some fields of a routing rule (only what differs is written and audited)."""
     changes = changes_of(body)
@@ -259,7 +259,7 @@ async def update_rule(
 
 @router.delete("/{rule_id}")
 async def delete_rule(
-    request: Request, admin: AdminSession, _csrf: CsrfChecked, rule_id: int, body: DeleteBody | None = None
+    request: Request, admin: AdminSession, _csrf: CsrfChecked, rule_id: common.RowId, body: DeleteBody | None = None
 ) -> dict[str, Any]:
     """Remove a routing rule (audited, with the row as it was)."""
     reason = body.reason if body is not None else ""

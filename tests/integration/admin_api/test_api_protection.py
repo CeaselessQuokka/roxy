@@ -158,7 +158,15 @@ async def test_throttle_all_limit_since_marker_and_watch(api: Any, api_app: Any,
     await api_app.ctx.dbs.hot.write(seed)
     table = ok(await api.get("protection/throttle-all/watch"), api_json)
     assert table["total"] == 1
-    assert table["items"][0] == {"ip": "203.0.113.9", "count": 3, "limited": True, "reset_in_s": 20}
+    row = table["items"][0]
+    assert {key: row[key] for key in ("ip", "count", "limited", "reset_in_s")} == {
+        "ip": "203.0.113.9",
+        "count": 3,
+        "limited": True,
+        "reset_in_s": 20,
+    }
+    # No client activity was recorded for it, so v1's watch columns are unknown, never a guessed zero (P6).
+    assert {row[key] for key in ("requests", "refused", "rate1", "top_endpoint", "last_seen_ms")} == {None}
     section13(await api.get("protection/throttle-all/watch", params={"order": "asc"}), 422, "invalid_table_query")
     state = ok(await api.post("protection/throttle-all", json={"enabled": False}), api_json)
     assert state["enabled"] is False
@@ -515,7 +523,9 @@ async def test_endpoint_blocks_rules_and_attempts(api: Any, api_app: Any, api_js
     section13(await api.post("protection/endpoint-blocks", json={"pattern": "(a|aa)+", "type": "regex"}), 422,
               "invalid_rule")  # fmt: skip
     for ip in ("203.0.113.30", "203.0.113.31", "203.0.113.31"):
-        refused(metrics_seed, 1, ReasonCode.ENDPOINT_BLOCKED, 403, client_ip=ip, path="games.roblox.com/v1/games/1")
+        # The abuse verdict's matched rows ride on the refusal event (`detail.rules`, review round 3).
+        refused(metrics_seed, 1, ReasonCode.ENDPOINT_BLOCKED, 403, client_ip=ip, path="games.roblox.com/v1/games/1",
+                matches={"rules_endpoint_block": str(block["key"])})  # fmt: skip
     refused(metrics_seed, 2, ReasonCode.ENDPOINT_RULE, 429, client_ip="203.0.113.40", path="economy.roblox.com/v1/x",
             endpoint_template="economy.roblox.com/v1/x")  # fmt: skip
     await metrics_seed.flush()
@@ -525,9 +535,12 @@ async def test_endpoint_blocks_rules_and_attempts(api: Any, api_app: Any, api_js
     assert (item["path"], item["attempts"], item["clients"]) == ("games.roblox.com/v1/games/1", 3, 2)
     assert item["methods"] == ["GET"]
     assert item["current_rule"] == "games.roblox.com/v1/games"
+    assert item["refused_by"] == ["games.roblox.com/v1/games"]  # the rule that refused, as recorded
+    assert "rule_ids" not in item
     attempts = ok(await api.get("protection/endpoint-rules/attempts"), api_json)
     assert attempts["items"][0]["attempts"] == 2
     assert attempts["items"][0]["current_rule"] == "economy.roblox.com/v1"
+    assert attempts["items"][0]["refused_by"] == []  # refusals that recorded no rule name none
     refused(metrics_seed, 1, ReasonCode.HEADER_RULE, 429, client_ip="203.0.113.41", path="games.roblox.com/v2/x")
     await metrics_seed.flush()
     filtered = ok(await api.get("protection/header-rules/attempts"), api_json)

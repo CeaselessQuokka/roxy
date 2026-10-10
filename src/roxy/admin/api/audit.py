@@ -5,7 +5,8 @@ What this is
       * `GET /audit`: the log as a table (newest first; paging, sorting, `q` search over action, target, actor,
         reason and request id), with filters `action`, `actor` and `target` (exact, or a prefix ending in `*`
         such as `setting:*` or `rule.*`) and a time window `from` / `to`. `format=csv|json` downloads it
-        (formula guarded, IP addresses hashed unless `export_include_ips` is on, the download itself audited).
+        (formula guarded, IP addresses hashed unless `export_include_ips` is on, in the previews and targets too,
+        read one page at a time within the export caps, the download itself audited).
       * `GET /audit/facets`: the actions and actors in the log with their counts (the filter menus).
       * `GET /audit/{id}`: one entry with `before` and `after` decoded, a flat `diff` (path, change, before,
         after) for the diff viewer, a `revert` block and a `manage` link to the page that owns the target.
@@ -33,7 +34,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Annotated, Any, Final
 
-from fastapi import Depends, Path, Query, Request
+from fastapi import Depends, Query, Request
 
 from roxy.admin.api import common
 from roxy.admin.api.common import (
@@ -62,11 +63,21 @@ AUDIT_TABLE: Final = TableSpec(
         Column("actor", "Who", "Who acted: admin:<name>, system:<what>, recommendation:<rule>, cli, import."),
         Column("actor_ip", "From", "The address the admin acted from.", sortable=False, ip=True),
         Column("action", "Action", "What was done, as a dotted name (setting.update, rule.delete, data.reset)."),
-        Column("target", "Target", "What it was done to (setting:<key>, <table>:<id>, credential, ...)."),
+        Column(
+            "target", "Target", "What it was done to (setting:<key>, <table>:<id>, credential, ...).", caller_text=True
+        ),
         Column("reason", "Reason", "The reason given.", sortable=False),
         Column("request_id", "Request", "The request id, to find the matching log lines.", sortable=False),
-        Column("before_preview", "Before", "The state before (the first 2000 characters).", sortable=False),
-        Column("after_preview", "After", "The state after (the first 2000 characters).", sortable=False),
+        Column(
+            "before_preview",
+            "Before",
+            "The state before (the first 2000 characters).",
+            sortable=False,
+            caller_text=True,
+        ),
+        Column(
+            "after_preview", "After", "The state after (the first 2000 characters).", sortable=False, caller_text=True
+        ),
     ),
     default_sort="id",
 )
@@ -245,9 +256,9 @@ async def list_audit(
             rows, total = await ctx.dbs.control.read(reader(page, size))
             return list(rows), int(total)
 
-        rows, total = await common.collect_pages(fetch)
         kept = {name: value for name, value in filters.items() if value is not None}
-        return await common.export_table(request, admin, AUDIT_TABLE, rows, fmt, total=total, tq=tq, filters=kept)
+        # One page at a time: an audit row may carry 4,000 characters of previews (mpjobs-5).
+        return await common.export_pages(request, admin, AUDIT_TABLE, fetch, fmt, tq=tq, filters=kept)
     rows, total = await ctx.dbs.control.read(reader(tq.page, tq.page_size))
     items = []
     for row in rows:
@@ -267,9 +278,7 @@ async def facets(request: Request, _admin: AdminSession) -> dict[str, Any]:
 
 
 @router.get("/{audit_id}")
-async def get_entry(
-    request: Request, audit_id: Annotated[int, Path(ge=1, le=2**62)], _admin: AdminSession
-) -> dict[str, Any]:
+async def get_entry(request: Request, audit_id: common.RowId, _admin: AdminSession) -> dict[str, Any]:
     """One audit entry with its diff, its revert block and the link to what it changed."""
     ctx = get_ctx(request)
 

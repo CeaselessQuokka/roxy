@@ -25,6 +25,7 @@ EXPECTED_SUBJECTS = {
     ("backup_stale", (("hours", 30),)): "Roxy: no backup for 30 h",
     ("health_failures", (("n", 3), ("fingerprint", "f1"))): "Roxy: health check found 3 new failures",
     ("auto_apply_rollback", (("rec_id", "r1"),)): "Roxy: auto-applied change rolled back",
+    ("auto_apply_rollback_failed", (("rec_id", "r1"),)): "Roxy: auto-applied change could not be rolled back",
     ("login_global", ()): "Roxy: login attempts throttled globally",
     ("digest", (("n", 4), ("day", "2026-10-07"))): "Roxy daily digest: 4 open recommendations",
 }
@@ -56,6 +57,9 @@ def test_cooldown_keys_severity_and_channels() -> None:
     assert leak.severity == "critical"
     assert make_alert("rotator_quota", summary="s", pct=95, severity="critical").severity == "critical"
     assert make_alert("digest", summary="s", n=1, day="d").channels == ("email",)
+    refused = make_alert("auto_apply_rollback_failed", summary="s", rec_id="r1")
+    assert refused.severity == "critical"  # the change is still in place (plan 11.4, finding insights-5)
+    assert refused.cooldown_key == "rollback_failed:r1"
 
 
 def test_parameters_cannot_inject_headers_and_bad_input_fails_loudly() -> None:

@@ -80,6 +80,7 @@ router = area_router("overview")
 KPI_KEYS: Final[tuple[str, ...]] = (
     "requests",
     "requests_last_hour",
+    "failures_last_hour",
     "avoided_pct",
     "avoided",
     "upstream_calls",
@@ -97,7 +98,9 @@ KPI_KEYS: Final[tuple[str, ...]] = (
     "served_cache",
     "errors_hidden",
 )
-"""The plan 14.1 Overview KPI tiles in display order, plus the two P6 companions (cache serves, errors hidden)."""
+"""The plan 14.1 Overview KPI tiles in display order, v1's `Failures (Last Hour)` next to `Requests (Last Hour)`
+(the dashboard.md 1.1 correction to plan 14.1 row 1, finding parity-2), plus the two P6 companions (cache serves,
+errors hidden)."""
 
 SPARK_METRICS: Final[tuple[str, ...]] = (
     "requests",
@@ -148,6 +151,14 @@ EXTRA_TILES: Final[dict[str, tuple[str, str, str]]] = {
         "Proxy requests in the last 60 minutes, whatever range is selected: the number that says whether Roxy is "
         "busy right now. The delta compares with the hour before.",
     ),
+    "failures_last_hour": (
+        "Failures (last hour)",
+        "requests",
+        "Requests Roxy could not answer in the last 60 minutes, whatever range is selected: Roblox kept failing "
+        "(5xx, timeouts, connection errors), every route was unavailable, or Roxy failed itself. Refusals by "
+        "Roxy's protection and Roblox's own 4xx answers are not failures (v1 counted the same way). The delta "
+        "compares with the hour before.",
+    ),
     "rotator_bytes_today": (
         "Rotator bytes today",
         "bytes",
@@ -174,8 +185,20 @@ EVENTS_SPEC: Final = TableSpec(
         Column("type", "Event", "What happened: a breaker, a cooldown, a credential change, a purge, a ban."),
         Column("severity", "Severity", "info, warn or critical."),
         Column("reason", "Reason", "The reason code recorded with the event.", sortable=False),
-        Column("endpoint_template", "Endpoint", "The endpoint it concerns, when it concerns one.", sortable=False),
-        Column("detail", "Detail", "Everything recorded with the event (secrets are never recorded).", sortable=False),
+        Column(
+            "endpoint_template",
+            "Endpoint",
+            "The endpoint it concerns, when it concerns one.",
+            sortable=False,
+            caller_text=True,
+        ),
+        Column(
+            "detail",
+            "Detail",
+            "Everything recorded with the event (secrets are never recorded).",
+            sortable=False,
+            caller_text=True,
+        ),
     ),
     default_sort="at_ms",
 )
@@ -358,10 +381,20 @@ def _rotator_today(conn: sqlite3.Connection, now: float, tz: str) -> dict[str, A
     yesterday = Window(start - 86_400, end - 86_400, "hour", tz)
     usage = queries.egress_usage_series(conn, today)
     spark = usage["egress"].get("rotator", {}).get("bytes", [0] * len(usage["buckets"]))
+    # Plan 6.8 (finding LOGICFIX-1): today against yesterday is built here, outside `kpis_sync`, so it asks the same
+    # question of its own table (`egress_usage`, as `rotator_bytes` reads it) for both days.
+    flags: dict[str, Any] = {}
+    today_marks = queries.reset_annotations(conn, today.start, today.end)
+    yesterday_marks = queries.reset_annotations(conn, yesterday.start, yesterday.end)
+    queries.mark_kpi_partial(flags, "rotator_bytes", today_marks, yesterday_marks, tz)
+    marks = [*today_marks, *yesterday_marks]
     return {
         "value": queries.egress_bytes(conn, today).get("rotator", 0),
         "previous": queries.egress_bytes(conn, yesterday).get("rotator", 0),
         "sparkline": [[b, v] for b, v in zip(usage["buckets"], spark, strict=False)],
+        "partial": bool(flags.get("partial")),
+        "notice": flags.get("notice"),
+        "resets": queries.touching_resets(marks, ("rotator_bytes",)),
     }
 
 
@@ -370,7 +403,9 @@ def _extra_tile(
 ) -> dict[str, Any]:
     label, unit, help_text = EXTRA_TILES[key]
     delta, delta_pct = _delta(value, previous)
-    direction = {"requests_last_hour": "neutral", "rotator_bytes_today": "down"}.get(key, "neutral")
+    direction = {"requests_last_hour": "neutral", "failures_last_hour": "down", "rotator_bytes_today": "down"}.get(
+        key, "neutral"
+    )
     return kpi_tile(
         key,
         label=label,
@@ -404,8 +439,10 @@ async def build_kpis(ctx: Any, tr: TimeRange) -> dict[str, Any]:
         return {
             "kpis": queries.kpis_sync(conn, window, now=now, compare=compare),
             "spark": queries.series_sync(conn, spark_window, metrics=list(SPARK_METRICS)),
-            "hour_spark": queries.series_sync(conn, hour, metrics=["requests"]),
-            "previous_hour": queries.totals_sync(conn, before)["requests"],
+            "hour_spark": queries.series_sync(conn, hour, metrics=["requests", "failed"]),
+            # The trailing hour and the hour before it, read once each: both "last hour" tiles come from them.
+            "hour": queries.totals_sync(conn, hour),
+            "previous_hour": queries.totals_sync(conn, before),
             "rotator": _rotator_today(conn, now, tz),
             "uptime": _service_uptime(ctx, conn, now),
             "legacy": read_dashboard.legacy_baseline(conn),
@@ -416,26 +453,50 @@ async def build_kpis(ctx: Any, tr: TimeRange) -> dict[str, Any]:
     spark = data["spark"]
     legacy = data["legacy"]
     tiles: list[dict[str, Any]] = []
+    # Plan 6.8 (finding parity-12): `queries.kpis` checks the trailing hour and the hour before for resets of the
+    # rollups both "last hour" tiles read; a reset there replaces their delta with its notice.
+    hour_flags = tiles_in.get("requests_last_hour", {})
     for key in KPI_KEYS:
-        if key == "requests_last_hour":
-            tiles.append(
-                _extra_tile(
-                    key,
-                    tiles_in[key]["value"],
-                    previous=data["previous_hour"],
-                    sparkline=_points(data["hour_spark"], "requests"),
-                )
+        if key in ("requests_last_hour", "failures_last_hour"):
+            # Same trailing hour as `queries.kpis` counts (`_hour_windows`), whatever range is selected.
+            metric = "requests" if key == "requests_last_hour" else "failed"
+            partial = bool(hour_flags.get("partial"))
+            tile = _extra_tile(
+                key,
+                data["hour"][metric],
+                previous=None if partial else data["previous_hour"][metric],
+                sparkline=_points(data["hour_spark"], metric),
+                notice=hour_flags.get("notice"),
             )
+            if partial:
+                tile["partial"] = True
+            tiles.append(tile)
         elif key == "rotator_bytes_today":
             rot = data["rotator"]
-            tiles.append(_extra_tile(key, rot["value"], previous=rot["previous"], sparkline=rot["sparkline"]))
+            tile = _extra_tile(
+                key,
+                rot["value"],
+                previous=None if rot["partial"] else rot["previous"],  # no delta against a reset day (plan 6.8)
+                sparkline=rot["sparkline"],
+                notice=rot["notice"],
+            )
+            if rot["partial"]:
+                tile["partial"] = True
+            tiles.append(tile)
         elif key == "active_bans":
             tiles.append(_extra_tile(key, _active_bans(ctx, now)))
         elif key == "service_uptime_s":
             tiles.append(_extra_tile(key, data["uptime"]))
         else:
-            tile = kpi_from_read_model(key, tiles_in[key], sparkline=_points(spark, key))
             current = tiles_in.get(key, {})
+            tile = kpi_from_read_model(key, current, sparkline=_points(spark, key), notice=current.get("notice"))
+            if current.get("partial"):
+                # A reset touched this tile's data: its notice (and its null delta) is what the tile shows.
+                tile["partial"] = True
+                if key == "roblox_429_per_10k":
+                    tile["baseline"] = legacy.get("roblox_429_per_10k")
+                tiles.append(tile)
+                continue
             if key == "avoided_pct":
                 avoided, demand = tiles_in["avoided"]["value"], tiles_in["demand"]["value"]
                 if demand:
@@ -459,8 +520,20 @@ async def build_kpis(ctx: Any, tr: TimeRange) -> dict[str, Any]:
         "sparkline_granularity": spark_window.granularity,
         "sparkline_range": range_info(spark_window),
         "tiles": tiles,
-        "notices": reset_notices(data["kpis"].get("notices") or [], tz=tz),
+        "notices": reset_notices(_notice_rows(data["kpis"].get("notices") or [], data["rotator"]["resets"]), tz=tz),
     }
+
+
+def _notice_rows(*groups: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Reset markers of several reads, each once (by id), in the order read."""
+    seen: set[Any] = set()
+    rows: list[Mapping[str, Any]] = []
+    for group in groups:
+        for row in group:
+            if row.get("id") not in seen:
+                seen.add(row.get("id"))
+                rows.append(row)
+    return rows
 
 
 # --------------------------------------------------------------------------------------------- visitors

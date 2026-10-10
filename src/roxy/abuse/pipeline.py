@@ -40,7 +40,9 @@ How it works
        only when no later check would refuse the request (a header filter, auth smuggling, a block, any static
        refusal): content is never served to a filtered request. The answer stays the throttle refusal (v1's order).
     5. Afterwards (memory only): statistics, spam detector and bot tracker observations, aggregated metrics events
-       (`ua_rule_hit`, `throttle_tier`), `record_throttled` for a client that just became throttled, and a ladder ban
+       (`ua_rule_hit`, `throttle_tier`), `record_throttled` for a client that just became throttled, `record_probe`
+       for a probe refusal (a URL that is unsafe, not Roblox or not an allowed host, or auth smuggling: the Security
+       probe log with v1's texts, `probe_log_reason`), and a ladder ban
        if a rung with action `ban` was reached. Rule hits: every admin rule row the request matched (the checks
        report them with `Facts.note_match`; bypass is resolved in step 0) is copied onto the verdict (`matches`) and
        handed to the metrics recorder, which sums them per rule and minute in memory and writes them with its
@@ -108,6 +110,17 @@ from roxy.abuse.limiter import (
     save_rows,
     unshared,
 )
+from roxy.abuse.messages import (
+    PROBE_LOG_AUTH,
+    PROBE_LOG_AUTH_HEADER,
+    PROBE_LOG_HOST,
+    PROBE_LOG_NOT_ROBLOX,
+    PROBE_LOG_UNSAFE,
+    REASON_AUTH_BODY,
+    REASON_AUTH_COOKIE_NAME,
+    REASON_AUTH_QUERY,
+    REASON_AUTH_TOKEN_HEADER,
+)
 from roxy.abuse.spam import SpamDetectors
 from roxy.abuse.state import SwitchesCache
 from roxy.abuse.tarpit import Tarpit
@@ -146,6 +159,12 @@ MAX_BACKGROUND_BANS: Final = 32
 MAX_UA_HIT_RECORDS: Final = 200
 MAX_TIER_RECORDS: Final = 32
 PROBE_REASONS: Final = frozenset({ReasonCode.UNSAFE_URL, ReasonCode.NOT_ROBLOX, ReasonCode.HOST_NOT_ALLOWED})
+PROBE_TEXT_CHARS: Final = 256
+"""Characters of the probed path handed to the probe log (its target and path columns keep 200 after redaction):
+the request path pays for redacting at most this much, however long the URL was."""
+_AUTH_PROBE_WHERE: Final = frozenset(
+    {REASON_AUTH_TOKEN_HEADER, REASON_AUTH_COOKIE_NAME, REASON_AUTH_QUERY, REASON_AUTH_BODY}
+)
 UA_RULE_HIT_EVENT: Final = "ua_rule_hit"
 """Aggregated metrics event: one User-Agent rule evaluated (detail `rule_id`, `result` allowed or refused)."""
 TIER_EVENT: Final = "throttle_tier"
@@ -364,6 +383,26 @@ def walk_limiters(
         if final.exists:
             state.penalty_wait_ms = max(0, final.throttled_until * 1000 - now_ms)
     return _Walk(state, writes, strike_writes)
+
+
+def probe_log_reason(verdict: Refuse, target: str) -> str | None:
+    """The probe log text for a refusal that is a probe (v1 `log_exploit_attempt`), or None for any other refusal.
+
+    `target` is the probed URL as received (v1 `dst`), already cut to `PROBE_TEXT_CHARS`. Every signature is Roxy's
+    own words (`metrics/security_events.py probe_signature` moves a quoted target to its own column), so a scanner
+    cannot create a new signature, summary row or event budget per request (v1 bug B19).
+    """
+    reason = verdict.reason
+    if reason == ReasonCode.UNSAFE_URL:
+        return PROBE_LOG_UNSAFE.format(target=target)
+    if reason == ReasonCode.NOT_ROBLOX:
+        return PROBE_LOG_NOT_ROBLOX.format(target=target)
+    if reason == ReasonCode.HOST_NOT_ALLOWED:
+        return PROBE_LOG_HOST
+    if reason == ReasonCode.AUTH_SMUGGLING:
+        where = verdict.detail if verdict.detail in _AUTH_PROBE_WHERE else PROBE_LOG_AUTH_HEADER
+        return PROBE_LOG_AUTH.format(where=where)
+    return None
 
 
 def slow_patterns(rules: RulesSnapshot) -> bool:
@@ -1059,6 +1098,8 @@ class AbusePipeline:
         if per_ip is not None and not per_ip.admitted and per_ip.ban_minutes:
             self._ladder_ban(facts.limit_key, per_ip.ban_minutes, per_ip.rung.index, int(facts.now))
         reason = verdict.reason if isinstance(verdict, Refuse) else None
+        if isinstance(verdict, Refuse) and (reason in PROBE_REASONS or reason == ReasonCode.AUTH_SMUGGLING):
+            self._probe(req, facts, verdict)
         probe = reason in PROBE_REASONS or facts.probe_signature is not None
         bypass = bool(getattr(req, "bypass", False))
         query = list(getattr(req, "query", None) or ())
@@ -1128,6 +1169,24 @@ class AbusePipeline:
             return  # a recorder without the keyword arguments (tests, older builds): counted in `stats` only
         except Exception:
             log.exception("abuse_event_failed", extra={"fields": {"kind": kind}})
+
+    def _probe(self, req: Any, facts: Facts, verdict: Refuse) -> None:
+        """A probe refusal goes to the Security probe log (v1 `log_exploit_attempt`; parity rows 51 and 80).
+
+        A URL probe (unsafe characters, not a Roblox URL, a host outside the allowlist) or an auth smuggling attempt,
+        when that check is the one that refused (a client refused earlier, say throttled, is not logged as a probe,
+        as in v1's order). In memory only: the recorder folds a flood over its per-signature event budget.
+        """
+        record = getattr(self.recorder, "record_probe", None)
+        target = facts.path[:PROBE_TEXT_CHARS]
+        text = probe_log_reason(verdict, target)
+        if record is None or text is None:
+            return
+        try:
+            user_agent = str(getattr(req, "user_agent", "") or "") or None
+            record(facts.ip or facts.limit_key, text, user_agent, ("/" + target)[:PROBE_TEXT_CHARS])
+        except Exception:
+            log.exception("abuse_event_failed", extra={"fields": {"kind": "probe"}})
 
     def _throttled(self, ip: str, tier: int, strikes: int) -> None:
         """`record_throttled`: a client that just became throttled (v1 `throttled_ips`, plan row 80)."""
@@ -1230,6 +1289,7 @@ __all__ = [
     "Verdict",
     "install",
     "merge_pending_rows",
+    "probe_log_reason",
     "slow_patterns",
     "walk_limiters",
 ]

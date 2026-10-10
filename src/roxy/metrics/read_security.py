@@ -7,9 +7,15 @@ What this is
         ignored or look unbounded (v1's "high cardinality" badge).
       * `header_values(conn, name, ...)`: one header's stored values, most frequent first (the v1 drill-down).
       * `user_agents(conn, ...)`: the User-Agent table.
-      * `blocked_fingerprints(conn, ...)`: header names and User-Agents of requests a request filter refused
-        (row 134, the "Blocked" tab), from the aggregated `blocked_header` and `blocked_user_agent` events.
+      * `blocked_fingerprints(conn, ...)` and `blocked_rows(conn, ...)`: header names and User-Agents of requests a
+        request filter refused (row 134, the "Blocked" tab), from the aggregated `blocked_header` and
+        `blocked_user_agent` events; `blocked_rows` is the same as one exportable table.
       * `csp_reports(conn, ...)`: Content-Security-Policy violation reports (plan 9.2), grouped by what was blocked.
+      * The per-header clears of v1's fingerprint tables (`.remake/v1notes/dashboard.md` 4.21, finding parity-11):
+        `clear_header_values` ("Clear values": the values go, the header and its count stay and it is still
+        recorded), `remove_header` ("Remove": the row and its values go), `remove_blocked_header` (the Blocked tab's
+        "Remove"), with `header_counts` and `blocked_header_count` for the audit row written first. These few
+        deletes of the tables this module reads sit here so the Security API stays thin.
 
 Why it exists
     The fingerprint tables are written by the recorder (`metrics/fingerprints.py`) and the CSP reports by
@@ -200,6 +206,70 @@ def blocked_fingerprints(
     }
 
 
+def blocked_rows(conn: sqlite3.Connection, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+    """The Blocked tab as one table (v1 `exportBlockedFingerprints`: `Type,Header,Value,Count,LastSeen`): a row per
+    blocked header name (`kind` `header`, `name`) and per blocked User-Agent (`kind` `user_agent`, `user_agent`),
+    with `count` and `last_ms`; at most `MAX_ROWS` of each kind. Blocked requests keep no header values."""
+    found = blocked_fingerprints(conn, start_ms, end_ms)
+    rows: list[dict[str, Any]] = [
+        {"kind": "header", "name": item["name"], "user_agent": None, "count": item["count"], "last_ms": item["last_ms"]}
+        for item in found["headers"]
+    ]
+    rows += [
+        {
+            "kind": "user_agent",
+            "name": None,
+            "user_agent": item["user_agent"],
+            "count": item["count"],
+            "last_ms": item["last_ms"],
+        }
+        for item in found["user_agents"]
+    ]
+    return rows
+
+
+# --------------------------------------------------------------------------------- per-header clears (v1 4.21)
+
+
+def header_counts(conn: sqlite3.Connection, name: str) -> dict[str, int]:
+    """`{headers, values}`: whether one (lowercased) header name has a row, and how many values it stores."""
+    key = name.lower()
+    headers = int(conn.execute("SELECT count(*) FROM fingerprint_headers WHERE name = ?", (key,)).fetchone()[0])
+    values = int(conn.execute("SELECT count(*) FROM fingerprint_values WHERE name = ?", (key,)).fetchone()[0])
+    return {"headers": headers, "values": values}
+
+
+def clear_header_values(conn: sqlite3.Connection, name: str) -> int:
+    """v1 "Clear values": delete one header's stored values, keep its row and count (it is still recorded)."""
+    return int(conn.execute("DELETE FROM fingerprint_values WHERE name = ?", (name.lower(),)).rowcount)
+
+
+def remove_header(conn: sqlite3.Connection, name: str) -> dict[str, int]:
+    """v1 "Remove": delete one header's row and its stored values (a later request carrying it adds it again)."""
+    key = name.lower()
+    values = int(conn.execute("DELETE FROM fingerprint_values WHERE name = ?", (key,)).rowcount)
+    headers = int(conn.execute("DELETE FROM fingerprint_headers WHERE name = ?", (key,)).rowcount)
+    return {"headers": headers, "values": values}
+
+
+def blocked_header_count(conn: sqlite3.Connection, name: str) -> int:
+    """Blocked requests counted for one header name, over every kept `blocked_header` row."""
+    row = conn.execute(
+        f"SELECT {_COUNT} FROM events WHERE type = ? AND reason_code = ?",  # noqa: S608 (fixed text)
+        (BLOCKED_HEADER_EVENT, name.lower()),
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def remove_blocked_header(conn: sqlite3.Connection, name: str) -> int:
+    """v1 "Remove" on the Blocked tab: delete one header name's `blocked_header` rows; returns the rows deleted."""
+    return int(
+        conn.execute(
+            "DELETE FROM events WHERE type = ? AND reason_code = ?", (BLOCKED_HEADER_EVENT, name.lower())
+        ).rowcount
+    )
+
+
 def csp_reports(
     conn: sqlite3.Connection,
     start_ms: int,
@@ -254,8 +324,14 @@ __all__ = [
     "UA_SORTS",
     "VALUE_SORTS",
     "blocked_fingerprints",
+    "blocked_header_count",
+    "blocked_rows",
+    "clear_header_values",
     "csp_reports",
+    "header_counts",
     "header_names",
     "header_values",
+    "remove_blocked_header",
+    "remove_header",
     "user_agents",
 ]

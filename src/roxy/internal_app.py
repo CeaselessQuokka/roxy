@@ -606,9 +606,8 @@ async def _reset_run(request: Request) -> Response:
     actor = operator_actor(request)
     request_id = _request_id(ctx)
     op = data.Operation(f"reset_{secrets.token_hex(8)}", "reset", plan.label, now)
-    # The data API's fleet-wide reset lease: one reset at a time, from the dashboard or from here. (`_Lease` is
-    # private to data.py today; the integrator is asked to give it a public name.)
-    lease = data._Lease(ctx, f"{ctx.worker_id}:{op.id}")
+    # The data API's fleet-wide lease (`data.ResetLease`): one reset or backup at a time, from the dashboard or here.
+    lease = data.ResetLease(ctx, f"{ctx.worker_id}:{op.id}")
     if not await common.run_mutation(lease.acquire()):
         raise OperatorError(409, "reset_in_progress", "Another data reset is running; wait for it to finish.")
     intent = {

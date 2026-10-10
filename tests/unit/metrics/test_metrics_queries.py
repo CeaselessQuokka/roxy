@@ -180,19 +180,25 @@ async def test_kpis_compare_and_reset_notice(
         recorder.record_outcome(make_event())
     recorder.close()
     now = fake_clock.now()
+    w = q.resolve_window("1h", now=now)
+    plain = recorder.dbs.metrics.read_sync(lambda c: q.kpis_sync(c, w, now=now, compare="previous"))
+    assert (plain["tiles"]["requests"]["delta"], plain["tiles"]["requests"]["delta_pct"]) == (2, 50.0)
+    assert "notice" not in plain["tiles"]["requests"]  # no reset in either window: the delta stands
     recorder.dbs.metrics.write_sync(
         lambda c: c.execute(
             "INSERT INTO annotations (at, kind, label) VALUES (?, 'reset', 'traffic reset')", (int(now) - 10,)
         )
     )
-    w = q.resolve_window("1h", now=now)
     result = recorder.dbs.metrics.read_sync(lambda c: q.kpis_sync(c, w, now=now, compare="previous"))
     tile = result["tiles"]["requests"]
     assert tile["value"] == 6
     assert tile["previous"] == 4
-    assert tile["delta"] == 2
-    assert tile["delta_pct"] == 50.0
+    # Plan 6.8 (finding parity-12): the marker does not say what it deleted, so the tile's own window may hold
+    # partial data: a notice instead of a delta (tests/unit/metrics/test_metrics_reset_scope.py has the scoping).
+    assert (tile["delta"], tile["delta_pct"]) == (None, None)
+    assert tile["notice"].endswith("this value covers partial data.")
     assert result["tiles"]["requests_last_hour"]["value"] == 6
+    assert result["tiles"]["failures_last_hour"]["value"] == 0  # v1's twin tile (parity-2), also on the stream
     assert [n["label"] for n in result["notices"]] == ["traffic reset"]
 
 
@@ -314,7 +320,12 @@ async def test_drops_since_refusal_reasons_retries_visitors(
     read = recorder.dbs.metrics.read_sync
     assert read(lambda c: q.drops_since(c, "paused", since, now)) == 3
     reasons = read(lambda c: q.refusal_reasons(c, w))
-    assert reasons[0] == {"reason": "paused", "requests": 3, "message_source": {"custom": 3}}
+    keys = ("reason", "requests", "message_source", "last_status", "clients", "unattributed")
+    first = {key: reasons[0][key] for key in keys}
+    # No ip_hash_key in this recorder: the client is not attributed, and `clients` is a lower bound of 0.
+    assert first == {"reason": "paused", "requests": 3, "message_source": {"custom": 3}, "last_status": 503,
+                     "clients": 0, "unattributed": 3}  # fmt: skip
+    assert reasons[0]["last_ms"] == reasons[0]["first_ms"] == int(since * 1000)
     assert reasons[1]["message_source"] == {"default": 1}
     retries = read(lambda c: q.retry_stats(c, w))
     assert retries["total"] == 2

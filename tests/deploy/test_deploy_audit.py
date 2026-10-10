@@ -168,6 +168,43 @@ def test_exposure_scores_and_report_file(audit: ModuleType, layout: object, caps
     assert "problem(s)" in capsys.readouterr().out
 
 
+def test_ctl_proofs_directory_is_audited(audit: ModuleType, layout: object) -> None:
+    """Lane tooling open issue 3: `<state dir>/ctl-proofs` (scripts/ctl.py's one-use proofs for the internal socket)
+    must be the service user's own 0700 directory. Absent is fine (made on first use); looser modes, another owner
+    or a link are findings, and the proof file names inside never reach the report."""
+    root = layout.root  # type: ignore[attr-defined]
+    proofs = root / "var/lib/roxy/ctl-proofs"
+    report = audit.run_audit(layout, with_scores=False)
+    entry = next(f for f in report["findings"] if f["path"] == "/var/lib/roxy/ctl-proofs")
+    assert entry["exists"] is False
+    assert entry["ok"] is True
+    proofs.mkdir(mode=0o700)
+    proofs.chmod(0o700)
+    (proofs / "0123456789abcdef").write_text("secret")
+    report = audit.run_audit(layout, with_scores=False)
+    assert findings_with_problems(report) == {}
+    assert "0123456789abcdef" not in json.dumps(report)
+    entry = next(f for f in report["findings"] if f["path"] == "/var/lib/roxy/ctl-proofs")
+    assert (entry["exists"], entry["mode"], entry["expected"]) == (
+        True,
+        "0700",
+        f"dir, owner {layout.service_user}, mode 0700",
+    )  # type: ignore[attr-defined]
+    for loose in (0o750, 0o770, 0o777):
+        proofs.chmod(loose)
+        problems = findings_with_problems(audit.run_audit(layout, with_scores=False))
+        assert f"mode is {loose:04o}, expected 0700" in problems["/var/lib/roxy/ctl-proofs"]
+    proofs.chmod(0o700)
+    other = dataclasses.replace(layout, service_user="nobody")  # type: ignore[type-var]
+    problems = findings_with_problems(audit.run_audit(other, with_scores=False))
+    assert any(p.startswith("owner is") and p.endswith("expected nobody") for p in problems["/var/lib/roxy/ctl-proofs"])
+    (proofs / "0123456789abcdef").unlink()
+    proofs.rmdir()
+    proofs.symlink_to(root / "tmp-elsewhere")
+    problems = findings_with_problems(audit.run_audit(layout, with_scores=False))
+    assert "is a symlink" in problems["/var/lib/roxy/ctl-proofs"]
+
+
 def test_report_directory_is_audited(audit: ModuleType, layout: object) -> None:
     root = layout.root  # type: ignore[attr-defined]
     (root / "var/lib/roxy/audit").chmod(0o700)

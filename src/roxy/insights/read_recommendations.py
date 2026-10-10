@@ -251,7 +251,13 @@ def history_page(
 
 
 def watch_of(conn: sqlite3.Connection, rec_id: str) -> dict[str, Any] | None:
-    """The watch window row of one recommendation (plan 11.4), or None when it was never applied."""
+    """The watch window row of one recommendation (plan 11.4), or None when it was never applied.
+
+    `rollback` summarizes the automatic rollback for the drawer: None (none was needed, or the window is still
+    open with nothing to do), `{"status": "done"}`, `{"status": "pending", "reason", "attempts"}` (it waits for the
+    action lease or hot.db; the window stays open) or `{"status": "refused", "reason"}` (the change stays; the
+    admin was alerted). `reason` is plain text that can name an endpoint template, which comes from callers'
+    paths: render it escaped, never as HTML."""
     row = conn.execute(
         "SELECT recommendation_id, action_id, started_at, ends_at, state, baseline_json, result_json "
         "FROM recommendation_watches WHERE recommendation_id = ?",
@@ -259,14 +265,34 @@ def watch_of(conn: sqlite3.Connection, rec_id: str) -> dict[str, Any] | None:
     ).fetchone()
     if row is None:
         return None
+    state, result = str(row[4]), _decode(row[6])
     return {
         "action_id": None if row[1] is None else int(row[1]),
         "started_at": int(row[2]),
         "ends_at": int(row[3]),
-        "state": str(row[4]),
+        "state": state,
         "baseline": _decode(row[5]),
-        "result": _decode(row[6]),
+        "result": result,
+        "rollback": _rollback_summary(state, result),
     }
+
+
+def _rollback_summary(state: str, result: Any) -> dict[str, Any] | None:
+    """See `watch_of`: what happened to the automatic rollback of one watch window."""
+    if state == "rolled_back":
+        return {"status": "done"}
+    if not isinstance(result, dict):
+        return None
+    if result.get("rollback_refused"):
+        return {"status": "refused", "reason": str(result["rollback_refused"])[:300]}
+    if state == "watching" and result.get("rollback_pending"):
+        attempts = result.get("rollback_attempts")
+        return {
+            "status": "pending",
+            "reason": str(result["rollback_pending"])[:300],
+            "attempts": attempts if isinstance(attempts, int) else None,
+        }
+    return None
 
 
 def same_fingerprint(

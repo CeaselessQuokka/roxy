@@ -10,19 +10,21 @@ What this is
 
 Why it exists
     v1 exported a few tables as CSV from the browser, formula guarded (parity row 88). v2 exports every dataset as
-    CSV or JSON from the server, with the same guards everywhere: `common.export_table` quotes every cell, puts an
-    apostrophe before a cell that would start a spreadsheet formula, hashes client IP addresses unless
-    `export_include_ips` is on (plan 9.15, 12.3), caps the rows (`MAX_EXPORT_ROWS`) and writes the audit row
-    (`export.download`) before the file leaves (plan 9.7; a refused audit write is a 503 and no file).
+    CSV or JSON from the server, with the same guards everywhere: `common.export_pages` quotes every cell, puts an
+    apostrophe before a cell that would start a spreadsheet formula, hashes client IP addresses (in every cell)
+    unless `export_include_ips` is on (plan 9.15, 12.3), caps the rows (`MAX_EXPORT_ROWS`), the bytes
+    (`MAX_EXPORT_BYTES`) and the downloads a worker builds at once (`MAX_CONCURRENT_EXPORTS`), and writes the audit
+    row (`export.download`) before the file leaves (plan 9.7; a refused audit write is a 503 and no file).
 
 How it works
-    `DATASETS` maps a name to a `TableSpec` (columns, labels, help, which columns hold IP addresses) and a fetch
-    function that reads the existing read model (`metrics/queries.py`, `metrics/security_events.py`,
-    `metrics/read_errors.py`, `config/read_audit.py`, `config/read_settings.py`, the System and Data areas),
-    page by page through `common.collect_pages` where the read model pages, never more than the export cap.
+    `DATASETS` maps a name to a `TableSpec` (columns, labels, help, which columns hold IP addresses) and a page
+    reader over the existing read model (`metrics/queries.py`, `metrics/security_events.py`,
+    `metrics/read_errors.py`, `config/read_audit.py`, `config/read_settings.py`, the System and Data areas).
+    `common.export_pages` reads one page at a time and drops it once it is in the file; a read model that has no
+    pages (a summary, or rows it caps itself at the export cap) is one page (`_whole`).
 
 What to read next
-    `roxy/admin/api/common.py` (`export_table`, `render_export`, `export_ip_policy`).
+    `roxy/admin/api/common.py` (`export_pages`, `ExportBuilder`, `export_ip_policy`).
 """
 
 from __future__ import annotations
@@ -74,6 +76,19 @@ _CLIENT_COLUMNS: Final = (
     Column("rate1", "Rate 1 min", "Requests per minute over the last minute.", "per_min"),
     Column("rate5", "Rate 5 min", "Requests per minute over the last 5 minutes.", "per_min"),
     Column("rate60", "Rate 60 min", "Requests per minute over the last hour.", "per_min"),
+    Column(
+        "last_seen",
+        "Last seen",
+        "Its newest request in the range, to the minute (coarser for compacted data).",
+        "timestamp",
+    ),
+    Column(
+        "peers",
+        "Peers",
+        "Distinct places for an address, distinct addresses for a place (a lower bound under a flood).",
+        "count",
+        sortable=False,
+    ),
 )
 
 _SECURITY_COLUMNS: Final = (
@@ -89,98 +104,133 @@ _SECURITY_COLUMNS: Final = (
     Column("successful", "Successful", "Whether a login succeeded.", sortable=False),
 )
 
-Fetch = Callable[[Any, TimeRange], Awaitable[tuple[list[dict[str, Any]], int]]]
+Rows = tuple[list[dict[str, Any]], int]
+Pages = Callable[[Any, TimeRange], common.PageFetch]
+"""How a dataset is read: `pages(ctx, tr)` gives a page reader, `fetch(page, page_size) -> (items, total)`."""
 
 
 @dataclass(frozen=True, slots=True)
 class Dataset:
-    """One exportable dataset: its table spec, whether it takes a time range, and how to read it."""
+    """One exportable dataset: its table spec, whether it takes a time range, and how to read it (page by page)."""
 
     spec: TableSpec
     label: str
     description: str
     ranged: bool
-    fetch: Fetch
+    pages: Pages
 
 
 def _spec(name: str, columns: tuple[Column, ...], default_sort: str) -> TableSpec:
     return TableSpec(name=name, columns=columns, default_sort=default_sort)
 
 
-async def _top(ctx: Any, tr: TimeRange, dimension: str) -> tuple[list[dict[str, Any]], int]:
-    async def page(number: int, size: int) -> tuple[list[dict[str, Any]], int]:
-        data = await queries.top_n(ctx.dbs.metrics, tr.window, dimension, page=queries.Page(number, size, "requests"))
-        return list(data["rows"]), int(data["total"])
+def _whole(read: Callable[[Any, TimeRange], Awaitable[Rows]]) -> Pages:
+    """A reader for a dataset its read model returns in one piece (a small summary, or rows capped by the read
+    model at `MAX_EXPORT_ROWS`): all of it is page 1."""
 
-    rows, total = await common.collect_pages(page, page_size=PAGE)
-    return rows, total
+    def pages(ctx: Any, tr: TimeRange) -> common.PageFetch:
+        async def fetch(number: int, _size: int) -> Rows:
+            if number > 1:
+                return [], 0
+            return await read(ctx, tr)
 
+        return fetch
 
-async def _clients(ctx: Any, tr: TimeRange, kind: str) -> tuple[list[dict[str, Any]], int]:
-    now = ctx.clock.now()
-
-    async def page(number: int, size: int) -> tuple[list[dict[str, Any]], int]:
-        data = await queries.client_table(
-            ctx.dbs.metrics, tr.window, kind, now=now, page=queries.Page(number, size, "requests")
-        )
-        return list(data["rows"]), int(data["total"])
-
-    return await common.collect_pages(page, page_size=PAGE)
+    return pages
 
 
-async def _security(ctx: Any, tr: TimeRange, event_type: str) -> tuple[list[dict[str, Any]], int]:
-    since, until = tr.window.start * 1000, tr.window.end * 1000
-
-    async def page(number: int, size: int) -> tuple[list[dict[str, Any]], int]:
-        data = await ctx.dbs.metrics.read(
-            lambda conn: security_events.ring(
-                conn, event_type, since_ms=since, until_ms=until, limit=size, offset=(number - 1) * size
+def _top(dimension: str) -> Pages:
+    def pages(ctx: Any, tr: TimeRange) -> common.PageFetch:
+        async def fetch(number: int, size: int) -> Rows:
+            data = await queries.top_n(
+                ctx.dbs.metrics, tr.window, dimension, page=queries.Page(number, size, "requests")
             )
-        )
-        return list(data["items"]), int(data["total"])
+            return list(data["rows"]), int(data["total"])
 
-    return await common.collect_pages(page, page_size=PAGE)
+        return fetch
+
+    return pages
 
 
-async def _rows(
-    ctx: Any, tr: TimeRange, read: Callable[[Any], list[dict[str, Any]]]
-) -> tuple[list[dict[str, Any]], int]:
+def _clients(kind: str) -> Pages:
+    def pages(ctx: Any, tr: TimeRange) -> common.PageFetch:
+        now = ctx.clock.now()
+
+        async def fetch(number: int, size: int) -> Rows:
+            data = await queries.client_table(
+                ctx.dbs.metrics,
+                tr.window,
+                kind,
+                now=now,
+                page=queries.Page(number, size, "requests"),
+                extras=True,  # Last seen and peers, as the Clients tables show (finding parity-7)
+            )
+            return list(data["rows"]), int(data["total"])
+
+        return fetch
+
+    return pages
+
+
+def _security(event_type: str) -> Pages:
+    def pages(ctx: Any, tr: TimeRange) -> common.PageFetch:
+        since, until = tr.window.start * 1000, tr.window.end * 1000
+
+        async def fetch(number: int, size: int) -> Rows:
+            data = await ctx.dbs.metrics.read(
+                lambda conn: security_events.ring(
+                    conn, event_type, since_ms=since, until_ms=until, limit=size, offset=(number - 1) * size
+                )
+            )
+            return list(data["items"]), int(data["total"])
+
+        return fetch
+
+    return pages
+
+
+async def _rows(ctx: Any, tr: TimeRange, read: Callable[[Any], list[dict[str, Any]]]) -> Rows:
     rows: list[dict[str, Any]] = await ctx.dbs.metrics.read(read)
     return rows[: common.MAX_EXPORT_ROWS], len(rows)
 
 
-async def _refusals(ctx: Any, tr: TimeRange) -> tuple[list[dict[str, Any]], int]:
+async def _refusals(ctx: Any, tr: TimeRange) -> Rows:
     return await _rows(ctx, tr, lambda conn: queries.refusal_reasons(conn, tr.window))
 
 
-async def _internal(ctx: Any, tr: TimeRange) -> tuple[list[dict[str, Any]], int]:
+async def _internal(ctx: Any, tr: TimeRange) -> Rows:
     return await _rows(ctx, tr, lambda conn: queries.internal_calls(conn, tr.window))
 
 
-async def _429s(ctx: Any, tr: TimeRange) -> tuple[list[dict[str, Any]], int]:
+def _429s(ctx: Any, tr: TimeRange) -> common.PageFetch:
+    """The Roblox 429 log page by page (one page held at a time, finding mpjobs-5), with the honest total from the
+    rollups (P6: rows the recorder folded over its budget are counted there)."""
     start, end = tr.window.start, tr.window.end
 
-    def read(conn: Any) -> tuple[list[dict[str, Any]], int]:
-        rows = read_history.upstream_429_rows(conn, start, end, limit=common.MAX_EXPORT_ROWS)
-        total = read_history.roblox_429_counts(conn, start, end, group_by=()).get((), 0)  # the honest total (P6)
-        return rows, max(total, len(rows))
+    async def fetch(number: int, size: int) -> Rows:
+        def read(conn: Any) -> Rows:
+            rows = read_history.upstream_429_rows(conn, start, end, limit=size, offset=(number - 1) * size)
+            total = read_history.roblox_429_counts(conn, start, end, group_by=()).get((), 0)
+            return rows, max(total, (number - 1) * size + len(rows))
 
-    result: tuple[list[dict[str, Any]], int] = await ctx.dbs.metrics.read(read)
-    return result
+        result: Rows = await ctx.dbs.metrics.read(read)
+        return result
+
+    return fetch
 
 
-async def _errors(ctx: Any, _tr: TimeRange) -> tuple[list[dict[str, Any]], int]:
-    async def page(number: int, size: int) -> tuple[list[dict[str, Any]], int]:
+def _errors(ctx: Any, _tr: TimeRange) -> common.PageFetch:
+    async def fetch(number: int, size: int) -> Rows:
         rows, total = await ctx.dbs.metrics.read(
             lambda conn: read_errors.errors_page(conn, limit=size, offset=(number - 1) * size)
         )
         return list(rows), int(total)
 
-    return await common.collect_pages(page, page_size=PAGE)
+    return fetch
 
 
-async def _audit(ctx: Any, tr: TimeRange) -> tuple[list[dict[str, Any]], int]:
-    async def page(number: int, size: int) -> tuple[list[dict[str, Any]], int]:
+def _audit(ctx: Any, tr: TimeRange) -> common.PageFetch:
+    async def fetch(number: int, size: int) -> Rows:
         rows, total = await ctx.dbs.control.read(
             lambda conn: read_audit.audit_page(
                 conn, since=tr.window.start, until=tr.window.end, limit=size, offset=(number - 1) * size
@@ -188,11 +238,11 @@ async def _audit(ctx: Any, tr: TimeRange) -> tuple[list[dict[str, Any]], int]:
         )
         return list(rows), int(total)
 
-    return await common.collect_pages(page, page_size=PAGE)
+    return fetch
 
 
-async def _history(ctx: Any, tr: TimeRange) -> tuple[list[dict[str, Any]], int]:
-    async def page(number: int, size: int) -> tuple[list[dict[str, Any]], int]:
+def _history(ctx: Any, tr: TimeRange) -> common.PageFetch:
+    async def fetch(number: int, size: int) -> Rows:
         rows, total = await ctx.dbs.control.read(
             lambda conn: read_settings.history_page(
                 conn, since=tr.window.start, until=tr.window.end, limit=size, offset=(number - 1) * size
@@ -200,7 +250,7 @@ async def _history(ctx: Any, tr: TimeRange) -> tuple[list[dict[str, Any]], int]:
         )
         return list(rows), int(total)
 
-    return await common.collect_pages(page, page_size=PAGE)
+    return fetch
 
 
 SETTINGS_TABLE: Final = _spec(
@@ -220,7 +270,7 @@ SETTINGS_TABLE: Final = _spec(
 )
 
 
-async def _settings(ctx: Any, _tr: TimeRange) -> tuple[list[dict[str, Any]], int]:
+async def _settings(ctx: Any, _tr: TimeRange) -> Rows:
     snapshot = ctx.settings.snapshot()
     rows = [
         {
@@ -239,7 +289,7 @@ async def _settings(ctx: Any, _tr: TimeRange) -> tuple[list[dict[str, Any]], int
     return rows, len(rows)
 
 
-async def _workers(ctx: Any, _tr: TimeRange) -> tuple[list[dict[str, Any]], int]:
+async def _workers(ctx: Any, _tr: TimeRange) -> Rows:
     data = await fleet(ctx)
     rows: list[dict[str, Any]] = data["workers"]
     return rows, len(rows)
@@ -251,28 +301,28 @@ DATASETS: Final[dict[str, Dataset]] = {
         "Endpoints",
         "Every endpoint template with its traffic, cache, 429 and latency numbers.",
         True,
-        lambda ctx, tr: _top(ctx, tr, "endpoint_template"),
+        _top("endpoint_template"),
     ),
     "hosts": Dataset(
         _spec("hosts", (Column("key", "Host", "The Roblox host."), *_MEASURE_COLUMNS), "requests"),
         "Hosts",
         "Every Roblox host with its traffic, cache, 429 and latency numbers.",
         True,
-        lambda ctx, tr: _top(ctx, tr, "host"),
+        _top("host"),
     ),
     "clients_ip": Dataset(
         _spec("clients_ip", (Column("key", "Client", "The client address.", ip=True), *_CLIENT_COLUMNS), "requests"),
         "Clients by IP address",
         "Every client address with its requests, refusals, bytes and rates.",
         True,
-        lambda ctx, tr: _clients(ctx, tr, "ip"),
+        _clients("ip"),
     ),
     "clients_place": Dataset(
         _spec("clients_place", (Column("key", "Place", "The place id (Roblox-Id)."), *_CLIENT_COLUMNS), "requests"),
         "Clients by place",
         "Every place (experience) with its requests, refusals, bytes and rates.",
         True,
-        lambda ctx, tr: _clients(ctx, tr, "place"),
+        _clients("place"),
     ),
     "refusal_reasons": Dataset(
         _spec(
@@ -280,6 +330,12 @@ DATASETS: Final[dict[str, Dataset]] = {
             (
                 Column("reason", "Reason", "The refusal or failure reason code."),
                 Column("requests", "Requests", "Requests with this reason.", "count"),
+                Column("last_status", "Status", "The status code the newest of them got."),
+                Column("last_path", "Last path", "The path the newest of them asked for.", sortable=False),
+                Column("clients", "Unique clients", "Distinct client hashes (a lower bound).", "count"),
+                Column("unattributed", "Unattributed", "Refusals recorded without a client.", "count"),
+                Column("first_ms", "First seen", "When the oldest was recorded.", "timestamp_ms"),
+                Column("last_ms", "Last seen", "When the newest was recorded.", "timestamp_ms"),
                 Column("message_source", "Message", "Custom versus default message counts (row 116).", sortable=False),
             ),
             "requests",
@@ -287,7 +343,7 @@ DATASETS: Final[dict[str, Dataset]] = {
         "Refusal reasons",
         "Refusals and failures by reason, with the custom versus default message split.",
         True,
-        _refusals,
+        _whole(_refusals),
     ),
     "internal_calls": Dataset(
         _spec(
@@ -305,7 +361,7 @@ DATASETS: Final[dict[str, Dataset]] = {
         "Internal calls",
         "Roxy's own calls to Roblox (probes, lookups) by purpose.",
         True,
-        _internal,
+        _whole(_internal),
     ),
     "upstream_429": Dataset(
         _spec(
@@ -331,34 +387,34 @@ DATASETS: Final[dict[str, Dataset]] = {
         "Probes",
         "Probe and exploit attempts.",
         True,
-        lambda ctx, tr: _security(ctx, tr, security_events.PROBE),
+        _security(security_events.PROBE),
     ),
     "logins": Dataset(
         _spec("logins", _SECURITY_COLUMNS, "id"),
         "Admin logins",
         "Admin login attempts.",
         True,
-        lambda ctx, tr: _security(ctx, tr, security_events.LOGIN),
+        _security(security_events.LOGIN),
     ),
     "crawls": Dataset(
         _spec("crawls", _SECURITY_COLUMNS, "id"),
         "Crawls",
         "robots.txt and sitemap fetches.",
         True,
-        lambda ctx, tr: _security(ctx, tr, security_events.CRAWL),
+        _security(security_events.CRAWL),
     ),
     "throttled": Dataset(
         _spec("throttled", _SECURITY_COLUMNS, "id"),
         "Throttled clients",
         "Clients that became throttled.",
         True,
-        lambda ctx, tr: _security(ctx, tr, security_events.THROTTLED),
+        _security(security_events.THROTTLED),
     ),
     "errors": Dataset(ERRORS_TABLE, "Errors", "Error signatures with counts and last detail.", False, _errors),
     "audit": Dataset(AUDIT_TABLE, "Audit log", "Every admin and automatic action in the range.", True, _audit),
-    "settings": Dataset(SETTINGS_TABLE, "Settings", "Every setting with its current value.", False, _settings),
+    "settings": Dataset(SETTINGS_TABLE, "Settings", "Every setting with its current value.", False, _whole(_settings)),
     "settings_history": Dataset(HISTORY_TABLE, "Settings history", "Every settings change.", True, _history),
-    "workers": Dataset(WORKERS_TABLE, "Workers", "The worker fleet (parity row 84).", False, _workers),
+    "workers": Dataset(WORKERS_TABLE, "Workers", "The worker fleet (parity row 84).", False, _whole(_workers)),
 }
 """Every exportable dataset, by name."""
 
@@ -400,9 +456,8 @@ async def export_dataset(
         raise common.validation_error(
             {"format": "Choose csv or json."}, "Choose an export format.", code="invalid_format"
         )
-    ctx = get_ctx(request)
-    rows, total = await common.run_mutation(item.fetch(ctx, tr))
-    return await common.export_table(request, admin, item.spec, rows, fmt, total=total, tr=tr if item.ranged else None)
+    fetch = item.pages(get_ctx(request), tr)
+    return await common.export_pages(request, admin, item.spec, fetch, fmt, tr=tr if item.ranged else None)
 
 
 __all__ = ["DATASETS", "Dataset", "router"]

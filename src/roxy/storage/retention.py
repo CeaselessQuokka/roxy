@@ -23,7 +23,10 @@ How it works
       row of any key; open recommendations are never pruned; the `leader` lease row is never pruned, so its epoch
       (fencing token) keeps counting up. Rows that enforce a limit outlive the longest period the limit can
       have: an alert dedupe row outlives the longest alert cooldown (`ALERT_GATE_KEEP_S`), a login failure slot the
-      longest lockout window the catalog accepts (`LOGIN_WINDOW_MAX_S`), so pruning never reopens either early.
+      longest lockout window the catalog accepts (`LOGIN_WINDOW_MAX_S`), a strike row the decay of its last strike
+      (the escalation ladder), and a dismissed, rolled back or applied recommendation its quiet period
+      (`dismiss_cooldown_days`, the watch window), so pruning never reopens any of them early. Such rows are still
+      bounded: by a row cap that drops them last (strikes: `MAX_TRACKED_THROTTLE_IPS`, plan 15.4).
 
 What to read next
     `roxy/scheduler/jobs.py` (`register_storage_jobs` wires these to the leader), then
@@ -47,6 +50,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from roxy.config.catalog import CATALOG
+from roxy.config.constants import MAX_TRACKED_THROTTLE_IPS
 from roxy.storage.db import Database, Databases
 
 log = logging.getLogger(__name__)
@@ -60,6 +64,15 @@ AUDIT_MIN_DAYS = 400
 
 OPEN_RECOMMENDATION_STATES = ("open", "snoozed")
 """Recommendations in these states are never pruned (plan 6.10: closed items only)."""
+
+QUIET_RECOMMENDATION_STATES = ("dismissed", "rolled_back")
+"""Closed states that keep the same recommendation quiet for `dismiss_cooldown_days` unless its severity rises
+(`insights/models.py QUIET_STATES`, repeated here: storage sits below insights and must not import it; a test pins
+the two equal). The engine needs the row to know it is quiet, so retention keeps it for that long."""
+
+APPLIED_RECOMMENDATION_STATES = ("applied", "auto_applied")
+"""Closed states the engine keeps quiet during the watch window, `auto_apply_watch_minutes`
+(`insights/models.py APPLIED_STATES`, pinned equal by a test)."""
 
 NEVER_PRUNED_LEASES = frozenset({"leader"})
 """Lease rows kept forever so their epoch never restarts at 1 (plan 5.6 fencing)."""
@@ -90,6 +103,13 @@ LOGIN_WINDOW_MAX_S = _catalog_max("admin_login_window_s", DAY_S)
 """The longest login lockout window an admin may configure (plan 15.3 G, 86400 s): failure slots are kept at least
 this long, so no live window ever loses a failure it still counts (the lockout itself drops older ones)."""
 
+DISMISS_COOLDOWN_MAX_DAYS = _catalog_max("dismiss_cooldown_days", 365)
+"""The longest quiet period after a dismiss the catalog accepts (plan 15.3 J): a policy built without settings keeps
+quiet recommendations at least this long, so it can never be shorter than the live value."""
+
+WATCH_MAX_MINUTES = _catalog_max("auto_apply_watch_minutes", 240)
+"""The longest watch window after an applied change the catalog accepts (plan 15.3 J), for the same reason."""
+
 
 @dataclass(frozen=True, slots=True)
 class RetentionPolicy:
@@ -111,6 +131,10 @@ class RetentionPolicy:
     request_sample_max_rows: int = 3_000_000
     retention_recommendations_days: int = 365
     recommendations_max_rows: int = 50_000
+    # The live quiet periods (from_settings); a quiet row outlives them (finding W2H-3). Without settings the catalog
+    # maxima apply, so a default policy can only keep more.
+    dismiss_cooldown_days: int = DISMISS_COOLDOWN_MAX_DAYS
+    auto_apply_watch_minutes: int = WATCH_MAX_MINUTES
     retention_health_days: int = 180
     health_runs_max: int = 2000
     capture_ttl_seconds: int = 900
@@ -134,7 +158,8 @@ class RetentionPolicy:
     change_observations_days: int = 90
     # hot.db (pruned every minute)
     stale_ip_duration: int = 60  # idle limiter rows
-    strike_idle_s: int = 1800  # throttle_strike_decay_seconds
+    strike_idle_s: int = 1800  # throttle_strike_decay_seconds: one strike fades per this many seconds (0: never)
+    strikes_max_rows: int = MAX_TRACKED_THROTTLE_IPS  # plan 15.4; rows still penalized are never dropped
     expired_lease_grace_s: int = 60
     cooldown_grace_s: int = 3600
     upstream_bucket_idle_s: int = 3600
@@ -440,6 +465,22 @@ def prune_request_samples(conn: sqlite3.Connection, now_s: float, policy: Retent
     )
 
 
+def prune_refusal_samples(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
+    """`refusal_samples` (metrics.db schema 7): kept like `request_samples` (`request_sample_hours`,
+    `request_sample_max_rows`), the stream a limit dry run replays with them."""
+    cutoff_ms = int((now_s - policy.request_sample_hours * 3600) * 1000) if policy.request_sample_hours > 0 else None
+    return prune_age_then_cap(
+        conn,
+        "refusal_samples",
+        key="rowid",
+        time_col="at_ms",
+        cutoff=cutoff_ms,
+        cap=policy.request_sample_max_rows,
+        limit=limit,
+        order="id",
+    )
+
+
 def prune_egress_usage(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
     """`egress_usage`: minute rows like minute rollups, hour like hour rollups, day and month like day rollups."""
     deleted = 0
@@ -465,21 +506,67 @@ def prune_egress_usage(conn: sqlite3.Connection, now_s: float, policy: Retention
     return deleted
 
 
-def prune_recommendations(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
-    """`recommendations`: closed items older than `retention_recommendations_days` (365), cap 50,000 closed
-    items. Open (and snoozed) recommendations are never pruned."""
-    placeholders = ", ".join("?" for _ in OPEN_RECOMMENDATION_STATES)
-    return prune_age_then_cap(
-        conn,
-        "recommendations",
-        key="rowid",
-        time_col="updated_at",
-        cutoff=_cutoff(now_s, policy.retention_recommendations_days),
-        cap=policy.recommendations_max_rows,
-        limit=limit,
-        extra_where=f"state NOT IN ({placeholders})",
-        extra_params=OPEN_RECOMMENDATION_STATES,
+def _marks(values: tuple[str, ...]) -> str:
+    return ", ".join("?" for _ in values)
+
+
+def quiet_recommendations_where(now_s: float, policy: RetentionPolicy) -> tuple[str, tuple[Any, ...]]:
+    """SQL (and its parameters) for closed recommendations the engine still reads as quiet.
+
+    The engine stays quiet about a fingerprint while `now < updated_at + dismiss_cooldown_days` for a dismissed or
+    rolled back row, and while `now < updated_at + auto_apply_watch_minutes` for an applied one
+    (`insights/engine.py _apply_result`). The bounds here use the whole second before `now_s`, so they keep at
+    least what the engine needs (a row kept a second longer is harmless; one deleted early reopens the item).
+    """
+    now = int(now_s)
+    quiet_since = now - max(0, int(policy.dismiss_cooldown_days)) * DAY_S
+    watch_since = now - max(0, int(policy.auto_apply_watch_minutes)) * 60
+    sql = (
+        f"((state IN ({_marks(QUIET_RECOMMENDATION_STATES)}) AND updated_at > ?) "
+        f"OR (state IN ({_marks(APPLIED_RECOMMENDATION_STATES)}) AND updated_at > ?))"
     )
+    return sql, (*QUIET_RECOMMENDATION_STATES, quiet_since, *APPLIED_RECOMMENDATION_STATES, watch_since)
+
+
+def prune_recommendations(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
+    """`recommendations`: closed items older than `retention_recommendations_days` (365), then the oldest closed
+    items beyond 50,000. Open (and snoozed) recommendations are never pruned.
+
+    A closed row the engine still reads as quiet (dismissed or rolled back inside `dismiss_cooldown_days`, applied
+    inside the watch window; `quiet_recommendations_where`) is kept whatever its age: deleting it would make the
+    next evaluation open the same recommendation again, and with auto-apply on, re-apply a change an admin or the
+    watch window rolled back (finding W2H-3). The row cap counts every closed row and removes the rows that are not
+    quiet first; only when quiet rows alone exceed it are the oldest of them removed too (plan P9: the cap holds).
+    """
+    closed = f"state NOT IN ({_marks(OPEN_RECOMMENDATION_STATES)})"
+    quiet, quiet_params = quiet_recommendations_where(now_s, policy)
+    prunable = f"{closed} AND NOT {quiet}"
+    prunable_params = (*OPEN_RECOMMENDATION_STATES, *quiet_params)
+    deleted = 0
+    cutoff = _cutoff(now_s, policy.retention_recommendations_days)
+    if cutoff is not None:
+        deleted += delete_batch(
+            conn,
+            "recommendations",
+            "rowid",
+            f"{prunable} AND updated_at < ?",
+            (*prunable_params, cutoff),
+            "updated_at",
+            limit,
+        )
+    if deleted >= limit:
+        return deleted
+    count_sql = f"SELECT count(*) FROM recommendations WHERE {closed}"  # noqa: S608 (placeholders only)
+    excess = int(conn.execute(count_sql, OPEN_RECOMMENDATION_STATES).fetchone()[0]) - max(
+        0, policy.recommendations_max_rows
+    )
+    for where, params in ((prunable, prunable_params), (closed, OPEN_RECOMMENDATION_STATES)):
+        if excess <= 0 or deleted >= limit:
+            break
+        step = delete_batch(conn, "recommendations", "rowid", where, params, "updated_at", min(excess, limit - deleted))
+        deleted += step
+        excess -= step
+    return deleted
 
 
 def prune_recommendation_actions(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
@@ -803,16 +890,35 @@ def prune_limiter(conn: sqlite3.Connection, now_s: float, policy: RetentionPolic
 
 
 def prune_strikes(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
-    """`strikes`: IPs that are not throttled and have had no strike for `strike_idle_s` (strike decay)."""
-    return delete_batch(
-        conn,
-        "strikes",
-        "ip",
-        "throttled_until < ? AND last_strike_at < ?",
-        (int(now_s), int(now_s - policy.strike_idle_s)),
-        "last_strike_at",
-        limit,
+    """`strikes`: rows that no longer change any decision, then the oldest beyond `strikes_max_rows`.
+
+    A row goes once its penalty is over and every strike on it has faded. One strike fades per full `strike_idle_s`
+    (the live `throttle_strike_decay_seconds`) since the last strike (`abuse/throttle.py effective_strikes`), so all
+    of them have faded when `last_strike_at + strikes * decay <= now`; with a decay of 0 strikes never fade, and
+    only rows without strikes go. Such a row decides exactly like no row. A row that still carries strikes is kept:
+    deleting it would put a client patient enough to pause between bursts back on the first rung of the escalation
+    ladder (finding W2H-2; v1 `_prune_once` kept them too, plan 10.4). The table stays bounded (plan P9): beyond
+    `strikes_max_rows` (plan 15.4 `MAX_TRACKED_THROTTLE_IPS`) the rows whose penalty is over go, oldest last strike
+    first. A row still penalized is never dropped (that would lift its penalty early); penalties end on their own.
+    """
+    now = int(now_s)
+    decay_s = max(0, int(policy.strike_idle_s))
+    if decay_s > 0:
+        # `last_strike_at = 0` with strikes left never decays (`effective_strikes`), so it is not "faded" here.
+        faded = "(strikes <= 0 OR (last_strike_at > 0 AND last_strike_at + strikes * ? <= ?))"
+        faded_params: tuple[int, ...] = (decay_s, now)
+    else:
+        faded, faded_params = "strikes <= 0", ()
+    deleted = delete_batch(
+        conn, "strikes", "ip", f"throttled_until < ? AND {faded}", (now, *faded_params), "last_strike_at", limit
     )
+    if deleted < limit:
+        excess = int(conn.execute("SELECT count(*) FROM strikes").fetchone()[0]) - max(1, policy.strikes_max_rows)
+        if excess > 0:
+            deleted += delete_batch(
+                conn, "strikes", "ip", "throttled_until < ?", (now,), "last_strike_at", min(excess, limit - deleted)
+            )
+    return deleted
 
 
 def prune_upstream_buckets(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
@@ -971,6 +1077,7 @@ RETENTION_TASKS: tuple[RetentionTask, ...] = (
     RetentionTask("metrics", "upstream_429", prune_upstream_429),
     RetentionTask("metrics", "events", prune_events),
     RetentionTask("metrics", "request_samples", prune_request_samples),
+    RetentionTask("metrics", "refusal_samples", prune_refusal_samples),
     RetentionTask("metrics", "egress_usage", prune_egress_usage),
     RetentionTask("metrics", "recommendations", prune_recommendations),
     RetentionTask("metrics", "recommendation_actions", prune_recommendation_actions),

@@ -361,7 +361,10 @@ The page caches add up to at most 30 MiB per worker, and only fill as pages are 
 libraries, the HTTP connection pools and the recorder's counters are the remaining part; they have not been
 measured on the server yet. Each worker reports its resident memory in its heartbeat every 5 s (the `rss` field of
 `worker_heartbeat`, shown on the System page through `GET /admin/api/v1/system/workers`), so the real figure is
-visible from the first day.
+visible from the first day. The load harness measured a development machine, not the production box: an idle color
+stays below `MemoryHigh`, a color under sustained load passes it, and the leader worker kept growing over a long
+replay (finding LOAD-2). `docs/PERFORMANCE.md` has the figures and the quiet-machine commands to measure again before
+release.
 
 ### What one color may hold
 

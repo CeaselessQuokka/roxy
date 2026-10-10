@@ -15,8 +15,11 @@ Why it exists
 How it works
     One grouped SQL read over the `request_samples` time index. A sample counts as a fetch when it reached Roblox
     (`egress` is not `none`) and carries Roblox's status (`upstream_status`); samples without a cache key cannot be
-    told apart and are left out. Samples are a `request_sample_pct` share of requests: the caller scales counts
-    (`roxy/insights/rules/cache.py`). Bounded by `MAX_GROUPS`, busiest first (plan P9). Run inside `Database.read`.
+    told apart and are left out, and so are samples the cache had off (`cache_state` `OFF`: a POST kept off by
+    `cache_post_requests` carries the key the cache would use since finding insights-7, but a request the cache had
+    off cannot be helped by the error lifetime CACHE-NEG proposes). Samples are a `request_sample_pct` share of
+    requests: the caller scales counts (`roxy/insights/rules/cache.py`). Bounded by `MAX_GROUPS`, busiest first
+    (plan P9). Run inside `Database.read`.
 
 What to read next
     `roxy/metrics/samples.py` (what a sample holds), `roxy/insights/rules/cache.py` (CACHE-NEG).
@@ -46,7 +49,7 @@ def error_refetches(
         "SELECT endpoint_template, key_id, upstream_status, count(*) AS n, min(at_ms) AS first_ms, "  # noqa: S608 (only ? marks)
         "max(at_ms) AS last_ms FROM request_samples "
         f"WHERE at_ms >= ? AND at_ms < ? AND upstream_status IN ({marks}) AND key_id IS NOT NULL "
-        "AND coalesce(egress, 'none') != 'none' "
+        "AND coalesce(egress, 'none') != 'none' AND coalesce(cache_state, '') != 'OFF' "
         "GROUP BY endpoint_template, key_id, upstream_status ORDER BY n DESC, endpoint_template, key_id LIMIT ?",
         (int(start) * 1000, int(end) * 1000, *wanted, MAX_GROUPS),
     ).fetchall()

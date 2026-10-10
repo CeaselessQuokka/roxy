@@ -1,15 +1,16 @@
 """Review round 3, lens mpjobs: recommendation actions and leader jobs under concurrency and failure.
 
 What this is
-    Adversarial tests (strict xfails, one per finding) against the running app (`api_app`): a deposed leader that
-    keeps running the D7 auto-apply job, an apply that races the leader's evaluation between the API's digest
-    check and the action lease, and a busy hot.db during a recommendation action.
+    Adversarial tests (one or more per finding; mpjobs-1, 2, 3 and 8 are fixed) against the running app
+    (`api_app`): a deposed leader that keeps running the D7 auto-apply job (and the current leader's pass as the
+    control), an apply that races the leader's evaluation between the API's digest check and the action lease, a
+    busy hot.db during a recommendation action, and a D7 rollback that has to wait for the action lease.
 
 Why it exists
     Plan 5.6 (a leader whose loop stalled past its lease cannot write; auto-apply is a non-idempotent job), plan 11.3
     and P4 (a recommendation is applied exactly as previewed), C6 (every limit holds with any number of workers) and
     C7 with DESIGN.md section 13 (shared state that cannot be written answers 503 `unavailable`, never a misleading
-    conflict). Each test fails today for the reason in its xfail marker.
+    conflict), plan 11.4 (a regression is rolled back automatically and the admin is notified).
 
 How it works
     The deposed leader is made the way `LeaderElector._try_acquire` makes one: another holder takes the expired
@@ -43,6 +44,7 @@ from roxy.insights.engine import write_recommendation
 from roxy.insights.models import Evidence, ProposedChange, Recommendation, changes_digest, make_fingerprint
 from roxy.scheduler.leader import LEADER_LEASE, LostLeadership
 from roxy.storage import leases
+from roxy.storage.db import BUSY_CIRCUIT_COOLDOWN_S
 
 BASE = "recommendations"
 TEMPLATE = "games.roblox.com/v1/games"
@@ -114,12 +116,8 @@ def _cache_rule_rows(api_app: Any, pattern: str) -> int:
 # ============================================================================== mpjobs-1: deposed leader
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding mpjobs-1: insights_auto_apply ignores its JobContext (`del job`), so a deposed leader "
-    "still applies",
-)
 async def test_r3_mpjobs_deposed_leader_auto_apply_writes_nothing(api_app: Any) -> None:
+    """mpjobs-1 (fixed): the auto-apply pass claims its idempotency key and fences every apply with its context."""
     await api_app.settings(insights_auto_apply=1)
     rec = await _seed(
         api_app, rule_id="HOT-ENDPOINT", subject=TEMPLATE, changes=[_cache_rule(TEMPLATE)], safe_auto=True
@@ -137,7 +135,7 @@ async def test_r3_mpjobs_deposed_leader_auto_apply_writes_nothing(api_app: Any) 
     assert grant.epoch > old_job.epoch
 
     job = api_app.ctx.jobs.registry.get(AUTO_APPLY_JOB)
-    with contextlib.suppress(LostLeadership):  # the fenced outcome: the old run is refused before it writes
+    with pytest.raises(LostLeadership):  # the fenced outcome: the old run is refused before it writes
         await job.fn(old_job)
 
     stored = await api_app.ctx.insights.get(rec.id)
@@ -147,19 +145,61 @@ async def test_r3_mpjobs_deposed_leader_auto_apply_writes_nothing(api_app: Any) 
     # budget `auto_apply_max_per_hour` (C6) and races the new leader's watch windows.
     assert stored.state == "open", stored.state
     assert _cache_rule_rows(api_app, TEMPLATE) == 0
+    claims = await api_app.ctx.dbs.hot.read(
+        lambda c: c.execute(
+            "SELECT count(*) FROM job_runs WHERE idem_key LIKE ?", (f"job:{AUTO_APPLY_JOB}:%",)
+        ).fetchone()
+    )
+    assert claims[0] == 0  # not even the idempotency key was recorded by the deposed run
+
+
+async def test_r3_mpjobs_deposed_leader_mid_pass_is_stopped_by_the_fence(api_app: Any) -> None:
+    """mpjobs-1 (fixed): a run that lost its lease after its claim (it stalled between two recommendations) is
+    refused when it asks for the next action lease: the grant is written only while the leader lease is its own."""
+    await api_app.settings(insights_auto_apply=1)
+    rec = await _seed(
+        api_app, rule_id="HOT-ENDPOINT", subject=TEMPLATE, changes=[_cache_rule(TEMPLATE)], safe_auto=True
+    )
+    elector = await _wait_leader(api_app)
+    old_job = elector.job_context(AUTO_APPLY_JOB)
+
+    def takeover(conn: sqlite3.Connection) -> Any:
+        conn.execute("UPDATE lease SET expires_ms = 0 WHERE name = ?", (LEADER_LEASE,))
+        return leases.acquire(conn, LEADER_LEASE, "other-worker:4242:feedface", 15_000, api_app.clock.now_ms())
+
+    assert await api_app.ctx.dbs.hot.write(takeover) is not None
+    with pytest.raises(LostLeadership):
+        await api_app.ctx.insight_actions.apply(rec.id, AUTO_ACTOR, "auto-apply (D7)", auto=True, fence=old_job)
+    assert (await api_app.ctx.insights.get(rec.id)).state == "open"
+    assert _cache_rule_rows(api_app, TEMPLATE) == 0
+    held = await api_app.ctx.dbs.hot.read(lambda c: leases.holder_epoch(c, f"{ACTION_LEASE_PREFIX}{rec.id}"))
+    assert held is None  # the fenced lease write never happened
+
+
+async def test_r3_mpjobs_current_leader_auto_apply_claims_once_per_interval(api_app: Any) -> None:
+    """mpjobs-1 control: the current leader's pass applies (fenced writes succeed) and records its key; a second
+    pass in the same interval (this leader again, or the next one) does nothing."""
+    await api_app.settings(insights_auto_apply=1)
+    rec = await _seed(
+        api_app, rule_id="HOT-ENDPOINT", subject=TEMPLATE, changes=[_cache_rule(TEMPLATE)], safe_auto=True
+    )
+    elector = await _wait_leader(api_app)
+    job = api_app.ctx.jobs.registry.get(AUTO_APPLY_JOB)
+    first = await job.fn(elector.job_context(AUTO_APPLY_JOB))
+    assert first["applied"] == [rec.id], first
+    assert (await api_app.ctx.insights.get(rec.id)).state == "auto_applied"
+    assert _cache_rule_rows(api_app, TEMPLATE) == 1
+    second = await job.fn(elector.job_context(AUTO_APPLY_JOB))
+    assert second.get("skipped") == "already_ran", second
 
 
 # ============================================================================== mpjobs-2: digest race
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding mpjobs-2: apply checks the previewed digest and the high-risk confirmation before the action "
-    "lease, then applies whatever the leader's evaluation stored in between",
-)
 async def test_r3_mpjobs_apply_never_writes_an_unpreviewed_high_risk_value(
-    api: Any, api_app: Any, monkeypatch: pytest.MonkeyPatch
+    api: Any, api_app: Any, monkeypatch: pytest.MonkeyPatch, section13: Any
 ) -> None:
+    """mpjobs-2 (fixed): the previewed digest is compared again inside the action lease."""
     previewed = ProposedChange("setting", key="rotator_hard_stop_pct", current=100, proposed=90)
     rec = await _seed(api_app, rule_id="EGR-BURN", subject="rotator", changes=[previewed])
     preview = (await api.get(f"{BASE}/{rec.id}/preview")).json()
@@ -184,19 +224,18 @@ async def test_r3_mpjobs_apply_never_writes_an_unpreviewed_high_risk_value(
     # Plan 11.3 and P4: applied exactly as previewed, or refused (409 changed_since_preview). Today the admin's
     # click applies 150 (overage charges, a high-risk value) with no preview, no confirmation and no reason.
     assert applied in (90, 100), (answer.status_code, answer.text, applied)
-    if answer.status_code != 200:
-        assert answer.status_code == 409, answer.text
+    section13(answer, 409, "changed_since_preview")
+    assert applied == 100  # nothing was written
+    stored = await api_app.ctx.insights.get(rec.id)
+    assert stored is not None
+    assert stored.state == "open"  # the admin reviews the new proposal and previews again
 
 
 # ============================================================================== mpjobs-3: busy hot.db
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding mpjobs-3: a busy hot.db during a recommendation action answers 409 wrong_state "
-    "('another request is changing this recommendation') instead of 503 unavailable",
-)
 async def test_r3_mpjobs_busy_hot_db_during_an_action_is_503(api: Any, api_app: Any, section13: Any) -> None:
+    """mpjobs-3 (fixed): `SharedStateUnavailable` from the action lease is 503 `unavailable` with Retry-After."""
     rec = await _seed(api_app, rule_id="HOT-ENDPOINT", subject=TEMPLATE, changes=[_cache_rule(TEMPLATE)])
     hot_path = str(api_app.ctx.dbs.hot.path)
     locker = sqlite3.connect(hot_path, timeout=0.1, isolation_level=None, check_same_thread=False)
@@ -210,20 +249,23 @@ async def test_r3_mpjobs_busy_hot_db_during_an_action_is_503(api: Any, api_app: 
     # DESIGN.md 13.1 and C7: shared state that cannot be written is 503 `unavailable` with Retry-After; a 409
     # `wrong_state` tells the admin another admin is acting on it, so they reload and retry into the same lock.
     section13(answer, 503, "unavailable")
+    assert answer.headers.get("retry-after") == "5"
     stored = await api_app.ctx.insights.get(rec.id)
     assert stored is not None
     assert stored.state == "open"
+    # The lock is gone: once the storage layer's busy circuit closes (it fails writes at once for a short time
+    # after a full busy wait), the same request succeeds; it was never "another request changing it".
+    await asyncio.sleep(BUSY_CIRCUIT_COOLDOWN_S + 0.2)
+    snoozed = await api.post(f"{BASE}/{rec.id}/snooze", json={"duration": "1h"})
+    assert snoozed.status_code == 200, snoozed.text
 
 
 # ============================================================================== mpjobs-8: watch window
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding mpjobs-8: when the D7 rollback cannot take the action lease, insights_watch closes the regressed "
-    "watch as kept, so the automatic rollback never happens",
-)
 async def test_r3_mpjobs_a_regressed_watch_is_rolled_back_once_the_lease_frees(api_app: Any, metrics_seed: Any) -> None:
+    """mpjobs-8 (fixed): a rollback that waits for the action lease leaves the window open; the next pass rolls
+    the change back."""
     rec = await _seed(
         api_app, rule_id="HOT-ENDPOINT", subject=TEMPLATE, changes=[_cache_rule(TEMPLATE)], safe_auto=True
     )
@@ -272,3 +314,9 @@ async def test_r3_mpjobs_a_regressed_watch_is_rolled_back_once_the_lease_frees(a
     # Plan 11.4: a guard metric that got worse rolls the change back automatically and notifies the admin.
     assert stored.state == "rolled_back", stored.state
     assert _cache_rule_rows(api_app, TEMPLATE) == 0
+    watch_state = await api_app.ctx.dbs.metrics.read(
+        lambda c: c.execute(
+            "SELECT state FROM recommendation_watches WHERE recommendation_id = ?", (rec.id,)
+        ).fetchone()[0]
+    )
+    assert watch_state == "rolled_back"  # never "kept" while the recommendation is rolled back

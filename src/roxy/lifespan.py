@@ -620,8 +620,18 @@ async def _start_heartbeat_and_leader(ctx: AppContext, stack: AsyncExitStack) ->
             def policy() -> Any:
                 return retention.RetentionPolicy.from_settings(settings.get)
 
-            # `setting` lets the daily job read `maintenance_hour` and `ui_timezone` live on every run.
-            register(registry, ctx.dbs, policy, state_dir=ctx.env.state_dir, setting=settings.get)
+            # `setting` lets the daily job read `maintenance_hour` and `ui_timezone` live on every run; a failed daily
+            # quick_check sends the plan 17.7 `db_integrity` alert.
+            producers = optional_import("roxy.notify.producers")
+            on_integrity = producers.integrity_hook(ctx) if producers is not None and ctx.alerts is not None else None
+            register(
+                registry,
+                ctx.dbs,
+                policy,
+                state_dir=ctx.env.state_dir,
+                setting=settings.get,
+                on_integrity_failure=on_integrity,
+            )
         _register_package_jobs(ctx, registry)
         _register_wave3_jobs(ctx, registry)
         runner = jobs_mod.JobRunner(registry, elector, ctx.clock, worker_id=ctx.worker_id)
@@ -646,6 +656,9 @@ def _register_package_jobs(ctx: AppContext, registry: JobRegistry) -> None:
             # `RulesStore.snapshot` is a property (the compiled rules of the current config_version).
             ignored_headers=lambda: rules.snapshot.ignored_value_headers if rules is not None else (),
         )
+        # The producer history (metrics.db schema 5): the hourly disk and table size samples SYS-DISK and the Data
+        # page read, and the prune that bounds every schema 5 table. Leader only, never at start (lane_producers).
+        metrics_jobs.register_producer_jobs(registry, ctx.dbs, ctx.settings.get, state_dir=ctx.env.state_dir)
     upstream_jobs = optional_import("roxy.upstream.jobs")
     if upstream_jobs is not None and ctx.upstream is not None:
         upstream_jobs.register_upstream_jobs(registry, ctx.upstream)
@@ -698,6 +711,11 @@ def _register_wave3_jobs(ctx: AppContext, registry: JobRegistry) -> None:
     system_api = optional_import("roxy.admin.api.system")
     if system_api is not None:
         system_api.register_jobs(registry, ctx)
+    # The plan 17.7 alerts that watch numbers (Roblox 429 and caller 5xx rates, storage, backups, the daily digest):
+    # leader jobs of `notify/producers.py`, none at start.
+    alert_producers = optional_import("roxy.notify.producers")
+    if alert_producers is not None and ctx.alerts is not None and ctx.recorder is not None:
+        alert_producers.register_jobs(registry, ctx)
 
 
 def _start_insights(ctx: AppContext) -> None:

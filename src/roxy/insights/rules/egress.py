@@ -256,21 +256,20 @@ class EgrUnderuse(Rule):
         budget: extra.RotatorBudget,
         rotator: Mapping[Any, Mapping[str, Any]],
     ) -> Recommendation | None:
-        pattern = simulate.template_pattern(template)
         covering = ctx.rules.routing_rule_for(template)
         if covering is not None and covering.enabled and covering.mode in ROTATOR_MODES:
             return None  # already routed to the rotator
-        own = next((r for r in ctx.rules.routing_rules if r.pattern == pattern and r.type == "glob"), None)
+        own = simulate.own_template_row(ctx.rules.routing_rules, template)
         if own is not None:
             current: dict[str, Any] | None = own.model_dump()
             match = {"pattern": own.pattern, "type": own.type}
             proposed: dict[str, Any] = {"mode": PREFERRED_MODE, "enabled": True}
         else:
             current = None
-            match = {"pattern": pattern, "type": "glob"}
+            # Plan 11.5 "for the named templates only": exactly this template (finding insights-8).
+            match = simulate.template_match(template)
             proposed = {
-                "pattern": pattern,
-                "type": "glob",
+                **match,
                 "mode": PREFERRED_MODE,
                 "note": "EGR-UNDERUSE: Roblox limits the direct path here, the rotator is healthy.",
             }

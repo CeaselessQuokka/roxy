@@ -49,7 +49,7 @@ from roxy.insights import providers_rules_abuse_system as facts
 from roxy.insights.context import InsightContext
 from roxy.insights.models import Evidence, ProposedChange, Recommendation, iso
 from roxy.insights.rules.base import Rule, register
-from roxy.insights.simulate import template_pattern
+from roxy.insights.simulate import names_template, template_match
 from roxy.metrics.templating import OTHER
 from roxy.rules.match import compile_pattern, specificity
 
@@ -1417,24 +1417,25 @@ class PlaceHeavy(Rule):
                 f"Counts come from request samples taken at {sample_pct:g}% (shares stay unbiased)."
             )
         evidence.links.append(f"{CLIENTS_LINK}?place={place}")
-        pattern = template_pattern(template) if template else ""
-        existing = next(
-            (r for r in await ctx.rule_rows("rules_endpoint_limit") if pattern and str(r["pattern"]) == pattern), None
-        )
+        # The template's own endpoint rule (the exact regex a recommendation writes, or the legacy v1 glob), and a
+        # new one for exactly this template, so it refuses what `would_be_refused` counts and nothing below it
+        # (finding insights-8).
+        rows = await ctx.rule_rows("rules_endpoint_limit") if template else []
+        existing = next((r for r in rows if names_template(str(r["pattern"]), str(r["type"]), template)), None)
         refused = 0
         if template and existing is None:
             per_minute = await facts.sampled_upstream_minutes(ctx, window, place, template)
             refused = sum(max(0, n - cap) for n in per_minute.values())
             evidence.add("would_be_refused", refused, "requests")
+            match = template_match(template)
             changes = [
                 ProposedChange(
                     "rule_upsert",
                     table="rules_endpoint_limit",
-                    match={"pattern": pattern, "type": "glob"},
+                    match=dict(match),
                     current=None,
                     proposed={
-                        "pattern": pattern,
-                        "type": "glob",
+                        **match,
                         "scope": "place",
                         "limit": cap,
                         "period": PLACE_RULE_PERIOD_S,

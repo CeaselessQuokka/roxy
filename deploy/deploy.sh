@@ -26,10 +26,12 @@
 #   5. Health gate: the idle color's internal socket must report Ready, PersistenceOK and Version=<sha> within
 #      60 s, then scripts/smoke_remote.py checks the public pages on its port.
 #   6. Install the nginx config through the root wrapper if it changed, then switch nginx to the idle color.
-#   7. Watch the new color for 60 s (internal readiness, and the public /health through nginx, which must be
-#      answered by Roxy v2 itself: during the cutover v1's nginx site can still own the host name).
+#   7. Watch the new color for 60 s: 12 checks 5 s apart, counted rather than timed by the wall clock (internal
+#      readiness, and the public /health through nginx, which must be answered by Roxy v2 itself: during the
+#      cutover v1's nginx site can still own the host name).
 #   8. Drain, stop the old color and wait until it is inactive (its shutdown flushes metrics). In low-memory mode,
-#      add workers to the new color through its gunicorn control socket. Keep the newest 5 releases.
+#      add workers to the new color through its gunicorn control socket. Keep the newest 5 releases by deploy order
+#      (a sequence number each deploy or rollback writes into the release it starts, never file times).
 #   9. Record the dependency audit of this commit in /var/lib/roxy-deploy/advisories.json (health check H-VERSION:
 #      the count CI's pip-audit found, passed by the workflow as ROXY_ADVISORY_COUNT; "not recorded" when the deploy
 #      was started by hand), record the commit in /var/lib/roxy-deploy/deployed_version (roxy-audit.path then runs
@@ -108,6 +110,8 @@ export UV_NO_PROGRESS=1
 REQUIRED_PATHS=(pyproject.toml uv.lock src/roxy deploy/deploy.sh deploy/deploy_rollback.sh deploy/gunicorn.conf.py
   deploy/prestart.py deploy/nginx/roxy.conf.template scripts/smoke_remote.py scripts/build_static.py)
 RELEASE_STAMP=".roxy-release-complete"
+# The deploy order of a release: written by every deploy or rollback that starts it (mark_release_used).
+RELEASE_SEQUENCE=".roxy-release-sequence"
 NGINX_MANIFEST=".roxy-nginx-manifest"
 # The audit record a release was deployed with, kept in the release so a rollback can put it back.
 RELEASE_ADVISORIES=".roxy-advisories.json"
@@ -432,6 +436,31 @@ release_in_use() {
   return 1
 }
 
+# The deploy sequence number of a release directory: 0 when it has none (a release only an older deploy.sh used).
+release_sequence() {
+  local seq=""
+  if [ -r "$1/$RELEASE_SEQUENCE" ]; then
+    IFS= read -r seq <"$1/$RELEASE_SEQUENCE" || true
+  fi
+  [[ "$seq" =~ ^[0-9]{1,18}$ ]] || seq=0
+  printf '%s' "$((10#$seq))"
+}
+
+# Give $RELEASE the next deploy sequence number: one more than the highest any release on disk carries (the
+# newest release is always kept, so the numbers only grow). keep_releases orders by it, never by file times: a
+# wall clock that steps back (NTP; WSL steps about 0.9 s) could make a newer release look older and get it
+# removed. The deploy lock makes the read and the write one step.
+mark_release_used() {
+  local dir seq highest=0
+  for dir in "$RELEASES_DIR"/*; do
+    # The current-<color> links name releases that are counted under their own names.
+    if [ ! -d "$dir" ] || [ -L "$dir" ]; then continue; fi
+    seq="$(release_sequence "$dir")"
+    if [ "$seq" -gt "$highest" ]; then highest="$seq"; fi
+  done
+  write_file "$RELEASE/$RELEASE_SEQUENCE" "$((highest + 1))"
+}
+
 fetch_release() {
   local url shown branch required
   # repo_url runs in a subshell, so the message is given here, where die can record it for the alert.
@@ -473,6 +502,7 @@ build_release() {
   if [ "$BUILT_NEW" = 0 ]; then
     log "Dependencies unchanged; keeping the existing environment."
     touch "$RELEASE/$RELEASE_STAMP"
+    mark_release_used
     return 0
   fi
   log "Dependencies changed (or no usable environment); rebuilding."
@@ -484,6 +514,7 @@ build_release() {
   "$RELEASE/.venv/bin/python" "$RELEASE/scripts/build_static.py" --out "$RELEASE/build/public"
   chmod -R go-w "$RELEASE"
   printf '%s\n' "$SHA" >"$RELEASE/$RELEASE_STAMP"
+  mark_release_used
 }
 
 choose_colors() {
@@ -596,11 +627,26 @@ switch_traffic() {
   sudo "$SWITCH_COLOR" "$IDLE_COLOR"
 }
 
+# How many watch checks span WATCH_S at one every WATCH_INTERVAL_S (rounded up, at least 1). awk, because bash
+# arithmetic has no fractions and the tests watch in tenths of a second; the margin absorbs float rounding.
+watch_checks() {
+  awk -v span="$WATCH_S" -v every="$WATCH_INTERVAL_S" 'BEGIN {
+    rounds = (every > 0) ? span / every : 1
+    whole = int(rounds)
+    if (whole < rounds - 1e-9) whole += 1
+    if (whole < 1) whole = 1
+    print whole
+  }'
+}
+
 watch_new_color() {
-  local want="${RELEASE##*/}" deadline failures=0
-  step 7 "watching $IDLE_COLOR for ${WATCH_S} s"
-  deadline=$((SECONDS + WATCH_S))
-  while [ "$SECONDS" -lt "$deadline" ]; do
+  local want="${RELEASE##*/}" checks check failures=0
+  # A fixed number of checks, WATCH_INTERVAL_S apart, that together span WATCH_S (60 s / 5 s: 12 checks). Counting
+  # checks rather than comparing whole seconds of the wall clock ($SECONDS) means a busy machine or a clock step
+  # never cuts the watch down to one check (or none), which would let a failing new color through.
+  checks="$(watch_checks)"
+  step 7 "watching $IDLE_COLOR for ${WATCH_S} s ($checks checks, ${WATCH_INTERVAL_S} s apart)"
+  for ((check = 1; check <= checks; check++)); do
     sleep "$WATCH_INTERVAL_S"
     if ! ready_ok "$IDLE_COLOR" "$want"; then
       failures=$((failures + 1))
@@ -667,7 +713,8 @@ scale_up() {
 
 keep_releases() {
   local dir kept=0
-  # Newest first by the completion stamp (touched on every deploy that uses the release). The newest
+  # Newest first by the deploy sequence number (mark_release_used: every deploy or rollback that starts a release
+  # gives it the next number), never by file times, which a clock stepping back can reorder. The newest
   # KEEP_RELEASES stay; a release a color points at is never removed, however old.
   while IFS= read -r dir; do
     [ -n "$dir" ] || continue
@@ -676,10 +723,15 @@ keep_releases() {
     log "Removing old release ${dir##*/}."
     rm -rf "$dir"
   done < <(
-    # find does not follow symlinks, so the current-<color> links are never listed (or removed) themselves.
-    # %T@ has sub-second precision, so releases built within the same second still sort correctly.
+    # Only complete builds count. find does not follow symlinks, so the current-<color> links are never listed
+    # (or removed) themselves. Releases without a sequence number (used only by an older deploy.sh) sort after
+    # every numbered one, newest stamp first among themselves.
     find "$RELEASES_DIR" -mindepth 2 -maxdepth 2 -type f -name "$RELEASE_STAMP" -printf '%T@ %h\n' |
-      sort -rn | cut -d' ' -f2- | grep -E '/[0-9a-f]{40}$' || true
+      grep -E '/[0-9a-f]{40}$' |
+      while IFS=' ' read -r stamped dir; do
+        printf '%s %s %s\n' "$(release_sequence "$dir")" "$stamped" "$dir"
+      done |
+      LC_ALL=C sort -k1,1nr -k2,2nr | cut -d' ' -f3- || true
   )
 }
 
@@ -810,6 +862,7 @@ rollback_target() {
   SHA="$(basename "$target")"
   log "Rolling back to ${SHA:0:12} on $IDLE_COLOR."
   touch "$RELEASE/$RELEASE_STAMP"
+  mark_release_used
 }
 
 main() {

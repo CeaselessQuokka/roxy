@@ -27,9 +27,13 @@ How it works
       (`router = common.area_router("<area>")`). Every route under it, nested routers included, is inspected
       through FastAPI's route contexts: its dependency tree must contain the admin guard (`require_admin("session")`
       or `require_admin("fresh_mfa")`, found by the guard's function name in `roxy.admin.auth.deps`) and, for
-      unsafe methods, `require_csrf` (from `roxy.admin.auth.deps` or its re-export in `roxy.deps`). A failed check
-      raises `ApiMountError` naming the module, the route and the rule. The event stream module follows the same
-      rules except the route class (a stream has no body to validate; it uses `area_router("stream")` anyway).
+      unsafe methods, `require_csrf` (from `roxy.admin.auth.deps` or its re-export in `roxy.deps`). A guard made
+      with `allow_bootstrap=True` (it admits a bootstrap session, password plus emailed code before any
+      authenticator is enrolled, D5) is refused outside `deps.ENROLL_PATHS`; its options are read from the guard
+      (`guard_options`), and a guard whose options cannot be read counts as admitting bootstrap sessions (fail
+      closed). A failed check raises `ApiMountError` naming the module, the route and the rule. The event stream
+      module follows the same rules except the route class (a stream has no body to validate; it uses
+      `area_router("stream")` anyway).
     * Nested prefixes: an area whose prefix lies under another area's (`/export/llm` under `/export`) is included
       before it, so the parent's path parameters (`/export/{dataset}`) never shadow it. Areas keep the
       `API_MODULES` order otherwise.
@@ -50,6 +54,7 @@ What to read next
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Iterator, Sequence
 from typing import Any, Final
 
@@ -132,8 +137,40 @@ def _is_admin_guard(call: Any) -> bool:
     return getattr(call, "__module__", None) == _GUARD_MODULE and getattr(call, "__name__", "") in _ADMIN_GUARD_NAMES
 
 
+GUARD_OPTIONS: Final[tuple[str, ...]] = ("scope", "allow_bootstrap", "activity")
+"""The arguments of `require_admin(scope, *, allow_bootstrap, activity)` that `guard_options` reports."""
+
+
+def guard_options(call: Any) -> dict[str, Any]:
+    """The options an admin guard instance was made with (`GUARD_OPTIONS`), empty for any other callable.
+
+    Read from attributes of the same names when the guard carries them, else from the guard's closure (the values
+    `require_admin` captured). An option that cannot be read is left out, and `admits_bootstrap` then fails closed.
+    """
+    if not _is_admin_guard(call):
+        return {}
+    try:
+        captured: dict[str, Any] = dict(inspect.getclosurevars(call).nonlocals)
+    except (TypeError, ValueError):
+        captured = {}
+    options: dict[str, Any] = {}
+    for name in GUARD_OPTIONS:
+        if hasattr(call, name):
+            options[name] = getattr(call, name)
+        elif name in captured:
+            options[name] = captured[name]
+    return options
+
+
+def admits_bootstrap(call: Any) -> bool:
+    """True for an admin guard made with `allow_bootstrap=True` (or one whose options cannot be read)."""
+    options = guard_options(call)
+    return _is_admin_guard(call) and options.get("allow_bootstrap", True) is not False
+
+
 def guard_scopes(dependant: Any) -> frozenset[str]:
-    """The admin guard scopes (`session`, `fresh_mfa`) in a dependency tree, and `csrf` when `require_csrf` is in it.
+    """The admin guard scopes (`session`, `fresh_mfa`) in a dependency tree, `bootstrap` when a guard there admits a
+    bootstrap session (`admits_bootstrap`), and `csrf` when `require_csrf` is in it.
 
     The security route discovery test and the mount checks read routes the same way, through this function.
     """
@@ -141,6 +178,8 @@ def guard_scopes(dependant: Any) -> frozenset[str]:
     for call in _dependency_calls(dependant):
         if _is_admin_guard(call):
             found.add(str(call.__name__).removeprefix("require_admin_"))
+            if admits_bootstrap(call):
+                found.add("bootstrap")
         elif call in _CSRF_GUARDS:
             found.add("csrf")
     return frozenset(found)
@@ -156,6 +195,11 @@ def check_route(route: Any, path: str, methods: set[str], *, module: str, route_
     calls = list(_dependency_calls(route.dependant))
     if not any(_is_admin_guard(call) for call in calls):
         raise ApiMountError(f"{where} must depend on require_admin('session') or require_admin('fresh_mfa')")
+    if path not in auth_deps.ENROLL_PATHS and any(admits_bootstrap(call) for call in calls):
+        raise ApiMountError(
+            f"{where} depends on require_admin(..., allow_bootstrap=True), which admits a bootstrap session (D5); "
+            "only the enrollment routes may (deps.ENROLL_PATHS)"
+        )
     if methods & UNSAFE_METHODS and not any(call in _CSRF_GUARDS for call in calls):
         raise ApiMountError(f"{where} changes state and must also depend on require_csrf")
 
@@ -302,6 +346,7 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "API_MODULES",
     "API_PACKAGE",
+    "GUARD_OPTIONS",
     "MOUNTED",
     "OPENAPI_PATH",
     "OPENAPI_URL",
@@ -309,10 +354,12 @@ __all__ = [
     "UNSAFE_METHODS",
     "ApiMountError",
     "admin_api_contexts",
+    "admits_bootstrap",
     "api_router",
     "build_api_router",
     "check_area_router",
     "check_route",
+    "guard_options",
     "guard_scopes",
     "openapi_document",
 ]

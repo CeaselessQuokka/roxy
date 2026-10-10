@@ -19,7 +19,9 @@ How it works
 
 What to read next
     `roxy/main.py` (how a request travels through the app), `roxy/lifespan.py` (what a worker does at startup),
-    then `roxy/core/__init__.py`. The full guided reading order (plan 18.5) is written in the last phase.
+    then `roxy/core/__init__.py`. The full guided reading order (plan 18.5) is `docs/LEARNING_PATH.md`; the
+    architecture, security model and runbooks are `docs/ARCHITECTURE.md`, `docs/SECURITY.md` and
+    `docs/RUNBOOKS.md`.
 """
 
 __version__ = "2.0.0"

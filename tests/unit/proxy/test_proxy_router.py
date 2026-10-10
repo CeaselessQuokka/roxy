@@ -627,3 +627,50 @@ async def test_a_credential_piece_in_roblox_id_never_reaches_the_request(
     assert scrubbed.place_id
     assert secret[:24] not in scrubbed.place_id
     assert plain.place_id == "4483381587"  # an ordinary place id is unchanged
+
+
+# --- a refusal's record names the rule rows the verdict matched (lane producers request) ------------------------------
+
+
+async def test_a_refusal_record_names_the_rule_rows_the_verdict_matched(
+    proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any
+) -> None:
+    """`Refuse.matches` reaches the outcome event (the refusal event's `rules`), so the Protection attempts tabs know
+    which rule refused without matching the patterns again. Allowed requests and the proxy's own refusals carry none."""
+    from roxy.abuse.verdict import Allow, Refuse
+    from roxy.metrics.recorder import OutcomeEvent
+
+    matched = {"rules_endpoint_block": "7", "access_list": "3"}
+    ctx.abuse = fakes.FakeAbuse(
+        Refuse(
+            status=403,
+            body="This endpoint is currently blocked.",
+            reason=ReasonCode.ENDPOINT_BLOCKED,
+            check="endpoint_block",
+            matches=dict(matched),
+        )
+    )
+    assert (await proxy_client.get(GAMES)).status_code == 403
+    ctx.abuse = fakes.FakeAbuse(Allow(headers={}, matches={"rules_endpoint_limit": "4"}))
+    assert (await proxy_client.get(GAMES)).status_code == 200
+    assert (await proxy_client.get("/this-is-not-roblox")).status_code == 404  # `respond.Refusal`: no matches
+    refused, allowed, probe = ctx.recorder.events
+    assert all(isinstance(event, OutcomeEvent) for event in ctx.recorder.events)
+    assert refused.matches == matched
+    assert allowed.matches is None  # a served answer is no refusal (its hits went to the rule hit counters)
+    assert probe.matches is None
+
+
+def test_refusal_matches_are_bounded_and_plain_strings() -> None:
+    from types import SimpleNamespace
+
+    from roxy.proxy.router import MAX_EVENT_MATCHES, refusal_matches
+
+    assert refusal_matches(None) is None
+    assert refusal_matches(SimpleNamespace(matches={})) is None
+    assert refusal_matches(SimpleNamespace()) is None
+    many = SimpleNamespace(matches={f"table_{i}": i for i in range(20)})
+    out = refusal_matches(many)
+    assert out is not None
+    assert len(out) == MAX_EVENT_MATCHES
+    assert all(isinstance(key, str) and isinstance(value, str) for key, value in out.items())

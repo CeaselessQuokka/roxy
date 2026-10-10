@@ -16,6 +16,16 @@ How it works
     - Leader-only jobs run only while `elector.is_leader`, each with a `JobContext` carrying the epoch it started
       under (so its writes are fenced, see leader.py). A job that becomes due while this worker is a follower
       waits; when this worker becomes the leader, overdue jobs run on the next tick.
+    - The schedule of leader jobs is fleet-wide (plan 5.6, C6). Every leader run first records its start in hot.db
+      `job_runs` under the key `schedule:<name>` (a fenced write: a run that lost the lease records nothing and
+      does not run). A worker that becomes the leader (a new epoch) reads those rows before it starts anything and
+      runs each job no earlier than one interval after its last start anywhere in the fleet (that wait never more
+      than one interval, in case a clock stepped), and no earlier than its own schedule says (`run_at_start=False`
+      jobs still wait one interval after this worker started, so a deploy never starts the health run at once).
+      Without that, each worker's own memory decided, so a leader change (every blue/green deploy, `max_requests`
+      recycle or crash) reran every job at once: the hourly LLM export file twice in an hour (finding mpjobs-7). A
+      job with no row (a fresh fleet, or a row older than the 7 day `job_runs` retention) keeps this worker's own
+      schedule.
     - Jobs with `idempotent=False` get an idempotency key `job:<name>:<bucket>` recorded in hot.db `job_runs`
       before they run (the bucket is the interval number, or what `bucket_fn` returns). If the key exists the
       run is skipped, so a leadership change can never send the same alert or digest twice.
@@ -32,6 +42,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sqlite3
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -49,6 +60,38 @@ JobFn = Callable[[JobContext], Awaitable[Any]]
 MAX_JOB_TIMEOUT_S = 600.0
 MAX_CONCURRENT_JOBS = 4
 """Jobs running at once per worker (plan 5.6: a cap on concurrency)."""
+
+SCHEDULE_PREFIX = "schedule:"
+"""`job_runs` key prefix of the fleet-wide schedule rows: `schedule:<job name>`, `started_at` = the job's last start
+(wall seconds) anywhere in the fleet, `epoch` = the leader epoch it ran under (module docstring)."""
+
+MAX_SCHEDULE_ROWS = 512
+"""Schedule rows read when a worker becomes the leader (plan P9). One row per leader job name, a short code list;
+rows of jobs a release no longer has go with the 7 day `job_runs` retention."""
+
+
+def schedule_key(name: str) -> str:
+    """The `job_runs` key of a leader job's schedule row."""
+    return f"{SCHEDULE_PREFIX}{name}"
+
+
+def record_start(conn: sqlite3.Connection, name: str, epoch: int, started_at: float) -> None:
+    """Record that leader job `name` starts now (run it inside the run's fenced hot.db write)."""
+    conn.execute(
+        "INSERT INTO job_runs (idem_key, epoch, started_at, finished_at) VALUES (?, ?, ?, NULL) "
+        "ON CONFLICT (idem_key) DO UPDATE SET epoch = excluded.epoch, started_at = excluded.started_at",
+        (schedule_key(name), int(epoch), int(started_at)),
+    )
+
+
+def read_schedule(conn: sqlite3.Connection, *, limit: int = MAX_SCHEDULE_ROWS) -> dict[str, int]:
+    """`{job name: last start (wall seconds)}` from the schedule rows, at most `limit` of them."""
+    # A primary key range scan: every key from "schedule:" up to (not including) "schedule;" (":" + 1 is ";").
+    rows = conn.execute(
+        "SELECT idem_key, started_at FROM job_runs WHERE idem_key >= ? AND idem_key < ? LIMIT ?",
+        (SCHEDULE_PREFIX, SCHEDULE_PREFIX[:-1] + chr(ord(SCHEDULE_PREFIX[-1]) + 1), int(limit)),
+    ).fetchall()
+    return {str(row[0])[len(SCHEDULE_PREFIX) :]: int(row[1]) for row in rows}
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +247,7 @@ class JobRunner:
         self._limit = asyncio.Semaphore(max_concurrent)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._status: dict[str, JobStatus] = {}
+        self._synced_epoch: int | None = None  # the leader epoch whose fleet schedule this runner has read
 
     def _status_for(self, job: Job) -> JobStatus:
         status = self._status.get(job.name)
@@ -233,10 +277,64 @@ class JobRunner:
             ready.append(job)
         return ready
 
+    async def sync_schedule(self) -> bool:
+        """Once per leadership term: schedule every leader job from the fleet's record of its last start.
+
+        Returns True when leader jobs may start (this worker is not the leader, the record was read for this
+        epoch, or there is no hot.db to read it from), False when hot.db could not be read: leader jobs then wait
+        for the next tick (they need hot.db for their fenced writes anyway).
+        """
+        elector = self.elector
+        if elector is None or not elector.is_leader:
+            return True
+        epoch = elector.state.epoch
+        if epoch == self._synced_epoch:
+            return True
+        hot = getattr(elector, "hot", None)
+        if hot is None:
+            self._synced_epoch = epoch
+            return True
+        try:
+            starts = await hot.read(read_schedule)
+        except SharedStateUnavailable as exc:
+            log.warning("job_schedule_unavailable", extra={"fields": {"epoch": epoch, "error": str(exc)[:200]}})
+            return False
+        applied = self.apply_schedule(starts)
+        self._synced_epoch = epoch
+        log.info("job_schedule_synced", extra={"fields": {"epoch": epoch, "jobs": applied}})
+        return True
+
+    def apply_schedule(self, starts: dict[str, int]) -> int:
+        """Move each leader job's next run to at least one interval after its last start in the fleet. Returns how
+        many jobs had a row.
+
+        The fleet's wait is cut to [0, interval] (a start stamped in the future, from a clock that stepped, can never
+        push a job back by more than one interval), and the later of it and this worker's own schedule wins: a
+        takeover never runs a job earlier than this worker would have, and never sooner than one interval after the
+        fleet last ran it. An overdue job whose own schedule is due runs at once.
+        """
+        now, mono = self.clock.now(), self.clock.monotonic()
+        applied = 0
+        for job in self.registry.all():
+            last = starts.get(job.name)
+            if not job.leader_only or last is None:
+                continue
+            interval = job.interval()
+            status = self._status_for(job)
+            if interval <= 0 or status.running:
+                continue
+            wait = min(max(0.0, last + interval - now), interval)
+            status.next_due_mono = max(status.next_due_mono, mono + wait)
+            applied += 1
+        return applied
+
     async def tick(self) -> list[str]:
         """Start every due job (each in its own task). Returns the names started."""
         started: list[str] = []
+        leader_ready = await self.sync_schedule()
         for job in self.due():
+            if job.leader_only and not leader_ready:
+                continue
             ctx = self._context(job)
             if ctx is None:
                 continue
@@ -271,6 +369,12 @@ class JobRunner:
             bucket: str | int | None = None
             try:
                 async with asyncio.timeout(job.timeout()):
+                    if job.leader_only and ctx.hot is not None and ctx.epoch > 0:
+                        # The fleet-wide schedule (module docstring); fenced, so a stale leader neither records nor
+                        # runs. One small hot.db write per leader run, never on the request path.
+                        await ctx.fenced_write(
+                            ctx.hot, lambda conn: record_start(conn, job.name, ctx.epoch, started_wall)
+                        )
                     if not job.idempotent:
                         bucket = job.bucket(ctx)
                         if not await ctx.claim(bucket):

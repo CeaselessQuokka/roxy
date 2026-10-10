@@ -18,8 +18,10 @@ How it works
        (all problems are collected, not just the first), require a reason for high-risk values, check `source`.
     2. Inside one `BEGIN IMMEDIATE` write: read the current overrides (so the decision never uses a stale cached
        copy), keep only DIRTY keys (whose stored override actually changes), run the cross-field rules on the
-       merged result (only issues that involve a changed key block the change), then write settings, history,
-       audit and the version bump. A value equal to its catalog default deletes the override, so `settings` keeps
+       merged result (only issues that involve a changed key block the change), run the caller's `guard` on the
+       dirty keys (`PendingWrite`: the admin API refuses there a stale second factor or arming the spam detectors,
+       judged on what control.db holds, not on a worker's lagging snapshot), then write settings, history, audit
+       and the version bump. A value equal to its catalog default deletes the override, so `settings` keeps
        holding only real overrides (plan 6.2) and a future change of the default applies.
     3. After the commit, this worker's `RuntimeSettings` reloads at once; the others follow within a second.
     In history rows, `old_json` and `new_json` hold the OVERRIDE as JSON, and NULL means "no override, the
@@ -38,7 +40,7 @@ import logging
 import re
 import secrets
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
@@ -173,6 +175,32 @@ class ImportPreview:
         return tuple(item for item in self.items if item.status in ("change", "reset"))
 
 
+@dataclass(frozen=True, slots=True)
+class PendingWrite:
+    """What a write is about to change, decided inside its control.db transaction (what a `WriteGuard` judges).
+
+    `dirty` maps every key whose stored override changes to `(effective value before, effective value after)`,
+    thawed to plain JSON shapes; `value(key)` is any key's effective value as control.db holds it before the write.
+    A guard judges the write on exactly the data the write uses, never on a worker's settings snapshot, which may be
+    up to `CONFIG_POLL_INTERVAL_S` behind a change another worker made (review finding secfix-1: a request that
+    "changes nothing" by a lagging snapshot still writes every key whose stored value differs).
+    """
+
+    dirty: Mapping[str, tuple[Any, Any]]
+    overrides: Mapping[str, Any]
+    defaults: Mapping[str, Any]
+
+    def value(self, key: str) -> Any:
+        """The effective value of `key` before this write: its stored override, else its catalog default."""
+        return thaw(self.overrides[key]) if key in self.overrides else thaw(self.defaults.get(key))
+
+
+WriteGuard = Callable[[PendingWrite], None]
+"""A check run inside the write transaction once the dirty keys are known (after the cross-field rules). It raises to
+refuse the whole write (the transaction rolls back and the exception reaches the caller unchanged) and returns None
+to let it go on. It runs on the database's writer thread, so it must not do I/O or await."""
+
+
 @dataclass(slots=True)
 class _Plan:
     """A validated change plan ready for the write transaction."""
@@ -181,6 +209,7 @@ class _Plan:
     action: str
     source: str
     warnings: list[str] = field(default_factory=list)
+    guard: WriteGuard | None = None
 
 
 def check_source(source: str) -> str:
@@ -233,13 +262,16 @@ class SettingsService:
         source: str = "admin",
         *,
         request_id: str | None = None,
+        guard: WriteGuard | None = None,
     ) -> UpdateResult:
         """Validate `changes` (key -> raw value) and apply the dirty ones in one transaction.
 
-        Raises `SettingsUpdateError` with every problem found; nothing is written then.
+        Raises `SettingsUpdateError` with every problem found; nothing is written then. `guard` (see `WriteGuard`)
+        judges the dirty keys inside the transaction; whatever it raises refuses the whole write.
         """
         reason_text = check_reason(reason)
         plan = self._plan(changes, reason_text, source, action="setting.update")
+        plan.guard = guard
         return await self._apply(plan, actor, reason_text, request_id)
 
     async def reset_to_default(
@@ -250,12 +282,13 @@ class SettingsService:
         source: str = "admin",
         *,
         request_id: str | None = None,
+        guard: WriteGuard | None = None,
     ) -> UpdateResult:
         """Remove the override of `key` so it follows its catalog default again (parity row 124)."""
         resolved = catalog.resolve_key(key) if self._specs is catalog.CATALOG else key
         if resolved is None or resolved not in self._specs:
             raise SettingsUpdateError({key: "Unknown setting"})
-        plan = _Plan({resolved: RESET}, "setting.reset", check_source(source))
+        plan = _Plan({resolved: RESET}, "setting.reset", check_source(source), guard=guard)
         return await self._apply(plan, actor, check_reason(reason), request_id)
 
     async def revert(
@@ -265,6 +298,7 @@ class SettingsService:
         reason: str,
         *,
         request_id: str | None = None,
+        guard: WriteGuard | None = None,
     ) -> UpdateResult:
         """Put a key back to the value it had before history row `history_id` (itself audited, source `revert`)."""
         entry = await self._db.read(lambda conn: _history_row(conn, history_id))
@@ -282,7 +316,7 @@ class SettingsService:
                 target = catalog.validate_spec_value(self._specs[entry.key], entry.old)
             except SettingValidationError as exc:
                 raise SettingsUpdateError({entry.key: f"The earlier value is no longer valid: {exc.message}"}) from None
-        plan = _Plan({entry.key: target}, "setting.revert", "revert")
+        plan = _Plan({entry.key: target}, "setting.revert", "revert", guard=guard)
         current = self._runtime.snapshot().overrides.get(entry.key, _MISSING) if self._runtime else _MISSING
         if self._runtime is not None and not _same_override(current, _override_or_missing(entry.new)):
             plan.warnings.append(f"{entry.key} was changed again after history entry {history_id}")
@@ -380,6 +414,7 @@ class SettingsService:
         *,
         replace: bool = False,
         request_id: str | None = None,
+        guard: WriteGuard | None = None,
     ) -> UpdateResult:
         """Apply an export document atomically (source `import`). Refused entirely if any entry is invalid."""
         preview = await self.preview_import(document, replace=replace)
@@ -387,7 +422,7 @@ class SettingsService:
         if errors or preview.cross:
             raise SettingsUpdateError(errors, preview.cross)
         reason_text = check_reason(reason)
-        plan = _Plan(dict(preview.plan), "settings.import", "import")
+        plan = _Plan(dict(preview.plan), "settings.import", "import", guard=guard)
         if not preview.catalog_version_matches:
             plan.warnings.append("The export was made with a different settings catalog version")
         self._require_reason_for_risk(plan.values, reason_text)
@@ -485,6 +520,22 @@ class SettingsService:
             issues = _relevant_cross(catalog.validate_cross(merged, catalog=specs), set(dirty))
             if issues:
                 raise SettingsUpdateError(cross=issues)
+            if plan.guard is not None:
+                # The caller's own rules (fresh second factor, arming, confirmation) on what this transaction is
+                # about to write, so no worker's lagging snapshot can let a change through (finding secfix-1).
+                plan.guard(
+                    PendingWrite(
+                        {
+                            key: (
+                                thaw(defaults[key] if old is _MISSING else old),
+                                thaw(defaults[key] if new is _MISSING else new),
+                            )
+                            for key, (old, new) in dirty.items()
+                        },
+                        current,
+                        defaults,
+                    )
+                )
             results: list[SettingChange] = []
             for key, (old, new) in dirty.items():
                 if new is _MISSING:
@@ -670,10 +721,12 @@ __all__ = [
     "HistoryNotFound",
     "ImportItem",
     "ImportPreview",
+    "PendingWrite",
     "SettingChange",
     "SettingsService",
     "SettingsUpdateError",
     "UpdateResult",
+    "WriteGuard",
     "check_reason",
     "check_source",
     "service_for",

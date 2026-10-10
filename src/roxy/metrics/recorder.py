@@ -55,6 +55,17 @@ How it works
       (`_ShutdownBudgetTarget`): a metrics.db locked by another process costs the budget, not SQLite's 5 s per
       write, and the numbers that could not be written are lost (metrics degrade open, C7; finding mp-6).
       `close()` is the synchronous form for scripts and tests.
+    - Reset fences (plan 6.8, finding parity-4; v1's `ClearEpochs`): a data reset deletes metrics.db rows, but every
+      worker still holds the counts it gathered since its last flush, and the next flush would write them back.
+      So the reset first appends a fence to the control.db `service_state` key `RESET_FENCE_KEY` (what it covers:
+      tables, matching values, a date range; see `FenceSelector`). Every batch handler of this recorder runs
+      behind `ResetFences.apply`, which reads that key inside the metrics.db write transaction (a WAL read, never a
+      wait) and drops, or for the latency and cache statistics families rewrites, the covered items of the batch
+      in hand and of the next one: those may hold counts from before the reset. Reading inside the transaction is
+      what makes it exact with any number of workers (C6): a flush that committed before the fence was written is
+      deleted by the reset that follows it, one that commits after it sees the fence. The worker running the reset
+      calls `note_reset_fence` and flushes before it deletes, so its later counts are kept at once. At most two
+      flush intervals of a worker's counts of the reset family are lost around a reset.
 
 What to read next
     `roxy/metrics/rollups.py` (what a flush writes and how the leader compacts it), `roxy/storage/batch.py`,
@@ -93,9 +104,28 @@ from roxy.metrics.capture import (
 )
 from roxy.metrics.fingerprints import FingerprintAggregator, FingerprintItem, write_fingerprints
 from roxy.metrics.live import LIVE_EVENT, LIVE_EVENTS_PER_SECOND, LiveRing, RateGate, live_entry
-from roxy.metrics.producers import ProducerHistory, write_producers
-from roxy.metrics.rollups import ClientDelta, EgressDelta, RollupDelta, write_clients, write_egress_usage, write_rollups
-from roxy.metrics.samples import SampleRow, should_sample, write_samples
+from roxy.metrics.producers import ProducerHistory, ProducerItem, write_producers
+from roxy.metrics.rollups import (
+    DIM_COLUMNS,
+    PAIR_CLIENT_TYPE,
+    ClientDelta,
+    EgressDelta,
+    RollupDelta,
+    pair_key,
+    split_pair,
+    write_clients,
+    write_egress_usage,
+    write_rollups,
+)
+from roxy.metrics.samples import (
+    MAX_REFUSAL_SAMPLES_PER_MINUTE,
+    RefusalSample,
+    SampleRow,
+    should_sample,
+    should_sample_refusal,
+    write_refusal_samples,
+    write_samples,
+)
 from roxy.metrics.templating import MAX_HOSTS, MAX_TEMPLATES, OTHER, TEMPLATE_VERSION, VocabularyGate, template_for
 from roxy.storage.batch import BatchWriter
 from roxy.storage.db import Database, Databases
@@ -159,6 +189,7 @@ KIND_AGG_EVENTS = "metrics.events_aggregated"
 KIND_FINGERPRINTS = "metrics.fingerprints"
 KIND_CAPTURES = "metrics.captures"
 KIND_SAMPLES = "metrics.samples"
+KIND_REFUSAL_SAMPLES = "metrics.refusal_samples"
 KIND_LIVE = "metrics.live"
 PRIORITIES: dict[str, int] = {
     KIND_ROLLUPS: 100,
@@ -173,6 +204,7 @@ PRIORITIES: dict[str, int] = {
     KIND_FINGERPRINTS: 40,
     KIND_CAPTURES: 20,
     KIND_SAMPLES: 10,
+    KIND_REFUSAL_SAMPLES: 8,
     KIND_LIVE: 5,
 }
 
@@ -385,6 +417,362 @@ class _ShutdownBudgetTarget:
         return getattr(self.db, name)
 
 
+# --- reset fences (plan 6.8, finding parity-4; see the module docstring) ----------------------------------------
+
+RESET_FENCE_KEY = "metrics_reset_fences"
+"""control.db `service_state` key: `{"seq": n, "fences": [{"seq", "at_ms", "selectors"}, ...]}`, the latest data
+resets that deleted or rewrote metrics.db rows (written by `admin/api/data.py`, newest last)."""
+MAX_RESET_FENCES = 16
+"""Fences kept in that key (plan P9). A worker that missed some (more than this many resets between two of its
+flushes) treats the gap as a reset of every table it writes, for its next two batches."""
+MAX_FENCE_SELECTORS = 64
+"""Selectors one fence holds (a reset plan has far fewer metrics.db parts)."""
+MAX_FENCE_VALUES = 32
+"""Values one selector column may list."""
+FENCE_START_MARGIN_MS = 5_000
+"""On its first look a worker applies only fences written after it started (minus this margin, which covers a wall
+clock step back): a worker that started after a reset holds nothing from before it."""
+FENCE_ACTIONS = frozenset({"delete", "clear_latency", "clear_cache_state"})
+"""What a selector does to a covered item: drop it, or (rollups only) empty its histograms or clear its cache
+state, the in-memory twins of `admin/api/data.py` part actions."""
+CACHE_LOOKUP_STATES: tuple[str, ...] = (
+    CacheState.HIT.value,
+    CacheState.REVALIDATING.value,
+    CacheState.STALE.value,
+    CacheState.COALESCED.value,
+    CacheState.MISS.value,
+)
+"""The cache states that are cache statistics (a lookup that hit, served stale or missed); `OFF` and `n/a` are not."""
+CLEARED_CACHE_STATE = "cleared"
+"""The `dims.cache_state` of requests whose cache state a cache statistics reset cleared (v1 "Clear stats" zeroed
+hits, misses, stale and coalesced together but kept the request counts, parity-8): the request stays in every
+Traffic total and is no longer a hit or a miss."""
+
+_HISTORY_KEY_COLUMNS: dict[str, tuple[str, ...]] = {
+    "bucket_minute": ("bucket_start", "bucket_key"),
+    "worker_minute": ("bucket_start", "worker_id"),
+    "cache_minute": ("bucket_start",),
+    "cache_eviction_passes": (),
+    "rule_hits": ("table_name", "rule_key"),
+    "error_minute": ("signature", "bucket_start"),
+    "upstream_attempt_minute": (
+        "bucket_start",
+        "endpoint_template",
+        "egress",
+        "attempt",
+        "kind",
+        "status",
+        "challenge",
+        "html_body",
+        "exit_id",
+    ),
+    "rule_hit_minute": ("bucket_start", "table_name", "rule_key"),
+    "tarpit_minute": ("bucket_start", "category", "kind"),
+    "tarpit_hold_minute": ("bucket_start", "category", "bound_ms"),
+    "client_score_hour": ("bucket_start", "client_key"),
+    "metrics_pipeline_minute": ("bucket_start", "worker_id"),
+}
+"""The key columns of each history and producer item, in `key` order (the first columns of its INSERT; pinned by a
+test against the statements), so a fence can match them by name."""
+
+_FINGERPRINT_TABLES = {"h": "fingerprint_headers", "v": "fingerprint_values", "u": "fingerprint_user_agents"}
+_DIM_INDEX = {name: index for index, name in enumerate(DIM_COLUMNS)}
+
+FENCED_TABLES = frozenset(
+    {
+        "rollup_minute",
+        "client_minute",
+        "egress_usage",
+        "upstream_429",
+        "events",
+        "errors",
+        "captures",
+        "request_samples",
+        "refusal_samples",
+        *_FINGERPRINT_TABLES.values(),
+        *_HISTORY_KEY_COLUMNS,
+    }
+)
+"""Every metrics.db table this recorder writes: the tables a reset fence can name."""
+
+
+def fence_table(item: Any) -> str | None:
+    """The metrics.db table a pending item of this recorder goes to (None for an unknown item)."""
+    if isinstance(item, RollupDelta):
+        return "rollup_minute"
+    if isinstance(item, HistoryItem | ProducerItem):
+        return item.table
+    if isinstance(item, EventRecord):
+        return "events"
+    if isinstance(item, ClientDelta):
+        return "client_minute"
+    if isinstance(item, EgressDelta):
+        return "egress_usage"
+    if isinstance(item, Upstream429Row):
+        return "upstream_429"
+    if isinstance(item, ErrorDelta):
+        return "errors"
+    if isinstance(item, FingerprintItem):
+        return _FINGERPRINT_TABLES.get(item.kind)
+    if isinstance(item, CaptureRow):
+        return "captures"
+    if isinstance(item, SampleRow):
+        return "request_samples"
+    if isinstance(item, RefusalSample):
+        return "refusal_samples"
+    return None
+
+
+def _fence_value(table: str, item: Any, column: str) -> Any:
+    """The value of `column` (a metrics.db column name) in a pending item of `table`, or None.
+
+    `client_minute` also has `pair_ip` and `pair_place`, the two halves of a `pair` row's key, so a reset of one
+    client fences the pairs it is part of."""
+    if table == "client_minute" and column in ("pair_ip", "pair_place"):
+        found = split_pair(item.client_key) if item.client_type == PAIR_CLIENT_TYPE else None
+        return None if found is None else found[0 if column == "pair_ip" else 1]
+    if table == "rollup_minute":
+        index = _DIM_INDEX.get(column)
+        if index is not None:
+            return item.dims[index] if index < len(item.dims) else None
+        return getattr(item, column, None)
+    columns = _HISTORY_KEY_COLUMNS.get(table)
+    if columns is not None:
+        if column not in columns:
+            return None
+        position = columns.index(column)
+        return item.key[position] if position < len(item.key) else None
+    return getattr(item, column, None)
+
+
+def _fence_time_s(table: str, item: Any) -> int | None:
+    """When a pending item happened (Unix seconds), or None when it carries no time."""
+    bucket = _fence_value(table, item, "bucket_start")
+    if isinstance(bucket, int | float):
+        return int(bucket)
+    if table == "cache_eviction_passes" and getattr(item, "values", None):
+        return int(item.values[0])
+    for name, scale in (("at_ms", 1000), ("at_s", 1), ("last_seen", 1)):
+        value = getattr(item, name, None)
+        if isinstance(value, int | float):
+            return int(value) // scale
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class FenceSelector:
+    """What one reset covers in one table: items of `table` whose columns hold one of the `match` values (every
+    listed column must match; none listed means every item), inside `[start, end)` when the reset had a date range.
+    `action` is applied to a covered item (`FENCE_ACTIONS`)."""
+
+    table: str
+    action: str = "delete"
+    match: tuple[tuple[str, frozenset[str]], ...] = ()
+    start: int | None = None
+    end: int | None = None
+
+    @classmethod
+    def parse(cls, raw: Any) -> FenceSelector | None:
+        """A selector from its JSON form (None for anything malformed: an unknown table or action never matches)."""
+        if not isinstance(raw, Mapping):
+            return None
+        table = raw.get("table")
+        action = raw.get("action", "delete")
+        if table not in FENCED_TABLES or action not in FENCE_ACTIONS:
+            return None
+        match: list[tuple[str, frozenset[str]]] = []
+        found = raw.get("match") or {}
+        if not isinstance(found, Mapping):
+            return None
+        for column, values in list(found.items())[:8]:
+            if not isinstance(values, list) or not values:
+                return None  # a column with no allowed value would match nothing: refuse rather than guess
+            match.append((str(column), frozenset(str(v) for v in values[:MAX_FENCE_VALUES])))
+        window = raw.get("range")
+        start = end = None
+        if window is not None:
+            if not isinstance(window, list) or len(window) != 2:
+                return None
+            try:
+                start, end = int(window[0]), int(window[1])
+            except (TypeError, ValueError):
+                return None
+        return cls(str(table), str(action), tuple(match), start, end)
+
+    def covers(self, table: str, item: Any, now_s: int) -> bool:
+        if table != self.table:
+            return False
+        for column, allowed in self.match:
+            value = _fence_value(table, item, column)
+            if value is None or str(value) not in allowed:
+                return False
+        if self.start is not None and self.end is not None:
+            at = _fence_time_s(table, item)
+            at = now_s if at is None else at  # a pending item without a time is recent
+            if not self.start <= at < self.end:
+                return False
+        return True
+
+    def act(self, item: Any) -> Any:
+        """The item after this selector's action: None to drop it."""
+        if self.action == "delete":
+            return None
+        if not isinstance(item, RollupDelta):
+            return item  # the rewriting actions exist for rollups only
+        if self.action == "clear_latency":
+            return replace(item, latency_hist=None, queue_wait_hist=None)
+        dims = list(item.dims)
+        dims[_DIM_INDEX["cache_state"]] = CLEARED_CACHE_STATE
+        cleared = tuple(dims)
+        return replace(item, dims=cleared, dim_hash=dims_hash(cleared))
+
+
+@dataclass(slots=True)
+class _ActiveFence:
+    seq: int
+    selectors: tuple[FenceSelector, ...]
+    until_drain: int  # batches drained up to this sequence number are covered
+
+
+class ResetFences:
+    """One worker's view of the reset fences (see the module docstring); every batch handler runs behind `apply`.
+
+    `drained()` counts the batch writer's drains (one per flush). A fence first seen while writing batch n covers
+    batches n and n + 1: batch n + 1 started gathering before this worker could know of the reset. A fence this
+    worker wrote itself (`note_local`, then a flush) covers the batches drained up to that flush only.
+    """
+
+    def __init__(self, read: Callable[[], str | None], clock: Clock) -> None:
+        self._read = read
+        self._clock = clock
+        self._lock = threading.Lock()  # handlers run on the metrics writer thread; drains and notes on the loop
+        self._drain_seq = 0
+        self._seen: int | None = None  # newest fence seq this worker knows (None before its first look)
+        self._text: str | None = None
+        self._started_ms = int(clock.now_ms())
+        self._active: list[_ActiveFence] = []
+        self._local: dict[int, int] = {}
+        self.changed = 0  # items a fence dropped or rewrote
+        self.read_errors = 0
+
+    def drained(self) -> None:
+        """The batch writer took a new batch (called by the recorder's first drain source)."""
+        with self._lock:
+            self._drain_seq += 1
+
+    def note_local(self, seq: int) -> None:
+        """This worker wrote fence `seq` and flushes next: batches drained from then on are clean."""
+        with self._lock:
+            self._local[int(seq)] = self._drain_seq
+            while len(self._local) > MAX_RESET_FENCES:
+                self._local.pop(next(iter(self._local)))
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "active": len(self._active),
+                "seen": self._seen or 0,
+                "changed": self.changed,
+                "read_errors": self.read_errors,
+            }
+
+    def _learn(self, text: str | None) -> None:
+        """Take note of fences newer than the last one seen. Caller holds `_lock`."""
+        if text == self._text and self._seen is not None:
+            return
+        fences: list[tuple[int, int, tuple[FenceSelector, ...]]] = []
+        try:
+            document = json.loads(text) if text else {}
+        except ValueError:
+            document = {}
+        listed = document.get("fences") if isinstance(document, dict) else None
+        for raw in listed[-MAX_RESET_FENCES:] if isinstance(listed, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                seq, at_ms = int(raw.get("seq", 0)), int(raw.get("at_ms", 0))
+            except (TypeError, ValueError):
+                continue
+            selectors = tuple(
+                s for s in (FenceSelector.parse(r) for r in (raw.get("selectors") or [])[:MAX_FENCE_SELECTORS]) if s
+            )
+            fences.append((seq, at_ms, selectors))
+        fences.sort(key=lambda fence: fence[0])
+        newest = max((fence[0] for fence in fences), default=0)
+        first_look = self._seen is None
+        seen = self._seen or 0
+        if newest < seen:
+            seen = newest  # the key was written anew (its sequence started again): adopt it
+        if first_look:
+            floor = self._started_ms - FENCE_START_MARGIN_MS
+            new = [fence for fence in fences if fence[1] >= floor]
+        else:
+            new = [fence for fence in fences if fence[0] > seen]
+            if fences and fences[0][0] > seen + 1:
+                # Fences between were pushed out of the bounded key before this worker saw them: cover everything.
+                every = tuple(FenceSelector(table) for table in sorted(FENCED_TABLES))
+                new.insert(0, (fences[0][0] - 1, 0, every))
+        for seq, _at_ms, selectors in new:
+            local = self._local.pop(seq, None)
+            until = (local + 1) if local is not None else (self._drain_seq + 1)
+            if selectors:
+                self._active.append(_ActiveFence(seq, selectors, until))
+        del self._active[: max(0, len(self._active) - 2 * MAX_RESET_FENCES)]
+        self._seen = max(seen, newest)
+        self._text = text
+
+    def apply(self, items: list[Any]) -> None:
+        """Drop or rewrite, in place, the items of this batch that a reset fence covers.
+
+        Runs on the metrics writer thread inside the batch's write transaction. The fence key is read from
+        control.db there; when it cannot be read, the fences already known still apply (metrics degrade open, C7).
+        In place, because the batch writer puts the same list back after a failed write.
+        """
+        try:
+            text = self._read()
+            known = True
+        except Exception:
+            known = False
+        with self._lock:
+            if known:
+                self._learn(text)
+            else:
+                self.read_errors += 1
+            current = self._drain_seq
+            self._active = [fence for fence in self._active if fence.until_drain >= current]
+            active = list(self._active)
+        if not active or not items:
+            return
+        now_s = int(self._clock.now())
+        kept: list[Any] = []
+        changed = 0
+        for item in items:
+            table = fence_table(item)
+            result = item
+            if table is not None:
+                for fence in active:
+                    for selector in fence.selectors:
+                        if result is not None and selector.covers(table, result, now_s):
+                            result = selector.act(result)
+                            changed += 1
+            if result is not None:
+                kept.append(result)
+        if changed:
+            items[:] = kept
+            with self._lock:
+                self.changed += changed
+
+    def wrap(self, handler: Callable[[Any, list[Any]], None]) -> Callable[[Any, list[Any]], None]:
+        """A batch handler that applies the fences to its items first (and writes nothing when none is left)."""
+
+        def fenced(conn: Any, items: list[Any]) -> None:
+            self.apply(items)
+            if items:
+                handler(conn, items)
+
+        return fenced
+
+
 class MetricsRecorder:
     """Per-worker metrics: in-memory aggregation flushed through a `BatchWriter` (see the module docstring)."""
 
@@ -443,8 +831,14 @@ class MetricsRecorder:
         self.live_sampled_out = 0
         self.rollup_overflow = 0
         self.dims_last_minute = 0
+        # Refusal samples kept in the current minute, and those left out over the per-minute bound (finding LOGICFIX-5).
+        self._refusal_minute = -1
+        self._refusal_kept = 0
+        self.refusal_samples_capped = 0
         # Schema version 5 producer history; at each flush it also writes how many items this worker dropped.
         self.producers = ProducerHistory(clock=self.clock, worker_id=worker_id, counters=self._drop_counters)
+        # Data resets fence off what this worker gathered before them (plan 6.8, parity-4; module docstring).
+        self.fences = ResetFences(self._read_fence_text, self.clock)
         self._register_kinds()
         # Capture rows are built on the encoder's thread (LOOP-1). `make_row` is looked up when each capture is
         # built, so it stays this module's name for the function (tests wrap it to see which thread runs it).
@@ -487,31 +881,76 @@ class MetricsRecorder:
         self._metrics_target = _ShutdownBudgetTarget(self.dbs.metrics)
         metrics = cast(Database, self._metrics_target)
         b = self.batch
-        b.register(KIND_ROLLUPS, metrics, write_rollups, priority=PRIORITIES[KIND_ROLLUPS], source=self._drain_rollups)
+        fenced = self.fences.wrap  # every handler applies the data reset fences first (parity-4)
         b.register(
-            KIND_EGRESS, metrics, write_egress_usage, priority=PRIORITIES[KIND_EGRESS], source=self._drain_egress
+            KIND_ROLLUPS, metrics, fenced(write_rollups), priority=PRIORITIES[KIND_ROLLUPS], source=self._drain_rollups
         )
-        b.register(KIND_429, metrics, _write_429, priority=PRIORITIES[KIND_429])
-        b.register(KIND_CLIENTS, metrics, write_clients, priority=PRIORITIES[KIND_CLIENTS], source=self._drain_clients)
-        b.register(KIND_HISTORY, metrics, write_history, priority=PRIORITIES[KIND_HISTORY], source=self._drain_history)
         b.register(
-            KIND_PRODUCERS, metrics, write_producers, priority=PRIORITIES[KIND_PRODUCERS], source=self.producers.drain
+            KIND_EGRESS,
+            metrics,
+            fenced(write_egress_usage),
+            priority=PRIORITIES[KIND_EGRESS],
+            source=self._drain_egress,
         )
-        b.register(KIND_ERRORS, metrics, _write_errors, priority=PRIORITIES[KIND_ERRORS], source=self._drain_errors)
-        b.register(KIND_EVENTS, metrics, write_events, priority=PRIORITIES[KIND_EVENTS])
+        b.register(KIND_429, metrics, fenced(_write_429), priority=PRIORITIES[KIND_429])
         b.register(
-            KIND_AGG_EVENTS, metrics, write_events, priority=PRIORITIES[KIND_AGG_EVENTS], source=self._drain_agg_events
+            KIND_CLIENTS, metrics, fenced(write_clients), priority=PRIORITIES[KIND_CLIENTS], source=self._drain_clients
+        )
+        b.register(
+            KIND_HISTORY, metrics, fenced(write_history), priority=PRIORITIES[KIND_HISTORY], source=self._drain_history
+        )
+        b.register(
+            KIND_PRODUCERS,
+            metrics,
+            fenced(write_producers),
+            priority=PRIORITIES[KIND_PRODUCERS],
+            source=self.producers.drain,
+        )
+        b.register(
+            KIND_ERRORS, metrics, fenced(_write_errors), priority=PRIORITIES[KIND_ERRORS], source=self._drain_errors
+        )
+        b.register(KIND_EVENTS, metrics, fenced(write_events), priority=PRIORITIES[KIND_EVENTS])
+        b.register(
+            KIND_AGG_EVENTS,
+            metrics,
+            fenced(write_events),
+            priority=PRIORITIES[KIND_AGG_EVENTS],
+            source=self._drain_agg_events,
         )
         b.register(
             KIND_FINGERPRINTS,
             metrics,
-            self._write_fingerprints,
+            fenced(self._write_fingerprints),
             priority=PRIORITIES[KIND_FINGERPRINTS],
             source=self.fingerprints.drain,
         )
-        b.register(KIND_CAPTURES, metrics, self._write_captures, priority=PRIORITIES[KIND_CAPTURES])
-        b.register(KIND_SAMPLES, metrics, write_samples, priority=PRIORITIES[KIND_SAMPLES])
-        b.register(KIND_LIVE, metrics, write_events, priority=PRIORITIES[KIND_LIVE])
+        b.register(KIND_CAPTURES, metrics, fenced(self._write_captures), priority=PRIORITIES[KIND_CAPTURES])
+        b.register(KIND_SAMPLES, metrics, fenced(write_samples), priority=PRIORITIES[KIND_SAMPLES])
+        b.register(
+            KIND_REFUSAL_SAMPLES,
+            metrics,
+            fenced(write_refusal_samples),
+            priority=PRIORITIES[KIND_REFUSAL_SAMPLES],
+        )
+        b.register(KIND_LIVE, metrics, fenced(write_events), priority=PRIORITIES[KIND_LIVE])
+
+    def _read_fence_text(self) -> str | None:
+        """The reset fence key from control.db (on the metrics writer thread, inside its transaction; a WAL read)."""
+        control = getattr(self.dbs, "control", None)
+        if control is None:
+            return None
+
+        def read(conn: sqlite3.Connection) -> str | None:
+            row = conn.execute("SELECT value_json FROM service_state WHERE key = ?", (RESET_FENCE_KEY,)).fetchone()
+            return None if row is None else str(row[0])
+
+        text: str | None = control.read_sync(read)
+        return text
+
+    def note_reset_fence(self, seq: int) -> None:
+        """This worker wrote reset fence `seq` and will flush before the reset deletes anything (`admin/api/data.py`):
+        what it gathered until that flush is fenced off, what comes after is kept."""
+        self.fences.note_local(seq)
 
     def _write_fingerprints(self, conn: Any, items: list[FingerprintItem]) -> None:
         write_fingerprints(conn, items, value_cap=self._config.value_cap, hash_key=self.ip_hash_key)
@@ -633,7 +1072,14 @@ class MetricsRecorder:
             # A local OPTIONS answer never reached the cache or Roblox: not a proxied request to sample (spec-7).
             local = ev.reason == ReasonCode.OPTIONS_LOCAL
             if not local and should_sample(str(ev.outcome), cfg.request_sample_pct, self._rng):
-                self.batch.add(KIND_SAMPLES, self._sample_row(ev, dims[0]))
+                self.batch.add(KIND_SAMPLES, self._sample_row(ev, dims[0], cfg.request_sample_pct))
+            elif (
+                ev.outcome == Outcome.REFUSED
+                and should_sample_refusal(str(ev.reason), cfg.request_sample_pct, self._rng)
+                and self._take_refusal_slot(minute)
+            ):
+                # A request a limiter refused, for the limit dry runs (finding LOGICFIX-5), bounded per minute.
+                self.batch.add(KIND_REFUSAL_SAMPLES, self._refusal_sample(ev, dims[0], cfg.request_sample_pct))
         except Exception:
             self._count_error("record_outcome")
         return capture_id
@@ -643,7 +1089,9 @@ class MetricsRecorder:
         refused = 1 if ev.outcome == Outcome.REFUSED else 0
         served = 1 if ev.outcome in (Outcome.SERVED_UPSTREAM, Outcome.SERVED_CACHE) else 0
         size = max(0, int(ev.caller_bytes_out))
-        for ctype, key in (("ip", ip_key(ev.client_ip)), ("place", place_key(ev.place_id))):
+        ip, place = ip_key(ev.client_ip), place_key(ev.place_id)
+        # The pair row keeps which IP called as which place (v1's peer columns, finding parity-7); no endpoints.
+        for ctype, key in (("ip", ip), ("place", place), (PAIR_CLIENT_TYPE, pair_key(ip, place))):
             if not key:
                 continue
             slot = (minute, ctype, key)
@@ -661,6 +1109,8 @@ class MetricsRecorder:
             agg.refused += refused
             agg.served += served
             agg.bytes += size
+            if ctype == PAIR_CLIENT_TYPE:
+                continue  # a pair's busiest endpoint is its IP's: not counted twice
             if template in agg.endpoints or len(agg.endpoints) < MAX_ENDPOINTS_PER_CLIENT:
                 agg.endpoints[template] = agg.endpoints.get(template, 0) + 1
 
@@ -710,11 +1160,15 @@ class MetricsRecorder:
             # The rule rows the abuse verdict matched (`Refuse.matches`): the attempts tabs can name the rule that
             # refused without matching the patterns again. Table names are fixed; row ids are short keys.
             detail["rules"] = {str(t)[:64]: str(k)[:64] for t, k in list(ev.matches.items())[:8]}
-        summary = (
+        summary: dict[str, Any] = (
             {"status": int(ev.status), "message_source": ev.message_source[:16]}
             if ev.message_source
             else {"status": int(ev.status)}
         )
+        if event_type == FAILURE_EVENT and ev.egress != Egress.NONE:
+            # A failure folded over the event budget keeps its egress (3 values, bounded), so the Upstream failure
+            # log groups it under its egress and the cards' last error agrees under a flood (parity rows 71, 72).
+            summary["egress"] = str(ev.egress)
         self._event(
             int(ev.at_ms),
             event_type,
@@ -727,7 +1181,7 @@ class MetricsRecorder:
             summary_detail=summary,
         )
 
-    def _sample_row(self, ev: OutcomeEvent, template: str) -> SampleRow:
+    def _sample_row(self, ev: OutcomeEvent, template: str, pct: float) -> SampleRow:
         return SampleRow(
             at_ms=int(ev.at_ms),
             key_id=ev.cache_key_id,
@@ -741,7 +1195,31 @@ class MetricsRecorder:
             body_hash=ev.body_hash,
             bytes=max(0, int(ev.caller_bytes_out)),
             auth_class=str(ev.auth_class),
+            sample_pct=float(pct),  # the rate this row was taken at (finding LOGICFIX-6)
         )
+
+    def _refusal_sample(self, ev: OutcomeEvent, template: str, pct: float) -> RefusalSample:
+        return RefusalSample(
+            at_ms=int(ev.at_ms),
+            reason=str(ev.reason),
+            endpoint_template=template,
+            method=ev.method[:12],
+            client_hash=self._hash_ip(ev.client_ip),
+            place=ev.place_id,
+            sample_pct=float(pct),
+        )
+
+    def _take_refusal_slot(self, minute: int) -> bool:
+        """One of this minute's `MAX_REFUSAL_SAMPLES_PER_MINUTE` refusal samples, or False (counted) when none is
+        left: a flood the limiter refuses never multiplies metrics writes (plan P9)."""
+        with self._lock:
+            if minute != self._refusal_minute:
+                self._refusal_minute, self._refusal_kept = minute, 0
+            if self._refusal_kept >= MAX_REFUSAL_SAMPLES_PER_MINUTE:
+                self.refusal_samples_capped += 1
+                return False
+            self._refusal_kept += 1
+            return True
 
     def _hash_ip(self, ip: str | None) -> str | None:
         if not ip or self.ip_hash_key is None:
@@ -1599,6 +2077,8 @@ class MetricsRecorder:
     # ------------------------------------------------------------------------------------------- draining
 
     def _drain_rollups(self) -> list[RollupDelta]:
+        # The first source of every drain: a new batch begins (the reset fences count batches, parity-4).
+        self.fences.drained()
         with self._lock:
             pending, self._rollups = self._rollups, {}
         out: list[RollupDelta] = []
@@ -1765,8 +2245,10 @@ class MetricsRecorder:
             "events_aggregated": self.events_aggregated,
             "live_sampled_out": self.live_sampled_out,
             "rollup_overflow": self.rollup_overflow,
+            "refusal_samples_capped": self.refusal_samples_capped,
             "history_dropped": self.history_dropped,
             "producers": self.producers.stats(),
+            "reset_fences": self.fences.stats(),
             "dims_last_minute": self.dims_last_minute,
             "templates_known": len(self.templates),
             "templates_rejected": self.templates.rejected,

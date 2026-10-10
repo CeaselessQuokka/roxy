@@ -10,12 +10,16 @@ What this is
       (`deploy/gunicorn.conf.py`, `roxy.worker.RoxyUvicornWorker`, 2 workers), resource sampling (RSS and CPU per
       worker) and reading Roxy's own metrics after the stop.
     - `client.py`: an open-loop load generator (requests leave on schedule whatever the answers do), spread over
-      several processes when one process cannot keep the rate.
+      several processes when one process cannot keep the rate, started together at a barrier.
+    - `clock.py`: the harness clock, the one time line the client, the mock and Roxy's own buckets share (the
+      wall clock, never stepping back; on WSL 2 CLOCK_MONOTONIC runs 9.5 percent fast, so it cannot be that).
     - `scenarios.py`: the five scenarios (steady mixed traffic, cold cache burst, a 429ing endpoint, a flood, and
       the replay of the v1-like profile) and the numbers each one reports.
     - `harness.py`: the command line (`python -m load.harness`, run from `tests/`), which runs scenarios inside a
       private network namespace and prints a results table.
-    - `test_replay_profile.py`: plan 19.10 row 7 (second half) as a normal pytest test, marked `load`.
+    - `test_replay_profile.py`: plan 19.10 row 7 (second half) as a normal pytest test, marked `load`; the only
+      test here that starts gunicorn (about 4 minutes). `test_load_units.py` checks the harness's own parts in a
+      couple of seconds. The other scenarios are run by the command, never by pytest.
 
 Why it exists
     Plan 19.4 asks for load tests "with locust or k6". This harness uses neither, on purpose: both are new

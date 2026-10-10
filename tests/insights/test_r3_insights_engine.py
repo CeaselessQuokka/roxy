@@ -2,8 +2,9 @@
 
 What this is
     Adversarial tests of `roxy/insights/engine.py` over real temporary databases and a fake clock: a Roblox 429
-    burst that the per-worker batch writer flushes after the leader's trigger poll (strict xfail, one finding),
-    and two workers' engines persisting the same evaluation at the same time (checked clean).
+    burst that the per-worker batch writer flushes after the leader's trigger poll (finding insights-10, fixed),
+    the 50 per rule cap against the resolve step (finding insights-11, fixed), and two workers' engines persisting
+    the same evaluation at the same time (checked clean).
 
 Why it exists
     Plan 11.1: the leader evaluates "immediately on trigger events (Roblox 429 burst, ...)", and re-evaluation
@@ -25,8 +26,6 @@ from __future__ import annotations
 import asyncio
 import copy
 from typing import Any
-
-import pytest
 
 from roxy.config.runtime import load_runtime_settings
 from roxy.core.clock import FakeClock
@@ -74,11 +73,8 @@ async def engine_over(dbs: Any, clock: FakeClock, rule: Rule) -> InsightsEngine:
     return InsightsEngine(dbs=dbs, settings=runtime, rules=store, clock=clock, rule_set={rule.id: rule})
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding insights-10: a 429 burst flushed after the trigger poll that passed its time never triggers",
-)
 async def test_r3_insights_a_late_flushed_429_burst_still_triggers(dbs: Any) -> None:
+    """insights-10 (fixed): the poll counts `upstream_429` rows by id since the last poll, whatever their time."""
     clock = FakeClock(NOW)
     rule = BurstRule()
     rule.results = [card()]
@@ -108,13 +104,46 @@ async def test_r3_insights_a_late_flushed_429_burst_still_triggers(dbs: Any) -> 
         "time with the previous poll's time instead of what it has read so far"
     )
     assert "roblox_429_burst" in report.trigger
+    assert report.opened == 1
+    # The rows are counted once: the next poll (nothing new flushed) starts nothing.
+    clock.advance(10)
+    assert await engine.check_triggers() is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="finding insights-11: a card cut by the 50 per rule cap is marked resolved while its rule still reports it",
-)
+async def test_r3_insights_a_small_late_flush_is_not_a_burst(dbs: Any) -> None:
+    """insights-10 (fixed), the other side: fewer new rows than `insight_up_429_endpoint_min_429s` start no run,
+    and rows already in metrics.db before the first poll never count (the first poll only sets the cursor)."""
+    clock = FakeClock(NOW)
+    rule = BurstRule()
+    rule.results = [card()]
+    engine = await engine_over(dbs, clock, rule)
+    recorder = MetricsRecorder(dbs, engine.settings, clock)
+
+    def record(n: int) -> None:
+        for i in range(n):
+            recorder.record_upstream_429(
+                endpoint_template=TEMPLATE,
+                host="games.roblox.com",
+                egress="direct",
+                retry_after_s=30,
+                ratelimit_headers={},
+                request_id=f"01K{i:023d}",
+                at_ms=int(clock.now() * 1000),
+            )
+
+    record(30)
+    await recorder.aclose(budget_s=10.0)
+    assert await engine.check_triggers() is None  # history before the first poll is not a burst
+    recorder = MetricsRecorder(dbs, engine.settings, clock)
+    clock.advance(10)
+    record(5)
+    await recorder.aclose(budget_s=10.0)
+    assert await engine.check_triggers() is None  # 5 < 20
+
+
 async def test_r3_insights_the_per_rule_cap_never_resolves_a_card_that_still_holds(dbs: Any) -> None:
+    """insights-11 (fixed): a card the 50 per rule cap leaves out keeps its state (it is still true); a card whose
+    condition is really gone is still resolved."""
     clock = FakeClock(NOW)
     rule = BurstRule()
 
@@ -137,6 +166,16 @@ async def test_r3_insights_the_per_rule_cap_never_resolves_a_card_that_still_hol
                                                 "WHERE state = 'resolved'")]
     )  # fmt: skip
     assert report.resolved == 0, f"resolved although the rule still reports them: {resolved}"
+    assert report.opened == 1
+    open_count = dbs.metrics.read_sync(
+        lambda c: c.execute("SELECT count(*) FROM recommendations WHERE state = 'open'").fetchone()[0]
+    )
+    assert open_count == 51
+    # One endpoint's condition clears for real: that card (and only it) is resolved.
+    rule.results = [r for r in rule.results if r.subject != "games.roblox.com/v1/e10"]
+    clock.advance(30)
+    report = await engine.run_once()
+    assert report.resolved == 1
 
 
 async def test_r3_insights_two_workers_persisting_at_once_keep_one_open_card(dbs: Any) -> None:

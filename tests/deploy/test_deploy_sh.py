@@ -198,6 +198,10 @@ def test_nginx_config_is_applied_only_when_it_changed(sandbox: DeploySandbox) ->
     assert second != third
 
 
+def sequence(box: DeploySandbox, sha: str) -> int:
+    return int((box.releases / sha / ".roxy-release-sequence").read_text().strip())
+
+
 def test_keeps_the_newest_five_releases(sandbox: DeploySandbox) -> None:
     shas = [deployed(sandbox, f"V{i}") for i in range(7)]
     remaining = sandbox.release_dirs()
@@ -205,6 +209,47 @@ def test_keeps_the_newest_five_releases(sandbox: DeploySandbox) -> None:
     assert set(shas[-5:]) == set(remaining)
     for color in ("blue", "green"):
         assert sandbox.current(color) in remaining
+    assert [sequence(sandbox, sha) for sha in shas[-5:]] == [3, 4, 5, 6, 7]  # one number per deploy, in order
+
+
+def test_releases_are_kept_by_deploy_order_not_file_time(sandbox: DeploySandbox) -> None:
+    """Lane tooling open issue 1: kept releases used to be ordered by the stamp's file time, and a wall clock that
+    steps back (NTP; WSL steps about 0.9 s every 31 s) made a newer release look older. Here every stamp's time is
+    turned around (the newest release looks oldest): the deploy sequence still removes the oldest release."""
+    shas = [deployed(sandbox, f"V{i}") for i in range(6)]  # V0 is already gone; V1 to V5 stay
+    assert set(sandbox.release_dirs()) == set(shas[1:])
+    base = 1_700_000_000
+    for age, sha in enumerate(reversed(shas[1:])):  # V5 gets the oldest stamp, V1 the newest
+        stamp = sandbox.releases / sha / ".roxy-release-complete"
+        os.utime(stamp, (base - 3600 * age, base - 3600 * age))
+    newest = deployed(sandbox, "V6")
+    assert set(sandbox.release_dirs()) == {*shas[2:], newest}, "the oldest deploy (V1) goes, whatever its file time"
+    # A rollback starts an older release again: it becomes the newest by deploy order, so it is kept next time.
+    result = sandbox.run(shas[4], script=sandbox.opt / "deploy_rollback.sh")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sequence(sandbox, shas[4]) == max(sequence(sandbox, sha) for sha in sandbox.release_dirs())
+    later = deployed(sandbox, "V7")
+    kept = set(sandbox.release_dirs())
+    assert shas[4] in kept
+    assert shas[2] not in kept  # now the oldest by deploy order
+    assert later in kept
+    assert len(kept) == 5
+
+
+def test_releases_from_an_older_deploy_script_sort_before_numbered_ones(sandbox: DeploySandbox) -> None:
+    """A release used only by a deploy.sh older than the sequence has no number: it counts as older than every
+    numbered release, so the first deploys with this script prune those first, newest stamp kept longest."""
+    shas = [deployed(sandbox, f"OLD{i}") for i in range(5)]
+    for index, sha in enumerate(shas):
+        (sandbox.releases / sha / ".roxy-release-sequence").unlink()
+        stamp_time = 1_700_000_000 + 3600 * index  # set, so a clock step during the test cannot reorder them
+        os.utime(sandbox.releases / sha / ".roxy-release-complete", (stamp_time, stamp_time))
+    newer = [deployed(sandbox, f"NEW{i}") for i in range(2)]
+    assert [sequence(sandbox, sha) for sha in newer] == [1, 2]
+    kept = set(sandbox.release_dirs())
+    assert set(newer) <= kept
+    assert len(kept) == 5
+    assert not {shas[0], shas[1]} & kept  # the two oldest unnumbered releases went first
 
 
 # ------------------------------------------------------------------------------------------ failures
@@ -450,6 +495,41 @@ def test_watch_requires_roxy_v2_to_answer_the_public_health(sandbox: DeploySandb
     assert "ROXY_DEPLOY_PUBLIC_CHECK=0" in result.stderr
     record = json.loads((sandbox.deploy_state / "last_failure.json").read_text())
     assert "not by Roxy v2" in record["error"]
+
+
+def public_checks(box: DeploySandbox) -> list[str]:
+    return [call for call in box.calls() if call.startswith("curl ") and "--resolve" in call]
+
+
+def test_watch_makes_every_check_however_slow_the_checks_are(sandbox: DeploySandbox) -> None:
+    """Lane tooling open issue 2: the watch counted whole seconds of the wall clock ($SECONDS), so on a busy machine
+    (or across a clock step) a 1 s watch could end after one check, or none. It now makes WATCH_S /
+    WATCH_INTERVAL_S checks (here 1 / 0.2 = 5), however long each takes."""
+    deployed(sandbox)
+    sandbox.flag("slow-public")  # each public answer takes 0.4 s: 5 checks need about 3 s, three times WATCH_S
+    sandbox.clear_calls()
+    result = sandbox.run(sandbox.make_commit("SLOW_BOX"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(public_checks(sandbox)) == 5
+    assert "watching green for 1 s (5 checks, 0.2 s apart)" in result.stdout
+    sandbox.clear_calls()
+    result = sandbox.run(sandbox.make_commit("SLOW_BOX_2"), ROXY_WATCH_S="1", ROXY_WATCH_INTERVAL_S="0.3")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(public_checks(sandbox)) == 4  # rounded up: the watch never spans less than WATCH_S
+
+
+def test_watch_catches_a_failure_late_in_the_window(sandbox: DeploySandbox) -> None:
+    """The public answer turns into v1's after the third check; checks 4 and 5 fail, so the deploy rolls back. A
+    watch timed by $SECONDS on a busy machine ended before the fourth check and let this release through."""
+    first = deployed(sandbox)
+    sandbox.flag("slow-public")
+    (sandbox.state / "flags" / "public-v1-after").write_text("3", encoding="utf-8")
+    sha = sandbox.make_commit("LATE_FAILURE")
+    sandbox.clear_calls()
+    result = sandbox.run(sha)
+    assert_rolled_back(sandbox, result, old="blue", old_sha=first)
+    assert "Watch failed: 2 failed checks on green" in result.stderr
+    assert len(public_checks(sandbox)) == 5  # three good answers, then the fourth and fifth fail
 
 
 def test_public_check_can_be_skipped_for_a_deploy_before_the_cutover(sandbox: DeploySandbox) -> None:

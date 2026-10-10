@@ -229,10 +229,24 @@ _SPECS: tuple[MetricSpec, ...] = (
         "roblox_5xx",
         "5xx from Roblox",
         "requests",
-        "Server errors that came from Roblox and were passed to the caller.",
-        "Sum of `requests` with a caller status from 500 to 599 and source `roblox` or `relay`.",
+        "Server errors that came from Roblox and were passed to the caller, with Roblox's own status (after the "
+        "allowed retries, the caller gets Roxy's retry text with Roblox's status).",
+        "Sum of `requests` with a caller status from 500 to 599 and source `roblox` or `relay`, or reason "
+        "`upstream_5xx` (a Roblox 5xx after the retries, recorded with source `roxy` because the text is Roxy's).",
         _ROLLUPS,
         ("overview#kpis", "traffic#status-codes"),
+        better="lower",
+    ),
+    MetricSpec(
+        "roxy_5xx",
+        "5xx from Roxy",
+        "requests",
+        "Server errors Roxy produced itself: its own failures (timeouts, connection errors, an exhausted deadline, "
+        "every route unavailable, internal errors) and its 503 answers such as a pause. A Roblox 5xx passed on to "
+        "the caller is not counted here.",
+        "Sum of `requests` with a caller status from 500 to 599 and source `roxy`, except reason `upstream_5xx`.",
+        _ROLLUPS,
+        ("traffic#status-codes",),
         better="lower",
     ),
     MetricSpec(
@@ -402,6 +416,17 @@ _SPECS: tuple[MetricSpec, ...] = (
         "Sum of `requests` in minute rows of the trailing hour.",
         "rollup_minute",
         ("overview#kpis",),
+    ),
+    MetricSpec(
+        "failures_last_hour",
+        "Failures (last hour)",
+        "requests",
+        "Requests Roxy could not answer in the last 60 minutes, whatever range is selected. Refusals by Roxy's "
+        "protection and Roblox's own 4xx answers are not failures.",
+        "Sum of `requests` with outcome `failed` in minute rows of the trailing hour.",
+        "rollup_minute",
+        ("overview#kpis",),
+        better="lower",
     ),
     MetricSpec(
         "metrics_dropped",
