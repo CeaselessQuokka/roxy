@@ -1,0 +1,10 @@
+{#-
+  Clients page: what the client view shows when it cannot be opened (not an address, a forged place id, a busy
+  database). The message is the API's own section 13 message, plain text; the view never answers a 500.
+  Context: `error`.
+-#}
+{% from "components/alert.html" import inline_alert %}
+<div class="client-view" data-card-error>
+  {{ inline_alert("bad", "This client could not be opened", error) }}
+  <p class="muted"><a href="/admin/clients">Back to the clients</a></p>
+</div>

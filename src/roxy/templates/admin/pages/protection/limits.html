@@ -1,0 +1,13 @@
+{#-
+  Protection page, card `limits` (`roxy/admin/pages/protection.py limits_card`): the flood limit and size limits.
+
+  What: what each limit does, with its refusals in the range (from the same rows as the Refusal reasons card);
+  the settings (`protection#limits` in the catalog) sit below, placed by the kit.
+  Context: `frame`, `counts`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "admin/pages/protection/_macros.html" import count_list %}
+{% call page_card(frame) %}
+<p>The flood limit is an absolute ceiling per client address that counts every request, cache hits included: a safety net against raw floods that normal callers never reach. The size limits refuse a request before anything else looks at it (413 for a large body, 431 for large or many headers, 414 for a long URL).</p>
+{{ count_list(counts) }}
+{% endcall %}

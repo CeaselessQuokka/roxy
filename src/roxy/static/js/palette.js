@@ -35,7 +35,9 @@
 import htmx from "roxy/htmx_setup";
 import { el, hasUnsavedChanges, icon, isTyping, qs, qsa, store } from "roxy/dom";
 import { closeDialog, openDialog, sessionOverlayOpen } from "roxy/dialog";
-import { localAdminHref, request } from "roxy/net";
+import { copyTextFrom, downloadFrom } from "roxy/exports";
+import { errorMessage, isReauthRequired, localAdminHref, request } from "roxy/net";
+import { confirmIdentity } from "roxy/reauth";
 import { cycleTheme } from "roxy/theme";
 import { toast } from "roxy/toast";
 
@@ -176,6 +178,41 @@ function scheduleRemote(query) {
   }, 200);
 }
 
+/**
+ * POST a JSON body to an admin API action (the palette's Run health check): the CSRF header, "Confirm it is you"
+ * on a 403 `reauth_required`, then the page named by `data-then` (where the result shows).
+ */
+async function postAction(option, retried = false) {
+  const url = localAdminHref(option.dataset.postJson);
+  if (!url) return;
+  let response;
+  try {
+    response = await request(url, {
+      method: "POST",
+      body: option.dataset.jsonBody || "{}",
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch {
+    toast("Roxy could not be reached. Nothing was started.", { tone: "bad" });
+    return;
+  }
+  const then = localAdminHref(option.dataset.then || "");
+  if (response.ok || response.status === 409) {
+    // 409 run_in_progress: a run is already going; following it is what the admin wants (the Health page).
+    toast(response.ok ? "Started. Follow it on the Health page." : "A health run is already running; showing it.", {
+      tone: "info",
+    });
+    if (then) navigate(then);
+    return;
+  }
+  const text = await response.text().catch(() => "");
+  if (!retried && isReauthRequired(response.status, response.headers.get("Roxy-Reauth"), text)) {
+    if (await confirmIdentity()) postAction(option, true);
+    return;
+  }
+  if (response.status !== 401) toast(errorMessage(text) || `Refused (${response.status}).`, { tone: "bad" });
+}
+
 function run(option) {
   if (!option) return;
   if (option.dataset.href) {
@@ -184,10 +221,19 @@ function run(option) {
   } else if (option.dataset.open) {
     closeDialog(dialog);
     openDialog(option.dataset.open);
+  } else if (option.dataset.postJson) {
+    closeDialog(dialog);
+    postAction(option);
   } else if (option.dataset.post) {
     closeDialog(dialog);
     htmx.ajax("POST", option.dataset.post, { swap: "none", source: document.body });
     toast("Started. Results appear on the Health page.", { tone: "info" });
+  } else if (option.dataset.action === "llm-copy") {
+    closeDialog(dialog);
+    copyTextFrom(option.dataset.url || "");
+  } else if (option.dataset.action === "llm-download") {
+    closeDialog(dialog);
+    downloadFrom(option.dataset.url || "");
   } else if (option.dataset.action === "theme") {
     const theme = cycleTheme();
     toast(`Theme: ${theme === "system" ? "follow the system" : theme}`, { tone: "info" });
@@ -214,7 +260,7 @@ function toggleCompare() {
   const form = qs("[data-range-form]");
   if (!form || !navigateAllowed()) return;
   const current = qs('input[name="compare"]:checked', form);
-  const target = qs(`input[name="compare"][value="${current && current.value !== "off" ? "off" : "prev"}"]`, form);
+  const target = qs(`input[name="compare"][value="${current && current.value !== "none" ? "none" : "previous"}"]`, form);
   if (target) target.checked = true;
   form.requestSubmit();
 }

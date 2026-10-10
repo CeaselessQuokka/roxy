@@ -1,0 +1,341 @@
+/*
+ * The Cache page (templates/admin/pages/cache*): facts, the request timeline, small lists, forms and drawers.
+ *
+ * What this is
+ *   Layout for what the shared components do not cover on this page: the three fact panels under the tiles, v1's
+ *   "what happens to one request" timeline, the short lists (ignored parameters, key spread) that become one card
+ *   per row on a phone, the forms and the drawer bodies (the stored answer's body may be long and wide).
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract). Only tokens
+ *   from tokens.css are used, so both themes follow; no inline style anywhere (plan 9.2).
+ * How it works
+ *   Mobile first where it matters: below 640 px a short list drops its header row and shows each cell with its
+ *   label (`data-label`), the timeline stacks its time over its text, and long keys and bodies wrap or scroll
+ *   inside their box so the page never scrolls sideways (plan 14.8).
+ * What to read next
+ *   static/css/components.css (.kv, .simple-table, .field), templates/admin/pages/cache/*.html.
+ */
+
+.cache-chips {
+  margin: 0 0 var(--sp-3);
+}
+
+.cache-chips .badge {
+  max-width: 100%;
+  height: auto;
+  white-space: normal;
+}
+
+/* Definition lists and form fields inside grids keep their natural height (a taller neighbor never stretches
+   their rows apart). */
+.page-card .kv,
+.cache-form .field {
+  align-content: start;
+}
+
+.cache-intro {
+  margin: 0 0 var(--sp-3);
+}
+
+.cache-fact__sub {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.cache-disk-error {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.cache-facts {
+  margin-top: var(--sp-4);
+}
+
+.cache-fact {
+  min-width: 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.cache-fact__title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-2);
+  font-weight: var(--fw-semibold);
+}
+
+.cache-fact__hint {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-1);
+}
+
+.cache-fact .kv,
+.cache-drawer__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+/* ------------------------------------------------------------------ v1's "what happens to one request" */
+.cache-explainer__title {
+  font-size: var(--fs-3);
+}
+
+.req-timeline {
+  display: grid;
+  gap: var(--sp-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.req-timeline__step {
+  display: grid;
+  grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr);
+  gap: var(--sp-3);
+  padding-left: var(--sp-3);
+  border-left: 3px solid var(--border-strong);
+}
+
+.req-timeline__at {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--fw-semibold);
+}
+
+.req-timeline__what {
+  margin: 0;
+  max-width: 80ch;
+}
+
+.req-timeline__what .badge {
+  vertical-align: baseline;
+}
+
+.cache-words {
+  margin-top: var(--sp-4);
+}
+
+.cache-words .kv {
+  margin-top: var(--sp-3);
+}
+
+/* ------------------------------------------------------------------ hints, suggestions, forms */
+.cache-hints p {
+  margin: 0 0 var(--sp-2);
+  max-width: 80ch;
+}
+
+.cache-tuner {
+  margin: var(--sp-4) 0;
+}
+
+.cache-tuner__list,
+.cache-suggest {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cache-tuner__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.cache-tuner__item a {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.cache-add,
+.cache-table {
+  margin-top: var(--sp-4);
+}
+
+.cache-add > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--target-min);
+  cursor: pointer;
+  font-weight: var(--fw-medium);
+}
+
+.cache-form {
+  margin-top: var(--sp-3);
+}
+
+.cache-form .field + .field {
+  margin-top: 0;
+}
+
+.cache-inline-form {
+  display: inline-flex;
+  margin: 0;
+}
+
+.cache-suggest-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0 0;
+}
+
+.cache-suggest li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.cache-browser__hint {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4);
+  font-size: var(--fs-1);
+}
+
+@media (min-width: 900px) {
+  #cache-endpoints [data-col="key"] {
+    min-width: 16rem;
+  }
+
+  #cache-rules [data-col="pattern"] {
+    min-width: 18rem;
+  }
+}
+
+/* ------------------------------------------------------------------ short lists (ignored params, key spread) */
+.cache-list th[scope="row"] {
+  color: var(--text);
+  font-weight: var(--fw-medium);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.cache-list td {
+  white-space: normal;
+}
+
+.cache-list__actions {
+  text-align: right;
+}
+
+.cache-list__actions .cluster,
+.cache-list__actions {
+  white-space: nowrap;
+}
+
+.cache-spread__suspect th,
+.cache-spread__suspect td {
+  background: var(--surface-2);
+}
+
+.cache-param {
+  white-space: nowrap;
+}
+
+.fill-note {
+  margin: var(--sp-2) 0 0;
+  overflow-wrap: anywhere;
+}
+
+.fill-note__label {
+  color: var(--text-muted);
+}
+
+/* ------------------------------------------------------------------ drawers */
+.cache-drawer__key {
+  margin: 0;
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.cache-drawer__facts dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.cache-drawer__actions {
+  margin: 0;
+}
+
+.cache-body {
+  max-height: 24rem;
+  margin: 0;
+  padding: var(--sp-3);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-1);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .req-timeline__step {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--sp-1);
+  }
+
+  .cache-list thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .cache-list,
+  .cache-list tbody,
+  .cache-list tr,
+  .cache-list th,
+  .cache-list td {
+    display: block;
+    width: 100%;
+  }
+
+  .cache-list tr {
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .cache-list th,
+  .cache-list td,
+  .cache-list td.num {
+    padding: 2px var(--sp-2);
+    border: 0;
+    text-align: left;
+  }
+
+  .cache-list td[data-label]::before {
+    content: attr(data-label) ": ";
+    color: var(--text-muted);
+  }
+
+  .cache-list__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    padding-top: var(--sp-2);
+    text-align: left;
+    white-space: normal;
+  }
+
+  .cache-drawer__facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

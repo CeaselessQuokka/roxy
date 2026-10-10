@@ -1,0 +1,81 @@
+{#-
+  Protection page, card `spam` (`roxy/admin/pages/protection.py spam_card`): the spam detectors (plan 10.3).
+
+  What: whether the detectors run and whether they are armed (`GET /protection/spam`); each detector with what it
+  watches, its action, threshold, window and its decisions in the range (each has its own card below, with its
+  settings); arming (`POST /spam/arm`): it shows the FILTER-COLLATERAL preview first (`GET /spam/collateral`: who
+  the detectors would have banned in the last 7 days and who of them looks legitimate), needs a reason, a typed
+  confirmation and a fresh second factor, and sends the preview's token so a changed list is refused (409);
+  "Back to dry run" (`POST /spam/disarm`) is always allowed. The decisions table (`GET /spam/events`) lists what the
+  detectors decided, newest first, with filters. The `spam_dry_run` setting below can only switch dry run back on;
+  switching it off goes through Arm.
+  Context: `frame`, `table`, `only`, `state`, `detectors`, `collateral`, `api`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num, caller_text, local_href %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/protection/_macros.html" import reason_field %}
+{% if only %}{{ data_table(**table) }}{% else %}
+{% set armed = not state.dry_run %}
+{% set actions %}{% if armed %}<button type="button" class="btn btn--sm" data-dialog-open="dlg-prot-spam-disarm" aria-haspopup="dialog" data-action="spam-disarm">{{ icon("pause") }}<span>Back to dry run</span></button>{% else %}<button type="button" class="btn btn--sm btn--warn" data-dialog-open="dlg-prot-spam-arm" aria-haspopup="dialog" data-action="spam-arm">{{ icon("shield") }}<span>Arm the detectors</span></button>{% endif %}{% endset %}
+{% call page_card(frame, actions=actions) %}
+<p class="prot-lead">{% if not state.enabled %}{{ status_badge("neutral", "Off") }} The spam detectors are switched off.{% elif armed %}{{ status_badge("bad", "Armed") }} Detectors whose action is ban make real bans.{% else %}{{ status_badge("info", "Dry run") }} Detectors only record who they <em>would</em> have banned; nobody is banned.{% endif %} A {{ term("spam-detector", "spam detector") }} watches each client over minutes to hours. Roblox game servers (by their signature) are never banned automatically, and places never are.</p>
+<div class="table-scroll" role="region" aria-labelledby="spam-detectors-caption" tabindex="0">
+  <table class="simple-table prot-detectors-table">
+    <caption id="spam-detectors-caption" class="prot-caption">Detectors and their decisions in this range</caption>
+    <thead><tr><th scope="col">Detector</th><th scope="col">Watches</th><th scope="col">Action now</th><th scope="col">Threshold</th><th scope="col">Window</th><th scope="col" class="num">Decisions</th></tr></thead>
+    <tbody>
+      {% for d in detectors %}
+      <tr>
+        <th scope="row"><a href="/admin/protection#spam-{{ d.id }}">{{ d.label }}</a></th>
+        <td>{{ d.signal }}</td>
+        <td>{% if d.effective_action == "off" %}{{ badge("Off", "neutral") }}{% elif d.effective_action == "ban" %}{{ badge(d.action_label, "bad") }}{% elif d.effective_action == "would_ban" %}{{ badge(d.action_label, "info") }}{% else %}{{ badge(d.action_label, "neutral") }}{% endif %}</td>
+        <td>{{ d.threshold }}</td>
+        <td>{{ d.window }}</td>
+        <td class="num">{{ num(d.decisions_total) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<h3 class="prot-sub__title">Decisions</h3>
+{{ data_table(**table) }}
+{% if state.this_worker %}
+<p class="field__hint">This worker: {{ num(state.this_worker.pending_subjects) }} clients watched now, {{ num(state.this_worker.detections) }} detections since it started{% if state.this_worker.dropped %}, {{ num(state.this_worker.dropped) }} dropped{% endif %} (each worker watches the clients it serves; decisions above are for every worker).</p>
+{% endif %}
+{% if armed %}
+{% call confirm_dialog("dlg-prot-spam-disarm", "Put the detectors back in dry run?", api.disarm, confirm_label="Back to dry run",
+                       api=True, success="The detectors are in dry run again.", on_success="reload",
+                       consequences=["Detectors stop making bans; they only record who they would have banned.",
+                                     "Bans already made stay until they expire or you lift them."]) %}
+  {{ reason_field("dlg-prot-spam-disarm-reason") }}
+{% endcall %}
+{% else %}
+{% set legit = collateral.legitimate_looking %}
+{% call confirm_dialog("dlg-prot-spam-arm", "Arm the spam detectors?", api.arm, confirm_label="Arm the detectors", danger=True,
+                       api=True, type_to_confirm="arm", hidden={"confirm_collateral": collateral.token},
+                       success="The detectors are armed.", on_success="reload",
+                       consequences=["Detectors whose action is ban will ban clients' addresses automatically when they fire again.",
+                                     "In the last " ~ collateral.window.days ~ " days they would have banned " ~ (collateral.would_ban|length) ~ " clients; " ~ (legit|length) ~ " of them look legitimate (listed below).",
+                                     "This needs your second factor again, and a reason for the audit log."]) %}
+  {% if legit %}
+  <div class="table-scroll" role="region" aria-labelledby="spam-collateral-caption" tabindex="0">
+    <table class="simple-table prot-wrap">
+      <caption id="spam-collateral-caption" class="prot-caption">Clients that look legitimate but would be banned</caption>
+      <thead><tr><th scope="col">Client</th><th scope="col">Detectors</th><th scope="col" class="num">Served</th><th scope="col">Why it looks legitimate</th></tr></thead>
+      <tbody>{% for entry in legit[:20] %}<tr><th scope="row" class="mono">{{ entry.client }}</th><td>{{ entry.detectors|join(", ") }}</td><td class="num">{% if entry.served_pct is not none %}{{ "%.1f"|format(entry.served_pct) }}%{% else %}n/a{% endif %}</td><td>{{ caller_text(entry.why|join("; "), 300) }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </div>
+  {% if legit|length > 20 %}<p class="field__hint">The first 20 of {{ legit|length }} are listed; the API has them all (GET /admin/api/v1/protection/spam/collateral).</p>{% endif %}
+  {% else %}<p class="muted">No client the detectors would have banned looks legitimate.</p>{% endif %}
+  <p class="field__hint">{{ collateral.note }}</p>
+  {{ reason_field("dlg-prot-spam-arm-reason", required=True) }}
+{% endcall %}
+{% endif %}
+<p class="field__hint">The dry run setting below can only switch dry run back on; to switch it off, use Arm the detectors (it shows who would be banned first).</p>
+{% endcall %}
+{% endif %}

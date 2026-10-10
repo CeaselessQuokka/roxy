@@ -93,6 +93,27 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+UNIT_FILE: Final = Path("deploy") / "systemd" / "roxy@.service"
+
+
+def unit_environment(tree: Path) -> dict[str, str]:
+    """The `Environment=KEY=VALUE` lines of a tree's `roxy@.service` (none of them `ROXY_*`: those come from the
+    environment files, and a run sets its own). A tree without the file, or without such lines, gives nothing."""
+    try:
+        text = (tree / UNIT_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    found: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith("Environment="):
+            continue
+        key, sep, value = line.removeprefix("Environment=").partition("=")
+        if sep and key and not key.startswith("ROXY_"):
+            found[key] = value
+    return found
+
+
 def base_env(
     work: Path,
     credentials: Path,
@@ -105,13 +126,16 @@ def base_env(
     """The environment of the gunicorn master (nothing inherited from the caller's shell).
 
     `tree`: a copy of the repository (`git archive` of a commit, say) whose `src/roxy` the workers import instead of
-    the installed working tree, so a measurement can name the exact code it measured. `extra`: variables for a
-    "what if" run (`--worker-env`, for example `MALLOC_ARENA_MAX=2`); never `ROXY_*`, which belong to the run.
+    the installed working tree, so a measurement can name the exact code it measured. The `Environment=` lines of
+    that tree's `deploy/systemd/roxy@.service` (the glibc malloc tuning of finding LOAD-2) apply too, as systemd
+    applies them in production (`unit_environment`). `extra`: variables for a "what if" run (`--worker-env`, for
+    example `MALLOC_ARENA_MAX=8`), which win over the unit's; never `ROXY_*`, which belong to the run.
     """
     state = work / "state"
     run = work / "run"
     path = {} if tree is None else {"PYTHONPATH": str(tree / "src")}  # ahead of the editable install's path
     return {
+        **unit_environment(tree or REPO),
         **dict(extra or {}),
         **path,
         "PATH": f"{VENV_BIN}:/usr/bin:/bin",
@@ -531,7 +555,23 @@ def _pipeline_sample(body: Mapping[str, Any]) -> dict[str, Any]:
         "hot_pending": _queued_writes(dbs.get("hot")),
         "metrics_pending": _queued_writes(dbs.get("metrics")),
         "cache_pending": _queued_writes(dbs.get("cache")),
+        # Since the worker started (cumulative histograms, LOAD-3): the write lock's wait and hold percentiles and
+        # how many hot-path writes shared a transaction (group commit).
+        "hot_lock_wait_ms": (dbs.get("hot") or {}).get("lock_wait_ms"),
+        "hot_hold_ms": (dbs.get("hot") or {}).get("hold_ms"),
+        "hot_groups": (dbs.get("hot") or {}).get("groups"),
+        "hot_grouped_writes": (dbs.get("hot") or {}).get("grouped_writes"),
+        "hot_largest_group": (dbs.get("hot") or {}).get("largest_group"),
     }
+
+
+def last_per_worker(samples: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """The last metrics pipeline sample of each worker (its cumulative counters cover the whole run)."""
+    out: dict[str, dict[str, Any]] = {}
+    for sample in samples:
+        if sample.get("worker") is not None:
+            out[str(sample["worker"])] = sample
+    return out
 
 
 def _queued_writes(row: Mapping[str, Any] | None) -> int | None:
@@ -625,10 +665,12 @@ __all__ = [
     "fake_credentials",
     "free_port",
     "json_line",
+    "last_per_worker",
     "prepare_state",
     "query",
     "roblox_429_rows",
     "roxy_totals",
+    "unit_environment",
     "upstream_limits",
     "worker_history",
     "write_rates",

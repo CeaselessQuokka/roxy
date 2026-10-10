@@ -1,0 +1,12 @@
+{#-
+  Security page, card `probes` (`roxy/admin/pages/security.py probes_card`): probe and exploit attempts in the
+  range, newest first (v1 "Exploit / Probe Attempts", plan 14.1 row 27). The page's main table: its signature filter
+  is in the address. `?ip=<address>` (a link from elsewhere) narrows it to one address, said in a note with a way
+  back. Signature, Target, Path and User-Agent are caller text. Context: `frame`, `table`, `part`, `ip_filter`,
+  `clear_ip_href`, `reset_href`, `range`.
+-#}
+{% from "admin/pages/security/_macros.html" import table_card, reset_action %}
+{% from "components/icon.html" import icon %}
+{% call table_card(frame, table, part, subtitle=range.description, actions=reset_action(reset_href, "probe records")) %}
+{% if ip_filter %}<p class="security-filter-note">{{ icon("filter") }}<span>Only probes from <span class="mono">{{ ip_filter }}</span>.</span> <a href="{{ clear_ip_href }}">Show every address</a></p>{% endif %}
+{% endcall %}

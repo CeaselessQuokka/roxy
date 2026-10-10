@@ -1,0 +1,167 @@
+/*
+ * The Clients page (templates/admin/pages/clients*): notes under the tables, the lookup answer, the client view.
+ *
+ * What this is
+ *   Layout for what the shared components do not cover here: the lookup's answer, the per-client view (its state
+ *   line, actions, sections and the short lists of requests and probes), and the lookup and activity pair.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract). Only tokens
+ *   are used, so both themes follow; no inline style anywhere (plan 9.2). The Cache page's stylesheet is not linked
+ *   here, so the few shared names (`.cache-inline-form`, `.cache-fact__title`) are defined again.
+ * How it works
+ *   Long User-Agents, paths and place ids wrap inside their box; below 640 px the facts stack (plan 14.8).
+ * What to read next
+ *   static/css/components.css (.kv, .simple-table), templates/admin/pages/clients/client.html.
+ */
+
+.clients-note {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-4) var(--sp-3);
+  font-size: var(--fs-1);
+}
+
+.clients-pair {
+  align-items: start;
+}
+
+/* Definition lists and form fields keep their natural height in a grid (a taller neighbor never stretches their
+   rows apart), and an introduction keeps its distance from what follows. */
+.page-card .kv,
+.page-card .field {
+  align-content: start;
+}
+
+.clients-intro {
+  margin: 0 0 var(--sp-3);
+}
+
+@media (min-width: 900px) {
+  #client-places [data-col="top_endpoint"],
+  #client-ips [data-col="top_endpoint"] {
+    min-width: 15rem;
+  }
+
+  #client-ips [data-col="bot_score"] {
+    min-width: 9rem;
+  }
+}
+
+.clients-lookup__result:empty {
+  display: none;
+}
+
+.clients-lookup__result {
+  margin-top: var(--sp-4);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.clients-lookup__result > * + * {
+  margin-top: var(--sp-3);
+}
+
+.clients-lookup__head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: 0;
+  font-size: var(--fs-3);
+}
+
+.clients-lookup__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.clients-lookup__desc {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.clients-lookup__address {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------ the client view */
+.client-view__key {
+  margin: 0;
+  font-size: var(--fs-4);
+  font-weight: var(--fw-semibold);
+  overflow-wrap: anywhere;
+}
+
+.client-view__head .cluster {
+  margin: var(--sp-2) 0 0;
+}
+
+.client-view__actions {
+  margin: 0;
+}
+
+.client-view__section {
+  display: grid;
+  gap: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.client-view__title,
+.cache-fact__title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  font-size: var(--fs-3);
+  font-weight: var(--fw-semibold);
+}
+
+.client-view__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.client-view__facts dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.client-view__list,
+.client-view__rows {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.client-view__rows li {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.client-view__score {
+  font-size: var(--fs-5);
+  font-variant-numeric: tabular-nums;
+}
+
+.cache-inline-form {
+  display: inline-flex;
+  margin: 0;
+}
+
+@media (max-width: 640px) {
+  .client-view__facts,
+  .clients-lookup__facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.clients-note-plain {
+  margin: var(--sp-3) 0 0;
+}

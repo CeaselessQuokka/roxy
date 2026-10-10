@@ -1,0 +1,19 @@
+{#-
+  Cache page, card `ratios` (`roxy/admin/pages/cache.py ratios_card`): the hit and avoided ratios over time.
+
+  The two ratio series come from one `cache.cache_series` answer (the `GET /admin/api/v1/cache/ratios` function),
+  embedded in two charts because they use different units (a ratio and a percent); the answers per cache state
+  are drawn from `GET /admin/api/v1/cache/states` by static/js/charts.js. Each chart lists its notices (resets in
+  the range, plan 6.8), its annotations (configuration changes, linked to their audit entry) and a data table.
+  Help texts come from metrics/catalog.py and the API's state labels.
+  Context: `frame`, `hit`, `avoided`, `states_src`, `ratios_src`, `help`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/chart.html" import series_chart %}
+{% call page_card(frame) %}
+<div class="grid grid--2">
+  {{ series_chart("cache-hit-ratio", "Hit ratio", series=hit, summary="Share of cache lookups answered from the cache, over the selected range.", help=help.hit, size="sm", y_format="percent", empty_text="No cache lookups in this range.") }}
+  {{ series_chart("cache-avoided", "Avoided upstream calls", series=avoided, summary="Share of caller demand that never reached Roblox, over the selected range.", help=help.avoided, size="sm", empty_text="No caller demand in this range.") }}
+</div>
+{{ series_chart("cache-states", "Answers by cache state", src=states_src, summary="Requests per cache state (hit, revalidating, stale, coalesced, miss) over the selected range.", help=help.states, kind="area", stack="states", empty_text="No cache lookups in this range.") }}
+{% endcall %}

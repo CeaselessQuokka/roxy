@@ -422,6 +422,11 @@ DATASETS: Final[dict[str, Dataset]] = {
 @router.get("/datasets")
 async def datasets(_admin: AdminSession) -> dict[str, Any]:
     """Every dataset this area exports, with its columns and whether a time range applies."""
+    return datasets_answer()
+
+
+def datasets_answer() -> dict[str, Any]:
+    """The `GET /export/datasets` answer (the Data page's exports card lists the same datasets)."""
     return {
         "datasets": [
             {
@@ -460,4 +465,4 @@ async def export_dataset(
     return await common.export_pages(request, admin, item.spec, fetch, fmt, tr=tr if item.ranged else None)
 
 
-__all__ = ["DATASETS", "Dataset", "router"]
+__all__ = ["DATASETS", "Dataset", "datasets_answer", "router"]

@@ -1,0 +1,71 @@
+{#-
+  The Protection page (`roxy/admin/pages/protection.py`): who Roxy turns away and how (plan 14.1, 10.9).
+
+  What: the page layout. A list "On this page" links every card, grouped as the page is: overview (pipeline and
+  refusal reasons), limits, who (bans, lists, bypass), rules, detectors and the tarpit. Each card is rendered by
+  its own template (`admin/pages/protection/<card>.html`, the same HTML its fragment answers); only the pipeline
+  renders with the page, the others load as fragments when they scroll into view (`lazy`).
+  Why: the page holds fourteen v1 sections; grouping them and linking each group keeps it findable on a phone and
+  keeps the first paint small on the 1 GB server.
+  Context: everything `admin/_page.html` takes (`cards`, `card_order`, `view`, ...).
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+
+{% set GROUPS = [
+  ("overview", "Overview", ["pipeline", "refusals"]),
+  ("limits", "Limits", ["throttle", "ladder", "strikes", "throttle-all", "limits", "places"]),
+  ("who", "Bans and lists", ["bans", "lists", "bypass"]),
+  ("rules", "Rules and filters", ["ua-rules", "request-filters", "endpoint-blocks", "endpoint-rules", "ignored-paths"]),
+  ("detectors", "Detectors", ["spam", "spam-rate", "spam-refused", "spam-probe", "spam-auth", "spam-enum", "spam-bust", "spam-dist", "bot", "challenge"]),
+  ("tarpit-group", "Tarpit", ["tarpit"]),
+] %}
+{% set TITLES = {
+  "pipeline": "Pipeline", "refusals": "Refusal reasons", "throttle": "Throttle", "ladder": "Ladder",
+  "strikes": "Strike board", "throttle-all": "Emergency limit", "limits": "Request limits", "places": "Place limits",
+  "bans": "Bans", "lists": "Deny and allow lists", "bypass": "Bypass", "ua-rules": "User-Agent rules",
+  "request-filters": "Request filters", "endpoint-blocks": "Endpoint blocks", "endpoint-rules": "Endpoint rules",
+  "ignored-paths": "Ignored paths", "spam": "Spam detectors", "bot": "Bot heuristics", "challenge": "Challenge",
+  "tarpit": "Tarpit",
+} %}
+{% set PAIRS = {"limits": "places", "bot": "challenge"} %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>A {{ term("refusal", "refusal") }} names its {{ term("reason-code", "reason") }}, so the Refusal reasons card tells you which check fired even when several answer with the same 429. Throttles give {{ term("strike", "strikes") }}; strikes pick a {{ term("rung", "rung") }} of the ladder; strikes wear off ({{ term("decay", "decay") }}). {{ term("bypass", "Bypass") }} entries skip the limits but never pause, bans, filters or blocks. Spam detectors start in {{ term("dry-run", "dry run") }}: they only say who they would ban until you arm them.</p>
+<p>Tables page, sort and search on the server; a row opens its details, where you can change or remove it. Numbers follow the time range in the top bar; the state cards (strikes, who is throttled now, bans in force) show the present moment. Text callers sent (paths, User-Agents) and text an admin typed (patterns, notes, messages) is shown as plain text, exactly as stored.</p>
+{% endblock %}
+
+{% block cards %}
+<details class="prot-toc" id="prot-toc" data-remember="protection-toc" open>
+  <summary class="prot-toc__summary">{{ icon("menu") }}<span>On this page</span>{{ icon("chevron-down", cls="prot-toc__chevron") }}</summary>
+  <nav class="prot-toc__nav" aria-label="Parts of the Protection page">
+    {% for group_id, label, ids in GROUPS %}
+    <div class="prot-toc__group">
+      <p class="prot-toc__label">{{ label }}</p>
+      <ul class="prot-toc__links">
+        {% for card_id in ids if card_id in TITLES %}<li><a href="#{{ card_id }}">{{ TITLES[card_id] }}</a></li>{% endfor %}
+      </ul>
+    </div>
+    {% endfor %}
+  </nav>
+</details>
+{% for group_id, label, ids in GROUPS %}
+<div class="prot-group stack-lg" id="group-{{ group_id }}">
+  <p class="prot-group__label" aria-hidden="true">{{ label }}</p>
+  {% if group_id == "detectors" %}
+    {{ cards["spam"] }}
+    <div class="grid grid--2 prot-detectors">
+      {% for card_id in ids if card_id.startswith("spam-") %}{{ cards[card_id] }}{% endfor %}
+    </div>
+    <div class="grid grid--2">{{ cards["bot"] }}{{ cards["challenge"] }}</div>
+  {% else %}
+    {% for card_id in ids %}
+      {% if card_id in PAIRS %}<div class="grid grid--2">{{ cards[card_id] }}{{ cards[PAIRS[card_id]] }}</div>
+      {% elif card_id not in PAIRS.values() %}{{ cards[card_id] }}{% endif %}
+    {% endfor %}
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}

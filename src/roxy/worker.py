@@ -32,6 +32,10 @@ Why it exists
     lease release never ran (finding SHUTDOWN-HOLD). Two changes fix it: uvicorn's `timeout_graceful_shutdown`
     is set below `graceful_timeout`, and `RoxyServer.shutdown` calls `roxy.lifespan.begin_drain` before uvicorn
     starts waiting, which answers every held refusal at once.
+    Last, it keeps full garbage collections short (finding LOAD-3): once the app started, `RoxyServer.startup`
+    freezes the startup heap (`freeze_startup_heap`, `gc.freeze`), which every full collection otherwise walked
+    again with the event loop stopped (115 to 125 ms each). Only real workers do this; tests that build many apps
+    in one process never freeze anything.
 
 How it works
     `UvicornWorker.__init__` builds uvicorn's `Config` from gunicorn's settings and then applies `CONFIG_KWARGS`
@@ -52,6 +56,8 @@ What to read next
 
 from __future__ import annotations
 
+import gc
+import logging
 import socket
 import sys
 from typing import Any
@@ -61,6 +67,8 @@ from uvicorn.server import Server
 from uvicorn_worker import UvicornWorker
 
 from roxy import lifespan
+
+log = logging.getLogger("roxy.worker")
 
 TRANSIENT_BOOT_EXIT_CODE = 1
 """Exit status for a startup that failed only on unavailable shared state: gunicorn restarts the worker."""
@@ -90,8 +98,31 @@ def graceful_shutdown_s(graceful_timeout: float, timeout: float) -> float:
     return max(MIN_GRACEFUL_SHUTDOWN_S, limit - lifespan.SHUTDOWN_BUDGET_S - SHUTDOWN_MARGIN_S)
 
 
+def freeze_startup_heap() -> int:
+    """Collect once, then move every object that exists now out of the garbage collector's sight (`gc.freeze`).
+
+    Called when a worker finished starting (finding LOAD-3). The startup heap (the app, its modules, routes,
+    templates, the settings catalog: about 900,000 blocks) lives as long as the worker, yet every full collection
+    walked all of it again: 115 to 125 ms with the event loop stopped, every minute or two at 10 requests a second
+    and every few seconds at 200, a large part of the tail latency. Frozen objects are never examined again, so a
+    full collection only walks what was created since. The cost is bounded: a cycle of startup objects that
+    becomes garbage later is never collected (the first settings and rules snapshots, replaced once). Returns how
+    many objects were frozen.
+    """
+    gc.collect()
+    gc.freeze()
+    return gc.get_freeze_count()
+
+
 class RoxyServer(Server):
-    """uvicorn's `Server`, which tells the app that shutdown began before it waits for open requests."""
+    """uvicorn's `Server`, which freezes the startup heap once the app started and tells the app that shutdown
+    began before it waits for open requests."""
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        await super().startup(sockets=sockets)
+        if self.started:
+            frozen = freeze_startup_heap()
+            log.info("startup_heap_frozen", extra={"fields": {"objects": frozen}})
 
     async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
         lifespan.begin_drain(self.config.app)

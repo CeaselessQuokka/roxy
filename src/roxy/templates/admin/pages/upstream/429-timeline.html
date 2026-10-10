@@ -1,0 +1,29 @@
+{#-
+  Upstream page, card `429-timeline` (`roxy/admin/pages/upstream.py timeline_card`): Roblox 429s per endpoint.
+
+  The chart embeds the `GET /admin/api/v1/upstream/429-timeline` answer (`series=`), so the first paint needs no
+  second request; charts.js draws it with a data table and the comparison overlay. Below it, the endpoints with the
+  most 429s in the range (endpoint templates are caller text). An empty range says that this is good news.
+  Context: `frame`, `series`, `total`, `by_endpoint`, `help`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/format.html" import num, caller_text %}
+{% call page_card(frame, subtitle="Roblox 429s in this range: " ~ num(total)) %}
+{% if total %}
+{{ series_chart("chart-roblox-429", "Roblox 429s by endpoint", series=series, kind="bars", stack="429s", y_format="count",
+                summary="Roblox 429 answers per time bucket, one series per endpoint with the most 429s.", help=help, size="md") }}
+<div class="table-scroll g3-scroll" role="region" aria-labelledby="t429-caption" tabindex="0">
+  <table class="simple-table g3-table">
+    <caption id="t429-caption" class="g3-caption">Endpoints with the most 429s</caption>
+    <thead><tr><th scope="col">Endpoint</th><th scope="col" class="num">429s</th></tr></thead>
+    <tbody>
+      {% for row in by_endpoint %}<tr><td>{{ caller_text(row.template, 160) }}</td><td class="num">{{ num(row.count) }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state("No 429s from Roblox in this range. Good.", "Roblox did not ask Roxy to slow down. When it does, each 429 is logged here by endpoint, and the cooldowns and buckets react on their own.", tone="good") }}
+{% endif %}
+{% endcall %}

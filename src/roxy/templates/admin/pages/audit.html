@@ -1,0 +1,25 @@
+{#-
+  The Audit page (`roxy/admin/pages/audit.py`): the reference layout for every page builder.
+
+  A page template extends admin/_page.html and places its cards from `cards` (each one rendered by its own card
+  template, the same HTML its fragment route answers). The Audit page has one visible card, the log; its entries
+  open in the drawer (`entry`, fragment-only). Page-level buttons go in `page_actions`; the page's own stylesheet
+  and module (static/css/pages/audit.css, static/js/pages/audit.js) are linked by base.html because they exist.
+  `how_to_read` extends the registry's text with what this page's controls do.
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="/admin/audit?range=all">{{ icon("history") }}<span>Whole log</span></a>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>Who acted reads <code>admin:&lt;name&gt;</code> for an admin, <code>system:&lt;what&gt;</code> for Roxy itself (an automatic ban, a {{ term("leader", "leader") }} job), <code>recommendation:&lt;rule&gt;</code> for an applied recommendation, and <code>cli</code> for the server's command line. Targets and previews may contain text that callers sent (paths, User-Agents); it is shown as plain text, exactly as stored.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["log"] }}
+{% endblock %}

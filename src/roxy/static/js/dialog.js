@@ -32,6 +32,9 @@ import { errorMessage, isReauthRequired } from "roxy/net";
 
 const openers = new WeakMap();
 const SESSION_DIALOG_ID = "session-expired";
+const STACKING_IDS = new Set([SESSION_DIALOG_ID, "reauth"]);
+// Dialogs that open ON TOP of an open one without closing it: the session alert, and "Confirm it is you", whose
+// retried request still needs the form underneath (static/js/reauth.js).
 
 function resolve(target) {
   return typeof target === "string" ? document.getElementById(target) : target;
@@ -50,8 +53,9 @@ export function openDialog(target, opener = document.activeElement) {
   const isSessionOverlay = dialog.id === SESSION_DIALOG_ID;
   if (!isSessionOverlay && sessionOverlayOpen()) return null;
   // Only one menu sheet or palette at a time: close any other open modal first (they would stack). The session
-  // alert is the exception: it stacks over whatever is open, so nothing the admin typed is thrown away.
-  if (!isSessionOverlay) {
+  // alert and the re-authentication dialog are the exceptions: they stack over whatever is open, so nothing the
+  // admin typed is thrown away.
+  if (!STACKING_IDS.has(dialog.id)) {
     for (const other of qsa("dialog[open]")) {
       if (other !== dialog && !other.contains(dialog)) other.close();
     }

@@ -1,0 +1,61 @@
+{#-
+  Cache page drawer: one endpoint template (`GET /admin/cache/drawer/endpoint?template=`, `roxy/admin/pages/
+  cache.py endpoint_drawer`), v1's "Rule" and "Purge" row buttons of "Where the cache is working".
+
+  Its row of `cache.endpoints_answer` for the range, the rule that applies (or the default lifetime), a form that
+  writes a cache rule for it (the wildcard pattern of the template, `insights.simulate.template_pattern`, which
+  also covers the paths under it; posts to the rules API, which purges what the rule covers), "Purge its stored
+  answers" (the shared purge dialog with the same pattern), and a link to the Endpoints page. The template is
+  caller text: shown as text only, and a value in our own forms.
+  Context: `template`, `row`, `rule`, `pattern`, `ttl_words`, `new_rule_ttl`, `rules_url`, `purge_url`,
+  `endpoints_href`, `range_label`.
+-#}
+{% from "components/format.html" import caller_text, num, pct, bytes, local_href %}
+{% from "components/icon.html" import icon %}
+<div class="cache-drawer stack">
+  <p class="cache-drawer__key">{{ caller_text(template, 300, block=True) }}</p>
+  {% if row %}
+  <dl class="kv cache-drawer__facts">
+    <dt>Requests</dt><dd>{{ num(row.requests) }} <span class="muted">({{ range_label }})</span></dd>
+    <dt>Hit ratio</dt><dd>{{ pct(row.hit_ratio) }}</dd>
+    <dt>Hits</dt><dd>{{ num(row.cache_hit) }}</dd>
+    <dt>Stale serves</dt><dd>{{ num(row.cache_stale) }}</dd>
+    <dt>Revalidations</dt><dd>{{ num(row.cache_revalidating) }}</dd>
+    <dt>Coalesced</dt><dd>{{ num(row.cache_coalesced) }}</dd>
+    <dt>Misses</dt><dd>{{ num(row.cache_miss) }}</dd>
+    <dt>Negative hits</dt><dd>{{ num(row.negative_hits) }}</dd>
+    <dt>Served bytes</dt><dd>{{ bytes(row.cache_bytes_out) }}</dd>
+    <dt>Upstream calls</dt><dd>{{ num(row.upstream_calls) }}</dd>
+    <dt>Lifetime</dt><dd>{{ "never cached" if row.ttl_s == 0 else ttl_words }}{% if rule %} <span class="muted">from rule</span> <span class="mono">#{{ rule.id }}</span> {{ caller_text(rule.pattern, 200) }}{% else %} <span class="muted">(the default)</span>{% endif %}</dd>
+  </dl>
+  {% else %}
+  <p class="muted">No requests for this endpoint in {{ range_label|lower }}. Choose a longer range in the top bar to see its numbers.</p>
+  {% endif %}
+
+  <form class="stack cache-form" data-api-form data-api-url="{{ rules_url }}" data-api-method="POST"
+        data-success="Cache rule added; the answers it covers were dropped so it applies at once." data-on-success="refresh" data-refresh="rules endpoints browser" novalidate>
+    <h3 class="cache-fact__title">Give this endpoint its own lifetime</h3>
+    <div class="field">
+      <label class="field__label" for="cache-endpoint-rule-pattern">Pattern</label>
+      <input class="input mono" id="cache-endpoint-rule-pattern" name="pattern" value="{{ pattern }}" maxlength="1000" required data-json="string" aria-describedby="cache-endpoint-rule-pattern-hint cache-endpoint-rule-pattern-error">
+      <p class="field__hint" id="cache-endpoint-rule-pattern-hint">The wildcard form of the template: each placeholder is a *, and it also covers the paths under it.</p>
+      <p class="field__error" id="cache-endpoint-rule-pattern-error" data-field-error="pattern" hidden></p>
+    </div>
+    <input type="hidden" name="type" value="glob" data-json="string">
+    <div class="field">
+      <label class="field__label" for="cache-endpoint-rule-ttl">Keep answers for (seconds)</label>
+      <input class="input input--num" id="cache-endpoint-rule-ttl" name="ttl" inputmode="numeric" value="{{ new_rule_ttl }}" data-json="int" aria-describedby="cache-endpoint-rule-ttl-hint cache-endpoint-rule-ttl-error">
+      <p class="field__hint" id="cache-endpoint-rule-ttl-hint">0 means never cache this endpoint.</p>
+      <p class="field__error" id="cache-endpoint-rule-ttl-error" data-field-error="ttl" hidden></p>
+    </div>
+    <input type="hidden" name="purge" value="true" data-json="bool">
+    <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    <div class="cluster">
+      <button type="submit" class="btn btn--primary btn--sm" data-action="cache-endpoint-rule">{{ icon("plus") }}<span>Write the rule</span></button>
+      <button type="button" class="btn btn--sm btn--bad-soft" data-dialog-open="dlg-cache-purge" data-action="cache-endpoint-purge"
+              data-fill='{{ {"scope": "pattern", "type": "glob", "value": pattern, "_label": "every stored answer for " ~ pattern}|tojson }}'>{{ icon("x-circle") }}<span>Purge its stored answers</span></button>
+    </div>
+  </form>
+  {% set endpoints_link = local_href(endpoints_href) %}
+  {% if endpoints_link %}<p><a href="{{ endpoints_link }}">{{ icon("external") }} Open this endpoint on the Endpoints page</a></p>{% endif %}
+</div>

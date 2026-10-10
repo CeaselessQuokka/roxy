@@ -1,0 +1,53 @@
+{#-
+  Recommendations, the "Tune this rule" drawer (fragment-only cards `rule-<slug>`,
+  `roxy/admin/pages/recommendations.py _rule_renderer`; plan 11.1 and 15.6 `recommendations#rule-<slug>`).
+
+  Shown in the drawer (which has its own heading), so the body starts at h3: what the rule detects (its docstring,
+  the single source of its help text), when it runs, whether auto-apply may ever use it, its open recommendations
+  (each opens its own detail), and every catalog setting of the rule (its switch, its severity override and each
+  threshold) as inline editors that save through the settings API with the usual review, reason and audit.
+  Context: `frame` (its `settings` are the rule's catalog settings), `rule`, `active`, `active_total`.
+-#}
+{% from "components/page_card.html" import inline_setting %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/format.html" import caller_text %}
+<div class="rec-rule stack" id="{{ frame.id }}" data-card="{{ frame.id }}" data-rule="{{ rule.id }}">
+  <p class="rec-rule__lead">
+    <code class="rec-rule__id">{{ rule.id }}</code>
+    {% if rule.enabled %}{{ status_badge("ok", "On") }}{% else %}{{ status_badge("neutral", "Switched off") }}{% endif %}
+    {% if rule.safe_auto %}{{ badge("Auto-apply may use it", "ok", "check-circle") }}{% else %}{{ badge("Never auto-applied", "neutral") }}{% endif %}
+    {% if not rule.implemented %}{{ badge("Not in this build", "warn", "alert-triangle") }}{% endif %}
+  </p>
+  <section class="rec-section" aria-labelledby="{{ frame.id }}-what">
+    <h3 class="rec-section__title" id="{{ frame.id }}-what">What it detects</h3>
+    <p class="rec-rule__help">{{ rule.help }}</p>
+    <dl class="kv">
+      <dt>Family</dt><dd>{{ rule.family|capitalize }}</dd>
+      <dt>Severity</dt><dd>{{ "Its own (auto)" if rule.severity_override == "auto" else rule.severity_override|capitalize }}</dd>
+      {% if rule.triggers %}<dt>Runs early after</dt><dd>{{ rule.triggers|join(", ")|replace("_", " ") }}</dd>{% endif %}
+    </dl>
+  </section>
+  <section class="rec-section" aria-labelledby="{{ frame.id }}-open">
+    <h3 class="rec-section__title" id="{{ frame.id }}-open">Open recommendations of this rule ({{ active_total }})</h3>
+    {% if active %}
+    <ul class="rec-mini" role="list">
+      {% for item in active %}
+      <li class="rec-mini__item">
+        <span class="tone tone--{{ item.severity_tone }}">{{ item.severity_words }}</span>
+        <button type="button" class="link-btn rec-mini__open" data-drawer-src="{{ item.drawer }}" data-drawer-title="Recommendation">{{ caller_text(item.title, 160) }}</button>
+        <span class="muted">{{ item.state_words }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="muted">None right now.</p>
+    {% endif %}
+  </section>
+  <section class="rec-section" aria-labelledby="{{ frame.id }}-tune">
+    <h3 class="rec-section__title" id="{{ frame.id }}-tune">Tune this rule</h3>
+    <p class="muted">Each threshold is an ordinary setting: it is checked, written to the audit log and in force on every worker within a second.</p>
+    <div class="card-settings__list rec-rule__settings">
+      {% for entry in frame.settings %}{{ inline_setting(entry) }}{% endfor %}
+    </div>
+  </section>
+</div>

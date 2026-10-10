@@ -1,0 +1,150 @@
+{#-
+  Security page, card `fingerprints` (`roxy/admin/pages/security.py fingerprints_card`): what callers send (v1
+  "Request Fingerprints" and "Blocked Request Fingerprints", plan 14.1 rows 29 and 30, parity rows 79 and 134).
+
+  Three shapes from one template:
+    * the card: four tabs (header names, User-Agents, the blocked variants, the headers whose values are not
+      recorded), each a server-paged table; static/js/pages/security.js switches the tabs (arrow keys too) and
+      remembers the open one across refreshes;
+    * `part=<tab>`: that tab's table alone (its own search, filter, sort and page requests);
+    * `part=header` / `part=blocked-header` (the drawer): one header name with its stored values and v1's actions
+      (stop or start recording its values, Clear values, Remove; on the Blocked tab only Remove, as blocked requests
+      keep no values). Each action posts to the Security API (static/js/api_forms.js: CSRF, audit) and refreshes
+      this card.
+  Header names and values are caller text; a name reaches a URL only percent-encoded inside Roxy's own API path.
+  Context: `frame`, `part`, `tables`, `tabs`, `drawer`, `reset_href`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import num, caller_text, local_href %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/badges.html" import badge %}
+{% from "components/icon.html" import icon %}
+{% from "admin/pages/security/_macros.html" import reset_action, when %}
+
+{% set INTROS = {
+  "headers": "Header names of requests that passed every check, with how many distinct values each carried. Open a header for its values and to stop recording them.",
+  "agents": "User-Agents of requests that passed every check. An unusual one with many requests is often a script.",
+  "blocked": "What requests refused by a request filter carried. Review it for false positives: a real caller here means the filter that caught it is too broad.",
+  "ignored": "Headers whose values are not recorded (their count still is): set automatically for headers whose value changes on nearly every request, shipped as defaults, or chosen by you.",
+} %}
+
+{% macro action_form(url, method, success, label, tone="btn--primary", hidden=None, consequences=(), reason=False, field_id="") -%}
+<form class="stack fp-action" data-api-form data-api-url="{{ url }}" data-api-method="{{ method }}" data-success="{{ success }}"
+      data-on-success="refresh" data-refresh="fingerprints" novalidate>
+  {% for name, value in (hidden or {}).items() %}<input type="hidden" name="{{ name }}" value="{{ value }}" data-json="string">{% endfor %}
+  {% if consequences %}<ul class="dialog__consequences">{% for line in consequences %}<li>{{ line }}</li>{% endfor %}</ul>{% endif %}
+  {% if reason %}
+  <div class="field">
+    <label class="field__label" for="{{ field_id }}-reason">Reason <span class="muted">(optional, saved in the audit log)</span></label>
+    <input class="input" id="{{ field_id }}-reason" name="reason" maxlength="500" autocomplete="off" data-json="skip-empty">
+  </div>
+  {% endif %}
+  <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+  <div class="cluster"><button type="submit" class="btn {{ tone }}">{{ label }}</button></div>
+</form>
+{%- endmacro %}
+
+{% if part == "header" %}
+{% set d = drawer %}
+<div class="fp-drawer stack" data-fp-header>
+  <dl class="kv fp-drawer__facts">
+    <dt>Header</dt><dd>{{ caller_text(d.name, 120) }}</dd>
+    <dt>Requests that carried it</dt><dd>{% if d.row %}{{ num(d.row.count) }}{% else %}<span class="muted">not recorded right now</span>{% endif %}</dd>
+    <dt>Values</dt><dd>{% if d.ignored %}{{ badge("Not recorded", "neutral", "eye") }}{% else %}{{ badge("Recorded", "ok", "check") }}{% endif %}</dd>
+    <dt>Distinct values kept</dt><dd>{{ num(d.values_total) }}</dd>
+    <dt>First seen</dt><dd>{{ when(d.first) }}</dd>
+    <dt>Last seen</dt><dd>{{ when(d.last) }}</dd>
+  </dl>
+  {% if d.row and d.row.high_cardinality %}
+  {{ inline_alert("warn", "High cardinality", "Nearly every request carried a value seen for the first time (" ~ ((d.row.unique_ratio or 0) * 100)|round|int ~ "%), so the list of values grows without telling you anything. Consider no longer recording its values; its count is still kept.") }}
+  {% endif %}
+
+  <section class="fp-drawer__section" aria-labelledby="fp-values-title">
+    <h3 class="fp-drawer__heading" id="fp-values-title">Stored values</h3>
+    {% if d.value_rows %}
+    <p class="muted">{% if d.values_total > d.value_rows|length %}The {{ d.value_rows|length }} most frequent of {{ num(d.values_total) }} stored values.{% else %}Every stored value, most frequent first.{% endif %} Secret-shaped values are stored as a keyed hash (<code>fp:</code>).</p>
+    <div class="table-scroll" role="region" aria-labelledby="fp-values-title" tabindex="0">
+      <table class="simple-table fp-values">
+        <caption class="sr-only">Stored values of this header, most frequent first</caption>
+        <thead><tr><th scope="col">Value</th><th scope="col" class="num">Requests</th><th scope="col">Last seen</th></tr></thead>
+        <tbody>
+          {% for v in d.value_rows %}
+          <tr><td>{{ caller_text(v.value, 300) }}</td><td class="num">{{ num(v.count) }}</td><td>{{ when(v.last) }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p><a class="btn btn--sm btn--ghost" href="{{ local_href(d.values_export) }}" data-export download>{{ icon("download") }}<span>Download every value (CSV)</span></a></p>
+    {% elif d.ignored %}
+    <p class="muted">Values of this header are not recorded, so none are kept.</p>
+    {% else %}
+    <p class="muted">No values are stored for this header.</p>
+    {% endif %}
+  </section>
+
+  <section class="fp-drawer__section" aria-labelledby="fp-actions-title">
+    <h3 class="fp-drawer__heading" id="fp-actions-title">What you can do</h3>
+    {% if d.ignored %}
+    {{ action_form(d.record_url, "DELETE", "Values of this header are recorded again.", "Record its values again",
+                   consequences=["New values are stored again from the next request; its count never stopped."]) }}
+    {% else %}
+    {{ action_form(d.ignore_url, "POST", "Values of this header are no longer recorded.", "Stop recording its values",
+                   hidden={"name": d.name},
+                   consequences=["Its stored values are deleted now and new ones are not kept; its request count still is.", "You can record them again here at any time."],
+                   reason=True, field_id="fp-ignore") }}
+    {% endif %}
+    {% if d.known %}
+    <details class="details-plain fp-danger">
+      <summary>Clear its stored values</summary>
+      {{ action_form(d.clear_url, "DELETE", "The stored values of this header were cleared.", "Clear the values", tone="btn--danger",
+                     consequences=["Deletes the values stored for this header (written to the audit log first).", "The header, its count and its recording stay; new values are stored from the next request."]) }}
+    </details>
+    <details class="details-plain fp-danger">
+      <summary>Remove this header from the table</summary>
+      {{ action_form(d.remove_url, "DELETE", "The header was removed from the fingerprints.", "Remove the header", tone="btn--danger",
+                     consequences=["Deletes this header's row and its stored values (written to the audit log first).", "The next request that carries it adds it again, counted from one."]) }}
+    </details>
+    {% endif %}
+  </section>
+</div>
+{% elif part == "blocked-header" %}
+{% set d = drawer %}
+<div class="fp-drawer stack" data-fp-blocked-header>
+  <dl class="kv fp-drawer__facts">
+    <dt>Header</dt><dd>{{ caller_text(d.name, 120) }}</dd>
+    <dt>Refused requests that carried it</dt><dd>{{ num(d.requests) }}</dd>
+  </dl>
+  <p class="muted">Refused requests keep no header values, so there is nothing to clear here; you can only remove the header from the Blocked list.</p>
+  {% if d.requests %}
+  <details class="details-plain fp-danger" open>
+    <summary>Remove it from the Blocked list</summary>
+    {{ action_form(d.remove_url, "DELETE", "The header was removed from the Blocked list.", "Remove from the Blocked list", tone="btn--danger",
+                   consequences=["Deletes the blocked counts of this header name (written to the audit log first).", "Requests refused later count again from one."]) }}
+  </details>
+  {% else %}
+  <p class="muted">No refused request carried this header name in the records kept.</p>
+  {% endif %}
+</div>
+{% elif part %}
+{{ data_table(**tables[part]) }}
+{% else %}
+{% call page_card(frame, flush=True, actions=reset_action(reset_href, "fingerprints")) %}
+<div class="fp-tabs" data-fp-tabs>
+  <div class="fp-tabs__list" role="tablist" aria-label="Fingerprint lists">
+    {% for id, label in tabs %}
+    <button type="button" role="tab" class="fp-tabs__tab" id="fp-tab-{{ id }}" aria-controls="fp-panel-{{ id }}"
+            aria-selected="{{ 'true' if loop.first else 'false' }}" tabindex="{{ '0' if loop.first else '-1' }}" data-fp-tab="{{ id }}">
+      <span>{{ label }}</span><span class="count-badge">{{ num(tables[id].total) }}</span>
+    </button>
+    {% endfor %}
+  </div>
+  {% for id, label in tabs %}
+  <div class="fp-tabs__panel" role="tabpanel" id="fp-panel-{{ id }}" aria-labelledby="fp-tab-{{ id }}" data-fp-panel="{{ id }}"{% if not loop.first %} hidden{% endif %}>
+    <p class="fp-tabs__intro">{{ INTROS[id] }}</p>
+    {{ data_table(**tables[id]) }}
+  </div>
+  {% endfor %}
+</div>
+{% endcall %}
+{% endif %}

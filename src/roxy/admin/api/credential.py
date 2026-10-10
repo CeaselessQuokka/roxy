@@ -107,7 +107,12 @@ class ConfirmBody(ApiBody):
 
 
 def _manager(request: Request) -> Any:
-    egress = get_ctx(request).egress
+    return manager_of(get_ctx(request))
+
+
+def manager_of(ctx: Any) -> Any:
+    """The running `CredentialManager`, or 503 while the worker is still starting (C7: never a 500)."""
+    egress = ctx.egress
     if egress is None:
         raise common.unavailable("The egress layer is not running yet; try again shortly.")
     return egress.credential
@@ -194,8 +199,12 @@ def texts() -> dict[str, str]:
 @router.get("")
 async def credential_status(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """The credential's status, masked suffix, fingerprints, account match, cooldown and source."""
-    ctx = get_ctx(request)
-    manager = _manager(request)
+    return await status_answer(get_ctx(request))
+
+
+async def status_answer(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /credential` (the Credential page's Status and Replace cards render it, plan P6)."""
+    manager = manager_of(ctx)
     now_ms = int(ctx.clock.now_ms())
     with common.service_errors():
         rows = await ctx.dbs.hot.read(lambda conn: cooldowns.read_rows(conn, (cooldowns.CREDENTIAL_KEY,)))
@@ -223,8 +232,12 @@ async def credential_status(request: Request, _admin: AdminSession) -> dict[str,
 @router.get("/probes")
 async def probes(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """The last probes (newest first, at most 50) and the last result the credential manager recorded."""
-    ctx = get_ctx(request)
-    manager = _manager(request)
+    return await probes_answer(get_ctx(request))
+
+
+async def probes_answer(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /credential/probes` (the Credential page's Probes card)."""
+    manager = manager_of(ctx)
     now_ms = int(ctx.clock.now_ms())
     keep_ms = 90 * 86_400 * 1000
     rows = await ctx.dbs.metrics.read(
@@ -252,7 +265,11 @@ async def probes(request: Request, _admin: AdminSession) -> dict[str, Any]:
 @router.get("/budget")
 async def budget(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """The credential bucket and the reserved probe bucket now, and the credential calls of the last hour and day."""
-    ctx = get_ctx(request)
+    return await budget_answer(get_ctx(request))
+
+
+async def budget_answer(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /credential/budget` (the Credential page's Budget card)."""
     upstream = ctx.upstream
     defaults = BucketDefaults.from_settings(ctx.settings)
     states: dict[str, Any] = {}
@@ -397,6 +414,11 @@ __all__ = [
     "ACCOUNT_SWITCH_WARNING",
     "C1_WARNING",
     "REPLACE_CONFIRMATION",
+    "budget_answer",
+    "manager_of",
+    "probes_answer",
     "router",
+    "status_answer",
     "status_view",
+    "texts",
 ]

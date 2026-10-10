@@ -1,0 +1,62 @@
+{#-
+  Cache page, card `spread` (`roxy/admin/pages/cache.py spread_card`): v1 "Why isn't something being reused?".
+
+  The key spread diagnostic (`cache.spread_answer`, the `GET /admin/api/v1/cache/spread` function): one row per
+  endpoint path with how many stored answers sit behind it, how often they were reused, and the parameters with
+  the most values; a suspect row (many answers, one parameter splitting them, almost no reuse) offers "Ignore"
+  (fills the ignored parameters form) and every row "Purge" (the shared purge dialog, a wildcard pattern of the
+  path). Paths, parameter names and sample values are caller text: shown as text only. The element `#key-spread`
+  keeps the recommendation rules' links (`/admin/cache#key-spread`) landing here.
+  Context: `frame`, `groups`, `ignored`, `suggested`, `checked`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import caller_text, num, bytes %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/icon.html" import icon %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/glossary.html" import term with context %}
+{% set actions %}<button type="button" class="btn btn--sm btn--ghost" data-refresh-card="spread" data-action="cache-spread-check">{{ icon("refresh") }}<span>Check now</span></button>{% endset %}
+{% call page_card(frame, actions=actions, subtitle="Checked " ~ checked) %}
+<span id="key-spread" class="sr-only">Key spread</span>
+<div class="prose cache-hints">
+  <p>A caller that adds a changing value to every request (a timestamp, a random number) makes each request a <strong>different question</strong>. Answers pile up, and the hit count never moves, because no two requests ever ask the same thing. This is the {{ term("key-spread", "key spread") }}: the one cache failure that looks like success on every other number.</p>
+  <p>Each row is one endpoint path. Many stored answers behind one path with no reuse is the giveaway, and the parameter doing it is named: <strong>Ignore</strong> leaves it out of the cache key so those requests collapse back into one.</p>
+</div>
+{% if groups %}
+<div class="table-scroll" role="region" aria-labelledby="spread-list-caption" tabindex="0">
+  <table class="simple-table cache-list cache-spread">
+    <caption class="sr-only" id="spread-list-caption">Endpoints by stored answers, suspects first</caption>
+    <thead><tr><th scope="col">Endpoint</th><th scope="col" class="num">Stored answers</th><th scope="col" class="num">Times reused</th><th scope="col">Parameter splitting them</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+    <tbody>
+      {% for g in groups %}
+      <tr{% if g.suspect %} class="cache-spread__suspect"{% endif %}>
+        <th scope="row" data-label="Endpoint"><span class="mono">{{ g.method }}</span> {{ caller_text(g.path, 160) }}{% if g.suspect %} {{ status_badge("bad", "splitting for nothing") }}{% endif %}</th>
+        <td class="num" data-label="Stored answers">{{ num(g.entries) }} <span class="muted">({{ bytes(g.bytes) }})</span></td>
+        <td class="num" data-label="Times reused">{% if g.hits == 0 and g.entries > 1 %}{{ status_badge("warn", "0") }}{% else %}{{ num(g.hits) }}{% endif %}</td>
+        <td data-label="Parameter splitting them">
+          {% if g.varying %}
+          {% for v in g.varying %}<span class="cache-param"><code class="mono">{{ caller_text(v.name, 60) }}</code> <span class="muted">({{ num(v["values"]) }} values)</span></span>{% if not loop.last %}, {% endif %}{% endfor %}
+          {% if g.suspect %}<span class="muted">: splitting these apart for nothing</span>{% elif g.reused %}<span class="muted">: and they are being reused, so this is fine</span>{% endif %}
+          {% else %}<span class="muted">no query parameters</span>{% endif %}
+        </td>
+        <td class="cache-list__actions">
+          {% if g.suspect and g.suspect_param %}
+          <form class="cache-inline-form" data-api-form data-api-url="/admin/api/v1/cache/ignored-params" data-api-method="POST"
+                data-success="Ignored. The answers it split apart were dropped, so the next ones are shared." data-on-success="refresh" data-refresh="ignored-params spread browser">
+            <input type="hidden" name="name" value="{{ g.suspect_param }}" data-json="string">
+            <input type="hidden" name="note" value="Ignored from the key spread" data-json="string">
+            <button type="submit" class="btn btn--sm btn--warn-soft" data-action="cache-spread-ignore">{{ icon("filter") }}<span>Ignore</span><span class="sr-only"> {{ g.suspect_param }}</span></button>
+          </form>
+          {% endif %}
+          <button type="button" class="btn btn--sm btn--ghost" data-dialog-open="dlg-cache-purge" data-fill='{{ {"scope": "pattern", "type": "glob", "value": g.purge_pattern, "_label": "every stored answer for " ~ g.purge_pattern}|tojson }}' data-action="cache-spread-purge">{{ icon("x-circle") }}<span>Purge</span></button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state("Nothing stored yet", "With no stored answers there is nothing to diagnose. Rows appear as callers' answers are cached.", "inbox") }}
+{% endif %}
+{% if ignored %}<p class="muted">Already ignored: {% for name in ignored %}<code class="mono">{{ caller_text(name, 60) }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.</p>{% endif %}
+{% endcall %}

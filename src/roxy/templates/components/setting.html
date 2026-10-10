@@ -14,12 +14,23 @@
     spec) needs a reason and an explicit "I understand" before it can be saved (plan 15.1), and the server checks
     the same rule again, so the browser is a convenience, never the guard.
   How
-    The form posts with htmx (`hx-post` = save_url, `hx-swap="outerHTML"`): fields `key`, `value` (for a switch the
-    LAST `value` wins: a hidden "0" followed by the checkbox "1"), `reason` and `confirm_high_risk`. The server
-    validates with `roxy.config.catalog.validate_value` and answers with this macro again: `saved=True` after a
-    save, or `error="..."` with the submitted text kept in `value`. Client behavior (dirty state, live validation,
-    slider sync, duration and size previews, the risk warning) is the `settingControl` Alpine component in
-    static/js/components.js, which reads the data-* attributes below; it never evaluates strings as code.
+    Two modes, one markup.
+    API mode (every dashboard page; `api_url` set, built by `roxy.admin.pages.inline.setting_entry`): the form
+    carries `data-setting-api` (the settings API URL, `PUT /admin/api/v1/settings/{key}`) and
+    `data-setting-fragment` (`GET /admin/ui/setting/{key}`, which re-renders this control). static/js/
+    settings_api.js handles Save: it first asks `POST /settings/preview` and shows the review (before, after, what
+    happens, risk), then saves with `{value, reason, confirm_high_risk}`; it asks for the second factor first when
+    the setting needs a fresh one (`data-fresh-mfa`), again on a 403 `reauth_required` (then retries), shows the
+    server's message on a 422 (`confirmation_required` reveals the confirmation), and re-renders the control from
+    the fragment after a save or when the event stream reports `settings_changed`.
+    Form mode (the development gallery; `save_url` set): the form posts with htmx (`hx-post`, `hx-swap="outerHTML"`):
+    fields `key`, `value` (for a switch the LAST `value` wins: a hidden "0" followed by the checkbox "1"),
+    `reason` and `confirm_high_risk`, and the server answers with this macro again: `saved=True` after a save, or
+    `error="..."` with the submitted text kept in `value`.
+    Client behavior (dirty state, live validation, slider sync, duration and size previews, the risk warning) is
+    the `settingControl` Alpine component in static/js/components.js, which reads the data-* attributes below; it
+    never evaluates strings as code. `always_risky` (a setting whose `risk` is high: every change needs a reason
+    and a confirmation, as the API's `risk_reason` says) shows the risk warning on any change.
     meta: {"changed_at": "2026-10-07 14:02", "changed_by": "owner", "reason": "..."} or None.
 -#}
 {% from "components/icon.html" import icon %}
@@ -55,8 +66,9 @@
 {%- endif -%}
 {%- endmacro %}
 
-{% macro setting_control(spec, value, save_url, meta=None, history_url=None, error=None, saved=False,
-                         prefix="set", submitted=None) -%}
+{% macro setting_control(spec, value, save_url=None, meta=None, history_url=None, error=None, saved=False,
+                         prefix="set", submitted=None, api_url=None, fragment_url=None, needs_fresh_mfa=False,
+                         always_risky=False) -%}
 {%- set fid = prefix ~ "-" ~ spec.key -%}
 {%- set shown = submitted if submitted is not none else _raw(spec, value) -%}
 {%- set is_default = value == spec.default -%}
@@ -68,8 +80,10 @@
 {%- for o in spec.options %}{% set _ = option_text.update({o.value: o.description}) %}{% endfor -%}
 {%- set described = fid ~ "-desc " ~ fid ~ "-hint " ~ fid ~ "-error" -%}
 {%- set numeric = spec.type in ("int", "float", "percent") -%}
-<form class="setting{% if risk.why %} setting--risky{% endif %}" id="{{ fid }}" hx-post="{{ save_url }}" hx-target="this" hx-swap="outerHTML"
-      novalidate x-data="settingControl" data-setting-key="{{ spec.key }}" data-type="{{ spec.type }}"
+<form class="setting{% if risk.why %} setting--risky{% endif %}" id="{{ fid }}"
+      {%- if api_url %} data-setting-api="{{ api_url }}" data-setting-fragment="{{ fragment_url or '' }}"{% if needs_fresh_mfa %} data-fresh-mfa{% endif %}
+      {%- else %} hx-post="{{ save_url }}" hx-target="this" hx-swap="outerHTML"{% endif %}{% if always_risky %} data-always-risky{% endif %}
+      novalidate x-data="settingControl" x-on:setting-error="serverError" data-setting-key="{{ spec.key }}" data-type="{{ spec.type }}"
       data-label="{{ spec.label }}" data-unit="{{ _unit_label(spec) }}"
       {% if spec.min is not none %}data-min="{{ spec.min }}" {% endif %}{% if spec.max is not none %}data-max="{{ spec.max }}" {% endif %}
       {% if spec.step is not none %}data-step="{{ spec.step }}" {% endif %}{% if spec.max_length %}data-max-length="{{ spec.max_length }}" {% endif %}
@@ -163,8 +177,12 @@
       <input class="input" type="text" id="{{ fid }}-reason" name="reason" maxlength="500" autocomplete="off" x-bind:required="highRisk">
     </div>
     <label class="check setting__confirm" x-show="highRisk"><input type="checkbox" name="confirm_high_risk" value="1" x-bind:required="highRisk"><span>I understand the risk described above</span></label>
+    {% if api_url %}
+    {% if needs_fresh_mfa %}<p class="setting__mfa">{{ icon("lock") }}<span>Saving asks for a current code from your authenticator app first.</span></p>{% endif %}
+    <div class="setting__review" data-setting-review role="status" hidden></div>
+    {% endif %}
     <div class="setting__buttons">
-      <button type="submit" class="btn btn--primary" x-bind:disabled="invalid">{{ icon("check") }}<span>Save</span></button>
+      <button type="submit" class="btn btn--primary" x-bind:disabled="invalid">{{ icon("check") }}<span data-setting-submit-label>{{ "Review" if api_url else "Save" }}</span></button>
       <button type="button" class="btn btn--ghost" x-on:click="revert">Cancel</button>
     </div>
   </div>

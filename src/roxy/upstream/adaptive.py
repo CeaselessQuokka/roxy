@@ -13,9 +13,17 @@ Why it exists
 
 How it works
     - Decrease (on a Roblox 429 through direct or the credential, never the rotator, whose exits differ): the rate
-      drops by `adaptive_decrease_pct` (30 %), floored at `adaptive_min_per_min` (6) and never raised by the floor.
-      Only the first 429 of a cooldown episode counts (requests already in flight when the cooldown opened do not
-      cut the rate again), and a key cut within the attribution window is not cut twice.
+      drops by `adaptive_decrease_pct` (30 %) from the LOWER of the bucket's current limit and the calls Roxy
+      actually made through that bucket in the last minute (`buckets.observed_calls`, the bucket's window meter,
+      fleet-wide). That count is the rate Roblox just refused; cutting only the configured rate (120 to 84) left an
+      endpoint that ran at 61 a minute against a limit of 60 exactly where it was, so Roblox had to say 429 again
+      (finding LOAD-1). The burst is cut by the same ratio, so the burst keeps its share of the window (host and
+      endpoint buckets are window buckets: rate plus burst fit inside one minute, `buckets.py`). A count at or below
+      the floor is no evidence about the rate (Roblox refusing the first call of a quiet minute is not a limit Roxy
+      could keep), so it leaves the plan's cut of the current rate. The result is floored at
+      `adaptive_min_per_min` (6) and never raised by the floor. Only the first 429 of a cooldown episode
+      counts (requests already in flight when the cooldown opened do not cut the rate again), and a key cut within
+      the attribution window is not cut twice.
     - Attribution (before blaming the endpoint): if 429s reached `EGRESS_ATTRIBUTION_MIN_HOSTS` (2) different hosts
       through this egress within `cooldown_host_escalation_window_s` (60 s), the whole egress is being limited:
       an egress cooldown opens (in `effects.py`) and no per-endpoint rate is lowered. Otherwise, if
@@ -24,8 +32,10 @@ How it works
       "Across hosts" in plan 7.3 means more than one host, so 2 is definitional rather than a tunable.
     - Increase (leader job, hourly): after `adaptive_probe_after_h` (24) hours with zero 429s on the key, and
       bucket rejections (`upstream_busy` and `queue_overflow` answers) above 1 % of its attempts, the rate rises by
-      `adaptive_increase_pct` (10 %), capped at `adaptive_max_per_min` (600). A cap that is never reached is never
-      raised: without rejections there is no evidence. The key's last change must also be that old, which makes
+      `adaptive_increase_pct` (10 %), capped at `adaptive_max_per_min` (600). The burst recovers carefully: at most
+      one call per raise, never beyond the default burst's share of the new rate, never beyond the default burst.
+      A cap that is never reached is never raised: without rejections there is no evidence. The key's last change
+      must also be that old, which makes
       the job idempotent (a duplicate run finds the fresh change and does nothing). A rate set by an admin or an
       applied recommendation is never raised automatically (a decrease on a 429 still applies: safety first), and
       a host bucket is raised only to undo a cut this controller made, because rejections cannot tell which of a
@@ -40,6 +50,7 @@ What to read next
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -48,7 +59,14 @@ from typing import Any, Final, Protocol
 
 from roxy.core.reasons import Egress, ReasonCode
 from roxy.upstream import cooldowns
-from roxy.upstream.buckets import BucketDefaults, LimitPair, LimitsLookup, endpoint_bucket_key, host_bucket_key
+from roxy.upstream.buckets import (
+    WINDOW_MS,
+    BucketDefaults,
+    LimitPair,
+    LimitsLookup,
+    endpoint_bucket_key,
+    host_bucket_key,
+)
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +140,44 @@ def increased_rate(current: float, pct: float, ceiling: float) -> float:
     return round(max(current, min(ceiling, raised)), 2)
 
 
+def scaled_burst(burst: int, old_per_min: float, new_per_min: float) -> int:
+    """The burst after a rate cut: scaled by the same ratio (rounded down, at least 1), so it keeps its share of the
+    window. Unchanged when the rate did not go down."""
+    if old_per_min <= 0 or new_per_min >= old_per_min:
+        return burst
+    return max(1, math.floor(burst * new_per_min / old_per_min + 1e-9))
+
+
+def decreased_limit(current: LimitPair, observed: float | None, pct: float, floor: float) -> LimitPair:
+    """The rate and burst after a Roblox 429 (plan 7.3 with finding LOAD-1).
+
+    `observed` is how many calls Roxy made through the bucket in the last minute (its window meter), or None when
+    unknown. The cut starts from the lower of that and the current rate, so it lands below what Roblox refused. A
+    count at or below the floor is not used: Roblox refusing that few calls is not a per-minute limit Roxy could
+    learn (the controller never goes below the floor), so it is no evidence about the rate (a refusal on the
+    first call of a quiet minute, an address-wide block) and the plan's cut of the current rate applies. The floor
+    never raises a rate an admin set below it. The burst shrinks by the same ratio as the rate.
+    """
+    base = current.per_min
+    if observed is not None and observed > floor:
+        base = min(base, observed)
+    cut = base * (1 - pct / 100)
+    per_min = round(min(current.per_min, max(floor, cut)), 2)
+    return LimitPair(per_min, scaled_burst(current.burst, current.per_min, per_min))
+
+
+def increased_limit(current: LimitPair, default: LimitPair, pct: float, ceiling: float) -> LimitPair:
+    """The rate and burst after a clean probe period: the rate up by `pct` (capped), the burst back up carefully.
+
+    The burst grows by at most one call per raise, and only up to the share of the window the default burst has
+    at the new rate (10 of 120 for an endpoint), never beyond the default burst itself: after a cut, bursts come
+    back slowly, behind the rate."""
+    per_min = increased_rate(current.per_min, pct, ceiling)
+    share = max(1, math.floor(per_min * default.burst / default.per_min + 1e-9)) if default.per_min > 0 else 1
+    burst = max(current.burst, min(current.burst + 1, share, default.burst))
+    return LimitPair(per_min, burst)
+
+
 @dataclass(frozen=True, slots=True)
 class AdaptivePolicy:
     """The adaptive settings of plan 15.3 C."""
@@ -151,7 +207,7 @@ class AdaptivePolicy:
 
 @dataclass(frozen=True, slots=True)
 class RateChange:
-    """One rate the controller changed."""
+    """One rate the controller changed (`burst` is the new burst, `old_burst` the one before)."""
 
     bucket_key: str
     old_per_min: float
@@ -159,6 +215,7 @@ class RateChange:
     burst: int
     direction: str  # "decrease" or "increase"
     evidence: dict[str, Any] = field(default_factory=dict)
+    old_burst: int | None = None
 
 
 class LimitsWriter(Protocol):
@@ -281,8 +338,13 @@ class AdaptiveController:
         limits: LimitsLookup | None,
         defaults: BucketDefaults,
         now_s: float,
+        observed: Mapping[str, float] | None = None,
     ) -> RateChange | None:
-        """Lower the attributed bucket after a Roblox 429, when the rules above allow it."""
+        """Lower the attributed bucket after a Roblox 429, when the rules above allow it.
+
+        `observed` maps bucket keys to the calls Roxy made through them in the last minute (`effects.CallEffects
+        .observed`, read from the window meters in the 429's own transaction); the cut starts from it when it is
+        below the current rate."""
         if not policy.enabled or egress not in (Egress.DIRECT, Egress.CREDENTIAL):
             return None
         key = attribution.bucket_key
@@ -298,14 +360,25 @@ class AdaptiveController:
             updated = getattr(row, "updated_at", None)
             if updated is not None and now_s - float(updated) < policy.window_s:
                 return None  # another worker lowered it moments ago
-        new = decreased_rate(current.per_min, policy.decrease_pct, policy.min_per_min)
-        if new >= current.per_min:
+        seen = None if observed is None else observed.get(key)
+        new = decreased_limit(current, seen, policy.decrease_pct, policy.min_per_min)
+        if new.per_min >= current.per_min:
             return None
-        evidence = attribution.evidence() | {"egress": egress.value}
-        reason = f"Roblox 429 attributed to {attribution.kind.value}: {current.per_min:g} -> {new:g} per minute"
-        await self._writer.write_limit(key, new, current.burst, reason)
+        evidence = attribution.evidence() | {
+            "egress": egress.value,
+            "observed_calls": seen,  # calls Roxy made through the bucket in the last minute (None: unknown)
+            "observed_window_s": WINDOW_MS / 1000,
+            "cut_from": "observed" if seen is not None and policy.min_per_min < seen < current.per_min else "limit",
+        }
+        reason = (
+            f"Roblox 429 attributed to {attribution.kind.value}: {current.per_min:g} per minute (burst "
+            f"{current.burst}) -> {new.per_min:g} (burst {new.burst})"
+        )
+        if seen is not None:
+            reason += f"; {seen:g} calls in the last minute"
+        await self._writer.write_limit(key, new.per_min, new.burst, reason)
         self._remember(key, now_s)
-        change = RateChange(key, current.per_min, new, current.burst, "decrease", evidence)
+        change = RateChange(key, current.per_min, new.per_min, new.burst, "decrease", evidence, current.burst)
         self._emit("adaptive_rate_decrease", change)
         return change
 
@@ -333,21 +406,23 @@ class AdaptiveController:
             last_change = None if row is None else getattr(row, "updated_at", None)
             if not should_increase(item, None if last_change is None else float(last_change), now_s, policy):
                 continue
-            new = increased_rate(current.per_min, policy.increase_pct, policy.max_per_min)
-            if new <= current.per_min:
+            new = increased_limit(current, _default_for(key, defaults), policy.increase_pct, policy.max_per_min)
+            if new.per_min <= current.per_min:
                 continue
             reason = (
                 f"{policy.probe_after_h:g} h without a 429 and {item.rejection_share:.1%} of attempts rejected by "
-                f"the bucket: {current.per_min:g} -> {new:g} per minute"
+                f"the bucket: {current.per_min:g} per minute (burst {current.burst}) -> {new.per_min:g} (burst "
+                f"{new.burst})"
             )
-            await self._writer.write_limit(key, new, current.burst, reason)
+            await self._writer.write_limit(key, new.per_min, new.burst, reason)
             change = RateChange(
                 key,
                 current.per_min,
-                new,
-                current.burst,
+                new.per_min,
+                new.burst,
                 "increase",
                 {"attempts": item.attempts, "rejections": item.rejections},
+                current.burst,
             )
             changes.append(change)
             self._emit("adaptive_rate_increase", change)
@@ -358,6 +433,8 @@ class AdaptiveController:
             "bucket_key": change.bucket_key,
             "old_per_min": change.old_per_min,
             "new_per_min": change.new_per_min,
+            "old_burst": change.old_burst,
+            "new_burst": change.burst,
             "evidence": change.evidence,
         }
         log.info(event_type, extra={"fields": detail})
@@ -397,8 +474,11 @@ __all__ = [
     "RulesLimitsWriter",
     "attribute",
     "collect_stats",
+    "decreased_limit",
     "decreased_rate",
     "increase_job",
+    "increased_limit",
     "increased_rate",
+    "scaled_burst",
     "should_increase",
 ]

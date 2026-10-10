@@ -1,0 +1,516 @@
+/*
+ * The Help page (templates/admin/pages/help*): the guide outline, the glossary, the shortcuts, the page list, and
+ * the documents at /admin/help/<document>.
+ *
+ * What this is
+ *   Layout for the Help cards and for a rendered document: a readable measure, headings with their copyable "#"
+ *   links, code blocks and tables that scroll sideways inside their own box (never the page), and the contents list
+ *   beside the document on a wide screen (above it on a phone).
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract). Only tokens
+ *   from tokens.css are used, so both themes follow; every link and button keeps at least the 24 px target (44 px
+ *   on a phone, plan 14.8).
+ * How it works
+ *   Mobile first: one column; from 1100 px the document sits in a two-column grid with a sticky contents list.
+ * What to read next
+ *   templates/admin/pages/help/doc.html, roxy/admin/pages/_help_docs.py (what the renderer outputs).
+ */
+
+/* ---------------------------------------------------------------------------------------------- jump list */
+.help-jump {
+  padding: var(--sp-3) var(--sp-4);
+}
+
+.help-jump__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.help-jump__list a,
+.help-links a,
+.help-docs a,
+.help-runbook a,
+.help-page__title a,
+.help-page__cards a,
+.help-toc a,
+.doc-toc__list a,
+.doc-more__list a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-min);
+}
+
+/* ---------------------------------------------------------------------------------------------- guide card */
+.help-chapters {
+  display: grid;
+  gap: var(--sp-4);
+  margin: 0;
+  padding-left: var(--sp-6);
+}
+
+.help-chapter__title {
+  font-size: var(--fs-3);
+}
+
+.help-chapter__text {
+  margin: var(--sp-1) 0 0;
+  color: var(--text-muted);
+}
+
+.help-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--sp-4);
+  margin: var(--sp-1) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.help-section {
+  display: grid;
+  gap: var(--sp-3);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border);
+}
+
+.help-section__title {
+  font-size: var(--fs-3);
+}
+
+.help-docs,
+.help-runbooks,
+.help-toc {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.help-toc {
+  padding-left: var(--sp-6);
+  list-style: decimal;
+}
+
+.help-docs li,
+.help-runbook {
+  display: grid;
+  gap: 0;
+}
+
+.help-docs__about,
+.help-runbook__used {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  overflow-wrap: anywhere;
+}
+
+@media (min-width: 1100px) {
+  .help-runbooks,
+  .help-docs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--sp-2) var(--sp-6);
+  }
+}
+
+.help-guide > .alert + .help-chapters {
+  margin-top: var(--sp-5);
+}
+
+.help-runbook:target {
+  padding: var(--sp-2);
+  border-radius: var(--radius-sm);
+  outline: 2px solid var(--focus-ring);
+}
+
+/* ---------------------------------------------------------------------------------------------- glossary */
+.help-glossary__filter {
+  display: grid;
+  gap: var(--sp-1);
+  max-width: 32rem;
+}
+
+.help-glossary__filter .input-icon {
+  width: 100%;
+}
+
+.help-glossary__list {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.help-term {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--sp-1);
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.help-term:target {
+  padding: var(--sp-2);
+  border-radius: var(--radius-sm);
+  outline: 2px solid var(--focus-ring);
+}
+
+.help-term__name {
+  font-weight: var(--fw-semibold);
+}
+
+.help-term__definition {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+@media (min-width: 720px) {
+  .help-term {
+    grid-template-columns: minmax(10rem, 14rem) minmax(0, 1fr);
+    gap: var(--sp-4);
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------- shortcuts */
+.help-keys__grid {
+  display: grid;
+  gap: var(--sp-5);
+}
+
+@media (min-width: 900px) {
+  .help-keys__grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+.help-keys__title {
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-2);
+}
+
+.help-keys__list {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.help-keys__row {
+  display: grid;
+  grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr);
+  gap: var(--sp-3);
+  align-items: baseline;
+}
+
+.help-keys__row dd {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.help-keys kbd {
+  display: inline-block;
+  min-width: 1.6em;
+  margin-right: 2px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-1);
+  text-align: center;
+}
+
+/* ---------------------------------------------------------------------------------------------- pages card */
+.help-pages {
+  display: grid;
+  gap: var(--sp-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.help-page {
+  display: grid;
+  gap: var(--sp-1);
+  padding-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.help-page__title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-3);
+}
+
+.help-page__purpose {
+  margin: 0;
+}
+
+.help-page__cards {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding-left: 1.25em;
+}
+
+/* ---------------------------------------------------------------------------------------------- documents */
+.doc-layout {
+  display: grid;
+  gap: var(--sp-4);
+  min-width: 0;
+}
+
+.doc-toc {
+  padding: var(--sp-2) var(--sp-4);
+}
+
+.doc-toc__summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--target-touch);
+  font-weight: var(--fw-semibold);
+  cursor: pointer;
+  list-style: none;
+}
+
+.doc-toc__summary::-webkit-details-marker {
+  display: none;
+}
+
+.doc-toc__chevron {
+  margin-left: auto;
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.doc-toc[open] .doc-toc__chevron {
+  transform: rotate(180deg);
+}
+
+.doc-toc__list {
+  display: grid;
+  gap: 0;
+  margin: 0 0 var(--sp-2);
+  padding-left: 1.5em;
+  font-size: var(--fs-1);
+}
+
+.doc {
+  min-width: 0;
+  padding: var(--sp-5) var(--sp-4);
+  line-height: var(--lh);
+}
+
+.doc > * + *,
+.doc .heading + * {
+  margin-top: var(--sp-3);
+}
+
+.doc .heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-6);
+}
+
+.doc .heading-h3 {
+  margin-top: var(--sp-5);
+}
+
+.doc h2 {
+  font-size: var(--fs-5);
+}
+
+.doc h3 {
+  font-size: var(--fs-4);
+}
+
+.doc h4 {
+  font-size: var(--fs-3);
+}
+
+/* Links inside running text are underlined: color must never be the only signal (WCAG 1.4.1). */
+.doc a:not(.anchor),
+.help-chapter__text a,
+.help-glossary a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.doc .anchor {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--target-min);
+  min-height: var(--target-min);
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.doc .anchor:hover,
+.doc .anchor:focus-visible {
+  color: var(--accent);
+}
+
+.doc p,
+.doc li {
+  max-width: 80ch;
+  overflow-wrap: anywhere;
+}
+
+.doc ul,
+.doc ol {
+  padding-left: 1.5em;
+}
+
+.doc code {
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+}
+
+.doc pre {
+  max-width: 100%;
+  margin: var(--sp-3) 0 0;
+  padding: var(--sp-3);
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-size: var(--fs-1);
+  line-height: var(--lh-tight);
+}
+
+.doc pre code {
+  padding: 0;
+  background: transparent;
+  overflow-wrap: normal;
+  white-space: pre;
+}
+
+.doc blockquote {
+  margin: var(--sp-3) 0 0;
+  padding: var(--sp-2) var(--sp-4);
+  border-left: 3px solid var(--accent);
+  color: var(--text-muted);
+}
+
+.doc-table {
+  max-width: 100%;
+  margin-top: var(--sp-3);
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.doc-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-1);
+}
+
+.doc-table th,
+.doc-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.doc-table th {
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-weight: var(--fw-semibold);
+}
+
+.doc-table .align-center {
+  text-align: center;
+}
+
+.doc-table .align-right {
+  text-align: right;
+}
+
+.doc-alias {
+  display: block;
+  height: 0;
+}
+
+.doc-missing {
+  padding: var(--sp-4);
+}
+
+.doc-more {
+  padding: var(--sp-3) var(--sp-4);
+}
+
+.doc-more__title {
+  font-size: var(--fs-2);
+}
+
+.doc-more__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--sp-4);
+  margin: var(--sp-1) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+@media (min-width: 1100px) {
+  .doc-layout {
+    grid-template-columns: minmax(14rem, 18rem) minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .doc-layout--single {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .doc-toc {
+    position: sticky;
+    top: calc(var(--topbar-h) + var(--sp-3));
+    max-height: calc(100vh - var(--topbar-h) - var(--sp-6));
+    overflow-y: auto;
+  }
+
+  .doc-more {
+    grid-column: 2;
+  }
+
+  .doc {
+    padding: var(--sp-6) var(--sp-8);
+  }
+}
+
+@media (max-width: 640px) {
+  .help-chapters {
+    padding-left: var(--sp-5);
+  }
+
+  .help-jump__list a,
+  .help-links a,
+  .help-docs a,
+  .help-runbook a,
+  .help-page__title a,
+  .help-page__cards a,
+  .help-toc a,
+  .doc-toc__list a,
+  .doc-more__list a,
+  .doc .anchor {
+    min-height: var(--target-touch);
+  }
+
+  .help-keys__row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+}

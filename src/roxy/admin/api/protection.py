@@ -44,6 +44,10 @@ How it works
       `timestamp_ms` (epoch milliseconds); text columns have none. Client address columns are `ip=True`, so exports
       hash them unless `export_include_ips` is on.
     - Tables backed by SQL are sorted by the read model; tables of a few hundred rule rows are sorted in memory.
+    - The Protection dashboard page (`roxy/admin/pages/protection.py`) shows the same numbers through the same code:
+      each route's read is a public `*_answer` (or `*_rows`) helper here that the route and the page both call
+      (`table_page` and `list_answer` build one page of a table, `one_order` is the page's form of the single-order
+      rule); the routes keep their exports and their answers unchanged (P11 contract).
 
 What to read next
     `roxy/admin/api/common.py` (the shared layer), `roxy/abuse/pipeline.py` (what these settings drive), then
@@ -269,6 +273,34 @@ def _with_extra(answer: dict[str, Any], extra: Mapping[str, Any] | None) -> dict
     return answer
 
 
+async def table_page(
+    spec: TableSpec, tq: TableQuery, fetch: Fetch, *, extra: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """One page of a paged read model as a section 13 table (the answer the routes give and the Protection page
+    shows; DESIGN.md 13, one source of truth per number)."""
+    items, total = await fetch(tq.page, tq.page_size)
+    return _with_extra(table_answer(spec, tq, items, total), extra)
+
+
+def list_answer(
+    spec: TableSpec,
+    tq: TableQuery,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    search_keys: Sequence[str] = (),
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A small in-memory list (rule rows) searched, sorted and paged here, as a section 13 table."""
+    items, total = page_rows(rows, tq, search_keys=search_keys)
+    return _with_extra(table_answer(spec, tq, items, total), extra)
+
+
+def one_order(tq: TableQuery, order: Literal["asc", "desc"] = "desc") -> TableQuery:
+    """`tq` in the one order a table whose read model sorts in SQL can give (the page's form of `_single_order`:
+    a page never fails on a header click, it shows the order it has)."""
+    return tq if tq.order == order else replace(tq, order=order)
+
+
 async def _table_or_export(
     request: Request,
     admin: AdminPrincipal,
@@ -284,8 +316,7 @@ async def _table_or_export(
     """A paged read model as a section 13 table, or every page of it as a CSV or JSON download."""
     if fmt is not None:
         return await export_pages(request, admin, spec, fetch, fmt, tq=tq, filters=filters, tr=tr)
-    items, total = await fetch(tq.page, tq.page_size)
-    return _with_extra(table_answer(spec, tq, items, total), extra)
+    return await table_page(spec, tq, fetch, extra=extra)
 
 
 async def _list_or_export(
@@ -305,8 +336,7 @@ async def _list_or_export(
     if fmt is not None:
         everything, total = page_rows(rows, replace(tq, page=1, page_size=max(1, len(rows))), search_keys=search_keys)
         return await export_table(request, admin, spec, everything, fmt, total=total, tq=tq, filters=filters, tr=tr)
-    items, total = page_rows(rows, tq, search_keys=search_keys)
-    return _with_extra(table_answer(spec, tq, items, total), extra)
+    return list_answer(spec, tq, rows, search_keys=search_keys, extra=extra)
 
 
 async def _with_rule_hits(ctx: Any, table: str, rows: list[dict[str, Any]], tr: TimeRange) -> None:
@@ -553,13 +583,17 @@ async def _throttle_all_view(ctx: Any, state: ThrottleAllState) -> dict[str, Any
     }
 
 
-@router.get("/throttle-all")
-async def throttle_all_state(request: Request, _admin: AdminSession) -> dict[str, Any]:
-    """The emergency per-IP limit: state, limit, "since" marker and refusals since it began (rows 42, 114, 115)."""
-    ctx = _ctx(request)
+async def throttle_all_answer(ctx: Any) -> dict[str, Any]:
+    """The `GET /throttle-all` answer (the route and the Protection page call this)."""
     with service_errors():
         raw = await ctx.dbs.control.read(lambda conn: read_state_value(conn, THROTTLE_ALL_KEY))
         return await _throttle_all_view(ctx, ThrottleAllState.from_json(raw))
+
+
+@router.get("/throttle-all")
+async def throttle_all_state(request: Request, _admin: AdminSession) -> dict[str, Any]:
+    """The emergency per-IP limit: state, limit, "since" marker and refusals since it began (rows 42, 114, 115)."""
+    return await throttle_all_answer(_ctx(request))
 
 
 @router.post("/throttle-all")
@@ -683,6 +717,30 @@ async def throttle_all_watch_table(
     """
     ctx = _ctx(request)
     _single_order(tq)
+    fetch, since = await _throttle_all_watch_fetch(ctx)
+    with service_errors():
+        return await _table_or_export(
+            request,
+            admin,
+            WATCH_ALL_SPEC,
+            tq,
+            fmt,
+            fetch,
+            extra={"since": since, "caller_text": list(WATCH_ALL_CALLER_TEXT)},
+        )
+
+
+async def throttle_all_watch_answer(ctx: Any, tq: TableQuery) -> dict[str, Any]:
+    """One page of `GET /throttle-all/watch` (the route and the Protection page share `_throttle_all_watch_fetch`)."""
+    fetch, since = await _throttle_all_watch_fetch(ctx)
+    with service_errors():
+        return await table_page(
+            WATCH_ALL_SPEC, one_order(tq), fetch, extra={"since": since, "caller_text": list(WATCH_ALL_CALLER_TEXT)}
+        )
+
+
+async def _throttle_all_watch_fetch(ctx: Any) -> tuple[Fetch, float]:
+    """The watch's page reader and its "since" (see `throttle_all_watch_table`)."""
     limit_setting = int(_setting(ctx, "global_throttle_limit"))
     period = int(_setting(ctx, "global_throttle_period"))
     with service_errors():
@@ -708,16 +766,7 @@ async def throttle_all_watch_table(
                 row[key] = found.get(key)
         return rows, int(data["total"])
 
-    with service_errors():
-        return await _table_or_export(
-            request,
-            admin,
-            WATCH_ALL_SPEC,
-            tq,
-            fmt,
-            fetch,
-            extra={"since": since, "caller_text": list(WATCH_ALL_CALLER_TEXT)},
-        )
+    return fetch, since
 
 
 # =============================================================================================== bans
@@ -789,6 +838,47 @@ async def bans_table(
 ) -> Any:
     """Bans with countdowns and evidence (plan 10.9), filtered and paged in SQL."""
     ctx = _ctx(request)
+    fetch, filters, active_total = _bans_fetch(
+        ctx, tq, state=state, origin=origin, detector=detector, subject_type=subject_type
+    )
+    with service_errors():
+        answer = await _table_or_export(request, admin, BAN_SPEC, tq, fmt, fetch, filters=filters)
+    if isinstance(answer, dict):
+        answer["active_total"] = active_total[0]
+        answer["disguised"] = bool(_setting(ctx, "ban_disguise_as_throttle"))
+    return answer
+
+
+async def bans_answer(
+    ctx: Any,
+    tq: TableQuery,
+    *,
+    state: Literal["active", "expired", "all"] = "active",
+    origin: Literal["any", "manual", "auto"] = "any",
+    detector: str | None = None,
+    subject_type: Literal["ip", "cidr", "place", "ua_hash"] | None = None,
+) -> dict[str, Any]:
+    """One page of `GET /bans` (the route and the Protection page share `_bans_fetch`)."""
+    fetch, _filters, active_total = _bans_fetch(
+        ctx, tq, state=state, origin=origin, detector=detector, subject_type=subject_type
+    )
+    with service_errors():
+        answer = await table_page(BAN_SPEC, tq, fetch)
+    answer["active_total"] = active_total[0]
+    answer["disguised"] = bool(_setting(ctx, "ban_disguise_as_throttle"))
+    return answer
+
+
+def _bans_fetch(
+    ctx: Any,
+    tq: TableQuery,
+    *,
+    state: Literal["active", "expired", "all"],
+    origin: Literal["any", "manual", "auto"],
+    detector: str | None,
+    subject_type: Literal["ip", "cidr", "place", "ua_hash"] | None,
+) -> tuple[Fetch, dict[str, Any], list[int]]:
+    """The bans page reader, its filters and the active count it fills (a 422 for an unknown detector)."""
     if detector is not None and detector not in read_bans.AUTO_DETECTORS:
         raise validation_error({"detector": f"Choose one of: {', '.join(read_bans.AUTO_DETECTORS)}."})
     now = _now(ctx)
@@ -814,12 +904,7 @@ async def bans_table(
         active_total[0] = int(data["active_total"])
         return data["rows"], int(data["total"])
 
-    with service_errors():
-        answer = await _table_or_export(request, admin, BAN_SPEC, tq, fmt, fetch, filters=filters)
-    if isinstance(answer, dict):
-        answer["active_total"] = active_total[0]
-        answer["disguised"] = bool(_setting(ctx, "ban_disguise_as_throttle"))
-    return answer
+    return fetch, filters, active_total
 
 
 @router.get("/bans/reset")
@@ -830,7 +915,11 @@ async def bans_reset_preview(
     detector: Annotated[str | None, Query(max_length=64)] = None,
 ) -> dict[str, Any]:
     """What a bans reset would delete, before anything is deleted (plan 6.8)."""
-    ctx = _ctx(request)
+    return await bans_reset_preview_answer(_ctx(request), scope, detector)
+
+
+async def bans_reset_preview_answer(ctx: Any, scope: str, detector: str | None = None) -> dict[str, Any]:
+    """The `GET /bans/reset` preview (the route and the Protection page's reset dialog call this)."""
     now = _now(ctx)
     try:
         read_bans.reset_scope(scope, now=now, detector=detector)
@@ -902,7 +991,11 @@ async def ban_detail(
     request: Request, _admin: AdminSession, ban_id: Annotated[int, Path(ge=1, le=2**62)]
 ) -> dict[str, Any]:
     """One ban with its evidence: the stored reason and the detector events about the subject."""
-    ctx = _ctx(request)
+    return await ban_detail_answer(_ctx(request), ban_id)
+
+
+async def ban_detail_answer(ctx: Any, ban_id: int) -> dict[str, Any]:
+    """The `GET /bans/{ban_id}` answer (the route and the Protection page's ban drawer call this); 404 when gone."""
     with service_errors():
         row = await ctx.dbs.control.read(lambda conn: read_bans.ban_row(conn, ban_id))
     if row is None:
@@ -1043,11 +1136,15 @@ def _covers(cidr: str, ip: str) -> bool:
 @router.get("/access/bypass/me")
 async def bypass_me_state(request: Request, admin: AdminSession) -> dict[str, Any]:
     """Your address as Roxy resolved it (plan 9.11; v1 "YourIP", row 113) and whether a bypass entry covers it."""
-    ctx = _ctx(request)
+    return await bypass_me_answer(_ctx(request), admin.ip)
+
+
+async def bypass_me_answer(ctx: Any, ip: str) -> dict[str, Any]:
+    """The `GET /access/bypass/me` answer for the admin's address `ip` (the route and the Protection page)."""
     rows = await _access_rows(ctx, "bypass")
-    covering = [row for row in rows if row["active"] and _covers(row["cidr"], admin.ip)]
+    covering = [row for row in rows if row["active"] and _covers(row["cidr"], ip)]
     return {
-        "ip": admin.ip,
+        "ip": ip,
         "bypassed": bool(covering),
         "entries": covering,
         "default_expiry_h": float(_setting(ctx, "bypass_default_expiry_h")),
@@ -1085,13 +1182,7 @@ async def access_table(
     """The deny list, the admin allowlist (D6) or the bypass list, each entry with its hits in the range and since
     it was added (`HIT_COLUMNS`; the admin allowlist is not an abuse check, so its entries record none)."""
     ctx = _ctx(request)
-    rows = await _access_rows(ctx, kind)
-    await _with_rule_hits(ctx, "access_list", rows, tr)
-    extra: dict[str, Any] = {"kind": kind, "your_ip": admin.ip, "range": tr.info()}
-    if kind == "bypass":
-        extra["default_expiry_h"] = float(_setting(ctx, "bypass_default_expiry_h"))
-    if kind == "allow_admin":
-        extra["allowlist_enabled"] = bool(_setting(ctx, "admin_allowlist_enabled"))
+    rows, extra = await _access_parts(ctx, kind, tr, admin.ip)
     return await _list_or_export(
         request,
         admin,
@@ -1099,11 +1190,37 @@ async def access_table(
         tq,
         fmt,
         rows,
-        search_keys=("cidr", "note", "created_by"),
+        search_keys=ACCESS_SEARCH,
         filters={"kind": kind},
         tr=tr,
         extra=extra,
     )
+
+
+ACCESS_SEARCH: Final = ("cidr", "note", "created_by")
+
+
+async def access_rows(ctx: Any, kind: str, tr: TimeRange) -> list[dict[str, Any]]:
+    """Every entry of one access list with its hits (`HIT_COLUMNS`), as `GET /access/{kind}` lists them."""
+    rows = await _access_rows(ctx, kind)
+    await _with_rule_hits(ctx, "access_list", rows, tr)
+    return rows
+
+
+async def _access_parts(ctx: Any, kind: str, tr: TimeRange, ip: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rows = await access_rows(ctx, kind, tr)
+    extra: dict[str, Any] = {"kind": kind, "your_ip": ip, "range": tr.info()}
+    if kind == "bypass":
+        extra["default_expiry_h"] = float(_setting(ctx, "bypass_default_expiry_h"))
+    if kind == "allow_admin":
+        extra["allowlist_enabled"] = bool(_setting(ctx, "admin_allowlist_enabled"))
+    return rows, extra
+
+
+async def access_answer(ctx: Any, kind: str, tq: TableQuery, tr: TimeRange, ip: str) -> dict[str, Any]:
+    """One page of `GET /access/{kind}` for the admin at `ip` (the route and the Protection page)."""
+    rows, extra = await _access_parts(ctx, kind, tr, ip)
+    return list_answer(ACCESS_SPEC, tq, rows, search_keys=ACCESS_SEARCH, extra=extra)
 
 
 async def _add_access(request: Request, admin: AdminPrincipal, kind: str, body: AccessBody) -> dict[str, Any]:
@@ -1403,7 +1520,9 @@ class ReasonBody(ApiBody):
     reason: str | None = Field(None, max_length=MAX_REASON_LENGTH)
 
 
-async def _ladder_view(ctx: Any, tr: TimeRange | None) -> dict[str, Any]:
+async def ladder_view(ctx: Any, tr: TimeRange | None) -> dict[str, Any]:
+    """The escalation ladder (`GET /ladder`; with `tr`, each rung's new strikes in the range): the routes and the
+    Protection page's ladder card call this."""
     with service_errors():
         rows = await _rules(ctx).list_rows("throttle_tiers")
     hits: dict[int, int] = {}
@@ -1441,14 +1560,14 @@ async def throttle_state(request: Request, _admin: AdminSession) -> dict[str, An
     ctx = _ctx(request)
     return {
         "settings": {key: _setting(ctx, key) for key in THROTTLE_KEYS},
-        "ladder": await _ladder_view(ctx, None),
+        "ladder": await ladder_view(ctx, None),
     }
 
 
 @router.get("/ladder")
 async def ladder_state(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """The escalation ladder with each rung's wait and how many new strikes reached it in the range (row 76)."""
-    return await _ladder_view(_ctx(request), tr)
+    return await ladder_view(_ctx(request), tr)
 
 
 @router.put("/ladder")
@@ -1461,7 +1580,7 @@ async def ladder_replace(request: Request, admin: AdminSession, _csrf: CsrfCheck
             tiers, actor_for(admin), audit_reason(body.reason), request_id=request_id_of(request)
         )
     )
-    return {"changed": change.changed, "config_version": change.config_version, **await _ladder_view(ctx, None)}
+    return {"changed": change.changed, "config_version": change.config_version, **await ladder_view(ctx, None)}
 
 
 @router.post("/ladder/reset")
@@ -1471,7 +1590,7 @@ async def ladder_reset(request: Request, admin: AdminSession, _csrf: CsrfChecked
     change = await run_mutation(
         _rules(ctx).reset_throttle_tiers(actor_for(admin), audit_reason(body.reason), request_id=request_id_of(request))
     )
-    return {"changed": change.changed, "config_version": change.config_version, **await _ladder_view(ctx, None)}
+    return {"changed": change.changed, "config_version": change.config_version, **await ladder_view(ctx, None)}
 
 
 STRIKE_SPEC: Final = TableSpec(
@@ -1511,6 +1630,19 @@ async def strikes_table(
     """The strike board, worst first, paged on the server (row 41)."""
     ctx = _ctx(request)
     _single_order(tq)
+    fetch = _strikes_fetch(ctx)
+    with service_errors():
+        return await _table_or_export(request, admin, STRIKE_SPEC, tq, fmt, fetch)
+
+
+async def strike_board_answer(ctx: Any, tq: TableQuery) -> dict[str, Any]:
+    """One page of `GET /strikes` (the route and the Protection page share `_strikes_fetch`)."""
+    fetch = _strikes_fetch(ctx)
+    with service_errors():
+        return await table_page(STRIKE_SPEC, one_order(tq), fetch)
+
+
+def _strikes_fetch(ctx: Any) -> Fetch:
     with service_errors():
         ladder = ladder_from(_rules_snapshot(ctx).throttle_tiers)
     decay = int(_setting(ctx, "throttle_strike_decay_seconds"))
@@ -1520,8 +1652,7 @@ async def strikes_table(
         data = await strike_board(ctx.dbs.hot, now_s=_now(ctx), decay_s=decay, ladder=ladder, limit=size, offset=offset)
         return data["rows"], int(data["total"])
 
-    with service_errors():
-        return await _table_or_export(request, admin, STRIKE_SPEC, tq, fmt, fetch)
+    return fetch
 
 
 def _rules_snapshot(ctx: Any) -> Any:
@@ -1568,14 +1699,23 @@ async def throttle_watch_table(
     """Who is being throttled right now, with time left, longest penalty first (row 118)."""
     ctx = _ctx(request)
     _single_order(tq)
+    with service_errors():
+        return await _table_or_export(request, admin, WATCH_SPEC, tq, fmt, _throttle_watch_fetch(ctx))
 
+
+async def throttle_watch_answer(ctx: Any, tq: TableQuery) -> dict[str, Any]:
+    """One page of `GET /throttle/watch` (the route and the Protection page share `_throttle_watch_fetch`)."""
+    with service_errors():
+        return await table_page(WATCH_SPEC, one_order(tq), _throttle_watch_fetch(ctx))
+
+
+def _throttle_watch_fetch(ctx: Any) -> Fetch:
     async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
         offset = (page - 1) * size
         data = await throttle_watch(ctx.dbs.hot, now_s=_now(ctx), limit=size, offset=offset)
         return data["rows"], int(data["total"])
 
-    with service_errors():
-        return await _table_or_export(request, admin, WATCH_SPEC, tq, fmt, fetch)
+    return fetch
 
 
 THROTTLED_SPEC: Final = TableSpec(
@@ -1598,15 +1738,25 @@ async def throttled_history(
     fmt: ExportFormatDep,
 ) -> Any:
     """Clients that became throttled in the range (v1 "Throttled IPs", row 80), most often first."""
-    ctx = _ctx(request)
+    rows = await throttled_rows(_ctx(request), tr)
+    return await _list_or_export(request, admin, THROTTLED_SPEC, tq, fmt, rows, search_keys=("ip",), tr=tr)
+
+
+async def throttled_rows(ctx: Any, tr: TimeRange) -> list[dict[str, Any]]:
+    """The rows of `GET /throttle/history` (the route and the Protection page)."""
     start, end = _range_ms(tr)
     with service_errors():
-        rows = await ctx.dbs.metrics.read(
+        rows: list[dict[str, Any]] = await ctx.dbs.metrics.read(
             lambda conn: security_events.summary_by_ip(
                 conn, security_events.THROTTLED, start, end, limit=read_protection.MAX_GROUPS
             )
         )
-    return await _list_or_export(request, admin, THROTTLED_SPEC, tq, fmt, rows, search_keys=("ip",), tr=tr)
+    return rows
+
+
+async def throttled_history_answer(ctx: Any, tq: TableQuery, tr: TimeRange) -> dict[str, Any]:
+    """One page of `GET /throttle/history`."""
+    return list_answer(THROTTLED_SPEC, tq, await throttled_rows(ctx, tr), search_keys=("ip",))
 
 
 # --- limiter state reset (plan 6.8) ---------------------------------------------------------------------------
@@ -1681,7 +1831,11 @@ async def limiter_reset_preview(
     client: Annotated[str | None, Query(max_length=64)] = None,
 ) -> dict[str, Any]:
     """How many limiter and strike rows a limiter reset would delete (plan 6.8 preview)."""
-    ctx = _ctx(request)
+    return await limiter_reset_preview_answer(_ctx(request), scope, client)
+
+
+async def limiter_reset_preview_answer(ctx: Any, scope: str, client: str | None = None) -> dict[str, Any]:
+    """The `GET /limiter/reset` preview (the route and the Protection page's reset dialogs call this)."""
     key = _limiter_client(scope, client)
     with service_errors():
         counts = await ctx.dbs.hot.read(lambda conn: _limiter_counts(conn, scope, key))
@@ -1871,6 +2025,20 @@ async def ua_rules_table(
 ) -> Any:
     """User-Agent rules in evaluation order with their allowed and refused counts in the range (rows 44, 76)."""
     ctx = _ctx(request)
+    rows = await ua_rule_rows(ctx, tr)
+    extra = _ua_extra(ctx, tr)
+    return await _list_or_export(request, admin, UA_SPEC, tq, fmt, rows, search_keys=UA_SEARCH, tr=tr, extra=extra)
+
+
+UA_SEARCH: Final = ("needle", "note", "message", "id")
+
+
+def _ua_extra(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    return {"rules_enabled": bool(_setting(ctx, "user_agent_rules_enabled")), "range": tr.info()}
+
+
+async def ua_rule_rows(ctx: Any, tr: TimeRange) -> list[dict[str, Any]]:
+    """Every User-Agent rule with its allowed and refused counts and hits in the range (`GET /ua-rules` rows)."""
     rows = await _rule_rows(ctx, "rules_user_agent")
     start, end = _range_ms(tr)
     hits = await ctx.dbs.metrics.read(lambda conn: read_protection.ua_rule_hits(conn, start, end))
@@ -1880,10 +2048,12 @@ async def ua_rules_table(
         row["refused"] = counts.get("refused", 0)
         row["last_hit_ms"] = counts.get("last_ms")
     await _with_rule_hits(ctx, "rules_user_agent", rows, tr)
-    extra = {"rules_enabled": bool(_setting(ctx, "user_agent_rules_enabled")), "range": tr.info()}
-    return await _list_or_export(
-        request, admin, UA_SPEC, tq, fmt, rows, search_keys=("needle", "note", "message", "id"), tr=tr, extra=extra
-    )
+    return rows
+
+
+async def ua_rules_answer(ctx: Any, tq: TableQuery, tr: TimeRange) -> dict[str, Any]:
+    """One page of `GET /ua-rules` (the route and the Protection page share `ua_rule_rows`)."""
+    return list_answer(UA_SPEC, tq, await ua_rule_rows(ctx, tr), search_keys=UA_SEARCH, extra=_ua_extra(ctx, tr))
 
 
 @router.post("/ua-rules")
@@ -2035,9 +2205,7 @@ async def header_rules_table(
     fmt: ExportFormatDep,
 ) -> Any:
     """Request filters (header rules), first match wins in id order (rows 45, 112), with their hits."""
-    ctx = _ctx(request)
-    rows = await _rule_rows(ctx, "rules_header")
-    await _with_rule_hits(ctx, "rules_header", rows, tr)
+    rows = await rule_table_rows(_ctx(request), "rules_header", tr)
     return await _list_or_export(
         request,
         admin,
@@ -2045,10 +2213,28 @@ async def header_rules_table(
         tq,
         fmt,
         rows,
-        search_keys=("header", "needle", "note", "message"),
+        search_keys=HEADER_SEARCH,
         tr=tr,
         extra={"disguised_by_default": True, "range": tr.info()},
     )
+
+
+HEADER_SEARCH: Final = ("header", "needle", "note", "message")
+
+
+async def rule_table_rows(ctx: Any, table: str, tr: TimeRange) -> list[dict[str, Any]]:
+    """Every row of one rule table with its hits in the range (`HIT_COLUMNS`): the rows of `GET /header-rules`,
+    `/endpoint-blocks` and `/endpoint-rules` (the routes and the Protection page call this)."""
+    rows = await _rule_rows(ctx, table)
+    await _with_rule_hits(ctx, table, rows, tr)
+    return rows
+
+
+async def header_rules_answer(ctx: Any, tq: TableQuery, tr: TimeRange) -> dict[str, Any]:
+    """One page of `GET /header-rules`."""
+    rows = await rule_table_rows(ctx, "rules_header", tr)
+    extra = {"disguised_by_default": True, "range": tr.info()}
+    return list_answer(HEADER_SPEC, tq, rows, search_keys=HEADER_SEARCH, extra=extra)
 
 
 @router.post("/header-rules")
@@ -2084,7 +2270,11 @@ async def header_rules_presets(request: Request, _admin: AdminSession) -> dict[s
     The live feed keeps each request's User-Agent and Roblox-Id but not its other headers (open a capture for the
     full set), so a sample holds those two lines.
     """
-    ctx = _ctx(request)
+    return await header_presets_answer(_ctx(request))
+
+
+async def header_presets_answer(ctx: Any) -> dict[str, Any]:
+    """The `GET /header-rules/presets` answer (the route and the Protection page's tester call this)."""
     with service_errors():
         rows = await ctx.dbs.metrics.read(lambda conn: read_protection.recent_live_rows(conn, limit=MAX_RECENT_SAMPLES))
     samples = []
@@ -2275,7 +2465,32 @@ async def _attempts(
     fmt: ExportFormat | None,
     matcher: Callable[[Any, str], Any] | None,
 ) -> Any:
-    ctx = _ctx(request)
+    fetch = _attempts_fetch(_ctx(request), reason, tr, tq, matcher)
+    with service_errors():
+        return await _table_or_export(
+            request, admin, ATTEMPT_SPEC, tq, fmt, fetch, filters={"reason": reason}, tr=tr, extra={"reason": reason}
+        )
+
+
+ATTEMPT_MATCHERS: Final[dict[str, Callable[[Any, str], Any] | None]] = {
+    "endpoint_blocked": match_block,
+    "endpoint_rule": match_endpoint_rule,
+    "header_rule": None,
+}
+"""The "matching rule now" of each attempts tab (a request filter matches headers, not a path: none)."""
+
+
+async def attempts_answer(ctx: Any, reason: str, tq: TableQuery, tr: TimeRange) -> dict[str, Any]:
+    """One page of an attempts tab (`GET /endpoint-blocks/attempts`, `/endpoint-rules/attempts`,
+    `/header-rules/attempts`; `reason` is `endpoint_blocked`, `endpoint_rule` or `header_rule`)."""
+    fetch = _attempts_fetch(ctx, reason, tr, tq, ATTEMPT_MATCHERS[reason])
+    with service_errors():
+        return await table_page(ATTEMPT_SPEC, tq, fetch, extra={"reason": reason})
+
+
+def _attempts_fetch(
+    ctx: Any, reason: str, tr: TimeRange, tq: TableQuery, matcher: Callable[[Any, str], Any] | None
+) -> Fetch:
     start, end = _range_ms(tr)
     snapshot = _rules_snapshot(ctx)
     rule_table = ATTEMPT_RULE_TABLE.get(reason)
@@ -2310,10 +2525,10 @@ async def _attempts(
         rows = await asyncio.to_thread(annotate, list(data["rows"]))  # pattern matching off the event loop
         return rows, int(data["total"])
 
-    with service_errors():
-        return await _table_or_export(
-            request, admin, ATTEMPT_SPEC, tq, fmt, fetch, filters={"reason": reason}, tr=tr, extra={"reason": reason}
-        )
+    return fetch
+
+
+PATTERN_SEARCH: Final = ("pattern", "note", "message")
 
 
 @router.get("/endpoint-blocks")
@@ -2325,9 +2540,7 @@ async def blocks_table(
     fmt: ExportFormatDep,
 ) -> Any:
     """Endpoint blocks (row 46): every matching block refuses with 403; each with its hits."""
-    ctx = _ctx(request)
-    rows = await _rule_rows(ctx, "rules_endpoint_block")
-    await _with_rule_hits(ctx, "rules_endpoint_block", rows, tr)
+    rows = await rule_table_rows(_ctx(request), "rules_endpoint_block", tr)
     return await _list_or_export(
         request,
         admin,
@@ -2335,10 +2548,16 @@ async def blocks_table(
         tq,
         fmt,
         rows,
-        search_keys=("pattern", "note", "message"),
+        search_keys=PATTERN_SEARCH,
         tr=tr,
         extra={"range": tr.info()},
     )
+
+
+async def endpoint_blocks_answer(ctx: Any, tq: TableQuery, tr: TimeRange) -> dict[str, Any]:
+    """One page of `GET /endpoint-blocks`."""
+    rows = await rule_table_rows(ctx, "rules_endpoint_block", tr)
+    return list_answer(BLOCK_SPEC, tq, rows, search_keys=PATTERN_SEARCH, extra={"range": tr.info()})
 
 
 @router.post("/endpoint-blocks")
@@ -2384,8 +2603,7 @@ async def endpoint_rules_table(
 ) -> Any:
     """Endpoint rate rules (row 43): the most specific matching rule applies; each with its hits."""
     ctx = _ctx(request)
-    rows = await _rule_rows(ctx, "rules_endpoint_limit")
-    await _with_rule_hits(ctx, "rules_endpoint_limit", rows, tr)
+    rows = await rule_table_rows(ctx, "rules_endpoint_limit", tr)
     return await _list_or_export(
         request,
         admin,
@@ -2393,10 +2611,20 @@ async def endpoint_rules_table(
         tq,
         fmt,
         rows,
-        search_keys=("pattern", "note", "message"),
+        search_keys=PATTERN_SEARCH,
         tr=tr,
-        extra={"per_ip_allowance": int(_setting(ctx, "allowed_requests_per_minute")), "range": tr.info()},
+        extra=_endpoint_rule_extra(ctx, tr),
     )
+
+
+def _endpoint_rule_extra(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    return {"per_ip_allowance": int(_setting(ctx, "allowed_requests_per_minute")), "range": tr.info()}
+
+
+async def endpoint_rules_answer(ctx: Any, tq: TableQuery, tr: TimeRange) -> dict[str, Any]:
+    """One page of `GET /endpoint-rules`."""
+    rows = await rule_table_rows(ctx, "rules_endpoint_limit", tr)
+    return list_answer(ENDPOINT_RULE_SPEC, tq, rows, search_keys=PATTERN_SEARCH, extra=_endpoint_rule_extra(ctx, tr))
 
 
 @router.post("/endpoint-rules")
@@ -2478,6 +2706,12 @@ async def ignored_paths_table(
     return await _list_or_export(request, admin, IGNORED_SPEC, tq, fmt, rows, search_keys=("pattern", "note"))
 
 
+async def ignored_paths_answer(ctx: Any, tq: TableQuery) -> dict[str, Any]:
+    """One page of `GET /ignored-paths` (the route and the Protection page)."""
+    rows = await _rule_rows(ctx, "ignored_paths")
+    return list_answer(IGNORED_SPEC, tq, rows, search_keys=("pattern", "note"))
+
+
 @router.post("/ignored-paths")
 async def ignored_path_create(
     request: Request, admin: AdminSession, _csrf: CsrfChecked, body: IgnoredPathBody
@@ -2541,7 +2775,11 @@ class ArmBody(ApiBody):
 @router.get("/spam")
 async def spam_state(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """The spam detectors (plan 10.3): master switch, dry run, each detector and its decisions in the range."""
-    ctx = _ctx(request)
+    return await spam_answer(_ctx(request), tr)
+
+
+async def spam_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The `GET /spam` answer (the route and the Protection page's detector cards call this)."""
     values = ctx.settings.snapshot()
     start, end = _range_ms(tr)
     with service_errors():
@@ -2583,14 +2821,34 @@ async def spam_events_table(
     """Detector decisions, newest first; `kind=would_ban` is the dry-run result list."""
     ctx = _ctx(request)
     _single_order(tq)
-    kinds = {
-        "all": read_protection.SPAM_EVENTS,
-        "would_ban": ("spam_would_ban",),
-        "ban": ("spam_ban",),
-        "strike": ("spam_strike",),
-        "tarpit": ("spam_tarpit",),
-        "recommend": ("spam_detected",),
-    }[kind]
+    fetch = _spam_events_fetch(ctx, tr, kind, detector)
+    with service_errors():
+        return await _table_or_export(
+            request, admin, SPAM_EVENTS_SPEC, tq, fmt, fetch, filters={"kind": kind, "detector": detector}, tr=tr
+        )
+
+
+SPAM_EVENT_KINDS: Final[dict[str, tuple[str, ...]]] = {
+    "all": read_protection.SPAM_EVENTS,
+    "would_ban": ("spam_would_ban",),
+    "ban": ("spam_ban",),
+    "strike": ("spam_strike",),
+    "tarpit": ("spam_tarpit",),
+    "recommend": ("spam_detected",),
+}
+"""The `kind` filter of `GET /spam/events` (event types per choice)."""
+
+
+async def spam_events_answer(
+    ctx: Any, tq: TableQuery, tr: TimeRange, *, kind: str = "all", detector: str | None = None
+) -> dict[str, Any]:
+    """One page of `GET /spam/events` (the route and the Protection page share `_spam_events_fetch`)."""
+    with service_errors():
+        return await table_page(SPAM_EVENTS_SPEC, one_order(tq), _spam_events_fetch(ctx, tr, kind, detector))
+
+
+def _spam_events_fetch(ctx: Any, tr: TimeRange, kind: str, detector: str | None) -> Fetch:
+    kinds = SPAM_EVENT_KINDS[kind]
     start, end = _range_ms(tr)
 
     async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
@@ -2601,10 +2859,13 @@ async def spam_events_table(
         )
         return data["rows"], int(data["total"])
 
-    with service_errors():
-        return await _table_or_export(
-            request, admin, SPAM_EVENTS_SPEC, tq, fmt, fetch, filters={"kind": kind, "detector": detector}, tr=tr
-        )
+    return fetch
+
+
+async def collateral_answer(ctx: Any) -> dict[str, Any]:
+    """The FILTER-COLLATERAL preview (`GET /spam/collateral`); `POST /spam/arm` checks its token, and the Protection
+    page's arm dialog shows it."""
+    return await _collateral(ctx)
 
 
 async def _collateral(ctx: Any) -> dict[str, Any]:
@@ -2700,7 +2961,11 @@ async def tarpit_state(request: Request, _admin: AdminSession, tr: TimeRangeDep)
     hold, by category and by kind, the hold histogram, and the mean arrival gap after a held and after an instant
     refusal (v1's "Time Between Requests", TARPIT-TUNE's evidence).
     """
-    ctx = _ctx(request)
+    return await tarpit_answer(_ctx(request), tr)
+
+
+async def tarpit_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The `GET /tarpit` answer (the route and the Protection page's tarpit card call this)."""
     state: dict[str, Any] = await _abuse(ctx).tarpit.state()
     start, end = tr.window.start, tr.window.end
     with service_errors():
@@ -2731,7 +2996,11 @@ CHALLENGE_KEYS: Final[tuple[str, ...]] = (
 @router.get("/bot")
 async def bot_state(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """Bot heuristics (plan 10.7) and the browser challenge (10.8): weights, thresholds, state, refusals."""
-    ctx = _ctx(request)
+    return await bot_answer(_ctx(request), tr)
+
+
+async def bot_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The `GET /bot` answer (the route and the Protection page's bot and challenge cards call this)."""
     pipeline = _abuse(ctx)
     with service_errors():
         hits = await ctx.dbs.metrics.read(lambda conn: read_protection.check_hits(conn, tr.window))
@@ -2765,7 +3034,11 @@ async def pipeline_diagram(request: Request, _admin: AdminSession, tr: TimeRange
     """The pipeline diagram (plan 10.9, row 5): every check in order with its refusals in the range, plus the
     `ua_rule_hit` and `throttle_tier` counters (row 76) and the rule rows' hits per table in the range
     (`rule_hits`, whatever the verdict; each table's rows are listed with theirs)."""
-    ctx = _ctx(request)
+    return await pipeline_answer(_ctx(request), tr)
+
+
+async def pipeline_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The `GET /pipeline` answer (the route and the Protection page's pipeline card call this)."""
     pipeline = _abuse(ctx)
     start, end = _range_ms(tr)
 
@@ -2878,9 +3151,7 @@ async def refusals(
     """Refusals and failures by reason (v1 section 10 "Refusal Reasons", rows 72 and 116): count, the newest status
     and path, distinct clients, first and last seen, and the custom versus default message split; a section 13
     table (sorted, searched and paged here, exported as CSV or JSON)."""
-    ctx = _ctx(request)
-    with service_errors():
-        rows = await ctx.dbs.metrics.read(lambda conn: queries.refusal_reasons(conn, tr.window))
+    rows = await refusal_rows(_ctx(request), tr)
     return await _list_or_export(
         request,
         admin,
@@ -2888,10 +3159,67 @@ async def refusals(
         tq,
         fmt,
         rows,
-        search_keys=("reason", "last_path"),
+        search_keys=REFUSAL_SEARCH,
         tr=tr,
         extra={"range": tr.info(), "caller_text": list(CALLER_TEXT_COLUMNS)},
     )
 
 
-__all__ = ["audit_reason", "protection_keys", "router"]
+REFUSAL_SEARCH: Final = ("reason", "last_path")
+
+
+async def refusal_rows(ctx: Any, tr: TimeRange) -> list[dict[str, Any]]:
+    """Every refusal and failure reason of the range (`GET /refusals` rows; the Protection page reads them too)."""
+    with service_errors():
+        rows: list[dict[str, Any]] = await ctx.dbs.metrics.read(lambda conn: queries.refusal_reasons(conn, tr.window))
+    return rows
+
+
+async def refusals_answer(ctx: Any, tq: TableQuery, tr: TimeRange) -> dict[str, Any]:
+    """One page of `GET /refusals` (the route and the Protection page share `refusal_rows`)."""
+    rows = await refusal_rows(ctx, tr)
+    extra = {"range": tr.info(), "caller_text": list(CALLER_TEXT_COLUMNS)}
+    return list_answer(REFUSALS_SPEC, tq, rows, search_keys=REFUSAL_SEARCH, extra=extra)
+
+
+__all__ = [
+    "ATTEMPT_MATCHERS",
+    "SPAM_EVENT_KINDS",
+    "access_answer",
+    "access_rows",
+    "attempts_answer",
+    "audit_reason",
+    "ban_detail_answer",
+    "bans_answer",
+    "bans_reset_preview_answer",
+    "bot_answer",
+    "bypass_me_answer",
+    "collateral_answer",
+    "endpoint_blocks_answer",
+    "endpoint_rules_answer",
+    "header_presets_answer",
+    "header_rules_answer",
+    "ignored_paths_answer",
+    "ladder_view",
+    "limiter_reset_preview_answer",
+    "list_answer",
+    "one_order",
+    "pipeline_answer",
+    "protection_keys",
+    "refusal_rows",
+    "refusals_answer",
+    "router",
+    "rule_table_rows",
+    "spam_answer",
+    "spam_events_answer",
+    "strike_board_answer",
+    "table_page",
+    "tarpit_answer",
+    "throttle_all_answer",
+    "throttle_all_watch_answer",
+    "throttle_watch_answer",
+    "throttled_history_answer",
+    "throttled_rows",
+    "ua_rule_rows",
+    "ua_rules_answer",
+]

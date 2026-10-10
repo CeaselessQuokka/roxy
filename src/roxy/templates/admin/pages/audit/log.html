@@ -1,0 +1,15 @@
+{#-
+  Audit page, card `log` (`roxy/admin/pages/audit.py log_card`): the audit log table.
+
+  The first paint of the page and every request of the table (search, filter, sort, page, rows per page: htmx asks
+  `/admin/audit/fragment/log?...`) render this same template, so they cannot drift. The table macro gets its
+  context from `kit.table_view` over the `GET /admin/api/v1/audit` answer; a row opens its entry in the drawer.
+  Context: `frame`, `table`, `total`, `filtered`, `whole_log`, `whole_log_url`, `range_description`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import num %}
+{% set subtitle = ("The whole log" if whole_log else range_description) ~ ": " ~ num(total) ~ (" matching entries" if filtered else " entries") %}
+{% call page_card(frame, flush=True, subtitle=subtitle, notices=[] if whole_log else ["Only entries from the range in the top bar are listed. Choose All in the time range (or Whole log) to see every entry."]) %}
+{{ data_table(**table) }}
+{% endcall %}

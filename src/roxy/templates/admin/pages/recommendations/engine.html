@@ -1,0 +1,20 @@
+{#-
+  Recommendations, card `engine` (`roxy/admin/pages/recommendations.py engine_card`): the engine's state and its
+  settings (plan 11.1, 11.4; the `recommendations#engine` catalog anchor places the settings below the body).
+
+  Says in words whether the engine runs, how often the leader evaluates, when it last did (the leader's published job
+  status), and whether auto-apply (D7) may act alone, with its limits.
+  Context: `frame`, `enabled`, `auto_apply`, `interval_s`, `max_per_hour`, `watch_minutes`, `last`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import status_badge %}
+{% call page_card(frame) %}
+<dl class="kv rec-engine">
+  <dt>Engine</dt>
+  <dd>{% if enabled %}{{ status_badge("ok", "On") }} Looks at Roxy's numbers every {{ interval_s }} seconds and right after a trigger (a Roblox 429 burst, a breaker, a credential change).{% else %}{{ status_badge("warn", "Off") }} No rule runs and nothing new is recommended.{% endif %}</dd>
+  <dt>Last evaluation</dt>
+  <dd>{% if last %}{{ last.when }}{% if last.ok is sameas false %} {{ status_badge("bad", "failed") }}{% endif %}{% else %}<span class="muted">Not published yet (the leader reports its jobs every 30 seconds).</span>{% endif %}</dd>
+  <dt>Auto-apply</dt>
+  <dd>{% if auto_apply %}{{ status_badge("warn", "On") }} Applies at most {{ max_per_hour }} safe, low-risk changes an hour by itself and watches each for {{ watch_minutes }} minutes.{% else %}{{ status_badge("neutral", "Off") }} Nothing is applied without you.{% endif %}</dd>
+</dl>
+{% endcall %}

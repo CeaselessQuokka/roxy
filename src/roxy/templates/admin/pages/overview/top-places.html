@@ -1,0 +1,36 @@
+{#-
+  Overview, card `top-places` (`roxy/admin/pages/overview.py top_places_card`): the experiences (Roblox-Id header)
+  sending the most requests in the range (plan 14.1 "top places").
+
+  At most ten rows from `build_breakdown`. A place id is what the caller claims in a header, so it is caller text
+  (shown with `caller_text`, never linked). Rates are requests per minute over the last 1, 5 and 60 minutes.
+  Context: `frame`, `rows`, `all_href`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num, caller_text, local_href, metric_value %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/icon.html" import icon %}
+{% set more %}<a class="btn btn--sm btn--ghost" href="{{ local_href(all_href) }}">{{ icon("users") }}<span>Every place</span></a>{% endset %}
+{% call page_card(frame, actions=more) %}
+{% if rows %}
+<div class="table-scroll ov-top-wrap" role="region" aria-labelledby="{{ frame.id }}-caption" tabindex="0">
+<table class="ov-top">
+  <caption id="{{ frame.id }}-caption" class="sr-only">The places sending the most requests in the range</caption>
+  <thead><tr><th scope="col">Place</th><th scope="col" class="num">Requests</th><th scope="col" class="num">Refused</th><th scope="col" class="num">Per minute (1, 5, 60 min)</th><th scope="col">Top endpoint</th></tr></thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <th scope="row" class="ov-top__key">{{ caller_text(row.key, 80) }}</th>
+      <td class="num" data-label="Requests">{{ num(row.requests) }}</td>
+      <td class="num" data-label="Refused">{{ num(row.refused) }}{% if row.refused_pct is not none %} <span class="muted">({{ metric_value(row.refused_pct, "percent") }})</span>{% endif %}</td>
+      <td class="num" data-label="Per minute">{{ metric_value(row.rate1) }} / {{ metric_value(row.rate5) }} / {{ metric_value(row.rate60) }}</td>
+      <td data-label="Top endpoint">{{ caller_text(row.top_endpoint, 80) }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+{{ empty_state("No place sent requests in this range", "Game servers name their experience in the Roblox-Id header; requests without it are not counted here.", "users", "neutral") }}
+{% endif %}
+{% endcall %}

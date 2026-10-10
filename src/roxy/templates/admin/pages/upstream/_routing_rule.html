@@ -1,0 +1,70 @@
+{#-
+  Upstream page, a routing rule in the drawer (`GET /admin/upstream/routing-rule?id=`): its fields, the edit form
+  (PATCH `/admin/api/v1/routing-rules/<id>`) and the delete dialog (DELETE, with plain-language consequences).
+  The pattern and the note are caller text (shown as text; in the form they are input values, never markup).
+  Context: `rule`, `mode_words`, `modes`, `url`, `created`, `updated`, `error`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/format.html" import caller_text %}
+{% from "admin/pages/upstream/_macros.html" import when %}
+{% if error %}
+<div data-card-error>{{ inline_alert("bad", "This rule could not be loaded", error) }}</div>
+{% else %}
+<div class="stack g3-drawer" data-routing-rule="{{ rule.id }}">
+  <dl class="kv">
+    <dt>Pattern</dt><dd>{{ caller_text(rule.pattern, 400) }} <span class="muted">({{ rule.type }})</span></dd>
+    <dt>Egress</dt><dd>{{ mode_words }}</dd>
+    <dt>In force</dt><dd>{{ "Yes" if rule.enabled else "No (switched off)" }}</dd>
+    <dt>Note</dt><dd>{{ caller_text(rule.note, 400) if rule.note else "n/a" }}</dd>
+    <dt>Created</dt><dd>{{ when(created) }} by {{ caller_text(rule.created_by, 80) }}</dd>
+    <dt>Changed</dt><dd>{{ when(updated) }}{% if rule.updated_by %} by {{ caller_text(rule.updated_by, 80) }}{% endif %}</dd>
+  </dl>
+  <section class="g3-section" aria-labelledby="routing-edit-title">
+    <h3 class="g3-subhead" id="routing-edit-title">Change this rule</h3>
+    <form class="stack g3-form" data-api-form data-api-url="{{ url }}" data-api-method="PATCH"
+          data-success="Rule saved. Every worker follows it within a second." data-on-success="refresh" data-refresh="routing" data-close-drawer novalidate>
+      <div class="field">
+        <label class="field__label" for="routing-edit-pattern">Endpoint pattern</label>
+        <input class="input mono" type="text" id="routing-edit-pattern" name="pattern" required maxlength="2048" value="{{ rule.pattern }}" autocomplete="off" spellcheck="false" data-json="string" aria-describedby="routing-edit-pattern-error">
+        <p class="field__error" id="routing-edit-pattern-error" data-field-error="pattern" hidden></p>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="routing-edit-type">Pattern type</label>
+          <select class="input" id="routing-edit-type" name="type" data-json="string">
+            <option value="glob"{% if rule.type == "glob" %} selected{% endif %}>Glob (* and ?)</option>
+            <option value="regex"{% if rule.type == "regex" %} selected{% endif %}>Regular expression</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="field__label" for="routing-edit-mode">Egress</label>
+          <select class="input" id="routing-edit-mode" name="mode" data-json="string">
+            {% for value, label in modes %}<option value="{{ value }}"{% if rule.mode == value %} selected{% endif %}>{{ label }}</option>{% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label class="field__label" for="routing-edit-note">Note</label>
+        <input class="input" type="text" id="routing-edit-note" name="note" maxlength="500" value="{{ rule.note }}" autocomplete="off" data-json="string">
+      </div>
+      <label class="check"><input type="checkbox" name="enabled" value="1"{% if rule.enabled %} checked{% endif %} data-json="bool"><span>In force</span></label>
+      <div class="field">
+        <label class="field__label" for="routing-edit-reason">Reason <span class="muted">(optional, saved in the audit log)</span></label>
+        <input class="input" type="text" id="routing-edit-reason" name="reason" maxlength="500" autocomplete="off">
+      </div>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      <div class="cluster">
+        <button type="submit" class="btn btn--primary" data-action="routing-rule-save">{{ icon("check") }}<span>Save the rule</span></button>
+        <button type="button" class="btn btn--ghost" data-dialog-open="dlg-routing-delete">{{ icon("x") }}<span>Delete the rule</span></button>
+      </div>
+    </form>
+  </section>
+  {{ confirm_dialog("dlg-routing-delete", "Delete routing rule #" ~ rule.id ~ "?", action=url, method="delete", api=True, danger=True,
+                    confirm_label="Delete the rule",
+                    consequences=["Requests for this endpoint follow the weights again on every worker within a second.",
+                                  "The rule as it was is kept in the audit log, so it can be added back by hand."],
+                    reason=True, success="Rule deleted.", on_success="refresh", refresh="routing") }}
+</div>
+{% endif %}

@@ -17,7 +17,9 @@ How it works
       endpoint breaker trips for that long, the host breaker counts a failure, attribution (`adaptive.attribute`)
       may add `host:<host>:<egress>` or `egress:<egress>` cooldowns, and a credential 429 also opens the fleet-wide
       `credential` cooldown. The returned `CallEffects` tells the service whether this was the first 429 of the
-      episode (the adaptive decrease trigger) and how long callers must wait.
+      episode (the adaptive decrease trigger), how long callers must wait, and how many calls the endpoint and
+      host buckets let through in the last minute (`observed`, read from their window meters: the adaptive cut
+      starts from that rate).
     - 429 through the rotator: the exit is recorded; only when enough distinct exits failed within the window does
       the endpoint cool down and the breaker count it. The rotator's failure streak and parking (parity row 31:
       429s and 5xx count too) live in `egress/rotator.py` (`RotatorPool.record_result`), which sees every rotator
@@ -39,7 +41,7 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from roxy.core.reasons import Egress
-from roxy.upstream import adaptive, aimd, breaker, cooldowns
+from roxy.upstream import adaptive, aimd, breaker, buckets, cooldowns
 from roxy.upstream.adaptive import Attribution, AttributionKind
 from roxy.upstream.backoff import UniformSource
 from roxy.upstream.breaker import BreakerPolicy, BreakerRow, Transition
@@ -90,6 +92,9 @@ class CallEffects:
     attribution: Attribution | None = None
     transitions: list[Transition] = field(default_factory=list)
     aimd_limit: float | None = None
+    observed: dict[str, float] = field(default_factory=dict)
+    """After a direct or credential 429: calls Roxy made through the endpoint and host buckets in the last minute
+    (their window meters), the rate Roblox refused, for the adaptive cut (finding LOAD-1)."""
 
 
 def should_record(facts: CallFacts, breakers_seen: Mapping[str, BreakerRow], now_s: float) -> bool:
@@ -182,6 +187,11 @@ def apply_call_outcome(
                     config.cooldown.host_escalation_endpoints,
                 )
                 effects.attribution = attribution
+                effects.observed = buckets.observed_calls(
+                    conn,
+                    (buckets.endpoint_bucket_key(facts.template), buckets.host_bucket_key(facts.host)),
+                    now_ms,
+                )
                 if attribution.kind is AttributionKind.HOST:
                     _open(
                         conn, effects, cooldowns.host_key(facts.host, egress), seconds, source, now_ms, config.cooldown

@@ -1,0 +1,31 @@
+{#-
+  The System page (`roxy/admin/pages/system.py`): workers, the leader, jobs, the metrics pipeline, persistence, the
+  error log, alerts, versions, the environment and the forced flush.
+
+  The fleet comes first (the v1 Service Health workers card), the leader and the forced flush side by side, then the
+  error log (the page's main table), and the heavier cards, which load as they scroll into view. Every card is the
+  same HTML its fragment route answers (roxy/admin/pages/kit.py).
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="#errors">{{ icon("alert-octagon") }}<span>Error log</span></a>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>Numbers marked "this worker" come from the worker that answered this page (each keeps its own queue and writers); everything else is read from shared state and covers the whole {{ term("fleet", "fleet") }}. Reset request counts zeroes the request counters of every worker; nothing else on this page changes data.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["fleet"] }}
+<div class="grid grid--2 system-pair">{{ cards["leader"] }}{{ cards["flush"] }}</div>
+{{ cards["errors"] }}
+{{ cards["jobs"] }}
+{{ cards["metrics-pipeline"] }}
+{{ cards["persistence"] }}
+<div class="grid grid--2 system-pair">{{ cards["versions"] }}{{ cards["environment"] }}</div>
+{{ cards["alerts"] }}
+{% endblock %}

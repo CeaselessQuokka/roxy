@@ -41,7 +41,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
-from roxy.abuse.limiter import DegradedEntry, LimiterRow, RateDecision, fixed, fixed_peek, gcra, gcra_peek
+from roxy.abuse.limiter import SAVE_CHUNK, DegradedEntry, LimiterRow, RateDecision, fixed, fixed_peek, gcra, gcra_peek
 from roxy.storage.db import Database
 
 # --- the ladder ------------------------------------------------------------------------------------------------------
@@ -129,14 +129,17 @@ def load_strike_rows(conn: sqlite3.Connection, keys: Iterable[str]) -> dict[str,
 
 
 def save_strike_rows(conn: sqlite3.Connection, rows: Iterable[StrikeRow]) -> None:
-    """Upsert strike rows inside the caller's transaction."""
+    """Upsert strike rows inside the caller's transaction: one multi-row statement per `limiter.SAVE_CHUNK` rows (the
+    reason is `limiter.save_rows`'s; rows apply in order)."""
     params = [(r.key, int(r.strikes), int(r.last_strike_at), int(r.tier), int(r.throttled_until)) for r in rows]
-    if params:
-        conn.executemany(
-            "INSERT INTO strikes (ip, strikes, last_strike_at, tier, throttled_until) VALUES (?, ?, ?, ?, ?) "
+    for start in range(0, len(params), SAVE_CHUNK):
+        chunk = params[start : start + SAVE_CHUNK]
+        values = ",".join("(?, ?, ?, ?, ?)" for _ in chunk)
+        conn.execute(
+            f"INSERT INTO strikes (ip, strikes, last_strike_at, tier, throttled_until) VALUES {values} "  # noqa: S608  # only "?" placeholders are interpolated
             "ON CONFLICT (ip) DO UPDATE SET strikes = excluded.strikes, last_strike_at = excluded.last_strike_at, "
             "tier = excluded.tier, throttled_until = excluded.throttled_until",
-            params,
+            [value for row in chunk for value in row],
         )
 
 

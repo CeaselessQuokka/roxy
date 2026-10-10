@@ -20,7 +20,7 @@ from roxy.upstream.adaptive import (
     increased_rate,
     should_increase,
 )
-from roxy.upstream.buckets import BucketDefaults
+from roxy.upstream.buckets import BucketDefaults, BucketSpec, LimitPair
 
 POLICY = AdaptivePolicy.from_settings(FakeSettings())
 DEFAULTS = BucketDefaults.from_settings(FakeSettings())
@@ -88,13 +88,15 @@ async def test_decrease_once_per_episode() -> None:
 
     change = await hit(True, NOW_S)
     assert change is not None
-    assert (change.bucket_key, change.old_per_min, change.new_per_min, change.burst) == (EP, 120, 84, 10)
-    assert writer.writes == [(EP, 84, 10, writer.writes[0][3])]
+    # No measurement passed: the plan's cut of the current limit, and the burst cut by the same ratio.
+    assert (change.bucket_key, change.old_per_min, change.new_per_min, change.burst) == (EP, 120, 84, 7)
+    assert change.old_burst == 10
+    assert writer.writes == [(EP, 84, 7, writer.writes[0][3])]
     assert await hit(False, NOW_S + 1) is None  # an in-flight request's 429: same episode
     assert await hit(True, NOW_S + 30) is None  # this worker lowered it moments ago
     later = await hit(True, NOW_S + 120)
     assert later is not None
-    assert later.new_per_min == pytest.approx(58.8)
+    assert (later.new_per_min, later.burst) == (pytest.approx(58.8), 4)
 
 
 async def test_decrease_respects_another_workers_recent_change() -> None:
@@ -160,8 +162,87 @@ async def test_host_attribution_lowers_the_host_bucket() -> None:
         "host:games.roblox.com",
         240,
         168,
-        15,
+        10,
     )
+
+
+@pytest.mark.parametrize(
+    ("current", "observed", "expected"),
+    [
+        ((120, 10), 61, (42.7, 3)),  # LOAD-1: Roblox refused 61 a minute; the cut starts there, not at 120
+        ((120, 10), 130, (84, 7)),  # more calls than the limit (booked ones count): the limit is the base
+        ((120, 10), None, (84, 7)),  # not measured: the plan's cut
+        ((120, 10), 0, (84, 7)),
+        ((120, 10), 1, (84, 7)),  # refused at its very first call: no evidence about the rate, the plan's cut
+        ((120, 10), 6, (84, 7)),  # at the floor: a limit Roxy could never keep, so still no evidence
+        ((120, 10), 7, (6, 1)),  # above it: the cut lands at the floor, burst 1
+        ((58.8, 4), 50, (35, 2)),
+        ((3, 1), 61, (3, 1)),  # an admin's rate below the floor is never raised by it
+    ],
+)
+def test_decreased_limit(current: tuple[float, int], observed: float | None, expected: tuple[float, int]) -> None:
+    new = adaptive.decreased_limit(LimitPair(*current), observed, 30, 6)
+    assert new.per_min == pytest.approx(expected[0])
+    assert new.burst == expected[1]
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        ((42.7, 3), (46.97, 3)),  # the burst stays behind the rate: 10 of 120 is 3 of 46.97
+        ((84, 3), (92.4, 4)),  # at most one more per raise
+        ((110, 9), (121, 10)),
+        ((132, 10), (145.2, 10)),  # never beyond the default burst
+        ((590, 10), (600, 10)),  # the rate is capped at adaptive_max_per_min
+    ],
+)
+def test_increased_limit_recovers_the_burst_carefully(current: tuple[float, int], expected: tuple[float, int]) -> None:
+    new = adaptive.increased_limit(LimitPair(*current), LimitPair(120, 10), 10, 600)
+    assert new.per_min == pytest.approx(expected[0])
+    assert new.burst == expected[1]
+
+
+@pytest.mark.parametrize(
+    ("burst", "old", "new", "expected"), [(10, 120, 84, 7), (10, 120, 42.7, 3), (10, 120, 6, 1), (4, 60, 60, 4)]
+)
+def test_scaled_burst(burst: int, old: float, new: float, expected: int) -> None:
+    assert adaptive.scaled_burst(burst, old, new) == expected
+
+
+async def test_decrease_cuts_from_the_calls_roblox_refused() -> None:
+    """Finding LOAD-1: an endpoint at the default 120 a minute that ran at 61 a minute when Roblox (limit 60) said
+    429 is cut to 42.7 (burst 3), below what Roblox refused, in ONE step; 84 would not have slowed it at all."""
+    rules = FakeRules()
+    writer = MemoryLimitsWriter(rules)
+    events: list[tuple[str, dict[str, Any]]] = []
+    controller = AdaptiveController(writer, event=lambda kind, severity, reason, detail: events.append((kind, detail)))
+    change = await controller.on_rate_limited(
+        attribution=endpoint_attr(),
+        egress=Egress.DIRECT,
+        first_in_episode=True,
+        policy=POLICY,
+        limits=rules.snapshot,
+        defaults=DEFAULTS,
+        now_s=NOW_S,
+        observed={EP: 61.0, "host:games.roblox.com": 61.0},
+    )
+    assert change is not None
+    assert (change.old_per_min, change.new_per_min, change.old_burst, change.burst) == (120, 42.7, 10, 3)
+    assert change.evidence["observed_calls"] == 61.0
+    assert change.evidence["cut_from"] == "observed"
+    assert writer.writes[0][:3] == (EP, 42.7, 3)
+    assert "61 calls in the last minute" in writer.writes[0][3]
+    ((kind, detail),) = events
+    assert kind == "adaptive_rate_decrease"
+    assert (detail["old_per_min"], detail["new_per_min"], detail["old_burst"], detail["new_burst"]) == (
+        120,
+        42.7,
+        10,
+        3,
+    )
+    # The bucket now holds at most 42 calls in any minute (a window bucket): below the 60 Roblox allows.
+    spec = BucketSpec(EP, writer.writes[0][1], writer.writes[0][2])
+    assert spec.window_calls == 42
 
 
 def test_should_increase_rules() -> None:

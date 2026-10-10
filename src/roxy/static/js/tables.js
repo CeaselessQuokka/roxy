@@ -3,9 +3,10 @@
  *
  * What this is
  *   Behavior for templates/components/table.html. The table block is server-rendered; this module only turns
- *   clicks into one consistent request (by setting the hidden page, size, sort and dir inputs of the table's state
- *   form and having htmx send that form: `GET src?...` and an outerHTML swap), remembers this browser's
- *   choices per table, and opens row details in the drawer. It also runs the heatmap's "Show numbers" switch.
+ *   clicks into one consistent request (by setting the hidden page, page_size, sort and order inputs of the
+ *   table's state form, the admin API's own parameter names, and having htmx send that form: `GET src?...` and
+ *   an outerHTML swap), remembers this browser's choices per table, and opens row details in the drawer. It also
+ *   runs the heatmap's "Show numbers" switch.
  *
  * Why it exists
  *   Every control going through the one form means there is exactly one request shape for the server to
@@ -15,7 +16,8 @@
  *
  * How it works
  *   Delegated listeners on document handle every table, including tables htmx swaps in later; `initTables(root)`
- *   re-applies hidden columns after each swap. A row with `data-drawer-src` opens that fragment in the drawer; a
+ *   re-applies hidden columns after each swap (and, for the page's main table, `data-dt-address`, puts its state
+ *   in the address bar). A row with `data-drawer-src` opens that fragment in the drawer; a
  *   row without one opens a definition list built from its cells (this is also how phones see the columns their
  *   card layout hides, plan 14.8).
  *
@@ -64,14 +66,34 @@ function rememberColumns(table) {
   store.set(`dt.${table.dataset.dtId}.hidden`, hidden);
 }
 
+/**
+ * Keep the page's main table (`data-dt-address`) in the address bar: its search, filters, sort, page and rows per
+ * page, so a reload or a shared link shows the same view (plan 14.2). A value equal to its default
+ * (`data-dt-default`) is left out; the page-level fields (`data-dt-keep`, the time range) are already there.
+ * replaceState, not pushState: going back leaves the page instead of stepping through every keystroke.
+ */
+function syncAddress(table) {
+  const form = qs("[data-dt-state]", table);
+  if (!form || !("dtAddress" in table.dataset)) return;
+  const url = new URL(window.location.href);
+  for (const input of qsa("input[name], select[name]", form)) {
+    if ("dtKeep" in input.dataset) continue;
+    const value = input.value.trim();
+    if (value === (input.dataset.dtDefault || "")) url.searchParams.delete(input.name);
+    else url.searchParams.set(input.name, value);
+  }
+  if (url.href !== window.location.href) window.history.replaceState(window.history.state, "", url.href);
+}
+
 export function initTables(root = document) {
   const tables = root instanceof Element && root.matches("[data-dt]") ? [root] : qsa("[data-dt]", root);
   for (const table of tables) {
     applyColumns(table);
+    if (root !== document) syncAddress(table);
     // A remembered page size different from the rendered one: ask once for the preferred size.
     const id = table.dataset.dtId;
     const preferred = store.get(`dt.${id}.size`);
-    const size = field(table, "size");
+    const size = field(table, "page_size");
     if (preferred && size && String(preferred) !== size.value && !appliedSize.has(id) && table.dataset.dtSrc) {
       appliedSize.add(id);
       size.value = String(preferred);
@@ -95,7 +117,8 @@ function rowDetails(row) {
 
 function openRow(row, opener) {
   const firstCell = qs("td", row);
-  const title = firstCell ? firstCell.textContent.trim() : "Details";
+  const cellText = firstCell ? firstCell.innerText.trim().split(/\s*\n+\s*/).join(", ") : "";
+  const title = row.dataset.drawerTitle || cellText || "Details";
   if (row.dataset.drawerSrc) openDrawerFrom(row.dataset.drawerSrc, title, opener);
   else openDrawer(title, rowDetails(row), opener);
 }
@@ -118,7 +141,7 @@ export function initTableEvents() {
     const sort = target.closest("[data-dt-sort]");
     if (sort) {
       field(table, "sort").value = sort.dataset.dtSort;
-      field(table, "dir").value = sort.dataset.dtNextDir || "desc";
+      field(table, "order").value = sort.dataset.dtNextOrder || "desc";
       field(table, "page").value = "1";
       submit(table);
       return;
@@ -146,7 +169,7 @@ export function initTableEvents() {
     const table = tableOf(target);
     if (!table) return;
     if (target.matches("[data-dt-size]")) {
-      field(table, "size").value = target.value;
+      field(table, "page_size").value = target.value;
       field(table, "page").value = "1";
       store.set(`dt.${table.dataset.dtId}.size`, Number(target.value));
       submit(table);

@@ -34,7 +34,9 @@ How it works
     the section 13 range parameters. Live state (buckets, cooldowns, breakers, AIMD) is read from hot.db, so every
     worker shows the same; a cooldown this worker could not share during a hot.db outage is listed as `local`.
     Fields holding text a caller chose (paths, endpoint templates, errors quoting them) are named in the answer's
-    `caller_text` list, so the page shows them as plain text.
+    `caller_text` list, so the page shows them as plain text. Each route's work is a module function the
+    Upstream page (`roxy/admin/pages/upstream.py`) calls too (`egress_cards_answer`, `host_rows` and
+    `hosts_answer`, `failure_rows` and `failures_answer`, ...), so the page and the API show the same numbers.
 
 What to read next
     `roxy/upstream/service.py`, `roxy/upstream/read_trace.py` (the explainer), `roxy/metrics/read_upstream.py`.
@@ -302,7 +304,11 @@ def _bucket_view(state: Any, configured: Mapping[str, Any]) -> dict[str, Any]:
 async def egress_cards(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """One health card per egress: traffic and failure rates over the range, v1's method health (failed count,
     last success, last error), challenge and HTML answers, plus its live bucket and state."""
-    ctx = get_ctx(request)
+    return await egress_cards_answer(get_ctx(request), tr)
+
+
+async def egress_cards_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The answer of `GET /upstream/egress` (the Upstream page's health card calls it too, plan P6)."""
     upstream = _need(ctx.upstream, "upstream service")
     egress = _need(ctx.egress, "egress layer")
     window = tr.window
@@ -372,7 +378,28 @@ async def host_table(
     fmt: ExportFormatDep,
 ) -> Any:
     """One row per Roblox host: calls, 429 and 5xx rates, latency percentiles, its bucket's fill and rate."""
-    ctx = get_ctx(request)
+    rows = await host_rows(get_ctx(request), tr)
+    if fmt is not None:
+        whole = common.TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q)
+        items, total = common.page_rows(rows, whole, search_keys=HOST_SEARCH)
+        return await common.export_table(request, admin, HOSTS_SPEC, items, fmt, total=total, tq=tq, tr=tr)
+    return hosts_answer(rows, tq, tr)
+
+
+HOST_SEARCH: Final = ("host",)
+
+
+def hosts_answer(rows: list[dict[str, Any]], tq: TableQuery, tr: TimeRange) -> dict[str, Any]:
+    """One page of `host_rows` as the `GET /upstream/hosts` table answer (the page's Hosts card renders it)."""
+    items, total = common.page_rows(rows, tq, search_keys=HOST_SEARCH)
+    answer = common.table_answer(HOSTS_SPEC, tq, items, total) | {
+        "range": tr.info(),
+    }
+    return common.add_caller_text(answer, list(CARD_CALLER_TEXT))
+
+
+async def host_rows(ctx: Any, tr: TimeRange) -> list[dict[str, Any]]:
+    """Every host row of the range (at most `MAX_HOSTS`), before searching, sorting and paging."""
     upstream = _need(ctx.upstream, "upstream service")
     window = tr.window
     page = queries.Page(size=MAX_HOSTS, sort="upstream_calls")
@@ -405,15 +432,7 @@ async def host_table(
                 "per_min": read_state.configured_limit(key, defaults, limits)["per_min"],
             }
         )
-    if fmt is not None:
-        whole = common.TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q)
-        items, total = common.page_rows(rows, whole, search_keys=("host",))
-        return await common.export_table(request, admin, HOSTS_SPEC, items, fmt, total=total, tq=tq, tr=tr)
-    items, total = common.page_rows(rows, tq, search_keys=("host",))
-    answer = common.table_answer(HOSTS_SPEC, tq, items, total) | {
-        "range": tr.info(),
-    }
-    return common.add_caller_text(answer, list(CARD_CALLER_TEXT))
+    return rows
 
 
 # --------------------------------------------------------------------------------------- failures and pages
@@ -431,23 +450,37 @@ async def failure_table(
     """Upstream > Failures (v1 "Request Failures", plan 14.1 row 24, parity row 72): failed requests in the range
     grouped by egress, reason and Roblox's status, with first and last seen and the latest one's status, endpoint,
     path and error. Searchable, sortable, exportable (`format=csv|json`)."""
-    ctx = get_ctx(request)
+    rows, capped = await failure_rows(get_ctx(request), tr, egress)
+    if fmt is not None:
+        whole = common.TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q)
+        items, total = common.page_rows(rows, whole, search_keys=FAILURE_SEARCH)
+        return await common.export_table(
+            request, admin, FAILURES_SPEC, items, fmt, total=total, tq=tq, tr=tr, filters={"egress": egress}
+        )
+    return failures_answer(rows, capped, tq, tr, egress)
+
+
+FAILURE_SEARCH: Final = ("egress", "reason", "last_template", "last_path", "last_error")
+
+
+async def failure_rows(ctx: Any, tr: TimeRange, egress: str | None = None) -> tuple[list[dict[str, Any]], bool]:
+    """The failure groups of the range (one egress, or all), and whether the read model's group cap was reached."""
     start_ms, end_ms = tr.window.start * 1000, tr.window.end * 1000
     with common.service_errors():
         found = await ctx.dbs.metrics.read(lambda conn: read_upstream.failure_log(conn, start_ms, end_ms))
     rows = [row for row in found if egress is None or row["egress"] == egress]
-    search_keys = ("egress", "reason", "last_template", "last_path", "last_error")
-    if fmt is not None:
-        whole = common.TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q)
-        items, total = common.page_rows(rows, whole, search_keys=search_keys)
-        return await common.export_table(
-            request, admin, FAILURES_SPEC, items, fmt, total=total, tq=tq, tr=tr, filters={"egress": egress}
-        )
-    items, total = common.page_rows(rows, tq, search_keys=search_keys)
+    return rows, len(found) >= read_upstream.MAX_FAILURE_GROUPS
+
+
+def failures_answer(
+    rows: list[dict[str, Any]], capped: bool, tq: TableQuery, tr: TimeRange, egress: str | None
+) -> dict[str, Any]:
+    """One page of `failure_rows` as the `GET /upstream/failures` answer (the page's Failures card renders it)."""
+    items, total = common.page_rows(rows, tq, search_keys=FAILURE_SEARCH)
     answer = common.table_answer(FAILURES_SPEC, tq, items, total) | {
         "range": tr.info(),
         "filters": {"egress": egress},
-        "capped": len(found) >= read_upstream.MAX_FAILURE_GROUPS,
+        "capped": capped,
     }
     return common.add_caller_text(answer, list(FAILURES_CALLER_TEXT))
 
@@ -462,17 +495,30 @@ async def challenge_table(
 ) -> Any:
     """Calls Roblox answered with a challenge or an HTML page (a block page) in the range, by egress and endpoint
     (`upstream/pages.py`; the evidence UP-CHALLENGE reads), most flagged first. Exportable."""
-    ctx = get_ctx(request)
-    start, end = tr.window.start, tr.window.end
-    with common.service_errors():
-        found = await ctx.dbs.metrics.read(
-            lambda conn: read_upstream.challenge_counts(conn, start, end, by_template=True)
-        )
+    found = await challenge_rows(get_ctx(request), tr)
     if fmt is not None:
         whole = common.TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q)
-        items, total = common.page_rows(found, whole, search_keys=("egress", "template"))
+        items, total = common.page_rows(found, whole, search_keys=CHALLENGE_SEARCH)
         return await common.export_table(request, admin, CHALLENGES_SPEC, items, fmt, total=total, tq=tq, tr=tr)
-    items, total = common.page_rows(found, tq, search_keys=("egress", "template"))
+    return challenges_answer(found, tq, tr)
+
+
+CHALLENGE_SEARCH: Final = ("egress", "template")
+
+
+async def challenge_rows(ctx: Any, tr: TimeRange) -> list[dict[str, Any]]:
+    """Calls flagged as a challenge or an HTML page in the range, by egress and endpoint (`challenge_counts`)."""
+    start, end = tr.window.start, tr.window.end
+    with common.service_errors():
+        found: list[dict[str, Any]] = await ctx.dbs.metrics.read(
+            lambda conn: read_upstream.challenge_counts(conn, start, end, by_template=True)
+        )
+    return found
+
+
+def challenges_answer(rows: list[dict[str, Any]], tq: TableQuery, tr: TimeRange) -> dict[str, Any]:
+    """One page of `challenge_rows` as the `GET /upstream/challenges` answer (the page's card renders it)."""
+    items, total = common.page_rows(rows, tq, search_keys=CHALLENGE_SEARCH)
     answer = common.table_answer(CHALLENGES_SPEC, tq, items, total) | {
         "range": tr.info(),
         "basis": "per call, from the minute history of upstream attempts (upstream_attempt_minute)",
@@ -503,7 +549,11 @@ async def timeline_429(
     egress: EgressName | None = None,
 ) -> dict[str, Any]:
     """Roblox 429s per time bucket, one series per endpoint with the most 429s (and `other`), by egress if given."""
-    ctx = get_ctx(request)
+    return await timeline_429_answer(get_ctx(request), tr, top=top, egress=egress)
+
+
+async def timeline_429_answer(ctx: Any, tr: TimeRange, *, top: int = 10, egress: str | None = None) -> dict[str, Any]:
+    """The answer of `GET /upstream/429-timeline` (series per endpoint, the comparison total and the totals)."""
     window = tr.window
     data = await ctx.dbs.metrics.read(
         lambda conn: read_upstream.roblox_429_timeline(conn, window, top=top, egress=egress)
@@ -544,7 +594,11 @@ async def latency(
     request: Request, _admin: AdminSession, tr: TimeRangeDep, egress: EgressName | None = None
 ) -> dict[str, Any]:
     """p50, p95 and p99 latency of requests that went to Roblox (served or failed), queue wait included."""
-    ctx = get_ctx(request)
+    return await latency_answer(get_ctx(request), tr, egress)
+
+
+async def latency_answer(ctx: Any, tr: TimeRange, egress: str | None = None) -> dict[str, Any]:
+    """The answer of `GET /upstream/latency` (p50, p95, p99 and the p95 queue wait as series)."""
     metrics = ["p50_ms", "p95_ms", "p99_ms", "queue_wait_p95_ms"]
     filters: dict[str, Any] = {"outcome": ["served_upstream", "failed"]}
     if egress:
@@ -577,7 +631,29 @@ async def bucket_table(
 ) -> Any:
     """Every bucket: fill gauge and next free slot now, configured rate, and reservations, refusals and peak fill
     over the range. Buckets are never refilled by hand (parity row 34)."""
-    ctx = get_ctx(request)
+    items_all = await bucket_rows(get_ctx(request), tr)
+    if fmt is not None:
+        whole = common.TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q)
+        items, total = common.page_rows(items_all, whole, search_keys=BUCKET_SEARCH)
+        return await common.export_table(request, admin, BUCKETS_SPEC, items, fmt, total=total, tq=tq, tr=tr)
+    return buckets_answer(items_all, tq, tr)
+
+
+BUCKET_SEARCH: Final = ("key",)
+
+
+def buckets_answer(rows: list[dict[str, Any]], tq: TableQuery, tr: TimeRange) -> dict[str, Any]:
+    """One page of `bucket_rows` as the `GET /upstream/buckets` answer (the page's Buckets card renders it)."""
+    items, total = common.page_rows(rows, tq, search_keys=BUCKET_SEARCH)
+    return common.table_answer(BUCKETS_SPEC, tq, items, total) | {
+        "range": tr.info(),
+        "refills": "never: a reset clears cooldowns and breakers only (parity row 34)",
+        "settings_card": "upstream#buckets",
+    }
+
+
+async def bucket_rows(ctx: Any, tr: TimeRange) -> list[dict[str, Any]]:
+    """Every bucket row: the live state of each bucket plus the buckets the range's history names."""
     upstream = _need(ctx.upstream, "upstream service")
     start, end = tr.window.start, tr.window.end
     with common.service_errors():
@@ -603,17 +679,7 @@ async def bucket_table(
         row["attempts"] = int(found.get("attempts") or 0)
         row["rejections"] = int(found.get("rejections") or 0)
         row["fill_pct_peak"] = found.get("fill_pct_peak")
-    items_all = list(rows.values())
-    if fmt is not None:
-        whole = common.TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q)
-        items, total = common.page_rows(items_all, whole, search_keys=("key",))
-        return await common.export_table(request, admin, BUCKETS_SPEC, items, fmt, total=total, tq=tq, tr=tr)
-    items, total = common.page_rows(items_all, tq, search_keys=("key",))
-    return common.table_answer(BUCKETS_SPEC, tq, items, total) | {
-        "range": tr.info(),
-        "refills": "never: a reset clears cooldowns and breakers only (parity row 34)",
-        "settings_card": "upstream#buckets",
-    }
+    return list(rows.values())
 
 
 @router.get("/buckets/history")
@@ -624,7 +690,11 @@ async def bucket_history(
     key: Annotated[str, Query(min_length=1, max_length=MAX_KEY_CHARS)],
 ) -> dict[str, Any]:
     """One bucket over time: reservations, refusals and peak fill per chart bucket (`bucket_minute`)."""
-    ctx = get_ctx(request)
+    return await bucket_history_answer(get_ctx(request), tr, key)
+
+
+async def bucket_history_answer(ctx: Any, tr: TimeRange, key: str) -> dict[str, Any]:
+    """The answer of `GET /upstream/buckets/history?key=` (the page's bucket drawer charts it)."""
     window = tr.window
     data = await ctx.dbs.metrics.read(lambda conn: read_upstream.bucket_series(conn, key, window))
     starts = data["buckets"]
@@ -646,7 +716,11 @@ async def bucket_history(
 @router.get("/adaptive")
 async def adaptive(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """The adaptive rate controller (plan 7.3): its settings, the rates it holds now, and its changes in the range."""
-    ctx = get_ctx(request)
+    return await adaptive_answer(get_ctx(request), tr)
+
+
+async def adaptive_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The answer of `GET /upstream/adaptive` (the page's Buckets card shows the changes and held rates)."""
     settings = ctx.settings
     start_ms, end_ms = tr.window.start * 1000, tr.window.end * 1000
     events = await ctx.dbs.metrics.read(
@@ -696,7 +770,11 @@ async def adaptive(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> 
 @router.get("/aimd")
 async def aimd_state(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Adaptive concurrency (plan 7.4, Tier 3): each host and egress key's limit and calls in flight now."""
-    ctx = get_ctx(request)
+    return await aimd_answer(get_ctx(request))
+
+
+async def aimd_answer(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /upstream/aimd` (the page's Concurrency card)."""
     policy = aimd.AimdPolicy.from_settings(ctx.settings)
     with common.service_errors():
         rows = await ctx.dbs.hot.read(read_state.aimd_rows)
@@ -722,7 +800,11 @@ async def aimd_state(request: Request, _admin: AdminSession) -> dict[str, Any]:
 @router.get("/cooldowns")
 async def cooldown_list(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Every active cooldown with its source and end time (the page counts down from `ends_at_ms`)."""
-    ctx = get_ctx(request)
+    return await cooldowns_answer(get_ctx(request))
+
+
+async def cooldowns_answer(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /upstream/cooldowns` (the page's Cooldowns card)."""
     upstream = _need(ctx.upstream, "upstream service")
     with common.service_errors():
         rows = await upstream.cooldown_snapshot(MAX_COOLDOWNS)
@@ -755,7 +837,11 @@ async def cooldown_list(request: Request, _admin: AdminSession) -> dict[str, Any
 @router.get("/breakers")
 async def breaker_list(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Breakers that are open, half-open or counting failures (plan 7.10), with when an open one may probe again."""
-    ctx = get_ctx(request)
+    return await breakers_answer(get_ctx(request))
+
+
+async def breakers_answer(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /upstream/breakers` (the page's Breakers card)."""
     upstream = _need(ctx.upstream, "upstream service")
     with common.service_errors():
         rows = await upstream.breaker_snapshot(MAX_BREAKERS)
@@ -822,7 +908,11 @@ async def reset_state(request: Request, admin: AdminSession, _csrf: CsrfChecked,
 @router.get("/retries")
 async def retries(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """Retries by status, reason and egress (parity row 117), CSRF retries, and upstream calls by attempt kind."""
-    ctx = get_ctx(request)
+    return await retries_answer(get_ctx(request), tr)
+
+
+async def retries_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The answer of `GET /upstream/retries` (the page's Retries card)."""
     window = tr.window
 
     def read(conn: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -854,7 +944,11 @@ def _internal_health(item: Mapping[str, Any]) -> str:
 @router.get("/internal-calls")
 async def internal_calls(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """Roxy's own upstream calls (probes, lookups, health checks): the list, counts, failures and health."""
-    ctx = get_ctx(request)
+    return await internal_calls_answer(get_ctx(request), tr)
+
+
+async def internal_calls_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The answer of `GET /upstream/internal-calls` (the page's Internal calls card, v1 rows 28 and 29)."""
     window = tr.window
     stats = await ctx.dbs.metrics.read(lambda conn: queries.internal_calls(conn, window))
     by_purpose = {str(row["purpose"]): row for row in stats}
@@ -897,13 +991,18 @@ async def trace(
     request_id: Annotated[str, Path(min_length=1, max_length=64)],
 ) -> dict[str, Any]:
     """What happened to one request and why it waited (plan 7.12), from what Roxy keeps across every worker."""
+    return await trace_answer(get_ctx(request), request_id)
+
+
+async def trace_answer(ctx: Any, request_id: str) -> dict[str, Any]:
+    """The answer of `GET /upstream/trace/{request_id}` (422 `invalid_request_id` for a value that is not a
+    Roxy-Request-Id); the page's trace card shows the same explanation."""
     clean = request_id.strip().upper()
     minted = read_upstream.ulid_time_ms(clean)
     if minted is None or not _REQUEST_ID.fullmatch(clean):
         raise common.validation_error(
             {"request_id": "A request id is the 26 character Roxy-Request-Id value."}, code="invalid_request_id"
         )
-    ctx = get_ctx(request)
     settings = ctx.settings
     deadline_s = int(settings.get("request_deadline_s"))
     start_ms = minted - TRACE_BEFORE_MS
@@ -945,4 +1044,29 @@ async def trace(
     return {"request_id": clean, "minted_at_ms": minted, "live": facts.live, **explanation}
 
 
-__all__ = ["BUCKETS_SPEC", "CHALLENGES_SPEC", "FAILURES_SPEC", "HOSTS_SPEC", "router"]
+__all__ = [
+    "BUCKETS_SPEC",
+    "CHALLENGES_SPEC",
+    "FAILURES_SPEC",
+    "HOSTS_SPEC",
+    "adaptive_answer",
+    "aimd_answer",
+    "breakers_answer",
+    "bucket_history_answer",
+    "bucket_rows",
+    "buckets_answer",
+    "challenge_rows",
+    "challenges_answer",
+    "cooldowns_answer",
+    "egress_cards_answer",
+    "failure_rows",
+    "failures_answer",
+    "host_rows",
+    "hosts_answer",
+    "internal_calls_answer",
+    "latency_answer",
+    "retries_answer",
+    "router",
+    "timeline_429_answer",
+    "trace_answer",
+]

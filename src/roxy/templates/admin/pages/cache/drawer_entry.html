@@ -1,0 +1,59 @@
+{#-
+  Cache page drawer: one stored answer (`GET /admin/cache/drawer/entry?id=`, `roxy/admin/pages/cache.py
+  entry_drawer`), v1's inspector.
+
+  From `cache.entry_answer` (the `GET /admin/api/v1/cache/entries/{id}` function): the question, when it was
+  stored and until when it is fresh, its state, lifetime and rule, how often it was reused, how Roxy fetched it and
+  what Roblox answered, the request body of a POST, and the stored body (scrubbed by the API, pretty printed when it
+  is JSON, shown as text). "Fetch it again" posts to the refresh route (refused for a 429 marker or a credential
+  answer, which say so instead); "Purge" opens the shared purge dialog for this one entry. Every value here may hold
+  caller or Roblox text: shown as text only.
+  Context: `entry`, `stored`, `expires`, `stale_until`, `last_hit`, `state_words`, `state_tone`, `ttl_words`,
+  `age_words`, `body_shown`, `body_cut`, `refresh_url`, `purge_url`, `refresh_refusal`.
+-#}
+{% from "components/format.html" import caller_text, num, bytes %}
+{% from "components/badges.html" import badge %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/icon.html" import icon %}
+{% macro when(cell) %}{% if cell %}<time datetime="{{ cell.datetime }}">{{ cell.text }}</time> <span class="muted">({{ cell.sub }})</span>{% else %}<span class="muted">n/a</span>{% endif %}{% endmacro %}
+<div class="cache-drawer stack" data-cache-entry="{{ entry.id }}">
+  <p class="cache-drawer__key">{{ caller_text(entry.key, 600, block=True) }}</p>
+  <p class="cluster">{{ badge(state_words, state_tone if state_tone in ("ok", "warn", "bad") else "neutral") }} {{ badge("HTTP " ~ entry.status, "neutral") }}{% if entry.auth_class == "cred" %} {{ badge("fetched with the credential", "warn") }}{% endif %}</p>
+  <dl class="kv cache-drawer__facts">
+    <dt>Stored</dt><dd>{{ when(stored) }}</dd>
+    <dt>Fresh until</dt><dd>{{ when(expires) }}</dd>
+    <dt>Usable if Roblox fails until</dt><dd>{{ when(stale_until) }}</dd>
+    <dt>Lifetime</dt><dd>{{ ttl_words }}</dd>
+    <dt>Age</dt><dd>{{ age_words }}</dd>
+    <dt>Times reused</dt><dd>{{ num(entry.hits) }}{% if last_hit %} <span class="muted">(last {{ last_hit.sub }})</span>{% endif %}</dd>
+    <dt>Size</dt><dd>{{ bytes(entry.bytes) }} <span class="muted">(body {{ num(entry.body_length) }} characters)</span></dd>
+    <dt>Fetched via</dt><dd class="mono">{{ entry.egress or "n/a" }}</dd>
+    <dt>Roblox said</dt><dd class="mono">{{ entry.status }}{% if entry.content_type %} <span class="muted">{{ caller_text(entry.content_type, 80) }}</span>{% endif %}</dd>
+    <dt>Rule</dt><dd>{% if entry.rule %}<span class="mono">#{{ entry.rule.id }}</span> {{ caller_text(entry.rule.pattern, 200) }}{% elif entry.rule_id %}<span class="mono">#{{ entry.rule_id }}</span> <span class="muted">(removed since)</span>{% else %}<span class="muted">default lifetime</span>{% endif %}</dd>
+    {% if entry.stripped %}<dt>Left out of the key</dt><dd>{% for name in entry.stripped %}<code class="mono">{{ caller_text(name, 60) }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</dd>{% endif %}
+  </dl>
+
+  <div class="cluster cache-drawer__actions">
+    {% if refresh_refusal %}
+    <p class="muted">{{ refresh_refusal }}</p>
+    {% else %}
+    <form class="cache-inline-form" data-api-form data-api-url="{{ refresh_url }}" data-api-method="POST" data-on-success="refresh" data-refresh="browser">
+      <button type="submit" class="btn btn--sm" data-action="cache-entry-refresh">{{ icon("refresh") }}<span>Fetch it again from Roblox</span></button>
+    </form>
+    {% endif %}
+    <button type="button" class="btn btn--sm btn--bad-soft" data-dialog-open="dlg-cache-purge" data-action="cache-entry-purge"
+            data-fill='{{ {"scope": "id", "value": entry.id, "_label": "this one stored answer (" ~ entry.id ~ ")"}|tojson }}'>{{ icon("x-circle") }}<span>Purge this answer</span></button>
+  </div>
+
+  {% if entry.request_body %}
+  <section aria-labelledby="cache-entry-req-{{ entry.id }}">
+    <h3 class="cache-fact__title" id="cache-entry-req-{{ entry.id }}">Request body sent to Roblox</h3>
+    <pre class="cache-body" tabindex="0">{{ entry.request_body }}</pre>
+  </section>
+  {% endif %}
+  <section aria-labelledby="cache-entry-body-{{ entry.id }}">
+    <h3 class="cache-fact__title" id="cache-entry-body-{{ entry.id }}">Stored answer</h3>
+    {% if body_shown %}<pre class="cache-body" tabindex="0">{{ body_shown }}</pre>{% else %}<p class="muted">The body is empty.</p>{% endif %}
+    {% if body_cut %}<p class="muted">Long bodies are cut here; the API answer has the first 256 KiB.</p>{% endif %}
+  </section>
+</div>

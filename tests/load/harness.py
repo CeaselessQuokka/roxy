@@ -165,6 +165,13 @@ def parse(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--steady-rate", type=float, default=200.0, help="requests a second of `steady` (200)")
     parser.add_argument(
+        "--steady-connections",
+        type=int,
+        default=96,
+        help="client connections of `steady` (96); raise it to find the server's ceiling, so the client's own "
+        "connection pool is not what limits the rate",
+    )
+    parser.add_argument(
         "--set",
         action="append",
         default=[],
@@ -234,6 +241,7 @@ def main(argv: list[str]) -> int:
         seed=args.seed,
         keep=args.keep,
         steady_rate=args.steady_rate,
+        steady_connections=args.steady_connections,
         overrides=args.overrides,
         tree=args.tree,
         worker_env=args.worker_env,

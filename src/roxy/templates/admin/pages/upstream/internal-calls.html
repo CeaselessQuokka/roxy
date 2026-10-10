@@ -1,0 +1,34 @@
+{#-
+  Upstream page, card `internal-calls` (`roxy/admin/pages/upstream.py internal_calls_card`): v1's Internal Requests
+  (plan 14.1 row 35, parity rows 28 and 29). Every call site Roxy has for itself (credential probes, the rotator
+  exit IP probe, place lookups, health checks), its endpoint, its health in words (not called yet, OK, failing:
+  never color alone), calls, failures, mean time, the last error and the last call (`GET /admin/api/v1/upstream/
+  internal-calls`). Not-called sites come first, as in v1.
+  Context: `frame`, `items`, `note`.
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/format.html" import num, caller_text %}
+{% from "admin/pages/upstream/_macros.html" import when %}
+{% call page_card(frame, subtitle=note) %}
+<div class="table-scroll g3-scroll" role="region" aria-labelledby="internal-caption" tabindex="0">
+  <table class="simple-table g3-table g3-table--wrap">
+    <caption id="internal-caption" class="sr-only">Roxy's own calls to Roblox</caption>
+    <thead><tr><th scope="col">Call site</th><th scope="col">Health</th><th scope="col" class="num">Calls</th><th scope="col" class="num">Failed</th><th scope="col" class="num">Average</th><th scope="col">Last call</th></tr></thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td><span class="mono">{{ item.purpose }}</span>{% if item.what %}<span class="g3-cell-sub">{{ item.what }}</span>{% endif %}{% if item.url %}<span class="g3-cell-sub mono">{{ item.url }}</span>{% endif %}</td>
+        <td>{{ status_badge(item.tone, item.words) }}</td>
+        <td class="num">{{ num(item.count) }}</td>
+        <td class="num">{{ num(item.failed) }}</td>
+        <td class="num">{{ item.mean }}</td>
+        <td>{{ when(item.last) }}{% if item.last_error %}<span class="g3-cell-sub">Last error {{ when(item.last_error_when) }}: {{ caller_text(item.last_error, 160) }}</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endcall %}
+{% endif %}

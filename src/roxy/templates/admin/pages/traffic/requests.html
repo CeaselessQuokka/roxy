@@ -1,0 +1,29 @@
+{#-
+  Traffic page, card `requests` (`roxy/admin/pages/traffic.py requests_card`; plan 14.1 row 7, v1 "Traffic").
+
+  The totals of the range (summed from the chart's own points, so they always add up to the chart) and requests
+  over time stacked by outcome. The series is embedded (`series_chart(series=...)`): the chart draws on first paint
+  without asking the API again; its comparison overlay, change markers and partial-data notices come with it.
+  Actions: "Last 60 minutes" (v1's view of this chart) and the inline reset of the traffic numbers (plan 6.8).
+  Context: `frame`, `answer`, `stats`, `summary`, `series_options`, `reset_href`, `last_hour_href`, `range_label`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/format.html" import num %}
+{% from "components/badges.html" import help_dot %}
+{% from "components/icon.html" import icon %}
+{% set actions %}
+<a class="btn btn--sm btn--ghost" href="{{ last_hour_href }}">{{ icon("clock") }}<span>Last 60 minutes</span></a>
+<button type="button" class="btn btn--sm btn--ghost" data-drawer-src="{{ reset_href }}" data-drawer-title="Reset the traffic numbers" data-action="traffic-reset">{{ icon("reset") }}<span>Reset</span></button>
+{% endset %}
+{% call page_card(frame, actions=actions, subtitle=range_label) %}
+<dl class="traffic-stats">
+  {% for stat in stats %}
+  <div class="traffic-stats__item traffic-stats__item--{{ stat.key }}">
+    <dt class="traffic-stats__label">{{ stat.label }}{{ help_dot(stat.label, stat.help) }}</dt>
+    <dd class="traffic-stats__value"><span class="traffic-stats__number">{{ num(stat.value) }}</span>{% if stat.share is not none %}<span class="traffic-stats__share">{{ "{:,.1f}".format(stat.share) }}%</span>{% endif %}</dd>
+  </div>
+  {% endfor %}
+</dl>
+{{ series_chart("traffic-requests-chart", "Requests by outcome", series=answer, summary=summary, help="Each band is one outcome; the top line is every request. With a comparison chosen, the dashed lines are the earlier period.", size="lg", kind="area", stack="outcome", series_options=series_options, y_format="count", empty_text="No requests in this range yet. Requests appear here a few seconds after Roxy answers them.") }}
+{% endcall %}

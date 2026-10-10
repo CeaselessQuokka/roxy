@@ -195,8 +195,10 @@ be installed at once. Things to know:
 ## Memory and swap on the 909 MB server
 
 The server has 909 MB of RAM and no swap. DESIGN.md section 0 sizes everything to fit without swap: each color is
-capped at `MemoryHigh=320M` and `MemoryMax=420M`, two workers per color, and low-memory mode during a deploy. Adding a
-small swap file is still recommended as a safety net, not as capacity:
+capped at `MemoryHigh=350M` and `MemoryMax=450M` (raised from 320M and 420M after the 35 minute soak of finding
+LOAD-2 measured 332 MiB of PSS for a color, docs/PERFORMANCE.md), two workers per color, glibc's allocator tuned in
+`roxy@.service` (`MALLOC_ARENA_MAX=2`, fixed mmap and trim thresholds of 128 KiB), and low-memory mode during a
+deploy. Adding a small swap file is still recommended as a safety net, not as capacity:
 
 ```
 sudo fallocate -l 1G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile

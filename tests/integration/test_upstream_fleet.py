@@ -101,6 +101,10 @@ async def test_429_retry_after_cools_down_every_worker(dbs: Any, second_dbs: Any
     assert recovered.status == 200
     assert route.call_count == 2  # one half-open probe, then normal traffic
     assert (await get(a)).status == 200
+    # Roblox refused the endpoint's very first call: one call in a minute is no per-minute limit Roxy could learn
+    # (it is below adaptive_min_per_min), so the adaptive controller made the plan's cut, rate and burst together.
+    limit = a._rules().upstream_limit(f"endpoint:{TEMPLATE}")
+    assert (limit.per_min, limit.burst, limit.origin) == (84, 7, "adaptive")
     await egress_a.http.aclose()
     await egress_b.http.aclose()
 

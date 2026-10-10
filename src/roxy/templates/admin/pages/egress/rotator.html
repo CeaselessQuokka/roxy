@@ -1,0 +1,60 @@
+{#-
+  Egress page, card `rotator` (`roxy/admin/pages/egress.py rotator_card`): the DataImpulse rotator.
+
+  v1's "Rotate (IP rotation)" tile (Service Health, parity row 34): its state in words, calls, failures and
+  timeouts in the range, last success and last error (from `GET /admin/api/v1/upstream/egress`); the gateway URL
+  masked (`scheme://host:port`, parity row 33; the URL itself is a secret and is never shown, plan 8.2), where it
+  comes from, the session mode in force; replacing the URL (`PUT /admin/api/v1/rotator/url`, a fresh second
+  factor, never echoed) and going back to the bootstrap value (`DELETE /rotator/url`). The `rotator_*` settings
+  (switch, weight, session mode, quota and price, cooldowns) are in the card's settings block.
+  Context: `frame`, `state`, `tone`, `words`, `rotator`, `last_success`, `last_success_precision`,
+  `last_error_at`, `source_words`, `ui_set`, `ui_by`, `mode_words`, `sessions`, `url_api` (or `deferred`).
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num, caller_text %}
+{% from "admin/pages/upstream/_macros.html" import when %}
+{% call page_card(frame) %}
+<div class="g3-rotator">
+  <p class="g3-rotator__state">{{ status_badge(tone, words) }} <span>{{ state_detail }}</span></p>
+  <dl class="kv">
+    <dt>Gateway</dt><dd>{% if state.url %}<span class="mono">{{ state.url }}</span>{% else %}<span class="muted">not configured</span>{% endif %} <span class="muted">({{ source_words }})</span></dd>
+    {% if ui_set %}<dt>Set from this page</dt><dd>{{ when(ui_set) }}{% if ui_by %} by {{ caller_text(ui_by, 80) }}{% endif %}</dd>{% endif %}
+    <dt>Session mode in force</dt><dd>{{ mode_words }}</dd>
+    {% if rotator %}
+    <dt>Calls in this range</dt><dd>{{ num(rotator.calls) }} <span class="muted">({{ num(rotator.failed) }} failed, {{ num(rotator.timeouts) }} timeouts, {{ num(rotator.roblox_429) }} Roblox 429s)</span></dd>
+    <dt>Last success</dt><dd>{{ when(last_success, last_success_precision) }}</dd>
+    <dt>Last error</dt><dd>{{ when(last_error_at) }}</dd>
+    {% endif %}
+  </dl>
+  <div class="cluster">
+    <button type="button" class="btn" data-dialog-open="dlg-rotator-url" data-action="rotator-url-replace">{{ icon("key") }}<span>Replace the gateway URL</span></button>
+    {% if state.can_revert %}<button type="button" class="btn btn--ghost" data-dialog-open="dlg-rotator-revert" data-action="rotator-url-revert">{{ icon("reset") }}<span>Go back to the bootstrap URL</span></button>{% endif %}
+  </div>
+  <p class="muted g3-note">{{ state.restart_note }}</p>
+</div>
+{% call confirm_dialog("dlg-rotator-url", "Replace the rotator gateway URL?", action=url_api, method="put", api=True,
+                       confirm_label="Replace the URL",
+                       consequences=["Every worker sends rotator traffic through the new gateway within a second.",
+                                     "The URL holds a user name and a password: it is stored encrypted, never shown again, and the audit log keeps only its fingerprint and host.",
+                                     "This needs a current code from your authenticator app."],
+                       reason=True, success="Gateway URL replaced.", on_success="refresh", refresh="rotator sessions exit-ips") %}
+<div class="field">
+  <label class="field__label" for="dlg-rotator-url-value">New gateway URL <span class="muted">(http://user:password@host:port)</span></label>
+  <input class="input mono" type="password" id="dlg-rotator-url-value" name="url" required maxlength="2048" autocomplete="off" spellcheck="false" data-json="string" aria-describedby="dlg-rotator-url-error">
+  <p class="field__error" id="dlg-rotator-url-error" data-field-error="url" hidden></p>
+</div>
+{% endcall %}
+{% if state.can_revert %}
+{{ confirm_dialog("dlg-rotator-revert", "Go back to the bootstrap gateway URL?", action=url_api, method="delete", api=True, danger=True,
+                  confirm_label="Use the bootstrap URL",
+                  consequences=["The URL set from this page is deleted; every worker uses the systemd credential rotator_url again within a second.",
+                                "If that file is empty, the rotator stops (direct carries everything).",
+                                "This needs a current code from your authenticator app; the change is written to the audit log."],
+                  reason=True, success="Back on the bootstrap gateway URL.", on_success="refresh", refresh="rotator sessions exit-ips") }}
+{% endif %}
+{% endcall %}
+{% endif %}

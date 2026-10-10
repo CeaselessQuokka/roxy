@@ -1,0 +1,38 @@
+{#-
+  Clients page, card `lookup` (`roxy/admin/pages/clients.py lookup_card`): v1 "Identify an experience" (row 92).
+
+  The form posts `{id, kind}` to `POST /admin/api/v1/clients/lookup` (a place or universe id to its universe and
+  game; paced by the upstream buckets at admin priority, never the credential, cached 10 minutes per worker).
+  static/js/pages/clients.js draws the answer into `[data-lookup-result]` with text nodes only: the name, owner,
+  numbers and description are Roblox's (and so possibly a caller's) text; v1's two links become the Roblox addresses
+  as text with a copy button (a dashboard script never links to another site). v1's throwaway-place warning
+  (`lookup.THROWAWAY_NOTE`, one source) shows when the API flags it.
+  Context: `frame`, `lookup_url`, `throwaway_note`, `prefill`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+{% call page_card(frame) %}
+<p class="clients-intro">Roblox stamps the calling {{ term("place") }} id on every HttpService request as the <code>Roblox-Id</code> header. Paste one here to find out which experience it is and who owns it. This uses Roblox's public endpoints through Roxy's own upstream pacing, so it needs no extra credentials and never uses the Roblox credential.</p>
+<form class="stack clients-lookup" id="clients-lookup-form" data-api-form data-api-url="{{ lookup_url }}" data-api-method="POST"
+      data-success="Found it." data-lookup-form data-throwaway="{{ throwaway_note }}" novalidate>
+  <div class="field-row">
+    <div class="field">
+      <label class="field__label" for="clients-lookup-id">Place or universe id</label>
+      <input class="input mono" id="clients-lookup-id" name="id" inputmode="numeric" autocomplete="off" required maxlength="20"
+             pattern="[0-9]{1,20}" placeholder="75227619283955" value="{{ prefill }}" data-json="string" aria-describedby="clients-lookup-id-error">
+      <p class="field__error" id="clients-lookup-id-error" data-field-error="id" hidden></p>
+    </div>
+    <div class="field">
+      <label class="field__label" for="clients-lookup-kind">It is a</label>
+      <select class="input" id="clients-lookup-kind" name="kind" data-json="string">
+        <option value="place" selected>Place id</option>
+        <option value="universe">Universe id</option>
+      </select>
+    </div>
+  </div>
+  <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+  <div class="cluster"><button type="submit" class="btn btn--primary" data-action="clients-lookup">{{ icon("search") }}<span>Identify</span></button></div>
+</form>
+<div class="clients-lookup__result" data-lookup-result aria-live="polite"></div>
+{% endcall %}

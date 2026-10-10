@@ -1,0 +1,22 @@
+{#-
+  Upstream page, card `queue` (`roxy/admin/pages/upstream.py queue_card`): how long each kind of request may wait for
+  a bucket slot (plan 7.8), with the live value of the setting that bounds each wait. The settings are edited in
+  the card's settings block below. Context: `frame`, `priorities`, `queue_max`, `deadline_s`.
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% call page_card(frame) %}
+<p class="muted">When a bucket is full, a call waits for its slot. Callers with no cached copy wait the longest; work nobody waits for is dropped first. Each worker holds at most {{ queue_max }} waiting calls, and every request ends after {{ deadline_s }} seconds whatever happens.</p>
+<div class="table-scroll g3-scroll" role="region" aria-labelledby="queue-caption" tabindex="0">
+  <table class="simple-table g3-table g3-table--wrap">
+    <caption id="queue-caption" class="sr-only">Wait limits by priority</caption>
+    <thead><tr><th scope="col" class="num">Priority</th><th scope="col">Who waits</th><th scope="col">Longest wait</th></tr></thead>
+    <tbody>
+      {% for row in priorities %}
+      <tr><td class="num">{{ row.priority }}</td><td>{{ row.who }}</td><td>{{ row.value }} <span class="g3-cell-sub mono">{{ row.key }}</span></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endcall %}
+{% endif %}

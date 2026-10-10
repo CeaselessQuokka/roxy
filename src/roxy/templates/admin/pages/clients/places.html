@@ -1,0 +1,20 @@
+{#-
+  Clients page, card `places` (`roxy/admin/pages/clients.py places_card`): v1 "Callers (by Roblox place ID)".
+
+  The page's main table (search, sort and page live in the address bar): one row per place id in the range from
+  `clients.client_table_answer` (the `GET /admin/api/v1/clients/places` function): requests, refusals, Rate1/5/60,
+  the busiest endpoint, the addresses it came from, when it was last seen, its cached experience name and whether a
+  ban covers it. A row opens the place in the drawer (digits only: a place id that is not a number is a forged
+  header and is shown as text without actions). The place limit settings (`clients#places`) follow, placed by the
+  page card from the catalog. A request of the table itself (`table_only`) is answered with the table alone; the
+  card's own fragment URL (`card_src`) keeps the search and sort for a refresh after an action.
+  Context: `frame`, `table`, `table_only`, `card_src`, `peers_basis`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% if table_only %}{{ data_table(**table) }}{% else %}
+{% call page_card(dict(frame, fragment_url=card_src), flush=True, subtitle="One row per calling game. Open a row for its timeline and actions.") %}
+{{ data_table(**table) }}
+{% if peers_basis %}<p class="muted clients-note">IPs counts {{ peers_basis }}.</p>{% endif %}
+{% endcall %}
+{% endif %}

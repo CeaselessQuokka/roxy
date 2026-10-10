@@ -1,0 +1,210 @@
+{#-
+  Data page, card `resets` (`roxy/admin/pages/data.py resets_card`): the granular resets of plan 6.8 (parity row 83:
+  v1's per-section "Clear data" buttons).
+
+  The form is built from `GET /admin/api/v1/data/resets` (`reset_catalog`): the scope (each with its plain
+  description), the metric families (each narrower family nested under its parent, with the card that shows it and
+  what it does to its rows), an optional date range, and the fields the other scopes need. Nothing is deleted from
+  here directly: static/js/pages/data.js posts the form to `POST /data/resets/preview`, shows the exact rows per
+  table, what stays and the snapshot plan, and only then offers "Run this reset", whose dialog (in data.html) asks
+  for a reason and the typed phrase a destructive full reset needs; the factory reset also asks for the second
+  factor. `?families=a,b` and `?scope=` preselect the form (the Clear buttons of other cards link here).
+  Below: the recent data operations (audit entries `data.*`) and where each of v1's 27 clear targets went; a target
+  whose scope is None says "Nothing to reset" with why.
+  Context: `frame`, `scopes`, `scope`, `families`, `cache_kinds`, `ban_kinds`, `recommendation_kinds`,
+  `scope_fields`, `targets`, `recent`, `urls`, `tz`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% from "admin/pages/data/_macros.html" import when %}
+
+{% macro scoped(name) -%}data-scope-fields="{{ scope_fields[name]|join(' ') }}"{% if scope not in scope_fields[name] %} hidden{% endif %}{%- endmacro %}
+
+{% macro family_item(f) -%}
+<li class="data-family">
+  <label class="check data-family__check"><input type="checkbox" name="families" value="{{ f.name }}"{% if f.checked %} checked{% endif %} aria-describedby="family-{{ f.name }}-note"><span>{{ f.label }}</span></label>
+  <p class="data-family__note" id="family-{{ f.name }}-note">
+    {% if f.note %}{{ f.note }} {% endif %}<span class="muted">It {{ f.action_words or "deletes rows" }} of {{ f.tables|length }} {{ "table" if f.tables|length == 1 else "tables" }}.</span>
+    {% if f.href %}<a href="{{ f.href }}">Shown on {{ f.card_label }}</a>{% endif %}
+  </p>
+  {% if f.children %}
+  <ul class="data-families data-families--narrow" role="list" aria-label="Narrower parts of {{ f.label }}">
+    {% for child in f.children %}{{ family_item(child) }}{% endfor %}
+  </ul>
+  {% endif %}
+</li>
+{%- endmacro %}
+
+{% call page_card(frame, subtitle="Delete statistics you no longer want; a preview comes first") %}
+<div class="data-resets stack">
+  <form class="data-reset-form stack" id="reset-form" data-reset-form data-preview-url="{{ urls.preview }}" data-run-url="{{ urls.run }}"
+        data-factory-url="{{ urls.factory }}" novalidate>
+    <div class="field data-reset-scope">
+      <label class="field__label" for="reset-scope">What to reset</label>
+      <select class="input" id="reset-scope" name="scope" data-reset-scope aria-describedby="reset-scope-desc">
+        {% for s in scopes %}<option value="{{ s.scope }}" data-description="{{ s.description }}"{% if s.scope == scope %} selected{% endif %}>{{ s.label }}</option>{% endfor %}
+      </select>
+      <p class="field__hint" id="reset-scope-desc" data-reset-scope-desc>{% for s in scopes if s.scope == scope %}{{ s.description }}{% endfor %}</p>
+    </div>
+
+    <fieldset class="data-fieldset" {{ scoped("families") }}>
+      <legend class="data-fieldset__legend">Metric families</legend>
+      <p class="field__hint">Each family is the data one card shows. A narrower family clears only part of its parent, as v1's separate Clear buttons did.</p>
+      <ul class="data-families" role="list">
+        {% for f in families %}{{ family_item(f) }}{% endfor %}
+      </ul>
+      <p class="field__error" data-field-error="families" hidden></p>
+    </fieldset>
+
+    <fieldset class="data-fieldset" {{ scoped("range") }}>
+      <legend class="data-fieldset__legend">Between two dates</legend>
+      <p class="field__hint" id="reset-range-hint">Needed for a date range; optional for families and health history (leave both empty for everything kept). Times are read in {{ tz }}.</p>
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="reset-from">From</label>
+          <input class="input" type="datetime-local" id="reset-from" name="from" aria-describedby="reset-range-hint reset-from-error">
+          <p class="field__error" id="reset-from-error" data-field-error="from" hidden></p>
+        </div>
+        <div class="field">
+          <label class="field__label" for="reset-to">To</label>
+          <input class="input" type="datetime-local" id="reset-to" name="to" aria-describedby="reset-range-hint reset-to-error">
+          <p class="field__error" id="reset-to-error" data-field-error="to" hidden></p>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="data-fieldset" {{ scoped("client") }}>
+      <legend class="data-fieldset__legend">The client</legend>
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="reset-client-type">Kind</label>
+          <select class="input" id="reset-client-type" name="client_type"><option value="ip">IP address</option><option value="place">Place (Roblox-Id)</option></select>
+        </div>
+        <div class="field">
+          <label class="field__label" for="reset-client">Address or place id</label>
+          <input class="input mono" id="reset-client" name="client" maxlength="64" autocomplete="off" spellcheck="false" aria-describedby="reset-client-error">
+          <p class="field__error" id="reset-client-error" data-field-error="client" hidden></p>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="data-fieldset" {{ scoped("endpoint") }}>
+      <legend class="data-fieldset__legend">The endpoint template</legend>
+      <div class="field">
+        <label class="field__label" for="reset-template">Template</label>
+        <input class="input mono" id="reset-template" name="template" maxlength="300" autocomplete="off" spellcheck="false"
+               placeholder="games.roblox.com/v1/games/{gameId}" aria-describedby="reset-template-hint reset-template-error">
+        <p class="field__hint" id="reset-template-hint">As the Endpoints page lists it: host and path, with ids as placeholders in braces.</p>
+        <p class="field__error" id="reset-template-error" data-field-error="template" hidden></p>
+      </div>
+    </fieldset>
+
+    <fieldset class="data-fieldset" {{ scoped("cache") }}>
+      <legend class="data-fieldset__legend">Which cached answers</legend>
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="reset-cache">Remove</label>
+          <select class="input" id="reset-cache" name="cache">
+            {% set CACHE_WORDS = {"all": "Every cached answer", "host": "Answers from one host", "rule": "Answers of one cache rule", "pattern": "Answers matching a pattern", "expired": "Expired answers only"} %}
+            {% for kind in cache_kinds %}<option value="{{ kind }}">{{ CACHE_WORDS.get(kind, kind) }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label class="field__label" for="reset-cache-value">Host, rule id or pattern</label>
+          <input class="input mono" id="reset-cache-value" name="value" maxlength="500" autocomplete="off" spellcheck="false" aria-describedby="reset-cache-value-error">
+          <p class="field__error" id="reset-cache-value-error" data-field-error="value" hidden></p>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="reset-pattern-type">Pattern type</label>
+          <select class="input" id="reset-pattern-type" name="pattern_type"><option value="glob">Glob (* and ?)</option><option value="regex">Regular expression</option></select>
+        </div>
+        <label class="check data-check"><input type="checkbox" name="include_stale" value="1"><span>With expired: also answers kept only to serve while Roblox is failing</span></label>
+      </div>
+    </fieldset>
+
+    <fieldset class="data-fieldset" {{ scoped("bans") }}>
+      <legend class="data-fieldset__legend">Which bans</legend>
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="reset-bans">Remove</label>
+          {% set BAN_WORDS = {"all": "Every ban", "auto": "Bans a detector made", "expired": "Expired bans", "detector": "Bans of one detector"} %}
+          <select class="input" id="reset-bans" name="bans">{% for kind in ban_kinds %}<option value="{{ kind }}">{{ BAN_WORDS.get(kind, kind) }}</option>{% endfor %}</select>
+        </div>
+        <div class="field">
+          <label class="field__label" for="reset-detector">Detector (for one detector's bans)</label>
+          <input class="input mono" id="reset-detector" name="detector" maxlength="40" autocomplete="off" spellcheck="false" placeholder="rate" aria-describedby="reset-detector-error">
+          <p class="field__error" id="reset-detector-error" data-field-error="detector" hidden></p>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="data-fieldset" {{ scoped("recommendations") }}>
+      <legend class="data-fieldset__legend">Which recommendations</legend>
+      <div class="field">
+        <label class="field__label" for="reset-recs">Remove</label>
+        {% set REC_WORDS = {"history": "Closed ones only (dismissed, expired, applied, undone)", "all": "Every recommendation, open ones too"} %}
+        <select class="input" id="reset-recs" name="recommendations">{% for kind in recommendation_kinds %}<option value="{{ kind }}">{{ REC_WORDS.get(kind, kind) }}</option>{% endfor %}</select>
+      </div>
+    </fieldset>
+
+    <p class="dialog__error" data-reset-error role="alert" hidden></p>
+    <div class="cluster">
+      <button type="submit" class="btn btn--primary" data-action="reset-preview">{{ icon("eye") }}<span>Preview</span></button>
+      <span class="muted">Nothing is deleted until you confirm the preview.</span>
+    </div>
+  </form>
+
+  <section class="data-reset-preview stack" data-reset-preview tabindex="-1" aria-labelledby="reset-preview-title" hidden>
+    <h3 class="data-reset-preview__title" id="reset-preview-title">Preview</h3>
+    <p class="data-reset-preview__summary" data-preview-summary></p>
+    <div class="table-scroll" role="region" aria-labelledby="reset-preview-title" tabindex="0">
+      <table class="simple-table data-table">
+        <caption class="sr-only">Rows each table loses or changes</caption>
+        <thead><tr><th scope="col">Table</th><th scope="col">What happens</th><th scope="col" class="num">Rows</th><th scope="col">Oldest</th><th scope="col">Newest</th></tr></thead>
+        <tbody data-preview-tables></tbody>
+      </table>
+    </div>
+    <ul class="data-reset-preview__list" data-preview-notes></ul>
+    <div class="cluster">
+      <button type="button" class="btn btn--danger" data-reset-open-run data-dialog-open="dlg-reset-run" data-action="reset-open-run">{{ icon("alert-triangle") }}<span>Run this reset</span></button>
+      <button type="button" class="btn btn--ghost" data-reset-discard>Discard the preview</button>
+    </div>
+  </section>
+
+  <div class="data-reset-result" data-reset-result role="status" aria-live="polite"></div>
+
+  <details class="details-plain data-recent">
+    <summary>Recent data operations</summary>
+    {% if recent %}
+    <ul class="data-recent__list" role="list">
+      {% for op in recent %}
+      <li><a href="{{ op.href }}" class="mono">{{ op.action }}</a> <span class="muted">by {{ op.actor }}, {{ when(op.when) }}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="muted">No reset, backup or VACUUM has been run yet. Each one is written to the audit log.</p>
+    {% endif %}
+  </details>
+
+  <details class="details-plain data-v1">
+    <summary>Where v1's "Clear data" buttons went</summary>
+    <div class="table-scroll" role="region" aria-label="v1 clear targets and their v2 reset" tabindex="0">
+      <table class="simple-table data-table">
+        <caption class="sr-only">Each v1 clear target and the v2 reset that replaces it</caption>
+        <thead><tr><th scope="col">v1 target</th><th scope="col">v2 reset</th><th scope="col">Note</th></tr></thead>
+        <tbody>
+          {% for t in targets %}
+          <tr>
+            <td data-label="v1 target" class="mono">{{ t.target }}</td>
+            <td data-label="v2 reset">{% if t.scope %}<a href="{{ t.href }}">{{ t.scope_label }}{% if t.families %}: {{ t.families|join(", ") }}{% endif %}</a>{% else %}<span class="tone tone--muted">Nothing to reset</span>{% endif %}</td>
+            <td data-label="Note">{{ t.note or "" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+</div>
+{% endcall %}

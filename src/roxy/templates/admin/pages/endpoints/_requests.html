@@ -1,0 +1,48 @@
+{#-
+  The Endpoints page's request table macro (`request_table(rows, id, caption)`): the recent card and the drill-down
+  list live rows with it (`roxy/admin/pages/endpoints.py request_rows` prepares them).
+
+  v1's "Inspect" block per request (When, From, Method, Query, We answered, Roblox answered, Served by, User-Agent)
+  as one table row: the path, query, place and User-Agent are caller text (`caller_text`); the first cell is a
+  button that opens the request on the Live page's drawer (its trace and its capture) when the id is one the Live
+  API accepts. On a phone the table scrolls inside its own region (the page never scrolls sideways).
+-#}
+{% from "components/format.html" import caller_text %}
+{% macro request_table(rows, id, caption) -%}
+<div class="table-scroll ep-requests" role="region" aria-labelledby="{{ id }}-caption" tabindex="0">
+  <table class="simple-table ep-requests__table">
+    <caption id="{{ id }}-caption" class="sr-only">{{ caption }}</caption>
+    <thead>
+      <tr>
+        <th scope="col">When</th>
+        <th scope="col">Request</th>
+        <th scope="col" class="num">Status</th>
+        <th scope="col">Outcome</th>
+        <th scope="col">Cache</th>
+        <th scope="col" class="num">Took</th>
+        <th scope="col">Client</th>
+        <th scope="col" class="ep-requests__ua">User-Agent</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <th scope="row" class="ep-requests__when">
+          {% if row.drawer %}<button type="button" class="link-btn" data-drawer-src="{{ row.drawer }}" data-drawer-title="Request {{ row.request_id }}">{% endif %}
+          {% if row.when %}<time datetime="{{ row.when.datetime }}">{{ row.when.text }}</time>{% else %}<span class="muted">n/a</span>{% endif %}
+          {% if row.drawer %}</button>{% endif %}
+          {% if row.when and row.when.sub %}<span class="dt__sub">{{ row.when.sub }}</span>{% endif %}
+        </th>
+        <td class="ep-requests__url"><span class="mono">{{ row.method }}</span> <span class="mono">{{ caller_text(row.url, 300) }}</span>{% if row.query %}<span class="dt__sub mono">?{{ caller_text(row.query, 200) }}</span>{% endif %}</td>
+        <td class="num"><span class="tone tone--{{ row.status_tone }} mono">{{ row.status if row.status is not none else "n/a" }}</span>{% if row.upstream_status %}<span class="dt__sub">Roblox said {{ row.upstream_status }}</span>{% endif %}</td>
+        <td>{{ row.outcome or "n/a" }}{% if row.reason %}<span class="dt__sub mono">{{ row.reason }}</span>{% endif %}</td>
+        <td>{% if row.cache %}<span class="mono">{{ row.cache }}</span>{% else %}<span class="muted">n/a</span>{% endif %}</td>
+        <td class="num">{{ row.took }}</td>
+        <td><span class="mono">{{ row.ip or "n/a" }}</span>{% if row.place %}<span class="dt__sub">Place {{ caller_text(row.place, 80) }}</span>{% endif %}</td>
+        <td class="ep-requests__ua">{% if row.user_agent %}{{ caller_text(row.user_agent, 120) }}{% else %}<span class="muted">n/a</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{%- endmacro %}

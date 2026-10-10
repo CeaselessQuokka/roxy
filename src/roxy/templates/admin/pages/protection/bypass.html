@@ -1,0 +1,61 @@
+{#-
+  Protection page, card `bypass` (`roxy/admin/pages/protection.py bypass_card`): v1 "Throttle Bypass (testing)".
+
+  What: your address as Roxy resolved it (v1 "YourIP", `GET /protection/access/bypass/me`) and whether an entry
+  covers it; "Bypass my IP" (`POST /access/bypass/me`, row 113, with the default expiry) and "Use my IP" (fills
+  the form, as v1 did); the bypass entries (`GET /access/bypass`) with their hits and expiry; "Add a bypass"
+  (`POST /access/bypass`: an expiry in hours, or "never", which needs a confirmation). A row opens the entry in the
+  drawer (`detail=<id>`, `_access_drawer.html`). The card's setting (`bypass_default_expiry_h`) sits below.
+  Context: `frame`, `table`, `only`, `me`, `api`; for the drawer `detail`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num %}
+{% from "components/badges.html" import status_badge %}
+{% from "admin/pages/protection/_macros.html" import reason_field, field_error %}
+{% if detail %}{% include "admin/pages/protection/_access_drawer.html" %}
+{% elif only %}{{ data_table(**table) }}{% else %}
+{% set actions %}<button type="button" class="btn btn--sm" data-dialog-open="dlg-prot-bypass-add" aria-haspopup="dialog" data-action="bypass-add">{{ icon("plus") }}<span>Add a bypass</span></button>{% endset %}
+{% call page_card(frame, actions=actions) %}
+<p>Addresses here skip the rate-limit 429s (the emergency limit, the per-IP limit, place limits, User-Agent and endpoint rules) and the tarpit, so you can load-test the proxy. They do <strong>not</strong> skip pause, bans, the deny list, request filters, endpoint blocks or the credential's own budget, so the real routing still applies.</p>
+<div class="prot-me">
+  <p>Your current IP is <strong class="mono" data-my-ip>{{ me.ip }}</strong>{% if me.bypassed %} {{ status_badge("ok", "Bypassed") }}{% else %} {{ status_badge("neutral", "Not bypassed") }}{% endif %}</p>
+  <div class="cluster">
+    <form data-api-form data-api-url="{{ api.me }}" data-api-method="POST" data-success="Your address now bypasses the limits." data-on-success="refresh" data-refresh="bypass" novalidate>
+      <button type="submit" class="btn btn--primary" data-action="bypass-my-ip"{% if me.bypassed %} aria-describedby="prot-bypass-me-note"{% endif %}>{{ icon("user") }}<span>Bypass my IP</span></button>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    </form>
+    <button type="button" class="btn btn--ghost" data-use-my-ip="{{ me.ip }}" data-target="dlg-prot-bypass-add-cidr" data-dialog-open="dlg-prot-bypass-add" aria-haspopup="dialog">{{ icon("copy") }}<span>Use my IP in the form</span></button>
+  </div>
+  <p class="field__hint" id="prot-bypass-me-note">{% if me.bypassed %}An entry already covers your address; bypassing it again extends nothing new.{% else %}Bypass my IP adds your address for {{ num(me.default_expiry_h) }} hours (the default expiry below).{% endif %}</p>
+</div>
+{{ data_table(**table) }}
+{% call confirm_dialog("dlg-prot-bypass-add", "Add a bypass", api.add, confirm_label="Add", api=True, success="Bypass added.",
+                       on_success="refresh", refresh="bypass",
+                       consequences=["Requests from it skip the rate limits and the tarpit (never pause, bans, filters or blocks).",
+                                     "It expires after the hours you give, or after the default expiry when you leave it empty."]) %}
+  <div class="field">
+    <label class="field__label" for="dlg-prot-bypass-add-cidr">Address or network</label>
+    <input class="input mono" id="dlg-prot-bypass-add-cidr" name="cidr" required aria-required="true" maxlength="100" autocomplete="off" spellcheck="false" placeholder="203.0.113.7" aria-describedby="dlg-prot-bypass-add-cidr-error">
+    {{ field_error("cidr", "dlg-prot-bypass-add-cidr-error") }}
+  </div>
+  <div class="field-row">
+    <div class="field">
+      <label class="field__label" for="dlg-prot-bypass-add-hours">Expires after (hours)</label>
+      <input class="input input--num" id="dlg-prot-bypass-add-hours" name="expires_in_h" inputmode="decimal" data-json="float" placeholder="{{ num(me.default_expiry_h) }}" aria-describedby="dlg-prot-bypass-add-hours-error">
+      {{ field_error("expires_in_h", "dlg-prot-bypass-add-hours-error") }}
+    </div>
+    <div class="field">
+      <label class="field__label" for="dlg-prot-bypass-add-note">Note <span class="muted">(optional)</span></label>
+      <input class="input" id="dlg-prot-bypass-add-note" name="note" maxlength="300">
+    </div>
+  </div>
+  <label class="check"><input type="checkbox" name="never"><span>Never expire</span></label>
+  <label class="check" data-confirm-field hidden><input type="checkbox" name="confirm_never"><span>I understand: this address skips the limits until someone removes it</span></label>
+  {{ field_error("never", "dlg-prot-bypass-add-never-error") }}
+  {{ reason_field("dlg-prot-bypass-add-reason") }}
+{% endcall %}
+{% endcall %}
+{% endif %}

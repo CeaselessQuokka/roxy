@@ -1,0 +1,42 @@
+{#-
+  System page, card `versions` (`roxy/admin/pages/system.py versions_card`): what runs.
+
+  `GET /admin/api/v1/system/versions` (`system_api.versions_view`): the release and deployed commit, the package,
+  Python, SQLite and library versions, the settings catalog and config versions, each database's schema against what
+  this release requires, the endpoint template version, and which releases the fresh workers report (more than one:
+  a deploy is switching, or a worker did not restart). Context: `frame`, `answer`, `schema`, `mixed`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/badges.html" import status_badge %}
+{% call page_card(frame) %}
+<div class="stack">
+  {% if mixed %}{{ inline_alert("warn", "Workers run different releases", "Usually a deploy is switching colors; if it lasts, a worker did not restart. See the Version mismatch runbook.") }}{% endif %}
+  <dl class="kv system-kv">
+    <dt>Release</dt><dd class="mono">{{ answer.release or "n/a" }}</dd>
+    <dt>Deployed commit</dt><dd class="mono">{{ answer.deployed_sha or "n/a" }}</dd>
+    <dt>Roxy</dt><dd class="mono">{{ answer.package }}</dd>
+    <dt>Python</dt><dd class="mono">{{ answer.python }}</dd>
+    <dt>SQLite</dt><dd class="mono">{{ answer.sqlite }}</dd>
+    <dt>Settings catalog</dt><dd><span class="mono">{{ answer.catalog_version }}</span> <span class="muted">({{ num(answer.settings) }} settings, config version {{ num(answer.config_version) }})</span></dd>
+    <dt>Endpoint templates</dt><dd>version {{ answer.template_version }}</dd>
+    <dt>Workers report</dt><dd>{% for label, count in (answer.fleet_versions or {}).items() %}<span class="mono">{{ label }}</span> <span class="muted">({{ num(count) }})</span>{{ ", " if not loop.last }}{% else %}<span class="muted">no fresh worker</span>{% endfor %}</dd>
+  </dl>
+  <section class="system-section" aria-labelledby="versions-schema-title">
+    <h3 class="system-section__title" id="versions-schema-title">Database schemas</h3>
+    <ul class="system-list">
+      {% for item in schema %}
+      <li><span class="mono">{{ item.db }}.db</span> version {{ item.version if item.version >= 0 else "unreadable" }}
+        {% if item.required is not none and item.version >= item.required %}{{ status_badge("ok", "up to date") }}{% elif item.required is not none %}{{ status_badge("bad", "needs " ~ item.required) }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+  </section>
+  <section class="system-section" aria-labelledby="versions-libs-title">
+    <h3 class="system-section__title" id="versions-libs-title">Libraries</h3>
+    <ul class="system-list system-list--inline">
+      {% for name, version in (answer.libraries or {}).items() %}<li><span class="mono">{{ name }}</span> {{ version or "not installed" }}</li>{% endfor %}
+    </ul>
+  </section>
+</div>
+{% endcall %}

@@ -1,0 +1,35 @@
+{#-
+  Egress page, card `usage` (`roxy/admin/pages/egress.py usage_card`): bytes and calls per egress path.
+
+  One tile per egress (direct, rotator, credential: v1's byte totals per method) with its state in words, from
+  `GET /admin/api/v1/egress/usage`; how the bytes are counted; and each egress's calls over the range from
+  `GET /admin/api/v1/egress/share` (embedded in the chart, so the first paint needs no second request).
+  Context: `frame`, `items`, `share`, `metering`, `estimate`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/format.html" import num %}
+{% call page_card(frame, subtitle="Bytes are " ~ metering ~ ".", notices=["The byte counts are an estimate: the socket meter is not available on this worker."] if estimate else []) %}
+<div class="g3-egress-usage">
+  {% for item in items %}
+  <article class="g3-usage" aria-labelledby="usage-{{ item.egress }}-title" data-egress="{{ item.egress }}">
+    <header class="g3-usage__head">
+      <h3 class="g3-usage__title" id="usage-{{ item.egress }}-title">{{ item.label }}</h3>
+      {{ status_badge(item.tone, item.state) }}
+    </header>
+    {% if item.state_detail %}<p class="g3-usage__state">{{ item.state_detail }}</p>{% endif %}
+    <p class="g3-usage__bytes"><strong>{{ item.bytes_text }}</strong></p>
+    <dl class="kv g3-usage__numbers">
+      <dt>Calls</dt><dd>{{ num(item.calls) }} <span class="muted">({{ item.share_text }} of all calls)</span></dd>
+      <dt>Bytes per call</dt><dd>{{ item.per_call_text }}</dd>
+    </dl>
+    <p class="g3-usage__about">{{ item.about }}</p>
+  </article>
+  {% endfor %}
+</div>
+{{ series_chart("chart-egress-share", "Upstream calls per egress", series=share, kind="area", stack="egress", y_format="count",
+                summary="Calls to Roblox per egress path and time bucket, stacked.", size="sm",
+                help="Calls Roxy made to Roblox through each egress, Roxy's own calls included, per time bucket.",
+                empty_text="No call went to Roblox in this range.") }}
+{% endcall %}

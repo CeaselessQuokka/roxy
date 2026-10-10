@@ -1,0 +1,85 @@
+{#-
+  System page, card `fleet` (`roxy/admin/pages/system.py fleet_card`): the worker fleet (parity row 84) and the
+  workers table, with "Reset request counts" (row 122).
+
+  The header reads `GET /admin/api/v1/system/fleet` (`system_api.fleet`): per color Expected (this worker's
+  ROXY_WORKERS) against the Count of fresh heartbeats, the gunicorn masters (both colors during a deploy) and the
+  service uptime from each master's own start time, host uptime, the time since the last deploy switch, fleet
+  memory and tarpit connection use. The table is the API's `workers` table (id `workers`: health checks link to
+  /admin/system#workers); its own requests get only the table back (`table_only`). The confirm dialog sits inside
+  the card so a refresh of the card replaces it instead of adding a second one.
+  Context: `frame`, `table`, `table_only`, `fleet`, `facts`, `max_requests`, `reset_url`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/kpi.html" import kpi_tile %}
+{% from "components/format.html" import duration, bytes as fmt_bytes, num %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/badges.html" import badge %}
+{% from "components/glossary.html" import term with context %}
+{% from "components/icon.html" import icon %}
+{% if table_only %}{{ data_table(**table) }}{% else %}
+{% set mine = facts.mine %}
+{% set totals = fleet.totals or {} %}
+{% set tarpit = fleet.tarpit_connections %}
+{% set actions %}<button type="button" class="btn btn--sm btn--ghost" data-dialog-open="dlg-reset-counts" data-action="reset-counts">{{ icon("reset") }}<span>Reset request counts</span></button>{% endset %}
+{% set notices = ["Both colors are serving: a deploy is switching between blue and green. Each color's workers, master and uptime are listed below."] if facts.deploying else [] %}
+{% call page_card(frame, actions=actions, notices=notices) %}
+<div class="system-fleet stack">
+  <div class="kpi-grid">
+    {{ kpi_tile("Service uptime", duration(mine.service_uptime_s) if mine and mine.service_uptime_s is not none else "n/a", key="service_uptime_s",
+                help="How long this color's gunicorn master has been running. Workers are recycled on purpose, so this, not a worker's age, is the uptime of the service.") }}
+    {% if mine %}
+    {{ kpi_tile("Workers", num(mine.count) ~ " of " ~ num(mine.expected), key="workers_fresh",
+                status=("bad" if mine.count < mine.expected else ("warn" if mine.stale else "ok")),
+                status_label=("Fewer than expected" if mine.count < mine.expected else ("Stale rows" if mine.stale else "All reporting")),
+                help="Workers of this color with a heartbeat in the last 20 seconds, against ROXY_WORKERS of the worker that answered.") }}
+    {% endif %}
+    {{ kpi_tile("Fleet memory", fmt_bytes(totals.rss_bytes), key="fleet_rss_bytes",
+                help="Resident memory of every fresh worker added up. The server has about 1 GB in all; a worker whose memory climbs while the others stay flat is the one to look at.") }}
+    {{ kpi_tile("Host uptime", duration(fleet.host.uptime_s) if fleet.host and fleet.host.uptime_s is not none else "n/a", key="host_uptime_s",
+                help="How long the server itself has been up (since its last boot).") }}
+    {{ kpi_tile("Since the last deploy", duration(fleet.deploy.since_switch_s) if fleet.deploy and fleet.deploy.since_switch_s is not none else "n/a", key="since_deploy_s",
+                help="Time since the deploy last switched colors (the deployed_version file). n/a on a server that was never deployed by the pipeline.") }}
+    {% if tarpit %}
+    {{ kpi_tile("Tarpit connections", num(tarpit.active_holds) ~ " of " ~ num(tarpit.connection_budget), key="tarpit_connections",
+                status=("warn" if (tarpit.capacity_used_pct or 0) >= 80 else None), status_label=("Near the budget" if (tarpit.capacity_used_pct or 0) >= 80 else None),
+                help="Connections the tarpit holds right now against tarpit_connection_budget, the most it may hold before refusing at once.") }}
+    {% endif %}
+  </div>
+
+  {% for warning in facts.warnings %}{{ inline_alert("warn", "Check the workers", warning) }}{% endfor %}
+
+  <ul class="system-colors" aria-label="Deploy colors">
+    {% for color in facts.colors %}
+    <li class="system-color">
+      <p class="system-color__name"><strong>{{ color.color|capitalize }}</strong>{% if color.is_this_color %} {{ badge("serving you", "info") }}{% endif %}{% if not color.active %} {{ badge("not running", "neutral") }}{% endif %}</p>
+      <p class="system-color__facts">{{ num(color.count) }} of {{ num(color.expected) }} workers fresh{% if color.stale %}, {{ num(color.stale) }} stale{% endif %}.
+        {% if color.master_pids %}Master pid {{ color.master_pids|join(", ") }}.{% endif %}
+        {% if color.service_uptime_s is not none %}Service up {{ duration(color.service_uptime_s) }}.{% endif %}</p>
+    </li>
+    {% endfor %}
+  </ul>
+  <p class="muted system-note">Expected is ROXY_WORKERS of the worker that answered this page, used for both colors.</p>
+
+  <details class="details-plain system-hints">
+    <summary>How to read the workers</summary>
+    <div class="stack">
+      <p>Every {{ term("worker", "worker") }} serving traffic. gunicorn recycles a worker once it has served {{ num(max_requests) if max_requests else "its" }} requests, so their ages differ by design. A worker whose memory climbs while the others stay flat is the one worth looking at.</p>
+      <p><strong>All requests</strong> counts everything a worker served, this dashboard included, because that is what gunicorn counts toward recycling. <strong>Proxy requests</strong> counts only traffic aimed at the proxy. If the first climbs and the second does not, the only thing talking to the server is you: the proxy is idle, not broken.</p>
+      <p>The {{ term("leader", "leader") }} runs the scheduled jobs; a stale row is a worker that stopped or froze, and goes away once the heartbeat table is pruned.</p>
+    </div>
+  </details>
+
+  {{ data_table(**table) }}
+
+  {{ confirm_dialog("dlg-reset-counts", "Zero the request counters for every worker?", action=reset_url, api=True,
+                    consequences=["Zero the request counters on every worker. Uptime and memory are not affected.",
+                                  "Each worker takes the reset at its next heartbeat, within 5 seconds, and the time is kept as Counters reset.",
+                                  "The audit log records who reset the counters and why."],
+                    reason=True, confirm_label="Reset request counts", success="Worker request counts reset",
+                    on_success="refresh", refresh="fleet") }}
+</div>
+{% endcall %}
+{% endif %}

@@ -1,0 +1,11 @@
+{#-
+  A card whose renderer failed (`roxy.admin.pages.kit.render_card`): the card keeps its place, title and settings,
+  and says in plain words what went wrong (a section 13 message, a busy database, or "failed to load"). The rest of
+  the page renders normally (a page never turns into a 500 because one card failed). The section carries
+  `data-card-error`, which the page tests look for. Context: `frame`, `message`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/alert.html" import inline_alert %}
+{% call page_card(frame, error=True) %}
+{{ inline_alert("bad", "This card could not be loaded", message) }}
+{% endcall %}

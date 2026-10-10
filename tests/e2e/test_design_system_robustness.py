@@ -473,6 +473,10 @@ def test_reauth_required_is_signaled_instead_of_reload_advice(
         lambda route: route.fulfill(status=403, content_type="application/json", headers=headers, body=body),
     )
     page.click("#g-server-toast")
+    # P11: the "Confirm it is you" dialog takes the signal over (static/js/reauth.js); canceling it says why
+    # nothing happened, never "reload".
+    page.wait_for_selector("#reauth[open]")
+    page.keyboard.press("Escape")
     page.wait_for_selector("#toasts .toast")
     texts = _toasts(page)
     assert not any("Reload" in text for text in texts), texts
@@ -551,7 +555,7 @@ def test_session_overlay_keeps_other_dialogs_and_ignores_the_palette(
     url = page.url
     page.click(".topbar__pause")
     page.wait_for_selector("#dlg-pause[open]")
-    page.fill("#dlg-pause-reason", "half written reason")
+    page.fill("#dlg-pause-message", "half written message")  # P11: the dialog sends the API's `message`
     page.evaluate("document.dispatchEvent(new CustomEvent('roxy:unauthorized', {detail: {source: 'test'}}))")
     page.wait_for_selector("#session-expired[open]")
     assert page.evaluate("document.getElementById('dlg-pause').open"), "the overlay closed the dialog underneath"
@@ -562,7 +566,7 @@ def test_session_overlay_keeps_other_dialogs_and_ignores_the_palette(
     page.click("[data-session-stay]")
     assert page.evaluate("!document.getElementById('session-expired').open")
     assert page.evaluate("document.getElementById('dlg-pause').open")
-    assert page.input_value("#dlg-pause-reason") == "half written reason"
+    assert page.input_value("#dlg-pause-message") == "half written message"
     page.wait_for_timeout(1200)
     assert page.url == url
 

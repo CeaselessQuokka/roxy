@@ -93,7 +93,21 @@ async def live_rows(
 ) -> dict[str, Any]:
     """The newest matching requests of every worker, newest first (see the module docstring)."""
     query = _query(outcome, reason, status, egress, cache, client, endpoint, q)
-    ctx = get_ctx(request)
+    return await rows_answer(get_ctx(request), query, limit, before)
+
+
+def live_query(**values: str | None) -> read_dashboard.LiveQuery:
+    """A `LiveQuery` from the Live filter's parameters (outcome, reason, status, egress, cache, client, endpoint,
+    q); 422 `validation_failed` naming each bad one, as `GET /live` and the stream answer."""
+    names = ("outcome", "reason", "status", "egress", "cache", "client", "endpoint", "q")
+    return _query(*(values.get(name) for name in names))
+
+
+async def rows_answer(
+    ctx: Any, query: read_dashboard.LiveQuery, limit: int = DEFAULT_LIMIT, before: int | None = None
+) -> dict[str, Any]:
+    """The `GET /live` answer: the newest live rows matching `query` (see the module docstring)."""
+    limit = max(1, min(int(limit), MAX_LIMIT))
     pairs = await ctx.dbs.metrics.read(lambda conn: read_dashboard.recent_live(conn, MAX_SCAN, before))
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -144,7 +158,11 @@ def _policy(ctx: Any) -> CapturePolicy:
 @router.get("/state")
 async def live_state(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """The capture window, counts and caps (v1 `capture.get_state`, row 82) and the live row limits."""
-    ctx = get_ctx(request)
+    return await state_answer(get_ctx(request))
+
+
+async def state_answer(ctx: Any) -> dict[str, Any]:
+    """The `GET /live/state` answer (the Live page's capture card reads the same)."""
     policy = _policy(ctx)
     now = ctx.clock.now()
     state = await ctx.dbs.metrics.read(lambda conn: capture_state(conn, policy, now))
@@ -167,9 +185,20 @@ async def live_detail(
     request_id: Annotated[str, Path(max_length=256)],
 ) -> dict[str, Any]:
     """One request's capture and live row; 404 with v1's expired text once the capture is gone (row 128)."""
+    return await detail_answer(get_ctx(request), request_id)
+
+
+def checked_request_id(request_id: str) -> str:
+    """A request id as the Live routes take it: 1 to 64 letters, digits, '-' or '_' (else a 422)."""
     if not REQUEST_ID_RE.fullmatch(request_id):
         raise validation_error({"request_id": "A request id is 1 to 64 letters, digits, '-' or '_'."})
-    ctx = get_ctx(request)
+    return request_id
+
+
+async def detail_parts(ctx: Any, request_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, int]:
+    """`(capture or None, live row or None, capture window in seconds)` of one checked request id: what
+    `GET /live/{request_id}` answers from, and what the Live page's request drawer shows (which also explains a
+    missing capture instead of failing)."""
     policy = _policy(ctx)
     now = ctx.clock.now()
     now_ms = ctx.clock.now_ms()
@@ -188,16 +217,43 @@ async def live_detail(
             if entry.get("request_id") == request_id:
                 row = entry
                 break
+    return found, row, policy.ttl_s
+
+
+def missing_capture(row: dict[str, Any] | None) -> ApiError:
+    """The 404 for a request without a capture: never captured (`not_captured`, v1's capture-off text) when its
+    live row says so, else expired or evicted (`capture_expired`, v1's exact text; row 128)."""
+    if row is not None and not row.get("capture_id"):
+        return ApiError(404, NOT_CAPTURED_CODE, CAPTURE_OFF_MESSAGE)
+    return ApiError(404, CAPTURE_EXPIRED_CODE, CAPTURE_EXPIRED_MESSAGE)
+
+
+async def detail_answer(ctx: Any, request_id: str) -> dict[str, Any]:
+    """The `GET /live/{request_id}` answer (404 `not_captured` or `capture_expired` without a capture)."""
+    request_id = checked_request_id(request_id)
+    found, row, window_s = await detail_parts(ctx, request_id)
     if found is None:
-        if row is not None and not row.get("capture_id"):
-            raise ApiError(404, NOT_CAPTURED_CODE, CAPTURE_OFF_MESSAGE)
-        raise ApiError(404, CAPTURE_EXPIRED_CODE, CAPTURE_EXPIRED_MESSAGE)
+        raise missing_capture(row)
     return {
         "request_id": request_id,
         "capture": found,
         "live": row,
-        "capture_window_s": policy.ttl_s,
+        "capture_window_s": window_s,
     }
 
 
-__all__ = ["CAPTURE_EXPIRED_CODE", "NOT_CAPTURED_CODE", "router"]
+__all__ = [
+    "CAPTURE_EXPIRED_CODE",
+    "DEFAULT_LIMIT",
+    "MAX_LIMIT",
+    "NOT_CAPTURED_CODE",
+    "REQUEST_ID_RE",
+    "checked_request_id",
+    "detail_answer",
+    "detail_parts",
+    "live_query",
+    "missing_capture",
+    "router",
+    "rows_answer",
+    "state_answer",
+]

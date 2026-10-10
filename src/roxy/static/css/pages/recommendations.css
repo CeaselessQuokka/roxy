@@ -1,0 +1,363 @@
+/*
+ * The Recommendations page (templates/admin/pages/recommendations*): the detail drawer, the preview panel, the
+ * action forms and the rule drawer.
+ *
+ * What this is
+ *   Layout for what the drawer shows: the lead badges, the explanation, the evidence numbers and charts, the diff of
+ *   proposed changes, the preview with its dry run and Apply form, the snooze and dismiss forms, the history, and
+ *   the rule tuning drawer. Tables, cards, badges, diff tables and setting controls come from components.css.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract). The drawer is
+ *   narrow on a desktop and the whole screen on a phone (plan 14.8), so everything here wraps: long values (a rule's
+ *   regex, a JSON row, an endpoint template) may break anywhere and never widen the page. Only tokens are used, so
+ *   both themes follow; states have words and icons besides their color (plan 14.9).
+ * How it works
+ *   Sections are separated by a rule line; buttons keep at least the touch target size on a phone.
+ * What to read next
+ *   static/css/components.css (.diff-table, .kv, .setting, .drawer), static/css/pages/audit.css (the same drawer
+ *   patterns for one audit entry).
+ */
+
+.rec-detail,
+.rec-rule {
+  overflow-wrap: anywhere;
+}
+
+.rec-detail__lead,
+.rec-rule__lead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.rec-detail__rule,
+.rec-rule__id {
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.rec-detail__auto {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  font-size: var(--fs-1);
+}
+
+.rec-detail__title {
+  margin: 0;
+  font-size: var(--fs-4);
+  line-height: var(--lh-tight);
+}
+
+.rec-detail__why {
+  color: var(--text);
+}
+
+.rec-detail__impact {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+}
+
+.rec-detail__impact .icon {
+  flex: none;
+  margin-top: 2px;
+  color: var(--accent);
+}
+
+.rec-detail__times,
+.rec-detail .kv,
+.rec-rule .kv {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.rec-section {
+  display: grid;
+  gap: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.rec-section__title {
+  margin: 0;
+  font-size: var(--fs-3);
+}
+
+.rec-metrics td,
+.rec-metrics th {
+  white-space: normal;
+}
+
+.rec-chart {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.rec-chart__title {
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+}
+
+.rec-chart__line {
+  display: grid;
+  gap: var(--sp-1);
+}
+
+.rec-chart__label {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.rec-chart .spark {
+  width: 100%;
+  height: 48px;
+}
+
+.rec-links {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rec-links a {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: var(--target-min);
+}
+
+.rec-pre {
+  margin: 0;
+  padding: var(--sp-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-1);
+  white-space: pre-wrap;
+}
+
+.rec-diff {
+  table-layout: fixed;
+  width: 100%;
+}
+
+.rec-diff th,
+.rec-diff td {
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+.rec-diff th[scope="row"] {
+  width: 40%;
+}
+
+.rec-diff th[scope="row"] > * {
+  display: block;
+}
+
+.rec-diff__invalid th,
+.rec-diff__invalid td {
+  background: var(--bad-soft);
+}
+
+.rec-actions .rec-act {
+  display: grid;
+  gap: var(--sp-2);
+  justify-items: start;
+}
+
+.rec-why-not {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.rec-why-not .icon {
+  flex: none;
+  margin-top: 2px;
+}
+
+.rec-form {
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.rec-form__title {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  font-weight: var(--fw-semibold);
+}
+
+.rec-form .dialog__consequences {
+  margin: 0;
+}
+
+.rec-snooze {
+  gap: var(--sp-2);
+}
+
+.rec-snooze form {
+  display: inline-flex;
+}
+
+.rec-until .cluster {
+  flex-wrap: wrap;
+}
+
+.rec-until .input {
+  flex: 1 1 14em;
+  min-width: 0;
+}
+
+.rec-preview:empty {
+  display: none;
+}
+
+.rec-preview__body {
+  padding: var(--sp-3);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+}
+
+.rec-preview__title {
+  margin: 0;
+  font-size: var(--fs-3);
+}
+
+.rec-preview__caption {
+  padding-bottom: var(--sp-2);
+  text-align: left;
+  font-weight: var(--fw-semibold);
+}
+
+.rec-windows {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.rec-dryrun {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.rec-dryrun__title {
+  margin: 0;
+  font-size: var(--fs-2);
+}
+
+.rec-dryrun .kv {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.rec-apply {
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.rec-confirm {
+  align-items: flex-start;
+}
+
+.rec-history,
+.rec-mini {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rec-history li,
+.rec-mini__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-2);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.rec-history__what {
+  font-weight: var(--fw-semibold);
+}
+
+.rec-history__summary {
+  flex-basis: 100%;
+}
+
+.rec-mini__open {
+  min-height: var(--target-min);
+  text-align: left;
+}
+
+.rec-rule__help {
+  margin: 0;
+  white-space: pre-line;
+}
+
+.rec-engine {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+/* The engine and dry-run cards hold many settings: side by side on a wide screen instead of one long column. */
+#engine .card-settings__list,
+#preview-settings .card-settings__list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr));
+  align-items: start;
+  gap: var(--sp-3);
+}
+
+/* Rule ids never break in the middle (UP-429-ENDPOINT). */
+#rules td[data-col="id"] .mono,
+#list td[data-col="rule_id"] .mono {
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .rec-detail__times,
+  .rec-detail .kv,
+  .rec-rule .kv,
+  .rec-dryrun .kv,
+  .rec-engine {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .rec-diff th[scope="row"] {
+    width: 34%;
+  }
+
+  .rec-snooze form,
+  .rec-snooze .btn,
+  .rec-act .btn,
+  .rec-apply .btn,
+  .rec-form .btn {
+    flex: 1 1 auto;
+    min-height: var(--target-touch);
+  }
+}

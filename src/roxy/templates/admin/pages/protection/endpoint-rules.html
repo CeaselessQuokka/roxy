@@ -1,0 +1,38 @@
+{#-
+  Protection page, card `endpoint-rules` (`roxy/admin/pages/protection.py endpoint_rules_card`): v1 "Per-Endpoint
+  Rate Rules" (rows 12, 43) and "Rate-Limited Attempts" (rows 17, 75).
+
+  What: two tabs. Rules (`GET /protection/endpoint-rules`): pattern, limit, period, scope, reply, hits; "Add a
+  rule" (`POST /endpoint-rules`); a row opens the rule in the drawer. Attempts (`GET /endpoint-rules/attempts`):
+  each refused path with its attempts, distinct clients, methods, the rule that refused it and the rule that
+  matches it now.
+  Context: `frame`, `tables`, `only`, `per_ip_allowance`; for the drawer `detail`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, reason_field %}
+{% from "admin/pages/protection/_rule_fields.html" import limit_fields %}
+{% if detail %}{% include "admin/pages/protection/_rule_drawer.html" %}
+{% elif only %}{{ data_table(**tables[only]) }}{% else %}
+{% set actions %}<button type="button" class="btn btn--sm btn--primary" data-dialog-open="dlg-prot-erule-add" aria-haspopup="dialog" data-action="endpoint-rule-add">{{ icon("plus") }}<span>Add a rule</span></button>{% endset %}
+{% call page_card(frame, actions=actions, subtitle="Rules are only ever stricter: the per-IP limit still applies.") %}
+{% call tabs("prot-erule-tabs", [("rules", "Rules"), ("attempts", "Attempts")], "Endpoint rule views") %}
+  {% call tab_panel("prot-erule-tabs", "rules", first=True) %}
+    <p class="prot-pad">An {{ term("endpoint-rule", "endpoint rule") }} gives the endpoints its pattern names their own limit; the most specific matching rule applies. A per-IP rule is never more generous than the per-IP allowance ({% if per_ip_allowance is not none %}{{ num(per_ip_allowance) }} requests per window{% else %}the Throttle card's limit{% endif %}).</p>
+    {{ data_table(**tables.rules) }}
+  {% endcall %}
+  {% call tab_panel("prot-erule-tabs", "attempts") %}{{ data_table(**tables.attempts) }}{% endcall %}
+{% endcall %}
+{% call confirm_dialog("dlg-prot-erule-add", "Add an endpoint rule", "/admin/api/v1/protection/endpoint-rules", confirm_label="Add rule",
+                       api=True, success="Endpoint rule added.", on_success="refresh", refresh="endpoint-rules",
+                       consequences=["Requests to the endpoints the pattern names get this limit from now on; over it they get 429.",
+                                     "Bypass addresses skip it. A second rule on the same pattern is refused."]) %}
+  {{ limit_fields("dlg-prot-erule-add") }}
+  {{ reason_field("dlg-prot-erule-add-reason") }}
+{% endcall %}
+{% endcall %}
+{% endif %}

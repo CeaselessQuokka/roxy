@@ -31,7 +31,7 @@ What to read next
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Annotated, Any, Final
 
 from fastapi import Depends, Query, Request
@@ -200,7 +200,8 @@ def revert_info(entry: Mapping[str, Any], history_id: int | None) -> dict[str, A
 # ================================================================================================ routes
 
 
-def _window(ctx: Any, since: str | None, until: str | None) -> tuple[int | None, int | None]:
+def audit_window(ctx: Any, since: str | None, until: str | None) -> tuple[int | None, int | None]:
+    """The `from` and `to` filters as epoch seconds in `ui_timezone` (422 `invalid_range` when unreadable)."""
     tz = str(ctx.settings.get("ui_timezone") or "UTC")
     values: dict[str, int | None] = {"from": None, "to": None}
     problems: dict[str, str] = {}
@@ -215,24 +216,21 @@ def _window(ctx: Any, since: str | None, until: str | None) -> tuple[int | None,
     return values["from"], values["to"]
 
 
-@router.get("", response_model=None)
-async def list_audit(
-    request: Request,
-    admin: AdminSession,
-    tq: Annotated[TableQuery, Depends(table_params(AUDIT_TABLE))],
-    fmt: ExportFormatDep,
-    action: Annotated[str | None, Query(max_length=64)] = None,
-    actor: Annotated[str | None, Query(max_length=80)] = None,
-    target: Annotated[str | None, Query(max_length=MAX_FILTER_CHARS)] = None,
-    from_: Annotated[str | None, Query(alias="from", max_length=common.MAX_TIME_TEXT)] = None,
-    to: Annotated[str | None, Query(max_length=common.MAX_TIME_TEXT)] = None,
-) -> Any:
-    """The audit log as a table (plan 9.7): search, filters, server-side paging and sorting, export."""
-    ctx = get_ctx(request)
-    since, until = _window(ctx, from_, to)
-    filters = {"action": action, "actor": actor, "target": target, "from": since, "to": until}
+_window = audit_window  # the name this module used before the Audit page needed it
 
-    def reader(page: int, size: int) -> Any:
+
+def audit_reader(
+    tq: TableQuery,
+    *,
+    action: str | None,
+    actor: str | None,
+    target: str | None,
+    since: int | None,
+    until: int | None,
+) -> Callable[[int, int], Callable[[Any], tuple[list[dict[str, Any]], int]]]:
+    """`reader(page, size)` -> a control.db read of one page of the filtered log (the table and its export)."""
+
+    def reader(page: int, size: int) -> Callable[[Any], tuple[list[dict[str, Any]], int]]:
         def run(conn: Any) -> tuple[list[dict[str, Any]], int]:
             return read_audit.audit_page(
                 conn,
@@ -250,7 +248,53 @@ async def list_audit(
 
         return run
 
+    return reader
+
+
+def list_items(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The table rows as `GET /audit` answers them: each with its `manage` link and `detail_url`."""
+    return [
+        {**row, "manage": manage_link(row.get("target")), "detail_url": f"{common.API_PREFIX}/audit/{row['id']}"}
+        for row in rows
+    ]
+
+
+async def audit_table(
+    ctx: Any,
+    tq: TableQuery,
+    *,
+    action: str | None = None,
+    actor: str | None = None,
+    target: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+) -> dict[str, Any]:
+    """The `GET /audit` table answer for one page (the API route and the Audit page both call this)."""
+    reader = audit_reader(tq, action=action, actor=actor, target=target, since=since, until=until)
+    rows, total = await ctx.dbs.control.read(reader(tq.page, tq.page_size))
+    answer = common.table_answer(AUDIT_TABLE, tq, list_items(rows), total)
+    answer["filters"] = {"action": action, "actor": actor, "target": target, "from": since, "to": until}
+    return answer
+
+
+@router.get("", response_model=None)
+async def list_audit(
+    request: Request,
+    admin: AdminSession,
+    tq: Annotated[TableQuery, Depends(table_params(AUDIT_TABLE))],
+    fmt: ExportFormatDep,
+    action: Annotated[str | None, Query(max_length=64)] = None,
+    actor: Annotated[str | None, Query(max_length=80)] = None,
+    target: Annotated[str | None, Query(max_length=MAX_FILTER_CHARS)] = None,
+    from_: Annotated[str | None, Query(alias="from", max_length=common.MAX_TIME_TEXT)] = None,
+    to: Annotated[str | None, Query(max_length=common.MAX_TIME_TEXT)] = None,
+) -> Any:
+    """The audit log as a table (plan 9.7): search, filters, server-side paging and sorting, export."""
+    ctx = get_ctx(request)
+    since, until = audit_window(ctx, from_, to)
+    filters = {"action": action, "actor": actor, "target": target, "from": since, "to": until}
     if fmt is not None:
+        reader = audit_reader(tq, action=action, actor=actor, target=target, since=since, until=until)
 
         async def fetch(page: int, size: int) -> tuple[list[dict[str, Any]], int]:
             rows, total = await ctx.dbs.control.read(reader(page, size))
@@ -259,28 +303,24 @@ async def list_audit(
         kept = {name: value for name, value in filters.items() if value is not None}
         # One page at a time: an audit row may carry 4,000 characters of previews (mpjobs-5).
         return await common.export_pages(request, admin, AUDIT_TABLE, fetch, fmt, tq=tq, filters=kept)
-    rows, total = await ctx.dbs.control.read(reader(tq.page, tq.page_size))
-    items = []
-    for row in rows:
-        link = manage_link(row.get("target"))
-        items.append({**row, "manage": link, "detail_url": f"{common.API_PREFIX}/audit/{row['id']}"})
-    answer = common.table_answer(AUDIT_TABLE, tq, items, total)
-    answer["filters"] = filters
-    return answer
+    return await audit_table(ctx, tq, action=action, actor=actor, target=target, since=since, until=until)
+
+
+async def audit_facets(ctx: Any) -> dict[str, Any]:
+    """The actions and actors in the log with their counts (`GET /audit/facets`; the page's filter menus)."""
+    data: dict[str, Any] = await ctx.dbs.control.read(read_audit.audit_facets)
+    return data
 
 
 @router.get("/facets")
 async def facets(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """The actions and actors in the log with their counts (the Audit page's filter menus)."""
-    ctx = get_ctx(request)
-    data: dict[str, Any] = await ctx.dbs.control.read(read_audit.audit_facets)
-    return data
+    return await audit_facets(get_ctx(request))
 
 
-@router.get("/{audit_id}")
-async def get_entry(request: Request, audit_id: common.RowId, _admin: AdminSession) -> dict[str, Any]:
-    """One audit entry with its diff, its revert block and the link to what it changed."""
-    ctx = get_ctx(request)
+async def entry_view(ctx: Any, audit_id: int) -> dict[str, Any] | None:
+    """One audit entry with its diff, its revert block and the link to what it changed (`GET /audit/{id}`), or
+    None when no entry has that id. The API route and the Audit page's entry drawer both call this."""
 
     def read(conn: Any) -> tuple[dict[str, Any] | None, int | None]:
         found = read_audit.audit_entry(conn, audit_id)
@@ -294,7 +334,7 @@ async def get_entry(request: Request, audit_id: common.RowId, _admin: AdminSessi
 
     found, history_id = await ctx.dbs.control.read(read)
     if found is None:
-        raise common.not_found("No audit entry has that id.")
+        return None
     return {
         "entry": found,
         "diff": diff(found.get("before"), found.get("after")),
@@ -305,4 +345,27 @@ async def get_entry(request: Request, audit_id: common.RowId, _admin: AdminSessi
     }
 
 
-__all__ = ["AUDIT_TABLE", "MANAGE_PAGES", "diff", "manage_link", "revert_info", "router", "target_kind"]
+@router.get("/{audit_id}")
+async def get_entry(request: Request, audit_id: common.RowId, _admin: AdminSession) -> dict[str, Any]:
+    """One audit entry with its diff, its revert block and the link to what it changed."""
+    view = await entry_view(get_ctx(request), audit_id)
+    if view is None:
+        raise common.not_found("No audit entry has that id.")
+    return view
+
+
+__all__ = [
+    "AUDIT_TABLE",
+    "MANAGE_PAGES",
+    "audit_facets",
+    "audit_reader",
+    "audit_table",
+    "audit_window",
+    "diff",
+    "entry_view",
+    "list_items",
+    "manage_link",
+    "revert_info",
+    "router",
+    "target_kind",
+]

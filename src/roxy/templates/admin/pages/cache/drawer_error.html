@@ -1,0 +1,10 @@
+{#-
+  Cache page drawer error: what a drawer shows when its details cannot be loaded (an entry evicted since the list
+  was drawn, a rule removed, a malformed link, a busy database). The message is the API's own section 13 message
+  (plain text); the drawer never answers a 500. Context: `error`.
+-#}
+{% from "components/alert.html" import inline_alert %}
+<div class="cache-drawer" data-card-error>
+  {{ inline_alert("bad", "These details could not be loaded", error) }}
+  <p class="muted">Close the details and open them again from the list, which may have changed since it was drawn.</p>
+</div>

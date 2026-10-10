@@ -1,0 +1,338 @@
+/*
+ * The Overview page (templates/admin/pages/overview*): the status strip, the top recommendations, the outcome
+ * shares and the two top-ten tables.
+ *
+ * What this is
+ *   Layout for the Overview's own pieces. Tiles, charts, the events table and the cards themselves come from
+ *   components.css; this file only places what the Overview adds.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract). Only tokens
+ *   from tokens.css are used, so both themes follow, and every state has words and an icon besides its color
+ *   (plan 14.9).
+ * How it works
+ *   The status strip is a grid of items that wraps (six across on a wide screen, one per row on a phone). The
+ *   top-ten tables turn into labeled blocks below 640 px (each value with its column name, from `data-label`), so a
+ *   phone never scrolls sideways (plan 14.8). Share bars are native <meter> elements styled with the tokens.
+ * What to read next
+ *   static/css/components.css (.kpi, .badge, .card), templates/admin/pages/overview/*.html.
+ */
+
+/* ---------------------------------------------------------------------------------------------- page header */
+.ov-health {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* ---------------------------------------------------------------------------------------------- status strip */
+.ov-status {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: var(--sp-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ov-status__item {
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: var(--sp-1);
+  padding: var(--sp-3) var(--sp-3) var(--sp-3) calc(var(--sp-3) + 3px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.ov-status__item::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 3px;
+  border-radius: var(--radius) 0 0 var(--radius);
+  background: var(--border-strong);
+}
+
+.ov-status__item--ok::before { background: var(--ok); }
+.ov-status__item--warn::before { background: var(--warn); }
+.ov-status__item--bad::before { background: var(--bad); }
+.ov-status__item--info::before { background: var(--info); }
+
+.ov-status__label {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ov-status__state .badge {
+  max-width: 100%;
+}
+
+.ov-status__detail {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  overflow-wrap: anywhere;
+}
+
+.ov-status__link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-min);
+  font-size: var(--fs-1);
+}
+
+/* ---------------------------------------------------------------------------------------------- recommendations */
+.ov-recs {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--sp-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ov-rec {
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-3) var(--sp-3) calc(var(--sp-3) + 3px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  overflow-wrap: anywhere;
+}
+
+.ov-rec::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 3px;
+  border-radius: var(--radius) 0 0 var(--radius);
+  background: var(--info);
+}
+
+.ov-rec--bad::before { background: var(--bad); }
+.ov-rec--warn::before { background: var(--warn); }
+
+.ov-rec__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-1);
+}
+
+.ov-rec__rule {
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  color: var(--text-muted);
+}
+
+.ov-rec__age {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.ov-rec__title {
+  margin: 0;
+  font-weight: var(--fw-semibold);
+}
+
+.ov-rec__title a {
+  display: inline-block;
+  min-height: var(--target-min);
+}
+
+.ov-rec__impact,
+.ov-rec__meta {
+  margin: 0;
+  font-size: var(--fs-1);
+}
+
+/* ---------------------------------------------------------------------------------------------- tiles */
+.ov-kpis .kpi__baseline,
+.ov-visitors .kpi__baseline {
+  flex-basis: 100%;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------------------------------------- outcomes */
+.ov-outcomes {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-2);
+}
+
+.ov-outcomes th,
+.ov-outcomes td {
+  padding: var(--sp-2) var(--sp-2);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.ov-outcomes thead th {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+}
+
+.ov-outcomes .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ov-outcomes__share {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.ov-outcomes__pct {
+  min-width: 3.5em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ov-meter {
+  flex: 1 1 auto;
+  min-width: 48px;
+  height: 10px;
+}
+
+/* Each outcome's bar in its series color (the words and the percent beside it carry the meaning). */
+.ov-meter::-webkit-meter-bar {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+}
+
+.ov-meter::-webkit-meter-optimum-value {
+  border-radius: var(--radius-pill);
+  background: var(--series-1);
+}
+
+.ov-meter::-moz-meter-bar {
+  border-radius: var(--radius-pill);
+  background: var(--series-1);
+}
+
+.ov-meter--served_cache::-webkit-meter-optimum-value { background: var(--series-3); }
+.ov-meter--served_cache::-moz-meter-bar { background: var(--series-3); }
+.ov-meter--refused::-webkit-meter-optimum-value { background: var(--series-4); }
+.ov-meter--refused::-moz-meter-bar { background: var(--series-4); }
+.ov-meter--failed::-webkit-meter-optimum-value { background: var(--bad); }
+.ov-meter--failed::-moz-meter-bar { background: var(--bad); }
+
+.ov-note {
+  margin-top: var(--sp-3);
+  font-size: var(--fs-1);
+}
+
+/* ---------------------------------------------------------------------------------------------- top tens */
+.ov-top {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-2);
+}
+
+.ov-top th,
+.ov-top td {
+  padding: var(--sp-2);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.ov-top thead th {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+  white-space: nowrap;
+}
+
+.ov-top .num {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.ov-top__key {
+  min-width: 18ch;
+  max-width: 34ch;
+  font-family: var(--font-mono);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-regular);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .ov-top-wrap {
+    overflow: visible;
+  }
+
+  .ov-top,
+  .ov-top tbody,
+  .ov-top tr,
+  .ov-top th,
+  .ov-top td {
+    display: block;
+  }
+
+  .ov-top thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .ov-top tr {
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .ov-top th,
+  .ov-top td {
+    padding: 2px 0;
+    border: 0;
+  }
+
+  .ov-top__key {
+    min-width: 0;
+    max-width: none;
+  }
+
+  .ov-top td {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--sp-3);
+    text-align: right;
+  }
+
+  .ov-top td::before {
+    content: attr(data-label);
+    color: var(--text-muted);
+    font-size: var(--fs-1);
+    text-align: left;
+  }
+
+  .ov-status {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ov-recs {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

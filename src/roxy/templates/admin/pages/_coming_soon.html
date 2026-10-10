@@ -1,0 +1,22 @@
+{#-
+  A registered page whose module is not built yet (`roxy.admin.pages.core.render_coming_soon`): the full shell
+  (navigation, top bar, dialogs) with a plain body that says what the page will hold, so every link works from
+  the start. Context: everything base.html takes, plus `coming_cards` (the page's registry cards).
+-#}
+{% extends "admin/base.html" %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/card.html" import card %}
+{% block content %}
+<div class="stack-lg" data-coming-soon>
+  {% call card(None) %}
+  {{ empty_state("This page is coming soon", "It is being built now. Everything else in the dashboard works; the top bar, the search and the menu are all here.", icon_name="clock", tone="info") }}
+  {% endcall %}
+  {% if coming_cards %}
+  {% call card("What this page will show", id="coming", level=2) %}
+  <ul class="coming-list">
+    {% for item in coming_cards %}<li><strong>{{ item.title }}</strong>{% if item.help %}<span class="muted"> {{ item.help }}</span>{% endif %}</li>{% endfor %}
+  </ul>
+  {% endcall %}
+  {% endif %}
+</div>
+{% endblock %}

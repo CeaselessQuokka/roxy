@@ -1,0 +1,27 @@
+{#-
+  Health, card `checks` (`roxy/admin/pages/health.py checks_card`): the catalog of plan 13.2 (every check, what it
+  measures, how it is judged, and where its fix is). Read from `checks_catalog`, the Health API's own function.
+  On a phone each check is a block with its parts labeled (health.css), so the page never scrolls sideways.
+  Context: `frame`, `items`, `hosts`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import local_href %}
+{% from "components/badges.html" import badge %}
+{% call page_card(frame, subtitle=items|length ~ " checks; the reachability check runs once for each of the " ~ hosts ~ " allowed Roblox hosts.") %}
+<div class="table-scroll hl-catalog-wrap" role="region" aria-labelledby="hl-catalog-caption" tabindex="0">
+<table class="hl-catalog">
+  <caption id="hl-catalog-caption" class="sr-only">Every health check, what it measures and how it is judged</caption>
+  <thead><tr><th scope="col">Check</th><th scope="col">Measures</th><th scope="col">Pass, warn and fail</th><th scope="col">Fix</th></tr></thead>
+  <tbody>
+    {% for item in items %}
+    <tr data-check-id="{{ item.id }}">
+      <th scope="row"><span class="hl-catalog__title">{{ item.title }}</span><code class="hl-catalog__id">{{ item.id }}</code>{% if item.uses_credential %}{{ badge("Calls the account", "warn", "key") }}{% endif %}</th>
+      <td data-label="Measures">{{ item.measures }}</td>
+      <td data-label="Judged by">{{ item.thresholds }}</td>
+      <td data-label="Fix">{% set href = local_href(item.fix_link) if item.fix_link else "" %}{% if href %}<a href="{{ href }}">{{ item.fix_label or "How to fix" }}</a>{% else %}<span class="muted">{{ item.fix_label or "n/a" }}</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endcall %}

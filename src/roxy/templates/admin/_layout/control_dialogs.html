@@ -1,65 +1,92 @@
 {#-
   The two global service controls from the top bar, banners, bottom sheet and palette: Pause (parity rows 42, 114)
   and the Emergency Limit, which is throttle-all (rows 49, 115). Each opens a confirm dialog that says in plain
-  words what will happen, takes the caller-facing message (v1 kept one for each) and a reason for the audit log.
+  words what will happen and takes the caller-facing message (v1 kept one for each).
 
-  Posts (form fields, with the X-CSRF-Token header from htmx):
-    urls.pause         paused=1|0, message, reason
-    urls.throttle_all  enabled=1|0, limit, period, message, reason
-  A successful answer should send `HX-Refresh: true` (the banners and buttons change everywhere) or a toast.
-  Context: `status`, `urls`. An empty message sends the live `pause_message_default` setting, for a pause and for
+  Both dialogs send JSON to the admin API (static/js/api_forms.js, `confirm_dialog(..., api=True)`):
+    urls.pause         POST /admin/api/v1/protection/pause         {paused, message}
+    urls.throttle_all  POST /admin/api/v1/protection/throttle-all  {enabled, limit, period, message, reason,
+                                                                    confirm_high_risk}
+  so the API's own checks apply (a dash in a message is a 422 shown under the field, a high-risk limit asks for the
+  confirmation, the change is audited), and the page reloads on success (the banners and buttons change). The
+  limit and period fields are the settings `global_throttle_limit` and `global_throttle_period` (their top bar
+  home, plan 15.6), so they carry `data-setting-key`.
+  Context: `status`, `urls`, and `dialog_settings` (the inline settings of the dialogs, built by
+  `roxy.admin.pages.shell`). An empty message sends the live `pause_message_default` setting, for a pause and for
   the emergency limit alike (v1 used one downtime text for both). Both message fields name it from
-  `status.pause_default` (built by `roxy.admin.gallery.caller_texts`, see admin/_layout/banners.html); plan 15.6
-  makes this dialog the setting's home, and the template keeps no copy of its text (plan P3), so without the key
-  the hint names the setting instead of quoting it.
+  `status.pause_default` (built by `roxy.admin.pages.texts.caller_texts`, see admin/_layout/banners.html); plan
+  15.6 makes the pause dialog the setting's home, so the dialog also holds its inline editor (`dialog_settings.
+  pause`), and the template keeps no copy of its text (plan P3): without the key the hint names the setting
+  instead of quoting it.
 -#}
+{% from "components/icon.html" import icon %}
 {% from "components/dialog.html" import confirm_dialog %}
+{% from "components/page_card.html" import inline_setting %}
 {% set st = status if status is defined and status else {} %}
 {% set u = urls if urls is defined and urls else {} %}
+{% set ds = dialog_settings if dialog_settings is defined and dialog_settings else {} %}
+
+{% set pause_appendix %}
+{% if ds.pause %}
+<details class="dialog__extra">
+  <summary>{{ icon("sliders") }}<span>Change the default message</span></summary>
+  <p class="field__hint">The text callers get when a pause or the emergency limit has no message of its own. It is a setting: saving it applies at once and is audited.</p>
+  {% for entry in ds.pause %}{{ inline_setting(entry) }}{% endfor %}
+</details>
+{% endif %}
+{% endset %}
+
 {% if st.paused %}
-{{ confirm_dialog("dlg-pause", "Resume the proxy?", u.pause or "/admin/api/v1/proxy/pause", confirm_label="Resume proxy",
+{{ confirm_dialog("dlg-pause", "Resume the proxy?", u.pause or "/admin/api/v1/protection/pause", confirm_label="Resume proxy",
                   consequences=["Proxy requests are answered normally again, from the cache or from Roblox.",
                                 "The pause banner disappears on every open dashboard within a few seconds."],
-                  reason=True, hidden={"paused": "0"}) }}
+                  hidden={"paused": "false"}, hidden_types={"paused": "bool"}, api=True, success="The proxy is running again.",
+                  on_success="reload", appendix=pause_appendix|trim) }}
 {% else %}
-{% call confirm_dialog("dlg-pause", "Pause the proxy?", u.pause or "/admin/api/v1/proxy/pause", confirm_label="Pause proxy",
-                       danger=True, reason=True, hidden={"paused": "1"},
+{% call confirm_dialog("dlg-pause", "Pause the proxy?", u.pause or "/admin/api/v1/protection/pause", confirm_label="Pause proxy",
+                       danger=True, hidden={"paused": "true"}, hidden_types={"paused": "bool"}, api=True,
+                       success="The proxy is paused.", on_success="reload", appendix=pause_appendix|trim,
                        consequences=["Every proxy request is refused with 503 Service Unavailable and the message below, until you resume.",
                                      "Cached answers are not served while paused, and nothing is sent to Roblox for callers.",
                                      "The dashboard, the health check and Roxy's own probes keep working."]) %}
   <div class="field">
     <label class="field__label" for="dlg-pause-message">Message shown to callers <span class="muted">(optional)</span></label>
-    <input class="input" id="dlg-pause-message" name="message" maxlength="300" value="{{ st.pause_reason or '' }}"{% if st.pause_default %} placeholder="{{ st.pause_default }}"{% endif %} aria-describedby="dlg-pause-message-hint">
+    <input class="input" id="dlg-pause-message" name="message" maxlength="300" value="{{ st.pause_reason or '' }}"{% if st.pause_default %} placeholder="{{ st.pause_default }}"{% endif %} aria-describedby="dlg-pause-message-hint" data-json="string">
     <p class="field__hint" id="dlg-pause-message-hint">Leave it empty to send the default pause message{% if st.pause_default %}: <q>{{ st.pause_default }}</q>{% endif %}.</p>
   </div>
 {% endcall %}
 {% endif %}
 
 {% if st.throttle_all %}
-{{ confirm_dialog("dlg-throttle-all", "Turn off the emergency limit?", u.throttle_all or "/admin/api/v1/proxy/throttle-all",
-                  confirm_label="Turn it off", reason=True, hidden={"enabled": "0"},
+{{ confirm_dialog("dlg-throttle-all", "Turn off the emergency limit?", u.throttle_all or "/admin/api/v1/protection/throttle-all",
+                  confirm_label="Turn it off", reason=True, hidden={"enabled": "false"}, hidden_types={"enabled": "bool"},
+                  api=True, success="The emergency limit is off.", on_success="reload",
                   consequences=["Callers go back to the normal per-IP limits.",
                                 "The count of refused requests stays in the history; the banner disappears."]) }}
 {% else %}
-{% call confirm_dialog("dlg-throttle-all", "Turn on the emergency limit?", u.throttle_all or "/admin/api/v1/proxy/throttle-all",
-                       confirm_label="Turn on the limit", danger=True, reason=True, hidden={"enabled": "1"},
+{% call confirm_dialog("dlg-throttle-all", "Turn on the emergency limit?", u.throttle_all or "/admin/api/v1/protection/throttle-all",
+                       confirm_label="Turn on the limit", danger=True, reason=True, hidden={"enabled": "true"},
+                       hidden_types={"enabled": "bool"}, api=True, success="The emergency limit is on.", on_success="reload",
                        consequences=["Every IP may make at most the number of requests below per period; the rest get 429 with the message.",
                                      "A softer alternative to pausing: allowed requests are still answered.",
                                      "Per-IP and per-endpoint limits still apply; bypass IPs are not limited."]) %}
   <div class="field-row">
-    <div class="field">
+    <div class="field" data-setting-key="global_throttle_limit">
       <label class="field__label" for="dlg-limit-limit">Requests per IP</label>
-      <input class="input input--num" id="dlg-limit-limit" name="limit" inputmode="numeric" value="{{ st.throttle_limit or 1 }}" required aria-required="true">
+      <input class="input input--num" id="dlg-limit-limit" name="limit" inputmode="numeric" value="{{ st.throttle_limit or 1 }}" required aria-required="true" data-json="int" aria-describedby="dlg-limit-limit-error">
+      <p class="field__error" id="dlg-limit-limit-error" data-field-error="limit" hidden></p>
     </div>
-    <div class="field">
+    <div class="field" data-setting-key="global_throttle_period">
       <label class="field__label" for="dlg-limit-period">Per (seconds)</label>
-      <input class="input input--num" id="dlg-limit-period" name="period" inputmode="numeric" value="{{ st.throttle_period or 60 }}" required aria-required="true">
+      <input class="input input--num" id="dlg-limit-period" name="period" inputmode="numeric" value="{{ st.throttle_period or 60 }}" required aria-required="true" data-json="int" aria-describedby="dlg-limit-period-error">
+      <p class="field__error" id="dlg-limit-period-error" data-field-error="period" hidden></p>
     </div>
   </div>
   <div class="field">
     <label class="field__label" for="dlg-limit-message">Message shown to callers <span class="muted">(optional)</span></label>
-    <input class="input" id="dlg-limit-message" name="message" maxlength="300" value="{{ st.throttle_reason or '' }}"{% if st.pause_default %} placeholder="{{ st.pause_default }}"{% endif %} aria-describedby="dlg-limit-message-hint">
+    <input class="input" id="dlg-limit-message" name="message" maxlength="300" value="{{ st.throttle_reason or '' }}"{% if st.pause_default %} placeholder="{{ st.pause_default }}"{% endif %} aria-describedby="dlg-limit-message-hint" data-json="string">
     <p class="field__hint" id="dlg-limit-message-hint">Leave it empty to send the default pause message{% if st.pause_default %}: <q>{{ st.pause_default }}</q>{% endif %}.</p>
   </div>
+  <label class="check" data-confirm-field hidden><input type="checkbox" name="confirm_high_risk" value="1" data-json="bool"><span>I understand: this limit is high risk</span></label>
 {% endcall %}
 {% endif %}

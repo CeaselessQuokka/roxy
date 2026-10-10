@@ -1,0 +1,37 @@
+{#-
+  Protection page, card `endpoint-blocks` (`roxy/admin/pages/protection.py endpoint_blocks_card`): v1 "Blocked
+  Endpoints" (rows 12, 46) and "Blocked Endpoint Attempts" (rows 16, 75).
+
+  What: two tabs. Blocks (`GET /protection/endpoint-blocks`): pattern, type, reply, hits, added; "Block an
+  endpoint" (`POST /endpoint-blocks`); a row opens the block in the drawer (edit, switch off, remove). Attempts
+  (`GET /endpoint-blocks/attempts`): each blocked path asked for in the range, attempts, distinct clients, methods,
+  the block that refused it ("Refused by") and the block that matches it now.
+  Context: `frame`, `tables`, `only`; for the drawer `detail`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, reason_field %}
+{% from "admin/pages/protection/_rule_fields.html" import block_fields %}
+{% if detail %}{% include "admin/pages/protection/_rule_drawer.html" %}
+{% elif only %}{{ data_table(**tables[only]) }}{% else %}
+{% set actions %}<button type="button" class="btn btn--sm btn--warn" data-dialog-open="dlg-prot-block-add" aria-haspopup="dialog" data-action="block-add">{{ icon("plus") }}<span>Block an endpoint</span></button>{% endset %}
+{% call page_card(frame, actions=actions, subtitle="A block refuses every caller with 403; the attempts show who still asks.") %}
+{% call tabs("prot-block-tabs", [("blocks", "Blocks"), ("attempts", "Attempts")], "Endpoint block views") %}
+  {% call tab_panel("prot-block-tabs", "blocks", first=True) %}
+    <p class="prot-pad">An {{ term("endpoint-block", "endpoint block") }} names a full path (games.roblox.com/v1/games), a whole host (games.roblox.com), or uses * for one segment; everything under the pattern is blocked too. Regex is the full-power form.</p>
+    {{ data_table(**tables.blocks) }}
+  {% endcall %}
+  {% call tab_panel("prot-block-tabs", "attempts") %}{{ data_table(**tables.attempts) }}{% endcall %}
+{% endcall %}
+{% call confirm_dialog("dlg-prot-block-add", "Block an endpoint", "/admin/api/v1/protection/endpoint-blocks", confirm_label="Block",
+                       api=True, danger=True, success="Endpoint blocked.", on_success="refresh", refresh="endpoint-blocks",
+                       consequences=["Every request to the endpoints the pattern names is refused with 403 for every caller, bypass addresses included.",
+                                     "Callers get the reply below, or the default text."]) %}
+  {{ block_fields("dlg-prot-block-add") }}
+  {{ reason_field("dlg-prot-block-add-reason") }}
+{% endcall %}
+{% endcall %}
+{% endif %}

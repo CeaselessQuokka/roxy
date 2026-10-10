@@ -1,0 +1,13 @@
+{#-
+  Health, card `history` (`roxy/admin/pages/health.py history_card`): every run (plan 13.1 "runs are stored, listed
+  with filters"), the page's main table (its filters, sort and page are kept in the address bar).
+
+  Filters by trigger and by the worst result; the top bar's range filters by when a run started ("All" shows every
+  run). A run's number opens it in the Run card (`?run=<id>`), where it can be compared and exported. Export downloads
+  through `GET /admin/api/v1/health/runs` (audited). Context: `frame`, `table`, `whole`, `range_label`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% call page_card(frame, flush=True, subtitle=("Every run" if whole else "Runs started in: " ~ range_label)) %}
+{{ data_table(**table) }}
+{% endcall %}

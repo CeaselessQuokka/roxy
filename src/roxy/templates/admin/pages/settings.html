@@ -1,0 +1,60 @@
+{#-
+  The Settings page (`roxy/admin/pages/settings.py`): the catalog editor, the change history, import and export, and
+  the alert and public site settings.
+
+  The editor comes first and is the page's main content; the history loads as it scrolls into view. The batch review
+  dialog lives here, outside the cards, so a refreshed card never replaces it: static/js/pages/settings.js fills it
+  from `POST /admin/api/v1/settings/preview` (every value as text, built with the DOM, never from HTML) and saves the
+  batch with `PATCH /admin/api/v1/settings`.
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="/admin/api/v1/settings/export" data-export download>{{ icon("download") }}<span>Export my changes</span></a>
+<a class="btn btn--ghost" href="#history">{{ icon("history") }}<span>Change history</span></a>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>These values are what the server's internals are using right now. Each setting shows its default, its range, a risk badge and "What happens if I change this?"; Review shows the change before it is saved. Settings of admin security and the credential ask for a current code from your authenticator app first.</p>
+<p>Change several settings, then Review all changes at the bottom of the list to save them together with one reason. Only the settings you changed are sent. Most settings also sit next to their feature on another page (Also on); it is the same setting there.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["editor"] }}
+{{ cards["history"] }}
+{{ cards["import-export"] }}
+<div class="grid grid--2 settings-pair">{{ cards["alerts"] }}{{ cards["public-site"] }}</div>
+
+<dialog class="dialog settings-batch-dialog" id="settings-batch-dialog" aria-labelledby="settings-batch-title" aria-describedby="settings-batch-desc">
+  <form class="dialog__form" data-batch-form novalidate>
+    <header class="dialog__head">
+      <h2 class="dialog__title" id="settings-batch-title">Review your changes</h2>
+      <button type="button" class="icon-btn" data-dialog-close aria-label="Close">{{ icon("x") }}</button>
+    </header>
+    <div class="dialog__body">
+      <p id="settings-batch-desc">Only the settings below are sent; every other setting stays as it is. They apply to every worker within a second and go in the audit log with your reason.</p>
+      <div class="table-scroll" role="region" aria-label="The changes to save" tabindex="0">
+        <table class="simple-table settings-batch__table">
+          <thead><tr><th scope="col">Setting</th><th scope="col">Now</th><th scope="col">After saving</th><th scope="col">What happens</th></tr></thead>
+          <tbody data-batch-rows></tbody>
+        </table>
+      </div>
+      <ul class="settings-batch__problems" data-batch-problems hidden></ul>
+      <p class="setting__mfa" data-batch-mfa hidden>{{ icon("lock") }}<span data-batch-mfa-text></span></p>
+      <div class="field">
+        <label class="field__label" for="settings-batch-reason">Reason <span class="muted" data-batch-reason-hint>(optional, saved in the audit log)</span></label>
+        <textarea class="input" id="settings-batch-reason" rows="2" maxlength="500" aria-describedby="settings-batch-reason-error" data-batch-reason></textarea>
+        <p class="field__error" id="settings-batch-reason-error" data-batch-reason-error hidden></p>
+      </div>
+      <label class="check" data-batch-confirm hidden><input type="checkbox" data-batch-confirm-box><span>I understand the high risk of these changes</span></label>
+      <p class="dialog__error" data-batch-error role="alert" hidden></p>
+    </div>
+    <footer class="dialog__foot">
+      <button type="button" class="btn btn--ghost" data-dialog-close>Cancel</button>
+      <button type="submit" class="btn btn--primary" data-batch-save data-action="settings-save-all">Save the changes</button>
+    </footer>
+  </form>
+</dialog>
+{% endblock %}

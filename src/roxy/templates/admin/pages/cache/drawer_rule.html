@@ -1,0 +1,84 @@
+{#-
+  Cache page drawer: one cache rule (`GET /admin/cache/drawer/rule?id=`, `roxy/admin/pages/cache.py rule_drawer`).
+
+  The rule (`cache.rule_view`, the same typed row the API answers) as an edit form that PATCHes
+  `/admin/api/v1/cache/rules/{id}` (every field sent; unchanged ones change nothing; by default the answers stored
+  under the rule, and under a new pattern, are purged) and "Remove this rule" (the shared remove dialog, DELETE).
+  The audit history link lists every change of the rule. Pattern and note are text a person chose: text only, and
+  values of our own form fields.
+  Context: `rule`, `rule_url`, `created`, `updated`, `history_href`, `flags_text`.
+-#}
+{% from "components/format.html" import caller_text, local_href %}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import badge %}
+{% set rid = rule.id %}
+<div class="cache-drawer stack">
+  <p class="cluster">{{ badge("Rule #" ~ rid, "neutral") }} {{ badge("added by " ~ (rule.origin or "admin"), "neutral") }}{% if not rule.enabled %} {{ badge("off", "warn") }}{% endif %}</p>
+  <dl class="kv cache-drawer__facts">
+    <dt>Added</dt><dd>{% if created %}<time datetime="{{ created.datetime }}">{{ created.text }}</time>{% if rule.created_by %} <span class="muted">by {{ caller_text(rule.created_by, 80) }}</span>{% endif %}{% else %}<span class="muted">n/a</span>{% endif %}</dd>
+    <dt>Changed</dt><dd>{% if updated %}<time datetime="{{ updated.datetime }}">{{ updated.text }}</time>{% else %}<span class="muted">never</span>{% endif %}</dd>
+  </dl>
+  <form class="stack cache-form" data-api-form data-api-url="{{ rule_url }}" data-api-method="PATCH"
+        data-success="Rule saved; the answers stored under it were dropped so the change applies at once." data-on-success="refresh" data-refresh="rules browser endpoints" novalidate>
+    <div class="field">
+      <label class="field__label" for="cache-rule-{{ rid }}-pattern">Endpoint pattern</label>
+      <input class="input mono" id="cache-rule-{{ rid }}-pattern" name="pattern" value="{{ rule.pattern }}" maxlength="1000" required data-json="string" aria-describedby="cache-rule-{{ rid }}-pattern-error">
+      <p class="field__error" id="cache-rule-{{ rid }}-pattern-error" data-field-error="pattern" hidden></p>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label class="field__label" for="cache-rule-{{ rid }}-type">Pattern type</label>
+        <select class="input" id="cache-rule-{{ rid }}-type" name="type" data-json="string">
+          <option value="glob"{% if rule.type != "regex" %} selected{% endif %}>Wildcard</option>
+          <option value="regex"{% if rule.type == "regex" %} selected{% endif %}>Regex</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="field__label" for="cache-rule-{{ rid }}-ttl">Keep answers for (seconds)</label>
+        <input class="input input--num" id="cache-rule-{{ rid }}-ttl" name="ttl" inputmode="numeric" value="{{ rule.ttl }}" data-json="int" aria-describedby="cache-rule-{{ rid }}-ttl-error">
+        <p class="field__error" id="cache-rule-{{ rid }}-ttl-error" data-field-error="ttl" hidden></p>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label class="field__label" for="cache-rule-{{ rid }}-stale">Revalidate window (seconds)</label>
+        <input class="input input--num" id="cache-rule-{{ rid }}-stale" name="stale_ttl" inputmode="numeric" value="{{ rule.stale_ttl or 0 }}" data-json="int" aria-describedby="cache-rule-{{ rid }}-stale-error">
+        <p class="field__error" id="cache-rule-{{ rid }}-stale-error" data-field-error="stale_ttl" hidden></p>
+      </div>
+      <div class="field">
+        <label class="field__label" for="cache-rule-{{ rid }}-negative">Keep refusals for (seconds)</label>
+        <input class="input input--num" id="cache-rule-{{ rid }}-negative" name="negative_ttl" inputmode="numeric" value="{{ rule.negative_ttl or 0 }}" data-json="int" aria-describedby="cache-rule-{{ rid }}-negative-error">
+        <p class="field__error" id="cache-rule-{{ rid }}-negative-error" data-field-error="negative_ttl" hidden></p>
+      </div>
+    </div>
+    <div class="field">
+      <label class="field__label" for="cache-rule-{{ rid }}-methods">Methods</label>
+      <select class="input" id="cache-rule-{{ rid }}-methods" name="methods" data-json="list">
+        <option value="GET"{% if "POST" not in (rule.methods or []) %} selected{% endif %}>GET only</option>
+        <option value="GET&#10;POST"{% if "POST" in (rule.methods or []) %} selected{% endif %}>GET and POST</option>
+      </select>
+    </div>
+    <div class="field">
+      <label class="field__label" for="cache-rule-{{ rid }}-flags">Normalization <span class="muted">(one per line)</span></label>
+      <textarea class="input mono" id="cache-rule-{{ rid }}-flags" name="normalize_flags" rows="2" data-json="list">{{ flags_text }}</textarea>
+    </div>
+    <div class="field">
+      <label class="field__label" for="cache-rule-{{ rid }}-note">Note <span class="muted">(private)</span></label>
+      <input class="input" id="cache-rule-{{ rid }}-note" name="note" value="{{ rule.note or '' }}" maxlength="500" data-json="string">
+    </div>
+    <label class="check"><input type="checkbox" name="enabled" data-json="bool"{% if rule.enabled %} checked{% endif %}><span>The rule is in force</span></label>
+    <label class="check"><input type="checkbox" name="purge" data-json="bool" checked><span>Drop the answers stored under it, so the change applies at once</span></label>
+    <div class="field">
+      <label class="field__label" for="cache-rule-{{ rid }}-reason">Reason <span class="muted">(optional, saved in the audit log)</span></label>
+      <textarea class="input" id="cache-rule-{{ rid }}-reason" name="reason" rows="2" maxlength="500"></textarea>
+    </div>
+    <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    <div class="cluster">
+      <button type="submit" class="btn btn--primary btn--sm" data-action="cache-rule-save">{{ icon("check") }}<span>Save the rule</span></button>
+      <button type="button" class="btn btn--sm btn--bad-soft" data-dialog-open="dlg-cache-rule-delete" data-action="cache-rule-delete"
+              data-fill='{{ {"_url": rule_url, "_label": "#" ~ rid ~ " " ~ rule.pattern}|tojson }}'>{{ icon("x-circle") }}<span>Remove this rule</span></button>
+    </div>
+  </form>
+  {% set history = local_href(history_href) %}
+  {% if history %}<p><a href="{{ history }}">{{ icon("history") }} Every change of this rule in the audit log</a></p>{% endif %}
+</div>

@@ -1,0 +1,29 @@
+{#-
+  The Clients page (`roxy/admin/pages/clients.py`): places first (the view that follows a game across its many
+  server addresses), then addresses, then the lookup and the activity records side by side, then the bot score.
+  A table row opens the client in the drawer (`/admin/clients/client?kind=&key=`); the drawer links to the client's
+  own page. `?lookup=<place id>` fills the lookup form (links from elsewhere).
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="/admin/protection">{{ icon("shield") }}<span>Protection</span></a>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>Places are usually the view you want: a Roblox game reaches Roxy from hundreds of rotating server addresses, so the same caller is one row under Places and a hundred rows under IP addresses. Use the addresses for anything that is not a game: scripts, scrapers, your own testing.</p>
+<p>A {{ term("place") }} id is self-reported (the Roblox-Id header), so treat it as evidence rather than proof; it is still the one identifier that stays the same while a game's servers come and go, which makes it the one worth writing a rule against. Rates are requests per minute: Rate1 is the last minute, the number an incident is judged on. Place ids, endpoints and User-Agents are text callers sent; they are shown as plain text.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["places"] }}
+{{ cards["ips"] }}
+<div class="grid grid--2 clients-pair">
+  {{ cards["lookup"] }}
+  {{ cards["activity"] }}
+</div>
+{{ cards["client-score"] }}
+{% endblock %}

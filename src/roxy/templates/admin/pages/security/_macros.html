@@ -1,0 +1,36 @@
+{#-
+  Security page macros (page-local; `roxy/admin/pages/security.py`).
+
+  What: `table_card(frame, table, part, ...)` renders a card that holds one server-paged table, or, when the request
+  asks for `part=table`, that table alone; `reset_action(href, what)` is the card button that opens the Data page's
+  reset form with this card's family chosen (plan 6.8: resets live next to the data they clear); `when(cell)` shows
+  a `fmt.time_cell` as a <time> element.
+  Why: a table's own requests (search, filter, sort, page) must swap only that table: the shared table macro swaps
+  the element it targets with the whole answer, so the answer to a table request is the table alone, rendered by
+  the same template as the first paint.
+  How: plain macros over the shared components; nothing here renders caller text except through `caller_text`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/icon.html" import icon %}
+
+{% macro reset_action(href, what) -%}
+{%- if href -%}<a class="btn btn--sm btn--ghost" href="{{ href }}" data-action="reset-family">{{ icon("reset") }}<span>Clear {{ what }}</span></a>{%- endif -%}
+{%- endmacro %}
+
+{% macro table_card(frame, table, part, subtitle=None, actions=None, notices=()) -%}
+{%- if part == "table" -%}
+{{ data_table(**table) }}
+{%- else -%}
+{%- set intro = caller() if caller is defined else "" -%}
+{% call page_card(frame, flush=True, subtitle=subtitle, actions=actions, notices=notices) %}
+{{ intro }}
+{{ data_table(**table) }}
+{% endcall %}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro when(cell, empty="n/a") -%}
+{%- if cell -%}<time datetime="{{ cell.datetime }}">{{ cell.text }}</time>{% if cell.sub %}<span class="dt__sub">{{ cell.sub }}</span>{% endif %}
+{%- else -%}<span class="muted">{{ empty }}</span>{%- endif -%}
+{%- endmacro %}

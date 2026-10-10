@@ -1,0 +1,12 @@
+{#-
+  Settings page, card `public-site` (`roxy/admin/pages/settings.py public_site_card`): texts and switches of the
+  public pages.
+
+  The settings come from the catalog (anchor `settings#public-site`; these have no feature page of their own) and
+  follow below this sentence. The site texts allow plain paragraphs and https links written as [label](url).
+  Context: `frame`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% call page_card(frame) %}
+<p class="muted">These change what visitors and callers see: the texts of the <a href="/">home page</a>, the <a href="/status">status page</a> and the footer, and how errors and cross-site requests are answered. Texts take plain paragraphs and https links written as [label](https://...); anything else is shown as typed.</p>
+{% endcall %}

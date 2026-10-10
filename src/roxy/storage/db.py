@@ -40,6 +40,26 @@ How it works
       job has not started it is canceled (it never runs) and the caller gets `SharedStateUnavailable`; if it is
       already running, its own busy timeout (the remaining budget) ends it within moments, commit or rollback,
       so a caller is never told "unavailable" about a write that later commits.
+    - Waiting for the lock (finding LOAD-3). Every request writes hot.db at least once and every worker process
+      competes for its ONE write lock. SQLite's own busy handler sleeps longer and longer between tries (1, 2, 5,
+      10 ... 100 ms), so a worker that found the lock taken a few times slept through most of the moments it was
+      free while the other worker took it again and again: writes queued up (p99 30 to 135 ms, about 205 requests
+      a second at most on the development machine). The writer thread therefore waits in short polls: SQLite
+      waits at most `LOCK_POLL_MS` per try, and the thread tries again until the job's budget (or the profile's
+      `busy_timeout`) runs out (`_begin_polling`). Every worker waits the same way, so none falls behind for long.
+    - Group commit on hot.db, only in a backlog (finding LOAD-3). A transaction holds the lock for much longer than
+      its SQL takes: the writer thread gives up the GIL inside every SQLite call and may wait for the event loop to
+      hand it back. When at least `GROUP_MIN_QUEUE` writes wait behind the one it takes, the writer of a database
+      whose profile says `group_writes` takes the hot-path writes already queued (a write with a busy budget; up
+      to `GROUP_MAX_JOBS`, while the group has held the lock less than `GROUP_MAX_MS`) and runs them in ONE
+      `BEGIN IMMEDIATE ... COMMIT`, one after another. Each write keeps its own atomicity (every write after the
+      first runs inside a savepoint, so a failing one undoes only its own changes and gets its own exception), its
+      own order (a read-then-write job sees every earlier job's rows, so limits stay exact, plan C6), its own
+      budget (a job whose deadline passed while the group waited is refused, never run), and its own result, which
+      its caller receives only after COMMIT: if the transaction is lost, every job of it gets
+      `SharedStateUnavailable` (it did not happen, plan C7). One lock acquisition and one commit then serve many
+      requests instead of one each. Below the backlog every write keeps a transaction of its own (the shortest
+      lock holds), and writes without a budget (admin changes, leader jobs, migrations) always do.
     - Every queue is bounded (plan P9): when more than `MAX_PENDING_JOBS` operations are waiting, new ones fail
       fast with `SharedStateUnavailable` instead of piling up memory.
     - `write_sync` and `read_sync` do the same work on the calling thread, for scripts, migrations and tests.
@@ -63,6 +83,7 @@ import sqlite3
 import stat
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,6 +142,7 @@ class DbProfile:
     foreign_keys: bool = False
     temp_store_memory: bool = False
     busy_timeout_ms: int = BUSY_TIMEOUT_MS  # tests lower it with dataclasses.replace() to see busy errors fast
+    group_writes: bool = False  # hot-path writes queued together share one transaction (group commit)
 
 
 PROFILES: dict[str, DbProfile] = {
@@ -130,9 +152,17 @@ PROFILES: dict[str, DbProfile] = {
         "control", "FULL", writer_cache_kib=2048, reader_cache_kib=1024, mmap_bytes=0, foreign_keys=True
     ),
     # hot.db is written on every request. NORMAL in WAL mode cannot corrupt the file; a power cut can only lose
-    # the last moments of limiter state, which is acceptable. temp_store=MEMORY keeps sort scratch off disk.
+    # the last moments of limiter state, which is acceptable. temp_store=MEMORY keeps sort scratch off disk. Its
+    # hot-path writes (the abuse transaction, bucket reservations, leases) are grouped: every worker writes it per
+    # request and the workers share its one write lock (LOAD-3, module docstring).
     "hot": DbProfile(
-        "hot", "NORMAL", writer_cache_kib=4096, reader_cache_kib=1024, mmap_bytes=0, temp_store_memory=True
+        "hot",
+        "NORMAL",
+        writer_cache_kib=4096,
+        reader_cache_kib=1024,
+        mmap_bytes=0,
+        temp_store_memory=True,
+        group_writes=True,
     ),
     "metrics": DbProfile("metrics", "NORMAL", writer_cache_kib=8192, reader_cache_kib=2048, mmap_bytes=0),
     # cache.db reads large bodies; memory mapping 32 MiB of it lets reads skip a copy (DESIGN.md section 0).
@@ -318,6 +348,84 @@ class _Job:
     deadline: float | None = None  # monotonic time by which a `busy_ms` job must be done waiting (queue included)
 
 
+GROUP_MAX_JOBS = 64
+"""Most hot-path writes that share one transaction (group commit, see the module docstring)."""
+
+GROUP_MAX_MS = 10.0
+"""A group neither takes nor starts more writes once it has held the write lock this long (the rest wait for the
+next transaction), so the other workers get the lock back quickly. Without this bound a group that grew to 64
+writes while it waited for the lock held it for up to a second when this worker's event loop kept the GIL busy."""
+
+GROUP_MIN_QUEUE = 8
+"""Group commit starts only when at least this many writes wait in the queue behind the one the writer takes (a
+backlog). Measured in the load harness: below the ceiling, single transactions keep the shortest lock holds (cache
+hit p99 24 ms against 70 ms with groups at 200 requests a second); in a backlog, groups answer more (about 310
+requests a second against 270 at 450 and 600 offered) with far shorter waits (p95 inside Roxy 93 to 150 ms against
+305 to 543 ms)."""
+
+LOCK_POLL_MS = 2
+"""While a writer waits for another worker's write lock, SQLite's busy handler waits at most this long at a time
+before the writer thread tries again (`_begin_polling`), so the wait never stretches into SQLite's 10 to 100 ms
+sleeps while the lock is free."""
+
+_GROUP_SAVEPOINT = "roxy_group_write"
+"""The savepoint around each grouped write after the first, so one write's failure undoes only that write."""
+
+
+def _groupable(job: _Job) -> bool:
+    """A hot-path write: it carries a busy budget (it is small and has a fallback) and takes the write lock."""
+    return job.deadline is not None and job.begin == "BEGIN IMMEDIATE"
+
+
+@dataclass(slots=True)
+class _Outcome:
+    """What one grouped job did, held until the group's COMMIT decides whether it happened."""
+
+    job: _Job
+    ok: bool  # its function returned (`value` is the result) or raised (`value` is what its caller gets)
+    value: Any
+    lost: bool = False  # the group's transaction is gone with it (or its state is unknown)
+    broken: bool = False  # the connection must be reopened
+
+
+TIMING_BOUNDS_MS: tuple[float, ...] = (0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000)
+"""Upper bounds of the write timing histograms (`DbStats.lock_wait_hist`, `hold_hist`); one more bucket above."""
+
+
+def _bucket(ms: float) -> int:
+    """The histogram bucket of a duration (the last bucket holds everything above the last bound)."""
+    for index, bound in enumerate(TIMING_BOUNDS_MS):
+        if ms <= bound:
+            return index
+    return len(TIMING_BOUNDS_MS)
+
+
+def histogram_summary(counts: list[int]) -> dict[str, float | int | None]:
+    """`{n, p50, p95, p99}` of a timing histogram, each percentile the upper bound of its bucket (None above the
+    last bound, or when empty). Coarse on purpose: it is cheap to keep on every write and says what matters (is
+    the lock wait a fraction of a millisecond, a few milliseconds, or a hundred?)."""
+    total = sum(counts)
+    out: dict[str, float | int | None] = {"n": total}
+    for name, share in (("p50", 0.5), ("p95", 0.95), ("p99", 0.99)):
+        if not total:
+            out[name] = None
+            continue
+        rank, seen = share * total, 0
+        for index, count in enumerate(counts):
+            seen += count
+            if seen >= rank:
+                out[name] = TIMING_BOUNDS_MS[index] if index < len(TIMING_BOUNDS_MS) else None
+                break
+    top = max((index for index, count in enumerate(counts) if count), default=None)
+    # The bucket of the slowest transaction (its upper bound; None above the last bound or when empty).
+    out["max"] = None if top is None or top >= len(TIMING_BOUNDS_MS) else TIMING_BOUNDS_MS[top]
+    return out
+
+
+def _empty_hist() -> list[int]:
+    return [0] * (len(TIMING_BOUNDS_MS) + 1)
+
+
 @dataclass(slots=True)
 class DbStats:
     """Counters for the System page. Updated from worker threads; exact values are not critical."""
@@ -331,6 +439,22 @@ class DbStats:
     reconnects: int = 0
     fast_failures: int = 0  # writes refused at once by the busy circuit
     deadline_failures: int = 0  # hot-path writes whose budget ran out while they waited in the queue
+    groups: int = 0  # transactions that carried more than one hot-path write (group commit)
+    grouped_writes: int = 0  # hot-path writes that shared their transaction with others
+    largest_group: int = 0  # the most hot-path writes one transaction carried
+    # Per write transaction of the writer thread: how long BEGIN IMMEDIATE waited for the write lock (another
+    # worker held it), and how long this worker then held it (until COMMIT or ROLLBACK). Fixed buckets
+    # (`TIMING_BOUNDS_MS`), so the p99 of every transaction since start is known, not only the last one.
+    lock_wait_hist: list[int] = field(default_factory=_empty_hist)
+    hold_hist: list[int] = field(default_factory=_empty_hist)
+
+    def note_transaction(self, lock_wait_ms: float, hold_ms: float) -> None:
+        self.lock_wait_hist[_bucket(lock_wait_ms)] += 1
+        self.hold_hist[_bucket(hold_ms)] += 1
+
+    def timing(self) -> dict[str, dict[str, float | int | None]]:
+        """Lock wait and lock hold percentiles of the writer's transactions (the System page, LOAD-3)."""
+        return {"lock_wait_ms": histogram_summary(self.lock_wait_hist), "hold_ms": histogram_summary(self.hold_hist)}
 
 
 class _ConnectionThread(threading.Thread):
@@ -344,12 +468,19 @@ class _ConnectionThread(threading.Thread):
         self._jobs = jobs
         self._conn: sqlite3.Connection | None = None
         self._busy_ms = db.profile.busy_timeout_ms  # the busy_timeout currently set on self._conn
+        # Jobs taken from the queue by a group that must run after it (an ordinary write, the stop marker, or the
+        # rest of a group whose transaction was lost). Taken before the queue, in order. Bounded by GROUP_MAX_JOBS.
+        self._carry: deque[_Job | None] = deque()
+        self._grouping = role == "writer" and db.profile.group_writes
 
     def run(self) -> None:
         while True:
-            job = self._jobs.get()
+            job = self._carry.popleft() if self._carry else self._jobs.get()
             if job is None:
                 break
+            if self._grouping and _groupable(job) and len(self._carry) + self._jobs.qsize() >= GROUP_MIN_QUEUE:
+                self._run_group(job)  # a backlog of hot-path writes: one transaction for many (GROUP_MIN_QUEUE)
+                continue
             # A caller that was canceled before its job started gets nothing run on its behalf.
             if not job.future.set_running_or_notify_cancel():
                 continue
@@ -389,10 +520,19 @@ class _ConnectionThread(threading.Thread):
                 raise db._translate(exc) from exc
             self._busy_ms = db.profile.busy_timeout_ms
         full_wait = job.busy_ms is None or job.busy_ms >= db.profile.busy_timeout_ms
+        lock_deadline: float | None = None
         if self.role == "writer":
-            self._set_busy_timeout(db.profile.busy_timeout_ms if busy_ms is None else busy_ms)
+            wait_ms = db.profile.busy_timeout_ms if busy_ms is None else busy_ms
+            if job.begin == "BEGIN IMMEDIATE":
+                # Wait for the write lock in short polls (`_begin_polling`), like a group does: every writer of every
+                # worker then waits the same way, so none sleeps through SQLite's long backoff while the others
+                # take turns (an ordinary write starved behind grouped ones held up its whole queue).
+                self._set_busy_timeout(LOCK_POLL_MS)
+                lock_deadline = time.monotonic() + wait_ms / 1000
+            else:
+                self._set_busy_timeout(wait_ms)  # a deferred write waits inside its statements: SQLite's handler
         try:
-            result = db._transact(self._conn, job.fn, job.begin, self.role)
+            result = db._transact(self._conn, job.fn, job.begin, self.role, lock_deadline=lock_deadline)
         except SharedStateUnavailable as exc:
             cause = exc.cause if isinstance(exc.cause, BaseException) else None
             if cause is not None and _is_broken_error(cause):
@@ -406,6 +546,250 @@ class _ConnectionThread(threading.Thread):
         if self.role == "writer":
             db._busy_until = 0.0
         return result
+
+    # ---- group commit (hot-path writes; the module docstring explains why) ----
+
+    def _take_more(self, group: list[_Job]) -> None:
+        """Move hot-path writes that are already waiting (carried first, then queued) into `group`, without waiting
+        for new ones. An ordinary write or the stop marker ends the group and runs right after it, in order."""
+        while len(group) < GROUP_MAX_JOBS:
+            if self._carry:
+                carried = self._carry[0]
+                if carried is None or not _groupable(carried):
+                    return
+                self._carry.popleft()
+                group.append(carried)
+                continue
+            try:
+                job = self._jobs.get_nowait()
+            except queue.Empty:
+                return
+            if job is None or not _groupable(job):
+                self._carry.append(job)
+                return
+            group.append(job)
+
+    def _start_grouped(self, job: _Job) -> bool:
+        """Mark a grouped job running just before its function runs; False when it must not run (its caller went
+        away, or its budget ran out while it waited for the lock or for the writes ahead of it)."""
+        if not job.future.set_running_or_notify_cancel():
+            return False
+        if job.deadline is not None and time.monotonic() >= job.deadline:
+            db = self._db
+            db.stats.deadline_failures += 1
+            db.stats.unavailable += 1
+            job.future.set_exception(SharedStateUnavailable(db.name, f"write budget of {job.busy_ms} ms ran out"))
+            return False
+        return True
+
+    def _fail_unstarted(self, jobs: list[_Job], error: Callable[[], BaseException]) -> int:
+        """Answer every job whose caller still waits with `error()` (a fresh exception each); how many there were."""
+        failed = 0
+        for job in jobs:
+            if job.future.set_running_or_notify_cancel():
+                job.future.set_exception(error())
+                failed += 1
+        return failed
+
+    def _job_error(self, exc: BaseException) -> BaseException:
+        """How a job's own exception reaches its caller (the mapping of `Database._transact`)."""
+        db = self._db
+        db._count_error("writer")
+        if is_unavailable_error(exc):
+            db.stats.unavailable += 1
+            return SharedStateUnavailable(db.name, exc)
+        return exc
+
+    def _run_group(self, first: _Job) -> None:
+        """Run `first` and the hot-path writes queued with it in ONE `BEGIN IMMEDIATE ... COMMIT` (group commit).
+
+        Each job is still atomic on its own: every job after the first runs inside a savepoint, so a failing job
+        undoes only its own changes and gets its own exception. Jobs run one after another on this thread, exactly as
+        separate transactions would, so a read-then-write job sees every earlier job's rows (limits stay exact,
+        plan C6). Results are handed out only after COMMIT: a caller never sees a value that was not committed, and
+        when the transaction is lost every job of it gets `SharedStateUnavailable` ("did not happen").
+        """
+        group = [first]
+        try:
+            self._group(group)
+        except BaseException as exc:  # a bug here must never stop the writer thread or strand a caller
+            log.exception("db_group_failed", extra={"fields": {"db": self._db.name}})
+            if self._conn is not None:
+                _rollback_quietly(self._conn)
+            for job in group:
+                if job.future.done() or any(job is carried for carried in self._carry):
+                    continue  # answered already, or handed on to run in the next transaction
+                if job.future.running() or job.future.set_running_or_notify_cancel():
+                    job.future.set_exception(SharedStateUnavailable(self._db.name, exc))
+
+    def _group(self, group: list[_Job]) -> None:
+        """The body of `_run_group` (`group` holds the first job and grows as jobs are taken)."""
+        db = self._db
+        self._take_more(group)
+        remaining = db._busy_until - time.monotonic()
+        if remaining > 0:
+            # The busy circuit is open (see `_run`): every job of the group fails at once.
+            for job in group:
+                if job.future.set_running_or_notify_cancel():
+                    db.stats.fast_failures += 1
+                    db.stats.unavailable += 1
+                    job.future.set_exception(
+                        SharedStateUnavailable(db.name, f"database is busy (retrying in {remaining:.1f} s)")
+                    )
+            return
+        if self._conn is None:
+            try:
+                self._conn = connect(db.path, db.profile, self.role)
+            except (sqlite3.Error, OSError) as exc:
+                cause = exc
+                self._fail_unstarted(group, lambda: db._translate(cause))
+                return
+            self._busy_ms = db.profile.busy_timeout_ms
+        conn = self._conn
+        full_wait = any((job.busy_ms or 0) >= db.profile.busy_timeout_ms for job in group)
+        started = time.perf_counter()
+        try:
+            if not self._begin_group(conn, group):
+                return  # every caller of the group gave up while it waited for the lock: nothing to run
+        except sqlite3.Error as exc:
+            db._count_error("writer")
+            failure = exc
+            now = time.monotonic()
+            # Jobs past their deadline ran out of budget waiting for another worker's lock (counted like the ones
+            # their callers gave up on); `_fail_unstarted` skips jobs already answered.
+            late = sum(1 for job in group if job.deadline is not None and job.deadline <= now and not job.future.done())
+            if self._fail_unstarted(group, lambda: db._translate(failure)):
+                db.stats.deadline_failures += late
+            if _is_broken_error(exc):
+                self._close()
+                db.stats.reconnects += 1
+            elif full_wait and _is_lock_timeout(exc):
+                db._busy_until = time.monotonic() + BUSY_CIRCUIT_COOLDOWN_S
+            return
+        locked = time.perf_counter()
+        done: list[_Outcome] = []
+        index = 0
+        while True:
+            held_ms = (time.perf_counter() - locked) * 1000
+            if index >= len(group) and held_ms < GROUP_MAX_MS:
+                self._take_more(group)  # writes queued while this group waited for the lock or ran
+            if index >= len(group):
+                break
+            if done and held_ms >= GROUP_MAX_MS:
+                # The group held the lock long enough (a slow job, or the GIL busy elsewhere in this worker): commit
+                # what ran and leave the rest for the next transaction, so the other workers get the lock now.
+                self._carry.extendleft(reversed(group[index:]))
+                break
+            job = group[index]
+            index += 1
+            if not self._start_grouped(job):
+                continue
+            # The first job of the transaction needs no savepoint: if it fails, nothing else is lost.
+            outcome = self._run_in_savepoint(conn, job) if done else self._run_first(conn, job)
+            done.append(outcome)
+            if outcome.lost or not conn.in_transaction:
+                # The first job failed (rolled back; nothing else had run), or SQLite rolled the whole transaction
+                # back under a later one (an I/O error, a full disk, out of memory): what had succeeded did not
+                # happen. The jobs not reached yet run in a new transaction.
+                _rollback_quietly(conn)
+                self._finish_lost(done, outcome.value)
+                if outcome.broken:
+                    self._close()
+                    db.stats.reconnects += 1
+                self._carry.extendleft(reversed(group[index:]))
+                return
+        if not done:
+            _rollback_quietly(conn)  # every job was canceled or out of time: nothing to commit
+            return
+        try:
+            conn.execute("COMMIT")
+        except BaseException as exc:
+            _rollback_quietly(conn)
+            db._count_error("writer")
+            self._finish_lost(done, exc)
+            if _is_broken_error(exc):
+                self._close()
+                db.stats.reconnects += 1
+            return
+        finished = time.perf_counter()
+        db.stats.note_transaction((locked - started) * 1000, (finished - locked) * 1000)
+        elapsed_ms = (finished - started) * 1000
+        db.stats.last_write_ms = elapsed_ms
+        db.stats.max_write_ms = max(db.stats.max_write_ms, elapsed_ms)
+        if len(done) > 1:
+            db.stats.groups += 1
+            db.stats.grouped_writes += len(done)
+            db.stats.largest_group = max(db.stats.largest_group, len(done))
+        db._busy_until = 0.0
+        for outcome in done:
+            if outcome.ok:
+                db.stats.writes += 1
+                outcome.job.future.set_result(outcome.value)
+            else:
+                outcome.job.future.set_exception(outcome.value)
+
+    def _begin_group(self, conn: sqlite3.Connection, group: list[_Job]) -> bool:
+        """`BEGIN IMMEDIATE` for a group, waiting for the write lock in short polls until the most patient job's
+        deadline. False (no transaction) when every caller of the group gave up meanwhile; raises the last
+        `sqlite3.Error` when the lock stayed taken (or anything else went wrong).
+
+        SQLite's own busy handler sleeps longer and longer between tries (1, 2, 5, 10 ... 100 ms), so while another
+        worker takes and frees the lock many times a second, a waiting worker sleeps through most of the moments
+        it was free and falls further behind. Here SQLite waits at most `LOCK_POLL_MS` at a time (it sleeps 1 ms,
+        then 1 ms more) and this loop tries again, so the wait never escalates. Each try needs the GIL back, which
+        is why the poll is not shorter.
+        """
+        self._set_busy_timeout(LOCK_POLL_MS)
+
+        def still_wanted() -> bool:
+            if all(job.future.cancelled() for job in group):
+                return False
+            self._take_more(group)  # writes queued meanwhile wait for the same lock
+            return True
+
+        return _begin_polling(conn, "BEGIN IMMEDIATE", lambda: max(job.deadline or 0.0 for job in group), still_wanted)
+
+    def _run_first(self, conn: sqlite3.Connection, job: _Job) -> _Outcome:
+        """The first job of a group's transaction, run as a plain write: on failure the whole (one job) transaction
+        is rolled back, exactly as `Database._transact` does."""
+        try:
+            return _Outcome(job, True, job.fn(conn))
+        except BaseException as exc:
+            _rollback_quietly(conn)
+            return _Outcome(job, False, self._job_error(exc), lost=True, broken=_is_broken_error(exc))
+
+    def _run_in_savepoint(self, conn: sqlite3.Connection, job: _Job) -> _Outcome:
+        """A later job of a group, inside a savepoint: its failure undoes its own changes and nothing else."""
+        try:
+            conn.execute(f"SAVEPOINT {_GROUP_SAVEPOINT}")
+        except sqlite3.Error as exc:  # the transaction is in an unknown state: treat it as lost
+            return _Outcome(job, False, self._job_error(exc), lost=True, broken=_is_broken_error(exc))
+        try:
+            value = job.fn(conn)
+        except BaseException as exc:
+            lost = _is_broken_error(exc)
+            try:
+                if conn.in_transaction:
+                    conn.execute(f"ROLLBACK TO {_GROUP_SAVEPOINT}")
+                    conn.execute(f"RELEASE {_GROUP_SAVEPOINT}")
+            except sqlite3.Error:
+                lost = True
+            return _Outcome(job, False, self._job_error(exc), lost=lost, broken=_is_broken_error(exc))
+        try:
+            conn.execute(f"RELEASE {_GROUP_SAVEPOINT}")
+        except sqlite3.Error as exc:
+            return _Outcome(job, False, self._job_error(exc), lost=True, broken=_is_broken_error(exc))
+        return _Outcome(job, True, value)
+
+    def _finish_lost(self, done: list[_Outcome], cause: BaseException) -> None:
+        """The group's transaction is gone: jobs whose function had returned did not happen after all."""
+        db = self._db
+        for outcome in done:
+            if outcome.ok:
+                db.stats.unavailable += 1
+                outcome.job.future.set_exception(SharedStateUnavailable(db.name, cause))
+            else:
+                outcome.job.future.set_exception(outcome.value)
 
     def _set_busy_timeout(self, busy_ms: int) -> None:
         if self._conn is None or busy_ms == self._busy_ms:
@@ -660,18 +1044,32 @@ class Database:
     # ----------------------------------------------------------------------------------------------- internals
 
     def _transact(
-        self, conn: sqlite3.Connection, fn: Callable[[sqlite3.Connection], T], begin: str, role: ConnRole
+        self,
+        conn: sqlite3.Connection,
+        fn: Callable[[sqlite3.Connection], T],
+        begin: str,
+        role: ConnRole,
+        *,
+        lock_deadline: float | None = None,
     ) -> T:
-        """Run `fn` between `begin` and COMMIT on `conn`; roll back and re-raise on any exception."""
+        """Run `fn` between `begin` and COMMIT on `conn`; roll back and re-raise on any exception. With
+        `lock_deadline` (the writer thread), `begin` waits for the lock in short polls until then (`_begin_polling`;
+        the caller set the connection's busy timeout to `LOCK_POLL_MS`)."""
         started = time.perf_counter()
         try:
-            conn.execute(begin)
+            if lock_deadline is None:
+                conn.execute(begin)
+            else:
+                _begin_polling(conn, begin, lambda: lock_deadline)
         except sqlite3.Error as exc:
             self._count_error(role)
             raise self._translate(exc) from exc
+        locked = time.perf_counter()
         try:
             result = fn(conn)
             conn.execute("COMMIT")
+            if role != "reader":
+                self.stats.note_transaction((locked - started) * 1000, (time.perf_counter() - locked) * 1000)
         except BaseException as exc:
             _rollback_quietly(conn)
             self._count_error(role)
@@ -707,6 +1105,28 @@ class Database:
     def pending(self) -> dict[str, int]:
         """Queued (not yet started) operations, for the System page."""
         return {"write": self._write_q.qsize(), "read": self._read_q.qsize()}
+
+
+def _begin_polling(
+    conn: sqlite3.Connection,
+    begin: str,
+    deadline: Callable[[], float],
+    still_wanted: Callable[[], bool] | None = None,
+) -> bool:
+    """Run `begin` on a connection whose busy timeout is `LOCK_POLL_MS`, trying again until `deadline()` (monotonic).
+
+    True once the transaction began; False when `still_wanted()` says nobody waits for it any more; the last
+    `sqlite3.Error` when the lock stayed taken past the deadline (or any other error, at once).
+    """
+    while True:
+        try:
+            conn.execute(begin)
+            return True
+        except sqlite3.Error as exc:
+            if not _is_lock_timeout(exc) or time.monotonic() >= deadline():
+                raise
+        if still_wanted is not None and not still_wanted():
+            return False
 
 
 def _rollback_quietly(conn: sqlite3.Connection) -> None:

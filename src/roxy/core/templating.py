@@ -202,6 +202,18 @@ TEMPLATE_SUFFIXES = (".html",)
 files kept next to them)."""
 
 
+def admin_nav() -> Any:
+    """The dashboard navigation (pages, groups, icons, shortcuts) from the page registry, for the admin layout.
+
+    A Jinja global, so the sidebar, the phone menu, the palette and the shortcut overlay read the one registry
+    (`roxy/admin/pages/registry.py`) whatever context a page passes. Imported on first use: the registry is plain
+    data (no routes, no database), and only admin templates call it.
+    """
+    from roxy.admin.pages.registry import nav_model
+
+    return nav_model()
+
+
 class Templates:
     """The Jinja2 environment with Roxy's rules: autoescape everywhere, nonce and `static_url` in every page."""
 
@@ -226,6 +238,7 @@ class Templates:
             auto_reload=False,
         )
         self.env.globals["static_url"] = self.hasher.url
+        self.env.globals["admin_nav"] = admin_nav
         if extra_globals:
             self.env.globals.update(extra_globals)
 

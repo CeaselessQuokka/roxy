@@ -1,0 +1,103 @@
+{#-
+  Recommendations, the preview panel (`GET /admin/recommendations/preview?rec=<id>&window=1h|6h|24h`,
+  `roxy/admin/pages/recommendations.py preview_context`; plan 11.3 "Dry-run preview" and "Apply").
+
+  Loaded into the detail drawer under the Preview button. It shows the validated diff (each change as Apply would
+  write it, a list setting as the delta against the live list), what Apply needs (a reason and the high-risk
+  confirmation; a fresh second factor for admin security, the credential or an admin allowlist row), the dry run over
+  sampled requests (counts scaled up when sampling is below 100%, with the engine's note) and the Apply form. The form
+  sends the digest of exactly these changes: if the recommendation changed since, the API answers 409
+  `changed_since_preview` and the panel says to preview again. A 403 `reauth_required` opens "Confirm it is you" and
+  retries (static/js/api_forms.js). Change targets can quote callers' paths: caller text.
+  Context: see `preview_context`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/format.html" import caller_text, num, pct %}
+{% set pid = "rp-" ~ ((id or "x")|replace("_", "-")) %}
+<div class="rec-preview__body stack" data-rec-preview-of="{{ id }}" data-preview-window="{{ window }}">
+  <h4 class="rec-preview__title" id="{{ pid }}-title" tabindex="-1">Preview</h4>
+  {% if notice %}<p class="card__notice" role="note">{{ icon("info") }}<span>{{ notice }}</span></p>{% endif %}
+
+  <div class="rec-windows" role="group" aria-label="Replay window">
+    <span class="muted">Replay:</span>
+    {% for key, label in windows %}
+    <button type="button" class="btn btn--sm {{ 'btn--primary' if key == window else 'btn--ghost' }}" aria-pressed="{{ 'true' if key == window else 'false' }}"
+            hx-get="{{ window_urls[key] }}" hx-target="closest [data-rec-preview]" hx-swap="innerHTML">{{ label }}</button>
+    {% endfor %}
+  </div>
+
+  <div class="table-scroll" role="region" aria-labelledby="{{ pid }}-diff-caption" tabindex="0">
+    <table class="diff-table rec-diff">
+      <caption id="{{ pid }}-diff-caption" class="rec-preview__caption">What Apply will write</caption>
+      <thead><tr><th scope="col">What</th><th scope="col">Now</th><th scope="col">After</th></tr></thead>
+      <tbody>
+        {% for row in diff %}
+        <tr{% if not row.valid %} class="rec-diff__invalid"{% endif %}>
+          <th scope="row">
+            <span class="diff-table__label">{{ row.label }}</span>
+            <code class="diff-table__key">{{ caller_text(row.target, 300) }}</code>
+            {% if not row.valid %}<span class="diff-table__note">{{ status_badge("bad", "Not valid") }} {{ caller_text(row.message, 300) }}</span>
+            {% elif row.message %}<span class="diff-table__note">{{ caller_text(row.message, 300) }}</span>{% endif %}
+          </th>
+          <td class="diff-table__before"><span class="sr-only">Now: </span>{% if row.before is none %}<span class="muted">not set</span>{% else %}<del>{{ caller_text(row.before, 600) }}</del>{% endif %}</td>
+          <td class="diff-table__after"><span class="sr-only">After: </span>{% if row.after is none %}<span class="muted">removed</span>{% else %}<ins>{{ caller_text(row.after, 600) }}</ins>{% endif %}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="3" class="muted">Nothing to apply.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <section class="rec-dryrun" aria-labelledby="{{ pid }}-dry">
+    <h5 class="rec-dryrun__title" id="{{ pid }}-dry">What it would have done{% if report.window_s == 3600 %} in the last hour{% elif report.window_s %} in the last {{ report.window_s // 3600 }} hours{% endif %}</h5>
+    {% if report.available %}
+    <dl class="kv">
+      <dt>Requests replayed</dt><dd>{{ num(report.sample_size) }} samples{% if report.sample_pct is not none and report.sample_pct < 100 %} (taken at {{ "%g"|format(report.sample_pct) }}%; counts below are scaled by {{ "%.3g"|format(report.scale or 1) }}){% endif %}</dd>
+      {% if report.baseline_requests %}<dt>Requests in that time</dt><dd>{{ num(report.baseline_requests) }}{% if report.baseline_upstream_calls %} ({{ num(report.baseline_upstream_calls) }} called Roblox){% endif %}</dd>{% endif %}
+      {% if report.avoided_calls is not none %}<dt>Calls to Roblox avoided</dt><dd>{{ num(report.avoided_calls) }}</dd>{% endif %}
+      {% if report.simulated_hit_ratio is not none %}<dt>Cache hit ratio</dt><dd>{{ pct(report.simulated_hit_ratio) }}</dd>{% endif %}
+      {% if report.staleness_risk is not none %}<dt>Served-old-data risk</dt><dd>{{ pct(report.staleness_risk) }} of the simulated hits would have served a body that had changed</dd>{% endif %}
+      {% if report.refused_requests is not none %}<dt>Requests it would have refused</dt><dd>{{ num(report.refused_requests) }}</dd>{% endif %}
+      {% if report.queue_wait_p95_ms is not none %}<dt>Queue wait p95</dt><dd>{{ num(report.queue_wait_p95_ms) }} ms</dd>{% endif %}
+    </dl>
+    {% if report.note %}<p class="muted">{{ report.note }}</p>{% endif %}
+    {% if computed %}<p class="muted">Computed {{ computed }}{% if report.cached %} (reused from a preview less than a minute old){% endif %}.</p>{% endif %}
+    {% else %}
+    <p class="muted">{{ report.note or "No change of this recommendation can be replayed; the diff above is exact." }}</p>
+    {% endif %}
+  </section>
+
+  {% if active and ok %}
+  <form class="rec-apply stack" data-api-form data-api-url="{{ apply_url }}" data-api-method="POST"
+        data-success="Applied. The changes are in force on every worker within a second." data-on-success="refresh" data-refresh="list history" data-reopen="{{ detail_url }}" novalidate>
+    <input type="hidden" name="changes_digest" value="{{ digest }}" data-json="string">
+    <p class="rec-form__title">{{ icon("check") }}<span>Apply these changes</span></p>
+    <ul class="dialog__consequences">
+      <li>Writes exactly the changes above, together, each through the audited settings or rules service; if one fails, the ones already written are put back.</li>
+      <li>Every worker uses them within a second. Undo puts them back as they were.</li>
+      {% if requires.fresh_mfa %}<li>It touches admin security or the credential, so Roxy asks for your second factor first.</li>{% endif %}
+    </ul>
+    <div class="field">
+      <label class="field__label" for="{{ pid }}-reason">Reason{% if requires.reason %} <span class="tone tone--warn">(required: a high-risk value)</span>{% else %} <span class="muted">(optional, saved in the audit log)</span>{% endif %}</label>
+      <textarea class="input" id="{{ pid }}-reason" name="reason" rows="2" maxlength="500" data-json="string"{% if requires.reason %} required aria-required="true"{% endif %} aria-describedby="{{ pid }}-reason-error"></textarea>
+      <p class="field__error" id="{{ pid }}-reason-error" data-field-error="reason" hidden></p>
+    </div>
+    {% if requires.confirm_high_risk %}
+    <label class="check rec-confirm"><input type="checkbox" name="confirm_high_risk" value="1" data-json="bool" required><span>I understand: {{ high_risk_labels|join(", ") or "a setting" }} will take a high-risk value.</span></label>
+    {% else %}
+    <label class="check" data-confirm-field hidden><input type="checkbox" name="confirm_high_risk" value="1" data-json="bool"><span>I understand: a value is high risk</span></label>
+    {% endif %}
+    <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    <div class="cluster">
+      <button type="submit" class="btn btn--primary" data-action="recommendation-apply">{{ icon("check") }}<span>Apply</span></button>
+      <button type="button" class="btn btn--ghost" hx-get="{{ window_urls[window] }}" hx-target="closest [data-rec-preview]" hx-swap="innerHTML">{{ icon("refresh") }}<span>Preview again</span></button>
+    </div>
+  </form>
+  {% elif not active %}
+  <p class="muted">It is {{ state|replace("_", " ") }}, so it cannot be applied.</p>
+  {% else %}
+  <p class="muted">{{ status_badge("bad", "Cannot apply") }} A change above is not valid any more; the rule will propose again on its next run.</p>
+  {% endif %}
+</div>

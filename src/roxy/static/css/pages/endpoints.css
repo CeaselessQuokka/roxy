@@ -1,0 +1,262 @@
+/*
+ * The Endpoints page (templates/admin/pages/endpoints*): the recent requests table, the drill-down (in the drawer
+ * and on its own page) and the inline reset.
+ *
+ * What this is
+ *   Layout for the pieces only this page has; the main table, tiles, charts and cards come from components.css.
+ *   Only tokens from tokens.css are used, so both themes follow.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract).
+ * How it works
+ *   The drill-down is narrow in the drawer (560 px) and wide on its page, so its pairs are a grid that collapses
+ *   to one column under 900 px, and its tables scroll inside their own region. Long templates and paths wrap
+ *   anywhere (caller text). Controls grow to the 44 px touch size on a phone (plan 14.8).
+ * What to read next
+ *   static/css/components.css, templates/admin/pages/endpoints/detail.html.
+ */
+
+#recent.page-card--lazy {
+  min-height: 360px;
+}
+
+/* The main table: a template keeps a readable width instead of wrapping every few characters. */
+.dt[data-table="endpoints"] td[data-col="key"] {
+  min-width: 24ch;
+}
+
+.card-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-3);
+}
+
+.ep-controls__select {
+  max-width: 100%;
+}
+
+.ep-controls__select select {
+  min-width: 0;
+  max-width: min(48ch, 70vw);
+  text-overflow: ellipsis;
+}
+
+.ep-note {
+  margin-top: var(--sp-3);
+  font-size: var(--fs-1);
+}
+
+/* The request tables (recent card and drill-down). */
+.ep-requests__table {
+  width: 100%;
+  min-width: 760px;
+}
+
+.ep-requests__table th[scope="row"] {
+  font-weight: var(--fw-regular);
+  white-space: nowrap;
+}
+
+.ep-requests__url {
+  max-width: 34ch;
+  overflow-wrap: anywhere;
+}
+
+.ep-requests__ua {
+  max-width: 26ch;
+  overflow-wrap: anywhere;
+}
+
+/* The drill-down. */
+.ep-detail__head {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.ep-detail__name {
+  overflow-wrap: anywhere;
+  font-size: var(--fs-3);
+}
+
+.ep-detail__notice {
+  margin: 0;
+}
+
+.ep-detail__section {
+  display: grid;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.ep-detail__heading {
+  font-size: var(--fs-3);
+}
+
+.ep-detail__subheading {
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-2);
+}
+
+.ep-detail__tiles {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.drawer .ep-detail__tiles {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ep-detail__charts,
+.ep-detail__pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-5);
+}
+
+.ep-detail__list {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding-left: var(--sp-5);
+  overflow-wrap: anywhere;
+}
+
+.ep-detail__target {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.ep-detail__target-name {
+  margin-bottom: var(--sp-2);
+  overflow-wrap: anywhere;
+}
+
+.ep-detail__paths td:first-child {
+  overflow-wrap: anywhere;
+}
+
+/* In the narrow drawer everything stacks. */
+.drawer .ep-detail__charts,
+.drawer .ep-detail__pair {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* The inline reset in the drawer (roxy/admin/pages/_traffic_reset.py). */
+.g2-reset__lead {
+  max-width: 70ch;
+}
+
+.g2-reset__section {
+  display: grid;
+  gap: var(--sp-3);
+}
+
+.g2-reset__heading {
+  font-size: var(--fs-3);
+}
+
+.g2-reset__snapshots {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--fs-1);
+}
+
+.g2-reset__snapshots li {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+}
+
+.g2-reset__snapshots .icon {
+  flex: none;
+  margin-top: 2px;
+}
+
+.g2-reset__target {
+  overflow-wrap: anywhere;
+}
+
+/* The Live page's request drawer, opened from the request tables (the rules live.css has for it there). */
+.lv-request__lead {
+  overflow-wrap: anywhere;
+  font-size: var(--fs-3);
+}
+
+.lv-request__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.lv-request__section {
+  display: grid;
+  gap: var(--sp-2);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.lv-request__heading {
+  font-size: var(--fs-3);
+}
+
+.lv-request__list {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding-left: var(--sp-5);
+}
+
+.lv-request__part > summary {
+  min-height: var(--target-min);
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+}
+
+.lv-request__headers {
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+  font-size: var(--fs-1);
+}
+
+.lv-request__body {
+  max-height: 360px;
+  overflow: auto;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-size: var(--fs-1);
+}
+
+@media (max-width: 1100px) {
+  .ep-detail__tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .ep-detail__charts,
+  .ep-detail__pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .card-controls .chip-select,
+  .card-controls select,
+  .card-controls .btn,
+  .ep-detail__actions .btn,
+  .g2-reset__form .btn {
+    min-height: var(--target-touch);
+  }
+
+  .card-controls .chip-select {
+    flex: 1 1 100%;
+  }
+
+  .card-controls select {
+    flex: 1;
+    max-width: none;
+  }
+}

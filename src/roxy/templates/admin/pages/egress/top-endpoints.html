@@ -1,0 +1,29 @@
+{#-
+  Egress page, card `top-endpoints` (`roxy/admin/pages/egress.py top_endpoints_card`): which endpoints use the most
+  bytes on one egress (the rotator by default: those bytes cost money). The page's main table (its egress filter,
+  search, sort and page live in the address bar), from `GET /admin/api/v1/egress/top-endpoints`; below it, how many
+  calls fell in each bytes-per-call slot (`GET /egress/bytes-per-request`, built from per-minute averages, which the
+  card says). Endpoint templates are caller text.
+  Context: `frame`, `table`, `egress_label`, `total`, `slots`, `slot_calls`, `basis`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import num %}
+{% call page_card(frame, flush=True, subtitle=egress_label ~ ": " ~ total ~ " in this range") %}
+<div class="g3-table-host" hx-select="#{{ table.id }}">{{ data_table(**table) }}</div>
+<details class="details-plain g3-pad">
+  <summary>Bytes per call on this egress</summary>
+  <p class="muted">{{ basis }}.</p>
+  {% if slot_calls %}
+  <div class="table-scroll g3-scroll" role="region" aria-labelledby="slots-caption" tabindex="0">
+    <table class="simple-table g3-table">
+      <caption id="slots-caption" class="sr-only">Calls per bytes-per-call slot</caption>
+      <thead><tr><th scope="col">Bytes per call</th><th scope="col" class="num">Calls</th></tr></thead>
+      <tbody>{% for slot in slots %}<tr><td>{{ slot.label }}</td><td class="num">{{ num(slot.calls) }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="muted">No calls on this egress in this range.</p>
+  {% endif %}
+</details>
+{% endcall %}

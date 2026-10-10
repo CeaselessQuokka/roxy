@@ -81,6 +81,14 @@ SCORE_WINDOW_S: Final = 25 * 3600
 """Recorded bot scores of clients seen in the last 25 hours (THROTTLE-TUNE reads 24 h; one hour of margin)."""
 DIMS_WINDOW_DAYS: Final = 7
 """SYS-DISK `dims_per_minute_7d_avg`: the mean over the disk samples of the last 7 days."""
+MAX_MEMO_SAMPLE_ROWS: Final = 50_000
+"""Most request and refusal sample rows one evaluation keeps memoized at once (finding LOAD-2). Each sample read
+returns up to `read_history.MAX_ROWS` (50,000) rows, and the rules of one run ask for several (one per template they
+look at): kept all together until the run ends, a busy day of samples made the leader's memory peak grow with the
+data (a tracemalloc snapshot of the leader caught one evaluation holding 28 MiB of sample dicts after 33 minutes
+at 10 requests a second; a busy day could hold eight reads of 50,000 rows). Past this bound the oldest sample reads
+are forgotten first (a rule that asks again reads again), so a run keeps at most one full read's worth of compact
+rows (`read_history.SampleRecord`, about 18 MiB) besides the read in use."""
 
 
 # --------------------------------------------------------------------------------------------- providers
@@ -332,6 +340,10 @@ class InsightContext:
     trigger: str = "schedule"
     _memo: dict[tuple[Any, ...], Any] = field(default_factory=dict)
     _locks: dict[tuple[Any, ...], asyncio.Lock] = field(default_factory=dict)
+    # Memo keys of sample reads, oldest first, and how many rows they hold (MAX_MEMO_SAMPLE_ROWS). Not init fields:
+    # a context copied with dataclasses.replace starts its own bookkeeping.
+    _sample_keys: list[tuple[Any, ...]] = field(default_factory=list, init=False)
+    _sample_rows: int = field(default=0, init=False)
 
     # ---- memo ----
 
@@ -346,6 +358,20 @@ class InsightContext:
 
     async def _metrics(self, key: tuple[Any, ...], fn: Callable[[Any], T]) -> T:
         return await self._cached(("metrics", *key), lambda: self.dbs.metrics.read(fn))
+
+    async def _sample_read(self, key: tuple[Any, ...], fn: Callable[[Any], list[T]]) -> list[T]:
+        """A memoized sample read whose rows count toward `MAX_MEMO_SAMPLE_ROWS` (the oldest reads are forgotten)."""
+        full = ("metrics", *key)
+        known = full in self._memo
+        rows = await self._metrics(key, fn)
+        if not known and full in self._memo and full not in self._sample_keys:
+            self._sample_keys.append(full)
+            self._sample_rows += len(rows)
+            while self._sample_rows > MAX_MEMO_SAMPLE_ROWS and len(self._sample_keys) > 1:
+                oldest = self._sample_keys.pop(0)
+                self._sample_rows -= len(self._memo.pop(oldest, None) or ())
+                self._locks.pop(oldest, None)
+        return rows
 
     # ---- settings ----
 
@@ -444,18 +470,19 @@ class InsightContext:
             lambda c: read_history.upstream_429_rows(c, window.start, window.end, template),
         )
 
-    async def samples(self, window: Window, templates: Iterable[str] | None = None) -> list[dict[str, Any]]:
-        """`request_samples` rows in the window, in time order (the input of plan 11.3 replay and tuning)."""
+    async def samples(self, window: Window, templates: Iterable[str] | None = None) -> list[read_history.SampleRecord]:
+        """`request_samples` rows in the window, in time order (the input of plan 11.3 replay and tuning), as compact
+        read-only mappings (`read_history.SampleRecord`); the run keeps at most `MAX_MEMO_SAMPLE_ROWS` of them."""
         wanted = tuple(sorted(set(templates))) if templates is not None else None
-        return await self._metrics(
+        return await self._sample_read(
             ("samples", window, wanted),
             lambda c: read_history.samples_between(c, window.start, window.end, wanted),
         )
 
-    async def refusal_samples(self, window: Window) -> list[dict[str, Any]]:
+    async def refusal_samples(self, window: Window) -> list[read_history.SampleRecord]:
         """`refusal_samples` rows in the window, in time order: requests a limiter refused (metrics.db schema 7), the
         refused part of the stream a limit dry run replays (finding LOGICFIX-5)."""
-        return await self._metrics(
+        return await self._sample_read(
             ("refusal_samples", window),
             lambda c: read_history.refusal_samples_between(c, window.start, window.end),
         )

@@ -1,0 +1,17 @@
+{#-
+  Upstream page, card `failures` (`roxy/admin/pages/upstream.py failures_card`): v1's Request Failures log (plan
+  14.1 row 24, parity row 72), the page's main table (its search, egress filter, sort and page live in the address
+  bar, so a link shares the view).
+
+  One row per (egress, reason, Roblox status) group with first and last seen and the latest failure's status,
+  method, endpoint, path and error (caller text). A row opens its details in the drawer (v1's "click a row for the
+  last detail"). Export downloads through `GET /admin/api/v1/upstream/failures`.
+  Context: `frame`, `table`, `total`, `capped`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import num %}
+{% set notes = ["Only the 1,000 largest groups are listed; narrow the range to see the rest."] if capped else [] %}
+{% call page_card(frame, flush=True, subtitle=num(total) ~ " failed requests in this range", notices=notes) %}
+<div class="g3-table-host" hx-select="#{{ table.id }}">{{ data_table(**table) }}</div>
+{% endcall %}

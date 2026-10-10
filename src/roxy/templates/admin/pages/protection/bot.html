@@ -1,0 +1,24 @@
+{#-
+  Protection page, card `bot` (`roxy/admin/pages/protection.py bot_card`): bot heuristics (plan 10.7).
+
+  What: the bot score's signals with their weights (`GET /protection/bot`), each weight's share of the score and
+  how the signal is measured; the thresholds; whether the score blocks on its own, and what it refused in the
+  range; how many clients this worker scores now (one worker's tracker, labeled). The weights and thresholds are
+  this card's settings, below. Each client's score is on its Clients page.
+  Context: `frame`, `bot`, `signals`, `total_weight`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/glossary.html" import term with context %}
+{% call page_card(frame) %}
+<p>The {{ term("bot-score", "bot score") }} (0 to 100) is the weighted share of these signals. Recommendations call a client legitimate up to {{ num(bot.settings.bot_score_legit_max) }} and abusive from {{ num(bot.settings.bot_score_abuse_min) }}. {% if bot.block_enabled %}{{ status_badge("warn", "Blocking") }} A score of {{ num(bot.settings.bot_score_block_threshold) }} or more is refused on its own: {{ num(bot.refused.bot_score) }} requests in this range.{% else %}{{ status_badge("neutral", "Not blocking") }} The score never refuses on its own (the block threshold is 0).{% endif %}</p>
+<div class="table-scroll" role="region" aria-labelledby="bot-signals-caption" tabindex="0">
+  <table class="simple-table prot-wrap">
+    <caption id="bot-signals-caption" class="prot-caption">Signals and their weights</caption>
+    <thead><tr><th scope="col">Signal</th><th scope="col" class="num">Weight</th><th scope="col" class="num">Share</th><th scope="col">How it is measured</th></tr></thead>
+    <tbody>{% for s in signals %}<tr><th scope="row">{{ s.label }}</th><td class="num">{{ num(s.weight) }}</td><td class="num">{{ "%.0f"|format(s.share) }}%</td><td>{{ s.how }}</td></tr>{% endfor %}</tbody>
+  </table>
+</div>
+<p class="field__hint">This worker scores {{ num(bot.tracked_clients) }} clients right now (each worker keeps its own tracker; recorded scores are on the Clients page).</p>
+{% endcall %}

@@ -260,6 +260,18 @@ async def endpoints_table(
             return list(data["rows"]), int(data["total"])
 
         return await export_pages(request, admin, TABLE_SPEC, fetch, fmt, tq=tq, filters=filters, tr=tr)
+    return await table_page(ctx, tr, tq, filters)
+
+
+def table_filters(host: str | None, method: str | None) -> dict[str, str]:
+    """The table's `host` and `method` filters, normalized (422 `validation_failed` naming the bad one)."""
+    return _filters(host, method)
+
+
+async def table_page(ctx: Any, tr: TimeRange, tq: TableQuery, filters: dict[str, str]) -> dict[str, Any]:
+    """One page of the endpoints table with its trend and v1's recency columns (the `GET /endpoints` answer); the
+    Endpoints dashboard page calls it too, so both show the same rows."""
+    db = ctx.dbs.metrics
     other = tr.compare_window or queries.comparison_window(tr.window, "previous")
     window = tr.window
 
@@ -402,8 +414,12 @@ async def endpoint_detail(
     template: Annotated[str | None, Query(max_length=MAX_TEMPLATE_CHARS * 4)] = None,
 ) -> dict[str, Any]:
     """The drill-down of one endpoint template (see the module docstring)."""
-    name = checked_template(template)
-    ctx = get_ctx(request)
+    return await detail_answer(get_ctx(request), tr, checked_template(template))
+
+
+async def detail_answer(ctx: Any, tr: TimeRange, name: str) -> dict[str, Any]:
+    """The `GET /endpoints/detail` answer for one checked template (`checked_template`); the dashboard's
+    drill-down renders this same answer."""
     window = tr.window
     other = tr.compare_window or queries.comparison_window(window, "previous")
     filters = {"endpoint_template": name}
@@ -487,9 +503,25 @@ async def endpoint_recent(
     limit: Annotated[int, Query(ge=1, le=RECENT_MAX)] = RECENT_DEFAULT,
 ) -> dict[str, Any]:
     """The newest requests of one template (live rows of every worker, the last 15 minutes), newest first."""
-    name = checked_template(template)
-    rows = await _recent(get_ctx(request), name, limit)
+    return await recent_answer(get_ctx(request), checked_template(template), limit)
+
+
+async def recent_answer(ctx: Any, name: str, limit: int = RECENT_DEFAULT) -> dict[str, Any]:
+    """The `GET /endpoints/recent` answer for one checked template (at most `RECENT_MAX` rows)."""
+    rows = await _recent(ctx, name, max(1, min(int(limit), RECENT_MAX)))
     return {"template": name, "items": rows, "total": len(rows)}
 
 
-__all__ = ["applicable_rules", "checked_template", "router"]
+__all__ = [
+    "RECENT_DEFAULT",
+    "RECENT_MAX",
+    "TABLE_CALLER_TEXT",
+    "TABLE_SPEC",
+    "applicable_rules",
+    "checked_template",
+    "detail_answer",
+    "recent_answer",
+    "router",
+    "table_filters",
+    "table_page",
+]

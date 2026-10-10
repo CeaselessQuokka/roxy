@@ -25,7 +25,9 @@ Why it exists
     same; per-worker values (meters, open sessions, recent exit IPs) say so (`this_worker`).
 
 How it works
-    Thin routes over `metrics/read_upstream.py`, `egress/read_state.py` and the live `EgressClients`. Bytes are
+    Thin routes over `metrics/read_upstream.py`, `egress/read_state.py` and the live `EgressClients`; each read
+    route's work is a module function (`usage_answer`, `budget_answer`, `sessions_answer`, ...) that the Egress
+    page (`roxy/admin/pages/egress.py`) calls too, so the page and the API show the same numbers. Bytes are
     decimal (1 GB = 10^9 bytes, the provider's unit). Writes go through the services: `EgressClients.enable_egress`
     writes its audit row in the same transaction as the change; the provider report is stored in metrics.db and
     audited in control.db (if the audit row cannot be written, the report is taken back and the answer is 503).
@@ -52,6 +54,7 @@ from roxy.admin.api.common import (
     ExportFormatDep,
     TableQuery,
     TableSpec,
+    TimeRange,
     TimeRangeDep,
     table_params,
 )
@@ -94,7 +97,12 @@ TOP_SPEC: Final = TableSpec(
 
 
 def _egress(request: Request) -> Any:
-    egress = get_ctx(request).egress
+    return egress_of(get_ctx(request))
+
+
+def egress_of(ctx: Any) -> Any:
+    """The running `EgressClients`, or 503 while the worker is still starting (C7: never a 500)."""
+    egress = ctx.egress
     if egress is None:
         raise common.unavailable("The egress layer is not running yet; try again shortly.")
     return egress
@@ -110,8 +118,12 @@ def _gb(size: float) -> float:
 @router.get("/usage")
 async def usage(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """Metered bytes and calls per egress over the range (all workers), plus this worker's live meters."""
-    ctx = get_ctx(request)
-    egress = _egress(request)
+    return await usage_answer(get_ctx(request), tr)
+
+
+async def usage_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The answer of `GET /egress/usage` (the Egress page's Usage card renders it, plan P6)."""
+    egress = egress_of(ctx)
     window = tr.window
 
     def read(conn: Any) -> tuple[dict[str, int], dict[str, Any]]:
@@ -162,8 +174,12 @@ def _budget_settings(settings: Any) -> dict[str, Any]:
 @router.get("/rotator/budget")
 async def rotator_budget(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """This billing cycle: used, projected (with a 90 percent band), remaining and cost (plan 8.4, D12)."""
-    ctx = get_ctx(request)
-    egress = _egress(request)
+    return await budget_answer(get_ctx(request))
+
+
+async def budget_answer(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /egress/rotator/budget` (the Egress page's Budget card renders it)."""
+    egress = egress_of(ctx)
     settings = _budget_settings(ctx.settings)
     now = ctx.clock.now()
     start, end = read_state.billing_cycle(now, settings["rotator_billing_day"])
@@ -259,7 +275,11 @@ async def rotator_daily(
     request: Request, _admin: AdminSession, cycle: Literal["current", "previous"] = "current"
 ) -> dict[str, Any]:
     """One bar per UTC day of the billing cycle (bytes, cumulative) with the quota and an even-pace line."""
-    ctx = get_ctx(request)
+    return await daily_answer(get_ctx(request), cycle)
+
+
+async def daily_answer(ctx: Any, cycle: Literal["current", "previous"] = "current") -> dict[str, Any]:
+    """The answer of `GET /egress/rotator/daily` (the Budget card's daily bars)."""
     settings = _budget_settings(ctx.settings)
     now = ctx.clock.now()
     start, end = read_state.billing_cycle(now, settings["rotator_billing_day"])
@@ -299,7 +319,11 @@ async def bytes_per_request(
     request: Request, _admin: AdminSession, tr: TimeRangeDep, egress: EgressName = "rotator"
 ) -> dict[str, Any]:
     """How many calls fell in each bytes-per-call slot on one egress (from per-minute averages; see `basis`)."""
-    ctx = get_ctx(request)
+    return await bytes_per_request_answer(get_ctx(request), tr, egress)
+
+
+async def bytes_per_request_answer(ctx: Any, tr: TimeRange, egress: str = "rotator") -> dict[str, Any]:
+    """The answer of `GET /egress/bytes-per-request` (the Top endpoints card shows the distribution)."""
     window = tr.window
     data = await ctx.dbs.metrics.read(lambda conn: read_upstream.bytes_per_call_histogram(conn, window, egress))
     return {"range": tr.info(), **data}
@@ -315,19 +339,34 @@ async def top_endpoints(
     egress: EgressName = "rotator",
 ) -> Any:
     """Endpoints by metered wire bytes on one egress (default the rotator: the ones that cost money)."""
-    ctx = get_ctx(request)
+    rows, total_bytes = await top_endpoint_rows(get_ctx(request), tr, egress)
+    if fmt is not None:
+        whole = common.TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q)
+        items, total = common.page_rows(rows, whole, search_keys=TOP_SEARCH)
+        return await common.export_table(
+            request, admin, TOP_SPEC, items, fmt, total=total, tq=tq, tr=tr, filters={"egress": egress}
+        )
+    return top_endpoints_answer(rows, total_bytes, tq, tr, egress)
+
+
+TOP_SEARCH: Final = ("template",)
+
+
+async def top_endpoint_rows(ctx: Any, tr: TimeRange, egress: str = "rotator") -> tuple[list[dict[str, Any]], int]:
+    """Every endpoint's metered bytes on one egress in the range, with its share, and the egress's total bytes."""
     window = tr.window
     rows = await ctx.dbs.metrics.read(lambda conn: read_upstream.endpoint_bytes(conn, window, egress))
     total_bytes = sum(row["bytes"] for row in rows)
     for row in rows:
         row["share_pct"] = round(row["bytes"] * 100.0 / total_bytes, 2) if total_bytes else None
-    if fmt is not None:
-        whole = common.TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q)
-        items, total = common.page_rows(rows, whole, search_keys=("template",))
-        return await common.export_table(
-            request, admin, TOP_SPEC, items, fmt, total=total, tq=tq, tr=tr, filters={"egress": egress}
-        )
-    items, total = common.page_rows(rows, tq, search_keys=("template",))
+    return rows, total_bytes
+
+
+def top_endpoints_answer(
+    rows: list[dict[str, Any]], total_bytes: int, tq: TableQuery, tr: TimeRange, egress: str
+) -> dict[str, Any]:
+    """One page of `top_endpoint_rows` as the `GET /egress/top-endpoints` answer (the page's card renders it)."""
+    items, total = common.page_rows(rows, tq, search_keys=TOP_SEARCH)
     return common.table_answer(TOP_SPEC, tq, items, total) | {
         "range": tr.info(),
         "egress": egress,
@@ -338,7 +377,11 @@ async def top_endpoints(
 @router.get("/share")
 async def call_share(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """Upstream calls per egress over time, and each egress's share of the calls in every bucket."""
-    ctx = get_ctx(request)
+    return await share_answer(get_ctx(request), tr)
+
+
+async def share_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The answer of `GET /egress/share` (calls and share per egress as series)."""
     window = tr.window
     data = await queries.series(ctx.dbs.metrics, window, metrics=["upstream_calls"], group_by="egress")
     buckets = data["buckets"]
@@ -379,12 +422,16 @@ async def exit_ips(request: Request, admin: AdminSession, reveal: bool = False) 
 
         with common.service_errors():  # no audit row, no reveal (fail closed, plan 9.7)
             await ctx.dbs.control.write(write)
-    return {
-        "items": items,
-        "masked": not reveal,
-        "this_worker": True,
-        "note": "Exit IPs are kept per worker (the last rotator_recent_ips probes); never in the LLM export.",
-    }
+    return exit_ips_view(items, masked=not reveal)
+
+
+EXIT_IPS_NOTE: Final = "Exit IPs are kept per worker (the last rotator_recent_ips probes); never in the LLM export."
+
+
+def exit_ips_view(items: list[dict[str, Any]], *, masked: bool) -> dict[str, Any]:
+    """The `GET /egress/exit-ips` answer around `RotatorPool.recent_exit_ips` items (the Egress page shows the
+    masked form; only this audited route reveals them)."""
+    return {"items": items, "masked": masked, "this_worker": True, "note": EXIT_IPS_NOTE}
 
 
 @router.post("/rotator/probe")
@@ -406,8 +453,12 @@ async def probe_rotator(request: Request, _admin: AdminSession, _csrf: CsrfCheck
 @router.get("/sessions")
 async def sessions(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """Rotator session health: mode, open sessions, the fleet-wide park and streak, and 429s per exit."""
-    ctx = get_ctx(request)
-    egress = _egress(request)
+    return await sessions_answer(get_ctx(request), tr)
+
+
+async def sessions_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The answer of `GET /egress/sessions` (the Egress page's Sessions and Rotator cards)."""
+    egress = egress_of(ctx)
     pool = egress.rotator
     settings = ctx.settings
     now_ms = int(ctx.clock.now_ms())
@@ -450,7 +501,8 @@ class ProviderReportBody(ApiBody):
     reason: Reason = ""
 
 
-async def _provider_view(ctx: Any) -> dict[str, Any]:
+async def provider_view(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /egress/provider-report` (the Egress page's Budget card shows it next to its form)."""
     billing_day = int(ctx.settings.get("rotator_billing_day"))
     start, end = read_state.billing_cycle(ctx.clock.now(), billing_day)
 
@@ -475,7 +527,7 @@ async def _provider_view(ctx: Any) -> dict[str, Any]:
 @router.get("/provider-report")
 async def provider_report(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """The newest provider figure, Roxy's metered bytes for the cycle, and how far apart they are."""
-    return await _provider_view(get_ctx(request))
+    return await provider_view(get_ctx(request))
 
 
 @router.post("/provider-report", status_code=201)
@@ -508,7 +560,7 @@ async def add_provider_report(
         except SharedStateUnavailable:
             log.error("provider_report_unaudited", extra={"fields": {"report_id": report_id}})
         raise common.unavailable("control.db is busy, so the figure could not be audited and was not kept.") from None
-    return await _provider_view(ctx) | {"audit_id": audit_id}
+    return await provider_view(ctx) | {"audit_id": audit_id}
 
 
 # ----------------------------------------------------------------------------------- leak guard trips
@@ -517,8 +569,12 @@ async def add_provider_report(
 @router.get("/trips")
 async def trips(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Egresses the leak guard disabled (fleet-wide rows), where it found the credential, and since when."""
-    ctx = get_ctx(request)
-    egress = _egress(request)
+    return await trips_answer(get_ctx(request))
+
+
+async def trips_answer(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /egress/trips` (the Egress page's Leak guard card)."""
+    egress = egress_of(ctx)
     with common.service_errors():
         rows = await ctx.dbs.control.read(read_state.leak_trips)
     items = [
@@ -559,4 +615,20 @@ async def enable_egress(
     return {"egress": name, "enabled": bool(enabled), "disabled_reason": why or None}
 
 
-__all__ = ["TOP_SPEC", "router"]
+__all__ = [
+    "EXIT_IPS_NOTE",
+    "TOP_SPEC",
+    "budget_answer",
+    "bytes_per_request_answer",
+    "daily_answer",
+    "egress_of",
+    "exit_ips_view",
+    "provider_view",
+    "router",
+    "sessions_answer",
+    "share_answer",
+    "top_endpoint_rows",
+    "top_endpoints_answer",
+    "trips_answer",
+    "usage_answer",
+]

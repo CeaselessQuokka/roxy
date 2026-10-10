@@ -1,0 +1,14 @@
+{#-
+  Upstream page, card `challenges` (`roxy/admin/pages/upstream.py challenges_card`): answers that were a bot check
+  or an HTML page instead of JSON, by egress and endpoint (`GET /admin/api/v1/upstream/challenges`, the evidence
+  UP-CHALLENGE reads). Endpoint templates are caller text.
+  Context: `frame`, `table`, `flagged`.
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import num %}
+{% call page_card(frame, flush=True, subtitle=num(flagged) ~ " endpoints with flagged answers") %}
+<div class="g3-table-host" hx-select="#{{ table.id }}">{{ data_table(**table) }}</div>
+{% endcall %}
+{% endif %}

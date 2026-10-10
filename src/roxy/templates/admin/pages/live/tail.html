@@ -1,0 +1,22 @@
+{#-
+  Live page, card `tail` (`roxy/admin/pages/live.py tail_card`; plan 14.1 row 8, 14.11, parity rows 81, 126).
+
+  The live tail component (components/live_tail.html, static/js/live_tail.js): every worker's requests over the
+  event stream, newest on top, pausable, filtered in the browser and on the server, keyboard navigable; a row opens
+  the request drawer (`/admin/live/request?id=`). The stream URL replays the newest recorded rows first
+  (`last_event_id`), so the list is not empty on load. The sampling note says what plan 14.11's limits mean, and
+  `data-live-filters` hands the address's checked filters to the page script. The reset button clears the live feed
+  and the captures (plan 6.8). This card is never refreshed in place: that would drop the list.
+  Context: `frame`, `stream_url`, `detail_url`, `filters_json`, `notices`, `keep_minutes`, `worker_rate`,
+  `stream_rate`, `reset_href`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/live_tail.html" import live_tail %}
+{% from "components/icon.html" import icon %}
+{% set actions %}
+<button type="button" class="btn btn--sm btn--ghost" data-drawer-src="{{ reset_href }}" data-drawer-title="Clear the live feed and the captures" data-action="live-reset">{{ icon("reset") }}<span>Delete the records</span></button>
+{% endset %}
+{% call page_card(frame, actions=actions, notices=notices, cls="lv-tail-card") %}
+<p class="lv-note" data-live-filters="{{ filters_json }}">{{ icon("info") }}<span>Requests finish here within a second, from every worker. When more than {{ stream_rate }} a second match the filters the list shows a sample of them, and each worker records at most {{ worker_rate }} a second; records are kept {{ keep_minutes }} minutes.</span></p>
+{{ live_tail("live-tail", stream_url, detail_url=detail_url, title="Requests as they finish", level=3, max_rows=1000) }}
+{% endcall %}

@@ -9,9 +9,10 @@ import pytest
 from upstream_fakes import FakeSettings, read_rows
 
 from roxy.core.reasons import Egress
-from roxy.upstream import breaker
+from roxy.upstream import breaker, buckets
 from roxy.upstream.adaptive import AttributionKind
 from roxy.upstream.breaker import BreakerPolicy, BreakerRow, BreakerState
+from roxy.upstream.buckets import BucketSpec
 from roxy.upstream.cooldowns import CooldownPolicy, RateLimitInfo
 from roxy.upstream.effects import CallFacts, EffectsConfig, apply_call_outcome, should_record
 from roxy.upstream.status import AttemptKind
@@ -55,6 +56,18 @@ def test_direct_429_cools_the_endpoint_and_trips_its_breaker(dbs: Any) -> None:
     assert effects.attribution is not None
     assert effects.attribution.kind is AttributionKind.ENDPOINT
     assert [t.reason for t in effects.transitions] == ["rate_limited"]
+
+
+def test_direct_429_reads_the_calls_the_window_buckets_let_through(dbs: Any) -> None:
+    """Finding LOAD-1: the 429's own transaction reads how many calls the endpoint and host buckets granted in the
+    last minute (their meters), the rate Roblox refused, for the adaptive cut."""
+    specs = (BucketSpec(f"host:{HOST}", 240, 15), BucketSpec(f"endpoint:{TEMPLATE}", 120, 10))
+    for k in range(61):  # 61 calls in 48 s, as the busiest endpoint of the replay
+        dbs.hot.write_sync(lambda conn, k=k: buckets.reserve_in(conn, specs, NOW_MS - 48_000 + 800 * k, 4000))
+    effects = apply(dbs, facts(AttemptKind.RATE_LIMITED))
+    assert effects.observed == {f"endpoint:{TEMPLATE}": 61, f"host:{HOST}": 61}
+    rotator = apply(dbs, facts(AttemptKind.RATE_LIMITED, egress=Egress.ROTATOR, exit_id="s1"), NOW_MS + 10)
+    assert rotator.observed == {}  # rotator exits are other addresses: no adaptive cut, nothing to read
 
 
 def test_second_429_in_the_same_episode_is_not_first(dbs: Any) -> None:

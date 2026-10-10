@@ -1,0 +1,70 @@
+{#-
+  System page, card `metrics-pipeline` (`roxy/admin/pages/system.py pipeline_card`): queues, flushes and drops.
+
+  `GET /admin/api/v1/system/metrics-pipeline` (`system_api.pipeline_view`). Each worker keeps its counters in memory
+  and writes them every `metrics_flush_interval_ms`; this card shows the worker that answered ("this worker"), every
+  worker's drops of the last hour from shared state ("fleet"), and each database writer of this worker. Drops mean
+  some numbers are missing, which the card says in words. The catalog settings placed here follow below the body.
+  Context: `frame`, `answer`, `recorder`, `batch`, `last_flush`, `drops`, `fleet_dropped`, `databases`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/badges.html" import badge %}
+{% from "admin/pages/system/_macros.html" import when, ms %}
+{% call page_card(frame, subtitle="This worker's queue and writers, and the fleet's drops of the last hour") %}
+<div class="stack">
+  {% if fleet_dropped %}
+  {{ inline_alert("warn", "Some numbers are missing", num(fleet_dropped) ~ " metric items were dropped in the last hour because a queue was full or a write failed. Totals on other pages are lower than what really happened in those minutes.") }}
+  {% endif %}
+  <div class="system-columns">
+    <section class="system-section" aria-labelledby="pipeline-worker-title">
+      <h3 class="system-section__title" id="pipeline-worker-title">This worker {{ badge("this worker", "neutral") }}</h3>
+      <dl class="kv system-kv">
+        <dt>Queued</dt><dd>{{ num(batch.queued) }}{% if batch.max_items %} of {{ num(batch.max_items) }}{% endif %}</dd>
+        <dt>Dropped since start</dt><dd>{{ num(recorder.metrics_dropped) }}</dd>
+        <dt>Flushes</dt><dd>{{ num(batch.flushes) }}{% if batch.flush_failures %}, {{ num(batch.flush_failures) }} failed{% endif %}</dd>
+        <dt>Last flush</dt><dd>{{ when(last_flush) }}{% if batch.last_flush_ms is not none %}, took {{ ms(batch.last_flush_ms) }}{% endif %}</dd>
+        <dt>Recording errors</dt><dd>{{ num(recorder.record_errors) }}</dd>
+        <dt>History items dropped</dt><dd>{{ num(recorder.history_dropped) }}</dd>
+        <dt>Captures dropped</dt><dd>{{ num(recorder.capture_dropped) }}{% if recorder.capture_errors %}, {{ num(recorder.capture_errors) }} errors{% endif %}</dd>
+        <dt>Endpoint templates</dt><dd>{{ num(recorder.templates_known) }} known{% if recorder.templates_rejected %}, {{ num(recorder.templates_rejected) }} refused{% endif %}</dd>
+        <dt>Live rows kept</dt><dd>{{ num(recorder.live_ring) }}</dd>
+        <dt>Forced flushes here</dt><dd>{{ num(answer.forced_flushes_here) if answer.forced_flushes_here is not none else "n/a" }}</dd>
+      </dl>
+    </section>
+    <section class="system-section" aria-labelledby="pipeline-fleet-title">
+      <h3 class="system-section__title" id="pipeline-fleet-title">Every worker, last hour {{ badge("fleet", "neutral") }}</h3>
+      <dl class="kv system-kv">
+        <dt>Items dropped</dt><dd>{{ num(drops.dropped or 0) }}</dd>
+        <dt>History items dropped</dt><dd>{{ num(drops.history_dropped or 0) }}</dd>
+        <dt>Captures dropped</dt><dd>{{ num(drops.capture_dropped or 0) }}</dd>
+        <dt>Minutes with drops</dt><dd>{{ num(drops.minutes_with_drops or 0) }}</dd>
+        <dt>Rows per minute</dt><dd>{{ num(answer.dims_per_minute_last_hour, 1) if answer.dims_per_minute_last_hour is not none else "n/a" }} <span class="muted">distinct counter rows a minute (above 1,500 the disk grows fast)</span></dd>
+      </dl>
+      {% if not answer.fleet_drops_last_hour %}<p class="muted">The fleet's drops could not be read: metrics.db was busy. Try again in a moment.</p>{% endif %}
+    </section>
+  </div>
+  <div class="table-scroll system-stack-wrap" role="region" aria-labelledby="pipeline-db-caption" tabindex="0">
+    <table class="simple-table system-stack">
+      <caption class="system-caption" id="pipeline-db-caption">Database writers of this worker</caption>
+      <thead><tr><th scope="col">Database</th><th scope="col" class="num">Writes</th><th scope="col" class="num">Reads</th><th scope="col" class="num">Write errors</th><th scope="col" class="num">Busy</th><th scope="col" class="num">Last write</th><th scope="col" class="num">Slowest write</th><th scope="col" class="num">Waiting</th></tr></thead>
+      <tbody>
+        {% for db in databases %}
+        <tr>
+          <th scope="row" data-label="Database" class="mono">{{ db.db }}</th>
+          <td data-label="Writes" class="num">{{ num(db.writes) }}</td>
+          <td data-label="Reads" class="num">{{ num(db.reads) }}</td>
+          <td data-label="Write errors" class="num">{{ num(db.write_errors) }}</td>
+          <td data-label="Busy" class="num">{{ num((db.unavailable or 0) + (db.busy_fast_failures or 0) + (db.deadline_failures or 0)) }}</td>
+          <td data-label="Last write" class="num">{{ ms(db.last_write_ms) }}</td>
+          <td data-label="Slowest write" class="num">{{ ms(db.max_write_ms) }}</td>
+          <td data-label="Waiting" class="num">{% if db.pending is mapping %}{{ num(db.pending.write or 0) }} writes, {{ num(db.pending.read or 0) }} reads{% else %}{{ db.pending }}{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">Busy counts writes that found the database locked for too long (unavailable, quick refusals and missed deadlines). Waiting is how many operations are queued for the database's writer right now.</p>
+</div>
+{% endcall %}

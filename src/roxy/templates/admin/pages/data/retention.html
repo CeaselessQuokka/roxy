@@ -1,0 +1,15 @@
+{#-
+  Data page, card `retention` (`roxy/admin/pages/data.py retention_card`): how long each kind of record is kept
+  (plan 6.10). The body lists every table with a limit against it (`GET /admin/api/v1/data/retention`: its rows, its
+  oldest row, its age limit and row cap with links to the settings that set them, the fixed rules the code sets,
+  and whether rows wait for the next prune); the settings themselves are placed below by the catalog
+  (`data#retention`). The leader's retention job enforces the limits every 10 minutes. Context: `frame`, `rows`,
+  `due`, `audit_min_days`, `measured`, `human_bytes`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "admin/pages/data/_macros.html" import limit_table %}
+{% set subtitle = (rows|length) ~ " tables with a limit" ~ (", " ~ due ~ " waiting for the next prune" if due else ", every one within its limits") %}
+{% call page_card(frame, flush=True, subtitle=subtitle) %}
+<p class="data-intro">Every table has an age limit, a row cap, or both. The leader's retention job deletes what is past its limit every 10 minutes (oldest first) and gives the space back. The audit log is kept at least {{ audit_min_days }} days, whatever its setting says.</p>
+{{ limit_table(rows, "Tables and their retention limits", human_bytes) }}
+{% endcall %}

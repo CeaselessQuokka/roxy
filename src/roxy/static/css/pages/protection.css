@@ -1,0 +1,568 @@
+/*
+ * The Protection page (templates/admin/pages/protection*): its own layout pieces.
+ *
+ * What this is
+ *   The "On this page" list, the group labels, the pipeline diagram, the sub-tabs inside cards, the ladder editor,
+ *   the repeat offender timeline, the testers' results, the drawers, and small stat lists. Everything else (cards,
+ *   tables, forms, dialogs, badges, KPI tiles) comes from components.css.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract). Only tokens
+ *   from tokens.css are used, so both themes follow and every pair keeps its checked contrast.
+ * How it works
+ *   Mobile first: one column, wrapping rows, tables that scroll inside their own region (never the page), and touch
+ *   sized tabs on coarse pointers (plan 14.8). Bars are native <meter> elements (no inline style is ever needed,
+ *   plan 9.2), colored with the accent and status tokens.
+ * What to read next
+ *   static/css/components.css, templates/admin/pages/protection.html, static/js/pages/protection.js.
+ */
+
+/* ------------------------------------------------------------------------------------------- on this page */
+.prot-toc {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-1);
+}
+
+.prot-toc__summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--target-min);
+  padding: var(--sp-3) var(--sp-4);
+  cursor: pointer;
+  font-weight: var(--fw-semibold);
+  list-style: none;
+}
+
+.prot-toc__summary::-webkit-details-marker {
+  display: none;
+}
+
+.prot-toc__chevron {
+  margin-left: auto;
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.prot-toc[open] .prot-toc__chevron {
+  transform: rotate(180deg);
+}
+
+.prot-toc__nav {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--sp-3) var(--sp-6);
+  padding: 0 var(--sp-4) var(--sp-4);
+}
+
+.prot-toc__label {
+  margin: 0 0 var(--sp-1);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.prot-toc__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prot-toc__links a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-min);
+}
+
+.prot-group__label {
+  margin: var(--sp-2) 0 0;
+  padding-bottom: var(--sp-1);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* ------------------------------------------------------------------------------------------- shared pieces */
+/* A link inside a sentence is underlined, so it never relies on color alone (WCAG 1.4.1). */
+.prot-group p a:not(.btn),
+.prot-group li a:not(.btn),
+.prot-drawer p a:not(.btn) {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.prot-lead {
+  max-width: 90ch;
+}
+
+.prot-pad {
+  padding: var(--sp-3) var(--sp-4);
+}
+
+.prot-foot {
+  padding: var(--sp-3) var(--sp-4) 0;
+}
+
+.prot-caption {
+  padding: var(--sp-2) 0;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  text-align: left;
+}
+
+.prot-sub {
+  display: grid;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.prot-sub__title {
+  font-size: var(--fs-3);
+  font-weight: var(--fw-semibold);
+}
+
+.prot-subgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--sp-4);
+  margin-top: var(--sp-4);
+}
+
+.prot-list {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prot-list li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: 2px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+
+.prot-list strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.prot-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-3);
+  margin: 0 0 var(--sp-4);
+}
+
+.prot-stats__item {
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.prot-stats dt {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.prot-stats dd {
+  margin: 0;
+  font-size: var(--fs-4);
+  font-weight: var(--fw-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.prot-counts {
+  display: grid;
+  gap: var(--sp-1);
+  margin: var(--sp-3) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prot-counts__n {
+  font-variant-numeric: tabular-nums;
+}
+
+.prot-meter {
+  width: 100%;
+  min-width: 64px;
+  height: 8px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+}
+
+.prot-meter::-webkit-meter-bar {
+  height: 8px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+}
+
+.prot-meter::-webkit-meter-optimum-value,
+.prot-meter::-webkit-meter-suboptimum-value {
+  border-radius: var(--radius-pill);
+  background: var(--accent-bg);
+}
+
+.prot-meter::-webkit-meter-even-less-good-value {
+  border-radius: var(--radius-pill);
+  background: var(--bad);
+}
+
+.prot-meter::-moz-meter-bar {
+  border-radius: var(--radius-pill);
+  background: var(--accent-bg);
+}
+
+.prot-meter--wide {
+  height: 12px;
+}
+
+.prot-meter--wide::-webkit-meter-bar {
+  height: 12px;
+}
+
+/* Long words (paths, keys, patterns) never widen a card. */
+.prot-drawer dd,
+.prot-step__body,
+.prot-timeline__what,
+.prot-result {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------------------------------- pipeline */
+.prot-pipeline {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prot-step {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: var(--sp-2) var(--sp-3);
+  align-items: start;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+}
+
+.prot-step--hit {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+
+.prot-step--marker {
+  border-style: dashed;
+}
+
+.prot-step__n {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--surface-3);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.prot-step__title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1) var(--sp-2);
+  margin: 0;
+  font-weight: var(--fw-semibold);
+}
+
+.prot-step__meta {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.prot-step__count {
+  grid-column: 2;
+  display: grid;
+  gap: 4px;
+}
+
+.prot-step__count p {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.prot-explainer {
+  margin-top: var(--sp-3);
+}
+
+/* ------------------------------------------------------------------------------------------- tabs */
+.prot-tabs {
+  display: grid;
+  gap: 0;
+  min-width: 0;
+}
+
+.prot-tabs__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  padding: 0 var(--sp-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.prot-tabs__tab {
+  min-height: 36px;
+  margin-bottom: -1px;
+  padding: 0 var(--sp-3);
+  border: 1px solid transparent;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+}
+
+.prot-tabs__tab:hover {
+  color: var(--text);
+}
+
+.prot-tabs__tab[aria-selected="true"] {
+  border-color: var(--border);
+  border-bottom: 2px solid var(--accent);
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: var(--fw-semibold);
+}
+
+.prot-tabs__tab:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.prot-tabs__panel {
+  min-width: 0;
+}
+
+.prot-tabbar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4) 0;
+}
+
+/* A card that is not flush pads its body: tabs inside it reach its edges like a flush card's. */
+.card__body > .prot-tabs {
+  margin-inline: calc(var(--sp-4) * -1);
+}
+
+/* ------------------------------------------------------------------------------------------- ladder */
+.prot-timeline {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prot-timeline li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+  padding-left: var(--sp-3);
+  border-left: 3px solid var(--accent);
+}
+
+.prot-timeline__at {
+  color: var(--accent);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.prot-ladder {
+  margin-top: var(--sp-4);
+}
+
+.prot-ladder__table td,
+.prot-ladder__table th {
+  vertical-align: middle;
+}
+
+.prot-ladder__table .input {
+  min-width: 96px;
+}
+
+.prot-ladder__table .input--num {
+  min-width: 72px;
+  max-width: 120px;
+}
+
+.prot-ladder__rung {
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.prot-dirty {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--warn);
+}
+
+/* ------------------------------------------------------------------------------------------- tables with prose */
+.prot-detectors-table td,
+.prot-detectors-table th,
+.prot-tarpit-cats th,
+.prot-wrap td,
+.prot-wrap th {
+  white-space: normal;
+}
+
+.simple-table tbody th[scope="row"] {
+  color: var(--text);
+  font-weight: var(--fw-medium);
+}
+
+.prot-tarpit-cats th[scope="row"] {
+  min-width: 220px;
+}
+
+/* ------------------------------------------------------------------------------------------- drawers, forms */
+.prot-drawer .kv {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.prot-drawer__form {
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.prot-events {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding-left: var(--sp-4);
+}
+
+.prot-me {
+  display: grid;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.prot-me p {
+  margin: 0;
+}
+
+.prot-field-check {
+  align-content: end;
+}
+
+.prot-gauge {
+  display: grid;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0;
+}
+
+.prot-gauge p {
+  margin: 0;
+}
+
+.prot-tiles {
+  margin: var(--sp-3) 0;
+}
+
+/* ------------------------------------------------------------------------------------------- testers */
+.prot-result {
+  display: grid;
+  gap: var(--sp-3);
+}
+
+.prot-result:empty {
+  display: none;
+}
+
+.prot-result__title {
+  margin: 0 0 var(--sp-1);
+  font-weight: var(--fw-semibold);
+}
+
+.prot-result__draft {
+  margin: 0;
+}
+
+.prot-result code {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+}
+
+@media (min-width: 720px) {
+  .prot-stats {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .prot-step {
+    grid-template-columns: 28px minmax(0, 1fr) minmax(160px, 220px);
+  }
+
+  .prot-step__count {
+    grid-column: 3;
+  }
+}
+
+/* Phones: components.css hides a data table's header row (each row is a card) with a 1 px absolute box whose
+   overflow does not apply while it is a table header group, so a wide header still widened the page. As a block
+   its overflow clips the header cells (reported to the integrator for components.css). */
+@media (max-width: 640px) {
+  .prot-group .dt__table thead {
+    display: block;
+  }
+}
+
+@media (max-width: 480px) {
+  .prot-drawer .kv {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .card__body > .prot-tabs {
+    margin-inline: calc(var(--sp-3) * -1);
+  }
+}
+
+@media (pointer: coarse) {
+  .prot-tabs__tab,
+  .prot-toc__links a,
+  .prot-toc__summary {
+    min-height: var(--target-touch);
+  }
+}

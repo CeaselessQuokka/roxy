@@ -37,6 +37,8 @@ How it works
       such fields in `caller_text`, and a page shows them escaped, never as markup (plan 9.16).
     - Place names in tables come only from the lookup cache (no upstream call per row); a client page offers the
       lookup button instead.
+    - The read routes delegate to `client_table_answer`, `ip_view` and `place_view`, which the Clients dashboard
+      page (`roxy/admin/pages/clients.py`) calls too (one source of truth per number, plan P6).
 
 What to read next
     `roxy/metrics/queries.py` (`client_table`), `roxy/metrics/read_clients.py`, `roxy/upstream/internal.py`
@@ -47,7 +49,7 @@ from __future__ import annotations
 
 import ipaddress
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final, Literal
 
@@ -227,6 +229,16 @@ async def _table(
     client_type: str,
 ) -> Any:
     ctx = get_ctx(request)
+    if fmt is not None:
+        with service_errors():
+            return await export_pages(request, admin, spec, _client_rows(ctx, tq, tr, client_type), fmt, tq=tq, tr=tr)
+    return await client_table_answer(ctx, spec, tq, tr, client_type)
+
+
+def _client_rows(
+    ctx: Any, tq: TableQuery, tr: TimeRange, client_type: str
+) -> Callable[[int, int], Awaitable[tuple[Sequence[Any], int]]]:
+    """A paged reader of decorated client rows (`fetch(page, size) -> (rows, total)`)."""
     now = ctx.clock.now()
     upstream = getattr(ctx, "upstream", None)
     lookup = place_lookup_for(upstream) if upstream is not None else None
@@ -238,10 +250,15 @@ async def _table(
         await _decorate(ctx, client_type, rows, lookup)
         return rows, int(data["total"])
 
+    return fetch
+
+
+async def client_table_answer(
+    ctx: Any, spec: TableSpec, tq: TableQuery, tr: TimeRange, client_type: str
+) -> dict[str, Any]:
+    """The `GET /clients/ips` or `/clients/places` answer (the Clients page tables read the same function)."""
     with service_errors():
-        if fmt is not None:
-            return await export_pages(request, admin, spec, fetch, fmt, tq=tq, tr=tr)
-        items, total = await fetch(tq.page, tq.page_size)
+        items, total = await _client_rows(ctx, tq, tr, client_type)(tq.page, tq.page_size)
     answer = table_answer(spec, tq, items, total)
     answer["range"] = tr.info()
     answer["peers_basis"] = read_client_extras.PEERS_BASIS
@@ -431,8 +448,12 @@ async def ip_page(
     request: Request, _admin: AdminSession, tr: TimeRangeDep, ip: Annotated[str, Path(max_length=64)]
 ) -> dict[str, Any]:
     """One address: range totals and timeline, the last hour, refusals, bans, bypass, strikes, bot score, probes."""
-    ctx = get_ctx(request)
-    address = _ip(ip)
+    return await ip_view(get_ctx(request), tr, _ip(ip))
+
+
+async def ip_view(ctx: Any, tr: TimeRange, address: str) -> dict[str, Any]:
+    """The `GET /clients/ips/{ip}` answer for an address already checked (`_ip`); the Clients page's client view
+    reads the same function."""
     now = ctx.clock.now()
     start_ms, end_ms = tr.window.start * 1000, tr.window.end * 1000
     key_bytes = getattr(ctx.recorder, "ip_hash_key", None) or getattr(ctx, "ip_hash_key", None)
@@ -501,7 +522,12 @@ async def place_page(
     request: Request, _admin: AdminSession, tr: TimeRangeDep, place: Annotated[str, Path(pattern=PLACE_PATTERN)]
 ) -> dict[str, Any]:
     """One place: range totals and timeline, the last hour, refusals, ban state and the cached lookup."""
-    ctx = get_ctx(request)
+    return await place_view(get_ctx(request), tr, place)
+
+
+async def place_view(ctx: Any, tr: TimeRange, place: str) -> dict[str, Any]:
+    """The `GET /clients/places/{place}` answer for one place id; the Clients page's client view reads the same
+    function."""
     now = ctx.clock.now()
     start_ms, end_ms = tr.window.start * 1000, tr.window.end * 1000
 
@@ -517,7 +543,8 @@ async def place_page(
 
     with service_errors():
         data = await ctx.dbs.metrics.read(read)
-    cached = _lookup(request).peek(place) if getattr(ctx, "upstream", None) is not None else None
+    upstream = getattr(ctx, "upstream", None)
+    cached = place_lookup_for(upstream).peek(place) if upstream is not None else None
     last_hour = dict(data["last_hour"])
     last_hour.pop("minutes", None)
     return {
@@ -730,4 +757,14 @@ async def place_lookup(
     return await _run_lookup(request, place, "place")
 
 
-__all__ = ["CachedPlaceLookup", "bot_score_for", "router"]
+__all__ = [
+    "IP_SPEC",
+    "PLACE_PATTERN",
+    "PLACE_SPEC",
+    "CachedPlaceLookup",
+    "bot_score_for",
+    "client_table_answer",
+    "ip_view",
+    "place_view",
+    "router",
+]

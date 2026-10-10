@@ -1,0 +1,35 @@
+{#-
+  Overview, card `outcomes` (`roxy/admin/pages/overview.py outcomes_card`): how requests ended in the range
+  (plan 14.1 "outcome breakdown").
+
+  A table, so it reads well without color: the outcome in words, the count, and the share as text plus a <meter>
+  bar (a native element: no inline style, and screen readers announce its value). OPTIONS requests answered by
+  Roxy itself are recorded under "Served by Roblox" (the closest value of the closed outcome list) but never reached
+  Roblox, so the card says how many there were (P6). Context: `frame`, `total`, `items`, `answered_locally`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/empty.html" import empty_state %}
+{% call page_card(frame, subtitle=(num(total) ~ " requests in this range") if total else None) %}
+{% if items %}
+<table class="ov-outcomes">
+  <caption class="sr-only">How requests ended, with each outcome's share of {{ num(total) }} requests</caption>
+  <thead><tr><th scope="col">Outcome</th><th scope="col" class="num">Requests</th><th scope="col">Share</th></tr></thead>
+  <tbody>
+    {% for item in items %}
+    <tr data-outcome="{{ item.outcome }}">
+      <th scope="row">{{ item.label }}</th>
+      <td class="num">{{ num(item.requests) }}</td>
+      <td class="ov-outcomes__share">
+        <meter class="ov-meter ov-meter--{{ item.outcome }}" min="0" max="100" value="{{ item.share_pct or 0 }}" aria-label="{{ item.label }}: {{ item.share_pct or 0 }} percent"></meter>
+        <span class="ov-outcomes__pct">{{ "%.1f"|format(item.share_pct or 0) }}%</span>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% if answered_locally %}<p class="muted ov-note">{{ num(answered_locally) }} of the requests served by Roblox were OPTIONS requests Roxy answered itself; they never reached Roblox.</p>{% endif %}
+{% else %}
+{{ empty_state("No requests in this range", "When callers use the proxy, this card shows how many requests were served from the cache, by Roblox, refused by Roxy's protection, or failed.", "activity", "neutral") }}
+{% endif %}
+{% endcall %}

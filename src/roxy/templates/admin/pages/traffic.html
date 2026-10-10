@@ -1,0 +1,28 @@
+{#-
+  The Traffic page (`roxy/admin/pages/traffic.py`; plan 14.1 Traffic row, 14.2, 14.3).
+
+  Layout: one column, the requests chart first (it is in the first paint), then bytes, verbs, the status codes,
+  latency, the busiest hours and the trends, each full width (a card puts its chart beside its small tables on a
+  wide screen). Every card but the first loads when it scrolls into view. `how_to_read` adds what each card's words
+  mean to the registry's paragraphs, with glossary terms for the jargon.
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/glossary.html" import term with context %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>Outcomes: <strong>served by Roblox</strong> means Roxy called Roblox and passed the answer on; <strong>served from the cache</strong> means Roblox never saw the request ({{ term("hit", "a cache hit") }} or a shared fetch, {{ term("coalescing") }}); <strong>refused</strong> means Roxy's own protection turned the caller away ({{ term("refusal") }}); <strong>failed</strong> means Roxy tried and could not answer (a Roblox error, a timeout, a {{ term("cooldown") }}).</p>
+<p>Bytes from and to callers are what Roxy received and sent for proxy requests; bytes from and to Roblox are what went over the wire for each {{ term("egress") }} path. The rotator's bytes cost money; the Egress page tracks its budget.</p>
+<p>{{ term("latency", "Latency") }} is shown as {{ term("percentile", "percentiles") }}: p95 is the time 95 out of 100 requests stayed under. Split it by verb, egress, host or outcome to see which part is slow; the outcome split is v1's "successes and failures" toggle.</p>
+<p>The busiest hours grid adds up every hour of each weekday in the range; switch "Show numbers" to read it as a table. Trends compare the last 7, 30 and 365 days with the same length just before, whatever range the top bar shows.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["requests"] }}
+{{ cards["bytes"] }}
+{{ cards["verbs"] }}
+{{ cards["status"] }}
+{{ cards["latency"] }}
+{{ cards["heatmap"] }}
+{{ cards["trends"] }}
+{% endblock %}

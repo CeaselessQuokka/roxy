@@ -1,0 +1,14 @@
+{#-
+  Recommendations, card `history` (`roxy/admin/pages/recommendations.py history_card`): every action taken on a
+  recommendation (plan 14.1 "history"): applies, undos, snoozes, dismissals, automatic applies and rollbacks.
+
+  A second table on the page (its state is kept in its own requests, not in the address). The range in the top bar
+  filters by when the action happened ("All" shows every one). A row opens the recommendation it acted on. Who
+  acted and the summary (which can hold a reason someone typed) are shown as plain text.
+  Context: `frame`, `table`, `whole`, `range_label`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% call page_card(frame, flush=True, subtitle=("Every action" if whole else "Actions in: " ~ range_label)) %}
+{{ data_table(**table) }}
+{% endcall %}

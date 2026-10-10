@@ -19,7 +19,9 @@ Why it exists
 
 How it works
     Every time argument is Unix seconds and every window is half open `[start, end)`. Minute tables are summed with
-    one indexed range read; results are small dicts and lists, bounded by `limit` arguments (plan P9).
+    one indexed range read; results are small dicts and lists, bounded by `limit` arguments (plan P9). The two
+    sample reads can return tens of thousands of rows, so they return compact read-only `SampleRecord` mappings
+    (one tuple per row, repeated strings shared) instead of dicts (finding LOAD-2).
 
 What to read next
     `roxy/metrics/recorder.py` (the writers), `roxy/insights/context.py` (how rules reach these functions).
@@ -29,7 +31,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any, Final
 
 MAX_ROWS: Final = 50_000
@@ -328,32 +330,128 @@ def upstream_429_rows(
     return [dict(r) for r in rows]
 
 
+class SampleRecord(Mapping[str, Any]):
+    """One sample row as a read-only mapping that costs a tuple, not a dict (finding LOAD-2).
+
+    A read of a day of samples returns up to `MAX_ROWS` rows, and the insights engine keeps every read of one
+    evaluation until the evaluation ends. As dicts, with a fresh string for every repeated value, each row cost about
+    1 KB, so one evaluation over a busy day held hundreds of MiB and the leader worker's memory kept its high water
+    mark. A record keeps the row's values in one tuple next to a column index shared by every record of the read, and
+    the read shares one string object per repeated value (`_Interner`): about a third of the memory, for the same
+    `record["column"]`, `record.get("column")`, `in`, iteration and equality with a dict.
+    """
+
+    __slots__ = ("_columns", "_values")
+
+    def __init__(self, columns: Mapping[str, int], values: tuple[Any, ...]) -> None:
+        self._columns = columns
+        self._values = values
+
+    def __getitem__(self, key: str) -> Any:
+        return self._values[self._columns[key]]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        index = self._columns.get(key)
+        return default if index is None else self._values[index]
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._columns
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._columns)
+
+    def __len__(self) -> int:
+        return len(self._columns)
+
+    def __repr__(self) -> str:
+        return f"SampleRecord({dict(self)!r})"
+
+
+class _Interner:
+    """One shared string object per distinct value of the low-cardinality columns within one read (bounded: at most
+    `MAX_INTERNED` values are remembered; later new values are simply kept as they are)."""
+
+    MAX_INTERNED: Final = 10_000
+
+    def __init__(self) -> None:
+        self._seen: dict[str, str] = {}
+
+    def __call__(self, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        found = self._seen.get(value)
+        if found is not None:
+            return found
+        if len(self._seen) < self.MAX_INTERNED:
+            self._seen[value] = value
+        return value
+
+
+def _records(cursor: sqlite3.Cursor, columns: tuple[str, ...], shared: frozenset[str]) -> list[SampleRecord]:
+    """The cursor's rows as `SampleRecord`s, the values of the `shared` columns interned."""
+    index = {name: position for position, name in enumerate(columns)}
+    interned = [position for position, name in enumerate(columns) if name in shared]
+    intern = _Interner()
+    out: list[SampleRecord] = []
+    for raw in cursor:
+        values = tuple(raw)
+        if interned:
+            items = list(values)
+            for position in interned:
+                items[position] = intern(items[position])
+            values = tuple(items)
+        out.append(SampleRecord(index, values))
+    return out
+
+
+SAMPLE_COLUMNS: Final = (
+    "id", "at_ms", "key_id", "endpoint_template", "method", "client_hash", "place", "cache_state", "upstream_status",
+    "egress", "body_hash", "bytes", "auth_class", "sample_pct",
+)  # fmt: skip
+"""The `request_samples` columns `samples_between` returns, in order."""
+
+REFUSAL_SAMPLE_COLUMNS: Final = (
+    "id", "at_ms", "reason", "endpoint_template", "method", "client_hash", "place", "sample_pct",
+)  # fmt: skip
+"""The `refusal_samples` columns `refusal_samples_between` returns, in order."""
+
+_SHARED_SAMPLE_VALUES: Final = frozenset(
+    {"endpoint_template", "method", "place", "cache_state", "egress", "auth_class", "reason", "key_id", "client_hash"}
+)
+"""Columns whose values repeat from row to row (templates, methods, states; a hot key or a busy client)."""
+
+
 def samples_between(
     conn: sqlite3.Connection, start: int, end: int, templates: Iterable[str] | None = None, limit: int | None = None
-) -> list[dict[str, Any]]:
-    """`request_samples` rows in `[start, end)` seconds (optionally only some templates), in time order."""
+) -> list[SampleRecord]:
+    """`request_samples` rows in `[start, end)` seconds (optionally only some templates), in time order, as compact
+    read-only `SampleRecord` mappings (at most `MAX_ROWS`)."""
     wanted = sorted(set(templates)) if templates is not None else []
     clause = f" AND endpoint_template IN ({', '.join('?' for _ in wanted)})" if wanted else ""
-    rows = conn.execute(
-        "SELECT id, at_ms, key_id, endpoint_template, method, client_hash, place, cache_state, upstream_status, "  # noqa: S608
-        f"egress, body_hash, bytes, auth_class, sample_pct FROM request_samples WHERE at_ms >= ? AND at_ms < ?{clause} "
+    cursor = conn.cursor()
+    cursor.row_factory = None  # plain tuples: the records share one column index instead of a dict per row
+    cursor.execute(
+        f"SELECT {', '.join(SAMPLE_COLUMNS)} FROM request_samples WHERE at_ms >= ? AND at_ms < ?{clause} "  # noqa: S608
         "ORDER BY at_ms, id LIMIT ?",
         (int(start) * 1000, int(end) * 1000, *wanted, _bounded(limit)),
-    ).fetchall()
-    return [dict(r) for r in rows]
+    )
+    return _records(cursor, SAMPLE_COLUMNS, _SHARED_SAMPLE_VALUES)
 
 
 def refusal_samples_between(
     conn: sqlite3.Connection, start: int, end: int, limit: int | None = None
-) -> list[dict[str, Any]]:
+) -> list[SampleRecord]:
     """`refusal_samples` rows (requests a limiter refused, metrics.db schema 7) in `[start, end)` seconds, in time
-    order: the refused part of the stream a limit dry run replays (`insights/simulate.py _limit_replays`)."""
-    rows = conn.execute(
-        "SELECT id, at_ms, reason, endpoint_template, method, client_hash, place, sample_pct FROM refusal_samples "
+    order: the refused part of the stream a limit dry run replays (`insights/simulate.py _limit_replays`). Compact
+    read-only records, like `samples_between`."""
+    cursor = conn.cursor()
+    cursor.row_factory = None
+    cursor.execute(
+        f"SELECT {', '.join(REFUSAL_SAMPLE_COLUMNS)} FROM refusal_samples "  # noqa: S608
         "WHERE at_ms >= ? AND at_ms < ? ORDER BY at_ms, id LIMIT ?",
         (int(start) * 1000, int(end) * 1000, _bounded(limit)),
-    ).fetchall()
-    return [dict(r) for r in rows]
+    )
+    return _records(cursor, REFUSAL_SAMPLE_COLUMNS, _SHARED_SAMPLE_VALUES)
 
 
 def latest_health_run(conn: sqlite3.Connection) -> dict[str, Any] | None:
@@ -443,6 +541,9 @@ def prune_history(
 __all__ = [
     "HISTORY_TABLES",
     "MAX_ROWS",
+    "REFUSAL_SAMPLE_COLUMNS",
+    "SAMPLE_COLUMNS",
+    "SampleRecord",
     "anomalies_between",
     "attempt_rows",
     "bucket_history",

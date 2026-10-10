@@ -1,0 +1,65 @@
+{#-
+  The Upstream page (`roxy/admin/pages/upstream.py`): how Roblox answers Roxy, and the pacing that keeps it calm.
+
+  Layout: the egress health cards first (the question "is Roblox happy with us?"), then the 429 timeline and the
+  latency chart side by side, the request trace lookup, the buckets, the cooldowns and breakers side by side (the
+  reset dialog they share is placed once, below the cards), the Request Failures log (the page's main table), the
+  hosts, routing, retries, challenge answers, internal calls, the queue and adaptive concurrency.
+  `how_to_read` extends the registry's text with glossary terms and what the controls do.
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+{% from "components/dialog.html" import confirm_dialog %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="#trace">{{ icon("search") }}<span>Look up a request</span></a>
+<a class="btn btn--ghost" href="/admin/egress">{{ icon("globe") }}<span>Egress</span></a>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>Words used here: an {{ term("egress") }} is the path a call to Roblox takes; a {{ term("bucket") }} is one of Roxy's own speed limits (it fills as calls go out and empties at its rate); a {{ term("cooldown") }} pauses calls after Roblox says "too many" (with a {{ term("retry-after") }} time when Roblox gives one); a {{ term("breaker") }} stops calling an endpoint that keeps failing and later lets one test call through; the {{ term("adaptive-rate", "adaptive rate") }} lowers an endpoint's speed after a 429 and raises it again slowly.</p>
+<p>The fill gauges say "room to spare" below 70 percent, "busy" from 70 and "full" from 95, where the next call waits for a slot. Settings sit under each card ("Settings for this card"); every change is saved through the settings API and written to the audit log.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["health"] }}
+<div class="grid grid--2 g3-pair">
+  {{ cards["429-timeline"] }}
+  {{ cards["latency"] }}
+</div>
+{{ cards["trace"] }}
+{{ cards["buckets"] }}
+<div class="grid grid--2 g3-pair">
+  {{ cards["cooldowns"] }}
+  {{ cards["breakers"] }}
+</div>
+{{ cards["failures"] }}
+{{ cards["hosts"] }}
+{{ cards["routing"] }}
+{{ cards["retries"] }}
+{{ cards["internal-calls"] }}
+{{ cards["challenges"] }}
+{{ cards["queue"] }}
+{{ cards["concurrency"] }}
+{{ confirm_dialog(
+     "dlg-upstream-reset",
+     "Clear every cooldown and breaker?",
+     action="/admin/api/v1/upstream/reset",
+     api=True,
+     danger=True,
+     confirm_label="Clear cooldowns and breakers",
+     consequences=[
+       "Every open cooldown and circuit breaker ends at once, on every worker, so Roxy may call endpoints Roblox recently refused.",
+       "Buckets are not refilled: Roxy keeps its normal pace, so this cannot cause a burst of calls.",
+       "If Roblox still limits an endpoint, the next 429 opens its cooldown again.",
+       "The reset and the exact counts cleared are written to the audit log, with a marker on the charts.",
+     ],
+     reason=True,
+     reason_required=True,
+     success="Cooldowns and breakers cleared.",
+     on_success="refresh",
+     refresh="cooldowns breakers health",
+   ) }}
+{% endblock %}

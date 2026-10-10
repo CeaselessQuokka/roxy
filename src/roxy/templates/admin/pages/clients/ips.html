@@ -1,0 +1,17 @@
+{#-
+  Clients page, card `ips` (`roxy/admin/pages/clients.py ips_card`): v1 "Top Talkers (by IP)".
+
+  One row per address in the range from `clients.client_table_answer` (the `GET /admin/api/v1/clients/ips`
+  function): requests, refusals, Rate1/5/60, the busiest endpoint, the places it called as, the bot score with where
+  it comes from (this worker's view of the last 15 minutes, else the fleet's recorded score; worded as well as
+  colored), and its ban and bypass state. A row opens the address in the drawer. A request of the table itself
+  (`table_only`) is answered with the table alone. Context: `frame`, `table`, `table_only`, `peers_basis`, `sources`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% if table_only %}{{ data_table(**table) }}{% else %}
+{% call page_card(frame, flush=True, subtitle="Precise but noisy for games; use it for scripts, scrapers and your own tests.") %}
+{{ data_table(**table) }}
+<p class="muted clients-note">Bot scores run from 0 (looks like a game server) to 100 (looks like a script): this worker's view of the address's last 15 minutes, or else the score the fleet recorded in the last 25 hours.</p>
+{% endcall %}
+{% endif %}

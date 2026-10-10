@@ -1,0 +1,369 @@
+/*
+ * The Traffic page (templates/admin/pages/traffic*): totals above the requests chart, the method mix meters,
+ * the small tables of the bytes card, the "Who returned it?" legend, the trends tables and the inline reset.
+ *
+ * What this is
+ *   Layout for the pieces only this page has. Charts, tables, tiles, the heatmap and the card frame come from
+ *   components.css; only tokens from tokens.css are used, so both themes follow.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract).
+ * How it works
+ *   Mobile first in spirit: grids collapse to one column below 760 px, card controls and the drawer's buttons grow
+ *   to the 44 px touch size there (plan 14.8), and nothing is wider than the screen (tables scroll inside their
+ *   own region, long values wrap).
+ * What to read next
+ *   static/css/components.css (cards, charts, data tables), templates/admin/pages/traffic/*.html.
+ */
+
+/* A lazy card keeps about the height it will have, so cards loading above one another do not push the page
+   around while it is read (and a card scrolled to stays in view). */
+#bytes.page-card--lazy,
+#heatmap.page-card--lazy {
+  min-height: 420px;
+}
+
+#verbs.page-card--lazy,
+#latency.page-card--lazy,
+#trends.page-card--lazy {
+  min-height: 560px;
+}
+
+#status.page-card--lazy {
+  min-height: 900px;
+}
+
+/* Totals of the range above the requests chart. */
+.traffic-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--sp-3);
+  margin: 0 0 var(--sp-4);
+}
+
+.traffic-stats__item {
+  display: grid;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.traffic-stats__item--served_upstream { border-left-color: var(--series-1); }
+.traffic-stats__item--served_cache { border-left-color: var(--series-3); }
+.traffic-stats__item--refused { border-left-color: var(--series-4); }
+.traffic-stats__item--failed { border-left-color: var(--series-8); }
+
+.traffic-stats__label {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-medium);
+}
+
+.traffic-stats__value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.traffic-stats__number {
+  font-size: var(--fs-4);
+  font-weight: var(--fw-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.traffic-stats__share {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Card controls (a select that asks the card again). */
+.card-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-3);
+}
+
+/* A chart with its small tables or meters beside it on a wide screen, under it on a narrow one. */
+.traffic-beside {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+  align-items: start;
+  gap: var(--sp-6);
+}
+
+.traffic-beside > .traffic-mix {
+  margin: 0;
+}
+
+/* The bytes card's two small tables, one under the other. */
+.traffic-split {
+  display: grid;
+  gap: var(--sp-5);
+}
+
+@media (max-width: 1100px) {
+  .traffic-beside {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .traffic-beside > .traffic-mix {
+    margin-top: var(--sp-2);
+  }
+}
+
+.traffic-table {
+  width: 100%;
+}
+
+.traffic-table__caption {
+  padding-bottom: var(--sp-2);
+  font-weight: var(--fw-semibold);
+  text-align: start;
+}
+
+.traffic-table th[scope="row"] {
+  font-weight: var(--fw-regular);
+}
+
+/* The method mix and outcome split: meters with their numbers in words. */
+.traffic-mix {
+  display: grid;
+  gap: var(--sp-2);
+  margin: var(--sp-4) 0;
+}
+
+.traffic-mix__title {
+  font-size: var(--fs-2);
+  font-weight: var(--fw-semibold);
+}
+
+.traffic-mix__list {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0 0 var(--sp-2);
+  padding: 0;
+  list-style: none;
+}
+
+.traffic-mix__item {
+  display: grid;
+  grid-template-columns: minmax(64px, 7rem) minmax(0, 1fr) minmax(0, max-content);
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-1);
+}
+
+.traffic-mix__bar {
+  width: 100%;
+  height: 10px;
+}
+
+.traffic-mix__value {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* A data table inside a card body keeps its own frame. */
+.traffic-dt {
+  margin-top: var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* v1's tiles and the verdict above the status chart. */
+.traffic-tiles {
+  margin-bottom: var(--sp-3);
+}
+
+.traffic-tiles + .alert {
+  margin-bottom: var(--sp-4);
+}
+
+.traffic-sources {
+  display: grid;
+  gap: var(--sp-3);
+  margin-top: var(--sp-5);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border);
+}
+
+.traffic-sources__title {
+  font-size: var(--fs-3);
+}
+
+.traffic-sources__lead {
+  max-width: 90ch;
+}
+
+.traffic-legend {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--sp-2) var(--sp-4);
+  margin: 0;
+  font-size: var(--fs-1);
+}
+
+.traffic-legend__item dt {
+  font-weight: var(--fw-semibold);
+}
+
+.traffic-legend__item dd {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.traffic-sources .traffic-dt {
+  margin-top: 0;
+}
+
+.traffic-note {
+  margin-top: var(--sp-3);
+  font-size: var(--fs-1);
+}
+
+/* Trends: one table per period, each a <details> (week open). */
+.traffic-trend {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.traffic-trend + .traffic-trend {
+  margin-top: var(--sp-3);
+}
+
+.traffic-trend__summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-3);
+  min-height: var(--target-min);
+  padding: var(--sp-3) var(--sp-4);
+  cursor: pointer;
+  list-style: none;
+}
+
+.traffic-trend__summary::-webkit-details-marker {
+  display: none;
+}
+
+.traffic-trend__chevron {
+  align-self: center;
+  margin-left: auto;
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.traffic-trend[open] .traffic-trend__chevron {
+  transform: rotate(180deg);
+}
+
+.traffic-trend > .table-scroll,
+.traffic-trend > .traffic-trend__notice {
+  margin: 0 var(--sp-4) var(--sp-4);
+}
+
+.traffic-trend__title {
+  font-size: var(--fs-3);
+}
+
+.traffic-trend__span {
+  font-size: var(--fs-1);
+}
+
+.traffic-trend__notice {
+  margin: 0 0 var(--sp-3);
+}
+
+.traffic-trend__table {
+  width: 100%;
+}
+
+.traffic-trend__table th[scope="row"] {
+  font-weight: var(--fw-regular);
+  white-space: nowrap;
+}
+
+.traffic-trend__spark .spark {
+  display: block;
+  width: 120px;
+  height: 28px;
+}
+
+/* The inline reset in the drawer (roxy/admin/pages/_traffic_reset.py). */
+.g2-reset__lead {
+  max-width: 70ch;
+}
+
+.g2-reset__section {
+  display: grid;
+  gap: var(--sp-3);
+}
+
+.g2-reset__heading {
+  font-size: var(--fs-3);
+}
+
+.g2-reset__snapshots {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--fs-1);
+}
+
+.g2-reset__snapshots li {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+}
+
+.g2-reset__snapshots .icon {
+  flex: none;
+  margin-top: 2px;
+}
+
+.g2-reset__target {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .traffic-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .traffic-stats__item--requests {
+    grid-column: 1 / -1;
+  }
+
+  .card-controls .chip-select,
+  .card-controls select {
+    min-height: var(--target-touch);
+  }
+
+  .card-controls .chip-select {
+    flex: 1 1 100%;
+  }
+
+  .card-controls select {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .traffic-trend__before,
+  .traffic-trend__spark {
+    display: none;
+  }
+
+  .g2-reset__form .btn {
+    min-height: var(--target-touch);
+  }
+}

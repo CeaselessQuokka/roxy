@@ -1,0 +1,41 @@
+{#-
+  Upstream page, card `breakers` (`roxy/admin/pages/upstream.py breakers_card`): endpoints Roxy stopped calling.
+
+  Every breaker that is open, half-open or counting failures (`GET /admin/api/v1/upstream/breakers`, plan 7.10):
+  what it covers (caller text for endpoint templates), its state in words with a badge, the failures it counted,
+  and when an open one lets a test call through (a countdown). The reset button shares the page's confirm dialog
+  (`#dlg-upstream-reset`). The card refreshes itself on the stream's `breaker` events.
+  Context: `frame`, `items`.
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/format.html" import caller_text, num %}
+{% from "admin/pages/upstream/_macros.html" import countdown %}
+{% set reset_button %}<button type="button" class="btn btn--sm btn--warn-soft" data-dialog-open="dlg-upstream-reset" data-action="upstream-reset">{{ icon("reset") }}<span>Clear cooldowns and breakers</span></button>{% endset %}
+{% call page_card(frame, actions=reset_button, subtitle=num(items|length) ~ " not plainly closed") %}
+{% if items %}
+<div class="table-scroll g3-scroll" role="region" aria-labelledby="breakers-caption" tabindex="0">
+  <table class="simple-table g3-table g3-table--wrap">
+    <caption id="breakers-caption" class="sr-only">Circuit breakers</caption>
+    <thead><tr><th scope="col">Covers</th><th scope="col">Egress</th><th scope="col">State</th><th scope="col" class="num">Failures</th><th scope="col">Test call in</th></tr></thead>
+    <tbody>
+      {% for b in items %}
+      <tr>
+        <td><span class="muted">{{ b.kind }}</span> {{ caller_text(b.target, 160) }}</td>
+        <td>{{ b.egress_label }}</td>
+        <td>{{ status_badge(b.tone, b.words) }}</td>
+        <td class="num">{{ num(b.failures) }}</td>
+        <td>{{ countdown(b.countdown) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state("Every breaker is closed", "Calls flow normally. A breaker opens when an endpoint keeps failing (or right away on a 429), stops calls for a while, then lets one test call through.", tone="good") }}
+{% endif %}
+{% endcall %}
+{% endif %}

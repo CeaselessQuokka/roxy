@@ -1,0 +1,57 @@
+{#-
+  Egress page, card `budget` (`roxy/admin/pages/egress.py budget_card`): the rotator's billing cycle (plan 8.4).
+
+  The four KPI tiles of `GET /admin/api/v1/egress/rotator/budget` (a tile with a notice, for example "set the quota
+  to see what is left", shows it instead of a number's comparison), the projection sentence with its 90 percent band,
+  the daily bars of the cycle with the cumulative total and an even pace to the quota (`GET /egress/rotator/daily`,
+  drawn by the chart component), the hard stop and the daily cap, and the provider's own figure next to Roxy's
+  metered bytes with the form that records a new one (`POST /admin/api/v1/egress/provider-report`, audited).
+  Context: `frame`, `tiles`, `sentence`, `band`, `band_reason`, `cycle_start`, `cycle_end`, `today`, `quota`,
+  `hard_stop`, `daily_cap`, `stopped`, `stop_words`, `daily`, `has_days`, `provider`, `provider_latest`,
+  `provider_when`, `provider_reported`, `metered`, `diff`, `provider_url`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/kpi.html" import kpi_api %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import caller_text %}
+{% from "admin/pages/upstream/_macros.html" import when %}
+{% call page_card(frame) %}
+{% if stopped %}{{ inline_alert("warn", "The rotator is stopped for now", "Because " ~ stop_words ~ ".") }}{% endif %}
+<div class="kpi-grid">{% for t in tiles %}{{ kpi_api(t.tile, display=t.display) }}{% endfor %}</div>
+<p class="g3-sentence">{{ sentence }}{% if band %} <span class="muted">The 90 percent band is {{ band }}.</span>{% elif band_reason %} <span class="muted">{{ band_reason }}</span>{% endif %}</p>
+<dl class="kv g3-cycle">
+  <dt>This cycle</dt><dd>{{ cycle_text }} <span class="muted">(UTC days{% if days_left %}; {{ days_left }}{% endif %})</span></dd>
+  <dt>Used today</dt><dd>{{ today }}</dd>
+  <dt>Quota</dt><dd>{{ quota or "not set (rotator_quota_gb_per_month is 0)" }}</dd>
+  <dt>Hard stop</dt><dd>{{ hard_stop or "none" }}</dd>
+  <dt>Daily cap</dt><dd>{{ daily_cap or "none" }}</dd>
+</dl>
+{% if has_days %}
+{{ series_chart("chart-rotator-daily", "Rotator bytes per day this cycle", series=daily, kind="bars", y_format="bytes",
+                series_options={"cumulative": {"kind": "line"}, "even_pace": {"kind": "line"}},
+                summary="Rotator bytes per UTC day of the billing cycle, the running total and an even pace to the quota.", size="sm",
+                help="Metered rotator bytes per UTC day; the even pace line reaches the quota on the last day of the cycle.") }}
+{% else %}
+<p class="muted">No rotator bytes yet this cycle, so there are no daily bars.</p>
+{% endif %}
+<section class="g3-section" aria-labelledby="provider-title">
+  <h3 class="g3-subhead" id="provider-title">The provider's own figure</h3>
+  <p class="muted">{{ provider.note }} Roxy metered {{ metered }} this cycle.{% if provider_latest %} The newest figure entered is {{ provider_reported }} ({{ when(provider_when) }}, by {{ caller_text(provider_latest.entered_by, 80) }}){% if diff %}: Roxy's count differs by {{ diff }}{% endif %}.{% endif %}</p>
+  <form class="g3-inline-form" data-api-form data-api-url="{{ provider_url }}" data-api-method="POST"
+        data-success="Figure recorded and written to the audit log." data-on-success="refresh" data-refresh="budget" novalidate>
+    <div class="field">
+      <label class="field__label" for="provider-gb">DataImpulse's figure for this cycle <span class="muted">(GB)</span></label>
+      <input class="input input--num" type="text" inputmode="decimal" id="provider-gb" name="reported_gb" required data-json="float" aria-describedby="provider-gb-error">
+      <p class="field__error" id="provider-gb-error" data-field-error="reported_gb" hidden></p>
+    </div>
+    <div class="field">
+      <label class="field__label" for="provider-reason">Note <span class="muted">(optional)</span></label>
+      <input class="input" type="text" id="provider-reason" name="reason" maxlength="500" autocomplete="off">
+    </div>
+    <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    <button type="submit" class="btn" data-action="provider-report">{{ icon("check") }}<span>Record the figure</span></button>
+  </form>
+</section>
+{% endcall %}

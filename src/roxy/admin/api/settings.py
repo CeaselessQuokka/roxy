@@ -37,7 +37,9 @@ How it works
     lets a stale session or an arming batch through (finding secfix-1). Reads come
     from this worker's settings snapshot (values), `config/read_settings.py` (history) and
     `metrics/read_recommended_settings.py` (open recommendations). Sensitive settings (`spec.sensitive`) are shown
-    as `[redacted]` everywhere, and their history holds only `{fingerprint, masked}` (plan 6.2).
+    as `[redacted]` everywhere, and their history holds only `{fingerprint, masked}` (plan 6.2). The Settings page
+    (`roxy/admin/pages/settings.py`) renders the answers of `settings_listing`, `history_answer` and
+    `history_change`, the functions these routes call, so the page and the API cannot disagree (plan P6).
 
 What to read next
     `roxy/config/settings_service.py`, `roxy/config/catalog.py`, `roxy/admin/api/common.py`.
@@ -557,6 +559,18 @@ class ImportBody(ImportPreviewBody):
 # ================================================================================================ catalog
 
 
+def listing_filter_problems(group: str | None, risk: str | None) -> dict[str, str]:
+    """Why the listing's `group` or `risk` filter is not a catalog value (field -> message; empty when both are).
+
+    Shared by `GET /settings` (a 422) and the Settings page (a notice, then the filter is dropped)."""
+    fields: dict[str, str] = {}
+    if group is not None and group not in {g.value for g in Group}:
+        fields["group"] = f"Choose one of: {', '.join(g.value for g in Group)}."
+    if risk is not None and risk not in {r.value for r in Risk}:
+        fields["risk"] = f"Choose one of: {', '.join(r.value for r in Risk)}."
+    return fields
+
+
 @router.get("")
 async def list_settings(
     request: Request,
@@ -569,14 +583,33 @@ async def list_settings(
     include_text: bool = True,
 ) -> dict[str, Any]:
     """The catalog editor listing (plan 15.2): grouped entries, search, and filters."""
-    fields: dict[str, str] = {}
-    if group is not None and group not in {g.value for g in Group}:
-        fields["group"] = f"Choose one of: {', '.join(g.value for g in Group)}."
-    if risk is not None and risk not in {r.value for r in Risk}:
-        fields["risk"] = f"Choose one of: {', '.join(r.value for r in Risk)}."
+    fields = listing_filter_problems(group, risk)
     if fields:
         raise common.validation_error(fields, "The filters are not valid.")
-    ctx = get_ctx(request)
+    return await settings_listing(
+        get_ctx(request),
+        q=q,
+        group=group,
+        risk=risk,
+        changed=changed,
+        has_recommendation=has_recommendation,
+        include_text=include_text,
+    )
+
+
+async def settings_listing(
+    ctx: Any,
+    *,
+    q: str | None = None,
+    group: str | None = None,
+    risk: str | None = None,
+    changed: bool = False,
+    has_recommendation: bool = False,
+    include_text: bool = True,
+) -> dict[str, Any]:
+    """The answer of `GET /settings` for filters `listing_filter_problems` accepted: the matching editor entries
+    grouped in catalog group order, the counts and the cross-field rules. The Settings page renders this same
+    answer (plan P6: one listing for the API and the page)."""
     snapshot = ctx.settings.snapshot()
     latest, recommendations = await _snapshot_reads(ctx)
     query = (q or "").strip()
@@ -653,6 +686,79 @@ async def update_settings(
 # ================================================================================================ history
 
 
+def history_window(ctx: Any, since: str | None, until: str | None) -> dict[str, int | None]:
+    """`{"since", "until"}` in epoch seconds from the history routes' `from` and `to` texts (ISO 8601, read in
+    `ui_timezone` without an offset, or epoch seconds); 422 `invalid_range` when one cannot be read."""
+    tz = str(ctx.settings.get("ui_timezone") or "UTC")
+    window: dict[str, int | None] = {"since": None, "until": None}
+    problems: dict[str, str] = {}
+    for name, raw in (("from", since), ("to", until)):
+        if raw:
+            try:
+                window["since" if name == "from" else "until"] = int(common.parse_instant(raw, tz=tz))
+            except ValueError as exc:
+                problems[name] = str(exc)
+    if problems:
+        raise common.validation_error(problems, "The time filter is not valid.", code="invalid_range")
+    return window
+
+
+def _history_reader(
+    tq: TableQuery,
+    *,
+    key: str | None,
+    source: str | None,
+    actor: str | None,
+    since: int | None,
+    until: int | None,
+) -> Any:
+    def read(page: int, size: int) -> Any:
+        def run(conn: Any) -> tuple[list[dict[str, Any]], int]:
+            return read_settings.history_page(
+                conn,
+                key=key,
+                source=source,
+                actor=actor,
+                q=tq.q,
+                since=since,
+                until=until,
+                sort=tq.sort,
+                descending=tq.descending,
+                limit=size,
+                offset=(page - 1) * size,
+            )
+
+        return run
+
+    return read
+
+
+async def history_answer(
+    ctx: Any,
+    tq: TableQuery,
+    *,
+    key: str | None = None,
+    source: str | None = None,
+    actor: str | None = None,
+    since: int | None = None,
+    until: int | None = None,
+) -> dict[str, Any]:
+    """One page of settings history as the history routes answer it (the table, its `filters` and the `sources`
+    of the source filter). The Settings page's history card renders this same answer."""
+    read = _history_reader(tq, key=key, source=source, actor=actor, since=since, until=until)
+    rows, total = await ctx.dbs.control.read(read(tq.page, tq.page_size))
+    answer = common.table_answer(HISTORY_TABLE, tq, [_history_item(row, link=True) for row in rows], total)
+    answer["filters"] = {"key": key, "source": source, "actor": actor, "q": tq.q, "since": since, "until": until}
+    answer["sources"] = await ctx.dbs.control.read(read_settings.history_sources)
+    return answer
+
+
+async def history_change(ctx: Any, history_id: int) -> dict[str, Any] | None:
+    """One settings history entry as the history routes show a row (with its revert link), or None."""
+    row = await ctx.dbs.control.read(lambda conn: read_settings.history_entry(conn, history_id))
+    return None if row is None else _history_item(row, link=True)
+
+
 async def _history_table(
     request: Request,
     admin: Any,
@@ -666,50 +772,20 @@ async def _history_table(
     until: str | None,
 ) -> Any:
     ctx = get_ctx(request)
-    tz = str(ctx.settings.get("ui_timezone") or "UTC")
-    window: dict[str, int | None] = {"since": None, "until": None}
-    problems: dict[str, str] = {}
-    for name, raw in (("from", since), ("to", until)):
-        if raw:
-            try:
-                window["since" if name == "from" else "until"] = int(common.parse_instant(raw, tz=tz))
-            except ValueError as exc:
-                problems[name] = str(exc)
-    if problems:
-        raise common.validation_error(problems, "The time filter is not valid.", code="invalid_range")
-    filters = {"key": key, "source": source, "actor": actor, "q": tq.q, **window}
-
-    def read(page: int, size: int) -> Any:
-        def run(conn: Any) -> tuple[list[dict[str, Any]], int]:
-            return read_settings.history_page(
-                conn,
-                key=key,
-                source=source,
-                actor=actor,
-                q=tq.q,
-                since=window["since"],
-                until=window["until"],
-                sort=tq.sort,
-                descending=tq.descending,
-                limit=size,
-                offset=(page - 1) * size,
-            )
-
-        return run
-
+    window = history_window(ctx, since, until)
     if fmt is not None:
+        read = _history_reader(tq, key=key, source=source, actor=actor, since=window["since"], until=window["until"])
 
         async def fetch(page: int, size: int) -> tuple[list[dict[str, Any]], int]:
             rows, total = await ctx.dbs.control.read(read(page, size))
             return [_history_item(row, link=False) for row in rows], total
 
+        filters = {"key": key, "source": source, "actor": actor, "q": tq.q, **window}
         kept = {k: v for k, v in filters.items() if v}
         return await common.export_pages(request, admin, HISTORY_TABLE, fetch, fmt, tq=tq, filters=kept)
-    rows, total = await ctx.dbs.control.read(read(tq.page, tq.page_size))
-    answer = common.table_answer(HISTORY_TABLE, tq, [_history_item(row, link=True) for row in rows], total)
-    answer["filters"] = filters
-    answer["sources"] = await ctx.dbs.control.read(read_settings.history_sources)
-    return answer
+    return await history_answer(
+        ctx, tq, key=key, source=source, actor=actor, since=window["since"], until=window["until"]
+    )
 
 
 @router.get("/history", response_model=None)
@@ -982,12 +1058,17 @@ __all__ = [
     "default_of",
     "entry",
     "fresh_mfa_keys",
+    "history_answer",
+    "history_change",
+    "history_window",
+    "listing_filter_problems",
     "needs_fresh_mfa",
     "preview_changes",
     "require_fresh_for",
     "result_answer",
     "risk_reason",
     "router",
+    "settings_listing",
     "settings_service",
     "shown",
     "write_rules",

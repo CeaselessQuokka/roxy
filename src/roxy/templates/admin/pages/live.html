@@ -1,0 +1,21 @@
+{#-
+  The Live page (`roxy/admin/pages/live.py`; plan 14.1 Live row, 14.11, v1 "Live Requests").
+
+  The live tail first (the page's reason to exist), then what capture keeps. `how_to_read` adds what the columns
+  and the sampling mean to the registry's paragraphs. The page script (static/js/pages/live.js) puts the address's
+  filters into the tail and opens `?request=<id>` in the drawer.
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/glossary.html" import term with context %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>Columns: the time the request finished, the status the caller got, the outcome (served by Roblox, from the cache, refused or failed), the {{ term("egress") }} path, the cache state ({{ term("hit") }}, {{ term("miss") }}, {{ term("stale") }}, {{ term("coalescing", "coalesced") }}), how long it took, the client (address and place) and the endpoint.</p>
+<p>On a busy proxy the list is a sample: each worker records at most 50 requests a second, and the list shows at most 50 a second that match your filters. The rest are counted, never queued. Live records are kept for 15 minutes; Roblox 429s and every number on the other pages are kept much longer.</p>
+<p>A {{ term("capture") }} is a redacted copy of a request and its answer, kept a short time. Refusals and failures are always captured while capture is on; served requests are sampled.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["tail"] }}
+{{ cards["capture"] }}
+{% endblock %}

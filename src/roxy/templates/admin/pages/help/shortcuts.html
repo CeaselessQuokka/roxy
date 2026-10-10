@@ -1,0 +1,35 @@
+{#-
+  Help page, card `shortcuts` (`roxy/admin/pages/help.py shortcuts_card`): every keyboard shortcut (plan 14.6).
+
+  The same lists the `?` overlay shows (admin/_layout/shortcuts.html): the general keys and the live tail and table
+  keys from help.py (a test keeps them equal to the overlay), the "go to" keys from the page registry. The switch
+  turns single-key shortcuts off in this browser (WCAG 2.1.4); static/js/palette.js keeps it in step with the one
+  in the overlay and the account menu. Context: `frame`, `general`, `goto`, `lists` (each `[(keys, what)]`, keys
+  a tuple of alternatives, each a tuple of keys).
+-#}
+{% from "components/page_card.html" import page_card %}
+{% macro keys(alternatives) -%}
+{%- for sequence in alternatives -%}{% for key in sequence %}<kbd>{{ key }}</kbd>{% endfor %}{{ " or " if not loop.last }}{%- endfor -%}
+{%- endmacro %}
+{% macro key_list(id, title, items) -%}
+<section class="help-keys__group" aria-labelledby="{{ id }}">
+  <h3 class="help-keys__title" id="{{ id }}">{{ title }}</h3>
+  <dl class="help-keys__list">
+    {% for alternatives, what in items %}<div class="help-keys__row"><dt>{{ keys(alternatives) }}</dt><dd>{{ what }}</dd></div>{% endfor %}
+  </dl>
+</section>
+{%- endmacro %}
+{% call page_card(frame) %}
+<div class="help-keys stack">
+  <div class="help-keys__grid">
+    {{ key_list("keys-general", "General", general) }}
+    {{ key_list("keys-goto", "Go to a page (press G, then the letter)", goto) }}
+    {{ key_list("keys-lists", "Live tail and tables", lists) }}
+  </div>
+  <p>Shortcuts never fire while you type in a field. Ctrl+K needs a modifier key, so it always works; the single-key shortcuts can be turned off if they fire by accident, for example with speech input.</p>
+  <div class="cluster">
+    <label class="check"><input type="checkbox" data-shortcuts-toggle checked><span>Single-key shortcuts (remembered in this browser)</span></label>
+    <button type="button" class="btn btn--ghost btn--sm" data-shortcuts-open>Show the shortcut overlay</button>
+  </div>
+</div>
+{% endcall %}

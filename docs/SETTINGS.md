@@ -1699,7 +1699,7 @@ How many rotator calls may leave back to back before the steady pace of rotator_
 
 ### `host_bucket_default_per_min`
 
-The rate each Roblox service host (for example games.roblox.com or users.roblox.com) gets unless it has its own limit on Upstream > Buckets. Roblox runs each service separately, so this keeps one busy service from being hammered even when the overall rate is fine.
+The most calls Roxy makes to one Roblox service host (for example games.roblox.com or users.roblox.com) in any minute, unless it has its own limit on Upstream > Buckets. Roblox runs each service separately, so this keeps one busy service from being hammered even when the overall rate is fine. The burst counts inside the same minute: no rolling minute ever holds more than this.
 
 | Field | Value |
 |---|---|
@@ -1734,7 +1734,7 @@ The rate each Roblox service host (for example games.roblox.com or users.roblox.
 
 ### `host_bucket_default_burst`
 
-How many calls to one Roblox host may leave back to back before the steady pace of its rate applies, for hosts without their own limit on Upstream > Buckets.
+How many calls to one Roblox host may leave back to back before the steady pace applies, for hosts without their own limit on Upstream > Buckets. The burst is part of the host's per-minute limit, not added to it: at 240 a minute with a burst of 15, 15 calls may go at once and the rest of the minute is paced so no minute holds more than 240.
 
 | Field | Value |
 |---|---|
@@ -1769,7 +1769,7 @@ How many calls to one Roblox host may leave back to back before the steady pace 
 
 ### `endpoint_bucket_default_per_min`
 
-The rate each endpoint template (one Roblox API path with ids replaced by placeholders, such as users.roblox.com/v1/users/{id}) gets unless it has its own limit on Upstream > Buckets. Roblox limits many APIs per endpoint, so this is the bucket that most often matches Roblox's own limit.
+The most calls Roxy makes to one endpoint template (one Roblox API path with ids replaced by placeholders, such as users.roblox.com/v1/users/{id}) in any minute, unless it has its own limit on Upstream > Buckets. Roblox limits many APIs per endpoint and counts calls in a rolling minute, so this is the bucket that most often matches Roblox's own limit, and the burst counts inside the same minute: no rolling minute ever holds more than this.
 
 | Field | Value |
 |---|---|
@@ -1800,11 +1800,11 @@ The rate each endpoint template (one Roblox API path with ids replaced by placeh
 | Item max length | none |
 | Item range | none |
 | Pending owner verification | no |
-| Notes | Per-endpoint limits come from an admin, an applied recommendation, or the adaptive rate controller, and win over this default. Recommendations change one endpoint's limit, never this default, because a change here throttles every endpoint at once. |
+| Notes | Per-endpoint limits come from an admin, an applied recommendation, or the adaptive rate controller, and win over this default. Recommendations change one endpoint's limit, never this default, because a change here throttles every endpoint at once. Because the burst fits inside the minute, the steady pace is a little lower than the limit: at 120 with a burst of 10, 10 calls may go at once and then about 109 a minute (Roxy paces over 61 s, a 1 s margin for network delays). |
 
 ### `endpoint_bucket_default_burst`
 
-How many calls to one endpoint template may leave back to back before the steady pace of its rate applies, for endpoints without their own limit on Upstream > Buckets.
+How many calls to one endpoint template may leave back to back before the steady pace applies, for endpoints without their own limit on Upstream > Buckets. The burst is part of the endpoint's per-minute limit, not added to it, and the adaptive controller cuts it together with the rate.
 
 | Field | Value |
 |---|---|
@@ -1852,7 +1852,7 @@ Lets Roxy tune each endpoint's rate by itself: after a Roblox 429 it lowers that
 | Step | none |
 | If raised | n/a |
 | If lowered | n/a |
-| If enabled | On a Roblox 429 the endpoint's rate drops by adaptive_decrease_pct (never below adaptive_min_per_min); after adaptive_probe_after_h clean hours with demand above the limit it rises by adaptive_increase_pct (never above adaptive_max_per_min). When several endpoints of one host get 429s together, the host's rate is lowered instead. |
+| If enabled | On a Roblox 429 the endpoint's rate and burst drop by adaptive_decrease_pct, counted from the calls it actually made in the last minute when that is lower than its rate (never below adaptive_min_per_min); after adaptive_probe_after_h clean hours with demand above the limit it rises by adaptive_increase_pct (never above adaptive_max_per_min), its burst by at most one call. When several endpoints of one host get 429s together, the host's rate is lowered instead. |
 | If disabled | Rates stay exactly where they are and change only when an admin edits them or applies a recommendation. Cooldowns after a 429 still happen; only the automatic rate tuning stops, so repeated 429s on one endpoint are more likely. |
 | Risk | low |
 | High risk when | none |
@@ -1874,7 +1874,7 @@ Lets Roxy tune each endpoint's rate by itself: after a Roblox 429 it lowers that
 
 ### `adaptive_decrease_pct`
 
-How much the adaptive controller cuts an endpoint's rate each time Roblox answers it with 429. At 30, an endpoint at 120 per minute drops to 84.
+How much the adaptive controller cuts an endpoint's rate each time Roblox answers it with 429. The cut starts from the calls the endpoint actually made in the last minute when that is lower than its rate, because that is the rate Roblox refused: at 30, an endpoint at 120 per minute that made 61 calls drops to 42.7 (its burst from 10 to 3), and one that Roxy cannot measure, or that made no more calls than adaptive_min_per_min, drops to 84 (burst 7).
 
 | Field | Value |
 |---|---|
@@ -1909,7 +1909,7 @@ How much the adaptive controller cuts an endpoint's rate each time Roblox answer
 
 ### `adaptive_increase_pct`
 
-How much the adaptive controller raises an endpoint's rate after a clean period (adaptive_probe_after_h hours with no 429s while callers wanted more than the limit allowed). At 10, an endpoint at 84 per minute rises to about 92.
+How much the adaptive controller raises an endpoint's rate after a clean period (adaptive_probe_after_h hours with no 429s while callers wanted more than the limit allowed). At 10, an endpoint at 84 per minute rises to about 92. Its burst comes back more slowly: at most one call per raise, and never beyond the default burst.
 
 | Field | Value |
 |---|---|

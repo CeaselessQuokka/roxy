@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from typing import Any
 
 import pytest
@@ -282,6 +283,104 @@ async def test_429_without_header_uses_default_backoff(service: UpstreamService,
     assert 30 <= result.retry_after_s <= 33  # cooldown_default_s plus at most 10 % jitter
 
 
+def busiest_minute(times_ms: list[float]) -> int:
+    """The most calls any closed 60 s span holds (how Roblox would count them)."""
+    ordered, best, first = sorted(times_ms), 0, 0
+    for index, at in enumerate(ordered):
+        while at - ordered[first] > 60_000:
+            first += 1
+        best = max(best, index - first + 1)
+    return best
+
+
+async def test_429_cuts_below_the_rate_roblox_refused_and_the_bucket_holds_it(
+    service: UpstreamService, egress: FakeEgress, ctx: Any, clock: Any
+) -> None:
+    """Finding LOAD-1 end to end: Roblox allows 60 calls a minute and refuses the 61st. The endpoint runs at the
+    default 120 a minute, so the cut must start from the 61 calls the endpoint's meter saw, not from 120 (84 would
+    not slow it down at all): one 429 takes it to 42.7 a minute with burst 3, and after the cooldown no minute
+    holds more than 42 calls however hard callers push."""
+    egress.disabled.add(Egress.ROTATOR)
+    sent: list[float] = []
+    refused: list[float] = []
+
+    def roblox(e: Egress, out: Any) -> Any:
+        sent.append(clock.now_ms())
+        if busiest_minute(sent[-61:]) > 60:  # Roblox: at most 60 calls in any minute
+            refused.append(sent[-1])
+            return answer(429, b"", {"retry-after": "30"})
+        return answer(200)
+
+    egress.handler = roblox
+    results = [await fetch(service) for _ in range(61)]
+    assert [r.status for r in results[:60]] == [200] * 60
+    assert (results[-1].upstream_status, results[-1].reason) == (429, ReasonCode.UPSTREAM_COOLDOWN)
+    limit = ctx.rules.snapshot.upstream_limit(f"endpoint:{TEMPLATE}")
+    assert (limit.per_min, limit.burst, limit.origin) == (42.7, 3, "adaptive")
+    decrease = [detail for kind, _s, _r, detail in ctx.recorder.events if kind == "adaptive_rate_decrease"]
+    assert decrease[0]["evidence"]["observed_calls"] == 61
+    clock.advance(31)  # the cooldown is over
+    before = len(sent)
+    end = clock.now() + 240
+    while clock.now() < end:
+        if (await fetch(service)).status != 200:
+            clock.advance(0.25)  # a busy answer: the caller comes back a moment later
+    after = sent[before:]
+    assert len(after) >= 120  # it keeps serving, at the learned pace
+    assert busiest_minute(after) <= 42
+    # The minutes that began before the cut hold at most 42 new and old calls together (the backlog of the 61 old
+    # calls is paced out first), so Roblox never had to say 429 again.
+    for at in after:
+        assert sum(1 for t in sent if at - 60_000 <= t <= at) <= 42
+    assert len(refused) == 1
+
+
+class FastSleepClock:
+    """A stepping clock whose sleeps end early, like asyncio's on WSL 2, where the monotonic clock runs about 10
+    percent fast against the wall clock the buckets use: a sleep of `s` moves the wall clock only 0.9 x s."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    def now(self) -> float:
+        return float(self.inner.now())
+
+    def now_ms(self) -> int:
+        return int(self.inner.now_ms())
+
+    def monotonic(self) -> float:
+        return float(self.inner.monotonic())
+
+    def advance(self, seconds: float) -> None:
+        self.inner.advance(seconds)
+
+    async def sleep(self, seconds: float) -> None:
+        self.inner.advance(max(0.0, seconds) * 0.9)
+        await asyncio.sleep(0)
+
+
+async def test_a_call_never_leaves_before_its_slot(dbs: Any, rules: Any) -> None:
+    """The queue's sleep is measured on another clock than the slot: a call woken early sleeps the rest, so calls
+    keep the bucket's spacing on the buckets' own clock (`_sleep_until_slot`)."""
+    from upstream_fakes import SteppingClock
+
+    clock = FastSleepClock(SteppingClock())
+    sent: list[int] = []
+
+    def roblox(e: Egress, out: Any) -> Any:
+        sent.append(clock.now_ms())
+        return answer(200)
+
+    egress = FakeEgress(roblox, disabled={Egress.ROTATOR})
+    rules.limit(f"endpoint:{TEMPLATE}", 60, 1)
+    service = make_service(make_ctx(dbs, clock, egress, rules=rules))
+    for _ in range(4):
+        assert (await fetch(service)).status == 200
+    spacing = buckets.BucketSpec(f"endpoint:{TEMPLATE}", 60, 1).interval_ms
+    gaps = [later - earlier for earlier, later in itertools.pairwise(sent)]
+    assert all(gap >= spacing - 2 for gap in gaps), (gaps, spacing)  # never 10 percent early
+
+
 async def test_429_fallback_on_429_uses_other_anonymous_egress(
     service: UpstreamService, egress: FakeEgress, settings: Any
 ) -> None:
@@ -467,9 +566,13 @@ async def test_csrf_handshake_with_cached_token(service: UpstreamService, egress
     assert [(r["status"], r["reason"], r["egress"], r["endpoint_template"]) for r in retries] == [
         (403, "CSRF token refresh", "direct", TEMPLATE)
     ]
-    # Both calls took a bucket slot: the endpoint bucket advanced by two intervals (120/min = 500 ms each).
+    # Both calls took a bucket slot: the endpoint bucket advanced by two intervals (120 a minute with burst 10 as a
+    # window bucket: 61,000 / 111 ms each) and its meter counted both.
+    interval = buckets.BucketSpec(f"endpoint:{TEMPLATE}", 120, 10).interval_ms
     tats = ctx.dbs.hot.read_sync(lambda conn: buckets.read_tats(conn, [f"endpoint:{TEMPLATE}"]))
-    assert tats[f"endpoint:{TEMPLATE}"] == pytest.approx(ctx.clock.now_ms() + 1000, abs=5)
+    assert tats[f"endpoint:{TEMPLATE}"] == pytest.approx(ctx.clock.now_ms() + 2 * interval, abs=5)
+    meters = ctx.dbs.hot.read_sync(lambda conn: buckets.read_meters(conn, [f"endpoint:{TEMPLATE}"]))
+    assert meters[f"endpoint:{TEMPLATE}"].current == 2
     second = await fetch(service, method="POST", body=b"{}", content_type="application/json")
     assert second.status == 200
     assert len(egress.calls) == 3  # the cached token went out with the first try
@@ -497,24 +600,24 @@ async def test_get_never_carries_a_csrf_token(service: UpstreamService, egress: 
 
 
 async def test_bucket_paces_calls(service: UpstreamService, egress: FakeEgress, rules: Any, clock: Any) -> None:
-    rules.limit(f"endpoint:{TEMPLATE}", 60, 1)  # one per second, no burst
+    rules.limit(f"endpoint:{TEMPLATE}", 60, 1)  # at most 60 in any minute, no burst: one every 61 / 60 s
     start = clock.now()
     for _ in range(3):
         result = await fetch(service)
         assert result.status == 200
-    assert clock.now() - start == pytest.approx(2.0, abs=0.01)  # slots at 0, 1 and 2 s
+    assert clock.now() - start == pytest.approx(2 * 61 / 60, abs=0.01)  # slots at 0, 1.017 and 2.033 s
     assert len(egress.calls) == 3
 
 
 async def test_bucket_busy_beyond_queue_budget(
     service: UpstreamService, egress: FakeEgress, rules: Any, settings: Any
 ) -> None:
-    rules.limit(f"endpoint:{TEMPLATE}", 6, 1)  # one per 10 s
+    rules.limit(f"endpoint:{TEMPLATE}", 6, 1)  # at most 6 in any minute: one per 10.17 s
     settings.set(queue_wait_interactive_ms=4000)
     assert (await fetch(service)).status == 200
     result = await fetch(service)
     assert (result.status, result.reason) == (429, ReasonCode.UPSTREAM_BUSY)
-    assert result.retry_after_s == 10
+    assert result.retry_after_s == 11  # 10.17 s, rounded up
     assert result.body == messages.BUSY_MESSAGE.encode()
     assert len(egress.calls) == 1
 
@@ -546,15 +649,20 @@ async def test_cancel_during_wait_refunds_slot(dbs: Any, rules: Any) -> None:
         await asyncio.sleep(0.01)
         if dbs.hot.read_sync(lambda conn: buckets.read_tats(conn, [key]))[key] > before:
             break
-    assert dbs.hot.read_sync(lambda conn: buckets.read_tats(conn, [key]))[key] == pytest.approx(before + 1000)
+    interval = buckets.BucketSpec(key, 60, 1).interval_ms
+    assert dbs.hot.read_sync(lambda conn: buckets.read_tats(conn, [key]))[key] == pytest.approx(
+        before + interval, abs=1
+    )
+    assert dbs.hot.read_sync(lambda conn: buckets.read_meters(conn, [key]))[key].current == 2
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     for _ in range(50):
-        if dbs.hot.read_sync(lambda conn: buckets.read_tats(conn, [key]))[key] == pytest.approx(before):
+        if dbs.hot.read_sync(lambda conn: buckets.read_tats(conn, [key]))[key] == pytest.approx(before, abs=1):
             break
         await asyncio.sleep(0.01)
-    assert dbs.hot.read_sync(lambda conn: buckets.read_tats(conn, [key]))[key] == pytest.approx(before)
+    assert dbs.hot.read_sync(lambda conn: buckets.read_tats(conn, [key]))[key] == pytest.approx(before, abs=1)
+    assert dbs.hot.read_sync(lambda conn: buckets.read_meters(conn, [key]))[key].current == 1  # the refund uncounted it
     assert len(ctx.egress.calls) == 1
     assert len(service.queue) == 0
 

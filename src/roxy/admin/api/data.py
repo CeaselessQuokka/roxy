@@ -65,6 +65,10 @@ How it works
       pre-migration snapshots are never removed here); a copy that still does not fit is skipped with its reason
       (finding apisec-5). 409 `not_feasible` only when neither the request nor any copy could be made.
 
+    * The Data dashboard page (`roxy/admin/pages/data.py`) reads through the same functions as these routes
+      (`reset_catalog`, `measure_storage` and `storage_rows`, `retention_answer`, `backups_answer`,
+      `vacuum_answer`) and changes nothing itself: its forms post to these routes (P6, DESIGN.md 13).
+
 What to read next
     `roxy/storage/read_sizes.py`, `roxy/metrics/recorder.py` (the reset fences), `roxy/metrics/annotate.py`,
     `roxy/cache/read_purge_counts.py`, `roxy/storage/retention.py`, `roxy/admin/api/system.py` (the per-worker
@@ -1855,6 +1859,11 @@ async def execute_reset(
 @router.get("/resets")
 async def reset_scopes(_admin: AdminSession) -> dict[str, Any]:
     """Every reset scope of plan 6.8, the metric families, and where each v1 clear target went."""
+    return reset_catalog()
+
+
+def reset_catalog() -> dict[str, Any]:
+    """The `GET /data/resets` answer (the Data page's reset form is built from the same data)."""
     return {
         "scopes": [{"scope": name, "description": text} for name, text in SCOPES.items()],
         "families": [
@@ -2069,16 +2078,20 @@ async def storage(request: Request, admin: AdminSession, fmt: ExportFormatDep, r
     ctx = get_ctx(request)
     data = await common.run_mutation(measure_storage(ctx, refresh=refresh))
     if fmt is not None:
-        rows = []
-        for database in data["databases"]:
-            for table in database.get("tables", []):
-                projection = table.get("projection_30d") or {}
-                rows.append(
-                    {**table, "projected_rows": projection.get("rows"), "projected_bytes": projection.get("bytes")}
-                )
+        rows = storage_rows(data)
         tq = TableQuery(sort="bytes")
         return await common.export_table(request, admin, STORAGE_TABLE, rows, fmt, total=len(rows), tq=tq)
     return data
+
+
+def storage_rows(data: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Every table of a `measure_storage` answer as one `STORAGE_TABLE` row (the export and the Data page)."""
+    rows = []
+    for database in data.get("databases") or ():
+        for table in database.get("tables", []):
+            projection = table.get("projection_30d") or {}
+            rows.append({**table, "projected_rows": projection.get("rows"), "projected_bytes": projection.get("bytes")})
+    return rows
 
 
 RETENTION_FILE_SETTINGS: Final = (
@@ -2109,7 +2122,11 @@ def retention_setting_keys() -> list[str]:
 @router.get("/retention")
 async def retention_view(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Every retention and record cap setting with its value, and each table's state against its limits."""
-    ctx = get_ctx(request)
+    return await retention_answer(get_ctx(request))
+
+
+async def retention_answer(ctx: Any) -> dict[str, Any]:
+    """The `GET /data/retention` answer (the Data page's retention and record cap cards read the same)."""
     data = await common.run_mutation(measure_storage(ctx))
     snapshot = ctx.settings.snapshot()
     settings = []
@@ -2278,7 +2295,11 @@ def write_backup_request(state_dir: Path, by: str, audit_id: int | None, request
 async def backups(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """The nightly backups (as `backup.sh` recorded them, with its last answered request), a request still
     waiting for it, and the snapshots on this server."""
-    ctx = get_ctx(request)
+    return await backups_answer(get_ctx(request))
+
+
+async def backups_answer(ctx: Any) -> dict[str, Any]:
+    """The `GET /data/backups` answer (the Data page's backups card reads the same)."""
     state_dir = Path(ctx.env.state_dir)
     nightly = await asyncio.to_thread(_backup_status, state_dir)
     pending = await asyncio.to_thread(_pending_request, state_dir)
@@ -2403,7 +2424,11 @@ async def _vacuum_estimates(ctx: Any) -> list[dict[str, Any]]:
 @router.get("/vacuum")
 async def vacuum_estimate(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Size, reclaimable space and an estimated time for a full VACUUM of each database (plan 6.5)."""
-    ctx = get_ctx(request)
+    return await vacuum_answer(get_ctx(request))
+
+
+async def vacuum_answer(ctx: Any) -> dict[str, Any]:
+    """The `GET /data/vacuum` answer (the Data page's vacuum card reads the same)."""
     return {"databases": await common.run_mutation(_vacuum_estimates(ctx)), "rate_bytes_per_s": VACUUM_BYTES_PER_S}
 
 
@@ -2464,6 +2489,7 @@ __all__ = [
     "MEMORY_FAMILIES",
     "RESET_LEASE",
     "SCOPES",
+    "STORAGE_TABLE",
     "V1_CLEAR_TARGETS",
     "Family",
     "Operation",
@@ -2472,6 +2498,7 @@ __all__ = [
     "ResetLease",
     "ResetPlan",
     "backup_plan",
+    "backups_answer",
     "build_plan",
     "count_part",
     "execute_reset",
@@ -2481,10 +2508,14 @@ __all__ = [
     "measure_storage",
     "part_clause",
     "preview_plan",
+    "reset_catalog",
+    "retention_answer",
     "retention_setting_keys",
     "router",
     "snapshot_feasibility",
+    "storage_rows",
     "take_snapshot",
     "template_regex",
+    "vacuum_answer",
     "write_backup_request",
 ]

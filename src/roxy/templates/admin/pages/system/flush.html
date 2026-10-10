@@ -1,0 +1,25 @@
+{#-
+  System page, card `flush` (`roxy/admin/pages/system.py flush_card`): the forced flush (parity row 121).
+
+  v1's Refresh asked the server to merge every worker's counters first (`?flush=1`). Here the form posts to
+  `POST /admin/api/v1/system/flush` (static/js/api_forms.js, CSRF header, audited): this worker writes its counters at
+  once and every other worker within about a second (the per-worker `admin_requests_watch` job). The metrics
+  pipeline and the fleet cards are refreshed afterwards. Context: `frame`, `flush_url`, `interval_ms`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/icon.html" import icon %}
+{% call page_card(frame) %}
+<form class="stack system-flush" data-api-form data-api-url="{{ flush_url }}" data-api-method="POST"
+      data-success="Flush requested: this worker wrote its counters, every other worker does within about 2 seconds."
+      data-on-success="refresh" data-refresh="metrics-pipeline fleet" novalidate>
+  <p>Workers keep their counters in memory and write them every {{ num(interval_ms) if interval_ms is not none else "few thousand" }} ms. A forced flush writes them now, so every page includes the last few seconds. It changes no setting and deletes nothing.</p>
+  <div class="field">
+    <label class="field__label" for="flush-reason">Reason <span class="muted">(optional, saved in the audit log)</span></label>
+    <input class="input" type="text" id="flush-reason" name="reason" maxlength="500" autocomplete="off" data-json="skip-empty" aria-describedby="flush-reason-error">
+    <p class="field__error" id="flush-reason-error" data-field-error="reason" hidden></p>
+  </div>
+  <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+  <div class="cluster"><button type="submit" class="btn btn--primary" data-action="flush">{{ icon("refresh") }}<span>Flush every worker now</span></button></div>
+</form>
+{% endcall %}

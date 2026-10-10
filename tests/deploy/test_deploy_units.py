@@ -106,8 +106,8 @@ EXPECTED_17_1 = {
     "RuntimeDirectoryMode": "0750",
     "UMask": "0027",
     "MemoryAccounting": "yes",
-    "MemoryHigh": "320M",  # DESIGN.md section 0 (909 MB server), not the plan's 650M
-    "MemoryMax": "420M",  # DESIGN.md section 0, not the plan's 800M
+    "MemoryHigh": "350M",  # the 909 MB server (DESIGN.md section 0), sized by the LOAD-2 soak; not the plan's 650M
+    "MemoryMax": "450M",  # MemoryHigh plus 100 MiB for short peaks; not the plan's 800M
     "TasksMax": "256",
     "LimitNOFILE": "65536",
     "NoNewPrivileges": "yes",
@@ -163,7 +163,13 @@ def test_roxy_unit_lists_and_order() -> None:
     for value in values(ROXY, "LoadCredential"):
         name, source = value.split(":", 1)
         assert source == f"/etc/roxy/credentials/{name}"
-    assert values(ROXY, "Environment") == [], "no Environment=ROXY_BIND=...${PORT}: systemd does not expand it (17.1)"
+    # Only the glibc malloc tuning of finding LOAD-2 (docs/PERFORMANCE.md); never Environment=ROXY_BIND=...${PORT}:
+    # systemd does not expand it (17.1), and every ROXY_* value comes from the environment files.
+    assert values(ROXY, "Environment") == [
+        "MALLOC_ARENA_MAX=2",
+        "MALLOC_MMAP_THRESHOLD_=131072",
+        "MALLOC_TRIM_THRESHOLD_=131072",
+    ]
     assert values(ROXY, "IPAddressDeny") == []
     assert values(ROXY, "IPAddressAllow") == []
     assert values(ROXY, "ExecStartPre") == [

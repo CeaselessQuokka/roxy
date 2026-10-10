@@ -1,0 +1,76 @@
+{#-
+  Settings page, card `history` (`roxy/admin/pages/settings.py history_card`): every settings change, or one change
+  in the drawer.
+
+  The table is `GET /admin/api/v1/settings/history` (`settings_api.history_answer`): newest first, the top bar range
+  (the page opens on All), a source filter and a search over keys, reasons and who changed them, server paging and
+  sorting, export through the API. Values are the effective ones (a sensitive setting shows `[redacted]`, the only
+  form its history keeps); values, reasons and who changed them are plain text through `caller_text`. A row opens
+  `?change=<id>` in the drawer: before and after, who and why, and the revert form, which posts to
+  `POST /admin/api/v1/settings/history/{id}/revert` (static/js/api_forms.js: CSRF, "Confirm it is you" for a setting
+  that needs a fresh second factor, the high-risk confirmation on a 422) and is itself audited.
+  Context: `frame`, then either `table`, `table_only`, `total`, `whole`, `range_description`, or the drawer's
+  `change`, `spec`, `when`, `before`, `after`, `before_default`, `after_default`, `revert_url`, `arming`,
+  `needs_fresh_mfa`, `high_risk`, `max_value_chars`, `history_url`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import num, caller_text, local_href %}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import badge %}
+{% if change is defined and change %}
+<div class="settings-change stack" data-settings-change="{{ change.id }}">
+  <p class="settings-change__lead">{{ badge("Change #" ~ change.id, "neutral") }} {% if spec %}<strong>{{ spec.label }}</strong>{% endif %} <code>{{ change.key }}</code></p>
+  <dl class="kv settings-change__facts">
+    <dt>When</dt><dd>{% if when %}<time datetime="{{ when.datetime }}">{{ when.text }}</time> <span class="muted">({{ when.sub }})</span>{% else %}<span class="muted">n/a</span>{% endif %}</dd>
+    <dt>Who</dt><dd>{{ caller_text(change.changed_by, 120) }}</dd>
+    <dt>Source</dt><dd class="mono">{{ change.source }}</dd>
+    <dt>Reason</dt><dd>{% if change.reason %}{{ caller_text(change.reason, 600, block=True) }}{% else %}<span class="muted">No reason was given.</span>{% endif %}</dd>
+  </dl>
+  <div class="table-scroll" role="region" aria-labelledby="change-{{ change.id }}-caption" tabindex="0">
+    <table class="diff-table settings-change__diff">
+      <caption class="sr-only" id="change-{{ change.id }}-caption">The value before and after this change</caption>
+      <thead><tr><th scope="col">Before</th><th scope="col">After</th></tr></thead>
+      <tbody><tr>
+        <td class="diff-table__before"><del>{{ caller_text(before, max_value_chars) }}</del>{% if before_default %} <span class="muted">(the default)</span>{% endif %}</td>
+        <td class="diff-table__after"><ins>{{ caller_text(after, max_value_chars) }}</ins>{% if after_default %} <span class="muted">(the default)</span>{% endif %}</td>
+      </tr></tbody>
+    </table>
+  </div>
+  {% set setting_href = local_href("/admin/settings?key=" ~ change.key) if spec else "" %}
+  <p class="settings-change__links">{% if setting_href %}<a href="{{ setting_href }}">{{ icon("sliders") }}<span>Open this setting</span></a>{% endif %}{% set audit_href = local_href(history_url) %}{% if audit_href %}<a href="{{ audit_href }}">{{ icon("history") }}<span>Its whole history in the audit log</span></a>{% endif %}</p>
+
+  <section class="settings-change__section" aria-labelledby="change-{{ change.id }}-undo">
+    <h3 class="settings-change__heading" id="change-{{ change.id }}-undo">Undo this change</h3>
+    {% set revert_href = local_href(revert_url) if revert_url else "" %}
+    {% if arming %}
+    <p>Reverting this would switch the spam detectors' dry run off, which arms them (real bans). Do it from <a href="/admin/protection#spam">Protection &gt; Spam detectors</a>, which first shows who would have been banned.</p>
+    {% elif revert_href %}
+    <form class="stack settings-revert" data-api-form data-api-url="{{ revert_href }}" data-api-method="POST"
+          data-success="Reverted. The setting has the value it had before this change." data-on-success="refresh" data-refresh="history editor" novalidate>
+      <ul class="dialog__consequences">
+        <li>Puts {{ spec.label if spec else change.key }} back to the value it had right before this change, on every worker within a second.</li>
+        <li>The revert is itself a change: it is written to the history and the audit log with your reason.</li>
+      </ul>
+      {% if needs_fresh_mfa %}<p class="setting__mfa">{{ icon("lock") }}<span>This setting asks for a current code from your authenticator app before it changes.</span></p>{% endif %}
+      <div class="field">
+        <label class="field__label" for="revert-change-{{ change.id }}-reason">Reason <span class="muted">({{ "required: this is a high-risk setting" if high_risk else "saved in the audit log; needed for a high-risk value" }})</span></label>
+        <textarea class="input" id="revert-change-{{ change.id }}-reason" name="reason" rows="2" maxlength="500" data-json="string" aria-describedby="revert-change-{{ change.id }}-reason-error"{% if high_risk %} required aria-required="true"{% endif %}></textarea>
+        <p class="field__error" id="revert-change-{{ change.id }}-reason-error" data-field-error="reason" hidden></p>
+      </div>
+      <label class="check" data-confirm-field{% if not high_risk %} hidden{% endif %}><input type="checkbox" name="confirm_high_risk" value="1" data-json="bool"><span>I understand: the old value is high risk</span></label>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      <div class="cluster"><button type="submit" class="btn btn--primary" data-action="settings-revert">{{ icon("reset") }}<span>Revert this change</span></button></div>
+    </form>
+    {% else %}
+    <p class="muted">{% if not spec %}This setting is no longer in the catalog, so there is nothing to put back.{% else %}A secret setting's earlier value is never kept, only its fingerprint, so it cannot be put back from here; set it again on its card.{% endif %}</p>
+    {% endif %}
+  </section>
+</div>
+{% elif table_only %}{{ data_table(**table) }}
+{% else %}
+{% set subtitle = ("Every change" if whole else range_description) ~ ": " ~ num(total) ~ " changes" %}
+{% call page_card(frame, subtitle=subtitle, notices=[] if whole else ["Only changes from the range in the top bar are listed. Choose All in the time range to see every change."]) %}
+{{ data_table(**table) }}
+{% endcall %}
+{% endif %}

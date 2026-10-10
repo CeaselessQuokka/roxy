@@ -1,0 +1,28 @@
+{#-
+  Protection page, card `throttle-all` (`roxy/admin/pages/protection.py throttle_all_card`): the emergency limit.
+
+  What: whether throttle-all is on (`GET /protection/throttle-all`), its limit, since when, how many requests it
+  refused since then (row 114) and the exact text callers get; the switch is the top bar's Emergency limit dialog
+  (`dlg-throttle-all`, its two settings included), opened from here too. Below, v1's "Who is being throttled right
+  now" (row 135, `GET /protection/throttle-all/watch`): each client at the limit with its requests and refusals
+  since throttle-all began, its rates, its busiest endpoint (caller text) and when it was last seen. The card
+  refreshes on the event stream while open.
+  Context: `frame`, `table`, `only`, `state`, `since`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num, caller_text %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/glossary.html" import term with context %}
+{% if only %}{{ data_table(**table) }}{% else %}
+{% set actions %}<button type="button" class="btn btn--sm{% if state.enabled %} btn--warn{% endif %}" data-dialog-open="dlg-throttle-all" aria-haspopup="dialog" data-action="throttle-all-toggle">{{ icon("gauge") }}<span>{{ "Turn the emergency limit off" if state.enabled else "Turn the emergency limit on" }}</span></button>{% endset %}
+{% call page_card(frame, flush=True, actions=actions) %}
+<div class="prot-pad stack">
+  <p class="prot-lead">{% if state.enabled %}{{ status_badge("warn", "On") }} Every IP may make <strong>{{ num(state.limit) }}</strong> request{{ "s" if state.limit != 1 }} per <strong>{{ num(state.period) }} seconds</strong>{% if since %} since <time datetime="{{ since.datetime }}">{{ since.text }}</time> ({{ since.sub }}){% endif %}; <strong>{{ num(state.drops_since_start or 0) }}</strong> requests refused so far.{% else %}{{ status_badge("neutral", "Off") }} The {{ term("emergency-limit", "emergency limit") }} is a softer brake than pausing: every IP gets a few requests per period; the rest get 429. When switched on it allows {{ num(state.limit) }} request{{ "s" if state.limit != 1 }} per {{ num(state.period) }} seconds.{% endif %}</p>
+  <p>Callers over the limit get {{ state.callers_see.status }} with: {{ caller_text(state.callers_see.body, 300) }} <span class="muted">({{ "a custom message" if state.callers_see.message_source == "custom" else "the default message" }})</span></p>
+  <p class="field__hint">Per-IP and per-endpoint limits still apply; bypass addresses are never limited. The list below is live while the limit is on, so the brake can be judged and released rather than left on out of caution.</p>
+</div>
+{{ data_table(**table) }}
+{% endcall %}
+{% endif %}

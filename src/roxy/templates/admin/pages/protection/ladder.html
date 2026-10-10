@@ -1,0 +1,80 @@
+{#-
+  Protection page, card `ladder` (`roxy/admin/pages/protection.py ladder_card`): the escalation ladder (rows 40, 125).
+
+  What: v1's "What happens to a repeat offender, using your current ladder" simulation (plan 14.7, v1 notes 7.2)
+  from the saved ladder and the live settings; the ladder editor (multiplier, message, note, and a rung may ban
+  instead of throttle, plan 10.4), with each rung's new strikes in the range (row 76); "Restore defaults" (the four
+  shipped rungs, row 125). The editor is saved whole with `PUT /admin/api/v1/protection/ladder` by
+  static/js/pages/protection.js (`[data-ladder-form]`): the rows become `{tiers: [...], reason}`; its errors show
+  in the form; the 403 second factor and the audit log are the API's.
+  Context: `frame`, `ladder` (`ladder_view`), `rungs`, `timeline`, `max_rungs`, `max_multiplier`,
+  `window_words`, `decay_words`, `api`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/format.html" import num %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/protection/_macros.html" import reason_field %}
+
+{% macro rung_row(index, rung) -%}
+<tr data-ladder-row>
+  <th scope="row" class="prot-ladder__rung"><span data-rung-label>Rung {{ index }}</span>{% if rung and rung.hits is not none %}<span class="dt__sub">{{ num(rung.hits) }} new strikes in range</span>{% endif %}</th>
+  <td><label class="sr-only" for="ladder-multiplier-{{ index }}" data-rung-for="multiplier">Rung {{ index }} multiplier</label>
+    <input class="input input--num" id="ladder-multiplier-{{ index }}" data-tier="multiplier" inputmode="decimal" value="{{ rung.multiplier if rung else 1 }}" required aria-required="true"></td>
+  <td><label class="sr-only" for="ladder-action-{{ index }}" data-rung-for="action">Rung {{ index }} action</label>
+    <select class="input" id="ladder-action-{{ index }}" data-tier="action">
+      <option value="throttle"{% if not rung or rung.action != "ban" %} selected{% endif %}>Throttle</option>
+      <option value="ban"{% if rung and rung.action == "ban" %} selected{% endif %}>Ban the IP</option>
+    </select></td>
+  <td><label class="sr-only" for="ladder-ban_minutes-{{ index }}" data-rung-for="ban_minutes">Rung {{ index }} ban minutes</label>
+    <input class="input input--num" id="ladder-ban_minutes-{{ index }}" data-tier="ban_minutes" inputmode="numeric" value="{{ rung.ban_minutes if rung and rung.ban_minutes else '' }}" placeholder="only for a ban"></td>
+  <td><label class="sr-only" for="ladder-message-{{ index }}" data-rung-for="message">Rung {{ index }} message shown to the caller</label>
+    <input class="input" id="ladder-message-{{ index }}" data-tier="message" maxlength="400" value="{{ rung.message if rung else '' }}"></td>
+  <td><label class="sr-only" for="ladder-note-{{ index }}" data-rung-for="note">Rung {{ index }} note</label>
+    <input class="input" id="ladder-note-{{ index }}" data-tier="note" maxlength="400" value="{{ rung.note if rung else '' }}"></td>
+  <td><button type="button" class="icon-btn" data-ladder-remove aria-label="Remove rung {{ index }}">{{ icon("x") }}</button></td>
+</tr>
+{%- endmacro %}
+
+{% set chip = ("Escalation on: " ~ (rungs|length) ~ " rung" ~ ("s" if rungs|length != 1 else "")) if ladder.escalation_enabled else "Escalation off" %}
+{% call page_card(frame, subtitle=chip) %}
+<section class="prot-sub" aria-labelledby="ladder-sim-title">
+  <h3 class="prot-sub__title" id="ladder-sim-title">What happens to a repeat offender, using your current ladder</h3>
+  <ol class="prot-timeline">
+    {% for step in timeline %}<li><span class="prot-timeline__at">{{ step.at }}</span><span class="prot-timeline__what">{{ step.what }}</span></li>{% endfor %}
+  </ol>
+  <p class="field__hint">The normal throttle lasts {{ window_words }} (Throttle window length); {% if decay_words %}a {{ term("rung", "rung") }} drops after {{ decay_words }} of good behavior{% else %}strikes never decay{% endif %}. Escalation and decay are settings of the <a href="/admin/protection#throttle">Throttle card</a>. The simulation follows the saved ladder: save to see a change.</p>
+</section>
+
+<form class="prot-ladder stack" data-ladder-form data-api-url="{{ api.save }}" data-api-method="PUT" data-max-rungs="{{ max_rungs }}" data-refresh="ladder strikes" novalidate>
+  <div class="table-scroll" role="region" aria-labelledby="ladder-editor-caption" tabindex="0">
+    <table class="simple-table prot-ladder__table">
+      <caption id="ladder-editor-caption" class="prot-caption">Escalation ladder (rung 1 is a caller's first strike; the last rung repeats)</caption>
+      <thead><tr><th scope="col">Rung</th><th scope="col">{{ term("multiplier", "Multiplier") }}</th><th scope="col">Action</th><th scope="col">Ban minutes</th><th scope="col">Message shown to the caller</th><th scope="col">Note (private)</th><th scope="col"><span class="sr-only">Remove</span></th></tr></thead>
+      <tbody data-ladder-rows>
+        {% for rung in rungs %}{{ rung_row(loop.index, rung) }}{% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <template data-ladder-template>{{ rung_row(0, none) }}</template>
+  <p class="muted" data-ladder-empty{% if rungs %} hidden{% endif %}>No rungs; every throttle is the plain one.</p>
+  <p class="field__hint">A multiplier of 4 makes that rung's wait 4 times the throttle window. At most {{ max_rungs }} rungs, multipliers up to {{ num(max_multiplier) }}. Write the message for a person reading an error: it is the part that changes behavior.</p>
+  {{ reason_field("ladder-reason") }}
+  <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+  <p class="prot-dirty" data-ladder-dirty role="status" hidden>{{ icon("alert-triangle") }}<span>Unsaved changes.</span></p>
+  <div class="cluster">
+    <button type="button" class="btn" data-ladder-add>{{ icon("plus") }}<span>Add a rung</span></button>
+    <button type="submit" class="btn btn--primary" data-action="ladder-save">{{ icon("check") }}<span>Save ladder</span></button>
+    <button type="button" class="btn btn--ghost" data-dialog-open="dlg-prot-ladder-reset" aria-haspopup="dialog" data-action="ladder-reset">{{ icon("reset") }}<span>Restore defaults</span></button>
+  </div>
+</form>
+{% call confirm_dialog("dlg-prot-ladder-reset", "Restore the shipped ladder?", api.reset, confirm_label="Restore defaults",
+                       api=True, success="The shipped ladder is back.", on_success="refresh", refresh="ladder strikes",
+                       consequences=["Replaces the ladder with the four shipped rungs (1, 2, 4 and 8 times the throttle window) and their messages.",
+                                     "Callers keep their strikes; their next throttle uses the restored rungs.",
+                                     "The change is written to the audit log."]) %}
+  {{ reason_field("dlg-prot-ladder-reset-reason") }}
+{% endcall %}
+{% endcall %}

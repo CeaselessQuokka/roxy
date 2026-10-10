@@ -2,39 +2,58 @@
   Top-N table shell with server-side paging, sorting, search, filter chips, column chooser and export (plan 14.5).
 
   What
-    `data_table(id, columns, rows, src=..., total=..., page=..., size=..., sort=..., dir=...)` renders one
+    `data_table(id, columns, rows, src=..., total=..., page=..., page_size=..., sort=..., order=...)` renders one
     self-contained table block. Every control re-asks the server through htmx: the server answers with the same
     macro for the new page, and htmx swaps the whole block (`outerHTML` on `#id`). The same macro serves the first
-    page render and every fragment, so the two can never drift.
+    page render and every fragment, so the two can never drift. Pages build the context from an admin API table
+    answer with `roxy.admin.pages.kit.table_view` and call `data_table(**table)`.
   Why
     Dashboard tables can have millions of rows (endpoint records, clients); only the server can sort and page them
     honestly (v1 sorted rendered rows in the browser, so "top 25" meant "top 25 of what was sent"). Paging sizes
     10, 25, 50, 100 and 250 are kept from v1, and the choices a person makes (rows per page, hidden columns) are
     remembered per table in this browser by static/js/tables.js.
   How
-    State lives in one form (`#id-state`): q, filters, and hidden page, size, sort and dir inputs. The search box
-    asks after a short pause; selects ask on change; sort headers, the pager and the rows-per-page select set the
-    hidden inputs and submit the form (tables.js), so there is exactly one request shape:
-    `GET src?q=&page=&size=&sort=&dir=&<filter>=`. Row cells carry `data-label` so phones can show each row as a
-    card with the key columns (`key_col`) and open the rest in the drawer (plan 14.8).
+    State lives in one form (`#id-state`): q, filters, the page-level parameters in `keep` (the time range), and
+    hidden page, page_size, sort and order inputs. The names are the admin API's own (DESIGN.md 13: `page`,
+    `page_size`, `sort`, `order`, `q`), so the same query string pages the fragment and exports through the API.
+    The search box asks after a short pause; selects ask on change; sort headers, the pager and the rows-per-page
+    select set the hidden inputs and submit the form (tables.js), so there is exactly one request shape:
+    `GET src?q=&page=&page_size=&sort=&order=&<filter>=&<keep>=`. Row cells carry `data-label` so phones can show
+    each row as a card with the key columns (`key_col`) and open the rest in the drawer (plan 14.8). The export
+    menu links to the API route (`export_url`) with `format=csv|json` and the current search and filters;
+    static/js/exports.js downloads it, says "try again in a few seconds" on a 429 and warns when the file was cut
+    (`Roxy-Export-Truncated`). The root carries `data-table="<API table name>"` (tests and pages find tables by it).
+    `size` and `dir` are the older names of `page_size` and `order` and still work. `address=True` marks the page's
+    main table: tables.js keeps its search, filters, sort and page in the address bar (values equal to `defaults`,
+    {"page_size", "sort", "order"}, are left out), so the page route must read the same names on a full render.
 
     columns: [{"key", "label", "num": bool, "sortable": bool (default true), "key_col": bool, "help": str,
                "hidden": bool (hidden by default), "mono": bool}]
-    rows:    [{"id": str, "drawer": url or None, "cells": {key: value | {"text", "href", "tone", "mono", "sub"}}}]
-             (a cell `href` becomes a link only when it is a path on this site, format.html `local_href`)
+    rows:    [{"id": str, "drawer": url or None, "title": the drawer's title or None, "cells": {key: value | cell}}],
+             a cell being
+             {"text", "href", "tone", "mono", "sub", "caller": bool, "datetime": ISO 8601}
+             (a cell `href` becomes a link only when it is a path on this site, format.html `local_href`; a
+             `caller` cell is caller-chosen text and goes through format.html `caller_text`; a `datetime` cell
+             renders as a <time> element)
     filters: [{"name", "label", "value", "options": [[value, label], ...]}]
 -#}
 {% from "components/icon.html" import icon %}
 {% from "components/badges.html" import help_dot %}
-{% from "components/format.html" import num, local_href %}
+{% from "components/format.html" import num, local_href, caller_text %}
 {% from "components/empty.html" import empty_state %}
+
+{% macro _text(column, value) -%}
+{%- if value.caller -%}{{ caller_text(value.text, value.limit or 200) }}
+{%- elif value.datetime -%}<time datetime="{{ value.datetime }}">{{ value.text }}</time>
+{%- else -%}{{ value.text }}{%- endif -%}
+{%- endmacro %}
 
 {% macro _cell(column, value) -%}
 {%- if value is mapping -%}
   {%- set href = local_href(value.href) if value.href else "" -%}
-  {%- if href -%}<a href="{{ href }}" class="{% if value.mono or column.mono %}mono{% endif %}">{{ value.text }}</a>
-  {%- elif value.tone -%}<span class="tone tone--{{ value.tone }}">{{ value.text }}</span>
-  {%- else -%}<span class="{% if value.mono or column.mono %}mono{% endif %}">{{ value.text }}</span>
+  {%- if href -%}<a href="{{ href }}" class="{% if value.mono or column.mono %}mono{% endif %}">{{ _text(column, value) }}</a>
+  {%- elif value.tone -%}<span class="tone tone--{{ value.tone }}">{{ _text(column, value) }}</span>
+  {%- else -%}<span class="{% if value.mono or column.mono %}mono{% endif %}">{{ _text(column, value) }}</span>
   {%- endif -%}
   {%- if value.sub %}<span class="dt__sub">{{ value.sub }}</span>{% endif -%}
 {%- elif value is none -%}<span class="muted">n/a</span>
@@ -44,23 +63,28 @@
 {%- endif -%}
 {%- endmacro %}
 
-{% macro data_table(id, columns, rows, src="", total=None, page=1, size=25, sort=None, dir="desc", q="",
+{% macro data_table(id, columns, rows, src="", total=None, page=1, page_size=None, sort=None, order=None, q="",
                     filters=(), export_url=None, sizes=(10, 25, 50, 100, 250), empty=None, caption=None,
-                    searchable=True, search_label="Search", search_placeholder="Search", show_caption=False) -%}
+                    searchable=True, search_label="Search", search_placeholder="Search", show_caption=False,
+                    table_name=None, keep=None, notice=None, size=25, dir="desc", address=False, defaults=None) -%}
+{%- set page_size = page_size or size -%}
+{%- set order = order or dir -%}
+{%- set d = defaults or {} -%}
 {%- set total = total if total is not none else rows|length -%}
-{%- set pages = [((total + size - 1) // size), 1]|max -%}
-{%- set first_row = 0 if total == 0 else (page - 1) * size + 1 -%}
-{%- set last_row = [page * size, total]|min -%}
-{%- set params = {"q": q, "page": page, "size": size, "sort": sort or "", "dir": dir} -%}
+{%- set pages = [((total + page_size - 1) // page_size), 1]|max -%}
+{%- set first_row = 0 if total == 0 else (page - 1) * page_size + 1 -%}
+{%- set last_row = [page * page_size, total]|min -%}
+{%- set params = {"q": q, "sort": sort or "", "order": order} -%}
 {%- for f in filters %}{% set _ = params.update({f.name: f.value or ""}) %}{% endfor -%}
-<div class="dt" id="{{ id }}" data-dt data-dt-id="{{ id }}" data-dt-src="{{ src }}">
+{%- for name, value in (keep or {}).items() %}{% set _ = params.update({name: value}) %}{% endfor -%}
+<div class="dt" id="{{ id }}" data-dt data-dt-id="{{ id }}" data-dt-src="{{ src }}"{% if table_name %} data-table="{{ table_name }}"{% endif %}{% if address %} data-dt-address{% endif %}>
   <div class="dt__toolbar">
     <form class="dt__state" id="{{ id }}-state" data-dt-state role="search" aria-label="{{ caption or 'Table' }}: search and filters"
           hx-get="{{ src }}" hx-target="#{{ id }}" hx-swap="outerHTML" hx-indicator="#{{ id }}"
           hx-trigger="submit, change, input changed delay:400ms from:#{{ id }}-q">
       {% if searchable %}
       <label class="sr-only" for="{{ id }}-q">{{ search_label }}</label>
-      <span class="input-icon">{{ icon("search") }}<input type="search" id="{{ id }}-q" name="q" value="{{ q }}" placeholder="{{ search_placeholder }}" autocomplete="off" spellcheck="false"></span>
+      <span class="input-icon">{{ icon("search") }}<input type="search" id="{{ id }}-q" name="q" value="{{ q }}" placeholder="{{ search_placeholder }}" autocomplete="off" spellcheck="false" maxlength="200"></span>
       {% endif %}
       {% for f in filters %}
       <label class="chip-select">
@@ -70,10 +94,11 @@
         </select>
       </label>
       {% endfor %}
-      <input type="hidden" name="page" value="{{ page }}" data-dt-field="page">
-      <input type="hidden" name="size" value="{{ size }}" data-dt-field="size">
-      <input type="hidden" name="sort" value="{{ sort or '' }}" data-dt-field="sort">
-      <input type="hidden" name="dir" value="{{ dir }}" data-dt-field="dir">
+      {% for name, value in (keep or {}).items() %}<input type="hidden" name="{{ name }}" value="{{ value }}" data-dt-keep>{% endfor %}
+      <input type="hidden" name="page" value="{{ page }}" data-dt-field="page" data-dt-default="1">
+      <input type="hidden" name="page_size" value="{{ page_size }}" data-dt-field="page_size" data-dt-default="{{ d.page_size or 25 }}">
+      <input type="hidden" name="sort" value="{{ sort or '' }}" data-dt-field="sort" data-dt-default="{{ d.sort or '' }}">
+      <input type="hidden" name="order" value="{{ order }}" data-dt-field="order" data-dt-default="{{ d.order or 'desc' }}">
     </form>
     <div class="dt__tools">
       <details class="menu" data-menu>
@@ -88,25 +113,27 @@
       <details class="menu" data-menu>
         <summary class="btn btn--sm btn--ghost">{{ icon("download") }}<span>Export</span></summary>
         <div class="menu__panel menu__panel--end">
-          {% set export_params = params.copy() %}{% set _ = export_params.pop("page") %}{% set _ = export_params.pop("size") %}
-          <a class="menu__item" href="{{ export_url }}?{{ dict(export_params, format='csv')|urlencode }}" download>CSV (spreadsheet safe)</a>
-          <a class="menu__item" href="{{ export_url }}?{{ dict(export_params, format='json')|urlencode }}" download>JSON</a>
+          {% set export_params = {} %}{% for k, v in params.items() if v not in (none, "") %}{% set _ = export_params.update({k: v}) %}{% endfor %}
+          {% set joiner = "&" if "?" in export_url else "?" %}
+          <a class="menu__item" href="{{ export_url }}{{ joiner }}{{ dict(export_params, format='csv')|urlencode }}" data-export download>CSV (spreadsheet safe)</a>
+          <a class="menu__item" href="{{ export_url }}{{ joiner }}{{ dict(export_params, format='json')|urlencode }}" data-export download>JSON</a>
         </div>
       </details>
       {% endif %}
     </div>
   </div>
+  {% if notice %}<p class="dt__notice" role="note">{{ icon("info") }}<span>{{ notice }}</span></p>{% endif %}
   <div class="dt__scroll" tabindex="0" role="region" aria-labelledby="{{ id }}-caption">
     <table class="dt__table">
-      <caption id="{{ id }}-caption" class="{% if caption and show_caption %}dt__caption{% else %}sr-only{% endif %}">{{ caption or "Table" }}<span class="sr-only">, {{ first_row }} to {{ last_row }} of {{ total }} rows{% if sort %}, sorted by {{ sort }} {{ "ascending" if dir == "asc" else "descending" }}{% endif %}</span></caption>
+      <caption id="{{ id }}-caption" class="{% if caption and show_caption %}dt__caption{% else %}sr-only{% endif %}">{{ caption or "Table" }}<span class="sr-only">, {{ first_row }} to {{ last_row }} of {{ total }} rows{% if sort %}, sorted by {{ sort }} {{ "ascending" if order == "asc" else "descending" }}{% endif %}</span></caption>
       <thead>
         <tr>
           {% for c in columns %}
           {%- set sorted_here = (sort == c.key) -%}
-          <th scope="col" data-col="{{ c.key }}" class="{% if c.num %}num{% endif %}"{% if c.hidden %} hidden{% endif %}{% if c.sortable is not defined or c.sortable %} aria-sort="{{ ('ascending' if dir == 'asc' else 'descending') if sorted_here else 'none' }}"{% endif %}>
+          <th scope="col" data-col="{{ c.key }}" class="{% if c.num %}num{% endif %}"{% if c.hidden %} hidden{% endif %}{% if c.sortable is not defined or c.sortable %} aria-sort="{{ ('ascending' if order == 'asc' else 'descending') if sorted_here else 'none' }}"{% endif %}>
             {%- if c.sortable is not defined or c.sortable -%}
-            <button type="button" class="th-sort" data-dt-sort="{{ c.key }}" data-dt-next-dir="{{ ('desc' if dir == 'asc' else 'asc') if sorted_here else ('asc' if not c.num else 'desc') }}">
-              <span>{{ c.label }}</span>{{ icon("chevron-up" if sorted_here and dir == "asc" else "chevron-down", cls="th-sort__icon" ~ (" is-active" if sorted_here else "")) }}
+            <button type="button" class="th-sort" data-dt-sort="{{ c.key }}" data-dt-next-order="{{ ('desc' if order == 'asc' else 'asc') if sorted_here else ('asc' if not c.num else 'desc') }}">
+              <span>{{ c.label }}</span>{{ icon("chevron-up" if sorted_here and order == "asc" else "chevron-down", cls="th-sort__icon" ~ (" is-active" if sorted_here else "")) }}
             </button>
             {%- else -%}<span class="th-label">{{ c.label }}</span>{%- endif -%}
             {%- if c.help %}{{ help_dot(c.label, c.help) }}{% endif -%}
@@ -116,7 +143,7 @@
       </thead>
       <tbody>
         {% for row in rows %}
-        <tr{% if row.drawer %} data-drawer-src="{{ row.drawer }}"{% endif %} data-row-id="{{ row.id or loop.index }}">
+        <tr{% if row.drawer %} data-drawer-src="{{ row.drawer }}"{% if row.title %} data-drawer-title="{{ row.title }}"{% endif %}{% endif %} data-row-id="{{ row.id or loop.index }}">
           {% for c in columns %}
           {%- set value = row.cells.get(c.key) -%}
           <td data-col="{{ c.key }}" data-label="{{ c.label }}" class="{% if c.num %}num{% endif %}"{% if c.key_col or loop.first %} data-key{% endif %}{% if c.hidden %} hidden{% endif %}>
@@ -142,7 +169,7 @@
     <label class="dt__size">
       <span>Rows</span>
       <select data-dt-size aria-label="Rows per page">
-        {% for s in sizes %}<option value="{{ s }}"{% if s == size %} selected{% endif %}>{{ s }}</option>{% endfor %}
+        {% for s in sizes %}<option value="{{ s }}"{% if s == page_size %} selected{% endif %}>{{ s }}</option>{% endfor %}
       </select>
     </label>
     <nav class="pager" aria-label="{{ caption or 'Table' }}: pages">

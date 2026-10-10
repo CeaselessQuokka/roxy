@@ -1,0 +1,43 @@
+{#-
+  Egress page, card `sessions` (`roxy/admin/pages/egress.py sessions_card`): rotator session health.
+
+  From `GET /admin/api/v1/egress/sessions`: whether the rotator can be used now (and why not), the session mode set
+  and in force (sticky modes need `rotator_session_username_template`), open sessions on this worker, the
+  fleet-wide park and failure streak (v1's rotate cooldown, parity row 31), and per exit (a short hash of a session,
+  never an address) the calls, Roblox 429s and failures. Session lifetimes are not recorded; the card says so.
+  Context: `frame`, `answer`, `health`, `parked_until`, `last_failure`, `mode_words`, `effective_words`,
+  `unavailable`, `exits` (or `deferred`).
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/format.html" import num %}
+{% from "admin/pages/upstream/_macros.html" import when %}
+{% call page_card(frame) %}
+<p>{% if answer.available %}{{ status_badge("ok", "Usable now") }}{% elif health.parked %}{{ status_badge("warn", "Parked") }} <span>{{ unavailable or "after a failure streak" }}</span>{% else %}{{ status_badge("neutral", "Not in use") }} <span>{{ unavailable or "off" }}</span>{% endif %}</p>
+<dl class="kv">
+  <dt>Mode set</dt><dd>{{ mode_words }}</dd>
+  <dt>Mode in force</dt><dd>{{ effective_words }}</dd>
+  <dt>Open sessions</dt><dd>{{ num(answer.open_sessions_this_worker) }} <span class="muted">on this worker (at most {{ answer.max_sessions }})</span></dd>
+  <dt>Failure streak</dt><dd>{{ num(health.failure_streak) }}{% if last_failure %} <span class="muted">(last {{ when(last_failure) }})</span>{% endif %}</dd>
+  <dt>Parked</dt><dd>{% if health.parked %}until {{ when(parked_until) }}{% else %}no{% endif %} <span class="muted">({{ num(health.times_parked) }} times so far)</span></dd>
+</dl>
+{% if answer.mode_note %}<p class="muted g3-note">{{ answer.mode_note }}</p>{% endif %}
+<h3 class="g3-subhead">Calls per exit <span class="muted">(in this range)</span></h3>
+{% if exits %}
+<div class="table-scroll g3-scroll" role="region" aria-labelledby="exits-caption" tabindex="0">
+  <table class="simple-table g3-table">
+    <caption id="exits-caption" class="sr-only">Calls, 429s and failures per rotator exit</caption>
+    <thead><tr><th scope="col">Exit</th><th scope="col" class="num">Calls</th><th scope="col" class="num">429s</th><th scope="col" class="num">429 rate</th><th scope="col" class="num">Failures</th><th scope="col">Last seen</th></tr></thead>
+    <tbody>
+      {% for e in exits %}<tr><td class="mono">{{ e.exit_id }}</td><td class="num">{{ num(e.calls) }}</td><td class="num">{{ num(e.roblox_429) }}</td><td class="num">{{ e.rate }}</td><td class="num">{{ num(e.failures) }}</td><td>{{ when(e.last) }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="muted g3-note">{{ answer.exits_note }}</p>
+{% else %}
+<p class="muted">No rotator calls in this range.</p>
+{% endif %}
+<p class="muted g3-note">How long each session lasted is not recorded yet; the counts above are per exit.</p>
+{% endcall %}
+{% endif %}

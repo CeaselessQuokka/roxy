@@ -1,0 +1,68 @@
+{#-
+  Help page, card `guide` (`roxy/admin/pages/help.py guide_card`): the admin guide, the documents, the runbooks.
+
+  While docs/ADMIN_GUIDE.md is not written, the card says so and lists the plan 16.3 chapters, each pointing to the
+  pages and documents that cover it today. The incident runbook index has one entry per runbook name of the link
+  index in docs/RUNBOOKS.md: alert emails link to `/admin/help#runbook-<name>`, and static/js/pages/help.js goes on
+  to the runbook itself (`data-runbook-href`); without scripts the entry and its link are shown. Every href here is
+  a constant of help.py or a slug of the link index (letters, digits and hyphens).
+  Context: `frame`, `guide` (a rendered document or None), `chapters`, `documents`, `missing`, `runbooks`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/icon.html" import icon %}
+{% call page_card(frame) %}
+<div class="help-guide stack">
+  {% if guide %}
+  <p>The admin guide explains how to run Roxy day to day, one chapter per dashboard page.</p>
+  <p><a class="btn btn--primary" href="/admin/help/guide">{{ icon("book") }}<span>Read the admin guide</span></a></p>
+  {% if guide.toc %}
+  <ol class="help-toc">
+    {% for entry in guide.toc if entry.level == 2 %}<li><a href="/admin/help/guide#{{ entry.anchor }}">{{ entry.title }}</a></li>{% endfor %}
+  </ol>
+  {% endif %}
+  {% else %}
+  {{ inline_alert("info", "The written admin guide is not part of this release yet", "Until docs/ADMIN_GUIDE.md is written, each chapter below points to the pages, cards and documents that already cover it.") }}
+  <ol class="help-chapters">
+    {% for chapter in chapters %}
+    <li class="help-chapter">
+      <h3 class="help-chapter__title">{{ chapter.title }}</h3>
+      <p class="help-chapter__text">{{ chapter.text }}</p>
+      <ul class="help-links" aria-label="Where to read about {{ chapter.title|lower }}">
+        {% for item in chapter.links %}<li><a href="{{ item.href }}">{{ item.label }}</a></li>{% endfor %}
+      </ul>
+    </li>
+    {% endfor %}
+  </ol>
+  {% endif %}
+
+  <section class="help-section" aria-labelledby="help-documents-title">
+    <h3 class="help-section__title" id="help-documents-title">Documents</h3>
+    <ul class="help-docs">
+      {% for spec in documents %}
+      <li><a href="/admin/help/{{ spec.slug }}">{{ spec.title }}</a><span class="help-docs__about">{{ spec.about }}</span></li>
+      {% endfor %}
+      <li><a href="/docs">User guide</a><span class="help-docs__about">The public guide for the developers who call Roxy from their games.</span></li>
+      <li><a href="/admin/settings">Settings</a><span class="help-docs__about">Every setting with what it does and what happens when you raise or lower it.</span></li>
+    </ul>
+    {% if missing %}<p class="muted">Not in this release: {% for spec in missing %}{{ spec.title }}{{ ", " if not loop.last }}{% endfor %}.</p>{% endif %}
+  </section>
+
+  <section class="help-section" id="runbook-index" aria-labelledby="runbook-index-title">
+    <h3 class="help-section__title" id="runbook-index-title">Incident runbooks</h3>
+    <p>Each alert email ends with a "What to do" link to one of these. A runbook says how to recognize the problem, how to confirm it, how to fix it and how to check the fix worked.</p>
+    {% if runbooks %}
+    <ul class="help-runbooks">
+      {% for item in runbooks %}
+      <li class="help-runbook" id="runbook-{{ item.name }}" data-runbook-href="{{ item.href }}">
+        <a href="{{ item.href }}">{{ item.title }}</a>
+        <span class="help-runbook__used">{{ item.used_by }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="muted">The runbooks (docs/RUNBOOKS.md) are not part of this release, so their index is empty.</p>
+    {% endif %}
+  </section>
+</div>
+{% endcall %}

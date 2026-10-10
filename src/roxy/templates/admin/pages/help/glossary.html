@@ -1,0 +1,29 @@
+{#-
+  Help page, card `glossary` (`roxy/admin/pages/help.py glossary_card`): every term of docs/glossary.yml.
+
+  Every dotted term on the dashboard (components/glossary.html) links to `/admin/help#term-<id>`, which is the id
+  of its entry here. The filter (static/js/pages/help.js) hides entries that do not contain the typed text and says
+  how many are left, politely and only after typing pauses; without scripts every term is listed.
+  Context: `frame`, `terms` (GlossaryEntry list, sorted by term).
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% call page_card(frame, subtitle=terms|length ~ " terms, from the same file as every tooltip") %}
+<div class="help-glossary stack">
+  <div class="help-glossary__filter">
+    <label class="field__label" for="glossary-filter">Filter the glossary</label>
+    <span class="input-icon">{{ icon("search") }}<input type="search" class="input" id="glossary-filter" data-glossary-filter
+      placeholder="For example cooldown or bucket" autocomplete="off" spellcheck="false" maxlength="100" aria-describedby="glossary-count"></span>
+    <p class="field__hint" id="glossary-count" data-glossary-count data-total="{{ terms|length }}" aria-live="polite">{{ terms|length }} terms</p>
+  </div>
+  <dl class="help-glossary__list">
+    {% for entry in terms %}
+    <div class="help-term" id="term-{{ entry.id }}" data-term>
+      <dt class="help-term__name">{{ entry.term }}</dt>
+      <dd class="help-term__definition">{{ entry.definition }}</dd>
+    </div>
+    {% endfor %}
+  </dl>
+  <p class="muted" data-glossary-empty hidden>No term matches that. Clear the filter to see every term.</p>
+</div>
+{% endcall %}

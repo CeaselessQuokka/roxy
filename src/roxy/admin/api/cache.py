@@ -33,6 +33,9 @@ How it works
     buckets, joins an in-flight fetch of the same key instead of calling twice, and is stored by the same rules as
     any other answer; its upstream call is recorded as Roxy's own (`admin_cache_refresh`), never as caller demand.
     Entries fetched with the credential are never refreshed from here (C1, P1: purge them instead).
+    Every read route delegates to a plain helper (`stats_answer`, `cache_series`, `endpoints_answer`,
+    `rules_answer`, `rule_view`, `ignored_params_answer`, `spread_answer`, `entries_answer`, `entry_answer`) that the
+    Cache dashboard page (`roxy/admin/pages/cache.py`) calls too, so the page and the API show the same numbers.
 
 What to read next
     `roxy/cache/service.py`, `roxy/cache/store.py`, `roxy/cache/read_browser.py`, `roxy/rules/service.py`.
@@ -82,7 +85,6 @@ from roxy.admin.api.common import (
     series_from_read_model,
     service_errors,
     table_answer,
-    table_from_read_model,
     table_params,
     unavailable,
     validation_error,
@@ -132,6 +134,8 @@ STATE_METRICS: Final[tuple[str, ...]] = (
     "cache_coalesced",
     "cache_miss",
 )
+RATIO_METRICS: Final[tuple[str, ...]] = ("hit_ratio", "avoided_pct")
+"""The series of `GET /cache/ratios`."""
 STATE_LABELS: Final[dict[str, str]] = {
     "cache_hit": "Hit (fresh copy)",
     "cache_revalidating": "Revalidating (copy served, refresh running)",
@@ -363,7 +367,11 @@ async def purge_audited(
 @router.get("/stats")
 async def cache_stats(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """Hit and avoided ratios with deltas, cache states, v1's short-window hit ratios, size, evictions, disk."""
-    ctx = get_ctx(request)
+    return await stats_answer(get_ctx(request), tr)
+
+
+async def stats_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """The `GET /cache/stats` answer (the Cache page's statistics card reads the same function, plan P6)."""
     window = tr.window
     other = tr.compare_window or queries.comparison_window(window, "previous")
     now = ctx.clock.now()
@@ -442,7 +450,8 @@ async def cache_stats(request: Request, _admin: AdminSession, tr: TimeRangeDep) 
     }
 
 
-async def _series(ctx: Any, tr: TimeRange, metrics: tuple[str, ...], labels: Mapping[str, str]) -> dict[str, Any]:
+async def cache_series(ctx: Any, tr: TimeRange, metrics: tuple[str, ...], labels: Mapping[str, str]) -> dict[str, Any]:
+    """A series answer for `metrics` (the `/cache/ratios` and `/cache/states` routes and the Cache page charts)."""
     db = ctx.dbs.metrics
     data = await queries.series(db, tr.window, metrics=list(metrics))
     series = [e for m in metrics for e in series_from_read_model(data, m, label=labels.get(m))]
@@ -468,13 +477,13 @@ async def _series(ctx: Any, tr: TimeRange, metrics: tuple[str, ...], labels: Map
 @router.get("/ratios")
 async def cache_ratios(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """Hit ratio and avoided upstream calls (percent) over time."""
-    return await _series(get_ctx(request), tr, ("hit_ratio", "avoided_pct"), {})
+    return await cache_series(get_ctx(request), tr, RATIO_METRICS, {})
 
 
 @router.get("/states")
 async def cache_states(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """Requests per `Roxy-Cache` state over time (hit, revalidating, stale, coalesced, miss)."""
-    return await _series(get_ctx(request), tr, STATE_METRICS, STATE_LABELS)
+    return await cache_series(get_ctx(request), tr, STATE_METRICS, STATE_LABELS)
 
 
 def _rule_columns(ctx: Any, rows: list[dict[str, Any]]) -> None:
@@ -498,46 +507,48 @@ async def cache_endpoints(
 ) -> Any:
     """Where the cache is working, one row per endpoint template (v1 "Where the cache is working")."""
     ctx = get_ctx(request)
-    db = ctx.dbs.metrics
-    window = tr.window
-    negative_filter = {"reason_code": "cache_negative"}
-
-    async def negatives(keys: list[str] | None) -> dict[str, int]:
-        if keys is not None and not keys:
-            return {}
-        filters: dict[str, Any] = dict(negative_filter)
-        if keys is not None:
-            filters["endpoint_template"] = keys
-
-        async def fetch(page: int, size: int) -> tuple[list[Any], int]:
-            page_spec = queries.Page(page=page, size=size, sort="requests")
-            data = await queries.top_n(db, window, "endpoint_template", page=page_spec, filters=filters)
-            return list(data["rows"]), int(data["total"])
-
-        rows, _total = await collect_pages(fetch)
-        return {str(row["key"]): int(row["requests"]) for row in rows}
-
     if fmt is not None:
 
         async def fetch_all(page: int, size: int) -> tuple[list[Any], int]:
             # One page at a time, joined with its negative counts and rule columns before the next is read
             # (finding mpjobs-5: a download holds one page of rows, never the whole table).
             page_spec = dataclasses.replace(tq.metrics_page(), page=page, size=size)
-            data = await queries.endpoint_table(db, window, page=page_spec)
-            rows = list(data["rows"])
-            counts = await negatives([str(row["key"]) for row in rows])
-            for row in rows:
-                row["negative_hits"] = counts.get(str(row["key"]), 0)
-            _rule_columns(ctx, rows)
-            return rows, int(data["total"])
+            return await _endpoint_rows(ctx, tr, page_spec)
 
         return await export_pages(request, admin, ENDPOINTS_SPEC, fetch_all, fmt, tq=tq, tr=tr)
-    data = await queries.endpoint_table(db, window, page=tq.metrics_page())
-    counts = await negatives([str(row["key"]) for row in data["rows"]])
-    for row in data["rows"]:
+    return await endpoints_answer(ctx, tr, tq)
+
+
+async def _endpoint_negatives(ctx: Any, tr: TimeRange, keys: list[str]) -> dict[str, int]:
+    """Stored refusals replayed (`cache_negative`) per endpoint template of `keys` in the range."""
+    if not keys:
+        return {}
+    filters: dict[str, Any] = {"reason_code": "cache_negative", "endpoint_template": keys}
+
+    async def fetch(page: int, size: int) -> tuple[list[Any], int]:
+        page_spec = queries.Page(page=page, size=size, sort="requests")
+        data = await queries.top_n(ctx.dbs.metrics, tr.window, "endpoint_template", page=page_spec, filters=filters)
+        return list(data["rows"]), int(data["total"])
+
+    rows, _total = await collect_pages(fetch)
+    return {str(row["key"]): int(row["requests"]) for row in rows}
+
+
+async def _endpoint_rows(ctx: Any, tr: TimeRange, page_spec: queries.Page) -> tuple[list[Any], int]:
+    """One page of endpoint rows with their negative hits, matching rule and TTL."""
+    data = await queries.endpoint_table(ctx.dbs.metrics, tr.window, page=page_spec)
+    rows = list(data["rows"])
+    counts = await _endpoint_negatives(ctx, tr, [str(row["key"]) for row in rows])
+    for row in rows:
         row["negative_hits"] = counts.get(str(row["key"]), 0)
-    _rule_columns(ctx, data["rows"])
-    return table_from_read_model(ENDPOINTS_SPEC, tq, data)
+    _rule_columns(ctx, rows)
+    return rows, int(data["total"])
+
+
+async def endpoints_answer(ctx: Any, tr: TimeRange, tq: TableQuery) -> dict[str, Any]:
+    """The `GET /cache/endpoints` table answer (the Cache page's per-endpoint card reads the same function)."""
+    rows, total = await _endpoint_rows(ctx, tr, tq.metrics_page())
+    return table_answer(ENDPOINTS_SPEC, tq, rows, total)
 
 
 # --------------------------------------------------------------------------------------------- rules
@@ -552,15 +563,30 @@ async def cache_rules(
 ) -> Any:
     """Every cache rule (at most `MAX_CACHE_RULES`, 500), searched, sorted and paged on the server."""
     ctx = get_ctx(request)
-    rows = [_row(CACHE_RULES, row) for row in await _service(ctx).list_rows(CACHE_RULES)]
-    keys = ("pattern", "note", "type", "origin")
     if fmt is not None:
-        ordered, total = page_rows(rows, dataclasses.replace(tq, page=1, page_size=max(1, len(rows))), search_keys=keys)
+        rows = [_row(CACHE_RULES, row) for row in await _service(ctx).list_rows(CACHE_RULES)]
+        everything = dataclasses.replace(tq, page=1, page_size=max(1, len(rows)))
+        ordered, total = page_rows(rows, everything, search_keys=RULE_SEARCH_KEYS)
         return await export_table(request, admin, RULES_SPEC, ordered, fmt, total=total, tq=tq)
-    items, total = page_rows(rows, tq, search_keys=keys)
+    return await rules_answer(ctx, tq)
+
+
+RULE_SEARCH_KEYS: Final[tuple[str, ...]] = ("pattern", "note", "type", "origin")
+
+
+async def rules_answer(ctx: Any, tq: TableQuery) -> dict[str, Any]:
+    """The `GET /cache/rules` table answer (the Cache page's rules card reads the same function)."""
+    rows = [_row(CACHE_RULES, row) for row in await _service(ctx).list_rows(CACHE_RULES)]
+    items, total = page_rows(rows, tq, search_keys=RULE_SEARCH_KEYS)
     answer = table_answer(RULES_SPEC, tq, items, total)
     answer["default_ttl_s"] = int(ctx.settings.int("cache_ttl_seconds"))
     return answer
+
+
+async def rule_view(ctx: Any, rule_id: int) -> dict[str, Any] | None:
+    """One cache rule in its typed form, or None (the inspector's rule and the page's rule drawer)."""
+    found = await _service(ctx).get_row(CACHE_RULES, int(rule_id))
+    return _row(CACHE_RULES, found) if found is not None else None
 
 
 def _rule_fields(body: ApiBody, *, exclude_unset: bool) -> dict[str, Any]:
@@ -683,7 +709,11 @@ def _spread_dict(group: Any) -> dict[str, Any]:
 @router.get("/ignored-params")
 async def cache_ignored_params(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Query parameters left out of cache keys, the v1 suggestions not yet ignored, and the key spread's suspects."""
-    ctx = get_ctx(request)
+    return await ignored_params_answer(get_ctx(request))
+
+
+async def ignored_params_answer(ctx: Any) -> dict[str, Any]:
+    """The `GET /cache/ignored-params` answer (the Cache page's ignored parameters card reads the same function)."""
     rows = [_row(IGNORED_PARAMS, row) for row in await _service(ctx).list_rows(IGNORED_PARAMS)]
     ignored = {str(row["name"]) for row in rows}
     suspects: list[dict[str, Any]] = []
@@ -765,7 +795,11 @@ async def cache_spread(
     request: Request, _admin: AdminSession, limit: Annotated[int, Query(ge=1, le=100)] = 25
 ) -> dict[str, Any]:
     """The key spread diagnostic (row 65): endpoints whose stored answers split on a changing parameter."""
-    ctx = get_ctx(request)
+    return await spread_answer(get_ctx(request), limit)
+
+
+async def spread_answer(ctx: Any, limit: int) -> dict[str, Any]:
+    """The `GET /cache/spread` answer (the Cache page's key spread card reads the same function)."""
     cache = _cache(ctx)
     with service_errors():
         groups = await cache.key_spread(limit=limit)
@@ -787,7 +821,11 @@ async def cache_entries(
     tq: Annotated[TableQuery, Depends(table_params(BROWSER_SPEC))],
 ) -> dict[str, Any]:
     """One page of stored answers (row 66): search by any part of the key, sort either way, no bodies."""
-    ctx = get_ctx(request)
+    return await entries_answer(get_ctx(request), tq)
+
+
+async def entries_answer(ctx: Any, tq: TableQuery) -> dict[str, Any]:
+    """The `GET /cache/entries` answer (the Cache page's browser card reads the same function)."""
     cache = _cache(ctx)
     await cache.flush()  # this worker's buffered hit counts first, so "Times reused" is current
     now = ctx.clock.now()
@@ -860,16 +898,18 @@ async def cache_entry(
     request: Request, _admin: AdminSession, entry_id: Annotated[str, Path(max_length=64)]
 ) -> dict[str, Any]:
     """Inspect one stored answer, body included (scrubbed, at most 256 KiB shown)."""
-    ctx = get_ctx(request)
+    return await entry_answer(get_ctx(request), entry_id)
+
+
+async def entry_answer(ctx: Any, entry_id: str) -> dict[str, Any]:
+    """The `GET /cache/entries/{id}` answer (the Cache page's inspector drawer reads the same function); 422 for a
+    malformed id, 404 for an entry that is gone."""
     cache = _cache(ctx)
     with service_errors():
         found = await cache.get_entry(_entry_id(entry_id))
     if found is None or read_browser.is_handoff_key(found.get("Key")):
         raise not_found(ENTRY_GONE)
-    rule = None
-    if found.get("Rule") is not None:
-        rule_row = await _service(ctx).get_row(CACHE_RULES, int(found["Rule"]))
-        rule = _row(CACHE_RULES, rule_row) if rule_row is not None else None
+    rule = await rule_view(ctx, int(found["Rule"])) if found.get("Rule") is not None else None
     return await asyncio.to_thread(_inspect, found, ctx.clock.now(), rule)
 
 
@@ -1069,4 +1109,22 @@ async def cache_purge(request: Request, admin: AdminSession, _csrf: CsrfChecked,
     return report
 
 
-__all__ = ["purge_audited", "router"]
+__all__ = [
+    "BROWSER_SPEC",
+    "ENDPOINTS_SPEC",
+    "RATIO_METRICS",
+    "RULES_SPEC",
+    "STATE_LABELS",
+    "STATE_METRICS",
+    "cache_series",
+    "endpoints_answer",
+    "entries_answer",
+    "entry_answer",
+    "ignored_params_answer",
+    "purge_audited",
+    "router",
+    "rule_view",
+    "rules_answer",
+    "spread_answer",
+    "stats_answer",
+]

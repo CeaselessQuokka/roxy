@@ -1,0 +1,21 @@
+{#-
+  The Endpoints page (`roxy/admin/pages/endpoints.py`; plan 14.1 Endpoints row, v1 "Top Endpoints").
+
+  The main table (search, host and method filters, sort and page kept in the address bar, so `?q=<template>` links
+  from other pages land on that endpoint), then the latest requests of one endpoint (lazy). A row opens its
+  drill-down in the drawer; the drill-down also has a page of its own (`/admin/endpoints/template`).
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/glossary.html" import term with context %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>An {{ term("endpoint-template") }} such as <code>games.roblox.com/v1/games/{universeId}/votes</code> stands for every path of that shape; the drill-down lists the concrete paths seen in the last 15 minutes. Templates and paths come from callers' requests, so they are shown exactly as text.</p>
+<p>Requests count every caller request; upstream calls are the calls Roxy made to Roblox for it; the hit ratio is the share of cache lookups answered from the cache ({{ term("hit") }}); Roblox 429s are the times Roblox asked Roxy to slow down for this endpoint. The trend compares the requests with the comparison chosen in the top bar, or the period just before.</p>
+<p>Last request, last status, last caller and last place describe the newest request in the range: exact while its live record is kept (15 minutes), else the start of its minute, hour or day.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["table"] }}
+{{ cards["recent"] }}
+{% endblock %}

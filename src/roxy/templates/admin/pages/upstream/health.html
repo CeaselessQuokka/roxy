@@ -1,0 +1,55 @@
+{#-
+  Upstream page, card `health` (`roxy/admin/pages/upstream.py health_card`): one card per egress path.
+
+  Each egress shows its state in words (working, off and why, cooling down, stopped by the leak guard), v1's method
+  health (calls, failed, timeouts, when it last worked and its last error; parity row 71), the 429 and 5xx rates,
+  latency percentiles, challenge answers, and its bucket's fill gauge. The last error's endpoint, path and error are
+  caller text (`format.html caller_text`).
+  Context: `frame`, `egresses` (see `_egress_card`), `range_label`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/format.html" import num, caller_text %}
+{% from "admin/pages/upstream/_macros.html" import gauge, when %}
+{% call page_card(frame, subtitle=range_label) %}
+<div class="g3-egresses">
+  {% for e in egresses %}
+  <article class="g3-egress g3-egress--{{ e.tone }}" aria-labelledby="egress-{{ e.name }}-title" data-egress="{{ e.name }}">
+    <header class="g3-egress__head">
+      <h3 class="g3-egress__title" id="egress-{{ e.name }}-title">{{ e.label }}</h3>
+      {{ status_badge(e.tone, e.words) }}
+    </header>
+    <p class="g3-egress__state">{{ e.state_detail }}</p>
+    <p class="g3-egress__about">{{ e.about }}</p>
+    <dl class="kv g3-egress__numbers">
+      <dt>Calls to Roblox</dt><dd>{{ num(e.item.calls) }} <span class="muted">({{ e.calls_per_min }} a minute; {{ num(e.item.internal_calls) }} by Roxy itself)</span></dd>
+      <dt>Roblox 429s</dt><dd>{{ num(e.item.roblox_429) }} <span class="muted">({{ e.rate_429 }} of calls)</span></dd>
+      <dt>Roblox 5xx</dt><dd>{{ num(e.item.roblox_5xx) }} <span class="muted">({{ e.rate_5xx }} of requests)</span></dd>
+      <dt>Failed requests</dt><dd>{{ num(e.item.failed) }} <span class="muted">({{ e.rate_failed }}; {{ num(e.item.timeouts) }} timeouts)</span></dd>
+      <dt>Latency p50 / p95 / p99</dt><dd>{{ e.latency }}</dd>
+      <dt>Queue wait p95</dt><dd>{{ e.queue_p95 }}</dd>
+      <dt>Challenge or HTML answers</dt><dd>{{ num(e.item.challenges) }} / {{ num(e.item.html_bodies) }}</dd>
+      <dt>Paused now</dt><dd>{{ num(e.item.cooldowns) }} cooldowns, {{ num(e.item.breakers_open) }} open breakers</dd>
+    </dl>
+    {{ gauge(e.gauge, "gauge-egress-" ~ e.name) }}
+    <dl class="kv g3-egress__when">
+      <dt>Last success</dt><dd>{{ when(e.last_success, e.last_success_precision) }}</dd>
+      <dt>Last error</dt><dd>{{ when(e.last_error_at, e.last_error_precision) }}</dd>
+    </dl>
+    {% if e.last_error %}
+    <details class="details-plain g3-egress__error">
+      <summary>The last recorded failure</summary>
+      <dl class="kv">
+        <dt>When</dt><dd>{{ when(e.last_error.when) }}</dd>
+        <dt>Why</dt><dd class="mono">{{ e.last_error.reason or "n/a" }}</dd>
+        {% if e.last_error.statuses %}<dt>Statuses</dt><dd>{{ e.last_error.statuses }}</dd>{% endif %}
+        <dt>Endpoint</dt><dd>{{ caller_text(e.last_error.template, 200) }}</dd>
+        <dt>Request</dt><dd><span class="mono">{{ e.last_error.method }}</span> {{ caller_text(e.last_error.path, 300) }}</dd>
+        <dt>Error</dt><dd>{{ caller_text(e.last_error.error, 300, block=True) }}</dd>
+      </dl>
+    </details>
+    {% endif %}
+  </article>
+  {% endfor %}
+</div>
+{% endcall %}

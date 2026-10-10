@@ -35,6 +35,9 @@ How it works
     `register_jobs(registry, ctx)` adds the per-worker job `admin_requests_watch`, which polls two `service_state`
     keys every second: `flush_requested_at` (flush this worker's metrics) and `memory_reset_at` (clear per-worker
     counters a data reset named, such as the tarpit statistics). The lifespan wires it (integrator).
+    Each read route delegates to a function the System page (`roxy/admin/pages/system.py`) calls too (`fleet`,
+    `workers_table`, `leader_state`, `jobs_view`, `pipeline_view`, `persistence_view`, `errors_answer`,
+    `error_detail_view`, `versions_view`, `environment_view`), so the page and the API show the same numbers.
 
 What to read next
     `roxy/scheduler/heartbeat.py`, `roxy/scheduler/jobs.py`, `roxy/metrics/recorder.py`, `roxy/admin/api/data.py`.
@@ -382,7 +385,13 @@ async def workers(
     rows = data["workers"]
     if fmt is not None:
         return await common.export_table(request, admin, WORKERS_TABLE, rows, fmt, total=len(rows), tq=tq)
-    items, total = common.page_rows(rows, tq, search_keys=("pid", "color", "worker_id", "version"))
+    return workers_table(data, tq)
+
+
+def workers_table(data: dict[str, Any], tq: TableQuery) -> dict[str, Any]:
+    """One page of the workers of a `fleet` answer as the `GET /system/workers` table (the System page reads the
+    fleet once and renders its header and this table from it)."""
+    items, total = common.page_rows(data["workers"], tq, search_keys=("pid", "color", "worker_id", "version"))
     return common.table_answer(WORKERS_TABLE, tq, items, total)
 
 
@@ -414,7 +423,11 @@ async def reset_counts(request: Request, body: ReasonBody, admin: AdminSession, 
 @router.get("/leader")
 async def leader(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Who leads the fleet (the hot.db lease), its epoch (fencing token), and this worker's view."""
-    ctx = get_ctx(request)
+    return await leader_state(get_ctx(request))
+
+
+async def leader_state(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /system/leader` (also the System page's leader card)."""
     lease = await run_mutation(ctx.dbs.hot.read(lambda conn: leases.holder_epoch(conn, LEADER_LEASE)))
     now_ms = ctx.clock.now_ms()
     elector = getattr(ctx, "leader", None)
@@ -460,7 +473,11 @@ async def _published_jobs(ctx: Any) -> dict[str, dict[str, Any]]:
 @router.get("/jobs")
 async def jobs(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Every scheduled job with its last run, and the WAL checkpoint durations (plan 6.5, 14.1)."""
-    ctx = get_ctx(request)
+    return await jobs_view(get_ctx(request))
+
+
+async def jobs_view(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /system/jobs` (also the System page's jobs card)."""
     runner = getattr(ctx, "jobs", None)
     elector = getattr(ctx, "leader", None)
     is_leader = bool(getattr(elector, "is_leader", False))
@@ -533,6 +550,12 @@ def _db_stats(db: Any) -> dict[str, Any]:
         "max_write_ms": round(stats.max_write_ms, 3),
         "last_write_ms": round(stats.last_write_ms, 3),
         "pending": db.pending(),
+        # LOAD-3: the write lock's wait and hold percentiles since start, and how many hot-path writes shared a
+        # transaction (group commit, storage/db.py).
+        **stats.timing(),
+        "groups": stats.groups,
+        "grouped_writes": stats.grouped_writes,
+        "largest_group": stats.largest_group,
     }
 
 
@@ -540,7 +563,11 @@ def _db_stats(db: Any) -> dict[str, Any]:
 async def metrics_pipeline(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """This worker's metrics queue, drops and flushes, and every database writer's statistics (per worker), plus
     the items every worker dropped in the last hour (`fleet_drops_last_hour`, SYS-METRICS-DROP's reading)."""
-    ctx = get_ctx(request)
+    return await pipeline_view(get_ctx(request))
+
+
+async def pipeline_view(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /system/metrics-pipeline` (also the System page's metrics pipeline card)."""
     recorder = getattr(ctx, "recorder", None)
     stats = recorder.stats() if recorder is not None else None
     now = int(ctx.clock.now())
@@ -577,7 +604,11 @@ async def persistence(request: Request, _admin: AdminSession) -> dict[str, Any]:
     growth history: Roxy's storage and the free disk sampled hourly by the leader over the last
     `GROWTH_DAYS` days (`metrics/read_producers.py disk_growth`, the line SYS-DISK projects) and the newest table
     sizes (sampled every 6 hours)."""
-    ctx = get_ctx(request)
+    return await persistence_view(get_ctx(request))
+
+
+async def persistence_view(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /system/persistence` (also the System page's persistence card)."""
     files = await asyncio.to_thread(read_sizes.file_sizes, [Path(db.path) for db in ctx.dbs.all()])
     out = []
     for db in ctx.dbs.all():
@@ -620,7 +651,19 @@ async def errors(
 ) -> Any:
     """Error signatures (plan 14.1 System > Errors; parity rows 16, 72): paged, searched, sorted on the server."""
     ctx = get_ctx(request)
+    if fmt is not None:
+        reader = _errors_reader(tq, source)
 
+        async def fetch(page: int, size: int) -> tuple[list[dict[str, Any]], int]:
+            rows, total = await ctx.dbs.metrics.read(reader(page, size))
+            return list(rows), int(total)
+
+        filters = {"source": source} if source else None
+        return await common.export_pages(request, admin, ERRORS_TABLE, fetch, fmt, tq=tq, filters=filters)
+    return await errors_answer(ctx, tq, source=source)
+
+
+def _errors_reader(tq: TableQuery, source: str | None) -> Any:
     def reader(page: int, size: int) -> Any:
         def run(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], int]:
             return read_errors.errors_page(
@@ -635,15 +678,13 @@ async def errors(
 
         return run
 
-    if fmt is not None:
+    return reader
 
-        async def fetch(page: int, size: int) -> tuple[list[dict[str, Any]], int]:
-            rows, total = await ctx.dbs.metrics.read(reader(page, size))
-            return list(rows), int(total)
 
-        filters = {"source": source} if source else None
-        return await common.export_pages(request, admin, ERRORS_TABLE, fetch, fmt, tq=tq, filters=filters)
-    rows, total = await run_mutation(ctx.dbs.metrics.read(reader(tq.page, tq.page_size)))
+async def errors_answer(ctx: Any, tq: TableQuery, *, source: str | None = None) -> dict[str, Any]:
+    """One page of error signatures as `GET /system/errors` answers it, with the `sources` of the source filter
+    (also the System page's error log card)."""
+    rows, total = await run_mutation(ctx.dbs.metrics.read(_errors_reader(tq, source)(tq.page, tq.page_size)))
     answer = common.table_answer(ERRORS_TABLE, tq, rows, total)
     answer["sources"] = await ctx.dbs.metrics.read(read_errors.error_sources)
     return answer
@@ -656,11 +697,18 @@ async def error_detail(
     signature: Annotated[str, Query(min_length=1, max_length=300)],
 ) -> dict[str, Any]:
     """One error signature with its redacted traceback and its hourly occurrences over the last day."""
-    ctx = get_ctx(request)
-    now = ctx.clock.now()
-    found = await run_mutation(ctx.dbs.metrics.read(lambda conn: read_errors.error_detail(conn, signature, now=now)))
+    found = await error_detail_view(get_ctx(request), signature)
     if found is None:
         raise common.not_found("No error has that signature.")
+    return found
+
+
+async def error_detail_view(ctx: Any, signature: str) -> dict[str, Any] | None:
+    """The answer of `GET /system/errors/detail` for `signature` (None when no error has it; the page's drawer)."""
+    now = ctx.clock.now()
+    found: dict[str, Any] | None = await run_mutation(
+        ctx.dbs.metrics.read(lambda conn: read_errors.error_detail(conn, signature, now=now))
+    )
     return found
 
 
@@ -692,7 +740,11 @@ def _deployed_sha() -> str | None:
 @router.get("/versions")
 async def versions(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """What runs: release, package, Python, SQLite, libraries, catalog, schema and template versions, fleet mix."""
-    ctx = get_ctx(request)
+    return await versions_view(get_ctx(request))
+
+
+async def versions_view(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /system/versions` (also the System page's versions card)."""
     schema: dict[str, int] = {}
     for db in ctx.dbs.all():
         try:
@@ -739,7 +791,11 @@ def _credentials_present(directory: Path | None) -> dict[str, bool]:
 @router.get("/environment")
 async def environment(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """The non-secret environment summary: `ROXY_*` deployment facts, and which credentials exist (names only)."""
-    ctx = get_ctx(request)
+    return await environment_view(get_ctx(request))
+
+
+async def environment_view(ctx: Any) -> dict[str, Any]:
+    """The answer of `GET /system/environment` (also the System page's environment and alerts cards)."""
     env = ctx.env
     present = await asyncio.to_thread(_credentials_present, env.credentials_dir)
     manager = getattr(getattr(ctx, "egress", None), "credential", None)
@@ -827,10 +883,19 @@ __all__ = [
     "WATCH_JOB",
     "WORKERS_TABLE",
     "RequestsWatcher",
+    "environment_view",
+    "error_detail_view",
+    "errors_answer",
     "fleet",
+    "jobs_view",
+    "leader_state",
+    "persistence_view",
+    "pipeline_view",
     "register_jobs",
     "request_memory_reset",
     "reset_local_memory",
     "router",
+    "versions_view",
+    "workers_table",
     "write_state",
 ]

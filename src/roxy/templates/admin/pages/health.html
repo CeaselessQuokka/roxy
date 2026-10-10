@@ -1,0 +1,23 @@
+{#-
+  The Health page (`roxy/admin/pages/health.py`): Check Proxy Health (plan 14.1, 13.1 to 13.3).
+
+  Layout: the Run card first (the button and the newest run, or the one named in the address, filling in live), then
+  the run history (the page's main table), the schedule, and the catalog of checks. On a phone everything is one
+  column and the Run button is full width (plan 14.8: run a health check from a phone).
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/glossary.html" import term with context %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>Each check passes, warns, fails, or is n/a (it does not apply here, for example the nginx checks on a development machine, or the credential check when you leave it out). A failing check names the page or runbook that fixes it, and when a recommendation would fix it, <strong>Apply fix</strong> opens that recommendation with its preview. <strong>Copy for LLM</strong> copies the run (or one check) with the instructions an assistant needs; text that came from outside Roxy is marked as untrusted in it.</p>
+<p>The credential check spends one call on the Roblox account (plan 13.3), so it asks for your second factor if you have not entered it recently; leave it out to run every other check at once. Only one run can go at a time in the whole fleet: starting a second one opens the run already going. The time range in the top bar filters the run history by when each run started.</p>
+<p>A run in progress fills in as each check finishes, through the live {{ term("sse", "event stream") }}; if the stream is not connected, the page asks again every few seconds.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["run"] }}
+{{ cards["history"] }}
+{{ cards["schedule"] }}
+{{ cards["checks"] }}
+{% endblock %}

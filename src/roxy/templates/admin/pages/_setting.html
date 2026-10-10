@@ -1,0 +1,7 @@
+{#-
+  One inline setting control as a fragment (`GET /admin/ui/setting/{key}`, roxy/admin/pages/core.py): what
+  static/js/settings_api.js swaps in after a save (`saved`) or when the event stream reports `settings_changed`.
+  Context: `entry` (roxy.admin.pages.inline.setting_entry), `saved`.
+-#}
+{% from "components/page_card.html" import inline_setting %}
+{{ inline_setting(entry, saved=saved) }}

@@ -7,7 +7,7 @@ What this is
       was sound (gunicorn stopped cleanly, no transport errors, enough upstream calls, no credential on caller
       traffic, a Retry-After on every 429 or 503 Roxy sent).
     - `test_replay_keeps_roblox_429s_below_a_tenth_of_a_percent`: Roblox answered 429 to fewer than 0.1 percent
-      of upstream calls. It is marked xfail for finding LOAD-1 (below).
+      of upstream calls (finding LOAD-1, below, is fixed).
     Marked `load` (`pytest -m load tests/load`) so CI can select it; the run takes about 4 minutes (the plan's
     budget is 5), the only gunicorn start in the normal suite's tests/load.
 
@@ -18,19 +18,19 @@ Why it exists
     must keep a Roblox that limits each endpoint from having to say "too many requests", while answering most
     callers without asking Roblox at all.
 
-    Finding LOAD-1 (load lane, 2026-10-09): at the plan's defaults v2 does not meet the 0.1 percent bar on this
-    profile. The busiest endpoint, avatar outfits (16 percent of requests, a long tail of 20,000 user ids, so a
-    low hit ratio, and a Roblox threshold of 60 calls a minute), starts at the default endpoint rate of 120 a
-    minute. Only its share of the direct egress bucket (300 a minute) holds it near 60, and it reaches 61 calls in
-    a minute twice: Roblox answers 429, the adaptive controller cuts the rate to 84 (still above 60, still not
-    binding), the share drifts back to 61 about 100 s later, a second 429 cuts it to 58.8. Two 429s in about 1,020
-    upstream calls is 0.196 percent, in every run, quiet or busy. These are the cost of learning the limits after a
-    cold start: longer runs pay eight or nine 429s in their first 17 minutes (presence, at 30 a minute, earns five)
-    and none after, which is 0.14 to 0.16 percent over 20 minutes and 0.095 percent over 30. The earlier version
-    of this test passed most runs only because its client and mock ran on CLOCK_MONOTONIC, which runs 9.5 percent
-    fast on WSL 2 (see tests/load/clock.py): the mock's minute was 55 real seconds while Roxy's buckets counted
-    real seconds. The lead's failing gate run was a run in which the busiest minute still reached 61. Details and
-    the numbers of every run: docs/PERFORMANCE.md.
+    Finding LOAD-1 (load lane, 2026-10-09; fixed by the pacing lane the same day): at the plan's defaults v2 used
+    to get 2 Roblox 429s in about 1,020 upstream calls (0.196 percent) on this profile, in every run. The busiest
+    endpoint, avatar outfits (16 percent of requests, a long tail of 20,000 user ids, so a low hit ratio, and a
+    Roblox threshold of 60 calls a minute), starts at the default endpoint rate of 120 a minute; only its share of
+    the direct egress bucket (300 a minute) held it near 60, and it reached 61 calls in a minute twice, because the
+    adaptive controller cut the CONFIGURED rate (120 to 84, still not binding) and never the burst. Now the host
+    and endpoint buckets never let a rolling minute hold more than their limit (rate plus burst inside one window),
+    and a Roblox 429 cuts rate and burst from the calls the endpoint actually made in that minute (61 to about 43,
+    burst 10 to 3), so the one 429 that discovers the endpoint's limit after a cold start is the only one: about 1
+    in 1,020 calls, under the bar (src/roxy/upstream/buckets.py and adaptive.py). The earlier version of this test
+    passed most runs only because its client and mock ran on CLOCK_MONOTONIC, which runs 9.5 percent fast on WSL 2
+    (see tests/load/clock.py): the mock's minute was 55 real seconds while Roxy's buckets counted real seconds.
+    Details and the numbers of the runs: docs/PERFORMANCE.md and .remake/p11_reports/pacing.md.
 
 How it works
     - Production settings (built-in defaults; only the scheduled health run and the rotator are off, see
@@ -49,7 +49,8 @@ How it works
 
 What to read next
     tests/load/scenarios.py (`replay`, `replay_numbers`), tests/load/traffic.py (the profile and thresholds),
-    docs/PERFORMANCE.md (every run's numbers and what would fix LOAD-1).
+    docs/PERFORMANCE.md (the load lane's runs before LOAD-1 was fixed), src/roxy/upstream/buckets.py (window
+    buckets and their meters) and src/roxy/upstream/adaptive.py (the cut from the calls Roblox refused).
 """
 
 from __future__ import annotations
@@ -69,14 +70,6 @@ PYTHON = REPO / ".venv" / "bin" / "python"
 EXIT_NO_NAMESPACE = 3  # harness.EXIT_NO_NAMESPACE
 RUN_TIMEOUT_S = 285.0
 """The harness run (about 230 s on a quiet machine) must end inside the tests' 300 s budget (plan: under 5 min)."""
-
-LOAD1 = (
-    "LOAD-1: at the plan's defaults (endpoint bucket 120/min, adaptive cut 30 %) the busiest endpoint reaches its "
-    "60/min Roblox threshold twice before the adaptive rate drops below it: 2 Roblox 429s in about 1,020 upstream "
-    "calls (0.196 %) in 10 of 10 runs on a shared clock, quiet or busy; 0.095 % only over 30 minutes "
-    "(docs/PERFORMANCE.md). Not strict: the busiest minute is 61 calls against 60, and a change that moves it by "
-    "one call passes; remove this marker when LOAD-1 is decided."
-)
 
 pytestmark = [
     pytest.mark.load,
@@ -156,7 +149,6 @@ def test_replay_avoids_calls_and_runs_clean(replay: dict[str, Any]) -> None:
 
 
 @pytest.mark.timeout(300)
-@pytest.mark.xfail(reason=LOAD1, strict=False)
 def test_replay_keeps_roblox_429s_below_a_tenth_of_a_percent(replay: dict[str, Any]) -> None:
     data = replay
     assert data["ok"], data["table"]

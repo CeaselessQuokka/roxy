@@ -1,0 +1,46 @@
+{#-
+  Page-local macros of the Upstream, Egress and Credential pages (the g3 page group).
+
+  What
+    `gauge(g, id)`: a fill gauge, a native <meter> (role meter, value 0 to 100, low 70, high 95) with its label, the
+    percent and words ("room to spare", "busy", "full: the next call waits") beside it, so color is never the only
+    signal (plan 14.9). `g` comes from `roxy.admin.pages._upstream_common.gauge`.
+    `when(cell, extra)`: a time from `fmt.time_cell` as <time> plus "12 minutes ago" (and an optional precision).
+    `countdown(c)`: "42 s left" that static/js/pages/upstream.js (or egress.js, credential.js) ticks down from
+    `data-ends-at-ms` and `data-now-ms` (the server's clock, so a skewed browser clock does not matter).
+    `stat(label, value, sub, tone)`: one number with its label in a small tile (a definition list item).
+  Why
+    The three pages show bucket fills, countdowns and times in the same way; the shared component library has no
+    gauge yet (a request to the integrator), so it lives here, next to the pages that use it.
+  How
+    Text only: every value is escaped by autoescaping; nothing here is caller text (callers' text goes through
+    components/format.html `caller_text` in the card templates).
+-#}
+
+{% macro gauge(g, id) -%}
+<div class="g3-gauge g3-gauge--{{ g.tone }}"{% if g.key %} data-gauge="{{ g.key }}"{% endif %}>
+  <div class="g3-gauge__head">
+    <span class="g3-gauge__label" id="{{ id }}-label">{{ g.label }}</span>
+    <span class="g3-gauge__value"><strong>{{ g.pct_text }}</strong> <span class="g3-gauge__words">{{ g.words }}</span></span>
+  </div>
+  <meter class="g3-gauge__meter" id="{{ id }}" min="0" max="100" low="70" high="95" optimum="0" value="{{ g.value }}" aria-labelledby="{{ id }}-label" aria-describedby="{{ id }}-detail">{{ g.pct_text }}</meter>
+  <p class="g3-gauge__detail" id="{{ id }}-detail">{{ g.detail or g.words }}</p>
+</div>
+{%- endmacro %}
+
+{% macro when(cell, extra="") -%}
+{%- if cell -%}<time datetime="{{ cell.datetime }}">{{ cell.text }}</time> <span class="muted">({{ cell.sub }}{% if extra %}, {{ extra }}{% endif %})</span>
+{%- else -%}<span class="muted">n/a</span>{%- endif -%}
+{%- endmacro %}
+
+{% macro countdown(c) -%}
+{%- if c -%}<span class="g3-countdown" data-countdown data-ends-at-ms="{{ c.ends_at_ms }}" data-now-ms="{{ c.now_ms }}">{{ c.remaining_s|round(0)|int }} s left</span>
+{%- else -%}<span class="muted">n/a</span>{%- endif -%}
+{%- endmacro %}
+
+{% macro stat(label, value, sub="", tone="") -%}
+<div class="g3-stat{% if tone %} g3-stat--{{ tone }}{% endif %}">
+  <dt class="g3-stat__label">{{ label }}</dt>
+  <dd class="g3-stat__value">{{ value }}{% if sub %}<span class="g3-stat__sub">{{ sub }}</span>{% endif %}</dd>
+</div>
+{%- endmacro %}

@@ -1,0 +1,313 @@
+/*
+ * The Data page (templates/admin/pages/data*): storage, limits, the reset form, backups, VACUUM and exports.
+ *
+ * What this is
+ *   Layout for the parts of the page the shared components do not cover: the storage summary, the tables of
+ *   tables (which become card rows on a phone), the reset form with its nested families and its preview, the
+ *   dataset list and the LLM export controls.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract); only tokens
+ *   from tokens.css are used, so both themes follow.
+ * How it works
+ *   Mobile first where it matters (plan 14.8): below 640 px every `.data-table` shows each row as a card with its
+ *   labels (`data-label`), the two column field rows stack, and touch targets keep 44 px on a coarse pointer.
+ * What to read next
+ *   static/css/components.css (.simple-table, .kv, .field, .kpi-grid), static/js/pages/data.js.
+ */
+
+.data-intro,
+.data-note {
+  margin: 0;
+  color: var(--text-muted);
+  max-width: 90ch;
+}
+
+.card__body--flush > .data-intro,
+.card__body--flush > .data-storage__summary {
+  padding: var(--sp-3) var(--sp-4) 0;
+}
+
+.card__body--flush > .data-op-result:not(:empty) {
+  padding: var(--sp-3) var(--sp-4) 0;
+}
+
+.data-storage__summary {
+  padding-bottom: var(--sp-3);
+}
+
+.data-table td {
+  vertical-align: top;
+}
+
+.data-table__label {
+  display: block;
+  white-space: normal;
+}
+
+.data-table td:first-child {
+  white-space: normal;
+}
+
+.data-table__actions {
+  text-align: right;
+}
+
+.data-limits {
+  margin-top: var(--sp-3);
+}
+
+.data-setting-ref {
+  margin-left: var(--sp-1);
+  font-size: var(--fs-1);
+}
+
+.data-files .table-scroll {
+  margin-top: var(--sp-2);
+}
+
+/* ---------------------------------------------------------------------------------- the storage drawer */
+.data-detail__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.data-detail__section {
+  display: grid;
+  gap: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.data-detail__heading {
+  font-size: var(--fs-3);
+}
+
+.data-detail__spark .spark {
+  width: 100%;
+  height: 48px;
+}
+
+/* ---------------------------------------------------------------------------------- resets */
+.data-fieldset {
+  display: grid;
+  gap: var(--sp-3);
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.data-fieldset__legend {
+  padding: 0 var(--sp-1);
+  font-weight: var(--fw-semibold);
+}
+
+.data-reset-scope {
+  max-width: 36rem;
+}
+
+.data-families {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+  gap: var(--sp-3) var(--sp-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.data-families--narrow {
+  grid-template-columns: minmax(0, 1fr);
+  margin-top: var(--sp-2);
+  padding-left: var(--sp-5);
+  border-left: 2px solid var(--border);
+}
+
+.data-family__check {
+  font-weight: var(--fw-medium);
+}
+
+.data-family__note {
+  margin: 2px 0 0 calc(var(--sp-2) + 16px);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.data-check {
+  align-self: end;
+}
+
+.data-reset-preview {
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.data-reset-preview__title {
+  font-size: var(--fs-3);
+}
+
+.data-reset-preview__summary {
+  margin: 0;
+  font-weight: var(--fw-medium);
+}
+
+.data-reset-preview__list {
+  margin: 0;
+  padding-left: var(--sp-5);
+}
+
+.data-reset-result:empty,
+.data-op-result:empty {
+  display: none;
+}
+
+.data-recent__list {
+  display: grid;
+  gap: var(--sp-1);
+  margin: var(--sp-2) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* ---------------------------------------------------------------------------------- backups */
+.data-backups__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: baseline;
+}
+
+.data-snapshots {
+  margin-top: var(--sp-4);
+}
+
+.data-snapshots__title {
+  font-size: var(--fs-3);
+}
+
+/* ---------------------------------------------------------------------------------- exports */
+.data-exports__privacy {
+  margin: 0 0 var(--sp-3);
+}
+
+.data-datasets {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
+  gap: var(--sp-2) var(--sp-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.data-dataset {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.data-dataset__text {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+.data-dataset__name {
+  margin: 0;
+  font-weight: var(--fw-medium);
+}
+
+.data-dataset__desc {
+  margin: 2px 0 0;
+  font-size: var(--fs-1);
+}
+
+.data-llm {
+  margin-top: var(--sp-5);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border);
+}
+
+.data-llm__title {
+  font-size: var(--fs-3);
+}
+
+.data-llm .field-row {
+  max-width: 40rem;
+}
+
+/* ---------------------------------------------------------------------------------- phones (plan 14.8) */
+@media (max-width: 640px) {
+  .data-table,
+  .data-table tbody,
+  .data-table tr,
+  .data-table td {
+    display: block;
+  }
+
+  .data-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .data-table tr {
+    padding: var(--sp-2) var(--sp-3);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .data-table td,
+  .data-table td:first-child {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: var(--sp-2);
+    padding: 2px 0;
+    border: 0;
+    text-align: right;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .data-table td::before {
+    content: attr(data-label);
+    color: var(--text-muted);
+    font-weight: var(--fw-semibold);
+    text-align: left;
+  }
+
+  .data-table td.data-table__actions::before {
+    content: none;
+  }
+
+  .data-table td .dt__sub {
+    flex-basis: 100%;
+  }
+
+  .data-detail__facts,
+  .data-backups__facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .field-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .data-families {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .data-fieldset {
+    padding: var(--sp-3);
+  }
+}
+
+@media (pointer: coarse) {
+  .data-dataset .btn,
+  .data-table .btn,
+  .data-family__check {
+    min-height: 44px;
+  }
+}

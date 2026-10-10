@@ -1,18 +1,23 @@
 {#-
-  Command palette (plan 14.6): Ctrl+K or / opens it; type to jump to any page, setting, endpoint, client or
+  Command palette (plan 14.6): Ctrl+K or / opens it; type to jump to any page, setting, endpoint or
   recommendation, or to run an action.
 
-  The static items (every page from admin/_layout/nav.html and the global actions) are rendered here, so the
-  palette works the moment the page loads; static/js/palette.js filters them as you type and, when `urls.palette`
-  is set, also asks the server for matching settings, endpoints, clients and recommendations (JSON, at most 20).
+  The static items (every page from the registry through admin/_layout/nav.html, and the global actions) are
+  rendered here, so the palette works the moment the page loads; static/js/palette.js filters them as you type and,
+  when `urls.palette` is set, also asks the server for matching settings, endpoints and recommendations (JSON, at
+  most 20, `GET /admin/ui/palette`).
   It is an ARIA combobox: the input owns a listbox, arrow keys move the active option (aria-activedescendant),
-  Enter follows it, Escape closes. Actions either link somewhere (`data-href`), open a dialog (`data-open`), or
-  post with htmx (`data-post`, which adds the CSRF header).
-  Context: `urls` {palette, health_run, llm_export}.
+  Enter follows it, Escape closes. Actions either link somewhere (`data-href`), open a dialog (`data-open`), send
+  JSON to the admin API (`data-post-json`, with the CSRF header; Run health check), or run a built-in action
+  (`data-action`: `theme`, `llm-copy` and `llm-download`, plan 12.2: "Copy for LLM" copies `GET
+  /admin/api/v1/export/llm?format=text`, "Download JSON" downloads `?download=true`; "Open schema" opens the
+  committed JSON Schema). The full detail export needs a fresh second factor, so the palette uses the summary.
+  Context: `urls` {palette, health_run, health_page, llm_export: {copy, download, schema}}.
 -#}
 {% from "components/icon.html" import icon %}
 {% from "admin/_layout/nav.html" import PAGES, page_href %}
 {% set u = urls if urls is defined and urls else {} %}
+{% set llm = u.llm_export if u.llm_export is mapping else {} %}
 <dialog class="palette" id="palette" aria-label="Command palette"{% if u.palette %} data-search-url="{{ u.palette }}"{% endif %}>
   <div class="palette__search">
     {{ icon("search") }}
@@ -29,8 +34,8 @@
     </li>
     {% endfor %}
     <li class="palette__item" role="option" id="pal-act-health" aria-selected="false" data-group="Actions"
-        {% if u.health_run %}data-post="{{ u.health_run }}"{% else %}data-href="{{ page_href('health') }}?run=1"{% endif %} data-search="run health check test probe">
-      {{ icon("heart") }}<span class="palette__label">Run health check</span><span class="palette__hint">Checks every part of Roxy in about a minute</span>
+        {% if u.health_run %}data-post-json="{{ u.health_run }}" data-json-body='{"include_credential": false}' data-then="{{ u.health_page or page_href('health') }}"{% else %}data-href="{{ page_href('health') }}?run=1"{% endif %} data-search="run health check test probe">
+      {{ icon("heart") }}<span class="palette__label">Run health check</span><span class="palette__hint">Checks every part of Roxy in about a minute (without the credential check)</span>
     </li>
     <li class="palette__item" role="option" id="pal-act-pause" aria-selected="false" data-group="Actions" data-open="dlg-pause" data-search="pause resume proxy stop maintenance">
       {{ icon("pause") }}<span class="palette__label">Pause or resume the proxy</span><span class="palette__hint">Asks for confirmation first</span>
@@ -41,9 +46,21 @@
     <li class="palette__item" role="option" id="pal-act-purge" aria-selected="false" data-group="Actions" data-href="{{ page_href('cache') }}#purge" data-search="purge cache host clear">
       {{ icon("database") }}<span class="palette__label">Purge cache for a host</span><span class="palette__hint">Opens the cache purge card</span>
     </li>
-    <li class="palette__item" role="option" id="pal-act-llm" aria-selected="false" data-group="Actions" data-href="{{ u.llm_export or (page_href('data') ~ '#exports') }}" data-search="export llm json diagnostics">
+    {% if llm["copy"] %}
+    <li class="palette__item" role="option" id="pal-act-llm-copy" aria-selected="false" data-group="Actions" data-action="llm-copy" data-url="{{ llm["copy"] }}" data-search="copy for llm export assistant diagnostics text">
+      {{ icon("copy") }}<span class="palette__label">Copy for LLM</span><span class="palette__hint">A redacted summary of the last 24 hours, as text to paste into an assistant</span>
+    </li>
+    <li class="palette__item" role="option" id="pal-act-llm-json" aria-selected="false" data-group="Actions" data-action="llm-download" data-url="{{ llm["download"] }}" data-search="export llm json download diagnostics">
+      {{ icon("download") }}<span class="palette__label">Download LLM export (JSON)</span><span class="palette__hint">The same summary as a JSON file</span>
+    </li>
+    <li class="palette__item" role="option" id="pal-act-llm-schema" aria-selected="false" data-group="Actions" data-href="{{ llm["schema"] }}" data-search="llm export schema json">
+      {{ icon("book") }}<span class="palette__label">Open the LLM export schema</span><span class="palette__hint">The JSON Schema every export follows</span>
+    </li>
+    {% else %}
+    <li class="palette__item" role="option" id="pal-act-llm" aria-selected="false" data-group="Actions" data-href="{{ page_href('data') }}#exports" data-search="export llm json diagnostics">
       {{ icon("download") }}<span class="palette__label">Export LLM JSON</span><span class="palette__hint">A redacted snapshot to paste into an assistant</span>
     </li>
+    {% endif %}
     <li class="palette__item" role="option" id="pal-act-theme" aria-selected="false" data-group="Actions" data-action="theme" data-search="theme dark light toggle colors">
       {{ icon("moon") }}<span class="palette__label">Switch theme</span><span class="palette__hint">Dark, light or follow the system</span>
     </li>

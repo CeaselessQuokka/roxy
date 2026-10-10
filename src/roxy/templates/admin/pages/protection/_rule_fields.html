@@ -1,0 +1,98 @@
+{#-
+  Form fields of the Protection page's rules (User-Agent rules, request filters, endpoint blocks and endpoint
+  rules), shared by the "Add" dialogs and the edit forms in each rule's drawer.
+
+  What: `ua_fields(prefix, rule)`, `header_fields(prefix, rule)`, `block_fields(prefix, rule)`,
+  `limit_fields(prefix, rule)`: labeled inputs named as the admin API's bodies (`POST /protection/ua-rules`, ...),
+  prefilled from `rule` when editing. Text a caller or an admin typed is only ever an input's value (autoescaped),
+  never markup. `message` and `note` are sent even when empty (`data-json="string"`), so an edit can clear them.
+  How: the `[data-kind-fields]` groups of a User-Agent rule show the fields of the chosen kind (burst or cooldown);
+  static/js/pages/protection.js switches them.
+-#}
+{% from "admin/pages/protection/_macros.html" import field_error %}
+
+{% macro _select(prefix, name, label, options, current) -%}
+<div class="field">
+  <label class="field__label" for="{{ prefix }}-{{ name }}">{{ label }}</label>
+  <select class="input" id="{{ prefix }}-{{ name }}" name="{{ name }}" aria-describedby="{{ prefix }}-{{ name }}-error">
+    {% for value, text in options %}<option value="{{ value }}"{% if value == current %} selected{% endif %}>{{ text }}</option>{% endfor %}
+  </select>
+  {{ field_error(name, prefix ~ "-" ~ name ~ "-error") }}
+</div>
+{%- endmacro %}
+
+{% macro _text(prefix, name, label, value="", hint="", required=False, mono=False, maxlength=400, placeholder="", json="string") -%}
+<div class="field">
+  <label class="field__label" for="{{ prefix }}-{{ name }}">{{ label }}</label>
+  <input class="input{% if mono %} mono{% endif %}" id="{{ prefix }}-{{ name }}" name="{{ name }}" value="{{ value if value is not none else '' }}" maxlength="{{ maxlength }}"
+         autocomplete="off" spellcheck="false"{% if required %} required aria-required="true"{% endif %}{% if placeholder %} placeholder="{{ placeholder }}"{% endif %} data-json="{{ json }}"
+         aria-describedby="{% if hint %}{{ prefix }}-{{ name }}-hint {% endif %}{{ prefix }}-{{ name }}-error">
+  {% if hint %}<p class="field__hint" id="{{ prefix }}-{{ name }}-hint">{{ hint }}</p>{% endif %}
+  {{ field_error(name, prefix ~ "-" ~ name ~ "-error") }}
+</div>
+{%- endmacro %}
+
+{% macro _number(prefix, name, label, value, json="int", hint="") -%}
+<div class="field">
+  <label class="field__label" for="{{ prefix }}-{{ name }}">{{ label }}</label>
+  <input class="input input--num" id="{{ prefix }}-{{ name }}" name="{{ name }}" value="{{ value if value is not none else '' }}" inputmode="{{ 'decimal' if json == 'float' else 'numeric' }}" data-json="{{ json }}"
+         aria-describedby="{% if hint %}{{ prefix }}-{{ name }}-hint {% endif %}{{ prefix }}-{{ name }}-error">
+  {% if hint %}<p class="field__hint" id="{{ prefix }}-{{ name }}-hint">{{ hint }}</p>{% endif %}
+  {{ field_error(name, prefix ~ "-" ~ name ~ "-error") }}
+</div>
+{%- endmacro %}
+
+
+{% macro ua_fields(prefix, rule=None) -%}
+{{ _text(prefix, "needle", "User-Agent text to match", rule.needle if rule else "", hint="With Contains a distinctive fragment is enough: python-requests catches python-requests/2.31.0.", required=True, mono=True, placeholder="python-requests", json="skip-empty") }}
+<div class="field-row">
+  {{ _select(prefix, "mode", "Match", [("contains", "Contains"), ("exact", "Exact"), ("regex", "Regex")], rule.mode if rule else "contains") }}
+  {{ _select(prefix, "kind", "Limit type", [("burst", "Burst allowance"), ("cooldown", "Cooldown between requests")], rule.kind if rule else "burst") }}
+</div>
+{{ _select(prefix, "scope", "Scope", [("ip", "Per IP: each address gets its own allowance"), ("global", "Shared: every address using this User-Agent draws on one allowance")], rule.scope if rule else "ip") }}
+<div class="field-row" data-kind-fields="burst"{% if rule and rule.kind == "cooldown" %} hidden{% endif %}>
+  {{ _number(prefix, "limit", "Requests allowed", rule.limit if rule else 10) }}
+  {{ _number(prefix, "period", "Per (seconds)", rule.period if rule else 60) }}
+</div>
+<div data-kind-fields="cooldown"{% if not rule or rule.kind != "cooldown" %} hidden{% endif %}>
+  {{ _number(prefix, "cooldown", "Seconds between requests", rule.cooldown if rule else 2, json="float") }}
+</div>
+{{ _text(prefix, "message", "Message for this client", rule.message if rule else "", hint="What the client is told when it goes too fast. Saying so is the point: a cooperative bot can only respect a limit it has been told about. Empty: an automatic description of the limit.") }}
+{{ _text(prefix, "note", "Note (private)", rule.note if rule else "") }}
+{%- endmacro %}
+
+{% macro header_fields(prefix, rule=None) -%}
+<div class="field-row">
+  {{ _text(prefix, "header", "Header (optional)", rule.header if rule else "", hint="Name a header to look only at its value; leave it empty to look at every header.", mono=True, maxlength=200, placeholder="User-Agent") }}
+  {{ _select(prefix, "scope", "Match against", [("either", "Name or value"), ("key", "Header name"), ("value", "Header value")], rule.scope if rule else "either") }}
+</div>
+<div class="field-row">
+  {{ _select(prefix, "mode", "Match", [("contains", "Contains"), ("exact", "Exact"), ("regex", "Regex")], rule.mode if rule else "contains") }}
+  {{ _text(prefix, "needle", "Text to match", rule.needle if rule else "", required=True, mono=True, placeholder="Xeno", json="skip-empty") }}
+</div>
+{{ _text(prefix, "message", "Reply (optional; breaks stealth)", rule.message if rule else "", hint="Leave it empty to keep the default: a filtered caller sees an ordinary throttle 429 and cannot tell it was filtered.") }}
+{{ _text(prefix, "note", "Note (private)", rule.note if rule else "") }}
+{%- endmacro %}
+
+{% macro block_fields(prefix, rule=None) -%}
+<div class="field-row">
+  {{ _text(prefix, "pattern", "Endpoint pattern", rule.pattern if rule else "", hint="host/path without https://; * is one path segment and everything under the pattern matches too. Regex: games\\.roblox\\.com/v1/games/\\d+/servers.", required=True, mono=True, maxlength=1200, placeholder="games.roblox.com/v1/games", json="skip-empty") }}
+  {{ _select(prefix, "type", "Pattern type", [("glob", "Wildcard"), ("regex", "Regex")], rule.type if rule else "glob") }}
+</div>
+{{ _text(prefix, "message", "Reply sent to the caller (optional)", rule.message if rule else "", hint="Returned instead of the default \"This endpoint is currently blocked.\", for example to point callers at a cheaper endpoint.") }}
+{{ _text(prefix, "note", "Note (private)", rule.note if rule else "") }}
+{%- endmacro %}
+
+{% macro limit_fields(prefix, rule=None) -%}
+<div class="field-row">
+  {{ _text(prefix, "pattern", "Endpoint pattern", rule.pattern if rule else "", required=True, mono=True, maxlength=1200, placeholder="economy.roblox.com/v1", json="skip-empty") }}
+  {{ _select(prefix, "type", "Pattern type", [("glob", "Wildcard"), ("regex", "Regex")], rule.type if rule else "glob") }}
+</div>
+<div class="field-row">
+  {{ _number(prefix, "limit", "Requests allowed", rule.limit if rule else "") }}
+  {{ _number(prefix, "period", "Per (seconds)", rule.period if rule else 60) }}
+</div>
+{{ _select(prefix, "scope", "Scope", [("ip", "Per IP (never more than the per-IP allowance)"), ("place", "Per experience"), ("global", "Shared by everyone")], rule.scope if rule else "ip") }}
+{{ _text(prefix, "message", "Reply sent to the caller (optional)", rule.message if rule else "", hint="Returned instead of the default rate-limit message.") }}
+{{ _text(prefix, "note", "Note (private)", rule.note if rule else "") }}
+{%- endmacro %}

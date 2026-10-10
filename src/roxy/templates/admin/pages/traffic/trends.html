@@ -1,0 +1,57 @@
+{#-
+  Traffic page, card `trends` (`roxy/admin/pages/traffic.py trends_card`; plan 14.3 "Trends" sub-view).
+
+  Week over week, month over month and year over year: for the key measures, the trailing 7, 30 or 365 days, the
+  same length just before, the change (an arrow, the signed percent and words saying better or worse; the
+  catalog's direction decides which is better), and a sparkline. When a reset touched a measure's data in either
+  period the row shows the notice instead of a change (plan 6.8, finding LOGICFIX-1), and the period lists the
+  resets it read. The top bar's range does not apply here. Week over week is open; month and year open on demand
+  (each period is a <details> whose summary holds its heading). Context: `frame`, `periods`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/chart.html" import sparkline %}
+{% from "components/badges.html" import delta, help_dot %}
+{% from "components/format.html" import metric_value %}
+{% from "components/icon.html" import icon %}
+{% call page_card(frame, subtitle="The last 7, 30 and 365 days, each compared with the same length just before.") %}
+{% for period in periods %}
+<details class="traffic-trend"{% if loop.first %} open{% endif %}>
+  <summary class="traffic-trend__summary">
+    <h3 class="traffic-trend__title" id="trend-{{ period.key }}-title">{{ period.label }}</h3>
+    <span class="muted traffic-trend__span">{{ period.span }}, compared with {{ period.before }}</span>
+    {{ icon("chevron-down", cls="traffic-trend__chevron") }}
+  </summary>
+  {% for note in period.notices %}<p class="card__notice traffic-trend__notice" role="note">{{ icon("info") }}<span>{{ note }}</span></p>{% endfor %}
+  <div class="table-scroll" role="region" aria-labelledby="trend-{{ period.key }}-title" tabindex="0">
+    <table class="simple-table traffic-trend__table">
+      <caption class="sr-only">{{ period.label }}: this period, the period before, the change and the trend</caption>
+      <thead>
+        <tr>
+          <th scope="col">Measure</th>
+          <th scope="col" class="num">This period</th>
+          <th scope="col" class="num traffic-trend__before">Before</th>
+          <th scope="col">Change</th>
+          <th scope="col" class="traffic-trend__spark">Trend</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in period.rows %}
+        <tr>
+          <th scope="row">{{ row.label }}{{ help_dot(row.label, row.help) }}</th>
+          {%- set suffix = "ms" if row.unit == "ms" else "" %}
+          <td class="num">{{ metric_value(row.current, row.unit, row.metric) }}{% if suffix and row.current is not none %} {{ suffix }}{% endif %}</td>
+          <td class="num traffic-trend__before">{{ metric_value(row.previous, row.unit, row.metric) }}{% if suffix and row.previous is not none %} {{ suffix }}{% endif %}</td>
+          <td>{% if row.partial %}<span class="kpi__notice">{{ icon("info") }}<span>{{ row.notice }}</span></span>
+            {%- elif row.delta_pct is none and row.previous == 0 and row.current %}<span class="muted">New in this period</span>
+            {%- else %}{{ delta(row.delta_pct, row.good_direction, "against the period before") }}{% endif %}</td>
+          <td class="traffic-trend__spark">{{ sparkline(row.spark, label=row.label ~ " in " ~ period.label|lower) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</details>
+{% else %}
+<p class="muted">No trends yet: they appear once Roxy has recorded traffic.</p>
+{% endfor %}
+{% endcall %}

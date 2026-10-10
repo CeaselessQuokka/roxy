@@ -36,12 +36,96 @@
  */
 
 import uPlot from "vendor/uplot";
-import { el, qs, qsa, rafThrottle } from "roxy/dom";
+import { el, icon, qs, qsa, rafThrottle } from "roxy/dom";
 import { fmtTime, fmtValue } from "roxy/format";
-import { getJSON } from "roxy/net";
+import { getJSON, localAdminHref } from "roxy/net";
 
 const MAX_TABLE_ROWS = 500;
 const MAX_SERIES = 8;
+const MAX_POINTS = 5000;
+const MAX_NOTES = 50;
+const COMPARE_LABELS = {
+  previous: "Previous period",
+  week: "Same period last week",
+  month: "Same period last month",
+  year: "Same period last year",
+};
+
+function readJSON(text, fallback) {
+  try {
+    return text ? JSON.parse(text) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** The y axis format of an admin API series unit (metrics/catalog.py units). */
+function formatOf(unit, key) {
+  if (unit === "bytes") return { format: "bytes", unit: "" };
+  if (unit === "ms") return { format: "ms", unit: "" };
+  if (unit === "seconds" || unit === "s") return { format: "seconds", unit: "" };
+  if (unit === "ratio" && /ratio|_rate$/.test(key || "")) return { format: "percent", unit: "" };
+  if (unit === "percent") return { format: "count", unit: "%" };
+  return { format: "count", unit: unit && !["count", "requests", "ratio"].includes(unit) ? unit : "" };
+}
+
+/**
+ * Turn an admin API series answer (DESIGN.md 13: {range, series: [{key, label, unit, points}], compare,
+ * annotations: [{at, kind, label, audit_id}], notices}) into the chart spec this module draws. Points of every
+ * series are aligned on one sorted time axis (a missing point is a gap); the comparison is overlaid bucket by
+ * bucket, as the API documents; an annotation links to its audit entry.
+ */
+export function specFromSeries(answer, options = {}) {
+  const data = answer && typeof answer === "object" ? answer : {};
+  const list = (Array.isArray(data.series) ? data.series : []).slice(0, MAX_SERIES);
+  const times = new Set();
+  for (const s of list) for (const p of (Array.isArray(s.points) ? s.points : []).slice(0, MAX_POINTS)) {
+    if (Array.isArray(p) && Number.isFinite(p[0])) times.add(p[0]);
+  }
+  const x = [...times].sort((a, b) => a - b);
+  const position = new Map(x.map((t, i) => [t, i]));
+  const perSeries = readJSON(options.seriesOptions, {}) || {};
+  const compareSeries = data.compare && Array.isArray(data.compare.series) ? data.compare.series : [];
+  const series = list.map((s, i) => {
+    const values = x.map(() => null);
+    for (const p of (Array.isArray(s.points) ? s.points : []).slice(0, MAX_POINTS)) {
+      if (Array.isArray(p) && position.has(p[0])) values[position.get(p[0])] = Number.isFinite(p[1]) ? p[1] : null;
+    }
+    const own = perSeries[s.key] || {};
+    const other = compareSeries.find((c) => c.key === s.key);
+    let compare = null;
+    if (other && Array.isArray(other.points)) {
+      const sorted = other.points.filter((p) => Array.isArray(p)).sort((a, b) => a[0] - b[0]);
+      compare = x.map((_, j) => (sorted[j] && Number.isFinite(sorted[j][1]) ? sorted[j][1] : null));
+    }
+    return {
+      label: String(own.label || s.label || s.key || `Series ${i + 1}`),
+      values,
+      color: own.color || i + 1,
+      kind: own.kind || options.chartKind || "line",
+      stack: own.stack || options.chartStack || null,
+      compare,
+    };
+  });
+  const first = list[0] || {};
+  const axis = formatOf(first.unit, first.key);
+  const notes = (Array.isArray(data.annotations) ? data.annotations : []).slice(0, MAX_NOTES).map((a) => ({
+    t: a.at,
+    iso: Number.isFinite(a.at) ? new Date(a.at * 1000).toISOString() : "",
+    when: Number.isFinite(a.at) ? fmtTime(a.at, { withDay: true, withSeconds: false }) : "",
+    kind: a.kind === "reset" ? "incident" : "config",
+    label: String(a.label || a.kind || "Change"),
+    href: a.audit_id ? `/admin/audit?entry=${encodeURIComponent(a.audit_id)}` : null,
+  }));
+  return {
+    x,
+    series,
+    compare_label: COMPARE_LABELS[data.compare && data.compare.mode] || "Comparison",
+    annotations: notes,
+    notices: (Array.isArray(data.notices) ? data.notices : []).slice(0, 10).map(String),
+    y: { format: options.yFormat || axis.format, unit: options.yUnit || axis.unit, min: 0 },
+  };
+}
 const live = new Set();
 const byFigure = new WeakMap();
 let probe = null;
@@ -91,8 +175,15 @@ class Chart {
   }
 
   async load() {
+    const data = this.figure.dataset;
     try {
-      this.spec = this.figure.dataset.spec ? JSON.parse(this.figure.dataset.spec) : await getJSON(this.figure.dataset.src);
+      if ("chartApi" in data) {
+        // An admin API series answer (embedded, or fetched from its URL), turned into the spec this module draws.
+        const answer = data.series ? JSON.parse(data.series) : await getJSON(data.seriesSrc);
+        this.spec = specFromSeries(answer, data);
+      } else {
+        this.spec = data.spec ? JSON.parse(data.spec) : await getJSON(data.src);
+      }
     } catch {
       if (!this.destroyed) this.fail("The chart data could not be loaded. Reload the page to try again.");
       return;
@@ -102,10 +193,12 @@ class Chart {
       return;
     }
     this.prepare();
+    this.renderNotices();
     if (!this.x.length) {
-      this.fail("No data in this range yet.");
+      this.fail(data.emptyText || "No data in this range yet.");
       return;
     }
+    this.renderNotes();
     this.build();
     this.buildLegend();
     this.renderTable();
@@ -136,7 +229,30 @@ class Chart {
 
   fail(message) {
     this.plot.replaceChildren(el("p", { class: "chart__loading", text: message }));
-    this.figure.dataset.chartReady = "error";
+    this.figure.dataset.chartReady = this.x && this.spec ? "empty" : "error";
+  }
+
+  /** The answer's partial-data notices (plan 6.8) as notes above the plot (text only). */
+  renderNotices() {
+    const box = qs("[data-chart-notices]", this.figure);
+    const notices = Array.isArray(this.spec.notices) ? this.spec.notices : [];
+    if (!box) return;
+    box.replaceChildren(...notices.map((text) => el("li", { class: "chart__notice", role: "note" }, [icon("info"), el("span", { text })])));
+    box.hidden = notices.length === 0;
+  }
+
+  /** The visible list of annotations under an API chart; a link only for an audit entry on this site. */
+  renderNotes() {
+    const box = qs("[data-chart-notes]", this.figure);
+    if (!box) return;
+    const items = this.annotations.map((note) => {
+      const href = note.href ? localAdminHref(note.href) : null;
+      const label = href ? el("a", { href, text: note.label }) : el("span", { text: note.label });
+      const when = note.iso ? el("time", { datetime: note.iso, text: note.when || note.iso }) : el("span", { text: note.when || "" });
+      return el("li", { class: `chart__note chart__note--${note.kind === "incident" ? "incident" : "config"}` }, [icon("flag"), when, label]);
+    });
+    box.replaceChildren(...items);
+    box.hidden = items.length === 0;
   }
 
   prepare() {

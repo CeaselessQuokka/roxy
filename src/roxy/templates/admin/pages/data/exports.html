@@ -1,0 +1,58 @@
+{#-
+  Data page, card `exports` (`roxy/admin/pages/data.py exports_card`): every dataset of `GET /admin/api/v1/export/
+  datasets` as a CSV (spreadsheet safe) or JSON download for the top bar's range (parity row 88), and the LLM export
+  of plan 12 (Copy for LLM, Download JSON, Open schema; full detail asks for the second factor first). The export
+  privacy settings (`data#exports`) are placed below by the catalog. Downloads go through static/js/exports.js,
+  which says "try again in a few seconds" when two downloads are already being built and warns when a file was cut
+  at 50,000 rows or 16 MiB. Context: `frame`, `datasets`, `max_rows`, `range`, `llm`, `include_ips`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num %}
+{% from "components/glossary.html" import term with context %}
+{% call page_card(frame, subtitle="For " ~ ((range.description or "this range")|lower)) %}
+<p class="cluster data-exports__privacy">
+  {% if include_ips %}{{ status_badge("warn", "Client addresses are included in exports") }}{% else %}{{ status_badge("ok", "Client addresses are replaced by keyed hashes") }}{% endif %}
+  <span class="muted">Every download is written to the audit log first; at most {{ num(max_rows) }} rows (or 16 MiB) per file.</span>
+</p>
+<ul class="data-datasets" role="list">
+  {% for d in datasets %}
+  <li class="data-dataset">
+    <div class="data-dataset__text">
+      <p class="data-dataset__name">{{ d.label }}</p>
+      <p class="data-dataset__desc muted">{{ d.description }}{% if not d.ranged %} Everything kept (no time range).{% endif %}</p>
+    </div>
+    <div class="cluster data-dataset__links">
+      <a class="btn btn--sm" href="{{ d.csv }}" data-export download data-action="export-{{ d.name }}-csv">{{ icon("download") }}<span>CSV</span><span class="sr-only"> of {{ d.label }}</span></a>
+      <a class="btn btn--sm btn--ghost" href="{{ d.json }}" data-export download>{{ icon("download") }}<span>JSON</span><span class="sr-only"> of {{ d.label }}</span></a>
+    </div>
+  </li>
+  {% endfor %}
+</ul>
+<section class="data-llm stack" aria-labelledby="data-llm-title" data-llm-export data-llm-url="{{ llm.url }}">
+  <h3 class="data-llm__title" id="data-llm-title">Everything at once, for an assistant</h3>
+  <p class="muted">The {{ term("llm-export", "LLM export") }} is one JSON document with Roxy's settings, numbers, recommendations and health, written for an AI assistant to read (it replaces v1's diagnostics download). Text callers chose is kept apart and marked untrusted; addresses are hashed.</p>
+  <div class="field-row">
+    <div class="field">
+      <label class="field__label" for="llm-window">Covering</label>
+      <select class="input" id="llm-window" name="window" data-llm-window>
+        {% for w in llm.windows %}<option value="{{ w }}">{{ {"24h": "The last 24 hours", "7d": "The last 7 days", "30d": "The last 30 days"}.get(w, w) }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label class="field__label" for="llm-detail">Detail</label>
+      <select class="input" id="llm-detail" name="detail" data-llm-detail aria-describedby="llm-detail-hint">
+        <option value="summary">Summary</option>
+        <option value="full">Full (asks for your second factor)</option>
+      </select>
+      <p class="field__hint" id="llm-detail-hint">Full adds every setting and rule row, evidence details and tracebacks.</p>
+    </div>
+  </div>
+  <div class="cluster">
+    <button type="button" class="btn" data-llm-action="copy" data-action="llm-copy">{{ icon("copy") }}<span>Copy for LLM</span></button>
+    <button type="button" class="btn" data-llm-action="download" data-action="llm-download">{{ icon("download") }}<span>Download JSON</span></button>
+    <a class="btn btn--ghost" href="{{ llm.schema }}" target="_blank" rel="noopener noreferrer">{{ icon("external") }}<span>Open schema</span></a>
+  </div>
+</section>
+{% endcall %}

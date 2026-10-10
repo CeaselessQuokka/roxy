@@ -1,0 +1,17 @@
+{#-
+  Protection page, card `refusals` (`roxy/admin/pages/protection.py refusals_card`): v1 "Refusal Reasons".
+
+  What: every refusal and failure reason of the range (`GET /admin/api/v1/protection/refusals`, the same rows):
+  count, the newest status and path (caller text), distinct clients (v1's last IP is a client count now, plan
+  9.15), first and last seen, and where the text callers got came from (row 116: a custom message, the default
+  text, Roxy's failure text or Roblox's own body). A table request (`table=refusals`) answers the table alone.
+  Context: `frame`, `table`, `only`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% if only %}{{ data_table(**table) }}{% else %}
+{% call page_card(frame, flush=True, subtitle="Several checks answer with the same 429; the reason says which one fired.") %}
+{{ data_table(**table) }}
+<p class="prot-foot field__hint">Unique clients counts distinct client hashes (a lower bound: refusals folded over the event budget are Unattributed). The Message column says where the text the caller got came from: a custom message an admin wrote, the default text, Roxy's own failure text, or Roblox's body passed on.</p>
+{% endcall %}
+{% endif %}

@@ -1,0 +1,57 @@
+{#-
+  System page, card `persistence` (`roxy/admin/pages/system.py persistence_card`): files, growth, largest tables.
+
+  `GET /admin/api/v1/system/persistence` (`system_api.persistence_view`, parity row 85): each database file with its
+  WAL and the health of its writer (v1's Persistence tile said PROBLEM when writing failed; so does this card), the
+  disk growth of the last 30 days (one sample an hour from the leader) drawn by static/js/charts.js from the answer
+  embedded here, with its data table, and the largest tables of the newest size sample. The files table has the id
+  `storage`: health checks link to /admin/system#storage.
+  Context: `frame`, `answer`, `databases`, `problems`, `series`, `largest`, `tables_count`, `tables_sampled`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num, bytes as fmt_bytes %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/badges.html" import status_badge %}
+{% from "admin/pages/system/_macros.html" import when %}
+{% call page_card(frame, subtitle="Database files: " ~ fmt_bytes(answer.total_bytes) ~ " in all") %}
+<div class="stack">
+  <p class="system-status">{% if problems %}{{ status_badge("bad", "Problem") }} Writing failed recently for {{ problems|join(", ") }}; see the error log and the metrics pipeline.{% else %}{{ status_badge("ok", "OK") }} Every database writer is writing without errors.{% endif %}</p>
+  <div class="table-scroll system-stack-wrap" id="storage" role="region" aria-labelledby="storage-caption" tabindex="0">
+    <table class="simple-table system-stack">
+      <caption class="system-caption" id="storage-caption">Database files</caption>
+      <thead><tr><th scope="col">File</th><th scope="col" class="num">Size</th><th scope="col" class="num">WAL</th><th scope="col" class="num">Shared memory</th><th scope="col" class="num">Writes</th><th scope="col" class="num">Write errors</th></tr></thead>
+      <tbody>
+        {% for db in databases %}
+        <tr>
+          <th scope="row" data-label="File" class="mono">{{ db.file }}</th>
+          <td data-label="Size" class="num">{{ fmt_bytes(db.bytes) }}</td>
+          <td data-label="WAL" class="num">{{ fmt_bytes(db.wal_bytes) }}</td>
+          <td data-label="Shared memory" class="num">{{ fmt_bytes(db.shm_bytes) }}</td>
+          <td data-label="Writes" class="num">{{ num(db.writes) }}</td>
+          <td data-label="Write errors" class="num">{{ num(db.write_errors) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if series %}
+  {{ series_chart("system-disk-growth", "Disk over the last " ~ answer.growth_days ~ " days", series=series, kind="line", y_format="bytes",
+                  summary="Roxy's storage and the free disk, one sample an hour", help=answer.growth_note) }}
+  {% else %}
+  <p class="muted">No disk samples yet: the leader takes one an hour, the first an hour after it starts leading. Data &gt; Storage projects the growth from the row counts meanwhile.</p>
+  {% endif %}
+  <section class="system-section" aria-labelledby="largest-title">
+    <h3 class="system-section__title" id="largest-title">Largest tables</h3>
+    {% if largest %}
+    <p class="muted">The newest size sample ({{ when(tables_sampled) }}), {{ num(largest|length) }} of {{ num(tables_count) }} tables.</p>
+    <ol class="system-list system-list--sizes">
+      {% for name, size in largest %}<li><span class="mono">{{ name }}</span> <span class="muted">{{ fmt_bytes(size) }}</span></li>{% endfor %}
+    </ol>
+    {% else %}
+    <p class="muted">No table sizes yet: the leader measures them every 6 hours.</p>
+    {% endif %}
+    <p><a href="/admin/data#storage">Data &gt; Storage</a> lists every table with its rows, its retention and a projection.</p>
+  </section>
+</div>
+{% endcall %}

@@ -1,0 +1,28 @@
+{#-
+  Help page, card `pages` (`roxy/admin/pages/help.py pages_card`): "what does this page do" for every page.
+
+  The purpose sentence, the "How to read this page" paragraphs and the cards with their help, all from the page
+  registry (roxy/admin/pages/registry.py), the same texts each page shows at its top: one source (plan 14.7).
+  Context: `frame`, `pages` (each: id, title, purpose, href, how_to_read, cards, built).
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import badge %}
+{% call page_card(frame) %}
+<ul class="help-pages">
+  {% for item in pages %}
+  <li class="help-page" id="page-{{ item.id }}">
+    <h3 class="help-page__title"><a href="{{ item.href }}">{{ item.title }}</a>{% if not item.built %} {{ badge("Being built", "neutral") }}{% endif %}</h3>
+    <p class="help-page__purpose">{{ item.purpose }}</p>
+    <details class="details-plain help-page__more">
+      <summary>How to read the {{ item.title }} page, and its {{ item.cards|length }} cards</summary>
+      <div class="help-page__body stack">
+        {% for paragraph in item.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+        <ul class="help-page__cards">
+          {% for card in item.cards %}<li><a href="{{ item.href }}#{{ card.id }}">{{ card.title }}</a><span class="muted">: {{ card.help }}</span></li>{% endfor %}
+        </ul>
+      </div>
+    </details>
+  </li>
+  {% endfor %}
+</ul>
+{% endcall %}

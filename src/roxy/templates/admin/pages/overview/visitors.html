@@ -1,0 +1,15 @@
+{#-
+  Overview, card `visitors` (`roxy/admin/pages/overview.py visitors_card`): the Visitors card (plan 14.1, parity
+  row 130; v1's Human Visitors, Crawler Visitors, Home Page Visits, Admin Page Visits and robots.txt Crawls tiles,
+  plus unknown visitors and sitemap fetches).
+
+  A minute is counted once it has closed, so the card can be up to about a minute behind; your own visits to the
+  login page stop counting once this browser has signed in (v1 rule). Context: `frame`, `tiles`, `compare_label`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/kpi.html" import kpi_api %}
+{% call page_card(frame, subtitle="Counted per closed minute, so up to a minute behind.") %}
+<div class="kpi-grid ov-visitors">
+  {% for item in tiles %}{{ kpi_api(item.tile, href=item.href, compare_label=compare_label, baseline=item.note) }}{% endfor %}
+</div>
+{% endcall %}

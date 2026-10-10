@@ -8,8 +8,10 @@ What this is
     "development"; every route also answers 404 outside development, so a mistaken include cannot expose it.
     `load_glossary()` reads docs/glossary.yml, `diff_lines()` builds the input of the line diff viewer, and
     `caller_texts()` builds the caller texts of the shell's `status` context (what paused or emergency-limited
-    callers get); the dashboard pages (P11 part two) use all three too. `find_glossary()` locates the glossary in a
-    source checkout and in a release installed with `uv sync --no-editable` (see "How it works").
+    callers get); the dashboard pages (P11 part two) use all three too, so they live in
+    `roxy/admin/pages/texts.py` (production code never imports this module) and are re-exported here.
+    `find_glossary()` locates the glossary in a source checkout and in a release installed with `uv sync
+    --no-editable` (see "How it works").
 
 Why it exists
     The design system (templates/components, static/css, static/js) is built before the pages that use it. The
@@ -45,7 +47,6 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import difflib
 import io
 import json
 import math
@@ -53,44 +54,32 @@ import random
 import secrets
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterable, Sequence
 from functools import lru_cache
-from pathlib import Path
 from typing import Any, Final
 
-import yaml
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from roxy import __version__
-from roxy.abuse.messages import downtime_default
 from roxy.abuse.pause import PauseState
 from roxy.abuse.throttle_all import ThrottleAllState
+from roxy.admin.pages.texts import (
+    GLOSSARY_PATH,
+    GLOSSARY_RELATIVE_PATH,
+    GLOSSARY_SEARCH_PARENTS,
+    PACKAGE_DIR,
+    GlossaryEntry,
+    caller_texts,
+    diff_lines,
+    find_glossary,
+    glossary_terms,
+    load_glossary,
+)
 from roxy.config.catalog import CATALOG, SettingValidationError, validate_value
 from roxy.config.spec import SettingSpec
 
 GALLERY_PREFIX: Final = "/admin/_gallery"
-PACKAGE_DIR: Final = Path(__file__).resolve().parents[1]
-"""The installed `roxy` package: `<repo>/src/roxy` in a checkout, `.../site-packages/roxy` in a release."""
-GLOSSARY_RELATIVE_PATH: Final = Path("docs") / "glossary.yml"
-GLOSSARY_SEARCH_PARENTS: Final = 5
-"""How far above the package `find_glossary` looks: far enough for `<release>/.venv/lib/python3.12/site-packages/
-roxy` (the release is the 5th parent) and no further, so an unrelated file higher up is never used."""
-
-
-def find_glossary(package_dir: Path = PACKAGE_DIR) -> Path | None:
-    """`docs/glossary.yml` in the nearest directory at or above the roxy package, or None when there is none."""
-    for directory in (package_dir, *package_dir.parents[:GLOSSARY_SEARCH_PARENTS]):
-        candidate = directory / GLOSSARY_RELATIVE_PATH
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-GLOSSARY_PATH: Final = find_glossary() or PACKAGE_DIR.parents[1] / GLOSSARY_RELATIVE_PATH
-"""The glossary this process reads. When no copy exists it names where a checkout keeps it, and `load_glossary`
-raises FileNotFoundError naming that path (a release without docs/ fails loudly, never with silent blanks)."""
 THEMES: Final = ("dark", "light", "system")
 EVENTS_PER_CONNECTION: Final = 20
 EVENT_INTERVAL_S: Final = 0.25
@@ -135,86 +124,8 @@ def include_gallery(target: FastAPI | APIRouter, env: Any) -> bool:
 
 
 # ------------------------------------------------------------------------------------------- shared helpers
-
-
-@dataclass(frozen=True, slots=True)
-class GlossaryEntry:
-    """One glossary term: shown text, plain definition, and where it came from (plan, dashboard, roxy)."""
-
-    id: str
-    term: str
-    definition: str
-    source: str
-
-
-@lru_cache(maxsize=4)
-def _load_glossary_cached(path: str, mtime_ns: int) -> dict[str, GlossaryEntry]:
-    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    entries: dict[str, GlossaryEntry] = {}
-    for item in raw.get("terms", []):
-        entry = GlossaryEntry(
-            id=str(item["id"]),
-            term=str(item["term"]),
-            definition=" ".join(str(item["definition"]).split()),
-            source=str(item.get("source", "roxy")),
-        )
-        if entry.id in entries:
-            raise ValueError(f"{path}: duplicate glossary id {entry.id!r}")
-        entries[entry.id] = entry
-    return entries
-
-
-def load_glossary(path: Path = GLOSSARY_PATH) -> dict[str, GlossaryEntry]:
-    """docs/glossary.yml as id -> entry, cached until the file changes (yaml.safe_load: data, never code)."""
-    try:
-        mtime_ns = path.stat().st_mtime_ns
-    except FileNotFoundError:
-        raise FileNotFoundError(
-            f"the dashboard glossary {path} does not exist; docs/glossary.yml must ship next to the roxy package "
-            f"(searched {GLOSSARY_SEARCH_PARENTS} levels above {PACKAGE_DIR})"
-        ) from None
-    return _load_glossary_cached(str(path), mtime_ns)
-
-
-def diff_lines(before: str, after: str, context: int = 3) -> list[dict[str, Any]]:
-    """A line diff for components/diff.html `diff_lines`: equal runs longer than 2 x context fold into one row."""
-    old, new = before.splitlines(), after.splitlines()
-    rows: list[dict[str, Any]] = []
-    matcher = difflib.SequenceMatcher(a=old, b=new, autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            span = i2 - i1
-            hidden = span - 2 * context
-            if hidden >= 2:  # folding a single line would hide nothing worth hiding
-                head = range(i1, i1 + context)
-                tail = range(i2 - context, i2)
-                rows += [{"op": "equal", "old": i + 1, "new": j1 + (i - i1) + 1, "text": old[i]} for i in head]
-                rows.append({"op": "skip", "old": None, "new": None, "text": f"{hidden} unchanged lines"})
-                rows += [{"op": "equal", "old": i + 1, "new": j1 + (i - i1) + 1, "text": old[i]} for i in tail]
-            else:
-                rows += [{"op": "equal", "old": i + 1, "new": j1 + (i - i1) + 1, "text": old[i]} for i in range(i1, i2)]
-            continue
-        rows += [{"op": "delete", "old": i + 1, "new": None, "text": old[i]} for i in range(i1, i2)]
-        rows += [{"op": "insert", "old": None, "new": j + 1, "text": new[j]} for j in range(j1, j2)]
-    return rows
-
-
-def caller_texts(
-    pause: PauseState, throttle_all: ThrottleAllState, *, now: float, pause_message_default: object
-) -> dict[str, str]:
-    """The caller texts of the shell's `status` context (admin/_layout/banners.html, control_dialogs.html).
-
-    `pause_message_default` is the LIVE setting value (`ctx.settings.get("pause_message_default")`). The result:
-    `pause_message`, the 503 text a paused caller gets at `now` (the reason, the scheduled reason inside a scheduled
-    window, else the default); `throttle_message`, the 429 text of the emergency limit (its reason, else the same
-    default, v1 B6); and `pause_default`, the default exactly as it is sent when a message is left empty.
-    """
-    default = downtime_default(pause_message_default)  # cleaned like the refusal path; empty means the catalog's
-    return {
-        "pause_message": pause.message(now, default)[0],
-        "pause_default": default,
-        "throttle_message": throttle_all.message(default)[0],
-    }
+# The glossary, the line diff and the caller texts are defined in `roxy/admin/pages/texts.py` and re-exported by
+# the import above (`load_glossary`, `find_glossary`, `glossary_terms`, `diff_lines`, `caller_texts`, ...).
 
 
 def _live_setting(request: Request, key: str) -> Any:
@@ -392,9 +303,9 @@ def _table_context(
         "src": f"{GALLERY_PREFIX}/table",
         "total": len(rows),
         "page": page,
-        "size": size,
+        "page_size": size,
         "sort": sort,
-        "dir": "asc" if direction == "asc" else "desc",
+        "order": "asc" if direction == "asc" else "desc",
         "q": q,
         "filters": [
             {"name": "host", "label": "Host", "value": host, "options": [["", "All"], *[[h, h] for h in hosts]]},
@@ -700,7 +611,7 @@ def _page_context(request: Request) -> dict[str, Any]:
         },
         "theme": theme,
         "density": density,
-        "time": {"range": query.get("range", "24h"), "compare": query.get("compare", "prev")},
+        "time": {"range": query.get("range", "24h"), "compare": query.get("compare", "previous")},
         "status": {
             "paused": False,
             "throttle_all": False,
@@ -866,15 +777,16 @@ def _fragment(request: Request, kind: str, status_code: int = 200, **context: An
 
 @router.get("/table", response_class=HTMLResponse)
 async def gallery_table(request: Request) -> HTMLResponse:
-    """The endpoint table, one page (server-side search, filter, sort and paging)."""
+    """The endpoint table, one page (server-side search, filter, sort and paging). The table macro sends the admin
+    API's parameter names (`page_size`, `order`); the older `size` and `dir` are still read."""
     query = request.query_params
     table = _table_context(
         q=query.get("q", "")[:200],
         host=query.get("host", "")[:40],
         sort=query.get("sort", "requests"),
-        direction=query.get("dir", "desc"),
+        direction=query.get("order") or query.get("dir", "desc"),
         page=_bounded_int(query.get("page"), 1, 10_000, 1),
-        size=_bounded_int(query.get("size"), 1, 250, 10),
+        size=_bounded_int(query.get("page_size") or query.get("size"), 1, 250, 10),
     )
     return _fragment(request, "table", table=table)
 
@@ -1109,6 +1021,16 @@ def gallery_routes() -> Sequence[str]:
     return tuple(sorted({getattr(route, "path", "") for route in router.routes}))
 
 
-def glossary_terms(entries: Mapping[str, GlossaryEntry]) -> list[GlossaryEntry]:
-    """Entries sorted by term, case-insensitive (the order of the Help page glossary)."""
-    return sorted(entries.values(), key=lambda entry: entry.term.lower())
+REEXPORTED: Final = (
+    GLOSSARY_PATH,
+    GLOSSARY_RELATIVE_PATH,
+    GLOSSARY_SEARCH_PARENTS,
+    PACKAGE_DIR,
+    GlossaryEntry,
+    caller_texts,
+    diff_lines,
+    find_glossary,
+    glossary_terms,
+    load_glossary,
+)
+"""The shared helpers this module re-exports from `roxy/admin/pages/texts.py` (kept for the gallery's users)."""

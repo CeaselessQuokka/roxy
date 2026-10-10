@@ -1,0 +1,348 @@
+/*
+ * The Settings page (templates/admin/pages/settings*): the editor's filters, groups and pager, the batch bar and
+ * its review dialog, import and export, and the change drawer.
+ *
+ * What this is
+ *   Layout around the shared setting control (components.css `.setting`): the filter row, a group heading per catalog
+ *   group, the "Also on" and recommendation lines under each setting, a pager, the bar that holds unsaved edits
+ *   (sticky at the bottom of the screen while there are some), and the tables of the batch review and the import.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract). Only tokens
+ *   from tokens.css are used, so both themes follow; targets stay at least 24 px (44 px on a phone, plan 14.8).
+ * How it works
+ *   Mobile first: everything is one column; the filters sit in a row from 720 px, import and export side by side
+ *   from 1100 px. Long values and keys wrap inside their cell; tables scroll inside their own region.
+ * What to read next
+ *   templates/admin/pages/settings/editor.html, static/js/pages/settings.js, static/css/components.css (.setting).
+ */
+
+.settings-pair {
+  align-items: start;
+}
+
+/* Links inside running text are underlined: color is never the only signal (WCAG 1.4.1). */
+.card__body p a:not(.btn),
+.card__body li a,
+.settings-change p a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------------------------------------- the filters */
+.settings-filter {
+  display: grid;
+  gap: var(--sp-3);
+}
+
+.settings-filter__search {
+  max-width: 36rem;
+}
+
+.settings-filter__search .input-icon {
+  width: 100%;
+}
+
+.settings-filter__chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-4);
+}
+
+.settings-filter__chips .check {
+  min-height: var(--target-min);
+}
+
+.settings-filter__status {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+@media (max-width: 719px) {
+  .settings-filter__chips {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-filter__chips .chip-select,
+  .settings-filter__chips .chip-select select {
+    width: 100%;
+  }
+
+  .settings-filter__chips .check {
+    min-height: var(--target-touch);
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------- results */
+.settings-results:focus {
+  outline: none;
+}
+
+.settings-results:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 4px;
+}
+
+.settings-key-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+}
+
+.settings-group {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.settings-group__title {
+  padding-bottom: var(--sp-1);
+  border-bottom: 1px solid var(--border-strong);
+  font-size: var(--fs-3);
+}
+
+.settings-group__list {
+  display: grid;
+  gap: var(--sp-3);
+}
+
+.settings-item {
+  display: grid;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.settings-item:target .setting {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.settings-item__more {
+  display: grid;
+  gap: var(--sp-1);
+  padding: 0 var(--sp-3) var(--sp-2);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  overflow-wrap: anywhere;
+}
+
+.settings-item__more p {
+  margin: 0;
+}
+
+.settings-item__note {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: flex-start;
+  color: var(--text);
+}
+
+.settings-item__rec {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1);
+  margin-right: var(--sp-3);
+}
+
+.settings-item__more a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-min);
+}
+
+.settings-pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2) var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.settings-pager__size {
+  margin-left: auto;
+}
+
+.settings-cross__list {
+  display: grid;
+  gap: var(--sp-1);
+  margin: var(--sp-2) 0 0;
+  padding-left: 1.25em;
+  font-size: var(--fs-1);
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------------------------------------- batch bar */
+.settings-batch {
+  position: sticky;
+  bottom: var(--sp-3);
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-lg);
+  background: var(--surface-3);
+  box-shadow: var(--shadow-pop);
+}
+
+.settings-batch[hidden] {
+  display: none;
+}
+
+.settings-batch__count {
+  margin: 0;
+  font-weight: var(--fw-semibold);
+}
+
+@media (max-width: 767px) {
+  .settings-batch {
+    bottom: calc(var(--mobile-nav-h) + var(--sp-2));
+  }
+
+  .settings-batch .btn {
+    min-height: var(--target-touch);
+  }
+}
+
+.settings-batch-dialog {
+  width: min(56rem, calc(100vw - 2 * var(--sp-4)));
+}
+
+.settings-batch__table th,
+.settings-batch__table td,
+.settings-import__table th,
+.settings-import__table td {
+  vertical-align: top;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.settings-batch__key {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.settings-batch__what {
+  display: grid;
+  gap: var(--sp-1);
+  min-width: 12rem;
+}
+
+.settings-batch__risk,
+.settings-batch__bad {
+  color: var(--bad);
+}
+
+.settings-batch__problems,
+.settings-import__problems {
+  display: grid;
+  gap: var(--sp-1);
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-2) var(--sp-3) var(--sp-2) 2em;
+  border-radius: var(--radius);
+  background: var(--bad-soft);
+}
+
+/* ---------------------------------------------------------------------------------------------- import, export */
+.settings-io {
+  display: grid;
+  gap: var(--sp-6);
+}
+
+@media (min-width: 1100px) {
+  .settings-io {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  }
+}
+
+.settings-io__title {
+  font-size: var(--fs-3);
+}
+
+.settings-io__subtitle {
+  font-size: var(--fs-2);
+}
+
+.settings-io__file {
+  padding: var(--sp-2);
+}
+
+.settings-import__message {
+  display: block;
+}
+
+/* ---------------------------------------------------------------------------------------------- change drawer */
+.settings-change__lead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.settings-change__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.settings-change__facts dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.settings-change__diff {
+  table-layout: fixed;
+  width: 100%;
+}
+
+.settings-change__diff td {
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+.settings-change__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-4);
+  margin: 0;
+}
+
+.settings-change__links a {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: var(--target-min);
+}
+
+.settings-change__section {
+  display: grid;
+  gap: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.settings-change__heading {
+  font-size: var(--fs-3);
+}
+
+.settings-revert .dialog__consequences {
+  margin: 0;
+}
+
+@media (max-width: 480px) {
+  .settings-change__facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

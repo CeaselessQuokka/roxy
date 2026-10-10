@@ -651,6 +651,27 @@ async def build_events(ctx: Any, window: Window, *, limit: int = EVENT_ROWS, off
     return found
 
 
+EVENT_SEARCH_KEYS: Final[tuple[str, ...]] = ("type", "severity", "reason", "endpoint_template")
+"""The fields the events table's search looks in."""
+
+
+async def recent_events(ctx: Any, tr: TimeRange) -> tuple[list[Mapping[str, Any]], bool]:
+    """The newest notable events of the range (at most `MAX_EVENTS_PAGE`, the card is a recent list) and whether
+    older ones exist beyond them. The events table of the API and of the Overview page both read through here."""
+    found = await build_events(ctx, tr.window, limit=read_dashboard.MAX_EVENTS_PAGE)
+    rows = list(found["rows"])
+    return rows, int(found["total"]) > len(rows)
+
+
+async def events_table(ctx: Any, tr: TimeRange, tq: TableQuery) -> dict[str, Any]:
+    """One page of the events table (searched, sorted and paged on the server) with `capped`."""
+    rows, capped = await recent_events(ctx, tr)
+    items, total = page_rows(rows, tq, search_keys=EVENT_SEARCH_KEYS)
+    answer = table_answer(EVENTS_SPEC, tq, items, total)
+    answer["capped"] = capped  # older events exist beyond the recent list
+    return answer
+
+
 # --------------------------------------------------------------------------------------------- recommendations
 
 
@@ -775,19 +796,17 @@ async def overview_events(
     """The newest notable events in the range (at most `MAX_EVENTS_PAGE` of them, the card is a recent list),
     sorted, searched and paged on the server; `format=csv|json` downloads them."""
     ctx = get_ctx(request)
-    found = await build_events(ctx, tr.window, limit=read_dashboard.MAX_EVENTS_PAGE)
-    rows = list(found["rows"])
-    keys = ("type", "severity", "reason", "endpoint_template")
     if fmt is not None:
-        ordered, total = page_rows(rows, replace(tq, page=1, page_size=max(1, len(rows))), search_keys=keys)
+        rows, _capped = await recent_events(ctx, tr)
+        everything = replace(tq, page=1, page_size=max(1, len(rows)))
+        ordered, total = page_rows(rows, everything, search_keys=EVENT_SEARCH_KEYS)
         return await export_table(request, admin, EVENTS_SPEC, ordered, fmt, total=total, tq=tq, tr=tr)
-    items, total = page_rows(rows, tq, search_keys=keys)
-    answer = table_answer(EVENTS_SPEC, tq, items, total)
-    answer["capped"] = int(found["total"]) > len(rows)  # older events exist beyond the recent list
-    return answer
+    return await events_table(ctx, tr, tq)
 
 
 __all__ = [
+    "EVENTS_SPEC",
+    "EVENT_SEARCH_KEYS",
     "KPI_KEYS",
     "build_breakdown",
     "build_chart",
@@ -796,5 +815,7 @@ __all__ = [
     "build_recommendations",
     "build_status",
     "build_visitors",
+    "events_table",
+    "recent_events",
     "router",
 ]

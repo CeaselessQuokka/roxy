@@ -20,7 +20,9 @@ How it works
     - Counters are never written per request (plan 6.3): each worker accumulates in memory (bounded) and the flush
       merges them in ONE hot.db transaction, evaluates the touched subjects, and claims detections with a `flag|`
       row. Only the worker that inserts the flag acts, so an action happens once fleet-wide; every worker reads the
-      active flags back so all of them refuse a flagged client within about a second.
+      active flags back so all of them refuse a flagged client within about a second. The transaction reads every
+      touched row with one statement and writes them back with one multi-row upsert per chunk (finding LOAD-3: a
+      statement per subject held hot.db's write lock for up to 200 ms a second under load, see `_read_windows`).
     - Detectors (thresholds in the detector's own unit, windows `spam_<id>_window_s`):
       rate: requests > threshold x (allowed_requests_per_minute / throttle_reset_duration) x window;
       refused: refusals > threshold; probe and auth: count >= threshold; enum: distinct ids > threshold;
@@ -242,6 +244,41 @@ def evaluate_row(
     return False, 0.0, threshold
 
 
+FLUSH_READ_CHUNK: Final = 500
+"""Subjects one flush reads with one statement (`subject IN (...)`)."""
+FLUSH_WRITE_CHUNK: Final = 300
+"""Rows one flush writes with one multi-row upsert (three parameters each, far below SQLite's parameter limit)."""
+
+_UPSERT_TAIL: Final = (
+    " ON CONFLICT (subject) DO UPDATE SET buckets_json = excluded.buckets_json, updated_at = excluded.updated_at"
+)
+
+
+def _read_windows(conn: sqlite3.Connection, subjects: Sequence[str]) -> dict[str, Any]:
+    """`{subject: buckets_json}` of the stored rows among `subjects` (missing ones are absent), in a few statements."""
+    stored: dict[str, Any] = {}
+    for start in range(0, len(subjects), FLUSH_READ_CHUNK):
+        chunk = subjects[start : start + FLUSH_READ_CHUNK]
+        marks = ",".join("?" for _ in chunk)
+        sql = f"SELECT subject, buckets_json FROM spam_windows WHERE subject IN ({marks})"  # noqa: S608  # only "?" placeholders are interpolated
+        for subject, raw in conn.execute(sql, chunk).fetchall():
+            stored[str(subject)] = raw
+    return stored
+
+
+def _write_windows(conn: sqlite3.Connection, rows: Sequence[tuple[str, str, int]]) -> None:
+    """Upsert `(subject, buckets_json, updated_at)` rows with one statement per `FLUSH_WRITE_CHUNK` (subjects are
+    unique, so no row of a statement conflicts with another of the same statement)."""
+    for start in range(0, len(rows), FLUSH_WRITE_CHUNK):
+        chunk = rows[start : start + FLUSH_WRITE_CHUNK]
+        values = ",".join("(?, ?, ?)" for _ in chunk)
+        params = [value for row in chunk for value in row]
+        conn.execute(
+            f"INSERT INTO spam_windows (subject, buckets_json, updated_at) VALUES {values}{_UPSERT_TAIL}",  # noqa: S608  # only "?" placeholders are interpolated
+            params,
+        )
+
+
 def _merge(data: dict[str, Any], pending: _Pending, cap: int, keep_after: int) -> dict[str, Any]:
     counts: dict[str, int] = {k: int(v) for k, v in (data.get("c") or {}).items() if int(k) >= keep_after}
     sets: dict[str, list[str]] = {k: list(v) for k, v in (data.get("s") or {}).items() if int(k) >= keep_after}
@@ -410,12 +447,18 @@ class SpamDetectors:
         self, conn: sqlite3.Connection, batch: dict[str, _Pending], values: Mapping[str, Any], now_s: int
     ) -> tuple[list[Detection], list[Flag]]:
         detections: list[Detection] = []
+        subjects = [subject for subject in batch if subject.partition("|")[0] in DETECTOR_OF]
+        # Few statements inside the write lock (finding LOAD-3): every SQLite call gives up the GIL and may wait for
+        # the event loop to hand it back, and hot.db's one lock is held all that time. One read of every subject's
+        # row and one multi-row write per chunk, instead of a read and a write per subject (a busy second has
+        # hundreds of subjects); the rows are independent, so reading them all first changes nothing.
+        stored = _read_windows(conn, subjects)
         inserted = 0
-        for subject, pending in batch.items():
+        writes: list[tuple[str, str, int]] = []
+        for subject in subjects:
+            pending = batch[subject]
             signal, _, who = subject.partition("|")
-            detector = DETECTOR_OF.get(signal)
-            if detector is None:
-                continue
+            detector = DETECTOR_OF[signal]
             window = _window(values, detector)
             keep_after = now_s - window - bucket_size(window)
             # A count threshold N only needs N + 1 distinct values per bucket to be decided; the cache-busting ratio
@@ -425,19 +468,14 @@ class SpamDetectors:
                 if detector == "bust"
                 else min(MAX_SET_PER_BUCKET, int(float(_setting(values, detector, "threshold"))) + 1)
             )
-            row = conn.execute("SELECT buckets_json FROM spam_windows WHERE subject = ?", (subject,)).fetchone()
-            inserted += row is None
+            inserted += subject not in stored
+            raw: Any = stored.get(subject)
             try:
-                data = json.loads(row[0]) if row is not None else {}
+                data = json.loads(raw) if subject in stored else {}  # a NULL stored value is unreadable: start over
             except (TypeError, ValueError):
                 data = {}
             merged = _merge(data if isinstance(data, dict) else {}, pending, max(1, cap), keep_after)
-            conn.execute(
-                "INSERT INTO spam_windows (subject, buckets_json, updated_at) VALUES (?, ?, ?) "
-                "ON CONFLICT (subject) DO UPDATE SET buckets_json = excluded.buckets_json, "
-                "updated_at = excluded.updated_at",
-                (subject, json.dumps(merged, separators=(",", ":")), now_s),
-            )
+            writes.append((subject, json.dumps(merged, separators=(",", ":")), now_s))
             if not bool(_setting(values, detector, "enabled")):
                 continue
             fired, value, threshold = evaluate_row(detector, merged, values, now_s)
@@ -457,6 +495,7 @@ class SpamDetectors:
                         f"SPAM-{detector.upper()}: {value:g} in {window} s (threshold {threshold:g})",
                     )
                 )
+        _write_windows(conn, writes)
         if inserted:
             self.evicted += self._evict(conn)
         self._drop_expired_flags(conn, now_s)

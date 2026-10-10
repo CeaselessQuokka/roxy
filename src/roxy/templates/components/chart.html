@@ -24,6 +24,15 @@
     An annotation `href` must be a path on this site (format.html `local_href`); anything else shows as text.
     `color` is a series slot 1 to 8 (tokens --series-1..8, fixed order, never cycled). Server-rendered fragments
     never contain <script> (plan 9.2), which is why data is an attribute and not an inline JSON script.
+
+    `series_chart(id, title, src, ...)` is the dashboard pages' chart: `src` is an admin API series URL (DESIGN.md
+    13: `{range, series: [{key, label, unit, points: [[t, v]]}], compare: {mode, range, series} | null,
+    annotations: [{at, kind, label, audit_id}], notices: [str]}`), and static/js/charts.js turns that answer into
+    the spec above in the browser: points aligned on one time axis, the comparison drawn bucket by bucket as
+    dashed lines, annotations linking to their audit entry (`/admin/audit?entry=<id>`), the y format from the
+    series unit, and the `notices` (plan 6.8 partial data) listed under the chart. `kind` (line, area, bars) and
+    `stack` (a group id) apply to every series; `series_options` maps a series key to its own `{color, kind,
+    stack, label}`. `series` instead of `src` embeds the same answer for the first paint (no request at all).
 -#}
 {% from "components/icon.html" import icon %}
 {% from "components/badges.html" import help_dot %}
@@ -82,6 +91,39 @@
     <summary>Show the data as a table</summary>
     <div class="table-scroll" data-chart-table tabindex="0" role="region" aria-label="{{ title }}: data table">
       {% if table %}{{ table }}{% else %}<p class="muted">The table appears once the chart has loaded.</p>{% endif %}
+    </div>
+  </details>
+</figure>
+{%- endmacro %}
+
+{#- size: "sm", "md", "lg" as `timeseries`. `y_format`: count, bytes, percent (a ratio), ms, seconds; empty takes it
+    from the first series' unit. -#}
+{% macro series_chart(id, title, src=None, series=None, summary="", help=None, size="md", level=3, kind="line",
+                      stack=None, y_format="", y_unit="", series_options=None, empty_text=None) -%}
+<figure class="chart" id="{{ id }}" data-chart data-chart-api{% if src %} data-series-src="{{ src }}"{% endif %}{% if series %} data-series='{{ series|tojson }}'{% endif %}
+        data-chart-kind="{{ kind }}"{% if stack %} data-chart-stack="{{ stack }}"{% endif %}{% if y_format %} data-y-format="{{ y_format }}"{% endif %}{% if y_unit %} data-y-unit="{{ y_unit }}"{% endif %}
+        {%- if series_options %} data-series-options='{{ series_options|tojson }}'{% endif %}{% if empty_text %} data-empty-text="{{ empty_text }}"{% endif %} aria-labelledby="{{ id }}-title">
+  <figcaption class="chart__head">
+    <span class="chart__titles">
+      <h{{ level }} class="chart__title" id="{{ id }}-title">{{ title }}</h{{ level }}>
+      {% if help %}{{ help_dot(title, help) }}{% endif %}
+    </span>
+    <span class="chart__tools" role="toolbar" aria-label="{{ title }}: zoom">
+      <button type="button" class="icon-btn icon-btn--sm" data-chart-zoom="in" aria-label="Zoom in on {{ title }}">{{ icon("zoom-in") }}</button>
+      <button type="button" class="icon-btn icon-btn--sm" data-chart-zoom="out" aria-label="Zoom out on {{ title }}">{{ icon("zoom-out") }}</button>
+      <button type="button" class="icon-btn icon-btn--sm" data-chart-zoom="reset" aria-label="Show the whole range of {{ title }}">{{ icon("reset") }}</button>
+    </span>
+  </figcaption>
+  <ul class="chart__notices" data-chart-notices hidden></ul>
+  <div class="chart__legend" data-chart-legend role="group" aria-label="{{ title }}: series (press to show or hide)"></div>
+  <div class="chart__plot chart__plot--{{ size }}" data-chart-plot role="img" aria-label="{{ summary or title }}">
+    <p class="chart__loading">Loading chart</p>
+  </div>
+  <ul class="chart__notes" data-chart-notes aria-label="{{ title }}: marked events" hidden></ul>
+  <details class="chart__table">
+    <summary>Show the data as a table</summary>
+    <div class="table-scroll" data-chart-table tabindex="0" role="region" aria-label="{{ title }}: data table">
+      <p class="muted">The table appears once the chart has loaded.</p>
     </div>
   </details>
 </figure>

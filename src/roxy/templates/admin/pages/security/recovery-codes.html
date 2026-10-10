@@ -1,0 +1,31 @@
+{#-
+  Security page, card `recovery-codes` (`roxy/admin/pages/security.py recovery_codes_card`): how many recovery codes
+  are left (`GET /admin/api/v1/security/recovery-codes`; never the codes), and "Make new codes" (a fresh second
+  factor; `POST .../recovery-codes/regenerate`). The new codes are the one secret the API returns: the page script
+  (static/js/pages/security.js) shows them once in this card from the answer, with a copy button; they are never in
+  any HTML the server renders. Context: `frame`, `remaining`, `total`, `tone`, `regenerate_url`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/icon.html" import icon %}
+{% call page_card(frame) %}
+<div class="stack" data-recovery>
+  <p class="recovery__count"><span class="recovery__number" data-recovery-remaining>{{ remaining }}</span> of <span data-recovery-total>{{ total }}</span> recovery codes left</p>
+  <p data-recovery-state>{% if tone == "bad" %}{{ status_badge("bad", "No codes left: make new ones now") }}{% elif tone == "warn" %}{{ status_badge("warn", "Running low: make new ones soon") }}{% else %}{{ status_badge("ok", "Enough codes left") }}{% endif %}</p>
+  <p class="security-intro">Each code signs you in once when your phone is not at hand. Keep them somewhere safe and offline.</p>
+  <div class="cluster"><button type="button" class="btn" data-dialog-open="dlg-recovery-new" data-action="recovery-regenerate">{{ icon("refresh") }}<span>Make new codes</span></button></div>
+  <div class="recovery-new stack" data-recovery-new hidden tabindex="-1" role="region" aria-labelledby="recovery-new-title">
+    <h3 class="recovery-new__title" id="recovery-new-title">Your new recovery codes</h3>
+    <p>They are shown this once. Copy them now and store them somewhere safe; the old codes no longer work.</p>
+    <ol class="recovery-new__list mono" data-recovery-list></ol>
+    <div class="cluster"><button type="button" class="btn btn--sm" data-recovery-copy>{{ icon("copy") }}<span>Copy the codes</span></button><button type="button" class="btn btn--sm btn--ghost" data-recovery-hide>{{ icon("eye") }}<span>Hide them</span></button></div>
+  </div>
+</div>
+{{ confirm_dialog("dlg-recovery-new", "Make new recovery codes?", action=regenerate_url, api=True,
+                  confirm_label="Make new codes",
+                  consequences=["Every current recovery code stops working at once.",
+                                "The new codes are shown once, on this page; copy them before you leave it.",
+                                "You will be asked for your second factor first."],
+                  success="New recovery codes are ready below. Copy them now.") }}
+{% endcall %}

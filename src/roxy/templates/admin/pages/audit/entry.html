@@ -1,0 +1,93 @@
+{#-
+  Audit page, card `entry` (`roxy/admin/pages/audit.py entry_card`): one audit entry, shown in the drawer.
+
+  A fragment-only card renders without the card frame: the drawer already has a heading, so this is its body.
+  It shows who acted, when, from where and why; the field diff (`GET /admin/api/v1/audit/{id}` `diff`); the two
+  documents as a line diff; the card that manages the target (`manage`, a path on this site, through `local_href`);
+  and, for a settings change, the revert form, which posts to the settings API (static/js/api_forms.js) and is
+  itself audited. Every value that came from data is plain text: targets, reasons and diff values through
+  `caller_text`, documents inside <code>.
+  Context: `frame`, `entry`, `when`, `changes`, `diff_truncated`, `lines`, `docs_cut`, `has_docs`, `revert`,
+  `manage`, `secret_target`, `max_value_chars`, `log_url`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import caller_text, local_href %}
+{% from "components/diff.html" import diff_lines as diff_lines_view %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/badges.html" import badge %}
+<div class="audit-entry stack" id="{{ frame.id }}" data-card="{{ frame.id }}" data-audit-entry="{{ entry.id }}">
+  <p class="audit-entry__lead">{{ badge("Entry #" ~ entry.id, "neutral") }} <span class="mono">{{ entry.action }}</span></p>
+  <dl class="kv audit-entry__facts">
+    <dt>When</dt><dd>{% if when %}<time datetime="{{ when.datetime }}">{{ when.text }}</time> <span class="muted">({{ when.sub }})</span>{% else %}<span class="muted">n/a</span>{% endif %}</dd>
+    <dt>Who</dt><dd class="mono">{{ caller_text(entry.actor, 120) }}</dd>
+    <dt>From</dt><dd class="mono">{{ entry.actor_ip or "n/a" }}</dd>
+    <dt>What</dt><dd class="mono">{{ entry.action }}</dd>
+    <dt>Target</dt><dd>{{ caller_text(entry.target, 400) }}</dd>
+    <dt>Reason</dt><dd>{% if entry.reason %}{{ caller_text(entry.reason, 600, block=True) }}{% else %}<span class="muted">No reason was given.</span>{% endif %}</dd>
+    <dt>Request</dt><dd class="mono">{{ entry.request_id or "n/a" }}</dd>
+  </dl>
+
+  {% if secret_target %}
+  {{ inline_alert("info", "A secret is involved", "The log never keeps a secret: only its fingerprint and its masked form are stored, so that is all the diff can show.") }}
+  {% endif %}
+
+  <section class="audit-entry__section" aria-labelledby="entry-{{ entry.id }}-changes">
+    <h3 class="audit-entry__heading" id="entry-{{ entry.id }}-changes">What changed</h3>
+    {% if changes %}
+    <div class="table-scroll" role="region" aria-labelledby="entry-{{ entry.id }}-changes" tabindex="0">
+      <table class="diff-table audit-diff">
+        <caption class="sr-only">Fields this action changed, with their value before and after</caption>
+        <thead><tr><th scope="col">Field</th><th scope="col">Before</th><th scope="col">After</th></tr></thead>
+        <tbody>
+          {% for row in changes %}
+          <tr>
+            <th scope="row"><code class="diff-table__key">{{ caller_text(row.path, 200) }}</code><span class="diff-table__note">{{ {"added": "added", "removed": "removed", "changed": "changed"}[row.change] }}</span></th>
+            <td class="diff-table__before"><span class="sr-only">Before: </span>{% if row.before is none %}<span class="muted">not set</span>{% else %}<del>{{ caller_text(row.before, max_value_chars) }}</del>{% endif %}</td>
+            <td class="diff-table__after"><span class="sr-only">After: </span>{% if row.after is none %}<span class="muted">removed</span>{% else %}<ins>{{ caller_text(row.after, max_value_chars) }}</ins>{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if diff_truncated %}<p class="muted">Only the first 500 fields are listed.</p>{% endif %}
+    {% else %}
+    <p class="muted">This entry records an action without a before and after (a download, a sign-in, a run).</p>
+    {% endif %}
+    {% if has_docs %}
+    <details class="details-plain">
+      <summary>The stored before and after, line by line</summary>
+      {{ diff_lines_view(lines, title="Before and after of entry " ~ entry.id) }}
+      {% if docs_cut %}<p class="muted">Long documents are cut at 20,000 characters here; the API has them whole.</p>{% endif %}
+    </details>
+    {% endif %}
+  </section>
+
+  {% set manage_href = local_href(manage.href) if manage and manage.href else "" %}
+  {% if manage_href %}
+  <p class="audit-entry__manage">{{ icon("external") }}<a href="{{ manage_href }}">Open {{ manage.label }}</a></p>
+  {% endif %}
+
+  <section class="audit-entry__section" aria-labelledby="entry-{{ entry.id }}-undo">
+    <h3 class="audit-entry__heading" id="entry-{{ entry.id }}-undo">Undo this change</h3>
+    {% set revert_href = local_href(revert.url) if revert.available and revert.url else "" %}
+    {% if revert_href %}
+    <form class="stack audit-revert" data-api-form data-api-url="{{ revert_href }}" data-api-method="POST"
+          data-success="Reverted. The setting has the value it had before this change." data-on-success="refresh" data-refresh="log" novalidate>
+      <ul class="dialog__consequences">
+        <li>Puts the setting back to the value it had right before this change, on every worker within a second.</li>
+        <li>The revert is itself a change: it is written to this log with your reason.</li>
+      </ul>
+      <div class="field">
+        <label class="field__label" for="revert-{{ entry.id }}-reason">Reason <span class="muted">(saved in the audit log; needed for a high-risk value)</span></label>
+        <textarea class="input" id="revert-{{ entry.id }}-reason" name="reason" rows="2" maxlength="500" data-json="string" aria-describedby="revert-{{ entry.id }}-reason-error"></textarea>
+        <p class="field__error" id="revert-{{ entry.id }}-reason-error" data-field-error="reason" hidden></p>
+      </div>
+      <label class="check" data-confirm-field hidden><input type="checkbox" name="confirm_high_risk" value="1" data-json="bool"><span>I understand: the old value is high risk</span></label>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      <div class="cluster"><button type="submit" class="btn btn--primary" data-action="audit-revert">{{ icon("reset") }}<span>Revert this change</span></button></div>
+    </form>
+    {% else %}
+    <p class="muted">{{ revert.reason or "This action has nothing to revert." }}</p>
+    {% endif %}
+  </section>
+</div>

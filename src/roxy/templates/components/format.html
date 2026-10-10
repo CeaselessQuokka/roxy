@@ -11,7 +11,43 @@
   come from data (table cells, chart annotations) go through it, so a value such as "https://...",
   "javascript:..." or "//host/..." never becomes a link; the text stays. Browsers read "/\host" like "//host" and
   drop tabs and line breaks inside a URL ("/<tab>/host" also becomes "//host"), so those are refused too.
+
+  `caller_text(value, limit=200)` is THE way to show text a caller chose (every field an API answer lists in
+  `caller_text`, every `Column(caller_text=True)`: paths, templates, User-Agents, header names, place names,
+  errors quoting them). It is escaped like everything else, isolated for bidirectional text (`dir="auto"`,
+  `unicode-bidi: isolate` in CSS: a right-to-left override inside a User-Agent cannot flip the words around it),
+  marked `translate="no"`, never put into an attribute that is interpreted (no href, src or style), and cut at
+  `limit` characters with a note of the full length (the drawer or the API has the rest).
+  `metric_value(value, unit, key="")` formats a number by its metric unit (`metrics/catalog.py` units).
 -#}
+{% macro caller_text(value, limit=200, block=False) -%}
+{%- if value is none or value == "" -%}<span class="muted">n/a</span>
+{%- else -%}
+{%- set text = value|string -%}
+<{{ "span" if not block else "div" }} class="caller-text{% if block %} caller-text--block{% endif %}" dir="auto" translate="no">{{ text[:limit] }}{% if text|length > limit %}<span class="caller-text__cut"> (first {{ limit }} of {{ "{:,}".format(text|length) }} characters)</span>{% endif %}</{{ "span" if not block else "div" }}>
+{%- endif -%}
+{%- endmacro %}
+
+{% macro metric_value(value, unit="", key="") -%}
+{%- if value is none -%}n/a
+{%- elif value is not number -%}{{ value }}
+{%- elif unit == "bytes" -%}{{ bytes(value) }}
+{%- elif unit == "percent" -%}{{ "{:,.1f}".format(value) }}%
+{%- elif unit == "ratio" and (key.endswith("ratio") or key.endswith("_rate")) -%}{{ pct(value) }}
+{%- elif unit == "ms" -%}{{ "{:,.0f}".format(value) if value >= 10 else "{:,.1f}".format(value) }}
+{%- elif unit in ("seconds", "s") -%}{{ duration(value) }}
+{%- elif value is integer -%}{{ "{:,}".format(value) }}
+{%- else -%}{{ "{:,.2f}".format(value) }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro unit_suffix(unit, key="") -%}
+{%- if unit == "ms" -%}ms
+{%- elif unit == "ratio" and not (key.endswith("ratio") or key.endswith("_rate")) -%}
+{%- elif unit in ("percent", "bytes", "seconds", "s", "ratio", "", "count", "rows") -%}
+{%- else -%}{{ unit }}
+{%- endif -%}
+{%- endmacro %}
 {% macro local_href(url) -%}
 {%- if url is string and url[:1] == "/" and url[1:2] not in ("/", "\\")
       and "\t" not in url and "\n" not in url and "\r" not in url -%}{{ url }}{%- endif -%}

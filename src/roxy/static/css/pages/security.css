@@ -1,0 +1,327 @@
+/*
+ * The Security page (templates/admin/pages/security*): fingerprint tabs and drawer, account lists, recovery codes.
+ *
+ * What this is
+ *   Layout for the parts of the page the shared components do not cover: the fingerprint card's tabs, the header
+ *   drawer (facts, stored values, actions), the small account tables (sessions, trusted devices) that become card
+ *   rows on a phone, the passkey list and the one-time recovery code list.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract); only tokens
+ *   from tokens.css are used, so both themes follow.
+ * How it works
+ *   Mobile first where it matters (plan 14.8): below 640 px the account tables show each row as a card with its
+ *   labels (`data-label`), and every control keeps a touch target of at least 44 px on a coarse pointer.
+ * What to read next
+ *   static/css/components.css (.simple-table, .kv, .dt), static/js/pages/security.js (the tabs).
+ */
+
+.security-intro,
+.security-filter-note {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4) 0;
+  color: var(--text-muted);
+  max-width: 90ch;
+}
+
+.card__body:not(.card__body--flush) > .security-intro {
+  padding: 0;
+}
+
+.security-filter-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--text);
+}
+
+/* ---------------------------------------------------------------------------------- fingerprint tabs */
+.fp-tabs__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+  padding: var(--sp-3) var(--sp-4) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.fp-tabs__tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 36px;
+  margin-bottom: -1px;
+  padding: 0 var(--sp-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+}
+
+.fp-tabs__tab:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.fp-tabs__tab[aria-selected="true"] {
+  border-color: var(--border);
+  border-bottom-color: var(--surface-1);
+  background: var(--surface-1);
+  color: var(--text);
+}
+
+.fp-tabs__tab:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.fp-tabs__intro {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4) 0;
+  color: var(--text-muted);
+  max-width: 90ch;
+}
+
+/* ---------------------------------------------------------------------------------- the header drawer */
+.fp-drawer__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.fp-drawer__section {
+  display: grid;
+  gap: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.fp-drawer__heading {
+  font-size: var(--fs-3);
+}
+
+.fp-values {
+  table-layout: fixed;
+}
+
+.fp-values td,
+.fp-values th {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+.fp-values th:first-child {
+  width: 60%;
+}
+
+.fp-action .dialog__consequences {
+  margin: 0;
+}
+
+.fp-danger > summary {
+  font-size: var(--fs-2);
+}
+
+.fp-danger[open] > form {
+  margin-top: var(--sp-2);
+}
+
+/* ---------------------------------------------------------------------------------- account tables */
+.security-list {
+  margin-top: var(--sp-3);
+}
+
+.security-table td {
+  vertical-align: middle;
+}
+
+.security-table td:first-child {
+  white-space: normal;
+  min-width: 14rem;
+  max-width: 28rem;
+}
+
+.security-table .badge {
+  margin-left: var(--sp-1);
+}
+
+.security-table__actions {
+  text-align: right;
+}
+
+.security-table tr.is-current {
+  background: var(--surface-2);
+}
+
+.admin-access__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: baseline;
+}
+
+.admin-access__facts dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* ---------------------------------------------------------------------------------- passkeys */
+.passkey-list {
+  display: grid;
+  gap: var(--sp-3);
+  margin: var(--sp-3) 0;
+  padding: 0;
+  list-style: none;
+}
+
+.passkey {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.passkey__head {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+.passkey__name {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  font-weight: var(--fw-semibold);
+  overflow-wrap: anywhere;
+}
+
+.passkey__meta {
+  margin: var(--sp-1) 0 0;
+  font-size: var(--fs-1);
+}
+
+.passkey__rename {
+  flex: 1 1 100%;
+  margin-top: 0;
+}
+
+.passkey__form {
+  align-items: flex-end;
+  margin-top: var(--sp-2);
+}
+
+.passkey__form .field {
+  flex: 1 1 14rem;
+}
+
+.passkey-add {
+  max-width: 28rem;
+}
+
+.passkey-add__status:empty {
+  display: none;
+}
+
+/* ---------------------------------------------------------------------------------- recovery codes */
+.recovery__count {
+  margin: 0;
+  font-size: var(--fs-3);
+}
+
+.recovery__number {
+  font-size: var(--fs-5);
+  font-weight: var(--fw-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.recovery-new {
+  padding: var(--sp-3);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.recovery-new__title {
+  font-size: var(--fs-3);
+}
+
+.recovery-new__list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+  gap: var(--sp-1) var(--sp-4);
+  margin: 0;
+  padding-left: var(--sp-6);
+  font-size: var(--fs-3);
+}
+
+/* ---------------------------------------------------------------------------------- phones (plan 14.8) */
+@media (max-width: 640px) {
+  .security-table,
+  .security-table tbody,
+  .security-table tr,
+  .security-table td {
+    display: block;
+  }
+
+  .security-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .security-table tr {
+    padding: var(--sp-2) var(--sp-3);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .security-table td,
+  .security-table td:first-child {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: var(--sp-2);
+    min-width: 0;
+    max-width: none;
+    padding: 2px 0;
+    border: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .security-table td::before {
+    content: attr(data-label);
+    color: var(--text-muted);
+    font-weight: var(--fw-semibold);
+  }
+
+  .security-table td.security-table__actions {
+    justify-content: flex-end;
+  }
+
+  .security-table td.security-table__actions::before {
+    content: none;
+  }
+
+  .fp-drawer__facts,
+  .admin-access__facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .fp-tabs__tab {
+    flex: 1 1 40%;
+    justify-content: center;
+  }
+}
+
+@media (pointer: coarse) {
+  .fp-tabs__tab,
+  .security-table .btn,
+  .passkey .btn {
+    min-height: 44px;
+  }
+}

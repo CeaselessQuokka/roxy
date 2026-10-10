@@ -1,0 +1,15 @@
+{#-
+  Upstream page, card `latency` (`roxy/admin/pages/upstream.py latency_card`): latency percentiles of requests that
+  went to Roblox, and the p95 queue wait (the time spent waiting for a bucket slot). The series answer of
+  `GET /admin/api/v1/upstream/latency` is embedded; the help comes from the metric catalog.
+  Context: `frame`, `series`, `help`, `basis`.
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/chart.html" import series_chart %}
+{% call page_card(frame, subtitle=basis) %}
+{{ series_chart("chart-upstream-latency", "Latency of calls to Roblox", series=series, kind="line", y_format="ms",
+                summary="p50, p95 and p99 latency and the p95 queue wait of requests that went to Roblox, per time bucket.",
+                help=help, size="md", empty_text="No request went to Roblox in this range, so there is no latency to show.") }}
+{% endcall %}
+{% endif %}

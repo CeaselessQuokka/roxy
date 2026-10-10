@@ -1,0 +1,36 @@
+{#-
+  Traffic page, card `latency` (`roxy/admin/pages/traffic.py latency_card`; plan 14.1 row 23, v1 "Proxy
+  Timings", parity rows 70 and 131).
+
+  p50, p95 and p99 over time (with the p95 queue wait), or the p95 split by verb, outcome, egress or host: v1's
+  "Split successes / failures" toggle is the outcome split. The split also drives the table under the chart
+  (`traffic_latency_split`, the API's table: requests, p50, p95, p99, queue wait and failures per group; it pages
+  and exports through `GET /admin/api/v1/traffic/latency/split`). The reset button empties only the latency
+  histograms (the `latency` family; request counts stay). A table request (`part` "table") gets the table alone.
+  Context: `frame`, `part`, `table`, and for the card `series`, `split`, `splits`, `by_word`, `reset_href`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/table.html" import data_table %}
+{% from "components/icon.html" import icon %}
+{% if part == "table" %}
+{{ data_table(**table) }}
+{% else %}
+{% set actions %}
+<button type="button" class="btn btn--sm btn--ghost" data-drawer-src="{{ reset_href }}" data-drawer-title="Reset the latency numbers" data-action="latency-reset">{{ icon("reset") }}<span>Reset</span></button>
+{% endset %}
+{% call page_card(frame, actions=actions) %}
+<form class="card-controls" hx-get="{{ frame.fragment_url }}" hx-target="#{{ frame.id }}" hx-swap="outerHTML" hx-trigger="change">
+  <label class="chip-select">
+    <span class="chip-select__label">Split</span>
+    <select id="traffic-latency-split" name="split" aria-label="Split the latency chart">
+      {% for value, text in splits %}<option value="{{ value }}"{% if value == split %} selected{% endif %}>{{ text }}</option>{% endfor %}
+    </select>
+  </label>
+</form>
+{{ series_chart("traffic-latency-chart", "Latency percentiles" if split == "none" else "p95 latency by " ~ by_word, series=series, summary=("Latency percentiles of caller requests over the range." if split == "none" else "The p95 latency of each " ~ by_word ~ " over the range."), size="md", kind="line", y_format="ms", empty_text="No timed requests in this range yet.") }}
+<div class="traffic-dt">
+{{ data_table(**table) }}
+</div>
+{% endcall %}
+{% endif %}

@@ -1,0 +1,19 @@
+{#-
+  Protection page, card `challenge` (`roxy/admin/pages/protection.py challenge_card`): the browser challenge
+  (plan 10.8).
+
+  What: whether the challenge is on and can work here, what it does, and what it refused in the range (`GET
+  /protection/bot`, its `challenge` part); its settings sit below.
+  Context: `frame`, `challenge`, `refused`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/glossary.html" import term with context %}
+{% set s = challenge.settings or {} %}
+{% call page_card(frame) %}
+<p>{% if s.challenge_enabled %}{{ status_badge("ok", "On") }}{% else %}{{ status_badge("neutral", "Off") }}{% endif %} The {{ term("challenge", "challenge") }} is a small proof-of-work page for browsers only (Roblox game servers cannot solve it): a browser client whose bot score reaches {{ num(s.challenge_trigger_score) }} must solve it once, then a signed cookie lets it through for {{ num(s.challenge_cookie_minutes) }} minutes. It is a tool against browser-based scraping, off by default.</p>
+<p>{{ num(refused) }} requests were answered with the challenge in this range.</p>
+{% if not challenge.available %}{{ inline_alert("warn", "The challenge cannot work here", "Puzzles cannot be signed: " ~ (challenge.unavailable_reason or "the signing key is missing") ~ ".") }}{% endif %}
+{% endcall %}

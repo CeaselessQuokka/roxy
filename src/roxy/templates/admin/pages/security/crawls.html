@@ -1,0 +1,9 @@
+{#-
+  Security page, card `crawls` (`roxy/admin/pages/security.py crawls_card`): robots.txt and sitemap fetches in the
+  range by client address (v1 "Crawler Activity", plan 14.1 row 25). Context: `frame`, `table`, `part`,
+  `reset_href`, `range`.
+-#}
+{% from "admin/pages/security/_macros.html" import table_card, reset_action %}
+{% call table_card(frame, table, part, subtitle=range.description, actions=reset_action(reset_href, "crawl records")) %}
+<p class="security-intro">Well-behaved crawlers (search engines) read robots.txt first; an address that fetches it often is a crawler checking back.</p>
+{% endcall %}

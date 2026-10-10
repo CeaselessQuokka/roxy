@@ -1,0 +1,45 @@
+{#-
+  Data page, card `vacuum` (`roxy/admin/pages/data.py vacuum_card`): each database's size, the space a full VACUUM
+  would give back and an estimate of how long it takes (`GET /admin/api/v1/data/vacuum`, plan 6.5: never
+  automatic). A database that may be vacuumed has a button opening a typed confirmation (`vacuum <database>`, which
+  `POST /data/vacuum` checks again); hot.db never may (it would stall every proxied request). The result (the bytes
+  given back) is shown by static/js/pages/data.js. Context: `frame`, `databases`, `url`, `human_bytes`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/icon.html" import icon %}
+{% from "admin/pages/data/_macros.html" import typed_dialog %}
+{% call page_card(frame, flush=True) %}
+<p class="data-intro">SQLite keeps deleted pages for reuse; the retention job already gives most of them back. A full VACUUM rewrites the whole file to return the rest, and writes to that database wait while it runs.</p>
+<div class="table-scroll data-vacuum" role="region" aria-labelledby="vacuum-title" tabindex="0">
+  <table class="simple-table data-table">
+    <caption class="sr-only">Databases, their size and what a VACUUM would give back</caption>
+    <thead><tr><th scope="col">Database</th><th scope="col" class="num">Size</th><th scope="col" class="num">Reclaimable</th><th scope="col">Takes about</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+    <tbody>
+      {% for d in databases %}
+      <tr>
+        <td data-label="Database" class="mono">{{ d.db }}.db</td>
+        <td data-label="Size" class="num">{{ human_bytes(d.bytes) }}{% if d.wal_bytes %}<span class="dt__sub">+ {{ human_bytes(d.wal_bytes) }} WAL</span>{% endif %}</td>
+        <td data-label="Reclaimable" class="num">{{ human_bytes(d.free_bytes) }}</td>
+        <td data-label="Takes about">{{ "%.1f"|format(d.estimated_s) }} s</td>
+        <td data-label="Actions" class="data-table__actions">
+          {% if d.allowed and d.enough_disk %}
+          <button type="button" class="btn btn--sm" data-dialog-open="dlg-vacuum-{{ d.db }}" data-action="vacuum-{{ d.db }}">Vacuum<span class="sr-only"> {{ d.db }}.db</span></button>
+          {% elif d.allowed %}{{ status_badge("warn", "Not enough free disk") }}
+          {% else %}<span class="muted">{{ d.note }}</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<div class="data-op-result" data-op-result="vacuum" role="status" aria-live="polite"></div>
+{% for d in databases if d.allowed and d.enough_disk %}
+{{ typed_dialog("dlg-vacuum-" ~ d.db, "Vacuum " ~ d.db ~ ".db?", url, d.confirm_phrase, hidden={"database": d.db},
+                confirm_label="Vacuum " ~ d.db ~ ".db", success="VACUUM started.", refresh="vacuum",
+                consequences=["Rewrites the whole file to give back about " ~ human_bytes(d.free_bytes) ~ "; it takes about " ~ "%.1f"|format(d.estimated_s) ~ " seconds.",
+                              d.note,
+                              "It needs free disk space of about twice the file while it runs."]) }}
+{% endfor %}
+{% endcall %}

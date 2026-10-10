@@ -1,0 +1,43 @@
+{#-
+  Traffic page, card `bytes` (`roxy/admin/pages/traffic.py bytes_card`; plan 14.3 byte definitions).
+
+  Bytes over time (callers in and out, Roblox in and out, served from the cache), then the range totals and the
+  wire bytes per egress path (TLS and the rotator's CONNECT included, as the egress meter counts them). Labels and
+  help come from the metric catalog (`metrics/catalog.py`), the one source of every number's words.
+  Context: `frame`, `answer` (the `GET /traffic/bytes` answer), `totals`, `by_egress`, `empty`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/format.html" import bytes as fmt_bytes %}
+{% from "components/badges.html" import help_dot %}
+{% call page_card(frame) %}
+<div class="traffic-beside">
+{{ series_chart("traffic-bytes-chart", "Bytes over time", series=answer, summary="Bytes between callers and Roxy and between Roxy and Roblox in this range.", size="md", kind="line", y_format="bytes", empty_text="No bytes recorded in this range yet.") }}
+<div class="traffic-split">
+  <div class="table-scroll" role="region" aria-labelledby="traffic-bytes-totals" tabindex="0">
+    <table class="simple-table traffic-table">
+      <caption id="traffic-bytes-totals" class="traffic-table__caption">Totals in this range</caption>
+      <thead><tr><th scope="col">What</th><th scope="col" class="num">Bytes</th></tr></thead>
+      <tbody>
+        {% for row in totals %}
+        <tr><th scope="row">{{ row.label }}{{ help_dot(row.label, row.help) }}</th><td class="num">{{ fmt_bytes(row.value) }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="table-scroll" role="region" aria-labelledby="traffic-bytes-egress" tabindex="0">
+    <table class="simple-table traffic-table">
+      <caption id="traffic-bytes-egress" class="traffic-table__caption">On the wire, per egress path</caption>
+      <thead><tr><th scope="col">Egress</th><th scope="col" class="num">Bytes</th></tr></thead>
+      <tbody>
+        {% for row in by_egress %}
+        <tr><th scope="row">{{ row.label }}</th><td class="num">{{ fmt_bytes(row.value) }}</td></tr>
+        {% else %}
+        <tr><td colspan="2" class="muted">No calls to Roblox in this range.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+</div>
+{% endcall %}

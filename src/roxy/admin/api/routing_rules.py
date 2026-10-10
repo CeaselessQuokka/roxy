@@ -126,7 +126,11 @@ def normalize_target(raw: str) -> str:
 
 def rules_service(request: Request) -> RulesService:
     """The audited rules service bound to this worker's control.db, clock and rules store."""
-    ctx = get_ctx(request)
+    return service_for(get_ctx(request))
+
+
+def service_for(ctx: Any) -> RulesService:
+    """`rules_service` for a worker context (the dashboard pages read the rule tables through it too)."""
     return RulesService(ctx.dbs.control, clock=ctx.clock, store=ctx.rules)
 
 
@@ -196,13 +200,25 @@ async def list_rules(
     fmt: ExportFormatDep,
 ) -> Any:
     """Every routing rule (at most 200, plan 15.4), paged and sorted on the server."""
-    with common.service_errors():
-        rows = [item_of(row) for row in await rules_service(request).list_rows(TABLE)]
-    keys = ("pattern", "mode", "note", "created_by")
+    rows = await rule_rows(get_ctx(request))
     if fmt is not None:
-        items, total = all_rows(rows, tq, search_keys=keys)
+        items, total = all_rows(rows, tq, search_keys=SEARCH_KEYS)
         return await common.export_table(request, admin, SPEC, items, fmt, total=total, tq=tq)
-    items, total = common.page_rows(rows, tq, search_keys=keys)
+    return rules_answer(rows, tq)
+
+
+SEARCH_KEYS: Final = ("pattern", "mode", "note", "created_by")
+
+
+async def rule_rows(ctx: Any) -> list[dict[str, Any]]:
+    """Every routing rule as the API shows it (the Upstream page's Routing card lists them too)."""
+    with common.service_errors():
+        return [item_of(row) for row in await service_for(ctx).list_rows(TABLE)]
+
+
+def rules_answer(rows: list[dict[str, Any]], tq: TableQuery) -> dict[str, Any]:
+    """One page of `rule_rows` as the `GET /routing-rules` table answer."""
+    items, total = common.page_rows(rows, tq, search_keys=SEARCH_KEYS)
     return common.table_answer(SPEC, tq, items, total) | {"modes": list(MODES)}
 
 
@@ -225,8 +241,13 @@ async def check_target(
     target: Annotated[str, Query(min_length=1, max_length=MAX_TARGET_CHARS)],
 ) -> dict[str, Any]:
     """Which routing rule decides `target` (host/path) right now, from this worker's live rules snapshot."""
+    return target_answer(get_ctx(request), target)
+
+
+def target_answer(ctx: Any, target: str) -> dict[str, Any]:
+    """The answer of `GET /routing-rules/test` (422 for a target without a host; the page's tester shows it)."""
     clean = normalize_target(target)
-    snapshot = get_ctx(request).rules.snapshot
+    snapshot = ctx.rules.snapshot
     with regex_budget(fresh=True):  # the admin's own budget, as a proxied request would have (plan 9.9)
         row = snapshot.routing_rule_for(clean)
     item = item_of(row.model_dump()) if row is not None else None
@@ -285,5 +306,9 @@ __all__ = [
     "normalize_target",
     "router",
     "rule_flag",
+    "rule_rows",
+    "rules_answer",
     "rules_service",
+    "service_for",
+    "target_answer",
 ]

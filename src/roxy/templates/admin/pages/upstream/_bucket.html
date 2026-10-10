@@ -1,0 +1,82 @@
+{#-
+  Upstream page, the bucket drawer (`GET /admin/upstream/bucket?key=`, `roxy/admin/pages/upstream.py bucket_drawer`).
+
+  One bucket: its fill now (gauge), its rate and where the rate comes from, its history over the page's range (the
+  `GET /admin/api/v1/upstream/buckets/history` answer, embedded in the chart), and for a host or endpoint bucket the
+  override form: PATCH `/admin/api/v1/upstream-limits/<key>` when an override exists (and a delete dialog), else POST
+  a new one. The key is caller text; in the form URL it is one percent-encoded path segment (`quoted_key`).
+  Context: `key`, `describe`, `row`, `history`, `gauge`, `overridable`, `override`, `settings_keys`, `patch_url`,
+  `create_url`, `fill_help`, `error`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/format.html" import caller_text %}
+{% from "admin/pages/upstream/_macros.html" import gauge as gauge_view %}
+{% if error %}
+<div data-card-error>{{ inline_alert("bad", "This bucket could not be loaded", error) }}</div>
+{% else %}
+<div class="stack g3-drawer" data-bucket-drawer>
+  <p class="g3-drawer__lead">{{ caller_text(key, 300) }}</p>
+  <dl class="kv">
+    <dt>Kind</dt><dd>{{ describe.kind }}</dd>
+    <dt>Applies to</dt><dd>{{ caller_text(describe.target, 300) }}</dd>
+    {% if row %}
+    <dt>Rate</dt><dd>{{ row.per_min if row.per_min is not none else "n/a" }} a minute, burst {{ row.burst if row.burst is not none else "n/a" }}</dd>
+    <dt>Rate from</dt><dd>{{ row.origin or "setting" }}</dd>
+    <dt>In this range</dt><dd>{{ row.attempts }} reservations, {{ row.rejections }} refused</dd>
+    {% endif %}
+  </dl>
+  {{ gauge_view(gauge, "drawer-bucket-gauge") }}
+  {{ series_chart("chart-bucket-history", "This bucket over time", series=history, kind="line", y_format="count",
+                  summary="Reservations, refusals and the peak fill of this bucket per time bucket.", help=fill_help, size="sm",
+                  empty_text="This bucket has no history in this range.") }}
+  {% if overridable %}
+  <section class="g3-section" aria-labelledby="bucket-override-title">
+    <h3 class="g3-subhead" id="bucket-override-title">{{ "Change its override" if override else "Give it its own rate" }}</h3>
+    <form class="stack g3-form" data-api-form data-api-url="{{ patch_url if override else create_url }}" data-api-method="{{ 'PATCH' if override else 'POST' }}"
+          data-success="Saved. Every worker uses the new rate within a second." data-on-success="refresh" data-refresh="buckets" data-close-drawer novalidate>
+      {% if not override %}<input type="hidden" name="bucket_key" value="{{ key }}" data-json="string">{% endif %}
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="bucket-rate">Rate <span class="muted">(calls a minute)</span></label>
+          <input class="input input--num" type="text" inputmode="decimal" id="bucket-rate" name="per_min" required data-json="float"
+                 value="{{ override.per_min if override else (row.per_min if row and row.per_min is not none else '') }}" aria-describedby="bucket-rate-error">
+          <p class="field__error" id="bucket-rate-error" data-field-error="per_min" hidden></p>
+        </div>
+        <div class="field">
+          <label class="field__label" for="bucket-burst">Burst</label>
+          <input class="input input--num" type="text" inputmode="numeric" id="bucket-burst" name="burst" required data-json="int"
+                 value="{{ override.burst if override else (row.burst if row and row.burst is not none else '') }}" aria-describedby="bucket-burst-error">
+          <p class="field__error" id="bucket-burst-error" data-field-error="burst" hidden></p>
+        </div>
+      </div>
+      <div class="field">
+        <label class="field__label" for="bucket-note">Note <span class="muted">(optional)</span></label>
+        <input class="input" type="text" id="bucket-note" name="note" maxlength="500" autocomplete="off" value="{{ override.note if override else '' }}">
+      </div>
+      <div class="field">
+        <label class="field__label" for="bucket-reason">Reason <span class="muted">(optional, saved in the audit log)</span></label>
+        <input class="input" type="text" id="bucket-reason" name="reason" maxlength="500" autocomplete="off">
+      </div>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      <div class="cluster">
+        <button type="submit" class="btn btn--primary" data-action="upstream-limit-save">{{ icon("check") }}<span>Save the rate</span></button>
+        {% if override %}<button type="button" class="btn btn--ghost" data-dialog-open="dlg-bucket-limit-delete">{{ icon("reset") }}<span>Back to the default rate</span></button>{% endif %}
+      </div>
+    </form>
+    {% if override %}
+    {{ confirm_dialog("dlg-bucket-limit-delete", "Remove this rate override?", action=patch_url, method="delete", api=True, danger=True,
+                      confirm_label="Remove the override",
+                      consequences=["The bucket goes back to the default rate of its kind on every worker within a second.",
+                                    "If the adaptive controller set this rate after a Roblox 429, Roblox may refuse again until it learns the limit anew.",
+                                    "The removal is written to the audit log."],
+                      reason=True, success="Override removed.", on_success="refresh", refresh="buckets") }}
+    {% endif %}
+  </section>
+  {% elif settings_keys %}
+  <p class="muted">This bucket's rate comes from the settings <code>{{ settings_keys[0] }}</code> and <code>{{ settings_keys[1] }}</code>; change them under "Settings for this card" on the Buckets card.</p>
+  {% endif %}
+</div>
+{% endif %}

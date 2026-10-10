@@ -1,0 +1,79 @@
+{#-
+  The Data page (`roxy/admin/pages/data.py`): storage, retention, record caps, resets, backups, VACUUM and exports.
+
+  What: the layout of the page's seven cards (each rendered by its own template in admin/pages/data/, the same HTML
+  its fragment route answers) and the two page-level dialogs: "Back up now" (opened from the header and the
+  backups card) and the reset confirmation (filled by static/js/pages/data.js from the preview the API answered).
+  Why: the dialogs live outside the cards, so a card that refreshes after an action never removes a dialog that is
+  open or about to open. Storage comes first (what an owner looks for), the actions follow, and the cards that
+  measure every database (VACUUM, retention, record caps) come last and together, loading as they come into view.
+  How: extends admin/_page.html; `how_to_read` explains snapshots, chart markers and export privacy in plain words.
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/glossary.html" import term with context %}
+
+{% block page_actions %}
+<button type="button" class="btn" data-dialog-open="dlg-backup" data-action="backup-now">{{ icon("download") }}<span>Back up now</span></button>
+<a class="btn btn--ghost" href="#resets">{{ icon("reset") }}<span>Reset statistics</span></a>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>Sizes are measured from the database files themselves; the 30 day projection uses the rows added over the last week, bounded by each table's age and row limits. The measured growth comes from samples the leader takes every hour, so it shows what really happened, not an estimate.</p>
+<p>Before a reset deletes rows, Roxy copies the affected database into a snapshot (kept for the days and within the space the retention settings allow), writes the exact rows per table to the {{ term("audit-log", "audit log") }}, and leaves a {{ term("annotation", "marker") }} on every chart covering that time, so a number that dropped never looks like real traffic going away.</p>
+<p>Back up now asks the server's nightly backup to run at once (it compresses, checks and can copy the backup off the server) and also keeps a copy here when one fits. Exports leave Roxy: client addresses in them are replaced by keyed hashes unless you turn on including them below, and every download is written to the audit log first.</p>
+{% endblock %}
+
+{% block cards %}
+{#- The cards that measure databases load as they come into view (lazy): storage at the top (in view at once), and
+    VACUUM, retention and record caps together at the end, after the cheap cards. -#}
+{{ cards["storage"] }}
+{{ cards["resets"] }}
+{{ cards["backups"] }}
+{{ cards["exports"] }}
+{{ cards["vacuum"] }}
+{{ cards["retention"] }}
+{{ cards["record-caps"] }}
+
+{{ confirm_dialog("dlg-backup", "Back up now?", action="/admin/api/v1/data/backups", api=True, reason=True,
+                  confirm_label="Back up now",
+                  consequences=["Asks the server's nightly backup to run now; it skips a request within 10 minutes of its last good backup.",
+                                "Also copies control.db and metrics.db into the snapshots folder here when they fit; Back up now's own oldest copies make room first.",
+                                "Nothing is deleted from the databases, and the proxy keeps serving."],
+                  success="Back up now started. The backups card shows what was asked and copied.", on_success="refresh", refresh="backups") }}
+
+<dialog class="dialog dialog--danger" id="dlg-reset-run" aria-labelledby="dlg-reset-run-title" aria-describedby="dlg-reset-run-desc">
+  <form class="dialog__form" data-reset-run novalidate>
+    <header class="dialog__head">
+      <h2 class="dialog__title" id="dlg-reset-run-title">{{ icon("alert-triangle", cls="dialog__title-icon") }}<span data-reset-run-title>Run this reset?</span></h2>
+      <button type="button" class="icon-btn" data-dialog-close aria-label="Close">{{ icon("x") }}</button>
+    </header>
+    <div class="dialog__body">
+      <div id="dlg-reset-run-desc">
+        <p data-reset-run-summary></p>
+        <p class="dialog__label">What happens</p>
+        <ul class="dialog__consequences" data-reset-run-consequences></ul>
+      </div>
+      <div class="field">
+        <label class="field__label" for="dlg-reset-run-reason">Reason <span class="muted" data-reset-run-reason-hint>(saved in the audit log)</span></label>
+        <textarea class="input" id="dlg-reset-run-reason" name="reason" rows="2" maxlength="500" aria-describedby="dlg-reset-run-reason-error"></textarea>
+        <p class="field__error" id="dlg-reset-run-reason-error" data-run-error="reason" hidden></p>
+      </div>
+      <div class="field" data-reset-run-phrase hidden>
+        <label class="field__label" for="dlg-reset-run-confirm">Type <strong class="mono" data-reset-run-phrase-text></strong> to confirm</label>
+        <input class="input mono" id="dlg-reset-run-confirm" name="confirm" autocomplete="off" spellcheck="false" autocapitalize="off"
+               aria-describedby="dlg-reset-run-confirm-hint dlg-reset-run-confirm-error">
+        <p class="field__hint" id="dlg-reset-run-confirm-hint">This deletes data for good (only a snapshot can bring it back), so the button stays off until the text matches.</p>
+        <p class="field__error" id="dlg-reset-run-confirm-error" data-run-error="confirm" hidden></p>
+      </div>
+      <p class="dialog__error" data-reset-run-error role="alert" hidden></p>
+    </div>
+    <footer class="dialog__foot">
+      <button type="button" class="btn btn--ghost" data-dialog-close>Cancel</button>
+      <button type="submit" class="btn btn--danger" data-action="reset-run" data-reset-run-submit>Reset</button>
+    </footer>
+  </form>
+</dialog>
+{% endblock %}

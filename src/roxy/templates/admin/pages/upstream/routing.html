@@ -1,0 +1,75 @@
+{#-
+  Upstream page, card `routing` (`roxy/admin/pages/upstream.py routing_card`): which egress each call takes.
+
+  First the plan 7.2 decision in plain words with the live setting values (the settings themselves are edited in
+  the card's settings block below). Then the routing rules table (`GET /admin/api/v1/routing-rules`; a row opens
+  the rule in the drawer with its edit form and delete dialog), the add form (`POST /admin/api/v1/routing-rules`)
+  and the tester, which asks `/admin/upstream/routing-test` (the API's own `target_answer`) and shows the answer
+  under the form. Patterns and notes are caller text.
+  Context: `frame`, `table`, `modes`, `create_url`, `summary`.
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/icon.html" import icon %}
+{% call page_card(frame) %}
+<ol class="g3-steps">
+  <li>An endpoint in the credential allowlist uses the credential (GET and HEAD only, never through the rotator).</li>
+  <li>A routing rule below may pin an endpoint to an egress, within what is available.</li>
+  <li>Otherwise direct and the rotator are drawn by weight: direct {{ summary.direct_weight }}, rotator {{ summary.rotator_weight }}
+      (direct is {{ "on" if summary.direct_enabled else "off" }}, the rotator is {{ "on" if summary.rotator_enabled else "off" }}).
+      Above {{ summary.shift_pct }} percent direct bucket fill, weight shifts toward the rotator when it is on.</li>
+  <li>Each request makes at most {{ summary.attempts }} attempts (5xx and timeouts only). A Roblox 429 is {{ "retried once on another anonymous egress" if summary.fallback_on_429 else "never retried" }}.</li>
+</ol>
+<div class="g3-table-host" hx-select="#{{ table.id }}">{{ data_table(**table) }}</div>
+<div class="grid grid--2 g3-tools">
+  <details class="details-plain g3-add">
+    <summary>{{ icon("plus") }}<span>Add a routing rule</span></summary>
+    <form class="stack g3-form" data-api-form data-api-url="{{ create_url }}" data-api-method="POST"
+          data-success="Routing rule added. Every worker follows it within a second." data-on-success="refresh" data-refresh="routing" novalidate>
+      <div class="field">
+        <label class="field__label" for="routing-new-pattern">Endpoint pattern</label>
+        <input class="input mono" type="text" id="routing-new-pattern" name="pattern" required maxlength="2048" autocomplete="off" spellcheck="false"
+               placeholder="games.roblox.com/v1/games/*" data-json="string" aria-describedby="routing-new-pattern-error">
+        <p class="field__error" id="routing-new-pattern-error" data-field-error="pattern" hidden></p>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="routing-new-type">Pattern type</label>
+          <select class="input" id="routing-new-type" name="type" data-json="string">
+            <option value="glob" selected>Glob (* and ?)</option>
+            <option value="regex">Regular expression</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="field__label" for="routing-new-mode">Egress</label>
+          <select class="input" id="routing-new-mode" name="mode" data-json="string" aria-describedby="routing-new-mode-error">
+            {% for value, label in modes %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+          </select>
+          <p class="field__error" id="routing-new-mode-error" data-field-error="mode" hidden></p>
+        </div>
+      </div>
+      <div class="field">
+        <label class="field__label" for="routing-new-note">Note <span class="muted">(optional)</span></label>
+        <input class="input" type="text" id="routing-new-note" name="note" maxlength="500" autocomplete="off">
+      </div>
+      <label class="check"><input type="checkbox" name="enabled" value="1" checked data-json="bool"><span>In force at once</span></label>
+      <div class="field">
+        <label class="field__label" for="routing-new-reason">Reason <span class="muted">(optional, saved in the audit log)</span></label>
+        <input class="input" type="text" id="routing-new-reason" name="reason" maxlength="500" autocomplete="off">
+      </div>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      <div class="cluster"><button type="submit" class="btn btn--primary" data-action="routing-rule-add">{{ icon("plus") }}<span>Add rule</span></button></div>
+    </form>
+  </details>
+  <form class="stack g3-form g3-tester" role="search" aria-label="Test which routing rule decides a path" hx-get="/admin/upstream/routing-test" hx-target="#routing-test-result" hx-swap="innerHTML">
+    <div class="field">
+      <label class="field__label" for="routing-test-target">Test a path <span class="muted">(host and path, no query)</span></label>
+      <input class="input mono" type="text" id="routing-test-target" name="target" required maxlength="2048" autocomplete="off" spellcheck="false" placeholder="games.roblox.com/v1/games">
+    </div>
+    <div class="cluster"><button type="submit" class="btn" data-action="routing-test">{{ icon("search") }}<span>Which rule decides it?</span></button></div>
+    <div id="routing-test-result" class="g3-tester__result" aria-live="polite"></div>
+  </form>
+</div>
+{% endcall %}
+{% endif %}

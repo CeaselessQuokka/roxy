@@ -28,11 +28,17 @@
 
 import "roxy/htmx_setup";
 import Alpine from "vendor/alpine";
+import { initApiForms } from "roxy/api_forms";
+import { initCards } from "roxy/cards";
 import { registerComponents } from "roxy/components";
 import { hasUnsavedChanges, initOverlayLayer, qs, qsa, store } from "roxy/dom";
 import { initDialogs, initMenus } from "roxy/dialog";
+import { initExports } from "roxy/exports";
 import { initPalette } from "roxy/palette";
+import { initReauth } from "roxy/reauth";
 import { initSession } from "roxy/session";
+import { initSettingsApi } from "roxy/settings_api";
+import { initShellStatus } from "roxy/shell";
 import { initStream } from "roxy/sse";
 import { initTableEvents, initTables } from "roxy/tables";
 import { initTheme } from "roxy/theme";
@@ -96,8 +102,8 @@ function initRangeForm() {
     for (const name of ["range", "compare", "from", "to"]) url.searchParams.delete(name);
     const range = data.get("range") || "24h";
     url.searchParams.set("range", range);
-    const compare = data.get("compare") || "off";
-    if (compare !== "off") url.searchParams.set("compare", compare);
+    const compare = data.get("compare") || "none";
+    if (compare !== "none") url.searchParams.set("compare", compare);
     if (range === "custom") {
       if (data.get("from")) url.searchParams.set("from", data.get("from"));
       if (data.get("to")) url.searchParams.set("to", data.get("to"));
@@ -144,6 +150,12 @@ initRemember();
 initCopy();
 initRangeForm();
 initLeaveGuard();
+initReauth();
+initApiForms();
+initSettingsApi();
+initExports();
+initCards();
+initShellStatus();
 initStream();
 enhance(document.body);
 

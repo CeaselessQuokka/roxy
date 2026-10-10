@@ -1,0 +1,49 @@
+{#-
+  Upstream page, card `cooldowns` (`roxy/admin/pages/upstream.py cooldowns_card`): what is cooling down now.
+
+  Every open cooldown (`GET /admin/api/v1/upstream/cooldowns`): what it covers (an endpoint, a host, an egress, the
+  credential; templates are caller text), which egress, why (`source`: Roblox's Retry-After, the default, the
+  x-ratelimit headers, a host escalation), a countdown, and how many 429s fed it. Cooldowns this worker could not
+  share during a hot.db outage are listed apart. The reset button opens the page's one confirm dialog
+  (`#dlg-upstream-reset`, POST /admin/api/v1/upstream/reset, reason required, audited). The card refreshes itself on
+  the stream's `cooldown` events.
+  Context: `frame`, `items`, `local`, `local_note`.
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/format.html" import caller_text, num %}
+{% from "admin/pages/upstream/_macros.html" import countdown, when %}
+{% set reset_button %}<button type="button" class="btn btn--sm btn--warn-soft" data-dialog-open="dlg-upstream-reset" data-action="upstream-reset">{{ icon("reset") }}<span>Clear cooldowns and breakers</span></button>{% endset %}
+{% call page_card(frame, actions=reset_button, subtitle=num(items|length) ~ " open now") %}
+{% if items %}
+<div class="table-scroll g3-scroll" role="region" aria-labelledby="cooldowns-caption" tabindex="0">
+  <table class="simple-table g3-table g3-table--wrap">
+    <caption id="cooldowns-caption" class="sr-only">Open cooldowns</caption>
+    <thead><tr><th scope="col">Paused</th><th scope="col">Egress</th><th scope="col">Why</th><th scope="col">Ends</th><th scope="col" class="num">429s</th></tr></thead>
+    <tbody>
+      {% for c in items %}
+      <tr>
+        <td><span class="muted">{{ c.kind }}</span> {{ caller_text(c.target, 160) }}</td>
+        <td>{{ c.egress_label }}</td>
+        <td>{{ c.source_words }}</td>
+        <td>{{ countdown(c.countdown) }}</td>
+        <td class="num">{{ num(c.hits) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state("No cooldowns are open", "Roblox has not asked Roxy to slow down recently. A 429 opens a cooldown for its endpoint (or its host, when several endpoints of one host are refused); while it lasts Roxy answers from the cache or with Retry-After instead of calling Roblox.", tone="good") }}
+{% endif %}
+{% if local %}
+<h3 class="g3-subhead">Held by this worker only</h3>
+<p class="muted">{{ local_note }}</p>
+<ul class="g3-list">
+  {% for c in local %}<li>{{ caller_text(c.target, 160) }} ({{ c.source_words }}): {{ countdown(c.countdown) }}</li>{% endfor %}
+</ul>
+{% endif %}
+{% endcall %}
+{% endif %}

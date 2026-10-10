@@ -1,0 +1,84 @@
+{#-
+  Protection page, card `request-filters` (`roxy/admin/pages/protection.py request_filters_card`): v1 "Request
+  Filters (Header Blocking)" with its tester and presets (rows 15, 45, 112) and v1 "Header-Blocked Attempts"
+  (row 18).
+
+  What: three tabs. Filters: the header rules in evaluation order (`GET /protection/header-rules`) with their hits;
+  "Add a filter" (`POST /header-rules`; the same filter twice is refused, row 112); a row opens the filter in the
+  drawer. Tester: paste headers (or load a recent request's, or v1's example lines; `GET /header-rules/presets`),
+  optionally a draft filter, and see which filter would refuse them (`POST /header-rules/test`, run by
+  static/js/pages/protection.js). Attempts: the paths a filter refused in the range, by how many clients, and which
+  filter refused them (`GET /header-rules/attempts`, the "Refused by" column).
+  Context: `frame`, `tables`, `only`, `presets`, `api`; for the drawer `detail`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, reason_field %}
+{% from "admin/pages/protection/_rule_fields.html" import header_fields %}
+{% if detail %}{% include "admin/pages/protection/_rule_drawer.html" %}
+{% elif only %}{{ data_table(**tables[only]) }}{% else %}
+{% set actions %}<button type="button" class="btn btn--sm btn--primary" data-dialog-open="dlg-prot-filter-add" aria-haspopup="dialog" data-action="filter-add">{{ icon("plus") }}<span>Add a filter</span></button>{% endset %}
+{% call page_card(frame, actions=actions, subtitle="Matching ignores case. By default a filtered caller gets a normal-looking throttle 429 and cannot tell it was filtered.") %}
+{% call tabs("prot-filter-tabs", [("filters", "Filters"), ("tester", "Tester"), ("attempts", "Attempts")], "Request filter views") %}
+  {% call tab_panel("prot-filter-tabs", "filters", first=True) %}
+    <p class="prot-pad">A {{ term("request-filter", "request filter") }} looks at the request's headers: a specific header's value, or any header's name, value, or either. The first enabled filter that matches refuses the request.</p>
+    {{ data_table(**tables.filters) }}
+  {% endcall %}
+  {% call tab_panel("prot-filter-tabs", "tester") %}
+  <form class="prot-pad stack prot-tester" data-prot-tester="header" data-api-url="{{ api.test }}" novalidate>
+    <div class="field">
+      <label class="field__label" for="filter-test-sample">Load headers from a recent request</label>
+      <select class="input" id="filter-test-sample" data-tester-sample aria-describedby="filter-test-sample-hint">
+        <option value="">{{ "Choose a recent request" if presets.samples else "No recent requests captured yet" }}</option>
+        {% for sample in presets.samples %}<option value="{{ sample.text }}">{{ sample.ip or "?" }}: {{ sample.text.split("\n")[0][:60] }}</option>{% endfor %}
+      </select>
+      <p class="field__hint" id="filter-test-sample-hint">{{ presets.samples_note }} Open a capture on the Live page for every header of a request.</p>
+    </div>
+    <div class="field">
+      <label class="field__label" for="filter-test-headers">Headers to test, one <span class="mono">Name: value</span> per line</label>
+      <textarea class="input mono" id="filter-test-headers" name="headers" rows="6" required aria-required="true" spellcheck="false" placeholder="User-Agent: Roblox/WinInet" aria-describedby="filter-test-headers-error"></textarea>
+      <p class="field__error" id="filter-test-headers-error" data-field-error="headers" hidden></p>
+      <p class="cluster"><button type="button" class="btn btn--sm btn--ghost" data-tester-example="{{ presets.example }}">{{ icon("copy") }}<span>Use an example</span></button></p>
+    </div>
+    <details class="details-plain">
+      <summary>Also try a filter I am writing</summary>
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="filter-test-header">Header (optional)</label>
+          <input class="input mono" id="filter-test-header" data-draft="header" maxlength="200" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label class="field__label" for="filter-test-scope">Match against</label>
+          <select class="input" id="filter-test-scope" data-draft="scope"><option value="either">Name or value</option><option value="key">Header name</option><option value="value">Header value</option></select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="filter-test-mode">Match</label>
+          <select class="input" id="filter-test-mode" data-draft="mode"><option value="contains">Contains</option><option value="exact">Exact</option><option value="regex">Regex</option></select>
+        </div>
+        <div class="field">
+          <label class="field__label" for="filter-test-needle">Text to match</label>
+          <input class="input mono" id="filter-test-needle" data-draft="needle" maxlength="1000" autocomplete="off" spellcheck="false" placeholder="Xeno">
+        </div>
+      </div>
+      <p class="field__hint">The draft is judged with the saved filters but is not saved. If it does not catch what you expect, check the header name, or try Contains instead of Exact.</p>
+    </details>
+    <div class="cluster"><button type="submit" class="btn btn--primary" data-action="filter-test">{{ icon("search") }}<span>Test</span></button></div>
+    <div class="prot-result" data-tester-result aria-live="polite"></div>
+  </form>
+  {% endcall %}
+  {% call tab_panel("prot-filter-tabs", "attempts") %}{{ data_table(**tables.attempts) }}{% endcall %}
+{% endcall %}
+{% call confirm_dialog("dlg-prot-filter-add", "Add a request filter", api.create, confirm_label="Add filter", api=True, danger=True,
+                       success="Request filter added.", on_success="refresh", refresh="request-filters",
+                       consequences=["Every request whose headers match is refused from now on (and held by the tarpit when its Request filter category is on).",
+                                     "Try it in the Tester tab first: a filter that is too wide refuses real callers."]) %}
+  {{ header_fields("dlg-prot-filter-add") }}
+  {{ reason_field("dlg-prot-filter-add-reason") }}
+{% endcall %}
+{% endcall %}
+{% endif %}

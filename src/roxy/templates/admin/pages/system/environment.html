@@ -1,0 +1,48 @@
+{#-
+  System page, card `environment` (`roxy/admin/pages/system.py environment_card`): the non-secret startup facts.
+
+  `GET /admin/api/v1/system/environment` (`system_api.environment_view`): the `ROXY_*` deployment facts this worker
+  started with, and which systemd credentials exist by name, never a value (plan 9.8). The one Roblox credential is
+  described by the credential manager (a bootstrap file, a dashboard value, one in use), never by its file (C1).
+  Context: `frame`, `env`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/system/_macros.html" import flag %}
+{% call page_card(frame) %}
+<div class="stack">
+  <dl class="kv system-kv">
+    <dt>Environment</dt><dd class="mono">{{ env.env }}</dd>
+    <dt>Color</dt><dd>{{ env.color }}</dd>
+    <dt>Workers</dt><dd>{{ num(env.workers) }} <span class="muted">(ROXY_WORKERS)</span></dd>
+    <dt>Recycle after</dt><dd>{{ num(env.max_requests) if env.max_requests is not none else "n/a" }} requests</dd>
+    <dt>Listens on</dt><dd class="mono">{{ env.bind }}</dd>
+    <dt>Trusted proxies</dt><dd>{{ num(env.trusted_proxy_hops) }} hop{{ "s" if env.trusted_proxy_hops != 1 }} from <span class="mono">{{ (env.trusted_proxy_cidrs or [])|join(", ") or "nowhere" }}</span></dd>
+    <dt>nginx</dt><dd>{{ num(env.nginx_worker_processes) }} processes, {{ num(env.nginx_worker_connections) }} connections each</dd>
+    <dt>HSTS</dt><dd>{{ flag(env.send_hsts, "Sent", "Not sent") }}</dd>
+    <dt>Log level</dt><dd class="mono">{{ env.log_level }}</dd>
+    <dt>Site origin</dt><dd class="mono">{{ env.site_origin }}</dd>
+    <dt>State directory</dt><dd class="mono system-id">{{ env.state_dir }}</dd>
+    <dt>Internal socket</dt><dd class="mono system-id">{{ env.internal_socket }}</dd>
+    <dt>Rotator address check</dt><dd class="mono system-id">{{ env.rotator_ip_echo_url or "n/a" }}</dd>
+    <dt>Off-server backups</dt><dd>{{ flag(env.backup_remote_configured, "Configured", "Not configured") }}</dd>
+    <dt>Migrations at start</dt><dd>{{ flag(env.auto_migrate, "On (development only)", "Off") }}</dd>
+    <dt>Release commit</dt><dd class="mono">{{ env.release_sha or "n/a" }}</dd>
+  </dl>
+  <section class="system-section" aria-labelledby="env-credentials-title">
+    <h3 class="system-section__title" id="env-credentials-title">{{ term("systemd-credential", "Credentials") }}</h3>
+    <p class="muted">{{ env.note }}</p>
+    <ul class="system-list system-list--grid">
+      {% for name, present in (env.credentials_present or {}).items() %}<li><span class="mono">{{ name }}</span> {{ flag(present, "present", "missing") }}</li>{% endfor %}
+    </ul>
+    {% if env.credential %}
+    <p>The Roblox credential: bootstrap file {{ flag(env.credential.bootstrap_file, "present", "missing") }}, dashboard value {{ flag(env.credential.dashboard_value, "set", "not set") }}, in use {{ flag(env.credential.in_use, "yes", "no", tone_no="warn") }}. <a href="/admin/credential">Credential page</a></p>
+    {% endif %}
+  </section>
+  <details class="details-plain">
+    <summary>Database files</summary>
+    <ul class="system-list">{% for name, path in (env.databases or {}).items() %}<li><span class="mono">{{ name }}</span>: <span class="mono system-id">{{ path }}</span></li>{% endfor %}</ul>
+  </details>
+</div>
+{% endcall %}

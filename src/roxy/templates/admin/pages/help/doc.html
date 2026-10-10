@@ -1,0 +1,54 @@
+{#-
+  One document of the Help page at /admin/help/<slug> (`roxy/admin/pages/help.py render_doc_page`): the runbooks,
+  the architecture, security, learning path and performance guides, and the admin guide once it is written.
+
+  The shell's h1 is the document's title (the document's own h1 was taken out, one h1 per page); the contents list
+  links to every second-level heading; the body was rendered by `roxy.public.pages.render_guide` with raw HTML
+  escaped, so it is Markup built by our renderer, never data marked safe. Heading ids are the anchors the health
+  checks link to (`/admin/help/runbooks#<anchor>`); on the runbooks the link index's `operations#<name>` names are
+  anchors too (`/admin/help/operations#<name>`). A document missing from this release says so (200).
+  Context: everything base.html takes, plus `doc` (RenderedDoc or None), `spec`, `toc`, `documents`.
+-#}
+{% extends "admin/base.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/alert.html" import inline_alert %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="/admin/help">{{ icon("chevron-left") }}<span>Help</span></a>
+{% endblock %}
+
+{% block content %}
+<div class="doc-layout{% if not toc %} doc-layout--single{% endif %}" data-doc="{{ spec.slug }}">
+  {% if doc %}
+  {% if toc %}
+  <details class="doc-toc card" data-doc-toc open>
+    <summary class="doc-toc__summary">{{ icon("book") }}<span>Contents ({{ toc|length }} sections)</span>{{ icon("chevron-down", cls="doc-toc__chevron") }}</summary>
+    <nav class="doc-toc__nav" aria-label="Contents of {{ doc.title }}">
+      <ol class="doc-toc__list">
+        {% for entry in toc %}<li><a href="#{{ entry.anchor }}">{{ entry.title }}</a></li>{% endfor %}
+      </ol>
+    </nav>
+  </details>
+  {% endif %}
+  <article class="doc prose card" aria-label="{{ doc.title }}">
+    {{ doc.html }}
+  </article>
+  {% else %}
+  <div class="doc-missing card stack">
+    {% if spec.slug == "guide" %}
+    {{ inline_alert("info", "The admin guide is not written yet", "docs/ADMIN_GUIDE.md is not part of this release. The Help page's admin guide card lists its chapters and points to the pages, cards and documents that cover each one today.") }}
+    <p><a class="btn btn--primary" href="/admin/help#guide">{{ icon("book") }}<span>Open the chapter outline</span></a></p>
+    {% else %}
+    {{ inline_alert("warn", "This document is not part of this release", "Its file (docs/" ~ spec.file ~ ") was not found next to the application. The other documents are listed below.") }}
+    {% endif %}
+  </div>
+  {% endif %}
+  <nav class="doc-more card" aria-labelledby="doc-more-title">
+    <h2 class="doc-more__title" id="doc-more-title">More documents</h2>
+    <ul class="doc-more__list">
+      {% for item in documents if item.slug != spec.slug %}<li><a href="/admin/help/{{ item.slug }}">{{ item.title }}</a></li>{% endfor %}
+      <li><a href="/admin/help#glossary">Glossary</a></li>
+    </ul>
+  </nav>
+</div>
+{% endblock %}

@@ -1,0 +1,7 @@
+{#-
+  The placeholder of a lazy card (`@page.card(..., lazy=True)`): it loads its fragment with htmx when it scrolls
+  into view and is replaced by it (outerHTML). Heavy cards (big tables, many settings) use it so the first paint
+  stays small on the 1 GB server. Context: `frame`.
+-#}
+{% from "components/page_card.html" import lazy_card %}
+{{ lazy_card(frame) }}

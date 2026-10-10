@@ -1,0 +1,137 @@
+{#-
+  Protection page, card `bans` (`roxy/admin/pages/protection.py bans_card`): bans with countdowns and evidence.
+
+  What: the bans table (`GET /protection/bans`: subject, state, time left, who made it, requests it refused, its
+  evidence; filters for state, maker, type and detector), "Ban a subject" (`POST /bans`; an active ban of the same
+  subject is extended), the plan 6.8 bans reset by scope with each scope's preview (expired, automatic, one
+  detector, or every ban with the typed confirmation "all bans"), and each ban's drawer (`detail=<id>`, `GET
+  /bans/{id}`): its evidence and the detector events behind it, its hits over the range, lift it (`DELETE
+  /bans/{id}`) or lift every ban of its subject (`POST /bans/lift`). A banned client gets 403 "Access denied." or,
+  with "Disguise bans as throttles" on (this card's setting), a normal-looking 429.
+  Context: `frame`, `table`, `only`, `active_total`, `disguised`, `previews`, `detectors`, `api`; for the drawer
+  `detail`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num, caller_text %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "admin/pages/protection/_macros.html" import reason_field, delete_dialog, rule_chart, field_error %}
+{% if detail %}
+{% set d = detail %}{% set ban = d.ban %}
+<div class="prot-drawer stack" data-prot-drawer="ban">
+  <p>{{ badge("Ban #" ~ ban.id, "neutral") }} {% if ban.active %}{{ status_badge("bad", "In force") }}{% else %}{{ status_badge("neutral", "Expired") }}{% endif %} {{ badge("Made by a detector" if ban.origin == "auto" else "Made by an admin", "info" if ban.origin == "auto" else "neutral") }}</p>
+  <dl class="kv">
+    <dt>Subject</dt><dd>{{ caller_text(ban.subject, 200) }} <span class="muted">({{ ban.subject_type }})</span></dd>
+    <dt>Ends</dt><dd>{% if ban.permanent %}Never (a permanent ban){% elif d.expires %}<time datetime="{{ d.expires.datetime }}">{{ d.expires.text }}</time>{% if ban.active %} <span class="muted">({{ d.remaining }} left)</span>{% endif %}{% endif %}</dd>
+    <dt>Created</dt><dd>{% if d.created %}<time datetime="{{ d.created.datetime }}">{{ d.created.text }}</time> <span class="muted">({{ d.created.sub }})</span>{% endif %} by {{ caller_text(ban.created_by, 120) }}</dd>
+    <dt>Refused</dt><dd>{{ num(ban.hits) }} requests{% if d.last_hit %}, last <time datetime="{{ d.last_hit.datetime }}">{{ d.last_hit.sub }}</time>{% endif %}</dd>
+    <dt>Evidence</dt><dd>{% if ban.evidence.reason_text %}{{ caller_text(ban.evidence.reason_text, 600, block=True) }}{% endif %}<span class="muted">Reason code: {{ ban.evidence.reason_code or "n/a" }}</span></dd>
+  </dl>
+  {% if d.events %}
+  <section aria-labelledby="ban-events-{{ ban.id }}">
+    <h3 class="prot-sub__title" id="ban-events-{{ ban.id }}">Detector events about this client</h3>
+    <ul class="prot-events">
+      {% for event in d.events %}<li>{% if event.when %}<time datetime="{{ event.when.datetime }}">{{ event.when.text }}</time>{% endif %} <strong>{{ event.kind }}</strong> {% if event.detector %}{{ event.detector }}{% endif %} {% if event.evidence %}{{ caller_text(event.evidence, 300) }}{% endif %}</li>{% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+  {{ rule_chart("ban-hits-" ~ ban.id, "Requests this ban refused", d.chart_src) }}
+  <div class="cluster">
+    <button type="button" class="btn btn--bad" data-dialog-open="dlg-prot-ban-lift-{{ ban.id }}" aria-haspopup="dialog" data-action="ban-lift">{{ icon("x") }}<span>Lift this ban</span></button>
+    <button type="button" class="btn" data-dialog-open="dlg-prot-ban-lift-all-{{ ban.id }}" aria-haspopup="dialog">{{ icon("x-circle") }}<span>Lift every ban of this subject</span></button>
+  </div>
+  {{ delete_dialog("dlg-prot-ban-lift-" ~ ban.id, "Lift ban #" ~ ban.id ~ "?", d.api.lift,
+                   ["The subject is no longer refused by this ban, on every worker within a second.",
+                    "Other bans of the same subject stay; the removal is written to the audit log."],
+                   "bans", confirm_label="Lift the ban", success="The ban was lifted.") }}
+  {% call confirm_dialog("dlg-prot-ban-lift-all-" ~ ban.id, "Lift every ban of this subject?", d.api.lift_subject,
+                         confirm_label="Lift every ban", api=True, danger=True,
+                         hidden={"subject_type": ban.subject_type, "subject": ban.subject},
+                         success="Every ban of that subject was lifted.", on_success="refresh", refresh="bans",
+                         consequences=["Removes every ban of this subject, active or expired.",
+                                       "The subject is answered normally again (other limits still apply)."]) %}
+    {{ reason_field("dlg-prot-ban-lift-all-" ~ ban.id ~ "-reason") }}
+  {% endcall %}
+</div>
+{% elif only %}{{ data_table(**table) }}{% else %}
+{% set actions %}
+<button type="button" class="btn btn--sm btn--primary" data-dialog-open="dlg-prot-ban-add" aria-haspopup="dialog" data-action="ban-add">{{ icon("plus") }}<span>Ban a subject</span></button>
+<details class="menu" data-menu>
+  <summary class="btn btn--sm btn--ghost">{{ icon("reset") }}<span>Delete bans</span></summary>
+  <div class="menu__panel menu__panel--end">
+    <button type="button" class="menu__item" data-dialog-open="dlg-prot-bans-expired" aria-haspopup="dialog">Expired bans ({{ num(previews.expired.rows) }})</button>
+    <button type="button" class="menu__item" data-dialog-open="dlg-prot-bans-auto" aria-haspopup="dialog">Bans made by detectors ({{ num(previews.auto.rows) }})</button>
+    <button type="button" class="menu__item" data-dialog-open="dlg-prot-bans-detector" aria-haspopup="dialog">Bans made by one detector</button>
+    <button type="button" class="menu__item" data-dialog-open="dlg-prot-bans-all" aria-haspopup="dialog">Every ban ({{ num(previews.all.rows) }})</button>
+  </div>
+</details>
+{% endset %}
+{% call page_card(frame, flush=True, actions=actions, subtitle=num(active_total) ~ " in force; " ~ ("answered with a normal-looking 429 (disguised)" if disguised else "answered 403 Access denied")) %}
+{{ data_table(**table) }}
+{% call confirm_dialog("dlg-prot-ban-add", "Ban a subject", api.create, confirm_label="Ban", danger=True, api=True,
+                       success="Banned.", on_success="refresh", refresh="bans",
+                       consequences=["Every request from the subject is refused at once, before any other check except pause.",
+                                     "An active ban of the same subject is extended instead (the later end wins).",
+                                     "Places and User-Agents are claims a caller can change: ban an address when you can."]) %}
+  <div class="field-row">
+    <div class="field">
+      <label class="field__label" for="ban-add-type">Type</label>
+      <select class="input" id="ban-add-type" name="subject_type">
+        <option value="ip">Address</option><option value="cidr">Network (CIDR)</option><option value="place">Place (Roblox-Id)</option><option value="ua_hash">User-Agent hash</option>
+      </select>
+    </div>
+    <div class="field">
+      <label class="field__label" for="ban-add-subject">Subject</label>
+      <input class="input mono" id="ban-add-subject" name="subject" required aria-required="true" maxlength="200" autocomplete="off" spellcheck="false" placeholder="203.0.113.7" aria-describedby="ban-add-subject-error">
+      {{ field_error("subject", "ban-add-subject-error") }}
+    </div>
+  </div>
+  <div class="field-row">
+    <div class="field">
+      <label class="field__label" for="ban-add-minutes">Length (minutes)</label>
+      <input class="input input--num" id="ban-add-minutes" name="minutes" inputmode="numeric" data-json="int" value="60" aria-describedby="ban-add-minutes-error">
+      {{ field_error("minutes", "ban-add-minutes-error") }}
+    </div>
+    <div class="field prot-field-check">
+      <label class="check"><input type="checkbox" name="permanent" data-prot-permanent><span>Permanent (no end; clear the length)</span></label>
+    </div>
+  </div>
+  <div class="field">
+    <label class="field__label" for="ban-add-message">Message kept with the ban <span class="muted">(optional, shown here as evidence)</span></label>
+    <input class="input" id="ban-add-message" name="message" maxlength="300" data-json="string" aria-describedby="ban-add-message-error">
+    {{ field_error("message", "ban-add-message-error") }}
+  </div>
+  {{ reason_field("ban-add-reason") }}
+{% endcall %}
+{% for scope, title, lines in [
+  ("expired", "Delete the expired bans?", ["Deletes " ~ num(previews.expired.rows) ~ " bans that already ended (they refuse nothing).", "Nothing changes for any caller."]),
+  ("auto", "Delete the bans made by detectors?", ["Deletes " ~ num(previews.auto.rows) ~ " bans made by spam detectors or the ladder (" ~ num(previews.auto.active) ~ " still in force).", "Those clients are answered normally again; bans made by hand stay."]),
+] %}
+{% call confirm_dialog("dlg-prot-bans-" ~ scope, title, api.reset, confirm_label="Delete", danger=True, api=True,
+                       hidden={"scope": scope}, success="Bans deleted.", on_success="refresh", refresh="bans",
+                       consequences=lines + [previews[scope].leaves_alone ~ " are left alone."]) %}
+  {{ reason_field("dlg-prot-bans-" ~ scope ~ "-reason", required=True) }}
+{% endcall %}
+{% endfor %}
+{% call confirm_dialog("dlg-prot-bans-detector", "Delete one detector's bans?", api.reset, confirm_label="Delete", danger=True, api=True,
+                       hidden={"scope": "detector"}, success="Bans deleted.", on_success="refresh", refresh="bans",
+                       consequences=["Deletes every ban that detector made, active or expired; its clients are answered normally again.",
+                                     previews.all.leaves_alone ~ " are left alone."]) %}
+  <div class="field">
+    <label class="field__label" for="dlg-prot-bans-detector-name">Detector</label>
+    <select class="input" id="dlg-prot-bans-detector-name" name="detector" aria-describedby="dlg-prot-bans-detector-name-error">{% for d in detectors %}<option value="{{ d }}">{{ d }}</option>{% endfor %}</select>
+    {{ field_error("detector", "dlg-prot-bans-detector-name-error") }}
+  </div>
+  {{ reason_field("dlg-prot-bans-detector-reason", required=True) }}
+{% endcall %}
+{% call confirm_dialog("dlg-prot-bans-all", "Delete every ban?", api.reset, confirm_label="Delete every ban", danger=True, api=True,
+                       type_to_confirm=previews.all.confirm_text, hidden={"scope": "all", "confirm": previews.all.confirm_text},
+                       success="Every ban was deleted.", on_success="refresh", refresh="bans",
+                       consequences=["Deletes all " ~ num(previews.all.rows) ~ " bans (" ~ num(previews.all.active) ~ " in force): every banned client is answered normally again.",
+                                     previews.all.leaves_alone ~ " are left alone. The reset is written to the audit log and marked on the charts."]) %}
+  {{ reason_field("dlg-prot-bans-all-reason", required=True) }}
+{% endcall %}
+{% endcall %}
+{% endif %}

@@ -1,0 +1,430 @@
+/*
+ * The Egress page (templates/admin/pages/egress*): usage tiles, the budget, the rotator and the leak guard.
+ *
+ * What this is
+ *   Layout for the page's own pieces: one usage tile per egress, the budget's projection sentence and cycle facts,
+ *   the provider figure form, the rotator card and the leak guard's trip blocks. The "g3 block" is the same as in
+ *   css/pages/upstream.css (gauges, small tables, forms; copied by .remake/scripts/g3_css.py, because a page's
+ *   stylesheet is linked only on that page).
+ * Why it exists
+ *   Plan 14.4 and 14.8: tokens only, both themes, and no sideways scroll on a phone.
+ * How it works
+ *   Auto-fill grids fall back to one column on a phone; long values break inside their cells.
+ * What to read next
+ *   static/css/pages/upstream.css, templates/admin/pages/egress.html.
+ */
+
+/* ------------------------------------------------------------------------------------------- g3 block (shared) */
+
+.g3-pair > * {
+  min-width: 0;
+}
+
+.g3-pad {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4);
+}
+
+.g3-section {
+  display: grid;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border);
+}
+
+.g3-subhead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0 var(--sp-2);
+  font-size: var(--fs-3);
+  font-weight: var(--fw-semibold);
+}
+
+.g3-section > .g3-subhead {
+  margin: 0;
+}
+
+.g3-scroll {
+  max-width: 100%;
+  margin-top: var(--sp-2);
+}
+
+.g3-table {
+  width: 100%;
+}
+
+.g3-table td {
+  vertical-align: top;
+}
+
+.g3-table--wrap td {
+  min-width: 6ch;
+  white-space: normal;
+  overflow-wrap: break-word;
+}
+
+.g3-caption {
+  caption-side: top;
+  padding: 0 0 var(--sp-1);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+  text-align: left;
+}
+
+/* Caller text breaks anywhere (components.css), which would let a table squeeze its column to one letter: keep
+   at least a readable width; longer text still wraps inside it, and the table scrolls in its own region. */
+.g3-table .caller-text,
+.g3-table-host td .caller-text {
+  display: inline-block;
+  min-width: 14ch;
+  max-width: 60ch;
+}
+
+/* A status badge with a long sentence wraps inside its card instead of running past its edge. */
+.g3-egress__head .badge,
+.g3-table .badge {
+  max-width: 100%;
+  white-space: normal;
+}
+
+.g3-cell-sub {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.g3-list {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding-left: var(--sp-5);
+  overflow-wrap: anywhere;
+}
+
+.g3-tables {
+  margin-top: var(--sp-3);
+}
+
+.g3-tables > * {
+  min-width: 0;
+}
+
+.g3-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--sp-3);
+  margin: 0;
+}
+
+.g3-stat {
+  display: grid;
+  gap: 2px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.g3-stat__label {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.g3-stat__value {
+  margin: 0;
+  font-size: var(--fs-4);
+  font-weight: var(--fw-semibold);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.g3-stat__sub {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-regular);
+}
+
+.g3-stat--bad .g3-stat__value {
+  color: var(--bad);
+}
+
+.g3-stat--warn .g3-stat__value {
+  color: var(--warn);
+}
+
+.g3-stat--ok .g3-stat__value {
+  color: var(--ok);
+}
+
+/* Gauges: a labeled <meter> with the percent and words beside it (color is never the only signal). */
+.g3-gauges {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.g3-gauge {
+  display: grid;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.g3-gauge__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-1) var(--sp-2);
+  font-size: var(--fs-1);
+}
+
+.g3-gauge__label {
+  color: var(--text-muted);
+  font-weight: var(--fw-semibold);
+}
+
+.g3-gauge__value {
+  font-variant-numeric: tabular-nums;
+}
+
+.g3-gauge__words {
+  color: var(--text-muted);
+}
+
+.g3-gauge--warn .g3-gauge__words {
+  color: var(--warn);
+}
+
+.g3-gauge--bad .g3-gauge__words {
+  color: var(--bad);
+}
+
+.g3-gauge__detail {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  overflow-wrap: anywhere;
+}
+
+.g3-gauge__meter {
+  display: block;
+  width: 100%;
+  height: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  appearance: none;
+}
+
+.g3-gauge__meter::-webkit-meter-bar {
+  height: 100%;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+}
+
+.g3-gauge__meter::-webkit-meter-optimum-value {
+  border-radius: var(--radius-pill);
+  background: var(--ok);
+}
+
+.g3-gauge__meter::-webkit-meter-suboptimum-value {
+  border-radius: var(--radius-pill);
+  background: var(--warn);
+}
+
+.g3-gauge__meter::-webkit-meter-even-less-good-value {
+  border-radius: var(--radius-pill);
+  background: var(--bad);
+}
+
+.g3-gauge__meter::-moz-meter-bar {
+  border-radius: var(--radius-pill);
+  background: var(--ok);
+}
+
+.g3-gauge__meter:-moz-meter-sub-optimum::-moz-meter-bar {
+  background: var(--warn);
+}
+
+.g3-gauge__meter:-moz-meter-sub-sub-optimum::-moz-meter-bar {
+  background: var(--bad);
+}
+
+.g3-countdown {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Forms, testers and drawers. */
+.g3-form {
+  max-width: 640px;
+}
+
+.g3-inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--sp-3);
+}
+
+.g3-inline-form > .field {
+  flex: 1 1 220px;
+  min-width: 0;
+  margin: 0;
+}
+
+.g3-inline-form > .btn {
+  margin-top: calc(var(--fs-2) * 1.5 + var(--sp-1));
+}
+
+.g3-note {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-1);
+}
+
+.g3-sentence {
+  margin: var(--sp-3) 0;
+}
+
+.g3-add > summary {
+  gap: var(--sp-2);
+}
+
+.g3-add[open] > summary {
+  margin-bottom: var(--sp-3);
+}
+
+.g3-tools {
+  align-items: start;
+  margin-top: var(--sp-4);
+}
+
+.g3-tools > * {
+  min-width: 0;
+}
+
+.g3-tester__result {
+  min-height: var(--target-min);
+  overflow-wrap: anywhere;
+}
+
+.g3-tester__result p {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.g3-drawer {
+  min-width: 0;
+}
+
+.g3-drawer__lead {
+  margin: 0;
+  font-family: var(--font-mono, monospace);
+  font-size: var(--fs-1);
+  overflow-wrap: anywhere;
+}
+
+.g3-drawer .kv dd {
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------------------------------------- the Egress page */
+
+.g3-egress-usage {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-4);
+}
+
+.g3-usage {
+  display: grid;
+  align-content: start;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.g3-usage__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.g3-usage__head .badge {
+  max-width: 100%;
+  white-space: normal;
+}
+
+.g3-usage__title {
+  margin: 0;
+  font-size: var(--fs-3);
+}
+
+.g3-usage__bytes {
+  margin: 0;
+  font-size: var(--fs-5);
+  font-variant-numeric: tabular-nums;
+}
+
+.g3-usage__about {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.g3-usage .kv,
+.g3-cycle,
+.g3-rotator .kv,
+.g3-trip .kv {
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+}
+
+.g3-cycle {
+  margin-bottom: var(--sp-3);
+}
+
+.g3-rotator {
+  display: grid;
+  gap: var(--sp-3);
+}
+
+.g3-rotator__state {
+  margin: 0;
+}
+
+.g3-trip {
+  display: grid;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.g3-reveal {
+  margin-top: var(--sp-2);
+}
+
+@media (max-width: 480px) {
+  .g3-usage .kv,
+  .g3-cycle,
+  .g3-rotator .kv,
+  .g3-trip .kv {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

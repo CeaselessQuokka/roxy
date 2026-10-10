@@ -33,6 +33,10 @@ How it works
       name, audit row), and the report asks for it to move into `admin/auth/enrollment.py`.
     - Regenerated recovery codes are the one secret this API returns: shown once, never stored in clear, never
       logged, and answered with `Cache-Control: no-store` like every admin answer.
+    - The Security dashboard page (`roxy/admin/pages/security.py`) reads through the same helpers the routes use
+      (`ring_fetch`, `header_fetch`, `values_fetch`, `user_agent_fetch`, `csp_fetch`, `table_page`, `listed_page`,
+      `probe_summary_rows`, `crawl_rows`, `blocked_table_rows`, `ignored_rows`, `sessions_answer`, `trusted_answer`,
+      `passkeys_answer`, `recovery_answer`), so the page and the API can never show different numbers (P6).
 
 What to read next
     `roxy/metrics/security_events.py`, `roxy/metrics/read_security.py`, `roxy/admin/auth/enrollment.py`, then
@@ -132,6 +136,32 @@ def _session_record(request: Request) -> sessions.SessionRecord:
 Fetch = Callable[[int, int], Awaitable[tuple[Sequence[Any], int]]]
 
 
+async def table_page(spec: TableSpec, tq: TableQuery, fetch: Fetch, *, tr: TimeRange | None = None) -> dict[str, Any]:
+    """One page of a paged read model as the section 13 table answer (the routes' answer without `format=`; the
+    Security page renders the same answer, P6)."""
+    items, total = await fetch(tq.page, tq.page_size)
+    answer = table_answer(spec, tq, items, total)
+    if tr is not None:
+        answer["range"] = tr.info()
+    return answer
+
+
+def listed_page(
+    spec: TableSpec,
+    tq: TableQuery,
+    rows: Sequence[dict[str, Any]],
+    *,
+    search_keys: Sequence[str],
+    tr: TimeRange | None = None,
+) -> dict[str, Any]:
+    """An in-memory list (a grouped summary) searched, sorted and paged as the section 13 table answer."""
+    items, total = page_rows(rows, tq, search_keys=search_keys)
+    answer = table_answer(spec, tq, items, total)
+    if tr is not None:
+        answer["range"] = tr.info()
+    return answer
+
+
 async def _paged(
     request: Request,
     admin: AdminPrincipal,
@@ -146,11 +176,7 @@ async def _paged(
     with service_errors():
         if fmt is not None:
             return await export_pages(request, admin, spec, fetch, fmt, tq=tq, tr=tr, filters=filters)
-        items, total = await fetch(tq.page, tq.page_size)
-    answer = table_answer(spec, tq, items, total)
-    if tr is not None:
-        answer["range"] = tr.info()
-    return answer
+        return await table_page(spec, tq, fetch, tr=tr)
 
 
 async def _listed(
@@ -167,11 +193,7 @@ async def _listed(
     if fmt is not None:
         everything, total = page_rows(rows, replace(tq, page=1, page_size=max(1, len(rows))), search_keys=search_keys)
         return await export_table(request, admin, spec, everything, fmt, total=total, tq=tq, tr=tr)
-    items, total = page_rows(rows, tq, search_keys=search_keys)
-    answer = table_answer(spec, tq, items, total)
-    if tr is not None:
-        answer["range"] = tr.info()
-    return answer
+    return listed_page(spec, tq, rows, search_keys=search_keys, tr=tr)
 
 
 def _only_newest_first(tq: TableQuery) -> None:
@@ -237,7 +259,11 @@ CRAWL_SPEC: Final = TableSpec(
 def _ring_fetch(
     request: Request, event_type: str, tr: TimeRange, *, ip: str | None = None, reason: str | None = None
 ) -> Fetch:
-    ctx = get_ctx(request)
+    return ring_fetch(get_ctx(request), event_type, tr, ip=ip, reason=reason)
+
+
+def ring_fetch(ctx: Any, event_type: str, tr: TimeRange, *, ip: str | None = None, reason: str | None = None) -> Fetch:
+    """The page reader of one security event log (`security_events.ring`) for the range, newest first."""
 
     async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
         data = await ctx.dbs.metrics.read(
@@ -293,13 +319,27 @@ async def probe_summary(
     fmt: ExportFormatDep,
 ) -> Any:
     """Probes grouped by signature in the range (v1 "Exploit / Probe Summary"; v1 bug B19 fixed by signatures)."""
-    ctx = get_ctx(request)
-    start, end = tr.window.start * 1000, tr.window.end * 1000
     with service_errors():
-        rows = await ctx.dbs.metrics.read(
-            lambda conn: security_events.summary_by_reason(conn, security_events.PROBE, start, end, MAX_SUMMARY_ROWS)
-        )
+        rows = await probe_summary_rows(get_ctx(request), tr)
     return await _listed(request, admin, SUMMARY_SPEC, tq, fmt, rows, search_keys=("reason",), tr=tr)
+
+
+async def probe_summary_rows(ctx: Any, tr: TimeRange, *, limit: int = MAX_SUMMARY_ROWS) -> list[dict[str, Any]]:
+    """Probe signatures in the range with their counts, busiest first (at most `limit` groups)."""
+    start, end = tr.window.start * 1000, tr.window.end * 1000
+    rows: list[dict[str, Any]] = await ctx.dbs.metrics.read(
+        lambda conn: security_events.summary_by_reason(conn, security_events.PROBE, start, end, limit)
+    )
+    return rows
+
+
+async def crawl_rows(ctx: Any, tr: TimeRange) -> list[dict[str, Any]]:
+    """robots.txt and sitemap fetches in the range grouped by client address, busiest first."""
+    start, end = tr.window.start * 1000, tr.window.end * 1000
+    rows: list[dict[str, Any]] = await ctx.dbs.metrics.read(
+        lambda conn: security_events.summary_by_ip(conn, security_events.CRAWL, start, end, MAX_SUMMARY_ROWS)
+    )
+    return rows
 
 
 @router.get("/crawls")
@@ -311,12 +351,8 @@ async def crawls(
     fmt: ExportFormatDep,
 ) -> Any:
     """robots.txt and sitemap fetches by client in the range (v1 "Crawler Activity", row 80)."""
-    ctx = get_ctx(request)
-    start, end = tr.window.start * 1000, tr.window.end * 1000
     with service_errors():
-        rows = await ctx.dbs.metrics.read(
-            lambda conn: security_events.summary_by_ip(conn, security_events.CRAWL, start, end, MAX_SUMMARY_ROWS)
-        )
+        rows = await crawl_rows(get_ctx(request), tr)
     return await _listed(request, admin, CRAWL_SPEC, tq, fmt, rows, search_keys=("ip",), tr=tr)
 
 
@@ -410,7 +446,11 @@ async def fingerprint_headers(
     fmt: ExportFormatDep,
 ) -> Any:
     """Header names callers send, with how many distinct values each carried (row 79)."""
-    ctx = get_ctx(request)
+    return await _paged(request, admin, HEADER_SPEC, tq, fmt, header_fetch(get_ctx(request), tq))
+
+
+def header_fetch(ctx: Any, tq: TableQuery) -> Fetch:
+    """The page reader of the header name table (search, sort and paging in SQL, the ignored mark from the rules)."""
     ignored = _ignored(ctx)
 
     async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
@@ -422,7 +462,7 @@ async def fingerprint_headers(
         )  # fmt: skip
         return data["rows"], int(data["total"])
 
-    return await _paged(request, admin, HEADER_SPEC, tq, fmt, fetch)
+    return fetch
 
 
 @router.get("/fingerprints/headers/{name}/values")
@@ -436,6 +476,15 @@ async def fingerprint_values(
     """One header's stored values, most frequent first (the v1 drill-down)."""
     ctx = get_ctx(request)
     key = name.lower()
+    answer = await _paged(request, admin, VALUE_SPEC, tq, fmt, values_fetch(ctx, key, tq), filters={"name": key})
+    if isinstance(answer, dict):
+        answer["name"] = key
+        answer["values_ignored"] = key in _ignored(ctx)
+    return answer
+
+
+def values_fetch(ctx: Any, key: str, tq: TableQuery) -> Fetch:
+    """The page reader of one (lowercased) header's stored values."""
 
     async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
         data = await ctx.dbs.metrics.read(
@@ -445,11 +494,7 @@ async def fingerprint_values(
         )
         return data["rows"], int(data["total"])
 
-    answer = await _paged(request, admin, VALUE_SPEC, tq, fmt, fetch, filters={"name": key})
-    if isinstance(answer, dict):
-        answer["name"] = key
-        answer["values_ignored"] = key in _ignored(ctx)
-    return answer
+    return fetch
 
 
 @router.get("/fingerprints/user-agents")
@@ -460,7 +505,11 @@ async def fingerprint_user_agents(
     fmt: ExportFormatDep,
 ) -> Any:
     """User-Agents callers send (row 79)."""
-    ctx = get_ctx(request)
+    return await _paged(request, admin, UA_SPEC, tq, fmt, user_agent_fetch(get_ctx(request), tq))
+
+
+def user_agent_fetch(ctx: Any, tq: TableQuery) -> Fetch:
+    """The page reader of the User-Agent table (search, sort and paging in SQL)."""
 
     async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
         data = await ctx.dbs.metrics.read(
@@ -470,7 +519,7 @@ async def fingerprint_user_agents(
         )
         return data["rows"], int(data["total"])
 
-    return await _paged(request, admin, UA_SPEC, tq, fmt, fetch)
+    return fetch
 
 
 @router.get("/fingerprints/blocked")
@@ -485,16 +534,20 @@ async def fingerprint_blocked(
     """Header names and User-Agents of requests a request filter refused in the range (row 134, Blocked tab), as
     one section 13 table (`kind` picks one of the two lists); `format=csv|json` is v1's blocked fingerprints export
     (finding parity-14). Blocked requests keep no header values, so there are no value rows."""
-    ctx = get_ctx(request)
-    start, end = tr.window.start * 1000, tr.window.end * 1000
     with service_errors():
-        found = await ctx.dbs.metrics.read(lambda conn: read_security.blocked_rows(conn, start, end))
-    rows = [row for row in found if kind is None or row["kind"] == kind]
+        rows = await blocked_table_rows(get_ctx(request), tr, kind)
     answer = await _listed(request, admin, BLOCKED_SPEC, tq, fmt, rows, search_keys=("name", "user_agent"), tr=tr)
     if isinstance(answer, dict):
         answer["kind"] = kind
         add_caller_text(answer, BLOCKED_CALLER_TEXT)
     return answer
+
+
+async def blocked_table_rows(ctx: Any, tr: TimeRange, kind: str | None = None) -> list[dict[str, Any]]:
+    """The Blocked tab's rows in the range (`read_security.blocked_rows`), of one `kind` or both."""
+    start, end = tr.window.start * 1000, tr.window.end * 1000
+    found = await ctx.dbs.metrics.read(lambda conn: read_security.blocked_rows(conn, start, end))
+    return [row for row in found if kind is None or row["kind"] == kind]
 
 
 @router.get("/fingerprints/ignored")
@@ -505,15 +558,20 @@ async def fingerprint_ignored(
     fmt: ExportFormatDep,
 ) -> Any:
     """Headers whose values are not recorded: detected automatically, a shipped default, or added by an admin."""
-    ctx = get_ctx(request)
     with service_errors():
-        stored = await _rules(ctx).list_rows("ignored_value_headers")
+        rows = await ignored_rows(get_ctx(request))
+    return await _listed(request, admin, IGNORED_SPEC, tq, fmt, rows, search_keys=("name", "note"))
+
+
+async def ignored_rows(ctx: Any) -> list[dict[str, Any]]:
+    """The ignored headers (rule table `ignored_value_headers`) with why each is there."""
+    stored = await _rules(ctx).list_rows("ignored_value_headers")
     rows = []
     for row in stored:
         note = str(row.get("note") or "")
         why = "Detected automatically" if row.get("auto") else ("Default" if note == "default" else "Added by an admin")
         rows.append({"name": row["name"], "why": why, "note": note, "auto": bool(row.get("auto"))})
-    return await _listed(request, admin, IGNORED_SPEC, tq, fmt, rows, search_keys=("name", "note"))
+    return rows
 
 
 def _rules(ctx: Any) -> RulesService:
@@ -701,19 +759,24 @@ async def csp_reports(
     directive: Annotated[str | None, Query(max_length=64, pattern=r"^[a-z-]+$")] = None,
 ) -> Any:
     """Content-Security-Policy violation reports in the range, grouped by what was blocked (plan 9.2)."""
-    ctx = get_ctx(request)
+    fetch = csp_fetch(get_ctx(request), tr, tq, directive or "")
+    return await _paged(request, admin, CSP_SPEC, tq, fmt, fetch, tr=tr, filters={"directive": directive})
+
+
+def csp_fetch(ctx: Any, tr: TimeRange, tq: TableQuery, directive: str = "") -> Fetch:
+    """The page reader of the CSP reports in the range (grouped, sorted and paged in SQL)."""
     start, end = tr.window.start * 1000, tr.window.end * 1000
 
     async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
         data = await ctx.dbs.metrics.read(
             lambda conn: read_security.csp_reports(
-                conn, start, end, directive=directive or "", sort=tq.sort, descending=tq.descending, limit=size,
+                conn, start, end, directive=directive, sort=tq.sort, descending=tq.descending, limit=size,
                 offset=(page - 1) * size,
             )
         )  # fmt: skip
         return data["rows"], int(data["total"])
 
-    return await _paged(request, admin, CSP_SPEC, tq, fmt, fetch, tr=tr, filters={"directive": directive})
+    return fetch
 
 
 # =============================================================================================== sessions
@@ -722,6 +785,11 @@ async def csp_reports(
 @router.get("/sessions")
 async def session_list(request: Request, admin: AdminSession) -> dict[str, Any]:
     """The admin's unexpired sessions, newest first (`current` marks this browser)."""
+    return await sessions_answer(request, admin)
+
+
+async def sessions_answer(request: Request, admin: AdminPrincipal) -> dict[str, Any]:
+    """The `GET /sessions` answer (the Security page reads the same): `id` is the public handle, never the cookie."""
     auth = get_auth(request)
     now = int(auth.clock.now())
     rows = await _auth_call(auth.control_read(lambda conn: sessions.list_for_user(conn, admin.user_id, now)))
@@ -806,6 +874,11 @@ async def session_revoke_all(request: Request, admin: AdminSession, _csrf: CsrfC
 @router.get("/trusted-devices")
 async def trusted_list(request: Request, admin: AdminSession) -> dict[str, Any]:
     """Trusted devices (row 100): name, browser family, last use; `this_device` marks this browser."""
+    return await trusted_answer(request, admin)
+
+
+async def trusted_answer(request: Request, admin: AdminPrincipal) -> dict[str, Any]:
+    """The `GET /trusted-devices` answer (the Security page reads the same)."""
     auth = get_auth(request)
     now = int(auth.clock.now())
     rows = await _auth_call(auth.control_read(lambda conn: trusted_devices.list_for_user(conn, admin.user_id, now)))
@@ -889,6 +962,11 @@ class PasskeyRename(ApiBody):
 @router.get("/passkeys")
 async def passkey_list(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Your passkeys (never the key material)."""
+    return await passkeys_answer(request)
+
+
+async def passkeys_answer(request: Request) -> dict[str, Any]:
+    """The `GET /passkeys` answer for the request's signed-in admin (the Security page reads the same)."""
     record = _session_record(request)
     items = await _auth_call(enrollment.passkey_list(get_auth(request), record))
     keys = [
@@ -958,6 +1036,11 @@ async def passkey_delete(
 @router.get("/recovery-codes")
 async def recovery_status(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """How many recovery codes you have left (never the codes)."""
+    return await recovery_answer(request)
+
+
+async def recovery_answer(request: Request) -> dict[str, Any]:
+    """The `GET /recovery-codes` answer (counts only; the Security page reads the same)."""
     record = _session_record(request)
     status = await _auth_call(enrollment.recovery_status(get_auth(request), record))
     return {"total": status["Total"], "remaining": status["Remaining"]}
@@ -971,4 +1054,33 @@ async def recovery_regenerate(request: Request, _admin: AdminFreshMfa, _csrf: Cs
     return {"codes": codes, "total": len(codes), "note": "Store these now; they are not shown again."}
 
 
-__all__ = ["auth_error", "router"]
+__all__ = [
+    "BLOCKED_CALLER_TEXT",
+    "BLOCKED_SPEC",
+    "CRAWL_SPEC",
+    "CSP_SPEC",
+    "HEADER_SPEC",
+    "IGNORED_SPEC",
+    "LOGIN_SPEC",
+    "PROBE_SPEC",
+    "SUMMARY_SPEC",
+    "UA_SPEC",
+    "VALUE_SPEC",
+    "auth_error",
+    "blocked_table_rows",
+    "crawl_rows",
+    "csp_fetch",
+    "header_fetch",
+    "ignored_rows",
+    "listed_page",
+    "passkeys_answer",
+    "probe_summary_rows",
+    "recovery_answer",
+    "ring_fetch",
+    "router",
+    "sessions_answer",
+    "table_page",
+    "trusted_answer",
+    "user_agent_fetch",
+    "values_fetch",
+]

@@ -50,6 +50,7 @@ from roxy.admin.api.routing_rules import (
     change_answer,
     changes_of,
     rules_service,
+    service_for,
 )
 from roxy.config.constants import MAX_RULE_LIMIT
 from roxy.deps import get_ctx
@@ -138,20 +139,35 @@ async def list_limits(
     fmt: ExportFormatDep,
 ) -> Any:
     """Every override (at most 2,500, plan 15.4) with the defaults it replaces."""
-    defaults = _defaults(request)
-    with common.service_errors():
-        rows = [item_of(row, defaults) for row in await rules_service(request).list_rows(TABLE)]
-    keys = ("bucket_key", "origin", "note", "updated_by")
+    ctx = get_ctx(request)
+    rows = await limit_rows(ctx)
     if fmt is not None:
-        items, total = all_rows(rows, tq, search_keys=keys)
+        items, total = all_rows(rows, tq, search_keys=SEARCH_KEYS)
         return await common.export_table(request, admin, SPEC, items, fmt, total=total, tq=tq)
-    items, total = common.page_rows(rows, tq, search_keys=keys)
+    return limits_answer(ctx, rows, tq)
+
+
+SEARCH_KEYS: Final = ("bucket_key", "origin", "note", "updated_by")
+
+
+async def limit_rows(ctx: Any) -> list[dict[str, Any]]:
+    """Every override with the default it replaces (the Upstream page's Buckets card lists them too)."""
+    defaults = BucketDefaults.from_settings(ctx.settings)
+    with common.service_errors():
+        return [item_of(row, defaults) for row in await service_for(ctx).list_rows(TABLE)]
+
+
+def limits_answer(ctx: Any, rows: list[dict[str, Any]], tq: TableQuery) -> dict[str, Any]:
+    """One page of `limit_rows` as the `GET /upstream-limits` table answer, with the defaults and the adaptive
+    controller's switch."""
+    defaults = BucketDefaults.from_settings(ctx.settings)
+    items, total = common.page_rows(rows, tq, search_keys=SEARCH_KEYS)
     answer = common.table_answer(SPEC, tq, items, total)
     answer["defaults"] = {
         "host": {"per_min": defaults.host.per_min, "burst": defaults.host.burst},
         "endpoint": {"per_min": defaults.endpoint.per_min, "burst": defaults.endpoint.burst},
     }
-    answer["adaptive_enabled"] = bool(get_ctx(request).settings.get("adaptive_rate_enabled"))
+    answer["adaptive_enabled"] = bool(ctx.settings.get("adaptive_rate_enabled"))
     return answer
 
 
@@ -223,4 +239,4 @@ async def delete_limit(
     }
 
 
-__all__ = ["SPEC", "router"]
+__all__ = ["SPEC", "item_of", "limit_rows", "limits_answer", "router"]

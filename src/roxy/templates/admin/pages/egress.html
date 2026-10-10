@@ -1,0 +1,33 @@
+{#-
+  The Egress page (`roxy/admin/pages/egress.py`): bytes per egress path, the rotator's quota, health and exits.
+
+  Layout: usage and the budget first (how much leaves, and what the rotator will cost this cycle), the endpoints
+  that use the most bytes (the page's main table), the rotator (its health, URL and settings), its exit addresses
+  and sessions side by side, and the leak guard last. `how_to_read` extends the registry's text with glossary terms.
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="/admin/upstream">{{ icon("upstream") }}<span>Upstream</span></a>
+<a class="btn btn--ghost" href="/admin/credential">{{ icon("key") }}<span>Credential</span></a>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>Words used here: an {{ term("egress") }} is a path out to Roblox; the {{ term("rotator") }} is the DataImpulse gateway, billed per byte against a monthly {{ term("quota") }}; the {{ term("direct-path", "direct path") }} leaves from the server's own address; the {{ term("leak-guard", "leak guard") }} stops any anonymous call that would carry the credential.</p>
+<p>Bytes here are decimal (1 GB is 1,000,000,000 bytes), the unit DataImpulse bills in, and they are metered on the wire, TLS and the proxy's own exchange included. Exit addresses are masked to the network unless you reveal them, and every reveal is written to the audit log.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["usage"] }}
+{{ cards["budget"] }}
+{{ cards["top-endpoints"] }}
+{{ cards["rotator"] }}
+<div class="grid grid--2 g3-pair">
+  {{ cards["exit-ips"] }}
+  {{ cards["sessions"] }}
+</div>
+{{ cards["trips"] }}
+{% endblock %}

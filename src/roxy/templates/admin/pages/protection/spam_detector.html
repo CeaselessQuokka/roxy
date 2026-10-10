@@ -1,0 +1,19 @@
+{#-
+  Protection page, cards `spam-<detector>` (`roxy/admin/pages/protection.py _make_detector_card`): one spam
+  detector each (rate, refused, probe, auth, enum, bust, dist; plan 10.3).
+
+  What: what the detector watches and its shipped default, what it does now (its action, or "would ban" in dry
+  run), its threshold and window, and its decisions in the range (`GET /protection/spam`, the same answer as the
+  Spam detectors card). Its six settings (`protection#spam-<detector>` in the catalog) sit below, open.
+  Context: `frame`, `detector`, `dry_run`, `master`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/badges.html" import badge, status_badge %}
+{% set d = detector %}
+{% call page_card(frame, subtitle=d.signal) %}
+<p>{% if d.effective_action == "off" %}{{ status_badge("neutral", "Off") }}{% elif d.effective_action == "ban" %}{{ status_badge("bad", d.action_label) }}{% elif d.effective_action == "would_ban" %}{{ status_badge("info", d.action_label) }}{% else %}{{ status_badge("ok", d.action_label) }}{% endif %}
+  When it sees more than {{ d.threshold }} over {{ d.window }}{% if d.recommend_only %}, it raises a recommendation (this detector never bans){% endif %}.</p>
+<p class="field__hint">Shipped default: {{ d.default }}{% if not master %} The detectors are switched off on the Spam detectors card.{% elif dry_run and d.settings.action == "ban" %} While the detectors are in dry run, a ban is only recorded as "would have banned".{% endif %}</p>
+<p>{% if d.decisions_total %}{% for row in d.decision_rows %}{{ badge(row.label ~ ": " ~ num(row.count), "neutral") }} {% endfor %}{% else %}<span class="muted">No decisions in this range.</span>{% endif %}</p>
+{% endcall %}

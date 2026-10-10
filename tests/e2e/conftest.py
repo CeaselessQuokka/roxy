@@ -7,6 +7,16 @@ What this is
     page (tests/e2e/spike/), and a `/csp-report` collector. `browser` is one headless Chromium per session;
     `open_page(...)` makes a fresh context per test that records every CSP violation, console error and page error.
 
+    The dashboard pages (P11) need the whole app instead: `dashboard` is `roxy.admin.pages.testing.DashboardServer`
+    (the real app with its lifespan on a FREE loopback port, its own temporary state, a local Roblox stand-in, an
+    admin signed in through the real password and TOTP steps, and seeded traffic, audit rows, a recommendation and
+    a health run), one per test session. `open_admin(path, theme=..., width=..., height=...)` opens a page in a
+    fresh browser context that carries that admin's session cookie and records CSP violations, console errors and
+    page errors (`AdminPage.problems()`); `AdminPage.settle()` scrolls every lazy card into view and waits for htmx,
+    `AdminPage.axe()` runs axe-core, `AdminPage.shot(name)` saves a full-page screenshot to
+    `.remake/p11_reports/shots/<page>_<theme>_<width>.png`. `roxy.admin.pages.testing` `VIEWPORTS` and `THEMES`
+    are the sizes and themes every page is checked in (plan 14.9: 1440x900 and 390x844, dark and light).
+
 Why it exists
     The design system has to be proven in a real browser: the CSP spike (plan 9.2, a P0 gate item moved to P11),
     axe-core accessibility checks in both themes and at phone and desktop sizes (plan 14.9, 19.8), and the
@@ -20,7 +30,8 @@ How it works
     (plan 19.12); the socket guard in tests/conftest.py still applies to the test process itself.
 
 What to read next
-    tests/e2e/test_csp_spike.py, tests/e2e/test_design_system.py, src/roxy/admin/gallery.py.
+    tests/e2e/test_csp_spike.py, tests/e2e/test_design_system.py, src/roxy/admin/gallery.py,
+    tests/e2e/test_page_audit.py (the reference dashboard page), `.remake/P11_CONTRACT.md`.
 """
 
 from __future__ import annotations
@@ -30,7 +41,7 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -238,3 +249,163 @@ def wait_js() -> Callable[..., Any]:
 def axe() -> Callable[[Any], list[dict[str, Any]]]:
     """The run_axe helper as a fixture."""
     return run_axe
+
+
+# ============================================================================================ dashboard pages (P11)
+
+REPO_ROOT = HERE.parents[1]
+SHOTS_DIR = REPO_ROOT / ".remake" / "p11_reports" / "shots"
+
+# Console lines that are not page faults: Chromium's own notes about the favicon request of a fresh context.
+_IGNORED_CONSOLE = ("favicon.ico",)
+
+# Waits for htmx to be idle: no request in flight, no swap still settling (new content carries `htmx-added` until
+# htmx has bound its triggers, about 20 ms after the swap) and no lazy card still loading.
+_SETTLED = """() => !document.querySelector(
+  '.htmx-request, .htmx-swapping, .htmx-settling, .htmx-added, [aria-busy="true"].page-card--lazy')"""
+
+
+_ANIMATIONS_DONE = """() => document.getAnimations().every(
+  (a) => a.playState !== "running" || a.effect.getComputedTiming().iterations === Infinity)"""
+
+
+@pytest.fixture(scope="session")
+def dashboard() -> Iterator[Any]:
+    """The real app on a free port with a signed-in admin and seeded data (see the module docstring)."""
+    from roxy.admin.pages.testing import DashboardServer
+
+    server = DashboardServer.start(seed=True)
+    try:
+        yield server
+    finally:
+        server.stop()
+
+
+@dataclass
+class AdminPage(PageRecord):
+    """A dashboard page in its own browser context, signed in as the dashboard admin."""
+
+    base_url: str = ""
+    theme: str = "dark"
+    width: int = 1440
+
+    def wait(self, expression: str, timeout: float = 10.0) -> Any:
+        """`wait_for_js` on this page (a JavaScript expression, polled until truthy), then until htmx is idle: a
+        test that types into content htmx just swapped in, before htmx bound its triggers, would wait forever."""
+        value = wait_for_js(self.page, expression, timeout)
+        wait_for_js(self.page, _SETTLED, timeout)
+        return value
+
+    def goto(self, path: str, *, settle: bool = True) -> Any:
+        response = self.page.goto(self.base_url + path, wait_until="load")
+        if settle:
+            self.settle()
+        return response
+
+    def settle(self, timeout: float = 15.0) -> None:
+        """Scroll every lazy card into view (they load on `revealed`) and wait until htmx is idle."""
+        for _ in range(4):
+            lazy = self.page.evaluate("document.querySelectorAll('.page-card--lazy').length")
+            if not lazy:
+                break
+            self.page.evaluate(
+                "() => { for (const el of document.querySelectorAll('.page-card--lazy')) el.scrollIntoView(); }"
+            )
+            wait_for_js(self.page, _SETTLED, timeout)
+        wait_for_js(self.page, _SETTLED, timeout)
+        self.page.evaluate("window.scrollTo(0, 0)")
+
+    def problems(self, expected: Sequence[str] = ()) -> list[str]:
+        """Console errors, uncaught page errors and CSP violations so far (each a readable line). `expected` lists
+        parts of console lines a test provoked on purpose (Chromium logs every 4xx answer as an error, so a flow
+        that meets a 403 `reauth_required` or a 422 passes `expected=["status of 403"]`)."""
+        found = [
+            line
+            for line in self.console
+            if line.startswith("error:")
+            and not line.endswith(_IGNORED_CONSOLE)
+            and not any(part in line for part in expected)
+        ]
+        found += [f"page error: {error}" for error in self.errors]
+        found += [f"CSP: {item}" for item in self.csp_violations()]
+        return found
+
+    def assert_clean(self, expected: Sequence[str] = ()) -> None:
+        problems = self.problems(expected)
+        assert not problems, f"{self.page.url} ({self.theme}, {self.width}px): {problems}"
+
+    def axe(self) -> list[dict[str, Any]]:
+        """axe-core on the page as it is now, once every finite animation (a dialog opening, a toast) has ended:
+        axe measures contrast on the colors it sees, and a half-faded element would be a false finding."""
+        wait_for_js(self.page, _ANIMATIONS_DONE)
+        return run_axe(self.page)
+
+    def shot(self, page_id: str) -> Path:
+        """Save a full-page screenshot as `<page>_<theme>_<width>.png` (look at it before reporting)."""
+        SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        path = SHOTS_DIR / f"{page_id}_{self.theme}_{self.width}.png"
+        self.page.screenshot(path=str(path), full_page=True)
+        return path
+
+    def overflows(self) -> bool:
+        """True when the page scrolls sideways (a phone layout must not)."""
+        return bool(self.page.evaluate("document.documentElement.scrollWidth > window.innerWidth + 1"))
+
+
+@pytest.fixture
+def open_admin(browser: Any, dashboard: Any) -> Iterator[Callable[..., AdminPage]]:
+    """`open_admin(path, theme="dark", width=1440, height=900, signed_in=True)`: an `AdminPage` loaded and settled.
+
+    The theme is the admin's saved preference (`POST /admin/api/v1/prefs`), so the server renders it into the
+    first paint as it does for a real admin; the browser's color scheme matches it."""
+    from roxy.admin.pages.testing import SESSION_COOKIE_NAME
+
+    contexts: list[Any] = []
+
+    def factory(
+        path: str | None = None,
+        *,
+        theme: str = "dark",
+        width: int = 1440,
+        height: int = 900,
+        signed_in: bool = True,
+        settle: bool = True,
+    ) -> AdminPage:
+        if signed_in:
+            answer = dashboard.api("POST", "prefs", json={"theme": theme})
+            assert answer.status_code == 200, answer.text
+        context = browser.new_context(
+            viewport={"width": width, "height": height},
+            color_scheme=theme,
+            base_url=dashboard.base_url,
+            accept_downloads=True,
+        )
+        contexts.append(context)
+        if signed_in:
+            # Chromium refuses a `__Host-` cookie given with `url` on http, but takes it by host and path (what a
+            # sign-in on 127.0.0.1 stores: loopback counts as a secure origin for cookies).
+            context.add_cookies(
+                [
+                    {
+                        "name": SESSION_COOKIE_NAME,
+                        "value": dashboard.signed_in.cookie,
+                        "domain": "127.0.0.1",
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": True,
+                        "sameSite": "Strict",
+                    }
+                ]
+            )
+        page = context.new_page()
+        record = AdminPage(page, base_url=dashboard.base_url, theme=theme, width=width)
+        page.add_init_script(CSP_RECORDER)
+        page.on("console", lambda message: record.console.append(f"{message.type}: {message.text}"))
+        page.on("pageerror", lambda error: record.errors.append(str(error)))
+        if path is not None:
+            record.goto(path, settle=settle)
+        return record
+
+    yield factory
+    for context in contexts:
+        context.close()

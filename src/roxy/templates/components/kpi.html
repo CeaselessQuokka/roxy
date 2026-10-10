@@ -3,9 +3,14 @@
 
   What: `kpi_tile("Roblox 429s", "12", delta=-38.0, good="down", spark=[...], status="ok", href="/admin/upstream")`.
   Put tiles inside `<div class="kpi-grid">` (4 to 6 per row on a desktop, 2 per row on a phone, plan 14.8).
+  `kpi_api(tile)` renders one admin API KPI answer (DESIGN.md 13: `{key, label, value, unit, delta, delta_pct,
+  good_direction, sparkline: [[t, v]], help, notice, partial}`) with the same tile: the value formatted by its
+  metric unit, the delta in percent, the catalog's help, and `data-kpi="<key>"` on the tile.
   Why: a tile answers three questions at a glance: how much, better or worse than before, and is it fine. The
   status uses color AND an icon with words (plan 14.9), the delta says "an improvement" or "getting worse" to
-  screen readers, and the whole tile is one link to the chart that explains the number.
+  screen readers, and the whole tile is one link to the chart that explains the number. Plan 6.8: when a reset
+  touched the tile's data (`partial`, or a `notice`), the tile shows the notice INSTEAD of a delta, because a
+  delta over partial data would mislead.
   How: `value` is pre-formatted text (use components/format.html); `status` is ok, warn, bad or info and adds a
   colored edge plus `status_label`; `baseline` is an optional reference line such as "v1 baseline 116".
   The stretched link covers the tile, while the help button stays on top of it and keeps working.
@@ -13,22 +18,43 @@
 {% from "components/icon.html" import icon %}
 {% from "components/badges.html" import delta as delta_badge, help_dot, TONE_ICONS %}
 {% from "components/chart.html" import sparkline %}
+{% from "components/format.html" import metric_value, unit_suffix %}
 
 {% macro kpi_tile(label, value, unit="", delta=None, good="up", compare_label="vs the previous period", spark=None,
                   spark_compare=None, status=None, status_label=None, help=None, href=None, baseline=None,
-                  level=3, id=None) -%}
-<article class="kpi{% if status %} kpi--{{ status }}{% endif %}{% if href %} kpi--link{% endif %}"{% if id %} id="{{ id }}"{% endif %}>
+                  level=3, id=None, key=None, notice=None) -%}
+<article class="kpi{% if status %} kpi--{{ status }}{% endif %}{% if href %} kpi--link{% endif %}{% if notice %} kpi--partial{% endif %}"{% if id %} id="{{ id }}"{% endif %}{% if key %} data-kpi="{{ key }}"{% endif %}>
   <header class="kpi__head">
     <h{{ level }} class="kpi__label">{{ label }}</h{{ level }}>
     {% if help %}{{ help_dot(label, help) }}{% endif %}
   </header>
   <p class="kpi__value"><span class="kpi__number">{{ value }}</span>{% if unit %}<span class="kpi__unit">{{ unit }}</span>{% endif %}</p>
   <div class="kpi__meta">
-    {% if delta is not none %}{{ delta_badge(delta, good, compare_label) }}{% endif %}
+    {% if notice %}<span class="kpi__notice">{{ icon("info") }}<span>{{ notice }}</span></span>
+    {% elif delta is not none %}{{ delta_badge(delta, good, compare_label) }}{% endif %}
     {% if status and status_label %}<span class="kpi__status kpi__status--{{ status }}">{{ icon(TONE_ICONS.get(status, "info")) }}{{ status_label }}</span>{% endif %}
     {% if baseline %}<span class="kpi__baseline">{{ baseline }}</span>{% endif %}
   </div>
   {% if spark %}<div class="kpi__spark">{{ sparkline(spark, spark_compare, label=label ~ " trend", tone=status or "accent") }}</div>{% endif %}
   {% if href %}<a class="kpi__link" href="{{ href }}"><span class="sr-only">Open the {{ label }} chart</span></a>{% endif %}
 </article>
+{%- endmacro %}
+
+{% macro kpi_api(tile, href=None, compare_label="vs the previous period", status=None, status_label=None,
+                 baseline=None, display=None, level=3) -%}
+{%- set values = [] -%}
+{%- for point in (tile.sparkline or []) %}{% if point[1] is number %}{% set _ = values.append(point[1]) %}{% endif %}{% endfor -%}
+{%- set partial = tile.partial or tile.notice -%}
+{%- set shown = display if display is not none else metric_value(tile.value, tile.unit or "", tile.key or "") -%}
+{{ kpi_tile(tile.label or tile.key, shown, unit=unit_suffix(tile.unit or "", tile.key or ""),
+            delta=None if partial else tile.delta_pct, good=tile.good_direction or "neutral", compare_label=compare_label,
+            spark=values if values|length > 1 else None, status=status, status_label=status_label,
+            help=tile.help or None, href=href, baseline=baseline, level=level, key=tile.key,
+            notice=(tile.notice or "Part of this data was reset; no comparison is shown.") if partial else None) }}
+{%- endmacro %}
+
+{% macro kpi_grid(tiles, hrefs=None, compare_label="vs the previous period") -%}
+<div class="kpi-grid">
+  {% for tile in tiles %}{{ kpi_api(tile, href=(hrefs or {}).get(tile.key), compare_label=compare_label) }}{% endfor %}
+</div>
 {%- endmacro %}

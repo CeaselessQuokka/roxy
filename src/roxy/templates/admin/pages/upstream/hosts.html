@@ -1,0 +1,20 @@
+{#-
+  Upstream page, card `hosts` (`roxy/admin/pages/upstream.py hosts_card`): the health of each Roblox host.
+
+  The `GET /admin/api/v1/upstream/hosts` table (calls, 429 and 5xx rates, failures, latency, the host bucket's fill
+  and rate, v1's last success and last error; the error summary is caller text), and which hosts Roxy may call at
+  all (`strict_host_allowlist`, `allowed_roblox_hosts`: the card's settings, below).
+  Context: `frame`, `table`, `strict`, `allowed`.
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/badges.html" import badge %}
+{% call page_card(frame, flush=True) %}
+<p class="g3-pad muted">
+  {% if strict %}{{ badge("Strict", "ok", "check") }} Roxy calls only the {{ allowed|length }} hosts in <code>allowed_roblox_hosts</code>; a request for any other host is answered 404 "Not a Roblox URL".
+  {% else %}{{ badge("Open", "warn", "alert-triangle") }} Roxy calls any <code>*.roblox.com</code> host (<code>strict_host_allowlist</code> is off), which widens what a caller can reach.{% endif %}
+</p>
+<div class="g3-table-host" hx-select="#{{ table.id }}">{{ data_table(**table) }}</div>
+{% endcall %}
+{% endif %}

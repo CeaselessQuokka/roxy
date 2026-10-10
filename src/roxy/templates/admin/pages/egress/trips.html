@@ -1,0 +1,50 @@
+{#-
+  Egress page, card `trips` (`roxy/admin/pages/egress.py trips_card`): the leak guard (plan C2 item 4).
+
+  Every egress the leak guard disabled (fleet-wide rows from `GET /admin/api/v1/egress/trips`): since when, where
+  in the call it found the credential, the purpose and the request id, and a form to re-enable it
+  (`POST /admin/api/v1/egress/{name}/enable`: a fresh second factor and a reason, audited). Then this worker's guard
+  counters (calls inspected, trips, auth smuggling refusals). A trip means a bug or an attack, so the card points to
+  the runbook. The location text may quote what a caller sent: it is shown as caller text.
+  Context: `frame`, `items`, `guard`, `runbook`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num, caller_text %}
+{% from "admin/pages/upstream/_macros.html" import when %}
+{% call page_card(frame) %}
+{% for item in items %}
+<div class="g3-trip">
+  {{ inline_alert("bad", item.label ~ " is disabled by the leak guard", "An anonymous call would have carried the credential, so the leak guard stopped it and switched this egress off. Read the runbook \"" ~ runbook ~ "\" before you turn it back on.") }}
+  <dl class="kv">
+    <dt>Since</dt><dd>{{ when(item.since_cell) }}</dd>
+    <dt>Where</dt><dd>{{ caller_text(item.location, 200) }}</dd>
+    <dt>Purpose</dt><dd>{{ caller_text(item.purpose, 80) }}</dd>
+    <dt>Request</dt><dd class="mono">{{ item.request_id or "n/a" }}</dd>
+  </dl>
+  <form class="stack g3-form" data-api-form data-api-url="{{ item.enable_url }}" data-api-method="POST"
+        data-success="Egress enabled again." data-on-success="refresh" data-refresh="trips usage" novalidate>
+    <div class="field">
+      <label class="field__label" for="enable-{{ item.egress }}-reason">Why it is safe again <span class="muted">(required, saved in the audit log)</span></label>
+      <textarea class="input" id="enable-{{ item.egress }}-reason" name="reason" rows="2" maxlength="500" required data-json="string" aria-describedby="enable-{{ item.egress }}-error"></textarea>
+      <p class="field__error" id="enable-{{ item.egress }}-error" data-field-error="reason" hidden></p>
+    </div>
+    <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    <div class="cluster"><button type="submit" class="btn btn--warn" data-action="egress-enable">{{ icon("play") }}<span>Turn {{ item.label|lower }} back on</span></button><span class="muted">Asks for a current code from your authenticator app.</span></div>
+  </form>
+</div>
+{% else %}
+{{ empty_state("The leak guard has not stopped anything", "Every anonymous call is checked for the credential before it leaves. If one ever carried it, the call would be stopped, that egress switched off, and you would get an alert.", tone="good") }}
+{% endfor %}
+{% if guard %}
+<div class="table-scroll g3-scroll" role="region" aria-labelledby="guard-caption" tabindex="0">
+  <table class="simple-table g3-table">
+    <caption id="guard-caption" class="g3-caption">Guard counters on this worker</caption>
+    <thead><tr><th scope="col">Egress</th><th scope="col" class="num">Calls checked</th><th scope="col" class="num">Trips</th><th scope="col" class="num">Smuggling refused</th></tr></thead>
+    <tbody>{% for g in guard %}<tr><td>{{ g.label }}</td><td class="num">{{ num(g.inspected) }}</td><td class="num">{{ num(g.leak_trips) }}</td><td class="num">{{ num(g.smuggling) }}</td></tr>{% endfor %}</tbody>
+  </table>
+</div>
+{% endif %}
+{% endcall %}

@@ -1,0 +1,63 @@
+{#-
+  Data page, card `backups` (`roxy/admin/pages/data.py backups_card`): the nightly backup as `backup.sh` recorded it
+  (`GET /admin/api/v1/data/backups`), the last "Back up now" request it answered (`last_request`: ran, skipped
+  because a good backup was recent, or skipped for want of a database), a request still waiting for it
+  (`pending_request`), and the snapshots on this server (reset and Back up now copies, within
+  `snapshots_max_bytes`). "Back up now" opens the page's dialog (data.html); static/js/pages/data.js shows what it
+  asked, copied, replaced and skipped (`request`, `snapshots`, `replaced`, `skipped`). Texts `backup.sh` wrote are
+  shown as text. Context: `frame`, `nightly`, `success`, `success_when`, `failure`, `failure_when`, `restore`,
+  `restore_when`, `last_request`, `last_request_when`, `last_request_asked`, `last_request_outcome`, `pending`,
+  `pending_asked`, `snapshots`, `snapshot_count`, `snapshots_bytes`, `snapshots_max_bytes`, `snapshots_pct`,
+  `keep_days`, `note`, `human_bytes`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import caller_text, num %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/icon.html" import icon %}
+{% from "admin/pages/data/_macros.html" import when %}
+{% set actions %}<button type="button" class="btn btn--sm" data-dialog-open="dlg-backup" data-action="backup-now-card">{{ icon("download") }}<span>Back up now</span></button>{% endset %}
+{% call page_card(frame, actions=actions) %}
+<dl class="kv data-backups__facts">
+  <dt>Last nightly backup</dt>
+  <dd>
+    {% if success %}
+    {{ status_badge("ok", "Succeeded") }} {{ when(success_when, success.at or "n/a") }}
+    <span class="dt__sub">{{ num(success.files|length) }} {{ "file" if success.files|length == 1 else "files" }}{% if success.encrypted %}, encrypted{% endif %}{% if success.remote %}, copied off the server{% else %}, kept on this server only{% endif %}</span>
+    {% elif nightly.known %}{{ status_badge("warn", "No successful backup recorded yet") }}
+    {% else %}<span class="muted">{{ nightly.note or "No nightly backup has been recorded on this server yet." }}</span>{% endif %}
+  </dd>
+  {% if failure %}
+  <dt>Last failure</dt>
+  <dd>{{ status_badge("bad", "Failed") }} {{ when(failure_when, failure.at or "n/a") }}{% if failure.step %}<span class="dt__sub">At step {{ caller_text(failure.step, 60) }}</span>{% endif %}{% if failure.error %}<span class="dt__sub">{{ caller_text(failure.error, 300) }}</span>{% endif %}</dd>
+  {% endif %}
+  {% if restore %}
+  <dt>Restore test</dt>
+  <dd>{% if restore.ok is sameas true %}{{ status_badge("ok", "Passed") }}{% elif restore.ok is sameas false %}{{ status_badge("bad", "Failed") }}{% else %}{{ status_badge("neutral", "Not run automatically") }}{% endif %} {{ when(restore_when, "") }}{% if restore.detail %}<span class="dt__sub">{{ caller_text(restore.detail, 300) }}</span>{% endif %}</dd>
+  {% endif %}
+  <dt>Last Back up now</dt>
+  <dd>{% if last_request %}{{ last_request_outcome }}, {{ when(last_request_when) }}<span class="dt__sub">Asked {{ when(last_request_asked, last_request.requested_at or "n/a") }}{% if last_request.by %} by {{ caller_text(last_request.by, 80) }}{% endif %}</span>{% else %}<span class="muted">No request answered yet.</span>{% endif %}</dd>
+  <dt>Waiting to run</dt>
+  <dd>{% if pending %}{% if pending.unreadable %}{{ status_badge("warn", "A request file is waiting but cannot be read") }}{% else %}{{ status_badge("info", "Asked " ~ (pending_asked.text if pending_asked else (pending.requested_at or "just now"))) }}{% if pending.by %} <span class="muted">by {{ caller_text(pending.by, 80) }}</span>{% endif %}{% endif %}{% else %}<span class="muted">Nothing waiting.</span>{% endif %}</dd>
+</dl>
+<div class="data-op-result" data-op-result="backups" role="status" aria-live="polite"></div>
+<section class="data-snapshots stack" aria-labelledby="data-snapshots-title">
+  <h3 class="data-snapshots__title" id="data-snapshots-title">Snapshots on this server</h3>
+  <p class="muted">{{ num(snapshot_count) }} {{ "copy" if snapshot_count == 1 else "copies" }}, {{ human_bytes(snapshots_bytes) }} of {{ human_bytes(snapshots_max_bytes) }}{% if snapshots_pct is not none %} ({{ snapshots_pct }}%){% endif %}; each is kept {{ keep_days }} days. Reset copies undo a reset; manual copies come from Back up now.</p>
+  {% if snapshots %}
+  <div class="table-scroll" role="region" aria-labelledby="data-snapshots-title" tabindex="0">
+    <table class="simple-table data-table">
+      <caption class="sr-only">Snapshot files on this server, newest first</caption>
+      <thead><tr><th scope="col">File</th><th scope="col">Kind</th><th scope="col" class="num">Size</th><th scope="col">Taken</th></tr></thead>
+      <tbody>
+        {% for s in snapshots %}
+        <tr><td data-label="File" class="mono">{{ s.file }}</td><td data-label="Kind">{{ {"reset": "Before a reset", "manual": "Back up now", "premigrate": "Before a migration"}.get(s.kind, s.kind) }}</td><td data-label="Size" class="num">{{ human_bytes(s.bytes) }}</td><td data-label="Taken">{{ when(s.when) }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="muted">No snapshot is kept on this server right now.</p>
+  {% endif %}
+</section>
+<p class="muted data-note">{{ note }}</p>
+{% endcall %}

@@ -1,0 +1,36 @@
+{#-
+  Clients page, card `client-score` (`roxy/admin/pages/clients.py client_score_card`): the bot score explained.
+
+  The formula, each signal's weight and its share of the score now (labels from the catalog's `bot_weight_*`
+  settings, one source), and how the scores the fleet recorded in the last 25 hours fall against the legitimate
+  and abusive thresholds; the bot settings (`clients#client-score`) follow, placed by the page card.
+  Context: `frame`, `signals`, `total_weight`, `legit_max`, `abuse_min`, `block`, `scored`, `legit`, `abusive`,
+  `blocked_now`, `middle`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/glossary.html" import term with context %}
+{% call page_card(frame) %}
+<p class="clients-intro">The {{ term("bot-score", "bot score") }} adds up signals that a client is a script rather than a game server: a library User-Agent, no Roblox signature, probes, refusals, a machine-regular rhythm, an unusual header order and cache-busting query strings. Each signal is between 0 and 1; the score is 100 times the weighted average, so it runs from 0 (looks like a game server) to 100 (looks like a script). No single signal proves anything, which is why they are combined; the score blocks nothing unless you set a block threshold.</p>
+<div class="grid grid--2">
+  <div class="table-scroll" role="region" aria-labelledby="client-score-weights-caption" tabindex="0">
+    <table class="simple-table">
+      <caption class="sr-only" id="client-score-weights-caption">Bot score signals and their weights now</caption>
+      <thead><tr><th scope="col">Signal</th><th scope="col" class="num">Weight</th><th scope="col" class="num">Share of the score</th></tr></thead>
+      <tbody>
+        {% for s in signals %}<tr><th scope="row">{{ s.label }}</th><td class="num">{{ num(s.weight) }}</td><td class="num">{{ "%.1f"|format(s.share) }}%</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div>
+    <p class="cache-fact__title">Recorded scores, last 25 hours (every worker)</p>
+    <dl class="kv">
+      <dt>Clients scored</dt><dd>{{ num(scored) }}</dd>
+      <dt>Look legitimate</dt><dd>{{ num(legit) }} <span class="muted">(score {{ legit_max }} or lower)</span></dd>
+      <dt>In between</dt><dd>{{ num(middle) }}</dd>
+      <dt>Look abusive</dt><dd>{{ num(abusive) }} <span class="muted">(score {{ abuse_min }} or higher)</span></dd>
+      <dt>Blocking</dt><dd>{% if block %}{{ num(blocked_now) }} <span class="muted">at or above the block threshold {{ block }}</span>{% else %}<span class="muted">off: the score blocks nothing</span>{% endif %}</dd>
+    </dl>
+  </div>
+</div>
+{% endcall %}

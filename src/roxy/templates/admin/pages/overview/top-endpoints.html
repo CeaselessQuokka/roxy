@@ -1,0 +1,39 @@
+{#-
+  Overview, card `top-endpoints` (`roxy/admin/pages/overview.py top_endpoints_card`): the endpoint templates callers
+  asked for most in the range (plan 14.1; v1's Top Endpoints, map row 11, which lives in full on the Endpoints page).
+
+  At most ten rows from `build_breakdown`. A template is built from callers' paths, so it is caller text: shown with
+  `caller_text`, linked only through `local_href` to the Endpoints page filtered to it. On a phone the table turns
+  into one block per row with each value labeled (overview.css), so the page never scrolls sideways.
+  Context: `frame`, `rows`, `all_href`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num, pct, caller_text, local_href, metric_value %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/icon.html" import icon %}
+{% set more %}<a class="btn btn--sm btn--ghost" href="{{ local_href(all_href) }}">{{ icon("endpoints") }}<span>Every endpoint</span></a>{% endset %}
+{% call page_card(frame, actions=more) %}
+{% if rows %}
+<div class="table-scroll ov-top-wrap" role="region" aria-labelledby="{{ frame.id }}-caption" tabindex="0">
+<table class="ov-top">
+  <caption id="{{ frame.id }}-caption" class="sr-only">The busiest endpoint templates of the range</caption>
+  <thead><tr><th scope="col">Endpoint</th><th scope="col" class="num">Requests</th><th scope="col" class="num">Upstream calls</th><th scope="col" class="num">Avoided</th><th scope="col" class="num">Roblox 429s</th><th scope="col" class="num">p95</th></tr></thead>
+  <tbody>
+    {% for row in rows %}
+    {% set href = local_href(row.href) %}
+    <tr>
+      <th scope="row" class="ov-top__key">{% if href %}<a href="{{ href }}">{{ caller_text(row.key, 160) }}</a>{% else %}{{ caller_text(row.key, 160) }}{% endif %}</th>
+      <td class="num" data-label="Requests">{{ num(row.requests) }}</td>
+      <td class="num" data-label="Upstream calls">{{ num(row.upstream_calls) }}</td>
+      <td class="num" data-label="Avoided">{{ metric_value(row.avoided_pct, "percent") }}</td>
+      <td class="num" data-label="Roblox 429s">{{ num(row.roblox_429) }}</td>
+      <td class="num" data-label="p95">{% if row.p95_ms is not none %}{{ metric_value(row.p95_ms, "ms") }} ms{% else %}n/a{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+{{ empty_state("No endpoint was called in this range", "Endpoints appear here once callers send requests through the proxy. Try a longer range in the top bar.", "endpoints", "neutral") }}
+{% endif %}
+{% endcall %}

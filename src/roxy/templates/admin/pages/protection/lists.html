@@ -1,0 +1,64 @@
+{#-
+  Protection page, card `lists` (`roxy/admin/pages/protection.py lists_card`): the deny list and the admin
+  allowlist (plan 10.5, D6).
+
+  What: two tabs, each a table (`GET /protection/access/deny` and `/access/allow_admin`) with its hits and expiry,
+  and an "Add" form (`POST /access/deny`; `POST /access/allow_admin` needs a fresh second factor, which the form
+  asks for and then retries). A row opens the entry in the drawer (`detail=<id>`, `_access_drawer.html`).
+  Context: `frame`, `tables`, `only`, `your_ip`, `allowlist_on`, `api`; for the drawer `detail`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, reason_field, field_error %}
+
+{% macro access_form(id, kind, url, title, lines) -%}
+{% call confirm_dialog(id, title, url, confirm_label="Add", api=True, danger=(kind == "deny"), success="Added.",
+                       on_success="refresh", refresh="lists", consequences=lines) %}
+  <div class="field">
+    <label class="field__label" for="{{ id }}-cidr">Address or network (CIDR)</label>
+    <input class="input mono" id="{{ id }}-cidr" name="cidr" required aria-required="true" maxlength="100" autocomplete="off" spellcheck="false" placeholder="203.0.113.0/24" aria-describedby="{{ id }}-cidr-error">
+    {{ field_error("cidr", id ~ "-cidr-error") }}
+  </div>
+  <div class="field-row">
+    <div class="field">
+      <label class="field__label" for="{{ id }}-hours">Expires after (hours, optional)</label>
+      <input class="input input--num" id="{{ id }}-hours" name="expires_in_h" inputmode="decimal" data-json="float" aria-describedby="{{ id }}-hours-hint {{ id }}-hours-error">
+      <p class="field__hint" id="{{ id }}-hours-hint">Leave it empty for an entry that never expires.</p>
+      {{ field_error("expires_in_h", id ~ "-hours-error") }}
+    </div>
+    <div class="field">
+      <label class="field__label" for="{{ id }}-note">Note <span class="muted">(private)</span></label>
+      <input class="input" id="{{ id }}-note" name="note" maxlength="300" aria-describedby="{{ id }}-note-error">
+      {{ field_error("note", id ~ "-note-error") }}
+    </div>
+  </div>
+  {{ reason_field(id ~ "-reason") }}
+{% endcall %}
+{%- endmacro %}
+
+{% if detail %}{% include "admin/pages/protection/_access_drawer.html" %}
+{% elif only %}{{ data_table(**tables[only]) }}{% else %}
+{% call page_card(frame) %}
+<p>The {{ term("allowlist-denylist", "deny list") }} refuses an address or network before any other check (like a ban, but meant for networks you never want). The admin allowlist decides who can reach /admin at all {% if allowlist_on %}({{ status_badge("ok", "On") }}){% else %}({{ status_badge("neutral", "Off") }}: switch it on in <a href="/admin/security#admin-access">Security &gt; Admin access</a>){% endif %}. Your address is <span class="mono">{{ your_ip }}</span>.</p>
+{% call tabs("prot-lists-tabs", [("deny", "Deny list"), ("allow-admin", "Admin allowlist")], "Lists") %}
+  {% call tab_panel("prot-lists-tabs", "deny", first=True) %}
+    <div class="prot-tabbar"><button type="button" class="btn btn--sm" data-dialog-open="dlg-prot-deny-add" aria-haspopup="dialog" data-action="deny-add">{{ icon("plus") }}<span>Deny an address</span></button></div>
+    {{ data_table(**tables.deny) }}
+  {% endcall %}
+  {% call tab_panel("prot-lists-tabs", "allow-admin") %}
+    <div class="prot-tabbar"><button type="button" class="btn btn--sm" data-dialog-open="dlg-prot-allow-add" aria-haspopup="dialog" data-action="allow-admin-add">{{ icon("plus") }}<span>Allow a network into /admin</span></button></div>
+    {{ data_table(**tables["allow-admin"]) }}
+  {% endcall %}
+{% endcall %}
+{{ access_form("dlg-prot-deny-add", "deny", api.deny, "Deny an address or network",
+               ["Every request from it is refused before any other check (except pause).",
+                "Prefer an expiry: addresses change hands. The entry is written to the audit log."]) }}
+{{ access_form("dlg-prot-allow-add", "allow_admin", api.allow_admin, "Allow a network into /admin",
+               ["While the admin allowlist is on, only listed networks can reach /admin (everyone else gets a plain 404).",
+                "This needs your second factor again: the list decides who can see the dashboard."]) }}
+{% endcall %}
+{% endif %}

@@ -54,9 +54,11 @@ from load.fleet import (
     ResourceSampler,
     SlotSampler,
     base_env,
+    last_per_worker,
     prepare_state,
     roblox_429_rows,
     roxy_totals,
+    unit_environment,
     upstream_limits,
     worker_history,
     write_rates,
@@ -143,6 +145,10 @@ class Options:
     keep: bool = False
     steady_rate: float = 200.0
     """Requests a second of the `steady` scenario (plan 6.7 states its targets at 200)."""
+    steady_connections: int = 96
+    """Client connections of the `steady` scenario. At a rate the server cannot answer in time, the client's pool
+    fills and requests wait for a connection (the "client lag" row); a ceiling run raises it (`--steady-connections`)
+    so the server, not the client, sets the rate."""
     overrides: tuple[tuple[str, Any], ...] = ()
     """Settings applied on top of every scenario's own (`--set key=value`), for "what if" runs. A run with
     overrides is not the reference measurement; the table says which ones applied."""
@@ -186,6 +192,7 @@ class System:
         out["upstream_limits"] = [row for row in upstream_limits(self.env) if row["origin"] != "default"]
         out["workers"] = worker_history(self.env, self.wall_start)
         out["tracebacks"] = self.fleet.log_count("Traceback")
+        out["unit_environment"] = unit_environment(self.fleet.tree)  # what roxy@.service sets (allocator tuning)
         # Signs of a saturated hot.db writer: a hot-path write whose 500 ms budget ran out in the queue.
         out["abuse_degraded"] = self.fleet.log_count('"event":"abuse_degraded"')
         out["singleflight_publish_failed"] = self.fleet.log_count('"event":"singleflight_publish_failed"')
@@ -277,6 +284,35 @@ def missing_retry_after(outcomes: Iterable[Outcome]) -> int:
     return sum(1 for o in outcomes if o.status in (429, 503) and not o.retry_after)
 
 
+def hot_lock_summary(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per worker, from its last metrics pipeline sample: hot.db write lock wait and hold percentiles over every
+    transaction since it started, and group commit counts (LOAD-3). Empty when the server does not report them."""
+    rows = []
+    for worker, sample in sorted(last_per_worker(samples).items()):
+        if sample.get("hot_lock_wait_ms") is None:
+            continue
+        rows.append(
+            {
+                "worker": worker,
+                "lock_wait_ms": sample["hot_lock_wait_ms"],
+                "hold_ms": sample["hot_hold_ms"],
+                "groups": sample.get("hot_groups"),
+                "grouped_writes": sample.get("hot_grouped_writes"),
+                "largest_group": sample.get("hot_largest_group"),
+            }
+        )
+    return rows
+
+
+def lock_text(row: Mapping[str, Any]) -> str:
+    wait, hold = row["lock_wait_ms"], row["hold_ms"]
+    return (
+        f"wait {fmt(wait.get('p50'))}/{fmt(wait.get('p99'))}/{fmt(wait.get('max'))}, "
+        f"hold {fmt(hold.get('p50'))}/{fmt(hold.get('p99'))}/{fmt(hold.get('max'))} "
+        f"(n={fmt(wait.get('n'))}, {fmt(row.get('grouped_writes'))} grouped, largest {fmt(row.get('largest_group'))})"
+    )
+
+
 def common_rows(result: dict[str, Any], opts: Options | None = None) -> list[Row]:
     memory = result["memory"]
     overrides: list[Row] = []
@@ -286,6 +322,9 @@ def common_rows(result: dict[str, Any], opts: Options | None = None) -> list[Row
     if opts is not None and opts.worker_env:
         text = ", ".join(f"{key}={value}" for key, value in opts.worker_env)
         overrides.append(("worker environment (--worker-env)", text, "not the reference run"))
+    if result.get("unit_environment"):
+        text = ", ".join(f"{key}={value}" for key, value in result["unit_environment"].items())
+        overrides.append(("environment from roxy@.service", text, "as systemd sets it in production"))
     workers = memory["worker_peak_rss_mib"]
     uss = memory["worker_peak_uss_mib"]
     timeline = memory.get("timeline") or []
@@ -298,7 +337,7 @@ def common_rows(result: dict[str, Any], opts: Options | None = None) -> list[Row
         (
             "peak memory of the color",
             f"PSS {memory['color_peak_pss_mib']} MiB (RSS sum {memory['color_peak_rss_sum_mib']} MiB)",
-            "MemoryHigh 320M, MemoryMax 420M",
+            "MemoryHigh 350M, MemoryMax 450M",
         ),
         ("memory over the run", growth, "a plateau, not steady growth"),
         (
@@ -353,7 +392,9 @@ def steady(opts: Options, *, rate: float | None = None, duration_s: float = 60.0
         probe.start()
         sys_.sampler.mark("start")
         started = time.monotonic()
-        t0, outcomes = run_plan(sys_.fleet.base_url, plan, processes=2, options=ClientOptions(connections=96))
+        t0, outcomes = run_plan(
+            sys_.fleet.base_url, plan, processes=2, options=ClientOptions(connections=opts.steady_connections)
+        )
         sys_.sampler.mark("end")
         cpu = sys_.sampler.cpu_percent("start", "end", time.monotonic() - started)
         probe.stop()
@@ -393,6 +434,7 @@ def steady(opts: Options, *, rate: float | None = None, duration_s: float = 60.0
         "metrics_dropped": max((s.get("metrics_dropped") or 0 for s in probe.samples), default=None),
         "hot_pending_max": max((s.get("hot_pending") or 0 for s in probe.samples), default=None),
         "hot_writes_per_s": write_rates(probe.samples),
+        "hot_lock": hot_lock_summary(probe.samples),
     }
     d = out.data
     out.rows = [
@@ -424,6 +466,11 @@ def steady(opts: Options, *, rate: float | None = None, duration_s: float = 60.0
             "hot.db writer",
             f"{list(d['hot_writes_per_s'].values())} writes/s per worker; queue up to {fmt(d['hot_pending_max'])}",
             "one writer thread per worker",
+        ),
+        (
+            "hot.db write lock, every transaction",
+            "; ".join(lock_text(row) for row in d["hot_lock"]) or "n/a",
+            "wait for it and hold it (p50 / p99 / max bucket bounds, ms)",
         ),
         ("recorded by Roxy", f"{fmt(roxy['requests'])} of {len(outcomes):,} sent", "equal"),
         ("client lag", f"p50 {fmt(d['client_lag_ms']['p50'])} / p99 {fmt(d['client_lag_ms']['p99'])} ms", ""),

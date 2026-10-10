@@ -3581,3 +3581,273 @@ dialog::backdrop {
     margin-bottom: var(--sp-2);
   }
 }
+
+/* ------------------------------------------------------------------------------------------- dashboard pages (P11)
+ * What the page kit adds (roxy/admin/pages): caller text, page cards and their inline settings, notices, the API
+ * forms' field errors, the setting review, "Confirm it is you" and the preferences dialog.
+ */
+
+/* Text a caller chose (format.html caller_text): plain text, isolated for bidirectional text, wraps anywhere. */
+.caller-text {
+  unicode-bidi: isolate;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.caller-text--block {
+  display: block;
+  white-space: pre-wrap;
+}
+
+.caller-text__cut {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  white-space: nowrap;
+}
+
+.page-cards {
+  min-width: 0;
+}
+
+.page-card--lazy .card__body {
+  min-height: 96px;
+}
+
+.page-card__loading {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.card__notice,
+.page-notice,
+.dt__notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  margin: var(--sp-3) var(--sp-4) 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-left: 3px solid var(--info);
+  border-radius: var(--radius);
+  background: var(--info-soft);
+  font-size: var(--fs-1);
+}
+
+.page-notice {
+  margin: 0 0 var(--sp-4);
+}
+
+.dt__notice {
+  margin: 0 var(--sp-4) var(--sp-3);
+}
+
+.card__notice .icon,
+.page-notice .icon,
+.dt__notice .icon {
+  flex: none;
+  margin-top: 2px;
+  color: var(--info);
+}
+
+/* Inline settings at the foot of a card (plan 15.6). */
+.card-settings {
+  border-top: 1px solid var(--border);
+}
+
+.card-settings__summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--target-min);
+  padding: var(--sp-2) var(--sp-4);
+  color: var(--text-muted);
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+  list-style: none;
+}
+
+.card-settings__summary::-webkit-details-marker {
+  display: none;
+}
+
+.card-settings__summary:hover {
+  color: var(--text);
+}
+
+.card-settings__chevron {
+  margin-left: auto;
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.card-settings[open] .card-settings__chevron {
+  transform: rotate(180deg);
+}
+
+.card-settings__list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
+  gap: var(--sp-3);
+  padding: 0 var(--sp-4) var(--sp-4);
+}
+
+/* KPI tiles over partial data (plan 6.8): the notice replaces the delta. */
+.kpi__notice {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.kpi__notice .icon {
+  flex: none;
+  color: var(--info);
+}
+
+/* Chart notices (partial data) and the annotation list of API charts. */
+.chart__notices {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0 0 var(--sp-2);
+  padding: 0;
+  list-style: none;
+}
+
+.chart__notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.chart__notice .icon {
+  flex: none;
+  color: var(--info);
+}
+
+/* Field errors of API forms (static/js/api_forms.js) and the dialogs' extras. */
+.field__error {
+  color: var(--bad);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+}
+
+form[aria-busy="true"] {
+  cursor: progress;
+}
+
+.dialog__appendix {
+  padding: 0 var(--sp-5) var(--sp-5);
+}
+
+.dialog__extra > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: var(--target-min);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.dialog__extra[open] > summary {
+  margin-bottom: var(--sp-2);
+}
+
+/* The inline setting's review step (static/js/settings_api.js). */
+.setting__review {
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+  font-size: var(--fs-1);
+}
+
+.setting__review-title {
+  font-weight: var(--fw-semibold);
+}
+
+.setting__review-risk {
+  color: var(--bad);
+  font-weight: var(--fw-semibold);
+}
+
+.setting__mfa {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+/* "Confirm it is you" and the preferences dialog. */
+.reauth__method {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.reauth__code {
+  max-width: 16ch;
+  font-size: var(--fs-4);
+  letter-spacing: 0.08em;
+}
+
+.prefs-dialog {
+  width: min(640px, calc(100vw - 32px));
+}
+
+.prefs-dialog__body {
+  display: grid;
+  gap: var(--sp-5);
+}
+
+.prefs-dialog__section {
+  display: grid;
+  gap: var(--sp-3);
+}
+
+.prefs-dialog__heading {
+  font-size: var(--fs-3);
+}
+
+.coming-list {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding-left: var(--sp-5);
+}
+
+/* A table's first cell is the button that opens its row: a time stacks over its "2 minutes ago" line. */
+.dt__table td:first-child .link-btn[data-dt-open] {
+  display: inline-block;
+  text-align: start;
+}
+
+.dt__table time {
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .card-settings__list {
+    padding: 0 var(--sp-3) var(--sp-3);
+  }
+
+  /* Filter chips take the full width on a phone, one per line, like the search box above them. */
+  .dt__state .chip-select {
+    flex: 1 1 100%;
+  }
+
+  .dt__state .chip-select select {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .card__notice {
+    margin: var(--sp-3) var(--sp-3) 0;
+  }
+}

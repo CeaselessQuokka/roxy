@@ -1,0 +1,86 @@
+{#-
+  Macros shared by the Cache and Clients pages (both built by one page builder; roxy/admin/pages/cache.py and
+  roxy/admin/pages/clients.py).
+
+  What
+    `reset_dialog(r, refresh=..., on_success=...)`: the confirm dialog of a plan 6.8 data reset (a metric family
+    such as `cache_stats` or `activity`, or one client). It posts JSON to `POST /admin/api/v1/data/resets` with the
+    scope, the preview digest the server computed for exactly that scope (`data.build_plan(...).digest`), a reason
+    and, when the plan asks for one, the typed phrase (sent as `confirm`, the API checks it again). When it opens,
+    the page script asks `POST /data/resets/preview` for the exact row counts and shows the API's own summary.
+    `fill_note()`: the line a shared confirm dialog shows its target in (the page script writes it as text).
+    `timeline(steps)`: v1's "what happens to one request" steps (strong words and state badges, all plain text).
+  Why
+    A reset cannot be undone, so it gets a deliberate dialog with plain-language consequences and, for a whole
+    family, the typed phrase (plan 6.8, 14.5); the API stays the one place that validates and audits it.
+  How
+    Plain markup with the data-api-form contract of static/js/api_forms.js and the `typeConfirm` Alpine component
+    (static/js/components.js); no inline style or handler (plan 9.2).
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import badge %}
+
+{% macro reset_dialog(r, refresh="", on_success="refresh") -%}
+<dialog class="dialog dialog--danger" id="{{ r.id }}" aria-labelledby="{{ r.id }}-title" aria-describedby="{{ r.id }}-desc" data-reset-dialog>
+  <form class="dialog__form" data-dialog-form x-data="typeConfirm" x-on:reset="clear" data-expected="{{ r.phrase or '' }}"
+        data-api-form data-api-url="/admin/api/v1/data/resets" data-api-method="POST"
+        data-success="{{ r.success or 'Done. The reset is written to the audit log.' }}" data-on-success="{{ on_success }}"{% if refresh %} data-refresh="{{ refresh }}"{% endif %}
+        data-reset-preview="/admin/api/v1/data/resets/preview">
+    <header class="dialog__head">
+      <h2 class="dialog__title" id="{{ r.id }}-title">{{ icon("alert-triangle", cls="dialog__title-icon") }}{{ r.title }}</h2>
+      <button type="button" class="icon-btn" data-dialog-close aria-label="Close">{{ icon("x") }}</button>
+    </header>
+    <div class="dialog__body">
+      <div id="{{ r.id }}-desc">
+        <p class="dialog__label">What happens</p>
+        <ul class="dialog__consequences">{% for c in r.consequences %}<li>{{ c }}</li>{% endfor %}</ul>
+        <p class="muted" data-reset-summary>Roxy counts the rows this would delete when this dialog opens.</p>
+        {% if r.note %}<p class="muted">{{ r.note }}</p>{% endif %}
+      </div>
+      <input type="hidden" name="scope" value="{{ r.scope or 'family' }}" data-json="string">
+      {% if r.family %}<input type="hidden" name="families" value="{{ r.family }}" data-json="list">{% endif %}
+      {% if r.client_type %}<input type="hidden" name="client_type" value="{{ r.client_type }}" data-json="string"><input type="hidden" name="client" value="{{ r.client }}" data-json="string">{% endif %}
+      <input type="hidden" name="preview" value="{{ r.digest or '' }}" data-json="string" data-reset-digest>
+      {% if not r.digest %}<p class="field__error">This reset could not be prepared right now; close the dialog and try again in a moment.</p>{% endif %}
+      <div class="field">
+        <label class="field__label" for="{{ r.id }}-reason">Reason <span class="muted">({% if r.phrase %}required, {% endif %}saved in the audit log)</span></label>
+        <textarea class="input" id="{{ r.id }}-reason" name="reason" rows="2" maxlength="500"{% if r.phrase %} required aria-required="true"{% endif %} data-json="skip-empty"></textarea>
+      </div>
+      {% if r.phrase %}
+      <div class="field">
+        <label class="field__label" for="{{ r.id }}-confirm">Type <strong class="mono">{{ r.phrase }}</strong> to confirm</label>
+        <input class="input mono" id="{{ r.id }}-confirm" name="confirm" autocomplete="off" spellcheck="false" autocapitalize="off"
+               required aria-required="true" x-on:input="onType" data-json="string" aria-describedby="{{ r.id }}-confirm-hint">
+        <p class="field__hint" id="{{ r.id }}-confirm-hint">This cannot be undone, so the button stays off until the text matches.</p>
+      </div>
+      {% endif %}
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    </div>
+    <footer class="dialog__foot">
+      <button type="button" class="btn btn--ghost" data-dialog-close>Cancel</button>
+      <button type="submit" class="btn btn--danger" x-bind:disabled="blocked">{{ r.confirm_label or "Reset" }}</button>
+    </footer>
+  </form>
+</dialog>
+{%- endmacro %}
+
+{% macro fill_note(label="Target") -%}
+<p class="fill-note"><span class="fill-note__label">{{ label }}:</span> <span class="caller-text mono" dir="auto" translate="no" data-fill-label></span></p>
+{%- endmacro %}
+
+{% macro timeline(steps, label_id) -%}
+<ol class="req-timeline" aria-labelledby="{{ label_id }}">
+  {% for step in steps %}
+  <li class="req-timeline__step">
+    <span class="req-timeline__at">{{ step.at }}</span>
+    <p class="req-timeline__what">
+      {%- for part in step.parts -%}
+      {%- if part.strong is defined %}<strong>{{ part.strong }}</strong>
+      {%- elif part.badge is defined %}{{ badge(part.badge, part.tone or "neutral") }}
+      {%- else %}{{ part.text }}{% endif -%}
+      {%- endfor -%}
+    </p>
+  </li>
+  {% endfor %}
+</ol>
+{%- endmacro %}

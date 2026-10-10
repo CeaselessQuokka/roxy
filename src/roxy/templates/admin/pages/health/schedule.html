@@ -1,0 +1,19 @@
+{#-
+  Health, card `schedule` (`roxy/admin/pages/health.py schedule_card`): automatic runs (plan 13.1 "optional
+  schedule", 13.3). The `health#schedule` catalog settings (`health_auto_interval_h`, `health_auto_include_credential`)
+  are placed below the body by the page card; this body says in words what they do now.
+  Context: `frame`, `enabled`, `interval_h`, `include_credential`, `last`, `next`, `job_seen`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import status_badge %}
+{% call page_card(frame) %}
+<dl class="kv hl-schedule">
+  <dt>Automatic runs</dt>
+  <dd>{% if enabled %}{{ status_badge("ok", "On") }} Every {{ "%g"|format(interval_h) }} hours, run by the leader; a new failure sends an alert.{% else %}{{ status_badge("neutral", "Off") }} Runs happen only when you press Run.{% endif %}</dd>
+  <dt>Credential check</dt>
+  <dd>{% if include_credential %}Included: each scheduled run spends one call on the Roblox account.{% else %}Left out of scheduled runs, to save the account's calls (plan 13.3).{% endif %}</dd>
+  <dt>Last scheduled run</dt>
+  <dd>{{ last or "None yet" }}</dd>
+  {% if enabled %}<dt>Next</dt><dd>{% if next %}About {{ next }}{% else %}Within about 5 minutes of the next check of the schedule{% endif %}</dd>{% endif %}
+</dl>
+{% endcall %}

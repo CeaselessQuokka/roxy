@@ -48,6 +48,16 @@ EnvironmentFile=/etc/roxy/%i.env
 # ROXY_NGINX_WORKER_CONNECTIONS, plan 15.3 L). The leading "-" makes it optional: before the first nginx apply
 # the file does not exist yet, and the app only uses it for a consistency check (H-NGINX).
 EnvironmentFile=-/etc/roxy/nginx-hints.env
+# glibc malloc tuning, measured in a 35 minute soak of the load harness (docs/PERFORMANCE.md, finding LOAD-2): at
+# most two malloc arenas instead of eight per CPU, so memory freed by one thread is reused by the others rather than
+# kept in a per-thread arena (the worker runs about 20 threads: SQLite readers and writers, the log writer)...
+Environment=MALLOC_ARENA_MAX=2
+# ...blocks of 128 KiB and more always come from mmap and go straight back to the system when freed (glibc otherwise
+# raises this threshold after the first large free, and later large blocks stay in the heap as fragmentation)...
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+# ...and free memory above 128 KiB at the top of the heap is returned at once. Together they kept the leader worker
+# 15 MiB and the other worker 5 MiB smaller (color PSS 327 against 347 MiB after 35 minutes).
+Environment=MALLOC_TRIM_THRESHOLD_=131072
 # Secrets as systemd credentials (plan 9.8): systemd copies each file into a private tmpfs that only this service
 # can read and sets $CREDENTIALS_DIRECTORY; they never appear in the environment or on a command line. Every
 # source file must exist (systemd refuses to start otherwise); an optional one (alert_webhook_url, or rotator_url
@@ -108,12 +118,15 @@ RuntimeDirectoryMode=0750
 UMask=0027
 # Account memory per unit so MemoryHigh and MemoryMax apply and the System page can read memory.current.
 MemoryAccounting=yes
-# Above 320 MB the kernel reclaims this color's memory aggressively before anything is killed. Sized for the
-# 909 MB server without swap (DESIGN.md section 0): two colors overlap during a deploy, and both together must
-# leave room for nginx and the operating system.
-MemoryHigh=320M
-# The hard ceiling: past 420 MB the kernel OOM-kills inside this unit only, and Restart= brings it back.
-MemoryMax=420M
+# Above 350 MiB the kernel reclaims this color's memory aggressively (page cache first) before anything is killed.
+# Sized for the 909 MB server without swap (DESIGN.md section 0) from the 35 minute soak (docs/PERFORMANCE.md,
+# finding LOAD-2): a color measured 332 MiB of PSS and was still rising slowly (about 0.6 MiB a minute, every bound
+# filling), so 320M throttled it; two colors at 350M plus about 200 MB for nginx and the OS still fit in 909 MB, and
+# gunicorn recycles each worker after about 20,000 requests (max_requests), which caps slow growth anyway.
+MemoryHigh=350M
+# The hard ceiling: past 450 MiB the kernel OOM-kills inside this unit only, and Restart= brings it back. The
+# 100 MiB above MemoryHigh is room for short peaks (an hourly LLM export file, a dry run, a 16 MiB table download).
+MemoryMax=450M
 # At most 256 processes and threads: fork-bomb containment (2 workers with their thread pools need far fewer).
 TasksMax=256
 # Many concurrent sockets per worker (async connections, tarpit holds, upstream pools).

@@ -1,0 +1,64 @@
+{#-
+  The Cache page (`roxy/admin/pages/cache.py`): ten cards in the registry's order, plus the confirm dialogs the
+  cards and their drawers share.
+
+  The dialogs live here, outside the cards, so a card refresh never removes one that is open. A button names its
+  dialog with `data-dialog-open` and fills it with `data-fill` (JSON built on the server: the hidden fields, the
+  API URL `_url` of a remove, the `_label` the dialog shows as text); static/js/pages/cache.js copies the values in.
+  Every dialog posts JSON to the cache API (audited first, purges fleet-wide) and refreshes the cards it affects.
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/cache/_shared.html" import fill_note %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="/admin/recommendations">{{ icon("bulb") }}<span>Recommendations</span></a>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>When two callers ask the same question, Roxy asks Roblox once and gives both the same answer. That is the whole idea, and it is the only control that does not depend on who is asking: a Roblox game reaches Roxy from hundreds of server addresses, so per-address limits see a new caller each time, while Roblox sees one proxy asking the same thing again and again. Answering the repeats from the cache is what keeps Roblox from rate-limiting Roxy.</p>
+<p>Words with a dotted underline, such as {{ term("hit") }}, {{ term("stale") }} and {{ term("ignored-param", "ignored parameter") }}, show their meaning when you hover or focus them. Stored keys, endpoint templates and bodies can contain text that callers sent; they are always shown as plain text.</p>
+{% endblock %}
+
+{% block cards %}
+{% for card_id in card_order %}{{ cards[card_id] }}{% endfor %}
+
+{% call confirm_dialog("dlg-cache-purge", "Purge these stored answers?", action="/admin/api/v1/cache/purge", api=True, danger=True,
+    confirm_label="Purge", reason=True, on_success="refresh", refresh="stats browser spread endpoints",
+    success="Purged. Every worker drops these answers within a second.",
+    hidden={"scope": "search", "value": "", "type": "glob", "include_stale": "false"}, hidden_types={"include_stale": "bool"},
+    consequences=["Every stored answer this matches is deleted now, on every worker.",
+                  "The next caller asking for one of them goes to Roblox again, so expect a few more upstream calls for a while.",
+                  "The purge is written to the audit log first."]) %}
+{{ fill_note("What is purged") }}
+{% endcall %}
+
+{% call confirm_dialog("dlg-cache-purge-all", "Empty the whole cache?", action="/admin/api/v1/cache/purge", api=True, danger=True,
+    confirm_label="Purge everything", reason=True, type_to_confirm="purge all", on_success="refresh",
+    refresh="stats browser spread endpoints", success="The cache is empty. Every worker dropped its copies.",
+    hidden={"scope": "all", "confirm": "true"}, hidden_types={"confirm": "bool"},
+    consequences=["Every stored answer is deleted, on every worker, at once.",
+                  "The next request for each question goes to Roblox, so expect a burst of upstream calls right after.",
+                  "Settings, rules and statistics stay as they are."]) %}
+{% endcall %}
+
+{% call confirm_dialog("dlg-cache-unignore", "Put this parameter back into the cache key?", action="/admin/api/v1/cache/ignored-params", method="delete",
+    api=True, danger=True, confirm_label="Put it back", reason=True, on_success="refresh", refresh="ignored-params spread browser",
+    success="The parameter is part of the cache key again.",
+    consequences=["Requests that differ in this parameter become different questions again, each with its own stored answer.",
+                  "The answers stored without it are purged, because callers with different values shared them."]) %}
+{{ fill_note("Parameter") }}
+{% endcall %}
+
+{% call confirm_dialog("dlg-cache-rule-delete", "Remove this cache rule?", action="/admin/api/v1/cache/rules", method="delete",
+    api=True, danger=True, confirm_label="Remove the rule", reason=True, on_success="refresh", refresh="rules browser endpoints",
+    success="The rule is removed; its endpoints use the default lifetime again.",
+    consequences=["The endpoints this rule covers fall back to the default lifetime (or another rule that matches).",
+                  "The answers stored under this rule are purged, so they do not keep its lifetime.",
+                  "The removal is written to the audit log; the rule can be added again by hand."]) %}
+{{ fill_note("Rule") }}
+{% endcall %}
+{% endblock %}

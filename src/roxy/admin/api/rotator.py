@@ -63,8 +63,15 @@ def _pool(request: Request) -> Any:
 
 async def describe(request: Request) -> dict[str, Any]:
     """The rotator URL state the page shows: masked URL, source, UI value metadata (never the URL itself)."""
-    ctx = get_ctx(request)
-    pool = _pool(request)
+    return await state_view(get_ctx(request))
+
+
+async def state_view(ctx: Any) -> dict[str, Any]:
+    """`describe` for a worker context (the Egress page's Rotator card calls it, plan P6)."""
+    egress = ctx.egress
+    if egress is None:
+        raise common.unavailable("The egress layer is not running yet; try again shortly.")
+    pool = egress.rotator
     with common.service_errors():
         stored = await ctx.dbs.control.read(read_state.rotator_store_meta)
     source = pool.url_source()
@@ -117,4 +124,4 @@ async def revert_url(
     return await describe(request) | {"reverted": True}
 
 
-__all__ = ["RESTART_NOTE", "router"]
+__all__ = ["RESTART_NOTE", "router", "state_view"]

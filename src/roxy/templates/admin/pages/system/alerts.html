@@ -1,0 +1,25 @@
+{#-
+  System page, card `alerts` (`roxy/admin/pages/system.py alerts_card`): alert channels and their settings.
+
+  Which channels have their systemd credentials, by name only (`system_api.environment_view`, never a value), and
+  whether the webhook is switched on; the alert settings (catalog anchor `system#alerts`, the same keys as
+  Settings > Alerts) follow below the body. Context: `frame`, `channels`, `webhook_on`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import status_badge %}
+{% call page_card(frame) %}
+<div class="stack">
+  <ul class="system-channels">
+    {% for channel in channels %}
+    <li class="system-channel">
+      <span class="system-channel__name">{{ "Email" if channel.name == "email" else "Webhook" }}</span>
+      {% if channel.configured and (channel.name != "webhook" or webhook_on) %}{{ status_badge("ok", "Configured") }}
+      {% elif channel.configured %}{{ status_badge("warn", "Configured, switched off") }}
+      {% else %}{{ status_badge("neutral", "Not configured") }}{% endif %}
+      <span class="muted system-channel__needs">Needs the {{ channel.credentials|join(" and ") }} credential{{ "s" if channel.credentials|length > 1 }}.</span>
+    </li>
+    {% endfor %}
+  </ul>
+  <p class="muted">Alert channels are systemd credentials on the server, never settings, so this page shows only whether each exists. When every channel fails, the <a href="/admin/help/runbooks#alert-channels-down">Alert channels down</a> runbook says what to check.</p>
+</div>
+{% endcall %}

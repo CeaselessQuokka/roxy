@@ -1,0 +1,184 @@
+{#-
+  Health, card `run` (`roxy/admin/pages/health.py run_card`): the Run button and the run view (plan 13.1).
+
+  The form starts a run through `POST /admin/api/v1/health/runs` (static/js/pages/health.js: 202 follows the new run,
+  409 `run_in_progress` follows the run already going, 403 `reauth_required` asks for the second factor first). The
+  run view is a checklist in plan 13.2 order: each check's status in words with an icon, its measured value and
+  threshold, what it means, its detail, the fix link (`local_href`), "Apply fix" when a recommendation is linked, and
+  "Copy for LLM" for a warning or failure. While the run is running, the checks still to come show "Waiting" and the
+  card follows the event stream. The card's refresh address names the run when one is chosen (`?run=`), so a refresh
+  keeps showing it. Context: `frame`, `run`, `pinned`, `compare`, `choices`, `notices`, `run_url`, `reauth_window_min`,
+  `page_path`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/format.html" import caller_text, local_href, num %}
+{% from "components/empty.html" import empty_state %}
+
+{#- One check: a one-line summary (status in words with an icon, title, id, measured value) that opens to what it
+    means, how it is judged, its detail and its actions. A check still to come shows "Waiting" and its thresholds. -#}
+{% macro check_row(row, open=False) -%}
+<li class="hl-check hl-check--{{ row.status.tone }}" data-check="{{ row.check_id }}" data-check-status="{{ row.status.raw }}">
+  {% if row.pending %}
+  <div class="hl-check__head hl-check__head--wait">
+    <span class="hl-check__status"><span class="spinner" aria-hidden="true"></span>{{ badge(row.status.words, row.status.tone) }}</span>
+    <span class="hl-check__title">{{ row.title }}</span>
+    <code class="hl-check__id">{{ caller_text(row.check_id, 120) }}</code>
+  </div>
+  {% else %}
+  <details class="hl-check__box"{% if open %} open{% endif %}>
+    <summary class="hl-check__head">
+      <span class="hl-check__status">{{ badge(row.status.words, row.status.tone, row.status.icon) }}</span>
+      <span class="hl-check__title">{{ row.title }}</span>
+      <code class="hl-check__id">{{ caller_text(row.check_id, 120) }}</code>
+      {% if row.critical %}{{ badge("Critical", "bad", "alert-octagon") }}{% endif %}
+      <span class="hl-check__value">{{ caller_text(row.value, 120) if row.value else "" }}</span>
+    </summary>
+    <div class="hl-check__body">
+      <dl class="hl-check__facts">
+        <div><dt>Measured</dt><dd>{{ caller_text(row.value, 300) if row.value else "n/a" }}</dd></div>
+        <div><dt>Judged by</dt><dd>{{ row.threshold or "n/a" }}</dd></div>
+      </dl>
+      <p class="hl-check__why">{{ caller_text(row.explanation, 2000, block=True) }}</p>
+      {% if row.detail %}
+      <dl class="kv hl-check__detail">
+        {% for label, value in row.detail %}<dt>{{ label }}</dt><dd>{{ caller_text(value, 300) }}</dd>{% endfor %}
+      </dl>
+      {% endif %}
+      {% set fix = local_href(row.fix_link) if row.fix_link else "" %}
+      {% if fix or row.apply_fix or row.llm %}
+      <div class="hl-check__actions cluster">
+        {% if row.apply_fix %}{% set apply_href = local_href(row.apply_fix.href) %}{% if apply_href %}<a class="btn btn--sm btn--primary" href="{{ apply_href }}" data-action="health-apply-fix">{{ icon("bulb") }}<span>Apply fix</span><span class="sr-only">: {{ row.apply_fix.rule_id }} for {{ row.check_id }}</span></a>{% endif %}{% endif %}
+        {% if fix %}<a class="btn btn--sm btn--ghost" href="{{ fix }}">{{ icon("external") }}<span>{{ row.fix_label }}</span></a>{% endif %}
+        {% if row.llm %}<button type="button" class="btn btn--sm btn--ghost" data-copy-llm="{{ row.llm }}">{{ icon("copy") }}<span>Copy for LLM</span><span class="sr-only">: {{ row.check_id }}</span></button>{% endif %}
+      </div>
+      {% endif %}
+    </div>
+  </details>
+  {% endif %}
+</li>
+{%- endmacro %}
+
+{% set src_params = {} %}
+{% if run and pinned %}{% set _ = src_params.update({"run": run.id}) %}{% endif %}
+{% if compare %}{% set _ = src_params.update({"with": compare.other}) %}{% endif %}
+{% set card_src = frame.fragment_url ~ (("&" if "?" in frame.fragment_url else "?") ~ (src_params|urlencode) if src_params else "") %}
+{% call page_card(dict(frame, fragment_url=card_src), notices=notices) %}
+<form class="hl-start" data-health-start data-run-url="{{ run_url }}" data-health-page="{{ page_path }}" novalidate>
+  <label class="check hl-start__cred">
+    <input type="checkbox" name="include_credential" value="true" checked aria-describedby="hl-cred-hint">
+    <span>Include the credential check</span>
+  </label>
+  <p class="field__hint" id="hl-cred-hint">It spends one call on the Roblox account and asks for your second factor if you have not entered it in the last {{ reauth_window_min }} minutes. Leave it out to run every other check at once.</p>
+  <div class="cluster">
+    <button type="submit" class="btn btn--primary hl-start__button" id="hl-run-button" data-action="health-run">{{ icon("heart") }}<span>Run a health check</span></button>
+  </div>
+</form>
+
+{% if run %}
+<section class="hl-run" aria-labelledby="hl-run-title" data-run-id="{{ run.id }}" data-run-state="{{ run.state }}" data-run-pinned="{{ 'true' if pinned else 'false' }}" data-run-done="{{ run.done }}">
+  <div class="hl-run__head">
+    <h3 class="hl-run__title" id="hl-run-title">Run {{ run.id }}{% if not pinned %} <span class="muted">(the newest)</span>{% endif %}</h3>
+    {% if run.state == "running" %}{{ badge("Running", "info", "clock") }}{% elif run.worst %}{{ badge("Worst: " ~ run.worst.words, run.worst.tone, run.worst.icon) }}{% else %}{{ badge(run.state_words, "neutral") }}{% endif %}
+  </div>
+  <dl class="kv hl-run__facts">
+    <dt>Started</dt><dd>{% if run.started %}<time datetime="{{ run.started.datetime }}">{{ run.started.text }}</time> <span class="muted">({{ run.started.sub }})</span>{% else %}n/a{% endif %}</dd>
+    <dt>Who</dt><dd>{{ run.trigger }}{% if run.actor %} <span class="muted">({{ caller_text(run.actor, 80) }})</span>{% endif %}</dd>
+    <dt>State</dt><dd>{{ run.state_words }}{% if run.duration %}, took {{ run.duration }}{% endif %}{% if not run.credential %}; without the credential check{% endif %}</dd>
+  </dl>
+  {% if run.state == "running" %}
+  <div class="hl-progress">
+    <progress class="hl-progress__bar" max="{{ run.planned or 1 }}" value="{{ run.done }}" aria-labelledby="hl-progress-label"></progress>
+    <span id="hl-progress-label">{{ run.done }} of {{ run.planned }} checks done</span>
+  </div>
+  {% else %}
+  <p class="hl-counts">
+    {{ status_badge("ok", num(run.counts["pass"]) ~ " passed") }}
+    {{ status_badge("warn", num(run.counts["warn"]) ~ " warned") }}
+    {{ status_badge("bad", num(run.counts["fail"]) ~ " failed") }}
+    {{ badge(num(run.counts["n/a"]) ~ " n/a", "neutral") }}
+    {% if run.counts.critical %}{{ badge(num(run.counts.critical) ~ " critical", "bad", "alert-octagon") }}{% endif %}
+  </p>
+  {% endif %}
+
+  <div class="hl-tools cluster" role="group" aria-label="Run {{ run.id }}: exports">
+    <button type="button" class="btn btn--sm btn--ghost" data-copy-llm="{{ run.exports.llm }}" data-action="health-copy-llm">{{ icon("copy") }}<span>Copy whole run for LLM</span></button>
+    <button type="button" class="btn btn--sm btn--ghost" data-download="{{ run.exports.json }}">{{ icon("download") }}<span>JSON</span></button>
+    <button type="button" class="btn btn--sm btn--ghost" data-download="{{ run.exports.html }}">{{ icon("download") }}<span>Printable report</span></button>
+  </div>
+
+  {% if run.state == "running" %}
+  <ol class="hl-checks" role="list" aria-label="Checks of run {{ run.id }}, in the order they are listed in the catalog">
+    {% for row in run.rows %}{{ check_row(row) }}{% endfor %}
+  </ol>
+  {% else %}
+  {% set problems = run.rows|selectattr("status.raw", "in", ["warn", "fail"])|list %}
+  {% set others = run.rows|rejectattr("status.raw", "in", ["warn", "fail"])|list %}
+  {% if problems %}
+  <h4 class="hl-group__title" id="hl-problems-title">Needs attention ({{ problems|length }})</h4>
+  <ol class="hl-checks" role="list" aria-labelledby="hl-problems-title">
+    {% for row in problems %}{{ check_row(row, open=True) }}{% endfor %}
+  </ol>
+  {% else %}
+  <p class="hl-allgood">{{ status_badge("ok", "Nothing needs attention") }} Every check passed or does not apply here.</p>
+  {% endif %}
+  <details class="hl-group"{% if not problems %} open{% endif %}>
+    <summary class="hl-group__summary">The other {{ others|length }} checks ({{ run.counts["pass"] }} passed, {{ run.counts["n/a"] }} n/a)</summary>
+    <ol class="hl-checks hl-checks--quiet" role="list" aria-label="Checks that passed or do not apply">
+      {% for row in others %}{{ check_row(row) }}{% endfor %}
+    </ol>
+  </details>
+  {% endif %}
+
+  {% if run.state != "running" %}
+  <section class="hl-compare" aria-labelledby="hl-compare-title">
+    <h3 class="hl-compare__title" id="hl-compare-title">What changed</h3>
+    {% set cmp = run.comparison %}
+    {% if cmp and cmp.previous_run_id %}
+    <p>Since run {{ cmp.previous_run_id }}:
+      {% if cmp.new_failures %}<strong>newly failing:</strong> {% for check in cmp.new_failures %}<code>{{ caller_text(check, 120) }}</code>{{ ", " if not loop.last }}{% endfor %}.{% else %}no new failure.{% endif %}
+      {% if cmp.fixed %} <strong>Fixed:</strong> {% for check in cmp.fixed %}<code>{{ caller_text(check, 120) }}</code>{{ ", " if not loop.last }}{% endfor %}.{% endif %}
+    </p>
+    {% else %}
+    <p class="muted">This is the first finished run, so there is nothing to compare with yet.</p>
+    {% endif %}
+    {% if choices %}
+    <form class="hl-compare__form" method="get" action="{{ page_path }}">
+      <input type="hidden" name="run" value="{{ run.id }}">
+      <div class="field">
+        <label class="field__label" for="hl-compare-with">Compare with</label>
+        <div class="cluster">
+          <select class="input" id="hl-compare-with" name="with">
+            {% for choice in choices %}<option value="{{ choice.id }}"{% if compare and compare.other == choice.id %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}
+          </select>
+          <button type="submit" class="btn btn--ghost" data-action="health-compare">{{ icon("compare") }}<span>Compare</span></button>
+        </div>
+      </div>
+    </form>
+    {% endif %}
+    {% if compare %}
+    <div class="table-scroll" role="region" aria-labelledby="hl-compare-caption" tabindex="0" data-compare-with="{{ compare.other }}">
+      <table class="simple-table hl-compare__table">
+        <caption id="hl-compare-caption" class="hl-compare__caption">Run {{ compare.other }} against run {{ run.id }}, check by check</caption>
+        <thead><tr><th scope="col">Check</th><th scope="col">Change</th><th scope="col">Run {{ compare.other }}</th><th scope="col">Run {{ run.id }}</th></tr></thead>
+        <tbody>
+          {% for row in compare.rows %}
+          <tr data-change="{{ row.change }}">
+            <th scope="row">{{ row.title }} <code class="muted">{{ caller_text(row.check_id, 120) }}</code></th>
+            <td><span class="tone tone--{{ {'neutral': 'muted'}.get(row.tone, row.tone) }}">{{ row.words }}</span></td>
+            <td>{% if row.before %}{{ row.before.words }}{% if row.before_value %} <span class="muted">{{ caller_text(row.before_value, 120) }}</span>{% endif %}{% else %}<span class="muted">not run</span>{% endif %}</td>
+            <td>{% if row.after %}{{ row.after.words }}{% if row.after_value %} <span class="muted">{{ caller_text(row.after_value, 120) }}</span>{% endif %}{% else %}<span class="muted">not run</span>{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </section>
+  {% endif %}
+</section>
+{% else %}
+{{ empty_state("No health run yet", "Press Run a health check: every part of Roxy is checked in about a minute, and the result stays here so you can compare it with later runs.", "heart", "info") }}
+{% endif %}
+{% endcall %}

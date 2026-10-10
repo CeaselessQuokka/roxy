@@ -1,0 +1,76 @@
+{#-
+  Upstream page, card `trace` (`roxy/admin/pages/upstream.py trace_card`): "Why did this request wait?" (plan 7.12
+  and the 14.7 explainer) for one Roxy-Request-Id.
+
+  The form asks this card's own fragment (`?request_id=`) with htmx and swaps the card, so the answer is rendered by
+  the server from `GET /admin/api/v1/upstream/trace/{id}` (`trace_answer`). The explanation is inferred from what
+  Roxy keeps (the Live row for 15 minutes, the 429 log for 90 days, the minute bucket history) and says so. The
+  sentences quote endpoint templates and the request's path, so they are shown as caller text.
+  Context: `frame`, `request_id`, `answer` (or None), `error`, `live`, `when`, `minted`, `roblox_429s`,
+  `prior_429s`, `link`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/format.html" import num, caller_text, local_href %}
+{% from "admin/pages/upstream/_macros.html" import when as when_text %}
+{% call page_card(frame) %}
+<form class="g3-lookup" role="search" aria-label="Explain one request" hx-get="{{ frame.fragment_url }}" hx-target="#{{ frame.id }}" hx-swap="outerHTML">
+  <div class="field g3-lookup__field">
+    <label class="field__label" for="trace-request-id">Request id <span class="muted">(the Roxy-Request-Id header of the answer, 26 characters)</span></label>
+    <input class="input mono" type="text" id="trace-request-id" name="request_id" value="{{ request_id }}" maxlength="64" autocomplete="off" spellcheck="false"
+           placeholder="01J9Z..." aria-describedby="trace-request-id-error"{% if error %} aria-invalid="true"{% endif %}>
+    <p class="field__error" id="trace-request-id-error"{% if not error %} hidden{% endif %}>{{ error or "" }}</p>
+  </div>
+  <button type="submit" class="btn btn--primary" data-action="upstream-trace">{{ icon("search") }}<span>Explain</span></button>
+</form>
+{% if answer %}
+<div class="g3-trace" aria-live="polite">
+  {% if not answer.found %}
+  {{ inline_alert("info", "Nothing is kept for this request", "Live records last 15 minutes (sampled above 50 requests a second per worker) and Roblox 429s are kept 90 days. A request older than that, or one that never reached Roxy, cannot be explained.") }}
+  {% endif %}
+  <h3 class="g3-subhead">What happened</h3>
+  <ol class="g3-reasons">
+    {% for sentence in answer.reasons %}<li>{{ caller_text(sentence, 600) }}</li>{% endfor %}
+  </ol>
+  {% if live %}
+  <dl class="kv g3-trace__facts">
+    <dt>When</dt><dd>{{ when_text(when) }}</dd>
+    <dt>Request</dt><dd><span class="mono">{{ live.method }}</span> {{ caller_text(live.url, 300) }}</dd>
+    <dt>Answer</dt><dd>{{ live.status }}{% if live.upstream_status is not none %} <span class="muted">(Roblox answered {{ live.upstream_status }})</span>{% endif %}</dd>
+    <dt>Outcome</dt><dd class="mono">{{ live.outcome }}: {{ live.reason }}</dd>
+    <dt>Egress and cache</dt><dd>{{ live.egress }}, cache {{ live.cache }}</dd>
+    <dt>Time taken</dt><dd>{{ num(live.duration_ms, 1) }} ms, of which {{ num(live.queue_wait_ms, 1) }} ms waiting for a slot</dd>
+    <dt>Attempts</dt><dd>{{ live.attempts }} ({{ live.retries }} CSRF retries)</dd>
+    {% if live.upstream_error %}<dt>Error</dt><dd>{{ caller_text(live.upstream_error, 300, block=True) }}</dd>{% endif %}
+  </dl>
+  {% elif minted %}
+  <p class="muted">The request id was minted at <time datetime="{{ minted.datetime }}">{{ minted.text }}</time> ({{ minted.sub }}).</p>
+  {% endif %}
+  {% if answer.full_buckets %}
+  <h3 class="g3-subhead">Buckets that were full in that minute <span class="muted">(inferred)</span></h3>
+  <ul class="g3-list">
+    {% for b in answer.full_buckets %}<li>{{ caller_text(b.key, 200) }}: peak {{ b.fill_pct_peak }} percent, {{ num(b.rejections) }} reservations refused</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% if roblox_429s %}
+  <h3 class="g3-subhead">Roblox 429s this request met</h3>
+  <ul class="g3-list">
+    {% for r in roblox_429s %}<li>{{ when_text(r.when) }}: {{ caller_text(r.template, 200) }} through {{ r.egress }}{% if r.retry_after_s is not none %}, Retry-After {{ r.retry_after_s }} s{% endif %}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% if prior_429s %}
+  <h3 class="g3-subhead">The 429s that opened the cooldown</h3>
+  <ul class="g3-list">
+    {% for r in prior_429s %}<li>{{ when_text(r.when) }}: {{ caller_text(r.template, 200) }} through {{ r.egress }}{% if r.retry_after_s is not none %}, Retry-After {{ r.retry_after_s }} s{% endif %}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% if answer.capture_available %}
+  <p>{{ icon("eye") }} A capture of this request is still kept: open it from the <a href="/admin/live">Live page</a>.</p>
+  {% endif %}
+  {% set trace_href = local_href(link) %}{% if trace_href %}<p class="muted g3-trace__link">Link to this explanation: <a href="{{ trace_href }}">{{ trace_href }}</a></p>{% endif %}
+</div>
+{% elif not error %}
+<p class="muted">Paste the <code>Roxy-Request-Id</code> of a slow or failed answer. Roxy explains what it did: a cooldown opened by an earlier 429, a full bucket, a retry after a Roblox error, a CSRF round trip, or a cached answer.</p>
+{% endif %}
+{% endcall %}

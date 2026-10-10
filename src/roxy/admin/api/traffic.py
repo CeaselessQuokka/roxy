@@ -27,7 +27,9 @@ How it works
     and Roxy's text, so it counts as Roblox's (`relay`), in the table, the source series and the `roblox_5xx` and
     `roxy_5xx` tiles alike (finding parity-1). A series' reset notices name only resets of the data it reads
     (`queries.reset_touches`, plan 6.8). Tables page and sort on the server and export as CSV or JSON through the
-    shared `export_table` (audited, formula guarded).
+    shared `export_table` (audited, formula guarded). Each answer is built by a plain function over the worker
+    context (`requests_answer`, `status_answer`, `status_sources_answer`, ...), which the Traffic dashboard page
+    calls too, so the page and the API can never show different numbers.
 
 What to read next
     `roxy/admin/api/common.py`, `roxy/metrics/queries.py`, `roxy/admin/api/endpoints.py`.
@@ -225,19 +227,20 @@ def _delta(current: Any, previous: Any) -> tuple[float | None, float | None]:
     return round(change, 4), (round(change * 100.0 / previous, 2) if previous else None)
 
 
-# --------------------------------------------------------------------------------------------- routes
+# --------------------------------------------------------------------------------------------- page helpers
+#
+# The answers below are built by plain functions over the worker context, so the Traffic dashboard page
+# (`roxy/admin/pages/traffic.py`) renders exactly what these routes answer (DESIGN.md 13, one source of truth per
+# number); each route only adds the request plumbing (guards, the time range dependency, exports).
 
 
-@router.get("/requests")
-async def traffic_requests(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
-    """Requests over time stacked by outcome (plus the comparison and markers)."""
-    return await _series_answer(get_ctx(request), tr, ["requests"], group_by="outcome")
+async def requests_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """Requests over time stacked by outcome, with the comparison, markers and notices (`GET /traffic/requests`)."""
+    return await _series_answer(ctx, tr, ["requests"], group_by="outcome")
 
 
-@router.get("/bytes")
-async def traffic_bytes(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
-    """Caller and upstream bytes over time (plan 14.3 definitions), with totals and wire bytes per egress."""
-    ctx = get_ctx(request)
+async def bytes_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """Caller and upstream bytes over time with totals and wire bytes per egress (`GET /traffic/bytes`)."""
     answer = await _series_answer(ctx, tr, BYTE_METRICS)
     window = tr.window
 
@@ -250,10 +253,36 @@ async def traffic_bytes(request: Request, _admin: AdminSession, tr: TimeRangeDep
     return answer
 
 
+async def verbs_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """Requests over time per HTTP method (`GET /traffic/verbs`)."""
+    return await _series_answer(ctx, tr, ["requests"], group_by="method")
+
+
+async def dimension_table(ctx: Any, spec: TableSpec, dimension: str, tr: TimeRange, tq: TableQuery) -> dict[str, Any]:
+    """One page of a `queries.top_n` table over `dimension` (the verbs and latency split tables)."""
+    data = await queries.top_n(ctx.dbs.metrics, tr.window, dimension, page=tq.metrics_page())
+    return table_from_read_model(spec, tq, data)
+
+
+# --------------------------------------------------------------------------------------------- routes
+
+
+@router.get("/requests")
+async def traffic_requests(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
+    """Requests over time stacked by outcome (plus the comparison and markers)."""
+    return await requests_answer(get_ctx(request), tr)
+
+
+@router.get("/bytes")
+async def traffic_bytes(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
+    """Caller and upstream bytes over time (plan 14.3 definitions), with totals and wire bytes per egress."""
+    return await bytes_answer(get_ctx(request), tr)
+
+
 @router.get("/verbs")
 async def traffic_verbs(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
     """Requests over time per HTTP method (v1 "Requests" section, now time-bucketed)."""
-    return await _series_answer(get_ctx(request), tr, ["requests"], group_by="method")
+    return await verbs_answer(get_ctx(request), tr)
 
 
 async def _dimension_table(
@@ -275,8 +304,7 @@ async def _dimension_table(
             return list(data["rows"]), int(data["total"])
 
         return await export_pages(request, admin, spec, fetch, fmt, tq=tq, tr=tr)
-    data = await queries.top_n(db, tr.window, dimension, page=tq.metrics_page())
-    return table_from_read_model(spec, tq, data)
+    return await dimension_table(ctx, spec, dimension, tr, tq)
 
 
 @router.get("/verbs/table")
@@ -300,9 +328,16 @@ async def traffic_status(
 ) -> dict[str, Any]:
     """Status classes over time (`view=class`, with Roxy's and Roblox's 429s), or requests by who produced the
     caller's status (`view=source`: Roblox, relayed, Roxy, cache, internal; `queries.ANSWER_SOURCE_SQL`)."""
-    if view not in ("class", "source"):
+    return await status_answer(get_ctx(request), tr, view)
+
+
+STATUS_VIEWS: Final[tuple[str, ...]] = ("class", "source")
+
+
+async def status_answer(ctx: Any, tr: TimeRange, view: str) -> dict[str, Any]:
+    """The `GET /traffic/status` series for `view` (`class` or `source`; anything else is a 422)."""
+    if view not in STATUS_VIEWS:
         raise validation_error({"view": "Choose class or source."}, "The view is not valid.")
-    ctx = get_ctx(request)
     if view == "source":
         return await _series_answer(ctx, tr, ["requests"], group_by="answer_source")
     return await _series_answer(ctx, tr, STATUS_METRICS)
@@ -339,6 +374,15 @@ async def traffic_status_sources(
     (`relay` in the table, counted by `roblox_5xx`), and `roxy_5xx` ("Our own failures") counts only Roxy's own.
     """
     ctx = get_ctx(request)
+    rows, totals = await status_source_rows(ctx, tr)
+    if fmt is not None:
+        ordered, total = page_rows(rows, _all_rows(tq, len(rows)), search_keys=("source", "source_label"))
+        return await export_table(request, admin, SOURCES_SPEC, ordered, fmt, total=total, tq=tq, tr=tr)
+    return status_sources_answer(tr, tq, rows, totals)
+
+
+async def status_source_rows(ctx: Any, tr: TimeRange) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Every (source, status) row of "Who returned it?" in the range, and the range totals (one metrics.db read)."""
     window = tr.window
 
     def read(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -354,9 +398,13 @@ async def traffic_status_sources(
         }
         for item in pairs
     ]
-    if fmt is not None:
-        ordered, total = page_rows(rows, _all_rows(tq, len(rows)), search_keys=("source", "source_label"))
-        return await export_table(request, admin, SOURCES_SPEC, ordered, fmt, total=total, tq=tq, tr=tr)
+    return rows, totals
+
+
+def status_sources_answer(
+    tr: TimeRange, tq: TableQuery, rows: Sequence[dict[str, Any]], totals: dict[str, Any]
+) -> dict[str, Any]:
+    """The `GET /traffic/status/sources` answer for one page of `rows`: the table, v1's four tiles, the verdict."""
     items, total = page_rows(rows, tq, search_keys=("source", "source_label"))
     answer = table_answer(SOURCES_SPEC, tq, items, total)
     answer["tiles"] = {
@@ -388,9 +436,13 @@ async def traffic_heatmap(
     The range is read at hour granularity; a range longer than `queries.MAX_POINTS` hours uses its most recent
     hours, and says so in `notices`.
     """
+    return await heatmap_answer(get_ctx(request), tr, metric)
+
+
+async def heatmap_answer(ctx: Any, tr: TimeRange, metric: str) -> dict[str, Any]:
+    """The `GET /traffic/heatmap` answer for one measure of `HEATMAP_METRICS` (anything else is a 422)."""
     if metric not in HEATMAP_METRICS:
         raise validation_error({"metric": f"Choose one of: {', '.join(HEATMAP_METRICS)}."}, "The metric is not valid.")
-    ctx = get_ctx(request)
     window = tr.window
     notices: list[str] = []
     start = window.start
@@ -419,7 +471,11 @@ async def traffic_latency(
     split: Annotated[str, Query(max_length=16)] = "none",
 ) -> dict[str, Any]:
     """p50, p95 and p99 latency over time (`split=none`), or p95 per verb, egress, host or outcome (row 131)."""
-    ctx = get_ctx(request)
+    return await latency_answer(get_ctx(request), tr, split)
+
+
+async def latency_answer(ctx: Any, tr: TimeRange, split: str) -> dict[str, Any]:
+    """The `GET /traffic/latency` series for `split` (`none` or a key of `SPLITS`; anything else is a 422)."""
     if split == "none":
         answer = await _series_answer(ctx, tr, LATENCY_METRICS)
     elif split in SPLITS:
@@ -511,9 +567,35 @@ async def traffic_trends(request: Request, _admin: AdminSession) -> dict[str, An
     Each period is the trailing range (7, 30 or 365 days) compared with the same length just before it; the
     global range picker does not apply here.
     """
-    ctx = get_ctx(request)
+    return await trends_answer(get_ctx(request))
+
+
+async def trends_answer(ctx: Any) -> dict[str, Any]:
+    """The `GET /traffic/trends` answer: the week, month and year periods, each against the one before it."""
     periods = [await _trend_period(ctx, key, label, range_key) for key, label, range_key in TREND_PERIODS]
     return {"periods": periods}
 
 
-__all__ = ["router", "traffic_heatmap", "traffic_trends"]
+__all__ = [
+    "BYTE_METRICS",
+    "HEATMAP_METRICS",
+    "SOURCES_SPEC",
+    "SOURCE_LABELS",
+    "SPLITS",
+    "SPLIT_SPEC",
+    "STATUS_VIEWS",
+    "VERBS_SPEC",
+    "bytes_answer",
+    "dimension_table",
+    "heatmap_answer",
+    "latency_answer",
+    "requests_answer",
+    "router",
+    "status_answer",
+    "status_source_rows",
+    "status_sources_answer",
+    "traffic_heatmap",
+    "traffic_trends",
+    "trends_answer",
+    "verbs_answer",
+]

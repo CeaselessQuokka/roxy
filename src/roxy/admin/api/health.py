@@ -170,10 +170,8 @@ def _filters(
 # ------------------------------------------------------------------------------------------------- routes
 
 
-@router.get("/checks")
-async def list_checks(request: Request, _admin: AdminSession) -> dict[str, Any]:
-    """The 13.2 catalog in table order, with what each check measures and how it is judged."""
-    get_ctx(request)
+def checks_catalog() -> dict[str, Any]:
+    """The 13.2 catalog in table order (`GET /health/checks` and the Health page's Checks card)."""
     return {
         "items": [
             {
@@ -192,6 +190,13 @@ async def list_checks(request: Request, _admin: AdminSession) -> dict[str, Any]:
         ],
         "events": list(store.EVENT_TYPES),
     }
+
+
+@router.get("/checks")
+async def list_checks(request: Request, _admin: AdminSession) -> dict[str, Any]:
+    """The 13.2 catalog in table order, with what each check measures and how it is judged."""
+    get_ctx(request)
+    return checks_catalog()
 
 
 @router.post("/runs", status_code=202)
@@ -248,14 +253,8 @@ async def list_runs(
     ctx = get_ctx(request)
     tz = str(ctx.settings.get("ui_timezone") or "UTC")
     filters = _filters(trigger, worst, check, check_status, from_, to, tz)
-    now = float(ctx.clock.now())
-
-    def read(page: int, size: int) -> Any:
-        return lambda conn: store.list_runs(
-            conn, filters, page=page, page_size=size, sort=tq.sort, descending=tq.descending, now=now
-        )
-
     if fmt is not None:
+        read = _runs_reader(ctx, filters, tq)
 
         async def fetch(page: int, size: int) -> tuple[list[dict[str, Any]], int]:
             rows, total = await ctx.dbs.metrics.read(read(page, size))
@@ -263,9 +262,55 @@ async def list_runs(
 
         applied = {k: v for k, v in dataclasses.asdict(filters).items() if v is not None}
         return await common.export_pages(request, admin, RUNS_TABLE, fetch, fmt, tq=tq, filters=applied)
+    return await runs_table(ctx, filters, tq)
+
+
+def _runs_reader(ctx: Any, filters: store.RunFilter, tq: TableQuery) -> Any:
+    now = float(ctx.clock.now())
+
+    def read(page: int, size: int) -> Any:
+        return lambda conn: store.list_runs(
+            conn, filters, page=page, page_size=size, sort=tq.sort, descending=tq.descending, now=now
+        )
+
+    return read
+
+
+async def runs_table(ctx: Any, filters: store.RunFilter, tq: TableQuery) -> dict[str, Any]:
+    """One page of the run history (`GET /health/runs` and the Health page's History card)."""
+    read = _runs_reader(ctx, filters, tq)
     with common.service_errors():
         rows, total = await ctx.dbs.metrics.read(read(tq.page, tq.page_size))
     return common.table_answer(RUNS_TABLE, tq, [_run_item(r) for r in rows], total)
+
+
+run_filters = _filters
+"""`run_filters(trigger, worst, check, check_status, start, end, tz) -> store.RunFilter` (422 when invalid)."""
+
+
+async def run_answer(ctx: Any, run_id: int) -> dict[str, Any]:
+    """One run as `GET /health/runs/{id}` answers it (404 when no run has that id)."""
+    return _shape_run(await _run_detail(ctx, run_id))
+
+
+async def latest_run_id(ctx: Any) -> int | None:
+    """The newest run's id (running or finished), or None before the first run."""
+    with common.service_errors():
+        found = await ctx.dbs.metrics.read(lambda conn: store.latest_run_id(conn, finished=False))
+    return None if found is None else int(found)
+
+
+async def compare_answer(ctx: Any, run_id: int, other: int | None) -> dict[str, Any]:
+    """What changed between run `run_id` and `other` (default: the run before), as `GET .../compare` answers."""
+    now = float(ctx.clock.now())
+    with common.service_errors():
+        found = await ctx.dbs.metrics.read(lambda conn: store.compare_runs(conn, run_id, other, now=now))
+    if found is None:
+        raise common.not_found("No health run has that id.")
+    if other is not None and found.get("previous") is None:
+        raise common.not_found("No health run has the id given in with.")
+    result: dict[str, Any] = found
+    return result
 
 
 async def _run_detail(ctx: Any, run_id: int) -> dict[str, Any]:
@@ -318,18 +363,16 @@ def _shape_run(run: dict[str, Any]) -> dict[str, Any]:
 async def latest_run(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """The newest run (running or finished), as `GET /runs/{id}` answers it."""
     ctx = get_ctx(request)
-    with common.service_errors():
-        run_id = await ctx.dbs.metrics.read(lambda conn: store.latest_run_id(conn, finished=False))
+    run_id = await latest_run_id(ctx)
     if run_id is None:
         raise common.not_found("No health run has been made yet.")
-    return _shape_run(await _run_detail(ctx, int(run_id)))
+    return await run_answer(ctx, run_id)
 
 
 @router.get("/runs/{run_id}")
 async def get_run(request: Request, run_id: common.RowId, _admin: AdminSession) -> dict[str, Any]:
     """One run: every result in 13.2 order, each failing check's open recommendation, and the change summary."""
-    ctx = get_ctx(request)
-    return _shape_run(await _run_detail(ctx, run_id))
+    return await run_answer(get_ctx(request), run_id)
 
 
 @router.get("/runs/{run_id}/compare")
@@ -340,16 +383,7 @@ async def compare_runs(
     with_: Annotated[int | None, Query(alias="with", ge=1, le=common.MAX_ROW_ID)] = None,
 ) -> dict[str, Any]:
     """What changed between this run and `with` (default: the run before it), check by check."""
-    ctx = get_ctx(request)
-    now = float(ctx.clock.now())
-    with common.service_errors():
-        found = await ctx.dbs.metrics.read(lambda conn: store.compare_runs(conn, run_id, with_, now=now))
-    if found is None:
-        raise common.not_found("No health run has that id.")
-    if with_ is not None and found.get("previous") is None:
-        raise common.not_found("No health run has the id given in with.")
-    result: dict[str, Any] = found
-    return result
+    return await compare_answer(get_ctx(request), run_id, with_)
 
 
 @router.get("/runs/{run_id}/export", response_model=None)
@@ -407,4 +441,15 @@ async def export_run(
     return response
 
 
-__all__ = ["RUNS_TABLE", "StartRunBody", "router"]
+__all__ = [
+    "RUNS_TABLE",
+    "STATUSES",
+    "StartRunBody",
+    "checks_catalog",
+    "compare_answer",
+    "latest_run_id",
+    "router",
+    "run_answer",
+    "run_filters",
+    "runs_table",
+]

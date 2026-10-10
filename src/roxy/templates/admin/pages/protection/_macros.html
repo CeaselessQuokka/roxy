@@ -1,0 +1,77 @@
+{#-
+  Macros shared by the Protection page's card templates (`templates/admin/pages/protection/*.html`).
+
+  What
+    `tabs(id, items, label)` with `tab_panel(id, key, first)`: sub-tabs inside a card (a rule table, its tester, its
+    attempts), the ARIA tabs pattern; static/js/pages/protection.js moves between them (click, arrow keys, Home,
+    End) and keeps the chosen tab when the card refreshes. Every panel is in the page (hidden ones carry `hidden`),
+    so a table on a second tab exists for links, tests and screen readers' "find".
+    `reason_field(id, query=False, required=False)`: the audit reason. `query=True` marks it `data-query`: the page
+    script sends it in the query string for the DELETE routes that take `reason` there (and never in the body).
+    `delete_dialog(...)`: a confirm dialog that sends DELETE to the admin API with that reason.
+    `rule_chart(id, title, src)`: one rule row's hits over the range (`GET /protection/rule-hits`).
+    `count_list(rows)`: "<label>: <n> in this range" lines for refusal counts.
+  Why
+    The cards repeat these shapes many times; one macro keeps their markup, their accessibility and their API
+    wiring identical (plan 14.9: labels tied to inputs, errors by aria-describedby).
+  How
+    Plain macros; they import nothing from the page context except what they are given.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/format.html" import num %}
+
+{% macro tabs(id, items, label) -%}
+<div class="prot-tabs" data-prot-tabs id="{{ id }}">
+  <div class="prot-tabs__list" role="tablist" aria-label="{{ label }}">
+    {% for key, title in items %}
+    <button type="button" role="tab" class="prot-tabs__tab" id="{{ id }}-tab-{{ key }}" aria-controls="{{ id }}-panel-{{ key }}"
+            aria-selected="{{ 'true' if loop.first else 'false' }}" tabindex="{{ 0 if loop.first else -1 }}" data-tab="{{ key }}">{{ title }}</button>
+    {% endfor %}
+  </div>
+  {{ caller() }}
+</div>
+{%- endmacro %}
+
+{% macro tab_panel(id, key, first=False) -%}
+<div class="prot-tabs__panel" role="tabpanel" id="{{ id }}-panel-{{ key }}" aria-labelledby="{{ id }}-tab-{{ key }}" data-panel="{{ key }}"{% if not first %} hidden{% endif %}>
+  {{ caller() }}
+</div>
+{%- endmacro %}
+
+{% macro reason_field(id, query=False, required=False, label="Reason") -%}
+<div class="field">
+  <label class="field__label" for="{{ id }}">{{ label }}{% if not required %} <span class="muted">(optional, saved in the audit log)</span>{% else %} <span class="muted">(saved in the audit log)</span>{% endif %}</label>
+  <textarea class="input" id="{{ id }}" name="reason" rows="2" maxlength="500"{% if required %} required aria-required="true"{% endif %}
+            aria-describedby="{{ id }}-error"{% if query %} data-query data-json="never"{% else %} data-json="skip-empty"{% endif %}></textarea>
+  <p class="field__error" id="{{ id }}-error" data-field-error="reason" hidden></p>
+</div>
+{%- endmacro %}
+
+{% macro delete_dialog(id, title, url, consequences, refresh, confirm_label="Remove", success="Removed.") -%}
+{%- set extra = caller() if caller is defined else "" -%}
+{% call confirm_dialog(id, title, url, method="delete", confirm_label=confirm_label, danger=True, consequences=consequences,
+                       api=True, success=success, on_success="refresh", refresh=refresh) %}
+  {{ reason_field(id ~ "-reason", query=True) }}
+  {{ extra }}
+{% endcall %}
+{%- endmacro %}
+
+{% macro rule_chart(id, title, src) -%}
+{{ series_chart(id, title, src=src, kind="bars", size="sm", y_format="count",
+                summary=title ~ " in the selected range, one bar per time bucket",
+                empty_text="No request matched this row in the range.") }}
+{%- endmacro %}
+
+{% macro count_list(rows) -%}
+<ul class="prot-counts">
+  {% for row in rows %}
+  <li><span class="prot-counts__label">{{ row.label }}</span> <strong class="prot-counts__n">{{ num(row.requests) }}</strong> <span class="muted">refused in this range{% if row.last %}; last <time datetime="{{ row.last.datetime }}">{{ row.last.sub }}</time>{% endif %}</span></li>
+  {% endfor %}
+</ul>
+{%- endmacro %}
+
+{% macro field_error(name, id) -%}
+<p class="field__error" id="{{ id }}" data-field-error="{{ name }}" hidden></p>
+{%- endmacro %}

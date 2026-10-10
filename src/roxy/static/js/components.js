@@ -153,6 +153,9 @@ function settingControl() {
         fallback: data.default ?? "",
         conds: readJSON(data.riskConds, []),
         options: readJSON(data.options, {}),
+        // A setting whose catalog risk is high: every change needs a reason and a confirmation (the settings API's
+        // `risk_reason`), not only the values its high_risk_if conditions name.
+        alwaysRisky: "alwaysRisky" in data,
       };
       root = this.$el;
       input = this.$el.querySelector("[data-setting-input]");
@@ -176,7 +179,18 @@ function settingControl() {
       if (input) input.setAttribute("aria-invalid", this.invalid ? "true" : "false");
       const risky = this.invalid ? null : cfg.conds.find((cond) => riskMatches(cond, result.value));
       this.riskWhy = risky ? risky.why : "";
+      if (!this.riskWhy && cfg.alwaysRisky && this.dirty && !this.invalid) {
+        this.riskWhy = "This is a high-risk setting: a reason and a confirmation are needed to change it.";
+      }
       if (cfg.type === "enum") this.optionText = cfg.options[result.value] || "";
+    },
+
+    /** The server refused a save (static/js/settings_api.js raises `setting-error` on the form). */
+    serverError(event) {
+      const detail = event.detail || {};
+      this.error = String(detail.message || "The server refused this value.");
+      if (detail.code === "confirmation_required" && !this.riskWhy) this.riskWhy = this.error;
+      if (input) input.setAttribute("aria-invalid", "true");
     },
 
     onInput() {

@@ -1,0 +1,62 @@
+{#-
+  System page, card `errors` (`roxy/admin/pages/system.py errors_card`): the error log (v1 Error Log, parity rows 16
+  and 72), or one error in detail for the drawer.
+
+  The table is `GET /admin/api/v1/system/errors` (`system_api.errors_answer`): errors grouped by signature with how
+  often each happened, searched, filtered by source, sorted and paged on the server, the page's main table (its state
+  is in the address bar). A row opens `?signature=` in the drawer: `system_api.error_detail_view`, the redacted
+  traceback and the hourly count of the last day. Signatures, details, the raising place and tracebacks can quote a
+  path or a header a caller sent, so all of them are plain text through `caller_text`.
+  Context: `frame`, then either `table`, `table_only`, `total`, `filtered`, or `detail`, `first`, `last`, `hourly`,
+  `hourly_values` (the drawer).
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import num, caller_text %}
+{% from "components/chart.html" import sparkline %}
+{% from "components/badges.html" import badge %}
+{% from "admin/pages/system/_macros.html" import when %}
+{% if detail is defined and detail %}
+<div class="system-error stack" data-error-detail>
+  <p class="system-error__signature">{{ caller_text(detail.signature, 300, block=True) }}</p>
+  <dl class="kv system-kv">
+    <dt>Count</dt><dd>{{ num(detail.count) }}</dd>
+    <dt>First seen</dt><dd>{{ when(first) }}</dd>
+    <dt>Last seen</dt><dd>{{ when(last) }}</dd>
+    <dt>Source</dt><dd>{{ (detail.source or "roxy")|capitalize }}</dd>
+    <dt>Raised at</dt><dd class="mono">{{ caller_text(detail.module_line, 200) }}</dd>
+  </dl>
+  <section class="system-section" aria-labelledby="error-detail-last">
+    <h3 class="system-section__title" id="error-detail-last">Last detail</h3>
+    {% if detail.last_detail %}{{ caller_text(detail.last_detail, 2000, block=True) }}{% else %}<p class="muted">No detail was recorded.</p>{% endif %}
+  </section>
+  <section class="system-section" aria-labelledby="error-detail-trace">
+    <h3 class="system-section__title" id="error-detail-trace">Traceback</h3>
+    {% if detail.traceback %}
+    <pre class="system-trace" tabindex="0" aria-labelledby="error-detail-trace">{{ caller_text(detail.traceback, 32768) }}</pre>
+    <p class="muted">Secrets were removed before the traceback was stored, and once more when it was read.</p>
+    {% else %}
+    <p class="muted">No traceback was kept for this error (Roblox's answers and probes have none).</p>
+    {% endif %}
+  </section>
+  {% if hourly is not none %}
+  <section class="system-section" aria-labelledby="error-detail-hours">
+    <h3 class="system-section__title" id="error-detail-hours">The last 24 hours</h3>
+    {% if hourly %}
+    {{ sparkline(hourly_values, label="Errors per hour", tone="bad") }}
+    <details class="details-plain"><summary>Show the hours as a list</summary>
+      <ul class="system-list">{% for item in hourly %}<li>{{ when(item.at) }}: {{ num(item.count) }}</li>{% endfor %}</ul>
+    </details>
+    {% else %}
+    <p class="muted">It did not happen in the last 24 hours.</p>
+    {% endif %}
+  </section>
+  {% endif %}
+</div>
+{% elif table_only %}{{ data_table(**table) }}
+{% else %}
+{% call page_card(frame, subtitle=(num(total) ~ (" matching errors" if filtered else " distinct errors"))) %}
+<p class="system-intro">Errors inside Roxy and its calls, grouped by signature with how often each happened. Nothing is dropped as more come in; a data reset of the errors family clears them. Open a row for its traceback.</p>
+{{ data_table(**table) }}
+{% endcall %}
+{% endif %}

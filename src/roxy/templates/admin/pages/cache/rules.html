@@ -1,0 +1,114 @@
+{#-
+  Cache page, card `rules` (`roxy/admin/pages/cache.py rules_card`): v1 "Rules for specific endpoints".
+
+  The rules table (`cache.rules_answer`, the `GET /admin/api/v1/cache/rules` function; a row opens its edit and
+  remove drawer), the add form (`POST /admin/api/v1/cache/rules`: by default it purges the stored answers the new
+  rule covers, as v1 did), and the TTL tuner's suggestions: the open recommendations of the cache family, each a
+  link to its card on the Recommendations page (nothing changes until it is applied there). Patterns, notes and
+  recommendation titles are text a person or a caller chose: shown as text only.
+  Context: `frame`, `table`, `default_ttl`, `default_ttl_words`, `new_rule_ttl`, `suggestions`, `suggestion_total`,
+  `tuner_on`, `prefill`, `table_only` (a request of the table itself: the table alone, which replaces itself).
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import caller_text, local_href %}
+{% from "components/badges.html" import severity_badge, badge %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+{% if table_only %}{{ data_table(**table) }}{% else %}
+{% call page_card(frame, subtitle="Default lifetime without a rule: " ~ default_ttl_words) %}
+<div class="prose cache-hints">
+  <p>Give one endpoint a different lifetime from the default. The most specific pattern wins, so a broad <code>games.roblox.com</code> rule can set a house default while one exact path overrides it.</p>
+  <p>A lifetime of <strong>0 means never cache this endpoint</strong>: that is how you exclude something without switching the whole cache off.</p>
+  <p><em>Examples:</em> <code>games.roblox.com/v1/games/votes</code> at <code>600</code>: vote counts barely move, so one request to Roblox every ten minutes is plenty. <code>games.roblox.com/v1/games/*/servers</code> at <code>0</code>: a live server list is worthless if it is even slightly out of date, so never save it.</p>
+</div>
+
+<section class="cache-tuner" aria-labelledby="cache-tuner-title">
+  <h3 class="cache-fact__title" id="cache-tuner-title">TTL tuner suggestions {% if not tuner_on %}{{ badge("tuner off", "warn") }}{% endif %}</h3>
+  {% if suggestions %}
+  <ul class="cache-tuner__list">
+    {% for rec in suggestions %}
+    <li class="cache-tuner__item">
+      {{ severity_badge(rec.severity) }}
+      <a href="{{ local_href(rec.href) }}">{{ caller_text(rec.title, 160) }}</a>
+      <span class="muted mono">{{ rec.rule_id }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% if suggestion_total > suggestions|length %}<p class="muted">{{ suggestion_total - suggestions|length }} more on the <a href="/admin/recommendations">Recommendations page</a>.</p>{% endif %}
+  {% else %}
+  <p class="muted">No open suggestions. The tuner measures how often each endpoint's answers really change (from request samples) and proposes a lifetime here when one is too short or too long. {% if not tuner_on %}It is off: switch on "TTL tuner" in the cache settings.{% endif %}</p>
+  {% endif %}
+</section>
+
+<details class="details-plain cache-add"{% if prefill %} open{% endif %}>
+  <summary>{{ icon("plus") }}<span>Add a cache rule</span></summary>
+  <form class="stack cache-form" data-api-form data-api-url="/admin/api/v1/cache/rules" data-api-method="POST"
+        data-success="Cache rule added; the answers it covers were dropped so it applies at once." data-on-success="refresh" data-refresh="rules browser endpoints stats" novalidate>
+    <div class="field-row">
+      <div class="field">
+        <label class="field__label" for="cache-rule-new-pattern">Endpoint pattern</label>
+        <input class="input mono" id="cache-rule-new-pattern" name="pattern" required maxlength="1000" autocomplete="off" spellcheck="false" placeholder="games.roblox.com/v1/games/votes" value="{{ prefill }}" data-json="string" aria-describedby="cache-rule-new-pattern-hint cache-rule-new-pattern-error">
+        <p class="field__hint" id="cache-rule-new-pattern-hint">Leave the https:// off. A * stands for one part of the path, and a wildcard pattern covers everything nested under it.</p>
+        <p class="field__error" id="cache-rule-new-pattern-error" data-field-error="pattern" hidden></p>
+      </div>
+      <div class="field">
+        <label class="field__label" for="cache-rule-new-type">Pattern type</label>
+        <select class="input" id="cache-rule-new-type" name="type" data-json="string" aria-describedby="cache-rule-new-type-hint">
+          <option value="glob" selected>Wildcard</option>
+          <option value="regex">Regex</option>
+        </select>
+        <p class="field__hint" id="cache-rule-new-type-hint">Wildcard is the simple form and almost always what you want; Regex is for a pattern a wildcard cannot express.</p>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label class="field__label" for="cache-rule-new-ttl">Keep answers for (seconds)</label>
+        <input class="input input--num" id="cache-rule-new-ttl" name="ttl" inputmode="numeric" value="{{ new_rule_ttl }}" data-json="int" aria-describedby="cache-rule-new-ttl-hint cache-rule-new-ttl-error">
+        <p class="field__hint" id="cache-rule-new-ttl-hint">0 means never cache these endpoints.</p>
+        <p class="field__error" id="cache-rule-new-ttl-error" data-field-error="ttl" hidden></p>
+      </div>
+      <div class="field">
+        <label class="field__label" for="cache-rule-new-stale">Revalidate window (seconds)</label>
+        <input class="input input--num" id="cache-rule-new-stale" name="stale_ttl" inputmode="numeric" value="0" data-json="int" aria-describedby="cache-rule-new-stale-hint cache-rule-new-stale-error">
+        <p class="field__hint" id="cache-rule-new-stale-hint">How long after expiry the copy is still served while one refresh runs ({{ term("stale-while-revalidate") }}).</p>
+        <p class="field__error" id="cache-rule-new-stale-error" data-field-error="stale_ttl" hidden></p>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label class="field__label" for="cache-rule-new-negative">Keep refusals for (seconds)</label>
+        <input class="input input--num" id="cache-rule-new-negative" name="negative_ttl" inputmode="numeric" value="0" data-json="int" aria-describedby="cache-rule-new-negative-hint cache-rule-new-negative-error">
+        <p class="field__hint" id="cache-rule-new-negative-hint">How long a definite refusal (404 and friends) is kept ({{ term("negative-caching") }}); 0 keeps none.</p>
+        <p class="field__error" id="cache-rule-new-negative-error" data-field-error="negative_ttl" hidden></p>
+      </div>
+      <div class="field">
+        <label class="field__label" for="cache-rule-new-methods">Methods</label>
+        <select class="input" id="cache-rule-new-methods" name="methods" data-json="list" aria-describedby="cache-rule-new-methods-hint">
+          <option value="GET" selected>GET only</option>
+          <option value="GET&#10;POST">GET and POST</option>
+        </select>
+        <p class="field__hint" id="cache-rule-new-methods-hint">POST only for batch lookups that read and never change anything.</p>
+      </div>
+    </div>
+    <div class="field">
+      <label class="field__label" for="cache-rule-new-flags">Normalization <span class="muted">(optional, one per line)</span></label>
+      <textarea class="input mono" id="cache-rule-new-flags" name="normalize_flags" rows="2" data-json="list" aria-describedby="cache-rule-new-flags-hint"></textarea>
+      <p class="field__hint" id="cache-rule-new-flags-hint"><code>sort_csv:&lt;param&gt;</code> sorts an id list so its order does not split answers; <code>casefold_path</code> lowercases the path.</p>
+    </div>
+    <div class="field">
+      <label class="field__label" for="cache-rule-new-note">Note <span class="muted">(optional, private)</span></label>
+      <input class="input" id="cache-rule-new-note" name="note" maxlength="500" autocomplete="off">
+    </div>
+    <label class="check"><input type="checkbox" name="purge" checked data-json="bool"><span>Drop the stored answers this rule now covers, so it applies at once</span></label>
+    <div class="field">
+      <label class="field__label" for="cache-rule-new-reason">Reason <span class="muted">(optional, saved in the audit log)</span></label>
+      <textarea class="input" id="cache-rule-new-reason" name="reason" rows="2" maxlength="500"></textarea>
+    </div>
+    <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    <div class="cluster"><button type="submit" class="btn btn--primary" data-action="cache-rule-add">{{ icon("plus") }}<span>Add rule</span></button></div>
+  </form>
+</details>
+<div class="cache-table">{{ data_table(**table) }}</div>
+{% endcall %}
+{% endif %}

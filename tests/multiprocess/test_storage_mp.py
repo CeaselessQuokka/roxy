@@ -9,8 +9,9 @@ gunicorn workers) that share temporary SQLite files, and checks a property that 
 3. A leader that stalls (SIGSTOP) past its lease and then resumes cannot write: epoch fencing.
 4. Counted slot leases (the tarpit cap) never exceed the cap under contention from 16 holders in 4 processes.
 5. Readers in another process are never blocked by a long write.
-Plus a measurement of p50/p99 latency of a small hot.db write transaction under 4-process contention, printed
-for docs/PERFORMANCE.md.
+6. Group commit (LOAD-3): hot-path writes that share a transaction lose no update with 1, 2 and 4 processes.
+Plus measurements of p50/p99 latency of a small hot.db write transaction under 4-process contention, and of write
+throughput with and without group commit under 2-process contention, printed for docs/PERFORMANCE.md.
 """
 
 from __future__ import annotations
@@ -531,3 +532,101 @@ def test_hot_write_latency_under_four_process_contention(
     p50, p99, _, _ = measured["4 processes, saturated"]
     assert p50 < 50
     assert p99 < 1000
+
+
+# ------------------------------------------------------------------------------------- 6. group commit (LOAD-3)
+
+
+def _child_grouped(
+    path: str, increments: int, concurrency: int, budget_ms: int | None, results: Any, start: Any
+) -> None:
+    asyncio.run(_grouped_main(path, increments, concurrency, budget_ms, results, start))
+
+
+async def _grouped_main(
+    path: str, increments: int, concurrency: int, budget_ms: int | None, results: Any, start: Any
+) -> None:
+    db = Database("hot", path)
+    await db.write(lambda c: None)  # threads and connection ready before the clock starts
+    start.wait(30)
+
+    def read_modify_write(conn: sqlite3.Connection) -> None:
+        # The shape of a limiter (plan 6.3): read a row, decide in Python, write it back.
+        n = conn.execute("SELECT n FROM mp_counter WHERE id = 1").fetchone()[0]
+        conn.execute("UPDATE mp_counter SET n = ? WHERE id = 1", (n + 1,))
+
+    gate = asyncio.Semaphore(concurrency)
+    latencies: list[float] = []
+    failed = 0
+
+    async def one() -> None:
+        nonlocal failed
+        async with gate:
+            t0 = time.perf_counter()
+            try:
+                await db.write(read_modify_write, busy_timeout_ms=budget_ms)
+            except SharedStateUnavailable:
+                failed += 1
+            latencies.append((time.perf_counter() - t0) * 1000)
+
+    began = time.perf_counter()
+    await asyncio.gather(*(one() for _ in range(increments)))
+    seconds = time.perf_counter() - began
+    results.put((db.stats.writes - 1, db.stats.grouped_writes, db.stats.largest_group, failed, seconds, latencies))
+    await db.close()
+
+
+@pytest.mark.parametrize("workers", [1, 2, 4])
+def test_grouped_hot_path_writes_lose_no_update_across_processes(
+    hot_path: Path, procs: list[Any], workers: int
+) -> None:
+    """LOAD-3: hot-path writes (a busy budget) queued together share one transaction (group commit). A read, decide,
+    write job inside a group still sees every write before it, of its own group and of the other processes', so no
+    update is lost with 1, 2 or 4 processes (plan C6), and the writes really were grouped."""
+    increments = 400
+    results = CTX.Queue()
+    start = CTX.Event()
+    for _ in range(workers):
+        _start(procs, _child_grouped, str(hot_path), increments, 64, 10_000, results, start)
+    time.sleep(1.0)
+    start.set()
+    _join_all(procs, 120)
+    reports = [results.get(timeout=10) for _ in range(workers)]
+    assert sum(r[3] for r in reports) == 0  # nothing ran out of its 10 s budget
+    assert sum(r[0] for r in reports) == workers * increments
+    assert _query(hot_path, "SELECT n FROM mp_counter WHERE id = 1") == [(workers * increments,)]
+    assert max(r[2] for r in reports) > 1  # transactions carried several writes
+    assert sum(r[1] for r in reports) > 0
+
+
+def test_group_commit_throughput_under_two_process_contention(
+    hot_path: Path, procs: list[Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Measurement for docs/PERFORMANCE.md (LOAD-3): two processes, 32 concurrent read, decide, write jobs each, as
+    ordinary writes (one transaction each) and as hot-path writes (grouped). Prints writes a second and latency; the
+    assertion is only that both lose nothing."""
+    measured: dict[str, tuple[float, float, float, int]] = {}
+    total = 0
+    for label, budget in (("one transaction per write", None), ("group commit (budgeted writes)", 10_000)):
+        procs.clear()
+        results = CTX.Queue()
+        start = CTX.Event()
+        for _ in range(2):
+            _start(procs, _child_grouped, str(hot_path), 1500, 32, budget, results, start)
+        time.sleep(1.0)
+        start.set()
+        _join_all(procs, 180)
+        reports = [results.get(timeout=10) for _ in range(2)]
+        assert sum(r[3] for r in reports) == 0
+        total += sum(r[0] for r in reports)
+        samples = [ms for r in reports for ms in r[5]]
+        rate = sum(r[0] for r in reports) / max(r[4] for r in reports)
+        largest = max(r[2] for r in reports) or 1  # 0 means no transaction ever carried more than one write
+        measured[label] = (rate, _percentile(samples, 50), _percentile(samples, 99), largest)
+    assert _query(hot_path, "SELECT n FROM mp_counter WHERE id = 1") == [(total,)]
+    with capsys.disabled():
+        for label, (rate, p50, p99, largest) in measured.items():
+            print(
+                f"\n[hot.db group commit] 2 processes x 32 concurrent jobs, {label}: {rate:,.0f} writes/s, "
+                f"p50 {p50:.2f} ms, p99 {p99:.2f} ms, largest transaction {largest} writes"
+            )

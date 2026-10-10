@@ -1863,6 +1863,52 @@ Two lenses checked the round 3 fixes and filed 13 findings (1 high, 7 medium, 5 
   BatchWriter.run` promised one more flush); it now flushes once more (seen as an intermittent
   `test_run_loop_flushes_periodically_and_on_stop` under load, now pinned by a deterministic test).
 
+#### P11 lane: upstream pacing, finding LOAD-1 fixed (2026-10-10; `upstream/buckets.py`, `adaptive.py`)
+
+Plan 19.10 row 7's replay now keeps Roblox 429s under 0.1% of upstream calls at the plan's defaults (1 in about 1,030
+calls, the one 429 that discovers the busiest endpoint's limit after a cold start; a 30 minute replay gets 2 in 8,593,
+0.023%, one per endpoint whose demand exceeds its limit, against 8 in 8,442 before); the thresholds (0.1% and 40%) and
+every default are unchanged, and `test_replay_keeps_roblox_429s_below_a_tenth_of_a_percent` is no longer an xfail.
+Report: `.remake/p11_reports/pacing.md`.
+
+- **Host and endpoint buckets cap every rolling minute (plan 7.3 formula changed for these two kinds).** Plain GCRA
+  lets `per_min + burst - 1` calls into one minute (129 for 120 a minute with burst 10), which a Roblox limit of
+  `per_min` refuses. For `host:` and `endpoint:` buckets (Roblox's own limits, configured or learned), `per_min` is
+  now the most calls any minute holds, burst included: with N = `per_min` rounded down and B = min(burst, N) the
+  spacing is `(60 s + 1 s margin) / (N - B + 1)` instead of `60 s / per_min`, so B calls still leave at once and the
+  steady pace is a little lower (120 with burst 10: about 109 a minute; 240 with 15: about 222). The 1 s margin
+  covers jitter between Roxy's slot time and Roblox's arrival time. The global and egress buckets are Roxy's own
+  ceilings and keep the plan formula. A bucket's fill on the Upstream page is relative to the new spacing.
+- **A Roblox 429 cuts from the rate Roblox refused, rate and burst together (plan 7.3 "drops 30%").** Each host and
+  endpoint bucket counts the calls it grants in a small sliding window counter (a `meter:<key>` row in hot.db's
+  `upstream_bucket`, written in the same reservation transaction, pruned like an idle bucket, never shown as a
+  bucket). After a direct or credential 429, the cut of `adaptive_decrease_pct` starts from the lower of the
+  current limit and the calls the bucket let through in the last minute, so it always lands below what Roblox refused
+  (the root cause of LOAD-1: 120 cut to 84 never slowed an endpoint running at 61 against 60; now 61 becomes about 43,
+  burst 10 becomes 3). A count at or below `adaptive_min_per_min` is not used (Roblox refusing that few calls is not
+  a per-minute limit Roxy could keep, for example a refusal of the first call of a quiet minute): the plan's cut of
+  the current limit applies. The burst always shrinks by the same ratio as the rate. The change event and the audited
+  `upstream_limits` write carry `old_burst`, `new_burst` and the evidence (`observed_calls`, `cut_from`).
+- **A lowered limit also holds for the minute that began before it.** The first reservation under a lower host or
+  endpoint limit (an adaptive cut or an admin's edit) starts from the backlog the last minute's calls make at the new
+  pace, so Roblox's window, which still holds those calls, never sees more than the new limit; routing reads the
+  same paced state.
+- **Careful recovery.** The hourly raise (plan 7.3 bounded probing, unchanged: 24 clean hours and rejections over
+  1%) also gives the burst back, at most one call per raise and never beyond the default burst's share of the new
+  rate or the default burst itself.
+- **A call never leaves before its slot.** The queue sleeps a duration measured on the monotonic clock while slots are
+  wall clock times (the clock the buckets share); on WSL 2 the monotonic clock runs about 10% fast and the wall clock
+  is stepped back every half minute, so calls left early and squeezed extra calls into a minute. The rest of the wait
+  is now slept (at most three rounds, never past the time the call needs before its deadline); on a server whose
+  clocks agree nothing changes.
+- **Settings texts and `docs/SETTINGS.md`:** the host and endpoint rate and burst, `adaptive_rate_enabled`,
+  `adaptive_decrease_pct` and `adaptive_increase_pct` describe the rolling minute, the measured cut and the burst. No
+  default changed: the catalog matches plan 7.3 and 15.3 C (600/30, 300/20, 300/20, 240/15, 120/10, credential 20/3
+  with 2 reserved, adaptive 30%, 10%, 24 h, 6 to 600); there are no built-in `upstream_limits` rows.
+- **Tests:** the upstream fleet test now also checks the plan's cut after a first-call 429; the multiprocess 429 test
+  checks the window guarantee (at most the limit, never limit plus burst) and the learned limit across two processes;
+  one admin API expectation follows the new spacing (an endpoint bucket 3 s ahead is 54.6% full, not 60%).
+
 ## Progress notes per phase
 
 ### Phase -1 (Tier 0): v1 hotfix, 2026-10-07

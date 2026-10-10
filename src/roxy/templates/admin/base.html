@@ -4,8 +4,8 @@
   What this is
     The page shell: head (styles, the import map, the one entry module), the skip link, the sidebar, the top bar,
     the service banners, the page header with "How to read this page", the content block, and the page-wide
-    overlays (command palette, shortcuts, session-expired dialog, drawer, toasts, phone menu, pause and
-    emergency-limit dialogs). Pages extend it and fill `content`.
+    overlays (command palette, shortcuts, session-expired dialog, "confirm it is you", preferences, drawer, toasts,
+    phone menu, pause and emergency-limit dialogs). Pages extend it (through admin/_page.html) and fill `content`.
 
   Why it exists
     Every page must look, behave and announce itself the same way, and the security rules of plan 9.2 must hold on
@@ -14,28 +14,37 @@
     inline `style` attribute or an inline event handler; the CSRF token reaches scripts only through the
     `csrf-token` meta tag (BREACH-masked per response by the server, plan 9.6) and is sent back as X-CSRF-Token.
 
-  How it works (context contract; every key is optional and has a safe default)
-    page        {"id": nav id from admin/_layout/nav.html, "title", "purpose": one sentence, "how_to_read": text}
+  How it works (context contract; every key is optional and has a safe default; `roxy.admin.pages.shell` builds it)
+    page        {"id": registry page id, "title", "purpose": one sentence, "how_to_read": text or paragraphs}
     admin       {"username"}
     csrf_token  the masked CSRF token for this response
     session     {"heartbeat_s": 30, "activity_window_s": 60, "heartbeat_url", "login_url": "/admin"}
     theme       "dark" (default) | "light" | "system";   density: "comfortable" | "dense"
-    time        {"range": "24h", "compare": "off|prev|week|month|year", "from", "to"}
+    time        {"range": "24h", "compare": "none|previous|week|month|year", "from", "to", "description", "notice"}
     status      service state for the banners, top bar buttons and pause dialogs (see admin/_layout/banners.html);
                 the caller texts `pause_message`, `pause_default` and `throttle_message` come from
-                `roxy.admin.gallery.caller_texts` with the live `pause_message_default`, never from a template
+                `roxy.admin.pages.texts.caller_texts` with the live `pause_message_default`, never from a template;
+                `signature` lets static/js/shell.js notice a pause switched elsewhere
     recs        {"open": n, "critical": n}
-    urls        {"pause", "throttle_all", "stream", "palette", "health_run", "llm_export", "logout", "prefs"}
+    urls        {"pause", "throttle_all", "stream", "palette", "status", "health_run", "health_page",
+                 "llm_export": {"copy", "download", "schema"}, "logout", "prefs", "reauth", "session"}
     glossary    term id -> {"term", "definition"} (components/glossary.html)
+    prefs       the admin's effective preferences (the preferences dialog)
+    dialog_settings  inline settings of the pause dialog and the preferences dialog (`roxy.admin.pages.inline`)
+    page_assets {"css": "css/pages/<page>.css" or None, "module": "js/pages/<page>.js" or None}
     env_name, version
-    Blocks: `title`, `page_actions` (buttons in the page header), `how_to_read` (the panel body), `content`.
+    Blocks: `title`, `page_css`, `page_actions` (buttons in the page header), `how_to_read` (the panel body),
+    `content`, `page_module`.
 
   What to read next
     admin/_layout/*.html (each piece of the shell), components/*.html (the macros pages use),
-    static/js/app.js (what boots on every page), and src/roxy/admin/gallery.py (a page that uses everything).
+    static/js/app.js (what boots on every page), roxy/admin/pages/shell.py (the context), and
+    src/roxy/admin/gallery.py (a page that uses everything).
 -#}
 {%- set sess = session if session is defined and session else {} -%}
 {%- set u = urls if urls is defined and urls else {} -%}
+{%- set assets = page_assets if page_assets is defined and page_assets else {} -%}
+{%- set st_sig = status.signature if status is defined and status and status.signature else "" -%}
 {%- set VENDOR = {
   "htmx": ("vendor/htmx-2.0.11/htmx.esm.js", "sha384-MGpLJI+YdNF+gTEwPJkKrb2WL70Ce3qnYw+YP2Hy3U+AX6oRl45HdZa9/W/7ROZr"),
   "alpine": ("vendor/alpine-csp-3.17.4/module.esm.min.js", "sha384-1iUT5Gr1H+nzOhvZHzMtH1F8+Hn/P6+jPCmpGGd++NA0IS5o7zN7GzlQsckdJqMa"),
@@ -43,7 +52,8 @@
 } -%}
 {%- set UPLOT_CSS = ("vendor/uplot-1.6.32/uPlot.min.css", "sha384-IfV0B7MIOYuO95kO9G5ySKPz/85zqFNOAs8iy4tkK5zd9izhJAB8b7lHrwYqqmYE") -%}
 {%- set MODULES = ["app", "htmx_setup", "net", "session", "sse", "live_tail", "palette", "charts", "tables", "theme",
-                   "tooltip", "toast", "dialog", "format", "components", "dom"] -%}
+                   "tooltip", "toast", "dialog", "format", "components", "dom", "api_forms", "reauth", "settings_api",
+                   "exports", "cards", "shell", "page"] -%}
 {%- set imports = {} -%}
 {%- for name in MODULES %}{% set _ = imports.update({"roxy/" ~ name: static_url("js/" ~ name ~ ".js")}) %}{% endfor -%}
 {%- set integrity = {} -%}
@@ -61,6 +71,7 @@
   <link rel="stylesheet" href="{{ static_url(UPLOT_CSS[0]) }}" integrity="{{ UPLOT_CSS[1] }}">
   <link rel="stylesheet" href="{{ static_url('css/layout.css') }}">
   <link rel="stylesheet" href="{{ static_url('css/components.css') }}">
+  {% block page_css %}{% if assets.css %}<link rel="stylesheet" href="{{ static_url(assets.css) }}">{% endif %}{% endblock %}
   <link rel="stylesheet" href="{{ static_url('css/print.css') }}" media="print">
   <script type="importmap" nonce="{{ csp_nonce }}">{{ {"imports": imports, "integrity": integrity}|tojson }}</script>
   <script type="module" nonce="{{ csp_nonce }}" src="{{ static_url('js/app.js') }}"></script>
@@ -68,7 +79,7 @@
 <body class="app"
       data-heartbeat-s="{{ sess.heartbeat_s or 30 }}" data-activity-window-s="{{ sess.activity_window_s or 60 }}"
       data-heartbeat-url="{{ sess.heartbeat_url or '/admin/api/v1/auth/heartbeat' }}" data-login-url="{{ sess.login_url or '/admin' }}"
-      {% if u.stream %}data-stream-url="{{ u.stream }}" {% endif %}{% if u.prefs %}data-prefs-url="{{ u.prefs }}" {% endif %}data-page="{{ page.id if page is defined and page else '' }}">
+      {% if u.stream %}data-stream-url="{{ u.stream }}" {% endif %}{% if u.prefs %}data-prefs-url="{{ u.prefs }}" {% endif %}{% if u.status %}data-status-url="{{ u.status }}" data-status-sig="{{ st_sig }}" {% endif %}data-page="{{ page.id if page is defined and page else '' }}">
   <a class="skip-link" href="#main">Skip to the main content</a>
   {% include "admin/_layout/icons.html" %}
   <div class="shell" data-shell>
@@ -88,9 +99,13 @@
         <details class="how-to-read" id="how-to-read" data-remember="how-to-read:{{ page.id if page is defined and page else 'page' }}">
           <summary><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-book"></use></svg><span>How to read this page</span><svg class="icon how-to-read__chevron" aria-hidden="true" focusable="false"><use href="#i-chevron-down"></use></svg></summary>
           <div class="how-to-read__body prose">
-            {% block how_to_read %}<p>{{ page.how_to_read if page is defined and page and page.how_to_read else "Hover or focus any underlined term or question mark for a plain-language definition." }}</p>{% endblock %}
+            {% block how_to_read %}
+            {% set htr = page.how_to_read if page is defined and page and page.how_to_read else "Hover or focus any underlined term or question mark for a plain-language definition." %}
+            {% if htr is string %}<p>{{ htr }}</p>{% else %}{% for paragraph in htr %}<p>{{ paragraph }}</p>{% endfor %}{% endif %}
+            {% endblock %}
           </div>
         </details>
+        {% if time is defined and time and time.notice %}<p class="page-notice" role="note"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-info"></use></svg><span>{{ time.notice }}</span></p>{% endif %}
         {% endblock %}
         {% block content %}{% endblock %}
       </main>
@@ -105,6 +120,9 @@
   {% include "admin/_layout/palette.html" %}
   {% include "admin/_layout/shortcuts.html" %}
   {% include "admin/_layout/control_dialogs.html" %}
+  {% include "admin/_layout/preferences.html" %}
+  {% include "admin/_layout/reauth.html" %}
   {% include "admin/_layout/overlays.html" %}
+  {% block page_module %}{% if assets.module %}<script type="module" nonce="{{ csp_nonce }}" src="{{ static_url(assets.module) }}"></script>{% endif %}{% endblock %}
 </body>
 </html>

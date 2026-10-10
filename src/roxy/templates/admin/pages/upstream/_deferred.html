@@ -1,0 +1,20 @@
+{#-
+  A deferred card's first paint (the g3 pages: Upstream, Egress, Credential; `_upstream_common.deferred`).
+
+  The card's title and help at once, and its body (settings, tables, charts) loaded from the card's own fragment
+  right after the page (`hx-trigger="load"`, an outerHTML swap with the whole card). It looks and announces itself
+  like the kit's lazy card (`page-card--lazy`, `aria-busy`), but it does not wait to be scrolled into view: see the
+  docstring of `deferred` for why. Context: `frame` (kit.card_frame).
+-#}
+{% from "components/badges.html" import help_dot %}
+<section class="card page-card page-card--lazy" id="{{ frame.id }}" data-card="{{ frame.id }}" data-card-src="{{ frame.fragment_url }}"
+         aria-labelledby="{{ frame.id }}-title" aria-busy="true"
+         hx-get="{{ frame.fragment_url }}" hx-trigger="load" hx-swap="outerHTML">
+  <header class="card__head">
+    <div class="card__titles">
+      <h2 class="card__title" id="{{ frame.id }}-title">{{ frame.title }}</h2>
+      {% if frame.help %}{{ help_dot(frame.title, frame.help) }}{% endif %}
+    </div>
+  </header>
+  <div class="card__body"><p class="muted page-card__loading"><span class="spinner" aria-hidden="true"></span> Loading {{ frame.title|lower }}</p></div>
+</section>

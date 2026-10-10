@@ -179,7 +179,11 @@ class PrefsUpdate(ApiBody):
 # ================================================================================================ storage
 
 
-def _read_rows(conn: sqlite3.Connection, user_id: int) -> dict[str, tuple[Any, int]]:
+def read_rows(conn: sqlite3.Connection, user_id: int) -> dict[str, tuple[Any, int]]:
+    """One admin's stored preference rows (`key -> (value, updated_at)`), in the caller's read transaction.
+
+    The dashboard pages read them together with the rest of the shell's control.db facts (one read per page), then
+    call `effective` exactly as `GET /prefs` does (one definition of the defaults)."""
     rows = conn.execute(
         "SELECT key, value_json, updated_at FROM admin_prefs WHERE user_id = ? ORDER BY key LIMIT ?",
         (user_id, len(SCALAR_KEYS) + 1 + MAX_TABLES + MAX_PANELS + 50),
@@ -283,9 +287,17 @@ def effective(rows: dict[str, tuple[Any, int]], *, default_theme: str) -> dict[s
     return prefs
 
 
+_read_rows = read_rows  # the name this module used before the pages needed it
+
+
+def default_theme_of(settings: Any) -> str:
+    """The theme an admin without a stored choice gets: the `ui_default_theme` setting."""
+    return str(settings.get("ui_default_theme") or "dark")
+
+
 async def _answer(ctx: Any, user_id: int) -> dict[str, Any]:
-    rows = await ctx.dbs.control.read(lambda conn: _read_rows(conn, user_id))
-    default_theme = str(ctx.settings.get("ui_default_theme") or "dark")
+    rows = await ctx.dbs.control.read(lambda conn: read_rows(conn, user_id))
+    default_theme = default_theme_of(ctx.settings)
     return {
         "prefs": effective(rows, default_theme=default_theme),
         "stored": sorted(rows),
@@ -403,7 +415,9 @@ __all__ = [
     "PrefsUpdate",
     "TablePref",
     "apply_update",
+    "default_theme_of",
     "effective",
     "parse_update",
+    "read_rows",
     "router",
 ]

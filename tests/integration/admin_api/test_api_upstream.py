@@ -174,7 +174,8 @@ async def test_buckets_show_fill_rates_and_history_and_a_reset_never_refills_the
     api_app: Any, api: Any, api_json: Any, metrics_seed: Any, section13: Any
 ) -> None:
     now = api_app.clock.now_ms()
-    # The endpoint bucket ran 3 s ahead of its schedule: at 120 per minute and burst 10 it is 60 percent used.
+    # The endpoint bucket ran 3 s ahead of its schedule: at 120 per minute and burst 10 it is 54.6 percent used (a
+    # window bucket fits rate and burst inside one minute, so its spacing is 61,000 / 111 ms, upstream/buckets.py).
     await _hot(
         api_app,
         "INSERT INTO upstream_bucket (bucket_key, tat_ms, burst, rate_per_s, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -200,7 +201,7 @@ async def test_buckets_show_fill_rates_and_history_and_a_reset_never_refills_the
     table = api_json(await api.get("upstream/buckets", params={"range": "1h", "q": "endpoint:"}))
     (row,) = table["items"]
     assert row["key"] == f"endpoint:{TEMPLATE}"
-    assert row["fill_pct"] == 60.0
+    assert row["fill_pct"] == 54.6
     assert row["next_free_in_ms"] == 0.0
     assert row["per_min"] == api_app.ctx.settings.get("endpoint_bucket_default_per_min")
     assert row["origin"] == "setting"
@@ -230,7 +231,7 @@ async def test_buckets_show_fill_rates_and_history_and_a_reset_never_refills_the
     assert reset["buckets"] == "unchanged"
     assert reset["warnings"] == []
     after = api_json(await api.get("upstream/buckets", params={"q": "endpoint:"}))
-    assert after["items"][0]["fill_pct"] == 60.0  # never refilled (v1 bug B21)
+    assert after["items"][0]["fill_pct"] == 54.6  # never refilled (v1 bug B21)
     tat = await api_app.ctx.dbs.hot.read(
         lambda conn: conn.execute(
             "SELECT tat_ms FROM upstream_bucket WHERE bucket_key = ?", (f"endpoint:{TEMPLATE}",)

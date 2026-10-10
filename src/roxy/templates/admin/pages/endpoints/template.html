@@ -1,0 +1,25 @@
+{#-
+  The drill-down page of one endpoint template (`GET /admin/endpoints/template?template=<t>`,
+  `roxy/admin/pages/endpoints.py template_page`; plan 14.1 "drill-down page per template", plan 6.8 "Endpoints >
+  template page header menu").
+
+  The shell (time range, comparison) and the Endpoints page's `detail` card, rendered as the page body instead of in
+  the drawer: the same template, so the page and the drawer can never drift. Its header row carries the way back,
+  "Watch it live" and the reset of this one endpoint's numbers. Context: base.html's, plus `cards` (`detail`).
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/glossary.html" import term with context %}
+
+{% block how_to_read %}
+<p>Everything on this page is about one {{ term("endpoint-template") }} over the range in the top bar. The totals compare with the comparison you chose, or the period just before; a total whose data was partly reset shows a notice instead of a change.</p>
+<p>Concrete paths, recent requests and the callers of the last 15 minutes come from the live records, which keep 15 minutes; the callers over the range come from request samples, with addresses hashed. Rules are checked with Roxy's own matchers against the template and the concrete paths seen.</p>
+<p>The reset button deletes this endpoint's counters, its Roblox 429 log rows, its cooldowns and breakers and its cached answers, after a preview. Rules stay.</p>
+{% endblock %}
+
+{% block cards %}
+<section class="card page-card ep-page" aria-label="Endpoint detail">
+  <div class="card__body">
+    {{ cards["detail"] }}
+  </div>
+</section>
+{% endblock %}

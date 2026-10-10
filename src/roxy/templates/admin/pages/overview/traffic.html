@@ -1,0 +1,17 @@
+{#-
+  Overview, card `traffic` (`roxy/admin/pages/overview.py traffic_card`): requests in against calls out (plan 14.1).
+
+  The chart reads `GET /admin/api/v1/overview/chart` (the API's series answer: caller requests, the demand that
+  needed Roblox, the calls Roxy made for callers and the cache serves, with the comparison overlay, the
+  configuration change markers and the partial data notices). static/js/charts.js draws it and builds the data table
+  alternative; the gap between the demand and the upstream calls is what the cache and coalescing saved.
+  Context: `frame`, `chart_src`, `range_label`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/chart.html" import series_chart %}
+{% call page_card(frame) %}
+{{ series_chart("ov-traffic-chart", "Requests and upstream calls over time", src=chart_src,
+                summary="Caller requests, the demand that needed Roblox, the calls Roxy made to Roblox and the requests served from the cache, " ~ (range_label|lower if range_label else "over the selected range") ~ ".",
+                kind="line", y_format="count", size="md",
+                empty_text="No requests in this range yet. Traffic through the proxy appears here within a minute.") }}
+{% endcall %}

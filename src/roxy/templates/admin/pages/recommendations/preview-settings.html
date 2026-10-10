@@ -1,0 +1,9 @@
+{#-
+  Recommendations, card `preview-settings` (`roxy/admin/pages/recommendations.py preview_settings_card`): what a dry
+  run replays (plan 11.3); the `recommendations#preview-settings` catalog anchor places the sampling settings below.
+  Context: `frame`, `sample_pct`, `sample_hours`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% call page_card(frame) %}
+<p class="muted">Roxy keeps {{ "%g"|format(sample_pct) }}% of requests as samples for {{ sample_hours }} hours. A preview replays them under the proposed change; below 100% the counts it shows are scaled up from the samples, and it says so.</p>
+{% endcall %}

@@ -3,27 +3,37 @@
 
   What
     `confirm_dialog("dlg-purge", "Purge the whole cache?", action="/admin/api/v1/cache/purge", danger=True,
-    consequences=[...], type_to_confirm="purge")` renders a native <dialog>. Open it with any button carrying
-    `data-dialog-open="dlg-purge"`; static/js/dialog.js opens it as a modal, traps focus (the browser does that for
-    modal dialogs), closes on Escape or Cancel, and gives focus back to the button that opened it.
+    consequences=[...], type_to_confirm="purge", api=True)` renders a native <dialog>. Open it with any button
+    carrying `data-dialog-open="dlg-purge"`; static/js/dialog.js opens it as a modal, traps focus (the browser does
+    that for modal dialogs), closes on Escape or Cancel, and gives focus back to the button that opened it.
   Why
     A destructive action deserves one deliberate pause that says what will happen in plain words. Typing a word
     (type-to-confirm) is reserved for actions that cannot be undone, so it never becomes a habit people click
     through. A reason field feeds the audit log (plan 9.7).
   How
-    The form posts with htmx (`hx-post`, or `method="delete"` etc.), so the X-CSRF-Token header is added by
-    static/js/htmx_setup.js. The server answers 2xx (the dialog closes; an `HX-Trigger` header can show a toast) or
-    an error (the dialog stays open and shows the message). The confirm button stays disabled until the typed text
-    matches, through the `typeConfirm` Alpine component (static/js/components.js). Extra fields can be passed with
-    `{% call confirm_dialog(...) %}<label>...</label>{% endcall %}`.
+    API mode (`api=True`, every dashboard page): the form sends JSON to the admin API (`data-api-form`; the URL is
+    `action`, the method `method`), built by static/js/api_forms.js from the fields: a field's `data-json` says its
+    type (`bool`, `int`, `float`, `string`, `skip-empty`), a checkbox is a boolean, `confirm_text` (type to
+    confirm) is never sent. The X-CSRF-Token header is added; 403 `reauth_required` asks for the second factor
+    and retries; 422 shows each field's message under it (`confirmation_required` reveals the field marked
+    `data-confirm-field`); other errors show in the dialog. On success the dialog closes, a toast says
+    `success` (or the answer's message) and `on_success` decides what follows: `reload` the page, `refresh` the
+    cards named in `refresh` (static/js/cards.js), or nothing.
+    Form mode (the development gallery; `api=False`): the form posts with htmx (`hx-post`, or another method), so
+    the X-CSRF-Token header is added by static/js/htmx_setup.js; a 2xx closes the dialog, an error stays in it.
+    Either way the confirm button stays disabled until the typed text matches, through the `typeConfirm` Alpine
+    component (static/js/components.js). Extra fields go in with `{% call confirm_dialog(...) %}...{% endcall %}`;
+    `appendix` is HTML placed after the form, inside the dialog (an inline setting cannot sit inside another form).
 -#}
 {% from "components/icon.html" import icon %}
 
 {% macro confirm_dialog(id, title, action, method="post", confirm_label="Confirm", danger=False, consequences=(),
-                        body=None, type_to_confirm=None, reason=False, reason_required=False, hidden=None) -%}
+                        body=None, type_to_confirm=None, reason=False, reason_required=False, hidden=None,
+                        api=False, success=None, on_success="", refresh="", appendix=None, hidden_types=None) -%}
 <dialog class="dialog{% if danger %} dialog--danger{% endif %}" id="{{ id }}" aria-labelledby="{{ id }}-title" aria-describedby="{{ id }}-desc">
-  <form class="dialog__form" hx-{{ method }}="{{ action }}" hx-swap="none" data-dialog-form
-        x-data="typeConfirm" x-on:reset="clear" data-expected="{{ type_to_confirm or '' }}">
+  <form class="dialog__form" data-dialog-form x-data="typeConfirm" x-on:reset="clear" data-expected="{{ type_to_confirm or '' }}"
+        {%- if api %} data-api-form data-api-url="{{ action }}" data-api-method="{{ method|upper }}"{% if success %} data-success="{{ success }}"{% endif %}{% if on_success %} data-on-success="{{ on_success }}"{% endif %}{% if refresh %} data-refresh="{{ refresh }}"{% endif %}
+        {%- else %} hx-{{ method }}="{{ action }}" hx-swap="none"{% endif %}>
     <header class="dialog__head">
       <h2 class="dialog__title" id="{{ id }}-title">{% if danger %}{{ icon("alert-triangle", cls="dialog__title-icon") }}{% endif %}{{ title }}</h2>
       <button type="button" class="icon-btn" data-dialog-close aria-label="Close">{{ icon("x") }}</button>
@@ -36,19 +46,19 @@
         <ul class="dialog__consequences">{% for c in consequences %}<li>{{ c }}</li>{% endfor %}</ul>
         {% endif %}
       </div>
-      {% for name, value in (hidden or {}).items() %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
+      {% for name, value in (hidden or {}).items() %}<input type="hidden" name="{{ name }}" value="{{ value }}"{% if hidden_types and hidden_types.get(name) %} data-json="{{ hidden_types[name] }}"{% endif %}>{% endfor %}
       {{ caller() if caller is defined else "" }}
       {% if reason %}
       <div class="field">
         <label class="field__label" for="{{ id }}-reason">Reason{% if not reason_required %} <span class="muted">(optional, saved in the audit log)</span>{% endif %}</label>
-        <textarea class="input" id="{{ id }}-reason" name="reason" rows="2" maxlength="500"{% if reason_required %} required aria-required="true"{% endif %}></textarea>
+        <textarea class="input" id="{{ id }}-reason" name="reason" rows="2" maxlength="500"{% if reason_required %} required aria-required="true"{% endif %}{% if api %} data-json="skip-empty"{% endif %}></textarea>
       </div>
       {% endif %}
       {% if type_to_confirm %}
       <div class="field">
         <label class="field__label" for="{{ id }}-confirm">Type <strong class="mono">{{ type_to_confirm }}</strong> to confirm</label>
         <input class="input mono" id="{{ id }}-confirm" name="confirm_text" autocomplete="off" spellcheck="false" autocapitalize="off"
-               x-on:input="onType" aria-describedby="{{ id }}-confirm-hint">
+               x-on:input="onType" aria-describedby="{{ id }}-confirm-hint" data-json="never">
         <p class="field__hint" id="{{ id }}-confirm-hint">This cannot be undone, so the button stays off until the text matches.</p>
       </div>
       {% endif %}
@@ -59,5 +69,6 @@
       <button type="submit" class="btn {{ 'btn--danger' if danger else 'btn--primary' }}" x-bind:disabled="blocked">{{ confirm_label }}</button>
     </footer>
   </form>
+  {% if appendix %}<div class="dialog__appendix">{{ appendix }}</div>{% endif %}
 </dialog>
 {%- endmacro %}

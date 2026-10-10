@@ -1,0 +1,33 @@
+{#-
+  Upstream page, card `concurrency` (`roxy/admin/pages/upstream.py concurrency_card`): adaptive concurrency (AIMD,
+  plan 7.4, Tier 3, off by default). Its switch, and for each host and egress the limit of calls at once and the
+  calls in flight now (`GET /admin/api/v1/upstream/aimd`). There is no history table (the answer says so). The
+  `aimd_*` settings sit in the card's settings block; plan 15.6 shows the limits only while `aimd_enabled` is on,
+  so the text says they do nothing while it is off.
+  Context: `frame`, `aimd`, `items`.
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import badge %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/format.html" import num, caller_text %}
+{% from "admin/pages/upstream/_macros.html" import when %}
+{% call page_card(frame) %}
+<p>{% if aimd.enabled %}{{ badge("On", "ok", "check") }} Each host and egress may have at most its limit of calls in flight; the limit grows by one after {{ aimd.settings.aimd_increase_after }} successes and is cut by {{ aimd.settings.aimd_decrease_factor }} on a 429, a timeout or a 5xx.
+{% else %}{{ badge("Off", "neutral") }} Roblox limits the rate of calls, not how many run at once, so this optional tool is off. The limits below do nothing until <code>aimd_enabled</code> is on.{% endif %}</p>
+{% if items %}
+<div class="table-scroll g3-scroll" role="region" aria-labelledby="aimd-caption" tabindex="0">
+  <table class="simple-table g3-table">
+    <caption id="aimd-caption" class="sr-only">Concurrency limits</caption>
+    <thead><tr><th scope="col">Host</th><th scope="col">Egress</th><th scope="col" class="num">Limit</th><th scope="col" class="num">In flight</th><th scope="col">Last change</th></tr></thead>
+    <tbody>
+      {% for item in items %}<tr><td>{{ caller_text(item.host, 120) }}</td><td>{{ item.egress }}</td><td class="num">{{ item.slots }}</td><td class="num">{{ num(item.inflight) }}</td><td>{{ when(item.changed) }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div>
+{% elif aimd.enabled %}
+{{ empty_state("No limits yet", "A host and egress gets its limit with its first call while this is on.") }}
+{% endif %}
+<p class="muted">{{ aimd.history_note }}</p>
+{% endcall %}
+{% endif %}

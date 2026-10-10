@@ -1,0 +1,16 @@
+{#-
+  Data page, card `record-caps` (`roxy/admin/pages/data.py record_caps_card`): the most rows the busiest record
+  tables may hold (plan 6.10 and 15.6: `max_*_records`, `endpoint_recent_requests`, `activity_tracking`,
+  `auto_ignore_high_cardinality`, placed below by the catalog's `data#record-caps` anchor), with the tables a cap
+  bounds and their rows now (`retention_answer`, the API's own function). Caps on event types (probes, logins,
+  crawls, throttled clients) bound rows of the shared events table and are enforced every minute by the leader.
+  Context: `frame`, `rows`, `human_bytes`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "admin/pages/data/_macros.html" import limit_table %}
+{% call page_card(frame, flush=True) %}
+<p class="data-intro">A cap keeps a table from growing without end when callers send endless new values (header values, User-Agents, endpoints). The oldest rows go first. The probe, sign-in, crawl and throttled client caps bound their share of the events table, enforced every minute.</p>
+{% if rows %}
+{{ limit_table(rows, "Tables bounded by a record cap", human_bytes, show_age=False) }}
+{% endif %}
+{% endcall %}

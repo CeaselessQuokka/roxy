@@ -1,0 +1,76 @@
+{#-
+  Cache page, card `ignored-params` (`roxy/admin/pages/cache.py ignored_params_card`): v1 "Parameters left out of
+  the cache key".
+
+  The list (`cache.ignored_params_answer`, the `GET /admin/api/v1/cache/ignored-params` function) with "Stop
+  ignoring" for each (the shared confirm dialog, DELETE through the API), the add form (`POST`; by default it
+  purges exactly the answers keyed with the parameter, where v1 emptied the whole cache), v1's suggestion list of
+  common cache busters and the parameters the key spread suspects, each one click to fill the form.
+  Parameter names and notes are text a person chose: shown as text only.
+  Context: `frame`, `rows`, `total`, `cap`, `suggestions`, `suspects`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import caller_text, num %}
+{% from "components/icon.html" import icon %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/glossary.html" import term with context %}
+{% call page_card(frame, subtitle=num(total) ~ " of at most " ~ num(cap) ~ " ignored") %}
+<p class="muted cache-intro">An {{ term("ignored-param", "ignored parameter") }} is left out of the {{ term("cache-key", "cache key") }}, so requests that differ only there share one stored answer. Only ignore one you know does not change the answer.</p>
+{% if rows %}
+<div class="table-scroll" role="region" aria-labelledby="ignored-params-list-caption" tabindex="0">
+  <table class="simple-table cache-list">
+    <caption class="sr-only" id="ignored-params-list-caption">Parameters left out of the cache key</caption>
+    <thead><tr><th scope="col">Parameter</th><th scope="col">Note</th><th scope="col">Added by</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <th scope="row" data-label="Parameter"><code class="mono">{{ caller_text(row.name, 120) }}</code></th>
+        <td data-label="Note">{{ caller_text(row.note, 200) }}</td>
+        <td data-label="Added by">{{ row.origin }}</td>
+        <td class="cache-list__actions"><button type="button" class="btn btn--sm btn--ghost" data-dialog-open="dlg-cache-unignore"
+            data-fill='{{ {"_url": row.remove_url, "_label": row.name}|tojson }}' data-action="cache-unignore">{{ icon("x-circle") }}<span>Stop ignoring</span><span class="sr-only"> {{ row.name }}</span></button></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state("Nothing ignored", "Every query parameter is part of the cache key. The key spread below names a parameter that splits answers apart, if there is one.", "inbox") }}
+{% endif %}
+
+<form class="stack cache-form" id="cache-ignore-form" data-api-form data-api-url="/admin/api/v1/cache/ignored-params" data-api-method="POST"
+      data-success="Ignored. The answers stored with it were dropped so it takes effect." data-on-success="refresh" data-refresh="ignored-params spread browser" novalidate>
+  <div class="field-row">
+    <div class="field">
+      <label class="field__label" for="cache-ignore-name">Parameter name</label>
+      <input class="input mono" id="cache-ignore-name" name="name" required maxlength="400" autocomplete="off" spellcheck="false" placeholder="t" data-json="string" aria-describedby="cache-ignore-name-hint cache-ignore-name-error">
+      <p class="field__hint" id="cache-ignore-name-hint">The exact name as it appears in the query string. Case-sensitive.</p>
+      <p class="field__error" id="cache-ignore-name-error" data-field-error="name" hidden></p>
+    </div>
+    <div class="field">
+      <label class="field__label" for="cache-ignore-note">Note <span class="muted">(optional, private)</span></label>
+      <input class="input" id="cache-ignore-note" name="note" maxlength="500" autocomplete="off">
+    </div>
+  </div>
+  <label class="check"><input type="checkbox" name="purge" checked data-json="bool"><span>Drop the answers stored with this parameter, so it takes effect at once</span></label>
+  <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+  <div class="cluster"><button type="submit" class="btn btn--primary" data-action="cache-ignore-add">{{ icon("plus") }}<span>Ignore it</span></button></div>
+</form>
+
+{% if suspects %}
+<section aria-labelledby="ignored-suspects-title">
+  <h3 class="cache-fact__title" id="ignored-suspects-title">Splitting answers right now</h3>
+  <ul class="cache-suggest">
+    {% for s in suspects %}
+    <li><button type="button" class="btn btn--sm btn--warn-soft" data-fill-form="cache-ignore-form" data-fill='{{ {"name": s.param}|tojson }}'><code class="mono">{{ s.param }}</code></button>
+      <span class="muted">on {{ caller_text(s.path, 120) }}: {{ num(s.entries) }} answers, {{ num(s.hits) }} reused</span></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% if suggestions %}
+<p class="cache-suggest-line"><span class="muted">Commonly used as cache busters (press one to fill the form):</span>
+  {% for name in suggestions %}<button type="button" class="btn btn--sm btn--ghost cache-chip" data-fill-form="cache-ignore-form" data-fill='{{ {"name": name}|tojson }}'><code class="mono">{{ name }}</code></button>{% endfor %}
+</p>
+{% endif %}
+{% endcall %}

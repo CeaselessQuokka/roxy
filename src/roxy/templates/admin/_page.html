@@ -1,0 +1,19 @@
+{#-
+  The page layout every dashboard page extends (`roxy.admin.pages.kit.Page.render`).
+
+  What: base.html plus the cards. `cards` maps a card id to its rendered HTML (or, for a lazy card, its loading
+  placeholder) and `card_order` lists them in registry order. This default layout puts every card in one column;
+  a page template (`admin/pages/<page>.html`) extends this file and overrides `cards` to lay them out, for example
+  `<div class="grid grid--2">{{ cards["ips"] }}{{ cards["places"] }}</div>`.
+  Why: the page and each card's HTMX fragment render the same card template, so the first paint and a refresh can
+  never drift, and a builder lays out cards without touching how they render.
+  Context: everything base.html takes, plus `cards`, `card_order`, `view` (the PageView) and `page_assets`.
+-#}
+{% extends "admin/base.html" %}
+{% block content %}
+<div class="page-cards stack-lg" data-page-cards>
+  {% block cards %}
+  {% for card_id in card_order %}{{ cards[card_id] }}{% endfor %}
+  {% endblock %}
+</div>
+{% endblock %}

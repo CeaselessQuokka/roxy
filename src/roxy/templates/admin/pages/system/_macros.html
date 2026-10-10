@@ -1,0 +1,28 @@
+{#-
+  Small macros of the System page cards (templates/admin/pages/system/*.html).
+
+  `when(cell)`: a time from `fmt.time_cell` as `<time>` with its "2 minutes ago", or "n/a".
+  `flag(value, yes, no, tone)`: a yes or no answer as a badge with an icon and words (color is never the only
+  signal, plan 14.9). `stat(label, value, help)`: one term and value of a facts list, with an optional help dot.
+  `ms(value)`: milliseconds with one decimal under 10, none above.
+-#}
+{% from "components/badges.html" import status_badge, help_dot %}
+
+{% macro when(cell) -%}
+{%- if cell -%}<time datetime="{{ cell.datetime }}">{{ cell.text }}</time>{% if cell.sub %} <span class="muted">({{ cell.sub }})</span>{% endif %}
+{%- else -%}<span class="muted">n/a</span>{%- endif -%}
+{%- endmacro %}
+
+{% macro flag(value, yes="Yes", no="No", tone_yes="ok", tone_no="neutral") -%}
+{%- if value -%}{{ status_badge(tone_yes, yes) }}{%- else -%}{{ status_badge(tone_no, no) }}{%- endif -%}
+{%- endmacro %}
+
+{% macro stat(label, help=None) -%}
+<dt>{{ label }}{% if help %} {{ help_dot(label, help) }}{% endif %}</dt><dd>{{ caller() }}</dd>
+{%- endmacro %}
+
+{% macro ms(value) -%}
+{%- if value is none -%}<span class="muted">n/a</span>
+{%- elif value < 10 -%}{{ "{:,.1f}".format(value) }} ms
+{%- else -%}{{ "{:,.0f}".format(value) }} ms{%- endif -%}
+{%- endmacro %}

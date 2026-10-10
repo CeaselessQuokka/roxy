@@ -1,0 +1,52 @@
+{#-
+  Upstream page, card `retries` (`roxy/admin/pages/upstream.py retries_card`): v1's Retries section (plan 14.1 row 22).
+
+  Retries by status, by reason and by egress (`GET /admin/api/v1/upstream/retries`, parity row 117), the CSRF token
+  refreshes among them, upstream calls by attempt kind, and v1's "Returned Reasons": whose words a refused or
+  failed caller got (Roxy's own text or Roblox's body passed on; parity row 116, from the refusal reasons read
+  model). The settings below are the retry backoff and the CSRF token cache.
+  Context: `frame`, `answer`, `by_status`, `by_reason`, `by_egress`, `kinds`, `returned`.
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num, caller_text %}
+{% from "admin/pages/upstream/_macros.html" import stat %}
+{% macro pairs(caption, rows, head, mono=False) -%}
+<div class="table-scroll g3-scroll" role="region" aria-label="{{ caption }}" tabindex="0">
+  <table class="simple-table g3-table">
+    <caption class="g3-caption">{{ caption }}</caption>
+    <thead><tr><th scope="col">{{ head }}</th><th scope="col" class="num">Count</th></tr></thead>
+    <tbody>
+      {% for name, count in rows %}<tr><td{% if mono %} class="mono"{% endif %}>{{ caller_text(name, 120) }}</td><td class="num">{{ num(count) }}</td></tr>
+      {% else %}<tr><td colspan="2" class="muted">None in this range.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div>
+{%- endmacro %}
+{% call page_card(frame) %}
+<dl class="g3-stats">
+  {{ stat("Retries after an error", num(retry_5xx), "a 5xx, a timeout or a connection error, retried after a backoff") }}
+  {{ stat("CSRF token refreshes", num(answer.csrf_retries), "Roblox asked for a token; the call was repeated once") }}
+  {{ stat("Retries after a 429", num(fallback_429), "on another anonymous egress (fallback_on_429)") }}
+</dl>
+<h3 class="g3-subhead">The retry log <span class="muted">(v1's count: every logged retry, {{ num(answer.total) }} in this range)</span></h3>
+<div class="grid grid--3 g3-tables">
+  {{ pairs("By status", by_status, "Status", mono=True) }}
+  {{ pairs("By reason", by_reason, "Reason") }}
+  {{ pairs("By egress", by_egress, "Egress") }}
+</div>
+<div class="grid grid--2 g3-tables">
+  {{ pairs("Upstream calls by attempt kind", kinds, "Kind") }}
+  <div class="table-scroll g3-scroll" role="region" aria-label="Returned reasons" tabindex="0">
+    <table class="simple-table g3-table">
+      <caption class="g3-caption">Returned reasons <span class="muted">(refused and failed requests)</span></caption>
+      <thead><tr><th scope="col">Callers got</th><th scope="col" class="num">Requests</th></tr></thead>
+      <tbody>
+        {% for row in returned %}<tr><td>{{ row.label }}</td><td class="num">{{ num(row.count) }}</td></tr>
+        {% else %}<tr><td colspan="2" class="muted">No refused or failed requests in this range.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endcall %}
+{% endif %}

@@ -263,9 +263,10 @@ router = APIRouter(lifespan=admin_lifespan)
 router.include_router(auth_router)  # /admin (login), /admin/enroll, /admin/invalidate/*, /admin/api/v1/auth/*
 router.include_router(api_router)  # /admin/api/v1/<area>/..., /admin/api/v1/stream, /admin/api/v1/openapi.json
 
-# ---- P11 include point: the dashboard pages (`roxy/admin/pages.py`, router `router`) --------------------------------
-# The pages specialist writes the module; nothing else needs editing. The module is checked (guards, CSRF, paths)
-# before it is included; a module that exists but fails to import raises, as for the API areas.
+# ---- P11 include point: the dashboard pages (package `roxy/admin/pages/`, router `router`) --------------------------
+# `roxy.admin.pages.router` holds `/admin/dashboard`, the shell's `/admin/ui/*` routes and every page of its registry
+# (the built ones and "coming soon" for the rest). It is checked (guards, CSRF, paths) before it is included; a page
+# module that exists but fails to import raises, as for the API areas.
 _pages = optional_import(PAGES_MODULE)
 if _pages is not None:
     router.include_router(check_page_router(PAGES_MODULE, getattr(_pages, "router", None)))

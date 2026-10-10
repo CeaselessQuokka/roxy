@@ -340,6 +340,22 @@ def test_worker_env_refuses_roxy_variables() -> None:
     assert option_value(["replay"], "--tree") is None
 
 
+def test_the_fleet_starts_with_the_units_environment(tmp_path: Path) -> None:
+    """The measured tree's `roxy@.service` `Environment=` lines (glibc malloc tuning, LOAD-2) reach gunicorn as
+    systemd would set them; `--worker-env` wins; `ROXY_*` lines never apply; a tree without the unit adds nothing."""
+    from load.fleet import REPO, base_env, unit_environment
+
+    assert unit_environment(REPO)["MALLOC_ARENA_MAX"] == "2"  # the repository's own unit
+    unit = tmp_path / "deploy" / "systemd" / "roxy@.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\n# why\nEnvironment=MALLOC_ARENA_MAX=2\n# never\nEnvironment=ROXY_WORKERS=9\n")
+    assert unit_environment(tmp_path) == {"MALLOC_ARENA_MAX": "2"}
+    assert unit_environment(tmp_path / "missing") == {}
+    env = base_env(tmp_path, tmp_path, "http://127.0.0.1:9", workers=2, tree=tmp_path, extra={"MALLOC_ARENA_MAX": "8"})
+    assert env["MALLOC_ARENA_MAX"] == "8"
+    assert env["ROXY_WORKERS"] == "2"
+
+
 def test_absolute_paths_rewrites_only_path_options() -> None:
     out = absolute_paths(["replay", "--json", "r.json", "--work=w", "--scale", "0.5"])
     assert out[0] == "replay"

@@ -1,0 +1,262 @@
+{#-
+  Recommendations, the detail drawer (`GET /admin/recommendations/detail?rec=<id>`,
+  `roxy/admin/pages/recommendations.py detail_context`; plan 11.2, 11.3, 14.5 "recommendation card").
+
+  Shown in the drawer (which has its own h2), so sections start at h3. In order: severity, state and the D7 badge (or
+  why auto-apply skips it); the title and explanation; the evidence (window, sample size, named numbers, a server-drawn
+  chart of every timeline the rule recorded with its data table, links, the other details as text); the exact
+  proposed changes (a single-endpoint rule reads "exactly this endpoint"); what to do: Preview (loads the dry run and
+  the Apply form below it), Undo, Snooze, Dismiss, each with the reason it is not possible now; the watch window and
+  its rollback; the actions taken; earlier recommendations with the same finding; the rule and its tuning drawer.
+  Every text a rule built (it can quote callers' paths) goes through `caller_text`; links only through `local_href`.
+  Forms post JSON to the Recommendations API (static/js/api_forms.js) and reopen this drawer on success
+  (`data-reopen`, static/js/pages/recommendations.js).
+  Context: see `detail_context`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/format.html" import caller_text, local_href, num %}
+{% from "components/chart.html" import sparkline %}
+{% from "components/alert.html" import inline_alert %}
+{% set rid = "rd-" ~ (id|replace("_", "-")) %}
+<div class="rec-detail stack" id="{{ rid }}" data-rec-detail="{{ id }}" data-reopen-url="{{ detail_url }}">
+  <p class="rec-detail__lead">
+    {{ badge(severity_words, severity_tone, {"bad": "alert-octagon", "warn": "alert-triangle", "info": "info"}.get(severity_tone, "minus")) }}
+    {{ badge(state_words, {"muted": "neutral"}.get(state_tone, state_tone)) }}
+    <code class="rec-detail__rule">{{ rec.rule_id }}</code>
+    <span class="muted">{{ rec.confidence|capitalize }} confidence, {{ rec.risk }} risk</span>
+  </p>
+  {% if safe_auto %}
+  <p class="rec-detail__auto">{{ badge("Safe to auto-apply", "ok", "check-circle") }} <span class="muted">Every change touches one endpoint, rule row or client, so auto-apply (when it is on) may apply it within its limits.</span></p>
+  {% elif wide_note %}
+  <p class="rec-detail__auto">{{ badge("Not auto-applied", "warn", "alert-triangle") }} <span>{{ wide_note }}</span></p>
+  {% endif %}
+
+  <h3 class="rec-detail__title">{{ caller_text(rec.title, 300) }}</h3>
+  {% if explanation %}<div class="rec-detail__why">{{ caller_text(explanation, 4000, block=True) }}</div>{% endif %}
+  {% if rec.expected_impact %}<p class="rec-detail__impact">{{ icon("sparkle") }}<span><strong>Expected:</strong> {{ caller_text(rec.expected_impact, 600) }}</span></p>{% endif %}
+  <dl class="kv rec-detail__times">
+    {% if created %}<dt>First raised</dt><dd><time datetime="{{ created.datetime }}">{{ created.text }}</time> <span class="muted">({{ created.sub }})</span></dd>{% endif %}
+    {% if updated %}<dt>Last updated</dt><dd><time datetime="{{ updated.datetime }}">{{ updated.text }}</time> <span class="muted">({{ updated.sub }})</span></dd>{% endif %}
+    {% if expires %}<dt>Expires</dt><dd>{{ expires }} <span class="muted">(if nobody acts on it)</span></dd>{% endif %}
+    <dt>Subject</dt><dd class="mono">{{ caller_text(rec.subject, 300) }}</dd>
+  </dl>
+
+  <section class="rec-section" aria-labelledby="{{ rid }}-evidence">
+    <h3 class="rec-section__title" id="{{ rid }}-evidence">Evidence</h3>
+    <p class="muted">From {{ evidence.from }} to {{ evidence.to }}{% if evidence.sample_size %}, based on {{ num(evidence.sample_size) }} observations{% endif %}.</p>
+    {% if evidence.metrics %}
+    <div class="table-scroll" role="region" aria-labelledby="{{ rid }}-metrics-caption" tabindex="0">
+      <table class="simple-table rec-metrics">
+        <caption id="{{ rid }}-metrics-caption" class="sr-only">The numbers this recommendation rests on</caption>
+        <thead><tr><th scope="col">What</th><th scope="col" class="num">Value</th></tr></thead>
+        <tbody>
+          {% for metric in evidence.metrics %}
+          <tr><th scope="row">{{ metric.name }}</th><td class="num">{{ caller_text(metric.value, 120) }}{% if metric.unit %} <span class="muted">{{ metric.unit }}</span>{% endif %}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+    {% for chart in evidence.charts %}
+    <figure class="rec-chart" aria-labelledby="{{ rid }}-chart-{{ loop.index }}">
+      <figcaption id="{{ rid }}-chart-{{ loop.index }}" class="rec-chart__title">{{ chart.title }}</figcaption>
+      {% for line in chart.series %}
+      <div class="rec-chart__line">
+        <span class="rec-chart__label">{{ line.label }}</span>
+        {{ sparkline(line["values"], label=chart.title ~ ", " ~ line.label, width=280, height=48, tone="bad" if severity_tone == "bad" else ("warn" if severity_tone == "warn" else "accent")) }}
+      </div>
+      {% endfor %}
+      <details class="details-plain">
+        <summary>Show the data as a table</summary>
+        <div class="table-scroll" role="region" aria-label="{{ chart.title }}: data table" tabindex="0">
+          <table class="simple-table">
+            <thead><tr><th scope="col">Time (UTC)</th>{% for measure in chart.measures %}<th scope="col" class="num">{{ measure }}</th>{% endfor %}</tr></thead>
+            <tbody>
+              {% for moment in chart.times %}
+              <tr><th scope="row">{{ moment }}</th>{% for value in chart.rows[loop.index0] %}<td class="num">{{ "n/a" if value is none else ("{:,.4g}".format(value)) }}</td>{% endfor %}</tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </figure>
+    {% endfor %}
+    {% set evidence_links = [] %}
+    {% for link in evidence.links %}{% set href = local_href(link) %}{% if href %}{% set _ = evidence_links.append(href) %}{% endif %}{% endfor %}
+    {% if evidence_links %}
+    <ul class="rec-links" role="list">
+      {% for href in evidence_links %}<li><a href="{{ href }}">{{ icon("external") }}<span>{{ href }}</span></a></li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if evidence.details %}
+    <details class="details-plain">
+      <summary>Everything else the rule recorded</summary>
+      <pre class="rec-pre">{{ caller_text(evidence.details, 4000, block=True) }}</pre>
+    </details>
+    {% endif %}
+  </section>
+
+  <section class="rec-section" aria-labelledby="{{ rid }}-changes">
+    <h3 class="rec-section__title" id="{{ rid }}-changes">Proposed changes</h3>
+    {% if changes %}
+    <div class="table-scroll" role="region" aria-labelledby="{{ rid }}-changes" tabindex="0">
+      <table class="diff-table rec-diff">
+        <caption class="sr-only">Each proposed change with its value now and after</caption>
+        <thead><tr><th scope="col">What</th><th scope="col">Now</th><th scope="col">After</th></tr></thead>
+        <tbody>
+          {% for change in changes %}
+          <tr>
+            <th scope="row">
+              <span class="diff-table__label">{{ change.label }}</span>
+              {% if change.endpoint %}<span class="diff-table__note">Exactly this endpoint: <code>{{ caller_text(change.endpoint, 300) }}</code></span>{% endif %}
+              {% if change.target %}<code class="diff-table__key">{{ caller_text(change.target, 300) }}</code>{% endif %}
+              {% if change.note %}<span class="diff-table__note">{{ caller_text(change.note, 600) }}</span>{% endif %}
+            </th>
+            {% if change.manual %}
+            <td colspan="2"><span class="muted">Roxy cannot make this change; it is a step for you.</span></td>
+            {% else %}
+            <td class="diff-table__before"><span class="sr-only">Now: </span>{% if change.before is none %}<span class="muted">not set</span>{% else %}<del>{{ caller_text(change.before, max_value_chars) }}</del>{% endif %}</td>
+            <td class="diff-table__after"><span class="sr-only">After: </span>{% if change.after is none %}<span class="muted">removed</span>{% else %}<ins>{{ caller_text(change.after, max_value_chars) }}</ins>{% endif %}</td>
+            {% endif %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="muted">This recommendation proposes no change.</p>
+    {% endif %}
+  </section>
+
+  {% if watch %}
+  <section class="rec-section" aria-labelledby="{{ rid }}-watch">
+    <h3 class="rec-section__title" id="{{ rid }}-watch">Watch window</h3>
+    <dl class="kv">
+      <dt>State</dt><dd>{{ watch.state }}</dd>
+      <dt>From</dt><dd>{{ watch.started }}</dd>
+      <dt>Until</dt><dd><time datetime="{{ watch.ends_iso }}">{{ watch.ends }}</time></dd>
+      {% if watch.rollback %}
+      <dt>Rollback</dt>
+      <dd data-rollback="{{ watch.rollback.status }}">
+        {% if watch.rollback.status == "done" %}{{ status_badge("warn", "Rolled back") }} The guard numbers got worse, so Roxy put the old values back.
+        {% elif watch.rollback.status == "pending" %}{{ status_badge("warn", "Rollback pending") }} Retried every pass{% if watch.rollback.attempts %} ({{ watch.rollback.attempts }} attempts so far){% endif %}: {{ caller_text(watch.rollback.reason, 300) }}
+        {% elif watch.rollback.status == "refused" %}{{ status_badge("bad", "Rollback refused") }} The change is still in place: {{ caller_text(watch.rollback.reason, 300) }}
+        {% endif %}
+      </dd>
+      {% endif %}
+    </dl>
+  </section>
+  {% endif %}
+
+  <section class="rec-section rec-actions" aria-labelledby="{{ rid }}-act">
+    <h3 class="rec-section__title" id="{{ rid }}-act">What you can do</h3>
+    {% if allowed.apply.allowed %}
+    <div class="rec-act">
+      <button type="button" class="btn btn--primary" data-action="recommendation-preview"
+              hx-get="{{ preview_url }}" hx-target="#{{ rid }}-preview" hx-swap="innerHTML" hx-indicator="#{{ rid }}-preview">{{ icon("eye") }}<span>Preview and apply</span></button>
+      <p class="muted">Shows the exact changes, what they would have done to recent traffic{% if not dry_run_available %} (no change of this one can be replayed){% endif %}, and the Apply button.</p>
+    </div>
+    <div class="rec-preview" id="{{ rid }}-preview" data-rec-preview></div>
+    {% elif allowed.apply.why %}
+    <p class="muted rec-why-not" data-why-not="apply">{{ icon("info") }}<span>Apply: {{ allowed.apply.why }}</span></p>
+    {% endif %}
+
+    {% if allowed.undo.allowed %}
+    <form class="rec-form stack" data-api-form data-api-url="{{ links.undo }}" data-api-method="POST"
+          data-success="Undone: the changes were put back as they were." data-on-success="refresh" data-refresh="list history" data-reopen="{{ detail_url }}" novalidate>
+      <p class="rec-form__title">{{ icon("reset") }}<span>Undo</span></p>
+      <ul class="dialog__consequences"><li>Puts back exactly what the apply changed, on every worker within a second.</li><li>Refused when someone changed the same setting or rule since; then change it by hand.</li></ul>
+      <div class="field">
+        <label class="field__label" for="{{ rid }}-undo-reason">Reason <span class="muted">(optional, saved in the audit log)</span></label>
+        <textarea class="input" id="{{ rid }}-undo-reason" name="reason" rows="2" maxlength="500" data-json="skip-empty"></textarea>
+      </div>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      <div class="cluster"><button type="submit" class="btn" data-action="recommendation-undo">{{ icon("reset") }}<span>Undo the changes</span></button></div>
+    </form>
+    {% endif %}
+
+    {% if allowed.snooze.allowed %}
+    <div class="rec-form stack" role="group" aria-labelledby="{{ rid }}-snooze-title">
+      <p class="rec-form__title" id="{{ rid }}-snooze-title">{{ icon("clock") }}<span>Snooze</span></p>
+      <p class="muted">Hides it from the open list until then; if the problem is still there afterwards it comes back.</p>
+      <div class="cluster rec-snooze">
+        {% for value, label in snooze %}
+        <form data-api-form data-api-url="{{ links.snooze }}" data-api-method="POST" data-success="Snoozed for {{ label }}." data-on-success="refresh" data-refresh="list history" data-reopen="{{ detail_url }}" novalidate>
+          <input type="hidden" name="duration" value="{{ value }}" data-json="string">
+          <button type="submit" class="btn btn--ghost" data-action="recommendation-snooze-{{ value }}">For {{ label }}</button>
+        </form>
+        {% endfor %}
+      </div>
+      <form class="rec-until" data-api-form data-api-url="{{ links.snooze }}" data-api-method="POST" data-success="Snoozed." data-on-success="refresh" data-refresh="list history" data-reopen="{{ detail_url }}" novalidate>
+        <div class="field">
+          <label class="field__label" for="{{ rid }}-until">Or until <span class="muted">(in {{ ui_tz }}, at most {{ snooze_max_days }} days ahead)</span></label>
+          <div class="cluster">
+            <input class="input" type="datetime-local" id="{{ rid }}-until" name="until" required data-json="string" aria-describedby="{{ rid }}-until-error">
+            <button type="submit" class="btn btn--ghost">Snooze until then</button>
+          </div>
+          <p class="field__error" id="{{ rid }}-until-error" data-field-error="until" hidden></p>
+        </div>
+        <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      </form>
+    </div>
+    {% elif allowed.snooze.why %}
+    <p class="muted rec-why-not" data-why-not="snooze">{{ icon("info") }}<span>Snooze and dismiss: {{ allowed.snooze.why }}</span></p>
+    {% endif %}
+
+    {% if allowed.dismiss.allowed %}
+    <form class="rec-form stack" data-api-form data-api-url="{{ links.dismiss }}" data-api-method="POST"
+          data-success="Dismissed. The same finding stays quiet for a while unless it gets more severe." data-on-success="refresh" data-refresh="list history" data-reopen="{{ detail_url }}" novalidate>
+      <p class="rec-form__title">{{ icon("x-circle") }}<span>Dismiss</span></p>
+      <div class="field">
+        <label class="field__label" for="{{ rid }}-dismiss-reason">Why</label>
+        <select class="input" id="{{ rid }}-dismiss-reason" name="reason" data-json="string" aria-describedby="{{ rid }}-dismiss-reason-error">
+          {% for value, label in dismiss_reasons %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+        </select>
+        <p class="field__error" id="{{ rid }}-dismiss-reason-error" data-field-error="reason" hidden></p>
+      </div>
+      <div class="field">
+        <label class="field__label" for="{{ rid }}-dismiss-text">Say more <span class="muted">(needed for Other; saved in the audit log)</span></label>
+        <textarea class="input" id="{{ rid }}-dismiss-text" name="text" rows="2" maxlength="500" data-json="skip-empty" aria-describedby="{{ rid }}-dismiss-text-error"></textarea>
+        <p class="field__error" id="{{ rid }}-dismiss-text-error" data-field-error="text" hidden></p>
+      </div>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      <div class="cluster"><button type="submit" class="btn btn--ghost" data-action="recommendation-dismiss">{{ icon("x") }}<span>Dismiss it</span></button></div>
+    </form>
+    {% endif %}
+  </section>
+
+  <section class="rec-section" aria-labelledby="{{ rid }}-history">
+    <h3 class="rec-section__title" id="{{ rid }}-history">What happened to it</h3>
+    {% if history %}
+    <ol class="rec-history" role="list">
+      {% for item in history %}
+      <li>
+        <span class="rec-history__what">{{ item.action }}</span>
+        {% if item.when %}<time class="muted" datetime="{{ item.when.datetime }}">{{ item.when.text }}</time>{% endif %}
+        <span class="muted">by {{ caller_text(item.actor, 80) }}</span>
+        {% if item.summary %}<span class="rec-history__summary">{{ caller_text(item.summary, 300) }}</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+    {% else %}
+    <p class="muted">Nobody has acted on it yet.</p>
+    {% endif %}
+    {% if earlier %}
+    <p class="rec-form__title">Earlier recommendations with the same finding</p>
+    <ul class="rec-mini" role="list">
+      {% for item in earlier %}
+      <li class="rec-mini__item"><button type="button" class="link-btn" data-drawer-src="{{ item.drawer }}" data-drawer-title="Earlier recommendation">{{ item.state_words }}, {{ item.when }}</button>{% if item.dismissed_reason %} <span class="muted">({{ item.dismissed_reason|replace("_", " ") }})</span>{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  {% if rule %}
+  <section class="rec-section" aria-labelledby="{{ rid }}-rule">
+    <h3 class="rec-section__title" id="{{ rid }}-rule">The rule: {{ rule.id }}</h3>
+    <p class="rec-rule__help">{{ rule.help }}</p>
+    {% if tune %}<p><button type="button" class="btn btn--ghost" data-drawer-src="{{ tune }}" data-drawer-title="Tune {{ rule.id }}">{{ icon("sliders") }}<span>Tune this rule</span></button></p>{% endif %}
+  </section>
+  {% endif %}
+</div>

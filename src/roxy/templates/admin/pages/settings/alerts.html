@@ -1,0 +1,11 @@
+{#-
+  Settings page, card `alerts` (`roxy/admin/pages/settings.py alerts_card`): where alerts go and how often.
+
+  The settings come from the catalog (anchor `settings#alerts`, the same keys as System > Alerts) and follow below
+  this sentence. The channels themselves are systemd credentials, so System > Alerts says which exist.
+  Context: `frame`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% call page_card(frame) %}
+<p class="muted">Every alert is deduplicated by its cooldown and capped per hour across all workers; a leak guard alert is never held back. The email and webhook channels are credentials on the server: <a href="/admin/system#alerts">System &gt; Alerts</a> shows which are configured.</p>
+{% endcall %}

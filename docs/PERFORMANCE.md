@@ -5,10 +5,13 @@ of plan 6.7, the replay of a v1-like traffic profile that plan 19.10 row 7 accep
 used against the 1 GB server, and how many bytes one metrics rollup row takes (plan 6.6). It also says how to run
 every measurement again.
 
-Every figure below was measured on 2026-10-09 on a development machine (WSL 2), not on the production plan size, and
-while nine other agents ran test suites on the same machine (load average mostly between 1 and 8). Counts (calls,
-429s, avoided shares) and memory are reliable; **latency and throughput figures are indicative only**. The lead
-reruns the numbers on a quiet machine before release with the commands in "Running it again".
+Every figure below was measured on 2026-10-09 and 2026-10-10 on a development machine (WSL 2), not on the production
+plan size, and while other agents ran test suites and their own load runs on the same machine (load average mostly
+between 1 and 8). Counts (calls, 429s, avoided shares) and memory are reliable; **latency and throughput figures are
+indicative only**, and every before and after comparison below was measured at the same time on the same machine
+(interleaved runs, or soaks side by side). The lead reruns the numbers on a quiet machine before release with the
+commands in "Running it again". The section "LOAD-2 and LOAD-3: what grew, what contended, what changed" records the
+perf lane's findings and fixes; the older sections keep the figures of the code before them (commit 3861e65).
 
 ## Running it again
 
@@ -51,10 +54,199 @@ env -u ROXY_ENV PYTHONPATH="$PWD" ../.venv/bin/python -m load.harness steady col
 cd .. && .venv/bin/python -m pytest -q -s tests/integration/test_metrics_rowsize.py
 ```
 
+**The memory soak and the write lock ceiling (LOAD-2, LOAD-3)**, before and after side by side: `$base` is the
+commit before the perf lane (3f2ad1c), the release is HEAD. The soaks run together (about 37 minutes); the steady
+runs alternate between the two trees, three of each, so the machine's mood hits both alike (about 25 minutes):
+
+```sh
+cd ~/Projects/RobloxProxyServer
+base=3f2ad1c; rel=$(git rev-parse --short HEAD); out=/tmp/roxy-perf-$rel; rm -rf "$out"
+mkdir -p "$out/base" "$out/tree"; git archive $base | tar -x -C "$out/base"; git archive HEAD | tar -x -C "$out/tree"
+cd tests
+for t in base tree; do
+  env -u ROXY_ENV PYTHONPATH="$PWD" ../.venv/bin/python -m load.harness replay --scale 10 --tree "$out/$t" \
+    --work "$out/soak-$t" --json "$out/soak-$t.json" > "$out/soak-$t.txt" 2>&1 &
+done; wait
+for n in 1 2 3; do for t in base tree; do
+  env -u ROXY_ENV PYTHONPATH="$PWD" ../.venv/bin/python -m load.harness steady --tree "$out/$t" \
+    --json "$out/steady200-$t-$n.json" > "$out/steady200-$t-$n.txt" 2>&1
+  env -u ROXY_ENV PYTHONPATH="$PWD" ../.venv/bin/python -m load.harness steady --tree "$out/$t" --steady-rate 450 \
+    --steady-connections 400 --json "$out/steady450-$t-$n.json" > "$out/steady450-$t-$n.txt" 2>&1
+done; done
+for t in base tree; do
+  env -u ROXY_ENV PYTHONPATH="$PWD" ../.venv/bin/python -m load.harness flood --tree "$out/$t" \
+    --json "$out/flood-$t.json" > "$out/flood-$t.txt" 2>&1
+done
+cd .. && .venv/bin/python -m pytest -q -s tests/multiprocess/test_storage_mp.py -k "group_commit or latency"
+```
+
+Read in each soak table the rows "peak RSS per worker", "peak memory of the color" and "memory over the run" (the
+JSON's `memory.timeline` has a point every 30 s); in each steady table "offered and achieved rate", "cache hit
+latency", "miss overhead", "hot.db write lock, every transaction" and "hot.db budget overruns". The harness applies
+the `Environment=` lines of the measured tree's `roxy@.service` (the allocator tuning) the way systemd does, and its
+table lists them.
+
 Useful options: `--scale 6` runs every duration six times longer (a 20 minute replay), `--keep` keeps each
 scenario's state, gunicorn log and the mock's call log (`<work>/replay/mock_calls.csv`), `--set KEY=VALUE` changes
 a setting and `--worker-env KEY=VALUE` the workers' environment for a "what if" run (marked in the table as not a
-reference run).
+reference run), and `--steady-connections N` gives the steady scenario's client more connections, so at a rate the
+server cannot keep up with, the server (not the client's pool) sets the answered rate.
+
+## LOAD-2 and LOAD-3: what grew, what contended, what changed
+
+Measured 2026-10-10 by the perf lane with the harness above, extra diagnostics that are not shipped (a
+`sitecustomize` hook in the measured copy writing each worker's RSS, glibc `mallinfo2`, SQLite's memory counter, GC
+pauses, per leader job RSS steps and tracemalloc snapshots every 30 s), and an offline replay of one recommendations
+evaluation against a kept state. "Before" is commit 3f2ad1c, "after" the code of this section; both ran at the
+same time.
+
+### LOAD-2: the leader worker's memory
+
+**What grew.** Not a leak of live objects: tracemalloc snapshots of the leader showed live Python memory up 1.7 MiB
+between minute 4 and 10 and 0.4 MiB between minute 10 and 20 (bounded caches filling: the cache memory tier, spam
+counters, the bot tracker). What grew was the high water mark of three things:
+
+| Part (leader, minute 5 to 35, before) | Growth | Why |
+|---|---|---|
+| Python's allocator arenas (anonymous memory outside glibc's heap) | about 38 MiB | each recommendations evaluation (every 30 s) read the request samples of a day as dicts, more each run as the table filled; the arenas keep the peak |
+| glibc heap: free space kept (fragmentation) | about 15 MiB | the same transient reads, spread over about 20 threads' malloc arenas |
+| SQLite page caches | about 12 MiB | bounded (DESIGN.md section 0: at most about 30 MiB per worker), filling as the leader's jobs read |
+
+The evidence: per leader job, `insights_evaluate` added 70 MiB of RSS over 21 runs in 35 minutes while its run time
+grew from 50 to 330 ms; the tracemalloc snapshot at minute 33 caught one evaluation holding 27.9 MiB in
+`metrics/read_history.py samples_between` (14.6 MiB of fetched rows, 13.3 MiB of dicts made from them). The step of
+about 7 MiB at minute 10 is the first `retention` run (6.3 MiB: the metrics writer's page cache filling while it
+prunes). The other worker, which runs no leader jobs, levelled at about 159 MiB. A full garbage collection took 115 to
+125 ms with the event loop stopped (about 900,000 objects).
+
+At production volume it was worse than the soak showed. Offline, one evaluation against a request sample table of
+the size plan 6.6 expects (293,304 samples in 24 hours) peaked at **249 MiB** above its start: 11 sample reads held
+258,030 rows (243 MiB) until the evaluation ended. That alone passes `MemoryMax` of a color.
+
+**Fixes (every structure bounded, plan P9).**
+- `metrics/read_history.py`: the sample reads return `SampleRecord`, a read-only mapping over one tuple with a shared
+  column index, repeated values (templates, methods, states, hot keys) sharing one string: 367 instead of 958 bytes
+  a row, same `[]`, `get`, `in`, iteration and equality.
+- `insights/context.py`: one evaluation keeps at most `MAX_MEMO_SAMPLE_ROWS` (50,000) sample rows memoized; the
+  oldest reads are forgotten first and read again when a rule asks. Peak of one evaluation: 249 MiB to 19 MiB at
+  production volume, 27.5 MiB to 14.1 MiB at the soak's volume (12,221 samples); same 17 recommendations. The cost is
+  time where reads repeat (7.9 s to 13.3 s per evaluation at production volume; open issue below).
+- `deploy/systemd/roxy@.service`: `MALLOC_ARENA_MAX=2`, `MALLOC_MMAP_THRESHOLD_=131072`, `MALLOC_TRIM_THRESHOLD_=131072`
+  (two malloc arenas instead of eight per CPU; blocks of 128 KiB and more always mmapped and returned when freed,
+  instead of glibc raising that threshold after the first large free). A periodic `malloc_trim(0)` was measured too
+  and changed nothing (333.6 against 332.2 MiB), so it is not used. `PYTHONMALLOC=malloc` made it worse (359.5 MiB).
+- `worker.py`: `gc.freeze()` once a worker started (LOAD-3 below); it changes no memory figure.
+
+**Soak, 35 minutes of the replay at 10 requests a second, 2 workers, both at once** (worker RSS in MiB; PSS of the
+whole color, master included):
+
+| Minute | Leader before | Leader after | Other worker before | Other worker after | Color PSS before | Color PSS after |
+|---|---|---|---|---|---|---|
+| 5 | 171.4 | 165.2 | 153.1 | 151.2 | | |
+| 10 | 187.4 | 177.2 | 156.2 | 153.5 | | |
+| 20 | 214.4 | 193.3 | 157.6 | 154.8 | | |
+| 30 | 231.5 | 202.8 | 158.3 | 155.3 | | |
+| 35 (end, peak) | 239.1 (244.7) | 205.8 (211.3) | 159.3 (162.4) | 155.5 (160.9) | 365.8 (367.8) | 329.7 (332.2) |
+
+The leader's growth over the last 15 minutes fell from 1.65 to 0.83 MiB a minute and keeps slowing: SQLite caches
+fill toward their bound (22.5 MiB at the end) and the transient peak is now bounded. The first round of soaks, with
+the 100,000-row memo bound, gave the same picture (color PSS 364.7 before, 346.8 code only, 327.5 code and allocator
+settings). Every soak had the same replay outcome (9,396 to 9,429 calls, 8 or 9 Roblox 429s, 53.2 to 53.3 percent
+avoided), so the fixes change no behavior.
+
+**Decision for the units (`roxy@.service`):** `MemoryHigh=350M`, `MemoryMax=450M` per color (were 320M and 420M) and
+the allocator lines above. Reasoning, with the soak's numbers:
+
+| Case | Estimate | Against |
+|---|---|---|
+| One color, 35 minutes at 10 requests a second | 332 MiB PSS (anonymous part about 300) | under `MemoryHigh` 350 |
+| One color after hours, every bound full (SQLite caches about 35 MiB a worker, one evaluation peak of 19 MiB at production volume, the 16 MiB cache tier) | about 365 MiB PSS, page cache above it reclaimable | `MemoryHigh` reclaims page cache first; `MemoryMax` 450 has 85 MiB left |
+| Worker recycling | gunicorn `max_requests` 20,000 (plus up to 10 percent jitter): at plan 6.6's 500,000 requests a day a worker restarts about every 2 hours | slow growth never runs for long |
+| Deploy, normal mode | old color 330 to 365 + new color 264 at start + nginx and the OS about 200 = 794 to 829 MB | 909 MB |
+| Deploy, low-memory mode (below 700 MB available) | old color 365 + new color with one worker about 160 + 200 = 725 MB | 909 MB |
+| Both colors at `MemoryHigh` | 700 + 200 = 900 MB | 909 MB (`test_memory_numbers_fit_the_909_mb_server`) |
+
+`MemoryHigh=320M` was below what a color uses after half an hour, so the kernel would have throttled it in normal
+operation. The margin at 909 MB is thin during a deploy; the swap file of `deploy/README.md` stays recommended.
+
+### LOAD-3: the hot.db write lock
+
+**What contends.** The steady 200 requests a second scenario with call site counters (the time inside each job's
+function, where the write lock is held):
+
+| hot.db write | How often | Time inside, average (max) |
+|---|---|---|
+| The abuse transaction (`abuse/pipeline.py _transaction`, plan 6.3) | once per request | 0.35 to 0.55 ms (8 to 28 ms) |
+| Bucket reservation with the single-flight lease (`upstream/buckets.py reserve`) | once per cache miss | 0.8 to 1.3 ms (18 to 35 ms) |
+| Single-flight outcome publish (`upstream/singleflight.py`) | once per cache miss | 0.15 to 0.2 ms (3 to 5 ms) |
+| Spam detector flush (`abuse/spam.py`) | once a second per worker | 5 to 16 ms (18 to 209 ms) |
+
+About 1.25 hot.db write transactions per request on average (every request, plus two per miss). The lock was busy
+only about 15 percent of the time, yet writes waited 30 to 135 ms at p99 and the fleet answered about 205 requests a
+second at most. Three things stretched the waits:
+1. SQLite's busy handler sleeps 1, 2, 5, 10 ... 100 ms between tries. A worker that found the lock taken a few times
+   slept through the moments it was free while the other worker took it again; its queue grew and its 500 ms
+   budgets ran out (`abuse_degraded`, `singleflight_publish_failed`, HTTP 503 `degraded`).
+2. Inside a transaction every SQLite statement gives the GIL away and may wait for the event loop thread to hand it
+   back (up to 5 ms each while the loop is busy), so a job holds the lock far longer than its SQL takes; the spam
+   flush ran two statements per subject (hundreds a second under load).
+3. Full garbage collections stopped the event loop for 115 to 125 ms, often enough at 200 requests a second to set
+   the tail.
+
+**Fixes.**
+- `storage/db.py`: every write on a writer thread waits for the lock in short polls (`LOCK_POLL_MS` 2 ms per try,
+  then try again until the job's budget or the profile's 5 s), so no worker falls into the long sleeps.
+- `storage/db.py`: group commit on hot.db in a backlog. When at least `GROUP_MIN_QUEUE` (8) hot-path writes wait,
+  the writer runs the queued ones in one `BEGIN IMMEDIATE ... COMMIT`, each in its own savepoint, while the group
+  has held the lock less than `GROUP_MAX_MS` (10 ms), at most `GROUP_MAX_JOBS` (64). Results reach callers only
+  after COMMIT; a lost transaction answers every job `SharedStateUnavailable`. Below the backlog every write keeps its
+  own transaction: with groups at any queue length, the cache hit p99 at 200 requests a second was 70 ms against
+  24 ms, because a group holds the lock across every member's GIL waits.
+- `abuse/spam.py`: the flush reads every subject with one statement per 500 and writes them with one multi-row upsert
+  per 300 (was a read and a write per subject); `abuse/limiter.py save_rows` and `abuse/throttle.py
+  save_strike_rows` write their rows in one statement (was one per row).
+- `worker.py`: `gc.freeze()` after the worker started, so full collections only walk what was created since; the
+  worst heartbeat's loop lag p99 fell from 80 to 250 ms to 12 to 60 ms in the interleaved runs.
+- `storage/db.py DbStats`: lock wait and lock hold histograms of every write transaction and group counts, on the
+  System page's metrics pipeline card (`GET /admin/api/v1/system/metrics-pipeline`, fields `lock_wait_ms`,
+  `hold_ms`, `groups`, `grouped_writes`, `largest_group`) and in the harness's steady table.
+
+**Results, interleaved on the same machine** (medians, ranges in brackets):
+
+| Steady scenario | Answered a second | Cache hit p99 | Miss overhead p99 | HTTP 503 | Budget overruns (`abuse_degraded`, publish failures) |
+|---|---|---|---|---|---|
+| 200 offered, before (2 runs) | 208 | 1,823 ms (1,023 to 2,623) | 3,271 ms | 20 (17 to 24) | 23 and 668 |
+| 200 offered, after (3 runs) | 202 | 37 ms (21 to 129) | 68 ms | 0 | 1 and 0 |
+| 200 offered, after without groups (3 runs) | 202 | 22 ms (18 to 26) | 45 ms | 0 | 0 and 0 |
+| 450 offered, 400 connections, before | 161 | 53 s | 54 s | 249 | 191 and 214 |
+| 450 offered, after (2 runs) | **346 (307 to 386)** | 27 s | 27 s | 83 | 6 and 384 |
+| 450 offered, after without groups (2 runs) | 283 (272 to 294) | 33 s | 33 s | 48 | 44 and 221 |
+
+The "before" runs at 200 requests a second were much worse than on 2026-10-09 (p99 27 to 278 ms then): the machine
+was busier (four soaks and another lane's 30 minute replay beside them), and the old code degrades the most under
+contention. **New ceiling: about 300 to 385 answered requests a second on this machine (was about 180 to 205)**; past
+it the latency grows without bound because both workers spend their CPU (55 to 70 percent of a core each, the rest
+lost to GIL handoffs), not because of the lock. The flood (1,000 a second offered from 50 addresses, tarpit on):
+**291 answers a second (was 200.5)**, `abuse_degraded` 67 (was 252), and no address served above its GCRA bound
+(was 1 above). Two processes doing only hot.db writes (`test_group_commit_throughput_under_two_process_contention`):
+4,058 to 4,478 writes a second one transaction each, 16,930 to 19,807 grouped, p99 337 or 36 ms to 25 or 17 ms.
+
+What the fixes keep: every limiter decision of a request is still one atomic unit (a savepoint inside the group's
+transaction, or a transaction of its own), runs under the write lock in queue order and sees every earlier write,
+so limits stay exact with 1, 2 and 4 workers (`test_grouped_hot_path_writes_lose_no_update_across_processes`, plan
+C6); budgets still count from the call and a caller is never told "unavailable" about a write that commits (plan C7);
+ordinary writes (admin changes, leader jobs, migrations) never join a group.
+
+### Open (LOAD-2 and LOAD-3)
+
+- The CPU of the recommendations rules grows with the request samples: at production volume one evaluation took 7.9
+  s, 13.3 s with the memo bound (the rules ask for the same per-template reads again). UP-LATENCY, CACHE-LOW-HIT,
+  HOT-ENDPOINT, UP-QUEUE-SAT and CACHE-TTL-TUNE take 2 to 3 s each. For the insights owners: aggregate in SQL or
+  share one read per template across rules; `insights_interval_s` is the knob meanwhile.
+- The ceiling is now CPU and GIL bound in the request path (about 4 ms of worker CPU per request at 200 a second),
+  outside the storage and abuse packages.
+- Plan 6.7's 3 ms p99 for the abuse transaction is still not met under contention on this machine (lock hold p99 in
+  the 20 ms bucket, from GIL handoffs inside the transaction).
 
 ## Method
 

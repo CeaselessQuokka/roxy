@@ -63,6 +63,7 @@ from roxy.admin.api.routing_rules import (
     normalize_target,
     rule_flag,
     rules_service,
+    service_for,
 )
 from roxy.config.constants import MAX_REASON_LENGTH
 from roxy.deps import get_ctx
@@ -186,13 +187,25 @@ async def list_rows(
     fmt: ExportFormatDep,
 ) -> Any:
     """Every allowlist row (at most 50, plan 15.4), with the D1 notice and the meaning of each choice."""
-    with common.service_errors():
-        rows = [item_of(row) for row in await rules_service(request).list_rows(TABLE)]
-    keys = ("pattern", "note", "created_by")
+    rows = await allowlist_rows(get_ctx(request))
     if fmt is not None:
-        items, total = all_rows(rows, tq, search_keys=keys)
+        items, total = all_rows(rows, tq, search_keys=SEARCH_KEYS)
         return await common.export_table(request, admin, SPEC, items, fmt, total=total, tq=tq)
-    items, total = common.page_rows(rows, tq, search_keys=keys)
+    return allowlist_answer(rows, tq)
+
+
+SEARCH_KEYS: Final = ("pattern", "note", "created_by")
+
+
+async def allowlist_rows(ctx: Any) -> list[dict[str, Any]]:
+    """Every allowlist row as the API shows it (the Credential page's Allowlist card lists them too)."""
+    with common.service_errors():
+        return [item_of(row) for row in await service_for(ctx).list_rows(TABLE)]
+
+
+def allowlist_answer(rows: list[dict[str, Any]], tq: TableQuery) -> dict[str, Any]:
+    """One page of `allowlist_rows` as the `GET /credential-allowlist` table answer, with the help texts."""
+    items, total = common.page_rows(rows, tq, search_keys=SEARCH_KEYS)
     return common.table_answer(SPEC, tq, items, total) | {"help": _help()}
 
 
@@ -221,9 +234,14 @@ async def check_target(
     method: Annotated[str, Query(max_length=8)] = "GET",
 ) -> dict[str, Any]:
     """Whether `method` on `target` (host/path) may use the credential now, and under which row (exact grants)."""
+    return target_answer(get_ctx(request), target, method)
+
+
+def target_answer(ctx: Any, target: str, method: str = "GET") -> dict[str, Any]:
+    """The answer of `GET /credential-allowlist/test` (422 for a target without a host; the page's tester)."""
     clean = normalize_target(target)
     verb = method.strip().upper()
-    snapshot = get_ctx(request).rules.snapshot
+    snapshot = ctx.rules.snapshot
     with regex_budget(fresh=True):  # the admin's own budget (plan 9.9); a cut-off match never grants (C1)
         row = snapshot.credential_rule_for(clean, verb) if verb in ("GET", "HEAD") else None
     item = item_of(row.model_dump()) if row is not None else None
@@ -316,4 +334,15 @@ async def delete_row(
     }
 
 
-__all__ = ["CACHE_PRIVATE_HELP", "D1_NOTICE", "EVIDENCE_REQUIRED", "EXACT_HELP", "SPEC", "router"]
+__all__ = [
+    "CACHE_PRIVATE_HELP",
+    "D1_NOTICE",
+    "EVIDENCE_REQUIRED",
+    "EXACT_HELP",
+    "SPEC",
+    "allowlist_answer",
+    "allowlist_rows",
+    "item_of",
+    "router",
+    "target_answer",
+]

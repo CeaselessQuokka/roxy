@@ -174,15 +174,26 @@ def load_rows(conn: sqlite3.Connection, keys: Iterable[str]) -> dict[str, Limite
     return rows
 
 
+SAVE_CHUNK: Final = 150
+"""Rows one upsert statement writes (5 parameters each, far below SQLite's parameter limit)."""
+
+
 def save_rows(conn: sqlite3.Connection, rows: Iterable[LimiterRow], now_s: int) -> None:
-    """Upsert rows (inside the caller's write transaction). `updated_at` is in seconds, `tat_ms` in milliseconds."""
+    """Upsert rows (inside the caller's write transaction). `updated_at` is in seconds, `tat_ms` in milliseconds.
+
+    One multi-row statement instead of one statement per row (finding LOAD-3): inside the abuse transaction every
+    SQLite call gives up the GIL and may wait for the event loop to hand it back while hot.db's write lock is held.
+    Rows apply in order, as before: a key given twice ends with its last values.
+    """
     params = [(row.key, int(row.tat_ms), int(row.window_start), int(row.count), int(now_s)) for row in rows]
-    if params:
-        conn.executemany(
-            "INSERT INTO limiter (bucket_key, tat_ms, window_start, count, updated_at) VALUES (?, ?, ?, ?, ?) "
+    for start in range(0, len(params), SAVE_CHUNK):
+        chunk = params[start : start + SAVE_CHUNK]
+        values = ",".join("(?, ?, ?, ?, ?)" for _ in chunk)
+        conn.execute(
+            f"INSERT INTO limiter (bucket_key, tat_ms, window_start, count, updated_at) VALUES {values} "  # noqa: S608  # only "?" placeholders are interpolated
             "ON CONFLICT (bucket_key) DO UPDATE SET tat_ms = excluded.tat_ms, window_start = excluded.window_start, "
             "count = excluded.count, updated_at = excluded.updated_at",
-            params,
+            [value for row in chunk for value in row],
         )
 
 

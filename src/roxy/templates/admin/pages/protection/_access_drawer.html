@@ -1,0 +1,41 @@
+{#-
+  The drawer of one access list entry (deny list, admin allowlist or bypass), included by `lists.html` and
+  `bypass.html` (`roxy/admin/pages/protection.py _access_detail`).
+
+  What: the entry (network, note, expiry, who added it), its hits over the range (`GET /protection/rule-hits`;
+  the admin allowlist is not an abuse check and records none), and "Remove" (`DELETE /protection/access/<kind>/
+  <id>`, the reason in the query string). Removing the admin allowlist entry that covers your own address while the
+  allowlist is on needs `confirm_lockout` (422 `confirmation_required` reveals the checkbox) and a fresh second
+  factor (403 asks for the code, then retries).
+  Context: `detail` {entry, kind, expires, created, last_hit, remaining, chart_src, delete_url, covers_you,
+  allowlist_on}.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num, caller_text %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "admin/pages/protection/_macros.html" import delete_dialog, rule_chart %}
+{% set d = detail %}{% set e = d.entry %}
+{% set KIND = {"deny": "deny list", "allow_admin": "admin allowlist", "bypass": "bypass list"} %}
+<div class="prot-drawer stack" data-prot-drawer="access">
+  <p>{{ badge(KIND[d.kind]|capitalize, "neutral") }} {% if e.active %}{{ status_badge("ok", "Active") }}{% else %}{{ status_badge("neutral", "Expired") }}{% endif %}{% if d.covers_you %} {{ badge("Covers your address", "info") }}{% endif %}</p>
+  <dl class="kv">
+    <dt>Network</dt><dd class="mono">{{ e.cidr }}</dd>
+    <dt>Note</dt><dd>{{ caller_text(e.note, 400) }}</dd>
+    <dt>Expires</dt><dd>{% if e.expires_at is none %}Never{% elif d.expires %}<time datetime="{{ d.expires.datetime }}">{{ d.expires.text }}</time>{% if d.remaining %} <span class="muted">({{ d.remaining }} left)</span>{% endif %}{% endif %}</dd>
+    <dt>Added</dt><dd>{% if d.created %}<time datetime="{{ d.created.datetime }}">{{ d.created.text }}</time>{% endif %} by {{ caller_text(e.created_by, 120) }}</dd>
+    {% if d.kind != "allow_admin" %}<dt>Matched</dt><dd>{{ num(e.hits) }} in the range, {{ num(e.hits_total) }} in all{% if d.last_hit %}; last <time datetime="{{ d.last_hit.datetime }}">{{ d.last_hit.sub }}</time>{% endif %}</dd>{% endif %}
+  </dl>
+  {% if d.chart_src %}{{ rule_chart("access-hits-" ~ e.id, "Requests this entry matched", d.chart_src) }}{% endif %}
+  <div class="cluster"><button type="button" class="btn btn--bad" data-dialog-open="dlg-prot-access-del-{{ e.id }}" aria-haspopup="dialog" data-action="access-remove">{{ icon("x") }}<span>Remove</span></button></div>
+  {% set lines = {
+    "deny": ["The network is no longer refused by the deny list (bans and other limits still apply)."],
+    "bypass": ["The network goes back to the normal limits: throttle-all, the per-IP limit, User-Agent and endpoint rules, and the tarpit."],
+    "allow_admin": ["This network can no longer reach /admin while the admin allowlist is on" ~ (" (it is on now)." if d.allowlist_on else " (it is off now, so nothing changes yet).")],
+  }[d.kind] + ["The removal is written to the audit log."] %}
+  {% call delete_dialog("dlg-prot-access-del-" ~ e.id, "Remove " ~ e.cidr ~ " from the " ~ KIND[d.kind] ~ "?", d.delete_url, lines,
+                        "lists bypass", success="Removed from the " ~ KIND[d.kind] ~ ".") %}
+    {% if d.kind == "allow_admin" %}
+    <label class="check" data-confirm-field hidden><input type="checkbox" name="confirm_lockout" value="true" data-query data-json="never"><span>I understand: this hides the dashboard from my own address</span></label>
+    {% endif %}
+  {% endcall %}
+</div>

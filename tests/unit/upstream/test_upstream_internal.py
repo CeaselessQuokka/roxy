@@ -59,7 +59,16 @@ async def test_internal_anonymous_call_is_paced_and_recorded(
     assert result.status == 200
     assert egress.egresses() == [Egress.DIRECT]
     assert egress.calls[0][1].url == "https://games.roblox.com/v1/games?universeIds=1"
-    assert read_rows(ctx.dbs.hot, "SELECT count(*) FROM upstream_bucket")[0][0] == 4  # it paid in every bucket
+    keys = {row[0] for row in read_rows(ctx.dbs.hot, "SELECT bucket_key FROM upstream_bucket")}
+    # It paid in every bucket, and the host and endpoint (window) buckets counted the call in their meters.
+    assert keys == {
+        "global",
+        "egress:direct",
+        "host:games.roblox.com",
+        "endpoint:games.roblox.com/v1/games",
+        "meter:host:games.roblox.com",
+        "meter:endpoint:games.roblox.com/v1/games",
+    }
     assert ctx.recorder.internal[0]["purpose"] == "health_check"
     assert ctx.recorder.internal[0]["ok"] is True
 

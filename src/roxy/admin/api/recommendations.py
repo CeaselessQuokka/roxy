@@ -789,24 +789,40 @@ async def list_recommendations(
     fmt: ExportFormatDep,
 ) -> Any:
     """The Recommendations table with its filters and counts (plan 14.1); `format=csv|json` downloads it."""
-    ctx = get_ctx(request)
+    if fmt is not None:
+        read_page = _list_reader(get_ctx(request), filters, tq)
+
+        async def cards(page: int, size: int) -> tuple[list[dict[str, Any]], int]:
+            rows, total = await read_page(page, size)
+            return [card(row_to_recommendation(row)) for row in rows], total
+
+        with common.service_errors():
+            return await common.export_pages(request, admin, LIST_TABLE, cards, fmt, tq=tq, filters=filters.echo())
+    return await list_answer(get_ctx(request), filters, tq)
+
+
+def _list_reader(
+    ctx: Any, filters: ListFilters, tq: TableQuery
+) -> Callable[[int, int], Awaitable[tuple[list[dict[str, Any]], int]]]:
+    """One page of the list as `(rows, total)`, for the table and for the export."""
     wanted = filters.as_read(tq.q)
 
     def read_page(page: int, size: int) -> Awaitable[tuple[list[dict[str, Any]], int]]:
-        return ctx.dbs.metrics.read(
+        pending: Awaitable[tuple[list[dict[str, Any]], int]] = ctx.dbs.metrics.read(
             lambda conn: reads.list_page(
                 conn, wanted, sort=tq.sort, descending=tq.descending, limit=size, offset=(page - 1) * size
             )
         )
+        return pending
 
+    return read_page
+
+
+async def list_answer(ctx: Any, filters: ListFilters, tq: TableQuery) -> dict[str, Any]:
+    """The Recommendations table with its filters, counts, vocabulary and engine state (`GET /recommendations`
+    and the Recommendations page read it through here)."""
+    read_page = _list_reader(ctx, filters, tq)
     with common.service_errors():
-        if fmt is not None:
-
-            async def cards(page: int, size: int) -> tuple[list[dict[str, Any]], int]:
-                rows, total = await read_page(page, size)
-                return [card(row_to_recommendation(row)) for row in rows], total
-
-            return await common.export_pages(request, admin, LIST_TABLE, cards, fmt, tq=tq, filters=filters.echo())
         rows, total = await read_page(tq.page, tq.page_size)
         facets = await ctx.dbs.metrics.read(reads.facets)
     answer = common.table_answer(LIST_TABLE, tq, [card(row_to_recommendation(row)) for row in rows], total)
@@ -858,35 +874,69 @@ async def global_history(
             fields[name] = str(exc)
     if fields:
         raise common.validation_error(fields, "The filters are not valid.", code="invalid_filter")
+    wanted = HistoryFilters(actions, rule_ids, recommendation, bounds["from"], bounds["to"])
+    if fmt is not None:
+        read_page = _history_reader(ctx, wanted, tq)
 
+        async def items(page: int, size: int) -> tuple[list[dict[str, Any]], int]:
+            rows, total = await read_page(page, size)
+            return [history_item(row) for row in rows], total
+
+        with common.service_errors():
+            return await common.export_pages(request, admin, HISTORY_TABLE, items, fmt, tq=tq, filters=wanted.echo())
+    return await history_answer(ctx, wanted, tq)
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryFilters:
+    """The validated filters of the history table (`GET /recommendations/history`)."""
+
+    actions: tuple[str, ...] = ()
+    rule_ids: tuple[str, ...] = ()
+    recommendation: str | None = None
+    since: int | None = None
+    until: int | None = None
+
+    def echo(self) -> dict[str, Any]:
+        return {
+            "action": list(self.actions),
+            "rule": list(self.rule_ids),
+            "recommendation": self.recommendation,
+            "from": self.since,
+            "to": self.until,
+        }
+
+
+def _history_reader(
+    ctx: Any, wanted: HistoryFilters, tq: TableQuery
+) -> Callable[[int, int], Awaitable[tuple[list[dict[str, Any]], int]]]:
     def read_page(page: int, size: int) -> Awaitable[tuple[list[dict[str, Any]], int]]:
-        return ctx.dbs.metrics.read(
+        pending: Awaitable[tuple[list[dict[str, Any]], int]] = ctx.dbs.metrics.read(
             lambda conn: reads.history_page(
                 conn,
-                actions=actions,
-                rule_ids=rule_ids,
-                recommendation_id=recommendation,
-                since=bounds["from"],
-                until=bounds["to"],
+                actions=wanted.actions,
+                rule_ids=wanted.rule_ids,
+                recommendation_id=wanted.recommendation,
+                since=wanted.since,
+                until=wanted.until,
                 sort=tq.sort,
                 descending=tq.descending,
                 limit=size,
                 offset=(page - 1) * size,
             )
         )
+        return pending
 
-    echo = {"action": list(actions), "rule": list(rule_ids), "recommendation": recommendation, **bounds}
+    return read_page
+
+
+async def history_answer(ctx: Any, wanted: HistoryFilters, tq: TableQuery) -> dict[str, Any]:
+    """One page of the action history (`GET /recommendations/history` and the page's History card)."""
+    read_page = _history_reader(ctx, wanted, tq)
     with common.service_errors():
-        if fmt is not None:
-
-            async def items(page: int, size: int) -> tuple[list[dict[str, Any]], int]:
-                rows, total = await read_page(page, size)
-                return [history_item(row) for row in rows], total
-
-            return await common.export_pages(request, admin, HISTORY_TABLE, items, fmt, tq=tq, filters=echo)
         rows, total = await read_page(tq.page, tq.page_size)
     answer = common.table_answer(HISTORY_TABLE, tq, [history_item(row) for row in rows], total)
-    answer["filters"] = echo
+    answer["filters"] = wanted.echo()
     return answer
 
 
@@ -899,11 +949,25 @@ async def list_rules(
     family: Annotated[str | None, Query(max_length=FILTER_TEXT_MAX)] = None,
 ) -> Any:
     """Every rule of the catalog with its switch, severity override, thresholds and open count (plan 11.1)."""
-    ctx = get_ctx(request)
     fields: dict[str, str] = {}
     families = _split(family, allowed=FAMILIES, field_name="family", fields=fields)
     if fields:
         raise common.validation_error(fields, "The filters are not valid.", code="invalid_filter")
+    rows = await rule_rows(request, families)
+    if fmt is not None:
+        everything, total = common.page_rows(rows, TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q))
+        return await common.export_table(
+            request, admin, RULES_TABLE, everything, fmt, total=total, tq=tq, filters={"family": list(families)}
+        )
+    return rules_answer(request, rows, tq)
+
+
+RULE_SEARCH_KEYS: Final[tuple[str, ...]] = ("id", "slug", "family", "title")
+
+
+async def rule_rows(request: Request, families: Sequence[str] = ()) -> list[dict[str, Any]]:
+    """Every rule of the catalog (in catalog order, `order`), optionally only some families, as `rule_card`s."""
+    ctx = get_ctx(request)
     snapshot = ctx.settings.snapshot()
     with common.service_errors():
         facets = await ctx.dbs.metrics.read(reads.facets)
@@ -916,12 +980,13 @@ async def list_rules(
         item = rule_card(rule_id, snapshot, meta, open_counts)
         item["order"] = order
         rows.append(item)
-    if fmt is not None:
-        everything, total = common.page_rows(rows, TableQuery(1, common.MAX_EXPORT_ROWS, tq.sort, tq.order, tq.q))
-        return await common.export_table(
-            request, admin, RULES_TABLE, everything, fmt, total=total, tq=tq, filters={"family": list(families)}
-        )
-    items, total = common.page_rows(rows, tq, search_keys=("id", "slug", "family", "title"))
+    return rows
+
+
+def rules_answer(request: Request, rows: Sequence[Mapping[str, Any]], tq: TableQuery) -> dict[str, Any]:
+    """One page of the rules table (`GET /recommendations/rules` and the page's Rules card)."""
+    ctx = get_ctx(request)
+    items, total = common.page_rows(rows, tq, search_keys=RULE_SEARCH_KEYS)
     answer = common.table_answer(RULES_TABLE, tq, items, total)
     answer.update(
         families=list(FAMILIES),
@@ -962,19 +1027,29 @@ async def rule_drawer(
     rule_id = _rule_id(rule)
     if rule_id is None:
         raise common.not_found("No recommendation rule has that id.")
+    summary = await rule_summary(request, rule_id)
+    entries = await _setting_entries(request, rule_keys(INSIGHT_RULES[rule_id]))
+    return {
+        "rule": summary["rule"],
+        "settings": entries,
+        "active": summary["active"],
+        "save": SAVE_HINT,
+        "config_version": summary["config_version"],
+    }
+
+
+async def rule_summary(request: Request, rule_id: str) -> dict[str, Any]:
+    """One rule (`rule_card`) and its open or snoozed recommendations (at most `MAX_DRAWER_OPEN`): the tuning
+    drawer of the API and of the Recommendations page. `rule_id` must be a key of `INSIGHT_RULES`."""
     ctx = get_ctx(request)
-    spec = INSIGHT_RULES[rule_id]
     snapshot = ctx.settings.snapshot()
     filters = reads.RecommendationFilter(states=tuple(sorted(ACTIVE_STATES)), rule_ids=(rule_id,))
     with common.service_errors():
         facets = await ctx.dbs.metrics.read(reads.facets)
         rows, total = await ctx.dbs.metrics.read(lambda conn: reads.list_page(conn, filters, limit=MAX_DRAWER_OPEN))
-    entries = await _setting_entries(request, rule_keys(spec))
     return {
         "rule": rule_card(rule_id, snapshot, _rule_meta(request), _counts(facets)["open_by_rule"]),
-        "settings": entries,
         "active": {"items": [card(row_to_recommendation(row)) for row in rows], "total": total},
-        "save": SAVE_HINT,
         "config_version": snapshot.version,
     }
 
@@ -999,6 +1074,12 @@ async def engine_settings(request: Request, _admin: AdminSession) -> dict[str, A
 @router.get("/{rec_id}")
 async def detail(request: Request, rec_id: RecId, _admin: AdminSession) -> dict[str, Any]:
     """The detail drawer of one recommendation (see the module docstring)."""
+    return await detail_answer(request, rec_id)
+
+
+async def detail_answer(request: Request, rec_id: str) -> dict[str, Any]:
+    """The detail drawer of one recommendation (`GET /recommendations/{id}` and the page's drawer); 404 when no
+    recommendation has that id."""
     ctx = get_ctx(request)
     rec = await _get(request, rec_id)
     with common.service_errors():
@@ -1052,6 +1133,12 @@ async def detail_history(request: Request, rec_id: RecId, _admin: AdminSession) 
 @router.get("/{rec_id}/preview")
 async def preview(request: Request, rec_id: RecId, _admin: AdminSession, window: WindowQuery = "1h") -> dict[str, Any]:
     """The dry run of plan 11.3: the validated diff, what an apply needs, and the replay over request samples."""
+    return await preview_answer(request, rec_id, window)
+
+
+async def preview_answer(request: Request, rec_id: str, window: str = "1h") -> dict[str, Any]:
+    """The preview of one recommendation (`GET /recommendations/{id}/preview` and the page's preview panel).
+    `window` is a key of `PREVIEW_WINDOWS_S`; 404 when no recommendation has that id."""
     rec = await _get(request, rec_id)
     items = await _act(actions_for(request).preview(rec.id))
     diff = [preview_item(item) for item in items]
@@ -1196,21 +1283,33 @@ async def dismiss(
 
 
 __all__ = [
+    "ALL_STATES",
     "FAMILIES",
     "HISTORY_TABLE",
     "LIST_TABLE",
+    "PREVIEW_WINDOWS_S",
     "RULES_TABLE",
     "SENSITIVE_GROUPS",
     "DryRunGate",
+    "HistoryFilters",
+    "ListFilters",
     "action_error",
     "actions_for",
     "allowed_actions",
     "card",
+    "detail_answer",
     "engine_for",
+    "history_answer",
+    "list_answer",
+    "list_filters",
+    "preview_answer",
     "risky_keys",
     "router",
     "rule_card",
     "rule_keys",
+    "rule_rows",
+    "rule_summary",
+    "rules_answer",
     "safe_payload",
     "sensitive_targets",
 ]

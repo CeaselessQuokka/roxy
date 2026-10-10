@@ -13,7 +13,7 @@
 {% from "admin/_layout/nav.html" import RANGES, COMPARES, page_href %}
 {% set t = time if time is defined and time else {} %}
 {% set range_id = t.range or "24h" %}
-{% set compare_id = t.compare or "off" %}
+{% set compare_id = t.compare if t.compare in ("previous", "week", "month", "year") else "none" %}
 {% set st = status if status is defined and status else {} %}
 {% set rc = recs if recs is defined and recs else {} %}
 {% set ns = namespace(range_label="Custom range", range_short=range_id) %}
@@ -25,7 +25,7 @@
     <summary class="btn btn--ghost range__button">
       {{ icon("calendar") }}
       <span class="range__text"><span class="range__long">{{ ns.range_label }}</span><span class="range__short">{{ ns.range_short }}</span></span>
-      {% if compare_id != "off" %}<span class="range__compare">{{ icon("compare") }}<span class="sr-only">, compared with </span><span class="range__compare-text">{% for v, l in COMPARES %}{% if v == compare_id %}{{ l|lower }}{% endif %}{% endfor %}</span></span>{% endif %}
+      {% if compare_id != "none" %}<span class="range__compare">{{ icon("compare") }}<span class="sr-only">, compared with </span><span class="range__compare-text">{% for v, l in COMPARES %}{% if v == compare_id %}{{ l|lower }}{% endif %}{% endfor %}</span></span>{% endif %}
       {{ icon("chevron-down", cls="range__chevron") }}
     </summary>
     <form class="popover__panel range__panel" method="get" data-range-form>
@@ -97,6 +97,7 @@
       </div>
       <label class="check user-menu__density"><input type="checkbox" data-density-toggle{% if density|default("comfortable") == "dense" %} checked{% endif %}><span>Dense tables</span></label>
       <label class="check user-menu__density"><input type="checkbox" data-shortcuts-toggle checked><span>Single-key shortcuts</span></label>
+      <button type="button" class="menu__item" data-dialog-open="preferences" aria-haspopup="dialog">{{ icon("sliders") }}<span>Preferences</span></button>
       <button type="button" class="menu__item" data-shortcuts-open>{{ icon("keyboard") }}<span>Keyboard shortcuts</span><kbd>?</kbd></button>
       <a class="menu__item" href="{{ page_href('help') }}">{{ icon("book") }}<span>Help and glossary</span></a>
       <form method="post" action="{{ (urls.logout if urls is defined and urls and urls.logout) or '/admin/api/v1/auth/logout' }}" class="user-menu__logout" data-logout>

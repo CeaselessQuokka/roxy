@@ -288,10 +288,24 @@ def test_429_retry_after_30_holds_across_two_processes(tmp_path: Path) -> None:
     during = [call for call in calls if first_429 + IN_FLIGHT_TOLERANCE_MS < call[0] < until_ms]
     assert during == [], f"calls during the cooldown: {during[:5]}"
 
-    # 3. After the cooldown, at most the bucket rate (60 per minute, burst 2) over the next 60 s, and it recovers.
+    # 3. After the cooldown, at most the bucket's limit in any minute, burst included (a window bucket: 60 per minute
+    #    with burst 2 means at most 60, never 61), and it recovers. The 429 also cut the limit for both processes
+    #    (adaptive rate, rate and burst together), and no minute after the cooldown holds more than the cut limit.
     after = [call for call in calls if until_ms <= call[0] < until_ms + 60_000]
-    assert 1 <= len(after) <= ENDPOINT_PER_MIN + ENDPOINT_BURST, len(after)
+    assert 1 <= len(after) <= ENDPOINT_PER_MIN, len(after)
     assert all(call[3] == 200 for call in after)
+    control = sqlite3.connect(paths["control"])
+    learned = control.execute(
+        "SELECT per_min, burst, origin FROM upstream_limits WHERE bucket_key = ?", (f"endpoint:{TEMPLATE}",)
+    ).fetchone()
+    control.close()
+    assert learned is not None, "the 429 cut no limit"
+    assert learned[2] == "adaptive", learned
+    assert float(learned[0]) < ENDPOINT_PER_MIN, learned
+    assert int(learned[1]) <= ENDPOINT_BURST, learned
+    recovered = [call[0] for call in calls if call[0] >= until_ms]
+    for at in recovered:
+        assert sum(1 for t in recovered if at - 60_000 <= t <= at) <= int(float(learned[0])), (at, learned)
 
     # 2. Every caller answer refused during the cooldown carried a Retry-After, in both processes.
     results = {path.name: json.loads(path.read_text(encoding="utf-8")) for path in outputs}

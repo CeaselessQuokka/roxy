@@ -1,0 +1,95 @@
+{#-
+  Upstream page, card `buckets` (`roxy/admin/pages/upstream.py buckets_card`): Roxy's own speed limits.
+
+  Top: fill gauges of the global and egress buckets (plan 7.3). Then every bucket as a table (its fill now, rate,
+  reservations, refusals and peak fill over the range; a row opens the bucket's history and its override in the
+  drawer), the adaptive rate controller's recent changes, and the `upstream_limits` overrides with an add form
+  that posts to `POST /admin/api/v1/upstream-limits` (CSRF, validation and audit in the API). Each table sits in a
+  wrapper whose `hx-select` keeps a table swap to the table itself (this card's fragment holds both tables).
+  Bucket keys of endpoints are caller text.
+  Context: `frame`, `gauges`, `table`, `limits_table`, `adaptive`, `changes`, `held_text`, `host_default`,
+  `endpoint_default`, `limits_url` (or `deferred` on the page's first paint).
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import badge %}
+{% from "components/format.html" import caller_text %}
+{% from "admin/pages/upstream/_macros.html" import gauge, when %}
+{% call page_card(frame, subtitle="Buckets are never refilled by hand; a reset clears cooldowns and breakers only.") %}
+<div class="g3-gauges" role="group" aria-label="Fill of Roxy's own ceilings">
+  {% for g in gauges %}{{ gauge(g, "gauge-bucket-" ~ loop.index) }}{% else %}<p class="muted">No bucket has been used yet.</p>{% endfor %}
+</div>
+
+<div class="g3-table-host" hx-select="#{{ table.id }}">{{ data_table(**table) }}</div>
+
+<section class="g3-section" aria-labelledby="adaptive-title">
+  <h3 class="g3-subhead" id="adaptive-title">Adaptive rate controller {% if adaptive.enabled %}{{ badge("On", "ok", "check") }}{% else %}{{ badge("Off", "neutral") }}{% endif %}</h3>
+  <p class="muted">After a Roblox 429 the controller lowers that endpoint's rate (and burst) below what Roblox refused; after {{ adaptive.settings.adaptive_probe_after_h }} clean hours with real demand it raises it again, a little at a time. It holds {{ held_text }} now.</p>
+  {% if changes %}
+  <div class="table-scroll g3-scroll" role="region" aria-labelledby="adaptive-caption" tabindex="0">
+    <table class="simple-table g3-table">
+      <caption id="adaptive-caption" class="sr-only">Recent rate changes of the adaptive controller</caption>
+      <thead><tr><th scope="col">When</th><th scope="col">Change</th><th scope="col">Bucket</th><th scope="col">Rate</th><th scope="col">Why</th></tr></thead>
+      <tbody>
+        {% for c in changes %}
+        <tr>
+          <td>{{ when(c.when) }}</td>
+          <td><span class="tone tone--{{ c.tone }}">{{ c.direction }}</span></td>
+          <td>{{ caller_text(c.key, 120) }}</td>
+          <td>{{ c.old }} to {{ c.new }}</td>
+          <td>{{ c.why or "n/a" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if adaptive.changes_truncated %}<p class="muted">Only the newest changes are listed.</p>{% endif %}
+  {% else %}
+  <p class="muted">No rate changes in this range.</p>
+  {% endif %}
+</section>
+
+<section class="g3-section" aria-labelledby="limits-title">
+  <h3 class="g3-subhead" id="limits-title">Rate overrides</h3>
+  <p class="muted">Without an override a host bucket runs at {{ host_default }} and an endpoint bucket at {{ endpoint_default }}. A rate you set is never raised by the adaptive controller; it may still lower it after a 429.</p>
+  <div class="g3-table-host" hx-select="#{{ limits_table.id }}">{{ data_table(**limits_table) }}</div>
+  <details class="details-plain g3-add">
+    <summary>{{ icon("plus") }}<span>Add a rate override</span></summary>
+    <form class="stack g3-form" data-api-form data-api-url="{{ limits_url }}" data-api-method="POST"
+          data-success="Override added. Every worker uses it within a second." data-on-success="refresh" data-refresh="buckets" novalidate>
+      <div class="field">
+        <label class="field__label" for="limit-new-key">Bucket</label>
+        <input class="input mono" type="text" id="limit-new-key" name="bucket_key" required maxlength="300" autocomplete="off" spellcheck="false"
+               placeholder="endpoint:games.roblox.com/v1/games" data-json="string" aria-describedby="limit-new-key-hint limit-new-key-error">
+        <p class="field__hint" id="limit-new-key-hint"><code>host:&lt;host&gt;</code> for a whole Roblox service, or <code>endpoint:&lt;template&gt;</code> for one endpoint (copy a key from the table above).</p>
+        <p class="field__error" id="limit-new-key-error" data-field-error="bucket_key" hidden></p>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="limit-new-rate">Rate <span class="muted">(calls a minute)</span></label>
+          <input class="input input--num" type="text" inputmode="decimal" id="limit-new-rate" name="per_min" required data-json="float" aria-describedby="limit-new-rate-error">
+          <p class="field__error" id="limit-new-rate-error" data-field-error="per_min" hidden></p>
+        </div>
+        <div class="field">
+          <label class="field__label" for="limit-new-burst">Burst <span class="muted">(calls at once)</span></label>
+          <input class="input input--num" type="text" inputmode="numeric" id="limit-new-burst" name="burst" required data-json="int" aria-describedby="limit-new-burst-error">
+          <p class="field__error" id="limit-new-burst-error" data-field-error="burst" hidden></p>
+        </div>
+      </div>
+      <div class="field">
+        <label class="field__label" for="limit-new-note">Note <span class="muted">(optional)</span></label>
+        <input class="input" type="text" id="limit-new-note" name="note" maxlength="500" autocomplete="off">
+      </div>
+      <div class="field">
+        <label class="field__label" for="limit-new-reason">Reason <span class="muted">(optional, saved in the audit log)</span></label>
+        <input class="input" type="text" id="limit-new-reason" name="reason" maxlength="500" autocomplete="off">
+      </div>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      <div class="cluster"><button type="submit" class="btn btn--primary" data-action="upstream-limit-add">{{ icon("plus") }}<span>Add override</span></button></div>
+    </form>
+  </details>
+</section>
+{% endcall %}
+{% endif %}

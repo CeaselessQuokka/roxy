@@ -1,0 +1,26 @@
+{#-
+  Security page, card `admin-access` (`roxy/admin/pages/security.py admin_access_card`): the admin security
+  settings the catalog places here (`security#admin-access`: login limits, session lifetimes, re-authentication,
+  trusted devices, the admin allowlist switch, the email code) with the facts they act on: the address you are
+  signing in from, the allowlist entries and whether this address is on it (entries are managed on Protection >
+  Deny and allow lists). Every one of these settings needs a fresh second factor to change (the settings API's
+  `admin_security` rule); the inline editor asks for it. Context: `frame`, `your_ip`, `allowlist_on`,
+  `allow_entries`, `you_are_allowed`, `trusted_on`, `reauth_minutes`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/format.html" import num %}
+{% call page_card(frame) %}
+<dl class="kv admin-access__facts">
+  <dt>You are signing in from</dt><dd class="mono">{{ your_ip or "an unknown address" }}</dd>
+  <dt>Admin allowlist</dt>
+  <dd>
+    {% if allowlist_on %}{{ status_badge("ok", "On") }}{% else %}{{ status_badge("neutral", "Off: any address may see the sign-in page") }}{% endif %}
+    <span class="muted">{{ num(allow_entries) }} {{ "entry" if allow_entries == 1 else "entries" }}{% if allow_entries %}; {% if you_are_allowed %}this address is on it{% else %}this address is not on it{% endif %}{% endif %}.</span>
+    <a href="/admin/protection#lists">Manage the entries</a>
+  </dd>
+  <dt>Trusted devices</dt><dd>{% if trusted_on %}{{ status_badge("ok", "On") }}{% else %}{{ status_badge("neutral", "Off") }}{% endif %}</dd>
+  <dt>Second factor again</dt><dd>Sensitive actions ask for your second factor again when the last one is older than {{ reauth_minutes }} minutes.</dd>
+</dl>
+<p class="security-intro muted">Changing any setting below asks for your second factor first. With the allowlist on, an address not on the list gets a plain 404 for every admin page, so add your own address before you switch it on.</p>
+{% endcall %}

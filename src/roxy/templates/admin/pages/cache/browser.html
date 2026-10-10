@@ -1,0 +1,35 @@
+{#-
+  Cache page, card `browser` (`roxy/admin/pages/cache.py browser_card`): v1 "Saved answers" (parity row 66).
+
+  The page's main table (its search, sort and page live in the address bar): one page of stored answers from
+  `cache.entries_answer` (the `GET /admin/api/v1/cache/entries` function, single-flight handoff rows never shown),
+  sortable both ways, each row opening the inspector drawer (body, Refresh, Purge). "Purge matching" opens the
+  shared purge dialog with `{"scope": "search", "value": <the search text>}`: the API removes exactly what the same
+  search lists (one shared matcher, v1 bug 4); static/js/pages/cache.js keeps the button in step with the search
+  box after every table swap. "Purge expired" removes answers past their lifetime and stale window (harmless: they
+  were only kept for a Roblox failure); "Purge all" asks for the typed phrase. Keys are caller text: text only.
+  A request of the table itself (`table_only`) is answered with the table alone; the card's own fragment URL
+  (`card_src`) carries the search and sort, so a refresh after a purge keeps them.
+  Context: `frame`, `table`, `table_only`, `card_src`, `q`, `fresh`, `total`, `loaded`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import num %}
+{% from "components/icon.html" import icon %}
+{% if table_only %}{{ data_table(**table) }}{% else %}
+{% set actions %}
+<button type="button" class="btn btn--sm btn--ghost" data-dialog-open="dlg-cache-purge" data-purge-matching data-action="cache-purge-matching"
+        data-fill='{{ {"scope": "search", "type": "glob", "value": q, "_label": "every stored answer whose question contains: " ~ q}|tojson }}'{% if not q %} disabled{% endif %}
+        aria-describedby="cache-purge-matching-hint">{{ icon("filter") }}<span>Purge matching</span></button>
+<form class="cache-inline-form" data-api-form data-api-url="/admin/api/v1/cache/purge" data-api-method="POST"
+      data-on-success="refresh" data-refresh="stats browser spread">
+  <input type="hidden" name="scope" value="expired" data-json="string">
+  <button type="submit" class="btn btn--sm btn--ghost" data-action="cache-purge-expired">{{ icon("clock") }}<span>Purge expired</span></button>
+</form>
+<button type="button" class="btn btn--sm btn--bad-soft" data-dialog-open="dlg-cache-purge-all" data-action="cache-purge-all">{{ icon("alert-triangle") }}<span>Purge all</span></button>
+{% endset %}
+{% call page_card(dict(frame, fragment_url=card_src), actions=actions, flush=True, subtitle=num(total) ~ " stored, " ~ num(fresh) ~ " still fresh; loaded " ~ loaded) %}
+<p class="muted cache-browser__hint" id="cache-purge-matching-hint">Everything the cache holds, one row per distinct question, fetched a page at a time. Search matches any part of the question (the endpoint or any parameter); Purge matching removes exactly the answers the search lists.</p>
+{{ data_table(**table) }}
+{% endcall %}
+{% endif %}

@@ -1,0 +1,84 @@
+{#-
+  Protection page, card `pipeline` (`roxy/admin/pages/protection.py pipeline_card`): the pipeline diagram.
+
+  What: every check a proxy request passes, in order (plan 4.1 row 5, 10.9), with how many requests it refused in
+  the range, its share of all refusals (a <meter>, decorative: the number is in the text), what it refuses as, and
+  whether bypass skips it; then the rule rows' hits per table, the User-Agent rule and ladder counters (row 76) and
+  this worker's own counters (labeled, plan P9). The v1 pipeline explanation is kept in "How the pipeline works".
+  Context: `frame`, `pipe` (`_protection_views.pipeline_model`), `range_text`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num, local_href %}
+{% from "components/badges.html" import badge %}
+{% from "components/icon.html" import icon %}
+{% call page_card(frame, subtitle=range_text) %}
+<dl class="prot-stats">
+  <div class="prot-stats__item"><dt>Requests checked</dt><dd>{{ num(pipe.evaluated) }}</dd></div>
+  <div class="prot-stats__item"><dt>Passed every check</dt><dd>{{ num(pipe.allowed) }}</dd></div>
+  <div class="prot-stats__item"><dt>Refused by a check below</dt><dd>{{ num(pipe.by_checks) }}</dd></div>
+  <div class="prot-stats__item"><dt>Refused elsewhere</dt><dd>{{ num(pipe.other_refusals) }}</dd></div>
+</dl>
+<ol class="prot-pipeline" aria-label="Checks in the order a request meets them">
+  {% for step in pipe.steps %}
+  {% set href = local_href(step.href) if step.href else "" %}
+  <li class="prot-step{% if step.refused %} prot-step--hit{% endif %}{% if step.marker %} prot-step--marker{% endif %}">
+    <span class="prot-step__n" aria-hidden="true">{{ loop.index }}</span>
+    <div class="prot-step__body">
+      <p class="prot-step__title">
+        <span class="sr-only">Step {{ loop.index }}: </span>{% if href %}<a href="{{ href }}">{{ step.label }}</a>{% else %}{{ step.label }}{% endif %}
+        {{ badge(step.kind, "neutral") }}
+        {% if step.skipped_by_bypass %}{{ badge("Bypass skips it", "info") }}{% endif %}
+        {% if step.uses_patterns %}{{ badge("Uses patterns", "neutral") }}{% endif %}
+      </p>
+      <p class="prot-step__meta">
+        {% if step.reasons %}Refuses as {{ step.reasons|join(", ") }}.{% elif step.marker %}Marks bypass addresses; refuses nothing.{% endif %}
+        {% if step.where and not href %} Managed in: {{ step.where }}.{% endif %}
+      </p>
+    </div>
+    <div class="prot-step__count">
+      {% if step.marker %}<span class="muted">n/a</span>{% else %}
+      <p><strong>{{ num(step.refused) }}</strong> <span class="muted">refused{% if pipe.refused %} ({{ "%.1f"|format(step.share_pct) }}%){% endif %}</span></p>
+      <meter class="prot-meter" min="0" max="{{ step.max }}" value="{{ step.refused }}" aria-hidden="true"></meter>
+      {% endif %}
+    </div>
+  </li>
+  {% endfor %}
+</ol>
+<details class="details-plain prot-explainer">
+  <summary>How the pipeline works</summary>
+  <div class="prose">
+    <p>Every proxy request walks down this list in order. The first check that refuses decides the answer; the checks below it never see that request, so each refusal is counted once, at the check that stopped it.</p>
+    <p>Bypass marks a request from a bypass address: the checks marked "Bypass skips it" are not applied to it, but pause, bans, filters and blocks still are. Rate limits count the request; fixed checks only look at it. "Refused elsewhere" counts refusals no check in this list made: the guard in front of Roblox refusing a request that tried to carry a credential marker, or a host the egress refused.</p>
+    <p>Each check's count follows the time range in the top bar; the tarpit may hold a refused request before its answer is sent (see the Tarpit card).</p>
+  </div>
+</details>
+<div class="prot-subgrid">
+  <section class="prot-sub" aria-labelledby="pipe-rules-title">
+    <h3 class="prot-sub__title" id="pipe-rules-title">Rule rows matched</h3>
+    {% if pipe.rule_hits %}
+    <ul class="prot-list">{% for row in pipe.rule_hits %}<li><span>{{ row.table }}</span> <strong>{{ num(row.hits) }}</strong></li>{% endfor %}</ul>
+    {% else %}<p class="muted">No rule row matched a request in this range.</p>{% endif %}
+    <p class="field__hint">Matches count whatever the verdict, so a rule that allows most of what it matches still shows here.</p>
+  </section>
+  <section class="prot-sub" aria-labelledby="pipe-ua-title">
+    <h3 class="prot-sub__title" id="pipe-ua-title">User-Agent rules and the ladder</h3>
+    <ul class="prot-list">
+      <li><span>User-Agent rules allowed</span> <strong>{{ num(pipe.ua_allowed) }}</strong></li>
+      <li><span>User-Agent rules refused</span> <strong>{{ num(pipe.ua_refused) }}</strong></li>
+      {% for tier in pipe.tiers %}<li><span>New strikes on rung {{ tier.rung }}</span> <strong>{{ num(tier.strikes) }}</strong></li>{% endfor %}
+    </ul>
+    <p class="field__hint">These counters arrive once their minute has closed, so the last minute may be missing.</p>
+  </section>
+  <section class="prot-sub" aria-labelledby="pipe-worker-title">
+    <h3 class="prot-sub__title" id="pipe-worker-title">This worker since it started</h3>
+    <ul class="prot-list">
+      <li><span>Checked</span> <strong>{{ num(pipe.worker.evaluated) }}</strong></li>
+      <li><span>Allowed</span> <strong>{{ num(pipe.worker.allowed) }}</strong></li>
+      <li><span>Checked while shared state was unavailable</span> <strong>{{ num(pipe.worker.degraded_requests) }}</strong></li>
+      <li><span>Pattern checks skipped (a cheap limit refused first)</span> <strong>{{ num(pipe.worker.pattern_checks_skipped) }}</strong></li>
+      <li><span>Bans made by the ladder</span> <strong>{{ num(pipe.worker.ladder_bans) }}</strong></li>
+    </ul>
+    <p class="field__hint">One worker's own counters (each worker keeps its own); the numbers above are for every worker.</p>
+  </section>
+</div>
+{% endcall %}

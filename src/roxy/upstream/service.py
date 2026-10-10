@@ -21,8 +21,10 @@ How it works (one fetch)
        picks an egress; `buckets.reserve` takes the slot in ONE hot.db WRITE transaction that also inserts the
        single-flight lease (when the cache passed a hook), re-checks cooldowns, takes the half-open probe lease of
        a breaker, and (Tier 3) an AIMD slot. Nothing is committed when any of them says no.
-    3. Wait for the slot in the per-worker `WaitQueue` (bounded; a canceled or evicted wait refunds the slot), and
-       re-check cooldowns after a real wait, so a cooldown opened meanwhile by another worker is still honored.
+    3. Wait for the slot in the per-worker `WaitQueue` (bounded; a canceled or evicted wait refunds the slot), never
+       leaving before the slot's wall clock time (`_sleep_until_slot`: the queue's sleep is measured on another
+       clock), and re-check cooldowns after a real wait, so a cooldown opened meanwhile by another worker is still
+       honored.
     4. Send through the egress (which adds its API-shaped header profile; upstream adds only the body's
        Content-Type, a safe forwarded Accept and a cached CSRF token for write methods), with timeouts clipped to
        the request deadline. A CSRF 403 is retried once with the new token (a new bucket slot); a 3xx is followed
@@ -34,7 +36,8 @@ How it works (one fetch)
     5. Classify (`status.py`; `pages.py` flags a challenge or an HTML page on a JSON endpoint on the call's trace
        record, for UP-CHALLENGE), apply the side effects in at most one more hot.db transaction (`effects.py`, skipped
        for a plain success), then: log Roblox 429s (`record_upstream_429`), rotate a burned rotator session, lower
-       the attributed bucket rate, set the credential cooldown, and decide by the 7.9 table whether to retry.
+       the attributed bucket's rate and burst (from the calls its window meter saw in the last minute when that is
+       lower than its rate), set the credential cooldown, and decide by the 7.9 table whether to retry.
     6. Retry only 5xx, timeouts and connect errors, up to `upstream_max_attempts` in total, after a decorrelated
        jitter backoff, and only while the request deadline allows. A 429 is never retried at once; with
        `fallback_on_429=1` one retry on the OTHER anonymous egress is allowed, never onto the credential.
@@ -148,6 +151,8 @@ MAX_ROUTE_ROUNDS: Final = 3
 MAX_REROUTES: Final = 4
 MIN_CALL_TIME_MS: Final = 1000.0
 """A slot is never reserved so late that less than this is left of the request deadline for the call itself."""
+SLOT_TOPUP_ROUNDS: Final = 3
+"""How many times `_sleep_until_slot` sleeps the rest of a wait that ended before the slot's wall clock time."""
 
 SAFE_RESPONSE_HEADERS: Final = frozenset(
     {
@@ -1021,7 +1026,11 @@ class UpstreamService:
 
     @staticmethod
     def _read_snapshot(
-        conn: sqlite3.Connection, ckeys: Sequence[str], bkeys: Sequence[str], tat_keys: Sequence[str], now_ms: int
+        conn: sqlite3.Connection,
+        ckeys: Sequence[str],
+        bkeys: Sequence[str],
+        bucket_specs: Sequence[BucketSpec],
+        now_ms: int,
     ) -> _Snapshot:
         rows = breaker.load(conn, bkeys)
         probes: dict[str, float] = {}
@@ -1032,7 +1041,9 @@ class UpstreamService:
             cooldowns=cooldowns.read_active(conn, ckeys, now_ms),
             breakers=rows,
             probe_leases=probes,
-            tats=buckets.read_tats(conn, tat_keys),
+            # As the reservation will see them: a window bucket cut since its row was written waits out the
+            # backlog of the last minute's calls (buckets.paced_tats), so routing does not promise a free slot.
+            tats=buckets.paced_tats(conn, bucket_specs, now_ms),
         )
 
     def _merge_local(self, rows: dict[str, CooldownRow], keys: Sequence[str], now_ms: int) -> None:
@@ -1093,10 +1104,12 @@ class UpstreamService:
             specs = {egress: self._specs(call, egress) for egress in candidates}
             ckeys = [key for egress in candidates for key in self._ckeys(call.host, call.template, egress)]
             bkeys = [key for egress in candidates for key in breaker.breaker_keys(call.host, call.template, egress)]
-            tat_keys = [spec.key for egress in candidates for spec in specs[egress]]
+            bucket_specs = list({spec.key: spec for egress in candidates for spec in specs[egress]}.values())
             now_ms = self._now_ms()
             snap = await self.hot.read(
-                functools.partial(self._read_snapshot, ckeys=ckeys, bkeys=bkeys, tat_keys=tat_keys, now_ms=now_ms)
+                functools.partial(
+                    self._read_snapshot, ckeys=ckeys, bkeys=bkeys, bucket_specs=bucket_specs, now_ms=now_ms
+                )
             )
             self._merge_local(snap.cooldowns, ckeys, now_ms)
             self._note_cooldowns({key: row.until_ms for key, row in snap.cooldowns.items()}, now_ms)
@@ -1334,6 +1347,8 @@ class UpstreamService:
         started = self._mono()
         try:
             arrived = await self.queue.wait(ticket, wait_ms / 1000, self._sleep)
+            if arrived:
+                await self._sleep_until_slot(call, routed)
         finally:
             state.queue_wait_ms += (self._mono() - started) * 1000
             call.trace.queue_wait_ms = state.queue_wait_ms
@@ -1353,6 +1368,25 @@ class UpstreamService:
             return any(not breaker.admission(rows.get(key), now_ms / 1000).allowed for key in bkeys)
 
         return "blocked" if await self.hot.read(recheck) else "ok"
+
+    async def _sleep_until_slot(self, call: _Call, routed: _Routed) -> None:
+        """Make sure a call never leaves before its slot on the clock the buckets run on.
+
+        The slot is wall clock time (`clock.now_ms`, the time every worker's buckets share), but the queue sleeps
+        for a duration, and asyncio measures durations on the monotonic clock. When the two run at different
+        speeds the sleep ends early: on WSL 2 the monotonic clock runs about 10 percent fast, and the wall clock
+        is stepped back a second or more every half minute. Calls that leave early squeeze more calls into a minute
+        than the bucket granted (the window guarantee of `buckets.py` is about slot times). So the remainder is
+        slept here, a few rounds at most, and never past the time the call itself needs before the deadline. On a
+        server whose clocks agree this finds nothing left to sleep.
+        """
+        for _round in range(SLOT_TOPUP_ROUNDS):
+            early_ms = routed.grant.slot_ms - self._now_ms()
+            room_ms = self._left_s(call.req) * 1000 - MIN_CALL_TIME_MS
+            pause_ms = min(early_ms, room_ms)
+            if pause_ms <= 1:
+                return
+            await self._sleep(pause_ms / 1000)
 
     async def _attempt(
         self, call: _Call, routed: _Routed, state: _RunState
@@ -1815,6 +1849,7 @@ class UpstreamService:
                         limits=call.rules,
                         defaults=call.cfg.defaults,
                         now_s=self.clock.now(),
+                        observed=effects.observed,
                     )
                 except Exception:  # an audit or control.db hiccup must not fail the caller's answer
                     log.warning("adaptive_decrease_failed", exc_info=True)

@@ -1,0 +1,308 @@
+/*
+ * The Health page (templates/admin/pages/health*): the Run form, the run view's checklist, the comparison and the
+ * catalog of checks.
+ *
+ * What this is
+ *   Layout for the Health page's own pieces; cards, badges, tables and the history table come from components.css.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract). The owner runs
+ *   a check from a phone (plan 14.8): the Run button is full width there, every action keeps the touch target size,
+ *   and long values (an address, a host, a JSON detail) break anywhere instead of widening the page. Only tokens are
+ *   used, so both themes follow; each check's status has words and an icon besides its colored edge (plan 14.9).
+ * How it works
+ *   The checklist is an ordered list of blocks with a colored left edge per status; the catalog table turns into
+ *   labeled blocks below 640 px, like the Overview's top tables.
+ * What to read next
+ *   static/css/components.css (.badge, .kv, .card), templates/admin/pages/health/run.html.
+ */
+
+.hl-start {
+  display: grid;
+  gap: var(--sp-2);
+  justify-items: start;
+  padding-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.hl-start .field__hint {
+  margin: 0;
+  max-width: 70ch;
+}
+
+.hl-run {
+  display: grid;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
+  overflow-wrap: anywhere;
+}
+
+.hl-run__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.hl-run__title {
+  margin: 0;
+  font-size: var(--fs-4);
+}
+
+.hl-run__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.hl-progress {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+.hl-progress__bar {
+  flex: 1 1 12em;
+  height: 10px;
+  accent-color: var(--accent);
+}
+
+.hl-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.hl-tools {
+  gap: var(--sp-2);
+}
+
+.hl-checks {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.hl-check {
+  position: relative;
+  display: grid;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-3) var(--sp-3) calc(var(--sp-3) + 3px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.hl-check::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 3px;
+  border-radius: var(--radius) 0 0 var(--radius);
+  background: var(--border-strong);
+}
+
+.hl-check--ok::before { background: var(--ok); }
+.hl-check--warn::before { background: var(--warn); }
+.hl-check--bad::before { background: var(--bad); }
+.hl-check--info::before { background: var(--info); }
+
+.hl-check__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.hl-check__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.hl-check__title {
+  font-weight: var(--fw-semibold);
+}
+
+.hl-check__id {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.hl-check__facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14em, 1fr));
+  gap: var(--sp-1) var(--sp-4);
+  margin: 0;
+  font-size: var(--fs-1);
+}
+
+.hl-check__facts dt {
+  color: var(--text-muted);
+}
+
+.hl-check__facts dd {
+  margin: 0;
+}
+
+.hl-check__more > summary {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-min);
+  color: var(--accent);
+  font-size: var(--fs-1);
+  cursor: pointer;
+}
+
+.hl-check__why {
+  margin: var(--sp-1) 0;
+  max-width: 80ch;
+}
+
+.hl-check__detail {
+  grid-template-columns: max-content minmax(0, 1fr);
+  font-size: var(--fs-1);
+}
+
+.hl-check__actions {
+  gap: var(--sp-2);
+}
+
+.hl-check__wait {
+  margin: 0;
+  font-size: var(--fs-1);
+}
+
+.hl-compare {
+  display: grid;
+  gap: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.hl-compare__title {
+  margin: 0;
+  font-size: var(--fs-3);
+}
+
+.hl-compare__form .input {
+  flex: 1 1 16em;
+  min-width: 0;
+  max-width: 32em;
+}
+
+.hl-compare__caption {
+  padding-bottom: var(--sp-2);
+  text-align: left;
+  font-weight: var(--fw-semibold);
+}
+
+.hl-compare__table td,
+.hl-compare__table th {
+  white-space: normal;
+}
+
+.hl-schedule {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.hl-catalog {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-1);
+}
+
+.hl-catalog th,
+.hl-catalog td {
+  padding: var(--sp-2);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.hl-catalog thead th {
+  color: var(--text-muted);
+  font-weight: var(--fw-semibold);
+}
+
+.hl-catalog th[scope="row"] {
+  min-width: 14em;
+  font-weight: var(--fw-regular);
+}
+
+.hl-catalog__title {
+  display: block;
+  font-weight: var(--fw-semibold);
+}
+
+.hl-catalog__id {
+  display: block;
+  margin: 2px 0 var(--sp-1);
+  color: var(--text-muted);
+}
+
+@media (max-width: 640px) {
+  .hl-start__button {
+    width: 100%;
+    min-height: var(--target-touch);
+    justify-content: center;
+  }
+
+  .hl-start .cluster {
+    width: 100%;
+  }
+
+  .hl-run__facts,
+  .hl-check__detail,
+  .hl-schedule {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .hl-check__actions .btn,
+  .hl-tools .btn {
+    min-height: var(--target-touch);
+  }
+
+  .hl-catalog-wrap {
+    overflow: visible;
+  }
+
+  .hl-catalog,
+  .hl-catalog tbody,
+  .hl-catalog tr,
+  .hl-catalog th,
+  .hl-catalog td {
+    display: block;
+  }
+
+  .hl-catalog thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .hl-catalog tr {
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .hl-catalog th,
+  .hl-catalog td {
+    padding: 2px 0;
+    border: 0;
+  }
+
+  .hl-catalog th[scope="row"] {
+    min-width: 0;
+  }
+
+  .hl-catalog td::before {
+    content: attr(data-label) ": ";
+    color: var(--text-muted);
+  }
+}

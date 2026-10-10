@@ -1,0 +1,113 @@
+{#-
+  Settings page, card `editor` (`roxy/admin/pages/settings.py editor_card`): the catalog editor (plan 15.2, v1
+  Runtime Settings, parity rows 87 and 124).
+
+  The filter form asks this card's fragment with htmx and swaps only `#editor-results` (hx-select), so the search box
+  keeps its text and focus. Each setting is the shared control (components/page_card.html `inline_setting`, which
+  saves through `PUT /admin/api/v1/settings/{key}` with the API's validation, risk rules, fresh second factor and
+  audit) inside a wrapper whose id is the setting key (`/admin/settings#<key>` lands there), followed by where else it
+  can be changed and the open recommendations that propose a change. static/js/pages/settings.js keeps the filters in
+  the address bar, moves between pages of results, remembers unsaved edits across them and saves several at once
+  after a review (`POST /settings/preview`, then `PATCH /settings`). Every value shown came from the catalog or the
+  live snapshot; a sensitive value is `[redacted]`.
+  Context: `frame`, `query`, `groups`, `total`, `catalog_total`, `changed_count`, `with_recommendation_count`,
+  `first`, `last`, `pages`, `sizes`, `group_options`, `risk_options`, `cross_rules`, `ranked`, `key_spec`, `src`,
+  `preview_url`, `save_url`.
+-#}
+{% from "components/page_card.html" import page_card, inline_setting %}
+{% from "components/format.html" import num, local_href %}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import severity_badge %}
+{% from "components/empty.html" import empty_state %}
+{% set q = query %}
+{% set summary = ("Showing " ~ num(first) ~ " to " ~ num(last) ~ " of " ~ num(total) ~ " settings" ~ (", best matches first" if ranked else "")) if total else "No setting matches that" %}
+{% call page_card(frame, subtitle=num(catalog_total) ~ " settings, " ~ num(changed_count) ~ " changed from default") %}
+<div class="settings-editor stack" data-settings-editor data-preview-url="{{ preview_url }}" data-save-url="{{ save_url }}">
+  <form class="settings-filter" id="editor-filter" role="search" aria-label="Find a setting" data-settings-filter
+        hx-get="{{ src }}" hx-target="#editor-results" hx-select="#editor-results" hx-swap="outerHTML"
+        hx-trigger="submit, change, input changed delay:400ms from:#editor-q">
+    <div class="field settings-filter__search">
+      <label class="field__label" for="editor-q">Find a setting</label>
+      <span class="input-icon">{{ icon("search") }}<input type="search" class="input" id="editor-q" name="q" value="{{ q.q }}" placeholder="Try cache, tarpit or throttle" maxlength="200" autocomplete="off" spellcheck="false" aria-describedby="editor-q-hint"></span>
+      <p class="field__hint" id="editor-q-hint">Searches the key, the v1 name, the label and the description.</p>
+    </div>
+    <div class="settings-filter__chips">
+      <label class="chip-select">
+        <span class="chip-select__label">Group</span>
+        <select name="group" aria-label="Filter by group">{% for value, text in group_options %}<option value="{{ value }}"{% if value == (q.group or "") %} selected{% endif %}>{{ text }}</option>{% endfor %}</select>
+      </label>
+      <label class="chip-select">
+        <span class="chip-select__label">Risk</span>
+        <select name="risk" aria-label="Filter by risk">{% for value, text in risk_options %}<option value="{{ value }}"{% if value == (q.risk or "") %} selected{% endif %}>{{ text }}</option>{% endfor %}</select>
+      </label>
+      <label class="check"><input type="checkbox" name="changed" value="1"{% if q.changed %} checked{% endif %}><span>Only what I have changed ({{ num(changed_count) }})</span></label>
+      <label class="check"><input type="checkbox" name="has_recommendation" value="1"{% if q.has_recommendation %} checked{% endif %}><span>Only with an open recommendation ({{ num(with_recommendation_count) }})</span></label>
+    </div>
+    <input type="hidden" name="page" value="{{ q.page }}" data-editor-page>
+    <input type="hidden" name="page_size" value="{{ q.page_size }}" data-editor-size>
+    {% if q.key %}<input type="hidden" name="key" value="{{ q.key }}" data-editor-key>{% endif %}
+    {% for name, value in view.time.params.items() %}<input type="hidden" name="{{ name }}" value="{{ value }}" data-editor-keep>{% endfor %}
+    <p class="settings-filter__status" data-editor-status role="status">{{ summary }}</p>
+  </form>
+
+  <div class="settings-results stack" id="editor-results" data-editor-results data-summary="{{ summary }}" aria-label="Settings" role="region" tabindex="-1">
+    {% for note in q.notices %}<p class="card__notice" role="note">{{ icon("info") }}<span>{{ note }}</span></p>{% endfor %}
+    {% if key_spec %}
+    <p class="settings-key-note">{{ icon("sliders") }}<span>Showing one setting: <strong>{{ key_spec.label }}</strong>.</span> <a href="/admin/settings">Show every setting</a></p>
+    {% endif %}
+    {% for group in groups %}
+    <section class="settings-group" aria-labelledby="editor-group-{{ group.id }}">
+      <h3 class="settings-group__title" id="editor-group-{{ group.id }}">{{ group.label }}</h3>
+      <div class="settings-list settings-group__list">
+        {% for item in group["items"] %}
+        <div class="settings-item{% if item.changed %} settings-item--changed{% endif %}" id="{{ item.key }}" data-settings-item="{{ item.key }}">
+          {{ inline_setting(item.control) }}
+          {% if item.homes or item.recommendations or item.renamed_from or item.arm_only %}
+          <div class="settings-item__more">
+            {% if item.arm_only %}<p class="settings-item__note">{{ icon("shield") }}<span>Switching the dry run off arms the detectors (real bans). Do it from <a href="/admin/protection#spam">Protection &gt; Spam detectors</a>, which first shows who would have been banned.</span></p>{% endif %}
+            {% if item.recommendations %}
+            <p class="settings-item__recs">Open recommendations:
+              {% for rec in item.recommendations %}{% set rec_href = local_href("/admin/recommendations?rec=" ~ (rec.id|urlencode)) %}<span class="settings-item__rec">{% if rec_href %}<a href="{{ rec_href }}">{{ rec.rule_id }}</a>{% else %}{{ rec.rule_id }}{% endif %} {{ severity_badge(rec.severity) }}</span>{% endfor %}
+            </p>
+            {% endif %}
+            {% if item.homes %}<p class="settings-item__homes">Also on: {% for home in item.homes %}{% set home_href = local_href(home.href) if home.href else "" %}{% if home_href %}<a href="{{ home_href }}">{{ home.label }}</a>{% else %}<span>{{ home.label }}</span>{% endif %}{{ ", " if not loop.last }}{% endfor %}</p>{% endif %}
+            {% if item.renamed_from %}<p class="settings-item__v1 muted">Called <code>{{ item.renamed_from }}</code> in v1.</p>{% endif %}
+          </div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+    {% else %}
+    {{ empty_state("No setting matches that.", "Clear the search or the filters to see every setting. The search looks in keys, v1 names, labels and descriptions.", "search") }}
+    {% endfor %}
+    {% if total %}
+    <nav class="settings-pager" aria-label="Pages of settings">
+      <button type="button" class="btn btn--sm btn--ghost" data-editor-goto="{{ q.page - 1 }}"{% if q.page <= 1 %} disabled{% endif %}>{{ icon("chevron-left") }}<span>Previous</span></button>
+      <span class="pager__pos">Page {{ q.page }} of {{ pages }}</span>
+      <button type="button" class="btn btn--sm btn--ghost" data-editor-goto="{{ q.page + 1 }}"{% if q.page >= pages %} disabled{% endif %}><span>Next</span>{{ icon("chevron-right") }}</button>
+      <label class="dt__size settings-pager__size"><span>Settings a page</span>
+        <select data-editor-size-select aria-label="Settings a page">{% for size in sizes %}<option value="{{ size }}"{% if size == q.page_size %} selected{% endif %}>{{ size }}</option>{% endfor %}</select>
+      </label>
+    </nav>
+    {% endif %}
+  </div>
+
+  <details class="details-plain settings-cross">
+    <summary>Rules between settings ({{ cross_rules|length }})</summary>
+    <p class="muted">A change that would break one of these is refused with the rule's name; the review shows it before anything is saved.</p>
+    <ul class="settings-cross__list">
+      {% for rule in cross_rules %}<li>{% for part in rule.split("`") %}{% if loop.index is even %}<code>{{ part }}</code>{% else %}{{ part }}{% endif %}{% endfor %}</li>{% endfor %}
+    </ul>
+  </details>
+
+  <div class="settings-batch" data-settings-batch hidden>
+    <span class="setting settings-batch__guard" data-settings-guard hidden></span>
+    <p class="settings-batch__count" data-batch-count></p>
+    <div class="cluster">
+      <button type="button" class="btn btn--primary" data-batch-review data-dialog-open="settings-batch-dialog" data-action="settings-review">{{ icon("check") }}<span>Review all changes</span></button>
+      <button type="button" class="btn btn--ghost" data-batch-discard>Discard all</button>
+    </div>
+  </div>
+</div>
+{% endcall %}

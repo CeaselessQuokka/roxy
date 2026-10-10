@@ -1,0 +1,19 @@
+{#-
+  Recommendations, card `list` (`roxy/admin/pages/recommendations.py list_card`): every recommendation (plan 14.1).
+
+  The page's main table (its filters, search, sort and page are kept in the address bar): filter chips for state
+  (open by default), severity, family and rule, the API's own parameter names, export through
+  `GET /admin/api/v1/recommendations`. A row opens the detail drawer. Titles and subjects can quote endpoint
+  templates built from callers' paths: they are caller text. The subtitle counts the open ones by severity, in words.
+  Context: `frame`, `table`, `open`, `by_severity`, `engine`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import num %}
+{% set subtitle = num(open) ~ " open: " ~ num(by_severity.critical) ~ " critical, " ~ num(by_severity.warn) ~ " warnings, " ~ num(by_severity.info) ~ " info" %}
+{% set notes = [] %}
+{% if not engine.enabled %}{% set _ = notes.append("The engine is switched off (insights_enabled), so no new recommendation is made; the list shows what was found before. Switch it on in the engine settings below.") %}{% endif %}
+{% if engine.auto_apply %}{% set _ = notes.append("Auto-apply is on: changes marked safe to auto-apply may be applied by Roxy itself, within the engine's limits, and are then watched and rolled back if they make things worse.") %}{% endif %}
+{% call page_card(frame, flush=True, subtitle=subtitle, notices=notes) %}
+{{ data_table(**table) }}
+{% endcall %}

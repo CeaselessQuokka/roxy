@@ -1,0 +1,57 @@
+{#-
+  Protection page, card `throttle` (`roxy/admin/pages/protection.py throttle_card`): the per-IP limit.
+
+  What: the limit in plain words (from the live settings), then three tabs: who is serving a throttle penalty now
+  (`GET /protection/throttle/watch`, row 118; a row opens the client's strikes in the drawer), the clients that
+  became throttled in the range (`GET /protection/throttle/history`, v1's "Throttled IPs", row 26), and the plan
+  6.8 limiter reset (everyone, typed confirmation, or one client) with its preview. The settings of this card
+  (`protection#throttle` in the catalog, the emergency limit's two included) sit below, placed by the kit.
+  A table request (`table=watch` or `table=history`) answers that table alone.
+  Context: `frame`, `tables`, `only`, `summary`, `reset_all`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, reason_field %}
+{% if only %}{{ data_table(**tables[only]) }}{% else %}
+{% call page_card(frame) %}
+<p class="prot-lead">Each client may make <strong>{{ num(summary.limit) }}</strong> requests per <strong>{{ num(summary.window) }} seconds</strong>, with {{ summary.pacing }}. {% if summary.cache_hits_count %}Answers from the cache count toward the limit too.{% else %}Answers from the cache do not count toward the limit.{% endif %} A client over the limit gets 429 and a {{ term("strike", "strike") }}{% if summary.escalation %}; repeat offenders climb the ladder to longer waits{% endif %}{% if summary.strike_on_retry %}, and retrying while throttled adds a strike{% endif %}.</p>
+{% call tabs("prot-throttle-tabs", [("now", "Throttled now"), ("history", "Throttled in this range"), ("reset", "Reset")], "Throttle views") %}
+  {% call tab_panel("prot-throttle-tabs", "now", first=True) %}{{ data_table(**tables.watch) }}{% endcall %}
+  {% call tab_panel("prot-throttle-tabs", "history") %}{{ data_table(**tables.history) }}{% endcall %}
+  {% call tab_panel("prot-throttle-tabs", "reset") %}
+  <div class="prot-pad stack">
+    <p>Resetting limiter state deletes the counters behind the per-IP limit, the flood limit, the emergency limit, User-Agent and endpoint rules, and the strikes. Unlike forgiving strikes, it also ends running penalties at once. {{ reset_all.leaves_alone }} are left alone.</p>
+    <div class="cluster">
+      <button type="button" class="btn" data-dialog-open="dlg-prot-limiter-client" aria-haspopup="dialog">{{ icon("reset") }}<span>Reset one client</span></button>
+      <button type="button" class="btn btn--bad" data-dialog-open="dlg-prot-limiter-all" aria-haspopup="dialog" data-action="limiter-reset">{{ icon("reset") }}<span>Reset every client</span></button>
+    </div>
+  </div>
+  {% endcall %}
+{% endcall %}
+{% call confirm_dialog("dlg-prot-limiter-all", "Reset every client's limits?", "/admin/api/v1/protection/limiter/reset",
+                       confirm_label="Reset every client", danger=True, type_to_confirm=reset_all.confirm_text, api=True,
+                       hidden={"scope": "all", "confirm": reset_all.confirm_text}, success="Limiter state reset for every client.",
+                       on_success="refresh", refresh="throttle strikes throttle-all",
+                       consequences=["Deletes " ~ num(reset_all.limiter_rows) ~ " limiter rows and " ~ num(reset_all.strike_rows) ~ " strike rows: every client's allowance is full again and every running penalty ends now.",
+                                     "Abusers start from a clean sheet too, so use it after a mistake (your own load test), not during an attack.",
+                                     "The reset is written to the audit log and marked on the charts."]) %}
+  {{ reason_field("dlg-prot-limiter-all-reason", required=True) }}
+{% endcall %}
+{% call confirm_dialog("dlg-prot-limiter-client", "Reset one client's limits?", "/admin/api/v1/protection/limiter/reset",
+                       confirm_label="Reset this client", api=True, hidden={"scope": "client"},
+                       success="Limiter state reset for that client.", on_success="refresh", refresh="throttle strikes throttle-all",
+                       consequences=["Deletes that client's limiter counters and strikes: its allowance is full again and a running penalty ends now.",
+                                     "Everyone else is left alone. The reset is written to the audit log."]) %}
+  <div class="field">
+    <label class="field__label" for="dlg-prot-limiter-client-key">Client address or IPv6 network</label>
+    <input class="input mono" id="dlg-prot-limiter-client-key" name="client" required aria-required="true" maxlength="64" autocomplete="off" spellcheck="false" aria-describedby="dlg-prot-limiter-client-key-error" placeholder="203.0.113.7">
+    <p class="field__error" id="dlg-prot-limiter-client-key-error" data-field-error="client" hidden></p>
+  </div>
+  {{ reason_field("dlg-prot-limiter-client-reason", required=True) }}
+{% endcall %}
+{% endcall %}
+{% endif %}

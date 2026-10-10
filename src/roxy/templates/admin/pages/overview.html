@@ -1,0 +1,42 @@
+{#-
+  The Overview page (`roxy/admin/pages/overview.py`): Roxy at a glance (plan 14.1, 11.6, 13.1).
+
+  Layout: the status strip and the top recommendations first (what needs attention), then the key number tiles and
+  the visitors, then the traffic chart beside the outcome breakdown, the busiest endpoints beside the busiest
+  places, and the recent notable events last. On a phone every card takes the full width and the tiles stack two
+  per row (plan 14.8). The page header holds the Check Proxy Health button (plan 13.1): it starts a run without the
+  credential check and opens it on the Health page (static/js/pages/overview.js).
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+
+{% block page_actions %}
+<form class="ov-health" data-health-start data-run-url="{{ urls.health_run if urls is defined and urls else '/admin/api/v1/health/runs' }}" data-health-page="/admin/health" novalidate>
+  <input type="hidden" name="include_credential" value="false">
+  <button type="submit" class="btn btn--primary" data-action="overview-health-run" aria-describedby="ov-health-hint">{{ icon("heart") }}<span>Check Proxy Health</span></button>
+  <p class="sr-only" id="ov-health-hint">Starts a health run of every check except the credential check, then opens it on the Health page.</p>
+</form>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>The tiles and the chart cover the range in the top bar; Requests (last hour) and Failures (last hour) always cover the last 60 minutes, and Service uptime, Active bans and Rotator bytes today are about right now. A tile is a link: it opens the page that explains the number. An {{ term("avoided-upstream-call", "avoided upstream call") }} is a caller request Roxy answered without asking Roblox (from the cache or by joining a call already in flight); refused requests never count as avoided.</p>
+<p>Check Proxy Health runs every check except the credential check (which spends one call on the Roblox account) and shows the result on the Health page, where you can also run the credential check.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["status"] }}
+{{ cards["recommendations"] }}
+{{ cards["kpis"] }}
+{{ cards["visitors"] }}
+<div class="grid grid--main-side">
+  {{ cards["traffic"] }}
+  {{ cards["outcomes"] }}
+</div>
+<div class="grid grid--2">
+  {{ cards["top-endpoints"] }}
+  {{ cards["top-places"] }}
+</div>
+{{ cards["events"] }}
+{% endblock %}

@@ -1,0 +1,233 @@
+{#-
+  Clients page: one client (an address or a place), the per-client view of plan 14.1 (`roxy/admin/pages/clients.py
+  client_context`). The drawer body of `GET /admin/clients/client?kind=&key=` and the body of the client's own page
+  (`/admin/clients/ip/{ip}`, `/admin/clients/place/{place}`, `clients/client_page.html`).
+
+  Everything comes from the API's own answer (`clients.ip_view` / `clients.place_view`): the state (ban, bypass,
+  deny list, strikes and penalty), the range's totals and timeline (a chart with a data table), the last hour with
+  its rates, refusals by reason, the bot score breakdown (an address), the peers, recent probes and requests, and
+  the cached lookup (a place). The actions open confirm dialogs nested in this view (the drawer stays open under
+  them) that post JSON to the clients API: ban, bypass or a deny list entry (an address), ban or a `Roblox-Id`
+  request filter (a place), identify (a place), and the plan 6.8 `client` reset. Request rows, User-Agents, paths,
+  probe targets and the lookup's texts are caller (or Roblox) text: shown as text only.
+  Context: see `client_context`, plus `standalone` and `view`.
+-#}
+{% from "components/format.html" import caller_text, num, bytes, local_href, pct %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/empty.html" import empty_state %}
+{% from "admin/pages/cache/_shared.html" import reset_dialog %}
+{% set on_success = "reload" if standalone else "refresh" %}
+{% set c = client %}
+{% set lh = c.last_hour or {} %}
+{% set rates = lh.rates or {} %}
+<div class="client-view stack" data-client-view data-client-kind="{{ kind }}" data-client-src="{{ drawer_src }}">
+  <div class="client-view__head">
+    <p class="client-view__key">{% if kind == "ip" %}<span class="mono">{{ key }}</span>{% else %}Place {{ caller_text(key, 64) }}{% if lookup and lookup.name %} <span class="muted">({{ caller_text(lookup.name, 120) }})</span>{% endif %}{% endif %}</p>
+    <p class="cluster">
+      {% if ban %}{{ status_badge("bad", "Banned" ~ (" until " ~ ban.until if ban.until else " permanently")) }}{% else %}{{ status_badge("neutral", "Not banned") }}{% endif %}
+      {% if kind == "ip" %}
+        {% if c.bypassed %}{{ status_badge("info", "Bypasses the limits") }}{% endif %}
+        {% if c.denied %}{{ status_badge("bad", "On the deny list") }}{% endif %}
+        {% if c.strikes and c.strikes.throttled %}{{ status_badge("warn", "Penalized for " ~ c.strikes.penalty_ends_in_s ~ "s more") }}{% endif %}
+        {% if c.strikes and c.strikes.strikes %}{{ badge(c.strikes.strikes ~ (" strike" if c.strikes.strikes == 1 else " strikes") ~ ", rung " ~ c.strikes.tier, "warn") }}{% endif %}
+      {% endif %}
+    </p>
+  </div>
+
+  <div class="cluster client-view__actions">
+    <button type="button" class="btn btn--sm btn--bad-soft" data-dialog-open="dlg-client-ban" data-action="client-ban">{{ icon("lock") }}<span>Ban</span></button>
+    {% if kind == "ip" %}
+    <button type="button" class="btn btn--sm" data-dialog-open="dlg-client-bypass" data-action="client-bypass">{{ icon("check") }}<span>Bypass the limits</span></button>
+    <button type="button" class="btn btn--sm btn--bad-soft" data-dialog-open="dlg-client-rule" data-action="client-rule">{{ icon("shield") }}<span>Add to the deny list</span></button>
+    {% else %}
+    <button type="button" class="btn btn--sm btn--bad-soft" data-dialog-open="dlg-client-rule" data-action="client-rule">{{ icon("shield") }}<span>Block its Roblox-Id</span></button>
+    <form class="cache-inline-form" data-api-form data-api-url="{{ api_base }}/lookup" data-api-method="POST" data-success="Found it." data-lookup-form data-throwaway="{{ throwaway_note }}">
+      <button type="submit" class="btn btn--sm" data-action="client-identify">{{ icon("search") }}<span>Identify</span></button>
+    </form>
+    {% endif %}
+    <button type="button" class="btn btn--sm btn--ghost" data-dialog-open="dlg-client-reset" data-action="client-reset">{{ icon("reset") }}<span>Reset this client</span></button>
+    {% if not standalone %}{% set own = local_href(page_href) %}{% if own %}<a class="btn btn--sm btn--ghost" href="{{ own }}">{{ icon("external") }}<span>Open as a page</span></a>{% endif %}{% endif %}
+  </div>
+  {% if kind == "place" %}<div class="clients-lookup__result" data-lookup-result aria-live="polite"></div>{% endif %}
+
+  <section class="client-view__section" aria-labelledby="client-range-title">
+    <h3 class="client-view__title" id="client-range-title">{{ range_label }}</h3>
+    <dl class="kv client-view__facts">
+      <dt>Requests</dt><dd>{{ num(c.totals.requests) }}</dd>
+      <dt>Refused</dt><dd>{{ num(c.totals.refused) }}{% if c.totals.refused_pct is not none %} <span class="muted">({{ "%.1f"|format(c.totals.refused_pct) }}%)</span>{% endif %}</dd>
+      <dt>Served</dt><dd>{{ num(c.totals.served) }}</dd>
+      <dt>Bytes sent</dt><dd>{{ bytes(c.totals.bytes) }}</dd>
+      <dt>Busiest endpoints</dt>
+      <dd>{% if c.top_endpoints %}<ul class="client-view__list">{% for e in c.top_endpoints[:5] %}<li>{{ caller_text(e.endpoint, 120) }} <span class="muted">{{ num(e.requests) }}</span></li>{% endfor %}</ul>{% else %}<span class="muted">none in this range</span>{% endif %}</dd>
+    </dl>
+    {{ series_chart("client-timeline", "Requests over time", series=chart, summary="This client's requests, served and refused, over the selected range.", help="Requests per time bucket from the per-client activity rows: everything it sent, what was served and what was refused.", size="sm", empty_text="No requests from this client in this range.") }}
+  </section>
+
+  <section class="client-view__section" aria-labelledby="client-hour-title">
+    <h3 class="client-view__title" id="client-hour-title">The last hour</h3>
+    <dl class="kv client-view__facts">
+      <dt>Requests</dt><dd>{{ num(lh.requests) }}{% if lh.refused %} <span class="muted">({{ num(lh.refused) }} refused)</span>{% endif %}</dd>
+      <dt>Rate (a minute)</dt><dd>{{ rate_text["1"] }} <span class="muted">now</span>, {{ rate_text["5"] }} <span class="muted">over 5 minutes</span>, {{ rate_text["60"] }} <span class="muted">over the hour</span></dd>
+      <dt>Busiest endpoint</dt><dd>{{ caller_text(lh.top_endpoint, 120) }}</dd>
+    </dl>
+  </section>
+
+  <section class="client-view__section" aria-labelledby="client-refusals-title">
+    <h3 class="client-view__title" id="client-refusals-title">Refusals by reason</h3>
+    {% if refusals %}
+    <div class="table-scroll" role="region" aria-labelledby="client-refusals-title" tabindex="0">
+      <table class="simple-table">
+        <thead><tr><th scope="col">Reason</th><th scope="col" class="num">Count</th><th scope="col">Last</th></tr></thead>
+        <tbody>{% for r in refusals %}<tr><td class="mono">{{ r.reason }}</td><td class="num">{{ num(r.count) }}</td><td>{% if r.when %}<time datetime="{{ r.when.datetime }}">{{ r.when.sub }}</time>{% endif %}</td></tr>{% endfor %}</tbody>
+      </table>
+    </div>
+    {% else %}<p class="muted">{{ c.refusals_note or "Nothing refused in this range." }}</p>{% endif %}
+  </section>
+
+  {% if kind == "ip" and bot %}
+  <section class="client-view__section" aria-labelledby="client-bot-title">
+    <h3 class="client-view__title" id="client-bot-title">Bot score {{ badge("this worker", "neutral") }}</h3>
+    {% if bot.score is not none %}
+    <p><strong class="client-view__score">{{ bot.score }}</strong> <span class="muted">of 100{% if bot.game_server %}; it carries a Roblox game server's signature{% endif %}</span></p>
+    {% if bot.rows %}
+    <div class="table-scroll" role="region" aria-labelledby="client-bot-title" tabindex="0">
+      <table class="simple-table">
+        <thead><tr><th scope="col">Signal</th><th scope="col" class="num">Value (0 to 1)</th><th scope="col" class="num">Weight</th></tr></thead>
+        <tbody>{% for s in bot.rows %}<tr><th scope="row">{{ s.label }}</th><td class="num">{{ "%.2f"|format(s.signal) }}</td><td class="num">{{ num(s.weight) }}</td></tr>{% endfor %}</tbody>
+      </table>
+    </div>
+    {% endif %}
+    {% else %}<p class="muted">{{ bot.note }}</p>{% endif %}
+    {% if bot.score is not none and bot.note %}<p class="muted">{{ bot.note }}</p>{% endif %}
+    <p class="muted">Recorded by the fleet: {% if bot.recorded %}<strong>{{ bot.recorded.score }}</strong> in its latest scored hour{% else %}no score in the last 25 hours{% endif %}. <a href="/admin/clients#client-score">How the score works</a></p>
+    {% if history %}<p class="muted">Recorded hours in the range: {% for h in history[-12:] %}<span class="mono">{{ h.score_max }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+  </section>
+  {% endif %}
+
+  <section class="client-view__section" aria-labelledby="client-peers-title">
+    <h3 class="client-view__title" id="client-peers-title">{{ "Places it called as" if kind == "ip" else "Addresses it came from" }} <span class="muted">({{ num(peers.total) }})</span></h3>
+    {% if peers.rows %}
+    <div class="table-scroll" role="region" aria-labelledby="client-peers-title" tabindex="0">
+      <table class="simple-table">
+        <thead><tr><th scope="col">{{ "Place" if kind == "ip" else "Address" }}</th><th scope="col" class="num">Requests</th><th scope="col" class="num">Refused</th><th scope="col">Last seen</th></tr></thead>
+        <tbody>
+          {% for p in peers.rows %}
+          {% set href = local_href(p.href) %}
+          <tr><td>{% if href %}<a href="{{ href }}" class="mono">{{ caller_text(p.key, 64) }}</a>{% else %}<span class="mono">{{ caller_text(p.key, 64) }}</span>{% endif %}</td><td class="num">{{ num(p.requests) }}</td><td class="num">{{ num(p.refused) }}</td><td>{% if p.when %}<time datetime="{{ p.when.datetime }}">{{ p.when.sub }}</time>{% endif %}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if peers.total > peers.rows|length %}<p class="muted">The busiest {{ peers.rows|length }} of {{ num(peers.total) }}.</p>{% endif %}
+    {% if peers.basis %}<p class="muted">Counted from {{ peers.basis }}.</p>{% endif %}
+    {% else %}<p class="muted">None in this range.</p>{% endif %}
+  </section>
+
+  {% if kind == "ip" %}
+  <section class="client-view__section" aria-labelledby="client-probes-title">
+    <h3 class="client-view__title" id="client-probes-title">Recent probes</h3>
+    {% if probes %}
+    <ul class="client-view__rows">
+      {% for p in probes %}
+      <li>{% if p.when %}<time class="muted" datetime="{{ p.when.datetime }}">{{ p.when.text }}</time>{% endif %} <strong>{{ caller_text(p.reason, 80) }}</strong> {{ caller_text(p.path or p.target, 200) }} <span class="muted">{{ caller_text(p.user_agent, 120) }}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}<p class="muted">No probes from this address in this range.</p>{% endif %}
+  </section>
+  {% endif %}
+
+  <section class="client-view__section" aria-labelledby="client-recent-title">
+    <h3 class="client-view__title" id="client-recent-title">Recent requests <span class="muted">(last 15 minutes)</span></h3>
+    {% if recent %}
+    <ul class="client-view__rows">
+      {% for r in recent %}
+      <li>
+        {% if r.when %}<time class="muted" datetime="{{ r.when.datetime }}">{{ r.when.text }}</time>{% endif %}
+        <span class="mono">{{ r.method }}</span> {{ caller_text(r.target, 200) }}
+        {{ badge(r.status ~ " " ~ r.outcome_words, "bad" if r.outcome in ("refused", "failed") else "neutral") }}
+        {% if kind == "place" %}<span class="muted mono">{{ r.ip }}</span>{% endif %}
+        <span class="muted">{{ caller_text(r.user_agent, 120) }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}<p class="muted">Nothing in the last 15 minutes; only the live rows keep single requests.</p>{% endif %}
+  </section>
+
+  {% set audit = local_href(audit_href) %}
+  {% if audit %}<p><a href="{{ audit }}">{{ icon("history") }} Audit entries that name this client</a></p>{% endif %}
+
+  {% call confirm_dialog("dlg-client-ban", "Ban this " ~ ("address" if kind == "ip" else "place") ~ "?", action=api_base ~ "/ban", api=True, danger=True,
+      confirm_label="Ban", reason=True, on_success=on_success, refresh="places ips",
+      success="Banned. Every worker refuses it within a second.",
+      consequences=(["Every request from this address is refused before any limit is checked, on every worker.", "A ban on an address that is already banned extends it."] if kind == "ip"
+                    else ["Every request carrying this Roblox-Id is refused, from any address.", "Place ids are claims a caller makes; a real game's servers keep sending the same one, a forger can change it."])) %}
+  <div class="field-row">
+    <div class="field">
+      <label class="field__label" for="dlg-client-ban-minutes">For how long</label>
+      <select class="input" id="dlg-client-ban-minutes" name="minutes" data-json="int">
+        {% for minutes, label in ban_lengths %}<option value="{{ minutes }}"{% if minutes == 1440 %} selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+      <p class="field__error" data-field-error="minutes" hidden></p>
+    </div>
+    <div class="field">
+      <span class="field__label" id="dlg-client-ban-perm-label">Or</span>
+      <label class="check"><input type="checkbox" name="permanent" data-json="bool" data-ban-permanent aria-describedby="dlg-client-ban-perm-label"><span>Ban permanently</span></label>
+    </div>
+  </div>
+  <div class="field">
+    <label class="field__label" for="dlg-client-ban-message">Message the caller gets <span class="muted">(optional)</span></label>
+    <input class="input" id="dlg-client-ban-message" name="message" maxlength="500" autocomplete="off">
+  </div>
+  {% endcall %}
+
+  {% if kind == "ip" %}
+  {% call confirm_dialog("dlg-client-bypass", "Let this address bypass the limits?", action=api_base ~ "/bypass", api=True,
+      confirm_label="Bypass", reason=True, on_success=on_success, refresh="ips",
+      success="Bypass added.",
+      consequences=["This address skips the throttles, place limits, User-Agent rules, endpoint rules and the tarpit (bans, filters and pause still apply).", "Use it for your own testing; it expires by itself."]) %}
+  <div class="field">
+    <label class="field__label" for="dlg-client-bypass-hours">For how many hours</label>
+    <input class="input input--num" id="dlg-client-bypass-hours" name="expires_in_h" inputmode="decimal" value="{{ bypass_hours }}" data-json="float">
+    <p class="field__error" data-field-error="expires_in_h" hidden></p>
+  </div>
+  <div class="field">
+    <label class="field__label" for="dlg-client-bypass-note">Note <span class="muted">(optional, private)</span></label>
+    <input class="input" id="dlg-client-bypass-note" name="note" maxlength="500" autocomplete="off" placeholder="Added from Clients">
+  </div>
+  {% endcall %}
+
+  {% call confirm_dialog("dlg-client-rule", "Add this address to the deny list?", action=api_base ~ "/rule", api=True, danger=True,
+      confirm_label="Deny", reason=True, on_success=on_success, refresh="ips",
+      success="Added to the deny list.",
+      consequences=["Every request from this address is refused before any limit, like a ban without hit counts.", "Leave the hours empty to keep the entry until you remove it on the Protection page."]) %}
+  <div class="field">
+    <label class="field__label" for="dlg-client-rule-hours">For how many hours <span class="muted">(empty: until removed)</span></label>
+    <input class="input input--num" id="dlg-client-rule-hours" name="expires_in_h" inputmode="decimal" data-json="float">
+    <p class="field__error" data-field-error="expires_in_h" hidden></p>
+  </div>
+  <div class="field">
+    <label class="field__label" for="dlg-client-rule-note">Note <span class="muted">(optional, private)</span></label>
+    <input class="input" id="dlg-client-rule-note" name="note" maxlength="500" autocomplete="off" placeholder="Added from Clients">
+  </div>
+  {% endcall %}
+  {% else %}
+  {% call confirm_dialog("dlg-client-rule", "Block every request carrying this Roblox-Id?", action=api_base ~ "/rule", api=True, danger=True,
+      confirm_label="Block", reason=True, on_success=on_success, refresh="places",
+      success="Request filter added.",
+      consequences=["A request filter refuses every request whose Roblox-Id header is exactly this place id (v1's Block button).", "Without a message the caller sees an ordinary slow-down answer, so a scraper cannot tell it was singled out.", "Remove it from Protection > Request filters."]) %}
+  <div class="field">
+    <label class="field__label" for="dlg-client-rule-message">Message the caller gets <span class="muted">(optional)</span></label>
+    <input class="input" id="dlg-client-rule-message" name="message" maxlength="500" autocomplete="off">
+  </div>
+  <div class="field">
+    <label class="field__label" for="dlg-client-rule-note">Note <span class="muted">(optional, private)</span></label>
+    <input class="input" id="dlg-client-rule-note" name="note" maxlength="500" autocomplete="off">
+  </div>
+  {% endcall %}
+  {% endif %}
+
+  {{ reset_dialog(reset, refresh="places ips", on_success=on_success) }}
+</div>

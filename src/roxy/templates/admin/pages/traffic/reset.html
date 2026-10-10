@@ -1,0 +1,85 @@
+{#-
+  An inline data reset, shown in the drawer (`roxy/admin/pages/_traffic_reset.py`; plan 6.8): the Traffic page's
+  Requests and Latency cards, the Live page's tail and an endpoint template's page open it.
+
+  The drawer already has a heading, so this is its body: what the reset does in plain words (the Data API's own
+  preview: rows per table and the dates they cover, what stays, whether a snapshot is taken first), then the form
+  that posts the previewed scope to `POST /admin/api/v1/data/resets` (static/js/api_forms.js: JSON, the CSRF
+  header, 422 messages under their fields) with the preview's digest, a reason for the audit log and, for a whole
+  metric family, the typed phrase (`typeConfirm` keeps the button off until it matches). An endpoint template is
+  caller text: it is shown through `caller_text` and travels only as a form value, never in a link or a script.
+  Context: `frame`, `reset` (InlineReset), `preview`, `tables`, `families`, `template`, `scope`, `phrase`,
+  `api_url`, `nothing`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num, caller_text %}
+{% from "components/alert.html" import inline_alert %}
+{% set rid = "reset-" ~ reset.key %}
+<div class="g2-reset stack" data-card="{{ frame.id }}" data-reset="{{ reset.key }}">
+  <p class="g2-reset__lead">{{ reset.lead }}</p>
+  {% if template %}<p class="g2-reset__target"><span class="muted">Endpoint:</span> <span class="mono">{{ caller_text(template, 300) }}</span></p>{% endif %}
+  {% if nothing %}
+  {{ inline_alert("info", "Nothing to reset", "No rows of this kind are stored right now, so there is nothing to delete. Numbers recorded from now on will appear as usual.") }}
+  {% else %}
+  <section class="g2-reset__section" aria-labelledby="{{ rid }}-what">
+    <h3 class="g2-reset__heading" id="{{ rid }}-what">What happens</h3>
+    <ul class="dialog__consequences">
+      <li>{{ preview.summary }}</li>
+      {% for note in preview.notes or [] %}<li>{{ caller_text(note, 400) }}</li>{% endfor %}
+      <li>{{ reset.after }}</li>
+      <li>The reset is written to the audit log with your reason.</li>
+    </ul>
+    {% if tables %}
+    <div class="table-scroll" role="region" aria-labelledby="{{ rid }}-rows" tabindex="0">
+      <table class="simple-table g2-reset__rows">
+        <caption id="{{ rid }}-rows" class="sr-only">Rows this reset deletes or clears, per table</caption>
+        <thead><tr><th scope="col">Table</th><th scope="col">What</th><th scope="col" class="num">Rows</th></tr></thead>
+        <tbody>
+          {% for table in tables %}
+          <tr>
+            <th scope="row" class="mono">{{ table.db }}.{{ table.table }}</th>
+            <td>{{ "deleted" if table.action == "delete" else "cleared (counts kept)" }}</td>
+            <td class="num">{{ num(table.rows) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+    {% if preview.snapshots %}
+    <ul class="g2-reset__snapshots">
+      {% for snap in preview.snapshots %}
+      <li>{% if snap.feasible %}{{ icon("check-circle") }}<span>A copy of {{ snap.db }}.db is taken first, so this can be undone from Data &gt; Backups.</span>{% else %}{{ icon("alert-triangle") }}<span>No copy of {{ snap.db }}.db can be taken first: {{ snap.reason }} The reset cannot be undone.</span>{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+  <form class="stack g2-reset__form" data-api-form data-api-url="{{ api_url }}" data-api-method="POST"
+        data-success="Reset done or started. The page reloads with the new numbers." data-on-success="reload"
+        x-data="typeConfirm" data-expected="{{ phrase }}" novalidate>
+    <input type="hidden" name="scope" value="{{ scope }}" data-json="string">
+    {% if families %}<input type="hidden" name="families" value="{{ families|join('\n') }}" data-json="list">{% endif %}
+    {% if template %}<input type="hidden" name="template" value="{{ template }}" data-json="string">{% endif %}
+    <input type="hidden" name="preview" value="{{ preview.preview }}" data-json="string">
+    <div class="field">
+      <label class="field__label" for="{{ rid }}-reason">Reason{% if not phrase %} <span class="muted">(optional, saved in the audit log)</span>{% else %} <span class="muted">(saved in the audit log)</span>{% endif %}</label>
+      <textarea class="input" id="{{ rid }}-reason" name="reason" rows="2" maxlength="500" data-json="string"{% if phrase %} required aria-required="true"{% endif %} aria-describedby="{{ rid }}-reason-error"></textarea>
+      <p class="field__error" id="{{ rid }}-reason-error" data-field-error="reason" hidden></p>
+    </div>
+    {% if phrase %}
+    <div class="field">
+      <label class="field__label" for="{{ rid }}-confirm">Type <strong class="mono">{{ phrase }}</strong> to confirm</label>
+      <input class="input mono" id="{{ rid }}-confirm" name="confirm" autocomplete="off" spellcheck="false" autocapitalize="off"
+             x-on:input="onType" data-json="string" aria-describedby="{{ rid }}-confirm-hint {{ rid }}-confirm-error">
+      <p class="field__hint" id="{{ rid }}-confirm-hint">This deletes recorded numbers, so the button stays off until the text matches.</p>
+      <p class="field__error" id="{{ rid }}-confirm-error" data-field-error="confirm" hidden></p>
+    </div>
+    {% endif %}
+    <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    <div class="cluster">
+      <button type="submit" class="btn btn--danger" x-bind:disabled="blocked" data-action="reset-{{ reset.key }}">{{ icon("reset") }}<span>{{ reset.title }}</span></button>
+      <button type="button" class="btn btn--ghost" data-dialog-close>Cancel</button>
+    </div>
+  </form>
+  {% endif %}
+</div>

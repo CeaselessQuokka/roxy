@@ -1,0 +1,72 @@
+{#-
+  Page card: the frame every dashboard page card renders in, with its inline settings (plan 14.1, 15.6).
+
+  What
+    `{% call page_card(frame) %} ... {% endcall %}` renders one card of a page: a <section> whose id is the card
+    anchor of DESIGN.md section 9 (`cache#settings` is `<section id="settings">` on /admin/cache), its title and
+    help from the page registry, optional actions and notices, the body from the caller, and the catalog settings
+    the `pages` field places on this card (`settings_block`). `frame` comes from `roxy.admin.pages.kit.card_frame`:
+    {id, title, help, page_id, anchor, fragment_url, settings, settings_open, refresh_on, refresh_min_s, lazy}.
+    `inline_setting(entry)` renders one inline setting control (API mode) from `roxy.admin.pages.inline`.
+  Why
+    The first paint and every HTMX refresh of a card render this same frame from the same template, so they can
+    never drift; `data-card-src` is the card's fragment URL (static/js/cards.js refreshes it after an action or
+    on a stream event named in `data-refresh-on`). Placing settings from the catalog here, never from a list in a
+    page template, is plan P3: one source of truth for where a setting lives.
+  How
+    The card is a landmark-like <section> named by its <h2>. Notices (plan 6.8 partial data, a fallback after a bad
+    link) are role="note" lines under the title. The settings list is a <details> (open on cards that exist to hold
+    settings); each control saves through PUT /admin/api/v1/settings/{key} (static/js/settings_api.js).
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import help_dot %}
+{% from "components/setting.html" import setting_control %}
+
+{% macro inline_setting(entry, saved=False) -%}
+{{ setting_control(entry.spec, entry.value, meta=entry.meta, history_url=entry.history_url, prefix=entry.prefix,
+                   api_url=entry.api_url, fragment_url=entry.fragment_url, needs_fresh_mfa=entry.needs_fresh_mfa,
+                   always_risky=entry.always_risky, saved=saved) }}
+{%- endmacro %}
+
+{% macro settings_block(frame) -%}
+<details class="card-settings" id="{{ frame.id }}-settings"{% if frame.settings_open %} open{% endif %}>
+  <summary class="card-settings__summary">{{ icon("sliders") }}<span>Settings for this card</span><span class="count-badge" aria-hidden="true">{{ frame.settings|length }}</span><span class="sr-only">({{ frame.settings|length }} settings)</span>{{ icon("chevron-down", cls="card-settings__chevron") }}</summary>
+  <div class="card-settings__list">
+    {% for entry in frame.settings %}{{ inline_setting(entry) }}{% endfor %}
+  </div>
+</details>
+{%- endmacro %}
+
+{% macro page_card(frame, actions=None, flush=False, notices=(), cls="", subtitle=None, error=None) -%}
+<section class="card page-card{% if cls %} {{ cls }}{% endif %}" id="{{ frame.id }}" data-card="{{ frame.id }}" data-card-src="{{ frame.fragment_url }}"
+         {%- if frame.refresh_on %} data-refresh-on="{{ frame.refresh_on }}" data-refresh-min-s="{{ frame.refresh_min_s }}"{% endif %}
+         {%- if error %} data-card-error{% endif %} aria-labelledby="{{ frame.id }}-title">
+  <header class="card__head">
+    <div class="card__titles">
+      <h2 class="card__title" id="{{ frame.id }}-title">{{ frame.title }}</h2>
+      {% if frame.help %}{{ help_dot(frame.title, frame.help) }}{% endif %}
+      {% if subtitle %}<p class="card__sub">{{ subtitle }}</p>{% endif %}
+    </div>
+    {% if actions %}<div class="card__actions">{{ actions }}</div>{% endif %}
+  </header>
+  {% for note in notices if note %}<p class="card__notice" role="note">{{ icon("info") }}<span>{{ note }}</span></p>{% endfor %}
+  <div class="card__body{% if flush %} card__body--flush{% endif %}">
+    {{ caller() if caller is defined else "" }}
+  </div>
+  {% if frame.settings %}{{ settings_block(frame) }}{% endif %}
+</section>
+{%- endmacro %}
+
+{% macro lazy_card(frame) -%}
+<section class="card page-card page-card--lazy" id="{{ frame.id }}" data-card="{{ frame.id }}" data-card-src="{{ frame.fragment_url }}"
+         aria-labelledby="{{ frame.id }}-title" aria-busy="true"
+         hx-get="{{ frame.fragment_url }}" hx-trigger="revealed" hx-swap="outerHTML">
+  <header class="card__head">
+    <div class="card__titles">
+      <h2 class="card__title" id="{{ frame.id }}-title">{{ frame.title }}</h2>
+      {% if frame.help %}{{ help_dot(frame.title, frame.help) }}{% endif %}
+    </div>
+  </header>
+  <div class="card__body"><p class="muted page-card__loading"><span class="spinner" aria-hidden="true"></span> Loading {{ frame.title|lower }}</p></div>
+</section>
+{%- endmacro %}

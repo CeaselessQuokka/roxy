@@ -1,0 +1,66 @@
+{#-
+  Cache page, card `stats` (`roxy/admin/pages/cache.py stats_card`): v1's Response Cache tiles and chips.
+
+  The tiles are the `GET /admin/api/v1/cache/stats` tiles (`cache.stats_answer`, the API's own function): hit ratio
+  and avoided calls with their comparison (a tile whose data a reset touched shows its notice instead of a delta,
+  plan 6.8), then v1's short windows (5 minutes, an hour, a day), the stored answers against their budgets with
+  the evictions of the range, this worker's memory tier, and the shared store's health (v1 `cacheDiskWarning`).
+  "Clear stats" resets the `cache_stats` family through the data API (v1 `Clear stats`).
+  Context: `frame`, `tiles`, `displays`, `settings`, `size`, `evictions`, `memory`, `disk`, `disk_problem`, `served`,
+  `recent`, `notices`, `ttl_words`, `reset`, `states`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/kpi.html" import kpi_api %}
+{% from "components/format.html" import num, bytes, pct, duration %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/icon.html" import icon %}
+{% from "admin/pages/cache/_shared.html" import reset_dialog %}
+{% set actions %}<button type="button" class="btn btn--sm btn--ghost" data-dialog-open="{{ reset.id }}" data-action="cache-clear-stats">{{ icon("reset") }}<span>Clear stats</span></button>{% endset %}
+{% call page_card(frame, actions=actions, notices=notices) %}
+<p class="cluster cache-chips">
+  {% if settings.enabled %}{{ status_badge("ok", "Caching on, answers kept " ~ ttl_words ~ " by default") }}{% else %}{{ status_badge("bad", "Caching off") }}{% endif %}
+  {% if served is not none %}{{ badge(num(served) ~ (" request Roblox never saw" if served == 1 else " requests Roblox never saw"), "accent", "check") }}{% endif %}
+</p>
+{% if disk_problem %}
+{% set why = "Roxy cannot write to its cache directory." if disk.Writable is sameas false else "Writing to the shared cache store is failing." %}
+{{ inline_alert("bad", "The shared cache store is not working.", why ~ " Saved answers are kept in each worker's memory instead, so they are not shared between workers and are lost on restart; that is why the hit ratio is lower than it should be and the browser below looks incomplete. Fix the directory's permissions (System > Environment), or turn off the shared disk copy in the settings to run memory only on purpose.") }}
+{% if disk.Error %}<p class="mono cache-disk-error">{{ disk.Error }}</p>{% endif %}
+{% endif %}
+<div class="kpi-grid">
+  {% for tile in tiles %}{{ kpi_api(tile, display=displays.get(tile.key)) }}{% endfor %}
+</div>
+<div class="grid grid--3 cache-facts">
+  <section class="cache-fact" aria-labelledby="stats-recent-title">
+    <h3 class="cache-fact__title" id="stats-recent-title">Hit ratio right now</h3>
+    <dl class="kv">
+      {% for row in recent %}
+      <dt>{{ row.label }}</dt>
+      <dd>{% if row.hit_ratio is none %}<span class="muted">no lookups</span>{% else %}<strong>{{ pct(row.hit_ratio) }}</strong>{% endif %}<span class="cache-fact__sub">{{ num(row.served_cache) }} served here, {{ num(row.cache_miss) }} went to Roblox</span></dd>
+      {% endfor %}
+    </dl>
+    <p class="muted cache-fact__hint">The short windows tell you whether a change you just made is working; the range above moves too slowly for that.</p>
+  </section>
+  <section class="cache-fact" aria-labelledby="stats-size-title">
+    <h3 class="cache-fact__title" id="stats-size-title">Stored answers (shared)</h3>
+    <dl class="kv">
+      <dt>Answers</dt><dd>{% if size.rows is none %}<span class="muted">the shared store is off</span>{% else %}{{ num(size.rows) }} of {{ num(size.max_entries) }}{% endif %}</dd>
+      <dt>Size</dt><dd>{% if size.bytes is none %}<span class="muted">n/a</span>{% else %}{{ bytes(size.bytes) }} of {{ bytes(size.max_bytes) }}{% endif %}</dd>
+      <dt>Evicted in range</dt><dd>{{ num(evictions.range.evictions) }}{% if evictions.range.young_evictions %} <span class="muted">({{ num(evictions.range.young_evictions) }} before their lifetime ran out)</span>{% endif %}</dd>
+      <dt>Mean age when evicted</dt><dd>{% if evictions.range.mean_eviction_age_s is none %}<span class="muted">nothing evicted</span>{% else %}{{ duration(evictions.range.mean_eviction_age_s) }}{% endif %}</dd>
+      <dt>Stored in range</dt><dd>{{ num(evictions.range.stores) }}</dd>
+    </dl>
+    <p class="muted cache-fact__hint">Evicted answers were thrown out early to stay inside the budgets. If evictions climb steadily, the cache is too small for the traffic.</p>
+  </section>
+  <section class="cache-fact" aria-labelledby="stats-memory-title">
+    <h3 class="cache-fact__title" id="stats-memory-title">Memory tier {{ badge("this worker", "neutral") }}</h3>
+    <dl class="kv">
+      <dt>Answers</dt><dd>{{ num(memory.Count) }} of {{ num(memory.MaxEntries) }}</dd>
+      <dt>Size</dt><dd>{{ bytes(memory.Bytes) }} of {{ bytes(memory.MaxBytes) }}</dd>
+      <dt>Evicted</dt><dd>{{ num(memory.Evictions) }} <span class="muted">since this worker started</span></dd>
+    </dl>
+    <p class="muted cache-fact__hint">Each worker keeps its own memory copies for instant answers, so the real memory cost is this times the number of workers. That is why the memory limits are small.</p>
+  </section>
+</div>
+{{ reset_dialog(reset, refresh="stats ratios endpoints") }}
+{% endcall %}

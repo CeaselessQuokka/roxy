@@ -1,0 +1,35 @@
+{#-
+  Egress page, card `exit-ips` (`roxy/admin/pages/egress.py exit_ips_card`): v1's Rotation Exit IPs (plan 14.1 row
+  36, parity row 32).
+
+  This worker's recent exit addresses, newest first, masked to the /24 (IPv6 /48) network (row 32 privacy), with
+  where each came from and when. "Verify rotation now" asks the IP echo service through the rotator
+  (`POST /admin/api/v1/egress/rotator/probe`) and says the answer in a toast, then refreshes this card
+  (static/js/pages/egress.js). "Show full addresses" asks `GET /admin/api/v1/egress/exit-ips?reveal=true`, which
+  writes an audit row first (no audit row, no reveal), and fills the table with the full addresses (text only).
+  Context: `frame`, `items`, `note`, `configured`, `probe_url`, `reveal_url` (or `deferred`).
+-#}
+{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
+{% from "components/page_card.html" import page_card %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/icon.html" import icon %}
+{% from "admin/pages/upstream/_macros.html" import when %}
+{% set actions %}<button type="button" class="btn btn--sm" data-action="rotator-verify" data-probe-url="{{ probe_url }}"{% if not configured %} disabled{% endif %}>{{ icon("refresh") }}<span>Verify rotation now</span></button>{% endset %}
+{% call page_card(frame, actions=actions, subtitle=items|length ~ " seen by this worker") %}
+<p class="muted g3-note">{{ note }} Masked to the network unless revealed.</p>
+{% if items %}
+<div class="table-scroll g3-scroll" role="region" aria-labelledby="exit-caption" tabindex="0">
+  <table class="simple-table g3-table" data-exit-ips>
+    <caption id="exit-caption" class="sr-only">Recent rotator exit addresses</caption>
+    <thead><tr><th scope="col">Exit address</th><th scope="col">From</th><th scope="col">When</th></tr></thead>
+    <tbody>
+      {% for item in items %}<tr><td class="mono" data-exit-ip>{{ item.ip }}</td><td>{{ item.source }}</td><td>{{ when(item.when) }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="cluster g3-reveal"><button type="button" class="btn btn--sm btn--ghost" data-action="exit-ips-reveal" data-reveal-url="{{ reveal_url }}">{{ icon("eye") }}<span>Show full addresses</span></button><span class="muted">Written to the audit log.</span></p>
+{% else %}
+{{ empty_state("No exit addresses recorded yet", ("Press Verify rotation now: Roxy asks the IP echo service through the rotator and lists the address it saw." if configured else "No rotator URL is set, so there is nothing to verify. Set one on the Rotator card."), "globe") }}
+{% endif %}
+{% endcall %}
+{% endif %}

@@ -361,19 +361,20 @@ The page caches add up to at most 30 MiB per worker, and only fill as pages are 
 libraries, the HTTP connection pools and the recorder's counters are the remaining part; they have not been
 measured on the server yet. Each worker reports its resident memory in its heartbeat every 5 s (the `rss` field of
 `worker_heartbeat`, shown on the System page through `GET /admin/api/v1/system/workers`), so the real figure is
-visible from the first day. The load harness measured a development machine, not the production box: an idle color
-stays below `MemoryHigh`, a color under sustained load passes it, and the leader worker kept growing over a long
-replay (finding LOAD-2). `docs/PERFORMANCE.md` has the figures and the quiet-machine commands to measure again before
-release.
+visible from the first day. The load harness measured a development machine, not the production box: the leader
+worker kept growing over a long replay (finding LOAD-2) because each recommendations evaluation read a day of request
+samples as dicts; reads are now compact and bounded, the units tune glibc's allocator, and a color measured 332 MiB
+of PSS after a 35 minute soak. `docs/PERFORMANCE.md` has the figures and the quiet-machine commands to measure again
+before release.
 
 ### What one color may hold
 
 systemd caps each color (`deploy/systemd/roxy@.service`):
 
-- `MemoryHigh=320M`: above this the kernel reclaims the color's memory aggressively and slows it down.
-- `MemoryMax=420M`: the hard limit; above it the color's processes are killed and systemd restarts the color.
+- `MemoryHigh=350M`: above this the kernel reclaims the color's memory aggressively and slows it down.
+- `MemoryMax=450M`: the hard limit; above it the color's processes are killed and systemd restarts the color.
 
-During a deploy both colors run for a few minutes. Two colors at `MemoryHigh` (640 MB) plus nginx and the
+During a deploy both colors run for a few minutes. Two colors at `MemoryHigh` (700 MB) plus nginx and the
 operating system (about 200 MB) fit the 909 MB; `tests/deploy/test_deploy_units.py::test_memory_numbers_fit_the_909_mb_server`
 checks that arithmetic. When less than 700 MB is available before the restart, `deploy/deploy.sh` switches to
 low-memory mode: the idle color starts with one worker and grows to `ROXY_WORKERS` after the old color stopped,
