@@ -125,9 +125,11 @@ from roxy.core.client_ip import limit_key, normalize_ip
 from roxy.core.iphash import ip_hash
 from roxy.core.reasons import Egress
 from roxy.deps import get_ctx
+from roxy.metrics import rollups
 from roxy.metrics.activity import ip_key, place_key
 from roxy.metrics.annotate import delete_annotation, insert_annotation, update_annotation
 from roxy.metrics.histograms import register_sql_functions
+from roxy.metrics.jobs import compaction_config
 from roxy.metrics.recorder import (
     CACHE_LOOKUP_STATES,
     CLEARED_CACHE_STATE,
@@ -348,7 +350,7 @@ FAMILIES: Final[dict[str, Family]] = {
         Family(
             "upstream",
             "Upstream",
-            "upstream#calls",
+            "upstream#health",
             (
                 Part("metrics", "upstream_429", "rowid", time_col="at_ms", unit="ms"),
                 Part("metrics", "upstream_attempt_minute", ATTEMPT_KEY, time_col="bucket_start"),
@@ -394,7 +396,7 @@ FAMILIES: Final[dict[str, Family]] = {
         Family(
             "throttled_clients",
             "Throttled clients",
-            "protection#throttle-history",
+            "protection#throttle",
             (_events("throttled"),),
             parent="throttle",
             note="The clients that became throttled (v1 throttled); rung and rule hit counts stay.",
@@ -454,7 +456,7 @@ FAMILIES: Final[dict[str, Family]] = {
         Family(
             "header_rule_attempts",
             "Request filter attempts",
-            "protection#header-rules",
+            "protection#request-filters",
             (_refusals("header_rule"),),
             parent="refusals",
             note="Only refusals by a request filter (v1 header_blocked_attempts); they also leave the Refusals card.",
@@ -576,12 +578,12 @@ V1_CLEAR_TARGETS: Final[dict[str, dict[str, Any]]] = {
     "pause_drops": {
         "scope": None,
         "families": [],
-        "note": "Nothing to reset: the pause banner counts from the moment the pause began (parity row 114).",
+        "note": "Nothing to reset: the pause banner counts from the moment the pause began.",
     },
     "throttle_drops": {
         "scope": None,
         "families": [],
-        "note": "Nothing to reset: enabling throttle-all starts a new count by itself (parity row 115).",
+        "note": "Nothing to reset: enabling throttle-all starts a new count by itself.",
     },
     "tarpit": {"scope": "family", "families": ["tarpit"]},
     "cache": {
@@ -1570,6 +1572,60 @@ async def _run_part(ctx: Any, op: Operation, lease: ResetLease, part: Part, wind
         await asyncio.sleep(BATCH_PAUSE_S)  # let the request path have the write lock between batches
 
 
+def source_floors(get: Callable[[str], Any], now: int) -> rollups.SourceFloors:
+    """How far back each rollup level still holds whole buckets (the retention settings, read live): the same floors
+    the compaction respects (`metrics/rollups.py compact_all`'s `not_before`), so a rebuild never recomputes a bucket
+    from a level retention already thinned."""
+
+    def floor(key: str, margin: int) -> int | None:
+        days = int(get(key) or 0)
+        return None if days <= 0 else now - days * 86_400 + margin
+
+    return rollups.SourceFloors(
+        minute=floor("retention_minute_days", rollups.HOUR_S),
+        hour=floor("retention_hour_days", rollups.DAY_S),
+        day=floor("retention_day_days", 32 * rollups.DAY_S),
+        client_minute=floor("retention_client_minute_days", rollups.HOUR_S),
+        client_hour=floor("retention_client_hour_days", rollups.DAY_S),
+    )
+
+
+async def rebuild_partial_buckets(ctx: Any, plan: ResetPlan) -> list[dict[str, Any]]:
+    """After a ranged reset: recompute the coarse buckets the range covers only in part (`rollups.
+    rebuild_partial_buckets`), for each chain of tables the plan changed, so every granularity shows the reset the
+    same way (a total over a day read from `rollup_day` equals the sum of its minutes). One metrics.db transaction
+    per chain; returns `[{table, bucket}]`."""
+    if plan.range is None:
+        return []
+    touched = {part.table for part in plan.parts if part.db == "metrics"}
+    chains = [name for name, tables in rollups.REBUILD_TABLES.items() if tables & touched]
+    if not chains:
+        return []
+    get = ctx.settings.get
+    now = int(ctx.clock.now())
+    config = compaction_config(get)
+    floors = source_floors(get, now)
+    start, end = plan.range
+    out: list[dict[str, Any]] = []
+    for chain in chains:
+
+        def run(conn: sqlite3.Connection, chain: str = chain) -> list[tuple[str, int]]:
+            return rollups.rebuild_partial_buckets(
+                conn,
+                chain,
+                int(start),
+                int(end),
+                tz_name=config.tz_name,
+                closed_until=now - config.grace_s,
+                floors=floors,
+                caps=config.caps,
+            )
+
+        done: list[tuple[str, int]] = await ctx.dbs.metrics.write(run)
+        out.extend({"table": table, "bucket": bucket} for table, bucket in done)
+    return out
+
+
 def _control_reset(
     conn: sqlite3.Connection,
     plan: ResetPlan,
@@ -1739,6 +1795,7 @@ async def execute_reset(
     target = f"operation:{op.id}"
     started = time.perf_counter()
     deleted: dict[str, int] = {}
+    rebuilt: list[dict[str, Any]] = []
     snapshots: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     fence: dict[str, Any] | None = None
@@ -1797,6 +1854,9 @@ async def execute_reset(
             label = f"{part.db}.{part.table}"
             deleted[label] = deleted.get(label, 0) + rows
             await lease.keep()
+        if plan.range is not None:
+            op.step = "rebuild"
+            rebuilt = await rebuild_partial_buckets(ctx, plan)
         if plan.memory:
             op.step = "memory"
             await request_memory_reset(ctx, plan.memory)
@@ -1840,6 +1900,7 @@ async def execute_reset(
         "snapshots": snapshots,
         "snapshots_skipped": skipped,
         "range": None if plan.range is None else {"from": plan.range[0], "to": plan.range[1]},
+        "rebuilt": rebuilt,
         "duration_ms": duration_ms,
         "intent_audit_id": op.audit_id,
         "fence": fence,

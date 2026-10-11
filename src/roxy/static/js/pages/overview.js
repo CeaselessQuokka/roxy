@@ -21,7 +21,7 @@
  *   static/js/pages/health.js (the same start flow on the Health page), roxy/admin/api/health.py.
  */
 
-import { confirmIdentity, onContent, request, toast } from "roxy/page";
+import { confirmIdentity, request, toast } from "roxy/page";
 
 const RUN_ID = /^[0-9]{1,15}$/;
 const MAX_ERROR_TEXT = 4096;
@@ -78,23 +78,6 @@ async function startRun(form) {
     tone: "bad",
   });
 }
-
-// The events table's answer is its whole card (the kit renders one template per card): keep only the table out of
-// it, and let the card's refresh address follow the table's state, so a stream refresh keeps the admin's search.
-document.addEventListener("htmx:beforeSwap", (event) => {
-  const target = event.detail && event.detail.target;
-  if (!(target instanceof Element) || !target.matches("[data-dt]") || !target.id) return;
-  if (!event.detail.selectOverride && target.closest("[data-card]")) event.detail.selectOverride = `#${CSS.escape(target.id)}`;
-});
-
-onContent("[data-dt]", (table) => {
-  const card = table.closest("[data-card]");
-  const form = table.querySelector("[data-dt-state]");
-  if (!card || !form || !table.dataset.dtSrc) return;
-  const params = new URLSearchParams();
-  for (const [name, value] of new FormData(form)) if (typeof value === "string" && value !== "") params.append(name, value);
-  card.dataset.cardSrc = `${table.dataset.dtSrc}?${params.toString()}`;
-});
 
 document.addEventListener("submit", async (event) => {
   const form = event.target;

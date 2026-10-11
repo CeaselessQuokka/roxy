@@ -484,11 +484,16 @@ async def latency_answer(ctx: Any, tr: TimeRange, split: str) -> dict[str, Any]:
         choices = ", ".join(("none", *SPLITS))
         raise validation_error({"split": f"Choose one of: {choices}."}, "The split is not valid.")
     answer["split"] = split
-    answer["notices"].append(
-        "Latency is the time Roxy took to answer, Roblox's time included; it is measured per caller request, so "
-        "Roxy's own probes are not part of it."
-    )
+    answer["notices"].append(LATENCY_NOTE)
     return answer
+
+
+LATENCY_NOTE: Final = (
+    "Latency is the time Roxy took to answer, Roblox's time included; it is measured per caller request, so "
+    "Roxy's own probes are not part of it."
+)
+"""What every latency answer says about its numbers (the last of its `notices`; the Traffic page shows it as the
+latency card's note, so the chart's notices list only resets)."""
 
 
 @router.get("/latency/split")
@@ -517,9 +522,10 @@ async def _trend_period(ctx: Any, key: str, label: str, range_key: str) -> dict[
     spark_window = read_dashboard.sparkline_window(current)
 
     def read(conn: sqlite3.Connection) -> dict[str, Any]:
+        # Only the trend metrics are summed (the rows show nothing else; plan 6.7, a year of day rows per period).
         return {
-            "now": queries.totals_sync(conn, current),
-            "before": queries.totals_sync(conn, previous),
+            "now": queries.totals_sync(conn, current, metrics=TREND_METRICS),
+            "before": queries.totals_sync(conn, previous, metrics=TREND_METRICS),
             "spark": queries.series_sync(conn, spark_window, metrics=list(TREND_METRICS)),
             "resets": queries.reset_annotations(conn, current.start, current.end),
             "baseline_resets": queries.reset_annotations(conn, previous.start, previous.end),
@@ -579,6 +585,7 @@ async def trends_answer(ctx: Any) -> dict[str, Any]:
 __all__ = [
     "BYTE_METRICS",
     "HEATMAP_METRICS",
+    "LATENCY_NOTE",
     "SOURCES_SPEC",
     "SOURCE_LABELS",
     "SPLITS",

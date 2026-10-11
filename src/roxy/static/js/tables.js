@@ -16,8 +16,11 @@
  *
  * How it works
  *   Delegated listeners on document handle every table, including tables htmx swaps in later; `initTables(root)`
- *   re-applies hidden columns after each swap (and, for the page's main table, `data-dt-address`, puts its state
- *   in the address bar). A row with `data-drawer-src` opens that fragment in the drawer; a
+ *   re-applies hidden columns after each swap, keeps the refresh address of the card holding the table on the
+ *   table's state (`followCard`), and, for the page's main table (`data-dt-address`), puts its state in the address
+ *   bar. A table's answer may be its whole card: the state form's `hx-select` keeps only the table (and
+ *   `submit()` sends the form as the source, so htmx.ajax reads the same attribute). A row with `data-drawer-src`
+ *   opens that fragment in the drawer; a
  *   row without one opens a definition list built from its cells (this is also how phones see the columns their
  *   card layout hides, plan 14.8).
  *
@@ -85,10 +88,33 @@ function syncAddress(table) {
   if (url.href !== window.location.href) window.history.replaceState(window.history.state, "", url.href);
 }
 
+/**
+ * A card that holds one table is drawn again from its `data-card-src` after an action or a stream event
+ * (static/js/cards.js). Keep that address on the view the table shows (search, filters, sort, rows per page) so a
+ * refresh never throws the admin's search away; the page number starts again at 1 (new rows move the pages). A
+ * card with two tables (tabs) shares one address between them, so it is left as the server drew it.
+ */
+function followCard(table) {
+  const card = table.closest("[data-card]");
+  const form = qs("[data-dt-state]", table);
+  if (!card || !form || !card.dataset.cardSrc || !table.dataset.dtSrc) return;
+  if (qsa("[data-dt]", card).length !== 1) return;
+  const url = new URL(card.dataset.cardSrc, window.location.origin);
+  const own = new URL(table.dataset.dtSrc, window.location.origin);
+  if (url.origin !== window.location.origin || url.pathname !== own.pathname) return;
+  for (const [name, value] of new FormData(form)) {
+    if (name === "page" || typeof value !== "string") continue;
+    if (value === "") url.searchParams.delete(name);
+    else url.searchParams.set(name, value);
+  }
+  card.dataset.cardSrc = `${url.pathname}${url.search}`;
+}
+
 export function initTables(root = document) {
   const tables = root instanceof Element && root.matches("[data-dt]") ? [root] : qsa("[data-dt]", root);
   for (const table of tables) {
     applyColumns(table);
+    followCard(table);
     if (root !== document) syncAddress(table);
     // A remembered page size different from the rendered one: ask once for the preferred size.
     const id = table.dataset.dtId;

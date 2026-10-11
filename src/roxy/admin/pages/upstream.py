@@ -29,8 +29,9 @@ Why it exists
 
 How it works
     `page = Page("upstream")`; each `@page.card` returns the context of `templates/admin/pages/upstream/<card>.html`.
-    Cards heavy with settings or tables are lazy (they load when scrolled into view) to keep the first paint small
-    on the 1 GB server. Three small page routes serve partials: `/admin/upstream/bucket?key=` (a bucket's drawer),
+    Cards heavy with settings or tables are lazy (the kit's placeholders, loaded one at a time right after the page
+    by `static/js/cards.js`, or at once when scrolled into view) to keep the first paint small on the 1 GB server.
+    Three small page routes serve partials: `/admin/upstream/bucket?key=` (a bucket's drawer),
     `/admin/upstream/routing-rule?id=` (a routing rule's drawer) and `/admin/upstream/routing-test?target=` (the
     tester's answer). Text a caller chose (paths, endpoint templates, errors quoting them) is rendered with
     `format.html caller_text`; a bucket key in a form URL is one percent-encoded path segment (`quoted_key`).
@@ -55,19 +56,19 @@ from roxy.admin.api import upstream as upstream_api
 from roxy.admin.api import upstream_limits as limits_api
 from roxy.admin.pages import shell
 from roxy.admin.pages._upstream_common import (
-    DEFERRED,
     EGRESS_ABOUT,
     EGRESS_LABELS,
-    deferred,
     egress_state,
     fill_tone,
     gauge,
     ms_text,
     pct_text,
     per_min_text,
+    plural,
     precision_words,
     quoted_key,
     render_partial,
+    sentence,
 )
 from roxy.admin.pages.kit import Page, PageAdmin, PageView, filter_chip, table_query, table_view
 from roxy.metrics import queries
@@ -121,10 +122,16 @@ SOURCE_WORDS: Final[dict[str, str]] = {
 }
 """Why a cooldown lasts as long as it does (`upstream/cooldowns.py CooldownSource`)."""
 CUT_FROM_WORDS: Final[dict[str, str]] = {
-    "observed": "cut from the calls Roblox refused",
+    "observed": "cut from the rate Roxy really sent at",
     "limit": "cut from the configured rate",
 }
 """What an adaptive decrease started from (`upstream/adaptive.py` evidence `cut_from`)."""
+BREAKER_WORDS: Final[dict[str, tuple[str, str, str]]] = {
+    "open": ("bad", "Open", "no calls until the test call"),
+    "half_open": ("warn", "Half-open", "one test call decides"),
+    "closed": ("neutral", "Counting", "calls flow; failures are counted"),
+}
+"""`(tone, badge word, detail)` of a breaker state (plan 7.10); the badge stays short so it never wraps."""
 MAX_TRACE_ID_CHARS: Final = 64
 QUEUE_PRIORITIES: Final[tuple[tuple[int, str, str], ...]] = (
     (0, "A caller's request with no cached copy to fall back on", "queue_wait_interactive_ms"),
@@ -196,6 +203,7 @@ def _egress_card(view: PageView, item: Mapping[str, Any]) -> dict[str, Any]:
         "rate_failed": pct_text(item.get("rate_failed_pct")),
         "latency": " / ".join(ms_text(item.get(key)) for key in ("p50_ms", "p95_ms", "p99_ms")),
         "queue_p95": ms_text(item.get("queue_wait_p95_ms")),
+        "paused": f"{plural(item.get('cooldowns'), 'cooldown')}, {plural(item.get('breakers_open'), 'open breaker')}",
         "gauge": gauge(f"{label} bucket fill", bucket.get("fill_pct"), detail=detail, key=f"egress:{name}"),
         "last_success": view.time_cell(item.get("last_success_at")),
         "last_success_precision": precision_words(item.get("last_success_precision")),
@@ -218,34 +226,38 @@ async def health_card(view: PageView) -> dict[str, Any]:
 # ============================================================================================ charts
 
 
+TIMELINE_TOP: Final = 10
+"""Endpoints the 429 timeline draws one series each for (the rest are summed into `other`)."""
+
+
 @page.card("429-timeline")
 async def timeline_card(view: PageView) -> dict[str, Any]:
-    """Roblox 429s per endpoint over the range (`timeline_429_answer`), embedded for the first paint."""
-    answer = await upstream_api.timeline_429_answer(view.ctx, view.tr, top=10)
+    """Roblox 429s per endpoint over the range (`timeline_429_answer`): the total and the endpoint table are rendered
+    on the server; the chart reads the same API answer by URL after the first paint (`chart_src`). Embedded, the
+    series was most of the page at plan 6.6's volume (270 KiB of 395, sent uncompressed because of BREACH)."""
+    answer = await upstream_api.timeline_429_answer(view.ctx, view.tr, top=TIMELINE_TOP)
     totals = answer.get("totals") or {}
     counts = totals.get("by_endpoint") or {}
     by_endpoint = [{"template": template, "count": count} for template, count in counts.items()]
     spec = METRICS.get("roblox_429")
     return {
-        "series": answer,
+        "chart_src": view.api_url("upstream/429-timeline", top=TIMELINE_TOP),
         "total": int(totals.get("total") or 0),
         "by_endpoint": by_endpoint,
         "help": spec.description if spec else "",
     }
 
 
-@page.card("latency")
+@page.card("latency", lazy=True)
 async def latency_card(view: PageView) -> dict[str, Any]:
     """p50, p95 and p99 latency and the p95 queue wait of requests that went to Roblox (`latency_answer`)."""
-    if deferred(view):
-        return DEFERRED
     answer = await upstream_api.latency_answer(view.ctx, view.tr)
     spec = METRICS.get("p95_ms")
     queue = METRICS.get("queue_wait_p95_ms")
     return {
         "series": answer,
         "help": " ".join(s.description for s in (spec, queue) if s is not None),
-        "basis": str(answer.get("basis") or "").capitalize(),
+        "basis": sentence(answer.get("basis")),
     }
 
 
@@ -323,7 +335,8 @@ def _adaptive_changes(view: PageView, changes: Sequence[Mapping[str, Any]]) -> l
         if isinstance(evidence, Mapping):
             observed = _number(evidence.get("observed_calls"))
             if observed is not None:
-                why.append(f"{observed:,.0f} calls went out in the minute before the 429")
+                went = "call went" if round(observed) == 1 else "calls went"
+                why.append(f"{observed:,.0f} {went} out in the minute before the 429")
             cut_from = CUT_FROM_WORDS.get(str(evidence.get("cut_from") or ""))
             if cut_from:
                 why.append(cut_from)
@@ -341,12 +354,10 @@ def _adaptive_changes(view: PageView, changes: Sequence[Mapping[str, Any]]) -> l
     return out
 
 
-@page.card("buckets")
+@page.card("buckets", lazy=True)
 async def buckets_card(view: PageView) -> dict[str, Any]:
     """Fill gauges, every bucket (`bucket_rows`), the adaptive controller (`adaptive_answer`) and the overrides
     (`upstream_limits.limit_rows`): the API's own functions."""
-    if deferred(view):
-        return DEFERRED
     tq, notice = table_query(view, upstream_api.BUCKETS_SPEC, address=False)
     rows = await upstream_api.bucket_rows(view.ctx, view.tr)
     answer = upstream_api.buckets_answer(rows, tq, view.tr)
@@ -466,23 +477,17 @@ async def bucket_drawer(request: Request, principal: PageAdmin) -> HTMLResponse:
 # ============================================================================================ concurrency, queue
 
 
-@page.card("concurrency")
+@page.card("concurrency", lazy=True)
 async def concurrency_card(view: PageView) -> dict[str, Any]:
     """Adaptive concurrency (AIMD, plan 7.4, Tier 3): its switch and each key's limit and calls in flight."""
-    if deferred(view):
-        return DEFERRED
     answer = await upstream_api.aimd_answer(view.ctx)
-    items = [
-        {**item, "changed": view.time_cell(item.get("last_change_at"))} for item in answer.get("items") or ()
-    ]
+    items = [{**item, "changed": view.time_cell(item.get("last_change_at"))} for item in answer.get("items") or ()]
     return {"aimd": answer, "items": items}
 
 
-@page.card("queue")
+@page.card("queue", lazy=True)
 async def queue_card(view: PageView) -> dict[str, Any]:
     """The five wait classes of plan 7.8 with the live value of the setting that bounds each one."""
-    if deferred(view):
-        return DEFERRED
     settings = view.ctx.settings
     rows = [
         {"priority": priority, "who": who, "key": key, "value": ms_text(settings.get(key))}
@@ -512,11 +517,9 @@ def _countdown(ends_at_ms: Any, now_ms: Any) -> dict[str, Any] | None:
     return {"ends_at_ms": int(ends), "now_ms": int(now), "remaining_s": round(remaining, 1)}
 
 
-@page.card("cooldowns", refresh_on=("cooldown",), refresh_min_s=5)
+@page.card("cooldowns", refresh_on=("cooldown",), refresh_min_s=5, lazy=True)
 async def cooldowns_card(view: PageView) -> dict[str, Any]:
     """Every open cooldown with its source and a countdown (`cooldowns_answer`), and the reset button."""
-    if deferred(view):
-        return DEFERRED
     answer = await upstream_api.cooldowns_answer(view.ctx)
     now_ms = answer.get("now_ms")
     items = [
@@ -540,28 +543,37 @@ async def cooldowns_card(view: PageView) -> dict[str, Any]:
     return {"items": items, "local": local, "local_note": answer.get("local_note")}
 
 
-@page.card("breakers", refresh_on=("breaker",), refresh_min_s=5)
+@page.card("breakers", refresh_on=("breaker",), refresh_min_s=5, lazy=True)
 async def breakers_card(view: PageView) -> dict[str, Any]:
     """Breakers that are open, half-open or counting failures (`breakers_answer`), and the reset button."""
-    if deferred(view):
-        return DEFERRED
     answer = await upstream_api.breakers_answer(view.ctx)
     now_ms = answer.get("now_ms")
     items = []
+    states = {"open": 0, "half_open": 0, "counting": 0}
     for item in answer.get("items") or ():
         state = str(item.get("state") or "")
-        tone = {"open": "bad", "half_open": "warn"}.get(state, "neutral")
-        words = {"open": "Open: no calls", "half_open": "Half-open: one test call"}.get(state, "Counting failures")
+        tone, words, detail = BREAKER_WORDS.get(state, BREAKER_WORDS["closed"])
+        states[state if state in states else "counting"] += 1
         items.append(
             {
                 **item,
                 "tone": tone,
                 "words": words,
+                "detail": detail,
                 "egress_label": EGRESS_LABELS.get(str(item.get("egress") or ""), "Every egress"),
                 "countdown": _countdown(item.get("reopens_at_ms"), now_ms) if item.get("reopens_at_ms") else None,
             }
         )
-    return {"items": items}
+    summary = ", ".join(
+        part
+        for part in (
+            f"{states['open']:,} open" if states["open"] else "",
+            f"{states['half_open']:,} half-open" if states["half_open"] else "",
+            f"{states['counting']:,} counting failures" if states["counting"] else "",
+        )
+        if part
+    )
+    return {"items": items, "summary": summary or "Every breaker is closed"}
 
 
 # ============================================================================================ failures, hosts
@@ -607,7 +619,8 @@ async def failures_card(view: PageView) -> dict[str, Any]:
         notice=notice,
     )
     total = sum(int(row.get("count") or 0) for row in rows)
-    return {"table": table, "total": total, "capped": capped}
+    label = f"through the {EGRESS_LABELS[egress].lower()} egress" if egress else "every egress"
+    return {"table": table, "total": total, "capped": capped, "egress_label": label}
 
 
 def _error_summary(error: Any) -> dict[str, Any] | None:
@@ -641,11 +654,9 @@ def _host_cells(item: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-@page.card("hosts")
+@page.card("hosts", lazy=True)
 async def hosts_card(view: PageView) -> dict[str, Any]:
     """Per Roblox host health (`host_rows`) and the host allowlist (the card's settings)."""
-    if deferred(view):
-        return DEFERRED
     tq, notice = table_query(view, upstream_api.HOSTS_SPEC, address=False)
     rows = await upstream_api.host_rows(view.ctx, view.tr)
     answer = upstream_api.hosts_answer(rows, tq, view.tr)
@@ -698,11 +709,9 @@ def _rule_cells(item: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-@page.card("routing")
+@page.card("routing", lazy=True)
 async def routing_card(view: PageView) -> dict[str, Any]:
     """How an attempt picks its egress (plan 7.2, the live settings) and the routing rules (`rule_rows`)."""
-    if deferred(view):
-        return DEFERRED
     tq, notice = table_query(view, routing_api.SPEC, address=False)
     rows = await routing_api.rule_rows(view.ctx)
     answer = routing_api.rules_answer(rows, tq)
@@ -812,19 +821,14 @@ RETURNED_LABELS: Final[dict[str, str]] = {
 """v1's "Returned Reasons" (row 22, parity row 116): whose words a refused or failed caller got."""
 
 
-@page.card("retries")
+@page.card("retries", lazy=True)
 async def retries_card(view: PageView) -> dict[str, Any]:
     """Retries by status, reason and egress, CSRF retries and attempt kinds (`retries_answer`), plus v1's
-    returned reasons from the refusal reasons read model (`metrics/queries.py refusal_reasons`, row 116)."""
-    if deferred(view):
-        return DEFERRED
+    returned reasons (`metrics/queries.py returned_reasons`: the `message_source` column of `refusal_reasons`
+    summed, row 116, read without the table's other three events scans)."""
     answer = await upstream_api.retries_answer(view.ctx, view.tr)
     window = view.tr.window
-    reasons = await view.ctx.dbs.metrics.read(lambda conn: queries.refusal_reasons(conn, window))
-    returned: dict[str, int] = {}
-    for row in reasons:
-        for source, count in (row.get("message_source") or {}).items():
-            returned[str(source)] = returned.get(str(source), 0) + int(count or 0)
+    returned = await view.ctx.dbs.metrics.read(lambda conn: queries.returned_reasons(conn, window))
     returned_rows = [
         {"source": source, "label": RETURNED_LABELS.get(source, source), "count": count}
         for source, count in sorted(returned.items(), key=lambda pair: -pair[1])
@@ -860,11 +864,9 @@ def _challenge_cells(item: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-@page.card("challenges")
+@page.card("challenges", lazy=True)
 async def challenges_card(view: PageView) -> dict[str, Any]:
     """Answers that were a bot challenge or an HTML page (`challenge_rows`, the API's own function)."""
-    if deferred(view):
-        return DEFERRED
     tq, notice = table_query(view, upstream_api.CHALLENGES_SPEC, address=False)
     rows = await upstream_api.challenge_rows(view.ctx, view.tr)
     flagged = [row for row in rows if int(row.get("challenges") or 0) or int(row.get("html_bodies") or 0)]
@@ -892,11 +894,9 @@ async def challenges_card(view: PageView) -> dict[str, Any]:
     return {"table": table, "flagged": len(flagged)}
 
 
-@page.card("internal-calls")
+@page.card("internal-calls", lazy=True)
 async def internal_calls_card(view: PageView) -> dict[str, Any]:
     """Roxy's own calls (v1 Internal Requests, rows 28 and 29): `internal_calls_answer`, the API's own function."""
-    if deferred(view):
-        return DEFERRED
     answer = await upstream_api.internal_calls_answer(view.ctx, view.tr)
     health = {
         "ok": ("ok", "OK"),

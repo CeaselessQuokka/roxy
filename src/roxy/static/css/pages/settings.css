@@ -16,10 +16,6 @@
  *   templates/admin/pages/settings/editor.html, static/js/pages/settings.js, static/css/components.css (.setting).
  */
 
-.settings-pair {
-  align-items: start;
-}
-
 /* Links inside running text are underlined: color is never the only signal (WCAG 1.4.1). */
 .card__body p a:not(.btn),
 .card__body li a,
@@ -116,6 +112,13 @@
   display: grid;
   gap: var(--sp-1);
   min-width: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+/* The rule under each setting moves from the control to the item, so "Also on" and the notes below a control sit
+   above the line and read as part of that setting, not of the next one. */
+.settings-item .setting {
+  border-bottom-width: 0;
 }
 
 .settings-item:target .setting {
@@ -157,6 +160,48 @@
   min-height: var(--target-min);
 }
 
+/* The one-setting view's own history (`?key=`): one line per change, its button opening the drawer. */
+.settings-key-history {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.settings-key-history__list {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.settings-key-history__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-3);
+  min-width: 0;
+}
+
+.settings-key-history__what {
+  flex: 1 1 18rem;
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.settings-key-history p a {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: var(--target-min);
+}
+
+@media (max-width: 767px) {
+  .settings-key-history__open {
+    min-height: var(--target-touch);
+  }
+}
+
 .settings-pager {
   display: flex;
   flex-wrap: wrap;
@@ -177,6 +222,42 @@
   padding-left: 1.25em;
   font-size: var(--fs-1);
   overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------------------------------------- history table */
+/* Values before and after keep a readable width beside a long reason (a reason may be one unbroken word). */
+#settings-history td[data-col="old"],
+#settings-history td[data-col="new"] {
+  min-width: 9rem;
+  overflow-wrap: anywhere;
+}
+
+#settings-history td[data-col="reason"] {
+  max-width: 24rem;
+  overflow-wrap: anywhere;
+}
+
+/* Phone card rows (components.css, below 641 px): the setting's key goes under its label instead of squeezing
+   beside it. */
+@media (max-width: 640px) {
+  #settings-history td[data-col="key"] {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: var(--sp-3);
+    align-items: baseline;
+  }
+
+  #settings-history td[data-col="key"] .dt__sub {
+    grid-column: 2;
+    overflow-wrap: anywhere;
+  }
+
+  #settings-history td[data-col="old"],
+  #settings-history td[data-col="new"],
+  #settings-history td[data-col="reason"] {
+    min-width: 0;
+    max-width: none;
+  }
 }
 
 /* ---------------------------------------------------------------------------------------------- batch bar */
@@ -219,12 +300,23 @@
   width: min(56rem, calc(100vw - 2 * var(--sp-4)));
 }
 
+.settings-batch__table,
+.settings-import__table {
+  width: 100%;
+}
+
 .settings-batch__table th,
 .settings-batch__table td,
 .settings-import__table th,
 .settings-import__table td {
   vertical-align: top;
   white-space: normal;
+}
+
+.settings-batch__table tbody th,
+.settings-batch__table td,
+.settings-import__table tbody th,
+.settings-import__table td {
   overflow-wrap: anywhere;
 }
 
@@ -237,7 +329,78 @@
 .settings-batch__what {
   display: grid;
   gap: var(--sp-1);
-  min-width: 12rem;
+}
+
+/* Wide screens: a table whose value columns keep a readable width (a header never breaks inside a word). */
+@media (min-width: 720px) {
+  .settings-batch__table thead th,
+  .settings-import__table thead th {
+    white-space: nowrap;
+  }
+
+  .settings-batch__table tbody th,
+  .settings-import__table tbody th {
+    min-width: 11rem;
+  }
+
+  .settings-batch__table td[data-label="Now"],
+  .settings-batch__table td[data-label="After saving"],
+  .settings-import__table td[data-label="Now"],
+  .settings-import__table td[data-label="In the file"] {
+    min-width: 6rem;
+  }
+
+  .settings-batch__what {
+    min-width: 12rem;
+  }
+}
+
+/* Phones: each change is a block of "Column: value" lines (the label comes from the cell's `data-label`, set by
+   static/js/pages/settings.js), so nothing is squeezed into one-letter columns. */
+@media (max-width: 719px) {
+  .settings-batch__table,
+  .settings-batch__table tbody,
+  .settings-batch__table tr,
+  .settings-batch__table th,
+  .settings-batch__table td,
+  .settings-import__table,
+  .settings-import__table tbody,
+  .settings-import__table tr,
+  .settings-import__table th,
+  .settings-import__table td {
+    display: block;
+    width: 100%;
+  }
+
+  .settings-batch__table thead,
+  .settings-import__table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .settings-batch__table tr,
+  .settings-import__table tr {
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .settings-batch__table th,
+  .settings-batch__table td,
+  .settings-import__table th,
+  .settings-import__table td {
+    padding: 2px 0;
+    border: 0;
+  }
+
+  .settings-batch__table td[data-label]::before,
+  .settings-import__table td[data-label]::before {
+    content: attr(data-label) ": ";
+    color: var(--text-muted);
+  }
 }
 
 .settings-batch__risk,

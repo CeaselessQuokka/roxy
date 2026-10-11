@@ -25,7 +25,10 @@
 {{ cards["editor"] }}
 {{ cards["history"] }}
 {{ cards["import-export"] }}
-<div class="grid grid--2 settings-pair">{{ cards["alerts"] }}{{ cards["public-site"] }}</div>
+{# Full width, one under the other: side by side, a setting with a long unit ("messages per channel per hour")
+   left its number field no room, and the public site's nine settings made one column far longer than the other. #}
+{{ cards["alerts"] }}
+{{ cards["public-site"] }}
 
 <dialog class="dialog settings-batch-dialog" id="settings-batch-dialog" aria-labelledby="settings-batch-title" aria-describedby="settings-batch-desc">
   <form class="dialog__form" data-batch-form novalidate>

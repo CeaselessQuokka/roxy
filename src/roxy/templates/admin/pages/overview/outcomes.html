@@ -21,8 +21,10 @@
       <th scope="row">{{ item.label }}</th>
       <td class="num">{{ num(item.requests) }}</td>
       <td class="ov-outcomes__share">
-        <meter class="ov-meter ov-meter--{{ item.outcome }}" min="0" max="100" value="{{ item.share_pct or 0 }}" aria-label="{{ item.label }}: {{ item.share_pct or 0 }} percent"></meter>
-        <span class="ov-outcomes__pct">{{ "%.1f"|format(item.share_pct or 0) }}%</span>
+        <div class="ov-outcomes__bar">
+          <meter class="ov-meter ov-meter--{{ item.outcome }}" min="0" max="100" value="{{ item.share_pct or 0 }}" aria-label="{{ item.label }}: {{ item.share_pct or 0 }} percent"></meter>
+          <span class="ov-outcomes__pct">{{ "%.1f"|format(item.share_pct or 0) }}%</span>
+        </div>
       </td>
     </tr>
     {% endfor %}

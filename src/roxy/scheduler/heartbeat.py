@@ -151,7 +151,15 @@ class LoopLagMonitor:
         while not stop.is_set():
             asked = time.monotonic()
             await asyncio.sleep(self.interval_s)
-            self.record((time.monotonic() - asked - self.interval_s) * 1000)
+            lag_ms = (time.monotonic() - asked - self.interval_s) * 1000
+            self.record(lag_ms)
+            if lag_ms >= LAG_SPIKE_MS:
+                # DEBUG only (off in production): the probe that ties a slow request to what held the loop.
+                log.debug("loop_lag_spike", extra={"fields": {"lag_ms": round(lag_ms, 1)}})
+
+
+LAG_SPIKE_MS = 50.0
+"""A loop lag sample at least this long is logged at DEBUG (`loop_lag_spike`)."""
 
 
 _UPSERT = """

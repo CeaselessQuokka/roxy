@@ -21,7 +21,7 @@
  *   roxy/admin/pages/shell.py (`status_signature`), templates/admin/_layout/banners.html.
  */
 
-import { hasUnsavedChanges, qs } from "roxy/dom";
+import { hasUnsavedChanges, qs, reloadPage, reloadPending } from "roxy/dom";
 import { getJSON } from "roxy/net";
 import { toast } from "roxy/toast";
 
@@ -33,7 +33,7 @@ let staleWhileHidden = false;
 async function check() {
   const url = document.body.dataset.statusUrl;
   const mine = document.body.dataset.statusSig;
-  if (!url || !mine) return;
+  if (!url || !mine || reloadPending()) return;
   if (document.hidden) {
     staleWhileHidden = true;
     return;
@@ -49,7 +49,8 @@ async function check() {
   }
   if (!answer || typeof answer.signature !== "string" || answer.signature === mine) return;
   if (!hasUnsavedChanges() && !qs("dialog[open]")) {
-    window.location.reload();
+    // One reload, even when the action that made this change already asked for its own (dom.js `reloadPage`).
+    reloadPage();
     return;
   }
   if (!warned) {

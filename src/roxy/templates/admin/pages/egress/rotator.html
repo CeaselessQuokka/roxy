@@ -8,15 +8,14 @@
   factor, never echoed) and going back to the bootstrap value (`DELETE /rotator/url`). The `rotator_*` settings
   (switch, weight, session mode, quota and price, cooldowns) are in the card's settings block.
   Context: `frame`, `state`, `tone`, `words`, `rotator`, `last_success`, `last_success_precision`,
-  `last_error_at`, `source_words`, `ui_set`, `ui_by`, `mode_words`, `sessions`, `url_api` (or `deferred`).
+  `last_error_at`, `source_words`, `ui_set`, `ui_by`, `mode_words`, `sessions`, `url_api`.
 -#}
-{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
 {% from "components/page_card.html" import page_card %}
 {% from "components/badges.html" import status_badge %}
 {% from "components/dialog.html" import confirm_dialog %}
 {% from "components/icon.html" import icon %}
 {% from "components/format.html" import num, caller_text %}
-{% from "admin/pages/upstream/_macros.html" import when %}
+{% from "components/pieces.html" import when %}
 {% call page_card(frame) %}
 <div class="g3-rotator">
   <p class="g3-rotator__state">{{ status_badge(tone, words) }} <span>{{ state_detail }}</span></p>
@@ -57,4 +56,3 @@
                   reason=True, success="Back on the bootstrap gateway URL.", on_success="refresh", refresh="rotator sessions exit-ips") }}
 {% endif %}
 {% endcall %}
-{% endif %}

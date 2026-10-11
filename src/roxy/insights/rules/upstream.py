@@ -52,7 +52,7 @@ from roxy.config.constants import (
 )
 from roxy.core.reasons import CacheState, Egress, ReasonCode
 from roxy.insights import simulate
-from roxy.insights.context import InsightContext
+from roxy.insights.context import InsightContext, bound_note
 from roxy.insights.models import MAX_CHANGES, Evidence, ProposedChange, Recommendation, iso
 from roxy.insights.providers_rules_upstream import RotatorStatus, rotator_status, span_window, ua_experiment_arms
 from roxy.insights.rules.base import Rule, register
@@ -64,7 +64,7 @@ from roxy.insights.rules.core import (
     own_cache_rule,
     rule_columns,
 )
-from roxy.metrics import histograms
+from roxy.metrics import histograms, read_history
 from roxy.metrics.queries import Window
 from roxy.metrics.templating import OTHER
 from roxy.upstream import adaptive, breaker
@@ -290,8 +290,8 @@ async def cache_change(
     if raise_ttl:
         tuned: int | None = None
         if ctx.flag("ttl_tuner_enabled"):
-            samples = await ctx.samples(ctx.window(hours=float(ctx.setting("request_sample_hours"))), [template])
-            estimate = simulate.estimate_change_interval(samples)
+            window = ctx.window(hours=float(ctx.setting("request_sample_hours")))
+            estimate = await ctx.change_estimate(window, template)  # one SQL read per window for every rule (G7)
             tuned = simulate.proposed_ttl(estimate, cap_s=cap)
             if evidence is not None and estimate.keys:
                 evidence.details.setdefault("ttl_tuner", {})[template] = estimate.to_dict()
@@ -913,9 +913,17 @@ class UpRetryAfterIgnored(Rule):
         intervals = await self._intervals(ctx, window)
         if not intervals:
             return []
-        samples = await ctx.samples(window, sorted(intervals))
+        # Only the rows this rule looks at (answers that made no call and served nothing, with a client), filtered
+        # in SQL: a busy window's other samples are never read, and a cut read is said in the evidence (G7).
+        read = await ctx.sample_read(
+            window,
+            sorted(intervals),
+            where=read_history.SampleFilter(
+                egress=Egress.NONE.value, exclude_cache_states=tuple(sorted(CACHE_SERVES)), with_client=True
+            ),
+        )
         per_slot: dict[tuple[str, str, str, int], int] = {}
-        for sample in samples:
+        for sample in read.rows:
             template = str(sample.get("endpoint_template") or "")
             client = sample.get("client_hash")
             if not client or sample.get("egress") != Egress.NONE.value or sample.get("cache_state") in CACHE_SERVES:
@@ -945,6 +953,9 @@ class UpRetryAfterIgnored(Rule):
             return []  # both remedies 11.5 names are already in place
         worst = sorted(offenders.items(), key=lambda kv: -kv[1])
         evidence = Evidence(window_from=window.start, window_to=window.end, sample_size=sum(offenders.values()))
+        cut = bound_note(read, "cooldown answers")
+        if cut is not None:
+            evidence.details["sample_bound"] = cut
         evidence.add("clients_retrying_early", len(offenders), "clients")
         evidence.add("early_retries", sum(offenders.values()), "requests")
         evidence.add("most_early_retries_one_client", worst[0][1], "requests")
@@ -1586,6 +1597,8 @@ class UpUaExperiment(Rule):
         if z < SIGNIFICANCE_Z or str(better["user_agent"]) == current_ua:
             return []
         evidence = Evidence(sample_size=min(int(arm["calls"]) for arm in arms))
+        if (data or {}).get("note"):
+            evidence.details["sample_bound"] = str((data or {})["note"])  # the arm counts hit their bound (G7)
         details = []
         for arm in arms:
             rate, low, high = proportion_interval(int(arm["roblox_429"]), int(arm["calls"]))

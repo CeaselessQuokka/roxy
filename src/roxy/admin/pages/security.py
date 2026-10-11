@@ -52,6 +52,7 @@ from roxy.admin.api.common import TableQuery, TableSpec
 from roxy.admin.pages import fmt
 from roxy.admin.pages.kit import Page, PageView, filter_chip, table_query, table_view
 from roxy.metrics import read_security, security_events
+from roxy.metrics.fingerprints import keeps_no_values
 
 page = Page("security")
 router = page.router
@@ -330,6 +331,7 @@ async def probe_summary_card(view: PageView) -> dict[str, Any]:
         spec,
         answer,
         src=view.fragment_url("probe-summary", part="table"),
+        hidden=("first_ms",),  # a half-width card: First seen is one click away in Columns
         cells=cells,
         row_id=lambda item: f"signature-{row_key(item.get('reason'))}",
         export_url=view.api_url("security/probes/summary"),
@@ -385,7 +387,9 @@ async def crawls_card(view: PageView) -> dict[str, Any]:
 # ============================================================================================ fingerprints
 
 
-def _fingerprint_table(view: PageView, tab: str, spec: TableSpec, answer: Mapping[str, Any], **options: Any) -> Any:
+def _fingerprint_table(
+    view: PageView, tab: str, spec: TableSpec, answer: Mapping[str, Any], **options: Any
+) -> dict[str, Any]:
     return table_view(
         view,
         f"fp-{tab}",
@@ -455,10 +459,21 @@ async def _agents_table(view: PageView) -> dict[str, Any]:
     answer = await security_api.table_page(spec, tq, security_api.user_agent_fetch(view.ctx, tq))
 
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
+        names = item.get("last_header_names") or []
         return {
             "first_seen": view.time_cell(item.get("first_seen")),
             "last_seen": view.time_cell(item.get("last_seen")),
+            "last_path": {"text": item.get("last_path"), "caller": True, "mono": True}
+            if item.get("last_path")
+            else None,
+            "last_caller": {"text": item.get("last_caller"), "mono": True} if item.get("last_caller") else None,
+            "last_header_names": {"text": ", ".join(names), "caller": True, "mono": True} if names else None,
+            "last_detail_at": view.time_cell(item.get("last_detail_at")),
         }
+
+    def drawer(item: Mapping[str, Any]) -> str | None:
+        key = str(item.get("ua_hash") or "")
+        return view.fragment_url("fingerprints", part="agent", ua=key) if key else None
 
     return _fingerprint_table(
         view,
@@ -466,9 +481,10 @@ async def _agents_table(view: PageView) -> dict[str, Any]:
         spec,
         answer,
         key_columns=("user_agent", "count", "last_seen"),
-        hidden=("first_seen",),
+        hidden=("first_seen", "last_path", "last_caller", "last_header_names", "last_detail_at"),
         cells=cells,
         row_id=lambda item: f"fp-agent-{row_key(item.get('user_agent'))}",
+        drawer=drawer,
         drawer_title=lambda item: "User-Agent",
         export_url=view.api_url("security/fingerprints/user-agents", time=False),
         caption="User-Agents callers send",
@@ -591,8 +607,10 @@ async def _header_drawer(view: PageView, *, blocked: bool) -> dict[str, Any]:
 
     counts, row = await view.ctx.dbs.metrics.read(read)
     # The rule rows themselves (control.db), not the snapshot each worker reloads within a second: right after
-    # "Stop recording" the drawer must already say so.
-    ignored = name in {str(item["name"]).lower() for item in await security_api.ignored_rows(view.ctx)}
+    # "Stop recording" the drawer must already say so. A header that carries client addresses is never recorded.
+    listed = await security_api.ignored_rows(view.ctx)
+    ignored = name in {str(item["name"]).lower() for item in listed}
+    never_recorded = keeps_no_values(name)
     tq = TableQuery(page=1, page_size=HEADER_VALUES_SHOWN, sort="count", order="desc")
     values = await security_api.table_page(security_api.VALUE_SPEC, tq, security_api.values_fetch(view.ctx, name, tq))
     items = [{**item, "last": fmt.time_cell(item.get("last_seen"), view.tz, view.now)} for item in values["items"]]
@@ -601,7 +619,8 @@ async def _header_drawer(view: PageView, *, blocked: bool) -> dict[str, Any]:
         "name": name,
         "row": row,
         "known": bool(counts["headers"] or counts["values"]),
-        "ignored": ignored,
+        "ignored": ignored or never_recorded,
+        "never_recorded": never_recorded,
         "value_rows": items,
         "values_total": int(values["total"]),
         "first": fmt.time_cell(row.get("first_seen"), view.tz, view.now) if row else None,
@@ -615,13 +634,36 @@ async def _header_drawer(view: PageView, *, blocked: bool) -> dict[str, Any]:
     }
 
 
+async def _agent_drawer(view: PageView) -> dict[str, Any]:
+    """One User-Agent in the drawer: its counts and what its newest recorded request looked like (v1's User-Agent
+    drill-down: the path, the client address and the header names it sent), through the API's own helper."""
+    key = view.param("ua", max_chars=32)
+    if len(key) != 32 or any(ch not in "0123456789abcdef" for ch in key):
+        raise common.not_found("Choose a User-Agent from the table; that key is not valid.")
+    detail = await security_api.user_agent_detail_answer(view.ctx, key)
+    return {
+        "mode": "agent",
+        "agent": detail,
+        "first": fmt.time_cell(detail.get("first_seen"), view.tz, view.now),
+        "last": fmt.time_cell(detail.get("last_seen"), view.tz, view.now),
+        "detail_at": fmt.time_cell(detail.get("last_detail_at"), view.tz, view.now)
+        if detail.get("last_detail_at") is not None
+        else None,
+        "live_href": "/admin/live?" + urlencode({"client": detail["last_caller"]}) if detail.get("last_caller") else "",
+        "api_url": api_path("security", "fingerprints", "user-agents", key),
+    }
+
+
 @page.card("fingerprints", lazy=True)
 async def fingerprints_card(view: PageView) -> dict[str, Any]:
     """The four fingerprint lists as tabs (all four render on the first load; a tab's own requests answer only
-    that tab's table), or one header in the drawer (`part=header` / `blocked-header`)."""
+    that tab's table), one header in the drawer (`part=header` / `blocked-header`), or one User-Agent with its
+    newest request (`part=agent&ua=<key>`)."""
     part = part_of(view)
     if part in ("header", "blocked-header"):
         return {"part": part, "drawer": await _header_drawer(view, blocked=part == "blocked-header")}
+    if part == "agent":
+        return {"part": part, "drawer": await _agent_drawer(view)}
     if part in TAB_BUILDERS:
         return {"part": part, "tables": {part: await TAB_BUILDERS[part](view)}, "tabs": FINGERPRINT_TABS}
     tables = {tab: await build(view) for tab, build in TAB_BUILDERS.items()}

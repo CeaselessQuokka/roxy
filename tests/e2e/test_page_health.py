@@ -20,12 +20,11 @@ What to read next
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from typing import Any
 
 import pytest
 
-from roxy.admin.pages.testing import SESSION_COOKIE_NAME, THEMES, VIEWPORTS
+from pages_harness import SESSION_COOKIE_NAME, THEMES, VIEWPORTS
 from roxy.health import store
 from roxy.health.model import CheckResult, Status
 from roxy.health.runner import RUN_LEASE, RUN_LEASE_TTL_MS
@@ -34,15 +33,22 @@ from roxy.storage import leases
 PAGE = "/admin/health"
 NO_HOSTILE_MARKUP = """() => !document.querySelector('img[src="x"], [onerror], [onclick], a[href^="javascript:"]')
   && typeof window.__pwned === "undefined\""""
-FINISHED = "document.querySelector('#run [data-run-id=\"{run}\"][data-run-state=\"finished\"]') !== null"
+FINISHED = 'document.querySelector(\'#run [data-run-id="{run}"][data-run-state="finished"]\') !== null'
 RUN_TIMEOUT_S = 150
 
 
 @pytest.fixture(autouse=True)
-def no_scheduled_runs(dashboard: Any) -> Iterator[None]:
+def no_scheduled_runs(dashboard: Any) -> None:
     """Scheduled runs off while these tests run (one run at a time in the fleet: a scheduled one would take it)."""
     dashboard.change_settings({"health_auto_interval_h": 0})
-    yield
+
+
+def newer_run(before: int) -> str:
+    """A JS condition: the Run card shows a run newer than run `before`."""
+    return (
+        "(() => { const n = document.querySelector('#run [data-run-id]'); "
+        f"return n && Number(n.dataset.runId) > {before}; }})()"
+    )
 
 
 def newest_run(dashboard: Any) -> int:
@@ -78,7 +84,7 @@ def test_a_run_from_a_phone_fills_in_live_and_finishes(open_admin: Any, dashboar
     before = newest_run(dashboard)
     page.locator('#run input[name="include_credential"]').uncheck()
     page.locator('#run [data-action="health-run"]').click()
-    admin.wait(f"(() => {{ const n = document.querySelector('#run [data-run-id]'); return n && Number(n.dataset.runId) > {before}; }})()")
+    admin.wait(newer_run(before))
     run_id = int(page.locator("#run [data-run-id]").first.get_attribute("data-run-id") or 0)
     assert f"run={run_id}" in page.url
     admin.wait(FINISHED.format(run=run_id), timeout=RUN_TIMEOUT_S)
@@ -105,7 +111,7 @@ def test_the_credential_check_asks_for_the_second_factor_first(open_admin: Any, 
         assert admin.axe() == []
         page.fill("#reauth-code", dashboard.next_code())
         page.locator('#reauth button[type="submit"]').click()
-        admin.wait(f"(() => {{ const n = document.querySelector('#run [data-run-id]'); return n && Number(n.dataset.runId) > {before}; }})()")
+        admin.wait(newer_run(before))
         run_id = int(page.locator("#run [data-run-id]").first.get_attribute("data-run-id") or 0)
         admin.wait(FINISHED.format(run=run_id), timeout=RUN_TIMEOUT_S)
         assert page.locator('#run [data-check="H-CRED-AUTH"]').get_attribute("data-check-status") != "n/a"
@@ -154,12 +160,13 @@ def test_a_run_going_in_another_worker_is_followed_live(open_admin: Any, dashboa
         page = admin.page
         page.locator('#run input[name="include_credential"]').uncheck()
         page.locator('#run [data-action="health-run"]').click()
-        admin.wait(f"document.querySelector('#run [data-run-id=\"{run_id}\"][data-run-state=\"running\"]') !== null")
+        admin.wait(f'document.querySelector(\'#run [data-run-id="{run_id}"][data-run-state="running"]\') !== null')
         admin.wait("/already running/.test(document.querySelector('#toasts').innerText)")
         assert page.locator('#run [data-check-status="pending"]').count() == 2
         dashboard.run(report(run_id, disk))
-        admin.wait("document.querySelector('#run [data-check=\"H-DISK\"][data-check-status=\"pass\"]') !== null")
+        admin.wait('document.querySelector(\'#run [data-check="H-DISK"][data-check-status="pass"]\') !== null')
         assert "1 of 2 checks done" in page.locator("#run .hl-progress").inner_text()
+        assert admin.axe() == []  # the running view too: the progress bar, a waiting check and a finished one
         dashboard.run(report(run_id, config, finish=True))
         admin.wait(FINISHED.format(run=run_id), timeout=20)
         admin.wait(f"/Health run {run_id} finished/.test(document.querySelector('#toasts').innerText)")

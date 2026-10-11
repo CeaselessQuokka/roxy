@@ -12,8 +12,9 @@ Why it exists
     email or a failed health check to a runbook: alerts link to `/admin/help#runbook-<name>`
     (`roxy.notify.notifier.runbook_link`), health checks to `/admin/help/runbooks#<anchor>` and
     `/admin/help/operations#<name>` (`roxy.health.checks`). Every one of those links must land on its runbook.
-    `docs/ADMIN_GUIDE.md` is not written yet (the docs lane writes it later); until it exists, its page and the
-    Help card say so and point to where each chapter's material already lives.
+    The admin guide's file (`ADMIN_GUIDE.md` in the docs folder) is not written yet (the docs lane writes it
+    later); until it exists, its page and the Help card say so and point to where each chapter's material already
+    lives.
 
 How it works
     The documents live in `docs/` next to the glossary (`texts.GLOSSARY_PATH.parent`, found the same way, so a

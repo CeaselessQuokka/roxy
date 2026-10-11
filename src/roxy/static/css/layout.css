@@ -877,34 +877,6 @@ hr {
   }
 }
 
-/* Touch screens get 44 px targets everywhere, whatever their width (plan 14.8). */
-@media (pointer: coarse) {
-  .nav-link,
-  .btn,
-  .icon-btn,
-  .menu__item,
-  .input,
-  .search-btn,
-  .segmented__item,
-  .pill-radio span,
-  .legend-item,
-  .link-btn,
-  .th-sort,
-  .chip-select select,
-  .avatar-btn,
-  .how-to-read > summary,
-  .details-summary {
-    min-height: var(--target-touch);
-  }
-
-  .icon-btn,
-  .icon-btn--sm,
-  .avatar-btn,
-  .help-dot {
-    min-width: var(--target-touch);
-  }
-
-  .help-dot {
-    height: var(--target-touch);
-  }
-}
+/* Touch screens get 44 px targets everywhere, whatever their width (plan 14.8): that block is the LAST rule of
+   components.css, because it must come after the component rules it enlarges (this file loads first, and a rule
+   here with the same specificity as `.input` or `.btn` there would lose; it did, tests/e2e/test_phone_flows.py). */

@@ -10,7 +10,9 @@ What this is
     the event types the rules read (breaker openings, credential probes, spam detections, logins), the version 1
     reads the rules need with groupings `metrics/queries.py` does not offer (`roblox_429_counts` per template, egress
     and minute, `upstream_429_rows`, `samples_between`, `latest_health_run`, `anomalies_between`, `heartbeats`),
-    and `prune_history`, the retention step for the version 2 tables.
+    the sample aggregates the rules share (`change_estimates`, the TTL tuner in SQL; `ua_arm_counts`), the bounded
+    reads of a dry run (`sample_cut`, `newest_streams`), and `prune_history`, the retention step for the version 2
+    tables.
 
 Why it exists
     DESIGN.md section 13: read models live next to their data, so the dashboard, the LLM export and the insights
@@ -21,7 +23,10 @@ How it works
     Every time argument is Unix seconds and every window is half open `[start, end)`. Minute tables are summed with
     one indexed range read; results are small dicts and lists, bounded by `limit` arguments (plan P9). The two
     sample reads can return tens of thousands of rows, so they return compact read-only `SampleRecord` mappings
-    (one tuple per row, repeated strings shared) instead of dicts (finding LOAD-2).
+    (one tuple per row, repeated strings shared) instead of dicts (finding LOAD-2), and take a `SampleFilter` so a
+    rule reads only the rows it looks at. What a rule needs per template over a whole day (the TTL tuner) is
+    computed in SQL over every row of the window and returns one small row per template (gaps_insights G7): no
+    row limit cuts it, and SQLite does the work without holding Python's GIL.
 
 What to read next
     `roxy/metrics/recorder.py` (the writers), `roxy/insights/context.py` (how rules reach these functions).
@@ -32,6 +37,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from typing import Any, Final
 
 MAX_ROWS: Final = 50_000
@@ -421,19 +427,79 @@ _SHARED_SAMPLE_VALUES: Final = frozenset(
 """Columns whose values repeat from row to row (templates, methods, states; a hot key or a busy client)."""
 
 
+def _sample_limit(limit: int | None) -> int:
+    """A sample read's row limit: `MAX_ROWS` by default, at most `MAX_ROWS + 1` (a caller that asks for one row more
+    than it keeps learns whether the bound cut the read; `insights/context.py SampleRead.complete`)."""
+    return MAX_ROWS if limit is None else max(1, min(int(limit), MAX_ROWS + 1))
+
+
+@dataclass(frozen=True, slots=True)
+class SampleFilter:
+    """Conditions a request sample read applies in SQL, so a rule reads only the rows it looks at instead of every
+    row of its window (gaps_insights G7: a rule that needs a few hundred rows no longer reads, and is no longer cut
+    by, the window's tens of thousands).
+
+    - `egress`: only rows with exactly this egress (`none`: answers that made no upstream call).
+    - `called`: only rows that made an upstream call (an egress that is set and is not `none`).
+    - `exclude_cache_states`: leave out rows with one of these cache states (a row without a state is kept).
+    - `with_client`: only rows with a client hash.
+    - `key_ids`: only rows of these cache keys.
+    - `statuses`: only rows with one of these upstream statuses.
+    """
+
+    egress: str | None = None
+    called: bool = False
+    exclude_cache_states: tuple[str, ...] = ()
+    with_client: bool = False
+    key_ids: tuple[str, ...] | None = None
+    statuses: tuple[int, ...] | None = None
+
+    def sql(self) -> tuple[str, list[Any]]:
+        """`(" AND ..." clause, parameters)`. Lists travel as one JSON parameter (`json_each`), so a long key list
+        never meets SQLite's limit on bound parameters."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if self.egress is not None:
+            clauses.append("egress = ?")
+            params.append(self.egress)
+        if self.called:
+            clauses.append("coalesce(nullif(egress, ''), 'none') <> 'none'")
+        if self.exclude_cache_states:
+            clauses.append("(cache_state IS NULL OR cache_state NOT IN (SELECT value FROM json_each(?)))")
+            params.append(json.dumps(sorted(self.exclude_cache_states)))
+        if self.with_client:
+            clauses.append("client_hash IS NOT NULL AND client_hash <> ''")
+        if self.key_ids is not None:
+            clauses.append("key_id IN (SELECT value FROM json_each(?))")
+            params.append(json.dumps(sorted(self.key_ids)))
+        if self.statuses is not None:
+            clauses.append("upstream_status IN (SELECT value FROM json_each(?))")
+            params.append(json.dumps(sorted(int(s) for s in self.statuses)))
+        return "".join(f" AND {clause}" for clause in clauses), params
+
+
 def samples_between(
-    conn: sqlite3.Connection, start: int, end: int, templates: Iterable[str] | None = None, limit: int | None = None
+    conn: sqlite3.Connection,
+    start: int,
+    end: int,
+    templates: Iterable[str] | None = None,
+    limit: int | None = None,
+    *,
+    where: SampleFilter | None = None,
 ) -> list[SampleRecord]:
-    """`request_samples` rows in `[start, end)` seconds (optionally only some templates), in time order, as compact
-    read-only `SampleRecord` mappings (at most `MAX_ROWS`)."""
+    """`request_samples` rows in `[start, end)` seconds (optionally only some templates, and only the rows `where`
+    admits), in time order, as compact read-only `SampleRecord` mappings (at most `MAX_ROWS`, or `MAX_ROWS + 1` when
+    asked: see `_sample_limit`). The OLDEST rows come first, so a read the limit cuts is missing its newest rows:
+    callers that need the newest part of a busy window use `newest_streams`."""
     wanted = sorted(set(templates)) if templates is not None else []
     clause = f" AND endpoint_template IN ({', '.join('?' for _ in wanted)})" if wanted else ""
+    extra, extra_params = where.sql() if where is not None else ("", [])
     cursor = conn.cursor()
     cursor.row_factory = None  # plain tuples: the records share one column index instead of a dict per row
     cursor.execute(
-        f"SELECT {', '.join(SAMPLE_COLUMNS)} FROM request_samples WHERE at_ms >= ? AND at_ms < ?{clause} "  # noqa: S608
+        f"SELECT {', '.join(SAMPLE_COLUMNS)} FROM request_samples WHERE at_ms >= ? AND at_ms < ?{clause}{extra} "  # noqa: S608
         "ORDER BY at_ms, id LIMIT ?",
-        (int(start) * 1000, int(end) * 1000, *wanted, _bounded(limit)),
+        (int(start) * 1000, int(end) * 1000, *wanted, *extra_params, _sample_limit(limit)),
     )
     return _records(cursor, SAMPLE_COLUMNS, _SHARED_SAMPLE_VALUES)
 
@@ -449,9 +515,152 @@ def refusal_samples_between(
     cursor.execute(
         f"SELECT {', '.join(REFUSAL_SAMPLE_COLUMNS)} FROM refusal_samples "  # noqa: S608
         "WHERE at_ms >= ? AND at_ms < ? ORDER BY at_ms, id LIMIT ?",
-        (int(start) * 1000, int(end) * 1000, _bounded(limit)),
+        (int(start) * 1000, int(end) * 1000, _sample_limit(limit)),
     )
     return _records(cursor, REFUSAL_SAMPLE_COLUMNS, _SHARED_SAMPLE_VALUES)
+
+
+SAMPLE_TABLES: Final[frozenset[str]] = frozenset({"request_samples", "refusal_samples"})
+"""The two sample tables (`sample_cut` names one; both have an `at_ms` index)."""
+
+
+def sample_cut(
+    conn: sqlite3.Connection, start: int, end: int, bound: int, *, table: str = "request_samples"
+) -> int | None:
+    """Where the newest part of `[start, end)` that holds at most `bound` rows of `table` begins (Unix seconds, on a
+    whole minute), or None when the whole window holds at most `bound` rows.
+
+    The row at offset `bound` from the newest is the newest row left out; every row from the next whole minute
+    after it is among the newest `bound` (one indexed scan of `bound` index entries).
+    """
+    if table not in SAMPLE_TABLES:
+        raise ValueError(f"not a sample table: {table!r}")
+    row = conn.execute(
+        f"SELECT at_ms FROM {table} WHERE at_ms >= ? AND at_ms < ? ORDER BY at_ms DESC LIMIT 1 OFFSET ?",  # noqa: S608 (SAMPLE_TABLES)
+        (int(start) * 1000, int(end) * 1000, max(1, int(bound))),
+    ).fetchone()
+    if row is None:
+        return None
+    after = int(row[0]) // 1000 + 1  # the first whole second after the newest row left out
+    return min(int(end), -(-after // 60) * 60)  # up to a whole minute, never past the window
+
+
+def newest_streams(
+    conn: sqlite3.Connection, start: int, end: int, bound: int, *, refusals: bool = False
+) -> tuple[int, list[SampleRecord], list[SampleRecord]]:
+    """`(cut, request samples, refusal samples)` of the newest part of `[start, end)` in which each table holds at
+    most `bound` rows (`sample_cut`; `cut` is `start` when the whole window fits), read in one snapshot: the input of
+    a dry run (plan 11.3), which replays one contiguous span and says so when it is shorter than asked
+    (gaps_insights G7; the old read silently kept the OLDEST `MAX_ROWS` rows of a busy window). Refusal samples are
+    read only with `refusals`."""
+    bound = max(1, min(int(bound), MAX_ROWS))
+    cut = int(start)
+    for table in ("request_samples", "refusal_samples") if refusals else ("request_samples",):
+        found = sample_cut(conn, cut, end, bound, table=table)
+        if found is not None:
+            cut = max(cut, found)
+    rows = samples_between(conn, cut, end, limit=bound)
+    refused = refusal_samples_between(conn, cut, end, limit=bound) if refusals else []
+    return cut, rows, refused
+
+
+# The TTL tuner (plan 11.3, F10) in SQL: for each template, over the fetches that carry a body (`body_hash`) of each
+# cache key in time order, the keys with two fetches or more, the span between their first and last fetch, and the
+# body changes (a fetch whose body differs from the key's previous fetch). `insights/simulate.py
+# estimate_change_interval` is the same computation over sample rows (a parity test pins them together).
+_FETCHES_SQL: Final = (
+    "SELECT endpoint_template AS template, key_id, at_ms, body_hash, "
+    "lag(body_hash) OVER fetch_order AS previous_hash, lag(at_ms) OVER fetch_order AS previous_ms "
+    "FROM request_samples "
+    "WHERE at_ms >= ? AND at_ms < ? AND key_id IS NOT NULL AND body_hash IS NOT NULL AND body_hash <> ''{clause} "
+    "WINDOW fetch_order AS (PARTITION BY endpoint_template, key_id ORDER BY at_ms, id)"
+)
+_CHANGE_TOTALS_SQL: Final = (
+    "WITH fetches AS (" + _FETCHES_SQL + "), "  # noqa: S608 (fixed SQL text; every value is a bound parameter)
+    "per_key AS (SELECT template, count(*) AS fetches, max(at_ms) - min(at_ms) AS span_ms, "
+    "sum(previous_hash IS NOT NULL AND previous_hash <> body_hash) AS changes FROM fetches GROUP BY template, key_id) "
+    "SELECT template, count(*), sum(span_ms), sum(changes > 0), sum(changes) FROM per_key WHERE fetches >= 2 "
+    "GROUP BY template"
+)
+# A change is placed halfway between the last fetch with the old body and the first with the new one; the gaps
+# between consecutive changes of one key are the intervals, and only their median (the middle one or two of each
+# template, 1-based ranks (n + 1) / 2 and (n + 2) / 2 in integer division) and their number leave the database.
+_CHANGE_MEDIANS_SQL: Final = (
+    "WITH fetches AS (" + _FETCHES_SQL + "), "  # noqa: S608 (fixed SQL text; every value is a bound parameter)
+    "points AS (SELECT template, key_id, (previous_ms + at_ms) / 2000.0 AS point FROM fetches "
+    "WHERE previous_hash IS NOT NULL AND previous_hash <> body_hash), "
+    "gaps AS (SELECT template, point - lag(point) OVER (PARTITION BY template, key_id ORDER BY point) AS gap "
+    "FROM points), "
+    "ranked AS (SELECT template, gap, row_number() OVER (PARTITION BY template ORDER BY gap) AS rank, "
+    "count(*) OVER (PARTITION BY template) AS total FROM gaps WHERE gap IS NOT NULL) "
+    "SELECT template, total, gap FROM ranked WHERE rank IN ((total + 1) / 2, (total + 2) / 2) ORDER BY template, rank"
+)
+
+
+def change_estimates(
+    conn: sqlite3.Connection, start: int, end: int, templates: Iterable[str] | None = None
+) -> dict[str, dict[str, Any]]:
+    """The TTL tuner's measurements per template over `[start, end)` seconds, computed in SQL over every sample of
+    the window (no row limit, nothing returned per row; gaps_insights G7):
+    `{template: {keys, keys_with_changes, changes, observed_ms, intervals, median_interval_s}}`.
+
+    `keys` counts the keys with at least two fetches carrying a body, `observed_ms` sums the span between the first
+    and last of them per key, `changes` counts body changes, `intervals` the gaps between consecutive changes of one
+    key and `median_interval_s` is their median (None without one). Templates without a key fetched twice are
+    absent. The intervals are computed only for templates that have one (a key that changed twice or more).
+    """
+    wanted = sorted(set(templates)) if templates is not None else None
+    clause = " AND endpoint_template IN (SELECT value FROM json_each(?))" if wanted is not None else ""
+    params: list[Any] = [int(start) * 1000, int(end) * 1000]
+    if wanted is not None:
+        params.append(json.dumps(wanted))
+    out: dict[str, dict[str, Any]] = {}
+    for template, keys, span_ms, with_changes, changes in conn.execute(
+        _CHANGE_TOTALS_SQL.format(clause=clause), params
+    ).fetchall():
+        out[str(template)] = {
+            "keys": int(keys),
+            "keys_with_changes": int(with_changes or 0),
+            "changes": int(changes or 0),
+            "observed_ms": int(span_ms or 0),
+            "intervals": 0,
+            "median_interval_s": None,
+        }
+    # A template has intervals only when one of its keys changed twice or more: more changes than changing keys.
+    repeated = sorted(t for t, v in out.items() if v["changes"] > v["keys_with_changes"])
+    if not repeated:
+        return out
+    middles: dict[str, list[float]] = {}
+    totals: dict[str, int] = {}
+    medians_sql = _CHANGE_MEDIANS_SQL.format(clause=" AND endpoint_template IN (SELECT value FROM json_each(?))")
+    for template, total, gap in conn.execute(medians_sql, (int(start) * 1000, int(end) * 1000, json.dumps(repeated))):
+        middles.setdefault(str(template), []).append(float(gap))
+        totals[str(template)] = int(total)
+    for template, values in middles.items():
+        entry = out.get(template)
+        if entry is None:
+            continue
+        entry["intervals"] = totals[template]
+        # statistics.median: the middle value, or the mean of the two middle values (the same float arithmetic).
+        entry["median_interval_s"] = values[0] if len(values) == 1 else (values[0] + values[1]) / 2
+    return out
+
+
+def ua_arm_counts(
+    conn: sqlite3.Connection, start: int, end: int, limit: int | None = None
+) -> list[tuple[str, int, int]]:
+    """`[(identity, calls, roblox_429s)]` of the direct calls that reached Roblox in `[start, end)` seconds, per
+    User-Agent experiment identity (the cache key id, else the template; `providers_rules_upstream.arms_from_samples`
+    reads the same columns from sample rows), most calls first, at most `limit` identities (`MAX_ROWS + 1` at most,
+    so a caller can tell a cut read)."""
+    rows = conn.execute(
+        "SELECT coalesce(nullif(key_id, ''), nullif(endpoint_template, ''), '') AS identity, count(*), "
+        "sum(upstream_status = 429) FROM request_samples "
+        "WHERE at_ms >= ? AND at_ms < ? AND egress = 'direct' AND upstream_status IS NOT NULL "
+        "GROUP BY identity ORDER BY count(*) DESC, identity LIMIT ?",
+        (int(start) * 1000, int(end) * 1000, _sample_limit(limit)),
+    ).fetchall()
+    return [(str(r[0]), int(r[1]), int(r[2] or 0)) for r in rows]
 
 
 def latest_health_run(conn: sqlite3.Connection) -> dict[str, Any] | None:
@@ -543,12 +752,15 @@ __all__ = [
     "MAX_ROWS",
     "REFUSAL_SAMPLE_COLUMNS",
     "SAMPLE_COLUMNS",
+    "SAMPLE_TABLES",
+    "SampleFilter",
     "SampleRecord",
     "anomalies_between",
     "attempt_rows",
     "bucket_history",
     "bucket_summary",
     "cache_summary",
+    "change_estimates",
     "error_counts",
     "error_series",
     "error_signatures",
@@ -557,11 +769,14 @@ __all__ = [
     "heartbeats",
     "latest_health_run",
     "latest_provider_report",
+    "newest_streams",
     "prune_history",
     "refusal_samples_between",
     "roblox_429_counts",
     "rule_hits",
+    "sample_cut",
     "samples_between",
+    "ua_arm_counts",
     "upstream_429_rows",
     "worker_history",
 ]

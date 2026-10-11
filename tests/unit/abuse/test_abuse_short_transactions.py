@@ -112,3 +112,21 @@ def test_limiter_and_strike_rows_are_written_in_chunks(dbs: Any) -> None:
     saved = dbs.hot.read_sync(lambda c: load_strike_rows(c, [s.key for s in strikes]))
     assert all(row.exists and row.strikes == 1 for row in saved.values())
     dbs.hot.write_sync(lambda conn: save_rows(conn, [], 1))  # nothing to write: no statement, no error
+
+
+def test_a_key_given_twice_in_one_statement_ends_with_its_last_values(dbs: Any) -> None:
+    """Inside one multi-row upsert SQLite applies the rows in order, so a repeated key ends exactly as the old
+    statement per row left it (the last values win), for limiter and strike rows alike."""
+    rows = [LimiterRow("ip:a", 1, 1, 1, True), LimiterRow("ip:b", 2, 2, 2, True), LimiterRow("ip:a", 3, 3, 3, True)]
+    strikes = [StrikeRow("ip:a", 1, 10, 0, 0, True), StrikeRow("ip:a", 2, 20, 1, 30, True)]
+
+    def write(conn: sqlite3.Connection) -> None:
+        save_rows(conn, rows, 5)
+        save_strike_rows(conn, strikes)
+
+    dbs.hot.write_sync(write)
+    loaded = dbs.hot.read_sync(lambda c: load_rows(c, ["ip:a", "ip:b"]))
+    assert (loaded["ip:a"].tat_ms, loaded["ip:a"].count) == (3, 3)
+    assert (loaded["ip:b"].tat_ms, loaded["ip:b"].count) == (2, 2)
+    strike = dbs.hot.read_sync(lambda c: load_strike_rows(c, ["ip:a"]))["ip:a"]
+    assert (strike.strikes, strike.last_strike_at, strike.tier, strike.throttled_until) == (2, 20, 1, 30)

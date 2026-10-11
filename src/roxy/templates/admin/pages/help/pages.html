@@ -14,7 +14,7 @@
     <h3 class="help-page__title"><a href="{{ item.href }}">{{ item.title }}</a>{% if not item.built %} {{ badge("Being built", "neutral") }}{% endif %}</h3>
     <p class="help-page__purpose">{{ item.purpose }}</p>
     <details class="details-plain help-page__more">
-      <summary>How to read the {{ item.title }} page, and its {{ item.cards|length }} cards</summary>
+      <summary>How to read the {{ item.title }} page, and its {{ item.cards|length }} {{ "card" if item.cards|length == 1 else "cards" }}</summary>
       <div class="help-page__body stack">
         {% for paragraph in item.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
         <ul class="help-page__cards">

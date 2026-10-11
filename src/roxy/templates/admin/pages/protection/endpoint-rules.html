@@ -7,6 +7,7 @@
   each refused path with its attempts, distinct clients, methods, the rule that refused it and the rule that
   matches it now.
   Context: `frame`, `tables`, `only`, `per_ip_allowance`; for the drawer `detail`.
+  Context also has `clear` (`protection.py clear_action`): v1's clear button of this section, a plan 6.8 data reset.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/table.html" import data_table %}
@@ -14,7 +15,7 @@
 {% from "components/icon.html" import icon %}
 {% from "components/format.html" import num %}
 {% from "components/glossary.html" import term with context %}
-{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, reason_field %}
+{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, reason_field, clear_button, clear_dialog %}
 {% from "admin/pages/protection/_rule_fields.html" import limit_fields %}
 {% if detail %}{% include "admin/pages/protection/_rule_drawer.html" %}
 {% elif only %}{{ data_table(**tables[only]) }}{% else %}
@@ -25,7 +26,10 @@
     <p class="prot-pad">An {{ term("endpoint-rule", "endpoint rule") }} gives the endpoints its pattern names their own limit; the most specific matching rule applies. A per-IP rule is never more generous than the per-IP allowance ({% if per_ip_allowance is not none %}{{ num(per_ip_allowance) }} requests per window{% else %}the Throttle card's limit{% endif %}).</p>
     {{ data_table(**tables.rules) }}
   {% endcall %}
-  {% call tab_panel("prot-erule-tabs", "attempts") %}{{ data_table(**tables.attempts) }}{% endcall %}
+  {% call tab_panel("prot-erule-tabs", "attempts") %}
+    <div class="prot-tabbar">{{ clear_button(clear) }}</div>
+    {{ data_table(**tables.attempts) }}
+  {% endcall %}
 {% endcall %}
 {% call confirm_dialog("dlg-prot-erule-add", "Add an endpoint rule", "/admin/api/v1/protection/endpoint-rules", confirm_label="Add rule",
                        api=True, success="Endpoint rule added.", on_success="refresh", refresh="endpoint-rules",
@@ -34,5 +38,6 @@
   {{ limit_fields("dlg-prot-erule-add") }}
   {{ reason_field("dlg-prot-erule-add-reason") }}
 {% endcall %}
+{{ clear_dialog(clear, "endpoint-rules refusals") }}
 {% endcall %}
 {% endif %}

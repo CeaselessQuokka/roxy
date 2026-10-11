@@ -38,7 +38,7 @@ const KEY_PATTERN = /^[a-z][a-z0-9_]{0,79}$/;
 const MAX_IMPORT_BYTES = 512 * 1024;
 const MAX_ERROR_TEXT = 4096;
 const FILTER_NAMES = ["q", "group", "risk", "changed", "has_recommendation", "page", "page_size", "key"];
-const DEFAULTS = { page: "1", page_size: "25" };
+const DEFAULTS = { page: "1", page_size: "10" }; // roxy/admin/pages/settings.py DEFAULT_EDITOR_SIZE
 
 const pending = new Map();
 let lastPreview = null;
@@ -238,11 +238,12 @@ function itemOutcome(item) {
 function fillPreview(answer) {
   const dialog = batchDialog();
   const rows = qs("[data-batch-rows]", dialog);
+  // `data-label` names each cell's column for the stacked phone layout (static/css/pages/settings.css).
   rows.replaceChildren(...answer.items.map((item) => el("tr", { "data-batch-key": item.key }, [
     el("th", { scope: "row" }, [el("span", { text: item.label || item.key }), el("code", { class: "settings-batch__key", text: item.key })]),
-    el("td", { text: display(item.current) }),
-    el("td", { text: item.status === "change" || item.status === "unchanged" ? display(item.new) : "" }),
-    el("td", {}, [el("div", { class: "settings-batch__what" }, itemOutcome(item))]),
+    el("td", { "data-label": "Now", text: display(item.current) }),
+    el("td", { "data-label": "After saving", text: item.status === "change" || item.status === "unchanged" ? display(item.new) : "" }),
+    el("td", { "data-label": "What happens" }, [el("div", { class: "settings-batch__what" }, itemOutcome(item))]),
   ])));
   const problems = qs("[data-batch-problems]", dialog);
   const issues = (answer.cross || []).map((issue) => issue.message);
@@ -404,9 +405,9 @@ function showImport(answer) {
   const rows = qs("[data-import-rows]", root);
   rows.replaceChildren(...answer.items.map((item) => el("tr", {}, [
     el("th", { scope: "row" }, [el("code", { text: item.key })]),
-    el("td", { text: display(item.current) }),
-    el("td", { text: item.status === "unknown" ? "" : display(item.new) }),
-    el("td", {}, [
+    el("td", { "data-label": "Now", text: display(item.current) }),
+    el("td", { "data-label": "In the file", text: item.status === "unknown" ? "" : display(item.new) }),
+    el("td", { "data-label": "Result" }, [
       el("span", { class: item.status === "invalid" || item.status === "unknown" ? "settings-batch__bad" : "", text: IMPORT_STATUS[item.status] || item.status }),
       item.message ? el("span", { class: "muted settings-import__message", text: ` ${item.message}` }) : el("span"),
       item.high_risk_reason ? el("strong", { class: "settings-batch__risk", text: ` High risk: ${item.high_risk_reason}` }) : el("span"),

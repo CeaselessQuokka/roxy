@@ -13,7 +13,7 @@
 {% from "components/empty.html" import empty_state %}
 {% from "components/icon.html" import icon %}
 {% from "components/format.html" import num, caller_text %}
-{% from "admin/pages/upstream/_macros.html" import when %}
+{% from "components/pieces.html" import when %}
 {% call page_card(frame) %}
 {% for item in items %}
 <div class="g3-trip">
@@ -40,10 +40,10 @@
 {% endfor %}
 {% if guard %}
 <div class="table-scroll g3-scroll" role="region" aria-labelledby="guard-caption" tabindex="0">
-  <table class="simple-table g3-table">
+  <table class="simple-table g3-table g3-table--stack">
     <caption id="guard-caption" class="g3-caption">Guard counters on this worker</caption>
     <thead><tr><th scope="col">Egress</th><th scope="col" class="num">Calls checked</th><th scope="col" class="num">Trips</th><th scope="col" class="num">Smuggling refused</th></tr></thead>
-    <tbody>{% for g in guard %}<tr><td>{{ g.label }}</td><td class="num">{{ num(g.inspected) }}</td><td class="num">{{ num(g.leak_trips) }}</td><td class="num">{{ num(g.smuggling) }}</td></tr>{% endfor %}</tbody>
+    <tbody>{% for g in guard %}<tr><td data-label="Egress">{{ g.label }}</td><td data-label="Calls checked" class="num">{{ num(g.inspected) }}</td><td data-label="Trips" class="num">{{ num(g.leak_trips) }}</td><td data-label="Smuggling refused" class="num">{{ num(g.smuggling) }}</td></tr>{% endfor %}</tbody>
   </table>
 </div>
 {% endif %}

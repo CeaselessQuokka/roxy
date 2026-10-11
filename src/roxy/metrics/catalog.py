@@ -94,11 +94,16 @@ _SPECS: tuple[MetricSpec, ...] = (
         "avoided_pct",
         "Avoided upstream calls (percent)",
         "percent",
-        "The share of caller demand that never reached Roblox.",
-        "Avoided upstream calls divided by caller demand, times 100. Empty when there was no demand.",
+        "The share of caller demand that never reached Roblox. It can be below 0%: when retries and background "
+        "refreshes made more calls to Roblox than callers sent requests, -100% means 2 upstream calls per request. "
+        "Roxy shows it as it is instead of rounding it up to 0% (honest numbers).",
+        "Avoided upstream calls divided by caller demand, times 100. Empty when there was no demand. Negative when "
+        "the upstream calls made for caller traffic (retries and refreshes included) outnumber the requests; never "
+        "clamped.",
         _ROLLUPS,
         ("overview#kpis", "cache#stats"),
         better="higher",
+        notes="Plan principle P6: the definition never flatters, so a negative share is shown, with avoided_note.",
     ),
     MetricSpec(
         "upstream_calls",
@@ -107,7 +112,7 @@ _SPECS: tuple[MetricSpec, ...] = (
         "How many requests Roxy sent to Roblox on behalf of callers, including retries and background refreshes.",
         "Sum of `upstream_calls` over rollup rows whose source is not `internal`.",
         _ROLLUPS,
-        ("overview#kpis", "upstream#calls"),
+        ("overview#kpis", "upstream#health"),
         better="lower",
     ),
     MetricSpec(
@@ -140,7 +145,7 @@ _SPECS: tuple[MetricSpec, ...] = (
         "Caller requests during which an upstream or internal error happened, whether or not the caller saw it.",
         "Sum of `errors` over rollup rows whose source is not `internal`.",
         _ROLLUPS,
-        ("traffic#requests", "upstream#calls"),
+        ("traffic#requests", "upstream#health"),
         better="lower",
     ),
     MetricSpec(
@@ -192,7 +197,7 @@ _SPECS: tuple[MetricSpec, ...] = (
         "Rows of the `upstream_429` log in the range: every 429 Roblox sent, counted once per upstream attempt, "
         "even when Roxy then served the caller from the cache or retried successfully.",
         "upstream_429",
-        ("overview#kpis", "upstream#429s"),
+        ("overview#kpis", "upstream#429-timeline"),
         better="lower",
     ),
     MetricSpec(
@@ -213,7 +218,7 @@ _SPECS: tuple[MetricSpec, ...] = (
         "Roblox rate limiting Roxy.",
         "Sum of `requests` with status 429 and source `roxy`.",
         _ROLLUPS,
-        ("overview#kpis", "traffic#status-codes"),
+        ("overview#kpis", "traffic#status"),
     ),
     MetricSpec(
         "status_5xx",
@@ -222,7 +227,7 @@ _SPECS: tuple[MetricSpec, ...] = (
         "Server error statuses (500 to 599) sent to callers, whoever produced them.",
         "Sum of `requests` with a caller status from 500 to 599.",
         _ROLLUPS,
-        ("overview#kpis", "traffic#status-codes"),
+        ("overview#kpis", "traffic#status"),
         better="lower",
     ),
     MetricSpec(
@@ -234,7 +239,7 @@ _SPECS: tuple[MetricSpec, ...] = (
         "Sum of `requests` with a caller status from 500 to 599 and source `roblox` or `relay`, or reason "
         "`upstream_5xx` (a Roblox 5xx after the retries, recorded with source `roxy` because the text is Roxy's).",
         _ROLLUPS,
-        ("overview#kpis", "traffic#status-codes"),
+        ("overview#kpis", "traffic#status"),
         better="lower",
     ),
     MetricSpec(
@@ -246,7 +251,7 @@ _SPECS: tuple[MetricSpec, ...] = (
         "the caller is not counted here.",
         "Sum of `requests` with a caller status from 500 to 599 and source `roxy`, except reason `upstream_5xx`.",
         _ROLLUPS,
-        ("traffic#status-codes",),
+        ("traffic#status",),
         better="lower",
     ),
     MetricSpec(
@@ -256,7 +261,7 @@ _SPECS: tuple[MetricSpec, ...] = (
         "Successful responses sent to callers.",
         "Sum of `requests` with a caller status from 200 to 299.",
         _ROLLUPS,
-        ("overview#kpis", "traffic#status-codes"),
+        ("overview#kpis", "traffic#status"),
         better="higher",
     ),
     MetricSpec(
@@ -266,7 +271,7 @@ _SPECS: tuple[MetricSpec, ...] = (
         "Client error responses sent to callers, from Roblox (for example 404) or from Roxy (refusals).",
         "Sum of `requests` with a caller status from 400 to 499.",
         _ROLLUPS,
-        ("overview#kpis", "traffic#status-codes"),
+        ("overview#kpis", "traffic#status"),
     ),
     MetricSpec(
         "timeouts",
@@ -275,7 +280,7 @@ _SPECS: tuple[MetricSpec, ...] = (
         "Requests that failed because Roblox did not answer in time.",
         "Sum of `requests` with reason `upstream_timeout`.",
         _ROLLUPS,
-        ("upstream#calls",),
+        ("upstream#health",),
         better="lower",
     ),
     MetricSpec(
@@ -528,7 +533,7 @@ _SPECS: tuple[MetricSpec, ...] = (
         "CPU use of a worker process, as a share of the CPU time it can get.",
         "`worker_minute.cpu_pct_sum / samples` per minute (the mean of the samples the worker reported).",
         "worker_minute",
-        ("system#metrics-pipeline",),
+        ("system#fleet",),
         better="lower",
     ),
     MetricSpec(
@@ -588,6 +593,20 @@ GLOSSARY_TERMS: Final[dict[str, str]] = {
 }
 
 _DASHES = (chr(0x2014), chr(0x2013))  # built at runtime so this file never contains the characters it bans
+
+
+def avoided_note(pct: float | None) -> str | None:
+    """Plain words for a negative avoided share (`avoided_pct` below 0), else None.
+
+    Plan P6 keeps the definition (caller demand minus the upstream calls made for caller traffic) and never clamps
+    it, so a share below 0% is shown as it is, with why: the upstream calls per caller request follow from the share
+    itself (`1 - pct / 100`: -100% is 2 calls a request). Every page that shows an avoided share (Overview, Cache,
+    Endpoints, Traffic) and the API tiles use this one sentence.
+    """
+    if isinstance(pct, bool) or not isinstance(pct, int | float) or pct >= 0:
+        return None
+    per_request = f"{1.0 - float(pct) / 100.0:,.2f}".rstrip("0").rstrip(".")
+    return f"retries and refreshes made {per_request} upstream calls per request"
 
 
 def catalog_self_check() -> None:

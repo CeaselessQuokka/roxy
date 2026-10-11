@@ -22,9 +22,9 @@
     <tr>
       <th scope="row" class="ov-top__key">{{ caller_text(row.key, 80) }}</th>
       <td class="num" data-label="Requests">{{ num(row.requests) }}</td>
-      <td class="num" data-label="Refused">{{ num(row.refused) }}{% if row.refused_pct is not none %} <span class="muted">({{ metric_value(row.refused_pct, "percent") }})</span>{% endif %}</td>
+      <td class="num" data-label="Refused"><span>{{ num(row.refused) }}{% if row.refused_pct is not none %} <span class="muted">({{ metric_value(row.refused_pct, "percent") }})</span>{% endif %}</span></td>
       <td class="num" data-label="Per minute">{{ metric_value(row.rate1) }} / {{ metric_value(row.rate5) }} / {{ metric_value(row.rate60) }}</td>
-      <td data-label="Top endpoint">{{ caller_text(row.top_endpoint, 80) }}</td>
+      <td data-label="Top endpoint"><span class="ov-top__endpoint">{{ caller_text(row.top_endpoint, 80) }}</span></td>
     </tr>
     {% endfor %}
   </tbody>

@@ -3,7 +3,8 @@
 What this is
     `local_time(ts, tz)`, `iso(ts)`, `ago(seconds)` and `since_text(ts, now, tz)` turn epoch seconds into the texts
     the dashboard shows ("Oct 9, 14:02:05", "12 minutes ago"); `time_cell(ts, tz, now)` is the `{"text",
-    "datetime", "sub"}` cell the table macro renders as a `<time>` element.
+    "datetime", "sub"}` cell the table macro renders as a `<time>` element. `avoided_cell(pct)` is the one way every
+    page shows an avoided share: a negative one as it is, with why (`metrics.catalog.avoided_note`).
 
 Why it exists
     Templates format numbers with `components/format.html`, but times need a time zone and "now", which only the
@@ -23,6 +24,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Final
 
+from roxy.metrics.catalog import avoided_note
 from roxy.metrics.rollups import zone
 
 MISSING: Final = "n/a"
@@ -92,4 +94,17 @@ def time_cell(ts: Any, tz: str, now: float | None = None) -> dict[str, Any] | No
     return cell
 
 
-__all__ = ["MISSING", "ago", "iso", "local_time", "since_text", "time_cell"]
+def avoided_cell(pct: Any) -> dict[str, Any] | None:
+    """An avoided share (`avoided_pct`) as a table cell: `12.5%`; a negative share as it is (plan P6 never clamps it)
+    with why under it (`metrics.catalog.avoided_note`: "-100.0%" and "retries and refreshes made 2 upstream calls
+    per request") in the warning tone. None (the table's "n/a") when there was no demand."""
+    if isinstance(pct, bool) or not isinstance(pct, int | float):
+        return None
+    note = avoided_note(pct)
+    cell: dict[str, Any] = {"text": f"{float(pct):,.1f}%"}
+    if note:
+        cell.update(sub=note, tone="warn")
+    return cell
+
+
+__all__ = ["MISSING", "ago", "avoided_cell", "iso", "local_time", "since_text", "time_cell"]

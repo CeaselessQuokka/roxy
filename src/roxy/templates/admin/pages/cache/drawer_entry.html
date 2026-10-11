@@ -15,7 +15,7 @@
 {% from "components/badges.html" import badge %}
 {% from "components/alert.html" import inline_alert %}
 {% from "components/icon.html" import icon %}
-{% macro when(cell) %}{% if cell %}<time datetime="{{ cell.datetime }}">{{ cell.text }}</time> <span class="muted">({{ cell.sub }})</span>{% else %}<span class="muted">n/a</span>{% endif %}{% endmacro %}
+{% from "components/pieces.html" import when %}
 <div class="cache-drawer stack" data-cache-entry="{{ entry.id }}">
   <p class="cache-drawer__key">{{ caller_text(entry.key, 600, block=True) }}</p>
   <p class="cluster">{{ badge(state_words, state_tone if state_tone in ("ok", "warn", "bad") else "neutral") }} {{ badge("HTTP " ~ entry.status, "neutral") }}{% if entry.auth_class == "cred" %} {{ badge("fetched with the credential", "warn") }}{% endif %}</p>

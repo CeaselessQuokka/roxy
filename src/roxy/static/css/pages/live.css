@@ -111,40 +111,6 @@
   font-size: var(--fs-1);
 }
 
-/* The inline reset in the drawer (roxy/admin/pages/_traffic_reset.py). */
-.g2-reset__lead {
-  max-width: 70ch;
-}
-
-.g2-reset__section {
-  display: grid;
-  gap: var(--sp-3);
-}
-
-.g2-reset__heading {
-  font-size: var(--fs-3);
-}
-
-.g2-reset__snapshots {
-  display: grid;
-  gap: var(--sp-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  font-size: var(--fs-1);
-}
-
-.g2-reset__snapshots li {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--sp-2);
-}
-
-.g2-reset__snapshots .icon {
-  flex: none;
-  margin-top: 2px;
-}
-
 @media (max-width: 760px) {
   /* Two selects a row, the two text fields full width: the list stays near the top of the screen. */
   .lv-tail-card .tail__filters .chip-select {
@@ -162,8 +128,7 @@
 
   .lv-tail-card .tail__filters select,
   .lv-tail-card .tail__filters input,
-  .lv-tail-card .tail__head .btn,
-  .g2-reset__form .btn {
+  .lv-tail-card .tail__head .btn {
     min-height: var(--target-touch);
   }
 

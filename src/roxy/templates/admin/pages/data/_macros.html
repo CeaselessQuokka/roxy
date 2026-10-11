@@ -5,18 +5,17 @@
   setting that sets it (its inline editor on this page, else the Settings page); `limit_table(rows, caption, ...)`
   is the table of tables against their limits (retention and record cap cards); `typed_dialog(...)` is a confirm
   dialog whose typed phrase is itself sent to the API as `confirm` (VACUUM asks for the phrase in its body).
-  Why: the shared confirm dialog never sends its typed text (it only gates the button), but `POST /data/vacuum`
-  checks the phrase on the server too, so the admin's own typing is what the API receives.
-  How: plain macros over the shared components; the dialog keeps the shared markup and the `typeConfirm` Alpine
-  component, so the button stays off until the text matches.
+  Why: `POST /data/vacuum` checks the phrase on the server too, so the admin's own typing is what the API
+  receives (the shared confirm dialog's `confirm_field`).
+  How: plain macros over the shared components; the dialog is `components/dialog.html confirm_dialog` with the
+  `typeConfirm` Alpine component, so the button stays off until the text matches.
 -#}
 {% from "components/icon.html" import icon %}
+{% from "components/dialog.html" import confirm_dialog %}
 {% from "components/format.html" import num %}
 
-{% macro when(cell, empty="n/a") -%}
-{%- if cell -%}<time datetime="{{ cell.datetime }}">{{ cell.text }}</time>{% if cell.sub %}<span class="dt__sub">{{ cell.sub }}</span>{% endif %}
-{%- else -%}<span class="muted">{{ empty }}</span>{%- endif -%}
-{%- endmacro %}
+{% from "components/pieces.html" import when as _when %}
+{% macro when(cell, empty="n/a") -%}{{ _when(cell, empty=empty, stacked=True) }}{%- endmacro %}
 
 {% macro setting_ref(link) -%}
 {%- if link %} <a class="data-setting-ref" href="{{ link.href }}">{{ link.label }}</a>{% endif -%}
@@ -50,37 +49,9 @@
 
 {% macro typed_dialog(id, title, action, phrase, consequences=(), confirm_label="Confirm", hidden=None, success="Done.",
                       refresh="", body=None) -%}
-<dialog class="dialog dialog--danger" id="{{ id }}" aria-labelledby="{{ id }}-title" aria-describedby="{{ id }}-desc">
-  <form class="dialog__form" data-dialog-form x-data="typeConfirm" x-on:reset="clear" data-expected="{{ phrase }}"
-        data-api-form data-api-url="{{ action }}" data-api-method="POST" data-success="{{ success }}"
-        data-on-success="refresh" data-refresh="{{ refresh }}" data-operation novalidate>
-    <header class="dialog__head">
-      <h2 class="dialog__title" id="{{ id }}-title">{{ icon("alert-triangle", cls="dialog__title-icon") }}{{ title }}</h2>
-      <button type="button" class="icon-btn" data-dialog-close aria-label="Close">{{ icon("x") }}</button>
-    </header>
-    <div class="dialog__body">
-      <div id="{{ id }}-desc">
-        {% if body %}<p>{{ body }}</p>{% endif %}
-        {% if consequences %}<p class="dialog__label">What happens</p>
-        <ul class="dialog__consequences">{% for c in consequences %}<li>{{ c }}</li>{% endfor %}</ul>{% endif %}
-      </div>
-      {% for name, value in (hidden or {}).items() %}<input type="hidden" name="{{ name }}" value="{{ value }}" data-json="string">{% endfor %}
-      <div class="field">
-        <label class="field__label" for="{{ id }}-reason">Reason <span class="muted">(optional, saved in the audit log)</span></label>
-        <textarea class="input" id="{{ id }}-reason" name="reason" rows="2" maxlength="500" data-json="skip-empty"></textarea>
-      </div>
-      <div class="field">
-        <label class="field__label" for="{{ id }}-confirm">Type <strong class="mono">{{ phrase }}</strong> to confirm</label>
-        <input class="input mono" id="{{ id }}-confirm" name="confirm" autocomplete="off" spellcheck="false" autocapitalize="off"
-               x-on:input="onType" data-json="string" aria-describedby="{{ id }}-confirm-hint">
-        <p class="field__hint" id="{{ id }}-confirm-hint">The button stays off until the text matches.</p>
-      </div>
-      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
-    </div>
-    <footer class="dialog__foot">
-      <button type="button" class="btn btn--ghost" data-dialog-close>Cancel</button>
-      <button type="submit" class="btn btn--danger" x-bind:disabled="blocked">{{ confirm_label }}</button>
-    </footer>
-  </form>
-</dialog>
+{%- set types = {} -%}{%- for name in (hidden or {}) %}{% set _ = types.update({name: "string"}) %}{% endfor -%}
+{{ confirm_dialog(id, title, action, confirm_label=confirm_label, danger=True, consequences=consequences, body=body,
+                  type_to_confirm=phrase, confirm_field="confirm", confirm_hint="The button stays off until the text matches.",
+                  reason=True, hidden=hidden, hidden_types=types, api=True, success=success, on_success="refresh",
+                  refresh=refresh, form_attrs={"data-operation": "", "novalidate": ""}) }}
 {%- endmacro %}

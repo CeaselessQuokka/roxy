@@ -241,6 +241,17 @@ use, no tarpit hold, no admin login, and a conservative per-worker rate limit of
 passes a shorter budget (`busy_timeout_ms`), measured from the moment the job was queued, so a locked hot.db costs
 a request half a second, not five.
 
+Two things keep the workers from queuing behind hot.db's one write lock (finding LOAD-3, `docs/PERFORMANCE.md`).
+A writer thread waits for the lock in short polls (`roxy.storage.db.LOCK_POLL_MS`, 2 ms a try) instead of SQLite's
+own backoff, which sleeps up to 100 ms between tries and let one worker fall behind while the other took the lock
+again and again. And in a backlog (at least `GROUP_MIN_QUEUE` writes waiting) the hot.db writer runs the queued
+hot-path writes (the ones with a budget) in one transaction, group commit: each in its own savepoint, in queue
+order, each seeing the writes before it, and every caller answered only after COMMIT. A failing write undoes only
+its own changes and gets its own exception; when the transaction itself is lost, every write of it is answered
+`SharedStateUnavailable`. The full contract is in `_ConnectionThread._run_group`, and the tests in
+`tests/unit/storage/test_storage_db_group_faults.py` pin each part of it. A function passed to `write` must
+therefore never end the transaction it runs in (`tests/unit/storage/test_storage_txn_contract.py`).
+
 ### Migrations
 
 `roxy.storage.migrate` runs numbered SQL files. Expand migrations only add (tables, columns, indexes), so the
@@ -296,7 +307,7 @@ health run slot) first claim an idempotency key in hot.db `job_runs`.
 | Job | Runs on | What it does |
 |---|---|---|
 | `metrics_compaction` | leader | Folds closed minutes into hours, days and months; keeps the top clients. |
-| `metrics_live_prune`, `metrics_security_caps`, `fingerprint_auto_ignore` | leader | Delete live rows older than 15 minutes, keep the probe, login and crawl events within their caps, and stop listing header values that are unique per request. |
+| `metrics_live_prune`, `metrics_security_caps`, `fingerprint_auto_ignore` | leader | Delete live rows older than 15 minutes, keep the probe, login and crawl events within their caps, delete any stored value of a header that carries client addresses, and stop listing header values that are unique per request. |
 | `retention`, `hot_prune`, `file_retention` | leader | Plan 6.10 retention for tables, hot.db rows, exports and snapshots. |
 | `wal_checkpoint_passive`, `daily_maintenance` | leader | PASSIVE checkpoints every few minutes; the daily TRUNCATE checkpoint, `quick_check` and `optimize` at `maintenance_hour`. |
 | `adaptive_rate_increase` | leader | Slowly raises a bucket rate that demand proves too low (never one an admin set). |
@@ -361,24 +372,29 @@ The page caches add up to at most 30 MiB per worker, and only fill as pages are 
 libraries, the HTTP connection pools and the recorder's counters are the remaining part; they have not been
 measured on the server yet. Each worker reports its resident memory in its heartbeat every 5 s (the `rss` field of
 `worker_heartbeat`, shown on the System page through `GET /admin/api/v1/system/workers`), so the real figure is
-visible from the first day. The load harness measured a development machine, not the production box: the leader
-worker kept growing over a long replay (finding LOAD-2) because each recommendations evaluation read a day of request
-samples as dicts; reads are now compact and bounded, the units tune glibc's allocator, and a color measured 332 MiB
-of PSS after a 35 minute soak. `docs/PERFORMANCE.md` has the figures and the quiet-machine commands to measure again
-before release.
+visible from the first day. The load harness measured a development machine, not the production box (finding
+LOAD-2): each recommendations evaluation used to read a day of request samples as dicts and keep every read until it
+ended, so the leader worker grew with the traffic (660 MiB after 30 minutes at 200 requests a second); reads are now
+compact and bounded, the units tune glibc's allocator, and a color whose workers recycle every 20,000 requests
+settles at 365 to 405 MiB of PSS. `docs/PERFORMANCE.md` has the figures and the quiet-machine commands to measure
+again before release.
 
 ### What one color may hold
 
 systemd caps each color (`deploy/systemd/roxy@.service`):
 
-- `MemoryHigh=350M`: above this the kernel reclaims the color's memory aggressively and slows it down.
-- `MemoryMax=450M`: the hard limit; above it the color's processes are killed and systemd restarts the color.
+- `MemoryHigh=420M`: above this the kernel reclaims the color's memory aggressively and slows it down. A healthy
+  color stays under it at any request rate measured.
+- `MemoryMax=500M`: the hard limit; above it the color's processes are killed and systemd restarts the color.
 
-During a deploy both colors run for a few minutes. Two colors at `MemoryHigh` (700 MB) plus nginx and the
-operating system (about 200 MB) fit the 909 MB; `tests/deploy/test_deploy_units.py::test_memory_numbers_fit_the_909_mb_server`
-checks that arithmetic. When less than 700 MB is available before the restart, `deploy/deploy.sh` switches to
-low-memory mode: the idle color starts with one worker and grows to `ROXY_WORKERS` after the old color stopped,
-through the gunicorn control socket (`--low-memory` forces it, `--no-low-memory` turns it off).
+During a deploy two colors run for a few minutes, but never two warm ones: the new color always starts fresh
+(about 155 MiB with one worker, 275 MiB with two) and the old one stops after the watch. A warm color at
+`MemoryMax` plus a fresh one-worker color plus nginx and the operating system (about 200 MB) fit the 909 MB;
+`tests/deploy/test_deploy_units.py::test_memory_numbers_fit_the_909_mb_server` checks that arithmetic. When less
+than 700 MB is available before the restart (always, on this server, while a warm color runs), `deploy/deploy.sh`
+switches to low-memory mode: the idle color starts with one worker and grows to `ROXY_WORKERS` after the old color
+stopped, through the gunicorn control socket (`--low-memory` forces it, `--no-low-memory` turns it off). Two warm
+colors at once (about 2 x 405 MiB) would not fit, so the idle color is never started by hand (`deploy/README.md`).
 
 ### If memory runs short
 

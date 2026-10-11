@@ -12,7 +12,8 @@ per-phase progress notes and the full parity list are added as the phases land.
   assume 2 GB. SQLite page caches are scaled down per DESIGN.md section 0 (control 2048/1024 KiB, hot 4096/1024,
   metrics 8192/2048, cache 4096/2048 for the writer and reader connections), `mmap_size` is 0 except 32 MiB on
   cache.db, `cache_memory_bytes` defaults to 16 MiB and `cache_memory_entries` to 1000, systemd uses
-  `MemoryHigh=320M` and `MemoryMax=420M` per color, and `ROXY_WORKERS=2`. The deploy switches to low-memory mode
+  `MemoryHigh=320M` and `MemoryMax=420M` per color (raised to 420M and 500M by the P11 perf lane, finding
+  LOAD-2: see that section below), and `ROXY_WORKERS=2`. The deploy switches to low-memory mode
   (the idle color starts with one worker) when less than 700 MB is available.
 - **Owner decisions.** D1: the credential is never sent for callers (the allowlist starts empty; only Roxy's own
   probes use it). D4: callers see Roblox's real status (`compat_collapse_upstream_errors=0`). D5: TOTP is
@@ -1863,6 +1864,12 @@ Two lenses checked the round 3 fixes and filed 13 findings (1 high, 7 medium, 5 
   BatchWriter.run` promised one more flush); it now flushes once more (seen as an intermittent
   `test_run_loop_flushes_periodically_and_on_stop` under load, now pinned by a deterministic test).
 
+### P11 part two: dashboard pages and the lanes (2026-10-10 to 2026-10-11)
+
+The pages, the three load findings (LOAD-1 to LOAD-3), the phone flows, the page latency, the docs pass and the three
+gaps lanes. Reports: `.remake/p11_reports/`; contracts: DESIGN.md section 15. The progress note is "P11 part two" under
+"Progress notes per phase".
+
 #### P11 lane: upstream pacing, finding LOAD-1 fixed (2026-10-10; `upstream/buckets.py`, `adaptive.py`)
 
 Plan 19.10 row 7's replay now keeps Roblox 429s under 0.1% of upstream calls at the plan's defaults (1 in about 1,030
@@ -1908,6 +1915,373 @@ Report: `.remake/p11_reports/pacing.md`.
 - **Tests:** the upstream fleet test now also checks the plan's cut after a first-call 429; the multiprocess 429 test
   checks the window guarantee (at most the limit, never limit plus burst) and the learned limit across two processes;
   one admin API expectation follows the new spacing (an endpoint bucket 3 s ahead is 54.6% full, not 60%).
+
+#### P11 lane: memory and the hot.db write lock, findings LOAD-2 and LOAD-3 fixed (2026-10-10; `storage/db.py`, `metrics/read_history.py`, `insights/context.py`, `abuse/`, `worker.py`, `deploy/systemd/roxy@.service`)
+
+Report: `.remake/p11_reports/perf.md` (final text); figures in `docs/PERFORMANCE.md` "LOAD-2 and LOAD-3"; contract in
+DESIGN.md 15.7. Measured on the shared development box (load average 5 to 12), before and after side by side.
+
+- **Plan conflict, memory per color (supersedes DESIGN.md section 0's 320M and 420M).** systemd now holds each color
+  at `MemoryHigh=420M` and `MemoryMax=500M`. Measured: a color whose workers recycle every 20,000 requests settles at
+  about 365 MiB of PSS at 10 requests a second and 405 MiB at 200; 320M would throttle a healthy color within 20
+  minutes and 350M within the hour. A deploy fits 909 MB because the new color always starts fresh (one worker below
+  700 MB available, which a warm color always causes on this server): a warm color at 500 plus a fresh one-worker
+  color (155) plus nginx and the OS (200) is 855. Two warm colors (about 1,010; 1,040 at `MemoryHigh`) do not fit:
+  deploy/README.md says never to start the idle color by hand, and `test_memory_numbers_fit_the_909_mb_server` checks
+  the arithmetic (and reads the 700 MB threshold from `deploy.sh`).
+- **glibc allocator tuning in the units:** `MALLOC_ARENA_MAX=2`, `MALLOC_MMAP_THRESHOLD_=131072`,
+  `MALLOC_TRIM_THRESHOLD_=131072` (20 MiB less per color in the same soak). The load harness applies a measured tree's
+  `Environment=` lines as systemd does.
+- **The recommendations evaluation no longer grows with the traffic (LOAD-2's cause).** Sample reads return compact
+  read-only `SampleRecord` mappings (a third of the memory of dicts), and one evaluation keeps at most 50,000 sample
+  rows memoized (`MAX_MEMO_SAMPLE_ROWS`; older reads are read again when asked). At a day's volume one evaluation
+  peaked at 251.5 MiB before and 35.6 MiB after, and took 3.5 s instead of 1.7 s (fixed by the gaps lane: about 0.6 s,
+  see "P11 gaps lane: the recommendations evaluation" below). After 30 minutes at 200 requests a second the leader was
+  660 MiB before and 290 MiB after; the color 819 MiB before and 477 after, with the cache hit p99 at 113 ms instead of
+  42.9 s and no HTTP 503 instead of 1,125.
+- **Soak at 10 requests a second (35 minutes, 2 workers, no recycling):** color PSS 364.7 MiB before and 354.0 after
+  (the after tree starts 27 MiB higher: it carries the P11 pages); the leader's slope 1.48 to 0.62 MiB a minute; at
+  the end the leader holds 218 MiB RSS and the other worker 166.
+- **The bot tracker creates a client's probe and query histories when first used** (3.3 instead of 4.1 KB a client,
+  up to 32 instead of 39 MiB a worker at its 10,000-client bound). Scores are unchanged.
+- **hot.db waits and group commit (LOAD-3).** Every writer `BEGIN IMMEDIATE` waits for the lock in 2 ms polls until
+  its budget (or 5 s) instead of SQLite's backoff of up to 100 ms a sleep; in a backlog (8 or more writes queued) the
+  hot.db writer runs the queued budgeted writes in one transaction, each in its own savepoint, answered only after
+  COMMIT (contract in DESIGN.md 15.7). Ordinary writes never group. The spam flush reads and writes its rows in a few
+  statements, and limiter and strike rows are written with one statement per 150. Measured ceiling (answered a second
+  at 450 offered, 3 interleaved runs): 179 before, 286 after (group commit is 23 of it); at 200 a second Roxy's own
+  p95 293 to 149 ms, lock wait p99 in the 10 ms bucket in 5 of 6 worker readings, hold p50 0.25 to 1 ms.
+- **Write contract:** a function passed to `Database.write` must never end its transaction (no COMMIT, ROLLBACK, END,
+  `commit()`, `executescript()`) and SQL must not use the ROLLBACK conflict resolution; a test scans `src/roxy`.
+- **`gc.freeze()` after a worker started** (full collections skip the startup heap; worst pause 156 to 108 ms on the
+  leader).
+- **System page, metrics pipeline card:** each database row gains `lock_wait_ms`, `hold_ms` (`{n, p50, p95, p99,
+  max}` bucket bounds of every write transaction since start), `groups`, `grouped_writes`, `largest_group`.
+- **Load harness:** `--steady-connections`, the steady table's "hot.db write lock, every transaction" and "metrics
+  queue (sampled max)" rows, and memory rows that name the measured tree's own `MemoryHigh` and `MemoryMax`.
+- Texts that named the old limits were updated: DESIGN.md section 0, the `cache_memory_bytes` high-risk text and notes
+  (and so `docs/SETTINGS.md`), the docstring of `test_r3_mpjobs_exports.py`; with 500M the 32 MiB per worker
+  high-risk threshold of `cache_memory_bytes` stays.
+- Still open (perf.md section 9, LEAD_NOTES "P11 part two"): per-client bounds (the bot tracker and the spam
+  detectors' per-client state are what still grows at high rates until a worker recycles), the OS and nginx memory on
+  the server (about 200 MB assumed), the abuse transaction's p99 under contention (plan 6.7's 3 ms is not met: GIL
+  waits), one request over an address's GCRA bound in degraded mode under a flood (4 before), and the quiet-machine
+  rerun.
+
+#### P11 dashboard pages (2026-10-10; `roxy/admin/pages/`, `templates/admin/`, `static/`; integration)
+
+Reports: `.remake/p11_reports/core.md`, `g1_overview.md` to `g7_settings.md`, `integrate.md`; the pages as built are
+DESIGN.md section 15.
+
+- **All 18 pages are built** (plan 14.1); the "coming soon" placeholder of the build period is gone, and a missing page
+  module now fails the startup instead of hiding behind it. Every v1 section of the plan 14.1 map has a passing test
+  (`tests/e2e/test_v1_sections.py`, a page that is not built now fails a row instead of skipping it), and every
+  catalog key is editable on a feature page (`tests/e2e/test_every_setting.py`, same rule).
+- **Page routes are GET only;** every change goes through the admin API (forms post JSON, inline settings through the
+  settings API), so validation, risk rules, fresh second factors and the audit log have one implementation.
+- **The page test harness is `tests/pages_harness.py`** (it was `roxy.admin.pages.testing`, inside the shipped
+  package; it writes fake credential files and patches the socket module, so it never ships). Bidirectional control
+  characters in test sources are written as escapes.
+- **Lazy cards load one at a time right after the page** (`static/js/cards.js`), on every page, as well as when they
+  scroll into view; the five page-local loaders of the build (and the g3 pages' "deferred" cards) are gone.
+- **Tables:** a table's answer may be its whole card (`hx-select` keeps the table), and the card's refresh address
+  follows the table's search, filters, sort and rows per page (`static/js/tables.js`), on every page.
+- **Inline resets** (plan 6.8) are a drawer previewed by the Data API's own read-only functions and run only by
+  `POST /admin/api/v1/data/resets`, with a reason and, for a whole family, the typed phrase (`roxy/admin/pages/
+  resets.py`); the Cache, Clients and Protection clears use the shared confirm dialog with the same preview, phrase and
+  reason. v1 cleared at once.
+- **Help:** the shortcuts card is `help#keys` (the id `shortcuts` is the shell's `?` overlay); `docs/ADMIN_GUIDE.md`
+  is a skeleton (one chapter per page plus getting started, alerts, backups and resets, the operator CLI) that the
+  docs phase fills; the guide card links it and keeps the plan 16.3 outline with the pages that cover each topic.
+- **Setting control:** a string setting longer than 200 characters or holding a line break is a textarea (the public
+  site's paragraphs no longer look edited on load or lose their line breaks on save); a number field keeps 7rem beside
+  a long unit.
+- **Catalog:** `insight_cred_probe_cost_max_per_hour` is also in its rule's "Tune this rule" drawer
+  (`recommendations#rule-cred_probe_cost`), CRED-PROBE-COST's only threshold. The seven spam detector cards keep their
+  settings folded (one click away).
+- **Reset families name real cards:** `upstream` names `upstream#health`, `throttled_clients` `protection#throttle`,
+  `header_rule_attempts` `protection#request-filters` (the API's `/data/resets` answer changed only in these values).
+- **Owner-facing texts no longer cite plan rows** (the workers export, the message source column, two "Nothing to
+  reset" notes).
+- **Templates are warmed at startup (decision, `dashboard_lifespan`):** every dashboard template under `admin/` and
+  `components/` (not the gallery) is compiled when a worker starts (39 templates when measured: about 270 ms and
+  4.3 MB a worker, `app.state.admin_templates_warmed`, log `dashboard_templates_warmed`), so the first admin request
+  after a restart does not pay the compile and no request compiles a template; the glossary is loaded there too, and
+  a missing `docs/glossary.yml` fails the startup (P11 part one's open item).
+- **The pages' deviations** (the builders' reports, "Deviations for CHANGES.md", as integrated; what a later lane
+  changed is in brackets):
+  - Shell and core (`core.md`): `caller_texts`, the glossary loader and `diff_lines` moved from
+    `roxy/admin/gallery.py` to `roxy/admin/pages/texts.py` (the gallery re-exports them, so production code never
+    imports the gallery); the table macro takes the API's `page_size` and `order` (`size` and `dir` still work), and
+    rows may name their drawer; comparison values are the API's `none`, `previous`, `week`, `month` and `year`; the
+    palette's "Run health check" and the Overview's Check Proxy Health leave the credential check out (a shortcut
+    must not spend the credential's budget; the Health page offers it); the pause and emergency limit dialogs post
+    JSON to the protection API and the pause field is `message` (v1's `reason`); a 403 `reauth_required` opens
+    "Confirm it is you" and retries once, and the old "needs your second factor" toast shows only when the admin
+    cancels; the Audit page opens on the whole log (range All) and the top bar's range filters by the action's time.
+  - Overview, Recommendations, Health (`g1_overview.md`): "Export data" (the Data page exports every table) replaces
+    v1's Overview "Export CSV"; the Visitors card's Reset (family `visits`) replaces v1's "Clear data"; v1's Refresh
+    and auto-refresh are stream refreshes; a tile's notice that is not about a reset shows under its value and keeps
+    the delta (only `partial` replaces it); the two top-ten tables stack unless both fit; event severities read as
+    words. Recommendations and Health open on range All (the list is not time ranged; the range filters History and
+    the runs); evidence timelines are sparklines drawn on the server with data tables (the rule's own minute data);
+    `/admin/recommendations/<id>` redirects to `?rec=<id>`; a finished health run lists what needs attention first,
+    and the page polls the run card every 4 s while a run shows as running without a stream event.
+  - Traffic, Endpoints, Live (`g2_traffic.md`): new page routes `GET /admin/endpoints/template?template=` (the
+    drill-down page) and `GET /admin/live/request?id=` (the request drawer, also opened from Endpoints); Live keeps
+    `?outcome=&status=&egress=&cache=&client=&endpoint=` and `?request=` in the address; the latency answer's fixed
+    sentence is the card's note, not a chart notice; the Endpoints table shows v1's columns first and hides eight v2
+    columns (the column chooser shows them), with the trend under each request count; the Live tail replays the
+    newest 40 recorded rows through the stream (`last_event_id`) instead of a separate list request.
+  - Upstream, Egress, Credential (`g3_upstream.md`): probe rows read their "why" from the recorded `trigger`, and a
+    429 probe reads "Rate limited"; table counts that follow a filter (Upstream failures, Egress top endpoints) are
+    swapped with the table (`hx-select-oob`) instead of being the card's subtitle; small tables stack into labeled
+    lines below 600 px instead of scrolling sideways; the rotator card's state words follow v1's Rotate tile ("Not
+    configured", "Off" with the reason, "Parked", "Cooling down", "Working"). [Their cards that loaded right after
+    the page became ordinary lazy cards of the shared loader.]
+  - Cache, Clients (`g4_cache.md`): Cache "Clear stats" is the family reset `cache_stats` and Clients "Clear data"
+    the family `activity`, previewed with a reason and the typed phrase (v1 cleared at once); one client is reset from
+    its own view (scope `client`, no phrase); "Purge matching" removes exactly what the browser's search lists
+    (`scope: search`, v1 bug 4; v1 purged a glob of the search text); v1's per-row actions of Callers and Top Talkers
+    (Identify, Block, Bypass, Filter feed) live in the client drawer and the client's own page
+    (`/admin/clients/ip/{ip}`, `/admin/clients/place/{place}`), "Filter feed" is "Show in Live", and a forged place id
+    that is not a number gets no drawer and no actions; the lookup shows the experience and owner Roblox addresses as
+    text with Copy (a dashboard never links to another site from data, plan 9.16); the Banned and Bypassed columns
+    are hidden by default (exports keep them); Rate1, Rate5 and Rate60 are labeled as request counts over the last
+    minute, 5 minutes and hour; not shown because no read model has them: v1's endpoint columns "Not cached
+    (skipped)" and "Last hit", the memory tier's "Oldest entry", and v1's per-client lists by status, outcome and
+    method (the client view lists its recent requests and links to Live); the cache browser has no export (stored rows
+    carry whole bodies); deep links Cache `?q=`, Clients `?q=` (places), `?ip=` (addresses), `?lookup=<place id>`.
+  - Protection (`g5_protection.md`): only the pipeline renders with the page, the other 26 cards are lazy; no table
+    keeps its state in the address bar (seventeen tables, `address=False`): each answers `?table=<key>` and its
+    drawers `?detail=<id>`; "Clients refused most" (plan 10.9) is the Clients address table sorted by refusals, a
+    row opening the Clients client drawer; v1's per-section clears are family resets with the typed phrase and a
+    reason (the refusals clear keeps the per-reason counts, which are traffic rollups, and clears the refusal records
+    and the attempts tabs); the ladder editor saves the whole ladder (`PUT /protection/ladder`) and a rung may ban
+    (plan 10.4); the seven detector cards show a summary above their settings, which start folded.
+  - Security, Data (`g6_security.md`): event logs first, then the admin's own account (sessions, trusted devices,
+    passkeys, recovery codes), then the two lazy cards (fingerprints, admin access); the security logs are newest
+    first only (another order shows newest first and says so); the probe summary hides First seen by default; the
+    Blocked tab's drawer offers Remove only (refused requests keep no header values, a wave 3b decision; v1 offered
+    a value drill-down there too); Data's retention table is collapsed unless a table waits for a prune, and VACUUM
+    times are in words. [v1's User-Agent drill-down, missing here, came back with the gaps lane (G1).]
+  - Settings, System, Help (`g7_settings.md`): the Settings editor pages on the server and `?key=` shows one key
+    (every key stays reachable, tested) [10 settings a page by default since the latency gaps lane; the builders
+    showed 25]; "History per key" (plan 15.2) is the one-setting view's newest 10 changes plus each control's History
+    link to Audit (`?target=setting:<key>`); the Alerts and public site cards and six System cards are lazy; Help
+    serves the repository guides at `/admin/help/<slug>` through the public site's one renderer, the runbooks also at
+    `/admin/help/operations` with an anchor per `operations#<name>` row of the link index, and
+    `/admin/help#runbook-<name>` forwards there; the System fleet header tiles are built from the `fleet` answer (no
+    KPI read model exists for them); the worker drawer is a fragment of the fleet card (`?worker=<pid>-<color>`).
+  - API helpers: every builder extracted the functions its cards call from its own API modules (the lists are in the
+    reports); the routes delegate, and the API answers and their tests are unchanged.
+
+#### P11 lanes after the integration: phone flows, page latency, docs (2026-10-10; `tests/e2e/test_phone_flows.py`, `tests/load/pages.py`, `metrics/`, `docs/screenshots/`)
+
+Reports: `.remake/p11_reports/flows.md`, `latency.md`, `docs.md`.
+
+Phone flows (plan 14.8) and the stream across workers (plan 14.11):
+- **Acceptance, plan 14.8:** `tests/e2e/test_phone_flows.py` drives the three phone flows (pause and resume; apply a
+  recommendation through the preview, then undo it, from the Overview or the bell; run a health check and watch the
+  live run view, from the bottom bar or the Overview's button) at 390x844 with touch, in both themes; every tapped
+  control is measured at 44x44 px or more, and axe, sideways scroll, console and CSP are checked at every step.
+- **Plan 14.11 under real gunicorn:** `tests/multiprocess/test_dashboard_sse_mp.py`: a browser whose streams all run
+  on worker B sees worker A's request in the Live tail, its `kpi` frames and the Overview tile count it, and a setting
+  saved through A re-renders the open inline editor on B (`settings_changed`).
+- **Fix (plan 14.8): the touch-screen 44 px target rules now apply.** They sat in `layout.css`, which loads before
+  `components.css`, whose rules of the same specificity won (on a phone the pause dialog's message field was 32 px
+  tall); the block is now the last rule of `components.css`, and checkbox and radio labels are included.
+- **Fix (1 GB server): stream-driven card refreshes keep their `refresh_min_s`.** The throttle was kept per card
+  element and every refresh swaps the element, so cards meant to refresh once a minute (the Overview's 19 KPI tiles,
+  Protection's pipeline) re-rendered on every `kpi` frame, every 2 s, per open tab; it is kept per card id now.
+- Overview: the recommendation title is a 44 px target on touch screens. Recommendations: the diff table gives the
+  setting column 40 percent (48 on a phone) as intended (the widths never applied, so setting keys broke inside the
+  word). Health: a run started or followed from elsewhere scrolls into view.
+
+Page latency (plan 6.7):
+- **Page scenario for the load harness, `tests/load/pages.py`:** seeds a day of 500,000 requests through the real
+  recorder and stretches it over 90 days of rollups (1.4 GB metrics.db, 2 million events, 80,000 audit rows, health
+  runs and recommendations through their real writers); runs gunicorn with 2 workers and `ROXY_WORKERS=2`, on all CPUs
+  or pinned to 2 with `taskset`, with or without 200 requests a second of proxy traffic; signs in through the real
+  steps and loads every page and card fragment and 20 chart routes, also at `range=90d`, timing each request by its
+  `Roxy-Request-Id` log line. Numbers and the rerun command: `docs/PERFORMANCE.md` "Dashboard pages".
+- Totals over a window read whole days and hours from the coarser rollups and minutes only at the ends
+  (`queries.total_pieces`, `cover_pieces`); the sums are unchanged; client tables still read minutes.
+- Charts and totals sum only the measures their metrics need (`queries.measures_for`, `totals_sync(metrics=)`); the
+  Traffic trends card sums only its own metrics. Answers keep their shape.
+- Histograms are merged in SQLite with `group_concat(hex(...))` and decoded once (`histograms.add_blob_into`) instead
+  of a Python aggregate per row, which made the two reader threads hand the GIL back and forth (2 to 2.7 times slower
+  than one thread). The compaction still uses the aggregate.
+- Event reads use their indexes: multi-type reads order by `+at_ms`, one index lookup per reason or failure group for
+  the newest fields, the last failure per egress or host read newest first in doubling windows, the Protection limit
+  cards counted from the rollups (`queries.reason_counts`), the Upstream retries card's returned reasons read alone
+  (`queries.returned_reasons`), the Live tail checking for any live row first; the peers of client addresses are one
+  indexed statement per address instead of one OR of 200 ranges.
+- Result on the development machine (20 rounds): Overview 6,452 to 126 ms p50, Upstream 1,063 to 60, Cache 1,067 to
+  53, Traffic 500 to 84, Protection 419 to 21 (whole views up to 9.8 s before); every page under 300 ms at p95 quiet
+  and on 2 CPUs except Clients under proxy load (313 ms); every 90 day chart route at the UI's granularity under 500 ms
+  (worst 460 ms). What stayed open went to the latency gaps lane (below), after which no page and no fragment is over
+  300 ms at p95 in any run.
+- **Deviation:** measured on the development machine (WSL 2, 32 CPUs, pinned runs on 2), not on a VM of the
+  production plan size; "first render" is the server time of the page request, not the browser's paint time.
+  `docs/PERFORMANCE.md` gives the rerun command for a quiet machine.
+
+Docs and the parity pass:
+- `docs/screenshots/` holds a full-page dark screenshot of every dashboard page (18) and light ones of Overview and
+  Protection, taken by `tests/e2e/test_docs_screenshots.py` with `ROXY_SCREENSHOTS=1` (plan 16.3: generated by
+  Playwright), and the 15 phone flow steps (`phone_<flow>_<step>.png`, `test_phone_flows.py` with the same switch); an
+  ordinary run checks the same pages into a temporary folder and leaves the repository alone. The wave 3a gallery
+  screenshots left `docs/` (the gallery is a development page); `test_design_system.py` writes them to `.remake/` for
+  review. `tests/unit/test_docs_screenshot_links.py` keeps the set and the README links complete.
+- README.md gains "The dashboard": the 18 pages by navigation group with their purpose and screenshots, the admin
+  guide link and the command that takes the screenshots again.
+- Parity pass: every checklist row whose v2 home is a dashboard page names its page tests;
+  `tests/integration/pages/test_page_parity_rows.py` compares the page with the API for rows 76, 78, 114, 118 and
+  135; the checklist gains the plan 14.1 v1 section map with its 37 test ids.
+- Visual fixes from the screenshot review: System jobs' checkpoint lines in words (no raw job result; "not run yet" on
+  the leader), "1 card" and "The other check" on Help and Health, side padding of the Tarpit tab tables, a shorter
+  System workers search placeholder, the Credential replace note, and the Overview events' detail as `key: value`
+  pairs instead of raw JSON.
+
+#### P11 gaps lane: the metrics-side gaps G1 to G12 (2026-10-11; `metrics/`, `storage/`, `core/`, `proxy/router.py`, `admin/`)
+
+Report: `.remake/p11_reports/gaps.md`; contract DESIGN.md 15.8. These close the metrics-side items the integration
+deferred (`integrate.md` section 7).
+
+- **Workers need metrics.db schema 8** (`--expand` adds `0008_user_agent_detail`, expand only: four nullable columns
+  on `fingerprint_user_agents`, instant on any size; the previous release keeps working on the new file). Schema 9
+  follows in the latency gaps lane below.
+- **G1 v1 User-Agent drill-down (parity row 79 covered).** Each User-Agent keeps its newest request's path (redacted,
+  300 characters), client address (64) and header names (64, names only, credential-shaped names hashed); an older
+  flush from another worker never replaces a newer detail. `GET /admin/api/v1/security/fingerprints/user-agents/
+  {ua_hash}`; Security > Fingerprints > User-Agents opens it in a drawer with "Its address in Live"; exports hash the
+  address (`Column(ip=True)`). It is the newest request only (v1 showed the last one too).
+- **G2 spam detector timelines (plan 10.9).** `read_protection.spam_points` (decisions per detector per minute, or
+  quarter hour for long windows, at most 200,000 groups with a `partial` flag), `GET
+  /admin/api/v1/protection/spam/series` (a section 13 series answer, one series per detector) and the Protection >
+  Spam chart (decisions per detector over the page's range) in place of the stand-in.
+- **G3 worker CPU (plan 14.7).** System > Fleet shows each worker's CPU for its last complete minute (and the peak of
+  that minute); the API's workers rows carry `cpu_pct`; the metric's home is `system#fleet`.
+- **G4 negative avoided share (plan P6).** Shown as it is (never clamped), with why in plain words ("retries and
+  refreshes made N upstream calls per request"), on Overview, Cache, Endpoints and Traffic; the metric help explains
+  it. **Deviation** from the integration's proposal (floor at 0 plus `retry_calls`): the honest value was asked for.
+- **G5 client address headers.** `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `True-Client-IP`, `CF-Connecting-IP`,
+  `X-Client-IP`, `X-Cluster-Client-IP` and `Via` never have a value stored in the fingerprint tables (not even
+  hashed): enforced in code (their names are still counted), shipped as ignored value headers (seed version 2, also
+  on existing installs, without bringing back defaults an admin deleted), older values deleted by the leader's
+  fingerprint job, listed as "Never recorded" on Security > Fingerprints, and refused by `DELETE
+  /admin/api/v1/security/fingerprints/ignored/{name}` (422). The v1 migrator's report shows 8 more default ignored
+  headers.
+- **G9 caller bytes are wire bytes (plan 14.3).** `caller_bytes_in` and `caller_bytes_out` count the request or
+  status line, the headers (as the app's middleware sends them, plus uvicorn's `Date`) and the body, between nginx and
+  the app, for served answers, refusals, failures and the tarpit's drip; GET traffic no longer shows "Bytes from
+  callers 0 B". **Deviation:** the chunk framing of a streamed answer (the tarpit's drip) and what nginx adds or
+  removes are not counted.
+- **G9 Data > Storage labels.** Every table of the four databases has a plain label (the control and rule tables,
+  `schema_version`, the cache generation); the credential table's label is registered by `egress/credential.py`
+  (plan C1: no other module names it).
+- **G10 a fenced write after a lost lease is a refusal, not a write error.** `storage.db.WriteRefused` (and
+  `LostLeadership`) roll back and count as `refused_writes`; System > Persistence no longer says "Writing failed
+  recently" after a leadership change.
+- **G11 one setting, one editor per page.** A setting placed on two cards of one page is edited on one of them; the
+  other shows the current value read-only with a link. 13 keys: the coalescing keys are edited on Cache > Coalescing
+  (Cache > Settings shows them read-only), the backoff keys on Upstream > Retries, seven rotator budget keys on Egress
+  > Budget, `insight_cred_probe_cost_max_per_hour` on Recommendations > Engine and `roblox_egress_cidrs` on
+  Protection > Bot. This settles the integration's open question about the coalescing editors shown twice (plan 15.6
+  names both cards).
+- **G12 header text.** Header values and User-Agents with UTF-8 bytes show as the caller wrote them (invalid bytes as
+  `\xNN` escapes, never markup) on Live, Endpoints and Security > Fingerprints. Metric homes re-pointed to real cards
+  (`upstream#health`, `traffic#status`, `upstream#429-timeline`, `system#fleet`); a test checks every home.
+- **LLM export parity.** The export's parity status reads the checklist's 135 rows (the plan 14.1 v1 section map below
+  the checklist was read as 37 more parity rows, 172) and resolves the CHANGES.md path off the event loop.
+
+#### P11 gaps lane: dashboard latency L1 to L5 (2026-10-11; `metrics/`, `storage/migrations/`, `scheduler/`, `admin/`)
+
+Report: `.remake/p11_reports/gaps_latency.md`; contract DESIGN.md 15.9.
+
+- **Workers need metrics.db schema 9** (`--expand` adds `0009_dashboard_read_indexes`, expand only: VIRTUAL generated
+  columns on `events` and partial indexes on events and the client tables; nothing rewritten, the previous release
+  keeps working on the new file). About 8 to 10 s holding the metrics.db write lock (the old color's flushes requeue)
+  and 405 MiB of indexes at plan 6.6's volume (metrics.db 1,391 to 1,796 MiB); a metrics flush of 2 s of traffic at
+  200 requests a second goes from 3.4 to 6.3 ms.
+- **Refusal, failure and retry cards read indexed event columns** instead of parsing `detail_json` of every refusal
+  and failure event of the range: Protection > Refusal reasons at 90 days 7.4 s to 0.19 s, Upstream > Failures 1.1 s
+  to 0.1 s, Upstream > Retries' returned reasons 2.0 s to 0.15 s (one process at plan 6.6's volume); the numbers are
+  the same (tests compare them with the old reads). The newest status and path of a reason no longer look for a
+  failure reason among every refusal of the window (2 s per field over 90 days).
+- **Clients:** the peers of a place are an index range (the Places card 277 to 127 ms for 24 hours); the IP addresses
+  table sums each address in index order, still exact (205 to 76 ms for 24 hours); one place's refusals and one
+  client's live rows are index lookups (203 to 7 ms at 90 days; an address with no live row 118 ms to nothing).
+- **A ranged data reset now shows the same at every granularity (plan 6.8):** it deleted whole hour, day and month
+  rows that only started in the range and kept those that started before it, so totals read from days and hours
+  counted reset traffic or missed traffic after the range (an hour of 601 requests against 305 in its minutes). The
+  partly covered buckets are recomputed from the trimmed level below (where retention still holds it); the result
+  and the `data.reset.done` audit row list them (`rebuilt`).
+- **The leader's slow window (traced):** under load the recommendations evaluation took 20 to 30 s of every 30 s on
+  the leader (timing out) and the compaction it slowed 12 to 20 s a minute, so the leader's page requests waited for
+  the CPU; retention and checkpoints were not the cause. A job whose run takes longer than half its interval now rests
+  as long as it ran before its next start (`JOB_REST_FACTOR`), and the compaction no longer caps a whole day of client
+  minutes every minute. Each job run and each loop lag spike over 50 ms is logged at DEBUG (`job_finished`,
+  `loop_lag_spike`).
+- **Lighter pages (BREACH: sent uncompressed):** the Upstream 429 timeline and the Traffic requests chart read their
+  series by URL after the first paint (their totals and tables stay rendered on the server); the Settings editor shows
+  10 settings a page by default (25, 50 and 100 one choice away). Upstream 395 to 130 KiB and Traffic 194 to 91 KiB at
+  plan 6.6's volume, Settings 243 to 156 KiB.
+- **Deviation:** DESIGN.md 15.5's "the Settings editor shows 25 settings a page" is now 10 by default (page weight,
+  plan 6.7).
+- **Result, page scenario before and after on one template:** before, 1 to 3 pages per run over 300 ms at p95 and 2 to
+  5 fragments; after, none and none (quiet, pinned to 2 CPUs, and with 200 requests a second of proxy load). At 90
+  days the Protection refusals card 7,647 to 271 ms p50, the Upstream page 1,169 to 144, Upstream retries 2,042 to
+  153, one place's timeline 324 to 61. Requests over 500 ms on the leader under unpinned load: 11 to 2.
+- **Page scenario:** every run's copy is migrated with `--expand` first (a template seeded by an older release still
+  starts), and the time is reported. Numbers: `docs/PERFORMANCE.md` "Dashboard pages", "Second pass".
+
+#### P11 gaps lane: the recommendations evaluation and the test suite's database threads, findings G7 and G8 fixed (2026-10-11; `insights/`, `metrics/read_history.py`, `metrics/queries.py`, `tests/conftest.py`)
+
+Report: `.remake/p11_reports/gaps_insights.md`; figures in `docs/PERFORMANCE.md` "The recommendations evaluation: one
+read per window"; contract DESIGN.md 15.10. No migration.
+
+- **The recommendations evaluation reads each window once for every rule (G7).** Tables a rule wants whole
+  (endpoints, clients) are one aggregate, not one per page of 250; the TTL tuner and the User-Agent experiment's arms
+  are computed in SQL over every sample of the window (the tuner matches the old Python version float for float in a
+  parity test); raw sample rows are read only where a rule needs rows, filtered in SQL. One evaluation at a day's
+  volume took 3 to 5.5 s of the leader's CPU every 30 s (most of it on reader threads holding the GIL the event loop
+  needs); now about 0.6 s, the longest event loop stall 5 to 17 ms (33 to 60 before), the evaluation's traced memory
+  peak 11 to 15 MiB (36 to 39 before).
+- **No rule sees a silently cut window.** The per-template day reads stopped at the oldest 50,000 samples (a busy
+  template's night); a dry run over 24 hours replayed the oldest 50,000 samples (about the first 5 hours of the day)
+  and said "24 hours". Now a dry run replays the newest part of its window that fits 50,000 samples and says so
+  (`bounded`, `requested_window_s`, the note; the Preview's title names the minutes replayed), and a rule whose
+  filtered read hits its bound says so in its evidence (`sample_bound`). The dry-run report gains two fields; no other
+  answer changed shape.
+- **Replays and other pure CPU work run on a worker thread** (one at a time per event loop, as argon2 runs), so the
+  leader worker keeps answering requests during a dry run.
+- **SYS-CHANGE-REGRESSION judges a first override and a reset to default** (the history's "no override" value, NULL,
+  used to make the rule fail on every evaluation after a first override).
+- **Tests: the browser tests' dashboard server stops after the last browser test** (it was a session fixture: a whole
+  app with its databases ran under every later test of the full run and broke a test that counts database threads),
+  and a suite-wide guard fails any test module that leaves a database open, naming the test that opened it, and any
+  run that ends with a database thread still running (`tests/db_threads.py`).
+
+#### P11 part two gate (2026-10-11; report `.remake/p11_reports/gate.md`)
+
+- **One reload per change (`static/js/dom.js reloadPage`).** A pause from the dialog asked for two reloads: the
+  form's own after the API answered (`api_forms.js`, 300 ms later) and the shell's status check when the stream
+  reported the same change (`shell.js`); in a busy browser run the second aborted the first navigation. Both now go
+  through `reloadPage`, which reloads once (`test_pages_shell.py::test_a_change_reported_twice_reloads_the_page_once`).
+- **Setting hints:** a default that is a sentence keeps its own period ("Default Service down for maintenance.", not
+  "....") and an empty default reads "Default empty." (`components/setting.html`; the docs lane's open issue).
+- **Test fixes at the root, no assertion weakened:** the shared page test servers start no scheduled health run
+  (`pages_harness.SEED_SETTINGS` sets `health_auto_interval_h` 0: a test that moved the fake clock past the first
+  scheduled poll started a run in the background, which took the fleet's one-run lease and sent the presence probe's
+  POST through the proxy, so a later Endpoints test found a POST row); the Endpoints method filter test empties the
+  table with DELETE, a method nothing in the shared dashboard proxies (it used POST, which a health run of another
+  test adds); the two apply-and-undo browser tests (Recommendations, phone flow) read the history newest first by
+  action number, not by time (the browser tests' dashboard runs on the wall clock, which WSL steps back about 0.9 s
+  every 31 s, so the undo could carry an earlier second than the apply); a unit test pins that the LLM export's parity
+  parser stops at the checklist's subsections.
+- `docs/PERFORMANCE.md`: LOAD-1 marked resolved where the finding is told, the plan 6.7 table points at "Dashboard
+  pages", and the recommendations evaluation's cost is marked resolved by the insights gaps lane.
 
 ## Progress notes per phase
 
@@ -2403,6 +2777,44 @@ Report: `.remake/p11_reports/pacing.md`.
   230 MiB over 33 minutes, past `MemoryHigh` under sustained load (LOAD-2). The quiet-machine rerun in
   `docs/PERFORMANCE.md` is the reference before release.
 
+### P11 part two: dashboard pages, the lanes and the gate, 2026-10-10 to 2026-10-11
+
+- Built: the 18 dashboard pages on the page kit (the core lane with the Audit page as the reference, seven page
+  builders, then the integration: one lazy card loader, one table follow rule, shared inline resets, dialogs and page
+  pieces, the test harness moved out of the package to `tests/pages_harness.py`, templates warmed at startup). Every
+  registry card renders on real data through the API's own read models, every catalog setting is editable inline on
+  its feature page (one editor per page), and every change goes through the admin API with CSRF, the fresh second
+  factor and the audit log. Then the lanes: upstream pacing (LOAD-1), memory and the hot.db write lock (LOAD-2,
+  LOAD-3), the phone flows and the stream across workers, page latency (the page scenario and faster read models),
+  the docs screenshots and the parity pass, and the gaps lanes: metrics G1 to G12 (metrics.db schema 8), latency L1
+  to L5 (schema 9), insights G7 and G8. Deviations: "P11 part two" under "Plan conflicts and deviations".
+- Acceptance: every v1 section of the plan 14.1 map has a passing browser test (37 of 37, plus the map test) and every
+  catalog key is edited on a feature page (493 of 493), nothing skipped; axe-core finds no serious or critical
+  violation on any page in both themes at 1440x900 and 390x844, no page scrolls sideways on a phone, and no page logs
+  a console error, page error or CSP violation; the three phone flows of plan 14.8 pass with touch and 44 px targets
+  in both themes; a dashboard whose streams run on worker B follows worker A under real gunicorn (plan 14.11). Parity
+  checklist: 135 rows, 130 covered, 2 changed, 3 partial (102 and 108 wait for P14, 107 for P12 part two); the plan
+  14.1 map is listed below it.
+- Load findings: LOAD-1 fixed (the row 7 replay at the plan's defaults: one discovery 429 in about 1,030 calls,
+  0.097 percent, 6 of 6 runs; 30 minutes 0.023 percent; the assertion is no longer an xfail); LOAD-2 fixed (after 30
+  minutes at 200 requests a second the leader holds 290 MiB instead of 660 and the color 477 instead of 819; units
+  `MemoryHigh=420M`, `MemoryMax=500M`); LOAD-3 fixed (ceiling 179 to 286 answered requests a second; Roxy's own p95 at
+  200 a second 293 to 149 ms). Page latency (plan 6.7, development machine): no page and no fragment over 300 ms at
+  p95 in any run of the page scenario (quiet, on 2 CPUs, under 200 requests a second); every 90 day chart route at the
+  UI's granularity under 500 ms, and every 90 day card too except Protection > Request filters (532 to 649 ms); the
+  recommendations evaluation at a day's volume about 0.6 s of CPU instead of 3 to 5.5 s.
+- Gate (2026-10-11, `.remake/p11_reports/gate.md`): the whole suite in one pytest process without `-x` (Playwright's
+  libraries exported): **11,701 passed, 0 failed, 0 skipped, 0 xfailed** in 1 h 49 min (deploy 422, e2e 831, health
+  194, insights 905, integration 1,760, load 38, migration 99, multiprocess 95, parity 57, security 730, unit 6,570);
+  `lead_gate.sh` at the same time: pytest `-x` 11,701 passed, ruff and ruff format clean (850 files), mypy no issues
+  (377 source files), `check_style.py` OK; `gen_settings_docs.py --check` and `gen_v1_parity.py --check` current;
+  bandit no high and no medium finding (34 low, all present before P11 part two). Three test failures of the triage
+  were traced to their roots (a background scheduled health run in the shared test dashboard, a double reload of the
+  page after a pause, history ordered by wall-clock seconds) and fixed without weakening an assertion; a test run
+  leaves the tree clean.
+- Open: LEAD_NOTES "P11 part two" (the quiet-machine reruns of the perf lane, the page scenario and the evaluation;
+  the 27 MB of screenshots shipped by `git archive`; the items for the final review).
+
 ## Parity checklist (plan section 4)
 
 Every row of plan section 4 (C3, plan 18.1 item 5) with its status and the tests that prove it. **covered**: the
@@ -2424,6 +2836,16 @@ covered now. Every other row that waited for P9 or P10 has its API part and its 
 page exists, so it now names only P11; row 78 also waits for a fleet-wide tarpit statistics history, which P10 did
 not store. Wave 3b also added API tests to the covered rows 15, 25, 29, 32, 45, 116, 117 and 119 and to the P11 rows
 114, 131, 132 and 134, and rows 45 and 75 now say what the admin side changed.
+
+P11 (2026-10-10, the dashboard pages): every row that waited for a page now names the page tests that prove it on
+its v2 home first (integration tests `tests/integration/pages/test_page_<page>.py` and `test_pages_core.py`, browser
+tests `tests/e2e/test_page_<page>.py`, `test_pages_shell.py` and the v1 section map's `test_v1_sections.py`), then
+the earlier service and API tests. The parity pass found five rows whose page tests rendered the card but did not
+compare its numbers with the API's, and added `tests/integration/pages/test_page_parity_rows.py` for them (rows 76,
+78, 114, 118 and 135). Row 79 stays partial: v1's User-Agent drill-down (last path, last address and last headers
+of each User-Agent) has no v2 store yet, deferred to the metrics owners with the read model it needs (lead notes C of
+the P11 round). The ids were checked against `pytest --collect-only` of the whole tree on 2026-10-10. The v1 section
+map of plan 14.1 follows the table.
 
 | # | Row | Status | Tests |
 |---|---|---|---|
@@ -2452,22 +2874,22 @@ not store. Wave 3b also added API tests to the covered rows 15, 25, 29, 32, 45, 
 | 23 | CSRF retry with a cached token | covered | `test_upstream_service.py::test_csrf_handshake_with_cached_token`, `test_upstream_fleet.py::test_csrf_token_cached_for_every_worker` |
 | 24 | Upstream status semantics | covered | `test_upstream_status_policy.py::test_classify_response`, `test_upstream_service.py::test_any_2xx_is_success`, `test_upstream_service.py::test_redirect_followed_within_allowed_hosts`, `test_upstream_service.py::test_5xx_retried_with_backoff_then_success`, `test_upstream_service.py::test_malformed_redirect_location_is_answered_not_raised` |
 | 25 | Credential 429 cooldown and probes | covered | `test_upstream_service.py::test_credential_429_sets_fleet_cooldown_and_never_cascades`, `test_egress_credential.py::test_one_probe_at_a_time_fleet_wide`, `test_egress_credential.py::test_cooldown_is_fleet_wide_and_never_shortened`, `test_egress_credential.py::test_probe_outcomes`, `test_api_credential.py::test_a_probe_429_is_rate_limited_never_expired` |
-| 26 | Credential replace, check, revalidate | partial: P11 (Credential page) | `test_credential_suite.py::test_single_credential_slot`, `test_credential_suite.py::test_superseded_bootstrap_never_reused`, `test_egress_credential.py::test_replace_is_encrypted_audited_and_reaches_other_workers`, `test_egress_credential.py::test_delete_ui_value_goes_back_to_the_bootstrap_value`, `test_rr_cred_audit_reason.py::test_replace_reason_never_stores_the_new_credential`, `test_api_credential.py::test_replace_and_return_to_the_bootstrap_account_with_typed_confirmations`, `test_api_credential.py::test_status_check_probes_and_budget` |
+| 26 | Credential replace, check, revalidate | covered (P11: the Credential page's status, check, replace and dashboard value delete) | `test_page_credential.py::test_the_replace_needs_the_typed_confirmation_and_a_fresh_factor`, `test_page_credential.py::test_a_check_shows_its_probe_and_a_429_reads_rate_limited_never_expired`, `test_page_credential.py::test_the_value_never_reaches_any_html_before_or_after_a_replace`, `test_page_credential.py::test_the_replace_dialog_refuses_a_wrong_typed_confirmation_next_to_the_field`, `test_v1_sections.py::test_credential_status`, `test_credential_suite.py::test_single_credential_slot`, `test_credential_suite.py::test_superseded_bootstrap_never_reused`, `test_egress_credential.py::test_replace_is_encrypted_audited_and_reaches_other_workers`, `test_egress_credential.py::test_delete_ui_value_goes_back_to_the_bootstrap_value`, `test_rr_cred_audit_reason.py::test_replace_reason_never_stores_the_new_credential`, `test_api_credential.py::test_replace_and_return_to_the_bootstrap_account_with_typed_confirmations`, `test_api_credential.py::test_status_check_probes_and_budget` |
 | 27 | `mask_token` | covered | `test_core_redact.py::test_mask_token_matches_v1_format` |
 | 28 | Internal probes count against budgets | covered | `test_upstream_internal.py::test_internal_anonymous_call_is_paced_and_recorded`, `test_upstream_internal.py::test_internal_credential_call_uses_the_probe_sub_bucket`, `test_upstream_egress_contract.py::test_credential_probe_hook_is_paced_by_the_probe_bucket` |
 | 29 | Internal endpoints list | covered | `test_upstream_internal.py::test_internal_endpoints_list`, `test_upstream_internal.py::test_probe_is_single_flight_fleet_wide`, `test_api_upstream.py::test_retries_and_internal_calls` |
-| 30 | Rotation proxy URL | partial: P11 (Egress page) | `test_egress_rotator.py::test_url_replace_and_revert_are_audited_and_shared`, `test_egress_rotator.py::test_bootstrap_url_is_masked_and_registered`, `test_egress_rotator.py::test_an_empty_rotator_url_file_means_not_configured`, `test_api_egress.py::test_rotator_url_is_masked_replaced_and_reverted_without_leaking` |
+| 30 | Rotation proxy URL | covered (P11: Egress > Rotator: replace and revert with a fresh factor, never echoed, the restart note) | `test_page_egress.py::test_the_url_replace_needs_a_fresh_factor_and_never_echoes_the_url`, `test_page_egress.py::test_the_rotator_url_and_full_exit_addresses_never_reach_the_page`, `test_page_egress.py::test_an_inline_rotator_setting_is_reviewed_and_saved`, `test_v1_sections.py::test_health_run`, `test_egress_rotator.py::test_url_replace_and_revert_are_audited_and_shared`, `test_egress_rotator.py::test_bootstrap_url_is_masked_and_registered`, `test_egress_rotator.py::test_an_empty_rotator_url_file_means_not_configured`, `test_api_egress.py::test_rotator_url_is_masked_replaced_and_reverted_without_leaking` |
 | 31 | Rotator failure cooldown | covered | `test_egress_rotator.py::test_failure_streak_parks_the_rotator_fleet_wide`, `test_upstream_effects.py::test_rotator_429_counts_only_with_distinct_exits`, `test_upstream_fleet.py::test_rotator_429s_count_by_distinct_exits` |
 | 32 | Exit IP probe and recent exits | covered | `test_egress_rotator.py::test_exit_ip_probe_parsing`, `test_egress_rotator.py::test_exit_ip_probe_errors_and_recent_ips`, `test_api_egress.py::test_exit_ips_are_masked_unless_revealed_and_the_reveal_is_audited` |
 | 33 | `masked_url` | covered | `test_core_redact.py::test_masked_url_matches_v1`, `test_egress_rotator.py::test_proxy_url_parsing_and_masking_parity` |
-| 34 | Routing state view and reset | partial: P11 (Upstream page) | `test_upstream_buckets.py::test_bucket_states_for_the_dashboard`, `test_upstream_breaker.py::test_reset_and_snapshot`, `test_upstream_service.py::test_reset_clears_cooldowns_and_breakers_never_buckets`, `test_api_upstream.py::test_buckets_show_fill_rates_and_history_and_a_reset_never_refills_them` |
+| 34 | Routing state view and reset | covered (P11: Upstream > Buckets, Cooldowns and Breakers, with the reset dialog) | `test_page_upstream.py::test_the_numbers_equal_the_api_for_the_same_range`, `test_page_upstream.py::test_the_reset_dialog_posts_a_required_reason_with_csrf`, `test_page_upstream.py::test_the_reset_dialog_clears_cooldowns_with_a_reason`, `test_page_upstream.py::test_a_bucket_row_opens_its_history_and_override_in_the_drawer`, `test_v1_sections.py::test_health_run`, `test_upstream_buckets.py::test_bucket_states_for_the_dashboard`, `test_upstream_breaker.py::test_reset_and_snapshot`, `test_upstream_service.py::test_reset_clears_cooldowns_and_breakers_never_buckets`, `test_api_upstream.py::test_buckets_show_fill_rates_and_history_and_a_reset_never_refills_them` |
 | 35 | Fleet email dedupe | covered | `test_notify_gate.py::test_dedupe_within_the_cooldown_and_report_what_was_held_back`, `test_notify_notifier.py::test_two_workers_send_one_alert`, `test_review_c7_failure_modes.py::test_review_readonly_hot_alert_cap_still_holds`, `test_rr_mp_alerts.py::test_rr_mp_alert_cap_holds_for_the_hour_across_a_hot_db_outage`, `test_rr_auth_alert_dedupe_retention.py::test_long_cooldown_alert_stays_deduped_through_retention` |
 | 36 | Busy and failed caller messages | covered | `test_upstream_messages_deadlines.py::test_exact_caller_texts`, `test_proxy_golden.py::test_7_13_row_golden` |
 | 37 | Trace fields | covered | `test_upstream_service.py::test_trace_has_v1_fields`, `test_upstream_csrf_trace_aimd.py::test_trace_v1_fields_and_redaction` |
 | 38 | Admin place lookup | covered | `test_upstream_internal.py::test_lookup_place_chain`, `test_upstream_internal.py::test_lookup_cache_expires`, `test_upstream_internal.py::test_lookup_runs_at_admin_priority`, `test_api_upstream.py::test_identify_an_experience_is_budgeted_cached_and_mapped`, `test_api_w3b_wiring.py::test_the_place_lookup_cache_is_shared_by_every_route` |
 | 39 | Per-IP limit, fixed or GCRA | covered (cache hits count by default, owner D10) | `test_abuse_limiter.py::test_gcra_burst`, `test_abuse_limiter.py::test_fixed_window_v1_semantics`, `test_abuse_mp.py::test_gcra_at_exact_limit_never_refused`, `test_abuse_golden.py::test_fresh_cache_hits_count_by_default`, `test_abuse_golden.py::test_fresh_cache_hits_are_not_counted_with_the_setting_off`, `test_rr_mp_degraded.py::test_rr_mp_leaving_degraded_mode_never_refills_the_allowance`, `test_rr_mp_degraded.py::test_rr_mp_degraded_share_never_multiplies_a_small_limit` |
 | 40 | Escalating ladder | covered | `test_abuse_throttle.py::test_ladder_penalties_double_per_rung_fixed_mode`, `test_abuse_throttle.py::test_decays_in_counts_to_the_next_drop_not_zero`, `test_abuse_throttle.py::test_strike_on_retry_adds_at_most_one_strike_per_window`, `test_defaults.py::test_throttle_ladder_is_v1_with_the_c5_message`, `test_service.py::test_ladder_validation_uses_v1_wording` |
-| 41 | Strike board and forgive | partial: P11 (Protection page) | `test_abuse_throttle.py::test_strike_board_forgive_and_watch`, `test_api_protection.py::test_strike_board_forgive_watch_and_export` |
+| 41 | Strike board and forgive | covered (P11: Protection > Strike board, paged on the server) | `test_page_protection.py::test_the_strike_board_drawer_and_forgive`, `test_page_protection.py::test_table_numbers_equal_the_api`, `test_v1_sections.py::test_protection_throttle`, `test_abuse_throttle.py::test_strike_board_forgive_and_watch`, `test_api_protection.py::test_strike_board_forgive_watch_and_export` |
 | 42 | Throttle-all (emergency per-IP limit) | covered | `test_abuse_golden.py::test_throttle_all_default_text_and_headers`, `test_abuse_review_fixes.py::test_r1_throttle_all_without_a_reason_shares_the_pause_default`, `test_pipeline_e2e.py::test_refusal_throttle_all`, `test_ingress_refusal_order.py::test_throttle_all_beats_the_per_ip_throttle` |
 | 43 | Endpoint rate rules | covered | `test_abuse_golden.py::test_endpoint_rule`, `test_abuse_golden.py::test_endpoint_rule_is_clamped_to_the_per_ip_allowance`, `test_abuse_golden.py::test_global_endpoint_rule_is_shared`, `test_service.py::test_a_second_rate_rule_on_the_same_pattern_is_refused` |
 | 44 | User-Agent rules and tester | covered | `test_abuse_golden.py::test_ua_burst_rule`, `test_abuse_golden.py::test_ua_cooldown_rule_and_custom_message`, `test_abuse_golden.py::test_ua_rules_master_switch`, `test_abuse_switches_rules.py::test_ua_rules_first_match_and_tester_reflects_the_switch`, `test_ingress_redos.py::test_timed_out_header_and_ua_regexes_refuse` |
@@ -2492,34 +2914,34 @@ not store. Wave 3b also added API tests to the covered rows 15, 25, 29, 32, 45, 
 | 63 | Buffered hit counting | covered | `test_cache_service.py::test_hits_and_change_observations_are_flushed`, `test_cache_store_parts.py::test_hit_buffer_is_bounded_and_restorable` |
 | 64 | Cache disk health | covered | `test_cache_store_parts.py::test_disk_health_recovers_after_a_later_write`, `test_cache_service.py::test_disk_write_failure_keeps_serving_from_memory`, `test_cache_flights.py::test_failed_cache_db_write_is_counted_and_the_answer_unaffected` |
 | 65 | Key spread diagnostic | covered (the apply route is built, the P11 Recommendations page draws the button; CACHE-KEYSPLIT never proposes ignoring a text or id parameter, see Wave 3b) | `test_cache_spread.py::test_cache_buster_is_suspect_like_v1_smoke`, `test_cache_spread.py::test_large_groups_can_still_be_suspect_b9_fixed`, `test_cache_purge.py::test_admin_views_and_key_spread`, `test_rules_cache_egress.py::test_rule_fixture`, `test_rules_cache_egress.py::test_text_and_id_parameters_are_never_ignored`, `test_rules_cache_egress.py::test_spread_rows_match_the_shared_tier`, `test_api_cache.py::test_key_spread_finds_the_splitting_parameter`, `test_api_recommendations.py::test_apply_then_undo_through_the_audited_services` |
-| 66 | Cache browser, inspect, purge, refresh | partial: P11 (Cache page) | `test_cache_purge.py::test_purge_scopes_report_true_counts`, `test_cache_purge.py::test_purge_host_regex_expired_and_all`, `test_cache_workers.py::test_purge_reaches_the_other_workers_memory_tier`, `test_cache_purge.py::test_admin_views_and_key_spread`, `test_api_cache.py::test_browser_search_sort_page_and_hidden_handoff_rows`, `test_api_cache.py::test_inspect_and_refresh_a_get_entry`, `test_api_cache.py::test_refresh_a_post_entry_resends_its_body`, `test_api_cache.py::test_purge_every_scope_is_audited_first`, `test_r3_parity_cache.py::test_parity_15_purge_matching_purges_exactly_what_the_search_lists`, `test_r3_parity_cache.py::test_parity_15_search_purge_removes_exactly_the_listed_entries_and_nothing_else` |
-| 67 | Cache stats and honest avoided calls | partial: P11 (Cache page) | `test_metrics_queries.py::test_avoided_calls_are_honest`, `test_metrics_recorder.py::test_upstream_429_internal_background_and_egress`, `test_cache_service.py::test_hits_and_change_observations_are_flushed`, `test_api_cache.py::test_stats_are_honest`, `test_api_overview.py::test_kpi_tiles_are_honest_and_carry_sparklines_and_deltas` |
-| 68 | Status codes by source | partial: P11 (Traffic page) | `test_metrics_recorder.py::test_dims_row_holds_every_dimension`, `test_metrics_recorder.py::test_cache_state_and_source_strings`, `test_metrics_queries.py::test_series_reads_compacted_levels_plus_the_tail`, `test_api_traffic.py::test_status_sources_and_the_429_verdict`, `test_r3_parity_overview.py::test_parity_1_a_roblox_5xx_counts_as_5xx_from_roblox` |
-| 69 | Request counts and traffic over time | partial: P11 (Overview and Traffic pages) | `test_metrics_rollups.py::test_minutes_compact_into_hours_exactly`, `test_metrics_rollups.py::test_days_and_months_in_ui_timezone`, `test_metrics_queries.py::test_comparison_windows`, `test_metrics_pipeline.py::test_flush_loop_compaction_and_queries`, `test_metrics_mp.py::test_metric_totals_equal_requests_sent`, `test_api_traffic.py::test_requests_stacked_by_outcome_with_compare`, `test_api_traffic.py::test_verbs_series_and_table_with_export`, `test_api_traffic.py::test_trend_tables`, `test_r3_parity_overview.py::test_parity_2_overview_has_the_v1_failures_last_hour_tile` |
-| 70 | Latency percentiles | partial: P11 (Traffic and Upstream pages) | `test_metrics_histograms.py::test_merge_is_element_wise_addition`, `test_metrics_histograms.py::test_percentile_interpolates_inside_the_bucket`, `test_metrics_histograms.py::test_percentile_error_is_bounded_by_the_bucket_width`, `test_metrics_histograms.py::test_sql_functions_merge_and_sum`, `test_api_traffic.py::test_latency_series_and_splits`, `test_api_upstream.py::test_latency_series_are_percentiles_of_upstream_requests` |
-| 71 | Method health per egress and host | partial: P11 (Upstream page) | `test_metrics_queries.py::test_filters_are_whitelisted`, `test_metrics_queries.py::test_misc_read_models`, `test_metrics_recorder.py::test_errors_are_upserted_and_redacted`, `test_api_upstream.py::test_egress_cards_and_host_table_report_honest_rates`, `test_r3_parity_upstream.py::test_parity_6_egress_cards_carry_v1_method_health`, `test_v1_upstream.py::test_v1_egress_health_says_when_it_last_worked_and_what_failed_last` |
-| 72 | Failure, refusal, internal and error logs | partial: P11 (Upstream, Protection and System pages) | `test_metrics_recorder.py::test_refusal_events_are_budgeted_but_counts_stay_exact`, `test_metrics_recorder.py::test_upstream_429_internal_background_and_egress`, `test_metrics_recorder.py::test_errors_are_upserted_and_redacted`, `test_metrics_recorder.py::test_aggregated_events_wait_for_their_minute_to_close`, `test_api_upstream.py::test_retries_and_internal_calls`, `test_api_system.py::test_errors_are_searchable_and_tracebacks_redacted`, `test_api_protection.py::test_bot_pipeline_and_refusals_for_the_range`, `test_r3_parity_upstream.py::test_parity_5_upstream_failures_log_exists`, `test_r3_parity_protection.py::test_parity_3_refusal_reasons_keep_the_v1_columns` |
-| 73 | Top talkers and callers with rates | partial: P11 (Clients page) | `test_metrics_clients.py::test_minute_keeps_top_n_and_folds_the_rest`, `test_metrics_clients.py::test_trailing_rate_has_no_minute_boundary_flap`, `test_metrics_queries.py::test_client_table_with_rates`, `test_storage_retention.py::test_place_clients_follow_max_caller_records`, `test_api_clients.py::test_ip_table_rates_flags_bot_score_sort_search_and_export`, `test_api_clients.py::test_place_table_page_actions_and_lookup_cache`, `test_r3_parity_clients.py::test_parity_7_client_tables_keep_last_seen_and_peers`, `test_metrics_client_extras.py::test_peer_counts_across_levels_count_each_peer_once`, `test_api_clients.py::test_recorded_fleet_scores_answer_when_no_live_row_exists` |
-| 74 | Endpoint popularity with templating | partial: P11 (Endpoints page; labels scrubbed, C1 over row 74) | `test_metrics_templating.py::test_v1_worked_examples`, `test_metrics_templating.py::test_templatize_equals_v1_on_generated_paths`, `test_metrics_templating.py::test_vocabulary_gate_bounds_distinct_values`, `test_metrics_labels.py::test_template_for_scrubs_a_piece_in_a_route_word`, `test_metrics_queries.py::test_top_n_pages_and_sorts_on_the_server`, `test_api_endpoints.py::test_table_sorts_pages_and_trends`, `test_api_endpoints.py::test_drill_down`, `test_r3_parity_endpoints.py::test_parity_13_endpoint_rows_keep_methods_and_last_request`, `test_r3_parity_endpoints.py::test_parity_13_last_request_falls_back_to_the_rollup_minute` |
-| 75 | Blocked and rate-limited attempt logs | partial: P11 (Protection page); the attempts tabs count distinct clients instead of showing the last IP (plan 9.15 over row 75) and, since review round 3, name the rule that refused (`refused_by`; see Wave 3b) | `test_abuse_pipeline_order.py::test_stats_count_refusals_by_check`, `test_metrics_recorder.py::test_refusal_events_are_budgeted_but_counts_stay_exact`, `test_api_protection.py::test_endpoint_blocks_rules_and_attempts`, `test_abuse_security_records.py::test_a_refusal_event_names_the_rule_that_refused` |
-| 76 | Throttle tier and UA rule hits | partial: P11 (Protection page) | `test_abuse_review_fixes.py::test_record_throttled_and_aggregated_tier_and_ua_rule_events`, `test_api_protection.py::test_ladder_replace_reset_and_tier_hits`, `test_api_protection.py::test_ua_rules_crud_order_hits_and_tester`, `test_producers_rule_hits.py::test_every_matched_rule_row_is_on_the_verdict_and_recorded`, `test_r3_fix_pages_lane.py::test_rule_tables_carry_hits_and_one_rule_has_a_hit_history` |
-| 77 | Budget rejections and peaks | partial: P11 (Upstream page; the bucket fill history is stored since P10) | `test_upstream_buckets.py::test_bucket_states_for_the_dashboard`, `test_upstream_buckets.py::test_fill_levels`, `test_engine.py::test_recorder_history_hooks_and_read_models`, `test_rules_upstream.py::test_up_bucket_tune_numbers_and_safe_auto`, `test_api_upstream.py::test_buckets_show_fill_rates_and_history_and_a_reset_never_refills_them` |
-| 78 | Tarpit stats | partial: P11 (Protection page); the fleet-wide hold statistics history is stored and served since the producers lane (`GET /protection/tarpit` `history`) | `test_abuse_tarpit.py::test_arrival_gap_is_measured_across_refusals`, `test_abuse_tarpit.py::test_over_the_cap_is_instant_and_counted_as_skipped`, `test_ingress_exhaustion.py::test_tarpit_stats_tables_are_bounded`, `test_api_protection.py::test_tarpit_state_has_the_effective_cap_fields`, `test_producers_tarpit_stats.py::test_holds_are_recorded_with_category_kind_and_hold_time`, `test_producers_tarpit_stats.py::test_skips_and_the_gaps_after_a_hold_and_after_an_instant_refusal`, `test_r3_fix_pages_lane.py::test_tarpit_card_has_the_fleet_hold_statistics_of_the_range` |
-| 79 | Header and User-Agent fingerprints | partial: P11 (Security page) | `test_metrics_fingerprints.py::test_secret_shaped_plain_values_are_stored_hashed`, `test_metrics_fingerprints.py::test_counts_add_up_across_workers_and_values_are_capped_per_header`, `test_metrics_fingerprints.py::test_auto_ignore_is_central_and_not_double_counted`, `test_metrics_jobs.py::test_rules_ignore_header_writes_an_audited_auto_entry`, `test_rr_cred_fingerprint_names.py::test_fingerprint_header_names_never_store_a_credential_piece`, `test_api_security.py::test_fingerprints_values_user_agents_blocked_and_ignored_headers`, `test_api_w3b_wiring.py::test_passing_requests_are_fingerprinted_and_filtered_ones_count_as_blocked`, `test_r3_parity_security.py::test_parity_11_one_headers_values_can_be_cleared_and_the_header_removed` |
-| 80 | Probe, login, crawl and throttled rings | partial: P11 (Security page) | `test_metrics_security_events.py::test_probe_signature`, `test_metrics_security_events.py::test_ring_pages_newest_first_with_filters`, `test_metrics_security_events.py::test_summaries`, `test_metrics_security_events.py::test_login_events_via_recorder`, `test_public_pages.py::test_visits_and_crawls_are_recorded`, `test_api_security.py::test_probes_ring_summary_and_crawls`, `test_api_security.py::test_logins_and_failed_logins`, `test_api_protection.py::test_throttled_history_from_the_throttled_events`, `test_v1_public.py::test_v1_proxy_probes_reach_the_probe_log` |
-| 81 | Live request feed | partial: P11 (Live page) | `test_metrics_live.py::test_tail_delivers_rows_from_any_writer`, `test_metrics_live.py::test_backfill_for_last_event_id`, `test_metrics_live.py::test_filter_covers_every_field`, `test_metrics_pipeline.py::test_live_tail_sees_every_worker`, `test_design_system.py::test_live_tail_streams_pauses_and_resumes_after_last_event_id`, `test_api_live.py::test_rows_newest_first_with_filters`, `test_api_live.py::test_cursor_pages_back_without_gaps`, `test_sse.py::test_kpi_then_filtered_live_rows`, `test_sse_mp.py::test_a_stream_on_worker_a_delivers_what_worker_b_recorded` |
+| 66 | Cache browser, inspect, purge, refresh | covered (P11: the Cache page's browser, inspector drawer and Purge card) | `test_page_cache.py::test_the_browser_searches_sorts_and_pages_with_the_api_names`, `test_page_cache.py::test_the_drawers_show_an_entry_an_endpoint_and_a_rule`, `test_page_cache.py::test_purge_matching_removes_exactly_what_the_search_lists`, `test_page_cache.py::test_the_forms_post_to_the_cache_api_and_need_csrf`, `test_page_cache.py::test_a_row_opens_the_inspector_drawer`, `test_page_cache.py::test_the_purge_card_reviews_before_it_purges`, `test_v1_sections.py::test_cache_stats`, `test_cache_purge.py::test_purge_scopes_report_true_counts`, `test_cache_purge.py::test_purge_host_regex_expired_and_all`, `test_cache_workers.py::test_purge_reaches_the_other_workers_memory_tier`, `test_cache_purge.py::test_admin_views_and_key_spread`, `test_api_cache.py::test_browser_search_sort_page_and_hidden_handoff_rows`, `test_api_cache.py::test_inspect_and_refresh_a_get_entry`, `test_api_cache.py::test_refresh_a_post_entry_resends_its_body`, `test_api_cache.py::test_purge_every_scope_is_audited_first`, `test_r3_parity_cache.py::test_parity_15_purge_matching_purges_exactly_what_the_search_lists`, `test_r3_parity_cache.py::test_parity_15_search_purge_removes_exactly_the_listed_entries_and_nothing_else` |
+| 67 | Cache stats and honest avoided calls | covered (P11: Cache > Statistics and Hit ratio over time) | `test_page_cache.py::test_the_numbers_equal_the_cache_api`, `test_page_cache.py::test_clear_stats_is_a_previewed_family_reset`, `test_v1_sections.py::test_cache_stats`, `test_metrics_queries.py::test_avoided_calls_are_honest`, `test_metrics_recorder.py::test_upstream_429_internal_background_and_egress`, `test_cache_service.py::test_hits_and_change_observations_are_flushed`, `test_api_cache.py::test_stats_are_honest`, `test_api_overview.py::test_kpi_tiles_are_honest_and_carry_sparklines_and_deltas` |
+| 68 | Status codes by source | covered (P11: Traffic > Status codes, "Who returned it?") | `test_page_traffic.py::test_status_tiles_verdict_and_table_equal_the_api`, `test_page_traffic.py::test_the_status_view_and_the_latency_split_swap_their_card_in_place`, `test_v1_sections.py::test_traffic_status`, `test_v1_sections.py::test_overview_kpis_errors`, `test_metrics_recorder.py::test_dims_row_holds_every_dimension`, `test_metrics_recorder.py::test_cache_state_and_source_strings`, `test_metrics_queries.py::test_series_reads_compacted_levels_plus_the_tail`, `test_api_traffic.py::test_status_sources_and_the_429_verdict`, `test_r3_parity_overview.py::test_parity_1_a_roblox_5xx_counts_as_5xx_from_roblox` |
+| 69 | Request counts and traffic over time | covered (P11: the Overview tiles and chart; Traffic > Requests, By verb, the heatmap and the trends) | `test_page_traffic.py::test_the_requests_totals_equal_the_api_series`, `test_page_traffic.py::test_verbs_and_latency_tables_equal_the_api`, `test_page_traffic.py::test_the_heatmap_and_trends_equal_the_api`, `test_page_overview.py::test_tile_numbers_equal_the_api_for_the_same_range`, `test_page_overview.py::test_the_chart_draws_the_api_series_with_a_data_table`, `test_v1_sections.py::test_traffic_requests`, `test_v1_sections.py::test_traffic_verbs`, `test_v1_sections.py::test_overview_kpis`, `test_metrics_rollups.py::test_minutes_compact_into_hours_exactly`, `test_metrics_rollups.py::test_days_and_months_in_ui_timezone`, `test_metrics_queries.py::test_comparison_windows`, `test_metrics_pipeline.py::test_flush_loop_compaction_and_queries`, `test_metrics_mp.py::test_metric_totals_equal_requests_sent`, `test_api_traffic.py::test_requests_stacked_by_outcome_with_compare`, `test_api_traffic.py::test_verbs_series_and_table_with_export`, `test_api_traffic.py::test_trend_tables`, `test_r3_parity_overview.py::test_parity_2_overview_has_the_v1_failures_last_hour_tile` |
+| 70 | Latency percentiles | covered (P11: Traffic > Latency and Upstream > Latency) | `test_page_traffic.py::test_verbs_and_latency_tables_equal_the_api`, `test_page_traffic.py::test_the_status_view_and_the_latency_split_swap_their_card_in_place`, `test_page_upstream.py::test_every_card_renders_without_an_error_and_holds_its_settings`, `test_v1_sections.py::test_traffic_latency`, `test_metrics_histograms.py::test_merge_is_element_wise_addition`, `test_metrics_histograms.py::test_percentile_interpolates_inside_the_bucket`, `test_metrics_histograms.py::test_percentile_error_is_bounded_by_the_bucket_width`, `test_metrics_histograms.py::test_sql_functions_merge_and_sum`, `test_api_traffic.py::test_latency_series_and_splits`, `test_api_upstream.py::test_latency_series_are_percentiles_of_upstream_requests` |
+| 71 | Method health per egress and host | covered (P11: Upstream > Egress and host health, and Hosts) | `test_page_upstream.py::test_the_numbers_equal_the_api_for_the_same_range`, `test_metrics_queries.py::test_filters_are_whitelisted`, `test_metrics_queries.py::test_misc_read_models`, `test_metrics_recorder.py::test_errors_are_upserted_and_redacted`, `test_api_upstream.py::test_egress_cards_and_host_table_report_honest_rates`, `test_r3_parity_upstream.py::test_parity_6_egress_cards_carry_v1_method_health`, `test_v1_upstream.py::test_v1_egress_health_says_when_it_last_worked_and_what_failed_last` |
+| 72 | Failure, refusal, internal and error logs | covered (P11: Upstream > Request failures and Internal calls, Protection > Refusal reasons, System > Error log) | `test_page_upstream.py::test_the_failures_log_filters_pages_and_exports_with_the_api_names`, `test_page_protection.py::test_the_refusal_reasons_keep_the_v1_columns_and_the_message_split`, `test_page_system.py::test_the_tables_show_the_apis_rows`, `test_page_system.py::test_the_error_log_filters_and_searches_in_place`, `test_v1_sections.py::test_upstream_failures`, `test_v1_sections.py::test_protection_refusals`, `test_v1_sections.py::test_upstream_internal_calls`, `test_v1_sections.py::test_system_errors`, `test_metrics_recorder.py::test_refusal_events_are_budgeted_but_counts_stay_exact`, `test_metrics_recorder.py::test_upstream_429_internal_background_and_egress`, `test_metrics_recorder.py::test_errors_are_upserted_and_redacted`, `test_metrics_recorder.py::test_aggregated_events_wait_for_their_minute_to_close`, `test_api_upstream.py::test_retries_and_internal_calls`, `test_api_system.py::test_errors_are_searchable_and_tracebacks_redacted`, `test_api_protection.py::test_bot_pipeline_and_refusals_for_the_range`, `test_r3_parity_upstream.py::test_parity_5_upstream_failures_log_exists`, `test_r3_parity_protection.py::test_parity_3_refusal_reasons_keep_the_v1_columns` |
+| 73 | Top talkers and callers with rates | covered (P11: Clients > Places and IP addresses, and the page of one client) | `test_page_clients.py::test_the_tables_equal_the_clients_api`, `test_page_clients.py::test_the_client_view_shows_the_api_numbers_and_its_actions`, `test_page_clients.py::test_the_client_has_a_page_of_its_own`, `test_v1_sections.py::test_clients_places`, `test_metrics_clients.py::test_minute_keeps_top_n_and_folds_the_rest`, `test_metrics_clients.py::test_trailing_rate_has_no_minute_boundary_flap`, `test_metrics_queries.py::test_client_table_with_rates`, `test_storage_retention.py::test_place_clients_follow_max_caller_records`, `test_api_clients.py::test_ip_table_rates_flags_bot_score_sort_search_and_export`, `test_api_clients.py::test_place_table_page_actions_and_lookup_cache`, `test_r3_parity_clients.py::test_parity_7_client_tables_keep_last_seen_and_peers`, `test_metrics_client_extras.py::test_peer_counts_across_levels_count_each_peer_once`, `test_api_clients.py::test_recorded_fleet_scores_answer_when_no_live_row_exists` |
+| 74 | Endpoint popularity with templating | covered (P11: the Endpoints page, its drill-down and Recent requests; labels scrubbed, C1 over row 74) | `test_page_endpoints.py::test_every_card_and_the_v1_columns_are_on_the_page`, `test_page_endpoints.py::test_the_table_equals_the_api_for_the_same_filters`, `test_page_endpoints.py::test_the_drill_down_equals_the_api_in_the_drawer_and_on_its_page`, `test_page_endpoints.py::test_the_recent_card_equals_the_api`, `test_v1_sections.py::test_endpoints_table`, `test_metrics_templating.py::test_v1_worked_examples`, `test_metrics_templating.py::test_templatize_equals_v1_on_generated_paths`, `test_metrics_templating.py::test_vocabulary_gate_bounds_distinct_values`, `test_metrics_labels.py::test_template_for_scrubs_a_piece_in_a_route_word`, `test_metrics_queries.py::test_top_n_pages_and_sorts_on_the_server`, `test_api_endpoints.py::test_table_sorts_pages_and_trends`, `test_api_endpoints.py::test_drill_down`, `test_r3_parity_endpoints.py::test_parity_13_endpoint_rows_keep_methods_and_last_request`, `test_r3_parity_endpoints.py::test_parity_13_last_request_falls_back_to_the_rollup_minute` |
+| 75 | Blocked and rate-limited attempt logs | covered (P11: the Attempts tabs of Protection > Endpoint blocks, Endpoint rules and Request filters); the attempts tabs count distinct clients instead of showing the last IP (plan 9.15 over row 75) and, since review round 3, name the rule that refused (`refused_by`; see Wave 3b) | `test_page_protection.py::test_attempts_tabs_name_the_rule_that_refused`, `test_page_protection.py::test_clearing_the_blocked_attempts_empties_that_tab_only`, `test_v1_sections.py::test_protection_endpoint_blocks_attempts`, `test_v1_sections.py::test_protection_endpoint_rules_attempts`, `test_v1_sections.py::test_protection_request_filters_attempts`, `test_abuse_pipeline_order.py::test_stats_count_refusals_by_check`, `test_metrics_recorder.py::test_refusal_events_are_budgeted_but_counts_stay_exact`, `test_api_protection.py::test_endpoint_blocks_rules_and_attempts`, `test_abuse_security_records.py::test_a_refusal_event_names_the_rule_that_refused` |
+| 76 | Throttle tier and UA rule hits | covered (P11: each rung's new strikes on Protection > Ladder, each rule's hits on the rule tables) | `test_page_parity_rows.py::test_row_76_rung_strikes_and_user_agent_rule_hits_are_the_apis`, `test_page_protection.py::test_the_ladder_card_has_the_simulation_the_editor_and_restore_defaults`, `test_abuse_review_fixes.py::test_record_throttled_and_aggregated_tier_and_ua_rule_events`, `test_api_protection.py::test_ladder_replace_reset_and_tier_hits`, `test_api_protection.py::test_ua_rules_crud_order_hits_and_tester`, `test_producers_rule_hits.py::test_every_matched_rule_row_is_on_the_verdict_and_recorded`, `test_r3_fix_pages_lane.py::test_rule_tables_carry_hits_and_one_rule_has_a_hit_history` |
+| 77 | Budget rejections and peaks | covered (P11: Upstream > Buckets, each bucket's fill history and rejections in its drawer; the bucket fill history is stored since P10) | `test_page_upstream.py::test_the_numbers_equal_the_api_for_the_same_range`, `test_page_upstream.py::test_a_bucket_row_opens_its_history_and_override_in_the_drawer`, `test_upstream_buckets.py::test_bucket_states_for_the_dashboard`, `test_upstream_buckets.py::test_fill_levels`, `test_engine.py::test_recorder_history_hooks_and_read_models`, `test_rules_upstream.py::test_up_bucket_tune_numbers_and_safe_auto`, `test_api_upstream.py::test_buckets_show_fill_rates_and_history_and_a_reset_never_refills_them` |
+| 78 | Tarpit stats | covered (P11: Protection > Tarpit shows the fleet's hold statistics of the range, stored and served since the producers lane) | `test_page_parity_rows.py::test_row_78_the_tarpit_tiles_and_categories_are_the_fleets_hold_statistics`, `test_v1_sections.py::test_protection_tarpit`, `test_abuse_tarpit.py::test_arrival_gap_is_measured_across_refusals`, `test_abuse_tarpit.py::test_over_the_cap_is_instant_and_counted_as_skipped`, `test_ingress_exhaustion.py::test_tarpit_stats_tables_are_bounded`, `test_api_protection.py::test_tarpit_state_has_the_effective_cap_fields`, `test_producers_tarpit_stats.py::test_holds_are_recorded_with_category_kind_and_hold_time`, `test_producers_tarpit_stats.py::test_skips_and_the_gaps_after_a_hold_and_after_an_instant_refusal`, `test_r3_fix_pages_lane.py::test_tarpit_card_has_the_fleet_hold_statistics_of_the_range` |
+| 79 | Header and User-Agent fingerprints | covered (P11: Security > Fingerprints; the v1 User-Agent drill-down, last path, last address and last header names of each User-Agent, is metrics.db schema 8 and the User-Agent drawer, gaps lane; header values are not kept there, and headers that carry client addresses keep no value at all) | `test_page_security.py::test_fingerprint_tabs_equal_the_api`, `test_page_security.py::test_fingerprint_actions_need_csrf_and_are_audited`, `test_page_security.py::test_a_header_opens_in_the_drawer_with_its_values_as_text`, `test_v1_sections.py::test_security_fingerprints`, `test_metrics_fingerprints.py::test_secret_shaped_plain_values_are_stored_hashed`, `test_metrics_fingerprints.py::test_counts_add_up_across_workers_and_values_are_capped_per_header`, `test_metrics_fingerprints.py::test_auto_ignore_is_central_and_not_double_counted`, `test_metrics_jobs.py::test_rules_ignore_header_writes_an_audited_auto_entry`, `test_rr_cred_fingerprint_names.py::test_fingerprint_header_names_never_store_a_credential_piece`, `test_api_security.py::test_fingerprints_values_user_agents_blocked_and_ignored_headers`, `test_api_w3b_wiring.py::test_passing_requests_are_fingerprinted_and_filtered_ones_count_as_blocked`, `test_r3_parity_security.py::test_parity_11_one_headers_values_can_be_cleared_and_the_header_removed`, `test_page_security.py::test_a_user_agent_row_opens_its_newest_request_in_the_drawer`, `test_api_gaps_fingerprints.py::test_the_user_agent_drill_down_answers_v1s_question`, `test_api_gaps_fingerprints.py::test_the_user_agent_export_hashes_the_last_caller`, `test_metrics_user_agent_detail.py::test_the_newest_request_of_each_user_agent_is_kept`, `test_storage_migrate_upgrade.py::test_this_releases_writers_and_readers_work_on_the_upgraded_file` |
+| 80 | Probe, login, crawl and throttled rings | covered (P11: Security > Probes, Probe summary, Admin logins and Crawler activity; Protection > Throttle, Throttled in this range) | `test_page_security.py::test_seeded_security_events_are_listed`, `test_page_security.py::test_table_numbers_equal_the_api_for_the_same_filters`, `test_page_security.py::test_the_probe_filter_swaps_only_its_table`, `test_page_protection.py::test_table_numbers_equal_the_api`, `test_v1_sections.py::test_security_probes`, `test_v1_sections.py::test_security_probe_summary`, `test_v1_sections.py::test_security_logins`, `test_v1_sections.py::test_security_crawls`, `test_v1_sections.py::test_protection_throttle_watch`, `test_metrics_security_events.py::test_probe_signature`, `test_metrics_security_events.py::test_ring_pages_newest_first_with_filters`, `test_metrics_security_events.py::test_summaries`, `test_metrics_security_events.py::test_login_events_via_recorder`, `test_public_pages.py::test_visits_and_crawls_are_recorded`, `test_api_security.py::test_probes_ring_summary_and_crawls`, `test_api_security.py::test_logins_and_failed_logins`, `test_api_protection.py::test_throttled_history_from_the_throttled_events`, `test_v1_public.py::test_v1_proxy_probes_reach_the_probe_log` |
+| 81 | Live request feed | covered (P11: the Live page's tail and request drawer) | `test_page_live.py::test_the_drawer_shows_the_record_the_trace_and_the_capture`, `test_page_live.py::test_filters_in_the_address_are_checked_and_handed_to_the_tail`, `test_page_live.py::test_pause_holds_new_rows_and_resume_shows_them`, `test_page_live.py::test_the_outcome_filter_narrows_the_list_and_a_row_opens_its_request`, `test_v1_sections.py::test_live_tail`, `test_metrics_live.py::test_tail_delivers_rows_from_any_writer`, `test_metrics_live.py::test_backfill_for_last_event_id`, `test_metrics_live.py::test_filter_covers_every_field`, `test_metrics_pipeline.py::test_live_tail_sees_every_worker`, `test_design_system.py::test_live_tail_streams_pauses_and_resumes_after_last_event_id`, `test_api_live.py::test_rows_newest_first_with_filters`, `test_api_live.py::test_cursor_pages_back_without_gaps`, `test_sse.py::test_kpi_then_filtered_live_rows`, `test_sse_mp.py::test_a_stream_on_worker_a_delivers_what_worker_b_recorded` |
 | 82 | Capture with redaction, TTL and caps | covered | `test_metrics_capture.py::test_headers_query_url_and_bodies_are_redacted`, `test_metrics_capture.py::test_write_enforces_count_bytes_and_ttl`, `test_metrics_capture.py::test_refusals_always_served_sampled`, `test_metrics_capture_encoder.py::test_queue_is_bounded_by_count_and_drops_without_waiting`, `test_review_loop_blocking.py::test_review_large_capture_is_not_encoded_on_the_loop`, `test_rr_cred_capture_header_names.py::test_captured_header_names_never_hold_a_credential_piece` |
-| 83 | Section clears (granular resets) | partial: P11 (Data page and the inline reset menus) | `test_metrics_queries.py::test_kpis_compare_and_reset_notice`, `test_api_data.py::test_family_reset_preview_phrase_snapshot_audit_and_annotation`, `test_api_data.py::test_reset_listing_maps_every_v1_clear_target`, `test_api_data.py::test_date_range_reset_deletes_only_inside_the_range`, `test_r3_parity_data.py::test_parity_8_clearing_cache_stats_keeps_ratios_honest_and_requests`, `test_r3_parity_data.py::test_parity_9_clearing_one_attempts_tab_keeps_the_others`, `test_r3_parity_data.py::test_parity_12_kpi_delta_over_a_reset_window_is_replaced_by_a_notice`, `test_metrics_reset_scope.py::test_a_reset_of_another_family_leaves_the_tiles_and_the_page_alone`, `test_v1_metrics.py::test_v1_a_reset_counter_resumes_from_zero_and_nothing_comes_back` |
-| 84 | Worker fleet registry | partial: P11 (System page) | `test_scheduler_heartbeat.py::test_beat_writes_the_parity_row_84_fields`, `test_scheduler_heartbeat.py::test_fleet_view_marks_fresh_stale_and_this_worker`, `test_scheduler_heartbeat.py::test_loop_lag_monitor_measures_a_blocked_loop`, `test_scheduler_heartbeat.py::test_beat_sync_and_rss`, `test_api_system.py::test_fleet_has_the_parity_row_84_fields_and_both_colors`, `test_api_w3b_wiring.py::test_the_heartbeat_feeds_the_worker_minute_history` |
-| 85 | Persistence and store sizes | partial: P11 (System and Data pages) | `test_review_loop_blocking.py::test_review_health_answers_at_once_while_the_disk_stalls`, `test_storage_retention.py::test_run_retention_works_in_batches_and_vacuums`, `test_api_system.py::test_metrics_pipeline_and_persistence`, `test_api_data.py::test_storage_has_every_database_and_table_with_a_projection`, `test_api_data.py::test_retention_view_lists_the_settings_and_each_tables_state`, `test_r3_fix_pages_lane.py::test_system_shows_fleet_drops_and_the_disk_growth_history`, `test_r3_parity_data.py::test_parity_10_retention_view_lists_every_data_retention_setting` |
-| 86 | Threat banner, now recommendations | partial: P11 (Overview card and Recommendations page) | `test_engine.py::test_lifecycle_open_update_resolve_reopen`, `test_rules_core.py::test_before_after_11_6_card`, `test_api_recommendations.py::test_list_filters_counts_paging_and_export`, `test_api_recommendations.py::test_apply_then_undo_through_the_audited_services`, `test_api_overview.py::test_top_recommendations_most_severe_first` |
-| 87 | Glossary, help dots, setting help, simulations | partial: P11 (pages and simulations) | `test_ui_static.py::test_glossary_has_every_plan_section_21_term`, `test_ui_static.py::test_glossary_includes_the_v1_dashboard_terms`, `test_ui_templates.py::test_setting_control_renders_every_catalog_setting`, `test_design_system.py::test_tooltips_for_help_dots_and_glossary_terms` |
+| 83 | Section clears (granular resets) | covered (P11: the Data page's reset form and the inline resets beside the numbers, each previewed by the Data API and run only through `POST /data/resets`) | `test_page_protection.py::test_each_v1_clear_button_runs_its_data_reset`, `test_v1_sections.py::test_data_storage`, `test_page_overview.py::test_the_visits_reset_previews_then_resets_through_the_data_api`, `test_page_traffic.py::test_the_traffic_reset_previews_then_runs_only_through_the_data_api`, `test_page_data.py::test_a_reset_runs_only_through_the_preview_the_form_shows`, `test_metrics_queries.py::test_kpis_compare_and_reset_notice`, `test_api_data.py::test_family_reset_preview_phrase_snapshot_audit_and_annotation`, `test_api_data.py::test_reset_listing_maps_every_v1_clear_target`, `test_api_data.py::test_date_range_reset_deletes_only_inside_the_range`, `test_r3_parity_data.py::test_parity_8_clearing_cache_stats_keeps_ratios_honest_and_requests`, `test_r3_parity_data.py::test_parity_9_clearing_one_attempts_tab_keeps_the_others`, `test_r3_parity_data.py::test_parity_12_kpi_delta_over_a_reset_window_is_replaced_by_a_notice`, `test_metrics_reset_scope.py::test_a_reset_of_another_family_leaves_the_tiles_and_the_page_alone`, `test_v1_metrics.py::test_v1_a_reset_counter_resumes_from_zero_and_nothing_comes_back` |
+| 84 | Worker fleet registry | covered (P11: System > Workers, both colors, every column in the worker drawer) | `test_page_system.py::test_the_fleet_and_pipeline_numbers_are_the_apis`, `test_page_system.py::test_a_worker_row_opens_every_column_in_the_drawer`, `test_page_system.py::test_on_a_phone_a_worker_opens_every_column_in_the_drawer`, `test_v1_sections.py::test_overview_kpis_errors`, `test_v1_sections.py::test_health_run`, `test_scheduler_heartbeat.py::test_beat_writes_the_parity_row_84_fields`, `test_scheduler_heartbeat.py::test_fleet_view_marks_fresh_stale_and_this_worker`, `test_scheduler_heartbeat.py::test_loop_lag_monitor_measures_a_blocked_loop`, `test_scheduler_heartbeat.py::test_beat_sync_and_rss`, `test_api_system.py::test_fleet_has_the_parity_row_84_fields_and_both_colors`, `test_api_w3b_wiring.py::test_the_heartbeat_feeds_the_worker_minute_history` |
+| 85 | Persistence and store sizes | covered (P11: System > Persistence and Data > Storage and Retention) | `test_page_data.py::test_the_storage_table_equals_the_api_and_answers_alone`, `test_page_data.py::test_the_retention_table_equals_the_api`, `test_page_system.py::test_every_card_is_on_the_page_and_every_fragment_renders`, `test_v1_sections.py::test_data_storage`, `test_v1_sections.py::test_health_run`, `test_review_loop_blocking.py::test_review_health_answers_at_once_while_the_disk_stalls`, `test_storage_retention.py::test_run_retention_works_in_batches_and_vacuums`, `test_api_system.py::test_metrics_pipeline_and_persistence`, `test_api_data.py::test_storage_has_every_database_and_table_with_a_projection`, `test_api_data.py::test_retention_view_lists_the_settings_and_each_tables_state`, `test_r3_fix_pages_lane.py::test_system_shows_fleet_drops_and_the_disk_growth_history`, `test_r3_parity_data.py::test_parity_10_retention_view_lists_every_data_retention_setting` |
+| 86 | Threat banner, now recommendations | covered (P11: the Overview's top recommendations and the Recommendations page) | `test_page_overview.py::test_top_recommendations_open_their_drawer_on_the_recommendations_page`, `test_page_recommendations.py::test_the_drawer_shows_evidence_diff_actions_and_stays_inert`, `test_page_recommendations.py::test_apply_undo_snooze_and_dismiss_through_the_api`, `test_page_recommendations.py::test_preview_apply_and_undo_from_a_phone`, `test_engine.py::test_lifecycle_open_update_resolve_reopen`, `test_rules_core.py::test_before_after_11_6_card`, `test_api_recommendations.py::test_list_filters_counts_paging_and_export`, `test_api_recommendations.py::test_apply_then_undo_through_the_audited_services`, `test_api_overview.py::test_top_recommendations_most_severe_first` |
+| 87 | Glossary, help dots, setting help, simulations | covered (P11: the glossary on Help and in every tooltip, setting and column help from the catalogs, and the cache, ladder, pipeline and "why did this request wait?" explainers) | `test_page_help.py::test_the_glossary_has_every_term_as_the_target_of_the_tooltips`, `test_page_help.py::test_the_glossary_filter_narrows_the_terms_and_says_how_many`, `test_page_cache.py::test_the_explainer_follows_the_settings`, `test_page_protection.py::test_the_ladder_card_has_the_simulation_the_editor_and_restore_defaults`, `test_page_protection.py::test_the_pipeline_counts_equal_the_api`, `test_page_upstream.py::test_the_trace_explains_a_real_request`, `test_every_setting.py::test_every_setting_on_a_feature_page`, `test_ui_static.py::test_glossary_has_every_plan_section_21_term`, `test_ui_static.py::test_glossary_includes_the_v1_dashboard_terms`, `test_ui_templates.py::test_setting_control_renders_every_catalog_setting`, `test_design_system.py::test_tooltips_for_help_dots_and_glossary_terms` |
 | 88 | CSV and JSON exports | covered (IP columns are hashed unless `export_include_ips`; see Wave 3b) | `test_ui_gallery.py::test_export_guards_spreadsheet_formulas`, `test_api_common.py::test_csv_and_json_exports_are_guarded_named_and_audited`, `test_api_common.py::test_exports_follow_the_ip_privacy_settings`, `test_api_data.py::test_dataset_exports`, `test_llm_export.py::test_export_of_a_fixture_database_validates_against_the_schema`, `test_llm_export.py::test_injection_fixture_appears_only_under_untrusted`, `test_llm_export.py::test_no_secret_appears_in_the_export`, `test_api_export_llm.py::test_summary_validates_and_every_download_is_audited`, `test_api_export_llm.py::test_the_leader_job_writes_the_hourly_file` |
-| 89 | Server-side sorting and paging | partial: P11 | `test_metrics_queries.py::test_top_n_pages_and_sorts_on_the_server`, `test_ui_gallery.py::test_table_fragment_sorts_filters_and_pages_on_the_server`, `test_design_system.py::test_table_paging_sorting_search_and_columns`, `test_api_common.py::test_table_paging_sorting_and_search`, `test_api_settings.py::test_prefs_json_and_form_updates_are_validated_and_stored_per_admin` |
-| 90 | Live updates over SSE | partial: P11 | `test_ui_gallery.py::test_stream_resumes_after_last_event_id`, `test_design_system.py::test_live_tail_streams_pauses_and_resumes_after_last_event_id`, `test_sse.py::test_kpi_then_filtered_live_rows`, `test_sse.py::test_last_event_id_resumes_exactly`, `test_sse.py::test_a_resume_that_cannot_catch_up_says_so`, `test_sse.py::test_a_revoked_session_ends_the_stream_with_401` |
-| 91 | Section jump, now the command palette | partial: P11 (palette search over the real pages) | `test_design_system.py::test_command_palette_and_shortcuts`, `test_ui_gallery.py::test_palette_search_is_bounded`, `test_design_system_robustness.py::test_single_key_shortcuts_can_be_turned_off_and_stay_off` |
-| 92 | Identify an experience | partial: P11 (Clients page) | `test_upstream_internal.py::test_lookup_place_chain`, `test_upstream_internal.py::test_lookup_rejects_non_numeric`, `test_api_clients.py::test_place_table_page_actions_and_lookup_cache`, `test_api_clients.py::test_lookup_errors_are_section13` |
-| 93 | Health check button | partial: P11 (Health page) | `test_upstream_internal.py::test_probe_credential_verdicts`, `test_egress_rotator.py::test_exit_ip_probe_errors_and_recent_ips`, `test_health_fixtures.py::test_health_fixture`, `test_runner.py::test_catalog_covers_every_13_2_check_once`, `test_api_health.py::test_a_run_starts_streams_and_reads_back`, `test_api_health.py::test_the_credential_check_needs_a_fresh_second_factor` |
+| 89 | Server-side sorting and paging | covered (P11: every table pages, sorts and searches on the server; the main table keeps its view in the address) | `test_page_audit.py::test_server_paging_sorting_and_search_use_the_api_names`, `test_page_audit.py::test_filters_search_and_paging_swap_the_table_in_place`, `test_page_cache.py::test_a_table_request_answers_the_table_alone_and_a_refresh_keeps_the_view`, `test_page_traffic.py::test_a_table_sorts_in_place_without_nesting_its_card`, `test_metrics_queries.py::test_top_n_pages_and_sorts_on_the_server`, `test_ui_gallery.py::test_table_fragment_sorts_filters_and_pages_on_the_server`, `test_design_system.py::test_table_paging_sorting_search_and_columns`, `test_api_common.py::test_table_paging_sorting_and_search`, `test_api_settings.py::test_prefs_json_and_form_updates_are_validated_and_stored_per_admin` |
+| 90 | Live updates over SSE | covered (P11: the Live tail and a running health check follow the stream; cards refresh on their stream kinds) | `test_page_live.py::test_pause_holds_new_rows_and_resume_shows_them`, `test_page_health.py::test_a_run_going_in_another_worker_is_followed_live`, `test_page_health.py::test_a_run_from_a_phone_fills_in_live_and_finishes`, `test_pages_core.py::test_the_shell_urls_csrf_session_and_stream`, `test_ui_gallery.py::test_stream_resumes_after_last_event_id`, `test_design_system.py::test_live_tail_streams_pauses_and_resumes_after_last_event_id`, `test_sse.py::test_kpi_then_filtered_live_rows`, `test_sse.py::test_last_event_id_resumes_exactly`, `test_sse.py::test_a_resume_that_cannot_catch_up_says_so`, `test_sse.py::test_a_revoked_session_ends_the_stream_with_401` |
+| 91 | Section jump, now the command palette | covered (P11: palette search over the real pages) | `test_pages_core.py::test_palette_search_answers_settings_recommendations_and_endpoints_as_admin_paths`, `test_pages_core.py::test_the_sidebar_phone_menu_and_palette_list_the_registry`, `test_pages_shell.py::test_the_palette_jumps_to_a_page_and_offers_the_llm_export`, `test_design_system.py::test_command_palette_and_shortcuts`, `test_ui_gallery.py::test_palette_search_is_bounded`, `test_design_system_robustness.py::test_single_key_shortcuts_can_be_turned_off_and_stay_off` |
+| 92 | Identify an experience | covered (P11: Clients > Identify an experience) | `test_page_clients.py::test_the_lookup_draws_the_experience_as_text`, `test_v1_sections.py::test_clients_places`, `test_upstream_internal.py::test_lookup_place_chain`, `test_upstream_internal.py::test_lookup_rejects_non_numeric`, `test_api_clients.py::test_place_table_page_actions_and_lookup_cache`, `test_api_clients.py::test_lookup_errors_are_section13` |
+| 93 | Health check button | covered (P11: the Health page, the Overview's Check Proxy Health and the palette's health run) | `test_page_health.py::test_every_card_the_run_button_and_the_schedule_settings_are_there`, `test_page_health.py::test_starting_a_run_needs_csrf_and_a_fresh_factor_for_the_credential`, `test_page_health.py::test_a_run_from_a_phone_fills_in_live_and_finishes`, `test_page_overview.py::test_check_proxy_health_starts_a_run_and_opens_it`, `test_v1_sections.py::test_health_run`, `test_upstream_internal.py::test_probe_credential_verdicts`, `test_egress_rotator.py::test_exit_ip_probe_errors_and_recent_ips`, `test_health_fixtures.py::test_health_fixture`, `test_runner.py::test_catalog_covers_every_13_2_check_once`, `test_api_health.py::test_a_run_starts_streams_and_reads_back`, `test_api_health.py::test_the_credential_check_needs_a_fresh_second_factor` |
 | 94 | Admin login with password (argon2id) | covered | `test_admin_auth_passwords.py::test_production_parameters_are_the_plan_values`, `test_admin_auth_passwords.py::test_unknown_user_verifies_against_a_dummy_hash_and_fails`, `test_admin_auth_flow.py::test_wrong_password_is_403_invalid_credentials_and_unknown_user_looks_the_same`, `test_auth_argon2_thread.py::test_argon2_runs_off_the_loop_thread` |
 | 95 | Login bound to IP and UA | covered | `test_admin_auth_flow.py::test_transaction_is_bound_to_ip_and_user_agent_and_expires` |
 | 96 | Second factor: TOTP, passkeys, email fallback | covered | `test_admin_auth_flow.py::test_password_then_totp_logs_in_and_sends_the_login_alert`, `test_admin_auth_flow.py::test_bootstrap_login_uses_email_then_forces_enrollment`, `test_admin_auth_flow.py::test_email_resend_replaces_the_code_and_is_rate_limited`, `test_admin_auth_flow.py::test_passkey_registration_and_login`, `test_admin_auth_flow.py::test_recovery_code_works_once`, `test_auth_uniform_404.py::test_every_second_factor_failure_looks_identical` |
@@ -2539,29 +2961,29 @@ not store. Wave 3b also added API tests to the covered rows 15, 25, 29, 32, 45, 
 | 110 | Worker recycling | covered | `test_deploy_gunicorn.py::test_settings_follow_plan_5_2`, `test_deploy_gunicorn.py::test_max_requests_zero_disables_recycling` |
 | 111 | Shared matcher semantics | covered (the credential allowlist is exact; see Wave 2) | `test_match.py::test_v1_rule_match_parity`, `test_match.py::test_v1_rule_match_corpus_parity`, `test_match.py::test_v1_best_match_parity`, `test_match.py::test_exact_patterns_grant_no_implicit_subpath` |
 | 112 | Canonical header rule id | covered | `test_match.py::test_header_rule_canonical_key_parity`, `test_service.py::test_header_rule_duplicates_are_rejected`, `test_service.py::test_imported_header_rule_keeps_its_v1_key_on_edit`, `test_service.py::test_opposite_regex_header_rules_are_two_rules` |
-| 113 | "Bypass my IP" | partial: P11 | `test_abuse_switches_rules.py::test_bypass_my_ip_and_never_needs_confirmation`, `test_api_protection.py::test_bypass_deny_and_bypass_my_ip` |
-| 114 | Pause and throttle-all drop counters and banners | partial: P11 (top bar banners) | `test_metrics_queries.py::test_drops_since_refusal_reasons_retries_visitors`, `test_api_protection.py::test_pause_message_schedule_and_drops_since`, `test_api_protection.py::test_throttle_all_limit_since_marker_and_watch` |
+| 113 | "Bypass my IP" | covered (P11: Protection > Bypass, with your address as Roxy resolved it) | `test_page_protection.py::test_bypass_my_ip_adds_my_address`, `test_v1_sections.py::test_protection_bypass`, `test_v1_sections.py::test_topbar_controls`, `test_abuse_switches_rules.py::test_bypass_my_ip_and_never_needs_confirmation`, `test_api_protection.py::test_bypass_deny_and_bypass_my_ip` |
+| 114 | Pause and throttle-all drop counters and banners | covered (P11: the top bar banners count the refusals since the state began and show when it began) | `test_page_parity_rows.py::test_row_114_the_pause_banner_counts_the_refusals_since_the_pause_began`, `test_page_parity_rows.py::test_rows_114_and_135_the_emergency_limit_banner_and_watch_equal_the_api`, `test_pages_core.py::test_banners_and_dialogs_say_what_callers_get_from_the_live_setting`, `test_pages_shell.py::test_the_pause_dialog_pauses_and_resumes_through_the_api`, `test_metrics_queries.py::test_drops_since_refusal_reasons_retries_visitors`, `test_api_protection.py::test_pause_message_schedule_and_drops_since`, `test_api_protection.py::test_throttle_all_limit_since_marker_and_watch` |
 | 115 | Enabling throttle-all starts a new count | covered | `test_abuse_switches_rules.py::test_enabling_throttle_all_records_a_new_since_marker` |
 | 116 | Custom message vs Roblox body split | covered | `test_proxy_router.py::test_message_source_tells_roxy_text_from_roblox_body`, `test_metrics_queries.py::test_drops_since_refusal_reasons_retries_visitors`, `test_rr_spec_message_source.py::test_spec_4_upstream_refusal_records_its_message_source`, `test_api_protection.py::test_bot_pipeline_and_refusals_for_the_range` |
 | 117 | Retry counts by status and reason | covered | `test_metrics_queries.py::test_drops_since_refusal_reasons_retries_visitors`, `test_upstream_service.py::test_csrf_handshake_with_cached_token`, `test_api_upstream.py::test_retries_and_internal_calls` |
-| 118 | Throttle watch table | partial: P11 (Protection page) | `test_abuse_throttle.py::test_strike_board_forgive_and_watch`, `test_api_protection.py::test_strike_board_forgive_watch_and_export` |
+| 118 | Throttle watch table | covered (P11: Protection > Throttle, Throttled now) | `test_page_parity_rows.py::test_row_118_who_is_throttled_now_is_the_apis_table`, `test_v1_sections.py::test_protection_throttle_watch`, `test_abuse_throttle.py::test_strike_board_forgive_and_watch`, `test_api_protection.py::test_strike_board_forgive_watch_and_export` |
 | 119 | Session-expired overlay | covered | `test_design_system.py::test_session_expired_overlay_on_any_401_and_stay`, `test_design_system.py::test_session_expired_overlay_redirects_to_login`, `test_design_system_robustness.py::test_session_overlay_keeps_other_dialogs_and_ignores_the_palette`, `test_design_system_robustness.py::test_live_tail_marks_a_gap_and_stops_for_good_on_unauthorized` |
-| 120 | `GET /admin` sends a signed-in admin to the dashboard | partial: P11 (the dashboard page it redirects to) | `test_admin_auth_flow.py::test_login_page_and_logged_in_redirect` |
+| 120 | `GET /admin` sends a signed-in admin to the dashboard | covered (P11: `/admin/dashboard` is the Overview) | `test_pages_core.py::test_dashboard_is_the_overview_and_the_login_lands_there`, `test_admin_auth_flow.py::test_login_page_and_logged_in_redirect` |
 | 121 | Forced metrics flush | covered | `test_api_system.py::test_forced_flush_writes_this_workers_metrics_and_asks_every_worker`, `test_api_system.py::test_watcher_flushes_and_clears_memory_when_another_worker_asks`, `test_ctl.py::test_flush_metrics_asks_every_worker` |
-| 122 | Workers "reset counts" | partial: P11 (System page) | `test_scheduler_heartbeat.py::test_reset_counts_is_adopted_by_every_worker`, `test_api_system.py::test_reset_counts_zeroes_every_worker_and_is_audited` |
+| 122 | Workers "reset counts" | covered (P11: System > Workers, Reset request counts) | `test_page_system.py::test_reset_counts_goes_through_the_api_with_csrf_and_an_audit_row`, `test_page_system.py::test_reset_request_counts_asks_first_then_resets`, `test_scheduler_heartbeat.py::test_reset_counts_is_adopted_by_every_worker`, `test_api_system.py::test_reset_counts_zeroes_every_worker_and_is_audited` |
 | 123 | Tarpit state fields and reasons | covered | `test_abuse_tarpit.py::test_state_fields`, `test_abuse_tarpit.py::test_effective_cap_formula_defaults`, `test_proxy_router.py::test_tarpit_gets_the_v1_reason_string` |
-| 124 | Per-setting "Reset to default" | partial: P11 (settings pages) | `test_settings_service.py::test_reset_to_default`, `test_ui_templates.py::test_setting_control_renders_every_catalog_setting`, `test_api_settings.py::test_put_one_key_and_reset_it_to_default`, `test_api_protection.py::test_protection_settings_patch_reset_and_refusals` |
-| 125 | Ladder "reset to defaults" | partial: P11 (Protection page) | `test_service.py::test_replace_and_reset_the_ladder`, `test_api_protection.py::test_ladder_replace_reset_and_tier_hits` |
+| 124 | Per-setting "Reset to default" | covered (P11: Reset to default on every setting control, on the Settings page and on every feature page) | `test_page_settings.py::test_the_v1_runtime_settings_section_has_its_home`, `test_design_system.py::test_setting_control_validates_previews_and_saves`, `test_every_setting.py::test_every_setting_on_a_feature_page`, `test_settings_service.py::test_reset_to_default`, `test_ui_templates.py::test_setting_control_renders_every_catalog_setting`, `test_api_settings.py::test_put_one_key_and_reset_it_to_default`, `test_api_protection.py::test_protection_settings_patch_reset_and_refusals` |
+| 125 | Ladder "reset to defaults" | covered (P11: Protection > Ladder, Restore defaults) | `test_page_protection.py::test_the_ladder_card_has_the_simulation_the_editor_and_restore_defaults`, `test_page_protection.py::test_the_ladder_editor_saves_and_restores_the_defaults`, `test_service.py::test_replace_and_reset_the_ladder`, `test_api_protection.py::test_ladder_replace_reset_and_tier_hits` |
 | 126 | Live feed entry fields | covered | `test_metrics_live.py::test_live_entry_has_every_row_126_field`, `test_proxy_router.py::test_event_carries_the_optional_recorder_fields` |
 | 127 | Capture never fails a request | covered | `test_metrics_recorder.py::test_record_outcome_never_raises`, `test_metrics_recorder.py::test_capture_errors_never_fail_the_request`, `test_metrics_capture_encoder.py::test_a_failing_capture_is_counted_and_the_thread_goes_on`, `test_proxy_router.py::test_recorder_failure_never_fails_the_request` |
 | 128 | Expired capture message | covered | `test_metrics_capture.py::test_v1_expired_message_is_exact`, `test_metrics_capture.py::test_get_capture_and_expiry`, `test_api_live.py::test_capture_detail_expired_and_not_captured` |
 | 129 | `POST /health` is 404 | covered | `test_pipeline_e2e.py::test_public_health_and_post_health` |
-| 130 | Overview visitor KPIs | partial: P11 | `test_metrics_queries.py::test_drops_since_refusal_reasons_retries_visitors`, `test_metrics_visitors_catalog.py::test_classify`, `test_metrics_recorder.py::test_visits_and_security_helpers`, `test_api_overview.py::test_visitors_card`, `test_api_security.py::test_probes_ring_summary_and_crawls`, `test_v1_visitors.py::test_v1_anonymous_admin_page_visits_are_counted_and_known_admins_are_not`, `test_v1_visitors.py::test_v1_the_owners_first_login_takes_back_its_own_admin_page_visit` |
-| 131 | Proxy timings split toggle | partial: P11 (Traffic page) | `test_metrics_recorder.py::test_dims_row_holds_every_dimension`, `test_api_traffic.py::test_latency_series_and_splits` |
-| 132 | Status codes source split | partial: P11 (Traffic page) | `test_metrics_recorder.py::test_cache_state_and_source_strings`, `test_api_traffic.py::test_status_sources_and_the_429_verdict`, `test_r3_parity_overview.py::test_parity_1_a_roblox_5xx_counts_as_5xx_from_roblox` |
-| 133 | "What's Being Stored" | partial: P11 (Data page) | `test_api_data.py::test_storage_has_every_database_and_table_with_a_projection` |
-| 134 | Blocked fingerprints | partial: P11 (Security page) | `test_metrics_recorder.py::test_fingerprints_flow_and_blocked_variant`, `test_api_security.py::test_fingerprints_values_user_agents_blocked_and_ignored_headers`, `test_api_w3b_wiring.py::test_passing_requests_are_fingerprinted_and_filtered_ones_count_as_blocked`, `test_r3_parity_security.py::test_parity_14_blocked_fingerprints_export_as_csv` |
-| 135 | Throttle-all watch | partial: P11 (Protection page) | `test_abuse_switches_rules.py::test_throttle_all_watch`, `test_api_protection.py::test_throttle_all_limit_since_marker_and_watch`, `test_r3_parity_protection.py::test_parity_4_throttle_all_watch_keeps_the_v1_columns` |
+| 130 | Overview visitor KPIs | covered (P11: the Overview's Visitors card) | `test_page_overview.py::test_tile_numbers_equal_the_api_for_the_same_range`, `test_v1_sections.py::test_overview_visitors`, `test_metrics_queries.py::test_drops_since_refusal_reasons_retries_visitors`, `test_metrics_visitors_catalog.py::test_classify`, `test_metrics_recorder.py::test_visits_and_security_helpers`, `test_api_overview.py::test_visitors_card`, `test_api_security.py::test_probes_ring_summary_and_crawls`, `test_v1_visitors.py::test_v1_anonymous_admin_page_visits_are_counted_and_known_admins_are_not`, `test_v1_visitors.py::test_v1_the_owners_first_login_takes_back_its_own_admin_page_visit` |
+| 131 | Proxy timings split toggle | covered (P11: Traffic > Latency, split by verb, egress or host) | `test_page_traffic.py::test_the_status_view_and_the_latency_split_swap_their_card_in_place`, `test_page_traffic.py::test_verbs_and_latency_tables_equal_the_api`, `test_v1_sections.py::test_traffic_latency`, `test_metrics_recorder.py::test_dims_row_holds_every_dimension`, `test_api_traffic.py::test_latency_series_and_splits` |
+| 132 | Status codes source split | covered (P11: Traffic > Status codes) | `test_page_traffic.py::test_status_tiles_verdict_and_table_equal_the_api`, `test_v1_sections.py::test_traffic_status`, `test_metrics_recorder.py::test_cache_state_and_source_strings`, `test_api_traffic.py::test_status_sources_and_the_429_verdict`, `test_r3_parity_overview.py::test_parity_1_a_roblox_5xx_counts_as_5xx_from_roblox` |
+| 133 | "What's Being Stored" | covered (P11: Data > Storage) | `test_page_data.py::test_the_storage_table_equals_the_api_and_answers_alone`, `test_page_data.py::test_a_table_opens_with_its_limits_and_links_to_their_settings`, `test_v1_sections.py::test_data_storage`, `test_api_data.py::test_storage_has_every_database_and_table_with_a_projection` |
+| 134 | Blocked fingerprints | covered (P11: Security > Fingerprints, Blocked tab) | `test_page_security.py::test_fingerprint_tabs_equal_the_api`, `test_page_security.py::test_fingerprint_tabs_work_with_the_mouse_and_the_keyboard`, `test_v1_sections.py::test_security_fingerprints_blocked`, `test_metrics_recorder.py::test_fingerprints_flow_and_blocked_variant`, `test_api_security.py::test_fingerprints_values_user_agents_blocked_and_ignored_headers`, `test_api_w3b_wiring.py::test_passing_requests_are_fingerprinted_and_filtered_ones_count_as_blocked`, `test_r3_parity_security.py::test_parity_14_blocked_fingerprints_export_as_csv` |
+| 135 | Throttle-all watch | covered (P11: Protection > Emergency limit) | `test_page_parity_rows.py::test_rows_114_and_135_the_emergency_limit_banner_and_watch_equal_the_api`, `test_page_protection.py::test_the_emergency_limit_card_opens_the_top_bar_dialog`, `test_v1_sections.py::test_topbar_controls`, `test_abuse_switches_rules.py::test_throttle_all_watch`, `test_api_protection.py::test_throttle_all_limit_since_marker_and_watch`, `test_r3_parity_protection.py::test_parity_4_throttle_all_watch_keeps_the_v1_columns` |
 
 Plan sections 7 and 10, which the rows above lean on: every 7.9 policy row
 (`test_upstream_status_policy.py::test_outcome_policy_row`) and every 7.13 row
@@ -2570,7 +2992,60 @@ queue horizon too (`test_upstream_buckets.py::test_priority_horizon_is_the_max_w
 the 10.7 bot weights match the plan (`test_abuse_tarpit.py::test_effective_cap_formula_defaults`,
 `test_abuse_bot_challenge.py::test_default_weights_match_the_plan`).
 
-Counts: 135 rows; 87 covered, 2 changed, 46 partial.
+Counts: 135 rows; 130 covered, 2 changed, 3 partial. (P11, 2026-10-10: every row whose v2 home is a dashboard page
+points to its page tests; the gaps lane made row 79 covered with the v1 User-Agent drill-down. The partial rows are
+102, the deploy workflow that stays disabled until the cutover, P14; 107, the deploy runbook, P12 part two; 108, the
+boot check, P14.)
+
+### v1 section map (plan 14.1)
+
+Plan 14.1 asks for every v1 dashboard section and KPI tile to be checked off with the browser test that finds it on
+its v2 page (plan 18.1 item 12). The map is `roxy.admin.pages.registry.V1_SECTIONS`, with the corrections of
+`.remake/v1notes/dashboard.md` section 2 (LEAD_NOTES decision 7: rows 1, 3, 4, 19, 26 and 34); each row has one test
+in `tests/e2e/test_v1_sections.py` that opens every page the row names and finds its key elements (the KPI tiles,
+tables, settings and actions that prove the section), and fails when a page it needs is not built. The map test
+`test_v1_sections.py::test_the_map_has_one_uniquely_named_test_per_row` keeps one test per row. All 37 rows pass
+(P11 integration, 2026-10-10: 37 of 37 plus the map test).
+
+| # | v1 section | v2 page > card | Test |
+|---|---|---|---|
+| 1 | Overview: Total Requests, 2xx Success, 4xx Client Errors, Served From Cache, Requests (Last Hour) and Failures (Last Hour) tiles | Overview > Key numbers | `test_v1_sections.py::test_overview_kpis` |
+| 2 | Overview: Human Visitors, Crawler Visitors, Home Page Visits, Admin Page Visits, robots.txt Crawls tiles | Overview > Visitors | `test_v1_sections.py::test_overview_visitors` |
+| 3 | 429s from Roblox, 429s from Roxy, 5xx from Roblox, 5xx from Roxy, Service Uptime | Overview > Key numbers; Traffic > Status codes; System > Workers | `test_v1_sections.py::test_overview_kpis_errors` |
+| 4 | Service Controls: pause and throttle-all with messages and banners, the throttle-all watch, bypass my IP, trusted devices, sessions | Top bar (Pause and Emergency limit with their dialogs and banners); Protection > Emergency limit, Bypass; Security > Trusted devices, Sessions | `test_v1_sections.py::test_topbar_controls` |
+| 5 | Response Cache: hit rate, stored responses, memory tier, requests Roblox never saw, settings, rules, browser, purge, key spread | Cache > Cache statistics, Cache settings, Cache rules, Cache browser, Purge, Key spread | `test_v1_sections.py::test_cache_stats` |
+| 6 | Throttle Rules: limits, ladder, strike board, reset to defaults, simulation | Protection > Throttle, Ladder, Strike board | `test_v1_sections.py::test_protection_throttle` |
+| 7 | Traffic (Last 60 Minutes) | Traffic > Requests over time | `test_v1_sections.py::test_traffic_requests` |
+| 8 | Live Requests | Live > Live requests | `test_v1_sections.py::test_live_tail` |
+| 9 | Callers and Top Talkers, with Identify an experience | Clients > Places, IP addresses, Identify an experience | `test_v1_sections.py::test_clients_places` |
+| 10 | Refusal Reasons (custom message or Roblox body) | Protection > Refusal reasons | `test_v1_sections.py::test_protection_refusals` |
+| 11 | Top Endpoints | Endpoints > Endpoints; Overview > Top endpoints | `test_v1_sections.py::test_endpoints_table` |
+| 12 | Endpoint Controls: blocks and endpoint rules | Protection > Endpoint blocks, Endpoint rules | `test_v1_sections.py::test_protection_endpoint_blocks` |
+| 13 | Throttle Bypass (testing) | Protection > Bypass | `test_v1_sections.py::test_protection_bypass` |
+| 14 | Tarpit: requests held, held in the last hour, average hold, time between requests, categories, state | Protection > Tarpit | `test_v1_sections.py::test_protection_tarpit` |
+| 15 | Request Filters (Header Blocking) with tester and presets | Protection > Request filters | `test_v1_sections.py::test_protection_request_filters` |
+| 16 | Blocked Endpoint Attempts | Protection > Endpoint blocks (Attempts tab) | `test_v1_sections.py::test_protection_endpoint_blocks_attempts` |
+| 17 | Rate-Limited Attempts | Protection > Endpoint rules (Attempts tab) | `test_v1_sections.py::test_protection_endpoint_rules_attempts` |
+| 18 | Header-Blocked Attempts | Protection > Request filters (Attempts tab) | `test_v1_sections.py::test_protection_request_filters_attempts` |
+| 19 | Auth Tokens: Token, Tokens Loaded and Token Safety Budget tiles; set, check, revalidate | Credential > Status, Budget, Allowlist | `test_v1_sections.py::test_credential_status` |
+| 20 | Requests (per verb) | Traffic > By verb | `test_v1_sections.py::test_traffic_verbs` |
+| 21 | Status Codes (Who returned it?) | Traffic > Status codes | `test_v1_sections.py::test_traffic_status` |
+| 22 | Retries (by status, by reason, returned reasons) | Upstream > Retries | `test_v1_sections.py::test_upstream_retries` |
+| 23 | Proxy Timings (split toggle) | Traffic > Latency | `test_v1_sections.py::test_traffic_latency` |
+| 24 | Request Failures | Upstream > Request failures | `test_v1_sections.py::test_upstream_failures` |
+| 25 | Crawler Activity | Security > Crawler activity | `test_v1_sections.py::test_security_crawls` |
+| 26 | Throttled IPs (the throttled IP records) | Protection > Throttle (Throttled now, Throttled in this range) | `test_v1_sections.py::test_protection_throttle_watch` |
+| 27 | Exploit / Probe Attempts | Security > Probes | `test_v1_sections.py::test_security_probes` |
+| 28 | Exploit / Probe Summary | Security > Probe summary | `test_v1_sections.py::test_security_probe_summary` |
+| 29 | Request Fingerprints: header names, values, User-Agents, ignored headers | Security > Fingerprints | `test_v1_sections.py::test_security_fingerprints` |
+| 30 | Blocked Request Fingerprints | Security > Fingerprints (Blocked tab) | `test_v1_sections.py::test_security_fingerprints_blocked` |
+| 31 | Error Log | System > Error log | `test_v1_sections.py::test_system_errors` |
+| 32 | Admin Logins | Security > Admin logins | `test_v1_sections.py::test_security_logins` |
+| 33 | Runtime Settings (also inline on each feature page) | Settings > All settings (and every feature page, `test_every_setting.py`) | `test_v1_sections.py::test_settings_editor` |
+| 34 | Service Health: rotator, persistence tiles, health check button, workers fleet, routing state | Health > Run a health check; Egress > Rotator; System > Workers, Persistence; Upstream > Cooldowns | `test_v1_sections.py::test_health_run` |
+| 35 | Internal Requests | Upstream > Internal calls | `test_v1_sections.py::test_upstream_internal_calls` |
+| 36 | Rotation Exit IPs | Egress > Exit IPs | `test_v1_sections.py::test_egress_exit_ips` |
+| 37 | Tools: what's being stored, clears, exports, diagnostics download, refresh with flush | Data > Storage, Resets, Exports; System > Forced flush | `test_v1_sections.py::test_data_storage` |
 
 ## Writing style (plan C5)
 

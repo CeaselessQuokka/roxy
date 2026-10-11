@@ -104,6 +104,7 @@ from roxy.admin.api.common import (
     TimeRangeDep,
     actor_for,
     add_caller_text,
+    annotation_entries,
     area_router,
     conflict,
     export_pages,
@@ -113,6 +114,7 @@ from roxy.admin.api.common import (
     parse_instant,
     request_id_of,
     require_reason,
+    reset_notices,
     run_mutation,
     series_answer,
     service_errors,
@@ -2862,6 +2864,73 @@ def _spam_events_fetch(ctx: Any, tr: TimeRange, kind: str, detector: str | None)
     return fetch
 
 
+SpamKind = Literal["all", "would_ban", "ban", "strike", "tarpit", "recommend"]
+SpamDetector = Annotated[str | None, Query(max_length=16, pattern=r"^SPAM-[A-Z]{1,8}$")]
+SPAM_SERIES_PARTIAL_NOTICE: Final = (
+    "Partial data: this range holds more detector decisions than one chart reads; narrow the range for every one."
+)
+
+
+@router.get("/spam/series")
+async def spam_series(
+    request: Request,
+    _admin: AdminSession,
+    tr: TimeRangeDep,
+    kind: Annotated[SpamKind, Query()] = "all",
+    detector: SpamDetector = None,
+) -> dict[str, Any]:
+    """The detector timelines (plan 10.9): spam detector decisions per detector over the range, one series per
+    detector (section 13 series answer); `kind` and `detector` filter like `GET /spam/events`."""
+    return await spam_series_answer(_ctx(request), tr, kind=kind, detector=detector)
+
+
+async def spam_series_answer(
+    ctx: Any, tr: TimeRange, *, kind: str = "all", detector: str | None = None
+) -> dict[str, Any]:
+    """The `GET /spam/series` answer (the Protection page's detector timeline chart reads the same route): the
+    decision events per detector per bucket (`read_protection.spam_points`), the comparison window's when asked,
+    the chart markers and the notices of data resets that deleted events in the range. Adds `totals` (per
+    detector), `total`, `kind` and `detector`."""
+    kinds = SPAM_EVENT_KINDS[kind]
+    window, other = tr.window, tr.compare_window
+
+    def read(conn: sqlite3.Connection) -> tuple[Any, Any, Any, Any]:
+        points = read_protection.spam_points(conn, window, kinds=kinds, detector=detector)
+        compared = read_protection.spam_points(conn, other, kinds=kinds, detector=detector) if other else None
+        marks = queries.chart_annotations(conn, window.start, window.end)
+        resets = queries.reset_annotations(conn, window.start, window.end)
+        return points, compared, marks, resets
+
+    with service_errors():
+        points, compared, marks, resets = await ctx.dbs.metrics.read(read)
+
+    def entries(found: Mapping[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {"key": label, "label": label, "unit": "count", "points": series}
+            for label, series in found["series"].items()
+        ]
+
+    notices = reset_notices([row for row in resets if queries.reset_touches(row, SPAM_SERIES_TABLES)], tz=window.tz)
+    if points["partial"] or (compared is not None and compared["partial"]):
+        notices.append(SPAM_SERIES_PARTIAL_NOTICE)
+    answer = series_answer(
+        tr,
+        entries(points),
+        compare_series=entries(compared) if compared is not None else None,
+        annotations=annotation_entries(marks),
+        notices=notices,
+    )
+    answer["totals"] = points["totals"]
+    answer["total"] = sum(points["totals"].values())
+    answer["kind"] = kind
+    answer["detector"] = detector
+    return answer
+
+
+SPAM_SERIES_TABLES: Final = ("metrics.events",)
+"""What the detector timeline reads (a data reset that deleted events in the range makes its chart partial)."""
+
+
 async def collateral_answer(ctx: Any) -> dict[str, Any]:
     """The FILTER-COLLATERAL preview (`GET /spam/collateral`); `POST /spam/arm` checks its token, and the Protection
     page's arm dialog shows it."""
@@ -3212,6 +3281,7 @@ __all__ = [
     "rule_table_rows",
     "spam_answer",
     "spam_events_answer",
+    "spam_series_answer",
     "strike_board_answer",
     "table_page",
     "tarpit_answer",

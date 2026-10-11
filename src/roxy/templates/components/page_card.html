@@ -7,7 +7,9 @@
     help from the page registry, optional actions and notices, the body from the caller, and the catalog settings
     the `pages` field places on this card (`settings_block`). `frame` comes from `roxy.admin.pages.kit.card_frame`:
     {id, title, help, page_id, anchor, fragment_url, settings, settings_open, refresh_on, refresh_min_s, lazy}.
-    `inline_setting(entry)` renders one inline setting control (API mode) from `roxy.admin.pages.inline`.
+    `inline_setting(entry)` renders one inline setting control (API mode) from `roxy.admin.pages.inline`;
+    `setting_reference(entry)` renders a setting whose one editor on this page is on another card (`read_only`,
+    `registry.editor_anchor`): its current value and a link to that card (`data-setting-ref`, never a second form).
   Why
     The first paint and every HTMX refresh of a card render this same frame from the same template, so they can
     never drift; `data-card-src` is the card's fragment URL (static/js/cards.js refreshes it after an action or
@@ -20,7 +22,7 @@
 -#}
 {% from "components/icon.html" import icon %}
 {% from "components/badges.html" import help_dot %}
-{% from "components/setting.html" import setting_control %}
+{% from "components/setting.html" import setting_control, display_value %}
 
 {% macro inline_setting(entry, saved=False) -%}
 {{ setting_control(entry.spec, entry.value, meta=entry.meta, history_url=entry.history_url, prefix=entry.prefix,
@@ -28,11 +30,21 @@
                    always_risky=entry.always_risky, saved=saved) }}
 {%- endmacro %}
 
+{% macro setting_reference(entry) -%}
+<div class="setting setting--reference" id="{{ entry.prefix }}-{{ entry.spec.key }}" data-setting-ref="{{ entry.spec.key }}">
+  <div class="setting__head">
+    <span class="setting__label">{{ entry.spec.label }}</span>
+    <code class="setting__key">{{ entry.spec.key }}</code>
+  </div>
+  <p class="setting__desc">Now {{ display_value(entry.spec, entry.value) }}. Edit it on this page's <a class="link" href="{{ entry.editor_href }}" data-setting-editor>{{ entry.editor_title }}</a> card.</p>
+</div>
+{%- endmacro %}
+
 {% macro settings_block(frame) -%}
 <details class="card-settings" id="{{ frame.id }}-settings"{% if frame.settings_open %} open{% endif %}>
   <summary class="card-settings__summary">{{ icon("sliders") }}<span>Settings for this card</span><span class="count-badge" aria-hidden="true">{{ frame.settings|length }}</span><span class="sr-only">({{ frame.settings|length }} settings)</span>{{ icon("chevron-down", cls="card-settings__chevron") }}</summary>
   <div class="card-settings__list">
-    {% for entry in frame.settings %}{{ inline_setting(entry) }}{% endfor %}
+    {% for entry in frame.settings %}{% if entry.read_only %}{{ setting_reference(entry) }}{% else %}{{ inline_setting(entry) }}{% endif %}{% endfor %}
   </div>
 </details>
 {%- endmacro %}

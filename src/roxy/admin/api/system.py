@@ -80,6 +80,7 @@ from roxy.config.constants import MAX_REASON_LENGTH
 from roxy.core.redact import masked_url
 from roxy.deps import get_ctx
 from roxy.metrics import queries, read_errors, read_producers
+from roxy.metrics.catalog import METRICS
 from roxy.metrics.templating import TEMPLATE_VERSION
 from roxy.scheduler import heartbeat, read_fleet
 from roxy.scheduler.jobs import Job, JobRegistry
@@ -130,6 +131,12 @@ a dashboard value present, a value in use)."""
 DEPLOYED_VERSION_FILES: Final = (Path("/var/lib/roxy-deploy/deployed_version"), Path("/var/lib/roxy/deployed_version"))
 """Where `deploy.sh` records the deployed commit; its mtime is the last color switch (plan 17.4 step 9)."""
 
+WORKER_CPU_HELP: Final = (
+    f"{METRICS['worker_cpu_pct'].description} The mean of its last complete minute (empty when it has none from the "
+    "last 5 minutes)."
+)
+"""The workers table's CPU column help: the metric catalog's description of `worker_cpu_pct` (plan 14.7)."""
+
 WORKERS_TABLE: Final = TableSpec(
     name="workers",
     columns=(
@@ -145,6 +152,7 @@ WORKERS_TABLE: Final = TableSpec(
         Column("max_requests", "Recycle after", "The request count at which gunicorn recycles the worker.", "count"),
         Column("counters_reset_at", "Counters reset", "When Reset counts last zeroed this worker.", "s"),
         Column("loop_lag_ms_p99", "Loop lag p99", "How late the event loop woke up (99th percentile, 1 min).", "ms"),
+        Column("cpu_pct", "CPU", WORKER_CPU_HELP, "percent"),
         Column("open_connections", "Connections", "Open connections.", "count"),
         Column("inflight_upstream", "In flight", "Upstream calls in progress.", "count"),
         Column("last_seen", "Last heartbeat", "When this worker last reported (Unix seconds).", "s"),
@@ -335,7 +343,9 @@ def _host_facts(pids: list[int]) -> dict[str, Any]:
 async def fleet(ctx: Any) -> dict[str, Any]:
     """The fleet header and workers (parity row 84) from shared heartbeats plus `/proc` facts."""
     now = ctx.clock.now()
-    rows = await ctx.dbs.metrics.read(lambda conn: heartbeat.fleet_view(conn, now, this_pid=os.getpid()))
+    rows, cpu = await ctx.dbs.metrics.read(
+        lambda conn: (heartbeat.fleet_view(conn, now, this_pid=os.getpid()), read_fleet.worker_cpu(conn, now))
+    )
     masters = sorted({int(r["master_pid"]) for r in rows if r.get("fresh") and r.get("master_pid")})
     host = await asyncio.to_thread(_host_facts, masters)
     summary = read_fleet.fleet_summary(
@@ -344,6 +354,7 @@ async def fleet(ctx: Any) -> dict[str, Any]:
         expected_per_color=int(ctx.env.workers),
         this_color=str(ctx.color),
         master_started=host["masters"],
+        cpu=cpu,
     )
     switched = host["deploy_switched_at"]
     tarpit: dict[str, Any] | None = None
@@ -544,6 +555,8 @@ def _db_stats(db: Any) -> dict[str, Any]:
         "writes": stats.writes,
         "reads": stats.reads,
         "write_errors": stats.write_errors,
+        # Writes a function refused on purpose (a leader job whose lease moved): expected, never a write error.
+        "refused_writes": stats.refused,
         "unavailable": stats.unavailable,
         "busy_fast_failures": stats.fast_failures,
         "deadline_failures": stats.deadline_failures,

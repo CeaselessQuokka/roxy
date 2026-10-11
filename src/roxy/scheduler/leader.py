@@ -51,7 +51,7 @@ from typing import TypeVar
 
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.storage import leases
-from roxy.storage.db import Database, SharedStateUnavailable
+from roxy.storage.db import Database, SharedStateUnavailable, WriteRefused
 
 log = logging.getLogger(__name__)
 
@@ -73,8 +73,11 @@ A healthy leader always has 10 to 15 s left; less means two renewals in a row fa
 at that point anyway (`_on_unavailable`)."""
 
 
-class LostLeadership(Exception):
-    """This worker is not (or no longer) the leader under the epoch the job started with. Nothing was written."""
+class LostLeadership(WriteRefused):
+    """This worker is not (or no longer) the leader under the epoch the job started with. Nothing was written.
+
+    A `storage.db.WriteRefused`: raised inside a fenced write, it rolls the transaction back and counts as a refused
+    write, not a database write error (a lease that moved is expected, gap G10)."""
 
 
 @dataclass(frozen=True, slots=True)

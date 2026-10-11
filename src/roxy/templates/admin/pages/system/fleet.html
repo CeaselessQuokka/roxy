@@ -8,7 +8,9 @@
   memory and tarpit connection use. The table is the API's `workers` table (id `workers`: health checks link to
   /admin/system#workers); its own requests get only the table back (`table_only`). The confirm dialog sits inside
   the card so a refresh of the card replaces it instead of adding a second one.
-  Context: `frame`, `table`, `table_only`, `fleet`, `facts`, `max_requests`, `reset_url`.
+  A row opens `?worker=<pid>-<color>` in the drawer: every column of that worker (a phone shows the key ones only).
+  Context: `frame`, `table`, `table_only`, `fleet`, `facts`, `max_requests`, `reset_url`, or the drawer's `worker`
+  and `worker_rows`.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/table.html" import data_table %}
@@ -19,7 +21,27 @@
 {% from "components/badges.html" import badge %}
 {% from "components/glossary.html" import term with context %}
 {% from "components/icon.html" import icon %}
-{% if table_only %}{{ data_table(**table) }}{% else %}
+{% from "components/badges.html" import help_dot %}
+{% if worker is defined and worker %}
+{#- The drawer of one worker (`?worker=<pid>-<color>`): every column of the workers table, the phone's card rows show
+    only the key ones. Values are numbers, times and Roxy's own words; nothing here is caller text. #}
+<div class="system-worker stack" data-worker-detail>
+  <dl class="kv system-kv">
+    {% for row in worker_rows %}
+    <dt>{{ row.label }} {{ help_dot(row.label, row.help) }}</dt>
+    <dd>
+      {%- if row.text is none %}<span class="muted">n/a</span>
+      {%- elif row.datetime %}<time datetime="{{ row.datetime }}">{{ row.text }}</time>
+      {%- elif row.tone %}<span class="tone tone--{{ row.tone }}">{{ row.text }}</span>
+      {%- elif row.mono %}<span class="mono system-id">{{ row.text }}</span>
+      {%- else %}{{ row.text }}{% endif %}
+      {%- if row.sub %} <span class="muted">({{ row.sub }})</span>{% endif -%}
+    </dd>
+    {% endfor %}
+  </dl>
+  <p class="muted">All requests counts everything this worker served, the dashboard included; Proxy requests only the traffic aimed at the proxy. Reset request counts zeroes both on every worker.</p>
+</div>
+{% elif table_only %}{{ data_table(**table) }}{% else %}
 {% set mine = facts.mine %}
 {% set totals = fleet.totals or {} %}
 {% set tarpit = fleet.tarpit_connections %}
@@ -55,9 +77,10 @@
     {% for color in facts.colors %}
     <li class="system-color">
       <p class="system-color__name"><strong>{{ color.color|capitalize }}</strong>{% if color.is_this_color %} {{ badge("serving you", "info") }}{% endif %}{% if not color.active %} {{ badge("not running", "neutral") }}{% endif %}</p>
+      {#- trim_blocks eats the line break after a block tag, so the spaces between the sentences are explicit. #}
       <p class="system-color__facts">{{ num(color.count) }} of {{ num(color.expected) }} workers fresh{% if color.stale %}, {{ num(color.stale) }} stale{% endif %}.
-        {% if color.master_pids %}Master pid {{ color.master_pids|join(", ") }}.{% endif %}
-        {% if color.service_uptime_s is not none %}Service up {{ duration(color.service_uptime_s) }}.{% endif %}</p>
+        {%- if color.master_pids %} Master pid {{ color.master_pids|join(", ") }}.{% endif %}
+        {%- if color.service_uptime_s is not none %} Service up {{ duration(color.service_uptime_s) }}.{% endif %}</p>
     </li>
     {% endfor %}
   </ul>

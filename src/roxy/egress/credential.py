@@ -111,7 +111,7 @@ from roxy.egress.events import EventSink
 from roxy.egress.guard import Verdict, inspect_request
 from roxy.egress.models import PURPOSE_CREDENTIAL_PROBE, EgressResponse, OutboundRequest
 from roxy.egress.targets import check_roblox_target, endpoint_label, is_loopback_host
-from roxy.storage import leases
+from roxy.storage import leases, read_sizes
 from roxy.storage.db import Databases, SharedStateUnavailable
 
 log = logging.getLogger("roxy.egress.credential")
@@ -120,6 +120,16 @@ BOOTSTRAP_FILE_NAME = "roblox_credential"
 """The systemd credential with the bootstrap value (plan 9.8). Read here and nowhere else (test 19.5 item 7)."""
 
 STORE_AAD = b"roxy:credential_store:v1"
+# The Data page label of the dashboard value's table, registered here because no other module may name the table
+# (plan C1, test 19.5 item 7; `storage/read_sizes.py register_table`).
+read_sizes.register_table(
+    "control",
+    read_sizes.TableMeta(
+        "credential_store",
+        "Roblox credential set on the dashboard (encrypted)",
+        rule="At most one row (plan C1: exactly one credential, never a list).",
+    ),
+)
 FINGERPRINT_LABEL = b"roxy credential fingerprint v1"
 VERSION_KEY = "credential_version"
 COOLDOWN_KEY = "credential"

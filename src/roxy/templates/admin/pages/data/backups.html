@@ -59,5 +59,10 @@
   <p class="muted">No snapshot is kept on this server right now.</p>
   {% endif %}
 </section>
-<p class="muted data-note">{{ note }}</p>
+{% if note %}
+<details class="details-plain data-backups__how">
+  <summary>How Back up now works</summary>
+  <p>{{ note }}</p>
+</details>
+{% endif %}
 {% endcall %}

@@ -11,5 +11,10 @@
 {% set subtitle = (rows|length) ~ " tables with a limit" ~ (", " ~ due ~ " waiting for the next prune" if due else ", every one within its limits") %}
 {% call page_card(frame, flush=True, subtitle=subtitle) %}
 <p class="data-intro">Every table has an age limit, a row cap, or both. The leader's retention job deletes what is past its limit every 10 minutes (oldest first) and gives the space back. The audit log is kept at least {{ audit_min_days }} days, whatever its setting says.</p>
-{{ limit_table(rows, "Tables and their retention limits", human_bytes) }}
+{#- The table of every table is long (about 80 rows): it opens by itself only when a table waits for a prune, so
+    the settings below stay one scroll away. -#}
+<details class="details-plain data-limits-box"{% if due %} open{% endif %}>
+  <summary>Every table and its limits ({{ rows|length }})</summary>
+  {{ limit_table(rows, "Tables and their retention limits", human_bytes) }}
+</details>
 {% endcall %}

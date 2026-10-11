@@ -2,7 +2,7 @@
 
 What this is
     Integration tests against the real app (`pages_app`, a signed-in `page`): the registry of the 18 pages and the
-    v1 section map, the pages router (every page answers, guarded like the API, unbuilt pages say "coming soon",
+    v1 section map, the pages router (every page answers, guarded like the API, every page is built,
     `/admin/dashboard` is the Overview), the shell (navigation from the registry, theme and density from the
     admin's preferences, the time range from the URL, banners with the live caller texts, the bell, the palette's
     LLM export actions and server search), the inline setting fragment, the kit's conventions (a failing card
@@ -20,6 +20,7 @@ What to read next
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from pathlib import Path
 from typing import Any
@@ -27,10 +28,10 @@ from typing import Any
 import pytest
 from fastapi.routing import iter_route_contexts
 
+from pages_harness import HOSTILE, assert_inert, parse_html, seed_recommendation
 from roxy.admin.api.recommendations import _counts
 from roxy.admin.pages import kit, registry, shell
 from roxy.admin.pages.registry import PAGES, SHELL_PAGE, V1_SECTIONS
-from roxy.admin.pages.testing import HOSTILE, assert_inert, parse_html, seed_recommendation
 from roxy.config.catalog import CATALOG, NON_PAGE_HOMES
 from roxy.config.catalog import PAGES as CATALOG_PAGES
 from roxy.core.style_guard import find_style_issues
@@ -85,6 +86,12 @@ def test_the_v1_section_map_has_37_rows_with_unique_tests_and_known_cards() -> N
                 key = re.search(r'data-setting-key="([a-z0-9_]+)"', selector)
                 if key:
                     assert key.group(1) in CATALOG, selector
+
+
+def test_every_registered_page_is_built() -> None:
+    """P11 acceptance: all 18 pages have their module (the pages router imports each one; nothing is a placeholder)."""
+    assert registry.built_pages() == tuple(p.id for p in PAGES)
+    assert len(PAGES) == 18
 
 
 def test_navigation_model_lists_every_page_once_with_help_last() -> None:
@@ -164,8 +171,9 @@ async def test_every_page_renders_the_shell_with_its_purpose_and_how_to_read(pag
         assert "nonce=" in tag, tag
     assert find_style_issues(html, page_id) == []
     assert_inert(html, page_id)
-    if not registry.is_built(page_id):
-        assert doc.select_one("[data-coming-soon]") is not None
+    assert registry.is_built(page_id)
+    assert doc.select_one("[data-coming-soon]") is None
+    assert doc.select("section[data-card]"), page_id  # the page's own cards, never a placeholder body
 
 
 # ============================================================================================ the shell
@@ -375,20 +383,24 @@ async def test_palette_search_answers_settings_recommendations_and_endpoints_as_
 # ============================================================================================ kit conventions
 
 
-async def test_a_failing_card_renders_in_place_and_the_page_keeps_working(page: Any, pages_app: Any) -> None:
-    probe = kit.Page("help")
+async def test_a_failing_card_renders_in_place_and_the_page_keeps_working(
+    page: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kit contract, on a built page whose renderers are swapped for failing ones (every page is built now, so
+    a second `kit.Page` of the same id would never be reached: the real router is included first)."""
+    from roxy.admin.pages import help as help_page
 
-    @probe.card("guide")
     async def broken(view: kit.PageView) -> dict[str, Any]:
         raise RuntimeError("boom")
 
-    @probe.card("glossary")
     async def refused(view: kit.PageView) -> dict[str, Any]:
         from roxy.admin.api.common import unavailable
 
         raise unavailable("The metrics database is busy right now; try again shortly.")
 
-    pages_app.app.include_router(probe.router)
+    probe = help_page.page
+    for card_id, render in (("guide", broken), ("glossary", refused)):
+        monkeypatch.setitem(probe._cards, card_id, dataclasses.replace(probe._cards[card_id], render=render))
     failed = await page.fragment("help", "guide")
     assert failed.status_code == 200
     assert "data-card-error" in failed.text

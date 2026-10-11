@@ -336,7 +336,7 @@ DATASETS: Final[dict[str, Dataset]] = {
                 Column("unattributed", "Unattributed", "Refusals recorded without a client.", "count"),
                 Column("first_ms", "First seen", "When the oldest was recorded.", "timestamp_ms"),
                 Column("last_ms", "Last seen", "When the newest was recorded.", "timestamp_ms"),
-                Column("message_source", "Message", "Custom versus default message counts (row 116).", sortable=False),
+                Column("message_source", "Message", "Custom versus default message counts.", sortable=False),
             ),
             "requests",
         ),
@@ -414,7 +414,13 @@ DATASETS: Final[dict[str, Dataset]] = {
     "audit": Dataset(AUDIT_TABLE, "Audit log", "Every admin and automatic action in the range.", True, _audit),
     "settings": Dataset(SETTINGS_TABLE, "Settings", "Every setting with its current value.", False, _whole(_settings)),
     "settings_history": Dataset(HISTORY_TABLE, "Settings history", "Every settings change.", True, _history),
-    "workers": Dataset(WORKERS_TABLE, "Workers", "The worker fleet (parity row 84).", False, _whole(_workers)),
+    "workers": Dataset(
+        WORKERS_TABLE,
+        "Workers",
+        "The worker fleet: every worker of both colors with its counters.",
+        False,
+        _whole(_workers),
+    ),
 }
 """Every exportable dataset, by name."""
 

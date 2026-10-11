@@ -20,10 +20,19 @@
   margin: 0 0 var(--sp-3);
 }
 
+/* A chip that wraps on a phone keeps its text inside the pill (a badge is one line by default). */
 .cache-chips .badge {
   max-width: 100%;
   height: auto;
+  padding-block: 3px;
+  line-height: var(--lh-tight);
   white-space: normal;
+}
+
+.cache-states {
+  margin: 0 0 var(--sp-3);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
 }
 
 /* Definition lists and form fields inside grids keep their natural height (a taller neighbor never stretches
@@ -87,18 +96,21 @@
   font-size: var(--fs-3);
 }
 
+/* The steps share one time column (a subgrid), so every step's text starts at the same edge however long its
+   time label is. */
 .req-timeline {
   display: grid;
+  grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr);
   gap: var(--sp-3);
-  margin: 0;
+  margin: var(--sp-3) 0 0;
   padding: 0;
   list-style: none;
 }
 
 .req-timeline__step {
   display: grid;
-  grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr);
-  gap: var(--sp-3);
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
   padding-left: var(--sp-3);
   border-left: 3px solid var(--border-strong);
 }
@@ -286,9 +298,12 @@
 }
 
 @media (max-width: 640px) {
-  .req-timeline__step {
+  .req-timeline {
     grid-template-columns: minmax(0, 1fr);
-    gap: var(--sp-1);
+  }
+
+  .req-timeline__step {
+    row-gap: var(--sp-1);
   }
 
   .cache-list thead {

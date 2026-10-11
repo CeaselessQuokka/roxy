@@ -69,9 +69,12 @@ async function reveal(button) {
       const body = card.querySelector("[data-exit-ips] tbody");
       if (body) {
         body.replaceChildren(...items.map((item) => el("tr", {}, [
-          el("td", { class: "mono", "data-exit-ip": "", text: String(item.ip || "") }),
-          el("td", { text: String(item.source || "") }),
-          el("td", { text: Number.isFinite(item.at) ? new Date(item.at * 1000).toLocaleString("en-US") : "n/a" }),
+          el("td", { class: "mono", "data-exit-ip": "", "data-label": "Exit address", text: String(item.ip || "") }),
+          el("td", { "data-label": "From", text: String(item.source || "") }),
+          el("td", {
+            "data-label": "When",
+            text: Number.isFinite(item.at) ? new Date(item.at * 1000).toLocaleString("en-US") : "n/a",
+          }),
         ])));
       }
     }

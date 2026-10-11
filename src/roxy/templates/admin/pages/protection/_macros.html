@@ -11,6 +11,9 @@
     `delete_dialog(...)`: a confirm dialog that sends DELETE to the admin API with that reason.
     `rule_chart(id, title, src)`: one rule row's hits over the range (`GET /protection/rule-hits`).
     `count_list(rows)`: "<label>: <n> in this range" lines for refusal counts.
+    `clear_button(c)` with `clear_dialog(c, refresh)`: v1's per-section clear buttons as plan 6.8 data resets
+    (`POST /admin/api/v1/data/resets` with the family, the preview digest, the typed phrase and a required reason;
+    `c` is `protection.py clear_action`).
   Why
     The cards repeat these shapes many times; one macro keeps their markup, their accessibility and their API
     wiring identical (plan 14.9: labels tied to inputs, errors by aria-describedby).
@@ -74,4 +77,19 @@
 
 {% macro field_error(name, id) -%}
 <p class="field__error" id="{{ id }}" data-field-error="{{ name }}" hidden></p>
+{%- endmacro %}
+
+{% macro clear_button(c, cls="btn btn--sm btn--ghost") -%}
+<button type="button" class="{{ cls }}" data-dialog-open="{{ c.id }}" aria-haspopup="dialog" data-action="clear-{{ c.family|replace('_', '-') }}">{{ icon("reset") }}<span>{{ c.button }}</span></button>
+{%- endmacro %}
+
+{% macro clear_dialog(c, refresh) -%}
+{% call confirm_dialog(c.id, c.title, "/admin/api/v1/data/resets", confirm_label=c.button, danger=True, api=True,
+                       type_to_confirm=c.phrase, confirm_field="confirm",
+                       hidden={"scope": "family", "families": c.family, "preview": c.digest or ""},
+                       hidden_types={"families": "list"}, success=c.success, on_success="refresh", refresh=refresh,
+                       consequences=c.consequences + ([c.note] if c.note else []) + ["The reset is written to the audit log and marked on the charts."]) %}
+  {% if not c.digest %}<p class="field__error">This reset could not be prepared right now; close the dialog and try again in a moment.</p>{% endif %}
+  {{ reason_field(c.id ~ "-reason", required=True) }}
+{% endcall %}
 {%- endmacro %}

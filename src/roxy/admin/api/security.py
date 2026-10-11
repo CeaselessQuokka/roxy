@@ -6,9 +6,12 @@ What this is
       * Event logs, paged on the server and exportable (parity rows 80, 97): admin logins and failed logins
         (`result` filter), probes and exploit attempts, the probe summary by signature, crawls by client.
       * Request fingerprints (rows 79, 134): header names with their value statistics, one header's values,
-        User-Agents, the blocked variants (headers and User-Agents of requests a request filter refused, one
-        exportable table), the ignored headers (values not recorded) with add and remove, and v1's per-header
-        "Clear values" and "Remove" (and "Remove" on the Blocked tab), each audited before it deletes.
+        User-Agents and one User-Agent's newest request (v1's drill-down: path, client address, header names), the
+        blocked variants (headers and User-Agents of requests a request filter refused, one exportable table), the
+        ignored headers (values not recorded) with add and remove, and v1's per-header "Clear values" and "Remove"
+        (and "Remove" on the Blocked tab), each audited before it deletes. Headers that carry client addresses
+        (`fingerprints.ADDRESS_HEADERS`) are shipped ignored and can never be recorded again: removing one from
+        the ignored list is refused (422), because their values are never kept whatever the list says.
       * CSP violation reports (plan 9.2), grouped by what was blocked.
       * The admin's own sessions (list, revoke one, revoke the others, sign out everywhere), trusted devices (list,
         revoke one or all), passkeys (list; rename and delete with a fresh second factor) and recovery codes
@@ -89,9 +92,10 @@ from roxy.admin.auth.flow import AuthError
 from roxy.admin.auth.responses import clear_session_cookie
 from roxy.config import audit
 from roxy.config.constants import MAX_REASON_LENGTH
+from roxy.config.defaults import IGNORED_ADDRESS_HEADER_NOTE
 from roxy.deps import get_ctx
 from roxy.metrics import read_security, security_events
-from roxy.metrics.fingerprints import clear_values
+from roxy.metrics.fingerprints import ADDRESS_HEADERS, clear_values, keeps_no_values
 from roxy.rules.service import RuleChange, RulesService
 
 router = area_router("security")
@@ -393,9 +397,21 @@ UA_SPEC: Final = TableSpec(
         Column("count", "Count", "Requests that sent it.", "count"),
         Column("first_seen", "First seen", "First request.", "timestamp"),
         Column("last_seen", "Last seen", "Latest request.", "timestamp"),
+        # v1's User-Agent drill-down (`GET /admin/fingerprints/user_agent`, metrics.db schema 8): the newest request.
+        Column("last_path", "Last path", "Where the newest recorded request of this User-Agent went (host and path, "
+               "no query, scrubbed).", sortable=False, caller_text=True),
+        Column("last_caller", "Last caller", "Client address of that request (hashed in exports unless "
+               "export_include_ips is on).", ip=True, sortable=False),
+        Column("last_header_names", "Last header names", "The header names that request carried, in the order "
+               "sent (names only, never values; a secret-shaped name as fp:<hash>).", sortable=False,
+               caller_text=True),
+        Column("last_detail_at", "Last detail at", "When that request arrived (empty: no request detail was "
+               "recorded for this User-Agent, for example before the upgrade).", "timestamp", sortable=False),
     ),
     default_sort="count",
-)
+)  # fmt: skip
+UA_DETAIL_CALLER_TEXT: Final = ("user_agent", "last_path", "last_header_names")
+"""Fields of the User-Agent detail answer holding text a caller chose: shown as plain text, never as markup."""
 BLOCKED_SPEC: Final = TableSpec(
     name="blocked_fingerprints",
     columns=(
@@ -434,8 +450,9 @@ IGNORED_SPEC: Final = TableSpec(
 
 
 def _ignored(ctx: Any) -> frozenset[str]:
+    """Header names whose values are not recorded: the ignore list plus the address headers (never recorded)."""
     names: frozenset[str] = ctx.rules.snapshot.ignored_value_headers
-    return names
+    return names | ADDRESS_HEADERS
 
 
 @router.get("/fingerprints/headers")
@@ -522,6 +539,28 @@ def user_agent_fetch(ctx: Any, tq: TableQuery) -> Fetch:
     return fetch
 
 
+UaHash = Annotated[str, Path(min_length=32, max_length=32, pattern=read_security.UA_HASH_PATTERN)]
+
+
+@router.get("/fingerprints/user-agents/{ua_hash}")
+async def fingerprint_user_agent(request: Request, _admin: AdminSession, ua_hash: UaHash) -> dict[str, Any]:
+    """One User-Agent with its newest recorded request: the path, the client address and the header names it sent
+    (v1 `GET /admin/fingerprints/user_agent`, `.remake/v1notes/dashboard.md` 4.21); 404 for an unknown key."""
+    return await user_agent_detail_answer(get_ctx(request), ua_hash)
+
+
+async def user_agent_detail_answer(ctx: Any, ua_hash: str) -> dict[str, Any]:
+    """The `GET /fingerprints/user-agents/{ua_hash}` answer (the Security page's User-Agent drawer reads the same):
+    `read_security.user_agent_detail` plus `caller_text`. `last_caller` is shown as the Endpoints page's last caller
+    is; the table export (`UA_SPEC`, `ip=True`) hashes it."""
+    with service_errors():
+        found = await ctx.dbs.metrics.read(lambda conn: read_security.user_agent_detail(conn, ua_hash))
+    if found is None:
+        raise not_found("No User-Agent with that key is recorded.")
+    answer: dict[str, Any] = dict(found)
+    return add_caller_text(answer, UA_DETAIL_CALLER_TEXT)
+
+
 @router.get("/fingerprints/blocked")
 async def fingerprint_blocked(
     request: Request,
@@ -564,13 +603,34 @@ async def fingerprint_ignored(
 
 
 async def ignored_rows(ctx: Any) -> list[dict[str, Any]]:
-    """The ignored headers (rule table `ignored_value_headers`) with why each is there."""
+    """The ignored headers (rule table `ignored_value_headers`) with why each is there.
+
+    A shipped default's note starts with `default` (v1's note, and seed version 2's address headers). The headers
+    that carry client addresses are listed even when their row is missing (a database not seeded again yet): their
+    values are never recorded whatever the list says, so `never_recorded` is True and they cannot be recorded again.
+    """
     stored = await _rules(ctx).list_rows("ignored_value_headers")
     rows = []
+    seen: set[str] = set()
     for row in stored:
         note = str(row.get("note") or "")
-        why = "Detected automatically" if row.get("auto") else ("Default" if note == "default" else "Added by an admin")
-        rows.append({"name": row["name"], "why": why, "note": note, "auto": bool(row.get("auto"))})
+        name = str(row["name"])
+        seen.add(name.lower())
+        default = note == "default" or note.startswith("default:")
+        why = "Detected automatically" if row.get("auto") else ("Default" if default else "Added by an admin")
+        rows.append(
+            {
+                "name": name,
+                "why": why,
+                "note": note,
+                "auto": bool(row.get("auto")),
+                "never_recorded": keeps_no_values(name.lower()),
+            }
+        )
+    for name in sorted(ADDRESS_HEADERS - seen):
+        rows.append(
+            {"name": name, "why": "Default", "note": IGNORED_ADDRESS_HEADER_NOTE, "auto": False, "never_recorded": True}
+        )
     return rows
 
 
@@ -625,8 +685,12 @@ async def fingerprint_unignore(
     name: Annotated[str, Path(min_length=1, max_length=120)],
     reason: Annotated[str | None, Query(max_length=MAX_REASON_LENGTH)] = None,
 ) -> dict[str, Any]:
-    """Record a header's values again."""
+    """Record a header's values again. Refused (422) for a header that carries client addresses: its values are never
+    kept (`fingerprints.ADDRESS_HEADERS`, a privacy rule), so removing it from the list would only mislead."""
     ctx = get_ctx(request)
+    if keeps_no_values(name.lower()):
+        text = "This header carries client addresses, so its values are never recorded (privacy)."
+        raise validation_error({"name": text}, text)
     change = await run_mutation(
         _rules(ctx).delete(
             "ignored_value_headers", name.lower(), actor_for(admin), audit_reason(reason),
@@ -1064,6 +1128,7 @@ __all__ = [
     "LOGIN_SPEC",
     "PROBE_SPEC",
     "SUMMARY_SPEC",
+    "UA_DETAIL_CALLER_TEXT",
     "UA_SPEC",
     "VALUE_SPEC",
     "auth_error",
@@ -1081,6 +1146,7 @@ __all__ = [
     "sessions_answer",
     "table_page",
     "trusted_answer",
+    "user_agent_detail_answer",
     "user_agent_fetch",
     "values_fetch",
 ]

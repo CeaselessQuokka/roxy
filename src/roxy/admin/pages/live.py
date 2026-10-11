@@ -50,9 +50,9 @@ from roxy.admin.api import common
 from roxy.admin.api import live as live_api
 from roxy.admin.api import upstream as upstream_api
 from roxy.admin.pages import fmt
-from roxy.admin.pages._traffic_reset import add_reset_route, family_reset, reset_href
 from roxy.admin.pages.kit import CardDef, Page, PageAdmin, PageView, render_card
 from roxy.admin.pages.registry import CardSpec
+from roxy.admin.pages.resets import add_reset_route, family_reset, reset_href
 from roxy.admin.pages.shell import DEFAULT_STREAM_EVENTS
 from roxy.admin.sse import LIVE_RATE
 from roxy.core.reasons import ReasonCode

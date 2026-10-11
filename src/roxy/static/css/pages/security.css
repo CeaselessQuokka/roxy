@@ -18,12 +18,12 @@
 .security-intro,
 .security-filter-note {
   margin: 0;
-  padding: var(--sp-3) var(--sp-4) 0;
+  padding: var(--sp-3) var(--sp-4) var(--sp-2);
   color: var(--text-muted);
   max-width: 90ch;
 }
 
-.card__body:not(.card__body--flush) > .security-intro {
+.card__body:not(.card__body--flush) .security-intro {
   padding: 0;
 }
 
@@ -78,7 +78,7 @@
 
 .fp-tabs__intro {
   margin: 0;
-  padding: var(--sp-3) var(--sp-4) 0;
+  padding: var(--sp-3) var(--sp-4) var(--sp-2);
   color: var(--text-muted);
   max-width: 90ch;
 }
@@ -97,6 +97,21 @@
 
 .fp-drawer__heading {
   font-size: var(--fs-3);
+}
+
+/* The User-Agent drawer: the header names of its newest request, in the order sent, wrapping on a phone. */
+.fp-header-names {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.fp-header-names code,
+.fp-drawer__facts code {
+  overflow-wrap: anywhere;
 }
 
 .fp-values {
@@ -156,6 +171,7 @@
 .admin-access__facts {
   grid-template-columns: max-content minmax(0, 1fr);
   align-items: baseline;
+  margin-bottom: var(--sp-3);
 }
 
 .admin-access__facts dd {
@@ -219,6 +235,7 @@
 
 .passkey-add {
   max-width: 28rem;
+  margin-top: var(--sp-3);
 }
 
 .passkey-add__status:empty {
@@ -257,6 +274,31 @@
   font-size: var(--fs-3);
 }
 
+/* ---------------------------------------------------------------------------------- tables, wider screens */
+/* The account tables read like the shared data tables: a header band, roomier cells, and in a flush card the
+   first and last columns line up with the card's text (16 px in) instead of touching its edge. */
+@media (min-width: 641px) {
+  .security-table th,
+  .security-table td {
+    padding: 6px var(--sp-3);
+  }
+
+  .security-table thead th {
+    height: 36px;
+    background: var(--surface-2);
+  }
+
+  .card__body--flush > .table-scroll .security-table th:first-child,
+  .card__body--flush > .table-scroll .security-table td:first-child {
+    padding-left: var(--sp-4);
+  }
+
+  .card__body--flush > .table-scroll .security-table th:last-child,
+  .card__body--flush > .table-scroll .security-table td:last-child {
+    padding-right: var(--sp-4);
+  }
+}
+
 /* ---------------------------------------------------------------------------------- phones (plan 14.8) */
 @media (max-width: 640px) {
   .security-table,
@@ -266,12 +308,16 @@
     display: block;
   }
 
+  /* The header row stays for screen readers but takes no room. A table-header-group ignores `overflow`, so its
+     cells would still widen the page by their full width: it becomes a block first, then clips them. */
   .security-table thead {
+    display: block;
     position: absolute;
     width: 1px;
     height: 1px;
     overflow: hidden;
     clip-path: inset(50%);
+    white-space: nowrap;
   }
 
   .security-table tr {
@@ -296,7 +342,14 @@
   .security-table td::before {
     content: attr(data-label);
     color: var(--text-muted);
+    font-family: var(--font-sans);
     font-weight: var(--fw-semibold);
+  }
+
+  /* "2 minutes ago" goes under its time, not into the middle of the line. */
+  .security-table td .dt__sub {
+    flex-basis: 100%;
+    text-align: right;
   }
 
   .security-table td.security-table__actions {

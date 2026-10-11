@@ -69,8 +69,14 @@
   letter-spacing: 0.04em;
 }
 
+/* A long state ("Not checked yet", "Worker 4052821") wraps inside its item on a phone instead of running into the
+   item's edge. */
 .ov-status__state .badge {
   max-width: 100%;
+  padding-block: 3px;
+  line-height: 1.25;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .ov-status__detail {
@@ -154,6 +160,16 @@
   min-height: var(--target-min);
 }
 
+/* On a touch screen the title is the item's only link: a full-width 44 px target (plan 14.8), so the owner can open
+   a recommendation from a phone with a thumb (tests/e2e/test_phone_flows.py). */
+@media (pointer: coarse) {
+  .ov-rec__title a {
+    display: flex;
+    align-items: center;
+    min-height: var(--target-touch);
+  }
+}
+
 .ov-rec__impact,
 .ov-rec__meta {
   margin: 0;
@@ -165,6 +181,13 @@
 .ov-visitors .kpi__baseline {
   flex-basis: 100%;
   overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------------------------------------- top-ten pair */
+/* The two top-ten tables sit side by side only when each gets about 46 rem (their six and five columns fit
+   without a sideways scroll); on a laptop they stack, each with the card's full width. */
+.ov-pair {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 46rem), 1fr));
 }
 
 /* ---------------------------------------------------------------------------------------------- outcomes */
@@ -188,12 +211,15 @@
   font-weight: var(--fw-semibold);
 }
 
+
 .ov-outcomes .num {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-.ov-outcomes__share {
+/* The bar and its percent sit in a flex box inside the cell, so the cell stays a table cell and lines up with a
+   label that wraps on a narrow screen. */
+.ov-outcomes__bar {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
@@ -268,12 +294,25 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* A negative avoided share says why under its number (`fmt.avoided_cell`, plan P6): the note wraps. */
+.ov-top .num .dt__sub {
+  max-width: 26ch;
+  margin-left: auto;
+  white-space: normal;
+}
+
 .ov-top__key {
   min-width: 18ch;
   max-width: 34ch;
   font-family: var(--font-mono);
   font-size: var(--fs-1);
   font-weight: var(--fw-regular);
+  overflow-wrap: anywhere;
+}
+
+.ov-top__endpoint {
+  font-family: var(--font-mono);
+  font-size: var(--fs-1);
   overflow-wrap: anywhere;
 }
 
@@ -316,9 +355,14 @@
 
   .ov-top td {
     display: flex;
+    flex-wrap: wrap;
     justify-content: space-between;
-    gap: var(--sp-3);
+    gap: 0 var(--sp-3);
     text-align: right;
+  }
+
+  .ov-top td .dt__sub {
+    flex-basis: 100%;
   }
 
   .ov-top td::before {
@@ -334,5 +378,11 @@
 
   .ov-recs {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Two tiles a row leave room for few words: let a long tile name wrap a third time instead of being cut. */
+  .ov-kpis .kpi__label,
+  .ov-visitors .kpi__label {
+    -webkit-line-clamp: 3;
   }
 }

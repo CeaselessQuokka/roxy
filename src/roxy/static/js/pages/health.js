@@ -3,9 +3,10 @@
  *
  * What this is
  *   * The Run button posts `{include_credential}` to `POST /admin/api/v1/health/runs`. 202: the Run card switches to
- *     the new run in place (the address gets `?run=<id>`); 409 `run_in_progress`: it follows the run already going
- *     (its id is in `Roxy-Health-Run`); 403 `reauth_required` (the credential check needs a fresh second factor):
- *     "Confirm it is you", then one retry.
+ *     the new run in place (the address gets `?run=<id>`) and the run's section scrolls into view when it starts low
+ *     (on a phone the form fills the first screen); 409 `run_in_progress`: it follows the run already going (its id
+ *     is in `Roxy-Health-Run`); 403 `reauth_required` (the credential check needs a fresh second factor): "Confirm it
+ *     is you", then one retry.
  *   * Live run view: every `health` event of the page-wide stream (`health_run_started`, `health_result`,
  *     `health_run_finished`) for the run on screen re-renders the Run card from the server (at most once a second),
  *     so the checklist fills in as checks finish; when the run finishes the history card refreshes too and a toast
@@ -15,8 +16,8 @@
  *   * "Copy for LLM" (`data-copy-llm`) copies the run's or one check's LLM text; `data-download` saves the JSON or
  *     the printable report. Both go through the audited export route (static/js/exports.js handles 429 and the
  *     second factor).
- *   * Tables: as on every page of this builder, a table swap keeps only the table out of its card's answer, and the
- *     card's refresh address follows the table's state.
+ *   (Tables keep only themselves out of a card's answer and the card's refresh address follows the table's state on
+ *   every page: templates/components/table.html `hx-select` and static/js/tables.js.)
  *
  * Why it exists
  *   Plan 13.1: "results stream back over SSE as each check finishes (a checklist filling in with spinners turning
@@ -31,7 +32,7 @@
  *   static/js/page.js, static/js/sse.js, roxy/admin/pages/health.py, roxy/admin/api/health.py.
  */
 
-import { confirmIdentity, copyTextFrom, downloadFrom, onContent, refreshCard, request, toast } from "roxy/page";
+import { confirmIdentity, copyTextFrom, downloadFrom, refreshCard, request, toast } from "roxy/page";
 
 const RUN_ID = /^[0-9]{1,15}$/;
 const EXPORT = /^\/admin\/api\/v1\/health\/runs\/[0-9]{1,15}\/export\?format=(json|html|llm)(&focus=[A-Za-z0-9._%-]{1,160})?$/;
@@ -42,6 +43,7 @@ const MAX_ERROR_TEXT = 4096;
 let lastRefresh = 0;
 let pending = 0;
 let lastEvent = 0;
+let revealId = "";  // a run this page just started or joined: brought into view once the card shows it
 
 function runCard() {
   return document.getElementById("run");
@@ -51,6 +53,24 @@ function shownRun() {
   const node = document.querySelector("#run [data-run-id]");
   return node ? { id: node.dataset.runId, state: node.dataset.runState, pinned: node.dataset.runPinned === "true" } : null;
 }
+
+/**
+ * After Run (or a run joined on 409), once the card shows that run: scroll its section to the top of the window if
+ * it starts low, so the progress and the checklist filling in are on screen (on a phone the form fills the first
+ * screen; plan 14.8). Once per run, instantly (no animation), and never moving focus: a card with focus inside is
+ * not refreshed, and the live view must keep refreshing.
+ */
+function revealRun() {
+  const shown = shownRun();
+  if (!revealId || !shown || shown.id !== revealId) return;
+  revealId = "";
+  const section = document.querySelector("#run .hl-run");
+  if (section && section.getBoundingClientRect().top > window.innerHeight * 0.4) {
+    section.scrollIntoView({ block: "start", behavior: "auto" });
+  }
+}
+
+document.addEventListener("htmx:afterSettle", revealRun);
 
 function refreshRun() {
   const card = runCard();
@@ -72,6 +92,7 @@ function follow(id) {
   }
   const card = runCard();
   if (!card) return;
+  revealId = String(id);
   card.dataset.cardSrc = `/admin/health/fragment/run?run=${id}`;
   const url = new URL(window.location.href);
   url.searchParams.set("run", String(id));
@@ -172,6 +193,19 @@ document.addEventListener("roxy:sse:health", (event) => {
   }
 });
 
+// Arriving from a start elsewhere (the Overview's Check Proxy Health and the palette open `?run=<id>#run`): the
+// browser scrolls to the card, whose form fills a phone's first screen; bring the run itself into view, after the
+// browser's own fragment scroll (the `load` event).
+function revealArrival() {
+  const shown = shownRun();
+  if (!shown || !shown.pinned || window.location.hash !== "#run") return;
+  revealId = shown.id;
+  window.requestAnimationFrame(revealRun);
+}
+
+if (document.readyState === "complete") revealArrival();
+else window.addEventListener("load", revealArrival, { once: true });
+
 // Without stream events (not connected yet, reconnecting), a running run is still followed.
 window.setInterval(() => {
   const shown = shownRun();
@@ -196,18 +230,3 @@ document.addEventListener("click", (event) => {
   }
 });
 
-// A table's answer is its whole card: keep only the table, and let the card's refresh address follow its state.
-document.addEventListener("htmx:beforeSwap", (event) => {
-  const target = event.detail && event.detail.target;
-  if (!(target instanceof Element) || !target.matches("[data-dt]") || !target.id) return;
-  if (!event.detail.selectOverride && target.closest("[data-card]")) event.detail.selectOverride = `#${CSS.escape(target.id)}`;
-});
-
-onContent("[data-dt]", (table) => {
-  const card = table.closest("[data-card]");
-  const form = table.querySelector("[data-dt-state]");
-  if (!card || !form || !table.dataset.dtSrc) return;
-  const params = new URLSearchParams();
-  for (const [name, value] of new FormData(form)) if (typeof value === "string" && value !== "") params.append(name, value);
-  card.dataset.cardSrc = `${table.dataset.dtSrc}?${params.toString()}`;
-});

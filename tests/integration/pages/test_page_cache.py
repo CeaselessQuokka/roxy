@@ -23,9 +23,9 @@ from typing import Any
 
 import pytest
 
+from pages_harness import HOSTILE, parse_html, setting_selector
 from roxy.admin.pages import registry
 from roxy.admin.pages.cache import explainer, span_words
-from roxy.admin.pages.testing import HOSTILE, parse_html
 from roxy.core.style_guard import find_style_issues
 
 PAGE = "/admin/cache"
@@ -55,13 +55,15 @@ async def test_every_card_fragment_and_inline_setting_is_there(page: Any, pages_
         fragment = await page.doc(f"{PAGE}/fragment/{card.id}")
         assert fragment.select_one(f"section#{card.id}[data-card]") is not None, card.id
         assert "data-card-error" not in str(fragment.text()), card.id
-        for spec in registry.settings_for(registry.anchor("cache", card.id)):
-            assert fragment.select_one(f'[data-setting-key="{spec.key}"]') is not None, (card.id, spec.key)
+        anchor = registry.anchor("cache", card.id)
+        for spec in registry.settings_for(anchor):
+            assert fragment.select_one(setting_selector(spec.key, anchor)) is not None, (card.id, spec.key)
     for card_id in LAZY:
         assert doc.select_one(f"section#{card_id}.page-card--lazy") is not None, card_id
     stats = doc.select_one("section#stats")
     for key in ("hit_ratio", "served_cache", "avoided_pct"):
         assert stats.select_one(f'[data-kpi="{key}"]') is not None, key
+    assert "fresh hits" in stats.select_one(".cache-states").text()
     assert doc.select_one('#browser [data-table="cache_entries"]') is not None
     assert doc.select_one('#stats [data-action="cache-clear-stats"]') is not None
     for dialog in ("dlg-cache-purge", "dlg-cache-purge-all", "dlg-cache-unignore", "dlg-cache-rule-delete"):
@@ -84,6 +86,10 @@ async def test_the_numbers_equal_the_cache_api(page: Any, pages_app: Any) -> Non
             assert node is not None, tile["key"]
             if tile["key"] == "served_cache":
                 assert node.text() == f"{tile['value']:,}", params
+        states = doc.select_one(".cache-states")
+        if states is not None:
+            assert f"{api['states']['cache_hit']:,} fresh hits" in states.text(), params
+            assert f"{api['states']['cache_stale']:,} stale rescues" in states.text(), params
     endpoints = (await page.api("GET", "cache/endpoints")).json()
     doc = await page.doc(f"{PAGE}/fragment/endpoints")
     count = doc.select_one(".dt__count").text()
@@ -249,6 +255,54 @@ async def test_clear_stats_is_a_previewed_family_reset(page: Any, pages_app: Any
         },
     )
     assert run.status_code in (200, 202), run.text
+    if run.status_code == 200:
+        # Plan 6.8 (parity-8): the hit ratio has no lookups left to divide by, and says why instead of "0%".
+        after = (await page.api("GET", "cache/stats")).json()
+        tile = next(t for t in after["tiles"] if t["key"] == "hit_ratio")
+        stats = await page.doc(f"{PAGE}/fragment/stats")
+        if tile["value"] is None and tile.get("partial"):
+            assert "cleared by a reset" in stats.select_one('[data-kpi="hit_ratio"]').text()
+        assert after["notices"], "the reset is named on the page"
+        assert any(notice in stats.text() for notice in after["notices"])
+
+
+async def test_a_table_request_answers_the_table_alone_and_a_refresh_keeps_the_view(page: Any, pages_app: Any) -> None:
+    await pages_app.seed_traffic()
+    for card, table in (("browser", "cache-browser"), ("endpoints", "cache-endpoints"), ("rules", "cache-rules")):
+        # The table's own request (htmx names the table in HX-Target): the table alone, which replaces itself.
+        alone = await page.get(
+            f"{PAGE}/fragment/{card}", params={"q": "games"}, htmx=True, headers={"HX-Target": table}
+        )
+        assert alone.status_code == 200, card
+        doc = parse_html(alone.text)
+        assert doc.select_one("section[data-card]") is None, card
+        root = doc.select_one(f"div#{table}[data-dt]")
+        assert root is not None, card
+        assert root.select_one('input[name="q"]').get("value") == "games", card
+        assert find_style_issues(alone.text, f"cache {card} table") == []
+        # The card's own request (a refresh, a lazy load): the whole card around the same table.
+        whole = await page.doc(f"{PAGE}/fragment/{card}", params={"q": "games"}, htmx=True)
+        assert whole.select_one(f"section#{card}[data-card] div#{table}[data-dt]") is not None, card
+    # The main table's card keeps its search and sort in its own refresh URL (a purge redraws the same view).
+    params = {"q": "universeIds=1", "sort": "key", "order": "asc"}
+    src = (await page.doc(f"{PAGE}/fragment/browser", params=params)).select_one("section#browser").get("data-card-src")
+    assert src.startswith("/admin/cache/fragment/browser?")
+    assert "q=universeIds%3D1" in src
+    assert "sort=key" in src
+    assert "order=asc" in src
+
+
+async def test_no_cache_form_needs_a_fresh_second_factor(page: Any, pages_app: Any) -> None:
+    # The page's forms post to routes guarded by the session and CSRF only (plan 9.6 keeps the second factor for
+    # credentials, admin security and the factory reset): a stale factor never blocks a purge or a rule.
+    await pages_app.seed_traffic()
+    page.make_mfa_stale()
+    purged = await page.api("POST", "cache/purge", json={"scope": "expired"})
+    assert purged.status_code == 200, purged.text
+    added = await page.api("POST", "cache/rules", json={"pattern": "games.roblox.com/v1/stale-factor", "ttl": 30})
+    assert added.status_code == 201, added.text
+    removed = await page.api("DELETE", f"cache/rules/{added.json()['rule']['id']}", json={"reason": "test"})
+    assert removed.status_code == 200, removed.text
 
 
 @pytest.mark.parametrize(

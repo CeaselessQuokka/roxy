@@ -30,7 +30,5 @@
 {%- endif -%}
 {%- endmacro %}
 
-{% macro when(cell, empty="n/a") -%}
-{%- if cell -%}<time datetime="{{ cell.datetime }}">{{ cell.text }}</time>{% if cell.sub %}<span class="dt__sub">{{ cell.sub }}</span>{% endif %}
-{%- else -%}<span class="muted">{{ empty }}</span>{%- endif -%}
-{%- endmacro %}
+{% from "components/pieces.html" import when as _when %}
+{% macro when(cell, empty="n/a") -%}{{ _when(cell, empty=empty, stacked=True) }}{%- endmacro %}

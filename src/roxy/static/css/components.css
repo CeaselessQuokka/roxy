@@ -286,7 +286,13 @@ input[type="radio"] {
 .field-row {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;  /* a field without a hint keeps its own height beside one with a hint */
   gap: var(--sp-3);
+}
+
+/* Side by side, the second field of a row starts level with the first (the stacking margin above is for columns). */
+.field-row > .field + .field {
+  margin-top: 0;
 }
 
 .field__label {
@@ -1287,7 +1293,11 @@ kbd {
   cursor: pointer;
 }
 
+/* A scroll box is the containing block of what it scrolls (`position: relative`): an absolutely positioned
+   descendant (a visually hidden label in a wide cell, a table header hidden on a phone) is then clipped by the box
+   instead of widening the whole page sideways. */
 .table-scroll {
+  position: relative;
   max-width: 100%;
   overflow-x: auto;
 }
@@ -1511,6 +1521,7 @@ kbd {
 }
 
 .dt__scroll {
+  position: relative;  /* the containing block of what it scrolls (see `.table-scroll`) */
   max-height: 70vh;
   overflow: auto;
   border-top: 1px solid var(--border);
@@ -2017,6 +2028,13 @@ kbd {
 .setting__desc {
   max-width: 80ch;
   color: var(--text-muted);
+  overflow-wrap: anywhere;  /* descriptions quote long paths that would widen a phone screen */
+}
+
+/* A setting edited on another card of the same page (one setting, one editor per page): its value and a link. */
+.setting--reference .setting__desc a {
+  color: var(--accent);
+  text-decoration: underline;
 }
 
 .setting__control {
@@ -2036,9 +2054,23 @@ kbd {
   min-width: 80px;
 }
 
+/* The number field keeps its own width beside a long unit ("messages per channel per hour"): the unit wraps
+   instead of squeezing the field to nothing. */
 .setting__numeric .input-unit {
-  flex: 0 0 auto;
-  width: 220px;
+  flex: 0 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.setting__numeric .input-unit .input {
+  flex: 0 0 7rem;
+  width: 7rem;
+  min-width: 0;
+}
+
+.setting__numeric .input-unit__unit {
+  flex: 1 1 auto;
+  white-space: normal;
 }
 
 .setting__option {
@@ -3695,8 +3727,16 @@ dialog::backdrop {
   display: inline-flex;
   align-items: flex-start;
   gap: 4px;
+  min-width: 0;
+  max-width: 100%;
   color: var(--text-muted);
   font-size: var(--fs-1);
+}
+
+/* A notice may name a setting key (one long word): it breaks inside a phone-width tile instead of running out. */
+.kpi__notice > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .kpi__notice .icon {
@@ -3815,13 +3855,6 @@ form[aria-busy="true"] {
   font-size: var(--fs-3);
 }
 
-.coming-list {
-  display: grid;
-  gap: var(--sp-2);
-  margin: 0;
-  padding-left: var(--sp-5);
-}
-
 /* A table's first cell is the button that opens its row: a time stacks over its "2 minutes ago" line. */
 .dt__table td:first-child .link-btn[data-dt-open] {
   display: inline-block;
@@ -3849,5 +3882,467 @@ form[aria-busy="true"] {
 
   .card__notice {
     margin: var(--sp-3) var(--sp-3) 0;
+  }
+}
+
+/* ============================================================================================ inline resets */
+/* The drawer of an inline data reset (templates/admin/pages/_reset.html, roxy/admin/pages/resets.py, plan 6.8). */
+.inline-reset__lead {
+  max-width: 70ch;
+}
+
+.inline-reset__target {
+  overflow-wrap: anywhere;
+}
+
+.inline-reset__section {
+  display: grid;
+  gap: var(--sp-3);
+}
+
+.inline-reset__heading {
+  font-size: var(--fs-3);
+}
+
+.inline-reset__snapshots {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--fs-1);
+}
+
+.inline-reset__snapshots li {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+}
+
+.inline-reset__snapshots .icon {
+  flex: none;
+  margin-top: 2px;
+}
+
+@media (max-width: 760px) {
+  .inline-reset__form .btn {
+    min-height: var(--target-touch);
+  }
+}
+
+/* ============================================================================================ page pieces */
+/* Fill gauges (a native <meter> with words), stat tiles, countdowns, small tables that stack into labeled lines
+   on a phone, and the small forms around them (templates/components/pieces.html). They began on the Upstream,
+   Egress and Credential pages (hence the `g3-` class prefix) and were copied into each page's stylesheet; the
+   P11 integration made them one shared copy. */
+
+.g3-pair > * {
+  min-width: 0;
+}
+
+.g3-pad {
+  margin: 0;
+  padding: var(--sp-3) var(--sp-4);
+}
+
+.g3-section {
+  display: grid;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border);
+}
+
+.g3-subhead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0 var(--sp-2);
+  font-size: var(--fs-3);
+  font-weight: var(--fw-semibold);
+}
+
+.g3-section > .g3-subhead {
+  margin: 0;
+}
+
+.g3-scroll {
+  max-width: 100%;
+  margin-top: var(--sp-2);
+}
+
+.g3-table {
+  width: 100%;
+}
+
+.g3-table td {
+  vertical-align: top;
+}
+
+.g3-table--wrap td {
+  min-width: 6ch;
+  white-space: normal;
+  overflow-wrap: break-word;
+}
+
+.g3-caption {
+  caption-side: top;
+  padding: 0 0 var(--sp-1);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+  text-align: left;
+}
+
+/* Caller text breaks anywhere (components.css), which would let a table squeeze its column to one letter: keep
+   at least a readable width; longer text still wraps inside it, and the table scrolls in its own region. */
+.g3-table .caller-text,
+.g3-table-host td .caller-text {
+  display: inline-block;
+  min-width: 14ch;
+  max-width: 60ch;
+}
+
+/* A status badge with a long sentence wraps inside its card instead of running past its edge; a badge in a table
+   cell holds one short word (its detail sits under it), so it never wraps inside its pill. */
+.g3-egress__head .badge {
+  max-width: 100%;
+  white-space: normal;
+}
+
+.g3-table .badge {
+  white-space: nowrap;
+}
+
+/* On a phone a small table stacks: each row becomes a block and each cell a labeled line (the label comes from the
+   cell's `data-label`, the column's header text), so nothing scrolls sideways and no column is squeezed. */
+@media (max-width: 600px) {
+  .g3-table--stack thead {
+    display: none;
+  }
+
+  .g3-table--stack,
+  .g3-table--stack tbody,
+  .g3-table--stack tr {
+    display: block;
+    width: 100%;
+  }
+
+  .g3-table--stack tr {
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .g3-table--stack td,
+  .g3-table--stack td.num {
+    display: grid;
+    grid-template-columns: minmax(6rem, 35%) minmax(0, 1fr);
+    gap: var(--sp-2);
+    min-width: 0;
+    padding: 2px 0;
+    border: 0;
+    text-align: left;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .g3-table--stack td::before {
+    content: attr(data-label);
+    color: var(--text-muted);
+    font-size: var(--fs-1);
+  }
+
+  .g3-table--stack .caller-text {
+    min-width: 0;
+  }
+}
+
+.g3-cell-sub {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.g3-list {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding-left: var(--sp-5);
+  overflow-wrap: anywhere;
+}
+
+.g3-tables {
+  margin-top: var(--sp-3);
+}
+
+.g3-tables > * {
+  min-width: 0;
+}
+
+.g3-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--sp-3);
+  margin: 0;
+}
+
+.g3-stat {
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.g3-stat__label {
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.g3-stat__value {
+  margin: 0;
+  font-size: var(--fs-4);
+  font-weight: var(--fw-semibold);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.g3-stat__sub {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-regular);
+}
+
+.g3-stat--bad .g3-stat__value {
+  color: var(--bad);
+}
+
+.g3-stat--warn .g3-stat__value {
+  color: var(--warn);
+}
+
+.g3-stat--ok .g3-stat__value {
+  color: var(--ok);
+}
+
+/* Gauges: a labeled <meter> with the percent and words beside it (color is never the only signal). */
+.g3-gauges {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.g3-gauge {
+  display: grid;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.g3-gauge__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-1) var(--sp-2);
+  font-size: var(--fs-1);
+}
+
+.g3-gauge__label {
+  color: var(--text-muted);
+  font-weight: var(--fw-semibold);
+}
+
+.g3-gauge__value {
+  font-variant-numeric: tabular-nums;
+}
+
+.g3-gauge__words {
+  color: var(--text-muted);
+}
+
+.g3-gauge--warn .g3-gauge__words {
+  color: var(--warn);
+}
+
+.g3-gauge--bad .g3-gauge__words {
+  color: var(--bad);
+}
+
+.g3-gauge__detail {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  overflow-wrap: anywhere;
+}
+
+.g3-gauge__meter {
+  display: block;
+  width: 100%;
+  height: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  appearance: none;
+}
+
+.g3-gauge__meter::-webkit-meter-bar {
+  height: 100%;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+}
+
+.g3-gauge__meter::-webkit-meter-optimum-value {
+  border-radius: var(--radius-pill);
+  background: var(--ok);
+}
+
+.g3-gauge__meter::-webkit-meter-suboptimum-value {
+  border-radius: var(--radius-pill);
+  background: var(--warn);
+}
+
+.g3-gauge__meter::-webkit-meter-even-less-good-value {
+  border-radius: var(--radius-pill);
+  background: var(--bad);
+}
+
+.g3-gauge__meter::-moz-meter-bar {
+  border-radius: var(--radius-pill);
+  background: var(--ok);
+}
+
+.g3-gauge__meter:-moz-meter-sub-optimum::-moz-meter-bar {
+  background: var(--warn);
+}
+
+.g3-gauge__meter:-moz-meter-sub-sub-optimum::-moz-meter-bar {
+  background: var(--bad);
+}
+
+.g3-countdown {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Forms, testers and drawers. */
+.g3-form {
+  max-width: 640px;
+}
+
+.g3-inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--sp-3);
+}
+
+.g3-inline-form > .field {
+  flex: 1 1 220px;
+  min-width: 0;
+  margin: 0;
+}
+
+.g3-inline-form > .btn {
+  margin-top: calc(var(--fs-2) * 1.5 + var(--sp-1));
+}
+
+.g3-note {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-1);
+}
+
+.g3-sentence {
+  margin: var(--sp-3) 0;
+}
+
+.g3-add > summary {
+  gap: var(--sp-2);
+}
+
+.g3-add[open] > summary {
+  margin-bottom: var(--sp-3);
+}
+
+.g3-tools {
+  align-items: start;
+  margin-top: var(--sp-4);
+}
+
+.g3-tools > * {
+  min-width: 0;
+}
+
+.g3-tester__result {
+  min-height: var(--target-min);
+  overflow-wrap: anywhere;
+}
+
+.g3-tester__result p {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.g3-drawer {
+  min-width: 0;
+}
+
+.g3-drawer__lead {
+  margin: 0;
+  font-family: var(--font-mono, monospace);
+  font-size: var(--fs-1);
+  overflow-wrap: anywhere;
+}
+
+.g3-drawer .kv dd {
+  min-width: 0;
+}
+
+/* ============================================================================================ touch targets */
+/* Touch screens get 44 px targets everywhere, whatever their width (plan 14.8, WCAG 2.5.5). This block stays the
+   LAST rule of this file: it enlarges component rules above (`.input` 32 px, `.btn`, ...) with the same
+   specificity, so it only wins by coming after them (it sat in layout.css, which loads first, and lost; the phone
+   flows in tests/e2e/test_phone_flows.py measure every control they tap). Page CSS loads later and may add its own
+   touch rules. */
+@media (pointer: coarse) {
+  .nav-link,
+  .btn,
+  .icon-btn,
+  .menu__item,
+  .input,
+  .search-btn,
+  .segmented__item,
+  .pill-radio span,
+  .legend-item,
+  .link-btn,
+  .th-sort,
+  .chip-select select,
+  .avatar-btn,
+  .how-to-read > summary,
+  .details-summary,
+  .check,
+  .radio {
+    min-height: var(--target-touch);  /* a checkbox or radio label is its control's target (24 px elsewhere) */
+  }
+
+  .icon-btn,
+  .icon-btn--sm,
+  .avatar-btn,
+  .help-dot {
+    min-width: var(--target-touch);
+  }
+
+  .help-dot {
+    height: var(--target-touch);
   }
 }

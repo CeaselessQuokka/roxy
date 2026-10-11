@@ -11,6 +11,9 @@
  *     the client again so it shows the new state; the ban dialog's "permanently" switch turns the length off.
  *   * Reset dialogs (`[data-reset-dialog]`) ask `POST /admin/api/v1/data/resets/preview` for the exact rows when
  *     they open and show the API's own summary (the same helper as the Cache page's script).
+ *   * A table swap (search, sort, rows per page) moves its card's refresh URL to the same view, so a refresh after
+ *     an action keeps what the admin was looking at.
+ *   * `?ip=<text>` opens the address table on that search (the places table, the page's main table, reads `q`).
  *
  * Why it exists
  *   The lookup answer is JSON from the admin API (a POST, because it spends upstream budget), so it is drawn in the
@@ -23,7 +26,7 @@
  *   static/js/page.js, static/js/api_forms.js, roxy/admin/api/clients.py (`_run_lookup`), roxy/admin/pages/clients.py.
  */
 
-import { onContent, openDrawerFrom, postJSON, refreshCard } from "roxy/page";
+import { onContent, openDrawerFrom, postJSON } from "roxy/page";
 import { el, icon, qs, qsa } from "roxy/dom";
 
 const DIGITS = /^[0-9]{1,20}$/;
@@ -127,31 +130,20 @@ async function previewReset(dialog) {
 }
 
 /**
- * Load the lazy cards one at a time right after the first paint, top to bottom, so scrolling never meets a
- * "Loading" card and the server renders one fragment at a time (the 1 GB box). A card that cannot load keeps its
- * placeholder (and loads again when it scrolls into view, as htmx's `revealed` trigger does).
+ * Deep link `?ip=<text>` (a link from another page, such as the strike board): the address table, which keeps its
+ * own state out of the address bar, opens on that search once it has loaded. Its value goes in as the search box's
+ * text only; the server reads it as the table's `q` like any typed search.
  */
-async function loadLazyCards() {
-  const tried = new Set();
-  for (;;) {
-    const card = qsa(".page-card--lazy").find((node) => !tried.has(node.id) && !node.classList.contains("htmx-request"));
-    if (!card) return;
-    tried.add(card.id);
-    try {
-      await refreshCard(card);
-    } catch {
-      /* the placeholder stays; htmx loads it when it is revealed */
-    }
-  }
-}
-
-if (document.readyState === "complete") window.setTimeout(loadLazyCards, 50);
-else window.addEventListener("load", () => window.setTimeout(loadLazyCards, 50), { once: true });
-
-// The places card's own refresh (after an action) asks for the view in the address bar (kept by tables.js).
-onContent("#client-places", () => {
-  const card = document.getElementById("places");
-  if (card && card.dataset.card === "places") card.dataset.cardSrc = `/admin/clients/fragment/places${window.location.search}`;
+const wantedIp = (new URLSearchParams(window.location.search).get("ip") || "").trim().slice(0, 200);
+let wantedIpApplied = wantedIp === "";
+onContent("#client-ips", (table) => {
+  if (wantedIpApplied) return;
+  const box = qs("input[name=q]", table);
+  if (!box) return;
+  wantedIpApplied = true;
+  box.value = wantedIp;
+  box.dispatchEvent(new Event("change", { bubbles: true }));  // the state form asks the server on `change`
+  table.scrollIntoView({ block: "start" });
 });
 
 document.addEventListener("roxy:api-success", (event) => {

@@ -4,14 +4,17 @@
   bar, so a link shares the view).
 
   One row per (egress, reason, Roblox status) group with first and last seen and the latest failure's status,
-  method, endpoint, path and error (caller text). A row opens its details in the drawer (v1's "click a row for the
-  last detail"). Export downloads through `GET /admin/api/v1/upstream/failures`.
-  Context: `frame`, `table`, `total`, `capped`.
+  method, endpoint, path and error (caller text). A row opens all its columns in the drawer (v1's "click a row for
+  the last detail"). Export downloads through `GET /admin/api/v1/upstream/failures`. A table request swaps only the
+  table (`hx-select`); the count above it follows the egress filter, so it comes along out of band
+  (`hx-select-oob`).
+  Context: `frame`, `table`, `total`, `capped`, `egress_label`.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/table.html" import data_table %}
 {% from "components/format.html" import num %}
 {% set notes = ["Only the 1,000 largest groups are listed; narrow the range to see the rest."] if capped else [] %}
-{% call page_card(frame, flush=True, subtitle=num(total) ~ " failed requests in this range", notices=notes) %}
-<div class="g3-table-host" hx-select="#{{ table.id }}">{{ data_table(**table) }}</div>
+{% call page_card(frame, flush=True, notices=notes) %}
+<p class="g3-pad g3-summary" id="failures-summary" aria-live="polite"><strong>{{ num(total) }}</strong> failed {{ "request" if total == 1 else "requests" }} in this range ({{ egress_label }})</p>
+<div class="g3-table-host" hx-select="#{{ table.id }}" hx-select-oob="#failures-summary">{{ data_table(**table) }}</div>
 {% endcall %}

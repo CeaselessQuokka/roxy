@@ -45,15 +45,17 @@ How it works
        `tarpit.plan_cooldown_retry`, which remembers it fleet-wide and, when this answer is itself a retry of the
        same key inside an earlier `Retry-After`, holds it with the `jitter` type (`upstream_cooldown_retry`, plan
        10.6; off by default).
-    7. `respond.render` builds the answer; `ctx.recorder.record_outcome(event)` runs exactly once per request
-       (for a drip, when the stream ends), with a `CaptureInput` when the recorder takes one (its capture policy
-       decides whether the bodies are kept). A refusal's record names the rule rows the verdict matched
-       (`refusal_matches`, the refusal event's `rules`). `message_source` tells whose words the caller got (row 116): a
-       refusal's `custom` or `default` (a refusal the upstream layer returned, such as an egress host refusal, is
-       `default`), `roxy` for a 7.13 failure text Roxy wrote, `roblox` for an error answer that carries Roblox's
-       own body. An exception still propagates to the middleware, which answers 500 (or the
-       deadline middleware 504), but the fallback outcome record (`internal_error` or `deadline`) is written here
-       first, because only this flow knows the request's endpoint and cache facts (DESIGN 7).
+    7. `respond.render` builds the answer; `ctx.recorder.record_outcome(event)` runs exactly once per request (for a
+       drip, when the stream ends), with a `CaptureInput` when the recorder takes one (its capture policy decides
+       whether the bodies are kept). Its caller bytes are plan 14.3's wire bytes: the request line, headers and body the
+       app received, and the status line, headers (as the middleware stack rewrites them) and body it sends
+       (`core/middleware.py request_head_bytes`, `response_head_bytes`). A refusal's record names the rule rows the
+       verdict matched (`refusal_matches`, the refusal event's `rules`). `message_source` tells whose words the caller
+       got (row 116): a refusal's `custom` or `default` (a refusal the upstream layer returned, such as an egress host
+       refusal, is `default`), `roxy` for a 7.13 failure text Roxy wrote, `roblox` for an error answer that carries
+       Roblox's own body. An exception still propagates to the middleware, which answers 500 (or the deadline middleware
+       504), but the fallback outcome record (`internal_error` or `deadline`) is written here first, because only this
+       flow knows the request's endpoint and cache facts (DESIGN 7).
     Fail closed (plan C7): no context or no abuse pipeline means 503 `degraded` for valid targets (invalid ones
     are still refused with their own 404); shared state that cannot be read or written is 503 `degraded`.
     `/internal` and everything under it exist only on the internal Unix socket app; a request for them that reaches
@@ -86,6 +88,7 @@ from starlette.types import Scope
 from roxy.core.client_ip import UNKNOWN_IP, limit_key
 from roxy.core.deadline import STATE_COMPAT_COLLAPSE
 from roxy.core.errors import not_found_response
+from roxy.core.middleware import request_head_bytes, response_head_bytes
 from roxy.core.reasons import AuthClass, Egress, Outcome, ReasonCode, Source
 from roxy.core.redact import redact_label
 from roxy.core.scope import catalog_default, get_app_context, get_state
@@ -408,14 +411,17 @@ class ProxyFlow:
         if plan is None:
             return await self.finish(req, rendered)
         if str(getattr(plan, "kind", "hold")) == "drip" and not req.is_head:
+            head: list[int] = []  # the streamed response's head bytes, known once it is built (below)
 
             async def on_close() -> None:
                 try:
                     await _release(plan)
                 finally:
-                    await self.record(req, rendered, None, bytes_out=len(rendered.body))
+                    await self.record(req, rendered, None, bytes_out=sum(head) + len(rendered.body))
 
-            return respond.drip_response(rendered, plan, on_close=on_close)
+            response = respond.drip_response(rendered, plan, on_close=on_close)
+            head.append(self.head_bytes(response))
+            return response
         try:
             wait = getattr(plan, "wait", None)
             if wait is not None:
@@ -462,13 +468,24 @@ class ProxyFlow:
 
         Every request that passed every check (parity row 79) and, as a blocked fingerprint, every request a
         request filter refused (row 134). In memory, flushed with the other metrics; the recorder hashes secret
-        values and skips ignored headers. Never raises: metrics never fail a request.
+        values and skips ignored headers. A passed request also hands its target, client address and header names
+        (references, no copy) for its User-Agent's drill-down (v1 `LastPath`, `LastIP`, `LastHeaders`; the recorder
+        keeps the newest per User-Agent). Never raises: metrics never fail a request.
         """
         record = getattr(getattr(self.ctx, "recorder", None), "record_fingerprint", None)
         if record is None:
             return
         try:
-            record(list(req.headers.items()), req.user_agent or None, blocked=blocked)
+            if blocked:
+                record(list(req.headers.items()), req.user_agent or None, blocked=True)
+            else:
+                record(
+                    list(req.headers.items()),
+                    req.user_agent or None,
+                    path=req.target,
+                    client_ip=req.client_ip,
+                    header_names=req.header_names_in_order,
+                )
         except Exception:
             log.exception("record_fingerprint_failed")
 
@@ -491,10 +508,30 @@ class ProxyFlow:
     async def finish(
         self, req: ProxyRequest, rendered: respond.Rendered, result: Any = None, *, reason: ReasonCode | None = None
     ) -> Response:
-        """Step 7: the Response, then exactly one outcome record."""
+        """Step 7: the Response, then exactly one outcome record (its bytes out are the status line, the headers
+        the stack sends and the body: plan 14.3 wire bytes; a HEAD answer has no body)."""
         response = rendered.to_response(head=req.is_head)
-        await self.record(req, rendered, result, bytes_out=0 if req.is_head else len(rendered.body), reason=reason)
+        body = 0 if req.is_head else len(rendered.body)
+        await self.record(req, rendered, result, bytes_out=self.head_bytes(response) + body, reason=reason)
         return response
+
+    def head_bytes(self, response: Response) -> int:
+        """The status line and headers this response goes out with (`core/middleware.py response_head_bytes`: the
+        same header rewrite the middleware stack applies). Never raises: a metric never fails a request."""
+        try:
+            return response_head_bytes(self.scope, response.status_code, response.raw_headers)
+        except Exception:
+            log.exception("caller_bytes_out_failed")
+            return 0
+
+    def request_bytes(self, req: ProxyRequest) -> int:
+        """The request as the app received it from nginx: request line, headers and the body it read (plan 14.3
+        `caller_bytes_in`; a GET's body is never read). Never raises."""
+        try:
+            return request_head_bytes(self.scope) + len(req.body)
+        except Exception:
+            log.exception("caller_bytes_in_failed")
+            return len(req.body)
 
     async def record_failure(self, req: ProxyRequest, reason: ReasonCode) -> None:
         """The fallback outcome record for a request that ends in an exception (a no-op if already recorded).
@@ -506,7 +543,8 @@ class ProxyFlow:
             return
         try:
             rendered = self.render(req, respond.failure_result(reason))
-            await self.record(req, rendered, None, bytes_out=len(rendered.body))
+            bytes_out = self.head_bytes(rendered.to_response()) + len(rendered.body)
+            await self.record(req, rendered, None, bytes_out=bytes_out)
         except Exception:
             log.exception("record_failure_failed")
 
@@ -527,7 +565,15 @@ class ProxyFlow:
         if recorder is None:
             return
         try:
-            event = build_outcome_event(req, rendered, result, bytes_out=bytes_out, reason=reason, refusal=self.refusal)
+            event = build_outcome_event(
+                req,
+                rendered,
+                result,
+                bytes_out=bytes_out,
+                reason=reason,
+                refusal=self.refusal,
+                bytes_in=self.request_bytes(req),
+            )
             record = recorder.record_outcome
             if _accepts_capture(record):
                 # The recorder decides from its capture policy whether to keep the bodies (plan rows 126, 127).
@@ -665,11 +711,13 @@ def build_outcome_event(
     bytes_out: int,
     reason: ReasonCode | None = None,
     refusal: Any = None,
+    bytes_in: int | None = None,
 ) -> Any:
     """The DESIGN.md section 8 `OutcomeEvent` for one finished request, plus the optional fields the recorder has.
 
     `error` means an upstream or internal error happened, whether or not the caller saw it: a stale serve after a
-    failed refresh counts (the metrics recorder's definition).
+    failed refresh counts (the metrics recorder's definition). `bytes_in` and `bytes_out` are plan 14.3's wire bytes
+    (`ProxyFlow.request_bytes`, `ProxyFlow.head_bytes` plus the body); without `bytes_in` only the body is counted.
     """
     latency_ms = max(0.0, (time.monotonic() - req.received_monotonic) * 1000.0)
     fields: dict[str, Any] = {
@@ -685,7 +733,7 @@ def build_outcome_event(
         "source": rendered.source if isinstance(rendered.source, Source) else Source(rendered.source),
         "cache_state": rendered.cache_state,
         "auth_class": AuthClass(getattr(result, "auth_class", AuthClass.ANON) or AuthClass.ANON),
-        "caller_bytes_in": len(req.body),
+        "caller_bytes_in": len(req.body) if bytes_in is None else int(bytes_in),
         "caller_bytes_out": bytes_out,
         "upstream_calls": int(getattr(result, "upstream_calls", 0) or 0),
         "upstream_bytes_in": int(getattr(result, "upstream_bytes_in", 0) or 0),

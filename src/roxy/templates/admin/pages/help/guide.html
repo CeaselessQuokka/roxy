@@ -1,8 +1,9 @@
 {#-
   Help page, card `guide` (`roxy/admin/pages/help.py guide_card`): the admin guide, the documents, the runbooks.
 
-  While docs/ADMIN_GUIDE.md is not written, the card says so and lists the plan 16.3 chapters, each pointing to the
-  pages and documents that cover it today. The incident runbook index has one entry per runbook name of the link
+  The guide (docs/ADMIN_GUIDE.md) is linked with its contents when the file exists (a skeleton until the docs phase
+  writes it); without it the card says so. Either way it lists the plan 16.3 chapters, each pointing to the pages
+  and documents that cover it today. The incident runbook index has one entry per runbook name of the link
   index in docs/RUNBOOKS.md: alert emails link to `/admin/help#runbook-<name>`, and static/js/pages/help.js goes on
   to the runbook itself (`data-runbook-href`); without scripts the entry and its link are shown. Every href here is
   a constant of help.py or a slug of the link index (letters, digits and hyphens).
@@ -16,25 +17,33 @@
   {% if guide %}
   <p>The admin guide explains how to run Roxy day to day, one chapter per dashboard page.</p>
   <p><a class="btn btn--primary" href="/admin/help/guide">{{ icon("book") }}<span>Read the admin guide</span></a></p>
-  {% if guide.toc %}
-  <ol class="help-toc">
-    {% for entry in guide.toc if entry.level == 2 %}<li><a href="/admin/help/guide#{{ entry.anchor }}">{{ entry.title }}</a></li>{% endfor %}
-  </ol>
+  {% set sections = guide.toc|selectattr("level", "equalto", 2)|list %}
+  {% if sections %}
+  <details class="help-toc-box">
+    <summary>Its chapters ({{ sections|length }})</summary>
+    <ol class="help-toc">
+      {% for entry in sections %}<li><a href="/admin/help/guide#{{ entry.anchor }}">{{ entry.title }}</a></li>{% endfor %}
+    </ol>
+  </details>
   {% endif %}
   {% else %}
   {{ inline_alert("info", "The written admin guide is not part of this release yet", "Until docs/ADMIN_GUIDE.md is written, each chapter below points to the pages, cards and documents that already cover it.") }}
-  <ol class="help-chapters">
-    {% for chapter in chapters %}
-    <li class="help-chapter">
-      <h3 class="help-chapter__title">{{ chapter.title }}</h3>
-      <p class="help-chapter__text">{{ chapter.text }}</p>
-      <ul class="help-links" aria-label="Where to read about {{ chapter.title|lower }}">
-        {% for item in chapter.links %}<li><a href="{{ item.href }}">{{ item.label }}</a></li>{% endfor %}
-      </ul>
-    </li>
-    {% endfor %}
-  </ol>
   {% endif %}
+
+  <section class="help-section" aria-labelledby="help-outline-title">
+    <h3 class="help-section__title" id="help-outline-title">Where each topic is on the dashboard</h3>
+    <ol class="help-chapters">
+      {% for chapter in chapters %}
+      <li class="help-chapter">
+        <h4 class="help-chapter__title">{{ chapter.title }}</h4>
+        <p class="help-chapter__text">{{ chapter.text }}</p>
+        <ul class="help-links" aria-label="Where to read about {{ chapter.title|lower }}">
+          {% for item in chapter.links %}<li><a href="{{ item.href }}">{{ item.label }}</a></li>{% endfor %}
+        </ul>
+      </li>
+      {% endfor %}
+    </ol>
+  </section>
 
   <section class="help-section" aria-labelledby="help-documents-title">
     <h3 class="help-section__title" id="help-documents-title">Documents</h3>

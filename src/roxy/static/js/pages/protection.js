@@ -38,36 +38,6 @@ import { el, qs, qsa } from "roxy/dom";
 const MAX_ERROR_TEXT = 4096;
 const chosenTabs = new Map();
 
-// ------------------------------------------------------------------------------------------------ lazy cards
-
-// The pipeline renders with the page; every other card is a lazy fragment that loads when it scrolls into view.
-// This page is long (27 cards), so after the first paint the cards still waiting load in the background, two at
-// a time, in page order: a link to #tarpit, the browser's find, and a phone scrolling fast then find their card
-// ready instead of a spinner. A card already loading (it was scrolled into view) is skipped.
-const BACKGROUND_LOADS = 2;
-const BACKGROUND_DELAY_MS = 300;
-
-async function loadWaitingCards() {
-  const queue = qsa("section.page-card--lazy[data-card-src]");
-  const worker = async () => {
-    while (queue.length) {
-      const card = queue.shift();
-      if (!card.isConnected || !card.classList.contains("page-card--lazy") || card.classList.contains("htmx-request")) {
-        continue;
-      }
-      try {
-        await refreshCard(card);
-      } catch {
-        /* the card keeps its placeholder and loads when it scrolls into view */
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: BACKGROUND_LOADS }, worker));
-}
-
-if (document.readyState === "complete") window.setTimeout(loadWaitingCards, BACKGROUND_DELAY_MS);
-else window.addEventListener("load", () => window.setTimeout(loadWaitingCards, BACKGROUND_DELAY_MS), { once: true });
-
 // ------------------------------------------------------------------------------------------------ tabs
 
 function selectTab(tabs, key, { focus = false } = {}) {

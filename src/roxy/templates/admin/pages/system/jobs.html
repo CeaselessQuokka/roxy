@@ -50,7 +50,16 @@
     {% if checkpoints %}
     <ul class="system-list">
       {% for item in checkpoints %}
-      <li><span class="mono">{{ item.name }}</span>: {% if item.last_duration_ms is not none %}{{ ms(item.last_duration_ms) }}, finished {{ when(item.finished) }}{% if item.per_database_ms is mapping and item.per_database_ms %} <span class="muted">({% for db, took in item.per_database_ms.items() %}{{ db }} {{ took }}{{ ", " if not loop.last }}{% endfor %})</span>{% endif %}{% else %}<span class="muted">known by the leader only</span>{% endif %}</li>
+      {#- The job's own result: the passive checkpoint answers milliseconds per database; the daily maintenance
+          answers whether it ran (it polls every few minutes and runs once a day) and its truncate timings. -#}
+      {% set result = item.per_database_ms if item.per_database_ms is mapping else {} %}
+      {% set timings = result.truncate_ms if "ran" in result else result %}
+      {% set timings = timings if timings is mapping and "truncated" not in result else {} %}
+      <li><span class="mono">{{ item.name }}</span>: {% if item.last_duration_ms is not none %}{{ ms(item.last_duration_ms) }}, finished {{ when(item.finished) }}
+        {%- if "ran" in result and not result.ran %} <span class="muted">(not due on that run: it runs once a day, at the maintenance hour while traffic is quiet)</span>
+        {%- else %}{% set shown = timings.items()|selectattr(1, "number")|rejectattr(1, "boolean")|list %}{% if shown %} <span class="muted">({% for db, took in shown %}{{ db }} {{ ms(took) }}{{ ", " if not loop.last }}{% endfor %})</span>{% endif %}{% endif %}
+        {%- elif answer.this_worker_is_leader %}<span class="muted">not run yet</span>
+        {%- else %}<span class="muted">known by the leader only</span>{% endif %}</li>
       {% endfor %}
     </ul>
     {% else %}

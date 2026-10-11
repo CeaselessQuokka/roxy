@@ -1,10 +1,11 @@
 """The dashboard shell in a real browser (P11 core): every page's frame, the controls in it, and the shared flows.
 
 What this is
-    Browser tests against the real app (`dashboard`, tests/e2e/conftest.py) for what every page shares: a page
-    nobody has built yet renders its "coming soon" body cleanly (no console error, page error or CSP violation,
-    axe clean in both themes at both sizes, no sideways scroll on a phone); the command palette jumps to a page and
-    offers the LLM export actions; the pause dialog pauses and resumes the proxy through the API; the inline editor
+    Browser tests against the real app (`dashboard`, tests/e2e/conftest.py) for what every page shares (each page's
+    own file checks it clean, axe clean in both themes at both sizes and without sideways scroll; the "coming soon"
+    placeholder these tests used to check is gone, every page is built): the command palette jumps to a page and
+    offers the LLM export actions; the pause dialog pauses and resumes the proxy through the API; one change reported
+    twice (the form's own reload and the shell's status check) reloads the page once; the inline editor
     of `pause_message_default` in that dialog reviews and saves the setting; the preferences dialog saves the
     admin's own preferences; and a change that needs a fresh second factor asks for the code ("Confirm it is you")
     and then goes through, on the reference page's revert form.
@@ -20,31 +21,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
-
-from roxy.admin.pages import registry
-from roxy.admin.pages.testing import SESSION_COOKIE_NAME, THEMES, VIEWPORTS
-
-
-def _unbuilt_page() -> str:
-    for spec in registry.PAGES:
-        if not registry.is_built(spec.id):
-            return spec.id
-    pytest.skip("every page is built")
-
-
-@pytest.mark.parametrize("theme", THEMES)
-@pytest.mark.parametrize("size", list(VIEWPORTS))
-def test_a_page_not_built_yet_is_a_clean_coming_soon_page(open_admin: Any, theme: str, size: str) -> None:
-    page_id = _unbuilt_page()
-    width, height = VIEWPORTS[size]
-    admin = open_admin(f"/admin/{page_id}", theme=theme, width=width, height=height)
-    assert admin.page.locator("[data-coming-soon]").count() == 1
-    assert admin.page.locator("h1").first.inner_text().strip() == registry.page(page_id).title
-    assert not admin.overflows(), "the page scrolls sideways"
-    assert admin.axe() == []
-    admin.shot("coming-soon")
-    admin.assert_clean()
+from pages_harness import SESSION_COOKIE_NAME
 
 
 def test_the_palette_jumps_to_a_page_and_offers_the_llm_export(open_admin: Any) -> None:
@@ -98,6 +75,34 @@ def test_the_pause_dialog_pauses_and_resumes_through_the_api(open_admin: Any, da
             page.locator('#dlg-pause .dialog__foot button[type="submit"]').click()
         admin.settle()
         assert dashboard.api("GET", "protection/pause").json()["paused"] is False
+        admin.assert_clean()
+    finally:
+        dashboard.api("POST", "protection/pause", json={"paused": False})
+
+
+def test_a_change_reported_twice_reloads_the_page_once(open_admin: Any, dashboard: Any) -> None:
+    """A pause from the dialog asked for two reloads: the form's own after the API answered (`api_forms.js`,
+    `data-on-success="reload"`, 300 ms later) and the shell's status check when the stream reported the same change
+    (`shell.js`). In a busy run the second `location.reload()` aborted the navigation of the first (Playwright:
+    `net::ERR_ABORTED`). Both now go through `dom.js reloadPage`, which reloads once: while a reload is pending, the
+    status check starts no other. The second half checks that the status check still reloads on its own."""
+    admin = open_admin("/admin/audit")
+    page = admin.page
+    try:
+        page.evaluate("window.__sameDocument = true")
+        pending = page.evaluate(
+            "import('roxy/dom').then((dom) => { dom.reloadPage({ delayMs: 60000 }); return dom.reloadPending(); })"
+        )
+        assert pending is True
+        assert dashboard.api("POST", "protection/pause", json={"paused": True}).status_code == 200
+        page.wait_for_timeout(3000)  # the settings watcher (1 s) and the stream report the pause well within this
+        assert page.evaluate("window.__sameDocument === true"), "a second reload started while one was pending"
+        admin = open_admin("/admin/audit")  # a fresh page, rendered paused, with no reload pending
+        page = admin.page
+        with page.expect_navigation(timeout=15_000):
+            assert dashboard.api("POST", "protection/pause", json={"paused": False}).status_code == 200
+        admin.settle()
+        assert "Pause" in page.locator(".topbar__pause").inner_text()
         admin.assert_clean()
     finally:
         dashboard.api("POST", "protection/pause", json={"paused": False})

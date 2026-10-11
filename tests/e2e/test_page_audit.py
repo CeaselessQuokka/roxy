@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.pages.testing import THEMES, VIEWPORTS
+from pages_harness import THEMES, VIEWPORTS
 
 PAGE = "/admin/audit"
 NO_HOSTILE_MARKUP = """() => !document.querySelector('img[src="x"], [onerror], [onclick], a[href^="javascript:"]')
@@ -83,7 +83,8 @@ def test_filters_search_and_paging_swap_the_table_in_place(open_admin: Any) -> N
 
 
 def test_a_row_opens_its_entry_in_the_drawer_with_the_diff_as_text(open_admin: Any, dashboard: Any) -> None:
-    admin = open_admin(PAGE, theme="light")
+    # Oldest first: the seeded row stays on the first page however many rows other tests of the session wrote.
+    admin = open_admin(f"{PAGE}?sort=id&order=asc", theme="light")
     page = admin.page
     entry_id = dashboard.seeded["audit"]["record_ids"][0]
     page.locator(f'#log tr[data-row-id="audit-{entry_id}"]').click()
@@ -109,7 +110,11 @@ def test_a_link_to_one_entry_opens_it_on_load(open_admin: Any, dashboard: Any) -
 
 
 def test_the_revert_form_puts_the_setting_back(open_admin: Any, dashboard: Any) -> None:
+    # The test makes the change it reverts: the newest change of the key may be another test's "put it back" write
+    # (the dashboard is shared by the session), whose revert would land on the value it already has.
     before = dashboard.api("GET", "settings/cache_ttl_seconds").json()
+    changed = int(before["setting"]["value"]) + 11
+    dashboard.change_settings({"cache_ttl_seconds": changed})
     changes = dashboard.api(
         "GET", "audit", params={"action": "setting.update", "target": "setting:cache_ttl_seconds"}
     ).json()
@@ -122,7 +127,7 @@ def test_the_revert_form_puts_the_setting_back(open_admin: Any, dashboard: Any) 
     admin.wait("document.querySelector('.toast') !== null")
     assert "Reverted" in page.locator(".toast").first.inner_text()
     after = dashboard.api("GET", "settings/cache_ttl_seconds").json()
-    assert after["setting"]["value"] != before["setting"]["value"]
+    assert after["setting"]["value"] == before["setting"]["value"] != changed  # the revert put the earlier value back
     reverts = dashboard.api("GET", "audit", params={"action": "setting.revert"}).json()
     assert reverts["total"] >= 1
     admin.assert_clean()

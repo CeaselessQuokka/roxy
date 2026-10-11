@@ -31,6 +31,11 @@ How it works
       run is skipped, so a leadership change can never send the same alert or digest twice.
     - Each run gets `timeout_s` (default: the interval, at most 10 minutes); exceptions are logged and counted,
       never raised into the loop.
+    - A run longer than half its interval rests as long as it ran before the next one starts (`JOB_REST_FACTOR`):
+      under load a slow job (the recommendations evaluation took 20 to 30 s of every 30 s on the leader in the
+      gaps_latency trace) can no longer run back to back and starve the worker's request path of CPU. Each run logs
+      `job_finished` (name, start, duration) at DEBUG, which with the loop lag probe's `loop_lag_spike` lines ties a
+      slow request to what ran (`ROXY_LOG_LEVEL=debug`).
 
 What to read next
     `roxy/scheduler/leader.py`, then `roxy/storage/retention.py` (what the storage jobs do).
@@ -60,6 +65,11 @@ JobFn = Callable[[JobContext], Awaitable[Any]]
 MAX_JOB_TIMEOUT_S = 600.0
 MAX_CONCURRENT_JOBS = 4
 """Jobs running at once per worker (plan 5.6: a cap on concurrency)."""
+
+JOB_REST_FACTOR = 1.0
+"""After a run, a job waits at least this many times its run's duration before it starts again (on top of its
+interval, whichever ends later), so one job never holds more than about half of a worker's time (module docstring).
+A bound on work, not a tuning knob (plan P9)."""
 
 SCHEDULE_PREFIX = "schedule:"
 """`job_runs` key prefix of the fleet-wide schedule rows: `schedule:<job name>`, `started_at` = the job's last start
@@ -416,6 +426,26 @@ class JobRunner:
                 status.history = [*status.history[-(_HISTORY - 1) :], duration_ms]
                 status.running = False
                 self._tasks.pop(job.name, None)
+                # A run that took longer than half its interval rests as long as it ran before the next one: one
+                # job can hold at most about half of this worker's time, however slow it gets (the gaps_latency
+                # trace: under load the recommendations evaluation took 20 to 30 s of every 30 s on the leader and
+                # its page requests waited for the CPU; plan 6.7). A fast job keeps its interval.
+                status.next_due_mono = max(
+                    status.next_due_mono, self.clock.monotonic() + duration_ms / 1000 * JOB_REST_FACTOR
+                )
+                # One line per run at DEBUG (off in production): with the loop lag probe's `loop_lag_spike` lines it
+                # shows which job ran while requests slowed down (the P11 latency gaps trace).
+                log.debug(
+                    "job_finished",
+                    extra={
+                        "fields": {
+                            "job": job.name,
+                            "started_at": round(started_wall, 3),
+                            "duration_ms": round(duration_ms, 1),
+                            "ok": status.last_ok,
+                        }
+                    },
+                )
 
     async def run(self, stop: asyncio.Event, poll_s: float = 0.5) -> None:
         """Start due jobs every `poll_s` seconds until `stop` is set, then cancel what is still running."""

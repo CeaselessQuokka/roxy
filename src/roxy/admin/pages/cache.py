@@ -145,12 +145,6 @@ def row_key(text: Any) -> str:
     return hashlib.sha256(str(text).encode("utf-8", "replace")).hexdigest()[:16]
 
 
-def table_only(view: PageView, table_id: str) -> bool:
-    """True for a table's own request (search, sort, page: htmx names the table in `HX-Target`): the card answers
-    with the table alone, which replaces itself, instead of the whole card (which would nest inside the card)."""
-    return view.in_fragment and view.request.headers.get("HX-Target") == table_id
-
-
 def table_state(tq: common.TableQuery, spec: common.TableSpec) -> dict[str, Any]:
     """The table's non-default search, sort and size, for the card's own fragment URL: a refresh after an action
     keeps what the admin was looking at (the page number starts again at 1)."""
@@ -355,8 +349,11 @@ def _split_series(answer: Mapping[str, Any], key: str) -> dict[str, Any]:
 async def ratios_card(view: PageView) -> dict[str, Any]:
     """Hit ratio and avoided calls (embedded: they have different units, so two charts), states from the API."""
     answer = await cache_api.cache_series(view.ctx, view.tr, cache_api.RATIO_METRICS, {})
+    hit = _split_series(answer, "hit_ratio")
+    # The note on a negative avoided share (plan P6) belongs to the avoided chart only.
+    hit["notices"] = [note for note in hit.get("notices") or () if note != cache_api.NEGATIVE_AVOIDED_NOTICE]
     return {
-        "hit": _split_series(answer, "hit_ratio"),
+        "hit": hit,
         "avoided": _split_series(answer, "avoided_pct"),
         "states_src": view.api_url("cache/states"),
         "ratios_src": view.api_url("cache/ratios"),
@@ -452,7 +449,7 @@ async def endpoints_card(view: PageView) -> dict[str, Any]:
         notice=notice,
         address=False,
     )
-    return {"table": table, "table_only": table_only(view, ENDPOINTS_TABLE)}
+    return {"table": table, "table_only": view.table_request(ENDPOINTS_TABLE)}
 
 
 # ============================================================================================ rules
@@ -545,7 +542,7 @@ async def rules_card(view: PageView) -> dict[str, Any]:
     )
     return {
         "table": table,
-        "table_only": table_only(view, RULES_TABLE),
+        "table_only": view.table_request(RULES_TABLE),
         "default_ttl": answer.get("default_ttl_s"),
         "default_ttl_words": span_words(answer.get("default_ttl_s")),
         "new_rule_ttl": DEFAULT_CACHE_RULE_TTL,
@@ -665,7 +662,7 @@ async def browser_card(view: PageView) -> dict[str, Any]:
     )
     return {
         "table": table,
-        "table_only": table_only(view, BROWSER_TABLE),
+        "table_only": view.table_request(BROWSER_TABLE),
         "card_src": view.fragment_url("browser", **table_state(tq, cache_api.BROWSER_SPEC)),
         "q": tq.q,
         "fresh": answer.get("fresh"),

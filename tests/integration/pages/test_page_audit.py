@@ -25,8 +25,8 @@ from typing import Any
 
 import pytest
 
+from pages_harness import HOSTILE, parse_html
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import HOSTILE, parse_html
 from roxy.core.style_guard import find_style_issues
 
 PAGE = "/admin/audit"

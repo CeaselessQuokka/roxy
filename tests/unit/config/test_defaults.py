@@ -10,10 +10,13 @@ from typing import Any
 import pytest
 
 from roxy.config import catalog, defaults
+from roxy.config.constants import CLIENT_ADDRESS_HEADERS
 from roxy.config.defaults import (
     CACHE_RULES,
     DEFAULT_TIER_MESSAGE,
     ID_LIST_NORMALIZATION,
+    IGNORED_ADDRESS_HEADER_NOTE,
+    IGNORED_ADDRESS_HEADERS,
     IGNORED_CACHE_PARAMS,
     IGNORED_PATHS,
     IGNORED_VALUE_HEADERS,
@@ -158,11 +161,13 @@ def test_seed_inserts_every_default_once(dbs: Any) -> None:
     assert not report.already_seeded
     assert report.inserted == {
         "cache_ignored_params": 9,
-        "ignored_value_headers": 9,
+        # v1's 9 tracing headers (seed version 1) and the 8 client address headers (seed version 2, privacy).
+        "ignored_value_headers": 9 + len(IGNORED_ADDRESS_HEADERS),
         "ignored_paths": 2,
         "throttle_tiers": 4,
         "rules_cache": len(CACHE_RULES),
     }
+    assert report.from_version == 0
     assert report.config_version == 1 == dbs.control.read_sync(read_config_version)
     origins = dbs.control.read_sync(
         lambda conn: {
@@ -185,6 +190,68 @@ def test_seed_inserts_every_default_once(dbs: Any) -> None:
     assert again.total_inserted == 0
     assert dbs.control.read_sync(read_config_version) == 1
     assert _count(dbs, "audit_log") == 1
+
+
+def test_client_address_headers_are_shipped_as_ignored_value_headers(dbs: Any) -> None:
+    """Privacy (gap G5): every header that carries client addresses is a default ignored value header, with a note
+    that says why, and the fingerprint writer's list is the same one."""
+    from roxy.metrics.fingerprints import ADDRESS_HEADERS
+
+    expected = {
+        "x-forwarded-for",
+        "x-real-ip",
+        "forwarded",
+        "true-client-ip",
+        "cf-connecting-ip",
+        "x-client-ip",
+        "x-cluster-client-ip",
+    }
+    assert expected <= set(IGNORED_ADDRESS_HEADERS) == set(CLIENT_ADDRESS_HEADERS) == set(ADDRESS_HEADERS)
+    _seed(dbs)
+    rows = dbs.control.read_sync(
+        lambda conn: {r[0]: (r[1], r[2]) for r in conn.execute("SELECT name, note, auto FROM ignored_value_headers")}
+    )
+    for name in IGNORED_ADDRESS_HEADERS:
+        assert rows[name] == (IGNORED_ADDRESS_HEADER_NOTE, 0), name
+    assert IGNORED_ADDRESS_HEADER_NOTE.startswith("default")
+    snapshot = dbs.control.read_sync(lambda conn: build_rules_snapshot(conn, 1_000.0))
+    assert set(IGNORED_ADDRESS_HEADERS) <= snapshot.ignored_value_headers
+
+
+def test_seed_version_2_reaches_a_database_seeded_at_version_1_and_adds_only_its_rows(dbs: Any) -> None:
+    """An install seeded before the address headers existed gets them on its next seed (deploy prestart), and only
+    them: a version 1 default the admin deleted stays deleted, an admin's own row for one of the names is kept."""
+    _seed(dbs)
+
+    def back_to_version_1(conn: sqlite3.Connection) -> None:
+        marks = ", ".join("?" for _ in IGNORED_ADDRESS_HEADERS)
+        conn.execute(f"DELETE FROM ignored_value_headers WHERE name IN ({marks})", IGNORED_ADDRESS_HEADERS)
+        conn.execute("DELETE FROM cache_ignored_params WHERE name = 'rand'")  # an admin removed a version 1 row
+        conn.execute("INSERT INTO ignored_value_headers (name, note) VALUES ('x-real-ip', 'mine')")
+        conn.execute(
+            "UPDATE service_state SET value_json = ? WHERE key = ?",
+            (json.dumps({"version": 1, "at": 1_000}), SEED_MARKER_KEY),
+        )
+
+    dbs.control.write_sync(back_to_version_1)
+    version_before = dbs.control.read_sync(read_config_version)
+    report = _seed(dbs, now=3_000)
+    assert not report.already_seeded
+    assert report.from_version == 1
+    assert report.inserted == {"ignored_value_headers": len(IGNORED_ADDRESS_HEADERS) - 1}
+    assert report.skipped == {"ignored_value_headers": 1}  # the admin's x-real-ip row stays as it is
+    assert report.config_version == version_before + 1
+    params = dbs.control.read_sync(lambda conn: {r[0] for r in conn.execute("SELECT name FROM cache_ignored_params")})
+    assert "rand" not in params
+    note = dbs.control.read_sync(
+        lambda conn: conn.execute("SELECT note FROM ignored_value_headers WHERE name = 'x-real-ip'").fetchone()[0]
+    )
+    assert note == "mine"
+    marker = dbs.control.read_sync(
+        lambda conn: conn.execute("SELECT value_json FROM service_state WHERE key = ?", (SEED_MARKER_KEY,)).fetchone()
+    )
+    assert json.loads(marker[0])["version"] == defaults.SEED_VERSION == 2
+    assert _seed(dbs, now=4_000).already_seeded
 
 
 def test_a_deleted_default_stays_deleted(dbs: Any) -> None:

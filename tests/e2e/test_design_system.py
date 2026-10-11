@@ -16,8 +16,9 @@ How it works
     `ui_server` and `open_page` come from tests/e2e/conftest.py; `wait_js` polls without eval (the strict CSP
     forbids it); `axe` runs the vendored axe-core 4.13.0 through the DevTools protocol. Phone tests use a touch
     context (`is_mobile`, `has_touch`), so the `pointer: coarse` rules apply as on a real phone. Gallery counters
-    (`/admin/_gallery/stats`) are shared by the session, so tests compare before and after values. Screenshots for
-    review are written to docs/screenshots/ only when ROXY_SCREENSHOTS=1.
+    (`/admin/_gallery/stats`) are shared by the session, so tests compare before and after values. Gallery
+    screenshots for review are written to .remake/p11_reports/shots/ (not shipped) only when ROXY_SCREENSHOTS=1;
+    the documentation screenshots of the real pages (docs/screenshots/) come from tests/e2e/test_docs_screenshots.py.
 
 What to read next
     tests/e2e/test_csp_spike.py, src/roxy/admin/gallery.py, templates/admin/_gallery/index.html.
@@ -499,8 +500,10 @@ def test_heatmap_shows_numbers_on_request(ui_server: Any, open_page: Any, wait_j
 
 
 def test_screenshots_for_review(ui_server: Any, open_page: Any, wait_js: Any, tmp_path: Path) -> None:
-    """Full-page screenshots in both themes at both sizes; into docs/screenshots/ when ROXY_SCREENSHOTS=1."""
-    out = REPO / "docs" / "screenshots" if os.environ.get("ROXY_SCREENSHOTS") == "1" else tmp_path
+    """Full-page screenshots in both themes at both sizes; into .remake/p11_reports/shots/ when ROXY_SCREENSHOTS=1
+    (the gallery is a development page: the documentation shows the real pages, test_docs_screenshots.py)."""
+    review = REPO / ".remake" / "p11_reports" / "shots"
+    out = review if os.environ.get("ROXY_SCREENSHOTS") == "1" else tmp_path
     out.mkdir(parents=True, exist_ok=True)
     for theme in ("dark", "light"):
         for name, size in (("1440", DESKTOP), ("390", PHONE)):

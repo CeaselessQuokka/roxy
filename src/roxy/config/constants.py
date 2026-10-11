@@ -216,6 +216,21 @@ ADMIN_SEEN_COOKIE_MAX_AGE_S: Final[int] = 180 * 86_400
 AUTO_IGNORE_MIN_REQUESTS: Final[int] = 500
 AUTO_IGNORE_UNIQUE_RATIO: Final[float] = 0.9
 
+# Reason: privacy, not a tunable. These headers carry client (or proxy) addresses, so a stored value, even a hash,
+# tells one client from another for `retention_fingerprints_days`. Their values are never kept in the fingerprint
+# tables (`metrics/fingerprints.py`), their names still are; `config/defaults.py` ships them as ignored value
+# headers so the dashboard lists them and says why, and the Security API refuses to record them again.
+CLIENT_ADDRESS_HEADERS: Final[tuple[str, ...]] = (
+    "x-forwarded-for",
+    "x-real-ip",
+    "forwarded",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "via",
+)
+
 # --- Data kept in code ------------------------------------------------------------------------------------------------
 
 # Reason: data, not a tunable. Path templating maps the segment before an id to a readable placeholder, so
@@ -365,6 +380,7 @@ __all__ = [
     "CACHEABLE_ERROR_STATUSES",
     "CACHE_PAGE_MAX",
     "CACHE_RULE_METHODS",
+    "CLIENT_ADDRESS_HEADERS",
     "CRAWLER_USER_AGENT_MARKERS",
     "CREDENTIAL_ALLOWLIST_METHODS",
     "DEFAULT_CACHE_RULE_TTL",

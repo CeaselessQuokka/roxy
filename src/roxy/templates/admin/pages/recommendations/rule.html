@@ -8,7 +8,7 @@
   threshold) as inline editors that save through the settings API with the usual review, reason and audit.
   Context: `frame` (its `settings` are the rule's catalog settings), `rule`, `active`, `active_total`.
 -#}
-{% from "components/page_card.html" import inline_setting %}
+{% from "components/page_card.html" import inline_setting, setting_reference %}
 {% from "components/badges.html" import badge, status_badge %}
 {% from "components/format.html" import caller_text %}
 <div class="rec-rule stack" id="{{ frame.id }}" data-card="{{ frame.id }}" data-rule="{{ rule.id }}">
@@ -47,7 +47,7 @@
     <h3 class="rec-section__title" id="{{ frame.id }}-tune">Tune this rule</h3>
     <p class="muted">Each threshold is an ordinary setting: it is checked, written to the audit log and in force on every worker within a second.</p>
     <div class="card-settings__list rec-rule__settings">
-      {% for entry in frame.settings %}{{ inline_setting(entry) }}{% endfor %}
+      {% for entry in frame.settings %}{% if entry.read_only %}{{ setting_reference(entry) }}{% else %}{{ inline_setting(entry) }}{% endif %}{% endfor %}
     </div>
   </section>
 </div>

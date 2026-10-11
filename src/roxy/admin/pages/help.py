@@ -3,14 +3,16 @@ what every page is for, plus the guides and runbooks at `/admin/help/<document>`
 
 What this is
     Four cards from the registry:
-      * `guide`: the admin guide. `docs/ADMIN_GUIDE.md` is not written yet, so the card says so and walks the plan
-        16.3 outline chapter by chapter, pointing to the pages, cards and documents that already cover each one;
-        then the documents this page renders (runbooks, architecture, security, learning path, performance) and the
-        incident runbook index, one entry per runbook name the alert emails link to (`#runbook-<name>`).
+      * `guide`: the admin guide (`docs/ADMIN_GUIDE.md`, a skeleton until the docs phase writes it): a link to it
+        and its contents, then the plan 16.3 outline chapter by chapter, pointing to the pages, cards and documents
+        that cover each one (the outline is the card's whole guide while the file is missing); then the documents
+        this page renders (runbooks, architecture, security, learning path, performance) and the incident runbook
+        index, one entry per runbook name the alert emails link to (`#runbook-<name>`).
       * `glossary`: every term of `docs/glossary.yml` (`#term-<id>`, where every dotted term on the dashboard
         links), with a filter.
-      * `shortcuts`: every keyboard shortcut (the same list the `?` overlay shows; the "go to" keys come from the page
-        registry).
+      * `keys`: every keyboard shortcut (the same list the `?` overlay shows; the "go to" keys come from the page
+        registry). Not `shortcuts`: that is the id of the shell's `?` overlay dialog, and two elements with one id
+        would make the `?` key open nothing on this page.
       * `pages`: "what does this page do" for every page, from the registry (purpose, how to read it, its cards).
     Extra routes: `GET /admin/help/<slug>` renders one document of `_help_docs.DOCS` with the shell around it:
     `/admin/help/runbooks#<anchor>` and `/admin/help/operations#<name>` are the links of the health checks.
@@ -215,11 +217,15 @@ async def guide_card(view: PageView) -> dict[str, Any]:
 @page.card("glossary")
 async def glossary_card(view: PageView) -> dict[str, Any]:
     """Every glossary term, sorted (`docs/glossary.yml`, loaded at startup)."""
-    entries = view.shell.context["glossary"] if view.shell else shell.glossary_of(view.request)
-    return {"terms": glossary_terms(entries)}
+    return {"terms": glossary_terms(view.glossary())}
 
 
-@page.card("shortcuts")
+SHORTCUTS_CARD: Final = "keys"
+"""The id of the shortcuts card (the registry's). Never `shortcuts`, the id of the shell's `?` overlay dialog
+(`admin/_layout/shortcuts.html`): `openDialog("shortcuts")` would find the card first and open nothing."""
+
+
+@page.card(SHORTCUTS_CARD)
 async def shortcuts_card(view: PageView) -> dict[str, Any]:
     """The shortcuts of the `?` overlay; the "go to" keys come from the page registry."""
     nav = registry.nav_model()
@@ -278,4 +284,4 @@ for _spec in DOCS:
     )
 
 
-__all__ = ["GENERAL_SHORTCUTS", "LIST_SHORTCUTS", "chapters", "page", "render_doc_page", "router"]
+__all__ = ["GENERAL_SHORTCUTS", "LIST_SHORTCUTS", "SHORTCUTS_CARD", "chapters", "page", "render_doc_page", "router"]

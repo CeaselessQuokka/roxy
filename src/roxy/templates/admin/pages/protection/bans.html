@@ -127,7 +127,7 @@
   {{ reason_field("dlg-prot-bans-detector-reason", required=True) }}
 {% endcall %}
 {% call confirm_dialog("dlg-prot-bans-all", "Delete every ban?", api.reset, confirm_label="Delete every ban", danger=True, api=True,
-                       type_to_confirm=previews.all.confirm_text, hidden={"scope": "all", "confirm": previews.all.confirm_text},
+                       type_to_confirm=previews.all.confirm_text, confirm_field="confirm", hidden={"scope": "all"},
                        success="Every ban was deleted.", on_success="refresh", refresh="bans",
                        consequences=["Deletes all " ~ num(previews.all.rows) ~ " bans (" ~ num(previews.all.active) ~ " in force): every banned client is answered normally again.",
                                      previews.all.leaves_alone ~ " are left alone. The reset is written to the audit log and marked on the charts."]) %}

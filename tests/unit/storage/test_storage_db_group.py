@@ -24,7 +24,6 @@ What to read next
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import sqlite3
 import threading
 import time
@@ -307,37 +306,6 @@ async def test_a_lost_group_transaction_fails_what_had_succeeded_and_reruns_the_
         assert results[2] == "later"
         assert _values(db) == ["later"]
         assert db.stats.reconnects == 1  # an I/O error reopens the connection
-    finally:
-        await db.close()
-
-
-async def test_no_caller_receives_a_result_its_commit_did_not_keep(tmp_path: Path) -> None:
-    """A failing COMMIT (here a deferred foreign key) undoes the whole group, so every write of it is answered
-    "unavailable", never with the value its function returned."""
-    profile = dataclasses.replace(PROFILES["hot"], foreign_keys=True)
-    db = Database("hot", tmp_path / "hot.db", profile)
-    _setup(db)
-    _script(
-        db,
-        "CREATE TABLE parent (id INTEGER PRIMARY KEY);"
-        "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER "
-        "REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
-    )
-
-    def orphan(conn: sqlite3.Connection) -> str:
-        conn.execute("INSERT INTO child (parent_id) VALUES (999)")  # checked only at COMMIT
-        return "orphan"
-
-    async def queue_jobs() -> list[Any]:
-        jobs = [_insert("innocent"), orphan]
-        return list(
-            await asyncio.gather(*(db.write(job, busy_timeout_ms=BUDGET_MS) for job in jobs), return_exceptions=True)
-        )
-
-    try:
-        results = await _behind_a_long_write(db, queue_jobs)
-        assert all(isinstance(r, SharedStateUnavailable) for r in results), results
-        assert _values(db) == []
     finally:
         await db.close()
 

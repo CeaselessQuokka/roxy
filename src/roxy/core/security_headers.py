@@ -210,6 +210,34 @@ def security_headers_for(scope: MutableMapping[str, Any], *, send_hsts: bool = F
     return [(name.encode("latin-1"), value.encode("latin-1")) for name, value in pairs]
 
 
+STATE_SEND_HSTS = "send_hsts"
+"""Key in `scope["state"]`: whether this app sends HSTS (the middleware's setting), for `secured_headers` callers."""
+
+
+def secured_headers(
+    scope: MutableMapping[str, Any], headers: Any, *, send_hsts: bool | None = None
+) -> list[tuple[bytes, bytes]]:
+    """A route's response `headers` (raw ASGI pairs) as this middleware sends them: its owned headers replaced by
+    `security_headers_for`, and under `/admin` `Cache-Control: no-store` (plan 9.3).
+
+    The middleware and `core/middleware.py response_head_bytes` (the caller byte metric, plan 14.3) both use it, so
+    the bytes counted are the headers sent. `send_hsts` None reads the middleware's choice from the scope state.
+    """
+    if send_hsts is None:
+        send_hsts = bool(_state(scope).get(STATE_SEND_HSTS))
+    admin = is_admin_path(str(scope.get("path", "")))
+    out = [
+        (name, value)
+        for name, value in headers
+        if name.lower() not in _OWNED and not (admin and name.lower() == b"cache-control")
+    ]
+    out.extend(security_headers_for(scope, send_hsts=send_hsts))
+    if admin:
+        # Admin data must never sit in a browser or proxy cache (plan 9.3).
+        out.append((b"cache-control", b"no-store"))
+    return out
+
+
 class SecurityHeadersMiddleware:
     """Pure ASGI middleware: nonce per request, security headers on every response (plan 9.2 and 9.3)."""
 
@@ -223,19 +251,11 @@ class SecurityHeadersMiddleware:
             return
         state = _state(scope)
         state[STATE_CSP_NONCE] = new_nonce()  # always new: a nonce reused across responses protects nothing
-        admin = is_admin_path(str(scope.get("path", "")))
+        state[STATE_SEND_HSTS] = self.send_hsts
 
         async def send_with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
-                headers = [
-                    (name, value)
-                    for name, value in message.get("headers", [])
-                    if name.lower() not in _OWNED and not (admin and name.lower() == b"cache-control")
-                ]
-                headers.extend(security_headers_for(scope, send_hsts=self.send_hsts))
-                if admin:
-                    # Admin data must never sit in a browser or proxy cache (plan 9.3).
-                    headers.append((b"cache-control", b"no-store"))
+                headers = secured_headers(scope, message.get("headers", []), send_hsts=self.send_hsts)
                 message = {**message, "headers": headers}
             await send(message)
 

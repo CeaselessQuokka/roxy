@@ -123,7 +123,8 @@ class PageView:
     tz: str
     prefs: dict[str, Any]
     latest: dict[str, dict[str, Any]]
-    shell: shell.Shell | None = None
+    page_shell: shell.Shell | None = None
+    """The whole shell, on a full page render (`Page.shell_view`); None for a fragment request."""
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -187,6 +188,16 @@ class PageView:
     def time_cell(self, ts: Any) -> dict[str, Any] | None:
         return fmt.time_cell(ts, self.tz, self.now)
 
+    def glossary(self) -> Any:
+        """The glossary loaded at startup: the shell's copy on a full page, else the app's (a fragment request)."""
+        return self.page_shell.context["glossary"] if self.page_shell else shell.glossary_of(self.request)
+
+    def table_request(self, table_id: str) -> bool:
+        """True for a request a table sent for itself (search, sort, page: htmx names the table in `HX-Target`).
+        A card holding that table may answer with the table alone; the table macro's `hx-select` keeps only the
+        table from a whole card anyway, so this is a saving, never a requirement."""
+        return self.in_fragment and self.request.headers.get("HX-Target") == table_id
+
 
 def card_frame(view: PageView, cdef: CardDef) -> dict[str, Any]:
     """The `frame` every card template receives (`components/page_card.html page_card(frame)`)."""
@@ -208,8 +219,7 @@ def card_frame(view: PageView, cdef: CardDef) -> dict[str, Any]:
 
 
 def _base_context(view: PageView) -> dict[str, Any]:
-    glossary = view.shell.context["glossary"] if view.shell else shell.glossary_of(view.request)
-    return {"view": view, "glossary": glossary, "tz": view.tz, "now": view.now, "time": view.time.view}
+    return {"view": view, "glossary": view.glossary(), "tz": view.tz, "now": view.now, "time": view.time.view}
 
 
 async def render_card(view: PageView, cdef: CardDef) -> Markup:
@@ -374,8 +384,10 @@ class Page:
             }
         )
 
-    async def render(self, request: Request, principal: AdminPrincipal) -> HTMLResponse:
-        """The whole page: the shell plus every card (lazy ones as placeholders)."""
+    async def shell_view(self, request: Request, principal: AdminPrincipal) -> tuple[PageView, shell.Shell]:
+        """The shell of this page and a `PageView` carrying it (`page_shell`): for the page itself and for any
+        whole page a module adds under its prefix (a drill-down page, a per-client page), so every full page is
+        built the same way."""
         built = await shell.build_shell(
             request,
             principal,
@@ -393,8 +405,13 @@ class Page:
             tz=built.tz,
             prefs=built.prefs,
             latest=built.facts.latest,
-            shell=built,
+            page_shell=built,
         )
+        return view, built
+
+    async def render(self, request: Request, principal: AdminPrincipal) -> HTMLResponse:
+        """The whole page: the shell plus every card (lazy ones as placeholders)."""
+        view, built = await self.shell_view(request, principal)
         shown = [cdef for cdef in self.cards() if not cdef.spec.fragment_only]
         eager = [cdef for cdef in shown if not cdef.lazy]
         rendered = await asyncio.gather(*(render_card(view, cdef) for cdef in eager))

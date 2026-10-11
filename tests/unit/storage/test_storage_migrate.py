@@ -460,6 +460,8 @@ def test_migrate_is_idempotent_and_records_versions(env) -> None:
             (5, "producer_history"),
             (6, "annotation_scope"),
             (7, "limit_samples"),
+            (8, "user_agent_detail"),
+            (9, "dashboard_read_indexes"),
         ]
         assert check_schema(dbs) == REQUIRED_SCHEMA
     finally:

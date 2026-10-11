@@ -169,9 +169,12 @@ def notable_events(
         where += " AND severity = ?"
         params.append(str(severity))
     total = int(conn.execute(f"SELECT count(*) FROM events WHERE {where}", params).fetchone()[0])  # noqa: S608
+    # `+at_ms`: order the few matching rows after reading them through `events_type_at`. Ordered by plain `at_ms`,
+    # SQLite walks `events_at_ms` back through every event of the window (refusals, failures, visits) looking for
+    # these rare types: 0.4 s over 90 days at plan 6.6's volume against 0.2 ms (plan 6.7).
     rows = conn.execute(
         f"SELECT id, at_ms, type, severity, reason_code, endpoint_template, detail_json FROM events "  # noqa: S608
-        f"WHERE {where} ORDER BY at_ms DESC, id DESC LIMIT ? OFFSET ?",
+        f"WHERE {where} ORDER BY +at_ms DESC, id DESC LIMIT ? OFFSET ?",
         (*params, max(1, min(int(limit), MAX_EVENTS_PAGE)), max(0, int(offset))),
     ).fetchall()
     return {
@@ -243,6 +246,12 @@ def recent_live(
     row 81). Ordered by event id, so `before_id` (the smallest id of the previous page) pages without gaps."""
     bound = max(1, min(int(limit), MAX_LIVE_ROWS))
     upper = int(before_id) if before_id is not None else (1 << 62)
+    # The newest rows are found by walking the table back in id order, which stops at once while requests arrive
+    # (live rows are the newest). With no live row left (no request for 15 minutes) that walk read the whole
+    # events table, 2 million rows at plan 6.6's cap (0.12 s per Live page, plan 6.7), so the `events_type_at`
+    # index is asked first whether there is any.
+    if conn.execute("SELECT 1 FROM events WHERE type = ? LIMIT 1", (LIVE_EVENT,)).fetchone() is None:
+        return []
     rows = conn.execute(
         "SELECT id, detail_json FROM events WHERE type = ? AND id < ? ORDER BY id DESC LIMIT ?",
         (LIVE_EVENT, upper, bound),

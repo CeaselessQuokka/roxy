@@ -169,8 +169,8 @@ TONE_OF_STATE: Final[dict[str, str]] = {
     "expired": "muted",
 }
 LIST_COLUMNS: Final = (
-    "severity",
     "title",
+    "severity",
     "state",
     "rule_id",
     "family",
@@ -313,13 +313,22 @@ def evidence_charts(details: Any) -> list[dict[str, Any]]:
                     rows.append((moment, {"value": float(entry)}))
                 elif isinstance(entry, Mapping):
                     numbers = {
-                        str(k): float(v) for k, v in entry.items() if isinstance(v, int | float) and not isinstance(v, bool)
+                        str(k): float(v)
+                        for k, v in entry.items()
+                        if isinstance(v, int | float) and not isinstance(v, bool)
                     }
                     if numbers:
                         rows.append((moment, numbers))
-        elif isinstance(value, list) and len(value) > 1 and all(
-            isinstance(p, list | tuple) and len(p) == 2 and isinstance(p[0], int | float) and isinstance(p[1], int | float)
-            for p in value
+        elif (
+            isinstance(value, list)
+            and len(value) > 1
+            and all(
+                isinstance(p, list | tuple)
+                and len(p) == 2
+                and isinstance(p[0], int | float)
+                and isinstance(p[1], int | float)
+                for p in value
+            )
         ):
             for point in value:
                 when = datetime.fromtimestamp(float(point[0]), UTC).strftime("%Y-%m-%dT%H:%MZ")
@@ -329,7 +338,10 @@ def evidence_charts(details: Any) -> list[dict[str, Any]]:
         rows = rows[-MAX_CHART_POINTS:]
         measures = sorted({measure for _, numbers in rows for measure in numbers})
         series = [
-            {"label": words_of(measure) if measure != "value" else words_of(name), "values": [n.get(measure, 0.0) for _, n in rows]}
+            {
+                "label": words_of(measure) if measure != "value" else words_of(name),
+                "values": [n.get(measure, 0.0) for _, n in rows],
+            }
             for measure in measures[:4]
         ]
         charts.append(
@@ -395,7 +407,10 @@ def rule_filter() -> list[tuple[str, str]]:
 
 async def list_filters_of(view: PageView) -> tuple[rec_api.ListFilters, dict[str, str], str | None]:
     """The list filters from the address (the API's names and values); a bad value falls back with a notice."""
-    raw = {name: view.state_param(name, max_chars=rec_api.FILTER_TEXT_MAX) for name in ("state", "severity", "family", "rule")}
+    raw = {
+        name: view.state_param(name, max_chars=rec_api.FILTER_TEXT_MAX)
+        for name in ("state", "severity", "family", "rule")
+    }
     try:
         filters = await rec_api.list_filters(
             state=raw["state"] or None,
@@ -433,7 +448,11 @@ async def list_card(view: PageView) -> dict[str, Any]:
                 "limit": 160,
                 "sub": "Safe to auto-apply" if item.get("safe_auto") else None,
             },
-            "state": {"text": STATE_WORDS.get(state, state), "tone": TONE_OF_STATE.get(state, "muted"), "sub": state_sub},
+            "state": {
+                "text": STATE_WORDS.get(state, state),
+                "tone": TONE_OF_STATE.get(state, "muted"),
+                "sub": state_sub,
+            },
             "rule_id": {"text": item.get("rule_id"), "mono": True},
             "family": FAMILY_WORDS.get(str(item.get("family")), item.get("family")),
             "subject": {"text": item.get("subject"), "caller": True, "limit": 120} if item.get("subject") else None,
@@ -463,7 +482,7 @@ async def list_card(view: PageView) -> dict[str, Any]:
         answer,
         src=view.fragment_url("list"),
         columns=LIST_COLUMNS,
-        key_columns=("severity", "title", "state"),
+        key_columns=("title", "severity", "state"),
         hidden=LIST_HIDDEN,
         cells=cells,
         row_id=lambda item: f"rec-{item.get('id')}",
@@ -544,7 +563,9 @@ async def history_card(view: PageView) -> dict[str, Any]:
         drawer=lambda item: detail_url(item.get("recommendation_id")),
         drawer_title=lambda item: "Recommendation",
         filters=[
-            filter_chip("action", "Action", action, [("", "Any action"), *((a, ACTION_WORDS[a]) for a in reads.ACTIONS)]),
+            filter_chip(
+                "action", "Action", action, [("", "Any action"), *((a, ACTION_WORDS[a]) for a in reads.ACTIONS)]
+            ),
             filter_chip("rule", "Rule", rule, rule_filter()),
         ],
         export_url=view.api_url("recommendations/history", time=False, **bounds),
@@ -601,7 +622,7 @@ async def rules_card(view: PageView) -> dict[str, Any]:
         answer,
         src=view.fragment_url("rules"),
         columns=RULE_COLUMNS,
-        key_columns=("id", "enabled", "open"),
+        key_columns=("id", "title", "enabled", "open"),
         cells=cells,
         row_id=lambda item: f"rule-{item.get('slug')}",
         drawer=drawer,
@@ -852,7 +873,10 @@ async def preview_context(view: PageView) -> dict[str, Any]:
             catalog.CATALOG[key].label for key in requires.get("high_risk_keys") or () if key in catalog.CATALOG
         ],
         "window": window,
-        "windows": [(key, {"1h": "Last hour", "6h": "Last 6 hours", "24h": "Last 24 hours"}[key]) for key in rec_api.PREVIEW_WINDOWS_S],
+        "windows": [
+            (key, {"1h": "Last hour", "6h": "Last 6 hours", "24h": "Last 24 hours"}[key])
+            for key in rec_api.PREVIEW_WINDOWS_S
+        ],
         "window_urls": {key: preview_url(rec_id, key) for key in rec_api.PREVIEW_WINDOWS_S},
         "report": report,
         "computed": fmt.local_time(report.get("computed_at"), view.tz) if report.get("computed_at") else None,

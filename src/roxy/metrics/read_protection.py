@@ -10,7 +10,8 @@ What this is
       * `refusal_attempts(conn, reason, ...)`: refusals of one reason grouped by path (the v1 "Blocked Endpoint
         Attempts", "Rate-Limited Attempts" and "Header-Blocked Attempts" tables, parity row 75), paged in SQL.
       * `spam_events(conn, ...)` and `would_ban_subjects(conn, ...)`: the spam detectors' decisions and dry-run
-        results (plan 10.3), the input of the FILTER-COLLATERAL preview.
+        results (plan 10.3), the input of the FILTER-COLLATERAL preview; `spam_points(conn, window, ...)`: the
+        same decisions per detector per bucket, the detector timelines of plan 10.9.
       * `watch_activity(conn, keys, since=, now=)`: v1's throttle-all watch columns (requests and refusals since
         the state began, rates, busiest endpoint, last seen) for one page of watched clients (parity row 135).
       * `rule_hit_columns`, `rule_hit_totals`, `rule_hit_points`: per-rule hits in a range, the lifetime count and
@@ -460,6 +461,65 @@ def spam_counts(conn: sqlite3.Connection, start_ms: int, end_ms: int) -> dict[st
     return out
 
 
+MAX_SPAM_POINT_GROUPS: Final = 200_000
+"""Most (detector, time slice) groups one detector timeline reads (plan P9); beyond it the answer says it is partial."""
+
+
+def spam_points(
+    conn: sqlite3.Connection,
+    window: Window,
+    *,
+    kinds: Sequence[str] = SPAM_EVENTS,
+    detector: str | None = None,
+    limit: int = MAX_SPAM_POINT_GROUPS,
+) -> dict[str, Any]:
+    """The detector timelines (plan 10.9): spam detector decisions per detector per bucket of `window`.
+
+    `{"series": {detector label: [[bucket start, decisions], ...]}, "totals": {label: n}, "partial": bool}`, zeros
+    included, one entry per detector that decided anything in the window (or only `detector`, a label such as
+    `SPAM-RATE`), labels sorted. A decision is one of the detectors' event rows (`SPAM_EVENTS`, or `kinds`: what
+    `abuse/spam.py` records when a detector acts or would act), weighted by its `count` (a row folded over the event
+    budget holds several), the same rows the decisions table and `spam_counts` read, so the totals agree. No new
+    write: the events already carry the time and the detector.
+
+    The rows are grouped in SQL by minute (by quarter hour for day and longer buckets, which every time zone offset
+    divides) through the `events_type_at` index, then folded into the window's buckets in its zone like the rule hit
+    timeline. At most `limit` groups are read (`partial` True when the cap was reached).
+    """
+    wanted = [kind for kind in kinds if kind in SPAM_EVENTS]
+    starts = bucket_starts(window)
+    if not wanted or not starts:
+        return {"series": {}, "totals": {}, "partial": False}
+    index = {start: i for i, start in enumerate(starts)}
+    zi = zone(window.tz)
+    slice_ms = 60_000 if window.granularity in ("minute", "hour") else 900_000
+    marks = ", ".join("?" for _ in wanted)
+    where = f"type IN ({marks}) AND at_ms >= ? AND at_ms < ?"
+    params: list[Any] = [*wanted, int(window.start) * 1000, int(window.end) * 1000]
+    if detector:
+        where += " AND json_extract(detail_json, '$.detector') = ?"
+        params.append(detector)
+    cap = max(1, int(limit))
+    rows = conn.execute(
+        f"SELECT json_extract(detail_json, '$.detector') AS detector, at_ms / ? AS slice, {_COUNT} AS n "  # noqa: S608
+        f"FROM events WHERE {where} GROUP BY detector, slice LIMIT ?",
+        (slice_ms, *params, cap),
+    ).fetchall()
+    values: dict[str, list[int]] = {}
+    for row in rows:
+        label = str(row["detector"] or "unknown")[:32]
+        slot = index.get(bucket_floor(int(row["slice"]) * slice_ms // 1000, window.granularity, zi))
+        if slot is None:
+            continue
+        values.setdefault(label, [0] * len(starts))[slot] += int(row["n"] or 0)
+    series = {
+        label: [[start, value] for start, value in zip(starts, found, strict=True)]
+        for label, found in sorted(values.items())
+    }
+    totals = {label: sum(found) for label, found in sorted(values.items())}
+    return {"series": series, "totals": totals, "partial": len(rows) >= cap}
+
+
 def would_ban_subjects(
     conn: sqlite3.Connection, start_ms: int, end_ms: int, *, limit: int = MAX_GROUPS
 ) -> list[dict[str, Any]]:
@@ -533,6 +593,7 @@ __all__ = [
     "ATTEMPT_SORTS",
     "CHECK_REASONS",
     "MAX_GROUPS",
+    "MAX_SPAM_POINT_GROUPS",
     "SPAM_EVENTS",
     "TIER_EVENT",
     "UA_RULE_HIT_EVENT",
@@ -547,6 +608,7 @@ __all__ = [
     "rule_hit_totals",
     "spam_counts",
     "spam_events",
+    "spam_points",
     "subject_events",
     "tier_hits",
     "ua_rule_hits",

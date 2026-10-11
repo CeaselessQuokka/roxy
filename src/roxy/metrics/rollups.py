@@ -34,6 +34,9 @@ How it works
       minutes rolled into hours and hours into local days, each capped the same way. A third type, `pair`
       (`PAIR_CLIENT_TYPE`, key `<ip>|<place>`), records which IP called as which place (v1's peer columns) and is
       capped like the IPs.
+    - A ranged data reset deletes the rows whose bucket starts in its range at every level; the coarse buckets it
+      covers only in part are then recomputed from the trimmed finer level (`rebuild_partial_buckets`), so a total
+      read from days and hours agrees with the minutes (plan 6.8).
 
 What to read next
     `roxy/metrics/histograms.py` (the merge function), `roxy/metrics/jobs.py` (the leader job that calls
@@ -636,9 +639,16 @@ async def _compact_clients(
     caps = config.caps
 
     def prepare(conn: sqlite3.Connection, start: int, end: int) -> None:
-        cap_clients(conn, "client_minute", caps, start, end)  # plan 6.4: minutes are capped before they roll up
-        if spec.src != "client_minute":
-            cap_clients(conn, spec.src, caps, start, end)
+        if spec.src == "client_minute":
+            cap_clients(conn, "client_minute", caps, start, end)  # plan 6.4: minutes are capped before they roll up
+            return
+        cap_clients(conn, spec.src, caps, start, end)
+        # A day reads minutes only for the partial hours at its edges (a half-hour zone); every other minute of it
+        # was capped when its hour was compacted. Capping the day's minutes on every run scanned a whole day of
+        # client minutes once a minute on the leader (plan 6.7, the gaps_latency trace).
+        for lo, hi in ((start, min(end, bucket_next(start, "hour"))), (max(start, end - end % HOUR_S), end)):
+            if lo < hi and (lo % HOUR_S or hi % HOUR_S):
+                cap_clients(conn, "client_minute", caps, lo, hi)
 
     def finish(conn: sqlite3.Connection, start: int, end: int) -> None:
         cap_clients(conn, spec.dst, caps, start, end)
@@ -653,3 +663,131 @@ async def _compact_clients(
         prepare=prepare,
         finish=finish,
     )
+
+
+# ----------------------------------------------------------------------------------- after a ranged reset
+
+
+REBUILD_CHAINS: dict[str, tuple[str, ...]] = {
+    "rollup": ("rollup_hour", "rollup_day", "rollup_month"),
+    "egress": ("egress_hour", "egress_day", "egress_month"),
+    "client": ("client_hour", "client_day"),
+}
+"""The levels a ranged reset leaves partly covered, per family of tables, finest first (each is rebuilt from the
+level before it, which is already right)."""
+
+REBUILD_TABLES: dict[str, frozenset[str]] = {
+    "rollup": frozenset({"rollup_minute", "rollup_hour", "rollup_day", "rollup_month"}),
+    "egress": frozenset({"egress_usage"}),
+    "client": frozenset({"client_minute", "client_hour", "client_day"}),
+}
+"""The tables of each chain: a ranged reset that changed one of them rebuilds that chain's partial buckets."""
+
+
+@dataclass(frozen=True, slots=True)
+class SourceFloors:
+    """The oldest time each source level still holds whole (its retention, as the compaction's `not_before`): a
+    bucket that starts earlier cannot be rebuilt from it. None is "kept forever"."""
+
+    minute: int | None = None
+    hour: int | None = None
+    day: int | None = None
+    client_minute: int | None = None
+    client_hour: int | None = None
+
+    def of(self, spec: LevelSpec) -> int | None:
+        """The floor of the level `spec` is computed from."""
+        value: int | None = getattr(self, _SOURCE_FLOOR[spec.name])
+        return value
+
+
+_SOURCE_FLOOR: dict[str, str] = {
+    "rollup_hour": "minute",
+    "rollup_day": "hour",
+    "rollup_month": "day",
+    "egress_hour": "minute",
+    "egress_day": "hour",
+    "egress_month": "day",
+    "client_hour": "client_minute",
+    "client_day": "client_hour",
+}
+"""`SourceFloors` field of the level each compacted level is computed from."""
+
+
+def straddling_buckets(unit: str, start: int, end: int, tz: ZoneInfo | None) -> list[tuple[int, int]]:
+    """The buckets of `unit` that hold part of `[start, end)` and part of the time outside it (at most two: the one
+    around `start` and the one around `end`)."""
+    out: list[tuple[int, int]] = []
+    for edge in (start, end):
+        first = bucket_floor(edge, unit, tz)
+        if first != edge:
+            bucket = (first, bucket_next(first, unit, tz))
+            if bucket not in out and bucket[0] < end and bucket[1] > start:
+                out.append(bucket)
+    return out
+
+
+def rebuild_partial_buckets(
+    conn: sqlite3.Connection,
+    chain: str,
+    start: int,
+    end: int,
+    *,
+    tz_name: str,
+    closed_until: int,
+    floors: SourceFloors,
+    caps: ClientCaps | None = None,
+) -> list[tuple[str, int]]:
+    """After a reset deleted `[start, end)` from every level of `chain`, make each coarser level agree with the finer
+    one again (plan 6.8: a reset's effect is the same at every granularity). Returns the `(level, bucket)` rebuilt.
+
+    A ranged reset deletes the rows whose bucket STARTS in the range at every level, so a coarse row that only partly
+    overlaps the range kept the reset part (it started before the range) or lost the time after the range (it started
+    inside it), while the finer level was trimmed exactly. Totals read whole days and hours from the coarse levels
+    (`queries.total_pieces`), so they disagreed with the minutes. Each partly covered bucket is recomputed from the
+    level below it (`recompute_bucket`, the compaction's own step; client buckets capped like the compaction caps
+    them), finest level first, so a day is rebuilt from hours already right. A bucket is left as it is when the level
+    below no longer holds all of it (its retention, `floors`), when it is not complete yet (`closed_until` for hours;
+    the source level's newest compacted bucket for days and months), when the compaction has not reached it (no row
+    of its level at or after it: the compaction computes it from the trimmed level below later), or when its row was
+    computed in another zone. Idempotent; run in one transaction."""
+    rebuilt: list[tuple[str, int]] = []
+    for level in REBUILD_CHAINS[chain]:
+        spec = LEVELS[level]
+        tz = zone(tz_name) if spec.unit != "hour" else None
+        if spec.unit == "hour":
+            complete = closed_until
+        else:
+            source = LEVELS[REBUILD_CHAINS[chain][REBUILD_CHAINS[chain].index(level) - 1]]
+            mark = watermark(conn, source)
+            if mark is None:
+                continue
+            complete = bucket_next(mark[0], source.unit, zone(mark[1]) if source.has_tz else None)
+        floor = floors.of(spec)
+        own = watermark(conn, spec)
+        for bucket_start, bucket_end in straddling_buckets(spec.unit, start, end, tz):
+            if bucket_end > complete or (floor is not None and bucket_start < floor):
+                continue
+            if own is None or own[0] < bucket_start:
+                # The compaction has not reached this bucket (or the reset deleted every row from it on): it
+                # computes it from the trimmed level below when it gets there. Writing it here would move this
+                # level's watermark past buckets the compaction has not made yet.
+                continue
+            if spec.edge_src is not None and (bucket_start % HOUR_S or bucket_end % HOUR_S):
+                edge_floor = floors.client_minute if chain == "client" else floors.minute
+                if edge_floor is not None and bucket_start < edge_floor:
+                    continue  # a half-hour zone's edge minutes are gone
+            if spec.has_tz:
+                row = conn.execute(
+                    f"SELECT tz FROM {spec.dst} WHERE {_and(spec.dst_filter, 'bucket_start = ?')} LIMIT 1",  # noqa: S608
+                    (bucket_start,),
+                ).fetchone()
+                if row is not None and (row[0] or "UTC") != (tz_name or "UTC"):
+                    continue  # computed in the zone before a change: its bucket is not this one
+            if chain == "client" and caps is not None:
+                cap_clients(conn, spec.src, caps, bucket_start, bucket_end)
+            recompute_bucket(conn, spec, bucket_start, bucket_end, tz_name)
+            if chain == "client" and caps is not None:
+                cap_clients(conn, spec.dst, caps, bucket_start, bucket_end)
+            rebuilt.append((level, bucket_start))
+    return rebuilt

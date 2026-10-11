@@ -1,11 +1,12 @@
 {#-
   Traffic page, card `requests` (`roxy/admin/pages/traffic.py requests_card`; plan 14.1 row 7, v1 "Traffic").
 
-  The totals of the range (summed from the chart's own points, so they always add up to the chart) and requests
-  over time stacked by outcome. The series is embedded (`series_chart(series=...)`): the chart draws on first paint
-  without asking the API again; its comparison overlay, change markers and partial-data notices come with it.
+  The totals of the range (summed on the server from the chart's own answer, so they always add up to the chart)
+  and requests over time stacked by outcome. The chart reads `GET /admin/api/v1/traffic/requests` by URL right after
+  the first paint (`src=chart_src`, the answer the totals come from), with its comparison overlay, change markers and
+  partial-data notices: embedded, a day of minute points was half of the page's HTML (plan 6.7, gaps_latency L4).
   Actions: "Last 60 minutes" (v1's view of this chart) and the inline reset of the traffic numbers (plan 6.8).
-  Context: `frame`, `answer`, `stats`, `summary`, `series_options`, `reset_href`, `last_hour_href`, `range_label`.
+  Context: `frame`, `chart_src`, `stats`, `summary`, `series_options`, `reset_href`, `last_hour_href`, `range_label`.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/chart.html" import series_chart %}
@@ -25,5 +26,5 @@
   </div>
   {% endfor %}
 </dl>
-{{ series_chart("traffic-requests-chart", "Requests by outcome", series=answer, summary=summary, help="Each band is one outcome; the top line is every request. With a comparison chosen, the dashed lines are the earlier period.", size="lg", kind="area", stack="outcome", series_options=series_options, y_format="count", empty_text="No requests in this range yet. Requests appear here a few seconds after Roxy answers them.") }}
+{{ series_chart("traffic-requests-chart", "Requests by outcome", src=chart_src, summary=summary, help="Each band is one outcome; the top line is every request. With a comparison chosen, the dashed lines are the earlier period.", size="lg", kind="area", stack="outcome", series_options=series_options, y_format="count", empty_text="No requests in this range yet. Requests appear here a few seconds after Roxy answers them.") }}
 {% endcall %}

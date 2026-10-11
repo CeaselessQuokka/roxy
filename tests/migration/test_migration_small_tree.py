@@ -8,6 +8,7 @@ from typing import Any
 
 from v1_migration_helpers import by_key, load_report, rows
 
+from roxy.config.constants import CLIENT_ADDRESS_HEADERS
 from roxy.config.defaults import DEFAULT_TIER_MESSAGE
 from roxy.migration.report import ALREADY, IMPORTED, INVALID, REPLACED_DEFAULT, SKIPPED, write_report
 from roxy.migration.runner import MARKER_KEY
@@ -70,7 +71,9 @@ async def test_migration_small_tree(v1: Any, ws: Any, migrate: Any, fake_clock: 
 
     ignored = {row["name"]: row for row in rows(control, "SELECT * FROM ignored_value_headers")}
     assert ignored["x-amz-cf-id"]["auto"] == 1
-    assert len(ignored) == 10
+    # 10 from v1 and the version 1 defaults, plus the client address headers seed version 2 ships (gap G5).
+    assert len(ignored) == 10 + len(CLIENT_ADDRESS_HEADERS)
+    assert all(ignored[name]["note"].startswith("default:") for name in CLIENT_ADDRESS_HEADERS)
 
     access = rows(control, "SELECT * FROM access_list")
     assert [(row["kind"], row["cidr"]) for row in access] == [("bypass", "198.51.100.7/32")]

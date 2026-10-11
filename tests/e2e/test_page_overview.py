@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.pages.testing import THEMES, VIEWPORTS, seed_recommendation
+from pages_harness import THEMES, VIEWPORTS, seed_recommendation
 
 PAGE = "/admin/overview"
 NO_HOSTILE_MARKUP = """() => !document.querySelector('img[src="x"], [onerror], [onclick], a[href^="javascript:"]')
@@ -89,6 +89,19 @@ def test_a_top_recommendation_opens_its_drawer(open_admin: Any, dashboard: Any) 
         dashboard.change_settings({"insight_up_429_endpoint_enabled": 1})
 
 
+@pytest.mark.parametrize("theme", THEMES)
+def test_the_visits_reset_opens_its_preview_in_the_drawer(open_admin: Any, theme: str) -> None:
+    admin = open_admin(PAGE, theme=theme, width=390, height=844)
+    page = admin.page
+    page.locator('#visitors [data-action="visits-reset"]').click()
+    admin.wait("document.querySelector('#drawer[open] [data-reset=\"visits\"]') !== null")
+    assert "visits" in page.locator("#drawer [data-reset]").inner_text()
+    assert not admin.overflows()
+    assert admin.axe() == []
+    admin.shot("overview-reset")
+    admin.assert_clean()
+
+
 def test_check_proxy_health_starts_a_run_and_opens_it(open_admin: Any, dashboard: Any) -> None:
     dashboard.change_settings({"health_auto_interval_h": 0})
     admin = open_admin(PAGE)
@@ -98,7 +111,8 @@ def test_check_proxy_health_starts_a_run_and_opens_it(open_admin: Any, dashboard
     admin.settle()
     admin.wait("document.querySelector('#run [data-run-id]') !== null")
     run_id = page.locator("#run [data-run-id]").first.get_attribute("data-run-id")
-    assert run_id and run_id.isdigit()
+    assert run_id
+    assert run_id.isdigit()
     # The run finishes on its own (local checks answer at once; outside calls are refused by the test guard).
     admin.wait("document.querySelector('#run [data-run-state=\"finished\"]') !== null", timeout=120)
     admin.assert_clean(expected=["status of 409"])

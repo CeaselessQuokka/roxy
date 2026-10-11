@@ -43,7 +43,7 @@
   <div class="field-row">
     <div class="field">
       <label class="field__label" for="cache-ignore-name">Parameter name</label>
-      <input class="input mono" id="cache-ignore-name" name="name" required maxlength="400" autocomplete="off" spellcheck="false" placeholder="t" data-json="string" aria-describedby="cache-ignore-name-hint cache-ignore-name-error">
+      <input class="input mono" id="cache-ignore-name" name="name" required maxlength="400" autocomplete="off" spellcheck="false" placeholder="for example: t" data-json="string" aria-describedby="cache-ignore-name-hint cache-ignore-name-error">
       <p class="field__hint" id="cache-ignore-name-hint">The exact name as it appears in the query string. Case-sensitive.</p>
       <p class="field__error" id="cache-ignore-name-error" data-field-error="name" hidden></p>
     </div>
@@ -62,7 +62,7 @@
   <h3 class="cache-fact__title" id="ignored-suspects-title">Splitting answers right now</h3>
   <ul class="cache-suggest">
     {% for s in suspects %}
-    <li><button type="button" class="btn btn--sm btn--warn-soft" data-fill-form="cache-ignore-form" data-fill='{{ {"name": s.param}|tojson }}'><code class="mono">{{ s.param }}</code></button>
+    <li><button type="button" class="btn btn--sm btn--warn-soft" data-fill-form="cache-ignore-form" data-fill='{{ {"name": s.param}|tojson }}'><code class="mono">{{ caller_text(s.param, 60) }}</code></button>
       <span class="muted">on {{ caller_text(s.path, 120) }}: {{ num(s.entries) }} answers, {{ num(s.hits) }} reused</span></li>
     {% endfor %}
   </ul>
@@ -70,7 +70,7 @@
 {% endif %}
 {% if suggestions %}
 <p class="cache-suggest-line"><span class="muted">Commonly used as cache busters (press one to fill the form):</span>
-  {% for name in suggestions %}<button type="button" class="btn btn--sm btn--ghost cache-chip" data-fill-form="cache-ignore-form" data-fill='{{ {"name": name}|tojson }}'><code class="mono">{{ name }}</code></button>{% endfor %}
+  {% for name in suggestions %}<button type="button" class="btn btn--sm cache-chip" data-fill-form="cache-ignore-form" data-fill='{{ {"name": name}|tojson }}'><code class="mono">{{ name }}</code></button>{% endfor %}
 </p>
 {% endif %}
 {% endcall %}

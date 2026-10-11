@@ -503,7 +503,7 @@ SETTINGS: list[SettingSpec] = [
             RiskCondition(
                 RiskOp.GT,
                 32 * _MIB,
-                "With 2 workers and the default systemd cap of MemoryMax=420M per color, more than 32 MiB per "
+                "With 2 workers and the default systemd cap of MemoryMax=500M per color, more than 32 MiB per "
                 "worker can push a color over its cap, and the kernel then kills workers mid-request.",
             ),
         ),
@@ -512,8 +512,8 @@ SETTINGS: list[SettingSpec] = [
         related_recommendations=("SEC-DEFAULTS",),
         v1_default=8 * _MIB,
         notes=(
-            "The default (16 MiB) is sized for a server with about 1 GB of RAM (systemd MemoryHigh=320M and "
-            "MemoryMax=420M per color); the plan's 64 MiB suits a 2 GB server with a higher cap. Migration "
+            "The default (16 MiB) is sized for a server with about 1 GB of RAM (systemd MemoryHigh=420M and "
+            "MemoryMax=500M per color); the plan's 64 MiB suits a 2 GB server with a higher cap. Migration "
             "imports a v1 value only when it differs from the v1 default (8 MiB) and is larger than this default."
         ),
     ),

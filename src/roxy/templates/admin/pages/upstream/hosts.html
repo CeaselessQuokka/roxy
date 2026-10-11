@@ -6,7 +6,6 @@
   all (`strict_host_allowlist`, `allowed_roblox_hosts`: the card's settings, below).
   Context: `frame`, `table`, `strict`, `allowed`.
 -#}
-{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
 {% from "components/page_card.html" import page_card %}
 {% from "components/table.html" import data_table %}
 {% from "components/badges.html" import badge %}
@@ -17,4 +16,3 @@
 </p>
 <div class="g3-table-host" hx-select="#{{ table.id }}">{{ data_table(**table) }}</div>
 {% endcall %}
-{% endif %}

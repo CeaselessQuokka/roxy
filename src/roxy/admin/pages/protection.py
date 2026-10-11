@@ -4,7 +4,8 @@ What this is
     The largest dashboard page: twenty registry cards plus one card per spam detector, in six groups (the "On this
     page" list at the top links them):
       * Overview: `pipeline` (every check in order with its refusals in the range, plan 10.9, row 5) and
-        `refusals` (v1 "Refusal Reasons" with the custom or default message split, rows 10, 72, 116).
+        `refusals` (v1 "Refusal Reasons" with the custom or default message split, rows 10, 72, 116; and the
+        clients refused most, plan 10.9, read with the Clients page's own `client_table_answer`).
       * Limits: `throttle` (the per-IP limit, who is throttled now, the throttled history, the limiter reset; rows 6,
         26, 118), `ladder` (the ladder editor, rung hits, restore defaults and v1's repeat offender simulation; rows
         40, 76, 125), `strikes` (the strike board with forgive; row 41), `throttle-all` (the emergency limit and who
@@ -50,20 +51,27 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import logging
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any, Final, Literal, cast
 from urllib.parse import urlencode
 
 from roxy.abuse.read_bans import AUTO_DETECTORS
 from roxy.abuse.throttle import decays_in, effective_strikes, ladder_from, load_strike_rows, rung_for
+from roxy.admin.api import clients as clients_api
 from roxy.admin.api import common
+from roxy.admin.api import data as data_api
 from roxy.admin.api import protection as prot
 from roxy.admin.api.common import API_PREFIX, TableQuery, TableSpec
 from roxy.admin.pages import _protection_views as pv
 from roxy.admin.pages import shell
+from roxy.admin.pages.clients import canonical_ip, client_href
 from roxy.admin.pages.kit import Page, PageView, filter_chip, table_query, table_view
 from roxy.config.constants import MAX_THROTTLE_MULTIPLIER, MAX_THROTTLE_TIERS, TARPIT_CATEGORIES
-from roxy.metrics import read_producers
+from roxy.metrics import queries, read_producers
+
+log = logging.getLogger("roxy.admin.pages")
 
 page = Page("protection", stream_events=(*shell.DEFAULT_STREAM_EVENTS, "kpi"))
 router = page.router
@@ -83,12 +91,19 @@ LIMIT_REASONS: Final[tuple[str, ...]] = (
 BAN_STATES: Final[tuple[str, ...]] = ("active", "expired", "all")
 BAN_ORIGINS: Final[tuple[str, ...]] = ("any", "manual", "auto")
 BAN_SUBJECTS: Final[tuple[str, ...]] = ("", "ip", "cidr", "place", "ua_hash")
+SUBJECT_LABELS: Final[dict[str, str]] = {"ip": "Address", "cidr": "Network", "place": "Place", "ua_hash": "User-Agent"}
+"""The words for a ban's subject type (the API's `ip`, `cidr`, `place`, `ua_hash`), as the Type filter says them."""
+ORIGIN_LABELS: Final[dict[str, str]] = {"manual": "An admin", "auto": "A detector"}
+"""Who made a ban (the API's `manual` or `auto`), as the "Made by" filter says it."""
 SPAM_KINDS: Final[tuple[str, ...]] = ("all", "would_ban", "ban", "strike", "tarpit", "recommend")
 TARPIT_WINDOWS: Final[tuple[tuple[str, int], ...]] = (("15m", 900), ("1h", 3600), ("24h", 86_400))
 """v1's "Last 15m", "Last hour" and "Last 24h" tarpit figures (now fleet-wide, from the hold statistics history)."""
 MAX_WORKER_ROWS: Final = 25
 """Rows of the per-worker tarpit tables shown ("why each hold happened", "callers held"), busiest first."""
 MAX_DETAIL_CHARS: Final = 80
+REFUSED_CLIENTS_SORT: Final = "refused"
+REFUSED_CLIENTS_ROWS: Final = 10
+"""The "Clients refused most" tab: the Clients page's address table, most refusals first, ten rows at first."""
 
 
 # ============================================================================================ table plumbing
@@ -216,6 +231,97 @@ def _not_found(what: str) -> common.ApiError:
     return common.not_found(f"No {what} has that id. It may have been removed; close this and refresh the card.")
 
 
+CLEARS: Final[dict[str, dict[str, Any]]] = {
+    "refusals": {
+        "button": "Clear refusal records",
+        "title": "Clear the refusal records?",
+        "consequences": [
+            "Every refusal record goes: each reason's last status and path, its clients, first and last seen and "
+            "the message split start again from the next refusal (v1's Clear data on Refusal Reasons).",
+            "The counts per reason stay: they are part of the traffic totals (the Data page resets those). The "
+            "attempts tabs of the endpoint blocks, endpoint rules and request filters read these records, so they "
+            "start again too. Rules, bans and lists stay.",
+        ],
+    },
+    "throttled_clients": {
+        "button": "Clear throttled clients",
+        "title": "Clear the throttled clients list?",
+        "consequences": [
+            "The list of clients that became throttled starts again from the next throttle (v1's Clear data on "
+            "Throttled IPs).",
+            "Strikes and running penalties stay: forgive or reset a client for those.",
+        ],
+    },
+    "throttle_rule_hits": {
+        "button": "Clear stats",
+        "title": "Clear the ladder and User-Agent rule statistics?",
+        "consequences": [
+            "The new strikes per rung and the User-Agent rules' allowed and refused counts start again from zero "
+            "(v1's Clear stats on Throttle Rules).",
+            "The ladder, the rules and every caller's strikes stay.",
+        ],
+    },
+    "tarpit": {
+        "button": "Clear stats",
+        "title": "Clear the tarpit statistics?",
+        "consequences": [
+            "Holds, skips, hold lengths and the gaps between requests start again from zero, in every worker within "
+            "a few seconds (v1's Clear stats on the Tarpit).",
+            "The tarpit settings stay, and holds in progress finish normally.",
+        ],
+    },
+    "endpoint_block_attempts": {
+        "button": "Clear attempts",
+        "title": "Clear the blocked endpoint attempts?",
+        "consequences": [
+            "The requests the endpoint blocks refused are forgotten (v1's Clear data on Blocked Endpoint Attempts).",
+            "The blocks stay and keep refusing; the other attempts tabs stay.",
+        ],
+    },
+    "endpoint_rule_attempts": {
+        "button": "Clear attempts",
+        "title": "Clear the rate-limited attempts?",
+        "consequences": [
+            "The requests the endpoint rules refused are forgotten (v1's Clear data on Rate-Limited Attempts).",
+            "The rules stay and keep limiting; the other attempts tabs stay.",
+        ],
+    },
+    "header_rule_attempts": {
+        "button": "Clear attempts",
+        "title": "Clear the header-blocked attempts?",
+        "consequences": [
+            "The requests the request filters refused are forgotten (v1's Clear data on Header-Blocked Attempts).",
+            "The filters stay and keep refusing; the other attempts tabs stay.",
+        ],
+    },
+}
+"""v1's per-section clear buttons of this page's sections (v1 notes 2.10 and 4.3, 4.11), as plan 6.8 data resets of
+the family each v1 target maps to (`admin/api/data.py V1_CLEAR_TARGETS`)."""
+
+
+def clear_action(view: PageView, family: str) -> dict[str, Any]:
+    """The dialog of one v1 clear button: `POST /admin/api/v1/data/resets` for the metric family `family`, with the
+    preview digest and typed phrase of the Data API's own plan (`build_plan`, no I/O), so the dialog can run only the
+    scope it shows. A plan that cannot be built leaves the digest empty and the dialog says so."""
+    phrase = f"reset {family}"
+    digest = None
+    try:
+        body = data_api.ResetBody.model_validate({"scope": "family", "families": [family]})
+        plan = data_api.build_plan(body, view.ctx, view.ctx.clock.now())
+        digest, phrase = plan.digest, plan.confirm_phrase or phrase
+    except (common.ApiError, ValueError):
+        log.warning("protection_clear_unavailable", extra={"fields": {"family": family}})
+    return {
+        "id": "dlg-prot-clear-" + family.replace("_", "-"),
+        "family": family,
+        "phrase": phrase,
+        "digest": digest,
+        "note": data_api.FAMILIES[family].note,
+        "success": "Cleared. The reset is in the audit log and marked on the charts.",
+        **CLEARS[family],
+    }
+
+
 # ============================================================================================ overview
 
 
@@ -228,7 +334,21 @@ async def pipeline_card(view: PageView) -> dict[str, Any]:
 
 @page.card("refusals", lazy=True)
 async def refusals_card(view: PageView) -> dict[str, Any]:
-    """v1 "Refusal Reasons" (`refusals_answer`): count, status, last path, clients, first and last seen, message."""
+    """v1 "Refusal Reasons" (`refusals_answer`): count, status, last path, clients, first and last seen, message;
+    and the clients refused most in the range (plan 10.9 "top refused clients", the Clients page's own read)."""
+    which = only_table(view, ("refusals", "clients"))
+    tables: dict[str, Any] = {}
+    if which in (None, "refusals"):
+        tables["refusals"] = await _refusal_reasons_table(view)
+    if which in (None, "clients"):
+        tables["clients"] = await _refused_clients_table(view)
+    context: dict[str, Any] = {"only": which, "tables": tables}
+    if which is None:
+        context["clear"] = clear_action(view, "refusals")
+    return context
+
+
+async def _refusal_reasons_table(view: PageView) -> dict[str, Any]:
     tq, notice = query_for(view, prot.REFUSALS_SPEC, "refusals")
     answer = await prot.refusals_answer(view.ctx, tq, view.tr)
 
@@ -239,31 +359,80 @@ async def refusals_card(view: PageView) -> dict[str, Any]:
             "message_source": pv.message_split(item.get("message_source")) or None,
         }
 
-    return {
-        "only": only_table(view, ("refusals",)),
-        "table": table(
-            view,
-            "refusals",
-            "refusals",
-            prot.REFUSALS_SPEC,
-            answer,
-            export="refusals",
-            cells=cells,
-            key_columns=("reason", "requests", "last_ms"),
-            hidden=("unattributed", "first_ms"),
-            row_id=lambda item: f"reason-{item.get('reason')}",
-            caption="Refusal and failure reasons in this range",
-            search_placeholder="Search reasons and paths",
-            notice=notice,
-            empty={
-                "title": "Roxy refused nothing in this range",
-                "body": "Every refusal and failure is counted here by its reason, with the message the caller got. "
-                "Choose a longer range in the top bar to see older ones.",
-                "icon": "shield",
-                "tone": "good",
-            },
-        ),
-    }
+    return table(
+        view,
+        "refusals",
+        "refusals",
+        prot.REFUSALS_SPEC,
+        answer,
+        export="refusals",
+        cells=cells,
+        key_columns=("reason", "requests", "last_ms"),
+        hidden=("unattributed", "first_ms"),
+        row_id=lambda item: f"reason-{item.get('reason')}",
+        caption="Refusal and failure reasons in this range",
+        search_placeholder="Search reasons and paths",
+        notice=notice,
+        empty={
+            "title": "Roxy refused nothing in this range",
+            "body": "Every refusal and failure is counted here by its reason, with the message the caller got. "
+            "Choose a longer range in the top bar to see older ones.",
+            "icon": "shield",
+            "tone": "good",
+        },
+    )
+
+
+def _client_drawer(view: PageView, key: Any) -> str | None:
+    """The Clients page's client view for an address (its drawer route), None for anything that is not one."""
+    try:
+        address = str(ipaddress.ip_address(str(key)))
+    except ValueError:
+        return None
+    return "/admin/clients/client?" + urlencode({**view.time.params, "kind": "ip", "key": address})
+
+
+async def _refused_clients_table(view: PageView) -> dict[str, Any]:
+    """The addresses refused most in the range: the Clients page's address table (`client_table_answer`, the read
+    of `GET /admin/api/v1/clients/ips`) sorted by refusals, so its numbers are the Clients page's numbers."""
+    spec = clients_api.IP_SPEC
+    if asked(view, "clients"):
+        tq, notice = table_query(view, spec, address=False)
+        if not view.param("sort", max_chars=40):
+            tq = replace(tq, sort=REFUSED_CLIENTS_SORT, order="desc")
+    else:
+        tq = replace(default_query(spec), sort=REFUSED_CLIENTS_SORT, order="desc", page_size=REFUSED_CLIENTS_ROWS)
+        notice = None
+    answer = await clients_api.client_table_answer(view.ctx, spec, tq, view.tr, "ip")
+    return table_view(
+        view,
+        "prot-clients",
+        spec,
+        answer,
+        src=view.fragment_url("refusals", **{TABLE_PARAM: "clients"}),
+        export_url=view.api_url("clients/ips"),
+        address=False,
+        columns=("key", "refused", "refused_pct", "requests", "top_endpoint", "last_seen", "bot_score"),
+        key_columns=("key", "refused", "refused_pct"),
+        hidden=("bot_score",),
+        cells=lambda item: {
+            "key": _mono(item.get("key")),
+            "refused": {"text": f"{int(item.get('refused') or 0):,}", "tone": "warn" if item.get("refused") else None},
+            "bot_score": None if item.get("bot_score") is None else {"text": f"{float(item['bot_score']):.0f}"},
+        },
+        row_id=lambda item: f"client-{row_key(item.get('key'))}",
+        drawer=lambda item: _client_drawer(view, item.get("key")),
+        drawer_title=lambda item: f"Address {item.get('key')}",
+        caption="Addresses Roxy refused most in this range",
+        search_placeholder="Search addresses",
+        notice=notice,
+        empty={
+            "title": "No address called Roxy in this range",
+            "body": "Every address is counted with its requests and refusals; the ones refused most come first. "
+            "Choose a longer range in the top bar to look further back.",
+            "icon": "users",
+        },
+    )
 
 
 # ============================================================================================ limits
@@ -352,6 +521,7 @@ async def throttle_card(view: PageView) -> dict[str, Any]:
     if which is None:
         context["summary"] = _throttle_summary(view)
         context["reset_all"] = await prot.limiter_reset_preview_answer(view.ctx, "all")
+        context["clear"] = clear_action(view, "throttled_clients")
     return context
 
 
@@ -375,6 +545,7 @@ async def ladder_card(view: PageView) -> dict[str, Any]:
         "window_words": pv.span_words(data["window_s"]),
         "decay_words": pv.span_words(data["decay_s"]) if data["decay_s"] else "",
         "api": {"save": f"{API}/ladder", "reset": f"{API}/ladder/reset"},
+        "clear": clear_action(view, "throttle_rule_hits"),
     }
 
 
@@ -406,7 +577,11 @@ async def _strike_detail(view: PageView, client: str) -> dict[str, Any]:
         "last_strike": view.time_cell(row.last_strike_at or None),
         "decays_in": decays_in(row.strikes, row.last_strike_at, now, decay),
         "live_href": "/admin/live?" + urlencode({"client": key}),
-        "clients_href": "/admin/clients?" + urlencode({"q": key}),
+        # An address opens its own client page; a network key (an IPv6 prefix) the address table searched for it
+        # (`?ip=`, the Clients page's deep link; `q` would search the places table).
+        "clients_href": client_href("ip", address)
+        if (address := canonical_ip(key))
+        else "/admin/clients?" + urlencode({"ip": key}),
         "api": {"forgive": f"{API}/strikes/forgive", "reset": f"{API}/limiter/reset"},
     }
 
@@ -474,8 +649,24 @@ async def throttle_all_card(view: PageView) -> dict[str, Any]:
     135 with v1's columns)."""
     which = only_table(view, ("watch-all",))
     tq, notice = query_for(view, prot.WATCH_ALL_SPEC, "watch-all")
+    state = await prot.throttle_all_answer(view.ctx)
     answer = await prot.throttle_all_watch_answer(view.ctx, tq)
     limit = int(_setting(view, "global_throttle_limit"))
+    if state.get("enabled"):
+        empty = {
+            "title": "Nothing has been refused since the emergency limit was switched on",
+            "body": "Every client that reaches the emergency limit is listed here with what it asks for and how "
+            "fast, so you can judge when to switch it off.",
+            "icon": "gauge",
+            "tone": "good",
+        }
+    else:
+        empty = {
+            "title": "The emergency limit is off, so it refuses nobody",
+            "body": "While the emergency limit is on, every client that reaches it is listed here with what it asks "
+            "for and how fast, so you can judge when to switch it off.",
+            "icon": "gauge",
+        }
 
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
         rate = item.get("rate1")
@@ -522,24 +713,23 @@ async def throttle_all_card(view: PageView) -> dict[str, Any]:
             search_placeholder="Search clients",
             searchable=False,
             notice=notice,
-            empty={
-                "title": "Nothing has been refused since the emergency limit was switched on",
-                "body": "While the emergency limit is on, every client that reaches it is listed here with what it "
-                "asks for and how fast, so you can judge when to switch it off. It is empty while the limit is off.",
-                "icon": "gauge",
-            },
+            empty=empty,
         ),
     }
     if which is None:
-        state = await prot.throttle_all_answer(view.ctx)
         context["state"] = state
         context["since"] = view.time_cell(state.get("since"))
     return context
 
 
 async def _reason_counts(view: PageView, reasons: Sequence[str]) -> list[dict[str, Any]]:
-    """Refusals per reason in the range for `reasons`, from the same rows as the Refusal reasons card."""
-    rows = {str(row.get("reason")): row for row in await prot.refusal_rows(view.ctx, view.tr)}
+    """Refusals per reason in the range for `reasons`: the Refusal reasons card's `requests` and `last_ms` for them
+    (`metrics/queries.py reason_counts`, which reads only those two numbers; the whole table read every event of
+    the range four ways, seconds over 90 days, for each of these cards; plan 6.7)."""
+    window = view.tr.window
+    wanted = tuple(reasons)
+    with common.service_errors():
+        rows = await view.ctx.dbs.metrics.read(lambda conn: queries.reason_counts(conn, window, wanted))
     return [
         {
             "reason": reason,
@@ -573,8 +763,12 @@ async def places_card(view: PageView) -> dict[str, Any]:
 def _ban_cells(view: PageView, item: Mapping[str, Any]) -> dict[str, Any]:
     evidence = item.get("evidence") or {}
     remaining = item.get("expires_in_s")
+    subject_type = str(item.get("subject_type") or "")
+    origin = str(item.get("origin") or "")
     return {
         "subject": _caller(item.get("subject")),
+        "subject_type": {"text": SUBJECT_LABELS.get(subject_type, subject_type)},
+        "origin": {"text": ORIGIN_LABELS.get(origin, origin), "sub": None},
         "active": pv.yes_no(item.get("active"), yes="In force", no="Expired"),
         "expires_in_s": {"text": "Permanent", "tone": "warn"} if item.get("permanent") else _span(remaining),
         "created_by": _caller(item.get("created_by")),
@@ -1090,6 +1284,7 @@ async def request_filters_card(view: PageView) -> dict[str, Any]:
     if which is None:
         context["presets"] = await prot.header_presets_answer(view.ctx)
         context["api"] = {"create": f"{API}/header-rules", "test": f"{API}/header-rules/test"}
+        context["clear"] = clear_action(view, "header_rule_attempts")
     return context
 
 
@@ -1110,8 +1305,10 @@ async def _pattern_card(
     empty_main: Mapping[str, Any],
     empty_attempts: Mapping[str, Any],
     attempts_caption: str,
+    clear_family: str,
 ) -> dict[str, Any]:
-    """The endpoint blocks and endpoint rules cards: the rule table, its attempts tab and each rule's drawer."""
+    """The endpoint blocks and endpoint rules cards: the rule table, its attempts tab (with v1's clear button, the
+    `clear_family` data reset) and each rule's drawer."""
     raw = detail_of(view)
     if raw:
         rows = await prot.rule_table_rows(view.ctx, table_name, view.tr)
@@ -1148,7 +1345,10 @@ async def _pattern_card(
         tables["attempts"] = _attempts_table(
             view, card, reason, answer, caption=attempts_caption, notice=notice, empty=empty_attempts
         )
-    return {"only": which, "tables": tables, "per_ip_allowance": extra.get("per_ip_allowance")}
+    context: dict[str, Any] = {"only": which, "tables": tables, "per_ip_allowance": extra.get("per_ip_allowance")}
+    if which is None:
+        context["clear"] = clear_action(view, clear_family)
+    return context
 
 
 def _pattern_cells(view: PageView, item: Mapping[str, Any]) -> dict[str, Any]:
@@ -1206,6 +1406,7 @@ async def endpoint_blocks_card(view: PageView) -> dict[str, Any]:
             "icon": "inbox",
         },
         attempts_caption="Requests a block refused in this range",
+        clear_family="endpoint_block_attempts",
     )
 
 
@@ -1252,6 +1453,7 @@ async def endpoint_rules_card(view: PageView) -> dict[str, Any]:
             "icon": "inbox",
         },
         attempts_caption="Requests an endpoint rule refused in this range",
+        clear_family="endpoint_rule_attempts",
     )
 
 
@@ -1403,6 +1605,9 @@ async def spam_card(view: PageView) -> dict[str, Any]:
         context["detectors"] = [_detector_view(item) for item in state.get("detectors") or ()]
         context["collateral"] = await prot.collateral_answer(view.ctx)
         context["api"] = {"arm": f"{API}/spam/arm", "disarm": f"{API}/spam/disarm"}
+        # The detector timelines (plan 10.9): every detector's decisions per time bucket, read by the chart from
+        # `GET /protection/spam/series` (the same events as the decisions table below, over the page's range).
+        context["timeline_src"] = view.api_url("protection/spam/series")
     return context
 
 
@@ -1519,6 +1724,7 @@ async def tarpit_card(view: PageView) -> dict[str, Any]:
         "reasons": worker_rows("reasons"),
         "ips": worker_rows("ips"),
         "span": pv.span_words,
+        "clear": clear_action(view, "tarpit"),
     }
 
 

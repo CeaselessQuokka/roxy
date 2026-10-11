@@ -6,12 +6,13 @@
   catalog's direction decides which is better), and a sparkline. When a reset touched a measure's data in either
   period the row shows the notice instead of a change (plan 6.8, finding LOGICFIX-1), and the period lists the
   resets it read. The top bar's range does not apply here. Week over week is open; month and year open on demand
-  (each period is a <details> whose summary holds its heading). Context: `frame`, `periods`.
+  (each period is a <details> whose summary holds its heading). The avoided share is shown as it is when below 0%,
+  with why under it (`row.cells`, `fmt.avoided_cell`, plan P6). Context: `frame`, `periods`.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/chart.html" import sparkline %}
 {% from "components/badges.html" import delta, help_dot %}
-{% from "components/format.html" import metric_value %}
+{% from "components/format.html" import metric_value, cell_value %}
 {% from "components/icon.html" import icon %}
 {% call page_card(frame, subtitle="The last 7, 30 and 365 days, each compared with the same length just before.") %}
 {% for period in periods %}
@@ -39,10 +40,17 @@
         <tr>
           <th scope="row">{{ row.label }}{{ help_dot(row.label, row.help) }}</th>
           {%- set suffix = "ms" if row.unit == "ms" else "" %}
+          {%- if row.cells %}
+          <td class="num">{{ cell_value(row.cells.current) }}</td>
+          <td class="num traffic-trend__before">{{ cell_value(row.cells.previous) }}</td>
+          {%- else %}
           <td class="num">{{ metric_value(row.current, row.unit, row.metric) }}{% if suffix and row.current is not none %} {{ suffix }}{% endif %}</td>
           <td class="num traffic-trend__before">{{ metric_value(row.previous, row.unit, row.metric) }}{% if suffix and row.previous is not none %} {{ suffix }}{% endif %}</td>
+          {%- endif %}
           <td>{% if row.partial %}<span class="kpi__notice">{{ icon("info") }}<span>{{ row.notice }}</span></span>
             {%- elif row.delta_pct is none and row.previous == 0 and row.current %}<span class="muted">New in this period</span>
+            {%- elif row.delta_pct is none and row.previous == 0 %}<span class="muted">No change (none in either)</span>
+            {%- elif row.delta_pct is none and row.previous is none %}<span class="muted">No earlier data</span>
             {%- else %}{{ delta(row.delta_pct, row.good_direction, "against the period before") }}{% endif %}</td>
           <td class="traffic-trend__spark">{{ sparkline(row.spark, label=row.label ~ " in " ~ period.label|lower) }}</td>
         </tr>

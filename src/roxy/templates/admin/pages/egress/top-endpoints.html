@@ -4,15 +4,19 @@
   search, sort and page live in the address bar), from `GET /admin/api/v1/egress/top-endpoints`; below it, how many
   calls fell in each bytes-per-call slot (`GET /egress/bytes-per-request`, built from per-minute averages, which the
   card says). Endpoint templates are caller text.
+
+  A table request swaps only the table (`hx-select`); the egress total and the bytes-per-call slots belong to the
+  chosen egress, so they come along out of band (`hx-select-oob`) and always describe what the table shows.
   Context: `frame`, `table`, `egress_label`, `total`, `slots`, `slot_calls`, `basis`.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/table.html" import data_table %}
 {% from "components/format.html" import num %}
-{% call page_card(frame, flush=True, subtitle=egress_label ~ ": " ~ total ~ " in this range") %}
-<div class="g3-table-host" hx-select="#{{ table.id }}">{{ data_table(**table) }}</div>
-<details class="details-plain g3-pad">
-  <summary>Bytes per call on this egress</summary>
+{% call page_card(frame, flush=True) %}
+<p class="g3-pad g3-summary" id="top-endpoints-summary" aria-live="polite">{{ egress_label }}: <strong>{{ total }}</strong> in this range</p>
+<div class="g3-table-host" hx-select="#{{ table.id }}" hx-select-oob="#top-endpoints-summary,#top-endpoints-slots">{{ data_table(**table) }}</div>
+<details class="details-plain g3-pad" id="top-endpoints-slots">
+  <summary>Bytes per call on this egress ({{ egress_label|lower }})</summary>
   <p class="muted">{{ basis }}.</p>
   {% if slot_calls %}
   <div class="table-scroll g3-scroll" role="region" aria-labelledby="slots-caption" tabindex="0">

@@ -319,7 +319,9 @@ SETTINGS: list[SettingSpec] = [
             "warns that it is spending the account's call budget. At default settings it makes about 2 or 3 such "
             "calls per hour."
         ),
-        pages=_ENGINE,
+        # Also in the rule's tuning drawer: it is CRED-PROBE-COST's only threshold (a generated rule has its
+        # params there; this one is an ordinary setting, so it names the anchor itself).
+        pages=(*_ENGINE, "recommendations#rule-cred_probe_cost"),
         if_raised=(
             "Tolerates more of Roxy's own credential calls before warning. Every call with the credential counts "
             "against the one Roblox account's rate limit, so keep this close to normal usage."

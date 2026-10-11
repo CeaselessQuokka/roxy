@@ -29,9 +29,11 @@ Why it exists
 
 How it works
     `page = Page("credential")`; each card renderer returns the context of
-    `templates/admin/pages/credential/<card>.html`. Two small page routes serve partials: `/admin/credential/allowlist-row?id=` (a row's drawer) and
-    `/admin/credential/allowlist-test?target=&method=` (the tester's answer). Allowlist patterns and notes are
-    caller text (an admin typed them, but they are shown as text everywhere, like every other rule).
+    `templates/admin/pages/credential/<card>.html`. Two small page routes serve partials:
+    `/admin/credential/allowlist-row?id=` (a row's drawer) and `/admin/credential/allowlist-test?target=&method=`
+    (the tester's answer). Allowlist patterns and notes are caller text (an admin typed them, but they are shown
+    as text everywhere, like every other rule). A probe's "why" comes from its recorded trigger (`TRIGGER_WORDS`);
+    its outcome says "Rate limited" for a 429, never "expired" (parity row 25).
 
 What to read next
     `templates/admin/pages/credential.html`, `roxy/admin/api/credential.py`, `roxy/egress/credential.py`,
@@ -94,11 +96,19 @@ PROBE_WORDS: Final[dict[str, str]] = {
     "timeout": "Failed: Roblox did not answer in time",
     "connect_error": "Failed: Roblox could not be reached",
 }
+TRIGGER_WORDS: Final[dict[str, str]] = {
+    "scheduled": "Scheduled liveness probe",
+    "admin": "Check credential (admin)",
+    "health": "Check Proxy Health (H-CRED-AUTH)",
+    "upstream": "Confirm a Roblox 401 before marking it rejected",
+}
+"""Why a probe ran: the `trigger` every probe records (`upstream/service.py PROBE_TRIGGERS`)."""
 PURPOSE_WORDS: Final[dict[str, str]] = {
-    "credential_probe": "Scheduled liveness probe",
+    "credential_probe": "A probe of the credential",
     "credential_check": "Check credential (admin)",
     "credential_confirm": "Confirm a 401 before marking it rejected",
 }
+"""The call site, for a probe recorded without a trigger (older rows)."""
 METHOD_CHOICES: Final[tuple[tuple[str, str], ...]] = (
     ("GET", "GET only"),
     ("GET\nHEAD", "GET and HEAD"),
@@ -116,6 +126,19 @@ def _number(value: Any) -> float | None:
 def _seconds_from_ms(value: Any) -> float | None:
     number = _number(value)
     return number / 1000 if number is not None else None
+
+
+def _probe_outcome(item: Mapping[str, Any]) -> tuple[str, str]:
+    """`(tone, word)` of one probe row: a 429 is "Rate limited", never "expired" (parity row 25); a 401 or 403 is
+    "Rejected" (the cookie expired or was revoked); any other failure is "Failed"."""
+    if item.get("ok"):
+        return "ok", "OK"
+    status = item.get("status")
+    if status == 429:
+        return "warn", "Rate limited"
+    if status in (401, 403):
+        return "bad", "Rejected"
+    return "bad", "Failed"
 
 
 def _probe_words(result: Any) -> str:
@@ -208,8 +231,10 @@ async def probes_card(view: PageView) -> dict[str, Any]:
         {
             **item,
             "when": view.time_cell(_seconds_from_ms(item.get("at_ms"))),
-            "purpose_words": PURPOSE_WORDS.get(str(item.get("purpose")), str(item.get("purpose"))),
+            "purpose_words": TRIGGER_WORDS.get(str(item.get("trigger") or ""))
+            or PURPOSE_WORDS.get(str(item.get("purpose")), str(item.get("purpose"))),
             "duration": ms_text(item.get("duration_ms")),
+            "outcome": _probe_outcome(item),
         }
         for item in answer.get("items") or ()
     ]

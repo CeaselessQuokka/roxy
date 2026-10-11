@@ -159,12 +159,19 @@ def query_fingerprint(template: str, query: Sequence[tuple[str, str]]) -> int | 
     return zlib.crc32(text.encode("utf-8", "surrogateescape"))
 
 
+PROBES_KEPT: Final = 64
+"""Probe times one client keeps (the probe signal counts those of the last `PROBE_WINDOW_S`)."""
+
+
 @dataclass(slots=True)
 class _Client:
-    probes: deque[float] = field(default_factory=lambda: deque(maxlen=64))
+    # Created at the client's first probe, and at its first request with a query string: an empty deque costs 760
+    # bytes, most clients never probe, and the tracker holds up to MAX_CLIENTS clients per worker (finding LOAD-2:
+    # about 4 KB a client before, so up to 39 MiB a worker). None reads as empty.
+    probes: deque[float] | None = None
     refusal_buckets: dict[int, list[int]] = field(default_factory=dict)  # bucket start -> [total, refused]
     arrivals: deque[float] = field(default_factory=lambda: deque(maxlen=TIMING_MIN_REQUESTS + 14))
-    queries: deque[int] = field(default_factory=lambda: deque(maxlen=BUST_WINDOW))
+    queries: deque[int] | None = None
     ips: list[str] = field(default_factory=list)  # recent addresses behind this key (bounded)
     # The per-request signals of the first request since the last recorded score: (library UA, game server
     # signature, header order anomaly). None: nothing to record (the client is not "dirty").
@@ -258,6 +265,8 @@ class ClientTracker:
         client = self._get(key, create=True)
         assert client is not None  # created above
         if probe:
+            if client.probes is None:
+                client.probes = deque(maxlen=PROBES_KEPT)
             client.probes.append(now)
         bucket = int(now // REFUSAL_BUCKET_S) * REFUSAL_BUCKET_S
         entry = client.refusal_buckets.setdefault(bucket, [0, 0])
@@ -268,6 +277,8 @@ class ClientTracker:
             del client.refusal_buckets[start]
         client.arrivals.append(monotonic)
         if query_fp is not None:
+            if client.queries is None:
+                client.queries = deque(maxlen=BUST_WINDOW)
             client.queries.append(query_fp)
         if ip and ip not in client.ips:
             client.ips.append(ip)
@@ -292,7 +303,7 @@ class ClientTracker:
         """The seven signals from a client's history and one request's per-request inputs."""
         probes = refusals = timing = busting = 0.0
         if client is not None:
-            recent_probes = sum(1 for at in client.probes if at >= now - PROBE_WINDOW_S)
+            recent_probes = sum(1 for at in client.probes or () if at >= now - PROBE_WINDOW_S)
             probes = min(1.0, recent_probes / 5)
             total = sum(
                 v[0] for s, v in client.refusal_buckets.items() if s + REFUSAL_BUCKET_S > now - REFUSAL_WINDOW_S
@@ -306,8 +317,9 @@ class ClientTracker:
                 variation = _coefficient_of_variation([b - a for a, b in itertools.pairwise(arrivals)])
                 if variation is not None and variation < TIMING_CV_THRESHOLD:
                     timing = 1.0
-            if len(client.queries) >= BUST_MIN_REQUESTS:
-                busting = len(set(client.queries)) / len(client.queries)
+            queries = client.queries or ()
+            if len(queries) >= BUST_MIN_REQUESTS:
+                busting = len(set(queries)) / len(queries)
         return BotSignals(
             library_ua=1.0 if library_ua else 0.0,
             no_roblox_signature=0.0 if game_server else 1.0,

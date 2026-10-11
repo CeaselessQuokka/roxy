@@ -106,8 +106,8 @@ EXPECTED_17_1 = {
     "RuntimeDirectoryMode": "0750",
     "UMask": "0027",
     "MemoryAccounting": "yes",
-    "MemoryHigh": "350M",  # the 909 MB server (DESIGN.md section 0), sized by the LOAD-2 soak; not the plan's 650M
-    "MemoryMax": "450M",  # MemoryHigh plus 100 MiB for short peaks; not the plan's 800M
+    "MemoryHigh": "420M",  # the 909 MB server, sized by the LOAD-2 soaks (docs/PERFORMANCE.md); not the plan's 650M
+    "MemoryMax": "500M",  # MemoryHigh plus 80 MiB for short peaks; not the plan's 800M
     "TasksMax": "256",
     "LimitNOFILE": "65536",
     "NoNewPrivileges": "yes",
@@ -184,16 +184,36 @@ def test_stop_timeout_outlives_gunicorns_graceful_timeout(monkeypatch: pytest.Mo
     assert int(one(ROXY, "TimeoutStopSec")) > conf.graceful_timeout
 
 
+SERVER_MIB = 909
+"""The production server's memory as `free -m` reports it (MiB, no swap; DESIGN.md section 0)."""
+OS_AND_NGINX_MIB = 200
+"""Ubuntu, sshd, journald and nginx with two workers: the lead's estimate (measure `free -m` with Roxy stopped)."""
+WARM_COLOR_MIB = 405
+"""The most PSS a color measured with its workers recycling every 20,000 requests (LOAD-2 soaks, 200 a second)."""
+FRESH_COLOR_MIB = {1: 155, 2: 275}
+"""PSS of a color that just started with one or two workers (the soaks' first point, 271 MiB with two)."""
+LOW_MEMORY_MB = 700
+"""deploy.sh starts the new color with one worker below this much available memory (`ROXY_LOW_MEMORY_MB`)."""
+
+
 def test_memory_numbers_fit_the_909_mb_server() -> None:
-    """DESIGN.md section 0: two colors overlap during a deploy; at their soft limits they must leave room for nginx
-    and the operating system on 909 MB without swap."""
+    """DESIGN.md section 0 as resized by finding LOAD-2 (docs/PERFORMANCE.md "Memory per color"). A healthy color
+    stays under MemoryHigh, so it is never throttled; one color at MemoryMax fits the server beside nginx and the OS;
+    and a deploy, which only ever overlaps a warm color with a freshly started one, fits even when the warm color is at
+    MemoryMax: below `LOW_MEMORY_MB` available the new color starts with one worker, at or above it two fit by
+    construction. Two warm colors at once never happen (deploy.sh stops the old color after its watch) and would not
+    fit: that is why an operator must never start the idle color by hand (deploy/README.md)."""
 
     def megabytes(text: str) -> int:
         return int(text.removesuffix("M"))
 
     high, hard = megabytes(one(ROXY, "MemoryHigh")), megabytes(one(ROXY, "MemoryMax"))
-    assert high < hard
-    assert 2 * high + 200 < 909, "two colors at MemoryHigh plus about 200 MB for nginx and the OS"
+    assert WARM_COLOR_MIB < high < hard, "a healthy color is never throttled; MemoryMax leaves room for peaks"
+    assert hard + OS_AND_NGINX_MIB < SERVER_MIB, "one color at its hard limit beside nginx and the OS"
+    assert hard + FRESH_COLOR_MIB[1] + OS_AND_NGINX_MIB < SERVER_MIB, "a deploy in low-memory mode"
+    assert FRESH_COLOR_MIB[2] < LOW_MEMORY_MB, "a deploy in normal mode: two fresh workers fit what was available"
+    assert f'LOW_MEMORY_MB="${{ROXY_LOW_MEMORY_MB:-{LOW_MEMORY_MB}}}"' in (DEPLOY / "deploy.sh").read_text()
+    assert 2 * high + OS_AND_NGINX_MIB > SERVER_MIB, "if two warm colors ever fit, this docstring is out of date"
 
 
 def test_ports_and_sockets_agree_across_files() -> None:

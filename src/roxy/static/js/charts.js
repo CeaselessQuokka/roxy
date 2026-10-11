@@ -140,6 +140,25 @@ function resolveColor(token) {
   return getComputedStyle(probe).color;
 }
 
+/**
+ * uPlot `points.filter` for a line or area series: when the series draws no points (`show` false, more than two
+ * buckets), still draw a dot at every value whose neighbors are both missing. A line needs two points, so traffic
+ * that fell in one bucket of the range (a fresh install, a reset, a quiet endpoint) would otherwise be invisible
+ * although the legend and the data table show its number.
+ */
+function isolatedPoints(u, seriesIdx, show) {
+  if (show) return null;  // every point is drawn anyway
+  const ys = u.data[seriesIdx] || [];
+  const found = [];
+  for (let j = 0; j < ys.length; j += 1) {
+    if (ys[j] === null || ys[j] === undefined) continue;
+    const before = j > 0 ? ys[j - 1] : null;
+    const after = j < ys.length - 1 ? ys[j + 1] : null;
+    if ((before === null || before === undefined) && (after === null || after === undefined)) found.push(j);
+  }
+  return found.length ? found : null;
+}
+
 function withAlpha(rgb, alpha) {
   const parts = rgb.match(/[\d.]+/g);
   return parts && parts.length >= 3 ? `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})` : rgb;
@@ -232,12 +251,13 @@ class Chart {
     this.figure.dataset.chartReady = this.x && this.spec ? "empty" : "error";
   }
 
-  /** The answer's partial-data notices (plan 6.8) as notes above the plot (text only). */
+  /** The answer's partial-data notices (plan 6.8) as notes above the plot (text only). Plain list items: an `li`
+   * given another role is no longer a list item, and its `ul` then fails axe's `list` rule. */
   renderNotices() {
     const box = qs("[data-chart-notices]", this.figure);
     const notices = Array.isArray(this.spec.notices) ? this.spec.notices : [];
     if (!box) return;
-    box.replaceChildren(...notices.map((text) => el("li", { class: "chart__notice", role: "note" }, [icon("info"), el("span", { text })])));
+    box.replaceChildren(...notices.map((text) => el("li", { class: "chart__notice" }, [icon("info"), el("span", { text })])));
     box.hidden = notices.length === 0;
   }
 
@@ -300,7 +320,8 @@ class Chart {
         label: s.label,
         stroke: color,
         width: s.kind === "bars" ? 0 : 2,
-        points: { show: this.x.length <= 2 },
+        // Bars draw a lone value anyway; a line draws a dot for a value with no neighbor (`isolatedPoints`).
+        points: s.kind === "bars" ? { show: this.x.length <= 2 } : { show: this.x.length <= 2, filter: isolatedPoints },
         value: (u, v) => fmt(v),
       };
       if (s.kind === "bars") {

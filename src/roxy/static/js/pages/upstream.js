@@ -8,6 +8,7 @@
  *     stream's `cooldown` and `breaker` events).
  *   - A form saved from inside the drawer (a bucket override, a routing rule) closes the drawer: the card it
  *     changed is refreshed by the shared form handler, and the drawer would otherwise show the old values.
+ *   - An answer with `warnings` (the reset when control.db was too busy for its audit row) shows them in a toast.
  *   Everything else (tables, drawers, settings, the reset dialog, the trace lookup) is the shared design system.
  *
  * Why it exists
@@ -22,7 +23,7 @@
  *   static/js/page.js (the helpers every page module uses), roxy/admin/pages/upstream.py.
  */
 
-import { onContent } from "roxy/page";
+import { onContent, toast } from "roxy/page";
 
 const seen = new WeakMap();
 const live = new Set();
@@ -63,7 +64,12 @@ window.setInterval(tick, 1000);
 
 document.addEventListener("roxy:api-success", (event) => {
   const form = event.target instanceof Element ? event.target : null;
-  if (!form || !form.closest("#drawer")) return;
+  if (!form) return;
+  // The reset is applied even when control.db was too busy for its audit row: the API says so in `warnings`.
+  const answer = event.detail && event.detail.answer;
+  const warnings = answer && Array.isArray(answer.warnings) ? answer.warnings.filter((w) => typeof w === "string") : [];
+  if (warnings.length) toast(warnings.join(" "), { tone: "warn" });
+  if (!form.closest("#drawer")) return;
   const close = document.querySelector("#drawer .drawer__head [data-dialog-close]");
   if (close instanceof HTMLElement) close.click();
 });

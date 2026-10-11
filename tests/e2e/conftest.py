@@ -7,15 +7,16 @@ What this is
     page (tests/e2e/spike/), and a `/csp-report` collector. `browser` is one headless Chromium per session;
     `open_page(...)` makes a fresh context per test that records every CSP violation, console error and page error.
 
-    The dashboard pages (P11) need the whole app instead: `dashboard` is `roxy.admin.pages.testing.DashboardServer`
-    (the real app with its lifespan on a FREE loopback port, its own temporary state, a local Roblox stand-in, an
+    The dashboard pages (P11) need the whole app instead: `dashboard` is `pages_harness.DashboardServer`
+    (`tests/pages_harness.py`: the real app with its lifespan on a FREE loopback port, its own temporary state, a
+    local Roblox stand-in, an
     admin signed in through the real password and TOTP steps, and seeded traffic, audit rows, a recommendation and
     a health run), one per test session. `open_admin(path, theme=..., width=..., height=...)` opens a page in a
     fresh browser context that carries that admin's session cookie and records CSP violations, console errors and
     page errors (`AdminPage.problems()`); `AdminPage.settle()` scrolls every lazy card into view and waits for htmx,
     `AdminPage.axe()` runs axe-core, `AdminPage.shot(name)` saves a full-page screenshot to
-    `.remake/p11_reports/shots/<page>_<theme>_<width>.png`. `roxy.admin.pages.testing` `VIEWPORTS` and `THEMES`
-    are the sizes and themes every page is checked in (plan 14.9: 1440x900 and 390x844, dark and light).
+    `.remake/p11_reports/shots/<page>_<theme>_<width>.png`. `pages_harness` `VIEWPORTS` and `THEMES` are the sizes
+    and themes every page is checked in (plan 14.9: 1440x900 and 390x844, dark and light).
 
 Why it exists
     The design system has to be proven in a real browser: the CSP spike (plan 9.2, a P0 gate item moved to P11),
@@ -49,6 +50,8 @@ from typing import Any
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, Response
+
+import db_threads
 
 HERE = Path(__file__).resolve().parent
 SPIKE_DIR = HERE / "spike"
@@ -269,16 +272,45 @@ _ANIMATIONS_DONE = """() => document.getAnimations().every(
   (a) => a.playState !== "running" || a.effect.getComputedTiming().iterations === Infinity)"""
 
 
+_RUNNING_DASHBOARDS: list[tuple[Any, Any]] = []
+"""The session's dashboard server (and its databases) while it runs: at most one."""
+
+
 @pytest.fixture(scope="session")
 def dashboard() -> Iterator[Any]:
-    """The real app on a free port with a signed-in admin and seeded data (see the module docstring)."""
-    from roxy.admin.pages.testing import DashboardServer
+    """The real app on a free port with a signed-in admin and seeded data (see the module docstring).
+
+    One server for every browser test of this directory, stopped after the last of them (`pytest_runtest_teardown`
+    below), not when the whole session ends: it is a full app (leader jobs, its hot.db and metrics.db), and kept
+    running it slowed every later test and broke one that counts database threads (finding G8). Its databases are
+    `db_threads.share`d meanwhile, so the root conftest's guard lets them outlive each module."""
+    from pages_harness import DashboardServer
 
     server = DashboardServer.start(seed=True)
+    databases = server.ctx.dbs
+    db_threads.share(databases, "tests/e2e dashboard (session)")
+    _RUNNING_DASHBOARDS.append((server, databases))
     try:
         yield server
     finally:
-        server.stop()
+        _stop_dashboards()
+
+
+def _stop_dashboards() -> None:
+    while _RUNNING_DASHBOARDS:
+        server, databases = _RUNNING_DASHBOARDS.pop()
+        try:
+            server.stop()
+        finally:
+            db_threads.unshare(databases)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> None:
+    """After the last browser test of this directory (its fixtures already torn down), stop the session's
+    dashboard: the next test belongs to another directory, or there is none."""
+    if nextitem is None or HERE not in Path(str(nextitem.fspath)).resolve().parents:
+        _stop_dashboards()
 
 
 @dataclass
@@ -302,17 +334,26 @@ class AdminPage(PageRecord):
             self.settle()
         return response
 
-    def settle(self, timeout: float = 15.0) -> None:
-        """Scroll every lazy card into view (they load on `revealed`) and wait until htmx is idle."""
-        for _ in range(4):
-            lazy = self.page.evaluate("document.querySelectorAll('.page-card--lazy').length")
-            if not lazy:
+    def settle(self, timeout: float = 45.0) -> None:
+        """Wait until every lazy card has loaded, then until htmx is idle.
+
+        `static/js/cards.js` loads a page's lazy cards one at a time right after the page (as an admin's browser
+        does); a placeholder that has not moved for a few seconds is scrolled into view (its `revealed` trigger),
+        one at a time: scrolling them all at once would leave all but the last outside the window, and htmx reveals
+        only what is inside it when scrolling stops. Whatever is still a placeholder at the deadline is left for the
+        test's own assertions to name."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.page.evaluate("document.querySelectorAll('.page-card--lazy').length"):
                 break
-            self.page.evaluate(
-                "() => { for (const el of document.querySelectorAll('.page-card--lazy')) el.scrollIntoView(); }"
-            )
-            wait_for_js(self.page, _SETTLED, timeout)
-        wait_for_js(self.page, _SETTLED, timeout)
+            try:
+                wait_for_js(self.page, "() => !document.querySelector('.page-card--lazy')", 4.0)
+            except AssertionError:
+                self.page.evaluate(
+                    "() => { const card = document.querySelector('.page-card--lazy:not(.htmx-request)');"
+                    " if (card) card.scrollIntoView(); }"
+                )
+        wait_for_js(self.page, _SETTLED, 15.0)
         self.page.evaluate("window.scrollTo(0, 0)")
 
     def problems(self, expected: Sequence[str] = ()) -> list[str]:
@@ -358,7 +399,7 @@ def open_admin(browser: Any, dashboard: Any) -> Iterator[Callable[..., AdminPage
 
     The theme is the admin's saved preference (`POST /admin/api/v1/prefs`), so the server renders it into the
     first paint as it does for a real admin; the browser's color scheme matches it."""
-    from roxy.admin.pages.testing import SESSION_COOKIE_NAME
+    from pages_harness import SESSION_COOKIE_NAME
 
     contexts: list[Any] = []
 

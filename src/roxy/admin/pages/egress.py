@@ -29,8 +29,9 @@ Why it exists
 
 How it works
     `page = Page("egress")`; each `@page.card` returns the context of `templates/admin/pages/egress/<card>.html`.
-    Settings-heavy cards are deferred (`_upstream_common.deferred`: they load as their own fragment right after the
-    page). Bytes are decimal (1 GB = 10^9 bytes, the provider's unit). Endpoint templates are caller text.
+    Settings-heavy cards are lazy (the kit's placeholders, loaded right after the page by `static/js/cards.js`, or
+    when scrolled into view). Bytes are decimal (1 GB = 10^9 bytes, the provider's unit). Endpoint templates are
+    caller text.
 
 What to read next
     `templates/admin/pages/egress.html`, `roxy/admin/api/egress.py`, `roxy/egress/read_state.py`,
@@ -48,17 +49,18 @@ from roxy.admin.api import egress as egress_api
 from roxy.admin.api import rotator as rotator_api
 from roxy.admin.api import upstream as upstream_api
 from roxy.admin.pages._upstream_common import (
-    DEFERRED,
     EGRESS_ABOUT,
     EGRESS_LABELS,
     decimal_bytes,
-    deferred,
     egress_state,
     pct_text,
+    plural,
     precision_words,
     reason_words,
+    sentence,
 )
 from roxy.admin.pages.kit import Page, PageView, filter_chip, table_query, table_view
+from roxy.metrics.catalog import METRICS
 
 page = Page("egress")
 router = page.router
@@ -135,9 +137,16 @@ async def usage_card(view: PageView) -> dict[str, Any]:
     return {
         "items": items,
         "share": calls_only,
+        "share_help": _metric_help("upstream_calls"),
         "metering": METERING_WORDS.get(mode, mode or "n/a"),
         "estimate": mode == "estimate",
     }
+
+
+def _metric_help(key: str) -> str:
+    """A chart's help from its single source, the metric catalog (plan 14.7)."""
+    spec = METRICS.get(key)
+    return spec.description if spec is not None else ""
 
 
 # ============================================================================================ budget
@@ -227,6 +236,7 @@ async def budget_card(view: PageView) -> dict[str, Any]:
         "stopped": bool(answer.get("stopped")),
         "stop_words": STOP_WORDS.get(str(answer.get("stop_reason") or ""), reason_words(answer.get("stop_reason"))),
         "daily": _daily_series(daily),
+        "daily_help": _metric_help("rotator_bytes"),
         "has_days": any(int(day.get("bytes") or 0) for day in daily.get("days") or ()),
         "provider": provider,
         "provider_latest": latest,
@@ -241,12 +251,10 @@ async def budget_card(view: PageView) -> dict[str, Any]:
 # ============================================================================================ rotator
 
 
-@page.card("rotator")
+@page.card("rotator", lazy=True)
 async def rotator_card(view: PageView) -> dict[str, Any]:
     """v1's Rotate tile and the gateway URL (masked): `rotator.state_view`, `sessions_answer` and the rotator's
     health card from `upstream.egress_cards_answer` (the API's own functions)."""
-    if deferred(view):
-        return DEFERRED
     state = await rotator_api.state_view(view.ctx)
     sessions = await egress_api.sessions_answer(view.ctx, view.tr)
     cards = await upstream_api.egress_cards_answer(view.ctx, view.tr)
@@ -278,12 +286,10 @@ async def rotator_card(view: PageView) -> dict[str, Any]:
 # ============================================================================================ exit IPs and sessions
 
 
-@page.card("exit-ips")
+@page.card("exit-ips", lazy=True)
 async def exit_ips_card(view: PageView) -> dict[str, Any]:
     """v1's Rotation Exit IPs: this worker's recent exits, masked (`exit_ips_view` over the pool, as the API's
     masked answer). The reveal is the API's audited route, asked by the page's script."""
-    if deferred(view):
-        return DEFERRED
     pool = egress_api.egress_of(view.ctx).rotator
     answer = egress_api.exit_ips_view(pool.recent_exit_ips(masked=True), masked=True)
     items = [
@@ -303,11 +309,9 @@ async def exit_ips_card(view: PageView) -> dict[str, Any]:
     }
 
 
-@page.card("sessions")
+@page.card("sessions", lazy=True)
 async def sessions_card(view: PageView) -> dict[str, Any]:
     """Session mode, open sessions, the fleet-wide park and streak, and the calls per exit (`sessions_answer`)."""
-    if deferred(view):
-        return DEFERRED
     answer = await egress_api.sessions_answer(view.ctx, view.tr)
     health = answer.get("health") or {}
     exits = [
@@ -328,6 +332,7 @@ async def sessions_card(view: PageView) -> dict[str, Any]:
         "effective_words": MODE_WORDS.get(str(answer.get("effective_mode") or ""), str(answer.get("effective_mode"))),
         "unavailable": reason_words(answer.get("unavailable_reason")) if answer.get("unavailable_reason") else None,
         "exits": exits,
+        "parked_times": plural(health.get("times_parked"), "time"),
     }
 
 
@@ -393,7 +398,7 @@ async def top_endpoints_card(view: PageView) -> dict[str, Any]:
         "total": decimal_bytes(total_bytes),
         "slots": slots,
         "slot_calls": int(histogram.get("calls") or 0),
-        "basis": str(histogram.get("basis") or "").capitalize(),
+        "basis": sentence(histogram.get("basis")),
     }
 
 

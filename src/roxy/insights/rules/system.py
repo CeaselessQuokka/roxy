@@ -444,6 +444,16 @@ def regression_rates(totals: Mapping[str, Any]) -> dict[str, float | None]:
     }
 
 
+def history_value(key: str, raw: Any) -> Any:
+    """A `settings_history` value as the catalog type. None means the key had no override then (a first override's
+    before, a reset's after: `config/settings_service.py` stores NULL), which is the catalog default; it used to
+    reach `validate_value` and make the rule fail for every such change. Raises `SettingValidationError` for a value
+    the catalog refuses."""
+    if raw is None:
+        return catalog.DEFAULTS.get(key, catalog.CATALOG[key].default)
+    return catalog.validate_value(key, raw)
+
+
 def worse_by(before: Mapping[str, float | None], after: Mapping[str, float | None]) -> dict[str, float]:
     """`{metric: percent worse}` for every rate with a non-zero baseline and a value since."""
     out: dict[str, float] = {}
@@ -504,11 +514,13 @@ class SysChangeRegression(Rule):
             if key not in catalog.CATALOG or catalog.CATALOG[key].sensitive:
                 return None
             current = ctx.setting(key)
-            if catalog.validate_value(key, change["after"]) != current:
+            try:
+                after, before = history_value(key, change["after"]), history_value(key, change["before"])
+            except catalog.SettingValidationError:
+                return None  # a stored value this release no longer accepts cannot be restored by a click
+            if after != current:
                 return None  # changed again since: the newer change is the one to judge
-            return ProposedChange(
-                "setting", key=key, current=current, proposed=catalog.validate_value(key, change["before"])
-            )
+            return ProposedChange("setting", key=key, current=current, proposed=before)
         table = str(change["target"]).split(":", 1)[0]
         spec = RULE_TABLES.get(table)
         if spec is None:
@@ -640,6 +652,7 @@ __all__ = [
     "SysLoopLag",
     "SysMetricsDrop",
     "SysWorkerSat",
+    "history_value",
     "projected_bytes",
     "regression_rates",
     "storage_bytes",

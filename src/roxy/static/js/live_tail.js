@@ -85,6 +85,10 @@ class LiveTail {
     this.rows = [];  // newest first
     this.waiting = [];
     this.dropped = 0;
+    // Rows the stream left out because more than 50 a second matched (plan 14.11): the `kpi` frame's
+    // `stream.live_sampled_out` counts them for this connection; `sampledBase` is where Clear put the count to zero.
+    this.sampledOut = 0;
+    this.sampledBase = 0;
     this.newSinceAnnounce = 0;
     this.filters = {};
     this.visible = [];
@@ -103,6 +107,7 @@ class LiveTail {
       onEvent: (event) => {
         if (event.type === "live" || event.type === "message") this.add(normalize(event.data));
         else if (event.type === "gap") this.markGap();
+        else if (event.type === "kpi" && event.data && event.data.stream) this.noteSampling(event.data.stream);
       },
       onState: (state) => {
         this.connection = state;
@@ -135,6 +140,7 @@ class LiveTail {
         this.rows = [];
         this.waiting = [];
         this.dropped = 0;
+        this.sampledBase = this.sampledOut;
         this.gap = false;
         this.active = -1;
         this.draw();
@@ -260,9 +266,21 @@ class LiveTail {
       let count = `${fmtNumber(this.rows.length)} row${this.rows.length === 1 ? "" : "s"}`;
       if (this.waiting.length) count += `, ${fmtNumber(this.waiting.length)} waiting`;
       if (this.dropped) count += `, ${fmtNumber(this.dropped)} dropped`;
+      const sampled = this.sampledOut - this.sampledBase;
+      if (sampled > 0) count += `, ${fmtNumber(sampled)} left out (more than 50 a second)`;
       if (this.gap) count += ", some missed while reconnecting";
       this.countLabel.textContent = count;
     }
+  }
+
+  /** The stream's own count of rows it sampled out (a new connection starts again from 0). */
+  noteSampling(stream) {
+    const value = Number(stream.live_sampled_out);
+    if (!Number.isFinite(value) || value < 0) return;
+    if (value < this.sampledBase) this.sampledBase = 0;  // a reconnect: the server counts this stream from 0
+    if (value === this.sampledOut) return;
+    this.sampledOut = value;
+    this.updateState();
   }
 
   /** The server could not replay everything missed during a reconnect: say so instead of implying a full list. */

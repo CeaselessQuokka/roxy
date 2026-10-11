@@ -23,8 +23,8 @@ from typing import Any
 
 import pytest
 
+from pages_harness import HOSTILE, parse_html, setting_selector
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import HOSTILE, parse_html
 from roxy.core.reasons import Egress
 from roxy.core.style_guard import find_style_issues
 from roxy.egress.guard import LeakTrip
@@ -60,12 +60,13 @@ async def test_every_card_renders_without_an_error_and_holds_its_settings(page: 
         section = fragment.select_one(f"section#{card.id}[data-card]")
         assert section is not None, card.id
         assert fragment.select_one("[data-card-error]") is None, (card.id, section.text()[:300])
-        for spec in registry.settings_for(registry.anchor(PAGE_ID, card.id)):
-            assert section.select_one(f'[data-setting-key="{spec.key}"]') is not None, (card.id, spec.key)
+        anchor = registry.anchor(PAGE_ID, card.id)
+        for spec in registry.settings_for(anchor):
+            assert section.select_one(setting_selector(spec.key, anchor)) is not None, (card.id, spec.key)
     assert not doc.select("[data-card-error]")
     assert doc.select_one('link[href*="css/pages/egress"]') is not None
     assert doc.select_one('script[type="module"][src*="js/pages/egress"]') is not None
-    deferred = {node.get("id") for node in doc.select("section.page-card--lazy[hx-trigger=load]")}
+    deferred = {node.get("id") for node in doc.select("section.page-card--lazy[hx-trigger=revealed]")}
     assert deferred == {"rotator", "exit-ips", "sessions"}
     assert find_style_issues((await page.get(PAGE)).text, "egress") == []
 

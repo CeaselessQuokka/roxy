@@ -16,7 +16,7 @@
 {% from "components/alert.html" import inline_alert %}
 {% from "components/icon.html" import icon %}
 {% from "components/format.html" import caller_text %}
-{% from "admin/pages/upstream/_macros.html" import when %}
+{% from "components/pieces.html" import when %}
 {% call page_card(frame) %}
 {% if stopped %}{{ inline_alert("warn", "The rotator is stopped for now", "Because " ~ stop_words ~ ".") }}{% endif %}
 <div class="kpi-grid">{% for t in tiles %}{{ kpi_api(t.tile, display=t.display) }}{% endfor %}</div>
@@ -32,7 +32,7 @@
 {{ series_chart("chart-rotator-daily", "Rotator bytes per day this cycle", series=daily, kind="bars", y_format="bytes",
                 series_options={"cumulative": {"kind": "line"}, "even_pace": {"kind": "line"}},
                 summary="Rotator bytes per UTC day of the billing cycle, the running total and an even pace to the quota.", size="sm",
-                help="Metered rotator bytes per UTC day; the even pace line reaches the quota on the last day of the cycle.") }}
+                help=daily_help ~ " One bar per UTC day; the even pace line reaches the quota on the last day of the cycle.") }}
 {% else %}
 <p class="muted">No rotator bytes yet this cycle, so there are no daily bars.</p>
 {% endif %}

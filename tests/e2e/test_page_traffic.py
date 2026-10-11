@@ -23,12 +23,14 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.pages.testing import THEMES, VIEWPORTS
+from pages_harness import THEMES, VIEWPORTS
 
 PAGE = "/admin/traffic"
 CARDS = ("requests", "bytes", "verbs", "status", "latency", "heatmap", "trends")
 NO_HOSTILE_MARKUP = """() => !document.querySelector('img[src="x"], [onerror], [onclick], a[href^="javascript:"]')"""
-ONE_OF_EACH = "() => ['status', 'latency', 'verbs'].every((id) => document.querySelectorAll('section#' + id).length === 1)"
+ONE_OF_EACH = (
+    "() => ['status', 'latency', 'verbs'].every((id) => document.querySelectorAll('section#' + id).length === 1)"
+)
 
 
 def _total(answer: dict[str, Any]) -> float:
@@ -61,6 +63,7 @@ def test_the_status_view_and_the_latency_split_swap_their_card_in_place(open_adm
     page = admin.page
     _loaded(admin)
     page.evaluate("window.__sameDocument = true")
+    page.locator("#traffic-status-view").focus()  # as a keyboard or pointer user would have it
     page.select_option("#traffic-status-view", "source")
     admin.wait("document.querySelector('#traffic-status-chart-title').textContent.includes('who returned')")
     admin.wait("document.querySelector('#traffic-status-chart').dataset.chartReady === '1'")
@@ -84,13 +87,11 @@ def test_a_table_sorts_in_place_without_nesting_its_card(open_admin: Any) -> Non
     _loaded(admin)
     sort = '#status [data-table="traffic_status_sources"] [data-dt-sort="status"]'
     page.locator(sort).click()
-    admin.wait(
-        "document.querySelector('#status th[data-col=\"status\"]').getAttribute('aria-sort') !== 'none'"
-    )
+    admin.wait("document.querySelector('#status th[data-col=\"status\"]').getAttribute('aria-sort') !== 'none'")
     assert page.evaluate(ONE_OF_EACH)
     assert page.locator("section#status section#status").count() == 0
     codes = page.locator('#status [data-table="traffic_status_sources"] td[data-col="status"]').all_inner_texts()
-    order = page.locator("#status th[data-col=\"status\"]").get_attribute("aria-sort")
+    order = page.locator('#status th[data-col="status"]').get_attribute("aria-sort")
     numbers = [int(code) for code in codes]
     assert numbers == sorted(numbers, reverse=order == "descending")
     assert "status=" not in page.url  # a second table of the page keeps its state out of the address

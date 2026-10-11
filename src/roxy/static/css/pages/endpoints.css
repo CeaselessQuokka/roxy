@@ -24,6 +24,14 @@
   min-width: 24ch;
 }
 
+/* Ten columns on one screen at 1440 px: a little less space between them than the default table. */
+@media (min-width: 761px) {
+  .dt[data-table="endpoints"] .dt__table th,
+  .dt[data-table="endpoints"] .dt__table td {
+    padding-inline: var(--sp-2);
+  }
+}
+
 .card-controls {
   display: flex;
   flex-wrap: wrap;
@@ -48,6 +56,10 @@
 }
 
 /* The request tables (recent card and drill-down). */
+.ep-requests {
+  container: ep-requests / inline-size;
+}
+
 .ep-requests__table {
   width: 100%;
   min-width: 760px;
@@ -59,13 +71,88 @@
 }
 
 .ep-requests__url {
-  max-width: 34ch;
+  min-width: 24ch;
+  max-width: 40ch;
+  white-space: normal;
   overflow-wrap: anywhere;
 }
 
-.ep-requests__ua {
-  max-width: 26ch;
+/* A table cell ignores max-width, so the User-Agent is bounded by a block inside it; it wraps (the simple table
+   keeps its cells on one line otherwise). */
+.ep-requests__clip {
+  display: block;
+  max-width: 24ch;
+  white-space: normal;
   overflow-wrap: anywhere;
+}
+
+/* A narrow region (a phone, or the drawer) turns the request tables into small cards: when (opens the drawer),
+   the request, its status and outcome, the client. The cache state, the time taken and the User-Agent are in the
+   request drawer (plan 14.8). A container query, so the drawer on a wide screen gets the same cards. */
+@container ep-requests (max-width: 700px) {
+  .ep-requests__table {
+    min-width: 0;
+  }
+
+  .ep-requests__table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .ep-requests__table tbody,
+  .ep-requests__table tr {
+    display: block;
+  }
+
+  .ep-requests__table tbody tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) max-content;
+    gap: var(--sp-1) var(--sp-3);
+    padding: var(--sp-3) 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .ep-requests__table tbody th,
+  .ep-requests__table tbody td {
+    display: block;
+    padding: 0;
+    border: 0;
+    text-align: start;
+  }
+
+  .ep-requests__when {
+    grid-column: 1 / -1;
+  }
+
+  .ep-requests__when .link-btn {
+    min-height: var(--target-touch);
+  }
+
+  .ep-requests__url {
+    grid-column: 1;
+    min-width: 0;
+    max-width: none;
+  }
+
+  .ep-requests__status {
+    grid-column: 2;
+    text-align: end;
+  }
+
+  .ep-requests__outcome,
+  .ep-requests__client {
+    grid-column: 1 / -1;
+  }
+
+  .ep-requests__table .ep-requests__cache,
+  .ep-requests__table .ep-requests__took,
+  .ep-requests__table .ep-requests__ua {
+    display: none;
+  }
 }
 
 /* The drill-down. */
@@ -81,6 +168,12 @@
 
 .ep-detail__notice {
   margin: 0;
+}
+
+/* Links inside sentences and lists are underlined: color is never the only sign of a link (WCAG 1.4.1). */
+.ep-detail a:not(.btn) {
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .ep-detail__section {
@@ -133,6 +226,7 @@
 }
 
 .ep-detail__paths td:first-child {
+  white-space: normal;
   overflow-wrap: anywhere;
 }
 
@@ -140,44 +234,6 @@
 .drawer .ep-detail__charts,
 .drawer .ep-detail__pair {
   grid-template-columns: minmax(0, 1fr);
-}
-
-/* The inline reset in the drawer (roxy/admin/pages/_traffic_reset.py). */
-.g2-reset__lead {
-  max-width: 70ch;
-}
-
-.g2-reset__section {
-  display: grid;
-  gap: var(--sp-3);
-}
-
-.g2-reset__heading {
-  font-size: var(--fs-3);
-}
-
-.g2-reset__snapshots {
-  display: grid;
-  gap: var(--sp-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  font-size: var(--fs-1);
-}
-
-.g2-reset__snapshots li {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--sp-2);
-}
-
-.g2-reset__snapshots .icon {
-  flex: none;
-  margin-top: 2px;
-}
-
-.g2-reset__target {
-  overflow-wrap: anywhere;
 }
 
 /* The Live page's request drawer, opened from the request tables (the rules live.css has for it there). */
@@ -246,8 +302,7 @@
   .card-controls .chip-select,
   .card-controls select,
   .card-controls .btn,
-  .ep-detail__actions .btn,
-  .g2-reset__form .btn {
+  .ep-detail__actions .btn {
     min-height: var(--target-touch);
   }
 

@@ -8,7 +8,6 @@
   under the form. Patterns and notes are caller text.
   Context: `frame`, `table`, `modes`, `create_url`, `summary`.
 -#}
-{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
 {% from "components/page_card.html" import page_card %}
 {% from "components/table.html" import data_table %}
 {% from "components/icon.html" import icon %}
@@ -72,4 +71,3 @@
   </form>
 </div>
 {% endcall %}
-{% endif %}

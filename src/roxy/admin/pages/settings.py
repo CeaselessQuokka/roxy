@@ -22,10 +22,12 @@ Why it exists
     second factor, the audit log), never through a page route.
 
 How it works
-    The editor renders only one page of controls (25 by default; a control is a few kilobytes and the catalog has
-    about 500 settings, plan 6.7 on the 1 GB server). Its filter form asks the editor's fragment and swaps only the
-    results; the page script keeps the filters in the address bar and remembers unsaved edits across pages of
-    results. The history is lazy (it loads when scrolled into view); its own requests get only the table back.
+    The editor renders only one page of controls (10 by default, `DEFAULT_EDITOR_SIZE`; a control is about 6 KiB
+    and the catalog has about 500 settings, plan 6.7 on the 1 GB server). Its filter form asks the editor's fragment
+    and swaps only the results; the page script keeps the filters in the address bar and remembers unsaved edits
+    across pages of results. The history and the two settings cards are lazy (they load when scrolled into view);
+    the history table's own requests get only the table back. `?key=<key>` adds that setting's newest changes
+    (`key_history`).
 
 What to read next
     `roxy/admin/api/settings.py`, `templates/admin/pages/settings.html`, `templates/components/setting.html`,
@@ -39,6 +41,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
+from urllib.parse import urlencode
 
 from roxy.admin.api import common
 from roxy.admin.api import settings as settings_api
@@ -54,12 +57,16 @@ router = page.router
 EDITOR_PREFIX: Final = "set-editor"
 """DOM id prefix of the editor's controls (inline cards use `set-<card>`, so a key on two cards never clashes)."""
 EDITOR_SIZES: Final[tuple[int, ...]] = (10, 25, 50, 100)
-DEFAULT_EDITOR_SIZE: Final = 25
+DEFAULT_EDITOR_SIZE: Final = 10
+"""Controls on the first paint (plan 6.7 page weight: a control is about 6 KiB of HTML and pages are sent
+uncompressed because of BREACH; 25 made the page 243 KiB, 10 keeps it near 150). 25, 50 and 100 stay one choice away."""
 HISTORY_TABLE_ID: Final = "settings-history"
 HISTORY_COLUMNS: Final = ("changed_at", "key", "old", "new", "changed_by", "source", "reason", "id")
 HISTORY_KEYS: Final = ("changed_at", "key", "new")
 HISTORY_HIDDEN: Final = ("id",)
 MAX_VALUE_CHARS: Final = 300
+KEY_HISTORY_ROWS: Final = 10
+"""Changes listed under one setting in the one-setting view (`?key=`); the Audit page has the rest."""
 TRUE_TEXTS: Final = frozenset({"1", "true", "on", "yes"})
 RISK_LABELS: Final[dict[str, str]] = {"low": "Low risk", "medium": "Medium risk", "high": "High risk"}
 HOME_LABELS: Final[dict[str, str]] = {
@@ -113,14 +120,17 @@ def editor_query(view: PageView) -> EditorQuery:
             query.notices.append(f"Showing {DEFAULT_EDITOR_SIZE} settings a page; choose 10, 25, 50 or 100.")
         size = DEFAULT_EDITOR_SIZE
     query.page_size = size
-    raw_key = view.param("key", max_chars=80)
-    if raw_key:
-        resolved = catalog.resolve_key(raw_key)
-        if resolved is not None and resolved in catalog.CATALOG:
-            query.key = resolved
-        else:
-            query.notices.append("No setting has the key in the address, so every setting is shown.")
+    query.key = page_key(view)
+    if view.param("key", max_chars=80) and query.key is None:
+        query.notices.append("No setting has the key in the address, so every setting is shown.")
     return query
+
+
+def page_key(view: PageView) -> str | None:
+    """The catalog key the address names with `?key=` (a v1 name is resolved to its v2 key), else None."""
+    raw = view.param("key", max_chars=80)
+    resolved = catalog.resolve_key(raw) if raw else None
+    return resolved if resolved is not None and resolved in catalog.CATALOG else None
 
 
 def other_homes(spec: SettingSpec) -> list[dict[str, str | None]]:
@@ -214,6 +224,7 @@ async def editor_card(view: PageView) -> dict[str, Any]:
     shown = entries[start : start + query.page_size]
     return {
         "query": query,
+        "key_history": await key_history(view, query.key) if query.key else None,
         "groups": editor_items(view, shown),
         "total": total,
         "catalog_total": listing["total"],
@@ -235,6 +246,30 @@ async def editor_card(view: PageView) -> dict[str, Any]:
 
 
 # ============================================================================================ history
+
+
+async def key_history(view: PageView, key: str) -> dict[str, Any]:
+    """The newest changes of one setting for the editor's one-setting view (plan 15.2 "history per key"): the same
+    `history_answer` the history card and `GET /settings/{key}/history` read, newest first. Each change opens in the
+    drawer (its before and after, and its revert form)."""
+    tq = common.check_table_query(
+        settings_api.HISTORY_TABLE, page=1, page_size=KEY_HISTORY_ROWS, sort="id", order="desc", q=None
+    )
+    answer = await settings_api.history_answer(view.ctx, tq, key=key)
+    rows = [
+        {
+            "id": item["id"],
+            "when": view.time_cell(item.get("changed_at")),
+            "before": value_text(item.get("old_effective")),
+            "after": value_text(item.get("new_effective")),
+            "after_default": item.get("new") is None,
+            "by": item.get("changed_by"),
+            "reason": item.get("reason"),
+            "drawer": view.fragment_url("history", change=item["id"]),
+        }
+        for item in answer["items"]
+    ]
+    return {"rows": rows, "total": int(answer["total"]), "audit_url": f"/admin/audit?target=setting:{key}"}
 
 
 def value_text(value: Any) -> str:
@@ -340,7 +375,7 @@ async def history_card(view: PageView) -> dict[str, Any]:
     filters = [filter_chip("source", "Source", source or "", _source_options(answer.get("sources") or (), source))]
     export = f"{common.API_PREFIX}/settings/history"
     if since is not None and view.time.view.get("range") != "custom":
-        export += f"?from={since}&to={until}"
+        export += f"?{urlencode({'from': since, 'to': until})}"
     table = table_view(
         view,
         HISTORY_TABLE_ID,
@@ -363,13 +398,13 @@ async def history_card(view: PageView) -> dict[str, Any]:
             "it happens. Try another range in the top bar, or clear the search and the source filter.",
             "icon": "history",
         },
-        search_placeholder="Search keys, reasons and who changed them",
+        search_placeholder="Search the history",
         notice=notice,
         address=False,
     )
     return {
         "table": table,
-        "table_only": view.in_fragment and view.request.headers.get("HX-Target") == HISTORY_TABLE_ID,
+        "table_only": view.table_request(HISTORY_TABLE_ID),
         "total": answer["total"],
         "whole": since is None,
         "range_description": view.time.view.get("description"),
@@ -393,13 +428,17 @@ async def import_export_card(view: PageView) -> dict[str, Any]:
     }
 
 
-@page.card("alerts")
+# The two settings cards hold 6 and 9 full setting controls (about 90 KB of HTML together) at the bottom of the page:
+# lazy, so the first paint stays the editor (plan 6.7 and the P11 contract on the 1 GB server).
+
+
+@page.card("alerts", lazy=True)
 async def alerts_card(view: PageView) -> dict[str, Any]:
     """The alert settings (placed by the catalog), with where the channels are configured."""
     return {}
 
 
-@page.card("public-site")
+@page.card("public-site", lazy=True)
 async def public_site_card(view: PageView) -> dict[str, Any]:
     """The public site settings (placed by the catalog), with links to the pages they change."""
     return {}
@@ -407,11 +446,14 @@ async def public_site_card(view: PageView) -> dict[str, Any]:
 
 __all__ = [
     "EDITOR_SIZES",
+    "KEY_HISTORY_ROWS",
     "EditorQuery",
     "editor_items",
     "editor_query",
+    "key_history",
     "other_homes",
     "page",
+    "page_key",
     "router",
     "value_text",
 ]

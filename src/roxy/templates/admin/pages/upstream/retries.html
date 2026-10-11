@@ -7,10 +7,9 @@
   model). The settings below are the retry backoff and the CSRF token cache.
   Context: `frame`, `answer`, `by_status`, `by_reason`, `by_egress`, `kinds`, `returned`.
 -#}
-{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
 {% from "components/page_card.html" import page_card %}
 {% from "components/format.html" import num, caller_text %}
-{% from "admin/pages/upstream/_macros.html" import stat %}
+{% from "components/pieces.html" import stat %}
 {% macro pairs(caption, rows, head, mono=False) -%}
 <div class="table-scroll g3-scroll" role="region" aria-label="{{ caption }}" tabindex="0">
   <table class="simple-table g3-table">
@@ -29,7 +28,8 @@
   {{ stat("CSRF token refreshes", num(answer.csrf_retries), "Roblox asked for a token; the call was repeated once") }}
   {{ stat("Retries after a 429", num(fallback_429), "on another anonymous egress (fallback_on_429)") }}
 </dl>
-<h3 class="g3-subhead">The retry log <span class="muted">(v1's count: every logged retry, {{ num(answer.total) }} in this range)</span></h3>
+<h3 class="g3-subhead">Retries logged one by one <span class="muted">(v1's retry log: {{ num(answer.total) }} in this range)</span></h3>
+<p class="muted g3-note">Roxy logs each repeat with a fresh CSRF token here, by Roblox's status, the reason and the egress. Retries after a Roblox error or a timeout are counted per call in "Upstream calls by attempt kind" below.</p>
 <div class="grid grid--3 g3-tables">
   {{ pairs("By status", by_status, "Status", mono=True) }}
   {{ pairs("By reason", by_reason, "Reason") }}
@@ -49,4 +49,3 @@
   </div>
 </div>
 {% endcall %}
-{% endif %}

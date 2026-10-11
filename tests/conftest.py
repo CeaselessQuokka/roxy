@@ -19,6 +19,9 @@ How it works
       `EnvSettings` from them, falling back to a plain object while `config/env.py` does not exist yet.
     - `app` and `client` skip the test cleanly while `roxy.main.create_app` cannot be imported yet.
     - Tests marked `live` run only with `ROXY_LIVE_TESTS=1`, and then without the guard. Agents never set it.
+    - The database thread guard (`tests/db_threads.py`): a module whose tests leave a database open fails at its
+      end, naming the test that opened it, and a database thread still running when the session ends fails the
+      run (a forgotten database once broke a later test that counts database threads).
 
 What to read next
     `tests/unit/storage/test_storage_db.py` for fixtures in use, and `roxy/storage/db.py`.
@@ -38,6 +41,7 @@ from typing import Any
 
 import pytest
 
+import db_threads
 from roxy.core.clock import FakeClock
 
 # ------------------------------------------------------------------------------------------- socket guard
@@ -292,6 +296,50 @@ def dbs(env: Any) -> Iterator[Any]:
 def fake_clock() -> FakeClock:
     """A clock that moves only when the test calls `advance()` (starts at a fixed time in 2025)."""
     return FakeClock()
+
+
+# ------------------------------------------------------------------------------- database thread guard (G8)
+
+
+@pytest.fixture(autouse=True)
+def _database_threads_of_each_test(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Note which test started each database thread still running after it (the module guard names it)."""
+    before = db_threads.alive()
+    yield
+    db_threads.note_started(db_threads.alive() - before, request.node.nodeid)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _databases_close_with_their_module() -> Iterator[None]:
+    """Fail the module whose tests leave a database open (`tests/db_threads.py`): its threads would run until the
+    test process ends and break any later test that counts database threads (finding G8). A database a broader
+    fixture keeps open on purpose is `db_threads.share`d by it."""
+    before = db_threads.alive()
+    yield
+    left = db_threads.still_running(db_threads.alive() - before)
+    if left:
+        pytest.fail(
+            "this module left databases open (close them in the test or its fixture: Databases.close_all, "
+            "Database.close, or the app's lifespan):\n  " + "\n  ".join(db_threads.describe(t) for t in left),
+            pytrace=False,
+        )
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Every fixture is torn down by now: a database thread still running was never closed (a shared database whose
+    owner never unshared it included). Reported, and the run fails."""
+    left = db_threads.still_running(db_threads.alive(), grace_s=db_threads.GRACE_S)
+    shared = sorted((t for t in db_threads.alive() if db_threads.is_shared(t)), key=lambda t: t.name)
+    if not (left or shared):
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    lines = [db_threads.describe(t) for t in [*left, *shared]]
+    if reporter is not None:
+        reporter.write_sep("=", "database threads still running at the end of the session", red=True)
+        for line in lines:
+            reporter.write_line(line)
+    if session.exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 # ------------------------------------------------------------------------------------------- app and client

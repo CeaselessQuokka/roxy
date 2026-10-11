@@ -27,8 +27,8 @@ from typing import Any
 
 import pytest
 
+from pages_harness import HOSTILE, parse_html
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import HOSTILE, parse_html
 from roxy.core.style_guard import find_style_issues
 
 PAGE = "/admin/data"
@@ -180,6 +180,38 @@ async def test_the_reset_form_is_built_from_the_api(page: Any) -> None:
     assert form.get("data-preview-url") == "/admin/api/v1/data/resets/preview"
     assert form.get("data-run-url") == "/admin/api/v1/data/resets"
     assert form.get("data-factory-url") == "/admin/api/v1/data/resets/factory"
+
+
+async def test_every_family_links_to_where_its_numbers_are_shown(page: Any) -> None:
+    api = (await page.api("GET", "data/resets")).json()
+    doc = parse_html((await page.fragment("data", "resets")).text)
+    for family in api["families"]:
+        note = doc.select_one(f"#family-{family['name']}-note")
+        assert note is not None, family["name"]
+        link = note.select_one("a")
+        assert link is not None, family["name"]
+        page_id, _, card_id = family["card"].partition("#")
+        assert card_id in {card.id for card in registry.cards_for(page_id)}, family  # every family names a real card
+        assert link.get("href") == f"/admin/{page_id}#{card_id}", (family["name"], link.get("href"))
+
+
+async def test_the_factory_reset_and_the_export_privacy_need_a_fresh_second_factor(page: Any) -> None:
+    resets = parse_html((await page.fragment("data", "resets")).text)
+    factory = resets.select_one("form[data-reset-form]").get("data-factory-url")
+    body = {"scope": "factory", "preview": "0" * 64, "reason": "test", "confirm": "factory reset"}
+    assert (await page.api("POST", factory, json=body, csrf=False)).status_code == 403
+    page.make_mfa_stale()
+    stale = await page.api("POST", factory, json=body)
+    assert stale.status_code == 403
+    assert stale.json()["error"]["code"] == "reauth_required"
+    exports = parse_html((await page.fragment("data", "exports")).text)
+    form = exports.select_one('form.setting[data-setting-key="export_include_ips"]')
+    assert form is not None
+    assert form.get("data-fresh-mfa") is not None
+    refused = await page.api("PUT", form.get("data-setting-api"), json={"value": True, "reason": "test"})
+    assert refused.status_code == 403
+    assert refused.json()["error"]["code"] == "reauth_required"
+    assert (await page.api("GET", "settings/export_include_ips")).json()["setting"]["value"] in (False, 0)
 
 
 async def test_a_link_preselects_the_families_and_the_scope(page: Any) -> None:

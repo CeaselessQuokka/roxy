@@ -48,17 +48,103 @@
   white-space: normal;
 }
 
-.data-table__actions {
+.data-table td.data-table__actions {
   text-align: right;
+}
+
+.card__body--flush > .table-scroll {
+  margin-top: var(--sp-3);
+}
+
+/* Tables read like the shared data tables on wider screens: a header band, roomier cells, and in a flush card
+   the first and last columns line up with the card's text (16 px in) instead of touching its edge. */
+@media (min-width: 641px) {
+  .data-table th,
+  .data-table td {
+    padding: 6px var(--sp-3);
+  }
+
+  .data-table thead th {
+    height: 36px;
+    background: var(--surface-2);
+  }
+
+  .card__body--flush > .table-scroll .data-table th:first-child,
+  .card__body--flush > .table-scroll .data-table td:first-child,
+  .card__body--flush > .data-limits-box .data-table th:first-child,
+  .card__body--flush > .data-limits-box .data-table td:first-child {
+    padding-left: var(--sp-4);
+  }
+
+  .card__body--flush > .table-scroll .data-table th:last-child,
+  .card__body--flush > .table-scroll .data-table td:last-child,
+  .card__body--flush > .data-limits-box .data-table th:last-child,
+  .card__body--flush > .data-limits-box .data-table td:last-child {
+    padding-right: var(--sp-4);
+  }
+}
+
+.card__body--flush > .data-limits-box {
+  margin-top: var(--sp-3);
+}
+
+.card__body--flush > .data-limits-box > summary {
+  margin: 0 var(--sp-4);
+}
+
+.data-backups__how {
+  margin-top: var(--sp-4);
+}
+
+.data-backups__how > p {
+  margin-top: var(--sp-2);
+  max-width: 90ch;
+  color: var(--text-muted);
 }
 
 .data-limits {
   margin-top: var(--sp-3);
 }
 
+/* Links set inside a line of text still get a whole target (WCAG 2.5.8; 44 px on a phone, below). */
+.data-setting-ref,
+.data-family__note a,
+.data-recent__list a,
+.data-v1 td a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--target-min);
+}
+
 .data-setting-ref {
   margin-left: var(--sp-1);
   font-size: var(--fs-1);
+}
+
+/* "Shown on <page> > <card>" sits on its own line under the family's note, so a tall touch target never
+   stretches a line of text. */
+.data-family__note a {
+  display: flex;
+  width: fit-content;
+}
+
+/* The export privacy badge is a sentence: on a phone it wraps instead of running out of its card. */
+.data-exports__privacy .badge {
+  max-width: 100%;
+  padding-block: 2px;
+  line-height: 1.3;
+  white-space: normal;
+}
+
+/* A link inside a line of text is underlined, so it never differs from the text by color alone (WCAG 1.4.1). */
+.data-setting-ref,
+.data-family__note a,
+.data-intro a,
+.data-note a,
+.data-recent__list a,
+.data-v1 td a,
+.data-reset-result a {
+  text-decoration: underline;
 }
 
 .data-files .table-scroll {
@@ -245,12 +331,16 @@
     display: block;
   }
 
+  /* The header row stays for screen readers but takes no room. A table-header-group ignores `overflow`, so its
+     cells would still widen the page by their full width: it becomes a block first, then clips them. */
   .data-table thead {
+    display: block;
     position: absolute;
     width: 1px;
     height: 1px;
     overflow: hidden;
     clip-path: inset(50%);
+    white-space: nowrap;
   }
 
   .data-table tr {
@@ -274,6 +364,7 @@
   .data-table td::before {
     content: attr(data-label);
     color: var(--text-muted);
+    font-family: var(--font-sans);
     font-weight: var(--fw-semibold);
     text-align: left;
   }
@@ -301,6 +392,13 @@
 
   .data-fieldset {
     padding: var(--sp-3);
+  }
+
+  .data-setting-ref,
+  .data-family__note a,
+  .data-recent__list a,
+  .data-v1 td a {
+    min-height: var(--target-touch);
   }
 }
 

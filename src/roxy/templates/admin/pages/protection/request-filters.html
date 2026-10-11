@@ -10,13 +10,14 @@
   static/js/pages/protection.js). Attempts: the paths a filter refused in the range, by how many clients, and which
   filter refused them (`GET /header-rules/attempts`, the "Refused by" column).
   Context: `frame`, `tables`, `only`, `presets`, `api`; for the drawer `detail`.
+  Context also has `clear` (`protection.py clear_action`): v1's clear button of this section, a plan 6.8 data reset.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/table.html" import data_table %}
 {% from "components/dialog.html" import confirm_dialog %}
 {% from "components/icon.html" import icon %}
 {% from "components/glossary.html" import term with context %}
-{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, reason_field %}
+{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, reason_field, clear_button, clear_dialog %}
 {% from "admin/pages/protection/_rule_fields.html" import header_fields %}
 {% if detail %}{% include "admin/pages/protection/_rule_drawer.html" %}
 {% elif only %}{{ data_table(**tables[only]) }}{% else %}
@@ -71,7 +72,10 @@
     <div class="prot-result" data-tester-result aria-live="polite"></div>
   </form>
   {% endcall %}
-  {% call tab_panel("prot-filter-tabs", "attempts") %}{{ data_table(**tables.attempts) }}{% endcall %}
+  {% call tab_panel("prot-filter-tabs", "attempts") %}
+    <div class="prot-tabbar">{{ clear_button(clear) }}</div>
+    {{ data_table(**tables.attempts) }}
+  {% endcall %}
 {% endcall %}
 {% call confirm_dialog("dlg-prot-filter-add", "Add a request filter", api.create, confirm_label="Add filter", api=True, danger=True,
                        success="Request filter added.", on_success="refresh", refresh="request-filters",
@@ -80,5 +84,6 @@
   {{ header_fields("dlg-prot-filter-add") }}
   {{ reason_field("dlg-prot-filter-add-reason") }}
 {% endcall %}
+{{ clear_dialog(clear, "request-filters refusals") }}
 {% endcall %}
 {% endif %}

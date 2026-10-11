@@ -356,6 +356,21 @@ def test_the_fleet_starts_with_the_units_environment(tmp_path: Path) -> None:
     assert env["ROXY_WORKERS"] == "2"
 
 
+def test_the_memory_rows_name_the_measured_units_limits(tmp_path: Path) -> None:
+    from load.fleet import REPO, unit_memory_limits
+    from load.scenarios import memory_limits_text
+
+    own = unit_memory_limits(REPO)
+    assert set(own) == {"MemoryHigh", "MemoryMax"}
+    assert memory_limits_text(own) == f"MemoryHigh {own['MemoryHigh']}, MemoryMax {own['MemoryMax']}"
+    unit = tmp_path / "deploy" / "systemd" / "roxy@.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\n# a comment about MemoryHigh=1M\nMemoryHigh=320M\nMemoryMax=420M\n")
+    assert unit_memory_limits(tmp_path) == {"MemoryHigh": "320M", "MemoryMax": "420M"}
+    assert unit_memory_limits(tmp_path / "missing") == {}
+    assert memory_limits_text({}) == "MemoryHigh and MemoryMax of roxy@.service"
+
+
 def test_absolute_paths_rewrites_only_path_options() -> None:
     out = absolute_paths(["replay", "--json", "r.json", "--work=w", "--scale", "0.5"])
     assert out[0] == "replay"

@@ -381,11 +381,17 @@ def _families(catalog_answer: Mapping[str, Any], chosen: set[str]) -> list[dict[
     every = [dict(f) for f in catalog_answer["families"]]
     for family in every:
         page_id, _, card_id = str(family.get("card") or "").partition("#")
-        known = registry.known(page_id) and card_id in {c.id for c in registry.cards_for(page_id)}
-        family["href"] = f"/admin/{page_id}#{card_id}" if known else ""
-        family["card_label"] = (
-            f"{registry.page(page_id).title} > {registry.card(page_id, card_id).title}" if known else ""
-        )
+        page_known = registry.known(page_id)
+        card_known = page_known and card_id in {c.id for c in registry.cards_for(page_id)}
+        # A family whose card the registry does not have still links to its page (never a dead anchor).
+        if card_known:
+            family["href"] = f"/admin/{page_id}#{card_id}"
+            family["card_label"] = f"{registry.page(page_id).title} > {registry.card(page_id, card_id).title}"
+        elif page_known:
+            family["href"] = f"/admin/{page_id}"
+            family["card_label"] = f"the {registry.page(page_id).title} page"
+        else:
+            family["href"] = family["card_label"] = ""
         family["checked"] = family["name"] in chosen
         family["action_words"] = ", ".join(ACTION_WORDS.get(a, a) for a in family.get("actions") or ())
     top = [f for f in every if not f.get("parent")]

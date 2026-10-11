@@ -6,7 +6,9 @@ What this is
         distinct values are stored, the share of requests that carried a new value, and whether the values are
         ignored or look unbounded (v1's "high cardinality" badge).
       * `header_values(conn, name, ...)`: one header's stored values, most frequent first (the v1 drill-down).
-      * `user_agents(conn, ...)`: the User-Agent table.
+      * `user_agents(conn, ...)`: the User-Agent table, and `user_agent_detail(conn, ua_hash)`: one User-Agent with
+        where its newest request went, who sent it and which header names it carried (v1's User-Agent drill-down,
+        metrics.db schema 8).
       * `blocked_fingerprints(conn, ...)` and `blocked_rows(conn, ...)`: header names and User-Agents of requests a
         request filter refused (row 134, the "Blocked" tab), from the aggregated `blocked_header` and
         `blocked_user_agent` events; `blocked_rows` is the same as one exportable table.
@@ -37,6 +39,7 @@ What to read next
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Collection
 from typing import Any, Final
@@ -168,28 +171,72 @@ def user_agents(
     limit: int = 25,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """The User-Agent table (stored text is scrubbed at write time), paged in SQL."""
+    """The User-Agent table (stored text is scrubbed at write time), paged in SQL. Each row also carries its
+    `ua_hash` (the key of `user_agent_detail`) and the newest request's detail (`_ua_row`)."""
     order = _order(UA_SORTS, sort, descending)
     size, skip = _page(limit, offset)
     where, params = ("WHERE instr(lower(user_agent), ?) > 0", [search.lower()]) if search else ("", [])
     total = int(conn.execute(f"SELECT count(*) FROM fingerprint_user_agents {where}", params).fetchone()[0])  # noqa: S608
     rows = conn.execute(
-        f"SELECT user_agent, count, first_seen, last_seen FROM fingerprint_user_agents {where} "  # noqa: S608
+        f"SELECT {_UA_COLUMNS} FROM fingerprint_user_agents {where} "  # noqa: S608
         f"ORDER BY {order}, ua_hash LIMIT ? OFFSET ?",
         (*params, size, skip),
     ).fetchall()
+    return {"total": total, "rows": [_ua_row(row) for row in rows]}
+
+
+_UA_COLUMNS: Final = (
+    "ua_hash, user_agent, count, first_seen, last_seen, last_path, last_caller, last_header_names, last_detail_at"
+)
+UA_HASH_PATTERN: Final = r"^[0-9a-f]{32}$"
+"""A `fingerprint_user_agents` key (`fingerprints.row_hash`): 32 lowercase hex characters."""
+
+
+def header_name_list(text: Any) -> list[str]:
+    """The stored `last_header_names` JSON array as a list of names (empty for NULL or anything malformed)."""
+    if not isinstance(text, str) or not text:
+        return []
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return []
+    return [str(item) for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+def _ua_row(row: sqlite3.Row) -> dict[str, Any]:
+    detail_at = row["last_detail_at"]
     return {
-        "total": total,
-        "rows": [
-            {
-                "user_agent": row["user_agent"],
-                "count": int(row["count"]),
-                "first_seen": int(row["first_seen"]),
-                "last_seen": int(row["last_seen"]),
-            }
-            for row in rows
-        ],
+        "ua_hash": row["ua_hash"],
+        "user_agent": row["user_agent"],
+        "count": int(row["count"]),
+        "first_seen": int(row["first_seen"]),
+        "last_seen": int(row["last_seen"]),
+        "last_path": row["last_path"],
+        "last_caller": row["last_caller"],
+        "last_header_names": header_name_list(row["last_header_names"]),
+        "last_detail_at": int(detail_at) if detail_at is not None else None,
     }
+
+
+def user_agent_detail(conn: sqlite3.Connection, ua_hash: str) -> dict[str, Any] | None:
+    """One User-Agent with what its newest recorded request looked like (v1 `GET /admin/fingerprints/user_agent`,
+    `.remake/v1notes/dashboard.md` 4.21), or None for an unknown key.
+
+    `{ua_hash, user_agent, count, first_seen, last_seen, last_path, last_caller, last_header_names,
+    last_detail_at, has_detail}`: the path (scrubbed), the client address (as the Endpoints page's last caller) and
+    the header names in the order sent (names only, a secret-shaped one as `fp:<hash>`) of that request, and when it
+    arrived. `has_detail` is False for a row written before metrics.db schema 8 (or imported from v1): Roxy has its
+    counts but never recorded a request detail for it.
+    """
+    row = conn.execute(
+        f"SELECT {_UA_COLUMNS} FROM fingerprint_user_agents WHERE ua_hash = ?",  # noqa: S608 (fixed columns)
+        (str(ua_hash),),
+    ).fetchone()
+    if row is None:
+        return None
+    item = _ua_row(row)
+    item["has_detail"] = item["last_detail_at"] is not None
+    return item
 
 
 def blocked_fingerprints(
@@ -321,6 +368,7 @@ def csp_reports(
 __all__ = [
     "CSP_SORTS",
     "HEADER_SORTS",
+    "UA_HASH_PATTERN",
     "UA_SORTS",
     "VALUE_SORTS",
     "blocked_fingerprints",
@@ -329,9 +377,11 @@ __all__ = [
     "clear_header_values",
     "csp_reports",
     "header_counts",
+    "header_name_list",
     "header_names",
     "header_values",
     "remove_blocked_header",
     "remove_header",
+    "user_agent_detail",
     "user_agents",
 ]

@@ -22,18 +22,27 @@
     Form mode (the development gallery; `api=False`): the form posts with htmx (`hx-post`, or another method), so
     the X-CSRF-Token header is added by static/js/htmx_setup.js; a 2xx closes the dialog, an error stays in it.
     Either way the confirm button stays disabled until the typed text matches, through the `typeConfirm` Alpine
-    component (static/js/components.js). Extra fields go in with `{% call confirm_dialog(...) %}...{% endcall %}`;
-    `appendix` is HTML placed after the form, inside the dialog (an inline setting cannot sit inside another form).
+    component (static/js/components.js). When the API checks the typed phrase itself (a data reset's `confirm`, a
+    VACUUM's), `confirm_field` names the field the typed text is sent as; without it the typed text is never sent.
+    Never put the phrase in `hidden` instead: the API's own check would then pass without anyone typing it.
+    Extra fields go in with `{% call confirm_dialog(...) %}...{% endcall %}`; `appendix` is HTML placed after the
+    form, inside the dialog (an inline setting cannot sit inside another form). `form_attrs` and `dialog_attrs` add
+    data attributes a page script reads (constant names from the template; a value of "" renders a bare attribute).
 -#}
 {% from "components/icon.html" import icon %}
 
+{% macro _attrs(attrs) -%}
+{%- for name, value in (attrs or {}).items() %} {{ name }}{% if value != "" %}="{{ value }}"{% endif %}{% endfor -%}
+{%- endmacro %}
+
 {% macro confirm_dialog(id, title, action, method="post", confirm_label="Confirm", danger=False, consequences=(),
                         body=None, type_to_confirm=None, reason=False, reason_required=False, hidden=None,
-                        api=False, success=None, on_success="", refresh="", appendix=None, hidden_types=None) -%}
-<dialog class="dialog{% if danger %} dialog--danger{% endif %}" id="{{ id }}" aria-labelledby="{{ id }}-title" aria-describedby="{{ id }}-desc">
+                        api=False, success=None, on_success="", refresh="", appendix=None, hidden_types=None,
+                        confirm_field=None, confirm_hint=None, form_attrs=None, dialog_attrs=None) -%}
+<dialog class="dialog{% if danger %} dialog--danger{% endif %}" id="{{ id }}" aria-labelledby="{{ id }}-title" aria-describedby="{{ id }}-desc"{{ _attrs(dialog_attrs) }}>
   <form class="dialog__form" data-dialog-form x-data="typeConfirm" x-on:reset="clear" data-expected="{{ type_to_confirm or '' }}"
         {%- if api %} data-api-form data-api-url="{{ action }}" data-api-method="{{ method|upper }}"{% if success %} data-success="{{ success }}"{% endif %}{% if on_success %} data-on-success="{{ on_success }}"{% endif %}{% if refresh %} data-refresh="{{ refresh }}"{% endif %}
-        {%- else %} hx-{{ method }}="{{ action }}" hx-swap="none"{% endif %}>
+        {%- else %} hx-{{ method }}="{{ action }}" hx-swap="none"{% endif %}{{ _attrs(form_attrs) }}>
     <header class="dialog__head">
       <h2 class="dialog__title" id="{{ id }}-title">{% if danger %}{{ icon("alert-triangle", cls="dialog__title-icon") }}{% endif %}{{ title }}</h2>
       <button type="button" class="icon-btn" data-dialog-close aria-label="Close">{{ icon("x") }}</button>
@@ -57,9 +66,10 @@
       {% if type_to_confirm %}
       <div class="field">
         <label class="field__label" for="{{ id }}-confirm">Type <strong class="mono">{{ type_to_confirm }}</strong> to confirm</label>
-        <input class="input mono" id="{{ id }}-confirm" name="confirm_text" autocomplete="off" spellcheck="false" autocapitalize="off"
-               x-on:input="onType" aria-describedby="{{ id }}-confirm-hint" data-json="never">
-        <p class="field__hint" id="{{ id }}-confirm-hint">This cannot be undone, so the button stays off until the text matches.</p>
+        <input class="input mono" id="{{ id }}-confirm" name="{{ confirm_field or 'confirm_text' }}" autocomplete="off" spellcheck="false" autocapitalize="off"
+               x-on:input="onType" aria-describedby="{{ id }}-confirm-hint {{ id }}-confirm-error" data-json="{{ 'string' if confirm_field else 'never' }}"{% if confirm_field %} required aria-required="true"{% endif %}>
+        <p class="field__hint" id="{{ id }}-confirm-hint">{{ confirm_hint or "This cannot be undone, so the button stays off until the text matches." }}</p>
+        <p class="field__error" id="{{ id }}-confirm-error" data-field-error="{{ confirm_field or 'confirm_text' }}" hidden></p>
       </div>
       {% endif %}
       <p class="dialog__error" data-dialog-error role="alert" hidden></p>

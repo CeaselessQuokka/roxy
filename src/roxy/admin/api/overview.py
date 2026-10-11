@@ -68,6 +68,7 @@ from roxy.admin.api.common import (
 from roxy.deps import get_ctx
 from roxy.lifespan import optional_import
 from roxy.metrics import queries, read_dashboard
+from roxy.metrics.catalog import avoided_note
 from roxy.metrics.queries import Window
 from roxy.scheduler import heartbeat, leader
 from roxy.storage import leases
@@ -499,11 +500,20 @@ async def build_kpis(ctx: Any, tr: TimeRange) -> dict[str, Any]:
                 continue
             if key == "avoided_pct":
                 avoided, demand = tiles_in["avoided"]["value"], tiles_in["demand"]["value"]
-                if demand:
+                note = avoided_note(current.get("value"))
+                if demand and note:
+                    # Below 0% (plan P6 never clamps it): say why instead of "-n of m requests needed no call".
+                    calls = tiles_in["upstream_calls"]["value"]
+                    tile["notice"] = f"Below 0%: {note} ({calls:,} upstream calls for {demand:,} caller requests)."
+                elif demand:
                     tile["notice"] = (
                         f"{avoided:,} of {demand:,} caller requests needed no call to Roblox (refused requests are "
                         "not counted as demand)."
                     )
+            elif key == "avoided":
+                note = avoided_note(tiles_in.get("avoided_pct", {}).get("value"))
+                if note:
+                    tile["notice"] = f"Below 0: {note}."  # a negative count as it is, with why (plan P6)
             elif key == "roblox_429":
                 calls = tiles_in["upstream_calls"]["value"]
                 share = _pct(float(current.get("value") or 0), float(calls or 0))

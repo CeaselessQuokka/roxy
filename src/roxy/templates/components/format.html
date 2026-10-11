@@ -19,7 +19,17 @@
   marked `translate="no"`, never put into an attribute that is interpreted (no href, src or style), and cut at
   `limit` characters with a note of the full length (the drawer or the API has the rest).
   `metric_value(value, unit, key="")` formats a number by its metric unit (`metrics/catalog.py` units).
+  `cell_value(cell)` renders a cell a route built (`{"text", "tone", "sub"}`, the same shape the table macro takes)
+  outside a data table: the text in its tone and the note under it; None is "n/a". An avoided share comes from
+  `admin/pages/fmt.py avoided_cell` this way on every page (a negative share with why it is negative).
 -#}
+{% macro cell_value(cell) -%}
+{%- if cell is none -%}n/a
+{%- else -%}
+{%- if cell.tone -%}<span class="tone tone--{{ cell.tone }}">{{ cell.text }}</span>{%- else -%}{{ cell.text }}{%- endif -%}
+{%- if cell.sub %}<span class="dt__sub">{{ cell.sub }}</span>{% endif -%}
+{%- endif -%}
+{%- endmacro %}
 {% macro caller_text(value, limit=200, block=False) -%}
 {%- if value is none or value == "" -%}<span class="muted">n/a</span>
 {%- else -%}

@@ -34,6 +34,7 @@
       <code class="hl-check__id">{{ caller_text(row.check_id, 120) }}</code>
       {% if row.critical %}{{ badge("Critical", "bad", "alert-octagon") }}{% endif %}
       <span class="hl-check__value">{{ caller_text(row.value, 120) if row.value else "" }}</span>
+      {{ icon("chevron-down", cls="hl-check__chevron") }}
     </summary>
     <div class="hl-check__body">
       <dl class="hl-check__facts">
@@ -124,7 +125,7 @@
   <p class="hl-allgood">{{ status_badge("ok", "Nothing needs attention") }} Every check passed or does not apply here.</p>
   {% endif %}
   <details class="hl-group"{% if not problems %} open{% endif %}>
-    <summary class="hl-group__summary">The other {{ others|length }} checks ({{ run.counts["pass"] }} passed, {{ run.counts["n/a"] }} n/a)</summary>
+    <summary class="hl-group__summary">{{ "The other check" if others|length == 1 else "The other " ~ others|length ~ " checks" }} ({{ run.counts["pass"] }} passed, {{ run.counts["n/a"] }} n/a)</summary>
     <ol class="hl-checks hl-checks--quiet" role="list" aria-label="Checks that passed or do not apply">
       {% for row in others %}{{ check_row(row) }}{% endfor %}
     </ol>

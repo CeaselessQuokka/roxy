@@ -8,9 +8,6 @@
  *     api_forms.js closed is opened again on the same recommendation, so the admin sees its new state, its watch
  *     window and the Undo button at once (the list and history cards refresh behind it).
  *   * When the preview panel arrives, focus moves to its heading, so keyboard and screen reader users land on it.
- *   * Tables: a table answer is the whole card (the kit renders one template per card), so a table swap keeps only
- *     the table out of it (`selectOverride`), and the card's refresh address follows the table's state, so a refresh
- *     after an action keeps the filters, search and page the admin chose.
  *
  * Why it exists
  *   Everything else on the page (cards, tables, the drawer, the forms, inline settings) is the shared design system;
@@ -23,7 +20,7 @@
  *   static/js/page.js, static/js/api_forms.js, roxy/admin/pages/recommendations.py.
  */
 
-import { onContent, openDrawerFrom, pageParams } from "roxy/page";
+import { openDrawerFrom, pageParams } from "roxy/page";
 
 const REC_ID = /^rec_[0-9A-Za-z]{1,64}$/;
 const REOPEN_DELAY_MS = 350;
@@ -50,18 +47,3 @@ document.addEventListener("htmx:afterSwap", (event) => {
   if (heading) heading.focus();
 });
 
-// A table's answer is its whole card: keep only the table (see the module docstring).
-document.addEventListener("htmx:beforeSwap", (event) => {
-  const target = event.detail && event.detail.target;
-  if (!(target instanceof Element) || !target.matches("[data-dt]") || !target.id) return;
-  if (!event.detail.selectOverride && target.closest("[data-card]")) event.detail.selectOverride = `#${CSS.escape(target.id)}`;
-});
-
-onContent("[data-dt]", (table) => {
-  const card = table.closest("[data-card]");
-  const form = table.querySelector("[data-dt-state]");
-  if (!card || !form || !table.dataset.dtSrc) return;
-  const params = new URLSearchParams();
-  for (const [name, value] of new FormData(form)) if (typeof value === "string" && value !== "") params.append(name, value);
-  card.dataset.cardSrc = `${table.dataset.dtSrc}?${params.toString()}`;
-});

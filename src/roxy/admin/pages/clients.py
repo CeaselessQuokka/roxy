@@ -54,10 +54,9 @@ from roxy.admin.api import common
 from roxy.admin.api import data as data_api
 from roxy.admin.api import lookup as lookup_api
 from roxy.admin.pages import fmt, shell
-from roxy.admin.pages.cache import reset_digest, row_key, table_only, table_state
+from roxy.admin.pages.cache import reset_digest, row_key, table_state
 from roxy.admin.pages.kit import Page, PageAdmin, PageView, table_query, table_view, templates_of
 from roxy.config.catalog import CATALOG
-from roxy.deps import get_ctx
 from roxy.metrics import read_producers
 
 log = logging.getLogger("roxy.admin.pages")
@@ -142,6 +141,20 @@ def _rate(value: Any) -> str:
     return f"{value:,.0f}" if float(value).is_integer() else f"{value:,.1f}"
 
 
+def _state_sub(item: Mapping[str, Any], notes: list[str]) -> dict[str, Any]:
+    """The line under a client's key: whether a ban or a bypass covers it (in words, so a table that hides the
+    Banned and Bypassed columns by default still says so, and color is never the only signal) plus `notes`."""
+    words = [*notes]
+    if item.get("banned"):
+        words.append("banned")
+    if item.get("bypassed"):
+        words.append("bypasses the limits")
+    out: dict[str, Any] = {"sub": "; ".join(words)} if words else {}
+    if item.get("banned"):
+        out["tone"] = "bad"
+    return out
+
+
 def _common_cells(view: PageView, item: Mapping[str, Any]) -> dict[str, Any]:
     refused_pct = item.get("refused_pct")
     return {
@@ -168,9 +181,8 @@ async def places_card(view: PageView) -> dict[str, Any]:
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
         key = str(item.get("key") or "")
         out = _common_cells(view, item)
-        out["key"] = {"text": key, "caller": True, "mono": True, "limit": 64}
-        if not is_place_id(key):
-            out["key"]["sub"] = "not a number: a forged header"
+        notes = [] if is_place_id(key) else ["not a number: a forged header"]
+        out["key"] = {"text": key, "caller": True, "mono": True, "limit": 64, **_state_sub(item, notes)}
         out["name"] = {"text": item.get("name"), "caller": True} if item.get("name") else {"text": "not looked up"}
         return out
 
@@ -197,7 +209,7 @@ async def places_card(view: PageView) -> dict[str, Any]:
             "banned",
         ),
         key_columns=("key", "requests", "rate1"),
-        hidden=("rate5", "rate60", "served", "bytes", "refused_pct"),
+        hidden=("rate5", "rate60", "served", "bytes", "refused_pct", "banned"),
         cells=cells,
         row_id=lambda item: f"place-{row_key(item.get('key'))}",
         drawer=lambda item: _drawer_src(view, "place", str(item["key"])) if is_place_id(str(item.get("key"))) else None,
@@ -215,7 +227,7 @@ async def places_card(view: PageView) -> dict[str, Any]:
     )
     return {
         "table": table,
-        "table_only": table_only(view, PLACES_TABLE),
+        "table_only": view.table_request(PLACES_TABLE),
         "card_src": view.fragment_url("places", **table_state(tq, clients_api.PLACE_SPEC)),
         "peers_basis": answer.get("peers_basis"),
     }
@@ -235,7 +247,7 @@ async def ips_card(view: PageView) -> dict[str, Any]:
 
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
         out = _common_cells(view, item)
-        out["key"] = {"text": item.get("key"), "mono": True}
+        out["key"] = {"text": item.get("key"), "mono": True, **_state_sub(item, [])}
         score = item.get("bot_score")
         source = item.get("bot_score_source")
         if isinstance(score, int | float):
@@ -279,7 +291,7 @@ async def ips_card(view: PageView) -> dict[str, Any]:
             "bypassed",
         ),
         key_columns=("key", "requests", "rate1"),
-        hidden=("rate5", "rate60", "served", "bytes", "refused_pct"),
+        hidden=("rate5", "rate60", "served", "bytes", "refused_pct", "banned", "bypassed"),
         cells=cells,
         row_id=lambda item: f"ip-{row_key(item.get('key'))}",
         drawer=lambda item: (
@@ -301,7 +313,7 @@ async def ips_card(view: PageView) -> dict[str, Any]:
     )
     return {
         "table": table,
-        "table_only": table_only(view, IPS_TABLE),
+        "table_only": view.table_request(IPS_TABLE),
         "peers_basis": answer.get("peers_basis"),
         "sources": answer.get("bot_score_sources"),
     }
@@ -331,7 +343,6 @@ async def client_score_card(view: PageView) -> dict[str, Any]:
     total = sum(max(0.0, w) for w in weights.values())
     signals = []
     for name in SIGNALS:
-        spec = CATALOG.get(f"bot_weight_{name}")
         weight = max(0.0, weights[name])
         signals.append(
             {
@@ -541,25 +552,18 @@ async def client_context(view: PageView, kind: str, key: str) -> dict[str, Any]:
         "rate_text": {name: _rate(((answer.get("last_hour") or {}).get("rates") or {}).get(name)) for name in RATES},
         "throwaway_note": lookup_api.THROWAWAY_NOTE,
         "audit_href": "/admin/audit?" + urlencode({"q": key}),
+        # v1's "Filter feed" (dashboard.md 4.6): the Live tail filtered to this client (its `client` filter matches
+        # the address or the place id).
+        "live_href": "/admin/live?" + urlencode({"client": key}),
     }
 
 
 async def _render_view(request: Request, principal: Any, kind: str, key: str, *, standalone: bool) -> HTMLResponse:
     """The client view as a drawer body, or (`standalone`) as a whole page inside the shell."""
     templates = templates_of(request)
+    built: shell.Shell | None = None
     if standalone:
-        built = await shell.build_shell(request, principal, page.spec, stream_events=page.stream_events)
-        view = PageView(
-            request=request,
-            principal=principal,
-            ctx=get_ctx(request),
-            page=page.spec,
-            time=built.time,
-            tz=built.tz,
-            prefs=built.prefs,
-            latest=built.facts.latest,
-            shell=built,
-        )
+        view, built = await page.shell_view(request, principal)
     else:
         view = await page.view(request, principal)
     base = {"view": view, "tz": view.tz, "now": view.now, "time": view.time.view, "standalone": standalone}
@@ -575,12 +579,11 @@ async def _render_view(request: Request, principal: Any, kind: str, key: str, *,
             message = mapped.error_message
         context = {"error": message}
         template = CLIENT_ERROR_TEMPLATE
-    if not standalone:
+    if built is None:  # the drawer body (a whole page carries its shell)
         return HTMLResponse(templates.render_to_string(request, template, {**base, **context}))
-    assert view.shell is not None
     title = f"Place {key}" if kind == "place" else f"Address {key}"
     page_ctx = {
-        **view.shell.context,
+        **built.context,
         **base,
         **context,
         "page": {

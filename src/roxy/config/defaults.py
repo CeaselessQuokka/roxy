@@ -4,8 +4,9 @@ What this is
     The default rule data of plan 15.5 and the v1 defaults that were data rather than settings: ignored cache
     parameters, default cache rules (each with a note saying why), the POST caching allowlist, the id-list
     normalization candidates, the allowed Roblox hosts (plan 9.10), the default throttle ladder (with the C5
-    replacement message), and the default ignored paths and ignored value headers from v1. `seed_defaults(conn,
-    now)` inserts the table-backed ones as rows with origin `default`, exactly once per database.
+    replacement message), the default ignored paths and ignored value headers from v1, and (seed version 2) the
+    headers that carry client addresses as ignored value headers. `seed_defaults(conn, now)` inserts the table-backed
+    ones as rows with origin `default`, exactly once per database and seed version.
 
 Why it exists
     v1 kept these in `config.py` and seeded them into memory at import, so "Restore defaults" buttons each carried
@@ -42,13 +43,13 @@ import os
 import sqlite3
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
 from roxy.config import audit
 from roxy.config.audit import SYSTEM_ACTOR, Actor
-from roxy.config.constants import SUGGESTED_CACHE_IGNORED_PARAMS
+from roxy.config.constants import CLIENT_ADDRESS_HEADERS, SUGGESTED_CACHE_IGNORED_PARAMS
 from roxy.config.runtime import bump_config_version
 from roxy.config.settings.routing import DEFAULT_ALLOWED_ROBLOX_HOSTS
 from roxy.core.clock import SYSTEM_CLOCK, Clock
@@ -92,6 +93,13 @@ IGNORED_VALUE_HEADERS: Final[tuple[str, ...]] = (
     "x-b3-parentspanid",
 )
 IGNORED_VALUE_HEADER_NOTE: Final = "default"
+
+# Headers that carry client addresses (`config/constants.py CLIENT_ADDRESS_HEADERS`, seed version 2): their values
+# are never kept in the fingerprint tables (privacy: even a hash tells one client from another), their names are still
+# counted. The fingerprint writer skips them whatever this list says; the rows are here so the dashboard's "Not
+# recorded" list shows them with the reason, and the Security API refuses to record them again.
+IGNORED_ADDRESS_HEADERS: Final[tuple[str, ...]] = CLIENT_ADDRESS_HEADERS
+IGNORED_ADDRESS_HEADER_NOTE: Final = "default: carries client addresses, so its values are never recorded"
 
 # --- Ignored paths (v1 index.py path_ignore_set, parity row 50) ------------------------------------------------------
 
@@ -322,7 +330,10 @@ def cache_rule_rows(
 # --- The seed --------------------------------------------------------------------------------------------------------
 
 SEED_MARKER_KEY: Final = "defaults_seeded"
-SEED_VERSION: Final = 1
+SEED_VERSION: Final = 2
+"""The newest seed. Version 1: the plan 15.5 defaults. Version 2: the client address headers as ignored value
+headers (`IGNORED_ADDRESS_HEADERS`). A database seeded at an earlier version gets only the rows of the versions after
+its own (so a version 1 default the admin deleted stays deleted); a new database gets every version at once."""
 
 
 @dataclass(slots=True)
@@ -333,6 +344,8 @@ class SeedReport:
     inserted: dict[str, int] = field(default_factory=dict)
     skipped: dict[str, int] = field(default_factory=dict)
     config_version: int | None = None
+    from_version: int = 0
+    """The seed version the database had before this run (0: never seeded)."""
 
     @property
     def total_inserted(self) -> int:
@@ -344,6 +357,7 @@ class SeedReport:
             "inserted": dict(self.inserted),
             "skipped": dict(self.skipped),
             "config_version": self.config_version,
+            "from_version": self.from_version,
         }
 
 
@@ -365,9 +379,14 @@ def _room(conn: sqlite3.Connection, table: str) -> int:
 
 
 def seed_defaults(conn: sqlite3.Connection, now_s: int, actor: Actor = SYSTEM_ACTOR) -> SeedReport:
-    """Insert the built-in default rows once (inside the caller's write transaction). See the module docstring."""
+    """Insert the built-in default rows once (inside the caller's write transaction). See the module docstring.
+
+    Versioned (`SEED_VERSION`): the marker records the version that ran, and a database seeded at an earlier version
+    gets only the rows of the later versions, so a default the admin deleted stays deleted.
+    """
     report = SeedReport()
     marker = conn.execute("SELECT value_json FROM service_state WHERE key = ?", (SEED_MARKER_KEY,)).fetchone()
+    seeded_version = 0
     if marker is not None:
         try:
             seeded_version = int(json.loads(marker[0]).get("version", 0))
@@ -375,12 +394,53 @@ def seed_defaults(conn: sqlite3.Connection, now_s: int, actor: Actor = SYSTEM_AC
             seeded_version = 0
         if seeded_version >= SEED_VERSION:
             report.already_seeded = True
+            report.from_version = seeded_version
             return report
+    report.from_version = seeded_version
 
     def count(table: str, inserted: bool) -> None:
         bucket = report.inserted if inserted else report.skipped
         bucket[table] = bucket.get(table, 0) + 1
 
+    if seeded_version < 1:
+        _seed_version_1(conn, now_s, actor, count)
+    if seeded_version < 2:
+        _seed_version_2(conn, count)
+
+    conn.execute(
+        "INSERT INTO service_state (key, value_json, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+        (SEED_MARKER_KEY, json.dumps({"version": SEED_VERSION, "at": int(now_s)}), int(now_s)),
+    )
+    audit.record(
+        conn,
+        actor,
+        "defaults.seed",
+        "defaults",
+        None,
+        report.as_dict(),
+        "Built-in defaults shipped with v2 (plan 15.5)",
+        None,
+        at=int(now_s),
+    )
+    if report.total_inserted:
+        report.config_version = bump_config_version(conn, int(now_s))
+    return report
+
+
+def _seed_version_2(conn: sqlite3.Connection, count: Callable[[str, bool], None]) -> None:
+    """Seed version 2: the client address headers as ignored value headers (INSERT OR IGNORE, within the cap)."""
+    table = RULE_TABLES["ignored_value_headers"]
+    for name in IGNORED_ADDRESS_HEADERS:
+        columns = to_columns(table, IgnoredValueHeaderIn(name=name, note=IGNORED_ADDRESS_HEADER_NOTE))
+        if _room(conn, "ignored_value_headers") <= 0:
+            count("ignored_value_headers", False)
+            continue
+        count("ignored_value_headers", _insert(conn, "ignored_value_headers", columns, ignore=True))
+
+
+def _seed_version_1(conn: sqlite3.Connection, now_s: int, actor: Actor, count: Callable[[str, bool], None]) -> None:
+    """Seed version 1: the plan 15.5 defaults (ignored parameters, value headers and paths, the ladder, cache rules)."""
     # Name-keyed tables: INSERT OR IGNORE, so an admin's (or the v1 import's) row with the same name is kept.
     simple: list[tuple[str, list[dict[str, Any]]]] = [
         (
@@ -441,26 +501,6 @@ def seed_defaults(conn: sqlite3.Connection, now_s: int, actor: Actor = SYSTEM_AC
         columns.update(created_at=int(now_s), created_by=actor.label)
         count("rules_cache", _insert(conn, "rules_cache", columns, ignore=False))
 
-    conn.execute(
-        "INSERT INTO service_state (key, value_json, updated_at) VALUES (?, ?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
-        (SEED_MARKER_KEY, json.dumps({"version": SEED_VERSION, "at": int(now_s)}), int(now_s)),
-    )
-    audit.record(
-        conn,
-        actor,
-        "defaults.seed",
-        "defaults",
-        None,
-        report.as_dict(),
-        "Built-in defaults shipped with v2 (plan 15.5)",
-        None,
-        at=int(now_s),
-    )
-    if report.total_inserted:
-        report.config_version = bump_config_version(conn, int(now_s))
-    return report
-
 
 async def seed_control_defaults(db: Database, clock: Clock | None = None, actor: Actor = SYSTEM_ACTOR) -> SeedReport:
     """`seed_defaults` in its own control.db write transaction (async callers)."""
@@ -499,6 +539,8 @@ __all__ = [
     "DEFAULT_TIER_MESSAGE",
     "ID_LIST_NORMALIZATION",
     "ID_LIST_PARAMS",
+    "IGNORED_ADDRESS_HEADERS",
+    "IGNORED_ADDRESS_HEADER_NOTE",
     "IGNORED_CACHE_PARAMS",
     "IGNORED_PATHS",
     "IGNORED_VALUE_HEADERS",

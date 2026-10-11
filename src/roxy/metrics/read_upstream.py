@@ -71,7 +71,6 @@ LAST_OUTCOME_LEVELS: Final[tuple[tuple[str, str], ...]] = (
 )
 """Rollup levels `last_outcome_at` reads, finest first, with the precision each one gives."""
 
-_COUNT: Final = "sum(coalesce(json_extract(detail_json, '$.count'), 1))"
 
 BYTES_EDGES: Final[tuple[int, ...]] = (
     1024,
@@ -246,9 +245,11 @@ def recent_events(
             return []
         clause += f" AND reason_code IN ({', '.join('?' for _ in chosen)})"
         params += chosen
+    # `+at_ms`: read the rows of these types through `events_type_at`, then order them (`read_dashboard.
+    # notable_events` says why: ordered by plain `at_ms`, SQLite walks every event of the window instead).
     rows = conn.execute(
         f"SELECT id, at_ms, type, severity, reason_code, endpoint_template, detail_json FROM events "  # noqa: S608
-        f"WHERE {clause} AND at_ms >= ? AND at_ms < ? ORDER BY at_ms DESC, id DESC LIMIT ?",
+        f"WHERE {clause} AND at_ms >= ? AND at_ms < ? ORDER BY +at_ms DESC, id DESC LIMIT ?",
         (*params, int(start_ms), int(end_ms), max(1, min(int(limit), MAX_EVENTS))),
     ).fetchall()
     out: list[dict[str, Any]] = []
@@ -284,28 +285,34 @@ def failure_log(
         "json_extract(detail_json, '$.egress') AS egress, reason_code AS reason, "
         "json_extract(detail_json, '$.upstream_status') AS upstream_status"
     )
-    where = "type = ? AND at_ms >= ? AND at_ms < ?"
-    params = (FAILURE_EVENT, int(start_ms), int(end_ms))
     bounded = max(1, min(int(limit), MAX_FAILURE_GROUPS))
+    # The groups are walked in order through `events_failure_groups` (metrics migration 0009: egress, reason, Roblox's
+    # status, time, count, folded marker), so nothing is parsed and nothing is sorted but the groups themselves; the
+    # generated columns are the JSON expressions this read grouped by before (plan 6.7: 1.1 s over 90 days at plan
+    # 6.6's volume, 0.1 s now). The literal type repeats the partial index's WHERE term, which `INDEXED BY` needs.
     totals = conn.execute(
-        f"SELECT {group}, {_COUNT} AS n, min(at_ms) AS first_ms, max(at_ms) AS last_ms, "  # noqa: S608 (fixed text)
-        f"sum(CASE WHEN json_extract(detail_json, '$.aggregated') THEN coalesce(json_extract(detail_json, "
-        f"'$.count'), 1) ELSE 0 END) AS folded FROM events WHERE {where} "
+        "SELECT detail_egress AS egress, reason_code AS reason, detail_upstream_status AS upstream_status, "  # noqa: S608
+        "sum(detail_count) AS n, min(at_ms) AS first_ms, max(at_ms) AS last_ms, "
+        "sum(CASE WHEN detail_aggregated THEN detail_count ELSE 0 END) AS folded "
+        f"FROM events INDEXED BY events_failure_groups WHERE type = '{FAILURE_EVENT}' AND at_ms >= ? AND at_ms < ? "
         "GROUP BY 1, 2, 3 ORDER BY n DESC, last_ms DESC LIMIT ?",
-        (*params, bounded),
+        (int(start_ms), int(end_ms), bounded),
     ).fetchall()
-    # One max() and no other min() or max(): SQLite takes the bare columns from the newest row of each group.
-    newest = conn.execute(
-        f"SELECT {group}, max(at_ms) AS at_ms, endpoint_template, detail_json FROM events "  # noqa: S608 (fixed)
-        f"WHERE {where} GROUP BY 1, 2, 3",
-        params,
-    ).fetchall()
+    # The newest event of each group is one of the events at its `last_ms`: read through the `(type, at_ms)` index
+    # instead of grouping every failure event of the window a second time (plan 6.7: over 90 days at plan 6.6's
+    # volume the second scan cost a second). Of several events in that millisecond, the newest id of the group.
     last: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
-    for row in newest:
-        last[(row["egress"], row["reason"], row["upstream_status"])] = {
-            "template": row["endpoint_template"],
-            "detail": _detail(row["detail_json"]),
-        }
+    for row in totals:
+        key = (row["egress"], row["reason"], row["upstream_status"])
+        candidates = conn.execute(
+            f"SELECT {group}, endpoint_template, detail_json FROM events "  # noqa: S608 (fixed text)
+            "WHERE type = ? AND at_ms = ? AND reason_code IS ? ORDER BY id DESC",
+            (FAILURE_EVENT, int(row["last_ms"]), row["reason"]),
+        ).fetchall()
+        for candidate in candidates:
+            if (candidate["egress"], candidate["reason"], candidate["upstream_status"]) == key:
+                last[key] = {"template": candidate["endpoint_template"], "detail": _detail(candidate["detail_json"])}
+                break
     out: list[dict[str, Any]] = []
     for row in totals:
         key = (row["egress"], row["reason"], row["upstream_status"])
@@ -359,13 +366,31 @@ def last_outcome_at(conn: sqlite3.Connection, column: str, outcome: str) -> dict
     return found
 
 
+FAILURE_SCAN_FIRST_MS: Final = 3_600_000
+"""How far back `last_failure_events` reads first (the newest hour of failure events); every further step reads
+twice as far back as the one before."""
+
+_LEVEL_SPAN_S: Final[dict[str, int]] = {"minute": 60, "hour": 3600, "day": 90_000, "month": 32 * 86_400}
+"""The longest bucket of each `LAST_OUTCOME_LEVELS` precision (a DST day is 25 hours; a month at most 31 days)."""
+
+_NO_FAILURE_KEYS: Final = frozenset({"", "none", "other"})
+"""Values `last_outcome_at` may report that no failure event ever names: an answer that reached no egress, and the
+folded `other` host (the event's template has no host part)."""
+
+
 def last_failure_events(conn: sqlite3.Connection, column: str) -> dict[str, dict[str, Any]]:
     """`{egress or host: the newest failure event's facts}` over every kept `failure` event (v1 "LastError").
 
     The facts are `at_ms`, `reason`, `status`, `upstream_status`, `method`, `template`, `path` and `error`. Rows
     the recorder folded over its event budget carry no egress or path and are skipped here; `last_outcome_at`
-    still dates the newest failure exactly to the minute. One scan of the indexed `failure` events (P9: the
-    events table is capped).
+    still dates the newest failure exactly to the minute.
+
+    The failure events are read newest first, through the `(type, at_ms)` index, in windows that grow backwards
+    (the newest hour, then twice as far each step), and the walk stops once every value that has a failure in the
+    rollups (`last_outcome_at`, the same counts every failure event adds to) and could still have an event kept has
+    its newest one. The newest event of a value is in the first window that holds any of its events, so the answer
+    is the one a scan of every failure event gives; it reads an hour of events instead of all of them (plan 6.7: at
+    plan 6.6's volume the full scan took most of a second, on every Upstream health card render).
     """
     if column == "egress":
         key_sql = "json_extract(detail_json, '$.egress')"
@@ -373,27 +398,43 @@ def last_failure_events(conn: sqlite3.Connection, column: str) -> dict[str, dict
         key_sql = "substr(endpoint_template, 1, instr(endpoint_template, '/') - 1)"
     else:
         raise ValueError(f"last failure by {column!r} is not offered")
-    rows = conn.execute(
-        f"SELECT {key_sql} AS k, max(at_ms) AS at_ms, reason_code, endpoint_template, detail_json FROM events "  # noqa: S608
-        "WHERE type = ? AND json_extract(detail_json, '$.aggregated') IS NULL GROUP BY k LIMIT ?",
-        (FAILURE_EVENT, MAX_FAILURE_GROUPS),
-    ).fetchall()
+    bounds = conn.execute("SELECT max(at_ms), min(at_ms) FROM events WHERE type = ?", (FAILURE_EVENT,)).fetchone()
+    if bounds is None or bounds[0] is None:
+        return {}
+    hi, oldest = int(bounds[0]) + 1, int(bounds[1])
+    wanted = {
+        key
+        for key, last in last_outcome_at(conn, column, "failed").items()
+        if key not in _NO_FAILURE_KEYS and (last["at"] + _LEVEL_SPAN_S[last["precision"]]) * 1000 >= oldest
+    }
     out: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        if not row["k"]:
-            continue
-        detail = _detail(row["detail_json"])
-        out[str(row["k"])] = {
-            "at_ms": int(row["at_ms"]),
-            "reason": row["reason_code"],
-            "status": _int_or_none(detail.get("status")),
-            "upstream_status": _int_or_none(detail.get("upstream_status")),
-            "method": detail.get("method"),
-            "template": row["endpoint_template"],
-            "path": detail.get("path"),
-            "error": detail.get("upstream_error"),
-        }
-    return out
+    span = FAILURE_SCAN_FIRST_MS
+    while True:
+        lo = max(oldest, hi - span)
+        rows = conn.execute(
+            f"SELECT {key_sql} AS k, max(at_ms) AS at_ms, reason_code, endpoint_template, detail_json FROM events "  # noqa: S608
+            "WHERE type = ? AND at_ms >= ? AND at_ms < ? AND json_extract(detail_json, '$.aggregated') IS NULL "
+            "GROUP BY k LIMIT ?",
+            (FAILURE_EVENT, lo, hi, MAX_FAILURE_GROUPS),
+        ).fetchall()
+        for row in rows:
+            key = str(row["k"] or "")
+            if not key or key in out or len(out) >= MAX_FAILURE_GROUPS:
+                continue
+            detail = _detail(row["detail_json"])
+            out[key] = {
+                "at_ms": int(row["at_ms"]),
+                "reason": row["reason_code"],
+                "status": _int_or_none(detail.get("status")),
+                "upstream_status": _int_or_none(detail.get("upstream_status")),
+                "method": detail.get("method"),
+                "template": row["endpoint_template"],
+                "path": detail.get("path"),
+                "error": detail.get("upstream_error"),
+            }
+        if lo <= oldest or wanted <= out.keys():
+            return out
+        hi, span = lo, span * 2
 
 
 def challenge_counts(

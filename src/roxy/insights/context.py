@@ -23,6 +23,12 @@ How it works
       seconds, minute granularity, built by `window(minutes=...)`.
     - Every database read runs on a reader thread through `Database.read` (never on the event loop), and every
       result is bounded by the read model it comes from (plan P9).
+    - One read per window, shared by every rule (gaps_insights G7): a table a rule wants whole (`by`, `clients`) is
+      aggregated once, not page by page, and what rules need from a day of request samples is computed in SQL
+      (`change_estimate`, the TTL tuner; `ua_arm_counts`). Raw sample rows are read only where a rule needs rows:
+      a dry run (`replay_samples`, the newest part of the window that fits its bound, and the dry run says when it
+      is shorter) and the few rows a rule filters in SQL (`sample_read`, which says whether its bound cut it, and the
+      rule's evidence then says so: `bound_note`).
     - `settings` is the immutable `SettingsSnapshot` of the run and `rules` the `RulesSnapshot`, so all rules of
       one run see the same configuration.
     - `DefaultProviders` reads what the producers recorded (`metrics/read_producers.py`): tarpit totals and the
@@ -55,8 +61,9 @@ from roxy.cache.policy import select_rule
 from roxy.config import catalog, read_changes, read_settings
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.egress import read_credential
+from roxy.insights import simulate
 from roxy.metrics import disk_history, queries, read_history, read_producers
-from roxy.metrics.queries import Page, Window
+from roxy.metrics.queries import Window
 from roxy.rules.models import RULE_TABLES, CacheRuleRow
 from roxy.rules.service import fetch_all
 from roxy.storage.db import SharedStateUnavailable
@@ -69,7 +76,6 @@ T = TypeVar("T")
 
 MAX_GROUPS: Final = 10_000
 """Most groups `by()` returns (40 pages of 250): far above the 2,000-template vocabulary (plan 6.2)."""
-_PAGE: Final = 250
 DAY_S: Final = 86_400
 PROVIDER_MEMO_S: Final = 10.0
 """How long `DefaultProviders` keeps an answer (one evaluation run asks the same seam from several rules)."""
@@ -89,6 +95,62 @@ data (a tracemalloc snapshot of the leader caught one evaluation holding 28 MiB 
 at 10 requests a second; a busy day could hold eight reads of 50,000 rows). Past this bound the oldest sample reads
 are forgotten first (a rule that asks again reads again), so a run keeps at most one full read's worth of compact
 rows (`read_history.SampleRecord`, about 18 MiB) besides the read in use."""
+
+
+@dataclass(frozen=True, slots=True)
+class SampleRead:
+    """One bounded sample read (`InsightContext.sample_read`): the rows, whether they are every row asked for, and
+    the bound that applied."""
+
+    rows: list[read_history.SampleRecord]
+    complete: bool
+    limit: int
+
+    @property
+    def size(self) -> int:
+        return len(self.rows)
+
+
+@dataclass(frozen=True, slots=True)
+class ReplaySamples:
+    """The input of one dry run (`InsightContext.replay_samples`): the span covered, its request and refusal
+    samples, and whether the span is the whole window asked for."""
+
+    window: Window
+    rows: list[read_history.SampleRecord]
+    refusals: list[read_history.SampleRecord]
+    complete: bool
+
+    @property
+    def size(self) -> int:
+        return len(self.rows) + len(self.refusals)
+
+
+@dataclass(frozen=True, slots=True)
+class UaArmCounts:
+    """`(identity, direct calls, Roblox 429s)` rows of the User-Agent experiment, and whether they are all."""
+
+    rows: list[tuple[str, int, int]]
+    complete: bool
+
+
+def bound_note(read: SampleRead, what: str) -> str | None:
+    """The evidence note of a cut sample read (gaps_insights G7: a rule never sees a cut window silently), or None
+    for a complete one. `what` names the rows (for example "cooldown answers")."""
+    if read.complete:
+        return None
+    return (
+        f"The window holds more than {read.limit:,} {what} in the request samples; only the oldest {read.limit:,} "
+        "were counted, so the figures are a lower bound."
+    )
+
+
+def _rows_held(found: Any) -> int:
+    """How many sample rows a memoized sample read holds (a list of rows, or an object with a `size`)."""
+    if found is None:
+        return 0
+    size = getattr(found, "size", None)
+    return int(size) if size is not None else len(found)
 
 
 # --------------------------------------------------------------------------------------------- providers
@@ -359,19 +421,20 @@ class InsightContext:
     async def _metrics(self, key: tuple[Any, ...], fn: Callable[[Any], T]) -> T:
         return await self._cached(("metrics", *key), lambda: self.dbs.metrics.read(fn))
 
-    async def _sample_read(self, key: tuple[Any, ...], fn: Callable[[Any], list[T]]) -> list[T]:
-        """A memoized sample read whose rows count toward `MAX_MEMO_SAMPLE_ROWS` (the oldest reads are forgotten)."""
+    async def _sample_read(self, key: tuple[Any, ...], fn: Callable[[Any], T]) -> T:
+        """A memoized sample read whose rows count toward `MAX_MEMO_SAMPLE_ROWS` (the oldest reads are forgotten).
+        The answer is a list of rows or an object with a `size` (`SampleRead`, `ReplaySamples`)."""
         full = ("metrics", *key)
         known = full in self._memo
-        rows = await self._metrics(key, fn)
+        found = await self._metrics(key, fn)
         if not known and full in self._memo and full not in self._sample_keys:
             self._sample_keys.append(full)
-            self._sample_rows += len(rows)
+            self._sample_rows += _rows_held(found)
             while self._sample_rows > MAX_MEMO_SAMPLE_ROWS and len(self._sample_keys) > 1:
                 oldest = self._sample_keys.pop(0)
-                self._sample_rows -= len(self._memo.pop(oldest, None) or ())
+                self._sample_rows -= _rows_held(self._memo.pop(oldest, None))
                 self._locks.pop(oldest, None)
-        return rows
+        return found
 
     # ---- settings ----
 
@@ -414,21 +477,13 @@ class InsightContext:
     async def by(
         self, window: Window, dimension: str, filters: Mapping[str, Any] | None = None
     ) -> dict[Any, dict[str, Any]]:
-        """`{value: measures}` for every value of one dimension (`queries.top_n_sync`, all pages)."""
+        """`{value: measures}` for every value of one dimension, busiest first (the rows of `queries.top_n_sync` in
+        its order, read once: `queries.top_rows_sync`; at most `MAX_GROUPS`)."""
         frozen = _freeze(filters)
 
         def read(conn: Any) -> dict[Any, dict[str, Any]]:
-            out: dict[Any, dict[str, Any]] = {}
-            page = 1
-            while True:
-                result = queries.top_n_sync(
-                    conn, window, dimension, page=Page(page=page, size=_PAGE, sort="requests"), filters=filters
-                )
-                for row in result["rows"]:
-                    out[row["key"]] = row
-                if page * _PAGE >= result["total"] or len(out) >= MAX_GROUPS:
-                    return out
-                page += 1
+            rows = queries.ordered_rows(queries.top_rows_sync(conn, window, dimension, filters=filters), "requests")
+            return {row["key"]: row for row in rows[:MAX_GROUPS]}
 
         return await self._metrics(("by", window, dimension, frozen), read)
 
@@ -471,8 +526,13 @@ class InsightContext:
         )
 
     async def samples(self, window: Window, templates: Iterable[str] | None = None) -> list[read_history.SampleRecord]:
-        """`request_samples` rows in the window, in time order (the input of plan 11.3 replay and tuning), as compact
-        read-only mappings (`read_history.SampleRecord`); the run keeps at most `MAX_MEMO_SAMPLE_ROWS` of them."""
+        """`request_samples` rows in the window, in time order, as compact read-only mappings
+        (`read_history.SampleRecord`); the run keeps at most `MAX_MEMO_SAMPLE_ROWS` of them.
+
+        At most `read_history.MAX_ROWS` rows, the OLDEST of the window: rules do not call this (a busy day holds
+        many times that). They read what they need in SQL (`change_estimate`, `ua_arm_counts`), only the rows they
+        look at (`sample_read` with a filter, which says whether the bound cut it) or, for a dry run, the newest part
+        of the window that fits (`replay_samples`). Kept for tests and tools."""
         wanted = tuple(sorted(set(templates))) if templates is not None else None
         return await self._sample_read(
             ("samples", window, wanted),
@@ -480,12 +540,74 @@ class InsightContext:
         )
 
     async def refusal_samples(self, window: Window) -> list[read_history.SampleRecord]:
-        """`refusal_samples` rows in the window, in time order: requests a limiter refused (metrics.db schema 7), the
-        refused part of the stream a limit dry run replays (finding LOGICFIX-5)."""
+        """`refusal_samples` rows in the window, in time order: requests a limiter refused (metrics.db schema 7).
+        The oldest `read_history.MAX_ROWS` of a busy window, like `samples`; a dry run reads them through
+        `replay_samples`."""
         return await self._sample_read(
             ("refusal_samples", window),
             lambda c: read_history.refusal_samples_between(c, window.start, window.end),
         )
+
+    async def sample_read(
+        self,
+        window: Window,
+        templates: Iterable[str] | None = None,
+        *,
+        where: read_history.SampleFilter | None = None,
+        limit: int | None = None,
+    ) -> SampleRead:
+        """The `request_samples` rows of the window (optionally some templates) that `where` admits, in time order,
+        at most `limit` (default `read_history.MAX_ROWS`): `SampleRead.complete` says whether they are all of them
+        (one more row is asked for than kept). A rule whose read is cut says so in its evidence (`bound_note`)."""
+        wanted = tuple(sorted(set(templates))) if templates is not None else None
+        keep = read_history.MAX_ROWS if limit is None else max(1, min(int(limit), read_history.MAX_ROWS))
+
+        def read(conn: Any) -> SampleRead:
+            rows = read_history.samples_between(conn, window.start, window.end, wanted, keep + 1, where=where)
+            return SampleRead(rows[:keep], len(rows) <= keep, keep)
+
+        return await self._sample_read(("sample_read", window, wanted, where, keep), read)
+
+    async def replay_samples(self, window: Window, *, refusals: bool = False, bound: int) -> ReplaySamples:
+        """The input of a dry run (plan 11.3): the request samples (and with `refusals` the refusal samples) of the
+        newest part of `window` in which each holds at most `bound` rows, read in one snapshot
+        (`read_history.newest_streams`). `ReplaySamples.window` is the span they cover; `complete` is False when it
+        is shorter than `window` (the dry run then says so)."""
+
+        def read(conn: Any) -> ReplaySamples:
+            cut, rows, refused = read_history.newest_streams(conn, window.start, window.end, bound, refusals=refusals)
+            covered = Window(cut, window.end, window.granularity, window.tz)
+            return ReplaySamples(covered, rows, refused, cut <= window.start)
+
+        return await self._sample_read(("replay_samples", window, refusals, int(bound)), read)
+
+    async def change_estimates(self, window: Window) -> dict[str, simulate.ChangeEstimate]:
+        """The TTL tuner's estimate for every template with fetches in the window (plan 11.3, F10), computed in SQL
+        over every sample of the window and shared by every rule of the run (`read_history.change_estimates`;
+        gaps_insights G7: each rule used to read up to 50,000 rows per template, the oldest of the day)."""
+
+        def read(conn: Any) -> dict[str, simulate.ChangeEstimate]:
+            found = read_history.change_estimates(conn, window.start, window.end)
+            return {template: simulate.ChangeEstimate.from_summary(entry) for template, entry in found.items()}
+
+        return await self._metrics(("change_estimates", window), read)
+
+    async def change_estimate(self, window: Window, template: str) -> simulate.ChangeEstimate:
+        """The TTL tuner's estimate for one template (`change_estimates`; an empty estimate without fetches). A copy:
+        the rule may keep it in evidence."""
+        found = (await self.change_estimates(window)).get(template)
+        return copy.copy(found) if found is not None else simulate.ChangeEstimate()
+
+    async def ua_arm_counts(self, window: Window) -> UaArmCounts:
+        """Direct calls and Roblox 429s per User-Agent experiment identity in the window (`read_history.ua_arm_counts`,
+        busiest first, at most `read_history.MAX_ROWS` identities; `complete` says whether they are all)."""
+        keep = read_history.MAX_ROWS
+
+        def read(conn: Any) -> UaArmCounts:
+            rows = read_history.ua_arm_counts(conn, window.start, window.end, keep + 1)
+            return UaArmCounts(rows[:keep], len(rows) <= keep)
+
+        return await self._metrics(("ua_arm_counts", window), read)
 
     async def internal_calls(self, window: Window) -> list[dict[str, Any]]:
         return await self._metrics(("internal", window), lambda c: queries.internal_calls(c, window))
@@ -497,21 +619,13 @@ class InsightContext:
         return await self._metrics(("egress_usage", window), lambda c: queries.egress_usage_series(c, window))
 
     async def clients(self, window: Window, client_type: str) -> list[dict[str, Any]]:
-        """Every client of a type (`ip` or `place`) in the window with requests, refused and served."""
-
-        def read(conn: Any) -> list[dict[str, Any]]:
-            rows: list[dict[str, Any]] = []
-            page = 1
-            while True:
-                result = queries.client_table_sync(
-                    conn, window, client_type, now=self.now, page=Page(page=page, size=_PAGE, sort="requests")
-                )
-                rows += result["rows"]
-                if page * _PAGE >= result["total"] or len(rows) >= MAX_GROUPS:
-                    return rows
-                page += 1
-
-        return await self._metrics(("clients", window, client_type), read)
+        """Every client of a type (`ip` or `place`) in the window with requests, refused, served, bytes,
+        `refused_pct` and `top_endpoint`, busiest first, at most `MAX_GROUPS`: one aggregate per window
+        (`queries.client_rows_sync`; the rows carry no Rate1/5/60, which no rule reads)."""
+        return await self._metrics(
+            ("clients", window, client_type),
+            lambda c: queries.client_rows_sync(c, window, client_type, limit=MAX_GROUPS),
+        )
 
     # ---- insight history (metrics/read_history.py) ----
 
@@ -726,4 +840,13 @@ def _freeze(value: Any) -> Any:
     return value
 
 
-__all__ = ["DefaultProviders", "InsightContext", "InsightProviders", "minute_floor"]
+__all__ = [
+    "DefaultProviders",
+    "InsightContext",
+    "InsightProviders",
+    "ReplaySamples",
+    "SampleRead",
+    "UaArmCounts",
+    "bound_note",
+    "minute_floor",
+]

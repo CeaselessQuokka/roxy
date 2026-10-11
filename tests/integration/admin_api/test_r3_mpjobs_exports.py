@@ -16,12 +16,12 @@ What this is
 
 Why it exists
     The production box has 909 MB of RAM and no swap, and systemd caps each color (a master and 2 workers) at
-    `MemoryHigh=320M`, `MemoryMax=420M` (DESIGN.md section 0). Plan P9 bounds every table and file; the export cap
-    is 50,000 rows (`common.MAX_EXPORT_ROWS`), but nothing bounds a row's width (audit previews are up to 2,000
-    characters each side plus a 1,000 character reason) or the number of downloads a worker builds at once (the LLM
-    export has `MAX_CONCURRENT_BUILDS`, table exports have nothing). The agent brief and the lens: never block the
-    event loop; CPU-heavy work goes to a thread (`UntrustedPool` itself says thousands of entries must never hold
-    the event loop). H-LOOP-LAG passes below 50 ms.
+    `MemoryHigh=420M`, `MemoryMax=500M` (DESIGN.md section 0, since the P11 perf lane). Plan P9 bounds every table
+    and file; the export cap is 50,000 rows (`common.MAX_EXPORT_ROWS`), but nothing bounds a row's width (audit
+    previews are up to 2,000 characters each side plus a 1,000 character reason) or the number of downloads a
+    worker builds at once (the LLM export has `MAX_CONCURRENT_BUILDS`, table exports have nothing). The agent
+    brief and the lens: never block the event loop; CPU-heavy work goes to a thread (`UntrustedPool` itself says
+    thousands of entries must never hold the event loop). H-LOOP-LAG passes below 50 ms.
 
 How it works
     The audit log gets 50,000 rule-change rows of about 0.9 KB each (a pattern, a note before and after, a reason),

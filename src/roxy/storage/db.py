@@ -59,9 +59,17 @@ How it works
       its caller receives only after COMMIT: if the transaction is lost, every job of it gets
       `SharedStateUnavailable` (it did not happen, plan C7). One lock acquisition and one commit then serve many
       requests instead of one each. Below the backlog every write keeps a transaction of its own (the shortest
-      lock holds), and writes without a budget (admin changes, leader jobs, migrations) always do.
+      lock holds), and writes without a budget (admin changes, leader jobs, migrations) always do. Two rules keep one
+      job's mistake inside its own savepoint: the profile keeps foreign keys off (`group_safe`: SQLite defers no
+      other constraint, so COMMIT cannot fail because of one job), and a function passed to `write` never ends the
+      transaction it runs in (`tests/unit/storage/test_storage_txn_contract.py`; a group whose job did it anyway is
+      never reported done, `JobEndedTransaction`). `_ConnectionThread._run_group` states the whole contract.
     - Every queue is bounded (plan P9): when more than `MAX_PENDING_JOBS` operations are waiting, new ones fail
       fast with `SharedStateUnavailable` instead of piling up memory.
+    - A write that fails counts in `DbStats.write_errors` (the System page says "Writing failed recently"), except a
+      deliberate refusal: a function that raises `WriteRefused` (a leader job whose lease moved, `LostLeadership`)
+      found a precondition false inside its transaction, so it is rolled back and counted in `DbStats.refused`; the
+      database worked.
     - `write_sync` and `read_sync` do the same work on the calling thread, for scripts, migrations and tests.
       Never call them from the event loop thread of a running server.
     - PRAGMAs per plan 6.1 with the memory sizes from DESIGN.md section 0 (the production box has 909 MB).
@@ -168,6 +176,17 @@ PROFILES: dict[str, DbProfile] = {
     # cache.db reads large bodies; memory mapping 32 MiB of it lets reads skip a copy (DESIGN.md section 0).
     "cache": DbProfile("cache", "NORMAL", writer_cache_kib=4096, reader_cache_kib=2048, mmap_bytes=32 * 1024 * 1024),
 }
+
+
+class WriteRefused(Exception):
+    """A write function's deliberate refusal: a precondition it checked inside its transaction was false (a leader
+    job whose lease moved to another worker, `scheduler.leader.LostLeadership`, is the one there is).
+
+    The transaction is rolled back and the exception reaches the caller unchanged, as any exception does; it is
+    counted in `DbStats.refused`, never in `write_errors`, because the database worked: a write error means the file
+    could not be written, and a refusal after a leadership change is expected (gap G10: the System page said
+    "Writing failed recently" right after startup when the sign-in moved the clock past the leader lease).
+    """
 
 
 class SharedStateUnavailable(Exception):
@@ -377,6 +396,13 @@ def _groupable(job: _Job) -> bool:
     return job.deadline is not None and job.begin == "BEGIN IMMEDIATE"
 
 
+def group_safe(profile: DbProfile) -> bool:
+    """True when the writer of a database with `profile` groups hot-path writes: the profile asks for it and keeps
+    foreign keys off. SQLite defers no other constraint, so then a COMMIT can only fail for a reason that is not one
+    job's (an I/O error, a full disk, no memory), and one job's mistake always surfaces inside its own savepoint."""
+    return profile.group_writes and not profile.foreign_keys
+
+
 @dataclass(slots=True)
 class _Outcome:
     """What one grouped job did, held until the group's COMMIT decides whether it happened."""
@@ -384,8 +410,26 @@ class _Outcome:
     job: _Job
     ok: bool  # its function returned (`value` is the result) or raised (`value` is what its caller gets)
     value: Any
-    lost: bool = False  # the group's transaction is gone with it (or its state is unknown)
+    # The group's transaction is gone with this job, or its state is not known: nothing that ran in it may be
+    # reported as done. `cause` says why (it becomes the `SharedStateUnavailable` cause of the jobs that had run).
+    lost: bool = False
+    cause: BaseException | None = None
     broken: bool = False  # the connection must be reopened
+    stop: bool = False  # the job never ran (its savepoint could not open): commit what ran, the rest goes on later
+
+
+def _unavailable(db_name: str, cause: BaseException) -> SharedStateUnavailable:
+    """`SharedStateUnavailable` chained to `cause`, exactly as `raise SharedStateUnavailable(...) from cause` makes it
+    (the single-transaction path raises it that way; a grouped job hands it over through its future instead)."""
+    error = SharedStateUnavailable(db_name, cause)
+    error.__cause__ = cause
+    return error
+
+
+class JobEndedTransaction(RuntimeError):
+    """A function passed to `Database.write` ended the transaction it runs in (it ran COMMIT, ROLLBACK or END, or
+    released a savepoint it did not open). That breaks the write contract, so nothing of its group is reported as
+    done: every write of the group is answered `SharedStateUnavailable` with this as the cause."""
 
 
 TIMING_BOUNDS_MS: tuple[float, ...] = (0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000)
@@ -433,6 +477,7 @@ class DbStats:
     writes: int = 0
     reads: int = 0
     write_errors: int = 0
+    refused: int = 0  # writes whose function refused on purpose (`WriteRefused`, a lost leader lease): not errors
     unavailable: int = 0
     max_write_ms: float = 0.0
     last_write_ms: float = 0.0
@@ -471,7 +516,11 @@ class _ConnectionThread(threading.Thread):
         # Jobs taken from the queue by a group that must run after it (an ordinary write, the stop marker, or the
         # rest of a group whose transaction was lost). Taken before the queue, in order. Bounded by GROUP_MAX_JOBS.
         self._carry: deque[_Job | None] = deque()
-        self._grouping = role == "writer" and db.profile.group_writes
+        # Grouping needs a COMMIT that cannot fail because of one job: with foreign keys on, a deferred foreign key
+        # of one job would fail the COMMIT of every job of its group (`group_safe`).
+        self._grouping = role == "writer" and group_safe(db.profile)
+        # The outcomes of a group whose COMMIT succeeded, until every caller has them (see `_run_group`).
+        self._committed: list[_Outcome] | None = None
 
     def run(self) -> None:
         while True:
@@ -592,35 +641,56 @@ class _ConnectionThread(threading.Thread):
         return failed
 
     def _job_error(self, exc: BaseException) -> BaseException:
-        """How a job's own exception reaches its caller (the mapping of `Database._transact`)."""
+        """How a job's own exception reaches its caller: the mapping of `Database._transact` (an unavailable database
+        becomes `SharedStateUnavailable` chained to SQLite's error, anything else reaches the caller as it is)."""
         db = self._db
-        db._count_error("writer")
+        db._count_error("writer", exc)
         if is_unavailable_error(exc):
             db.stats.unavailable += 1
-            return SharedStateUnavailable(db.name, exc)
+            return _unavailable(db.name, exc)
         return exc
+
+    def _start_error(self, exc: sqlite3.Error | OSError) -> BaseException:
+        """How a failed connect or BEGIN reaches the callers of a group (`Database._translate`, chained like the
+        `raise ... from exc` of the single-transaction path)."""
+        error = self._db._translate(exc)
+        if error is not exc:
+            error.__cause__ = exc
+        return error
 
     def _run_group(self, first: _Job) -> None:
         """Run `first` and the hot-path writes queued with it in ONE `BEGIN IMMEDIATE ... COMMIT` (group commit).
 
-        Each job is still atomic on its own: every job after the first runs inside a savepoint, so a failing job
-        undoes only its own changes and gets its own exception. Jobs run one after another on this thread, exactly as
-        separate transactions would, so a read-then-write job sees every earlier job's rows (limits stay exact,
-        plan C6). Results are handed out only after COMMIT: a caller never sees a value that was not committed, and
-        when the transaction is lost every job of it gets `SharedStateUnavailable` ("did not happen").
+        The contract, each part pinned by `tests/unit/storage/test_storage_db_group.py` (and the multiprocess tests):
+        - Atomic per job: every job after the first runs inside a savepoint, so a job that raises undoes only its own
+          changes and gets its own exception; the first job needs none (if it fails, nothing else had run).
+        - Serial order: jobs run one after another in queue order on this thread, so each sees every earlier job's
+          rows, and no other process writes in between (one `BEGIN IMMEDIATE`): limits stay exact (plan C6).
+        - Committed results only: a caller receives its value only after COMMIT returned. When the transaction is
+          lost (COMMIT fails, an I/O error, a job ended the transaction, any state this code cannot vouch for),
+          every job that had run gets `SharedStateUnavailable` (it did not happen, plan C7) and the jobs not reached
+          yet run in a new transaction. A process that dies between jobs answered nobody, and SQLite discards the
+          uncommitted transaction.
+        - Budgets: a job starts only before its deadline; a caller whose deadline passed while its job waited
+          cancels it, and it never runs (the same race-free `Future` handshake as a write of its own).
         """
         group = [first]
         try:
             self._group(group)
         except BaseException as exc:  # a bug here must never stop the writer thread or strand a caller
             log.exception("db_group_failed", extra={"fields": {"db": self._db.name}})
-            if self._conn is not None:
+            committed = self._committed
+            if committed is not None:
+                _deliver(committed)  # the COMMIT had returned: those writes happened, their results stand
+            elif self._conn is not None:
                 _rollback_quietly(self._conn)
             for job in group:
                 if job.future.done() or any(job is carried for carried in self._carry):
                     continue  # answered already, or handed on to run in the next transaction
                 if job.future.running() or job.future.set_running_or_notify_cancel():
-                    job.future.set_exception(SharedStateUnavailable(self._db.name, exc))
+                    job.future.set_exception(_unavailable(self._db.name, exc))
+        finally:
+            self._committed = None
 
     def _group(self, group: list[_Job]) -> None:
         """The body of `_run_group` (`group` holds the first job and grows as jobs are taken)."""
@@ -642,7 +712,7 @@ class _ConnectionThread(threading.Thread):
                 self._conn = connect(db.path, db.profile, self.role)
             except (sqlite3.Error, OSError) as exc:
                 cause = exc
-                self._fail_unstarted(group, lambda: db._translate(cause))
+                self._fail_unstarted(group, lambda: self._start_error(cause))
                 return
             self._busy_ms = db.profile.busy_timeout_ms
         conn = self._conn
@@ -658,7 +728,7 @@ class _ConnectionThread(threading.Thread):
             # Jobs past their deadline ran out of budget waiting for another worker's lock (counted like the ones
             # their callers gave up on); `_fail_unstarted` skips jobs already answered.
             late = sum(1 for job in group if job.deadline is not None and job.deadline <= now and not job.future.done())
-            if self._fail_unstarted(group, lambda: db._translate(failure)):
+            if self._fail_unstarted(group, lambda: self._start_error(failure)):
                 db.stats.deadline_failures += late
             if _is_broken_error(exc):
                 self._close()
@@ -684,20 +754,23 @@ class _ConnectionThread(threading.Thread):
             index += 1
             if not self._start_grouped(job):
                 continue
-            # The first job of the transaction needs no savepoint: if it fails, nothing else is lost.
             outcome = self._run_in_savepoint(conn, job) if done else self._run_first(conn, job)
             done.append(outcome)
-            if outcome.lost or not conn.in_transaction:
-                # The first job failed (rolled back; nothing else had run), or SQLite rolled the whole transaction
-                # back under a later one (an I/O error, a full disk, out of memory): what had succeeded did not
-                # happen. The jobs not reached yet run in a new transaction.
+            if outcome.lost:
+                # Nothing that ran in this transaction may be reported as done: roll it back, answer every job that
+                # ran (its own exception, or "unavailable"), and run the jobs not reached yet in a new transaction.
                 _rollback_quietly(conn)
-                self._finish_lost(done, outcome.value)
+                self._finish_lost(done, outcome.cause or SharedStateUnavailable(db.name, "transaction lost"))
                 if outcome.broken:
                     self._close()
                     db.stats.reconnects += 1
                 self._carry.extendleft(reversed(group[index:]))
                 return
+            if outcome.stop:
+                # Its savepoint could not open, so it never ran (as when BEGIN fails for a write of its own): the jobs
+                # before it commit now, the ones after it run in the next transaction.
+                self._carry.extendleft(reversed(group[index:]))
+                break
         if not done:
             _rollback_quietly(conn)  # every job was canceled or out of time: nothing to commit
             return
@@ -711,7 +784,12 @@ class _ConnectionThread(threading.Thread):
                 self._close()
                 db.stats.reconnects += 1
             return
+        # The writes happened. From here every caller gets its result: `_run_group` delivers these if a bug interrupts
+        # the bookkeeping below, so no caller of a committed write is ever told "unavailable". The counters come
+        # first so a caller that looks at them after its write returned sees its write counted.
+        self._committed = done
         finished = time.perf_counter()
+        db.stats.writes += sum(1 for outcome in done if outcome.ok)
         db.stats.note_transaction((locked - started) * 1000, (finished - locked) * 1000)
         elapsed_ms = (finished - started) * 1000
         db.stats.last_write_ms = elapsed_ms
@@ -721,12 +799,7 @@ class _ConnectionThread(threading.Thread):
             db.stats.grouped_writes += len(done)
             db.stats.largest_group = max(db.stats.largest_group, len(done))
         db._busy_until = 0.0
-        for outcome in done:
-            if outcome.ok:
-                db.stats.writes += 1
-                outcome.job.future.set_result(outcome.value)
-            else:
-                outcome.job.future.set_exception(outcome.value)
+        _deliver(done)
 
     def _begin_group(self, conn: sqlite3.Connection, group: list[_Job]) -> bool:
         """`BEGIN IMMEDIATE` for a group, waiting for the write lock in short polls until the most patient job's
@@ -751,43 +824,69 @@ class _ConnectionThread(threading.Thread):
 
     def _run_first(self, conn: sqlite3.Connection, job: _Job) -> _Outcome:
         """The first job of a group's transaction, run as a plain write: on failure the whole (one job) transaction
-        is rolled back, exactly as `Database._transact` does."""
+        is rolled back, exactly as `Database._transact` does, and the jobs after it go on in a new transaction."""
         try:
-            return _Outcome(job, True, job.fn(conn))
+            value = job.fn(conn)
         except BaseException as exc:
             _rollback_quietly(conn)
-            return _Outcome(job, False, self._job_error(exc), lost=True, broken=_is_broken_error(exc))
+            error = self._job_error(exc)
+            return _Outcome(job, False, error, lost=True, cause=error, broken=_is_broken_error(exc))
+        if not conn.in_transaction:
+            return self._ended_transaction(job, value)
+        return _Outcome(job, True, value)
 
     def _run_in_savepoint(self, conn: sqlite3.Connection, job: _Job) -> _Outcome:
         """A later job of a group, inside a savepoint: its failure undoes its own changes and nothing else."""
         try:
             conn.execute(f"SAVEPOINT {_GROUP_SAVEPOINT}")
-        except sqlite3.Error as exc:  # the transaction is in an unknown state: treat it as lost
-            return _Outcome(job, False, self._job_error(exc), lost=True, broken=_is_broken_error(exc))
+        except sqlite3.Error as exc:
+            error = self._job_error(exc)
+            if conn.in_transaction and not _is_broken_error(exc):
+                # Nothing changed: the transaction holds exactly the jobs before this one, which commit.
+                return _Outcome(job, False, error, stop=True)
+            return _Outcome(job, False, error, lost=True, cause=error, broken=_is_broken_error(exc))
         try:
             value = job.fn(conn)
         except BaseException as exc:
-            lost = _is_broken_error(exc)
-            try:
-                if conn.in_transaction:
-                    conn.execute(f"ROLLBACK TO {_GROUP_SAVEPOINT}")
-                    conn.execute(f"RELEASE {_GROUP_SAVEPOINT}")
-            except sqlite3.Error:
-                lost = True
-            return _Outcome(job, False, self._job_error(exc), lost=lost, broken=_is_broken_error(exc))
+            error = self._job_error(exc)
+            if _is_broken_error(exc) or not _undo_savepoint(conn):
+                # An I/O error, corruption or no memory (SQLite advises rolling the whole transaction back after
+                # them), or the savepoint could not be rolled back (SQLite already dropped the transaction): the state
+                # of the transaction is not known, so nothing of it is kept.
+                return _Outcome(job, False, error, lost=True, cause=error, broken=_is_broken_error(exc))
+            return _Outcome(job, False, error)  # only its own changes were undone; the group goes on
         try:
             conn.execute(f"RELEASE {_GROUP_SAVEPOINT}")
         except sqlite3.Error as exc:
-            return _Outcome(job, False, self._job_error(exc), lost=True, broken=_is_broken_error(exc))
+            # The savepoint is gone (the job ended the transaction or released it) or SQLite refused (no memory, a
+            # write statement the job left running): what the transaction holds is not known.
+            if not conn.in_transaction:
+                return self._ended_transaction(job, value)
+            self._db._count_error("writer")
+            return _Outcome(job, True, value, lost=True, cause=exc, broken=_is_broken_error(exc))
+        if not conn.in_transaction:
+            return self._ended_transaction(job, value)
         return _Outcome(job, True, value)
 
+    def _ended_transaction(self, job: _Job, value: Any) -> _Outcome:
+        """A job that returned after ending the transaction itself (it broke the write contract): its group is lost,
+        so no write of it is reported as done (`JobEndedTransaction`)."""
+        db = self._db
+        db._count_error("writer")
+        log.error("db_job_ended_transaction", extra={"fields": {"db": db.name}})
+        cause = JobEndedTransaction(f"a write ended the {db.name}.db transaction it ran in")
+        return _Outcome(job, True, value, lost=True, cause=cause)
+
     def _finish_lost(self, done: list[_Outcome], cause: BaseException) -> None:
-        """The group's transaction is gone: jobs whose function had returned did not happen after all."""
+        """The group's transaction is gone: jobs whose function had returned did not happen after all, and jobs that
+        failed get their own exception."""
         db = self._db
         for outcome in done:
+            if outcome.job.future.done():
+                continue
             if outcome.ok:
                 db.stats.unavailable += 1
-                outcome.job.future.set_exception(SharedStateUnavailable(db.name, cause))
+                outcome.job.future.set_exception(_unavailable(db.name, cause))
             else:
                 outcome.job.future.set_exception(outcome.value)
 
@@ -857,7 +956,9 @@ class Database:
         """Run `fn(conn)` on this database's writer thread inside `BEGIN IMMEDIATE ... COMMIT`.
 
         `fn` must be quick and must not touch the event loop; return plain values (call `fetchall()` inside
-        `fn`, never return a cursor). Exceptions roll the transaction back and are re-raised here. Busy, locked
+        `fn`, never return a cursor), and never end the transaction it runs in (no COMMIT, ROLLBACK, END,
+        `commit()` or `executescript()`; savepoints of its own are fine). Exceptions roll the transaction back
+        (with group commit: `fn`'s own savepoint) and are re-raised here. Busy, locked
         and I/O errors become `SharedStateUnavailable`. If the awaiting coroutine is canceled before the job
         starts, it never runs; once it started it finishes (commit or rollback), so it is never half applied.
         `busy_timeout_ms` is a total budget for a hot path that has a better fallback than waiting: measured from
@@ -1068,11 +1169,9 @@ class Database:
         try:
             result = fn(conn)
             conn.execute("COMMIT")
-            if role != "reader":
-                self.stats.note_transaction((locked - started) * 1000, (time.perf_counter() - locked) * 1000)
         except BaseException as exc:
             _rollback_quietly(conn)
-            self._count_error(role)
+            self._count_error(role, exc)
             # On a reader, "readonly" means a write was sent to read() (query_only refused it): a bug in the
             # caller, so it is raised as is instead of being disguised as an unavailable database.
             misuse = role == "reader" and isinstance(exc, sqlite3.Error) and _primary_code(exc) == _SQLITE_READONLY
@@ -1080,18 +1179,26 @@ class Database:
                 self.stats.unavailable += 1
                 raise SharedStateUnavailable(self.name, exc) from exc
             raise
-        elapsed_ms = (time.perf_counter() - started) * 1000
+        finished = time.perf_counter()
+        elapsed_ms = (finished - started) * 1000
         if role == "reader":
             self.stats.reads += 1
         else:
+            # After the try: the write committed, so nothing here may turn it into an error for the caller.
+            self.stats.note_transaction((locked - started) * 1000, (finished - locked) * 1000)
             self.stats.writes += 1
             self.stats.last_write_ms = elapsed_ms
             if elapsed_ms > self.stats.max_write_ms:
                 self.stats.max_write_ms = elapsed_ms
         return result
 
-    def _count_error(self, role: ConnRole) -> None:
-        if role != "reader":
+    def _count_error(self, role: ConnRole, exc: BaseException | None = None) -> None:
+        """A failed write: `write_errors`, or `refused` for a function's deliberate `WriteRefused` (not an error)."""
+        if role == "reader":
+            return
+        if isinstance(exc, WriteRefused):
+            self.stats.refused += 1
+        else:
             self.stats.write_errors += 1
 
     def _translate(self, exc: sqlite3.Error | OSError) -> BaseException:
@@ -1127,6 +1234,31 @@ def _begin_polling(
                 raise
         if still_wanted is not None and not still_wanted():
             return False
+
+
+def _deliver(done: list[_Outcome]) -> None:
+    """Hand every outcome of a committed group to its caller (a value, or the job's own exception)."""
+    for outcome in done:
+        future = outcome.job.future
+        if future.done():
+            continue
+        if outcome.ok:
+            future.set_result(outcome.value)
+        else:
+            future.set_exception(outcome.value)
+
+
+def _undo_savepoint(conn: sqlite3.Connection) -> bool:
+    """Roll a grouped job's changes back to its savepoint and drop the savepoint. False when that is not possible
+    (SQLite already dropped the whole transaction, or refused), so the group's transaction must be given up."""
+    try:
+        if not conn.in_transaction:
+            return False
+        conn.execute(f"ROLLBACK TO {_GROUP_SAVEPOINT}")
+        conn.execute(f"RELEASE {_GROUP_SAVEPOINT}")
+    except sqlite3.Error:
+        return False
+    return conn.in_transaction
 
 
 def _rollback_quietly(conn: sqlite3.Connection) -> None:

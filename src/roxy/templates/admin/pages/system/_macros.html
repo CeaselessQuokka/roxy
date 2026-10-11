@@ -8,10 +8,8 @@
 -#}
 {% from "components/badges.html" import status_badge, help_dot %}
 
-{% macro when(cell) -%}
-{%- if cell -%}<time datetime="{{ cell.datetime }}">{{ cell.text }}</time>{% if cell.sub %} <span class="muted">({{ cell.sub }})</span>{% endif %}
-{%- else -%}<span class="muted">n/a</span>{%- endif -%}
-{%- endmacro %}
+{% from "components/pieces.html" import when as _when %}
+{% macro when(cell) -%}{{ _when(cell) }}{%- endmacro %}
 
 {% macro flag(value, yes="Yes", no="No", tone_yes="ok", tone_no="neutral") -%}
 {%- if value -%}{{ status_badge(tone_yes, yes) }}{%- else -%}{{ status_badge(tone_no, no) }}{%- endif -%}

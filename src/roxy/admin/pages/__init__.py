@@ -2,13 +2,15 @@
 
 What this is
     `router` (built on first access) holds, in order: the shared routes of `core.py` (`/admin/dashboard`, the shell's
-    `/admin/ui/*` endpoints), then for each of the 18 pages of `registry.PAGES` either the page module's own router
-    (`roxy.admin.pages.<id>`, once its builder wrote it) or a "coming soon" route. Its lifespan
+    `/admin/ui/*` endpoints), then the router of each of the 18 pages of `registry.PAGES` (`roxy.admin.pages.<id>`;
+    every page is built, and a missing page module fails the startup instead of hiding behind a placeholder). Its
+    lifespan
     (`dashboard_lifespan`) loads `docs/glossary.yml` at startup (a missing glossary fails the worker's startup and
     so the deploy health gate) and compiles the dashboard templates.
     Submodules: `registry` (pages, cards, the v1 section map), `kit` (`Page`, `PageView`, `table_view`), `shell`
     (the base layout's context), `inline` (inline settings), `texts` (glossary, caller texts, line diff), `fmt`
-    (times), `core` (shared routes), `testing` (test harness; never imported by production code).
+    (times), `core` (shared routes). The page test harness is `tests/pages_harness.py` (outside the package, so it
+    never ships).
 
 Why it exists
     `roxy/admin/router.py` includes this package's `router` at its marked include point and checks it with
@@ -83,14 +85,11 @@ def build_router() -> Any:
     router = APIRouter(lifespan=dashboard_lifespan)
     router.include_router(core.router)
     for spec in registry.PAGES:
-        if registry.is_built(spec.id):
-            module = importlib.import_module(spec.module)
-            page_router = getattr(module, "router", None)
-            if not isinstance(page_router, APIRouter):
-                raise TypeError(f"{spec.module} must expose `router` (its `Page(...).router`)")
-            router.include_router(page_router)
-        else:
-            router.include_router(core.coming_soon_router(spec))
+        module = importlib.import_module(spec.module)  # every registered page has its module (ImportError if not)
+        page_router = getattr(module, "router", None)
+        if not isinstance(page_router, APIRouter):
+            raise TypeError(f"{spec.module} must expose `router` (its `Page(...).router`)")
+        router.include_router(page_router)
     return router
 
 

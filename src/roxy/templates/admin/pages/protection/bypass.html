@@ -31,7 +31,7 @@
   </div>
   <p class="field__hint" id="prot-bypass-me-note">{% if me.bypassed %}An entry already covers your address; bypassing it again extends nothing new.{% else %}Bypass my IP adds your address for {{ num(me.default_expiry_h) }} hours (the default expiry below).{% endif %}</p>
 </div>
-{{ data_table(**table) }}
+<div class="prot-bleed">{{ data_table(**table) }}</div>
 {% call confirm_dialog("dlg-prot-bypass-add", "Add a bypass", api.add, confirm_label="Add", api=True, success="Bypass added.",
                        on_success="refresh", refresh="bypass",
                        consequences=["Requests from it skip the rate limits and the tarpit (never pause, bans, filters or blocks).",

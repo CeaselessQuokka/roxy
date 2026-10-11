@@ -101,7 +101,7 @@ from roxy.core.reasons import AuthClass, Outcome
 from roxy.core.redact import redact_text
 from roxy.deps import get_ctx
 from roxy.metrics import queries, read_history
-from roxy.metrics.catalog import METRICS
+from roxy.metrics.catalog import METRICS, avoided_note
 from roxy.proxy import validate
 from roxy.proxy.context import ProxyRequest, endpoint_template, is_browser
 from roxy.proxy.router import allowed_hosts, setting
@@ -136,6 +136,12 @@ STATE_METRICS: Final[tuple[str, ...]] = (
 )
 RATIO_METRICS: Final[tuple[str, ...]] = ("hit_ratio", "avoided_pct")
 """The series of `GET /cache/ratios`."""
+AVOIDED_TILES: Final = frozenset({"avoided_pct", "avoided"})
+"""Tiles that explain a negative avoided share (`metrics.catalog.avoided_note`) instead of showing a delta."""
+NEGATIVE_AVOIDED_NOTICE: Final = (
+    "Avoided is below 0% in some buckets: there, retries and refreshes made more calls to Roblox than callers sent "
+    "requests (-100% means 2 upstream calls per request). Roxy shows it as it is."
+)
 STATE_LABELS: Final[dict[str, str]] = {
     "cache_hit": "Hit (fresh copy)",
     "cache_revalidating": "Revalidating (copy served, refresh running)",
@@ -396,7 +402,12 @@ async def stats_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
         tile = {"value": current.get(key), "delta": delta, "delta_pct": delta_pct}
         # Plan 6.8 (finding LOGICFIX-1): a reset of this tile's data in either window replaces its delta.
         queries.mark_kpi_partial(tile, key, data["resets"], data["baseline_resets"], tz)
-        tiles.append(kpi_from_read_model(key, tile) | ({"partial": True} if tile.get("partial") else {}))
+        built = kpi_from_read_model(key, tile) | ({"partial": True} if tile.get("partial") else {})
+        note = avoided_note(current.get("avoided_pct")) if key in AVOIDED_TILES else None
+        if note and not tile.get("partial"):
+            # Below 0% (plan P6 never clamps it): the tile says why instead of a delta.
+            built["notice"] = f"Below 0%: {note}."
+        tiles.append(built)
     # The page notices: every reset inside the range (as before), and a reset of the comparison window that made a
     # tile partial (its tile says so; the page names it too).
     listed = {row.get("id") for row in data["resets"]}
@@ -465,12 +476,20 @@ async def cache_series(ctx: Any, tr: TimeRange, metrics: tuple[str, ...], labels
         return queries.chart_annotations(conn, start, end), queries.reset_annotations(conn, start, end)
 
     annotations, resets = await db.read(marks)
+    notices = reset_notices(resets, tz=tr.window.tz)
+    if "avoided_pct" in metrics and any(
+        isinstance(value, int | float) and value < 0
+        for entry in series
+        if entry.get("key") == "avoided_pct"
+        for _t, value in entry.get("points") or ()
+    ):
+        notices.append(NEGATIVE_AVOIDED_NOTICE)
     return series_answer(
         tr,
         series,
         compare_series=compare,
         annotations=annotation_entries(annotations),
-        notices=reset_notices(resets, tz=tr.window.tz),
+        notices=notices,
     )
 
 

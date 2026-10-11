@@ -20,20 +20,21 @@ What to read next
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 from typing import Any
 
 import pytest
 
+from pages_harness import HOSTILE, PlannedRequest, parse_html, setting_selector
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import HOSTILE, PlannedRequest, parse_html
 from roxy.core.style_guard import find_style_issues
 
 PAGE = "/admin/protection"
 CARDS = [card.id for card in registry.cards_for("protection")]
 TABLES: dict[str, tuple[str, ...]] = {
-    "refusals": ("refusals",),
+    "refusals": ("refusals", "clients"),
     "throttle": ("watch", "history"),
     "strikes": ("strikes",),
     "throttle-all": ("watch-all",),
@@ -149,7 +150,8 @@ async def test_every_inline_setting_of_the_protection_anchors_is_on_its_card(pag
             continue
         doc = parse_html((await page.fragment("protection", card)).text)
         for key in keys:
-            assert doc.select_one(f'section#{card} [data-setting-key="{key}"]') is not None, (card, key)
+            found = doc.select_one(f"section#{card} " + setting_selector(key, registry.anchor("protection", card)))
+            assert found is not None, (card, key)
 
 
 async def test_the_v1_key_elements_are_on_their_cards(page: Any, pages_app: Any) -> None:
@@ -213,6 +215,7 @@ async def test_hostile_text_is_inert_on_the_page_fragments_tables_and_drawers(
     ("card", "key", "api", "params"),
     [
         ("refusals", "refusals", "protection/refusals", {}),
+        ("refusals", "clients", "clients/ips", {"sort": "refused", "order": "desc"}),
         ("bans", "bans", "protection/bans", {"state": "all"}),
         ("lists", "deny", "protection/access/deny", {}),
         ("bypass", "bypass", "protection/access/bypass", {}),
@@ -260,6 +263,32 @@ async def test_the_pipeline_counts_equal_the_api(page: Any, pages_app: Any) -> N
     assert f"{answer['evaluated']:,}" in doc.select_one(".prot-stats").text()
 
 
+async def test_the_spam_card_charts_the_detector_timelines_from_the_api(page: Any, pages_app: Any) -> None:
+    """Plan 10.9 "detector timelines" (gap G2): the spam card's chart reads `GET /protection/spam/series` over the
+    page's range, one stacked series per detector, and its totals equal the decisions table's."""
+    recorder = pages_app.ctx.recorder
+    for kind, detector in (
+        ("spam_would_ban", "SPAM-RATE"),
+        ("spam_would_ban", "SPAM-RATE"),
+        ("spam_strike", "SPAM-AUTH"),
+    ):
+        recorder.record_event(kind, "warn", None, {"detector": detector, "subject": "ip:203.0.113.60", "action": "ban"})
+    await pages_app.flush()
+    fragment = parse_html((await page.fragment("protection", "spam")).text)
+    chart = fragment.select_one("#spam-timeline[data-chart]")
+    assert chart is not None
+    src = chart.get("data-series-src").replace("&amp;", "&")
+    assert src.split("?", 1)[0] == "/admin/api/v1/protection/spam/series"
+    assert chart.get("data-chart-stack") == "detectors"
+    answer = (await page.get(src)).json()
+    assert answer["totals"] == {"SPAM-AUTH": 1, "SPAM-RATE": 2}
+    table = (await page.api("GET", "protection/spam/events", params={"range": "24h"})).json()
+    assert table["total"] == answer["total"] == 3
+    assert [entry["key"] for entry in answer["series"]] == ["SPAM-AUTH", "SPAM-RATE"]
+    week = parse_html((await page.fragment("protection", "spam", range="7d")).text)
+    assert "range=7d" in week.select_one("#spam-timeline").get("data-series-src")  # the chart follows the range
+
+
 async def test_the_refusal_reasons_keep_the_v1_columns_and_the_message_split(page: Any, pages_app: Any) -> None:
     await seed_protection(page, pages_app)
     doc = parse_html((await page.fragment("protection", "refusals")).text)
@@ -268,6 +297,29 @@ async def test_the_refusal_reasons_keep_the_v1_columns_and_the_message_split(pag
         assert any(label in text for text in labels), label
     assert "custom message" in doc.text() or "default text" in doc.text()
     assert "Endpoint block" in doc.text()
+
+
+async def test_the_clients_refused_most_come_first_and_open_the_clients_drawer(page: Any, pages_app: Any) -> None:
+    await seed_protection(page, pages_app)
+    doc = parse_html((await page.fragment("protection", "refusals")).text)
+    table = doc.select_one('#prot-clients[data-table="client_ips"]')
+    assert table is not None
+    answer = (
+        await page.api("GET", "clients/ips", params={"sort": "refused", "order": "desc", "page_size": "10"})
+    ).json()
+    rows = table.select("tbody tr[data-row-id]")
+    assert len(rows) == len(answer["items"])
+    refused = [int(item["refused"]) for item in answer["items"]]
+    assert refused == sorted(refused, reverse=True)
+    assert refused[0] >= 1
+    first = answer["items"][0]["key"]
+    assert first in rows[0].text()
+    src = rows[0].get("data-drawer-src")
+    assert src.startswith("/admin/clients/client?")
+    assert "kind=ip" in src
+    drawer = await page.get(src)
+    assert drawer.status_code == 200
+    assert first in drawer.text
 
 
 async def test_attempts_tabs_name_the_rule_that_refused(page: Any, pages_app: Any) -> None:
@@ -335,10 +387,77 @@ async def test_every_form_posts_to_a_protection_api_route_with_its_method(page: 
         for form in doc.select("form[data-api-form]"):
             url = form.get("data-api-url", "")
             method = form.get("data-api-method", "POST")
-            assert url.startswith(("/admin/api/v1/protection/", "/admin/api/v1/settings/")), (card, url)
+            # The Protection API, inline settings, and v1's clear buttons (plan 6.8 data resets of this page's data).
+            assert url.startswith(("/admin/api/v1/protection/", "/admin/api/v1/settings/")) or (
+                url == "/admin/api/v1/data/resets"
+            ), (card, url)
             seen.add((method, url.split("?")[0].rsplit("/", 1)[0] if method in ("DELETE", "PATCH") else url))
     methods = {method for method, _ in seen}
     assert {"POST", "PATCH", "DELETE", "PUT"} <= methods, seen
+
+
+CLEARS = [
+    ("refusals", "refusals"),
+    ("throttle", "throttled_clients"),
+    ("ladder", "throttle_rule_hits"),
+    ("tarpit", "tarpit"),
+    ("endpoint-blocks", "endpoint_block_attempts"),
+    ("endpoint-rules", "endpoint_rule_attempts"),
+    ("request-filters", "header_rule_attempts"),
+]
+"""v1's per-section clear buttons of this page (v1 notes 2.10, 4.3, 4.11) and the data reset family each runs."""
+
+
+def _clear_body(doc: Any, family: str) -> dict[str, Any]:
+    """What the clear dialog of `family` sends (its hidden fields, as static/js/api_forms.js types them)."""
+    dialog_id = "dlg-prot-clear-" + family.replace("_", "-")
+    assert doc.select_one(f'[data-dialog-open="{dialog_id}"][data-action]') is not None, family
+    form = doc.select_one(f"dialog#{dialog_id} form[data-api-form]")
+    assert form.get("data-api-url") == "/admin/api/v1/data/resets"
+    assert form.get("data-api-method") == "POST"
+    hidden = {node.get("name"): node.get("value") for node in form.select('input[type="hidden"]')}
+    assert doc.select_one(f"dialog#{dialog_id} textarea[name=reason][required]") is not None
+    # The phrase travels only as what the admin types (the API checks it); the page never sends a copy of it.
+    assert "confirm" not in hidden
+    typed = form.select_one('input[name="confirm"][data-json="string"][required]')
+    assert typed is not None
+    return {
+        "scope": hidden["scope"],
+        "families": [hidden["families"]],
+        "preview": hidden["preview"],
+        "confirm": form.get("data-expected"),  # what the admin is asked to type
+        "reason": "test",
+    }
+
+
+@pytest.mark.parametrize(("card", "family"), CLEARS, ids=[family for _, family in CLEARS])
+async def test_each_v1_clear_button_runs_its_data_reset(page: Any, card: str, family: str) -> None:
+    doc = parse_html((await page.fragment("protection", card)).text)
+    body = _clear_body(doc, family)
+    assert body["families"] == [family]
+    assert body["confirm"] == f"reset {family}"
+    refused = await page.api("POST", "data/resets", json=body, csrf=False)
+    assert refused.status_code == 403
+    done = await page.api("POST", "data/resets", json=body)
+    assert done.status_code in (200, 202), done.text
+
+
+async def test_clearing_the_blocked_attempts_empties_that_tab_only(page: Any, pages_app: Any) -> None:
+    await seed_protection(page, pages_app)
+    assert (await page.api("GET", "protection/endpoint-blocks/attempts")).json()["total"] >= 1
+    rules_before = (await page.api("GET", "protection/endpoint-rules/attempts")).json()["total"]
+    doc = parse_html((await page.fragment("protection", "endpoint-blocks")).text)
+    done = await page.api("POST", "data/resets", json=_clear_body(doc, "endpoint_block_attempts"))
+    assert done.status_code in (200, 202), done.text
+    if done.status_code == 202:  # a reset that outlives the inline wait finishes in the background
+        for _ in range(100):
+            if (await page.api("GET", done.json()["url"])).json()["status"] != "running":
+                break
+            await asyncio.sleep(0.05)
+    assert (await page.api("GET", "protection/endpoint-blocks/attempts")).json()["total"] == 0
+    assert (await page.api("GET", "protection/endpoint-rules/attempts")).json()["total"] == rules_before
+    table = parse_html((await page.fragment("protection", "endpoint-blocks", table="attempts")).text)
+    assert table.select_one(".dt__count").text() == "No rows"
 
 
 @pytest.mark.parametrize(
@@ -359,18 +478,31 @@ async def test_every_change_the_page_makes_needs_the_csrf_token(page: Any, metho
     assert refused.status_code == 403, refused.text
 
 
-async def test_arming_and_the_admin_allowlist_need_a_fresh_second_factor(page: Any, pages_app: Any) -> None:
+async def test_arming_and_the_admin_allowlist_need_a_fresh_second_factor(page: Any) -> None:
     doc = parse_html((await page.fragment("protection", "spam")).text)
     token = doc.select_one('dialog#dlg-prot-spam-arm input[name="confirm_collateral"]').get("value")
     assert token
     assert len(token) == 32
+    # The allowlist form is a dialog that posts JSON; the page script asks for the code on 403 and retries.
+    lists = parse_html((await page.fragment("protection", "lists")).text)
+    allow_form = lists.select_one("dialog#dlg-prot-allow-add form[data-api-form]")
+    assert allow_form.get("data-api-url") == "/admin/api/v1/protection/access/allow_admin"
     page.make_mfa_stale()
-    assert (await pages_app.harness.login(page.admin)).status_code == 200
-    page.make_mfa_stale()
-    armed = await page.api("POST", "protection/spam/arm", json={"confirm_collateral": token, "reason": "test"})
-    assert armed.status_code in (401, 403), armed.text
-    if armed.status_code == 403:
-        assert armed.json()["error"]["code"] == "reauth_required"
+    arm = {"confirm_collateral": token, "reason": "test"}
+    allow = {"cidr": "203.0.113.0/24", "note": "office"}
+    for path, body in (("protection/spam/arm", arm), ("protection/access/allow_admin", allow)):
+        stale = await page.api("POST", path, json=body)
+        assert stale.status_code == 403, (path, stale.text)
+        assert stale.json()["error"]["code"] == "reauth_required"
+        assert stale.headers.get("roxy-reauth") == "required"
+    await page.fresh_mfa()
+    for path, body in (("protection/spam/arm", arm), ("protection/access/allow_admin", allow)):
+        done = await page.api("POST", path, json=body)
+        assert done.status_code == 200, (path, done.text)
+    assert (await page.api("GET", "protection/spam")).json()["dry_run"] is False
+    armed = parse_html((await page.fragment("protection", "spam")).text)
+    assert armed.select_one('[data-action="spam-disarm"]') is not None
+    assert armed.select_one("dialog#dlg-prot-spam-arm") is None
 
 
 async def test_a_ladder_saved_as_the_page_script_sends_it_is_stored_and_simulated(page: Any) -> None:
@@ -452,7 +584,7 @@ async def test_an_empty_database_explains_itself(page: Any) -> None:
     for card, text in (
         ("refusals", "Roxy refused nothing in this range"),
         ("strikes", "Nobody is carrying strikes right now"),
-        ("throttle-all", "Nothing has been refused since the emergency limit was switched on"),
+        ("throttle-all", "The emergency limit is off, so it refuses nobody"),
         ("bans", "No ban matches"),
         ("ua-rules", "No client rules; every caller uses the ordinary limits"),
         ("request-filters", "No request filters"),

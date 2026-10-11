@@ -6,17 +6,31 @@
  *   card for the answer (htmx, outerHTML). `initCards()` wires two triggers: the `roxy:refresh-cards` event that
  *   api_forms.js raises after a successful action (`data-on-success="refresh"`, cards named in `data-refresh`, else
  *   the card holding the form), and the page-wide stream: a card with `data-refresh-on="kpi recommendation"` is
- *   refreshed when one of those event kinds arrives, at most once per `data-refresh-min-s` seconds.
+ *   refreshed when one of those event kinds arrives, at most once per `data-refresh-min-s` seconds. It also loads
+ *   the page's lazy cards (`@page.card(..., lazy=True)`, placeholders with `hx-trigger="revealed"`) in the
+ *   background: one at a time, top to bottom, starting right after the page has loaded.
  *
  * Why it exists
  *   A card's first paint and its refresh render the same server template, so refreshing a card is the honest way to
  *   show new numbers (one source of truth, plan P6). Stream events can be frequent (`kpi` every 2 s), so refreshes
  *   are throttled per card, skipped while the tab is hidden, and never replace a card the admin is working in
  *   (focus inside, an open menu, an unsaved setting), which would throw their input away.
+ *   Lazy cards keep the first paint small on the 1 GB server, but htmx's `revealed` fires only for a card inside
+ *   the window when scrolling stops: a reader who jumps (a link to `#tarpit`, the browser's find, a fast scroll on
+ *   a phone) would meet placeholders that never load. Loading them in the background, one request at a time, means
+ *   a card is usually ready before the reader gets there, and the server never renders a burst of fragments at once.
+ *   Every page loads its lazy cards this way (it replaced five page-local copies of the idea).
  *
  * How it works
- *   One delegated listener per trigger; per-card timestamps in a WeakMap (monotonic `performance.now`). A card that
- *   could not refresh keeps its old content (htmx does not swap error answers) and is tried again next time.
+ *   One delegated listener per trigger; per-card timestamps (monotonic `performance.now`) kept by card id, not by
+ *   element: a refresh swaps the card's element for a new one (outerHTML), and a timestamp kept on the old element
+ *   was lost with it, so every `kpi` frame (every 2 s) re-rendered a card meant to refresh once a minute (found by
+ *   tests/multiprocess/test_dashboard_sse_mp.py). A card that could not refresh keeps its old content (htmx does not
+ *   swap error answers) and is tried again next time.
+ *   The background loader waits for the `load` event and a short pause, then asks the first placeholder that is not
+ *   already loading (scrolled into view meanwhile), waits for its answer (at most 15 s), pauses, and goes on; a hidden
+ *   tab waits until it is shown again. A placeholder whose request failed is not asked again by the loader: it keeps
+ *   its message and still loads when it scrolls into view.
  *
  * What to read next
  *   templates/components/page_card.html (`data-card-src`, `data-refresh-on`), static/js/api_forms.js.
@@ -25,7 +39,50 @@
 import htmx from "roxy/htmx_setup";
 import { qs, qsa } from "roxy/dom";
 
-const lastRefresh = new WeakMap();
+const lastRefresh = new Map();  // card id -> when it last refreshed (bounded: one entry per card of the page)
+const LAZY_DELAY_MS = 250;  // after the load event: the first paint and its scripts settle first
+const LAZY_PAUSE_MS = 80;  // between two cards: one fragment at a time on the server
+const LAZY_WAIT_MS = 15000;  // never wait on one card forever
+
+function pause(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function whenVisible() {
+  if (!document.hidden) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onChange = () => {
+      if (document.hidden) return;
+      document.removeEventListener("visibilitychange", onChange);
+      resolve();
+    };
+    document.addEventListener("visibilitychange", onChange);
+  });
+}
+
+/** Load every lazy card still waiting, one at a time, top to bottom (see the module docstring). */
+async function loadLazyCards() {
+  const asked = new WeakSet();
+  for (;;) {
+    await whenVisible();
+    const card = qsa("section.page-card--lazy[data-card-src]").find(
+      (node) => !asked.has(node) && !node.classList.contains("htmx-request"),
+    );
+    if (!card) return;
+    asked.add(card);
+    try {
+      await Promise.race([refreshCard(card, { force: true }), pause(LAZY_WAIT_MS)]);
+    } catch {
+      /* the placeholder stays and loads when it scrolls into view */
+    }
+    await pause(LAZY_PAUSE_MS);
+  }
+}
+
+/** The key a card's refresh time is kept under: its id, which the swapped-in element keeps. */
+function cardKey(card) {
+  return card.id || card.dataset.cardSrc || "";
+}
 
 function busy(card) {
   return Boolean(
@@ -40,7 +97,7 @@ function busy(card) {
 export function refreshCard(card, { force = false } = {}) {
   if (!(card instanceof Element) || !card.dataset.cardSrc) return null;
   if (!force && busy(card)) return null;
-  lastRefresh.set(card, performance.now());
+  lastRefresh.set(cardKey(card), performance.now());
   return htmx.ajax("GET", card.dataset.cardSrc, { target: card, swap: "outerHTML", source: card });
 }
 
@@ -63,8 +120,11 @@ export function initCards() {
       const kinds = card.dataset.refreshOn.split(/\s+/);
       if (!kinds.includes(kind)) continue;
       const gap = Math.max(2, Number(card.dataset.refreshMinS) || 15) * 1000;
-      if (now - (lastRefresh.get(card) || -Infinity) < gap) continue;
+      if (now - (lastRefresh.get(cardKey(card)) ?? -Infinity) < gap) continue;
       refreshCard(card);
     }
   });
+  const start = () => window.setTimeout(loadLazyCards, LAZY_DELAY_MS);
+  if (document.readyState === "complete") start();
+  else window.addEventListener("load", start, { once: true });
 }

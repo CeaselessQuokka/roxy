@@ -155,7 +155,9 @@ EXPECTED_NO_PARAM_RULES = {
 }
 
 ALLOWED_FAMILIES = {"upstream", "cache", "abuse", "egress", "credential", "filter", "system", "security", "host"}
-ALLOWED_PAGES = {"recommendations#engine"}
+ALLOWED_PAGES = {"recommendations#engine", "recommendations#rule-cred_probe_cost"}
+"""Plan 15.6 puts the insights group on Recommendations > Engine; the CRED-PROBE-COST threshold (its rule's only
+one, an ordinary setting) is also in that rule's "Tune this rule" drawer (P11 integration)."""
 
 NUMERIC_TYPES = {SettingType.INT, SettingType.FLOAT, SettingType.DURATION, SettingType.BYTES, SettingType.PERCENT}
 DASHES = (chr(0x2014), chr(0x2013))  # em dash, en dash
@@ -244,6 +246,9 @@ def test_group_j_spec_complete(spec: SettingSpec) -> None:
     assert spec.description.strip()
     assert spec.pages
     assert set(spec.pages) <= ALLOWED_PAGES
+    assert "recommendations#engine" in spec.pages
+    if "recommendations#rule-cred_probe_cost" in spec.pages:
+        assert spec.key == "insight_cred_probe_cost_max_per_hour"
     assert spec.apply == Apply.LIVE
     if spec.type in NUMERIC_TYPES:
         assert spec.if_raised.strip()

@@ -28,8 +28,8 @@ from urllib.parse import quote
 
 import pytest
 
+from pages_harness import HOSTILE, parse_html
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import HOSTILE, parse_html
 from roxy.core.style_guard import find_style_issues
 
 PAGE = "/admin/security"
@@ -160,6 +160,25 @@ async def test_every_inline_setting_of_the_admin_access_card_is_there(page: Any)
     text = doc.select_one("section#admin-access").text()
     assert "You are signing in from" in text
     assert "Admin allowlist" in text
+
+
+async def test_an_admin_access_setting_saves_only_with_csrf_and_a_fresh_second_factor(page: Any) -> None:
+    doc = parse_html((await page.fragment("security", "admin-access")).text)
+    form = doc.select_one('section#admin-access form.setting[data-setting-key="admin_login_max_failures"]')
+    assert form is not None
+    assert form.get("data-fresh-mfa") is not None
+    url = form.get("data-setting-api")
+    assert url == "/admin/api/v1/settings/admin_login_max_failures"
+    assert (await page.api("PUT", url, json={"value": 6}, csrf=False)).status_code == 403
+    page.make_mfa_stale()
+    stale = await page.api("PUT", url, json={"value": 6, "reason": "test"})
+    assert stale.status_code == 403
+    assert stale.json()["error"]["code"] == "reauth_required"
+    await page.fresh_mfa()
+    saved = await page.api("PUT", url, json={"value": 6, "reason": "test"})
+    assert saved.status_code == 200, saved.text
+    after = parse_html((await page.fragment("security", "admin-access")).text)
+    assert after.select_one("#set-admin-access-admin_login_max_failures-value").get("value") == "6"
 
 
 # ============================================================================================ tables
@@ -304,6 +323,72 @@ async def test_a_header_row_opens_its_drawer_by_an_encoded_url(page: Any, pages_
     assert "/admin/api/v1/security/fingerprints/headers/x-roxy-test" in urls
     assert "/admin/api/v1/security/fingerprints/ignored" in urls
     assert drawer.select_one('form[data-api-form] input[name="name"]').get("value") == "x-roxy-test"
+
+
+async def test_a_user_agent_row_opens_its_newest_request_in_the_drawer(page: Any, pages_app: Any, inert: Any) -> None:
+    """v1's User-Agent drill-down (gap G1, v1notes 4.21): where its newest request went, from which address and with
+    which header names, read through the API's own helper; caller text stays text."""
+    await seed_security(pages_app)
+    table = (await page.api("GET", "security/fingerprints/user-agents", params={"page_size": 250})).json()
+    doc = parse_html((await page.fragment("security", "fingerprints", part="agents", page_size=250)).text)
+    rows = doc.select("tbody tr[data-drawer-src]")
+    assert len(rows) == len(table["items"])  # every User-Agent row opens a drawer
+    hostile = next(item for item in table["items"] if item["user_agent"] == HOSTILE["script"])
+    src = next(row.get("data-drawer-src") for row in rows if hostile["ua_hash"] in (row.get("data-drawer-src") or ""))
+    assert src.startswith("/admin/security/fragment/fingerprints?")
+    assert "part=agent" in src
+    response = await page.get(src.replace("&amp;", "&"))
+    assert response.status_code == 200
+    inert(response.text, "user-agent drawer")
+    drawer = parse_html(response.text)
+    detail = (await page.api("GET", f"security/fingerprints/user-agents/{hostile['ua_hash']}")).json()
+    assert detail["has_detail"] is True
+    facts = drawer.select_one("[data-fp-agent-detail]")
+    assert facts is not None
+    text = drawer.text()
+    assert HOSTILE["script"] in text  # the User-Agent, shown as text
+    assert detail["last_path"] in text
+    assert detail["last_caller"] in text
+    names = [item.text() for item in drawer.select(".fp-header-names li")]
+    assert names == detail["last_header_names"]
+    assert "user-agent" in names
+    assert "&lt;script&gt;" in response.text
+
+
+async def test_a_user_agent_without_detail_and_a_bad_key_say_so(page: Any, pages_app: Any) -> None:
+    def old_row(conn: Any) -> None:  # a row from before metrics.db schema 8 (or imported from v1): counts only
+        conn.execute(
+            "INSERT INTO fingerprint_user_agents (ua_hash, user_agent, count, first_seen, last_seen) "
+            "VALUES (?, 'OldAgent/1', 4, 1700000000, 1700000060)",
+            ("a" * 32,),
+        )
+
+    await pages_app.ctx.dbs.metrics.write(old_row)
+    old = await page.fragment("security", "fingerprints", part="agent", ua="a" * 32)
+    assert old.status_code == 200
+    assert "No request detail was recorded for this User-Agent yet" in old.text
+    for bad in ("", "zz", "A" * 32, "0" * 32):
+        response = await page.fragment("security", "fingerprints", part="agent", ua=bad)
+        assert response.status_code == 200
+        assert "data-card-error" in response.text, bad
+
+
+async def test_a_header_that_carries_client_addresses_is_never_recorded(page: Any, pages_app: Any) -> None:
+    """Gap G5: x-forwarded-for is counted, its values are never kept, and the drawer offers no way to record them."""
+    await seed_security(pages_app)
+    headers = (await page.api("GET", "security/fingerprints/headers", params={"q": "x-forwarded-for"})).json()
+    assert headers["items"][0]["count"] >= 1
+    values = (await page.api("GET", "security/fingerprints/headers/x-forwarded-for/values")).json()
+    assert values["total"] == 0
+    drawer = parse_html((await page.fragment("security", "fingerprints", part="header", name="x-forwarded-for")).text)
+    assert "Never recorded" in drawer.text()
+    assert "carries client addresses" in drawer.text()
+    methods = {(f.get("data-api-method"), f.get("data-api-url")) for f in drawer.select("form[data-api-form]")}
+    assert ("DELETE", "/admin/api/v1/security/fingerprints/ignored/x-forwarded-for") not in methods
+    assert not any(url == "/admin/api/v1/security/fingerprints/ignored" for _m, url in methods)
+    tab = parse_html((await page.fragment("security", "fingerprints", part="ignored", page_size=100)).text).text()
+    assert "x-forwarded-for" in tab
+    assert "carries client addresses" in tab
 
 
 @pytest.mark.parametrize("name", ["", "a\x01b", "x" * 300])

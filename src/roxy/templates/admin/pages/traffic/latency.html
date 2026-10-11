@@ -7,7 +7,9 @@
   (`traffic_latency_split`, the API's table: requests, p50, p95, p99, queue wait and failures per group; it pages
   and exports through `GET /admin/api/v1/traffic/latency/split`). The reset button empties only the latency
   histograms (the `latency` family; request counts stay). A table request (`part` "table") gets the table alone.
-  Context: `frame`, `part`, `table`, and for the card `series`, `split`, `splits`, `by_word`, `reset_href`.
+  The API's fixed sentence on what latency measures (`traffic_api.LATENCY_NOTE`) is the card's note under the chart;
+  the chart's own notices are the partial-data warnings only.
+  Context: `frame`, `part`, `table`, and for the card `series`, `note`, `split`, `splits`, `by_word`, `reset_href`.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/chart.html" import series_chart %}
@@ -29,6 +31,7 @@
   </label>
 </form>
 {{ series_chart("traffic-latency-chart", "Latency percentiles" if split == "none" else "p95 latency by " ~ by_word, series=series, summary=("Latency percentiles of caller requests over the range." if split == "none" else "The p95 latency of each " ~ by_word ~ " over the range."), size="md", kind="line", y_format="ms", empty_text="No timed requests in this range yet.") }}
+{% if note %}<p class="muted traffic-note">{{ note }}</p>{% endif %}
 <div class="traffic-dt">
 {{ data_table(**table) }}
 </div>

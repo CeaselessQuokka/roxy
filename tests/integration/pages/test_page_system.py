@@ -23,8 +23,8 @@ from typing import Any
 
 import pytest
 
+from pages_harness import HOSTILE, parse_html
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import HOSTILE, parse_html
 from roxy.core.style_guard import find_style_issues
 from roxy.health.checks import SPECS as HEALTH_SPECS
 
@@ -39,7 +39,10 @@ async def _seed_errors(pages_app: Any) -> None:
         HOSTILE_SIGNATURE,
         detail="GET /games.roblox.com/" + HOSTILE["script"] + " " + HOSTILE["js_url"],
         module_line="roxy/proxy/" + HOSTILE["attr"],
-        traceback="Traceback (most recent call last):\n  File " + HOSTILE["img"] + "\nValueError: " + HOSTILE["unicode"],
+        traceback="Traceback (most recent call last):\n  File "
+        + HOSTILE["img"]
+        + "\nValueError: "
+        + HOSTILE["unicode"],
     )
     recorder.record_error("RuntimeError: plain one", detail="nothing hostile", source="internal")
     await pages_app.flush()
@@ -124,6 +127,106 @@ async def test_the_tables_show_the_apis_rows(page: Any, pages_app: Any) -> None:
     assert [n.text() for n in persistence.select("#storage tbody th")] == [db["file"] for db in files["databases"]]
 
 
+def _facts(doc: Any, section: str) -> dict[str, str]:
+    """The term and value pairs of the facts list under one heading id (`dt` text -> `dd` text)."""
+    node = doc.select_one(f'section[aria-labelledby="{section}"] dl')
+    assert node is not None, section
+    terms = [dt.text().split("?")[0].strip() for dt in node.select("dt")]  # a term's help dot reads "?"
+    return dict(zip(terms, (dd.text().strip() for dd in node.select("dd")), strict=True))
+
+
+async def test_the_fleet_and_pipeline_numbers_are_the_apis(page: Any, pages_app: Any) -> None:
+    await pages_app.seed_traffic()
+    fleet = (await page.api("GET", "system/fleet")).json()
+    doc = parse_html((await page.fragment("system", "fleet")).text)
+    mine = next(color for color in fleet["colors"] if color.get("is_this_color"))
+    assert f"{mine['count']:,} of {mine['expected']:,}" in doc.select_one('[data-kpi="workers_fresh"]').text()
+    for color in fleet["colors"]:
+        assert f"{color['count']:,} of {color['expected']:,} workers fresh" in " ".join(doc.text().split())
+    pipeline = (await page.api("GET", "system/metrics-pipeline")).json()
+    card = parse_html((await page.fragment("system", "metrics-pipeline")).text)
+    drops = pipeline["fleet_drops_last_hour"] or {}
+    fleet_facts = _facts(card, "pipeline-fleet-title")
+    assert fleet_facts["Items dropped"] == f"{int(drops.get('dropped') or 0):,}"
+    assert fleet_facts["Minutes with drops"] == f"{int(drops.get('minutes_with_drops') or 0):,}"
+    worker = _facts(card, "pipeline-worker-title")
+    assert worker["Dropped since start"] == f"{int(pipeline['recorder']['metrics_dropped']):,}"
+    names = [row.text() for row in card.select('th[data-label="Database"]')]
+    assert names == [db["db"] for db in pipeline["databases"]]
+    from roxy.metrics.catalog import METRICS
+
+    helps = {node.get("data-help") for node in card.select("button.help-dot")}
+    assert METRICS["metrics_dropped"].description in helps  # metric help from its one source (plan 14.7)
+    leader = (await page.api("GET", "system/leader")).json()
+    leader_doc = parse_html((await page.fragment("system", "leader")).text)
+    assert (leader["holder"] or "No worker holds the lease") in leader_doc.text()
+
+
+async def test_a_worker_row_opens_every_column_in_the_drawer(page: Any) -> None:
+    """On a phone the workers table shows its key columns only; the drawer has all of them (parity row 84)."""
+    workers = (await page.api("GET", "system/workers")).json()
+    doc = parse_html((await page.fragment("system", "fleet")).text)
+    row = doc.select_one('[data-table="workers"] tbody tr[data-row-id]')
+    src = row.get("data-drawer-src") or ""
+    assert src.startswith(f"{PAGE}/fragment/fleet?")
+    assert (row.get("data-drawer-title") or "").startswith("Worker ")
+    drawer = await page.get(src, htmx=True)
+    assert drawer.status_code == 200
+    assert "data-card=" not in drawer.text
+    detail = parse_html(drawer.text)
+    labels = [node.text().split("?")[0].strip() for node in detail.select("[data-worker-detail] dt")]
+    from roxy.admin.api.system import WORKERS_TABLE
+
+    assert labels == [column.label for column in WORKERS_TABLE.columns]
+    values = dict(zip(labels, (node.text().strip() for node in detail.select("[data-worker-detail] dd")), strict=True))
+    item = workers["items"][0]
+    after = (await page.api("GET", "system/workers")).json()["items"][0]
+    assert values["PID"].startswith(str(item["pid"]))
+    shown = int(values["All requests"].replace(",", ""))
+    assert int(item["requests"]) <= shown <= int(after["requests"])  # every request counts, these included
+    gone = await page.fragment("system", "fleet", worker="1-nowhere")
+    assert "That worker is not in the fleet any more" in gone.text
+
+
+async def test_each_worker_shows_its_last_minute_of_cpu(page: Any, pages_app: Any) -> None:
+    """Gap G3 (`worker_cpu_pct`, homed on `system#fleet`): the workers table's CPU column is the API's number, the
+    mean of the worker's last complete minute in `worker_minute`, with its highest sample under it."""
+    ctx = pages_app.ctx
+    minute = int(ctx.clock.now()) // 60 * 60 - 60
+
+    def write(conn: Any) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO worker_minute (bucket_start, worker_id, samples, cpu_pct_sum, cpu_pct_max) "
+            "VALUES (?, ?, 4, 50.0, 31.0)",
+            (minute, ctx.worker_id),
+        )
+
+    await ctx.dbs.metrics.write(write)
+    workers = (await page.api("GET", "system/workers")).json()
+    mine = next(item for item in workers["items"] if item["worker_id"] == ctx.worker_id)
+    assert mine["cpu_pct"] == 12.5
+    from roxy.metrics.catalog import METRICS
+
+    column = next(column for column in workers["columns"] if column["key"] == "cpu_pct")
+    assert column["help"].startswith(METRICS["worker_cpu_pct"].description)
+    doc = parse_html((await page.fragment("system", "fleet")).text)
+    row = doc.select_one(f'[data-table="workers"] tbody tr[data-row-id="worker-{mine["pid"]}-{mine["color"]}"]')
+    assert row is not None
+    assert "12.5%" in row.text()
+    assert "peak 31.0%" in row.text()
+
+
+async def test_an_empty_history_explains_itself(page: Any) -> None:
+    """A fresh install has no disk samples and no table sizes yet; the cards say when they come."""
+    persistence = (await page.api("GET", "system/persistence")).json()
+    text = " ".join(parse_html((await page.fragment("system", "persistence")).text).text().split())
+    if not persistence.get("growth"):
+        assert "No disk samples yet" in text
+    if not (persistence.get("table_sizes") or {}).get("tables"):
+        assert "No table sizes yet" in text
+    assert "Every database writer is writing without errors" in text
+
+
 async def test_hostile_error_text_is_inert_in_the_table_and_the_drawer(page: Any, pages_app: Any, inert: Any) -> None:
     await _seed_errors(pages_app)
     response = await page.get(PAGE)
@@ -206,9 +309,14 @@ async def test_the_inline_settings_of_the_cards_are_there(page: Any) -> None:
             assert doc.select_one(f'section#{card} [data-setting-key="{key}"]') is not None, (card, key)
 
 
+def _credential_values(directory: Path) -> list[str]:
+    """The fake credential values the test app was started with (8 characters or more)."""
+    values = [p.read_text(encoding="utf-8").strip() for p in directory.iterdir() if p.is_file()]
+    return [value for value in values if len(value) >= 8]
+
+
 async def test_no_credential_value_reaches_the_environment_or_alerts(page: Any, credentials_dir: Path) -> None:
-    secrets = [p.read_text(encoding="utf-8").strip() for p in credentials_dir.iterdir() if p.is_file()]
-    secrets = [s for s in secrets if len(s) >= 8]
+    secrets = _credential_values(credentials_dir)
     assert secrets
     for card in ("environment", "alerts", "versions"):
         text = (await page.fragment("system", card)).text

@@ -6,16 +6,17 @@ What this is
       * `pages_app` (`PagesApp`): `create_app(env)` with its real lifespan over temporary databases (the root
         conftest's `env`, fake credentials and socket guard), a `FakeClock`, the fast password hasher and recorded
         mail of `roxy.admin.auth.testing.auth_harness`, and Roblox played by `respx` with
-        `roxy.admin.pages.testing.roblox_answer` (JSON with hostile names, a 429 on `/too-many` paths, a 503 on
-        `/fail` paths). The settings are `testing.SEED_SETTINGS` (no tarpit, no rotator, no upstream queue
-        waits). `await pages_app.seed_traffic()` sends the harness's `traffic_plan()` through the REAL proxy
-        (served, cached, refused, probed, Roblox 429 and 503, several IPs, places and User-Agents, the hostile
-        text set) and flushes the recorder; `await pages_app.seed_all()` also writes audit rows with hostile text
-        (through `SettingsService` and `config.audit.record`), an open recommendation and a finished health run.
+        `pages_harness.roblox_answer` (`tests/pages_harness.py`: JSON with hostile names, a 429 on `/too-many`
+        paths, a 503 on `/fail` paths). The settings are `testing.SEED_SETTINGS` (no tarpit, no rotator, no
+        upstream queue waits). `await pages_app.seed_traffic()` sends the harness's `traffic_plan()` through the
+        REAL proxy (served, cached, refused, probed, Roblox 429 and 503, several IPs, places and User-Agents, the
+        hostile text set) and flushes the recorder; `await pages_app.seed_all()` also writes audit rows with
+        hostile text (through `SettingsService` and `config.audit.record`), an open recommendation and a finished
+        health run.
         `pages_app.ctx`, `.clock`, `.harness` and `await pages_app.settings(**values)` are there too.
       * `page` (`PageSession`): a client signed in through the real password and TOTP steps. `await
         page.get("/admin/audit", params=...)` (HTML; `htmx=True` sends `HX-Request`), `await page.doc(path)`
-        (200 checked, parsed with `roxy.admin.pages.testing.parse_html`: `doc.select("#log [data-table]")`),
+        (200 checked, parsed with `pages_harness.parse_html`: `doc.select("#log [data-table]")`),
         `await page.fragment("audit", "log", entry=1)`, `await page.api("PUT", "settings/cache_ttl_seconds",
         json={...})` (CSRF token added for unsafe methods; `csrf=False` leaves it out), `page.make_mfa_stale()` and
         `await page.fresh_mfa()`.
@@ -32,7 +33,7 @@ How it works
     Requests come from the trusted loopback peer; proxy traffic names its client in `X-Forwarded-For`.
 
 What to read next
-    `roxy/admin/pages/testing.py`, `tests/integration/pages/test_pages_core.py`, `tests/integration/pages/
+    `tests/pages_harness.py`, `tests/integration/pages/test_pages_core.py`, `tests/integration/pages/
     test_page_audit.py` (the reference page's tests), `.remake/P11_CONTRACT.md`.
 """
 
@@ -46,8 +47,8 @@ from typing import Any
 import httpx
 import pytest
 
+import pages_harness as testing
 from roxy.admin.auth.testing import AuthHarness, TestAdmin, auth_harness
-from roxy.admin.pages import testing
 from roxy.config.audit import Actor
 from roxy.config.settings_service import SettingsService
 from roxy.core.clock import FakeClock
@@ -220,7 +221,7 @@ def anon(pages_app: PagesApp) -> PageSession:
 
 @pytest.fixture
 def hostile() -> dict[str, str]:
-    """The hostile caller text set (`roxy.admin.pages.testing.HOSTILE`)."""
+    """The hostile caller text set (`pages_harness.HOSTILE` (`tests/pages_harness.py`))."""
     return dict(testing.HOSTILE)
 
 

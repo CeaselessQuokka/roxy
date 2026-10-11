@@ -397,3 +397,27 @@ async def test_daily_job_reads_maintenance_settings_live(dbs, fake_clock: FakeCl
     values["maintenance_hour"] = hour  # an admin changes the setting; the next run sees it
     second = await runner.run_job_now("daily_maintenance")
     assert second.last_result["ran"] is True
+
+
+async def test_a_slow_run_rests_as_long_as_it_ran_and_a_fast_one_keeps_its_interval(fake_clock: FakeClock) -> None:
+    """`JOB_REST_FACTOR` (gaps_latency L3): one job never holds more than about half of a worker's time."""
+    calls: list[str] = []
+
+    async def slow(ctx: JobContext) -> None:
+        calls.append("slow")
+        await asyncio.sleep(0.3)  # real time: what `perf_counter` measures as the run's duration
+
+    registry = JobRegistry()
+    registry.add(Job("slow", 0.2, slow, leader_only=False, timeout_s=5))
+    registry.add(_counter_job("fast", 0.2, calls, leader_only=False))
+    runner = JobRunner(registry, None, fake_clock)
+    await runner.tick()
+    await _settle(runner)
+    fake_clock.advance(0.25)  # past the interval of both, inside the slow run's rest
+    assert await runner.tick() == ["fast"]
+    await _settle(runner)
+    fake_clock.advance(0.1)  # the rest is over (0.3 s after the slow run ended)
+    assert "slow" in await runner.tick()
+    await _settle(runner)
+    assert calls.count("slow") == 2
+    assert calls.count("fast:0") == 2

@@ -1,0 +1,3 @@
+# Documentation screenshots are for readers of the repository, not for the server: deploy.sh exports the tree
+# with `git archive`, and a 909 MB box keeps five releases, so they are left out of every release.
+docs/screenshots/ export-ignore

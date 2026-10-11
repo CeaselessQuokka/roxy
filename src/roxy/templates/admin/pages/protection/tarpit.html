@@ -10,6 +10,7 @@
   callers, labeled: each worker keeps its own). The 22 tarpit settings (switches per category included) sit below.
   Context: `frame`, `tarpit`, `status_tone`, `status`, `tiles`, `categories`, `kinds`, `histogram`, `reasons`,
   `ips`, `span`.
+  Context also has `clear` (`protection.py clear_action`): v1's clear button of this section, a plan 6.8 data reset.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/kpi.html" import kpi_tile %}
@@ -17,10 +18,11 @@
 {% from "components/badges.html" import badge, status_badge %}
 {% from "components/alert.html" import inline_alert %}
 {% from "components/glossary.html" import term with context %}
-{% from "admin/pages/protection/_macros.html" import tabs, tab_panel %}
+{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, clear_button, clear_dialog %}
 {% set t = tarpit %}
 {% macro seconds(value) -%}{% if value is none %}n/a{% elif value < 10 %}{{ "%.1f"|format(value) }}s{% elif value < 60 %}{{ value|round|int }}s{% else %}{{ span(value) }}{% endif %}{%- endmacro %}
-{% call page_card(frame, subtitle=status) %}
+{% set actions %}{{ clear_button(clear) }}{% endset %}
+{% call page_card(frame, actions=actions) %}
 <p class="prot-lead">{{ status_badge(status_tone, status) }} A {{ term("tarpit", "tarpit") }} makes a caller Roxy already refused WAIT for its error ({{ t.default_type }}, {{ "%g"|format(t.min_seconds) }} to {{ "%g"|format(t.max_seconds) }} seconds), so an abusive script loses seconds per attempt while Roxy spends almost nothing. It never holds a served request or a bypass address.</p>
 <div class="prot-gauge">
   <p><strong>{{ "n/a" if t.active_holds is none else num(t.active_holds) }}</strong> of <strong>{{ num(t.max_concurrent) }}</strong> hold slots in use; {{ num(t.slots_free) }} free.</p>
@@ -38,18 +40,18 @@
 {% call tabs("prot-tarpit-tabs", [("categories", "By category"), ("lengths", "Hold lengths"), ("held", "Who is held")], "Tarpit views") %}
   {% call tab_panel("prot-tarpit-tabs", "categories", first=True) %}
   <div class="table-scroll" role="region" aria-labelledby="tarpit-cat-caption" tabindex="0">
-    <table class="simple-table prot-tarpit-cats">
+    <table class="simple-table prot-tarpit-cats prot-stack">
       <caption id="tarpit-cat-caption" class="prot-caption">Which kinds of refusal are held, and what holding them did in this range</caption>
       <thead><tr><th scope="col">Refusal</th><th scope="col">Held?</th><th scope="col" class="num">Held</th><th scope="col" class="num">Skipped</th><th scope="col" class="num">Average hold</th><th scope="col" class="num">Time held</th></tr></thead>
       <tbody>
         {% for c in categories %}
         <tr>
           <th scope="row">{{ c.label }}<span class="dt__sub">{{ c.note }}</span></th>
-          <td>{% if c.on %}{{ badge("Held", "ok", "check") }}{% else %}{{ badge("Not held", "neutral") }}{% endif %}</td>
-          <td class="num">{{ num(c.holds) }}</td>
-          <td class="num">{{ num(c.skipped) }}</td>
-          <td class="num">{{ seconds(c.mean) }}</td>
-          <td class="num">{{ seconds(c.total) if c.holds else "n/a" }}</td>
+          <td data-label="Held?">{% if c.on %}{{ badge("Held", "ok", "check") }}{% else %}{{ badge("Not held", "neutral") }}{% endif %}</td>
+          <td class="num" data-label="Held">{{ num(c.holds) }}</td>
+          <td class="num" data-label="Skipped">{{ num(c.skipped) }}</td>
+          <td class="num" data-label="Average hold">{{ seconds(c.mean) }}</td>
+          <td class="num" data-label="Time held">{{ seconds(c.total) if c.holds else "n/a" }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -69,19 +71,20 @@
   {% call tab_panel("prot-tarpit-tabs", "held") %}
   <p class="prot-pad field__hint">Since this worker started (each worker keeps its own lists; the busiest 25 rows of each are shown).</p>
   <div class="table-scroll" role="region" aria-labelledby="tarpit-why-caption" tabindex="0">
-    <table class="simple-table">
+    <table class="simple-table prot-stack">
       <caption id="tarpit-why-caption" class="prot-caption">Why each hold happened (this worker)</caption>
       <thead><tr><th scope="col">Category</th><th scope="col">Rule</th><th scope="col" class="num">Held</th><th scope="col" class="num">Skipped</th><th scope="col" class="num">Time held</th><th scope="col">Last held</th></tr></thead>
-      <tbody>{% for row in reasons %}<tr><th scope="row">{{ row.category }}</th><td>{{ caller_text(row.rule, 120) }}</td><td class="num">{{ num(row.held) }}</td><td class="num">{{ num(row.skipped) }}</td><td class="num">{{ seconds(row.total) }}</td><td>{% if row.last %}<time datetime="{{ row.last.datetime }}">{{ row.last.sub }}</time>{% else %}n/a{% endif %}</td></tr>{% else %}<tr><td colspan="6" class="muted">No holds recorded by this worker yet.</td></tr>{% endfor %}</tbody>
+      <tbody>{% for row in reasons %}<tr><th scope="row">{{ row.category }}</th><td data-label="Rule">{{ caller_text(row.rule, 120) }}</td><td class="num" data-label="Held">{{ num(row.held) }}</td><td class="num" data-label="Skipped">{{ num(row.skipped) }}</td><td class="num" data-label="Time held">{{ seconds(row.total) }}</td><td data-label="Last held">{% if row.last %}<time datetime="{{ row.last.datetime }}">{{ row.last.sub }}</time>{% else %}n/a{% endif %}</td></tr>{% else %}<tr><td colspan="6" class="muted">No holds recorded by this worker yet.</td></tr>{% endfor %}</tbody>
     </table>
   </div>
   <div class="table-scroll" role="region" aria-labelledby="tarpit-ips-caption" tabindex="0">
-    <table class="simple-table">
+    <table class="simple-table prot-stack">
       <caption id="tarpit-ips-caption" class="prot-caption">Callers held (this worker)</caption>
       <thead><tr><th scope="col">Client</th><th scope="col" class="num">Held</th><th scope="col" class="num">Skipped</th><th scope="col" class="num">Time held</th><th scope="col">Last held</th></tr></thead>
-      <tbody>{% for row in ips %}<tr><th scope="row" class="mono">{{ row.key }}</th><td class="num">{{ num(row.held) }}</td><td class="num">{{ num(row.skipped) }}</td><td class="num">{{ seconds(row.total) }}</td><td>{% if row.last %}<time datetime="{{ row.last.datetime }}">{{ row.last.sub }}</time>{% else %}n/a{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">No callers held by this worker yet.</td></tr>{% endfor %}</tbody>
+      <tbody>{% for row in ips %}<tr><th scope="row" class="mono">{{ row.key }}</th><td class="num" data-label="Held">{{ num(row.held) }}</td><td class="num" data-label="Skipped">{{ num(row.skipped) }}</td><td class="num" data-label="Time held">{{ seconds(row.total) }}</td><td data-label="Last held">{% if row.last %}<time datetime="{{ row.last.datetime }}">{{ row.last.sub }}</time>{% else %}n/a{% endif %}</td></tr>{% else %}<tr><td colspan="5" class="muted">No callers held by this worker yet.</td></tr>{% endfor %}</tbody>
     </table>
   </div>
   {% endcall %}
 {% endcall %}
+{{ clear_dialog(clear, "tarpit") }}
 {% endcall %}

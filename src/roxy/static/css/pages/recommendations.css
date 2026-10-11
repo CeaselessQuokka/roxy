@@ -165,6 +165,9 @@
   vertical-align: top;
 }
 
+/* A fixed table layout takes its column widths from the first row, the head: the width goes on the head's first
+   cell (on the row headers alone it was ignored, and the three columns stayed equal). */
+.rec-diff thead th:first-child,
 .rec-diff th[scope="row"] {
   width: 40%;
 }
@@ -348,8 +351,11 @@
     grid-template-columns: minmax(0, 1fr);
   }
 
+  /* Half the width for what changes: a setting key (`cache_ttl_seconds`, about 20 monospace characters) fits on
+     one line on a 390 px phone instead of breaking inside the word; the values wrap in their quarters. */
+  .rec-diff thead th:first-child,
   .rec-diff th[scope="row"] {
-    width: 34%;
+    width: 48%;
   }
 
   .rec-snooze form,

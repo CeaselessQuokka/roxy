@@ -49,6 +49,7 @@
     </form>
     {% endif %}
     <button type="button" class="btn btn--sm btn--ghost" data-dialog-open="dlg-client-reset" data-action="client-reset">{{ icon("reset") }}<span>Reset this client</span></button>
+    {% set live = local_href(live_href) %}{% if live %}<a class="btn btn--sm btn--ghost" href="{{ live }}" data-action="client-live">{{ icon("live") }}<span>Show in Live</span></a>{% endif %}
     {% if not standalone %}{% set own = local_href(page_href) %}{% if own %}<a class="btn btn--sm btn--ghost" href="{{ own }}">{{ icon("external") }}<span>Open as a page</span></a>{% endif %}{% endif %}
   </div>
   {% if kind == "place" %}<div class="clients-lookup__result" data-lookup-result aria-live="polite"></div>{% endif %}
@@ -61,7 +62,7 @@
       <dt>Served</dt><dd>{{ num(c.totals.served) }}</dd>
       <dt>Bytes sent</dt><dd>{{ bytes(c.totals.bytes) }}</dd>
       <dt>Busiest endpoints</dt>
-      <dd>{% if c.top_endpoints %}<ul class="client-view__list">{% for e in c.top_endpoints[:5] %}<li>{{ caller_text(e.endpoint, 120) }} <span class="muted">{{ num(e.requests) }}</span></li>{% endfor %}</ul>{% else %}<span class="muted">none in this range</span>{% endif %}</dd>
+      <dd>{% if c.top_endpoints %}<ul class="client-view__list">{% for e in c.top_endpoints[:5] %}<li>{{ caller_text(e.endpoint, 120) }} <span class="muted">{{ num(e.requests) }}</span></li>{% endfor %}</ul>{% else %}<span class="muted">none in this range</span>{% endif %}{% if c.top_endpoints and c.top_endpoints_basis %}<span class="muted client-view__basis">Counted from {{ c.top_endpoints_basis }}.</span>{% endif %}</dd>
     </dl>
     {{ series_chart("client-timeline", "Requests over time", series=chart, summary="This client's requests, served and refused, over the selected range.", help="Requests per time bucket from the per-client activity rows: everything it sent, what was served and what was refused.", size="sm", empty_text="No requests from this client in this range.") }}
   </section>
@@ -70,7 +71,7 @@
     <h3 class="client-view__title" id="client-hour-title">The last hour</h3>
     <dl class="kv client-view__facts">
       <dt>Requests</dt><dd>{{ num(lh.requests) }}{% if lh.refused %} <span class="muted">({{ num(lh.refused) }} refused)</span>{% endif %}</dd>
-      <dt>Rate (a minute)</dt><dd>{{ rate_text["1"] }} <span class="muted">now</span>, {{ rate_text["5"] }} <span class="muted">over 5 minutes</span>, {{ rate_text["60"] }} <span class="muted">over the hour</span></dd>
+      <dt>Requests in the last</dt><dd><span class="muted">minute</span> {{ rate_text["1"] }}, <span class="muted">5 minutes</span> {{ rate_text["5"] }}, <span class="muted">hour</span> {{ rate_text["60"] }} <span class="muted">(Rate1, Rate5, Rate60)</span></dd>
       <dt>Busiest endpoint</dt><dd>{{ caller_text(lh.top_endpoint, 120) }}</dd>
     </dl>
   </section>
@@ -94,7 +95,7 @@
     <p><strong class="client-view__score">{{ bot.score }}</strong> <span class="muted">of 100{% if bot.game_server %}; it carries a Roblox game server's signature{% endif %}</span></p>
     {% if bot.rows %}
     <div class="table-scroll" role="region" aria-labelledby="client-bot-title" tabindex="0">
-      <table class="simple-table">
+      <table class="simple-table clients-signals">
         <thead><tr><th scope="col">Signal</th><th scope="col" class="num">Value (0 to 1)</th><th scope="col" class="num">Weight</th></tr></thead>
         <tbody>{% for s in bot.rows %}<tr><th scope="row">{{ s.label }}</th><td class="num">{{ "%.2f"|format(s.signal) }}</td><td class="num">{{ num(s.weight) }}</td></tr>{% endfor %}</tbody>
       </table>
@@ -102,7 +103,7 @@
     {% endif %}
     {% else %}<p class="muted">{{ bot.note }}</p>{% endif %}
     {% if bot.score is not none and bot.note %}<p class="muted">{{ bot.note }}</p>{% endif %}
-    <p class="muted">Recorded by the fleet: {% if bot.recorded %}<strong>{{ bot.recorded.score }}</strong> in its latest scored hour{% else %}no score in the last 25 hours{% endif %}. <a href="/admin/clients#client-score">How the score works</a></p>
+    <p class="muted">Recorded by the fleet: {% if bot.recorded %}<strong>{{ bot.recorded.score }}</strong> in its latest scored hour{% else %}no score in the last 25 hours{% endif %}{% if bot.recorded_basis %} ({{ bot.recorded_basis }}){% endif %}. <a href="/admin/clients#client-score">How the score works</a></p>
     {% if history %}<p class="muted">Recorded hours in the range: {% for h in history[-12:] %}<span class="mono">{{ h.score_max }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
   </section>
   {% endif %}

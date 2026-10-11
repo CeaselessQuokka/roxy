@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.pages.testing import THEMES, VIEWPORTS, seed_recommendation
+from pages_harness import THEMES, VIEWPORTS, seed_recommendation
 
 PAGE = "/admin/recommendations"
 NO_HOSTILE_MARKUP = """() => !document.querySelector('img[src="x"], [onerror], [onclick], a[href^="javascript:"]')
@@ -96,21 +96,30 @@ def test_preview_apply_and_undo_from_a_phone(open_admin: Any, dashboard: Any) ->
     admin.wait(drawer_of(rec_id))
     page.locator('#drawer [data-action="recommendation-preview"]').click()
     admin.wait("document.querySelector('#drawer form.rec-apply') !== null")
-    assert "Cache lifetime" in page.locator("#drawer .rec-preview__body").inner_text() or page.locator(
-        "#drawer .rec-diff"
-    ).count()
+    assert (
+        "Cache lifetime" in page.locator("#drawer .rec-preview__body").inner_text()
+        or page.locator("#drawer .rec-diff").count()
+    )
     page.fill("#drawer form.rec-apply textarea[name=reason]", "Applied from a phone (browser test)")
     page.locator('#drawer [data-action="recommendation-apply"]').click()
     admin.wait("document.querySelector('.toast') && /Applied/.test(document.querySelector('#toasts').innerText)")
-    admin.wait(drawer_of(rec_id) + " && document.querySelector('#drawer [data-action=\"recommendation-undo\"]') !== null")
+    admin.wait(
+        drawer_of(rec_id) + " && document.querySelector('#drawer [data-action=\"recommendation-undo\"]') !== null"
+    )
     assert "Applied" in page.locator("#drawer .rec-detail__lead").inner_text()
     assert dashboard.api("GET", "settings/cache_ttl_seconds").json()["setting"]["value"] == 300
     admin.shot("recommendations-applied")
     page.locator('#drawer [data-action="recommendation-undo"]').click()
     admin.wait("/Undone/.test(document.querySelector('#toasts').innerText)")
-    admin.wait(drawer_of(rec_id) + " && /Rolled back/.test(document.querySelector('#drawer .rec-detail__lead').innerText)")
+    admin.wait(
+        drawer_of(rec_id) + " && /Rolled back/.test(document.querySelector('#drawer .rec-detail__lead').innerText)"
+    )
     assert dashboard.api("GET", "settings/cache_ttl_seconds").json()["setting"]["value"] == before
-    history = dashboard.api("GET", "recommendations/history", params={"recommendation": rec_id}).json()
+    # Newest first by action number: the dashboard runs on the wall clock, which WSL steps back about 0.9 s every
+    # 31 s, so the apply and the undo may carry seconds in the wrong order (the default sort is by time).
+    history = dashboard.api(
+        "GET", "recommendations/history", params={"recommendation": rec_id, "sort": "id", "order": "desc"}
+    ).json()
     assert [item["action"] for item in history["items"]] == ["undo", "apply"]
     admin.assert_clean()
 
@@ -129,7 +138,9 @@ def test_snooze_and_dismiss_from_the_drawer(open_admin: Any, dashboard: Any) -> 
     page.select_option("#drawer select[name=reason]", "other")
     page.fill("#drawer textarea[name=text]", "We handle this one by hand")
     page.locator('#drawer [data-action="recommendation-dismiss"]').click()
-    admin.wait(drawer_of(dismissed) + " && /Dismissed/.test(document.querySelector('#drawer .rec-detail__lead').innerText)")
+    admin.wait(
+        drawer_of(dismissed) + " && /Dismissed/.test(document.querySelector('#drawer .rec-detail__lead').innerText)"
+    )
     detail = dashboard.api("GET", f"recommendations/{dismissed}").json()
     assert detail["card"]["state"] == "dismissed"
     assert detail["history"][0]["details"]["text"] == "We handle this one by hand"
@@ -153,14 +164,31 @@ def test_filters_swap_the_list_in_place(open_admin: Any, dashboard: Any) -> None
     admin.assert_clean()
 
 
-def test_a_rule_drawer_tunes_the_rule_inline(open_admin: Any) -> None:
+def test_a_rule_drawer_tunes_the_rule_inline(open_admin: Any, dashboard: Any) -> None:
+    key = "insight_up_429_endpoint_min_429s"
+    before = dashboard.api("GET", f"settings/{key}").json()["setting"]["value"]
     admin = open_admin(PAGE)
     page = admin.page
-    page.locator("#rules").scroll_into_view_if_needed()
-    admin.settle()
-    page.locator('#rules tr[data-row-id="rule-up_429_endpoint"] [data-dt-open]').click()
-    admin.wait("document.querySelector('#drawer[open] [data-rule=\"UP-429-ENDPOINT\"]') !== null")
-    assert page.locator('#drawer [data-setting-key="insight_up_429_endpoint_min_429s"]').count() == 1
-    assert page.locator('#drawer [data-setting-key="insight_up_429_endpoint_enabled"]').count() == 1
-    assert admin.axe() == []
-    admin.assert_clean()
+    try:
+        page.locator("#rules").scroll_into_view_if_needed()
+        admin.settle()
+        page.locator('#rules tr[data-row-id="rule-up_429_endpoint"] [data-dt-open]').click()
+        admin.wait("document.querySelector('#drawer[open] [data-rule=\"UP-429-ENDPOINT\"]') !== null")
+        assert page.locator(f'#drawer [data-setting-key="{key}"]').count() == 1
+        assert page.locator('#drawer [data-setting-key="insight_up_429_endpoint_enabled"]').count() == 1
+        assert admin.axe() == []
+        # Save a new threshold from the drawer: Review first, then Save (the settings API, audited).
+        control = page.locator(f'#drawer form[data-setting-key="{key}"]')
+        control.locator("[data-setting-input]").first.fill(str(int(before) + 1))
+        control.locator('input[name="reason"]').fill("Browser test of a rule threshold")
+        control.locator('button[type="submit"]').click()
+        admin.wait(
+            f"document.querySelector('#drawer form[data-setting-key=\"{key}\"] [data-setting-review]') &&"
+            f" !document.querySelector('#drawer form[data-setting-key=\"{key}\"] [data-setting-review]').hidden"
+        )
+        control.locator('button[type="submit"]').click()
+        admin.wait("document.querySelector('#drawer .setting__saved') !== null")
+        assert dashboard.api("GET", f"settings/{key}").json()["setting"]["value"] == int(before) + 1
+        admin.assert_clean()
+    finally:
+        dashboard.change_settings({key: before})

@@ -117,8 +117,15 @@
   }
 }
 
-.help-guide > .alert + .help-chapters {
-  margin-top: var(--sp-5);
+.help-toc-box > summary {
+  display: flex;
+  align-items: center;
+  min-height: var(--target-min);
+  cursor: pointer;
+}
+
+.help-toc-box > .help-toc {
+  margin-top: var(--sp-2);
 }
 
 .help-runbook:target {

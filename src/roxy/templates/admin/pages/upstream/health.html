@@ -10,7 +10,7 @@
 {% from "components/page_card.html" import page_card %}
 {% from "components/badges.html" import status_badge %}
 {% from "components/format.html" import num, caller_text %}
-{% from "admin/pages/upstream/_macros.html" import gauge, when %}
+{% from "components/pieces.html" import gauge, when %}
 {% call page_card(frame, subtitle=range_label) %}
 <div class="g3-egresses">
   {% for e in egresses %}
@@ -29,7 +29,7 @@
       <dt>Latency p50 / p95 / p99</dt><dd>{{ e.latency }}</dd>
       <dt>Queue wait p95</dt><dd>{{ e.queue_p95 }}</dd>
       <dt>Challenge or HTML answers</dt><dd>{{ num(e.item.challenges) }} / {{ num(e.item.html_bodies) }}</dd>
-      <dt>Paused now</dt><dd>{{ num(e.item.cooldowns) }} cooldowns, {{ num(e.item.breakers_open) }} open breakers</dd>
+      <dt>Paused now</dt><dd>{{ e.paused }}</dd>
     </dl>
     {{ gauge(e.gauge, "gauge-egress-" ~ e.name) }}
     <dl class="kv g3-egress__when">

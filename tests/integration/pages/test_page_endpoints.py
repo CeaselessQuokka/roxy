@@ -23,8 +23,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+from pages_harness import parse_html
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import parse_html
 from roxy.core.style_guard import find_style_issues
 
 PAGE = "/admin/endpoints"
@@ -75,9 +75,11 @@ async def test_every_card_and_the_v1_columns_are_on_the_page(page: Any, pages_ap
         "order",
     }
     export = table.select_one('a[data-export][href*="format=csv"]')
-    assert export is not None and export.get("href").startswith("/admin/api/v1/endpoints?")
+    assert export is not None
+    assert export.get("href").startswith("/admin/api/v1/endpoints?")
     row = table.select_one("tbody tr[data-drawer-src]")
-    assert row is not None and row.get("data-drawer-src").startswith(f"{PAGE}/fragment/detail?")
+    assert row is not None
+    assert row.get("data-drawer-src").startswith(f"{PAGE}/fragment/detail?")
     assert doc.select_one('section#recent.page-card--lazy[hx-get^="/admin/endpoints/fragment/recent"]') is not None
     assert doc.select_one('link[href*="css/pages/endpoints"]') is not None
 
@@ -102,7 +104,13 @@ async def test_the_table_equals_the_api_for_the_same_filters(page: Any, pages_ap
     games = next(item for item in (await page.api("GET", "endpoints")).json()["items"] if item["key"] == GAMES)
     doc = await page.doc(f"{PAGE}/fragment/table", params={"q": GAMES})
     cells = doc.select_one("tbody tr[data-row-id]")
-    assert cells.select_one('td[data-col="requests"]').text() == f"{games['requests']:,}"
+    requests = cells.select_one('td[data-col="requests"]')
+    sub = requests.select_one(".dt__sub")
+    assert requests.text().removesuffix(sub.text() if sub else "").strip() == f"{games['requests']:,}"
+    if games["previous_requests"] == 0:  # the trend rides under the count (its own column is hidden by default)
+        assert sub is not None
+        assert sub.text() == "new in this range"
+    assert cells.select_one('td[data-col="trend_pct"]').get("hidden") is not None
     expected = " ".join(f"{name}:{count}" for name, count in games["methods"].items())
     assert cells.select_one('td[data-col="methods"]').text() == expected  # v1's `GET:3 POST:1`
     assert cells.select_one('td[data-col="last_status"]').text() == str(games["last_status"])
@@ -112,7 +120,8 @@ async def test_a_deep_link_by_template_lands_on_it(page: Any, pages_app: Any) ->
     await pages_app.seed_traffic()
     doc = await page.doc(PAGE, params={"q": GAMES})
     rows = doc.select("#table tbody tr[data-row-id]")
-    assert rows and all(GAMES in r.text() for r in rows)
+    assert rows
+    assert all(GAMES in r.text() for r in rows)
     assert doc.select_one('#table input[name="q"]').get("value") == GAMES
 
 
@@ -175,11 +184,16 @@ async def test_no_filter_or_range_ever_fails_the_page(page: Any, pages_app: Any,
 
 
 async def test_a_bad_or_missing_template_says_so_in_the_drawer(page: Any, pages_app: Any) -> None:
-    for params, text in (({}, "Choose an endpoint"), ({"template": "a\u0007b"}, "printable"), ({"template": ""}, "Choose")):
+    for params, text in (
+        ({}, "Choose an endpoint"),
+        ({"template": "a\u0007b"}, "printable"),
+        ({"template": ""}, "Choose"),
+    ):
         for path in (f"{PAGE}/fragment/detail", f"{PAGE}/template", f"{PAGE}/reset"):
             response = await page.get(path, params=params)
             assert response.status_code == 200, (path, params)
             assert "data-card-error" in response.text, (path, params)
+            assert text in response.text, (path, params)
     response = await page.fragment("endpoints", "detail", template="a\u0007b")
     assert "printable" in response.text
 

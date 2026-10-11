@@ -24,8 +24,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+from pages_harness import HOSTILE, parse_html
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import HOSTILE, parse_html
 from roxy.core.style_guard import find_style_issues
 from roxy.metrics.capture import CAPTURE_EXPIRED_MESSAGE, CAPTURE_OFF_MESSAGE
 
@@ -102,6 +102,27 @@ async def test_the_capture_card_equals_the_api(page: Any, pages_app: Any) -> Non
     assert "Capture off" in off.select_one("#capture").text()
 
 
+async def test_the_inline_settings_save_only_with_csrf_and_need_no_fresh_factor(page: Any, pages_app: Any) -> None:
+    # The capture and tail editors post to the settings API: the CSRF token is required, a second factor is not
+    # (these are neither admin security nor credential settings, plan 9.6), and the page says so to the editor.
+    doc = await page.doc(PAGE)
+    for key in ("capture_sample_served_pct", "live_tail_buffer"):
+        form = doc.select_one(f'form[data-setting-key="{key}"]')
+        assert form is not None, key
+        assert form.get("data-setting-api") == f"/admin/api/v1/settings/{key}"
+        assert form.get("data-fresh-mfa") is None, key
+    body = {"value": 35, "reason": "test"}
+    refused = await page.api("PUT", "settings/capture_sample_served_pct", json=body, csrf=False)
+    assert refused.status_code == 403
+    assert pages_app.ctx.settings.int("capture_sample_served_pct") != 35
+    page.make_mfa_stale()
+    saved = await page.api("PUT", "settings/capture_sample_served_pct", json=body)
+    assert saved.status_code == 200, saved.text
+    await pages_app.ctx.settings.refresh_if_changed()  # the worker's 1 s settings poll, run now
+    after = parse_html((await page.fragment("live", "capture")).text)
+    assert "35% of served requests" in after.select_one("#capture").text()
+
+
 async def test_the_drawer_shows_the_record_the_trace_and_the_capture(page: Any, pages_app: Any) -> None:
     await _seed(pages_app)
     refused = next(r for r in await _rows(page) if r["outcome"] == "refused" and r.get("capture_id"))
@@ -119,7 +140,8 @@ async def test_the_drawer_shows_the_record_the_trace_and_the_capture(page: Any, 
     served = next(r for r in await _rows(page) if r["outcome"] == "served_upstream" and r.get("template"))
     detail = parse_html((await page.get(f"{PAGE}/request", params={"id": served["request_id"]})).text)
     link = detail.select_one('a[href^="/admin/endpoints/template?"]')
-    assert link is not None and parse_qs(urlparse(link.get("href")).query)["template"] == [served["template"]]
+    assert link is not None
+    assert parse_qs(urlparse(link.get("href")).query)["template"] == [served["template"]]
 
 
 async def test_never_captured_and_expired_are_different_messages(page: Any, pages_app: Any) -> None:
@@ -195,7 +217,13 @@ async def test_the_live_reset_previews_then_runs_only_through_the_data_api(page:
     form = doc.select_one('form[data-api-form][data-api-url="/admin/api/v1/data/resets"]')
     fields = {node.get("name"): node.get("value") for node in form.select("input[type=hidden]")}
     assert fields["families"] == "live"
-    body = {"scope": "family", "families": ["live"], "preview": fields["preview"], "reason": "t", "confirm": "reset live"}
+    body = {
+        "scope": "family",
+        "families": ["live"],
+        "preview": fields["preview"],
+        "reason": "t",
+        "confirm": "reset live",
+    }
     assert (await page.api("POST", "data/resets", json=body, csrf=False)).status_code == 403
     done = await page.api("POST", "data/resets", json=body)
     assert done.status_code in (200, 202), done.text

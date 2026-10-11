@@ -132,7 +132,12 @@
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: var(--sp-4);
+  align-items: start;
   margin-top: var(--sp-4);
+}
+
+.prot-subgrid .prot-sub {
+  align-content: start;
 }
 
 .prot-list {
@@ -145,7 +150,7 @@
 
 .prot-list li {
   display: flex;
-  flex-wrap: wrap;
+  align-items: baseline;
   justify-content: space-between;
   gap: var(--sp-2);
   padding: 2px 0;
@@ -153,8 +158,19 @@
   overflow-wrap: anywhere;
 }
 
+/* A long label wraps on its own side; the number stays at the right edge of its row. */
+.prot-list li > span:first-child {
+  min-width: 0;
+}
+
 .prot-list strong {
+  flex: none;
   font-variant-numeric: tabular-nums;
+}
+
+/* The tester results list rows of badges and texts: those wrap as one line of text. */
+.prot-result .prot-list li {
+  display: block;
 }
 
 .prot-stats {
@@ -367,6 +383,17 @@
   min-width: 0;
 }
 
+/* A table that opens a tab panel keeps a gap under the tab list (its toolbar has no top padding of its own). */
+.prot-tabs__panel > .dt:first-child {
+  margin-top: var(--sp-3);
+}
+
+/* A small table straight inside a tab panel (the tarpit's) keeps the card's side padding: the tabs reach the card's
+   edges, and a data table brings its own padding, but a plain table does not. */
+.prot-tabs__panel > .table-scroll {
+  padding-inline: var(--sp-4);
+}
+
 .prot-tabbar {
   display: flex;
   flex-wrap: wrap;
@@ -375,9 +402,20 @@
   padding: var(--sp-3) var(--sp-4) 0;
 }
 
-/* A card that is not flush pads its body: tabs inside it reach its edges like a flush card's. */
-.card__body > .prot-tabs {
+/* A card that is not flush pads its body: tabs and tables inside it reach its edges like a flush card's (a data
+   table brings its own side padding). */
+.card__body:not(.card__body--flush) > .prot-tabs,
+.card__body:not(.card__body--flush) > .prot-bleed {
   margin-inline: calc(var(--sp-4) * -1);
+}
+
+.card__body > * + .prot-tabs,
+.card__body > * + .prot-bleed {
+  margin-top: var(--sp-3);
+}
+
+.prot-bleed > .prot-sub__title {
+  padding: 0 var(--sp-4);
 }
 
 /* ------------------------------------------------------------------------------------------- ladder */
@@ -540,22 +578,144 @@
   }
 }
 
-/* Phones: components.css hides a data table's header row (each row is a card) with a 1 px absolute box whose
-   overflow does not apply while it is a table header group, so a wide header still widened the page. As a block
-   its overflow clips the header cells (reported to the integrator for components.css). */
-@media (max-width: 640px) {
-  .prot-group .dt__table thead {
-    display: block;
-  }
-}
-
 @media (max-width: 480px) {
   .prot-drawer .kv {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .card__body > .prot-tabs {
+  .card__body:not(.card__body--flush) > .prot-tabs,
+  .card__body:not(.card__body--flush) > .prot-bleed {
     margin-inline: calc(var(--sp-3) * -1);
+  }
+}
+
+/* ------------------------------------------------------------------------------------------- phones */
+/* The ladder editor's cell labels: hidden visually in the desktop table (its column headers say the same), shown
+   above each input when a phone stacks every rung as a small form. */
+@media (min-width: 641px) {
+  .prot-ladder__label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+/* Phones (plan 14.8): tables of a few rows become one block per row instead of scrolling sideways. The ladder's
+   rungs become small forms (rung, then multiplier and action, ban minutes and the remove button, message, note);
+   the prose tables (detectors, bot signals, tarpit categories and holds) show each cell under its column name
+   (`data-label`, the same words as the header). */
+@media (max-width: 640px) {
+  .prot-ladder .table-scroll {
+    overflow: visible;
+  }
+
+  .prot-ladder__table,
+  .prot-ladder__table tbody,
+  .prot-stack,
+  .prot-stack tbody {
+    display: block;
+  }
+
+  .prot-ladder__table caption,
+  .prot-stack caption {
+    display: block;
+    white-space: normal;
+  }
+
+  .prot-ladder__table thead,
+  .prot-stack thead {
+    display: none;
+  }
+
+  .prot-ladder__table tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: var(--sp-2) var(--sp-3);
+    padding: var(--sp-3) 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .prot-ladder__table th,
+  .prot-ladder__table td {
+    display: grid;
+    gap: 4px;
+    align-content: start;
+    padding: 0;
+    border: 0;
+    white-space: normal;
+  }
+
+  .prot-ladder__table th,
+  .prot-ladder__table td:nth-child(5),
+  .prot-ladder__table td:nth-child(6) {
+    grid-column: 1 / -1;
+  }
+
+  .prot-ladder__table td:last-child {
+    grid-row: 3;
+    grid-column: 2;
+    align-self: end;
+    justify-self: end;
+  }
+
+  .prot-ladder__table .input,
+  .prot-ladder__table .input--num {
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+  }
+
+  .prot-ladder__label {
+    color: var(--text-muted);
+    font-size: var(--fs-1);
+  }
+
+  .prot-ladder__table .icon-btn {
+    width: var(--target-touch);
+    height: var(--target-touch);
+  }
+
+  .prot-stack tr {
+    display: grid;
+    gap: 2px;
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .prot-stack th,
+  .prot-stack td {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: var(--sp-1) var(--sp-3);
+    padding: 2px 0;
+    border: 0;
+    text-align: left;
+    white-space: normal;
+  }
+
+  .prot-stack td.num {
+    text-align: right;
+  }
+
+  .prot-stack td[data-label]::before {
+    content: attr(data-label);
+    color: var(--text-muted);
+    font-size: var(--fs-1);
+  }
+
+  .prot-stack th[scope="row"] {
+    min-width: 0;
+    font-weight: var(--fw-semibold);
+  }
+
+  .prot-tarpit-cats th[scope="row"] {
+    display: grid;
+    min-width: 0;
   }
 }
 

@@ -24,8 +24,9 @@ from typing import Any
 
 import pytest
 
+from pages_harness import HOSTILE, parse_html
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import HOSTILE, parse_html
+from roxy.admin.pages.settings import DEFAULT_EDITOR_SIZE
 from roxy.config import catalog
 from roxy.core.style_guard import find_style_issues
 
@@ -69,7 +70,9 @@ async def test_every_card_renders_and_the_page_stays_light(page: Any, pages_app:
     assert len(ids) == len(set(ids)), sorted({i for i in ids if ids.count(i) > 1})
     assert doc.select_one('link[href*="css/pages/settings"]') is not None
     assert doc.select_one('script[type="module"][src*="js/pages/settings"]') is not None
-    assert len(response.content) < 600_000, len(response.content)  # 25 controls, never the whole catalog at once
+    # 10 controls and the shell (about 145 KiB; plan 6.7 page weight, gaps_latency L4); the history and the two
+    # settings cards load as they come into view.
+    assert len(response.content) < 175_000, len(response.content)
 
 
 async def test_the_v1_runtime_settings_section_has_its_home(page: Any) -> None:
@@ -77,7 +80,7 @@ async def test_the_v1_runtime_settings_section_has_its_home(page: Any) -> None:
     doc = await page.doc(PAGE)
     editor = doc.select_one("section#editor")
     assert editor is not None
-    assert len(editor.select("[data-setting-key]")) == 25
+    assert len(editor.select("[data-setting-key]")) == DEFAULT_EDITOR_SIZE
     assert "changed from default" in editor.select_one(".card__sub").text()
     assert editor.select_one('form#editor-filter input[name="q"]') is not None
     assert editor.select_one('input[name="changed"][type="checkbox"]') is not None
@@ -96,7 +99,7 @@ async def test_the_editor_lists_what_the_api_lists(page: Any, pages_app: Any, pa
     answer = (await page.api("GET", "settings", params={**api_params, "include_text": "false"})).json()
     doc = parse_html((await page.fragment("settings", "editor", **params)).text)
     expected = _api_keys(answer)
-    assert _keys(doc) == expected[:25], params
+    assert _keys(doc) == expected[:DEFAULT_EDITOR_SIZE], params
     status = doc.select_one("[data-editor-status]").text()
     assert (f"of {answer['count']:,} settings" in status) if answer["count"] else "No setting matches" in status
     if not answer["count"]:
@@ -126,7 +129,7 @@ async def test_a_key_link_shows_that_one_setting_and_v1_names_work(page: Any) ->
     assert _keys(v1) == [renamed.key]
     assert renamed.renamed_from in v1.select_one(f"#{renamed.key}").text()
     unknown = await page.doc(PAGE, params={"key": "no_such_setting"})
-    assert len(_keys(unknown)) == 25
+    assert len(_keys(unknown)) == DEFAULT_EDITOR_SIZE
     assert "No setting has the key in the address" in unknown.text()
 
 
@@ -161,17 +164,19 @@ async def test_a_bad_filter_in_the_address_is_a_notice(page: Any) -> None:
     doc = await page.doc(PAGE, params={"group": "bogus", "page_size": "7"})
     notes = " ".join(node.text() for node in doc.select("#editor-results .card__notice"))
     assert "A filter in the address was not valid" in notes
-    assert "Showing 25 settings a page" in notes
-    assert len(_keys(doc)) == 25
+    assert f"Showing {DEFAULT_EDITOR_SIZE} settings a page" in notes
+    assert len(_keys(doc)) == DEFAULT_EDITOR_SIZE
 
 
 async def test_the_alert_and_public_site_cards_hold_their_catalog_settings(page: Any) -> None:
     doc = await page.doc(PAGE)
     for card in ("alerts", "public-site"):
+        assert "page-card--lazy" in doc.select_one(f"section#{card}").classes()  # 15 controls: off the first paint
+        fragment = parse_html((await page.fragment("settings", card)).text)
         keys = {spec.key for spec in registry.settings_for(f"settings#{card}")}
         assert keys
         for key in keys:
-            assert doc.select_one(f'section#{card} [data-setting-key="{key}"]') is not None, (card, key)
+            assert fragment.select_one(f'section#{card} [data-setting-key="{key}"]') is not None, (card, key)
 
 
 async def test_the_spam_dry_run_points_to_the_arm_flow(page: Any) -> None:
@@ -227,6 +232,31 @@ async def test_the_history_drawer_reverts_through_the_api_with_csrf_and_audit(pa
     assert reverts["total"] == 1
     missing = await page.fragment("settings", "history", change=999999)
     assert "No settings change has that number" in missing.text
+
+
+async def test_the_one_setting_view_lists_that_settings_own_history(page: Any, pages_app: Any, inert: Any) -> None:
+    """Plan 15.2 "history per key": `?key=` lists the setting's newest changes as `GET /settings/{key}/history`."""
+    empty = (await page.doc(PAGE, params={"key": "tarpit_max_seconds"})).select_one("[data-key-history]")
+    assert empty is not None
+    assert "No change of this setting is in the history" in empty.text()
+    for ttl in (61, 62, 63):
+        await pages_app.settings(cache_ttl_seconds=ttl)
+    await pages_app.settings(site_footer_text="Footer " + HOSTILE["img"])
+    api = (await page.api("GET", "settings/cache_ttl_seconds/history", params={"page_size": 10})).json()
+    response = await page.get(PAGE, params={"key": "cache_ttl_seconds"})
+    doc = parse_html(response.text)
+    section = doc.select_one("#editor-results [data-key-history]")
+    assert section is not None
+    buttons = section.select("button[data-drawer-src]")
+    assert [b.get("data-drawer-title") for b in buttons] == [f"Settings change #{item['id']}" for item in api["items"]]
+    assert "to 63" in section.text()
+    assert section.select_one('a[href="/admin/audit?target=setting:cache_ttl_seconds"]') is not None
+    drawer = await page.get(buttons[0].get("data-drawer-src") or "", htmx=True)
+    assert drawer.status_code == 200
+    assert parse_html(drawer.text).select_one("form.settings-revert") is not None
+    hostile = await page.get(PAGE, params={"key": "site_footer_text"})
+    inert(hostile.text, "one-setting history")
+    assert "&lt;img src=x onerror=alert(1)&gt;" in hostile.text
 
 
 async def test_tables_own_requests_get_only_the_table(page: Any) -> None:

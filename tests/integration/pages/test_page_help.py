@@ -18,13 +18,16 @@ What to read next
 
 from __future__ import annotations
 
+import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from roxy.admin.pages import _help_docs, help as help_page, registry
-from roxy.admin.pages.testing import parse_html
+from pages_harness import parse_html
+from roxy.admin.pages import _help_docs, registry
+from roxy.admin.pages import help as help_page
 from roxy.admin.pages.texts import load_glossary
 from roxy.core.style_guard import find_style_issues
 from roxy.health.checks import SPECS as HEALTH_SPECS
@@ -64,20 +67,45 @@ async def test_every_card_renders_with_one_h1_clean_markup_and_its_fragment(page
     assert doc.select_one('link[href*="css/pages/help"]') is not None
     assert doc.select_one('script[type="module"][src*="js/pages/help"]') is not None
     ids = doc.ids()
-    duplicates = sorted({i for i in ids if ids.count(i) > 1})
-    assert set(duplicates) <= {REGISTRY_CLASH, f"{REGISTRY_CLASH}-title"}, duplicates
+    assert not sorted({i for i in ids if ids.count(i) > 1})
 
 
-REGISTRY_CLASH = "shortcuts"
-"""The registry names a Help card `shortcuts`, the id of the shell's `?` overlay dialog (admin/_layout/shortcuts.html):
-two elements share the id, so `openDialog("shortcuts")` finds the card instead of the dialog on this page. The fix is
-a registry change (the card id `keys`), requested from the integrator; see `.remake/p11_reports/g7_settings.md`."""
-
-
-@pytest.mark.xfail(strict=True, reason="registry card help#shortcuts collides with the shell dialog #shortcuts")
 async def test_no_id_on_the_help_page_is_used_twice(page: Any) -> None:
+    """The shortcuts card is `keys`: the id `shortcuts` belongs to the shell's `?` overlay dialog, which
+    `openDialog("shortcuts")` must find on this page too."""
     ids = parse_html((await page.get(PAGE)).text).ids()
-    assert len(ids) == len(set(ids)), sorted({i for i in ids if ids.count(i) > 1})
+    duplicates = sorted({i for i in ids if ids.count(i) > 1})
+    assert not duplicates, duplicates
+    assert help_page.SHORTCUTS_CARD == "keys"
+    assert ids.count("shortcuts") == 1
+
+
+async def test_a_card_whose_renderer_fails_shows_the_error_in_place(page: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The kit contract on the real Help page: a renderer that raises becomes the error card, the rest renders."""
+
+    async def broken(view: Any) -> dict[str, Any]:
+        raise RuntimeError("boom")
+
+    async def refused(view: Any) -> dict[str, Any]:
+        from roxy.admin.api.common import unavailable
+
+        raise unavailable("The metrics database is busy right now; try again shortly.")
+
+    for card_id, render in (("guide", broken), ("glossary", refused)):
+        monkeypatch.setitem(help_page.page._cards, card_id, replace(help_page.page._cards[card_id], render=render))
+    failed = await page.fragment("help", "guide")
+    assert failed.status_code == 200
+    assert "data-card-error" in failed.text
+    assert "failed to load" in failed.text
+    assert "boom" not in failed.text
+    busy = await page.fragment("help", "glossary")
+    assert "The metrics database is busy" in busy.text
+    whole = await page.get(PAGE)
+    assert whole.status_code == 200
+    doc = parse_html(whole.text)
+    assert doc.select_one("section#guide[data-card-error]") is not None  # the card keeps its place, with the error
+    assert doc.select_one("section#pages .help-page") is not None  # every other card still renders
+    assert doc.select_one(f"section#{help_page.SHORTCUTS_CARD} .help-keys") is not None
 
 
 async def test_the_glossary_has_every_term_as_the_target_of_the_tooltips(page: Any) -> None:
@@ -131,6 +159,35 @@ async def test_every_help_fix_link_of_the_health_checks_lands_on_an_element(page
     assert {"/admin/help/runbooks", "/admin/help/operations"} <= set(pages)
 
 
+HELP_LINK = re.compile(r"""["'](/admin/help(?:/[a-z-]+)?#[a-z0-9-]+)["']""")
+
+
+def _template_help_links() -> set[str]:
+    """Every literal `/admin/help...#anchor` link in the dashboard templates (the development gallery left out)."""
+    from roxy.core.templating import TEMPLATES_DIR
+
+    links: set[str] = set()
+    for path in TEMPLATES_DIR.rglob("*.html"):
+        if "_gallery" not in path.parts:
+            links.update(HELP_LINK.findall(path.read_text(encoding="utf-8")))
+    return links
+
+
+async def test_every_help_link_written_in_a_dashboard_template_lands_on_an_element(page: Any) -> None:
+    """Pages link into Help by hand too (`/admin/help/runbooks#alert-channels-down` on System > Alerts): every such
+    literal link in the dashboard templates (the development gallery aside) must land on an element."""
+    links = _template_help_links()
+    assert "/admin/help/runbooks#alert-channels-down" in links
+    ids: dict[str, set[str]] = {}
+    for link in sorted(links):
+        path, anchor = _split(link)
+        if path not in ids:
+            response = await page.get(path)
+            assert response.status_code == 200, link
+            ids[path] = set(parse_html(response.text).ids())
+        assert anchor in ids[path], f"{link} lands on nothing"
+
+
 async def test_the_operations_names_are_anchors_before_their_runbooks(page: Any) -> None:
     response = await page.get(f"{PAGE}/operations")
     links = _help_docs.parse_link_index((_help_docs.DOCS_DIR / "RUNBOOKS.md").read_text(encoding="utf-8"))
@@ -141,7 +198,7 @@ async def test_the_operations_names_are_anchors_before_their_runbooks(page: Any)
         name = link.name.removeprefix("operations#")
         assert doc.select_one(f"#{name}") is not None, name
         assert doc.select_one(f"#{link.anchor}") is not None, link.anchor
-    assert f'id="environment"></span><div class="heading heading-h2"><h2 id="proxy-variables-in-the-environment">' in (
+    assert 'id="environment"></span><div class="heading heading-h2"><h2 id="proxy-variables-in-the-environment">' in (
         response.text
     )
 
@@ -167,9 +224,35 @@ async def test_every_document_renders_with_the_shell_one_h1_and_unique_ids(page:
         assert region.select_one("table") is not None
 
 
-async def test_the_unwritten_admin_guide_says_so_and_points_to_the_outline(page: Any) -> None:
-    if (_help_docs.DOCS_DIR / "ADMIN_GUIDE.md").exists():
-        pytest.skip("docs/ADMIN_GUIDE.md exists now: the guide renders instead of its outline")
+async def test_the_admin_guide_renders_with_its_contents_and_the_outline(page: Any) -> None:
+    """`docs/ADMIN_GUIDE.md` exists (a skeleton until the docs phase writes it): the card links it with its chapters
+    and still points each plan 16.3 topic to the pages that cover it."""
+    assert (_help_docs.DOCS_DIR / "ADMIN_GUIDE.md").is_file()
+    guide = await page.doc(f"{PAGE}/guide")
+    assert len(guide.select("h1")) == 1
+    headings = [node.text() for node in guide.select("article.doc h2")]
+    assert headings[0] == "Getting started"
+    assert {"Alerts", "Backups and resets", "The operator CLI"} <= set(headings)
+    assert {spec.title for spec in registry.PAGES} <= set(headings)  # one chapter per dashboard page
+    card = (await page.doc(PAGE)).select_one("section#guide")
+    assert card is not None
+    assert card.select_one('a[href="/admin/help/guide"]') is not None
+    contents = card.select(".help-toc a")
+    assert len(contents) == len(headings)
+    assert contents[0].get("href") == "/admin/help/guide#getting-started"
+    assert len(card.select(".help-chapter__title")) == 12
+    assert "not part of this release yet" not in card.text()
+
+
+async def test_the_unwritten_admin_guide_says_so_and_points_to_the_outline(
+    page: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without `ADMIN_GUIDE.md` (a release without the docs phase) the card says so and the outline is the guide."""
+    for spec in _help_docs.DOCS:
+        source = _help_docs.DOCS_DIR / spec.file
+        if spec.slug != "guide" and source.is_file():
+            (tmp_path / spec.file).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(_help_docs, "DOCS_DIR", tmp_path)
     doc = await page.doc(f"{PAGE}/guide")
     assert "The admin guide is not written yet" in doc.text()
     assert doc.select_one('a[href="/admin/help#guide"]') is not None
@@ -178,7 +261,8 @@ async def test_the_unwritten_admin_guide_says_so_and_points_to_the_outline(page:
     assert "not part of this release yet" in card.text()
     titles = [node.text() for node in card.select(".help-chapter__title")]
     assert len(titles) == 12  # plan 16.3 has twelve chapters
-    assert titles[0] == "First-time setup" and titles[-1] == "Glossary"
+    assert titles[0] == "First-time setup"
+    assert titles[-1] == "Glossary"
 
 
 async def test_a_missing_document_folder_never_fails_the_page(
@@ -198,8 +282,9 @@ async def test_a_missing_document_folder_never_fails_the_page(
 async def test_the_shortcuts_are_the_overlays_own_list(page: Any) -> None:
     doc = await page.doc(PAGE)
     overlay = doc.select_one("dialog#shortcuts")
-    card = doc.select_one("section#shortcuts")
-    assert overlay is not None and card is not None
+    card = doc.select_one(f"section#{help_page.SHORTCUTS_CARD}")
+    assert overlay is not None
+    assert card is not None
 
     def rows(root: Any) -> list[tuple[str, str]]:
         return [(row.select_one("dt").text(), row.select_one("dd").text()) for row in root.select("dl div")]
@@ -261,6 +346,7 @@ def test_documents_render_once_per_file_version(tmp_path: Path) -> None:
     assert _help_docs.load_doc(spec, tmp_path) is first
     (tmp_path / "T.md").write_text("# Title here\n\n<script>alert(1)</script>\n", encoding="utf-8")
     second = _help_docs.load_doc(spec, tmp_path)
-    assert second is not None and second is not first
+    assert second is not None
+    assert second is not first
     assert "<script>" not in str(second.html)
     assert _help_docs.load_doc(_help_docs.DocSpec("u", "U.md", "U", "Missing."), tmp_path) is None

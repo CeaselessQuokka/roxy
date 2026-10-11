@@ -431,6 +431,12 @@ Redaction is the last line of defense and is deliberately blunt (`src/roxy/core/
 - Client addresses can be hashed in logs (`log_hash_client_ips`) with a keyed HMAC, never a plain hash, which could
   be reversed by hashing all four billion IPv4 addresses (`src/roxy/core/iphash.py`). Exports use a derived key per
   export unless `export_stable_ip_hash` is on.
+- Request fingerprints (Security > Fingerprints) never keep a value of a header that carries client addresses
+  (`X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `True-Client-IP`, `CF-Connecting-IP`, `X-Client-IP`,
+  `X-Cluster-Client-IP`, `Via`; `src/roxy/config/constants.py` `CLIENT_ADDRESS_HEADERS`), not even as a hash: their
+  names are counted, they are shipped as ignored value headers (the dashboard lists them and refuses to record them
+  again), and the leader's fingerprint job deletes any value an earlier release stored. The User-Agent drill-down
+  keeps header names only, never values; its client address is hashed in exports like every other address column.
 - Audit rows for secret targets hold only `{fingerprint, masked}`; anything else raises before a row is written
   (`roxy.config.audit.record`). The audit log is append-only: database triggers refuse updates and deletes except
   the 400-day retention job.

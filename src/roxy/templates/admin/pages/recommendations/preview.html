@@ -51,7 +51,7 @@
   </div>
 
   <section class="rec-dryrun" aria-labelledby="{{ pid }}-dry">
-    <h5 class="rec-dryrun__title" id="{{ pid }}-dry">What it would have done{% if report.window_s == 3600 %} in the last hour{% elif report.window_s %} in the last {{ report.window_s // 3600 }} hours{% endif %}</h5>
+    <h5 class="rec-dryrun__title" id="{{ pid }}-dry">What it would have done{% if report.window_s == 3600 %} in the last hour{% elif report.window_s and report.window_s % 3600 == 0 %} in the last {{ report.window_s // 3600 }} hours{% elif report.window_s %} in the last {{ report.window_s // 60 }} minutes{% endif %}</h5>
     {% if report.available %}
     <dl class="kv">
       <dt>Requests replayed</dt><dd>{{ num(report.sample_size) }} samples{% if report.sample_pct is not none and report.sample_pct < 100 %} (taken at {{ "%g"|format(report.sample_pct) }}%; counts below are scaled by {{ "%.3g"|format(report.scale or 1) }}){% endif %}</dd>

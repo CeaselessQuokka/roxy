@@ -117,6 +117,11 @@
     <p class="setting__option" id="{{ fid }}-option" x-text="optionText">{{ option_text.get(shown, "") }}</p>
     {% elif spec.type in ("list[str]", "list[int]", "list[cidr]") %}
     <textarea class="input mono" id="{{ fid }}-value" name="value" rows="4" spellcheck="false" data-setting-input x-on:input="onInput" aria-describedby="{{ described }}">{{ shown }}</textarea>
+    {% elif spec.type == "string" and ((spec.max_length or 0) > 200 or "\n" in shown) %}
+    {#- A paragraph (a public site text): a one-line input would drop its line breaks, look edited on load and
+        flatten the text on save. The newline after the start tag keeps a value that starts with one. #}
+    <textarea class="input" id="{{ fid }}-value" name="value" rows="4"{% if spec.max_length %} maxlength="{{ spec.max_length }}"{% endif %} spellcheck="false" data-setting-input x-on:input="onInput" aria-describedby="{{ described }}">
+{{ shown }}</textarea>
     {% elif spec.type == "string" %}
     <input class="input" type="text" id="{{ fid }}-value" name="value" value="{{ shown }}"{% if spec.max_length %} maxlength="{{ spec.max_length }}"{% endif %} spellcheck="false" data-setting-input x-on:input="onInput" aria-describedby="{{ described }}">
     {% else %}
@@ -141,7 +146,9 @@
     {%- if spec.min is not none and spec.max is not none -%}Allowed {{ display_value(spec, spec.min) }} to {{ display_value(spec, spec.max) }}.
     {%- elif spec.max_length and spec.type == "string" -%}Up to {{ num(spec.max_length) }} characters.
     {%- elif spec.type in ("list[str]", "list[int]", "list[cidr]") -%}One entry per line.{%- endif %}
-    Default {{ display_value(spec, spec.default) }}.
+    {# A default that is a sentence keeps its own period; an empty one says so (not "Default ." or "Default ..."). #}
+    {% set default_text = display_value(spec, spec.default)|trim %}
+    Default {% if not default_text %}empty.{% elif default_text[-1] in ".!?" %}{{ default_text }}{% else %}{{ default_text }}.{% endif %}
   </p>
   <p class="setting__error" id="{{ fid }}-error" role="alert" x-text="error"{% if not error %} hidden{% endif %} x-bind:hidden="!error">{{ error or "" }}</p>
   <div class="setting__risk" role="alert"{% if not risk.why %} hidden{% endif %} x-bind:hidden="!riskWhy">

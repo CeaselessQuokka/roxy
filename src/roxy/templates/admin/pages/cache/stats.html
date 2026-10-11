@@ -5,7 +5,8 @@
   and avoided calls with their comparison (a tile whose data a reset touched shows its notice instead of a delta,
   plan 6.8), then v1's short windows (5 minutes, an hour, a day), the stored answers against their budgets with
   the evictions of the range, this worker's memory tier, and the shared store's health (v1 `cacheDiskWarning`).
-  "Clear stats" resets the `cache_stats` family through the data API (v1 `Clear stats`).
+  "Clear stats" resets the `cache_stats` family through the data API (v1 `Clear stats`). Under the chips, the
+  answers Roblox never saw split by cache state (v1's "Fresh hits, Stale rescues, Collapsed" tile line).
   Context: `frame`, `tiles`, `displays`, `settings`, `size`, `evictions`, `memory`, `disk`, `disk_problem`, `served`,
   `recent`, `notices`, `ttl_words`, `reset`, `states`.
 -#}
@@ -22,6 +23,7 @@
   {% if settings.enabled %}{{ status_badge("ok", "Caching on, answers kept " ~ ttl_words ~ " by default") }}{% else %}{{ status_badge("bad", "Caching off") }}{% endif %}
   {% if served is not none %}{{ badge(num(served) ~ (" request Roblox never saw" if served == 1 else " requests Roblox never saw"), "accent", "check") }}{% endif %}
 </p>
+{% if served %}<p class="cache-states">By cache state in this range: {{ num(states.cache_hit) }} fresh hits, {{ num(states.cache_revalidating) }} served while one refresh ran, {{ num(states.cache_stale) }} stale rescues while Roblox failed, {{ num(states.cache_coalesced) }} shared another caller's fetch.</p>{% endif %}
 {% if disk_problem %}
 {% set why = "Roxy cannot write to its cache directory." if disk.Writable is sameas false else "Writing to the shared cache store is failing." %}
 {{ inline_alert("bad", "The shared cache store is not working.", why ~ " Saved answers are kept in each worker's memory instead, so they are not shared between workers and are lost on restart; that is why the hit ratio is lower than it should be and the browser below looks incomplete. Fix the directory's permissions (System > Environment), or turn off the shared disk copy in the settings to run memory only on purpose.") }}

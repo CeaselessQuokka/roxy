@@ -32,7 +32,7 @@ How it works
 
 What to read next
     `roxy/admin/api/traffic.py`, `templates/admin/pages/traffic.html` and `traffic/*.html`,
-    `roxy/admin/pages/_traffic_reset.py` (the inline resets), `roxy/metrics/queries.py` (`series`, `top_n`).
+    `roxy/admin/pages/resets.py` (the inline resets), `roxy/metrics/queries.py` (`series`, `top_n`).
 """
 
 from __future__ import annotations
@@ -43,8 +43,8 @@ from typing import Any, Final
 
 from roxy.admin.api import traffic as traffic_api
 from roxy.admin.pages import fmt
-from roxy.admin.pages._traffic_reset import add_reset_route, family_reset, reset_href
 from roxy.admin.pages.kit import Page, PageView, table_query, table_view
+from roxy.admin.pages.resets import add_reset_route, family_reset, reset_href
 from roxy.metrics.catalog import METRICS
 from roxy.metrics.rollups import zone
 
@@ -163,7 +163,9 @@ def _day(ts: Any, tz: str) -> str:
 
 @page.card("requests")
 async def requests_card(view: PageView) -> dict[str, Any]:
-    """Requests over time by outcome and the range totals (`traffic_api.requests_answer`)."""
+    """Requests over time by outcome and the range totals (`traffic_api.requests_answer`). The totals are rendered
+    on the server; the chart reads the same answer by URL right after the first paint (`chart_src`): embedded, its
+    points were half of the page (about 100 KiB for a day of minutes, sent uncompressed because of BREACH)."""
     answer = await traffic_api.requests_answer(view.ctx, view.tr)
     totals = group_totals(answer)
     total = sum(totals.values())
@@ -188,7 +190,7 @@ async def requests_card(view: PageView) -> dict[str, Any]:
         else f"No requests were recorded in this range ({view.time.view['description']})."
     )
     return {
-        "answer": answer,
+        "chart_src": view.api_url("traffic/requests"),
         "stats": stats,
         "summary": summary,
         "series_options": {f"requests:{key}": {"label": label, "color": slot} for key, label, slot in OUTCOMES},
@@ -415,10 +417,16 @@ async def latency_card(view: PageView) -> dict[str, Any]:
     if table_only(view):
         return {"part": "table", "table": table}
     series = await traffic_api.latency_answer(view.ctx, view.tr, split)
+    # The API's fixed sentence about what latency measures is the card's note; the chart's notices keep only the
+    # partial-data warnings (plan 6.8), the ones that change from range to range.
+    notices = list(series.get("notices") or ())
+    note = traffic_api.LATENCY_NOTE if traffic_api.LATENCY_NOTE in notices else ""
+    series = {**series, "notices": [text for text in notices if text != traffic_api.LATENCY_NOTE]}
     return {
         "part": "card",
         "table": table,
         "series": series,
+        "note": note,
         "split": split,
         "splits": LATENCY_SPLITS,
         "by_word": word,
@@ -488,7 +496,14 @@ async def trends_card(view: PageView) -> dict[str, Any]:
         rows = []
         for row in period.get("rows") or ():
             values = [float(v) if isinstance(v, int | float) else 0.0 for _t, v in row.get("sparkline") or ()]
-            rows.append({**row, "spark": values, "help": METRICS[row["metric"]].description})
+            shown: dict[str, Any] = {**row, "spark": values, "help": METRICS[row["metric"]].description}
+            if row.get("metric") == "avoided_pct":
+                # A negative avoided share as it is, with why under it (plan P6; `fmt.avoided_cell`, every page).
+                shown["cells"] = {
+                    "current": fmt.avoided_cell(row.get("current")),
+                    "previous": fmt.avoided_cell(row.get("previous")),
+                }
+            rows.append(shown)
         periods.append(
             {
                 "key": period.get("key"),

@@ -224,6 +224,8 @@ class Up429Endpoint(Rule):
             risk="low",
         )
         report = await simulate.dry_run(ctx, rec, window_s=window.end - window.start)
+        if report.bounded:
+            evidence.details["sample_bound"] = report.note  # only the newest part of the window was replayed (G7)
         if report.avoided_calls is not None:
             rec.expected_impact = (
                 f"About {per_hour_text(report.avoided_calls, report.window_s)} fewer upstream calls per hour on this "
@@ -245,8 +247,7 @@ class Up429Endpoint(Rule):
         ttl = current_ttl
         if int(ctx.setting("ttl_tuner_enabled")):
             hours = float(ctx.setting("request_sample_hours"))
-            samples = await ctx.samples(ctx.window(hours=hours), [template])
-            estimate = simulate.estimate_change_interval(samples)
+            estimate = await ctx.change_estimate(ctx.window(hours=hours), template)  # one SQL read per window (G7)
             tuned = simulate.proposed_ttl(estimate, cap_s=float(ctx.setting("ttl_tuner_max_s")))
             evidence.details["ttl_tuner"] = estimate.to_dict()
             if tuned is not None:
@@ -403,8 +404,7 @@ class CacheTtlTune(Rule):
             return None
         current = effective_ttl(ctx, covering)
         sample_hours = min(hours, float(ctx.setting("request_sample_hours")))
-        samples = await ctx.samples(ctx.window(hours=sample_hours), [template])
-        estimate = simulate.estimate_change_interval(samples)
+        estimate = await ctx.change_estimate(ctx.window(hours=sample_hours), template)  # one SQL read per window
         tuned = simulate.proposed_ttl(estimate, cap_s=cap)
         if tuned is None:
             # No samples to measure: the observations alone, read as random (Poisson) body changes, give the

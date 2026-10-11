@@ -4,7 +4,10 @@
   What
     `data_table(id, columns, rows, src=..., total=..., page=..., page_size=..., sort=..., order=...)` renders one
     self-contained table block. Every control re-asks the server through htmx: the server answers with the same
-    macro for the new page, and htmx swaps the whole block (`outerHTML` on `#id`). The same macro serves the first
+    macro for the new page, and htmx swaps the whole block (`outerHTML` on `#id`). The answer may be the whole card
+    the table sits in (the card's fragment route renders one template per card): `hx-select="#id"` keeps only this
+    table out of it, so a card never ends up inside itself (a card may still answer with the table alone when
+    `PageView.table_request(id)` says the table asked, a saving only). The same macro serves the first
     page render and every fragment, so the two can never drift. Pages build the context from an admin API table
     answer with `roxy.admin.pages.kit.table_view` and call `data_table(**table)`.
   Why
@@ -80,7 +83,7 @@
 <div class="dt" id="{{ id }}" data-dt data-dt-id="{{ id }}" data-dt-src="{{ src }}"{% if table_name %} data-table="{{ table_name }}"{% endif %}{% if address %} data-dt-address{% endif %}>
   <div class="dt__toolbar">
     <form class="dt__state" id="{{ id }}-state" data-dt-state role="search" aria-label="{{ caption or 'Table' }}: search and filters"
-          hx-get="{{ src }}" hx-target="#{{ id }}" hx-swap="outerHTML" hx-indicator="#{{ id }}"
+          hx-get="{{ src }}" hx-target="#{{ id }}" hx-select="#{{ id }}" hx-swap="outerHTML" hx-indicator="#{{ id }}"
           hx-trigger="submit, change, input changed delay:400ms from:#{{ id }}-q">
       {% if searchable %}
       <label class="sr-only" for="{{ id }}-q">{{ search_label }}</label>
@@ -143,7 +146,7 @@
       </thead>
       <tbody>
         {% for row in rows %}
-        <tr{% if row.drawer %} data-drawer-src="{{ row.drawer }}"{% if row.title %} data-drawer-title="{{ row.title }}"{% endif %}{% endif %} data-row-id="{{ row.id or loop.index }}">
+        <tr{% if row.drawer %} data-drawer-src="{{ row.drawer }}"{% endif %}{% if row.title %} data-drawer-title="{{ row.title }}"{% endif %} data-row-id="{{ row.id or loop.index }}">
           {% for c in columns %}
           {%- set value = row.cells.get(c.key) -%}
           <td data-col="{{ c.key }}" data-label="{{ c.label }}" class="{% if c.num %}num{% endif %}"{% if c.key_col or loop.first %} data-key{% endif %}{% if c.hidden %} hidden{% endif %}>

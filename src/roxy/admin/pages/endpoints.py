@@ -29,13 +29,14 @@ How it works
 
 What to read next
     `roxy/admin/api/endpoints.py`, `templates/admin/pages/endpoints/*.html`, `roxy/admin/pages/live.py` (the request
-    drawer the recent rows open), `roxy/admin/pages/_traffic_reset.py`.
+    drawer the recent rows open), `roxy/admin/pages/resets.py`.
 """
 
 from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any, Final
 from urllib.parse import urlencode
 
@@ -45,8 +46,7 @@ from fastapi.responses import HTMLResponse
 from roxy.admin.api import common
 from roxy.admin.api import endpoints as endpoints_api
 from roxy.admin.api import live as live_api
-from roxy.admin.pages import fmt, shell
-from roxy.admin.pages._traffic_reset import add_reset_route, endpoint_reset, reset_href
+from roxy.admin.pages import fmt
 from roxy.admin.pages.kit import (
     Page,
     PageAdmin,
@@ -57,8 +57,9 @@ from roxy.admin.pages.kit import (
     table_view,
     templates_of,
 )
-from roxy.deps import get_ctx
-from roxy.metrics.catalog import METRICS
+from roxy.admin.pages.resets import add_reset_route, endpoint_reset, reset_href
+from roxy.metrics.catalog import METRICS, avoided_note
+from roxy.metrics.rollups import zone
 
 page = Page("endpoints")
 router = page.router
@@ -67,16 +68,16 @@ TABLE_ID: Final = "endpoints-table"
 SHOWN_COLUMNS: Final = (
     "key",
     "requests",
-    "trend_pct",
-    "upstream_calls",
-    "hit_ratio",
-    "roblox_429",
-    "failed",
-    "p95_ms",
     "methods",
     "last_request_ms",
     "last_status",
     "last_caller",
+    "hit_ratio",
+    "roblox_429",
+    "p95_ms",
+    "trend_pct",
+    "upstream_calls",
+    "failed",
     "last_place",
     "previous_requests",
     "demand",
@@ -84,8 +85,20 @@ SHOWN_COLUMNS: Final = (
     "p50_ms",
     "p99_ms",
 )
+"""v1's Top Endpoints columns first (Endpoint, Count, Methods, Last Request, Last Status, Last Caller), then v2's
+numbers; the column chooser shows the hidden ones (the trend also shows under each request count)."""
 KEY_COLUMNS: Final = ("key", "requests", "roblox_429")
-HIDDEN_COLUMNS: Final = ("previous_requests", "demand", "avoided_pct", "p50_ms", "p99_ms", "last_place")
+HIDDEN_COLUMNS: Final = (
+    "trend_pct",
+    "upstream_calls",
+    "failed",
+    "last_place",
+    "previous_requests",
+    "demand",
+    "avoided_pct",
+    "p50_ms",
+    "p99_ms",
+)
 METHODS: Final[tuple[str, ...]] = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 RECENT_ROWS: Final = 25
 CHOICES_MAX: Final = 10
@@ -151,6 +164,18 @@ def pct_text(value: Any, *, ratio: bool = False) -> str:
     if not isinstance(value, int | float):
         return fmt.MISSING
     return f"{value * 100 if ratio else value:,.1f}%"
+
+
+def short_time_cell(view: PageView, ts: Any) -> dict[str, Any] | None:
+    """A time cell for a busy table: `Oct 10, 18:52` (the year only when it is not this year) with "2 minutes ago"
+    under it; the exact time stays in the cell's `datetime`."""
+    cell = view.time_cell(ts)
+    if cell is None:
+        return None
+    moment = datetime.fromtimestamp(float(ts), zone(view.tz))
+    this_year = datetime.fromtimestamp(view.now, zone(view.tz)).year
+    year = "" if moment.year == this_year else f" {moment.year},"
+    return {**cell, "text": f"{moment:%b} {moment.day},{year} {moment:%H:%M}"}
 
 
 def methods_text(methods: Any) -> str:
@@ -267,22 +292,33 @@ async def table_card(view: PageView) -> dict[str, Any]:
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
         trend = item.get("trend_pct")
         previous = item.get("previous_requests")
+        requests = item.get("requests")
         if isinstance(trend, int | float):
-            trend_cell: Any = {"text": f"{'+' if trend > 0 else ''}{trend:,.1f}%"}
-        elif previous == 0 and item.get("requests"):
+            trend_text = f"{'+' if trend > 0 else ''}{trend:,.1f}%"
+            trend_cell: Any = {"text": trend_text}
+            trend_sub = f"{trend_text} vs before"
+        elif previous == 0 and requests:
             trend_cell = {"text": "New", "tone": "info"}
+            trend_sub = "new in this range"
         else:
             trend_cell = None
+            trend_sub = ""
+        # The trend also rides under the request count, so it shows without its own column (hidden by default to
+        # keep v1's columns and Roblox's numbers on one screen).
+        requests_cell: Any = (
+            {"text": f"{int(requests):,}", "sub": trend_sub} if trend_sub and isinstance(requests, int) else requests
+        )
         last_ms = item.get("last_request_ms")
-        when = view.time_cell(last_ms / 1000 if isinstance(last_ms, int | float) else None)
+        when = short_time_cell(view, last_ms / 1000 if isinstance(last_ms, int | float) else None)
         precision = str(item.get("last_request_precision") or "")
         if when is not None and precision and precision != "exact":
             when = {**when, "sub": f"{when.get('sub', '')}, to the {precision}".strip(", ")}
         status = item.get("last_status")
         return {
             "key": {"text": item.get("key"), "caller": True, "mono": True},
+            "requests": requests_cell,
             "trend_pct": trend_cell,
-            "avoided_pct": pct_text(item.get("avoided_pct")),
+            "avoided_pct": fmt.avoided_cell(item.get("avoided_pct")),  # a negative share as it is, with why (P6)
             "hit_ratio": pct_text(item.get("hit_ratio"), ratio=True),
             "p50_ms": ms_text(item.get("p50_ms")),
             "p95_ms": ms_text(item.get("p95_ms")),
@@ -393,9 +429,13 @@ async def detail_card(view: PageView) -> dict[str, Any]:
     answer = await endpoints_api.detail_answer(view.ctx, view.tr, name)
     totals = answer.get("totals") or {}
     tiles = []
+    avoided_why = avoided_note((totals.get("avoided_pct") or {}).get("value"))
     for key in DETAIL_TILES:
         item = totals.get(key) or {}
         spec = METRICS.get(key)
+        notice = item.get("notice")
+        if notice is None and avoided_why and key in ("avoided_pct", "avoided"):
+            notice = f"Below 0%: {avoided_why}."  # a negative share as it is, with why (plan P6)
         tile = common.kpi_tile(
             key,
             label=spec.label if spec else key,
@@ -405,7 +445,7 @@ async def detail_card(view: PageView) -> dict[str, Any]:
             delta_pct=item.get("delta_pct"),
             good_direction=direction(key),
             help=spec.description if spec else "",
-            notice=item.get("notice"),
+            notice=notice,
         )
         tile["partial"] = bool(item.get("partial"))
         tiles.append(tile)
@@ -476,20 +516,10 @@ async def detail_card(view: PageView) -> dict[str, Any]:
 @page.router.get("/template", name="page_endpoints_template", include_in_schema=False)
 async def template_page(request: Request, principal: PageAdmin) -> HTMLResponse:
     """The drill-down of one template as a page of its own (plan 14.1): the shell, then the `detail` card."""
-    built = await shell.build_shell(request, principal, page.spec, stream_events=page.stream_events)
-    view = PageView(
-        request=request,
-        principal=principal,
-        ctx=get_ctx(request),
-        page=page.spec,
-        time=built.time,
-        tz=built.tz,
-        prefs=built.prefs,
-        latest=built.facts.latest,
-        shell=built,
-    )
+    view, built = await page.shell_view(request, principal)
     card = page.card_def("detail")
-    assert card is not None  # a registry card of this page (kit raises at import otherwise)
+    if card is None:  # a registry card of this page: losing it is a bug, never a quiet empty page
+        raise RuntimeError("the registry has no endpoints#detail card")
     html = await render_card(view, card)
     context = {
         **built.context,

@@ -51,7 +51,7 @@
   <dl class="kv fp-drawer__facts">
     <dt>Header</dt><dd>{{ caller_text(d.name, 120) }}</dd>
     <dt>Requests that carried it</dt><dd>{% if d.row %}{{ num(d.row.count) }}{% else %}<span class="muted">not recorded right now</span>{% endif %}</dd>
-    <dt>Values</dt><dd>{% if d.ignored %}{{ badge("Not recorded", "neutral", "eye") }}{% else %}{{ badge("Recorded", "ok", "check") }}{% endif %}</dd>
+    <dt>Values</dt><dd>{% if d.never_recorded %}{{ badge("Never recorded", "neutral", "lock") }}{% elif d.ignored %}{{ badge("Not recorded", "neutral", "eye") }}{% else %}{{ badge("Recorded", "ok", "check") }}{% endif %}</dd>
     <dt>Distinct values kept</dt><dd>{{ num(d.values_total) }}</dd>
     <dt>First seen</dt><dd>{{ when(d.first) }}</dd>
     <dt>Last seen</dt><dd>{{ when(d.last) }}</dd>
@@ -76,6 +76,8 @@
       </table>
     </div>
     <p><a class="btn btn--sm btn--ghost" href="{{ local_href(d.values_export) }}" data-export download>{{ icon("download") }}<span>Download every value (CSV)</span></a></p>
+    {% elif d.never_recorded %}
+    <p class="muted">This header carries client addresses, so its values are never recorded (not even as a hash): only its count is kept.</p>
     {% elif d.ignored %}
     <p class="muted">Values of this header are not recorded, so none are kept.</p>
     {% else %}
@@ -85,7 +87,9 @@
 
   <section class="fp-drawer__section" aria-labelledby="fp-actions-title">
     <h3 class="fp-drawer__heading" id="fp-actions-title">What you can do</h3>
-    {% if d.ignored %}
+    {% if d.never_recorded %}
+    <p class="muted">Recording its values cannot be switched on: a value of this header identifies a client, and Roxy never keeps one.</p>
+    {% elif d.ignored %}
     {{ action_form(d.record_url, "DELETE", "Values of this header are recorded again.", "Record its values again",
                    consequences=["New values are stored again from the next request; its count never stopped."]) }}
     {% else %}
@@ -105,6 +109,32 @@
       {{ action_form(d.remove_url, "DELETE", "The header was removed from the fingerprints.", "Remove the header", tone="btn--danger",
                      consequences=["Deletes this header's row and its stored values (written to the audit log first).", "The next request that carries it adds it again, counted from one."]) }}
     </details>
+    {% endif %}
+  </section>
+</div>
+{% elif part == "agent" %}
+{% set d = drawer %}
+{% set a = d.agent %}
+<div class="fp-drawer stack" data-fp-agent>
+  <dl class="kv fp-drawer__facts">
+    <dt>User-Agent</dt><dd>{{ caller_text(a.user_agent, 400, block=True) }}</dd>
+    <dt>Requests that sent it</dt><dd>{{ num(a.count) }}</dd>
+    <dt>First seen</dt><dd>{{ when(d.first) }}</dd>
+    <dt>Last seen</dt><dd>{{ when(d.last) }}</dd>
+  </dl>
+  <section class="fp-drawer__section" aria-labelledby="fp-agent-last-title">
+    <h3 class="fp-drawer__heading" id="fp-agent-last-title">Its newest recorded request</h3>
+    {% if a.has_detail %}
+    <dl class="kv fp-drawer__facts" data-fp-agent-detail>
+      <dt>When</dt><dd>{{ when(d.detail_at) }}</dd>
+      <dt>Path</dt><dd>{% if a.last_path %}{{ caller_text(a.last_path, 300, block=True) }}{% else %}<span class="muted">not recorded</span>{% endif %}</dd>
+      <dt>From</dt><dd>{% if a.last_caller %}<code>{{ a.last_caller }}</code>{% else %}<span class="muted">not recorded</span>{% endif %}</dd>
+      <dt>Header names sent</dt><dd>{% if a.last_header_names %}<ol class="fp-header-names">{% for name in a.last_header_names %}<li><code>{{ caller_text(name, 120) }}</code></li>{% endfor %}</ol>{% else %}<span class="muted">none</span>{% endif %}</dd>
+    </dl>
+    <p class="muted">Header names only, in the order sent: their values are never kept here. The address is hashed in exports unless the export privacy setting allows addresses.</p>
+    {% set live = local_href(d.live_href) %}{% if live %}<p><a class="btn btn--sm btn--ghost" href="{{ live }}" data-action="agent-live">{{ icon("live") }}<span>Its address in Live</span></a></p>{% endif %}
+    {% else %}
+    <p class="muted">No request detail was recorded for this User-Agent yet: Roxy keeps the path, address and header names of its newest request from the next request it sends (rows from before the upgrade, or imported from v1, have only their counts).</p>
     {% endif %}
   </section>
 </div>

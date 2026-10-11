@@ -10,7 +10,10 @@ What this is
       * `kpis`: the plan 14.1 tiles (v1's eleven Overview tiles plus the plan 11.6 ones) with sparklines and the
         change against the comparison period; a tile whose data a reset touched shows its notice instead of a delta
         (plan 6.8).
-      * `visitors`: human, crawler and unknown visitors, home and admin page visits, robots.txt and sitemap crawls.
+      * `visitors`: human, crawler and unknown visitors, home and admin page visits, robots.txt and sitemap crawls,
+        with v1's "Clear data" of the Overview as an inline reset of the `visits` family (plan 6.8): its Reset
+        button opens the Data API's own preview in the drawer (`GET /admin/overview/reset`, the shared inline
+        reset of `resets.py`) and posts the previewed scope to `POST /admin/api/v1/data/resets`.
       * `traffic`: caller requests against the calls Roxy made to Roblox, as a chart of the API series.
       * `outcomes`, `top-endpoints`, `top-places`: how requests ended and the busiest endpoint templates and
         experiences of the range (one read for the three cards).
@@ -42,7 +45,7 @@ import asyncio
 import json
 import logging
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Final
 from urllib.parse import quote, urlencode
@@ -50,7 +53,9 @@ from urllib.parse import quote, urlencode
 from roxy.admin.api import overview as overview_api
 from roxy.admin.pages import fmt
 from roxy.admin.pages.kit import Page, PageView, table_query, table_view
+from roxy.admin.pages.resets import InlineReset, add_reset_route, reset_href
 from roxy.admin.pages.shell import COMPARE_LABELS
+from roxy.metrics.catalog import METRICS
 from roxy.storage.db import SharedStateUnavailable
 
 log = logging.getLogger("roxy.admin.pages")
@@ -92,6 +97,16 @@ VISITOR_LINKS: Final[dict[str, str]] = {
     "sitemap_crawls": "/admin/security#crawls",
 }
 
+VISITS_RESET: Final = InlineReset(
+    "visits",
+    "Reset the visit counts",
+    "Deletes the recorded visits behind the Visitors card: human, crawler and unknown visitors, home and admin page "
+    "visits, robots.txt and sitemap fetches (v1's Clear data on the Overview). Requests, refusals and every other "
+    "number stay; the Security page's crawl log has its own reset.",
+    {"scope": "family", "families": ["visits"]},
+)
+"""The plan 6.8 `visits` family, whose card is `overview#visitors` (`admin/api/data.py FAMILIES`)."""
+
 SEVERITY_TONES: Final[dict[str, str]] = {
     "critical": "bad",
     "error": "bad",
@@ -100,6 +115,15 @@ SEVERITY_TONES: Final[dict[str, str]] = {
     "info": "info",
 }
 """Event and recommendation severities as tones (the severity word is always shown beside the tone)."""
+
+SEVERITY_WORDS: Final[dict[str, str]] = {
+    "critical": "Critical",
+    "error": "Error",
+    "warn": "Warning",
+    "warning": "Warning",
+    "info": "Info",
+}
+"""Event severities in words: producers write `warn` or `warning`, the table says "Warning" for both."""
 
 PROXY_STATES: Final[dict[str, tuple[str, str]]] = {
     "running": ("ok", "Running"),
@@ -157,7 +181,7 @@ def _seconds_text(value: Any) -> str:
     """`42 s`, `3 min 5 s`, `2 h 10 min` (a remaining time)."""
     if not isinstance(value, int | float) or value <= 0:
         return "0 s"
-    total = int(round(value))
+    total = round(value)
     if total < 60:
         return f"{total} s"
     if total < 3600:
@@ -238,7 +262,14 @@ def status_items(status: Mapping[str, Any], view: PageView) -> list[dict[str, An
         if not rotator.get("configured"):
             detail = "No rotator URL is configured; every call goes direct."
     items.append(
-        {"key": "rotator", "label": "Rotator", "tone": tone, "state": words, "detail": detail, "href": "/admin/egress#rotator"}
+        {
+            "key": "rotator",
+            "label": "Rotator",
+            "tone": tone,
+            "state": words,
+            "detail": detail,
+            "href": "/admin/egress#rotator",
+        }
     )
 
     lead = status.get("leader") or {}
@@ -252,7 +283,14 @@ def status_items(status: Mapping[str, Any], view: PageView) -> list[dict[str, An
         tone, words = "warn", "No leader"
         detail = "Scheduled jobs wait until a worker takes the lease (within about 15 s)."
     items.append(
-        {"key": "leader", "label": "Leader", "tone": tone, "state": words, "detail": detail, "href": "/admin/system#leader"}
+        {
+            "key": "leader",
+            "label": "Leader",
+            "tone": tone,
+            "state": words,
+            "detail": detail,
+            "href": "/admin/system#leader",
+        }
     )
 
     workers = status.get("workers") or {}
@@ -367,7 +405,14 @@ async def visitors_card(view: PageView) -> dict[str, Any]:
         display_tile(tile, _href(VISITOR_LINKS[tile["key"]], view) if tile["key"] in VISITOR_LINKS else None)
         for tile in answer["tiles"]
     ]
-    return {"tiles": tiles, "compare_label": compare_label((answer.get("compare") or {}).get("mode"))}
+    return {
+        "tiles": tiles,
+        "compare_label": compare_label((answer.get("compare") or {}).get("mode")),
+        "reset_href": reset_href(page.id),
+    }
+
+
+add_reset_route(page, lambda view: VISITS_RESET)
 
 
 # ============================================================================================ chart
@@ -413,8 +458,15 @@ def endpoint_href(template: Any) -> str:
 async def top_endpoints_card(view: PageView) -> dict[str, Any]:
     """The busiest endpoint templates of the range (caller-built text: shown as text)."""
     data = await _breakdown(view)
-    rows = [{**row, "href": endpoint_href(row.get("key"))} for row in data["top_endpoints"]]
-    return {"rows": rows, "all_href": _href("/admin/endpoints#table", view)}
+    rows = [
+        {**row, "href": endpoint_href(row.get("key")), "avoided": fmt.avoided_cell(row.get("avoided_pct"))}
+        for row in data["top_endpoints"]
+    ]
+    return {
+        "rows": rows,
+        "all_href": _href("/admin/endpoints#table", view),
+        "avoided_help": METRICS["avoided_pct"].description,
+    }
 
 
 @page.card("top-places")
@@ -427,13 +479,24 @@ async def top_places_card(view: PageView) -> dict[str, Any]:
 # ============================================================================================ events
 
 
+def _detail_value(value: Any) -> str:
+    """One detail value as text: a string as it is, anything else (numbers, flags, nested values) as compact JSON."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _detail_text(detail: Any) -> str | None:
+    """An event's detail as a reader sees it: `key: value` pairs in key order (no JSON braces and quotes)."""
     if detail in (None, {}, []):
         return None
-    try:
-        return json.dumps(detail, sort_keys=True, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        return str(detail)
+    if isinstance(detail, Mapping):
+        pairs = sorted(detail.items(), key=lambda pair: str(pair[0]))
+        return "; ".join(f"{key}: {_detail_value(value)}" for key, value in pairs)
+    return _detail_value(detail)
 
 
 @page.card("events")
@@ -449,7 +512,9 @@ async def events_card(view: PageView) -> dict[str, Any]:
         return {
             "at_ms": view.time_cell(at_ms / 1000) if isinstance(at_ms, int | float) else None,
             "type": {"text": item.get("type"), "mono": True},
-            "severity": {"text": severity, "tone": SEVERITY_TONES.get(severity, "muted")} if severity else None,
+            "severity": {"text": SEVERITY_WORDS.get(severity, severity), "tone": SEVERITY_TONES.get(severity, "muted")}
+            if severity
+            else None,
             "reason": {"text": item.get("reason"), "mono": True} if item.get("reason") else None,
             "detail": {"text": detail, "caller": True, "limit": MAX_DETAIL_CHARS} if detail else None,
         }
@@ -486,4 +551,4 @@ async def events_card(view: PageView) -> dict[str, Any]:
     return {"table": table, "total": int(answer.get("total") or 0)}
 
 
-__all__ = ["compare_label", "display_tile", "page", "router", "status_items"]
+__all__ = ["VISITS_RESET", "compare_label", "display_tile", "page", "router", "status_items"]

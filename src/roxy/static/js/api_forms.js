@@ -29,7 +29,7 @@
  *   templates/components/dialog.html (`confirm_dialog(..., api=True)`), static/js/reauth.js, static/js/net.js.
  */
 
-import { el, qs, qsa } from "roxy/dom";
+import { el, qs, qsa, reloadPage } from "roxy/dom";
 import { closeDialog } from "roxy/dialog";
 import { errorMessage, isReauthRequired, request } from "roxy/net";
 import { confirmIdentity } from "roxy/reauth";
@@ -135,7 +135,7 @@ function afterSuccess(form, answer) {
   toast(message, { tone: "ok" });
   const then = form.dataset.onSuccess || "";
   if (then === "reload") {
-    window.setTimeout(() => window.location.reload(), 300);
+    reloadPage({ delayMs: 300 });
   } else if (then === "refresh") {
     const names = (form.dataset.refresh || "").split(/\s+/).filter(Boolean);
     document.dispatchEvent(new CustomEvent("roxy:refresh-cards", { detail: { cards: names, from: form } }));

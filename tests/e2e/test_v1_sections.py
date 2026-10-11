@@ -9,9 +9,9 @@ What this is
     inline settings, `[data-action=...]` buttons, `[data-chart]` charts. No page may log a console error, a page
     error or a CSP violation on the way.
 
-    A check on a page nobody has built yet (`registry.is_built` is False: no `roxy/admin/pages/<page>.py`) is not
-    run. When a row still has such checks the test is SKIPPED with the reason "page not built: <pages>" after the
-    checks on built pages have passed, so a row passes only when every page it names is built and right.
+    Every page is built since the P11 integration, so a check on a page without its module (`registry.is_built`
+    False: no `roxy/admin/pages/<page>.py`) FAILS the row with "page not built: <pages>" (it used to skip while the
+    builders worked): a row passes only when every page it names is built and right, and no row is ever skipped.
 
 Why it exists
     v2 is a remake: nothing v1 showed may silently disappear (plan 14.1, AGENT_BRIEF parity). The map is the
@@ -30,9 +30,9 @@ from typing import Any
 
 import pytest
 
+from pages_harness import parse_html
 from roxy.admin.pages import registry
 from roxy.admin.pages.registry import SHELL_PAGE, V1_SECTIONS, V1Check, V1Section
-from roxy.admin.pages.testing import parse_html
 
 
 def _shell_page() -> str | None:
@@ -54,7 +54,9 @@ def _check_in_browser(admin: Any, row: V1Section, check: V1Check, root: str) -> 
     where = f"{check.page if check.page != SHELL_PAGE else 'the shell'} {root}"
     assert page.locator(root).count() >= 1, f"row {row.row} ({row.v1}): {where} is missing"
     if check.page != SHELL_PAGE:
-        page.locator(root).first.scroll_into_view_if_needed()
+        # In one step in the page: a card that follows the stream (`kpi` every 2 s) may be swapped for its refresh
+        # between a locator's lookup and its scroll, which Playwright reports as "not attached to the DOM".
+        page.evaluate("(root) => { const card = document.querySelector(root); if (card) card.scrollIntoView(); }", root)
         admin.settle()
     for selector in check.selectors:
         found = page.locator(f"{root} {selector}").count()
@@ -90,7 +92,8 @@ def check_row(row: V1Section, open_admin: Callable[..., Any], dashboard: Any) ->
         admin.assert_clean()
     if pending:
         passed = f"; the {ran} checks on built pages passed" if ran else ""
-        pytest.skip(f"page not built: {', '.join(dict.fromkeys(pending))}{passed}")
+        pytest.fail(f"page not built: {', '.join(dict.fromkeys(pending))}{passed}")
+    assert ran, f"row {row.row} ({row.v1}) checked nothing"
 
 
 def _make_test(row: V1Section) -> Callable[..., None]:

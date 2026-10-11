@@ -8,8 +8,10 @@ What this is
       the client tables (`rollups.compact_all`).
     - `metrics_live_prune` (every minute): delete `live` event rows older than 15 minutes.
     - `metrics_security_caps` (every minute): keep each security event type within its `max_*_records` cap.
-    - `fingerprint_auto_ignore` (every 5 minutes): add headers whose values are unique per request to the
-      ignored value headers list and delete their stored values (central decision, fixes v1 bug B22).
+    - `fingerprint_auto_ignore` (every 5 minutes): delete any stored value of a header that carries client
+      addresses (`fingerprints.clear_address_values`: a previous release kept them hashed), then add headers whose
+      values are unique per request to the ignored value headers list and delete their stored values (central
+      decision, fixes v1 bug B22).
     `rules_ignore_header(...)` builds the default callback that writes the ignore entry through the audited
     rules service.
     `register_producer_jobs(registry, dbs, setting, state_dir=...)` adds the jobs of the producer history
@@ -126,6 +128,11 @@ def register_metrics_jobs(
         return result
 
     async def auto_ignore_job(ctx: JobContext) -> list[str]:
+        # Values of headers that carry client addresses are never kept (`fingerprints.ADDRESS_HEADERS`): delete any
+        # a previous release stored, or an older color wrote during a deploy, whatever the auto-ignore setting says.
+        removed = int(await ctx.fenced_write(metrics, fingerprints.clear_address_values))
+        if removed:
+            log.info("fingerprint_address_values_cleared", extra={"fields": {"values": removed}})
         if ignore_header is None or not bool(int(_live(setting, "auto_ignore_high_cardinality", 1))):
             return []
         cap = int(_live(setting, "max_header_value_records", 500))
@@ -177,7 +184,7 @@ def register_metrics_jobs(
             AUTO_IGNORE_INTERVAL_S,
             auto_ignore_job,
             run_at_start=False,
-            description="Stop listing header values that are unique per request (row 79, auto-ignore).",
+            description="Delete client address header values; stop listing values unique per request (row 79).",
         )
     )
 

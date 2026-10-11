@@ -23,8 +23,8 @@ from typing import Any
 
 import pytest
 
+from pages_harness import HOSTILE, parse_html
 from roxy.admin.pages import overview, registry
-from roxy.admin.pages.testing import HOSTILE, parse_html
 from roxy.core.style_guard import find_style_issues
 from roxy.metrics.annotate import insert_annotation
 
@@ -82,6 +82,8 @@ async def test_every_registry_card_and_the_v1_tiles_are_on_the_page(page: Any, p
     button = doc.select_one('.page-header__actions form[data-health-start] [data-action="overview-health-run"]')
     assert button is not None
     assert doc.select_one("form[data-health-start]").get("data-run-url") == "/admin/api/v1/health/runs"
+    # v1's Overview "Export CSV" went to the Data page's exports (plan 14.1 map row 37).
+    assert doc.select_one('.page-header__actions [data-action="overview-export"]').get("href") == "/admin/data#exports"
     assert doc.select_one('link[href*="css/pages/overview"]') is not None
     assert doc.select_one('script[type="module"][src*="js/pages/overview"]') is not None
     assert len(doc.select("h1")) == 1
@@ -222,6 +224,7 @@ async def test_top_recommendations_open_their_drawer_on_the_recommendations_page
     "params",
     [
         {"range": "forever"},
+        {"range": "live"},
         {"range": "custom", "from": "yesterday"},
         {"range": "all"},
         {"range": "7d", "compare": "year"},
@@ -256,9 +259,53 @@ async def test_an_empty_database_explains_every_card(page: Any) -> None:
         assert doc.select_one(f'[data-kpi="{key}"]') is not None, key
 
 
+async def test_the_visits_reset_previews_then_resets_through_the_data_api(page: Any, pages_app: Any, anon: Any) -> None:
+    await pages_app.seed_all()
+    # One home page visit in a minute that has closed (visits are counted per closed minute), written now.
+    now_ms = int(pages_app.clock.now() * 1000)
+    pages_app.ctx.recorder.record_visit("home", "Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0", at_ms=now_ms - 120_000)
+    await pages_app.ctx.recorder.flush()
+    before = (await page.api("GET", "overview/visitors", params={"range": "1h"})).json()
+    assert {t["key"]: t["value"] for t in before["tiles"]}["home_visits"] >= 1
+    assert (await anon.get(f"{PAGE}/reset")).status_code == 302
+    card = await page.doc(f"{PAGE}/fragment/visitors")
+    button = card.select_one('[data-action="visits-reset"]')
+    assert button is not None
+    assert button.get("data-drawer-src") == f"{PAGE}/reset"
+    drawer = await page.get(f"{PAGE}/reset")
+    assert drawer.status_code == 200
+    assert find_style_issues(drawer.text, "visits reset") == []
+    doc = parse_html(drawer.text)
+    assert doc.select_one('[data-reset="visits"]') is not None
+    form = doc.select_one("form[data-api-form]")
+    assert form is not None, doc.text()[:500]
+    assert form.get("data-api-url") == "/admin/api/v1/data/resets"
+    fields = {node.get("name"): node.get("value") for node in form.select("input[type=hidden]")}
+    assert fields["scope"] == "family"
+    assert fields["families"] == "visits"
+    assert len(fields["preview"]) == 64
+    assert doc.select_one('input[name="confirm"]') is not None  # a whole family: type the phrase
+    body = {"scope": "family", "families": ["visits"], "preview": fields["preview"], "reason": "page test"}
+    refused = await page.api("POST", "data/resets", json={**body, "confirm": "reset visits"}, csrf=False)
+    assert refused.status_code == 403
+    unconfirmed = await page.api("POST", "data/resets", json=body)
+    assert unconfirmed.status_code == 422
+    assert unconfirmed.json()["error"]["code"] == "confirmation_required"
+    done = await page.api("POST", "data/resets", json={**body, "confirm": "reset visits"})
+    assert done.status_code in (200, 202), done.text
+    for _ in range(50):
+        visitors = (await page.api("GET", "overview/visitors", params={"range": "1h"})).json()
+        if all(tile["value"] == 0 for tile in visitors["tiles"]):
+            break
+        await pages_app.flush()
+    assert all(tile["value"] == 0 for tile in visitors["tiles"]), visitors["tiles"]
+
+
 async def test_the_health_button_posts_to_the_health_api_with_csrf(page: Any, pages_app: Any) -> None:
     await pages_app.settings(health_auto_interval_h=0)
-    refused = await page.api("POST", "health/runs", json={"checks": ["H-DISK"], "include_credential": False}, csrf=False)
+    refused = await page.api(
+        "POST", "health/runs", json={"checks": ["H-DISK"], "include_credential": False}, csrf=False
+    )
     assert refused.status_code == 403
     started = await page.api("POST", "health/runs", json={"checks": ["H-DISK"], "include_credential": False})
     assert started.status_code == 202, started.text

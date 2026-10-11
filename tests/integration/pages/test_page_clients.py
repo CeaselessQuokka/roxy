@@ -23,8 +23,8 @@ from typing import Any
 
 import pytest
 
+from pages_harness import HOSTILE, PLACES, parse_html
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import HOSTILE, PLACES, parse_html
 from roxy.core.style_guard import find_style_issues
 
 PAGE = "/admin/clients"
@@ -127,6 +127,9 @@ async def test_the_client_view_shows_the_api_numbers_and_its_actions(page: Any, 
     assert reset.select_one('input[name="client"]').get("value") == IP
     assert view.select_one("[data-chart][data-series]") is not None
     assert "Recent probes" in view.text()
+    # v1's "Filter feed": the Live tail filtered to this client.
+    assert view.select_one('[data-action="client-live"]').get("href") == f"/admin/live?client={IP}"
+    assert api["bot_score"]["recorded_basis"] in view.text()
     place = parse_html((await page.get(f"{PAGE}/client", params={"kind": "place", "key": PLACES[0]})).text)
     assert place.select_one(f'form[data-api-url="/admin/api/v1/clients/places/{PLACES[0]}/lookup"]') is not None
     rule = place.select_one("dialog#dlg-client-rule form[data-api-form]")
@@ -146,6 +149,9 @@ async def test_actions_need_csrf_and_a_ban_shows_in_the_view_and_the_table(page:
     assert "Banned until" in view.text
     table = parse_html((await page.fragment("clients", "ips", q=IP)).text)
     assert table.select_one('td[data-col="banned"]').text() == "banned"
+    # The Banned column is hidden by default; the address says it in words (color is never the only signal).
+    assert table.select_one('td[data-col="banned"]').get("hidden") is not None
+    assert "banned" in table.select_one('td[data-col="key"]').text()
     bypass = await page.api("POST", f"clients/ips/{IP}/bypass", json={"expires_in_h": 1})
     assert bypass.status_code == 200, bypass.text
     view = await page.get(f"{PAGE}/client", params={"kind": "ip", "key": IP})
@@ -171,6 +177,34 @@ async def test_clear_activity_is_a_previewed_family_reset(page: Any, pages_app: 
     assert (await page.api("POST", "data/resets/preview", json=body)).json()["preview"] == client_digest
     run = await page.api("POST", "data/resets", json={**body, "preview": client_digest, "reason": "test"})
     assert run.status_code in (200, 202), run.text
+
+
+async def test_a_table_request_answers_the_table_alone_and_a_refresh_keeps_the_view(page: Any, pages_app: Any) -> None:
+    await pages_app.seed_traffic()
+    for card, table in (("places", "client-places"), ("ips", "client-ips")):
+        alone = await page.get(f"{PAGE}/fragment/{card}", params={"q": "2"}, htmx=True, headers={"HX-Target": table})
+        assert alone.status_code == 200, card
+        doc = parse_html(alone.text)
+        assert doc.select_one("section[data-card]") is None, card
+        assert doc.select_one(f"div#{table}[data-dt]") is not None, card
+        assert find_style_issues(alone.text, f"clients {card} table") == []
+        whole = await page.doc(f"{PAGE}/fragment/{card}", params={"q": "2"}, htmx=True)
+        assert whole.select_one(f"section#{card}[data-card] div#{table}[data-dt]") is not None, card
+    params = {"q": PLACES[0], "sort": "last_seen", "order": "asc"}
+    src = (await page.doc(f"{PAGE}/fragment/places", params=params)).select_one("section#places").get("data-card-src")
+    assert src.startswith("/admin/clients/fragment/places?")
+    assert f"q={PLACES[0]}" in src
+    assert "sort=last_seen" in src
+
+
+async def test_no_client_action_needs_a_fresh_second_factor(page: Any, pages_app: Any) -> None:
+    # Ban, bypass, rule and the client reset are guarded by the session and CSRF only (plan 9.6); a stale factor
+    # never blocks them. The lookup spends upstream budget at admin priority, never the credential.
+    await pages_app.seed_traffic()
+    page.make_mfa_stale()
+    for action, body in (("bypass", {"expires_in_h": 1}), ("rule", {"expires_in_h": 1}), ("ban", {"minutes": 5})):
+        done = await page.api("POST", f"clients/ips/203.0.113.51/{action}", json={**body, "reason": "test"})
+        assert done.status_code == 200, (action, done.text)
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,8 @@
   `?change=<id>` in the drawer: before and after, who and why, and the revert form, which posts to
   `POST /admin/api/v1/settings/history/{id}/revert` (static/js/api_forms.js: CSRF, "Confirm it is you" for a setting
   that needs a fresh second factor, the high-risk confirmation on a 422) and is itself audited.
+  The history of one setting is in the editor's one-setting view (`?key=`, templates/admin/pages/settings/editor.html)
+  and in the Audit page (each control's History link); this table is the global one.
   Context: `frame`, then either `table`, `table_only`, `total`, `whole`, `range_description`, or the drawer's
   `change`, `spec`, `when`, `before`, `after`, `before_default`, `after_default`, `revert_url`, `arming`,
   `needs_fresh_mfa`, `high_risk`, `max_value_chars`, `history_url`.

@@ -30,6 +30,5 @@
 </div>
 {{ series_chart("chart-egress-share", "Upstream calls per egress", series=share, kind="area", stack="egress", y_format="count",
                 summary="Calls to Roblox per egress path and time bucket, stacked.", size="sm",
-                help="Calls Roxy made to Roblox through each egress, Roxy's own calls included, per time bucket.",
-                empty_text="No call went to Roblox in this range.") }}
+                help=share_help, empty_text="No call went to Roblox in this range.") }}
 {% endcall %}

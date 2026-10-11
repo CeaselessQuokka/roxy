@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.pages.testing import HOSTILE, PLACES, THEMES, VIEWPORTS
+from pages_harness import HOSTILE, PLACES, THEMES, VIEWPORTS
 
 PAGE = "/admin/clients"
 NO_HOSTILE_MARKUP = """() => !document.querySelector('img[src="x"], [onerror], [onclick], a[href^="javascript:"]')
@@ -65,13 +65,25 @@ def test_the_places_search_swaps_in_place_and_keeps_the_address(open_admin: Any)
     admin.assert_clean()
 
 
-@pytest.mark.parametrize("theme,size", [("light", "desktop"), ("dark", "phone")])
+def test_a_deep_link_opens_the_address_table_on_its_search(open_admin: Any) -> None:
+    # `?ip=` (for links from other pages): the lazy address table loads, then searches for the address in place.
+    admin = open_admin(f"{PAGE}?ip=203.0.113.53")
+    page = admin.page
+    admin.wait("document.querySelectorAll('#ips tbody tr[data-row-id]').length === 1")
+    assert "203.0.113.53" in page.locator("#ips tbody tr[data-row-id]").first.inner_text()
+    assert page.locator('#ips input[name="q"]').input_value() == "203.0.113.53"
+    assert "q=203.0.113.53" in page.evaluate("document.getElementById('ips').dataset.cardSrc")
+    assert page.locator("#ips section[data-card]").count() == 0, "the table swap nested a card"
+    admin.assert_clean()
+
+
+@pytest.mark.parametrize(("theme", "size"), [("light", "desktop"), ("dark", "phone")])
 def test_a_row_opens_the_client_in_the_drawer(open_admin: Any, theme: str, size: str) -> None:
     width, height = VIEWPORTS[size]
     admin = open_admin(PAGE, theme=theme, width=width, height=height)
     page = admin.page
     page.locator("#ips").scroll_into_view_if_needed()
-    row = page.locator('#ips tbody tr[data-row-id]').first
+    row = page.locator("#ips tbody tr[data-row-id]").first
     row.locator("[data-dt-open]").click()
     admin.wait("document.querySelector('#drawer[open] [data-client-view]') !== null")
     drawer = page.locator("#drawer")
@@ -140,3 +152,28 @@ def test_the_client_has_a_page_of_its_own(open_admin: Any) -> None:
     assert admin.axe() == []
     admin.shot("clients-page")
     admin.assert_clean()
+
+
+def test_an_inline_bot_setting_reviews_and_saves(open_admin: Any, dashboard: Any) -> None:
+    key = "bot_weight_timing"
+    before = dashboard.api("GET", f"settings/{key}").json()["setting"]["value"]
+    wanted = 12 if before != 12 else 11
+    try:
+        admin = open_admin(f"{PAGE}#client-score")
+        page = admin.page
+        page.locator("#client-score-settings").evaluate("(details) => { details.open = true; }")
+        control = page.locator(f'#client-score form[data-setting-key="{key}"]')
+        control.scroll_into_view_if_needed()
+        control.locator("[data-setting-input]").fill(str(wanted))
+        control.locator('input[name="reason"]').fill("Browser test of the bot score card")
+        control.locator('button[type="submit"]').click()
+        admin.wait(
+            "(() => { const r = document.querySelector("
+            f"'#client-score [data-setting-key=\"{key}\"] [data-setting-review]'); return r && !r.hidden; }})()"
+        )
+        control.locator('button[type="submit"]').click()
+        admin.wait("document.querySelector('#client-score .setting__saved') !== null")
+        assert dashboard.api("GET", f"settings/{key}").json()["setting"]["value"] == wanted
+        admin.assert_clean()
+    finally:
+        dashboard.change_settings({key: before})

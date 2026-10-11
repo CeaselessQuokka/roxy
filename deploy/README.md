@@ -195,10 +195,19 @@ be installed at once. Things to know:
 ## Memory and swap on the 909 MB server
 
 The server has 909 MB of RAM and no swap. DESIGN.md section 0 sizes everything to fit without swap: each color is
-capped at `MemoryHigh=350M` and `MemoryMax=450M` (raised from 320M and 420M after the 35 minute soak of finding
-LOAD-2 measured 332 MiB of PSS for a color, docs/PERFORMANCE.md), two workers per color, glibc's allocator tuned in
-`roxy@.service` (`MALLOC_ARENA_MAX=2`, fixed mmap and trim thresholds of 128 KiB), and low-memory mode during a
-deploy. Adding a small swap file is still recommended as a safety net, not as capacity:
+capped at `MemoryHigh=420M` and `MemoryMax=500M` (raised from 320M and 420M by finding LOAD-2: a color whose workers
+recycle every 20,000 requests settles at 365 to 405 MiB of PSS, docs/PERFORMANCE.md "Memory per color"), two
+workers per color, glibc's allocator tuned in `roxy@.service` (`MALLOC_ARENA_MAX=2`, fixed mmap and trim thresholds
+of 128 KiB), and low-memory mode during a deploy.
+
+**Never run two warm colors at once.** One color at its hard limit plus a color that just started plus nginx and the
+OS fit in 909 MB; two colors that have both served traffic for a while do not (about 2 x 405 MiB plus 200 MB). The
+deploy and the rollback only ever start the idle color fresh and stop the old one after the watch; do not
+`systemctl start` the idle color by hand while the active one serves. On this server the deploy runs in low-memory
+mode (the new color starts with one worker) whenever a warm color is active, because less than 700 MB is then
+available; that is expected, not a warning sign.
+
+Adding a small swap file is still recommended as a safety net, not as capacity:
 
 ```
 sudo fallocate -l 1G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
@@ -206,7 +215,7 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/90-roxy-swap.conf && sudo sysctl --system
 ```
 
-Why: without swap, a short spike (both colors at their soft limit during a deploy, plus certbot or apt) goes straight
+Why: without swap, a short spike (a warm color at its hard limit during a deploy, plus certbot or apt) goes straight
 to the kernel's OOM killer, which may pick nginx. With a low swappiness the kernel only swaps under real pressure,
 and `MemoryMax` still bounds each color's RAM (cgroup memory limits do not count swap), so a runaway color is
 throttled and swapped, then restarted by systemd, instead of taking the box down. Watch `free -m` on the System page;

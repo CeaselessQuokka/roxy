@@ -114,6 +114,21 @@ def unit_environment(tree: Path) -> dict[str, str]:
     return found
 
 
+def unit_memory_limits(tree: Path) -> dict[str, str]:
+    """`{"MemoryHigh": ..., "MemoryMax": ...}` from a tree's `roxy@.service` (what the color is held to), so the
+    memory rows of a table name the limits of the code they measured. Missing lines or file: missing keys."""
+    try:
+        text = (tree / UNIT_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    found: dict[str, str] = {}
+    for raw in text.splitlines():
+        key, sep, value = raw.strip().partition("=")
+        if sep and key in ("MemoryHigh", "MemoryMax"):
+            found[key] = value.strip()
+    return found
+
+
 def base_env(
     work: Path,
     credentials: Path,
@@ -549,6 +564,7 @@ def _pipeline_sample(body: Mapping[str, Any]) -> dict[str, Any]:
         "flushes": batch.get("flushes"),
         "last_flush_ms": batch.get("last_flush_ms"),
         "metrics_dropped": recorder.get("metrics_dropped"),
+        "metrics_queued": batch.get("queued"),  # items waiting for the next metrics.db write (LOAD-2)
         "hot_last_write_ms": (dbs.get("hot") or {}).get("last_write_ms"),
         "hot_max_write_ms": (dbs.get("hot") or {}).get("max_write_ms"),
         "hot_writes": (dbs.get("hot") or {}).get("writes"),
@@ -671,6 +687,7 @@ __all__ = [
     "roblox_429_rows",
     "roxy_totals",
     "unit_environment",
+    "unit_memory_limits",
     "upstream_limits",
     "worker_history",
     "write_rates",

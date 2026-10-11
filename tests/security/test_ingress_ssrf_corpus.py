@@ -76,7 +76,7 @@ EXPANDED: list[tuple[str, bytes, bytes, ReasonCode]] = [
     ("dotted_capital_i", "/İnventory.roblox.com/x".encode(), b"", NR),
     ("kelvin_sign", "/Katalog.roblox.com/x".encode(), b"", NR),
     ("long_s", "/ſearch.roblox.com/x".encode(), b"", NR),
-    ("right_to_left_override", "/games.roblox.com‮/x".encode(), b"", NR),
+    ("right_to_left_override", "/games.roblox.com\u202e/x".encode(), b"", NR),
     ("combining_dot", "/games.roblox.cȯm/x".encode(), b"", NR),
     ("invalid_utf8_host", b"/games.roblox.com\xff/x", b"", NR),
     # --- IP literals -------------------------------------------------------------------------------------------------

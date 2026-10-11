@@ -9,6 +9,7 @@
   in the form; the 403 second factor and the audit log are the API's.
   Context: `frame`, `ladder` (`ladder_view`), `rungs`, `timeline`, `max_rungs`, `max_multiplier`,
   `window_words`, `decay_words`, `api`.
+  Context also has `clear` (`protection.py clear_action`): v1's clear button of this section, a plan 6.8 data reset.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/dialog.html" import confirm_dialog %}
@@ -16,30 +17,31 @@
 {% from "components/badges.html" import badge, status_badge %}
 {% from "components/format.html" import num %}
 {% from "components/glossary.html" import term with context %}
-{% from "admin/pages/protection/_macros.html" import reason_field %}
+{% from "admin/pages/protection/_macros.html" import reason_field, clear_button, clear_dialog %}
 
 {% macro rung_row(index, rung) -%}
 <tr data-ladder-row>
   <th scope="row" class="prot-ladder__rung"><span data-rung-label>Rung {{ index }}</span>{% if rung and rung.hits is not none %}<span class="dt__sub">{{ num(rung.hits) }} new strikes in range</span>{% endif %}</th>
-  <td><label class="sr-only" for="ladder-multiplier-{{ index }}" data-rung-for="multiplier">Rung {{ index }} multiplier</label>
+  <td><label class="prot-ladder__label" for="ladder-multiplier-{{ index }}" data-rung-for="multiplier">Rung {{ index }} multiplier</label>
     <input class="input input--num" id="ladder-multiplier-{{ index }}" data-tier="multiplier" inputmode="decimal" value="{{ rung.multiplier if rung else 1 }}" required aria-required="true"></td>
-  <td><label class="sr-only" for="ladder-action-{{ index }}" data-rung-for="action">Rung {{ index }} action</label>
+  <td><label class="prot-ladder__label" for="ladder-action-{{ index }}" data-rung-for="action">Rung {{ index }} action</label>
     <select class="input" id="ladder-action-{{ index }}" data-tier="action">
       <option value="throttle"{% if not rung or rung.action != "ban" %} selected{% endif %}>Throttle</option>
       <option value="ban"{% if rung and rung.action == "ban" %} selected{% endif %}>Ban the IP</option>
     </select></td>
-  <td><label class="sr-only" for="ladder-ban_minutes-{{ index }}" data-rung-for="ban_minutes">Rung {{ index }} ban minutes</label>
+  <td><label class="prot-ladder__label" for="ladder-ban_minutes-{{ index }}" data-rung-for="ban_minutes">Rung {{ index }} ban minutes</label>
     <input class="input input--num" id="ladder-ban_minutes-{{ index }}" data-tier="ban_minutes" inputmode="numeric" value="{{ rung.ban_minutes if rung and rung.ban_minutes else '' }}" placeholder="only for a ban"></td>
-  <td><label class="sr-only" for="ladder-message-{{ index }}" data-rung-for="message">Rung {{ index }} message shown to the caller</label>
+  <td><label class="prot-ladder__label" for="ladder-message-{{ index }}" data-rung-for="message">Rung {{ index }} message shown to the caller</label>
     <input class="input" id="ladder-message-{{ index }}" data-tier="message" maxlength="400" value="{{ rung.message if rung else '' }}"></td>
-  <td><label class="sr-only" for="ladder-note-{{ index }}" data-rung-for="note">Rung {{ index }} note</label>
+  <td><label class="prot-ladder__label" for="ladder-note-{{ index }}" data-rung-for="note">Rung {{ index }} note</label>
     <input class="input" id="ladder-note-{{ index }}" data-tier="note" maxlength="400" value="{{ rung.note if rung else '' }}"></td>
   <td><button type="button" class="icon-btn" data-ladder-remove aria-label="Remove rung {{ index }}">{{ icon("x") }}</button></td>
 </tr>
 {%- endmacro %}
 
 {% set chip = ("Escalation on: " ~ (rungs|length) ~ " rung" ~ ("s" if rungs|length != 1 else "")) if ladder.escalation_enabled else "Escalation off" %}
-{% call page_card(frame, subtitle=chip) %}
+{% set actions %}{{ clear_button(clear) }}{% endset %}
+{% call page_card(frame, actions=actions, subtitle=chip) %}
 <section class="prot-sub" aria-labelledby="ladder-sim-title">
   <h3 class="prot-sub__title" id="ladder-sim-title">What happens to a repeat offender, using your current ladder</h3>
   <ol class="prot-timeline">
@@ -77,4 +79,5 @@
                                      "The change is written to the audit log."]) %}
   {{ reason_field("dlg-prot-ladder-reset-reason") }}
 {% endcall %}
+{{ clear_dialog(clear, "ladder ua-rules pipeline") }}
 {% endcall %}

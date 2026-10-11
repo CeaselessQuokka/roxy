@@ -285,9 +285,14 @@ async def test_close_stops_threads_and_refuses_new_work(tmp_path: Path) -> None:
     _scratch(db)
     await db.write(lambda c: None)
     await db.read(lambda c: None)
-    assert any(t.name.startswith("roxy-db-hot-") for t in threading.enumerate())
+    # This database's own threads: another test of the same process may still have a hot.db open, so the check is
+    # not "no roxy-db-hot thread anywhere" (the full suite failed that way once a thread of an earlier test lingered).
+    own = list(db._threads)
+    assert own
+    assert all(t.name.startswith("roxy-db-hot-") for t in own)
     await db.close()
-    assert not any(t.name.startswith("roxy-db-hot-") and t.is_alive() for t in threading.enumerate())
+    assert not any(t.is_alive() for t in own)
+    assert db._threads == []
     with pytest.raises(SharedStateUnavailable, match="closed"):
         await db.write(lambda c: None)
     with pytest.raises(SharedStateUnavailable, match="closed"):

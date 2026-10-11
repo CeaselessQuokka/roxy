@@ -59,6 +59,7 @@ from load.fleet import (
     roblox_429_rows,
     roxy_totals,
     unit_environment,
+    unit_memory_limits,
     upstream_limits,
     worker_history,
     write_rates,
@@ -193,6 +194,7 @@ class System:
         out["workers"] = worker_history(self.env, self.wall_start)
         out["tracebacks"] = self.fleet.log_count("Traceback")
         out["unit_environment"] = unit_environment(self.fleet.tree)  # what roxy@.service sets (allocator tuning)
+        out["unit_memory"] = unit_memory_limits(self.fleet.tree)  # the color's MemoryHigh and MemoryMax
         # Signs of a saturated hot.db writer: a hot-path write whose 500 ms budget ran out in the queue.
         out["abuse_degraded"] = self.fleet.log_count('"event":"abuse_degraded"')
         out["singleflight_publish_failed"] = self.fleet.log_count('"event":"singleflight_publish_failed"')
@@ -313,6 +315,13 @@ def lock_text(row: Mapping[str, Any]) -> str:
     )
 
 
+def memory_limits_text(limits: Mapping[str, str]) -> str:
+    """The measured tree's `roxy@.service` limits, for the memory rows (`fleet.unit_memory_limits`)."""
+    if not limits:
+        return "MemoryHigh and MemoryMax of roxy@.service"
+    return ", ".join(f"{key} {limits[key]}" for key in ("MemoryHigh", "MemoryMax") if key in limits)
+
+
 def common_rows(result: dict[str, Any], opts: Options | None = None) -> list[Row]:
     memory = result["memory"]
     overrides: list[Row] = []
@@ -337,7 +346,7 @@ def common_rows(result: dict[str, Any], opts: Options | None = None) -> list[Row
         (
             "peak memory of the color",
             f"PSS {memory['color_peak_pss_mib']} MiB (RSS sum {memory['color_peak_rss_sum_mib']} MiB)",
-            "MemoryHigh 350M, MemoryMax 450M",
+            memory_limits_text(result.get("unit_memory") or {}),
         ),
         ("memory over the run", growth, "a plateau, not steady growth"),
         (
@@ -432,6 +441,7 @@ def steady(opts: Options, *, rate: float | None = None, duration_s: float = 60.0
             "p99": percentile(hot_writes, 0.99),
         },
         "metrics_dropped": max((s.get("metrics_dropped") or 0 for s in probe.samples), default=None),
+        "metrics_queued_max": max((s.get("metrics_queued") or 0 for s in probe.samples), default=None),
         "hot_pending_max": max((s.get("hot_pending") or 0 for s in probe.samples), default=None),
         "hot_writes_per_s": write_rates(probe.samples),
         "hot_lock": hot_lock_summary(probe.samples),
@@ -455,6 +465,11 @@ def steady(opts: Options, *, rate: float | None = None, duration_s: float = 60.0
             f"p50 {fmt(d['flush_ms_samples']['p50'])} / max {fmt(d['flush_ms_samples']['max'])} ms "
             f"(n={d['flush_ms_samples']['n']})",
             "under 50 ms per 2 s of traffic (6.7)",
+        ),
+        (
+            "metrics queue (sampled max)",
+            f"{fmt(d['metrics_queued_max'])} items, {fmt(d['metrics_dropped'])} dropped",
+            "items waiting for the next metrics.db write, per worker (metrics_queue_max)",
         ),
         (
             "hot.db write time (sampled)",

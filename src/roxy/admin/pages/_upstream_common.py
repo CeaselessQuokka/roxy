@@ -5,7 +5,8 @@ What this is
       * plain words for egress paths, egress states and the reasons an egress is off (`EGRESS_LABELS`,
         `egress_state`, `reason_words`), and for the precision of a "last seen" time (`precision_words`);
       * number text that the Jinja format macros do not cover (`pct_text`, `per_min_text`, `ms_text`,
-        `decimal_bytes`) and the tone of a fill level (`fill_tone`);
+        `decimal_bytes`, `plural`), a sentence's first capital (`sentence`) and the tone of a fill level
+        (`fill_tone`);
       * `quoted_key(key)`: a bucket key as ONE percent-encoded URL path segment, so a key that holds caller text (an
         endpoint template) can never add path segments to an admin API URL (`..` included);
       * `render_partial(...)`: the HTML of a small page-local route (a tester result, a drawer) with the page's
@@ -91,6 +92,18 @@ def reason_words(reason: Any) -> str:
     return REASON_WORDS.get(text, text.replace("_", " "))
 
 
+def sentence(text: Any) -> str:
+    """`text` with its first letter capitalized and the rest unchanged (`str.capitalize` would lowercase "Roblox")."""
+    value = str(text or "").strip()
+    return value[:1].upper() + value[1:]
+
+
+def plural(count: Any, one: str, many: str | None = None) -> str:
+    """`1 cooldown`, `3 cooldowns` (`many` for an irregular plural), with thousands separators."""
+    number = int(count or 0)
+    return f"{number:,} {one if number == 1 else (many or one + 's')}"
+
+
 def precision_words(precision: Any) -> str:
     return PRECISION_WORDS.get(str(precision or ""), "")
 
@@ -142,7 +155,7 @@ def fill_tone(pct: Any) -> str:
 
 
 def gauge(label: str, pct: Any, *, detail: str = "", key: str = "") -> dict[str, Any]:
-    """The context of one fill gauge (`upstream/_macros.html gauge`): a native <meter> with words beside it."""
+    """The context of one fill gauge (`components/pieces.html gauge`): a native <meter> with words beside it."""
     value = float(pct) if isinstance(pct, int | float) and not isinstance(pct, bool) else None
     shown = min(100.0, max(0.0, value)) if value is not None else 0.0
     tone = fill_tone(value)
@@ -182,22 +195,6 @@ def quoted_key(key: str) -> str:
     return quote(str(key), safe="")
 
 
-DEFERRED: Final[dict[str, Any]] = {"deferred": True}
-"""The context of a deferred card's first paint (`admin/pages/upstream/_deferred.html`)."""
-
-
-def deferred(view: PageView) -> bool:
-    """True on the page's first paint for a card that loads its body as its own fragment right after the page.
-
-    Heavy cards (many settings, tables) are not rendered into the first paint, so the page stays small on the 1 GB
-    server. They load at once (`hx-trigger="load"`), not when scrolled into view: the kit's lazy cards load on
-    `revealed`, which only fires for cards in the final scroll position, so a page with many lazy cards far apart
-    never finished loading for a reader who jumps around (and the browser test harness's settle step, which
-    scrolls every lazy card into view in one pass, never saw them all load). A card's own fragment request
-    (`/admin/<page>/fragment/<card>`) always renders the whole card."""
-    return not view.in_fragment
-
-
 PartialBuild = Callable[[PageView], Awaitable[Mapping[str, Any]]]
 
 
@@ -230,21 +227,21 @@ async def render_partial(
 
 
 __all__ = [
-    "DEFERRED",
     "EGRESS_ABOUT",
     "EGRESS_LABELS",
     "FILL_BAD_PCT",
     "FILL_WARN_PCT",
     "decimal_bytes",
-    "deferred",
     "egress_state",
     "fill_tone",
     "gauge",
     "ms_text",
     "pct_text",
     "per_min_text",
+    "plural",
     "precision_words",
     "quoted_key",
     "reason_words",
     "render_partial",
+    "sentence",
 ]

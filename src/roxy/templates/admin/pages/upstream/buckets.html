@@ -8,15 +8,14 @@
   wrapper whose `hx-select` keeps a table swap to the table itself (this card's fragment holds both tables).
   Bucket keys of endpoints are caller text.
   Context: `frame`, `gauges`, `table`, `limits_table`, `adaptive`, `changes`, `held_text`, `host_default`,
-  `endpoint_default`, `limits_url` (or `deferred` on the page's first paint).
+  `endpoint_default`, `limits_url`.
 -#}
-{% if deferred %}{% include "admin/pages/upstream/_deferred.html" %}{% else %}
 {% from "components/page_card.html" import page_card %}
 {% from "components/table.html" import data_table %}
 {% from "components/icon.html" import icon %}
 {% from "components/badges.html" import badge %}
 {% from "components/format.html" import caller_text %}
-{% from "admin/pages/upstream/_macros.html" import gauge, when %}
+{% from "components/pieces.html" import gauge, when %}
 {% call page_card(frame, subtitle="Buckets are never refilled by hand; a reset clears cooldowns and breakers only.") %}
 <div class="g3-gauges" role="group" aria-label="Fill of Roxy's own ceilings">
   {% for g in gauges %}{{ gauge(g, "gauge-bucket-" ~ loop.index) }}{% else %}<p class="muted">No bucket has been used yet.</p>{% endfor %}
@@ -29,17 +28,17 @@
   <p class="muted">After a Roblox 429 the controller lowers that endpoint's rate (and burst) below what Roblox refused; after {{ adaptive.settings.adaptive_probe_after_h }} clean hours with real demand it raises it again, a little at a time. It holds {{ held_text }} now.</p>
   {% if changes %}
   <div class="table-scroll g3-scroll" role="region" aria-labelledby="adaptive-caption" tabindex="0">
-    <table class="simple-table g3-table">
+    <table class="simple-table g3-table g3-table--wrap g3-table--stack">
       <caption id="adaptive-caption" class="sr-only">Recent rate changes of the adaptive controller</caption>
       <thead><tr><th scope="col">When</th><th scope="col">Change</th><th scope="col">Bucket</th><th scope="col">Rate</th><th scope="col">Why</th></tr></thead>
       <tbody>
         {% for c in changes %}
         <tr>
-          <td>{{ when(c.when) }}</td>
-          <td><span class="tone tone--{{ c.tone }}">{{ c.direction }}</span></td>
-          <td>{{ caller_text(c.key, 120) }}</td>
-          <td>{{ c.old }} to {{ c.new }}</td>
-          <td>{{ c.why or "n/a" }}</td>
+          <td data-label="When"><span>{{ when(c.when) }}</span></td>
+          <td data-label="Change"><span class="tone tone--{{ c.tone }}">{{ c.direction }}</span></td>
+          <td data-label="Bucket">{{ caller_text(c.key, 120) }}</td>
+          <td data-label="Rate">{{ c.old }} to {{ c.new }}</td>
+          <td data-label="Why">{{ c.why or "n/a" }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -92,4 +91,3 @@
   </details>
 </section>
 {% endcall %}
-{% endif %}

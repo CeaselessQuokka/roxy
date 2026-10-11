@@ -4,8 +4,8 @@
  * What this is
  *   `el()` builds elements without innerHTML, `icon()` builds a sprite icon, `qs()`/`qsa()` query, and `store`
  *   reads and writes this browser's remembered preferences. `initOverlayLayer()` keeps the page-wide overlays
- *   (tooltip, toasts, live regions) usable while a modal dialog is open, and `hasUnsavedChanges()` says whether
- *   leaving the page now would lose an edit.
+ *   (tooltip, toasts, live regions) usable while a modal dialog is open, `hasUnsavedChanges()` says whether
+ *   leaving the page now would lose an edit, and `reloadPage()` reloads the page once however many modules ask.
  *
  * Why it exists
  *   Building DOM with `textContent` and `setAttribute` (never innerHTML with data) is how the dashboard stays safe
@@ -190,6 +190,25 @@ export function hasUnsavedChanges(root = document) {
     }
   }
   return false;
+}
+
+// ------------------------------------------------------------------------------------------ reloading
+
+let reloadStarted = false;
+
+/** Reload the page once. One change can ask twice (an action's own reload after its API answer, and the shell's
+ *  status check when the stream reports the same change); a second `location.reload()` would abort the navigation the
+ *  first one started, so every later call is ignored. `delayMs` lets a toast be seen first. */
+export function reloadPage({ delayMs = 0 } = {}) {
+  if (reloadStarted) return;
+  reloadStarted = true;
+  if (delayMs > 0) window.setTimeout(() => window.location.reload(), delayMs);
+  else window.location.reload();
+}
+
+/** True once `reloadPage` was asked: the page is about to be replaced, so there is nothing left to check. */
+export function reloadPending() {
+  return reloadStarted;
 }
 
 /** Run `fn` at most once per animation frame (resize and scroll handlers). */

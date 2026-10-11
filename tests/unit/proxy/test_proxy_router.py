@@ -25,11 +25,31 @@ from typing import Any
 import httpx
 import pytest
 
+from roxy.core.middleware import CHUNKED_HEADER_BYTES, DATE_HEADER_BYTES
 from roxy.core.reasons import CacheState, Egress, Outcome, ReasonCode
 from roxy.proxy import respond
 from roxy.storage.db import SharedStateUnavailable
 
 GAMES = "/games.roblox.com/v1/games?universeIds=1"
+
+
+def wire_out(response: httpx.Response, *, body: int | None = None) -> int:
+    """Plan 14.3 `caller_bytes_out` of an answer as the app sent it: the status line, every header the middleware
+    stack sent (`response.headers.raw`), uvicorn's `Date` line (and `Transfer-Encoding` for a streamed body, which has
+    no `Content-Length`), the empty line and the body (gap G9: the router counted the body only before)."""
+    head = len(f"HTTP/1.1 {response.status_code} {response.reason_phrase}\r\n")
+    head += sum(len(name) + len(value) + 4 for name, value in response.headers.raw)
+    head += DATE_HEADER_BYTES + 2
+    if "content-length" not in response.headers:
+        head += CHUNKED_HEADER_BYTES
+    return head + (len(response.content) if body is None else body)
+
+
+def wire_in(request: httpx.Request, path: str) -> int:
+    """Plan 14.3 `caller_bytes_in`: the request line, the headers the client sent and the body."""
+    head = len(f"{request.method} {path} HTTP/1.1\r\n")
+    head += sum(len(name) + len(value) + 4 for name, value in request.headers.raw)
+    return head + 2 + len(request.content)
 
 
 async def test_served_flow(proxy_client: httpx.AsyncClient, ctx: Any) -> None:
@@ -62,7 +82,10 @@ async def test_served_flow(proxy_client: httpx.AsyncClient, ctx: Any) -> None:
     assert event.cache_state is CacheState.MISS
     assert event.method == "GET"
     assert event.place_id == "12345"
-    assert event.caller_bytes_out == len(b'{"data":[]}')
+    # Plan 14.3 wire bytes: status line, headers and body as sent, and the request as received.
+    assert event.caller_bytes_out == wire_out(response)
+    assert event.caller_bytes_out > len(b'{"data":[]}') + 300  # the headers count (CSP, Roxy-*, Cache-Control)
+    assert event.caller_bytes_in == wire_in(response.request, GAMES)
     assert event.endpoint_template == "games.roblox.com/v1/games"
     assert event.latency_ms >= 0
 
@@ -172,7 +195,8 @@ async def test_tarpit_drip(proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any
     assert plan.released == 1
     assert plan.waited == 0
     [event] = ctx.recorder.events
-    assert event.caller_bytes_out == len(b'"Not a Roblox URL"\n')
+    # The dripped body (its leading spaces are tarpit padding outside the record) plus the streamed head.
+    assert event.caller_bytes_out == wire_out(response, body=len(b'"Not a Roblox URL"\n'))
 
 
 async def test_bypass_is_never_held(proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any) -> None:
@@ -317,11 +341,11 @@ async def test_head_runs_as_get(proxy_client: httpx.AsyncClient, ctx: Any) -> No
     assert req.is_head is True
     [event] = ctx.recorder.events
     assert event.method == "HEAD"
-    assert event.caller_bytes_out == 0
+    assert event.caller_bytes_out == wire_out(response)  # the head only: a HEAD answer has no body
 
 
 async def test_post_body_is_read(proxy_client: httpx.AsyncClient, ctx: Any) -> None:
-    await proxy_client.post(
+    response = await proxy_client.post(
         "/users.roblox.com/v1/usernames/users",
         content=b'{"usernames":["a"]}',
         headers={"content-type": "application/json"},
@@ -332,7 +356,9 @@ async def test_post_body_is_read(proxy_client: httpx.AsyncClient, ctx: Any) -> N
     assert req.content_type == "application/json"
     # httpx sends `Accept: */*` by default, which is one of the two forwardable values.
     assert req.forwarded_headers() == {"accept": "*/*", "content-type": "application/json", "content-length": "19"}
-    assert ctx.recorder.events[0].caller_bytes_in == 19
+    # Plan 14.3 wire bytes: the request line and headers count too, not only the 19 body bytes (gap G9).
+    assert ctx.recorder.events[0].caller_bytes_in == wire_in(response.request, "/users.roblox.com/v1/usernames/users")
+    assert ctx.recorder.events[0].caller_bytes_in > 19 + 100
 
 
 async def test_unhandled_error_is_recorded_once_by_the_router(proxy_client: httpx.AsyncClient, ctx: Any) -> None:

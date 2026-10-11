@@ -160,6 +160,43 @@ def decode(blob: bytes | None) -> list[int]:
     return counts
 
 
+def add_blob_into(target: list[int], blob: bytes) -> None:
+    """`add_into(target, decode(blob))` without the intermediate list: one pass over the blob's pairs.
+
+    The read models add up to hundreds of thousands of blobs for one chart (`metrics/queries.py HIST_MEASURES`), so
+    this is the decoder's hot loop. A bucket index is below `BUCKETS` (21), so it is always one varint byte; a count
+    may take several. Same checks as `decode`: a truncated blob, a varint over 64 bits or an out of order or unknown
+    index raises ValueError, and then `target` may hold part of the blob.
+    """
+    data = blob
+    size = len(data)
+    pos = 0
+    previous = -1
+    try:
+        while pos < size:
+            index = data[pos]
+            if index <= previous or index >= BUCKETS:
+                raise ValueError("histogram blob has an out of order or unknown bucket index")
+            count = data[pos + 1]
+            pos += 2
+            if count & 0x80:
+                count &= 0x7F
+                shift = 7
+                while True:
+                    byte = data[pos]
+                    pos += 1
+                    count |= (byte & 0x7F) << shift
+                    if not byte & 0x80:
+                        break
+                    shift += 7
+                    if shift > 63:
+                        raise ValueError("histogram varint too long")
+            target[index] += count
+            previous = index
+    except IndexError:
+        raise ValueError("truncated histogram blob") from None
+
+
 def merge_blobs(a: bytes | None, b: bytes | None) -> bytes | None:
     """`encode(decode(a) + decode(b))`, the scalar SQL function `roxy_hist_merge` (NULL-safe)."""
     if not a:

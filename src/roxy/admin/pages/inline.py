@@ -11,7 +11,9 @@ Why it exists
     as the Settings page, same validation and audit", and placement is data (the `pages` field of each
     `SettingSpec`), never a second hand-written list. Every card gets its settings from here, and every control
     saves through `PUT /admin/api/v1/settings/{key}` (the settings API's validation, risk rules, fresh second factor
-    and audit), so a page route never writes a setting itself.
+    and audit), so a page route never writes a setting itself. One setting has one editor per page: where the
+    catalog anchors a key on two cards of one page, `registry.editor_anchor` picks the editing card and the other
+    card shows the value read-only with a link to it (two editors of one value could disagree until a refresh).
 
 How it works
     Values come from the worker's settings snapshot (`shown` from the settings API: a sensitive value is
@@ -91,10 +93,30 @@ def card_settings(
     tz: str,
     prefix: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Every setting the catalog places on `anchor` (`cache#settings`), in key order, as control contexts."""
-    card_id = anchor.split("#", 1)[1] if "#" in anchor else anchor
+    """Every setting the catalog places on `anchor` (`cache#settings`), in key order, as control contexts.
+
+    One setting, one editor per page (`registry.editor_anchor`): a key whose editor is on another card of the same
+    page comes back as a read-only reference instead (`read_only`, `editor_href` to that card, `editor_title`), which
+    `components/page_card.html` renders as the current value with a link to the editor.
+    """
+    page_id, _, card_id = anchor.partition("#") if "#" in anchor else ("", "", anchor)
     chosen = prefix or card_prefix(card_id)
-    return [setting_entry(spec, snapshot, latest, tz=tz, prefix=chosen) for spec in registry.settings_for(anchor)]
+    entries = []
+    for spec in registry.settings_for(anchor):
+        entry = setting_entry(spec, snapshot, latest, tz=tz, prefix=chosen)
+        home = registry.editor_anchor(spec.key, page_id) if page_id else None
+        if home is not None and home != anchor:
+            editor_card = home.partition("#")[2]
+            entry.update(read_only=True, editor_href=f"#{editor_card}", editor_title=_card_title(page_id, editor_card))
+        entries.append(entry)
+    return entries
+
+
+def _card_title(page_id: str, card_id: str) -> str:
+    try:
+        return registry.card(page_id, card_id).title
+    except (KeyError, LookupError):
+        return card_id
 
 
 def read_latest(conn: Any, keys: Iterable[str]) -> dict[str, dict[str, Any]]:

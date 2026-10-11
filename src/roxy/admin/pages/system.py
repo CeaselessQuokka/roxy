@@ -45,6 +45,7 @@ from typing import Any, Final
 from roxy.admin.api import common
 from roxy.admin.api import system as system_api
 from roxy.admin.pages.kit import Page, PageView, filter_chip, table_query, table_view
+from roxy.metrics.catalog import METRICS
 
 page = Page("system")
 router = page.router
@@ -62,6 +63,7 @@ WORKER_COLUMNS: Final = (
     "requests",
     "proxied",
     "loop_lag_ms_p99",
+    "cpu_pct",
     "open_connections",
     "inflight_upstream",
     "max_requests",
@@ -78,6 +80,8 @@ ERROR_HIDDEN: Final = ("first_seen", "module_line")
 SOURCE_TONES: Final[dict[str, str]] = {"roblox": "warn", "internal": "info"}
 """v1's source badges: Roblox warn, Internal muted (info here), anything else (Roxy's own) bad."""
 MAX_TABLE_SIZES: Final = 15
+PIPELINE_METRICS: Final = ("metrics_dropped", "capture_errors", "dims_per_minute", "error_occurrences")
+"""Metrics of `metrics/catalog.py` shown on the metrics pipeline card: their help is the catalog's (plan 14.7)."""
 CHANNEL_CREDENTIALS: Final[dict[str, tuple[str, ...]]] = {
     "email": ("smtp_password", "alert_emails"),
     "webhook": ("alert_webhook_url",),
@@ -119,18 +123,21 @@ def stable_id(text: Any) -> str:
     return hashlib.sha256(str(text).encode("utf-8", "replace")).hexdigest()[:12]
 
 
-def _is_table_request(view: PageView, table_id: str) -> bool:
-    """True when htmx asks for one table of a card (its own sort, page or filter request), not the whole card."""
-    return view.in_fragment and view.request.headers.get("HX-Target") == table_id
-
-
 # ============================================================================================ fleet
 
 
 def _worker_cells(view: PageView) -> Any:
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
         lag = item.get("loop_lag_ms_p99")
+        cpu, peak = item.get("cpu_pct"), item.get("cpu_pct_max")
         return {
+            # `worker_cpu_pct`: the mean of the worker's last complete minute, its highest sample under it.
+            "cpu_pct": {
+                "text": f"{float(cpu):,.1f}%",
+                "sub": f"peak {float(peak):,.1f}%" if isinstance(peak, int | float) else None,
+            }
+            if isinstance(cpu, int | float)
+            else None,
             "pid": {
                 "text": str(item.get("pid")),
                 "mono": True,
@@ -175,10 +182,45 @@ def fleet_facts(data: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def worker_key(item: Mapping[str, Any]) -> str:
+    """A worker row's id in the page (`worker-<pid>-<color>`, unique: two colors may reuse a pid only by chance)."""
+    return f"{item.get('pid')}-{item.get('color')}"
+
+
+def worker_rows(view: PageView, item: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Every column of one worker as label, help and display value (the drawer: on a phone the table shows only
+    its key columns, so the drawer holds the rest, parity row 84)."""
+    cells = _worker_cells(view)(item)
+    rows = []
+    for column in system_api.WORKERS_TABLE.columns:
+        shown = cells.get(column.key, item.get(column.key))
+        if isinstance(shown, Mapping):
+            cell = dict(shown)
+        elif shown is None:
+            cell = {"text": None}
+        elif isinstance(shown, bool):
+            cell = {"text": "Yes" if shown else "No"}
+        elif isinstance(shown, int | float):
+            cell = {"text": f"{shown:,}"}
+        else:
+            cell = {"text": str(shown)}
+        rows.append({"key": column.key, "label": column.label, "help": column.help, **cell})
+    return rows
+
+
 @page.card("fleet")
 async def fleet_card(view: PageView) -> dict[str, Any]:
-    """The fleet header and the workers table (`fleet` and `workers_table`, the API's own functions)."""
+    """The fleet header and the workers table (`fleet` and `workers_table`, the API's own functions), or one worker
+    for the drawer (`?worker=<pid>-<color>`)."""
     data = await system_api.fleet(view.ctx)
+    wanted = view.param("worker", max_chars=80) if view.in_fragment else ""
+    if wanted or (view.in_fragment and "worker" in view.query):
+        found = next((w for w in data.get("workers") or () if worker_key(w) == wanted), None)
+        if found is None:
+            raise common.not_found(
+                "That worker is not in the fleet any more: it stopped, or its heartbeat row was pruned."
+            )
+        return {"worker": found, "worker_rows": worker_rows(view, found)}
     tq, notice = table_query(view, system_api.WORKERS_TABLE, address=False)
     answer = system_api.workers_table(data, tq)
     table = table_view(
@@ -191,7 +233,9 @@ async def fleet_card(view: PageView) -> dict[str, Any]:
         key_columns=WORKER_KEYS,
         hidden=WORKER_HIDDEN,
         cells=_worker_cells(view),
-        row_id=lambda item: f"worker-{item.get('pid')}-{item.get('color')}",
+        row_id=lambda item: f"worker-{worker_key(item)}",
+        drawer=lambda item: view.fragment_url("fleet", worker=worker_key(item)),
+        drawer_title=lambda item: f"Worker {item.get('pid')} ({item.get('color')})",
         export_url=view.api_url("system/workers", time=False),
         caption="Workers",
         empty={
@@ -200,14 +244,14 @@ async def fleet_card(view: PageView) -> dict[str, Any]:
             "starting.",
             "icon": "server",
         },
-        search_placeholder="Search by pid, color or version",
+        search_placeholder="Pid, color or version",  # fits the search box (the longer text was cut at 1440 px)
         notice=notice,
         address=False,
     )
     max_requests = next((w.get("max_requests") for w in data.get("workers") or () if w.get("max_requests")), None)
     return {
         "table": table,
-        "table_only": _is_table_request(view, WORKERS_TABLE_ID),
+        "table_only": view.table_request(WORKERS_TABLE_ID),
         "fleet": data,
         "facts": fleet_facts(data),
         "max_requests": max_requests,
@@ -264,6 +308,7 @@ async def pipeline_card(view: PageView) -> dict[str, Any]:
         "drops": drops,
         "fleet_dropped": dropped,
         "databases": answer.get("databases") or [],
+        "metric_help": {key: METRICS[key].description for key in PIPELINE_METRICS if key in METRICS},
     }
 
 
@@ -349,6 +394,7 @@ async def errors_card(view: PageView) -> dict[str, Any]:
             "last": view.time_cell(found.get("last_seen")),
             "hourly": [{"at": view.time_cell(at), "count": count} for at, count in hourly],
             "hourly_values": [count for _at, count in hourly],
+            "occurrence_help": METRICS["error_occurrences"].description if "error_occurrences" in METRICS else "",
         }
     tq, notice = table_query(view, system_api.ERRORS_TABLE)
     source = view.state_param("source", max_chars=64) or None
@@ -387,7 +433,7 @@ async def errors_card(view: PageView) -> dict[str, Any]:
     )
     return {
         "table": table,
-        "table_only": _is_table_request(view, ERRORS_TABLE_ID),
+        "table_only": view.table_request(ERRORS_TABLE_ID),
         "total": answer["total"],
         "filtered": bool(tq.q or source),
     }
@@ -437,4 +483,14 @@ async def flush_card(view: PageView) -> dict[str, Any]:
     return {"flush_url": f"{common.API_PREFIX}/system/flush", "interval_ms": interval}
 
 
-__all__ = ["bytes_text", "duration_text", "fleet_facts", "growth_series", "page", "router", "stable_id"]
+__all__ = [
+    "bytes_text",
+    "duration_text",
+    "fleet_facts",
+    "growth_series",
+    "page",
+    "router",
+    "stable_id",
+    "worker_key",
+    "worker_rows",
+]

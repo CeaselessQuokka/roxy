@@ -9,6 +9,8 @@
  *     `data-fill-form` fills a form on the page instead (the ignored parameters form).
  *   * "Purge matching" follows the browser's search box: after every table swap its value and state are set from
  *     the search the table was drawn with, so the purge removes exactly what the list shows.
+ *   * A table swap (search, sort, rows per page) also moves its card's refresh URL to the same view, so a refresh
+ *     after an action keeps what the admin was looking at.
  *   * The purge card's form fills the shared purge dialog ("Review the purge") instead of sending at once.
  *   * Reset dialogs (`[data-reset-dialog]`) ask `POST /admin/api/v1/data/resets/preview` for the exact rows when
  *     they open and show the API's own summary; `[data-refresh-card]` re-renders a card from its fragment.
@@ -178,28 +180,6 @@ document.addEventListener("submit", (event) => {
   }
 });
 
-/**
- * Load the lazy cards one at a time right after the first paint, top to bottom, so scrolling never meets a
- * "Loading" card and the server renders one fragment at a time (the 1 GB box). A card that cannot load keeps its
- * placeholder (and loads again when it scrolls into view, as htmx's `revealed` trigger does).
- */
-async function loadLazyCards() {
-  const tried = new Set();
-  for (;;) {
-    const card = qsa(".page-card--lazy").find((node) => !tried.has(node.id) && !node.classList.contains("htmx-request"));
-    if (!card) return;
-    tried.add(card.id);
-    try {
-      await refreshCard(card);
-    } catch {
-      /* the placeholder stays; htmx loads it when it is revealed */
-    }
-  }
-}
-
-if (document.readyState === "complete") window.setTimeout(loadLazyCards, 50);
-else window.addEventListener("load", () => window.setTimeout(loadLazyCards, 50), { once: true });
-
 // "Purge matching" sends the search the browser was drawn with (read after every table swap).
 onContent("#cache-browser", (table) => {
   const button = qs("[data-purge-matching]");
@@ -213,7 +193,5 @@ onContent("#cache-browser", (table) => {
     _label: `every stored answer whose question contains: ${q}`,
   });
   button.disabled = q === "";
-  // The card's own refresh (after a purge) asks for the view in the address bar, which tables.js keeps in step.
-  const card = document.getElementById("browser");
-  if (card && card.dataset.card === "browser") card.dataset.cardSrc = `/admin/cache/fragment/browser${window.location.search}`;
 });
+

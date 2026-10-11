@@ -145,6 +145,20 @@
   overflow-wrap: anywhere;
 }
 
+/* The bot score's signal table and the client view's short tables fit a phone: long names and times wrap
+   instead of pushing the last column out of view. */
+.clients-signals th[scope="row"],
+.client-view .simple-table th,
+.client-view .simple-table td {
+  white-space: normal;
+}
+
+.client-view__basis {
+  display: block;
+  margin-top: var(--sp-1);
+  font-size: var(--fs-1);
+}
+
 .client-view__score {
   font-size: var(--fs-5);
   font-variant-numeric: tabular-nums;

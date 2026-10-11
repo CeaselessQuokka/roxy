@@ -55,6 +55,7 @@ from typing import Any
 
 import zstandard
 
+from roxy.core.header_text import header_text
 from roxy.core.redact import redact_headers, redact_label, redact_query, redact_text
 from roxy.storage import retention
 
@@ -177,7 +178,11 @@ def truncate_body(
     return kept.decode("utf-8", "replace"), len(kept) < length, length
 
 
-def _headers(headers: Mapping[str, str] | Iterable[tuple[str, str]]) -> dict[str, str]:
+def _headers(headers: Mapping[str, str] | Iterable[tuple[str, str]], *, caller: bool = False) -> dict[str, str]:
+    """Redacted headers; a caller's header values read as the caller wrote them (`core/header_text.py`)."""
+    if caller:
+        items = headers.items() if isinstance(headers, Mapping) else headers
+        headers = [(name, header_text(value) if isinstance(value, str) else value) for name, value in items]
     return redact_headers(headers, max_value_length=MAX_HEADER_VALUE_CHARS)
 
 
@@ -196,13 +201,13 @@ def build_record(inp: CaptureInput, policy: CapturePolicy) -> dict[str, Any]:
         "query": redact_query(inp.query)[:MAX_QUERY_CHARS],
         # The Roblox-Id header, as the caller sent it: scrubbed like every other caller text (plan C1, 9.15).
         "place_id": redact_label(inp.place_id) if inp.place_id else inp.place_id,
-        "user_agent": redact_text(inp.user_agent)[:MAX_UA_CHARS],
+        "user_agent": redact_text(header_text(inp.user_agent))[:MAX_UA_CHARS],
         "outcome": inp.outcome,
         "reason": inp.reason,
         "status": int(inp.status),
         "upstream_status": inp.upstream_status,
         "egress": inp.egress,
-        "request_headers": _headers(inp.request_headers),
+        "request_headers": _headers(inp.request_headers, caller=True),
         "request_body": redact_text(request_body),
         "request_body_truncated": request_cut,
         "request_body_length": request_len,

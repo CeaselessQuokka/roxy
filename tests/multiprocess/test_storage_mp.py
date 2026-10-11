@@ -9,7 +9,8 @@ gunicorn workers) that share temporary SQLite files, and checks a property that 
 3. A leader that stalls (SIGSTOP) past its lease and then resumes cannot write: epoch fencing.
 4. Counted slot leases (the tarpit cap) never exceed the cap under contention from 16 holders in 4 processes.
 5. Readers in another process are never blocked by a long write.
-6. Group commit (LOAD-3): hot-path writes that share a transaction lose no update with 1, 2 and 4 processes.
+6. Group commit (LOAD-3): hot-path writes that share a transaction lose no update with 1, 2 and 4 processes,
+   admit exactly a cap across 2 and 4 processes, and a process that dies between grouped writes commits none.
 Plus measurements of p50/p99 latency of a small hot.db write transaction under 4-process contention, and of write
 throughput with and without group commit under 2-process contention, printed for docs/PERFORMANCE.md.
 """
@@ -48,6 +49,8 @@ CREATE TABLE IF NOT EXISTS mp_counter (id INTEGER PRIMARY KEY, n INTEGER NOT NUL
 INSERT OR IGNORE INTO mp_counter (id, n) VALUES (1, 0);
 CREATE TABLE IF NOT EXISTS mp_leader_log (id INTEGER PRIMARY KEY, holder TEXT, epoch INTEGER, at_ms INTEGER);
 CREATE TABLE IF NOT EXISTS mp_slot_obs (id INTEGER PRIMARY KEY, holders INTEGER);
+CREATE TABLE IF NOT EXISTS mp_grants (id INTEGER PRIMARY KEY, owner TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mp_rows (id INTEGER PRIMARY KEY, v TEXT NOT NULL);
 """
 
 
@@ -630,3 +633,107 @@ def test_group_commit_throughput_under_two_process_contention(
                 f"\n[hot.db group commit] 2 processes x 32 concurrent jobs, {label}: {rate:,.0f} writes/s, "
                 f"p50 {p50:.2f} ms, p99 {p99:.2f} ms, largest transaction {largest} writes"
             )
+
+
+def _child_capped(path: str, attempts: int, cap: int, owner: str, results: Any, start: Any) -> None:
+    asyncio.run(_capped_main(path, attempts, cap, owner, results, start))
+
+
+async def _capped_main(path: str, attempts: int, cap: int, owner: str, results: Any, start: Any) -> None:
+    db = Database("hot", path)
+    await db.write(lambda c: None)
+    start.wait(30)
+
+    def admit(conn: sqlite3.Connection) -> bool:
+        # The shape of every limit (plan 6.3, C6): count what was granted, decide, record the grant.
+        granted = conn.execute("SELECT count(*) FROM mp_grants").fetchone()[0]
+        if granted >= cap:
+            return False
+        conn.execute("INSERT INTO mp_grants (owner) VALUES (?)", (owner,))
+        return True
+
+    answers = await asyncio.gather(*(db.write(admit, busy_timeout_ms=20_000) for _ in range(attempts)))
+    results.put((owner, sum(1 for a in answers if a), db.stats.grouped_writes))
+    await db.close()
+
+
+@pytest.mark.parametrize("workers", [2, 4])
+def test_grouped_writes_admit_exactly_the_cap_across_processes(hot_path: Path, procs: list[Any], workers: int) -> None:
+    """Every process asks for far more grants than the cap allows, all at once (so its writes group): exactly the cap
+    is granted fleet-wide, and every grant a caller was told about is a row (plan C6 with group commit)."""
+    cap, attempts = 150, 120
+    results = CTX.Queue()
+    start = CTX.Event()
+    for index in range(workers):
+        _start(procs, _child_capped, str(hot_path), attempts, cap, f"w{index}", results, start)
+    time.sleep(1.0)
+    start.set()
+    _join_all(procs, 120)
+    reports = [results.get(timeout=10) for _ in range(workers)]
+    assert sum(r[1] for r in reports) == cap
+    rows = dict(_query(hot_path, "SELECT owner, count(*) FROM mp_grants GROUP BY owner"))
+    assert rows == {r[0]: r[1] for r in reports if r[1]}
+    assert sum(r[2] for r in reports) > 0  # the writes really were grouped
+
+
+def _child_dies_mid_group(path: str, ran: str) -> None:
+    asyncio.run(_dies_mid_group(path, ran))
+
+
+def _note(path: str, value: str) -> None:
+    """Append one line and close the file: it survives an `os._exit` right after (a queue's feeder thread may not)."""
+    with open(path, "a", encoding="utf-8") as out:
+        out.write(value + "\n")
+
+
+async def _dies_mid_group(path: str, ran: str) -> None:
+    from roxy.storage import db as dbmod
+
+    dbmod.GROUP_MIN_QUEUE = 0  # group whatever the backlog
+    db = Database("hot", path)
+    await db.write(lambda c: None)
+    release = asyncio.Event()
+
+    def hold(conn: sqlite3.Connection) -> None:
+        while not release.is_set():
+            time.sleep(0.01)
+
+    def insert(value: str) -> Any:
+        def run(conn: sqlite3.Connection) -> None:
+            conn.execute("INSERT INTO mp_rows (v) VALUES (?)", (value,))
+            _note(ran, value)
+
+        return run
+
+    def die(conn: sqlite3.Connection) -> None:
+        _note(ran, "die")
+        os._exit(7)  # the process is killed between grouped writes: no cleanup, no rollback, no answer
+
+    holder = asyncio.ensure_future(db.write(hold))
+    await asyncio.sleep(0.1)
+    jobs = [insert("before-1"), insert("before-2"), die, insert("after")]
+    writes = [asyncio.ensure_future(db.write(job, busy_timeout_ms=10_000)) for job in jobs]
+    await asyncio.sleep(0.1)  # every write is queued behind the long one
+    release.set()
+    await holder
+    await asyncio.gather(*writes)
+
+
+def test_a_process_that_dies_between_grouped_writes_commits_none_of_them(hot_path: Path, procs: list[Any]) -> None:
+    """Group commit answers nobody before COMMIT, so a worker killed between two grouped writes leaves no caller with a
+    result, and SQLite discards the uncommitted transaction: the writes that ran before the crash are not in the file.
+    The write lock dies with the process, so another process writes at once."""
+    ran = hot_path.parent / "ran.txt"
+    proc = _start(procs, _child_dies_mid_group, str(hot_path), str(ran))
+    proc.join(60)
+    assert proc.exitcode == 7
+    assert ran.read_text(encoding="utf-8").split() == ["before-1", "before-2", "die"]
+    assert _query(hot_path, "SELECT v FROM mp_rows") == []
+    conn = sqlite3.connect(str(hot_path), timeout=2, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO mp_rows (v) VALUES (?)", ("next",))
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    assert _query(hot_path, "SELECT v FROM mp_rows") == [("next",)]

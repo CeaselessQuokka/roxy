@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.pages.testing import THEMES, VIEWPORTS
+from pages_harness import THEMES, VIEWPORTS
 
 PAGE = "/admin/cache"
 NO_HOSTILE_MARKUP = """() => !document.querySelector('img[src="x"], [onerror], [onclick], a[href^="javascript:"]')
@@ -138,8 +138,10 @@ def test_the_inline_ttl_setting_reviews_and_saves(open_admin: Any, dashboard: An
         control.locator("[data-setting-input]").fill("4m")
         control.locator('input[name="reason"]').fill("Browser test of the cache settings card")
         control.locator('button[type="submit"]').click()
-        admin.wait("(() => { const r = document.querySelector('#settings [data-setting-key=\"cache_ttl_seconds\"] "
-                   "[data-setting-review]'); return r && !r.hidden; })()")
+        admin.wait(
+            '(() => { const r = document.querySelector(\'#settings [data-setting-key="cache_ttl_seconds"] '
+            "[data-setting-review]'); return r && !r.hidden; })()"
+        )
         control.locator('button[type="submit"]').click()
         admin.wait("document.querySelector('#settings .setting__saved') !== null")
         assert dashboard.api("GET", "settings/cache_ttl_seconds").json()["setting"]["value"] == 240
@@ -159,8 +161,10 @@ def test_a_rule_is_added_from_the_form_and_edited_in_its_drawer(open_admin: Any,
         page.fill("#cache-rule-new-note", "added by the browser test")
         page.locator('[data-action="cache-rule-add"]').click()
         admin.wait("document.querySelector('.toast') !== null && /Cache rule added/.test(document.body.innerText)")
-        admin.wait("document.querySelector('#rules tbody') && /catalog.roblox.com\\/v1\\/e2e/.test("
-                   "document.querySelector('#rules tbody').textContent)")
+        admin.wait(
+            "document.querySelector('#rules tbody') && /catalog.roblox.com\\/v1\\/e2e/.test("
+            "document.querySelector('#rules tbody').textContent)"
+        )
         rules = dashboard.api("GET", "cache/rules", params={"q": "e2e"}).json()["items"]
         assert len(rules) == 1
         created = rules[0]["id"]

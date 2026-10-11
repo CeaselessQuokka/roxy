@@ -24,8 +24,8 @@ from typing import Any
 
 import pytest
 
+from pages_harness import HOSTILE, parse_html
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import HOSTILE, parse_html
 from roxy.config.insight_params import INSIGHT_RULES
 from roxy.core.ids import new_id
 from roxy.core.style_guard import find_style_issues
@@ -138,7 +138,11 @@ async def test_the_run_view_lists_checks_in_order_with_words_fixes_and_copies(
     assert run.get("data-run-state") == "finished"
     order = [node.get("data-check") for node in run.select("[data-check]")]
     assert sorted(order) == ["H-CACHE-HIT", "H-DB-INTEGRITY", "H-REACH"]
-    assert order == sorted(order, key=checks.sort_key)  # the 13.2 order
+    # A finished run lists what needs attention first, then the rest, each group in the 13.2 order.
+    problems = [node.get("data-check") for node in run.select('ol[aria-labelledby="hl-problems-title"] [data-check]')]
+    assert problems == sorted(["H-CACHE-HIT", "H-REACH"], key=checks.sort_key)
+    assert order == [*problems, "H-DB-INTEGRITY"]
+    assert run.select_one('details.hl-group [data-check="H-DB-INTEGRITY"]') is not None
     statuses = {node.get("data-check"): node.select_one(".badge").text() for node in run.select("[data-check]")}
     assert statuses == {"H-REACH": "Fail", "H-CACHE-HIT": "Warn", "H-DB-INTEGRITY": "Pass"}
     warn = run.select_one('[data-check="H-CACHE-HIT"]')
@@ -196,9 +200,11 @@ async def test_two_runs_compare_check_by_check(page: Any, pages_app: Any) -> Non
     run = doc.select_one(f'[data-run-id="{second}"]')
     sentence = run.select_one(".hl-compare").text()
     assert f"Since run {first}" in sentence
-    assert "H-DISK" in sentence and "H-CONFIG" in sentence  # newly failing and fixed
+    assert "H-DISK" in sentence  # newly failing
+    assert "H-CONFIG" in sentence  # fixed
     clock = run.select_one('[data-check="H-CLOCK"]').text()
-    assert "Queue wait ms" in clock and "Call ms" in clock  # H-CLOCK's detail (insights-12)
+    assert "Queue wait ms" in clock  # H-CLOCK's detail (insights-12)
+    assert "Call ms" in clock
     options = [o.get("value") for o in run.select('select[name="with"] option')]
     assert str(first) in options
     compared = await page.doc(PAGE, params={"run": second, "with": first})

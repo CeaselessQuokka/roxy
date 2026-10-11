@@ -74,8 +74,10 @@ async def spread(ctx: InsightContext, max_rows: int = DEFAULT_MAX_ROWS) -> list[
     """The newest cache.db content entries as `SpreadRow`s (the input of `cache/spread.py compute_spread`)."""
 
     async def make() -> list[SpreadRow]:
-        raw = await ctx.dbs.cache.read(lambda c: read_spread.spread_rows(c, max_rows))
-        return rows_from_db(raw)  # decoded once per run, however many rules group the rows
+        # Decoded once per run, however many rules group the rows, and on the reader thread with the read: parsing
+        # up to `max_rows` key texts is CPU work the event loop never waits for (gaps_insights G7).
+        found: list[SpreadRow] = await ctx.dbs.cache.read(lambda c: rows_from_db(read_spread.spread_rows(c, max_rows)))
+        return found
 
     return await _memo(ctx, ("spread", int(max_rows)), make)
 

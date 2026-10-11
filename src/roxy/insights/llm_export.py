@@ -1204,11 +1204,15 @@ _PARITY_STATUSES: Final = ("covered", "partial", "changed", "missing")
 
 
 def parse_parity(text: str) -> list[dict[str, Any]]:
-    """The rows of the "Parity checklist" table of CHANGES.md: row number, title, status, note, test ids."""
+    """The rows of the "Parity checklist" table of CHANGES.md: row number, title, status, note, test ids.
+
+    The checklist ends at the next heading of any level: its "### v1 section map" subsection holds a second numbered
+    table (plan 14.1), whose rows are not parity rows.
+    """
     rows: list[dict[str, Any]] = []
     inside = False
     for line in text.splitlines():
-        if line.startswith("## "):
+        if line.startswith("#"):
             inside = line.strip().lower().startswith("## parity checklist")
             continue
         if not inside or not line.startswith("|"):
@@ -2418,8 +2422,11 @@ class _Build:
         }
 
     async def parity_status(self) -> dict[str, Any]:
-        path = self.sources.changes_path or default_changes_path(self.sources.code_root)
-        rows = await asyncio.to_thread(read_parity, path)
+        def read() -> list[dict[str, Any]] | None:
+            # `default_changes_path` resolves the package path (a stat), so it runs on the thread with the read.
+            return read_parity(self.sources.changes_path or default_changes_path(self.sources.code_root))
+
+        rows = await asyncio.to_thread(read)
         if rows is None:
             return {"available": False, "source": None, "counts": {}, "shown": "all", "rows": []}
         counts = Counter(row["status"] for row in rows)

@@ -28,9 +28,9 @@ from typing import Any
 
 import pytest
 
+from pages_harness import HOSTILE, parse_html, setting_selector
 from roxy.admin.pages import registry
 from roxy.admin.pages.recommendations import change_row, evidence_charts, exact_endpoint
-from roxy.admin.pages.testing import HOSTILE, parse_html
 from roxy.config.insight_params import INSIGHT_RULES
 from roxy.core.ids import new_id
 from roxy.core.style_guard import find_style_issues
@@ -74,7 +74,9 @@ async def seed(
         confidence="high",
         explanation=explanation or ("Plain words " + HOSTILE["js_url"]),
         evidence=evidence,
-        changes=changes if changes is not None else [ProposedChange("setting", key="cache_ttl_seconds", current=180, proposed=300)],
+        changes=changes
+        if changes is not None
+        else [ProposedChange("setting", key="cache_ttl_seconds", current=180, proposed=300)],
         expected_impact="Fewer calls " + HOSTILE["img"],
         risk="low",
         safe_auto=safe_auto,
@@ -120,15 +122,16 @@ async def test_every_registry_card_and_inline_setting_is_there(page: Any, pages_
         anchor = registry.anchor("recommendations", card)
         fdoc = parse_html(fragment.text)
         for spec in registry.settings_for(anchor):
-            assert fdoc.select_one(f'[data-setting-key="{spec.key}"]') is not None, (card, spec.key)
+            assert fdoc.select_one(setting_selector(spec.key, anchor)) is not None, (card, spec.key)
     assert len(RULE_CARDS) == len(INSIGHT_RULES)
     for card in RULE_CARDS:
         fragment = await page.fragment("recommendations", card)
         assert fragment.status_code == 200, card
         fdoc = parse_html(fragment.text)
         assert fdoc.select_one(f"#{card}[data-rule]") is not None, card
-        for spec in registry.settings_for(registry.anchor("recommendations", card)):
-            assert fdoc.select_one(f'[data-setting-key="{spec.key}"]') is not None, (card, spec.key)
+        rule_anchor = registry.anchor("recommendations", card)
+        for spec in registry.settings_for(rule_anchor):
+            assert fdoc.select_one(setting_selector(spec.key, rule_anchor)) is not None, (card, spec.key)
     tables = {
         "history": "recommendation_actions",
         "rules": "recommendation_rules",
@@ -136,6 +139,41 @@ async def test_every_registry_card_and_inline_setting_is_there(page: Any, pages_
     for card, name in tables.items():
         fdoc = parse_html((await page.fragment("recommendations", card)).text)
         assert fdoc.select_one(f'[data-table="{name}"]') is not None, card
+
+
+async def test_hostile_text_is_inert_on_the_page_in_every_fragment_and_the_preview(
+    page: Any, pages_app: Any, inert: Any
+) -> None:
+    await pages_app.seed_all()
+    rec_id = await seed(
+        pages_app,
+        changes=[
+            ProposedChange(
+                "rule_upsert",
+                table="rules_cache",
+                match={"pattern": HOSTILE["img"], "type": "glob"},
+                proposed={"ttl": 9},
+            )
+        ],
+    )
+    dismissed = await seed(pages_app, subject="users.roblox.com/v1/users/" + HOSTILE["script"])
+    assert (
+        await page.api("POST", f"recommendations/{dismissed}/dismiss", json={"reason": "other", "text": HOSTILE["img"]})
+    ).status_code == 200
+    response = await page.get(PAGE)
+    inert(response.text, "recommendations page")
+    assert find_style_issues(response.text, "recommendations") == []
+    for card in [*VISIBLE, RULE_CARDS[0]]:
+        for params in ({}, {"state": "all"}):
+            fragment = await page.fragment("recommendations", card, **params)
+            inert(fragment.text, f"recommendations {card}")
+            assert find_style_issues(fragment.text, card) == []
+    for path in (f"{PAGE}/preview", f"{PAGE}/detail"):
+        for rec in (rec_id, dismissed):
+            shown = await page.get(path, params={"rec": rec})
+            assert shown.status_code == 200
+            inert(shown.text, path)
+            assert find_style_issues(shown.text, path) == []
 
 
 async def test_the_list_equals_the_api_for_the_same_filters(page: Any, pages_app: Any) -> None:
@@ -271,7 +309,9 @@ async def test_a_security_change_needs_a_fresh_second_factor(page: Any, pages_ap
 async def test_the_watch_window_shows_its_rollback_reason_as_text(page: Any, pages_app: Any, inert: Any) -> None:
     rec_id = await seed(pages_app)
     digest = (await page.api("GET", f"recommendations/{rec_id}/preview")).json()["changes_digest"]
-    assert (await page.api("POST", f"recommendations/{rec_id}/apply", json={"changes_digest": digest})).status_code == 200
+    assert (
+        await page.api("POST", f"recommendations/{rec_id}/apply", json={"changes_digest": digest})
+    ).status_code == 200
     result = json.dumps({"rollback_refused": "Refused for " + HOSTILE["img"]})
     await pages_app.ctx.dbs.metrics.write(
         lambda conn: conn.execute(
@@ -359,7 +399,8 @@ def test_change_rows_and_charts_read_every_shape() -> None:
     assert row["label"].startswith("Setting: ")
     assert (row["before"], row["after"]) == ("180", "300")
     manual = change_row({"kind": "manual", "text": "Renew the credential"})
-    assert manual["manual"] and manual["note"] == "Renew the credential"
+    assert manual["manual"]
+    assert manual["note"] == "Renew the credential"
     charts = evidence_charts(
         {
             "timeline": {"2026-10-10T12:00:00Z": {"a": 1, "b": 2}, "2026-10-10T12:01:00Z": {"a": 3, "b": 4}},

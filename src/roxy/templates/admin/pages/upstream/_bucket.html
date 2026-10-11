@@ -13,7 +13,7 @@
 {% from "components/chart.html" import series_chart %}
 {% from "components/dialog.html" import confirm_dialog %}
 {% from "components/format.html" import caller_text %}
-{% from "admin/pages/upstream/_macros.html" import gauge as gauge_view %}
+{% from "components/pieces.html" import gauge as gauge_view %}
 {% if error %}
 <div data-card-error>{{ inline_alert("bad", "This bucket could not be loaded", error) }}</div>
 {% else %}

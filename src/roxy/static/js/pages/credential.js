@@ -1,11 +1,12 @@
 /**
- * The Credential page's own script (templates/admin/pages/credential.html): the cooldown countdown.
+ * The Credential page's own script (templates/admin/pages/credential.html): the cooldown countdown, and the drawer
+ * after a save.
  *
  * What this is
  *   The credential's cooldown (`[data-countdown]` on the Status card) shows "42 s left" and counts down once a second
  *   from the server's `data-ends-at-ms` and `data-now-ms` (so a browser clock that is off still shows the right
- *   time). Everything else (the forms, the dialogs with the typed confirmations, the second factor prompt, the
- *   allowlist table and its drawer) is the shared design system.
+ *   time). A form saved from inside the drawer closes the drawer. Everything else (the forms, the dialogs with the
+ *   typed confirmations, the second factor prompt, the allowlist table and its drawer) is the shared design system.
  *
  * Why it exists
  *   A cooldown that never moves reads as "stuck"; the owner wants to know when the account is usable again.
@@ -18,7 +19,7 @@
  *   static/js/pages/upstream.js (the same countdown), static/js/page.js.
  */
 
-import { onContent } from "roxy/page";
+import { onContent, toast } from "roxy/page";
 
 const seen = new WeakMap();
 const live = new Set();
@@ -55,3 +56,21 @@ onContent("[data-countdown]", (node) => {
 });
 
 window.setInterval(tick, 1000);
+
+// A form saved from inside the drawer (an allowlist row's edit form or its remove dialog) closes the drawer: the
+// allowlist card is refreshed by the shared form handler, and the drawer would otherwise show the old row.
+document.addEventListener("roxy:api-success", (event) => {
+  const form = event.target instanceof Element ? event.target : null;
+  if (!form) return;
+  // A replace or a delete probes the new value at once, but the API waits at most 40 s for it: `pending` means the
+  // probe is still running, so the Status card shows its result only after a later refresh.
+  const answer = event.detail && event.detail.answer;
+  if (answer && answer.pending === true) {
+    toast("The probe of the credential is still running; refresh the Status card in a minute to see its result.", {
+      tone: "info",
+    });
+  }
+  if (!form.closest("#drawer")) return;
+  const close = document.querySelector("#drawer .drawer__head [data-dialog-close]");
+  if (close instanceof HTMLElement) close.click();
+});

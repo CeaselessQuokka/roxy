@@ -21,22 +21,10 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.pages.testing import THEMES, VIEWPORTS
+from pages_harness import THEMES, VIEWPORTS
+from roxy.admin.pages.help import SHORTCUTS_CARD
 
 PAGE = "/admin/help"
-CLASH = "shortcuts"
-"""The registry's Help card `shortcuts` shares its id with the shell's `?` overlay dialog (integrator request 1)."""
-
-
-def _without_the_known_clash(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """axe findings other than the duplicate ids of the registry clash (see `CLASH`)."""
-    rest = []
-    for finding in findings:
-        targets = [str(target) for node in finding["nodes"] for target in node]
-        if finding["id"].startswith("duplicate-id") and all(CLASH in target for target in targets):
-            continue
-        rest.append(finding)
-    return rest
 
 
 @pytest.mark.parametrize("theme", THEMES)
@@ -45,10 +33,10 @@ def test_the_page_is_clean_accessible_and_fits(open_admin: Any, theme: str, size
     width, height = VIEWPORTS[size]
     admin = open_admin(PAGE, theme=theme, width=width, height=height)
     page = admin.page
-    assert page.locator("#guide .help-chapter").count() == 12 or page.locator("#guide .help-toc li").count() > 0
+    assert page.locator("#guide .help-chapter").count() == 12
     assert page.locator("#glossary .help-term").count() > 100
     assert not admin.overflows(), "the page scrolls sideways"
-    assert _without_the_known_clash(admin.axe()) == []
+    assert admin.axe() == []
     admin.shot("help")
     admin.assert_clean()
 
@@ -115,8 +103,12 @@ def test_the_contents_list_jumps_to_a_section(open_admin: Any) -> None:
     admin.assert_clean()
 
 
-@pytest.mark.xfail(strict=True, reason="registry card help#shortcuts collides with the shell dialog #shortcuts")
 def test_the_shortcut_overlay_opens_from_the_help_page(open_admin: Any) -> None:
     admin = open_admin(PAGE)
-    admin.page.locator("#shortcuts [data-shortcuts-open]").click()
+    admin.page.locator(f"section#{SHORTCUTS_CARD} [data-shortcuts-open]").click()
     admin.wait("document.querySelector('dialog#shortcuts') && document.querySelector('dialog#shortcuts').open")
+    admin.page.keyboard.press("Escape")
+    admin.wait("!document.querySelector('dialog#shortcuts').open")
+    admin.page.keyboard.press("?")
+    admin.wait("document.querySelector('dialog#shortcuts').open")
+    admin.assert_clean()

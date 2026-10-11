@@ -37,6 +37,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal
 
+from roxy.config.constants import (
+    MAX_CACHE_IGNORED_PARAMS,
+    MAX_CACHE_RULES,
+    MAX_CREDENTIAL_ALLOWLIST_RULES,
+    MAX_ENDPOINT_BLOCKS,
+    MAX_ENDPOINT_RULES,
+    MAX_HEADER_RULES,
+    MAX_IGNORED_PATHS,
+    MAX_IGNORED_VALUE_HEADERS,
+    MAX_ROUTING_RULES,
+    MAX_THROTTLE_TIERS,
+    MAX_UPSTREAM_LIMITS,
+    MAX_USER_AGENT_RULES,
+)
+
 DAY_S: Final = 86_400
 GROWTH_WINDOW_S: Final = 7 * DAY_S
 """How far back new rows are counted to estimate daily growth."""
@@ -98,6 +113,20 @@ JOB_STATUS_KEEP_S: Final = DAY_S  # health.store: published rows a day old are d
 
 _EXPIRED: Final = "Expired rows are deleted every hour."
 _IDLE_HOT: Final = "Idle rows are deleted every minute (rows still in use stay)."
+_SCHEMA: Final = "One row per migration applied; kept for good."
+_RULES: Final = "Rows an admin (or a shipped default) made; kept until removed, up to the fixed row cap."
+_ONE_ROW: Final = "One row, rewritten in place."
+_NAMED_ROWS: Final = "A few named rows, each rewritten in place."
+
+
+def _schema() -> TableMeta:
+    """`schema_version`, which every database has (`storage/migrate.py`)."""
+    return TableMeta("schema_version", "Applied schema migrations", rule=_SCHEMA)
+
+
+def _rules(table: str, label: str, cap: int) -> TableMeta:
+    """A control.db rule table: no age, a row cap the code sets (`config/constants.py`, `rules/models.RULE_TABLES`)."""
+    return TableMeta(table, label, fixed_cap=cap, rule=_RULES)
 
 
 TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
@@ -236,6 +265,7 @@ TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
             fixed_age_s=DISK_KEEP_DAYS * DAY_S,
             fixed_cap=TABLE_SIZES_ROW_CAP,
         ),
+        _schema(),
     ),
     "control": (
         _t("settings", "Setting overrides"),
@@ -259,6 +289,33 @@ TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
         _t("trusted_devices", "Trusted devices", "expires_at", fixed_age_s=0, rule=_EXPIRED),
         _t("invalidation_tokens", "Session invalidation links", "expires_at", fixed_age_s=0, rule=_EXPIRED),
         _t("admin_prefs", "Admin preferences"),
+        _t("admin_users", "Admin accounts", rule="One row per admin account; kept until the account is removed."),
+        _t("admin_passkeys", "Admin passkeys", rule="Kept until the admin deletes the passkey."),
+        _t(
+            "audit_prune_gate",
+            "Audit log prune checkpoint",
+            rule="One row: how far the retention job may delete audit rows (never younger than 400 days).",
+        ),
+        _t(
+            "credential_meta",
+            "Roblox credential state (fingerprints, status, budget; never the value)",
+            rule="At most one row.",
+        ),
+        _t("rotator_store", "Rotator proxy address set on the dashboard (encrypted)", rule="At most one row."),
+        _t("service_state", "Service switches and markers (pause, emergency limit, seeds, fences)", rule=_NAMED_ROWS),
+        _rules("rules_cache", "Cache rules", MAX_CACHE_RULES),
+        _rules("rules_endpoint_block", "Endpoint blocks", MAX_ENDPOINT_BLOCKS),
+        _rules("rules_endpoint_limit", "Endpoint rate rules", MAX_ENDPOINT_RULES),
+        _rules("rules_header", "Request filters (header rules)", MAX_HEADER_RULES),
+        _rules("rules_user_agent", "User-Agent rules", MAX_USER_AGENT_RULES),
+        _rules("rules_routing", "Routing rules", MAX_ROUTING_RULES),
+        _rules("upstream_limits", "Upstream rate limits per host and endpoint", MAX_UPSTREAM_LIMITS),
+        _rules("credential_allowlist", "Credential allowlist", MAX_CREDENTIAL_ALLOWLIST_RULES),
+        _rules("throttle_tiers", "Throttle ladder rungs", MAX_THROTTLE_TIERS),
+        _rules("cache_ignored_params", "Ignored cache parameters", MAX_CACHE_IGNORED_PARAMS),
+        _rules("ignored_value_headers", "Headers whose values are not recorded", MAX_IGNORED_VALUE_HEADERS),
+        _rules("ignored_paths", "Ignored paths", MAX_IGNORED_PATHS),
+        _schema(),
     ),
     "hot": (
         _idle("limiter", "Rate limiter state", "updated_at", "stale_ip_duration"),
@@ -307,18 +364,41 @@ TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
         ),
         _idle("spam_windows", "Spam detector windows", "updated_at", "spam_windows_idle_s"),
         _t("csrf_cache", "Roblox CSRF tokens", "expires_at", fixed_age_s=0, rule="Expired tokens are deleted."),
+        _schema(),
     ),
     "cache": (
         _t("entries", "Cached responses", "stored_at", rule="Bounded by cache_max_entries and cache_max_bytes."),
         _t("change_observations", "TTL tuning observations", "day", age="change_observations_days"),
+        _t("generation", "Cache generation (moves on Purge All)", rule=_ONE_ROW),
+        _schema(),
     ),
 }
-"""Known tables per database. Any other table found is measured with rows and bytes only."""
+"""Known tables per database, every table of the schema with a plain label (a test checks each migrated database
+has an entry for every table, with `register_table` entries added). A table found that is not here is measured with
+rows and bytes only."""
+
+_OWNED: Final[dict[str, list[TableMeta]]] = {}
+
+
+def register_table(db: str, meta: TableMeta) -> None:
+    """Add the metadata of a table only its owner module may name, at that module's import.
+
+    Plan C1 and test 19.5 item 7: no module but `egress/credential.py` names the credential table, so that module
+    registers the table's label here instead of this list naming it. Registering a table twice keeps the first.
+    """
+    owned = _OWNED.setdefault(db, [])
+    if all(item.table != meta.table for item in owned):
+        owned.append(meta)
+
+
+def tables_of(db: str) -> tuple[TableMeta, ...]:
+    """Every known table of `db`: the `TABLES` entries, then the ones their owners registered."""
+    return (*TABLES.get(db, ()), *_OWNED.get(db, ()))
 
 
 def meta_for(db: str, table: str) -> TableMeta | None:
     """The known metadata of `db.table`, or None."""
-    for meta in TABLES.get(db, ()):
+    for meta in tables_of(db):
         if meta.table == table:
             return meta
     return None
@@ -513,4 +593,6 @@ __all__ = [
     "measure_table",
     "meta_for",
     "project",
+    "register_table",
+    "tables_of",
 ]

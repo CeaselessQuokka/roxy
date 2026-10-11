@@ -23,32 +23,14 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.pages.testing import HOSTILE, THEMES, VIEWPORTS
+from pages_harness import HOSTILE, THEMES, VIEWPORTS
 
 PAGE = "/admin/system"
-LAZY_LEFT = "[...document.querySelectorAll('.page-card--lazy')].map((node) => node.id)"
 
 
 def open_page(open_admin: Any, path: str = PAGE, **options: Any) -> Any:
-    """`open_admin` without its settle step, then every lazy card loaded one at a time.
-
-    The shared `AdminPage.settle()` scrolls every lazy card into view in one burst and waits until none is left, but
-    htmx's `revealed` only sees the last scroll position, so on a phone the lazy cards above it never load and the wait
-    times out (integrator request: load them one at a time there). This does it one card at a time."""
-    admin = open_admin(path, settle=False, **options)
-    page = admin.page
-    for _ in range(30):
-        left = page.evaluate(LAZY_LEFT)
-        if not left:
-            break
-        page.locator(f"#{left[0]}").scroll_into_view_if_needed()
-        for _ in range(200):  # up to 10 s for this card's fragment
-            if not page.evaluate(f"!!document.querySelector('#{left[0]}.page-card--lazy')"):
-                break
-            page.wait_for_timeout(50)
-    admin.wait("true")  # then htmx idle (no request, swap or settle left)
-    page.evaluate("window.scrollTo(0, 0)")
-    return admin
+    """`open_admin` (its settle step waits until every lazy card has loaded, `tests/e2e/conftest.py`)."""
+    return open_admin(path, **options)
 
 
 NO_HOSTILE_MARKUP = """() => !document.querySelector('img[src="x"], [onerror], [onclick], a[href^="javascript:"]')
@@ -127,6 +109,22 @@ def test_a_row_opens_its_traceback_in_the_drawer_as_text(open_admin: Any, errors
     admin.shot("system-drawer")
     page.keyboard.press("Escape")
     admin.wait("!document.querySelector('#drawer[open]')")
+    admin.assert_clean()
+
+
+def test_on_a_phone_a_worker_opens_every_column_in_the_drawer(open_admin: Any) -> None:
+    width, height = VIEWPORTS["phone"]
+    admin = open_page(open_admin, PAGE, theme="dark", width=width, height=height)
+    page = admin.page
+    row = page.locator('#fleet [data-table="workers"] tbody tr[data-row-id]').first
+    row.locator("[data-dt-open]").click()
+    admin.wait("document.querySelector('#drawer[open] [data-worker-detail]') !== null")
+    assert page.locator("#drawer-title").inner_text().startswith("Worker ")
+    text = page.locator("#drawer").inner_text()
+    for label in ("All requests", "Proxy requests", "Loop lag p99", "Last heartbeat", "Version"):
+        assert label in text
+    assert admin.axe() == []
+    admin.shot("system-worker")
     admin.assert_clean()
 
 

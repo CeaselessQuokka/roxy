@@ -230,6 +230,12 @@
   font-size: var(--fs-1);
 }
 
+/* The busiest hours grid names whole weekdays: its label column is wide enough for "Wednesday", so a label never
+   runs over the first hour's cell. */
+#heatmap .heatmap__corner {
+  width: 76px;
+}
+
 /* Trends: one table per period, each a <details> (week open). */
 .traffic-trend {
   border: 1px solid var(--border);
@@ -282,6 +288,12 @@
   margin: 0 0 var(--sp-3);
 }
 
+/* A negative avoided share says why under its number (`fmt.avoided_cell`, plan P6): the note wraps. */
+.traffic-trend__table .num .dt__sub {
+  min-width: 18ch;
+  white-space: normal;
+}
+
 .traffic-trend__table {
   width: 100%;
 }
@@ -295,44 +307,6 @@
   display: block;
   width: 120px;
   height: 28px;
-}
-
-/* The inline reset in the drawer (roxy/admin/pages/_traffic_reset.py). */
-.g2-reset__lead {
-  max-width: 70ch;
-}
-
-.g2-reset__section {
-  display: grid;
-  gap: var(--sp-3);
-}
-
-.g2-reset__heading {
-  font-size: var(--fs-3);
-}
-
-.g2-reset__snapshots {
-  display: grid;
-  gap: var(--sp-1);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  font-size: var(--fs-1);
-}
-
-.g2-reset__snapshots li {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--sp-2);
-}
-
-.g2-reset__snapshots .icon {
-  flex: none;
-  margin-top: 2px;
-}
-
-.g2-reset__target {
-  overflow-wrap: anywhere;
 }
 
 @media (max-width: 760px) {
@@ -363,7 +337,12 @@
     display: none;
   }
 
-  .g2-reset__form .btn {
-    min-height: var(--target-touch);
+  /* Measure, this period and the change fit the phone: long measure names wrap. */
+  .traffic-trend__table th[scope="row"] {
+    white-space: normal;
+  }
+
+  .traffic-trend > .table-scroll {
+    margin: 0 var(--sp-2) var(--sp-3);
   }
 }

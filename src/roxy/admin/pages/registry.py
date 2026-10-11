@@ -12,8 +12,8 @@ What this is
       * `V1_SECTIONS`: the 37 rows of the plan 14.1 v1 section to v2 page map (with the corrections of
         `.remake/v1notes/dashboard.md` section 1.1), each with the page, card and key elements that prove the v1
         section survived. `tests/e2e/test_v1_sections.py` turns each row into one test.
-      * `is_built(page_id)`: whether the page's module `roxy.admin.pages.<id>` exists. A page that is registered but
-        not built renders a plain "coming soon" body, so the shell and the navigation work from the start.
+      * `is_built(page_id)`: whether the page's module `roxy.admin.pages.<id>` exists. Every page is built since the
+        P11 integration (the pages router imports each one; a test keeps it that way).
 
 Why it exists
     Plan 14.1 lists the pages; DESIGN.md section 9 pins the card anchors the settings catalog points at; plan 14.7
@@ -586,7 +586,7 @@ _PAGES: Final[tuple[PageSpec, ...]] = (
         cards=(
             _c("guide", "Admin guide", "How to run Roxy, page by page."),
             _c("glossary", "Glossary", "Every term the dashboard uses."),
-            _c("shortcuts", "Keyboard shortcuts", "Every shortcut."),
+            _c("keys", "Keyboard shortcuts", "Every shortcut."),
             _c("pages", "What each page does", "One sentence per page."),
         ),
     ),
@@ -626,6 +626,56 @@ def settings_for(anchor: str) -> tuple[SettingSpec, ...]:
     return ANCHOR_SETTINGS.get(anchor, ())
 
 
+def _renders_on_page(page_id: str, found: str) -> bool:
+    """Whether the card of `found` is part of the page (not a fragment-only drawer, such as a rule's tuning panel)."""
+    try:
+        return not card(page_id, found.partition("#")[2]).fragment_only
+    except (KeyError, LookupError):
+        return True
+
+
+@cache
+def editor_anchors() -> dict[tuple[str, str], str]:
+    """`(setting key, page id)` -> the one anchor of that page that holds the key's editor (`editor_anchor`)."""
+    homes: dict[tuple[str, str], str] = {}
+    for spec in CATALOG.values():
+        by_page: dict[str, list[str]] = {}
+        for found in spec.pages:
+            page_id, _, card_id = found.partition("#")
+            if card_id:
+                by_page.setdefault(page_id, []).append(found)
+        for page_id, found_on_page in by_page.items():
+            shown = [found for found in found_on_page if _renders_on_page(page_id, found)]
+            homes[(spec.key, page_id)] = (shown or found_on_page)[-1]
+    return homes
+
+
+def editor_anchor(key: str, page_id: str) -> str | None:
+    """The one card of `page_id` that edits setting `key`: one setting, one editor per page (DESIGN.md 15.2).
+
+    A key the catalog anchors on several cards of one page is edited on the LAST of them in its `pages` order that
+    renders on the page (a fragment-only drawer, such as one rule's tuning panel, only when no other card of the page
+    names the key); every other card of that page shows the current value read-only with a link to that editor
+    (`inline.card_settings`). Plan 15.6 names a key's general card first and the specific one after it ("`cache_*`
+    Cache > Settings (`cache_coalesce*` also on Cache > Coalescing)"; "`rotator_*` Egress > Rotator (quota and price
+    keys also on Egress > Budget)"), so the editor sits where the setting does its work, and two editors of one
+    setting can never show different values on one page. None when the key has no card on the page.
+    """
+    return editor_anchors().get((key, page_id))
+
+
+def shared_anchors() -> dict[tuple[str, str], tuple[str, ...]]:
+    """`(setting key, page id)` -> its anchors on that page, for every key the catalog anchors on two or more cards
+    of one page (the cases `editor_anchor` decides; the tests walk them all)."""
+    out: dict[tuple[str, str], list[str]] = {}
+    for spec in CATALOG.values():
+        for found in spec.pages:
+            page_id, _, card_id = found.partition("#")
+            if card_id:
+                out.setdefault((spec.key, page_id), []).append(found)
+    return {where: tuple(anchors) for where, anchors in out.items() if len(anchors) > 1}
+
+
 def anchor(page_id: str, card_id: str) -> str:
     return f"{page_id}#{card_id}"
 
@@ -656,7 +706,9 @@ def cards_for(page_id: str) -> tuple[CardSpec, ...]:
                 _generated_title(card_id),
                 "The settings of this part, from the settings catalog.",
                 fragment_only=card_id.startswith("rule-"),
-                settings_open=True,
+                # A rule's drawer exists to tune it (settings open); the seven spam detector cards sit on the long
+                # Protection page, where each one's six settings stay one click away (its summary says what it does).
+                settings_open=card_id.startswith("rule-"),
             )
         )
     return tuple(cards)
@@ -686,7 +738,7 @@ def unplaced_anchors() -> list[str]:
 
 @cache
 def is_built(page_id: str) -> bool:
-    """True when `roxy.admin.pages.<page_id>` exists (the page builder wrote it); False renders "coming soon"."""
+    """True when `roxy.admin.pages.<page_id>` exists (the page builder wrote it; every registered page has one)."""
     if page_id not in _BY_ID:
         return False
     return importlib.util.find_spec(f"{PAGE_PACKAGE}.{page_id}") is not None
@@ -1050,6 +1102,8 @@ __all__ = [
     "card",
     "cards_for",
     "describe",
+    "editor_anchor",
+    "editor_anchors",
     "is_built",
     "known",
     "nav_model",
@@ -1057,6 +1111,7 @@ __all__ = [
     "page_anchors",
     "required_cards",
     "settings_for",
+    "shared_anchors",
     "unplaced_anchors",
     "v1_rows_for",
 ]

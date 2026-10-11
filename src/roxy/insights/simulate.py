@@ -51,6 +51,7 @@ What to read next
 
 from __future__ import annotations
 
+import asyncio
 import bisect
 import functools
 import itertools
@@ -58,10 +59,14 @@ import json
 import math
 import re
 import statistics
+import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import unquote
+
+import anyio
+import anyio.to_thread
 
 from roxy.abuse.limiter import LimiterRow, fixed, gcra
 from roxy.cache.keys import build_key
@@ -287,6 +292,25 @@ class ChangeEstimate:
     changes: int = 0
     intervals: list[float] = field(default_factory=list)  # seconds between consecutive changes of one key
     observed_s: float = 0.0  # summed span between first and last fetch of each key
+    interval_count: int | None = None
+    """The number of intervals when only their median is kept (`from_summary`: the SQL tuner of
+    `metrics/read_history.py change_estimates`); None when `intervals` holds them all."""
+    median_interval_s: float | None = None
+    """The median of those intervals (with `interval_count`)."""
+
+    @classmethod
+    def from_summary(cls, summary: Mapping[str, Any] | None) -> ChangeEstimate:
+        """An estimate from one template's `read_history.change_estimates` entry (an empty one for None)."""
+        if not summary:
+            return cls()
+        return cls(
+            keys=int(summary["keys"]),
+            keys_with_changes=int(summary["keys_with_changes"]),
+            changes=int(summary["changes"]),
+            observed_s=int(summary["observed_ms"]) / 1000,
+            interval_count=int(summary["intervals"]),
+            median_interval_s=summary["median_interval_s"],
+        )
 
     @property
     def never_changed(self) -> bool:
@@ -298,6 +322,8 @@ class ChangeEstimate:
         """The median interval between body changes, or None when it cannot be told."""
         if self.intervals:
             return float(statistics.median(self.intervals))
+        if self.interval_count and self.median_interval_s is not None:
+            return float(self.median_interval_s)
         if self.changes:
             return self.observed_s / self.changes  # one change per key: the rate is the best estimate left
         return None
@@ -307,7 +333,7 @@ class ChangeEstimate:
             "keys": self.keys,
             "keys_with_changes": self.keys_with_changes,
             "changes": self.changes,
-            "intervals": len(self.intervals),
+            "intervals": len(self.intervals) if self.interval_count is None else self.interval_count,
             "observed_s": round(self.observed_s, 1),
             "change_interval_s": None if self.change_interval_s is None else round(self.change_interval_s, 1),
             "never_changed": self.never_changed,
@@ -317,7 +343,12 @@ class ChangeEstimate:
 def estimate_change_interval(
     samples: Iterable[Sample], *, key_of: Callable[[Sample], str | None] = lambda s: s.get("key_id")
 ) -> ChangeEstimate:
-    """The 11.3 tuner estimate over the fetches (samples with a body hash) of each key."""
+    """The 11.3 tuner estimate over the fetches (samples with a body hash) of each key.
+
+    The rules read the same estimate from `InsightContext.change_estimate` (`metrics/read_history.py
+    change_estimates`, this computation in SQL over every sample of the window); a parity test pins the two.
+    `observed_s` sums whole milliseconds before it divides, as the SQL does, so both give the same float.
+    """
     per_key: dict[str, list[tuple[int, str]]] = {}
     for sample in _ordered(samples):
         key = key_of(sample)
@@ -326,11 +357,12 @@ def estimate_change_interval(
             continue
         per_key.setdefault(key, []).append((int(sample["at_ms"]), str(body)))
     estimate = ChangeEstimate()
+    observed_ms = 0
     for fetches in per_key.values():
         if len(fetches) < 2:
             continue
         estimate.keys += 1
-        estimate.observed_s += (fetches[-1][0] - fetches[0][0]) / 1000
+        observed_ms += fetches[-1][0] - fetches[0][0]
         points: list[float] = []
         for (t0, h0), (t1, h1) in itertools.pairwise(fetches):
             if h0 != h1:
@@ -339,6 +371,7 @@ def estimate_change_interval(
             estimate.keys_with_changes += 1
             estimate.changes += len(points)
             estimate.intervals += [b - a for a, b in itertools.pairwise(points)]
+    estimate.observed_s = observed_ms / 1000
     return estimate
 
 
@@ -687,6 +720,11 @@ class DryRunReport:
     baseline_requests: int = 0
     baseline_upstream_calls: int = 0
     parts: dict[str, Any] = field(default_factory=dict)
+    requested_window_s: int = DEFAULT_WINDOW_S
+    """The window asked for; `window_s` is the span replayed, shorter when `bounded`."""
+    bounded: bool = False
+    """The window held more samples than one replay reads (`MAX_REPLAY_ROWS` of each kind): only its newest part
+    (`window_s`) was replayed, and `note` says so (gaps_insights G7: never a silently cut window)."""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -736,26 +774,87 @@ def _thinned(limit: float, scale: float) -> int:
     return max(1, round(float(limit) / scale))
 
 
+MAX_REPLAY_ROWS: Final = 50_000
+"""Most request samples (and, for a limit, refusal samples) one dry run replays (plan P9; with the context's memo
+bound this keeps an evaluation's peak where finding LOAD-2 left it). A window that holds more is replayed over its
+newest part that fits (`InsightContext.replay_samples`), and the report says so (`bounded`, `note`)."""
+
+REPLAY_THREADS: Final = 1
+"""Pure replay work that runs at once per event loop (`offload`): the dry runs of an evaluation run one after the
+other anyway, and one thread keeps a worker's CPU for its requests."""
+
+_REPLAY_LIMITERS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, anyio.CapacityLimiter] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _replay_limiter() -> anyio.CapacityLimiter:
+    """This event loop's limiter (anyio binds a limiter to the loop that first uses it, and the Preview API replays
+    on a thread with a loop of its own, `admin/api/recommendations.py _replay`)."""
+    loop = asyncio.get_running_loop()
+    found = _REPLAY_LIMITERS.get(loop)
+    if found is None:
+        found = _REPLAY_LIMITERS[loop] = anyio.CapacityLimiter(REPLAY_THREADS)
+    return found
+
+
+async def offload[R](fn: Callable[..., R], *args: Any) -> R:
+    """`fn(*args)` on a worker thread, `REPLAY_THREADS` at a time per event loop (as `admin/auth/passwords.py`
+    runs argon2): CPU-heavy pure work (a replay over tens of thousands of samples takes tens to hundreds of
+    milliseconds) never holds the event loop, which keeps answering the leader worker's requests meanwhile
+    (gaps_insights G7). The function must only read what it is given (the samples, the settings and rules
+    snapshots, all immutable)."""
+    return await anyio.to_thread.run_sync(functools.partial(fn, *args), limiter=_replay_limiter())
+
+
+@dataclass(slots=True)
+class _ReplayInput:
+    """What `dry_run` read on the event loop, for the replay on a worker thread."""
+
+    rec: Recommendation
+    samples: Sequence[Sample]
+    refusals: Sequence[Sample]
+    weigh: Callable[[Sample], float]
+    post_mode: str
+    error_ttl: int
+    swr_default: int
+    ignored: frozenset[str]
+    added: frozenset[str]
+    plan: list[tuple[ProposedChange, set[str]]]
+    templates: set[str]
+    queue_wait_ms: float
+    texts: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
 async def dry_run(ctx: InsightContext, rec: Recommendation, *, window_s: int = DEFAULT_WINDOW_S) -> DryRunReport:
     """Replay the last `window_s` seconds of samples under the recommendation's changes (see the module docstring).
 
-    Cache changes are replayed first; a bucket override then replays the upstream calls that would remain.
+    Cache changes are replayed first; a bucket override then replays the upstream calls that would remain. The
+    samples are read on the event loop (database reads run on reader threads); the replays, pure work over up to
+    `MAX_REPLAY_ROWS` samples, run on a worker thread (`offload`). A window holding more samples than that is
+    replayed over its newest part that fits, and the report says so (`bounded`, `window_s`, `note`).
     """
     hours = float(ctx.setting("request_sample_hours"))
     window_s = int(min(max(60, window_s), hours * 3600))
-    report = DryRunReport(available=can_simulate(rec), window_s=window_s)
+    report = DryRunReport(available=can_simulate(rec), window_s=window_s, requested_window_s=window_s)
     report.sample_pct = float(ctx.setting("request_sample_pct"))
-    scale = report.scale = _sample_scale(report.sample_pct)
+    report.scale = _sample_scale(report.sample_pct)
     if report.sample_pct <= 0:
         report.note = "Request sampling is off (request_sample_pct 0), so there are no samples to replay."
     elif report.sample_pct < 100:
         report.note = (
             f"Samples cover {report.sample_pct:g}% of requests; counts are scaled to all requests "
-            f"(times {scale:.3g}), so they are estimates."
+            f"(times {report.scale:.3g}), so they are estimates."
         )
     if not report.available:
         return report
-    window = ctx.window(seconds=window_s)
+    replay = await ctx.replay_samples(
+        ctx.window(seconds=window_s), refusals=_replays_limits(rec), bound=MAX_REPLAY_ROWS
+    )
+    window = replay.window
+    if not replay.complete:
+        report.bounded = True
+        report.window_s = int(window.end - window.start)
     post_mode = str(ctx.setting("cache_post_requests"))
     error_ttl = int(ctx.setting("cache_error_ttl_seconds"))
     ignored: frozenset[str] = frozenset(ctx.rules.cache_ignored_params)
@@ -767,55 +866,96 @@ async def dry_run(ctx: InsightContext, rec: Recommendation, *, window_s: int = D
             error_ttl = int(change.proposed)
         if change.kind == "ignored_param_add" and isinstance(change.proposed, Mapping):
             added.add(str(change.proposed.get("name")))
-    ignored = ignored | added
-    all_samples = await ctx.samples(window)
     # Each sample counts for 100 / the rate it was taken at (its own `sample_pct`, else the rate in force at its
     # time), never the live rate for the whole window (finding LOGICFIX-6).
     weigh = await _sample_weights(ctx, window, report.sample_pct)
-    weights = [weigh(s) for s in all_samples]
+    data = _ReplayInput(
+        rec=rec,
+        samples=replay.rows,
+        refusals=replay.refusals,
+        weigh=weigh,
+        post_mode=post_mode,
+        error_ttl=error_ttl,
+        swr_default=int(ctx.setting("cache_swr_seconds")),
+        ignored=ignored | added,
+        added=frozenset(added),
+        plan=[],
+        templates=set(),
+        queue_wait_ms=float(ctx.setting("queue_wait_interactive_ms")),
+    )
+    wanted_keys = await offload(_plan_replay, ctx, data, report)
+    if wanted_keys:
+        data.texts = dict(await ctx.key_texts(wanted_keys))
+    await offload(_run_replay, ctx, data, report)
+    if report.bounded:
+        lead = f"{report.note} " if report.note else ""
+        report.note = (
+            f"{lead}The last {round(report.requested_window_s / 60):,} minutes hold more than {MAX_REPLAY_ROWS:,} "
+            f"samples, so only the newest {round(report.window_s / 60):,} minutes were replayed."
+        )
+    return report
+
+
+def _plan_replay(ctx: InsightContext, data: _ReplayInput, report: DryRunReport) -> list[str]:
+    """On a worker thread (`offload`): the sampling note, the templates of the window and the cache changes to
+    replay (`data.templates`, `data.plan`), and the key ids whose stored key texts the replay needs (read next, on
+    the event loop). Reads only immutable inputs: the samples and the context's settings and rules snapshots."""
+    weights = [data.weigh(s) for s in data.samples]
     if weights:
         rates = sorted({round(100.0 / w, 2) for w in weights})
         if len(rates) > 1:
-            scale = report.scale = round(sum(weights) / len(weights), 4)
+            report.scale = round(sum(weights) / len(weights), 4)
             report.note = (
                 f"Samples in this window were taken at different rates ({rates[0]:g}% to {rates[-1]:g}%); each "
                 "counts for 100 / the rate it was taken at, so counts are estimates."
             )
-        elif abs(weights[0] - scale) > 1e-9:
-            scale = report.scale = weights[0]
+        elif abs(weights[0] - report.scale) > 1e-9:
+            report.scale = weights[0]
             report.note = (
                 f"The samples in this window were taken at {rates[0]:g}% (request_sample_pct is "
-                f"{report.sample_pct:g}% now); counts are scaled to all requests (times {scale:.3g})."
+                f"{report.sample_pct:g}% now); counts are scaled to all requests (times {report.scale:.3g})."
             )
-    refusals = await ctx.refusal_samples(window) if _replays_limits(rec) else []
-    templates = {str(s["endpoint_template"]) for s in all_samples}
-    call_times: list[int] | None = None
-    affected_templates: set[str] = set()
+    data.templates = {str(s["endpoint_template"]) for s in data.samples}
     plan: list[tuple[ProposedChange, set[str]]] = []
-    for change in rec.changes:
+    for change in data.rec.changes:
         if change.kind == "rule_upsert" and change.table == "rules_cache":
             matches = _matcher(change)
             if matches is not None:
-                plan.append((change, {t for t in templates if matches(t)}))
-    if (added or _changes_setting(rec, "cache_error_ttl_seconds")) and not plan:
+                plan.append((change, {t for t in data.templates if matches(t)}))
+    if (data.added or _changes_setting(data.rec, "cache_error_ttl_seconds")) and not plan:
         # An ignored parameter or the error lifetime alone: replay every template under the rule it has today.
-        plan = [(_current_rule_change(ctx, template), {template}) for template in sorted(templates)]
+        plan = [(_current_rule_change(ctx, template), {template}) for template in sorted(data.templates)]
+    data.plan = plan
+    affected_all: set[str] = set()
+    for _change, affected in plan:
+        affected_all |= affected
+    return sorted(
+        {str(s["key_id"]) for s in data.samples if s["endpoint_template"] in affected_all and s.get("key_id")}
+    )
+
+
+def _run_replay(ctx: InsightContext, data: _ReplayInput, report: DryRunReport) -> None:
+    """On a worker thread (`offload`): every replay of the recommendation (cache, limits, buckets), written into
+    `report`. Pure: reads only `data` and the context's immutable snapshots."""
+    scale = report.scale
+    weigh = data.weigh
+    call_times: list[int] | None = None
+    affected_templates: set[str] = set()
     avoided = baseline_requests = baseline_calls = 0.0
-    for change, affected in plan:
+    for change, affected in data.plan:
         affected_templates |= affected
-        rows = [s for s in all_samples if s["endpoint_template"] in affected]
+        rows = [s for s in data.samples if s["endpoint_template"] in affected]
         rule = _cache_rule(change)
-        texts = await ctx.key_texts(str(s["key_id"]) for s in rows if s.get("key_id"))
-        key_of = _rekey(rule, texts, ignored, rebuild=bool(added) or _flags_change(change))
-        swr = rule.stale_ttl if rule.stale_ttl > 0 else int(ctx.setting("cache_swr_seconds"))
-        negative = _negative_ttl(rule, error_ttl)
+        key_of = _rekey(rule, data.texts, data.ignored, rebuild=bool(data.added) or _flags_change(change))
+        swr = rule.stale_ttl if rule.stale_ttl > 0 else data.swr_default
+        negative = _negative_ttl(rule, data.error_ttl)
 
         def cacheable(sample: Sample, rule: CacheRuleRow = rule) -> bool:
             method = str(sample.get("method") or "GET").upper()
             if method == "GET":
                 return "GET" in rule.methods
             if method == "POST":
-                return post_allowed(str(sample["endpoint_template"]), rule, post_mode)
+                return post_allowed(str(sample["endpoint_template"]), rule, data.post_mode)
             return False
 
         replay = cache_replay(
@@ -829,20 +969,20 @@ async def dry_run(ctx: InsightContext, rec: Recommendation, *, window_s: int = D
         baseline_requests += replay.weighted_requests
         baseline_calls += sum(weigh(s) for s in rows if s.get("egress") not in (None, "none"))
         call_times = _call_times(rows, rule.ttl, cacheable, key_of, negative)
-    if plan:
+    if data.plan:
         report.avoided_calls = round(avoided)
         report.baseline_requests = round(baseline_requests)
         report.baseline_upstream_calls = round(baseline_calls)
-    for targets, limit in _limit_replays(ctx, rec, all_samples, refusals, templates, scale, weigh):
+    for targets, limit in _limit_replays(ctx, data.rec, data.samples, data.refusals, data.templates, scale, weigh):
         for target in targets:
             report.parts[target] = limit.to_dict()
         report.refused_requests = (report.refused_requests or 0) + round(limit.refused_weight)
         report.sample_size = max(report.sample_size, limit.requests)
-    for change in rec.changes:
+    for change in data.rec.changes:
         if change.kind != "bucket_override" or not isinstance(change.proposed, Mapping) or not change.bucket_key:
             continue
         template = change.bucket_key.split(":", 1)[1] if change.bucket_key.startswith("endpoint:") else None
-        rows = [s for s in all_samples if template is None or s["endpoint_template"] == template]
+        rows = [s for s in data.samples if template is None or s["endpoint_template"] == template]
         times = (
             call_times
             if call_times is not None and template in affected_templates
@@ -853,14 +993,13 @@ async def dry_run(ctx: InsightContext, rec: Recommendation, *, window_s: int = D
             times,
             per_min=float(change.proposed.get("per_min") or 1) / scale,
             burst=_thinned(int(change.proposed.get("burst") or 1), scale),
-            max_wait_ms=float(ctx.setting("queue_wait_interactive_ms")),
+            max_wait_ms=data.queue_wait_ms,
             key=change.bucket_key,
         )
         report.parts[change.target] = replay_b.to_dict()
         report.refused_requests = (report.refused_requests or 0) + _scaled(replay_b.refused, scale)
         report.queue_wait_p95_ms = replay_b.percentile(0.95)
         report.sample_size = max(report.sample_size, replay_b.requests)
-    return report
 
 
 def _changes_setting(rec: Recommendation, key: str) -> bool:

@@ -22,8 +22,8 @@ from typing import Any
 
 import pytest
 
+from pages_harness import parse_html
 from roxy.admin.pages import registry
-from roxy.admin.pages.testing import parse_html
 from roxy.core.style_guard import find_style_issues
 
 PAGE = "/admin/traffic"
@@ -61,7 +61,8 @@ async def test_every_card_the_v1_elements_and_the_assets_are_on_the_page(page: A
         assert fragment.select_one(f'section#{card} [data-table="{table}"]') is not None, card
         assert fragment.select_one(f"section#{card} [data-chart]") is not None, card
         export = fragment.select_one(f'[data-table="{table}"] a[data-export][href*="format=csv"]')
-        assert export is not None and export.get("href").startswith("/admin/api/v1/traffic/")
+        assert export is not None
+        assert export.get("href").startswith("/admin/api/v1/traffic/")
     for card in ("bytes", "heatmap", "trends"):
         response = await page.fragment("traffic", card)
         assert response.status_code == 200
@@ -91,7 +92,10 @@ async def test_the_requests_totals_equal_the_api_series(page: Any, pages_app: An
     for key, value in by_key.items():
         assert shown[key] == f"{int(value):,}", key
     chart = doc.select_one("#requests figure[data-chart]")
-    assert chart is not None and chart.get("data-series")  # embedded: no request after the first paint
+    assert chart is not None
+    # The chart reads the same API answer by URL after the first paint (plan 6.7 page weight, gaps_latency L4).
+    assert chart.get("data-series") is None
+    assert chart.get("data-series-src", "").split("?")[0] == "/admin/api/v1/traffic/requests"
     assert chart.get("data-chart-stack") == "outcome"
 
 
@@ -109,8 +113,7 @@ async def test_status_tiles_verdict_and_table_equal_the_api(page: Any, pages_app
     rows = doc.select('#status [data-table="traffic_status_sources"] tbody tr[data-row-id]')
     assert len(rows) == api["total"]
     shown = sorted(
-        (r.select_one('td[data-col="source_label"]').text(), r.select_one('td[data-col="status"]').text())
-        for r in rows
+        (r.select_one('td[data-col="source_label"]').text(), r.select_one('td[data-col="status"]').text()) for r in rows
     )
     expected = sorted((item["source_label"], str(item["status"])) for item in api["items"])
     assert shown == expected
@@ -134,7 +137,8 @@ async def test_verbs_and_latency_tables_equal_the_api(page: Any, pages_app: Any)
         keys = sorted(r.select_one('td[data-col="key"]').text() for r in found)
         assert keys == sorted(str(item["key"]) for item in api["items"]), split
         chart = fragment.select_one("#latency figure[data-chart]")
-        assert chart is not None and chart.get("data-series")
+        assert chart is not None
+        assert chart.get("data-series")
     none = parse_html((await page.fragment("traffic", "latency")).text)
     assert none.select_one('#latency select[name="split"] option[value="none"][selected]') is not None
 

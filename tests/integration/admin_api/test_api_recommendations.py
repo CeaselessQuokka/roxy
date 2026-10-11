@@ -247,6 +247,10 @@ async def test_preview_validates_the_diff_and_replays_the_samples(api: Any, api_
         )
     )
     rec = await seed(api_app, changes=[cache_rule(300), setting("cache_ttl_seconds", 120, -5)])
+    # The dry-run cache key holds the settings and rules versions: bring this worker's view up to date first, so the
+    # config watcher's own refresh (late on a loaded box) cannot land between the two previews and change the key.
+    await api_app.ctx.settings.refresh_if_changed()
+    await api_app.ctx.rules.refresh_if_changed()
     body = api_json(await api.get(f"{BASE}/{rec.id}/preview"))
     assert body["changes_digest"] == changes_digest(rec.changes)
     first, second = body["diff"]

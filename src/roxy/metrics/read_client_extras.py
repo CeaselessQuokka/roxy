@@ -25,7 +25,8 @@ How it works
       first one. Counting distinct peers across levels is one SQL statement over the union of the pieces, so a peer
       seen in an hour row and again in a minute row counts once. The `other` row of each bucket is skipped.
     - For IP rows the pair rows are found by key range (`<ip>|` to `<ip>}`, the index on client_type and key); for
-      place rows by the key's suffix, a scan of the window's pair rows (the same order of cost as the table query).
+      place rows by the key's place part, an index range of `*_pair_place` (metrics migration 0009, a partial index
+      on that expression; it was a scan of every pair row of the window, the Clients page's slowest read, plan 6.7).
     - Peer counts come from the pair rows the top-N caps kept (`max_ip_activity_records` per bucket): under a flood
       of pairs they are lower bounds, and `PEERS_BASIS` says so.
     - Everything is bounded: keys in chunks of `KEY_CHUNK`, lists to `MAX_PEERS`, scores to the keys asked for.
@@ -66,11 +67,14 @@ def _union(pieces: Sequence[tuple[str, int, int]], where: str, where_params: Seq
     parts: list[str] = []
     params: list[Any] = []
     for table, lo, hi in pieces:
+        # The pair type is written as a literal: it repeats the WHERE term of the `*_pair_place` partial indexes
+        # (metrics migration 0009), which SQLite needs before it uses a partial index.
         parts.append(
             f"SELECT client_key, requests, refused, served, bucket_start FROM {table} "  # noqa: S608 (client table names)
-            f"WHERE client_type = ? AND bucket_start >= ? AND bucket_start < ? AND client_key != ? AND ({where})"
+            f"WHERE client_type = '{PAIR_CLIENT_TYPE}' AND bucket_start >= ? AND bucket_start < ? AND client_key != ? "
+            f"AND ({where})"
         )
-        params.extend([PAIR_CLIENT_TYPE, int(lo), int(hi), OTHER_KEY, *where_params])
+        params.extend([int(lo), int(hi), OTHER_KEY, *where_params])
     return " UNION ALL ".join(parts), params
 
 
@@ -109,6 +113,16 @@ def peer_counts(
     wanted = [key for key in dict.fromkeys(str(k) for k in keys) if key and key != OTHER_KEY]
     out: dict[str, int] = {}
     if not wanted or not pieces:
+        return out
+    if client_type == "ip":
+        # One statement per address, each an indexed range (`client_minute_client` is ordered by type, key, time):
+        # SQLite does not turn an OR of ranges into index seeks, so one statement with them all read every pair row
+        # of the window (0.2 s for a page of 25 addresses at plan 6.6's volume; plan 6.7).
+        for key in wanted:
+            union, params = _union(pieces, *_ip_ranges([key]))
+            row = conn.execute(f"SELECT count(DISTINCT {peer}) FROM ({union})", params).fetchone()  # noqa: S608
+            if row is not None and row[0]:
+                out[key] = int(row[0])
         return out
     for first in range(0, len(wanted), KEY_CHUNK):
         chunk = wanted[first : first + KEY_CHUNK]

@@ -37,6 +37,7 @@ What to read next
 
 from __future__ import annotations
 
+import functools
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -53,10 +54,11 @@ from roxy.config.defaults import ID_LIST_PARAMS
 from roxy.core.redact import redact_text
 from roxy.insights import providers_rules_cache_egress as extra
 from roxy.insights import simulate
-from roxy.insights.context import InsightContext
+from roxy.insights.context import InsightContext, bound_note
 from roxy.insights.models import Evidence, ProposedChange, Recommendation
 from roxy.insights.rules.base import Rule, register
 from roxy.insights.rules.core import HOUR_S, SWR_SHARE_OF_TTL, per_hour_text, rule_columns
+from roxy.metrics import read_history
 from roxy.metrics.queries import Window
 from roxy.metrics.templating import OTHER, template_for
 
@@ -155,8 +157,8 @@ async def tuned_ttl(ctx: InsightContext, template: str) -> tuple[int | None, sim
     """The TTL tuner's lifetime for one template (None without a measurement or while the tuner is off)."""
     if not int(ctx.setting("ttl_tuner_enabled")):
         return None, simulate.ChangeEstimate()
-    samples = await ctx.samples(ctx.window(hours=float(ctx.setting("request_sample_hours"))), [template])
-    estimate = simulate.estimate_change_interval(samples)
+    window = ctx.window(hours=float(ctx.setting("request_sample_hours")))
+    estimate = await ctx.change_estimate(window, template)  # one SQL read per window for every rule (G7)
     tuned = simulate.proposed_ttl(estimate, cap_s=float(ctx.setting("ttl_tuner_max_s")))
     return (None if tuned is None else int(min(tuned, MAX_CACHE_RULE_TTL_S))), estimate
 
@@ -205,6 +207,8 @@ def setting_max(key: str) -> float:
 async def impact_from_dry_run(ctx: InsightContext, rec: Recommendation, window_s: int, scope: str) -> str | None:
     """`About N fewer upstream calls per hour ...` from the 11.3 dry run, or None when no samples cover it."""
     report = await simulate.dry_run(ctx, rec, window_s=window_s)
+    if report.bounded:
+        rec.evidence.details["sample_bound"] = report.note  # only the newest part of the window was replayed (G7)
     if report.avoided_calls is None or not report.sample_size:
         return None
     note = f" {report.note}" if report.note else ""
@@ -290,12 +294,16 @@ async def split_findings(ctx: InsightContext, limits: Mapping[str, float]) -> li
         rows = await extra.spread(ctx, SPREAD_ROWS)
         if not rows:
             return []
-        groups = compute_spread(
-            rows,
-            min_entries=limits["min_entries"],
-            distinct_pct=limits["distinct_pct"],
-            max_hit_pct=limits["max_hit_pct"],
-            limit=MAX_SPLIT_GROUPS,
+        # Grouping up to SPREAD_ROWS entries is pure CPU work: on a worker thread, off the event loop (G7).
+        groups = await simulate.offload(
+            functools.partial(
+                compute_spread,
+                rows,
+                min_entries=limits["min_entries"],
+                distinct_pct=limits["distinct_pct"],
+                max_hit_pct=limits["max_hit_pct"],
+                limit=MAX_SPLIT_GROUPS,
+            )
         )
         suspects = {group.key: group for group in groups if group.suspect and group.suspect_param}
         if not suspects:
@@ -862,7 +870,11 @@ class CacheKeysplit(Rule):
         ]
         if not rows:
             return None
-        groups = compute_spread(rows, min_entries=1, distinct_pct=0, max_hit_pct=100, limit=MAX_SPLIT_GROUPS)
+        groups = await simulate.offload(  # pure CPU work: on a worker thread, off the event loop (G7)
+            functools.partial(
+                compute_spread, rows, min_entries=1, distinct_pct=0, max_hit_pct=100, limit=MAX_SPLIT_GROUPS
+            )
+        )
         distinct_pct = self.param(ctx, "distinct_pct")
         ignored = frozenset(ctx.rules.cache_ignored_params)
         for group in groups:
@@ -1151,31 +1163,45 @@ class CacheNeg(Rule):
             changes=[ProposedChange("setting", key=key, current=current, proposed=proposed)],
             risk="low",
         )
-        rec.expected_impact = await self._impact(ctx, window, repeated, proposed, scale)
+        rec.expected_impact = await self._impact(ctx, window, repeated, proposed, scale, rec.evidence)
         return [rec]
 
     @staticmethod
     async def _impact(
-        ctx: InsightContext, window: Window, repeated: Sequence[Mapping[str, Any]], ttl: int, scale: float
+        ctx: InsightContext,
+        window: Window,
+        repeated: Sequence[Mapping[str, Any]],
+        ttl: int,
+        scale: float,
+        evidence: Evidence,
     ) -> str:
         """Replay the repeated error fetches under the proposed lifetime (plan 11.3 cache replay)."""
         keys = {str(g["key_id"]) for g in repeated}
         statuses = {int(g["status"]) for g in repeated}
-        samples = await ctx.samples(window, sorted({str(g["endpoint_template"]) for g in repeated}))
+        # Only the repeated error calls, filtered in SQL (G7): the rest of the hour's samples are never read.
+        read = await ctx.sample_read(
+            window,
+            sorted({str(g["endpoint_template"]) for g in repeated}),
+            where=read_history.SampleFilter(called=True, key_ids=tuple(sorted(keys)), statuses=tuple(sorted(statuses))),
+        )
         rows = [
             s
-            for s in samples
+            for s in read.rows
             if str(s.get("key_id")) in keys
             and s.get("upstream_status") in statuses
             and str(s.get("egress") or "none") != "none"
         ]
         # Every row is an error answer, so only the error lifetime decides what the cache keeps (a 2xx lifetime is
-        # passed only because 0 would mean "never cache this endpoint").
-        replay = simulate.cache_replay(rows, ttl_s=ttl, negative_ttl_s=ttl)
+        # passed only because 0 would mean "never cache this endpoint"). Pure work: on a worker thread.
+        replay = await simulate.offload(functools.partial(simulate.cache_replay, rows, ttl_s=ttl, negative_ttl_s=ttl))
         avoided = round(replay.avoided_calls * scale)
+        cut = bound_note(read, "repeated error calls")
+        if cut is not None:
+            evidence.details["sample_bound"] = cut
         return (
             f"About {avoided:,} of the {round(replay.requests * scale):,} repeated error calls of the last hour would "
             f"have been answered from the cache (replayed over {replay.requests:,} request samples)."
+            + (f" {cut}" if cut else "")
         )
 
 

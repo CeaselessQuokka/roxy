@@ -130,6 +130,29 @@ def duration_text(seconds: Any) -> str | None:
     return f"{minutes} min {rest} s" if rest else f"{minutes} min"
 
 
+def _detail_value(value: Any, depth: int = 0) -> str:
+    """One detail value as words: numbers grouped, booleans as yes or no, a nested mapping as `read 19.3, write
+    3.6` and a list joined with commas (never Python's own `{'read': ...}` form)."""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        return f"{value:,.3g}" if abs(value) < 1000 else f"{value:,.0f}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "n/a"
+    if depth < 2 and isinstance(value, Mapping):
+        return ", ".join(
+            f"{str(k).replace('_', ' ')} {_detail_value(v, depth + 1)}"
+            for k, v in list(value.items())[:MAX_DETAIL_ITEMS]
+        )
+    if depth < 2 and isinstance(value, list | tuple):
+        return ", ".join(_detail_value(v, depth + 1) for v in value[:MAX_DETAIL_ITEMS])
+    return str(value)
+
+
 def detail_items(detail: Any) -> list[tuple[str, str]]:
     """A result's `detail` as label and value pairs (`queue_wait_ms` reads "Queue wait ms")."""
     if not isinstance(detail, Mapping):
@@ -137,17 +160,7 @@ def detail_items(detail: Any) -> list[tuple[str, str]]:
     items: list[tuple[str, str]] = []
     for key, value in list(detail.items())[:MAX_DETAIL_ITEMS]:
         label = str(key).replace("_", " ").strip().capitalize()
-        if isinstance(value, bool):
-            text = "yes" if value else "no"
-        elif isinstance(value, float):
-            text = f"{value:,.3g}" if abs(value) < 1000 else f"{value:,.0f}"
-        elif isinstance(value, int):
-            text = f"{value:,}"
-        elif isinstance(value, str):
-            text = value
-        else:
-            text = str(value)
-        items.append((label, text[:300]))
+        items.append((label, _detail_value(value)[:300]))
     return items
 
 

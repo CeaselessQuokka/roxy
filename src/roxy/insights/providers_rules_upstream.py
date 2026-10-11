@@ -24,9 +24,10 @@ Why it exists
 How it works
     `rotator_status` reads two numbers from metrics.db (this cycle's and today's rotator bytes) and two facts the
     context already memoizes (active cooldown rows, for the park key, and the leak guard's `service_state` row).
-    `ua_experiment_arms` reads the samples since the experiment (or one of its User-Agent strings) last changed,
-    bounded by `request_sample_hours` and by `read_history.MAX_ROWS` rows: an estimate, labeled as one, whose call
-    counts are sampled calls (a lower bound when `request_sample_pct` is below 100).
+    `ua_experiment_arms` counts the samples since the experiment (or one of its User-Agent strings) last changed,
+    bounded by `request_sample_hours`, in SQL per experiment identity (`InsightContext.ua_arm_counts`, every sample
+    of the span; at most `read_history.MAX_ROWS` identities, and a `note` says when more had calls): an estimate,
+    labeled as one, whose call counts are sampled calls (a lower bound when `request_sample_pct` is below 100).
 
 What to read next
     `roxy/insights/rules/upstream.py` (the rules that use these), `roxy/egress/rotator.py` (the budget),
@@ -161,22 +162,42 @@ async def ua_experiment_arms(ctx: InsightContext) -> dict[str, Any] | None:
     started = await experiment_started_at(ctx, window.start)
     if started >= window.end:
         return None
-    samples = await ctx.samples(span_window(started, window.end))
-    return arms_from_samples(samples, ctx.settings)
+    # Counted in SQL per identity over every sample of the span (gaps_insights G7; reading the rows stopped at the
+    # oldest 50,000 of a busy day), then each identity's arm is assigned here exactly as for one sample row.
+    counts = await ctx.ua_arm_counts(span_window(started, window.end))
+    arms = arms_from_counts(counts.rows, ctx.settings)
+    if not counts.complete:
+        arms["note"] = (
+            f"Only the {len(counts.rows):,} busiest experiment keys were counted (more had direct calls), so the "
+            "arms are a lower bound."
+        )
+    return arms
 
 
 def arms_from_samples(samples: Sequence[Mapping[str, Any]], settings: Mapping[str, Any]) -> dict[str, Any]:
-    """Direct calls and Roblox 429s per experiment arm (see the module docstring). Pure, so it is unit tested."""
-    profiles = HeaderProfiles(settings, "")
-    counts: dict[str, list[int]] = {"primary": [0, 0], "alt": [0, 0]}
+    """Direct calls and Roblox 429s per experiment arm (see the module docstring), from sample rows. Pure, so it is
+    unit tested; `ua_experiment_arms` reads the same counts per identity in SQL (`arms_from_counts`)."""
+    per_identity: dict[str, list[int]] = {}
     for sample in samples:
         if sample.get("egress") != Egress.DIRECT.value or sample.get("upstream_status") is None:
             continue  # only calls that reached Roblox on the direct path are part of the experiment
         identity = str(sample.get("key_id") or sample.get("endpoint_template") or "")
-        arm = profiles.ua_variant(Egress.DIRECT, identity)
-        counts[arm][0] += 1
+        entry = per_identity.setdefault(identity, [0, 0])
+        entry[0] += 1
         if int(sample["upstream_status"]) == TOO_MANY_REQUESTS:
-            counts[arm][1] += 1
+            entry[1] += 1
+    return arms_from_counts([(i, calls, limited) for i, (calls, limited) in per_identity.items()], settings)
+
+
+def arms_from_counts(rows: Sequence[tuple[str, int, int]], settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Direct calls and Roblox 429s per experiment arm from `(identity, calls, roblox_429s)` rows
+    (`read_history.ua_arm_counts`): each identity's arm is the egress layer's own assignment."""
+    profiles = HeaderProfiles(settings, "")
+    counts: dict[str, list[int]] = {"primary": [0, 0], "alt": [0, 0]}
+    for identity, calls, limited in rows:
+        arm = profiles.ua_variant(Egress.DIRECT, identity)
+        counts[arm][0] += int(calls)
+        counts[arm][1] += int(limited)
     labels = {"primary": str(settings["direct_user_agent"]), "alt": str(settings["ua_experiment_alt_user_agent"])}
     return {
         "arms": [
@@ -192,6 +213,7 @@ __all__ = [
     "SAMPLE_SOURCE",
     "UA_EXPERIMENT_KEYS",
     "RotatorStatus",
+    "arms_from_counts",
     "arms_from_samples",
     "experiment_started_at",
     "rotator_status",

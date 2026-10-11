@@ -83,11 +83,12 @@ import random
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, TypeVar, cast
 
 from roxy.core.clock import SYSTEM_CLOCK, Clock
+from roxy.core.header_text import header_text
 from roxy.core.iphash import ip_hash
 from roxy.core.reasons import AuthClass, CacheState, Egress, Outcome, ReasonCode, Source
 from roxy.core.redact import MASK, is_secret_field, is_sensitive_key, redact_label, redact_text
@@ -102,7 +103,7 @@ from roxy.metrics.capture import (
     trim_input,
     write_captures,
 )
-from roxy.metrics.fingerprints import FingerprintAggregator, FingerprintItem, write_fingerprints
+from roxy.metrics.fingerprints import FingerprintAggregator, FingerprintItem, RequestDetail, write_fingerprints
 from roxy.metrics.live import LIVE_EVENT, LIVE_EVENTS_PER_SECOND, LiveRing, RateGate, live_entry
 from roxy.metrics.producers import ProducerHistory, ProducerItem, write_producers
 from roxy.metrics.rollups import (
@@ -1637,26 +1638,44 @@ class MetricsRecorder:
             self._count_error("record_error")
 
     def record_fingerprint(
-        self, header_pairs: Iterable[tuple[str, str]], user_agent: str | None, *, blocked: bool = False
+        self,
+        header_pairs: Iterable[tuple[str, str]],
+        user_agent: str | None,
+        *,
+        blocked: bool = False,
+        path: str | None = None,
+        client_ip: str | None = None,
+        header_names: Sequence[str] | None = None,
     ) -> None:
         """Header names, values and User-Agent of one request that passed every check (row 79).
 
         `blocked=True` (a request-filter refusal, row 134) records the header names and the User-Agent as
         aggregated `blocked_header` and `blocked_user_agent` events instead.
+
+        `path` (the target, no query), `client_ip` and `header_names` (in the order sent) describe the request for
+        its User-Agent's drill-down (v1 `GET /admin/fingerprints/user_agent`, metrics.db schema 8): the aggregator
+        keeps a reference to the newest one per User-Agent and the flush stores it (`fingerprints.stored_detail`).
+        Without `header_names` the names of `header_pairs` are used.
         """
         try:
             now_ms = _now_ms(self.clock)
             if blocked:
                 for name, _value in list(header_pairs)[:100]:
                     self._event(now_ms, BLOCKED_HEADER_EVENT, "info", str(name).lower()[:120], None, aggregate=True)
-                ua = (user_agent or "(none)")[:400]
+                ua = header_text(user_agent or "(none)")[:400]
                 self._event(now_ms, BLOCKED_UA_EVENT, "info", None, {"user_agent": redact_text(ua)}, aggregate=True)
                 return
             ignored: frozenset[str] = frozenset()
             if self.rules is not None:
                 with contextlib.suppress(Exception):
                     ignored = self.rules.snapshot().ignored_value_headers
-            self.fingerprints.add(header_pairs, user_agent, now_ms // 1000, ignored)
+            detail = None
+            if path is not None or client_ip is not None or header_names is not None:
+                if header_names is None:
+                    header_pairs = list(header_pairs)
+                    header_names = [name for name, _value in header_pairs]
+                detail = RequestDetail(path or "", client_ip or "", header_names)
+            self.fingerprints.add(header_pairs, user_agent, now_ms // 1000, ignored, detail)
         except Exception:
             self._count_error("record_fingerprint")
 
@@ -2038,8 +2057,9 @@ class MetricsRecorder:
 
     def record_visit(self, page: str, user_agent: str | None, *, count: int = 1, at_ms: int | None = None) -> None:
         """A visit to a public page (`home`, `admin`, `robots`, `sitemap`), counted per minute (row 130)."""
+        agent = header_text(user_agent) or None
         self.record_event(
-            visitors.VISIT_EVENT, "info", None, visitors.visit_detail(page, user_agent), at_ms=at_ms, count=count,
+            visitors.VISIT_EVENT, "info", None, visitors.visit_detail(page, agent), at_ms=at_ms, count=count,
             aggregate=True,
         )  # fmt: skip
 
@@ -2052,7 +2072,7 @@ class MetricsRecorder:
     def record_probe(self, ip: str, reason: str, user_agent: str | None = None, path: str | None = None) -> None:
         """An exploit or probe attempt (row 80; v1 reason strings kept, B19 fixed by `probe_signature`)."""
         try:
-            signature, detail = security_events.probe_detail(ip, reason, user_agent, path)
+            signature, detail = security_events.probe_detail(ip, reason, header_text(user_agent) or None, path)
             self._event(_now_ms(self.clock), security_events.PROBE, "warn", signature, detail, ip=ip,
                         summary_detail={})  # fmt: skip
         except Exception:
@@ -2066,8 +2086,8 @@ class MetricsRecorder:
 
     def record_crawl(self, ip: str, path: str, user_agent: str | None = None) -> None:
         """A robots.txt or sitemap.xml fetch (row 13)."""
-        self.record_event(security_events.CRAWL, "info", path[:64], security_events.crawl_detail(ip, path, user_agent),
-                          ip=ip)  # fmt: skip
+        detail = security_events.crawl_detail(ip, path, header_text(user_agent) or None)
+        self.record_event(security_events.CRAWL, "info", path[:64], detail, ip=ip)
 
     def record_throttled(self, ip: str, *, tier: int | None = None, strikes: int | None = None) -> None:
         """A client that just became throttled (the v1 `throttled_ips` watch, row 80)."""
@@ -2267,13 +2287,18 @@ def scrub_labels(ev: OutcomeEvent) -> OutcomeEvent:
     which passes the log filter, so a credential piece in a path segment or the `Roblox-Id` header must be removed
     here. Ordinary values come back unchanged (and the same event object is returned), so v1 templates and place
     ids are stored exactly as before.
+
+    The User-Agent is made readable here too (`core/header_text.py`): header bytes reach the proxy as Latin-1 text,
+    so a UTF-8 User-Agent would read as mojibake on the Live tail and the Endpoints page; it is recorded as the caller
+    wrote it, invalid bytes as `\\xNN` (the Live row still scrubs and cuts it).
     """
     template = redact_label(ev.endpoint_template) if ev.endpoint_template else ev.endpoint_template
     host = redact_label(ev.host) if ev.host else ev.host
     place = redact_label(ev.place_id) if ev.place_id else ev.place_id
-    if template == ev.endpoint_template and host == ev.host and place == ev.place_id:
+    agent = header_text(ev.user_agent) if ev.user_agent else ev.user_agent
+    if template == ev.endpoint_template and host == ev.host and place == ev.place_id and agent == ev.user_agent:
         return ev
-    return replace(ev, endpoint_template=template, host=host, place_id=place)
+    return replace(ev, endpoint_template=template, host=host, place_id=place, user_agent=agent)
 
 
 def _complete_capture(capture: CaptureInput, ev: OutcomeEvent) -> CaptureInput:

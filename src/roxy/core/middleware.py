@@ -23,6 +23,9 @@ How it works
     request in this worker's fleet counters (`count_request`; the proxy route counts its own share as `proxied`).
     Pure ASGI is used instead of Starlette's `BaseHTTPMiddleware`, which runs the app in a separate task and
     buffers through a memory stream: more overhead per request, and it breaks context variables and streaming.
+    `request_head_bytes(scope)` and `response_head_bytes(scope, status, headers)` count the request and response
+    heads as they travel between nginx and the app (plan 14.3 caller byte metrics), the response's through the same
+    header functions this stack applies (`with_request_id`, `security_headers.secured_headers`).
 
 What to read next
     `roxy/main.py` (where `build_middleware` is used), then `roxy/proxy/router.py` (what runs after the stack).
@@ -34,7 +37,8 @@ import logging
 import re
 import time
 from collections.abc import Sequence
-from typing import Any
+from http import HTTPStatus
+from typing import Any, Final
 
 from starlette.middleware import Middleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -48,7 +52,7 @@ from roxy.core.logging import request_id_var
 from roxy.core.reasons import ReasonCode
 from roxy.core.redact import redact_query
 from roxy.core.scope import get_app_context, get_state, setting_int
-from roxy.core.security_headers import SecurityHeadersMiddleware
+from roxy.core.security_headers import SecurityHeadersMiddleware, secured_headers
 
 _log = logging.getLogger("roxy.core.middleware")
 
@@ -86,6 +90,13 @@ def count_request(scope: Scope) -> None:
         counters.requests += 1  # plain int on the event loop thread: no lock needed
 
 
+def with_request_id(headers: Any, value: bytes) -> list[tuple[bytes, bytes]]:
+    """`headers` with exactly one `Roxy-Request-Id: value` at the end (a route's own copy is replaced)."""
+    out = [(k, v) for k, v in headers if k.lower() != _REQUEST_ID_HEADER_LOWER]
+    out.append((REQUEST_ID_HEADER.encode("latin-1"), value))
+    return out
+
+
 class RequestIdMiddleware:
     """Gives every request a ULID, stores it in the state and the log context, and sends `Roxy-Request-Id`."""
 
@@ -114,9 +125,7 @@ class RequestIdMiddleware:
 
         async def send_with_id(message: Message) -> None:
             if message["type"] == "http.response.start":
-                headers = [(k, v) for k, v in message.get("headers", []) if k.lower() != _REQUEST_ID_HEADER_LOWER]
-                headers.append((REQUEST_ID_HEADER.encode("latin-1"), header_value))
-                message = {**message, "headers": headers}
+                message = {**message, "headers": with_request_id(message.get("headers", []), header_value)}
             await send(message)
 
         # A context variable, so every log line written while serving this request carries its id.
@@ -335,6 +344,59 @@ class TimingMiddleware:
                     "client_ip": state.get("client_ip"),
                 }
                 _log.log(level, "http_request", extra={"fields": fields})
+
+
+# --- wire bytes (plan 14.3 caller byte metrics) --------------------------------------------------------------------
+
+DATE_HEADER_BYTES: Final = len(b"date: Sat, 11 Oct 2026 03:41:01 GMT\r\n")
+"""The `Date` header uvicorn adds to every response (`date_header=True`, `roxy/worker.py`): an IMF-fixdate is always
+29 characters, so the line is always this long. (`Server` is off: `server_header=False`.)"""
+CHUNKED_HEADER_BYTES: Final = len(b"transfer-encoding: chunked\r\n")
+"""What uvicorn adds to a response without `Content-Length` (a streamed body such as the tarpit's drip)."""
+_CRLF: Final = 2
+_HEADER_LINE_EXTRA: Final = 4  # ": " between name and value, "\r\n" after the value
+
+
+def request_head_bytes(scope: Scope) -> int:
+    """The request line and headers of this request as the server received them over the loopback connection from
+    nginx (plan 14.3 `caller_bytes_in` without the body): `METHOD target HTTP/1.1\\r\\n`, one `name: value\\r\\n`
+    per header and the empty line. Rebuilt from the parsed scope (the server already parsed the bytes; their
+    lengths are kept exactly, only optional whitespace around a value is not), so it costs one pass over the header
+    list and no copy."""
+    raw_path = scope.get("raw_path")
+    if isinstance(raw_path, bytes | bytearray):
+        # Some servers (and httpx's test transport) include the query in raw_path; count it once.
+        path_length = len(bytes(raw_path).split(b"?", 1)[0])
+    else:
+        path_length = len(str(scope.get("path", "")).encode("utf-8"))
+    query = scope.get("query_string") or b""
+    target = path_length + (1 + len(query) if query else 0)
+    method = str(scope.get("method") or "GET")
+    version = str(scope.get("http_version") or "1.1")
+    size = len(method) + 1 + target + len(" HTTP/") + len(version) + _CRLF
+    size += sum(len(name) + len(value) + _HEADER_LINE_EXTRA for name, value in scope.get("headers", []))
+    return size + _CRLF
+
+
+def response_head_bytes(scope: Scope, status: int, headers: Any) -> int:
+    """The status line and headers the app sends for a response whose route set `headers` (raw ASGI pairs; plan
+    14.3 `caller_bytes_out` without the body): the headers as the middleware stack rewrites them (the security
+    headers of `security_headers.secured_headers`, the request id of `with_request_id`, the same functions the
+    middleware runs), the `Date` header uvicorn adds, `Transfer-Encoding` when no `Content-Length` is set, the
+    status line `HTTP/1.1 <status> <reason>` and the empty line. Uncompressed: nginx gzips after this."""
+    final = secured_headers(scope, headers)
+    request_id = get_state(scope).get("request_id")
+    if isinstance(request_id, str) and request_id:
+        final = with_request_id(final, request_id.encode("latin-1"))
+    try:
+        phrase = HTTPStatus(int(status)).phrase
+    except ValueError:
+        phrase = ""
+    size = len(f"HTTP/1.1 {int(status)} {phrase}") + _CRLF
+    size += sum(len(name) + len(value) + _HEADER_LINE_EXTRA for name, value in final)
+    if not any(name.lower() == b"content-length" for name, _value in final):
+        size += CHUNKED_HEADER_BYTES
+    return size + DATE_HEADER_BYTES + _CRLF
 
 
 # --- assembly ------------------------------------------------------------------------------------------------------

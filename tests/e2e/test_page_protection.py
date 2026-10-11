@@ -8,7 +8,8 @@ What this is
     serious, the phone never scrolls sideways, and a screenshot is saved for the visual review. Then the controls:
     the sub-tabs (mouse and keyboard), a table filter swapping the table in place, a row's drawer with hostile text
     shown as text, adding and removing a request filter through the dialogs, the two testers, the ladder editor and
-    restore defaults, Bypass my IP, an inline setting saved on its card, and the emergency limit's dialog.
+    restore defaults, Bypass my IP, an inline setting saved on its card, the clients refused most opening a client,
+    one of v1's clear buttons (typed phrase, reason, the data reset), and the emergency limit's dialog.
 
 Why it exists
     The integration tests prove what the server sends; only a browser proves the page works with the strict CSP,
@@ -25,7 +26,7 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.pages.testing import HOSTILE, THEMES, VIEWPORTS, PlannedRequest
+from pages_harness import HOSTILE, THEMES, VIEWPORTS, PlannedRequest
 
 PAGE = "/admin/protection"
 NO_HOSTILE_MARKUP = """() => !document.querySelector('img[src="x"], [onerror], [onclick], a[href^="javascript:"]')
@@ -206,8 +207,12 @@ def test_add_a_request_filter_then_remove_it(open_admin: Any, dashboard: Any, pr
     admin.wait("!/e2e-added-filter/.test(document.querySelector('#prot-filters').innerText)")
     remaining = dashboard.api("GET", "protection/header-rules").json()["items"]
     assert all(rule["needle"] != "e2e-added-filter" for rule in remaining)
-    audit = dashboard.api("GET", "audit", params={"q": "e2e-added-filter"}).json()
-    assert audit["total"] >= 1
+    # Both changes are in the audit log with the reasons typed in the dialogs (the removal's reason travels in the
+    # query string of the DELETE).
+    audit = dashboard.api("GET", "audit", params={"target": f"rules_header:{added['id']}"}).json()["items"]
+    reasons = {row["action"]: row["reason"] for row in audit}
+    assert reasons.get("rule.create") == "Browser test"
+    assert reasons.get("rule.delete") == "Browser test cleanup"
     admin.assert_clean()
 
 
@@ -305,6 +310,42 @@ def test_an_inline_setting_saves_on_its_card(open_admin: Any, dashboard: Any) ->
         admin.assert_clean()
     finally:
         dashboard.change_settings({"bypass_default_expiry_h": 24})
+
+
+def test_the_clients_refused_most_tab_opens_a_client(open_admin: Any, protection_data: Any) -> None:
+    admin = open_admin(PAGE)
+    page = admin.page
+    page.locator("#refusals").scroll_into_view_if_needed()
+    admin.wait("document.querySelector('#prot-refusal-tabs') !== null")
+    page.locator('#prot-refusal-tabs [role="tab"][data-tab="clients"]').click()
+    rows = page.locator("#prot-clients tbody tr[data-row-id]")
+    assert rows.count() >= 1
+    rows.first.locator("[data-dt-open]").click()
+    admin.wait("document.querySelector('#drawer[open]') && /Address/.test(document.querySelector('#drawer').innerText)")
+    assert page.evaluate(NO_HOSTILE_MARKUP)
+    page.keyboard.press("Escape")
+    admin.wait("!document.querySelector('#drawer[open]')")
+    admin.assert_clean()
+
+
+def test_a_v1_clear_button_asks_for_the_phrase_then_resets(open_admin: Any, dashboard: Any) -> None:
+    admin = open_admin(PAGE)
+    page = admin.page
+    page.locator("#ladder").scroll_into_view_if_needed()
+    admin.wait("document.querySelector('#ladder [data-action=\"clear-throttle-rule-hits\"]') !== null")
+    page.locator('#ladder [data-action="clear-throttle-rule-hits"]').click()
+    dialog = "#dlg-prot-clear-throttle-rule-hits"
+    admin.wait(f"document.querySelector('{dialog}[open]') !== null")
+    submit = page.locator(f'{dialog} button[type="submit"]')
+    assert submit.is_disabled()  # the typed phrase is still missing
+    page.fill(f"{dialog}-reason", "Browser test of a clear button")
+    page.fill(f"{dialog}-confirm", "reset throttle_rule_hits")
+    assert submit.is_enabled()
+    submit.click()
+    admin.wait(f"!document.querySelector('{dialog}[open]')")
+    audit = dashboard.api("GET", "audit", params={"q": "Browser test of a clear button"}).json()
+    assert audit["total"] >= 1
+    admin.assert_clean()
 
 
 def test_the_emergency_limit_card_opens_the_top_bar_dialog(open_admin: Any) -> None:

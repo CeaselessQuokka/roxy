@@ -1,10 +1,10 @@
-"""The dashboard's shared routes: `/admin/dashboard`, the "coming soon" pages and the shell's small endpoints.
+"""The dashboard's shared routes: `/admin/dashboard` and the shell's small endpoints.
 
 What this is
     * `GET /admin/dashboard`: v1's dashboard URL (smoke check 173, `GET /admin/dashboard (logged in) -> 200`) and the
       address the login flow sends a signed-in admin to; it renders the Overview page itself (200, not a redirect).
-    * `coming_soon_router(spec)`: `GET /admin/<id>` for a registered page whose module is not written yet: the shell
-      with the page's purpose and the list of cards it will have, so the navigation works from the start.
+      (While the pages were being built, this module also served a "coming soon" page for a registered page without
+      its module; every page is built since the P11 integration, so a missing page module now fails at startup.)
     * `GET /admin/ui/setting/{key}?prefix=`: one inline setting control (API mode), re-rendered after a save or when
       the event stream says settings changed (`static/js/settings_api.js`).
     * `GET /admin/ui/palette?q=`: the command palette's server results (settings, recommendations, endpoints; at most
@@ -36,7 +36,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from roxy.admin.pages import inline, registry, shell
 from roxy.admin.pages.kit import PageAdmin, page_session, templates_of
-from roxy.admin.pages.registry import PageSpec
 from roxy.config import catalog
 from roxy.deps import get_ctx
 from roxy.insights import read_recommendations
@@ -45,7 +44,6 @@ from roxy.metrics import queries
 log = logging.getLogger("roxy.admin.pages")
 
 DASHBOARD_PATH: Final = "/admin/dashboard"
-COMING_SOON_TEMPLATE: Final = "admin/pages/_coming_soon.html"
 SETTING_TEMPLATE: Final = "admin/pages/_setting.html"
 MAX_PALETTE: Final = 20
 PALETTE_MIN_CHARS: Final = 2
@@ -55,37 +53,14 @@ PALETTE_ENDPOINT_WINDOW_S: Final = 86_400
 router = APIRouter(dependencies=[Depends(page_session)])
 
 
-async def render_coming_soon(request: Request, principal: Any, spec: PageSpec) -> HTMLResponse:
-    """The shell with a plain "coming soon" body for a registered page that is not built yet."""
-    built = await shell.build_shell(request, principal, spec)
-    cards = [card for card in registry.cards_for(spec.id) if not card.fragment_only]
-    context = {**built.context, "coming_cards": cards}
-    return templates_of(request).render(request, COMING_SOON_TEMPLATE, context)
-
-
 async def render_page(request: Request, principal: Any, page_id: str) -> HTMLResponse:
-    """Render page `page_id`: its module's `page` when built, else the coming soon body."""
-    spec = registry.page(page_id)
-    if registry.is_built(page_id):
-        module = importlib.import_module(spec.module)
-        handle = getattr(module, "page", None)
-        if handle is not None and hasattr(handle, "render"):
-            response: HTMLResponse = await handle.render(request, principal)
-            return response
-    return await render_coming_soon(request, principal, spec)
-
-
-def coming_soon_router(spec: PageSpec) -> APIRouter:
-    """`GET /admin/<id>` for a page that is registered but not built yet."""
-    pages = APIRouter(dependencies=[Depends(page_session)])
-
-    async def coming_soon(request: Request, principal: PageAdmin) -> HTMLResponse:
-        return await render_coming_soon(request, principal, spec)
-
-    pages.add_api_route(
-        spec.href, coming_soon, methods=["GET"], name=f"page_{spec.id}_coming_soon", include_in_schema=False
-    )
-    return pages
+    """Render page `page_id` through its module's `page` (every registered page has one)."""
+    module = importlib.import_module(registry.page(page_id).module)
+    handle = getattr(module, "page", None)
+    if handle is None or not hasattr(handle, "render"):
+        raise RuntimeError(f"{module.__name__} has no `page` to render")
+    response: HTMLResponse = await handle.render(request, principal)
+    return response
 
 
 @router.get(DASHBOARD_PATH, include_in_schema=False)
@@ -205,4 +180,4 @@ async def status(request: Request, principal: PageAdmin) -> Response:
     return JSONResponse(await shell.status_signature(get_ctx(request)))
 
 
-__all__ = ["DASHBOARD_PATH", "coming_soon_router", "render_coming_soon", "render_page", "router", "setting_href"]
+__all__ = ["DASHBOARD_PATH", "render_page", "router", "setting_href"]

@@ -3294,7 +3294,7 @@ RAM budget of each worker's in-memory cache tier. It is per worker, so total use
 | If enabled | n/a |
 | If disabled | n/a |
 | Risk | medium |
-| High risk when | value > 33554432: With 2 workers and the default systemd cap of MemoryMax=420M per color, more than 32 MiB per worker can push a color over its cap, and the kernel then kills workers mid-request. |
+| High risk when | value > 33554432: With 2 workers and the default systemd cap of MemoryMax=500M per color, more than 32 MiB per worker can push a color over its cap, and the kernel then kills workers mid-request. |
 | Applies | live (hot reload fleet-wide within about a second) |
 | Dashboard | `cache#settings` |
 | Related settings | `cache_memory_entries`, `cache_max_body`, `cache_disk_enabled` |
@@ -3309,7 +3309,7 @@ RAM budget of each worker's in-memory cache tier. It is per worker, so total use
 | Item max length | none |
 | Item range | none |
 | Pending owner verification | no |
-| Notes | The default (16 MiB) is sized for a server with about 1 GB of RAM (systemd MemoryHigh=320M and MemoryMax=420M per color); the plan's 64 MiB suits a 2 GB server with a higher cap. Migration imports a v1 value only when it differs from the v1 default (8 MiB) and is larger than this default. |
+| Notes | The default (16 MiB) is sized for a server with about 1 GB of RAM (systemd MemoryHigh=420M and MemoryMax=500M per color); the plan's 64 MiB suits a 2 GB server with a higher cap. Migration imports a v1 value only when it differs from the v1 default (8 MiB) and is larger than this default. |
 
 ### `cache_eviction_policy`
 
@@ -10512,7 +10512,7 @@ Threshold for the CRED-PROBE-COST recommendation. If Roxy's own calls that use t
 | Risk | low |
 | High risk when | none |
 | Applies | live (hot reload fleet-wide within about a second) |
-| Dashboard | `recommendations#engine` |
+| Dashboard | `recommendations#engine`, `recommendations#rule-cred_probe_cost` |
 | Related settings | `credential_probe_interval_min`, `credential_probe_reserved_per_min`, `health_auto_interval_h`, `health_auto_include_credential` |
 | Related rules | none |
 | Related recommendations | `CRED-PROBE-COST` |

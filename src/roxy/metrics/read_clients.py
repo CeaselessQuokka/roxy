@@ -46,7 +46,6 @@ KEY_CHUNK: Final = 500
 MAX_LIVE_ROWS: Final = 50
 TOP_ENDPOINTS_BASIS: Final = "busiest endpoint of each bucket, weighted by that bucket's requests"
 _COLUMNS: Final = ("requests", "refused", "served", "bytes")
-_COUNT: Final = "sum(coalesce(json_extract(detail_json, '$.count'), 1))"
 
 
 def _watermark_end(conn: sqlite3.Connection, table: str, unit: str, tz: str) -> int | None:
@@ -154,13 +153,19 @@ def client_refusals(
 ) -> list[dict[str, Any]]:
     """Refusals of one client by reason code in `[start_ms, end_ms)` (refusal events; folded rows lose the client).
 
-    Exactly one of `ip_hash` (the recorder's keyed hash of the address) or `place` names the client.
+    Exactly one of `ip_hash` (the recorder's keyed hash of the address) or `place` names the client. A place is read
+    through `events_refusal_places` (metrics migration 0009: place, time, reason, count; every refusal of the window
+    used to be read to find one place's, 0.35 s over 90 days at plan 6.6's volume), an address through
+    `events_ip_hash_at`; `detail_count` is the generated column `coalesce($.count, 1)` this read summed before.
     """
     if (ip_hash is None) == (place is None):
         raise ValueError("pass exactly one of ip_hash or place")
     column, value = ("ip_hash", ip_hash) if ip_hash is not None else ("place", place)
+    # The place index is named: its range is that place's refusals of the window, never more than the type index's
+    # range (every refusal of the window), whatever SQLite's statistics say.
+    index = "events_ip_hash_at" if ip_hash is not None else "events_refusal_places"
     rows = conn.execute(
-        f"SELECT reason_code, {_COUNT} AS n, max(at_ms) AS last_ms FROM events "  # noqa: S608  # fixed column names
+        f"SELECT reason_code, sum(detail_count) AS n, max(at_ms) AS last_ms FROM events INDEXED BY {index} "  # noqa: S608 (fixed names)
         f"WHERE type = 'refusal' AND {column} = ? AND at_ms >= ? AND at_ms < ? "
         "GROUP BY reason_code ORDER BY n DESC LIMIT ?",
         (value, int(start_ms), int(end_ms), max(1, min(int(limit), 200))),
@@ -171,13 +176,19 @@ def client_refusals(
 def recent_live(
     conn: sqlite3.Connection, *, ip: str | None = None, place: str | None = None, limit: int = 1
 ) -> list[dict[str, Any]]:
-    """The newest live rows (last 15 minutes) of one client, by address or by place, newest first."""
+    """The newest live rows (last 15 minutes) of one client, by address or by place, newest first.
+
+    One index range, newest id first, through `events_live_ips` or `events_live_places` (metrics migration 0009;
+    `detail_ip` is the generated column `json_extract(detail_json, '$.ip')`): it used to walk the live rows, or the
+    whole events table newest first when the client had none left (plan 6.7)."""
     if (ip is None) == (place is None):
         raise ValueError("pass exactly one of ip or place")
-    where = "json_extract(detail_json, '$.ip') = ?" if ip is not None else "place = ?"
+    where = "detail_ip = ?" if ip is not None else "place = ?"
+    index = "events_live_ips" if ip is not None else "events_live_places"
     value = ip if ip is not None else place
     rows = conn.execute(
-        f"SELECT detail_json FROM events WHERE type = 'live' AND {where} ORDER BY id DESC LIMIT ?",  # noqa: S608
+        f"SELECT detail_json FROM events INDEXED BY {index} WHERE type = 'live' AND {where} "  # noqa: S608 (constants)
+        "ORDER BY id DESC LIMIT ?",
         (value, max(1, min(int(limit), MAX_LIVE_ROWS))),
     ).fetchall()
     out = []
