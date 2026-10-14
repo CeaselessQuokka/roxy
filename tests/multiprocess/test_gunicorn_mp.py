@@ -11,8 +11,8 @@ What this is
       takes over when the leading one stops;
     - the metrics totals recorded equal the proxy requests sent (after the graceful stop flushed every worker);
     - plan 19.10 row 7: after a Roblox 429 with `Retry-After: 30`, zero calls to that endpoint while the cooldown
-      lasts, at most the bucket rate in the 60 s after it, zero calls carrying the credential, and every refused
-      caller is told when to come back (`Retry-After`).
+      lasts (beyond the few already on the wire when the 429 arrived), at most the bucket rate in the 60 s after it,
+      zero calls carrying the credential, and every refused caller is told when to come back (`Retry-After`).
 
 Why it exists
     Unit and integration tests run every package in one process; only real worker processes show that the shared
@@ -178,7 +178,12 @@ def test_gunicorn_mock_429_retry_after_30(tmp_path: Path, credentials_dir: Path)
     log = out.get("log_tail", "")
     assert out["ready"], log
     assert out["t429_seen"], (out, log)
-    assert out["calls_during_cooldown"] == 0, (out, log)  # no worker called the endpoint while it cooled down
+    # No worker called the endpoint while it cooled down. The window starts COOLDOWN_IN_FLIGHT_S (0.5 s) after the
+    # 429, like the caller answers below: calls Roxy sent before it could know of the 429 may land just after it (a
+    # cold start bunches the first requests; the gate measured them 3 to 12 ms after the 429). Those are few: the
+    # endpoint's burst (5) bounds what one moment can send, the 429's own call included.
+    assert out["calls_during_cooldown"] == 0, (out["cooldown_call_offsets"], out["first_answers"], out, log)
+    assert out["calls_in_flight_at_429"] <= 4, (out["cooldown_call_offsets"], out["first_answers"], out)
     assert out["responses_during_cooldown"] >= 80, out
     assert out["during_statuses"] == {"429": out["responses_during_cooldown"]}, out
     assert out["during_without_retry_after"] == 0, out  # every caller was told when to come back

@@ -50,6 +50,7 @@ from typing import Any, Final
 from roxy.metrics import queries
 from roxy.metrics.rollups import zone
 from roxy.notify.alerts import Alert, SendResult, make_alert
+from roxy.storage import read_sizes
 from roxy.storage.db import SharedStateUnavailable
 
 log = logging.getLogger("roxy.notify")
@@ -68,8 +69,6 @@ STORAGE_ALERT_PCT: Final = 90.0
 """`storage_total_budget_gb`: "Roxy ... raises a SYS-DISK recommendation at 70 percent and an alert at 90 percent"."""
 STORAGE_CRITICAL_PCT: Final = 100.0
 """Over the budget itself the storage alert is critical (plan 17.7 "Disk over budget")."""
-GIB: Final = 1024**3
-"""The catalog's GB is 1,073,741,824 bytes (the unit df -h shows)."""
 GROWTH_DAYS: Final = 7
 """The storage alert's growth figure: bytes per day over the disk samples of the last week."""
 BACKUP_STALE_H: Final = 26.0
@@ -114,7 +113,8 @@ def _rate_text(value: float) -> str:
 
 
 def _size(n: float) -> str:
-    """Bytes in the units `df -h` uses (binary), e.g. `1.2 GB`."""
+    """Bytes in the units `df -h` uses (binary), e.g. `1.2 GB`: the unit of `storage_total_budget_gb` too (its
+    notes: 1 GB is 1,073,741,824 bytes), so an alert's sizes and its budget read alike."""
     value = float(n)
     for unit in ("bytes", "KB", "MB", "GB"):
         if abs(value) < 1024 or unit == "GB":
@@ -276,7 +276,8 @@ async def check_storage(ctx: Any, now: float) -> dict[str, Any]:
     state_dir = getattr(ctx.env, "state_dir", None)
     folder = Path(state_dir) if state_dir else Path(ctx.dbs.metrics.path).parent
     measure = await asyncio.to_thread(disk_history.measure_files, folder, paths)
-    budget = int(_setting(ctx, "storage_total_budget_gb")) * GIB
+    # The setting's unit (1,073,741,824 bytes): the same divisor as the Data page and the Health check (truth-5).
+    budget = read_sizes.budget_bytes(_setting(ctx, "storage_total_budget_gb"))
     used = int(measure.storage_bytes)
     pct = _pct(used, budget)
     report: dict[str, Any] = {"storage_bytes": used, "budget_bytes": budget, "pct": pct}

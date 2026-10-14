@@ -27,7 +27,9 @@
  *   roxy/admin/api/data.py (the routes), templates/admin/pages/data/resets.html, static/js/exports.js.
  */
 
-import { confirmIdentity, copyTextFrom, downloadFrom, getJSON, onContent, postJSON, refreshCard, toast } from "roxy/page";
+import {
+  confirmIdentity, copyTextFrom, downloadFrom, getJSON, localTime, onContent, postJSON, refreshCard, toast,
+} from "roxy/page";
 
 const POLL_MS = 1500;
 const POLL_TRIES = 160;  // four minutes; a longer operation is still in the audit log
@@ -58,7 +60,7 @@ function fmtBytes(n) {
 
 function fmtTime(seconds) {
   if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) return "n/a";
-  return new Date(seconds * 1000).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" });
+  return localTime(seconds);  // the dashboard's time zone, like the server's tables (finding truth-9)
 }
 
 async function readError(response) {

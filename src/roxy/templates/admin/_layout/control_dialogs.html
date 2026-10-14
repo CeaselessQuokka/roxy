@@ -10,7 +10,8 @@
   so the API's own checks apply (a dash in a message is a 422 shown under the field, a high-risk limit asks for the
   confirmation, the change is audited), and the page reloads on success (the banners and buttons change). The
   limit and period fields are the settings `global_throttle_limit` and `global_throttle_period` (their top bar
-  home, plan 15.6), so they carry `data-setting-key`.
+  home, plan 15.6), so they carry `data-setting-key`; the API names a refused value by the body's field (`limit`,
+  `period`; finding functional-4), so the reason shows in the box under the field that holds it.
   Context: `status`, `urls`, and `dialog_settings` (the inline settings of the dialogs, built by
   `roxy.admin.pages.shell`). An empty message sends the live `pause_message_default` setting, for a pause and for
   the emergency limit alike (v1 used one downtime text for both). Both message fields name it from
@@ -37,9 +38,13 @@
 {% endset %}
 
 {% if st.paused %}
+{#- During a scheduled maintenance window Resume also ends the window (abuse/pause.py set_pause, finding
+    functional-2), and the dialog says so. -#}
+{% set resume_consequences = ["Proxy requests are answered normally again, from the cache or from Roblox.",
+                              "The pause banner disappears on every open dashboard within a few seconds."] %}
+{% if st.window_running %}{% set resume_consequences = ["The scheduled maintenance window, planned to end at " ~ st.window_ends ~ ", ends now."] + resume_consequences %}{% endif %}
 {{ confirm_dialog("dlg-pause", "Resume the proxy?", u.pause or "/admin/api/v1/protection/pause", confirm_label="Resume proxy",
-                  consequences=["Proxy requests are answered normally again, from the cache or from Roblox.",
-                                "The pause banner disappears on every open dashboard within a few seconds."],
+                  consequences=resume_consequences,
                   hidden={"paused": "false"}, hidden_types={"paused": "bool"}, api=True, success="The proxy is running again.",
                   on_success="reload", appendix=pause_appendix|trim) }}
 {% else %}

@@ -4,7 +4,8 @@
 What this is
     Charts and tables of what went through Roxy over a time range:
       * `GET /traffic/requests`: requests over time stacked by outcome (served by Roblox, served from cache,
-        refused, failed), with the comparison overlay and chart annotations.
+        refused, failed, and the OPTIONS requests Roxy answered itself when there were any), with the comparison
+        overlay and chart annotations.
       * `GET /traffic/bytes`: caller and upstream bytes in and out over time, with totals per egress (14.3).
       * `GET /traffic/verbs` and `/traffic/verbs/table`: requests by HTTP method (v1 "Counts by Method").
       * `GET /traffic/status` (`view=class` or `view=source`) and `/traffic/status/sources`: status classes over
@@ -21,8 +22,11 @@ Why it exists
 
 How it works
     Thin over `metrics/queries.py` (series, totals, top N, `answer_source_counts`) and `metrics/read_dashboard.py`
-    (the heatmap fold, sparkline windows). Roblox 429s always come from the `upstream_429` log, counted once per
-    upstream attempt, never from caller status codes. "Who returned it?" reads the source through
+    (the heatmap fold, sparkline windows). Requests by outcome chart the catalog's outcome measures, never the raw
+    `outcome` column (`outcome_lines`, finding truth-6): a local OPTIONS answer is recorded with outcome
+    `served_upstream` and reason `options_local`, and it never reached Roblox, so it is its own line, "Answered by
+    Roxy (OPTIONS)", as the `served_upstream` help promises. Roblox 429s always come from the `upstream_429` log,
+    counted once per upstream attempt, never from caller status codes. "Who returned it?" reads the source through
     `queries.ANSWER_SOURCE_SQL`: a Roblox 5xx passed on after the retries (`upstream_5xx`) carries Roblox's status
     and Roxy's text, so it counts as Roblox's (`relay`), in the table, the source series and the `roblox_5xx` and
     `roxy_5xx` tiles alike (finding parity-1). A series' reset notices name only resets of the data it reads
@@ -38,7 +42,7 @@ What to read next
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Annotated, Any, Final
 
@@ -54,12 +58,14 @@ from roxy.admin.api.common import (
     TimeRangeDep,
     annotation_entries,
     area_router,
+    comparison_resets,
     export_pages,
     export_table,
     page_rows,
     range_info,
     reset_notices,
     series_answer,
+    series_entry,
     series_from_read_model,
     table_answer,
     table_from_read_model,
@@ -79,6 +85,22 @@ BYTE_METRICS: Final[tuple[str, ...]] = (
     "upstream_bytes_out",
     "cache_bytes_out",
 )
+OUTCOME_MEASURES: Final[tuple[str, ...]] = ("served_upstream", "served_cache", "refused", "failed")
+"""The outcome lines of a requests by outcome chart, in stacking order: the catalog's measures (`metrics/catalog.py`),
+never the raw `outcome` column. The router records a local OPTIONS answer with outcome `served_upstream` and reason
+`options_local` (the closest value of the closed enum), and the `served_upstream` measure leaves it out (finding
+spec-7), so "Served by Roblox" counts only what reached Roblox (finding truth-6)."""
+OUTCOME_READS: Final[tuple[str, ...]] = ("requests", *OUTCOME_MEASURES)
+"""What `outcome_lines` reads: every request, and the four outcome measures."""
+ANSWERED_LOCALLY: Final = "answered_locally"
+ANSWERED_LOCALLY_LABEL: Final = "Answered by Roxy (OPTIONS)"
+ANSWERED_LOCALLY_HELP: Final = (
+    "OPTIONS requests (a browser's preflight check) that Roxy answered itself, without contacting Roblox. They count "
+    "as requests, never as served by Roblox."
+)
+"""The line of requests no outcome measure counts: `requests` minus the four measures, bucket by bucket. The four
+partition every rollup row but those recorded `served_upstream` with reason `options_local`, so this is exactly the
+OPTIONS requests Roxy answered itself (shown only when the range or its comparison has any)."""
 STATUS_METRICS: Final[tuple[str, ...]] = ("status_2xx", "status_4xx", "status_5xx", "roxy_429", "roblox_429")
 LATENCY_METRICS: Final[tuple[str, ...]] = ("p50_ms", "p95_ms", "p99_ms", "queue_wait_p95_ms")
 HEATMAP_METRICS: Final[tuple[str, ...]] = ("requests", "demand", "upstream_calls", "served_cache", "refused", "failed")
@@ -201,17 +223,23 @@ async def _series_answer(
         ]
     start, end = tr.window.start, tr.window.end
 
-    def marks(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        return queries.chart_annotations(conn, start, end), queries.reset_annotations(conn, start, end)
+    def marks(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        return (
+            queries.chart_annotations(conn, start, end),
+            queries.reset_annotations(conn, start, end),
+            comparison_resets(conn, tr),
+        )
 
-    annotations, resets = await db.read(marks)
+    annotations, resets, compare_resets = await db.read(marks)
     touching = [row for row in resets if queries.reset_touches(row, tables, latency=latency, cache=cache)]
+    # The comparison overlay over a reset is partial too (plan 6.8, finding truth-3).
+    behind = [row for row in compare_resets if queries.reset_touches(row, tables, latency=latency, cache=cache)]
     return series_answer(
         tr,
         series,
         compare_series=compare_series,
         annotations=annotation_entries(annotations),
-        notices=reset_notices(touching, tz=tr.window.tz),
+        notices=[*reset_notices(touching, tz=tr.window.tz), *reset_notices(behind, tz=tr.window.tz, comparison=True)],
     )
 
 
@@ -221,10 +249,62 @@ def _good_direction(metric: str) -> str:
 
 
 def _delta(current: Any, previous: Any) -> tuple[float | None, float | None]:
-    if not isinstance(current, int | float) or not isinstance(previous, int | float):
-        return None, None
-    change = current - previous
-    return round(change, 4), (round(change * 100.0 / previous, 2) if previous else None)
+    """`queries.change`: the percent divides by the size of the baseline, so its sign follows the change."""
+    return queries.change(current, previous)
+
+
+def _value(points: Sequence[Sequence[Any]], index: int) -> int | float:
+    found = points[index][1] if index < len(points) else None
+    return found if isinstance(found, int | float) else 0
+
+
+def _outcome_split(entries: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """`(the four outcome lines, the answered locally line)` from the ungrouped series of `OUTCOME_READS`.
+
+    Every line of one `queries.series` read has the same buckets in the same order, so the answered locally line is
+    `requests` minus the four measures at each index (never clamped: a difference that is not a local OPTIONS answer
+    would show, plan P6). Keys stay `requests:<outcome>`, the keys of the grouped chart this replaces.
+    """
+    by_key = {str(entry.get("key")): entry for entry in entries}
+    lines: list[dict[str, Any]] = []
+    for measure in OUTCOME_MEASURES:
+        entry = by_key.get(measure) or {}
+        spec = METRICS[measure]
+        lines.append(series_entry(f"requests:{measure}", spec.label, spec.unit, entry.get("points") or ()))
+    every: Sequence[Sequence[Any]] = (by_key.get("requests") or {}).get("points") or ()
+    local: list[list[Any]] = []
+    for index, point in enumerate(every):
+        total = point[1]
+        if not isinstance(total, int | float):
+            local.append([point[0], None])
+            continue
+        local.append([point[0], total - sum(_value(line["points"], index) for line in lines)])
+    return lines, series_entry(f"requests:{ANSWERED_LOCALLY}", ANSWERED_LOCALLY_LABEL, METRICS["requests"].unit, local)
+
+
+def _has_any(line: Mapping[str, Any]) -> bool:
+    return any(isinstance(v, int | float) and v != 0 for _t, v in line.get("points") or ())
+
+
+def outcome_lines(
+    series: Sequence[Mapping[str, Any]], compare: Sequence[Mapping[str, Any]] | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    """Requests by outcome for a chart and its comparison, from series of `OUTCOME_READS` (finding truth-6).
+
+    The four outcome lines always; the answered locally line (`ANSWERED_LOCALLY`) in both when either period has a
+    local OPTIONS answer, so the comparison overlay pairs with it and the lines add up to every request. Used by
+    `requests_answer` and the Endpoints drill-down (`roxy/admin/api/endpoints.py`).
+    """
+    lines, local = _outcome_split(series)
+    other_lines: list[dict[str, Any]] | None = None
+    other_local: dict[str, Any] | None = None
+    if compare is not None:
+        other_lines, other_local = _outcome_split(compare)
+    if _has_any(local) or (other_local is not None and _has_any(other_local)):
+        lines.append(local)
+        if other_lines is not None and other_local is not None:
+            other_lines.append(other_local)
+    return lines, other_lines
 
 
 # --------------------------------------------------------------------------------------------- page helpers
@@ -235,8 +315,18 @@ def _delta(current: Any, previous: Any) -> tuple[float | None, float | None]:
 
 
 async def requests_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
-    """Requests over time stacked by outcome, with the comparison, markers and notices (`GET /traffic/requests`)."""
-    return await _series_answer(ctx, tr, ["requests"], group_by="outcome")
+    """Requests over time stacked by outcome, with the comparison, markers and notices (`GET /traffic/requests`).
+
+    The lines are the outcome measures plus the OPTIONS requests Roxy answered itself (`outcome_lines`), not a group
+    by the raw `outcome` column, which counted those as served by Roblox (finding truth-6).
+    """
+    answer = await _series_answer(ctx, tr, OUTCOME_READS)
+    compare = answer.get("compare")
+    lines, other = outcome_lines(answer["series"], compare["series"] if compare else None)
+    answer["series"] = lines
+    if compare and other is not None:
+        compare["series"] = other
+    return answer
 
 
 async def bytes_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
@@ -583,9 +673,14 @@ async def trends_answer(ctx: Any) -> dict[str, Any]:
 
 
 __all__ = [
+    "ANSWERED_LOCALLY",
+    "ANSWERED_LOCALLY_HELP",
+    "ANSWERED_LOCALLY_LABEL",
     "BYTE_METRICS",
     "HEATMAP_METRICS",
     "LATENCY_NOTE",
+    "OUTCOME_MEASURES",
+    "OUTCOME_READS",
     "SOURCES_SPEC",
     "SOURCE_LABELS",
     "SPLITS",
@@ -596,6 +691,7 @@ __all__ = [
     "dimension_table",
     "heatmap_answer",
     "latency_answer",
+    "outcome_lines",
     "requests_answer",
     "router",
     "status_answer",

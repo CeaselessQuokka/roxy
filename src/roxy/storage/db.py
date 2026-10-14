@@ -470,6 +470,10 @@ def _empty_hist() -> list[int]:
     return [0] * (len(TIMING_BOUNDS_MS) + 1)
 
 
+_PROBLEM_COUNTERS = frozenset({"write_errors", "unavailable"})
+"""`DbStats` counters whose increase is a failure (`DbStats.last_problem_at`)."""
+
+
 @dataclass(slots=True)
 class DbStats:
     """Counters for the System page. Updated from worker threads; exact values are not critical."""
@@ -492,6 +496,25 @@ class DbStats:
     # (`TIMING_BOUNDS_MS`), so the p99 of every transaction since start is known, not only the last one.
     lock_wait_hist: list[int] = field(default_factory=_empty_hist)
     hold_hist: list[int] = field(default_factory=_empty_hist)
+    # When a write or read last failed (`write_errors` or `unavailable` went up) and when a write last succeeded
+    # (`writes` went up), on the monotonic clock (0.0: never). The System page says "Problem" only while the last
+    # failure is newer than the last good write, as v1 did (LastErrorAt > LastWriteOK), so one failed write no
+    # longer marks a database for the rest of the worker's life (review finding v1parity-4).
+    last_problem_at: float = 0.0
+    last_write_ok_at: float = 0.0
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Every counter is updated as `stats.x += 1`; the moments are noted here, so no call site changes.
+        if name in _PROBLEM_COUNTERS:
+            if value > getattr(self, name, 0):
+                object.__setattr__(self, "last_problem_at", time.monotonic())
+        elif name == "writes" and value > getattr(self, name, 0):
+            object.__setattr__(self, "last_write_ok_at", time.monotonic())
+        object.__setattr__(self, name, value)
+
+    def problem_now(self) -> bool:
+        """Whether the last failure is newer than the last good write (v1's PROBLEM rule)."""
+        return self.last_problem_at > self.last_write_ok_at
 
     def note_transaction(self, lock_wait_ms: float, hold_ms: float) -> None:
         self.lock_wait_hist[_bucket(lock_wait_ms)] += 1

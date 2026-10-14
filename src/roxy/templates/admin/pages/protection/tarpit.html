@@ -36,7 +36,7 @@
   {{ kpi_tile(tile.label, tile.value, key=tile.key, help=tile.help, status=tile.status, status_label=tile.status_label, baseline=tile.lines|join("; ")) }}
   {% endfor %}
 </div>
-<p class="field__hint">The tiles count every worker over the range in the top bar (the hold statistics are written each minute); "Time between requests" is the average gap before a held caller's next request, the number that says whether holding slows it down.</p>
+<p class="field__hint">The tiles count every worker over the range in the top bar (the hold statistics are written each minute); "Time between requests" is the average gap before a held caller's next request, the number that says whether holding slows it down. Its trend compares the last hour with the period just before that hour (the day before it, or the range when the range is longer).</p>
 {% call tabs("prot-tarpit-tabs", [("categories", "By category"), ("lengths", "Hold lengths"), ("held", "Who is held")], "Tarpit views") %}
   {% call tab_panel("prot-tarpit-tabs", "categories", first=True) %}
   <div class="table-scroll" role="region" aria-labelledby="tarpit-cat-caption" tabindex="0">

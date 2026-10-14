@@ -57,6 +57,7 @@ from fastapi.responses import Response
 
 from roxy.core.reasons import REFUSAL_HEADER, Egress, ReasonCode
 from roxy.core.scope import catalog_default
+from roxy.storage import read_sizes
 
 log = logging.getLogger("roxy.public.health")
 
@@ -64,7 +65,6 @@ router = APIRouter()
 
 JSON_TYPE: Final = "application/json"  # v1 jsonify: no charset parameter
 PING_TIMEOUT_S: Final = 2.0
-GIB: Final = 1024**3
 NOT_ROBLOX_BODY: Final = b'"Not a Roblox URL"\n'
 """v1's refusal for a non-GET /health (the proxy's not_roblox text, JSON string plus newline)."""
 
@@ -241,10 +241,8 @@ async def health_body(ctx: Any) -> dict[str, Any]:
     started = ctx is not None and bool(getattr(ctx, "ready", False))
     answers = await databases_answer(ctx) if started else False
     used = await cached_data_bytes(ctx) if started else 0
-    try:
-        limit = int(float(_setting(ctx, "storage_total_budget_gb") or 0) * GIB)
-    except (TypeError, ValueError):
-        limit = 0
+    # Decimal GB, the catalog's unit (one divisor everywhere, finding truth-5); 0 when it is not a number.
+    limit = read_sizes.budget_bytes(_setting(ctx, "storage_total_budget_gb"))
     within_budget = limit <= 0 or used <= limit
     degraded: list[str] = []
     if not started:

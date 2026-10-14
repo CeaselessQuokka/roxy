@@ -10,7 +10,7 @@
   Context: `frame`, then either `table`, `table_only`, `total`, `filtered`, or `detail`, `first`, `last`, `hourly`,
   `hourly_values`, `occurrence_help` (the drawer; the help of `error_occurrences` from metrics/catalog.py).
 -#}
-{% from "components/page_card.html" import page_card %}
+{% from "components/page_card.html" import page_card, family_reset %}
 {% from "components/table.html" import data_table %}
 {% from "components/format.html" import num, caller_text %}
 {% from "components/chart.html" import sparkline %}
@@ -55,7 +55,8 @@
 </div>
 {% elif table_only %}{{ data_table(**table) }}
 {% else %}
-{% call page_card(frame, subtitle=(num(total) ~ (" matching errors" if filtered else " distinct errors"))) %}
+{#- v1's "Clear data" of the Error Log: the plan 6.8 family `errors` (finding v1parity-8). -#}
+{% call page_card(frame, actions=family_reset("errors", "the error log"), subtitle=(num(total) ~ (" matching errors" if filtered else " distinct errors"))) %}
 <p class="system-intro">Errors inside Roxy and its calls, grouped by signature with how often each happened. Nothing is dropped as more come in; a data reset of the errors family clears them. Open a row for its traceback.</p>
 {{ data_table(**table) }}
 {% endcall %}

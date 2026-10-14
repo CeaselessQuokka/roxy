@@ -9,7 +9,7 @@ What this is
       * Limits: `throttle` (the per-IP limit, who is throttled now, the throttled history, the limiter reset; rows 6,
         26, 118), `ladder` (the ladder editor, rung hits, restore defaults and v1's repeat offender simulation; rows
         40, 76, 125), `strikes` (the strike board with forgive; row 41), `throttle-all` (the emergency limit and who
-        it refuses right now; rows 4, 135), `limits` and `places`.
+        it turned away since it was switched on, refused most first; rows 4, 135), `limits` and `places`.
       * Who: `bans` (countdowns, evidence, ban, lift, reset), `lists` (deny list and admin allowlist), `bypass`
         (bypass entries and "Bypass my IP"; rows 13, 113).
       * Rules: `ua-rules` (with the tester; row 44), `request-filters` (with the tester, presets and the attempts
@@ -68,6 +68,7 @@ from roxy.admin.pages import _protection_views as pv
 from roxy.admin.pages import shell
 from roxy.admin.pages.clients import canonical_ip, client_href
 from roxy.admin.pages.kit import Page, PageView, filter_chip, table_query, table_view
+from roxy.admin.pages.texts import bypass_scope
 from roxy.config.constants import MAX_THROTTLE_MULTIPLIER, MAX_THROTTLE_TIERS, TARPIT_CATEGORIES
 from roxy.metrics import queries, read_producers
 
@@ -98,6 +99,11 @@ ORIGIN_LABELS: Final[dict[str, str]] = {"manual": "An admin", "auto": "A detecto
 SPAM_KINDS: Final[tuple[str, ...]] = ("all", "would_ban", "ban", "strike", "tarpit", "recommend")
 TARPIT_WINDOWS: Final[tuple[tuple[str, int], ...]] = (("15m", 900), ("1h", 3600), ("24h", 86_400))
 """v1's "Last 15m", "Last hour" and "Last 24h" tarpit figures (now fleet-wide, from the hold statistics history)."""
+TARPIT_HOUR_S: Final = 3600
+TARPIT_BASELINE_MIN_S: Final = 86_400
+"""The tarpit trend compares the last hour with the period just before it: the range's length, at least a day (v1
+compared the hour with the lifetime gap; finding v1parity-10: the range alone made the 1 h trend compare the hour
+with itself)."""
 MAX_WORKER_ROWS: Final = 25
 """Rows of the per-worker tarpit tables shown ("why each hold happened", "callers held"), busiest first."""
 MAX_DETAIL_CHARS: Final = 80
@@ -645,8 +651,8 @@ async def strikes_card(view: PageView) -> dict[str, Any]:
 
 @page.card("throttle-all", lazy=True, refresh_on=("kpi",), refresh_min_s=15)
 async def throttle_all_card(view: PageView) -> dict[str, Any]:
-    """The emergency limit (`throttle_all_answer`) and who it refuses right now (`throttle_all_watch_answer`, row
-    135 with v1's columns)."""
+    """The emergency limit (`throttle_all_answer`) and who it turned away since it was switched on, refused most
+    first (`throttle_all_watch_answer`, row 135 with v1's columns and rows: v1 listed the IPs with refusals)."""
     which = only_table(view, ("watch-all",))
     tq, notice = query_for(view, prot.WATCH_ALL_SPEC, "watch-all")
     state = await prot.throttle_all_answer(view.ctx)
@@ -655,25 +661,29 @@ async def throttle_all_card(view: PageView) -> dict[str, Any]:
     if state.get("enabled"):
         empty = {
             "title": "Nothing has been refused since the emergency limit was switched on",
-            "body": "Every client that reaches the emergency limit is listed here with what it asks for and how "
-            "fast, so you can judge when to switch it off.",
+            "body": "Every client Roxy turns away while the emergency limit is on is listed here, refused most "
+            "first, with what it asks for and how fast, so you can judge when to switch it off.",
             "icon": "gauge",
             "tone": "good",
         }
     else:
         empty = {
             "title": "The emergency limit is off, so it refuses nobody",
-            "body": "While the emergency limit is on, every client that reaches it is listed here with what it asks "
+            "body": "While the emergency limit is on, every client Roxy turns away is listed here with what it asks "
             "for and how fast, so you can judge when to switch it off.",
             "icon": "gauge",
         }
 
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
         rate = item.get("rate1")
+        count = item.get("count")
         return {
             "ip": _mono(item.get("ip")),
             "limited": pv.yes_no(item.get("limited"), yes="Refused now", no="Within the limit"),
-            "count": {"text": f"{int(item.get('count') or 0):,} of {limit:,}"},
+            # A client whose emergency window ended has none until its next request (it would be admitted).
+            "count": {"text": "No window now", "tone": "muted"}
+            if count is None
+            else {"text": f"{int(count):,} of {limit:,}"},
             "reset_in_s": _span(item.get("reset_in_s"), zero="now"),
             "rate1": None
             if rate is None
@@ -709,7 +719,7 @@ async def throttle_all_card(view: PageView) -> dict[str, Any]:
             hidden=("count", "reset_in_s", "rate5", "rate60"),
             cells=cells,
             row_id=lambda item: f"watch-all-{item.get('ip')}",
-            caption="Who the emergency limit refuses right now",
+            caption="Who the emergency limit turned away since it was switched on, refused most first",
             search_placeholder="Search clients",
             searchable=False,
             notice=notice,
@@ -1034,6 +1044,7 @@ async def bypass_card(view: PageView) -> dict[str, Any]:
     if which is None:
         context["me"] = await prot.bypass_me_answer(view.ctx, view.principal.ip)
         context["api"] = {"me": f"{API}/access/bypass/me", "add": f"{API}/access/bypass"}
+        context["scope"] = bypass_scope()  # from the checks' own flags (finding v1parity-9)
     return context
 
 
@@ -1177,25 +1188,53 @@ def _attempts_table(
     view: PageView, card: str, reason: str, answer: Mapping[str, Any], **options: Any
 ) -> dict[str, Any]:
     route = {"endpoint_blocked": "endpoint-blocks", "endpoint_rule": "endpoint-rules", "header_rule": "header-rules"}
+    spec = prot.ATTEMPT_SPECS[reason]
+    headers = spec is prot.HEADER_ATTEMPT_SPEC
 
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
         refused_by = ", ".join(str(rule) for rule in item.get("refused_by") or ())
-        return {
+        found = {
             "path": {"text": str(item.get("path") or ""), "caller": True, "sub": None},
             "methods": _caller(", ".join(str(m) for m in item.get("methods") or ())),
             "refused_by": _caller(refused_by),
             "current_rule": _caller(item.get("current_rule")),
         }
+        if headers:
+            # v1's Last Header, Triggered By (`Header name` or `Header value`) and Matched Text (finding v1parity-5).
+            field = str(item.get("last_field") or "")
+            found["last_header"] = _caller(item.get("last_header"))
+            found["last_field"] = {"text": pv.SCOPE_LABELS[field]} if field in ("key", "value") else None
+            found["last_text"] = _caller(item.get("last_text"))
+        return found
 
+    if headers:
+        # v1's column order: rule, blocked, unique IPs, then what matched, then the last path and attempt.
+        options.setdefault(
+            "columns",
+            (
+                "path",
+                "attempts",
+                "clients",
+                "last_header",
+                "last_field",
+                "last_text",
+                "refused_by",
+                "methods",
+                "last_ms",
+                "unattributed",
+                "current_rule",
+            ),
+        )
     return table(
         view,
         card,
         "attempts",
-        prot.ATTEMPT_SPEC,
+        spec,
         answer,
         export=f"{route[reason]}/attempts",
-        key_columns=("path", "attempts", "last_ms"),
-        hidden=("unattributed",),
+        key_columns=("path", "attempts", "last_header", "last_ms") if headers else ("path", "attempts", "last_ms"),
+        # A request filter matches headers, not a path, so it has no "matching rule now".
+        hidden=("unattributed", "current_rule") if headers else ("unattributed",),
         cells=cells,
         row_id=lambda item: f"attempt-{row_key(item.get('path'))}",
         search_placeholder="Search paths",
@@ -1264,7 +1303,7 @@ async def request_filters_card(view: PageView) -> dict[str, Any]:
             },
         )
     if which in (None, "attempts"):
-        tq, notice = query_for(view, prot.ATTEMPT_SPEC, "attempts")
+        tq, notice = query_for(view, prot.HEADER_ATTEMPT_SPEC, "attempts")
         answer = await prot.attempts_answer(view.ctx, "header_rule", tq, view.tr)
         tables["attempts"] = _attempts_table(
             view,
@@ -1275,8 +1314,8 @@ async def request_filters_card(view: PageView) -> dict[str, Any]:
             notice=notice,
             empty={
                 "title": "No request was filtered in this range",
-                "body": "Each path a request filter refused is listed here with how often, how many clients, and "
-                "which filter refused it (v1's Header-Blocked Attempts).",
+                "body": "Each path a request filter refused is listed here with how often, how many clients, which "
+                "filter refused it and which header it matched, by name or by value (v1's Header-Blocked Attempts).",
                 "icon": "inbox",
             },
         )
@@ -1665,12 +1704,19 @@ async def challenge_card(view: PageView) -> dict[str, Any]:
 @page.card("tarpit", lazy=True)
 async def tarpit_card(view: PageView) -> dict[str, Any]:
     """The tarpit (`tarpit_answer`): switches, the effective cap and its gauge, v1's tiles over the fleet's hold
-    statistics (the range, plus the last 15 minutes, hour and day), categories, hold lengths, who is held."""
+    statistics (the range, plus the last 15 minutes, hour and day), categories, hold lengths, who is held.
+
+    The trend under "Time between requests" compares the last hour with the period that ends where that hour begins
+    (`baseline`: as long as the range, at least a day), never with a window that holds the hour itself."""
     state = await prot.tarpit_answer(view.ctx, view.tr)
     now = int(view.ctx.clock.now())
+    hour_start = now - TARPIT_HOUR_S
+    baseline_s = max(TARPIT_BASELINE_MIN_S, int(view.tr.window.span))
 
     def windows(conn: Any) -> dict[str, Any]:
-        return {key: read_producers.tarpit_summary(conn, now - span, now + 60) for key, span in TARPIT_WINDOWS}
+        found = {key: read_producers.tarpit_summary(conn, now - span, now + 60) for key, span in TARPIT_WINDOWS}
+        found["baseline"] = read_producers.tarpit_summary(conn, hour_start - baseline_s, hour_start)
+        return found
 
     with common.service_errors():
         recent = await view.ctx.dbs.metrics.read(windows)

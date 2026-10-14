@@ -185,12 +185,30 @@ function settingControl() {
       if (cfg.type === "enum") this.optionText = cfg.options[result.value] || "";
     },
 
-    /** The server refused a save (static/js/settings_api.js raises `setting-error` on the form). */
+    /**
+     * The server refused a save (static/js/settings_api.js raises `setting-error` on the form). `detail.field` names
+     * the field at fault: `value` (the default), `confirm` (the "I understand the risk" box) or `reason`. That field
+     * is marked invalid, tied to the message with aria-describedby and focused; the value stays valid when it is not
+     * the problem (WCAG 3.3.1 and 3.3.3, review finding a11y-9).
+     */
     serverError(event) {
       const detail = event.detail || {};
       this.error = String(detail.message || "The server refused this value.");
-      if (detail.code === "confirmation_required" && !this.riskWhy) this.riskWhy = this.error;
-      if (input) input.setAttribute("aria-invalid", "true");
+      const field = detail.field || "value";
+      const box = root ? root.querySelector(".setting__error") : null;
+      const target = field === "confirm" ? root && root.querySelector('input[name="confirm_high_risk"]')
+        : field === "reason" ? root && root.querySelector('input[name="reason"]') : input;
+      if (input) input.setAttribute("aria-invalid", target === input ? "true" : "false");
+      for (const other of root ? root.querySelectorAll('input[name="confirm_high_risk"], input[name="reason"]') : []) {
+        if (other !== target) other.removeAttribute("aria-invalid");
+      }
+      if (!target) return;
+      target.setAttribute("aria-invalid", "true");
+      if (box && box.id) {
+        const described = (target.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
+        if (!described.includes(box.id)) target.setAttribute("aria-describedby", [...described, box.id].join(" "));
+      }
+      if (target !== input) target.focus();
     },
 
     onInput() {

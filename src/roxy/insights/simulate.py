@@ -76,6 +76,7 @@ from roxy.config.constants import CACHEABLE_ERROR_STATUSES
 from roxy.core.reasons import AuthClass
 from roxy.insights.models import ProposedChange, Recommendation
 from roxy.metrics.samples import reasons_from
+from roxy.metrics.templating import literal_text
 from roxy.rules.match import PatternValidationError, compile_pattern, validate_pattern
 from roxy.rules.models import CacheRuleRow
 from roxy.upstream.buckets import BucketSpec, gcra_advance_ms, gcra_earliest_ms
@@ -502,8 +503,10 @@ def template_pattern(template: str) -> str:
 
     A glob always covers the paths below it too (`rules/match.py`), so a rule with this pattern also applies to
     every sibling endpoint under the template. A proposal meant for exactly one endpoint uses `template_match`.
+    A literal segment is the caller's own text (`templating.literal_text`); a glob has no way to spell a literal
+    `*`, so a template holding one is named by `subtree_match` with a regex instead (review finding esc-1).
     """
-    parts = [("*" if _placeholder(part) else part) for part in template.split("/")]
+    parts = [("*" if _placeholder(part) else literal_text(part)) for part in template.split("/")]
     return "/".join(parts)
 
 
@@ -511,9 +514,38 @@ def exact_template_pattern(template: str) -> str:
     """The regex that names exactly one endpoint template: `^host/path/?$` with the literal segments escaped and
     each `{placeholder}` one segment without a slash (`TEMPLATE_SEGMENT`). Rule regexes are matched with `search`
     and IGNORECASE on the normalized target (`rules/match.py`), so the anchors make it cover the template itself
-    (one trailing slash allowed), never a path below it."""
-    parts = [TEMPLATE_SEGMENT if _placeholder(part) else re.escape(part) for part in template.split("/")]
+    (one trailing slash allowed), never a path below it. A literal segment is matched as the caller's own text
+    (`templating.literal_text`: a `*` or a brace a caller sent is a character, never syntax)."""
+    parts = [TEMPLATE_SEGMENT if _placeholder(part) else re.escape(literal_text(part)) for part in template.split("/")]
     return "^" + "/".join(parts) + "/?$"
+
+
+def literal_wildcard(template: str) -> bool:
+    """Whether a literal segment of `template` holds a `*`, which a glob would read as a wildcard (finding esc-1)."""
+    return any("*" in literal_text(part) for part in template.split("/") if not _placeholder(part))
+
+
+def subtree_match(template: str) -> dict[str, str]:
+    """`{"pattern", "type"}` of a dashboard action for one endpoint template (the Cache page's "Write the rule" and
+    "Purge its stored answers"): the v1 glob of `template_pattern` (it covers the template and the paths under it,
+    as v1's buttons did), or, when a literal segment holds a `*` that the glob would read as a wildcard over every
+    sibling (finding esc-1: `games.roblox.com/*` covered the whole host), the exact regex of `template_match`."""
+    if literal_wildcard(template):
+        return template_match(template)
+    return {"pattern": template_pattern(template), "type": "glob"}
+
+
+def path_match(path: str) -> dict[str, str] | None:
+    """`{"pattern", "type"}` that names one concrete stored path (`host/path`, the Cache page's key spread purge):
+    the path itself as a glob (it covers the paths under it, as v1's purge did), or, when the path holds a `*` (a
+    caller's own text), an anchored regex of the escaped path, so the purge never covers its siblings (finding
+    esc-1). None when that regex is longer than a rule pattern may be (the page then offers no purge for it)."""
+    if "*" not in path:
+        return {"pattern": path, "type": "glob"}
+    try:
+        return {"pattern": validate_pattern("^" + re.escape(path) + "/?$", "regex"), "type": "regex"}
+    except PatternValidationError:
+        return None
 
 
 @functools.lru_cache(maxsize=MAX_EXACT_PATTERNS)
@@ -540,7 +572,8 @@ def names_template(pattern: str, kind: str, template: str) -> bool:
     paths below it). Pure string comparisons: nothing is validated or compiled."""
     if kind == "regex":
         return pattern == exact_template_pattern(template)
-    return pattern == template_pattern(template)
+    # A glob cannot name a template with a literal `*` (it would read it as a wildcard): only the regex can.
+    return not literal_wildcard(template) and pattern == template_pattern(template)
 
 
 def own_template_row(rows: Iterable[Any], template: str) -> Any:
@@ -1222,10 +1255,13 @@ __all__ = [
     "estimate_change_interval",
     "exact_template_pattern",
     "limit_replay",
+    "literal_wildcard",
     "names_template",
     "own_template_row",
+    "path_match",
     "proposed_ttl",
     "stored_as",
+    "subtree_match",
     "template_match",
     "template_pattern",
 ]

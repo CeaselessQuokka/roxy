@@ -86,8 +86,15 @@ function fieldError(form, name, message) {
   if (!box && field) {
     box = el("p", { class: "field__error", "data-field-error": name, "data-api-added-error": "1", id: `${field.id || name}-api-error` });
     field.insertAdjacentElement("afterend", box);
+  }
+  // Tie the box to its field (aria-describedby), also a box the template already had (WCAG 3.3.1, finding a11y-18):
+  // a field inside a group that names the box already (a fieldset of checkboxes) is left as it is.
+  if (box && field) {
+    if (!box.id) box.id = `${field.id || name}-api-error`;
+    const group = field.closest("fieldset[aria-describedby], [role=group][aria-describedby]");
+    const named = group && (group.getAttribute("aria-describedby") || "").split(/\s+/).includes(box.id);
     const described = (field.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
-    if (!described.includes(box.id)) field.setAttribute("aria-describedby", [...described, box.id].join(" "));
+    if (!named && !described.includes(box.id)) field.setAttribute("aria-describedby", [...described, box.id].join(" "));
   }
   if (field) field.setAttribute("aria-invalid", "true");
   if (box) {

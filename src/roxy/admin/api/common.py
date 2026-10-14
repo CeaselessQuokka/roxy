@@ -76,6 +76,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any, Final, Literal
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -383,6 +384,23 @@ def service_errors(extra: ErrorMap | None = None) -> Iterator[None]:
         if mapped is None or mapped is exc:
             raise
         raise mapped from exc
+
+
+@contextmanager
+def fields_named(names: Mapping[str, str]) -> Iterator[None]:
+    """Section 13 errors raised inside name the request's own fields (DESIGN 13: `fields` names the request's
+    fields): a route that hands its body field `limit` to the settings service as `global_throttle_limit`, or its
+    `message` to the rules service as `reason_text`, answers with `limit` and `message`, so the page shows the
+    reason under the field the admin typed in (review finding functional-4)."""
+    try:
+        yield
+    except ApiError as error:
+        if not any(key in names for key in error.error_fields):
+            raise
+        fields = {names.get(key, key): message for key, message in error.error_fields.items()}
+        raise ApiError(
+            error.status_code, error.error_code, error.error_message, fields=fields, headers=error.headers
+        ) from None
 
 
 async def run_mutation[T](call: Awaitable[T], *, extra: ErrorMap | None = None) -> T:
@@ -708,19 +726,55 @@ def annotation_entries(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]
     ]
 
 
-def reset_notices(rows: Sequence[Mapping[str, Any]], *, tz: str) -> list[str]:
-    """Plan 6.8 partial data warnings for `queries.reset_annotations` rows inside the window."""
+def reset_notices(rows: Sequence[Mapping[str, Any]], *, tz: str, comparison: bool = False) -> list[str]:
+    """Plan 6.8 partial data warnings for `queries.reset_annotations` rows inside the window (or, with
+    `comparison`, inside the comparison window: the overlay then covers partial data, review finding truth-3)."""
     notices: list[str] = []
+    head = "Partial data in the comparison" if comparison else "Partial data"
     for row in rows:
         at = datetime.fromtimestamp(int(row.get("at") or 0), zone(tz)).strftime("%Y-%m-%d %H:%M %Z")
         label = clean_message(row.get("label") or "a reset", 200)
         until = row.get("until")
         if until is not None:
             end = datetime.fromtimestamp(int(until), zone(tz)).strftime("%Y-%m-%d %H:%M %Z")
-            notices.append(f"Partial data: counters from {at} to {end} were reset ({label}).")
+            notices.append(f"{head}: counters from {at} to {end} were reset ({label}).")
         else:
-            notices.append(f"Partial data: counters were reset at {at} ({label}).")
+            notices.append(f"{head}: counters were reset at {at} ({label}).")
     return notices
+
+
+DOT_SEGMENTS: Final[frozenset[str]] = frozenset({".", ".."})
+"""Names a URL path cannot carry as a segment: a browser resolves them away before the request leaves (WHATWG
+URL, also for `%2e`), so `/headers/./values` arrives as `/headers/values` (review finding esc-2)."""
+NAME_STANDIN: Final = "_"
+"""The path segment that stands for a name sent in the query instead (`name_in_path`)."""
+
+
+def name_in_path(prefix: str, name: str, suffix: str = "") -> str:
+    """`prefix/<name><suffix>` with a caller-chosen `name` (a header or parameter name) as one percent-encoded path
+    segment. A name a path cannot carry (`.` or `..`) goes in the query (`?name=`) under the stand-in segment
+    `NAME_STANDIN`; the routes that take a `{name}` read the query first (`named`). Append more query parameters
+    with `&` when the result holds a `?`."""
+    if name in DOT_SEGMENTS:
+        return f"{prefix}/{NAME_STANDIN}{suffix}?{urlencode({'name': name})}"
+    return f"{prefix}/{quote(name, safe='')}{suffix}"
+
+
+def named(path_value: str, query_value: str | None) -> str:
+    """The name a `{name}` route acts on: the `name` query parameter when given (`name_in_path`), else the path's."""
+    return query_value if query_value is not None else path_value
+
+
+def comparison_resets(conn: Any, tr: TimeRange) -> list[dict[str, Any]]:
+    """The reset markers of the comparison window of `tr` (none without a comparison), read inside the caller's
+    metrics.db read: a series answer whose comparison overlay crosses a reset says so (plan 6.8, finding truth-3).
+    Markers that also touch the window itself are left out (the window's own notice already names them)."""
+    other = tr.compare_window
+    if not tr.compare or other is None:
+        return []
+    rows = queries.reset_annotations(conn, other.start, other.end)
+    mine = {row["id"] for row in queries.reset_annotations(conn, tr.window.start, tr.window.end)}
+    return [row for row in rows if row["id"] not in mine]
 
 
 def series_answer(
@@ -1642,6 +1696,7 @@ __all__ = [
     "clean_fields",
     "clean_message",
     "collect_pages",
+    "comparison_resets",
     "conflict",
     "csv_bytes",
     "csv_safe",
@@ -1654,11 +1709,14 @@ __all__ = [
     "export_pages",
     "export_slots",
     "export_table",
+    "fields_named",
     "forbidden",
     "kpi_from_read_model",
     "kpi_tile",
     "mask_ip_text",
     "mask_ip_value",
+    "name_in_path",
+    "named",
     "not_found",
     "page_rows",
     "parse_export_format",

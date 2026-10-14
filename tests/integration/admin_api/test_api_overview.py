@@ -79,11 +79,15 @@ async def test_kpi_tiles_are_honest_and_carry_sparklines_and_deltas(
     # P6: avoided = demand (refusals excluded) minus caller upstream calls.
     assert tiles["avoided"]["value"] == 5
     assert tiles["avoided_pct"]["value"] == round(5 * 100 / 15, 2)
-    assert "5 of 15 caller requests" in tiles["avoided_pct"]["notice"]
+    # The note words the net count as calls (finding truth-10): 10 calls for 15 requests, 5 fewer.
+    assert "10 upstream calls for 15 caller requests, 5 fewer than one call each" in tiles["avoided_pct"]["notice"]
     assert tiles["upstream_calls"]["value"] == 10
     assert tiles["roxy_429"]["value"] == 3
     assert tiles["roblox_429"]["value"] == 2  # from the upstream_429 log, not caller statuses
-    assert tiles["roblox_429"]["notice"] == "20.0% of the upstream calls made for callers."
+    # Like for like (finding truth-8): every 429 over every upstream call, callers' and Roxy's own.
+    assert tiles["roblox_429"]["notice"] == (
+        "20.0% of every upstream call Roxy made (10 on callers' behalf, 0 for its own checks)."
+    )
     assert tiles["roblox_429_per_10k"]["value"] == round(2 * 10_000 / 15, 2)
     assert tiles["roblox_429_per_10k"]["baseline"] is None  # no v1 import in this state
     assert tiles["served_cache"]["value"] == 5

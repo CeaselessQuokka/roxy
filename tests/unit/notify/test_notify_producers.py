@@ -41,6 +41,7 @@ from roxy.notify import producers
 from roxy.notify.mail import MailConfig, MailSender
 from roxy.notify.notifier import Notifier
 from roxy.scheduler.jobs import JobRegistry
+from roxy.storage.read_sizes import BUDGET_UNIT_BYTES as GB  # the budget's unit, 1,073,741,824 bytes (truth-5)
 
 CONFIG = MailConfig("owner@example.invalid", "alerts@example.invalid", SecretStr("not-a-real-password"))
 CALLER_IP = "203.0.113.99"
@@ -237,10 +238,10 @@ async def test_a_pause_is_not_a_caller_error(world: World) -> None:
 # ------------------------------------------------------------------------------------------------ storage
 
 
-def fake_measure(used: int, free: int = 5 * producers.GIB) -> Any:
+def fake_measure(used: int, free: int = 5 * GB) -> Any:
     def measure(state_dir: Any, paths: Any) -> disk_history.FilesMeasure:
         return disk_history.FilesMeasure(
-            total_bytes=20 * producers.GIB,
+            total_bytes=20 * GB,
             free_bytes=free,
             files={"metrics.db": {"bytes": used - 1000, "wal_bytes": 1000}, "control.db": {"bytes": 0, "wal_bytes": 0}},
         )
@@ -252,28 +253,28 @@ async def test_storage_alerts_from_90_percent_and_is_critical_over_the_budget(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     world.settings.values["storage_total_budget_gb"] = 10
-    monkeypatch.setattr(disk_history, "measure_files", fake_measure(8 * producers.GIB))
+    monkeypatch.setattr(disk_history, "measure_files", fake_measure(8 * GB))
     quiet = await producers.check_storage(world.ctx, world.clock.now())
     assert (quiet["pct"], "alert" in quiet) == (80.0, False)
     now = int(world.clock.now())
 
     def samples(conn: Any) -> None:
-        for days, size in ((6, 8 * producers.GIB), (0, int(9.5 * producers.GIB))):
+        for days, size in ((6, 8 * GB), (0, int(9.5 * GB))):
             conn.execute(
                 "INSERT INTO disk_samples (at, total_bytes, free_bytes, storage_bytes, files_json) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (now - days * 86_400, 20 * producers.GIB, producers.GIB, size, "{}"),
+                (now - days * 86_400, 20 * GB, GB, size, "{}"),
             )
 
     await world.ctx.dbs.metrics.write(samples)
-    monkeypatch.setattr(disk_history, "measure_files", fake_measure(int(9.5 * producers.GIB)))
+    monkeypatch.setattr(disk_history, "measure_files", fake_measure(int(9.5 * GB)))
     warn = await producers.check_storage(world.ctx, world.clock.now())
     assert (warn["pct"], warn["severity"], warn["sent"]) == (95.0, "warn", ["email", "webhook"])
     assert world.mail.subjects() == ["Roxy: storage at 95% of budget"]
     body = world.mail.bodies()[0]
     assert "Largest: metrics.db 9.5 GB" in body
     assert "Growth per day: 256.0 MB" in body  # 1.5 GiB over six days
-    monkeypatch.setattr(disk_history, "measure_files", fake_measure(12 * producers.GIB))
+    monkeypatch.setattr(disk_history, "measure_files", fake_measure(12 * GB))
     assert (await producers.check_storage(world.ctx, world.clock.now()))["skipped"] == "deduped"  # key disk, 6 h
     world.clock.advance(6 * 3600 + 1)
     over = await producers.check_storage(world.ctx, world.clock.now())

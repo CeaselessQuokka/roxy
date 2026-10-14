@@ -1,8 +1,9 @@
 """Two worker processes, one set of databases, and a mock Roblox that says 429 with Retry-After: 30 (plan 19.10 row 7).
 
 What this checks (plan 19.10, section 7 acceptance, and 19.3 "upstream buckets hold"):
-    1. Once the first 429 is recorded, NEITHER process makes a single call to that endpoint through that egress
-       until the cooldown ends (allowing only calls already on the wire when the 429 arrived).
+    1. Once the first 429 is recorded (its cooldown is in hot.db, where every process reads it), NEITHER process
+       makes a single call to that endpoint through that egress until the cooldown ends (allowing only calls
+       already on the wire when it was recorded), and the record follows the 429 promptly.
     2. Every caller answer during the cooldown carries a Retry-After.
     3. After the cooldown ends, the call rate to the endpoint is at most its bucket rate (measured over 60 s).
     4. Nothing ever goes through the credential.
@@ -11,6 +12,13 @@ How it runs fast: both processes use a `ScaledClock`, a wall clock that runs SPE
 is computed from the system-wide monotonic clock, so both processes agree on "now" (and it never steps back, unlike
 WSL's wall clock). The service sleeps through the clock (`clock.sleep`), so a 30 s cooldown and a 60 s measuring
 window take about 9 real seconds. The mock records every call it receives in its own SQLite file.
+
+Why the in-flight allowance starts at the record, not at the 429: the clock runs SPEED times faster, but the time
+Roxy needs to record the cooldown (the 429's answer, then a hot.db write that may wait for the other process's
+lock) is real time. On a loaded machine (the gate ran two test sessions side by side) it passed the 50 real ms that
+the allowance's 500 fake ms are, about once in 40 runs, and a call the other process had been granted before the
+record counted as "during the cooldown". `CooldownWatcher`, a thread of the test process, notes on the same clock
+when the cooldown first shows in hot.db; the allowance starts there, and `RECORD_LAG_MAX_MS` bounds the record's lag.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ import json
 import multiprocessing as mp
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,7 +56,10 @@ REQUEST_GAP_S = 0.2  # fake seconds between new requests in each process (300 pe
 ENDPOINT_PER_MIN = 60
 ENDPOINT_BURST = 2
 TEMPLATE = "games.roblox.com/v1/games"
-IN_FLIGHT_TOLERANCE_MS = 500  # fake ms: calls already reserved when the first 429 arrived may still land
+COOLDOWN_KEY = f"endpoint:{TEMPLATE}:direct"
+IN_FLIGHT_TOLERANCE_MS = 500  # fake ms after the record: calls already on the wire when it was recorded may land
+RECORD_LAG_MAX_MS = 5_000  # fake ms (0.5 real s): the cooldown is in hot.db this soon after the first 429
+WATCH_POLL_S = 0.001  # real seconds between the watcher's reads of hot.db
 
 
 class ScaledClock:
@@ -72,6 +84,42 @@ class ScaledClock:
 
     async def sleep(self, seconds: float) -> None:
         await asyncio.sleep(max(0.0, seconds) / self.speed)
+
+
+class CooldownWatcher:
+    """Notes, on the shared scaled clock, when the endpoint's cooldown first shows in hot.db: the moment the 429 is
+    recorded for every process. A thread of the test process reads hot.db every `WATCH_POLL_S`; `seen_ms` is the
+    time just before the read that saw it (a WAL read sees what was committed when it began)."""
+
+    def __init__(self, hot_path: str, clock: ScaledClock) -> None:
+        self.hot_path = hot_path
+        self.clock = clock
+        self.seen_ms: int | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="cooldown-watcher", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=10)
+
+    def _run(self) -> None:
+        conn = sqlite3.connect(self.hot_path, timeout=30, isolation_level=None)
+        try:
+            while not self._stop.is_set():
+                before = self.clock.now_ms()
+                try:
+                    row = conn.execute("SELECT 1 FROM cooldown WHERE key = ?", (COOLDOWN_KEY,)).fetchone()
+                except sqlite3.OperationalError:
+                    row = None  # a busy moment: read again
+                if row is not None:
+                    self.seen_ms = before
+                    return
+                time.sleep(WATCH_POLL_S)
+        finally:
+            conn.close()
 
 
 @dataclass
@@ -256,10 +304,15 @@ def test_429_retry_after_30_holds_across_two_processes(tmp_path: Path) -> None:
         CTX.Process(target=worker_main, args=(paths, mock_path, name, mono0, str(out)), daemon=True)
         for name, out in zip(("a", "b"), outputs, strict=True)
     ]
-    for proc in procs:
-        proc.start()
-    for proc in procs:
-        proc.join(timeout=90)
+    watcher = CooldownWatcher(paths["hot"], ScaledClock(mono0))  # when the 429 is recorded for every process
+    watcher.start()
+    try:
+        for proc in procs:
+            proc.start()
+        for proc in procs:
+            proc.join(timeout=90)
+    finally:
+        watcher.stop()
     for proc in procs:
         if proc.is_alive():
             proc.kill()
@@ -269,9 +322,7 @@ def test_429_retry_after_30_holds_across_two_processes(tmp_path: Path) -> None:
     calls = mock.execute("SELECT at_ms, worker, egress, status FROM calls ORDER BY at_ms").fetchall()
     mock.close()
     hot = sqlite3.connect(paths["hot"])
-    row = hot.execute(
-        "SELECT until_ms, set_at, source FROM cooldown WHERE key = ?", (f"endpoint:{TEMPLATE}:direct",)
-    ).fetchone()
+    row = hot.execute("SELECT until_ms, set_at, source FROM cooldown WHERE key = ?", (COOLDOWN_KEY,)).fetchone()
     hot.close()
 
     assert calls, "the mock saw no calls at all"
@@ -283,10 +334,13 @@ def test_429_retry_after_30_holds_across_two_processes(tmp_path: Path) -> None:
     assert source == "retry_after"
     first_429 = limited[0][0]
     assert until_ms >= first_429 + RETRY_AFTER_S * 1000
+    recorded = watcher.seen_ms
+    assert recorded is not None, "hot.db never showed the cooldown while the processes ran"
+    assert recorded - first_429 <= RECORD_LAG_MAX_MS, (first_429, recorded)  # recorded promptly after the 429
 
-    # 1. While the cooldown is active, no process calls the endpoint (beyond calls already on the wire).
-    during = [call for call in calls if first_429 + IN_FLIGHT_TOLERANCE_MS < call[0] < until_ms]
-    assert during == [], f"calls during the cooldown: {during[:5]}"
+    # 1. Once the cooldown is recorded, no process calls the endpoint until it ends (beyond calls already on the wire).
+    during = [call for call in calls if recorded + IN_FLIGHT_TOLERANCE_MS < call[0] < until_ms]
+    assert during == [], f"calls during the cooldown: {during[:5]} (first 429 at {first_429}, recorded at {recorded})"
 
     # 3. After the cooldown, at most the bucket's limit in any minute, burst included (a window bucket: 60 per minute
     #    with burst 2 means at most 60, never 61), and it recovers. The 429 also cut the limit for both processes
@@ -316,6 +370,7 @@ def test_429_retry_after_30_holds_across_two_processes(tmp_path: Path) -> None:
         assert all(item["status"] == 429 for item in cooling)
         assert not [item for item in items if item["egress"] == "credential"]
     print(  # for the report: what the fleet did
-        f"\ncalls={len(calls)} 429s={len(limited)} cooldown={(until_ms - first_429) / 1000:.1f}s "
+        f"\ncalls={len(calls)} 429s={len(limited)} recorded_after={recorded - first_429}ms "
+        f"cooldown={(until_ms - first_429) / 1000:.1f}s "
         f"after_60s={len(after)} answers={sum(len(v) for v in results.values())}"
     )

@@ -188,7 +188,7 @@
   {% call confirm_dialog("dlg-client-bypass", "Let this address bypass the limits?", action=api_base ~ "/bypass", api=True,
       confirm_label="Bypass", reason=True, on_success=on_success, refresh="ips",
       success="Bypass added.",
-      consequences=["This address skips the throttles, place limits, User-Agent rules, endpoint rules and the tarpit (bans, filters and pause still apply).", "Use it for your own testing; it expires by itself."]) %}
+      consequences=["This address skips " ~ bypass_scope.skips ~ " (" ~ bypass_scope.keeps ~ " still apply).", "Use it for your own testing; it expires by itself."]) %}
   <div class="field">
     <label class="field__label" for="dlg-client-bypass-hours">For how many hours</label>
     <input class="input input--num" id="dlg-client-bypass-hours" name="expires_in_h" inputmode="decimal" value="{{ bypass_hours }}" data-json="float">

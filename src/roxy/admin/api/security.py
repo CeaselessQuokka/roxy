@@ -75,6 +75,7 @@ from roxy.admin.api.common import (
     area_router,
     export_pages,
     export_table,
+    named,
     not_found,
     page_rows,
     request_id_of,
@@ -436,6 +437,9 @@ BLOCKED_SPEC: Final = TableSpec(
 BLOCKED_CALLER_TEXT: Final = ("name", "user_agent")
 """Columns of the Blocked tab holding text a caller chose: shown as plain text, never as markup."""
 HEADER_NAME_PATTERN: Final = r"^[^\x00-\x1f\x7f]+$"
+QueryName = Annotated[str | None, Query(alias="name", min_length=1, max_length=120, pattern=HEADER_NAME_PATTERN)]
+"""A header name in the query (`?name=`), which wins over the `{name}` path segment: how the dashboard names a header
+called `.` or `..`, which a browser would resolve out of the path (`common.name_in_path`, finding esc-2)."""
 """A header name in a path: printable characters only (stored names are lowercased and at most 120 characters)."""
 IGNORED_SPEC: Final = TableSpec(
     name="ignored_headers",
@@ -489,10 +493,12 @@ async def fingerprint_values(
     name: Annotated[str, Path(min_length=1, max_length=120)],
     tq: Annotated[TableQuery, Depends(table_params(VALUE_SPEC))],
     fmt: ExportFormatDep,
+    name_q: QueryName = None,
 ) -> Any:
-    """One header's stored values, most frequent first (the v1 drill-down)."""
+    """One header's stored values, most frequent first (the v1 drill-down). `?name=` names the header instead of
+    the path (`common.name_in_path`: a name `.` or `..` cannot be a path segment; finding esc-2)."""
     ctx = get_ctx(request)
-    key = name.lower()
+    key = named(name, name_q).lower()
     answer = await _paged(request, admin, VALUE_SPEC, tq, fmt, values_fetch(ctx, key, tq), filters={"name": key})
     if isinstance(answer, dict):
         answer["name"] = key
@@ -684,10 +690,13 @@ async def fingerprint_unignore(
     _csrf: CsrfChecked,
     name: Annotated[str, Path(min_length=1, max_length=120)],
     reason: Annotated[str | None, Query(max_length=MAX_REASON_LENGTH)] = None,
+    name_q: QueryName = None,
 ) -> dict[str, Any]:
-    """Record a header's values again. Refused (422) for a header that carries client addresses: its values are never
-    kept (`fingerprints.ADDRESS_HEADERS`, a privacy rule), so removing it from the list would only mislead."""
+    """Record a header's values again (`?name=` instead of the path: `common.name_in_path`, finding esc-2).
+    Refused (422) for a header that carries client addresses: its values are never kept
+    (`fingerprints.ADDRESS_HEADERS`, a privacy rule), so removing it from the list would only mislead."""
     ctx = get_ctx(request)
+    name = named(name, name_q)
     if keeps_no_values(name.lower()):
         text = "This header carries client addresses, so its values are never recorded (privacy)."
         raise validation_error({"name": text}, text)
@@ -724,12 +733,17 @@ async def _audit_first(
 
 @router.delete("/fingerprints/headers/{name}/values")
 async def fingerprint_clear_values(
-    request: Request, admin: AdminSession, _csrf: CsrfChecked, name: HeaderName, reason: ClearReason = None
+    request: Request,
+    admin: AdminSession,
+    _csrf: CsrfChecked,
+    name: HeaderName,
+    reason: ClearReason = None,
+    name_q: QueryName = None,
 ) -> dict[str, Any]:
     """v1 "Clear values" (dashboard.md 4.21, finding parity-11): drop one header's stored values; the header, its
     count and its recording stay. Audited first (`fingerprints.clear_values`); 404 for a header never recorded."""
     ctx = get_ctx(request)
-    key = name.lower()
+    key = named(name, name_q).lower()
     text = audit_reason(reason)
     with service_errors():
         counts = await ctx.dbs.metrics.read(lambda conn: read_security.header_counts(conn, key))
@@ -747,12 +761,17 @@ async def fingerprint_clear_values(
 
 @router.delete("/fingerprints/headers/{name}")
 async def fingerprint_remove_header(
-    request: Request, admin: AdminSession, _csrf: CsrfChecked, name: HeaderName, reason: ClearReason = None
+    request: Request,
+    admin: AdminSession,
+    _csrf: CsrfChecked,
+    name: HeaderName,
+    reason: ClearReason = None,
+    name_q: QueryName = None,
 ) -> dict[str, Any]:
     """v1 "Remove" (dashboard.md 4.21, finding parity-11): drop one header's row and its stored values. Its ignore
     entry, if any, is a rule and stays; the next request carrying the header records it again. Audited first."""
     ctx = get_ctx(request)
-    key = name.lower()
+    key = named(name, name_q).lower()
     text = audit_reason(reason)
     with service_errors():
         counts = await ctx.dbs.metrics.read(lambda conn: read_security.header_counts(conn, key))
@@ -773,12 +792,17 @@ async def fingerprint_remove_header(
 
 @router.delete("/fingerprints/blocked/headers/{name}")
 async def fingerprint_remove_blocked_header(
-    request: Request, admin: AdminSession, _csrf: CsrfChecked, name: HeaderName, reason: ClearReason = None
+    request: Request,
+    admin: AdminSession,
+    _csrf: CsrfChecked,
+    name: HeaderName,
+    reason: ClearReason = None,
+    name_q: QueryName = None,
 ) -> dict[str, Any]:
     """v1 "Remove" on the Blocked tab (finding parity-11, the blocked variant): drop one header name's blocked
     rows. Blocked requests keep no values, so the tab has no "Clear values". Audited first."""
     ctx = get_ctx(request)
-    key = name.lower()
+    key = named(name, name_q).lower()
     text = audit_reason(reason)
     with service_errors():
         requests = await ctx.dbs.metrics.read(lambda conn: read_security.blocked_header_count(conn, key))

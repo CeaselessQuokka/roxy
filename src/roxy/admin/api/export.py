@@ -73,9 +73,9 @@ _CLIENT_COLUMNS: Final = (
     Column("bytes", "Bytes", "Bytes sent to this client.", "bytes"),
     Column("refused_pct", "Refused %", "Share refused.", "percent"),
     Column("top_endpoint", "Top endpoint", "The busiest endpoint template."),
-    Column("rate1", "Rate 1 min", "Requests per minute over the last minute.", "per_min"),
-    Column("rate5", "Rate 5 min", "Requests per minute over the last 5 minutes.", "per_min"),
-    Column("rate60", "Rate 60 min", "Requests per minute over the last hour.", "per_min"),
+    Column("rate1", "Rate 1 min", "Requests in the trailing 60 seconds.", "requests"),
+    Column("rate5", "Rate 5 min", "Requests in the trailing 5 minutes.", "requests"),
+    Column("rate60", "Rate 60 min", "Requests in the trailing hour.", "requests"),
     Column(
         "last_seen",
         "Last seen",

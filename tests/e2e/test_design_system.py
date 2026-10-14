@@ -301,7 +301,8 @@ def test_session_expired_overlay_redirects_to_login(ui_server: Any, open_page: A
     page = _open(ui_server, open_page, wait_js).page
     page.click("#g-expire")
     page.wait_for_selector("#session-expired[open]")
-    page.wait_for_url(re.compile(r".*/admin$"), timeout=9000)
+    # The countdown gives 30 seconds (WCAG 2.2.1 asks for at least 20; review finding a11y-5).
+    page.wait_for_url(re.compile(r".*/admin$"), timeout=40000)
 
 
 # ------------------------------------------------------------------------------------------- components

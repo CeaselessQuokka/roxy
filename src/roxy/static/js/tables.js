@@ -31,6 +31,7 @@
 import htmx from "roxy/htmx_setup";
 import { el, qs, qsa, store } from "roxy/dom";
 import { openDrawer, openDrawerFrom } from "roxy/dialog";
+import { announce } from "roxy/toast";
 
 const appliedSize = new Set();
 
@@ -51,7 +52,55 @@ function field(table, name) {
 function submit(table) {
   const form = qs("[data-dt-state]", table);
   if (!form || !table.dataset.dtSrc) return;
+  keepFocus(table);
   htmx.ajax("GET", table.dataset.dtSrc, { source: form, target: table, swap: "outerHTML" });
+}
+
+/** A selector for the twin of the focused sort button, pager button or rows-per-page select in the new table. */
+function focusedControl(table) {
+  const active = document.activeElement;
+  if (!(active instanceof Element) || !table.contains(active)) return null;
+  if (active.matches("[data-dt-sort]")) return `[data-dt-sort="${CSS.escape(active.dataset.dtSort)}"]`;
+  if (active.matches("[data-dt-page]")) {
+    const label = active.getAttribute("aria-label");
+    return label ? `[data-dt-page][aria-label="${CSS.escape(label)}"]` : "[data-dt-page]";
+  }
+  if (active.matches("[data-dt-size]")) return "[data-dt-size]";
+  return null;
+}
+
+/**
+ * The table swaps itself whole (outerHTML) after a sort, a page change or a new page size; those controls have no
+ * id htmx could refocus, so keyboard focus would fall to the page body (WCAG 2.4.3, review finding a11y-1). Note
+ * the focused control, then focus its twin in the new table (an enabled pager button, else the table's scroll
+ * region, when the twin is now disabled) and announce the new rows and order politely.
+ */
+function keepFocus(table) {
+  const selector = focusedControl(table);
+  const id = table.id;
+  if (!selector || !id) return;
+  const old = table;
+  let done = false;
+  const restore = () => {
+    const fresh = document.getElementById(id);
+    if (done || !fresh || fresh === old) return;
+    done = true;
+    document.removeEventListener("htmx:afterSettle", restore);
+    const active = document.activeElement;
+    if (active && active !== document.body && fresh.contains(active)) return;  // already somewhere in the table
+    const usable = (node) => node instanceof HTMLElement && !node.disabled && node.getClientRects().length > 0;
+    const twin = qsa(selector, fresh).find(usable)
+      || qsa("[data-dt-page]", fresh).find(usable)
+      || qs(".dt__scroll", fresh);
+    if (twin instanceof HTMLElement) twin.focus();
+    const caption = qs("caption", fresh);
+    if (caption) announce(caption.textContent.replace(/\s+/g, " ").trim());
+  };
+  document.addEventListener("htmx:afterSettle", restore);
+  window.setTimeout(() => {
+    restore();
+    document.removeEventListener("htmx:afterSettle", restore);
+  }, 5000);
 }
 
 function applyColumns(table) {

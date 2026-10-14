@@ -10,9 +10,13 @@ What this is
       * `recommendation`, `health`, `alert`, `breaker`, `cooldown`: notable events as the recorder, the insights
         engine and the health runner write them (`events` rows); `cooldown` also reports upstream cooldowns
         starting and ending (from hot.db, compared every 2 seconds).
-      * `settings_changed` when the settings snapshot's `config_version` moves.
+      * `settings_changed` when the settings snapshot's `config_version` moves, and at once when the page says it
+        was rendered with another version (`config_version` parameter): a change made while the page had no stream
+        (before its first connect, or while a reconnect waited) still reaches it (review finding functional-5).
       * `unauthorized` (status 401) when the session expires or is revoked; the stream then ends, and the client's
-        reconnect gets a real 401 (the session-expired overlay, row 119).
+        reconnect gets a real 401 (the session-expired overlay, row 119). A session check that cannot read
+        control.db is not an ended session: after `SESSION_FAILURES_MAX` such checks the stream just ends, and
+        the client's reconnect gets the guard's honest 503 and retries (plan C7; finding authz-4).
       * `gap` when a `Last-Event-ID` resume could not deliver everything that was missed (the page reloads).
     Comment lines (`: keepalive`) every 15 seconds keep proxies from closing an idle stream.
 
@@ -36,7 +40,12 @@ How it works
       continues with live rows above it, so no row is sent twice and none is skipped in between.
     * Session: every `SESSION_CHECK_S` the stream re-reads its session (without touching it); a session that is
       gone, idle past its timeout, revoked by the kill switch or past its absolute lifetime ends the stream with
-      `unauthorized`. A worker that starts draining ends its streams at once, so shutdown never waits on them.
+      `unauthorized`. A due check comes before any queued row: a reader that stalled and reads again after its
+      session was revoked gets `unauthorized`, never the rows queued meanwhile (finding robust-5). A re-entered
+      second factor rotates the session, so the page's stream (opened with the old cookie) also ends with
+      `unauthorized`; `static/js/sse.js` then asks `GET /auth/session` and reconnects with the new cookie while
+      the session lives (finding authz-1). A worker that starts draining ends its streams at once, so shutdown
+      never waits on them.
     * Network: on every turn of its loop (at least every `TICK_S`) the stream asks the admin allowlist (D6) again,
       with the live settings and rules snapshot, for the address it was opened from; once that network is shut
       out the stream ends at once with nothing more, as every other `/admin` answer to it is now the plain 404
@@ -127,7 +136,8 @@ HEARTBEAT_S: Final = 15.0
 SESSION_CHECK_S: Final = 5.0
 """How often a stream re-reads its session (an expired or revoked session ends the stream this soon)."""
 SESSION_FAILURES_MAX: Final = 3
-"""Consecutive session checks that could not read control.db before the stream gives up (the reconnect decides)."""
+"""Consecutive session checks that could not read control.db before the stream gives up: it ends without
+`unauthorized`, so the client reconnects and the guard's answer decides (503 while control.db is down)."""
 TICK_S: Final = 0.25
 """The stream loop's longest sleep: how promptly a new `kpi`, setting or drain is noticed."""
 MAX_STREAMS_PER_SESSION: Final = 6
@@ -454,6 +464,8 @@ class Stream:
     kpi_seq: int = 0
     change_seq: int = 0
     config_version: int = -1
+    page_version: int | None = None
+    """The settings version the page was rendered with (the `config_version` parameter), or None."""
     session_failures: int = 0
     closed: bool = False
     guard: Any = None
@@ -469,7 +481,10 @@ class Stream:
             await asyncio.sleep(TAIL_WAIT_STEP_S)  # only right after startup: the tail takes its first position
         self.sub = tail.subscribe(types=types, live_filter=self.query.base)
         self.mark = tail.last_id
-        self.config_version = int(getattr(self.ctx.settings, "version", 0) or 0)
+        current = int(getattr(self.ctx.settings, "version", 0) or 0)
+        # Start from the page's version when it says one: a change made before this connection is then reported
+        # by the first turn of the loop (finding functional-5); without one, from now.
+        self.config_version = current if self.page_version is None else self.page_version
         self.change_seq = self.hub.change_seq
         self.hub.join()
         self.guard = weakref.finalize(
@@ -556,13 +571,15 @@ class Stream:
         worker's settings and rules snapshots, no I/O, so it runs on every turn of the loop)."""
         return admin_ip_allowed(self.ctx, self.principal.ip)
 
-    async def _session_alive(self) -> bool:
-        """Re-read the session without touching it; False once it is gone, expired, idle or revoked."""
+    async def _session_alive(self) -> bool | None:
+        """Re-read the session without touching it: True while it lives, False once it is gone, expired, idle or
+        revoked, None after `SESSION_FAILURES_MAX` checks in a row could not read control.db (not known: the
+        stream ends without `unauthorized` and the reconnect decides; finding authz-4)."""
         try:
             record = await get_auth(self.request).load_session(self.token)
         except AuthError:
             self.session_failures += 1
-            return self.session_failures < SESSION_FAILURES_MAX
+            return None if self.session_failures >= SESSION_FAILURES_MAX else True
         self.session_failures = 0
         return record is not None and record.id_hash == self.principal.session_id
 
@@ -593,7 +610,11 @@ class Stream:
                 now = mono()
                 if now >= next_session:
                     next_session = now + SESSION_CHECK_S
-                    if not await self._session_alive():
+                    alive = await self._session_alive()
+                    if alive is None:
+                        yield comment("session check unavailable")
+                        return  # control.db cannot be read: the reconnect's 503 decides, not a false sign-out
+                    if not alive:
                         yield frame(
                             "unauthorized", {"status": 401, "code": "unauthorized", "message": "Session expired"}
                         )
@@ -617,6 +638,10 @@ class Stream:
                     yield data
                 drained = 0
                 while drained < DRAIN_PER_TICK:
+                    # A due session check, or an address the allowlist no longer admits, comes before any queued
+                    # row: a stalled reader never gets rows past a revocation (finding robust-5).
+                    if mono() >= next_session or not self._network_allowed():
+                        break
                     try:
                         item = self.sub.queue.get_nowait()
                     except asyncio.QueueEmpty:
@@ -629,8 +654,8 @@ class Stream:
                 if now >= next_heartbeat:
                     next_heartbeat = now + HEARTBEAT_S
                     yield comment("keepalive")
-                if drained >= DRAIN_PER_TICK:
-                    continue  # behind: keep forwarding before sleeping
+                if drained >= DRAIN_PER_TICK or mono() >= next_session:
+                    continue  # behind, or a session check is due: back to the top of the loop first
                 try:
                     item = await asyncio.wait_for(self.sub.queue.get(), timeout=TICK_S)
                 except TimeoutError:
@@ -661,11 +686,13 @@ async def stream(
     client: Param = None,
     endpoint: Param = None,
     q: Param = None,
+    config_version: Annotated[int | None, Query(ge=0, le=2**62)] = None,
     last_event_id: Annotated[str | None, Query(max_length=32)] = None,
     last_event_id_header: Annotated[str | None, Header(alias="Last-Event-ID", max_length=32)] = None,
 ) -> StreamingResponse:
     """Open the event stream (see the module docstring). Query parameters filter the `live` rows exactly as the
-    Live page's filter does; `events` picks the event kinds (all by default)."""
+    Live page's filter does; `events` picks the event kinds (all by default); `config_version` is the settings
+    version the page shows (a different one gets `settings_changed` at once)."""
     kinds = parse_kinds(events)
     query, problems = read_dashboard.parse_live_query(
         outcome=outcome, reason=reason, status=status, egress=egress, cache=cache, client=client, endpoint=endpoint, q=q
@@ -697,6 +724,7 @@ async def stream(
             slot=slot,
             holder=holder,
             session_key=session_key,
+            page_version=config_version,
         )
         try:
             await conn.start()

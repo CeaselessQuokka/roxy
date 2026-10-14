@@ -29,13 +29,19 @@
 </label>
 {%- endmacro %}
 
-{% macro live_tail(id, stream_url, detail_url=None, title="Live requests", level=2, max_rows=1000) -%}
+{% macro live_tail(id, stream_url, detail_url=None, title="Live requests", level=2, max_rows=1000, reasons=()) -%}
+{#- `reasons`: `(code, words)` pairs of the refusal and failure kinds (v1's outcome filter, parity row 81; review
+    finding v1parity-3). With them the tail filters by reason and searches a text (User-Agent, query, path), both
+    also sent to the stream as `reason` and `q`, and each row names its reason in words. -#}
 <section class="tail card" id="{{ id }}" data-live-tail data-stream-url="{{ stream_url }}"{% if detail_url %} data-detail-url="{{ detail_url }}"{% endif %}
          data-max-rows="{{ max_rows }}" aria-labelledby="{{ id }}-title">
   <header class="card__head tail__head">
     <div class="card__titles">
       <h{{ level }} class="card__title" id="{{ id }}-title">{{ title }}</h{{ level }}>
+      {#- The live region says only what the admin asked for (Pause, P) and the connection; the pause while the
+          pointer or the keyboard is in the list shows beside it, never announced (plan 14.9, finding a11y-16). -#}
       <span class="tail__state" data-tail-state role="status">Connecting</span>
+      <span class="tail__hold muted" data-tail-hold aria-hidden="true" hidden></span>
     </div>
     <div class="card__actions">
       <span class="tail__count muted" data-tail-count>0 rows</span>
@@ -45,6 +51,7 @@
   </header>
   <form class="tail__filters" data-tail-filters role="search" aria-label="{{ title }}: filters">
     {{ _select("outcome", "Outcome", _OUTCOMES) }}
+    {% if reasons %}{{ _select("reason", "Reason", [("", "Any reason")] + (reasons|list)) }}{% endif %}
     {{ _select("status", "Status", _STATUS) }}
     {{ _select("egress", "Egress", _EGRESS) }}
     {{ _select("cache", "Cache", _CACHE) }}
@@ -52,6 +59,10 @@
     <span class="input-icon">{{ icon("users") }}<input type="search" id="{{ id }}-client" data-tail-filter="client" placeholder="Client IP or place" autocomplete="off" spellcheck="false"></span>
     <label class="sr-only" for="{{ id }}-endpoint">Endpoint contains</label>
     <span class="input-icon">{{ icon("endpoints") }}<input type="search" id="{{ id }}-endpoint" data-tail-filter="endpoint" placeholder="Endpoint contains" autocomplete="off" spellcheck="false"></span>
+    {% if reasons %}
+    <label class="sr-only" for="{{ id }}-q">Text in the User-Agent, query or path</label>
+    <span class="input-icon">{{ icon("search") }}<input type="search" id="{{ id }}-q" data-tail-filter="q" placeholder="User-Agent, query or path" autocomplete="off" spellcheck="false" maxlength="200"></span>
+    {% endif %}
   </form>
   <div class="tail__cols" aria-hidden="true">
     <span>Time</span><span>Status</span><span>Outcome</span><span>Egress</span><span>Cache</span><span class="num">Latency</span><span>Client</span><span>Endpoint</span>

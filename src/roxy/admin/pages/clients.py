@@ -56,6 +56,7 @@ from roxy.admin.api import lookup as lookup_api
 from roxy.admin.pages import fmt, shell
 from roxy.admin.pages.cache import reset_digest, row_key, table_state
 from roxy.admin.pages.kit import Page, PageAdmin, PageView, table_query, table_view, templates_of
+from roxy.admin.pages.texts import bypass_scope
 from roxy.config.catalog import CATALOG
 from roxy.metrics import read_producers
 
@@ -548,6 +549,7 @@ async def client_context(view: PageView, kind: str, key: str) -> dict[str, Any]:
         "reset": client_reset(ctx, kind, key),
         "ban_lengths": BAN_LENGTHS,
         "bypass_hours": float(ctx.settings.get("bypass_default_expiry_h")),
+        "bypass_scope": bypass_scope(),  # what a bypass skips, from the checks' own flags (finding v1parity-9)
         "range_label": view.time.view.get("label"),
         "rate_text": {name: _rate(((answer.get("last_hour") or {}).get("rates") or {}).get(name)) for name in RATES},
         "throwaway_note": lookup_api.THROWAWAY_NOTE,

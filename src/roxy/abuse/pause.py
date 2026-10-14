@@ -159,7 +159,9 @@ async def set_pause(
     """Switch the manual pause on or off (None toggles), optionally replacing the reason (v1 `/admin/proxy/toggle`).
 
     Switching it on records a new `since` marker, so the drop counter of the banner restarts (v1 cleared
-    `pause_drops`; v2 keeps history in the rollups and counts from the marker, row 114). Raises ValueError for a
+    `pause_drops`; v2 keeps history in the rollups and counts from the marker, row 114). Resuming (`paused`
+    False) also ends a scheduled window that is running right now, so the proxy really runs again, as the
+    dashboard's Resume says (review finding functional-2); a window still to come is kept. Raises ValueError for a
     reason with an em or en dash or a control character (plan C5), before anything is written.
     """
     stored = checked_state_reason(reason) if reason is not None else None
@@ -173,6 +175,8 @@ async def set_pause(
             after = replace(after, since=now)
         if not target:
             after = replace(after, since=0.0)
+        if paused is False and before.in_scheduled_window(now):
+            after = replace(after, scheduled_start=None, scheduled_end=None, scheduled_reason="", scheduled_by="")
         return after
 
     return await _write(db, clock, actor, "pause.set", change, reason or "", request_id)

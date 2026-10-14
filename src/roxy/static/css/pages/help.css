@@ -172,6 +172,7 @@
 .help-term__definition {
   margin: 0;
   color: var(--text-muted);
+  overflow-wrap: anywhere;  /* a long path in a definition wraps at 320 px instead of widening the page (a11y-15) */
 }
 
 @media (min-width: 720px) {

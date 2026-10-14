@@ -914,16 +914,13 @@ kbd {
 }
 
 .kpi__label {
-  display: -webkit-box;
   min-width: 0;
-  overflow: hidden;
+  overflow-wrap: anywhere;  /* long names wrap; never clamped, so bigger text or text spacing loses no word */
   color: var(--text-muted);
   font-size: var(--fs-2);
   font-weight: var(--fw-medium);
   line-height: 1.3;
   letter-spacing: 0;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;  /* long names wrap once instead of being cut */
 }
 
 .kpi__value {
@@ -1957,6 +1954,40 @@ kbd {
   font-size: var(--fs-1);
 }
 
+.tail__hold {
+  margin-left: var(--sp-2);
+  font-size: var(--fs-1);
+}
+
+/* The column header never widens the page: its tracks shrink with the rows (a 900 px window, 200 percent zoom on
+   a 1800 px screen; review finding a11y-11). Between the phone and the wide layout the tail shows fewer columns. */
+.tail__cols {
+  overflow: hidden;
+}
+
+.tail__cols > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 1280px) {
+  .tail__cols,
+  .tail__row {
+    grid-template-columns: 70px 48px minmax(0, 1fr) minmax(0, 1fr) minmax(0, 2fr);
+  }
+
+  .tail__cols > :nth-child(4),
+  .tail__cols > :nth-child(5),
+  .tail__cols > :nth-child(6),
+  .tail__row > .tail__egress,
+  .tail__row > .tail__cache,
+  .tail__row > .tail__latency {
+    display: none;
+  }
+}
+
 @media (max-width: 760px) {
   .tail__cols {
     display: none;
@@ -2091,6 +2122,7 @@ kbd {
 .setting__hint {
   color: var(--text-muted);
   font-size: var(--fs-1);
+  overflow-wrap: anywhere;  /* a default URL wraps at 320 px (a11y-15) */
 }
 
 .setting__error {
@@ -2127,6 +2159,8 @@ kbd {
 
 .setting__what-body {
   display: grid;
+  min-width: 0;  /* a grid item: without it, a long unbroken key or URL widens the page (320 px reflow, a11y-15) */
+  overflow-wrap: anywhere;
   gap: var(--sp-2);
   max-width: 80ch;
   margin-top: var(--sp-1);
@@ -2547,6 +2581,7 @@ dialog::backdrop {
   border-radius: var(--radius);
   background: var(--bad-soft);
   color: var(--text);
+  overflow-wrap: anywhere;
 }
 
 .dialog__foot {
@@ -3189,7 +3224,23 @@ dialog::backdrop {
 }
 
 .palette__input:focus {
-  outline: none;
+  outline: none;  /* the search box around it shows the focus instead (below) */
+}
+
+.palette__input::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+/* Where the keyboard is in the palette (WCAG 2.4.7, 1.4.11; review finding a11y-13): the search box carries the
+   focus ring while its input has focus, and the active option (aria-activedescendant) a 3 px bar in the focus color,
+   which stands out at 3:1 from every surface, besides its tint. */
+.palette__search:focus-within {
+  box-shadow: inset 0 0 0 2px var(--focus-ring);
+}
+
+.palette__item[aria-selected="true"] {
+  box-shadow: inset 3px 0 0 var(--focus-ring);
 }
 
 .palette__close {
@@ -3448,6 +3499,7 @@ dialog::backdrop {
 
 .alert__body {
   color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 
 .alert__actions {
@@ -3722,6 +3774,10 @@ dialog::backdrop {
   padding: 0 var(--sp-4) var(--sp-4);
 }
 
+.card-settings__list > * {
+  min-width: 0;  /* a grid item never widens the card past a narrow window (a11y-15) */
+}
+
 /* KPI tiles over partial data (plan 6.8): the notice replaces the delta. */
 .kpi__notice {
   display: inline-flex;
@@ -3771,6 +3827,7 @@ dialog::backdrop {
   color: var(--bad);
   font-size: var(--fs-1);
   font-weight: var(--fw-semibold);
+  overflow-wrap: anywhere;  /* a message quoting a long value never widens its dialog (a11y-19) */
 }
 
 form[aria-busy="true"] {
@@ -3947,10 +4004,15 @@ form[aria-busy="true"] {
 
 .g3-section {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);  /* its table may not widen the card (720 to 900 px windows, a11y-11) */
   gap: var(--sp-3);
   margin-top: var(--sp-4);
   padding-top: var(--sp-4);
   border-top: 1px solid var(--border);
+}
+
+.g3-section > * {
+  min-width: 0;
 }
 
 .g3-subhead {
@@ -4013,6 +4075,14 @@ form[aria-busy="true"] {
 
 .g3-table .badge {
   white-space: nowrap;
+}
+
+/* Any badge outside a table cell wraps its sentence at 320 px instead of widening the page (Security's "Off: any
+   address may see the sign-in page"; WCAG 1.4.10, review finding a11y-15). */
+:where(dd, p, li, div) > .badge {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* On a phone a small table stacks: each row becomes a block and each cell a labeled line (the label comes from the
@@ -4344,5 +4414,91 @@ form[aria-busy="true"] {
 
   .help-dot {
     height: var(--target-touch);
+  }
+
+  /* Every other control, in both dimensions (review finding a11y-3: table search boxes 33 px, rows-per-page 28 px,
+     summaries 24 px, switches, sliders, short sort buttons, standalone links, the palette). */
+  input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea,
+  [role="option"],
+  .palette__item {
+    min-height: var(--target-touch);
+  }
+
+  select,
+  .th-sort,
+  .link-btn,
+  .palette__close {
+    min-width: var(--target-touch);
+  }
+
+  .palette__close {
+    min-height: var(--target-touch);
+    justify-content: center;
+  }
+
+  /* A summary keeps its disclosure marker (no display change): padding makes its row 44 px tall. The component
+     summaries with a height of their own are named, so this block (the last rule) wins over them. */
+  summary,
+  .chart__table > summary,
+  .details-plain > summary,
+  .setting__what > summary,
+  .card-settings__summary,
+  .dialog__extra > summary,
+  .g3-add > summary,
+  .heatmap__summary,
+  .menu > summary,
+  .popover > summary {
+    min-width: var(--target-touch);
+    min-height: var(--target-touch);
+  }
+
+  summary {
+    padding-block: 10px;
+  }
+
+  /* `:not([data-touch-skip])` only raises the weight of the selector, so the rule also wins over a page's own
+     `.x > summary` rule, which loads after this file. */
+  details > summary:not([data-touch-skip]) {
+    min-height: var(--target-touch);
+  }
+
+  .dt__size select,
+  .btn {
+    min-height: var(--target-touch);
+    min-width: var(--target-touch);
+  }
+
+  .setting__links a,
+  .setting__links .link-btn {
+    min-height: var(--target-touch);
+  }
+
+  /* A checkbox, radio or switch is reached through its label (the label is the target the test and a finger use). */
+  label:has(> input[type="checkbox"]),
+  label:has(> input[type="radio"]),
+  .switch {
+    display: inline-flex;
+    align-items: center;
+    min-width: var(--target-touch);
+    min-height: var(--target-touch);
+  }
+
+  /* A link that stands alone (not a word inside a sentence) is a control: 44 by 44. */
+  a[href]:not(:where(p, dd, figcaption, q, blockquote) a) {
+    display: inline-flex;
+    align-items: center;
+    min-width: var(--target-touch);
+    min-height: var(--target-touch);
+  }
+
+  /* A link inside a text block keeps the text's lines: vertical padding with an equal negative margin makes its
+     touch area 44 px tall without moving a line (inline padding never changes the line box), and a link laid out
+     as a block (in a flex row of a title) gets its 44 px width too. */
+  :where(p, dd, figcaption, q, blockquote) a[href] {
+    min-width: var(--target-touch);
+    padding-block: 13px;
+    margin-block: -13px;
   }
 }

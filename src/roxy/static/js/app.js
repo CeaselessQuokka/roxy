@@ -31,7 +31,7 @@ import Alpine from "vendor/alpine";
 import { initApiForms } from "roxy/api_forms";
 import { initCards } from "roxy/cards";
 import { registerComponents } from "roxy/components";
-import { hasUnsavedChanges, initOverlayLayer, qs, qsa, store } from "roxy/dom";
+import { hasUnsavedChanges, initFocusKeeper, initOverlayLayer, qs, qsa, store } from "roxy/dom";
 import { initDialogs, initMenus } from "roxy/dialog";
 import { initExports } from "roxy/exports";
 import { initPalette } from "roxy/palette";
@@ -86,20 +86,29 @@ function initCopy() {
   });
 }
 
-/** The time range form keeps the page's other query parameters (filters) when it is applied (plan 14.2). */
+/** The time range form keeps the page's other query parameters (filters) when it is applied (plan 14.2).
+ *  A click or tap on a preset applies it at once; the keyboard moves through the radios (arrow keys check them
+ *  as they move) and applies with Enter or the Apply button, so moving never loads a page (WCAG 3.2.2, finding
+ *  a11y-2). Applying starts the tables on their first page: a page number kept from another range can lie past
+ *  the end (finding functional-7). */
 function initRangeForm() {
   const form = qs("[data-range-form]");
   if (!form) return;
+  let pointerAt = -Infinity;
+  form.addEventListener("pointerdown", () => {
+    pointerAt = performance.now();
+  });
   form.addEventListener("change", (event) => {
     const target = event.target;
-    if (target instanceof HTMLInputElement && target.name === "range" && target.value !== "custom") form.requestSubmit();
-    if (target instanceof HTMLInputElement && target.name === "compare") form.requestSubmit();
+    if (!(target instanceof HTMLInputElement) || performance.now() - pointerAt > 1500) return;  // keyboard: wait
+    if (target.name === "range" && target.value !== "custom") form.requestSubmit();
+    if (target.name === "compare") form.requestSubmit();
   });
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     const url = new URL(window.location.href);
     const data = new FormData(form);
-    for (const name of ["range", "compare", "from", "to"]) url.searchParams.delete(name);
+    for (const name of ["range", "compare", "from", "to", "page"]) url.searchParams.delete(name);
     const range = data.get("range") || "24h";
     url.searchParams.set("range", range);
     const compare = data.get("compare") || "none";
@@ -137,6 +146,7 @@ registerComponents(Alpine);
 Alpine.start();
 
 initOverlayLayer(["#roxy-tip", "#toasts", "#sr-polite", "#sr-assertive"]);
+initFocusKeeper();
 initTheme();
 initToasts();
 initTooltips();

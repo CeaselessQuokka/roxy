@@ -276,7 +276,8 @@
 
 .data-datasets {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
+  /* `min(100%, 20rem)`: one column narrower than 20rem at 320 px instead of a page that scrolls (a11y-15). */
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 20rem), 1fr));
   gap: var(--sp-2) var(--sp-4);
   margin: 0;
   padding: 0;

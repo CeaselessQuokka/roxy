@@ -280,6 +280,7 @@ def disguised_throttle(
     penalty_wait_ms: int = 0,
     tarpit_category: str | None,
     detail: str,
+    match_detail: Mapping[str, str] | None = None,
 ) -> Refuse:
     """A refusal that looks exactly like an ordinary per-IP throttle refusal (header filters, bans, spam flags).
 
@@ -288,7 +289,8 @@ def disguised_throttle(
     v2 also sends `Roxy-Requests-Left: 0` and `Roxy-Refusal: throttle`, exactly what a genuine throttle refusal
     carries, in the same order (`throttle_refusal_headers`), so nothing in the response tells the client which rule
     caught it. A client whose throttle penalty is still running (`penalty_wait_ms`) is told the time left on it, as
-    a genuine refusal would tell it right now.
+    a genuine refusal would tell it right now. `match_detail` (what a request filter hit) is kept for the records
+    only, never sent.
     """
     window = max(1, facts.int("throttle_reset_duration"))
     retry, reset = window, window
@@ -310,6 +312,7 @@ def disguised_throttle(
         disguised=True,
         message_source=source,
         detail=detail,
+        match_detail=dict(match_detail or {}),
     )
 
 
@@ -329,6 +332,7 @@ def redisguise(refusal: Refuse, tx: TxState) -> Refuse:
         penalty_wait_ms=tx.penalty_wait_ms,
         tarpit_category=refusal.tarpit_category,
         detail=refusal.detail,
+        match_detail=refusal.match_detail,
     )
 
 

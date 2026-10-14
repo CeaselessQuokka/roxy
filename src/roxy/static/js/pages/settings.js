@@ -5,7 +5,8 @@
  * What this is
  *   1. Filters and pages: the editor's filter form asks its fragment with htmx (only the results are swapped); this
  *      script resets to page 1 when a filter changes, moves between pages and page sizes, keeps the view in the
- *      address bar (replaceState, values equal to their default left out), and announces the new count.
+ *      address bar (replaceState, values equal to their default left out) and in the card's refresh address (so a
+ *      re-render after a save, an import or a revert shows the same view), and announces the new count.
  *   2. Batch edit: every setting edited in the editor and not yet saved is remembered (also across pages of
  *      results). "Review all changes" opens a dialog with the server's preview of the batch (`POST
  *      /admin/api/v1/settings/preview`: before, after, what happens, risk, the rules between settings); "Save the
@@ -190,6 +191,37 @@ function syncAddress() {
   if (url.href !== window.location.href) window.history.replaceState(window.history.state, "", url.href);
 }
 
+/**
+ * Keep the editor card's refresh address (`data-card-src`, static/js/cards.js) on the view its filter form shows:
+ * the search, the filters, the page, the page size and the one-setting key (as static/js/tables.js `followCard` does
+ * for a table, but with the page kept: the editor's pages do not move when a value is saved). The server draws the
+ * card with the time range only, so without this a batch save, an import or a revert from the history drawer, which
+ * re-render the whole card, showed page 1 of every setting with an empty search box and dropped the search from the
+ * address (finding functional-10).
+ */
+function followFilters() {
+  const card = editorRoot();
+  const form = filterForm();
+  if (!card || !form || !card.dataset.cardSrc) return;
+  const url = new URL(card.dataset.cardSrc, window.location.origin);
+  const own = new URL(form.getAttribute("hx-get") || "", window.location.origin);
+  if (url.origin !== window.location.origin || url.pathname !== own.pathname) return;
+  for (const name of FILTER_NAMES) url.searchParams.delete(name);
+  for (const [name, value] of new FormData(form)) {
+    if (!FILTER_NAMES.includes(name) || typeof value !== "string") continue;
+    const text = value.trim();
+    if (text && DEFAULTS[name] !== text) url.searchParams.set(name, text);
+  }
+  const src = `${url.pathname}${url.search}`;
+  if (card.dataset.cardSrc !== src) card.dataset.cardSrc = src;
+}
+
+/** Re-render the editor card on the view the admin is looking at (after a batch save or an import). */
+function refreshEditor() {
+  followFilters();
+  refreshCard("editor");
+}
+
 function submitFilters({ page } = {}) {
   const form = filterForm();
   if (!form) return;
@@ -209,6 +241,7 @@ function onResults(results) {
   } else {
     syncAddress();
   }
+  followFilters();
   if (focusResults) {
     focusResults = false;
     results.focus({ preventScroll: true });
@@ -349,7 +382,7 @@ async function saveBatch(form) {
     renderBar();
     dialog.close();
     toast(`Saved ${count} setting${count === 1 ? "" : "s"}. Every worker uses ${count === 1 ? "it" : "them"} within a second.`, { tone: "ok" });
-    refreshCard("editor");
+    refreshEditor();
     refreshCard("history");
     return;
   }
@@ -516,7 +549,7 @@ async function applyImport(form) {
     closeImport();
     for (const node of qsa("[data-settings-import], [data-import-apply]")) node.reset();
     toast(`Imported ${count} change${count === 1 ? "" : "s"}. Every worker uses them within a second.`, { tone: "ok" });
-    refreshCard("editor");
+    refreshEditor();
     refreshCard("history");
     return;
   }

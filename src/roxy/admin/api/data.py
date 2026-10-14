@@ -140,6 +140,7 @@ from roxy.metrics.recorder import (
     dims_hash,
 )
 from roxy.metrics.rollups import DIM_COLUMNS, PAIR_CLIENT_TYPE, PAIR_SEPARATOR, ROLLUP_SUMS, zone
+from roxy.metrics.templating import literal_text
 from roxy.rules.match import PatternValidationError
 from roxy.rules.models import RULE_TABLES
 from roxy.storage import leases, read_sizes, retention
@@ -709,9 +710,11 @@ def _range(body: ResetBody, tz: str, *, required: bool) -> tuple[int, int] | Non
 
 
 def template_regex(template: str) -> str:
-    """An anchored regex for the cache entries of an endpoint template (`{name}` matches one path segment)."""
+    """An anchored regex for the cache entries of an endpoint template (`{name}` matches one path segment). Only
+    `templatize` writes braces into a template (a caller's own are percent-encoded, `metrics/templating.py`), and
+    the literal text is matched as the caller sent it (`literal_text`), never as syntax (finding esc-1)."""
     pieces = _PLACEHOLDER_RE.split(template.strip().lstrip("/"))
-    return "^" + "[^/]+".join(re.escape(piece) for piece in pieces) + "$"
+    return "^" + "[^/]+".join(re.escape(literal_text(piece)) for piece in pieces) + "$"
 
 
 def _client_parts(kind: str, raw: str, ctx: Any) -> tuple[list[Part], dict[str, Any], list[str]]:
@@ -2101,7 +2104,7 @@ async def measure_storage(ctx: Any, *, refresh: bool = False) -> dict[str, Any]:
         files = await asyncio.to_thread(read_sizes.file_sizes, paths)
         extra = await asyncio.to_thread(_folder_bytes, Path(ctx.env.state_dir))
         total = sum(f["bytes"] + f["wal_bytes"] + f["shm_bytes"] for f in files.values()) + sum(extra.values())
-        budget = int(float(ctx.settings.get("storage_total_budget_gb")) * 1024**3)
+        budget = read_sizes.budget_bytes(ctx.settings.get("storage_total_budget_gb"))  # decimal GB (truth-5)
         value = {
             "measured_at": int(now),
             "databases": databases,

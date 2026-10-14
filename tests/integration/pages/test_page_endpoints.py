@@ -23,7 +23,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from pages_harness import parse_html
+from pages_harness import PlannedRequest, parse_html
+from roxy.admin.api import traffic as traffic_api
 from roxy.admin.pages import registry
 from roxy.core.style_guard import find_style_issues
 
@@ -144,6 +145,35 @@ async def test_the_drill_down_equals_the_api_in_the_drawer_and_on_its_page(page:
     assert full.select_one('[data-action="endpoint-page"]') is None  # already the page
     assert full.select_one('[data-action="endpoint-reset"]') is not None  # plan 6.8: the header menu's reset
     assert full.select_one('[data-kpi="requests"] .kpi__number').text() == tile.text()
+
+
+async def test_the_drill_down_chart_counts_options_answered_locally_apart(page: Any, pages_app: Any) -> None:
+    """Finding truth-6 (the Traffic chart's lines, `traffic_api.outcome_lines`): the drill-down's requests by outcome
+    say "Served by Roblox" only for what reached Roblox, as its own `served_upstream` total does."""
+    statuses = await pages_app.seed_traffic(
+        [
+            PlannedRequest("/games.roblox.com/v1/games?universeIds=91", "203.0.113.80"),
+            PlannedRequest("/games.roblox.com/v1/games?universeIds=91", "203.0.113.81", method="OPTIONS"),
+            PlannedRequest("/games.roblox.com/v1/games?universeIds=92", "203.0.113.82", method="OPTIONS"),
+        ]
+    )
+    assert statuses == [200, 204, 204], statuses
+    api = (await page.api("GET", "endpoints/detail", params={"template": GAMES, "range": "1h"})).json()
+    lines = {s["key"]: sum(v for _t, v in s["points"] if v) for s in api["requests_by_outcome"]["series"]}
+    local = f"requests:{traffic_api.ANSWERED_LOCALLY}"
+    assert lines == {
+        "requests:served_upstream": 1,
+        "requests:served_cache": 0,
+        "requests:refused": 0,
+        "requests:failed": 0,
+        local: 2,
+    }
+    assert lines["requests:served_upstream"] == api["totals"]["served_upstream"]["value"]
+    assert sum(lines.values()) == api["totals"]["requests"]["value"] == 3
+    drawer = parse_html((await page.fragment("endpoints", "detail", template=GAMES, range="1h")).text)
+    options = drawer.select_one("figure#ep-outcomes-chart").get("data-series-options")
+    assert local in options
+    assert traffic_api.ANSWERED_LOCALLY_LABEL in options
 
 
 async def test_the_recent_card_equals_the_api(page: Any, pages_app: Any) -> None:

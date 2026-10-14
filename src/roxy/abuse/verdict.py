@@ -24,6 +24,9 @@ How it works
       id}` (an endpoint block, a rate rule, a header filter, a User-Agent rule, a bypass, deny or ban entry), whatever
       the verdict; the pipeline fills it and records the hits (`checks/base.py Facts.note_match`). Never sent to the
       caller.
+    - `match_detail` (a request filter's refusal only) says what the filter hit: `{header, field, text}` (the header,
+      whether its name or its value matched, and the text that matched; `abuse/header_rules.py match_detail`). The
+      refusal's outcome record keeps it for the Header-Blocked Attempts tab (parity row 75). Never sent to the caller.
 
 What to read next
     `roxy/abuse/messages.py` (every text), then `roxy/abuse/pipeline.py`.
@@ -94,6 +97,7 @@ class Refuse:
     detail: str = ""
     content_type: str = JSON_CONTENT_TYPE
     matches: dict[str, str] = field(default_factory=dict)  # rule rows this request matched (module docstring)
+    match_detail: dict[str, str] = field(default_factory=dict)  # what a request filter hit (module docstring)
 
     def encoded_body(self) -> bytes:
         """The bytes to send: the JSON wire form for every refusal, the page itself for the HTML challenge."""

@@ -42,4 +42,20 @@ def header_text(value: str | None) -> str:
     return raw.decode("utf-8", "backslashreplace")
 
 
-__all__ = ["header_text"]
+def text_lines(text: str | None) -> list[str]:
+    """`text` split at line breaks only: `\\r\\n`, `\\n` and `\\r` (no empty last line after a final break).
+
+    `str.splitlines()` also breaks at U+2028, U+2029, U+0085, U+000B, U+000C and U+001C to U+001E, which a caller
+    can put inside a header value or a path (header values are read as UTF-8, paths are percent-decoded). Text a
+    caller chose must never become extra lines: the request filter tester would read a forged header, and an audit
+    diff would cut a line in two (review finding esc-4).
+    """
+    if not text:
+        return []
+    parts = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if parts[-1] == "":
+        parts.pop()
+    return parts
+
+
+__all__ = ["header_text", "text_lines"]

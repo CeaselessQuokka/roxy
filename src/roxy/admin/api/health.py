@@ -288,6 +288,29 @@ run_filters = _filters
 """`run_filters(trigger, worst, check, check_status, start, end, tz) -> store.RunFilter` (422 when invalid)."""
 
 
+def window_bounds(start: float, end: float) -> tuple[int, int]:
+    """A page's time range window as `(from, to)` epoch seconds within the bounds `from` and `to` may name here
+    (1970 to 2100, `common.MAX_EPOCH_S`), for the run filter's `since` and `until` and the export link.
+
+    A window aligned to day, week or month buckets in `ui_timezone` may start before 1970 or end after 2100 (a zone
+    west or east of UTC), which `run_filters` refuses when it is handed back as text (finding robust-3). No run can
+    be that old or that new, so clamping keeps every run the window holds, and the export link the page builds from
+    the same numbers is one the API accepts.
+    """
+
+    def clamp(value: float) -> int:
+        return min(max(0, int(value)), common.MAX_EPOCH_S)
+
+    return clamp(start), clamp(end)
+
+
+def window_filter(filters: store.RunFilter, start: float, end: float) -> store.RunFilter:
+    """`filters` limited to the runs started in the window `[start, end)`, passed as numbers (`window_bounds`), never
+    re-parsed from text: a page's time range was validated when its view was built."""
+    since, until = window_bounds(start, end)
+    return dataclasses.replace(filters, since=since, until=until)
+
+
 async def run_answer(ctx: Any, run_id: int) -> dict[str, Any]:
     """One run as `GET /health/runs/{id}` answers it (404 when no run has that id)."""
     return _shape_run(await _run_detail(ctx, run_id))
@@ -452,4 +475,6 @@ __all__ = [
     "run_answer",
     "run_filters",
     "runs_table",
+    "window_bounds",
+    "window_filter",
 ]

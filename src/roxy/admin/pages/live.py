@@ -50,6 +50,7 @@ from roxy.admin.api import common
 from roxy.admin.api import live as live_api
 from roxy.admin.api import upstream as upstream_api
 from roxy.admin.pages import fmt
+from roxy.admin.pages._protection_views import REASON_LABELS
 from roxy.admin.pages.kit import CardDef, Page, PageAdmin, PageView, render_card
 from roxy.admin.pages.registry import CardSpec
 from roxy.admin.pages.resets import add_reset_route, family_reset, reset_href
@@ -66,8 +67,13 @@ router = page.router
 
 SEED_ROWS: Final = 40
 """Rows the tail replays on load (the stream's rate gate lets 50 through at once; more would be sampled out)."""
-FILTER_NAMES: Final[tuple[str, ...]] = ("outcome", "status", "egress", "cache", "client", "endpoint")
-"""The tail's filter fields (`components/live_tail.html`); the address may name them (plan 14.2)."""
+FILTER_NAMES: Final[tuple[str, ...]] = ("outcome", "reason", "status", "egress", "cache", "client", "endpoint", "q")
+"""The tail's filter fields (`components/live_tail.html`); the address may name them (plan 14.2). `reason` and `q`
+are v1's outcome filter of refusal kinds and its text search (parity row 81, review finding v1parity-3)."""
+REASON_CHOICES: Final[tuple[tuple[str, str], ...]] = tuple(
+    (code.value, REASON_LABELS.get(code.value, code.value)) for code in ReasonCode if code.is_refusal or code.is_failure
+)
+"""The Reason filter's options: every refusal and failure kind in words (`_protection_views.REASON_LABELS`)."""
 STREAM_EVENTS: Final = "live,kpi"
 DETAIL_URL: Final = "/admin/live/request?id={id}"
 MAX_BODY_CHARS: Final = 20_000
@@ -126,11 +132,13 @@ def pretty_body(text: Any) -> str:
     raw = str(text or "")
     try:
         value = json.loads(raw)
-    except (TypeError, ValueError):
+        if not isinstance(value, dict | list):
+            return raw[:MAX_BODY_CHARS]
+        return json.dumps(value, indent=2, ensure_ascii=False)[:MAX_BODY_CHARS]
+    except (TypeError, ValueError, RecursionError, MemoryError):
+        # Not JSON, or JSON nested deeper than the parser's stack (a caller can send 16 KiB of `[`; finding esc-3):
+        # the body as captured, so the drawer of exactly that request still shows.
         return raw[:MAX_BODY_CHARS]
-    if not isinstance(value, dict | list):
-        return raw[:MAX_BODY_CHARS]
-    return json.dumps(value, indent=2, ensure_ascii=False)[:MAX_BODY_CHARS]
 
 
 def header_rows(headers: Any) -> list[tuple[str, str]]:
@@ -159,6 +167,7 @@ async def tail_card(view: PageView) -> dict[str, Any]:
         "worker_rate": int(LIVE_EVENTS_PER_SECOND),
         "stream_rate": int(LIVE_RATE),
         "reset_href": reset_href("live", which="live"),
+        "reasons": REASON_CHOICES,
     }
 
 

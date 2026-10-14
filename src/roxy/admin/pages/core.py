@@ -9,8 +9,9 @@ What this is
       the event stream says settings changed (`static/js/settings_api.js`).
     * `GET /admin/ui/palette?q=`: the command palette's server results (settings, recommendations, endpoints; at most
       20, every link a path under `/admin`).
-    * `GET /admin/ui/status`: `{paused, throttle_all, signature}`, so an open page notices a pause or emergency
-      limit switched elsewhere (`static/js/shell.js`).
+    * `GET /admin/ui/status`: `{paused, throttle_all, signature, digest, next_change}`, so an open page notices a
+      pause or emergency limit switched or changed elsewhere (`static/js/shell.js`); `GET /admin/ui/status/parts`
+      renders the top bar controls, banners and control dialogs as they are now, for a page that cannot reload.
 
 Why it exists
     These routes belong to no single page. They are read-only (every change goes through the admin API) and
@@ -176,8 +177,22 @@ async def palette(
 
 @router.get("/admin/ui/status", include_in_schema=False)
 async def status(request: Request, principal: PageAdmin) -> Response:
-    """The pause and emergency-limit switches as a short signature (the shell checks it on `settings_changed`)."""
+    """The pause and emergency-limit switches as a short signature, a digest of everything the shell prints about
+    them and when a scheduled window next changes them (`shell.status_signature`; the shell checks it on
+    `settings_changed` and at `next_change`)."""
     return JSONResponse(await shell.status_signature(get_ctx(request)))
+
+
+STATUS_PARTS_TEMPLATE: Final = "admin/_layout/status_parts.html"
+
+
+@router.get("/admin/ui/status/parts", include_in_schema=False)
+async def status_parts(request: Request, principal: PageAdmin) -> HTMLResponse:
+    """The top bar controls, banners and control dialogs as they are now (`static/js/shell.js` swaps them into a
+    page that cannot reload; findings functional-6, functional-8 and functional-11)."""
+    context = await shell.status_parts_context(request, principal)
+    html = templates_of(request).render_to_string(request, STATUS_PARTS_TEMPLATE, context)
+    return HTMLResponse(html)
 
 
 __all__ = ["DASHBOARD_PATH", "render_page", "router", "setting_href"]

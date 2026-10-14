@@ -41,6 +41,7 @@ import yaml
 from roxy.abuse.messages import downtime_default
 from roxy.abuse.pause import PauseState
 from roxy.abuse.throttle_all import ThrottleAllState
+from roxy.core.header_text import text_lines
 
 PACKAGE_DIR: Final = Path(__file__).resolve().parents[2]
 """The installed `roxy` package: `<repo>/src/roxy` in a checkout, `.../site-packages/roxy` in a release."""
@@ -109,8 +110,10 @@ def glossary_terms(entries: Mapping[str, GlossaryEntry]) -> list[GlossaryEntry]:
 
 
 def diff_lines(before: str, after: str, context: int = 3) -> list[dict[str, Any]]:
-    """A line diff for components/diff.html `diff_lines`: equal runs longer than 2 x context fold into one row."""
-    old, new = before.splitlines(), after.splitlines()
+    """A line diff for components/diff.html `diff_lines`: equal runs longer than 2 x context fold into one row.
+    Lines break at `\\n` and `\\r` only (`text_lines`): a U+2028 a caller put in a path stays inside its line
+    (finding esc-4)."""
+    old, new = text_lines(before), text_lines(after)
     rows: list[dict[str, Any]] = []
     matcher = difflib.SequenceMatcher(a=old, b=new, autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -149,12 +152,57 @@ def caller_texts(
     }
 
 
+CHECK_WORDS: Final[dict[str, str]] = {
+    "pause": "pause",
+    "bans": "bans",
+    "flood": "the flood limit",
+    "spam": "the spam detectors",
+    "throttle_all": "the emergency limit",
+    "throttle": "the per-IP limit",
+    "place_limit": "place limits",
+    "challenge": "the browser challenge",
+    "bot_score": "the bot score block",
+    "user_agent_rule": "User-Agent rules",
+    "ignored_path": "ignored paths",
+    "unsafe_url": "unsafe URL refusals",
+    "not_roblox": "the Roblox host check",
+    "auth_smuggling": "credential smuggling refusals",
+    "header_rule": "request filters",
+    "endpoint_blocked": "endpoint blocks",
+    "endpoint_rule": "endpoint rules",
+}
+"""The dashboard's words for each abuse check (`abuse/checks`, by `name`)."""
+
+
+def _join(words: list[str]) -> str:
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1] if words else ""
+
+
+@lru_cache(maxsize=1)
+def bypass_scope() -> dict[str, str]:
+    """What an admin bypass skips and what it does not, in words, read from the checks' own `skipped_by_bypass`
+    flags (`abuse/checks`), so the Bypass card and the client drawer's bypass dialog can never leave a check out
+    (review finding v1parity-9: they named neither the flood limit nor the spam detectors, the challenge or the bot
+    score block). `skips` ends with the tarpit, which a bypassed request never meets either."""
+    from roxy.abuse.checks import default_checks  # lazy: the checks pull in the whole abuse layer
+
+    skipped: list[str] = []
+    kept: list[str] = []
+    for check in default_checks():
+        words = CHECK_WORDS.get(check.name)
+        if words and check.name != "bypass":
+            (skipped if check.skipped_by_bypass else kept).append(words)
+    return {"skips": _join([*skipped, "the tarpit"]), "keeps": _join(kept)}
+
+
 __all__ = [
+    "CHECK_WORDS",
     "GLOSSARY_PATH",
     "GLOSSARY_RELATIVE_PATH",
     "GLOSSARY_SEARCH_PARENTS",
     "PACKAGE_DIR",
     "GlossaryEntry",
+    "bypass_scope",
     "caller_texts",
     "diff_lines",
     "find_glossary",

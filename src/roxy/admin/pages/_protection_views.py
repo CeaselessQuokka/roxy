@@ -413,29 +413,50 @@ def _seconds(value: Any) -> str:
     return span_words(value)
 
 
-def gap_trend(recent: Any, baseline: Any) -> str:
-    """v1's trend sentence: is the hour's gap between a held caller's requests longer than usual?"""
+BASELINE_WORDS: Final = "the day before it"
+"""How the trend names its shortest baseline (the 24 hours before the last hour)."""
+
+
+def baseline_words(span_s: Any) -> str:
+    """The trend's baseline in words: `the day before it` for 24 hours, else `the 7 days before it` and so on."""
+    if isinstance(span_s, bool) or not isinstance(span_s, int | float) or span_s <= 86_400:
+        return BASELINE_WORDS
+    return f"the {span_words(span_s)} before it"
+
+
+def gap_trend(recent: Any, baseline: Any, words: str = BASELINE_WORDS) -> str:
+    """v1's trend sentence: is the hour's gap between a held caller's requests longer than usual?
+
+    v1 compared the last hour with the lifetime gap (`AvgGap(60) / lifetime`, "Backing off" at 1.15 or more). Here
+    `baseline` is the gap of a period that ENDS where the hour begins (at least a day, `words` names it), so the hour
+    is never compared with itself (finding v1parity-10: at the 1 h range the range was the hour, so the sentence
+    could only ever say "Holding steady")."""
     if not isinstance(recent, int | float) or not isinstance(baseline, int | float) or not baseline:
         return "Not enough data yet to compare."
     ratio = float(recent) / float(baseline)
     if ratio >= 1.15:
-        return f"Backing off: {round((ratio - 1) * 100)}% longer between requests this hour than over the range."
+        return f"Backing off: {round((ratio - 1) * 100)}% longer between requests this hour than in {words}."
     if ratio <= 0.85:
-        return f"Speeding up: {round((1 - ratio) * 100)}% shorter between requests this hour."
-    return "Holding steady; about the same request rate as over the range."
+        return f"Speeding up: {round((1 - ratio) * 100)}% shorter between requests this hour than in {words}."
+    return f"Holding steady; about the same request rate as in {words}."
 
 
 def tarpit_tiles(
     history: Mapping[str, Any], windows: Mapping[str, Mapping[str, Any]], state: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
     """The four v1 tiles (`Requests Held`, `Average Hold`, `Time Between Requests`, `Held In Last Hour`) from the
-    fleet hold statistics of the range (`history`) and of the last 15 minutes, hour and day (`windows`)."""
+    fleet hold statistics of the range (`history`) and of the last 15 minutes, hour and day (`windows`).
+
+    `windows["baseline"]` (optional) is the period before the last hour that the trend sentence compares the hour
+    with (`gap_trend`); its `window` (`{from, to}`, as `read_producers.tarpit_summary` answers) names it in words."""
     holds = int(history.get("holds") or 0)
     skipped = int(history.get("skipped") or 0)
     active = state.get("active_holds")
     cap = int(state.get("max_concurrent") or 0)
-    w15, w60, w1440 = (windows.get(key) or {} for key in ("15m", "1h", "24h"))
+    w15, w60, w1440, before = (windows.get(key) or {} for key in ("15m", "1h", "24h", "baseline"))
     gap = history.get("gap_after_hold_s")
+    span = before.get("window") or {}
+    words = baseline_words(int(span.get("to") or 0) - int(span.get("from") or 0))
     worker_ips = len((state.get("stats") or {}).get("ips") or {})
     return [
         {
@@ -471,11 +492,12 @@ def tarpit_tiles(
                 f"Last 15m: {_seconds(w15.get('gap_after_hold_s'))}; last hour: "
                 f"{_seconds(w60.get('gap_after_hold_s'))}; last 24h: {_seconds(w1440.get('gap_after_hold_s'))}",
                 f"After an instant refusal: {_seconds(history.get('gap_after_instant_s'))}. "
-                + gap_trend(w60.get("gap_after_hold_s"), gap),
+                + gap_trend(w60.get("gap_after_hold_s"), before.get("gap_after_hold_s"), words),
             ],
             "help": "The average gap before a held caller's next request: the number that says whether holding "
             "them slows them down. Compare it with the gap after an instant refusal; if the tarpit works, the gap "
-            "after a hold is LONGER.",
+            "after a hold is LONGER. The trend compares the last hour with the day before it (or with the range "
+            "before it, when the range is longer).",
         },
         {
             "key": "tarpit_hour",
@@ -532,6 +554,7 @@ __all__ = [
     "TARPIT_CATEGORY_NOTES",
     "TYPE_LABELS",
     "UA_SCOPE_LABELS",
+    "baseline_words",
     "gap_trend",
     "header_rule_text",
     "histogram_rows",

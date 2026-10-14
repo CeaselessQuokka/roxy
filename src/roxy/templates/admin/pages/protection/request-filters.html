@@ -7,8 +7,9 @@
   "Add a filter" (`POST /header-rules`; the same filter twice is refused, row 112); a row opens the filter in the
   drawer. Tester: paste headers (or load a recent request's, or v1's example lines; `GET /header-rules/presets`),
   optionally a draft filter, and see which filter would refuse them (`POST /header-rules/test`, run by
-  static/js/pages/protection.js). Attempts: the paths a filter refused in the range, by how many clients, and which
-  filter refused them (`GET /header-rules/attempts`, the "Refused by" column).
+  static/js/pages/protection.js). Attempts: the paths a filter refused in the range, by how many clients, which
+  filter refused them (`GET /header-rules/attempts`, the "Refused by" column) and v1's Last header, Triggered by
+  (header name or value) and Matched text of the newest refusal (finding v1parity-5).
   Context: `frame`, `tables`, `only`, `presets`, `api`; for the drawer `detail`.
   Context also has `clear` (`protection.py clear_action`): v1's clear button of this section, a plan 6.8 data reset.
 -#}

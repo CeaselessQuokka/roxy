@@ -70,6 +70,7 @@ from roxy.admin.api.common import (
     run_mutation,
     table_params,
 )
+from roxy.admin.auth.allowlist import in_admin_allowlist
 from roxy.admin.auth.deps import AdminPrincipal, ReauthRequired
 from roxy.admin.auth.sessions import FULL_MFA_LEVELS
 from roxy.config import audit, catalog, read_settings
@@ -103,6 +104,16 @@ detectors (real bans), which plan 10.3 allows only after the collateral preview:
 the preview's token. Turning the dry run back on (1), resetting it to its default (1) and leaving it as it is are
 always allowed."""
 ARM_ONLY_MESSAGE: Final = "Arm the spam detectors from the Protection page: it first shows who would have been banned."
+ALLOWLIST_KEY: Final = "admin_allowlist_enabled"
+"""The admin network allowlist switch (D6): switching it on hides /admin from every network not on the list."""
+LOCKOUT_MESSAGE: Final = (
+    "Your address is not on the admin allowlist, so switching the allowlist on would lock you out of the dashboard "
+    "(only the server console could undo it). Add your network to the allowlist first (Protection > Lists)."
+)
+EMPTY_ALLOWLIST_MESSAGE: Final = (
+    "The admin allowlist has no entry, so switching it on would hide the dashboard from every network. Add your "
+    "network to the allowlist first (Protection > Lists)."
+)
 FRESH_MFA_GROUPS: Final[frozenset[Group]] = frozenset({Group.ADMIN_SECURITY, Group.CREDENTIAL})
 """Settings groups whose every change needs a fresh second factor (plan 9.6): `admin_security` decides who may sign
 in and what a session may do (the re-auth window itself, session lifetimes, lockouts, the admin network allowlist),
@@ -432,6 +443,13 @@ class WriteRules:
         control.db holds (the value before this write): 403 `reauth_required`;
       * an `ARM_ONLY_SETTINGS` key going from on to off, unless `arming_allowed` (only the arm route): 422
         `confirmation_required`;
+      * `admin_allowlist_enabled` going from off to on (review finding authz-2: it locked the admin out unasked,
+        while removing the allowlist entry that covers them asks for `confirm_lockout`): refused outright with an
+        empty list (it would hide /admin from every network: 422 `validation_failed`), and with `confirm_lockout`
+        False when the acting admin's address is on no entry (422 `confirmation_required`). Every settings writer
+        passes this guard (inline control, batch, import, revert, reset, the Protection page's batches);
+    `covered` and `listed` are read from this worker's rules snapshot when the request starts (a lookup, no I/O on
+    the writer thread; an entry added within the last second may not be in it yet, which only asks once more).
       * with `confirmed` False, a high-risk value (`risk_reason`): 422 `confirmation_required`. None means the route
         decided its confirmation from data that does not lag (a revert's history row, an import preview read from
         control.db).
@@ -442,6 +460,11 @@ class WriteRules:
     factor_age_s: float | None
     confirmed: bool | None = None
     arming_allowed: bool = False
+    covered: bool = True
+    """Whether the acting admin's address is inside an active `allow_admin` entry."""
+    listed: bool = True
+    """Whether the admin allowlist has any entry at all."""
+    confirm_lockout: bool = False
 
     def fresh(self, pending: PendingWrite) -> bool:
         """Whether the second factor is fresh by the re-auth window control.db holds."""
@@ -456,6 +479,15 @@ class WriteRules:
     def __call__(self, pending: PendingWrite) -> None:
         if fresh_mfa_keys(pending.dirty) and not self.fresh(pending):
             raise ReauthRequired()
+        if ALLOWLIST_KEY in pending.dirty:
+            old, new = pending.dirty[ALLOWLIST_KEY]
+            if not bool(old) and bool(new):
+                if not self.listed:
+                    raise common.validation_error({ALLOWLIST_KEY: EMPTY_ALLOWLIST_MESSAGE}, EMPTY_ALLOWLIST_MESSAGE)
+                if not self.covered and not self.confirm_lockout:
+                    raise common.validation_error(
+                        {ALLOWLIST_KEY: LOCKOUT_MESSAGE}, LOCKOUT_MESSAGE, code="confirmation_required"
+                    )
         if not self.arming_allowed:
             arming = {
                 key: f"{ARM_ONLY_MESSAGE} ({ARM_ONLY_SETTINGS[key]})"
@@ -477,11 +509,28 @@ class WriteRules:
 
 
 def write_rules(
-    ctx: Any, admin: AdminPrincipal, *, confirmed: bool | None = None, arming_allowed: bool = False
+    ctx: Any,
+    admin: AdminPrincipal,
+    *,
+    confirmed: bool | None = None,
+    arming_allowed: bool = False,
+    confirm_lockout: bool = False,
 ) -> WriteRules:
-    """The `WriteRules` of a request by `admin` (the age of its second factor on this worker's clock)."""
+    """The `WriteRules` of a request by `admin` (the age of its second factor on this worker's clock, and whether
+    its address is on the admin allowlist)."""
     age = float(ctx.clock.now()) - float(admin.mfa_at) if admin.mfa_level in FULL_MFA_LEVELS else None
-    return WriteRules(age, confirmed=confirmed, arming_allowed=arming_allowed)
+    try:
+        listed = len(ctx.rules.snapshot.access.allow_admin) > 0
+    except (AttributeError, TypeError):
+        listed = True  # no rules snapshot (a tool without one): the address check below decides
+    return WriteRules(
+        age,
+        confirmed=confirmed,
+        arming_allowed=arming_allowed,
+        covered=in_admin_allowlist(ctx, str(admin.ip or "")),
+        listed=listed,
+        confirm_lockout=confirm_lockout,
+    )
 
 
 def _errors_or_none(preview: Mapping[str, Any]) -> None:
@@ -519,6 +568,8 @@ class UpdateBody(ApiBody):
     changes: dict[str, Any] = Field(min_length=1, max_length=MAX_CHANGES)
     reason: str = Field(default="", max_length=MAX_REASON_LENGTH)
     confirm_high_risk: bool = False
+    confirm_lockout: bool = False
+    """Switch the admin allowlist on although the acting admin's address is on no entry (`WriteRules`)."""
 
 
 class ValueBody(ApiBody):
@@ -527,6 +578,7 @@ class ValueBody(ApiBody):
     value: Any
     reason: str = Field(default="", max_length=MAX_REASON_LENGTH)
     confirm_high_risk: bool = False
+    confirm_lockout: bool = False
 
 
 class ReasonBody(ApiBody):
@@ -540,6 +592,7 @@ class RevertBody(ApiBody):
 
     reason: str = Field(default="", max_length=MAX_REASON_LENGTH)
     confirm_high_risk: bool = False
+    confirm_lockout: bool = False
 
 
 class ImportPreviewBody(ApiBody):
@@ -554,6 +607,7 @@ class ImportBody(ImportPreviewBody):
 
     reason: str = Field(default="", max_length=MAX_REASON_LENGTH)
     confirm_high_risk: bool = False
+    confirm_lockout: bool = False
 
 
 # ================================================================================================ catalog
@@ -677,7 +731,7 @@ async def update_settings(
             reason,
             "admin",
             request_id=request_id_of(request),
-            guard=write_rules(ctx, admin, confirmed=body.confirm_high_risk),
+            guard=write_rules(ctx, admin, confirmed=body.confirm_high_risk, confirm_lockout=body.confirm_lockout),
         )
     )
     return result_answer(result)
@@ -832,7 +886,11 @@ async def revert(
     reason = check_risk(risky, reason=body.reason, confirmed=body.confirm_high_risk)
     result = await run_mutation(
         settings_service(ctx).revert(
-            history_id, actor_for(admin), reason, request_id=request_id_of(request), guard=write_rules(ctx, admin)
+            history_id,
+            actor_for(admin),
+            reason,
+            request_id=request_id_of(request),
+            guard=write_rules(ctx, admin, confirm_lockout=body.confirm_lockout),
         )
     )
     return {**result_answer(result), "reverted": history_id}
@@ -907,10 +965,25 @@ def _import_answer(preview: Any) -> dict[str, Any]:
 async def import_preview(
     request: Request, body: ImportPreviewBody, _admin: AdminSession, _csrf: CsrfChecked
 ) -> dict[str, Any]:
-    """Validate an exported document and show the diff an import would apply (nothing is written)."""
+    """Validate an exported document and show the diff an import would apply (nothing is written). A change the
+    import would refuse (switching an `ARM_ONLY_SETTINGS` key off arms the spam detectors, which only its own route
+    may do) is marked `refused` with the reason, and `ok` is false, so the page never enables an import that must
+    fail (review finding functional-9)."""
     ctx = get_ctx(request)
     preview = await run_mutation(settings_service(ctx).preview_import(body.document, replace=body.replace))
-    return _import_answer(preview)
+    answer = _import_answer(preview)
+    try:
+        refuse_arming(
+            {key: value for key, value in preview.plan.items() if value is not RESET}, ctx.settings.snapshot()
+        )
+    except common.ApiError as refused:
+        answer["ok"] = False
+        for item in answer["items"]:
+            if item["key"] in refused.error_fields:
+                item["status"] = "refused"
+                item["message"] = refused.error_fields[item["key"]]
+        answer["refused"] = dict(refused.error_fields)
+    return answer
 
 
 @router.post("/import")
@@ -934,7 +1007,7 @@ async def import_overrides(
             reason,
             replace=body.replace,
             request_id=request_id_of(request),
-            guard=write_rules(ctx, admin),
+            guard=write_rules(ctx, admin, confirm_lockout=body.confirm_lockout),
         )
     )
     return {**result_answer(result), "catalog_version_matches": preview.catalog_version_matches}
@@ -995,7 +1068,7 @@ async def set_setting(
             reason,
             "admin",
             request_id=request_id_of(request),
-            guard=write_rules(ctx, admin, confirmed=body.confirm_high_risk),
+            guard=write_rules(ctx, admin, confirmed=body.confirm_high_risk, confirm_lockout=body.confirm_lockout),
         )
     )
     return result_answer(result)

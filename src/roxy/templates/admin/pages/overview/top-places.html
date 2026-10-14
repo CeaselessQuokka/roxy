@@ -3,7 +3,9 @@
   sending the most requests in the range (plan 14.1 "top places").
 
   At most ten rows from `build_breakdown`. A place id is what the caller claims in a header, so it is caller text
-  (shown with `caller_text`, never linked). Rates are requests per minute over the last 1, 5 and 60 minutes.
+  (shown with `caller_text`, never linked). `rate1`, `rate5` and `rate60` are counts, not per minute rates: the
+  requests in the trailing 1, 5 and 60 minutes (`queries.trailing_rate`, the Clients API's Rate1/5/60 columns), so
+  the column says so in v1's words ("Requests in the last 1, 5, 60 min"; finding truth-4).
   Context: `frame`, `rows`, `all_href`.
 -#}
 {% from "components/page_card.html" import page_card %}
@@ -16,14 +18,14 @@
 <div class="table-scroll ov-top-wrap" role="region" aria-labelledby="{{ frame.id }}-caption" tabindex="0">
 <table class="ov-top">
   <caption id="{{ frame.id }}-caption" class="sr-only">The places sending the most requests in the range</caption>
-  <thead><tr><th scope="col">Place</th><th scope="col" class="num">Requests</th><th scope="col" class="num">Refused</th><th scope="col" class="num">Per minute (1, 5, 60 min)</th><th scope="col">Top endpoint</th></tr></thead>
+  <thead><tr><th scope="col">Place</th><th scope="col" class="num">Requests</th><th scope="col" class="num">Refused</th><th scope="col" class="num">Requests in the last 1, 5, 60 min</th><th scope="col">Top endpoint</th></tr></thead>
   <tbody>
     {% for row in rows %}
     <tr>
       <th scope="row" class="ov-top__key">{{ caller_text(row.key, 80) }}</th>
       <td class="num" data-label="Requests">{{ num(row.requests) }}</td>
       <td class="num" data-label="Refused"><span>{{ num(row.refused) }}{% if row.refused_pct is not none %} <span class="muted">({{ metric_value(row.refused_pct, "percent") }})</span>{% endif %}</span></td>
-      <td class="num" data-label="Per minute">{{ metric_value(row.rate1) }} / {{ metric_value(row.rate5) }} / {{ metric_value(row.rate60) }}</td>
+      <td class="num" data-label="Last 1, 5, 60 min">{{ metric_value(row.rate1) }} / {{ metric_value(row.rate5) }} / {{ metric_value(row.rate60) }}</td>
       <td data-label="Top endpoint"><span class="ov-top__endpoint">{{ caller_text(row.top_endpoint, 80) }}</span></td>
     </tr>
     {% endfor %}

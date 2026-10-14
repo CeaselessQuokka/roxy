@@ -17,8 +17,9 @@
  * How it works
  *   ES module evaluation order guarantees this runs after htmx's module body (which only schedules its start) and
  *   before DOMContentLoaded, when htmx reads its config. The CSRF token is read at request time from the meta tag,
- *   so a rotated token is honored at once: the server sends it as `HX-Trigger: {"roxy:csrf": {"token": "..."}}`
- *   (htmx raises that event for any status) and net.js `setCsrfToken` stores it. A 422 answer is swapped (the
+ *   so a rotated token is honored at once: a re-authentication stores it (net.js `sessionRotated`, which also
+ *   tells the other tabs), and an answer may carry it as `HX-Trigger: {"roxy:csrf": {"token": "..."}}` (htmx
+ *   raises that event for any status; net.js `setCsrfToken` stores it). A 422 answer is swapped (the
  *   server re-renders a form with its validation errors); other 4xx and 5xx answers are not swapped. A 403 that
  *   asks for a fresh second factor raises `roxy:reauth` (net.js) instead of the generic "refused" toast. Requests
  *   made from inside a dialog (a dialog form, the drawer) report their errors inside that dialog (dialog.js).

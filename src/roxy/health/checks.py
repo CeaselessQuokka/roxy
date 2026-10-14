@@ -69,6 +69,7 @@ from roxy.health.model import (
     band_high_good,
     band_low_good,
 )
+from roxy.storage import read_sizes
 
 # ------------------------------------------------------------------------------------------------ thresholds
 # Plan 13.2 defaults. They are plan constants, not settings: the catalog (config/catalog.py) has no health
@@ -924,10 +925,13 @@ async def check_db_size(env: CheckEnv) -> CheckResult:
         return env.not_applicable("no budget", "storage_total_budget_gb is 0.")
     disk = await env.facts.disk_usage()
     total = sum(size + wal for size, wal in disk.files.values())
-    budget = budget_gb * 1_000_000_000  # decimal GB, as the catalog's unit says
+    # The setting's own unit (its notes: 1 GB is 1,073,741,824 bytes), the one divisor of every budget reading
+    # (`read_sizes.BUDGET_UNIT_BYTES`, finding truth-5).
+    unit = read_sizes.BUDGET_UNIT_BYTES
+    budget = budget_gb * unit
     pct = total * 100.0 / budget
     status = band_low_good(pct, DB_SIZE_PASS_PCT, DB_SIZE_WARN_PCT)
-    value = f"{_fmt(pct)}% of the {_fmt(budget_gb, 1)} GB budget ({_fmt(total / 1e9, 2)} GB)"
+    value = f"{_fmt(pct)}% of the {_fmt(budget_gb, 1)} GB budget ({_fmt(total / unit, 2)} GB)"
     finding = (
         "" if status is Status.PASS else "The databases are close to their budget; retention or caps can shrink them."
     )

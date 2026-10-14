@@ -93,12 +93,37 @@ function busy(card) {
   );
 }
 
+/** A selector for the twin of the focused control in the swapped-in card: its id, else its action name. */
+function focusTwin(card) {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || active === card || !card.contains(active)) return null;
+  if (active.id) return `#${CSS.escape(active.id)}`;
+  if (active.dataset.action) return `[data-action="${CSS.escape(active.dataset.action)}"]`;
+  return null;
+}
+
 /** Re-render one card from its fragment URL (skipped while the admin is working in it, unless `force`). */
 export function refreshCard(card, { force = false } = {}) {
   if (!(card instanceof Element) || !card.dataset.cardSrc) return null;
   if (!force && busy(card)) return null;
   lastRefresh.set(cardKey(card), performance.now());
-  return htmx.ajax("GET", card.dataset.cardSrc, { target: card, swap: "outerHTML", source: card });
+  const twin = focusTwin(card);
+  const hadFocus = card.contains(document.activeElement);
+  const id = card.id;
+  const swap = htmx.ajax("GET", card.dataset.cardSrc, { target: card, swap: "outerHTML", source: card });
+  if (hadFocus && id) {
+    // A forced refresh (after an action in the card) keeps keyboard focus in the card: on the swapped-in twin of
+    // the focused control, else on the card itself (htmx keeps it only for an element with an id; a11y-8).
+    Promise.resolve(swap).then(() => window.setTimeout(() => {
+      const fresh = document.getElementById(id);
+      const active = document.activeElement;
+      if (!fresh || fresh === card || (active && active !== document.body && fresh.contains(active))) return;
+      const target = (twin && qs(twin, fresh)) || fresh;
+      if (target === fresh && !fresh.hasAttribute("tabindex")) fresh.setAttribute("tabindex", "-1");
+      target.focus();
+    }, 30)).catch(() => {});
+  }
+  return swap;
 }
 
 function byIds(ids) {

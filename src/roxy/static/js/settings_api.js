@@ -41,6 +41,7 @@ const SESSION_URL = "/admin/api/v1/auth/session";
 const MAX_ERROR_TEXT = 4096;
 const REFRESH_GAP_MS = 1000;
 const reviewed = new WeakMap();  // form -> the value text its shown review is about
+const reviewedNow = new WeakMap();  // form -> the value in force its review was made against ("Now")
 let lastRefresh = 0;
 
 function currentText(form) {
@@ -50,8 +51,23 @@ function currentText(form) {
   return input.value;
 }
 
-function serverError(form, message, code = "") {
-  form.dispatchEvent(new CustomEvent("setting-error", { detail: { message, code } }));
+function serverError(form, message, code = "", field = "value") {
+  form.dispatchEvent(new CustomEvent("setting-error", { detail: { message, code, field } }));
+}
+
+const CONFIRM_TEXT = "This is a high-risk value: tick \"I understand the risk\" below, then save again.";
+
+/** The control field a refused save points at, and the words for it (the API's own names never reach the page:
+ *  `confirm_high_risk` is the box "I understand the risk"; review finding a11y-9). A confirmation the control's
+ *  own box gives (a high-risk value) points at the box; any other confirmation (the admin allowlist lockout) keeps
+ *  the server's words on the value. */
+function refusal(form, error, key) {
+  const box = qs('input[name="confirm_high_risk"]', form);
+  if (error.code === "confirmation_required" && box && box.getClientRects().length && !box.checked) {
+    return { field: "confirm", message: CONFIRM_TEXT };
+  }
+  if (error.fields.reason && !error.fields[key]) return { field: "reason", message: error.fields.reason };
+  return { field: "value", message: error.fields[key] || error.message };
 }
 
 function label(form, text) {
@@ -84,6 +100,7 @@ function display(value) {
 
 function resetReview(form) {
   reviewed.delete(form);
+  reviewedNow.delete(form);
   const box = qs("[data-setting-review]", form);
   if (box) {
     box.replaceChildren();
@@ -137,6 +154,7 @@ async function review(form, key, text) {
   }
   showReview(form, item);
   reviewed.set(form, text);
+  reviewedNow.set(form, display(item.current));
   label(form, "Save");
 }
 
@@ -185,7 +203,8 @@ async function save(form, key, text, { retried = false } = {}) {
     }
   }
   const error = await readError(response);
-  serverError(form, error.fields[key] || error.fields.reason || error.message, error.code);
+  const why = refusal(form, error, key);
+  serverError(form, why.message, error.code, why.field);
 }
 
 /** Replace a control with the server's rendering of it (`saved` adds the "Saved" mark). */
@@ -218,14 +237,44 @@ async function onSubmit(form) {
   }
 }
 
-/** After `settings_changed`: re-render every API-mode control without an unsaved edit (others are marked stale). */
+/**
+ * A control whose review was made against a value that changed meanwhile (another admin, another tab): the review
+ * is dropped, so the next press reviews again against the value in force instead of saving over it unseen, and the
+ * control says why (review finding functional-3: "Now 180" stayed on screen after another admin saved 230).
+ */
+async function checkReview(form) {
+  const key = form.dataset.settingKey;
+  if (!key || !reviewedNow.has(form) || !form.dataset.settingApi) return;
+  let answer;
+  try {
+    answer = await getJSON(form.dataset.settingApi);
+  } catch {
+    return;
+  }
+  const now = answer && answer.setting ? answer.setting.value : undefined;
+  if (now === undefined || display(now) === reviewedNow.get(form)) return;
+  resetReview(form);
+  const box = qs("[data-setting-review]", form);
+  if (box) {
+    box.replaceChildren(el("p", {
+      class: "setting__review-what",
+      role: "status",
+      text: `This setting was changed elsewhere meanwhile (it is now ${display(now)}). Review again before saving.`,
+    }));
+    box.hidden = false;
+  }
+}
+
+/** After `settings_changed`: re-render every API-mode control without an unsaved edit; a control holding an edit
+ *  keeps it, and its review is dropped when the value it was made against changed (`checkReview`). */
 function refreshAll() {
   const now = performance.now();
   if (now - lastRefresh < REFRESH_GAP_MS) return;
   lastRefresh = now;
   for (const form of qsa("form[data-setting-api]")) {
-    if (form.hasAttribute("data-dirty") || form.contains(document.activeElement)) {
+    if (form.hasAttribute("data-dirty") || form.contains(document.activeElement) || reviewed.has(form)) {
       form.dataset.stale = "1";
+      checkReview(form);
       continue;
     }
     rerender(form, false);

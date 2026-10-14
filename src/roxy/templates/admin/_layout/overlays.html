@@ -3,9 +3,10 @@
   announcements are written into.
 
   Session expired: static/js/session.js opens it when any request (htmx, a fetch, the SSE stream) answers 401. It is
-  an alertdialog with "Log in again" focused; after a short countdown it goes to the login page (v1 did the same),
-  unless the admin chooses "Stay on this page" (for example to copy unsaved text), which stops the countdown
-  (WCAG 2.2.1: a time limit the user can turn off).
+  an alertdialog with "Log in again" focused; after a 30 second countdown it goes to the login page (v1 did the same
+  after 3 seconds), unless the admin chooses "Stay on this page" (for example to copy unsaved text), which stops the
+  countdown. WCAG 2.2.1 asks for at least 20 seconds to act (review finding a11y-5); the countdown line is not a
+  live region (the alert is read once), and the remaining time is announced once, half way.
   Drawer: a modal side panel for row details and dry runs, filled by htmx from `data-drawer-src` (or built from a
   table row by static/js/tables.js); on a phone it rises from the bottom.
   Toasts: static/js/toast.js puts toasts in `#toasts` and announces them in the polite or assertive live region.

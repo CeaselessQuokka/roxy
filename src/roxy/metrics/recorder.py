@@ -221,6 +221,9 @@ BLOCKED_UA_EVENT = "blocked_user_agent"
 
 # --- the contract (DESIGN.md section 8) -------------------------------------------------------------------------
 
+MATCH_DETAIL_KEYS: tuple[str, ...] = ("header", "field", "text")
+"""What a refusal event keeps of `OutcomeEvent.match_detail` as `detail.matched` (finding v1parity-5)."""
+
 
 @dataclass(slots=True)
 class OutcomeEvent:
@@ -271,6 +274,8 @@ class OutcomeEvent:
     capture_id: str = ""
     # --- added by the wave 3b producers (optional) ---
     matches: dict[str, str] | None = None  # refusals: the rule rows the abuse verdict matched ({table: row id})
+    # --- added for finding v1parity-5 (optional) ---
+    match_detail: dict[str, str] | None = None  # request filter refusals: what it hit ({header, field, text})
 
 
 @dataclass(slots=True)
@@ -1161,6 +1166,12 @@ class MetricsRecorder:
             # The rule rows the abuse verdict matched (`Refuse.matches`): the attempts tabs can name the rule that
             # refused without matching the patterns again. Table names are fixed; row ids are short keys.
             detail["rules"] = {str(t)[:64]: str(k)[:64] for t, k in list(ev.matches.items())[:8]}
+        if ev.match_detail:
+            # What a request filter hit (`Refuse.match_detail`, finding v1parity-5): the header (caller text, bounded),
+            # whether its name or its value matched, and the name or the filter's own needle (never a header value).
+            matched = {key: str(ev.match_detail[key])[:120] for key in MATCH_DETAIL_KEYS if ev.match_detail.get(key)}
+            if matched:
+                detail["matched"] = matched
         summary: dict[str, Any] = (
             {"status": int(ev.status), "message_source": ev.message_source[:16]}
             if ev.message_source

@@ -45,7 +45,8 @@ from roxy.admin.api.common import (
     TableSpec,
     table_params,
 )
-from roxy.config import catalog, read_audit
+from roxy.admin.api.settings import ARM_ONLY_SETTINGS
+from roxy.config import catalog, read_audit, read_settings
 from roxy.config.audit import is_secret_target
 from roxy.deps import get_ctx
 
@@ -168,8 +169,16 @@ def manage_link(target: str | None) -> dict[str, str] | None:
     return None if page is None else {"href": page[0], "label": page[1]}
 
 
-def revert_info(entry: Mapping[str, Any], history_id: int | None) -> dict[str, Any]:
-    """The revert block of an entry: whether a one-click revert exists, and how to call it."""
+ARMING_REVERT: Final = (
+    "Reverting this change would arm the spam detectors (real bans), which only the Protection page does: it first "
+    "shows who would have been banned."
+)
+
+
+def revert_info(entry: Mapping[str, Any], history_id: int | None, *, arming: bool = False) -> dict[str, Any]:
+    """The revert block of an entry: whether a one-click revert exists, and how to call it. `arming`: the revert
+    would switch an arm-only setting off (`settings.ARM_ONLY_SETTINGS`), which the settings API always refuses, so
+    no revert is offered, as in the Settings history drawer (review finding functional-9)."""
     action = str(entry.get("action") or "")
     target = str(entry.get("target") or "")
     if action in read_audit.SETTING_ACTIONS and target.startswith("setting:"):
@@ -181,6 +190,8 @@ def revert_info(entry: Mapping[str, Any], history_id: int | None) -> dict[str, A
             return {"available": False, "reason": "The settings history entry of this change was pruned."}
         if spec.sensitive:
             return {"available": False, "reason": "Sensitive values are not kept in history; enter the value again."}
+        if arming:
+            return {"available": False, "reason": ARMING_REVERT, "arm_url": ARM_ONLY_SETTINGS.get(key)}
         return {
             "available": True,
             "method": "POST",
@@ -318,27 +329,47 @@ async def facets(request: Request, _admin: AdminSession) -> dict[str, Any]:
     return await audit_facets(get_ctx(request))
 
 
+def _reverting_arms(ctx: Any, history: Mapping[str, Any] | None) -> bool:
+    """Whether reverting this settings history row would switch an arm-only setting off (its value before the change,
+    or the catalog default when it had none, is off while the setting is on now): the Settings history drawer's rule
+    (`pages/settings.py change_drawer`)."""
+    if not history or str(history.get("key")) not in ARM_ONLY_SETTINGS:
+        return False
+    key = str(history["key"])
+    spec = catalog.CATALOG.get(key)
+    old = history.get("old")
+    before = (spec.default if spec is not None else None) if old is None else old
+    try:
+        before = catalog.validate_value(key, before) if before is not None else before
+    except (catalog.SettingValidationError, KeyError):
+        return False
+    return not bool(before) and bool(ctx.settings.get(key))
+
+
 async def entry_view(ctx: Any, audit_id: int) -> dict[str, Any] | None:
     """One audit entry with its diff, its revert block and the link to what it changed (`GET /audit/{id}`), or
     None when no entry has that id. The API route and the Audit page's entry drawer both call this."""
 
-    def read(conn: Any) -> tuple[dict[str, Any] | None, int | None]:
+    def read(conn: Any) -> tuple[dict[str, Any] | None, int | None, dict[str, Any] | None]:
         found = read_audit.audit_entry(conn, audit_id)
         if found is None:
-            return None, None
+            return None, None, None
         target = str(found.get("target") or "")
         history_id = None
+        history = None
         if found["action"] in read_audit.SETTING_ACTIONS and target.startswith("setting:"):
             history_id = read_audit.settings_history_id(conn, target.split(":", 1)[1], found["at"], found["actor"])
-        return found, history_id
+            if history_id is not None:
+                history = read_settings.history_entry(conn, history_id)
+        return found, history_id, history
 
-    found, history_id = await ctx.dbs.control.read(read)
+    found, history_id, history = await ctx.dbs.control.read(read)
     if found is None:
         return None
     return {
         "entry": found,
         "diff": diff(found.get("before"), found.get("after")),
-        "revert": revert_info(found, history_id),
+        "revert": revert_info(found, history_id, arming=_reverting_arms(ctx, history)),
         "manage": manage_link(found.get("target")),
         # A secret-bearing target holds fingerprints only (plan 6.2); the page says so next to the diff.
         "secret_target": is_secret_target(found.get("target")),

@@ -231,6 +231,24 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* At 320 px (400 percent zoom of a 1280 px screen) the share column gives up width first, so the table fits
+   (WCAG 1.4.10; review finding a11y-15). */
+@media (max-width: 400px) {
+  .ov-outcomes th,
+  .ov-outcomes td {
+    padding: var(--sp-2) var(--sp-1);
+  }
+
+  .ov-outcomes th:first-child,
+  .ov-outcomes td:first-child {
+    overflow-wrap: anywhere;
+  }
+
+  .ov-outcomes .ov-meter {
+    min-width: 12px;
+  }
+}
+
 .ov-meter {
   flex: 1 1 auto;
   min-width: 48px;

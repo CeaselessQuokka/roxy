@@ -67,6 +67,11 @@ VENV_BIN = REPO / ".venv" / "bin"
 NETS = ("192.0.2", "198.51.100", "203.0.113")  # documentation ranges (RFC 5737)
 SINGLE_FLIGHT_UNIVERSE = "4242"
 COOLDOWN_SETTLE_S = 1.5
+COOLDOWN_IN_FLIGHT_S = 0.5
+"""Calls already on the wire when Roblox's 429 arrived may still land (the same allowance as
+tests/multiprocess/test_upstream_mp.py `IN_FLIGHT_TOLERANCE_MS`, and as this scenario's caller answers): a cold start
+can hold the first requests until both workers dispatch them together, so calls Roxy sent before it could know of
+the 429 reach the mock a few milliseconds after it (3 to 12 ms measured under the gate's load)."""
 QUIET_BACKGROUND: dict[str, Any] = {"health_auto_interval_h": 0}
 """Settings for scenarios that count every upstream call of one endpoint: the leader's scheduled health run (it
 probes a public URL on every Roblox host, plan 13.4; its first poll comes 5 minutes after the job runner starts)
@@ -689,14 +694,25 @@ def scenario_cooldown_429(work: Path, credentials: Path, workers: int) -> dict[s
         calls = [call for call in mock.snapshot() if call.host == "badges.roblox.com"]
         out["t429_seen"] = t429 is not None
         if t429 is not None:
-            out["calls_during_cooldown"] = sum(1 for c in calls if t429 < c.at < t429 + 30 - COOLDOWN_SETTLE_S)
+            cooling = t429 + COOLDOWN_IN_FLIGHT_S, t429 + 30 - COOLDOWN_SETTLE_S
+            out["calls_during_cooldown"] = sum(1 for c in calls if cooling[0] <= c.at < cooling[1])
+            out["calls_in_flight_at_429"] = sum(1 for c in calls if t429 < c.at < cooling[0])
+            # Diagnostics: when each call after the 429 and inside the cooldown reached the mock, and the first
+            # caller answers (sent and back), as seconds after the 429.
+            out["cooldown_call_offsets"] = [round(c.at - t429, 3) for c in calls if t429 < c.at < cooling[1]]
+            first = sorted(out.get("_responses", []), key=lambda r: r["sent_at"])[:6]
+            out["first_answers"] = [
+                [round(r["sent_at"] - t429, 3), round(r["received_at"] - t429, 3), r["refusal"]] for r in first
+            ]
             window = [c for c in calls if t429 + 30 + COOLDOWN_SETTLE_S <= c.at <= t429 + 30 + COOLDOWN_SETTLE_S + 60]
             out["calls_in_60s_after"] = len(window)
-            during = [r for r in out.pop("_responses") if t429 + 0.5 <= r["sent_at"] <= t429 + 30 - COOLDOWN_SETTLE_S]
+            during = [r for r in out.pop("_responses") if cooling[0] <= r["sent_at"] <= cooling[1]]
             out["responses_during_cooldown"] = len(during)
             out["during_statuses"] = dict(Counter(str(r["status"]) for r in during))
             out["during_without_retry_after"] = sum(1 for r in during if not r["retry_after"])
         out["cookie_calls"] = sum(1 for call in mock.snapshot() if "cookie" in call.headers)
+        text = master.log.read_text(errors="replace")
+        out["cooldown_kept_in_memory"] = sum(1 for line in text.splitlines() if "upstream_effects_not_shared" in line)
         out["stop_code"], out["stop_s"] = master.stop()
         out["recorded"] = recorded_requests(env)
         out["log_tail"] = master.log_tail()
@@ -723,6 +739,7 @@ async def paced_traffic(master: Master, out: dict[str, Any]) -> int:
             results.append(
                 {
                     "sent_at": sent_at,
+                    "received_at": time.monotonic(),
                     "status": response.status_code,
                     "retry_after": response.headers.get("retry-after"),
                     "refusal": response.headers.get("roxy-refusal", ""),

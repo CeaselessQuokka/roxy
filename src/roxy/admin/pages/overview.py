@@ -52,7 +52,7 @@ from urllib.parse import quote, urlencode
 
 from roxy.admin.api import overview as overview_api
 from roxy.admin.pages import fmt
-from roxy.admin.pages.kit import Page, PageView, table_query, table_view
+from roxy.admin.pages.kit import LIVE_REFRESH_S, Page, PageView, table_query, table_view
 from roxy.admin.pages.resets import InlineReset, add_reset_route, reset_href
 from roxy.admin.pages.shell import COMPARE_LABELS
 from roxy.metrics.catalog import METRICS
@@ -418,7 +418,7 @@ add_reset_route(page, lambda view: VISITS_RESET)
 # ============================================================================================ chart
 
 
-@page.card("traffic")
+@page.card("traffic", live_refresh_s=LIVE_REFRESH_S)
 async def traffic_card(view: PageView) -> dict[str, Any]:
     """Requests in against calls out: the chart reads `GET /overview/chart` (the API's series, notices included)."""
     return {
@@ -440,7 +440,7 @@ async def _breakdown(view: PageView) -> dict[str, Any]:
     return found
 
 
-@page.card("outcomes")
+@page.card("outcomes", live_refresh_s=LIVE_REFRESH_S)
 async def outcomes_card(view: PageView) -> dict[str, Any]:
     """How requests ended in the range, with each outcome's share."""
     data = await _breakdown(view)

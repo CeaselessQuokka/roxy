@@ -337,3 +337,38 @@ def test_an_import_shows_its_preview_then_imports_with_a_reason(open_admin: Any,
         admin.wait(toast_says("Imported 1 change"))
         assert int(value_of(dashboard, "cache_ttl_seconds")) == target
         admin.assert_clean()
+
+
+def test_an_import_redraws_the_editor_on_the_same_filters_and_page(open_admin: Any, dashboard: Any) -> None:
+    """Finding functional-10 (the import half; the batch save half is tests/review_p11/test_functional_e2e.py): the
+    editor card re-rendered after an import keeps its group filter, its page and the address."""
+    listing = dashboard.api("GET", "settings", params={"group": "cache", "include_text": "false"}).json()
+    expected = [entry["key"] for group in listing["groups"] for entry in group["settings"]]
+    assert len(expected) > DEFAULT_EDITOR_SIZE, "the cache group has a second page of settings"
+    second_page = expected[DEFAULT_EDITOR_SIZE : DEFAULT_EDITOR_SIZE * 2]
+    with restored(dashboard, "cache_ttl_seconds") as before:
+        exported = dashboard.api("GET", "settings/export").json()
+        overrides = {**exported["overrides"], "cache_ttl_seconds": int(before["cache_ttl_seconds"]) + 4}
+        admin = open_page(open_admin, f"{PAGE}?group=cache&page=2")
+        page = admin.page
+        assert shown_keys(page) == second_page
+        # Every re-render of the card (an import, a batch save, a revert from the history drawer) asks this address.
+        src = page.evaluate("new URL(document.getElementById('editor').dataset.cardSrc, location.origin).search")
+        assert "group=cache" in src, src
+        assert "page=2" in src, src
+        page.evaluate("document.getElementById('editor').__drawnBefore = true")
+        card = page.locator("section#import-export")
+        card.locator("details summary").click()
+        page.fill("#settings-import-text", json.dumps({**exported, "overrides": overrides}))
+        card.locator('[data-action="settings-import-preview"]').click()
+        admin.wait("!document.querySelector('[data-import-result]').hidden")
+        page.fill("#settings-import-reason", "Browser test of an import on page 2")
+        card.locator('[data-action="settings-import"]').click()
+        admin.wait(toast_says("Imported 1 change"))
+        admin.wait("document.getElementById('editor').__drawnBefore !== true")  # the card was drawn again
+        where = f"after the import the editor shows {shown_keys(page)} (address {page.url})"
+        assert shown_keys(page) == second_page, where
+        assert page.locator('#editor-filter select[name="group"]').input_value() == "cache", where
+        assert page.evaluate("new URL(location.href).searchParams.get('group')") == "cache", where
+        assert page.evaluate("new URL(location.href).searchParams.get('page')") == "2", where
+        admin.assert_clean()

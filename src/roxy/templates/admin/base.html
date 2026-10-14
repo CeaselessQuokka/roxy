@@ -45,6 +45,8 @@
 {%- set u = urls if urls is defined and urls else {} -%}
 {%- set assets = page_assets if page_assets is defined and page_assets else {} -%}
 {%- set st_sig = status.signature if status is defined and status and status.signature else "" -%}
+{%- set st_digest = status.digest if status is defined and status and status.digest else "" -%}
+{%- set st_next = status.next_change if status is defined and status and status.next_change else "" -%}
 {%- set VENDOR = {
   "htmx": ("vendor/htmx-2.0.11/htmx.esm.js", "sha384-MGpLJI+YdNF+gTEwPJkKrb2WL70Ce3qnYw+YP2Hy3U+AX6oRl45HdZa9/W/7ROZr"),
   "alpine": ("vendor/alpine-csp-3.17.4/module.esm.min.js", "sha384-1iUT5Gr1H+nzOhvZHzMtH1F8+Hn/P6+jPCmpGGd++NA0IS5o7zN7GzlQsckdJqMa"),
@@ -79,7 +81,7 @@
 <body class="app"
       data-heartbeat-s="{{ sess.heartbeat_s or 30 }}" data-activity-window-s="{{ sess.activity_window_s or 60 }}"
       data-heartbeat-url="{{ sess.heartbeat_url or '/admin/api/v1/auth/heartbeat' }}" data-login-url="{{ sess.login_url or '/admin' }}"
-      {% if u.stream %}data-stream-url="{{ u.stream }}" {% endif %}{% if u.prefs %}data-prefs-url="{{ u.prefs }}" {% endif %}{% if u.status %}data-status-url="{{ u.status }}" data-status-sig="{{ st_sig }}" {% endif %}data-page="{{ page.id if page is defined and page else '' }}">
+      {% if u.stream %}data-stream-url="{{ u.stream }}" {% endif %}{% if u.prefs %}data-prefs-url="{{ u.prefs }}" {% endif %}{% if u.status %}data-status-url="{{ u.status }}" data-status-sig="{{ st_sig }}" data-status-digest="{{ st_digest }}" data-status-next="{{ st_next }}" {% endif %}{% if u.status_parts %}data-status-parts-url="{{ u.status_parts }}" {% endif %}{% if u.session %}data-session-url="{{ u.session }}" {% endif %}{% if tz is defined and tz %}data-tz="{{ tz }}" {% endif %}data-page="{{ page.id if page is defined and page else '' }}">
   <a class="skip-link" href="#main">Skip to the main content</a>
   {% include "admin/_layout/icons.html" %}
   <div class="shell" data-shell>
@@ -106,6 +108,7 @@
           </div>
         </details>
         {% if time is defined and time and time.notice %}<p class="page-notice" role="note"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-info"></use></svg><span>{{ time.notice }}</span></p>{% endif %}
+        {% if shell_notice is defined and shell_notice %}<p class="page-notice" role="note"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-info"></use></svg><span>{{ shell_notice }}</span></p>{% endif %}
         {% endblock %}
         {% block content %}{% endblock %}
       </main>

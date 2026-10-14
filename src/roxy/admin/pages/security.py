@@ -157,6 +157,18 @@ def api_path(*parts: str) -> str:
     return API + "/" + "/".join(quote(part, safe="") for part in parts)
 
 
+def header_path(*parts: str, name: str, suffix: str = "") -> str:
+    """`api_path(*parts)/<name><suffix>` for a header a caller named: one percent-encoded segment, or, for a name a
+    path cannot carry (`.` or `..`, which a browser resolves away), the `?name=` form the routes read first
+    (`common.name_in_path`; finding esc-2: "Clear the values" of header `.` cleared the header `values`)."""
+    return common.name_in_path(api_path(*parts), name, suffix)
+
+
+def with_query(url: str, **params: str) -> str:
+    """`url` with more query parameters (`&` when it already has a query)."""
+    return url + ("&" if "?" in url else "?") + urlencode(params)
+
+
 def ms_cell(view: PageView, at_ms: Any) -> dict[str, Any] | None:
     return view.time_cell(at_ms / 1000) if isinstance(at_ms, int | float) and not isinstance(at_ms, bool) else None
 
@@ -591,7 +603,7 @@ async def _header_drawer(view: PageView, *, blocked: bool) -> dict[str, Any]:
             "mode": "blocked-header",
             "name": name,
             "requests": int(requests),
-            "remove_url": api_path("security", "fingerprints", "blocked", "headers", name),
+            "remove_url": header_path("security", "fingerprints", "blocked", "headers", name=name),
         }
 
     def read(conn: Any) -> tuple[dict[str, int], dict[str, Any] | None]:
@@ -625,11 +637,13 @@ async def _header_drawer(view: PageView, *, blocked: bool) -> dict[str, Any]:
         "values_total": int(values["total"]),
         "first": fmt.time_cell(row.get("first_seen"), view.tz, view.now) if row else None,
         "last": fmt.time_cell(row.get("last_seen"), view.tz, view.now) if row else None,
-        "values_export": api_path("security", "fingerprints", "headers", name, "values") + "?format=csv",
-        "clear_url": api_path("security", "fingerprints", "headers", name, "values"),
-        "remove_url": api_path("security", "fingerprints", "headers", name),
+        "values_export": with_query(
+            header_path("security", "fingerprints", "headers", name=name, suffix="/values"), format="csv"
+        ),
+        "clear_url": header_path("security", "fingerprints", "headers", name=name, suffix="/values"),
+        "remove_url": header_path("security", "fingerprints", "headers", name=name),
         "ignore_url": f"{API}/security/fingerprints/ignored",
-        "record_url": api_path("security", "fingerprints", "ignored", name),
+        "record_url": header_path("security", "fingerprints", "ignored", name=name),
         "shown": HEADER_VALUES_SHOWN,
     }
 

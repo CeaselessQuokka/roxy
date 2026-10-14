@@ -2,8 +2,9 @@
 
 What this is
     `header_pairs` (a request's headers in arrival order), `rule_hit` and `match_header_rule` (v1 `rule_hit` and
-    `match_header_rule`: first rule that hits wins), `header_rule_message`, and the tester helpers
-    `parse_header_text` and `explain_header_rules` behind Protection > Request filters (plan 4.3 row 45, row 112).
+    `match_header_rule`: first rule that hits wins), `header_rule_message`, `match_detail` (what a refusal records
+    about the hit), and the tester helpers `parse_header_text` and `explain_header_rules` behind Protection > Request
+    filters (plan 4.3 row 45, row 112).
 
 Why it exists
     Some abusive tools give themselves away in a header (an executor fingerprint header, an odd `Accept` value).
@@ -17,6 +18,11 @@ How it works
     - A regex that times out counts as a hit (fail closed).
     - Names are compared case-insensitively; the tarpit reason and tester show them Title-Cased like v1 did.
     - v1 decision kept (B31): rules see every header nginx forwards, including the ones nginx adds.
+    - A refusal records what the filter hit (`match_detail`, v1 `log_header_blocked`: Last Header, Triggered By and
+      Matched Text), so Protection > Request filters > Attempts shows a broad filter's false positives (parity row 75,
+      finding v1parity-5). The matched text is never a caller's header value (refused requests keep no header
+      values, wave 3b): for a name hit it is the name, for a value hit the filter's own needle (what a `contains` or
+      `exact` filter found in the value), and none for a value a regex matched.
 
 What to read next
     `roxy/rules/match.py` (`text_matches`, `header_rule_canonical_key`), then `roxy/abuse/checks/header_rules.py`.
@@ -32,6 +38,7 @@ from pydantic import ValidationError
 
 from roxy.abuse.messages import clean_admin_message
 from roxy.abuse.verdict import title_case_header
+from roxy.core.header_text import header_text, text_lines
 from roxy.rules.match import text_matches
 from roxy.rules.models import HeaderRuleIn
 from roxy.rules.store import RulesSnapshot
@@ -40,6 +47,8 @@ MAX_TEST_HEADERS: Final = 200
 """v1 tester limit (index.py:1267)."""
 MAX_TEST_NAME: Final = 200
 MAX_TEST_VALUE: Final = 2000
+MAX_MATCH_TEXT: Final = 120
+"""The longest header name or matched text a refusal records (v1 `_snippet_for` kept 120 characters)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,10 +114,25 @@ def header_rule_message(rule: Any) -> str:
     return clean_admin_message(getattr(rule, "message", ""))
 
 
+def match_detail(hit: HeaderHit) -> dict[str, str]:
+    """What a refusal records about a filter's hit (module docstring): `header` (Title-Cased as v1 showed it, the
+    caller's own text read as UTF-8, bounded), `field` (`key`: the name matched, `value`: the value did) and `text`
+    (the name, or the needle a `contains` or `exact` filter found in the value; absent for a regex on a value)."""
+    header = title_case_header(header_text(hit.header))[:MAX_MATCH_TEXT]
+    detail = {"header": header, "field": "key" if hit.field == "key" else "value"}
+    if detail["field"] == "key":
+        detail["text"] = header  # v1: the matched text of a name hit is the name itself
+    elif str(getattr(hit.rule, "mode", "") or "contains") != "regex":
+        detail["text"] = str(getattr(hit.rule, "needle", "") or "")[:MAX_MATCH_TEXT]
+    return detail
+
+
 def parse_header_text(text: str) -> list[tuple[str, str]]:
-    """v1 `_parse_header_text`: `Name: value` per line; lines without a colon (a request line) are skipped."""
+    """v1 `_parse_header_text`: `Name: value` per line; lines without a colon (a request line) are skipped. Lines
+    break at `\\n` and `\\r` only (`core/header_text.py text_lines`): a U+2028 inside a value is part of the value,
+    as it was on the wire, never a second header (finding esc-4)."""
     pairs: list[tuple[str, str]] = []
-    for line in text.splitlines():
+    for line in text_lines(text):
         stripped = line.strip()
         if not stripped or ":" not in stripped:
             continue
@@ -180,11 +204,13 @@ def explain_header_rules(
 
 
 __all__ = [
+    "MAX_MATCH_TEXT",
     "MAX_TEST_HEADERS",
     "HeaderHit",
     "explain_header_rules",
     "header_pairs",
     "header_rule_message",
+    "match_detail",
     "match_header_rule",
     "parse_header_text",
     "rule_hit",

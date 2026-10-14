@@ -22,7 +22,8 @@ from typing import Any
 
 import pytest
 
-from pages_harness import parse_html
+from pages_harness import PlannedRequest, parse_html
+from roxy.admin.api import traffic as traffic_api
 from roxy.admin.pages import registry
 from roxy.core.style_guard import find_style_issues
 
@@ -30,10 +31,22 @@ PAGE = "/admin/traffic"
 CARDS = ("requests", "bytes", "verbs", "status", "latency", "heatmap", "trends")
 LAZY = ("bytes", "verbs", "status", "latency", "heatmap", "trends")
 TABLE_CARDS = {"verbs": "traffic_verbs", "status": "traffic_status_sources", "latency": "traffic_latency_split"}
+OUTCOME_KEYS = ("requests:served_upstream", "requests:served_cache", "requests:refused", "requests:failed")
+LOCAL_KEY = "requests:answered_locally"
+ONE_GET_TWO_PREFLIGHTS = (
+    PlannedRequest("/games.roblox.com/v1/games?universeIds=91", "203.0.113.80"),
+    PlannedRequest("/games.roblox.com/v1/games?universeIds=91", "203.0.113.81", method="OPTIONS"),
+    PlannedRequest("/games.roblox.com/v1/games?universeIds=92", "203.0.113.82", method="OPTIONS"),
+)
+"""One request Roblox answered and two OPTIONS requests Roxy answered itself (204, reason `options_local`)."""
 
 
 def _points_sum(series: dict[str, Any]) -> float:
     return sum(v for _t, v in series["points"] if isinstance(v, int | float))
+
+
+def _line(key: str, values: list[int]) -> dict[str, Any]:
+    return {"key": key, "label": key, "unit": "requests", "points": [[60 * i, v] for i, v in enumerate(values)]}
 
 
 async def test_the_page_its_fragments_and_drawers_need_a_signed_in_admin(anon: Any) -> None:
@@ -97,6 +110,76 @@ async def test_the_requests_totals_equal_the_api_series(page: Any, pages_app: An
     assert chart.get("data-series") is None
     assert chart.get("data-series-src", "").split("?")[0] == "/admin/api/v1/traffic/requests"
     assert chart.get("data-chart-stack") == "outcome"
+
+
+async def test_options_answered_locally_are_their_own_line_never_served_by_roblox(page: Any, pages_app: Any) -> None:
+    """Finding truth-6: the chart and its totals read the outcome measures, so the two preflights Roxy answered
+    itself are "Answered by Roxy (OPTIONS)", and "Served by Roblox" is the one request that reached Roblox."""
+    statuses = await pages_app.seed_traffic(list(ONE_GET_TWO_PREFLIGHTS))
+    assert statuses == [200, 204, 204], statuses
+    api = (await page.api("GET", "traffic/requests", params={"range": "1h", "compare": "previous"})).json()
+    by_key = {s["key"]: _points_sum(s) for s in api["series"]}
+    assert list(by_key) == [*OUTCOME_KEYS, LOCAL_KEY]  # stacking order
+    assert by_key == {OUTCOME_KEYS[0]: 1, OUTCOME_KEYS[1]: 0, OUTCOME_KEYS[2]: 0, OUTCOME_KEYS[3]: 0, LOCAL_KEY: 2}
+    # The comparison pairs line for line (its hour had no traffic: zeros, the local line included).
+    assert [s["key"] for s in api["compare"]["series"]] == [*OUTCOME_KEYS, LOCAL_KEY]
+    assert sum(_points_sum(s) for s in api["compare"]["series"]) == 0
+    doc = await page.doc(f"{PAGE}/fragment/requests", params={"range": "1h"})
+    shown = {
+        node.classes().difference({"traffic-stats__item"}).pop().split("--")[1]: node
+        for node in doc.select("#requests .traffic-stats__item")
+    }
+    number = {key: node.select_one(".traffic-stats__number").text() for key, node in shown.items()}
+    assert number == {
+        "requests": "3",
+        "served_upstream": "1",
+        "served_cache": "0",
+        "refused": "0",
+        "failed": "0",
+        "answered_locally": "2",
+    }
+    local_help = shown["answered_locally"].select_one(".help-dot").get("data-help")
+    assert local_help == traffic_api.ANSWERED_LOCALLY_HELP
+    assert "OPTIONS" in shown["answered_locally"].text()
+    summary = doc.select_one("#requests figure[data-chart] [data-chart-plot]").get("aria-label")
+    assert "1 served by roblox" in summary, summary
+    assert "2 OPTIONS requests Roxy answered itself" in summary, summary
+    options = doc.select_one("#requests figure[data-chart]").get("data-series-options")
+    assert LOCAL_KEY in options
+    assert traffic_api.ANSWERED_LOCALLY_LABEL in options
+    # A range without a local OPTIONS answer has no such line, and the card no such total.
+    now = int(pages_app.clock.now())
+    before = {"range": "custom", "from": str(now - 7200), "to": str(now - 3600)}
+    quiet = (await page.api("GET", "traffic/requests", params=before)).json()
+    assert [s["key"] for s in quiet["series"]] == list(OUTCOME_KEYS)
+    quiet_doc = await page.doc(f"{PAGE}/fragment/requests", params=before)
+    assert quiet_doc.select_one(".traffic-stats__item--answered_locally") is None
+
+
+def test_the_answered_locally_line_is_in_both_periods_when_either_has_one() -> None:
+    """`outcome_lines`: the local line is `requests` minus the four measures, bucket by bucket (never clamped), and
+    it is in the chart and its comparison together, so the overlay pairs with it."""
+    current = [
+        _line("requests", [3, 1]),
+        _line("served_upstream", [1, 1]),
+        _line("served_cache", [0, 0]),
+        _line("refused", [0, 0]),
+        _line("failed", [0, 0]),
+    ]
+    quiet = [_line(key, [0, 0]) for key in traffic_api.OUTCOME_READS]
+    lines, other = traffic_api.outcome_lines(current, quiet)
+    assert [line["key"] for line in lines] == [*OUTCOME_KEYS, LOCAL_KEY]
+    assert lines[-1]["points"] == [[0, 2], [60, 0]]
+    assert lines[-1]["label"] == traffic_api.ANSWERED_LOCALLY_LABEL
+    assert other is not None
+    assert [line["key"] for line in other] == [*OUTCOME_KEYS, LOCAL_KEY]
+    lines, other = traffic_api.outcome_lines(quiet, current)  # only the comparison has one
+    assert [line["key"] for line in lines] == [*OUTCOME_KEYS, LOCAL_KEY]
+    assert other is not None
+    assert other[-1]["points"] == [[0, 2], [60, 0]]
+    lines, other = traffic_api.outcome_lines(quiet)
+    assert [line["key"] for line in lines] == list(OUTCOME_KEYS)
+    assert other is None
 
 
 async def test_status_tiles_verdict_and_table_equal_the_api(page: Any, pages_app: Any) -> None:

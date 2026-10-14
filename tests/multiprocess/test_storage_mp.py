@@ -225,7 +225,10 @@ def test_one_leader_across_blue_and_green_and_fast_takeover(
     leader_index = flags[:].index(1)
     old_holder, old_epoch, _ = _query(hot_path, "SELECT holder, epoch, expires_ms FROM lease WHERE name = 'leader'")[0]
     assert old_holder == holders[leader_index]
-    killed_at = time.monotonic()
+    # The lease runs on the wall clock (`expires_ms`), so the takeover is measured on it too: WSL 2's monotonic clock
+    # runs up to about 10 percent fast against the wall clock (which it steps back every half minute), so a 15 s
+    # lease read on the monotonic clock took up to 16.5 s (seen at 16.4 s after a WSL restart).
+    killed_at_ms = _now_ms()
     procs[leader_index].kill()  # SIGKILL: no lease release, exactly like a crash
 
     def taken_over() -> bool:
@@ -233,7 +236,7 @@ def test_one_leader_across_blue_and_green_and_fast_takeover(
         return bool(rows) and rows[0][0] != old_holder and rows[0][1] > _now_ms()
 
     assert _wait_for(taken_over, LEADER_TTL_S + 5, interval=0.05), "nobody took over"
-    takeover_s = time.monotonic() - killed_at
+    takeover_s = (_now_ms() - killed_at_ms) / 1000
     new_holder, new_epoch = _query(hot_path, "SELECT holder, epoch FROM lease WHERE name = 'leader'")[0]
     alive = {i for i in range(len(holders)) if i != leader_index}
     assert _wait_for(lambda: sum(flags[i] for i in alive) == 1, 5)

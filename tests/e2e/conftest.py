@@ -395,10 +395,13 @@ class AdminPage(PageRecord):
 
 @pytest.fixture
 def open_admin(browser: Any, dashboard: Any) -> Iterator[Callable[..., AdminPage]]:
-    """`open_admin(path, theme="dark", width=1440, height=900, signed_in=True)`: an `AdminPage` loaded and settled.
+    """`open_admin(path, theme="dark", width=1440, height=900, signed_in=True, touch=False)`: an `AdminPage` loaded
+    and settled.
 
     The theme is the admin's saved preference (`POST /admin/api/v1/prefs`), so the server renders it into the
-    first paint as it does for a real admin; the browser's color scheme matches it."""
+    first paint as it does for a real admin; the browser's color scheme matches it. `touch=True` opens a touch
+    screen (`has_touch`, `is_mobile`: a coarse pointer, so the 44 px touch rules of components.css apply; review
+    finding a11y-3 found the page tests' phone runs used a fine pointer)."""
     from pages_harness import SESSION_COOKIE_NAME
 
     contexts: list[Any] = []
@@ -411,6 +414,7 @@ def open_admin(browser: Any, dashboard: Any) -> Iterator[Callable[..., AdminPage
         height: int = 900,
         signed_in: bool = True,
         settle: bool = True,
+        touch: bool = False,
     ) -> AdminPage:
         if signed_in:
             answer = dashboard.api("POST", "prefs", json={"theme": theme})
@@ -420,6 +424,8 @@ def open_admin(browser: Any, dashboard: Any) -> Iterator[Callable[..., AdminPage
             color_scheme=theme,
             base_url=dashboard.base_url,
             accept_downloads=True,
+            has_touch=touch,
+            is_mobile=touch,
         )
         contexts.append(context)
         if signed_in:

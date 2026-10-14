@@ -3,12 +3,13 @@
   cache.py endpoint_drawer`), v1's "Rule" and "Purge" row buttons of "Where the cache is working".
 
   Its row of `cache.endpoints_answer` for the range, the rule that applies (or the default lifetime), a form that
-  writes a cache rule for it (the wildcard pattern of the template, `insights.simulate.template_pattern`, which
-  also covers the paths under it; posts to the rules API, which purges what the rule covers), "Purge its stored
-  answers" (the shared purge dialog with the same pattern), and a link to the Endpoints page. The template is
-  caller text: shown as text only, and a value in our own forms.
-  Context: `template`, `row`, `rule`, `pattern`, `ttl_words`, `new_rule_ttl`, `rules_url`, `purge_url`,
-  `endpoints_href`, `range_label`.
+  writes a cache rule for it (`insights.simulate.subtree_match`: the wildcard pattern of the template, which also
+  covers the paths under it, or its exact regex when the path holds a `*` a caller sent, finding esc-1; posts to
+  the rules API, which purges what the rule covers), "Purge its stored answers" (the shared purge dialog with the
+  same pattern and type), and a link to the Endpoints page. The template is caller text: shown as text only, and a
+  value in our own forms.
+  Context: `template`, `row`, `rule`, `pattern`, `pattern_type`, `ttl_words`, `new_rule_ttl`, `rules_url`,
+  `purge_url`, `endpoints_href`, `range_label`.
 -#}
 {% from "components/format.html" import caller_text, num, pct, bytes, local_href %}
 {% from "components/icon.html" import icon %}
@@ -38,10 +39,14 @@
     <div class="field">
       <label class="field__label" for="cache-endpoint-rule-pattern">Pattern</label>
       <input class="input mono" id="cache-endpoint-rule-pattern" name="pattern" value="{{ pattern }}" maxlength="1000" required data-json="string" aria-describedby="cache-endpoint-rule-pattern-hint cache-endpoint-rule-pattern-error">
+      {% if pattern_type == "regex" %}
+      <p class="field__hint" id="cache-endpoint-rule-pattern-hint">This template's path holds a * that a caller sent, so the rule names exactly this one endpoint (a regular expression); a wildcard pattern would cover every endpoint beside it.</p>
+      {% else %}
       <p class="field__hint" id="cache-endpoint-rule-pattern-hint">The wildcard form of the template: each placeholder is a *, and it also covers the paths under it.</p>
+      {% endif %}
       <p class="field__error" id="cache-endpoint-rule-pattern-error" data-field-error="pattern" hidden></p>
     </div>
-    <input type="hidden" name="type" value="glob" data-json="string">
+    <input type="hidden" name="type" value="{{ pattern_type or 'glob' }}" data-json="string">
     <div class="field">
       <label class="field__label" for="cache-endpoint-rule-ttl">Keep answers for (seconds)</label>
       <input class="input input--num" id="cache-endpoint-rule-ttl" name="ttl" inputmode="numeric" value="{{ new_rule_ttl }}" data-json="int" aria-describedby="cache-endpoint-rule-ttl-hint cache-endpoint-rule-ttl-error">
@@ -53,7 +58,7 @@
     <div class="cluster">
       <button type="submit" class="btn btn--primary btn--sm" data-action="cache-endpoint-rule">{{ icon("plus") }}<span>Write the rule</span></button>
       <button type="button" class="btn btn--sm btn--bad-soft" data-dialog-open="dlg-cache-purge" data-action="cache-endpoint-purge"
-              data-fill='{{ {"scope": "pattern", "type": "glob", "value": pattern, "_label": "every stored answer for " ~ pattern}|tojson }}'>{{ icon("x-circle") }}<span>Purge its stored answers</span></button>
+              data-fill='{{ {"scope": "pattern", "type": pattern_type or "glob", "value": pattern, "_label": "every stored answer for " ~ template}|tojson }}'>{{ icon("x-circle") }}<span>Purge its stored answers</span></button>
     </div>
   </form>
   {% set endpoints_link = local_href(endpoints_href) %}

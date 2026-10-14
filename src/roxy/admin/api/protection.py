@@ -4,8 +4,8 @@ What this is
     The routes behind plan 14.1 "Protection" and the top-bar switches, in the DESIGN.md section 13 shapes:
       * Switches: pause with a message and a scheduled window, throttle-all with its limit, period and "since"
         marker, each with the text callers get and the refusals since the state began (rows 49, 114, 115); the
-        throttle-all watch with v1's columns (requests and refusals since it began, rates, busiest endpoint, last
-        seen; row 135).
+        throttle-all watch: who it turned away, refused most first, with v1's columns (requests and refusals since
+        it began, rates, busiest endpoint, last seen; row 135).
       * Bans with countdowns and evidence; create, lift one, lift a subject; the plan 6.8 "bans only" reset with a
         preview. Deny list, admin allowlist and bypass entries (CIDR, expiry with the `bypass_default_expiry_h`
         default, "never" needs confirmation, "Bypass my IP" with the address Roxy resolved, row 113).
@@ -87,7 +87,7 @@ from roxy.abuse.state import read_state_value
 from roxy.abuse.tarpit import ARRIVAL_PREFIX, RETRY_PREFIX
 from roxy.abuse.throttle import forgive, ladder_from, strike_board, throttle_watch
 from roxy.abuse.throttle_all import STATE_KEY as THROTTLE_ALL_KEY
-from roxy.abuse.throttle_all import ThrottleAllState, set_throttle_all, throttle_all_watch
+from roxy.abuse.throttle_all import ThrottleAllState, set_throttle_all, turned_away
 from roxy.abuse.ua_rules import explain_user_agent_rules
 from roxy.admin.api import settings as settings_api
 from roxy.admin.api.common import (
@@ -109,6 +109,7 @@ from roxy.admin.api.common import (
     conflict,
     export_pages,
     export_table,
+    fields_named,
     not_found,
     page_rows,
     parse_instant,
@@ -571,6 +572,12 @@ class ThrottleAllBody(ApiBody):
     confirm_high_risk: bool = False
 
 
+THROTTLE_ALL_FIELDS: Final[dict[str, str]] = {"global_throttle_limit": "limit", "global_throttle_period": "period"}
+"""The settings the emergency limit's `limit` and `period` are, mapped back to the body's names for its errors."""
+BAN_FIELDS: Final[dict[str, str]] = {"reason_text": "message"}
+"""A ban row's `reason_text` is the body's `message` (the text a banned caller gets)."""
+
+
 async def _throttle_all_view(ctx: Any, state: ThrottleAllState) -> dict[str, Any]:
     text, source = state.message(str(_setting(ctx, "pause_message_default") or ""))
     return {
@@ -618,17 +625,20 @@ async def throttle_all_set(
         if value is not None
     }
     if changes:
-        # The settings editor's rules first (finding apisec-4), so a refused value changes nothing at all.
-        await check_settings_change(request, ctx, changes, reason=reason, confirmed=body.confirm_high_risk)
-        await run_mutation(
-            _settings_service(ctx).update(
-                changes,
-                actor,
-                reason or "throttle-all limit",
-                request_id=request_id,
-                guard=settings_api.write_rules(ctx, admin, confirmed=body.confirm_high_risk),
+        # The settings editor's rules first (finding apisec-4), so a refused value changes nothing at all. Its
+        # errors name the body's fields, `limit` and `period`, not the settings keys (section 13 errors name the
+        # request's fields; finding functional-4), so the dialog shows the reason under the field.
+        with fields_named(THROTTLE_ALL_FIELDS):
+            await check_settings_change(request, ctx, changes, reason=reason, confirmed=body.confirm_high_risk)
+            await run_mutation(
+                _settings_service(ctx).update(
+                    changes,
+                    actor,
+                    reason or "throttle-all limit",
+                    request_id=request_id,
+                    guard=settings_api.write_rules(ctx, admin, confirmed=body.confirm_high_risk),
+                )
             )
-        )
     try:
         state = await run_mutation(
             set_throttle_all(
@@ -647,16 +657,27 @@ WATCH_ALL_SPEC: Final = TableSpec(
         Column(
             "ip",
             "Client",
-            "The client key (IPv6 grouped by its network) hitting the emergency limit.",
+            "The address Roxy turned away while the emergency limit was on (an IPv6 network where its emergency "
+            "window is the only record of it).",
             ip=True,
             sortable=False,
         ),
-        Column("count", "Requests this window", "Requests counted in the current emergency window.", "count"),
-        Column("limited", "Refused now", "Whether the client is over the emergency limit right now.", sortable=False),
+        Column(
+            "count",
+            "Requests this window",
+            "Requests counted in the client's current emergency window; empty once its window ended.",
+            "count",
+        ),
+        Column(
+            "limited",
+            "Refused now",
+            "Whether the client's window is full right now, so its next request is refused.",
+            sortable=False,
+        ),
         Column(
             "reset_in_s",
             "Window ends in",
-            "Seconds until the client's emergency window starts again.",
+            "Seconds until the client's emergency window starts again; empty when it has none.",
             "seconds",
             sortable=False,
         ),
@@ -670,9 +691,9 @@ WATCH_ALL_SPEC: Final = TableSpec(
         Column(
             "refused",
             "Refused",
-            "Of those, requests Roxy turned away (throttle-all or any other refusal).",
+            "Of those, requests Roxy turned away (throttle-all or any other refusal); empty when Roxy has no "
+            "activity record for the client yet.",
             "requests",
-            sortable=False,
         ),
         Column(
             "rate1",
@@ -698,7 +719,7 @@ WATCH_ALL_SPEC: Final = TableSpec(
             sortable=False,
         ),
     ),
-    default_sort="count",
+    default_sort="refused",
 )
 WATCH_ALL_CALLER_TEXT: Final = ("top_endpoint",)
 WATCH_ACTIVITY_KEYS: Final = ("requests", "refused", "rate1", "rate5", "rate60", "top_endpoint", "last_seen_ms")
@@ -711,15 +732,20 @@ async def throttle_all_watch_table(
     tq: Annotated[TableQuery, Depends(table_params(WATCH_ALL_SPEC))],
     fmt: ExportFormatDep,
 ) -> Any:
-    """Who is hitting the emergency limit right now, fullest first (row 135), with v1's watch columns: requests and
-    refusals since throttle-all began, rates, the busiest endpoint and when it was last seen (finding parity-4).
+    """Who the emergency limit turned away (row 135, v1 "Who is being throttled right now"), refused most first, with
+    v1's watch columns: requests and refusals since throttle-all began, rates, the busiest endpoint and when it was
+    last seen (finding parity-4), and each client's emergency window while it still has one.
 
-    The limiter rows (hot.db) pick and order the page; client activity (metrics.db) fills the v1 columns for that
-    page only. A client key that is an IPv6 network has no per-address activity, so those columns are None there.
+    The rows are the clients with refusals since the "since" marker (client activity, metrics.db; finding
+    v1parity-6: they were the limiter windows in force, so a polite client with an open window was listed and a
+    refused one vanished when its window ended); `abuse/throttle_all.py turned_away` picks and orders them, hot.db
+    adds the windows, and client activity fills the v1 columns for the page only. A full window lists a client by
+    itself only where no activity record exists (an IPv6 network key, a client not written yet); its columns are
+    None there. While the emergency limit is off the watch is empty: it turns nobody away.
     """
     ctx = _ctx(request)
     _single_order(tq)
-    fetch, since = await _throttle_all_watch_fetch(ctx)
+    fetch, since = await _throttle_all_watch_fetch(ctx, tq)
     with service_errors():
         return await _table_or_export(
             request,
@@ -734,28 +760,40 @@ async def throttle_all_watch_table(
 
 async def throttle_all_watch_answer(ctx: Any, tq: TableQuery) -> dict[str, Any]:
     """One page of `GET /throttle-all/watch` (the route and the Protection page share `_throttle_all_watch_fetch`)."""
-    fetch, since = await _throttle_all_watch_fetch(ctx)
+    tq = one_order(tq)
+    fetch, since = await _throttle_all_watch_fetch(ctx, tq)
     with service_errors():
         return await table_page(
-            WATCH_ALL_SPEC, one_order(tq), fetch, extra={"since": since, "caller_text": list(WATCH_ALL_CALLER_TEXT)}
+            WATCH_ALL_SPEC, tq, fetch, extra={"since": since, "caller_text": list(WATCH_ALL_CALLER_TEXT)}
         )
 
 
-async def _throttle_all_watch_fetch(ctx: Any) -> tuple[Fetch, float]:
+async def _throttle_all_watch_fetch(ctx: Any, tq: TableQuery) -> tuple[Fetch, float]:
     """The watch's page reader and its "since" (see `throttle_all_watch_table`)."""
     limit_setting = int(_setting(ctx, "global_throttle_limit"))
     period = int(_setting(ctx, "global_throttle_period"))
+    ipv6_prefix = int(_setting(ctx, "ipv6_limit_prefix"))
     with service_errors():
         raw = await ctx.dbs.control.read(lambda conn: read_state_value(conn, THROTTLE_ALL_KEY))
     state = ThrottleAllState.from_json(raw)
     now = ctx.clock.now()
-    # The "since" marker of the running emergency limit; with it off, the rows left are at most one period old.
-    since = float(state.since) if state.enabled and state.since else now - period
+    running = bool(state.enabled and state.since)
+    # The "since" marker of the running emergency limit (the answer's `since`; with it off, one period back).
+    since = float(state.since) if running else now - period
 
     async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
-        offset = (page - 1) * size
-        data = await throttle_all_watch(
-            ctx.dbs.hot, now_ms=ctx.clock.now_ms(), limit_setting=limit_setting, limit=size, offset=offset
+        if not running:
+            return [], 0  # off: the emergency limit turns nobody away (v1 hid the watch)
+        data = await turned_away(
+            ctx.dbs.hot,
+            ctx.dbs.metrics,
+            since=since,
+            now_ms=ctx.clock.now_ms(),
+            limit_setting=limit_setting,
+            ipv6_prefix=ipv6_prefix,
+            sort=tq.sort,
+            limit=size,
+            offset=(page - 1) * size,
         )
         rows = [dict(row) for row in data["rows"]]
         keys = [str(row["ip"]) for row in rows]
@@ -1028,9 +1066,12 @@ async def ban_create(request: Request, admin: AdminSession, _csrf: CsrfChecked, 
         "reason_text": body.message,
         "expires_at": expires_at,
     }
-    change = await run_mutation(
-        _rules(ctx).create("bans", row, actor_for(admin), audit_reason(body.reason), request_id=request_id_of(request))
-    )
+    with fields_named(BAN_FIELDS):  # a refused message names the body's `message` (finding functional-4)
+        change = await run_mutation(
+            _rules(ctx).create(
+                "bans", row, actor_for(admin), audit_reason(body.reason), request_id=request_id_of(request)
+            )
+        )
     answer = _change(change)
     answer["ban"] = read_bans.ban_view(change.after or {}, _now(ctx)) if change.after else None
     answer["extended_existing"] = change.action == "update"
@@ -2395,6 +2436,44 @@ ATTEMPT_SPEC: Final = TableSpec(
     ),
     default_sort="attempts",
 )
+MATCH_COLUMNS: Final[tuple[Column, ...]] = (
+    # The header is what the caller sent (caller text); the matched text is that name or the filter's needle.
+    Column(
+        "last_header",
+        "Last header",
+        "The header the newest refusal's filter matched (v1 Last Header): a filter on any header's name or value "
+        "can catch a header you never named, so this is where a broad filter's false positives show.",
+        sortable=False,
+        caller_text=True,
+    ),
+    Column(
+        "last_field",
+        "Triggered by",
+        "Whether that header's name (key) or its value matched (v1 Triggered By).",
+        sortable=False,
+    ),
+    Column(
+        "last_text",
+        "Matched text",
+        "What matched (v1 Matched Text): the header name for a name match, the filter's own text for a value it "
+        "contains or equals; empty for a value a regex matched (refused requests keep no header values).",
+        sortable=False,
+        caller_text=True,
+    ),
+)
+HEADER_ATTEMPT_SPEC: Final = TableSpec(
+    name="refusal_attempts",
+    columns=(*ATTEMPT_SPEC.columns[:3], *MATCH_COLUMNS, *ATTEMPT_SPEC.columns[3:]),
+    default_sort="attempts",
+)
+"""The Header-Blocked Attempts tab (`GET /header-rules/attempts`): the attempts columns plus v1's Last Header,
+Triggered By and Matched Text, which each refusal records since finding v1parity-5 (older ones have none)."""
+ATTEMPT_SPECS: Final[dict[str, TableSpec]] = {
+    "endpoint_blocked": ATTEMPT_SPEC,
+    "endpoint_rule": ATTEMPT_SPEC,
+    "header_rule": HEADER_ATTEMPT_SPEC,
+}
+"""The table of each attempts tab (keyed by the refusal reason it lists)."""
 ATTEMPT_RULE_TABLE: Final[dict[str, str]] = {
     "endpoint_blocked": "rules_endpoint_block",
     "endpoint_rule": "rules_endpoint_limit",
@@ -2468,9 +2547,10 @@ async def _attempts(
     matcher: Callable[[Any, str], Any] | None,
 ) -> Any:
     fetch = _attempts_fetch(_ctx(request), reason, tr, tq, matcher)
+    spec = ATTEMPT_SPECS[reason]
     with service_errors():
         return await _table_or_export(
-            request, admin, ATTEMPT_SPEC, tq, fmt, fetch, filters={"reason": reason}, tr=tr, extra={"reason": reason}
+            request, admin, spec, tq, fmt, fetch, filters={"reason": reason}, tr=tr, extra={"reason": reason}
         )
 
 
@@ -2487,7 +2567,7 @@ async def attempts_answer(ctx: Any, reason: str, tq: TableQuery, tr: TimeRange) 
     `/header-rules/attempts`; `reason` is `endpoint_blocked`, `endpoint_rule` or `header_rule`)."""
     fetch = _attempts_fetch(ctx, reason, tr, tq, ATTEMPT_MATCHERS[reason])
     with service_errors():
-        return await table_page(ATTEMPT_SPEC, tq, fetch, extra={"reason": reason})
+        return await table_page(ATTEMPT_SPECS[reason], tq, fetch, extra={"reason": reason})
 
 
 def _attempts_fetch(
@@ -2496,6 +2576,7 @@ def _attempts_fetch(
     start, end = _range_ms(tr)
     snapshot = _rules_snapshot(ctx)
     rule_table = ATTEMPT_RULE_TABLE.get(reason)
+    match_keys = [column.key for column in MATCH_COLUMNS] if ATTEMPT_SPECS[reason] is HEADER_ATTEMPT_SPEC else []
 
     def annotate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for row in rows:
@@ -2503,6 +2584,10 @@ def _attempts_fetch(
             # "the attempts tabs show the rule that refused at the time").
             ids = [str(i) for i in row.pop("rule_ids", None) or ()]
             row["refused_by"] = [_rule_label(snapshot, rule_table, i) for i in ids] if rule_table else []
+            # What the newest refusal's filter matched (`detail.matched`, the read model's `last_*`; None where no
+            # refusal of the row recorded one).
+            for key in match_keys:
+                row[key] = row.get(key)
             # One request's regex budget per path: the rule a request for this path would match today.
             with regex_budget(fresh=True):
                 rule = matcher(snapshot, str(row.get("path") or "").lower()) if matcher else None
@@ -2654,10 +2739,11 @@ async def header_rule_attempts(
     request: Request,
     admin: AdminSession,
     tr: TimeRangeDep,
-    tq: Annotated[TableQuery, Depends(table_params(ATTEMPT_SPEC))],
+    tq: Annotated[TableQuery, Depends(table_params(HEADER_ATTEMPT_SPEC))],
     fmt: ExportFormatDep,
 ) -> Any:
-    """Header-blocked attempts in the range (v1 "Header-Blocked Attempts", row 75)."""
+    """Header-blocked attempts in the range (v1 "Header-Blocked Attempts", row 75), with v1's Last Header,
+    Triggered By and Matched Text (`last_header`, `last_field` `key` or `value`, `last_text`; finding v1parity-5)."""
     return await _attempts(request, admin, "header_rule", tr, tq, fmt, None)
 
 

@@ -46,6 +46,7 @@ from fastapi.responses import HTMLResponse
 from roxy.admin.api import common
 from roxy.admin.api import endpoints as endpoints_api
 from roxy.admin.api import live as live_api
+from roxy.admin.api import traffic as traffic_api
 from roxy.admin.pages import fmt
 from roxy.admin.pages.kit import (
     Page,
@@ -123,7 +124,11 @@ OUTCOME_SERIES: Final[dict[str, dict[str, Any]]] = {
     "requests:served_cache": {"label": "Served from the cache", "color": 3},
     "requests:refused": {"label": "Refused by Roxy", "color": 4},
     "requests:failed": {"label": "Failed", "color": 8},
+    # OPTIONS requests Roxy answered itself (finding truth-6): the line is in the answer only when the range has any.
+    f"requests:{traffic_api.ANSWERED_LOCALLY}": {"label": traffic_api.ANSWERED_LOCALLY_LABEL, "color": 2},
 }
+"""The drill-down's requests by outcome lines (`traffic_api.outcome_lines`, the Traffic chart's): key, words, color
+slot, as the Traffic requests card has them."""
 RULE_FAMILIES: Final[tuple[tuple[str, str, str], ...]] = (
     ("endpoint_block", "Endpoint block", "/admin/protection#endpoint-blocks"),
     ("endpoint_rule", "Endpoint rule (a rate limit)", "/admin/protection#endpoint-rules"),
@@ -293,9 +298,13 @@ async def table_card(view: PageView) -> dict[str, Any]:
         trend = item.get("trend_pct")
         previous = item.get("previous_requests")
         requests = item.get("requests")
-        if isinstance(trend, int | float):
+        if item.get("trend_partial"):
+            # Plan 6.8 (finding truth-3): a reset in either window; the table's notice says which one.
+            trend_cell: Any = {"text": "Partial data", "tone": "warn"}
+            trend_sub = "partial data, no trend"
+        elif isinstance(trend, int | float):
             trend_text = f"{'+' if trend > 0 else ''}{trend:,.1f}%"
-            trend_cell: Any = {"text": trend_text}
+            trend_cell = {"text": trend_text}
             trend_sub = f"{trend_text} vs before"
         elif previous == 0 and requests:
             trend_cell = {"text": "New", "tone": "info"}

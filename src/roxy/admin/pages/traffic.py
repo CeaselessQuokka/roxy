@@ -3,9 +3,10 @@ Codes and Proxy Timings).
 
 What this is
     Seven cards, each reading the same answer as its admin API route (`roxy/admin/api/traffic.py`):
-      * `requests`: requests over time stacked by outcome (served by Roblox, from the cache, refused, failed) with
-        the totals of the range above it; v1's "Traffic (Last 60 Minutes)" is this chart with the range "1h" (row 7).
-        The card's reset button clears the traffic family (plan 6.8, v1's Clear data on these sections).
+      * `requests`: requests over time stacked by outcome (served by Roblox, from the cache, refused, failed, and
+        the OPTIONS requests Roxy answered itself when the range has any) with the totals of the range above it;
+        v1's "Traffic (Last 60 Minutes)" is this chart with the range "1h" (row 7). The card's reset button clears
+        the traffic family (plan 6.8, v1's Clear data on these sections).
       * `bytes`: bytes between callers and Roxy and between Roxy and Roblox over time (plan 14.3 definitions), the
         range totals and the wire bytes per egress.
       * `verbs`: requests per HTTP method over time, the method mix, and the "Counts by Method" table (row 20).
@@ -43,7 +44,7 @@ from typing import Any, Final
 
 from roxy.admin.api import traffic as traffic_api
 from roxy.admin.pages import fmt
-from roxy.admin.pages.kit import Page, PageView, table_query, table_view
+from roxy.admin.pages.kit import LIVE_REFRESH_S, Page, PageView, table_query, table_view
 from roxy.admin.pages.resets import add_reset_route, family_reset, reset_href
 from roxy.metrics.catalog import METRICS
 from roxy.metrics.rollups import zone
@@ -57,7 +58,11 @@ OUTCOMES: Final[tuple[tuple[str, str, int], ...]] = (
     ("refused", "Refused by Roxy", 4),
     ("failed", "Failed", 8),
 )
-"""The outcome groups of the requests chart: key, words, series color slot (tokens `--series-N`)."""
+"""The outcome lines of the requests chart (`traffic_api.OUTCOME_MEASURES`): key, words, series color slot (tokens
+`--series-N`). Each is the catalog measure of that name, so its total and its help say the same thing."""
+LOCAL: Final[tuple[str, str, int]] = (traffic_api.ANSWERED_LOCALLY, traffic_api.ANSWERED_LOCALLY_LABEL, 2)
+"""The line of OPTIONS requests Roxy answered itself (finding truth-6): in the answer, and so on the card, only when
+the range or its comparison has any."""
 
 SOURCE_COLORS: Final[dict[str, int]] = {"roblox": 1, "relay": 7, "roxy": 4, "cache": 3, "internal": 6}
 STATUS_LABELS: Final[dict[str, tuple[str, int]]] = {
@@ -161,7 +166,7 @@ def _day(ts: Any, tz: str) -> str:
 # ============================================================================================ requests
 
 
-@page.card("requests")
+@page.card("requests", live_refresh_s=LIVE_REFRESH_S)
 async def requests_card(view: PageView) -> dict[str, Any]:
     """Requests over time by outcome and the range totals (`traffic_api.requests_answer`). The totals are rendered
     on the server; the chart reads the same answer by URL right after the first paint (`chart_src`): embedded, its
@@ -183,9 +188,24 @@ async def requests_card(view: PageView) -> dict[str, Any]:
         stats.append(
             {"key": key, "label": label, "value": value, "share": share(value, total), "help": METRICS[key].description}
         )
-    words = ", ".join(f"{int(s['value']):,} {s['label'].lower()}" for s in stats[1:])
+    words = [f"{int(s['value']):,} {s['label'].lower()}" for s in stats[1:]]
+    local_key, local_label, _slot = LOCAL
+    if local_key in totals:
+        # Only when the answer has the line (the range or its comparison had a local OPTIONS answer), so the totals
+        # above the chart still add up to the chart, line for line.
+        value = totals[local_key]
+        stats.append(
+            {
+                "key": local_key,
+                "label": local_label,
+                "value": value,
+                "share": share(value, total),
+                "help": traffic_api.ANSWERED_LOCALLY_HELP,
+            }
+        )
+        words.append(f"{int(value):,} OPTIONS requests Roxy answered itself")
     summary = (
-        f"Requests by outcome, {view.time.view['description']}: {int(total):,} requests in all ({words})."
+        f"Requests by outcome, {view.time.view['description']}: {int(total):,} requests in all ({', '.join(words)})."
         if total
         else f"No requests were recorded in this range ({view.time.view['description']})."
     )
@@ -193,7 +213,9 @@ async def requests_card(view: PageView) -> dict[str, Any]:
         "chart_src": view.api_url("traffic/requests"),
         "stats": stats,
         "summary": summary,
-        "series_options": {f"requests:{key}": {"label": label, "color": slot} for key, label, slot in OUTCOMES},
+        "series_options": {
+            f"requests:{key}": {"label": label, "color": slot} for key, label, slot in (*OUTCOMES, LOCAL)
+        },
         "reset_href": reset_href("traffic", which="traffic"),
         "last_hour_href": "/admin/traffic?range=1h",
         "range_label": view.time.view["label"],
@@ -203,7 +225,7 @@ async def requests_card(view: PageView) -> dict[str, Any]:
 # ============================================================================================ bytes
 
 
-@page.card("bytes", lazy=True)
+@page.card("bytes", lazy=True, live_refresh_s=LIVE_REFRESH_S)
 async def bytes_card(view: PageView) -> dict[str, Any]:
     """Caller and upstream bytes over time, the range totals and the wire bytes per egress."""
     answer = await traffic_api.bytes_answer(view.ctx, view.tr)
@@ -231,7 +253,7 @@ VERB_KEY_COLUMNS: Final = ("key", "requests", "failed")
 VERB_HIDDEN: Final = ("status_2xx", "status_4xx", "status_5xx")
 
 
-@page.card("verbs", lazy=True)
+@page.card("verbs", lazy=True, live_refresh_s=LIVE_REFRESH_S)
 async def verbs_card(view: PageView) -> dict[str, Any]:
     """Requests per method over time, the method mix and the counts by method (`traffic_api.dimension_table`)."""
     spec = traffic_api.VERBS_SPEC
@@ -296,7 +318,7 @@ async def verbs_card(view: PageView) -> dict[str, Any]:
 SOURCE_COLUMNS: Final = ("source_label", "status", "requests", "source")
 
 
-@page.card("status", lazy=True)
+@page.card("status", lazy=True, live_refresh_s=LIVE_REFRESH_S)
 async def status_card(view: PageView) -> dict[str, Any]:
     """v1's Status Codes section: the four tiles, the verdict, "Who returned it?" and status over time."""
     spec = traffic_api.SOURCES_SPEC
@@ -382,7 +404,7 @@ async def status_card(view: PageView) -> dict[str, Any]:
 # ============================================================================================ latency
 
 
-@page.card("latency", lazy=True)
+@page.card("latency", lazy=True, live_refresh_s=LIVE_REFRESH_S)
 async def latency_card(view: PageView) -> dict[str, Any]:
     """Latency percentiles over time, or split (v1's toggle), and the split as a table."""
     split = choice(view, "split", LATENCY_SPLITS, "none")

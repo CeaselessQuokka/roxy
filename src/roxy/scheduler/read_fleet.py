@@ -4,9 +4,12 @@ What this is
     `fleet_summary(rows, ...)` turns the `worker_heartbeat` rows (`scheduler.heartbeat.fleet_view`) into the
     System page's fleet header and worker list (parity row 84): per color the expected and fresh worker counts,
     the gunicorn master pids (both colors during a deploy) and the service uptime of each master, plus totals.
-    `host_uptime_s()`, `boot_time_s()` and `process_started_at(pid)` read Linux's `/proc`, and
-    `file_mtime(paths)` reads when the deploy last switched colors (`deployed_version`). `worker_cpu(conn, now)`
-    reads each worker's last complete minute of CPU from `worker_minute` (metric `worker_cpu_pct`).
+    `color_master_pids(rows, color)` and `service_since(pids, started, now)` are that uptime alone, which the
+    Overview's Service uptime tile reads too (plan 14.1 row 3 homes one v1 tile on both pages: one number).
+    `host_uptime_s()`, `boot_time_s()`, `process_started_at(pid)` and `master_start_times(pids)` read Linux's
+    `/proc`, and `file_mtime(paths)` reads when the deploy last switched colors (`deployed_version`).
+    `worker_cpu(conn, now)` reads each worker's last complete minute of CPU from `worker_minute` (metric
+    `worker_cpu_pct`).
 
 Why it exists
     Plan 4.5 row 84 renames and extends v1's worker registry: host uptime from `/proc/uptime`, Expected
@@ -90,6 +93,51 @@ def process_started_at(pid: int, *, proc: Path = _PROC, boot_s: int | None = Non
     except (ValueError, OSError, AttributeError):
         hertz = 100
     return boot + ticks / max(1, int(hertz))
+
+
+def master_start_times(pids: Iterable[int], *, proc: Path = _PROC) -> dict[int, float | None]:
+    """`{pid: started_at}` for each gunicorn master pid (`process_started_at`, the boot time read once), None for a
+    pid whose start cannot be read. File reads: the caller runs this on a worker thread."""
+    boot = boot_time_s(proc)
+    return {int(pid): process_started_at(int(pid), proc=proc, boot_s=boot) for pid in pids}
+
+
+def _row_color(row: Mapping[str, Any]) -> str:
+    """The color a heartbeat row is grouped under (`fleet_summary`): its color, or `unknown` when it has none."""
+    return str(row.get("color") or "") or "unknown"
+
+
+def color_master_pids(rows: Iterable[Mapping[str, Any]], color: str) -> list[int]:
+    """The gunicorn master pids named by the fresh heartbeat rows of `color`, each once, in row order.
+
+    One pid in steady state; two only while a master is being replaced. Stale rows are left out: a worker that
+    stopped beating says nothing about the master serving now.
+    """
+    pids: list[int] = []
+    for row in rows:
+        master = row.get("master_pid")
+        if not row.get("fresh") or _row_color(row) != color:
+            continue
+        if isinstance(master, int) and master > 0 and master not in pids:
+            pids.append(master)
+    return pids
+
+
+def service_since(
+    master_pids: Iterable[int], master_started: Mapping[int, float | None], now_s: float
+) -> tuple[float | None, int | None]:
+    """`(service_started_at, service_uptime_s)` of one color (parity row 84): since its oldest master started.
+
+    Read from the gunicorn master, never from a worker's age: workers recycle on purpose (`ROXY_MAX_REQUESTS`), so a
+    worker's start says nothing about how long the service has run, while the master lives until a deploy or a
+    restart. Both are None when no master's start is known (a non-Linux machine, a pid that is gone): unknown is
+    shown as unknown, never as the age of a worker (P6).
+    """
+    times = [t for t in (master_started.get(pid) for pid in master_pids) if t is not None]
+    if not times:
+        return None, None
+    started = min(times)
+    return started, max(0, int(now_s - started))
 
 
 def file_mtime(paths: Iterable[Path]) -> float | None:
@@ -183,25 +231,17 @@ def fleet_summary(
     started = dict(master_started or {})
     colors: dict[str, dict[str, Any]] = {}
     for worker in workers:
-        color = worker["color"] or "unknown"
-        entry = colors.setdefault(
-            color,
-            {"color": color, "expected": expected_per_color, "count": 0, "stale": 0, "master_pids": []},
-        )
+        color = _row_color(worker)
+        entry = colors.setdefault(color, {"color": color, "expected": expected_per_color, "count": 0, "stale": 0})
         if worker["fresh"]:
             entry["count"] += 1
-            master = worker["master_pid"]
-            if isinstance(master, int) and master > 0 and master not in entry["master_pids"]:
-                entry["master_pids"].append(master)
         else:
             entry["stale"] += 1
-    colors.setdefault(
-        this_color, {"color": this_color, "expected": expected_per_color, "count": 0, "stale": 0, "master_pids": []}
-    )
+    colors.setdefault(this_color, {"color": this_color, "expected": expected_per_color, "count": 0, "stale": 0})
     for entry in colors.values():
-        times = [t for t in (started.get(pid) for pid in entry["master_pids"]) if t is not None]
-        entry["service_started_at"] = min(times) if times else None
-        entry["service_uptime_s"] = max(0, int(now_s - min(times))) if times else None
+        # The same two helpers give the Overview its Service uptime tile (plan 14.1 row 3: one v1 tile, one number).
+        entry["master_pids"] = color_master_pids(workers, entry["color"])
+        entry["service_started_at"], entry["service_uptime_s"] = service_since(entry["master_pids"], started, now_s)
         entry["active"] = entry["count"] > 0
         entry["short"] = entry["count"] < entry["expected"] and entry["count"] > 0
         entry["is_this_color"] = entry["color"] == this_color
@@ -226,10 +266,13 @@ __all__ = [
     "CPU_LOOKBACK_S",
     "MAX_WORKERS_SHOWN",
     "boot_time_s",
+    "color_master_pids",
     "file_mtime",
     "fleet_summary",
     "host_uptime_s",
+    "master_start_times",
     "process_started_at",
+    "service_since",
     "worker_cpu",
     "worker_row",
 ]

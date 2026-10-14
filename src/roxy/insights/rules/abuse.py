@@ -39,6 +39,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
+from urllib.parse import urlencode
 
 from roxy.abuse.bans import REPEAT_WINDOW_S, ban_subject_for, escalated_minutes, ua_hash
 from roxy.abuse.bot import in_networks
@@ -102,6 +103,15 @@ FILTER_REASONS: Final[dict[str, str]] = {
 """The abuse filter tables and the refusal reason each one writes (DESIGN 6)."""
 PATTERN_TABLES: Final = frozenset({"rules_endpoint_block", "rules_endpoint_limit"})
 CLIENTS_LINK: Final = "/admin/clients"
+
+
+def clients_link(**params: object) -> str:
+    """A Clients page link whose values are percent-encoded (DESIGN 15.3: URLs carrying caller text encode it). A
+    place id is a caller's Roblox-Id claim, so it may hold `&` or `#` (finding esc-5); it goes in `q`, the place
+    search the Clients page reads (DESIGN 15.4), and an address in `ip`."""
+    return f"{CLIENTS_LINK}?{urlencode({name: str(value) for name, value in params.items()})}"
+
+
 PROTECTION_LINK: Final = "/admin/protection"
 
 
@@ -388,7 +398,7 @@ class AbuseSpam(Rule):
             }
             for r in entry.auto_bans[-10:]
         ]
-        evidence.links += [f"{CLIENTS_LINK}?ip={client}", f"{PROTECTION_LINK}#spam"]
+        evidence.links += [clients_link(ip=client), f"{PROTECTION_LINK}#spam"]
         length = "as long as the armed detectors would have made it by now"
         if entry.auto_bans:
             why = (
@@ -435,7 +445,7 @@ class AbuseSpam(Rule):
         evidence.add("detections_last_hour", detections, "detections")
         evidence.details["detectors"] = dict(entry.detectors)
         evidence.details["timeline"] = entry.detections[-20:]
-        evidence.links.append(f"{CLIENTS_LINK}?place={place}")
+        evidence.links.append(clients_link(q=place))
         return self.recommendation(
             ctx,
             subject=entry.subject,
@@ -519,7 +529,7 @@ class AbuseBot(Rule):
         evidence.add("refused_last_hour", int(row.get("refused") or 0), "requests")
         evidence.add("served_last_hour", int(row.get("served") or 0), "requests")
         evidence.details["top_endpoint"] = row.get("top_endpoint")
-        evidence.links.append(f"{CLIENTS_LINK}?ip={ip}")
+        evidence.links.append(clients_link(ip=ip))
         expires_at = int(ctx.now) + TEMPORARY_BAN_S
         subject_type, subject = ban_subject_for(ip)
         return self.recommendation(
@@ -742,7 +752,7 @@ class FilterAdd(Rule):
             {"from": iso(w.start), "to": iso(w.end), "refused": n} for w, n in zip(windows, counts, strict=True)
         ]
         evidence.details["top_endpoint"] = latest.get("top_endpoint")
-        evidence.links.append(f"{CLIENTS_LINK}?ip={ip}")
+        evidence.links.append(clients_link(ip=ip))
         subject_type, subject = ban_subject_for(ip)
         expires_at = int(ctx.now) + TEMPORARY_BAN_S
         hourly = ", ".join(f"{n:,}" for n in counts)
@@ -949,7 +959,7 @@ class FilterRemove(Rule):
             evidence.add("served_pct_before_ban", round(served * 100.0 / requests, 2), "percent")
             evidence.add("rank_by_served", rank)
             evidence.add("ban_hits", int(row.get("hits") or 0), "requests")
-            evidence.links.append(f"{CLIENTS_LINK}?place={place}")
+            evidence.links.append(clients_link(q=place))
             hours = (window.end - window.start) / 3600
             out.append(
                 self.recommendation(
@@ -1416,7 +1426,7 @@ class PlaceHeavy(Rule):
             evidence.details["note"] = (
                 f"Counts come from request samples taken at {sample_pct:g}% (shares stay unbiased)."
             )
-        evidence.links.append(f"{CLIENTS_LINK}?place={place}")
+        evidence.links.append(clients_link(q=place))
         # The template's own endpoint rule (the exact regex a recommendation writes, or the legacy v1 glob), and a
         # new one for exactly this template, so it refuses what `would_be_refused` counts and nothing below it
         # (finding insights-8).

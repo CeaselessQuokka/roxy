@@ -49,7 +49,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, Final
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse
@@ -62,7 +62,7 @@ from roxy.admin.pages.kit import Page, PageAdmin, PageView, table_query, table_v
 from roxy.config.constants import DEFAULT_CACHE_RULE_TTL, MAX_CACHE_IGNORED_PARAMS
 from roxy.config.insight_params import INSIGHT_RULES
 from roxy.insights import read_recommendations
-from roxy.insights.simulate import template_pattern
+from roxy.insights.simulate import path_match, subtree_match
 from roxy.metrics.catalog import METRICS
 
 log = logging.getLogger("roxy.admin.pages")
@@ -568,7 +568,7 @@ async def ignored_params_card(view: PageView) -> dict[str, Any]:
                 "name": name,
                 "note": item.get("note") or "",
                 "origin": RULE_ORIGINS.get(str(item.get("origin")), str(item.get("origin") or "")),
-                "remove_url": f"{common.API_PREFIX}/cache/ignored-params/{_path_segment(name)}",
+                "remove_url": _param_url(name),
             }
         )
     return {
@@ -580,9 +580,11 @@ async def ignored_params_card(view: PageView) -> dict[str, Any]:
     }
 
 
-def _path_segment(name: str) -> str:
-    """A parameter name as one URL path segment (percent-encoded; the API decodes it)."""
-    return quote(name, safe="")
+def _param_url(name: str) -> str:
+    """The API URL of one ignored parameter: its name as one percent-encoded path segment, or, for a name a path
+    cannot carry (`.` or `..`, which a browser resolves away), the `?name=` form the route reads first
+    (`common.name_in_path`; finding esc-2: "Stop ignoring" of `.` answered 404)."""
+    return common.name_in_path(f"{common.API_PREFIX}/cache/ignored-params", name)
 
 
 # ============================================================================================ key spread
@@ -595,11 +597,15 @@ async def spread_card(view: PageView) -> dict[str, Any]:
     groups = []
     for item in answer.get("items") or ():
         varying = list(item.get("varying") or ())[:4]
+        path = str(item.get("path") or "")
+        # The stored path as a glob, or an exact regex when the caller's path holds a `*` (finding esc-1).
+        match = path_match(path) if path else None
         groups.append(
             {
                 **item,
                 "varying": varying,
-                "purge_pattern": str(item.get("path") or ""),
+                "purge_pattern": match["pattern"] if match else "",
+                "purge_type": match["type"] if match else "",
                 "reused": int(item.get("hits") or 0) > 0,
             }
         )
@@ -728,7 +734,7 @@ async def entry_drawer(request: Request, principal: PageAdmin) -> HTMLResponse:
         if "json" in str(found.get("content_type") or "").lower() or body[:1] in ("{", "["):
             try:
                 pretty = json.dumps(json.loads(body), indent=2, ensure_ascii=False)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, RecursionError, MemoryError):  # nested past the parser's stack: esc-3
                 pretty = body
         state = str(found.get("state") or "")
         refusal = None
@@ -772,12 +778,15 @@ async def endpoint_drawer(request: Request, principal: PageAdmin) -> HTMLRespons
         rule = None
         if row is not None and row.get("rule_id") is not None:
             rule = await cache_api.rule_view(view.ctx, int(row["rule_id"]))
-        pattern = template_pattern(template)
+        # The template's v1 glob, or its exact regex when a literal segment holds a `*` that the glob would read as
+        # a wildcard over every sibling endpoint (finding esc-1); the rule and the purge use the same match.
+        match = subtree_match(template)
         return {
             "template": template,
             "row": row,
             "rule": rule,
-            "pattern": pattern,
+            "pattern": match["pattern"],
+            "pattern_type": match["type"],
             "ttl_words": span_words((row or {}).get("ttl_s")),
             "new_rule_ttl": DEFAULT_CACHE_RULE_TTL,
             "rules_url": f"{common.API_PREFIX}/cache/rules",

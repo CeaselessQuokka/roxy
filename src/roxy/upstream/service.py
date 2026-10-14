@@ -23,7 +23,8 @@ How it works (one fetch)
        a breaker, and (Tier 3) an AIMD slot. Nothing is committed when any of them says no.
     3. Wait for the slot in the per-worker `WaitQueue` (bounded; a canceled or evicted wait refunds the slot), never
        leaving before the slot's wall clock time (`_sleep_until_slot`: the queue's sleep is measured on another
-       clock), and re-check cooldowns after a real wait, so a cooldown opened meanwhile by another worker is still
+       clock), and re-check cooldowns after a real wait, or when a due slot's grant is older than `GRANT_FRESH_MS`
+       (the event loop resumed the request late), so a cooldown opened meanwhile by another worker is still
        honored.
     4. Send through the egress (which adds its API-shaped header profile; upstream adds only the body's
        Content-Type, a safe forwarded Accept and a cached CSRF token for write methods), with timeouts clipped to
@@ -153,6 +154,10 @@ MIN_CALL_TIME_MS: Final = 1000.0
 """A slot is never reserved so late that less than this is left of the request deadline for the call itself."""
 SLOT_TOPUP_ROUNDS: Final = 3
 """How many times `_sleep_until_slot` sleeps the rest of a wait that ended before the slot's wall clock time."""
+GRANT_FRESH_MS: Final = 5
+"""A call whose slot is already due leaves on the reservation's own cooldown check only while the grant is at most
+this old; an older grant (the event loop resumed the request late, a busy machine) is checked again first, so a 429
+another worker recorded meanwhile still holds it (plan 19.10 row 7; found by the P11 review round's gate)."""
 
 SAFE_RESPONSE_HEADERS: Final = frozenset(
     {
@@ -1338,23 +1343,28 @@ class UpstreamService:
 
     async def _wait_for_slot(self, call: _Call, routed: _Routed, state: _RunState) -> str:
         """Sleep until the reserved slot. Returns "ok", "overflow", "evicted" or "blocked"."""
-        wait_ms = routed.grant.slot_ms - self._now_ms()
+        now_ms = self._now_ms()
+        wait_ms = routed.grant.slot_ms - now_ms
         if wait_ms <= 1:
-            return "ok"
-        ticket = self.queue.enter(call.priority)
-        if ticket is None:
-            return "overflow"
-        started = self._mono()
-        try:
-            arrived = await self.queue.wait(ticket, wait_ms / 1000, self._sleep)
-            if arrived:
-                await self._sleep_until_slot(call, routed)
-        finally:
-            state.queue_wait_ms += (self._mono() - started) * 1000
-            call.trace.queue_wait_ms = state.queue_wait_ms
-        if not arrived:
-            return "evicted"
-        # While this request slept, another worker may have opened a cooldown or a breaker: honor it.
+            # Due now. A fresh grant leaves on the reservation's own check (made inside its transaction); a grant
+            # the event loop came back to late is checked again below (GRANT_FRESH_MS).
+            if now_ms - routed.grant.now_ms <= GRANT_FRESH_MS:
+                return "ok"
+        else:
+            ticket = self.queue.enter(call.priority)
+            if ticket is None:
+                return "overflow"
+            started = self._mono()
+            try:
+                arrived = await self.queue.wait(ticket, wait_ms / 1000, self._sleep)
+                if arrived:
+                    await self._sleep_until_slot(call, routed)
+            finally:
+                state.queue_wait_ms += (self._mono() - started) * 1000
+                call.trace.queue_wait_ms = state.queue_wait_ms
+            if not arrived:
+                return "evicted"
+        # Since the grant (a real wait, or a late resume), another worker may have opened a cooldown or a breaker.
         ckeys = self._ckeys(call.host, call.template, routed.egress)
         bkeys = [k for k in breaker.breaker_keys(call.host, call.template, routed.egress) if k not in routed.probe_keys]
         now_ms = self._now_ms()

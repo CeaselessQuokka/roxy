@@ -66,18 +66,21 @@
     {{ icon("search") }}<span class="search-btn__text">Search or jump to</span><span class="keys search-btn__keys"><kbd>Ctrl</kbd><kbd>K</kbd></span>
   </button>
 
-  <a class="icon-btn topbar__recs" href="{{ page_href('recommendations') }}"
-     aria-label="Recommendations: {{ rc.open or 0 }} open{% if rc.critical %}, {{ rc.critical }} critical{% endif %}">
+  {#- `data-shell-part`: static/js/shell.js swaps these from GET /admin/ui/status/parts when the state changes
+      elsewhere and the page cannot reload (findings functional-6, functional-8, functional-11). -#}
+  {% set recs_known = recs_known if recs_known is defined else true %}
+  <a class="icon-btn topbar__recs" href="{{ page_href('recommendations') }}" data-shell-part="topbar-recs"
+     aria-label="Recommendations: {% if recs_known %}{{ rc.open or 0 }} open{% if rc.critical %}, {{ rc.critical }} critical{% endif %}{% else %}counts not available right now{% endif %}">
     {{ icon("bell") }}{% if rc.open %}<span class="count-badge count-badge--dot{% if rc.critical %} count-badge--bad{% endif %}" aria-hidden="true">{{ rc.open }}</span>{% endif %}
   </a>
 
   <a class="btn btn--ghost topbar__health" href="{{ page_href('health') }}">{{ icon("heart") }}<span>Health</span></a>
 
-  <button type="button" class="btn topbar__pause{% if st.paused %} btn--bad-soft{% endif %}" data-dialog-open="dlg-pause" aria-haspopup="dialog">
+  <button type="button" class="btn topbar__pause{% if st.paused %} btn--bad-soft{% endif %}" data-dialog-open="dlg-pause" aria-haspopup="dialog" data-shell-part="topbar-pause">
     {{ icon("play" if st.paused else "pause") }}<span class="topbar__pause-long">{{ "Resume proxy" if st.paused else "Pause proxy" }}</span><span class="topbar__pause-short">{{ "Resume" if st.paused else "Pause" }}</span>
   </button>
 
-  <button type="button" class="btn topbar__limit{% if st.throttle_all %} btn--warn-soft{% endif %}" data-dialog-open="dlg-throttle-all" aria-haspopup="dialog">
+  <button type="button" class="btn topbar__limit{% if st.throttle_all %} btn--warn-soft{% endif %}" data-dialog-open="dlg-throttle-all" aria-haspopup="dialog" data-shell-part="topbar-limit">
     {{ icon("gauge") }}<span>Emergency limit</span>{% if st.throttle_all %}<span class="badge badge--warn">On</span>{% endif %}
   </button>
 

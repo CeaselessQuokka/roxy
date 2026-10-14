@@ -50,7 +50,8 @@ How it works
        whether the bodies are kept). Its caller bytes are plan 14.3's wire bytes: the request line, headers and body the
        app received, and the status line, headers (as the middleware stack rewrites them) and body it sends
        (`core/middleware.py request_head_bytes`, `response_head_bytes`). A refusal's record names the rule rows the
-       verdict matched (`refusal_matches`, the refusal event's `rules`). `message_source` tells whose words the caller
+       verdict matched (`refusal_matches`, the refusal event's `rules`) and what a request filter hit (the header, name
+       or value, and the matched text: `refusal_match_detail`). `message_source` tells whose words the caller
        got (row 116): a refusal's `custom` or `default` (a refusal the upstream layer returned, such as an egress host
        refusal, is `default`), `roxy` for a 7.13 failure text Roxy wrote, `roblox` for an error answer that carries
        Roblox's own body. An exception still propagates to the middleware, which answers 500 (or the deadline middleware
@@ -698,6 +699,25 @@ def refusal_matches(refusal: Any) -> dict[str, str] | None:
     return {str(table): str(key) for table, key in list(matches.items())[:MAX_EVENT_MATCHES]}
 
 
+MATCH_DETAIL_KEYS = ("header", "field", "text")
+"""What a request filter's refusal record keeps about its hit (`abuse/header_rules.py match_detail`)."""
+MAX_MATCH_DETAIL_CHARS = 120
+
+
+def refusal_match_detail(refusal: Any) -> dict[str, str] | None:
+    """What a request filter hit, `{header, field, text}`, for a refusal's outcome record (`Refuse.match_detail`).
+
+    The Header-Blocked Attempts tab shows it as v1's Last Header, Triggered By and Matched Text (parity row 75,
+    finding v1parity-5). The header name is caller text (bounded here and rendered as plain text by the page); the
+    text is that name or the filter's own needle, never a caller's header value. Every other outcome gives None.
+    """
+    detail = getattr(refusal, "match_detail", None) if refusal is not None else None
+    if not isinstance(detail, Mapping) or not detail:
+        return None
+    kept = {key: str(detail[key])[:MAX_MATCH_DETAIL_CHARS] for key in MATCH_DETAIL_KEYS if detail.get(key)}
+    return kept or None
+
+
 def _trace_count(result: Any, name: str) -> int:
     value = getattr(getattr(result, "trace", None), name, 0)
     return int(value) if isinstance(value, int) else 0
@@ -764,6 +784,8 @@ def build_outcome_event(
         "message_source": message_source(rendered, refusal),
         "check": str(getattr(refusal, "check", "") or "") if refusal is not None else "",
         "matches": refusal_matches(refusal),
+        # Kept once the metrics recorder's `OutcomeEvent` has the field (fields it lacks are left out below).
+        "match_detail": refusal_match_detail(refusal),
         "cache_key_id": getattr(cache_key, "id", None),
         "body_hash": fetched_body_hash(rendered, result),
     }

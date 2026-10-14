@@ -95,11 +95,28 @@ export function humanDuration(ms) {
   return parts.join(" ");
 }
 
-/** HH:MM:SS (or "Mon 14:02" with `withDay`) in the browser's time zone. */
+/**
+ * The time zone the dashboard shows times in: the admin's `timezone` preference, else the `ui_timezone` setting
+ * (`data-tz` on <body>, rendered by roxy/admin/pages/shell.py `display_tz`), so a chart, the Live tail and a table
+ * the server rendered read the same clock (review finding truth-9). Undefined (the browser's zone) only when the
+ * page names none or the browser does not know the zone.
+ */
+export function displayZone() {
+  const zone = document.body ? document.body.dataset.tz || "" : "";
+  if (!zone) return undefined;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    return zone;
+  } catch {
+    return undefined;
+  }
+}
+
+/** HH:MM:SS (or "Mon 14:02" with `withDay`) in the dashboard's time zone (`displayZone`). */
 export function fmtTime(epochSeconds, { withDay = false, withSeconds = true } = {}) {
   if (!Number.isFinite(epochSeconds)) return "n/a";
   const date = new Date(epochSeconds * 1000);
-  const options = { hour: "2-digit", minute: "2-digit", hour12: false };
+  const options = { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: displayZone() };
   if (withSeconds) options.second = "2-digit";
   if (withDay) Object.assign(options, { weekday: "short", month: "short", day: "numeric" });
   return new Intl.DateTimeFormat("en-US", options).format(date);

@@ -54,6 +54,8 @@
 .traffic-stats__item--served_cache { border-left-color: var(--series-3); }
 .traffic-stats__item--refused { border-left-color: var(--series-4); }
 .traffic-stats__item--failed { border-left-color: var(--series-8); }
+/* OPTIONS requests Roxy answered itself: shown only when the range has any (finding truth-6). */
+.traffic-stats__item--answered_locally { border-left-color: var(--series-2); }
 
 .traffic-stats__label {
   display: flex;
@@ -314,7 +316,8 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .traffic-stats__item--requests {
+  .traffic-stats__item--requests,
+  .traffic-stats__item--answered_locally {
     grid-column: 1 / -1;
   }
 

@@ -15,7 +15,8 @@ What this is
         leader publishes, plus the WAL checkpoint durations.
       * `GET /system/metrics-pipeline`: this worker's metrics queue, drops and flushes, and every database's writer
         statistics and pending operations, plus every worker's drops of the last hour; `GET /system/persistence`:
-        file and WAL sizes (parity row 85), with the disk growth history and the newest table sizes.
+        file and WAL sizes (parity row 85) with this worker's writer counts (`writers_scope: this_worker`), the disk
+        growth history and the newest table sizes.
       * `GET /system/errors` (signatures, paged, searchable, exportable) and `GET /system/errors/detail?signature=`
         (one signature with its redacted traceback).
       * `GET /system/versions` and `GET /system/environment` (the non-secret environment summary).
@@ -111,6 +112,14 @@ GROWTH_DAYS: Final = 30
 """Days of hourly disk samples the persistence card charts (SYS-DISK projects from the same 30 days)."""
 MAX_GROWTH_SAMPLES: Final = GROWTH_DAYS * 24 + 24
 """Most samples one answer carries: one an hour over `GROWTH_DAYS`, plus a day of slack (plan P9)."""
+THIS_WORKER_SCOPE: Final = "this_worker"
+"""The scope label of a value one worker holds (DESIGN 13.1: `stats_scope`, `tracker_scope`, ... = `this_worker`)."""
+WRITERS_NOTE: Final = (
+    "Writes and write errors are counted by the database writers of the worker that answered, since it started; "
+    "every worker has its own writers, so another worker's failing writer does not show here. File sizes are the "
+    "files on disk, the same for every worker."
+)
+"""Why the persistence answer's writer counts are labeled `this_worker` (finding truth-7, plan P6)."""
 
 LIBRARIES: Final = ("fastapi", "starlette", "uvicorn", "gunicorn", "httpx", "pydantic", "jinja2", "regex")
 CREDENTIAL_NAMES: Final = (
@@ -558,6 +567,9 @@ def _db_stats(db: Any) -> dict[str, Any]:
         # Writes a function refused on purpose (a leader job whose lease moved): expected, never a write error.
         "refused_writes": stats.refused,
         "unavailable": stats.unavailable,
+        # v1's PROBLEM rule: the last failure is newer than the last good write (finding v1parity-4); the counters
+        # above stay counters since the worker started.
+        "problem": stats.problem_now(),
         "busy_fast_failures": stats.fast_failures,
         "deadline_failures": stats.deadline_failures,
         "max_write_ms": round(stats.max_write_ms, 3),
@@ -616,12 +628,16 @@ async def persistence(request: Request, _admin: AdminSession) -> dict[str, Any]:
     """Database and WAL file sizes, the schema versions and each writer's health (parity row 85), with the disk
     growth history: Roxy's storage and the free disk sampled hourly by the leader over the last
     `GROWTH_DAYS` days (`metrics/read_producers.py disk_growth`, the line SYS-DISK projects) and the newest table
-    sizes (sampled every 6 hours)."""
+    sizes (sampled every 6 hours). The writer counts are this worker's (`writers_scope: this_worker`)."""
     return await persistence_view(get_ctx(request))
 
 
 async def persistence_view(ctx: Any) -> dict[str, Any]:
-    """The answer of `GET /system/persistence` (also the System page's persistence card)."""
+    """The answer of `GET /system/persistence` (also the System page's persistence card).
+
+    The file sizes are fleet facts (the files on disk); each database's `writes`, `write_errors` and the other
+    `DbStats` fields are this process's writer statistics, so the answer labels them (`writers_scope` and
+    `writers_worker_id`, with `writers_note`), as the metrics pipeline answer does with its `scope`."""
     files = await asyncio.to_thread(read_sizes.file_sizes, [Path(db.path) for db in ctx.dbs.all()])
     out = []
     for db in ctx.dbs.all():
@@ -639,6 +655,10 @@ async def persistence_view(ctx: Any) -> dict[str, Any]:
         )
     return {
         "databases": out,
+        # DESIGN 13.1: a value one worker holds is labeled. Every writer count in `databases` is this worker's own.
+        "writers_scope": THIS_WORKER_SCOPE,
+        "writers_worker_id": ctx.worker_id,
+        "writers_note": WRITERS_NOTE,
         "total_bytes": sum(f["bytes"] + f["wal_bytes"] + f["shm_bytes"] for f in files.values()),
         "growth": growth,
         "growth_days": GROWTH_DAYS,

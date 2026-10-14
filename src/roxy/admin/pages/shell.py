@@ -35,8 +35,11 @@ What to read next
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Final
 from urllib.parse import urlencode
 
@@ -56,6 +59,8 @@ from roxy.admin.pages.texts import GlossaryEntry, caller_texts, load_glossary
 from roxy.deps import get_ctx
 from roxy.insights import read_recommendations
 from roxy.metrics import queries
+
+log = logging.getLogger(__name__)
 
 GLOSSARY_STATE: Final = "admin_glossary"
 """`app.state` attribute holding the glossary loaded at startup (`roxy.admin.pages.dashboard_lifespan`)."""
@@ -177,6 +182,12 @@ def resolve_time(
     return PageTime(tr=tr, view=view, params=used, notice=notice)
 
 
+def with_notice(time: PageTime, notice: str) -> PageTime:
+    """`time` with `notice` added to what the page says about its range (shown above the cards)."""
+    text = f"{time.notice} {notice}" if time.notice else notice
+    return replace(time, notice=text, view={**time.view, "notice": text})
+
+
 # ============================================================================================ reads
 
 
@@ -192,17 +203,56 @@ class ShellFacts:
     pause_drops: int | None = None
     throttle_drops: int | None = None
     earliest: float | None = None
+    metrics_notice: str | None = None
+    """Set when the shell's metrics.db read failed: the bell and the refusal counts are then unknown (finding
+    robust-2), and the page says so instead of answering 500."""
+
+
+METRICS_UNREADABLE: Final = (
+    "Roxy could not read its metrics database just now, so the recommendations count and the refusal counts of "
+    "the banners are not shown; each card says what it could read."
+)
+EARLIEST_UNREADABLE: Final = (
+    "Roxy could not read when its oldest data begins, so All shows the last 24 hours; try again in a moment."
+)
+_read_failures = {"count": 0}
+"""How many shell reads failed in this worker (the first and every hundredth are logged, not each one)."""
+
+
+def _note_failure(what: str, exc: BaseException) -> None:
+    _read_failures["count"] += 1
+    count = _read_failures["count"]
+    if count == 1 or count % 100 == 0:
+        error = f"{type(exc).__name__}: {exc}"[:300]
+        log.warning("shell_read_failed", extra={"fields": {"read": what, "error": error, "failures": count}})
 
 
 def shell_setting_keys() -> list[str]:
     return sorted({spec.key for anchor in TOPBAR_SETTING_ANCHORS.values() for spec in registry.settings_for(anchor)})
 
 
+async def read_earliest(ctx: Any) -> tuple[float | None, str | None]:
+    """`(when the oldest data begins, None)`, or `(None, notice)` when metrics.db cannot be read: range All then
+    shows the last 24 hours with the notice, and the page still renders (plan C7: metrics degrade open; review
+    finding robust-2)."""
+    try:
+        earliest: float | None = await ctx.dbs.metrics.read(queries.earliest_data)
+    except Exception as exc:  # a damaged or unavailable metrics.db must not take every page down with it
+        _note_failure("earliest_data", exc)
+        return None, EARLIEST_UNREADABLE
+    return earliest, None
+
+
 async def read_facts(
     ctx: Any, user_id: int, *, extra_keys: Sequence[str] = (), want_earliest: bool = False
 ) -> ShellFacts:
     """The shell's control.db and metrics.db facts (one read each); `extra_keys` adds settings whose last change
-    the page's cards show (so a page with inline settings does not need a read of its own)."""
+    the page's cards show (so a page with inline settings does not need a read of its own).
+
+    The metrics.db read degrades open (plan C7, review finding robust-2): when it fails, the bell counts and the
+    banners' refusal counts are left out, `metrics_notice` says why, and the page renders its cards, each of which
+    shows its own error. A control.db failure never gets here: the session guard already answered 503.
+    """
     keys = [*shell_setting_keys(), *extra_keys]
 
     def control(conn: Any) -> tuple[Any, Any, dict[str, tuple[Any, int]], dict[str, dict[str, Any]]]:
@@ -227,7 +277,12 @@ async def read_facts(
         e = queries.earliest_data(conn) if want_earliest else None
         return rows, p, t, e
 
-    facets, pause_drops, throttle_drops, earliest = await ctx.dbs.metrics.read(metrics)
+    try:
+        facets, pause_drops, throttle_drops, earliest = await ctx.dbs.metrics.read(metrics)
+    except Exception as exc:  # degrade open (see the docstring)
+        _note_failure("shell_metrics", exc)
+        facts = ShellFacts(pause, throttle_all, pref_rows, latest, [], None, None, None, METRICS_UNREADABLE)
+        return facts
     return ShellFacts(pause, throttle_all, pref_rows, latest, facets, pause_drops, throttle_drops, earliest)
 
 
@@ -243,19 +298,28 @@ def bell_counts(facets: Sequence[Mapping[str, Any]]) -> dict[str, int]:
 # ============================================================================================ the context
 
 
-def stream_url(events: Sequence[str]) -> str:
+def stream_url(events: Sequence[str], config_version: int | None = None) -> str:
+    """The page-wide stream's URL. `config_version` is the settings version this page was rendered with: the stream
+    sends `settings_changed` at once when its own differs (a change made before the stream connected, or while it
+    was down, still reaches the page; review finding functional-5)."""
     wanted = ",".join(dict.fromkeys(events))
-    return f"{API_PREFIX}/stream?{urlencode({'events': wanted})}" if wanted else ""
+    if not wanted:
+        return ""
+    params = {"events": wanted}
+    if config_version is not None:
+        params["config_version"] = str(int(config_version))
+    return f"{API_PREFIX}/stream?{urlencode(params)}"
 
 
-def shell_urls(events: Sequence[str]) -> dict[str, Any]:
+def shell_urls(events: Sequence[str], config_version: int | None = None) -> dict[str, Any]:
     """The URLs the shell's scripts and dialogs call (base.html contract `urls`)."""
     return {
         "pause": f"{API_PREFIX}/protection/pause",
         "throttle_all": f"{API_PREFIX}/protection/throttle-all",
-        "stream": stream_url(events),
+        "stream": stream_url(events, config_version),
         "palette": "/admin/ui/palette",
         "status": "/admin/ui/status",
+        "status_parts": "/admin/ui/status/parts",
         "health_run": f"{API_PREFIX}/health/runs",
         "health_page": "/admin/health",
         "llm_export": {
@@ -270,6 +334,38 @@ def shell_urls(events: Sequence[str]) -> dict[str, Any]:
     }
 
 
+def _next_change(pause: PauseState, now: float) -> int | None:
+    """When the pause state changes by itself: the start of a scheduled window still to come, or the end of the
+    one running now (no event marks those moments, so the page checks again then; finding functional-6)."""
+    start, end = pause.scheduled_start, pause.scheduled_end
+    if start is None or end is None:
+        return None
+    if now < start:
+        return int(start)
+    if now < end:
+        return int(end)
+    return None
+
+
+def state_digest(pause: PauseState, throttle_all: ThrottleAllState, settings: Any, now: float) -> str:
+    """A short digest of everything the banners, the top bar buttons and the control dialogs print: both switches,
+    the emergency limit and period, the reasons, the scheduled window and the caller texts. Any change elsewhere
+    (another admin raising the limit, a new message, a window starting) changes it, so `static/js/shell.js` notices
+    (review finding functional-6: the old `p0t1` signature only knew the two switches)."""
+    texts = caller_texts(pause, throttle_all, now=now, pause_message_default=settings.get("pause_message_default"))
+    printed = {
+        "paused": pause.active(now),
+        "throttle_all": throttle_all.enabled,
+        "limit": int(settings.int("global_throttle_limit")),
+        "period": int(settings.int("global_throttle_period")),
+        "pause_reason": pause.reason,
+        "throttle_reason": throttle_all.reason,
+        "window": [pause.scheduled_start, pause.scheduled_end, pause.scheduled_reason],
+        "texts": texts,
+    }
+    return hashlib.sha256(json.dumps(printed, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
 def status_view(ctx: Any, facts: ShellFacts, *, tz: str) -> dict[str, Any]:
     """The `status` context of banners.html, topbar.html and control_dialogs.html."""
     settings = ctx.settings
@@ -278,13 +374,19 @@ def status_view(ctx: Any, facts: ShellFacts, *, tz: str) -> dict[str, Any]:
     paused = pause.active(now)
     since = pause.active_since(now) if paused else 0.0
     limit_since = throttle_all.since if throttle_all.enabled else 0.0
+    window_running = pause.in_scheduled_window(now)
     return {
         "paused": paused,
         "paused_since": fmt.since_text(since, now, tz),
         "paused_since_iso": fmt.iso(since),
         "pause_reason": pause.reason,
         "pause_drops": facts.pause_drops or 0,
+        "drops_known": facts.metrics_notice is None,
         "scheduled": pause.scheduled_start is not None and pause.scheduled_end is not None,
+        # A scheduled maintenance window running now (finding functional-2: the banner and Resume name it).
+        "window_running": window_running,
+        "window_ends": fmt.local_time(pause.scheduled_end, tz, seconds=False) if window_running else "",
+        "window_ends_iso": fmt.iso(pause.scheduled_end or 0) if window_running else "",
         "throttle_all": throttle_all.enabled,
         "throttle_all_since": fmt.since_text(limit_since, now, tz),
         "throttle_all_since_iso": fmt.iso(limit_since),
@@ -293,6 +395,8 @@ def status_view(ctx: Any, facts: ShellFacts, *, tz: str) -> dict[str, Any]:
         "throttle_reason": throttle_all.reason,
         "throttle_drops": facts.throttle_drops or 0,
         "signature": f"p{int(paused)}t{int(throttle_all.enabled)}",
+        "digest": state_digest(pause, throttle_all, settings, now),
+        "next_change": _next_change(pause, now),
         **caller_texts(pause, throttle_all, now=now, pause_message_default=settings.get("pause_message_default")),
     }
 
@@ -340,8 +444,9 @@ async def build_shell(
     settings = ctx.settings
     pref_values = prefs.effective(facts.pref_rows, default_theme=prefs.default_theme_of(settings))
     opening_range = default_range or str(pref_values.get("default_range") or DEFAULT_RANGE)
+    earliest_notice = EARLIEST_UNREADABLE if want_earliest and facts.metrics_notice else None
     if not want_earliest and opening_range == "all" and not query.get("range"):
-        facts.earliest = await ctx.dbs.metrics.read(queries.earliest_data)
+        facts.earliest, earliest_notice = await read_earliest(ctx)
     window_tz = str(settings.get("ui_timezone") or "UTC")
     time = resolve_time(
         query,
@@ -351,6 +456,8 @@ async def build_shell(
         default_range=opening_range,
         default_compare=str(pref_values.get("compare") or "none"),
     )
+    if earliest_notice and time.view.get("range") == "all":
+        time = with_notice(time, earliest_notice)
     tz = display_tz(ctx, pref_values)
     snapshot = settings.snapshot()
     dialog_settings = {
@@ -378,7 +485,9 @@ async def build_shell(
         "time": time.view,
         "status": status_view(ctx, facts, tz=tz),
         "recs": bell_counts(facts.facets),
-        "urls": shell_urls(stream_events),
+        "recs_known": facts.metrics_notice is None,
+        "shell_notice": facts.metrics_notice,
+        "urls": shell_urls(stream_events, int(getattr(settings, "version", 0) or 0)),
         "glossary": glossary_of(request),
         "dialog_settings": dialog_settings,
         "env_name": str(getattr(ctx.env, "env", "production")),
@@ -390,15 +499,48 @@ async def build_shell(
 
 
 async def status_signature(ctx: Any) -> dict[str, Any]:
-    """`{paused, throttle_all, signature}` for `GET /admin/ui/status` (the shell's change check)."""
+    """`{paused, throttle_all, signature, digest, next_change}` for `GET /admin/ui/status` (the shell's change
+    check): `signature` names the two switches, `digest` everything the shell prints about them (`state_digest`)."""
 
     def control(conn: Any) -> tuple[Any, Any]:
         return read_state_value(conn, PAUSE_KEY), read_state_value(conn, THROTTLE_ALL_KEY)
 
     raw_pause, raw_throttle = await ctx.dbs.control.read(control)
-    paused = PauseState.from_json(raw_pause).active(ctx.clock.now())
-    limited = ThrottleAllState.from_json(raw_throttle).enabled
-    return {"paused": paused, "throttle_all": limited, "signature": f"p{int(paused)}t{int(limited)}"}
+    now = ctx.clock.now()
+    pause = PauseState.from_json(raw_pause)
+    throttle_all = ThrottleAllState.from_json(raw_throttle)
+    paused = pause.active(now)
+    limited = throttle_all.enabled
+    return {
+        "paused": paused,
+        "throttle_all": limited,
+        "signature": f"p{int(paused)}t{int(limited)}",
+        "digest": state_digest(pause, throttle_all, ctx.settings, now),
+        "next_change": _next_change(pause, now),
+    }
+
+
+async def status_parts_context(request: Request, principal: AdminPrincipal) -> dict[str, Any]:
+    """The context of `admin/_layout/status_parts.html`: the shell's top bar controls, banners and control
+    dialogs as they are now, for `GET /admin/ui/status/parts`. `static/js/shell.js` swaps them into a page that
+    cannot reload (an unsaved edit, an open dialog, a reload the admin refused), so the page never offers Pause
+    while the proxy is paused (review findings functional-6 and functional-8)."""
+    ctx = get_ctx(request)
+    facts = await read_facts(ctx, principal.user_id)
+    pref_values = prefs.effective(facts.pref_rows, default_theme=prefs.default_theme_of(ctx.settings))
+    tz = display_tz(ctx, pref_values)
+    snapshot = ctx.settings.snapshot()
+    return {
+        "status": status_view(ctx, facts, tz=tz),
+        "urls": shell_urls(DEFAULT_STREAM_EVENTS),
+        "dialog_settings": {
+            name: inline.card_settings(anchor, snapshot, facts.latest, tz=tz, prefix=f"set-{name.replace('_', '-')}")
+            for name, anchor in TOPBAR_SETTING_ANCHORS.items()
+            if name == "pause" or name == "throttle_all"
+        },
+        "recs": bell_counts(facts.facets),
+        "recs_known": facts.metrics_notice is None,
+    }
 
 
 async def load_glossary_into(app: Any) -> dict[str, GlossaryEntry]:
@@ -411,7 +553,9 @@ async def load_glossary_into(app: Any) -> dict[str, GlossaryEntry]:
 __all__ = [
     "COMPARE_LABELS",
     "DEFAULT_STREAM_EVENTS",
+    "EARLIEST_UNREADABLE",
     "GLOSSARY_STATE",
+    "METRICS_UNREADABLE",
     "RANGE_LABELS",
     "TIME_PARAMS",
     "TOPBAR_SETTING_ANCHORS",
@@ -423,11 +567,15 @@ __all__ = [
     "display_tz",
     "glossary_of",
     "load_glossary_into",
+    "read_earliest",
     "read_facts",
     "resolve_time",
     "shell_setting_keys",
     "shell_urls",
+    "state_digest",
+    "status_parts_context",
     "status_signature",
     "status_view",
     "stream_url",
+    "with_notice",
 ]

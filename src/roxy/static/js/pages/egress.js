@@ -23,7 +23,7 @@
  */
 
 import { el } from "roxy/dom";
-import { getJSON, refreshCard, request, toast } from "roxy/page";
+import { getJSON, localTime, refreshCard, request, toast } from "roxy/page";
 
 async function verify(button) {
   const url = button.dataset.probeUrl;
@@ -73,7 +73,7 @@ async function reveal(button) {
           el("td", { "data-label": "From", text: String(item.source || "") }),
           el("td", {
             "data-label": "When",
-            text: Number.isFinite(item.at) ? new Date(item.at * 1000).toLocaleString("en-US") : "n/a",
+            text: Number.isFinite(item.at) ? localTime(item.at) : "n/a",  // the dashboard's zone (truth-9)
           }),
         ])));
       }

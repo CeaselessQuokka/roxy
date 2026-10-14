@@ -45,6 +45,10 @@ How it works
       decisions are made on one read of the recommendation, and the action compares the same digest again inside
       its lease (`expected_digest`), so an evaluation that rewrites the proposal in between is refused (409), never
       applied without its confirmation or second factor (P4).
+    * An apply that switches the admin allowlist on is held to the settings writers' lockout rule (finding authz-2,
+      `lockout_check`): refused (422 `validation_failed`) when no entry would exist, and 422
+      `confirmation_required` without `confirm_lockout` when the acting admin's address is on no entry, counting
+      the entries the recommendation itself adds (SEC-ADMIN-ALLOWLIST adds the login networks it saw first).
     * Another action holding the recommendation is 409 `wrong_state`; a hot.db that cannot be written is 503
       `unavailable` with `Retry-After` (C7), never "another request".
     * The dry run replays up to `simulate.MAX_SAMPLES` samples in pure Python, so it runs on a worker thread with
@@ -61,6 +65,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import ipaddress
 import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
@@ -84,6 +89,7 @@ from roxy.admin.api.common import (
     request_id_of,
     table_params,
 )
+from roxy.admin.auth.allowlist import allowlist_enabled, in_admin_allowlist
 from roxy.admin.auth.deps import AdminPrincipal
 from roxy.config import catalog, read_settings
 from roxy.config.constants import MAX_REASON_LENGTH
@@ -102,6 +108,7 @@ from roxy.insights.models import (
     SEVERITIES,
     SNOOZE_DURATIONS_S,
     STATES,
+    ProposedChange,
     Recommendation,
     changes_digest,
 )
@@ -571,6 +578,56 @@ def risky_keys(items: Iterable[PreviewItem]) -> list[str]:
     return out
 
 
+def _added_admin_networks(changes: Iterable[ProposedChange]) -> list[str]:
+    """The admin allowlist entries (`access_list` rows of kind `allow_admin`) a recommendation's changes add."""
+    out: list[str] = []
+    for change in changes:
+        row = change.proposed if isinstance(change.proposed, Mapping) else {}
+        if change.kind == "rule_upsert" and change.table == "access_list" and str(row.get("kind")) == "allow_admin":
+            out.append(str(row.get("cidr") or ""))
+    return out
+
+
+def _inside(ip: str, networks: Iterable[str]) -> bool:
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for network in networks:
+        try:
+            if address in ipaddress.ip_network(network, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def lockout_check(ctx: Any, admin: AdminPrincipal, changes: Sequence[ProposedChange], *, confirm_lockout: bool) -> None:
+    """Refuse an apply that would switch the admin allowlist on and shut the acting admin out (finding authz-2; the
+    rule `settings.WriteRules` applies to every other settings writer). The entries the recommendation adds count:
+    SEC-ADMIN-ALLOWLIST adds the networks of the admin logins it saw before it switches the allowlist on, so its
+    apply passes from those networks and asks for `confirm_lockout` from any other."""
+    turns_on = any(
+        change.kind == "setting" and change.key == settings_api.ALLOWLIST_KEY and bool(change.proposed)
+        for change in changes
+    )
+    if not turns_on or allowlist_enabled(ctx):
+        return
+    added = _added_admin_networks(changes)
+    ip = str(admin.ip or "")
+    try:
+        listed = bool(added) or len(ctx.rules.snapshot.access.allow_admin) > 0
+    except (AttributeError, TypeError):
+        listed = True  # no rules snapshot: the address check below decides
+    if not listed:
+        message = settings_api.EMPTY_ALLOWLIST_MESSAGE
+        raise common.validation_error({settings_api.ALLOWLIST_KEY: message}, message)
+    if in_admin_allowlist(ctx, ip) or _inside(ip, added) or confirm_lockout:
+        return
+    message = settings_api.LOCKOUT_MESSAGE
+    raise common.validation_error({settings_api.ALLOWLIST_KEY: message}, message, code="confirmation_required")
+
+
 def preview_item(item: PreviewItem) -> dict[str, Any]:
     out = item.to_dict()
     out["before"] = safe_value(item.target, item.before)
@@ -747,6 +804,8 @@ class ApplyBody(ApiBody):
     changes_digest: str = Field(pattern=r"^[0-9a-f]{16}$")
     reason: str = Field(default="", max_length=MAX_REASON_LENGTH)
     confirm_high_risk: bool = False
+    confirm_lockout: bool = False
+    """Switch the admin allowlist on although the acting admin's address is on no entry (`lockout_check`)."""
 
 
 class ReasonBody(ApiBody):
@@ -1189,6 +1248,7 @@ async def apply(
             {}, "This recommendation proposes no change; there is nothing to apply.", code="nothing_to_apply"
         )
     reason = settings_api.check_risk(risky_keys(items), reason=body.reason, confirmed=body.confirm_high_risk)
+    lockout_check(get_ctx(request), admin, rec.changes, confirm_lockout=body.confirm_lockout)
     # The risk and second factor decisions above hold for this digest only; the action checks it again inside the
     # recommendation's lease, after any evaluation that rewrote the proposal (409 changed_since_preview then).
     result: ActionResult = await _act(
@@ -1302,6 +1362,7 @@ __all__ = [
     "history_answer",
     "list_answer",
     "list_filters",
+    "lockout_check",
     "preview_answer",
     "risky_keys",
     "router",

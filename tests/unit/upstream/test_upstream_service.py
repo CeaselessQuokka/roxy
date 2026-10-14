@@ -381,6 +381,42 @@ async def test_a_call_never_leaves_before_its_slot(dbs: Any, rules: Any) -> None
     assert all(gap >= spacing - 2 for gap in gaps), (gaps, spacing)  # never 10 percent early
 
 
+async def test_a_grant_gone_stale_is_checked_again_before_the_call_leaves(
+    service: UpstreamService, egress: FakeEgress, ctx: Any, clock: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan 19.10 row 7 (found by the P11 review round's gate): the reservation checks the cooldowns inside its own
+    transaction, but on a busy machine the event loop may resume the request well after that. A 429 another worker
+    recorded meanwhile must still hold the call, also when its slot is already due (no queue wait): a grant older than
+    `GRANT_FRESH_MS` is checked again before the call leaves."""
+    real_write = ctx.dbs.hot.write
+    key = f"endpoint:{TEMPLATE}:direct"
+    writes = 0
+
+    def another_workers_429(conn: Any) -> None:
+        now_ms = clock.now_ms()
+        conn.execute(
+            "INSERT INTO cooldown (key, until_ms, source, set_at, hits) VALUES (?, ?, 'retry_after', ?, 1)",
+            (key, now_ms + 30_000, now_ms / 1000),
+        )
+
+    async def reservation_then_a_late_resume(fn: Any, **kwargs: Any) -> Any:
+        nonlocal writes
+        writes += 1
+        result = await real_write(fn, **kwargs)
+        if writes == 1:  # the reservation committed; another worker records a 429 before this request runs again
+            ctx.dbs.hot.write_sync(another_workers_429)
+            clock.advance(0.2)  # and the event loop resumes the request 200 ms later
+        return result
+
+    egress.disabled.add(Egress.ROTATOR)  # otherwise the rotator would serve while direct cools down
+    monkeypatch.setattr(ctx.dbs.hot, "write", reservation_then_a_late_resume)
+    result = await fetch(service)
+    assert egress.calls == []  # the call never left
+    assert result.reason is ReasonCode.UPSTREAM_COOLDOWN
+    assert result.retry_after_s is not None
+    assert result.retry_after_s > 20  # the other worker's cooldown, not a guess
+
+
 async def test_429_fallback_on_429_uses_other_anonymous_egress(
     service: UpstreamService, egress: FakeEgress, settings: Any
 ) -> None:

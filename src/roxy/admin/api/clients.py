@@ -76,6 +76,7 @@ from roxy.admin.api.common import (
     add_caller_text,
     area_router,
     export_pages,
+    fields_named,
     not_found,
     request_id_of,
     run_mutation,
@@ -85,7 +86,7 @@ from roxy.admin.api.common import (
     unavailable,
     validation_error,
 )
-from roxy.admin.api.protection import audit_reason
+from roxy.admin.api.protection import BAN_FIELDS, audit_reason
 from roxy.admin.auth.deps import AdminPrincipal
 from roxy.config.constants import MAX_REASON_LENGTH
 from roxy.core.client_ip import limit_key
@@ -610,9 +611,13 @@ async def _ban_action(
         "reason_text": body.message,
         "expires_at": expires_at,
     }
-    change = await run_mutation(
-        _rules(ctx).create("bans", row, actor_for(admin), audit_reason(body.reason), request_id=request_id_of(request))
-    )
+    # A refused message names the body's `message`, the field the client drawer's ban dialog has (functional-4).
+    with fields_named(BAN_FIELDS):
+        change = await run_mutation(
+            _rules(ctx).create(
+                "bans", row, actor_for(admin), audit_reason(body.reason), request_id=request_id_of(request)
+            )
+        )
     answer = _change(change)
     answer["ban"] = ban_view(change.after, int(ctx.clock.now())) if change.after else None
     answer["extended_existing"] = change.action == "update"

@@ -68,6 +68,14 @@ a:hover {
   text-decoration: underline;
 }
 
+/* A link inside running text is underlined, so it is told apart from the words around it by more than hue (WCAG
+   1.4.1; review finding a11y-10: a muted sentence's link was 1.04:1 against it). Links styled as controls (a class
+   of their own: buttons, menu items, nav links) keep their own look. */
+:where(p, dd, li, td, .setting__related) a:not([class]) {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+}
+
 code, kbd, pre, samp, .mono {
   font-family: var(--font-mono);
   font-size: 0.92em;
@@ -314,9 +322,7 @@ hr {
 .nav-link__label {
   flex: 1;
   min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;  /* wraps under bigger text or text spacing instead of being cut (WCAG 1.4.12, a11y-14) */
 }
 
 .sidebar__foot {

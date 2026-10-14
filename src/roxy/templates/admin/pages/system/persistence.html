@@ -5,21 +5,23 @@
   WAL and the health of its writer (v1's Persistence tile said PROBLEM when writing failed; so does this card), the
   disk growth of the last 30 days (one sample an hour from the leader) drawn by static/js/charts.js from the answer
   embedded here, with its data table, and the largest tables of the newest size sample. The files table has the id
-  `storage`: health checks link to /admin/system#storage.
+  `storage`: health checks link to /admin/system#storage. The sizes are the files on disk (the same for every
+  worker); the writer counts (Writes, Write errors) and the status line are this worker's own (`answer.writers_scope`
+  is `this_worker`, DESIGN 13.1), so the card says "this worker" wherever it shows them (finding truth-7).
   Context: `frame`, `answer`, `databases`, `problems`, `series`, `largest`, `tables_count`, `tables_sampled`.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/format.html" import num, bytes as fmt_bytes %}
 {% from "components/chart.html" import series_chart %}
 {% from "components/alert.html" import inline_alert %}
-{% from "components/badges.html" import status_badge %}
+{% from "components/badges.html" import badge, status_badge %}
 {% from "admin/pages/system/_macros.html" import when %}
 {% call page_card(frame, subtitle="Database files: " ~ fmt_bytes(answer.total_bytes) ~ " in all") %}
 <div class="stack">
-  <p class="system-status">{% if problems %}{{ status_badge("bad", "Problem") }} Writing failed recently for {{ problems|join(", ") }}; see the error log and the metrics pipeline.{% else %}{{ status_badge("ok", "OK") }} Every database writer is writing without errors.{% endif %}</p>
+  <p class="system-status">{% if problems %}{{ status_badge("bad", "Problem") }} Writing failed recently in this worker for {{ problems|join(", ") }}; see the error log and the metrics pipeline.{% else %}{{ status_badge("ok", "OK") }} Every database writer is writing without errors in this worker.{% endif %} {{ badge("this worker", "neutral") }}</p>
   <div class="table-scroll system-stack-wrap" id="storage" role="region" aria-labelledby="storage-caption" tabindex="0">
     <table class="simple-table system-stack">
-      <caption class="system-caption" id="storage-caption">Database files</caption>
+      <caption class="system-caption" id="storage-caption">Database files, with the writes of this worker</caption>
       <thead><tr><th scope="col">File</th><th scope="col" class="num">Size</th><th scope="col" class="num">WAL</th><th scope="col" class="num">Shared memory</th><th scope="col" class="num">Writes</th><th scope="col" class="num">Write errors</th></tr></thead>
       <tbody>
         {% for db in databases %}
@@ -35,6 +37,7 @@
       </tbody>
     </table>
   </div>
+  <p class="muted">{{ answer.writers_note }}</p>
   {% if series %}
   {{ series_chart("system-disk-growth", "Disk over the last " ~ answer.growth_days ~ " days", series=series, kind="line", y_format="bytes",
                   summary="Roxy's storage and the free disk, one sample an hour", help=answer.growth_note) }}

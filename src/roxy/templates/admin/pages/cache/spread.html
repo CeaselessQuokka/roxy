@@ -48,7 +48,7 @@
             <button type="submit" class="btn btn--sm btn--warn-soft" data-action="cache-spread-ignore">{{ icon("filter") }}<span>Ignore</span><span class="sr-only"> {{ g.suspect_param }}</span></button>
           </form>
           {% endif %}
-          <button type="button" class="btn btn--sm btn--ghost" data-dialog-open="dlg-cache-purge" data-fill='{{ {"scope": "pattern", "type": "glob", "value": g.purge_pattern, "_label": "every stored answer for " ~ g.purge_pattern}|tojson }}' data-action="cache-spread-purge">{{ icon("x-circle") }}<span>Purge</span></button>
+          {% if g.purge_pattern %}<button type="button" class="btn btn--sm btn--ghost" data-dialog-open="dlg-cache-purge" data-fill='{{ {"scope": "pattern", "type": g.purge_type or "glob", "value": g.purge_pattern, "_label": "every stored answer for " ~ g.path}|tojson }}' data-action="cache-spread-purge">{{ icon("x-circle") }}<span>Purge</span></button>{% endif %}
         </td>
       </tr>
       {% endfor %}

@@ -34,6 +34,8 @@
 
 const MAX_TOKEN_LENGTH = 512;
 const MAX_ERROR_BODY = 4096;
+const SESSION_URL = "/admin/api/v1/auth/session";
+const SESSION_CHANNEL = "roxy-session";
 
 export function csrfToken() {
   const meta = document.querySelector('meta[name="csrf-token"]');
@@ -53,6 +55,67 @@ export function setCsrfToken(token) {
   }
   meta.setAttribute("content", token);
   return true;
+}
+
+// Every dashboard tab of this browser shares one session cookie, so a re-authentication in one tab rotates the
+// session (and the CSRF secret derived from it) for all of them (review finding authz-1). The tab that rotated it
+// tells the others its new token on this same-origin channel; each one also reconnects its event stream.
+let channel = null;
+try {
+  channel = typeof BroadcastChannel === "function" ? new BroadcastChannel(SESSION_CHANNEL) : null;
+} catch {
+  channel = null;  // a browser without the channel still recovers through the 403 retry below
+}
+if (channel) {
+  channel.addEventListener("message", (event) => {
+    const data = event.data || {};
+    if (data.type === "rotated" && setCsrfToken(data.token)) {
+      document.dispatchEvent(new CustomEvent("roxy:session-rotated", { detail: { source: "another tab" } }));
+    }
+  });
+}
+
+/** This tab rotated the session (a fresh second factor): take the new token, tell the other tabs, reconnect. */
+export function sessionRotated(token) {
+  if (!setCsrfToken(token)) return;
+  if (channel) {
+    try {
+      channel.postMessage({ type: "rotated", token });
+    } catch {
+      /* the other tabs then recover through the 403 retry */
+    }
+  }
+  document.dispatchEvent(new CustomEvent("roxy:session-rotated", { detail: { source: "this tab" } }));
+}
+
+/** Ask the server for this session's current masked CSRF token (`GET /auth/session`, which does not extend the
+ *  session); true when the page's token was replaced with a different one. */
+export async function refreshCsrfToken() {
+  const before = csrfToken();
+  try {
+    const response = await fetch(document.body.dataset.sessionUrl || SESSION_URL, {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "error",
+    });
+    if (!response.ok) return false;
+    const body = await response.json().catch(() => ({}));
+    return Boolean(body && typeof body.CsrfToken === "string" && setCsrfToken(body.CsrfToken) && before !== body.CsrfToken);
+  } catch {
+    return false;
+  }
+}
+
+/** True when a 403 answer is the CSRF check's (`forbidden`), the one a token from before a rotation gets. */
+function isCsrfRefusal(status, bodyText) {
+  if (status !== 403 || !bodyText || bodyText.length > MAX_ERROR_BODY) return false;
+  try {
+    const data = JSON.parse(bodyText);
+    return Boolean(data && data.error && data.error.code === "forbidden");
+  } catch {
+    return false;
+  }
 }
 
 export function signalUnauthorized(source) {
@@ -106,23 +169,33 @@ export function localAdminHref(href) {
   return url.pathname + url.search + url.hash;
 }
 
-/** fetch() for the admin API: same origin, CSRF header on writes, 401 and re-auth answers reported once. */
+/** fetch() for the admin API: same origin, CSRF header on writes, 401 and re-auth answers reported once. A write
+ *  refused by the CSRF check (`forbidden`) is sent once more with the session's current token: the token of a page
+ *  opened before another tab re-authenticated is out of date, and nothing was done the first time (authz-1). */
 export async function request(url, { method = "GET", body, headers = {}, signal, accept = "application/json" } = {}) {
   const upper = method.toUpperCase();
-  const finalHeaders = { Accept: accept, ...headers };
-  if (upper !== "GET" && upper !== "HEAD") {
-    const token = csrfToken();
-    if (token) finalHeaders["X-CSRF-Token"] = token;
+  const unsafe = upper !== "GET" && upper !== "HEAD";
+  const send = () => {
+    const finalHeaders = { Accept: accept, ...headers };
+    if (unsafe) {
+      const token = csrfToken();
+      if (token) finalHeaders["X-CSRF-Token"] = token;
+    }
+    return fetch(url, {
+      method: upper,
+      body,
+      headers: finalHeaders,
+      credentials: "same-origin",
+      redirect: "error",
+      cache: "no-store",
+      signal,
+    });
+  };
+  let response = await send();
+  if (unsafe && response.status === 403 && (typeof body === "string" || body === undefined || body === null)) {
+    const text = await response.clone().text().catch(() => "");
+    if (isCsrfRefusal(403, text) && (await refreshCsrfToken())) response = await send();
   }
-  const response = await fetch(url, {
-    method: upper,
-    body,
-    headers: finalHeaders,
-    credentials: "same-origin",
-    redirect: "error",
-    cache: "no-store",
-    signal,
-  });
   if (response.status === 401) signalUnauthorized(url);
   if (response.status === 403) {
     // Read a copy of the body, so the caller can still read the original.

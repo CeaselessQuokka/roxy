@@ -344,7 +344,8 @@ async def persistence_card(view: PageView) -> dict[str, Any]:
     """Database files, writer health, disk growth and the largest tables (`persistence_view`)."""
     answer = await system_api.persistence_view(view.ctx)
     databases = answer.get("databases") or []
-    problems = [db["db"] for db in databases if int(db.get("write_errors") or 0) or int(db.get("unavailable") or 0)]
+    # v1's rule: a problem only while the last failure is newer than the last good write (finding v1parity-4).
+    problems = [db["db"] for db in databases if db.get("problem")]
     tables = (answer.get("table_sizes") or {}).get("tables") or {}
     largest = sorted(tables.items(), key=lambda item: int(item[1] or 0), reverse=True)[:MAX_TABLE_SIZES]
     sampled = (answer.get("table_sizes") or {}).get("at")

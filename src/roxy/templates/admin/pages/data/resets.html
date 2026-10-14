@@ -47,13 +47,14 @@
       <p class="field__hint" id="reset-scope-desc" data-reset-scope-desc>{% for s in scopes if s.scope == scope %}{{ s.description }}{% endfor %}</p>
     </div>
 
-    <fieldset class="data-fieldset" {{ scoped("families") }}>
+    {#- The error box is named by its fieldset, so a screen reader reads a 422 with the group (finding a11y-18). -#}
+    <fieldset class="data-fieldset" {{ scoped("families") }} aria-describedby="reset-families-error">
       <legend class="data-fieldset__legend">Metric families</legend>
       <p class="field__hint">Each family is the data one card shows. A narrower family clears only part of its parent, as v1's separate Clear buttons did.</p>
       <ul class="data-families" role="list">
         {% for f in families %}{{ family_item(f) }}{% endfor %}
       </ul>
-      <p class="field__error" data-field-error="families" hidden></p>
+      <p class="field__error" id="reset-families-error" data-field-error="families" hidden></p>
     </fieldset>
 
     <fieldset class="data-fieldset" {{ scoped("range") }}>

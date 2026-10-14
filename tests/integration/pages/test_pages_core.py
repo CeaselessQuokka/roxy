@@ -273,7 +273,17 @@ async def test_banners_and_dialogs_say_what_callers_get_from_the_live_setting(pa
     assert "Back after the upgrade." in banner.text()
     assert doc.select_one("body").get("data-status-sig") == "p1t0"
     status = await page.get("/admin/ui/status")
-    assert status.json() == {"paused": True, "throttle_all": False, "signature": "p1t0"}
+    # `digest` is everything the shell prints about the switches, the same as the page was drawn with; no scheduled
+    # window, so nothing changes by itself (`next_change`; review findings functional-6 and functional-8).
+    digest = doc.select_one("body").get("data-status-digest")
+    assert digest
+    assert status.json() == {
+        "paused": True,
+        "throttle_all": False,
+        "signature": "p1t0",
+        "digest": digest,
+        "next_change": None,
+    }
     dialog = doc.select_one("#dlg-pause form")
     assert dialog.get("data-api-url") == "/admin/api/v1/protection/pause"
     assert dialog.select_one('input[name="paused"]').get("value") == "false"

@@ -28,6 +28,7 @@ import { getJSON, postJSON, request } from "roxy/net";
 import { submitApiForm } from "roxy/api_forms";
 import { confirmIdentity } from "roxy/reauth";
 import { copyTextFrom, downloadFrom } from "roxy/exports";
+import { displayZone } from "roxy/format";
 import { toast } from "roxy/toast";
 
 /** Run `fn(element)` for every element matching `selector`, now and in content htmx swaps in later. */
@@ -59,9 +60,17 @@ export function pageParams() {
   return new URLSearchParams(window.location.search);
 }
 
+/** Date and time text in the dashboard's time zone (the admin's preference, else `ui_timezone`; finding truth-9),
+ *  like every time the server renders: `localTime(epochSeconds)`; `options` are Intl.DateTimeFormat options. */
+export function localTime(epochSeconds, options = { dateStyle: "medium", timeStyle: "short" }) {
+  if (typeof epochSeconds !== "number" || !Number.isFinite(epochSeconds)) return "n/a";
+  return new Intl.DateTimeFormat("en-US", { ...options, timeZone: displayZone() }).format(new Date(epochSeconds * 1000));
+}
+
 export {
   confirmIdentity,
   copyTextFrom,
+  displayZone,
   downloadFrom,
   getJSON,
   openDrawerFrom,

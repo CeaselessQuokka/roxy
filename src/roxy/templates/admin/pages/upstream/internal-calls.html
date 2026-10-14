@@ -6,12 +6,13 @@
   internal-calls`). Not-called sites come first, as in v1.
   Context: `frame`, `items`, `note`.
 -#}
-{% from "components/page_card.html" import page_card %}
+{% from "components/page_card.html" import page_card, family_reset %}
 {% from "components/badges.html" import help_dot %}
 {% from "components/badges.html" import status_badge %}
 {% from "components/format.html" import num, caller_text %}
 {% from "components/pieces.html" import when %}
-{% call page_card(frame, subtitle=note) %}
+{#- v1's "Clear data" of Internal Requests: the plan 6.8 family `internal_calls` (finding v1parity-8). -#}
+{% call page_card(frame, actions=family_reset("internal_calls", "internal call records"), subtitle=note) %}
 <div class="table-scroll g3-scroll" role="region" aria-labelledby="internal-caption" tabindex="0">
   <table class="simple-table g3-table g3-table--wrap g3-table--stack">
     <caption id="internal-caption" class="sr-only">Roxy's own calls to Roblox</caption>

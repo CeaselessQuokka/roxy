@@ -16,7 +16,8 @@
  * How it works
  *   `POST /admin/api/v1/auth/reauth` with `{method: "totp" | "recovery", code}` and the CSRF header. A 200 answer
  *   rotates the session and carries a new masked `CsrfToken`, which replaces the page's token at once (net.js
- *   `setCsrfToken`), so the retried request is accepted. A wrong code is the uniform 404 of every second factor
+ *   `sessionRotated`: the other tabs get it too and every event stream reconnects with the new cookie), so the
+ *   retried request is accepted and no open page is signed out (review finding authz-1). A wrong code is the uniform 404 of every second factor
  *   failure; a 429 is the lockout. The dialog opens on top of an open dialog without closing it (dialog.js), so a
  *   half-filled form survives.
  *
@@ -27,7 +28,7 @@
 import htmx from "roxy/htmx_setup";
 import { qs } from "roxy/dom";
 import { closeDialog, openDialog } from "roxy/dialog";
-import { errorMessage, postJSON, setCsrfToken } from "roxy/net";
+import { errorMessage, postJSON, sessionRotated } from "roxy/net";
 import { toast } from "roxy/toast";
 
 let pending = null;
@@ -88,7 +89,9 @@ async function submit(form) {
   }
   if (response.ok) {
     const body = await response.json().catch(() => ({}));
-    if (body && typeof body.CsrfToken === "string") setCsrfToken(body.CsrfToken);
+    // The session rotated: this tab takes the new token, the other tabs hear of it, and the event streams
+    // reconnect with the new cookie instead of being signed out (net.js `sessionRotated`, finding authz-1).
+    if (body && typeof body.CsrfToken === "string") sessionRotated(body.CsrfToken);
     toast("Confirmed. Carrying on with what you asked.", { tone: "ok" });
     finish(true);
     return;

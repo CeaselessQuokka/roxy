@@ -380,7 +380,11 @@ _PAGES: Final[tuple[PageSpec, ...]] = (
             _c("throttle", "Throttle", "The per-IP limit, who is throttled now and the history.", settings_open=True),
             _c("ladder", "Ladder", "Escalating penalties for repeat offenders."),
             _c("strikes", "Strike board", "Callers with strikes against them, and forgiving them."),
-            _c("throttle-all", "Emergency limit", "The throttle-all switch and who it refuses right now."),
+            _c(
+                "throttle-all",
+                "Emergency limit",
+                "The throttle-all switch and who it turned away since it was switched on.",
+            ),
             _c("limits", "Request limits", "Flood limit and size limits on requests.", settings_open=True),
             _c("places", "Place limits", "Limits per experience (Roblox-Id).", settings_open=True),
             _c("bans", "Bans", "Bans in force, made by hand or by a detector."),

@@ -19,14 +19,16 @@ Why it exists
     Plan 13.1: one click runs every check, results stream in, runs are stored, compared and exported; plan 14.8: the
     owner runs it from a phone. Page routes only read: the Run button posts to `POST /admin/api/v1/health/runs` and
     the exports are the API's (audited) downloads. Plan P6: every card reads through the Health API's own functions
-    (`run_answer`, `latest_run_id`, `compare_answer`, `runs_table`, `run_filters`, `checks_catalog`).
+    (`run_answer`, `latest_run_id`, `compare_answer`, `runs_table`, `run_filters`, `window_filter`,
+    `checks_catalog`).
 
 How it works
     `page = Page("health", default_range="all")`: the history opens on every run; another range filters runs by
-    their start. The run card's renderer reads one run (results, linked recommendations and the comparison) and, for
-    a running run, the planned check list (`health.checks.expand`, the runner's own plan) to show what is still to
-    come. Check explanations and values are Roxy's own words, but a value can quote an address or a host, and fix
-    links go through `local_href`.
+    their start, the window handed to the filter as numbers (`window_bounds`, clamped to the API's 1970 to 2100) and
+    never re-parsed from text, so a custom range the shell accepted never fails the card. The run card's renderer
+    reads one run (results, linked recommendations and the comparison) and, for a running run, the planned check
+    list (`health.checks.expand`, the runner's own plan) to show what is still to come. Check explanations and
+    values are Roxy's own words, but a value can quote an address or a host, and fix links go through `local_href`.
 
 What to read next
     `roxy/admin/api/health.py`, `roxy/health/store.py`, `roxy/health/checks.py`, `templates/admin/pages/health/*.html`,
@@ -390,17 +392,21 @@ async def history_card(view: PageView) -> dict[str, Any]:
     trigger = view.state_param("trigger", max_chars=16)
     worst = view.state_param("worst", max_chars=8)
     whole = view.time.view.get("range") == "all"
-    start = None if whole else str(int(view.tr.window.start))
-    end = None if whole else str(int(view.tr.window.end))
     notices = [table_notice] if table_notice else []
     tz = str(view.ctx.settings.get("ui_timezone") or "UTC")
     try:
-        filters = health_api.run_filters(trigger or None, worst or None, None, None, start, end, tz)
+        # Only the address's own filters are parsed here; the time window is added below as numbers.
+        filters = health_api.run_filters(trigger or None, worst or None, None, None, None, None, tz)
     except common.ApiError as error:
         details = "; ".join(error.error_fields.values()) or error.error_message
         notices.append(f"The filters in the address were not valid ({details}); every run is shown.")
         trigger = worst = ""
-        filters = health_api.run_filters(None, None, None, None, start, end, tz)
+        filters = health_store.RunFilter()  # the filters that failed are dropped; nothing left can fail again
+    # The range's window as numbers, clamped to what the API accepts (finding robust-3): a custom range whose buckets
+    # start before 1970 or end after 2100 in `ui_timezone` was accepted by the shell and must not fail this card.
+    bounds = None if whole else health_api.window_bounds(view.tr.window.start, view.tr.window.end)
+    if bounds is not None:
+        filters = health_api.window_filter(filters, *bounds)
     answer = await health_api.runs_table(view.ctx, filters, tq)
 
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -416,7 +422,8 @@ async def history_card(view: PageView) -> dict[str, Any]:
             "version": {"text": item.get("version"), "mono": True} if item.get("version") else None,
         }
 
-    bounds = {} if whole else {"from": start, "to": end}
+    # The export downloads the runs the table shows: the same clamped window, as epoch seconds the API accepts.
+    export_bounds = {} if bounds is None else {"from": str(bounds[0]), "to": str(bounds[1])}
     table = table_view(
         view,
         HISTORY_TABLE_ID,
@@ -439,7 +446,7 @@ async def history_card(view: PageView) -> dict[str, Any]:
                 [("", "Any result"), *((s, STATUS_WORDS[s][1]) for s in health_api.STATUSES)],
             ),
         ],
-        export_url=view.api_url("health/runs", time=False, **bounds),
+        export_url=view.api_url("health/runs", time=False, **export_bounds),
         caption="Health runs",
         empty={
             "title": "No health run yet" if whole else "No health run in this range",

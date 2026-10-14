@@ -39,11 +39,12 @@ What to read next
 
 from __future__ import annotations
 
+import calendar
 import json
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from roxy.metrics import annotate, histograms, read_client_extras
@@ -299,30 +300,83 @@ def resolve_window(
 
 
 def _shift_months(ts: int, months: int, tz: str) -> int:
+    """`ts` moved by `months` calendar months on the local wall clock; a day the target month lacks (the 29th to
+    the 31st) becomes that month's last day (review finding truth-1: clamping every day to the 28th cut windows
+    short)."""
     zi = zone(tz)
     local = datetime.fromtimestamp(ts, zi)
     month_index = local.month - 1 + months
     year = local.year + month_index // 12
     month = month_index % 12 + 1
-    day = min(local.day, 28)  # every month has day 28; keeps the shift defined for the 29th to 31st
+    day = min(local.day, calendar.monthrange(year, month)[1])
     shifted = local.replace(year=year, month=month, day=day)
     return int(shifted.timestamp())
 
 
+def _shift_local_days(ts: int, days: int, tz: str) -> int:
+    """`ts` moved by `days` whole days on the local wall clock (a day across a daylight saving change is 23 or 25
+    hours long, so local midnight stays local midnight)."""
+    zi = zone(tz)
+    local = datetime.fromtimestamp(ts, zi).replace(tzinfo=None) + timedelta(days=days)
+    return int(local.replace(tzinfo=zi).timestamp())
+
+
+def _local_days(window: Window) -> int:
+    """Whole local days the window spans (day, week and month windows start and end on local midnights)."""
+    zi = zone(window.tz)
+    first = datetime.fromtimestamp(window.start, zi).date()
+    last = datetime.fromtimestamp(window.end, zi).date()
+    return max(1, (last - first).days)
+
+
+def _local_months(window: Window) -> int:
+    zi = zone(window.tz)
+    first = datetime.fromtimestamp(window.start, zi)
+    last = datetime.fromtimestamp(window.end, zi)
+    return max(1, (last.year - first.year) * 12 + last.month - first.month)
+
+
+CALENDAR_UNITS = frozenset({"day", "week", "month"})
+"""Granularities whose buckets start on local midnights: their comparisons move by whole local days or months, so
+every compared bucket starts at local midnight and holds as many buckets as the window (finding truth-11)."""
+
+
+def _ending(window: Window, start: int) -> int:
+    """The end of a comparison window that starts at `start` and holds as many buckets as `window`."""
+    if window.granularity == "month":
+        return _shift_months(start, _local_months(window), window.tz)
+    if window.granularity in CALENDAR_UNITS:
+        return _shift_local_days(start, _local_days(window), window.tz)
+    return start + window.span
+
+
 def comparison_window(window: Window, mode: str) -> Window:
-    """The window to compare with: previous period, same period last week, last month or last year."""
+    """The window to compare with: previous period, same period last week, last month or last year.
+
+    The comparison always holds as many buckets as the window (charts overlay bucket j on bucket j): minute and hour
+    windows move by their exact length; day, week and month windows move by whole local days or months, so a window
+    holding a daylight saving change is still compared day by day from local midnight (review finding truth-11).
+    Month and year comparisons move the start by calendar months (the 31st becomes the last day of a shorter month)
+    and keep the window's length, so a range ending on the 29th to 31st is never cut short (finding truth-1).
+    """
+    tz = window.tz
     if mode == "previous":
-        return replace(window, start=window.start - window.span, end=window.start)
+        if window.granularity == "month":
+            start = _shift_months(window.start, -_local_months(window), tz)
+        elif window.granularity in CALENDAR_UNITS:
+            start = _shift_local_days(window.start, -_local_days(window), tz)
+        else:
+            start = window.start - window.span
+        return replace(window, start=start, end=window.start)
     if mode == "week":
-        return replace(window, start=window.start - 7 * 86_400, end=window.end - 7 * 86_400)
-    if mode == "month":
-        return replace(
-            window, start=_shift_months(window.start, -1, window.tz), end=_shift_months(window.end, -1, window.tz)
-        )
-    if mode == "year":
-        return replace(
-            window, start=_shift_months(window.start, -12, window.tz), end=_shift_months(window.end, -12, window.tz)
-        )
+        if window.granularity in CALENDAR_UNITS:
+            start = _shift_local_days(window.start, -7, tz)
+        else:
+            start = window.start - 7 * 86_400
+        return replace(window, start=start, end=_ending(window, start))
+    if mode in ("month", "year"):
+        start = _shift_months(window.start, -1 if mode == "month" else -12, tz)
+        return replace(window, start=start, end=_ending(window, start))
     raise ValueError(f"unknown comparison {mode!r}")
 
 
@@ -771,12 +825,24 @@ def answer_source_counts(conn: sqlite3.Connection, window: Window) -> list[dict[
     return [{"source": a, "status": b, "requests": -negative} for negative, a, b in ordered]
 
 
-def _delta(current: Any, previous: Any) -> dict[str, Any]:
+def change(current: Any, previous: Any) -> tuple[float | None, float | None]:
+    """`(delta, delta_pct)` of a number against its comparison: the one formula of every delta the admin API shows
+    (the Overview, Cache, Traffic and Endpoints helpers call it).
+
+    The percent divides by the size of the baseline (`abs(previous)`), so its sign always follows the change: a
+    number that goes from -1 to 5 went up by 600%, never "down 600%" (review finding truth-2; the avoided calls and
+    the avoided share are negative by design, plan P6). No baseline (0 or missing) gives no percent.
+    """
     if not isinstance(current, int | float) or not isinstance(previous, int | float):
-        return {"previous": previous, "delta": None, "delta_pct": None}
+        return None, None
     delta = current - previous
-    pct = round(delta * 100.0 / previous, 2) if previous else None
-    return {"previous": previous, "delta": round(delta, 4), "delta_pct": pct}
+    pct = round(delta * 100.0 / abs(previous), 2) if previous else None
+    return round(delta, 4), pct
+
+
+def _delta(current: Any, previous: Any) -> dict[str, Any]:
+    delta, pct = change(current, previous)
+    return {"previous": previous, "delta": delta, "delta_pct": pct}
 
 
 KPI_KEYS: tuple[str, ...] = (

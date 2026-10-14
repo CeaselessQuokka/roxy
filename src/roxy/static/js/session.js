@@ -19,8 +19,8 @@
  *   every activity window when that is shorter: the server extends the session only for input inside the window,
  *   so with an interval longer than the window, input between two ticks would otherwise never be reported.
  *   Any 401, from the heartbeat or from any other request (net.js and htmx_setup.js raise `roxy:unauthorized`, the
- *   SSE client too), opens the alertdialog with "Log in again" focused and a 5 second countdown to the login page.
- *   "Stay on this page", or Escape, cancels the countdown (WCAG 2.2.1). The alert opens on top of any open dialog
+ *   SSE client too), opens the alertdialog with "Log in again" focused and a 30 second countdown to the login page
+ *   (WCAG 2.2.1 asks for at least 20; finding a11y-5). "Stay on this page", or Escape, cancels the countdown. The alert opens on top of any open dialog
  *   without closing it (dialog.js), so text typed there can still be copied. The intervals come from data
  *   attributes on <body>, rendered from the live settings, so changing a setting changes the browser's behavior on
  *   the next page load.
@@ -35,9 +35,11 @@
 import { leaveOnPurpose, qs } from "roxy/dom";
 import { openDialog } from "roxy/dialog";
 import { postJSON, request } from "roxy/net";
-import { toast } from "roxy/toast";
+import { announce, toast } from "roxy/toast";
 
-const REDIRECT_SECONDS = 5;
+// WCAG 2.2.1 asks for at least 20 seconds to act on a time limit (review finding a11y-5: it was 5).
+const REDIRECT_SECONDS = 30;
+const ANNOUNCE_AT_SECONDS = 15;
 
 let lastInputAt = -Infinity;
 let expired = false;
@@ -114,6 +116,8 @@ export function expireSession() {
       return;
     }
     render();
+    // Once, half way: the countdown line itself is not a live region (it would speak every second).
+    if (left === ANNOUNCE_AT_SECONDS) announce(`${left} seconds left before the login page. Stay on this page keeps it.`);
   }, 1000);
 }
 

@@ -31,6 +31,8 @@ import { el, icon, qs, qsa } from "roxy/dom";
 import { errorMessage, isReauthRequired } from "roxy/net";
 
 const openers = new WeakMap();
+const lastClosed = new WeakMap();
+const REOPEN_MS = 10000;
 const SESSION_DIALOG_ID = "session-expired";
 const STACKING_IDS = new Set([SESSION_DIALOG_ID, "reauth"]);
 // Dialogs that open ON TOP of an open one without closing it: the session alert, and "Confirm it is you", whose
@@ -46,12 +48,50 @@ export function sessionOverlayOpen() {
   return Boolean(overlay && overlay.open);
 }
 
+/** Where focus goes back to when a dialog closes: the opener itself, and enough to find its successor when a
+ *  refresh replaced it (the table row it sat in, the card around it). */
+function describeOpener(opener) {
+  if (!(opener instanceof HTMLElement) || opener === document.body) return null;
+  // An item of a dropdown menu is hidden once the menu closes (it closes as the dialog opens), so neither this
+  // script nor the browser could focus it again: the menu's own button takes its place (WCAG 2.4.3, a11y-6).
+  const menu = opener.closest("details[data-menu]");
+  const summary = menu ? qs(":scope > summary", menu) : null;
+  const target = summary && opener !== summary ? summary : opener;
+  const row = target.closest("[data-row-id]");
+  const card = target.closest("[data-card]");
+  return { opener: target, rowId: row ? row.dataset.rowId : "", cardId: card ? card.id : "" };
+}
+
+/** The element to give focus back to: the opener, else its row's or its card's successor, else the main area. */
+function returnTarget(record) {
+  if (!record) return null;
+  if (record.opener && record.opener.isConnected && record.opener.getClientRects().length) return record.opener;
+  const card = record.cardId ? document.getElementById(record.cardId) : null;
+  const scope = card || document;
+  if (record.rowId) {
+    const row = qs(`[data-row-id="${CSS.escape(record.rowId)}"]`, scope);
+    const control = row ? qs("[data-dt-open], a[href], button:not([disabled])", row) || row : null;
+    if (control && control.getClientRects().length) return control;
+  }
+  if (card && card.getClientRects().length) {
+    if (!card.hasAttribute("tabindex")) card.setAttribute("tabindex", "-1");
+    return card;
+  }
+  return document.getElementById("main");
+}
+
 export function openDialog(target, opener = document.activeElement) {
   const dialog = resolve(target);
   if (!dialog || typeof dialog.showModal !== "function") return null;
   if (dialog.open) return dialog;
   const isSessionOverlay = dialog.id === SESSION_DIALOG_ID;
   if (!isSessionOverlay && sessionOverlayOpen()) return null;
+  // The opener is described before the menus close, while the item still sits in its menu (a11y-6). A dialog
+  // reopened by a script right after an action (no opener of its own: `document.body`) keeps the opener of its
+  // previous opening, so closing it still returns focus to the page (a11y-7).
+  let record = describeOpener(opener);
+  const previous = lastClosed.get(dialog);
+  if (!record && previous && performance.now() - previous.at < REOPEN_MS) record = previous.record;
   // Only one menu sheet or palette at a time: close any other open modal first (they would stack). The session
   // alert and the re-authentication dialog are the exceptions: they stack over whatever is open, so nothing the
   // admin typed is thrown away.
@@ -61,7 +101,7 @@ export function openDialog(target, opener = document.activeElement) {
     }
   }
   for (const menu of qsa("details[data-menu][open]")) menu.open = false;
-  openers.set(dialog, opener instanceof HTMLElement ? opener : null);
+  openers.set(dialog, record);
   dialog.showModal();
   const autofocus = dialog.querySelector("[autofocus], input:not([type=hidden]):not([disabled]), select, textarea");
   if (autofocus && !dialog.classList.contains("dialog--danger")) autofocus.focus();
@@ -144,19 +184,38 @@ export function initDialogs() {
     }
   });
 
-  // Give focus back to whatever opened the dialog (WCAG 2.4.3).
-  document.addEventListener("close", (event) => {
-    const dialog = event.target;
-    if (!(dialog instanceof HTMLDialogElement)) return;
-    const opener = openers.get(dialog);
-    openers.delete(dialog);
-    if (opener && opener.isConnected && opener !== document.body) {
-      opener.focus();
-    } else if (dialog.contains(document.activeElement)) {
+  // Give focus back to whatever opened the dialog, or to its successor after a refresh (WCAG 2.4.3). The browser
+  // fires `close` in a later task, after the dialog has already lost its `open` attribute; in between, focus would
+  // sit on a control of the closed dialog. So the `open` attribute is watched too (a mutation observer runs right
+  // after the task that closed the dialog), and `close` only finishes what the observer did not (a11y-6).
+  const settleFocus = (dialog) => {
+    if (openers.has(dialog)) {
+      const record = openers.get(dialog);
+      openers.delete(dialog);
+      if (record) lastClosed.set(dialog, { record, at: performance.now() });
+      const back = returnTarget(record);
+      if (back && back !== document.body) {
+        back.focus();
+        return;
+      }
+    }
+    if (dialog.contains(document.activeElement)) {
       // Nothing to return to: never leave focus on a field inside a closed dialog (keys would go nowhere, and
       // the single-key shortcuts would think the admin is still typing).
       document.activeElement.blur();
     }
+  };
+  new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      const dialog = mutation.target;
+      if (dialog instanceof HTMLDialogElement && !dialog.open && mutation.oldValue !== null) settleFocus(dialog);
+    }
+  }).observe(document.documentElement, {
+    subtree: true, attributes: true, attributeFilter: ["open"], attributeOldValue: true,
+  });
+  document.addEventListener("close", (event) => {
+    const dialog = event.target;
+    if (dialog instanceof HTMLDialogElement && !dialog.open) settleFocus(dialog);
   }, true);
 
   document.addEventListener("htmx:afterRequest", (event) => {

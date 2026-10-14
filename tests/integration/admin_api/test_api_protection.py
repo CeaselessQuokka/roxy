@@ -138,7 +138,7 @@ async def test_throttle_all_limit_since_marker_and_watch(api: Any, api_app: Any,
     assert state["callers_see"]["body"] == "Slow down please."
     assert api_app.ctx.settings.int("global_throttle_limit") == 3
     fields = section13(await api.post("protection/throttle-all", json={"limit": 0}), 422, "invalid_settings")
-    assert "global_throttle_limit" in fields  # v1 bug B16: a bad limit is reported, never ignored
+    assert "limit" in fields  # v1 bug B16: a bad limit is reported, never ignored; named by the body's field
     dash = chr(0x2014)
     fields = section13(
         await api.post("protection/throttle-all", json={"limit": 9, "message": f"Slow {dash} down"}),

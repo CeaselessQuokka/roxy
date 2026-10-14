@@ -42,6 +42,7 @@ from typing import Annotated, Any, Final
 
 from fastapi import Depends, Query, Request
 
+from roxy.admin.api import traffic as traffic_api
 from roxy.admin.api.common import (
     AdminSession,
     Column,
@@ -210,9 +211,8 @@ def _filters(host: str | None, method: str | None) -> dict[str, str]:
 
 
 def _trend(current: Any, previous: Any) -> float | None:
-    if not isinstance(current, int | float) or not isinstance(previous, int | float) or not previous:
-        return None
-    return round((current - previous) * 100.0 / previous, 2)
+    """The percent of `queries.change` (its sign follows the change, also over a negative baseline)."""
+    return queries.change(current, previous)[1]
 
 
 def _with_recency(conn: sqlite3.Connection, window: queries.Window, rows: list[dict[str, Any]]) -> None:
@@ -275,7 +275,12 @@ async def table_page(ctx: Any, tr: TimeRange, tq: TableQuery, filters: dict[str,
     other = tr.compare_window or queries.comparison_window(tr.window, "previous")
     window = tr.window
 
-    def read(conn: sqlite3.Connection) -> tuple[dict[str, Any], dict[str, Any]]:
+    Resets = list[dict[str, Any]]
+
+    def touches(row: dict[str, Any]) -> bool:
+        return queries.reset_touches(row, queries.ROLLUP_TABLES)
+
+    def read(conn: sqlite3.Connection) -> tuple[dict[str, Any], dict[str, Any], tuple[Resets, Resets]]:
         data = queries.endpoint_table_sync(conn, window, page=tq.metrics_page(), filters=filters or None)
         keys = [row["key"] for row in data["rows"]]
         previous: dict[str, Any] = {}
@@ -289,14 +294,26 @@ async def table_page(ctx: Any, tr: TimeRange, tq: TableQuery, filters: dict[str,
             )
             previous = {row["key"]: row["requests"] for row in before["rows"]}
         _with_recency(conn, window, data["rows"])
-        return data, previous
+        mine = [row for row in queries.reset_annotations(conn, window.start, window.end) if touches(row)]
+        seen = {row["id"] for row in mine}
+        baseline = queries.reset_annotations(conn, other.start, other.end)
+        theirs = [row for row in baseline if touches(row) and row["id"] not in seen]
+        return data, previous, (mine, theirs)
 
-    data, previous = await db.read(read)
+    data, previous, (current_resets, baseline_resets) = await db.read(read)
+    # Plan 6.8 (finding truth-3): a reset of the traffic of either window leaves the trend partial, so none is
+    # computed ("New" would claim an endpoint nobody asked for before); the answer's notices say why.
+    partial = bool(current_resets or baseline_resets)
     for row in data["rows"]:
         row["previous_requests"] = int(previous.get(row["key"], 0))
-        row["trend_pct"] = _trend(row["requests"], row["previous_requests"])
+        row["trend_pct"] = None if partial else _trend(row["requests"], row["previous_requests"])
+        row["trend_partial"] = partial
     answer = table_from_read_model(TABLE_SPEC, tq, data)
     answer["compare"] = {"mode": tr.compare or "previous", "range": range_info(other)}
+    answer["notices"] = [
+        *reset_notices(current_resets, tz=window.tz),
+        *reset_notices(baseline_resets, tz=window.tz, comparison=True),
+    ]
     answer["filters"] = filters
     add_caller_text(answer, TABLE_CALLER_TEXT)
     return answer
@@ -385,19 +402,28 @@ async def _recent(ctx: Any, template: str, limit: int) -> list[dict[str, Any]]:
 
 
 async def _series(ctx: Any, tr: TimeRange, template: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Requests by outcome and the latency percentiles of one template, as two series answers."""
+    """Requests by outcome and the latency percentiles of one template, as two series answers.
+
+    Requests by outcome are the Traffic chart's lines (`traffic_api.outcome_lines`): the catalog's outcome measures
+    plus the OPTIONS requests Roxy answered itself, never a group by the raw `outcome` column, which counted those as
+    served by Roblox (finding truth-6).
+    """
     db = ctx.dbs.metrics
     filters = {"endpoint_template": template}
-    outcomes = await queries.series(db, tr.window, metrics=["requests"], filters=filters, group_by="outcome")
+    reads = list(traffic_api.OUTCOME_READS)
+    outcomes = await queries.series(db, tr.window, metrics=reads, filters=filters)
     latency = await queries.series(db, tr.window, metrics=["p50_ms", "p95_ms", "p99_ms"], filters=filters)
     compare_outcomes = compare_latency = None
     if tr.compare_window is not None:
-        other_o = await queries.series(db, tr.compare_window, metrics=["requests"], filters=filters, group_by="outcome")
+        other_o = await queries.series(db, tr.compare_window, metrics=reads, filters=filters)
         other_l = await queries.series(db, tr.compare_window, metrics=["p50_ms", "p95_ms", "p99_ms"], filters=filters)
-        compare_outcomes = series_from_read_model(other_o, "requests")
+        compare_outcomes = [e for m in reads for e in series_from_read_model(other_o, m)]
         compare_latency = [e for m in ("p50_ms", "p95_ms", "p99_ms") for e in series_from_read_model(other_l, m)]
+    by_outcome, compare_outcomes = traffic_api.outcome_lines(
+        [e for m in reads for e in series_from_read_model(outcomes, m)], compare_outcomes
+    )
     return (
-        series_answer(tr, series_from_read_model(outcomes, "requests"), compare_series=compare_outcomes),
+        series_answer(tr, by_outcome, compare_series=compare_outcomes),
         series_answer(
             tr,
             [e for m in ("p50_ms", "p95_ms", "p99_ms") for e in series_from_read_model(latency, m)],

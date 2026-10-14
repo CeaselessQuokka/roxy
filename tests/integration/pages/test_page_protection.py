@@ -330,6 +330,65 @@ async def test_attempts_tabs_name_the_rule_that_refused(page: Any, pages_app: An
     assert all("users.roblox.com/v1/users" in cell for cell in cells), cells
 
 
+async def test_the_header_attempts_tab_has_v1s_match_columns_and_never_a_header_value(
+    page: Any, pages_app: Any
+) -> None:
+    """Parity row 75 (finding v1parity-5): the Header-Blocked Attempts tab has v1's Last header, Triggered by and
+    Matched text columns (caller text where a caller chose it), and a value a regex filter matched is never kept or
+    shown (refused requests keep no header values). tests/review_p11/test_v1parity.py checks the cells of a name
+    match."""
+    rule = {"needle": "^zz-private", "scope": "value", "mode": "regex"}
+    assert (await page.api("POST", "protection/header-rules", json=rule)).status_code in (200, 201)
+    secret = "zz-private-value-4242"
+    response = await pages_app.harness.new_client().get(
+        "/games.roblox.com/v1/games?universeIds=1950",
+        headers={"User-Agent": "Roblox/WinInet", "X-Forwarded-For": "203.0.113.192", "X-Probe-Token": secret},
+    )
+    assert response.status_code == 429  # the filter's stealth refusal
+    await pages_app.flush()
+    answer = await page.api("GET", "protection/header-rules/attempts", params={"range": "1h"})
+    assert answer.status_code == 200
+    body = answer.json()
+    assert [column["key"] for column in body["columns"]][3:6] == ["last_header", "last_field", "last_text"]
+    assert {"last_header", "last_text"} <= set(body["caller_text"])
+    row = next(item for item in body["items"] if item["path"] == "games.roblox.com/v1/games")
+    if row["last_field"] is not None:  # the newest refusal of the path recorded its match (metrics `detail.matched`)
+        assert (row["last_header"], row["last_field"], row["last_text"]) == ("X-Probe-Token", "value", None)
+    fragment = await page.fragment("protection", "request-filters", table="attempts", range="1h")
+    headers = parse_html(fragment.text).select("#prot-attempts th[data-col]")
+    labels = [node.text().strip().removesuffix("?").strip() for node in headers]  # without the help mark
+    assert {"Last header", "Triggered by", "Matched text"} <= set(labels), labels
+    for text in (answer.text, fragment.text):
+        assert secret not in text
+
+
+async def test_the_emergency_limit_watch_lists_the_refused_and_is_empty_once_it_is_off(
+    page: Any, pages_app: Any
+) -> None:
+    """Row 135 (finding v1parity-6): while the emergency limit is on, the watch lists who it turned away, refused
+    most first; once it is off it turns nobody away, so the watch is empty although windows are still open."""
+    caller = "203.0.113.191"
+    body = {"enabled": True, "limit": 1, "period": 60, "reason": "watch test"}
+    try:
+        assert (await page.api("POST", "protection/throttle-all", json=body)).status_code == 200
+        statuses = await pages_app.seed_traffic(
+            [PlannedRequest(f"/games.roblox.com/v1/games?universeIds={1900 + i}", caller) for i in range(3)]
+        )
+        assert statuses.count(429) == 2, statuses
+        watch = (await page.api("GET", "protection/throttle-all/watch")).json()
+        assert watch["sort"] == "refused"
+        mine = next(item for item in watch["items"] if item["ip"] == caller)
+        assert (mine["refused"], mine["count"], mine["limited"]) == (2, 1, True)
+        doc = parse_html((await page.fragment("protection", "throttle-all", table="watch-all")).text)
+        assert doc.select_one(f"#prot-watch-all tr[data-row-id=watch-all-{caller}]") is not None
+    finally:
+        await page.api("POST", "protection/throttle-all", json={"enabled": False})
+    watch = (await page.api("GET", "protection/throttle-all/watch")).json()
+    assert (watch["total"], watch["items"]) == (0, [])
+    response = await page.fragment("protection", "throttle-all")
+    assert "The emergency limit is off, so it refuses nobody" in response.text
+
+
 async def test_the_ladder_card_has_the_simulation_the_editor_and_restore_defaults(page: Any, pages_app: Any) -> None:
     doc = parse_html((await page.fragment("protection", "ladder")).text)
     steps = [node.text() for node in doc.select(".prot-timeline li")]

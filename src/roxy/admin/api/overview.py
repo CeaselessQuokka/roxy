@@ -23,7 +23,8 @@ Why it exists
 How it works
     Thin: every number comes from a read model (`metrics/queries.py` kpis, series, top N and clients;
     `metrics/read_dashboard.py` for the v1 baseline, visits, sparklines and events; `roxy.insights` for
-    recommendations; the worker's own state objects for the status strip). KPI deltas use the requested
+    recommendations; the worker's own state objects for the status strip; `scheduler/read_fleet.py` for the
+    service uptime, read from the gunicorn master as System > Fleet reads it). KPI deltas use the requested
     `compare` mode, and the previous period when none is given, so every tile has a delta. Sparklines are the
     same range at a granularity of at most 60 points. Cards that read optional parts (recommendations,
     notable events) degrade open: a failure is a notice on that card, never a failed page (plan C7 lets metrics
@@ -36,6 +37,7 @@ What to read next
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from collections.abc import Mapping, Sequence
@@ -54,6 +56,7 @@ from roxy.admin.api.common import (
     TimeRangeDep,
     annotation_entries,
     area_router,
+    comparison_resets,
     export_table,
     kpi_from_read_model,
     kpi_tile,
@@ -70,7 +73,7 @@ from roxy.lifespan import optional_import
 from roxy.metrics import queries, read_dashboard
 from roxy.metrics.catalog import avoided_note
 from roxy.metrics.queries import Window
-from roxy.scheduler import heartbeat, leader
+from roxy.scheduler import heartbeat, leader, read_fleet
 from roxy.storage import leases
 from roxy.storage.db import SharedStateUnavailable
 
@@ -137,6 +140,8 @@ VISITOR_LABELS: Final[dict[str, tuple[str, str]]] = {
     "robots_crawls": ("robots.txt crawls", "Fetches of robots.txt, almost all of them search engines."),
     "sitemap_crawls": ("Sitemap crawls", "Fetches of sitemap.xml."),
 }
+VISIT_TABLES: Final[tuple[str, ...]] = ("metrics.events",)
+"""What the Visitors tiles read (visits are `events` rows): a reset marker naming it makes them partial (plan 6.8)."""
 
 OUTCOME_LABELS: Final[dict[str, str]] = {
     "served_upstream": "Served by Roblox",
@@ -174,8 +179,9 @@ EXTRA_TILES: Final[dict[str, tuple[str, str, str]]] = {
     "service_uptime_s": (
         "Service uptime",
         "s",
-        "How long this color's oldest running worker has been up. Workers recycle on purpose, so this restarts "
-        "only when every worker of the color was replaced (a deploy or a restart).",
+        "How long this color's gunicorn master has been running (read from the master process, as v1 did). Workers "
+        "are recycled on purpose, so a worker's age is not the service's: this restarts only on a deploy or a "
+        "service restart. n/a when the master's start time cannot be read.",
     ),
 }
 
@@ -223,10 +229,8 @@ def _pct(part: float, whole: float) -> float | None:
 
 
 def _delta(current: Any, previous: Any) -> tuple[float | None, float | None]:
-    if not isinstance(current, int | float) or not isinstance(previous, int | float):
-        return None, None
-    change = current - previous
-    return round(change, 4), (round(change * 100.0 / previous, 2) if previous else None)
+    """`queries.change`: the percent divides by the size of the baseline, so its sign follows the change."""
+    return queries.change(current, previous)
 
 
 def _effective_compare(tr: TimeRange) -> str:
@@ -361,12 +365,19 @@ def _active_bans(ctx: Any, now: float) -> int:
     return sum(1 for row in rows if row.expires_at is None or row.expires_at > now)
 
 
-def _service_uptime(ctx: Any, conn: sqlite3.Connection, now: float) -> int | None:
+async def service_uptime(ctx: Any, rows: Sequence[Mapping[str, Any]], now: float) -> int | None:
+    """This color's service uptime (plan 14.1 row 3, parity row 84): since its gunicorn master started.
+
+    Read exactly as System > Fleet reads it (`read_fleet.color_master_pids`, `master_start_times`, `service_since`
+    over the same `heartbeat.fleet_view` rows), so the one v1 tile shows one number on both pages and a worker
+    recycle (`ROXY_MAX_REQUESTS`) never restarts it (finding v1parity-2). None when no master's start can be read.
+    """
     color = str(getattr(ctx, "color", "") or "")
-    fresh = [row for row in heartbeat.fleet_view(conn, now) if row["fresh"] and (row.get("color") or "") == color]
-    if not fresh:
+    pids = read_fleet.color_master_pids(rows, color)
+    if not pids:
         return None
-    return max(0, int(now) - min(int(row["started_at"]) for row in fresh))
+    started = await asyncio.to_thread(read_fleet.master_start_times, pids)  # `/proc` file reads, off the event loop
+    return read_fleet.service_since(pids, started, now)[1]
 
 
 def _hour_windows(now: float, tz: str) -> tuple[Window, Window]:
@@ -445,11 +456,12 @@ async def build_kpis(ctx: Any, tr: TimeRange) -> dict[str, Any]:
             "hour": queries.totals_sync(conn, hour),
             "previous_hour": queries.totals_sync(conn, before),
             "rotator": _rotator_today(conn, now, tz),
-            "uptime": _service_uptime(ctx, conn, now),
+            "fleet": heartbeat.fleet_view(conn, now),
             "legacy": read_dashboard.legacy_baseline(conn),
         }
 
     data = await ctx.dbs.metrics.read(read)
+    data["uptime"] = await service_uptime(ctx, data["fleet"], now)
     tiles_in = data["kpis"]["tiles"]
     spark = data["spark"]
     legacy = data["legacy"]
@@ -501,24 +513,33 @@ async def build_kpis(ctx: Any, tr: TimeRange) -> dict[str, Any]:
             if key == "avoided_pct":
                 avoided, demand = tiles_in["avoided"]["value"], tiles_in["demand"]["value"]
                 note = avoided_note(current.get("value"))
+                calls = tiles_in["upstream_calls"]["value"]
                 if demand and note:
-                    # Below 0% (plan P6 never clamps it): say why instead of "-n of m requests needed no call".
-                    calls = tiles_in["upstream_calls"]["value"]
+                    # Below 0% (plan P6 never clamps it): say why instead of a negative count of saved calls.
                     tile["notice"] = f"Below 0%: {note} ({calls:,} upstream calls for {demand:,} caller requests)."
                 elif demand:
+                    # `avoided` is demand minus upstream calls, a net count of calls (a retry costs one), never a
+                    # count of requests that needed no call (finding truth-10): word it as the calls it counts.
                     tile["notice"] = (
-                        f"{avoided:,} of {demand:,} caller requests needed no call to Roblox (refused requests are "
-                        "not counted as demand)."
+                        f"{calls:,} upstream calls for {demand:,} caller requests, {avoided:,} fewer than one call "
+                        "each (cache serves and coalesced requests save calls, retries add them; refused requests "
+                        "are not counted as demand)."
                     )
             elif key == "avoided":
                 note = avoided_note(tiles_in.get("avoided_pct", {}).get("value"))
                 if note:
                     tile["notice"] = f"Below 0: {note}."  # a negative count as it is, with why (plan P6)
             elif key == "roblox_429":
-                calls = tiles_in["upstream_calls"]["value"]
-                share = _pct(float(current.get("value") or 0), float(calls or 0))
+                # Like for like (finding truth-8): the 429 log holds every 429 Roblox sent, Roxy's own probes and
+                # health checks included, so the share is over every upstream call, callers' and Roxy's own.
+                callers = int(tiles_in["upstream_calls"]["value"] or 0)
+                own = int(tiles_in.get("internal_calls", {}).get("value") or 0)
+                share = _pct(float(current.get("value") or 0), float(callers + own))
                 if share is not None:
-                    tile["notice"] = f"{share}% of the upstream calls made for callers."
+                    tile["notice"] = (
+                        f"{share}% of every upstream call Roxy made ({callers:,} on callers' behalf, {own:,} for its "
+                        "own checks)."
+                    )
             elif key == "roblox_429_per_10k":
                 baseline = legacy.get("roblox_429_per_10k")
                 tile["baseline"] = baseline  # v1 lifetime value from legacy_totals (plan 11.6), None when absent
@@ -555,31 +576,35 @@ async def build_visitors(ctx: Any, tr: TimeRange) -> dict[str, Any]:
     other = queries.comparison_window(window, _effective_compare(tr))
     spark_window = read_dashboard.sparkline_window(window)
 
-    def read(conn: sqlite3.Connection) -> tuple[dict[str, int], dict[str, int], dict[str, Any]]:
+    def read(conn: sqlite3.Connection) -> tuple[Any, ...]:
         return (
             queries.visitor_kpis(conn, window),
             queries.visitor_kpis(conn, other),
             read_dashboard.visit_series(conn, spark_window),
+            queries.reset_annotations(conn, window.start, window.end),
+            queries.reset_annotations(conn, other.start, other.end),
         )
 
-    current, previous, series = await ctx.dbs.metrics.read(read)
+    current, previous, series, current_resets, baseline_resets = await ctx.dbs.metrics.read(read)
     tiles = []
     for key in read_dashboard.VISIT_KEYS:
         label, help_text = VISITOR_LABELS[key]
         delta, delta_pct = _delta(current.get(key, 0), previous.get(key, 0))
         points = [[b, v] for b, v in zip(series["buckets"], series["values"][key], strict=False)]
-        tiles.append(
-            kpi_tile(
-                key,
-                label=label,
-                value=current.get(key, 0),
-                unit="count",
-                delta=delta,
-                delta_pct=delta_pct,
-                sparkline=points,
-                help=help_text,
-            )
+        tile = kpi_tile(
+            key,
+            label=label,
+            value=current.get(key, 0),
+            unit="count",
+            delta=delta,
+            delta_pct=delta_pct,
+            sparkline=points,
+            help=help_text,
         )
+        # Plan 6.8 (finding truth-3): visits are `events` rows; a reset of them in either window makes the tile
+        # partial (a notice instead of a delta that compares with what the reset left).
+        queries.mark_partial(tile, VISIT_TABLES, current_resets, baseline_resets, window.tz)
+        tiles.append(tile)
     return {"range": tr.info(), "compare": {"mode": _effective_compare(tr), "range": range_info(other)}, "tiles": tiles}
 
 
@@ -599,16 +624,21 @@ async def build_chart(ctx: Any, tr: TimeRange) -> dict[str, Any]:
         compare_series = [entry for metric in CHART_METRICS for entry in series_from_read_model(other, metric)]
     start, end = tr.window.start, tr.window.end
 
-    def marks(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        return queries.chart_annotations(conn, start, end), queries.reset_annotations(conn, start, end)
+    def marks(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        return (
+            queries.chart_annotations(conn, start, end),
+            queries.reset_annotations(conn, start, end),
+            comparison_resets(conn, tr),
+        )
 
-    annotations, resets = await db.read(marks)
+    annotations, resets, behind = await db.read(marks)
     return series_answer(
         tr,
         series,
         compare_series=compare_series,
         annotations=annotation_entries(annotations),
-        notices=reset_notices(resets, tz=tr.window.tz),
+        # The comparison overlay over a reset is partial too (plan 6.8, finding truth-3).
+        notices=[*reset_notices(resets, tz=tr.window.tz), *reset_notices(behind, tz=tr.window.tz, comparison=True)],
     )
 
 
@@ -828,4 +858,5 @@ __all__ = [
     "events_table",
     "recent_events",
     "router",
+    "service_uptime",
 ]

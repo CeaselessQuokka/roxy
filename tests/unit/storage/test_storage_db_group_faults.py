@@ -358,6 +358,8 @@ async def test_a_bug_before_commit_answers_every_caller_and_keeps_nothing(
     calls = {"n": 0}
 
     def flaky(self: Any, job: Any) -> bool:
+        if self._db is not db:  # the patch is on the class: another database of this process is not counted
+            return original(self, job)
         calls["n"] += 1
         if calls["n"] == 3:
             raise RuntimeError("a bug in the group code")
@@ -384,6 +386,9 @@ async def test_a_bug_after_commit_still_delivers_every_committed_result(
     calls = {"n": 0}
 
     def broken(self: Any, lock_wait_ms: float, hold_ms: float) -> None:
+        if self is not db.stats:  # the patch is on the class: another database of this process is not counted
+            original(self, lock_wait_ms, hold_ms)
+            return
         calls["n"] += 1
         if calls["n"] == 2:  # the first call is the long write's, the second the group's
             raise RuntimeError("a bug in the statistics")

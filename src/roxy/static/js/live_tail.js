@@ -14,8 +14,11 @@
  *   and counted (plan P9).
  *
  * How it works
- *   Pausing: the Pause button (aria-pressed), the P key inside the tail, or simply hovering the list (so a row
- *   does not move under the pointer). Paused events wait in a bounded buffer and join on resume. Filters apply
+ *   Pausing: the Pause button (aria-pressed), the P key inside the tail, or simply hovering the list or moving
+ *   through it with the keyboard (so a row never changes under the pointer or under keyboard focus: a screen
+ *   reader reads the request Enter opens; review finding a11y-4). Paused events wait in a bounded buffer and join
+ *   on resume. Only the Pause button and the connection are announced (the `role=status` label); the hover and
+ *   focus pause shows beside it as plain text, so moving the mouse is never read out (finding a11y-16). Filters apply
  *   instantly in the browser and are also sent to the server as stream parameters (the server samples above 50
  *   events a second, plan 14.11). Each new set of parameters means a new stream connection, so typed filters
  *   reach the server only once typing pauses for 400 ms (a select applies at once). Keyboard: Up and Down move a
@@ -67,6 +70,8 @@ function normalize(raw) {
     place: String(data.place ?? data.place_id ?? ""),
     method: String(data.method ?? "GET"),
     endpoint: String(data.endpoint ?? data.path ?? ""),
+    ua: String(data.user_agent ?? data.ua ?? ""),
+    query: String(data.query ?? ""),
   };
 }
 
@@ -77,6 +82,11 @@ class LiveTail {
     this.spacer = qs("[data-tail-spacer]", root);
     this.empty = qs("[data-tail-empty]", root);
     this.stateLabel = qs("[data-tail-state]", root);
+    this.holdLabel = qs("[data-tail-hold]", root);
+    // Reason codes in words, from the Reason filter's own options (v1's outcome words; finding v1parity-3).
+    this.reasonWords = new Map(
+      qsa('[data-tail-filter="reason"] option', root).filter((o) => o.value).map((o) => [o.value, o.textContent.trim()]),
+    );
     this.countLabel = qs("[data-tail-count]", root);
     this.pauseButton = qs("[data-tail-pause]", root);
     this.announcer = qs("[data-tail-announce]", root);
@@ -96,6 +106,7 @@ class LiveTail {
     this.active = -1;
     this.pausedByButton = false;
     this.pausedByHover = false;
+    this.pausedByFocus = false;
     this.connection = "connecting";
     this.rowHeight = 34;
     this.render = rafThrottle(() => this.draw());
@@ -121,13 +132,18 @@ class LiveTail {
   }
 
   get paused() {
-    return this.pausedByButton || this.pausedByHover;
+    return this.pausedByButton || this.pausedByHover || this.pausedByFocus;
   }
 
   bind() {
     this.viewport.addEventListener("scroll", () => this.render(), { passive: true });
     this.viewport.addEventListener("pointerenter", () => this.setHoverPause(true));
     this.viewport.addEventListener("pointerleave", () => this.setHoverPause(false));
+    // Keyboard focus in the list holds new rows like the pointer does (a11y-4).
+    this.viewport.addEventListener("focusin", () => this.setFocusPause(true));
+    this.viewport.addEventListener("focusout", (event) => {
+      if (!(event.relatedTarget instanceof Node && this.viewport.contains(event.relatedTarget))) this.setFocusPause(false);
+    });
     this.viewport.addEventListener("keydown", (event) => this.onKey(event));
     this.viewport.addEventListener("click", (event) => {
       const row = event.target instanceof Element ? event.target.closest(".tail__row") : null;
@@ -194,6 +210,7 @@ class LiveTail {
   matches(row) {
     const f = this.filters;
     if (f.outcome && row.outcome !== f.outcome) return false;
+    if (f.reason && row.reason !== f.reason) return false;
     if (f.egress && row.egress !== f.egress) return false;
     if (f.cache && row.cache.toUpperCase() !== f.cache) return false;
     if (f.status) {
@@ -205,6 +222,7 @@ class LiveTail {
     }
     if (f.client && !(`${row.client} ${row.place}`.toLowerCase().includes(f.client.toLowerCase()))) return false;
     if (f.endpoint && !row.endpoint.toLowerCase().includes(f.endpoint.toLowerCase())) return false;
+    if (f.q && !`${row.ua} ${row.query} ${row.endpoint}`.toLowerCase().includes(f.q.toLowerCase())) return false;
     return true;
   }
 
@@ -233,6 +251,13 @@ class LiveTail {
     this.updateState();
   }
 
+  setFocusPause(on) {
+    if (this.pausedByFocus === on) return;
+    this.pausedByFocus = on;
+    if (!this.paused) this.flush();
+    this.updateState();
+  }
+
   togglePause() {
     this.pausedByButton = !this.pausedByButton;
     if (this.pauseButton) {
@@ -246,6 +271,7 @@ class LiveTail {
 
   flush() {
     if (!this.waiting.length) return;
+    if (this.active >= 0) this.active += this.waiting.length;  // the highlighted row keeps its request
     this.rows = this.waiting.concat(this.rows).slice(0, this.maxRows);
     this.newSinceAnnounce += this.waiting.length;
     this.waiting = [];
@@ -259,9 +285,16 @@ class LiveTail {
     else if (this.connection === "reconnecting" || this.connection === "error") [state, text] = ["error", "Reconnecting"];
     else if (this.connection === "expired") [state, text] = ["error", "Signed out"];
     if (this.pausedByButton) [state, text] = ["paused", "Paused"];
-    else if (this.pausedByHover) [state, text] = ["paused", "Paused while the pointer is over the list"];
-    this.root.dataset.state = state;
+    // The hover and keyboard holds are shown, never announced: the live region keeps its text (a11y-16).
+    let hold = "";
+    if (!this.pausedByButton && this.pausedByHover) hold = "Paused while the pointer is over the list";
+    else if (!this.pausedByButton && this.pausedByFocus) hold = "Paused while you move through the list";
+    this.root.dataset.state = hold ? "paused" : state;
     if (this.stateLabel && this.stateLabel.textContent !== text) this.stateLabel.textContent = text;
+    if (this.holdLabel) {
+      this.holdLabel.hidden = !hold;
+      if (this.holdLabel.textContent !== hold) this.holdLabel.textContent = hold;
+    }
     if (this.countLabel) {
       let count = `${fmtNumber(this.rows.length)} row${this.rows.length === 1 ? "" : "s"}`;
       if (this.waiting.length) count += `, ${fmtNumber(this.waiting.length)} waiting`;
@@ -316,7 +349,9 @@ class LiveTail {
     status.textContent = row.status ? String(row.status) : "n/a";
     status.className = `tail__status tone--${statusTone(row.status)}`;
     outcome.textContent = OUTCOME_WORDS[row.outcome] || row.outcome || "n/a";
-    outcome.title = row.reason;
+    // The refusal kind in words (v1parity-3): the cell's tooltip and the row's name; the drawer shows it too.
+    const why = row.reason ? this.reasonWords.get(row.reason) || row.reason : "";
+    outcome.title = why;
     egress.textContent = row.egress || "n/a";
     cache.textContent = row.cache || "n/a";
     latency.textContent = `${fmtNumber(row.latency)} ms`;
@@ -325,7 +360,8 @@ class LiveTail {
     node.classList.toggle("is-active", index === this.active);
     node.classList.toggle("is-new", Boolean(row.fresh));
     row.fresh = false;
-    node.setAttribute("aria-label", `${time.textContent}, status ${status.textContent}, ${outcome.textContent}, ${endpoint.textContent}`);
+    const kind = why ? `${outcome.textContent} (${why})` : outcome.textContent;
+    node.setAttribute("aria-label", `${time.textContent}, status ${status.textContent}, ${kind}, ${endpoint.textContent}`);
     node.style.transform = `translateY(${index * this.rowHeight}px)`;
   }
 
@@ -404,7 +440,8 @@ class LiveTail {
     const list = el("dl", { class: "kv" });
     const fields = [
       ["Request id", row.id || "n/a"], ["Time", fmtTime(row.t, { withDay: true })], ["Status", row.status],
-      ["Outcome", OUTCOME_WORDS[row.outcome] || row.outcome], ["Reason", row.reason || "n/a"],
+      ["Outcome", OUTCOME_WORDS[row.outcome] || row.outcome],
+      ["Reason", row.reason ? `${this.reasonWords.get(row.reason) || row.reason} (${row.reason})` : "n/a"],
       ["Egress", row.egress || "n/a"], ["Cache", row.cache || "n/a"], ["Latency", `${fmtNumber(row.latency)} ms`],
       ["Client", row.client || "n/a"], ["Place", row.place || "n/a"], ["Endpoint", `${row.method} ${row.endpoint}`],
     ];

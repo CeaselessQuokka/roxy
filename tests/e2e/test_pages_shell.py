@@ -80,6 +80,26 @@ def test_the_pause_dialog_pauses_and_resumes_through_the_api(open_admin: Any, da
         dashboard.api("POST", "protection/pause", json={"paused": False})
 
 
+def test_the_emergency_limit_dialog_shows_a_refused_limit_under_its_field(open_admin: Any, dashboard: Any) -> None:
+    """The API names a refused limit by the body's field (`limit`, not the setting `global_throttle_limit`), so the
+    reason shows in the dialog's box under the field and marks it invalid (finding functional-4; v1 bug B16: a bad
+    limit is reported, never ignored), and nothing is switched on."""
+    admin = open_admin("/admin/audit")
+    page = admin.page
+    page.locator(".topbar__limit").click()
+    admin.wait("document.querySelector('#dlg-throttle-all[open]') !== null")
+    page.fill("#dlg-limit-limit", "0")
+    page.locator('#dlg-throttle-all .dialog__foot button[type="submit"]').click()
+    admin.wait("(() => { const box = document.querySelector('#dlg-limit-limit-error'); return box && !box.hidden; })()")
+    assert page.locator("#dlg-limit-limit-error").inner_text().strip()
+    assert page.locator("#dlg-limit-limit").get_attribute("aria-invalid") == "true"
+    described = (page.locator("#dlg-limit-limit").get_attribute("aria-describedby") or "").split()
+    assert "dlg-limit-limit-error" in described
+    assert dashboard.api("GET", "protection/throttle-all").json()["enabled"] is False
+    assert admin.axe() == []
+    admin.assert_clean(expected=["status of 422"])
+
+
 def test_a_change_reported_twice_reloads_the_page_once(open_admin: Any, dashboard: Any) -> None:
     """A pause from the dialog asked for two reloads: the form's own after the API answered (`api_forms.js`,
     `data-on-success="reload"`, 300 ms later) and the shell's status check when the stream reported the same change

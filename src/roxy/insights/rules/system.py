@@ -39,9 +39,11 @@ from roxy.insights.rules.abuse import highest_safe, setting_change
 from roxy.insights.rules.base import Rule, register
 from roxy.metrics.queries import Window
 from roxy.rules.models import RULE_TABLES, row_to_input
+from roxy.storage.read_sizes import BUDGET_UNIT_BYTES
 
-GB: Final = 1_000_000_000
-"""`storage_total_budget_gb` is read as decimal gigabytes (the catalog unit is GB)."""
+GB: Final = BUDGET_UNIT_BYTES
+"""One unit of `storage_total_budget_gb` in bytes: 1,073,741,824, as the setting's notes say (the one divisor of
+every budget reading, `read_sizes.BUDGET_UNIT_BYTES`; finding truth-5)."""
 PROJECTION_DAYS: Final = 30
 """SYS-DISK "30-day projection" (11.5 row)."""
 DAY_S: Final = 86_400

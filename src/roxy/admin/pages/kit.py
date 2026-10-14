@@ -57,7 +57,6 @@ from roxy.admin.pages import fmt, inline, registry, shell
 from roxy.admin.pages.registry import CardSpec, PageSpec
 from roxy.core.templating import STATIC_DIR, TEMPLATES_DIR, Templates
 from roxy.deps import get_ctx
-from roxy.metrics import queries
 
 log = logging.getLogger("roxy.admin.pages")
 
@@ -77,8 +76,31 @@ ERROR_CARD_TEMPLATE: Final = "admin/pages/_card_error.html"
 LAZY_CARD_TEMPLATE: Final = "admin/pages/_card_lazy.html"
 MAX_FRAGMENT_PARAMS: Final = 32
 DEFAULT_REFRESH_MIN_S: Final = 15
+LIVE_REFRESH_S: Final = 10
+"""How often a card on the Live range follows the stream at most (`Page.card(live_refresh_s=)`; the `kpi` event
+comes every 2 seconds, so the card is never more than this far behind)."""
 
 _KNOWN_ERRORS: Final = (common.ApiError,)
+
+PAGE_OVERRIDES: Final = "table_page_overrides"
+"""`PageView.extra` key: table spec name -> the page number to read instead of the address's (see `PastTheEnd`)."""
+
+
+class PastTheEnd(Exception):  # a signal between `table_view` and `render_card`, not an error
+    """Raised by `table_view` when the answer of a page number past the last page came back empty though the table
+    has rows (a page number kept from another range or filter, a shared link). `render_card` then renders the card
+    once more on the table's last page (review finding functional-7: "Showing 981 to 17 of 17" and no row)."""
+
+    def __init__(self, table: str, last_page: int) -> None:
+        super().__init__(f"page past the end of {table}")
+        self.table = table
+        self.last_page = last_page
+
+
+def page_overrides(view: Any) -> dict[str, int]:
+    """The view's `PAGE_OVERRIDES` (empty for a view without `extra`, such as a test's stand-in)."""
+    extra = getattr(view, "extra", None)
+    return extra.get(PAGE_OVERRIDES, {}) if isinstance(extra, dict) else {}
 
 
 def templates_of(request: Request) -> Templates:
@@ -109,6 +131,9 @@ class CardDef:
     lazy: bool = False
     refresh_on: tuple[str, ...] = ()
     refresh_min_s: int = DEFAULT_REFRESH_MIN_S
+    live_refresh_s: int | None = None
+    """On the Live range (the last 15 minutes, "streaming", plan 14.2) the card follows the stream's `kpi` event at
+    most this often (review finding functional-12: the Live range never moved); None: only its own `refresh_on`."""
 
 
 @dataclass(slots=True)
@@ -202,6 +227,11 @@ class PageView:
 def card_frame(view: PageView, cdef: CardDef) -> dict[str, Any]:
     """The `frame` every card template receives (`components/page_card.html page_card(frame)`)."""
     spec = cdef.spec
+    refresh_on, refresh_min_s = cdef.refresh_on, cdef.refresh_min_s
+    if cdef.live_refresh_s and is_live_range(view):
+        # The Live range streams: the card follows the stream's `kpi` event (functional-12).
+        refresh_on = tuple(dict.fromkeys((*refresh_on, "kpi")))
+        refresh_min_s = min(refresh_min_s, cdef.live_refresh_s)
     return {
         "card": spec,
         "id": spec.id,
@@ -212,10 +242,15 @@ def card_frame(view: PageView, cdef: CardDef) -> dict[str, Any]:
         "fragment_url": view.fragment_url(spec.id),
         "settings": view.settings(spec.id),
         "settings_open": spec.settings_open,
-        "refresh_on": " ".join(cdef.refresh_on),
-        "refresh_min_s": cdef.refresh_min_s,
+        "refresh_on": " ".join(refresh_on),
+        "refresh_min_s": refresh_min_s,
         "lazy": cdef.lazy,
     }
+
+
+def is_live_range(view: PageView) -> bool:
+    """Whether the page shows the Live range (`range=live`: the last 15 minutes, streaming)."""
+    return str(view.time.view.get("range") or "") == "live"
 
 
 def _base_context(view: PageView) -> dict[str, Any]:
@@ -227,7 +262,12 @@ async def render_card(view: PageView, cdef: CardDef) -> Markup:
     frame = card_frame(view, cdef)
     templates = templates_of(view.request)
     try:
-        context = dict(await cdef.render(view) or {}) if cdef.render is not None else {}
+        try:
+            context = dict(await cdef.render(view) or {}) if cdef.render is not None else {}
+        except PastTheEnd as past:
+            # A page number past the last page: read the last one instead (once; functional-7).
+            view.extra.setdefault(PAGE_OVERRIDES, {})[past.table] = past.last_page
+            context = dict(await cdef.render(view) or {}) if cdef.render is not None else {}
         html = templates.render_to_string(
             view.request, cdef.template, {**_base_context(view), "frame": frame, **context}
         )
@@ -296,8 +336,10 @@ class Page:
         lazy: bool = False,
         refresh_on: Sequence[str] = (),
         refresh_min_s: int = DEFAULT_REFRESH_MIN_S,
+        live_refresh_s: int | None = None,
     ) -> Callable[[CardRenderer], CardRenderer]:
-        """Decorator: `@page.card("log")` registers the renderer of card `log` (a registry card of this page)."""
+        """Decorator: `@page.card("log")` registers the renderer of card `log` (a registry card of this page).
+        `live_refresh_s`: on the Live range the card follows the stream at most this often (`CardDef`)."""
         spec = registry.card(self.id, card_id)  # KeyError for a card the registry does not know
 
         def register(render: CardRenderer) -> CardRenderer:
@@ -308,6 +350,7 @@ class Page:
                 lazy=lazy,
                 refresh_on=tuple(refresh_on),
                 refresh_min_s=refresh_min_s,
+                live_refresh_s=live_refresh_s,
             )
             return render
 
@@ -352,9 +395,10 @@ class Page:
         rows, latest = await ctx.dbs.control.read(control)
         values = prefs.effective(rows, default_theme=prefs.default_theme_of(ctx.settings))
         default_range = self.default_range or str(values.get("default_range") or common.DEFAULT_RANGE)
-        earliest = None
+        earliest, earliest_notice = None, None
         if want_earliest or (default_range == "all" and not request.query_params.get("range")):
-            earliest = await ctx.dbs.metrics.read(queries.earliest_data)
+            # Degrades open (finding robust-2): a failed read shows the last 24 hours with a notice, never a 500.
+            earliest, earliest_notice = await shell.read_earliest(ctx)
         time = shell.resolve_time(
             request.query_params,
             now=ctx.clock.now(),
@@ -363,6 +407,8 @@ class Page:
             default_range=default_range,
             default_compare=str(values.get("compare") or "none"),
         )
+        if earliest_notice and time.view.get("range") == "all":
+            time = shell.with_notice(time, earliest_notice)
         return PageView(
             request=request,
             principal=principal,
@@ -388,11 +434,14 @@ class Page:
         """The shell of this page and a `PageView` carrying it (`page_shell`): for the page itself and for any
         whole page a module adds under its prefix (a drill-down page, a per-client page), so every full page is
         built the same way."""
+        events = tuple(self.stream_events)
+        if (request.query_params.get("range") or "") == "live" and any(c.live_refresh_s for c in self.cards()):
+            events = tuple(dict.fromkeys((*events, "kpi")))  # the Live range's cards follow `kpi` (functional-12)
         built = await shell.build_shell(
             request,
             principal,
             self.spec,
-            stream_events=self.stream_events,
+            stream_events=events,
             extra_setting_keys=self.page_setting_keys(),
             default_range=self.default_range,
         )
@@ -489,10 +538,11 @@ def table_query(view: PageView, spec: TableSpec, *, address: bool = True) -> tup
         except ValueError:
             return -1
 
+    override = page_overrides(view).get(spec.name)  # the last page, after `PastTheEnd`
     try:
         tq = common.check_table_query(
             spec,
-            page=number("page", 1),
+            page=int(override) if override is not None else number("page", 1),
             page_size=number("page_size", common.DEFAULT_PAGE_SIZE),
             sort=raw("sort"),
             order=raw("order"),
@@ -568,6 +618,13 @@ def table_view(
     `format=csv|json` and the current filters). `address` marks the page's main table (see `table_query`; pass the
     same value to both).
     """
+    total = int(answer.get("total") or 0)
+    size = int(answer.get("page_size") or common.DEFAULT_PAGE_SIZE) or common.DEFAULT_PAGE_SIZE
+    shown_page = int(answer.get("page") or 1)
+    if shown_page > 1 and total > 0 and not answer.get("items"):
+        last = max(1, -(-total // size))
+        if last < shown_page and spec.name not in page_overrides(view):
+            raise PastTheEnd(spec.name, last)  # `render_card` renders the card again on the last page
     by_key = {column.key: column for column in spec.columns}
     chosen = [by_key[key] for key in (columns or [c.key for c in spec.columns]) if key in by_key]
     caller_keys = set(answer.get("caller_text") or ()) | set(spec.caller_text)
@@ -605,6 +662,9 @@ def table_view(
             }
         )
     keep_values = {k: v for k, v in (keep if keep is not None else view.time.params).items() if v not in (None, "")}
+    # The answer's own notices (plan 6.8 partial data over a reset, finding truth-3) show with the page's notice.
+    said = [str(text) for text in (notice, *(answer.get("notices") or ())) if text]
+    notice = " ".join(dict.fromkeys(said)) or None
     return {
         "id": table_id,
         "table_name": spec.name,
@@ -645,16 +705,21 @@ def filter_chip(name: str, label: str, value: str, options: Sequence[tuple[str, 
 __all__ = [
     "DEFAULT_CARD_TEMPLATE",
     "DEFAULT_PAGE_TEMPLATE",
+    "LIVE_REFRESH_S",
+    "PAGE_OVERRIDES",
     "CardDef",
     "Page",
     "PageAdmin",
     "PageCsrf",
     "PageFreshAdmin",
     "PageView",
+    "PastTheEnd",
     "card_frame",
     "default_cell",
     "filter_chip",
+    "is_live_range",
     "lazy_card",
+    "page_overrides",
     "page_session",
     "render_card",
     "table_query",

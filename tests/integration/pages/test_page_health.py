@@ -25,6 +25,8 @@ from typing import Any
 import pytest
 
 from pages_harness import HOSTILE, parse_html
+from roxy.admin.api import common
+from roxy.admin.api import health as health_api
 from roxy.admin.pages import registry
 from roxy.config.insight_params import INSIGHT_RULES
 from roxy.core.ids import new_id
@@ -232,6 +234,34 @@ async def test_the_history_equals_the_api_and_exports_through_it(page: Any, page
     assert export.get("href").startswith("/admin/api/v1/health/runs?")
     download = await page.api("GET", export.get("href"))
     assert download.status_code == 200
+
+
+def test_the_history_window_is_clamped_to_what_the_api_accepts() -> None:
+    """Finding robust-3: a window aligned to buckets in `ui_timezone` may start before 1970 or end after 2100."""
+    assert health_api.window_bounds(-2_660_400, 4_102_462_800) == (0, common.MAX_EPOCH_S)
+    assert health_api.window_bounds(1_760_000_000, 1_760_003_600) == (1_760_000_000, 1_760_003_600)
+    widened = health_api.window_filter(store.RunFilter(trigger="schedule"), -1, common.MAX_EPOCH_S + 7200)
+    assert widened == store.RunFilter(trigger="schedule", since=0, until=common.MAX_EPOCH_S)
+
+
+async def test_a_range_beyond_the_api_bounds_keeps_the_history_and_its_export(page: Any, pages_app: Any) -> None:
+    """Finding robust-3: the shell accepts a custom range from 1970 to 2100, whose month buckets reach past both ends
+    in New York; the history still lists the runs of its window and exports through a link the API accepts."""
+    await pages_app.settings(ui_timezone="America/New_York")
+    await pages_app.seed_all()
+    params = {"range": "custom", "from": "0", "to": str(common.MAX_EPOCH_S)}
+    api = (await page.api("GET", "health/runs", params={"from": "0", "to": str(common.MAX_EPOCH_S)})).json()
+    assert api["items"], api  # the seeded run
+    doc = await page.doc(PAGE, params=params)
+    assert doc.select_one("section#history[data-card-error]") is None
+    rows = [row.get("data-row-id") for row in doc.select("#history tbody tr[data-row-id]")]
+    assert rows == [f"run-{item['id']}" for item in api["items"]]
+    export = doc.select_one('#history a[data-export][href*="format=csv"]')
+    href = export.get("href")
+    assert "from=0&" in href, href
+    assert f"to={common.MAX_EPOCH_S}" in href, href
+    download = await page.api("GET", export.get("href"))
+    assert download.status_code == 200, download.text[:200]
 
 
 async def test_starting_a_run_needs_csrf_and_a_fresh_factor_for_the_credential(page: Any, pages_app: Any) -> None:

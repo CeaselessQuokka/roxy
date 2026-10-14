@@ -60,6 +60,20 @@ PROJECTION_DAYS: Final = 30
 MAX_TABLES: Final = 200
 """Tables measured per database (plan P9); the schema has far fewer."""
 
+BUDGET_UNIT_BYTES: Final = 1024**3
+"""Bytes in one unit of `storage_total_budget_gb`: the setting's own notes say "1 GB here means 1,073,741,824 bytes
+(the unit df -h shows)" and that the H-DB-SIZE health check uses the same budget. The one divisor of the Data page,
+the storage alert, the Health check H-DB-SIZE, SYS-DISK and /health (review finding truth-5: two of them divided by
+1,000,000,000, so the same files read as two shares of one budget)."""
+
+
+def budget_bytes(budget_gb: Any) -> int:
+    """`storage_total_budget_gb` in bytes (0 when it is missing or not a number)."""
+    try:
+        return max(0, int(float(budget_gb or 0) * BUDGET_UNIT_BYTES))
+    except (TypeError, ValueError):
+        return 0
+
 
 @dataclass(frozen=True, slots=True)
 class TableMeta:

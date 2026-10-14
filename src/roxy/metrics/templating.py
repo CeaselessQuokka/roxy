@@ -39,6 +39,7 @@ from __future__ import annotations
 import re
 import threading
 from collections.abc import Iterable
+from typing import Final
 
 from roxy.core.redact import redact_label
 
@@ -120,28 +121,68 @@ def clean_path(path: str) -> str:
     return path.split("?", 1)[0].strip("/")
 
 
+# A caller's own `*`, `{` and `}` (and the `%` that escapes them) in a literal segment are written percent-encoded,
+# so in a template only `templatize` placeholders are pattern syntax (review finding esc-1). `%` first, so the
+# encoding can be read back exactly (`literal_text`).
+_LITERAL_ESCAPES: Final[tuple[tuple[str, str], ...]] = (("%", "%25"), ("*", "%2A"), ("{", "%7B"), ("}", "%7D"))
+_LITERAL_RE: Final = re.compile(r"%(25|2A|7B|7D)", re.IGNORECASE)
+_LITERAL_BACK: Final[dict[str, str]] = {"25": "%", "2A": "*", "7B": "{", "7D": "}"}
+
+
+def escape_literal(segment: str) -> str:
+    """A literal path segment with the characters a template or a rule pattern would read as syntax encoded."""
+    if not any(char in segment for char, _ in _LITERAL_ESCAPES):
+        return segment
+    for char, code in _LITERAL_ESCAPES:
+        segment = segment.replace(char, code)
+    return segment
+
+
+def literal_text(segment: str) -> str:
+    """The caller's own text of a literal template segment (`escape_literal` read back): what a rule or a purge
+    that names the template must match in a request path."""
+    if "%" not in segment:
+        return segment
+    return _LITERAL_RE.sub(lambda found: _LITERAL_BACK[found.group(1).upper()], segment)
+
+
+def _escape_literals(original: str, templated: str) -> str:
+    """`templated` (`templatize(original)`) with every segment it kept as written passed through `escape_literal`.
+    `templatize` maps segments one to one, so a segment it changed is one of its own placeholders."""
+    before, after = original.split("/"), templated.split("/")
+    if len(before) != len(after):  # cannot happen (templatize keeps the segment count); keep v1's text then
+        return templated
+    return "/".join(escape_literal(seg) if seg == raw else seg for raw, seg in zip(before, after, strict=True))
+
+
 def template_for(host: str, path: str) -> str:
     """The endpoint template of a request to `host` + `path` (`ProxyRequest.template`, plan 6.2 dimension).
 
     `path` may start with `/` and may carry a query; both are removed as in v1. A path that already starts
-    with the host (v1 passed `dst`, the whole `host/path`) is not doubled. The template is then scrubbed like a
-    log line (`redact_label`): a path segment that is not id-shaped stays as it is, so a caller who puts a
-    credential piece there (`/v1/x.<piece>`) would otherwise have it stored in every metric row, Live row, event
-    and hot.db key that carries the template (plan C1, 9.15). Ordinary paths are returned exactly as v1 made them.
+    with the host (v1 passed `dst`, the whole `host/path`) is not doubled. A literal segment's `*`, `{`, `}` and
+    `%` are percent-encoded (`escape_literal`), so a caller who asks for `/games.roblox.com/*` gets the template
+    `games.roblox.com/%2A`, never one whose `*` a rule or a purge would read as a wildcard over the whole host
+    (review finding esc-1); Roblox's own paths hold none of them, so their templates are unchanged. The template
+    is then scrubbed like a log line (`redact_label`): a path segment that is not id-shaped stays as it is, so a
+    caller who puts a credential piece there (`/v1/x.<piece>`) would otherwise have it stored in every metric row,
+    Live row, event and hot.db key that carries the template (plan C1, 9.15). Ordinary paths are returned exactly
+    as v1 made them.
     """
     cleaned = clean_path(path)
     host = host.strip().strip("/")
     if host and cleaned != host and not cleaned.startswith(host + "/"):
         cleaned = f"{host}/{cleaned}" if cleaned else host
-    return redact_label(templatize(cleaned))[:MAX_TEMPLATE_CHARS]
+    return redact_label(_escape_literals(cleaned, templatize(cleaned)))[:MAX_TEMPLATE_CHARS]
 
 
 def remap_templates(examples: dict[str, str]) -> dict[str, str]:
     """For a future data migration: old template -> new template, by re-templating one concrete example of each
     (plan 14.3). Templates whose example produces the same text map to themselves."""
-    return {
-        old: redact_label(templatize(clean_path(example)))[:MAX_TEMPLATE_CHARS] for old, example in examples.items()
-    }
+    out: dict[str, str] = {}
+    for old, example in examples.items():
+        cleaned = clean_path(example)
+        out[old] = redact_label(_escape_literals(cleaned, templatize(cleaned)))[:MAX_TEMPLATE_CHARS]
+    return out
 
 
 class VocabularyGate:

@@ -37,7 +37,7 @@
 
 import uPlot from "vendor/uplot";
 import { el, icon, qs, qsa, rafThrottle } from "roxy/dom";
-import { fmtTime, fmtValue } from "roxy/format";
+import { displayZone, fmtTime, fmtValue } from "roxy/format";
 import { getJSON, localAdminHref } from "roxy/net";
 
 const MAX_TABLE_ROWS = 500;
@@ -348,12 +348,15 @@ class Chart {
       });
     }
     const yMin = this.yMin;
+    const zone = displayZone();
     return {
       width: Math.max(this.plot.clientWidth, 120),
       height: Math.max(this.plot.clientHeight, 120),
       class: "roxy-uplot",
       legend: { show: false },
       focus: { alpha: 0.35 },
+      // The x axis in the dashboard's time zone, like every other time on the page (finding truth-9).
+      ...(zone ? { tzDate: (ts) => uPlot.tzDate(new Date(ts * 1e3), zone) } : {}),
       cursor: {
         drag: { x: true, y: false, setScale: true },
         points: { size: 7, width: 2, fill: colors.surface },
@@ -363,7 +366,9 @@ class Chart {
         x: { time: true },
         y: {
           range: (u, lo, hi) => {
-            const min = yMin ?? Math.min(0, lo ?? 0);
+            // `y.min` is where the axis starts for numbers that are never negative; a value below it (a negative
+            // avoided share, plan P6) moves the axis down instead of being drawn outside the plot (truth-12).
+            const min = Math.min(yMin ?? 0, lo ?? 0);
             let max = hi ?? 1;
             if (!(max > min)) max = min + 1;
             return [min, max + (max - min) * 0.08];

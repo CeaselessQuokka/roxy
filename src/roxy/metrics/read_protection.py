@@ -98,6 +98,12 @@ ATTEMPT_RULE_TABLES: Final[frozenset[str]] = frozenset({"rules_endpoint_block", 
 event's `detail.rules`)."""
 MAX_ATTEMPT_RULE_IDS: Final = 8
 """Most refusing rule ids listed per attempts row (one path is normally refused by one rule)."""
+MATCHED_RULE_TABLE: Final = "rules_header"
+"""The attempts tab whose refusals record what their rule matched (`detail.matched`: a request filter's header,
+name or value, and matched text; finding v1parity-5)."""
+_MATCH_STAMP_DIGITS: Final = 15
+"""`at_ms`, then the event id, each zero-padded to this width in front of `detail.matched`, so the largest text of a
+group is its newest refusal (the id breaks a tie within one millisecond)."""
 
 
 def _bounded(limit: int, cap: int = MAX_PAGE_ROWS) -> int:
@@ -338,7 +344,9 @@ def refusal_attempts(
     without a client hash: folded over the recorder's budget, or no `ip_hash_key`), `methods`, `last_ms`, and with
     `rule_table` (one of `ATTEMPT_RULE_TABLES`) `rule_ids`: the row ids of that table the refusals recorded as the
     rule that refused them (`detail.rules`, written since review round 3; at most `MAX_ATTEMPT_RULE_IDS`, older
-    refusals carry none).
+    refusals carry none). For the request filters (`rule_table` `MATCHED_RULE_TABLE`) also v1's Last Header,
+    Triggered By and Matched Text: `last_header`, `last_field` (`key` or `value`) and `last_text` of the newest
+    refusal of the row that recorded what its filter matched (`detail.matched`, finding v1parity-5; None without one).
     """
     order = ATTEMPT_SORTS.get(sort)
     if order is None:
@@ -353,12 +361,21 @@ def refusal_attempts(
         having = " HAVING instr(lower(path), ?) > 0"
     # The json path is a bound parameter built from an allowlisted table name (never caller text).
     rule_ids = "group_concat(DISTINCT json_extract(detail_json, ?))" if rule_table is not None else "NULL"
+    # The newest recorded match of the group: the largest "<at_ms><id>" (zero-padded) followed by the
+    # `detail.matched` JSON (a refusal without one gives NULL, which max() skips).
+    stamp = f"%0{_MATCH_STAMP_DIGITS}d"
+    matched = (
+        f"max(printf('{stamp}{stamp}', at_ms, id) || json_extract(detail_json, '$.matched'))"
+        if rule_table == MATCHED_RULE_TABLE
+        else "NULL"
+    )
     grouped = (
         f"SELECT {path_expr} AS path, max(endpoint_template) AS template, {_COUNT} AS attempts, "  # noqa: S608  # constant clauses
         "count(DISTINCT ip_hash) AS clients, "
         f"sum(CASE WHEN ip_hash IS NULL THEN coalesce(json_extract(detail_json, '$.count'), 1) ELSE 0 END) "
         "AS unattributed, group_concat(DISTINCT json_extract(detail_json, '$.method')) AS methods, "
-        f"{rule_ids} AS rule_ids, max(at_ms) AS last_ms FROM events WHERE {where} GROUP BY path{having}"
+        f"{rule_ids} AS rule_ids, {matched} AS last_matched, max(at_ms) AS last_ms FROM events WHERE {where} "
+        f"GROUP BY path{having}"
     )
     select_params: list[Any] = [f"$.rules.{rule_table}"] if rule_table is not None else []
     group_params = [*select_params, *params, search.lower()] if search else [*select_params, *params]
@@ -368,8 +385,9 @@ def refusal_attempts(
         f"SELECT * FROM ({grouped}) ORDER BY {order} {direction}, path LIMIT ? OFFSET ?",  # noqa: S608  # allowlisted
         (*group_params, _bounded(limit), max(0, int(offset))),
     ).fetchall()
-    items = [
-        {
+    items = []
+    for row in rows:
+        item: dict[str, Any] = {
             "path": row["path"],
             "template": row["template"],
             "attempts": int(row["attempts"] or 0),
@@ -379,8 +397,12 @@ def refusal_attempts(
             "rule_ids": sorted({str(i) for i in str(row["rule_ids"] or "").split(",") if i})[:MAX_ATTEMPT_RULE_IDS],
             "last_ms": int(row["last_ms"]) if row["last_ms"] is not None else None,
         }
-        for row in rows
-    ]
+        if rule_table == MATCHED_RULE_TABLE:
+            found = _detail(str(row["last_matched"] or "")[2 * _MATCH_STAMP_DIGITS :])
+            for key, name in (("last_header", "header"), ("last_field", "field"), ("last_text", "text")):
+                value = found.get(name)
+                item[key] = str(value) if value else None
+        items.append(item)
     return {"total": total, "rows": items}
 
 

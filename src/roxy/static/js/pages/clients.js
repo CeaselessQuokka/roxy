@@ -26,7 +26,7 @@
  *   static/js/page.js, static/js/api_forms.js, roxy/admin/api/clients.py (`_run_lookup`), roxy/admin/pages/clients.py.
  */
 
-import { onContent, openDrawerFrom, postJSON } from "roxy/page";
+import { localTime, onContent, openDrawerFrom, postJSON } from "roxy/page";
 import { el, icon, qs, qsa } from "roxy/dom";
 
 const DIGITS = /^[0-9]{1,20}$/;
@@ -43,7 +43,8 @@ function count(value) {
 
 function when(value) {
   const date = new Date(String(value || ""));
-  return Number.isNaN(date.getTime()) ? text(value) : date.toLocaleString();
+  // The dashboard's time zone, like the server's tables (finding truth-9).
+  return Number.isNaN(date.getTime()) ? text(value) : localTime(date.getTime() / 1000);
 }
 
 /** A Roblox page address as text with a copy button. The dashboard never links to another site from data, so

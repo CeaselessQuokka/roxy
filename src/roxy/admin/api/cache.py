@@ -322,10 +322,8 @@ def _service(ctx: Any) -> RulesService:
 
 
 def _delta(current: Any, previous: Any) -> tuple[float | None, float | None]:
-    if not isinstance(current, int | float) or not isinstance(previous, int | float):
-        return None, None
-    change = current - previous
-    return round(change, 4), (round(change * 100.0 / previous, 2) if previous else None)
+    """`queries.change`: the percent divides by the size of the baseline, so its sign follows the change."""
+    return queries.change(current, previous)
 
 
 def _row(table: str, entry: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -789,9 +787,12 @@ async def cache_ignored_param_remove(
     _csrf: CsrfChecked,
     name: Annotated[str, Path(max_length=MAX_PARAM_CHARS)],
     body: Annotated[RemoveBody | None, Body()] = None,
+    name_q: Annotated[str | None, Query(alias="name", min_length=1, max_length=MAX_PARAM_CHARS)] = None,
 ) -> dict[str, Any]:
     """Put a parameter back into cache keys; by default drop the answers stored without it (they were shared by
-    callers that sent different values, which would now be wrong)."""
+    callers that sent different values, which would now be wrong). `?name=` names the parameter instead of the path
+    (`common.name_in_path`: a name `.` or `..` cannot be a path segment; finding esc-2)."""
+    name = common.named(name, name_q)
     ctx = get_ctx(request)
     options = body or RemoveBody()
     reason = require_reason(options.reason, required=False)

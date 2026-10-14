@@ -127,6 +127,22 @@ async def test_the_tables_show_the_apis_rows(page: Any, pages_app: Any) -> None:
     assert [n.text() for n in persistence.select("#storage tbody th")] == [db["file"] for db in files["databases"]]
 
 
+async def test_the_persistence_writer_counts_say_they_are_this_workers(page: Any, pages_app: Any) -> None:
+    """Finding truth-7 (DESIGN 13.1, plan P6): the writes, the write errors and the status line built from them are
+    this worker's `DbStats`, so the answer and the card label them; the answer names the worker that counted."""
+    from roxy.admin.api import system as system_api
+
+    answer = (await page.api("GET", "system/persistence")).json()
+    assert answer["writers_scope"] == system_api.THIS_WORKER_SCOPE == "this_worker"
+    assert answer["writers_worker_id"] == pages_app.ctx.worker_id
+    assert answer["writers_note"] == system_api.WRITERS_NOTE
+    doc = parse_html((await page.fragment("system", "persistence")).text)
+    status = " ".join(doc.select_one("#persistence .system-status").text().split())
+    assert "in this worker" in status, status
+    assert "this worker" in doc.select_one("#storage caption").text()
+    assert system_api.WRITERS_NOTE in " ".join(doc.text().split())
+
+
 def _facts(doc: Any, section: str) -> dict[str, str]:
     """The term and value pairs of the facts list under one heading id (`dt` text -> `dd` text)."""
     node = doc.select_one(f'section[aria-labelledby="{section}"] dl')

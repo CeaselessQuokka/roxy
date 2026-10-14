@@ -17,22 +17,56 @@
  *   The text/event-stream format: lines `event:`, `data:` (several are joined with newlines), `id:`, `retry:`, and
  *   comments starting with ":"; a blank line ends one event. Reconnects wait the server's `retry` value, or an
  *   exponential backoff from 1 to 30 seconds with jitter (so many tabs do not reconnect in lockstep), reset once a
- *   connection has delivered events. A 401 raises `roxy:unauthorized` and stops for good; this traffic never counts
- *   as session activity on the server (plan 9.6). The server's two control events: `unauthorized` (the session
- *   ended while the stream was open; the server closes it) is handled like that 401, without a reconnect that could
- *   only fail; `gap` (a resume could not replay everything that was missed) is passed on like any event, so each
- *   consumer reloads or marks what it shows (`roxy:sse:gap` on the page-wide stream).
+ *   connection has delivered events. A 401, or the server's control event `unauthorized` (the session ended while
+ *   the stream was open; the server closes it), is checked with `GET /admin/api/v1/auth/session` before the
+ *   page is told it is signed out: a re-entered second factor rotates the session cookie, and the stream opened
+ *   with the old one is ended although the admin is still signed in (review finding authz-1). While the session
+ *   answers 200 the stream reconnects at once with the new cookie (and the page takes the new CSRF token); a 401
+ *   raises `roxy:unauthorized` and stops for good; anything else (no answer, a 503) reconnects with the backoff,
+ *   and after `MAX_RECHECKS` checks within a minute the server's word stands (it sends `unauthorized` and 401 only
+ *   for a session it read as ended; a control.db outage is a 503 and never a recheck, C7). This traffic never
+ *   counts as session activity on the server (plan 9.6). `gap` (a resume could not replay everything that was
+ *   missed) is passed on like any event, so each consumer reloads or marks what it shows (`roxy:sse:gap` on the page-wide stream).
+ *   Settings: the page-wide stream's URL carries the `config_version` the page was rendered with, and every
+ *   `settings_changed` moves it, so a reconnect after a drop is told at once about a change it missed (finding
+ *   functional-5). `roxy:session-rotated` (static/js/reauth.js, or another tab) reconnects at once.
  *
  * What to read next
  *   static/js/live_tail.js (the main consumer), roxy/admin/sse.py (the server side, P11 part two).
  */
 
 import { qs } from "roxy/dom";
-import { signalUnauthorized } from "roxy/net";
+import { setCsrfToken, signalUnauthorized } from "roxy/net";
 
 const MAX_BUFFER = 1024 * 1024;
 const MIN_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30000;
+const MAX_RECHECKS = 3;  // session checks within RECHECK_WINDOW_MS before the server's word stands
+const RECHECK_WINDOW_MS = 60000;
+const SESSION_URL = "/admin/api/v1/auth/session";
+
+/**
+ * Is the session of this browser still alive? `"alive"` (200: the new masked CSRF token is taken too), `"ended"`
+ * (401), or `"unknown"` (no answer, 503 while control.db cannot be read, anything else).
+ */
+export async function sessionState() {
+  let response;
+  try {
+    response = await fetch(document.body.dataset.sessionUrl || SESSION_URL, {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "error",
+    });
+  } catch {
+    return "unknown";
+  }
+  if (response.status === 401) return "ended";
+  if (!response.ok) return "unknown";
+  const body = await response.json().catch(() => ({}));
+  if (body && typeof body.CsrfToken === "string") setCsrfToken(body.CsrfToken);
+  return "alive";
+}
 
 export class EventStream {
   constructor(url, { onEvent = () => {}, onState = () => {}, params = {} } = {}) {
@@ -47,6 +81,7 @@ export class EventStream {
     this.timer = 0;
     this.stopped = true;
     this.state = "off";
+    this.rechecks = [];  // when each recent session check ran (Date.now())
   }
 
   setState(state) {
@@ -76,6 +111,45 @@ export class EventStream {
     if (this.controller) this.controller.abort();
     this.controller = null;
     this.setState("off");
+  }
+
+  /** Reconnect at once (the session cookie was rotated: the open connection still carries the old one). */
+  reconnectNow() {
+    if (this.stopped) return;
+    window.clearTimeout(this.timer);
+    if (this.controller) this.controller.abort();
+    this.backoffMs = MIN_BACKOFF_MS;
+    this.connect();
+  }
+
+  /**
+   * The server said the session ended (a 401, or the `unauthorized` event). Ask whether it did: a rotated
+   * session (a fresh second factor) is alive under a new cookie, and a control.db outage proves nothing.
+   */
+  async recheckSession() {
+    window.clearTimeout(this.timer);
+    if (this.controller) this.controller.abort();
+    this.controller = null;
+    // The server's own word (a 401 or `unauthorized`; it never says so while it cannot read the session, authz-4)
+    // stands once MAX_RECHECKS checks within RECHECK_WINDOW_MS did not prove the session alive under a new cookie:
+    // a stream that keeps being ended is not reopened forever.
+    const now = Date.now();
+    this.rechecks = this.rechecks.filter((at) => now - at < RECHECK_WINDOW_MS);
+    const verdict = this.rechecks.length < MAX_RECHECKS ? await sessionState() : "ended";
+    this.rechecks.push(now);
+    if (this.stopped) return;
+    if (verdict === "alive") {
+      this.backoffMs = MIN_BACKOFF_MS;
+      this.connect();
+      return;
+    }
+    if (verdict === "unknown") {
+      this.scheduleReconnect();  // no answer either way: try again with the backoff
+      return;
+    }
+    this.stopped = true;
+    this.setState("expired");
+    signalUnauthorized("sse");
   }
 
   /** Change the server-side filter: reconnects at once, keeping Last-Event-ID. */
@@ -118,9 +192,7 @@ export class EventStream {
       return;
     }
     if (response.status === 401) {
-      this.stopped = true;
-      this.setState("expired");
-      signalUnauthorized("sse");
+      this.recheckSession();
       return;
     }
     if (!response.ok || !response.body) {
@@ -182,12 +254,8 @@ export class EventStream {
 
   dispatch(event) {
     if (event.type === "unauthorized") {
-      // The session ended mid-stream (roxy/admin/sse.py): stop for good and show the sign-in overlay once.
-      this.stopped = true;
-      window.clearTimeout(this.timer);
-      if (this.controller) this.controller.abort();
-      this.setState("expired");
-      signalUnauthorized("sse");
+      // The server ended the stream for its session: check whether the session really ended (see above).
+      this.recheckSession();
       return;
     }
     const raw = event.data.join("\n");
@@ -196,6 +264,10 @@ export class EventStream {
       data = JSON.parse(raw);
     } catch {
       /* not JSON: hand over the text */
+    }
+    if (event.type === "settings_changed" && data && Number.isInteger(data.config_version)) {
+      // A reconnect then starts from the version this page has seen (functional-5).
+      this.params = { ...this.params, config_version: String(data.config_version) };
     }
     this.onEvent({ type: event.type, data, id: this.lastEventId });
   }
@@ -232,5 +304,7 @@ export function initStream() {
     },
   });
   stream.start();
+  // A fresh second factor in this tab or another rotated the session cookie: reconnect with it at once.
+  document.addEventListener("roxy:session-rotated", () => stream.reconnectNow());
   return stream;
 }

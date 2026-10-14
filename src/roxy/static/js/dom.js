@@ -192,18 +192,91 @@ export function hasUnsavedChanges(root = document) {
   return false;
 }
 
+// ------------------------------------------------------------------------------------------ busy controls
+
+/**
+ * Keyboard focus survives a control that disables itself while its request runs (review finding a11y-8). A
+ * disabled element cannot hold focus, so the browser moves it to <body> and it never comes back: the keyboard user
+ * starts again from the top. This keeper notices a focused button or field becoming disabled (one MutationObserver
+ * on the `disabled` attribute for the whole page, so every page's busy buttons are covered) and gives focus back
+ * when it is enabled again, or, when a refresh replaced it, to its successor with the same id or action, as long as
+ * focus is still on <body> (the admin has not moved on).
+ */
+export function initFocusKeeper() {
+  let lastFocused = null;
+  const parked = new Map();  // the disabled element -> how to find its successor
+  document.addEventListener("focusin", (event) => {
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    lastFocused = target;
+    if (target && target !== document.body && !parked.has(target)) parked.clear();  // the admin moved on
+  }, true);
+  const idle = () => !document.activeElement || document.activeElement === document.body;
+  const restore = () => {
+    for (const [node, twin] of parked) {
+      if (document.activeElement === node) {
+        if (!node.disabled) parked.delete(node);  // enabled again before the browser moved focus away
+        continue;
+      }
+      if (!idle()) continue;
+      if (node.isConnected && !node.disabled) {
+        parked.delete(node);
+        node.focus();
+      } else if (!node.isConnected) {
+        parked.delete(node);
+        const successor = twin ? document.querySelector(twin) : null;
+        if (successor instanceof HTMLElement && !successor.disabled) successor.focus();
+      }
+    }
+  };
+  const observer = new MutationObserver((records) => {
+    for (const record of records) {
+      const node = record.target;
+      // The browser moves focus off a disabled element only at its next rendering step, so the element may still
+      // be the active one here: it is parked either way, and given focus back only while focus is on <body>.
+      if (record.type === "attributes" && node instanceof HTMLElement && node.disabled
+          && (node === document.activeElement || node === lastFocused)) {
+        const twin = node.id ? `#${CSS.escape(node.id)}`
+          : node.dataset.action ? `[data-action="${CSS.escape(node.dataset.action)}"]` : "";
+        parked.set(node, twin);
+      }
+    }
+    if (parked.size) restore();
+  });
+  observer.observe(document.body, { attributes: true, attributeFilter: ["disabled"], childList: true, subtree: true });
+}
+
 // ------------------------------------------------------------------------------------------ reloading
 
 let reloadStarted = false;
+let unloading = false;
+const RELOAD_KEPT_MS = 1500;
+
+window.addEventListener("pagehide", () => {
+  unloading = true;
+});
 
 /** Reload the page once. One change can ask twice (an action's own reload after its API answer, and the shell's
  *  status check when the stream reports the same change); a second `location.reload()` would abort the navigation the
- *  first one started, so every later call is ignored. `delayMs` lets a toast be seen first. */
+ *  first one started, so every later call is ignored. `delayMs` lets a toast be seen first.
+ *  When an unsaved edit makes the browser ask "Leave site?" and the admin stays, the page was not replaced: the
+ *  pending mark is cleared and `roxy:reload-kept` lets the shell redraw what the reload was for (the top bar,
+ *  banners and dialogs after a pause; review finding functional-8). The browser's question pauses this page's
+ *  timers, so the check runs only after the admin answered it. */
 export function reloadPage({ delayMs = 0 } = {}) {
   if (reloadStarted) return;
   reloadStarted = true;
-  if (delayMs > 0) window.setTimeout(() => window.location.reload(), delayMs);
-  else window.location.reload();
+  const reload = () => {
+    const asks = hasUnsavedChanges();
+    window.location.reload();
+    if (!asks) return;
+    window.setTimeout(() => {
+      if (unloading) return;
+      reloadStarted = false;
+      document.dispatchEvent(new CustomEvent("roxy:reload-kept"));
+    }, RELOAD_KEPT_MS);
+  };
+  if (delayMs > 0) window.setTimeout(reload, delayMs);
+  else reload();
 }
 
 /** True once `reloadPage` was asked: the page is about to be replaced, so there is nothing left to check. */
