@@ -4,31 +4,38 @@ What this is
     `DOCS` lists the repository guides the Help page renders at `/admin/help/<slug>` (the admin guide, the runbooks,
     the architecture, security, learning path and performance guides). `load_doc(spec)` renders one with the public
     site's Markdown renderer (`roxy.public.pages.render_guide`, the one renderer of every guide) and caches it per
-    file version; `runbook_links()` reads the machine-readable "Link index" table of `docs/RUNBOOKS.md`, the table
-    that resolves every runbook name the alerts and the health checks link to.
+    file version; `load_guide()` renders the admin guide (`ADMIN_GUIDE.md`) the same way and cuts it into its `##`
+    chapters, one page each; `runbook_links()` reads the machine-readable "Link index" table of `docs/RUNBOOKS.md`,
+    the table that resolves every runbook name the alerts and the health checks link to.
 
 Why it exists
     Plan 14.1 and 16.3 put the admin guide on the Help page, and plan 17.7 and 13.2 send the owner from an alert
     email or a failed health check to a runbook: alerts link to `/admin/help#runbook-<name>`
     (`roxy.notify.notifier.runbook_link`), health checks to `/admin/help/runbooks#<anchor>` and
     `/admin/help/operations#<name>` (`roxy.health.checks`). Every one of those links must land on its runbook.
-    The admin guide's file (`ADMIN_GUIDE.md` in the docs folder) is not written yet (the docs lane writes it
-    later); until it exists, its page and the Help card say so and point to where each chapter's material already
-    lives.
+    The admin guide is about 500 KB of Markdown in 26 chapters: as one page it is about 640 KB of HTML, far too
+    heavy for a phone, so the Help page shows it one chapter at a time (a lead decision of the final review). The
+    Markdown stays one file, readable on GitHub.
 
 How it works
     The documents live in `docs/` next to the glossary (`texts.GLOSSARY_PATH.parent`, found the same way, so a
-    release ships them together). Rendering is blocking (it reads and parses a file of up to about 90 KB), so the
-    page calls `load_doc` through `asyncio.to_thread`; the result is kept per slug until the file's size or mtime
-    changes (one entry per document, bounded by `DOCS`). After rendering, the page's own `<h1>` replaces the
+    release ships them together). Rendering is blocking (it reads and parses a file of up to about 500 KB), so the
+    page calls `load_doc` and `load_guide` through `asyncio.to_thread`; each result is kept until the file's size or
+    mtime changes (one entry per document, bounded). After rendering, the page's own `<h1>` replaces the
     document's (one h1 per page), every table is wrapped in a keyboard-focusable scroll region (a wide table must
     never widen a phone screen, and a scrolling region must be reachable with the keyboard), and on the runbooks the
     `operations#<name>` names of the link index get an anchor just before their runbook's heading. Markdown is
     rendered with raw HTML escaped (markdown-it `html=False`), so nothing in a document becomes markup by itself.
+    The guide is cut at the renderer's own `##` heading markup (code blocks are escaped, so the marker cannot occur
+    inside one); the text before the first chapter is its introduction. Every element id is assigned to the chapter
+    that holds it, and an in-guide link `#anchor` to an id of another chapter is rewritten to that chapter's address
+    (`/admin/help/guide/<chapter>#anchor`). The first chapter ("Getting started") is shown on `/admin/help/guide`
+    itself, after the introduction and the contents, so `/admin/help/guide#getting-started` keeps landing on it.
 
 What to read next
     `roxy/admin/pages/help.py` (the routes), `roxy/public/pages.py` (`render_guide`, `slugify`), `docs/RUNBOOKS.md`
-    (its "Link index"), `tests/unit/test_docs_references.py` (which pins that index against the alerts and checks).
+    (its "Link index"), `tests/unit/test_docs_references.py` (which pins that index against the alerts and checks),
+    `tests/unit/test_help_guide_chapters.py` (the chapter cut).
 """
 
 from __future__ import annotations
@@ -48,10 +55,17 @@ DOCS_DIR: Final = GLOSSARY_PATH.parent
 """`docs/` of this checkout or release (the glossary's directory, found by `texts.find_glossary`)."""
 
 RUNBOOKS_FILE: Final = "RUNBOOKS.md"
+GUIDE_FILE: Final = "ADMIN_GUIDE.md"
+GUIDE_SLUG: Final = "guide"
+GUIDE_PATH: Final = "/admin/help/guide"
+"""Where the admin guide's first page lives (introduction, contents, first chapter); a chapter is `<this>/<slug>`."""
 LINK_INDEX_HEADING: Final = "## Link index"
 OPERATIONS_PREFIX: Final = "operations#"
 MAX_DOC_BYTES: Final = 1024 * 1024
-"""Largest document the Help page renders (the biggest guide is under 100 KB; plan P9: every read is bounded)."""
+"""Largest document the Help page renders (the admin guide is about 500 KB, the next biggest under 100 KB; plan P9:
+every read is bounded)."""
+MAX_GUIDE_CHAPTERS: Final = 64
+"""Most chapters the guide is cut into (it has 26): a file with more `##` headings keeps the rest in the last page."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,8 +82,8 @@ class DocSpec:
 
 DOCS: Final[tuple[DocSpec, ...]] = (
     DocSpec(
-        "guide",
-        "ADMIN_GUIDE.md",
+        GUIDE_SLUG,
+        GUIDE_FILE,
         "Admin guide",
         "How to run Roxy day to day, one chapter per dashboard page.",
     ),
@@ -293,17 +307,173 @@ def available(directory: Path | None = None) -> dict[str, bool]:
     return {spec.slug: doc_path(spec, directory).is_file() for spec in DOCS}
 
 
+# ============================================================================================ the guide by chapter
+
+_CHAPTER_MARK: Final = '<div class="heading heading-h2"><h2 id="'
+"""How `render_guide` opens every `##` heading (code is escaped, so this text never occurs inside a code block)."""
+_LOCAL_HREF: Final = re.compile(r'href="#([^"]+)"')
+
+
+def chapter_href(slug: str, anchor: str | None = None, *, first: bool = False) -> str:
+    """The address of `anchor` in the guide chapter `slug`: the first chapter is on the guide's own page (always with
+    its fragment, which skips the introduction and the contents), every other chapter on `/admin/help/guide/<slug>`
+    (with no fragment when the anchor is the chapter's own heading, which opens the page)."""
+    if first:
+        return f"{GUIDE_PATH}#{anchor or slug}"
+    if anchor is None or anchor == slug:
+        return f"{GUIDE_PATH}/{slug}"
+    return f"{GUIDE_PATH}/{slug}#{anchor}"
+
+
+@dataclass(frozen=True, slots=True)
+class GuideChapter:
+    """One `##` chapter of the admin guide, shown as a page of its own."""
+
+    number: int
+    """1 for the first chapter, which `/admin/help/guide` shows after the introduction."""
+    slug: str
+    """The id of the chapter's heading (`getting-started`), also its address segment."""
+    title: str
+    html: Markup
+    """The chapter's body, heading included, with in-guide links pointed at the pages that hold their targets."""
+    sections: tuple[TocEntry, ...]
+    """Its `###` headings, for the contents list."""
+    ids: frozenset[str]
+
+    @property
+    def first(self) -> bool:
+        return self.number == 1
+
+    @property
+    def href(self) -> str:
+        return chapter_href(self.slug, first=self.first)
+
+
+@dataclass(frozen=True, slots=True)
+class GuideBook:
+    """The admin guide cut into its chapters: its title, its introduction (shown on the first page) and the chapters
+    in order."""
+
+    title: str
+    intro: Markup
+    chapters: tuple[GuideChapter, ...]
+
+    def chapter(self, slug: str) -> GuideChapter | None:
+        return next((item for item in self.chapters if item.slug == slug), None)
+
+    def neighbors(self, chapter: GuideChapter) -> tuple[GuideChapter | None, GuideChapter | None]:
+        """The chapters before and after `chapter` (None at either end)."""
+        index = chapter.number - 1
+        before = self.chapters[index - 1] if index > 0 else None
+        after = self.chapters[index + 1] if index + 1 < len(self.chapters) else None
+        return before, after
+
+
+def _cut(body: str) -> tuple[str, list[tuple[str, str]]]:
+    """The introduction and `(slug, html)` per `##` chapter, at most `MAX_GUIDE_CHAPTERS` (the rest stays in the
+    last one)."""
+    intro, *pieces = body.split(_CHAPTER_MARK)
+    chapters: list[tuple[str, str]] = []
+    for piece in pieces:
+        html = _CHAPTER_MARK + piece
+        if len(chapters) >= MAX_GUIDE_CHAPTERS:
+            slug, last = chapters[-1]
+            chapters[-1] = (slug, last + html)
+            continue
+        chapters.append((piece.split('"', 1)[0], html))
+    return intro, chapters
+
+
+def _point_links(html: str, here: int, home: dict[str, int], slugs: list[str]) -> str:
+    """`href="#anchor"` to an id of another chapter becomes that chapter's address with the anchor; links to this
+    page, and to ids the guide does not have, stay as written (a test reports the latter)."""
+
+    def repoint(match: re.Match[str]) -> str:
+        anchor = match.group(1)
+        target = home.get(anchor)
+        if target is None or target == here:
+            return match.group(0)
+        return f'href="{chapter_href(slugs[target], anchor, first=target == 0)}"'
+
+    return _LOCAL_HREF.sub(repoint, html)
+
+
+def cut_guide(doc: RenderedDoc) -> GuideBook:
+    """The rendered admin guide cut into its chapters (see the module docstring)."""
+    intro, pieces = _cut(str(doc.html))
+    slugs = [slug for slug, _ in pieces]
+    home: dict[str, int] = dict.fromkeys(_ID.findall(intro), 0)  # the introduction is on the first page
+    for number, (_, html) in enumerate(pieces):
+        home.update(dict.fromkeys(_ID.findall(html), number))
+    titles = {entry.anchor: entry.title for entry in doc.toc if entry.level == 2}
+    sections: dict[str, list[TocEntry]] = {slug: [] for slug in slugs}
+    current: str | None = None
+    for entry in doc.toc:
+        if entry.level == 2:
+            current = entry.anchor if entry.anchor in sections else current
+        elif current is not None:
+            sections[current].append(entry)
+    chapters = tuple(
+        GuideChapter(
+            number=number + 1,
+            slug=slug,
+            title=titles.get(slug, slug),
+            # markdown-it escaped the file (html=False); only our own attribute values were rewritten.
+            html=Markup(_point_links(html, number, home, slugs)),  # noqa: S704
+            sections=tuple(sections[slug]),
+            ids=frozenset(_ID.findall(html)),
+        )
+        for number, (slug, html) in enumerate(pieces)
+    )
+    intro_html = Markup(_point_links(intro, 0, home, slugs))  # noqa: S704 (as above)
+    return GuideBook(doc.title, intro_html, chapters)
+
+
+_guide_lock = threading.Lock()
+_guide_cache: dict[Path, tuple[int, int, GuideBook]] = {}
+
+
+def load_guide(directory: Path | None = None) -> GuideBook | None:
+    """The admin guide cut into chapters, or None when its file does not exist (or cannot be read). Blocking: call it
+    on a thread. Cached per file version (one entry per guide file; only tests read more than one copy). The whole
+    rendered document is not kept: the chapters hold all of it."""
+    path = doc_path(DOC_BY_SLUG[GUIDE_SLUG], directory)
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    cached = _guide_cache.get(path)
+    if cached is not None and cached[:2] == (stat.st_mtime_ns, stat.st_size):
+        return cached[2]
+    text = _read(path)
+    if text is None:
+        return None
+    book = cut_guide(render_doc(DOC_BY_SLUG[GUIDE_SLUG], text))
+    with _guide_lock:
+        if len(_guide_cache) >= 4 and path not in _guide_cache:
+            _guide_cache.clear()  # bounded (plan P9)
+        _guide_cache[path] = (stat.st_mtime_ns, stat.st_size, book)
+    return book
+
+
 __all__ = [
     "DOCS",
     "DOCS_DIR",
     "DOC_BY_SLUG",
+    "GUIDE_PATH",
+    "GUIDE_SLUG",
     "OPERATIONS_PREFIX",
     "DocSpec",
+    "GuideBook",
+    "GuideChapter",
     "RenderedDoc",
     "RunbookLink",
     "available",
+    "chapter_href",
+    "cut_guide",
     "doc_path",
     "load_doc",
+    "load_guide",
     "parse_link_index",
     "render_doc",
     "runbook_links",

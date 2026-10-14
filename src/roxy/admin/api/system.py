@@ -8,8 +8,8 @@ What this is
         heartbeats, the gunicorn master pids and service uptime of both colors during a deploy, host uptime, the time
         since the last deploy switch, and tarpit connection use against `tarpit_connection_budget`.
         `GET /system/workers` is the same list as a table (`format=csv|json` downloads it).
-      * `POST /system/workers/reset-counts`: "Reset counts" (parity row 122): zero requests and proxied for every
-        worker and set `counters_reset_at`.
+      * `POST /system/workers/reset-counts`: "Reset request counts" (parity row 122): zero requests and proxied for
+        every worker and set `counters_reset_at`.
       * `GET /system/leader`: who leads (fleet-wide, from the hot.db lease) and under which epoch.
       * `GET /system/jobs`: every job with its interval and last run, from this worker's runner and from what the
         leader publishes, plus the WAL checkpoint durations.
@@ -22,6 +22,8 @@ What this is
       * `GET /system/versions` and `GET /system/environment` (the non-secret environment summary).
       * `POST /system/flush`: the forced flush (parity row 121, v1 `?flush=1`): bumps `flush_requested_at` in
         `service_state`; this worker flushes at once, every other worker within about a second.
+      * `POST /system/alerts/test`: "Send test alert" (plan 13.2 H-ALERTS, the Settings > Alerts card): one real
+        alert through every configured channel, audited first, one a minute and within the hourly cap.
 
 Why it exists
     v1's Service Health and Tools sections (worker table, persistence card, refresh with flush) and the plan's
@@ -83,6 +85,7 @@ from roxy.deps import get_ctx
 from roxy.metrics import queries, read_errors, read_producers
 from roxy.metrics.catalog import METRICS
 from roxy.metrics.templating import TEMPLATE_VERSION
+from roxy.notify.alerts import SEVERITIES, make_alert
 from roxy.scheduler import heartbeat, read_fleet
 from roxy.scheduler.jobs import Job, JobRegistry
 from roxy.scheduler.leader import LEADER_LEASE, JobContext
@@ -159,7 +162,7 @@ WORKERS_TABLE: Final = TableSpec(
         Column("requests", "All requests", "Every request this worker served since its counters were reset.", "count"),
         Column("proxied", "Proxy requests", "Requests aimed at the proxy, served or refused.", "count"),
         Column("max_requests", "Recycle after", "The request count at which gunicorn recycles the worker.", "count"),
-        Column("counters_reset_at", "Counters reset", "When Reset counts last zeroed this worker.", "s"),
+        Column("counters_reset_at", "Counters reset", "When Reset request counts last zeroed this worker.", "s"),
         Column("loop_lag_ms_p99", "Loop lag p99", "How late the event loop woke up (99th percentile, 1 min).", "ms"),
         Column("cpu_pct", "CPU", WORKER_CPU_HELP, "percent"),
         Column("open_connections", "Connections", "Open connections.", "count"),
@@ -174,11 +177,20 @@ WORKERS_TABLE: Final = TableSpec(
 ERRORS_TABLE: Final = TableSpec(
     name="errors",
     columns=(
-        Column("signature", "Signature", "The error's stable signature (type, place and message shape)."),
+        Column(
+            "signature",
+            "Signature",
+            "The error's signature: its type and message (`<Type>: <message>`, the first 200 characters).",
+        ),
         Column("count", "Count", "How often it happened (kept since first seen).", "count"),
         Column("first_seen", "First seen", "When it first happened (Unix seconds).", "s"),
         Column("last_seen", "Last seen", "When it last happened (Unix seconds).", "s"),
-        Column("source", "Source", "Where it was raised (request, job, startup, ...)."),
+        Column(
+            "source",
+            "Source",
+            "Where it was recorded: roxy for an error Roxy raised while answering a request; rows brought over "
+            "from v1 keep v1's source (roxy, roblox, relay, internal or cache).",
+        ),
         Column("module_line", "Where", "The raising frame as module:line.", sortable=False),
         Column("last_detail", "Last detail", "The last message (redacted).", sortable=False, caller_text=True),
     ),
@@ -869,6 +881,64 @@ async def environment_view(ctx: Any) -> dict[str, Any]:
     }
 
 
+# ================================================================================================ test alert
+
+TEST_ALERT_SKIPS: Final[dict[str, str]] = {
+    "no_channel": "No alert channel is configured; System > Alerts shows which are.",
+    "deduped": "A test alert went out less than a minute ago; wait a minute and try again.",
+    "capped": "The hourly alert cap (alert_rate_limit_per_hour) is reached; try again later.",
+    "severity": "The alert severity filter held it back.",
+    "shutting_down": "This worker is stopping; try again in a moment.",
+}
+"""Why a test alert was not sent (`SendResult.skipped`), in words."""
+
+
+@router.post("/alerts/test")
+async def send_test_alert(
+    request: Request, body: ReasonBody, admin: AdminSession, _csrf: CsrfChecked
+) -> dict[str, Any]:
+    """Send one real alert through every configured channel ("Send test alert", plan 13.2 H-ALERTS): the only way to
+    check a webhook provider that cannot be tested without posting. The audit row is written first (C7: no row,
+    nothing sent). It goes out at the lowest severity `alert_min_severity` lets through, so the filter never hides
+    it, and it keeps the alert gates: one a minute (its cooldown) and the hourly cap."""
+    ctx = get_ctx(request)
+    notifier = getattr(ctx, "alerts", None)
+    if notifier is None:
+        raise common.unavailable("The notifier is not running yet; try again shortly.")
+    reason = common.require_reason(body.reason, required=False)
+    at = int(ctx.clock.now())
+    actor = actor_for(admin)
+    request_id = request_id_of(request)
+
+    def intent(conn: sqlite3.Connection) -> int:
+        return audit.record(
+            conn, actor, "alerts.test", "alerts", None, {"requested_at": at}, reason or None, request_id, at=at
+        )
+
+    audit_id = await run_mutation(ctx.dbs.control.write(intent))
+    severity = str(ctx.settings.get("alert_min_severity") or "warn")
+    alert = make_alert(
+        "test_alert",
+        summary="A test alert, sent from Settings > Alerts. Nothing needs doing.",
+        severity=severity if severity in SEVERITIES else "warn",
+    )
+    result = await notifier.send(alert)
+    warnings = [f"{channel}: {error}" for channel, error in sorted(result.errors.items())]
+    if result.sent:
+        message = f"Test alert sent by {' and '.join(result.sent)}."
+    else:
+        message = "The test alert was not sent."
+        warnings.insert(0, TEST_ALERT_SKIPS.get(str(result.skipped), "Every channel failed."))
+    return {
+        "sent": list(result.sent),
+        "skipped": result.skipped,
+        "errors": dict(result.errors),
+        "audit_id": audit_id,
+        "message": message,
+        "warnings": warnings,
+    }
+
+
 # ================================================================================================ forced flush
 
 
@@ -913,6 +983,7 @@ __all__ = [
     "FLUSH_KEY",
     "MEMORY_FAMILIES",
     "MEMORY_RESET_KEY",
+    "TEST_ALERT_SKIPS",
     "WATCH_JOB",
     "WORKERS_TABLE",
     "RequestsWatcher",

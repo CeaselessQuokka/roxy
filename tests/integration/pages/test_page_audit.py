@@ -242,3 +242,67 @@ async def test_links_into_the_audit_page_keep_working(page: Any, pages_app: Any)
     assert len(rows) == 2
     deep = await page.get(PAGE, params={"entry": "1"})
     assert deep.status_code == 200
+
+
+async def test_each_target_choice_lists_exactly_the_targets_it_names(page: Any, pages_app: Any) -> None:
+    """Review finding docs_b-1: filters match by prefix, so "The credential" is exact (it must not list the
+    allowlist's rows), its status and account rows have choices of their own, and resets, backups and VACUUM runs
+    (audited as `operation:<kind>_<hex>` by `admin/api/data.py`) each have a prefix that finds them."""
+    from roxy.config import audit
+    from roxy.config.audit import Actor
+
+    targets = {
+        "credential": "credential",
+        "credential_status": "credential_status",
+        "credential_account": "credential_account",
+        "allowlist": "credential_allowlist:7",
+        "reset": "operation:reset_0123456789abcdef",
+        "backup": "operation:backup_0123456789abcdef",
+        "vacuum": "operation:vacuum_0123456789abcdef",
+    }
+
+    def write(conn: Any) -> None:
+        for target in targets.values():
+            audit.record(conn, Actor("admin", "owner", None), "review.check", target, None, None, None, None)
+
+    await pages_app.ctx.dbs.control.write(write)
+    doc = await page.doc(PAGE)
+    choices = {" ".join(o.text().split()): o.get("value") for o in doc.select('select[name="target"] option')}
+    expected = {
+        "The credential (value, replace, delete)": {targets["credential"]},
+        "Credential status changes": {targets["credential_status"]},
+        "Credential account checks": {targets["credential_account"]},
+        "Credential allowlist": {targets["allowlist"]},
+        "Everything about the credential, allowlist included": {
+            targets[name] for name in ("credential", "credential_status", "credential_account", "allowlist")
+        },
+        "Data resets": {targets["reset"]},
+        "Backups": {targets["backup"]},
+        "VACUUM runs": {targets["vacuum"]},
+    }
+    for label, wanted in expected.items():
+        value = choices[label]
+        found = (await page.api("GET", "audit", params={"target": value, "action": "review.check"})).json()["items"]
+        assert {item["target"] for item in found} == wanted, (label, value)
+
+
+async def test_the_revert_form_says_when_the_setting_was_changed_again(page: Any, pages_app: Any) -> None:
+    """Review finding docs_b-4, the Audit side: reverting an older change also undoes the later ones, so its form
+    says so (with the value in force now) before the owner presses Revert; the newest change's form does not. The
+    clock moves between the two changes: an audit row finds its history row by key, second and actor
+    (`read_audit.settings_history_id`), so two changes in one second share the newer one's revert."""
+    await pages_app.settings(alert_rate_limit_per_hour=30)
+    pages_app.clock.advance(5)
+    await pages_app.settings(alert_rate_limit_per_hour=40)
+    rows = (await page.api("GET", "audit", params={"target": "setting:alert_rate_limit_per_hour"})).json()["items"]
+    ids = sorted(int(row["id"]) for row in rows)
+    assert len(ids) == 2
+    older = parse_html((await page.fragment("audit", "entry", entry=ids[0])).text).select_one("form.audit-revert")
+    newer = parse_html((await page.fragment("audit", "entry", entry=ids[-1])).text).select_one("form.audit-revert")
+    assert older is not None
+    assert newer is not None
+    warning = next(li for li in older.select(".dialog__consequences li") if "changed again" in li.text())
+    assert "This setting was changed again after this change (it is now" in warning.text()
+    assert "also undoes those later changes" in warning.text()
+    assert warning.select_one(".caller-text").text() == "40"  # the value in force, as plain text
+    assert "changed again" not in newer.text()

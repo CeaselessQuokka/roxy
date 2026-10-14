@@ -59,8 +59,9 @@ _MEASURE_COLUMNS: Final = (
     Column("avoided", "Avoided calls", "Demand minus upstream calls (plan P6).", "count"),
     Column("hit_ratio", "Hit ratio", "Share of cache lookups answered from the cache.", "ratio"),
     Column("roblox_429", "Roblox 429s", "429 answers Roblox sent.", "count"),
-    Column("status_4xx", "4xx", "Answers with a 4xx status.", "count"),
-    Column("status_5xx", "5xx", "Answers with a 5xx status.", "count"),
+    # The answers callers got (lead decision 11: `status_4xx` counts Roblox's answers per attempt since metrics 10).
+    Column("caller_4xx", "4xx", "Answers to callers with a 4xx status.", "count"),
+    Column("status_5xx", "5xx", "Answers to callers with a 5xx status.", "count"),
     Column("p50_ms", "p50", "Median latency.", "ms"),
     Column("p95_ms", "p95", "95th percentile latency.", "ms"),
     Column("p99_ms", "p99", "99th percentile latency.", "ms"),

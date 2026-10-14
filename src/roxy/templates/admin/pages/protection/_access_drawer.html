@@ -8,7 +8,7 @@
   allowlist is on needs `confirm_lockout` (422 `confirmation_required` reveals the checkbox) and a fresh second
   factor (403 asks for the code, then retries).
   Context: `detail` {entry, kind, expires, created, last_hit, remaining, chart_src, delete_url, covers_you,
-  allowlist_on}.
+  allowlist_on, bypass_skips (`texts.bypass_scope`, what a bypass skips: finding abuse-6)}.
 -#}
 {% from "components/icon.html" import icon %}
 {% from "components/format.html" import num, caller_text %}
@@ -29,7 +29,7 @@
   <div class="cluster"><button type="button" class="btn btn--bad" data-dialog-open="dlg-prot-access-del-{{ e.id }}" aria-haspopup="dialog" data-action="access-remove">{{ icon("x") }}<span>Remove</span></button></div>
   {% set lines = {
     "deny": ["The network is no longer refused by the deny list (bans and other limits still apply)."],
-    "bypass": ["The network goes back to the normal limits: throttle-all, the per-IP limit, User-Agent and endpoint rules, and the tarpit."],
+    "bypass": ["The network goes back to the normal checks: " ~ d.bypass_skips ~ "."],
     "allow_admin": ["This network can no longer reach /admin while the admin allowlist is on" ~ (" (it is on now)." if d.allowlist_on else " (it is off now, so nothing changes yet).")],
   }[d.kind] + ["The removal is written to the audit log."] %}
   {% call delete_dialog("dlg-prot-access-del-" ~ e.id, "Remove " ~ e.cidr ~ " from the " ~ KIND[d.kind] ~ "?", d.delete_url, lines,

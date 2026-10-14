@@ -134,7 +134,11 @@ async def test_another_workers_unflushed_counts_never_refill_a_reset(
             api_app.ctx.dbs.control, "SELECT value_json FROM service_state WHERE key = ?", (RESET_FENCE_KEY,)
         )
         fence = json.loads(stored[0][0])["fences"][-1]
-        assert fence["selectors"] == [{"table": "rollup_minute", "action": "delete", "match": {}}]
+        assert fence["selectors"] == [
+            {"table": "rollup_minute", "action": "delete", "match": {}},
+            # Roblox's answers to the same traffic (lead decision 11): the Traffic reset takes them too.
+            {"table": "roblox_answer_minute", "action": "delete", "match": {}},
+        ]
     finally:
         await other.aclose(budget_s=1.0)
 

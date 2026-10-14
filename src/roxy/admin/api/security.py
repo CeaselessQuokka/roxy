@@ -97,6 +97,7 @@ from roxy.config.defaults import IGNORED_ADDRESS_HEADER_NOTE
 from roxy.deps import get_ctx
 from roxy.metrics import read_security, security_events
 from roxy.metrics.fingerprints import ADDRESS_HEADERS, clear_values, keeps_no_values
+from roxy.rules.models import normalize_ua_hash
 from roxy.rules.service import RuleChange, RulesService
 
 router = area_router("security")
@@ -564,6 +565,12 @@ async def user_agent_detail_answer(ctx: Any, ua_hash: str) -> dict[str, Any]:
     if found is None:
         raise not_found("No User-Agent with that key is recorded.")
     answer: dict[str, Any] = dict(found)
+    # The subject a Protection > Bans "User-Agent hash" ban takes for this row (finding abuse-3): the key names the
+    # stored text, so a User-Agent stored masked or cut at 400 characters cannot be banned from it.
+    try:
+        answer["ban_hash"] = normalize_ua_hash(str(answer.get("ua_hash") or ""))
+    except ValueError:
+        answer["ban_hash"] = None
     return add_caller_text(answer, UA_DETAIL_CALLER_TEXT)
 
 

@@ -301,6 +301,49 @@ def test_v1_8_failed_build_leaves_a_usable_environment(sandbox: DeploySandbox) -
     assert sandbox.running("blue")
 
 
+def test_build_only_builds_beside_the_live_color_and_touches_nothing_else(sandbox: DeploySandbox) -> None:
+    """Lead decision (5), finding ops-6: `--build-only` runs steps 1 and 2 while the live color keeps serving, so
+    the cutover window never includes the venv build; the deploy of the same commit then reuses the release."""
+    first = deployed(sandbox)
+    sha = sandbox.make_commit("AHEAD")
+    sandbox.clear_calls()
+    result = sandbox.run("--build-only", sha)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (sandbox.releases / sha / ".roxy-release-complete").exists()
+    assert not any(call.startswith(("systemctl", "sudo", "roxy-", "curl")) for call in sandbox.calls())
+    assert sandbox.active_color() == "blue"
+    assert sandbox.unit_value("blue", "release") == first
+    assert sandbox.current("green") is None, "no color points at the release yet"
+    assert (sandbox.deploy_state / "deployed_version").read_text().strip() == first
+    sandbox.clear_calls()
+    assert sandbox.run(sha).returncode == 0
+    assert not any(call.startswith("uv sync") for call in sandbox.calls())
+    assert sandbox.active_color() == "green"
+
+
+def test_failed_build_only_run_removes_its_release_and_records_nothing(sandbox: DeploySandbox) -> None:
+    first = deployed(sandbox)
+    sha = sandbox.make_commit("BROKEN_AHEAD")
+    sandbox.flag("fail-uv-sync")
+    sandbox.clear_calls()
+    result = sandbox.run("--build-only", sha)
+    assert result.returncode != 0
+    assert "Build-only run failed" in result.stderr
+    assert "nothing was started or switched" in result.stderr
+    assert not (sandbox.releases / sha).exists(), "a half-built release is removed"
+    assert not (sandbox.deploy_state / "last_failure.json").exists(), "the live site was never touched: no alert"
+    assert sandbox.running("blue")
+    assert sandbox.unit_value("blue", "release") == first
+    assert not any(call.startswith(("systemctl", "sudo", "roxy-")) for call in sandbox.calls())
+
+
+@pytest.mark.parametrize("args", [("--build-only",), ("--build-only", "--rollback"), ("--rollback", "--build-only")])
+def test_build_only_needs_a_commit_and_no_other_mode(sandbox: DeploySandbox, args: tuple[str, ...]) -> None:
+    result = sandbox.run(*args, "0" * 40) if len(args) > 1 else sandbox.run(*args)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert not sandbox.calls()
+
+
 def test_v1_5_commit_missing_required_paths_is_refused(sandbox: DeploySandbox) -> None:
     """v1 scenario 5, with the C5 replacement text: "Clone is missing <x>; refusing to deploy it."."""
     deployed(sandbox)

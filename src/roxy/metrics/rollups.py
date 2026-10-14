@@ -4,9 +4,10 @@ What this is
     The write side of the time series (`write_rollups`, `write_clients`, `write_egress_usage`: the batch writer
     handlers for `rollup_minute`, `client_minute` and minute rows of `egress_usage`) and the leader's compaction
     (`compact_level` with the `LevelSpec` table below): minute to hour (UTC), hour to day and day to month (in
-    `ui_timezone`, each day and month row storing the zone it was computed in), the same for `egress_usage`, and
-    for the client tables with the "top N plus one `other` row" rule. Plus the time helpers every reader uses
-    (`bucket_floor`, `bucket_next`).
+    `ui_timezone`, each day and month row storing the zone it was computed in), the same for `egress_usage` and the
+    Roblox answer tables (`roblox_answer_*`, metrics 0010: the answers Roblox gave the calls made for callers, per
+    attempt, by status class), and for the client tables with the "top N plus one `other` row" rule. Plus the time
+    helpers every reader uses (`bucket_floor`, `bucket_next`).
 
 Why it exists
     Plan 6.3 and 6.4. One row per minute per active dimension combination keeps the hot path cheap (workers only
@@ -83,6 +84,17 @@ DIM_COLUMNS: tuple[str, ...] = (
 )
 CLIENT_SUMS: tuple[str, ...] = ("requests", "refused", "served", "bytes")
 EGRESS_SUMS: tuple[str, ...] = ("requests", "req_bytes", "resp_bytes", "overhead_bytes")
+ANSWER_KEYS: tuple[str, ...] = ("endpoint_template", "host", "egress")
+ANSWER_SUMS: tuple[str, ...] = ("answers_2xx", "answers_3xx", "answers_4xx", "answers_5xx")
+"""The Roblox answer tables (metrics 0010, lead decision 11): the answers Roblox gave the calls made for callers, by
+status class, per bucket, template, host and egress."""
+ANSWER_TABLES: tuple[str, ...] = (
+    "roblox_answer_minute",
+    "roblox_answer_hour",
+    "roblox_answer_day",
+    "roblox_answer_month",
+)
+"""Finest first; only the minute table is written by the recorder, the others by the compaction."""
 
 DEFAULT_ZONE = "America/New_York"
 
@@ -360,6 +372,18 @@ LEVELS: dict[str, LevelSpec] = {
         src_filter="granularity = 'day'", dst_filter="granularity = 'month'",
         dst_consts=(("granularity", "'month'"),),
     ),
+    "roblox_answer_hour": LevelSpec(
+        "roblox_answer_hour", "hour", "roblox_answer_minute", "roblox_answer_hour", ANSWER_KEYS, ANSWER_SUMS,
+        recompute_last=2,
+    ),
+    "roblox_answer_day": LevelSpec(
+        "roblox_answer_day", "day", "roblox_answer_hour", "roblox_answer_day", ANSWER_KEYS, ANSWER_SUMS,
+        has_tz=True, edge_src="roblox_answer_minute",
+    ),
+    "roblox_answer_month": LevelSpec(
+        "roblox_answer_month", "month", "roblox_answer_day", "roblox_answer_month", ANSWER_KEYS, ANSWER_SUMS,
+        has_tz=True,
+    ),
 }  # fmt: skip
 """Every compaction step, by name. Table and column names here are the only identifiers interpolated into SQL."""
 
@@ -621,6 +645,29 @@ async def compact_all(write: Write, now_s: float, config: CompactionConfig) -> d
     )
     report["egress_month"] = egress_months.buckets
 
+    # Roblox's answers per attempt (metrics 0010): the same levels and rules as the rollups, from their own
+    # watermarks, so a previous release compacting only the rollups during a deploy never leaves them out of step.
+    answer_hours = await compact_level(
+        write, LEVELS["roblox_answer_hour"], closed_until=closed, not_before=hour_floor, max_buckets=config.max_buckets
+    )
+    report["roblox_answer_hour"] = answer_hours.buckets
+    answer_days = await compact_level(
+        write,
+        LEVELS["roblox_answer_day"],
+        closed_until=answer_hours.complete_until,
+        tz_name=config.tz_name,
+        max_buckets=config.max_buckets,
+    )
+    report["roblox_answer_day"] = answer_days.buckets
+    answer_months = await compact_level(
+        write,
+        LEVELS["roblox_answer_month"],
+        closed_until=answer_days.complete_until,
+        tz_name=config.tz_name,
+        max_buckets=12,
+    )
+    report["roblox_answer_month"] = answer_months.buckets
+
     if config.activity_tracking:
         client_hours = await _compact_clients(write, "client_hour", closed, None, client_floor, config)
         report["client_hour"] = client_hours.buckets
@@ -672,6 +719,7 @@ REBUILD_CHAINS: dict[str, tuple[str, ...]] = {
     "rollup": ("rollup_hour", "rollup_day", "rollup_month"),
     "egress": ("egress_hour", "egress_day", "egress_month"),
     "client": ("client_hour", "client_day"),
+    "roblox_answers": ("roblox_answer_hour", "roblox_answer_day", "roblox_answer_month"),
 }
 """The levels a ranged reset leaves partly covered, per family of tables, finest first (each is rebuilt from the
 level before it, which is already right)."""
@@ -680,6 +728,7 @@ REBUILD_TABLES: dict[str, frozenset[str]] = {
     "rollup": frozenset({"rollup_minute", "rollup_hour", "rollup_day", "rollup_month"}),
     "egress": frozenset({"egress_usage"}),
     "client": frozenset({"client_minute", "client_hour", "client_day"}),
+    "roblox_answers": frozenset(ANSWER_TABLES),
 }
 """The tables of each chain: a ranged reset that changed one of them rebuilds that chain's partial buckets."""
 
@@ -710,8 +759,12 @@ _SOURCE_FLOOR: dict[str, str] = {
     "egress_month": "day",
     "client_hour": "client_minute",
     "client_day": "client_hour",
+    "roblox_answer_hour": "minute",
+    "roblox_answer_day": "hour",
+    "roblox_answer_month": "day",
 }
-"""`SourceFloors` field of the level each compacted level is computed from."""
+"""`SourceFloors` field of the level each compacted level is computed from (the Roblox answer levels keep the
+rollups' retention, so they share the rollups' floors)."""
 
 
 def straddling_buckets(unit: str, start: int, end: int, tz: ZoneInfo | None) -> list[tuple[int, int]]:

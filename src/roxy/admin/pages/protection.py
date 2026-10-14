@@ -57,6 +57,7 @@ from dataclasses import replace
 from typing import Any, Final, Literal, cast
 from urllib.parse import urlencode
 
+from roxy.abuse.bans import REPEAT_WINDOW_S
 from roxy.abuse.read_bans import AUTO_DETECTORS
 from roxy.abuse.throttle import decays_in, effective_strikes, ladder_from, load_strike_rows, rung_for
 from roxy.admin.api import clients as clients_api
@@ -887,6 +888,9 @@ async def bans_card(view: PageView) -> dict[str, Any]:
             scope: await prot.bans_reset_preview_answer(view.ctx, scope) for scope in ("all", "auto", "expired")
         }
         context["detectors"] = AUTO_DETECTORS
+        # A detector doubles a client's next ban for each automatic ban of it created in this window, expired ones
+        # included (`abuse/bans.py previous_offenses`), so every delete dialog says the escalation starts over.
+        context["repeat_days"] = REPEAT_WINDOW_S // 86_400
         context["api"] = {"create": f"{API}/bans", "reset": f"{API}/bans/reset"}
     return context
 
@@ -956,6 +960,8 @@ async def _access_detail(view: PageView, raw: str, kinds: Sequence[str]) -> dict
                 "delete_url": f"{API}/access/{kind}/{int(found['id'])}",
                 "covers_you": covers(str(found.get("cidr")), view.principal.ip),
                 "allowlist_on": bool(_setting(view, "admin_allowlist_enabled")),
+                # What the network goes back to on removal, from the checks' own flags (finding abuse-6).
+                "bypass_skips": bypass_scope()["skips"] if kind == "bypass" else "",
             }
     raise _not_found("entry of this list")
 
@@ -1559,6 +1565,9 @@ DECISION_LABELS: Final[dict[str, str]] = {
     "spam_tarpit": "Tarpit",
     "spam_detected": "Recommendation",
 }
+AT_LEAST_DETECTORS: Final = frozenset({"probe", "auth"})
+"""Detectors that fire AT their threshold (`abuse/spam.py evaluate_row`: `total >= threshold`, plan 10.3 ">= 5",
+">= 3"); every other detector fires only above it, so its card says "more than"."""
 
 
 def _detector_view(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -1570,6 +1579,7 @@ def _detector_view(item: Mapping[str, Any]) -> dict[str, Any]:
         "signal": signal,
         "default": default,
         "action_label": ACTION_LABELS.get(str(item.get("effective_action")), str(item.get("effective_action"))),
+        "compare": "at least" if str(item.get("id")) in AT_LEAST_DETECTORS else "more than",
         "threshold": f"{pv.number(settings.get('threshold'))} {item.get('unit') or ''}".strip(),
         "window": pv.span_words(settings.get("window_s")),
         "decisions_total": sum(int(v or 0) for v in decisions.values()),

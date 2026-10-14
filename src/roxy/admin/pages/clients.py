@@ -59,6 +59,7 @@ from roxy.admin.pages.kit import Page, PageAdmin, PageView, table_query, table_v
 from roxy.admin.pages.texts import bypass_scope
 from roxy.config.catalog import CATALOG
 from roxy.metrics import read_producers
+from roxy.metrics.activity import OTHER_KEY
 
 log = logging.getLogger("roxy.admin.pages")
 
@@ -99,6 +100,15 @@ OUTCOME_WORDS: Final[dict[str, str]] = {
     "refused": "refused",
     "failed": "failed",
 }
+FORGED_PLACE_NOTE: Final = "not a number: a forged header"
+"""The note under a place key that is not digits (Roblox game servers always send digits)."""
+OTHER_NOTES: Final[dict[str, str]] = {
+    "place": "Roxy's own sum of the quieter experiences beyond 'Experiences kept per period' (Data > Record caps)",
+    "ip": "Roxy's own sum of the quieter addresses beyond 'IP addresses kept per period' (Data > Record caps)",
+}
+"""The note under the folded `other` row (`metrics/activity.py OTHER_KEY`): when a period closes, the leader keeps
+the busiest `max_caller_records` places (`max_ip_activity_records` addresses) and sums the rest into this one row,
+so in a busy hour it is often the biggest row of the table (finding docs_b-8: it is not a forgery)."""
 
 
 # ============================================================================================ helpers
@@ -107,6 +117,16 @@ OUTCOME_WORDS: Final[dict[str, str]] = {
 def is_place_id(text: str) -> bool:
     """A place id the API's place routes accept (digits only; anything else is a forged header)."""
     return bool(PLACE_RE.fullmatch(text or ""))
+
+
+def key_notes(kind: str, key: str) -> list[str]:
+    """The notes under a table row's key: Roxy's folded `other` row says what it sums, a place key that is not digits
+    says it was forged, and every other key needs none."""
+    if key == OTHER_KEY:
+        return [OTHER_NOTES[kind]]
+    if kind == "place" and not is_place_id(key):
+        return [FORGED_PLACE_NOTE]
+    return []
 
 
 def signal_label(name: str) -> str:
@@ -182,8 +202,13 @@ async def places_card(view: PageView) -> dict[str, Any]:
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
         key = str(item.get("key") or "")
         out = _common_cells(view, item)
-        notes = [] if is_place_id(key) else ["not a number: a forged header"]
-        out["key"] = {"text": key, "caller": True, "mono": True, "limit": 64, **_state_sub(item, notes)}
+        out["key"] = {
+            "text": key,
+            "caller": True,
+            "mono": True,
+            "limit": 64,
+            **_state_sub(item, key_notes("place", key)),
+        }
         out["name"] = {"text": item.get("name"), "caller": True} if item.get("name") else {"text": "not looked up"}
         return out
 
@@ -248,7 +273,8 @@ async def ips_card(view: PageView) -> dict[str, Any]:
 
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
         out = _common_cells(view, item)
-        out["key"] = {"text": item.get("key"), "mono": True, **_state_sub(item, [])}
+        key = str(item.get("key") or "")
+        out["key"] = {"text": item.get("key"), "mono": True, **_state_sub(item, key_notes("ip", key))}
         score = item.get("bot_score")
         source = item.get("bot_score_source")
         if isinstance(score, int | float):
@@ -438,6 +464,22 @@ def _series(answer: Mapping[str, Any]) -> dict[str, Any]:
     return {"range": answer.get("range"), "series": series, "compare": None, "annotations": [], "notices": []}
 
 
+def bypass_prefill(default_h: Any) -> dict[str, Any]:
+    """The bypass dialog's hours field from `bypass_default_expiry_h` (finding docs_b-5).
+
+    A default above 0 is prefilled (`24`, not `24.0`). A default of 0 means "new entries never expire" (`abuse/
+    bypass.py bypass_expires_at`), but `POST /clients/ips/{ip}/bypass` takes `expires_in_h` above 0 only, so a
+    prefilled 0 was always refused: the field stays empty instead (the API then applies the default) and
+    `bypass_never` lets the dialog say that an empty field means the entry never expires."""
+    try:
+        hours = float(default_h)
+    except (TypeError, ValueError):
+        hours = 0.0
+    if not hours > 0:  # 0 (and anything the API would not take) leaves the field to the API's default
+        return {"bypass_hours": "", "bypass_never": True}
+    return {"bypass_hours": f"{hours:g}", "bypass_never": False}
+
+
 def client_reset(ctx: Any, kind: str, key: str) -> dict[str, Any]:
     """The "Reset this client" dialog (plan 6.8 scope `client`; bans stay)."""
     return {
@@ -548,7 +590,7 @@ async def client_context(view: PageView, kind: str, key: str) -> dict[str, Any]:
         "drawer_src": _drawer_src(view, kind, key),
         "reset": client_reset(ctx, kind, key),
         "ban_lengths": BAN_LENGTHS,
-        "bypass_hours": float(ctx.settings.get("bypass_default_expiry_h")),
+        **bypass_prefill(ctx.settings.get("bypass_default_expiry_h")),
         "bypass_scope": bypass_scope(),  # what a bypass skips, from the checks' own flags (finding v1parity-9)
         "range_label": view.time.view.get("label"),
         "rate_text": {name: _rate(((answer.get("last_hour") or {}).get("rates") or {}).get(name)) for name in RATES},

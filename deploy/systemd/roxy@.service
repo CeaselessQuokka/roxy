@@ -3,8 +3,8 @@
 # Installed as /etc/systemd/system/roxy@.service (deploy/install-system.sh). deploy.sh starts the idle color,
 # switches nginx to it, then stops the old one, so both instances run for a few minutes during a deploy and share
 # /var/lib/roxy (leader election, limits and buckets live in the shared SQLite files, plan 5.6).
-# Every directive says why it is here, as plan 17.1 and 18.1 item 8 require. Memory numbers follow DESIGN.md
-# section 0 (909 MB server, no swap), not the 2 GB numbers in plan 6.1 and 17.1.
+# Every directive says why it is here, as plan 17.1 and 18.1 item 8 require. Memory numbers follow the 909 MB
+# server without swap (CHANGES.md, "Memory sizing for the 1 GB server"), not the 2 GB numbers in plan 6.1 and 17.1.
 
 [Unit]
 # Names the color in `systemctl status`, `systemctl list-units` and alert emails.
@@ -123,12 +123,19 @@ MemoryAccounting=yes
 # recycle after about 20,000 requests each (gunicorn max_requests) stays at or under about 405 MiB of PSS, whatever
 # the rate (365 at 10 requests a second, 405 at 200), so this never throttles a healthy color. 320M and 350M did.
 MemoryHigh=420M
-# The hard ceiling: past 500 MiB the kernel OOM-kills inside this unit only, and Restart= brings it back. The 80 MiB
-# above MemoryHigh is room for short peaks (one recommendations evaluation at production volume, two table downloads).
+# The hard ceiling: past 500 MiB the kernel OOM-kills one process inside this unit only (the largest, a worker), and
+# gunicorn starts a replacement (see OOMPolicy below). The 80 MiB above MemoryHigh is room for short peaks (one
+# recommendations evaluation at production volume, two table downloads).
 # A deploy never runs two warm colors: the new one starts fresh (with one worker below 700 MB available, deploy.sh),
 # so a warm color at MemoryMax plus a starting one (about 155 MiB) plus nginx and the OS (about 200 MB) fit in 909 MB
 # (tests/deploy/test_deploy_units.py::test_memory_numbers_fit_the_909_mb_server).
 MemoryMax=500M
+# What systemd does when the kernel OOM-kills a process of this unit: continue, so only the killed worker is lost and
+# gunicorn forks its replacement while the other worker keeps serving. systemd's default (stop) would stop the whole
+# color instead: outside a deploy it is the only color nginx sends callers to, so every caller would get 502 until
+# Restart= brought it back (RestartSec, the pre-start step and a cold start), and five such kills in 300 s would leave
+# it failed. A killed master still ends the unit, and Restart= then starts it again.
+OOMPolicy=continue
 # At most 256 processes and threads: fork-bomb containment (2 workers with their thread pools need far fewer).
 TasksMax=256
 # Many concurrent sockets per worker (async connections, tarpit holds, upstream pools).

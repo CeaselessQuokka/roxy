@@ -247,7 +247,10 @@ def check_hits(conn: sqlite3.Connection, window: Window) -> dict[str, Any]:
         "refused": sum(by_reason.values()),
         "by_reason": by_reason,
         "by_check": checks,
-        # Refusals no abuse check produced (the upstream guard's marker 400, an egress host refusal).
+        # Refusals no abuse check produced: the size and method limits answered before any route ran
+        # (`body_too_large`, `headers_too_large`, `url_too_long`, `method_not_allowed`, recorded since finding abuse-4).
+        # The upstream guard's marker 400 and an egress host refusal carry check reasons (`auth_smuggling`,
+        # `host_not_allowed`), so they count under their checks.
         "other_refusals": sum(n for code, n in by_reason.items() if code not in known),
     }
 
@@ -581,15 +584,18 @@ def would_ban_subjects(
 def subject_events(
     conn: sqlite3.Connection, subject: str, *, kinds: Sequence[str] = SPAM_EVENTS, limit: int = 20
 ) -> list[dict[str, Any]]:
-    """The newest detector events about one subject (`ip:<key>`), the evidence behind an automatic ban."""
+    """The newest detector events about one subject (`ip:<key>`), the evidence behind an automatic ban. A detector
+    whose subject is a client and a template (SPAM-ENUM's `ip:<key>|<template>`) acts on that client since finding
+    abuse-5, so its events (subject `<subject>|...`) are evidence of the client's ban too."""
     wanted = [kind for kind in kinds if kind in SPAM_EVENTS]
     if not wanted:
         return []
     marks = ", ".join("?" for _ in wanted)
     rows = conn.execute(
         f"SELECT id, at_ms, type, detail_json FROM events WHERE type IN ({marks}) "  # noqa: S608  # placeholders only
-        "AND json_extract(detail_json, '$.subject') = ? ORDER BY id DESC LIMIT ?",
-        (*wanted, subject, _bounded(limit, 100)),
+        "AND (json_extract(detail_json, '$.subject') = ? "
+        "OR substr(json_extract(detail_json, '$.subject'), 1, ?) = ?) ORDER BY id DESC LIMIT ?",
+        (*wanted, subject, len(subject) + 1, subject + "|", _bounded(limit, 100)),
     ).fetchall()
     return [{"at_ms": int(row["at_ms"]), "kind": row["type"], **_detail(row["detail_json"])} for row in rows]
 

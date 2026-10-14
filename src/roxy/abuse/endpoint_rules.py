@@ -15,9 +15,13 @@ How it works
       as a match (fail closed).
     - Scope `ip`: key `ep:<rule id>|<limit key>`, and the limit is clamped to `allowed_requests_per_minute` (v1: a
       rule can only make an endpoint stricter than the general per-IP allowance, never looser; only the count is
-      clamped, the rule keeps its own period). Scope `place`: key `ep:<id>|place:<place id>` (a request without a
-      `Roblox-Id` falls back to its IP budget). Scope `global`: key `ep:<id>|*`. The non-IP scopes are not clamped,
-      because a fleet-wide budget is naturally larger than one client's.
+      clamped, the rule keeps its own period). Scope `place`: key `ep:<id>|place:<place id>|<caller network>` while
+      `place_limit_key` is `place_prefix` (the default), else `ep:<id>|place:<place id>`; a request without a
+      `Roblox-Id` falls back to its IP budget. The `Roblox-Id` header is a claim anyone can forge (plan 10.2 and
+      threat 6 of plan 9), so like the place limit the budget is per place AND caller network (/24 for IPv4, /48 for
+      IPv6): a forger only spends their own network's share, never a real game's (finding abuse-15). Scope
+      `global`: key `ep:<id>|*`. The non-IP scopes are not clamped, because a fleet-wide budget is naturally larger
+      than one client's.
     - The window is v1's fixed window (`limiter.fixed`), evaluated in the pipeline's single hot.db transaction.
       `Retry-After` and the "try again in N seconds" text use a true ceiling of at least 1 (v1 could say 0, B16).
 
@@ -41,16 +45,26 @@ def match_endpoint_rule(snapshot: RulesSnapshot, target: str) -> EndpointLimitRo
 
 
 def endpoint_limit(
-    rule: EndpointLimitRow, *, limit_key: str, place_id: str | None, allowed_per_ip: int
+    rule: EndpointLimitRow,
+    *,
+    limit_key: str,
+    place_id: str | None,
+    allowed_per_ip: int,
+    place_network: str | None = None,
 ) -> tuple[str, int, int]:
-    """`(limiter key, effective limit, period seconds)` for one request under `rule`."""
+    """`(limiter key, effective limit, period seconds)` for one request under `rule`.
+
+    `place_network` is the caller's network for a `place` scope rule (`checks/place_limit.py caller_network`, given
+    while `place_limit_key` is `place_prefix`); None keys the budget on the claimed place id alone.
+    """
     period = max(1, int(rule.period or 60))
     limit = max(1, int(rule.limit or 1))
     scope = (rule.scope or "ip").lower()
     if scope == "global":
         return f"{KEY_PREFIX}{rule.id}|*", limit, period
     if scope == "place" and place_id:
-        return f"{KEY_PREFIX}{rule.id}|place:{place_id}", limit, period
+        suffix = f"|{place_network}" if place_network else ""  # a forger spends only their own network's share
+        return f"{KEY_PREFIX}{rule.id}|place:{place_id}{suffix}", limit, period
     if allowed_per_ip:
         limit = min(limit, int(allowed_per_ip))  # v1 clamp: never looser than the general per-IP allowance
     return f"{KEY_PREFIX}{rule.id}|{limit_key}", max(1, limit), period

@@ -805,15 +805,27 @@ async def check_429_rate(env: CheckEnv) -> CheckResult:
 
 async def check_err_rate(env: CheckEnv) -> CheckResult:
     totals = await _totals(env, RATE_WINDOW_S, {"source": list(CALLER_SOURCES)})
-    requests = int(totals.get("requests") or 0)
-    errors = int(totals.get("status_5xx") or 0)
+    # A deliberate pause answers 503 on purpose (`abuse/checks/pause.py`): it is left out of both sides, as the
+    # paired caller 5xx alert does (`notify/producers.py caller_5xx_facts`) and the guard metrics do (final review
+    # brain-5). Otherwise the owner's own pause fails this check and a scheduled run alerts about it.
+    paused = int(totals.get("paused") or 0)
+    requests = max(0, int(totals.get("requests") or 0) - paused)
+    errors = max(0, int(totals.get("status_5xx") or 0) - paused)
     if requests == 0:
+        if paused:
+            return env.not_applicable(
+                "Roxy is paused",
+                f"Roxy was paused: all {paused} caller requests of the last 15 minutes got the pause answer, which "
+                "is not a server error.",
+            )
         return env.not_applicable("no requests", "No caller request in the last 15 minutes.")
     pct = errors * 100.0 / requests
     status = band_low_good(pct, ERR_PASS_PCT, ERR_WARN_PCT)
     value = f"{_fmt(pct, 2)}% of {requests} caller requests answered 5xx (last 15 min)"
+    if paused:
+        value += f"; {paused} pause answers left out"
     finding = "" if status is Status.PASS else "Callers are getting server errors; the Errors view shows which."
-    detail = {"requests": requests, "status_5xx": errors}
+    detail = {"requests": requests, "status_5xx": errors, "paused": paused}
     return env.result(status, value, finding=finding, measured=pct, unit="%", detail=detail)
 
 
@@ -1139,13 +1151,15 @@ async def check_rotator_quota(env: CheckEnv) -> CheckResult:
         return env.not_applicable(
             "quota unknown", "rotator_quota_gb_per_month is 0 (unknown), so there is nothing to compare."
         )
-    from roxy.egress.rotator import DECIMAL_GB, cycle_start_for, usage_since
+    from roxy.egress.rotator import DECIMAL_GB, cycle_start_for, day_start_for, read_billed_bytes
 
     now = env.now()
     billing_day = int(env.setting("rotator_billing_day") or 1)
     start = cycle_start_for(now, billing_day)
     end = _next_cycle(start, billing_day)
-    used: int = await env.ctx.dbs.metrics.read(lambda conn: usage_since(conn, "rotator", start))
+    # The bytes the hard stop counts: egress_usage and the rotator's own billing count, which no statistics reset
+    # lowers (finding data-4), so this check never reads a full quota as fresh after an Egress usage reset.
+    used, _day = await read_billed_bytes(env.ctx.dbs, start, day_start_for(now))
     quota = quota_gb * DECIMAL_GB
     remaining_pct = (quota - used) * 100.0 / quota
     elapsed_days = max(0.0, (now - start) / 86_400)

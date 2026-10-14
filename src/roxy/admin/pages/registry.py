@@ -135,7 +135,14 @@ _PAGES: Final[tuple[PageSpec, ...]] = (
             _c("outcomes", "Outcomes", "How requests ended: from the cache, from Roblox, refused, or failed."),
             _c("top-endpoints", "Top endpoints", "The endpoint templates callers ask for most in this range."),
             _c("top-places", "Top places", "The experiences (Roblox-Id) sending the most requests in this range."),
-            _c("events", "Recent notable events", "Bans, cooldowns, breakers, alerts and configuration changes."),
+            _c(
+                "events",
+                "Recent notable events",
+                # What `metrics/read_dashboard.py NOTABLE_EVENT_TYPES` lists, no more (finding docs_a-13): sent
+                # alerts are on System, setting and rule changes in the Audit log.
+                "Breakers, Roblox 429s, credential, rotator and leak guard events, spam bans, cache purges, "
+                "recommendations and health runs. Setting and rule changes are in the Audit log.",
+            ),
         ),
     ),
     PageSpec(
@@ -194,7 +201,13 @@ _PAGES: Final[tuple[PageSpec, ...]] = (
             _c("bytes", "Bytes in and out", "Bytes between callers and Roxy, and between Roxy and Roblox."),
             _c("verbs", "By verb", "Requests per HTTP method."),
             _c("status", "Status codes", "Answers by status class and by who returned them."),
-            _c("latency", "Latency", "How long requests took, Roxy's own time and Roblox's separately."),
+            _c(
+                "latency",
+                "Latency",
+                # One total per caller request (`traffic_api.LATENCY_NOTE`), never split into Roxy's and Roblox's
+                # time (finding docs_a-14).
+                "How long callers waited for an answer, Roblox's time and the queue wait included.",
+            ),
             _c("heatmap", "Busiest hours", "Requests by hour of day and weekday."),
             _c("trends", "Trends", "Week over week, month over month and year over year."),
         ),
@@ -244,7 +257,12 @@ _PAGES: Final[tuple[PageSpec, ...]] = (
             _c("routing", "Routing", "Which egress path each request takes and the routing rules."),
             _c("hosts", "Hosts", "The Roblox hosts Roxy may call."),
             _c("429-timeline", "Roblox 429s", "When and where Roblox asked Roxy to slow down."),
-            _c("latency", "Latency percentiles", "How long Roblox took to answer."),
+            _c(
+                "latency",
+                "Latency percentiles",
+                # `upstream_api.latency_answer`: caller latency of the requests that went to Roblox (finding docs_a-14).
+                "How long callers waited for requests that went to Roblox: the queue wait plus every attempt.",
+            ),
             _c("buckets", "Buckets", "Roxy's own speed limits per egress, host and endpoint, and how full they are."),
             _c("concurrency", "Concurrency", "Adaptive concurrency (AIMD), off by default."),
             _c("cooldowns", "Cooldowns", "Pauses after Roblox said too many requests, and the reset."),
@@ -344,9 +362,10 @@ _PAGES: Final[tuple[PageSpec, ...]] = (
         purpose="See who calls Roxy, by experience (place) and by address, how fast, how often they are refused, "
         "and act on one of them.",
         how_to_read=(
-            "A place is a Roblox experience, identified by the Roblox-Id header its servers send. Rates are "
-            "requests per minute over the last minute, five minutes and hour. Refused counts include every reason "
-            "Roxy turned a request away.",
+            # Counts, not per-minute rates (`metrics/queries.py trailing_rate`; finding docs_b-7).
+            "A place is a Roblox experience, identified by the Roblox-Id header its servers send. Rate1, Rate5 and "
+            "Rate60 count the requests of the last minute, five minutes and hour. Refused counts include every "
+            "reason Roxy turned a request away.",
             "The bot score adds up signals that a caller is a script rather than a game server. Open a client for "
             "its timeline and for actions: ban, bypass or a rule just for it.",
         ),

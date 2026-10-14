@@ -575,7 +575,9 @@ class ThrottleAllBody(ApiBody):
 THROTTLE_ALL_FIELDS: Final[dict[str, str]] = {"global_throttle_limit": "limit", "global_throttle_period": "period"}
 """The settings the emergency limit's `limit` and `period` are, mapped back to the body's names for its errors."""
 BAN_FIELDS: Final[dict[str, str]] = {"reason_text": "message"}
-"""A ban row's `reason_text` is the body's `message` (the text a banned caller gets)."""
+"""A ban row's `reason_text` is the body's `message`: evidence kept with the ban and shown on Protection > Bans. A
+banned caller never gets it (`abuse/checks/bans.py` answers "Access denied." or a disguised throttle; finding
+abuse-10)."""
 
 
 async def _throttle_all_view(ctx: Any, state: ThrottleAllState) -> dict[str, Any]:

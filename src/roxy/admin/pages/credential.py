@@ -83,6 +83,8 @@ SOURCE_WORDS: Final[dict[str, str]] = {
 PROBE_WORDS: Final[dict[str, str]] = {
     "ok": "OK: Roblox accepted it",
     "ok_no_account_id": "OK, but the answer named no account",
+    "replaced": "Not checked yet since the replace",
+    "account_changed": "OK: a different account than before the replace (replaced on purpose)",
     "account_confirmed": "OK: the account switch was confirmed",
     "account_mismatch": "A different account than before: not used until you confirm",
     "rejected": "Rejected: the cookie expired or was revoked",
@@ -95,7 +97,14 @@ PROBE_WORDS: Final[dict[str, str]] = {
     "degraded": "Skipped: Roxy's shared state could not be used",
     "timeout": "Failed: Roblox did not answer in time",
     "connect_error": "Failed: Roblox could not be reached",
+    "not_confirmed": "Skipped: the account switch waits for your confirmation",
+    "TargetNotAllowed": "Failed: the probe address is not an allowed Roblox host",
+    "EgressDisabled": "Failed: the credential path is switched off",
 }
+"""A probe's stored result in words (`egress/credential.py _run_probe` and `_interpret_probe`). Two families carry the
+status Roblox answered in the code and are worded by `_probe_words`: `rejected_401` and `rejected_403` (Rejected),
+`http_<status>` (an answer that says nothing about the credential; its state is left as it was). Finding docs_a-12:
+the Status card printed "rejected 401"."""
 TRIGGER_WORDS: Final[dict[str, str]] = {
     "scheduled": "Scheduled liveness probe",
     "admin": "Check credential (admin)",
@@ -145,7 +154,14 @@ def _probe_words(result: Any) -> str:
     if not isinstance(result, Mapping):
         return "No probe yet"
     code = str(result.get("result") or result.get("outcome") or "")
-    return PROBE_WORDS.get(code, code.replace("_", " ") or "n/a")
+    if code in PROBE_WORDS:
+        return PROBE_WORDS[code]
+    family, _, status = code.rpartition("_")
+    if family == "rejected" and status.isdigit():  # rejected_401, rejected_403: the status Roblox refused it with
+        return f"{PROBE_WORDS['rejected']} (Roblox answered {status})"
+    if family == "http" and status.isdigit():  # any other answer: no verdict, the state is left as it was
+        return f"Unexpected answer: Roblox answered {status}, which says nothing about the credential"
+    return code.replace("_", " ") or "n/a"
 
 
 # ============================================================================================ status
@@ -200,9 +216,11 @@ async def budget_card(view: PageView) -> dict[str, Any]:
     answer = await credential_api.budget_answer(view.ctx)
     rows = {str(row["key"]): row for row in await upstream_api.bucket_rows(view.ctx, view.tr)}
     buckets = []
+    # Probes take only the reserved sub-bucket (`upstream/buckets.py specs_for`), so the account bucket moves only
+    # with allowlisted callers: never while the allowlist is empty (owner decision D1; finding docs_a-11).
     for name, label in (
-        ("account_bucket", "The account (callers on the allowlist and probes)"),
-        ("probe_bucket", "Reserved for Roxy's probes"),
+        ("account_bucket", "Allowlisted callers (the credential rate limit minus the reserve)"),
+        ("probe_bucket", "Reserved for Roxy's credential checks"),
     ):
         bucket = answer.get(name) or {}
         history = rows.get(str(bucket.get("key"))) or {}

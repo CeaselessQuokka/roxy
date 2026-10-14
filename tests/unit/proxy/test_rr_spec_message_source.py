@@ -60,3 +60,16 @@ async def test_spec_4_upstream_refusal_records_its_message_source(
     event = ctx.recorder.events[-1]
     assert event.outcome is Outcome.REFUSED
     assert event.message_source == "default"  # Roxy's own built-in v1 text, never an admin's
+
+
+def test_a_compat_roblox_429_carries_robloxs_words(fakes: Any) -> None:
+    """Final review pipe-4: compat mode answers a Roblox 429 with Roblox's own body, so its record says `roblox`;
+    the same failure without compat (Roxy's busy text) says `roxy`."""
+    from roxy.proxy.router import message_source
+
+    result = respond.failure_result(
+        ReasonCode.UPSTREAM_COOLDOWN, status=429, upstream_status=429, retry_after_s=5, upstream_body=b'{"errors":[]}'
+    )
+    collapsed = respond.render(fakes.make_req(), result, compat_collapse=True)
+    assert message_source(collapsed, None) == "roblox"
+    assert message_source(respond.render(fakes.make_req(), result), None) == "roxy"

@@ -17,7 +17,7 @@
 
 {% block how_to_read %}
 {% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
-<p>Who acted reads <code>admin:&lt;name&gt;</code> for an admin, <code>system:&lt;what&gt;</code> for Roxy itself (an automatic ban, a {{ term("leader", "leader") }} job), <code>recommendation:&lt;rule&gt;</code> for an applied recommendation, and <code>cli</code> for the server's command line. Targets and previews may contain text that callers sent (paths, User-Agents); it is shown as plain text, exactly as stored.</p>
+<p>Who acted reads <code>admin:&lt;name&gt;</code> for an admin (a recommendation applied with its Apply button is the admin who pressed it; the reason starts with <code>recommendation:&lt;id&gt;</code>), <code>system:&lt;what&gt;</code> for Roxy itself (<code>system:auto:&lt;detector&gt;</code> for an automatic ban, <code>system:adaptive</code> for an adaptive rate change, a {{ term("leader", "leader") }} job), <code>auto_apply:insights</code> for a recommendation applied automatically, <code>cli:&lt;login name&gt;</code> for the server's command line, and <code>import:v1</code> for what the move from v1 brought over. Targets and previews may contain text that callers sent (paths, User-Agents); it is shown as plain text, exactly as stored.</p>
 {% endblock %}
 
 {% block cards %}

@@ -39,7 +39,7 @@ from roxy.core.ids import new_id
 from roxy.core.reasons import CacheState, Egress, Outcome, ReasonCode, Source
 from roxy.insights import AUTO_APPLY_JOB, simulate
 from roxy.insights.actions import ACTION_LEASE_PREFIX, ACTION_LEASE_TTL_MS
-from roxy.insights.autoapply import AUTO_ACTOR
+from roxy.insights.autoapply import AUTO_ACTOR, in_force_values
 from roxy.insights.engine import write_recommendation
 from roxy.insights.models import Evidence, ProposedChange, Recommendation, changes_digest, make_fingerprint
 from roxy.scheduler.leader import LEADER_LEASE, LostLeadership
@@ -180,8 +180,16 @@ async def test_r3_mpjobs_current_leader_auto_apply_claims_once_per_interval(api_
     """mpjobs-1 control: the current leader's pass applies (fenced writes succeed) and records its key; a second
     pass in the same interval (this leader again, or the next one) does nothing."""
     await api_app.settings(insights_auto_apply=1)
+    # The new rule's lifetime stays within the D7 step of the one the endpoint has today (final review brain-3: a
+    # new cache rule is stepped from the lifetime in force, `autoapply.in_force_values`).
+    in_force = in_force_values(
+        api_app.ctx.insights.context(), Recommendation("HOT-ENDPOINT", "cache", TEMPLATE, "t"), _cache_rule(TEMPLATE)
+    )
+    assert in_force is not None
+    assert in_force["ttl"] > 0, in_force
+    ttl = int(in_force["ttl"]) + int(in_force["ttl"]) // 4
     rec = await _seed(
-        api_app, rule_id="HOT-ENDPOINT", subject=TEMPLATE, changes=[_cache_rule(TEMPLATE)], safe_auto=True
+        api_app, rule_id="HOT-ENDPOINT", subject=TEMPLATE, changes=[_cache_rule(TEMPLATE, ttl=ttl)], safe_auto=True
     )
     elector = await _wait_leader(api_app)
     job = api_app.ctx.jobs.registry.get(AUTO_APPLY_JOB)

@@ -17,7 +17,10 @@ Why it exists
 How it works
     For each v1 key: read the stored value the way v1 restored it (`int()`, then clamp into the v1 range; an
     unreadable value is skipped, as v1 skipped it), compare it with the v1 default, apply the rule, clamp into the
-    v2 catalog range, then validate with `catalog.validate_spec_value`. Nothing here touches a database; the
+    v2 catalog range, then validate with `catalog.validate_spec_value`. Where v1 read 0 as "no limit" and v2 reads
+    it as "nothing" (`capture_max_body`, `capture_ttl_seconds`), a v1 0 becomes the v2 maximum, the closest v2
+    value with the v1 meaning, as the catalog notes of both keys say (finding ops-10); a value the catalog calls
+    high risk is imported with a report warning. Nothing here touches a database; the
     runner applies the decisions through the settings service (source `import`), which adds history and audit
     rows and bumps `config_version`.
 
@@ -55,6 +58,7 @@ class V1Setting:
     rule: Rule
     v2_key: str | None = None  # None means the same key
     why: str = ""
+    zero_is_unlimited: bool = False  # v1 read 0 as "no limit"; v2 reads it as "nothing", so 0 maps to the v2 maximum
 
     def target(self, key: str) -> str:
         return self.v2_key or key
@@ -116,8 +120,9 @@ V1_SETTINGS: Final[dict[str, V1Setting]] = {
     "capture_enabled": V1Setting(1, 0, 1, Rule.IF_CHANGED),
     "capture_max_records": V1Setting(250, 0, 1000, Rule.IF_LARGER),
     "capture_max_bytes": V1Setting(4194304, 0, 67108864, Rule.IF_LARGER),
-    "capture_max_body": V1Setting(16384, 0, 524288, Rule.IF_CHANGED),
-    "capture_ttl_seconds": V1Setting(900, 0, 86400, Rule.IF_CHANGED),
+    # v1 app/capture.py cut a body only `if limit` and pruned only `if ttl`: 0 meant no limit (finding ops-10).
+    "capture_max_body": V1Setting(16384, 0, 524288, Rule.IF_CHANGED, zero_is_unlimited=True),
+    "capture_ttl_seconds": V1Setting(900, 0, 86400, Rule.IF_CHANGED, zero_is_unlimited=True),
     "throttle_escalation_enabled": V1Setting(1, 0, 1, Rule.IF_CHANGED),
     "throttle_strike_decay_seconds": V1Setting(1800, 0, 604800, Rule.IF_CHANGED),
     "user_agent_rules_enabled": V1Setting(1, 0, 1, Rule.IF_CHANGED),
@@ -343,6 +348,7 @@ def plan_setting(key: str, raw: Any, *, present: bool, saved_at: Any = None) -> 
         decision.notes.append(f"{v2_key} is not in the v2 catalog")
         return decision
     candidate: Any = value
+    mapped_zero = False
     if meta.rule is Rule.CACHE_POST:
         if value != 1:
             decision.action = Action.SKIP_DEFAULT
@@ -355,6 +361,12 @@ def plan_setting(key: str, raw: Any, *, present: bool, saved_at: Any = None) -> 
         decision.warning = (
             "HIGH RISK: cache_post_requests is 'all' because v1 cached every POST; a POST that changes something "
             "can then be answered from the cache. Consider 'allowlist' (only the read-only lookups v2 knows are safe)"
+        )
+    elif meta.zero_is_unlimited and value == 0 and spec.max is not None:
+        mapped_zero = True
+        candidate = type(catalog.DEFAULTS[v2_key])(spec.max)
+        decision.notes.append(
+            f"v1's 0 meant no limit, and v2's 0 means nothing is kept, so it is imported as the v2 maximum {candidate}"
         )
     elif meta.rule is Rule.IF_LARGER:
         v2_default = catalog.DEFAULTS[v2_key]
@@ -372,6 +384,9 @@ def plan_setting(key: str, raw: Any, *, present: bool, saved_at: Any = None) -> 
         decision.action = Action.SKIP_INVALID
         decision.notes.append(f"v2 refused the value: {exc.message}")
         return decision
+    risky = spec.is_high_risk_value(decision.value) if mapped_zero else None
+    if risky:
+        decision.warning = f"HIGH RISK: {v2_key} is imported as {decision.value!r} from v1: {risky}"
     decision.action = Action.IMPORT
     return decision
 

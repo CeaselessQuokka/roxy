@@ -144,7 +144,8 @@ def test_default_matches_plan_and_validates(key: str) -> None:
         assert default in (0, 1)
         assert not isinstance(default, bool)
     elif spec.type is SettingType.ENUM:
-        assert spec.option_values() == ACTIONS
+        # SPAM-DIST only recommends (its subject is a swarm sharing one User-Agent; finding abuse-5).
+        assert spec.option_values() == (("recommend",) if key == "spam_dist_action" else ACTIONS)
         assert default in spec.option_values()
     else:
         pytest.fail(f"{key}: unexpected type {spec.type}")
@@ -215,8 +216,9 @@ def test_detector_ranges(detector: str) -> None:
 
 
 def test_ban_is_risky_only_where_the_plan_recommends() -> None:
-    for detector in ("enum", "bust", "dist"):
+    for detector in ("enum", "bust"):
         assert BY_KEY[f"spam_{detector}_action"].is_high_risk_value("ban")
+    assert "ban" not in BY_KEY["spam_dist_action"].option_values()  # SPAM-DIST only recommends (abuse-5)
     for detector in ("rate", "refused", "probe", "auth"):
         assert BY_KEY[f"spam_{detector}_action"].is_high_risk_value("ban") is None
 

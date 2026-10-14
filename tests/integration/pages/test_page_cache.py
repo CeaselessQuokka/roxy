@@ -25,7 +25,7 @@ import pytest
 
 from pages_harness import HOSTILE, parse_html, setting_selector
 from roxy.admin.pages import registry
-from roxy.admin.pages.cache import explainer, span_words
+from roxy.admin.pages.cache import explainer, rule_fallbacks, rule_window_cell, span_words
 from roxy.core.style_guard import find_style_issues
 
 PAGE = "/admin/cache"
@@ -370,3 +370,23 @@ def test_the_explainer_follows_the_settings() -> None:
     with_swr = explainer(Settings(cache_swr_seconds=60))["steps"]
     assert any(any(p.get("badge") == "REVALIDATING" for p in step["parts"]) for step in with_swr)
     assert [span_words(1), span_words(90), span_words(3700)] == ["1 second", "1 minute 30s", "1 hour 1m"]
+
+
+def test_a_rule_zero_reads_as_the_setting_it_falls_back_to() -> None:
+    """Finding docs_b-2 (`cache/policy.py request_policy`): a rule's 0 revalidate window or refusal lifetime is the
+    setting's value, "none" only when the setting is 0 too, and nothing at all for a rule that never caches."""
+
+    class Settings:
+        def __init__(self, **values: int) -> None:
+            self.values = {"cache_swr_seconds": 60, "cache_error_ttl_seconds": 60, **values}
+
+        def int(self, key: str) -> int:
+            return int(self.values[key])
+
+    fallbacks = rule_fallbacks(Settings(cache_error_ttl_seconds=0))
+    assert fallbacks["stale_ttl"]["words"] == "1 minute"
+    assert fallbacks["negative_ttl"]["words"] == "none"
+    assert rule_window_cell(0, 300, fallbacks["stale_ttl"])["text"] == "default (1 minute)"
+    assert rule_window_cell(0, 300, fallbacks["negative_ttl"])["text"] == "default (none)"
+    assert rule_window_cell(90, 300, fallbacks["stale_ttl"])["text"] == "1 minute 30s"
+    assert rule_window_cell(90, 0, fallbacks["stale_ttl"])["text"] == "none (never cached)"

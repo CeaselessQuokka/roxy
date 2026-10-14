@@ -11,9 +11,9 @@ from typing import Any
 import pytest
 from fastapi.routing import APIRoute
 
+from auth_harness import TEST_UA, AuthHarness, auth_harness
 from roxy.admin.auth import csrf, sessions
 from roxy.admin.auth.routes import router
-from roxy.admin.auth.testing import TEST_UA, AuthHarness, auth_harness
 from roxy.core.clock import FakeClock
 
 API = "/admin/api/v1/auth"

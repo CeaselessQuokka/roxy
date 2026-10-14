@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from roxy.admin.auth.testing import RecordingTransport
+from auth_harness import RecordingTransport
 from roxy.core.clock import FakeClock
 from roxy.core.redact import SecretRegistry
 from roxy.notify.alerts import make_alert

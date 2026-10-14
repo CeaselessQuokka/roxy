@@ -350,7 +350,7 @@ def fresh_counts(conn: sqlite3.Connection, now_s: float, stale_after_s: float = 
 
 
 def reset_fleet_counters(conn: sqlite3.Connection, at: int) -> int:
-    """Reset counts (parity row 122): set `counters_reset_at` and zero requests and proxied for every worker.
+    """Reset request counts (parity row 122): set `counters_reset_at` and zero requests and proxied for every worker.
 
     Each worker adopts the reset on its next beat (it sees a newer `counters_reset_at` than its own). Returns the
     number of rows changed.

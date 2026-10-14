@@ -59,6 +59,7 @@ from roxy.admin.api import common
 from roxy.admin.api import data as data_api
 from roxy.admin.pages import fmt
 from roxy.admin.pages.kit import Page, PageAdmin, PageView, table_query, table_view, templates_of
+from roxy.config.catalog import CATALOG
 from roxy.config.constants import DEFAULT_CACHE_RULE_TTL, MAX_CACHE_IGNORED_PARAMS
 from roxy.config.insight_params import INSIGHT_RULES
 from roxy.insights import read_recommendations
@@ -110,6 +111,10 @@ RULE_COLUMN_ORDER: Final[tuple[str, ...]] = (
 )
 """The rules table's columns, pattern first (the cell that opens the rule; a phone card leads with it)."""
 RULE_ORIGINS: Final[dict[str, str]] = {"default": "shipped", "admin": "admin", "recommendation": "recommendation"}
+RULE_FALLBACKS: Final[dict[str, str]] = {"stale_ttl": "cache_swr_seconds", "negative_ttl": "cache_error_ttl_seconds"}
+"""The setting a cache rule's 0 falls back to, per field (`cache/policy.py request_policy`: a rule's `stale_ttl` of 0
+uses `cache_swr_seconds` and its `negative_ttl` of 0 uses `cache_error_ttl_seconds`; only a rule `ttl` of 0 keeps
+nothing at all). Finding docs_b-2: the page said "none" and "0 keeps none" for both."""
 
 
 # ============================================================================================ small helpers
@@ -129,6 +134,32 @@ def span_words(seconds: Any) -> str:
     h, rest = divmod(s, 3600)
     m = rest // 60
     return f"{h} hour{'' if h == 1 else 's'}" + (f" {m}m" if m else "")
+
+
+def rule_fallbacks(settings: Any) -> dict[str, dict[str, Any]]:
+    """What a 0 in each fallback field of a cache rule means now: `{field: {key, label, seconds, words}}` (the
+    setting's catalog label and current value, in `span_words`; "none" when the setting itself is 0)."""
+    out: dict[str, dict[str, Any]] = {}
+    for field, key in RULE_FALLBACKS.items():
+        spec = CATALOG.get(key)
+        seconds = max(0, int(settings.int(key)))
+        out[field] = {
+            "key": key,
+            "label": spec.label if spec else key,
+            "seconds": seconds,
+            "words": span_words(seconds) if seconds else "none",
+        }
+    return out
+
+
+def rule_window_cell(value: Any, ttl: Any, fallback: Mapping[str, Any]) -> dict[str, Any]:
+    """A rule's revalidate window or negative TTL cell: its own value, or (0) the setting it falls back to, or
+    nothing at all when the rule never caches (`ttl` 0 stores neither answers nor refusals)."""
+    if ttl == 0:
+        return {"text": "none (never cached)", "tone": "muted"}
+    if isinstance(value, int | float) and value > 0:
+        return {"text": span_words(value)}
+    return {"text": f"default ({fallback['words']})", "tone": "muted", "sub": f"setting: {fallback['label']}"}
 
 
 def _stats(view: PageView) -> asyncio.Future[dict[str, Any]]:
@@ -173,17 +204,32 @@ def reset_digest(ctx: Any, **scope: Any) -> str | None:
 def stats_reset(ctx: Any) -> dict[str, Any]:
     """The "Clear stats" dialog of the statistics card (v1 `Clear stats`, the `cache_stats` family)."""
     family = data_api.FAMILIES[STATS_FAMILY]
+    tables = {(part.db, part.table) for part in family.parts}
+    consequences = ["Hits, misses, stale and coalesced counts start again from zero, as v1's Clear stats did."]
+    # Every table the family deletes is named here, read from the family itself so the dialog follows it
+    # (finding docs_b-3: the eviction counts and the TTL tuner's observations went without a word).
+    if tables & {("metrics", "cache_minute"), ("metrics", "cache_eviction_passes")}:
+        consequences.append(
+            'The Stored answers box\'s "Stored in range" and "Evicted in range" counts (and the eviction passes '
+            "behind them) start again from zero too."
+        )
+    if ("cache", "change_observations") in tables:
+        consequences.append(
+            "The TTL tuner's refetch observations (how often each endpoint's answers really change) are deleted. "
+            "They live in cache.db, which no snapshot keeps, so they cannot come back: the tuner starts learning "
+            "again from the next refetch."
+        )
+    consequences += [
+        "The stored answers stay (use Purge for those); the requests stay in every Traffic total.",
+        "A marker on the charts shows when it happened, and tiles over that time say their data was reset.",
+    ]
     return {
         "id": "dlg-cache-reset-stats",
         "title": "Clear the cache statistics?",
         "family": STATS_FAMILY,
         "phrase": f"reset {STATS_FAMILY}",
         "digest": reset_digest(ctx, scope="family", families=[STATS_FAMILY]),
-        "consequences": [
-            "Hits, misses, stale and coalesced counts start again from zero, as v1's Clear stats did.",
-            "The stored answers stay (use Purge for those); the requests stay in every Traffic total.",
-            "A marker on the charts shows when it happened, and tiles over that time say their data was reset.",
-        ],
+        "consequences": consequences,
         "note": family.note,
     }
 
@@ -496,6 +542,7 @@ async def rules_card(view: PageView) -> dict[str, Any]:
     tq, notice = table_query(view, cache_api.RULES_SPEC, address=False)
     answer = await cache_api.rules_answer(view.ctx, tq)
     suggestions, suggestion_total = await tuner_suggestions(view.ctx)
+    fallbacks = rule_fallbacks(view.ctx.settings)
 
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
         ttl = item.get("ttl")
@@ -506,8 +553,9 @@ async def rules_card(view: PageView) -> dict[str, Any]:
             "pattern": {"text": item.get("pattern"), "caller": True, "mono": True},
             "type": "Regex" if item.get("type") == "regex" else "Wildcard",
             "ttl": {"text": "never cache" if ttl == 0 else span_words(ttl), "tone": "warn" if ttl == 0 else None},
-            "stale_ttl": span_words(item.get("stale_ttl")) if item.get("stale_ttl") else "none",
-            "negative_ttl": span_words(item.get("negative_ttl")) if item.get("negative_ttl") else "none",
+            # A 0 here is the setting's value, not "none" (finding docs_b-2).
+            "stale_ttl": rule_window_cell(item.get("stale_ttl"), ttl, fallbacks["stale_ttl"]),
+            "negative_ttl": rule_window_cell(item.get("negative_ttl"), ttl, fallbacks["negative_ttl"]),
             "methods": ", ".join(str(m) for m in methods) or "GET",
             "normalize_flags": {"text": ", ".join(str(f) for f in flags), "caller": True} if flags else None,
             "note": {"text": item.get("note"), "caller": True} if item.get("note") else None,
@@ -546,6 +594,7 @@ async def rules_card(view: PageView) -> dict[str, Any]:
         "default_ttl": answer.get("default_ttl_s"),
         "default_ttl_words": span_words(answer.get("default_ttl_s")),
         "new_rule_ttl": DEFAULT_CACHE_RULE_TTL,
+        "fallbacks": fallbacks,
         "suggestions": suggestions,
         "suggestion_total": suggestion_total,
         "tuner_on": bool(view.ctx.settings.bool("ttl_tuner_enabled")),
@@ -816,6 +865,7 @@ async def rule_drawer(request: Request, principal: PageAdmin) -> HTMLResponse:
             "updated": view.time_cell(rule.get("updated_at")),
             "history_href": "/admin/audit?" + urlencode({"target": f"rules_cache:{int(rule['id'])}"}),
             "flags_text": "\n".join(str(f) for f in rule.get("normalize_flags") or ()),
+            "fallbacks": rule_fallbacks(view.ctx.settings),
         }
 
     return await _render_drawer(request, principal, "admin/pages/cache/drawer_rule.html", build)

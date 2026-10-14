@@ -184,6 +184,31 @@ async def test_tarpit_hold(proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any
     assert len(ctx.recorder.events) == 1
 
 
+async def test_a_held_refusal_keeps_only_a_capture_of_the_body(
+    proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any
+) -> None:
+    """Final review memory-3: a refusal sends the body nowhere, so before a tarpit hold (8 to 20 s) the request keeps
+    only `capture_max_body` bytes of it; the caller's wire bytes still count the whole body (plan 14.3)."""
+    plan = fakes.FakePlan("hold")
+    tarpit = fakes.FakeTarpit(plan)
+    refusal = respond.Refusal(
+        403,
+        "Requests that look like sign in attempts are not allowed.",
+        ReasonCode.SPAM,
+        tarpit_category="auth_attempt",
+    )
+    ctx.settings = fakes.FakeSettings(capture_max_body=1024)
+    ctx.abuse = fakes.FakeAbuse(refusal, tarpit=tarpit)
+    path = "/auth.roblox.com/v2/login"
+    response = await proxy_client.post(path, content=b"x" * (100 * 1024), headers={"Content-Type": "text/plain"})
+    assert response.status_code == 403
+    assert plan.waited == 1
+    [(category, held)] = tarpit.asked
+    assert (category, len(held.body)) == ("auth_attempt", 1024)  # cut before the tarpit was asked
+    [event] = ctx.recorder.events
+    assert event.caller_bytes_in == wire_in(response.request, path)  # the full 100 KiB body counts
+
+
 async def test_tarpit_drip(proxy_client: httpx.AsyncClient, ctx: Any, fakes: Any) -> None:
     plan = fakes.FakePlan("drip", ticks=4)
     ctx.abuse.tarpit = fakes.FakeTarpit(plan)

@@ -64,6 +64,7 @@ from roxy.config.audit import Actor
 from roxy.config.constants import MAX_RULE_MESSAGE, MAX_RULE_NOTE, MAX_THROTTLE_TIERS
 from roxy.config.defaults import IGNORED_VALUE_HEADER_NOTE, IGNORED_VALUE_HEADERS, throttle_tier_rows
 from roxy.config.runtime import bump_config_version
+from roxy.core.clock import SYSTEM_CLOCK
 from roxy.migration.report import (
     ALREADY,
     DUPLICATE,
@@ -76,6 +77,7 @@ from roxy.migration.report import (
     MigrationReport,
 )
 from roxy.migration.text import CleanText, clean_admin_text
+from roxy.migration.times import plausible_epoch, plausible_expiry
 from roxy.migration.v1_settings import v1_int
 from roxy.rules.match import header_rule_canonical_key
 from roxy.rules.models import RULE_TABLES, RuleTable, ThrottleTierIn, to_columns
@@ -158,14 +160,13 @@ def _items(value: Any) -> list[tuple[str, dict[str, Any]]]:
     return [(str(key), dict(record)) for key, record in value.items() if isinstance(record, Mapping)]
 
 
-def _epoch(value: Any) -> int | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(number) or number <= 0:
-        return None
-    return int(number)
+def _epoch(value: Any, now: int | None) -> int | None:
+    """A plausible v1 time (finite, positive, at most a day after `now`, lead decision 4), else None: missing.
+
+    A huge `Added` time (what v1's swinging merge produced on its way to infinity) once overflowed SQLite's INTEGER
+    and rolled back the whole table (finding ops-5); now it is missing, so the row gets the time of the run.
+    """
+    return plausible_epoch(value, now=int(SYSTEM_CLOCK.now()) if now is None else now)
 
 
 def _no_scrub(text: str) -> str:
@@ -179,6 +180,7 @@ class PlanContext:
 
     report: MigrationReport
     scrub: Callable[[str], str] = _no_scrub
+    now: int | None = None  # the run's time, the bound of every v1 time (None: the system clock)
 
 
 def clean_scrubbed(value: Any, limit: int, scrub: Callable[[str], str]) -> tuple[CleanText, bool]:
@@ -254,7 +256,7 @@ def _plan_blocks(runtime: Mapping[str, Any], ctx: PlanContext) -> list[RowPlan]:
     plans = []
     for pattern, record in _items(runtime.get("EndpointBlocks")):
         plan = RowPlan("rules_endpoint_block", pattern, stored_fields=frozenset({"pattern", "type"}))
-        plan.created_at = _epoch(record.get("Added"))
+        plan.created_at = _epoch(record.get("Added"), ctx.now)
         plan.data = {
             "type": _pattern_kind(record),
             "pattern": pattern,
@@ -269,7 +271,7 @@ def _plan_endpoint_rules(runtime: Mapping[str, Any], ctx: PlanContext) -> list[R
     plans = []
     for pattern, record in _items(runtime.get("EndpointRules")):
         plan = RowPlan("rules_endpoint_limit", pattern, stored_fields=frozenset({"pattern", "type"}))
-        plan.created_at = _epoch(record.get("Added"))
+        plan.created_at = _epoch(record.get("Added"), ctx.now)
         limit, period = v1_int(record.get("Limit")), v1_int(record.get("Period", 60))
         if limit is None or period is None:
             plan.error = "Limit and period must be whole numbers"
@@ -290,7 +292,7 @@ def _plan_cache_rules(runtime: Mapping[str, Any], ctx: PlanContext) -> list[RowP
     plans = []
     for pattern, record in _items(runtime.get("CacheRules")):
         plan = RowPlan("rules_cache", pattern, stored_fields=frozenset({"pattern", "type"}))
-        plan.created_at = _epoch(record.get("Added"))
+        plan.created_at = _epoch(record.get("Added"), ctx.now)
         ttl = v1_int(record.get("TTL"))
         if ttl is None:
             plan.error = "TTL must be a whole number of seconds"
@@ -309,7 +311,7 @@ def _plan_user_agent_rules(runtime: Mapping[str, Any], ctx: PlanContext) -> list
     plans = []
     for index, (rule_id, record) in enumerate(_items(runtime.get("UserAgentRules"))):
         plan = RowPlan("rules_user_agent", rule_id, stored_fields=frozenset({"needle", "mode"}))
-        plan.created_at = _epoch(record.get("Added"))
+        plan.created_at = _epoch(record.get("Added"), ctx.now)
         try:
             cooldown = float(record.get("Cooldown", 2.0))
         except (TypeError, ValueError):
@@ -338,7 +340,7 @@ def _plan_header_rules(runtime: Mapping[str, Any], ctx: PlanContext) -> list[Row
     plans = []
     for rule_id, record in _items(runtime.get("HeaderRules")):
         plan = RowPlan("rules_header", rule_id, stored_fields=frozenset({"needle", "mode"}))
-        plan.created_at = _epoch(record.get("Added"))
+        plan.created_at = _epoch(record.get("Added"), ctx.now)
         plan.data = {
             "header": str(record.get("Header", "") or ""),
             "scope": record.get("Scope", "either"),
@@ -405,7 +407,7 @@ def _plan_bypass(runtime: Mapping[str, Any], ctx: PlanContext, now: int, expiry_
     default_expiry = now + expiry_hours * 3600 if expiry_hours > 0 else None
     for address, record in _items(runtime.get("ThrottleBypassIps")):
         plan = RowPlan("access_list", address)
-        plan.created_at = _epoch(record.get("Added"))
+        plan.created_at = _epoch(record.get("Added"), ctx.now)
         if not _single_address(address):
             plan.error = (
                 "not a single IP address: v1 compared bypass entries with the client address as exact text, so this "
@@ -414,7 +416,7 @@ def _plan_bypass(runtime: Mapping[str, Any], ctx: PlanContext, now: int, expiry_
             ctx.report.warn(
                 f"v1 bypass entry {address[:60]!r} is not a single IP address and never matched in v1; not imported"
             )
-        v1_expiry = _epoch(record.get("Expires"))
+        v1_expiry = plausible_expiry(record.get("Expires"))
         if v1_expiry is not None and v1_expiry <= now:
             plan.status = SKIPPED
             plan.notes.append("expired in v1 already")
@@ -447,7 +449,7 @@ def build_rule_plans(
     scrub: Callable[[str], str] = _no_scrub,
 ) -> dict[str, list[RowPlan]]:
     """Validated plans for every row-by-row rule table (no database access)."""
-    ctx = PlanContext(report, scrub)
+    ctx = PlanContext(report, scrub, now)
     plans = {
         "rules_endpoint_block": _plan_blocks(runtime, ctx),
         "rules_endpoint_limit": _plan_endpoint_rules(runtime, ctx),
@@ -747,7 +749,11 @@ async def import_ladder(
 
 
 def plan_service_state(
-    runtime: Mapping[str, Any], report: MigrationReport, scrub: Callable[[str], str] = _no_scrub
+    runtime: Mapping[str, Any],
+    report: MigrationReport,
+    scrub: Callable[[str], str] = _no_scrub,
+    *,
+    now: int | None = None,
 ) -> list[tuple[str, dict[str, Any], str]]:
     """(service_state key, value, v1 summary) for the pause and throttle-all state worth importing.
 
@@ -771,7 +777,7 @@ def plan_service_state(
         if not flag and not reason:
             report.service_state.append({"key": key, "v1": summary, "status": SKIPPED, "notes": ["nothing to import"]})
             continue
-        since = float(_epoch(runtime.get(since_name)) or 0) if flag else 0.0
+        since = float(_epoch(runtime.get(since_name), now) or 0) if flag else 0.0
         if key == PAUSE_KEY:
             value = PauseState(paused=flag, reason=reason, since=since).to_json()
         else:

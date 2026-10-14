@@ -68,6 +68,7 @@ import asyncio
 import csv
 import io
 import json
+import math
 import re
 import secrets
 from collections import deque
@@ -1243,13 +1244,34 @@ async def export_format(
 ExportFormatDep = Annotated[ExportFormat | None, Depends(export_format)]
 
 
+MAX_FINITE_DEPTH: Final = 32
+"""How deep `finite_json` walks a value (export rows are shallow; deeper parts are kept as they are)."""
+
+
+def finite_json(value: Any, depth: int = 0) -> Any:
+    """`value` with every non-finite float (NaN, infinity) as None, so an export is always strict JSON (defense in
+    depth for final review data-9: the header parsers that stored infinity are fixed; LEAD_NOTES: a NaN once made
+    v1's dashboard blank)."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if depth >= MAX_FINITE_DEPTH:
+        return value
+    if isinstance(value, Mapping):
+        return {key: finite_json(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [finite_json(item, depth + 1) for item in value]
+    return value
+
+
 def _cell_text(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, float) and not math.isfinite(value):
+        return ""  # unknown, as an empty cell (never "nan" or "inf")
     if isinstance(value, Mapping | list | tuple):
-        return json.dumps(jsonable_encoder(value), separators=(",", ":"), ensure_ascii=False)
+        return json.dumps(finite_json(jsonable_encoder(value)), separators=(",", ":"), ensure_ascii=False)
     return str(value).replace("\x00", "")
 
 
@@ -1452,7 +1474,7 @@ class ExportBuilder:
             elif hasher is not None:
                 value = mask_ip_value(value, hasher, keep_versions=ipmask.is_user_agent_field(column.key))
             out[column.key] = value
-        text = json.dumps(out, separators=(",", ":"), ensure_ascii=False)
+        text = json.dumps(finite_json(out), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
         return (("," if self.rows else "") + text).encode("utf-8")
 
     def add(self, items: Iterable[Mapping[str, Any]]) -> bool:
@@ -1655,6 +1677,7 @@ __all__ = [
     "MAX_CONCURRENT_EXPORTS",
     "MAX_EXPORT_BYTES",
     "MAX_EXPORT_ROWS",
+    "MAX_FINITE_DEPTH",
     "MAX_ROW_ID",
     "MAX_SEARCH_CHARS",
     "PAGE_SIZES",
@@ -1710,6 +1733,7 @@ __all__ = [
     "export_slots",
     "export_table",
     "fields_named",
+    "finite_json",
     "forbidden",
     "kpi_from_read_model",
     "kpi_tile",

@@ -92,7 +92,7 @@
   {{ _number(prefix, "limit", "Requests allowed", rule.limit if rule else "") }}
   {{ _number(prefix, "period", "Per (seconds)", rule.period if rule else 60) }}
 </div>
-{{ _select(prefix, "scope", "Scope", [("ip", "Per IP (never more than the per-IP allowance)"), ("place", "Per experience"), ("global", "Shared by everyone")], rule.scope if rule else "ip") }}
+{{ _select(prefix, "scope", "Scope", [("ip", "Per IP (never more than the per-IP allowance)"), ("place", "Per experience (and caller network, as Place limit counts by says)"), ("global", "Shared by everyone")], rule.scope if rule else "ip") }}
 {{ _text(prefix, "message", "Reply sent to the caller (optional)", rule.message if rule else "", hint="Returned instead of the default rate-limit message.") }}
 {{ _text(prefix, "note", "Note (private)", rule.note if rule else "") }}
 {%- endmacro %}

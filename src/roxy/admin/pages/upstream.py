@@ -54,7 +54,7 @@ from roxy.admin.api import common
 from roxy.admin.api import routing_rules as routing_api
 from roxy.admin.api import upstream as upstream_api
 from roxy.admin.api import upstream_limits as limits_api
-from roxy.admin.pages import shell
+from roxy.admin.pages import registry, shell
 from roxy.admin.pages._upstream_common import (
     EGRESS_ABOUT,
     EGRESS_LABELS,
@@ -71,6 +71,8 @@ from roxy.admin.pages._upstream_common import (
     sentence,
 )
 from roxy.admin.pages.kit import Page, PageAdmin, PageView, filter_chip, table_query, table_view
+from roxy.config.catalog import CATALOG
+from roxy.egress.rotator import PARK_KEY
 from roxy.metrics import queries
 from roxy.metrics.catalog import METRICS
 
@@ -105,14 +107,31 @@ BUCKET_LABELS: Final[dict[str, str]] = {
     "egress:credential": "Credential",
     "egress:credential:probe": "Credential probes (reserved)",
 }
-BUCKET_SETTINGS: Final[dict[str, tuple[str, str]]] = {
+BUCKET_SETTINGS: Final[dict[str, tuple[str, ...]]] = {
     "global": ("global_bucket_per_min", "global_bucket_burst"),
     "egress:direct": ("direct_bucket_per_min", "direct_bucket_burst"),
     "egress:rotator": ("rotator_bucket_per_min", "rotator_bucket_burst"),
-    "egress:credential": ("credential_bucket_per_min", "credential_bucket_burst"),
+    "egress:credential": ("credential_bucket_per_min", "credential_probe_reserved_per_min", "credential_bucket_burst"),
     "egress:credential:probe": ("credential_probe_reserved_per_min", "credential_bucket_burst"),
 }
-"""Where the rate of a bucket that `upstream_limits` cannot override comes from (the drawer names it)."""
+"""Where the rate of a bucket that `upstream_limits` cannot override comes from (the drawer names the settings and
+the card they are edited on: the catalog's first anchor of the first key, finding docs_a-11)."""
+BUCKET_RATE_WORDS: Final[dict[str, str]] = {
+    "egress:credential": (
+        "Only callers on the credential allowlist use this bucket (none while the allowlist is empty). Its rate is "
+        "the credential rate limit minus the rate reserved for credential checks (at least 1 a minute); its burst "
+        "is the credential burst minus the 1 kept for credential checks (at least 1)."
+    ),
+    "egress:credential:probe": (
+        "Only Roxy's own credential checks use this bucket. Its rate is the rate reserved for credential checks (at "
+        "least 1 a minute); its burst is 1, its share of the credential burst, so no more account calls than the "
+        "credential burst ever leave back to back. At a credential burst of 1 a check also takes the slot of the "
+        "allowlisted traffic's bucket."
+    ),
+}
+"""How the two credential buckets are made from their settings (`upstream/buckets.py BucketDefaults`, plan 7.3:
+probes use the reserved sub-bucket only, so the account bucket moves only with allowlisted traffic; the burst split
+of finding constraints-6: `CREDENTIAL_PROBE_BURST`, `credential_probe_shares_burst`)."""
 MAX_CHANGES_SHOWN: Final = 25
 SOURCE_WORDS: Final[dict[str, str]] = {
     "retry_after": "Roblox's Retry-After",
@@ -121,6 +140,10 @@ SOURCE_WORDS: Final[dict[str, str]] = {
     "default": "no Retry-After (the default)",
 }
 """Why a cooldown lasts as long as it does (`upstream/cooldowns.py CooldownSource`)."""
+PARK_SOURCE_WORDS: Final = "the rotator's failure streak (parked after rotator_max_failures failures in a row)"
+"""The rotator park's cooldown row (`egress/rotator.py PARK_KEY`) is written with the `breaker` source (hot.db's
+`cooldown.source` allows four values), but no circuit breaker parks it: its own failure streak does (finding
+docs_a-10)."""
 CUT_FROM_WORDS: Final[dict[str, str]] = {
     "observed": "cut from the rate Roxy really sent at",
     "limit": "cut from the configured rate",
@@ -441,6 +464,30 @@ async def buckets_card(view: PageView) -> dict[str, Any]:
     }
 
 
+def bucket_rate_source(key: str) -> dict[str, Any] | None:
+    """Where a fixed bucket's rate comes from: its settings (key and catalog label), the card that edits them (the
+    catalog's first anchor of the first key: `upstream#buckets`, or `credential#budget` for the two credential
+    buckets) and how the rate is made from them; None for a bucket an override can change."""
+    keys = BUCKET_SETTINGS.get(key)
+    if not keys:
+        return None
+    specs = [CATALOG.get(name) for name in keys]
+    home = next((anchor for spec in specs if spec for anchor in spec.pages), "upstream#buckets")
+    page_id, _, card_id = home.partition("#")
+    try:
+        where = f"{registry.page(page_id).title} > {registry.card(page_id, card_id).title}"
+    except KeyError:  # an anchor the registry lacks (a test checks every catalog anchor is placed)
+        where = home
+    return {
+        "settings": [
+            {"key": name, "label": spec.label if spec else name} for name, spec in zip(keys, specs, strict=True)
+        ],
+        "href": f"/admin/{page_id}#{card_id}",
+        "where": where,
+        "how": BUCKET_RATE_WORDS.get(key, ""),
+    }
+
+
 @page.router.get("/bucket", include_in_schema=False)
 async def bucket_drawer(request: Request, principal: PageAdmin) -> HTMLResponse:
     """One bucket in the drawer: its history chart, its rate and where it comes from, and its override form."""
@@ -465,7 +512,7 @@ async def bucket_drawer(request: Request, principal: PageAdmin) -> HTMLResponse:
             "gauge": gauge("Fill now", (row or {}).get("fill_pct")),
             "overridable": overridable,
             "override": override,
-            "settings_keys": BUCKET_SETTINGS.get(key),
+            "rate_source": bucket_rate_source(key),
             "patch_url": f"{API}/upstream-limits/{quoted_key(key)}",
             "create_url": f"{API}/upstream-limits",
             "fill_help": (METRICS["bucket_fill_peak_pct"].description if "bucket_fill_peak_pct" in METRICS else ""),
@@ -503,7 +550,9 @@ async def queue_card(view: PageView) -> dict[str, Any]:
 # ============================================================================================ cooldowns, breakers
 
 
-def _source_words(source: Any) -> str:
+def _source_words(source: Any, key: Any = None) -> str:
+    if key == PARK_KEY:  # the rotator park: its failure streak, not a circuit breaker (finding docs_a-10)
+        return PARK_SOURCE_WORDS
     text = str(source or "")
     return SOURCE_WORDS.get(text, text.replace("_", " ") or "n/a")
 
@@ -526,7 +575,7 @@ async def cooldowns_card(view: PageView) -> dict[str, Any]:
         {
             **item,
             "egress_label": EGRESS_LABELS.get(str(item.get("egress") or ""), "Every egress"),
-            "source_words": _source_words(item.get("source")),
+            "source_words": _source_words(item.get("source"), item.get("key")),
             "countdown": _countdown(item.get("ends_at_ms"), now_ms),
             "set": view.time_cell(item.get("set_at")),
         }
@@ -535,7 +584,7 @@ async def cooldowns_card(view: PageView) -> dict[str, Any]:
     local = [
         {
             **item,
-            "source_words": _source_words(item.get("source")),
+            "source_words": _source_words(item.get("source"), item.get("key")),
             "countdown": _countdown(item.get("ends_at_ms"), now_ms),
         }
         for item in answer.get("local") or ()

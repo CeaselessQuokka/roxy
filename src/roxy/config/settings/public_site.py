@@ -131,8 +131,11 @@ SETTINGS: list[SettingSpec] = [
             "content type, exactly as in v1: with ?prettyprint=true a 4xx answered from the cache is pretty printed "
             "and a live one is not, as v1 did. Every Roblox 5xx, 502 and 504 becomes a 500 with the text 'Upstream "
             "request failed; please try again later.'. Old scripts that only check for 200 or 500 keep working, "
-            "but they usually retry at once, which sends more traffic to Roblox and causes more 429s. Roxy's own "
-            "refusals (throttles, pause, invalid URLs) are unchanged, and Retry-After is still sent."
+            "but they usually retry at once, which sends more traffic to Roblox and causes more 429s. A Roblox "
+            "429 that Roxy's own call received counts as a Roblox 4xx: callers get 500 with Roblox's body, and "
+            "Retry-After is still sent. Roxy's own busy and cooldown answers that made no call (a cooling "
+            "endpoint, a per-key 429 marker, a full queue) stay 429, and Roxy's own refusals (throttles, pause, "
+            "invalid URLs) are unchanged."
         ),
         if_disabled=(
             "Callers see the real upstream status (404 stays 404, 429 stays 429 with Retry-After) plus a "

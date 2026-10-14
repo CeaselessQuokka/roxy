@@ -34,6 +34,13 @@ How it works
     15 s) plus this worker's bytes not yet in it; at `rotator_hard_stop_pct` of `rotator_quota_gb_per_month`
     (decimal GB, the provider's unit) or `rotator_daily_cap_mb`, the rotator stops until the next cycle or day.
     Cycles and days are UTC.
+    Billing count (finding data-4): `egress_usage` is a statistics table the owner may reset (Data > Egress usage),
+    but the provider bills every byte of the cycle. So the rotator also keeps its own count in control.db
+    `service_state[BILLING_KEY]` (`BillingCount`), which no statistics reset touches: per cycle and per UTC day,
+    the most bytes `egress_usage` ever showed (`*_floor`, a high-water mark) and the bytes the workers counted
+    themselves (`*_counted`: every worker adds the rotator bytes `on_usage` saw, at most every 15 s). The budget is
+    the largest of the three (each is a lower bound of what was really sent, so the largest is the best one and
+    nothing is counted twice), and a reset of the statistics never lifts the hard stop or the daily cap mid-cycle.
 
 What to read next
     `roxy/egress/clients.py` (`EgressClients.send` uses `acquire` and `release`), `roxy/egress/metering.py` (the
@@ -49,12 +56,14 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import secrets
 import sqlite3
 import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote, unquote, urlsplit
@@ -91,6 +100,13 @@ STICKY_UNTIL_429 = "sticky_until_429"
 SESSION_MODES = (PER_REQUEST, STICKY, STICKY_UNTIL_429)
 
 USAGE_REFRESH_S = 15.0
+BILLING_KEY = "rotator_billing"
+"""control.db `service_state` row with the rotator's own billing count (`BillingCount`, finding data-4)."""
+BILLING_WRITE_BUDGET_MS = 500
+"""How long the billing count's control.db write waits for another process's lock (the refresh loop must not stall);
+the bytes stay in this worker's count and are added by the next refresh."""
+MAX_BILLING_BYTES = 2**62
+"""Largest count read back from the billing row (a damaged row can never make a number SQLite cannot hold)."""
 DECIMAL_GB = 1_000_000_000
 DECIMAL_MB = 1_000_000
 MAX_URL_LENGTH = 2048
@@ -314,6 +330,113 @@ def usage_since(conn: sqlite3.Connection, egress: str, start_s: int) -> int:
     return total
 
 
+@dataclass(frozen=True, slots=True)
+class BillingCount:
+    """The rotator's own count of billed bytes for one billing cycle and one UTC day (control.db `BILLING_KEY`).
+
+    `*_floor`: the most bytes metrics.db `egress_usage` ever showed for the period (a high-water mark).
+    `*_counted`: the rotator bytes every worker counted itself (`RotatorPool.on_usage`), added up fleet-wide.
+    Neither is ever lowered within its period, and no statistics reset touches the row (finding data-4).
+    """
+
+    cycle_start: int = 0
+    cycle_floor: int = 0
+    cycle_counted: int = 0
+    day_start: int = 0
+    day_floor: int = 0
+    day_counted: int = 0
+
+    def for_periods(self, cycle: int, day: int) -> BillingCount:
+        """This count as of the cycle starting at `cycle` and the day at `day` (a period that moved starts at 0)."""
+        same_cycle = self.cycle_start == cycle
+        same_day = self.day_start == day
+        return BillingCount(
+            cycle,
+            self.cycle_floor if same_cycle else 0,
+            self.cycle_counted if same_cycle else 0,
+            day,
+            self.day_floor if same_day else 0,
+            self.day_counted if same_day else 0,
+        )
+
+    def as_json(self) -> str:
+        return json.dumps(asdict(self), sort_keys=True)
+
+
+def _billing_number(data: dict[str, Any], key: str) -> int:
+    """One count of the stored row: a finite number of bytes, else 0 (`json.loads` accepts NaN and Infinity)."""
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        return 0
+    return max(0, min(int(value), MAX_BILLING_BYTES))
+
+
+def read_billing(conn: sqlite3.Connection) -> BillingCount:
+    """The billing count stored in control.db (zeros when none is stored yet or the row is unreadable)."""
+    row = conn.execute("SELECT value_json FROM service_state WHERE key = ?", (BILLING_KEY,)).fetchone()
+    try:
+        data = json.loads(row[0]) if row is not None else {}
+    except (TypeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return BillingCount(**{item.name: _billing_number(data, item.name) for item in dataclass_fields(BillingCount)})
+
+
+def merge_billing(
+    conn: sqlite3.Connection,
+    *,
+    cycle: int,
+    day: int,
+    table_cycle: int,
+    table_day: int,
+    add_cycle: int,
+    add_day: int,
+    now_s: int,
+) -> BillingCount:
+    """Raise the floors to what `egress_usage` shows and add this worker's counted bytes, in one control.db
+    transaction (two workers never lose each other's bytes). Returns the stored count."""
+    stored = read_billing(conn).for_periods(cycle, day)
+    merged = BillingCount(
+        cycle,
+        max(stored.cycle_floor, table_cycle),
+        stored.cycle_counted + add_cycle,
+        day,
+        max(stored.day_floor, table_day),
+        stored.day_counted + add_day,
+    )
+    conn.execute(
+        "INSERT INTO service_state (key, value_json, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+        (BILLING_KEY, merged.as_json(), now_s),
+    )
+    return merged
+
+
+def billed_bytes(table_cycle: int, table_day: int, billing: BillingCount, cycle: int, day: int) -> tuple[int, int]:
+    """`(cycle bytes, day bytes)` the rotator budget counts: the largest of what `egress_usage` shows now, its
+    high-water mark and the workers' own count (each a lower bound of the bytes really sent). The read model for
+    every page, check and rule that must agree with the hard stop (finding data-4)."""
+    count = billing.for_periods(cycle, day)
+    return (
+        max(table_cycle, count.cycle_floor, count.cycle_counted),
+        max(table_day, count.day_floor, count.day_counted),
+    )
+
+
+async def read_billed_bytes(dbs: Any, cycle: int, day: int) -> tuple[int, int]:
+    """`billed_bytes` read from the shared databases (metrics.db `egress_usage`, control.db `BILLING_KEY`) for a
+    reader with no `RotatorPool` at hand: H-ROTATOR-QUOTA and the insights rotator status, which must agree with
+    the hard stop (finding data-4). It leaves out a worker's bytes not shared yet (at most one refresh, 15 s)."""
+
+    def table(conn: sqlite3.Connection) -> tuple[int, int]:
+        return usage_since(conn, "rotator", cycle), usage_since(conn, "rotator", day)
+
+    table_cycle, table_day = await dbs.metrics.read(table)
+    billing = await dbs.control.read(read_billing)
+    return billed_bytes(table_cycle, table_day, billing, cycle, day)
+
+
 class RotatorPool:
     """DataImpulse sessions and budget (see the module docstring)."""
 
@@ -364,8 +487,13 @@ class RotatorPool:
         self._db_day_bytes = 0
         self._pending = 0
         self._kept: dict[str, tuple[int, int]] = {"day": (0, 0), "cycle": (0, 0)}
+        # Rotator bytes this worker counted that the fleet's billing count does not hold yet: (period start, bytes).
+        self._unshared: dict[str, tuple[int, int]] = {"day": (0, 0), "cycle": (0, 0)}
+        self._billing = BillingCount()
+        self._billing_degraded = False
         self._usage_read_at = -1e18
         self._usage_cycle_start = 0
+        self._usage_day_start = 0
         self._alerted: set[str] = set()
         self._degraded = False
         self._closing: set[asyncio.Task[None]] = set()
@@ -674,13 +802,17 @@ class RotatorPool:
 
     async def record_result(self, ok: bool, kind: str) -> None:
         """Count one rotator outcome: a success resets the fleet-wide streak; a failure extends it and parks the
-        rotator for `rotator_cooldown_s` at `rotator_max_failures` (failures: timeout, connect, 429, 5xx)."""
+        rotator for `rotator_cooldown_s` at `rotator_max_failures` (failures: timeout, connect, 429, 5xx).
+
+        The `rotator:streak` row is a counter kept in the breaker table, never a breaker: its state is always
+        `closed` (the park itself is the `rotator:parked` cooldown row). An `open` row without a reopening time
+        reads as half-open everywhere breakers are shown, and nothing would ever close it (finding docs_a-10)."""
         if ok:
             if self._streak == 0:
                 return
 
             def reset(conn: sqlite3.Connection) -> None:
-                conn.execute("UPDATE breaker SET failures = 0 WHERE key = ?", (STREAK_KEY,))
+                conn.execute("UPDATE breaker SET failures = 0, state = 'closed' WHERE key = ?", (STREAK_KEY,))
 
             with contextlib.suppress(SharedStateUnavailable):
                 await self._dbs.hot.write(reset)
@@ -704,10 +836,10 @@ class RotatorPool:
                 )
                 failures = 0
             conn.execute(
-                "INSERT INTO breaker (key, state, failures, window_start) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET state = excluded.state, failures = excluded.failures, "
+                "INSERT INTO breaker (key, state, failures, window_start) VALUES (?, 'closed', ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET state = 'closed', failures = excluded.failures, "
                 "window_start = excluded.window_start",
-                (STREAK_KEY, "open" if until else "closed", failures, now_ms // 1000),
+                (STREAK_KEY, failures, now_ms // 1000),
             )
             return failures, until
 
@@ -726,15 +858,20 @@ class RotatorPool:
     # --- usage and budget (plan 8.4) -----------------------------------------------------------------------------
 
     def on_usage(self, usage: EgressUsage, handed_off: bool) -> None:
-        """Accounting listener: count rotator bytes at once, so a worker stops at the cap without a flush."""
+        """Accounting listener: count rotator bytes at once, so a worker stops at the cap without a flush. Every
+        byte also goes to the fleet's billing count with the next usage refresh (`_share_billing`)."""
         if usage.egress is not Egress.ROTATOR:
             return
         size = usage.total_bytes
+        now = self._clock.now()
+        periods = (("day", day_start_for(now)), ("cycle", self._cycle_start(now)))
+        for name, start in periods:
+            unshared_start, unshared = self._unshared[name]
+            self._unshared[name] = (start, (unshared if unshared_start == start else 0) + size)
         if handed_off:
             self._pending += size  # becomes visible in metrics.db after the recorder flushes
             return
-        now = self._clock.now()
-        for name, start in (("day", day_start_for(now)), ("cycle", self._cycle_start(now))):
+        for name, start in periods:
             kept_start, kept = self._kept[name]
             self._kept[name] = (start, (kept if kept_start == start else 0) + size)
 
@@ -755,22 +892,86 @@ class RotatorPool:
         except (SharedStateUnavailable, sqlite3.Error) as exc:
             # Metrics may degrade open (C7): keep the last numbers plus this worker's own count.
             log.warning("rotator_usage_unavailable", extra={"fields": {"error": str(exc)[:200]}})
+            await self._share_billing(cycle, day)
             return
         self._pending = max(0, self._pending - pending)
         self._usage_read_at = self._clock.monotonic()
         self._usage_cycle_start = cycle
+        self._usage_day_start = day
+        await self._share_billing(cycle, day)
         self._check_budget_alerts()
 
+    def _table_bytes(self, cycle: int, day: int) -> tuple[int, int]:
+        """What metrics.db `egress_usage` showed at the last read, for the current cycle and day."""
+        return (
+            self._db_cycle_bytes if self._usage_cycle_start == cycle else 0,
+            self._db_day_bytes if self._usage_day_start == day else 0,
+        )
+
+    def _unshared_bytes(self, cycle: int, day: int) -> tuple[int, int]:
+        """This worker's counted bytes the fleet's billing count does not hold yet, for the current periods."""
+        cycle_start, cycle_bytes = self._unshared["cycle"]
+        day_start, day_bytes = self._unshared["day"]
+        return (cycle_bytes if cycle_start == cycle else 0), (day_bytes if day_start == day else 0)
+
+    async def _share_billing(self, cycle: int, day: int) -> None:
+        """Bring the fleet's billing count (control.db `BILLING_KEY`) up to date and read it back: raise its floors
+        to what `egress_usage` showed and add this worker's counted bytes, in one transaction; a plain read when
+        there is nothing to add. If control.db cannot be used the bytes stay counted here (C7) and the stop still
+        holds in this worker; the next refresh adds them."""
+        table_cycle, table_day = self._table_bytes(cycle, day)
+        add_cycle, add_day = self._unshared_bytes(cycle, day)
+        known = self._billing.for_periods(cycle, day)
+        needs_write = add_cycle > 0 or add_day > 0 or table_cycle > known.cycle_floor or table_day > known.day_floor
+        now_s = int(self._clock.now())
+
+        def merge(conn: sqlite3.Connection) -> BillingCount:
+            return merge_billing(
+                conn,
+                cycle=cycle,
+                day=day,
+                table_cycle=table_cycle,
+                table_day=table_day,
+                add_cycle=add_cycle,
+                add_day=add_day,
+                now_s=now_s,
+            )
+
+        try:
+            if needs_write:
+                billing = await self._dbs.control.write(merge, busy_timeout_ms=BILLING_WRITE_BUDGET_MS)
+            else:
+                billing = await self._dbs.control.read(read_billing)
+        except SharedStateUnavailable as exc:
+            if not self._billing_degraded:
+                log.warning("rotator_billing_unavailable", extra={"fields": {"error": str(exc)[:200]}})
+            self._billing_degraded = True
+            return
+        self._billing_degraded = False
+        self._billing = billing
+        if needs_write:
+            # Only what was added: bytes counted while the write ran stay for the next refresh.
+            for name, start, added in (("cycle", cycle, add_cycle), ("day", day, add_day)):
+                unshared_start, unshared = self._unshared[name]
+                if unshared_start == start:
+                    self._unshared[name] = (start, max(0, unshared - added))
+
     def usage_snapshot(self) -> RotatorUsage:
-        """The rotator budget now (DESIGN.md 11.4 "usage snapshot")."""
+        """The rotator budget now (DESIGN.md 11.4 "usage snapshot"): the largest of what metrics.db shows (plus
+        this worker's bytes not in it yet) and the fleet's billing count (plus this worker's bytes not in it yet),
+        so a reset of the usage statistics never lifts the hard stop or the daily cap (finding data-4)."""
         now = self._clock.now()
         cycle = self._cycle_start(now)
         day = day_start_for(now)
         kept_day = self._kept["day"][1] if self._kept["day"][0] == day else 0
         kept_cycle = self._kept["cycle"][1] if self._kept["cycle"][0] == cycle else 0
-        cycle_db = self._db_cycle_bytes if self._usage_cycle_start == cycle else 0
-        cycle_bytes = cycle_db + self._pending + kept_cycle
-        day_bytes = self._db_day_bytes + self._pending + kept_day
+        table_cycle, table_day = self._table_bytes(cycle, day)
+        add_cycle, add_day = self._unshared_bytes(cycle, day)
+        billing = self._billing.for_periods(cycle, day)
+        cycle_bytes = max(
+            table_cycle + self._pending + kept_cycle, billing.cycle_floor, billing.cycle_counted + add_cycle
+        )
+        day_bytes = max(table_day + self._pending + kept_day, billing.day_floor, billing.day_counted + add_day)
         quota = int(float(self._get("rotator_quota_gb_per_month", 0)) * DECIMAL_GB)
         stop_pct = float(self._get("rotator_hard_stop_pct", 100))
         hard_stop = int(quota * stop_pct / 100) if quota > 0 and stop_pct > 0 else 0
@@ -806,9 +1007,10 @@ class RotatorPool:
                     severity="critical" if pct >= 95 else "warn",
                     subject=f"Roxy: rotator at {pct}% of monthly quota",
                     summary=f"Rotator usage this cycle is {usage.pct_of_quota}% of the monthly quota.",
-                    fields={"used_bytes": usage.cycle_bytes, "quota_bytes": usage.quota_bytes, "page": "egress#budget"},
+                    fields={"used_bytes": usage.cycle_bytes, "quota_bytes": usage.quota_bytes},
                     cooldown_key=key,
                     cooldown_s=40 * 86_400,
+                    page="egress#budget",
                 )
         if len(self._alerted) > 64:
             self._alerted = {key for key in self._alerted if key.endswith(f":{usage.cycle_start}")}
@@ -933,12 +1135,14 @@ async def _close_quietly(client: _Closable) -> None:
 
 
 __all__ = [
+    "BILLING_KEY",
     "BOOTSTRAP_SECRET_NAMES",
     "IN_USE_SECRET_NAMES",
     "OFFERED_SECRET_NAMES",
     "PER_REQUEST",
     "STICKY",
     "STICKY_UNTIL_429",
+    "BillingCount",
     "ExitIpProbe",
     "ProxyEndpoint",
     "RotatorLease",
@@ -946,9 +1150,13 @@ __all__ = [
     "RotatorStateError",
     "RotatorUrlError",
     "RotatorUsage",
+    "billed_bytes",
     "cycle_start_for",
     "mask_ip",
+    "merge_billing",
     "parse_exit_ip",
     "parse_proxy_url",
+    "read_billed_bytes",
+    "read_billing",
     "usage_since",
 ]

@@ -9,8 +9,8 @@ from typing import Any
 
 import pytest
 
+from auth_harness import AuthHarness, SoftwarePasskey, auth_harness
 from roxy.admin.auth import totp
-from roxy.admin.auth.testing import AuthHarness, SoftwarePasskey, auth_harness
 from roxy.core.clock import FakeClock
 
 API = "/admin/api/v1/auth"

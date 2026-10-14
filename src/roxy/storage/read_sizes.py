@@ -149,6 +149,11 @@ TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
         _t("rollup_hour", "Per-hour traffic totals", "bucket_start", age="retention_hour_days"),
         _t("rollup_day", "Per-day traffic totals", "bucket_start", age="retention_day_days"),
         _t("rollup_month", "Per-month traffic totals", "bucket_start", age="retention_day_days"),
+        # Schema version 10 (metrics/0010_roblox_answers.sql): Roblox's answers per attempt, kept like the rollups.
+        _t("roblox_answer_minute", "Per-minute Roblox answers", "bucket_start", age="retention_minute_days"),
+        _t("roblox_answer_hour", "Per-hour Roblox answers", "bucket_start", age="retention_hour_days"),
+        _t("roblox_answer_day", "Per-day Roblox answers", "bucket_start", age="retention_day_days"),
+        _t("roblox_answer_month", "Per-month Roblox answers", "bucket_start", age="retention_day_days"),
         _t("dims", "Dimension combinations (endpoint, status, outcome)"),
         _t("client_minute", "Per-minute client activity", "bucket_start", age="retention_client_minute_days"),
         _t("client_hour", "Per-hour client activity", "bucket_start", age="retention_client_hour_days"),
@@ -217,7 +222,11 @@ TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
             "Header value fingerprints",
             "last_seen",
             age="retention_fingerprints_days",
-            cap="max_header_value_records",
+            # Per header name, not for the whole table (finding data-6): no table row cap is shown.
+            rule=(
+                "At most max_header_value_records values per header name (the least seen go first); values not seen "
+                "for retention_fingerprints_days are deleted."
+            ),
         ),
         _t(
             "fingerprint_user_agents",
@@ -256,7 +265,12 @@ TABLES: Final[dict[str, tuple[TableMeta, ...]]] = {
             "at",
             fixed_age_s=PROVIDER_REPORTS_KEEP_DAYS * DAY_S,
         ),
-        _t("recommendation_watches", "Recommendation watch windows", "started_at"),
+        _t(
+            "recommendation_watches",
+            "Recommendation watch windows",
+            "started_at",
+            rule="Deleted with their recommendation (retention_recommendations_days, recommendations_max_rows).",
+        ),
         _t("health_job_status", "Published leader job status", "published_at", fixed_age_s=JOB_STATUS_KEEP_S),
         # Schema version 5 (metrics/0005_producer_history.sql), pruned by the leader job `metrics_producer_prune`.
         _t("rule_hit_minute", "Rule hits per minute", "bucket_start", age="retention_minute_days"),

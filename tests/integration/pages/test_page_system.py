@@ -278,6 +278,50 @@ async def test_an_empty_error_log_explains_itself(page: Any) -> None:
     assert "No errors match the filter" in filtered.text()
 
 
+def _errors_template() -> str:
+    """The error log card's template source (the drawer's no-traceback line shows only for a row without one)."""
+    path = Path(__file__).resolve().parents[3] / "src" / "roxy" / "templates" / "admin" / "pages" / "system"
+    return (path / "errors.html").read_text(encoding="utf-8")
+
+
+async def test_the_error_log_states_the_live_retention_and_never_that_nothing_is_dropped(
+    page: Any, pages_app: Any
+) -> None:
+    """Review finding docs_b-10 (the page side): `storage/retention.py prune_errors` deletes a signature
+    `retention_errors_days` after it last happened and keeps at most `max_error_records`, so the card says so with
+    the live values; the drawer blames only the rows brought over from v1 for a missing traceback."""
+    await pages_app.settings(retention_errors_days=45, max_error_records=750)
+    card = " ".join(parse_html((await page.fragment("system", "errors")).text).text().split())
+    assert "kept 45 days after it last happened, and at most 750 are kept" in card
+    assert "Nothing is dropped" not in card
+    drawer = _errors_template()
+    assert "probes have none" not in drawer
+    assert "Errors brought over from v1 have none" in drawer
+
+
+async def test_the_fleet_tarpit_tile_warns_near_and_at_the_hold_cap(
+    page: Any, pages_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding abuse-12: holds stop at the effective cap (`max_concurrent`), so the tile counts against it and
+    warns from 80 percent of it; v1's share of the whole connection budget stays in its help."""
+    tarpit = pages_app.ctx.abuse.tarpit
+    cap = int((await tarpit.state())["max_concurrent"])
+    assert cap > 0
+    for holds, status in ((0, None), (int(cap * 0.8), "Near the cap"), (cap, "Full: refusals answered at once")):
+
+        async def active(value: int = holds) -> int:
+            return value
+
+        monkeypatch.setattr(tarpit, "active_holds", active)
+        doc = parse_html((await page.fragment("system", "fleet")).text)
+        tile = doc.select_one('[data-kpi="tarpit_connections"]')
+        assert tile is not None
+        assert tile.select_one(".kpi__number").text().strip() == f"{holds:,} of {cap:,}"
+        shown = tile.select_one(".kpi__status")
+        assert (shown.text().strip() if shown is not None else None) == status, holds
+        assert "share of the whole connection budget" in (tile.select_one("button.help-dot").get("data-help") or "")
+
+
 async def test_a_tables_own_request_gets_only_the_table(page: Any) -> None:
     for card, table in (("fleet", "workers"), ("errors", "error-log")):
         response = await page.get(f"{PAGE}/fragment/{card}", htmx=True, headers={"HX-Target": table})

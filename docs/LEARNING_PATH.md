@@ -136,8 +136,10 @@ call, a CPU-heavy hash) freezes every request in that worker.
 
 **Read.**
 
-1. `src/roxy/admin/auth/passwords.py`: argon2id takes about 250 ms by design, so
-   `roxy.admin.auth.passwords.PasswordHasher` runs it on a worker thread with a small capacity limit.
+1. `src/roxy/admin/auth/passwords.py`: argon2id is slow and memory-hungry by design (19 MiB a hash; tens of
+   milliseconds on the development machine, an estimated 100 ms on the server), and on the event loop it would
+   freeze the worker that long, so `roxy.admin.auth.passwords.PasswordHasher` runs it on a worker thread, one hash at
+   a time per worker.
 2. `src/roxy/storage/db.py`: every SQLite call runs on a thread of its own (`roxy.storage.db.Database.write` and
    `roxy.storage.db.Database.read`).
 3. `src/roxy/core/tasks.py`: `roxy.core.tasks.TaskSupervisor` gives every background loop logging, restarts,

@@ -601,8 +601,8 @@ The data allowance of your DataImpulse plan per billing cycle, in gigabytes. Rox
 | Max length | none |
 | Item max length | none |
 | Item range | none |
-| Pending owner verification | no |
-| Notes | Fill this in from your DataImpulse plan (owner decision D12). Automatic recommendation changes never touch the quota (plan 11.4). |
+| Pending owner verification | yes |
+| Notes | PENDING owner verification: fill this in from your DataImpulse plan (owner decision D12); the 0 shipped is a placeholder. Automatic recommendation changes never touch the quota (plan 11.4). |
 
 ### `rotator_price_per_gb_usd`
 
@@ -636,8 +636,8 @@ What DataImpulse charges per gigabyte, in US dollars. It is used only to show co
 | Max length | none |
 | Item max length | none |
 | Item range | none |
-| Pending owner verification | no |
-| Notes | Fill this in from your DataImpulse plan (owner decision D12). |
+| Pending owner verification | yes |
+| Notes | PENDING owner verification: fill this in from your DataImpulse plan (owner decision D12); the 0 shipped is a placeholder. |
 
 ### `rotator_billing_day`
 
@@ -1131,7 +1131,7 @@ The User-Agent header (the client identity text) Roxy sends to Roblox on the dir
 
 ### `ua_experiment_enabled`
 
-Runs a side-by-side (A/B) test on direct traffic: calls are split between direct_user_agent and ua_experiment_alt_user_agent by a hash of the request's cache key for ua_experiment_days, and the UP-UA-EXPERIMENT recommendation compares the Roblox 429 rate of each identity.
+Runs a side-by-side (A/B) test on direct traffic: for ua_experiment_days from when it was last switched on (or either User-Agent last changed), calls are split between direct_user_agent and ua_experiment_alt_user_agent by a hash of the request's cache key, and the UP-UA-EXPERIMENT recommendation compares the Roblox 429 rate of each identity. When the days are over, every direct call uses direct_user_agent again; switch this off and on to start a new run.
 
 | Field | Value |
 |---|---|
@@ -1144,7 +1144,7 @@ Runs a side-by-side (A/B) test on direct traffic: calls are split between direct
 | Step | none |
 | If raised | n/a |
 | If lowered | n/a |
-| If enabled | Part of direct traffic uses the alternative identity. If Roblox limits that identity more, 429s rise on that part during the experiment; the result comes with a confidence interval and offers the better identity as the new direct_user_agent. |
+| If enabled | Part of direct traffic uses the alternative identity for ua_experiment_days. If Roblox limits that identity more, 429s rise on that part during the experiment; the result comes with a confidence interval and offers the better identity as the new direct_user_agent. |
 | If disabled | Every direct call uses direct_user_agent and no comparison data is collected. |
 | Risk | medium |
 | High risk when | none |
@@ -1166,7 +1166,7 @@ Runs a side-by-side (A/B) test on direct traffic: calls are split between direct
 
 ### `ua_experiment_days`
 
-How many days the User-Agent experiment runs before UP-UA-EXPERIMENT reports its result.
+How many days the User-Agent experiment splits direct traffic, counted from when ua_experiment_enabled was last switched on (or either User-Agent last changed). Afterwards every direct call uses direct_user_agent again. UP-UA-EXPERIMENT compares only calls made during the run, and reports once each identity has enough calls in the request samples (insight_up_ua_experiment_min_calls_per_arm).
 
 | Field | Value |
 |---|---|
@@ -1177,15 +1177,15 @@ How many days the User-Agent experiment runs before UP-UA-EXPERIMENT reports its
 | Range | 1 to 30 days |
 | Unit | days |
 | Step | 1 |
-| If raised | More calls per identity, so a tighter confidence interval and a more trustworthy answer, but it takes longer. |
-| If lowered | A faster answer from fewer calls, with a wider interval. The rule reports medium confidence only once each identity has about 10,000 calls. |
+| If raised | The split runs longer: more days in which each identity can reach the minimum number of calls, and part of direct traffic keeps the alternative identity for longer. |
+| If lowered | The split ends sooner, so less traffic carries the alternative identity, but the recommendation may never see enough calls to report. It reports medium confidence only once each identity has about 10,000 calls. |
 | If enabled | n/a |
 | If disabled | n/a |
 | Risk | low |
 | High risk when | none |
 | Applies | live (hot reload fleet-wide within about a second) |
 | Dashboard | `upstream#routing` |
-| Related settings | `ua_experiment_enabled` |
+| Related settings | `ua_experiment_enabled`, `insight_up_ua_experiment_min_calls_per_arm` |
 | Related rules | none |
 | Related recommendations | `UP-UA-EXPERIMENT` |
 | Auto-apply bounds | none |
@@ -1310,7 +1310,7 @@ The steady pace at which Roxy may send requests that carry the Roblox account, s
 
 ### `credential_bucket_burst`
 
-How many credential requests may go out back to back before the even pacing of credential_bucket_per_min applies. It lets a short cluster of calls through without waiting while the average stays at the configured rate.
+How many credential requests may go out back to back before the even pacing of credential_bucket_per_min applies. It lets a short cluster of calls through without waiting while the average stays at the configured rate. The burst is shared with Roxy's own credential checks: allowlisted traffic gets this burst minus 1 and the checks' reserved sub-bucket gets 1 (at 1, a check also takes the traffic's slot), so no more than this many account calls ever leave back to back.
 
 | Field | Value |
 |---|---|
@@ -4388,7 +4388,7 @@ How many requests per minute one experience (place) may send through Roxy while 
 
 ### `place_limit_key`
 
-Decides what one per-experience budget belongs to. Place ids come from a header any caller can set, so counting them together with the caller's network stops a forger from exhausting a real game's budget.
+Decides what one per-experience budget belongs to. Place ids come from a header any caller can set, so counting them together with the caller's network stops a forger from exhausting a real game's budget. It also decides what a Per experience endpoint rate rule counts by.
 
 | Field | Value |
 |---|---|
@@ -4424,7 +4424,7 @@ Decides what one per-experience budget belongs to. Place ids come from a header 
 Options:
 
 - `place` (Claimed place id only): One shared budget per place id. The Roblox-Id header is a claim anyone can forge, so an attacker who sends a real game's place id can use up that game's whole budget and get its players refused.
-- `place_prefix` (Place id and caller network (recommended)): One budget per place id and caller network (a /24 for IPv4, a /48 for IPv6). A forger only spends the share that belongs to their own network, so a real game's servers keep theirs. A game spread across many networks gets one budget per network.
+- `place_prefix` (Place id and caller network (recommended)): One budget per place id and caller network (a /24 for IPv4, a /48 for IPv6), for the place limit and every Per experience endpoint rate rule. A forger only spends the share that belongs to their own network, so a real game's servers keep theirs. A game spread across many networks gets one budget per network.
 
 ### `roblox_egress_cidrs`
 
@@ -4458,8 +4458,8 @@ IP address ranges, written in CIDR form (for example 203.0.113.0/24, meaning 256
 | Max length | 200 |
 | Item max length | 49 |
 | Item range | none |
-| Pending owner verification | no |
-| Notes | Add only ranges Roblox itself documents; never add a range because one caller asked for it. |
+| Pending owner verification | yes |
+| Notes | PENDING owner verification: Roxy ships the list empty, so no caller gets game server credit until you fill it (plan 9, threat 6). Add only ranges Roblox itself documents; never add a range because one caller asked for it. |
 
 ### `ban_disguise_as_throttle`
 
@@ -4498,11 +4498,11 @@ When on, a banned client gets the same 429 Too Many Requests answer a throttled 
 
 ### `bot_score_block_threshold`
 
-Refuse requests from clients whose bot score (0 to 100, higher means more bot-like) is above this value, with reason bot_score. 0 turns blocking off; the score is then only shown and used by the detectors and recommendations.
+Refuse requests from clients whose bot score (0 to 100, higher means more bot-like) is at or above this value, with reason bot_score. 0 turns blocking off; the score is then only shown and used by the detectors and recommendations.
 
 | Field | Value |
 |---|---|
-| Label | Block clients above bot score |
+| Label | Block clients at or above bot score |
 | Group | Abuse detection |
 | Type | int |
 | Default | 0 score (0 to 100) |
@@ -4533,7 +4533,7 @@ Refuse requests from clients whose bot score (0 to 100, higher means more bot-li
 
 ### `bot_score_legit_max`
 
-Clients with a bot score at or below this value count as legitimate when the THROTTLE-TUNE and FILTER-COLLATERAL recommendations decide whether a limit or filter is hurting real users. It does not block or allow anything by itself.
+Clients with a bot score at or below this value count as legitimate for two recommendations: THROTTLE-TUNE measures how many legitimate addresses were refused at least once, and ABUSE-DIST ignores a distributed burst (SPAM-DIST) made only of legitimate clients, such as game servers sharing the Roblox User-Agent. It does not block or allow anything by itself.
 
 | Field | Value |
 |---|---|
@@ -4544,17 +4544,17 @@ Clients with a bot score at or below this value count as legitimate when the THR
 | Range | 0 to 100 score (0 to 100) |
 | Unit | score (0 to 100) |
 | Step | 1 |
-| If raised | More clients count as legitimate, so those rules see more collateral damage and suggest loosening limits and filters more often. |
-| If lowered | Fewer clients count as legitimate, so those rules see less collateral damage and suggest loosening less often. |
+| If raised | More clients count as legitimate: THROTTLE-TUNE sees more real users refused and suggests loosening the per-IP limit more often, and ABUSE-DIST ignores more bursts. |
+| If lowered | Fewer clients count as legitimate: THROTTLE-TUNE suggests loosening the per-IP limit less often, and ABUSE-DIST may propose a rule against a burst that is really game servers. |
 | If enabled | n/a |
 | If disabled | n/a |
 | Risk | low |
 | High risk when | none |
 | Applies | live (hot reload fleet-wide within about a second) |
 | Dashboard | `protection#bot`, `clients#client-score` |
-| Related settings | `bot_score_abuse_min`, `bot_score_block_threshold`, `insight_throttle_tune_legit_throttled_pct`, `insight_filter_collateral_served_pct` |
+| Related settings | `bot_score_abuse_min`, `bot_score_block_threshold`, `insight_throttle_tune_legit_throttled_pct`, `spam_dist_threshold` |
 | Related rules | none |
-| Related recommendations | none |
+| Related recommendations | `THROTTLE-TUNE`, `ABUSE-DIST` |
 | Auto-apply bounds | none |
 | Sensitive | no |
 | Since | 2.0 |
@@ -4918,11 +4918,11 @@ How hard the proof-of-work puzzle is: the browser must find a SHA-256 hash that 
 
 ### `challenge_trigger_score`
 
-Browser clients whose bot score is above this value are shown the challenge page while the browser challenge is on.
+Browser clients whose bot score is at or above this value are shown the challenge page while the browser challenge is on.
 
 | Field | Value |
 |---|---|
-| Label | Challenge above bot score |
+| Label | Challenge at or above bot score |
 | Group | Abuse detection |
 | Type | int |
 | Default | 80 score (0 to 100) |
@@ -4988,7 +4988,7 @@ How long a browser that solved the challenge may skip it again, remembered with 
 
 ### `bypass_default_expiry_h`
 
-How long a new bypass entry lasts unless the admin picks another time. A bypassed IP or range skips throttle-all, the per-IP limit, User-Agent rules, endpoint rate rules and the tarpit, but is still subject to pause, blocks, filters and auth checks. 0 means new entries never expire.
+How long a new bypass entry lasts unless the admin picks another time. A bypassed IP or range skips the flood limit, the spam detectors, the emergency limit (throttle-all), the per-IP limit, place limits, the browser challenge, the bot score block, User-Agent rules, endpoint rules and the tarpit, but is still subject to pause, bans, endpoint blocks, request filters, ignored paths, unsafe URL refusals, the Roblox host check and credential smuggling refusals. 0 means new entries never expire.
 
 | Field | Value |
 |---|---|
@@ -5373,7 +5373,7 @@ What SPAM-RATE does when a client crosses its threshold. Whatever is chosen, det
 
 Options:
 
-- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned'. Trusted Roblox game servers get a strike instead, and places are never banned.
+- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned' (for every client). Once armed, trusted Roblox game servers get a strike instead, and places are never banned.
 - `strike` (Add a throttle strike): Refuses the offending requests and adds one throttle strike, so the client's next penalties on the strike ladder are longer. Nobody is banned.
 - `tarpit` (Hold the refusals): Refuses the offending requests after a deliberate delay (the tarpit), so a script that retries at once is slowed to one attempt per hold. Nobody is banned; the hold uses the settings on Protection > Tarpit.
 - `recommend` (Recommend only): Takes no action on traffic; instead it creates an ABUSE-SPAM recommendation naming the client for you to review.
@@ -5590,7 +5590,7 @@ What SPAM-REFUSED does when a client crosses its threshold. Whatever is chosen, 
 
 Options:
 
-- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned'. Trusted Roblox game servers get a strike instead, and places are never banned.
+- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned' (for every client). Once armed, trusted Roblox game servers get a strike instead, and places are never banned.
 - `strike` (Add a throttle strike): Refuses the offending requests and adds one throttle strike, so the client's next penalties on the strike ladder are longer. Nobody is banned.
 - `tarpit` (Hold the refusals): Refuses the offending requests after a deliberate delay (the tarpit), so a script that retries at once is slowed to one attempt per hold. Nobody is banned; the hold uses the settings on Protection > Tarpit.
 - `recommend` (Recommend only): Takes no action on traffic; instead it creates an ABUSE-SPAM recommendation naming the client for you to review.
@@ -5807,7 +5807,7 @@ What SPAM-PROBE does when a client crosses its threshold. Whatever is chosen, de
 
 Options:
 
-- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned'. Trusted Roblox game servers get a strike instead, and places are never banned.
+- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned' (for every client). Once armed, trusted Roblox game servers get a strike instead, and places are never banned.
 - `strike` (Add a throttle strike): Refuses the offending requests and adds one throttle strike, so the client's next penalties on the strike ladder are longer. Nobody is banned.
 - `tarpit` (Hold the refusals): Refuses the offending requests after a deliberate delay (the tarpit), so a script that retries at once is slowed to one attempt per hold. Nobody is banned; the hold uses the settings on Protection > Tarpit.
 - `recommend` (Recommend only): Takes no action on traffic; instead it creates an ABUSE-SPAM recommendation naming the client for you to review.
@@ -6024,7 +6024,7 @@ What SPAM-AUTH does when a client crosses its threshold. Whatever is chosen, det
 
 Options:
 
-- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned'. Trusted Roblox game servers get a strike instead, and places are never banned.
+- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned' (for every client). Once armed, trusted Roblox game servers get a strike instead, and places are never banned.
 - `strike` (Add a throttle strike): Refuses the offending requests and adds one throttle strike, so the client's next penalties on the strike ladder are longer. Nobody is banned.
 - `tarpit` (Hold the refusals): Refuses the offending requests after a deliberate delay (the tarpit), so a script that retries at once is slowed to one attempt per hold. Nobody is banned; the hold uses the settings on Protection > Tarpit.
 - `recommend` (Recommend only): Takes no action on traffic; instead it creates an ABUSE-SPAM recommendation naming the client for you to review.
@@ -6241,7 +6241,7 @@ What SPAM-ENUM does when a client crosses its threshold. Whatever is chosen, det
 
 Options:
 
-- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned'. Trusted Roblox game servers get a strike instead, and places are never banned.
+- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned' (for every client). Once armed, trusted Roblox game servers get a strike instead, and places are never banned.
 - `strike` (Add a throttle strike): Refuses the offending requests and adds one throttle strike, so the client's next penalties on the strike ladder are longer. Nobody is banned.
 - `tarpit` (Hold the refusals): Refuses the offending requests after a deliberate delay (the tarpit), so a script that retries at once is slowed to one attempt per hold. Nobody is banned; the hold uses the settings on Protection > Tarpit.
 - `recommend` (Recommend only): Takes no action on traffic; instead it creates an ABUSE-SPAM recommendation suggesting an endpoint rate rule for the enumerated endpoint.
@@ -6458,7 +6458,7 @@ What SPAM-BUST does when a client crosses its threshold. Whatever is chosen, det
 
 Options:
 
-- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned'. Trusted Roblox game servers get a strike instead, and places are never banned.
+- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned' (for every client). Once armed, trusted Roblox game servers get a strike instead, and places are never banned.
 - `strike` (Add a throttle strike): Refuses the offending requests and adds one throttle strike, so the client's next penalties on the strike ladder are longer. Nobody is banned.
 - `tarpit` (Hold the refusals): Refuses the offending requests after a deliberate delay (the tarpit), so a script that retries at once is slowed to one attempt per hold. Nobody is banned; the hold uses the settings on Protection > Tarpit.
 - `recommend` (Recommend only): Takes no action on traffic; instead it creates a recommendation to ignore the busting query parameter in cache keys (CACHE-KEYSPLIT) or to limit the client.
@@ -6640,7 +6640,7 @@ How far back SPAM-DIST looks when it counts requests, in seconds (default 300, w
 
 ### `spam_dist_action`
 
-What SPAM-DIST does when a client crosses its threshold. Whatever is chosen, detectors never ban places (place ids can be forged) and never auto-ban trusted Roblox game servers.
+What SPAM-DIST does when its threshold is crossed: it only recommends. Its subject is many addresses sharing one User-Agent, and Roblox game servers share theirs, so no action on traffic is offered (a ban, strike or hold would reach every server of a popular game).
 
 | Field | Value |
 |---|---|
@@ -6648,7 +6648,7 @@ What SPAM-DIST does when a client crosses its threshold. Whatever is chosen, det
 | Group | Abuse detection |
 | Type | enum |
 | Default | "recommend" |
-| Range | one of `ban`, `strike`, `tarpit`, `recommend` |
+| Range | one of `recommend` |
 | Unit | none |
 | Step | none |
 | If raised | n/a |
@@ -6656,12 +6656,12 @@ What SPAM-DIST does when a client crosses its threshold. Whatever is chosen, det
 | If enabled | n/a |
 | If disabled | n/a |
 | Risk | medium |
-| High risk when | value = ban: Every IP in the group would be banned at once. Roblox game servers all send the same User-Agent, so a popular game polling one endpoint could be cut off on all of its servers. |
+| High risk when | none |
 | Applies | live (hot reload fleet-wide within about a second) |
 | Dashboard | `protection#spam-dist` |
 | Related settings | `spam_dist_enabled`, `spam_dist_threshold`, `spam_dist_window_s`, `spam_dist_ban_minutes`, `spam_dist_ban_max_minutes`, `spam_enabled`, `spam_dry_run`, `ban_disguise_as_throttle`, `roblox_egress_cidrs`, `tarpit_on_spam`, `user_agent_rules_enabled` |
 | Related rules | none |
-| Related recommendations | `ABUSE-SPAM`, `SEC-DEFAULTS` |
+| Related recommendations | `ABUSE-SPAM` |
 | Auto-apply bounds | none |
 | Sensitive | no |
 | Since | 2.0 |
@@ -6675,9 +6675,6 @@ What SPAM-DIST does when a client crosses its threshold. Whatever is chosen, det
 
 Options:
 
-- `ban` (Temporary IP ban): Bans the client's IP for the first ban length; each repeat offense within 30 days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have banned'. Trusted Roblox game servers get a strike instead, and places are never banned.
-- `strike` (Add a throttle strike): Refuses the offending requests and adds one throttle strike, so the client's next penalties on the strike ladder are longer. Nobody is banned.
-- `tarpit` (Hold the refusals): Refuses the offending requests after a deliberate delay (the tarpit), so a script that retries at once is slowed to one attempt per hold. Nobody is banned; the hold uses the settings on Protection > Tarpit.
 - `recommend` (Recommend only): Takes no action on traffic; instead it creates an ABUSE-DIST recommendation suggesting a User-Agent rule with global scope, or a temporary emergency limit (throttle-all).
 
 ### `spam_dist_ban_minutes`
@@ -7676,7 +7673,7 @@ The absolute lifetime of an admin session, counted from login, however active yo
 
 ### `admin_reauth_window_s`
 
-Sensitive actions (replacing the Roblox credential, changing your password, managing passkeys, factory reset, exporting all data) need a second factor entered within this many seconds. If your last one is older, the dashboard asks for it again before going ahead.
+Sensitive actions, such as replacing the Roblox credential, managing passkeys and recovery codes, the factory reset or the full LLM export, need a second factor entered within this many seconds. If your last one is older, the dashboard asks for it again before going ahead.
 
 | Field | Value |
 |---|---|
@@ -7886,7 +7883,7 @@ Whether a code sent by email may be used as the second login factor instead of t
 
 ### `two_fa_expiration`
 
-How long an emailed login code stays valid after it is sent. Used only when emailed codes are allowed, and for the one-time first login after the upgrade from v1.
+How long an emailed login code stays valid after it is sent, but never longer than challenge_expiration (the time allowed between the password and the second factor): a code lives the shorter of the two, 2 minutes at the defaults, and the login page counts that down. Used only when emailed codes are allowed, and for the one-time first login after the upgrade from v1.
 
 | Field | Value |
 |---|---|
@@ -7897,7 +7894,7 @@ How long an emailed login code stays valid after it is sent. Used only when emai
 | Range | 30 to 900 seconds |
 | Unit | seconds |
 | Step | 1 |
-| If raised | More time for slow email delivery, but a code that leaks (for example in a forwarded mail) can be used for longer. |
+| If raised | More time for slow email delivery, up to challenge_expiration (raise that too for a longer window), but a code that leaks (for example in a forwarded mail) can be used for longer. |
 | If lowered | Codes expire sooner; slow email may arrive after its code is no longer valid. |
 | If enabled | n/a |
 | If disabled | n/a |
@@ -8096,7 +8093,7 @@ Every new admin login sends an email with a one-time 'this was not me' link that
 
 ### `admin_allowlist_enabled`
 
-When on, /admin (including the login page) answers only to networks on the admin allowlist; every other network gets a plain 404 Not Found, as if the dashboard did not exist. The list itself (address ranges in CIDR form: a base address, a slash, and how many leading bits must match) is edited on the Security page. Add your networks before turning this on.
+When on, /admin (including the login page) answers only to networks on the admin allowlist; every other network gets a plain 404 Not Found, as if the dashboard did not exist. The list itself (address ranges in CIDR form: a base address, a slash, and how many leading bits must match) is edited on the Protection page, under Deny and allow lists. Add your networks before turning this on.
 
 | Field | Value |
 |---|---|
@@ -8316,7 +8313,7 @@ Whether alerts are also posted to a webhook (a web address that turns a post int
 
 ### `alert_digest_hour`
 
-The hour of the day (0 to 23, in the dashboard time zone) at which Roxy emails a daily digest of open recommendations, failing health checks and the Roblox rate limiting numbers. -1 turns the digest off.
+The hour of the day (0 to 23, in the dashboard time zone) at which Roxy emails a daily digest of open recommendations, failing health checks and the Roblox rate limiting numbers. -1 turns the digest off. The digest is an info-level message, so it is emailed only while alert_min_severity is info (the default, warn, holds it back).
 
 | Field | Value |
 |---|---|
@@ -8386,7 +8383,7 @@ How often Roxy runs the full proxy health check on its own and alerts you about 
 
 ### `health_auto_include_credential`
 
-Whether scheduled health runs also run the checks that call Roblox with the account credential (for example confirming it is still logged in). Runs you start yourself always include them, and the credential also has its own periodic check (credential_probe_interval_min).
+Whether scheduled health runs also run the checks that call Roblox with the account credential (for example confirming it is still logged in). A run you start from the Health page includes them while its 'Include the credential check' box is ticked (the default); the Overview's Check Proxy Health button and the command palette leave them out. The credential also has its own periodic check (credential_probe_interval_min).
 
 | Field | Value |
 |---|---|
@@ -8460,7 +8457,7 @@ How often each worker (one of the Roxy server processes that handle requests) wr
 
 ### `metrics_queue_max`
 
-The most events, Roblox 429 records, body captures and fingerprints one worker may hold in memory while waiting for its next write to the statistics database. When the queue is full the oldest low-priority items are dropped and counted on the System page, so a burst of traffic can never grow the queue without limit.
+The most events, Roblox 429 records, body captures and fingerprints one worker may hold in memory while waiting for its next write to the statistics database (a count of items, whatever their size). When the queue is full the oldest low-priority items are dropped and counted on the System page, so a burst of traffic can never grow the queue without limit. Queued body captures are also held within capture_max_records and capture_max_bytes: past those the oldest captures leave the queue, counted as capped, not dropped (the capture table would keep no more of them anyway).
 
 | Field | Value |
 |---|---|
@@ -9335,7 +9332,7 @@ The local hour (in the dashboard timezone) when Roxy runs daily database mainten
 
 ### `live_tail_buffer`
 
-How many recent requests each worker keeps in memory for the Live view, so opening the page shows recent history at once instead of an empty list. New requests stream in live regardless of this setting.
+How many recent requests each worker also keeps in memory. The Live page opens with the newest rows of the shared metrics database and streams new requests whatever this says; this worker's memory only fills gaps: rows the database does not hold yet (not written, or sampled out above the live row rate) are added to the Live list and to a request's details, and the capture card shows its size.
 
 | Field | Value |
 |---|---|
@@ -9346,8 +9343,8 @@ How many recent requests each worker keeps in memory for the Live view, so openi
 | Range | 0 to 5000 requests |
 | Unit | requests |
 | Step | 1 |
-| If raised | You can scroll further back in the Live view, at the cost of a little more memory per worker (each row holds the request summary and up to 2,000 characters of body). |
-| If lowered | Less memory is used and the Live view opens with less history. 0 keeps none, so only requests that arrive while the page is open appear. |
+| If raised | More of this worker's own recent rows can fill gaps in the Live list and the request details, at the cost of a little more memory per worker (each row holds the request summary and up to 2,000 characters of body). |
+| If lowered | Less memory is used, and fewer rows the database skipped or has not written yet can be shown. 0 keeps none: the Live view then shows only what the metrics database holds. |
 | If enabled | n/a |
 | If disabled | n/a |
 | Risk | low |
@@ -9873,7 +9870,7 @@ Whether Roxy stores the request and response bodies of some requests, with secre
 | Step | none |
 | If raised | n/a |
 | If lowered | n/a |
-| If enabled | Every refused request and a sample of served requests (capture_sample_served_pct) are captured. This stores caller data, such as player names and ids in request bodies, on disk for up to capture_ttl_seconds. |
+| If enabled | Every refused or failed request and a sample of served requests (capture_sample_served_pct) are captured. This stores caller data, such as player names and ids in request bodies, on disk for up to capture_ttl_seconds. |
 | If disabled | No caller payloads are stored at all. The Live view still shows each request's method, path, status and timing, but not the bodies, which makes debugging a game's failing requests much harder. |
 | Risk | medium |
 | High risk when | none |
@@ -10035,7 +10032,7 @@ How long a capture is kept before it is deleted, whatever the count and size cap
 
 ### `capture_sample_served_pct`
 
-What share of successfully served requests (answered from Roblox or from the cache) are captured. Refused requests are always captured while capture is on, because those are usually the ones you need to investigate.
+What share of successfully served requests (answered from Roblox or from the cache) are captured. Refused and failed requests are always captured while capture is on, because those are usually the ones you need to investigate.
 
 | Field | Value |
 |---|---|
@@ -10047,7 +10044,7 @@ What share of successfully served requests (answered from Roblox or from the cac
 | Unit | percent |
 | Step | 1 |
 | If raised | More examples of normal traffic are captured, at the cost of more caller data stored, more disk and a little more CPU per request. At 100 every request is captured, as in v1. |
-| If lowered | Fewer normal requests are captured; refusals still are. 0 captures refusals only. |
+| If lowered | Fewer normal requests are captured; refusals and failures still are. 0 captures refusals and failures only. |
 | If enabled | n/a |
 | If disabled | n/a |
 | Risk | low |
@@ -10568,7 +10565,7 @@ Turns the UP-429-ENDPOINT recommendation rule on or off (upstream family). It de
 
 ### `insight_up_429_endpoint_severity`
 
-The severity UP-429-ENDPOINT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-429-ENDPOINT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -10604,9 +10601,9 @@ The severity UP-429-ENDPOINT recommendations are reported with. auto keeps the s
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_429_endpoint_min_429s`
 
@@ -10785,7 +10782,7 @@ Turns the UP-429-HOST recommendation rule on or off (upstream family). It detect
 
 ### `insight_up_429_host_severity`
 
-The severity UP-429-HOST recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-429-HOST recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -10821,9 +10818,9 @@ The severity UP-429-HOST recommendations are reported with. auto keeps the sever
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_429_host_min_templates`
 
@@ -10932,7 +10929,7 @@ Turns the UP-429-CREDENTIAL recommendation rule on or off (upstream family). It 
 
 ### `insight_up_429_credential_severity`
 
-The severity UP-429-CREDENTIAL recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-429-CREDENTIAL recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -10968,9 +10965,9 @@ The severity UP-429-CREDENTIAL recommendations are reported with. auto keeps the
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_429_credential_min_429s`
 
@@ -11044,7 +11041,7 @@ Turns the UP-429-AMPLIFY recommendation rule on or off (upstream family). It det
 
 ### `insight_up_429_amplify_severity`
 
-The severity UP-429-AMPLIFY recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-429-AMPLIFY recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -11080,9 +11077,9 @@ The severity UP-429-AMPLIFY recommendations are reported with. auto keeps the se
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_429_amplify_calls_per_request`
 
@@ -11156,7 +11153,7 @@ Turns the UP-RETRYAFTER-IGNORED recommendation rule on or off (upstream family).
 
 ### `insight_up_retryafter_ignored_severity`
 
-The severity UP-RETRYAFTER-IGNORED recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-RETRYAFTER-IGNORED recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -11192,9 +11189,9 @@ The severity UP-RETRYAFTER-IGNORED recommendations are reported with. auto keeps
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_retryafter_ignored_min_retries`
 
@@ -11303,7 +11300,7 @@ Turns the UP-4XX-SPIKE recommendation rule on or off (upstream family). It detec
 
 ### `insight_up_4xx_spike_severity`
 
-The severity UP-4XX-SPIKE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-4XX-SPIKE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -11339,9 +11336,9 @@ The severity UP-4XX-SPIKE recommendations are reported with. auto keeps the seve
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_4xx_spike_baseline_multiple`
 
@@ -11520,7 +11517,7 @@ Turns the UP-CSRF-LOOP recommendation rule on or off (upstream family). It detec
 
 ### `insight_up_csrf_loop_severity`
 
-The severity UP-CSRF-LOOP recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-CSRF-LOOP recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -11556,9 +11553,9 @@ The severity UP-CSRF-LOOP recommendations are reported with. auto keeps the seve
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_csrf_loop_retry_pct`
 
@@ -11667,7 +11664,7 @@ Turns the UP-CHALLENGE recommendation rule on or off (upstream family). It detec
 
 ### `insight_up_challenge_severity`
 
-The severity UP-CHALLENGE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-CHALLENGE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -11703,9 +11700,9 @@ The severity UP-CHALLENGE recommendations are reported with. auto keeps the seve
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_challenge_min_pages`
 
@@ -11814,7 +11811,7 @@ Turns the UP-UA-EXPERIMENT recommendation rule on or off (upstream family). It d
 
 ### `insight_up_ua_experiment_severity`
 
-The severity UP-UA-EXPERIMENT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-UA-EXPERIMENT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -11850,9 +11847,9 @@ The severity UP-UA-EXPERIMENT recommendations are reported with. auto keeps the 
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_ua_experiment_min_calls_per_arm`
 
@@ -11926,7 +11923,7 @@ Turns the UP-5XX recommendation rule on or off (upstream family). It detects: Ro
 
 ### `insight_up_5xx_severity`
 
-The severity UP-5XX recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-5XX recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -11962,9 +11959,9 @@ The severity UP-5XX recommendations are reported with. auto keeps the severity t
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_5xx_rate_pct`
 
@@ -12108,7 +12105,7 @@ Turns the UP-TIMEOUT recommendation rule on or off (upstream family). It detects
 
 ### `insight_up_timeout_severity`
 
-The severity UP-TIMEOUT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-TIMEOUT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -12144,9 +12141,9 @@ The severity UP-TIMEOUT recommendations are reported with. auto keeps the severi
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_timeout_rate_pct`
 
@@ -12255,7 +12252,7 @@ Turns the UP-LATENCY recommendation rule on or off (upstream family). It detects
 
 ### `insight_up_latency_severity`
 
-The severity UP-LATENCY recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-LATENCY recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -12291,9 +12288,9 @@ The severity UP-LATENCY recommendations are reported with. auto keeps the severi
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_latency_p95_ms`
 
@@ -12472,7 +12469,7 @@ Turns the UP-QUEUE-SAT recommendation rule on or off (upstream family). It detec
 
 ### `insight_up_queue_sat_severity`
 
-The severity UP-QUEUE-SAT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-QUEUE-SAT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -12508,9 +12505,9 @@ The severity UP-QUEUE-SAT recommendations are reported with. auto keeps the seve
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_queue_sat_drop_pct`
 
@@ -12619,7 +12616,7 @@ Turns the UP-BUCKET-TUNE recommendation rule on or off (upstream family). It det
 
 ### `insight_up_bucket_tune_severity`
 
-The severity UP-BUCKET-TUNE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-BUCKET-TUNE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -12655,9 +12652,9 @@ The severity UP-BUCKET-TUNE recommendations are reported with. auto keeps the se
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_bucket_tune_clean_hours`
 
@@ -12836,7 +12833,7 @@ Turns the UP-BREAKER-FLAP recommendation rule on or off (upstream family). It de
 
 ### `insight_up_breaker_flap_severity`
 
-The severity UP-BREAKER-FLAP recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity UP-BREAKER-FLAP recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -12872,9 +12869,9 @@ The severity UP-BREAKER-FLAP recommendations are reported with. auto keeps the s
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_up_breaker_flap_openings_per_hour`
 
@@ -12948,7 +12945,7 @@ Turns the CACHE-LOW-HIT recommendation rule on or off (cache family). It detects
 
 ### `insight_cache_low_hit_severity`
 
-The severity CACHE-LOW-HIT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity CACHE-LOW-HIT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -12984,9 +12981,9 @@ The severity CACHE-LOW-HIT recommendations are reported with. auto keeps the sev
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_cache_low_hit_top_n`
 
@@ -13130,7 +13127,7 @@ Turns the CACHE-TTL-TUNE recommendation rule on or off (cache family). It detect
 
 ### `insight_cache_ttl_tune_severity`
 
-The severity CACHE-TTL-TUNE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity CACHE-TTL-TUNE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -13166,9 +13163,9 @@ The severity CACHE-TTL-TUNE recommendations are reported with. auto keeps the se
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_cache_ttl_tune_identical_raise_pct`
 
@@ -13347,7 +13344,7 @@ Turns the CACHE-KEYSPLIT recommendation rule on or off (cache family). It detect
 
 ### `insight_cache_keysplit_severity`
 
-The severity CACHE-KEYSPLIT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity CACHE-KEYSPLIT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -13383,9 +13380,9 @@ The severity CACHE-KEYSPLIT recommendations are reported with. auto keeps the se
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_cache_keysplit_min_entries`
 
@@ -13529,7 +13526,7 @@ Turns the CACHE-PRESSURE recommendation rule on or off (cache family). It detect
 
 ### `insight_cache_pressure_severity`
 
-The severity CACHE-PRESSURE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity CACHE-PRESSURE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -13565,9 +13562,9 @@ The severity CACHE-PRESSURE recommendations are reported with. auto keeps the se
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_cache_pressure_young_eviction_pct`
 
@@ -13676,7 +13673,7 @@ Turns the CACHE-OFF recommendation rule on or off (cache family). It detects: Th
 
 ### `insight_cache_off_severity`
 
-The severity CACHE-OFF recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity CACHE-OFF recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -13712,9 +13709,9 @@ The severity CACHE-OFF recommendations are reported with. auto keeps the severit
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_cache_neg_enabled`
 
@@ -13753,7 +13750,7 @@ Turns the CACHE-NEG recommendation rule on or off (cache family). It detects: Ca
 
 ### `insight_cache_neg_severity`
 
-The severity CACHE-NEG recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity CACHE-NEG recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -13789,9 +13786,9 @@ The severity CACHE-NEG recommendations are reported with. auto keeps the severit
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_cache_neg_min_404_per_hour`
 
@@ -13865,7 +13862,7 @@ Turns the HOT-ENDPOINT recommendation rule on or off (cache family). It detects:
 
 ### `insight_hot_endpoint_severity`
 
-The severity HOT-ENDPOINT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity HOT-ENDPOINT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -13901,9 +13898,9 @@ The severity HOT-ENDPOINT recommendations are reported with. auto keeps the seve
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_hot_endpoint_top_n`
 
@@ -13977,7 +13974,7 @@ Turns the EGR-BURN recommendation rule on or off (egress family). It detects: Th
 
 ### `insight_egr_burn_severity`
 
-The severity EGR-BURN recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity EGR-BURN recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -14013,9 +14010,9 @@ The severity EGR-BURN recommendations are reported with. auto keeps the severity
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_egr_burn_projected_pct`
 
@@ -14089,7 +14086,7 @@ Turns the EGR-UNDERUSE recommendation rule on or off (egress family). It detects
 
 ### `insight_egr_underuse_severity`
 
-The severity EGR-UNDERUSE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity EGR-UNDERUSE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -14125,9 +14122,9 @@ The severity EGR-UNDERUSE recommendations are reported with. auto keeps the seve
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_egr_underuse_direct_429_pct`
 
@@ -14271,7 +14268,7 @@ Turns the EGR-POOL-BURNED recommendation rule on or off (egress family). It dete
 
 ### `insight_egr_pool_burned_severity`
 
-The severity EGR-POOL-BURNED recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity EGR-POOL-BURNED recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -14307,9 +14304,9 @@ The severity EGR-POOL-BURNED recommendations are reported with. auto keeps the s
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_egr_pool_burned_rotator_429_pct`
 
@@ -14418,7 +14415,7 @@ Turns the EGR-CALIBRATE recommendation rule on or off (egress family). It detect
 
 ### `insight_egr_calibrate_severity`
 
-The severity EGR-CALIBRATE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity EGR-CALIBRATE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -14454,9 +14451,9 @@ The severity EGR-CALIBRATE recommendations are reported with. auto keeps the sev
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_egr_calibrate_diff_pct`
 
@@ -14530,7 +14527,7 @@ Turns the CRED-EXPIRING recommendation rule on or off (credential family). It de
 
 ### `insight_cred_expiring_severity`
 
-The severity CRED-EXPIRING recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity CRED-EXPIRING recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -14566,9 +14563,9 @@ The severity CRED-EXPIRING recommendations are reported with. auto keeps the sev
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_cred_unused_enabled`
 
@@ -14607,7 +14604,7 @@ Turns the CRED-UNUSED recommendation rule on or off (credential family). It dete
 
 ### `insight_cred_unused_severity`
 
-The severity CRED-UNUSED recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity CRED-UNUSED recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -14643,9 +14640,9 @@ The severity CRED-UNUSED recommendations are reported with. auto keeps the sever
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_cred_unused_min_comparisons`
 
@@ -14754,7 +14751,7 @@ Turns the CRED-ROTATOR-GUARD recommendation rule on or off (credential family). 
 
 ### `insight_cred_rotator_guard_severity`
 
-The severity CRED-ROTATOR-GUARD recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity CRED-ROTATOR-GUARD recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -14790,9 +14787,9 @@ The severity CRED-ROTATOR-GUARD recommendations are reported with. auto keeps th
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_abuse_spam_enabled`
 
@@ -14831,7 +14828,7 @@ Turns the ABUSE-SPAM recommendation rule on or off (abuse family). It detects: A
 
 ### `insight_abuse_spam_severity`
 
-The severity ABUSE-SPAM recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity ABUSE-SPAM recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -14867,9 +14864,9 @@ The severity ABUSE-SPAM recommendations are reported with. auto keeps the severi
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_abuse_bot_enabled`
 
@@ -14908,7 +14905,7 @@ Turns the ABUSE-BOT recommendation rule on or off (abuse family). It detects: Bo
 
 ### `insight_abuse_bot_severity`
 
-The severity ABUSE-BOT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity ABUSE-BOT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -14944,9 +14941,9 @@ The severity ABUSE-BOT recommendations are reported with. auto keeps the severit
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_abuse_bot_min_requests_per_hour`
 
@@ -15020,7 +15017,7 @@ Turns the ABUSE-DIST recommendation rule on or off (abuse family). It detects: A
 
 ### `insight_abuse_dist_severity`
 
-The severity ABUSE-DIST recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity ABUSE-DIST recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -15056,9 +15053,9 @@ The severity ABUSE-DIST recommendations are reported with. auto keeps the severi
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_filter_add_enabled`
 
@@ -15097,7 +15094,7 @@ Turns the FILTER-ADD recommendation rule on or off (filter family). It detects: 
 
 ### `insight_filter_add_severity`
 
-The severity FILTER-ADD recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity FILTER-ADD recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -15133,9 +15130,9 @@ The severity FILTER-ADD recommendations are reported with. auto keeps the severi
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_filter_add_refusals_per_hour`
 
@@ -15244,7 +15241,7 @@ Turns the FILTER-REMOVE recommendation rule on or off (filter family). It detect
 
 ### `insight_filter_remove_severity`
 
-The severity FILTER-REMOVE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity FILTER-REMOVE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -15280,9 +15277,9 @@ The severity FILTER-REMOVE recommendations are reported with. auto keeps the sev
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_filter_remove_idle_rule_days`
 
@@ -15391,7 +15388,7 @@ Turns the FILTER-COLLATERAL recommendation rule on or off (filter family). It de
 
 ### `insight_filter_collateral_severity`
 
-The severity FILTER-COLLATERAL recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity FILTER-COLLATERAL recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -15427,9 +15424,9 @@ The severity FILTER-COLLATERAL recommendations are reported with. auto keeps the
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_filter_collateral_served_pct`
 
@@ -15503,7 +15500,7 @@ Turns the TARPIT-TUNE recommendation rule on or off (abuse family). It detects: 
 
 ### `insight_tarpit_tune_severity`
 
-The severity TARPIT-TUNE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity TARPIT-TUNE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -15539,9 +15536,9 @@ The severity TARPIT-TUNE recommendations are reported with. auto keeps the sever
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_tarpit_tune_skipped_pct`
 
@@ -15615,7 +15612,7 @@ Turns the THROTTLE-TUNE recommendation rule on or off (abuse family). It detects
 
 ### `insight_throttle_tune_severity`
 
-The severity THROTTLE-TUNE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity THROTTLE-TUNE recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -15651,13 +15648,13 @@ The severity THROTTLE-TUNE recommendations are reported with. auto keeps the sev
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_throttle_tune_legit_throttled_pct`
 
-Distinct client IP addresses with a bot score below bot_score_legit_max (likely legitimate) that the per-IP limit throttled at least once in a day, as a share of all such addresses that day. A threshold of the THROTTLE-TUNE recommendation rule, in percent; the rule detects: The per-IP request limit looks too tight or too loose.
+Distinct client IP addresses with a bot score at or below bot_score_legit_max (likely legitimate) that were refused at least once in the last 24 hours, as a share of all such addresses seen then. A threshold of the THROTTLE-TUNE recommendation rule, in percent; the rule detects: The per-IP request limit looks too tight or too loose.
 
 | Field | Value |
 |---|---|
@@ -15727,7 +15724,7 @@ Turns the PLACE-HEAVY recommendation rule on or off (abuse family). It detects: 
 
 ### `insight_place_heavy_severity`
 
-The severity PLACE-HEAVY recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity PLACE-HEAVY recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -15763,9 +15760,9 @@ The severity PLACE-HEAVY recommendations are reported with. auto keeps the sever
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_place_heavy_share_pct`
 
@@ -15874,7 +15871,7 @@ Turns the SYS-DISK recommendation rule on or off (system family). It detects: Di
 
 ### `insight_sys_disk_severity`
 
-The severity SYS-DISK recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity SYS-DISK recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -15910,9 +15907,9 @@ The severity SYS-DISK recommendations are reported with. auto keeps the severity
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_sys_disk_budget_pct`
 
@@ -16056,7 +16053,7 @@ Turns the SYS-WORKER-SAT recommendation rule on or off (system family). It detec
 
 ### `insight_sys_worker_sat_severity`
 
-The severity SYS-WORKER-SAT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity SYS-WORKER-SAT recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -16092,9 +16089,9 @@ The severity SYS-WORKER-SAT recommendations are reported with. auto keeps the se
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_sys_worker_sat_cpu_pct`
 
@@ -16203,7 +16200,7 @@ Turns the SYS-LOOP-LAG recommendation rule on or off (system family). It detects
 
 ### `insight_sys_loop_lag_severity`
 
-The severity SYS-LOOP-LAG recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity SYS-LOOP-LAG recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -16239,9 +16236,9 @@ The severity SYS-LOOP-LAG recommendations are reported with. auto keeps the seve
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_sys_loop_lag_p99_ms`
 
@@ -16350,7 +16347,7 @@ Turns the SYS-ERRORS recommendation rule on or off (system family). It detects: 
 
 ### `insight_sys_errors_severity`
 
-The severity SYS-ERRORS recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity SYS-ERRORS recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -16386,9 +16383,9 @@ The severity SYS-ERRORS recommendations are reported with. auto keeps the severi
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_sys_errors_baseline_multiple`
 
@@ -16532,7 +16529,7 @@ Turns the SYS-METRICS-DROP recommendation rule on or off (system family). It det
 
 ### `insight_sys_metrics_drop_severity`
 
-The severity SYS-METRICS-DROP recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity SYS-METRICS-DROP recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -16568,9 +16565,9 @@ The severity SYS-METRICS-DROP recommendations are reported with. auto keeps the 
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_sys_change_regression_enabled`
 
@@ -16609,7 +16606,7 @@ Turns the SYS-CHANGE-REGRESSION recommendation rule on or off (system family). I
 
 ### `insight_sys_change_regression_severity`
 
-The severity SYS-CHANGE-REGRESSION recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity SYS-CHANGE-REGRESSION recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -16645,9 +16642,9 @@ The severity SYS-CHANGE-REGRESSION recommendations are reported with. auto keeps
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_sys_change_regression_worse_pct`
 
@@ -16791,7 +16788,7 @@ Turns the SYS-HEALTH-FAIL recommendation rule on or off (system family). It dete
 
 ### `insight_sys_health_fail_severity`
 
-The severity SYS-HEALTH-FAIL recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity SYS-HEALTH-FAIL recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -16827,9 +16824,9 @@ The severity SYS-HEALTH-FAIL recommendations are reported with. auto keeps the s
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_sec_admin_allowlist_enabled`
 
@@ -16868,7 +16865,7 @@ Turns the SEC-ADMIN-ALLOWLIST recommendation rule on or off (security family). I
 
 ### `insight_sec_admin_allowlist_severity`
 
-The severity SEC-ADMIN-ALLOWLIST recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity SEC-ADMIN-ALLOWLIST recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -16904,9 +16901,9 @@ The severity SEC-ADMIN-ALLOWLIST recommendations are reported with. auto keeps t
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_sec_admin_allowlist_max_networks`
 
@@ -17015,7 +17012,7 @@ Turns the SEC-BYPASS-FOREVER recommendation rule on or off (security family). It
 
 ### `insight_sec_bypass_forever_severity`
 
-The severity SEC-BYPASS-FOREVER recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity SEC-BYPASS-FOREVER recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -17051,9 +17048,9 @@ The severity SEC-BYPASS-FOREVER recommendations are reported with. auto keeps th
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_host_add_enabled`
 
@@ -17092,7 +17089,7 @@ Turns the HOST-ADD recommendation rule on or off (host family). It detects: A re
 
 ### `insight_host_add_severity`
 
-The severity HOST-ADD recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity HOST-ADD recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -17128,9 +17125,9 @@ The severity HOST-ADD recommendations are reported with. auto keeps the severity
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_host_add_min_places`
 
@@ -17274,7 +17271,7 @@ Turns the CRED-PROBE-COST recommendation rule on or off (credential family). It 
 
 ### `insight_cred_probe_cost_severity`
 
-The severity CRED-PROBE-COST recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity CRED-PROBE-COST recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -17310,9 +17307,9 @@ The severity CRED-PROBE-COST recommendations are reported with. auto keeps the s
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 ### `insight_sec_defaults_enabled`
 
@@ -17351,7 +17348,7 @@ Turns the SEC-DEFAULTS recommendation rule on or off (security family). It detec
 
 ### `insight_sec_defaults_severity`
 
-The severity SEC-DEFAULTS recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which also decides whether an alert is sent (compare alert_min_severity).
+The severity SEC-DEFAULTS recommendations are reported with. auto keeps the severity the rule computes from its evidence; the other values force one level, which orders the findings on the Recommendations page and in the bell (no alert is sent for a recommendation).
 
 | Field | Value |
 |---|---|
@@ -17387,9 +17384,9 @@ The severity SEC-DEFAULTS recommendations are reported with. auto keeps the seve
 Options:
 
 - `auto` (Automatic): Use the severity the rule computes from its evidence (recommended).
-- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page but sit below the default alert level (alert_min_severity = warn), so no alert is sent for them.
-- `warn` (Warn): Always report this rule's findings as warn (may need action soon); with the default alert settings each new finding is also sent as an alert.
-- `critical` (Critical): Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity level, so use this only for rules you must never miss.
+- `info` (Info): Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, below warn and critical findings.
+- `warn` (Warn): Always report this rule's findings as warn (may need action soon): listed above info findings on the Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts the open ones.
+- `critical` (Critical): Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked (or alert_min_severity at info, which also emails the daily digest).
 
 <a id="group-public_site"></a>
 
@@ -17445,7 +17442,7 @@ Controls the status code callers get when Roblox fails or rejects a request. Off
 | Step | none |
 | If raised | n/a |
 | If lowered | n/a |
-| If enabled | Every Roblox 4xx, live or cached, reaches callers as a 500 that still carries Roblox's own body and content type, exactly as in v1: with ?prettyprint=true a 4xx answered from the cache is pretty printed and a live one is not, as v1 did. Every Roblox 5xx, 502 and 504 becomes a 500 with the text 'Upstream request failed; please try again later.'. Old scripts that only check for 200 or 500 keep working, but they usually retry at once, which sends more traffic to Roblox and causes more 429s. Roxy's own refusals (throttles, pause, invalid URLs) are unchanged, and Retry-After is still sent. |
+| If enabled | Every Roblox 4xx, live or cached, reaches callers as a 500 that still carries Roblox's own body and content type, exactly as in v1: with ?prettyprint=true a 4xx answered from the cache is pretty printed and a live one is not, as v1 did. Every Roblox 5xx, 502 and 504 becomes a 500 with the text 'Upstream request failed; please try again later.'. Old scripts that only check for 200 or 500 keep working, but they usually retry at once, which sends more traffic to Roblox and causes more 429s. A Roblox 429 that Roxy's own call received counts as a Roblox 4xx: callers get 500 with Roblox's body, and Retry-After is still sent. Roxy's own busy and cooldown answers that made no call (a cooling endpoint, a per-key 429 marker, a full queue) stay 429, and Roxy's own refusals (throttles, pause, invalid URLs) are unchanged. |
 | If disabled | Callers see the real upstream status (404 stays 404, 429 stays 429 with Retry-After) plus a Roxy-Upstream-Status header, so well-written scripts can wait the right amount of time instead of retrying immediately. |
 | Risk | medium |
 | High risk when | none |

@@ -664,6 +664,25 @@ class InsightContext:
     async def rule_hits(self, table: str | None = None) -> dict[tuple[str, str], dict[str, int | None]]:
         return await self._metrics(("rule_hits", table), lambda c: read_history.rule_hits(c, table))
 
+    async def data_reset_at(self, tables: Iterable[str], since: float) -> float | None:
+        """When the newest data reset (a plan 6.8 `reset` marker) at or after `since` that deleted rows of any of
+        `tables` (`<db>.<table>` names, as a marker lists them) ended: a ranged reset's `until`, else its instant;
+        None when no such reset happened. Rows read from those tables start again there, so a rule must never read
+        the deleted rows as "nothing happened" (final review data-2: after a statistics reset FILTER-REMOVE called
+        a working filter "never matched"). A marker that does not say what it deleted counts
+        (`queries.reset_touches`: the safe reading). One memoized read of the markers per `since`."""
+        start = int(since)
+        markers = await self._metrics(
+            ("reset_markers", start), lambda c: queries.reset_annotations(c, start, int(self.now) + 1)
+        )
+        wanted = tuple(tables)
+        points = [
+            float(marker["until"] if marker.get("until") is not None else marker["at"])
+            for marker in markers
+            if queries.reset_touches(marker, wanted)
+        ]
+        return max(points) if points else None
+
     async def rule_last_hit(self, table: str, key: Any) -> int | None:
         """When a rule row last matched a request (None: never since it was created)."""
         hits = await self.rule_hits(table)

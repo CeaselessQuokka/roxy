@@ -462,6 +462,7 @@ def test_migrate_is_idempotent_and_records_versions(env) -> None:
             (7, "limit_samples"),
             (8, "user_agent_detail"),
             (9, "dashboard_read_indexes"),
+            (10, "roblox_answers"),
         ]
         assert check_schema(dbs) == REQUIRED_SCHEMA
     finally:

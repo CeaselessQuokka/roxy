@@ -618,15 +618,16 @@ SETTINGS: list[SettingSpec] = [
             OptionSpec(
                 "place_prefix",
                 "Place id and caller network (recommended)",
-                "One budget per place id and caller network (a /24 for IPv4, a /48 for IPv6). A forger only "
-                "spends the share that belongs to their own network, so a real game's servers keep theirs. A "
-                "game spread across many networks gets one budget per network.",
+                "One budget per place id and caller network (a /24 for IPv4, a /48 for IPv6), for the place limit "
+                "and every Per experience endpoint rate rule. A forger only spends the share that belongs to their "
+                "own network, so a real game's servers keep theirs. A game spread across many networks gets one "
+                "budget per network.",
             ),
         ),
         description=(
             "Decides what one per-experience budget belongs to. Place ids come from a header any caller can "
             "set, so counting them together with the caller's network stops a forger from exhausting a real "
-            "game's budget."
+            "game's budget. It also decides what a Per experience endpoint rate rule counts by."
         ),
         risk=Risk.MEDIUM,
         high_risk_if=(
@@ -668,7 +669,12 @@ SETTINGS: list[SettingSpec] = [
         risk=Risk.MEDIUM,
         related_settings=("bot_weight_no_roblox_signature", "spam_dry_run", "place_limit_key"),
         pages=(_PLACES, _CLIENT_PLACES, _BOT),
-        notes="Add only ranges Roblox itself documents; never add a range because one caller asked for it.",
+        pending_owner_verification=True,
+        notes=(
+            "PENDING owner verification: Roxy ships the list empty, so no caller gets game server credit until you "
+            "fill it (plan 9, threat 6). Add only ranges Roblox itself documents; never add a range because one "
+            "caller asked for it."
+        ),
     ),
     # ------------------------------------------------------------------------------------------------------
     # Bans (Protection > Bans)
@@ -703,7 +709,7 @@ SETTINGS: list[SettingSpec] = [
     SettingSpec(
         key="bot_score_block_threshold",
         group=Group.ABUSE,
-        label="Block clients above bot score",
+        label="Block clients at or above bot score",
         type=SettingType.INT,
         default=0,
         unit="score (0 to 100)",
@@ -711,8 +717,8 @@ SETTINGS: list[SettingSpec] = [
         max=100,
         step=1,
         description=(
-            "Refuse requests from clients whose bot score (0 to 100, higher means more bot-like) is above this "
-            "value, with reason bot_score. 0 turns blocking off; the score is then only shown and used by the "
+            "Refuse requests from clients whose bot score (0 to 100, higher means more bot-like) is at or above "
+            "this value, with reason bot_score. 0 turns blocking off; the score is then only shown and used by the "
             "detectors and recommendations."
         ),
         if_raised="Only very bot-like clients are blocked, so fewer legitimate callers are caught.",
@@ -743,25 +749,27 @@ SETTINGS: list[SettingSpec] = [
         max=100,
         step=1,
         description=(
-            "Clients with a bot score at or below this value count as legitimate when the THROTTLE-TUNE and "
-            "FILTER-COLLATERAL recommendations decide whether a limit or filter is hurting real users. It does "
-            "not block or allow anything by itself."
+            "Clients with a bot score at or below this value count as legitimate for two recommendations: "
+            "THROTTLE-TUNE measures how many legitimate addresses were refused at least once, and ABUSE-DIST ignores "
+            "a distributed burst (SPAM-DIST) made only of legitimate clients, such as game servers sharing the "
+            "Roblox User-Agent. It does not block or allow anything by itself."
         ),
         if_raised=(
-            "More clients count as legitimate, so those rules see more collateral damage and suggest loosening "
-            "limits and filters more often."
+            "More clients count as legitimate: THROTTLE-TUNE sees more real users refused and suggests loosening "
+            "the per-IP limit more often, and ABUSE-DIST ignores more bursts."
         ),
         if_lowered=(
-            "Fewer clients count as legitimate, so those rules see less collateral damage and suggest "
-            "loosening less often."
+            "Fewer clients count as legitimate: THROTTLE-TUNE suggests loosening the per-IP limit less often, and "
+            "ABUSE-DIST may propose a rule against a burst that is really game servers."
         ),
         risk=Risk.LOW,
         related_settings=(
             "bot_score_abuse_min",
             "bot_score_block_threshold",
             "insight_throttle_tune_legit_throttled_pct",
-            "insight_filter_collateral_served_pct",
+            "spam_dist_threshold",
         ),
+        related_recommendations=("THROTTLE-TUNE", "ABUSE-DIST"),
         pages=(_BOT, _CLIENT_SCORE),
     ),
     SettingSpec(
@@ -923,7 +931,7 @@ SETTINGS: list[SettingSpec] = [
     SettingSpec(
         key="challenge_trigger_score",
         group=Group.ABUSE,
-        label="Challenge above bot score",
+        label="Challenge at or above bot score",
         type=SettingType.INT,
         default=80,
         unit="score (0 to 100)",
@@ -931,7 +939,7 @@ SETTINGS: list[SettingSpec] = [
         max=100,
         step=1,
         description=(
-            "Browser clients whose bot score is above this value are shown the challenge page while the "
+            "Browser clients whose bot score is at or above this value are shown the challenge page while the "
             "browser challenge is on."
         ),
         if_raised="Only very bot-like browsers are challenged, so fewer real visitors ever see the puzzle.",
@@ -980,8 +988,10 @@ SETTINGS: list[SettingSpec] = [
         step=1,
         description=(
             "How long a new bypass entry lasts unless the admin picks another time. A bypassed IP or range "
-            "skips throttle-all, the per-IP limit, User-Agent rules, endpoint rate rules and the tarpit, but "
-            "is still subject to pause, blocks, filters and auth checks. 0 means new entries never expire."
+            "skips the flood limit, the spam detectors, the emergency limit (throttle-all), the per-IP limit, "
+            "place limits, the browser challenge, the bot score block, User-Agent rules, endpoint rules and the "
+            "tarpit, but is still subject to pause, bans, endpoint blocks, request filters, ignored paths, unsafe "
+            "URL refusals, the Roblox host check and credential smuggling refusals. 0 means new entries never expire."
         ),
         if_raised=(
             "Entries last longer before they must be renewed, so forgotten load-test or office entries keep "

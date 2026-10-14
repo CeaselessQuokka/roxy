@@ -68,7 +68,8 @@ from roxy.metrics import histograms, read_history
 from roxy.metrics.queries import Window
 from roxy.metrics.templating import OTHER
 from roxy.upstream import adaptive, breaker
-from roxy.upstream.buckets import GLOBAL_KEY, egress_bucket_key
+from roxy.upstream.buckets import GLOBAL_KEY, egress_bucket_key, endpoint_bucket_key
+from roxy.upstream.pacing import pacing_template
 
 # ------------------------------------------------------------------------------------------------ constants
 
@@ -343,6 +344,15 @@ async def cache_change(
     )
 
 
+async def display_template(ctx: InsightContext, window: Window, pacing: str) -> str:
+    """The template callers used for an endpoint whose pacing form (`upstream/pacing.py`, the form breaker and
+    cooldown keys carry since finding pipe-2) is `pacing`: the busiest one in the window, else `pacing` itself. Links,
+    cache rules and sample reads use the metrics templates, which keep the letter case callers sent."""
+    rows = await ctx.by_template(window)
+    found = [(number(row, "requests"), str(name)) for name, row in rows.items() if pacing_template(str(name)) == pacing]
+    return max(found)[1] if found else pacing
+
+
 async def dominant_method(ctx: InsightContext, window: Window, template: str) -> str:
     """The method most of the endpoint's requests used in the window (GET when it had none)."""
     methods = await ctx.by(window, "method", {"endpoint_template": template})
@@ -475,7 +485,9 @@ def key_matches_429(key: str, template: str, host: str, egress: str) -> bool:
     if key == GLOBAL_KEY:
         return True
     if key.startswith("endpoint:"):
-        return key == f"endpoint:{template}"
+        # The pacing key the runtime uses (finding pipe-2), or a row typed with the caller's case before keys were
+        # folded (`buckets.endpoint_limit_row` reads that one too).
+        return key in (endpoint_bucket_key(template), f"endpoint:{template}")
     if key.startswith("host:"):
         return key == f"host:{host}"
     return key == egress_bucket_key(egress) if egress in UPSTREAM_EGRESSES else False
@@ -498,6 +510,39 @@ class TightBucket:
         return pct(self.rejections, self.attempts)
 
 
+async def bucket_changed_at(ctx: InsightContext, key: str, since: float) -> float | None:
+    """When the rate of bucket `key` last changed at or after `since` (Unix seconds), or None when it did not.
+
+    The plan 7.3 controller judges a bucket only on evidence gathered at its CURRENT rate ("the key's last change
+    must also be that old", `upstream/adaptive.py should_increase`), and so do the rules that tune it (final review
+    brain-1: rejections turned away at the old rate say nothing about a raised one). A change is any of: the key's
+    `upstream_limits` row written (its `updated_at`), the row created, updated or deleted through the audited rules
+    service (`audit_log`, target `upstream_limits:<key>`), the catalog default an endpoint or host key without a row
+    runs at, or the setting an egress or global key runs at (`settings_history`)."""
+    times: list[float] = []
+    if key.startswith(("endpoint:", "host:")):
+        row = ctx.rules.upstream_limit(key)
+        if row is not None and row.updated_at is not None and float(row.updated_at) >= since:
+            times.append(float(row.updated_at))
+        target = f"upstream_limits:{key}"
+        times.extend(
+            float(change["at"])
+            for change in await ctx.recent_changes(since)
+            if change.get("kind") == "rule" and change.get("target") == target
+        )
+        if row is None:
+            kind = "endpoint" if key.startswith("endpoint:") else "host"
+            setting: str | None = f"{kind}_bucket_default_per_min"
+        else:
+            setting = None
+    else:
+        setting = EGRESS_BUCKET_SETTINGS.get(key)
+    if setting is not None:
+        # The first entry is the value in force at `since`; every later one is a change inside the window.
+        times.extend(float(at) for at, _value in (await ctx.setting_timeline(setting, since))[1:])
+    return max(times) if times else None
+
+
 def controller_manages(ctx: InsightContext, key: str) -> bool:
     """While `adaptive_rate_enabled` is 1, the 7.3 controller raises endpoint buckets that run at the default or at
     a rate it set itself (`upstream/adaptive.py`); a recommendation would only race it."""
@@ -509,8 +554,11 @@ def controller_manages(ctx: InsightContext, key: str) -> bool:
 
 async def tight_bucket(ctx: InsightContext, key: str) -> TightBucket | None:
     """Plan 7.3 bounded probing as UP-BUCKET-TUNE judges it: zero Roblox 429s on `key` for `clean_hours` and
-    bucket rejections above `rejection_pct` of its attempts. UP-LATENCY and UP-QUEUE-SAT raise a bucket only on
-    this evidence ("never as a latency fix alone")."""
+    bucket rejections above `rejection_pct` of its attempts, all of it at the bucket's current rate: a bucket whose
+    rate changed within `clean_hours` waits until a whole window was measured at the new rate (like the 7.3
+    controller, `adaptive.should_increase`; final review brain-1: otherwise each raise is followed, once its watch
+    window ends, by another one on the same rejections, all turned away at the old rate). UP-LATENCY and
+    UP-QUEUE-SAT raise a bucket only on this evidence ("never as a latency fix alone")."""
     if controller_manages(ctx, key):
         return None
     tune = UpBucketTune()
@@ -525,6 +573,12 @@ async def tight_bucket(ctx: InsightContext, key: str) -> TightBucket | None:
     counts = await ctx.roblox_429(window, group_by=("endpoint_template", "host", "egress"))
     if any(key_matches_429(key, str(t), str(h), str(e)) for (t, h, e) in counts):
         return None
+    if await ctx.data_reset_at((adaptive.EVIDENCE_TABLE,), window.start) is not None:
+        # A data reset deleted Roblox 429 records inside the window: "no 429s" is unknown, never clean (the
+        # adaptive controller's own rule, finding data-1, `adaptive.reset_evidence_until`).
+        return None
+    if await bucket_changed_at(ctx, key, window.start) is not None:
+        return None  # part of the window ran at another rate: its rejections do not judge the current one
     current = bucket_rate(ctx, key)
     if current is None:
         return None
@@ -910,14 +964,14 @@ class UpRetryAfterIgnored(Rule):
 
     async def evaluate(self, ctx: InsightContext) -> list[Recommendation]:
         window = ctx.window(minutes=self.param(ctx, "window_min"))
-        intervals = await self._intervals(ctx, window)
+        intervals, names = await self._intervals(ctx, window)
         if not intervals:
             return []
         # Only the rows this rule looks at (answers that made no call and served nothing, with a client), filtered
         # in SQL: a busy window's other samples are never read, and a cut read is said in the evidence (G7).
         read = await ctx.sample_read(
             window,
-            sorted(intervals),
+            sorted(names),
             where=read_history.SampleFilter(
                 egress=Egress.NONE.value, exclude_cache_states=tuple(sorted(CACHE_SERVES)), with_client=True
             ),
@@ -929,7 +983,7 @@ class UpRetryAfterIgnored(Rule):
             if not client or sample.get("egress") != Egress.NONE.value or sample.get("cache_state") in CACHE_SERVES:
                 continue  # only answers that made no call and served nothing: the caller was told to wait
             at = int(sample["at_ms"]) / 1000
-            for index, (start, end) in enumerate(intervals.get(template, ())):
+            for index, (start, end) in enumerate(intervals.get(pacing_template(template), ())):
                 if start <= at < end:
                     key = str(sample.get("key_id") or template)
                     slot = (str(client), key, template, index)
@@ -991,13 +1045,19 @@ class UpRetryAfterIgnored(Rule):
             )
         ]
 
-    async def _intervals(self, ctx: InsightContext, window: Window) -> dict[str, list[tuple[float, float]]]:
-        """Per template, the times callers were told to wait: each Roblox 429 plus its Retry-After (clamped to the
-        cooldown range), and each cooldown that is still active."""
+    async def _intervals(
+        self, ctx: InsightContext, window: Window
+    ) -> tuple[dict[str, list[tuple[float, float]]], set[str]]:
+        """Per endpoint, the times callers were told to wait: each Roblox 429 plus its Retry-After (clamped to the
+        cooldown range), and each cooldown that is still active; and the templates whose samples to read.
+
+        Keyed by the template's pacing form (`upstream/pacing.py`): one cooldown holds every letter case of an
+        endpoint since finding pipe-2, and a cooldown key carries that form, not the caller's template."""
         low, high = float(ctx.setting("cooldown_min_s")), float(ctx.setting("cooldown_max_s"))
         default = float(ctx.setting("cooldown_default_s"))
         earlier = span_window(window.start - high, window.end)
         spans: dict[str, list[tuple[float, float]]] = {}
+        names: set[str] = set()
         for row in await ctx.upstream_429_rows(earlier):
             template = str(row.get("endpoint_template") or "")
             if not real_template(template):
@@ -1005,11 +1065,13 @@ class UpRetryAfterIgnored(Rule):
             wait = row.get("retry_after_s")
             seconds = min(high, max(low, float(wait if wait is not None else default)))
             start = int(row["at_ms"]) / 1000
-            spans.setdefault(template, []).append((start, start + seconds))
+            names.add(template)
+            spans.setdefault(pacing_template(template), []).append((start, start + seconds))
         for row in await ctx.cooldowns():
             if row.key.startswith("endpoint:"):
                 template = row.key[len("endpoint:") :].rsplit(":", 1)[0]
-                spans.setdefault(template, []).append((float(row.set_at), row.until_ms / 1000))
+                names.add(template)
+                spans.setdefault(pacing_template(template), []).append((float(row.set_at), row.until_ms / 1000))
         merged: dict[str, list[tuple[float, float]]] = {}
         for template, items in spans.items():
             out: list[tuple[float, float]] = []
@@ -1019,7 +1081,8 @@ class UpRetryAfterIgnored(Rule):
                 else:
                     out.append((start, end))
             merged[template] = [(s, e) for s, e in out if e > window.start and s < window.end]
-        return {template: items for template, items in merged.items() if items}
+        kept = {pacing: items for pacing, items in merged.items() if items}
+        return kept, {name for name in names if pacing_template(name) in kept}
 
     def _changes(self, ctx: InsightContext) -> list[ProposedChange]:
         tarpit_on = ctx.flag("tarpit_enabled")
@@ -2244,6 +2307,13 @@ class UpBucketTune(Rule):
             first = min(int(r["at_ms"]) for r in rows) / 1000
             if row is not None and row.origin == "adaptive" and (row.updated_at or 0) >= first:
                 return None  # the controller already cut it for these 429s
+        # Only 429s drawn at the bucket's current rate count (final review brain-1): once a cut is applied, the hour
+        # of 429s that justified it is still in the window when its watch window ends, and must not cut it again.
+        changed = await bucket_changed_at(ctx, key, min(int(r["at_ms"]) for r in rows) / 1000)
+        if changed is not None:
+            rows = [r for r in rows if int(r["at_ms"]) // 1000 > changed]
+            if not rows:
+                return None
         proposed = lowered_rate(ctx, key, current, self.param(ctx, "lower_pct"))
         if proposed is None:
             return None
@@ -2359,7 +2429,11 @@ class UpBreakerFlap(Rule):
         proposed = int(min(cap, current * BREAKER_OPEN_RAISE_FACTOR))
         if proposed > current:
             changes.append(setting_change(ctx, "breaker_open_s", proposed))
-        template = key[len("endpoint:") :].rsplit(":", 1)[0] if key.startswith("endpoint:") else ""
+        template = (
+            await display_template(ctx, window, key[len("endpoint:") :].rsplit(":", 1)[0])
+            if key.startswith("endpoint:")
+            else ""
+        )
         if template and real_template(template):
             evidence.links.append(endpoint_link(template))
             if ctx.cache_rule_for(template) is None:

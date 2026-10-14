@@ -39,6 +39,7 @@ from typing import Any, Final
 
 from roxy.core.redact import MASK, TOKEN_PREFIX, redact_text
 from roxy.migration.text import EM_DASH, EN_DASH, CleanText
+from roxy.migration.times import finite_json
 
 REPORT_SCHEMA: Final = "roxy.v1_migration_report/1"
 
@@ -591,7 +592,10 @@ def write_report(report: MigrationReport, path: Path) -> tuple[Path, Path]:
     """Write the JSON and Markdown files for `report`; returns their paths."""
     json_path, markdown_path = report_paths(path)
     # ensure_ascii=True: non-ASCII (the dashes in C5 "before" texts included) is written as \\u escapes.
-    _write_private(json_path, json.dumps(report.as_dict(), indent=2, sort_keys=False, ensure_ascii=True) + "\n")
+    # finite_json then allow_nan=False: a NaN or infinity from v1's data file is written as null, never as a bare
+    # NaN that no JSON reader accepts (lead decision 4).
+    body = json.dumps(finite_json(report.as_dict()), indent=2, sort_keys=False, ensure_ascii=True, allow_nan=False)
+    _write_private(json_path, body + "\n")
     _write_private(markdown_path, render_markdown(report))
     return json_path, markdown_path
 

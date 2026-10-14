@@ -16,6 +16,10 @@ How it works
     a plain function or a coroutine; a coroutine runs as a background task with a timeout, kept in a bounded set
     so it is not garbage collected mid-flight. Every alert is also logged (the log filter redacts the fields), so
     a trip leaves a journal line even with no notifier. Fields never contain request content or secrets.
+    Plan 17.7 wants `Where` (a page link) and `What to do` (a runbook link) in every alert body: a caller names the
+    dashboard card (`page="credential#status"`), which becomes `<ROXY_SITE_ORIGIN>/admin/credential#status` from the
+    notifier's `site_origin`, and the runbook is the alert type's own (`roxy.notify.alerts.ALERT_SPECS`), so the
+    egress layer's alerts link exactly what the alert catalog promises (finding brain-6).
 
 What to read next
     `roxy/egress/guard.py` and `roxy/egress/credential.py` (the main callers).
@@ -36,6 +40,8 @@ log = logging.getLogger("roxy.egress.events")
 ALERT_SEND_TIMEOUT_S = 10.0
 MAX_PENDING_ALERTS = 64
 _ALERT_MODULES = ("roxy.notify.models", "roxy.notify.alerts", "roxy.notify")
+ADMIN_PATH = "/admin/"
+"""Where dashboard pages live under `ROXY_SITE_ORIGIN` (`page_link`)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +57,7 @@ class EgressAlert:
     cooldown_s: int | None = None
     link: str | None = None
     always_send: bool = False
+    runbook: str | None = None
 
 
 def _alert_class() -> Any:
@@ -63,6 +70,31 @@ def _alert_class() -> Any:
         if isinstance(found, type):
             return found
     return EgressAlert
+
+
+def runbook_for(alert_type: str) -> str | None:
+    """The runbook name the alert catalog gives `alert_type` (`ALERT_SPECS[type].runbook`), or None."""
+    for name in _ALERT_MODULES:
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        specs = getattr(module, "ALERT_SPECS", None)
+        if isinstance(specs, dict):
+            spec = specs.get(alert_type)
+            runbook = getattr(spec, "runbook", None)
+            return runbook if isinstance(runbook, str) and runbook else None
+    return None
+
+
+def page_link(notifier: Any, page: str | None) -> str | None:
+    """`<site origin>/admin/<page>` for a dashboard card (`credential#status`), from the notifier's `site_origin`
+    (`ROXY_SITE_ORIGIN`); None without a page. Built by Roxy, never from request data."""
+    if not page:
+        return None
+    origin = getattr(notifier, "site_origin", "")
+    base = origin.rstrip("/") if isinstance(origin, str) else ""
+    return f"{base}{ADMIN_PATH}{page.lstrip('/')}"
 
 
 def build_alert(**fields: Any) -> Any:
@@ -98,8 +130,13 @@ class EventSink:
         cooldown_s: int | None = None,
         link: str | None = None,
         always_send: bool = False,
+        page: str | None = None,
+        runbook: str | None = None,
     ) -> None:
-        """Send one alert in the background (never raises, never waits)."""
+        """Send one alert in the background (never raises, never waits).
+
+        `page` names the dashboard card the alert is about (`credential#status`): it becomes the `Where` link unless
+        `link` is given. `runbook` defaults to the alert type's runbook in the alert catalog (`What to do`)."""
         payload = dict(fields or {})
         level = logging.CRITICAL if severity == "critical" else logging.WARNING
         log.log(level, "egress_alert", extra={"fields": {"type": type, "subject": subject, **payload}})
@@ -115,8 +152,9 @@ class EventSink:
             fields=payload,
             cooldown_key=cooldown_key,
             cooldown_s=cooldown_s,
-            link=link,
+            link=link or page_link(notifier, page),
             always_send=always_send,
+            runbook=runbook or runbook_for(type),
         )
         try:
             result = send(alert)
@@ -167,4 +205,4 @@ class EventSink:
         await asyncio.wait(set(self._pending), timeout=timeout_s)
 
 
-__all__ = ["EgressAlert", "EventSink", "build_alert"]
+__all__ = ["ADMIN_PATH", "EgressAlert", "EventSink", "build_alert", "page_link", "runbook_for"]

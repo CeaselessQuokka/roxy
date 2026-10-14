@@ -823,7 +823,7 @@ class DashboardServer:
         """Start everything (see the module docstring). `settings` are applied before seeding."""
         import os
 
-        from roxy.admin.auth.testing import fast_hasher
+        from auth_harness import fast_hasher
         from roxy.config.env import EnvSettings
         from roxy.egress.targets import TEST_UPSTREAM_ENV
         from roxy.main import create_app
@@ -882,8 +882,8 @@ class DashboardServer:
     # ---- admin and sign-in
 
     def make_admin(self) -> Any:
+        from auth_harness import make_admin
         from roxy.admin.auth import totp
-        from roxy.admin.auth.testing import make_admin
 
         cipher = totp.load_cipher(self.ctx.env.credentials_dir)
         assert cipher is not None, "make_fake_credentials writes the TOTP key"

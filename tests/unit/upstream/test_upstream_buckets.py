@@ -138,9 +138,13 @@ def test_default_rates_from_the_catalog() -> None:
     assert (defaults.rotator.per_min, defaults.rotator.burst) == (300, 20)
     assert (defaults.host.per_min, defaults.host.burst) == (240, 15)
     assert (defaults.endpoint.per_min, defaults.endpoint.burst) == (120, 10)
-    # The account's 20 per minute is split: 18 for allowlisted traffic, 2 reserved for Roxy's own probes.
-    assert (defaults.credential.per_min, defaults.credential.burst) == (18, 3)
-    assert (defaults.credential_probe.per_min, defaults.credential_probe.burst) == (2, 2)
+    # The account's 20 per minute and burst of 3 are split: 18 and 2 for allowlisted traffic, 2 and 1 reserved for
+    # Roxy's own probes, so the two buckets together never let more than the account's 3 calls leave back to back
+    # (final review constraints-6: each used to get the whole burst, 3 + 2).
+    assert (defaults.credential.per_min, defaults.credential.burst) == (18, 2)
+    assert (defaults.credential_probe.per_min, defaults.credential_probe.burst) == (2, 1)
+    assert defaults.credential.burst + defaults.credential_probe.burst == 3
+    assert defaults.credential_probe_shares_burst is False
 
 
 def test_specs_for_each_egress_and_overrides() -> None:
@@ -169,6 +173,43 @@ def test_specs_for_each_egress_and_overrides() -> None:
     assert shared[1].key == "egress:credential"
     with pytest.raises(ValueError, match="none"):
         specs_for(Egress.NONE, "h", "t", defaults, None)
+
+
+def test_endpoint_buckets_ignore_the_letter_case_of_the_path() -> None:
+    """Final review pipe-2: one bucket (and one learned rate) per Roblox endpoint, whatever case a caller used. A
+    row written under the caller's case before keys were folded still applies."""
+    assert buckets.endpoint_bucket_key("games.roblox.com/V1/Games/{universeId}") == (
+        "endpoint:games.roblox.com/v1/games/{universeId}"
+    )
+    defaults = BucketDefaults.from_settings(FakeSettings())
+    rules = FakeRules()
+    rules.limit("endpoint:games.roblox.com/v1/games", 30, 2, origin="adaptive")
+    for template in ("games.roblox.com/v1/games", "games.roblox.com/V1/GAMES"):
+        endpoint = specs_for(Egress.DIRECT, "games.roblox.com", template, defaults, rules.snapshot)[3]
+        assert (endpoint.key, endpoint.per_min, endpoint.burst) == ("endpoint:games.roblox.com/v1/games", 30, 2)
+    legacy = FakeRules()
+    legacy.limit("endpoint:games.roblox.com/V1/Badges", 12, 1, origin="admin")
+    endpoint = specs_for(Egress.DIRECT, "games.roblox.com", "games.roblox.com/V1/Badges", defaults, legacy.snapshot)[3]
+    assert (endpoint.key, endpoint.per_min, endpoint.burst) == ("endpoint:games.roblox.com/v1/badges", 12, 1)
+
+
+async def test_the_account_burst_holds_across_traffic_and_probes(dbs: Any) -> None:
+    """Final review constraints-6: allowlisted calls and probes together never leave more than
+    `credential_bucket_burst` calls back to back, at the default burst of 3 and at 1, where a probe also takes a
+    slot in the traffic bucket (nothing can be split)."""
+    for burst, now in ((3, NOW), (1, NOW + 3_600_000)):
+        defaults = BucketDefaults.from_settings(FakeSettings(credential_bucket_burst=burst))
+        assert defaults.credential_probe_shares_burst is (burst == 1)
+        traffic = specs_for(Egress.CREDENTIAL, "economy.roblox.com", "economy.roblox.com/v1/a", defaults, None)
+        probe = specs_for(
+            Egress.CREDENTIAL, "users.roblox.com", "users.roblox.com/v1/x", defaults, None, credential_probe=True
+        )
+        assert probe[1].key == "egress:credential:probe"  # the egress bucket stays the second spec
+        granted = 0
+        for specs in (traffic,) * 4 + (probe,) * 3:
+            outcome = await buckets.reserve(dbs.hot, specs, now_ms=lambda now=now: now, max_wait_ms=0)
+            granted += int(outcome.granted)
+        assert granted == burst, (burst, granted)
 
 
 # --- reservations in hot.db -------------------------------------------------------------------------------------------

@@ -101,8 +101,13 @@ HOSTS_SPEC: Final = TableSpec(
         Column("calls_per_min", "Calls per minute", "Calls divided by the minutes of the range so far.", "per_min"),
         Column("roblox_429", "Roblox 429s", "Answers where Roblox said 429 (every one is logged).", "count"),
         Column("rate_429_pct", "429 rate", "Roblox 429s per 100 calls.", "pct"),
-        Column("roblox_5xx", "Roblox 5xx", "Requests that ended with a 5xx Roblox sent.", "count"),
-        Column("rate_5xx_pct", "5xx rate", "Roblox 5xx per 100 requests that went to this host.", "pct"),
+        Column(
+            "roblox_5xx",
+            "Roblox 5xx",
+            "5xx answers Roblox gave calls to this host for callers (every attempt, retries included).",
+            "count",
+        ),
+        Column("rate_5xx_pct", "5xx rate", "Roblox 5xx answers per 100 calls to this host.", "pct"),
         Column("timeouts", "Timeouts", "Requests that ended because Roblox did not answer in time.", "count"),
         Column("failed", "Failed", "Requests to this host Roxy could not answer (any failure reason).", "count"),
         Column("p50_ms", "p50", "Median latency of requests to this host (queue wait included).", "ms"),
@@ -251,8 +256,9 @@ def _health(row: Mapping[str, Any], minutes: float) -> dict[str, Any]:
         "rate_failed_pct": _rate(int(row.get("failed") or 0), requests),
         "roblox_429": row.get("roblox_429"),
         "rate_429_pct": _rate(row.get("roblox_429"), calls),
-        "roblox_5xx": int(row.get("roblox_5xx") or 0),
-        "rate_5xx_pct": _rate(row.get("roblox_5xx"), requests),
+        # Roblox's 5xx answers per attempt (lead decision 11; unknown stays None, P6), per call like the 429 rate.
+        "roblox_5xx": row.get("roblox_5xx"),
+        "rate_5xx_pct": _rate(row.get("roblox_5xx"), calls),
         "timeouts": int(row.get("timeouts") or 0),
         "p50_ms": row.get("p50_ms"),
         "p95_ms": row.get("p95_ms"),
@@ -553,7 +559,11 @@ async def timeline_429(
 
 
 async def timeline_429_answer(ctx: Any, tr: TimeRange, *, top: int = 10, egress: str | None = None) -> dict[str, Any]:
-    """The answer of `GET /upstream/429-timeline` (series per endpoint, the comparison total and the totals)."""
+    """The answer of `GET /upstream/429-timeline` (series per endpoint, the comparison total and the totals).
+
+    The comparison is the earlier period's total over every endpoint (`roblox_429:total`), not one series per
+    endpoint: the top endpoints of the two periods differ. No main series has its key, so `static/js/charts.js`
+    draws it as a dashed line of its own over the stacked endpoints (finding docs_a-9)."""
     window = tr.window
     data = await ctx.dbs.metrics.read(
         lambda conn: read_upstream.roblox_429_timeline(conn, window, top=top, egress=egress)
@@ -880,7 +890,12 @@ async def reset_state(request: Request, admin: AdminSession, _csrf: CsrfChecked,
     now = int(ctx.clock.now())
     actor = common.actor_for(admin)
     request_id = common.request_id_of(request)
-    after = {"cooldowns_cleared": counts.get("cooldowns", 0), "breakers_cleared": counts.get("breakers", 0)}
+    after = {
+        "cooldowns_cleared": counts.get("cooldowns", 0),
+        "breakers_cleared": counts.get("breakers", 0),
+        # The cache's per-key 429 markers end with the cooldowns (finding pipe-5); the dialog promises exact counts.
+        "markers_cleared": counts.get("markers", 0),
+    }
     warnings: list[str] = []
     audit_id: int | None = None
     try:

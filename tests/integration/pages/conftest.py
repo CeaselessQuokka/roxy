@@ -5,7 +5,7 @@ What this is
     `__init__.py`):
       * `pages_app` (`PagesApp`): `create_app(env)` with its real lifespan over temporary databases (the root
         conftest's `env`, fake credentials and socket guard), a `FakeClock`, the fast password hasher and recorded
-        mail of `roxy.admin.auth.testing.auth_harness`, and Roblox played by `respx` with
+        mail of `auth_harness.auth_harness`, and Roblox played by `respx` with
         `pages_harness.roblox_answer` (`tests/pages_harness.py`: JSON with hostile names, a 429 on `/too-many`
         paths, a 503 on `/fail` paths). The settings are `testing.SEED_SETTINGS` (no tarpit, no rotator, no
         upstream queue waits). `await pages_app.seed_traffic()` sends the harness's `traffic_plan()` through the
@@ -48,7 +48,7 @@ import httpx
 import pytest
 
 import pages_harness as testing
-from roxy.admin.auth.testing import AuthHarness, TestAdmin, auth_harness
+from auth_harness import AuthHarness, TestAdmin, auth_harness
 from roxy.config.audit import Actor
 from roxy.config.settings_service import SettingsService
 from roxy.core.clock import FakeClock

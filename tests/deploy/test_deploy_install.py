@@ -141,6 +141,56 @@ def test_install_never_changes_a_directory_through_a_symlink(tmp_path: Path) -> 
     assert mode(victim) == 0o700
 
 
+def secure_fs(*args: str) -> subprocess.CompletedProcess[str]:
+    """The descriptor helper embedded in install-system.sh (`SECURE_FS`), run the way the script runs it."""
+    text = (DEPLOY / "install-system.sh").read_text(encoding="utf-8")
+    code = text.split("SECURE_FS='", 1)[1].split("\n'\n", 1)[0]
+    return subprocess.run(["python3", "-I", "-c", code, *args], capture_output=True, text=True, timeout=60, check=False)
+
+
+def test_the_descriptor_helper_sets_owner_and_mode_and_never_follows_a_link(tmp_path: Path) -> None:
+    """Finding sec-1: the helper behind `directory` and `file_once` changes modes and owners through descriptors.
+    On the server it runs as root with an owner; here with the test user's own name and group, which exercises the
+    same fchown call."""
+    import grp
+    import pwd
+
+    owner = f"{pwd.getpwuid(os.getuid()).pw_name}:{grp.getgrgid(os.getgid()).gr_name}"
+    base = tmp_path / "root"
+    base.mkdir()
+    made = secure_fs("dir", str(base), "/opt/roxy/releases", "0750", owner)
+    assert made.returncode == 0, made.stderr
+    assert mode(base / "opt" / "roxy" / "releases") == 0o750
+    source = tmp_path / "deploy.sh"
+    source.write_text("#!/bin/bash\n", encoding="utf-8")
+    placed = secure_fs("file-once", str(base), str(source), "/opt/roxy/deploy.sh", "0755", owner)
+    assert placed.returncode == 0, placed.stderr
+    assert mode(base / "opt" / "roxy" / "deploy.sh") == 0o755
+    assert (base / "opt" / "roxy" / "deploy.sh").read_text(encoding="utf-8") == "#!/bin/bash\n"
+    assert not [p.name for p in (base / "opt" / "roxy").iterdir() if ".install-" in p.name], "no temporary file"
+    # A link planted where a file is about to be created is kept as it is; root never writes through it.
+    victim = tmp_path / "shadow"
+    victim.write_text("root:x:0:0\n", encoding="utf-8")
+    victim.chmod(0o600)
+    (base / "opt" / "roxy" / "deploy_rollback.sh").symlink_to(victim)
+    kept = secure_fs("file-once", str(base), str(source), "/opt/roxy/deploy_rollback.sh", "0755", owner)
+    assert kept.returncode == 0, kept.stderr
+    assert "keeping the existing /opt/roxy/deploy_rollback.sh" in kept.stdout
+    assert victim.read_text(encoding="utf-8") == "root:x:0:0\n"
+    assert mode(victim) == 0o600
+    # A link in the middle of the path, inside a directory another account could change, is never followed.
+    (base / "opt" / "roxy" / "releases").rmdir()
+    (base / "opt" / "roxy" / "releases").symlink_to(tmp_path)
+    (base / "opt" / "roxy").chmod(0o777)  # writable by others: a link in it may not be trusted
+    try:
+        refused = secure_fs("dir", str(base), "/opt/roxy/releases/abc", "0755", owner)
+    finally:
+        (base / "opt" / "roxy").chmod(0o755)
+    assert refused.returncode == 1
+    assert "symlink" in refused.stderr
+    assert not (tmp_path / "abc").exists()
+
+
 # --------------------------------------------------------------------------------- beside Roxy v1 (cutover)
 
 

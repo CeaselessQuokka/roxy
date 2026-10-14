@@ -5,10 +5,11 @@
   It shows who acted, when, from where and why; the field diff (`GET /admin/api/v1/audit/{id}` `diff`); the two
   documents as a line diff; the card that manages the target (`manage`, a path on this site, through `local_href`);
   and, for a settings change, the revert form, which posts to the settings API (static/js/api_forms.js) and is
-  itself audited. Every value that came from data is plain text: targets, reasons and diff values through
-  `caller_text`, documents inside <code>.
+  itself audited; when the setting was changed again since (`now_value`, `settings.py changed_again`), the form says
+  first that the revert also undoes those later changes. Every value that came from data is plain text: targets,
+  reasons and diff values through `caller_text`, documents inside <code>.
   Context: `frame`, `entry`, `when`, `changes`, `diff_truncated`, `lines`, `docs_cut`, `has_docs`, `revert`,
-  `manage`, `secret_target`, `max_value_chars`, `log_url`.
+  `now_value`, `manage`, `secret_target`, `max_value_chars`, `log_url`.
 -#}
 {% from "components/icon.html" import icon %}
 {% from "components/format.html" import caller_text, local_href %}
@@ -74,6 +75,7 @@
     <form class="stack audit-revert" data-api-form data-api-url="{{ revert_href }}" data-api-method="POST"
           data-success="Reverted. The setting has the value it had before this change." data-on-success="refresh" data-refresh="log" novalidate>
       <ul class="dialog__consequences">
+        {% if now_value is defined and now_value is not none %}<li><strong>This setting was changed again after this change</strong> (it is now {{ caller_text(now_value or "empty", max_value_chars) }}). Reverting this one also undoes those later changes; to undo only a later one, revert that change instead.</li>{% endif %}
         <li>Puts the setting back to the value it had right before this change, on every worker within a second.</li>
         <li>The revert is itself a change: it is written to this log with your reason.</li>
       </ul>

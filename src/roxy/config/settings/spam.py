@@ -75,6 +75,8 @@ class _Detector:
     ban_max_minutes: int
     action_ban_risk: str = ""  # non-empty when `ban` is a dangerous action for this detector
     related: tuple[str, ...] = ()  # extra related settings outside the detector's own six keys
+    actions: tuple[str, ...] = ("ban", "strike", "tarpit", "recommend")
+    """The actions the detector can really take (the action setting offers these only; finding abuse-5)."""
 
 
 # Window text for detectors whose threshold is a COUNT: a longer window gives the same count more time to
@@ -361,11 +363,11 @@ _DETECTORS: tuple[_Detector, ...] = (
         ),
         ban_minutes=0,
         ban_max_minutes=0,
-        action_ban_risk=(
-            "Every IP in the group would be banned at once. Roblox game servers all send the same User-Agent, "
-            "so a popular game polling one endpoint could be cut off on all of its servers."
-        ),
         related=("user_agent_rules_enabled",),
+        # Its subject is many addresses sharing one User-Agent, and Roblox game servers share theirs: acting on the
+        # swarm would cut a popular game off on all of its servers, so it only recommends (`abuse/spam.py
+        # RECOMMEND_ONLY`, finding abuse-5).
+        actions=("recommend",),
     ),
 )
 
@@ -476,36 +478,45 @@ def _detector_settings(d: _Detector) -> list[SettingSpec]:
         label=f"{d.name} action",
         type=SettingType.ENUM,
         default=d.action_default,
-        options=(
-            OptionSpec(
-                "ban",
-                "Temporary IP ban",
-                f"Bans the client's IP for the first ban length; each repeat offense within {_REPEAT_WINDOW_DAYS} "
-                "days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have "
-                "banned'. Trusted Roblox game servers get a strike instead, and places are never banned.",
-            ),
-            OptionSpec(
-                "strike",
-                "Add a throttle strike",
-                "Refuses the offending requests and adds one throttle strike, so the client's next penalties "
-                "on the strike ladder are longer. Nobody is banned.",
-            ),
-            OptionSpec(
-                "tarpit",
-                "Hold the refusals",
-                "Refuses the offending requests after a deliberate delay (the tarpit), so a script that "
-                "retries at once is slowed to one attempt per hold. Nobody is banned; the hold uses the "
-                "settings on Protection > Tarpit.",
-            ),
-            OptionSpec(
-                "recommend",
-                "Recommend only",
-                f"Takes no action on traffic; instead {d.recommend_effect}",
-            ),
+        options=tuple(
+            option
+            for option in (
+                OptionSpec(
+                    "ban",
+                    "Temporary IP ban",
+                    f"Bans the client's IP for the first ban length; each repeat offense within {_REPEAT_WINDOW_DAYS} "
+                    "days doubles the ban, up to the ban cap. While dry run is on this only logs 'would have "
+                    "banned' (for every client). Once armed, trusted Roblox game servers get a strike instead, and "
+                    "places are never banned.",
+                ),
+                OptionSpec(
+                    "strike",
+                    "Add a throttle strike",
+                    "Refuses the offending requests and adds one throttle strike, so the client's next penalties "
+                    "on the strike ladder are longer. Nobody is banned.",
+                ),
+                OptionSpec(
+                    "tarpit",
+                    "Hold the refusals",
+                    "Refuses the offending requests after a deliberate delay (the tarpit), so a script that "
+                    "retries at once is slowed to one attempt per hold. Nobody is banned; the hold uses the "
+                    "settings on Protection > Tarpit.",
+                ),
+                OptionSpec(
+                    "recommend",
+                    "Recommend only",
+                    f"Takes no action on traffic; instead {d.recommend_effect}",
+                ),
+            )
+            if option.value in d.actions
         ),
         description=(
             f"What {d.rule_id} does when a client crosses its threshold. Whatever is chosen, detectors never "
             "ban places (place ids can be forged) and never auto-ban trusted Roblox game servers."
+            if len(d.actions) > 1
+            else f"What {d.rule_id} does when its threshold is crossed: it only recommends. Its subject is many "
+            "addresses sharing one User-Agent, and Roblox game servers share theirs, so no action on traffic is "
+            "offered (a ban, strike or hold would reach every server of a popular game)."
         ),
         risk=Risk.MEDIUM,
         high_risk_if=(RiskCondition(RiskOp.EQ, "ban", d.action_ban_risk),) if d.action_ban_risk else (),

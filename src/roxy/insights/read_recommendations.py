@@ -41,6 +41,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
+from roxy.insights.models import watch_verdict
+
+GUARD_ORDER: Final[dict[str, int]] = {
+    name: rank for rank, name in enumerate(("error_rate", "roblox_429_rate", "p95_ms", "refused_rate"))
+}
+"""The order the guard metrics of plan 11.4 are listed in (`actions.GUARD_METRICS`; a test pins the two)."""
+
 SEVERITY_RANK_SQL: Final = "CASE severity WHEN 'critical' THEN 2 WHEN 'warn' THEN 1 ELSE 0 END"
 """The severity order (`models.SEVERITIES`) as SQL, so "most severe first" sorts in the database."""
 
@@ -257,7 +264,11 @@ def watch_of(conn: sqlite3.Connection, rec_id: str) -> dict[str, Any] | None:
     open with nothing to do), `{"status": "done"}`, `{"status": "pending", "reason", "attempts"}` (it waits for the
     action lease or hot.db; the window stays open) or `{"status": "refused", "reason"}` (the change stays; the
     admin was alerted). `reason` is plain text that can name an endpoint template, which comes from callers'
-    paths: render it escaped, never as HTML."""
+    paths: render it escaped, never as HTML.
+
+    `verdict` is what the window found (`models.WATCH_VERDICTS`; a `kept` window is `within_bounds` only when no guard
+    number got worse, final review brain-4) and `worse` the guard numbers that got worse, `[{metric, before, after,
+    change_pct}]` (empty when none did), so a page never words a regression as "stayed within bounds"."""
     row = conn.execute(
         "SELECT recommendation_id, action_id, started_at, ends_at, state, baseline_json, result_json "
         "FROM recommendation_watches WHERE recommendation_id = ?",
@@ -266,6 +277,10 @@ def watch_of(conn: sqlite3.Connection, rec_id: str) -> dict[str, Any] | None:
     if row is None:
         return None
     state, result = str(row[4]), _decode(row[6])
+    rec_state: str | None = None
+    if state == "kept" and not (isinstance(result, dict) and isinstance(result.get("verdict"), str)):
+        found = conn.execute("SELECT state FROM recommendations WHERE id = ?", (rec_id,)).fetchone()
+        rec_state = None if found is None else str(found[0])  # a window closed before verdicts were recorded
     return {
         "action_id": None if row[1] is None else int(row[1]),
         "started_at": int(row[2]),
@@ -274,7 +289,30 @@ def watch_of(conn: sqlite3.Connection, rec_id: str) -> dict[str, Any] | None:
         "baseline": _decode(row[5]),
         "result": result,
         "rollback": _rollback_summary(state, result),
+        "verdict": watch_verdict(state, result, rec_state),
+        "worse": _worse_rows(result),
     }
+
+
+def _worse_rows(result: Any) -> list[dict[str, Any]]:
+    """The guard numbers a watch window found worse (`autoapply.worse`), one row per metric, in metric order."""
+    worse = result.get("worse") if isinstance(result, dict) else None
+    if not isinstance(worse, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for metric in sorted(worse, key=lambda name: (GUARD_ORDER.get(str(name), len(GUARD_ORDER)), str(name))):
+        item = worse[metric]
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "metric": str(metric),
+                "before": item.get("before"),
+                "after": item.get("after"),
+                "change_pct": item.get("change_pct"),
+            }
+        )
+    return rows
 
 
 def _rollback_summary(state: str, result: Any) -> dict[str, Any] | None:

@@ -28,7 +28,7 @@ import json
 import sqlite3
 from typing import Any, Final
 
-from roxy.cache.store import PurgeKind, PurgeScope, target_matches
+from roxy.cache.store import MARKER_PARAMS, MARKER_WHERE, PurgeKind, PurgeScope, target_matches
 
 MAX_SCAN: Final = 200_000
 """Rows a pattern or parameter preview reads at most (the disk tier is bounded by `cache_max_bytes`)."""
@@ -79,6 +79,8 @@ def purge_preview(conn: sqlite3.Connection, scope: PurgeScope, now_s: int) -> di
     if kind == PurgeKind.EXPIRED:
         column = "expires_at" if scope.include_stale else "stale_until"
         return _summary(conn, f"{column} <= ?", (int(now_s),))
+    if kind == PurgeKind.MARKERS:
+        return _summary(conn, MARKER_WHERE, MARKER_PARAMS)
     rows = bytes_ = scanned = 0
     oldest: int | None = None
     newest: int | None = None

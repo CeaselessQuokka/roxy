@@ -28,7 +28,8 @@ How it works
       `events.py`           audit log rows and security events for every auth event (plan 9.7)
       `deps.py`             `require_admin(scope)` and `require_csrf`, the FastAPI guards (DESIGN.md 11.7)
       `routes.py`           the HTTP endpoints and pages; `responses.py` the v1-shaped JSON answers
-      `testing.py`          helpers for tests (fast hasher, test users, a software passkey)
+    The test helpers (fast hasher, test users, a software passkey, the app harness) live in `tests/auth_harness.py`,
+    outside the package, so they never ship.
 
 What to read next
     `roxy/admin/auth/flow.py` (the login state machine), then `roxy/admin/auth/deps.py` (how every other admin

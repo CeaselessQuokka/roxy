@@ -99,11 +99,19 @@ MANAGE_PAGES: Final[dict[str, tuple[str, str]]] = {
     "access_list": ("/admin/protection#bypass", "Protection > Bypass and lists"),
     "bans": ("/admin/protection#bans", "Protection > Bans"),
     "credential": ("/admin/credential#status", "Credential > Status"),
+    "credential_status": ("/admin/credential#status", "Credential > Status"),
+    "credential_account": ("/admin/credential#status", "Credential > Status"),
     "rotator_url": ("/admin/egress#rotator", "Egress > Rotator"),
     "table": ("/admin/data#exports", "Data > Exports"),
-    "reset": ("/admin/data#resets", "Data > Resets"),
 }
 """Where each audit target kind is managed (page `/admin/<page>`, card anchor; DESIGN.md section 9 anchors)."""
+OPERATION_PAGES: Final[dict[str, tuple[str, str]]] = {
+    "reset_": ("/admin/data#resets", "Data > Resets"),
+    "backup_": ("/admin/data#backups", "Data > Backups"),
+    "vacuum_": ("/admin/data#vacuum", "Data > VACUUM"),
+}
+"""Data operations are audited as `operation:<kind>_<hex>` (a reset, Back up now, VACUUM): the page by the id's
+prefix (finding docs_b-1: their entries had no "Open ..." link)."""
 
 
 # ================================================================================================ diff
@@ -165,7 +173,11 @@ def manage_link(target: str | None) -> dict[str, str] | None:
         if key in catalog.CATALOG:
             return {"href": f"/admin/settings?key={key}", "label": f"Settings > {catalog.CATALOG[key].label}"}
         return {"href": "/admin/settings", "label": "Settings"}
-    page = MANAGE_PAGES.get(kind)
+    if kind == "operation":
+        operation = (target or "").split(":", 1)[1] if ":" in (target or "") else ""
+        page = next((found for prefix, found in OPERATION_PAGES.items() if operation.startswith(prefix)), None)
+    else:
+        page = MANAGE_PAGES.get(kind)
     return None if page is None else {"href": page[0], "label": page[1]}
 
 

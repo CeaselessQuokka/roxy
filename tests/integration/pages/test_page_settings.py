@@ -234,6 +234,25 @@ async def test_the_history_drawer_reverts_through_the_api_with_csrf_and_audit(pa
     assert "No settings change has that number" in missing.text
 
 
+async def test_only_a_change_changed_again_since_warns_that_its_revert_undoes_more(page: Any, pages_app: Any) -> None:
+    """Review finding docs_b-4: the drawer makes the service's own "changed again" check. The older change of a
+    setting changed twice says the revert also undoes the later change and names the value in force; the newest
+    change, and a change whose later edit put the same value back, say nothing of the kind."""
+    await pages_app.settings(alert_rate_limit_per_hour=30)
+    await pages_app.settings(alert_rate_limit_per_hour=40)
+    items = (await page.api("GET", "settings/history", params={"key": "alert_rate_limit_per_hour"})).json()["items"]
+    ids = sorted(int(item["id"]) for item in items)
+    older_doc = parse_html((await page.fragment("settings", "history", change=ids[0])).text)
+    newer = parse_html((await page.fragment("settings", "history", change=ids[-1])).text).text()
+    warning = next(li for li in older_doc.select(".dialog__consequences li") if "changed again" in li.text())
+    assert "This setting was changed again after this change (it is now" in warning.text()
+    assert warning.select_one(".caller-text").text() == "40"  # the value in force, as plain text
+    assert "changed again" not in newer
+    await pages_app.settings(alert_rate_limit_per_hour=30)  # back to what the first change wrote
+    again = parse_html((await page.fragment("settings", "history", change=ids[0])).text).text()
+    assert "changed again" not in again  # the same answer as the service: nothing later is lost now
+
+
 async def test_the_one_setting_view_lists_that_settings_own_history(page: Any, pages_app: Any, inert: Any) -> None:
     """Plan 15.2 "history per key": `?key=` lists the setting's newest changes as `GET /settings/{key}/history`."""
     empty = (await page.doc(PAGE, params={"key": "tarpit_max_seconds"})).select_one("[data-key-history]")

@@ -119,6 +119,7 @@
   <dl class="kv fp-drawer__facts">
     <dt>User-Agent</dt><dd>{{ caller_text(a.user_agent, 400, block=True) }}</dd>
     <dt>Requests that sent it</dt><dd>{{ num(a.count) }}</dd>
+    {% if a.ban_hash %}<dt>Ban hash</dt><dd><code>{{ a.ban_hash }}</code> <span class="muted">(the subject of a Protection &gt; Bans ban of type User-Agent hash; a User-Agent shown masked or cut at 400 characters names the stored text, not what the caller sent, so its hash refuses nobody)</span></dd>{% endif %}
     <dt>First seen</dt><dd>{{ when(d.first) }}</dd>
     <dt>Last seen</dt><dd>{{ when(d.last) }}</dd>
   </dl>

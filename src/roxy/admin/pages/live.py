@@ -70,6 +70,8 @@ SEED_ROWS: Final = 40
 FILTER_NAMES: Final[tuple[str, ...]] = ("outcome", "reason", "status", "egress", "cache", "client", "endpoint", "q")
 """The tail's filter fields (`components/live_tail.html`); the address may name them (plan 14.2). `reason` and `q`
 are v1's outcome filter of refusal kinds and its text search (parity row 81, review finding v1parity-3)."""
+SELECT_FILTERS: Final[frozenset[str]] = frozenset({"outcome", "reason", "status", "egress", "cache"})
+"""The filter fields that are selects: each holds exactly one value (the API also takes comma lists)."""
 REASON_CHOICES: Final[tuple[tuple[str, str], ...]] = tuple(
     (code.value, REASON_LABELS.get(code.value, code.value)) for code in ReasonCode if code.is_refusal or code.is_failure
 )
@@ -103,8 +105,23 @@ REQUEST_TEMPLATE: Final = "admin/pages/live/request.html"
 # ============================================================================================ helpers
 
 
+def select_value(name: str, value: str) -> str:
+    """One value of a select filter in the form the tail compares (`live_tail.js matches`): a status code without
+    leading zeros (`404`) or a lower-case class (`4xx`), an upper-case cache state (`HIT`); the rest as given."""
+    if name == "status":
+        return str(int(value)) if value.isdigit() else value.lower()
+    if name == "cache" and value.lower() != "n/a":
+        return value.upper()
+    return value
+
+
 def address_filters(view: PageView) -> tuple[dict[str, str], str | None]:
-    """The tail's filters named in the address, checked with the Live API's parser (bad ones dropped, said so)."""
+    """The tail's filters named in the address, checked with the Live API's parser (bad ones dropped, said so).
+
+    The API takes more than the tail's selects show: any status code (`404`), a cache state in lower case (`hit`)
+    and comma lists. A single value goes to the page script in the form the tail compares (`select_value`; the
+    script adds an option for a value the select lacks), so the list and the stream both apply it. A list cannot sit
+    in a select: it is left out and the notice says so (finding docs_a-16: both were dropped in silence)."""
     values = {name: view.param(name, max_chars=read_dashboard.MAX_FILTER_TEXT) for name in FILTER_NAMES}
     wanted = {name: value for name, value in values.items() if value}
     if not wanted:
@@ -114,7 +131,24 @@ def address_filters(view: PageView) -> tuple[dict[str, str], str | None]:
     except common.ApiError as error:
         bad = ", ".join(sorted(error.error_fields)) or "the filter"
         return {}, f"The live filter in the address was not valid ({bad}); every request is shown."
-    return wanted, None
+    applied: dict[str, str] = {}
+    left_out: list[str] = []
+    for name, value in wanted.items():
+        if name not in SELECT_FILTERS:
+            applied[name] = value
+            continue
+        items = [item.strip() for item in value.split(",") if item.strip()]
+        if len(items) == 1:
+            applied[name] = select_value(name, items[0])
+        elif items:
+            left_out.append(name)
+    if not left_out:
+        return applied, None
+    names = " and ".join(left_out)
+    return applied, (
+        f"The live filters hold one value each, so the list of values for {names} in the address was left out: "
+        f"every request is shown whatever its {names}."
+    )
 
 
 async def seed_after(view: PageView) -> int | None:

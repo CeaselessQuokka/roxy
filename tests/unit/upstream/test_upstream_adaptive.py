@@ -254,6 +254,41 @@ def test_should_increase_rules() -> None:
     limited = KeyStats(EP, attempts=1000, rejections=50, rate_limited=1)
     assert should_increase(limited, None, NOW_S, POLICY) is False
     assert should_increase(demand, NOW_S - window + 60, NOW_S, POLICY) is False  # changed less than 24 h ago
+    # A reset deleted 429 records less than a window ago: not known to be clean (final review data-1).
+    lost = KeyStats(EP, attempts=1000, rejections=50, evidence_lost_until_ms=int((NOW_S - 7200) * 1000))
+    assert should_increase(lost, None, NOW_S, POLICY) is False
+    old_loss = KeyStats(EP, attempts=1000, rejections=50, evidence_lost_until_ms=int((NOW_S - window - 60) * 1000))
+    assert should_increase(old_loss, None, NOW_S, POLICY) is True
+
+
+def test_reset_markers_say_when_429_evidence_was_lost(dbs: Any) -> None:
+    """Final review data-1: a statistics reset that deleted `metrics.upstream_429` (or did not say what it deleted)
+    hides the 429s of the probe window; one that left the 429 log alone, or whose deleted span ended before the
+    window, does not."""
+    from roxy.metrics.annotate import insert_annotation
+
+    since = NOW_S - POLICY.probe_after_h * 3600
+
+    def lost() -> float | None:
+        return dbs.metrics.read_sync(lambda conn: adaptive.reset_evidence_until(conn, since))
+
+    def mark(at: float, tables: list[str] | None, until: float | None = None) -> None:
+        dbs.metrics.write_sync(
+            lambda conn: insert_annotation(conn, int(at), "reset", "Data reset", None, until=until, tables=tables)
+        )
+
+    assert lost() is None
+    mark(NOW_S - 600, ["metrics.login_attempts"])  # another family: the 429 log was kept
+    mark(since - 3600, ["metrics.upstream_429"])  # before the window: nothing the window needs
+    mark(NOW_S - 90_000, ["metrics.upstream_429"], until=since - 60)  # a range that ended before the window
+    dbs.metrics.write_sync(
+        lambda conn: insert_annotation(conn, int(NOW_S - 300), "config_change", "Upstream state reset", None)
+    )
+    assert lost() is None
+    mark(NOW_S - 7200, ["metrics.upstream_429", "metrics.upstream_attempt_minute"])
+    assert lost() == NOW_S - 7200
+    mark(NOW_S - 90_000, None, until=NOW_S - 3600)  # a ranged reset that does not say what it deleted counts
+    assert lost() == NOW_S - 3600
 
 
 async def test_increase_job_reads_metrics_and_raises(dbs: Any) -> None:

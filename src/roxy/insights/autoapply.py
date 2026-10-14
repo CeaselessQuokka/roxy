@@ -28,7 +28,8 @@ How it works (the guardrails, plan 11.4)
       every worker).
     - A setting must have `auto_apply_bounds` in the catalog, stay inside them, and move at most
       `auto_apply_max_step_pct` percent per change; security, admin and credential settings are never touched.
-      Numeric rule values (a bucket's rate, a cache rule's TTL) obey the same step limit against their current value.
+      Numeric rule values (a bucket's rate, a cache rule's TTL) obey the same step limit against their current value;
+      a NEW cache rule's TTL against the lifetime its endpoint has today (`in_force_values`).
     - Never a ban of more than one address, never the credential allowlist, never a bypass entry, never the
       rotator quota.
     - Every apply starts a watch window of `auto_apply_watch_minutes` with a baseline of the same length before it;
@@ -63,6 +64,7 @@ from roxy.config import catalog
 from roxy.config.audit import Actor
 from roxy.config.spec import Group
 from roxy.core.clock import Clock
+from roxy.insights import simulate
 from roxy.insights.actions import (
     GUARD_METRICS,
     ActionError,
@@ -70,8 +72,16 @@ from roxy.insights.actions import (
     fenced,
     guard_metrics_sync,
 )
+from roxy.insights.context import InsightContext
 from roxy.insights.engine import InsightsEngine
-from roxy.insights.models import SCOPED_KINDS, Recommendation, changes_digest, severity_rank
+from roxy.insights.models import (
+    SCOPED_KINDS,
+    ProposedChange,
+    Recommendation,
+    changes_digest,
+    severity_rank,
+    watch_verdict,
+)
 from roxy.scheduler.leader import JobContext, LostLeadership
 from roxy.storage.db import SharedStateUnavailable
 
@@ -114,6 +124,44 @@ def _step_problem(current: Any, proposed: Any, max_step_pct: float, what: str) -
     return None if step <= max_step_pct else f"{what} moves {step:.0f}%, more than {max_step_pct:g}%"
 
 
+STEP_COLUMNS: Final = ("ttl", "limit", "period")
+"""Rule row columns whose value auto-apply moves at most `auto_apply_max_step_pct` per change (plan 11.4)."""
+
+InForce = Callable[[Recommendation, ProposedChange], Mapping[str, Any] | None]
+"""What a NEW rule row's `STEP_COLUMNS` replace for its endpoint today (`in_force_values`), or None when unknown."""
+
+
+def in_force_values(ctx: InsightContext, rec: Recommendation, change: ProposedChange) -> dict[str, Any] | None:
+    """The values a NEW `rules_cache` row's step-limited columns replace (final review brain-3): the lifetime the
+    cache gives its endpoint today, which is the covering rule's TTL or else `cache_ttl_seconds` (the cache rules'
+    own `effective_ttl`, the `current_ttl_s` a card's evidence shows), and 0 while the cache is switched off.
+
+    A new rule for an endpoint that is already cached changes that lifetime as much as an update of its own row
+    would, so it obeys the same step. The endpoint is the one the row's pattern names: the card's subject when the
+    pattern names it (`simulate.names_template`: the exact regex or the v1 glob of the template), else the template
+    an exact pattern spells. None for any other change, or a pattern that names no endpoint, so the guardrail
+    refuses it rather than judge no step at all (whether a row is scoped to one endpoint is `safe_auto`'s question)."""
+    if change.kind != "rule_upsert" or change.table != "rules_cache" or change.current is not None:
+        return None
+    proposed = change.proposed if isinstance(change.proposed, Mapping) else {}
+    match = change.match or {"pattern": proposed.get("pattern"), "type": proposed.get("type")}
+    pattern, kind = str(match.get("pattern") or ""), str(match.get("type") or "glob")
+    if simulate.names_template(pattern, kind, rec.subject):
+        template: str | None = rec.subject  # the card's own template, with its segment names
+    else:
+        template = simulate.template_of_match(match)
+    if template is None:
+        return None
+    methods = proposed.get("methods")
+    if isinstance(methods, str):
+        methods = [part.strip() for part in methods.split(",") if part.strip()]
+    method = str(next(iter(methods or ()), "GET")).upper()
+    if not int(ctx.setting("cache_enabled")):
+        return {"ttl": 0}
+    covering = ctx.cache_rule_for(template, method)
+    return {"ttl": int(covering.ttl) if covering is not None else int(ctx.setting("cache_ttl_seconds"))}
+
+
 def guardrail_problem(
     rec: Recommendation,
     settings: Mapping[str, Any],
@@ -121,12 +169,15 @@ def guardrail_problem(
     rule_allows: bool = True,
     rule_enabled: bool = True,
     now: float | None = None,
+    in_force: InForce | None = None,
 ) -> str | None:
     """Why `rec` may not be auto-applied, or None when every guardrail holds (module docstring).
 
     `rule_allows` is the rule class's `safe_auto`, `rule_enabled` its live `insight_<rule>_enabled` switch; with
-    `now`, a card no evaluation refreshed within `FRESH_EVALUATIONS` intervals is refused as stale. The live-value
-    check (has an admin changed the row since?) needs the stores and runs inside the apply."""
+    `now`, a card no evaluation refreshed within `FRESH_EVALUATIONS` intervals is refused as stale. `in_force`
+    names what a NEW rule row's step-limited columns replace (`in_force_values`); without it, or when it cannot
+    tell, such a row is refused. The live-value check (has an admin changed the row since?) needs the stores and
+    runs inside the apply."""
     if not rule_enabled:
         return "its rule is switched off (insight_<rule>_enabled is 0)"
     if not rule_allows or not rec.safe_auto:
@@ -176,14 +227,22 @@ def guardrail_problem(
             )
             if problem:
                 return problem
-        if (
-            change.kind == "rule_upsert"
-            and isinstance(change.current, Mapping)
-            and isinstance(change.proposed, Mapping)
-        ):
-            for column in ("ttl", "limit", "period"):
-                if column in change.proposed and change.current.get(column) is not None:
-                    problem = _step_problem(change.current[column], change.proposed[column], max_step, column)
+        if change.kind == "rule_upsert" and isinstance(change.proposed, Mapping):
+            stepped = [column for column in STEP_COLUMNS if column in change.proposed]
+            if isinstance(change.current, Mapping):
+                baseline: Mapping[str, Any] | None = change.current
+            elif stepped:
+                # A new row (`current` None) still moves a value already in force for its endpoint: the step is
+                # measured from that value, never skipped (final review brain-3: a new cache rule took an
+                # endpoint from 120 s to 3,600 s unattended while the same move on an existing row was refused).
+                baseline = in_force(rec, change) if in_force is not None else None
+                if baseline is None:
+                    return f"a new {change.table} row's {stepped[0]} cannot be compared with the value in force"
+            else:
+                baseline = None
+            for column in stepped:
+                if baseline is not None and baseline.get(column) is not None:
+                    problem = _step_problem(baseline[column], change.proposed[column], max_step, column)
                     if problem:
                         return problem
     return None
@@ -217,11 +276,19 @@ class AutoApplier:
         actions: RecommendationActions,
         notifier: Any = None,
         clock: Clock | None = None,
+        site_origin: str | None = None,
     ) -> None:
         self.engine = engine
         self.actions = actions
         self.notifier = notifier
         self.clock = clock or engine.clock
+        self.site_origin = site_origin  # None: the notifier's (`ROXY_SITE_ORIGIN`)
+
+    def _card_link(self, rec: Recommendation) -> str:
+        """The recommendation's own card as a link a mail client can open (plan 17.7: `<ROXY_SITE_ORIGIN>/admin/
+        recommendations/<id>`; final review brain-13). `/admin/recommendations/<id>` redirects to the open card."""
+        origin = getattr(self, "site_origin", None) or getattr(self.notifier, "site_origin", "") or ""
+        return f"{str(origin).rstrip('/')}/admin/recommendations/{rec.id}"
 
     def _settings(self) -> Mapping[str, Any]:
         return self.engine.context().settings
@@ -244,10 +311,11 @@ class AutoApplier:
 
         `job` is the leader job's context: the pass claims its idempotency key first and every apply is fenced
         (module docstring "Leadership"); a deposed leader gets `LostLeadership` before it writes anything."""
-        settings = self._settings()
+        when = float(self.clock.now() if now is None else now)
+        ctx = self.engine.context(when)  # this pass's settings and rules snapshots (the values in force)
+        settings = ctx.settings
         if not int(settings["insights_enabled"]) or not int(settings["insights_auto_apply"]):
             return {"skipped": "auto_apply_off"}
-        when = float(self.clock.now() if now is None else now)
         bucket: int | None = None
         if job is not None and fenced(job):
             # Plan 5.6: auto-apply is a non-idempotent job; claimed only once it will really act (a pass while the
@@ -269,6 +337,7 @@ class AutoApplier:
                 rule_allows=bool(rule is not None and rule.safe_auto),
                 rule_enabled=self._rule_enabled(rec, settings),
                 now=when,
+                in_force=lambda card, change: in_force_values(ctx, card, change),
             )
             if problem is not None:
                 refused[rec.id] = problem
@@ -300,7 +369,8 @@ class AutoApplier:
 
         Returns the recommendation ids per outcome: `kept`, `rolled_back`, `rollback_refused` (refused for good,
         window closed, admin alerted) and `rollback_pending` (the rollback waits for the action lease or hot.db;
-        the window stays open and the next pass tries again)."""
+        the window stays open and the next pass tries again). A window closed as kept records its `verdict`
+        (`models.WATCH_VERDICTS`): `within_bounds` only when no guard number got worse."""
         settings = self._settings()
         when = float(self.clock.now() if now is None else now)
         threshold = float(settings["auto_apply_rollback_threshold_pct"])
@@ -323,6 +393,10 @@ class AutoApplier:
             rec = await self.engine.get(rec_id)
             result: dict[str, Any] = {"baseline": baseline, "after": after, "worse": regressions}
             if not (regressions and rec is not None and rec.state == "auto_applied"):
+                # Plan 11.4 rolls back only auto-applied changes, so a change applied by hand is kept even when a
+                # guard number got worse; the verdict says which it was, so no page reads a regression as "stayed
+                # within bounds" (final review brain-4).
+                result["verdict"] = watch_verdict("kept", result, rec.state if rec is not None else None)
                 await self._close(rec_id, result, job)
                 report["kept"].append(rec_id)
                 continue
@@ -336,7 +410,7 @@ class AutoApplier:
                 await self._mark_pending(rec_id, result, job)
                 report["rollback_pending"].append(rec_id)
             else:
-                result.update(rollback_refused=message)
+                result.update(rollback_refused=message, verdict="worse_rollback_refused")
                 if await self._close(rec_id, result, job):  # only the pass that closed the window alerts
                     self._notify_refused(rec, regressions, message)
                 report["rollback_refused"].append(rec_id)
@@ -400,7 +474,7 @@ class AutoApplier:
                 ROLLBACK_ALERT,
                 summary=f"An auto-applied change ({rec.title}) made a guard metric worse and was rolled back.",
                 fields={"Recommendation": rec.id, "Rule": rec.rule_id, "Worse": ", ".join(sorted(regressions))},
-                link="/admin/recommendations",
+                link=self._card_link(rec),
                 rec_id=rec.id,
             )
             self.notifier.notify(alert)
@@ -426,7 +500,7 @@ class AutoApplier:
                     "Worse": ", ".join(sorted(regressions)),
                     "Rollback": "refused",
                 },
-                link="/admin/recommendations",
+                link=self._card_link(rec),
                 severity="critical",
                 rec_id=rec.id,
             )
@@ -465,5 +539,6 @@ __all__ = [
     "ROLLBACK_FAILED_ALERT",
     "AutoApplier",
     "guardrail_problem",
+    "in_force_values",
     "worse",
 ]

@@ -81,6 +81,7 @@ from typing import Any, Final, Protocol
 
 from roxy.core.reasons import Egress
 from roxy.storage.db import Database
+from roxy.upstream.pacing import pacing_template
 
 GLOBAL_KEY: Final = "global"
 CREDENTIAL_PROBE_KEY: Final = "egress:credential:probe"
@@ -141,7 +142,9 @@ def host_bucket_key(host: str) -> str:
 
 
 def endpoint_bucket_key(template: str) -> str:
-    return f"endpoint:{template}"
+    """`endpoint:<template>` with the template in its pacing form: one bucket per Roblox endpoint, whatever letter
+    case a caller used (`upstream/pacing.py`, review finding pipe-2)."""
+    return f"endpoint:{pacing_template(template)}"
 
 
 def is_windowed(key: str) -> bool:
@@ -388,17 +391,33 @@ class LimitPair:
     burst: int
 
 
+CREDENTIAL_PROBE_BURST: Final = 1
+"""The probe sub-bucket's burst: its share of `credential_bucket_burst`. One credential probe runs at a time
+fleet-wide anyway (the credential manager's probe lease), so one is all it needs (review finding constraints-6)."""
+
+
 @dataclass(frozen=True, slots=True)
 class BucketDefaults:
-    """Every default rate of plan 7.3 / 15.3 B and C, read once per request from the runtime settings."""
+    """Every default rate of plan 7.3 / 15.3 B and C, read once per request from the runtime settings.
+
+    The account's limits are split between two buckets that together never exceed them: the reserved probe
+    sub-bucket gets `credential_probe_reserved_per_min` and a burst of `CREDENTIAL_PROBE_BURST`, allowlisted traffic
+    the rest of `credential_bucket_per_min` and of `credential_bucket_burst` (plan 7.3: the probe share is part of
+    the account's bucket; finding constraints-6: both bursts used to be the whole setting, so 5 account calls could
+    leave back to back where the setting allows 3). With a burst of 1 there is nothing to split: a probe then also
+    takes a slot in the traffic bucket (`credential_probe_shares_burst`), so the account never sends two calls
+    back to back.
+    """
 
     global_: LimitPair
     direct: LimitPair
     rotator: LimitPair
-    credential: LimitPair  # allowlisted credential traffic: the account's rate minus the probe reservation
+    credential: LimitPair  # allowlisted credential traffic: the account's rate and burst minus the probe share
     credential_probe: LimitPair  # the reserved probe sub-bucket
     host: LimitPair
     endpoint: LimitPair
+    credential_probe_shares_burst: bool = False
+    """True when `credential_bucket_burst` is 1: a probe takes a slot in both credential buckets."""
 
     @classmethod
     def from_settings(cls, settings: Any) -> BucketDefaults:
@@ -407,16 +426,17 @@ class BucketDefaults:
 
         account = float(settings.get("credential_bucket_per_min"))
         reserved = float(settings.get("credential_probe_reserved_per_min"))
-        burst = int(settings.get("credential_bucket_burst"))
+        burst = max(1, int(settings.get("credential_bucket_burst")))
         # The catalog cross rule keeps reserved < account; max() keeps both buckets valid even if it did not.
         return cls(
             global_=pair("global_bucket_per_min", "global_bucket_burst"),
             direct=pair("direct_bucket_per_min", "direct_bucket_burst"),
             rotator=pair("rotator_bucket_per_min", "rotator_bucket_burst"),
-            credential=LimitPair(max(1.0, account - reserved), burst),
-            credential_probe=LimitPair(max(1.0, reserved), max(1, min(burst, int(reserved)))),
+            credential=LimitPair(max(1.0, account - reserved), max(1, burst - CREDENTIAL_PROBE_BURST)),
+            credential_probe=LimitPair(max(1.0, reserved), CREDENTIAL_PROBE_BURST),
             host=pair("host_bucket_default_per_min", "host_bucket_default_burst"),
             endpoint=pair("endpoint_bucket_default_per_min", "endpoint_bucket_default_burst"),
+            credential_probe_shares_burst=burst <= CREDENTIAL_PROBE_BURST,
         )
 
 
@@ -426,8 +446,20 @@ class LimitsLookup(Protocol):
     def upstream_limit(self, bucket_key: str) -> Any: ...
 
 
-def _override(limits: LimitsLookup | None, key: str, default: LimitPair) -> LimitPair:
-    row = limits.upstream_limit(key) if limits is not None else None
+def endpoint_limit_row(limits: LimitsLookup | None, template: str) -> Any:
+    """The `upstream_limits` row of an endpoint bucket: under its pacing key, else (a row an admin typed with the
+    caller's letter case before keys were folded) under the template exactly as given. None when neither exists."""
+    if limits is None:
+        return None
+    key = endpoint_bucket_key(template)
+    row = limits.upstream_limit(key)
+    exact = f"endpoint:{template}"
+    if row is None and exact != key:
+        row = limits.upstream_limit(exact)
+    return row
+
+
+def _pair_of(row: Any, default: LimitPair) -> LimitPair:
     if row is None:
         return default
     per_min = float(getattr(row, "per_min", 0) or 0)
@@ -435,6 +467,10 @@ def _override(limits: LimitsLookup | None, key: str, default: LimitPair) -> Limi
     if per_min <= 0 or burst < 1:
         return default  # a zero row would divide by zero; the model forbids it, this is belt and braces
     return LimitPair(per_min, burst)
+
+
+def _override(limits: LimitsLookup | None, key: str, default: LimitPair) -> LimitPair:
+    return _pair_of(limits.upstream_limit(key) if limits is not None else None, default)
 
 
 def specs_for(
@@ -449,7 +485,9 @@ def specs_for(
     """The buckets one call through `egress` to `template` on `host` must take a slot in (plan 7.3 table).
 
     `credential_probe=True` (Roxy's own credential probes) uses the reserved sub-bucket instead of the shared
-    credential bucket, so probes never queue behind allowlisted traffic and traffic never starves probes.
+    credential bucket, so probes never queue behind allowlisted traffic and traffic never starves probes. The two
+    buckets split the account's burst (`BucketDefaults`); only with a burst of 1, where nothing can be split, does a
+    probe also take a slot in the traffic bucket (appended last: the egress bucket stays the second spec).
     """
     if egress is Egress.DIRECT:
         egress_pair = defaults.direct
@@ -460,13 +498,17 @@ def specs_for(
     else:
         raise ValueError("no buckets for egress 'none'")
     host_pair = _override(limits, host_bucket_key(host), defaults.host)
-    endpoint_pair = _override(limits, endpoint_bucket_key(template), defaults.endpoint)
-    return (
+    endpoint_pair = _pair_of(endpoint_limit_row(limits, template), defaults.endpoint)
+    specs = [
         BucketSpec(GLOBAL_KEY, defaults.global_.per_min, defaults.global_.burst),
         BucketSpec(egress_bucket_key(egress, probe=credential_probe), egress_pair.per_min, egress_pair.burst),
         BucketSpec(host_bucket_key(host), host_pair.per_min, host_pair.burst),
         BucketSpec(endpoint_bucket_key(template), endpoint_pair.per_min, endpoint_pair.burst),
-    )
+    ]
+    if egress is Egress.CREDENTIAL and credential_probe and defaults.credential_probe_shares_burst:
+        shared = defaults.credential
+        specs.append(BucketSpec(egress_bucket_key(Egress.CREDENTIAL), shared.per_min, shared.burst))
+    return tuple(specs)
 
 
 # --- reservations in one transaction ---------------------------------------------------------------------------------
@@ -745,6 +787,7 @@ def bucket_states(conn: sqlite3.Connection, now_ms: int, limit: int = 500) -> li
 
 __all__ = [
     "BACKGROUND_GLOBAL_LIMIT",
+    "CREDENTIAL_PROBE_BURST",
     "CREDENTIAL_PROBE_KEY",
     "GLOBAL_KEY",
     "METER_PREFIX",
@@ -767,6 +810,7 @@ __all__ = [
     "earliest_slot_ms",
     "egress_bucket_key",
     "endpoint_bucket_key",
+    "endpoint_limit_row",
     "gcra_advance_ms",
     "gcra_earliest_ms",
     "gcra_fill",

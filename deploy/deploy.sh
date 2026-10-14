@@ -21,8 +21,8 @@
 #      /opt/roxy/python, never the system Python), and the content-hashed static files nginx serves.
 #   3. Migrations: the expand migrations and the pre-migration snapshot of control.db run as the roxy user in
 #      the idle color's pre-start step (deploy/prestart.py explains why the deploy user cannot run them itself).
-#   4. Point current-<idle> at the release and restart roxy@<idle>. Below 700 MB of available memory (DESIGN.md
-#      section 0) the idle color starts with one worker (low-memory mode).
+#   4. Point current-<idle> at the release and restart roxy@<idle>. Below 700 MB of available memory (CHANGES.md,
+#      "Memory sizing for the 1 GB server") the idle color starts with one worker (low-memory mode).
 #   5. Health gate: the idle color's internal socket must report Ready, PersistenceOK and Version=<sha> within
 #      60 s, then scripts/smoke_remote.py checks the public pages on its port.
 #   6. Install the nginx config through the root wrapper if it changed, then switch nginx to the idle color.
@@ -37,6 +37,11 @@
 #      was started by hand), record the commit in /var/lib/roxy-deploy/deployed_version (roxy-audit.path then runs
 #      the permission audit) and install this release's deploy scripts as the new /opt/roxy/deploy.sh. A rollback
 #      puts back the audit record its release was deployed with.
+#   `--build-only <sha>` runs steps 1 and 2 and stops: the release is fetched and built (a few minutes) while the
+#   site keeps serving, so a later deploy of the same commit skips both ("is already built"). MIGRATION.md uses it
+#   to keep the venv build out of the cutover window. It starts, switches and records nothing.
+#   A first deploy that failed after its switch leaves nginx's link on a color that no longer runs; the next run
+#   treats that as "no active color yet" and starts blue again (live_color).
 #   Safety: `set -Eeuo pipefail`; an ERR trap (inherited by functions and subshells through -E) records the
 #   failing command, and an EXIT trap runs the rollback for ANY non-zero exit, including `set -u` errors and
 #   signals, which an ERR trap alone misses (v1 bug: a failing command inside a function skipped its trap). The
@@ -159,6 +164,7 @@ die() {
 usage() {
   cat <<'EOF'
 usage: deploy.sh [--low-memory | --no-low-memory] [--force-nginx] <40 character commit sha>
+       deploy.sh --build-only <40 character commit sha>      (steps 1 and 2 only: fetch and build, start nothing)
        deploy.sh --rollback [<sha of an existing release>]   (what deploy_rollback.sh runs)
 EOF
 }
@@ -311,6 +317,15 @@ handle_failure() {
   HANDLED=1
   trap - ERR
   set +e
+  if [ "$MODE" = build ]; then
+    # A build-only run started nothing and switched nothing: remove a half-built release and say so. No deploy
+    # record and no alert, since the live site was never touched.
+    if [ "$BUILT_NEW" = 1 ] && [ -n "$RELEASE" ] && [ ! -e "$RELEASE/$RELEASE_STAMP" ]; then
+      rm -rf "$RELEASE"
+    fi
+    fail "Build-only run failed (exit $code) at step $STEP${LAST_ERROR:+: ${LAST_ERROR%.}}; nothing was started or switched."
+    return 0
+  fi
   fail "Deploy failed (exit $code) at step $STEP${LAST_ERROR:+: ${LAST_ERROR%.}}. Rolling back."
   if [ "$COMMITTED" = 1 ]; then
     detail="the new color stays live (the old color was already stopped)"
@@ -382,7 +397,15 @@ parse_args() {
       --low-memory) LOW_MEMORY=on ;;
       --no-low-memory) LOW_MEMORY=off ;;
       --force-nginx) FORCE_NGINX=1 ;;
-      --rollback) MODE=rollback ;;
+      --rollback | --build-only)
+        local wanted=rollback
+        [ "$1" = --rollback ] || wanted=build
+        if [ "$MODE" != deploy ] && [ "$MODE" != "$wanted" ]; then
+          usage >&2
+          exit 2
+        fi
+        MODE="$wanted"
+        ;;
       -h | --help)
         usage
         exit 0
@@ -401,7 +424,7 @@ parse_args() {
     esac
     shift
   done
-  if [ "$MODE" = deploy ] && [ -z "$SHA" ]; then
+  if [ "$MODE" != rollback ] && [ -z "$SHA" ]; then
     usage >&2
     exit 2
   fi
@@ -517,8 +540,27 @@ build_release() {
   mark_release_used
 }
 
+# The color that serves: the one nginx points at, or nothing before the first deploy. A link to a color that is not
+# running and has no release link is what a FAILED first deploy leaves (finding ops-7): its switch created the link
+# (roxy-nginx-apply --initial-color; the installed site includes the file, so it cannot just be removed), then the
+# rollback stopped the color and removed current-<color>, with no earlier color to switch back to. Nothing serves
+# then, so it counts as no active color: the retry starts blue again, as MIGRATION.md expects, instead of reading
+# blue as live and deploying green.
+live_color() {
+  local color
+  color="$(active_color)"
+  if [ -n "$color" ] && [ ! -L "$RELEASES_DIR/current-$color" ] && ! is_active "$color"; then
+    color=""
+  fi
+  printf '%s' "$color"
+}
+
 choose_colors() {
-  ACTIVE_COLOR="$(active_color)"
+  ACTIVE_COLOR="$(live_color)"
+  if [ -z "$ACTIVE_COLOR" ] && [ -n "$(active_color)" ]; then
+    log "nginx points at $(active_color), but $(unit "$(active_color)") is not running and has no release (a first" \
+      "deploy that failed after its switch); treating this as the first deploy."
+  fi
   if [ -z "$ACTIVE_COLOR" ]; then
     IDLE_COLOR=blue
     log "No active color yet: this is the first deploy; starting blue."
@@ -885,7 +927,17 @@ main() {
   trap on_exit EXIT
   trap 'LAST_ERROR="interrupted by a signal"; exit 130' INT TERM HUP
 
-  if [ "$MODE" = rollback ]; then
+  if [ "$MODE" = build ]; then
+    # Steps 1 and 2 only, ahead of a deploy (MIGRATION.md builds the cutover release before v1 stops): no sudo, no
+    # color, no nginx, no record. The deploy of the same commit then finds it built ("is already built") and
+    # skips the fetch and the environment build.
+    log "Build-only run of $SHA started: fetch and build; nothing is started or switched."
+    fetch_release
+    build_release
+    log "Release ${SHA:0:12} is built; deploy it with: $ROXY_ROOT/deploy.sh $SHA"
+    log "Done."
+    return 0
+  elif [ "$MODE" = rollback ]; then
     log "Rollback started."
     choose_colors
     rollback_target
@@ -909,7 +961,7 @@ main() {
 # The idle color name for the step 3 log line, before choose_colors has run.
 active_color_or_first() {
   local active
-  active="$(active_color)"
+  active="$(live_color)"
   if [ -z "$active" ]; then echo blue; else other_color "$active"; fi
 }
 

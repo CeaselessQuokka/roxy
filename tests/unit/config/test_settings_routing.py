@@ -459,9 +459,16 @@ def test_v1_names_and_defaults(key: str, expected: tuple[str | None, Any]) -> No
     assert (spec.renamed_from, spec.v1_default) == expected
 
 
-def test_only_the_session_template_is_pending_owner_verification() -> None:
+def test_the_owner_filled_settings_are_pending_owner_verification() -> None:
+    """The session template (plan 15.3 A) and the two D12 placeholders the owner fills in from the DataImpulse plan
+    (plan 0.3: "Owner fills in rotator_quota_gb_per_month and rotator_price_per_gb_usd. Placeholders: 0"; review
+    finding docs_c-7)."""
     pending = {spec.key for spec in routing.SETTINGS if spec.pending_owner_verification}
-    assert pending == {"rotator_session_username_template"}
+    assert pending == {"rotator_session_username_template", "rotator_quota_gb_per_month", "rotator_price_per_gb_usd"}
+    for key in ("rotator_quota_gb_per_month", "rotator_price_per_gb_usd"):
+        spec = _by_key()[key]
+        assert spec.default == 0
+        assert spec.notes.startswith("PENDING owner verification"), spec.notes
 
 
 def test_auto_apply_bounds_are_inside_the_range_and_never_on_security_settings() -> None:

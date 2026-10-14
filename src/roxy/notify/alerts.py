@@ -87,6 +87,9 @@ class AlertSpec:
     cooldown_setting: str | None = None
     always_send: bool = False
     runbook: str = ""
+    page: str = ""
+    """The dashboard path an alert of this type links when its producer passes no link (plan 17.7 "Where"); the
+    notifier turns a path into an absolute link with `ROXY_SITE_ORIGIN` (final review brain-13)."""
 
 
 ALERT_SPECS: dict[str, AlertSpec] = {
@@ -109,6 +112,7 @@ ALERT_SPECS: dict[str, AlertSpec] = {
             300,
             cooldown_setting="error_email_cooldown",
             runbook="all-upstream-unavailable",
+            page="/admin/upstream",  # where every egress path's state shows (its producer passes no link)
         ),
         AlertSpec(
             "credential_rejected",
@@ -163,6 +167,18 @@ ALERT_SPECS: dict[str, AlertSpec] = {
             runbook="deploy-failed",
         ),
         AlertSpec(
+            # Plan 13.2 H-ALERTS: "Send test alert" on Settings > Alerts posts one real low-severity message, only
+            # when clicked (`admin/api/system.py send_test_alert`): the one way to check a webhook provider that
+            # cannot be tested without posting. One a minute (its cooldown) and within the hourly cap; the route sends
+            # it at the lowest severity `alert_min_severity` lets through.
+            "test_alert",
+            "Roxy: test alert",
+            "info",
+            "test_alert",
+            60,
+            page="/admin/settings#alerts",
+        ),
+        AlertSpec(
             "leak_guard",
             "Roxy SECURITY: credential leak blocked",
             "critical",
@@ -176,11 +192,14 @@ ALERT_SPECS: dict[str, AlertSpec] = {
         ),
         AlertSpec("caller_5xx", "Roxy: caller errors at {rate}%", "warn", "caller_5xx", 1800, runbook="caller-5xx"),
         AlertSpec(
+            # The producer (`egress/rotator.py _check_budget_alerts`) passes its own key and cooldown, matching
+            # these: one alert per threshold and billing cycle, kept 40 days so a long month never repeats one;
+            # it raises critical from 95% (warn below; finding brain-6).
             "rotator_quota",
             "Roxy: rotator at {pct}% of monthly quota",
             "warn",
-            "quota:{pct}",
-            31 * DAY_S,
+            "quota:{pct}:{cycle_start}",
+            40 * DAY_S,
             runbook="rotator-quota",
         ),
         AlertSpec("disk", "Roxy: storage at {pct}% of budget", "warn", "disk", 6 * HOUR_S, runbook="disk"),
@@ -259,7 +278,8 @@ def make_alert(
     body: str | None = None,
     **params: Any,
 ) -> Alert:
-    """An `Alert` of a catalog type. `params` fill the subject and cooldown key templates."""
+    """An `Alert` of a catalog type. `params` fill the subject and cooldown key templates. Without `link` the
+    spec's `page` (a dashboard path) is the link; the notifier makes a path absolute with `ROXY_SITE_ORIGIN`."""
     spec = ALERT_SPECS.get(alert_type)
     if spec is None:
         raise KeyError(f"unknown alert type {alert_type!r}")
@@ -275,7 +295,7 @@ def make_alert(
         fields=dict(fields or {}),
         cooldown_key=_fill(spec.cooldown_key, clean)[:200] if spec.cooldown_key else None,
         cooldown_s=spec.cooldown_s,
-        link=link,
+        link=link or spec.page or None,
         always_send=spec.always_send,
         channels=spec.channels,
         body=body,

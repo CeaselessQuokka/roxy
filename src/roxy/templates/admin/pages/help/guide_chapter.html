@@ -1,0 +1,79 @@
+{#-
+  The admin guide, one chapter at a time (`roxy/admin/pages/help.py render_guide_page`): `/admin/help/guide` shows the
+  guide's introduction, its contents and its first chapter ("Getting started"); `/admin/help/guide/<chapter>` one
+  `##` chapter of docs/ADMIN_GUIDE.md.
+
+  The shell's h1 is the guide's title (its own h1 was taken out, one h1 per page); each chapter keeps its `##` heading
+  and its id, so `/admin/help/guide/<chapter>#<section>` lands on a section. The contents list links every chapter and
+  lists the sections of the one shown. The bodies were rendered by `roxy.public.pages.render_guide` with raw HTML
+  escaped and cut by `_help_docs.cut_guide`, which pointed in-guide links at the chapter holding their target: they are
+  Markup built by our renderer, never data marked safe. Every href here is a constant or a chapter's heading anchor
+  (letters, digits and hyphens).
+  Context: everything base.html takes, plus `book` (GuideBook), `chapter` (GuideChapter or None), `intro` (Markup on
+  the first page, else None), `previous`, `next`, `tab_title`, `spec`, `documents`.
+-#}
+{% extends "admin/base.html" %}
+{% from "components/icon.html" import icon %}
+
+{% block title %}{{ tab_title }}{% endblock %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="/admin/help">{{ icon("chevron-left") }}<span>Help</span></a>
+{% endblock %}
+
+{% block content %}
+<div class="doc-layout" data-doc="{{ spec.slug }}"{% if chapter %} data-guide-chapter="{{ chapter.slug }}"{% endif %}>
+  {% if book.chapters %}
+  <details class="doc-toc card" data-doc-toc open>
+    <summary class="doc-toc__summary">{{ icon("book") }}<span>Contents ({{ book.chapters|length }} chapters)</span>{{ icon("chevron-down", cls="doc-toc__chevron") }}</summary>
+    <nav class="doc-toc__nav" aria-label="Chapters of {{ book.title }}">
+      <ol class="doc-toc__list">
+        {% for item in book.chapters %}
+        {% if chapter and item.slug == chapter.slug %}
+        <li><a href="#{{ item.slug }}" aria-current="page"><strong>{{ item.title }}</strong></a>
+          {% if item.sections %}
+          <ol class="doc-toc__list" aria-label="Sections of {{ item.title }}">
+            {% for entry in item.sections %}<li><a href="#{{ entry.anchor }}">{{ entry.title }}</a></li>{% endfor %}
+          </ol>
+          {% endif %}
+        </li>
+        {% else %}
+        <li><a href="{{ item.href }}">{{ item.title }}</a></li>
+        {% endif %}
+        {% endfor %}
+      </ol>
+    </nav>
+  </details>
+  {% endif %}
+  <article class="doc prose card" aria-label="{{ chapter.title if chapter and not intro else book.title }}">
+    {% if intro %}
+    {{ intro }}
+    {% if book.chapters %}
+    <nav aria-labelledby="guide-contents">
+      <div class="heading heading-h2"><h2 id="guide-contents">Contents</h2></div>
+      <ol class="help-toc">{# help.css: a numbered list whose links keep the 24 px target (44 px on a phone) #}
+        {% for item in book.chapters %}<li><a href="{{ item.href }}">{{ item.title }}</a></li>{% endfor %}
+      </ol>
+    </nav>
+    {% endif %}
+    {% endif %}
+    {% if chapter %}{{ chapter.html }}{% endif %}
+  </article>
+  {% if previous or next %}
+  <nav class="doc-more card" aria-labelledby="guide-pager-title">
+    <h2 class="doc-more__title" id="guide-pager-title">Keep reading</h2>
+    <ul class="doc-more__list">
+      {% if previous %}<li><a href="{{ previous.href }}" rel="prev">{{ icon("chevron-left") }}<span>Previous: {{ previous.title }}</span></a></li>{% endif %}
+      {% if next %}<li><a href="{{ next.href }}" rel="next"><span>Next: {{ next.title }}</span>{{ icon("chevron-right") }}</a></li>{% endif %}
+    </ul>
+  </nav>
+  {% endif %}
+  <nav class="doc-more card" aria-labelledby="doc-more-title">
+    <h2 class="doc-more__title" id="doc-more-title">More documents</h2>
+    <ul class="doc-more__list">
+      {% for item in documents if item.slug != spec.slug %}<li><a href="/admin/help/{{ item.slug }}">{{ item.title }}</a></li>{% endfor %}
+      <li><a href="/admin/help#glossary">Glossary</a></li>
+    </ul>
+  </nav>
+</div>
+{% endblock %}

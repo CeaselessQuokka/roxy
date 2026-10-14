@@ -37,6 +37,10 @@ How it works
       (a setting, a bucket's effective rate, a rule row's columns): the step guardrail was measured from it.
     - With `fence` (a leader job's context) the lease is taken only while the leader lease is still this run's, and
       every service write first proves it again with the fencing margin, so a deposed leader writes nothing (5.6).
+    - Apply and undo pass the caller's settings `guard` (the admin API's `WriteRules`) into every setting write, and
+      undo first runs the caller's `check` on what it would revert (`setting_restores`): an undo writes settings
+      like any other writer and never gets past the arm-only route or a high-risk confirmation (final review
+      brain-2).
 
 What to read next
     `roxy/insights/autoapply.py` (D7, which calls `apply` with `auto=True` and `undo` on a regression),
@@ -56,8 +60,14 @@ from typing import Any, Final, TypeVar
 
 from roxy.config import catalog
 from roxy.config.audit import Actor
-from roxy.config.settings_service import SettingsService, SettingsUpdateError, check_reason, service_for
-from roxy.config.spec import SettingType
+from roxy.config.settings_service import (
+    SettingsService,
+    SettingsUpdateError,
+    WriteGuard,
+    check_reason,
+    service_for,
+)
+from roxy.config.spec import Risk, SettingType
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.insights.engine import InsightsEngine, publish, row_to_recommendation, write_recommendation
 from roxy.insights.models import DISMISS_REASONS, SNOOZE_DURATIONS_S, ProposedChange, Recommendation, changes_digest
@@ -81,6 +91,11 @@ frees it after this)."""
 BUSY_MESSAGE: Final = "Another request is changing this recommendation right now; reload it and try again."
 CHANGED_MESSAGE: Final = "This recommendation changed since you previewed it; review the new changes and apply again."
 """`ActionError("changed")`: the stored changes are not the ones the caller judged (409 `changed_since_preview`)."""
+UNDO_CONFIRM_MESSAGE: Final = (
+    "This undo puts back a high-risk value; confirm it with confirm_high_risk and give a reason (it goes in the "
+    "audit log)."
+)
+"""`ActionError("confirm")`: an undo that restores a high-risk setting value, unconfirmed (`high_risk_restores`)."""
 GUARD_METRICS: Final[tuple[str, ...]] = ("error_rate", "roblox_429_rate", "p95_ms", "refused_rate")
 """The guard metrics of plan 11.4, all "lower is better"."""
 _SETTING_KINDS: Final = frozenset({"setting", "host_add", "tarpit_category"})
@@ -104,8 +119,8 @@ _TABLE_OF: Final[dict[str, str]] = {
 class ActionError(Exception):
     """An action that cannot be done. `code` maps to the API status: `not_found` 404; `conflict` (the
     recommendation's state does not allow it), `busy` (another holder has its action lease right now: worth a retry),
-    `changed` (not the changes the caller judged) and `superseded` (a value changed since) 409; `invalid` and
-    `manual` 422."""
+    `changed` (not the changes the caller judged) and `superseded` (a value changed since) 409; `invalid`,
+    `manual` and `confirm` (an undo that restores a high-risk value needs `confirm_high_risk` and a reason) 422."""
 
     def __init__(self, code: str, message: str, fields: Mapping[str, str] | None = None) -> None:
         super().__init__(message)
@@ -194,6 +209,29 @@ class AppliedChange:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def setting_restores(applied: Sequence[AppliedChange]) -> dict[str, Any]:
+    """The setting values an undo of `applied` writes back (`{key: before}`): the changes whose apply wrote a
+    settings history row (one that found its value already in place wrote none, and its undo writes nothing). The
+    settings writers' rules judge exactly these (arm-only keys, high-risk values; final review brain-2)."""
+    return {
+        str(item.key): item.before
+        for item in applied
+        if item.kind in _SETTING_KINDS and item.history_id is not None and item.key is not None
+    }
+
+
+def high_risk_restores(applied: Sequence[AppliedChange]) -> list[str]:
+    """The setting keys an undo of `applied` would set to a high-risk value: the settings editor's rule (a value the
+    catalog's `high_risk_if` names, or any value of a `Risk.HIGH` setting), which asks for `confirm_high_risk` and
+    a reason (final review brain-2: an undo restored such values, `spam_dry_run` 0 among them, unconfirmed)."""
+    out: list[str] = []
+    for key, value in setting_restores(applied).items():
+        spec = catalog.CATALOG.get(key)
+        if spec is not None and (spec.is_high_risk_value(value) or spec.risk is Risk.HIGH):
+            out.append(key)
+    return sorted(out)
 
 
 @dataclass(slots=True)
@@ -361,16 +399,27 @@ class RecommendationActions:
         request_id: str | None = None,
         expected_digest: str | None = None,
         fence: JobContext | None = None,
+        guard: WriteGuard | None = None,
     ) -> ActionResult:
         """Apply every change of an open recommendation, all or nothing (module docstring).
 
         `expected_digest` is the `changes_digest` the caller judged (the admin's preview, the auto-applier's
         guardrails); it is compared inside the lease, so exactly those changes are applied or `ActionError("changed")`
         is raised. `auto` (D7) also refuses (`superseded`) when a live value is no longer the `current` the rule
-        judged. `fence` is the leader job's context: every write first proves the run still leads (plan 5.6)."""
+        judged. `fence` is the leader job's context: every write first proves the run still leads (plan 5.6).
+        `guard` is the settings writers' check (`SettingsService` `WriteGuard`; the admin API passes its
+        `WriteRules`), run inside each setting write's transaction; what it raises reaches the caller unchanged after
+        the changes already applied are put back."""
         async with self._exclusive(rec_id, fence):
             return await self._apply(
-                rec_id, actor, reason, auto=auto, request_id=request_id, expected_digest=expected_digest, fence=fence
+                rec_id,
+                actor,
+                reason,
+                auto=auto,
+                request_id=request_id,
+                expected_digest=expected_digest,
+                fence=fence,
+                guard=guard,
             )
 
     async def _apply(
@@ -383,6 +432,7 @@ class RecommendationActions:
         request_id: str | None,
         expected_digest: str | None,
         fence: JobContext | None,
+        guard: WriteGuard | None = None,
     ) -> ActionResult:
         rec = await self._get(rec_id)
         if expected_digest is not None and changes_digest(rec.changes) != expected_digest:
@@ -430,7 +480,7 @@ class RecommendationActions:
         try:
             for change in rec.changes:
                 await still_leader(fence)
-                applied.append(await self._apply_one(change, actor, note, source, request_id))
+                applied.append(await self._apply_one(change, actor, note, source, request_id, guard=guard))
             # The record is part of "all or nothing": changes nobody can see or undo must not stay applied.
             action_id = await self._write_metrics(write, fence)
         except Exception as exc:
@@ -531,11 +581,20 @@ class RecommendationActions:
         return {k: v for k, v in data.items() if k in spec.input_fields}
 
     async def _apply_one(
-        self, change: ProposedChange, actor: Actor, note: str, source: str, request_id: str | None
+        self,
+        change: ProposedChange,
+        actor: Actor,
+        note: str,
+        source: str,
+        request_id: str | None,
+        *,
+        guard: WriteGuard | None = None,
     ) -> AppliedChange:
         if change.kind in _SETTING_KINDS:
             key, value = self._setting_target(change, self._snapshot())  # a list delta reads the live list now
-            result = await self.settings_service.update({key: value}, actor, note, source, request_id=request_id)
+            result = await self.settings_service.update(
+                {key: value}, actor, note, source, request_id=request_id, guard=guard
+            )
             if not result.changes:
                 current = self._snapshot().get(key)
                 return AppliedChange(change.kind, f"setting:{key}", None, key, current, current, None)
@@ -565,11 +624,15 @@ class RecommendationActions:
             )
         return AppliedChange(change.kind, change.target, table, ruled.key, existing, ruled.after)
 
-    async def _revert_one(self, applied: AppliedChange, actor: Actor, note: str) -> None:
-        """Put one applied change back to its stored before value (through the same audited services)."""
+    async def _revert_one(
+        self, applied: AppliedChange, actor: Actor, note: str, *, guard: WriteGuard | None = None
+    ) -> None:
+        """Put one applied change back to its stored before value (through the same audited services). `guard` is
+        the settings writers' check (an undo passes the caller's; compensating a failed apply passes none: it puts
+        back what was in place moments before, inside the same all-or-nothing action)."""
         if applied.kind in _SETTING_KINDS:
             if applied.history_id is not None:  # None: the apply found the value already in place
-                await self.settings_service.revert(applied.history_id, actor, note)
+                await self.settings_service.revert(applied.history_id, actor, note, guard=guard)
             return
         table = str(applied.table)
         spec = RULE_TABLES[table]
@@ -606,11 +669,32 @@ class RecommendationActions:
         auto: bool = False,
         result: Mapping[str, Any] | None = None,
         fence: JobContext | None = None,
+        guard: WriteGuard | None = None,
+        check: Callable[[Sequence[AppliedChange]], None] | None = None,
+        confirm_high_risk: bool = False,
     ) -> ActionResult:
         """Revert exactly what the last apply wrote (module docstring). `auto` marks an automatic rollback; `fence`
-        is the leader job's context (the watch job): every write first proves the run still leads (plan 5.6)."""
+        is the leader job's context (the watch job): every write first proves the run still leads (plan 5.6).
+
+        An undo writes settings like any other writer, so it passes the settings writers' rules (final review
+        brain-2: an undo of a SEC-DEFAULTS card armed the spam detectors past the arm route, unconfirmed): an undo
+        by a person that puts back a high-risk value (`high_risk_restores`) needs `confirm_high_risk` and a reason
+        (`ActionError("confirm")` otherwise); `check` judges the changes it would revert (`setting_restores` names
+        the setting values it writes) before anything is written, and whatever it raises refuses the undo; `guard`
+        (a `WriteGuard`, the admin API's `WriteRules`) runs again inside each setting write's transaction. An
+        automatic rollback (`auto`) puts back what D7 replaced, inside the settings' auto-apply bounds."""
         async with self._exclusive(rec_id, fence):
-            return await self._undo(rec_id, actor, reason, auto=auto, result=result, fence=fence)
+            return await self._undo(
+                rec_id,
+                actor,
+                reason,
+                auto=auto,
+                result=result,
+                fence=fence,
+                guard=guard,
+                check=check,
+                confirm_high_risk=confirm_high_risk,
+            )
 
     async def _undo(
         self,
@@ -621,6 +705,9 @@ class RecommendationActions:
         auto: bool,
         result: Mapping[str, Any] | None,
         fence: JobContext | None,
+        guard: WriteGuard | None = None,
+        check: Callable[[Sequence[AppliedChange]], None] | None = None,
+        confirm_high_risk: bool = False,
     ) -> ActionResult:
         rec = await self._get(rec_id)
         if rec.state not in ("applied", "auto_applied"):
@@ -640,12 +727,17 @@ class RecommendationActions:
         applied = [AppliedChange(**item) for item in details.get("changes", [])]
         text = _reason(reason)
         note = f"undo recommendation:{rec.id}" + (f" {text}" if text else "")
-        # First prove nothing was superseded, then revert in reverse order.
+        # First prove nothing was superseded and the caller's rules allow every write, then revert in reverse order.
         for item in applied:
             await self._check_not_superseded(item)
+        risky = [] if auto else high_risk_restores(applied)
+        if risky and not (confirm_high_risk and text):
+            raise ActionError("confirm", UNDO_CONFIRM_MESSAGE, dict.fromkeys(risky, UNDO_CONFIRM_MESSAGE))
+        if check is not None:
+            check(applied)
         for item in reversed(applied):
             await still_leader(fence)
-            await self._revert_one(item, actor, note)
+            await self._revert_one(item, actor, note, guard=guard)
         now = self.clock.now()
         action = "auto_rollback" if auto else "undo"
 
@@ -772,6 +864,7 @@ __all__ = [
     "BUSY_MESSAGE",
     "CHANGED_MESSAGE",
     "GUARD_METRICS",
+    "UNDO_CONFIRM_MESSAGE",
     "ActionError",
     "ActionResult",
     "AppliedChange",
@@ -780,8 +873,10 @@ __all__ = [
     "effective_bucket",
     "fenced",
     "guard_metrics_sync",
+    "high_risk_restores",
     "list_delta",
     "load_recommendation",
     "same_value",
+    "setting_restores",
     "still_leader",
 ]

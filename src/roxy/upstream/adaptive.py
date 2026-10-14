@@ -34,7 +34,9 @@ How it works
       bucket rejections (`upstream_busy` and `queue_overflow` answers) above 1 % of its attempts, the rate rises by
       `adaptive_increase_pct` (10 %), capped at `adaptive_max_per_min` (600). The burst recovers carefully: at most
       one call per raise, never beyond the default burst's share of the new rate, never beyond the default burst.
-      A cap that is never reached is never raised: without rejections there is no evidence. The key's last change
+      A cap that is never reached is never raised: without rejections there is no evidence. A window whose 429
+      records a statistics reset deleted is not clean either: it counts only `adaptive_probe_after_h` after the
+      deleted span (`reset_evidence_until`, from the reset's chart marker; finding data-1). The key's last change
       must also be that old, which makes
       the job idempotent (a duplicate run finds the fresh change and does nothing). A rate set by an admin or an
       applied recommendation is never raised automatically (a decrease on a 429 still applies: safety first), and
@@ -58,6 +60,7 @@ from enum import StrEnum
 from typing import Any, Final, Protocol
 
 from roxy.core.reasons import Egress, ReasonCode
+from roxy.metrics.annotate import RESET_TABLES_COLUMN, has_reset_tables, reset_tables_of
 from roxy.upstream import cooldowns
 from roxy.upstream.buckets import (
     WINDOW_MS,
@@ -257,6 +260,9 @@ class KeyStats:
     rejections: int = 0
     rate_limited: int = 0
     last_429_ms: int | None = None
+    evidence_lost_until_ms: int | None = None
+    """A data reset deleted Roblox 429 records up to this moment inside the probe window (`reset_evidence_until`):
+    no 429 can be seen before it, so the window is not known to be clean until a full window has passed since."""
 
     @property
     def rejection_share(self) -> float:
@@ -264,15 +270,51 @@ class KeyStats:
 
 
 def should_increase(stats: KeyStats, last_change_s: float | None, now_s: float, policy: AdaptivePolicy) -> bool:
-    """Plan 7.3 bounded upward probing: a clean probe window, real demand above the cap, no recent change."""
+    """Plan 7.3 bounded upward probing: a clean probe window, real demand above the cap, no recent change.
+
+    "Clean" means zero 429s were SEEN on the key: a window whose 429 records a statistics reset deleted is not
+    clean (finding data-1: the Upstream reset deleted `upstream_429` and the next run raised a rate Roblox had
+    limited two hours before), so it counts as clean only `probe_after_h` after the evidence it lost."""
     window_s = policy.probe_after_h * 3600
     if stats.rate_limited > 0:
         return False
     if stats.last_429_ms is not None and stats.last_429_ms / 1000 > now_s - window_s:
         return False
+    if stats.evidence_lost_until_ms is not None and stats.evidence_lost_until_ms / 1000 > now_s - window_s:
+        return False
     if last_change_s is not None and last_change_s > now_s - window_s:
         return False
     return stats.attempts > 0 and stats.rejection_share > REJECTION_SHARE
+
+
+EVIDENCE_TABLE: Final = "metrics.upstream_429"
+"""The table a data reset's marker names when it deleted the 429 log (`admin/api/data.py marker_tables`)."""
+MAX_RESET_MARKERS: Final = 1000
+"""Reset markers one increase run reads (P9; resets are rare, the window is a day)."""
+
+
+def reset_evidence_until(conn: sqlite3.Connection, since_s: float) -> float | None:
+    """The latest moment (seconds) up to which a data reset deleted Roblox 429 records after `since_s`, or None.
+
+    A reset writes a chart marker (`annotations`, kind `reset`) naming what it deleted (`reset_tables`; a marker
+    without the list may have deleted anything and counts). An unranged reset deleted everything up to its own
+    time (`at`); a ranged one the range `[at, until)`. Only evidence inside the window matters: a reset whose
+    deleted span ended before `since_s` took nothing the probe window needs."""
+    has_tables = has_reset_tables(conn)
+    tables = RESET_TABLES_COLUMN if has_tables else "NULL"
+    rows = conn.execute(
+        f"SELECT at, until, {tables} FROM annotations WHERE kind = 'reset' AND COALESCE(until, at) >= ? "  # noqa: S608 - a fixed column name
+        "ORDER BY at DESC LIMIT ?",
+        (int(since_s), MAX_RESET_MARKERS),
+    ).fetchall()
+    latest: float | None = None
+    for at, until, deleted in rows:
+        names = reset_tables_of(deleted)
+        if names is not None and EVIDENCE_TABLE not in names:
+            continue  # this reset said what it deleted, and the 429 log was not part of it
+        end = float(until if until is not None else at)
+        latest = end if latest is None else max(latest, end)
+    return latest
 
 
 def collect_stats(conn: sqlite3.Connection, since_s: float) -> dict[str, KeyStats]:
@@ -308,6 +350,11 @@ def collect_stats(conn: sqlite3.Connection, since_s: float) -> dict[str, KeyStat
             last_ms = int(last) if last is not None else None
             if last_ms is not None and (item.last_429_ms is None or last_ms > item.last_429_ms):
                 item.last_429_ms = last_ms
+    lost = reset_evidence_until(conn, since_s)
+    if lost is not None:
+        # A reset deleted 429 records of the window, for every key alike: none of them is known to be clean.
+        for item in stats.values():
+            item.evidence_lost_until_ms = int(lost * 1000)
     return stats
 
 
@@ -463,6 +510,8 @@ async def increase_job(
 __all__ = [
     "ADAPTIVE_ACTOR_NAME",
     "EGRESS_ATTRIBUTION_MIN_HOSTS",
+    "EVIDENCE_TABLE",
+    "MAX_RESET_MARKERS",
     "REJECTION_SHARE",
     "AdaptiveController",
     "AdaptivePolicy",
@@ -479,6 +528,7 @@ __all__ = [
     "increase_job",
     "increased_limit",
     "increased_rate",
+    "reset_evidence_until",
     "scaled_burst",
     "should_increase",
 ]

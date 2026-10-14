@@ -26,7 +26,8 @@ How it works
     3. After the commit, this worker's `RuntimeSettings` reloads at once; the others follow within a second.
     In history rows, `old_json` and `new_json` hold the OVERRIDE as JSON, and NULL means "no override, the
     catalog default". Sensitive settings (`spec.sensitive`) are stored as `{fingerprint, masked}` in history and
-    audit, never as the value (plan 6.2).
+    audit, never as the value (plan 6.2). No value may hold a secret (the catalog refuses it, review finding
+    constraints-1); the history reason is scrubbed like the audit reason, and the export scrubs again.
 
 What to read next
     `roxy/config/catalog.py` (validation and cross rules), `roxy/config/runtime.py` (how the change is picked up)
@@ -57,9 +58,10 @@ from roxy.config.runtime import (
     same_value,
     thaw,
 )
+from roxy.config.secret_text import scrub_secrets
 from roxy.config.spec import Apply, Risk, SettingSpec
 from roxy.core.clock import SYSTEM_CLOCK, Clock
-from roxy.core.redact import MASK
+from roxy.core.redact import MASK, redact_text
 from roxy.storage.db import Database, SharedStateUnavailable
 
 log = logging.getLogger(__name__)
@@ -332,14 +334,16 @@ class SettingsService:
     async def export_overrides(self) -> dict[str, Any]:
         """Every current override as a JSON document (plan 15.2), with the catalog version for drift detection.
 
-        Sensitive values are replaced by `[redacted]`; an import skips them.
+        Sensitive values are replaced by `[redacted]`; an import skips them. Any other text that holds a secret is
+        scrubbed on the way out too (`secret_text.scrub_secrets`; review finding constraints-1): a stored value is
+        screened when it is written and when it is decoded, so this is the second line, not the first.
         """
         rows = await self._db.read(_read_override_rows)
         overrides, _meta, _invalid = _decode(rows, self._specs)
         version = await self._db.read(_read_version)
         exported: dict[str, Any] = {}
         for key in sorted(overrides):
-            exported[key] = MASK if self._specs[key].sensitive else thaw(overrides[key])
+            exported[key] = MASK if self._specs[key].sensitive else scrub_secrets(thaw(overrides[key]))
         return {
             "schema": EXPORT_SCHEMA,
             "catalog_version": catalog.catalog_version(self._specs),
@@ -479,6 +483,9 @@ class SettingsService:
         now = int(self._clock.now())
         specs = self._specs
         defaults = self._defaults
+        # The history row keeps the reason as the audit row does (`audit.record` scrubs it): a secret pasted into
+        # the reason box must not reach the history table and its exports (review findings cred-2, constraints-1).
+        history_reason = redact_text(reason)[:MAX_REASON_LENGTH] if reason else None
 
         def summarize(key: str, value: Any) -> Any:
             if value is _MISSING:
@@ -557,7 +564,7 @@ class SettingsService:
                         None if new is _MISSING else json.dumps(new_hist),
                         now,
                         actor.label,
-                        reason or None,
+                        history_reason,
                         plan.source,
                     ),
                 )

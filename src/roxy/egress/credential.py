@@ -42,7 +42,20 @@ How it works
     credential request, re-reads the version, status and cooldown, so a replacement or a 429 cooldown applies
     fleet-wide at once. If control.db or hot.db cannot be read the credential is not used (C7). A cooldown that
     hot.db could not record (the 429 arrived during an outage) is kept in this worker's memory, merged with hot.db's
-    row on every refresh, and written to hot.db by the first refresh that can write.
+    row on every refresh, and written to hot.db by the first refresh that can write; a rejection (a confirmed 401
+    or another account) that control.db could not record is kept the same way and blocks the value here until
+    control.db takes it (finding constraints-3).
+    A probe's verdict belongs to the value it checked: `probe` notes the slot's fingerprint before it sends, and the
+    verdict is decided and written in one control.db transaction only while `credential_meta` still describes that
+    value. A verdict that lands after a replace (or after another color moved `credential_meta` to its own
+    bootstrap file) is dropped, so an answer about one value never makes another value active, rejected or
+    "account checked" (finding constraints-2); and a stored status describes only the value whose fingerprint it
+    carries. Accounts (plan C1, 13.2 H-CRED-AUTH): a 200 naming the recorded account (or the first account a value
+    ever answers for) makes the value active; another account is `account_mismatch` (rejected until the typed
+    `confirm_account`); a 200 that names no account (an HTML page, a probe URL without ids) never clears a
+    rejection or confirms an account it cannot see (finding constraints-4). `replace` keeps the previous value's
+    account in `last_probe_result` (`replaced`, `previous_account`), so the new value's first probe can say
+    `account_changed` instead of claiming the same account (finding docs_a-1).
     `authorize(request)` is the only place the cookie is attached: after those checks, after validating that the
     target is https on an allowed Roblox host, and after the leak guard's own inspection of the request (a caller
     who sends a 24+ character piece of the credential on an allowlisted endpoint is refused as auth smuggling, so
@@ -68,6 +81,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -167,6 +181,19 @@ COOLDOWN_SOURCES = ("retry_after", "ratelimit_reset", "breaker", "default")
 
 SCHEDULED_PROBE_KINDS = frozenset({"liveness"})
 """Probe kinds that are skipped while the credential is rejected (only an admin check re-tests a dead cookie)."""
+
+PENDING_RETRY_S = 1.0
+"""How often a rejection control.db could not record is offered to control.db again (finding constraints-3): at
+most once a second per worker, so a read-only control.db never costs every credential request a failed write."""
+
+REPLACED = "replaced"
+"""`last_probe_result.result` from a replace until the new value's first answer: it carries `previous_account`, the
+account fingerprint of the value the replace took over from (finding docs_a-1)."""
+ACCOUNT_CHANGED = "account_changed"
+"""`last_probe_result.result` of the first answer after a replace that named another account than the previous
+value's: the value is used (the replace was deliberate, with the typed C1 warning), and the page says the account
+changed instead of "same account as before" (finding docs_a-1)."""
+ACCOUNT_MISMATCH = "account_mismatch"
 
 ACTIVE = "active"
 UNKNOWN = "unknown"
@@ -616,6 +643,121 @@ def _account_id(body: bytes) -> str | None:
     return text if text.isdigit() else None
 
 
+# --- probe verdicts -----------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Verdict:
+    """What one answer about a value does to `credential_meta`, decided from a `credential_meta` row.
+
+    `status` None keeps the stored status and `result` None keeps the stored `last_probe_result`. `alert` is the
+    `result` field of the rejection alert raised once the verdict counts (it was written, or kept in memory)."""
+
+    outcome: str
+    status: str | None = None
+    result: dict[str, Any] | None = None
+    account_fp: str | None = None
+    account_match: bool | None = None
+    alert: str | None = None
+
+
+VerdictRule = Callable[[dict[str, Any]], _Verdict]
+
+
+def _fixed(verdict: _Verdict) -> VerdictRule:
+    """A rule whose verdict does not depend on the stored row (the row still decides whether it applies at all)."""
+    return lambda meta: verdict
+
+
+def _describes(meta: dict[str, Any], value_fp: str | None) -> bool:
+    """True when the `credential_meta` row is about the value with fingerprint `value_fp` (None: any value)."""
+    return value_fp is None or meta.get("fingerprint") == value_fp
+
+
+def _previous_account(meta: dict[str, Any]) -> str | None:
+    """The account a replace took over from (`replaced` and the results after it), while the new value has no
+    account recorded yet (finding docs_a-1)."""
+    if meta.get("account_id_fingerprint") is not None:
+        return None
+    stored = _json_obj(meta.get("last_probe_result")) or {}
+    previous = stored.get("previous_account")
+    return previous if isinstance(previous, str) and previous else None
+
+
+def _named_answer(meta: dict[str, Any], account_fp: str, base: dict[str, Any]) -> _Verdict:
+    """A 200 naming account `account_fp` (plan C1, 13.2 H-CRED-AUTH): the same account (or the first one a value
+    ever names) makes it active; after a replace, another account than the previous value's is `account_changed`
+    (used: the replace was the deliberate, confirmed switch); otherwise another account is `account_mismatch`."""
+    recorded = meta.get("account_id_fingerprint")
+    if recorded is None:
+        previous = _previous_account(meta)
+        if previous is not None and previous != account_fp:
+            result = {"result": ACCOUNT_CHANGED, **base, "previous_account": previous}
+            return _Verdict("ok", ACTIVE, result, account_fp, account_match=False)
+        return _Verdict("ok", ACTIVE, {"result": "ok", **base}, account_fp, account_match=True)
+    if recorded == account_fp:
+        return _Verdict("ok", ACTIVE, {"result": "ok", **base}, account_fp, account_match=True)
+    result = {"result": ACCOUNT_MISMATCH, **base, "pending_account": account_fp}
+    return _Verdict(ACCOUNT_MISMATCH, REJECTED, result, account_match=False, alert=ACCOUNT_MISMATCH)
+
+
+def _unnamed_answer(meta: dict[str, Any], base: dict[str, Any]) -> _Verdict:
+    """A 200 that names no account (an HTML challenge or error page Roblox sends with 200, or a probe URL that never
+    returns an id): it keeps an active value active and confirms a value that has no account to compare yet, but
+    it never clears a rejection nor confirms a recorded account it cannot see (finding constraints-4, plan C1). A
+    pending account switch keeps its record, so `confirm_account` still has the account to confirm."""
+    result = {"result": "ok_no_account_id", **base}
+    stored = str(meta.get("status") or UNKNOWN)
+    if stored in (ACTIVE, COOLING_DOWN):
+        return _Verdict("ok_no_account_id", None, result)
+    if meta.get("account_id_fingerprint") is None and stored != REJECTED:
+        return _Verdict("ok_no_account_id", ACTIVE, result)
+    last = _json_obj(meta.get("last_probe_result")) or {}
+    keep = last.get("result") == ACCOUNT_MISMATCH
+    return _Verdict("ok_no_account_id", None, None if keep else result)
+
+
+def _write_verdict(
+    conn: sqlite3.Connection,
+    meta: dict[str, Any],
+    verdict: _Verdict,
+    *,
+    now: int,
+    probed_at: int | None,
+    request_id: str | None,
+) -> None:
+    """Write `verdict` over the `credential_meta` row `meta` (read in this transaction); audit a status or account
+    change and bump the version so every worker sees it at once."""
+    before = str(meta.get("status") or UNKNOWN)
+    status = verdict.status or before
+    result = verdict.result
+    previous = _previous_account(meta) if verdict.account_fp is None else None
+    if result is not None and previous is not None and "previous_account" not in result:
+        result = {**result, "previous_account": previous}  # still waiting for the first account after a replace
+    result_text = json.dumps(result, sort_keys=True)[:400] if result is not None else None
+    account_changed = verdict.account_fp is not None and verdict.account_fp != meta.get("account_id_fingerprint")
+    conn.execute(
+        "UPDATE credential_meta SET status = ?, status_at = CASE WHEN status = ? THEN status_at ELSE ? END, "
+        "last_probe_result = coalesce(?, last_probe_result), "
+        "last_probe_at = coalesce(?, last_probe_at), "
+        "account_id_fingerprint = coalesce(?, account_id_fingerprint) WHERE id = 1",
+        (status, status, now, result_text, probed_at, verdict.account_fp),
+    )
+    if before != status or account_changed:
+        audit.record(
+            conn,
+            _EGRESS_ACTOR,
+            "credential.status",
+            "credential_status",
+            {"status": before},
+            {"status": status, "result": (result or {}).get("result")},
+            None,
+            request_id,
+            at=now,
+        )
+        bump_version(conn, VERSION_KEY, now)
+
+
 _UNCHANGED = object()
 
 
@@ -663,6 +805,10 @@ class CredentialManager:
         # A cooldown opened while hot.db could not be written: (until_ms, source). Honored here until hot.db takes
         # it, so a refresh that reads hot.db's (older) row never forgets it (C7, finding UP-COOLDOWN-LOST).
         self._pending_cooldown: tuple[int, str] | None = None
+        # A rejection control.db could not record: (fingerprint of the rejected value, its `last_probe_result` JSON).
+        # It blocks that value in this worker until control.db takes it (C7, finding constraints-3); one tuple at most.
+        self._pending_rejection: tuple[str, str] | None = None
+        self._pending_retry_at = 0.0
         self._problem: str | None = None
         self._degraded = False
         self._started = False
@@ -802,6 +948,7 @@ class CredentialManager:
         """Re-read version, metadata and cooldown (and the stored value when the version moved). False when shared
         state was unreadable: the credential is then unusable until a read succeeds (C7)."""
         await self._share_pending_cooldown()
+        await self._share_pending_rejection()
         try:
             await self._load(force=force)
         except SharedStateUnavailable as exc:
@@ -832,6 +979,28 @@ class CredentialManager:
         if self._pending_cooldown == pending:
             self._pending_cooldown = None
         log.info("credential_cooldown_shared", extra={"fields": {"remaining_s": round((until_ms - now_ms) / 1000)}})
+
+    async def _share_pending_rejection(self) -> None:
+        """Write a rejection kept in memory during a control.db outage into control.db, once it takes writes again
+        (at most every `PENDING_RETRY_S`). It is written only while `credential_meta` still describes the rejected
+        value; a replace meanwhile makes it moot, and it is dropped."""
+        pending = self._pending_rejection
+        if pending is None:
+            return
+        now_mono = self._clock.monotonic()
+        if now_mono < self._pending_retry_at:
+            return
+        self._pending_retry_at = now_mono + PENDING_RETRY_S
+        value_fp, result_text = pending
+        rule = _fixed(_Verdict(REJECTED, REJECTED, _json_obj(result_text)))
+        try:
+            # Budgeted: this runs before every credential request (`authorize`), which must not wait out a lock.
+            written = await self._write_tx(rule, value_fp=value_fp, budget_ms=HOT_WRITE_BUDGET_MS)
+        except SharedStateUnavailable:
+            return  # still unwritable: it stays in memory and keeps blocking the value in this worker
+        if self._pending_rejection == pending:
+            self._pending_rejection = None
+        log.info("credential_rejection_shared" if written is not None else "credential_rejection_moot")
 
     def _apply(self, version: int, meta: dict[str, Any], store: Any, cooldown_until_ms: int) -> None:
         self._meta = meta
@@ -875,6 +1044,9 @@ class CredentialManager:
         current = self._slot._reveal_credential()
         if previous is not None and previous != current:
             self._extra_values.append(previous)
+        pending = self._pending_rejection
+        if pending is not None and pending[0] != self._slot.fingerprint:
+            self._pending_rejection = None  # it was about the value the slot held before; that value is gone
         self._rebuild_matcher()
         if self._problem in ("bootstrap_superseded", "cannot_verify_bootstrap", "encryption_key_missing"):
             log.error("credential_not_loaded", extra={"fields": {"problem": self._problem}})
@@ -919,7 +1091,9 @@ class CredentialManager:
             return UNAVAILABLE
         if not self._slot.is_set:
             return UNAVAILABLE if self._problem else ABSENT
-        stored = str(self._meta.get("status") or UNKNOWN)
+        if self._rejection_pending():
+            return REJECTED
+        stored = self._stored_status()
         if stored == REJECTED:
             return REJECTED
         if self.cooldown_remaining() > 0:
@@ -927,6 +1101,18 @@ class CredentialManager:
         if stored in (ACTIVE, COOLING_DOWN):
             return ACTIVE
         return UNKNOWN
+
+    def _stored_status(self) -> str:
+        """The shared status of the value in the slot. A `credential_meta` row about another value (a replace that
+        landed, another color's bootstrap file) says nothing about this one: `unknown` (finding constraints-2)."""
+        if self._meta.get("fingerprint") != self._slot.fingerprint:
+            return UNKNOWN
+        return str(self._meta.get("status") or UNKNOWN)
+
+    def _rejection_pending(self) -> bool:
+        """True when this worker holds a rejection of the slot's value that control.db could not record yet."""
+        pending = self._pending_rejection
+        return pending is not None and pending[0] == self._slot.fingerprint
 
     def available(self) -> bool:
         """True when allowlisted traffic may use the credential now (active, not cooling down, state readable)."""
@@ -939,6 +1125,9 @@ class CredentialManager:
     def status(self) -> CredentialStatus:
         """The current status, from the last refresh (DESIGN.md 11.4 `status()`)."""
         superseded = _json_list(self._meta.get("superseded_fingerprints_json"))
+        last_result = self._meta.get("last_probe_result")
+        if self._rejection_pending() and self._pending_rejection is not None:
+            last_result = self._pending_rejection[1]  # what this worker knows and control.db could not take yet
         return CredentialStatus(
             enabled=self.enabled,
             present=self._slot.is_set,
@@ -951,7 +1140,7 @@ class CredentialManager:
             set_at=self._meta.get("set_at"),
             set_by=self._meta.get("set_by"),
             last_probe_at=self._meta.get("last_probe_at"),
-            last_probe_result=_json_obj(self._meta.get("last_probe_result")),
+            last_probe_result=_json_obj(last_result),
             problem="degraded" if self._degraded else self._problem,
             version=self._version,
             bootstrap_present=self._bootstrap is not None,
@@ -964,6 +1153,7 @@ class CredentialManager:
     async def _authoritative_check(self, *, probe: bool) -> None:
         """Re-read shared state and raise `CredentialUnavailable` unless the credential may be used right now."""
         await self._share_pending_cooldown()
+        await self._share_pending_rejection()
         try:
             await self._load(force=False)
         except SharedStateUnavailable as exc:
@@ -1089,6 +1279,7 @@ class CredentialManager:
             },
             cooldown_key="credential:rotated",
             cooldown_s=3600,
+            page="credential#replace",
         )
         self._events.event("credential_rotated", "critical", "credential", {"endpoint": endpoint})
 
@@ -1133,6 +1324,7 @@ class CredentialManager:
                 fields={"remaining_s": int(remaining), "source": source},
                 cooldown_key="credential:cooldown",
                 cooldown_s=600,
+                page="credential#status",
             )
         return remaining
 
@@ -1150,67 +1342,111 @@ class CredentialManager:
         return target
 
     async def mark_rejected(self, reason: str, *, request_id: str | None = None) -> None:
-        """Mark the credential rejected (after the upstream layer's confirming probe, plan 7.9) and alert."""
-        await self._set_status(REJECTED, {"result": "rejected", "reason": reason[:80]}, request_id=request_id)
-        self._alert_rejected(reason[:80])
+        """Mark the credential rejected (after the upstream layer's confirming probe, plan 7.9) and alert.
+
+        The rejection is about the value in the slot now; it is written only while `credential_meta` still
+        describes that value, and kept in memory when control.db cannot take it (C7, finding constraints-3)."""
+        why = reason[:80]
+        rule = _fixed(_Verdict(REJECTED, REJECTED, {"result": "rejected", "reason": why}, alert=why))
+        verdict = await self._record_verdict(rule, value_fp=self._slot.fingerprint, request_id=request_id)
+        if verdict is not None and verdict.alert:
+            self._alert_rejected(verdict.alert)
 
     def _alert_rejected(self, outcome: str) -> None:
+        """The critical "Token Expired" alert (plan 17.7 keeps v1's subject, which owners filter on). An account
+        switch is not an expired cookie, so its summary says what happened instead (finding docs_a-2)."""
+        masked = self._meta.get("masked") or mask_token(None)
+        if outcome == ACCOUNT_MISMATCH:
+            summary = (
+                f'The Roblox credential "{masked}" now answers for a different Roblox account than the one it was '
+                "set for. Roxy stopped using it until you confirm that account on the Credential page (plan C1)."
+            )
+        else:
+            summary = f'An auth token has expired: "{masked}".'
         self._events.alert(
             type="credential_rejected",
             severity="critical",
             subject="Token Expired",
-            summary=f'An auth token has expired: "{self._meta.get("masked") or mask_token(None)}".',
-            fields={"status": REJECTED, "result": outcome, "page": "credential#status"},
+            summary=summary,
+            fields={"status": REJECTED, "result": outcome},
             cooldown_key="credential:rejected",
             cooldown_s=int(self._setting("email_cooldown", 600)),
+            page="credential#status",
         )
 
-    async def _set_status(
+    async def _write_tx(
         self,
-        status: str,
-        result: dict[str, Any] | None,
+        rule: VerdictRule,
         *,
-        request_id: str | None = None,
-        account_fp: str | None = None,
+        value_fp: str | None,
         probed_at: int | None = None,
-    ) -> None:
+        request_id: str | None = None,
+        budget_ms: int | None = None,
+    ) -> _Verdict | None:
+        """Decide `rule(meta)` and write it in ONE control.db transaction, only while `credential_meta` describes
+        the value with fingerprint `value_fp` (None: whatever value it describes). Returns the verdict written, or
+        None when the row is about another value (the verdict is moot) or missing. Raises `SharedStateUnavailable`.
+        """
         now = int(self._clock.now())
-        result_text = json.dumps(result, sort_keys=True)[:400] if result is not None else None
 
-        def write(conn: sqlite3.Connection) -> None:
-            meta = _row_dict(
-                conn.execute("SELECT status, account_id_fingerprint FROM credential_meta WHERE id = 1").fetchone()
-            )
-            if not meta:
-                return
-            before = str(meta.get("status") or UNKNOWN)
-            account_changed = account_fp is not None and account_fp != meta.get("account_id_fingerprint")
-            conn.execute(
-                "UPDATE credential_meta SET status = ?, status_at = CASE WHEN status = ? THEN status_at ELSE ? END, "
-                "last_probe_result = coalesce(?, last_probe_result), "
-                "last_probe_at = coalesce(?, last_probe_at), "
-                "account_id_fingerprint = coalesce(?, account_id_fingerprint) WHERE id = 1",
-                (status, status, now, result_text, probed_at, account_fp),
-            )
-            if before != status or account_changed:
-                audit.record(
-                    conn,
-                    _EGRESS_ACTOR,
-                    "credential.status",
-                    "credential_status",
-                    {"status": before},
-                    {"status": status, "result": (result or {}).get("result")},
-                    None,
-                    request_id,
-                    at=now,
-                )
-                bump_version(conn, VERSION_KEY, now)
+        def write(conn: sqlite3.Connection) -> _Verdict | None:
+            meta = _row_dict(conn.execute("SELECT * FROM credential_meta WHERE id = 1").fetchone())
+            if not meta or not _describes(meta, value_fp):
+                return None
+            verdict = rule(meta)
+            _write_verdict(conn, meta, verdict, now=now, probed_at=probed_at, request_id=request_id)
+            return verdict
 
+        if budget_ms is None:
+            written: _Verdict | None = await self._dbs.control.write(write)
+        else:
+            written = await self._dbs.control.write(write, busy_timeout_ms=budget_ms)
+        return written
+
+    async def _record_verdict(
+        self,
+        rule: VerdictRule,
+        *,
+        value_fp: str | None,
+        probed_at: int | None = None,
+        request_id: str | None = None,
+        kind: str = "",
+    ) -> _Verdict | None:
+        """Apply what an answer about the value `value_fp` means (see `_write_tx`), then refresh.
+
+        Returns the verdict that counts (written, or kept in memory because control.db could not take a rejection),
+        or None when the answer was about a value `credential_meta` no longer describes: a replace, a deleted UI
+        value or another color's bootstrap file landed while the probe was on the wire, so the answer says nothing
+        about the value in use (finding constraints-2) and nothing is written or alerted.
+        """
         try:
-            await self._dbs.control.write(write)
+            verdict = await self._write_tx(rule, value_fp=value_fp, probed_at=probed_at, request_id=request_id)
         except SharedStateUnavailable as exc:
-            log.error("credential_status_not_saved", extra={"fields": {"error": str(exc)[:200], "status": status}})
+            verdict = self._keep_unsaved(rule, value_fp, exc)
+        else:
+            if verdict is None:
+                log.info("credential_verdict_moot", extra={"fields": {"kind": kind}})
         await self.refresh()
+        return verdict
+
+    def _keep_unsaved(self, rule: VerdictRule, value_fp: str | None, exc: Exception) -> _Verdict | None:
+        """control.db could not take a verdict: decide it from this worker's last read, and keep a rejection of the
+        value in the slot in memory so that value is not used here until control.db takes it (C7)."""
+        meta = self._meta
+        if meta and not _describes(meta, value_fp):
+            log.info("credential_verdict_moot", extra={"fields": {"saved": False}})
+            return None
+        verdict = rule(meta)
+        log.error(
+            "credential_status_not_saved",
+            extra={"fields": {"error": str(exc)[:200], "status": verdict.status or "unchanged"}},
+        )
+        target = value_fp or self._slot.fingerprint
+        if verdict.status == REJECTED and target is not None:
+            result = dict(verdict.result or {"result": REJECTED})
+            self._pending_rejection = (target, json.dumps(result, sort_keys=True)[:400])
+            self._pending_retry_at = self._clock.monotonic() + PENDING_RETRY_S
+        return verdict
 
     # --- probes -----------------------------------------------------------------------------------------------------
 
@@ -1274,9 +1510,13 @@ class CredentialManager:
             return ProbeResult(kind, "degraded", at=now)
         if grant is None:
             return ProbeResult(kind, "busy", at=now)
+        # The value this probe checks: its verdict is applied only while `credential_meta` still describes it
+        # (finding constraints-2). If a replace lands before `authorize` attaches the cookie, the new value is sent
+        # and its verdict is dropped as well: never applied to the wrong value, in either direction.
+        value_fp = self._slot.fingerprint
         started = self._clock.monotonic()
         try:
-            result = await self._run_probe(kind, fetch or self._default_fetch, now, started)
+            result = await self._run_probe(kind, fetch or self._default_fetch, now, started, value_fp)
         finally:
             # If hot.db is busy now, the lease simply expires on its own after ttl_ms.
             with contextlib.suppress(SharedStateUnavailable):
@@ -1286,7 +1526,9 @@ class CredentialManager:
                                                                        "status": result.status_code})  # fmt: skip
         return result
 
-    async def _run_probe(self, kind: str, fetch: ProbeFetch, now: int, started: float) -> ProbeResult:
+    async def _run_probe(
+        self, kind: str, fetch: ProbeFetch, now: int, started: float, value_fp: str | None
+    ) -> ProbeResult:
         url = str(self._setting("credential_probe_url", "https://users.roblox.com/v1/users/authenticated"))
         try:
             response = await fetch(url)
@@ -1299,60 +1541,58 @@ class CredentialManager:
         except EgressError as exc:
             outcome = type(exc).__name__
         else:
-            return await self._interpret_probe(kind, response, now, started)
+            return await self._interpret_probe(kind, response, now, started, value_fp)
         latency = round((self._clock.monotonic() - started) * 1000, 1)
-        await self._set_status(self._stored_status(), {"result": outcome, "kind": kind}, probed_at=now)
+        failed = _Verdict(outcome, None, {"result": outcome, "kind": kind})
+        await self._record_verdict(_fixed(failed), value_fp=value_fp, probed_at=now, kind=kind)
         return ProbeResult(kind, outcome, latency_ms=latency, at=now)
 
-    def _stored_status(self) -> str:
-        return str(self._meta.get("status") or UNKNOWN)
-
-    async def _interpret_probe(self, kind: str, response: ProbeAnswer, now: int, started: float) -> ProbeResult:
+    async def _interpret_probe(
+        self, kind: str, response: ProbeAnswer, now: int, started: float, value_fp: str | None
+    ) -> ProbeResult:
         latency = round((self._clock.monotonic() - started) * 1000, 1)
         code = response.status
+        base: dict[str, Any] = {"kind": kind, "status": code}
+        retry_s: int | None = None
+        rule: VerdictRule
         if code == 200:
             account = _account_id(response.body)
             if account is None:
-                await self._set_status(
-                    ACTIVE, {"result": "ok_no_account_id", "kind": kind, "status": code}, probed_at=now
-                )
-                return ProbeResult(kind, "ok_no_account_id", code, latency_ms=latency, at=now)
-            account_fp = fingerprint(account, self._fp_key)
-            recorded = self._meta.get("account_id_fingerprint")
-            if recorded is None or recorded == account_fp:
-                await self._set_status(
-                    ACTIVE, {"result": "ok", "kind": kind, "status": code}, account_fp=account_fp, probed_at=now
-                )
-                return ProbeResult(kind, "ok", code, account_match=True, latency_ms=latency, at=now)
-            await self._set_status(
-                REJECTED,
-                {"result": "account_mismatch", "kind": kind, "status": code, "pending_account": account_fp},
-                probed_at=now,
-            )
-            self._alert_rejected("account_mismatch")
-            return ProbeResult(kind, "account_mismatch", code, account_match=False, latency_ms=latency, at=now)
-        if code == 429:
+                rule = functools.partial(_unnamed_answer, base=base)
+            else:
+                rule = functools.partial(_named_answer, account_fp=fingerprint(account, self._fp_key), base=base)
+        elif code == 429:
             retry = retry_after_seconds(response.headers.get("retry-after"), self._clock.now())
             source = "retry_after" if retry is not None else "default"
             low = float(self._setting("cooldown_min_s", 1))
             high = float(self._setting("cooldown_max_s", 600))
             seconds = retry if retry is not None else float(self._setting("credential_cooldown_default_s", 60))
             seconds = min(max(seconds, low), high)
+            # The cooldown rests the account (the one credential), whichever value was sent: always applied.
             await self.set_cooldown(seconds, source)
-            await self._set_status(
-                self._stored_status(), {"result": "rate_limited", "kind": kind, "status": code}, probed_at=now
-            )
-            return ProbeResult(kind, "rate_limited", code, retry_after_s=math.ceil(seconds), latency_ms=latency, at=now)
-        if code in (401, 403):
-            await self._set_status(
-                REJECTED, {"result": f"rejected_{code}", "kind": kind, "status": code}, probed_at=now
-            )
-            self._alert_rejected(f"rejected_{code}")
-            return ProbeResult(kind, "rejected", code, latency_ms=latency, at=now)
-        await self._set_status(
-            self._stored_status(), {"result": f"http_{code}", "kind": kind, "status": code}, probed_at=now
+            retry_s = math.ceil(seconds)
+            rule = _fixed(_Verdict("rate_limited", None, {"result": "rate_limited", **base}))
+        elif code in (401, 403):
+            refused = {"result": f"rejected_{code}", **base}
+            rule = _fixed(_Verdict("rejected", REJECTED, refused, alert=f"rejected_{code}"))
+        else:
+            rule = _fixed(_Verdict(f"http_{code}", None, {"result": f"http_{code}", **base}))
+        # What the answer means for the value as this worker last saw it: the outcome reported when the verdict is
+        # moot (the answer is still true of the value that was sent; it just no longer decides anything).
+        seen = rule(self._meta)
+        verdict = await self._record_verdict(rule, value_fp=value_fp, probed_at=now, kind=kind)
+        if verdict is not None and verdict.alert:
+            self._alert_rejected(verdict.alert)
+        found = verdict or seen
+        return ProbeResult(
+            kind,
+            found.outcome,
+            code,
+            retry_after_s=retry_s,
+            account_match=found.account_match,
+            latency_ms=latency,
+            at=now,
         )
-        return ProbeResult(kind, f"http_{code}", code, latency_ms=latency, at=now)
 
     # --- admin actions ------------------------------------------------------------------------------------------------
 
@@ -1391,6 +1631,11 @@ class CredentialManager:
                 if item and item != new_fp and item not in superseded:
                     superseded.append(item)
             superseded = [item for item in superseded if item != new_fp][-MAX_SUPERSEDED:]
+            # The account of the value being replaced (or the one an earlier replace was still waiting to compare
+            # with): the new value's first answer says whether the account changed (finding docs_a-1). The new
+            # value itself starts with no account: a replace is the deliberate, confirmed way to switch (C1).
+            previous = meta.get("account_id_fingerprint") or _previous_account(meta)
+            marker = json.dumps({"previous_account": previous, "result": REPLACED}) if previous else None
             conn.execute(
                 "INSERT INTO credential_store (id, ciphertext, nonce, set_at, set_by) VALUES (1, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET ciphertext = excluded.ciphertext, nonce = excluded.nonce, "
@@ -1400,13 +1645,13 @@ class CredentialManager:
             conn.execute(
                 "INSERT INTO credential_meta (id, fingerprint, masked, account_id_fingerprint, "
                 "superseded_fingerprints_json, set_at, set_by, status, status_at, last_probe_at, last_probe_result) "
-                "VALUES (1, ?, ?, NULL, ?, ?, ?, 'unknown', ?, NULL, NULL) "
+                "VALUES (1, ?, ?, NULL, ?, ?, ?, 'unknown', ?, NULL, ?) "
                 "ON CONFLICT(id) DO UPDATE SET fingerprint = excluded.fingerprint, masked = excluded.masked, "
                 "account_id_fingerprint = NULL, superseded_fingerprints_json = excluded.superseded_fingerprints_json, "
                 "set_at = excluded.set_at, set_by = excluded.set_by, status = 'unknown', "
                 "status_at = excluded.status_at, "
-                "last_probe_result = NULL",
-                (new_fp, after["masked"], json.dumps(superseded), now, actor.label, now),
+                "last_probe_result = excluded.last_probe_result",
+                (new_fp, after["masked"], json.dumps(superseded), now, actor.label, now, marker),
             )
             before = {"fingerprint": old_fp, "masked": meta.get("masked") or ""} if old_fp else None
             audit.record(conn, actor, "credential.replace", "credential", before, after, reason, request_id, at=now)
@@ -1469,12 +1714,15 @@ class CredentialManager:
     ) -> CredentialStatus:
         """Accept the account the last probe saw after an `account_mismatch` (the typed C1 confirmation)."""
         now = int(self._clock.now())
+        # A mismatch control.db could not record yet is offered to it first, so it can be confirmed (C7).
+        self._pending_retry_at = 0.0
+        await self._share_pending_rejection()
 
         def write(conn: sqlite3.Connection) -> int:
             meta = _row_dict(conn.execute("SELECT * FROM credential_meta WHERE id = 1").fetchone())
             result = _json_obj(meta.get("last_probe_result")) or {}
             pending = result.get("pending_account")
-            if result.get("result") != "account_mismatch" or not isinstance(pending, str):
+            if result.get("result") != ACCOUNT_MISMATCH or not isinstance(pending, str):
                 raise CredentialStateError("the last probe did not report a different account to confirm")
             conn.execute(
                 "UPDATE credential_meta SET account_id_fingerprint = ?, status = 'active', status_at = ?, "
@@ -1531,6 +1779,8 @@ class CredentialManager:
 
 
 __all__ = [
+    "ACCOUNT_CHANGED",
+    "ACCOUNT_MISMATCH",
     "BOOTSTRAP_FILE_NAME",
     "BOOTSTRAP_SECRET_NAME",
     "COOLDOWN_KEY",
@@ -1538,9 +1788,11 @@ __all__ = [
     "DECODE_ROUNDS",
     "HOT_WRITE_BUDGET_MS",
     "IN_USE_SECRET_NAME",
+    "PENDING_RETRY_S",
     "PROBE_LEASE",
     "PUBLIC_RUN",
     "PUBLIC_TEXTS",
+    "REPLACED",
     "VERSION_KEY",
     "CredentialManager",
     "CredentialSlot",

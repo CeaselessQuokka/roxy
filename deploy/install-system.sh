@@ -25,7 +25,9 @@
 # How it works
 #   Every step is idempotent: directories get their mode and owner set every time, files are installed with
 #   `install -m` (replacing older copies), and files that hold local configuration (the env files, the
-#   credential files) are only created when missing, never overwritten. `--prefix DIR` installs under DIR without
+#   credential files) are only created when missing, never overwritten. Directories and those local files are
+#   handled by descriptor (a small system Python helper, `SECURE_FS`), never by path, because some of them sit in
+#   directories another account can change (the deploy user's /opt/roxy, v1's /etc/roxy). `--prefix DIR` installs under DIR without
 #   creating accounts, changing owners or calling systemctl, which is how tests/deploy checks it (there,
 #   ROXY_INSTALL_UID and ROXY_SETFACL stand in for root and setfacl; they are ignored on the real system). The
 #   sudo rules are rendered for the deploy user into a temporary file, checked with `visudo -c`, and only then
@@ -96,35 +98,161 @@ VISUDO="$(command -v visudo || true)"
 
 log() { printf 'install-system: %s\n' "$*"; }
 
-# A directory with an exact mode, and (on the real system) an owner and group. Never through a symlink: some of
-# these live in directories other accounts own (/opt/roxy is the deploy user's), and chmod and chown follow links,
-# so a planted /opt/roxy/releases -> /etc/sudoers.d would otherwise hand that directory to the deploy user.
-directory() {
-  local path="$PREFIX$1" mode="$2" owner="$3"
-  if [ -L "$path" ]; then
-    echo "install-system.sh: $1 is a symlink; refusing to change its target (remove the link and run this again)" >&2
-    exit 1
-  fi
-  mkdir -p "$path"
-  chmod "$mode" "$path"
-  if [ "$SYSTEM" = 1 ]; then chown "$owner" "$path"; fi
+# The system Python runs the descriptor-based helper below (it has os.fchmod, os.fchown and dir_fd; bash has not).
+PYTHON3=/usr/bin/python3
+[ -x "$PYTHON3" ] || PYTHON3="$(command -v python3 || true)"
+# Where the helper's directory walk starts: / on the server, the real path of --prefix in a test install (set
+# after the checks below, which must change nothing).
+BASE=/
+
+# Directories and local configuration files are made by descriptor, never by path. Some of them live in
+# directories another account owns (/opt/roxy and so /opt/roxy/releases, deploy.sh and deploy_rollback.sh belong to
+# the deploy user; /etc/roxy to v1's account until the cutover), and that account may rename entries there at any
+# moment. chmod, chown and install by path follow a link swapped in after any check (finding sec-1: a link to
+# /etc/systemd/system in place of /opt/roxy/releases, or to /etc/shadow in place of a deploy.sh this script is
+# about to chown, would hand a root file to the deploy user, plan 9.14). So the helper walks the path one
+# component at a time with O_NOFOLLOW (a link is followed only inside a directory no other account can write),
+# opens the final directory with O_NOFOLLOW and changes its mode and owner through that descriptor (fchmod,
+# fchown), and creates a file with O_CREAT|O_EXCL|O_NOFOLLOW under a temporary name, then links it into place
+# (never over an existing name), so whatever stands at a name, root never writes or chowns through it.
+SECURE_FS='
+import errno, grp, os, pwd, shutil, stat, sys
+
+PREFIX = "install-system.sh: "
+
+
+def die(message):
+    sys.stderr.write(PREFIX + message + "\n")
+    sys.exit(1)
+
+
+def ids(owner):
+    """(uid, gid) of "user:group", or None in a --prefix install (no owner changes)."""
+    if not owner:
+        return None
+    user, _, group = owner.partition(":")
+    return pwd.getpwnam(user).pw_uid, grp.getgrnam(group or user).gr_gid
+
+
+def trusted(fd):
+    """A directory only this account (root on the server) can change, so a link in it was made by root."""
+    st = os.fstat(fd)
+    return st.st_uid == os.geteuid() and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+
+def is_link(name, fd):
+    try:
+        return stat.S_ISLNK(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def parent_of(base, shown):
+    """A descriptor of the directory that holds the last component of the path, made as needed, and that name."""
+    parts = [part for part in shown.split("/") if part]
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    for name in parts[:-1]:
+        try:
+            os.mkdir(name, 0o755, dir_fd=fd)
+        except FileExistsError:
+            pass
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        if not (is_link(name, fd) and trusted(fd)):
+            flags |= os.O_NOFOLLOW
+        try:
+            inner = os.open(name, flags, dir_fd=fd)
+        except OSError as exc:
+            if is_link(name, fd):
+                die(f"{shown}: {name} is a symlink in a directory another account can change; refusing to follow it")
+            die(f"{shown}: cannot open {name} ({exc.strerror})")
+        os.close(fd)
+        fd = inner
+    return fd, parts[-1]
+
+
+def directory(base, shown, mode, owner):
+    fd, name = parent_of(base, shown)
+    try:
+        os.mkdir(name, 0o700, dir_fd=fd)  # opened up below, through the descriptor
+    except FileExistsError:
+        pass
+    try:
+        target = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+    except OSError as exc:
+        if is_link(name, fd):
+            die(f"{shown} is a symlink; refusing to change its target (remove the link and run this again)")
+        die(f"{shown} is not a directory ({exc.strerror})")
+    os.fchmod(target, int(mode, 8))
+    wanted = ids(owner)
+    if wanted is not None:
+        os.fchown(target, *wanted)
+
+
+def file_once(base, source, shown, mode, owner):
+    fd, name = parent_of(base, shown)
+    try:
+        os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        print(f"install-system: keeping the existing {shown}")
+        return
+    temporary = f".{name}.install-{os.getpid()}"
+    out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=fd)
+    try:
+        with open(source, "rb") as data, os.fdopen(out, "wb", closefd=False) as handle:
+            shutil.copyfileobj(data, handle)
+        os.fchmod(out, int(mode, 8))
+        wanted = ids(owner)
+        if wanted is not None:
+            os.fchown(out, *wanted)
+        try:
+            os.link(temporary, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+        except FileExistsError:
+            print(f"install-system: keeping the existing {shown}")
+    finally:
+        os.close(out)
+        try:
+            os.unlink(temporary, dir_fd=fd)  # unlink never follows a link, whatever now stands at the name
+        except FileNotFoundError:
+            pass
+
+
+command, base = sys.argv[1], sys.argv[2]
+if command == "dir":
+    directory(base, *sys.argv[3:6])
+elif command == "file-once":
+    file_once(base, *sys.argv[3:7])
+else:
+    die(f"unknown helper command {command}")
+'
+
+# Run the helper; the owner is only passed on the real system (a --prefix install changes no owner).
+secure_fs() {
+  "$PYTHON3" -I -c "$SECURE_FS" "$@"
 }
 
-# Install one file (replacing an older copy).
+# A directory with an exact mode, and (on the real system) an owner and group, never through a symlink (above).
+directory() {
+  local owner=""
+  if [ "$SYSTEM" = 1 ]; then owner="$3"; fi
+  secure_fs dir "$BASE" "$1" "$2" "$owner"
+}
+
+# Install one file into a root-owned directory (replacing an older copy). No other account can rename entries in
+# these directories (/etc/systemd/system, /usr/local/lib/roxy, /usr/local/sbin, /etc/sudoers.d), so by path is safe.
 file() {
   local source="$1" target="$PREFIX$2" mode="$3" owner="$4"
   install -D -m "$mode" "$source" "$target"
   if [ "$SYSTEM" = 1 ]; then chown "$owner" "$target"; fi
 }
 
-# Install a file only when it does not exist yet (local configuration is never overwritten).
+# Install a file only when nothing stands at its name yet (local configuration is never overwritten), through the
+# descriptor helper: these files live in directories another account may own (/opt/roxy, a v1 /etc/roxy).
 file_once() {
-  local target="$PREFIX$2"
-  if [ -e "$target" ]; then
-    log "keeping the existing $2"
-    return 0
-  fi
-  file "$@"
+  local owner=""
+  if [ "$SYSTEM" = 1 ]; then owner="$4"; fi
+  secure_fs file-once "$BASE" "$1" "$2" "$3" "$owner"
 }
 
 # Checks that can refuse the whole run come first, so a refusal changes nothing.
@@ -143,6 +271,15 @@ fi
 if [ "$SYSTEM" = 1 ] && [ -z "$VISUDO" ]; then
   echo "install-system.sh: visudo is missing; sudo rules are never installed unchecked. Nothing was changed." >&2
   exit 1
+fi
+if [ -z "$PYTHON3" ]; then
+  echo "install-system.sh: python3 is missing (Ubuntu ships it); directories are never set up by path. Nothing" \
+    "was changed." >&2
+  exit 1
+fi
+if [ "$SYSTEM" = 0 ]; then
+  mkdir -p "$PREFIX"
+  BASE="$(cd "$PREFIX" && pwd -P)"
 fi
 
 if [ "$SYSTEM" = 1 ]; then

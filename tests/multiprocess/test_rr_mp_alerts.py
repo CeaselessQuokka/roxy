@@ -95,7 +95,7 @@ class _Settings:
 async def test_rr_mp_alert_cap_holds_for_the_hour_across_a_hot_db_outage(hot_path: str, procs: list[Any]) -> None:
     from pydantic import SecretStr
 
-    from roxy.admin.auth.testing import RecordingTransport
+    from auth_harness import RecordingTransport
     from roxy.notify import gate
     from roxy.notify.alerts import Alert
     from roxy.notify.mail import MailConfig, MailSender

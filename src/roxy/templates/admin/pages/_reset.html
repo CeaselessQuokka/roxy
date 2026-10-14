@@ -9,7 +9,8 @@
   metric family, the typed phrase (`typeConfirm` keeps the button off until it matches). An endpoint template is
   caller text: it is shown through `caller_text` and travels only as a form value, never in a link or a script.
   Context: `frame`, `reset` (InlineReset), `preview`, `tables`, `families`, `template`, `scope`, `phrase`,
-  `api_url`, `nothing`.
+  `api_url`, `nothing`, `snapshot_keep_days`, `restore_href`. A snapshot is a whole-file copy: the dashboard cannot
+  put it back, so the drawer says how long it is kept and where the restore steps are (finding docs_a-7).
 -#}
 {% from "components/icon.html" import icon %}
 {% from "components/format.html" import num, caller_text %}
@@ -49,7 +50,7 @@
     {% if preview.snapshots %}
     <ul class="inline-reset__snapshots">
       {% for snap in preview.snapshots %}
-      <li>{% if snap.feasible %}{{ icon("check-circle") }}<span>A copy of {{ snap.db }}.db is taken first, so this can be undone from Data &gt; Backups.</span>{% else %}{{ icon("alert-triangle") }}<span>No copy of {{ snap.db }}.db can be taken first: {{ snap.reason }} The reset cannot be undone.</span>{% endif %}</li>
+      <li>{% if snap.feasible %}{{ icon("check-circle") }}<span>A copy of {{ snap.db }}.db is taken first and kept {{ num(snapshot_keep_days) }} {{ "day" if snapshot_keep_days == 1 else "days" }} (listed on Data &gt; Backups). Putting it back is a restore on the server that also drops what was recorded after the reset: see <a href="{{ restore_href }}">Restore from backup</a>.</span>{% else %}{{ icon("alert-triangle") }}<span>No copy of {{ snap.db }}.db can be taken first: {{ snap.reason }} The reset cannot be undone.</span>{% endif %}</li>
       {% endfor %}
     </ul>
     {% endif %}

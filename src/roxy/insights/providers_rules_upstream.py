@@ -4,8 +4,9 @@ User-Agent experiment arms, and a window helper.
 What this is
     - `rotator_status(ctx) -> RotatorStatus`: whether the rotator could take more traffic right now (switched on,
       not parked, not disabled by the leak guard, a monthly quota configured and not used up, daily cap not hit),
-      read with the rotator's own budget arithmetic (`egress/rotator.py usage_since` and `cycle_start_for`), so a
-      recommendation and the hard stop never disagree about the bytes of this billing cycle.
+      read with the rotator's own budget arithmetic (`egress/rotator.py read_billed_bytes` and `cycle_start_for`:
+      egress_usage and the billing count no statistics reset lowers, finding data-4), so a recommendation and the
+      hard stop never disagree about the bytes of this billing cycle.
     - `ua_experiment_arms(ctx)`: the two arms of the User-Agent experiment (D23): calls and Roblox 429s per
       User-Agent. The provider seam `InsightProviders.ua_experiment()` wins when it knows the numbers (the fixture
       harness fills it; a future per-arm counter in the upstream recorder would too). Otherwise the arms are
@@ -22,12 +23,16 @@ Why it exists
     nothing is written.
 
 How it works
-    `rotator_status` reads two numbers from metrics.db (this cycle's and today's rotator bytes) and two facts the
-    context already memoizes (active cooldown rows, for the park key, and the leak guard's `service_state` row).
+    `rotator_status` reads two numbers (this cycle's and today's rotator bytes, from metrics.db and the billing
+    count in control.db) and two facts the context already memoizes (active cooldown rows, for the park key, and
+    the leak guard's `service_state` row).
     `ua_experiment_arms` counts the samples since the experiment (or one of its User-Agent strings) last changed,
-    bounded by `request_sample_hours`, in SQL per experiment identity (`InsightContext.ua_arm_counts`, every sample
-    of the span; at most `read_history.MAX_ROWS` identities, and a `note` says when more had calls): an estimate,
-    labeled as one, whose call counts are sampled calls (a lower bound when `request_sample_pct` is below 100).
+    bounded by `request_sample_hours` and by the end of the run (`ua_experiment_days` after the newest recorded
+    change of those keys, when `egress/headers.py` stops splitting; review finding brain-7), in SQL per experiment
+    identity
+    (`InsightContext.ua_arm_counts`, every sample of the span; at most `read_history.MAX_ROWS` identities, and a
+    `note` says when more had calls): an estimate, labeled as one, whose call counts are sampled calls (a lower
+    bound when `request_sample_pct` is below 100).
 
 What to read next
     `roxy/insights/rules/upstream.py` (the rules that use these), `roxy/egress/rotator.py` (the budget),
@@ -41,10 +46,11 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Final
 
+from roxy.config import read_settings
 from roxy.core.reasons import Egress
 from roxy.egress.clients import DISABLED_KEY_PREFIX
-from roxy.egress.headers import HeaderProfiles
-from roxy.egress.rotator import DECIMAL_GB, DECIMAL_MB, PARK_KEY, cycle_start_for, day_start_for, usage_since
+from roxy.egress.headers import DAY_S, HeaderProfiles
+from roxy.egress.rotator import DECIMAL_GB, DECIMAL_MB, PARK_KEY, cycle_start_for, day_start_for, read_billed_bytes
 from roxy.insights.context import InsightContext
 from roxy.metrics.queries import Window
 
@@ -117,11 +123,9 @@ async def rotator_status(ctx: InsightContext) -> RotatorStatus:
     cycle = cycle_start_for(ctx.now, int(ctx.setting("rotator_billing_day")))
     day = day_start_for(ctx.now)
 
-    def read(conn: Any) -> tuple[int, int]:
-        # The rotator's own budget read (finest rows first), so this agrees with its hard stop byte for byte.
-        return usage_since(conn, Egress.ROTATOR.value, cycle), usage_since(conn, Egress.ROTATOR.value, day)
-
-    cycle_bytes, day_bytes = await ctx.dbs.metrics.read(read)
+    # The rotator's own budget read (egress_usage, finest rows first, and its billing count in control.db, which no
+    # statistics reset lowers: finding data-4), so this agrees with its hard stop.
+    cycle_bytes, day_bytes = await read_billed_bytes(ctx.dbs, cycle, day)
     status = RotatorStatus(enabled, parked, guard_disabled, quota, hard_stop, cap, cycle_bytes, day_bytes)
     if not enabled:
         status.reasons.append("the rotator is switched off (rotator_enabled is 0)")
@@ -162,9 +166,19 @@ async def ua_experiment_arms(ctx: InsightContext) -> dict[str, Any] | None:
     started = await experiment_started_at(ctx, window.start)
     if started >= window.end:
         return None
+    # Only calls made while the egress layer split them: `ua_experiment_days` from the newest recorded change of the
+    # experiment keys (`egress/headers.py`, review finding brain-7). Samples after the run's end all carried
+    # direct_user_agent and would be counted half in the alternative arm. History keeps each key's newest row, so a
+    # missing record only happens in a context seeded without history; the sample window alone bounds it then.
+    end = float(window.end)
+    recorded = await ctx.dbs.control.read(lambda conn: read_settings.latest_change_at(conn, UA_EXPERIMENT_KEYS))
+    if recorded is not None:
+        end = min(end, float(recorded) + float(ctx.setting("ua_experiment_days")) * DAY_S)
+        if started >= end:
+            return None
     # Counted in SQL per identity over every sample of the span (gaps_insights G7; reading the rows stopped at the
     # oldest 50,000 of a busy day), then each identity's arm is assigned here exactly as for one sample row.
-    counts = await ctx.ua_arm_counts(span_window(started, window.end))
+    counts = await ctx.ua_arm_counts(span_window(started, end))
     arms = arms_from_counts(counts.rows, ctx.settings)
     if not counts.complete:
         arms["note"] = (

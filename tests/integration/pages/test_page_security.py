@@ -515,7 +515,7 @@ async def test_recovery_codes_show_counts_only_and_regenerate_needs_a_fresh_fact
 async def test_passkeys_are_added_renamed_and_deleted_through_the_cards_urls(
     page: Any, pages_app: Any, inert: Any
 ) -> None:
-    from roxy.admin.auth.testing import SoftwarePasskey
+    from auth_harness import SoftwarePasskey
 
     doc = parse_html((await page.fragment("security", "passkeys")).text)
     add = doc.select_one("form[data-passkey-add]")

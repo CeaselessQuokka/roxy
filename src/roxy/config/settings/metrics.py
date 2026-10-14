@@ -128,9 +128,11 @@ SETTINGS: list[SettingSpec] = [
         step=1000,
         description=(
             "The most events, Roblox 429 records, body captures and fingerprints one worker may hold in memory "
-            "while waiting for its next write to the statistics database. When the queue is full the oldest "
-            "low-priority items are dropped and counted on the System page, so a burst of traffic can never "
-            "grow the queue without limit."
+            "while waiting for its next write to the statistics database (a count of items, whatever their "
+            "size). When the queue is full the oldest low-priority items are dropped and counted on the System "
+            "page, so a burst of traffic can never grow the queue without limit. Queued body captures are also "
+            "held within capture_max_records and capture_max_bytes: past those the oldest captures leave the "
+            "queue, counted as capped, not dropped (the capture table would keep no more of them anyway)."
         ),
         pages=(_PIPELINE,),
         if_raised=(
@@ -866,18 +868,20 @@ SETTINGS: list[SettingSpec] = [
         max=5000,
         step=1,
         description=(
-            "How many recent requests each worker keeps in memory for the Live view, so opening the page shows "
-            "recent history at once instead of an empty list. New requests stream in live regardless of this "
-            "setting."
+            "How many recent requests each worker also keeps in memory. The Live page opens with the newest rows "
+            "of the shared metrics database and streams new requests whatever this says; this worker's memory only "
+            "fills gaps: rows the database does not hold yet (not written, or sampled out above the live row rate) "
+            "are added to the Live list and to a request's details, and the capture card shows its size."
         ),
         pages=(_PIPELINE, _LIVE_TAIL),
         if_raised=(
-            "You can scroll further back in the Live view, at the cost of a little more memory per worker (each "
-            "row holds the request summary and up to 2,000 characters of body)."
+            "More of this worker's own recent rows can fill gaps in the Live list and the request details, at the "
+            "cost of a little more memory per worker (each row holds the request summary and up to 2,000 "
+            "characters of body)."
         ),
         if_lowered=(
-            "Less memory is used and the Live view opens with less history. 0 keeps none, so only requests that "
-            "arrive while the page is open appear."
+            "Less memory is used, and fewer rows the database skipped or has not written yet can be shown. 0 keeps "
+            "none: the Live view then shows only what the metrics database holds."
         ),
         risk=Risk.LOW,
         apply=Apply.LIVE,
@@ -1287,7 +1291,8 @@ SETTINGS: list[SettingSpec] = [
         ),
         pages=(_CAPTURE,),
         if_enabled=(
-            "Every refused request and a sample of served requests (capture_sample_served_pct) are captured. "
+            "Every refused or failed request and a sample of served requests (capture_sample_served_pct) are "
+            "captured. "
             "This stores caller data, such as player names and ids in request bodies, on disk for up to "
             "capture_ttl_seconds."
         ),
@@ -1447,15 +1452,18 @@ SETTINGS: list[SettingSpec] = [
         step=1,
         description=(
             "What share of successfully served requests (answered from Roblox or from the cache) are captured. "
-            "Refused requests are always captured while capture is on, because those are usually the ones you "
-            "need to investigate."
+            "Refused and failed requests are always captured while capture is on, because those are usually the "
+            "ones you need to investigate."
         ),
         pages=(_CAPTURE,),
         if_raised=(
             "More examples of normal traffic are captured, at the cost of more caller data stored, more disk and "
             "a little more CPU per request. At 100 every request is captured, as in v1."
         ),
-        if_lowered="Fewer normal requests are captured; refusals still are. 0 captures refusals only.",
+        if_lowered=(
+            "Fewer normal requests are captured; refusals and failures still are. 0 captures refusals and failures "
+            "only."
+        ),
         risk=Risk.LOW,
         apply=Apply.LIVE,
         related_settings=("capture_enabled", "capture_max_records", "metrics_queue_max"),

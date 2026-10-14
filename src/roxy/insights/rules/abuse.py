@@ -43,7 +43,7 @@ from urllib.parse import urlencode
 
 from roxy.abuse.bans import REPEAT_WINDOW_S, ban_subject_for, escalated_minutes, ua_hash
 from roxy.abuse.bot import in_networks
-from roxy.abuse.spam import DETECTORS
+from roxy.abuse.spam import DETECTORS, SHARED_OVERFLOW_SUBJECTS
 from roxy.config import catalog
 from roxy.config.spec import RiskOp
 from roxy.insights import providers_rules_abuse_system as facts
@@ -51,6 +51,7 @@ from roxy.insights.context import InsightContext
 from roxy.insights.models import Evidence, ProposedChange, Recommendation, iso
 from roxy.insights.rules.base import Rule, register
 from roxy.insights.simulate import names_template, template_match
+from roxy.metrics import queries
 from roxy.metrics.templating import OTHER
 from roxy.rules.match import compile_pattern, specificity
 
@@ -103,6 +104,10 @@ FILTER_REASONS: Final[dict[str, str]] = {
 """The abuse filter tables and the refusal reason each one writes (DESIGN 6)."""
 PATTERN_TABLES: Final = frozenset({"rules_endpoint_block", "rules_endpoint_limit"})
 CLIENTS_LINK: Final = "/admin/clients"
+RULE_HIT_TABLES: Final = ("metrics.rule_hits", "metrics.rule_hit_minute")
+"""Where a filter's or bypass entry's hits are recorded (`<db>.<table>`, as a reset marker lists them)."""
+CLIENT_TABLES: Final = tuple(f"metrics.{table}" for table, _unit in queries.CLIENT_LEVELS)
+"""The client tables `FilterRemove._seen_lately` reads (a bypass entry's fallback evidence)."""
 
 
 def clients_link(**params: object) -> str:
@@ -127,6 +132,15 @@ def is_active(row: Mapping[str, Any], now: float) -> bool:
 def bypass_rows(rows: Iterable[Mapping[str, Any]], now: float) -> list[Mapping[str, Any]]:
     """Active bypass entries of the access list."""
     return [row for row in rows if row.get("kind") == "bypass" and is_active(row, now)]
+
+
+def bypass_skips() -> str:
+    """What a bypass entry lets a request skip, in the dashboard's words (`admin/pages/texts.bypass_scope`, built
+    from the checks' own `skipped_by_bypass` flags), so the recommendations name the same checks as the Bypass card,
+    the client dialog and the catalog (review finding abuse-6: they named only the per-IP and place limits)."""
+    from roxy.admin.pages.texts import bypass_scope  # lazy: the dashboard's words for the abuse checks
+
+    return bypass_scope()["skips"]
 
 
 def banned_subjects(rows: Iterable[Mapping[str, Any]], now: float) -> set[tuple[str, str]]:
@@ -286,6 +300,8 @@ class AbuseSpam(Rule):
             subject = str(detail.get("subject") or "")
             if detector.upper() == DIST_DETECTOR or not subject:
                 continue  # SPAM-DIST is ABUSE-DIST's
+            if subject in SHARED_OVERFLOW_SUBJECTS:
+                continue  # a fold every client feeds names nobody (the detectors never emit one; finding abuse-16)
             client = _client_of(subject)
             key = f"ip:{client}" if client else subject
             entry = subjects.setdefault(key, _SpamSubject(key))
@@ -797,7 +813,9 @@ class FilterRemove(Rule):
     the rollups show a refusal they would have made), for a bypass entry unused for `idle_bypass_days` days (remove
     it) or with no expiry at all (set one), and for an active ban on a place that was one of the busiest legitimate
     places before the ban (its traffic was served, by the FILTER-COLLATERAL measure). One recommendation per object:
-    remove it, or for a bypass entry still in use, give it an expiry.
+    remove it, or for a bypass entry still in use, give it an expiry. Idleness never spans a data reset of the
+    evidence it reads (the hit record, the refusals in the rollups, the client tables): after such a reset an object
+    waits its whole idle period again, and an older reset is named instead of "never matched" (final review data-2).
     """
 
     id = "FILTER-REMOVE"
@@ -831,17 +849,33 @@ class FilterRemove(Rule):
         since = float(last_hit) if last_hit is not None else created
         if ctx.now - since <= idle_s:
             return None
+        # The evidence this rule reads (the hit record, and the refusals in the rollups for pattern and header
+        # filters) starts again at a data reset: a reset inside the idle window leaves too little history to call
+        # the filter idle, and an older one makes "never matched" untrue (final review data-2).
+        tables = RULE_HIT_TABLES if table == "rules_user_agent" else (*RULE_HIT_TABLES, *queries.ROLLUP_TABLES)
+        if await ctx.data_reset_at(tables, max(since, ctx.now - idle_s)) is not None:
+            return None
         if table != "rules_user_agent" and await self._refused_lately(ctx, table, row, ctx.now - idle_s):
             return None
+        reset_at = await ctx.data_reset_at(tables, since)
+        if reset_at is not None:
+            since = max(since, reset_at)
         days = (ctx.now - since) / DAY_S
         evidence = Evidence(window_from=ctx.now - idle_s, window_to=ctx.now, sample_size=1)
         evidence.add("idle_days", round(days, 1), "days")
         evidence.add("age_days", round((ctx.now - created) / DAY_S, 1), "days")
         evidence.details["last_hit_at"] = iso(last_hit)
+        if reset_at is not None:
+            evidence.details["data_reset_at"] = iso(reset_at)
         evidence.details["row"] = dict(row)
         evidence.links.append(f"{PROTECTION_LINK}#filters")
         label = filter_label(table, row)
-        never = "has never matched a request" if last_hit is None else f"last matched {days:.0f} days ago"
+        if reset_at is not None:
+            never = f"has no recorded hit since the data reset on {iso(reset_at)}"
+        elif last_hit is None:
+            never = "has never matched a request"
+        else:
+            never = f"last matched {days:.0f} days ago"
         return self.recommendation(
             ctx,
             subject=f"{table}:{row['id']}",
@@ -879,7 +913,12 @@ class FilterRemove(Rule):
             last_hit = (hits.get(("access_list", str(row["id"]))) or {}).get("last_hit_at")
             created = float(row.get("created_at") or ctx.now)
             since = float(last_hit) if last_hit is not None else created
-            idle = ctx.now - since > idle_s and not await self._seen_lately(ctx, str(row["cidr"]), ctx.now - idle_s)
+            idle = ctx.now - since > idle_s
+            if idle and await ctx.data_reset_at((*RULE_HIT_TABLES, *CLIENT_TABLES), ctx.now - idle_s) is not None:
+                # A data reset inside the window deleted the hits and the client rows that show the entry in use:
+                # too little history to call it unused (final review data-2).
+                idle = False
+            idle = idle and not await self._seen_lately(ctx, str(row["cidr"]), ctx.now - idle_s)
             forever = row.get("expires_at") is None
             if not idle and not forever:
                 continue
@@ -915,8 +954,8 @@ class FilterRemove(Rule):
                     severity="info",
                     confidence="high",
                     explanation=(
-                        f"The bypass entry {cidr} ({row.get('note') or 'no note'}) lets every request from it skip the "
-                        f"per-IP limit, the place limit and the tarpit, and {why}. The change {what}."
+                        f"The bypass entry {cidr} ({row.get('note') or 'no note'}) lets every request from it skip "
+                        f"{bypass_skips()}, and {why}. The change {what}."
                     ),
                     evidence=evidence,
                     changes=[change],

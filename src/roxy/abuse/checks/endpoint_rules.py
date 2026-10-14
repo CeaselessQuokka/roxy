@@ -5,7 +5,8 @@ What this is
 
 Why it exists
     v1 parity plus the `place` and `global` scopes. The budget is a limiter row evaluated in the single hot.db
-    transaction, so it holds exactly across workers.
+    transaction, so it holds exactly across workers. A `place` budget follows `place_limit_key` like the place limit
+    (per place and caller network by default), because the `Roblox-Id` header is a claim anyone can forge.
 
 How it works
     Refusal 429: the rule's message or `This endpoint is rate-limited for you; try again in N seconds.`. Headers as
@@ -33,6 +34,7 @@ from roxy.abuse.checks.base import (
     refusal_headers,
     with_trio,
 )
+from roxy.abuse.checks.place_limit import caller_network
 from roxy.abuse.endpoint_rules import endpoint_limit, endpoint_rule_message, match_endpoint_rule
 from roxy.abuse.messages import REASON_RATE_RULE
 from roxy.abuse.verdict import TRUE, Refuse
@@ -55,11 +57,15 @@ class EndpointRuleCheck(Check):
         if rule is None:
             return None
         facts.note_match(TABLE_ENDPOINT_LIMIT, rule.id)  # matched, whether its budget admits or refuses
+        # A per-experience budget is keyed like the place limit: with `place_limit_key = place_prefix` (default) per
+        # place AND caller network, so a forged Roblox-Id never spends a real game's budget (finding abuse-15).
+        network = caller_network(facts.ip, facts.limit_key) if facts.str("place_limit_key") == "place_prefix" else None
         key, limit, period = endpoint_limit(
             rule,
             limit_key=facts.limit_key,
             place_id=getattr(req, "place_id", None),
             allowed_per_ip=facts.int("allowed_requests_per_minute"),
+            place_network=network,
         )
         return LimitSpec(self.name, key, "fixed", limit=limit, window_s=period, payload=rule)
 

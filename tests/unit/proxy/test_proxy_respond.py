@@ -209,6 +209,44 @@ def test_compat_collapse_of_a_5xx_uses_the_failure_text(fakes: Any) -> None:
     assert (timeout.status, timeout.body) == (500, respond.UPSTREAM_FAILED_TEXT.encode())
 
 
+ROBLOX_429_BODY = b'{"errors":[{"code":0,"message":"Too many requests"}]}'
+
+
+def test_compat_collapse_of_a_roblox_429_keeps_robloxs_body_and_retry_after(fakes: Any) -> None:
+    """Final review pipe-4: a Roblox 429 is a Roblox 4xx. In compat mode the answer of a request whose own call
+    Roblox answered with 429 is 500 with Roblox's body (v1's `last_response`) and Retry-After; off, it stays 429 with
+    the busy text. A cooldown answer that made no call (no upstream status) is Roxy's back pressure: still 429."""
+    roblox_429 = respond.failure_result(
+        ReasonCode.UPSTREAM_COOLDOWN,
+        status=429,
+        upstream_status=429,
+        retry_after_s=30,
+        cooldown_s=30,
+        upstream_body=ROBLOX_429_BODY,
+        upstream_content_type="application/json; charset=utf-8",
+    )
+    rendered = respond.render(fakes.make_req(), roblox_429, compat_collapse=True)
+    assert (rendered.status, rendered.body, rendered.content_type) == (500, ROBLOX_429_BODY, "application/json")
+    assert rendered.header("Retry-After") == "30"
+    assert rendered.header("Roxy-Upstream-Status") == "429"
+    assert rendered.header("Roxy-Refusal") is None
+    assert (rendered.collapsed, rendered.outcome, rendered.source) == (True, Outcome.FAILED, Source.ROBLOX)
+    browser = respond.render(fakes.make_req(is_browser=True), roblox_429, compat_collapse=True)
+    assert (browser.status, browser.body) == (500, respond.html_pre(ROBLOX_429_BODY))
+    off = respond.render(fakes.make_req(), roblox_429, compat_collapse=False)
+    assert (off.status, off.body, off.header("Roxy-Refusal")) == (
+        429,
+        respond.UPSTREAM_BUSY_TEXT.encode(),
+        "upstream_cooldown",
+    )
+    no_call = respond.failure_result(ReasonCode.UPSTREAM_COOLDOWN, status=429, retry_after_s=12, cooldown_s=12)
+    kept = respond.render(fakes.make_req(), no_call, compat_collapse=True)
+    assert (kept.status, kept.header("Retry-After"), kept.collapsed) == (429, "12", False)
+    follower = respond.failure_result(ReasonCode.UPSTREAM_COOLDOWN, status=429, upstream_status=429, retry_after_s=9)
+    shared = respond.render(fakes.make_req(), follower, compat_collapse=True)  # the owner's status, no Roblox body
+    assert (shared.status, shared.body, shared.header("Retry-After")) == (500, respond.UPSTREAM_BUSY_TEXT.encode(), "9")
+
+
 @pytest.mark.parametrize("status", [204, 304])
 def test_no_body_statuses(fakes: Any, status: int) -> None:
     rendered = respond.render(fakes.make_req(prettyprint=True, is_browser=True), fakes.served(body=b"", status=status))

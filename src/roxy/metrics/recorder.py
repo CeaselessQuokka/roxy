@@ -43,6 +43,10 @@ How it works
       (`record_attempts`, `record_attempt`). They are summed in bounded maps and written by one batch kind,
       `metrics.insight_history`, with upserts that add up across workers. The `note_*` module functions are the
       one-line producer hooks: they find the recorder and never raise.
+    - Roblox's answers per attempt (schema version 10, lead decision 11): every call of a caller fetch that Roblox
+      answered counts by status class per minute, template, host and egress (`record_roblox_answer`, from
+      `record_attempts`), batch kind `metrics.roblox_answers`, compacted and kept like the rollups. The Overview and
+      Traffic tiles "2xx", "4xx" and "5xx from Roblox" read them (v1 counted Roblox's answers, not callers' statuses).
     - Producer history (schema version 5, `metrics/producers.py`): rule hits per rule and minute (inside
       `record_rule_hit`), tarpit holds and skips with hold times and arrival gaps (`record_tarpit`), bot scores per
       client and hour (`record_client_score`), and at every flush the items this worker dropped since the previous
@@ -176,9 +180,16 @@ counted in `history_dropped` (metrics degrade open, C7)."""
 MAX_EVICTION_PASSES = 256
 """Eviction pass rows held between two flushes (one pass a minute fleet-wide, so this never fills in practice)."""
 MAX_HISTORY_LABEL_CHARS = 255
+ANSWER_CLASS_COLUMNS: dict[int, int] = {2: 0, 3: 1, 4: 2, 5: 3}
+"""Status class (hundreds digit) to its position in a Roblox answer row (`answers_2xx`, `answers_3xx`, `answers_4xx`,
+`answers_5xx`; metrics 0010)."""
+MAX_LIMIT_PATH_CHARS = 300
+"""How much of a limit refusal's path (already redacted by `core/errors.event_from_scope`) its outcome keeps: a URL
+refused for being too long is long, and the Live row needs only its start."""
 
 # Batch kinds and their priorities (higher survives longer when the queue is full).
 KIND_ROLLUPS = "metrics.rollups"
+KIND_ANSWERS = "metrics.roblox_answers"
 KIND_EGRESS = "metrics.egress_usage"
 KIND_429 = "metrics.upstream_429"
 KIND_CLIENTS = "metrics.clients"
@@ -194,6 +205,7 @@ KIND_REFUSAL_SAMPLES = "metrics.refusal_samples"
 KIND_LIVE = "metrics.live"
 PRIORITIES: dict[str, int] = {
     KIND_ROLLUPS: 100,
+    KIND_ANSWERS: 97,
     KIND_EGRESS: 95,
     KIND_429: 90,
     KIND_CLIENTS: 70,
@@ -477,6 +489,7 @@ _HISTORY_KEY_COLUMNS: dict[str, tuple[str, ...]] = {
     "tarpit_hold_minute": ("bucket_start", "category", "bound_ms"),
     "client_score_hour": ("bucket_start", "client_key"),
     "metrics_pipeline_minute": ("bucket_start", "worker_id"),
+    "roblox_answer_minute": ("bucket_start", "endpoint_template", "host", "egress"),
 }
 """The key columns of each history and producer item, in `key` order (the first columns of its INSERT; pinned by a
 test against the statements), so a fence can match them by name."""
@@ -824,6 +837,8 @@ class MetricsRecorder:
         self._rule_hits: dict[tuple[str, str], list[int]] = {}  # [hits, first_hit_at, last_hit_at]
         self._error_minutes: dict[tuple[str, int], int] = {}
         self._attempt_minutes: dict[tuple[Any, ...], int] = {}
+        # Roblox's answers per attempt (metrics 0010): (minute, template, host, egress) -> [2xx, 3xx, 4xx, 5xx].
+        self._answer_minutes: dict[tuple[int, str, str, str], list[int]] = {}
         self.history_dropped = 0
         self._budgets: dict[tuple[str, str], RateGate] = {}
         self._live_gate = RateGate(LIVE_EVENTS_PER_SECOND, LIVE_EVENTS_PER_SECOND, self.clock.monotonic)
@@ -892,6 +907,13 @@ class MetricsRecorder:
             KIND_ROLLUPS, metrics, fenced(write_rollups), priority=PRIORITIES[KIND_ROLLUPS], source=self._drain_rollups
         )
         b.register(
+            KIND_ANSWERS,
+            metrics,
+            fenced(write_history),
+            priority=PRIORITIES[KIND_ANSWERS],
+            source=self._drain_answers,
+        )
+        b.register(
             KIND_EGRESS,
             metrics,
             fenced(write_egress_usage),
@@ -930,7 +952,19 @@ class MetricsRecorder:
             priority=PRIORITIES[KIND_FINGERPRINTS],
             source=self.fingerprints.drain,
         )
-        b.register(KIND_CAPTURES, metrics, fenced(self._write_captures), priority=PRIORITIES[KIND_CAPTURES])
+        # Captures are bounded on their own by the capture caps: `write_captures` keeps only the newest
+        # `capture_max_records` rows within `capture_max_bytes`, so queued rows past them could never be kept, and
+        # while metrics.db cannot be written each weighs what a caller's body does (final review finding memory-1).
+        b.register(
+            KIND_CAPTURES,
+            metrics,
+            fenced(self._write_captures),
+            priority=PRIORITIES[KIND_CAPTURES],
+            # The cached config (the request path refreshes it): the encoder thread adds rows, and must not reload it.
+            keep_items=lambda: self._config.capture.max_records,
+            keep_bytes=lambda: self._config.capture.max_bytes,
+            weigh=_capture_row_bytes,
+        )
         b.register(KIND_SAMPLES, metrics, fenced(write_samples), priority=PRIORITIES[KIND_SAMPLES])
         b.register(
             KIND_REFUSAL_SAMPLES,
@@ -2010,6 +2044,10 @@ class MetricsRecorder:
         identity when the call does not name one). A call the upstream exchange found to be a Roblox challenge or
         an HTML page on a JSON endpoint (`upstream/pages.py`) carries its `challenge` and `html_body` flags
         (UP-CHALLENGE).
+
+        Each call Roblox answered also counts in Roblox's answers by status class (`record_roblox_answer`, metrics
+        0010): the upstream service calls this for caller traffic and its refreshes only, never for Roxy's own
+        internal calls, so these are v1's per-attempt 2xx, 4xx and 5xx totals (lead decision 11).
         """
         try:
             calls = list(getattr(trace, "calls", ()) or ())
@@ -2017,6 +2055,12 @@ class MetricsRecorder:
             exit_id = identity.split(":", 1)[1] if identity.startswith("rotator:") else ""
             previous: Any = None
             for call in calls:
+                self.record_roblox_answer(
+                    endpoint_template=endpoint_template,
+                    egress=str(getattr(call, "egress", "") or "none"),
+                    status=getattr(call, "status", None),
+                    at_ms=at_ms,
+                )
                 if getattr(call, "csrf_retry", False):
                     kind = "csrf_retry"
                 elif getattr(call, "redirect_hop", 0):
@@ -2044,6 +2088,48 @@ class MetricsRecorder:
                 previous = call
         except Exception:
             self._count_error("record_attempts")
+
+    def record_roblox_answer(
+        self,
+        *,
+        endpoint_template: str,
+        egress: Egress | str,
+        status: int | None,
+        count: int = 1,
+        at_ms: int | None = None,
+    ) -> None:
+        """One answer Roblox gave a call made for callers, by status class (2xx, 3xx, 4xx or 5xx; a call without an
+        answer, a timeout or a refused connection, is not an answer and is not counted). Lead decision 11 (findings
+        v1parity-1, data-3): the Overview and Traffic tiles "2xx", "4xx" and "5xx from Roblox" count these, per
+        attempt, like v1's `log_status_code`; the caller's own final status stays in the rollups.
+
+        The template and host are bounded like the rollup dimensions (the same vocabulary gates), so these rows,
+        kept as long as the rollups, never grow with caller text."""
+        try:
+            code = int(status) if status is not None else -1
+            column = ANSWER_CLASS_COLUMNS.get(code // 100) if code >= 0 else None
+            if column is None:
+                return
+            host = self._bounded_host(str(endpoint_template or "").split("/", 1)[0])
+            template = self._bounded_template(str(endpoint_template or ""), host)
+            key = (self._minute_s(at_ms), template, host, str(egress)[:16])
+            with self._lock:
+                counts = self._answer_minutes.get(key)
+                if counts is None:
+                    if len(self._answer_minutes) >= MAX_HISTORY_KEYS:
+                        # Fold the endpoint (never the count): the totals stay exact, as the rollups fold templates.
+                        key = (key[0], OTHER, OTHER, key[3])
+                        counts = self._answer_minutes.get(key)
+                    if counts is None:
+                        counts = self._answer_minutes[key] = [0, 0, 0, 0]
+                counts[column] += max(0, int(count))
+        except Exception:
+            self._count_error("record_roblox_answer")
+
+    def _drain_answers(self) -> list[HistoryItem]:
+        with self._lock:
+            answers, self._answer_minutes = self._answer_minutes, {}
+        return [HistoryItem("roblox_answer_minute", key, tuple(values)) for key, values in answers.items()]
 
     def _drain_history(self) -> list[HistoryItem]:
         with self._lock:
@@ -2088,6 +2174,58 @@ class MetricsRecorder:
                         summary_detail={})  # fmt: skip
         except Exception:
             self._count_error("record_probe")
+
+    def record_limit_refusal(
+        self,
+        *,
+        reason: ReasonCode,
+        status: int,
+        method: str,
+        path: str,
+        client_ip: str,
+        user_agent: str,
+        request_id: str,
+    ) -> str:
+        """The refused outcome of a caller's request a size or method limit answered before any route ran (413,
+        414, 431, 405; `security_events.counts_as_refusal`). Recorded once, from the client error hook: the proxy
+        flow never saw the request. The template is the reason's own problem template (`(url_too_long)`), so a
+        refusal of an oversized target never mints a dimension from its text (finding abuse-4)."""
+        try:
+            return self.record_outcome(
+                OutcomeEvent(
+                    at_ms=_now_ms(self.clock),
+                    request_id=request_id,
+                    endpoint_template=f"({ReasonCode(reason).value})",
+                    host="",
+                    method=method,
+                    egress=Egress.NONE,
+                    outcome=Outcome.REFUSED,
+                    reason=ReasonCode(reason),
+                    status=int(status),
+                    source=Source.ROXY,
+                    cache_state=CacheState.NA,
+                    auth_class=AuthClass.ANON,
+                    caller_bytes_in=0,
+                    caller_bytes_out=0,
+                    upstream_calls=0,
+                    upstream_bytes_in=0,
+                    upstream_bytes_out=0,
+                    latency_ms=0.0,
+                    queue_wait_ms=0.0,
+                    upstream_ms=0.0,
+                    client_ip=client_ip,
+                    place_id=None,
+                    user_agent=user_agent,
+                    bypass=False,
+                    error=False,
+                    path=path[:MAX_LIMIT_PATH_CHARS],
+                    message_source="default",
+                    check="limits",
+                )
+            )
+        except Exception:
+            self._count_error("record_limit_refusal")
+            return ""
 
     def record_login(self, ip: str, successful: bool, *, username: str | None = None, method: str = "") -> None:
         """An admin login attempt (row 97)."""
@@ -2330,6 +2468,13 @@ def _complete_capture(capture: CaptureInput, ev: OutcomeEvent) -> CaptureInput:
     )
 
 
+def _capture_row_bytes(row: Any) -> int:
+    """A queued capture row's size as `capture_max_bytes` counts it: the stored (compressed) blob, the `captures.bytes`
+    column `retention.prune_captures` sums."""
+    blob = getattr(row, "blob", b"")
+    return len(blob) if isinstance(blob, bytes | bytearray) else 0
+
+
 def build_recorder(ctx: Any) -> MetricsRecorder:
     """The worker's recorder from its `AppContext` (lifespan step "recorder", DESIGN.md section 1).
 
@@ -2490,6 +2635,13 @@ _HISTORY_SQL: dict[str, str] = {
         "challenge, html_body, exit_id, count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bucket_start, "
         "endpoint_template, egress, attempt, kind, status, challenge, html_body, exit_id) DO UPDATE SET "
         "count = count + excluded.count"
+    ),
+    "roblox_answer_minute": (
+        "INSERT INTO roblox_answer_minute (bucket_start, endpoint_template, host, egress, answers_2xx, answers_3xx, "
+        "answers_4xx, answers_5xx) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (bucket_start, endpoint_template, "
+        "host, egress) DO UPDATE SET answers_2xx = answers_2xx + excluded.answers_2xx, "
+        "answers_3xx = answers_3xx + excluded.answers_3xx, answers_4xx = answers_4xx + excluded.answers_4xx, "
+        "answers_5xx = answers_5xx + excluded.answers_5xx"
     ),
 }
 

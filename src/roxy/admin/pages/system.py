@@ -424,19 +424,23 @@ async def errors_card(view: PageView) -> dict[str, Any]:
             "title": "No errors match the filter" if (tq.q or source) else "No errors recorded",
             "body": "Clear the search or the source filter to see every error."
             if (tq.q or source)
-            else "Errors appear here when a request or a job fails inside Roxy, grouped by signature with how often "
-            "each happened. Nothing is dropped as more come in.",
+            else "Errors appear here when Roxy fails inside while answering a request (the caller gets a 500), "
+            "grouped by signature with how often each happened.",
             "icon": "check-circle" if not (tq.q or source) else "inbox",
             "tone": "good" if not (tq.q or source) else "neutral",
         },
         search_placeholder="Search errors",
         notice=notice,
     )
+    settings = view.ctx.settings
     return {
         "table": table,
         "table_only": view.table_request(ERRORS_TABLE_ID),
         "total": answer["total"],
         "filtered": bool(tq.q or source),
+        # How long a signature stays (`storage/retention.py prune_errors`: days after it was last seen, then a cap
+        # on the count, least recent first), stated on the card instead of a promise that nothing is dropped.
+        "kept": {"days": int(settings.get("retention_errors_days")), "max": int(settings.get("max_error_records"))},
     }
 
 

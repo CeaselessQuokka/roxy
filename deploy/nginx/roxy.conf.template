@@ -282,6 +282,9 @@ server {
         add_header Cache-Control "public, immutable";
         # nginx serves these bytes itself, so the app's nosniff header is not there to protect them.
         add_header X-Content-Type-Options "nosniff" always;
+        # Only pages of this site may load these scripts and styles (plan 9.3), the same header the app sends on
+        # the static files it serves itself (core/security_headers.py), so both servers of an asset agree.
+        add_header Cross-Origin-Resource-Policy "same-origin" always;
         # This location has its own add_header, so HSTS must be included again (see the snippet).
         include {{NGINX_DIR}}/snippets/roxy-security-headers.conf;
     }

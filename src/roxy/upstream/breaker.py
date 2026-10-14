@@ -44,6 +44,7 @@ from typing import Any, Final
 
 from roxy.core.reasons import Egress
 from roxy.storage import leases
+from roxy.upstream.pacing import pacing_template
 
 MAX_OPEN_S: Final = 600.0
 """Plan 7.10: a failed probe doubles the open time, capped at 600 s."""
@@ -110,9 +111,10 @@ class Transition:
 
 
 def breaker_keys(host: str, template: str, egress: Egress | str) -> tuple[str, str]:
-    """The endpoint and host breaker keys of one call."""
+    """The endpoint and host breaker keys of one call (the template in its pacing form, `upstream/pacing.py`: one
+    breaker per Roblox endpoint whatever letter case a caller used, review finding pipe-2)."""
     value = Egress(egress).value
-    return f"endpoint:{template}:{value}", f"host:{host}:{value}"
+    return f"endpoint:{pacing_template(template)}:{value}", f"host:{host}:{value}"
 
 
 def effective_state(row: BreakerRow | None, now_s: float) -> BreakerState:

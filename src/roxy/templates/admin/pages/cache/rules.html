@@ -6,7 +6,8 @@
   rule covers, as v1 did), and the TTL tuner's suggestions: the open recommendations of the cache family, each a
   link to its card on the Recommendations page (nothing changes until it is applied there). Patterns, notes and
   recommendation titles are text a person or a caller chose: shown as text only.
-  Context: `frame`, `table`, `default_ttl`, `default_ttl_words`, `new_rule_ttl`, `suggestions`, `suggestion_total`,
+  Context: `frame`, `table`, `default_ttl`, `default_ttl_words`, `new_rule_ttl`, `fallbacks` (what a 0 revalidate
+  window or refusal lifetime falls back to, `cache.py rule_fallbacks`), `suggestions`, `suggestion_total`,
   `tuner_on`, `prefill`, `table_only` (a request of the table itself: the table alone, which replaces itself).
 -#}
 {% from "components/page_card.html" import page_card %}
@@ -71,7 +72,7 @@
       <div class="field">
         <label class="field__label" for="cache-rule-new-stale">Revalidate window (seconds)</label>
         <input class="input input--num" id="cache-rule-new-stale" name="stale_ttl" inputmode="numeric" value="0" data-json="int" aria-describedby="cache-rule-new-stale-hint cache-rule-new-stale-error">
-        <p class="field__hint" id="cache-rule-new-stale-hint">How long after expiry the copy is still served while one refresh runs ({{ term("stale-while-revalidate") }}).</p>
+        <p class="field__hint" id="cache-rule-new-stale-hint">How long after expiry the copy is still served while one refresh runs ({{ term("stale-while-revalidate") }}). 0 uses the setting "{{ fallbacks.stale_ttl.label }}" (now {{ fallbacks.stale_ttl.words }}).</p>
         <p class="field__error" id="cache-rule-new-stale-error" data-field-error="stale_ttl" hidden></p>
       </div>
     </div>
@@ -79,7 +80,7 @@
       <div class="field">
         <label class="field__label" for="cache-rule-new-negative">Keep refusals for (seconds)</label>
         <input class="input input--num" id="cache-rule-new-negative" name="negative_ttl" inputmode="numeric" value="0" data-json="int" aria-describedby="cache-rule-new-negative-hint cache-rule-new-negative-error">
-        <p class="field__hint" id="cache-rule-new-negative-hint">How long a definite refusal (404 and friends) is kept ({{ term("negative-caching") }}); 0 keeps none.</p>
+        <p class="field__hint" id="cache-rule-new-negative-hint">How long a definite refusal (404 and friends) is kept ({{ term("negative-caching") }}). 0 uses the setting "{{ fallbacks.negative_ttl.label }}" (now {{ fallbacks.negative_ttl.words }}); to keep no refusals for these endpoints, set a lifetime of 0 (never cache).</p>
         <p class="field__error" id="cache-rule-new-negative-error" data-field-error="negative_ttl" hidden></p>
       </div>
       <div class="field">

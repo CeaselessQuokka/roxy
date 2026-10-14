@@ -47,6 +47,8 @@ from roxy.admin.pages.registry import CardSpec
 RESET_TEMPLATE: Final = "admin/pages/_reset.html"
 RESET_CARD: Final = CardSpec("reset", "Reset", "Preview and confirm a reset of these numbers.", fragment_only=True)
 RESET_API: Final = f"{common.API_PREFIX}/data/resets"
+RESTORE_RUNBOOK: Final = "/admin/help/runbooks#restore-from-backup"
+"""Where the drawer sends an admin who wants a reset snapshot back (`docs/RUNBOOKS.md` "Restore from backup")."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +123,10 @@ async def preview_context(view: PageView, reset: InlineReset) -> dict[str, Any]:
         "phrase": preview.get("confirm_phrase") or "",
         "api_url": RESET_API,
         "nothing": int(preview.get("total_rows") or 0) == 0 and not preview.get("actions"),
+        # How long the copy taken first is kept (the retention job's own setting). Putting one back is a restore on
+        # the server, not a dashboard action, so the drawer says that instead of promising an undo (docs_a-7).
+        "snapshot_keep_days": int(view.ctx.settings.get("retention_snapshots_days")),
+        "restore_href": RESTORE_RUNBOOK,
     }
 
 

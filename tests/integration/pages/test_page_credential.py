@@ -26,6 +26,7 @@ import pytest
 from pages_harness import HOSTILE, parse_html
 from roxy.admin.api.credential import REPLACE_CONFIRMATION
 from roxy.admin.pages import registry
+from roxy.admin.pages.credential import _probe_words as probe_words
 from roxy.core.style_guard import find_style_issues
 
 PAGE = "/admin/credential"
@@ -269,6 +270,9 @@ async def test_a_check_shows_its_probe_and_a_429_reads_rate_limited_never_expire
     assert "No probe yet" not in status.text()
     # Roblox answers the next probe 429 (the stand-in does on `/too-many` paths): slow down, never "expired".
     await pages_app.settings(credential_probe_url="https://users.roblox.com/v1/too-many")
+    # The probe sub-bucket's next slot (burst 1 at 2 a minute since finding constraints-6): a second check at the
+    # same fake instant would wait for a clock that never moves.
+    pages_app.clock.advance(60)
     limited = await page.api("POST", "credential/check")
     assert limited.status_code == 200, limited.text
     assert limited.json()["probe"]["outcome"] == "rate_limited"
@@ -321,3 +325,14 @@ async def test_an_empty_database_explains_itself(page: Any) -> None:
     assert "No probe yet" in status
     tester = await page.doc(TESTER, params={"target": PATTERN})
     assert "never uses the credential" in tester.text()
+
+
+def test_every_stored_probe_result_reads_in_words() -> None:
+    """Finding docs_a-12: `egress/credential.py` stores `rejected_401`, `rejected_403` and `http_<status>` besides
+    the plain codes; each reads as words on the Status and Probes cards, never as the raw code."""
+    words = {code: probe_words({"result": code}) for code in ("rejected_401", "rejected_403", "http_500", "ok")}
+    assert words["rejected_401"] == "Rejected: the cookie expired or was revoked (Roblox answered 401)"
+    assert words["rejected_403"].endswith("(Roblox answered 403)")
+    assert words["http_500"].startswith("Unexpected answer: Roblox answered 500")
+    assert words["ok"] == "OK: Roblox accepted it"
+    assert probe_words(None) == "No probe yet"

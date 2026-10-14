@@ -17,7 +17,8 @@ What this is
       * `traffic`: caller requests against the calls Roxy made to Roblox, as a chart of the API series.
       * `outcomes`, `top-endpoints`, `top-places`: how requests ended and the busiest endpoint templates and
         experiences of the range (one read for the three cards).
-      * `events`: recent notable events (bans, cooldowns, breakers, alerts, configuration changes) as a server-paged
+      * `events`: recent notable events (breakers, Roblox 429s, credential, rotator and leak guard events, spam
+        bans, cache purges, recommendations, health runs: `read_dashboard.NOTABLE_EVENT_TYPES`) as a server-paged
         table, the page's main table, with CSV and JSON export through the API.
     The page header has the Check Proxy Health button (plan 13.1); it starts a run without the credential check
     and opens the run on the Health page (`static/js/pages/overview.js`).
@@ -56,6 +57,7 @@ from roxy.admin.pages.kit import LIVE_REFRESH_S, Page, PageView, table_query, ta
 from roxy.admin.pages.resets import InlineReset, add_reset_route, reset_href
 from roxy.admin.pages.shell import COMPARE_LABELS
 from roxy.metrics.catalog import METRICS
+from roxy.scheduler.heartbeat import HEARTBEAT_STALE_S
 from roxy.storage.db import SharedStateUnavailable
 
 log = logging.getLogger("roxy.admin.pages")
@@ -297,7 +299,7 @@ def status_items(status: Mapping[str, Any], view: PageView) -> list[dict[str, An
     fresh, expected = int(workers.get("fresh") or 0), int(workers.get("expected") or 0)
     tone = "ok" if fresh and fresh >= expected else ("warn" if fresh else "bad")
     color = str(workers.get("color") or "")
-    detail = "Workers that sent a heartbeat in the last 30 seconds"
+    detail = f"Workers that sent a heartbeat in the last {int(HEARTBEAT_STALE_S)} seconds"
     detail += f" (color {color})." if color else "."
     items.append(
         {
@@ -540,8 +542,9 @@ async def events_card(view: PageView) -> dict[str, Any]:
         caption="Recent notable events",
         empty={
             "title": "No notable events in this range",
-            "body": "Bans, Roblox cooldowns, open breakers, alerts and configuration changes are listed here as "
-            "they happen. A quiet range is good news; choose a longer range in the top bar to look further back.",
+            "body": "Breakers, Roblox 429s, credential, rotator and leak guard events, spam bans, cache purges, "
+            "recommendations and health runs are listed here as they happen; setting and rule changes are in the "
+            "Audit log. A quiet range is good news; choose a longer range in the top bar to look further back.",
             "icon": "flag",
             "tone": "good",
         },

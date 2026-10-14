@@ -7,9 +7,11 @@
   detector, or every ban with the typed confirmation "all bans"), and each ban's drawer (`detail=<id>`, `GET
   /bans/{id}`): its evidence and the detector events behind it, its hits over the range, lift it (`DELETE
   /bans/{id}`) or lift every ban of its subject (`POST /bans/lift`). A banned client gets 403 "Access denied." or,
-  with "Disguise bans as throttles" on (this card's setting), a normal-looking 429.
-  Context: `frame`, `table`, `only`, `active_total`, `disguised`, `previews`, `detectors`, `api`; for the drawer
-  `detail`.
+  with "Disguise bans as throttles" on (this card's setting), a normal-looking 429. Every delete dialog says that
+  repeat offenders start again from the first ban length: a detector doubles a client's next ban for each automatic
+  ban of it created in the last `repeat_days`, expired ones included (`abuse/bans.py previous_offenses`).
+  Context: `frame`, `table`, `only`, `active_total`, `disguised`, `previews`, `detectors`, `repeat_days`, `api`; for
+  the drawer `detail`.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/table.html" import data_table %}
@@ -84,7 +86,8 @@
     </div>
     <div class="field">
       <label class="field__label" for="ban-add-subject">Subject</label>
-      <input class="input mono" id="ban-add-subject" name="subject" required aria-required="true" maxlength="200" autocomplete="off" spellcheck="false" placeholder="203.0.113.7" aria-describedby="ban-add-subject-error">
+      <input class="input mono" id="ban-add-subject" name="subject" required aria-required="true" maxlength="200" autocomplete="off" spellcheck="false" placeholder="203.0.113.7" aria-describedby="ban-add-subject-hint ban-add-subject-error">
+      <p class="field__hint" id="ban-add-subject-hint">For a User-Agent hash: the key Security &gt; Fingerprints shows for the User-Agent (32 hex characters), its 16-character ban hash, or a full SHA-256 of the User-Agent text.</p>
       {{ field_error("subject", "ban-add-subject-error") }}
     </div>
   </div>
@@ -105,9 +108,10 @@
   </div>
   {{ reason_field("ban-add-reason") }}
 {% endcall %}
+{% set repeat_line = "Repeat offenders start again from the first ban length: a detector doubles a client's next ban for each automatic ban of it from the last " ~ repeat_days ~ " days, expired ones included." %}
 {% for scope, title, lines in [
-  ("expired", "Delete the expired bans?", ["Deletes " ~ num(previews.expired.rows) ~ " bans that already ended (they refuse nothing).", "Nothing changes for any caller."]),
-  ("auto", "Delete the bans made by detectors?", ["Deletes " ~ num(previews.auto.rows) ~ " bans made by spam detectors or the ladder (" ~ num(previews.auto.active) ~ " still in force).", "Those clients are answered normally again; bans made by hand stay."]),
+  ("expired", "Delete the expired bans?", ["Deletes " ~ num(previews.expired.rows) ~ " bans that already ended (they refuse nothing), so no caller is refused or let through because of it.", repeat_line]),
+  ("auto", "Delete the bans made by detectors?", ["Deletes " ~ num(previews.auto.rows) ~ " bans made by spam detectors or the ladder (" ~ num(previews.auto.active) ~ " still in force).", "Those clients are answered normally again; bans made by hand stay.", repeat_line]),
 ] %}
 {% call confirm_dialog("dlg-prot-bans-" ~ scope, title, api.reset, confirm_label="Delete", danger=True, api=True,
                        hidden={"scope": scope}, success="Bans deleted.", on_success="refresh", refresh="bans",
@@ -118,6 +122,7 @@
 {% call confirm_dialog("dlg-prot-bans-detector", "Delete one detector's bans?", api.reset, confirm_label="Delete", danger=True, api=True,
                        hidden={"scope": "detector"}, success="Bans deleted.", on_success="refresh", refresh="bans",
                        consequences=["Deletes every ban that detector made, active or expired; its clients are answered normally again.",
+                                     repeat_line,
                                      previews.all.leaves_alone ~ " are left alone."]) %}
   <div class="field">
     <label class="field__label" for="dlg-prot-bans-detector-name">Detector</label>
@@ -130,6 +135,7 @@
                        type_to_confirm=previews.all.confirm_text, confirm_field="confirm", hidden={"scope": "all"},
                        success="Every ban was deleted.", on_success="refresh", refresh="bans",
                        consequences=["Deletes all " ~ num(previews.all.rows) ~ " bans (" ~ num(previews.all.active) ~ " in force): every banned client is answered normally again.",
+                                     repeat_line,
                                      previews.all.leaves_alone ~ " are left alone. The reset is written to the audit log and marked on the charts."]) %}
   {{ reason_field("dlg-prot-bans-all-reason", required=True) }}
 {% endcall %}

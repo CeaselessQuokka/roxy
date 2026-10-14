@@ -18,7 +18,7 @@ How it works
       profile's timeout to keep the suite fast (the same code path).
     - A refusing database: `Database.read` or `Database.write` replaced for the duration of a test by a function
       that raises `SharedStateUnavailable` at once, as a full queue, an open busy circuit or an I/O error does.
-    The harness (`roxy.admin.auth.testing.auth_harness`) is the real app with its lifespan, a fast hasher and a
+    The harness (`auth_harness.auth_harness`) is the real app with its lifespan, a fast hasher and a
     fake clock. Elapsed times are measured with `time.monotonic()` (the WSL wall clock steps back).
 
 What to read next
@@ -39,8 +39,8 @@ from typing import Any
 
 import pytest
 
+from auth_harness import AuthHarness, auth_harness
 from roxy.admin.auth.flow import UNAVAILABLE_TEXT
-from roxy.admin.auth.testing import AuthHarness, auth_harness
 from roxy.core.clock import FakeClock
 from roxy.storage.db import BUSY_CIRCUIT_COOLDOWN_S, BUSY_TIMEOUT_MS, SharedStateUnavailable
 

@@ -264,9 +264,10 @@ again.
 
 Plan 17.8: "Credential rejected or expired".
 
-**Symptoms.** The alert "Token Expired"; the Credential page says rejected; health check H-CRED-AUTH fails (Roblox
-answered 401 or 403, or the cookie now belongs to a different account); H-CRED-PRESENT fails when no credential is
-configured at all.
+**Symptoms.** The alert "Token Expired": its first line says either that an auth token has expired (Roblox answered
+401 or 403) or that the credential now answers for a different Roblox account than the one it was set for (Roxy
+stopped using it until you confirm that account). The Credential page says rejected; health check H-CRED-AUTH fails;
+H-CRED-PRESENT fails when no credential is configured at all.
 
 **Confirm.** The Credential page (`GET /admin/api/v1/credential`) and its probe history
 (`GET /admin/api/v1/credential/probes`). "Check credential" (`POST /admin/api/v1/credential/check`) probes once more;
@@ -281,7 +282,10 @@ its session.
 1. Sign in to the same Roblox account in a private browser window and copy its `.ROBLOSECURITY` cookie value.
 2. On the Credential page choose Replace (`POST /admin/api/v1/credential/replace`). It asks for a fresh second
    factor, a reason, and the typed phrase `replace the credential`. The old value stops being used everywhere at
-   once, and Roxy probes the new one right away to record the account.
+   once, and Roxy probes the new one right away to record the account. The Status card then says "Same account as
+   before", or "A different account than before the replace" with the earlier account's fingerprint: a replace is
+   the deliberate change rule C1 allows, so the new value is used either way, but check that the account is the one
+   you meant.
 3. After a replacement from the dashboard, empty the bootstrap file so the old cookie is not kept on disk:
    `sudo truncate -s 0 /etc/roxy/credentials/roblox_credential`. Keep the file itself: systemd expects it, and an
    empty file means "no bootstrap value".
@@ -579,7 +583,8 @@ the journal.
 3. Reset a metric family you do not need (preview first: `POST /admin/api/v1/data/resets/preview`, then
    `POST /admin/api/v1/data/resets`).
 4. Give the space back with VACUUM on the Data page (`POST /admin/api/v1/data/vacuum`; control, metrics or cache,
-   never hot.db). VACUUM needs free space about the size of the database while it runs.
+   never hot.db). VACUUM needs free space of about twice the database file while it runs, and the Data page refuses
+   it otherwise; free space first (step 6) when the disk is that full.
 5. Lower `retention_snapshots_days` or `snapshots_max_bytes` when snapshots are large.
 6. When the volume is completely full, free space first (an old backup set, the journal with
    `sudo journalctl --vacuum-size=500M`), then do the steps above.
@@ -644,11 +649,15 @@ sudo ls -l /var/backups/roxy
 The Data page lists the backups too (`GET /admin/api/v1/data/backups`).
 
 **Likely causes.** A missing tool (`zstd`, `age`), a full disk, a damaged database (the copy failed its
-`integrity_check`), an off-box copy (rclone) that failed, or the timer not running.
+`integrity_check`), an off-box copy (rclone) that failed, or the timer not running. A run that fails at the step
+"rclone push" with `ROXY_BACKUP_REMOTE` set and no age recipient is refusing on purpose: only an encrypted set may
+leave the server, so nothing was copied (the local set is kept).
 
 **Fix.**
 
-1. Fix the cause from the journal.
+1. Fix the cause from the journal. For the refused push: put your age public key in the file
+   `ROXY_BACKUP_AGE_RECIPIENTS` names (`/etc/roxy/backup-age-recipients`), or unset `ROXY_BACKUP_REMOTE` in
+   `/etc/roxy/roxy.env` if you do not want an off-box copy.
 2. Run the backup now: `sudo systemctl start roxy-backup.service` (or `roxyctl backup-now`).
 
 **Verify.** `backup.json` records the success; a new dated directory appears in `/var/backups/roxy`; H-BACKUP passes.
@@ -660,31 +669,59 @@ below once a quarter (plan 17.5).
 
 ## Restore from backup
 
-**Symptoms.** A database is damaged or lost, or a bad change has to be undone as a whole.
+**Symptoms.** A database is damaged or lost, or a bad change has to be undone as a whole: a nightly backup set, or
+one of the on-server snapshots a statistics reset, Back up now or a migration takes (the reset drawer links here).
 
-**Confirm.** Pick the backup set: `sudo ls /var/backups/roxy` lists one directory per day, each with
-`control.db.zst` and `metrics.db.zst` (with `.age` appended when encrypted) and a `SHA256SUMS` file. Check it:
-`cd /var/backups/roxy/<date> && sudo sha256sum -c SHA256SUMS`.
+**Confirm.** The backup sets are readable by root only (`/var/backups/roxy` and every set in it are mode 0700, every
+file 0600), so do this whole runbook in a root shell: open one with `sudo -i`, and leave it with `exit` at the end.
+Then pick the set: `ls /var/backups/roxy` lists one directory per day (named by the UTC date; 14 daily and 8 weekly
+sets are kept), each holding `control.db.zst` and `metrics.db.zst` (`control.db.zst.age` and `metrics.db.zst.age`
+when the set is encrypted) and a `SHA256SUMS` file. Check the set:
+`cd /var/backups/roxy/<date> && sha256sum -c SHA256SUMS` must print `OK` for every file.
+
+If the disk was lost, two things lived on it that you need first:
+
+1. The credentials. Backups never hold the encryption keys, and without `totp_encryption_key` nobody can sign in, so
+   restore `/etc/roxy/credentials/` from your offline copy (the commands are at the end of this runbook).
+2. The sets themselves. Only an off-box copy survives (D15: `ROXY_BACKUP_REMOTE` names an rclone remote, and only
+   encrypted sets are ever copied there). With the credentials back, install rclone (`apt install rclone`), list the
+   sets with `rclone --config /etc/roxy/credentials/rclone_config lsd <remote>:roxy-backups` and fetch one with
+   `rclone --config /etc/roxy/credentials/rclone_config copy <remote>:roxy-backups/<date> /var/backups/roxy/<date>`,
+   then check it with `sha256sum -c SHA256SUMS` as above. Without an off-box copy, only the offline key escrow
+   survives: start with empty databases and set Roxy up again.
 
 **Likely causes.** Not applicable.
 
-**Fix.**
+**Fix.** In the root shell, for control.db (metrics.db the same way, with its own name):
 
-1. Stop both colors: `sudo systemctl stop roxy@blue roxy@green`.
-2. Move the damaged files aside, for example `sudo mv /var/lib/roxy/control.db /var/lib/roxy/control.db.bad`, and
-   the same for its `-wal` and `-shm` files.
-3. Decrypt when the set is encrypted: `age -d -i <your identity file> control.db.zst.age > control.db.zst`.
-4. Decompress into place: `sudo zstd -d control.db.zst -o /var/lib/roxy/control.db`.
-5. Check it: run the `PRAGMA integrity_check` the same way as the quick check in
-   [Database corrupt](#database-corrupt).
-6. Give it back to the service: `sudo chown roxy:roxy /var/lib/roxy/control.db` and
-   `sudo chmod 0640 /var/lib/roxy/control.db`.
-7. If the disk was lost, restore `/etc/roxy/credentials/` from your offline copy first (below): backups never hold
-   the encryption keys, and without `totp_encryption_key` nobody can sign in.
-8. Start the live color: `sudo /usr/local/sbin/roxy-switch-color --boot`.
-9. Run Check Proxy Health.
+1. Stop both colors: `systemctl stop roxy@blue roxy@green`.
+2. Move the damaged files aside, for example `mv /var/lib/roxy/control.db /var/lib/roxy/control.db.bad`, and the
+   same for its `-wal` and `-shm` files when they exist.
+3. When the set is encrypted, decrypt it with your age identity file, which never lives on the server: copy it into
+   root's home for the moment, decrypt, then delete it:
+   `age -d -i /root/age-identity.txt -o /root/control.db.zst /var/backups/roxy/<date>/control.db.zst.age`, then
+   `rm /root/age-identity.txt`.
+4. Decompress into place, from the set (or from the decrypted file of step 3):
+   `zstd -d /var/backups/roxy/<date>/control.db.zst -o /var/lib/roxy/control.db`.
+5. Give it to the service before anything opens it: zstd gives the new file the root-only mode of the set's copy, which
+   the service cannot read. `chown roxy:roxy /var/lib/roxy/control.db` and `chmod 0640 /var/lib/roxy/control.db`.
+6. Check it as the service user, the same way as the quick check in [Database corrupt](#database-corrupt):
+   `sudo -u roxy python3 -c "import sqlite3; print(sqlite3.connect('file:/var/lib/roxy/control.db?mode=ro', uri=True).execute('PRAGMA integrity_check').fetchall())"`
+   must print `[('ok',)]`.
+7. Start the live color: `/usr/local/sbin/roxy-switch-color --boot`.
+8. Leave the root shell (`exit`) and run Check Proxy Health.
 
 hot.db does not need restoring (a fresh one is created at start) and cache.db is never backed up.
+
+**Putting back an on-server snapshot.** The folder `/var/lib/roxy/snapshots` holds copies Roxy takes itself:
+`reset-<time>-<db>.db` before a statistics reset deletes rows, `manual-<time>-<db>.db` from Back up now, and
+`pre-migrate-<time>-<release>.db` (control.db) before a release migrates it. Data > Backups lists them. They are plain
+SQLite files, neither compressed nor encrypted, and every file in the folder is kept `retention_snapshots_days` (7 by
+default) within `snapshots_max_bytes`. Everything recorded after the snapshot is lost when you put it back: for
+metrics.db the statistics since then, for control.db the settings, rules, bans and audit entries since then. In the
+root shell: stop both colors (step 1), move the live file and its `-wal` and `-shm` files aside (step 2), copy the
+snapshot into place, for example `cp /var/lib/roxy/snapshots/<file> /var/lib/roxy/metrics.db`, then steps 5 to 8 with
+that file's name. A pre-migrate copy of control.db is migrated again when the color starts.
 
 The offline copy of the credentials (key escrow, plan 9.8) is made once, and again after any key changes, with
 [age](https://age-encryption.org) and a key that does not live on the server:
@@ -977,12 +1014,15 @@ window (`auto_apply_watch_minutes`) the error rate, Roblox 429 rate, p95 latency
 than `auto_apply_rollback_threshold_pct`, so Roxy undid it.
 
 **Fix.** Usually nothing: the change is already undone. Check whether something else moved the metric at the same
-time (a deploy, an attack, a Roblox outage). If the rule keeps proposing changes that do not help, dismiss the
-recommendation or switch auto-apply off (`insights_auto_apply`).
+time (a deploy, an attack, a Roblox outage). If the rule keeps proposing changes that do not help, dismiss its next
+card when one opens, or switch auto-apply off (`insights_auto_apply`).
 
 **Verify.** The recommendation shows as rolled back and the setting or rule is back to its earlier value.
 
-**Roll back.** Apply it again by hand after review (`POST /admin/api/v1/recommendations/{rec_id}/apply`).
+**Roll back.** A rolled back recommendation is closed for good: it cannot be applied again (only open or snoozed
+ones can; the API answers 409 `wrong_state`), and the engine keeps the same finding quiet for `dismiss_cooldown_days`.
+If, after review, you still want the change, make it by hand on the page that owns the setting or rule (the
+recommendation's changes name it), with a reason; or wait until the rule proposes it again after that period.
 
 **Prevent.** Auto-apply is off by default; keep it that way until the recommendations have proved themselves.
 
@@ -1031,14 +1071,18 @@ fails.
 (`GET /admin/api/v1/system/leader`) and the jobs (`GET /admin/api/v1/system/jobs`); from the server, `roxyctl leader`
 and `roxyctl jobs`.
 
-**Likely causes.** A worker crashed or its event loop froze (gunicorn restarts it); hot.db is locked so leases cannot
-be renewed; a job keeps failing.
+**Likely causes.** A worker crashed, was killed for memory or its event loop froze (gunicorn restarts it); hot.db is
+locked so leases cannot be renewed; a job keeps failing.
 
 **Fix.**
 
-1. Read the journal of the color for tracebacks.
-2. Reload the color's workers gracefully: `sudo systemctl reload roxy@blue` (gunicorn starts new workers and lets the
-   old ones finish).
+1. Read the journal of the color for tracebacks. An out-of-memory kill ends only the worker the kernel chose: the
+   unit sets `OOMPolicy=continue`, so the color keeps serving and gunicorn starts a new worker in its place.
+2. If a worker stays missing, restart the color: `sudo systemctl restart roxy@blue` (a few seconds of 502 while it
+   starts), or switch to the other release with `/opt/roxy/deploy_rollback.sh` run as `roxy-deploy` (no outage). Do
+   not use `systemctl reload` on a warm color: a reload starts the new workers before the old ones leave, so for a
+   moment the color runs four workers (about 405 MiB plus two new workers of about 120 MiB each), past its
+   `MemoryMax=500M`.
 3. A failing job names its error on the jobs card; fix the cause it names.
 
 **Verify.** H-WORKERS and H-LEADER pass.
@@ -1120,7 +1164,9 @@ may be failing silently.
 2. Credentials are read when a color starts. To pick them up without downtime, deploy the commit that is already
    running: `/opt/roxy/deploy.sh <the commit in /var/lib/roxy-deploy/deployed_version>`.
 
-**Verify.** H-ALERTS passes on the next health run.
+**Verify.** H-ALERTS passes on the next health run. Then press **Send test alert** on the Settings page's Alerts card:
+`Roxy: test alert` must arrive on every channel you configured (a webhook other than Discord's is proven only this
+way).
 
 **Roll back.** Put the previous value back the same way.
 

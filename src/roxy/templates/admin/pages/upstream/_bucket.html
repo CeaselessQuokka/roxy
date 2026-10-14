@@ -5,7 +5,8 @@
   `GET /admin/api/v1/upstream/buckets/history` answer, embedded in the chart), and for a host or endpoint bucket the
   override form: PATCH `/admin/api/v1/upstream-limits/<key>` when an override exists (and a delete dialog), else POST
   a new one. The key is caller text; in the form URL it is one percent-encoded path segment (`quoted_key`).
-  Context: `key`, `describe`, `row`, `history`, `gauge`, `overridable`, `override`, `settings_keys`, `patch_url`,
+  Context: `key`, `describe`, `row`, `history`, `gauge`, `overridable`, `override`, `rate_source` (a fixed bucket's
+  settings, the card that edits them and how its rate is made: `upstream.py bucket_rate_source`), `patch_url`,
   `create_url`, `fill_help`, `error`.
 -#}
 {% from "components/icon.html" import icon %}
@@ -75,8 +76,9 @@
                       reason=True, success="Override removed.", on_success="refresh", refresh="buckets") }}
     {% endif %}
   </section>
-  {% elif settings_keys %}
-  <p class="muted">This bucket's rate comes from the settings <code>{{ settings_keys[0] }}</code> and <code>{{ settings_keys[1] }}</code>; change them under "Settings for this card" on the Buckets card.</p>
+  {% elif rate_source %}
+  <p class="muted">This bucket's rate comes from the settings {% for s in rate_source.settings %}{{ s.label }} (<code>{{ s.key }}</code>){% if loop.revindex == 2 %} and {% elif not loop.last %}, {% endif %}{% endfor %}; change them under "Settings for this card" on <a href="{{ rate_source.href }}">{{ rate_source.where }}</a>.</p>
+  {% if rate_source.how %}<p class="muted">{{ rate_source.how }}</p>{% endif %}
   {% endif %}
 </div>
 {% endif %}

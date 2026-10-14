@@ -1,8 +1,247 @@
 # Roxy v2 changes
 
 This file records what v2 changes on purpose, and every place where the build had to choose between two rules of
-REMAKE_PLAN.md or depart from it (plan 18.1). Each entry says what changed, why, and where the code is. The
-per-phase progress notes and the full parity list are added as the phases land.
+REMAKE_PLAN.md or depart from it (plan 18.1). Each entry says what changed, why, and where the code is.
+
+Many entries name the build's working notes where a decision was first written down (`.remake/...`, LEAD_NOTES,
+DESIGN.md, the reading notes of v1 in `v1notes`). Those notes are not part of the repository or of a release; every
+decision they hold is stated in the entry itself.
+
+## Contents (plan 18.1)
+
+The thirteen parts plan 18.1 asks for, and where each one is:
+
+1. Summary of the rewrite: "Summary of the rewrite" below.
+2. Files removed: "Files removed".
+3. Files added: "Files added".
+4. Files changed: "Files changed".
+5. Feature parity checklist: "Parity checklist (plan section 4)", near the end (135 rows, each with its tests).
+6. Settings decisions: "Settings decisions".
+7. Owner decisions applied: "Owner decisions applied" (D1 to D23; `DECISIONS_REVIEW.md` has the detail and the
+   owner's sign-off).
+8. Ops changes: "Ops changes".
+9. Behavior changes callers may notice: "Behavior changes callers may notice".
+10. Plan conflicts: "Plan conflicts and deviations", phase by phase, ending with "Final review".
+11. Progress notes per phase: "Progress notes per phase".
+12. v1 section map and parity checklists: "v1 section map (plan 14.1)" under the parity checklist, and
+    `tests/V1_PARITY.md`.
+13. Known limitations and follow-ups: the last part of this file.
+
+## Summary of the rewrite
+
+Roxy v2 rebuilds the v1 Flask app (`app/`) as a FastAPI application under gunicorn with uvicorn workers (`src/roxy/`;
+two workers per color on the 909 MB server, owner decision D2), with four SQLite databases in WAL mode as the state
+every worker shares (control.db, hot.db, metrics.db, cache.db; no Redis, D3), a blue/green deploy, and a new
+dashboard and versioned admin API (D9). What changed, and why:
+
+- **Kind to Roblox (plan sections 2 and 7).** v1 kept being rate-limited. v2 paces every call with fleet-wide rate
+  buckets per host and per endpoint, opens a cooldown when Roblox answers 429 (honoring `Retry-After`), stops calling
+  a failing endpoint with circuit breakers, lets one call answer many identical requests (single-flight), serves a
+  stale answer rather than ask again, and tunes its rates from what Roblox refused. On the plan's replay of a
+  v1-like day it stays under 0.1 percent Roblox 429s at the shipped defaults (finding LOAD-1).
+- **Safe for its operator (plan section 3).** Exactly one Roblox credential, never sent through the rotator, and
+  never sent for callers by default (D1: the allowlist ships empty; v1 sent it with about 75 percent of caller
+  traffic). A layered leak guard refuses any request that would carry it on an anonymous path.
+- **Honest to callers (D4).** Callers get Roblox's real status with `Roxy-Upstream-Status`, Roxy's own refusals keep
+  v1's texts and wire form, and a compatibility switch brings back v1's "everything is 500". The full list is under
+  "Behavior changes callers may notice".
+- **Hard to abuse (plan section 10).** One atomic abuse transaction per request decides every limit together: an
+  exact per-address limit (GCRA), a flood limit, an escalation ladder, bans, request filters, endpoint rules, spam
+  detectors (dry run by default), the tarpit, a bot score and a browser challenge.
+- **A locked admin door (plan section 9).** An authenticator app is mandatory (D5), with passkeys and recovery codes;
+  sessions live on the server; every change needs CSRF, and sensitive ones a fresh second factor; passwords are
+  argon2id, sized for the server.
+- **Fully observable (plan sections 6, 11 to 14).** Minute, hour and day statistics (kept 14 days, 400 days and for
+  ever, D16), an 18-page dashboard with 493 settings explained where they act, 50 recommendation rules (auto-apply
+  off, D7), Check Proxy Health with 34 checks, an export for a language model, and 21 kinds of alerts by email and
+  webhook (D14).
+- **Operated safely (plan section 17).** Sandboxed systemd units, nginx in front, a blue/green deploy with a health
+  gate, a smoke test and automatic rollback, expand-only migrations, nightly backups (optionally encrypted and off
+  the box, D15), a migrator from v1 (D17) and a cutover guide (`MIGRATION.md`).
+- **Nothing lost.** Every row of the plan's feature parity matrix is kept, improved or replaced (135 rows), and every
+  v1 dashboard section has a home on a v2 page (37 rows of the plan 14.1 map), each with its tests. About 11,800
+  tests (unit, integration, browser, multi-process, security, load, migration and v1 parity) run in CI.
+
+## Files removed
+
+The v1 application stays in the repository until the cutover is done (it is the parity ground truth of the build and
+the code a rollback to v1 runs, `MIGRATION.md` section 6); it is deleted in a follow-up after v1 is decommissioned
+(`MIGRATION.md` 5.6). Each v1 file and what replaces it:
+
+| v1 file | Replaced by |
+|---|---|
+| `app/index.py` (the Flask app, routes, admin pages and API) | `src/roxy/main.py`, `src/roxy/asgi.py`, `src/roxy/admin/` (pages, API, auth), `src/roxy/public/` |
+| `app/proxy.py` (the proxy route and its pipeline) | `src/roxy/proxy/` (route, validation, responses) and `src/roxy/upstream/` |
+| `app/routing.py`, `app/rotate.py` (token and rotator weights, the rotator) | `src/roxy/upstream/routing.py`, `src/roxy/egress/` (direct, credential and rotator clients, the leak guard) |
+| `app/throttle.py`, `app/tarpit.py`, `app/challenge.py` | `src/roxy/abuse/` (limiter, ladder, bans, filters, spam detectors, tarpit, bot score, challenge) |
+| `app/cache.py`, `app/capture.py` | `src/roxy/cache/` and `src/roxy/metrics/capture.py` |
+| `app/diagnostics.py`, `app/workers.py`, `app/background.py` | `src/roxy/metrics/`, `src/roxy/scheduler/` (leader, jobs, heartbeats), `src/roxy/insights/`, `src/roxy/health/` |
+| `app/auth.py`, `app/two_fa.py`, `app/mail.py` | `src/roxy/admin/auth/` (passwords, TOTP, passkeys, recovery codes, sessions) and `src/roxy/notify/` |
+| `app/config.py`, `app/runtime.py`, `app/storage.py`, `app/lockfile.py` | `src/roxy/config/` (the settings catalog and store) and `src/roxy/storage/` (the four databases) |
+| `app/gunicorn.conf.py`, `app/move_files.sh` | `deploy/gunicorn.conf.py`, `deploy/install-system.sh` |
+| `app/templates/*.html`, `app/static/*` | `src/roxy/templates/` and `src/roxy/static/` (`robots.txt`, `sitemap.xml` and the two icons kept, see "Files changed") |
+| `Tooling/UpdateBuild.sh`, `Tooling/DEPLOY.md` | `deploy/deploy.sh`, `deploy/deploy_rollback.sh`, `deploy/README.md` |
+| `Tooling/roxy.service`, `Tooling/roxy-alert@.service`, `Tooling/alert_on_failure.py` | `deploy/systemd/roxy@.service` and the other units, `deploy/tools/alert_on_failure.py` (v2 keeps the alert unit's name; `MIGRATION.md` 2.5) |
+| `Tooling/nginx-roxy.conf` | `deploy/nginx/roxy.conf.template` and its snippets |
+| `requirements.txt` | `pyproject.toml` and `uv.lock` (locked with hashes) |
+| `tests/smoke_test.py`, `tests/deploy_test.sh`, `tests/boot_check.sh` (v1's tests) | kept for v1 until it is decommissioned; v2's tests are the folders under `tests/` |
+| `tests/__pycache__/smoke_test.cpython-312.pyc` (tracked by mistake on `main`) | not tracked on `remake/v2` (a compiled file belongs in no commit) |
+
+## Files added
+
+The layout follows plan 5.4; `docs/ARCHITECTURE.md` explains how the parts fit and `docs/LEARNING_PATH.md` reads them
+in order. Every module opens with a docstring that says what it is, why it exists, how it works and what to read next.
+
+| Path | Purpose |
+|---|---|
+| `src/roxy/main.py`, `asgi.py`, `lifespan.py`, `worker.py`, `internal_app.py`, `deps.py` | The app, what gunicorn loads, the start and stop of a worker, the uvicorn worker class, the internal Unix socket app |
+| `src/roxy/proxy/` | The public proxy route: target validation, header scrubbing, answers and refusals |
+| `src/roxy/upstream/` | Talking to Roblox: rate buckets, cooldowns, breakers, single-flight, retries, adaptive pacing, routing |
+| `src/roxy/egress/` | Every path a request leaves by (direct, the credential, the rotator) and the leak guard |
+| `src/roxy/cache/` | The response cache: keys, policy, memory and cache.db tiers, stale serving, key spread |
+| `src/roxy/abuse/` | Every check that can refuse a request before Roxy spends anything on it |
+| `src/roxy/rules/` | The admin rules (blocks, endpoint, cache, User-Agent and header rules, routing, bans, access lists) |
+| `src/roxy/metrics/` | Counting and keeping everything Roxy does, and the read models of the dashboard |
+| `src/roxy/storage/` | The four SQLite databases, their migrations, retention and the batch writer |
+| `src/roxy/config/` | Environment settings, the settings catalog (493 settings) and the live settings store |
+| `src/roxy/scheduler/` | Leader election, the job registry and worker heartbeats |
+| `src/roxy/insights/` | The recommendations engine (50 rules), dry runs, auto-apply and the LLM export |
+| `src/roxy/health/` | Check Proxy Health (34 checks) |
+| `src/roxy/notify/` | Alerts by email and webhook, deduplicated across workers and capped |
+| `src/roxy/admin/` | The dashboard pages (18), the admin API (25 areas) and admin authentication |
+| `src/roxy/public/` | The home page, the user guide at `/docs`, `/status`, `/health` and the crawler files |
+| `src/roxy/core/` | Clocks, ids, logging, redaction, client addresses, middleware |
+| `src/roxy/templates/`, `src/roxy/static/` | Server-rendered templates and the self-hosted scripts, styles and vendored libraries |
+| `deploy/` | The systemd units, nginx site, gunicorn config, blue/green deploy, root wrappers, backups, alerts and audit (`deploy/README.md`) |
+| `scripts/` | The operator CLI (`ctl.py`), the migrator, `create_admin.py`, the smoke test, the shadow report, the style check and the doc generators |
+| `docs/` | The user and admin guides, runbooks, architecture, security, learning path, performance, the generated settings reference and the glossary |
+| `tests/` | Unit, integration, browser (`e2e`), security, insights, health, deploy, load, migration, multi-process and parity tests, and the two test harnesses |
+| `MIGRATION.md`, `DECISIONS_REVIEW.md` | The cutover guide and the owner's sign-off document |
+| `pyproject.toml`, `uv.lock`, `.github/workflows/ci.yml` | The locked dependencies and CI (tests, lint, types, style, secrets scan, dependency audit) |
+
+## Files changed
+
+- `app/robots.txt` is served byte for byte from `src/roxy/templates/public/robots.txt`; `app/sitemap.xml` keeps v1's
+  bytes and adds `/docs` and `/status` (parity row 13).
+- `app/static/roxy_favicon.png` and `roxy_icon.png` are kept as `src/roxy/static/public/`.
+- `.github/workflows/deploy.yml` is v2's (it replaces v1's file of the same name) and its deploy job stays off
+  (`if: false`) until `MIGRATION.md` 5.2 turns it on.
+- `README.md` describes v2 and points at the guides, `MIGRATION.md` and `DECISIONS_REVIEW.md`.
+- `.gitignore` and `.gitattributes` (`docs/screenshots` is left out of releases).
+
+## Settings decisions
+
+- **Every setting, with its default and the reason:** `docs/SETTINGS.md`, generated from the settings catalog
+  (`src/roxy/config/catalog.py`; `scripts/gen_settings_docs.py --check` keeps them equal). Each of the 493 settings
+  has its type, range, default, risk level, what raising and lowering it does, the page that edits it and the
+  recommendations that tune it.
+- **Defaults that differ from the plan:** `throttle_count_cache_hits` 1 (D10 reversed by the owner); the memory
+  sizes of "Memory sizing for the 1 GB server" (for example `cache_memory_bytes` 16 MiB and `cache_memory_entries`
+  1000); `credential_bucket_burst` is shared with Roxy's own credential checks (final review, constraints-6); the
+  others are entries under "Plan conflicts and deviations".
+- **Settings waiting for the owner** (the catalog's "PENDING owner verification", `DECISIONS_REVIEW.md` section 3):
+  `rotator_session_username_template`, `rotator_quota_gb_per_month`, `rotator_price_per_gb_usd`,
+  `roblox_egress_cidrs`, `insights_auto_apply`, `public_cors_allow_any_origin`, the six `site_*` texts and
+  `ui_timezone`.
+- **Renamed keys and the v1 import:** the plan 18.3 table, as `src/roxy/migration/v1_settings.py` implements it.
+  Renamed and imported when changed: `rotate_enabled` to `rotator_enabled`, `rotate_cooldown` to
+  `rotator_cooldown_s`, `rotate_max_failures` to `rotator_max_failures`, `max_live_requests` to `live_tail_buffer`.
+  Renamed but never imported (their meaning changed): `token_expiration_cooldown` (`credential_cooldown_default_s`),
+  `token_weight` (`direct_weight`), `rotate_weight` (`rotator_weight`), `token_danger_zone`
+  (`direct_shift_threshold_pct`), `token_budget_requests` and `token_budget_window` (`credential_bucket_per_min`,
+  `credential_bucket_burst`), `max_retries_per_request` (`upstream_max_attempts`), `autosave_interval` and
+  `diagnostics_flush_interval` (`metrics_flush_interval_ms`). Every other v1 key keeps its name; the migration report
+  lists each one with what was done.
+
+## Owner decisions applied
+
+Plan 0.3 asked the owner 23 questions. The value each one has in v2 (`DECISIONS_REVIEW.md` section 2 has where each
+lives, what changing it costs, and the owner's signature; PENDING means the plan's recommended default was used):
+
+| | Decision | Value used | Status |
+|---|---|---|---|
+| D1 | Caller traffic and the credential | Never: the allowlist ships empty; only Roxy's own checks use the credential | Decided by the owner (2026-10-07) |
+| D2 | Process model | gunicorn with uvicorn workers, `ROXY_WORKERS=2` per color | PENDING, default used (and the owner's instruction) |
+| D3 | Shared store | SQLite in WAL mode, four files, no Redis | PENDING, default used |
+| D4 | Status callers see when Roblox fails | Roblox's real status plus `Roxy-Upstream-Status`; `compat_collapse_upstream_errors` 0 | Decided by the owner (2026-10-07) |
+| D5 | Admin second factor | Authenticator app mandatory, passkeys optional, 10 recovery codes; a one-time emailed code for the imported admin's first sign-in; `admin_email_code_enabled` 0 | Decided by the owner (2026-10-07) |
+| D6 | Admin network allowlist | Off (`admin_allowlist_enabled` 0) | PENDING, default used |
+| D7 | Auto-apply safe recommendations | Off (`insights_auto_apply` 0) | PENDING, default used |
+| D8 | Body capture | On: refused and failed requests always, 20% of served ones, 15 minutes, 64 MiB, 16 KiB a body, redacted | PENDING, default used |
+| D9 | Old admin API paths | Not kept; public addresses unchanged | PENDING, default used |
+| D10 | Cache hits and the per-IP limit | They count (`throttle_count_cache_hits` 1) | Decided by the owner (2026-10-07), reversing the plan's default |
+| D11 | Per-experience limits | Observe and recommend (`place_limit_enabled` 0, 600 a minute ready) | PENDING, default used |
+| D12 | DataImpulse quota and price | 0 (unknown) until the owner fills them in | PENDING, the owner's values are needed |
+| D13 | When the rotator is used | Anonymous calls only, as spillover; `rotator_weight` 0 | PENDING, default used |
+| D14 | Alert channels | Email (Gmail app password); webhook possible, off | PENDING, default used |
+| D15 | Off-box backups | Nightly local backups; off-box (rclone) only when configured, and only encrypted | PENDING, default used |
+| D16 | Retention | Minute 14 days, hour 400 days, day and month for ever, 2,000,000 events, captures 15 minutes | PENDING, default used |
+| D17 | Old statistics | Settings changed from v1's defaults and every rule imported; v1 lifetime counters as one legacy snapshot | PENDING, default used |
+| D18 | Home page texts naming people or prices | Kept, as editable `site_*` settings marked for the owner's check | PENDING, default used |
+| D19 | Open Cloud API keys | Not built | PENDING, default used |
+| D20 | CORS on the public proxy | None (`public_cors_allow_any_origin` 0) | PENDING, default used |
+| D21 | HSTS preload | No preload; nginx sends HSTS without it | PENDING, default used |
+| D22 | Admin roles | One role, every admin is a full admin | PENDING, default used |
+| D23 | Upstream User-Agent | Browser-like; the A/B experiment is built and off, and a run ends after `ua_experiment_days` | PENDING, default used |
+
+## Ops changes
+
+`deploy/README.md` maps every operations file and where it goes, and each file explains its settings next to them
+(every systemd directive carries its reason, a test checks it). The changes from v1's operations, and why:
+
+- **Units.** v1's single `roxy` unit became the template `roxy@.service` (one instance per color, blue and green)
+  under a systemd sandbox (`NoNewPrivileges`, `ProtectSystem=strict`, a system call filter, no capabilities), with
+  `MemoryHigh=420M`, `MemoryMax=500M`, the glibc allocator lines and `OOMPolicy=continue` (an out-of-memory kill ends
+  one worker, not the color). New units: `roxy-backup` (timer, service and a request path for "Back up now"),
+  `roxy-audit` (timer, path and service, the permission audit), `roxy-boot` (starts the active color after a reboot),
+  `roxy-deploy-alert.path` and `roxy-alert@.service` (failure mail, the name v1 used). Why: plan 17.1 and 9.14, and
+  the memory plan of "Memory sizing for the 1 GB server".
+- **nginx.** v2's site `roxy-v2.conf` (rendered from `deploy/nginx/roxy.conf.template`) sits beside v1's during the
+  cutover, points at the active color through one symlink, sends the security headers and HSTS, limits requests and
+  connections per address, refuses `/internal/`, serves static files with `Cross-Origin-Resource-Policy`, and never
+  logs the kill-switch path. Only the root wrapper `roxy-nginx-apply` installs it, from the verified commit.
+- **Deploy pipeline.** `deploy/deploy.sh` (run by GitHub Actions as `roxy-deploy`, or by hand) fetches one commit of
+  `main`, builds its release and environment (`--build-only` stops there), starts the idle color, gates on its
+  internal socket, runs `scripts/smoke_remote.py`, switches nginx, watches 60 s and stops the old color; any failure
+  switches back and alerts. `deploy/deploy_rollback.sh` goes back to an earlier release. v1's `UpdateBuild.sh`
+  rebuilt in place as `ubuntu`.
+- **Users and directories.** `roxy` runs the service and owns only the databases; `roxy-deploy` deploys with sudo
+  rights for two wrappers and the color units only (never `ubuntu`, which has unrestricted sudo). Releases live in
+  `/opt/roxy/releases`, state in `/var/lib/roxy`, secrets as systemd credentials in `/etc/roxy/credentials` (root,
+  0600), backups in `/var/backups/roxy` (root, 0700), root tools in `/usr/local/lib/roxy`.
+- **Migrations.** Expand migrations run as `roxy` in the new color's pre-start step after a snapshot of control.db;
+  contract migrations are manual (`deploy/README.md`); workers never migrate.
+- **Details:** "Operations (P13; `deploy/`)" under Wave 3a, "P11 lane: memory and the hot.db write lock", and the
+  final review's ops entries below.
+
+## Behavior changes callers may notice
+
+Each with its justification in the entry named; the complete wire contract is plan 7.13 and section 4.
+
+- **Real upstream statuses (D4).** A Roblox 404 stays 404 and a Roblox 429 stays 429 with `Retry-After`, plus
+  `Roxy-Upstream-Status`; v1 sent 500 for every Roblox error. `compat_collapse_upstream_errors` brings v1's answers
+  back, a Roblox 429 included ("Compat collapse restores v1's bytes"; final review, pipe-4).
+- **New headers.** `Roxy-Cache` (HIT, MISS, STALE, REVALIDATING, COALESCED, OFF, or n/a), `Roxy-Request-Id`,
+  `Roxy-Refusal` on refusals, `Roxy-Upstream-Status`, `Roxy-Throttle-Reset`, `Retry-After` on more refusals, and
+  `Cache-Control: no-store` on every proxy answer ("Answer shapes", "Retry-After on more refusals").
+- **Refusals keep v1's wire form** (a JSON string and a newline); Roblox failure messages keep their text but are
+  sent as `text/plain` (v1 labeled them JSON) ("Decided by the lead"). New refusal texts exist only for checks v1 did
+  not have (flood, place limit, an undisguised ban).
+- **Exact limits.** The per-address limit allows exactly the limit (v1 let one more through per window); a request
+  refused by a later check spends no rate budget; cache hits count toward the limit (D10, as in v1).
+- **Per-experience endpoint rate rules** count per place and caller network by default, like the place limit (final
+  review, abuse-15).
+- **Cache keys** percent-encode names and values, so two different upstream addresses never share a cached answer
+  ("Cache key encoding"); a POST is cached only when it is on the allowlist (`cache_post_requests` `allowlist`).
+- **HEAD and OPTIONS.** OPTIONS is answered at once with `Allow` (v1 parity, never logged as a probe); HEAD follows
+  GET without a body.
+- **Target checks.** `&` and `'` are now allowed in paths, encoded separators and dot segments are refused, any port
+  in the host is refused ("Target validation").
+- **Public pages.** `/docs` (the user guide) and `/status` are new; `/internal` on the public port is an instant 404;
+  POST, PUT, PATCH and DELETE on `/health` answer 404 without the tarpit. No CORS headers (D20).
+- **C5 dash replacements in caller-facing text.** Rung 1's message reads `Too many requests; please slow down.`; the
+  other replacements are the plan section 3 C5 table, and admin texts imported from v1 are listed in the migration
+  report.
 
 ## Plan conflicts and deviations
 
@@ -33,8 +272,10 @@ per-phase progress notes and the full parity list are added as the phases land.
   as globs, so an entry also covers every path below it (`favicon.ico` covers `favicon.ico/x`). The bypass list
   became CIDR based (`access_list`).
 - **Per-IP limit off by one.** v1 allowed `limit + 1` requests per window; v2 allows exactly `limit` (plan 10.2).
-- **Dashboard section count.** v1 has 35 dashboard sections, not the count in the plan 14.1 map; see
-  `.remake/v1notes/dashboard.md` section 2.
+- **Dashboard section count.** v1's dashboard has 35 sections (its Overview, Service Controls and 33 feature
+  sections); the plan 14.1 map has 37 rows because it gives the Overview's tiles three rows (1 to 3). Every section
+  has its row; the map's other corrections (rows 4, 19, 26 and 34) follow v1's page, as the reading notes of v1's
+  `dashboard.html` found it. See "v1 section map (plan 14.1)" below.
 - **Hotfix shadow mode.** The Tier 0 hotfix replays in the opposite direction (anonymous primary, credential
   replay), because the hotfix removes credential traffic; the comparison is equivalent.
 - **Cache key encoding (plan row 53 against sections 3 and 9).** v1 built cache key text from decoded names and
@@ -2450,7 +2691,415 @@ Deferred:
   `status_4xx`, `roblox_5xx` to Roblox's answers; (2) record per attempt `roblox_2xx`, `roblox_4xx`, `roblox_5xx`
   (callers' calls only) in the recorder and the rollups; (3) the measures read them; (4) record the definitions here.
   `tests/review_p11/test_v1parity.py::test_v1parity_1_the_status_tiles_count_roblox_answers_like_v1` is a non-strict
-  xfail until then.
+  xfail until then. Fixed in the final review (lead decision 11, below): the path proposed here, with the answers in
+  tables of their own.
+
+### Final review (2026-10-13 to 2026-10-14)
+
+The last review before the owner signs off: eleven lenses (the constraints C1 to C7, the request pipeline, security,
+data, ops and the migration, the "brain" (recommendations, health checks and alerts), abuse, memory on the 909 MB
+server, and the product's own texts in three parts) each filed a reproduction per finding in `tests/review_final/`; a
+skeptic per lens confirmed 101 findings (6 high, 31 medium, 64 low, the deferred v1parity-1 included) and refuted 18.
+Eleven fixers, one per file owner, fixed them at the root, an integrator applied their requests to each other's files,
+and the docs step installed the admin guide, `MIGRATION.md` and `DECISIONS_REVIEW.md`. Each fixed reproduction stays
+in `tests/review_final/` as a regression test. The findings table and the gate are at the end of this section
+("Final review: findings table", "Final review gate").
+
+Lead decisions of this round (binding; the owner sees them in `DECISIONS_REVIEW.md`):
+
+- **The cutover stops v1, it does not pause it (plan 18.2).** v1 uses about 345 MB, and v1 beside a v2 color does
+  not fit in 909 MB. A pause still carries over (a v1 paused at copy time makes v2 start paused, parity), so the
+  smoke test and the deploy pass on a paused or throttle-all color: the proxy check accepts exactly Roxy's own
+  refusal for that switch when `/health` reports it, and says so (ops-2).
+- **The migrator hands the databases to the service** (ops-3), **treats an empty optional credential file as
+  absent** (ops-4), and **rejects far-future times and tolerates NaN and infinity in both v1 files** (ops-5).
+- **`deploy.sh --build-only`** (ops-6), so the cutover's outage does not include the environment build.
+- **v2 keeps the alert unit name `roxy-alert@.service`**: its script reports v1's `OnFailure` too (`MIGRATION.md` 2.5).
+- **The auth test helpers left the shipped package** for `tests/auth_harness.py` (ops-8), like `tests/pages_harness.py`.
+- **A product text that disagrees with the code** is fixed in the text when the code is right, and in the code when
+  the text states what the plan wants (decision 9; most of the docs findings).
+- **Decision 11 (v1parity-1 and data-3): the Roblox status tiles count Roblox's answers again.** The Overview's "2xx
+  from Roblox", "4xx from Roblox" and "5xx from Roblox" (`status_2xx`, `status_4xx`, `roblox_5xx`, and the Upstream
+  hosts table's 5xx) count every answer Roblox gave Roxy's calls for callers, per attempt (retries included), as
+  v1's `log_status_code` did; Roxy's own internal calls are left out, and a call Roblox never answered (a timeout) is
+  not an answer. They are recorded per call (`MetricsRecorder.record_roblox_answer`, from `record_attempts`) into the
+  new metrics tables `roblox_answer_minute`, `_hour`, `_day` and `_month` (migration `0010_roblox_answers.sql`,
+  expand, four empty tables, instant; `REQUIRED_SCHEMA` metrics 10), compacted and kept like the rollups
+  (`retention_minute_days`, `retention_hour_days`, `retention_day_days`), rebuilt by a ranged reset and included in the
+  Traffic and endpoint reset families. Separate tables, not rollup columns, because the previous release's leader
+  rebuilds `rollup_hour` and `rollup_day` with the columns it knows. No backfill: the tiles say "Roblox's answers are
+  counted since <date>" for a range that starts before the upgrade (never in production: v2 has no traffic before it).
+  They are known only by endpoint, host and egress (unknown, never zero, under any other filter). The caller-status
+  series keep their meaning under new names and labels: `caller_2xx` "2xx answers to callers", `caller_4xx` "4xx
+  answers to callers", `status_5xx` "5xx answers to callers" and `caller_roblox_5xx` (Traffic > Status codes and By
+  verb, the endpoint drill-down, the exports).
+
+Request path, upstream and cache:
+
+- **One pacing identity per Roblox endpoint, in every letter case (pipe-2, high).** `upstream/pacing.py
+  pacing_template` lowercases a template's literal parts (`{placeholders}` kept); buckets, cooldowns, breakers, rotator
+  exit records and learned rates key on it, so `/v1/Users/1` and `/v1/users/1` share one pace. The displayed template
+  (metrics, Live, the 429 log) is unchanged. `buckets.endpoint_limit_row` reads an `upstream_limits` row under the
+  pacing key, then under the exact template (rows typed before), and new rows are stored under the pacing key. It
+  assumes Roblox's routes ignore case (not checkable offline; folding only merges keys, so the cost of a wrong guess is
+  slower pacing, never extra calls).
+- **The account burst is shared with Roxy's own checks (constraints-6).** Allowlisted traffic gets
+  `credential_bucket_burst` minus 1 and the probe sub-bucket `CREDENTIAL_PROBE_BURST` (1); at a burst of 1 a probe
+  also takes the traffic slot, so no more than the burst ever leaves back to back.
+- **Outbound headers come from the cache key's allowlist (pipe-1).** `Accept` and `Content-Type` are built by
+  `proxy/scrub.forwarded_request_headers`; a dropped `Content-Type` (non-ASCII, over 256 characters, control
+  characters) becomes `application/json`, so the wire and the key always agree and a non-ASCII type is no longer a 500.
+- **Compatibility mode collapses a Roblox 429 too (pipe-4).** With `compat_collapse_upstream_errors` 1, a request whose
+  own call Roblox answered with 429 gets 500 with Roblox's body and content type, `Retry-After` kept and no
+  `Roxy-Refusal` (`respond.render_roblox_429_compat`); Roblox's body travels in the new `upstream_body` and
+  `upstream_content_type` fields. Roxy's own cooldown answers that made no call stay 429. A follower in another worker
+  gets the 500 with Roxy's busy text (the shared outcome carries no body).
+- **The Upstream reset also ends the cache's per-key 429 markers (pipe-5)** (`CacheService.purge_markers`,
+  `PurgeKind.MARKERS`); the reset reports how many.
+- **One burned rotator exit opens no cooldown and stores no marker (pipe-6).**
+- **Adaptive raises wait after a reset that deleted 429 evidence (data-1)** (`adaptive.reset_evidence_until`,
+  `KeyStats.evidence_lost_until_ms`): `adaptive_probe_after_h` counts from the reset.
+- **Header values never become infinite (data-9).** A `Retry-After` or `x-ratelimit-reset` too large for a float
+  reads as `cooldowns.MAX_HEADER_WAIT_S` (one day); an infinite limit or remaining count as unknown.
+- **Refused bodies are cut before the tarpit holds them (memory-3):** to `capture_max_body` (56 KiB a hold, was
+  about 1 MiB); the full length still counts in the caller's bytes and the capture's `request_body_length`.
+- **The key spread read is bounded (memory-5):** `spread.collect_rows` walks rows up to 8 MiB
+  (`SPREAD_BYTES_BUDGET`, the newest entries) and compacts long parameter lists without changing the spread (peak 8
+  MiB, was 61 MiB).
+
+The credential and egress:
+
+- **A probe's verdict belongs to the value it checked (constraints-2).** It is decided and written in one control.db
+  transaction only while `credential_meta` still names the probed fingerprint; a verdict on a replaced value is moot
+  (nothing written, nothing alerted). A stored status describes only the value whose fingerprint it carries.
+- **A rejection control.db cannot take is kept in memory (constraints-3)** (`_pending_rejection`), still blocks that
+  value in the worker, and is written by the first refresh that can write (C7, like the hot.db pending cooldown).
+- **An answer naming no account (constraints-4)** never clears a rejection or confirms a recorded account.
+- **A replace keeps the previous account (docs_a-1).** The first answer naming an account is `ok` for the same account
+  or `account_changed` for another (used: the replace was the deliberate C1 switch); the Status card says "Same
+  account as before" or "A different account than before the replace" with the earlier fingerprint.
+- **The account mismatch alert says what happened (docs_a-2):** the subject stays "Token Expired" (plan 17.7); the
+  text says the credential now answers for a different Roblox account and is not used until the owner confirms it.
+- **Egress alerts link their dashboard card and runbook (brain-6)** (`EventSink.alert(page=, runbook=)`), and every
+  alert link is absolute with `ROXY_SITE_ORIGIN` (brain-13, `notifier.page_link`; `all_unavailable` links the Upstream
+  page; an auto-apply rollback links its recommendation).
+- **The rotator's streak row is always "closed" (docs_a-10)**: it is a counter; the park is the `rotator:parked`
+  cooldown, whose reason reads "the rotator's failure streak".
+- **The rotator keeps a billing count apart from the statistics (data-4)** (control.db `service_state`
+  `rotator_billing`; `BillingCount`, `read_billing`, `merge_billing`, `billed_bytes`): a statistics reset never lifts
+  the monthly hard stop or the daily cap, and H-ROTATOR-QUOTA and the recommendations read the same count.
+
+Admin authentication:
+
+- **argon2id sized for the 909 MB server (sec-2, high; plan 9.5 against the lead's memory sizing).** Plan 9.5's 64
+  MiB, parallelism 2, two hashes at a time per worker became 19 MiB (`time_cost` 3, parallelism 1), one hash at a
+  time (`HASH_CONCURRENCY` 1, `CapacityLimiter(1)`): a login burst, which anyone can send, held 95 to 129 MiB a worker
+  against the 95 MiB a warm color has left, and now holds 20 MiB a worker (measured). Stored hashes with the old
+  parameters still verify and are rehashed at the next sign-in; `create_admin.py` and the migrator use the new
+  parameters.
+- **Two reserved hash places for callers Roxy trusts (sec-4)** (the admin allowlist, a trusted device, a signed-in
+  admin: `RESERVED_EXEMPT_HASHES`), so a flood of slowed guesses cannot lock the owner out.
+- **The dummy hash is made once, inside the queue bound (sec-6).**
+- **The D5 bootstrap closes for good at enrollment (sec-3):** enrolling deletes the account's pending bootstrap
+  logins and ends its other bootstrap sessions; the account is asked again when a bootstrap login finishes and when a
+  bootstrap session enrolls.
+
+Settings and their texts:
+
+- **A setting never holds a secret (constraints-1).** `config/secret_text.py`: the catalog refuses a value holding a
+  registered secret, a 24 character run of the credential, the `TOKEN_PREFIX` marker or a `.ROBLOSECURITY=` value,
+  from every writer, and a stored one is dropped at the next reload; the settings history's reason is stored scrubbed
+  like the audit reason, the history views and downloads and the settings export scrub secrets; pause and
+  throttle-all reasons and rule texts are refused when written (not on reload, which would silently drop a ban).
+- **The User-Agent experiment ends after `ua_experiment_days` (brain-7)**, counted from the newest switch-on or
+  User-Agent change (`read_settings.latest_change_at`); UP-UA-EXPERIMENT counts only calls made during the run.
+- **More settings marked for the owner (docs_c-7):** `rotator_quota_gb_per_month`, `rotator_price_per_gb_usd` and
+  `roblox_egress_cidrs` are "PENDING owner verification".
+- **Texts corrected to the code (decision 9):** every text that says what a bypass skips names the same checks, pinned
+  to each check's own flag (abuse-6); capture always keeps refused and failed requests (docs_a-15); an emailed code
+  lives the shorter of `two_fa_expiration` and `challenge_expiration` (docs_a-18); the allowlist, fresh factor and bot
+  score texts (docs_b-14); the bot score and challenge thresholds are "at or above" (abuse-9); `place_limit_key` also
+  decides what a per-experience endpoint rule counts by (abuse-15); the compat and credential burst texts above;
+  SPAM-DIST offers only "recommend" (abuse-5); `metrics_queue_max` counts items and captures are also held within the
+  capture caps (memory-1).
+
+Metrics and storage:
+
+- **The client tables stream and rank through a bounded heap (memory-2, high).** A top-ten read held every client of
+  the window (424 MiB at 720,000 places a day); now its peak is near zero and totals stay exact.
+- **Size and method limit refusals count as refused requests (abuse-4)**: the 413, 414, 431 and 405 Roxy answers
+  before any route record one refused outcome (check `limits`), so Protection > Request limits and the Overview count
+  them ("Refused elsewhere" says so).
+- **Queued captures stay within the capture caps (memory-1):** the batch writer's per-kind bounds drop the oldest
+  queued captures past `capture_max_records` and `capture_max_bytes`, counted as `capped`, never as dropped.
+- **Retention:** `capture_ttl_seconds` 0 deletes every capture (data-5); fingerprint values are capped per header
+  name (data-6); watches of a deleted recommendation are deleted (data-10); only one damaged cache.db copy is kept,
+  and the disk measure counts it (constraints-5).
+- **A data operation canceled by a worker shutdown records how it ended (data-7)** within 2 s (`STOPPED_RECORD_S`),
+  and Back up now and VACUUM write `.failed` rows; a reset that failed inside its first table keeps its marker as
+  "Data reset (incomplete)" and counts the batches it committed.
+
+Recommendations, health and alerts:
+
+- **FILTER-REMOVE never spans a data reset of its evidence (data-2)** (`InsightContext.data_reset_at`); an older reset
+  is named instead of "never matched".
+- **UP-BUCKET-TUNE, UP-LATENCY and UP-QUEUE-SAT raise a bucket only when its rate was unchanged for `clean_hours`
+  (brain-1)**, and the "too loose" branch ignores 429s drawn before the last change.
+- **An undo is a settings writer (brain-2):** an undo that puts back a high-risk value asks for a confirmation and a
+  reason, it never arms the spam detectors (the Protection page does), and it passes the settings write rules.
+- **Auto-apply steps a new rule row from the value in force (brain-3)**, and refuses when that value is unknown.
+- **A watch says what its guard numbers did (brain-4)** (`models.WATCH_VERDICTS`): "Kept: the guard numbers stayed
+  within bounds" only when none got worse; the drawer shows the numbers that got worse.
+- **H-ERR-RATE leaves a deliberate pause out (brain-5)**; "Apply fix" links only its own check's card (brain-14).
+
+Abuse protection:
+
+- **Trusted Roblox game servers are never auto-banned (abuse-1, high):** the game server mark is per client and every
+  detector honors it; **dry run takes no action on anyone (abuse-2)**, and `spam_would_ban` says what arming would do
+  (`when_armed`).
+- **A User-Agent ban accepts the Security page's 32-character key or a full SHA-256 (abuse-3)** and refuses lengths
+  that can never match; the Security drawer shows the 16-character ban hash.
+- **SPAM-ENUM and SPAM-BUST act on their chosen action; SPAM-DIST only recommends (abuse-5)**: a deviation from plan
+  10.3, which lists four actions for every detector, because SPAM-DIST's subject is many addresses sharing one
+  User-Agent (Roblox game servers share theirs), so there is no one client to act on.
+- **Per-experience endpoint rate rules count per place and caller network (abuse-15)** while `place_limit_key` is
+  `place_prefix` (the default), a caller-visible change: a forged `Roblox-Id` no longer uses up a real game's budget.
+- **The degraded-mode stores are bounded at 6,000 entries each (abuse-14)** (`limiter.MEMORY_ROWS_MAX`, was 50,000):
+  about 4.4 MiB a worker when full; an evicted client reads hot.db again.
+- **The folded "(other)" place and SPAM-DIST pair are never detection subjects (abuse-16).**
+
+Dashboard texts (decision 9; each with its reproduction): the Overview names what its cards refresh and lists only the
+event kinds it shows (docs_a-13); the Live filters and search match what the server matches (docs_a-6, docs_a-16); the
+reset drawer says how long its copy is kept and links the restore runbook, with no promise of an undo (docs_a-7); the
+Roblox 429s chart draws the comparison as a dashed total (docs_a-9, `charts.js` `compare_only`); latency helps say
+what they measure (docs_a-14); the bucket drawer and Credential > Budget say how each credential bucket's rate is made
+(docs_a-11); credential check results read in words (docs_a-12); cache rule zeros name the setting they fall back to
+(docs_b-2); Clear stats names what it deletes (docs_b-3); the revert drawers warn when a setting changed again since
+(docs_b-4); the bypass dialog handles a default of 0 (docs_b-5); the import preview has words for every status
+(docs_b-6); the Clients rates are counts (docs_b-7) and the "other" row is Roxy's own sum (docs_b-8); pre-migrate
+snapshots read "Before a migration" (docs_b-9); the error log states its retention (docs_b-10); buttons are named as
+labeled (docs_b-12); the Audit target choices find resets, backups, VACUUM runs and the credential, and its actor forms
+are listed (docs_b-1, docs_b-13); card subtitles no longer say "compared with" when they compare nothing (docs_b-15);
+the Bot card's game server note, the spam detector thresholds, the ban delete dialogs (repeat offenders start over) and
+the fleet's tarpit tile (against the hold cap) say what the code does (abuse-8, abuse-9, abuse-11, abuse-12); the
+client ban message is evidence the caller never sees (abuse-10).
+
+Operations and the migrator:
+
+- **`install-system.sh` never follows a planted link (sec-1, high):** it changes modes and owners only through
+  `O_NOFOLLOW` descriptors (a helper run with the system `python3 -I`, now required) and creates its one-time files
+  beside the target and links them in, so a link at `/opt/roxy/deploy.sh` is never written through.
+- **An off-box backup is always encrypted (sec-5):** `backup.sh` refuses the rclone push of an unencrypted set (the
+  local set is kept, the run fails at "rclone push").
+- **`smoke_remote.py` checks with `require`, never `assert` (sec-7)**, so it works under `python -O`; a non-JSON body
+  fails; it accepts a paused or throttle-all color as above (ops-2).
+- **nginx sends `Cross-Origin-Resource-Policy: same-origin` on static files (sec-8).**
+- **`OOMPolicy=continue` (ops-9):** an out-of-memory kill ends one worker, not the color; the runbooks and
+  `deploy/README.md` prefer `systemctl restart` (or a rollback) to `reload` on a warm color, which briefly runs four
+  workers.
+- **The master keeps a listener on the color's port (memory-4, high; amends "One TCP listener per worker").** gunicorn's
+  master opens one `SO_REUSEPORT` listener per TCP address (`master_tcp_listeners`) and hands it to every worker, so
+  the port is never without a listener while both workers recycle (it refused connections for 4 to 6 s; now at most
+  0.05 s measured). The `max_requests` jitter does not stagger the two workers' recycles; the comment said it did.
+- **A retry of a first deploy that failed after its switch starts blue again (ops-7)** (`deploy.sh live_color`).
+- **The migrator:** hands the database files to the state directory's owner, mode 0640 (ops-3); fills an empty
+  optional credential file (ops-4); reads a time that is not finite, zero, negative or more than a day ahead as
+  missing, a non-finite count as 0, caps counts at 2**53 and writes strict JSON (ops-5, `migration/times.py`); imports
+  a v1 capture limit of 0 as the v2 maximum, with a HIGH RISK warning for the capture lifetime (ops-10); and its
+  fallback argon2 parameters follow the login's (sec-2).
+
+Documents:
+
+- **The admin guide (`docs/ADMIN_GUIDE.md`, 26 chapters) is installed** and reconciled with this round's fixes; the
+  Help page shows it one chapter at a time (`/admin/help/guide` has the introduction, the contents and "Getting
+  started"; `/admin/help/guide/<chapter>` one chapter with Previous and Next; in-guide links point at the chapter that
+  holds their target; `_help_docs.load_guide`), because the whole guide is about 640 KB of HTML. The Markdown stays one
+  file.
+- **`MIGRATION.md` and `DECISIONS_REVIEW.md`** are at the repository root; `README.md` is final and points at them
+  (docs_c-8). This file gained the plan 18.1 parts it lacked (docs_c-4).
+- **Runbooks:** "Restore from backup" works from an operator shell (a root shell, absolute paths, the file handed to
+  `roxy` before its integrity check, fetching an off-box set after a lost disk) and covers the on-server snapshots
+  (docs_c-1, docs_a-7); VACUUM needs about twice the file free (docs_b-16); a rolled back recommendation cannot be
+  applied again, so the change is made by hand (brain-8); "Workers or leader missing" restarts instead of reloading
+  (ops-9); the backup runbook explains the refused unencrypted push (sec-5).
+- **The public privacy chapter says what Roxy records (docs_c-2):** a record of each forwarded request (not "a small
+  sample") and that failed requests are always captured.
+- **Owner-facing documents cite only files in the repository (docs_c-6)** (`docs/ARCHITECTURE.md`,
+  `docs/PERFORMANCE.md`, `deploy/README.md`, the shadow report); the security and performance guides carry the new
+  argon2 and degraded-store figures.
+- **Send test alert** is described in the guide (Getting started step 10, Settings > Alerts, the Alerts chapter's
+  table and "Testing that alerts arrive") and in the "Alert channels down" runbook's Verify step.
+- **`docs/SETTINGS.md`** is regenerated from the catalog's new texts, and the glossary gained `credential-check`
+  (Roxy's own call that asks Roblox whether the cookie still works).
+
+#### Final review: findings table
+
+Every confirmed finding, most severe first within its lens (status: fixed means its reproduction in
+`tests/review_final/` passes with no marker and stays as a regression test; v1parity-1's is in `tests/review_p11/`).
+
+| Id | Severity | Status | Fix |
+|---|---|---|---|
+| pipe-2 | high | fixed | One pacing key per endpoint in every letter case (`upstream/pacing.py pacing_template`) for buckets, cooldowns, breakers, rotator exits and learned rates |
+| sec-1 | high | fixed | `install-system.sh` changes modes and owners only through `O_NOFOLLOW` descriptors (system `python3 -I` helper); one-time files linked in from a temporary file |
+| sec-2 | high | fixed | argon2id 19 MiB, parallelism 1, one hash at a time per worker (a plan 9.5 deviation); old hashes verify and are rehashed |
+| abuse-1 | high | fixed | The trusted game server mark is per client; SPAM-REFUSED, SPAM-PROBE and SPAM-AUTH give a game server a strike, never a ban |
+| memory-4 | high | fixed | The gunicorn master holds one `SO_REUSEPORT` listener per TCP address and hands it to every worker; the port always has a listener |
+| memory-2 | high | fixed | Client tables stream in key order and rank through a bounded heap; totals exact, peak near zero |
+| constraints-1 | medium | fixed | `config/secret_text.py`: settings, pause, schedule and throttle-all reasons and rule texts refuse secrets; history and exports scrub them |
+| pipe-1 | medium | fixed | Outbound `Accept` and `Content-Type` come from the cache key's allowlist (`proxy/scrub.forwarded_request_headers`); a dropped type becomes `application/json` |
+| sec-3 | medium | fixed | Enrollment ends the D5 bootstrap for good (pending bootstrap logins and other bootstrap sessions) |
+| sec-4 | medium | fixed | Two reserved hash places (`RESERVED_EXEMPT_HASHES`) for the admin allowlist, trusted devices and signed-in admins |
+| data-1 | medium | fixed | Adaptive raises wait `adaptive_probe_after_h` after a reset that deleted 429 evidence (`reset_evidence_until`) |
+| data-2 | medium | fixed | FILTER-REMOVE never spans a data reset of its evidence (`InsightContext.data_reset_at`) and names an older reset |
+| data-3 | medium | fixed | With v1parity-1 (decision 12): metrics 0010 answer tables, the Roblox tiles count Roblox's answers per attempt |
+| data-6 | medium | fixed | `prune_fingerprint_values` caps values per header name, plus a table safety cap |
+| ops-2 | medium | fixed | `smoke_remote.py` accepts exactly Roxy's own pause or throttle-all refusal when `/health` reports the switch, and says so |
+| ops-3 | medium | fixed | The migrator hands every database file to the state directory's owner and group, mode 0640, through `O_NOFOLLOW` descriptors |
+| ops-9 | medium | fixed | `roxy@.service OOMPolicy=continue`; runbooks prefer a restart to a reload on a warm color |
+| ops-6 | medium | fixed | `deploy.sh --build-only <sha>` builds the release ahead of the window (no sudo, no color, no nginx) |
+| brain-1 | medium | fixed | UP-BUCKET-TUNE, UP-LATENCY and UP-QUEUE-SAT raise only a bucket whose rate held for `clean_hours` (`bucket_changed_at`) |
+| brain-2 | medium | fixed | An undo asks the high-risk confirmation and a reason, never arms the spam detectors, and passes the settings write rules |
+| brain-3 | medium | fixed | Auto-apply steps a new cache rule from the lifetime in force (`autoapply.in_force_values`) and refuses when unknown |
+| brain-4 | medium | fixed | Watch windows record a verdict (`models.WATCH_VERDICTS`); the drawer names the guard numbers that got worse |
+| abuse-3 | medium | fixed | `normalize_ua_hash` takes the Security page's 32-character key or a full SHA-256; other lengths refused |
+| abuse-2 | medium | fixed | Dry run applies to every action and every client (`_effective_action`, `when_armed`) |
+| abuse-15 | medium | fixed | Per-experience endpoint rules count per place and caller network under `place_limit_key=place_prefix` |
+| abuse-4 | medium | fixed | 413, 414, 431 and 405 limit refusals record one refused outcome (`record_limit_refusal`) |
+| abuse-14 | medium | fixed | `limiter.MEMORY_ROWS_MAX` 6,000 per degraded store (about 4.4 MiB a worker when full) |
+| memory-5 | medium | fixed | `spread.collect_rows` stops at 8 MiB and compacts long parameters without changing the spread |
+| memory-3 | medium | fixed | A refused body is cut to `capture_max_body` before a tarpit hold (`ProxyFlow.drop_body`) |
+| memory-1 | medium | fixed | `BatchWriter.register(keep_items=, keep_bytes=)` holds queued captures within the capture caps (counted `capped`) |
+| docs_a-1 | medium | fixed | A replace keeps the previous account; the Status card says "A different account than before the replace" |
+| docs_a-6 | medium | fixed | `live_tail.js` matches the Endpoint filter on template or path, like the server's `LiveQuery` |
+| docs_b-1 | medium | fixed | Audit Target choices match the targets the code writes (resets, backups, VACUUM runs, the credential) |
+| docs_b-2 | medium | fixed | A cache rule's 0 reads "default (<setting value>)" with the setting it falls back to |
+| docs_c-1 | medium | fixed | "Restore from backup" rewritten for an operator shell (root shell, absolute paths, chown before the integrity check) |
+| docs_c-2 | medium | fixed | The public privacy chapter says what Roxy records (each forwarded request; failed requests always captured) |
+| v1parity-1 | medium | fixed | Decision 11: `status_2xx`, `status_4xx`, `roblox_5xx` count Roblox's answers per attempt; caller statuses renamed `caller_*` |
+| constraints-2 | low | fixed | A probe verdict applies only while `credential_meta` names the probed fingerprint; a moot verdict writes nothing |
+| constraints-3 | low | fixed | A rejection control.db cannot take is held in memory (`_pending_rejection`) and written by the first refresh that can |
+| constraints-4 | low | fixed | A 200 naming no account never clears a rejection or confirms a recorded account (`_unnamed_answer`) |
+| constraints-5 | low | fixed | At most one damaged cache.db copy is kept, and the disk measure and `/health DataBytes` count it |
+| constraints-6 | low | fixed | Probe sub-bucket burst 1, allowlisted traffic `credential_bucket_burst - 1`; no more than the burst leaves back to back |
+| pipe-4 | low | fixed | Compat mode answers a Roblox 429 Roxy received with 500 and Roblox's body (`render_roblox_429_compat`) |
+| pipe-5 | low | fixed | The Upstream reset also purges the per-key 429 markers (`PurgeKind.MARKERS`, `markers_cleared`) |
+| pipe-6 | low | fixed | An uncounted rotator 429 opens no cooldown and stores no marker |
+| sec-5 | low | fixed | `backup.sh` refuses the rclone push of an unencrypted set |
+| sec-6 | low | fixed | The dummy hash is made once on the worker thread inside the queue bound |
+| sec-7 | low | fixed | `smoke_remote.py` uses `require()` and `CheckFailed`, so `python -O` keeps every check |
+| sec-8 | low | fixed | nginx `/static/` sends `Cross-Origin-Resource-Policy: same-origin` |
+| data-4 | low | fixed | A rotator billing count in control.db (`BillingCount`); the hard stop, the daily cap, H-ROTATOR-QUOTA, the insights and (gate) the Egress Budget tiles and the LLM export read it |
+| data-5 | low | fixed | `capture_ttl_seconds` 0 deletes every capture |
+| data-7 | low | fixed | A reset, Back up now or VACUUM canceled by shutdown writes its `.failed` row within 2 s; an incomplete reset keeps a marker saying so |
+| data-9 | low | fixed | Header parsers never return infinity (`cooldowns.MAX_HEADER_WAIT_S`); exports write strict JSON |
+| data-10 | low | fixed | `prune_recommendation_watches` deletes watches whose recommendation is gone |
+| ops-5 | low | fixed | `migration/times.py`: far-future, negative, zero and non-finite times are missing, non-finite counts 0, counts capped at 2**53 |
+| ops-4 | low | fixed | `secrets_out` treats an existing empty optional credential file as absent |
+| ops-7 | low | fixed | `deploy.sh live_color` treats a link to a stopped color with no release as no active color, so the retry starts blue |
+| ops-10 | low | fixed | A v1 capture limit of 0 imports as the v2 maximum, with a HIGH RISK warning for the capture lifetime |
+| ops-8 | low | fixed | `src/roxy/admin/auth/testing.py` moved to `tests/auth_harness.py` (decision 8) |
+| brain-5 | low | fixed | H-ERR-RATE leaves a deliberate pause out of both sides |
+| brain-6 | low | fixed | Egress alerts link their card and runbook (`EventSink.alert(page=, runbook=)`) |
+| brain-7 | low | fixed | The User-Agent experiment ends after `ua_experiment_days`; UP-UA-EXPERIMENT counts only the run |
+| brain-8 | low | fixed | The rollback runbook makes the change by hand instead of applying a rolled back recommendation again |
+| brain-13 | low | fixed | Alert links are absolute with `ROXY_SITE_ORIGIN` (`notifier.page_link`); `all_unavailable` links the Upstream page |
+| brain-14 | low | fixed | `linked_recommendations` matches the SYS-HEALTH-FAIL subject exactly |
+| abuse-5 | low | fixed | SPAM-ENUM and SPAM-BUST act on their client; SPAM-DIST offers only "recommend" (a plan 10.3 deviation) |
+| abuse-6 | low | fixed | Every bypass text names what a bypass skips, pinned to each check's `skipped_by_bypass` flag |
+| abuse-11 | low | fixed | The ban delete dialogs say repeat offenders start again from the first ban length |
+| abuse-12 | low | fixed | The fleet tarpit tile counts against the hold cap and warns from 80 percent |
+| abuse-8 | low | fixed | The Bot card's `no_roblox_signature` note describes the empty list the right way round |
+| abuse-9 | low | fixed | Threshold texts say "at or above" (probe and auth "at least") where the checks do |
+| abuse-10 | low | fixed | The client ban dialog's message is "kept with the ban"; the caller never sees it |
+| abuse-16 | low | fixed | The folded "(other)" place and the SPAM-DIST overflow pair are never detection subjects |
+| docs_a-2 | low | fixed | The account mismatch alert keeps its subject and says the credential answers for a different account |
+| docs_a-7 | low | fixed | The reset drawer says how long its copy is kept and links the restore runbook, no undo promised |
+| docs_a-9 | low | fixed | `charts.js` draws a comparison-only series as a dashed line (`compare_only`) |
+| docs_a-10 | low | fixed | The `rotator:streak` breaker row is always written closed |
+| docs_a-11 | low | fixed | The bucket drawer and Credential > Budget say where each credential bucket's settings are and how its rate is made |
+| docs_a-12 | low | fixed | Credential check results read in words; the page links the glossary's `credential-check` term (gate) |
+| docs_a-13 | low | fixed | The Overview texts name what refreshes itself and the events it lists |
+| docs_a-14 | low | fixed | The latency helps describe the caller's whole wait |
+| docs_a-15 | low | fixed | Capture texts say refused and failed requests are always captured; the ring only fills gaps |
+| docs_a-16 | low | fixed | A Live address filter is applied (`select_value`) or said to be ignored |
+| docs_a-18 | low | fixed | `two_fa_expiration` says an emailed code lives the shorter of it and `challenge_expiration` |
+| docs_b-3 | low | fixed | Clear stats names the eviction and store counts and the TTL tuner's observations it deletes |
+| docs_b-4 | low | fixed | The revert drawers warn when the setting changed again and show the current value |
+| docs_b-5 | low | fixed | The bypass dialog prefills whole hours and handles a default expiry of 0 (empty never expires) |
+| docs_b-6 | low | fixed | `settings.js IMPORT_STATUS` maps `same` and `refused` |
+| docs_b-7 | low | fixed | Clients "How to read" says Rate1, Rate5 and Rate60 are counts |
+| docs_b-8 | low | fixed | The folded "other" row reads as Roxy's own sum beyond the record cap |
+| docs_b-9 | low | fixed | Pre-migration snapshots read "Before a migration" (`snapshot_kind`) |
+| docs_b-10 | low | fixed | The error log states its retention; card, empty state, drawer and column help corrected |
+| docs_b-12 | low | fixed | Texts name the buttons as labeled ("Revoke all", "Reset request counts") |
+| docs_b-13 | low | fixed | The Audit "How to read" lists the actor forms the log holds |
+| docs_b-14 | low | fixed | Catalog texts name the real page, action and rules (allowlist, reauth window, bot score) |
+| docs_b-15 | low | fixed | Card subtitles say "compared with" only when they compare (`shell.resolve_time`) |
+| docs_b-16 | low | fixed | The disk full runbook states the VACUUM room the dashboard asks for (about twice the file) |
+| docs_c-4 | low | fixed | This file has every plan 18.1 section ("Contents (plan 18.1)") |
+| docs_c-6 | low | fixed | Owner-facing texts cite only repository files (CHANGES.md, DECISIONS_REVIEW.md) |
+| docs_c-7 | low | fixed | `rotator_quota_gb_per_month`, `rotator_price_per_gb_usd` and `roblox_egress_cidrs` are pending owner verification |
+| docs_c-8 | low | fixed | README.md is final and points at MIGRATION.md |
+
+The 18 refuted findings (the skeptics' full reasons are in the round's records). Their reproductions were deleted,
+except the docs_a test of each duplicate group, which stays as the regression test of the defect it found. The three
+groups whose findings were each refuted as a duplicate of the other described real defects that no fixer held, so the
+integrator fixed them: the severity options and `alert_digest_hour` no longer promise alerts the defaults never send,
+the "Send test alert" button of plan 13.2 exists (`POST /admin/api/v1/system/alerts/test`), and
+`health_auto_include_credential` says which runs include the credential check.
+
+| Id | Filed as | Status | Why refuted |
+|---|---|---|---|
+| pipe-3 | An unfollowed Roblox 3xx reaches the caller without `Location` | refuted | The plan sets it: parity row 24 and plan 7.9 follow only allowlisted hosts, and plan 9.13's outbound headers have no `Location` (v1's follow-any-host was bug B32) |
+| pipe-7 | A Roblox 5xx `Retry-After` is relayed without the plan 7.5 clamp | refuted | Plan 7.13's `upstream_5xx` row relays Roblox's value; the 7.5 clamp governs cooldowns after a 429 |
+| data-8 | Back up now deletes its older copies before the new one exists | refuted | Recorded decision (apisec-5): the folder never passes its cap; the nightly backups are untouched |
+| ops-1 | The deploy user's ACL reaches v1 secret files others can read | refuted | A recorded trade-off (`deploy/README.md` "Running beside v1"); v1 writes its secret files 0600 |
+| abuse-7 | Bot score signals are per worker | refuted | Plan 10.1 keeps the bot score in worker memory, recorded as per worker; SPAM-PROBE acts fleet-wide at 5 probes |
+| abuse-13 | One spam flush holds hot.db's lock 100 to 250 ms under a flood | refuted | Needs about 7,000 new addresses a second per worker, about 50 times the measured ceiling; reachable holds are tens of ms (the known abuse transaction item) |
+| docs_a-3 | The clear cooldowns dialog does not name the credential rest and the rotator park | refuted | Plan row 34 clears every cooldown; the dialog says so, on the card that lists both rows |
+| docs_a-4 | The live feed clear keeps captures in its 7-day snapshot, unsaid | refuted | Plan 6.8 prescribes the snapshot, and the drawer says a copy is taken first |
+| docs_b-11 | A follower's System > Jobs shows a failed leader job without its error | refuted | The documented design (the card says failure details stay with the leader); an enhancement that needs a schema change |
+| docs_c-3 | Permanent v1 bypass entries expire 24 h after the cutover, unsaid | refuted | Plan 15.3 and 18.3 set it; the migrator report notes it on every such row, and `MIGRATION.md` 3.2 sends the owner there |
+| docs_c-5 | `docs/SECURITY.md` names no reporting channel | refuted | Already an owner item in `DECISIONS_REVIEW.md`; only the owner can choose a channel |
+| brain-9 | The `insight_<rule>_severity` texts promise alerts | refuted as a duplicate; real, fixed | Duplicate of docs_a-5; the integrator fixed the texts, tested through docs_a-5 |
+| brain-10 | `alert_digest_hour` promises a digest the defaults never send | refuted as a duplicate; real, fixed | Duplicate of docs_a-5; text fixed, tested through docs_a-5 |
+| docs_a-5 | The severity choices and the digest hour promise emails | refuted as a duplicate; real, fixed | Duplicate of brain-9 and brain-10; the integrator fixed the texts; its test stays |
+| brain-11 | Texts name a "Send test alert" button that does not exist | refuted as a duplicate; real, fixed | Duplicate of docs_a-8; the integrator built the button and its audited route (plan 13.2), tested through docs_a-8 |
+| docs_a-8 | The same texts as brain-11 | refuted as a duplicate; real, fixed | Duplicate of brain-11; fixed with the button; its test stays |
+| brain-12 | `health_auto_include_credential` says runs you start always include the check | refuted as a duplicate; real, fixed | Duplicate of docs_a-17; text fixed, tested through docs_a-17 |
+| docs_a-17 | The same text as brain-12 | refuted as a duplicate; real, fixed | Duplicate of brain-12; text fixed; its test stays |
+
+#### Final review gate
+
+**Green on 2026-10-14** (on top of the work-in-progress commit 2be7334). No strict xfail, and in fact no xfail marker
+of any kind, is left in `tests/` (checked on the syntax tree of every test file); `tests/review_final/` holds 13
+files of passing regression tests and no scratch test file exists.
+
+- The whole suite, every test file exactly once: ten parallel pytest processes balanced by the previous run's times,
+  then `tests/multiprocess` and `tests/load` each alone (15:00 to 15:27 EDT, 27 minutes): **12,173 passed, 0 failed,
+  0 errors, 2 skipped, 0 xfailed**. By suite: deploy 436 (and the 2 skips), e2e 843, health 194, insights 917,
+  integration 1,802, load 38, migration 124, multiprocess 97, parity 57, review_final 114, review_p11 71, security 730,
+  unit 6,750. The 2 skips are `tests/deploy/test_deploy_units.py`'s two `systemd-run --user` tests
+  (`test_libraries_work_under_memory_deny_write_execute`, `test_app_boots_under_the_unit_sandbox`): the development
+  machine's WSL has had no systemd user manager since it restarted, and the tests say so; they passed in earlier
+  gates. The run left the tree as it found it.
+- Static checks: no v1 file changed; ruff and ruff format clean (901 files); mypy no issues (379 source files); the
+  style check OK on the tree and on the plan; `docs/SETTINGS.md` up to date; the parity map 781 rows, 0 problems;
+  bandit 0 high, 0 medium, 30 low (every one present at 84ab636 already; 4 low left the package with the auth test
+  helpers). The executable bits are kept.
+- Found and fixed in the gate: the docs step's open code item after data-4 (the Egress Budget tiles and the LLM
+  export's rotator budget read the billing count `rotator.read_billed_bytes`, like the hard stop, with a new
+  integration test); the Credential page links the glossary's `credential-check`; the memory-4 regression test moved
+  to `tests/multiprocess/test_worker_recycle_mp.py` (real gunicorn masters, run alone) and probes at 50 new
+  connections a second (at 100 the scaled scenario overloads the color, so drops at a stopping worker were counted as
+  listener gaps while the port never lost its listener), and it also asserts from `ss` samples that the port always
+  has a listener; the code before the fix still fails it. No test failed in the gate's run, so no assertion changed.
+- Not taken: data request 10 (SYS-METRICS-DROP during failed flushes needs a per-worker flush-failure field and a
+  producer column) stays deferred; a public `/health` emergency-limit field stays declined (it would tell every caller
+  when the limit is on); `public/pages.py capture_rule` keeps its wording, since chapter 10 already says right after
+  it that failed requests are always captured.
+- Migrations: metrics.db goes to version 10 (`0010_roblox_answers.sql`, expand: four empty tables, instant;
+  `REQUIRED_SCHEMA` metrics 10; the upgrade test covers every earlier release, metrics 1, 4, 6, 7, 8 and 9).
 
 ## Progress notes per phase
 
@@ -2984,6 +3633,26 @@ Deferred:
 - Open: LEAD_NOTES "P11 part two" (the quiet-machine reruns of the perf lane, the page scenario and the evaluation;
   the 27 MB of screenshots shipped by `git archive`; the items for the final review).
 
+### P11 review round, 2026-10-12 to 2026-10-13
+
+- Built and gated: see "P11 review round" under "Plan conflicts and deviations" (60 findings confirmed, 59 fixed,
+  v1parity-1 deferred to the final review). Gate (commit 84ab636): the whole suite in one pytest process, 11,796
+  passed, 0 failed, 2 skipped (no systemd user manager on the development machine at that moment), 1 expected
+  failure (v1parity-1, non-strict); ruff, mypy, the style check and bandit clean.
+
+### Final whole-system review, 2026-10-13 to 2026-10-14
+
+- Built: the eleven lenses and their skeptics (101 findings confirmed: 6 high, 31 medium, 64 low; 18 refuted), the
+  fixes by eleven file owners, the integration of their requests, and the final documents (the admin guide on the
+  Help page one chapter at a time, `MIGRATION.md`, `DECISIONS_REVIEW.md`, the plan 18.1 parts of this file).
+  Deviations and decisions: "Final review" under "Plan conflicts and deviations".
+- Gate (2026-10-14, on top of 2be7334): green. The whole suite as ten parallel pytest processes plus the
+  multi-process and load suites alone: 12,173 passed, 0 failed, 2 skipped (no systemd user manager on the development
+  machine), 0 xfailed; ruff, mypy, the style check and bandit clean; no xfail marker left in `tests/`. Details:
+  "Final review gate" under "Plan conflicts and deviations".
+- Open: the quiet-machine reruns of the performance figures and the docs screenshots with clean data (after this
+  review); the owner's sign-off of `DECISIONS_REVIEW.md`; then the cutover (`MIGRATION.md`).
+
 ## Parity checklist (plan section 4)
 
 Every row of plan section 4 (C3, plan 18.1 item 5) with its status and the tests that prove it. **covered**: the
@@ -3111,7 +3780,7 @@ map of plan 14.1 follows the table.
 | 91 | Section jump, now the command palette | covered (P11: palette search over the real pages) | `test_pages_core.py::test_palette_search_answers_settings_recommendations_and_endpoints_as_admin_paths`, `test_pages_core.py::test_the_sidebar_phone_menu_and_palette_list_the_registry`, `test_pages_shell.py::test_the_palette_jumps_to_a_page_and_offers_the_llm_export`, `test_design_system.py::test_command_palette_and_shortcuts`, `test_ui_gallery.py::test_palette_search_is_bounded`, `test_design_system_robustness.py::test_single_key_shortcuts_can_be_turned_off_and_stay_off` |
 | 92 | Identify an experience | covered (P11: Clients > Identify an experience) | `test_page_clients.py::test_the_lookup_draws_the_experience_as_text`, `test_v1_sections.py::test_clients_places`, `test_upstream_internal.py::test_lookup_place_chain`, `test_upstream_internal.py::test_lookup_rejects_non_numeric`, `test_api_clients.py::test_place_table_page_actions_and_lookup_cache`, `test_api_clients.py::test_lookup_errors_are_section13` |
 | 93 | Health check button | covered (P11: the Health page, the Overview's Check Proxy Health and the palette's health run) | `test_page_health.py::test_every_card_the_run_button_and_the_schedule_settings_are_there`, `test_page_health.py::test_starting_a_run_needs_csrf_and_a_fresh_factor_for_the_credential`, `test_page_health.py::test_a_run_from_a_phone_fills_in_live_and_finishes`, `test_page_overview.py::test_check_proxy_health_starts_a_run_and_opens_it`, `test_v1_sections.py::test_health_run`, `test_upstream_internal.py::test_probe_credential_verdicts`, `test_egress_rotator.py::test_exit_ip_probe_errors_and_recent_ips`, `test_health_fixtures.py::test_health_fixture`, `test_runner.py::test_catalog_covers_every_13_2_check_once`, `test_api_health.py::test_a_run_starts_streams_and_reads_back`, `test_api_health.py::test_the_credential_check_needs_a_fresh_second_factor` |
-| 94 | Admin login with password (argon2id) | covered | `test_admin_auth_passwords.py::test_production_parameters_are_the_plan_values`, `test_admin_auth_passwords.py::test_unknown_user_verifies_against_a_dummy_hash_and_fails`, `test_admin_auth_flow.py::test_wrong_password_is_403_invalid_credentials_and_unknown_user_looks_the_same`, `test_auth_argon2_thread.py::test_argon2_runs_off_the_loop_thread` |
+| 94 | Admin login with password (argon2id) | covered | `test_admin_auth_passwords.py::test_production_parameters_fit_the_909_mb_server`, `test_admin_auth_passwords.py::test_unknown_user_verifies_against_a_dummy_hash_and_fails`, `test_admin_auth_flow.py::test_wrong_password_is_403_invalid_credentials_and_unknown_user_looks_the_same`, `test_auth_argon2_thread.py::test_argon2_runs_off_the_loop_thread` |
 | 95 | Login bound to IP and UA | covered | `test_admin_auth_flow.py::test_transaction_is_bound_to_ip_and_user_agent_and_expires` |
 | 96 | Second factor: TOTP, passkeys, email fallback | covered | `test_admin_auth_flow.py::test_password_then_totp_logs_in_and_sends_the_login_alert`, `test_admin_auth_flow.py::test_bootstrap_login_uses_email_then_forces_enrollment`, `test_admin_auth_flow.py::test_email_resend_replaces_the_code_and_is_rate_limited`, `test_admin_auth_flow.py::test_passkey_registration_and_login`, `test_admin_auth_flow.py::test_recovery_code_works_once`, `test_auth_uniform_404.py::test_every_second_factor_failure_looks_identical` |
 | 97 | Lockout with exploit-log reasons | covered | `test_admin_auth_lockout.py::test_reserve_counts_before_checking_and_refuses_at_the_limit`, `test_auth_lockout.py::test_parallel_guesses_cannot_pass_the_limit`, `test_auth_lockout.py::test_two_workers_share_one_count`, `test_metrics_security_events.py::test_login_events_via_recorder` |
@@ -3169,8 +3838,9 @@ boot check, P14.)
 ### v1 section map (plan 14.1)
 
 Plan 14.1 asks for every v1 dashboard section and KPI tile to be checked off with the browser test that finds it on
-its v2 page (plan 18.1 item 12). The map is `roxy.admin.pages.registry.V1_SECTIONS`, with the corrections of
-`.remake/v1notes/dashboard.md` section 2 (LEAD_NOTES decision 7: rows 1, 3, 4, 19, 26 and 34); each row has one test
+its v2 page (plan 18.1 item 12). The map is `roxy.admin.pages.registry.V1_SECTIONS`, 37 rows covering v1's 35
+sections (the Overview has rows 1 to 3), with the corrections the reading of v1's `dashboard.html` found (rows 1, 3,
+4, 19, 26 and 34; "Dashboard section count" under "Decided by the lead"); each row has one test
 in `tests/e2e/test_v1_sections.py` that opens every page the row names and finds its key elements (the KPI tiles,
 tables, settings and actions that prove the section), and fails when a page it needs is not built. The map test
 `test_v1_sections.py::test_the_map_has_one_uniquely_named_test_per_row` keeps one test per row. All 37 rows pass
@@ -3224,3 +3894,46 @@ tables, settings and actions that prove the section), and fails when a page it n
   "send a new one."; v2 says `This code has expired; send a new one.` (LEAD_NOTES decision 5).
 - **Vendored libraries.** The style walk skips `src/roxy/static/vendor` and `tests/e2e/vendor`; the reason is under
   "Design system (P11a)" above.
+
+## Known limitations and follow-ups
+
+What v2 knowingly ships with, and what is left for after the cutover. `DECISIONS_REVIEW.md` section 5 asks the owner
+to accept these (or name the ones that must be fixed first).
+
+- **Measured on the development machine only.** Every performance figure so far comes from the shared development
+  machine (`docs/PERFORMANCE.md`); the quiet-machine reruns of the perf lane, the row 7 replay, the dashboard page
+  scenario and the recommendations evaluation run after this review, and the docs screenshots are taken again then
+  with clean data (they show the test data's hostile sample text today).
+- **Known slow spots:** the Protection attempts tabs at 90 days (532 to 649 ms); pages above about 150 KiB (Overview
+  185, Security 192, Cache and Clients 159); hourly points over 90 days on four API routes (up to 759 ms, which the
+  dashboard never asks for); the endpoint drill-down at 90 days doubled in one quiet run for no reason found; the
+  abuse transaction's p99 above plan 6.7's 3 ms under contention (GIL waits); the cache-lifetime tuner sorts a day of
+  samples in one read (an index would cost every insert).
+- **Memory:** the bot tracker (up to 10,000 clients, 32 MiB a worker) and the spam detectors' per-client state
+  (20,000 subjects) grow under heavy traffic until a worker recycles; the server's argon2 time (an estimated 100 ms)
+  is not measured; two warm colors never fit the 909 MB server (the deploy never makes them).
+- **Under a flood with hot.db degraded,** one address can get one request past its GCRA bound (plan C7).
+- **Behavior:** a rule refused for a conflict or a validation error inside a database write counts as a write error;
+  a read-only setting reference (and the Settings page's second control of a key) refreshes with its card, not on
+  save; the User-Agent drill-down keeps the newest request only (as v1); keys typed in a table's search while a search
+  is loading can be lost; touch is exercised only in the three phone flows; the pause dialog's appendix renders after
+  its footer; two changes of one setting by one admin in the same second share one revert on the Audit page.
+- **Seen in the final review, not fixed:** a kill switch racing a re-authentication can leave the rotated session
+  alive (`sessions.rotate` does not check that the old row still existed); the first unknown username of a worker
+  costs two hashes; a pause reason or rule text saved with a secret before Roxy learned that secret is still served
+  until rewritten; in compatibility mode a follower in another worker gets Roxy's busy text, not Roblox's body;
+  resetting a User-Agent to its default during an experiment run restarts the run for the recommendation but not for
+  the traffic split; 4 to 8 percent of fresh connections made at the moment a worker recycles are reset (connections
+  already in that worker's queue; `net.ipv4.tcp_migrate_req` stays at the kernel default, an owner decision).
+- **Not measurable offline:** the 33 default `allowed_roblox_hosts` were not checked against Roblox's documentation
+  (plan 9.10; no network to Roblox during the build); that Roblox's web API routes ignore letter case (the pacing key
+  assumes it); the addresses of Roblox's game servers (`roblox_egress_cidrs` ships empty).
+- **Deferred features:** a per-side counter for the User-Agent experiment (it counts the request samples of at most
+  the last 24 hours); a producer of `credential_comparison` events (so the shadow report and CRED-UNUSED have no v2
+  input; harmless while the credential allowlist is empty); roles for several admins (D22); Open Cloud keys (D19).
+- **Owner items:** a vulnerability contact for `docs/SECURITY.md`; the DataImpulse quota, price and session template;
+  the Tier 0 v1 hotfix (commit 3453d66, never merged: live v1 sends the credential with caller traffic until the
+  cutover); a key rotation procedure for `ip_hash_key`, `credential_encryption_key` and `totp_encryption_key` (plan
+  9.15; none is written yet).
+- **After the cutover:** delete v1's code (`app/`, `Tooling/`, v1's tests and `requirements.txt`) once v1 is
+  decommissioned (`MIGRATION.md` 5.6).

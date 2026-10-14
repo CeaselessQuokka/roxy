@@ -178,7 +178,46 @@ def test_restore_test_runs_monthly(tmp_path: Path, state: Path, zstd: str) -> No
     assert second == first, "not due again until 28 days have passed"
 
 
+def encrypting(tmp_path: Path) -> dict[str, str]:
+    """An age stub and a recipients file: the set is "encrypted" (copied under the .age names), which is all the
+    push tests need; test_age_encryption_round_trip covers the real age."""
+    stub = write_exec(
+        tmp_path / "bin" / "age",
+        '#!/bin/bash\nout=""; src=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -R) shift ;;\n'
+        '    -o) out="$2"; shift ;;\n    *) src="$1" ;;\n  esac\n  shift\ndone\ncp "$src" "$out"\n',
+    )
+    recipients = tmp_path / "recipients"
+    recipients.write_text("age1fakefakefakefakefakefakefakefakefakefakefakefakefakefakefake\n")
+    return {"ROXY_AGE": str(stub), "ROXY_BACKUP_AGE_RECIPIENTS": str(recipients)}
+
+
 def test_rclone_push(tmp_path: Path, state: Path, zstd: str) -> None:
+    log = tmp_path / "rclone.log"
+    rclone = write_exec(tmp_path / "bin" / "rclone", f'#!/bin/bash\necho "$*" >>{log}\n')
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    (creds / "rclone_config").write_text("[offsite]\ntype = local\n")
+    result = run_backup(
+        tmp_path,
+        state,
+        zstd,
+        ROXY_RCLONE=str(rclone),
+        ROXY_BACKUP_REMOTE="offsite",
+        CREDENTIALS_DIRECTORY=str(creds),
+        **encrypting(tmp_path),
+    )
+    assert result.returncode == 0, result.stderr
+    assert log.read_text().strip() == (
+        f"--config {creds}/rclone_config copy {tmp_path}/backups/2026-10-07 offsite:roxy-backups/2026-10-07"
+    )
+    status = json.loads((tmp_path / "status" / "backup.json").read_text())
+    assert status["last_success"]["set"]["remote"] == "offsite"
+    assert status["last_success"]["set"]["encrypted"] is True
+
+
+def test_rclone_push_refuses_an_unencrypted_set(tmp_path: Path, state: Path, zstd: str) -> None:
+    """Plan D15: the off-box copy is encrypted with age (finding sec-5). With a remote and no recipients file the
+    local set is still made, nothing is copied, and the run fails so the alert names the missing recipient."""
     log = tmp_path / "rclone.log"
     rclone = write_exec(tmp_path / "bin" / "rclone", f'#!/bin/bash\necho "$*" >>{log}\n')
     creds = tmp_path / "creds"
@@ -187,12 +226,14 @@ def test_rclone_push(tmp_path: Path, state: Path, zstd: str) -> None:
     result = run_backup(
         tmp_path, state, zstd, ROXY_RCLONE=str(rclone), ROXY_BACKUP_REMOTE="offsite", CREDENTIALS_DIRECTORY=str(creds)
     )
-    assert result.returncode == 0, result.stderr
-    assert log.read_text().strip() == (
-        f"--config {creds}/rclone_config copy {tmp_path}/backups/2026-10-07 offsite:roxy-backups/2026-10-07"
-    )
+    assert result.returncode != 0
+    assert not log.exists(), "rclone was called for an unencrypted set"
+    assert "not encrypted" in result.stdout
+    assert "ROXY_BACKUP_AGE_RECIPIENTS" in result.stdout
+    day = tmp_path / "backups" / "2026-10-07"
+    assert sorted(p.name for p in day.iterdir()) == ["SHA256SUMS", "control.db.zst", "metrics.db.zst"]
     status = json.loads((tmp_path / "status" / "backup.json").read_text())
-    assert status["last_success"]["set"]["remote"] == "offsite"
+    assert status["last_failure"]["step"] == "rclone push"
 
 
 @pytest.mark.parametrize("remote", ["evil:path", "a b", "../x"])
@@ -200,11 +241,20 @@ def test_rclone_remote_must_be_a_name(tmp_path: Path, state: Path, zstd: str, re
     creds = tmp_path / "creds"
     creds.mkdir()
     (creds / "rclone_config").write_text("[x]\n")
-    rclone = write_exec(tmp_path / "bin" / "rclone", "#!/bin/bash\nexit 0\n")
+    log = tmp_path / "rclone.log"
+    rclone = write_exec(tmp_path / "bin" / "rclone", f'#!/bin/bash\necho "$*" >>{log}\n')
     result = run_backup(
-        tmp_path, state, zstd, ROXY_RCLONE=str(rclone), ROXY_BACKUP_REMOTE=remote, CREDENTIALS_DIRECTORY=str(creds)
+        tmp_path,
+        state,
+        zstd,
+        ROXY_RCLONE=str(rclone),
+        ROXY_BACKUP_REMOTE=remote,
+        CREDENTIALS_DIRECTORY=str(creds),
+        **encrypting(tmp_path),
     )
     assert result.returncode != 0
+    assert "must be a remote name only" in result.stdout
+    assert not log.exists()
 
 
 def test_failure_is_recorded_and_leaves_no_partial_set(tmp_path: Path, state: Path, zstd: str) -> None:

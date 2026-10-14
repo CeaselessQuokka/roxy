@@ -217,48 +217,190 @@ async def test_every_document_renders_with_the_shell_one_h1_and_unique_ids(page:
     assert find_style_issues(html, path) == []
     assert "<script>" not in html
     for link in doc.select(".doc-toc__list a"):
-        assert (link.get("href") or "#")[1:] in set(ids), link.get("href")
+        href = link.get("href") or "#"
+        if href.startswith(f"{GUIDE}/") or href.startswith(f"{GUIDE}#"):
+            continue  # the guide's contents link its other chapters (test_every_in_guide_link_lands_on_its_target)
+        assert href[1:] in set(ids), href
     for region in doc.select(".doc-table"):
         assert region.get("tabindex") == "0"
         assert region.get("role") == "region"
         assert region.select_one("table") is not None
 
 
+# ============================================================================================ the admin guide
+
+GUIDE = f"{PAGE}/guide"
+GUIDE_PAGE_MAX_BYTES = 200 * 1024
+"""The heaviest guide page (the Protection chapter, about 72 KB of HTML plus the 80 KB shell) stays below this. As
+one page the guide was about 640 KB: too heavy for a phone, which is why it is shown one chapter at a time."""
+
+
+def _book() -> _help_docs.GuideBook:
+    book = _help_docs.load_guide()
+    assert book is not None, "docs/ADMIN_GUIDE.md is missing"
+    return book
+
+
+def _guide_pages() -> list[str]:
+    return [GUIDE, *(f"{GUIDE}/{chapter.slug}" for chapter in _book().chapters[1:])]
+
+
 async def test_the_admin_guide_renders_with_its_contents_and_the_outline(page: Any) -> None:
-    """`docs/ADMIN_GUIDE.md` exists (a skeleton until the docs phase writes it): the card links it with its chapters
-    and still points each plan 16.3 topic to the pages that cover it."""
+    """`docs/ADMIN_GUIDE.md` is the written guide: `/admin/help/guide` shows its introduction, its contents (every
+    chapter linked) and its first chapter, "Getting started" (other files link `/admin/help/guide#getting-started`).
+    The card links it with its chapters and still points each plan 16.3 topic to the pages that cover it."""
     assert (_help_docs.DOCS_DIR / "ADMIN_GUIDE.md").is_file()
-    guide = await page.doc(f"{PAGE}/guide")
+    book = _book()
+    titles = [chapter.title for chapter in book.chapters]
+    assert titles[0] == "Getting started"
+    assert {"Daily routine", "Alerts", "Backups and resets", "The operator CLI", "Glossary"} <= set(titles)
+    assert {spec.title for spec in registry.PAGES} <= set(titles)  # one chapter per dashboard page
+    guide = await page.doc(GUIDE)
     assert len(guide.select("h1")) == 1
-    headings = [node.text() for node in guide.select("article.doc h2")]
-    assert headings[0] == "Getting started"
-    assert {"Alerts", "Backups and resets", "The operator CLI"} <= set(headings)
-    assert {spec.title for spec in registry.PAGES} <= set(headings)  # one chapter per dashboard page
+    assert guide.select_one("h1").text() == book.title
+    assert guide.select_one("article.doc h2#getting-started") is not None  # old links land on the first chapter
+    contents = [link.get("href") for link in guide.select('nav[aria-labelledby="guide-contents"] a')]
+    assert contents == [chapter.href for chapter in book.chapters]
+    assert contents[0] == f"{GUIDE}#getting-started"
+    assert contents[1] == f"{GUIDE}/daily-routine"
+    assert [node.text() for node in guide.select("article.doc h2")] == ["Contents", "Getting started"]
+    pager = guide.select_one('nav[aria-labelledby="guide-pager-title"]')
+    assert pager is not None
+    assert "Next: Daily routine" in " ".join(pager.text().split())
     card = (await page.doc(PAGE)).select_one("section#guide")
     assert card is not None
-    assert card.select_one('a[href="/admin/help/guide"]') is not None
-    contents = card.select(".help-toc a")
-    assert len(contents) == len(headings)
-    assert contents[0].get("href") == "/admin/help/guide#getting-started"
+    assert card.select_one(f'a[href="{GUIDE}"]') is not None
+    assert [link.get("href") for link in card.select(".help-toc a")] == contents
     assert len(card.select(".help-chapter__title")) == 12
-    assert "not part of this release yet" not in card.text()
+    assert "not part of this release" not in card.text()
+
+
+async def test_every_chapter_of_the_guide_renders_as_its_own_page(page: Any) -> None:
+    """One page per `##` chapter: the shell, one h1, the chapter's own heading, unique ids, clean markup (no inline
+    script or style: the CSP), the contents with this chapter's sections, and Previous and Next in the guide's order."""
+    book = _book()
+    assert len(book.chapters) == 26
+    for chapter in book.chapters:
+        path = GUIDE if chapter.first else f"{GUIDE}/{chapter.slug}"
+        response = await page.get(path)
+        assert response.status_code == 200, path
+        html = response.text
+        doc = parse_html(html)
+        assert len(doc.select("h1")) == 1, path
+        assert doc.select_one("body").get("data-page") == "help"
+        assert doc.select_one('a[aria-current="page"][data-nav-id="help"]') is not None
+        assert doc.select_one(f"article.doc h2#{chapter.slug}") is not None, path
+        assert doc.select_one(f'.doc-toc__list a[aria-current="page"][href="#{chapter.slug}"]') is not None, path
+        for entry in chapter.sections:
+            assert doc.select_one(f'.doc-toc__list a[href="#{entry.anchor}"]') is not None, (path, entry.anchor)
+        ids = doc.ids()
+        assert len(ids) == len(set(ids)), (path, sorted({i for i in ids if ids.count(i) > 1}))
+        assert find_style_issues(html, path) == [], path
+        assert "<script>" not in html
+        before, after = book.neighbors(chapter)
+        pager = doc.select_one('nav[aria-labelledby="guide-pager-title"]')
+        assert pager is not None, path
+        hrefs = [link.get("href") for link in pager.select("a")]
+        assert hrefs == [item.href for item in (before, after) if item is not None], path
+        title = doc.select_one("title").text()
+        assert title.startswith(book.title if chapter.first else f"{chapter.title}: {book.title}"), title
+        if not chapter.first:
+            assert f"Chapter {chapter.number} of 26" in doc.select_one(".page-header__purpose").text()
+
+
+async def test_every_in_guide_link_lands_on_its_target(page: Any) -> None:
+    """Every link of the guide still lands now that it is cut into pages: a `#anchor` names an id of the same page,
+    a link to another chapter (`/admin/help/guide/<chapter>#anchor`, rewritten from the Markdown's `#anchor`) answers
+    200 and has that id, and the links into the runbooks, the other documents and the glossary land on an element.
+    Links to dashboard pages answer 200."""
+    pages: dict[str, set[str]] = {}
+
+    async def ids_of(path: str) -> set[str]:
+        if path not in pages:
+            response = await page.get(path)
+            assert response.status_code == 200, path
+            pages[path] = set(parse_html(response.text).ids())
+        return pages[path]
+
+    checked = 0
+    for path in _guide_pages():
+        doc = await page.doc(path)
+        here = set(doc.ids())
+        pages[path] = here
+        for link in doc.select("article.doc a"):
+            href = link.get("href") or ""
+            target, _, anchor = href.partition("#")
+            if href.startswith("#"):
+                assert anchor in here, f"{path}: {href} lands on nothing"
+            elif target.startswith("/admin/"):
+                found = await ids_of(target)
+                assert not anchor or anchor in found, f"{path}: {href} lands on nothing"
+            else:
+                assert href.startswith(("https://", "http://", "/docs")), f"{path}: unexpected link {href}"
+                continue
+            checked += 1
+    assert checked > 400  # about 500 links: the guide's cross references, runbooks and glossary terms
+    book = _book()
+    assert {f"{GUIDE}/{chapter.slug}" for chapter in book.chapters[1:]} <= set(pages)
+
+
+async def test_a_link_to_another_chapter_names_that_chapters_page(page: Any) -> None:
+    """The Markdown says `[Step 9](#step-9-choose-where-alerts-go)` inside Getting started and `[Replace](#replace)`
+    for a section of the Credential chapter: on the first page the first stays on the page, the second names the
+    Credential chapter's page; the Credential chapter links back to Getting started on the guide's page."""
+    first = await page.doc(GUIDE)
+    assert first.select_one('article.doc a[href="#step-9-choose-where-alerts-go"]') is not None
+    assert first.select_one(f'article.doc a[href="{GUIDE}/credential#replace"]') is not None
+    assert first.select_one('article.doc a[href="#replace"]') is None
+    alerts = await page.doc(f"{GUIDE}/alerts")
+    assert alerts.select_one(f'article.doc a[href="{GUIDE}#step-9-choose-where-alerts-go"]') is not None
+
+
+async def test_the_largest_guide_page_stays_light(page: Any) -> None:
+    sizes = {}
+    for path in _guide_pages():
+        response = await page.get(path)
+        assert response.status_code == 200, path
+        sizes[path] = len(response.content)
+    largest = max(sizes, key=lambda path: sizes[path])
+    assert sizes[largest] < GUIDE_PAGE_MAX_BYTES, (largest, sizes[largest])
+
+
+async def test_unknown_chapters_are_not_pages_and_the_first_one_has_one_address(page: Any, anon: Any) -> None:
+    for path in (
+        f"{GUIDE}/no-such-chapter",
+        f"{GUIDE}/Overview",
+        f"{GUIDE}/overview.md",
+        f"{GUIDE}/{'a' * 120}",
+        f"{GUIDE}/fragment",
+    ):
+        response = await page.get(path)
+        assert response.status_code == 404, path
+    first = await page.get(f"{GUIDE}/getting-started")
+    assert first.status_code == 302
+    assert first.headers["location"] == f"{GUIDE}#getting-started"
+    response = await anon.get(f"{GUIDE}/overview")
+    assert response.status_code == 302
+    assert response.headers["location"] == "/admin"
 
 
 async def test_the_unwritten_admin_guide_says_so_and_points_to_the_outline(
     page: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Without `ADMIN_GUIDE.md` (a release without the docs phase) the card says so and the outline is the guide."""
+    """Without `ADMIN_GUIDE.md` (a release without the guide) the card says so and the outline is the guide; a
+    chapter address is then a 404."""
     for spec in _help_docs.DOCS:
         source = _help_docs.DOCS_DIR / spec.file
         if spec.slug != "guide" and source.is_file():
             (tmp_path / spec.file).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
     monkeypatch.setattr(_help_docs, "DOCS_DIR", tmp_path)
-    doc = await page.doc(f"{PAGE}/guide")
-    assert "The admin guide is not written yet" in doc.text()
+    doc = await page.doc(GUIDE)
+    assert "The admin guide is not part of this release" in doc.text()
     assert doc.select_one('a[href="/admin/help#guide"]') is not None
+    assert (await page.get(f"{GUIDE}/overview")).status_code == 404
     card = (await page.doc(PAGE)).select_one("section#guide")
     assert card is not None
-    assert "not part of this release yet" in card.text()
+    assert "not part of this release" in card.text()
     titles = [node.text() for node in card.select(".help-chapter__title")]
     assert len(titles) == 12  # plan 16.3 has twelve chapters
     assert titles[0] == "First-time setup"

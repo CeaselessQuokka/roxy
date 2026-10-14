@@ -25,6 +25,14 @@ How it works
       group.
     - Groups are sorted Suspect first, then by entry count; a few sample values (truncated) go with each
       parameter as evidence. Negative 429 markers are not entries and are left out.
+    - Bounded in bytes, not only in rows (plan P9, finding memory-5): a batch endpoint keyed by its id list (100
+      ids, about 1 KiB of query) is exactly the key split this looks for, and 100,000 such rows held raw and
+      decoded were about 300 MiB. So the read (`collect_rows`, used by both `read_spread.spread_rows` and
+      `SharedTier.spread_rows`) walks the cursor newest first and stops at `SPREAD_BYTES_BUDGET` of estimated
+      memory, and a long `params_json` is compacted as it is read: a value longer than `LONG_VALUE_CHARS` is kept
+      as its first `SAMPLE_TEXT_MAX` characters plus a 64-bit digest of the whole value (`compact_value`), and a
+      row keeps at most `MAX_PARAMS_PER_ROW` parameters. The grouping needs nothing more: two values are the same
+      signature exactly when their prefixes and digests are, and the samples shown are the same first characters.
 
 What to read next
     `roxy/cache/keys.py` (ignored parameters and normalization flags), then the CACHE-KEYSPLIT rule in
@@ -33,6 +41,7 @@ What to read next
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -47,6 +56,28 @@ SAMPLE_TEXT_MAX: Final = 40
 """Sample values are cut to this many characters: they are caller input shown in the dashboard and the export."""
 DEFAULT_MAX_ROWS: Final = 100_000
 """Most recent entries read for one spread report (bounds the query, plan P9)."""
+SPREAD_BYTES_BUDGET: Final = 8 * 1024 * 1024
+"""Estimated memory one spread read may hold, rows and decoded parameters together (`row_cost`; finding memory-5).
+About 10,000 entries of a 100-id batch query, 14,000 of short queries: the newest entries, which the diagnostic is
+about. A safety bound for the 1 GB server, not a tuning knob."""
+ROW_COST_BYTES: Final = 450
+"""Estimated bytes one kept row costs before its parameter text (the tuples, the `SpreadRow`, the numbers)."""
+TEXT_COST_FACTOR: Final = 3
+"""Estimated bytes per character of (compacted) parameter text: the text itself plus its decoded strings."""
+COMPACT_ABOVE_CHARS: Final = 512
+"""A `params_json` longer than this is compacted as it is read (`compact_params_json`); shorter ones cost nothing."""
+LONG_VALUE_CHARS: Final = 64
+"""A parameter value longer than this is kept as its first `SAMPLE_TEXT_MAX` characters plus a digest."""
+MAX_PARAMS_PER_ROW: Final = 32
+"""Parameters one row keeps for the spread (Roblox endpoints take a handful; the rest is junk a caller added)."""
+MAX_NAME_CHARS: Final = 64
+"""Longest parameter name kept."""
+_DIGEST_MARK: Final = "\x01"
+"""Separates a compacted value's prefix from its digest (a control character no real query value carries; at worst
+a crafted value would count as the same signature as one other value)."""
+
+SpreadTuple = tuple[str, str, str, str | None, int, int]
+"""`(method, host, path, params_json, hits, bytes)` of one cache.db entry, as the spread reads it."""
 
 
 class SettingsReader(Protocol):
@@ -195,17 +226,78 @@ def compute_spread(
     return result[: max(1, int(limit))]
 
 
-def rows_from_db(raw: Sequence[tuple[str, str, str, str | None, int, int]]) -> list[SpreadRow]:
-    """Turn `SharedTier.spread_rows` tuples into `SpreadRow`s (decoding `params_json`)."""
+def compact_value(value: str) -> str:
+    """`value` when it is at most `LONG_VALUE_CHARS` long, else its first `SAMPLE_TEXT_MAX` characters, a mark and
+    a 64-bit digest of the whole value: distinct values stay distinct, and the sample shown is unchanged."""
+    if len(value) <= LONG_VALUE_CHARS:
+        return value
+    digest = hashlib.blake2b(value.encode("utf-8", "surrogatepass"), digest_size=8).hexdigest()
+    return f"{value[:SAMPLE_TEXT_MAX]}{_DIGEST_MARK}{digest}"
+
+
+def _params_of(params_json: str) -> tuple[tuple[str, str], ...]:
+    """The `(name, value)` pairs of one `params_json`, compacted and capped (`()` when it is not readable)."""
+    try:
+        doc = json.loads(params_json)
+        pairs = doc.get("params", ())
+        return tuple(
+            (str(name)[:MAX_NAME_CHARS], compact_value(str(value))) for name, value in list(pairs)[:MAX_PARAMS_PER_ROW]
+        )
+    except (ValueError, TypeError, AttributeError):
+        return ()
+
+
+def compact_params_json(params_json: str | None) -> str | None:
+    """`params_json` as the spread keeps it: unchanged when short, else re-encoded from its compacted parameters
+    (same JSON shape, `{"params": [[name, value], ...]}`). An unreadable long one becomes "" (no parameters)."""
+    if params_json is None or len(params_json) <= COMPACT_ABOVE_CHARS:
+        return params_json
+    params = _params_of(params_json)
+    if not params:
+        return ""
+    return json.dumps({"params": [list(pair) for pair in params]}, separators=(",", ":"))
+
+
+def row_cost(params_json: str | None) -> int:
+    """Estimated bytes one kept row costs (raw tuple and decoded `SpreadRow` together, see `SPREAD_BYTES_BUDGET`)."""
+    return ROW_COST_BYTES + TEXT_COST_FACTOR * len(params_json or "")
+
+
+def collect_rows(
+    rows: Iterable[Sequence[Any]], max_rows: int, *, budget_bytes: int = SPREAD_BYTES_BUDGET
+) -> list[SpreadTuple]:
+    """The spread's input from a cursor of `(method, host, path, params_json, hits, bytes)` rows, newest first.
+
+    Stops at `max_rows` rows or `budget_bytes` of estimated memory, whichever comes first; long parameter text is
+    compacted as it is read (module docstring). The repeated method, host and path strings are shared, so a
+    thousand entries of one endpoint hold one copy of each.
+    """
+    limit = max(1, int(max_rows))
+    shared: dict[str, str] = {}
+    kept: list[SpreadTuple] = []
+    spent = 0
+    for raw in rows:
+        params_json = compact_params_json(raw[3])
+        cost = row_cost(params_json)
+        if kept and spent + cost > budget_bytes:
+            break
+        spent += cost
+        method, host, path = (shared.setdefault(text, text) for text in (str(raw[0]), str(raw[1]), str(raw[2])))
+        kept.append((method, host, path, params_json, int(raw[4] or 0), int(raw[5] or 0)))
+        if len(kept) >= limit:
+            break
+    return kept
+
+
+def rows_from_db(raw: Sequence[SpreadTuple]) -> list[SpreadRow]:
+    """Turn `spread_rows` tuples into `SpreadRow`s (decoding `params_json`, compacted and capped as the read does,
+    parameter names shared between rows)."""
+    names: dict[str, str] = {}
     rows: list[SpreadRow] = []
     for method, host, path, params_json, hits, size in raw:
         params: tuple[tuple[str, str], ...] = ()
         if params_json:
-            try:
-                doc = json.loads(params_json)
-                params = tuple((str(n), str(v)) for n, v in doc.get("params", ()))
-            except (ValueError, TypeError, AttributeError):
-                params = ()
+            params = tuple((names.setdefault(name, name), value) for name, value in _params_of(params_json))
         rows.append(SpreadRow(method, host, path, params, hits, size))
     return rows
 
@@ -227,11 +319,20 @@ def thresholds(settings: SettingsReader) -> dict[str, float]:
 
 
 __all__ = [
+    "COMPACT_ABOVE_CHARS",
     "DEFAULT_MAX_ROWS",
+    "LONG_VALUE_CHARS",
+    "MAX_PARAMS_PER_ROW",
+    "SPREAD_BYTES_BUDGET",
     "SpreadGroup",
     "SpreadRow",
+    "SpreadTuple",
     "VaryingParam",
+    "collect_rows",
+    "compact_params_json",
+    "compact_value",
     "compute_spread",
+    "row_cost",
     "rows_from_db",
     "thresholds",
 ]

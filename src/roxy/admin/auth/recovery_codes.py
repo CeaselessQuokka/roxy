@@ -12,7 +12,7 @@ Why it exists
 How it works
     - A code is 16 characters of Crockford base32 (no I, L, O or U, so it reads aloud and types cleanly), shown in
       four groups. The first group is a public lookup id; the whole code is the secret. With the id the server
-      verifies ONE stored hash instead of trying all ten, which would cost ten 250 ms argon2 runs per attempt.
+      verifies ONE stored hash instead of trying all ten, which would cost ten argon2 runs per attempt.
     - Input is normalized before checking: case, spaces and dashes do not matter, and the letters O, I and L are
       read as 0, 1 and 1.
     - Spending a code is a compare-and-set inside one control.db write transaction (`mark_used`): two parallel
@@ -94,14 +94,17 @@ def lookup_id(normalized: str) -> str:
     return normalized[:ID_LENGTH]
 
 
-async def hash_codes(hasher: PasswordHasher, codes: list[str]) -> list[RecoveryEntry]:
-    """Stored entries for `codes` (each hashed off the event loop, one after another)."""
+async def hash_codes(hasher: PasswordHasher, codes: list[str], *, exempt: bool = False) -> list[RecoveryEntry]:
+    """Stored entries for `codes` (each hashed off the event loop, one after another).
+
+    `exempt`: the caller is a signed-in admin, so the hashes use the hasher's reserved slots (`passwords.py`).
+    """
     entries: list[RecoveryEntry] = []
     for code in codes:
         normalized = normalize(code)
         if normalized is None:  # pragma: no cover - generate() only makes valid codes
             raise ValueError("not a recovery code")
-        entries.append(RecoveryEntry(lookup_id(normalized), await hasher.hash(normalized)))
+        entries.append(RecoveryEntry(lookup_id(normalized), await hasher.hash(normalized, exempt=exempt)))
     return entries
 
 

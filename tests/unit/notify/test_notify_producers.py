@@ -30,7 +30,7 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from roxy.admin.auth.testing import RecordingTransport
+from auth_harness import RecordingTransport
 from roxy.config import catalog
 from roxy.core.clock import FakeClock
 from roxy.core.reasons import AuthClass, CacheState, Egress, Outcome, ReasonCode, Source

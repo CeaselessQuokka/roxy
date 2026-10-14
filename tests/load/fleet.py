@@ -493,8 +493,8 @@ class AdminProbe:
         self._thread = threading.Thread(target=self._run, name="admin-probe", daemon=True)
 
     def sign_in(self) -> bool:
+        from auth_harness import LOGIN_PATH, MFA_PATH, TEST_UA, make_admin
         from roxy.admin.auth import totp
-        from roxy.admin.auth.testing import LOGIN_PATH, MFA_PATH, TEST_UA, make_admin
         from roxy.storage.db import Database
 
         cipher = totp.load_cipher(self.credentials)

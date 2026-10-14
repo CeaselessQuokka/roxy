@@ -66,6 +66,8 @@ class FakeColor:
         }
         self.delays: dict[str, float] = {}  # seconds the TCP side waits before answering a path
         self.proxy_states = ["MISS", "HIT"]
+        # When set, every proxy request gets this answer (an owner's switch refusing it).
+        self.proxy_refusal: tuple[int, dict[str, str], bytes] | None = None
         self.version = SHA
         self.color = "green"
         self.seen_hosts: list[str] = []
@@ -80,6 +82,8 @@ def make_handler(fake: FakeColor, *, internal: bool) -> type[http.server.BaseHTT
             if internal:
                 body = json.dumps({"Version": fake.version, "Color": fake.color}).encode()
                 self.reply(200, {"Content-Type": "application/json"}, body)
+            elif self.path.startswith("/users.roblox.com/") and fake.proxy_refusal is not None:
+                self.reply(*fake.proxy_refusal)
             elif self.path.startswith("/users.roblox.com/"):
                 state = fake.proxy_states.pop(0) if fake.proxy_states else "HIT"
                 headers = {"Content-Type": "application/json"}
@@ -214,6 +218,70 @@ def test_internal_hidden_fails_fast_when_the_answer_is_held(
     assert "Timeout" in found["internal_hidden"][1]
     assert [name for name, (status, _) in found.items() if status == "FAIL"] == ["internal_hidden"]
     assert time.monotonic() - started < 10
+
+
+PAUSED = (503, {"Content-Type": "application/json", "Roxy-Refusal": "paused", "Roxy-Paused": "True"}, b'"Soon"\n')
+THROTTLE_ALL = (
+    429,
+    {"Content-Type": "application/json", "Roxy-Refusal": "throttle_all", "Roxy-Global-Throttled": "True"},
+    b'"Slow down"\n',
+)
+
+
+def health_says(fake: FakeColor, **switches: bool) -> None:
+    fake.answers["/health"] = (
+        200,
+        {"Content-Type": "application/json"},
+        json.dumps({"Status": "ok", **switches}).encode(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("refusal", "health", "word"),
+    [
+        (PAUSED, {"Paused": True}, "paused"),
+        # /health of this release has no throttle-all key: the refusal's own headers are the evidence.
+        (THROTTLE_ALL, {"Paused": False}, "throttle-all"),
+        (THROTTLE_ALL, {"Paused": False, "ThrottleAll": True}, "throttle-all"),
+    ],
+)
+def test_an_owners_switch_refusal_passes_the_proxy_check_and_says_so(
+    smoke: ModuleType, color: Any, release: Path, refusal: Any, health: dict[str, bool], word: str
+) -> None:
+    """Lead decision (1), finding ops-2: a color that is paused or in throttle-all answers the proxy check with
+    Roxy's own refusal, which still proves the proxy route and the abuse pipeline work; the deploy must not fail
+    (a pause carried over from v1, or one the owner keeps on while shipping a fix)."""
+    fake, target = color
+    fake.proxy_refusal = refusal
+    health_says(fake, **health)
+    found = results(smoke, target, release)
+    assert found["proxy"][0] == "PASS", found["proxy"]
+    assert word in found["proxy"][1], found["proxy"]
+    assert [name for name, (status, _) in found.items() if status == "FAIL"] == []
+
+
+@pytest.mark.parametrize(
+    ("refusal", "health"),
+    [
+        (PAUSED, {"Paused": False}),  # /health says the color is not paused: something else refuses as "paused"
+        (PAUSED, {}),  # no Paused in /health at all
+        (THROTTLE_ALL, {"Paused": False, "ThrottleAll": False}),
+        # A refusal without the header only that switch's refusal carries is not Roxy's switch answer.
+        ((503, {"Roxy-Refusal": "paused"}, b'"Soon"\n'), {"Paused": True}),
+        ((429, {"Roxy-Refusal": "throttle_all"}, b'"Slow down"\n'), {"Paused": False}),
+        # Another refusal is never accepted in place of the proxied answer.
+        ((429, {"Roxy-Refusal": "throttle", "Roxy-Throttled": "True"}, b'"Slow down"\n'), {"Paused": True}),
+    ],
+)
+def test_a_switch_refusal_the_color_does_not_report_fails(
+    smoke: ModuleType, color: Any, release: Path, refusal: Any, health: dict[str, bool]
+) -> None:
+    fake, target = color
+    fake.proxy_refusal = refusal
+    health_says(fake, **health)
+    found = results(smoke, target, release)
+    assert found["proxy"][0] == "FAIL", found["proxy"]
+    assert [name for name, (status, _) in found.items() if status == "FAIL"] == ["proxy"]
 
 
 def test_strict_cache_needs_a_hit(smoke: ModuleType, color: Any, release: Path) -> None:

@@ -44,11 +44,11 @@ from fastapi import APIRouter, Depends, FastAPI
 from fastapi.routing import iter_route_contexts
 
 import roxy.admin.router as admin_router
+from auth_harness import AuthHarness, TestAdmin, auth_harness
 from roxy.admin import api as admin_api
 from roxy.admin.api import API_MODULES, MOUNTED, SSE_MODULE, ApiMountError, build_api_router, guard_scopes
 from roxy.admin.api.common import AdminSession, CsrfChecked, area_router
 from roxy.admin.auth.deps import ENROLL_PATHS, require_admin
-from roxy.admin.auth.testing import AuthHarness, TestAdmin, auth_harness
 from roxy.config.insight_params import INSIGHT_RULES
 from roxy.core.errors import is_admin_api_path
 from roxy.core.ids import new_id

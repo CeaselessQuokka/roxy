@@ -48,7 +48,7 @@
   <summary>How the pipeline works</summary>
   <div class="prose">
     <p>Every proxy request walks down this list in order. The first check that refuses decides the answer; the checks below it never see that request, so each refusal is counted once, at the check that stopped it.</p>
-    <p>Bypass marks a request from a bypass address: the checks marked "Bypass skips it" are not applied to it, but pause, bans, filters and blocks still are. Rate limits count the request; fixed checks only look at it. "Refused elsewhere" counts refusals no check in this list made: the guard in front of Roblox refusing a request that tried to carry a credential marker, or a host the egress refused.</p>
+    <p>Bypass marks a request from a bypass address: the checks marked "Bypass skips it" are not applied to it, but pause, bans, filters and blocks still are. Rate limits count the request; fixed checks only look at it. "Refused elsewhere" counts refusals no check in this list made: the request size and method limits (body, headers, URL length, method; see Request limits). The guard's credential marker counts under Sent a credential (auth smuggling), and a host the egress refused under Host not allowed.</p>
     <p>Each check's count follows the time range in the top bar; the tarpit may hold a refused request before its answer is sent (see the Tarpit card).</p>
   </div>
 </details>

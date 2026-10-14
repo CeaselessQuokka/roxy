@@ -2,8 +2,8 @@
 
 What this is
     `AdminUser` and the functions the login flow, enrollment and `scripts/create_admin.py` use on control.db:
-    `get_by_username`, `get_by_id`, `insert_user`, `set_password_hash`, `store_totp`, `set_recovery_codes`,
-    `reset_mfa`, `mark_login`, and `email_for`.
+    `get_by_username`, `get_by_id`, `bootstrap_open`, `insert_user`, `set_password_hash`, `store_totp`,
+    `set_recovery_codes`, `reset_mfa`, `mark_login`, and `email_for`.
 
 Why it exists
     One place that knows the column names keeps the flow readable, and lets the console script create the first
@@ -13,6 +13,8 @@ How it works
     Every function takes a connection already inside a transaction. Usernames compare case-insensitively (the
     column is `COLLATE NOCASE`). The TOTP secret is encrypted before it reaches this module (`totp.TotpCipher`);
     storing one clears `mfa_bootstrap_pending`, which ends the one-time emailed-code login of the v1 upgrade (D5).
+    `bootstrap_open` is the one test of "may this account still use that login"; the flow and enrollment ask it
+    again inside the write that would act on a bootstrap login or session minted earlier.
     `reset_mfa` (console only) removes the TOTP secret, recovery codes, passkeys, trusted devices and sessions.
 
 What to read next
@@ -51,6 +53,11 @@ class AdminUser:
     def has_totp(self) -> bool:
         return bool(self.totp_secret_enc)
 
+    @property
+    def bootstrap_open(self) -> bool:
+        """The D5 first login (password plus emailed code) is still allowed: flagged, and no authenticator yet."""
+        return self.mfa_bootstrap_pending and not self.has_totp
+
 
 def _row_to_user(row: Any) -> AdminUser | None:
     if row is None:
@@ -83,6 +90,18 @@ def get_by_username(conn: sqlite3.Connection, username: str) -> AdminUser | None
 def get_by_id(conn: sqlite3.Connection, user_id: int) -> AdminUser | None:
     row = conn.execute(f"SELECT {_COLUMNS} FROM admin_users WHERE id = ?", (user_id,)).fetchone()  # noqa: S608 (column list is a module constant)
     return _row_to_user(row)
+
+
+def bootstrap_open(conn: sqlite3.Connection, user_id: int) -> bool:
+    """`AdminUser.bootstrap_open` read inside the caller's transaction (so a write can rely on it).
+
+    A login transaction or a session that says "bootstrap" was minted earlier; the account may have enrolled an
+    authenticator since, which closes the one-time email path for good (D5, finding sec-3).
+    """
+    row = conn.execute(
+        "SELECT mfa_bootstrap_pending, totp_secret_enc FROM admin_users WHERE id = ?", (user_id,)
+    ).fetchone()
+    return row is not None and bool(row[0]) and not row[1]
 
 
 def count_users(conn: sqlite3.Connection) -> int:

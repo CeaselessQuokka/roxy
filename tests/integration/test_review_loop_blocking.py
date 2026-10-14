@@ -40,7 +40,7 @@ from typing import Any
 import httpx
 import pytest
 
-from roxy.admin.auth.testing import auth_harness
+from auth_harness import auth_harness
 from roxy.core.clock import FakeClock
 
 LARGE_BODY = 64 * 1024

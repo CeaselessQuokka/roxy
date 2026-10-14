@@ -85,6 +85,25 @@ async def test_body_carries_content_type(service: UpstreamService, egress: FakeE
     assert out.headers["Content-Type"] == "application/json; charset=utf-8"
 
 
+@pytest.mark.parametrize(
+    ("content_type", "sent"),
+    [
+        ("text/plain; charset=utf-8", "text/plain; charset=utf-8"),
+        ("application/json; x=\xe9", "application/json"),  # not printable ASCII: httpx could not even encode it
+        ("text/plain; x=" + "a" * 300, "application/json"),  # longer than scrub.MAX_HEADER_VALUE
+        ("application/json\r\nx-evil: 1", "application/json"),
+    ],
+)
+async def test_a_caller_content_type_goes_upstream_only_through_the_allowlist(
+    service: UpstreamService, egress: FakeEgress, content_type: str, sent: str
+) -> None:
+    """Final review pipe-1: the outbound Content-Type is exactly what the cache key varies on (`proxy/scrub.py
+    forwarded_request_headers`); one the allowlist drops is replaced by Roxy's default, as a body without one is."""
+    result = await fetch(service, method="POST", body=b"{}", headers={"content-type": content_type})
+    assert result.reason is ReasonCode.UPSTREAM_OK
+    assert egress.calls[0][1].headers["Content-Type"] == sent
+
+
 @pytest.mark.parametrize("status", [400, 404, 410])
 async def test_definitive_4xx_negative_cached(service: UpstreamService, egress: FakeEgress, status: int) -> None:
     egress.handler = lambda e, out: answer(status, b'{"errors":[]}')
@@ -281,6 +300,50 @@ async def test_429_without_header_uses_default_backoff(service: UpstreamService,
     egress.handler = lambda e, out: answer(429, b"")
     result = await fetch(service)
     assert 30 <= result.retry_after_s <= 33  # cooldown_default_s plus at most 10 % jitter
+
+
+async def test_a_429_keeps_robloxs_own_body_for_compat_mode(service: UpstreamService, egress: FakeEgress) -> None:
+    """Final review pipe-4: `body` stays Roxy's 7.13 text; Roblox's own body travels beside it for the compat
+    collapse (v1 answered a Roblox 429 with 500 and Roblox's body)."""
+    egress.disabled.add(Egress.ROTATOR)
+    egress.handler = lambda e, out: answer(429, b'{"errors":[]}', {"retry-after": "30"})
+    result = await fetch(service)
+    assert result.body == messages.BUSY_MESSAGE.encode()
+    assert (result.upstream_body, result.upstream_content_type) == (b'{"errors":[]}', "application/json")
+
+
+async def test_a_cooldown_holds_for_the_endpoint_in_every_letter_case(
+    service: UpstreamService, egress: FakeEgress, ctx: Any
+) -> None:
+    """Final review pipe-2: Roblox's routes ignore case, so `/V1/Games` is the endpoint Roblox just limited: no call
+    inside its Retry-After, and no host-wide escalation from case variants of one endpoint."""
+    egress.disabled.add(Egress.ROTATOR)
+    egress.handler = lambda e, out: answer(429, b"", {"retry-after": "60"})
+    assert (await fetch(service)).upstream_status == 429
+    for path in ("/V1/Games", "/v1/GAMES", "/V1/games"):
+        variant = await fetch(service, path=path)
+        assert (variant.reason, variant.calls) == (ReasonCode.UPSTREAM_COOLDOWN, 0), path
+    assert len(egress.calls) == 1
+    assert read_rows(ctx.dbs.hot, "SELECT key FROM cooldown") == [(f"endpoint:{TEMPLATE}:direct",)]
+
+
+async def test_one_burned_rotator_exit_opens_no_cooldown_and_parks_no_key(
+    service: UpstreamService, egress: FakeEgress, ctx: Any
+) -> None:
+    """Final review pipe-6: a rotator 429 counts toward a cooldown only from `rotator_cooldown_distinct_exits`
+    exits (plan 7.5). Before that the answer carries no cooldown and no marker hint, and its Retry-After is the
+    row's minimum: the session rotated, and the next exit may answer."""
+    ctx.rules.route(TEMPLATE, "rotator_only")
+    ctx.settings.set(rotator_enabled=1)
+    egress.handler = lambda e, out: answer(429, b"{}", {"retry-after": "45"})
+    result = await fetch(service)
+    assert (result.reason, result.upstream_status, result.egress) == (
+        ReasonCode.UPSTREAM_COOLDOWN,
+        429,
+        Egress.ROTATOR,
+    )
+    assert (result.cooldown_s, result.negative_ttl_s, result.retry_after_s) == (None, None, 1)
+    assert read_rows(ctx.dbs.hot, "SELECT key FROM cooldown") == []
 
 
 def busiest_minute(times_ms: list[float]) -> int:
@@ -1133,6 +1196,33 @@ async def test_reset_state_forgets_local_cooldowns(service: UpstreamService, clo
     service.local_cooldowns.remember(f"endpoint:{TEMPLATE}:direct", 30, "retry_after", clock.now_ms())
     await service.reset_state()
     assert len(service.local_cooldowns) == 0
+
+
+async def test_reset_state_ends_the_caches_429_markers_too(service: UpstreamService, ctx: Any) -> None:
+    """Final review pipe-5: a per-key 429 marker lives until its cooldown ends (plan 7.7), so the reset that ends
+    every cooldown removes them through the cache (`CacheService.purge_markers`); a cache that cannot do it never
+    fails the reset (C7: the markers then expire on their own)."""
+
+    class Cache:
+        def __init__(self, outcome: Any) -> None:
+            self.outcome = outcome
+            self.calls = 0
+
+        async def purge_markers(self) -> int:
+            self.calls += 1
+            if isinstance(self.outcome, BaseException):
+                raise self.outcome
+            return int(self.outcome)
+
+    ctx.cache = Cache(4)
+    counts = await service.reset_state()
+    assert (counts["markers"], ctx.cache.calls) == (4, 1)
+    from roxy.storage.db import SharedStateUnavailable
+
+    ctx.cache = Cache(SharedStateUnavailable("cache", "locked"))
+    assert (await service.reset_state())["markers"] == 0
+    del ctx.cache  # no cache service at all (scripts, early startup)
+    assert (await service.reset_state())["markers"] == 0
 
 
 # --- single-flight lease hook, availability, reset ------------------------------------------------------------------

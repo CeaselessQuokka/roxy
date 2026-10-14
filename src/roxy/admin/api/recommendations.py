@@ -99,7 +99,15 @@ from roxy.deps import get_ctx
 from roxy.insights import read_recommendations as reads
 from roxy.insights import simulate
 from roxy.insights.actions import CHANGED_MESSAGE as ACTION_CHANGED_MESSAGE
-from roxy.insights.actions import ActionError, ActionResult, AppliedChange, PreviewItem, RecommendationActions
+from roxy.insights.actions import (
+    ActionError,
+    ActionResult,
+    AppliedChange,
+    PreviewItem,
+    RecommendationActions,
+    high_risk_restores,
+    setting_restores,
+)
 from roxy.insights.engine import InsightsEngine, row_to_recommendation
 from roxy.insights.models import (
     ACTIVE_STATES,
@@ -160,6 +168,7 @@ _ACTION_ERRORS: Final[dict[str, tuple[int, str]]] = {
     "superseded": (409, "superseded"),
     "invalid": (422, "invalid_change"),
     "manual": (422, "manual_change"),
+    "confirm": (422, "confirmation_required"),
 }
 """`ActionError.code` -> (status, section 13 code). A busy hot.db is not an `ActionError`: the action raises
 `SharedStateUnavailable`, which `common.service_errors` answers as 503 `unavailable`."""
@@ -657,7 +666,7 @@ def allowed_actions(rec: Recommendation) -> dict[str, dict[str, Any]]:
     return {
         "preview": {"allowed": True, "why": None},
         "apply": {"allowed": apply_why is None, "why": apply_why},
-        "undo": {"allowed": undo_why is None, "why": undo_why},
+        "undo": {"allowed": undo_why is None, "why": undo_why, "high_risk_keys": [], "arms": []},
         "snooze": {"allowed": active, "why": None if active else not_open},
         "dismiss": {"allowed": active, "why": None if active else not_open},
     }
@@ -812,6 +821,13 @@ class ReasonBody(ApiBody):
     """`POST /{id}/undo`: an optional reason for the audit log."""
 
     reason: str = Field(default="", max_length=MAX_REASON_LENGTH)
+
+
+class UndoBody(ReasonBody):
+    """`POST /{id}/undo`: the reason, and the confirmation an undo needs when it puts back a high-risk setting value
+    (with a reason then; final review brain-2: an undo is a settings writer like PATCH, a revert and an import)."""
+
+    confirm_high_risk: bool = False
 
 
 class SnoozeBody(ApiBody):
@@ -1153,11 +1169,24 @@ async def detail_answer(request: Request, rec_id: str) -> dict[str, Any]:
         open_counts = _counts(facets)["open_by_rule"]
         rule = rule_card(rec.rule_id, ctx.settings.snapshot(), _rule_meta(request), open_counts)
     base = f"{common.API_PREFIX}/recommendations/{rec.id}"
+    allowed = allowed_actions(rec)
+    if allowed["undo"]["allowed"]:
+        # What the undo route will ask (final review brain-2): the high-risk values it puts back (a confirmation and
+        # a reason) and the arm-only switches it would turn off (refused: arming is the Protection page's).
+        with common.service_errors():
+            applied = await _last_applied(request, rec.id)
+        snapshot = ctx.settings.snapshot()
+        allowed["undo"]["high_risk_keys"] = high_risk_restores(applied)
+        allowed["undo"]["arms"] = sorted(
+            key
+            for key, value in setting_restores(applied).items()
+            if key in settings_api.ARM_ONLY_SETTINGS and not value and bool(snapshot.get(key))
+        )
     return {
         "recommendation": safe_payload(rec),
         "card": card(rec),
         "changes_digest": changes_digest(rec.changes),
-        "allowed": allowed_actions(rec),
+        "allowed": allowed,
         "rule": rule,
         "history": [history_item(action) for action in actions],
         "watch": watch,
@@ -1283,15 +1312,30 @@ async def _last_applied(request: Request, rec_id: str) -> list[AppliedChange]:
 
 @router.post("/{rec_id}/undo")
 async def undo(
-    request: Request, rec_id: RecId, body: ReasonBody, admin: AdminSession, _csrf: CsrfChecked
+    request: Request, rec_id: RecId, body: UndoBody, admin: AdminSession, _csrf: CsrfChecked
 ) -> dict[str, Any]:
-    """Revert exactly what the last apply wrote; refused (409 `superseded`) when a key changed since."""
+    """Revert exactly what the last apply wrote; refused (409 `superseded`) when a key changed since.
+
+    An undo writes settings like every settings writer (final review brain-2): it never arms the spam detectors
+    (422 `confirmation_required`: only the arm route does, after its collateral preview), a high-risk value it puts
+    back needs `confirm_high_risk` and a reason, and the editor's rules (`settings.WriteRules`) run again inside each
+    setting write's transaction."""
     rec = await _get(request, rec_id)
     with common.service_errors():
         applied = await _last_applied(request, rec.id)
     admin = await _fresh_if(request, admin, bool(sensitive_targets(applied, undo=True)))
-    reason = common.require_reason(body.reason, required=False)
-    result: ActionResult = await _act(actions_for(request).undo(rec.id, actor_for(admin), reason))
+    ctx = get_ctx(request)
+    settings_api.refuse_arming(setting_restores(applied), ctx.settings.snapshot())
+    reason = settings_api.check_risk(high_risk_restores(applied), reason=body.reason, confirmed=body.confirm_high_risk)
+    result: ActionResult = await _act(
+        actions_for(request).undo(
+            rec.id,
+            actor_for(admin),
+            reason,
+            guard=settings_api.write_rules(ctx, admin, confirmed=body.confirm_high_risk),
+            confirm_high_risk=body.confirm_high_risk,
+        )
+    )
     return {
         "recommendation": card(result.recommendation),
         "action": result.action,

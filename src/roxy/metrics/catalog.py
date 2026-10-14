@@ -49,6 +49,7 @@ class MetricSpec:
 
 
 _ROLLUPS = "rollup_minute, rollup_hour, rollup_day, rollup_month joined with dims"
+_ANSWERS = "roblox_answer_minute, roblox_answer_hour, roblox_answer_day, roblox_answer_month"
 _REFUSED_OR_DEMAND = (
     "Demand is every caller proxy request that Roxy tried to serve: outcome served from Roblox, served from the "
     "cache, or failed, excluding refusals, OPTIONS requests answered locally, and Roxy's own internal calls."
@@ -233,13 +234,29 @@ _SPECS: tuple[MetricSpec, ...] = (
     MetricSpec(
         "roblox_5xx",
         "5xx from Roblox",
+        "count",
+        "Times Roblox's own servers failed on Roxy's calls for callers (500 to 599), counted once per call, even "
+        "when a retry then succeeded or the cache served the caller an older copy, so your callers may not have "
+        "noticed (v1 counted the same way).",
+        "Answers with a status from 500 to 599 in the Roblox answer tables: every answer Roblox gave a call made "
+        "for callers (their requests, background refreshes and the retries of both), once per attempt. Roxy's own "
+        "probes and lookups are not counted. Counted since the upgrade that added these tables (metrics schema "
+        "10); a range that starts earlier says so.",
+        _ANSWERS,
+        ("overview#kpis", "traffic#status"),
+        better="lower",
+        notes="Lead decision 11 (findings v1parity-1, data-3): v1 `log_status_code` counted each Roblox answer.",
+    ),
+    MetricSpec(
+        "caller_roblox_5xx",
+        "Roblox 5xx answers to callers",
         "requests",
-        "Server errors that came from Roblox and were passed to the caller, with Roblox's own status (after the "
-        "allowed retries, the caller gets Roxy's retry text with Roblox's status).",
+        "Requests whose caller received a server error that came from Roblox, with Roblox's own status (after "
+        "the allowed retries, the caller gets Roxy's retry text with Roblox's status).",
         "Sum of `requests` with a caller status from 500 to 599 and source `roblox` or `relay`, or reason "
         "`upstream_5xx` (a Roblox 5xx after the retries, recorded with source `roxy` because the text is Roxy's).",
         _ROLLUPS,
-        ("overview#kpis", "traffic#status"),
+        ("traffic#status",),
         better="lower",
     ),
     MetricSpec(
@@ -256,22 +273,52 @@ _SPECS: tuple[MetricSpec, ...] = (
     ),
     MetricSpec(
         "status_2xx",
-        "2xx responses",
-        "requests",
-        "Successful responses sent to callers.",
-        "Sum of `requests` with a caller status from 200 to 299.",
-        _ROLLUPS,
+        "2xx from Roblox",
+        "count",
+        "Times Roblox answered Roxy's calls for callers successfully (200 to 299), counted once per call. Answers "
+        "from Roxy's cache and Roxy's own refusals are not Roblox's answers and are not counted.",
+        "Answers with a status from 200 to 299 in the Roblox answer tables: every answer Roblox gave a call made "
+        "for callers (their requests, background refreshes and the retries of both), once per attempt. Roxy's own "
+        "probes and lookups are not counted. Counted since the upgrade that added these tables (metrics schema "
+        "10); a range that starts earlier says so.",
+        _ANSWERS,
         ("overview#kpis", "traffic#status"),
         better="higher",
+        notes="Lead decision 11 (findings v1parity-1, data-3): v1 `log_status_code` counted each Roblox answer.",
     ),
     MetricSpec(
         "status_4xx",
-        "4xx responses",
+        "4xx from Roblox",
+        "count",
+        "Times Roblox refused one of Roxy's calls for callers (400 to 499, Roblox's 429s included), counted once "
+        "per call. Roxy's own refusals are not counted here: a burst of Roxy's own throttling never reads as Roblox "
+        "starting to reject Roxy.",
+        "Answers with a status from 400 to 499 in the Roblox answer tables: every answer Roblox gave a call made "
+        "for callers (their requests, background refreshes and the retries of both), once per attempt. Roxy's own "
+        "probes and lookups are not counted. Counted since the upgrade that added these tables (metrics schema "
+        "10); a range that starts earlier says so.",
+        _ANSWERS,
+        ("overview#kpis", "traffic#status"),
+        notes="Lead decision 11 (findings v1parity-1, data-3): v1 `log_status_code` counted each Roblox answer.",
+    ),
+    MetricSpec(
+        "caller_2xx",
+        "2xx answers to callers",
+        "requests",
+        "Successful responses sent to callers, from Roblox or from Roxy's cache.",
+        "Sum of `requests` with a caller status from 200 to 299.",
+        _ROLLUPS,
+        ("traffic#status",),
+        better="higher",
+    ),
+    MetricSpec(
+        "caller_4xx",
+        "4xx answers to callers",
         "requests",
         "Client error responses sent to callers, from Roblox (for example 404) or from Roxy (refusals).",
         "Sum of `requests` with a caller status from 400 to 499.",
         _ROLLUPS,
-        ("overview#kpis", "traffic#status"),
+        ("traffic#status",),
     ),
     MetricSpec(
         "timeouts",

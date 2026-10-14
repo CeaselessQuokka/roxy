@@ -289,6 +289,40 @@ async def test_the_spam_card_charts_the_detector_timelines_from_the_api(page: An
     assert "range=7d" in week.select_one("#spam-timeline").get("data-series-src")  # the chart follows the range
 
 
+@pytest.mark.parametrize(
+    ("detector", "compare"),
+    [
+        ("probe", "at least"),
+        ("auth", "at least"),
+        ("rate", "more than"),
+        ("refused", "more than"),
+        ("enum", "more than"),
+    ],
+)
+async def test_each_detector_card_compares_with_its_threshold_as_the_detector_does(
+    page: Any, detector: str, compare: str
+) -> None:
+    """Review finding abuse-9 (the card side): `abuse/spam.py evaluate_row` fires probe and auth AT their threshold
+    (`>=`) and the others only above it, and each card says which."""
+    card = parse_html((await page.fragment("protection", f"spam-{detector}")).text)
+    lead = " ".join(next(p.text() for p in card.select("p") if "When it sees" in p.text()).split())
+    assert f"When it sees {compare} " in lead, lead
+
+
+async def test_every_ban_delete_dialog_says_repeat_offenders_start_over(page: Any) -> None:
+    """Review finding abuse-11: a detector doubles a client's next ban for each automatic ban of it in the last 30
+    days, expired ones included (`abuse/bans.py previous_offenses`), so every scope that deletes automatic bans says
+    the escalation starts again, and the expired scope no longer says nothing changes."""
+    card = parse_html((await page.fragment("protection", "bans")).text)
+    for scope in ("expired", "auto", "detector", "all"):
+        dialog = card.select_one(f"#dlg-prot-bans-{scope}")
+        assert dialog is not None, scope
+        words = " ".join(dialog.text().split())
+        assert "Repeat offenders start again from the first ban length" in words, scope
+        assert "the last 30 days, expired ones included" in words, scope
+        assert "Nothing changes for any caller" not in words, scope
+
+
 async def test_the_refusal_reasons_keep_the_v1_columns_and_the_message_split(page: Any, pages_app: Any) -> None:
     await seed_protection(page, pages_app)
     doc = parse_html((await page.fragment("protection", "refusals")).text)

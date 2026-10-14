@@ -1,9 +1,9 @@
 """Documentation references (plan 18.5): every file, symbol, test, route and command the guides name exists.
 
 What this is
-    Tests over the four hand-written guides: `docs/LEARNING_PATH.md`, `docs/ARCHITECTURE.md`, `docs/SECURITY.md`
-    and `docs/RUNBOOKS.md`. Every reference inside a code span or a code block is checked against the repository
-    and the application:
+    Tests over the hand-written guides: `docs/LEARNING_PATH.md`, `docs/ARCHITECTURE.md`, `docs/SECURITY.md`,
+    `docs/RUNBOOKS.md` and the cutover guide `MIGRATION.md` at the repository root. Every reference inside a code
+    span or a code block is checked against the repository and the application:
       * repository paths (`src/roxy/...`, `tests/...`, `deploy/...`) exist;
       * dotted Python names (`roxy.abuse.limiter.gcra`) are defined in their module, read with `ast`;
       * test ids (`tests/....py::test_name`) name a test function that exists;
@@ -19,14 +19,14 @@ What this is
     For the runbooks: the link index resolves every runbook name the alerts (`roxy.notify.alerts.ALERT_SPECS`) and the
     health checks (`roxy.health.checks.SPECS`) link to, every health check has a row, every runbook of plan 17.8
     exists, and every runbook has its seven parts. The architecture page's startup order is compared with a real
-    worker's, and the counts and memory sizes the guides quote with the code that sets them. Finally the four files
+    worker's, and the counts and memory sizes the guides quote with the code that sets them. Finally the guides
     pass the C5 style check.
 
 Why it exists
-    The owner learns from these guides and follows the runbooks during incidents. A path that moved, a test that was
-    renamed or a flag that never existed sends the reader nowhere at the worst moment, and a made-up name teaches
-    something false. Plan 18.5 asks for `test_learning_path_references_exist`; the same rules hold for the other three
-    guides, so each gets its own test.
+    The owner learns from these guides, follows the runbooks during incidents and MIGRATION.md during the cutover. A
+    path that moved, a test that was renamed or a flag that never existed sends the reader nowhere at the worst
+    moment, and a made-up name teaches something false. Plan 18.5 asks for `test_learning_path_references_exist`; the
+    same rules hold for the other guides, so each gets its own test.
 
 How it works
     A small line parser splits each guide into inline code spans, code block lines (a line ending in a backslash is
@@ -69,7 +69,14 @@ from roxy.public.pages import slugify
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 DOCS = ROOT / "docs"
-GUIDES = ("LEARNING_PATH.md", "ARCHITECTURE.md", "SECURITY.md", "RUNBOOKS.md")
+GUIDES = ("LEARNING_PATH.md", "ARCHITECTURE.md", "SECURITY.md", "RUNBOOKS.md", "MIGRATION.md")
+ROOT_GUIDES = frozenset({"MIGRATION.md"})
+"""Guides that live at the repository root instead of `docs/` (MIGRATION.md, plan 18.2)."""
+
+
+def guide_path(name: str) -> Path:
+    return (ROOT if name in ROOT_GUIDES else DOCS) / name
+
 
 REPO_DIRS = ("src/", "tests/", "scripts/", "deploy/", "docs/", ".github/")
 """A reference that starts with one of these is a repository path and must exist."""
@@ -126,6 +133,25 @@ SCRIPT_DELEGATES = {
 
 CREATED_BY_THE_READER = frozenset({"/var/lib/roxy/control.db.bad"})
 """Server paths a runbook tells the reader to create (a damaged file moved aside), so no deploy file names them."""
+
+OUTSIDE_ROXY: dict[str, tuple[frozenset[str], tuple[str, ...]]] = {
+    "MIGRATION.md": (
+        frozenset(
+            {
+                "/admin/shadow",  # v1's routes (the Tier 0 hotfix's shadow report, v1's diagnostics poll)
+                "/admin/diagnostics",
+                "/.well-known/acme-challenge/",  # served by nginx from /var/www/letsencrypt, not by the app
+                "/etc/ssh/ssh_host_ed25519_key.pub",  # the host's ssh key (the deploy workflow's fingerprint)
+                "MemoryCurrent",  # a systemd property `systemctl show` prints
+                "authorized_keys",  # the ssh file of an account
+                "roxy.env",  # a file name in /etc/roxy, not a Python module
+            }
+        ),
+        ("/root", "/home/"),  # root's and ubuntu's home directories: v1's code, copies and reports live there
+    ),
+}
+"""References a guide makes to v1 (its routes and files) or to the host itself, which no Roxy v2 file names. Listed
+per guide and exactly, so a mistyped v2 reference in the same guide is still caught."""
 
 RELEASE_PATH = re.compile(r"^/opt/roxy/releases/[^/]+/(.+)$")
 TEST_ID = re.compile(r"^(tests/[\w./-]+\.py)::([\w:]+?)(\[[^\]]*\])?$")
@@ -195,7 +221,7 @@ class Guide:
 
 def parse_guide(name: str) -> Guide:
     """Code spans, code block lines and headings (with the anchors the guide renderer gives them)."""
-    text = (DOCS / name).read_text(encoding="utf-8")
+    text = guide_path(name).read_text(encoding="utf-8")
     guide = Guide(name, text)
     used: dict[str, int] = {}
     in_block = False
@@ -455,10 +481,18 @@ def page_problem(path: str) -> str | None:
 class Checker:
     routes: Routes
     problems: list[str] = field(default_factory=list)
+    outside: frozenset[str] = frozenset()
+    outside_prefixes: tuple[str, ...] = ()
 
     def report(self, where: str, reference: str, problem: str | None) -> None:
         if problem:
             self.problems.append(f"{where}: `{reference}`: {problem}")
+
+    def is_outside(self, text: str) -> bool:
+        """A reference this guide makes to v1 or to the host itself (`OUTSIDE_ROXY`)."""
+        return bool(text) and (
+            text in self.outside or bool(self.outside_prefixes and text.startswith(self.outside_prefixes))
+        )
 
     def http_path(self, where: str, method: str | None, path: str) -> None:
         first = path.split("/")[1] if path.count("/") >= 1 and len(path) > 1 else ""
@@ -473,6 +507,8 @@ class Checker:
     def span(self, where: str, span: str) -> None:
         """A whole inline code span."""
         text = span.strip()
+        if self.is_outside(text) or self.is_outside(text.partition(" ")[2]):
+            return  # a reference to v1 or to the host itself (OUTSIDE_ROXY), alone or after an HTTP method
         test_id = TEST_ID.match(text)
         if test_id:
             self.report(where, text, problem_of_test_id(test_id.group(1), test_id.group(2)))
@@ -506,7 +542,7 @@ class Checker:
         words = PLACEHOLDER.sub("{}", line).split()
         for index, raw in enumerate(words):
             word = raw.strip("'\"`,;()")
-            if not word or PLACEHOLDER.search(word) or "*" in word:
+            if not word or PLACEHOLDER.search(word) or "*" in word or self.is_outside(word):
                 continue
             if word.startswith("http://localhost/"):
                 self.http_path(where, None, word[len("http://localhost") :])
@@ -561,7 +597,8 @@ class Checker:
 
 
 def check_guide(name: str, routes: Routes) -> list[str]:
-    checker = Checker(routes)
+    outside, prefixes = OUTSIDE_ROXY.get(name, (frozenset(), ()))
+    checker = Checker(routes, outside=outside, outside_prefixes=prefixes)
     checker.guide(guide(name))
     return checker.problems
 
@@ -629,6 +666,11 @@ def test_security_references_exist(routes: Routes) -> None:
 
 def test_runbook_references_exist(routes: Routes) -> None:
     assert check_guide("RUNBOOKS.md", routes) == []
+
+
+def test_migration_references_exist(routes: Routes) -> None:
+    """MIGRATION.md (plan 18.2): every command, flag, path and section link of the cutover exists."""
+    assert check_guide("MIGRATION.md", routes) == []
 
 
 def runbook_sections() -> dict[str, str]:
@@ -733,7 +775,8 @@ def style() -> ModuleType:
 def test_guides_pass_the_style_check(style: ModuleType, name: str) -> None:
     """Plan C5: no em or en dash and US spelling (the same rules CI applies to the whole tree)."""
     rules = style.load_rules()
-    issues = style.check_text((DOCS / name).read_text(encoding="utf-8"), rules, f"docs/{name}")
+    path = guide_path(name)
+    issues = style.check_text(path.read_text(encoding="utf-8"), rules, str(path.relative_to(ROOT)))
     assert [f"{issue.line}: {issue.message}" for issue in issues] == []
 
 

@@ -21,6 +21,7 @@
     session     {"heartbeat_s": 30, "activity_window_s": 60, "heartbeat_url", "login_url": "/admin"}
     theme       "dark" (default) | "light" | "system";   density: "comfortable" | "dense"
     time        {"range": "24h", "compare": "none|previous|week|month|year", "from", "to", "description", "notice"}
+                (`description` is the range alone; `compare_label` names the comparison for a card that draws it)
     status      service state for the banners, top bar buttons and pause dialogs (see admin/_layout/banners.html);
                 the caller texts `pause_message`, `pause_default` and `throttle_message` come from
                 `roxy.admin.pages.texts.caller_texts` with the live `pause_message_default`, never from a template;

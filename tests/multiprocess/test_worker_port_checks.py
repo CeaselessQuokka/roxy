@@ -6,8 +6,9 @@ What this is
     tests/multiprocess/test_rr_mp_reuse_port.py runs the same hooks inside real gunicorn masters.
 
 Why it exists
-    With `reuse_port` every worker binds its own SO_REUSEPORT listener after the fork and the master binds nothing,
-    so without these hooks a second master on a served port shares it silently, and a port another program holds
+    With `reuse_port` every worker binds its own SO_REUSEPORT listener after the fork (and the master one more in
+    the same group, `master_tcp_listeners`, finding memory-4), so without these hooks a second master on a served
+    port shares it silently, and a port another program holds
     leaves a READY master whose workers fail to bind forever. The hooks must refuse exactly those cases and never
     the master's own listeners.
 
@@ -168,13 +169,43 @@ def test_on_starting_skips_the_check_for_a_reexecuted_master(conf: ModuleType, m
     checked: list[Any] = []
     monkeypatch.setattr(conf, "check_ports_free", checked.append)
     monkeypatch.setattr(conf, "internal_listener", lambda server: "unix-listener")
+    monkeypatch.setattr(conf, "master_tcp_listeners", lambda server: ["tcp-listener"])
     reexecuted = _server(1, master_pid=4242)
     conf.on_starting(reexecuted)
     assert checked == []
-    assert reexecuted.LISTENERS == ["unix-listener"]
+    # The master's own share of the TCP port first (finding memory-4), then the internal socket.
+    assert reexecuted.LISTENERS == ["tcp-listener", "unix-listener"]
     fresh = _server(1)
     conf.on_starting(fresh)
     assert checked == [fresh]
+
+
+def test_the_master_keeps_a_reuse_port_listener_the_workers_share(conf: ModuleType, opened: list[Any]) -> None:
+    """Finding memory-4: the master's own TCP listener joins the workers' SO_REUSEPORT group (a worker's listener
+    can still bind beside it, `pre_fork` still accepts the port) and keeps the port answering when no worker
+    listens: a connection made while only the master's listener exists waits in its queue instead of being
+    refused."""
+    port = _free_port()
+    server = _server(port)
+    server.cfg.reuse_port = True
+    server.cfg.backlog = 64
+    server.cfg.is_ssl = False
+    (master,) = conf.master_tcp_listeners(server)
+    opened.append(master.sock)
+    assert master.sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT) == 1
+    worker_listener = _listener(reuse_port=True, port=port)  # what a worker opens after the fork
+    opened.append(worker_listener)
+    conf.pre_fork(server, object())  # the master's own listener never trips the foreign-listener check
+    worker_listener.close()  # the worker stops (a max_requests recycle): only the master's listener is left
+    caller = socket.create_connection(("127.0.0.1", port), timeout=5)
+    opened.append(caller)
+    master.sock.settimeout(5)  # gunicorn made it non-blocking; the next worker's event loop waits instead
+    accepted, _ = master.sock.accept()  # the next worker accepts it from the master's queue
+    opened.append(accepted)
+    caller.sendall(b"x")
+    accepted.settimeout(5)
+    assert accepted.recv(1) == b"x"
+    assert conf.port_problem("127.0.0.1", port, shared=False) is not None, "a second master is still refused"
 
 
 @pytest.mark.parametrize(

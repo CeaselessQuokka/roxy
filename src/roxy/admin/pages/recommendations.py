@@ -153,10 +153,57 @@ TABLE_WORDS: Final[dict[str, str]] = {
 }
 WATCH_WORDS: Final[dict[str, str]] = {
     "watching": "Watching",
-    "kept": "Kept: the guard numbers stayed within bounds",
+    "kept": "Kept",
     "rolled_back": "Rolled back automatically",
     "canceled": "Ended: the change was undone by hand",
 }
+"""A watch window's table state in words; its verdict (`VERDICT_WORDS`) is what the drawer says when it has one."""
+VERDICT_WORDS: Final[dict[str, str]] = {
+    "watching": "Watching",
+    "within_bounds": "Kept: the guard numbers stayed within bounds",
+    "worse_applied_by_hand": (
+        "Kept, but the guard numbers got worse: a change applied by hand is never rolled back automatically; review "
+        "it and undo it if it hurts"
+    ),
+    "worse_kept": "Ended with worse guard numbers; the change was no longer applied by this recommendation",
+    "worse_rollback_refused": "Kept: the guard numbers got worse and the automatic rollback was refused",
+    "rolled_back": "Rolled back automatically",
+    "canceled": "Ended: the change was undone by hand",
+}
+"""What a watch window found (`insights.models.WATCH_VERDICTS`), in words: a window whose guard numbers got worse
+never reads "stayed within bounds" (final review brain-4)."""
+GUARD_LABELS: Final[dict[str, str]] = {
+    "error_rate": "Error rate",
+    "roblox_429_rate": "Roblox 429 rate",
+    "p95_ms": "p95 latency",
+    "refused_rate": "Refused rate",
+}
+"""The plan 11.4 guard metrics (`insights.actions.GUARD_METRICS`) in words."""
+
+
+def guard_value(metric: str, value: Any) -> str:
+    """One guard number as the drawer shows it: a rate as a percent (2 decimals), p95 in ms, unknown as n/a."""
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return "n/a"
+    if metric == "p95_ms":
+        return f"{value:,.0f} ms"
+    return f"{value * 100:.2f}%"
+
+
+def worse_rows(watch: Mapping[str, Any]) -> list[str]:
+    """The guard numbers a watch window found worse, one line each ("Error rate 0.00% before, 50.00% after")."""
+    lines: list[str] = []
+    for row in watch.get("worse") or ():
+        if not isinstance(row, Mapping):
+            continue
+        metric = str(row.get("metric") or "")
+        label = GUARD_LABELS.get(metric, words_of(metric))
+        lines.append(
+            f"{label} {guard_value(metric, row.get('before'))} before, {guard_value(metric, row.get('after'))} after"
+        )
+    return lines
+
+
 FAMILY_WORDS: Final[dict[str, str]] = {family: family.capitalize() for family in rec_api.FAMILIES}
 TONE_OF_STATE: Final[dict[str, str]] = {
     "open": "info",
@@ -761,8 +808,12 @@ async def detail_context(view: PageView) -> dict[str, Any]:
     watch_view = None
     if watch:
         rollback = watch.get("rollback") or None
+        verdict = str(watch.get("verdict") or "")
         watch_view = {
-            "state": WATCH_WORDS.get(str(watch.get("state")), words_of(watch.get("state"))),
+            "state": VERDICT_WORDS.get(verdict)
+            or WATCH_WORDS.get(str(watch.get("state")), words_of(watch.get("state"))),
+            "verdict": verdict,
+            "worse": worse_rows(watch),
             "raw_state": str(watch.get("state") or ""),
             "started": fmt.local_time(watch.get("started_at"), view.tz, seconds=False),
             "ends": fmt.local_time(watch.get("ends_at"), view.tz, seconds=False),

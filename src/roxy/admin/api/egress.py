@@ -63,7 +63,7 @@ from roxy.config import audit
 from roxy.core.reasons import Egress
 from roxy.deps import get_ctx
 from roxy.egress import read_state
-from roxy.egress.rotator import DECIMAL_GB, day_start_for, mask_ip, usage_since
+from roxy.egress.rotator import DECIMAL_GB, day_start_for, mask_ip, read_billed_bytes, usage_since
 from roxy.metrics import queries, read_history, read_upstream
 from roxy.storage.db import SharedStateUnavailable
 
@@ -185,12 +185,14 @@ async def budget_answer(ctx: Any) -> dict[str, Any]:
     start, end = read_state.billing_cycle(now, settings["rotator_billing_day"])
     today = day_start_for(now)
 
-    def read(conn: Any) -> tuple[int, list[int], int]:
-        used = usage_since(conn, Egress.ROTATOR.value, start)
-        trailing = read_upstream.rotator_daily_bytes(conn, today - read_state.TRAILING_DAYS * DAY_S, today)
-        return used, trailing, usage_since(conn, Egress.ROTATOR.value, today)
+    def read(conn: Any) -> list[int]:
+        return read_upstream.rotator_daily_bytes(conn, today - read_state.TRAILING_DAYS * DAY_S, today)
 
-    used, trailing, today_bytes = await ctx.dbs.metrics.read(read)
+    trailing = await ctx.dbs.metrics.read(read)
+    # The bytes the budget counts, the same read model as the hard stop, the daily cap and H-ROTATOR-QUOTA (finding
+    # data-4): the largest of what egress_usage shows, its high-water mark and the workers' own count, so an Egress
+    # usage statistics reset never makes these tiles show less than the stop is counting.
+    used, today_bytes = await read_billed_bytes(ctx.dbs, start, today)
     projection = read_state.project_cycle(
         cycle_start=start, cycle_end=end, now_s=now, used_bytes=used, trailing=trailing
     )
@@ -205,7 +207,11 @@ async def budget_answer(ctx: Any) -> dict[str, Any]:
             value=used,
             unit="bytes",
             good_direction="down",
-            help="Metered rotator bytes since the cycle began (all workers, as flushed to metrics.db).",
+            help=(
+                "Rotator bytes billed since the cycle began, the count the hard stop and the daily cap use: the "
+                "largest of the metered bytes in metrics.db, the most they ever showed this cycle and the workers' "
+                "own count, so an Egress usage reset does not lower it."
+            ),
         ),
         common.kpi_tile(
             "rotator_projected_bytes",

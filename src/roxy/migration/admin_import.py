@@ -14,8 +14,10 @@ Why it exists
 
 How it works
     The hasher is the admin auth module's own (`roxy.admin.auth.passwords.PasswordHasher` with its production
-    parameters) when it is importable, otherwise `argon2-cffi` with the plan 9.5 parameters (time cost 3,
-    64 MiB, parallelism 2), so a hash made here verifies exactly like one made at login. Hashing is CPU heavy, so
+    parameters) when it is importable, otherwise `argon2-cffi` with the same parameters (time cost 3, 19 MiB,
+    parallelism 1: the login's own, which the final review lowered from plan 9.5's 64 MiB and parallelism 2 for
+    the 909 MB server, finding sec-2), so a hash made here verifies exactly like one made at login, and the login
+    never has to rehash it. Hashing is CPU heavy, so
     it runs in a worker thread. The v2 password policy is checked and any problem is reported (the password is
     still imported, so the owner can sign in and change it). An account with the same username is never
     replaced: if the v1 password verifies against it the result is "already imported", otherwise it is kept and
@@ -49,9 +51,11 @@ from roxy.migration.secrets_out import masked_email
 from roxy.migration.v1_tree import V1Secrets
 from roxy.storage.db import Database
 
+# The login's argon2id parameters (`roxy.admin.auth.passwords` ARGON2_*), for the fallback hasher; a test keeps the
+# two equal. The names keep "PLAN" from plan 9.5, whose 64 MiB and parallelism 2 the final review lowered (sec-2).
 PLAN_TIME_COST: Final = 3
-PLAN_MEMORY_COST_KIB: Final = 65536
-PLAN_PARALLELISM: Final = 2
+PLAN_MEMORY_COST_KIB: Final = 19456
+PLAN_PARALLELISM: Final = 1
 _AUTH_PASSWORDS: Final = "roxy.admin.auth.passwords"
 USERNAME_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}")
 """The v2 username rule (`roxy/admin/auth/users.py`): 1 to 64 letters, digits, `_`, `.`, `@` or `-`."""
@@ -74,7 +78,7 @@ class Hasher:
 
 
 def plan_hasher() -> Hasher:
-    """argon2id with the plan 9.5 parameters (`argon2-cffi` directly)."""
+    """argon2id with the login's parameters (`argon2-cffi` directly; see PLAN_TIME_COST)."""
     argon2 = Argon2Hasher(
         time_cost=PLAN_TIME_COST, memory_cost=PLAN_MEMORY_COST_KIB, parallelism=PLAN_PARALLELISM, type=Type.ID
     )
@@ -88,7 +92,7 @@ def plan_hasher() -> Hasher:
     return Hasher(
         argon2.hash,
         verify,
-        "argon2-cffi with the plan 9.5 parameters",
+        "argon2-cffi with the login's parameters",
         PLAN_TIME_COST,
         PLAN_MEMORY_COST_KIB,
         PLAN_PARALLELISM,

@@ -65,7 +65,8 @@ from typing import Any, Final
 
 import zstandard
 
-from roxy.cache.keys import HANDOFF_SUFFIX
+from roxy.cache.keys import HANDOFF_SUFFIX, MARKER_SUFFIX
+from roxy.cache.spread import collect_rows
 from roxy.core.clock import Clock
 from roxy.core.reasons import AuthClass
 from roxy.rules.match import compile_pattern, kind_of, normalize_glob, normalize_regex, validate_pattern
@@ -495,6 +496,13 @@ class PurgeKind(StrEnum):
     EXPIRED = "expired"
     PARAM = "param"
     SEARCH = "search"  # the cache browser's search text: "Purge matching" (v1 bug 4, finding parity-15)
+    MARKERS = "markers"  # every per-key Roblox 429 marker: the upstream reset ends them with the cooldowns (pipe-5)
+
+
+MARKER_WHERE: Final = "negative = 1 AND status = 429 AND substr(key, -?) = ?"
+"""The `entries` rows that are per-key 429 markers (plan 7.7: key text plus `keys.MARKER_SUFFIX`), with
+`MARKER_PARAMS`."""
+MARKER_PARAMS: Final = (len(MARKER_SUFFIX), MARKER_SUFFIX)
 
 
 @dataclass(frozen=True, slots=True)
@@ -541,10 +549,15 @@ class PurgeScope:
         """Entries affected by adding or removing ignored query parameter `name` (scoped, parity row 54)."""
         return cls(PurgeKind.PARAM, name)
 
+    @classmethod
+    def markers(cls) -> PurgeScope:
+        """Every per-key 429 marker (`MARKER_WHERE`); content and error entries stay."""
+        return cls(PurgeKind.MARKERS)
+
     def validated(self) -> PurgeScope:
         """Normalized copy. Raises ValueError (a `PatternValidationError` for patterns) when it cannot run."""
         kind = PurgeKind(self.kind)
-        if kind in (PurgeKind.ALL, PurgeKind.EXPIRED):
+        if kind in (PurgeKind.ALL, PurgeKind.EXPIRED, PurgeKind.MARKERS):
             return PurgeScope(kind, None, include_stale=self.include_stale)
         if kind == PurgeKind.RULE:
             return PurgeScope(kind, int(self.value or 0))
@@ -930,7 +943,8 @@ class SharedTier:
 
     async def spread_rows(self, max_rows: int) -> list[tuple[str, str, str, str | None, int, int]]:
         """`(method, host, path, params_json, hits, bytes)` of up to `max_rows` content entries (no markers, no
-        single-flight handoff rows: both repeat an entry's parameters and would count one key twice)."""
+        single-flight handoff rows: both repeat an entry's parameters and would count one key twice), newest first,
+        within `spread.SPREAD_BYTES_BUDGET` of estimated memory (`spread.collect_rows`, finding memory-5)."""
         sql = (
             f"SELECT method, host, path, params_json, hits, {SIZE_SQL} FROM entries "  # noqa: S608  # constants
             "WHERE generation >= ? AND NOT (negative = 1 AND status = 429) AND substr(key, -?) != ? "
@@ -940,10 +954,11 @@ class SharedTier:
         def run(conn: sqlite3.Connection) -> list[tuple[str, str, str, str | None, int, int]]:
             floor, _stamp = _generation(conn)
             params = (floor, len(HANDOFF_SUFFIX), HANDOFF_SUFFIX, max_rows)
-            return [
-                (str(r[0]), str(r[1]), str(r[2]), r[3], int(r[4] or 0), int(r[5] or 0))
-                for r in conn.execute(sql, params).fetchall()
-            ]
+            cursor = conn.execute(sql, params)
+            try:
+                return collect_rows(cursor, max_rows)  # row by row, never the whole result set at once
+            finally:
+                cursor.close()
 
         return await self.db.read(run)
 
@@ -1157,6 +1172,8 @@ class CacheStore:
         if kind == PurgeKind.EXPIRED:
             column = "expires_at" if scope.include_stale else "stale_until"
             return await shared.delete_where(f"{column} <= ?", (now_s,))
+        if kind == PurgeKind.MARKERS:
+            return await shared.delete_where(MARKER_WHERE, MARKER_PARAMS)
         if kind == PurgeKind.PATTERN:
             pattern, pattern_type = str(scope.value), scope.pattern_type
 
@@ -1201,6 +1218,8 @@ class CacheStore:
 
 
 __all__ = [
+    "MARKER_PARAMS",
+    "MARKER_WHERE",
     "SIZE_SQL",
     "CacheEntry",
     "CacheStore",

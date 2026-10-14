@@ -424,14 +424,19 @@ async function readDocument(form) {
   return document;
 }
 
+// Every status the import preview answers (review finding docs_b-6): `config/settings_service.py ImportStatus`
+// (change, same, reset, invalid, unknown, skipped) plus `refused`, which `admin/api/settings.py import_preview`
+// sets on a change only its own page may make (switching the spam dry run off arms the detectors).
 const IMPORT_STATUS = {
   change: "Will change",
-  unchanged: "Already set",
+  same: "Already set",
   invalid: "Not valid",
   unknown: "Unknown setting",
   skipped: "Skipped",
   reset: "Back to the default",
+  refused: "Not imported here",
 };
+const IMPORT_BAD = new Set(["invalid", "unknown", "refused"]);
 
 function showImport(answer) {
   const root = qs("[data-import-result]");
@@ -441,7 +446,7 @@ function showImport(answer) {
     el("td", { "data-label": "Now", text: display(item.current) }),
     el("td", { "data-label": "In the file", text: item.status === "unknown" ? "" : display(item.new) }),
     el("td", { "data-label": "Result" }, [
-      el("span", { class: item.status === "invalid" || item.status === "unknown" ? "settings-batch__bad" : "", text: IMPORT_STATUS[item.status] || item.status }),
+      el("span", { class: IMPORT_BAD.has(item.status) ? "settings-batch__bad" : "", text: IMPORT_STATUS[item.status] || item.status }),
       item.message ? el("span", { class: "muted settings-import__message", text: ` ${item.message}` }) : el("span"),
       item.high_risk_reason ? el("strong", { class: "settings-batch__risk", text: ` High risk: ${item.high_risk_reason}` }) : el("span"),
     ]),

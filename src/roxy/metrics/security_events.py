@@ -8,7 +8,8 @@ What this is
     leader's cap enforcement, and the read models (paged rings and grouped summaries). `install_error_hooks`
     attaches the metrics side of `core/errors.py`: client errors become probes (`HTTP 404 via GET` plus the
     path as target; the method is a standard one or OTHER, `client_error_reason`, so a caller's own method token is
-    never a signature), server errors become error signatures with `module:line` and a redacted traceback.
+    never a signature), and a caller's request refused by a size or method limit also records its refused outcome
+    (`counts_as_refusal`); server errors become error signatures with `module:line` and a redacted traceback.
 
 Why it exists
     v1 kept 20 of each in memory. v2 keeps thousands on disk, paged and filterable, and fixes v1 bug B19: a
@@ -38,6 +39,7 @@ import traceback
 from collections.abc import Callable
 from typing import Any
 
+from roxy.core.reasons import ReasonCode
 from roxy.core.redact import redact_text
 
 PROBE = "probe"
@@ -148,6 +150,32 @@ def throttled_detail(ip: str, tier: int | None = None, strikes: int | None = Non
 
 # --------------------------------------------------------------------------------------------- error hooks
 
+LIMIT_REFUSAL_REASONS: frozenset[ReasonCode] = frozenset(
+    {
+        ReasonCode.BODY_TOO_LARGE,
+        ReasonCode.HEADERS_TOO_LARGE,
+        ReasonCode.URL_TOO_LONG,
+        ReasonCode.METHOD_NOT_ALLOWED,
+    }
+)
+"""The refusals answered before any route runs (`core/middleware.py SizeLimitMiddleware`, the 405 of
+`core/errors.py`): no proxy flow records them, so the client error hook records their outcome (finding abuse-4: the
+Protection > Request limits card counted these reasons from the outcome rollups and always read 0)."""
+
+
+def counts_as_refusal(event: Any) -> bool:
+    """True when a client error is a caller's request refused by a size or method limit, so its outcome is recorded:
+    one of `LIMIT_REFUSAL_REASONS`, outside `/admin` (the dashboard's own wrong methods are not caller traffic) and
+    `/internal` (the public port's instant 404 for operator paths is never counted, DESIGN 11.9)."""
+    path = str(getattr(event, "path", "") or "")
+    if getattr(event, "reason", None) not in LIMIT_REFUSAL_REASONS:
+        return False
+    return not any(path == prefix or path.startswith(prefix + "/") for prefix in NOT_CALLER_PREFIXES)
+
+
+NOT_CALLER_PREFIXES: tuple[str, ...] = ("/admin", "/internal")
+"""Paths whose limit refusals are not caller traffic (the dashboard, the operator socket's paths)."""
+
 
 def describe_exception(exc: BaseException | None) -> tuple[str, str, str]:
     """`(signature, module:line, traceback)` for the errors table (row 72): the signature is v1's
@@ -181,6 +209,18 @@ def install_error_hooks(hooks: Any, recorder: Callable[[], Any]) -> None:
             return
         reason = client_error_reason(event.status, event.method, event.path)  # signature: status and method class
         rec.record_probe(event.client_ip or "unknown", reason, event.user_agent, event.path)
+        if counts_as_refusal(event):
+            # A size or method limit refused a caller's request before any route ran: its outcome is recorded here,
+            # once, so the refusal counts like every other (final review finding abuse-4).
+            rec.record_limit_refusal(
+                reason=event.reason,
+                status=int(event.status),
+                method=str(event.method or ""),
+                path=str(event.path or ""),
+                client_ip=str(event.client_ip or ""),
+                user_agent=str(event.user_agent or ""),
+                request_id=str(event.request_id or ""),
+            )
 
     def server_error(event: Any) -> None:
         rec = recorder()

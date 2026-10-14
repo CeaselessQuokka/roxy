@@ -121,6 +121,18 @@ def runbook_link(site_origin: str, runbook: str | None) -> str | None:
     return f"{site_origin.rstrip('/')}/admin/help#runbook-{runbook}"
 
 
+def page_link(site_origin: str, link: str | None) -> str | None:
+    """`link` as the message carries it: a dashboard path (`/admin/...`) becomes absolute with `ROXY_SITE_ORIGIN`
+    (plan 17.7 "Links use ROXY_SITE_ORIGIN": a mail client cannot open a bare path; final review brain-13); an
+    absolute link, or a path when no origin is configured, is kept as it is."""
+    if not link:
+        return None
+    origin = site_origin.rstrip("/")
+    if origin and link.startswith("/") and not link.startswith("//"):
+        return f"{origin}{link}"
+    return link
+
+
 def _field_value(key: Any, value: Any) -> str:
     """A field value for a message: masked entirely when its NAME says secret (`password`, `token`, ...)."""
     return MASK if is_secret_field(str(key), value) else _clean(value)
@@ -156,7 +168,7 @@ def render_email(alert: Alert, *, suppressed: int, now: float, tz_name: str, sit
     else:
         lines.append(f"What happened: {_clean(alert.summary, 1000)}")
     lines.append(f"When: {utc_text} ({local_text})")
-    lines.append(f"Where: {alert.link or 'n/a'}")
+    lines.append(f"Where: {page_link(site_origin, alert.link) or 'n/a'}")
     if evidence:
         lines.append("Evidence:")
         lines.extend(f"  {key}: {value}" for key, value in evidence)
@@ -171,7 +183,8 @@ def render_webhook(alert: Alert, *, suppressed: int, now: float, tz_name: str, s
     subject, _ = render_email(alert, suppressed=suppressed, now=now, tz_name=tz_name, site_origin=site_origin)
     utc_text, local_text = format_when(now, tz_name)
     summary = _clean(alert.summary, 1000)
-    text = f"{subject}\n{summary}" + (f"\n{alert.link}" if alert.link else "")
+    link = page_link(site_origin, alert.link)
+    text = f"{subject}\n{summary}" + (f"\n{link}" if link else "")
     return {
         "content": text[:1900],  # Discord shows `content` (2000 character limit)
         "text": text,  # Slack-compatible receivers show `text`
@@ -180,7 +193,7 @@ def render_webhook(alert: Alert, *, suppressed: int, now: float, tz_name: str, s
         "subject": subject,
         "summary": summary,
         "fields": {_clean(k, 60): _field_value(k, v) for k, v in list(alert.fields.items())[:MAX_FIELDS]},
-        "link": alert.link,
+        "link": link,
         "when_utc": utc_text,
         "when_local": local_text,
         "runbook": runbook_link(site_origin, alert.runbook),
@@ -542,6 +555,7 @@ __all__ = [
     "error_alert",
     "get_notifier",
     "install_error_alerts",
+    "page_link",
     "render_email",
     "render_webhook",
 ]

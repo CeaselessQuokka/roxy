@@ -86,7 +86,8 @@ A malicious or vulnerable dependency, or a tampered deploy. See [Supply chain an
 `Roblox-Id` and `User-Agent` are headers the caller writes, so a non-Roblox client can claim any place id, to frame
 an experience, exhaust its place limit, or look like a game server. Roxy treats them as claims: places are never
 banned automatically (the spam detectors only recommend, `roxy.abuse.bans`), the place limit keys on the place and
-the caller's network (`place_limit_key` = `place_prefix`), and the bot score credits a Roblox game server only when
+the caller's network (`place_limit_key` = `place_prefix`), and so do per-experience endpoint rate rules (a forged
+`Roblox-Id` from another network never uses up a real game's budget), and the bot score credits a Roblox game server only when
 the caller's address is also in `roblox_egress_cidrs`, which is empty by default. `ProxyRequest.place_id` is
 scrubbed with `roxy.core.redact.redact_label` before it becomes a key anywhere.
 
@@ -265,7 +266,7 @@ route set, so a route cannot weaken them):
 | `Referrer-Policy` | `no-referrer` | URLs never leak to other sites. |
 | `Permissions-Policy` | every powerful feature off | Least privilege. Passkey features keep their default, which the login needs. |
 | `Cross-Origin-Opener-Policy` | `same-origin` | Isolates the browsing context. |
-| `Cross-Origin-Resource-Policy` | `same-origin` on pages | Other sites cannot embed Roxy's pages. |
+| `Cross-Origin-Resource-Policy` | `same-origin` on pages, and on the static files nginx serves | Other sites cannot embed Roxy's pages or its scripts and styles. |
 | `Cross-Origin-Embedder-Policy` | `require-corp` under `/admin` | Stronger isolation; every admin asset is self-hosted. |
 | `Cache-Control` | `no-store` under `/admin` | Admin data never sits in a browser or proxy cache. |
 | `Server` | removed | Less fingerprinting (nginx also has `server_tokens off`). |
@@ -289,18 +290,28 @@ JSON is shown as text, and CSV exports guard every cell against spreadsheet form
 
 ### Signing in
 
-- **Passwords** are hashed with argon2id (`time_cost=3`, `memory_cost=65536` KiB, `parallelism=2`) on a worker
-  thread, at most two at a time per worker, with at most four more waiting; beyond that a login gets the
-  lockout-style 429 at once (`roxy.admin.auth.passwords.PasswordHasher`). An unknown username is checked against a
-  dummy hash, so both answers take the same time. The policy asks for at least 14 characters, not on the bundled
-  list of common passwords and not containing the username. Tests:
-  `tests/unit/admin_auth/test_admin_auth_passwords.py::test_production_parameters_are_the_plan_values`,
+- **Passwords** are hashed with argon2id (`time_cost=3`, `memory_cost=19456` KiB, `parallelism=1`) on a worker
+  thread, one hash at a time per worker (`HASH_CONCURRENCY` 1), with at most four more waiting; beyond that a login
+  gets the lockout-style 429 at once (`roxy.admin.auth.passwords.PasswordHasher`). Two more places in the queue are
+  reserved for callers Roxy already trusts (an address on the admin allowlist, a trusted device, a signed-in admin
+  confirming it is them: `RESERVED_EXEMPT_HASHES`), so a flood of wrong guesses cannot lock the owner out; they still
+  wait for the one hash slot, so memory stays one hash per worker. The parameters are sized for the 909 MB server: a
+  login burst, which anyone can send, holds 19 MiB a worker (plan 9.5's 64 MiB, two at a time, measured 95 to 129
+  MiB a worker against the 95 MiB a warm color has left). A hash made with other parameters still verifies and is
+  made again with these at the next sign-in. An unknown username is checked against a dummy hash, made once inside
+  the same queue bound, so both answers take the same time. The policy asks for at least 14 characters, not on the
+  bundled list of common passwords and not containing the username. Tests:
+  `tests/unit/admin_auth/test_admin_auth_passwords.py::test_production_parameters_fit_the_909_mb_server`,
   `tests/security/test_auth_argon2_thread.py::test_argon2_runs_off_the_loop_thread`.
 - **The second factor is mandatory** (owner decision D5). TOTP accepts one 30 s step of drift either way and each
   step once per user (`roxy.admin.auth.totp.match_step`); its secret is stored encrypted with
   `totp_encryption_key`. Passkeys (WebAuthn, user verification required) are optional. Ten single-use recovery
   codes are hashed with argon2id. An emailed code is off by default (`admin_email_code_enabled`); it is used once,
-  for the bootstrap login of an account imported from v1, which must then enroll TOTP. Tests:
+  for the bootstrap login of an account imported from v1, which must then enroll TOTP. That bootstrap closes for
+  good at enrollment: enrolling deletes the account's other pending bootstrap logins and ends its other bootstrap
+  sessions, and the account is asked again when a bootstrap login finishes and when a bootstrap session enrolls, so
+  a second emailed code started earlier cannot reach the dashboard. Tests:
+  `tests/unit/admin_auth/test_admin_auth_bootstrap_closes.py::test_enrollment_ends_every_other_bootstrap_session_and_login`,
   `tests/unit/admin_auth/test_admin_auth_flow.py::test_totp_code_is_single_use_per_step`,
   `tests/unit/admin_auth/test_admin_auth_flow.py::test_totp_accepts_one_step_of_drift_but_not_two`,
   `tests/unit/admin_auth/test_admin_auth_flow.py::test_recovery_code_works_once`,
@@ -440,8 +451,18 @@ Redaction is the last line of defense and is deliberately blunt (`src/roxy/core/
 - Audit rows for secret targets hold only `{fingerprint, masked}`; anything else raises before a row is written
   (`roxy.config.audit.record`). The audit log is append-only: database triggers refuse updates and deletes except
   the 400-day retention job.
+- **A pasted secret is refused, not only hidden.** No setting is meant to hold a secret, and several settings are
+  texts every caller reads (the pause message, the `site_*` texts). `roxy.config.secret_text.holds_secret` finds a
+  registered secret, a run of 24 credential characters, the `TOKEN_PREFIX` text or a `.ROBLOSECURITY=` value in a
+  text (also after percent-decoding); the settings catalog refuses such a value from every writer (the editor,
+  import, revert, a recommendation, the CLI), and a stored override that holds one is dropped at the next reload
+  (callers get the default). Pause and throttle-all reasons and rule texts are refused when written. The settings
+  history keeps its reason scrubbed like the audit reason, and the history views, their downloads and the settings
+  export scrub every value (final review finding constraints-1).
 
-Tests: `tests/unit/core/test_core_redact.py::test_credential_substring_of_24_chars_is_redacted`,
+Tests: `tests/unit/config/test_secret_text.py::test_the_catalog_refuses_a_setting_that_holds_a_secret`,
+`tests/unit/config/test_secret_text.py::test_a_stored_override_holding_a_secret_is_not_served`,
+`tests/unit/core/test_core_redact.py::test_credential_substring_of_24_chars_is_redacted`,
 `tests/unit/core/test_core_logging.py::test_debug_logging_redacts_secrets_from_every_logger`,
 `tests/unit/core/test_core_logging.py::test_third_party_loggers_pinned_to_warning`,
 `tests/unit/config/test_audit.py::test_secret_target_refuses_raw_values_before_writing`,
@@ -502,7 +523,16 @@ Tests: `tests/unit/egress/test_egress_guard.py::test_guard_transport_refuses_and
 - **File permissions.** `/etc/roxy/credentials` is root 0700 with 0600 files, the state directory 0750 and database
   files 0640. The service cannot see the credential directory, so a root timer (`roxy-audit.service`, every 6 hours
   and after each deploy) checks modes and owners, reading metadata only, and health check H-SECRETS-PERMS reads its
-  report (`deploy/tools/roxy-audit.py`).
+  report (`deploy/tools/roxy-audit.py`). `deploy/install-system.sh`, which runs as root, never changes a mode or an
+  owner by path name: it opens each directory and file one path component at a time with `O_NOFOLLOW` and changes it
+  through the open descriptor, and creates its one-time files beside the target and links them into place, so a link
+  the deploy user or the service planted (for example at `/opt/roxy/deploy.sh`) is never followed and never written
+  through. The migrator, run as root at the cutover, gives each database file it made to the owner and group of the
+  state directory, mode 0640, the same way.
+- **Backups** are root-only (`/var/backups/roxy` and every set 0700, files 0600) and can be encrypted with `age`
+  (`ROXY_BACKUP_AGE_RECIPIENTS`). A set leaves the server (`ROXY_BACKUP_REMOTE`, through rclone) only when it is
+  encrypted: with a remote and no age recipient, `deploy/tools/backup.sh` keeps the local set, copies nothing and
+  fails, so the alert says what is missing.
 - **nginx** terminates TLS, hides its version, limits requests and connections per address (separate zones so the
   login guard never throttles the dashboard), times out slow clients, and never logs the kill-switch path
   (`tests/deploy/test_deploy_nginx.py::test_kill_switch_token_is_never_logged`).

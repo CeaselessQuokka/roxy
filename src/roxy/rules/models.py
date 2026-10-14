@@ -31,6 +31,7 @@ What to read next
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import math
@@ -95,6 +96,7 @@ from roxy.rules.match import (
     validate_pattern,
     validate_regex,
 )
+from roxy.upstream.pacing import pacing_template
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # newline and tab are allowed in messages
 _CONTROL_ALL = re.compile(r"[\x00-\x1f\x7f]")
@@ -110,6 +112,14 @@ MAX_BUCKET_KEY: Final = 300
 MAX_BAN_SUBJECT: Final = 128
 MAX_POSITION: Final = 1_000_000
 METHOD_ORDER: Final[tuple[str, ...]] = ("GET", "HEAD", "POST")
+UA_HASH_LENGTH: Final = 16
+"""Hex characters that name a User-Agent in a `ua_hash` ban: the first 16 of the SHA-256 of the exact User-Agent
+text (`abuse/bans.py ua_hash`, which the ban lookup computes for every request)."""
+UA_HASH_INPUT_LENGTHS: Final = frozenset({UA_HASH_LENGTH, 32, 64})
+"""Hash lengths a `ua_hash` ban accepts (`normalize_ua_hash`)."""
+_NO_USER_AGENT_KEY: Final = hashlib.sha256(b"(none)").hexdigest()[:32]
+"""The Security page's fingerprint key of requests WITHOUT a User-Agent (`metrics/fingerprints.py`
+`row_hash(NO_USER_AGENT)`, the text "(none)"); such a request is banned by the hash of the empty text."""
 
 PatternType = Literal["glob", "regex"]
 
@@ -143,6 +153,28 @@ def _text(limit: int, what: str) -> Callable[[str], str]:
         return check_admin_text(value, limit, what)
 
     return check
+
+
+def normalize_ua_hash(text: str) -> str:
+    """The `ua_hash` ban subject for a User-Agent hash an admin gives (finding abuse-3).
+
+    Accepted, case-insensitive: the 16 hex characters bans use, the 32-character key the Security page shows for a
+    User-Agent (`metrics/fingerprints.py row_hash`: the first 32 hex characters of the SHA-256 of the same text), or
+    a full SHA-256 (64) of the User-Agent text. A longer form is cut to its first 16, which is what the ban lookup
+    computes, and the fingerprint key of "no User-Agent" becomes the hash of the empty text. Any other length could
+    never match a request, so it is refused (a ban that is listed "in force" but refuses nobody is worse than none).
+    One limit remains: the Security page stores a User-Agent with secrets masked and cut at 400 characters, so a
+    key of such a row names that stored text, not what the caller sent.
+    """
+    lowered = text.strip().lower()
+    if len(lowered) not in UA_HASH_INPUT_LENGTHS or not re.fullmatch(r"[0-9a-f]+", lowered):
+        raise ValueError(
+            "A User-Agent ban needs the User-Agent hash: 16 hex characters, the 32-character key Security > "
+            "Fingerprints shows for a User-Agent, or the full SHA-256 (64 hex characters) of the User-Agent text"
+        )
+    if lowered == _NO_USER_AGENT_KEY:
+        return hashlib.sha256(b"").hexdigest()[:UA_HASH_LENGTH]
+    return lowered[:UA_HASH_LENGTH]
 
 
 Lower = BeforeValidator(_lower)
@@ -412,7 +444,9 @@ class UpstreamLimitIn(_Model):
             host = template.split("/", 1)[0].lower()
             if not template or _CONTROL_ALL.search(template) or " " in template or not _ROBLOX_HOST.fullmatch(host):
                 raise ValueError("An endpoint bucket is endpoint:<host>/<path template>, on a roblox.com host")
-            return f"endpoint:{host}{template[len(host) :]}"
+            # The pacing form the runtime reads (`upstream/pacing.py`, finding pipe-2): one row per Roblox
+            # endpoint whatever letter case the admin typed; `{placeholders}` keep their names.
+            return "endpoint:" + pacing_template(f"{host}{template[len(host) :]}")
         raise ValueError("A bucket key starts with host: or endpoint:")
 
 
@@ -586,10 +620,7 @@ class BanIn(_Model):
                 raise ValueError("A place ban needs the numeric place id (the Roblox-Id header)")
             return text
         if kind == "ua_hash":
-            lowered = text.lower()
-            if not re.fullmatch(r"[0-9a-f]{16,64}", lowered):
-                raise ValueError("A User-Agent ban needs the User-Agent hash (16 to 64 hex characters)")
-            return lowered
+            return normalize_ua_hash(text)
         return text
 
     @field_validator("reason_code")
@@ -1057,6 +1088,7 @@ def row_to_input(table: RuleTable, row: Mapping[str, Any]) -> dict[str, Any]:
 __all__ = [
     "ACCESS_LIST_CAPS",
     "RULE_TABLES",
+    "UA_HASH_LENGTH",
     "AccessListIn",
     "AccessListRow",
     "BanIn",
@@ -1088,6 +1120,7 @@ __all__ = [
     "UserAgentRuleRow",
     "check_admin_text",
     "normalize_network",
+    "normalize_ua_hash",
     "row_to_input",
     "to_columns",
 ]

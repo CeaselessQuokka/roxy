@@ -311,3 +311,29 @@ def test_high_risk_examples() -> None:
 def test_byte_limits_never_exceed_nginx() -> None:
     assert BY_KEY["max_body_bytes"].max == 2 * 1024 * 1024
     assert BY_KEY["max_header_bytes"].max == 8 * 1024
+
+
+def test_the_bypass_text_names_every_check_a_bypass_skips_and_keeps() -> None:
+    """Review finding abuse-6: the catalog text an owner reads before setting a bypass expiry names exactly what the
+    checks' own `skipped_by_bypass` flags say (the dashboard's words, `admin/pages/texts.CHECK_WORDS`), so a check
+    added to either side later fails here instead of leaving the text behind."""
+    from roxy.abuse.checks import default_checks
+    from roxy.admin.pages.texts import CHECK_WORDS
+
+    text = BY_KEY["bypass_default_expiry_h"].description.lower()
+    skips, keeps = text.split(" but is still subject to ", 1)
+    for check in default_checks():
+        words = CHECK_WORDS.get(check.name)
+        if not words or check.name == "bypass":
+            continue
+        side = skips if check.skipped_by_bypass else keeps
+        assert words.lower().removeprefix("the ") in side, (check.name, words, check.skipped_by_bypass)
+    assert "the tarpit" in skips
+
+
+def test_the_owner_fills_in_the_game_server_ranges() -> None:
+    """Plan 9 threat 6: no game server credit "until the owner fills it" (roblox_egress_cidrs ships empty)."""
+    spec = BY_KEY["roblox_egress_cidrs"]
+    assert spec.default == []
+    assert spec.pending_owner_verification
+    assert spec.notes.startswith("PENDING owner verification")

@@ -66,6 +66,7 @@ from roxy.deps import get_ctx
 from roxy.metrics import queries, read_dashboard
 from roxy.metrics.catalog import METRICS
 from roxy.rules.match import regex_budget
+from roxy.upstream.buckets import endpoint_limit_row
 
 router = area_router("endpoints")
 
@@ -166,8 +167,10 @@ DETAIL_TOTALS: Final[tuple[str, ...]] = (
     "hit_ratio",
     "roblox_429",
     "roblox_429_per_10k",
-    "status_2xx",
-    "status_4xx",
+    # The answers this endpoint's callers got (lead decision 11: `status_2xx` and `status_4xx` count Roblox's answers
+    # per attempt now, unknown under a method filter), beside `status_5xx`, the same view.
+    "caller_2xx",
+    "caller_4xx",
     "status_5xx",
     "p50_ms",
     "p95_ms",
@@ -365,7 +368,8 @@ def applicable_rules(snapshot: Any, template: str, concrete: list[str]) -> dict[
         "targets": targets,
         "upstream_limits": {
             "host": _row_dict(snapshot.upstream_limit(f"host:{host}")),
-            "endpoint": _row_dict(snapshot.upstream_limit(f"endpoint:{template}")),
+            # Under the template's pacing key, else as typed before keys were case folded (finding pipe-2).
+            "endpoint": _row_dict(endpoint_limit_row(snapshot, template)),
         },
         "rules_version": getattr(snapshot, "version", None),
     }

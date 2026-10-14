@@ -2,7 +2,7 @@
 
 `harness` starts `create_app(env, clock=fake_clock)` with its lifespan (temp databases, fake credentials from the
 root conftest), includes the auth router, swaps in a cheap argon2 hasher and a notifier whose mail transport only
-records messages. See `roxy/admin/auth/testing.py` for the helpers (`login`, `post`, `next_code`, ...).
+records messages. See `tests/auth_harness.py` for the helpers (`login`, `post`, `next_code`, ...).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.auth.testing import AuthHarness, auth_harness
+from auth_harness import AuthHarness, auth_harness
 from roxy.core.clock import FakeClock
 
 

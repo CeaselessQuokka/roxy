@@ -16,7 +16,10 @@ How it works
     The same query as `SharedTier.spread_rows` (`cache/store.py`): only rows of the current purge generation, no
     429 markers (they repeat a real entry's parameters), no single-flight handoff rows (key text ending in
     `keys.HANDOFF_SUFFIX`), newest first, at most `max_rows` (plan P9). The row size is `store.SIZE_SQL`, the bytes
-    each row counts against `cache_max_bytes`. Run inside `Database.read` on the cache database.
+    each row counts against `cache_max_bytes`. The cursor is walked row by row through `spread.collect_rows`, which
+    also stops at `spread.SPREAD_BYTES_BUDGET` of estimated memory and compacts long parameter text as it reads
+    (finding memory-5: 100,000 id-list queries held whole were about 300 MiB). Run inside `Database.read` on the
+    cache database.
 
 What to read next
     `roxy/cache/spread.py` (the grouping and the Suspect test), `roxy/insights/rules/cache.py` (the rules).
@@ -28,10 +31,8 @@ import sqlite3
 from typing import Final
 
 from roxy.cache.keys import HANDOFF_SUFFIX
-from roxy.cache.spread import DEFAULT_MAX_ROWS
+from roxy.cache.spread import DEFAULT_MAX_ROWS, SpreadTuple, collect_rows
 from roxy.cache.store import SIZE_SQL
-
-SpreadTuple = tuple[str, str, str, str | None, int, int]
 
 _SQL: Final = (
     f"SELECT method, host, path, params_json, hits, {SIZE_SQL} FROM entries "  # noqa: S608 (store constants only)
@@ -41,14 +42,16 @@ _SQL: Final = (
 
 
 def spread_rows(conn: sqlite3.Connection, max_rows: int = DEFAULT_MAX_ROWS) -> list[SpreadTuple]:
-    """`(method, host, path, params_json, hits, bytes)` of up to `max_rows` content entries, newest first."""
+    """`(method, host, path, params_json, hits, bytes)` of up to `max_rows` content entries, newest first, within
+    `spread.SPREAD_BYTES_BUDGET` (long parameter text compacted, `spread.collect_rows`)."""
     row = conn.execute("SELECT value FROM generation WHERE id = 1").fetchone()
     floor = int(row[0]) if row is not None else 0
     limit = max(1, min(int(max_rows), DEFAULT_MAX_ROWS))
-    return [
-        (str(r[0]), str(r[1]), str(r[2]), r[3], int(r[4] or 0), int(r[5] or 0))
-        for r in conn.execute(_SQL, (floor, len(HANDOFF_SUFFIX), HANDOFF_SUFFIX, limit)).fetchall()
-    ]
+    cursor = conn.execute(_SQL, (floor, len(HANDOFF_SUFFIX), HANDOFF_SUFFIX, limit))
+    try:
+        return collect_rows(cursor, limit)  # row by row: never the whole result set in memory at once
+    finally:
+        cursor.close()
 
 
 __all__ = ["SpreadTuple", "spread_rows"]

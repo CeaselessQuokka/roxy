@@ -58,6 +58,7 @@ from fastapi.responses import Response
 from roxy.core.reasons import REFUSAL_HEADER, Egress, ReasonCode
 from roxy.core.scope import catalog_default
 from roxy.storage import read_sizes
+from roxy.storage.migrate import damaged_copies
 
 log = logging.getLogger("roxy.public.health")
 
@@ -97,6 +98,11 @@ def measure_bytes(paths: tuple[str, ...]) -> int:
         for suffix in DB_SUFFIXES:
             with contextlib.suppress(OSError):
                 total += (path.with_name(path.name + suffix)).stat().st_size
+        # The damaged copy a cache.db recovery keeps (at most one set, `storage/migrate.py recover_cache_db`) is Roxy's
+        # storage too, as the disk budget counts it (`metrics/disk_history.py`, finding constraints-5).
+        for aside in damaged_copies(path):
+            with contextlib.suppress(OSError):
+                total += aside.stat().st_size
     return total
 
 

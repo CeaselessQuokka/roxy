@@ -658,9 +658,13 @@ How long it is kept:
 - per-minute activity by IP address and experience: {{ client_minute_retention }};
 - hourly summaries: {{ client_hour_retention }}, and daily summaries: {{ client_day_retention }};
 - notable events, such as refusals, bans and probes: {{ events_retention }};
-- a small sample of individual requests (no bodies), used to tune caching: {{ request_sample_retention }}.
+- a short record of each request Roxy forwards (unless Roxy's admin turns the sampling down), and of a share of
+  the requests it refuses: the time, the endpoint, the method, a keyed hash of your IP address, the experience id,
+  the status and the size, never a body. Roxy replays these records to test a change to its limits, detectors and
+  caching before making it, and uses them to tune caching: {{ request_sample_retention }}.
 
-{{ capture_rule }}
+{{ capture_rule }} Requests that fail (a timeout, or no way to reach Roblox) are always captured too while body
+capture is on, like refused ones.
 
 Only Roxy's admin can see this data, and it is used only to run and protect the service. Never put personal
 data in a URL you send through Roxy.

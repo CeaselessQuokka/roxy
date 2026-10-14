@@ -17,9 +17,11 @@
  *     `bool` ("true", "1", "on" are true; a checkbox is its checked state), `int`, `float`, `string` (sent even when
  *     empty), `skip-empty` (left out when empty, the default for text), `list` (one item per line). Repeated names
  *     become a list. Disabled fields are skipped.
- *   * 2xx: the dialog around the form closes, a toast says `data-success` (or the answer's `message`), and
- *     `data-on-success` decides what follows: `reload` the page, `refresh` (the cards named in `data-refresh`, or
- *     the card the form sits in, static/js/cards.js), or nothing. A `roxy:api-success` event carries the answer.
+ *   * 2xx: the dialog around the form closes, a toast says `data-success` (or the answer's `message`), a second
+ *     toast shows the answer's `warnings` when it has any (a revert of a setting changed again since, an audit row
+ *     control.db could not take; finding docs_b-4), and `data-on-success` decides what follows: `reload` the page,
+ *     `refresh` (the cards named in `data-refresh`, or the card the form sits in, static/js/cards.js), or nothing.
+ *     A `roxy:api-success` event carries the answer.
  *   * 403 `reauth_required`: "Confirm it is you" (reauth.js), then the same request once more.
  *   * 422: each `error.fields` message goes under its field (`[data-field-error="<name>"]`, or a message element
  *     added after the input, tied with aria-describedby); `confirmation_required` reveals `[data-confirm-field]`.
@@ -140,9 +142,13 @@ function afterSuccess(form, answer) {
     closeDialog(dialog);
   }
   toast(message, { tone: "ok" });
+  const warnings = answer && Array.isArray(answer.warnings)
+    ? answer.warnings.filter((warning) => typeof warning === "string" && warning)
+    : [];
+  if (warnings.length) toast(warnings.join(" ").slice(0, MAX_ERROR_TEXT), { tone: "warn" });
   const then = form.dataset.onSuccess || "";
   if (then === "reload") {
-    reloadPage({ delayMs: 300 });
+    reloadPage({ delayMs: warnings.length ? 4000 : 300 });  // time to read a warning before the page goes
   } else if (then === "refresh") {
     const names = (form.dataset.refresh || "").split(/\s+/).filter(Boolean);
     document.dispatchEvent(new CustomEvent("roxy:refresh-cards", { detail: { cards: names, from: form } }));

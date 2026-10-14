@@ -22,6 +22,11 @@ How it works
     tightened) to 0700, and an existing file readable by others is set to 0600. Keys are 32 random bytes from
     `secrets`, written as 64 hex characters (the form `core/iphash.py decode_key_material` reads). Values are
     compared with what is already there, so a rerun reports "already present" and writes nothing.
+    An optional credential file that exists but is empty means "not configured" (install-system.sh creates
+    `rotator_url`, `alert_webhook_url` and `rclone_config` that way), so it counts as absent: v1's value replaces
+    it atomically (a new 0600 file renamed over it). Before, a migrator run after install-system.sh kept the empty
+    `rotator_url` and v2 ran without the rotator (lead decision 3, finding ops-4). Only when no earlier run handled
+    the name: an optional file an earlier run wrote and the owner emptied since is a deliberate "not configured".
 
 What to read next
     `roxy/core/iphash.py` (how a key file is read) and REMAKE_PLAN.md sections 3 (C1) and 9.8.
@@ -50,6 +55,8 @@ DIR_MODE: Final = 0o700
 FILE_MODE: Final = 0o600
 VALUE_NAMES: Final[tuple[str, ...]] = ("roblox_credential", "rotator_url", "smtp_password", "alert_emails")
 KEY_NAMES: Final[tuple[str, ...]] = ("credential_encryption_key", "totp_encryption_key", "ip_hash_key")
+OPTIONAL_NAMES: Final = frozenset({"rotator_url", "alert_webhook_url", "rclone_config"})
+"""Credentials v2 runs without; install-system.sh creates them empty, and an empty one means "not configured"."""
 KEY_BYTES: Final = 32
 MIN_KEY_BYTES: Final = 16
 _TEMPORARY = re.compile(r"\.(?:" + "|".join(map(re.escape, (*VALUE_NAMES, *KEY_NAMES))) + r")\.[0-9a-f]{8}\.tmp")
@@ -148,8 +155,12 @@ def _tighten(path: Path, report: MigrationReport) -> None:
     report.warn(f"{path.name} was mode {mode:o}; it is now {FILE_MODE:o}")
 
 
-def _write_new(path: Path, content: str) -> bool:
-    """Create `path` with `content` (mode 0600) unless it exists. Returns False when it already existed."""
+def _write_new(path: Path, content: str, *, replace: bool = False) -> bool:
+    """Create `path` with `content` (mode 0600) unless it exists. Returns False when it already existed.
+
+    With `replace`, the new file is renamed over whatever is at `path` (the empty optional file `_place` found):
+    a rename replaces the name itself and never follows a link.
+    """
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, FILE_MODE)
     try:
@@ -161,6 +172,9 @@ def _write_new(path: Path, content: str) -> bool:
             os.fsync(fd)
         finally:
             os.close(fd)
+        if replace:
+            os.replace(temporary, path)  # atomic: readers see the empty file or the whole value, never a part
+            return True
         try:
             os.link(temporary, path)  # atomic and never replaces an existing file
         except FileExistsError:
@@ -180,9 +194,23 @@ def _existing(path: Path) -> str | None:
         return "\0unreadable"
 
 
-def _place(path: Path, content: str, report: MigrationReport) -> str:
-    """Write one value file, or say why not."""
+def _empty_regular_file(path: Path, current: str | None) -> bool:
+    """True when `path` is a regular file (not a link) holding nothing but white space."""
+    if current is None or current.strip():
+        return False
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _place(path: Path, content: str, report: MigrationReport, *, empty_is_absent: bool = False) -> str:
+    """Write one value file, or say why not. With `empty_is_absent`, an existing empty file is replaced."""
     current = _existing(path)
+    if empty_is_absent and _empty_regular_file(path, current):
+        _write_new(path, content, replace=True)
+        report.changed()
+        return WRITTEN
     if current is not None:
         _tighten(path, report)
         return PRESENT if current.strip() == content.strip() else KEPT_DIFFERENT
@@ -237,7 +265,14 @@ def write_credential_files(
         path = out_dir / name
         if _removed_after_import(path, previously):
             return _removed_item(name, report)
-        return {"name": name, "status": _place(path, content, report), "detail": detail}
+        # An empty optional file is "not configured" (install-system.sh), unless an earlier run handled this name
+        # and the owner emptied it since (then it stays empty on purpose).
+        empty_is_absent = name in OPTIONAL_NAMES and name not in previously
+        was_empty = empty_is_absent and _empty_regular_file(path, _existing(path))
+        status = _place(path, content, report, empty_is_absent=empty_is_absent)
+        if was_empty and status == WRITTEN:
+            detail += "; replaced the empty file install-system.sh created (empty means not configured)"
+        return {"name": name, "status": status, "detail": detail}
 
     # The Roblox credential (C1): the first non-empty line only.
     if v1.tokens:

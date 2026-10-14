@@ -33,7 +33,9 @@ How it works
        cache entry (`allow_fresh_cache_serve`, which the pipeline grants only when no later filter refuses the
        request), else ask the tarpit for a plan (never for bypass callers, whatever check refused them: the
        pipeline marks `req.bypass` before any check runs; the refusal's `detail` is the v1 per-hold reason), hold or
-       jitter (`await plan.wait()`) or drip (a streaming response), and release the slot in `finally`. The one HTML
+       jitter (`await plan.wait()`) or drip (a streaming response), and release the slot in `finally`. Before the
+       tarpit is asked, the refused caller's body is cut to what a capture keeps (`drop_body`), so a hold never pins
+       a 2 MiB upload for its 8 to 20 s (its full length still counts in the caller's bytes). The one HTML
        refusal (the challenge page) is switched back to the page CSP, because its script runs with this response's
        nonce (`req.csp_nonce`).
     6. Allow: an invalid target is refused even if the pipeline let it through (defense in depth: the SSRF guard
@@ -233,6 +235,8 @@ class ProxyFlow:
         # and the outcome record agree even if the setting changes mid-request (review finding spec-5).
         self.state[STATE_COMPAT_COLLAPSE] = self.compat_collapse
         self.cors_any_origin = bool(setting(ctx, "public_cors_allow_any_origin"))
+        self.body_length: int | None = None
+        """The caller's body length when a refusal cut the body (`drop_body`): its wire bytes and capture use it."""
 
     # --- steps --------------------------------------------------------------------------------------------------
 
@@ -402,6 +406,7 @@ class ProxyFlow:
             reason = ReasonCode.THROTTLED_CACHE if rendered.outcome is Outcome.SERVED_CACHE else None
             return await self.finish(req, rendered, result, reason=reason)
         self.refusal = refusal
+        self.drop_body(req)  # a refusal sends the body nowhere; a tarpit hold must not keep it (finding memory-3)
         if getattr(refusal, "reason", None) == ReasonCode.HEADER_RULE:
             self.note_fingerprint(req, blocked=True)  # a request filter's catch: the blocked fingerprints (row 134)
         rendered = respond.render_refusal(req, refusal, cors_any_origin=self.cors_any_origin)
@@ -430,6 +435,25 @@ class ProxyFlow:
         finally:
             await _release(plan)
         return await self.finish(req, rendered)
+
+    def drop_body(self, req: ProxyRequest) -> None:
+        """Keep at most `capture_max_body` bytes of a refused caller's body (finding memory-3).
+
+        The body was read in full before the verdict (up to `max_body_bytes`, 2 MiB), and a refusal in a tarpit
+        category is then held for 8 to 20 s: up to `tarpit_max_concurrent` (50) holds pinned about 100 MiB of a
+        color. Nothing after a refusal needs more than a capture keeps, so the request's copy (`req.body`) and
+        Starlette's cached one (`Request._body`, the same object) are replaced by that prefix before the tarpit is
+        asked; the original length is kept for the caller's wire bytes (plan 14.3) and the capture's
+        `request_body_length`.
+        """
+        size = len(req.body)
+        keep = max(0, int(setting(self.ctx, "capture_max_body") or 0))
+        if size <= keep:
+            return
+        self.body_length = size
+        req.body = req.body[:keep]  # a slice of bytes is a copy: the full body is freed with its last reference
+        if hasattr(self.request, "_body"):
+            self.request._body = req.body  # Starlette's cache of the body read in `build_request`
 
     async def tarpit_plan(self, req: ProxyRequest, refusal: Any) -> Any:
         """The tarpit plan for this refusal, or None (no category, a bypass caller, tarpit off or full)."""
@@ -527,12 +551,14 @@ class ProxyFlow:
 
     def request_bytes(self, req: ProxyRequest) -> int:
         """The request as the app received it from nginx: request line, headers and the body it read (plan 14.3
-        `caller_bytes_in`; a GET's body is never read). Never raises."""
+        `caller_bytes_in`; a GET's body is never read; a refusal's cut body counts with its full length). Never
+        raises."""
+        body = len(req.body) if self.body_length is None else self.body_length
         try:
-            return request_head_bytes(self.scope) + len(req.body)
+            return request_head_bytes(self.scope) + body
         except Exception:
             log.exception("caller_bytes_in_failed")
-            return len(req.body)
+            return body
 
     async def record_failure(self, req: ProxyRequest, reason: ReasonCode) -> None:
         """The fallback outcome record for a request that ends in an exception (a no-op if already recorded).
@@ -578,7 +604,8 @@ class ProxyFlow:
             record = recorder.record_outcome
             if _accepts_capture(record):
                 # The recorder decides from its capture policy whether to keep the bodies (plan rows 126, 127).
-                await _maybe_await(record(event, capture=capture_input(req, rendered, result)))
+                capture = capture_input(req, rendered, result, body_length=self.body_length)
+                await _maybe_await(record(event, capture=capture))
             else:
                 await _maybe_await(record(event))
         except Exception:
@@ -605,11 +632,14 @@ def _accepts_capture(record: Any) -> bool:
         return _function_accepts_capture.__wrapped__(function)
 
 
-def capture_input(req: ProxyRequest, rendered: respond.Rendered, result: Any) -> Any:
-    """`metrics/capture.py: CaptureInput` for this request (raw values; the recorder redacts and truncates)."""
+def capture_input(req: ProxyRequest, rendered: respond.Rendered, result: Any, *, body_length: int | None = None) -> Any:
+    """`metrics/capture.py: CaptureInput` for this request (raw values; the recorder redacts and truncates).
+
+    `body_length` is the caller's body length when a refusal already cut `req.body` (`ProxyFlow.drop_body`)."""
     capture_class = _capture_class()
     if capture_class is None:
         return None
+    extra: dict[str, Any] = {} if body_length is None else {"request_body_length": int(body_length)}
     return capture_class(
         request_id=req.request_id,
         at_ms=req.received_ms,
@@ -628,6 +658,7 @@ def capture_input(req: ProxyRequest, rendered: respond.Rendered, result: Any) ->
         request_body=req.body,
         response_headers=list(rendered.headers),
         response_body=rendered.body,
+        **extra,
     )
 
 
@@ -643,7 +674,8 @@ def message_source(rendered: respond.Rendered, refusal: Any) -> str:
     A refusal: its own `custom` or `default`. A refusal the cache or upstream layer returned as a result (a public
     credential marker at the egress guard, an egress host refusal; DESIGN 11.9 "Rows outside plan 7.13") has no
     refusal object, and its text is always Roxy's built-in v1 text: `default`. A failure Roxy wrote (a plan 7.13
-    text): `roxy`. Any other error answer (status 400 or more) carries Roblox's own body, live, reshaped or from the
+    text): `roxy`; a failure answered with Roblox's own body (compat mode's 500 for a Roblox 429, finding pipe-4):
+    `roblox`. Any other error answer (status 400 or more) carries Roblox's own body, live, reshaped or from the
     cache: `roblox`. A success has no message: "".
     """
     if refusal is not None:
@@ -651,7 +683,7 @@ def message_source(rendered: respond.Rendered, refusal: Any) -> str:
     if rendered.outcome is Outcome.REFUSED:
         return MESSAGE_SOURCE_DEFAULT
     if rendered.outcome is Outcome.FAILED:
-        return MESSAGE_SOURCE_ROXY
+        return MESSAGE_SOURCE_ROBLOX if rendered.source in _ROBLOX_BODY_SOURCES else MESSAGE_SOURCE_ROXY
     if rendered.status >= 400 and rendered.source in _ROBLOX_BODY_SOURCES:
         return MESSAGE_SOURCE_ROBLOX
     return ""

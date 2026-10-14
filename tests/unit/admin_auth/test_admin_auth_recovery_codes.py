@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from auth_harness import fast_hasher
 from roxy.admin.auth import recovery_codes, users
-from roxy.admin.auth.testing import fast_hasher
 
 
 def test_generate_ten_codes_with_unique_ids() -> None:

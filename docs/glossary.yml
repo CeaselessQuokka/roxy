@@ -72,7 +72,7 @@ terms:
     source: plan
   - id: bypass
     term: Bypass
-    definition: An allowlisted IP address that skips rate limits. It is never exempt from blocks, bans, filters or a pause.
+    definition: An allowlisted IP address or range that skips Roxy's request limits and detectors (the flood, emergency, per-IP and place limits, the spam detectors, the browser challenge, the bot score block, User-Agent and endpoint rules, and the tarpit). It is never exempt from a pause, bans, endpoint blocks, request filters or the URL and credential checks.
     source: plan
   - id: cache-key
     term: Cache key
@@ -429,6 +429,10 @@ terms:
   - id: caller
     term: Caller
     definition: Whoever sends a request to Roxy, usually a Roblox game server.
+    source: roxy
+  - id: credential-check
+    term: Credential check
+    definition: Roxy's own call with the credential that asks Roblox whether the cookie still works. It runs on a schedule (every 30 minutes by default), when you press Check credential, during a health run that includes it, and to confirm a Roblox 401.
     source: roxy
   - id: queue-wait
     term: Queue wait

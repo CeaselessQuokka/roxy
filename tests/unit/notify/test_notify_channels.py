@@ -11,7 +11,7 @@ import httpx
 import pytest
 import respx
 
-from roxy.admin.auth.testing import RecordingTransport
+from auth_harness import RecordingTransport
 from roxy.core.redact import SecretRegistry, redact_text
 from roxy.notify import mail as mail_module
 from roxy.notify.mail import MailError, MailSender, load_mail_config, parse_alert_emails

@@ -133,7 +133,7 @@
   <section class="rec-section" aria-labelledby="{{ rid }}-watch">
     <h3 class="rec-section__title" id="{{ rid }}-watch">Watch window</h3>
     <dl class="kv">
-      <dt>State</dt><dd>{{ watch.state }}</dd>
+      <dt>State</dt><dd data-watch-verdict="{{ watch.verdict }}">{{ watch.state }}{% if watch.worse %}<ul class="rec-watch-worse">{% for line in watch.worse %}<li>Got worse: {{ line }}</li>{% endfor %}</ul>{% endif %}</dd>
       <dt>From</dt><dd>{{ watch.started }}</dd>
       <dt>Until</dt><dd><time datetime="{{ watch.ends_iso }}">{{ watch.ends }}</time></dd>
       {% if watch.rollback %}
@@ -166,11 +166,18 @@
     <form class="rec-form stack" data-api-form data-api-url="{{ links.undo }}" data-api-method="POST"
           data-success="Undone: the changes were put back as they were." data-on-success="refresh" data-refresh="list history" data-reopen="{{ detail_url }}" novalidate>
       <p class="rec-form__title">{{ icon("reset") }}<span>Undo</span></p>
-      <ul class="dialog__consequences"><li>Puts back exactly what the apply changed, on every worker within a second.</li><li>Refused when someone changed the same setting or rule since; then change it by hand.</li></ul>
+      <ul class="dialog__consequences"><li>Puts back exactly what the apply changed, on every worker within a second.</li><li>Refused when someone changed the same setting or rule since; then change it by hand.</li>{% if allowed.undo.arms %}<li>It would arm the spam detectors ({{ allowed.undo.arms | join(", ") }} off), which only the Protection page does after showing who would be banned: <a href="/admin/protection#spam">arm them there</a>. This undo is refused while that is so.</li>{% endif %}</ul>
+      {% set undo_risky = allowed.undo.high_risk_keys %}
       <div class="field">
-        <label class="field__label" for="{{ rid }}-undo-reason">Reason <span class="muted">(optional, saved in the audit log)</span></label>
-        <textarea class="input" id="{{ rid }}-undo-reason" name="reason" rows="2" maxlength="500" data-json="skip-empty"></textarea>
+        <label class="field__label" for="{{ rid }}-undo-reason">Reason <span class="muted">({{ "required: it puts back a high-risk value" if undo_risky else "optional" }}, saved in the audit log)</span></label>
+        <textarea class="input" id="{{ rid }}-undo-reason" name="reason" rows="2" maxlength="500" data-json="skip-empty"{% if undo_risky %} required aria-describedby="{{ rid }}-undo-reason-error"{% endif %}></textarea>
+        <p class="field__error" id="{{ rid }}-undo-reason-error" data-field-error="reason" hidden></p>
       </div>
+      {% if undo_risky %}
+      <label class="check rec-confirm"><input type="checkbox" name="confirm_high_risk" value="1" data-json="bool" required><span>I understand: the undo puts back a high-risk value ({{ undo_risky | join(", ") }}).</span></label>
+      {% else %}
+      <label class="check" data-confirm-field hidden><input type="checkbox" name="confirm_high_risk" value="1" data-json="bool"><span>I understand: a value is high risk</span></label>
+      {% endif %}
       <p class="dialog__error" data-dialog-error role="alert" hidden></p>
       <div class="cluster"><button type="submit" class="btn" data-action="recommendation-undo">{{ icon("reset") }}<span>Undo the changes</span></button></div>
     </form>

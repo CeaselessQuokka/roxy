@@ -2,10 +2,12 @@
 
 What this is
     Browser tests against the real app (`dashboard`, tests/e2e/conftest.py). For each theme and size (1440x900 and
-    390x844, dark and light) the Help page and the runbooks load with no console error, page error or CSP violation,
-    axe-core finds nothing serious, the phone never scrolls sideways, and screenshots are saved for the visual review.
-    Then what people do here: filter the glossary, follow an alert email's `/admin/help#runbook-<name>` link to the
-    runbook itself, follow a health check's `/admin/help/operations#<name>` link, and open the contents of a document.
+    390x844, dark and light) the Help page, the runbooks and the admin guide's pages (its first page and its largest
+    chapter) load with no console error, page error or CSP violation, axe-core finds nothing serious, the phone never
+    scrolls sideways, and screenshots are saved for the visual review. Then what people do here: filter the glossary,
+    follow an alert email's `/admin/help#runbook-<name>` link to the runbook itself, follow a health check's
+    `/admin/help/operations#<name>` link, open the contents of a document, follow a guide link into another chapter,
+    and walk the guide with Previous and Next.
 
 Why it exists
     The integration tests prove the links point somewhere; only a browser proves that following one lands on the
@@ -25,6 +27,8 @@ from pages_harness import THEMES, VIEWPORTS
 from roxy.admin.pages.help import SHORTCUTS_CARD
 
 PAGE = "/admin/help"
+RUNBOOKS_SHOT_TIMEOUT_MS = 180_000
+"""How long the runbooks' full-page review shot may take (see `test_the_runbooks_are_clean_accessible_and_fit`)."""
 
 
 @pytest.mark.parametrize("theme", THEMES)
@@ -53,7 +57,62 @@ def test_the_runbooks_are_clean_accessible_and_fit(open_admin: Any, theme: str, 
         assert page.evaluate("!document.querySelector('[data-doc-toc]').open")  # the text comes first on a phone
     assert not admin.overflows(), "the page scrolls sideways"
     assert admin.axe() == []
+    # The runbooks are about 25,000 px tall at 1440 px wide, and a full-page capture that large leaves Chromium's
+    # fast path: the one picture takes about 50 s (the 19,000 px Protection chapter takes 2 s), longer than
+    # Playwright's 30 s default. A reader never meets this (they scroll), so the review shot gets the time it needs.
+    page.set_default_timeout(RUNBOOKS_SHOT_TIMEOUT_MS)
     admin.shot("help-runbooks")
+    admin.assert_clean()
+
+
+GUIDE = f"{PAGE}/guide"
+
+
+@pytest.mark.parametrize("theme", THEMES)
+@pytest.mark.parametrize("size", list(VIEWPORTS))
+@pytest.mark.parametrize("path", [GUIDE, f"{GUIDE}/protection"], ids=["first-page", "largest-chapter"])
+def test_the_admin_guide_chapters_are_clean_accessible_and_fit(
+    open_admin: Any, theme: str, size: str, path: str
+) -> None:
+    """The guide is shown one chapter at a time: its first page and its largest chapter (Protection) load with no
+    console error or CSP violation, pass axe, and never scroll sideways on a phone."""
+    width, height = VIEWPORTS[size]
+    admin = open_admin(path, theme=theme, width=width, height=height)
+    page = admin.page
+    assert page.locator("h1").count() == 1
+    assert page.locator("h1").inner_text().strip() == "Roxy admin guide"
+    assert page.locator("article.doc h2").count() >= 1
+    assert page.locator("nav[aria-labelledby='guide-pager-title'] a").count() >= 1
+    if size == "phone":
+        assert page.evaluate("!document.querySelector('[data-doc-toc]').open")  # the text comes first on a phone
+    assert not admin.overflows(), "the page scrolls sideways"
+    assert admin.axe() == []
+    admin.shot("help-guide" if path == GUIDE else "help-guide-protection")
+    admin.assert_clean()
+
+
+def test_a_link_to_another_chapter_opens_that_chapter_at_its_section(open_admin: Any) -> None:
+    """Getting started links "[Replace](#replace)", a section of the Credential chapter: the link names that chapter's
+    page, and following it lands on the section."""
+    admin = open_admin(GUIDE, width=1440)
+    page = admin.page
+    page.locator("article.doc a[href='/admin/help/guide/credential#replace']").first.click()
+    admin.wait("location.pathname === '/admin/help/guide/credential' && location.hash === '#replace'")
+    top = "document.querySelector('#replace').getBoundingClientRect().top"
+    admin.wait(f"{top} >= 0 && {top} < 400")  # scrolled to the section, below the sticky top bar
+    assert page.locator("article.doc h2#credential").count() == 1
+    admin.assert_clean()
+
+
+def test_previous_and_next_walk_the_guide_in_order(open_admin: Any) -> None:
+    admin = open_admin(f"{GUIDE}/daily-routine", width=1440)
+    page = admin.page
+    page.locator("nav[aria-labelledby='guide-pager-title'] a[rel='next']").click()
+    admin.wait("location.pathname === '/admin/help/guide/how-roxy-stays-under-robloxs-limits'")
+    page.locator("nav[aria-labelledby='guide-pager-title'] a[rel='prev']").click()
+    admin.wait("location.pathname === '/admin/help/guide/daily-routine'")
+    page.locator("nav[aria-labelledby='guide-pager-title'] a[rel='prev']").click()
+    admin.wait("location.pathname === '/admin/help/guide' && location.hash === '#getting-started'")
     admin.assert_clean()
 
 

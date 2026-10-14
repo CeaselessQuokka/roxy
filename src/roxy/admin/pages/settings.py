@@ -49,6 +49,7 @@ from roxy.admin.pages import inline, registry
 from roxy.admin.pages.kit import Page, PageView, filter_chip, table_query, table_view
 from roxy.config import catalog
 from roxy.config.catalog import NON_PAGE_HOMES
+from roxy.config.runtime import same_value
 from roxy.config.spec import GROUP_LABELS, Group, Risk, SettingSpec
 
 page = Page("settings", default_range="all")
@@ -285,6 +286,26 @@ def value_text(value: Any) -> str:
     return str(value)[: MAX_VALUE_CHARS * 2]
 
 
+def changed_again(settings: Any, key: str, written: Any) -> str | None:
+    """The value in force now when `key` was changed again after a history entry that wrote `written` (that entry's
+    override; None for "back to the default"), else None.
+
+    The same check `SettingsService.revert` makes before it answers the warning "<key> was changed again after
+    history entry N": a revert puts back the value from before that entry, so it also undoes every later change of
+    the setting. The revert drawers (Settings history and the Audit entry) say so before the owner presses Revert
+    (review finding docs_b-4). A sensitive setting is never compared: its history keeps only a fingerprint.
+    """
+    spec = catalog.CATALOG.get(key)
+    if spec is None or spec.sensitive:
+        return None
+    current = settings.snapshot().overrides.get(key)  # None: no override, the default is in force
+    if current is None and written is None:
+        return None
+    if current is not None and written is not None and same_value(current, written):
+        return None
+    return value_text(settings.get(key))
+
+
 def _history_cells(view: PageView) -> Any:
     def cells(item: Mapping[str, Any]) -> dict[str, Any]:
         key = str(item.get("key"))
@@ -355,6 +376,7 @@ async def change_drawer(view: PageView, raw: str) -> dict[str, Any]:
         "after_default": item.get("new") is None,
         "revert_url": item.get("revert_url") if not arming else None,
         "arming": arming,
+        "now_value": changed_again(view.ctx.settings, key, item.get("new")),
         "needs_fresh_mfa": bool(spec and settings_api.needs_fresh_mfa(spec)),
         "high_risk": bool(spec and spec.risk is Risk.HIGH),
         "max_value_chars": MAX_VALUE_CHARS,
@@ -434,8 +456,9 @@ async def import_export_card(view: PageView) -> dict[str, Any]:
 
 @page.card("alerts", lazy=True)
 async def alerts_card(view: PageView) -> dict[str, Any]:
-    """The alert settings (placed by the catalog), with where the channels are configured."""
-    return {}
+    """The alert settings (placed by the catalog), with where the channels are configured, and the Send test alert
+    button (plan 13.2 H-ALERTS)."""
+    return {"test_url": view.api_url("system/alerts/test", time=False)}
 
 
 @page.card("public-site", lazy=True)

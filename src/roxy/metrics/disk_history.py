@@ -3,7 +3,8 @@
 What this is
     The measuring and writing half of the `disk_samples` and `table_size_samples` tables
     (`storage/migrations/metrics/0005_producer_history.sql`): `measure_files(state_dir, db_paths)` (the state volume's
-    size and free space, and each database file with its WAL, plus the `exports` and `snapshots` folders),
+    size and free space, and each database file with its WAL, the damaged cache.db copy a recovery kept, plus the
+    `exports` and `snapshots` folders),
     `table_bytes(conn)` (each table's bytes, indexes included, from SQLite's `dbstat` catalog),
     `rollup_rows_per_minute(conn, now_s)` (minute rollup rows written per minute in the last full hour), and
     `take_sample(dbs, ...)`, which the leader job `metrics_disk_history` runs hourly (`metrics/jobs.py
@@ -44,6 +45,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
+
+from roxy.storage.migrate import DAMAGED_COPY_MARK, damaged_copies
 
 DISK_SAMPLE_INTERVAL_S: Final = 3600.0
 """One disk sample an hour: enough for a growth slope over days; plan 6.6 projects 30 days ahead."""
@@ -113,6 +116,11 @@ def measure_files(state_dir: Path | None, db_paths: Mapping[str, Path]) -> Files
     for name, path in db_paths.items():
         file_path = Path(path)
         measure.files[f"{name}.db"] = {"bytes": _size(file_path), "wal_bytes": _size(Path(f"{file_path}-wal"))}
+        # The damaged copy a cache.db recovery keeps (at most one set, `storage/migrate.py recover_cache_db`) is
+        # Roxy's storage too, so the disk budget and its alert see it (final review finding constraints-5).
+        aside = damaged_copies(file_path)
+        if aside:
+            measure.files[f"{name}.db{DAMAGED_COPY_MARK}copy"] = {"bytes": sum(_size(p) for p in aside), "wal_bytes": 0}
     if state_dir is not None:
         for folder in FOLDERS:
             directory = Path(state_dir) / folder

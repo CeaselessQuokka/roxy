@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import Final
 
 from roxy.config.constants import MAX_RULE_MESSAGE
+from roxy.config.secret_text import PASTE_REFUSED_MESSAGE, holds_secret
 from roxy.rules.models import check_admin_text
 
 MAX_STATE_REASON: Final = 300
@@ -109,9 +110,14 @@ def checked_state_reason(value: object) -> str:
 
     The reason becomes every caller's 503 or 429 body, so plan C5 applies: `rules/models.py check_admin_text`
     refuses an em or en dash and control characters with a ValueError (the admin API answers it as a 400, like a
-    rule message). Length is not refused: v1 cut reasons to 300 characters, and so does this.
+    rule message). Length is not refused: v1 cut reasons to 300 characters, and so does this. A reason holding a
+    secret Roxy keeps or a Roblox cookie is refused too (`config/secret_text.py`, review finding constraints-1):
+    every caller would receive it.
     """
-    return check_admin_text(clean_admin_message(value, MAX_STATE_REASON), MAX_STATE_REASON, "The reason")
+    text = check_admin_text(clean_admin_message(value, MAX_STATE_REASON), MAX_STATE_REASON, "The reason")
+    if holds_secret(text):
+        raise ValueError(f"The reason: {PASTE_REFUSED_MESSAGE}")
+    return text
 
 
 def downtime_default(setting_value: object) -> str:

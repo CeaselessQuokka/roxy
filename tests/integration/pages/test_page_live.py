@@ -89,6 +89,22 @@ async def test_filters_in_the_address_are_checked_and_handed_to_the_tail(page: A
     assert "live filter in the address was not valid" in bad.select_one("#tail").text()
 
 
+async def test_address_values_the_selects_lack_are_applied_or_said_to_be_left_out(page: Any, pages_app: Any) -> None:
+    """Finding docs_a-16: the API takes a status code, a lower-case cache state and comma lists. A single value goes
+    to the tail in the form it compares (the page script adds an option the select lacks); a list cannot sit in a
+    select, so it is left out and the card says so, never in silence."""
+    single = await page.doc(PAGE, params={"status": "0404", "cache": "hit", "egress": "direct"})
+    filters = json.loads(single.select_one("[data-live-filters]").get("data-live-filters"))
+    assert filters == {"cache": "HIT", "egress": "direct", "status": "404"}
+    assert "left out" not in single.select_one("#tail").text()
+    listed = await page.doc(PAGE, params={"outcome": "refused,failed", "status": "4XX", "endpoint": "games"})
+    filters = json.loads(listed.select_one("[data-live-filters]").get("data-live-filters"))
+    assert filters == {"endpoint": "games", "status": "4xx"}
+    notice = " ".join(listed.select_one("#tail").text().split())
+    assert "for outcome in the address was left out" in notice, notice
+    assert "every request is shown whatever its outcome" in notice, notice
+
+
 async def test_the_capture_card_equals_the_api(page: Any, pages_app: Any) -> None:
     await _seed(pages_app)
     state = (await page.api("GET", "live/state")).json()

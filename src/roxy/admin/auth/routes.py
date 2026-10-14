@@ -41,7 +41,7 @@ from fastapi import APIRouter, Depends, Path, Request
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import RedirectResponse, Response
 
-from roxy.admin.auth import enrollment, invalidation, sessions, trusted_devices
+from roxy.admin.auth import enrollment, invalidation, sessions, trusted_devices, users
 from roxy.admin.auth.allowlist import admin_ip_allowed, not_found
 from roxy.admin.auth.csrf import foreign_origin
 from roxy.admin.auth.deps import (
@@ -517,16 +517,23 @@ async def api_reauth_passkey_options(
 # ------------------------------------------------------------------------------------------------ enrollment
 
 
-def _require_enroll_rights(request: Request, record: sessions.SessionRecord) -> None:
-    """A bootstrap session may enroll; anyone else replacing their authenticator needs a fresh second factor.
+async def _require_enroll_rights(request: Request, record: sessions.SessionRecord) -> None:
+    """A bootstrap session may enroll while its account has no authenticator; anyone else replacing their
+    authenticator needs a fresh second factor.
 
-    The refusal is the guards' own `ReauthRequired` (an `HTTPException`, so it passes the routes' `except
-    AuthError`): the `Roxy-Reauth: required` header plus the section 13 body with code `reauth_required`, the same
-    answer every other fresh-MFA refusal gives (DESIGN.md 13).
+    The account is read again: a bootstrap session minted before the account enrolled (another browser) must not
+    put a different authenticator over the enrolled one (D5 and plan 9.6, finding sec-3; enrollment ends those
+    sessions, and `confirm_totp` asks again inside its write). The refusal is the guards' own `ReauthRequired` (an
+    `HTTPException`, so it passes the routes' `except AuthError`): the `Roxy-Reauth: required` header plus the
+    section 13 body with code `reauth_required`, the same answer every other fresh-MFA refusal gives (DESIGN.md
+    13). A database problem is the flow's C7 `AuthError` (503).
     """
-    if record.mfa_level == "bootstrap":
-        return
     auth = get_auth(request)
+    if record.mfa_level == "bootstrap":
+        user = await auth.control_read(lambda conn: users.get_by_id(conn, record.user_id))
+        if user is not None and user.bootstrap_open:
+            return
+        raise ReauthRequired()
     if not record.is_fresh(auth.clock.now(), int(auth.settings.int("admin_reauth_window_s"))):
         raise ReauthRequired()
 
@@ -539,7 +546,7 @@ async def api_totp_start(
 ) -> Response:
     record, _ = _session_of(request)
     try:
-        _require_enroll_rights(request, record)
+        await _require_enroll_rights(request, record)
         data = await enrollment.start_totp(get_auth(request), record)
     except AuthError as error:
         return error_response(error)
@@ -554,7 +561,7 @@ async def api_totp_confirm(
 ) -> Response:
     record, _ = _session_of(request)
     try:
-        _require_enroll_rights(request, record)
+        await _require_enroll_rights(request, record)
         body = await read_json_body(request, CodeBody)
         token, codes = await enrollment.confirm_totp(get_auth(request), request_info(request), record, body.code)
     except AuthError as error:

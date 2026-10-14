@@ -5,8 +5,8 @@ What this is
     what v1 showed for the same section of the plan 14.1 map (`app/templates/dashboard.html`,
     `app/static/dashboard.js`, `.remake/v1notes/dashboard.md`): the meaning of a number, its window, a column, an
     action or a text. Each was marked `xfail(strict=True)` with the finding id until the P11 review round fixed it;
-    the fixed ones are regression tests now. v1parity-1 is deferred to the lead and stays a non-strict xfail (its
-    comment says why); the refuted v1parity-7 (v1's default sort orders, which no plan section requires) has no test.
+    the fixed ones are regression tests now. v1parity-1 was deferred to the lead and fixed in the final review (its
+    comment says how); the refuted v1parity-7 (v1's default sort orders, which no plan section requires) has no test.
 
 Why it exists
     The acceptance test `tests/e2e/test_v1_sections.py` proves that every v1 section has a home (the selectors are
@@ -44,15 +44,9 @@ def _kpi_number(doc: Node, key: str) -> str:
 # ============================================================================================ v1parity-1
 
 
-# Deferred to the lead in the P11 review round (not strict, like LOAD-1 was): the fix redefines three catalog metrics
-# (status_2xx, status_4xx, roblox_5xx are caller statuses on purpose today) and needs per-attempt Roblox status
-# classes in the minute, hour and day rollups (a metrics migration). See CHANGES.md "P11 review round".
-@pytest.mark.xfail(
-    strict=False,
-    reason="v1parity-1 (deferred to the lead): the status tiles read Roblox's answers from the caller's final status: "
-    "2xx and 4xx count Roxy's refusals and cache serves, and 5xx from Roblox misses a Roblox failure a retry hid; v1 "
-    "counted each answer Roblox gave Roxy's calls",
-)
+# Fixed in the final review (fixer data, lead decision 11, with data-3): the tiles `status_2xx`, `status_4xx` and
+# `roblox_5xx` count Roblox's answers per attempt from the `roblox_answer_*` tables (metrics 0010); the caller's final
+# statuses are `caller_2xx`, `caller_4xx`, `status_5xx` and `caller_roblox_5xx`.
 async def test_v1parity_1_the_status_tiles_count_roblox_answers_like_v1(
     page: Any, pages_app: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

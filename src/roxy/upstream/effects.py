@@ -165,7 +165,8 @@ def apply_call_outcome(
         seconds, source = cooldowns.cooldown_duration(
             facts.retry_after_s, facts.ratelimit, repeat, config.cooldown, rng
         )
-        effects.cooldown_s, effects.cooldown_source = seconds, source.value
+        # An uncounted rotator 429 (one burned exit, plan 7.5) opens no cooldown, so it reports none either: no
+        # Retry-After of a cooldown that does not exist and no per-key 429 marker (plan 7.7, finding pipe-6).
         if counted:
             opened = cooldowns.open_cooldown(conn, endpoint_ckey, seconds, source, now_ms, repeat)
             effects.cooldown_keys.append(endpoint_ckey)

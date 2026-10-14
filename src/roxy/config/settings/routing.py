@@ -543,9 +543,10 @@ SETTINGS: list[SettingSpec] = [
             "rotator_daily_cap_mb",
         ),
         pages=(_ROTATOR, _BUDGET),
+        pending_owner_verification=True,
         notes=(
-            "Fill this in from your DataImpulse plan (owner decision D12). Automatic recommendation changes never "
-            "touch the quota (plan 11.4)."
+            "PENDING owner verification: fill this in from your DataImpulse plan (owner decision D12); the 0 shipped "
+            "is a placeholder. Automatic recommendation changes never touch the quota (plan 11.4)."
         ),
     ),
     SettingSpec(
@@ -567,7 +568,11 @@ SETTINGS: list[SettingSpec] = [
         if_lowered="Lower cost-so-far and projected cost figures.",
         related_settings=("rotator_quota_gb_per_month",),
         pages=(_ROTATOR, _BUDGET),
-        notes="Fill this in from your DataImpulse plan (owner decision D12).",
+        pending_owner_verification=True,
+        notes=(
+            "PENDING owner verification: fill this in from your DataImpulse plan (owner decision D12); the 0 shipped "
+            "is a placeholder."
+        ),
     ),
     SettingSpec(
         key="rotator_billing_day",
@@ -998,14 +1003,16 @@ SETTINGS: list[SettingSpec] = [
         type=SettingType.BOOL,
         default=0,
         description=(
-            "Runs a side-by-side (A/B) test on direct traffic: calls are split between direct_user_agent and "
-            "ua_experiment_alt_user_agent by a hash of the request's cache key for ua_experiment_days, and the "
-            "UP-UA-EXPERIMENT recommendation compares the Roblox 429 rate of each identity."
+            "Runs a side-by-side (A/B) test on direct traffic: for ua_experiment_days from when it was last switched "
+            "on (or either User-Agent last changed), calls are split between direct_user_agent and "
+            "ua_experiment_alt_user_agent by a hash of the request's cache key, and the UP-UA-EXPERIMENT "
+            "recommendation compares the Roblox 429 rate of each identity. When the days are over, every direct "
+            "call uses direct_user_agent again; switch this off and on to start a new run."
         ),
         if_enabled=(
-            "Part of direct traffic uses the alternative identity. If Roblox limits that identity more, 429s rise "
-            "on that part during the experiment; the result comes with a confidence interval and offers the better "
-            "identity as the new direct_user_agent."
+            "Part of direct traffic uses the alternative identity for ua_experiment_days. If Roblox limits that "
+            "identity more, 429s rise on that part during the experiment; the result comes with a confidence "
+            "interval and offers the better identity as the new direct_user_agent."
         ),
         if_disabled="Every direct call uses direct_user_agent and no comparison data is collected.",
         risk=Risk.MEDIUM,
@@ -1023,16 +1030,22 @@ SETTINGS: list[SettingSpec] = [
         max=30,
         step=1,
         unit="days",
-        description="How many days the User-Agent experiment runs before UP-UA-EXPERIMENT reports its result.",
+        description=(
+            "How many days the User-Agent experiment splits direct traffic, counted from when ua_experiment_enabled "
+            "was last switched on (or either User-Agent last changed). Afterwards every direct call uses "
+            "direct_user_agent again. UP-UA-EXPERIMENT compares only calls made during the run, and reports once "
+            "each identity has enough calls in the request samples (insight_up_ua_experiment_min_calls_per_arm)."
+        ),
         if_raised=(
-            "More calls per identity, so a tighter confidence interval and a more trustworthy answer, but it takes "
-            "longer."
+            "The split runs longer: more days in which each identity can reach the minimum number of calls, and "
+            "part of direct traffic keeps the alternative identity for longer."
         ),
         if_lowered=(
-            "A faster answer from fewer calls, with a wider interval. The rule reports medium confidence only once "
-            "each identity has about 10,000 calls."
+            "The split ends sooner, so less traffic carries the alternative identity, but the recommendation may "
+            "never see enough calls to report. It reports medium confidence only once each identity has about "
+            "10,000 calls."
         ),
-        related_settings=("ua_experiment_enabled",),
+        related_settings=("ua_experiment_enabled", "insight_up_ua_experiment_min_calls_per_arm"),
         related_recommendations=("UP-UA-EXPERIMENT",),
         pages=(_ROUTING,),
     ),

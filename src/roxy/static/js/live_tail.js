@@ -70,6 +70,10 @@ function normalize(raw) {
     place: String(data.place ?? data.place_id ?? ""),
     method: String(data.method ?? "GET"),
     endpoint: String(data.endpoint ?? data.path ?? ""),
+    // The endpoint template (`users.roblox.com/v1/users/{userId}`): the Endpoint filter matches it or the path, as
+    // the server's own filter does (`read_dashboard.LiveQuery.matches`; Endpoints > Watch it live puts a template
+    // there, which no concrete path contains: finding docs_a-6).
+    template: String(data.template ?? ""),
     ua: String(data.user_agent ?? data.ua ?? ""),
     query: String(data.query ?? ""),
   };
@@ -221,8 +225,11 @@ class LiveTail {
       }
     }
     if (f.client && !(`${row.client} ${row.place}`.toLowerCase().includes(f.client.toLowerCase()))) return false;
-    if (f.endpoint && !row.endpoint.toLowerCase().includes(f.endpoint.toLowerCase())) return false;
-    if (f.q && !`${row.ua} ${row.query} ${row.endpoint}`.toLowerCase().includes(f.q.toLowerCase())) return false;
+    // Template or path, like the server's filter: a row the stream sent for the filter is never hidden here.
+    if (f.endpoint && !`${row.template} ${row.endpoint}`.toLowerCase().includes(f.endpoint.toLowerCase())) return false;
+    // The search reads what the server's search reads (`metrics/live.py LiveFilter`), plus the query string.
+    const searched = [row.endpoint, row.client, row.method, row.place, row.ua, row.status, row.outcome, row.query];
+    if (f.q && !searched.join(" ").toLowerCase().includes(f.q.toLowerCase())) return false;
     return true;
   }
 

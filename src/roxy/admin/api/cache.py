@@ -200,8 +200,20 @@ RULE_COLUMNS: Final[tuple[Column, ...]] = (
     Column("pattern", "Pattern", "Which endpoints the rule covers (glob: `*` is one path segment; regex)."),
     Column("type", "Type", "glob or regex."),
     Column("ttl", "TTL", "How long an answer stays fresh; 0 means never cache these endpoints.", "s"),
-    Column("stale_ttl", "Revalidate window", "How long after expiry the copy is served while one refresh runs.", "s"),
-    Column("negative_ttl", "Negative TTL", "How long a definite refusal (404 and friends) is kept.", "s"),
+    Column(
+        "stale_ttl",
+        "Revalidate window",
+        "How long after expiry the copy is served while one refresh runs. 0 uses the Stale-while-revalidate window "
+        "setting (cache_swr_seconds).",
+        "s",
+    ),
+    Column(
+        "negative_ttl",
+        "Negative TTL",
+        "How long a definite refusal (404 and friends) is kept. 0 uses the Error answer lifetime setting "
+        "(cache_error_ttl_seconds); a rule lifetime of 0 keeps none.",
+        "s",
+    ),
     Column("methods", "Methods", "GET, and POST for batch lookups that only read."),
     Column("normalize_flags", "Normalization", "sort_csv:<param> sorts an id list; casefold_path lowercases."),
     Column("note", "Note", "Your reminder of why the rule exists. Never sent anywhere."),

@@ -101,6 +101,8 @@ async def test_egress_cards_and_host_table_report_honest_rates(
         api_app.ctx.recorder.record_upstream_429(
             endpoint_template=TEMPLATE, host="games.roblox.com", egress="direct", retry_after_s=30, at_ms=now
         )
+    # Roblox's answers per attempt (lead decision 11): `metrics_seed` records outcomes only, never a trace.
+    api_app.ctx.recorder.record_roblox_answer(endpoint_template=TEMPLATE, egress="direct", status=502, count=2)
     await metrics_seed.flush()
     body = api_json(await api.get("upstream/egress", params={"range": "1h"}))
     cards = {card["egress"]: card for card in body["items"]}
@@ -227,7 +229,7 @@ async def test_buckets_show_fill_rates_and_history_and_a_reset_never_refills_the
     missing = await api.post("upstream/reset", json={"reason": "  "})
     assert "reason" in section13(missing, 422, "validation_failed")
     reset = api_json(await api.post("upstream/reset", json={"reason": "cleared after the incident"}))
-    assert reset["cleared"] == {"cooldowns_cleared": 1, "breakers_cleared": 1}
+    assert reset["cleared"] == {"cooldowns_cleared": 1, "breakers_cleared": 1, "markers_cleared": 0}
     assert reset["buckets"] == "unchanged"
     assert reset["warnings"] == []
     after = api_json(await api.get("upstream/buckets", params={"q": "endpoint:"}))
@@ -241,7 +243,7 @@ async def test_buckets_show_fill_rates_and_history_and_a_reset_never_refills_the
     assert api_json(await api.get("upstream/cooldowns"))["items"] == []
     assert api_json(await api.get("upstream/breakers"))["items"] == []
     (audit_row,) = _audit_rows(api_app, "upstream.reset_state")
-    assert json.loads(audit_row["after_json"]) == {"cooldowns_cleared": 1, "breakers_cleared": 1}
+    assert json.loads(audit_row["after_json"]) == {"cooldowns_cleared": 1, "breakers_cleared": 1, "markers_cleared": 0}
     assert audit_row["reason"] == "cleared after the incident"
     assert audit_row["actor"].startswith("admin:")
     marks = await api_app.ctx.dbs.metrics.read(

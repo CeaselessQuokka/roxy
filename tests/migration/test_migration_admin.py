@@ -80,14 +80,21 @@ async def test_migration_admin_existing_account_is_kept(v1: Any, ws: Any, migrat
 
 @pytest.mark.parametrize("make", [choose_hasher, plan_hasher])
 def test_hashers_are_argon2id_with_plan_parameters(make: Any) -> None:
-    """The admin auth module's hasher (when importable) and the fallback agree on plan 9.5."""
+    """The admin auth module's hasher (when importable) and the fallback agree with the login's parameters (plan
+    9.5's time cost 3; the memory and parallelism the final review set for the 909 MB server, finding sec-2), so
+    an imported hash never needs a rehash at the first login."""
+    from roxy.admin.auth import passwords
+
+    login = (passwords.ARGON2_TIME_COST, passwords.ARGON2_MEMORY_KIB, passwords.ARGON2_PARALLELISM)
+    assert login[0] == 3
+    assert login == (PLAN_TIME_COST, PLAN_MEMORY_COST_KIB, PLAN_PARALLELISM), "the fallback drifted from the login"
     hasher = make()
-    assert (hasher.time_cost, hasher.memory_kib, hasher.parallelism) == (3, 65536, 2)
+    assert (hasher.time_cost, hasher.memory_kib, hasher.parallelism) == login
     encoded = hasher.hash("fake-test-password-1234")
     assert extract_parameters(encoded).type is Type.ID
     assert hasher.verify(encoded, "fake-test-password-1234")
     assert not hasher.verify(encoded, "something-else-entirely")
-    assert hasher.parameters == "argon2id t=3 m=65536KiB p=2"
+    assert hasher.parameters == f"argon2id t={login[0]} m={login[1]}KiB p={login[2]}"
 
 
 def test_choose_hasher_uses_the_admin_auth_module() -> None:

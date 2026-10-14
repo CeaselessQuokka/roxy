@@ -2,7 +2,7 @@
 
 What this is
     The `parity` fixture (`ParityApp`) used by every `tests/parity/test_v1_<area>.py` file. It starts
-    `create_app(env)` with its real lifespan over temporary databases through `roxy.admin.auth.testing.auth_harness`
+    `create_app(env)` with its real lifespan over temporary databases through `auth_harness.auth_harness`
     (fast argon2 hasher, a `FakeClock`, a notifier whose mail is recorded instead of sent), with Roblox played by
     the root conftest's `respx_mock` (any unmocked outgoing request fails), and the tarpit and the rotator off, as
     the v1 smoke suite ran (it switched the tarpit off right after import).
@@ -22,7 +22,7 @@ How it works
     - `parity.mail` is the recorded mail (`subjects()`), `parity.last()` the newest outcome record of the Live ring.
 
 What to read next
-    `tests/V1_PARITY.md` (which rows these tests cover), `roxy/admin/auth/testing.py` (the harness underneath),
+    `tests/V1_PARITY.md` (which rows these tests cover), `tests/auth_harness.py` (the harness underneath),
     `tests/integration/test_pipeline_e2e.py` (the end-to-end tests these follow).
 """
 
@@ -37,7 +37,7 @@ from typing import Any
 import httpx
 import pytest
 
-from roxy.admin.auth.testing import AuthHarness, TestAdmin, auth_harness
+from auth_harness import AuthHarness, TestAdmin, auth_harness
 from roxy.config.audit import Actor
 from roxy.config.settings_service import SettingsService
 from roxy.core.clock import FakeClock

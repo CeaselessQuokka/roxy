@@ -2,7 +2,8 @@
 
 What this is
     Functions over control.db `admin_sessions` (run inside the caller's `db.write`/`db.read`): `create`, `load`,
-    `touch`, `rotate`, `revoke`, `revoke_user`, `revoke_all`, `kill_switch_sessions`, plus the cookie helpers and
+    `touch`, `rotate`, `revoke`, `revoke_user`, `revoke_bootstrap`, `revoke_all`, `revoke_non_passkey_sessions`
+    (the kill switch's narrower option), plus the cookie helpers and
     `csrf_secret(token)` (the per-session CSRF secret, `csrf.py`).
 
 Why it exists
@@ -256,6 +257,12 @@ def revoke_public(conn: sqlite3.Connection, user_id: int, short_id: str) -> bool
 def revoke_user(conn: sqlite3.Connection, user_id: int, *, keep: str | None = None) -> int:
     """End every session of one admin (except `keep`, the caller's own)."""
     return conn.execute("DELETE FROM admin_sessions WHERE user_id = ? AND id_hash != ?", (user_id, keep or "")).rowcount
+
+
+def revoke_bootstrap(conn: sqlite3.Connection, user_id: int) -> int:
+    """End every D5 first-login (bootstrap) session of one admin: once an authenticator is enrolled, a bootstrap
+    session left in another browser must not enroll a different one over it (finding sec-3)."""
+    return conn.execute("DELETE FROM admin_sessions WHERE user_id = ? AND mfa_level = 'bootstrap'", (user_id,)).rowcount
 
 
 def revoke_all(conn: sqlite3.Connection, now: int) -> tuple[int, int]:

@@ -30,9 +30,9 @@ How it works
     - Stored (row 56, plan 7.7): any Roblox 2xx under a positive lifetime and within `cache_max_body` bytes;
       Roblox 400, 403 (only when it is not a CSRF challenge), 404 and 410 for the error lifetime; a Roblox 429 as a
       marker until the cooldown ends (when `cache_negative_429` is on), never as content; 5xx, timeouts and every
-      Roxy-side failure never. The upstream layer's hints are honored: a 2xx with `cacheable=False` and a 4xx
-      without `negative_ttl_s` are not stored. An answer fetched with the credential is never stored under an
-      anonymous key (defense in depth for plan 6.9).
+      Roxy-side failure never. The upstream layer's hints are honored: a 2xx with `cacheable=False`, and a 4xx or a
+      429 without `negative_ttl_s` (a 429 that opened no cooldown, such as one burned rotator exit) are not stored.
+      An answer fetched with the credential is never stored under an anonymous key (defense in depth for plan 6.9).
 
 What to read next
     `roxy/cache/store.py` (where decisions are carried out), then `roxy/cache/service.py`.
@@ -349,9 +349,13 @@ def store_decision(result: UpstreamAnswer, policy: RequestPolicy, cs: CacheSetti
     reason = ReasonCode(result.reason)
     negative_hint: int | None = getattr(result, "negative_ttl_s", None)
     if upstream == 429:
-        if cs.negative_429:
-            return StoreDecision(StoreKind.MARKER, ttl_s=marker_ttl(result, cs, negative_hint), why="upstream_429")
-        return StoreDecision(StoreKind.NONE, why="upstream_429")
+        if not cs.negative_429:
+            return StoreDecision(StoreKind.NONE, why="upstream_429")
+        if hasattr(result, "negative_ttl_s") and negative_hint is None:
+            # The upstream opened no cooldown for this 429 (one burned rotator exit, plan 7.5) or keeps it private:
+            # a marker lives until the cooldown ends (plan 7.7), so there is none to keep (finding pipe-6).
+            return StoreDecision(StoreKind.NONE, why="upstream_veto")
+        return StoreDecision(StoreKind.MARKER, ttl_s=marker_ttl(result, cs, negative_hint), why="upstream_429")
     if upstream is None or reason.is_failure:
         return StoreDecision(StoreKind.NONE, why="failure")  # Roxy-side failures and 5xx are never content
     if 200 <= upstream < 300:

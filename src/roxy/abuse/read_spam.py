@@ -85,8 +85,11 @@ def detector_states(values: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def client_key_of(subject: str) -> str | None:
-    """The client key of a detector subject (`ip:203.0.113.9` gives `203.0.113.9`), None for other subjects."""
-    return subject[3:] if subject.startswith("ip:") else None
+    """The client key of a detector subject (`ip:203.0.113.9`, or SPAM-ENUM's `ip:203.0.113.9|<template>`, gives
+    `203.0.113.9`), None for other subjects."""
+    if not subject.startswith("ip:"):
+        return None
+    return subject[3:].split("|", 1)[0] or None
 
 
 def collateral(

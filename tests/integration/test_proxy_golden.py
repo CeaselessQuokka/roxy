@@ -712,7 +712,47 @@ ROWS: list[RowGolden] = [
     ),
     RowGolden(
         "cooldown_no_stale",
-        failure(ReasonCode.UPSTREAM_COOLDOWN, status=429, cooldown_s=27.2, upstream_status=429),
+        # Roblox answered this request's own call with 429 (Roxy-Upstream-Status). Compat mode answers it as v1 did:
+        # 500 with Roblox's body, Retry-After kept, no Roxy-Refusal (final review pipe-4: a Roblox 429 is a 4xx).
+        failure(
+            ReasonCode.UPSTREAM_COOLDOWN,
+            status=429,
+            cooldown_s=27.2,
+            upstream_status=429,
+            upstream_body=b'{"errors":[{"code":0,"message":"Too many requests"}]}',
+            upstream_content_type="application/json; charset=utf-8",
+        ),
+        Expect(
+            429,
+            BUSY,
+            TEXT,
+            {
+                **TRIO_TEXT,
+                "Retry-After": "28",
+                "Roxy-Cache": "MISS",
+                "Roxy-Upstream-Cooldown": "28",
+                "Roxy-Upstream-Status": "429",
+                "Roxy-Refusal": "upstream_cooldown",
+            },
+        ),
+        Expect(
+            500,
+            b'{"errors":[{"code":0,"message":"Too many requests"}]}',
+            JSON,
+            {
+                **TRIO_TEXT,
+                "Retry-After": "28",
+                "Roxy-Cache": "MISS",
+                "Roxy-Upstream-Cooldown": "28",
+                "Roxy-Upstream-Status": "429",
+            },
+        ),
+    ),
+    RowGolden(
+        "cooldown_no_call",
+        # The endpoint was cooling down and no call was made (no upstream status): Roxy's own back pressure, which
+        # compat mode leaves at 429.
+        failure(ReasonCode.UPSTREAM_COOLDOWN, status=429, cooldown_s=12, retry_after_s=12),
         *_same(
             Expect(
                 429,
@@ -720,10 +760,9 @@ ROWS: list[RowGolden] = [
                 TEXT,
                 {
                     **TRIO_TEXT,
-                    "Retry-After": "28",
+                    "Retry-After": "12",
                     "Roxy-Cache": "MISS",
-                    "Roxy-Upstream-Cooldown": "28",
-                    "Roxy-Upstream-Status": "429",
+                    "Roxy-Upstream-Cooldown": "12",
                     "Roxy-Refusal": "upstream_cooldown",
                 },
             )

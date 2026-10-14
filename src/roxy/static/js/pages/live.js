@@ -14,9 +14,12 @@
  *
  * How it works
  *   The server checked the address's filters with the Live API's own parser and wrote the good ones as JSON in
- *   `data-live-filters` (plain values, set as field values, never as markup). The tail (static/js/live_tail.js)
- *   starts after its module loads and marks its root with `data-state`; this script waits for that mark (at most
- *   10 seconds), sets the fields, and raises `change` on one of them: the tail reads every field at once
+ *   `data-live-filters` (plain values, set as field values, never as markup): one value per select, in the form the
+ *   tail compares (a list is left out with a notice). A value a select does not list (a status code such as 404)
+ *   gets an option of its own built with `el()` (its text is a text node), so it applies. The tail
+ *   (static/js/live_tail.js) starts after its module loads and marks its root with `data-state`; this script waits
+ *   for that mark (at most 10 seconds), sets the fields, and raises `change` on one of them: the tail reads every
+ *   field at once
  *   (`readFilters`) and reconnects its stream with them. The request id is checked to be letters, digits, `-` or
  *   `_` before it goes into the drawer URL (the drawer route checks it again).
  *
@@ -24,6 +27,7 @@
  *   static/js/page.js, static/js/live_tail.js, roxy/admin/pages/live.py.
  */
 
+import { el } from "roxy/dom";
 import { openDrawerFrom, pageParams } from "roxy/page";
 
 const WAIT_MS = 10000;
@@ -44,8 +48,12 @@ function applyFilters(tail, filters) {
   let last = null;
   for (const [name, value] of Object.entries(filters)) {
     const field = tail.querySelector(`[data-tail-filter="${CSS.escape(name)}"]`);
-    if (!field || typeof value !== "string") continue;
-    if (field.tagName === "SELECT" && ![...field.options].some((option) => option.value === value)) continue;
+    if (!field || typeof value !== "string" || !value) continue;
+    if (field.tagName === "SELECT" && ![...field.options].some((option) => option.value === value)) {
+      // A value the API takes but the select does not list (`?status=404`): the server sent it in the form the tail
+      // compares, so it gets an option of its own and applies like any other (finding docs_a-16).
+      field.append(el("option", { value, dataset: { fromAddress: "" } }, `${value} (from the address)`));
+    }
     field.value = value;
     last = field;
   }

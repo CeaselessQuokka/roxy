@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import re
 
+from auth_harness import AuthHarness, SoftwarePasskey
 from roxy.admin.auth import sessions
-from roxy.admin.auth.testing import AuthHarness, SoftwarePasskey
 from roxy.core.style_guard import find_dashes, find_style_issues
 
 API = "/admin/api/v1/auth"

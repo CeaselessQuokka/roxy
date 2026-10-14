@@ -256,7 +256,7 @@ async def test_review_readonly_hot_alert_cap_still_holds(app: App) -> None:
     the next mail after the hour reports what was held back; a leak guard trip is never held back."""
     from pydantic import SecretStr
 
-    from roxy.admin.auth.testing import RecordingTransport
+    from auth_harness import RecordingTransport
     from roxy.notify.alerts import Alert
     from roxy.notify.mail import MailConfig, MailSender
     from roxy.notify.notifier import Notifier

@@ -176,6 +176,10 @@ class ServeResult:
     stale_after_failure: bool = False
     key_id: str | None = None
     """The cache key id (24 hex) when the request had a key, for request samples and the live feed."""
+    upstream_body: bytes = b""
+    """Roblox's own body of a 429 this request's call received (`UpstreamResult.upstream_body`): sent only in
+    `compat_collapse_upstream_errors` mode, as v1 did (finding pipe-4). Empty for every other answer."""
+    upstream_content_type: str | None = None
 
 
 @dataclass(slots=True)
@@ -1172,6 +1176,8 @@ class CacheService:
             upstream_ms=float(result.upstream_ms),
             trace=getattr(result, "trace", None),
             key_id=key_id,
+            upstream_body=bytes(getattr(result, "upstream_body", b"") or b""),
+            upstream_content_type=getattr(result, "upstream_content_type", None),
         )
 
     def _from_shared(
@@ -1310,6 +1316,15 @@ class CacheService:
         log.info("cache_purged", extra={"fields": dataclasses.asdict(report)})
         self._event("cache_purge", "info", "cache_purge", dataclasses.asdict(report))
         return report
+
+    async def purge_markers(self) -> int:
+        """Remove every per-key 429 marker fleet-wide and return how many cache.db held (the upstream reset,
+        `UpstreamService.reset_state`: a marker lives until its cooldown ends, plan 7.7, finding pipe-5). Content
+        entries stay; every worker's memory tier is dropped within `GENERATION_POLL_S` by the purge's stamp.
+        Raises `SharedStateUnavailable` when cache.db cannot be written (this worker's memory tier is still
+        emptied first)."""
+        report = await self.purge(PurgeScope.markers(), "upstream_reset")
+        return report.removed
 
     async def maintain(self) -> EvictionReport | None:
         """The eviction pass, at most once a minute fleet-wide (a hot.db lease that is left to expire). While the

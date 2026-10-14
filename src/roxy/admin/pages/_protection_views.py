@@ -150,7 +150,13 @@ MODE_LABELS: Final[dict[str, str]] = {"contains": "Contains", "exact": "Exact", 
 TYPE_LABELS: Final[dict[str, str]] = {"glob": "Wildcard", "regex": "Regex"}
 """v1 `typeBadge`: a glob pattern is a "Wildcard"."""
 UA_SCOPE_LABELS: Final[dict[str, str]] = {"ip": "Per IP", "global": "Shared by all IPs"}
-RULE_SCOPE_LABELS: Final[dict[str, str]] = {"ip": "Per IP", "place": "Per experience", "global": "Shared by everyone"}
+RULE_SCOPE_LABELS: Final[dict[str, str]] = {
+    "ip": "Per IP",
+    # Keyed by Roblox-Id and the caller's network while place_limit_key is place_prefix (the default), so a forged
+    # Roblox-Id never uses up a real game's budget (finding abuse-15).
+    "place": "Per experience (and caller network)",
+    "global": "Shared by everyone",
+}
 
 DETECTOR_SIGNALS: Final[dict[str, tuple[str, str]]] = {
     "rate": ("Sustained request rate", "More than 5 times the per-IP limit rate for 10 minutes; bans for 1 hour."),
@@ -194,8 +200,9 @@ BOT_SIGNAL_NOTES: Final[dict[str, tuple[str, str]]] = {
     "library_ua": ("Library or missing User-Agent", "1 when the User-Agent is python-requests, curl, Go or empty."),
     "no_roblox_signature": (
         "No Roblox game server signature",
-        "1 when the Roblox-Id header and a Roblox User-Agent are missing (and, when the Roblox egress list is set, "
-        "the address is outside it).",
+        "0 only for a request with the Roblox-Id header and a Roblox User-Agent from an address inside the Roblox "
+        "game server IP ranges; 1 otherwise. With that list empty (the default) every caller scores 1, real game "
+        "servers included, because the signature alone is easy to forge.",
     ),
     "probes": ("Probe history", "Probes in the last 24 hours divided by 5, at most 1."),
     "refusals": ("Refusal ratio", "Refused requests divided by all requests over the last hour."),

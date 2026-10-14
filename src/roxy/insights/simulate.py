@@ -80,6 +80,7 @@ from roxy.metrics.templating import literal_text
 from roxy.rules.match import PatternValidationError, compile_pattern, validate_pattern
 from roxy.rules.models import CacheRuleRow
 from roxy.upstream.buckets import BucketSpec, gcra_advance_ms, gcra_earliest_ms
+from roxy.upstream.pacing import pacing_template
 
 if TYPE_CHECKING:
     from roxy.insights.context import InsightContext
@@ -588,18 +589,26 @@ def own_template_row(rows: Iterable[Any], template: str) -> Any:
 _ESCAPED_CHAR: Final = re.compile(r"\\(.)")
 
 
-def covers_exactly_one_template(match: Mapping[str, Any] | None) -> bool:
-    """Whether a change's `match` is an exact template pattern (`exact_template_pattern` of some template), so the
-    rule it writes applies to one endpoint only (plan 11.2 "scoped to one endpoint"). The pattern is read back into
-    the template it spells and rebuilt; any other regex (a wildcard, an alternative) does not rebuild to itself."""
+def template_of_match(match: Mapping[str, Any] | None) -> str | None:
+    """The endpoint template an exact template pattern spells (`exact_template_pattern`), or None for any other
+    pattern. A variable segment reads back as `{segment}` (every segment name compiles to the same regex, so the
+    cache selects the same rule for it). The pattern is read back and rebuilt; any other regex (a wildcard, an
+    alternative) does not rebuild to itself."""
     if not isinstance(match, Mapping) or str(match.get("type") or "glob") != "regex":
-        return False
+        return None
     pattern = str(match.get("pattern") or "")
     if not (pattern.startswith("^") and pattern.endswith("/?$")):
-        return False
+        return None
     body = pattern[1:-3].replace(TEMPLATE_SEGMENT, "\0")  # the segment itself holds a slash: protect it first
     parts = ["{segment}" if part == "\0" else _ESCAPED_CHAR.sub(r"\1", part) for part in body.split("/")]
-    return exact_template_pattern("/".join(parts)) == pattern
+    template = "/".join(parts)
+    return template if exact_template_pattern(template) == pattern else None
+
+
+def covers_exactly_one_template(match: Mapping[str, Any] | None) -> bool:
+    """Whether a change's `match` is an exact template pattern (`exact_template_pattern` of some template), so the
+    rule it writes applies to one endpoint only (plan 11.2 "scoped to one endpoint"; `template_of_match`)."""
+    return template_of_match(match) is not None
 
 
 PATTERN_RULE_TABLES: Final[frozenset[str]] = frozenset(
@@ -1014,11 +1023,16 @@ def _run_replay(ctx: InsightContext, data: _ReplayInput, report: DryRunReport) -
     for change in data.rec.changes:
         if change.kind != "bucket_override" or not isinstance(change.proposed, Mapping) or not change.bucket_key:
             continue
-        template = change.bucket_key.split(":", 1)[1] if change.bucket_key.startswith("endpoint:") else None
-        rows = [s for s in data.samples if template is None or s["endpoint_template"] == template]
+        # An endpoint bucket key carries the template's pacing form (`upstream/pacing.py`, finding pipe-2): every
+        # letter case of the endpoint shares the bucket, so samples are matched on that form too.
+        pacing = (
+            pacing_template(change.bucket_key.split(":", 1)[1]) if change.bucket_key.startswith("endpoint:") else None
+        )
+        rows = [s for s in data.samples if pacing is None or pacing_template(str(s["endpoint_template"])) == pacing]
+        affected_paced = {pacing_template(name) for name in affected_templates}
         times = (
             call_times
-            if call_times is not None and template in affected_templates
+            if call_times is not None and pacing is not None and pacing in affected_paced
             else [int(s["at_ms"]) for s in rows if s.get("egress") not in (None, "none")]
         )
         # The sample's calls arrive at 1 / scale of the real rate: the bucket is thinned the same way.
@@ -1263,5 +1277,6 @@ __all__ = [
     "stored_as",
     "subtree_match",
     "template_match",
+    "template_of_match",
     "template_pattern",
 ]

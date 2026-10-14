@@ -3,7 +3,7 @@
 Everything that runs Roxy on the server lives here: the gunicorn config, the systemd units, the nginx site, the
 blue/green deploy and its rollback, the root wrappers the deploy may call through sudo, backups, alerts and the
 permission audit (plan section 17). Every file explains each setting next to the setting itself. This page is the
-map; `MIGRATION.md` (phase P14) walks through the cutover from v1 step by step. When something breaks on the
+map; `MIGRATION.md` (at the repository root) walks through the cutover from v1 step by step. When something breaks on the
 server, `docs/RUNBOOKS.md` (the ops docs the alerts and health checks link to) says how to confirm, fix, verify and
 roll back each case; `docs/PERFORMANCE.md` has the load figures and the quiet-machine rerun commands.
 
@@ -80,10 +80,26 @@ sends "Roxy: deploy <short sha> failed at step <n>". The repository URL is logge
 part. Releases are built with compiled bytecode (`uv sync --compile-bytecode`), because the service cannot write
 bytecode into its read-only release.
 
-Low-memory mode (DESIGN.md section 0): when less than 700 MB is available before the restart, the idle color starts
+A paused color or one in throttle-all (switched on by the owner, or a pause carried over from v1 at the cutover)
+answers the smoke test's proxy request with Roxy's own pause (503) or throttle-all (429) refusal. The smoke test
+accepts exactly that refusal when the color reports the switch, and says so on its `proxy` line, so a deploy (the fix
+you are shipping, say) still goes through while the switch stays on.
+
+Low-memory mode (CHANGES.md, "Plan conflicts and deviations", "Memory sizing for the 1 GB server"): when less than
+700 MB is available before the restart, the idle color starts
 with one worker and grows to `ROXY_WORKERS` after the old color stopped, through the gunicorn control socket (the
 same code as gunicorn's SIGTTIN handler; the deploy user may not signal the `roxy` user's processes). Force it with
 `--low-memory`, or turn it off with `--no-low-memory`.
+
+Build ahead: `/opt/roxy/deploy.sh --build-only <sha>` runs steps 1 and 2 only (fetch, the release's `.venv` and
+static files) while the live site keeps serving; it starts, switches and records nothing. The deploy of the same
+commit then logs `Release ... is already built` and goes straight to step 3, which keeps the venv build (minutes on
+this server) out of a maintenance window such as the cutover. A failed build-only run removes its half-built release
+and sends no deploy alert.
+
+A first deploy that fails after its switch leaves nginx's active-upstream link on blue (the installed site needs the
+file) while blue is stopped and has no release link; the next deploy sees that nothing serves and starts blue again,
+as for a first deploy.
 
 Rollback: `/opt/roxy/deploy_rollback.sh` goes back to the release the other color last ran, with the same health gate;
 `/opt/roxy/deploy_rollback.sh <sha>` goes to any release still in `/opt/roxy/releases` (the newest five are kept).
@@ -157,10 +173,21 @@ sudo -u roxy /opt/roxy/releases/current-blue/.venv/bin/python /opt/roxy/releases
 
 `roxy-backup.timer` runs `backup.sh` nightly at 03:30 (plus up to 15 minutes): control.db and metrics.db (hot.db with
 `ROXY_BACKUP_HOT=1`) are copied with `VACUUM INTO`, checked, compressed, optionally encrypted with `age`, and kept 14
-daily and 8 weekly. To restore: stop both colors, decompress (`zstd -d control.db.zst`, after `age -d` when
-encrypted) into `/var/lib/roxy/`, run `PRAGMA integrity_check`, fix owners (`chown roxy:roxy`, mode 0640), start the
-color nginx points at (`sudo /usr/local/sbin/roxy-switch-color --boot`), and run the health check. The encryption keys are
-never in a backup (plan 9.8): restore `/etc/roxy/credentials/` from the owner's offline copy if the disk was lost.
+daily and 8 weekly. The optional off-box copy (`ROXY_BACKUP_REMOTE`, through rclone) only ever sends an encrypted set:
+with a remote set and no age recipient in `ROXY_BACKUP_AGE_RECIPIENTS`, the run keeps its local set, copies nothing
+and fails, so the alert says what to add.
+
+To restore, follow `docs/RUNBOOKS.md` "Restore from backup", in a root shell (`sudo -i`): the sets are root-only
+(`/var/backups/roxy` and each set 0700, files 0600), so a per-command `sudo` cannot `cd` into them. In short: check
+the set (`sha256sum -c SHA256SUMS` inside it), stop both colors, move the damaged file aside, decrypt (`age -d`, when
+encrypted) and decompress (`zstd -d /var/backups/roxy/<date>/control.db.zst -o /var/lib/roxy/control.db`), give the
+file to the service BEFORE anything opens it (`chown roxy:roxy`, mode 0640: zstd keeps the set's root-only mode), run
+`PRAGMA integrity_check` as `roxy`, start the color nginx points at (`/usr/local/sbin/roxy-switch-color --boot`), and
+run the health check. The encryption keys are never in a backup (plan 9.8): if the disk was lost, restore
+`/etc/roxy/credentials/` from the owner's offline copy first, then fetch an off-box set with `rclone --config
+/etc/roxy/credentials/rclone_config copy <remote>:roxy-backups/<date> /var/backups/roxy/<date>`. The on-server
+snapshots in `/var/lib/roxy/snapshots/` (reset, manual and pre-migrate copies) are plain SQLite files and go back the
+same way without the decompression.
 
 "Back up now" runs the same full backup on request: the service or `scripts/ctl.py backup-now` (both the `roxy`
 user, which may not start units) writes `/var/lib/roxy/backup-request`, and `roxy-backup-request.path` starts
@@ -194,16 +221,21 @@ be installed at once. Things to know:
 
 ## Memory and swap on the 909 MB server
 
-The server has 909 MB of RAM and no swap. DESIGN.md section 0 sizes everything to fit without swap: each color is
-capped at `MemoryHigh=420M` and `MemoryMax=500M` (raised from 320M and 420M by finding LOAD-2: a color whose workers
-recycle every 20,000 requests settles at 365 to 405 MiB of PSS, docs/PERFORMANCE.md "Memory per color"), two
-workers per color, glibc's allocator tuned in `roxy@.service` (`MALLOC_ARENA_MAX=2`, fixed mmap and trim thresholds
-of 128 KiB), and low-memory mode during a deploy.
+The server has 909 MB of RAM and no swap. Everything is sized to fit without swap (CHANGES.md, "Memory sizing for the
+1 GB server"): each color is capped at `MemoryHigh=420M` and `MemoryMax=500M` (raised from 320M and 420M by finding
+LOAD-2: a color whose workers recycle every 20,000 requests settles at 365 to 405 MiB of PSS, docs/PERFORMANCE.md
+"Memory per color"), two workers per color, glibc's allocator tuned in `roxy@.service` (`MALLOC_ARENA_MAX=2`, fixed
+mmap and trim thresholds of 128 KiB), and low-memory mode during a deploy. When a color does pass `MemoryMax`, the
+kernel kills one process inside it (the largest, a worker) and `OOMPolicy=continue` keeps the color running: gunicorn
+starts a replacement worker while the other one serves (systemd's default would stop and restart the whole color, a
+502 for every caller meanwhile).
 
 **Never run two warm colors at once.** One color at its hard limit plus a color that just started plus nginx and the
 OS fit in 909 MB; two colors that have both served traffic for a while do not (about 2 x 405 MiB plus 200 MB). The
 deploy and the rollback only ever start the idle color fresh and stop the old one after the watch; do not
-`systemctl start` the idle color by hand while the active one serves. On this server the deploy runs in low-memory
+`systemctl start` the idle color by hand while the active one serves. For the same reason prefer `systemctl restart`
+(or a rollback) to `systemctl reload` on a warm color: a reload starts the new workers before the old ones leave, so
+for a moment the color runs four. On this server the deploy runs in low-memory
 mode (the new color starts with one worker) whenever a warm color is active, because less than 700 MB is then
 available; that is expected, not a warning sign.
 

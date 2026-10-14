@@ -175,7 +175,11 @@ def resolve_time(
         "granularity": params.granularity,
         "label": label,
         "compare_label": compare_text,
-        "description": f"{label}, compared with {compare_text}" if compare_text else label,
+        # What a card's numbers cover: the range alone. The comparison is a page-wide choice that only some cards
+        # draw (charts, KPI arrows, trends); a card subtitle "Last 24 hours, compared with the same period last
+        # week: 6 attempts" read as a comparison on cards that compare nothing (Security, Data exports, Audit,
+        # Settings history; finding docs_b-15). A card that draws one names it from `compare_label`.
+        "description": label,
         "notice": notice,
         "tz": tz,
     }

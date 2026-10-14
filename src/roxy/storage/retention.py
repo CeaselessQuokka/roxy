@@ -315,6 +315,35 @@ def prune_rollup_month(conn: sqlite3.Connection, now_s: float, policy: Retention
     )
 
 
+_ANSWER_KEY = "bucket_start, endpoint_template, host, egress"
+
+
+def _prune_answers(conn: sqlite3.Connection, table: str, days: int, now_s: float, limit: int) -> int:
+    return prune_age_then_cap(
+        conn, table, key=_ANSWER_KEY, time_col="bucket_start", cutoff=_cutoff(now_s, days), cap=None, limit=limit
+    )
+
+
+def prune_answer_minute(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
+    """`roblox_answer_minute` (metrics 0010): like `rollup_minute`, `retention_minute_days` (14)."""
+    return _prune_answers(conn, "roblox_answer_minute", policy.retention_minute_days, now_s, limit)
+
+
+def prune_answer_hour(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
+    """`roblox_answer_hour`: like `rollup_hour`, `retention_hour_days` (400)."""
+    return _prune_answers(conn, "roblox_answer_hour", policy.retention_hour_days, now_s, limit)
+
+
+def prune_answer_day(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
+    """`roblox_answer_day`: like `rollup_day`, `retention_day_days` (0 = forever)."""
+    return _prune_answers(conn, "roblox_answer_day", policy.retention_day_days, now_s, limit)
+
+
+def prune_answer_month(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
+    """`roblox_answer_month`: like `rollup_month`, `retention_day_days` (0 = forever)."""
+    return _prune_answers(conn, "roblox_answer_month", policy.retention_day_days, now_s, limit)
+
+
 def cap_client_rows(
     conn: sqlite3.Connection,
     table: str,
@@ -594,6 +623,25 @@ def prune_recommendation_actions(conn: sqlite3.Connection, now_s: float, policy:
     return deleted
 
 
+def prune_recommendation_watches(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
+    """`recommendation_watches` (metrics 0002): a watch row leaves with its recommendation, as its actions do.
+
+    One row per applied recommendation (keyed by its id), so the recommendations' own age and row cap
+    (`retention_recommendations_days`, `recommendations_max_rows`) bound this table too (plan 6.10, P9; final review
+    finding data-10: nothing ever deleted a watch row). A watch of a recommendation still kept stays whatever its age:
+    the engine and the auto-apply watch read it while the recommendation is quiet.
+    """
+    return delete_batch(
+        conn,
+        "recommendation_watches",
+        "rowid",
+        "recommendation_id NOT IN (SELECT id FROM recommendations)",
+        (),
+        "started_at",
+        limit,
+    )
+
+
 def prune_health(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
     """`health_runs` and `health_results`: `retention_health_days` (180), `health_runs_max` (2,000 runs).
     Results go with their run, and orphaned results are removed."""
@@ -636,8 +684,15 @@ def prune_health(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy
 
 
 def prune_captures(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
-    """`captures`: `capture_ttl_seconds` (900), `capture_max_records` (2,000), `capture_max_bytes` (64 MiB)."""
-    cutoff = int(now_s - policy.capture_ttl_seconds) if policy.capture_ttl_seconds > 0 else None
+    """`captures`: `capture_ttl_seconds` (900), `capture_max_records` (2,000), `capture_max_bytes` (64 MiB).
+
+    A TTL of 0 means captures expire at once (the catalog; `metrics/capture.py CapturePolicy.active` is off and
+    `get_capture` answers every capture as expired), so none is kept: captured caller payloads never stay on disk,
+    and in every nightly backup, while the dashboard counts none of them (final review finding data-5).
+    """
+    if policy.capture_ttl_seconds <= 0:
+        return delete_batch(conn, "captures", "rowid", "1", (), "id", limit)
+    cutoff = int(now_s - policy.capture_ttl_seconds)
     deleted = prune_age_then_cap(
         conn,
         "captures",
@@ -679,16 +734,52 @@ def prune_fingerprint_headers(conn: sqlite3.Connection, now_s: float, policy: Re
 
 
 def prune_fingerprint_values(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
-    """`fingerprint_values`: `retention_fingerprints_days` (90 since last seen), `max_header_value_records`."""
-    return prune_age_then_cap(
+    """`fingerprint_values`: `retention_fingerprints_days` (90 since last seen), then at most
+    `max_header_value_records` values PER HEADER NAME, then the whole table at most `max_header_name_records` times
+    that (a safety cap; only rows of names the header cap no longer counts can reach it).
+
+    The per-header cap is what the catalog and v1 (`MAX_HEADER_VALUE_RECORDS`) mean, and what the writer keeps
+    (`metrics/fingerprints.py write_fingerprints`: least seen first, then oldest). Read as a cap on the whole table it
+    cut three headers of 300 values each to 500 values in all every 10 minutes, so one busy varying header pushed
+    every other header's drill-down empty (final review finding data-6).
+    """
+    deleted = prune_age_then_cap(
         conn,
         "fingerprint_values",
         key="rowid",
         time_col="last_seen",
         cutoff=_cutoff(now_s, policy.retention_fingerprints_days),
-        cap=policy.max_header_value_records,
+        cap=None,
         limit=limit,
     )
+    per_header = max(1, int(policy.max_header_value_records))
+    if deleted < limit:
+        # Only the names above the cap are ranked (the `fingerprint_values_name` index finds them), each keeping its
+        # most seen values (newest first among equal counts), as the writer does.
+        deleted += conn.execute(
+            """
+            DELETE FROM fingerprint_values WHERE rowid IN (
+                SELECT rowid FROM (
+                    SELECT v.rowid AS rowid,
+                           row_number() OVER (PARTITION BY v.name
+                                              ORDER BY v.count DESC, v.last_seen DESC, v.value_hash) AS rank
+                    FROM fingerprint_values AS v
+                    WHERE v.name IN (SELECT name FROM fingerprint_values GROUP BY name HAVING count(*) > ?)
+                ) WHERE rank > ? LIMIT ?)
+            """,
+            (per_header, per_header, limit - deleted),
+        ).rowcount
+    if deleted < limit:
+        deleted += prune_age_then_cap(
+            conn,
+            "fingerprint_values",
+            key="rowid",
+            time_col="last_seen",
+            cutoff=None,
+            cap=max(1, int(policy.max_header_name_records)) * per_header,
+            limit=limit - deleted,
+        )
+    return deleted
 
 
 def prune_fingerprint_user_agents(conn: sqlite3.Connection, now_s: float, policy: RetentionPolicy, limit: int) -> int:
@@ -1071,6 +1162,10 @@ RETENTION_TASKS: tuple[RetentionTask, ...] = (
     RetentionTask("metrics", "rollup_hour", prune_rollup_hour),
     RetentionTask("metrics", "rollup_day", prune_rollup_day),
     RetentionTask("metrics", "rollup_month", prune_rollup_month),
+    RetentionTask("metrics", "roblox_answer_minute", prune_answer_minute),
+    RetentionTask("metrics", "roblox_answer_hour", prune_answer_hour),
+    RetentionTask("metrics", "roblox_answer_day", prune_answer_day),
+    RetentionTask("metrics", "roblox_answer_month", prune_answer_month),
     RetentionTask("metrics", "client_minute", prune_client_minute),
     RetentionTask("metrics", "client_hour", prune_client_hour),
     RetentionTask("metrics", "client_day", prune_client_day),
@@ -1081,6 +1176,7 @@ RETENTION_TASKS: tuple[RetentionTask, ...] = (
     RetentionTask("metrics", "egress_usage", prune_egress_usage),
     RetentionTask("metrics", "recommendations", prune_recommendations),
     RetentionTask("metrics", "recommendation_actions", prune_recommendation_actions),
+    RetentionTask("metrics", "recommendation_watches", prune_recommendation_watches),
     RetentionTask("metrics", "health_runs", prune_health),
     RetentionTask("metrics", "captures", prune_captures),
     RetentionTask("metrics", "fingerprint_headers", prune_fingerprint_headers),

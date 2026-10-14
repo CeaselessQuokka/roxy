@@ -112,6 +112,9 @@ def test_rotator_429_counts_only_with_distinct_exits(dbs: Any) -> None:
         assert effects.counted_429 is False
         assert effects.distinct_exits == i + 1
         assert cooldown_keys(dbs) == {}
+        # No cooldown opened, so none is reported either (final review pipe-6: no Retry-After of a cooldown that
+        # does not exist, no per-key 429 marker).
+        assert (effects.cooldown_s, effects.cooldown_source) == (None, "")
     effects = apply(dbs, facts(AttemptKind.RATE_LIMITED, egress=Egress.ROTATOR, exit_id="s3"), NOW_MS + 2)
     assert effects.counted_429 is True
     assert f"endpoint:{TEMPLATE}:rotator" in cooldown_keys(dbs)

@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.auth.testing import SoftwarePasskey
+from auth_harness import SoftwarePasskey
 
 pytestmark = pytest.mark.asyncio
 

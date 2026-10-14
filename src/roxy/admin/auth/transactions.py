@@ -2,9 +2,9 @@
 
 What this is
     A tiny keyed store with expiry, built on hot.db's `lease (name, holder, expires_ms, epoch, payload_json)`
-    rows: `put`, `get`, `take` (read and delete in one step), `delete`, `cap`, plus the TOTP replay guard
-    `accept_totp_step`. Every function is plain SQL on a connection, so callers run it inside their own
-    `db.write`/`db.read` and can combine it with a lockout update in the same transaction.
+    rows: `put`, `get`, `take` (read and delete in one step), `delete`, `delete_bootstrap_logins`, `cap`, plus the
+    TOTP replay guard `accept_totp_step`. Every function is plain SQL on a connection, so callers run it inside
+    their own `db.write`/`db.read` and can combine it with a lockout update in the same transaction.
 
 Why it exists
     The password step and the second factor step of a login are separate requests that may land on different
@@ -132,6 +132,24 @@ def delete(conn: sqlite3.Connection, name: str) -> None:
 def delete_prefix(conn: sqlite3.Connection, prefix: str) -> int:
     """Delete every record whose name starts with `prefix`."""
     return conn.execute("DELETE FROM lease WHERE name >= ? AND name < ?", (prefix, prefix + _PREFIX_END)).rowcount
+
+
+def delete_bootstrap_logins(conn: sqlite3.Connection, user_id: int) -> int:
+    """Delete the pending login transactions of `user_id` that would finish as a D5 bootstrap login.
+
+    Called when the account enrolls an authenticator: the one-time email path is closed, so a login started before
+    (its transaction lives `challenge_expiration`, and each resend extends it) must not finish (finding sec-3; the
+    flow also re-checks the account when it finishes one). At most `MAX_EXPIRABLES_PER_STORE` rows are read.
+    """
+    rows = conn.execute(
+        "SELECT name, payload_json FROM lease WHERE name >= ? AND name < ?", (LOGIN_TX, LOGIN_TX + _PREFIX_END)
+    ).fetchall()
+    deleted = 0
+    for name, text in rows:
+        payload = _decode(text)
+        if payload is not None and payload.get("bootstrap") and payload.get("uid") == user_id:
+            deleted += conn.execute("DELETE FROM lease WHERE name = ?", (name,)).rowcount
+    return deleted
 
 
 def cap(conn: sqlite3.Connection, prefix: str, now_ms: int, limit: int = MAX_EXPIRABLES_PER_STORE) -> int:

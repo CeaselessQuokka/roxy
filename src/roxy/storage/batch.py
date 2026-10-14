@@ -19,6 +19,10 @@ How it works
       plan P9). On overflow the oldest item of the lowest priority kind is dropped; if the new item itself has
       the lowest priority, it is the one dropped. Every drop increments `dropped` (the `metrics_dropped` counter
       on the System page; recommendation SYS-METRICS-DROP fires when it is not zero).
+    - A kind whose handler keeps only so much anyway may also carry its own bounds (`keep_items`, `keep_bytes` with
+      `weigh`): captures, whose rows weigh what a request body does and which `write_captures` prunes to the capture
+      caps on insert. Past those bounds the kind's oldest items leave (`capped`, not `dropped`: nothing that could
+      have been kept is lost), so a metrics.db that cannot be written never fills a worker's memory with them.
     - A flush takes everything queued at that moment, then writes each database's share in one transaction.
       If the database is unavailable the items are put back and retried next time: metrics may degrade, but they
       never block requests (plan C7). Putting back respects priorities the same way `add()` does: lower priority
@@ -63,6 +67,9 @@ Handler = Callable[[sqlite3.Connection, list[Any]], None]
 Source = Callable[[], list[Any]]
 """Returns (and forgets) the items accumulated since the last call, for example a swapped counter dict."""
 
+Bound = Callable[[], int]
+"""A live bound of one kind (read on every add, so a setting change applies at once)."""
+
 
 @dataclass(slots=True)
 class _Kind:
@@ -74,6 +81,13 @@ class _Kind:
     source: Source | None = None
     dropped: int = 0
     written: int = 0
+    # The kind's own bounds (`register(keep_items=, keep_bytes=, weigh=)`): queued items past them are items the
+    # handler could never keep, so the oldest leave (counted in `capped`, not `dropped`: no number is lost).
+    keep_items: Bound | None = None
+    keep_bytes: Bound | None = None
+    weigh: Callable[[Any], int] | None = None
+    queued_bytes: int = 0
+    capped: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +205,7 @@ class BatchWriter:
         self._lock = threading.Lock()
         self._total = 0
         self.dropped = 0
+        self.capped = 0  # items a kind's own bounds removed (never `dropped`: the handler could not keep them)
         self.flushes = 0
         self.flush_failures = 0
         self.last_flush_at: float | None = None
@@ -201,12 +216,32 @@ class BatchWriter:
     # ------------------------------------------------------------------------------------------- registration
 
     def register(
-        self, kind: str, db: Database, handler: Handler, *, priority: int = 0, source: Source | None = None
+        self,
+        kind: str,
+        db: Database,
+        handler: Handler,
+        *,
+        priority: int = 0,
+        source: Source | None = None,
+        keep_items: Bound | None = None,
+        keep_bytes: Bound | None = None,
+        weigh: Callable[[Any], int] | None = None,
     ) -> None:
-        """Declare an item kind: where it is written, how, and how important it is when the queue is full."""
+        """Declare an item kind: where it is written, how, and how important it is when the queue is full.
+
+        `keep_items` and `keep_bytes` (with `weigh`, an item's size in bytes) bound the kind on its own, for a kind
+        whose handler keeps only that much anyway (captures: `write_captures` prunes to the capture caps the moment
+        it inserts): beyond them the kind's oldest queued items leave, counted in `capped`. Without it such a kind
+        filled the shared queue while its database could not be written, every item weighing what a request body
+        does (final review finding memory-1).
+        """
         if kind in self._kinds:
             raise ValueError(f"batch kind {kind!r} already registered")
-        self._kinds[kind] = _Kind(kind, db, handler, priority, source=source)
+        if keep_bytes is not None and weigh is None:
+            raise ValueError(f"batch kind {kind!r}: keep_bytes needs weigh")
+        self._kinds[kind] = _Kind(
+            kind, db, handler, priority, source=source, keep_items=keep_items, keep_bytes=keep_bytes, weigh=weigh
+        )
 
     def kinds(self) -> list[str]:
         return list(self._kinds)
@@ -224,8 +259,49 @@ class BatchWriter:
                 self.dropped += 1
                 return False
             spec.queue.append(item)
+            spec.queued_bytes += self._weight(spec, item)
             self._total += 1
+            return self._trim_kind_locked(spec, item)
+
+    @staticmethod
+    def _weight(spec: _Kind, item: Any) -> int:
+        return max(0, int(spec.weigh(item))) if spec.weigh is not None else 0
+
+    @staticmethod
+    def _bound(bound: Bound | None) -> int | None:
+        if bound is None:
+            return None
+        try:
+            return max(0, int(bound()))
+        except Exception:  # a bound that cannot be read leaves the kind to the shared queue bound
+            log.exception("batch_bound_failed")
+            return None
+
+    def _pop_oldest_locked(self, spec: _Kind) -> Any:
+        """Remove the oldest queued item of `spec`, keeping the counters right; caller holds `_lock`."""
+        item = spec.queue.popleft()
+        spec.queued_bytes = max(0, spec.queued_bytes - self._weight(spec, item))
+        self._total -= 1
+        return item
+
+    def _trim_kind_locked(self, spec: _Kind, newest: Any = None) -> bool:
+        """Enforce `spec`'s own bounds, oldest first (counted in `capped`). False when `newest` had to leave too
+        (one item larger than the kind's byte bound). Caller holds `_lock`."""
+        if spec.keep_items is None and spec.keep_bytes is None:
             return True
+        max_items = self._bound(spec.keep_items)
+        max_bytes = self._bound(spec.keep_bytes)
+        kept = True
+        while spec.queue and (
+            (max_items is not None and len(spec.queue) > max_items)
+            or (max_bytes is not None and spec.queued_bytes > max_bytes)
+        ):
+            gone = self._pop_oldest_locked(spec)
+            spec.capped += 1
+            self.capped += 1
+            if gone is newest:
+                kept = False
+        return kept
 
     def add_many(self, kind: str, items: list[Any]) -> int:
         """Queue several items; returns how many were accepted."""
@@ -242,10 +318,9 @@ class BatchWriter:
         if not victims:
             return False
         victim = min(victims, key=lambda k: k.priority)
-        victim.queue.popleft()
+        self._pop_oldest_locked(victim)
         victim.dropped += 1
         self.dropped += 1
-        self._total -= 1
         return True
 
     # ----------------------------------------------------------------------------------------------- flushing
@@ -258,6 +333,7 @@ class BatchWriter:
                 if spec.queue:
                     taken[spec.name] = list(spec.queue)
                     spec.queue.clear()
+                spec.queued_bytes = 0
             self._total = 0
         for spec in self._kinds.values():
             if spec.source is None:
@@ -297,7 +373,11 @@ class BatchWriter:
             spec.dropped += lost
             self.dropped += lost
         spec.queue.extendleft(reversed(keep))
+        spec.queued_bytes += sum(self._weight(spec, item) for item in keep)
         self._total += len(keep)
+        # The put-back items are the kind's oldest: its own bounds take them first (an unwritable metrics.db
+        # never lets a kind with bounds grow past them, flush after flush; finding memory-1).
+        self._trim_kind_locked(spec)
 
     def _evict_lower_locked(self, priority: int) -> bool:
         """Drop the oldest queued item of the lowest priority kind strictly below `priority`; False if none."""
@@ -305,10 +385,9 @@ class BatchWriter:
         if not victims:
             return False
         victim = min(victims, key=lambda k: k.priority)
-        victim.queue.popleft()
+        self._pop_oldest_locked(victim)
         victim.dropped += 1
         self.dropped += 1
-        self._total -= 1
         return True
 
     def _drop_bad(self, kind: str, items: list[Any], reason: str) -> None:
@@ -507,14 +586,23 @@ class BatchWriter:
         """Queue sizes, drops and flush timing for the System page (metrics pipeline card)."""
         with self._lock:
             kinds = {
-                name: {"queued": len(k.queue), "dropped": k.dropped, "written": k.written, "priority": k.priority}
+                name: {
+                    "queued": len(k.queue),
+                    "dropped": k.dropped,
+                    "written": k.written,
+                    "priority": k.priority,
+                    "capped": k.capped,
+                    "queued_bytes": k.queued_bytes,
+                }
                 for name, k in self._kinds.items()
             }
             total = self._total
+            capped = self.capped
         return {
             "queued": total,
             "max_items": self._limit(),
             "dropped": self.dropped,
+            "capped": capped,
             "flushes": self.flushes,
             "flush_failures": self.flush_failures,
             "last_flush_at": self.last_flush_at,

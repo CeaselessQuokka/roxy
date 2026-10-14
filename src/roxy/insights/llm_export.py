@@ -96,7 +96,7 @@ from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.core.redact import masked_url, redact_text
 from roxy.egress import read_credential
 from roxy.egress import read_state as egress_state
-from roxy.egress.rotator import DECIMAL_GB, day_start_for, usage_since
+from roxy.egress.rotator import DECIMAL_GB, day_start_for, read_billed_bytes
 from roxy.health import checks as health_checks
 from roxy.health import store as health_store
 from roxy.health.report import LLM_INSTRUCTIONS, UNTRUSTED_MAX_CHARS, escape_untrusted
@@ -2157,14 +2157,15 @@ class _Build:
         billing_day = int(self.snap["rotator_billing_day"])
         start, end = egress_state.billing_cycle(self.now, billing_day)
         today = day_start_for(self.now)
-        rotator = reasons.Egress.ROTATOR.value
 
-        def read(conn: Any) -> tuple[int, list[int], int, dict[str, int]]:
-            used = usage_since(conn, rotator, start)
+        def read(conn: Any) -> tuple[list[int], dict[str, int]]:
             trailing = read_upstream.rotator_daily_bytes(conn, today - egress_state.TRAILING_DAYS * 86_400, today)
-            return used, trailing, usage_since(conn, rotator, today), queries.egress_bytes(conn, self.win)
+            return trailing, queries.egress_bytes(conn, self.win)
 
-        used, trailing, today_bytes, window_bytes = await self.metrics(read)
+        trailing, window_bytes = await self.metrics(read)
+        # The budget's own count, as the Egress page and the hard stop read it (finding data-4): a statistics reset
+        # of the usage rows never makes the export report less than the stop counts.
+        used, today_bytes = await read_billed_bytes(self.dbs, start, today)
         projection = egress_state.project_cycle(
             cycle_start=start, cycle_end=end, now_s=self.now, used_bytes=used, trailing=trailing
         )

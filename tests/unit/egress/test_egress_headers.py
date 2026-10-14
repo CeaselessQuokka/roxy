@@ -26,10 +26,10 @@ from roxy.egress.headers import (
     FORWARDED_CALLER_HEADERS,
     ROTATOR_PROFILES,
     HeaderProfiles,
-    forwardable_caller_headers,
     merge_outbound,
     profile_for_session,
 )
+from roxy.proxy.scrub import forwarded_request_headers
 
 
 def test_direct_and_credential_headers_are_api_shaped(settings: Any) -> None:
@@ -81,12 +81,16 @@ def test_inbound_allowlist() -> None:
         "Authorization": "Bearer z",
         "X-Custom": "1",
     }
-    assert forwardable_caller_headers(caller, has_body=True) == {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+    # One implementation of the allowlist (`proxy/scrub.py`), shared by the cache key and the upstream call (finding
+    # pipe-1: the egress layer's own copy was unused and differed).
+    lowered = {name.lower(): value for name, value in caller.items()}
+    assert forwarded_request_headers("POST", lowered, b"{}") == {
+        "content-type": "application/json",
+        "accept": "application/json",
+        "content-length": "2",
     }
-    assert forwardable_caller_headers(caller, has_body=False) == {"Accept": "application/json"}
-    assert forwardable_caller_headers({"Accept": "text/html"}, has_body=False) == {}
+    assert forwarded_request_headers("GET", lowered, b"") == {"accept": "application/json"}
+    assert forwarded_request_headers("GET", {"accept": "text/html"}, b"") == {}
     assert FORWARDED_CALLER_HEADERS == ("content-type", "accept")
 
 

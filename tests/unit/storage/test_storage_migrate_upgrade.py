@@ -3,15 +3,17 @@
 What this is
     Tests that migrate a temporary state to the schema of an earlier release (metrics.db at version 1 for the wave 2
     release, commit 2db0f16, at version 4 for the wave 3b release, commit bb96d16, at version 6 for the review
-    round 3 tree, at version 7 for the P11 checkpoint, commit 94ca1c3, or at version 8 for the P11 gaps round; every
-    other database at its current version), fill it with rows the way that release wrote them, then run this
-    release's `--expand` and check: only the newer metrics migrations run (2 `insight_history`, 3 `health_details`,
-    4 `annotation_range`, 5 `producer_history`, 6 `annotation_scope`, 7 `limit_samples`, 8 `user_agent_detail`,
-    9 `dashboard_read_indexes`), every old row survives with sensible defaults in the new columns, the earlier
-    release's own statements still work on the upgraded file (so the old color keeps running during a deploy), this
+    round 3 tree, at version 7 for the P11 checkpoint, commit 94ca1c3, at version 8 for the P11 gaps round, or at
+    version 9 for the P11 review round, commit 84ab636; every other database at its current version), fill it with
+    rows the way that release wrote them, then run this release's `--expand` and check: only the newer metrics
+    migrations run (2 `insight_history`, 3 `health_details`, 4 `annotation_range`, 5 `producer_history`, 6
+    `annotation_scope`, 7 `limit_samples`, 8 `user_agent_detail`, 9 `dashboard_read_indexes`, 10 `roblox_answers`),
+    every old row survives with sensible defaults in the new columns, the earlier release's own statements still work
+    on the upgraded file (so the old color keeps running during a deploy, its rollup compaction included), this
     release's writers and readers work on it (the schema 5 producer tables, the schema 6 reset scope, the schema 7
-    sample rates and refusal samples, the schema 8 User-Agent drill-down and the schema 9 event and client indexes
-    included, which index the rows the earlier release wrote), and `check_schema` passes.
+    sample rates and refusal samples, the schema 8 User-Agent drill-down, the schema 9 event and client indexes,
+    which index the rows the earlier release wrote, and the schema 10 Roblox answers included), and `check_schema`
+    passes.
 
 Why it exists
     Plan 17.4: `deploy.sh` migrates (expand) BEFORE it switches colors, so for a while the old color runs on the new
@@ -26,7 +28,7 @@ How it works
 
 What to read next
     `roxy/storage/migrate.py`, then `roxy/storage/migrations/metrics/0002_insight_history.sql` up to
-    `0009_dashboard_read_indexes.sql`.
+    `0010_roblox_answers.sql`.
 """
 
 from __future__ import annotations
@@ -57,6 +59,7 @@ NEWER_MIGRATIONS: dict[int, list[str]] = {
         "limit_samples",
         "user_agent_detail",
         "dashboard_read_indexes",
+        "roblox_answers",
     ],
     4: [  # wave 3b (bb96d16)
         "producer_history",
@@ -64,11 +67,16 @@ NEWER_MIGRATIONS: dict[int, list[str]] = {
         "limit_samples",
         "user_agent_detail",
         "dashboard_read_indexes",
+        "roblox_answers",
     ],
-    6: ["limit_samples", "user_agent_detail", "dashboard_read_indexes"],  # review round 3 (before round 4)
-    7: ["user_agent_detail", "dashboard_read_indexes"],  # the P11 checkpoint (94ca1c3)
-    8: ["dashboard_read_indexes"],  # the P11 gaps round (schema 8, the User-Agent drill-down)
+    6: ["limit_samples", "user_agent_detail", "dashboard_read_indexes", "roblox_answers"],  # review round 3
+    7: ["user_agent_detail", "dashboard_read_indexes", "roblox_answers"],  # the P11 checkpoint (94ca1c3)
+    8: ["dashboard_read_indexes", "roblox_answers"],  # the P11 gaps round (schema 8, the User-Agent drill-down)
+    9: ["roblox_answers"],  # the P11 review round (84ab636, schema 9, the dashboard read indexes)
 }
+
+ANSWER_TABLES = {"roblox_answer_minute", "roblox_answer_hour", "roblox_answer_day", "roblox_answer_month"}
+"""The tables of `0010_roblox_answers.sql` (lead decision 11: Roblox's answers per attempt)."""
 """metrics.db schema version of an earlier release -> the migrations this release adds on top of it, in order."""
 
 OLD_UA_HASH = row_hash("Roblox/WinInet")
@@ -267,6 +275,7 @@ def test_old_rows_survive_and_new_columns_have_defaults(previous_state: Any) -> 
     )
     assert set(seen["tables"]) >= PRODUCER_TABLES
     assert "refusal_samples" in seen["tables"]  # schema 7
+    assert set(seen["tables"]) >= ANSWER_TABLES  # schema 10, empty: no backfill (the read models say since when)
     assert seen["jobs"] == (["llm_export_file"] if version >= 4 else [])
     sample = dbs.metrics.read_sync(
         lambda conn: dict(conn.execute("SELECT at_ms, sample_pct FROM request_samples WHERE at_ms = 1").fetchone())
@@ -330,6 +339,31 @@ def test_previous_release_statements_still_work_after_the_upgrade(previous_state
         ).fetchall()
     )
     assert sorted(tuple(row) for row in old_split) == [("throttle", "default", 8), ("upstream_5xx", "", 2)]
+    # Schema 10: the old color's leader recomputes a rollup hour with DELETE plus INSERT of the columns it knows; the
+    # Roblox answers live in tables of their own, so its compaction can never wipe them.
+    from roxy.metrics.recorder import HistoryItem, write_history
+
+    answer = HistoryItem("roblox_answer_minute", (1_700_000_040, "t/x", "games.roblox.com", "direct"), (2, 0, 1, 1))
+    dbs.metrics.write_sync(lambda conn: write_history(conn, [answer]))
+
+    def old_compaction(conn: sqlite3.Connection) -> None:
+        conn.execute("DELETE FROM rollup_hour WHERE bucket_start = ?", (1_699_999_200,))
+        conn.execute(
+            "INSERT INTO rollup_hour (bucket_start, dim_hash, requests, caller_bytes_in, caller_bytes_out, "
+            "upstream_calls, upstream_bytes_in, upstream_bytes_out, errors) SELECT ?, dim_hash, sum(requests), "
+            "sum(caller_bytes_in), sum(caller_bytes_out), sum(upstream_calls), sum(upstream_bytes_in), "
+            "sum(upstream_bytes_out), sum(errors) FROM rollup_minute WHERE bucket_start >= ? AND bucket_start < ? "
+            "GROUP BY dim_hash",
+            (1_699_999_200, 1_699_999_200, 1_700_002_800),
+        )
+
+    dbs.metrics.write_sync(old_compaction)
+    kept = dbs.metrics.read_sync(
+        lambda conn: tuple(
+            conn.execute("SELECT answers_2xx, answers_4xx, answers_5xx FROM roblox_answer_minute").fetchone()
+        )
+    )
+    assert kept == (2, 1, 1)
 
 
 def test_this_releases_writers_and_readers_work_on_the_upgraded_file(previous_state: Any) -> None:
@@ -415,3 +449,14 @@ def test_this_releases_writers_and_readers_work_on_the_upgraded_file(previous_st
     assert found["place"] == [{"reason": "throttle", "count": 4, "last_ms": 1_700_000_060_000}]
     assert [row["place"] for row in found["live"]] == ["9100001"]
     assert found["peers"] == {"9100001": 1}
+
+    # Schema 10: this release's Roblox answers (two workers' flushes of one minute add up) are what the tiles read;
+    # the caller's own statuses stay in the rollups.
+    from roxy.metrics.recorder import HistoryItem, write_history
+
+    key = (1_700_000_040, "games.roblox.com/v1/games", "games.roblox.com", "direct")
+    dbs.metrics.write_sync(lambda conn: write_history(conn, [HistoryItem("roblox_answer_minute", key, (3, 0, 1, 0))]))
+    dbs.metrics.write_sync(lambda conn: write_history(conn, [HistoryItem("roblox_answer_minute", key, (1, 0, 0, 2))]))
+    window = queries.Window(1_699_999_980, 1_700_000_100, "minute", "UTC")
+    totals = dbs.metrics.read_sync(lambda conn: queries.totals_sync(conn, window))
+    assert (totals["status_2xx"], totals["status_4xx"], totals["roblox_5xx"]) == (4, 1, 2)

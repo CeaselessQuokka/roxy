@@ -45,8 +45,17 @@ from typing import Final
 GCRA_SLACK_MS: Final = 1
 """Rounding slack of the admit test (see the module docstring)."""
 
-MEMORY_ROWS_MAX: Final = 50_000
-"""Bound of the per-worker degraded-mode table (plan P9); the least recently used row is evicted first."""
+MEMORY_ROWS_MAX: Final = 6_000
+"""Bound of each per-worker degraded-mode table (plan P9); the least recently used row is evicted first.
+
+Sized for the 909 MB box (DESIGN 0, finding abuse-14): the pipeline keeps two of these tables (limiter rows and
+strike rows), each entry a `DegradedEntry` with its row and its seed, about 380 bytes by tracemalloc, so both full
+take about 4.4 MiB a worker (8.8 MiB a color with ROXY_WORKERS=2), inside the per-worker headroom the memory plan
+leaves. 50,000 took about 37 MiB a worker. The limiter table holds about two rows per client (the flood and the
+per-IP rows), so about 3,000 clients a worker keep their degraded rows. An evicted client is no worse off than a new
+one: its next request reads the shared row from hot.db again and gets this worker's share on top of it, and what it
+had counted here is not merged back after the outage (a bounded over-admission during a flood from thousands of
+addresses at once, never a refusal of a legitimate caller)."""
 
 _EPSILON: Final = 1e-9  # floating point guard for floor() of a ratio that should be an exact integer
 

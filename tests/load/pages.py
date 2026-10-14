@@ -972,7 +972,7 @@ class PageClient:
 
 def admin_headers(env: Mapping[str, str]) -> dict[str, str]:
     """What a browser on the dashboard sends besides the cookie (the same as `fleet.AdminProbe`'s sign-in)."""
-    from roxy.admin.auth.testing import TEST_UA
+    from auth_harness import TEST_UA
 
     return {"Origin": env["ROXY_SITE_ORIGIN"], "Sec-Fetch-Site": "same-origin", "User-Agent": TEST_UA}
 

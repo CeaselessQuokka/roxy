@@ -15,9 +15,10 @@ Why it exists
     Plan 18.4: D1 moves the credential off caller traffic, so before the cutover the owner should see which
     endpoints behave the same without it. Templates that differ or fail are the D1 allowlist decision (each with
     its `cache_private` choice). The owner has decided D1 = never send the credential for callers (empty
-    allowlist; only Roxy's own probes use it), so the 7-day shadow week was not run before the cutover (LEAD_NOTES
-    decision 8, DECISIONS_REVIEW.md). The script stays so the comparison can be made at any time later, from either
-    producer, and so the cutover documents say exactly what was and was not measured.
+    allowlist; only Roxy's own probes use it), so the 7-day shadow week was not run before the cutover
+    (DECISIONS_REVIEW.md, decision D1; CHANGES.md, "Hotfix shadow mode"). The script stays so the comparison can
+    be made at any time later, from either producer, and so the cutover documents say exactly what was and was not
+    measured.
 
 How it works
     Two producers, both optional:
@@ -350,7 +351,8 @@ NO_SHADOW_WEEK: Final = (
     "No shadow week ran. Plan 18.4 asks for a 7-day comparison before the cutover so that the owner can decide "
     "which endpoints, if any, should keep the credential (decision D1). The owner decided that ahead of time: "
     "D1 = never send the credential for callers. The credential allowlist ships empty and only Roxy's own probes "
-    "use the credential, so no endpoint waited on this measurement (LEAD_NOTES decision 8, DECISIONS_REVIEW.md)."
+    "use the credential, so no endpoint waited on this measurement (DECISIONS_REVIEW.md, decision D1; CHANGES.md, "
+    '"Hotfix shadow mode").'
 )
 
 WOULD_CONTAIN: Final = (

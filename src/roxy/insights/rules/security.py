@@ -31,7 +31,7 @@ from typing import Any, Final
 from roxy.config import catalog
 from roxy.insights.context import InsightContext
 from roxy.insights.models import Evidence, ProposedChange, Recommendation, iso
-from roxy.insights.rules.abuse import BYPASS_EXPIRY_S, access_match, bypass_rows
+from roxy.insights.rules.abuse import BYPASS_EXPIRY_S, access_match, bypass_rows, bypass_skips
 from roxy.insights.rules.base import Rule, register
 
 DAY_S: Final = 86_400
@@ -177,8 +177,10 @@ class SecAdminAllowlist(Rule):
 class SecBypassForever(Rule):
     """A bypass entry never expires.
 
-    Fires for every bypass entry without an expiry. A bypass entry lets an address skip the per-IP limit, the place
-    limit and the tarpit, so one forgotten after a load test is an unlimited client for anyone who gets that address.
+    Fires for every bypass entry without an expiry. A bypass entry lets an address skip the flood, emergency, per-IP
+    and place limits, the spam detectors, the browser challenge, the bot score block, User-Agent and endpoint rules
+    and the tarpit (`abuse.bypass_skips`), so one forgotten after a load test is an unlimited client for anyone who
+    gets that address.
     The change gives the entry an expiry 30 days from now (renew it if it is still needed then).
     """
 
@@ -213,8 +215,8 @@ class SecBypassForever(Rule):
             confidence="high",
             explanation=(
                 f"{cidr} ({row.get('note') or 'no note'}) has been on the bypass list since {iso(created)} with no "
-                f"expiry ({used}). Every request from it skips the per-IP limit, the place limit and the tarpit. The "
-                f"change sets it to expire on {iso(expires_at)}."
+                f"expiry ({used}). Every request from it skips {bypass_skips()}. The change sets it to expire on "
+                f"{iso(expires_at)}."
             ),
             evidence=evidence,
             changes=[

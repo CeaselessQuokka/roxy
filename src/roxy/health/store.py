@@ -493,7 +493,9 @@ def linked_recommendations(
     """For each check id, the newest open recommendation that fixes it (the 13.1 "Apply fix" button).
 
     A recommendation is linked when its rule is one of the check's related rules (`rules_by_check`, keyed by the
-    13.2 base id or the full id), or when it is a SYS-HEALTH-FAIL recommendation whose payload names the check.
+    13.2 base id or the full id), or when it is a SYS-HEALTH-FAIL recommendation whose subject IS the check id.
+    The subject is compared whole (final review brain-14): check ids share prefixes (`H-TLS` and `H-TLS-PUBLIC`), so a
+    substring test would offer one check's fix on another check's row.
     """
     wanted = [str(c) for c in check_ids]
     if not wanted:
@@ -518,8 +520,8 @@ def linked_recommendations(
             payload = _loads(row["payload_json"]) or {}
             rule_id = str(row["rule_id"])
             if rule_id == LINK_RULES_DEFAULT:
-                text = " ".join(str(payload.get(k, "")) for k in ("subject", "title", "fingerprint"))
-                if check_id not in text:
+                # SYS-HEALTH-FAIL's subject is the failing result's check id (`rules/system.py`): an exact match.
+                if str(payload.get("subject") or "") != check_id:
                     continue
             elif rule_id not in related:
                 continue

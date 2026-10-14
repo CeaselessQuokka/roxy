@@ -10,10 +10,15 @@ What this is
       internal_hidden   GET /internal/version on the TCP port is an immediate 404 from the app itself (internal
                         endpoints exist only on the socket; the path never reaches the proxy pipeline)
       proxy             a proxy request goes through the whole pipeline twice; the second answer carries a
-                        Roxy-Cache header (with --strict-cache it must be a cache hit)
+                        Roxy-Cache header (with --strict-cache it must be a cache hit). On a color that is paused
+                        or in throttle-all (an owner's choice, or a pause carried over from v1), Roxy's own pause
+                        (503) or throttle-all (429) refusal is the right answer: the check verifies it is that
+                        refusal and says so
       static            a content-hashed asset from the release's static manifest is 200 on the TCP port and, when
                         --nginx is given, 200 through nginx with Strict-Transport-Security
-    Each check prints one PASS, FAIL or SKIP line; the exit status is 1 when any check failed.
+    Each check prints one PASS, FAIL or SKIP line; the exit status is 1 when any check failed. A check fails
+    through `require` (an `if`, never an `assert`): `python -O` and PYTHONOPTIMIZE remove asserts, and a gate
+    that passes everything under them is worse than none (finding sec-7).
 
 Why it exists
     The health gate (/internal/ready) proves the workers started and the databases answer, but not that pages
@@ -103,20 +108,56 @@ def resolve_target(args: argparse.Namespace) -> Target:
     return Target(args.color, f"http://{bind}", socket_path, host, args.expect_version)
 
 
+class CheckFailed(Exception):
+    """The color failed a check (raised by `require`)."""
+
+
+def require(condition: bool, message: str) -> None:
+    """Fail the running check with `message` unless `condition` holds.
+
+    A plain `if`, never an `assert`: `python -O` and PYTHONOPTIMIZE strip asserts, and every check would then pass
+    a color answering 500 everywhere, so deploy.sh would switch traffic to it (finding sec-7).
+    """
+    if not condition:
+        raise CheckFailed(message)
+
+
 def check(name: str, fn: Callable[[], str]) -> Result:
-    """Run one check: a returned string is the PASS detail; AssertionError is FAIL; SkipCheck is SKIP."""
+    """Run one check: a returned string is the PASS detail; CheckFailed is FAIL; SkipCheck is SKIP."""
     try:
         return Result(name, "PASS", fn())
     except SkipCheck as exc:
         return Result(name, "SKIP", str(exc))
-    except AssertionError as exc:
-        return Result(name, "FAIL", str(exc) or "assertion failed")
+    except CheckFailed as exc:
+        return Result(name, "FAIL", str(exc) or "check failed")
     except httpx.HTTPError as exc:
+        return Result(name, "FAIL", f"{type(exc).__name__}: {exc}")
+    except ValueError as exc:  # a body that should be JSON is not (json.JSONDecodeError is a ValueError)
         return Result(name, "FAIL", f"{type(exc).__name__}: {exc}")
 
 
 class SkipCheck(Exception):
     """The check does not apply here (for example no static files yet)."""
+
+
+SWITCH_REFUSALS = {
+    # Roxy-Refusal value: (status, the header only that refusal carries, the /health key that reports the switch)
+    "paused": (503, "roxy-paused", "Paused"),
+    "throttle_all": (429, "roxy-global-throttled", "ThrottleAll"),
+}
+"""Roxy's own answers while an owner's switch is on (abuse/checks/pause.py and throttle_all.py)."""
+
+
+def switch_refusal(response: httpx.Response) -> str | None:
+    """`paused` or `throttle_all` when `response` is exactly Roxy's own refusal for that switch, else None."""
+    reason = (response.headers.get("roxy-refusal") or "").strip().lower()
+    expected = SWITCH_REFUSALS.get(reason)
+    if expected is None:
+        return None
+    status, marker, _ = expected
+    if response.status_code != status or (response.headers.get(marker) or "").strip().lower() != "true":
+        return None
+    return reason
 
 
 def static_asset(release_root: Path) -> str | None:
@@ -149,51 +190,100 @@ def run_checks(
 
         def internal_version() -> str:
             body = internal.get("/internal/version").raise_for_status().json()
+            require(isinstance(body, dict), "/internal/version did not answer a JSON object")
             version = body.get("Version")
             if target.expect_version is not None:
-                assert version == target.expect_version, f"version {version!r}, expected {target.expect_version!r}"
+                require(version == target.expect_version, f"version {version!r}, expected {target.expect_version!r}")
             color = body.get("Color")
-            assert color in (target.color, None), f"color {color!r}, expected {target.color!r}"
+            require(color in (target.color, None), f"color {color!r}, expected {target.color!r}")
             return f"version {version}, color {color}"
 
         def home() -> str:
             response = tcp.get("/")
-            assert response.status_code == 200, f"status {response.status_code}"
+            require(response.status_code == 200, f"status {response.status_code}")
             content_type = response.headers.get("content-type", "")
-            assert content_type.startswith("text/html"), f"content-type {content_type!r}"
+            require(content_type.startswith("text/html"), f"content-type {content_type!r}")
             return "200 text/html"
 
         def health() -> str:
             response = tcp.get("/health")
-            assert response.status_code == 200, f"status {response.status_code}"
+            require(response.status_code == 200, f"status {response.status_code}")
             return "200"
 
         def admin_login() -> str:
             response = tcp.get("/admin")
-            assert response.status_code == 200, f"status {response.status_code}"
-            assert response.headers.get("content-type", "").startswith("text/html"), "not HTML"
+            require(response.status_code == 200, f"status {response.status_code}")
+            require(response.headers.get("content-type", "").startswith("text/html"), "not HTML")
             return "200 text/html"
 
         def internal_hidden() -> str:
             # A timeout here (httpx.ReadTimeout, a FAIL) or a Roxy-Refusal header means /internal reached the proxy
             # pipeline and its tarpit instead of the public app's own 404 (src/roxy/internal_app.py).
             response = tcp.get("/internal/version", timeout=INTERNAL_HIDDEN_TIMEOUT)
-            assert response.status_code == 404, f"status {response.status_code}; internal endpoints must be 404 on TCP"
+            require(
+                response.status_code == 404, f"status {response.status_code}; internal endpoints must be 404 on TCP"
+            )
             refusal = response.headers.get("roxy-refusal")
-            assert refusal is None, f"refused by the proxy pipeline ({refusal}); /internal must never reach it"
+            require(refusal is None, f"refused by the proxy pipeline ({refusal}); /internal must never reach it")
             return "404 on the TCP port"
+
+        def health_switches() -> dict[str, object]:
+            """The color's /health document (Paused, and ThrottleAll when this release reports it), or {}."""
+            try:
+                body = tcp.get("/health").json()
+            except (httpx.HTTPError, ValueError):
+                return {}
+            return body if isinstance(body, dict) else {}
+
+        def switch_answer(second: httpx.Response, before: dict[str, object]) -> str | None:
+            """The PASS detail when the answer is Roxy's own refusal for an owner's switch the color reports as on.
+
+            A paused color answers every proxy request with its own 503 pause refusal and a color in throttle-all
+            refuses the second request of an address with its own 429 (lead decision 1: an owner may pause on
+            purpose, and a v1 paused at copy time makes v2 start paused). Either one still proves the request went
+            through the proxy route and the abuse pipeline. /health must agree (read before and after the requests,
+            so a switch flipped in between still counts); it reports Paused, and ThrottleAll where the release has
+            it; without that key the refusal's own headers (Roxy-Refusal: throttle_all with
+            Roxy-Global-Throttled: True) are the evidence.
+            """
+            reason = switch_refusal(second)
+            if reason is None:
+                return None
+            _, marker, key = SWITCH_REFUSALS[reason]
+            readings = [before, health_switches()]
+            reported = [reading[key] for reading in readings if key in reading]
+            if key == "Paused" or reported:
+                require(
+                    any(value is True for value in reported),
+                    f"Roxy refused the proxy request as {reason} (status {second.status_code}), but /health does not "
+                    f"say {key}",
+                )
+                evidence = f"/health says {key}"
+            else:
+                evidence = f"{marker}: True (/health does not report throttle-all)"
+            what = "paused" if reason == "paused" else "in throttle-all"
+            return (
+                f"the color is {what} ({evidence}): Roxy's own {reason} refusal, status {second.status_code} with "
+                f"Roxy-Refusal: {reason}; the proxy route is mounted"
+            )
 
         def proxy() -> str:
             if not proxy_path:
                 raise SkipCheck("--skip-proxy")
+            before = health_switches()
             first = tcp.get(proxy_path)
             second = tcp.get(proxy_path)
+            switched = switch_answer(second, before)
+            if switched is not None:
+                return switched
             state = second.headers.get("roxy-cache")
-            assert state is not None, f"no Roxy-Cache header (status {second.status_code}); the proxy route is missing"
+            require(
+                state is not None, f"no Roxy-Cache header (status {second.status_code}); the proxy route is missing"
+            )
             internal_error = second.status_code == 500 and "roxy-upstream-status" not in second.headers
-            assert not internal_error, "status 500 from Roxy itself (no upstream status)"
+            require(not internal_error, "status 500 from Roxy itself (no upstream status)")
             if strict_cache:
-                assert state.upper() in CACHE_HITS, f"second request was {state}, expected a cache hit"
+                require(str(state).upper() in CACHE_HITS, f"second request was {state}, expected a cache hit")
             return f"first {first.status_code} {first.headers.get('roxy-cache')}, second {second.status_code} {state}"
 
         def static() -> str:
@@ -201,7 +291,7 @@ def run_checks(
             if url is None:
                 raise SkipCheck("no static files in this release")
             response = tcp.get(url)
-            assert response.status_code == 200, f"{url}: status {response.status_code} on the TCP port"
+            require(response.status_code == 200, f"{url}: status {response.status_code} on the TCP port")
             detail = f"{url} 200"
             if nginx:
                 with httpx.Client(timeout=TIMEOUT, trust_env=False, verify=verify) as client:
@@ -210,9 +300,9 @@ def run_checks(
                         headers={"Host": target.host},
                         extensions={"sni_hostname": target.host},
                     )
-                assert via.status_code == 200, f"{url}: status {via.status_code} through nginx"
+                require(via.status_code == 200, f"{url}: status {via.status_code} through nginx")
                 hsts = via.headers.get("strict-transport-security", "")
-                assert "max-age=" in hsts, f"{url}: no Strict-Transport-Security through nginx"
+                require("max-age=" in hsts, f"{url}: no Strict-Transport-Security through nginx")
                 detail += f"; through nginx 200 with HSTS ({hsts})"
             return detail
 

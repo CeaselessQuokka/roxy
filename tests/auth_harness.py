@@ -1,16 +1,21 @@
 """Test helpers for admin auth: a cheap hasher, test admin accounts, a recording mail transport, a software passkey.
 
 What this is
-    Small helpers the unit, security and end-to-end tests share: `fast_hasher()` (argon2id with tiny cost
-    parameters), `make_admin(...)` (an account with a known password, TOTP secret and recovery codes),
-    `RecordingTransport` (a mail transport that keeps messages in memory instead of sending them), and
-    `SoftwarePasskey` (a WebAuthn authenticator in pure Python that answers registration and login challenges).
+    Small helpers the unit, security, integration, multiprocess, load and end-to-end tests share (imported as
+    `auth_harness`: the root `tests/conftest.py` puts `tests/` on `sys.path`, like `pages_harness`):
+    `fast_hasher()` (argon2id with tiny cost parameters), `make_admin(...)` (an account with a known password, TOTP
+    secret and recovery codes), `RecordingTransport` (a mail transport that keeps messages in memory instead of
+    sending them), `SoftwarePasskey` (a WebAuthn authenticator in pure Python that answers registration and login
+    challenges), and `auth_harness(...)` (the real app with its lifespan, the fast hasher and recorded mail).
 
 Why it exists
-    Real argon2id costs 64 MiB and about 250 ms per hash; a test suite with hundreds of logins would take minutes
-    and gigabytes. Tests never talk to a mail server (plan 19.12), and no test machine has a fingerprint reader,
-    so passkeys need a stand-in that produces exactly what a browser would send. Nothing here weakens production:
-    production code never imports this module, and the software passkey can only sign with keys it made itself.
+    Real argon2id costs 19 MiB and tens of milliseconds per hash; a test suite with hundreds of logins would take
+    minutes. Tests never talk to a mail server (plan 19.12), and no test machine has a fingerprint reader, so
+    passkeys need a stand-in that produces exactly what a browser would send. It lives under `tests/`, not in the
+    `roxy` package, so it never ships (it was `roxy.admin.auth.testing` until the final review moved it here, lead
+    decision 8, finding ops-8): a fast hasher, test accounts and `ensure_auth_routes` have no place in a release.
+    Scripts that run a test module directly (`tests/multiprocess/gunicorn_mp_driver.py`) put `tests/` on
+    `sys.path` themselves; `python -m load.<scenario>` runs from `tests/`.
 
 How it works
     `SoftwarePasskey` holds one P-256 key pair. `register` builds a `none`-attestation answer (client data JSON,

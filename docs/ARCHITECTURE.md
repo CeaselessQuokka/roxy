@@ -74,7 +74,9 @@ Every worker serves two sockets:
 
 1. The TCP port nginx proxies to (`ROXY_BIND`, 8001 for blue and 8002 for green). With `reuse_port` each worker
    opens its own listener, so the kernel spreads connections evenly instead of handing almost all of them to the
-   worker that went idle last.
+   worker that went idle last. The master also opens one listener of the same group when it starts and hands it to
+   every worker: a worker's own listener closes when it recycles, and without the master's the port would refuse
+   connections for the seconds in which both workers restart at once (a final review finding, memory-4).
 2. The internal Unix socket `/run/roxy-<color>/internal.sock` (mode 0660, group `roxy`). The master creates it
    once and hands it to every worker. It serves `GET /internal/version`, `GET /internal/ready` and
    `POST /internal/flush` from `src/roxy/internal_app.py`, plus the few routes the operator CLI `scripts/ctl.py`
@@ -351,8 +353,8 @@ picture, including the first setup.
 ## Memory sizing for the 1 GB server
 
 The production server has 909 MB of RAM and no swap, while the plan was sized for 2 GB. Everything that can grow
-is bounded by a setting or a constant, and the sizes were scaled down (DESIGN.md section 0, `CHANGES.md`
-"Memory sizing for the 1 GB server").
+is bounded by a setting or a constant, and the sizes were scaled down (`CHANGES.md`, "Memory sizing for the 1 GB
+server").
 
 ### What one worker may hold
 
@@ -367,6 +369,8 @@ is bounded by a setting or a constant, and the sizes were scaled down (DESIGN.md
 | Metrics queue | `metrics_queue_max` items (50,000) | settings catalog |
 | Background log queue | 10,000 lines or 4 MiB | `roxy.core.logging.LOG_QUEUE_MAX_LINES`, `roxy.core.logging.LOG_QUEUE_MAX_BYTES` |
 | Upstream wait queue | `queue_max_length` (500) waiters | settings catalog |
+| Password hashing | one argon2id hash of 19 MiB at a time, 4 more waiting (2 places kept for trusted callers) | `roxy.admin.auth.passwords.HASH_CONCURRENCY`, `roxy.admin.auth.passwords.ARGON2_MEMORY_KIB` |
+| Degraded-mode limiter rows (only while hot.db cannot be written, plan C7) | 6,000 entries per store, about 4.4 MiB when both are full | `roxy.abuse.limiter.MEMORY_ROWS_MAX` |
 
 The page caches add up to at most 30 MiB per worker, and only fill as pages are read. The Python heap, the
 libraries, the HTTP connection pools and the recorder's counters are the remaining part; they have not been
@@ -385,7 +389,9 @@ systemd caps each color (`deploy/systemd/roxy@.service`):
 
 - `MemoryHigh=420M`: above this the kernel reclaims the color's memory aggressively and slows it down. A healthy
   color stays under it at any request rate measured.
-- `MemoryMax=500M`: the hard limit; above it the color's processes are killed and systemd restarts the color.
+- `MemoryMax=500M`: the hard limit; above it the kernel kills the largest process of the color (a worker), and
+  because the unit sets `OOMPolicy=continue` the color keeps running: gunicorn starts a replacement worker while the
+  other one serves (systemd's default would stop and restart the whole color).
 
 During a deploy two colors run for a few minutes, but never two warm ones: the new color always starts fresh
 (about 155 MiB with one worker, 275 MiB with two) and the old one stops after the watch. A warm color at
@@ -422,9 +428,9 @@ net, not as capacity.
 | One settings catalog | Every setting is declared once with its type, range, help and risk; validation, the editor, `docs/SETTINGS.md` and the LLM export come from it (plan principle P3). | `src/roxy/config/catalog.py` |
 | Internal endpoints on a Unix socket | The peer address proves nothing behind nginx; a socket that only the `roxy` group can open does. | `src/roxy/internal_app.py` |
 | Credential confinement in layers | Each layer (separate clients, `trust_env=False`, the leak guard transport, cookie jars that refuse cookies) holds on its own (C2). | `src/roxy/egress/` |
-| CPU-heavy work off the event loop | One 250 ms argon2 hash on the loop would freeze every request of the worker. | `src/roxy/admin/auth/passwords.py` |
+| CPU-heavy work off the event loop | One argon2 hash (19 MiB; tens of milliseconds on the development machine, an estimated 100 ms on the server) on the loop would freeze every request of the worker for that long. | `src/roxy/admin/auth/passwords.py` |
 | Logs written by a thread | A paused journald must never freeze a worker; the queue is bounded and drops are counted. | `src/roxy/core/logging.py` |
-| One TCP listener per worker (`reuse_port`) | With one shared socket nearly all connections went to one worker; the kernel now spreads them. | `deploy/gunicorn.conf.py` |
+| One TCP listener per worker (`reuse_port`), plus one in the master | With one shared socket nearly all connections went to one worker; the kernel now spreads them. The master holds one more listener of the same group and hands it to every worker, so the port is never without a listener while both workers recycle (a new connection waits in that queue for the next worker instead of being refused). | `deploy/gunicorn.conf.py` |
 | Server-side admin sessions | Logout, revocation and the kill switch delete rows; a copied database holds only hashes. | `src/roxy/admin/auth/sessions.py` |
 
 ## Where to go next

@@ -28,12 +28,13 @@ How it works
     Roxy (OPTIONS)", as the `served_upstream` help promises. Roblox 429s always come from the `upstream_429` log,
     counted once per upstream attempt, never from caller status codes. "Who returned it?" reads the source through
     `queries.ANSWER_SOURCE_SQL`: a Roblox 5xx passed on after the retries (`upstream_5xx`) carries Roblox's status
-    and Roxy's text, so it counts as Roblox's (`relay`), in the table, the source series and the `roblox_5xx` and
-    `roxy_5xx` tiles alike (finding parity-1). A series' reset notices name only resets of the data it reads
-    (`queries.reset_touches`, plan 6.8). Tables page and sort on the server and export as CSV or JSON through the
-    shared `export_table` (audited, formula guarded). Each answer is built by a plain function over the worker
-    context (`requests_answer`, `status_answer`, `status_sources_answer`, ...), which the Traffic dashboard page
-    calls too, so the page and the API can never show different numbers.
+    and Roxy's text, so it counts as Roblox's (`relay`) in the table and the source series, and never in the
+    `roxy_5xx` tile (finding parity-1). The `roblox_5xx` tile counts every 5xx Roblox answered Roxy's calls for
+    callers, per attempt, retries included (lead decision 11, finding v1parity-1; metrics 0010). A series' reset
+    notices name only resets of the data it reads (`queries.reset_touches`, plan 6.8). Tables page and sort on the
+    server and export as CSV or JSON through the shared `export_table` (audited, formula guarded). Each answer is
+    built by a plain function over the worker context (`requests_answer`, `status_answer`, `status_sources_answer`,
+    ...), which the Traffic dashboard page calls too, so the page and the API can never show different numbers.
 
 What to read next
     `roxy/admin/api/common.py`, `roxy/metrics/queries.py`, `roxy/admin/api/endpoints.py`.
@@ -101,7 +102,10 @@ ANSWERED_LOCALLY_HELP: Final = (
 """The line of requests no outcome measure counts: `requests` minus the four measures, bucket by bucket. The four
 partition every rollup row but those recorded `served_upstream` with reason `options_local`, so this is exactly the
 OPTIONS requests Roxy answered itself (shown only when the range or its comparison has any)."""
-STATUS_METRICS: Final[tuple[str, ...]] = ("status_2xx", "status_4xx", "status_5xx", "roxy_429", "roblox_429")
+STATUS_METRICS: Final[tuple[str, ...]] = ("caller_2xx", "caller_4xx", "status_5xx", "roxy_429", "roblox_429")
+"""The status chart: the answers callers got (`caller_2xx`, `caller_4xx`, `status_5xx`) and the two 429 sources.
+`status_2xx` and `status_4xx` count Roblox's answers per attempt since lead decision 11 (finding v1parity-1) and are
+unknown for a group by method, so the caller series keep their own keys."""
 LATENCY_METRICS: Final[tuple[str, ...]] = ("p50_ms", "p95_ms", "p99_ms", "queue_wait_p95_ms")
 HEATMAP_METRICS: Final[tuple[str, ...]] = ("requests", "demand", "upstream_calls", "served_cache", "refused", "failed")
 SPLITS: Final[dict[str, str]] = {
@@ -155,8 +159,8 @@ VERB_COLUMNS: Final[tuple[Column, ...]] = (
     Column("served_cache", "Served from cache", METRICS["served_cache"].description, "requests"),
     Column("refused", "Refused", METRICS["refused"].description, "requests"),
     Column("failed", "Failed", METRICS["failed"].description, "requests"),
-    Column("status_2xx", "2xx", "Successful answers sent to callers.", "requests"),
-    Column("status_4xx", "4xx", "Client error answers sent to callers.", "requests"),
+    Column("caller_2xx", "2xx", "Successful answers sent to callers.", "requests"),
+    Column("caller_4xx", "4xx", "Client error answers sent to callers.", "requests"),
     Column("status_5xx", "5xx", "Server error answers sent to callers.", "requests"),
     Column("p95_ms", "p95", METRICS["p95_ms"].description, "ms"),
 )
@@ -461,7 +465,8 @@ async def traffic_status_sources(
     """Status codes by who produced them (rows 68, 132), with v1's four tiles and the 429 verdict.
 
     The table and the tiles read one definition of "who": a Roblox 5xx passed on after the retries is Roblox's
-    (`relay` in the table, counted by `roblox_5xx`), and `roxy_5xx` ("Our own failures") counts only Roxy's own.
+    (`relay` in the table), and `roxy_5xx` ("Our own failures") counts only Roxy's own. The `roblox_5xx` tile counts
+    Roblox's 5xx answers per attempt, retries included (lead decision 11).
     """
     ctx = get_ctx(request)
     rows, totals = await status_source_rows(ctx, tr)

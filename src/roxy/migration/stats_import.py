@@ -26,6 +26,9 @@ How it works
     - Probe summaries: `events` rows of type `v1_probe_summary`, found again on a rerun by an `import_key` in
       `detail_json`. v1 kept only the last time per reason; the first time comes from v1's recent probe list when
       that reason is still in it.
+    - Damaged numbers (`roxy/migration/times.py`): a time that is not finite, not positive or more than a day
+      ahead of the run counts as missing, and a count is clamped, so NaN, infinity, a huge value or a wrong clock
+      in v1's file never stops the step or sorts a row first for years (lead decision 4, finding ops-5).
 
 What to read next
     `roxy/storage/migrations/metrics/0001_initial.sql` (the tables) and REMAKE_PLAN.md sections 6.2 and 11.6.
@@ -35,7 +38,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import sqlite3
 from collections.abc import Callable, Mapping
@@ -52,6 +54,7 @@ from roxy.metrics.fingerprints import (
     row_hash,
 )
 from roxy.migration.report import MigrationReport
+from roxy.migration.times import MAX_COUNT, bounded_count, plausible_epoch
 from roxy.storage.db import Database
 
 LEGACY_PREFIX: Final = "v1."
@@ -72,20 +75,13 @@ _IP_LINE = re.compile(r"(?m)^(IP:\s*).*$")
 
 
 def _num(value: Any) -> int:
-    """A non-negative whole number from a v1 counter (anything else counts as 0)."""
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return max(0, value)
-    if isinstance(value, float) and math.isfinite(value):
-        return max(0, int(value))
-    return 0
+    """A non-negative whole number from a v1 counter, at most `times.MAX_COUNT` (anything else counts as 0)."""
+    return bounded_count(value)
 
 
-def _epoch(value: Any) -> int | None:
-    if isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
-        return int(value)
-    return None
+def _epoch(value: Any, now: int) -> int | None:
+    """A plausible v1 time at `now` (finite, positive, at most a day ahead), else None (lead decision 4)."""
+    return plausible_epoch(value, now=now)
 
 
 def _counts(value: Any) -> dict[str, int]:
@@ -106,10 +102,10 @@ def _nested_counts(value: Any, fields: tuple[str, ...] | None = None) -> dict[st
     return out
 
 
-def build_legacy_totals(diagnostics: Mapping[str, Any], source: str) -> dict[str, dict[str, Any]]:
+def build_legacy_totals(diagnostics: Mapping[str, Any], source: str, *, now: int) -> dict[str, dict[str, Any]]:
     """The `legacy_totals` rows (key -> value object) for the v1 lifetime counters."""
     epochs_raw = diagnostics.get("ClearEpochs")
-    epochs = {str(k): _epoch(v) for k, v in epochs_raw.items()} if isinstance(epochs_raw, Mapping) else {}
+    epochs = {str(k): _epoch(v, now) for k, v in epochs_raw.items()} if isinstance(epochs_raw, Mapping) else {}
 
     def row(value: Any, label: str, store: str) -> dict[str, Any]:
         return {"value": value, "label": label, "since": epochs.get(store), "source": "roxy v1"}
@@ -244,8 +240,8 @@ def ua_hash(shown: str) -> str:
 
 
 def _times(record: Mapping[str, Any], now: int) -> tuple[int, int]:
-    first = _epoch(record.get("FirstSeen"))
-    last = _epoch(record.get("LastSeen")) or first or now
+    first = _epoch(record.get("FirstSeen"), now)
+    last = _epoch(record.get("LastSeen"), now) or first or now
     return (first or last), last
 
 
@@ -254,7 +250,7 @@ def _merge(target: dict[Any, list[int]], key: Any, count: int, first: int, last:
     if current is None:
         target[key] = [count, first, last]
     else:
-        current[0] += count
+        current[0] = min(current[0] + count, MAX_COUNT)  # SQLite INTEGER holds 64 bits; stay far below
         current[1] = min(current[1], first)
         current[2] = max(current[2], last)
 
@@ -343,7 +339,7 @@ def _probe_events(diagnostics: Mapping[str, Any], now: int) -> list[dict[str, An
     attempts = diagnostics.get("exploit_attempts")
     for attempt in attempts if isinstance(attempts, list) else ():
         if isinstance(attempt, Mapping):
-            when = _epoch(attempt.get("Date"))
+            when = _epoch(attempt.get("Date"), now)
             reason = str(attempt.get("Reason", ""))
             if when is not None and (reason not in firsts or when < firsts[reason]):
                 firsts[reason] = when
@@ -352,7 +348,7 @@ def _probe_events(diagnostics: Mapping[str, Any], now: int) -> list[dict[str, An
         if not isinstance(record, Mapping):
             continue
         reason = str(raw_reason)
-        last = _epoch(record.get("LastSeen")) or now
+        last = _epoch(record.get("LastSeen"), now) or now
         events.append(
             {
                 "at_ms": last * 1000,
@@ -396,7 +392,7 @@ async def import_statistics(
     from the v1 tree (on top of `redact_text`'s shape rules), so a token that ended up in an error message or a
     refusal reason in v1 never reaches metrics.db.
     """
-    totals = _deep(build_legacy_totals(diagnostics, source), clean)
+    totals = _deep(build_legacy_totals(diagnostics, source, now=now), clean)
     raw_headers, raw_values, raw_agents, skipped_values = _fingerprints(diagnostics, now)
     headers = {clean(name): numbers for name, numbers in raw_headers.items()}
     values: dict[str, tuple[str, str, list[int]]] = {}

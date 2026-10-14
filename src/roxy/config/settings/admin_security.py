@@ -182,8 +182,8 @@ SETTINGS: list[SettingSpec] = [
         max=3600,
         step=1,
         description=(
-            "Sensitive actions (replacing the Roblox credential, changing your password, managing passkeys, "
-            "factory reset, exporting all data) need a second factor entered within this many seconds. If your "
+            "Sensitive actions, such as replacing the Roblox credential, managing passkeys and recovery codes, the "
+            "factory reset or the full LLM export, need a second factor entered within this many seconds. If your "
             "last one is older, the dashboard asks for it again before going ahead."
         ),
         pages=_PAGES,
@@ -403,13 +403,15 @@ SETTINGS: list[SettingSpec] = [
         max=900,
         step=1,
         description=(
-            "How long an emailed login code stays valid after it is sent. Used only when emailed codes are allowed, "
-            "and for the one-time first login after the upgrade from v1."
+            "How long an emailed login code stays valid after it is sent, but never longer than "
+            "challenge_expiration (the time allowed between the password and the second factor): a code lives the "
+            "shorter of the two, 2 minutes at the defaults, and the login page counts that down. Used only when "
+            "emailed codes are allowed, and for the one-time first login after the upgrade from v1."
         ),
         pages=_PAGES,
         if_raised=(
-            "More time for slow email delivery, but a code that leaks (for example in a forwarded mail) can be used "
-            "for longer."
+            "More time for slow email delivery, up to challenge_expiration (raise that too for a longer window), "
+            "but a code that leaks (for example in a forwarded mail) can be used for longer."
         ),
         if_lowered="Codes expire sooner; slow email may arrive after its code is no longer valid.",
         risk=Risk.MEDIUM,
@@ -573,7 +575,7 @@ SETTINGS: list[SettingSpec] = [
             "When on, /admin (including the login page) answers only to networks on the admin allowlist; every "
             "other network gets a plain 404 Not Found, as if the dashboard did not exist. The list itself (address "
             "ranges in CIDR form: a base address, a slash, and how many leading bits must match) is edited on the "
-            "Security page. Add your networks before turning this on."
+            "Protection page, under Deny and allow lists. Add your networks before turning this on."
         ),
         pages=_PAGES,
         if_enabled=(

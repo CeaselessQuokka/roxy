@@ -85,7 +85,14 @@ export function specFromSeries(answer, options = {}) {
   const x = [...times].sort((a, b) => a - b);
   const position = new Map(x.map((t, i) => [t, i]));
   const perSeries = readJSON(options.seriesOptions, {}) || {};
-  const compareSeries = data.compare && Array.isArray(data.compare.series) ? data.compare.series : [];
+  const compareSeries = (data.compare && Array.isArray(data.compare.series) ? data.compare.series : [])
+    .filter((c) => c && typeof c === "object");
+  // The comparison period's values, bucket by bucket (both windows have the same number of buckets).
+  const aligned = (other) => {
+    if (!Array.isArray(other.points)) return null;
+    const sorted = other.points.filter((p) => Array.isArray(p)).sort((a, b) => a[0] - b[0]);
+    return x.map((_, j) => (sorted[j] && Number.isFinite(sorted[j][1]) ? sorted[j][1] : null));
+  };
   const series = list.map((s, i) => {
     const values = x.map(() => null);
     for (const p of (Array.isArray(s.points) ? s.points : []).slice(0, MAX_POINTS)) {
@@ -93,11 +100,7 @@ export function specFromSeries(answer, options = {}) {
     }
     const own = perSeries[s.key] || {};
     const other = compareSeries.find((c) => c.key === s.key);
-    let compare = null;
-    if (other && Array.isArray(other.points)) {
-      const sorted = other.points.filter((p) => Array.isArray(p)).sort((a, b) => a[0] - b[0]);
-      compare = x.map((_, j) => (sorted[j] && Number.isFinite(sorted[j][1]) ? sorted[j][1] : null));
-    }
+    const compare = other ? aligned(other) : null;
     return {
       label: String(own.label || s.label || s.key || `Series ${i + 1}`),
       values,
@@ -107,6 +110,15 @@ export function specFromSeries(answer, options = {}) {
       compare,
     };
   });
+  // A comparison series whose key no main series has (the Roblox 429s chart stacks the top endpoints and compares
+  // with the earlier period's total, `roblox_429:total`) is drawn as a dashed line of its own, never dropped
+  // without a word (finding docs_a-9). Keys of main series cut by MAX_SERIES are not "unmatched".
+  const mainKeys = new Set((Array.isArray(data.series) ? data.series : []).map((s) => s && s.key));
+  const compareOnly = compareSeries
+    .filter((c) => !mainKeys.has(c.key))
+    .slice(0, MAX_SERIES)
+    .map((c, k) => ({ label: String(c.label || c.key || `Comparison ${k + 1}`), values: aligned(c) }))
+    .filter((c) => c.values !== null);
   const first = list[0] || {};
   const axis = formatOf(first.unit, first.key);
   const notes = (Array.isArray(data.annotations) ? data.annotations : []).slice(0, MAX_NOTES).map((a) => ({
@@ -120,6 +132,7 @@ export function specFromSeries(answer, options = {}) {
   return {
     x,
     series,
+    compare_only: compareOnly,
     compare_label: COMPARE_LABELS[data.compare && data.compare.mode] || "Comparison",
     annotations: notes,
     notices: (Array.isArray(data.notices) ? data.notices : []).slice(0, 10).map(String),
@@ -307,6 +320,21 @@ class Chart {
     this.series.forEach((s, i) => {
       if (s.compare) this.compareIndex.push(i);
     });
+    // Comparison lines that belong to no main series (`specFromSeries`), after the matched ones in uPlot's order.
+    this.compareOnly = (Array.isArray(spec.compare_only) ? spec.compare_only : []).slice(0, MAX_SERIES).map((c, k) => ({
+      label: String(c.label || `Comparison ${k + 1}`),
+      values: Array.isArray(c.values) ? c.values : [],
+    }));
+  }
+
+  /** uPlot's index of the k-th comparison line that belongs to no main series. */
+  compareOnlyIndex(k) {
+    return this.series.length + 1 + this.compareIndex.length + k;
+  }
+
+  /** The words for a comparison line of its own: "All endpoints (Previous period)". */
+  compareOnlyLabel(c) {
+    return `${c.label} (${this.compareLabel})`;
   }
 
   options(colors) {
@@ -341,6 +369,17 @@ class Chart {
       series.push({
         label: `${s.label} (${this.compareLabel})`,
         stroke: withAlpha(colors.series[s.slot - 1], 0.75),
+        width: 1.5,
+        dash: [5, 4],
+        points: { show: false },
+        value: (u, v) => fmt(v),
+      });
+    }
+    for (const c of this.compareOnly) {
+      // A total of its own (not one series' color): the muted text color, dashed like every comparison.
+      series.push({
+        label: this.compareOnlyLabel(c),
+        stroke: colors.text,
         width: 1.5,
         dash: [5, 4],
         points: { show: false },
@@ -406,7 +445,12 @@ class Chart {
   }
 
   data() {
-    return [this.x, ...this.plotted, ...this.compareIndex.map((i) => this.series[i].compare)];
+    return [
+      this.x,
+      ...this.plotted,
+      ...this.compareIndex.map((i) => this.series[i].compare),
+      ...this.compareOnly.map((c) => c.values),
+    ];
   }
 
   build(keepScale = null) {
@@ -462,11 +506,14 @@ class Chart {
       this.legend.append(button);
       this.legendButtons.push(button);
     });
-    if (this.compareIndex.length) {
-      const first = this.series[this.compareIndex[0]];
+    if (this.compareIndex.length || this.compareOnly.length) {
+      // One button shows or hides every comparison line; a chart whose only comparison is a line of its own
+      // names it ("All endpoints (Previous period)").
+      const first = this.compareIndex.length ? this.series[this.compareIndex[0]] : null;
+      const only = !first && this.compareOnly.length === 1 ? this.compareOnly[0] : null;
       const button = el("button", { type: "button", class: "legend-item", "aria-pressed": "true", "data-series": "compare" }, [
-        el("span", { class: `swatch swatch--compare sw-${first.slot}`, "aria-hidden": "true" }),
-        el("span", { class: "legend-item__label", text: this.compareLabel }),
+        el("span", { class: first ? `swatch swatch--compare sw-${first.slot}` : "swatch swatch--compare", "aria-hidden": "true" }),
+        el("span", { class: "legend-item__label", text: only ? this.compareOnlyLabel(only) : this.compareLabel }),
       ]);
       button.addEventListener("click", () => this.toggle(button));
       this.legend.append(button);
@@ -478,6 +525,7 @@ class Chart {
     const which = button.dataset.series;
     if (which === "compare") {
       this.compareIndex.forEach((_, k) => this.u.setSeries(this.series.length + 1 + k, { show }));
+      this.compareOnly.forEach((_, k) => this.u.setSeries(this.compareOnlyIndex(k), { show }));
     } else {
       const i = Number(which);
       this.u.setSeries(i + 1, { show });
@@ -528,6 +576,13 @@ class Chart {
           el("span", { text: fmtValue(s.compare[idx], this.yFormat, this.yUnit) }),
         ]));
       }
+    });
+    this.compareOnly.forEach((c, k) => {
+      if (!u.series[this.compareOnlyIndex(k)].show) return;
+      rows.push(el("div", { class: "chart__tip-row" }, [
+        el("span", { class: "swatch swatch--compare" }), el("span", { text: this.compareOnlyLabel(c) }),
+        el("span", { text: fmtValue(c.values[idx], this.yFormat, this.yUnit) }),
+      ]));
     });
     this.tip.replaceChildren(...rows);
     this.tip.hidden = false;
@@ -608,6 +663,7 @@ class Chart {
       head.append(el("th", { scope: "col", class: "num", text: s.label }));
       if (s.compare) head.append(el("th", { scope: "col", class: "num", text: `${s.label} (${this.compareLabel})` }));
     });
+    for (const c of this.compareOnly) head.append(el("th", { scope: "col", class: "num", text: this.compareOnlyLabel(c) }));
     const body = el("tbody");
     for (let j = 0; j < this.x.length; j += step) {
       const row = el("tr", {}, [el("th", { scope: "row", text: fmtTime(this.x[j], { withDay: true }) })]);
@@ -615,6 +671,7 @@ class Chart {
         row.append(el("td", { class: "num", text: fmtValue(s.values[j], this.yFormat, this.yUnit) }));
         if (s.compare) row.append(el("td", { class: "num", text: fmtValue(s.compare[j], this.yFormat, this.yUnit) }));
       });
+      for (const c of this.compareOnly) row.append(el("td", { class: "num", text: fmtValue(c.values[j], this.yFormat, this.yUnit) }));
       body.append(row);
     }
     const caption = el("caption", { class: "sr-only", text: `${this.title}, data table` });

@@ -51,6 +51,7 @@ from roxy.config.audit import Actor
 from roxy.config.catalog import DASH_MESSAGE, EM_DASH, EN_DASH
 from roxy.config.constants import MAX_REASON_LENGTH, MAX_THROTTLE_TIERS
 from roxy.config.runtime import bump_config_version, read_config_version
+from roxy.config.secret_text import PASTE_REFUSED_MESSAGE, value_holds_secret
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.rules.models import (
     ACCESS_LIST_CAPS,
@@ -99,6 +100,19 @@ class RuleValidationError(RulesError, ValueError):
         self.errors = [dict(error) for error in errors]
         summary = "; ".join(f"{error['field']}: {error['message']}" for error in self.errors) or "invalid rule"
         super().__init__(table, summary)
+
+
+def secret_field_errors(model: Any, skip: frozenset[str] = frozenset(), prefix: str = "") -> list[dict[str, str]]:
+    """`{"field", "message"}` for every field of a validated rule input that holds a secret Roxy keeps or a Roblox
+    cookie (`config/secret_text.py`, review finding constraints-1): a rule's message reaches every refused caller,
+    and every text of a rule reaches the dashboard and its exports. Write paths only (create, update, the ladder):
+    `store.load_rows` never drops a stored row for it, so a ban or block cannot vanish when the registry learns a
+    value later. Fields in `skip` (an update's unchanged ones) are not judged again."""
+    return [
+        {"field": f"{prefix}{name}", "message": PASTE_REFUSED_MESSAGE}
+        for name, value in model.model_dump().items()
+        if name not in skip and value_holds_secret(value)
+    ]
 
 
 class RuleNotFound(RulesError, LookupError):
@@ -334,9 +348,13 @@ class RulesService:
         if not isinstance(data, Mapping):
             raise RuleValidationError(spec.name, [{"field": "rule", "message": "Expected an object"}])
         try:
-            return spec.input_model.model_validate(dict(data), context={"unchanged": unchanged})
+            model = spec.input_model.model_validate(dict(data), context={"unchanged": unchanged})
         except ValidationError as exc:
             raise RuleValidationError(spec.name, validation_errors(exc)) from None
+        secrets_found = secret_field_errors(model, unchanged)
+        if secrets_found:
+            raise RuleValidationError(spec.name, secrets_found)
+        return model
 
     def _creator(self, spec: RuleTable, actor: Actor) -> str:
         # Detectors act as Actor("system", "auto:<detector>"); bans record them as `auto:<detector>` (plan 6.2).
@@ -675,12 +693,18 @@ class RulesService:
                 continue
             data = {**raw, "position": index}
             try:
-                rows.append(to_columns(spec, ThrottleTierIn.model_validate(data)))
+                rung = ThrottleTierIn.model_validate(data)
             except ValidationError as exc:
                 errors += [
                     {"field": f"tiers.{index}.{error['field']}", "message": f"Rung {index}: {error['message']}"}
                     for error in validation_errors(exc)
                 ]
+                continue
+            found = secret_field_errors(rung, prefix=f"tiers.{index}.")
+            if found:
+                errors += [{**error, "message": f"Rung {index}: {error['message']}"} for error in found]
+                continue
+            rows.append(to_columns(spec, rung))
         if errors:
             raise RuleValidationError(table, errors)
         now = int(self._clock.now())

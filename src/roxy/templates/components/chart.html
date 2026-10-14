@@ -16,6 +16,7 @@
       {"x": [t0, t1, ...],
        "series": [{"label": "Requests in", "values": [...], "color": 1, "kind": "line|area|bars",
                    "stack": "group id or null", "compare": [...same length, optional...]}],
+       "compare_only": [{"label": "All endpoints", "values": [...same length...]}],   (optional)
        "compare_label": "Previous period",
        "annotations": [{"t": t, "iso": "2026-10-07T14:02:00Z", "when": "14:02", "kind": "config|incident",
                         "label": "cache_ttl_seconds 300 to 600", "href": "/admin/audit#..."}],
@@ -29,7 +30,9 @@
     13: `{range, series: [{key, label, unit, points: [[t, v]]}], compare: {mode, range, series} | null,
     annotations: [{at, kind, label, audit_id}], notices: [str]}`), and static/js/charts.js turns that answer into
     the spec above in the browser: points aligned on one time axis, the comparison drawn bucket by bucket as
-    dashed lines, annotations linking to their audit entry (`/admin/audit?entry=<id>`), the y format from the
+    dashed lines (a comparison series whose key no main series has, such as the Roblox 429s chart's earlier total
+    over its stacked endpoints, is a dashed line of its own: `compare_only`), annotations linking to their audit
+    entry (`/admin/audit?entry=<id>`), the y format from the
     series unit, and the `notices` (plan 6.8 partial data) listed under the chart. `kind` (line, area, bars) and
     `stack` (a group id) apply to every series; `series_options` maps a series key to its own `{color, kind,
     stack, label}`. `series` instead of `src` embeds the same answer for the first paint (no request at all).

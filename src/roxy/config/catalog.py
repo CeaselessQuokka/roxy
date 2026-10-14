@@ -25,9 +25,9 @@ How it works
        `scripts/style_words.txt` (when that file is present), and the defaults pass the cross-field rules.
        Problems raise `CatalogError` at import; in partial mode they are kept in `SELF_CHECK_PROBLEMS` and
        reported by the tests instead, so one unfinished module does not hide every other result.
-    Values are validated by type (`validate_value`), then by a few key-specific checks (time zone names, host
-    names, URLs), then together (`validate_cross`: every `*_min`/`*_max` pair, the AIMD and cooldown chains, and
-    the request deadline budget from plan 5.2).
+    Values are validated by type (`validate_value`), screened for pasted secrets (`config/secret_text.py`), then by
+    a few key-specific checks (time zone names, host names, URLs), then together (`validate_cross`: every
+    `*_min`/`*_max` pair, the AIMD and cooldown chains, and the request deadline budget from plan 5.2).
 
 What to read next
     `roxy/config/spec.py` (the field meanings), one group module such as `roxy/config/settings/cache.py`, then
@@ -56,6 +56,7 @@ from types import ModuleType
 from typing import Any, Final
 from urllib.parse import urlsplit
 
+from roxy.config.secret_text import PASTE_REFUSED_MESSAGE, value_holds_secret
 from roxy.config.spec import (
     GROUP_LABELS,
     Group,
@@ -302,20 +303,22 @@ SEVERITY_OPTIONS: Final[tuple[OptionSpec, ...]] = (
     OptionSpec(
         "info",
         "Info",
-        "Always report this rule's findings as info: they are listed on the Recommendations page but sit below "
-        "the default alert level (alert_min_severity = warn), so no alert is sent for them.",
+        "Always report this rule's findings as info: they are listed on the Recommendations page and in the bell, "
+        "below warn and critical findings.",
     ),
     OptionSpec(
         "warn",
         "Warn",
-        "Always report this rule's findings as warn (may need action soon); with the default alert settings each "
-        "new finding is also sent as an alert.",
+        "Always report this rule's findings as warn (may need action soon): listed above info findings on the "
+        "Recommendations page and in the bell. Roxy sends no alert for a recommendation; the daily digest counts "
+        "the open ones.",
     ),
     OptionSpec(
         "critical",
         "Critical",
-        "Always report this rule's findings as critical (urgent); they are alerted at every alert_min_severity "
-        "level, so use this only for rules you must never miss.",
+        "Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in "
+        "the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked "
+        "(or alert_min_severity at info, which also emails the daily digest).",
     ),
 )
 
@@ -404,8 +407,8 @@ def insight_rule_settings(
                 options=SEVERITY_OPTIONS,
                 description=(
                     f"The severity {rule.rule_id} recommendations are reported with. auto keeps the severity the "
-                    "rule computes from its evidence; the other values force one level, which also decides "
-                    "whether an alert is sent (compare alert_min_severity)."
+                    "rule computes from its evidence; the other values force one level, which orders the "
+                    "findings on the Recommendations page and in the bell (no alert is sent for a recommendation)."
                 ),
                 pages=(anchor,),
                 related_settings=(enabled_key, "alert_min_severity"),
@@ -904,12 +907,19 @@ def validate_spec_value(spec: SettingSpec, raw: Any) -> Any:
 
     Canonical forms: bool -> 0 or 1; int, duration, bytes -> int; float -> float; percent -> int when whole and
     the default is an int, else float; enum and string -> str; lists -> list (trimmed, deduplicated, CIDRs
-    normalized). Plain numbers for durations and sizes are in the setting's own unit.
+    normalized). Plain numbers for durations and sizes are in the setting's own unit. A value holding a secret Roxy
+    keeps or a Roblox cookie is refused (`config/secret_text.py`), here so that every writer (the API, an import, a
+    revert, the CLI) and every reload of a stored value applies the same rule.
     """
     validator = _TYPE_VALIDATORS.get(spec.type)
     if validator is None:
         raise _fail(spec, f"Unsupported setting type {spec.type!r}")
     value = validator(spec, raw)
+    if not spec.sensitive and value_holds_secret(value):
+        # Review finding constraints-1 (plan C4, 9.15): no setting holds a secret, and a text setting may reach
+        # every caller (the downtime message, the public site texts), the settings export and the history. Checked
+        # on the canonical value (bounded by the type's limits) before the key checks, whose messages quote input.
+        raise _fail(spec, PASTE_REFUSED_MESSAGE)
     for applies, check in _KEY_CHECKS:
         if applies(spec.key):
             value = check(spec, value)

@@ -10,7 +10,7 @@
 #   file, encrypts it with age when a recipients file exists, and stores the set in /var/backups/roxy/<date>/
 #   with a SHA256SUMS file. Then it prunes old sets (14 daily and 8 weekly are kept), once every 28 days restores
 #   the newest set into a temporary directory and checks it again, optionally copies the set off the box with
-#   rclone (D15), and writes /var/lib/roxy/audit/backup.json (0640 root:roxy) for health check H-BACKUP.
+#   rclone (D15; only an encrypted set: with a remote and no age recipient the run fails instead), and writes /var/lib/roxy/audit/backup.json (0640 root:roxy) for health check H-BACKUP.
 #
 # Why it exists
 #   v1 had no backups. One Lightsail disk is a single point of failure, and a bad migration or a mistaken bulk
@@ -363,10 +363,20 @@ restore_test() {
   [ "$ok" = true ]
 }
 
+# The optional off-box copy (D15). Only an encrypted set ever leaves the box: plan D15 says the off-box copy is
+# encrypted with age, and a bucket at a third party is where a copy gets stolen (finding sec-5). The set holds the
+# admin password hash, raw client addresses, the rules and the audit log, so with a remote and no recipients file
+# the copy is refused and the run fails (the OnFailure alert and the app's backup alert name the fix); the local set
+# was already made and kept.
 push_remote() {
   [ -n "$REMOTE" ] || return 0
   STEP="rclone push"
   local config="${CREDENTIALS_DIRECTORY:-/nonexistent}/rclone_config"
+  if [ "$SET_ENCRYPTED" != 1 ]; then
+    log "ROXY_BACKUP_REMOTE is set but the set is not encrypted: put an age recipient in $RECIPIENTS" \
+      "(ROXY_BACKUP_AGE_RECIPIENTS); no unencrypted copy leaves the box, so nothing was copied to $REMOTE"
+    return 1
+  fi
   [ -s "$config" ] || { log "ROXY_BACKUP_REMOTE is set but the rclone_config credential is empty"; return 1; }
   [[ "$REMOTE" =~ ^[A-Za-z0-9_-]+$ ]] || { log "ROXY_BACKUP_REMOTE must be a remote name only"; return 1; }
   "$RCLONE" --config "$config" copy "$SET_DIR" "$REMOTE:roxy-backups/$DATE"

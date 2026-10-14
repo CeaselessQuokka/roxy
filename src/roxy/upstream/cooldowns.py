@@ -21,6 +21,8 @@ How it works
       counts the streak. A 429 that arrives while the cooldown is still active (a request that was already in
       flight) never shortens it and does not grow the streak.
     - Keys: `endpoint:<template>:<egress>`, `host:<host>:<egress>`, `egress:<egress>` and `credential` (plan 6.2).
+      The template is in its pacing form (`upstream/pacing.py`: literal parts lowercased), because Roblox's routes
+      ignore letter case: `/V1/Games` is the same endpoint, inside the same cooldown, as `/v1/games`.
       `set_at` holds the wall clock seconds of the latest 429 (a float), which is the evidence used to escalate:
       when `cooldown_host_escalation_endpoints` (3) templates of one host cooled down within
       `cooldown_host_escalation_window_s` (60 s), the host cools down as a whole.
@@ -53,6 +55,7 @@ from typing import Any, Final
 from roxy.core.reasons import Egress
 from roxy.storage import leases
 from roxy.upstream.backoff import UniformSource
+from roxy.upstream.pacing import pacing_template
 
 CREDENTIAL_KEY: Final = "credential"
 """The fleet-wide credential cooldown row (plan 7.5: replaces v1's per-worker token drop)."""
@@ -68,6 +71,12 @@ _NUMBER = re.compile(r"\s*(\d+(?:\.\d+)?)")
 _DELAY_SECONDS = re.compile(r"\d+(?:\.\d+)?")
 _EPOCH_THRESHOLD_S: Final = 1_000_000_000
 """An `x-ratelimit-reset` above this is an absolute Unix time, not a number of seconds (some APIs send either)."""
+MAX_HEADER_WAIT_S: Final = 86_400.0
+"""What a `Retry-After` or `x-ratelimit-reset` too large for a float is read as (one day). Any run of digits parses,
+and 309 or more digits are infinity as a float: such a value becomes this finite "very long", so no infinite number
+is ever stored in the 429 log, sent in a JSON answer or turned into a Retry-After (review finding data-9). A finite
+value, however absurd, is kept as Roblox sent it (the 429 log shows it); a cooldown is clamped to `cooldown_max_s`
+(at most an hour) either way."""
 
 
 class CooldownSource(StrEnum):
@@ -83,7 +92,9 @@ class CooldownSource(StrEnum):
 
 
 def endpoint_key(template: str, egress: Egress | str) -> str:
-    return f"endpoint:{template}:{Egress(egress).value}"
+    """`endpoint:<template>:<egress>`, the template in its pacing form: a cooldown holds for the endpoint in every
+    letter case a caller may use (`upstream/pacing.py`, review finding pipe-2)."""
+    return f"endpoint:{pacing_template(template)}:{Egress(egress).value}"
 
 
 def host_key(host: str, egress: Egress | str) -> str:
@@ -108,6 +119,7 @@ def parse_retry_after(value: str | None, now_s: float) -> float | None:
 
     Returns None for a missing or unparseable value (garbage is ignored, never trusted as 0). A date in the past
     gives 0. Fractional seconds are accepted even though the RFC uses integers: being lenient costs nothing here.
+    More digits than a float holds read as `MAX_HEADER_WAIT_S`, never as infinity.
     """
     if value is None:
         return None
@@ -115,7 +127,7 @@ def parse_retry_after(value: str | None, now_s: float) -> float | None:
     if not text:
         return None
     if _DELAY_SECONDS.fullmatch(text):
-        return float(text)
+        return _finite_wait(float(text))
     try:
         when = email.utils.parsedate_to_datetime(text)
     except (TypeError, ValueError, IndexError, OverflowError):
@@ -124,14 +136,26 @@ def parse_retry_after(value: str | None, now_s: float) -> float | None:
         return None
     if when.tzinfo is None:
         when = when.replace(tzinfo=UTC)  # HTTP dates are always GMT
-    return max(0.0, when.timestamp() - now_s)
+    return max(0.0, when.timestamp() - now_s)  # dates end in year 9999: always finite
+
+
+def _finite_wait(seconds: float) -> float:
+    """A header's wait as a finite number: infinity (a run of digits too long for a float) is `MAX_HEADER_WAIT_S`."""
+    return seconds if math.isfinite(seconds) else MAX_HEADER_WAIT_S
 
 
 def _first_number(value: str | None) -> float | None:
+    """The first number of a header value (infinity when it has more digits than a float holds), or None."""
     if value is None:
         return None
     match = _NUMBER.match(value)
     return float(match.group(1)) if match else None
+
+
+def _finite(number: float | None) -> float | None:
+    """A count from a header, or None when it does not fit a float: a limit or remaining count of infinity is no
+    usable number, and an infinite value must never be stored or sent (review finding data-9)."""
+    return number if number is not None and math.isfinite(number) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,18 +179,19 @@ def parse_ratelimit_headers(headers: Mapping[str, str], now_s: float) -> RateLim
     """Read `x-ratelimit-limit`, `-remaining` and `-reset` (first number of each; any case). None if all absent.
 
     Values like `30, 30;w=60` (the IETF draft form) use their first number. A reset above 10^9 is an absolute Unix
-    time and is converted to seconds from now.
+    time and is converted to seconds from now. Every value is finite (review finding data-9): a limit or remaining
+    count too large for a float is None, and such a reset reads as `MAX_HEADER_WAIT_S`.
     """
     lower = {name.lower(): value for name, value in headers.items()}
-    limit = _first_number(lower.get("x-ratelimit-limit"))
-    remaining = _first_number(lower.get("x-ratelimit-remaining"))
+    limit_raw = _first_number(lower.get("x-ratelimit-limit"))
+    remaining_raw = _first_number(lower.get("x-ratelimit-remaining"))
     reset_raw = _first_number(lower.get("x-ratelimit-reset"))
-    if limit is None and remaining is None and reset_raw is None:
+    if limit_raw is None and remaining_raw is None and reset_raw is None:
         return None
     reset_s = None
     if reset_raw is not None:
-        reset_s = max(0.0, reset_raw - now_s) if reset_raw > _EPOCH_THRESHOLD_S else reset_raw
-    return RateLimitInfo(limit, remaining, reset_s)
+        reset_s = _finite_wait(max(0.0, reset_raw - now_s) if reset_raw > _EPOCH_THRESHOLD_S else reset_raw)
+    return RateLimitInfo(_finite(limit_raw), _finite(remaining_raw), reset_s)
 
 
 # --- the length of a cooldown ----------------------------------------------------------------------------------------
@@ -343,8 +368,9 @@ def _digest(value: str) -> str:
 
 
 def rotator_exit_prefix(template: str) -> str:
-    """The lease name prefix of the exits that returned 429 for `template` (hashed: templates may contain ':')."""
-    return f"{ROTATOR_EXIT_PREFIX}{_digest(template)}:"
+    """The lease name prefix of the exits that returned 429 for `template` (hashed: templates may contain ':'), in
+    the template's pacing form like every other endpoint key."""
+    return f"{ROTATOR_EXIT_PREFIX}{_digest(pacing_template(template))}:"
 
 
 def record_rotator_exit_429(conn: sqlite3.Connection, template: str, exit_id: str, now_ms: int, window_s: float) -> int:
@@ -446,6 +472,7 @@ def clear_all(conn: sqlite3.Connection) -> int:
 __all__ = [
     "CREDENTIAL_KEY",
     "JITTER_FRACTION",
+    "MAX_HEADER_WAIT_S",
     "MAX_LOCAL_COOLDOWNS",
     "ROTATOR_EXIT_HOLDER",
     "ROTATOR_EXIT_PREFIX",

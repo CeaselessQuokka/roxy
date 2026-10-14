@@ -37,7 +37,7 @@ import sqlite3
 from typing import Final
 
 from roxy.config.audit import Actor
-from roxy.rules.models import BanRow
+from roxy.rules.models import UA_HASH_LENGTH, BanRow
 from roxy.rules.service import RuleChange, RulesService
 from roxy.rules.store import RulesSnapshot
 from roxy.storage.db import Database, SharedStateUnavailable
@@ -50,13 +50,13 @@ REPEAT_WINDOW_S: Final = 30 * 86_400
 MAX_PENDING_HITS: Final = 10_000
 """Bound of the per-worker hit buffer (plan P9); beyond it new ban ids are counted as dropped."""
 
-UA_HASH_LENGTH: Final = 16
-
 
 def ua_hash(user_agent: str) -> str:
     """The name of a User-Agent in a `ua_hash` ban: SHA-256 of the exact UA text, first 16 hex characters.
 
-    Not keyed: a UA is not secret, and the dashboard must be able to compute the hash of a UA the admin pastes.
+    Not keyed: a UA is not secret, and the dashboard must be able to compute the hash of a UA the admin pastes. A
+    ban given the 32-character key the Security page shows for a User-Agent (the same SHA-256, longer) or a full
+    SHA-256 is stored as these 16 characters (`rules/models.py normalize_ua_hash`, finding abuse-3).
     """
     return hashlib.sha256(user_agent.encode("utf-8", "surrogateescape")).hexdigest()[:UA_HASH_LENGTH]
 

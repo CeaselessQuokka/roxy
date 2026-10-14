@@ -17,7 +17,8 @@ Why it exists
       2. Over the global cap the attempt is slowed (`admin_login_global_delay_s`), never refused; the first
          attempt over the cap writes an audit row and raises the `login_global` alert.
       3. argon2id verification off the event loop; an unknown username verifies against a dummy hash, so both
-         answers take the same time. A full hash queue refuses with the lockout-style 429 and gives the slot back.
+         answers take the same time. A full hash queue refuses with the lockout-style 429 and gives the slot back;
+         exempt callers hash in slots of their own, so a flood never locks the owner out (`passwords.py`).
       4. Wrong password: 403 `Invalid credentials` (v1). The slot stays used: that is the failure being counted.
       5. Right password: the slot is given back. A valid trusted device for this account skips the second factor
          (only when `admin_trusted_devices_enabled`). Otherwise a login transaction is stored in hot.db, bound to
@@ -35,6 +36,9 @@ Why it exists
       3. Success takes the transaction (`DELETE ... RETURNING`, so exactly one request can finish it), clears the
          lockout key, creates the session (deleting any session cookie the browser brought: no fixation), mints
          the kill-switch token, records the login, and sends the `Roxy Admin Login` email in the background.
+         A bootstrap transaction finishes only while the account is still in bootstrap (`users.bootstrap_open`),
+         checked when the attempt starts and again in the write that creates the session: once an authenticator
+         is enrolled the emailed code never signs in again (D5).
 
     C7: if hot.db or control.db cannot be used, every step answers 503 with a clear message (`UNAVAILABLE_TEXT`)
     instead of guessing.
@@ -106,6 +110,9 @@ UNAVAILABLE_TEXT = (
     "Admin login is unavailable right now because shared state cannot be read or written; please try again shortly."
 )
 LOGIN_ALERT_SUMMARY = "A successful login to the Roxy admin panel just occurred."
+BOOTSTRAP_CLOSED_REASON = (
+    "first-login emailed code used after the authenticator app was enrolled; the one-time email path is closed"
+)
 
 Method = Literal["totp", "recovery", "email", "passkey"]
 
@@ -354,7 +361,11 @@ class AuthService:
 
         user = await self.control_read(lambda conn: users.get_by_username(conn, username))
         try:
-            result = await self.hasher.verify(user.password_hash if user else None, password, delay_s=delay_s)
+            # An exempt caller (allowlist, trusted device) hashes in the reserved slots, so slowed guesses filling
+            # this worker's queue never lock the owner out (plan 9.5, finding sec-4).
+            result = await self.hasher.verify(
+                user.password_hash if user else None, password, delay_s=delay_s, exempt=exempt
+            )
         except HashQueueFull:
             # Never checked, so not a failure: give the slot back (otherwise an attack would lock the owner out).
             await self.hot_write(lambda conn: lockout.release(conn, reservation.subject))
@@ -365,7 +376,7 @@ class AuthService:
         if result.needs_rehash:
             await self._rehash(user, password)
 
-        bootstrap = user.mfa_bootstrap_pending and not user.has_totp
+        bootstrap = user.bootstrap_open
         if device is not None and device.user_id == user.id and not bootstrap:
             await self.hot_write(lambda conn: lockout.clear(conn, key))
             return await self._finish_login(info, user, "trusted_device", trust_device=False, device_id=device.id)
@@ -432,7 +443,8 @@ class AuthService:
 
     async def _rehash(self, user: users.AdminUser, password: str) -> None:
         try:
-            new_hash = await self.hasher.hash(password)
+            # The password was right: this is the account holder, so the reserved slots, not the queue.
+            new_hash = await self.hasher.hash(password, exempt=True)
         except HashQueueFull:
             return  # try again on the next login
         await self.control_write(lambda conn: users.set_password_hash(conn, user.id, new_hash))
@@ -594,8 +606,12 @@ class AuthService:
         *,
         challenge_b64: str | None,
         email: tuple[str, int, str] | None,
+        exempt: bool = False,
     ) -> _FactorCheck:
-        """Verify one factor without spending anything (spending is atomic, in the caller)."""
+        """Verify one factor without spending anything (spending is atomic, in the caller).
+
+        `exempt`: a recovery code check of an allowlisted or signed-in caller hashes in the reserved slots.
+        """
         now = self.clock.now()
         if method == "totp":
             cipher = self.cipher()
@@ -609,7 +625,7 @@ class AuthService:
             entries = recovery_codes.loads(user.recovery_codes_hash_json)
             entry = recovery_codes.find_entry(entries, normalized) if normalized else None
             # No matching entry still costs one argon2 run (the dummy hash), so timing reveals nothing.
-            result = await self.hasher.verify(entry.hash if entry else None, normalized or "x")
+            result = await self.hasher.verify(entry.hash if entry else None, normalized or "x", exempt=exempt)
             return _FactorCheck(result.ok, recovery=entry, recovery_normalized=normalized)
         if method == "email":
             if email is None or not isinstance(code, str):
@@ -647,12 +663,24 @@ class AuthService:
         if user is None:
             await self._mfa_failed(info, REASON_BAD_CHALLENGE, payload)
             raise mfa_failure()
+        if payload.get("bootstrap") and not user.bootstrap_open:
+            # D5: the emailed first-login code is one-time. A bootstrap login started before the account enrolled
+            # its authenticator never finishes after it (finding sec-3); `_finish_login` asks again in its write.
+            await self.hot_write(lambda conn: transactions.delete(conn, name))
+            await self._bootstrap_closed(info, int(payload["uid"]))
+            raise mfa_failure()
         email = None
         if method == "email" and payload.get("email_hash"):
             email = (str(payload["email_hash"]), int(payload.get("email_exp", 0)), name)
         try:
             check = await self._check_factor(
-                user, method, code, credential, challenge_b64=payload.get("webauthn"), email=email
+                user,
+                method,
+                code,
+                credential,
+                challenge_b64=payload.get("webauthn"),
+                email=email,
+                exempt=in_admin_allowlist(self.ctx, info.ip),
             )
         except HashQueueFull:
             raise lockout_error(HashQueueFull.retry_after_s) from None
@@ -684,6 +712,20 @@ class AuthService:
             await self.control_write(lambda conn: webauthn.update_sign_count(conn, passkey_id, count, now))
         level = "bootstrap" if payload.get("bootstrap") else method
         return await self._finish_login(info, user, level, trust_device=bool(payload.get("trust")))
+
+    async def _bootstrap_closed(self, info: RequestInfo, user_id: int) -> None:
+        """A bootstrap login of an account that has enrolled since: logged like a stale challenge, and audited."""
+        record_probe(self.ctx, ip=info.ip, reason=REASON_BAD_CHALLENGE, user_agent=info.ua, path=info.path)
+        record_login(self.ctx, ip=info.ip, successful=False, username=None, method="second_factor")
+        await self.audit_quietly(
+            "auth.mfa_failed",
+            info,
+            user_id=user_id or None,
+            username=None,
+            reason=BOOTSTRAP_CLOSED_REASON,
+            after={"network": lockout.ip_prefix(info.ip)},
+            actor_kind="system",
+        )
 
     async def _spend_recovery(self, info: RequestInfo, user: users.AdminUser, check: _FactorCheck, now: int) -> bool:
         entry = check.recovery
@@ -730,7 +772,11 @@ class AuthService:
         )
         old_cookie = info.session_cookie
 
-        def write(conn: sqlite3.Connection) -> tuple[str, str | None, str]:
+        def write(conn: sqlite3.Connection) -> tuple[str, str | None, str] | None:
+            if level == "bootstrap" and not users.bootstrap_open(conn, user.id):
+                # Asked again inside the write that creates the session: an enrollment that committed after
+                # `mfa` read the account closes the email path here too (finding sec-3; writes are serialized).
+                return None
             if old_cookie:
                 # Session fixation defense: whatever session id the browser brought is ended, never reused.
                 sessions.revoke(conn, sessions.hash_token(old_cookie))
@@ -763,7 +809,11 @@ class AuthService:
             )
             return token, trusted, kill
 
-        token, trusted, kill = await self.control_write(write)
+        written = await self.control_write(write)
+        if written is None:
+            await self._bootstrap_closed(info, user.id)
+            raise mfa_failure()
+        token, trusted, kill = written
         record_login(self.ctx, ip=info.ip, successful=True, username=user.username, method=level)
         self._send_login_alert(info, kill, now)
         return LoginOutcome(
@@ -811,6 +861,10 @@ class AuthService:
             raise AuthError(403, START_AGAIN_TEXT)
         user = await self.control_read(lambda conn: users.get_by_id(conn, int(payload["uid"])))
         if user is None:
+            raise AuthError(403, START_AGAIN_TEXT)
+        if payload.get("bootstrap") and not user.bootstrap_open:
+            # The account enrolled an authenticator since this bootstrap login began: no new code (finding sec-3).
+            await self.hot_write(lambda conn: transactions.delete(conn, name))
             raise AuthError(403, START_AGAIN_TEXT)
         return await self._send_email_code(user, name, first=int(payload.get("sends", 0)) == 0)
 
@@ -896,7 +950,10 @@ class AuthService:
         if user is None or method not in ("totp", "recovery", "passkey"):
             raise mfa_failure()
         try:
-            check = await self._check_factor(user, method, code, credential, challenge_b64=challenge, email=None)
+            # A signed-in admin: a recovery code check uses the reserved slots, never the anonymous queue.
+            check = await self._check_factor(
+                user, method, code, credential, challenge_b64=challenge, email=None, exempt=True
+            )
         except HashQueueFull:
             await self.hot_write(lambda conn: lockout.release(conn, reservation.subject))
             raise lockout_error(HashQueueFull.retry_after_s) from None

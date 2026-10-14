@@ -34,7 +34,7 @@ from urllib.parse import urlencode
 import pytest
 
 import roxy.admin.api  # noqa: F401 - first: the API package mounts roxy.admin.sse
-from roxy.admin.auth.testing import auth_harness
+from auth_harness import auth_harness
 from roxy.config import catalog
 from roxy.core.clock import FakeClock
 from roxy.core.reasons import AuthClass, CacheState, Egress, Outcome, ReasonCode, Source

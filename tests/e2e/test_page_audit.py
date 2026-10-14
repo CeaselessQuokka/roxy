@@ -69,7 +69,11 @@ def test_filters_search_and_paging_swap_the_table_in_place(open_admin: Any) -> N
     admin.wait(f"{COUNT} === {json.dumps(everything)}")
     page.fill('#log input[name="q"]', "export.download")
     admin.wait("new URL(location.href).searchParams.get('q') === 'export.download'")
-    admin.wait("document.querySelectorAll('#log tbody tr[data-row-id]').length === 1")
+    # Every row matches the search (other tests of the session may have exported too: one or more rows).
+    admin.wait(
+        "(() => { const rows = [...document.querySelectorAll('#log tbody tr[data-row-id]')]; "
+        "return rows.length >= 1 && rows.every((row) => row.innerText.includes('export.download')); })()"
+    )
     assert "export.download" in page.locator("#log tbody tr[data-row-id]").first.inner_text()
     page.fill('#log input[name="q"]', "")
     admin.wait(f"{COUNT} === {json.dumps(everything)}")

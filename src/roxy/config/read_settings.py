@@ -5,7 +5,8 @@ What this is
     search text and a time window) with the total for the pager. `latest_changes(conn)` returns the newest history
     row of every key ("last changed: who, when, why" on each row of the editor, plan 15.2). `history_entry(conn,
     id)` returns one row. Rows are plain dicts with the JSON columns decoded. `value_timeline(conn, key, since)`
-    gives the values one key had over a span (the dry run reads `request_sample_pct` per sample time from it).
+    gives the values one key had over a span (the dry run reads `request_sample_pct` per sample time from it), and
+    `latest_change_at(conn, keys)` when any of a few keys last changed (the User-Agent experiment's start).
 
 Why it exists
     Plan 15.2 asks for history per key and globally, with one-click revert, and DESIGN.md section 13 puts read
@@ -19,7 +20,8 @@ How it works
     case-insensitive `instr` over the key, the reason and who changed it (no LIKE, so `%` and `_` in a search are
     plain characters). Page sizes are bounded by `MAX_PAGE_ROWS` (plan P9). History values are the stored
     OVERRIDES (NULL means "the catalog default", see settings_service.py); sensitive settings were stored as
-    `{fingerprint, masked}` only, so nothing here can expose a secret value.
+    `{fingerprint, masked}` only, and any other text holding a secret is scrubbed in `history_row`, so nothing here
+    can expose a secret value.
 
 What to read next
     `roxy/config/settings_service.py` (the writer), `roxy/admin/api/settings.py` (the API that serves these).
@@ -31,6 +33,8 @@ import json
 import sqlite3
 from collections.abc import Iterable
 from typing import Any, Final
+
+from roxy.config.secret_text import scrub_secrets
 
 HISTORY_SORTS: Final[dict[str, str]] = {
     "id": "id",
@@ -62,15 +66,20 @@ def decode_json(text: str | None) -> Any:
 
 
 def history_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
-    """One `settings_history` row as a dict: `old` and `new` are overrides, None meaning the catalog default."""
+    """One `settings_history` row as a dict: `old` and `new` are overrides, None meaning the catalog default.
+
+    Every text that holds a secret is scrubbed here (`secret_text.scrub_secrets`, review finding constraints-1), so
+    the editor, the history tables and their CSV and JSON downloads never show one, even for a row written before
+    the screening existed or before the registry knew the value. Revert reads the stored row itself
+    (`settings_service`), where the catalog refuses such a value."""
     return {
         "id": int(row[0]),
         "key": str(row[1]),
-        "old": decode_json(row[2]),
-        "new": decode_json(row[3]),
+        "old": scrub_secrets(decode_json(row[2])),
+        "new": scrub_secrets(decode_json(row[3])),
         "changed_at": int(row[4]),
         "changed_by": str(row[5]),
-        "reason": row[6],
+        "reason": scrub_secrets(row[6]),
         "source": str(row[7]),
     }
 
@@ -205,6 +214,28 @@ def value_timeline(
     return [(start, first), *((int(row[0]), value(row[2])) for row in later)]
 
 
+MAX_CHANGE_KEYS: Final = 50
+"""Keys one `latest_change_at` call may name (a run of a feature is a few keys; plan P9)."""
+
+
+def latest_change_at(conn: sqlite3.Connection, keys: Iterable[str]) -> int | None:
+    """When any of `keys` last changed (Unix seconds, from `settings_history`), or None when none ever did.
+
+    History keeps every key's newest row forever (`storage/retention.py`), so a feature switched on through the
+    settings service always has its switch-on time here, however long ago (the User-Agent experiment's start, review
+    finding brain-7). One indexed lookup per key (`settings_history_key_id`).
+    """
+    wanted = list(dict.fromkeys(keys))[:MAX_CHANGE_KEYS]
+    if not wanted:
+        return None
+    marks = ", ".join("?" for _ in wanted)
+    found = conn.execute(
+        f"SELECT max(changed_at) FROM settings_history WHERE key IN ({marks})",  # noqa: S608 (placeholders only)
+        wanted,
+    ).fetchone()
+    return None if found is None or found[0] is None else int(found[0])
+
+
 def history_sources(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]]:
     """Distinct sources with their counts (the editor's source filter), most used first."""
     rows = conn.execute(
@@ -216,6 +247,7 @@ def history_sources(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str
 
 __all__ = [
     "HISTORY_SORTS",
+    "MAX_CHANGE_KEYS",
     "MAX_LATEST_KEYS",
     "MAX_PAGE_ROWS",
     "MAX_TIMELINE_ROWS",
@@ -224,6 +256,7 @@ __all__ = [
     "history_page",
     "history_row",
     "history_sources",
+    "latest_change_at",
     "latest_changes",
     "value_timeline",
 ]

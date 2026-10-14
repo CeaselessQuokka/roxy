@@ -95,6 +95,11 @@ async def test_verbs_series_and_table_with_export(api: Any, api_app: Any, metric
 
 async def test_status_sources_and_the_429_verdict(api: Any, api_app: Any, metrics_seed: Any, api_json: Any) -> None:
     seed_traffic(metrics_seed)
+    # The answers Roblox gave the seeded calls (`metrics_seed` records outcomes only): the "5xx from Roblox" tile
+    # counts Roblox's answers per attempt (lead decision 11, finding v1parity-1).
+    recorder = api_app.ctx.recorder
+    recorder.record_roblox_answer(endpoint_template="games.roblox.com/v1/games", egress="direct", status=200, count=4)
+    recorder.record_roblox_answer(endpoint_template="games.roblox.com/v1/games", egress="rotator", status=502)
     await metrics_seed.flush()
     body = api_json(await api.get("traffic/status/sources", params={"range": "1h"}))
     pairs = {(row["source"], row["status"]): row["requests"] for row in body["items"]}
@@ -121,7 +126,7 @@ async def test_status_sources_and_the_429_verdict(api: Any, api_app: Any, metric
     status = series_by_key(api_json(await api.get("traffic/status", params={"range": "1h"})))
     assert total(status["roblox_429"]) == 1
     assert total(status["roxy_429"]) == 2
-    assert total(status["status_2xx"]) == 5
+    assert total(status["caller_2xx"]) == 5  # the answers callers got (lead decision 11)
     by_source = series_by_key(api_json(await api.get("traffic/status", params={"range": "1h", "view": "source"})))
     assert total(by_source["requests:roxy"]) == 2
     assert total(by_source["requests:relay"]) == 1

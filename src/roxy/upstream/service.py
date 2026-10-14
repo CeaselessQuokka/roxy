@@ -81,6 +81,7 @@ from roxy.core.clock import Clock
 from roxy.core.ids import new_request_id
 from roxy.core.reasons import AuthClass, Egress, ReasonCode
 from roxy.metrics.recorder import note_attempts, note_reservation
+from roxy.proxy import scrub
 from roxy.proxy.validate import parse_redirect
 from roxy.rules.match import regex_budget
 from roxy.storage.db import Database, SharedStateUnavailable
@@ -241,6 +242,12 @@ class UpstreamResult:
     belongs to its own request and is never stored or handed to a follower (plan 6.9, 9.13; review finding cred-4).
     Only the upstream knows the row it actually routed under; the cache also re-reads the row when the answer
     arrives (`CacheService._row_now_private`)."""
+    upstream_body: bytes = b""
+    """Roblox's own body of a 429 this request received (`body` is Roxy's busy text, the 7.13 row). Only
+    `compat_collapse_upstream_errors` sends it: v1 answered a Roblox 429 with 500 and Roblox's body (finding
+    pipe-4)."""
+    upstream_content_type: str | None = None
+    """The content type Roblox sent with `upstream_body`."""
 
     @property
     def ok(self) -> bool:
@@ -812,7 +819,14 @@ class UpstreamService:
                 await asyncio.wait_for(stop.wait(), timeout=interval_s)
 
     async def reset_state(self) -> dict[str, int]:
-        """Clear every cooldown and breaker (parity row 34). Buckets are NEVER refilled (v1 bug B21)."""
+        """Clear every cooldown and breaker (parity row 34). Buckets are NEVER refilled (v1 bug B21).
+
+        The cache's per-key 429 markers go too (`markers`): a marker lives "until the cooldown ends" (plan 7.7), so
+        once every cooldown ended at once the key that drew the 429 must reach Roblox again like every other key of
+        its endpoint (finding pipe-5). The purge moves the cache's change stamp, so every worker drops its memory
+        copies within `cache.service.GENERATION_POLL_S`. A cache that cannot be written keeps its markers until
+        they expire (at most `cooldown_max_s`) and the count says 0; the cooldowns are cleared either way.
+        """
 
         def clear(conn: sqlite3.Connection) -> dict[str, int]:
             return {"cooldowns": cooldowns.clear_all(conn), "breakers": breaker.reset_all(conn)}
@@ -821,7 +835,19 @@ class UpstreamService:
         self._mirror_cooldowns.clear()
         self._mirror_breakers.clear()
         self.local_cooldowns = cooldowns.LocalCooldowns()
+        counts["markers"] = await self._clear_cache_markers()
         return counts
+
+    async def _clear_cache_markers(self) -> int:
+        """Remove every per-key 429 marker fleet-wide through the cache service; 0 when there is none or it fails."""
+        purge_markers = getattr(getattr(self._ctx, "cache", None), "purge_markers", None)
+        if not callable(purge_markers):
+            return 0
+        try:
+            return int(await purge_markers())
+        except Exception:  # the cache is disposable (C7): the markers then expire on their own
+            log.warning("upstream_reset_markers_not_cleared", exc_info=True)
+            return 0
 
     async def bucket_snapshot(self, limit: int = 500) -> list[buckets.BucketState]:
         """Bucket fill levels and next free slots for the Upstream page."""
@@ -1434,15 +1460,28 @@ class UpstreamService:
 
     def _outbound_headers(self, call: _Call) -> dict[str, str]:
         """The extra headers upstream adds (plan 9.13): the body's Content-Type, a forwarded `Accept` when it is one
-        of the safe values. The egress adds its own API-shaped profile (Accept-Language, User-Agent) itself."""
+        of the safe values. The egress adds its own API-shaped profile (Accept-Language, User-Agent) itself.
+
+        Both come from `proxy/scrub.py forwarded_request_headers`, the allowlist the cache key varies on, so what
+        Roblox receives is exactly what the key describes (finding pipe-1): a caller's Content-Type that is not
+        printable ASCII or is longer than `scrub.MAX_HEADER_VALUE` is never sent (httpx cannot even encode a
+        non-ASCII one, which made it Roxy's own 500); the body then goes with Roxy's default `application/json`,
+        as a body sent without a Content-Type does, and the key (which left the header out) says the same.
+        `ProxyRequest.content_type` is that same header; Roxy's own internal calls (and request objects without the
+        header) name their type only there, so it fills in a missing header before the allowlist screens it.
+        """
         headers: dict[str, str] = {}
         caller_headers = getattr(call.req, "headers", None) or {}
-        accept = str(caller_headers.get("accept", "")).strip().lower()
+        body = getattr(call.req, "body", b"") or b""
+        own_type = getattr(call.req, "content_type", None)
+        if own_type and "content-type" not in caller_headers:
+            caller_headers = {**caller_headers, "content-type": str(own_type)}
+        forwarded = scrub.forwarded_request_headers(call.method, caller_headers, body)
+        accept = forwarded.get("accept")
         if accept in FORWARDED_ACCEPT:
             headers["Accept"] = accept
-        body = getattr(call.req, "body", b"") or b""
         if body:
-            headers["Content-Type"] = str(getattr(call.req, "content_type", None) or "application/json")
+            headers["Content-Type"] = forwarded.get("content-type") or "application/json"
         return headers
 
     @staticmethod
@@ -1928,10 +1967,17 @@ class UpstreamService:
         now_s = self.clock.now()
         upstream_retry = cooldowns.parse_retry_after(exchange.headers.get("retry-after"), now_s)
         if kind is AttemptKind.RATE_LIMITED:
-            cooldown_s = (
-                effects.cooldown_s if effects is not None and effects.cooldown_s is not None else upstream_retry
-            )
-            source = effects.cooldown_source if effects is not None else ""
+            cooldown_s: float | None
+            if egress is Egress.ROTATOR and (effects is None or not effects.counted_429):
+                # One burned exit (plan 7.5): no cooldown opened, the session already rotated, and the next exit may
+                # well answer. No cooldown Retry-After and no per-key 429 marker (plan 7.7; finding pipe-6): the
+                # row's own minimum Retry-After (1 s) applies.
+                cooldown_s, source = None, ""
+            else:
+                cooldown_s = (
+                    effects.cooldown_s if effects is not None and effects.cooldown_s is not None else upstream_retry
+                )
+                source = effects.cooldown_source if effects is not None else ""
             call.trace.cooldown_source = source
             result = self._failure(
                 ReasonCode.UPSTREAM_COOLDOWN,
@@ -1944,6 +1990,8 @@ class UpstreamService:
             )
             result.auth_class = auth
             result.private = private
+            result.upstream_body = exchange.body
+            result.upstream_content_type = exchange.headers.get("content-type")
             if call.cfg.negative_429 and not private and result.cooldown_s:
                 result.negative_ttl_s = result.cooldown_s
             return result

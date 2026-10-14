@@ -1,20 +1,52 @@
 # Roxy
 
-Roxy v2 is a Roblox web API proxy that is safe for its operator, kind to Roblox and fully observable. The full
-README is written in P12; until then, these are the guides:
+Roxy is a proxy for Roblox's web APIs: game servers call `https://<your site>/<sub>.roblox.com/<path>` and Roxy
+forwards the request to Roblox, answers from its cache when it can, paces its calls so Roblox does not rate-limit it,
+and turns away abusive callers. Roxy v2 (this tree, FastAPI under gunicorn in `src/roxy/`) replaces v1 (the Flask
+app in `app/`). It is built to be safe for its operator (one Roblox credential, never sent for callers and never
+through the rotator), kind to Roblox and fully observable from its admin dashboard.
 
+## Where to read next
+
+- [`DECISIONS_REVIEW.md`](DECISIONS_REVIEW.md): the decisions the owner signs before v2 goes live (D1 to D23, the
+  values only the owner can give, the known limitations).
+- [`MIGRATION.md`](MIGRATION.md): the cutover from v1 to v2, step by step, with the rollback to v1.
 - [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md): for game developers who call Roxy (also served at `/docs`).
 - [`docs/ADMIN_GUIDE.md`](docs/ADMIN_GUIDE.md): for the owner who runs Roxy, one chapter per dashboard page (also on
-  the dashboard's Help page; being written).
+  the dashboard's Help page, one chapter at a time).
+- [`docs/RUNBOOKS.md`](docs/RUNBOOKS.md): what to do when an alert or a health check fires.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): the process model, the request flow, storage and jobs, deploys
   and memory, and the design decisions behind them.
 - [`docs/SECURITY.md`](docs/SECURITY.md): the threats, the hard constraints C1 to C7 and the tests that prove them.
-- [`docs/RUNBOOKS.md`](docs/RUNBOOKS.md): what to do when an alert or a health check fires.
 - [`docs/LEARNING_PATH.md`](docs/LEARNING_PATH.md): the guided reading order through the code, with exercises.
 - [`docs/SETTINGS.md`](docs/SETTINGS.md): every setting (generated from the catalog).
 - [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md): the load harness, its results and how to run it again.
 - [`deploy/README.md`](deploy/README.md): the operations files and the server layout.
 - [`CHANGES.md`](CHANGES.md): what changed from v1, and why.
+
+## Run it locally
+
+You need Python 3.12 and [uv](https://docs.astral.sh/uv/). On Linux or WSL:
+
+```sh
+uv sync                                    # the locked dependencies into .venv
+.venv/bin/python -m pytest tests/unit -q   # the fast tests (the whole suite takes about two hours)
+.venv/bin/ruff check src tests scripts && .venv/bin/mypy
+```
+
+To look at the site and the dashboard on your machine, start one worker in development mode with a scratch state
+directory (development mode creates the databases itself; production never does):
+
+```sh
+mkdir -p /tmp/roxy-dev
+ROXY_ENV=development ROXY_AUTO_MIGRATE=1 ROXY_STATE_DIR=/tmp/roxy-dev ROXY_SITE_ORIGIN=http://localhost:8000 \
+  ROXY_INTERNAL_SOCKET=/tmp/roxy-dev/internal.sock .venv/bin/uvicorn roxy.asgi:app --port 8000
+```
+
+Then open `http://localhost:8000/` (the public site), `/docs` (the user guide) and `/admin` (the sign-in page; make
+an admin first with `scripts/create_admin.py`, see its `--help`). The tests never reach Roblox or any other real
+service: they run against local mock servers. On the production server Roxy runs under gunicorn and systemd, two
+workers per color, as `deploy/README.md` describes.
 
 ## The dashboard
 

@@ -66,9 +66,9 @@ the range or its comparison has any."""
 
 SOURCE_COLORS: Final[dict[str, int]] = {"roblox": 1, "relay": 7, "roxy": 4, "cache": 3, "internal": 6}
 STATUS_LABELS: Final[dict[str, tuple[str, int]]] = {
-    "status_2xx": ("2xx answers", 6),
-    "status_4xx": ("4xx answers", 4),
-    "status_5xx": ("5xx answers", 8),
+    "caller_2xx": ("2xx answers to callers", 6),
+    "caller_4xx": ("4xx answers to callers", 4),
+    "status_5xx": ("5xx answers to callers", 8),
     "roxy_429": ("429s from Roxy", 2),
     "roblox_429": ("429s from Roblox", 5),
 }
@@ -94,7 +94,7 @@ EGRESS_WORDS: Final[dict[str, str]] = {
 TILES: Final[tuple[tuple[str, str], ...]] = (
     ("roblox_429", "Roblox rate limiting Roxy"),
     ("roxy_429", "Roxy turning callers away"),
-    ("roblox_5xx", "Roblox's own server errors"),
+    ("roblox_5xx", "Roblox's own server errors, every attempt (retries included)"),
     ("roxy_5xx", "Roxy's own failures"),
 )
 """v1's four "Who returned it?" tiles (dashboard.md 4.16) with their meta lines, in v1's order."""
@@ -250,7 +250,7 @@ async def bytes_card(view: PageView) -> dict[str, Any]:
 
 
 VERB_KEY_COLUMNS: Final = ("key", "requests", "failed")
-VERB_HIDDEN: Final = ("status_2xx", "status_4xx", "status_5xx")
+VERB_HIDDEN: Final = ("caller_2xx", "caller_4xx", "status_5xx")
 
 
 @page.card("verbs", lazy=True, live_refresh_s=LIVE_REFRESH_S)

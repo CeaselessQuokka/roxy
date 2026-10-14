@@ -10,7 +10,7 @@ Why it exists
     out address cannot get in with the correct password until the window passes.
 
 How it works
-    The `parity` fixture runs the real app with the real login flow (`roxy.admin.auth.testing.auth_harness`). The
+    The `parity` fixture runs the real app with the real login flow (`auth_harness.auth_harness`). The
     tests call the login steps directly (`password_step`), as the dashboard's login page does.
 
 What to read next

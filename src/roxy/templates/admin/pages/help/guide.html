@@ -1,13 +1,14 @@
 {#-
   Help page, card `guide` (`roxy/admin/pages/help.py guide_card`): the admin guide, the documents, the runbooks.
 
-  The guide (docs/ADMIN_GUIDE.md) is linked with its contents when the file exists (a skeleton until the docs phase
-  writes it); without it the card says so. Either way it lists the plan 16.3 chapters, each pointing to the pages
-  and documents that cover it today. The incident runbook index has one entry per runbook name of the link
-  index in docs/RUNBOOKS.md: alert emails link to `/admin/help#runbook-<name>`, and static/js/pages/help.js goes on
-  to the runbook itself (`data-runbook-href`); without scripts the entry and its link are shown. Every href here is
-  a constant of help.py or a slug of the link index (letters, digits and hyphens).
-  Context: `frame`, `guide` (a rendered document or None), `chapters`, `documents`, `missing`, `runbooks`.
+  The guide (docs/ADMIN_GUIDE.md) is linked with its chapters when the file exists, each chapter a link to its own
+  page (`/admin/help/guide/<chapter>`; the first one is on the guide's page); in a release without the file the
+  card says so. Either way it lists the plan 16.3 topics, each pointing to the pages and documents that cover it.
+  The incident runbook index has one entry per runbook name of the link index in docs/RUNBOOKS.md: alert emails
+  link to `/admin/help#runbook-<name>`, and static/js/pages/help.js goes on to the runbook itself
+  (`data-runbook-href`); without scripts the entry and its link are shown. Every href here is a constant of help.py,
+  a chapter address made of a heading anchor, or a slug of the link index (letters, digits and hyphens).
+  Context: `frame`, `guide` (a GuideBook or None), `chapters`, `documents`, `missing`, `runbooks`.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/alert.html" import inline_alert %}
@@ -15,19 +16,18 @@
 {% call page_card(frame) %}
 <div class="help-guide stack">
   {% if guide %}
-  <p>The admin guide explains how to run Roxy day to day, one chapter per dashboard page.</p>
+  <p>The admin guide explains how to run Roxy day to day, one chapter per dashboard page. It opens one chapter at a time.</p>
   <p><a class="btn btn--primary" href="/admin/help/guide">{{ icon("book") }}<span>Read the admin guide</span></a></p>
-  {% set sections = guide.toc|selectattr("level", "equalto", 2)|list %}
-  {% if sections %}
+  {% if guide.chapters %}
   <details class="help-toc-box">
-    <summary>Its chapters ({{ sections|length }})</summary>
+    <summary>Its chapters ({{ guide.chapters|length }})</summary>
     <ol class="help-toc">
-      {% for entry in sections %}<li><a href="/admin/help/guide#{{ entry.anchor }}">{{ entry.title }}</a></li>{% endfor %}
+      {% for item in guide.chapters %}<li><a href="{{ item.href }}">{{ item.title }}</a></li>{% endfor %}
     </ol>
   </details>
   {% endif %}
   {% else %}
-  {{ inline_alert("info", "The written admin guide is not part of this release yet", "Until docs/ADMIN_GUIDE.md is written, each chapter below points to the pages, cards and documents that already cover it.") }}
+  {{ inline_alert("info", "The written admin guide is not part of this release", "docs/ADMIN_GUIDE.md was not found next to the application, so each topic below points to the pages, cards and documents that cover it.") }}
   {% endif %}
 
   <section class="help-section" aria-labelledby="help-outline-title">

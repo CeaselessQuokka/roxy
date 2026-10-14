@@ -24,7 +24,7 @@
     <dl class="kv g3-egress__numbers">
       <dt>Calls to Roblox</dt><dd>{{ num(e.item.calls) }} <span class="muted">({{ e.calls_per_min }} a minute; {{ num(e.item.internal_calls) }} by Roxy itself)</span></dd>
       <dt>Roblox 429s</dt><dd>{{ num(e.item.roblox_429) }} <span class="muted">({{ e.rate_429 }} of calls)</span></dd>
-      <dt>Roblox 5xx</dt><dd>{{ num(e.item.roblox_5xx) }} <span class="muted">({{ e.rate_5xx }} of requests)</span></dd>
+      <dt>Roblox 5xx</dt><dd>{{ num(e.item.roblox_5xx) }} <span class="muted">({{ e.rate_5xx }} of calls, every attempt)</span></dd>
       <dt>Failed requests</dt><dd>{{ num(e.item.failed) }} <span class="muted">({{ e.rate_failed }}; {{ num(e.item.timeouts) }} timeouts)</span></dd>
       <dt>Latency p50 / p95 / p99</dt><dd>{{ e.latency }}</dd>
       <dt>Queue wait p95</dt><dd>{{ e.queue_p95 }}</dd>

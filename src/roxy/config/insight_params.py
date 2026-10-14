@@ -1526,8 +1526,8 @@ PARAM_DEFINITIONS: dict[str, str] = {
         "full, as a share of all refusals eligible for a hold."
     ),
     "THROTTLE-TUNE.legit_throttled_pct": (
-        "Distinct client IP addresses with a bot score below bot_score_legit_max (likely legitimate) that the "
-        "per-IP limit throttled at least once in a day, as a share of all such addresses that day."
+        "Distinct client IP addresses with a bot score at or below bot_score_legit_max (likely legitimate) that "
+        "were refused at least once in the last 24 hours, as a share of all such addresses seen then."
     ),
     "PLACE-HEAVY.share_pct": "One experience's (place id's) share of all upstream calls within the window.",
     "PLACE-HEAVY.window_min": "How many minutes of upstream calls the share is measured over.",

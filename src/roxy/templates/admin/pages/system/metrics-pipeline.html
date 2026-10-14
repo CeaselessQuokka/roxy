@@ -30,6 +30,7 @@
         <dt>Recording errors</dt><dd>{{ num(recorder.record_errors) }}</dd>
         <dt>History items dropped</dt><dd>{{ num(recorder.history_dropped) }}</dd>
         <dt>Captures dropped {{ help_dot("Captures dropped", metric_help.capture_errors) }}</dt><dd>{{ num(recorder.capture_dropped) }}{% if recorder.capture_errors %}, {{ num(recorder.capture_errors) }} errors{% endif %}</dd>
+        {% if batch.capped %}<dt>Queued captures capped</dt><dd>{{ num(batch.capped) }} <span class="muted">(the oldest queued captures beyond capture_max_records or capture_max_bytes; the capture table would keep no more of them, so no number is missing)</span></dd>{% endif %}
         <dt>Endpoint templates</dt><dd>{{ num(recorder.templates_known) }} known{% if recorder.templates_rejected %}, {{ num(recorder.templates_rejected) }} refused{% endif %}</dd>
         <dt>Live rows kept</dt><dd>{{ num(recorder.live_ring) }}</dd>
         <dt>Forced flushes here</dt><dd>{{ num(answer.forced_flushes_here) if answer.forced_flushes_here is not none else "n/a" }}</dd>

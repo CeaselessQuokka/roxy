@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from roxy.admin.auth.testing import AuthHarness, auth_harness
+from auth_harness import AuthHarness, auth_harness
 from roxy.core.clock import FakeClock
 
 

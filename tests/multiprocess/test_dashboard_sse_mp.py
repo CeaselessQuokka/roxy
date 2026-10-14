@@ -305,8 +305,8 @@ def _driver(work: Path, credentials: Path) -> dict[str, Any]:
 
 def _sign_in(httpx: Any, origin: str, admin: Any) -> str:
     """The session cookie of an admin signed in through the real password and TOTP steps."""
+    from auth_harness import LOGIN_PATH, MFA_PATH, TEST_UA
     from roxy.admin.auth import totp
-    from roxy.admin.auth.testing import LOGIN_PATH, MFA_PATH, TEST_UA
 
     headers = {"Origin": origin, "Sec-Fetch-Site": "same-origin", "User-Agent": TEST_UA, "Accept": "application/json"}
     with httpx.Client(base_url=origin, timeout=30, trust_env=False) as client:
@@ -335,7 +335,7 @@ def _scenario(
     query: Callable[..., list[tuple[Any, ...]]],
     out: dict[str, Any],
 ) -> None:
-    from roxy.admin.auth.testing import TEST_UA
+    from auth_harness import TEST_UA
 
     admin_headers = {
         "Origin": origin,

@@ -28,6 +28,7 @@ What to read next
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.resources
 import logging
 import os
@@ -52,7 +53,7 @@ from roxy.storage.db import (
 
 log = logging.getLogger(__name__)
 
-REQUIRED_SCHEMA: dict[str, int] = {"control": 1, "hot": 1, "metrics": 9, "cache": 1}
+REQUIRED_SCHEMA: dict[str, int] = {"control": 1, "hot": 1, "metrics": 10, "cache": 1}
 """The schema version each database must be at (at least) for this release to start. Raise it in the same
 change that adds a migration this release's code depends on (a unit test keeps it equal to the newest expand
 migration)."""
@@ -329,12 +330,33 @@ def auto_migrate(dbs: Databases, env: object, *, names: Iterable[str] | None = N
     return True
 
 
+DAMAGED_COPY_MARK = ".corrupt-"
+"""`recover_cache_db` keeps a damaged cache.db as `cache.db.corrupt-<unix time>` (with its `-wal` and `-shm`)."""
+
+
+def damaged_copies(path: Path | str) -> list[Path]:
+    """The damaged copies `recover_cache_db` kept beside the database file `path`: every regular file named
+    `<file name>.corrupt-<unix time>`, with its `-wal` and `-shm` companions (oldest first by name)."""
+    target = Path(path)
+    prefix = f"{target.name}{DAMAGED_COPY_MARK}"
+    try:
+        entries = list(target.parent.iterdir())
+    except OSError:
+        return []
+    return sorted(e for e in entries if e.name.startswith(prefix) and not e.is_symlink() and e.is_file())
+
+
 def recover_cache_db(path: Path | str) -> Path | None:
     """Startup check for the disposable cache.db (plan 5.5): `quick_check`, and rebuild it if damaged.
 
     Call it while holding the `cache_init` lease, before this worker opens cache.db. On failure the file and
     its `-wal` and `-shm` companions are renamed aside (`cache.db.corrupt-<unix time>`) and a fresh, migrated
     file takes its place. Returns the path the damaged file was moved to, or None when the file was healthy.
+
+    Only the newest damaged copy is kept (plan P9: every file bounded; final review finding constraints-5): the
+    copies an earlier recovery kept are deleted first, so repeated recoveries never pile up copies as large as the
+    cache tier. The cache is disposable; the one copy is there to look at, and the disk measure counts it
+    (`metrics/disk_history.py measure_files`).
     """
     target = Path(path)
     if not target.exists():
@@ -350,7 +372,10 @@ def recover_cache_db(path: Path | str) -> Path | None:
         healthy = False
     if healthy:
         return None
-    aside = target.with_name(f"{target.name}.corrupt-{int(time.time())}")
+    for older in damaged_copies(target):
+        with contextlib.suppress(FileNotFoundError):
+            older.unlink()
+    aside = target.with_name(f"{target.name}{DAMAGED_COPY_MARK}{int(time.time())}")
     for suffix in ("", "-wal", "-shm"):
         source = Path(f"{target}{suffix}")
         if source.exists():

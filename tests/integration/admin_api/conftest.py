@@ -5,12 +5,12 @@ What this is
     unique across the suite: the tests folders are not packages).
       * `api_app` (`ApiApp`): `create_app(env)` with its real lifespan over temporary databases (the root
         conftest's `env` and fake credentials), a `FakeClock`, a fast argon2 hasher and recorded mail
-        (`roxy.admin.auth.testing.auth_harness`), Roblox played by `respx` (`api_app.roblox`; any unmocked
+        (`auth_harness.auth_harness`), Roblox played by `respx` (`api_app.roblox`; any unmocked
         outgoing request fails), the tarpit and the rotator off (a refusal would be held 8 to 20 s; tests that
         need them turn them on with `await api_app.settings(...)`). `api_app.ctx`, `.clock`, `.harness`
         (`AuthHarness`: `next_code`, `set_settings`, `allow_admin_cidr`, `mail`) and `.include(router)` (adds a
         router to the running app, after the admin catch-all, which steps aside for it) are there too.
-      * `api_admin` (`TestAdmin`): an admin made with `roxy.admin.auth.testing.make_admin` (password, TOTP secret,
+      * `api_admin` (`TestAdmin`): an admin made with `auth_harness.make_admin` (password, TOTP secret,
         recovery codes).
       * `api` (`ApiSession`): a client that signed in as `api_admin` through the real flow (password, then a TOTP
         code) and holds the `__Host-roxy_session` cookie. `await api.get(path, params=...)`,
@@ -40,7 +40,7 @@ How it works
     `ip=` is given.
 
 What to read next
-    `roxy/admin/auth/testing.py` (the harness), `roxy/admin/api/common.py` (what the tests exercise),
+    `tests/auth_harness.py` (the harness), `roxy/admin/api/common.py` (what the tests exercise),
     `tests/integration/test_pipeline_e2e.py` (the same app driven through the proxy).
 """
 
@@ -54,7 +54,7 @@ from typing import Any
 import httpx
 import pytest
 
-from roxy.admin.auth.testing import AuthHarness, TestAdmin, auth_harness
+from auth_harness import AuthHarness, TestAdmin, auth_harness
 from roxy.config.audit import Actor
 from roxy.config.settings_service import SettingsService
 from roxy.core.clock import FakeClock

@@ -6,7 +6,8 @@
   under the rule, and under a new pattern, are purged) and "Remove this rule" (the shared remove dialog, DELETE).
   The audit history link lists every change of the rule. Pattern and note are text a person chose: text only, and
   values of our own form fields.
-  Context: `rule`, `rule_url`, `created`, `updated`, `history_href`, `flags_text`.
+  Context: `rule`, `rule_url`, `created`, `updated`, `history_href`, `flags_text`, `fallbacks` (what a 0 revalidate
+  window or refusal lifetime falls back to, `cache.py rule_fallbacks`).
 -#}
 {% from "components/format.html" import caller_text, local_href %}
 {% from "components/icon.html" import icon %}
@@ -42,12 +43,14 @@
     <div class="field-row">
       <div class="field">
         <label class="field__label" for="cache-rule-{{ rid }}-stale">Revalidate window (seconds)</label>
-        <input class="input input--num" id="cache-rule-{{ rid }}-stale" name="stale_ttl" inputmode="numeric" value="{{ rule.stale_ttl or 0 }}" data-json="int" aria-describedby="cache-rule-{{ rid }}-stale-error">
+        <input class="input input--num" id="cache-rule-{{ rid }}-stale" name="stale_ttl" inputmode="numeric" value="{{ rule.stale_ttl or 0 }}" data-json="int" aria-describedby="cache-rule-{{ rid }}-stale-hint cache-rule-{{ rid }}-stale-error">
+        <p class="field__hint" id="cache-rule-{{ rid }}-stale-hint">0 uses the setting "{{ fallbacks.stale_ttl.label }}" (now {{ fallbacks.stale_ttl.words }}).</p>
         <p class="field__error" id="cache-rule-{{ rid }}-stale-error" data-field-error="stale_ttl" hidden></p>
       </div>
       <div class="field">
         <label class="field__label" for="cache-rule-{{ rid }}-negative">Keep refusals for (seconds)</label>
-        <input class="input input--num" id="cache-rule-{{ rid }}-negative" name="negative_ttl" inputmode="numeric" value="{{ rule.negative_ttl or 0 }}" data-json="int" aria-describedby="cache-rule-{{ rid }}-negative-error">
+        <input class="input input--num" id="cache-rule-{{ rid }}-negative" name="negative_ttl" inputmode="numeric" value="{{ rule.negative_ttl or 0 }}" data-json="int" aria-describedby="cache-rule-{{ rid }}-negative-hint cache-rule-{{ rid }}-negative-error">
+        <p class="field__hint" id="cache-rule-{{ rid }}-negative-hint">0 uses the setting "{{ fallbacks.negative_ttl.label }}" (now {{ fallbacks.negative_ttl.words }}); a lifetime of 0 keeps no refusals at all.</p>
         <p class="field__error" id="cache-rule-{{ rid }}-negative-error" data-field-error="negative_ttl" hidden></p>
       </div>
     </div>

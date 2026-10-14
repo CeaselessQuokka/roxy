@@ -42,10 +42,13 @@ How it works
     a 4xx answered from the cache (`Roxy-Cache` HIT, REVALIDATING, STALE or COALESCED, the states that were
     cache serves in v1 too) is pretty printed before the browser view. v1 never replaced a Roblox error body with
     its own text (v1 notes pipeline.md section 7 step 4, bug B1), and the setting exists to reproduce v1, so its
-    body wins over plan 7.13's compat note, which assumed v1 sent the failure text. Every Roblox 5xx and the 502
+    body wins over plan 7.13's compat note, which assumed v1 sent the failure text. A Roblox 429 is a Roblox 4xx
+    too: the `upstream_cooldown` answer of a request whose own call Roblox answered with 429 becomes 500 with
+    Roblox's body (`render_roblox_429_compat`, finding pipe-4; v1's `last_response`). Every Roblox 5xx and the 502
     and 504 rows become 500 with `Upstream request failed; please try again later.` as plan 7.13 says. Roxy's own
-    refusals and the 429 and 503 rows are unchanged, and `Retry-After` is still sent. Off (plan D4, the default)
-    passes the real status and pretty prints every Roblox body, live or cached, 2xx or 4xx.
+    refusals, its busy and cooldown answers that made no call (429) and the 503 rows are unchanged, and
+    `Retry-After` is still sent. Off (plan D4, the default) passes the real status and pretty prints every Roblox
+    body, live or cached, 2xx or 4xx.
     Header names keep their canonical casing (`Roxy-Cache`, `Retry-After`) because Starlette would lowercase them:
     they are appended to `raw_headers` directly. The router marks every proxy response as proxied content, so the
     security middleware sends `Content-Security-Policy: default-src 'none'; sandbox` (plan 9.2), and the HTML view
@@ -196,6 +199,9 @@ class ProxyResult:
     upstream_ms: float = 0.0
     trace: Any = None
     stale_after_failure: bool = False
+    upstream_body: bytes = b""
+    """Roblox's own body of a 429 this request received (compat mode sends it, `render_roblox_429_compat`)."""
+    upstream_content_type: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +294,8 @@ def result_from_upstream(upstream: Any) -> ProxyResult:
         queue_wait_ms=float(upstream.queue_wait_ms),
         upstream_ms=float(upstream.upstream_ms),
         trace=getattr(upstream, "trace", None),
+        upstream_body=_as_bytes(getattr(upstream, "upstream_body", None)),
+        upstream_content_type=getattr(upstream, "upstream_content_type", None),
     )
 
 
@@ -318,7 +326,7 @@ def seconds_header(value: float | int | None, *, minimum: int = 0) -> str | None
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # an int too large for a float is no wait anyone can honor
         return None
     if not math.isfinite(number):
         return None
@@ -586,6 +594,83 @@ def render_failure(
     )
 
 
+def _roblox_body_view(
+    req: ProxyRequest, body: bytes, content_type: str | None, *, pretty: bool
+) -> tuple[bytes, str | None, bool]:
+    """Roblox's body as this caller receives it: `(body, content type, transformed)`.
+
+    Pretty printed when the caller asked and `pretty` allows it, the `<pre>` view for a browser and a textual
+    type, v1's exact JSON type, else the real type when it is a safe header value (plan row 4).
+    """
+    transformed = False
+    if pretty and req.prettyprint:
+        printed = pretty_json(body)
+        transformed = printed != body
+        body = printed
+    if req.is_browser and is_textual_type(content_type):
+        return html_pre(body), HTML_TYPE, True
+    if is_json_type(content_type):
+        content_type = JSON_TYPE
+    elif content_type is None or not scrub.is_safe_value(content_type):
+        content_type = FALLBACK_BINARY_TYPE
+    return body, content_type, transformed
+
+
+def is_roblox_429(result: Any) -> bool:
+    """True for the `upstream_cooldown` answer of a request whose own call Roblox answered with 429 (the
+    cooldown answers that made no call, a marker or a cooling endpoint, carry no upstream status)."""
+    return ReasonCode(result.reason) is ReasonCode.UPSTREAM_COOLDOWN and getattr(result, "upstream_status", None) == 429
+
+
+def render_roblox_429_compat(
+    req: ProxyRequest,
+    result: Any,
+    row: FailureRow,
+    *,
+    extra_headers: Mapping[str, Any] | None = None,
+    cors_any_origin: bool = False,
+) -> Rendered:
+    """`compat_collapse_upstream_errors` on: a Roblox 429 this request's call received, as v1 sent it (pipe-4).
+
+    v1 answered a method chain that ended on a Roblox 429 with status 500 and Roblox's own body (app/proxy.py
+    `last_response`), and the setting promises that every Roblox 4xx reaches callers that way. So the 429 becomes 500
+    carrying Roblox's body and content type (raw, as every live 4xx in compat mode; a browser still gets the `<pre>`
+    view), `Retry-After` is still sent, and there is no `Roxy-Refusal` (the words are Roblox's). A follower in another
+    worker never saw Roblox's body (an owner shares its status and Roxy's text), so it gets the 500 with Roxy's busy
+    text. The cooldown answers that made no call (a marker, a cooling endpoint) are Roxy's own back pressure and keep
+    their 429 row.
+    """
+    reason = ReasonCode(result.reason)
+    body = _as_bytes(getattr(result, "upstream_body", None))
+    content_type: str | None = getattr(result, "upstream_content_type", None)
+    source = Source.ROBLOX
+    if body:
+        body, content_type, transformed = _roblox_body_view(req, body, content_type, pretty=False)
+        if transformed:
+            source = Source.RELAY
+    else:
+        body, content_type, source = row.text.encode("utf-8"), TEXT_TYPE, Source.ROXY
+    headers = _HeaderList()
+    headers.set(RETRY_AFTER, _retry_after_for(row, reason, result))
+    for name, value in (extra_headers or {}).items():
+        headers.set(name, value)
+    _cache_headers(headers, result)
+    headers.set(ROXY_UPSTREAM_STATUS, 429)
+    headers.set(ROXY_UPSTREAM_COOLDOWN, seconds_header(getattr(result, "cooldown_s", None), minimum=0))
+    _common_tail(headers, req, cors_any_origin)
+    return Rendered(
+        status=500,
+        body=body,
+        content_type=content_type,
+        headers=headers.items(),
+        outcome=Outcome.FAILED,
+        reason=reason,
+        source=source,
+        cache_state=CacheState(getattr(result, "cache_state", CacheState.NA)),
+        collapsed=True,
+    )
+
+
 def render_served(
     req: ProxyRequest,
     result: Any,
@@ -617,16 +702,8 @@ def render_served(
         # Prettyprint in compat mode follows v1's two paths: the live path pretty printed only a successful call
         # (so a live 4xx stays raw), `_serve_from_cache` pretty printed every entry it served (so a cached 4xx is
         # pretty). Outside compat mode every Roblox body is pretty printed, live or cached.
-        if req.prettyprint and (not collapsed or cache_state in CACHE_SERVE_STATES):
-            pretty = pretty_json(body)
-            transformed = pretty != body
-            body = pretty
-        if req.is_browser and is_textual_type(content_type):
-            body, content_type, transformed = html_pre(body), HTML_TYPE, True
-        elif is_json_type(content_type):
-            content_type = JSON_TYPE
-        elif content_type is None or not scrub.is_safe_value(content_type):
-            content_type = FALLBACK_BINARY_TYPE
+        pretty = not collapsed or cache_state in CACHE_SERVE_STATES
+        body, content_type, transformed = _roblox_body_view(req, body, content_type, pretty=pretty)
     headers = _HeaderList()
     for name, value in (extra_headers or {}).items():
         headers.set(name, value)
@@ -671,6 +748,10 @@ def render(
         return render_refusal(req, target_refusal(reason), extra_headers=extra_headers, cors_any_origin=cors_any_origin)
     row = FAILURE_ROWS.get(reason)
     if row is not None:
+        if compat_collapse and is_roblox_429(result):
+            return render_roblox_429_compat(
+                req, result, row, extra_headers=extra_headers, cors_any_origin=cors_any_origin
+            )
         return render_failure(
             req,
             result,

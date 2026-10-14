@@ -3,11 +3,11 @@ what every page is for, plus the guides and runbooks at `/admin/help/<document>`
 
 What this is
     Four cards from the registry:
-      * `guide`: the admin guide (`docs/ADMIN_GUIDE.md`, a skeleton until the docs phase writes it): a link to it
-        and its contents, then the plan 16.3 outline chapter by chapter, pointing to the pages, cards and documents
-        that cover each one (the outline is the card's whole guide while the file is missing); then the documents
-        this page renders (runbooks, architecture, security, learning path, performance) and the incident runbook
-        index, one entry per runbook name the alert emails link to (`#runbook-<name>`).
+      * `guide`: the admin guide (`docs/ADMIN_GUIDE.md`): a link to it and its chapters, each a link to its own
+        page; then the plan 16.3 outline topic by topic, pointing to the pages, cards and documents that cover each
+        one (the outline is the card's whole guide in a release without the file); then the documents this page
+        renders (runbooks, architecture, security, learning path, performance) and the incident runbook index, one
+        entry per runbook name the alert emails link to (`#runbook-<name>`).
       * `glossary`: every term of `docs/glossary.yml` (`#term-<id>`, where every dotted term on the dashboard
         links), with a filter.
       * `keys`: every keyboard shortcut (the same list the `?` overlay shows; the "go to" keys come from the page
@@ -15,35 +15,41 @@ What this is
         would make the `?` key open nothing on this page.
       * `pages`: "what does this page do" for every page, from the registry (purpose, how to read it, its cards).
     Extra routes: `GET /admin/help/<slug>` renders one document of `_help_docs.DOCS` with the shell around it:
-    `/admin/help/runbooks#<anchor>` and `/admin/help/operations#<name>` are the links of the health checks.
+    `/admin/help/runbooks#<anchor>` and `/admin/help/operations#<name>` are the links of the health checks. The
+    admin guide is shown one chapter at a time: `/admin/help/guide` has its title, introduction, contents and first
+    chapter ("Getting started"), and `/admin/help/guide/<chapter>` one `##` chapter with links to the previous and
+    next ones (an unknown chapter is a 404; the first chapter's own address sends you to the guide's page).
 
 Why it exists
     Plan 14.7: help comes from one source each (the glossary file, the registry, the docs), and every page has
     "What this page is for". Plan 17.7: alert emails link to `/admin/help#runbook-<name>`
     (`roxy.notify.notifier.runbook_link`), and health checks link into the runbooks (`roxy.health.checks`): every
-    one of those links must reach its runbook (a test walks them all).
+    one of those links must reach its runbook (a test walks them all). The guide is about 640 KB of HTML in one
+    piece; a chapter is a page a phone can load.
 
 How it works
     The cards read no database: the glossary is loaded at startup (`shell.glossary_of`), the registry is data, and
-    the documents are rendered once per file version on a worker thread (`_help_docs.load_doc`). `static/js/pages/
-    help.js` filters the glossary and, when the address names `#runbook-<name>`, goes on to that runbook.
+    the documents are rendered once per file version on a worker thread (`_help_docs.load_doc`, and
+    `_help_docs.load_guide` for the guide's chapters). `static/js/pages/help.js` filters the glossary and, when the
+    address names `#runbook-<name>`, goes on to that runbook.
 
 What to read next
-    `roxy/admin/pages/_help_docs.py`, `templates/admin/pages/help.html`, `docs/RUNBOOKS.md` (its link index),
-    `roxy/admin/pages/registry.py`.
+    `roxy/admin/pages/_help_docs.py`, `templates/admin/pages/help.html`, `templates/admin/pages/help/
+    guide_chapter.html`, `docs/RUNBOOKS.md` (its link index), `roxy/admin/pages/registry.py`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any, Final
 
-from fastapi import Request
-from fastapi.responses import HTMLResponse
+from fastapi import HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from roxy.admin.pages import _help_docs, registry, shell
-from roxy.admin.pages._help_docs import DOC_BY_SLUG, DOCS, DocSpec, RunbookLink
+from roxy.admin.pages._help_docs import DOC_BY_SLUG, DOCS, GUIDE_SLUG, DocSpec, GuideBook, GuideChapter, RunbookLink
 from roxy.admin.pages.kit import Page, PageAdmin, PageView, templates_of
 from roxy.admin.pages.texts import glossary_terms
 
@@ -51,6 +57,9 @@ page = Page("help")
 router = page.router
 
 DOC_TEMPLATE: Final = "admin/pages/help/doc.html"
+GUIDE_TEMPLATE: Final = "admin/pages/help/guide_chapter.html"
+CHAPTER_SLUG: Final = re.compile(r"[a-z0-9-]{1,80}")
+"""What a chapter address segment can be (the guide's heading anchors, `roxy.public.pages.slugify`)."""
 
 Keys = tuple[tuple[str, ...], ...]
 """One shortcut: its alternatives, each a sequence of keys (`(("Ctrl", "K"), ("/",))` reads "Ctrl K or /")."""
@@ -82,6 +91,13 @@ DOC_HOW_TO_READ: Final[tuple[str, ...]] = (
     "The contents list jumps to any section; every heading also has a # link you can copy to point someone at it.",
     "Commands are shown in boxes you can scroll sideways. They are meant for the server's console, as the "
     "runbooks explain; nothing on this page runs anything.",
+)
+
+GUIDE_HOW_TO_READ: Final[tuple[str, ...]] = (
+    "The guide is shown one chapter at a time. The contents list opens any chapter, and lists the sections of the "
+    "one you are reading; Previous and Next at the end of a chapter follow the guide's order.",
+    "Every heading has a # link you can copy to point someone at it. Commands are shown in boxes you can scroll "
+    "sideways; they are meant for the server's console, and nothing on this page runs anything.",
 )
 
 
@@ -196,20 +212,21 @@ def chapters() -> list[dict[str, Any]]:
 
 @page.card("guide")
 async def guide_card(view: PageView) -> dict[str, Any]:
-    """The admin guide card: the guide (or its outline while it is unwritten), the documents, the runbook index."""
+    """The admin guide card: the guide and its chapters (or only the outline in a release without the file), the
+    documents, the runbook index."""
 
     def read() -> tuple[dict[str, bool], tuple[RunbookLink, ...]]:
         return _help_docs.available(), _help_docs.runbook_links()
 
     present, links = await asyncio.to_thread(read)
     guide = None
-    if present.get("guide"):
-        guide = await asyncio.to_thread(_help_docs.load_doc, DOC_BY_SLUG["guide"])
+    if present.get(GUIDE_SLUG):
+        guide = await asyncio.to_thread(_help_docs.load_guide)
     return {
         "guide": guide,
         "chapters": chapters(),
-        "documents": [spec for spec in DOCS if spec.listed and spec.slug != "guide" and present.get(spec.slug)],
-        "missing": [spec for spec in DOCS if spec.listed and spec.slug != "guide" and not present.get(spec.slug)],
+        "documents": [spec for spec in DOCS if spec.listed and spec.slug != GUIDE_SLUG and present.get(spec.slug)],
+        "missing": [spec for spec in DOCS if spec.listed and spec.slug != GUIDE_SLUG and not present.get(spec.slug)],
         "runbooks": [link for link in links if not link.operations],
     }
 
@@ -267,8 +284,60 @@ async def render_doc_page(request: Request, principal: Any, spec: DocSpec) -> HT
     return templates_of(request).render(request, DOC_TEMPLATE, context)
 
 
-def _doc_route(spec: DocSpec) -> Callable[[Request, PageAdmin], Awaitable[HTMLResponse]]:
-    async def route(request: Request, principal: PageAdmin) -> HTMLResponse:
+def guide_context(book: GuideBook, chapter: GuideChapter | None) -> dict[str, Any]:
+    """What `guide_chapter.html` needs besides the shell: the chapter (None for a guide with no `##` heading), the
+    introduction and the contents on the first page, the previous and next chapters, and the browser tab's title."""
+    first = chapter is None or chapter.first
+    before, after = book.neighbors(chapter) if chapter is not None else (None, None)
+    total = len(book.chapters)
+    if chapter is None or first:
+        purpose = DOC_BY_SLUG[GUIDE_SLUG].about
+    else:
+        purpose = f"Chapter {chapter.number} of {total}: {chapter.title}."
+    return {
+        "book": book,
+        "chapter": chapter,
+        "intro": book.intro if first else None,
+        "previous": before,
+        "next": after,
+        "purpose": purpose,
+        "tab_title": book.title if first or chapter is None else f"{chapter.title}: {book.title}",
+    }
+
+
+async def render_guide_page(request: Request, principal: Any, slug: str | None) -> Response:
+    """The admin guide's first page (`slug` None) or one of its chapters (`/admin/help/guide/<slug>`); 404 for a
+    chapter the guide does not have. A release without the guide shows the document page's "not written" notice."""
+    book = await asyncio.to_thread(_help_docs.load_guide)
+    if book is None:
+        if slug is not None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        return await render_doc_page(request, principal, DOC_BY_SLUG[GUIDE_SLUG])
+    if slug is None:
+        chapter = book.chapters[0] if book.chapters else None
+    else:
+        chapter = book.chapter(slug) if CHAPTER_SLUG.fullmatch(slug) else None
+        if chapter is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        if chapter.first:
+            return RedirectResponse(chapter.href, status_code=302)  # its one address: the guide's own page
+    built = await shell.build_shell(request, principal, page.spec)
+    guide = guide_context(book, chapter)
+    context = {
+        **built.context,
+        **guide,
+        "page": {"id": page.id, "title": book.title, "purpose": guide["purpose"], "how_to_read": GUIDE_HOW_TO_READ},
+        "spec": DOC_BY_SLUG[GUIDE_SLUG],
+        "documents": [item for item in DOCS if item.listed],
+        "page_assets": page.assets,
+    }
+    return templates_of(request).render(request, GUIDE_TEMPLATE, context)
+
+
+def _doc_route(spec: DocSpec) -> Callable[[Request, PageAdmin], Awaitable[Response]]:
+    async def route(request: Request, principal: PageAdmin) -> Response:
+        if spec.slug == GUIDE_SLUG:
+            return await render_guide_page(request, principal, None)
         return await render_doc_page(request, principal, spec)
 
     return route
@@ -284,4 +353,21 @@ for _spec in DOCS:
     )
 
 
-__all__ = ["GENERAL_SHORTCUTS", "LIST_SHORTCUTS", "SHORTCUTS_CARD", "chapters", "page", "render_doc_page", "router"]
+@router.get(f"/{GUIDE_SLUG}/{{chapter}}", include_in_schema=False, name="page_help_guide_chapter")
+async def guide_chapter_page(request: Request, principal: PageAdmin, chapter: str) -> Response:
+    """One chapter of the admin guide (`/admin/help/guide/<chapter>`)."""
+    return await render_guide_page(request, principal, chapter[:100])
+
+
+__all__ = [
+    "GENERAL_SHORTCUTS",
+    "GUIDE_HOW_TO_READ",
+    "LIST_SHORTCUTS",
+    "SHORTCUTS_CARD",
+    "chapters",
+    "guide_context",
+    "page",
+    "render_doc_page",
+    "render_guide_page",
+    "router",
+]

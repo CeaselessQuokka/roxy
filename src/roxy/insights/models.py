@@ -57,6 +57,39 @@ QUIET_STATES: Final[frozenset[str]] = frozenset({"dismissed", "rolled_back"})
 """Closed states that keep the same fingerprint quiet for `dismiss_cooldown_days` unless severity rises (11.3)."""
 APPLIED_STATES: Final[frozenset[str]] = frozenset({"applied", "auto_applied"})
 
+WATCH_VERDICTS: Final[tuple[str, ...]] = (
+    "watching",
+    "within_bounds",
+    "worse_applied_by_hand",
+    "worse_kept",
+    "worse_rollback_refused",
+    "rolled_back",
+    "canceled",
+)
+"""What a watch window (plan 11.4) found, beside its table state (`recommendation_watches.state` keeps `watching`,
+`kept`, `rolled_back`, `canceled`). A window closed as `kept` is `within_bounds` only when no guard number got worse;
+otherwise it is `worse_applied_by_hand` (plan 11.4 rolls back only auto-applied changes), `worse_kept` (the
+recommendation was no longer applied when the window closed) or `worse_rollback_refused` (final review brain-4: a
+regression must never read as "stayed within bounds")."""
+
+
+def watch_verdict(state: str, result: Any, rec_state: str | None = None) -> str:
+    """The `WATCH_VERDICTS` entry of one watch window: its stored `verdict`, else derived from its table `state` and
+    `result` (`worse`, `rollback_refused`; windows closed before verdicts were recorded). `rec_state` is the
+    recommendation's state when the window closes (`applied` names a change made by hand)."""
+    data = result if isinstance(result, Mapping) else {}
+    stored = data.get("verdict")
+    if isinstance(stored, str) and stored in WATCH_VERDICTS:
+        return stored
+    if state in ("watching", "rolled_back", "canceled"):
+        return state
+    if data.get("rollback_refused"):
+        return "worse_rollback_refused"
+    if not data.get("worse"):
+        return "within_bounds"
+    return "worse_applied_by_hand" if rec_state == "applied" else "worse_kept"
+
+
 CHANGE_KINDS: Final[tuple[str, ...]] = (
     "setting",
     "bucket_override",
@@ -400,6 +433,7 @@ __all__ = [
     "SEVERITIES",
     "SNOOZE_DURATIONS_S",
     "STATES",
+    "WATCH_VERDICTS",
     "Evidence",
     "Metric",
     "ProposedChange",
@@ -408,4 +442,5 @@ __all__ = [
     "iso",
     "make_fingerprint",
     "severity_rank",
+    "watch_verdict",
 ]

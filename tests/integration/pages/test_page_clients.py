@@ -25,6 +25,7 @@ import pytest
 
 from pages_harness import HOSTILE, PLACES, parse_html
 from roxy.admin.pages import registry
+from roxy.admin.pages.clients import OTHER_NOTES, bypass_prefill, key_notes
 from roxy.core.style_guard import find_style_issues
 
 PAGE = "/admin/clients"
@@ -243,3 +244,33 @@ async def test_an_empty_database_explains_itself(page: Any) -> None:
     view = await page.get(f"{PAGE}/client", params={"kind": "ip", "key": IP})
     assert view.status_code == 200
     assert "None in this range" in view.text
+
+
+def test_the_fold_row_and_the_bypass_hours_say_what_they_are() -> None:
+    """Findings docs_b-8 and docs_b-5: Roxy's own `other` row (the quieter clients beyond the record caps, summed)
+    is never called forged, in either table; a bypass default of 0 ("never expire") leaves the hours empty (the API
+    takes only hours above 0 and applies the default itself) and the dialog says an empty field never expires."""
+    assert key_notes("place", "other") == [OTHER_NOTES["place"]]
+    assert key_notes("ip", "other") == [OTHER_NOTES["ip"]]
+    assert key_notes("place", "<b>x</b>") == ["not a number: a forged header"]
+    assert key_notes("place", PLACES[0]) == []
+    assert key_notes("ip", IP) == []
+    assert bypass_prefill(24) == {"bypass_hours": "24", "bypass_never": False}
+    assert bypass_prefill(1.5) == {"bypass_hours": "1.5", "bypass_never": False}
+    assert bypass_prefill(0) == {"bypass_hours": "", "bypass_never": True}
+
+
+async def test_a_never_expiring_bypass_default_reads_as_such_in_the_dialog(page: Any, pages_app: Any) -> None:
+    before = pages_app.ctx.settings.get("bypass_default_expiry_h")
+    await pages_app.settings(bypass_default_expiry_h=0)
+    try:
+        doc = await page.doc(f"{PAGE}/ip/{IP}")
+        field = doc.select_one("#dlg-client-bypass-hours")
+        assert field is not None
+        assert not field.get("value")
+        words = " ".join(doc.select_one("#dlg-client-bypass").text().split())
+        assert "(empty: never expires)" in words
+        assert "this entry never expires" in words
+        assert "it expires by itself" not in words
+    finally:
+        await pages_app.settings(bypass_default_expiry_h=before)

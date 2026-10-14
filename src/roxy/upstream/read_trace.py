@@ -24,11 +24,13 @@ What to read next
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
 from roxy.core.reasons import ReasonCode
+from roxy.upstream.buckets import endpoint_bucket_key
 
 FULL_PCT: Final = 99.5
 """A bucket whose peak fill reached this (percent of its burst) in a minute was full in that minute."""
@@ -111,8 +113,18 @@ def request_bucket_keys(row: Mapping[str, Any]) -> list[str]:
         keys.append(f"host:{host}")
     template = str(row.get("template") or "")
     if template:
-        keys.append(f"endpoint:{template}")
+        keys.append(endpoint_bucket_key(template))  # the bucket's own key: the template in its pacing form
     return keys
+
+
+def _wait_text(retry: Any) -> str:
+    """` with Retry-After N s` for a logged 429's wait, or "" when it is missing or not a finite number (a row
+    written before header waits were bounded may hold infinity: review finding data-9)."""
+    try:
+        seconds = float(retry)
+    except (TypeError, ValueError):
+        return ""
+    return f" with Retry-After {round(seconds)} s" if math.isfinite(seconds) else ""
 
 
 def _ms(value: Any) -> float:
@@ -170,8 +182,7 @@ def explain_wait(facts: WaitFacts) -> dict[str, Any]:
     if reason == ReasonCode.UPSTREAM_COOLDOWN.value or reason == ReasonCode.CACHE_STALE_COOLDOWN.value:
         if facts.prior_429s:
             first = facts.prior_429s[0]
-            retry = first.get("retry_after_s")
-            wait = f" with Retry-After {round(float(retry))} s" if retry is not None else ""
+            wait = _wait_text(first.get("retry_after_s"))
             reasons.append(
                 f"The cooldown came from Roblox: a 429 on {first.get('endpoint_template')} through "
                 f"{first.get('egress')} at {first.get('at_ms')} ms{wait}."

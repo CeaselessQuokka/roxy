@@ -214,6 +214,14 @@ def test_memory_numbers_fit_the_909_mb_server() -> None:
     assert FRESH_COLOR_MIB[2] < LOW_MEMORY_MB, "a deploy in normal mode: two fresh workers fit what was available"
     assert f'LOW_MEMORY_MB="${{ROXY_LOW_MEMORY_MB:-{LOW_MEMORY_MB}}}"' in (DEPLOY / "deploy.sh").read_text()
     assert 2 * high + OS_AND_NGINX_MIB > SERVER_MIB, "if two warm colors ever fit, this docstring is out of date"
+    # A login burst (anyone can send one, no password needed) holds one argon2 hash per worker at a time: it must fit
+    # what a warm color has left under MemoryMax, or a burst gets a color killed (finding sec-2).
+    from roxy.admin.auth.passwords import ARGON2_MEMORY_KIB, HASH_CONCURRENCY
+
+    found = re.search(r"^ROXY_WORKERS=(\d+)$", (DEPLOY / "env" / "roxy.env.example").read_text(), re.M)
+    assert found is not None
+    workers = int(found[1])
+    assert workers * HASH_CONCURRENCY * ARGON2_MEMORY_KIB / 1024 <= hard - WARM_COLOR_MIB
 
 
 def test_ports_and_sockets_agree_across_files() -> None:

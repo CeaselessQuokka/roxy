@@ -12,8 +12,8 @@ from typing import Any
 
 import pytest
 
+from auth_harness import fast_hasher
 from roxy.admin.auth import recovery_codes, totp, users
-from roxy.admin.auth.testing import fast_hasher
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "create_admin.py"
 GOOD_PASSWORD = "violet tractor ladder 7731"

@@ -9,7 +9,9 @@ Why it exists
     Owner decision D5: the first v2 login of the imported v1 account uses the password plus an emailed code once,
     and the resulting "bootstrap" session can do exactly one thing: enroll an authenticator app. Confirming it
     stores the secret (encrypted), creates 10 recovery codes (shown once), clears `mfa_bootstrap_pending` so the
-    email path closes, and rotates the session to a full one. Replacing the authenticator later, regenerating
+    email path closes, rotates the session to a full one, and ends every other bootstrap session and pending
+    bootstrap login of the account in the same writes (a bootstrap session confirming after another enrolled is
+    refused inside the write). Replacing the authenticator later, regenerating
     recovery codes and managing passkeys are sensitive actions: the routes require a fresh second factor
     (`require_admin("fresh_mfa")`, plan 9.6).
 
@@ -117,7 +119,7 @@ async def confirm_totp(
         raise mfa_failure()
     codes = recovery_codes.generate()
     try:
-        entries = await recovery_codes.hash_codes(service.hasher, codes)
+        entries = await recovery_codes.hash_codes(service.hasher, codes, exempt=True)
     except HashQueueFull:
         await service.hot_write(lambda conn: lockout.release(conn, reservation.subject))
         raise lockout_error(HashQueueFull.retry_after_s) from None
@@ -128,6 +130,9 @@ async def confirm_totp(
         if transactions.take(conn, name, now_ms) is None:
             return False
         lockout.clear(conn, key)
+        # The emailed first-login path closes with this enrollment: a bootstrap login started earlier (in any
+        # browser) can no longer finish (D5, finding sec-3; `flow.mfa` also re-checks the account).
+        transactions.delete_bootstrap_logins(conn, record.user_id)
         return True
 
     if not await service.hot_write(finish):
@@ -135,7 +140,11 @@ async def confirm_totp(
     stored = cipher.encrypt(secret, totp.user_context(record.user_id))
     max_age = service.settings.int("admin_session_max_age_s")
 
-    def write(conn: sqlite3.Connection) -> str:
+    def write(conn: sqlite3.Connection) -> str | None:
+        if record.mfa_level == "bootstrap" and not users.bootstrap_open(conn, record.user_id):
+            # This bootstrap session was opened before another one enrolled an authenticator: it may not put a
+            # different one over it (that needs a fresh second factor, plan 9.6; finding sec-3).
+            return None
         users.store_totp(conn, record.user_id, stored, recovery_codes.dumps(entries))
         audit_auth(
             conn,
@@ -161,9 +170,20 @@ async def confirm_totp(
             at=now,
         )
         token, _ = sessions.rotate(conn, record, mfa_level="totp", now=now, ip=info.ip, ua=info.ua, max_age_s=max_age)
+        # Every other bootstrap session of this account (a second browser, an attacker's) ends in the same write.
+        sessions.revoke_bootstrap(conn, record.user_id)
         return token
 
     token = await service.control_write(write)
+    if token is None:
+        await service.audit_quietly(
+            "auth.mfa_failed",
+            info,
+            user_id=record.user_id,
+            username=record.username,
+            reason="authenticator enrollment from a first-login session after the account had enrolled one",
+        )
+        raise mfa_failure()
     return token, codes
 
 
@@ -171,7 +191,7 @@ async def regenerate_recovery(service: AuthService, info: RequestInfo, record: s
     """Replace every recovery code with a new set (the old ones stop working)."""
     codes = recovery_codes.generate()
     try:
-        entries = await recovery_codes.hash_codes(service.hasher, codes)
+        entries = await recovery_codes.hash_codes(service.hasher, codes, exempt=True)
     except HashQueueFull:
         raise lockout_error(HashQueueFull.retry_after_s) from None
     now = int(service.clock.now())

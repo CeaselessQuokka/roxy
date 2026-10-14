@@ -255,6 +255,9 @@ def test_resolve_time_follows_the_api_rules() -> None:
     assert time.tr.compare == "week"
     assert time.params == {"range": "6h", "compare": "week"}
     assert time.query(page=2) == "range=6h&compare=week&page=2"
+    # A card subtitle reads the range alone; a card that draws the comparison names it (finding docs_b-15).
+    assert time.view["description"] == "Last 6 hours"
+    assert time.view["compare_label"] == "the same period last week"
     fallback = shell.resolve_time({"range": "6h", "from": "1"}, now=1_800_000_000, tz="UTC")
     assert fallback.notice
     assert fallback.tr.key == "24h"

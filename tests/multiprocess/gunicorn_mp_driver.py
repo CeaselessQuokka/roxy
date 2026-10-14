@@ -63,6 +63,10 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 
 REPO = Path(__file__).resolve().parents[2]
+if str(REPO / "tests") not in sys.path:
+    # Run as a script, this file's own directory is on sys.path, not tests/: the auth test helpers
+    # (`tests/auth_harness.py`) are imported from there, as pytest's root conftest makes possible.
+    sys.path.append(str(REPO / "tests"))
 VENV_BIN = REPO / ".venv" / "bin"
 NETS = ("192.0.2", "198.51.100", "203.0.113")  # documentation ranges (RFC 5737)
 SINGLE_FLIGHT_UNIVERSE = "4242"
@@ -799,8 +803,8 @@ async def wave3_jobs_settle(env: Mapping[str, str], timeout_s: float = 100.0) ->
 
 def make_test_admin(env: Mapping[str, str], credentials: Path) -> Any:
     """An admin with a password and a TOTP secret, written straight to control.db (`make_admin`, test helper)."""
+    from auth_harness import make_admin
     from roxy.admin.auth import totp
-    from roxy.admin.auth.testing import make_admin
     from roxy.storage.db import Database
 
     cipher = totp.load_cipher(credentials)
@@ -818,8 +822,8 @@ def admin_openapi(master: Master, env: Mapping[str, str], admin: Any) -> dict[st
     The session cookie is `Secure`, which httpx never sends over plain http, so it is read from `Set-Cookie` and
     sent by hand (the server only reads the cookie; HTTPS is nginx's job in production).
     """
+    from auth_harness import LOGIN_PATH, MFA_PATH, TEST_UA
     from roxy.admin.auth import totp
-    from roxy.admin.auth.testing import LOGIN_PATH, MFA_PATH, TEST_UA
 
     base = f"http://127.0.0.1:{master.port}"
     headers = {"Origin": env["ROXY_SITE_ORIGIN"], "Sec-Fetch-Site": "same-origin", "User-Agent": TEST_UA}

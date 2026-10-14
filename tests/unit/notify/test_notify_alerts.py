@@ -13,12 +13,13 @@ EXPECTED_SUBJECTS = {
     ("credential_cooldown", ()): "Roxy: credential cooling down",
     ("credential_rotated", ()): "Roxy: Roblox sent a new credential cookie",
     ("admin_login", ()): "Roxy Admin Login",
+    ("test_alert", ()): "Roxy: test alert",
     ("service_down", (("unit", "roxy@blue"), ("host", "box"))): "Roxy DOWN: roxy@blue failed on box",
     ("deploy_failed", (("short_sha", "abc1234"), ("step", 4))): "Roxy: deploy abc1234 failed at step 4",
     ("leak_guard", ()): "Roxy SECURITY: credential leak blocked",
     ("roblox_429", (("rate", "3.1"),)): "Roxy: Roblox is rate-limiting us (3.1%)",
     ("caller_5xx", (("rate", "2.5"),)): "Roxy: caller errors at 2.5%",
-    ("rotator_quota", (("pct", 80),)): "Roxy: rotator at 80% of monthly quota",
+    ("rotator_quota", (("pct", 80), ("cycle_start", 1_760_000_000))): "Roxy: rotator at 80% of monthly quota",
     ("disk", (("pct", 91),)): "Roxy: storage at 91% of budget",
     ("db_integrity", ()): "Roxy: database integrity check failed",
     ("backup_failed", ()): "Roxy: backup failed",
@@ -55,7 +56,9 @@ def test_cooldown_keys_severity_and_channels() -> None:
     leak = make_alert("leak_guard", summary="s")
     assert leak.always_send
     assert leak.severity == "critical"
-    assert make_alert("rotator_quota", summary="s", pct=95, severity="critical").severity == "critical"
+    quota = make_alert("rotator_quota", summary="s", pct=95, cycle_start=1_760_000_000, severity="critical")
+    assert quota.severity == "critical"
+    assert (quota.cooldown_key, quota.cooldown_s) == ("quota:95:1760000000", 40 * 86_400)  # as its producer passes
     assert make_alert("digest", summary="s", n=1, day="d").channels == ("email",)
     refused = make_alert("auto_apply_rollback_failed", summary="s", rec_id="r1")
     assert refused.severity == "critical"  # the change is still in place (plan 11.4, finding insights-5)

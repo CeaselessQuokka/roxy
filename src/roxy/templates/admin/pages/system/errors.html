@@ -7,8 +7,11 @@
   is in the address bar). A row opens `?signature=` in the drawer: `system_api.error_detail_view`, the redacted
   traceback and the hourly count of the last day. Signatures, details, the raising place and tracebacks can quote a
   path or a header a caller sent, so all of them are plain text through `caller_text`.
-  Context: `frame`, then either `table`, `table_only`, `total`, `filtered`, or `detail`, `first`, `last`, `hourly`,
-  `hourly_values`, `occurrence_help` (the drawer; the help of `error_occurrences` from metrics/catalog.py).
+  The intro states how long signatures are kept (`kept`: the live `retention_errors_days` and `max_error_records`,
+  applied by `storage/retention.py prune_errors`); the drawer says that only rows brought over from v1 lack a
+  traceback (`metrics/security_events.py` stores one for every error Roxy records itself).
+  Context: `frame`, then either `table`, `table_only`, `total`, `filtered`, `kept`, or `detail`, `first`, `last`,
+  `hourly`, `hourly_values`, `occurrence_help` (the drawer; the help of `error_occurrences` from metrics/catalog.py).
 -#}
 {% from "components/page_card.html" import page_card, family_reset %}
 {% from "components/table.html" import data_table %}
@@ -36,7 +39,7 @@
     <pre class="system-trace" tabindex="0" aria-labelledby="error-detail-trace">{{ caller_text(detail.traceback, 32768) }}</pre>
     <p class="muted">Secrets were removed before the traceback was stored, and once more when it was read.</p>
     {% else %}
-    <p class="muted">No traceback was kept for this error (Roblox's answers and probes have none).</p>
+    <p class="muted">No traceback was kept for this error. Errors brought over from v1 have none; Roxy's own keep the last one.</p>
     {% endif %}
   </section>
   {% if hourly is not none %}
@@ -57,7 +60,7 @@
 {% else %}
 {#- v1's "Clear data" of the Error Log: the plan 6.8 family `errors` (finding v1parity-8). -#}
 {% call page_card(frame, actions=family_reset("errors", "the error log"), subtitle=(num(total) ~ (" matching errors" if filtered else " distinct errors"))) %}
-<p class="system-intro">Errors inside Roxy and its calls, grouped by signature with how often each happened. Nothing is dropped as more come in; a data reset of the errors family clears them. Open a row for its traceback.</p>
+<p class="system-intro">Errors raised inside Roxy while it answered a request (the caller got a 500), grouped by signature with how often each happened. A signature is kept {{ num(kept.days) }} days after it last happened, and at most {{ num(kept.max) }} are kept (the least recent go first; both are settings on the Data page); a data reset of the errors family clears them. Open a row for its traceback.</p>
 {{ data_table(**table) }}
 {% endcall %}
 {% endif %}

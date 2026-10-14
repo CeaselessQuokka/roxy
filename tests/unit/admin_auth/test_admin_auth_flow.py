@@ -8,8 +8,8 @@ from __future__ import annotations
 import json
 import re
 
+from auth_harness import TEST_UA, AuthHarness, SoftwarePasskey
 from roxy.admin.auth import sessions, totp, transactions
-from roxy.admin.auth.testing import TEST_UA, AuthHarness, SoftwarePasskey
 
 API = "/admin/api/v1/auth"
 

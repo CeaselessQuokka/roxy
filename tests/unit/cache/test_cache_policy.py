@@ -227,6 +227,16 @@ def test_429_becomes_a_marker_until_the_cooldown_ends() -> None:
     assert marker_ttl(bare, _cs()) == 30  # no Retry-After: cooldown_default_s
 
 
+def test_a_429_that_opened_no_cooldown_leaves_no_marker() -> None:
+    """Final review pipe-6: one burned rotator exit opens no cooldown (plan 7.5), so the upstream sends no
+    `negative_ttl_s` and the key is not parked behind a marker of a cooldown that does not exist (plan 7.7)."""
+    burned = roblox_429(45, cooldown_s=None, negative_ttl_s=None)
+    decision = store_decision(burned, _policy(), _cs())
+    assert (decision.kind, decision.why) == (StoreKind.NONE, "upstream_veto")
+    off = store_decision(burned, _policy(cache_negative_429=0), _cs(cache_negative_429=0))
+    assert (off.kind, off.why) == (StoreKind.NONE, "upstream_429")
+
+
 def test_failures_are_never_content() -> None:
     for result in (failure(), failure(ReasonCode.UPSTREAM_TIMEOUT, 504), failure(ReasonCode.UPSTREAM_BUSY, 429)):
         assert store_decision(result, _policy(), _cs()).kind is StoreKind.NONE

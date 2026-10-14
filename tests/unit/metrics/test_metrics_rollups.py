@@ -234,4 +234,5 @@ async def test_compact_level_reports_completeness(dbs: Any) -> None:
 def test_level_specs_are_consistent(level: str) -> None:
     spec = LEVELS[level]
     assert spec.unit in ("hour", "day", "month")
-    assert spec.has_tz == (spec.dst in ("rollup_day", "rollup_month"))
+    # Day and month rows store their zone: the rollups' and the Roblox answers' (metrics 0010).
+    assert spec.has_tz == (spec.dst in ("rollup_day", "rollup_month", "roblox_answer_day", "roblox_answer_month"))

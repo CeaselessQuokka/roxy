@@ -210,7 +210,9 @@ SETTINGS: list[SettingSpec] = [
         step=1,
         description=(
             "The hour of the day (0 to 23, in the dashboard time zone) at which Roxy emails a daily digest of open "
-            "recommendations, failing health checks and the Roblox rate limiting numbers. -1 turns the digest off."
+            "recommendations, failing health checks and the Roblox rate limiting numbers. -1 turns the digest off. "
+            "The digest is an info-level message, so it is emailed only while alert_min_severity is info (the "
+            "default, warn, holds it back)."
         ),
         pages=_ALERT_PAGES,
         if_raised="The digest arrives later in the day.",
@@ -258,8 +260,10 @@ SETTINGS: list[SettingSpec] = [
         default=0,
         description=(
             "Whether scheduled health runs also run the checks that call Roblox with the account credential (for "
-            "example confirming it is still logged in). Runs you start yourself always include them, and the "
-            "credential also has its own periodic check (credential_probe_interval_min)."
+            "example confirming it is still logged in). A run you start from the Health page includes them while "
+            "its 'Include the credential check' box is ticked (the default); the Overview's Check Proxy Health "
+            "button and the command palette leave them out. The credential also has its own periodic check "
+            "(credential_probe_interval_min)."
         ),
         pages=_HEALTH_PAGES,
         if_enabled=(

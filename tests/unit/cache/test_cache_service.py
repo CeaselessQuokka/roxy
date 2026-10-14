@@ -333,6 +333,25 @@ async def test_429_marker_keeps_callers_away_from_roblox(dbs: Any, clock: FakeCl
     assert upstream.count == 2
 
 
+async def test_purge_markers_lets_the_marked_key_reach_roblox_again(dbs: Any, clock: FakeClock) -> None:
+    """Final review pipe-5: the upstream reset ends every cooldown, so it removes the per-key 429 markers too
+    (fleet-wide: cache.db rows and, through the change stamp, every memory tier); content entries stay."""
+    upstream = FakeUpstream(lambda req, n: ok("{}"))
+    service = make_service(dbs, clock, upstream)
+    await call(service, "games.roblox.com/v1/games/votes?universeIds=2")  # a content entry that must stay
+    upstream.responder = lambda req, n: roblox_429(300)
+    assert (await call(service)).status == 429
+    clock.advance(2)
+    assert (await call(service)).status == 429  # the marker answers, no call
+    assert upstream.count == 2
+    assert await service.purge_markers() == 1
+    upstream.responder = lambda req, n: ok("{}")
+    assert (await call(service)).status == 200
+    assert upstream.count == 3
+    kept = await call(service, "games.roblox.com/v1/games/votes?universeIds=2")
+    assert kept.cache_state is CacheState.HIT
+
+
 async def test_429_with_stale_entry_serves_stale_then_marker_keeps_serving_stale(dbs: Any, clock: FakeClock) -> None:
     upstream = FakeUpstream()
     service = make_service(dbs, clock, upstream)

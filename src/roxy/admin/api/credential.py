@@ -56,7 +56,7 @@ from roxy.admin.api.common import AdminFreshMfa, AdminSession, ApiBody, CsrfChec
 from roxy.admin.api.routing_rules import DeleteBody, Reason
 from roxy.core.reasons import Egress
 from roxy.deps import get_ctx
-from roxy.egress.credential import MAX_VALUE_LENGTH, ProbeResult
+from roxy.egress.credential import ACCOUNT_CHANGED, MAX_VALUE_LENGTH, ProbeResult
 from roxy.metrics import queries, read_upstream
 from roxy.metrics.queries import Window
 from roxy.upstream import cooldowns
@@ -130,20 +130,37 @@ def _confirmed(text: str, expected: str) -> bool:
 
 
 def _account(status: Any) -> dict[str, Any]:
-    """The account fingerprint the credential was set with, and the one the last probe saw when they differ."""
-    result = status.last_probe_result or {}
-    pending = result.get("pending_account") if isinstance(result, dict) else None
+    """The account fingerprint the credential was set with, and the one the last probe saw when they differ.
+
+    After a deliberate replace whose first answer named another account than the previous value's
+    (`last_probe_result.result` `account_changed`, finding docs_a-1), `changed` is True and `previous` names the
+    account before the replace: the page says the account changed instead of "Same account as before", and no
+    confirmation is asked (the replace itself was the confirmed C1 action)."""
+    result = status.last_probe_result if isinstance(status.last_probe_result, dict) else {}
+    pending = result.get("pending_account")
     recorded = status.account_id_fingerprint
+    if result.get("result") == ACCOUNT_CHANGED:
+        previous = result.get("previous_account")
+        return {
+            "recorded": recorded,
+            "previous": previous if isinstance(previous, str) else None,
+            "last_probe": recorded,
+            "match": None,
+            "changed": True,
+            "confirmation_required": False,
+        }
     if result.get("result") == "account_mismatch" and isinstance(pending, str):
         match: bool | None = False
-    elif recorded is not None and isinstance(result, dict) and result.get("result") in ("ok", "account_confirmed"):
+    elif recorded is not None and result.get("result") in ("ok", "account_confirmed"):
         match = True
     else:
         match = None
     return {
         "recorded": recorded,
+        "previous": None,
         "last_probe": pending if match is False else (recorded if match else None),
         "match": match,
+        "changed": False,
         "confirmation_required": match is False,
     }
 

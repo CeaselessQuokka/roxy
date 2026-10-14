@@ -32,6 +32,10 @@ How it works
       minus upstream calls for caller traffic; `errors_hidden` counts stale serves after an upstream failure;
       "who returned it" reads the source through `ANSWER_SOURCE_SQL` (a Roblox 5xx passed on after the retries is
       Roblox's). A KPI tile over a reset of its own data gets a notice instead of a delta (`kpis_sync`, plan 6.8).
+    - Two views of status codes (lead decision 11): the answers Roxy gave callers (`caller_2xx`, `caller_4xx`,
+      `status_5xx`, `caller_roblox_5xx`: rollup measures of the caller's final status) and the answers Roblox gave
+      Roxy's calls for callers, per attempt (`status_2xx`, `status_4xx`, `roblox_5xx`: `ANSWER_METRICS`, read from
+      the Roblox answer tables like `roblox_429` from its log, unknown for a slice those tables do not keep).
 
 What to read next
     `roxy/metrics/catalog.py` (what each measure means), `roxy/metrics/rollups.py` (how the levels are built).
@@ -39,10 +43,13 @@ What to read next
 
 from __future__ import annotations
 
+import bisect
 import calendar
+import heapq
+import itertools
 import json
 import sqlite3
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
@@ -50,7 +57,7 @@ from typing import Any
 from roxy.metrics import annotate, histograms, read_client_extras
 from roxy.metrics.histograms import register_sql_functions
 from roxy.metrics.live import LIVE_EVENT
-from roxy.metrics.rollups import HOUR_S, bucket_floor, bucket_next, zone
+from roxy.metrics.rollups import ANSWER_TABLES, HOUR_S, bucket_floor, bucket_next, zone
 from roxy.storage.db import Database
 
 GRANULARITIES: tuple[str, ...] = ("minute", "hour", "day", "week", "month", "year")
@@ -121,12 +128,14 @@ MEASURES: tuple[tuple[str, str], ...] = (
     ("internal_calls", "sum(CASE WHEN d.source = 'internal' THEN r.upstream_calls ELSE 0 END)"),
     ("errors", "sum(CASE WHEN d.source != 'internal' THEN r.errors ELSE 0 END)"),
     ("errors_hidden", "sum(CASE WHEN d.reason_code = 'cache_stale_error' THEN r.requests ELSE 0 END)"),
-    ("status_2xx", "sum(CASE WHEN d.status BETWEEN 200 AND 299 THEN r.requests ELSE 0 END)"),
-    ("status_4xx", "sum(CASE WHEN d.status BETWEEN 400 AND 499 THEN r.requests ELSE 0 END)"),
+    # The caller's final status (lead decision 11: "answers to callers"). `status_2xx`, `status_4xx` and `roblox_5xx`
+    # are Roblox's answers per attempt since metrics 0010 (`ANSWER_METRICS`); these keep the caller's view.
+    ("caller_2xx", "sum(CASE WHEN d.status BETWEEN 200 AND 299 THEN r.requests ELSE 0 END)"),
+    ("caller_4xx", "sum(CASE WHEN d.status BETWEEN 400 AND 499 THEN r.requests ELSE 0 END)"),
     ("status_5xx", "sum(CASE WHEN d.status BETWEEN 500 AND 599 THEN r.requests ELSE 0 END)"),
     ("roxy_429", "sum(CASE WHEN d.status = 429 AND d.source = 'roxy' THEN r.requests ELSE 0 END)"),
     (
-        "roblox_5xx",
+        "caller_roblox_5xx",
         f"sum(CASE WHEN d.status BETWEEN 500 AND 599 AND {ANSWER_SOURCE_SQL} IN ('roblox', 'relay') "
         "THEN r.requests ELSE 0 END)",
     ),
@@ -182,9 +191,23 @@ METRIC_MEASURES: dict[str, tuple[str, ...]] = {
     "hit_ratio": ("cache_hit", "cache_stale", "cache_revalidating", "cache_coalesced", "cache_miss"),
     "roblox_429": (),
     "roblox_429_per_10k": ("demand",),
+    "status_2xx": (),
+    "status_4xx": (),
+    "roblox_5xx": (),
 }
 """The measures each other derived metric is computed from (`Totals.derived`; every name of `MEASURE_NAMES` is its
 own measure). A series computes only what its metrics read (`measures_for`)."""
+
+ANSWER_METRICS: dict[str, str] = {"status_2xx": "answers_2xx", "status_4xx": "answers_4xx", "roblox_5xx": "answers_5xx"}
+"""The tiles that count Roblox's answers per attempt (lead decision 11, v1 `log_status_code`): metric key to its column
+of the Roblox answer tables (metrics 0010, `ANSWER_LEVELS`). Not rollup measures: like `roblox_429` they are read from
+their own tables (`_count_answers`), by endpoint, host and egress only, and None for a slice those tables cannot
+answer (a group or filter by outcome, say). The caller's final status keeps its own measures (`caller_2xx`,
+`caller_4xx`, `status_5xx`, `caller_roblox_5xx`)."""
+ANSWER_SLICES: frozenset[str] = frozenset({"endpoint_template", "host", "egress"})
+"""The dimensions the Roblox answer tables keep: the only groups and filters `_count_answers` can answer."""
+AnswerCounts = tuple[int, int, int]
+"""`(2xx, 4xx, 5xx)` answers Roblox gave, in `ANSWER_METRICS` order."""
 
 
 def measures_for(metrics: Iterable[str]) -> tuple[tuple[str, ...] | None, tuple[str, ...] | None]:
@@ -210,7 +233,34 @@ def measures_for(metrics: Iterable[str]) -> tuple[tuple[str, ...] | None, tuple[
     return tuple(n for n in MEASURE_NAMES if n in names), tuple(h for h in HIST_NAMES if h in hists)
 
 
-LEVEL_ORDER: tuple[str, ...] = ("rollup_month", "rollup_day", "rollup_hour", "rollup_minute")
+@dataclass(frozen=True, slots=True)
+class LevelFamily:
+    """One set of time levels compacted alike (`rollups.LEVELS`): the minute level the workers write, then the hours
+    (UTC), local days and local months the leader computes, each day and month row carrying its zone. The rollups
+    are one family; the Roblox answer tables (metrics 0010) another, read through the same piece rules, each level
+    up to its own watermark."""
+
+    minute: str
+    hour: str
+    day: str
+    month: str
+
+    @property
+    def order(self) -> tuple[str, str, str, str]:
+        """Coarsest first (`LEVEL_ORDER` for the rollups)."""
+        return (self.month, self.day, self.hour, self.minute)
+
+    def base(self, granularity: str) -> str:
+        """The coarsest level of this family that fits `granularity` (`BASE_LEVEL` for the rollups)."""
+        units = {"minute": self.minute, "hour": self.hour, "day": self.day, "week": self.day}
+        return units.get(granularity, self.month)
+
+
+ROLLUP_LEVELS = LevelFamily("rollup_minute", "rollup_hour", "rollup_day", "rollup_month")
+ANSWER_LEVELS = LevelFamily(*ANSWER_TABLES)
+"""Roblox's answers per attempt (metrics 0010, lead decision 11): `roblox_answer_minute` to `roblox_answer_month`."""
+
+LEVEL_ORDER: tuple[str, ...] = ROLLUP_LEVELS.order
 BASE_LEVEL = {
     "minute": "rollup_minute",
     "hour": "rollup_hour",
@@ -219,7 +269,13 @@ BASE_LEVEL = {
     "month": "rollup_month",
     "year": "rollup_month",
 }
-LEVEL_UNIT = {"rollup_month": "month", "rollup_day": "day", "rollup_hour": "hour", "rollup_minute": "minute"}
+LEVEL_UNIT = {
+    family_level: unit
+    for family in (ROLLUP_LEVELS, ANSWER_LEVELS)
+    for family_level, unit in zip(family.order, ("month", "day", "hour", "minute"), strict=True)
+}
+TZ_LEVELS: frozenset[str] = frozenset({ROLLUP_LEVELS.day, ROLLUP_LEVELS.month, ANSWER_LEVELS.day, ANSWER_LEVELS.month})
+"""Levels whose rows store the zone they were computed in (`tz`)."""
 
 SORTABLE: tuple[str, ...] = (
     *MEASURE_NAMES,
@@ -230,6 +286,7 @@ SORTABLE: tuple[str, ...] = (
     "p95_ms",
     "p99_ms",
     "roblox_429",
+    *ANSWER_METRICS,
     "key",
 )
 
@@ -424,32 +481,41 @@ def _filter_sql(filters: Mapping[str, Any] | None) -> tuple[str, list[Any]]:
 
 
 def _watermark_end(conn: sqlite3.Connection, table: str) -> int | None:
-    """End of the newest compacted bucket of a level (None when the level is empty)."""
-    if table == "rollup_minute":
+    """End of the newest compacted bucket of a level (None when the level is empty, or for a minute level)."""
+    unit = LEVEL_UNIT[table]
+    if unit == "minute":
         return None
-    tz_col = ", tz" if table in ("rollup_day", "rollup_month") else ""
-    row = conn.execute(f"SELECT bucket_start{tz_col} FROM {table} ORDER BY bucket_start DESC LIMIT 1").fetchone()  # noqa: S608 (LEVEL_ORDER)
+    tz_col = ", tz" if table in TZ_LEVELS else ""
+    row = conn.execute(f"SELECT bucket_start{tz_col} FROM {table} ORDER BY bucket_start DESC LIMIT 1").fetchone()  # noqa: S608 (LEVEL_UNIT)
     if row is None:
         return None
-    unit = LEVEL_UNIT[table]
     return bucket_next(int(row[0]), unit, zone(row[1]) if tz_col else None)
 
 
 def level_pieces(conn: sqlite3.Connection, base: str, start: int, end: int) -> list[tuple[str, int, int]]:
     """Which table answers which part of `[start, end)`: the base level up to its watermark, then finer levels."""
+    return _family_level_pieces(conn, base, start, end, ROLLUP_LEVELS)
+
+
+def _family_level_pieces(
+    conn: sqlite3.Connection, base: str, start: int, end: int, family: LevelFamily
+) -> list[tuple[str, int, int]]:
+    """`level_pieces` over the levels of `family` (the rollups, or the Roblox answer tables), each read up to its
+    own watermark."""
     pieces: list[tuple[str, int, int]] = []
     cursor = start
-    for table in LEVEL_ORDER[LEVEL_ORDER.index(base) :]:
+    order = family.order
+    for table in order[order.index(base) :]:
         if cursor >= end:
             break
-        if table == "rollup_minute":
+        if table == family.minute:
             pieces.append((table, cursor, end))
             cursor = end
             break
-        if table == "rollup_hour" and cursor % HOUR_S:
+        if table == family.hour and cursor % HOUR_S:
             # A half-hour zone's day boundary: the partial hour comes from minutes.
             edge = min(end, cursor - cursor % HOUR_S + HOUR_S)
-            pieces.append(("rollup_minute", cursor, edge))
+            pieces.append((family.minute, cursor, edge))
             cursor = edge
         mark = _watermark_end(conn, table)
         hi = min(end, mark) if mark is not None else cursor
@@ -459,7 +525,9 @@ def level_pieces(conn: sqlite3.Connection, base: str, start: int, end: int) -> l
     return pieces
 
 
-def _whole_days(conn: sqlite3.Connection, start: int, end: int) -> tuple[int, int] | None:
+def _whole_days(
+    conn: sqlite3.Connection, start: int, end: int, *, family: LevelFamily | None = None
+) -> tuple[int, int] | None:
     """`(lo, hi)`: the first contiguous run of compacted day buckets that lie wholly inside `[start, end)`, or None.
 
     Each `rollup_day` row knows its zone (`tz`), so a bucket ends where `bucket_next` in that zone says (23 or 25
@@ -467,8 +535,9 @@ def _whole_days(conn: sqlite3.Connection, start: int, end: int) -> tuple[int, in
     change) and is used only when both its ends are on whole hours (never in a half-hour zone), so the hours on
     either side of it tile the rest of the window exactly.
     """
+    day_table = (family or ROLLUP_LEVELS).day
     rows = conn.execute(
-        "SELECT bucket_start, max(tz) AS tz FROM rollup_day WHERE bucket_start >= ? AND bucket_start < ? "
+        f"SELECT bucket_start, max(tz) AS tz FROM {day_table} WHERE bucket_start >= ? AND bucket_start < ? "  # noqa: S608 (LevelFamily)
         "GROUP BY bucket_start ORDER BY bucket_start",
         (start, end),
     ).fetchall()
@@ -488,7 +557,9 @@ def _whole_days(conn: sqlite3.Connection, start: int, end: int) -> tuple[int, in
     return lo, hi
 
 
-def cover_pieces(conn: sqlite3.Connection, start: int, end: int) -> list[tuple[str, int, int]]:
+def cover_pieces(
+    conn: sqlite3.Connection, start: int, end: int, *, family: LevelFamily | None = None
+) -> list[tuple[str, int, int]]:
     """Which rows answer `[start, end)` when only the window's sum is wanted (totals, KPI tiles and top-N tables;
     never the buckets of a chart): whole compacted days from `rollup_day`, whole hours from `rollup_hour`, and the
     minutes at either edge and after the hour watermark from `rollup_minute`.
@@ -498,34 +569,38 @@ def cover_pieces(conn: sqlite3.Connection, start: int, end: int) -> list[tuple[s
     day total about 30 day rows instead of 720 hour rows (plan 6.7: dashboard first render under 300 ms; at plan
     6.6's volume a 24 hour total read 120,000 minute rows and called the histogram aggregate twice for each).
     """
-    days = _whole_days(conn, start, end)
+    levels = family or ROLLUP_LEVELS
+    days = _whole_days(conn, start, end, family=levels)
     if days is None:
-        return _hour_pieces(conn, start, end)
+        return _hour_pieces(conn, start, end, family=levels)
     lo, hi = days
-    pieces = _hour_pieces(conn, start, lo) if start < lo else []
-    pieces.append(("rollup_day", lo, hi))
+    pieces = _hour_pieces(conn, start, lo, family=levels) if start < lo else []
+    pieces.append((levels.day, lo, hi))
     if hi < end:
-        pieces += _hour_pieces(conn, hi, end)
+        pieces += _hour_pieces(conn, hi, end, family=levels)
     return pieces
 
 
-def _hour_pieces(conn: sqlite3.Connection, start: int, end: int) -> list[tuple[str, int, int]]:
+def _hour_pieces(
+    conn: sqlite3.Connection, start: int, end: int, *, family: LevelFamily | None = None
+) -> list[tuple[str, int, int]]:
     """`[start, end)` as minutes up to the first whole hour, whole compacted hours (never one that runs past `end`
     or past the hour watermark), and minutes for the rest."""
+    levels = family or ROLLUP_LEVELS
     first = min(end, start + (-start) % HOUR_S)
     pieces: list[tuple[str, int, int]] = []
     if start < first:
-        pieces.append(("rollup_minute", start, first))
-    mark = _watermark_end(conn, "rollup_hour")
+        pieces.append((levels.minute, start, first))
+    mark = _watermark_end(conn, levels.hour)
     last = min(end - end % HOUR_S, mark) if mark is not None else first
     if last > first:
-        pieces.append(("rollup_hour", first, last))
+        pieces.append((levels.hour, first, last))
         first = last
     if first < end:
-        if pieces and pieces[-1][0] == "rollup_minute":
-            pieces[-1] = ("rollup_minute", pieces[-1][1], end)  # no whole hour between: one minute read
+        if pieces and pieces[-1][0] == levels.minute:
+            pieces[-1] = (levels.minute, pieces[-1][1], end)  # no whole hour between: one minute read
         else:
-            pieces.append(("rollup_minute", first, end))
+            pieces.append((levels.minute, first, end))
     return pieces
 
 
@@ -533,10 +608,15 @@ def total_pieces(conn: sqlite3.Connection, window: Window) -> list[tuple[str, in
     """The pieces a sum over the whole window reads: `cover_pieces` for a minute or hour window (one that fits the
     finer levels' retention), else the base level as `level_pieces` reads it (day and month windows already read
     their coarse level)."""
-    base = BASE_LEVEL[window.granularity]
-    if base in ("rollup_minute", "rollup_hour"):
-        return cover_pieces(conn, window.start, window.end)
-    return level_pieces(conn, base, window.start, window.end)
+    return _family_total_pieces(conn, window, ROLLUP_LEVELS)
+
+
+def _family_total_pieces(conn: sqlite3.Connection, window: Window, family: LevelFamily) -> list[tuple[str, int, int]]:
+    """`total_pieces` over the levels of `family`, each read up to its own watermark."""
+    base = family.base(window.granularity)
+    if base in (family.minute, family.hour):
+        return cover_pieces(conn, window.start, window.end, family=family)
+    return _family_level_pieces(conn, base, window.start, window.end, family)
 
 
 def _measure_rows(
@@ -611,8 +691,9 @@ class Totals:
         histograms.add_into(self.latency, other.latency)
         histograms.add_into(self.queue_wait, other.queue_wait)
 
-    def derived(self, roblox_429: int | None = None) -> dict[str, Any]:
-        """Every measure plus the derived ones (P6 definitions in metrics/catalog.py)."""
+    def derived(self, roblox_429: int | None = None, answers: AnswerCounts | None = None) -> dict[str, Any]:
+        """Every measure plus the derived ones (P6 definitions in metrics/catalog.py). `answers` are Roblox's answers
+        per attempt in the same slice (`_count_answers`); None when the answer tables cannot answer it."""
         v = dict(self.values)
         demand = v["demand"]
         avoided = demand - v["upstream_calls"]
@@ -635,6 +716,9 @@ class Totals:
         out["roblox_429_per_10k"] = (
             round(roblox_429 * 10_000.0 / demand, 2) if roblox_429 is not None and demand else None
         )
+        # The same rule for Roblox's answers per attempt (lead decision 11): unknown, never zero, where they cannot say.
+        for position, metric in enumerate(ANSWER_METRICS):
+            out[metric] = answers[position] if answers is not None else None
         return out
 
 
@@ -714,6 +798,73 @@ def _count_429(
     return out
 
 
+def _count_answers(
+    conn: sqlite3.Connection, window: Window, *, group_col: str | None = None, bucketed: bool = True,
+    filters: Mapping[str, Any] | None = None,
+) -> dict[tuple[int | None, Any], AnswerCounts] | None:  # fmt: skip
+    """Roblox's answers per attempt (`ANSWER_METRICS`), bucketed and grouped like `collect`, from the Roblox answer
+    tables (`ANSWER_LEVELS`, metrics 0010), each level up to its own watermark.
+
+    None when the grouping or a filter names a dimension those tables do not keep (`ANSWER_SLICES`; for example
+    `outcome` or `status_class`): there is no honest count then, and the tiles and columns read unknown, never zero
+    (the `_count_429` rule).
+    """
+    if group_col is not None and group_col not in ANSWER_SLICES:
+        return None
+    clauses: list[str] = []
+    params: list[Any] = []
+    for key, value in (filters or {}).items():
+        if value in (None, "", []):
+            continue
+        if key not in ANSWER_SLICES:
+            return None
+        values = list(value) if isinstance(value, list | tuple | set | frozenset) else [value]
+        clauses.append(f"{key} IN ({', '.join('?' for _ in values)})")
+        params += [str(v) for v in values]
+    where = "".join(f" AND {clause}" for clause in clauses)
+    zi = zone(window.tz)
+    if bucketed:
+        pieces = _family_level_pieces(
+            conn, ANSWER_LEVELS.base(window.granularity), window.start, window.end, ANSWER_LEVELS
+        )
+    else:
+        pieces = _family_total_pieces(conn, window, ANSWER_LEVELS)
+    group_expr = group_col or "NULL"
+    sums = ", ".join(f"sum({column})" for column in ANSWER_METRICS.values())
+    out: dict[tuple[int | None, Any], AnswerCounts] = {}
+    for table, lo, hi in pieces:
+        if not bucketed:
+            time_expr = "NULL"
+        elif window.granularity == "hour" and table == ANSWER_LEVELS.minute:
+            time_expr = "bucket_start - bucket_start % 3600"
+        else:
+            time_expr = "bucket_start"  # re-bucketed to local days and longer below, as `collect` does
+        rows = conn.execute(
+            f"SELECT {time_expr} AS b, {group_expr} AS g, {sums} FROM {table} "  # noqa: S608 (fixed identifiers)
+            f"WHERE bucket_start >= ? AND bucket_start < ?{where} GROUP BY b, g",
+            (lo, hi, *params),
+        ).fetchall()
+        for row in rows:
+            bucket = bucket_floor(int(row[0]), window.granularity, zi) if bucketed and row[0] is not None else None
+            slot = (bucket, row[1])
+            before = out.get(slot, (0, 0, 0))
+            out[slot] = (before[0] + int(row[2] or 0), before[1] + int(row[3] or 0), before[2] + int(row[4] or 0))
+    return out
+
+
+def _sum_answers(counts: Iterable[AnswerCounts]) -> AnswerCounts:
+    total = [0, 0, 0]
+    for item in counts:
+        for position in range(3):
+            total[position] += int(item[position])
+    return total[0], total[1], total[2]
+
+
+def _wants_answers(metrics: Iterable[str] | None) -> bool:
+    """Whether a read of `metrics` (None: every one) shows a Roblox answer number (one read of the answer tables)."""
+    return metrics is None or any(metric in ANSWER_METRICS for metric in metrics)
+
+
 # ---------------------------------------------------------------------------------------------- series
 
 
@@ -734,11 +885,17 @@ def series_sync(
     data = collect(conn, window, filters=filters, group_by=group_by, measures=measures, hists=hists)
     found_429 = _count_429(conn, window, group_col=group_by, filters=filters)
     counts_429 = found_429 or {}
+    found_answers = None
+    if _wants_answers(wanted):
+        found_answers = _count_answers(conn, window, group_col=group_by, filters=filters)
+    answer_counts = found_answers or {}
     groups: dict[Any, dict[int, Totals]] = {}
     for (bucket, group), totals in data.items():
         groups.setdefault(group, {})[int(bucket or 0)] = totals
-    for (bucket, group), _n in counts_429.items():
+    for bucket, group in counts_429:
         groups.setdefault(group, {}).setdefault(int(bucket or 0), Totals.zero())
+    # Roblox's answers fill the groups callers' traffic (or the 429 log) made, never a group of their own: a group with
+    # answers alone is what a narrower reset left behind (`top_rows_sync` follows the same rule).
     ranked = sorted(groups, key=lambda g: -sum(t.values["requests"] for t in groups[g].values()))
     shown, rest = ranked[:max_groups], ranked[max_groups:]
     out_groups: dict[str, dict[str, list[Any]]] = {}
@@ -748,12 +905,17 @@ def series_sync(
         for start in starts:
             totals = Totals.zero()
             n429 = 0
+            answered: list[AnswerCounts] = []
             for member in members:
                 found = groups.get(member, {}).get(start)
                 if found is not None:
                     totals.add(found)
                 n429 += counts_429.get((start, member), 0)
-            derived = totals.derived(roblox_429=n429 if found_429 is not None else None)
+                answered.append(answer_counts.get((start, member), (0, 0, 0)))
+            derived = totals.derived(
+                roblox_429=n429 if found_429 is not None else None,
+                answers=_sum_answers(answered) if found_answers is not None else None,
+            )
             for metric in wanted:
                 values[metric].append(derived.get(metric))
         out_groups[name] = values
@@ -798,7 +960,11 @@ def totals_sync(
     for item in data.values():
         totals.add(item)
     found_429 = _count_429(conn, window, bucketed=False, filters=filters)
-    out = totals.derived(roblox_429=sum(found_429.values()) if found_429 is not None else None)
+    found_answers = _count_answers(conn, window, bucketed=False, filters=filters) if _wants_answers(metrics) else None
+    out = totals.derived(
+        roblox_429=sum(found_429.values()) if found_429 is not None else None,
+        answers=_sum_answers(found_answers.values()) if found_answers is not None else None,
+    )
     if metrics is not None:
         wanted = set(metrics)
         out = {key: value for key, value in out.items() if key in wanted}
@@ -811,7 +977,8 @@ def totals_sync(
 def answer_source_counts(conn: sqlite3.Connection, window: Window) -> list[dict[str, Any]]:
     """Requests by who produced the caller's status and by status (v1 "Who returned it?", rows 68 and 132):
     `[{source, status, requests}]`, most first. `source` is read through `ANSWER_SOURCE_SQL`, so a Roblox 5xx
-    passed on with Roxy's retry text is Roblox's (`relay`), as the `roblox_5xx` tile counts it."""
+    passed on with Roxy's retry text is Roblox's (`relay`), as `caller_roblox_5xx` counts it. These are answers to
+    callers; the `roblox_5xx` tile counts Roblox's own answers per attempt (`ANSWER_METRICS`)."""
     totals: dict[tuple[str, int], int] = {}
     for table, lo, hi in total_pieces(conn, window):
         sql = (
@@ -869,10 +1036,13 @@ KPI_KEYS: tuple[str, ...] = (
 
 ROLLUP_TABLES: tuple[str, ...] = tuple(f"metrics.{table}" for table in LEVEL_ORDER)
 """The rollup levels as `<db>.<table>` names, the way a reset marker lists what it deleted (`reset_tables`)."""
+ANSWER_TABLE_NAMES: tuple[str, ...] = tuple(f"metrics.{table}" for table in ANSWER_TABLES)
+"""The Roblox answer levels as `<db>.<table>` names (a reset marker's `reset_tables`)."""
 KPI_SOURCES: dict[str, tuple[str, ...]] = {
     "roblox_429": ("metrics.upstream_429",),
     "roblox_429_per_10k": ("metrics.upstream_429", *ROLLUP_TABLES),
     "rotator_bytes": ("metrics.egress_usage",),
+    **dict.fromkeys(ANSWER_METRICS, ANSWER_TABLE_NAMES),
 }
 """Tables a KPI tile reads, where it is not only the rollups (every other tile, `requests_last_hour` included)."""
 LATENCY_KPIS: frozenset[str] = frozenset({"p50_ms", "p95_ms", "p99_ms"})
@@ -1031,7 +1201,58 @@ def kpis_sync(conn: sqlite3.Connection, window: Window, *, now: float, compare: 
             seen.add(row["id"])
             notices.append(row)
     result["notices"] = notices
+    since_text = answers_notice(conn, (window, *([other] if compare else [])), now=now)
+    if since_text:
+        for key in ANSWER_METRICS:
+            tile = tiles[key]
+            if not tile.get("partial"):
+                tile["notice"] = since_text
+                tile["partial"] = True
+                if "delta" in tile:
+                    tile["delta"] = None
+                    tile["delta_pct"] = None
     return result
+
+
+ANSWERS_SCHEMA_VERSION = 10
+"""The metrics.db migration that began counting Roblox's answers per attempt (`0010_roblox_answers.sql`)."""
+
+
+def answers_since(conn: sqlite3.Connection) -> int | None:
+    """When this install began counting Roblox's answers per attempt: the time `ANSWERS_SCHEMA_VERSION` was applied
+    (None when it was not, or the schema table cannot be read)."""
+    try:
+        row = conn.execute(
+            "SELECT applied_at FROM schema_version WHERE version = ?", (ANSWERS_SCHEMA_VERSION,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return int(row[0]) if row is not None and row[0] is not None else None
+
+
+def answers_notice(conn: sqlite3.Connection, windows: Iterable[Window], *, now: float) -> str | None:
+    """The tile notice of the Roblox answer tiles when a window (or its comparison) holds caller requests from before
+    the answers were counted (lead decision 11: no backfill, the notice says since when), else None.
+
+    v2 records no traffic before this migration (the release ships with it), so in practice this stays None; it is
+    there for an install that upgrades with traffic of its own. A migration time after `now` is a clock the data does
+    not share (a test's fake clock), never an upgrade still to come: no notice then.
+    """
+    since = answers_since(conn)
+    if since is None or since > now:
+        return None
+    cut = since - since % 60  # minute rows that start before the upgrade's minute
+    for window in windows:
+        end = min(cut, window.end)
+        if window.start >= end:
+            continue
+        before = Window(window.start, end, "minute" if end - window.start <= 86_400 else "hour", window.tz)
+        if int(totals_sync(conn, before, metrics=("requests",)).get("requests") or 0) > 0:
+            return (
+                f"Roblox's answers are counted since {_when(since, window.tz)}; requests before then are not in "
+                "this number."
+            )
+    return None
 
 
 async def kpis(db: Database, window: Window, *, now: float, compare: str | None = None) -> dict[str, Any]:
@@ -1149,11 +1370,18 @@ def top_rows_sync(
     data = collect(conn, window, filters=filters, group_by=dimension, bucketed=False)
     found_429 = _count_429(conn, window, group_col=dimension, bucketed=False, filters=filters)
     counts_429 = found_429 or {}
+    found_answers = _count_answers(conn, window, group_col=dimension, bucketed=False, filters=filters)
+    answer_counts = found_answers or {}
     rows: list[dict[str, Any]] = []
+    # The rows are the groups callers' traffic or the 429 log made; Roblox's answers fill them in (a group with answers
+    # alone is what a narrower reset left behind, never a row of its own).
     keys = {group for (_b, group) in data} | {group for (_b, group) in counts_429}
     for key in keys:
         totals = data.get((None, key), Totals.zero())
-        row = totals.derived(roblox_429=counts_429.get((None, key), 0) if found_429 is not None else None)
+        row = totals.derived(
+            roblox_429=counts_429.get((None, key), 0) if found_429 is not None else None,
+            answers=answer_counts.get((None, key), (0, 0, 0)) if found_answers is not None else None,
+        )
         row["key"] = key
         if search and search.lower() not in str(key).lower():
             continue
@@ -1250,13 +1478,9 @@ def trailing_rate(per_minute: Mapping[int, int], now: float, window_s: int) -> f
     return round(total, 2)
 
 
-def _client_totals(
-    conn: sqlite3.Connection, window: Window, client_type: str, search_text: str = ""
-) -> tuple[list[dict[str, Any]], list[tuple[str, int, int]]]:
-    """Every client of a type with its totals in the window (`key`, `requests`, `refused`, `served`, `bytes`,
-    `top_endpoint`, `refused_pct`; unsorted), and the `(table, start, end)` pieces that were read: each client level
-    from the coarsest whose compacted rows start on the window, then the finer ones (row 73)."""
-    acc: dict[str, dict[str, Any]] = {}
+def _client_pieces(conn: sqlite3.Connection, window: Window) -> list[tuple[str, int, int]]:
+    """The `(table, start, end)` pieces a client read covers the window with: each client level from the coarsest
+    whose compacted rows start on the window, then the finer ones (row 73)."""
     pieces: list[tuple[str, int, int]] = []
     cursor = window.start
     for table, unit in CLIENT_LEVELS:
@@ -1273,47 +1497,234 @@ def _client_totals(
             hi = min(mark, bucket_floor(window.end, unit, zi))
         if hi <= cursor:
             continue
-        source, type_sql = table, "client_type = ?"
-        params: list[Any] = [client_type, cursor, hi]
-        if table == "client_minute" and client_type == "ip" and hi - cursor >= IP_KEY_ORDER_MIN_S:
-            # Many hours of address minutes: `client_minute_ip_rows` (metrics migration 0009) holds every summed
-            # column in key order, so each address is summed as the index is walked instead of sorting the window's
-            # rows (720,000 for 24 hours at plan 6.6's volume; 0.2 s to 0.08 s, plan 6.7). The walk reads every kept
-            # address minute, so a short window keeps the time-ordered primary key. The literal type repeats the
-            # partial index's WHERE term, which `INDEXED BY` needs; the sums are the same rows either way.
-            source, type_sql = "client_minute INDEXED BY client_minute_ip_rows", "client_type = 'ip'"
-            params = [cursor, hi]
+        pieces.append((table, cursor, hi))
+        cursor = hi
+    return pieces
+
+
+def _piece_from(table: str, client_type: str, lo: int, hi: int) -> tuple[str, str, list[Any]]:
+    """`(FROM source, client type condition, its parameters)` for one piece of a client read."""
+    if table == "client_minute" and client_type == "ip" and hi - lo >= IP_KEY_ORDER_MIN_S:
+        # Many hours of address minutes: `client_minute_ip_rows` (metrics migration 0009) holds every summed column
+        # in key order, so each address is summed as the index is walked instead of sorting the window's rows
+        # (720,000 for 24 hours at plan 6.6's volume; 0.2 s to 0.08 s, plan 6.7). The walk reads every kept address
+        # minute, so a short window keeps the time-ordered primary key. The literal type repeats the partial index's
+        # WHERE term, which `INDEXED BY` needs; the sums are the same rows either way.
+        return "client_minute INDEXED BY client_minute_ip_rows", "client_type = 'ip'", []
+    return table, "client_type = ?", [client_type]
+
+
+ClientSums = tuple[str, int, int, int, int, Any]
+"""One client's sums over a read's pieces: `(key, requests, refused, served, bytes, top_endpoint)`."""
+
+
+def _client_stream(
+    conn: sqlite3.Connection, client_type: str, pieces: Sequence[tuple[str, int, int]], search_text: str = ""
+) -> Iterator[ClientSums]:
+    """Every client of a type in the pieces, ONE AT A TIME in key order, with its sums over all of them.
+
+    Memory stays flat whatever the number of clients (final review finding memory-2: `Roblox-Id` is free caller
+    text, so a caller choosing a new value per request leaves up to 720,000 distinct places a day, and the read used
+    to hold one dict per client before it sorted and cut, 424 MiB for a top-10 page). Each piece is one grouped
+    statement ordered by key (the order its GROUP BY already produces: no extra sort); the cursors are merged by key
+    and the rows of one client summed as they pass. `top_endpoint` comes from the busiest row of the busiest piece
+    (the bare column of the statement's one `max()`, SQLite's min/max rule; the first piece wins a tie, as before).
+    """
+    cursors: list[Iterator[Any]] = []
+    for table, lo, hi in pieces:
+        source, type_sql, params = _piece_from(table, client_type, lo, hi)
+        params = [*params, int(lo), int(hi)]
         search = ""
         if search_text:
             search = " AND instr(lower(client_key), ?) > 0"
             params.append(search_text.lower())
-        # `top_endpoint` is a bare column taken from the row of `max(requests)` (SQLite's min/max rule), so this
-        # statement keeps exactly one max(); `last_seen` is read by `read_client_extras.attach_last_seen`.
-        rows = conn.execute(
-            f"SELECT client_key, sum(requests) AS requests, sum(refused) AS refused, sum(served) AS served, "  # noqa: S608
-            f"sum(bytes) AS bytes, max(requests) AS busiest, top_endpoint FROM {source} "
-            f"WHERE {type_sql} AND bucket_start >= ? AND bucket_start < ?{search} GROUP BY client_key",
-            params,
-        ).fetchall()
-        for r in rows:
-            item = acc.setdefault(
-                r["client_key"],
-                {"key": r["client_key"], "requests": 0, "refused": 0, "served": 0, "bytes": 0, "top_endpoint": None,
-                 "_busiest": -1},
-            )  # fmt: skip
-            for col in ("requests", "refused", "served", "bytes"):
-                item[col] += int(r[col] or 0)
-            if int(r["busiest"] or 0) > item["_busiest"]:
-                item["_busiest"] = int(r["busiest"] or 0)
-                item["top_endpoint"] = r["top_endpoint"]
-        pieces.append((table, cursor, hi))
-        cursor = hi
-    rows_out = []
-    for item in acc.values():
-        item.pop("_busiest", None)
-        item["refused_pct"] = round(item["refused"] * 100.0 / item["requests"], 2) if item["requests"] else None
-        rows_out.append(item)
-    return rows_out, pieces
+        cursors.append(
+            conn.execute(
+                f"SELECT client_key, sum(requests), sum(refused), sum(served), sum(bytes), max(requests), "  # noqa: S608
+                f"top_endpoint FROM {source} WHERE {type_sql} AND bucket_start >= ? AND bucket_start < ?{search} "
+                "GROUP BY client_key ORDER BY client_key",
+                params,
+            )
+        )
+    # heapq.merge is stable: equal keys come in piece order (day, hour, minute), as the dict merge read them.
+    for key, rows in itertools.groupby(heapq.merge(*cursors, key=_first), key=_first):
+        requests = refused = served = size = 0
+        busiest, top = -1, None
+        for row in rows:
+            requests += int(row[1] or 0)
+            refused += int(row[2] or 0)
+            served += int(row[3] or 0)
+            size += int(row[4] or 0)
+            if int(row[5] or 0) > busiest:
+                busiest, top = int(row[5] or 0), row[6]
+        yield str(key), requests, refused, served, size, top
+
+
+def _first(row: Any) -> Any:
+    return row[0]
+
+
+def _newest_stream(
+    conn: sqlite3.Connection, client_type: str, pieces: Sequence[tuple[str, int, int]], search_text: str = ""
+) -> Iterator[tuple[str, int]]:
+    """`(key, last_seen)` for every client of `_client_stream`'s read, in the same key order: the start of its newest
+    bucket in the pieces (`read_client_extras.attach_last_seen`'s value), streamed the same way."""
+    cursors: list[Iterator[Any]] = []
+    for table, lo, hi in pieces:
+        source, type_sql, params = _piece_from(table, client_type, lo, hi)
+        params = [*params, int(lo), int(hi)]
+        search = ""
+        if search_text:
+            search = " AND instr(lower(client_key), ?) > 0"
+            params.append(search_text.lower())
+        cursors.append(
+            conn.execute(
+                f"SELECT client_key, max(bucket_start) FROM {source} WHERE {type_sql} "  # noqa: S608 (constants)
+                f"AND bucket_start >= ? AND bucket_start < ?{search} GROUP BY client_key ORDER BY client_key",
+                params,
+            )
+        )
+    for key, rows in itertools.groupby(heapq.merge(*cursors, key=_first), key=_first):
+        yield str(key), max(int(row[1]) for row in rows)
+
+
+def _with_newest(
+    stream: Iterator[ClientSums], newest: Iterator[tuple[str, int]]
+) -> Iterator[tuple[int | None, ClientSums]]:
+    """`(last_seen, client)` for each streamed client: a merge join of two key-ordered streams of the same read."""
+    pending = next(newest, None)
+    for item in stream:
+        while pending is not None and pending[0] < item[0]:
+            pending = next(newest, None)
+        yield (pending[1] if pending is not None and pending[0] == item[0] else None), item
+
+
+RATE_WINDOWS_S: dict[str, int] = {"rate1": 60, "rate5": 300, "rate60": 3600}
+"""The trailing windows of the Rate1/5/60 columns (row 73)."""
+
+RATE_LOOKBACK_S = 3660
+"""Minutes read for Rate1/5/60: the trailing hour plus the partly covered minute."""
+
+
+def _recent_minutes(conn: sqlite3.Connection, client_type: str, now: float) -> dict[str, dict[int, int]]:
+    """`{key: {minute: requests}}` of every client with a minute row in the last `RATE_LOOKBACK_S` (a Rate1/5/60
+    sort ranks every client by them). Bounded by the minute caps (`max_ip_activity_records` and
+    `max_caller_records` per closed minute plus the open minutes), not by the window's clients."""
+    found: dict[str, dict[int, int]] = {}
+    for r in conn.execute(
+        "SELECT client_key, bucket_start, requests FROM client_minute WHERE client_type = ? AND bucket_start >= ?",
+        (client_type, int(now) - RATE_LOOKBACK_S),
+    ):
+        found.setdefault(str(r[0]), {})[int(r[1])] = int(r[2])
+    return found
+
+
+def _client_value(item: ClientSums, sort: str) -> Any:
+    """The value of one SQL-summed sort column of a streamed client (None: sorts last, as `ordered_rows`)."""
+    key, requests, refused, served, size, _top = item
+    if sort == "requests":
+        return requests
+    if sort == "refused":
+        return refused
+    if sort == "served":
+        return served
+    if sort == "bytes":
+        return size
+    if sort == "refused_pct":
+        return round(refused * 100.0 / requests, 2) if requests else None
+    return key  # "key"
+
+
+def _client_row(item: ClientSums) -> dict[str, Any]:
+    key, requests, refused, served, size, top = item
+    return {
+        "key": key,
+        "requests": requests,
+        "refused": refused,
+        "served": served,
+        "bytes": size,
+        "top_endpoint": top,
+        "refused_pct": round(refused * 100.0 / requests, 2) if requests else None,
+    }
+
+
+def _top_clients(
+    items: Iterable[tuple[Any, ClientSums]], count: int, *, descending: bool
+) -> tuple[list[tuple[Any, ClientSums]], int]:
+    """The first `count` `(sort value, client)` pairs in table order, and how many clients there were, holding at
+    most `count` of them.
+
+    Table order is `ordered_rows`': by the value (ties by key, the same direction), clients without a value last (by
+    key). `heapq.nlargest` and `nsmallest` keep a heap of `count` entries while they consume the stream, so a top-10
+    read of 720,000 clients holds 10 (finding memory-2)."""
+    total = 0
+    missing: list[tuple[str, ClientSums]] = []  # the first `count` clients without a value, by key
+
+    def present() -> Iterator[tuple[tuple[Any, str], tuple[Any, ClientSums]]]:
+        nonlocal total
+        for value, item in items:
+            total += 1
+            if value is None:
+                bisect.insort(missing, (item[0], item))
+                if len(missing) > count:
+                    missing.pop()
+                continue
+            yield (value, item[0]), (value, item)
+
+    stream = present()
+    best: list[tuple[Any, ClientSums]] = []
+    if count > 0:
+        pick = heapq.nlargest if descending else heapq.nsmallest
+        best = [pair for _order, pair in pick(count, stream, key=_first)]
+    for _entry in stream:  # read what is left (nlargest(0) reads nothing), so `total` is exact
+        pass
+    best.extend((None, item) for _key, item in missing[: max(0, count - len(best))])
+    return best, total
+
+
+def _client_totals(
+    conn: sqlite3.Connection,
+    window: Window,
+    client_type: str,
+    search_text: str = "",
+    *,
+    sort: str = "requests",
+    descending: bool = True,
+    count: int | None = None,
+    now: float = 0.0,
+) -> tuple[list[dict[str, Any]], int, list[tuple[str, int, int]], dict[str, int] | None]:
+    """The first `count` clients of a type in the window in table order (all when None), sorted by `sort`.
+
+    Returns `(rows, total, pieces, last_seen)`: rows with `key`, `requests`, `refused`, `served`, `bytes`,
+    `top_endpoint`, `refused_pct` (and the Rate1/5/60 the sort read, when it was a rate); `total` the number of
+    clients (exact); `pieces` the `(table, start, end)` read; `last_seen` the newest bucket of each returned row when
+    the sort read it, else None. Memory holds `count` clients, never the window's (finding memory-2): the clients are
+    streamed in key order (`_client_stream`) and ranked through a bounded heap (`_top_clients`).
+    """
+    pieces = _client_pieces(conn, window)
+    stream = _client_stream(conn, client_type, pieces, search_text)
+    newest: dict[str, int] | None = None
+    recent: dict[str, dict[int, int]] | None = None
+    items: Iterable[tuple[Any, ClientSums]]
+    if sort == "last_seen":
+        items = _with_newest(stream, _newest_stream(conn, client_type, pieces, search_text))
+    elif sort in RATE_WINDOWS_S:
+        recent = _recent_minutes(conn, client_type, now)
+        window_s = RATE_WINDOWS_S[sort]
+        items = ((trailing_rate(recent.get(item[0], {}), now, window_s), item) for item in stream)
+    else:
+        items = ((_client_value(item, sort), item) for item in stream)
+    limit = count if count is not None else 2**62
+    best, total = _top_clients(items, limit, descending=descending)
+    rows = [_client_row(item) for _value, item in best]
+    if sort == "last_seen":
+        newest = {item[0]: int(value) for value, item in best if value is not None}
+    if recent is not None:
+        for row in rows:
+            minutes = recent.get(row["key"], {})
+            for name, window_s in RATE_WINDOWS_S.items():
+                row[name] = trailing_rate(minutes, now, window_s)
+    return rows, total, pieces, newest
 
 
 def client_rows_sync(
@@ -1325,9 +1736,9 @@ def client_rows_sync(
     evaluation at 2,000 addresses, gaps_insights G7)."""
     if client_type not in ("ip", "place"):
         raise ValueError("client_type must be 'ip' or 'place'")
-    rows, _pieces = _client_totals(conn, window, client_type)
-    ordered = ordered_rows(rows, "requests")
-    return ordered if limit is None else ordered[: max(0, int(limit))]
+    count = None if limit is None else max(0, int(limit))
+    rows, _total, _pieces, _newest = _client_totals(conn, window, client_type, count=count)
+    return rows
 
 
 def client_table_sync(
@@ -1353,14 +1764,32 @@ def client_table_sync(
     page = page or Page(sort="requests")
     if page.size not in PAGE_SIZES or page.sort not in CLIENT_SORTABLE:
         raise ValueError("invalid page size or sort key")
-    rows_out, pieces = _client_totals(conn, window, client_type, page.search)
-    needs_rates = page.sort in ("rate1", "rate5", "rate60")
-    if needs_rates:
-        _attach_rates(conn, client_type, rows_out, now)
-    if page.sort == "last_seen":
-        read_client_extras.attach_last_seen(conn, client_type, rows_out, pieces)
-    result = _paged(rows_out, page)
-    if not needs_rates:
+    number = max(1, int(page.page))
+    first = (number - 1) * page.size
+    # Only the clients up to the end of the asked page are ever held (finding memory-2), whatever the window holds.
+    ranked, total, pieces, newest = _client_totals(
+        conn,
+        window,
+        client_type,
+        page.search,
+        sort=page.sort,
+        descending=page.descending,
+        count=first + page.size,
+        now=now,
+    )
+    rows_out = ranked[first : first + page.size]
+    if newest is not None:
+        for row in rows_out:
+            row["last_seen"] = newest.get(str(row["key"]))
+    result: dict[str, Any] = {
+        "total": total,
+        "page": page.page,
+        "size": page.size,
+        "sort": page.sort,
+        "descending": page.descending,
+        "rows": rows_out,
+    }
+    if page.sort not in RATE_WINDOWS_S:
         _attach_rates(conn, client_type, result["rows"], now)
     if not extras:
         return result

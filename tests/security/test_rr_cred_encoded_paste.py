@@ -99,7 +99,9 @@ async def test_encoded_credential_paste_never_lets_a_caller_disable_an_egress(
                     ("Set-Cookie", f".ROBLOSECURITY={rotated}; domain=.roblox.com; path=/; secure; HttpOnly"),
                 ],
             )
-            run.clock.advance(5)
+            # The probe sub-bucket's next slot (burst 1 at 2 a minute since finding constraints-6): a second probe
+            # at the same fake instant would wait for a clock that never moves.
+            run.clock.advance(60)
             probe = await run.ctx.egress.credential.probe("liveness", fetch=run.ctx.upstream.credential_probe_fetch)
             assert probe.ok, probe
         statuses = []

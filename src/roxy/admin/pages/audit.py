@@ -37,8 +37,10 @@ from typing import Any, Final
 
 from roxy.admin.api import audit as audit_api
 from roxy.admin.api import common
+from roxy.admin.api import settings as settings_api
 from roxy.admin.pages import fmt
 from roxy.admin.pages.kit import Page, PageView, filter_chip, table_query, table_view
+from roxy.admin.pages.settings import changed_again
 from roxy.admin.pages.texts import diff_lines
 from roxy.config.audit import is_secret_target
 
@@ -77,11 +79,22 @@ TARGET_KINDS: Final[tuple[tuple[str, str], ...]] = (
     ("credential_allowlist:*", "Credential allowlist"),
     ("access_list:*", "Access lists"),
     ("bans:*", "Bans"),
-    ("credential*", "The credential"),
+    ("credential", "The credential (value, replace, delete)"),
+    ("credential_status", "Credential status changes"),
+    ("credential_account", "Credential account checks"),
+    ("credential*", "Everything about the credential, allowlist included"),
     ("table:*", "Downloads"),
-    ("reset:*", "Data resets"),
+    ("operation:reset_*", "Data resets"),
+    ("operation:backup_*", "Backups"),
+    ("operation:vacuum_*", "VACUUM runs"),
 )
-"""Target filter choices (a prefix ending in `*`, as `GET /audit` takes them; `admin/api/audit.py MANAGE_PAGES`)."""
+"""Target filter choices, as `GET /audit` takes them: an exact target, or a prefix ending in `*` (`admin/api/
+audit.py MANAGE_PAGES`). Filters match by prefix, so a choice that must not catch a longer kind is exact: `egress/
+credential.py` audits the one credential as `credential`, its status changes as `credential_status` and its account
+checks as `credential_account`, while `credential*` also catches `credential_allowlist:<id>` (kept as the "everything"
+choice the Credential page's history link uses). `admin/api/data.py` audits resets, backups and VACUUM runs as
+`operation:<kind>_<hex>` (`_new_id`; `internal_app.py` the same for the CLI's resets), so each gets its own prefix
+(review finding docs_b-1)."""
 
 
 def _bounded(view: PageView, name: str, limit: int) -> str | None:
@@ -243,6 +256,13 @@ async def entry_card(view: PageView) -> dict[str, Any]:
         for item in found["diff"]["entries"]
     ]
     revert = dict(found["revert"])
+    now_value = None
+    if revert.get("available") and revert.get("history_id") is not None:
+        # The settings history drawer's check (review finding docs_b-4): a revert of a change that was changed again
+        # since also undoes the later changes, and the form says so before the owner presses Revert.
+        change = await settings_api.history_change(view.ctx, int(revert["history_id"]))
+        if change is not None:
+            now_value = changed_again(view.ctx.settings, str(change["key"]), change.get("new"))
     return {
         "entry": entry,
         "when": fmt.time_cell(entry.get("at"), view.tz, view.now),
@@ -252,6 +272,7 @@ async def entry_card(view: PageView) -> dict[str, Any]:
         "docs_cut": len(before_doc) > MAX_DOC_CHARS or len(after_doc) > MAX_DOC_CHARS,
         "has_docs": bool(before_doc or after_doc),
         "revert": revert,
+        "now_value": now_value,
         "manage": found["manage"],
         "secret_target": bool(found["secret_target"]) or is_secret_target(entry.get("target")),
         "max_value_chars": MAX_VALUE_CHARS,

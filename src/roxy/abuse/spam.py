@@ -31,9 +31,14 @@ How it works
     - Actions (`spam_<id>_action`): `ban` (a temporary IP ban, doubled for each repeat within 30 days up to the cap;
       while `spam_dry_run` is on only a "would have banned" event), `strike` (one ladder strike, then the client's
       requests are refused while the condition holds), `tarpit` (refused and held while the condition holds),
-      `recommend` (an event the recommendations engine turns into ABUSE-SPAM). Collateral protection: a trusted Roblox
-      game server (`roxy/abuse/bot.py`) is never banned (it gets a strike instead), places and the distributed
-      detector only ever recommend, and bypass entries are never counted.
+      `recommend` (an event the recommendations engine turns into ABUSE-SPAM). The action applies to the client of
+      the subject, so SPAM-BUST (`ip:<key>`) and SPAM-ENUM (`ip:<key>|<template>`) act like the others.
+      Collateral protection: a trusted Roblox game server (`roxy/abuse/bot.py`) is never banned; armed, its ban
+      becomes a strike. The mark is kept on every row of the client and read per client, so it holds whichever
+      detector fires. Dry run is applied to the configured action first: a configured `ban` only logs "would have
+      banned" for everyone, game servers included (nothing is struck or refused for it). Places and the distributed
+      detector only ever recommend, folded subjects every client feeds (`SHARED_OVERFLOW_SUBJECTS`) are counted but
+      never evaluated, and bypass entries are never counted.
     - Bounds (plan P9). Some subjects are keyed by values the CALLER chooses (`Roblox-Id` place ids, path-derived
       templates, the User-Agent hash), so one client could otherwise add a row per request. Per client and per
       `CHOSEN_WINDOW_S`, each such family (places, enum templates, distributed template and User-Agent pairs) takes at
@@ -61,7 +66,7 @@ import sqlite3
 import zlib
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Final
 
 from roxy.abuse.bans import create_auto_ban, ua_hash
@@ -84,7 +89,11 @@ SIGNAL_OF: Final[dict[str, str]] = {
     "dist": "dist",
 }
 DETECTOR_OF: Final[dict[str, str]] = {signal: detector for detector, signal in SIGNAL_OF.items()}
-RECOMMEND_ONLY: Final = frozenset({"enum", "bust", "dist"})  # detectors whose subject is not a single address
+RECOMMEND_ONLY: Final = frozenset({"dist"})
+"""Detectors that only ever recommend, whatever `spam_<id>_action` says: SPAM-DIST's subject is a swarm (an endpoint
+template and a User-Agent hash over many addresses), not one client, and Roblox game servers all share one
+User-Agent. SPAM-ENUM (`ip:<key>|<template>`) and SPAM-BUST (`ip:<key>`) are one client each, so their chosen action
+applies to that client (finding abuse-5)."""
 FLAG_PREFIX: Final = "flag|"
 FLAG_REFUSE_S: Final = 10
 """A refusing flag (strike, tarpit) lasts this long and is refreshed while the detector keeps firing."""
@@ -102,6 +111,10 @@ MAX_TRACKED_CLIENTS: Final = 20_000
 """Clients whose chosen-value quota one worker remembers (least recently seen forgotten first)."""
 OVERFLOW: Final = "(other)"
 """The folded value of a family once a client's quota is spent (module docstring, bounds)."""
+SHARED_OVERFLOW_SUBJECTS: Final = frozenset({f"place:{OVERFLOW}", f"{OVERFLOW}|{OVERFLOW}"})
+"""Folded subjects EVERY client feeds (places and SPAM-DIST pairs carry no client key): counted, never evaluated,
+because their sum names no real place or endpoint (finding abuse-16). A client's own folded SPAM-ENUM subject
+(`ip:<key>|(other)`) is still evaluated: it is still one client, so decoys never hide its traffic."""
 MAX_SPAM_ROWS: Final = 50_000
 """Counter rows (flags excluded) `spam_windows` may hold; a flush over it evicts (module docstring, bounds)."""
 EVICT_BATCH: Final = 1_000
@@ -167,8 +180,18 @@ class Detection:
 
     @property
     def limit_key(self) -> str | None:
-        """The client key for IP subjects, None for places and fleet-wide subjects."""
-        return self.subject[3:] if self.subject.startswith("ip:") and self.detector not in RECOMMEND_ONLY else None
+        """The client key of a one-client subject (`ip:<key>`, or `ip:<key>|<template>` for SPAM-ENUM); None for
+        places and the fleet-wide SPAM-DIST subject."""
+        if not self.subject.startswith("ip:") or self.detector in RECOMMEND_ONLY:
+            return None
+        return _client_key(self.subject)
+
+
+def _client_key(who: str) -> str | None:
+    """The client limit key of an `ip:` subject (`ip:<key>` or `ip:<key>|<template>`), else None."""
+    if not who.startswith("ip:"):
+        return None
+    return who[3:].split("|", 1)[0] or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,18 +373,23 @@ class SpamDetectors:
             self._pending[subject] = pending
         return pending
 
-    def _count(self, values: Mapping[str, Any], detector: str, who: str, now_s: int, value: str | None = None) -> None:
+    def _count(
+        self, values: Mapping[str, Any], detector: str, who: str, now_s: int, value: str | None = None
+    ) -> _Pending | None:
+        """Count one observation on `<signal>|<who>`; returns the slot (None when the detector is off or the
+        pending bound is reached)."""
         if not bool(_setting(values, detector, "enabled")):
-            return
+            return None
         slot = self._slot(f"{SIGNAL_OF[detector]}|{who}")
         if slot is None:
-            return
+            return None
         bucket = self._bucket(values, detector, now_s)
         slot.counts[bucket] = slot.counts.get(bucket, 0) + 1
         if value is not None:
             members = slot.sets.setdefault(bucket, set())
             if len(members) < MAX_SET_PER_BUCKET:
                 members.add(value)
+        return slot
 
     def observe(
         self,
@@ -384,28 +412,30 @@ class SpamDetectors:
             return
         now_s = int(self.clock.now())
         who = f"ip:{limit_key}"
-        self._count(values, "rate", who, now_s)
-        if game_server:
-            slot = self._pending.get(f"req|{who}")
-            if slot is not None:
-                slot.game_server = True
+        # This client's own rows (every `ip:` subject). The trusted game server mark goes on EACH of them, so a
+        # detection of any signal knows the client is a game server, not only SPAM-RATE's (finding abuse-1).
+        own: list[_Pending | None] = [self._count(values, "rate", who, now_s)]
         place = self._chosen(limit_key, "place", place_id, now_s) if place_id else None
         if place:
             self._count(values, "rate", f"place:{place}", now_s)
         if refused:
-            self._count(values, "refused", who, now_s)
+            own.append(self._count(values, "refused", who, now_s))
             if place:
                 self._count(values, "refused", f"place:{place}", now_s)
         if probe:
-            self._count(values, "probe", who, now_s)
+            own.append(self._count(values, "probe", who, now_s))
         if auth:
-            self._count(values, "auth", who, now_s)
+            own.append(self._count(values, "auth", who, now_s))
         ids = [part for part in path.split("/") if _DIGITS.match(part)]
         if ids and template:
             enum_template = self._chosen(limit_key, "enum", template, now_s)
-            self._count(values, "enum", f"{who}|{enum_template}", now_s, "/".join(ids))
+            own.append(self._count(values, "enum", f"{who}|{enum_template}", now_s, "/".join(ids)))
         fingerprint = template + "?" + "&".join(f"{k}={v}" for k, v in sorted(query)) if query else template
-        self._count(values, "bust", who, now_s, _short_hash(fingerprint) if query else None)
+        own.append(self._count(values, "bust", who, now_s, _short_hash(fingerprint) if query else None))
+        if game_server:
+            for slot in own:
+                if slot is not None:
+                    slot.game_server = True
         if template:
             pair = self._chosen(limit_key, "dist", f"{template}|{ua_hash(user_agent)}", now_s)
             self._count(values, "dist", pair if pair != OVERFLOW else f"{OVERFLOW}|{OVERFLOW}", now_s,
@@ -455,6 +485,7 @@ class SpamDetectors:
         stored = _read_windows(conn, subjects)
         inserted = 0
         writes: list[tuple[str, str, int]] = []
+        trusted: set[str] = set()  # client keys with the trusted game server mark on a row merged here
         for subject in subjects:
             pending = batch[subject]
             signal, _, who = subject.partition("|")
@@ -476,12 +507,15 @@ class SpamDetectors:
                 data = {}
             merged = _merge(data if isinstance(data, dict) else {}, pending, max(1, cap), keep_after)
             writes.append((subject, json.dumps(merged, separators=(",", ":")), now_s))
-            if not bool(_setting(values, detector, "enabled")):
-                continue
+            client = _client_key(who)
+            if client is not None and merged.get("gs"):
+                trusted.add(client)
+            if who in SHARED_OVERFLOW_SUBJECTS or not bool(_setting(values, detector, "enabled")):
+                continue  # a folded subject every client feeds is no place or endpoint (finding abuse-16)
             fired, value, threshold = evaluate_row(detector, merged, values, now_s)
             if fired:
                 action = str(_setting(values, detector, "action"))
-                if detector in RECOMMEND_ONLY or not who.startswith("ip:"):
+                if detector in RECOMMEND_ONLY or client is None:
                     action = "recommend"  # places and fleet-wide subjects only ever recommend (plan 10.3)
                 detections.append(
                     Detection(
@@ -496,6 +530,7 @@ class SpamDetectors:
                     )
                 )
         _write_windows(conn, writes)
+        detections = self._mark_game_servers(conn, detections, trusted, batch)
         if inserted:
             self.evicted += self._evict(conn)
         self._drop_expired_flags(conn, now_s)
@@ -508,6 +543,33 @@ class SpamDetectors:
                 claimed.append(detection)
         flags = self._read_flags(conn, now_s)
         return claimed, flags
+
+    @staticmethod
+    def _mark_game_servers(
+        conn: sqlite3.Connection, detections: list[Detection], trusted: set[str], batch: Mapping[str, _Pending]
+    ) -> list[Detection]:
+        """Collateral protection per CLIENT, not per row (plan 10.3, finding abuse-1): a detection of any signal on a
+        client that carries the trusted game server mark on any of its rows is a game server's detection.
+
+        `trusted` holds the clients marked on a row merged in this flush; for the others, the client's stored
+        SPAM-RATE row (every request counts there) is read, only for the few that fired.
+        """
+        unknown = sorted(
+            {
+                d.limit_key
+                for d in detections
+                if d.limit_key is not None and not d.game_server and d.limit_key not in trusted
+            }
+        )
+        subjects = [f"req|ip:{key}" for key in unknown if f"req|ip:{key}" not in batch]
+        for subject, raw in _read_windows(conn, subjects).items():  # no statement at all when `subjects` is empty
+            try:
+                data = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("gs"):
+                trusted.add(subject[len("req|ip:") :])
+        return [replace(d, game_server=True) if not d.game_server and d.limit_key in trusted else d for d in detections]
 
     @staticmethod
     def _count_flags(conn: sqlite3.Connection) -> int:
@@ -550,9 +612,14 @@ class SpamDetectors:
                 (FLAG_PREFIX, FLAG_PREFIX + "\U0010ffff", now_s),
             )
 
-    def _effective_action(self, detection: Detection) -> str:
-        if detection.action == "ban" and detection.game_server:
-            return "strike"  # collateral protection: never ban a trusted game server (plan 10.3)
+    @staticmethod
+    def _effective_action(detection: Detection, dry_run: bool) -> str:
+        """What a detection does. Dry run applies to the CONFIGURED action first (plan 15.3 E2: "spam_dry_run = 1
+        turns every ban into a logged 'would have banned'"; finding abuse-2): a configured `ban` stays `ban` and is
+        only logged, for every client, a trusted game server included. Armed, a trusted game server's ban becomes a
+        strike (plan 10.3 collateral protection: never auto-banned)."""
+        if detection.action == "ban" and detection.game_server and not dry_run:
+            return "strike"
         return detection.action
 
     def _claim(
@@ -566,7 +633,7 @@ class SpamDetectors:
     ) -> tuple[bool, bool]:
         """Insert or refresh this detection's flag. Returns `(acted, created)`: `acted` only for the worker that
         created the active flag (it acts once), `created` when a new flag row was added (the flag cap counts it)."""
-        action = self._effective_action(detection)
+        action = self._effective_action(detection, bool(_live(values, "spam_dry_run")))
         refuses = action in ("strike", "tarpit") and detection.limit_key is not None
         until = now_s + (FLAG_REFUSE_S if refuses else detection.window_s)
         subject = f"{FLAG_PREFIX}{detection.detector}|{detection.subject}"
@@ -640,8 +707,14 @@ class SpamDetectors:
         self.flushes += 1
         refusing: dict[str, Flag] = {}
         for flag in flags:
-            if flag.refuses:
-                refusing[flag.who] = flag
+            if not flag.refuses:
+                continue
+            # Keyed by the client (`ip:<key>`): a SPAM-ENUM flag's subject also names the template.
+            client = _client_key(flag.who)
+            who = f"ip:{client}" if client is not None else flag.who
+            held = refusing.get(who)
+            if held is None or flag.until > held.until:
+                refusing[who] = flag
         self._flags = refusing
         for detection in claimed:
             self.detections_total += 1
@@ -649,7 +722,8 @@ class SpamDetectors:
         return claimed
 
     async def _act(self, detection: Detection, values: Mapping[str, Any], now_s: int) -> None:
-        action = self._effective_action(detection)
+        dry_run = bool(_live(values, "spam_dry_run"))
+        action = self._effective_action(detection, dry_run)
         detail = {
             "detector": f"SPAM-{detection.detector.upper()}",
             "subject": detection.subject,
@@ -662,8 +736,12 @@ class SpamDetectors:
             "evidence": detection.evidence,
         }
         if action == "ban" and detection.limit_key is not None:
-            if bool(_live(values, "spam_dry_run")):
-                self._event("spam_would_ban", "warning", detail)
+            if dry_run:
+                # What arming would do instead: a trusted game server gets a strike, never a ban (FILTER-COLLATERAL
+                # lists it as "looked like a trusted Roblox game server").
+                self._event(
+                    "spam_would_ban", "warning", {**detail, "when_armed": self._effective_action(detection, False)}
+                )
                 return
             if self.rules_service is not None and self.control_db is not None:
                 try:

@@ -85,6 +85,24 @@ def test_ratelimit_headers(
         assert info.reset_s == pytest.approx(reset)
 
 
+def test_header_numbers_too_large_for_a_float_are_never_infinite() -> None:
+    """Final review data-9: 309 or more digits are infinity as a float. The wait reads as MAX_HEADER_WAIT_S (one
+    day), a count as None: nothing infinite reaches the 429 log, a JSON answer or a Retry-After."""
+    huge = "9" * 400
+    assert cooldowns.parse_retry_after(huge, NOW_S) == cooldowns.MAX_HEADER_WAIT_S
+    info = cooldowns.parse_ratelimit_headers(
+        {"x-ratelimit-limit": huge, "x-ratelimit-remaining": huge, "x-ratelimit-reset": huge}, NOW_S
+    )
+    assert info is not None
+    assert (info.limit, info.remaining, info.reset_s) == (None, None, cooldowns.MAX_HEADER_WAIT_S)
+    exhausted = cooldowns.parse_ratelimit_headers({"x-ratelimit-remaining": "0", "x-ratelimit-reset": huge}, NOW_S)
+    assert exhausted is not None
+    assert exhausted.exhausted
+    assert exhausted.reset_s == cooldowns.MAX_HEADER_WAIT_S
+    seconds, _source = cooldowns.cooldown_duration(None, exhausted, 1, POLICY, random.Random(1))
+    assert seconds == POLICY.max_s  # still clamped like every other wait
+
+
 def test_ratelimit_absent() -> None:
     assert cooldowns.parse_ratelimit_headers({"content-type": "application/json"}, NOW_S) is None
     assert RateLimitInfo(None, 0, 5).exhausted is True
@@ -139,6 +157,18 @@ def test_keys() -> None:
     assert cooldowns.egress_key(Egress.CREDENTIAL) == "egress:credential"
     assert cooldowns.keys_for("h.roblox.com", "h.roblox.com/x", Egress.CREDENTIAL)[-1] == "credential"
     assert "credential" not in cooldowns.keys_for("h.roblox.com", "h.roblox.com/x", Egress.DIRECT)
+
+
+def test_endpoint_keys_ignore_the_letter_case_of_the_path() -> None:
+    """Final review pipe-2: Roblox's routes ignore case, so `/V1/Games` is inside the cooldown of `/v1/games`; the
+    templating's id placeholders keep their names."""
+    for template in ("games.roblox.com/v1/games", "games.roblox.com/V1/Games", "games.roblox.com/v1/GAMES"):
+        assert cooldowns.endpoint_key(template, Egress.DIRECT) == "endpoint:games.roblox.com/v1/games:direct"
+    assert (
+        cooldowns.endpoint_key("games.roblox.com/V1/Games/{universeId}/Votes", "rotator")
+        == "endpoint:games.roblox.com/v1/games/{universeId}/votes:rotator"
+    )
+    assert cooldowns.rotator_exit_prefix("t/X") == cooldowns.rotator_exit_prefix("t/x")
 
 
 def test_repeat_count() -> None:

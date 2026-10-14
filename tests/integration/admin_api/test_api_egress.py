@@ -216,6 +216,36 @@ async def test_rotator_budget_tiles_projection_and_daily_bars(
     assert previous["cycle"]["end"] == daily["cycle"]["start"]
 
 
+async def test_rotator_budget_tiles_keep_the_billing_count_after_a_usage_reset(
+    api_app: Any, api: Any, api_json: Any, metrics_seed: Any
+) -> None:
+    """The final review gate (the docs step's CODE request after data-4): the Budget tiles read the count the hard
+    stop and the daily cap use (`rotator.read_billed_bytes`), so an Egress usage statistics reset (the rows of
+    `egress_usage` gone, the control.db billing count kept) never makes them show less than the stop counts."""
+    from roxy.egress.rotator import cycle_start_for, day_start_for, merge_billing
+
+    await api_app.settings(rotator_quota_gb_per_month=5, rotator_price_per_gb_usd=2)
+    now = api_app.clock.now_ms()
+    api_app.ctx.recorder.record_egress_usage("rotator", req_bytes=0, resp_bytes=50_000_000, at_ms=now)
+    await metrics_seed.flush()
+    now_s = now // 1000
+    cycle, day = cycle_start_for(now_s, 1), day_start_for(now_s)
+    # What a reset leaves behind: the high-water mark of the deleted rows (900 MB this cycle, 300 MB today).
+    api_app.ctx.dbs.control.write_sync(
+        lambda conn: merge_billing(
+            conn, cycle=cycle, day=day, table_cycle=900_000_000, table_day=300_000_000, add_cycle=0, add_day=0,
+            now_s=now_s,
+        )
+    )  # fmt: skip
+    body = api_json(await api.get("egress/rotator/budget"))
+    tiles = {tile["key"]: tile for tile in body["tiles"]}
+    assert tiles["rotator_cycle_bytes"]["value"] == 900_000_000
+    assert tiles["rotator_remaining_bytes"]["value"] == 5 * DECIMAL_GB - 900_000_000
+    assert tiles["rotator_cost_usd"]["value"] == 1.8
+    assert body["cycle"]["today_bytes"] == 300_000_000
+    assert "hard stop" in tiles["rotator_cycle_bytes"]["help"]
+
+
 # ================================================================================= exit IPs and sessions
 
 

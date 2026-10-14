@@ -51,7 +51,9 @@ How it works
       counters go, else `config_change`, P6), written BEFORE the first delete and linked to the intent row, so a
       reset that fails midway still marks what it deleted (finding mpjobs-4): on success it links to the
       `data.reset.done` row, on a failure that deleted something it is labeled incomplete and links to the
-      `data.reset.failed` row, and when nothing was deleted it is removed. Then batches of 5,000 rows, each its
+      `data.reset.failed` row, and when nothing was deleted it is removed. A worker shutdown that cancels a running
+      reset, backup or VACUUM is such a failure too: it writes its `.failed` row within `STOPPED_RECORD_S` before
+      the cancellation goes on (finding data-7). Then batches of 5,000 rows, each its
       own short write transaction with a yield between batches (the hot path keeps writing). The POST waits up to
       `INLINE_WAIT_S` and answers the result, or 202 with the operation id. One reset or backup runs at a time
       fleet-wide (the hot.db lease `ResetLease`, also taken by the internal socket's resets). Each worker's
@@ -88,7 +90,7 @@ import shutil
 import sqlite3
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -159,6 +161,16 @@ BATCH_PAUSE_S: Final = 0.01
 INLINE_WAIT_S: Final = 5.0
 """How long `POST /data/resets` (and backups, VACUUM) waits for its operation before answering 202."""
 
+STOPPED_RECORD_S: Final = 2.0
+"""How long an operation canceled by its worker's shutdown may spend writing down how it ended (finding data-7).
+A gunicorn `max_requests` recycle or a deploy stopping the old color ends a worker, and `TaskSupervisor.stop`
+cancels an operation still running after its drain; the failed audit row, the marker relabel and the lease release
+then get this long each (milliseconds when the databases answer), well inside the lifespan's 8 s shutdown budget,
+before the cancellation goes on."""
+
+STOPPED_MESSAGE: Final = "Stopped part way: the worker shut down (a restart, a recycle or a deploy) before it finished."
+"""The `error` an operation canceled by its worker's shutdown records (its audit row and `GET /operations/{id}`)."""
+
 MAX_OPERATIONS: Final = 32
 """Operations each worker remembers for `GET /data/operations/{id}` (plan P9); older ones live in the audit log."""
 
@@ -181,6 +193,18 @@ SNAPSHOT_DBS: Final = ("control", "metrics")
 SNAPSHOT_MIN_FREE_BYTES: Final = 64 * 1024 * 1024
 MANUAL_SNAPSHOT_PREFIX: Final = "manual-"
 """Back up now's own copies: the only snapshots it removes to make room (oldest first)."""
+
+PREMIGRATE_SNAPSHOT_PREFIX: Final = "pre-migrate-"
+"""The deploy's copies before a migration (`deploy/prestart.py SNAPSHOT_PREFIX`, which a test keeps equal)."""
+
+SNAPSHOT_KINDS: Final[tuple[tuple[str, str], ...]] = (
+    (PREMIGRATE_SNAPSHOT_PREFIX, "premigrate"),
+    ("reset-", "reset"),
+    (MANUAL_SNAPSHOT_PREFIX, "manual"),
+)
+"""File name prefix and kind of each snapshot the snapshots folder holds (`take_snapshot` writes `reset-` and
+`manual-`). The kind is the whole prefix: `pre-migrate-` has a hyphen of its own, so the text before the first
+hyphen read as `pre` on Data > Backups (finding docs_b-9)."""
 
 BACKUP_REQUEST_NAME: Final = "backup-request"
 """`<state dir>/backup-request`, the file `roxy-backup-request.path` watches (same name as `scripts/ctl.py`)."""
@@ -278,6 +302,23 @@ def _rollups(
     return tuple(Part("metrics", t, ROLLUP_KEY, where, params, "bucket_start", "s", action, match) for t in ROLLUPS)
 
 
+ANSWER_KEY: Final = "bucket_start, endpoint_template, host, egress"
+"""The primary key of the `roblox_answer_*` tables (WITHOUT ROWID; metrics 0010)."""
+
+
+def _answers(
+    where: str = "1",
+    params: tuple[Any, ...] = (),
+    match: tuple[tuple[str, tuple[Any, ...]], ...] | None = None,
+) -> tuple[Part, ...]:
+    """Roblox's answers per attempt (`rollups.ANSWER_TABLES`, lead decision 11): they belong to the traffic the rollups
+    count, so a Traffic or endpoint reset takes them too, or the three "from Roblox" tiles would keep counting
+    traffic the reset removed."""
+    return tuple(
+        Part("metrics", t, ANSWER_KEY, where, params, "bucket_start", "s", match=match) for t in rollups.ANSWER_TABLES
+    )
+
+
 _LOOKUP_STATES_SQL: Final = ", ".join(f"'{state}'" for state in CACHE_LOOKUP_STATES)
 """The cache lookup states as SQL literals (module constants of the recorder, never request text)."""
 
@@ -315,10 +356,10 @@ FAMILIES: Final[dict[str, Family]] = {
             "traffic",
             "Traffic",
             "traffic#requests",
-            _rollups(),
+            (*_rollups(), *_answers()),
             note=(
                 "Traffic rows also hold the latency, cache and upstream numbers of the same requests; they go "
-                "with them."
+                "with them, and so do the counts of Roblox's answers to them (the 2xx, 4xx and 5xx from Roblox)."
             ),
         ),
         Family(
@@ -365,7 +406,10 @@ FAMILIES: Final[dict[str, Family]] = {
             "Egress usage",
             "egress#usage",
             (Part("metrics", "egress_usage", "bucket_start, egress, granularity", time_col="bucket_start"),),
-            note="The rotator quota count of the current billing cycle starts again from what is left.",
+            note=(
+                "The rotator's billing count (its monthly hard stop, daily cap and budget alerts) is kept: Roxy "
+                "keeps it apart from these statistics, so the stop still holds after this reset."
+            ),
         ),
         Family(
             "tarpit",
@@ -605,7 +649,7 @@ V1_CLEAR_TARGETS: Final[dict[str, dict[str, Any]]] = {
     "errors": {"scope": "family", "families": ["errors"]},
     "fingerprints": {"scope": "family", "families": ["fingerprints"]},
     "blocked_fingerprints": {"scope": "family", "families": ["fingerprints"], "note": "One family in v2."},
-    "all": {"scope": "everything", "note": "Plus the worker request counts: System > Reset counts."},
+    "all": {"scope": "everything", "note": "Plus the worker request counts: System > Reset request counts."},
 }
 """Where every v1 `POST /admin/data/clear` target went (plan 6.8 last paragraph; v1 notes diagnostics.md 14).
 `scope` None: v2 counts it from a moment that moves by itself, so there is nothing to reset (the note says why)."""
@@ -874,6 +918,7 @@ def build_plan(body: ResetBody, ctx: Any, now: float) -> ResetPlan:
         same_template = (("endpoint_template", (template,)),)
         plan.parts = [
             *_rollups(_dims("endpoint_template = ?"), (template,), match=same_template),
+            *_answers("endpoint_template = ?", (template,), match=same_template),
             Part(
                 "metrics",
                 "upstream_429",
@@ -1377,9 +1422,9 @@ async def _start(
         try:
             op.result = await work()
             op.status = "done"
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:  # canceled: the worker is shutting down (data-7)
             op.status = "failed"
-            op.error = common.clean_message(f"{type(exc).__name__}: {exc}", 300)
+            op.error = failure_text(exc)
             raise
         finally:
             op.finished_at = ctx.clock.now()
@@ -1413,6 +1458,39 @@ async def _audit(
 
     result: int = await common.run_mutation(ctx.dbs.control.write(write))
     return result
+
+
+def failure_text(exc: BaseException) -> str:
+    """What an operation that ended early records as its error: `STOPPED_MESSAGE` for a cancellation (its worker
+    shut down), else the exception's type and message, cleaned and bounded."""
+    if isinstance(exc, asyncio.CancelledError):
+        return STOPPED_MESSAGE
+    return common.clean_message(f"{type(exc).__name__}: {exc}", 300)
+
+
+async def settle_ending(record: Callable[[], Awaitable[Any]], exc: BaseException) -> None:
+    """Run `record` (writing down how an operation ended), best effort: it never raises.
+
+    `asyncio.CancelledError` is not an `Exception`, so an operation's `except Exception` never saw a worker shutdown
+    cancel it (finding data-7). After a cancellation `record` gets at most `STOPPED_RECORD_S`: the task has had its
+    one cancel from `TaskSupervisor.stop`, so its awaits run again, and the time bound keeps the shutdown from
+    waiting on a database that does not answer. The caller re-raises the cancellation afterwards.
+    """
+    with contextlib.suppress(Exception):  # the database may be why it failed; TimeoutError is an Exception too
+        if isinstance(exc, asyncio.CancelledError):
+            async with asyncio.timeout(STOPPED_RECORD_S):
+                await record()
+        else:
+            await record()
+
+
+async def _release_after(lease: ResetLease, ended: BaseException | None) -> None:
+    """Give the lease back at the end of an operation; after a cancellation within `STOPPED_RECORD_S` (else the
+    lease simply expires after `RESET_LEASE_TTL_MS`)."""
+    if isinstance(ended, asyncio.CancelledError):
+        await settle_ending(lease.release, ended)
+    else:
+        await lease.release()
 
 
 # ================================================================================================ running a reset
@@ -1670,7 +1748,12 @@ def fence_selectors(plan: ResetPlan) -> list[dict[str, Any]]:
     for part in plan.parts:
         if part.db != "metrics":
             continue
-        table = "rollup_minute" if part.table in ROLLUPS else part.table
+        if part.table in ROLLUPS:
+            table = "rollup_minute"
+        elif part.table in rollups.ANSWER_TABLES:
+            table = "roblox_answer_minute"  # the only answer level the recorder writes
+        else:
+            table = part.table
         if table not in FENCED_TABLES:
             continue
         match = part.match
@@ -1787,6 +1870,17 @@ def _keep_marker(part: Part, marker: int | None) -> Part:
     return replace(part, where=f"({part.where}) AND id != ?", params=(*part.params, marker))
 
 
+def deleted_so_far(deleted: Mapping[str, int], progress: Mapping[str, int]) -> dict[str, int]:
+    """The rows a reset changed before it stopped: the steps it finished (`deleted`), plus the batches already
+    committed of the table it was working on (`op.progress` counts each batch as it commits, `deleted` a table only
+    once all of it is done). Without the second part a reset stopped in its first table read as one that changed
+    nothing, and its marker was removed although rows were gone."""
+    out = dict(deleted)
+    for label, rows in progress.items():
+        out[label] = max(out.get(label, 0), int(rows))
+    return out
+
+
 async def execute_reset(
     ctx: Any, op: Operation, plan: ResetPlan, actor: Actor, reason: str, request_id: str | None, lease: ResetLease
 ) -> dict[str, Any]:
@@ -1803,6 +1897,7 @@ async def execute_reset(
     skipped: list[dict[str, Any]] = []
     fence: dict[str, Any] | None = None
     marker: int | None = None
+    ended: BaseException | None = None
     try:
         now = ctx.clock.now()
         op.step = "snapshot"
@@ -1866,35 +1961,39 @@ async def execute_reset(
         for name in sorted({p.db for p in plan.parts} & {"metrics", "cache"}):
             with contextlib.suppress(SharedStateUnavailable):  # give the freed pages back to the file system
                 await ctx.dbs.get(name).maintenance(retention.incremental_vacuum)
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         # What was deleted before the failure is still recorded (plan 9.7), best effort: control.db may be the
-        # reason it failed.
-        failure = {
-            "deleted": deleted,
-            "step": op.step,
-            "error": common.clean_message(f"{type(exc).__name__}: {exc}", 300),
-            "fence": fence,
-        }
-        failed_id: int | None = None
-        with contextlib.suppress(Exception):
-            failed_id = await _audit(ctx, actor, AUDIT_RESET_FAILED, target, failure, reason, request_id)
-        if marker is not None:
-            # Rows already gone keep their marker, so every chart and KPI over them still says "data reset"
-            # (plan 6.8, finding mpjobs-4); a reset that changed nothing leaves no marker behind. Best effort.
-            marker_id = marker
-            changed = sum(deleted.values()) > 0
-            incomplete = f"Data reset (incomplete): {plan.label}"[:MAX_LABEL_CHARS]
+        # reason it failed. A worker shutdown cancels a reset still running (`TaskSupervisor.stop`), and
+        # `CancelledError` is not an `Exception`: it is named here so a canceled reset records how it ended too,
+        # within `STOPPED_RECORD_S`, before the cancellation goes on (finding data-7).
+        ended = exc
+        so_far = deleted_so_far(deleted, op.progress)
+        failure = {"deleted": so_far, "step": op.step, "error": failure_text(exc), "fence": fence}
+        marker_id = marker
+        changed = sum(so_far.values()) > 0
+        incomplete = f"Data reset (incomplete): {plan.label}"[:MAX_LABEL_CHARS]
 
+        async def record() -> None:
+            failed_id: int | None = None
+            with contextlib.suppress(Exception):
+                failed_id = await _audit(ctx, actor, AUDIT_RESET_FAILED, target, failure, reason, request_id)
+            if marker_id is None:
+                return
+            mark: int = marker_id
+
+            # Rows already gone keep their marker, so every chart and KPI over them still says "data reset"
+            # (plan 6.8, finding mpjobs-4); a reset that changed nothing leaves no marker behind.
             def settle(conn: sqlite3.Connection) -> bool:
                 if changed:
-                    return update_annotation(conn, marker_id, audit_id=failed_id, label=incomplete)
-                return delete_annotation(conn, marker_id)
+                    return update_annotation(conn, mark, audit_id=failed_id, label=incomplete)
+                return delete_annotation(conn, mark)
 
-            with contextlib.suppress(Exception):
-                await ctx.dbs.metrics.write(settle)
+            await ctx.dbs.metrics.write(settle)
+
+        await settle_ending(record, exc)
         raise
     finally:
-        await lease.release()
+        await _release_after(lease, ended)
     op.step = "audit"
     duration_ms = round((time.perf_counter() - started) * 1000, 1)
     outcome = {
@@ -2247,6 +2346,14 @@ async def retention_answer(ctx: Any) -> dict[str, Any]:
 # ================================================================================================ routes: backups
 
 
+def snapshot_kind(name: str) -> str:
+    """The kind of a snapshot file from its name (`SNAPSHOT_KINDS`); an unknown file keeps its first word."""
+    for prefix, kind in SNAPSHOT_KINDS:
+        if name.startswith(prefix):
+            return kind
+    return name.split("-", 1)[0]
+
+
 def _snapshot_files(folder: Path) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if folder.is_dir():
@@ -2254,7 +2361,7 @@ def _snapshot_files(folder: Path) -> list[dict[str, Any]]:
             if not entry.is_file(follow_symlinks=False) or not entry.name.endswith(".db"):
                 continue
             info = entry.stat(follow_symlinks=False)
-            kind = entry.name.split("-", 1)[0]
+            kind = snapshot_kind(entry.name)
             out.append({"file": entry.name, "bytes": info.st_size, "at": int(info.st_mtime), "kind": kind})
     out.sort(key=lambda item: int(item["at"]), reverse=True)
     return out[:500]
@@ -2434,10 +2541,12 @@ async def back_up_now(request: Request, body: ReasonBody, admin: AdminSession, _
         raise
 
     async def work() -> dict[str, Any]:
+        removed: list[str] = []
+        made: list[dict[str, Any]] = []
+        ended: BaseException | None = None
         try:
             op.step = "room"
             removed = await asyncio.to_thread(_remove_snapshots, replaced)
-            made = []
             for name in copies:
                 op.step = name
                 made.append(await take_snapshot(ctx, name, "manual", now))
@@ -2447,8 +2556,19 @@ async def back_up_now(request: Request, body: ReasonBody, admin: AdminSession, _
                 ctx, actor, f"{AUDIT_BACKUP}.done", f"operation:{op.id}", outcome, reason, request_id
             )
             return {**outcome, "audit_id": done_id}
+        except (Exception, asyncio.CancelledError) as exc:
+            # A copy that failed, or a worker shutdown (finding data-7): the audit log says how it ended, with the
+            # copies already made and removed, so `GET /operations/{id}` never reads "started" for ever.
+            ended = exc
+            failed: dict[str, Any] = {"step": op.step, "snapshots": made, "replaced": removed, "request": asked}
+            failed["error"] = failure_text(exc)
+            target = f"operation:{op.id}"
+            await settle_ending(
+                lambda: _audit(ctx, actor, f"{AUDIT_BACKUP}.failed", target, failed, reason, request_id), exc
+            )
+            raise
         finally:
-            await lease.release()
+            await _release_after(lease, ended)
 
     return await _start(request, op, work, on_refused=lease.release)
 
@@ -2527,22 +2647,32 @@ async def run_vacuum(request: Request, body: VacuumBody, admin: AdminSession, _c
 
     async def work() -> dict[str, Any]:
         db = ctx.dbs.get(body.database)
-        before = await db.maintenance(retention.database_sizes)
-        started = time.perf_counter()
-        op.step = "vacuum"
-        await db.maintenance(lambda conn: conn.execute("VACUUM"))
-        after = await db.maintenance(retention.database_sizes)
-        outcome = {
-            "database": body.database,
-            "bytes_before": before["bytes"],
-            "bytes_after": after["bytes"],
-            "reclaimed_bytes": max(0, before["bytes"] - after["bytes"]),
-            "duration_ms": round((time.perf_counter() - started) * 1000, 1),
-        }
-        outcome["audit_id"] = await _audit(
-            ctx, actor, f"{AUDIT_VACUUM}.done", f"operation:{op.id}", outcome, reason, request_id
-        )
-        return outcome
+        try:
+            before = await db.maintenance(retention.database_sizes)
+            started = time.perf_counter()
+            op.step = "vacuum"
+            await db.maintenance(lambda conn: conn.execute("VACUUM"))
+            after = await db.maintenance(retention.database_sizes)
+            outcome = {
+                "database": body.database,
+                "bytes_before": before["bytes"],
+                "bytes_after": after["bytes"],
+                "reclaimed_bytes": max(0, before["bytes"] - after["bytes"]),
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            }
+            outcome["audit_id"] = await _audit(
+                ctx, actor, f"{AUDIT_VACUUM}.done", f"operation:{op.id}", outcome, reason, request_id
+            )
+            return outcome
+        except (Exception, asyncio.CancelledError) as exc:
+            # A failed VACUUM, or a worker shutdown while it ran (finding data-7): recorded either way. SQLite runs
+            # a VACUUM as one transaction on its own thread, so the file is whole whether it finished or not.
+            failed = {"database": body.database, "step": op.step, "error": failure_text(exc)}
+            target = f"operation:{op.id}"
+            await settle_ending(
+                lambda: _audit(ctx, actor, f"{AUDIT_VACUUM}.failed", target, failed, reason, request_id), exc
+            )
+            raise
 
     return await _start(request, op, work)
 
@@ -2551,8 +2681,12 @@ __all__ = [
     "BACKUP_REQUEST_NAME",
     "FAMILIES",
     "MEMORY_FAMILIES",
+    "PREMIGRATE_SNAPSHOT_PREFIX",
     "RESET_LEASE",
     "SCOPES",
+    "SNAPSHOT_KINDS",
+    "STOPPED_MESSAGE",
+    "STOPPED_RECORD_S",
     "STORAGE_TABLE",
     "V1_CLEAR_TARGETS",
     "Family",
@@ -2565,7 +2699,9 @@ __all__ = [
     "backups_answer",
     "build_plan",
     "count_part",
+    "deleted_so_far",
     "execute_reset",
+    "failure_text",
     "fence_pending_counts",
     "fence_selectors",
     "marker_tables",
@@ -2576,7 +2712,9 @@ __all__ = [
     "retention_answer",
     "retention_setting_keys",
     "router",
+    "settle_ending",
     "snapshot_feasibility",
+    "snapshot_kind",
     "storage_rows",
     "take_snapshot",
     "template_regex",

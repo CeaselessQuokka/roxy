@@ -287,3 +287,19 @@ def test_format_parameter() -> None:
             parse_export_format(bad)
         assert caught.value.status_code == 422
         assert set(caught.value.error_fields) == {"format"}
+
+
+def test_exports_never_carry_a_non_finite_number() -> None:
+    """Final review data-9 (defense in depth): a NaN or an infinity anywhere in a row is null in a JSON file and an
+    empty cell in a CSV file, so every export stays strict JSON (json.loads refuses NaN with parse_constant)."""
+    items = [{"name": "a", "count": float("inf"), "meta": {"wait": float("nan"), "list": [1.5, float("-inf")]}}]
+
+    def refuse(constant: str) -> None:
+        raise ValueError(constant)
+
+    data = json.loads(render_export(SPEC, items, "json", at_ms=0).content, parse_constant=refuse)
+    assert data["items"] == [{"name": "a", "count": None, "meta": {"wait": None, "list": [1.5, None]}}]
+    rows = list(csv.reader(io.StringIO(render_export(SPEC, items, "csv", at_ms=0).content.decode("utf-8"))))
+    assert rows[1][:2] == ["a", ""]
+    assert "NaN" not in rows[1][2]
+    assert "Infinity" not in rows[1][2]

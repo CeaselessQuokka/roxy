@@ -145,7 +145,10 @@ SETTINGS: list[SettingSpec] = [
         description=(
             "How many credential requests may go out back to back before the even pacing of "
             "credential_bucket_per_min applies. It lets a short cluster of calls through without waiting while "
-            "the average stays at the configured rate."
+            "the average stays at the configured rate. The burst is shared with Roxy's own credential checks: "
+            "allowlisted traffic gets this burst minus 1 and the checks' reserved sub-bucket gets 1 (at 1, a "
+            "check also takes the traffic's slot), so no more than this many account calls ever leave back to "
+            "back."
         ),
         pages=(_BUDGET,),
         if_raised=(

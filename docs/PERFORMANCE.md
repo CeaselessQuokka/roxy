@@ -128,8 +128,8 @@ minutes).
 
 What did not grow: live Python objects stay flat at the replay's rate (tracemalloc snapshots of the leader at minute
 15 and 25 differ by 0.2 MiB after the fix, 0.4 MiB between minute 10 and 20 before, besides an evaluation in flight),
-and SQLite's page caches fill toward their bound (DESIGN.md section 0: about 30 MiB per worker; 22 MiB on the leader
-after 35 minutes, 7 MiB on the other worker).
+and SQLite's page caches fill toward their bound (`docs/ARCHITECTURE.md`, "What one worker may hold": about 30 MiB
+per worker; 22 MiB on the leader after 35 minutes, 7 MiB on the other worker).
 
 ### LOAD-2: what changed
 
@@ -195,7 +195,7 @@ evaluation, almost all of it on the databases' reader threads (Python building r
 loop needs): every rule that tunes a cache lifetime read up to 50,000 samples of its template for the whole day (the
 OLDEST 50,000: a busy template's day was silently cut), and the memo bound made the rules read them again in turn;
 the address table was read 250 rows a page, each page re-running the whole aggregate and a rates read (3.2 s for
-2,000 addresses over 24 hours). Now (`.remake/p11_reports/gaps_insights.md`):
+2,000 addresses over 24 hours). Now (`CHANGES.md`, "P11 gaps lane: the recommendations evaluation", finding G7):
 
 - each window is read once for every rule of a run: `by` and `clients` are one aggregate (`queries.top_rows_sync`,
   `queries.client_rows_sync`), and the TTL tuner is SQL over every sample of the window
@@ -209,8 +209,10 @@ the address table was read 250 rows a page, each page re-running the whole aggre
   and CACHE-NEG's error replay.
 
 Offline, one evaluation (`InsightsEngine.evaluate`, every rule) at the time of the last sample, the process pinned to
-one CPU (the leader's share of the 2 vCPU server under load), two runs each, before and after interleaved
-(`.remake/scripts/gaps_insights_pinned.sh`). "Day" is the dashboard scenario's seeded day (`tests/load/pages.py`:
+one CPU with `taskset` (the leader's share of the 2 vCPU server under load), two runs each, before and after
+interleaved, on copies of the seeded databases (a one-off measurement script of the lane, not part of the
+repository; to measure again, time one `InsightsEngine.evaluate` call the same way on a copy of the dashboard
+scenario's template). "Day" is the dashboard scenario's seeded day (`tests/load/pages.py`:
 500,000 requests, 477,330 request samples, 2,000 addresses); "replay" is the perf lane's copy of a replay state
 (293,304 samples over 22 hours, 13 templates). The loop stall is how late a 2 ms sleep on the same event loop woke up.
 
@@ -235,6 +237,8 @@ The units now hold each color at `MemoryHigh=420M` and `MemoryMax=500M` (were 32
 | A color at 10 a second, workers recycling every 20,000 requests (about every 67 minutes) | 354 MiB at 35 minutes, 0.3 MiB a minute at the end: about 365 MiB | under `MemoryHigh` 420 |
 | A color at 200 a second, workers recycling every 20,000 requests (about every 3.5 minutes) | 405 MiB at 3.5 minutes | under `MemoryHigh` 420 |
 | Short peaks on top (one evaluation at a day's volume, two 16 MiB table downloads) | up to about 70 MiB | under `MemoryMax` 500 |
+| A login burst (anyone can send one; no password is needed to make Roxy hash): one argon2id hash of 19 MiB at a time per worker (`HASH_CONCURRENCY` 1, final review finding sec-2) | +20 MiB a worker, measured over 5 runs with the unit's allocator lines: 40 MiB a color (plan 9.5's 64 MiB, two at a time, measured 95 to 129 MiB a worker) | the 95 MiB a warm color has left under `MemoryMax` 500 |
+| The C7 degraded-mode stores while hot.db cannot be written (`limiter.MEMORY_ROWS_MAX` 6,000 entries each, least recently used evicted; final review finding abuse-14) | about 4.4 MiB a worker when both are full (tracemalloc, about 380 bytes an entry): 8.8 MiB a color (50,000 entries, the bound before, took about 37 MiB a worker) | under `MemoryMax` 500 |
 | One color at its hard limit, plus nginx and the OS (about 200 MB, the lead's estimate) | 500 + 200 = 700 | 909 |
 | A deploy on this server (low-memory mode: below 700 MB available, which a warm color always causes): a warm color at `MemoryMax` plus a new color with one worker (155 MiB at start) plus 200 | 855 | 909 |
 | A deploy in normal mode (only when 700 MB or more is available): two fresh workers, 275 MiB at start | fits in the 700 available | 909 |
@@ -349,7 +353,7 @@ ran out, open issue below). Two processes doing only hot.db writes
 ## Method
 
 **The system under test** is started the way production starts it: `gunicorn -c deploy/gunicorn.conf.py
-roxy.asgi:app` with `roxy.worker.RoxyUvicornWorker` and 2 workers (DESIGN.md section 0), `reuse_port`, the
+roxy.asgi:app` with `roxy.worker.RoxyUvicornWorker` and 2 workers (`ROXY_WORKERS`, `deploy/env/roxy.env.example`), `reuse_port`, the
 production keep-alive and timeouts. The four databases live in a fresh temporary state directory, migrated and
 seeded before the start as the deploy's prestart step does. Settings are the built-in defaults, with three
 exceptions that every scenario shares (`tests/load/fleet.py`): the scheduled health run and the rotator are off
@@ -424,9 +428,9 @@ from the cache or a shared fetch and the share deferred by pacing.
 | Load | load average 0.6 to 8 from other agents' test runs, 34 for the two deliberate busy-machine replays |
 | Roxy measured | `git archive` of commit 3861e65 (`--tree`), except where a row says "working tree" |
 
-Production is a 2 vCPU burstable Lightsail instance with 909 MB of memory and no swap (LEAD_NOTES, DESIGN.md
-section 0). Throughput and latency on it will differ; per-process memory figures transfer better (see the memory
-section for the one caveat).
+Production is a 2 vCPU burstable Lightsail instance with 909 MB of memory and no swap (`docs/ARCHITECTURE.md`,
+"Memory sizing for the 1 GB server"). Throughput and latency on it will differ; per-process memory figures transfer
+better (see the memory section for the one caveat).
 
 ## Results of the plan 19.4 scenarios (indicative)
 
@@ -657,7 +661,7 @@ said `MemoryHigh=320M` and `MemoryMax=420M`). The current figures, the cause of 
 the units now set (420M and 500M) are in "LOAD-2 and LOAD-3" above, "Memory per color and the systemd decision".
 
 Production has 909 MB and no swap; each color ran with `MemoryHigh=320M` and `MemoryMax=420M` (MiB), and during a
-deploy two colors overlap (DESIGN.md section 0, `deploy/systemd/roxy@.service`). The sampler reads RSS, USS and PSS
+deploy two colors overlap (`deploy/systemd/roxy@.service`). The sampler reads RSS, USS and PSS
 from `/proc` every 0.5 s; PSS summed over the master and both workers is the best per-process estimate of the
 color's charge (the cgroup also charges page cache, which no per-process figure shows).
 
@@ -685,7 +689,7 @@ end. `MALLOC_ARENA_MAX=2` lowers every figure by about 10 MiB and changes neithe
 is not allocator fragmentation across threads. The cause is not known: the leader is the worker that runs the
 leader jobs (insights every 30 s, history pruning every 10 minutes, rollups and compaction, health publishing, the
 LLM export file at start and hourly). The page caches of a worker's usual SQLite connections and the cache.db
-memory map add up to about 60 MiB (DESIGN.md section 0), less than the leader's 73 MiB of growth, and the other
+memory map add up to about 60 MiB (`docs/ARCHITECTURE.md`, "What one worker may hold"), less than the leader's 73 MiB of growth, and the other
 worker, which reads the same files for the same requests, did not grow. Someone who owns those jobs should take two
 `tracemalloc` snapshots of the leader ten minutes apart, and the quiet rerun should include a soak of a few hours
 (`--scale 60` is a 200 minute replay) to see where it levels off.
@@ -962,9 +966,9 @@ as above (20 rounds, 3 rounds at 90 days) twice, back to back: "before" with the
 lane started (metrics schema 8), "after" with the working tree at the end of the lane (schema 9; each run's copy took
 8.7 to 9.8 s to migrate). The "after" tree also holds the other lanes' changes made in between (the recommendations
 evaluation got cheaper in the insights lane), and the machine was busier than for the first pass (load average 3 to
-7 from other work): read the before and after columns against each other, not against the first pass. Report:
-`.remake/p11_reports/gaps_latency.md`; raw output in `.remake/p11_reports/gaps_latency_runs/` (`before`, `after`,
-`compare.md`).
+7 from other work): read the before and after columns against each other, not against the first pass. The changes
+are recorded in `CHANGES.md`, "P11 gaps lane: dashboard latency L1 to L5"; the raw output of the runs stayed with the
+lane's working notes, outside the repository.
 
 Pages at their default range, server time p50 / p95 in ms, before -> after:
 
@@ -1003,7 +1007,7 @@ Whole views (a page plus every fragment, summed) after: Clients 384 / 394 ms qui
 161 KiB, Traffic 227 to 124, Settings 276 to 189. Peak worker RSS after: 207 and 205 MiB quiet, 239 and 231 MiB with
 load (241 and 196, 283 and 230 before).
 
-The reads in one process on one connection (the reader cache of DESIGN.md section 0), on the seeded data, ms (24
+The reads in one process on one connection (the reader page cache of `roxy.storage.db.PROFILES`), on the seeded data, ms (24
 hours, 7 days, 90 days):
 
 | Read | Before | After |

@@ -1,6 +1,7 @@
 {#-
   One document of the Help page at /admin/help/<slug> (`roxy/admin/pages/help.py render_doc_page`): the runbooks,
-  the architecture, security, learning path and performance guides, and the admin guide once it is written.
+  the architecture, security, learning path and performance guides. The admin guide has its own template
+  (`guide_chapter.html`, one chapter per page); this one only says so when a release lacks its file.
 
   The shell's h1 is the document's title (the document's own h1 was taken out, one h1 per page); the contents list
   links to every second-level heading; the body was rendered by `roxy.public.pages.render_guide` with raw HTML
@@ -36,7 +37,7 @@
   {% else %}
   <div class="doc-missing card stack">
     {% if spec.slug == "guide" %}
-    {{ inline_alert("info", "The admin guide is not written yet", "docs/ADMIN_GUIDE.md is not part of this release. The Help page's admin guide card lists its chapters and points to the pages, cards and documents that cover each one today.") }}
+    {{ inline_alert("info", "The admin guide is not part of this release", "docs/ADMIN_GUIDE.md was not found next to the application. The Help page's admin guide card lists its topics and points to the pages, cards and documents that cover each one.") }}
     <p><a class="btn btn--primary" href="/admin/help#guide">{{ icon("book") }}<span>Open the chapter outline</span></a></p>
     {% else %}
     {{ inline_alert("warn", "This document is not part of this release", "Its file (docs/" ~ spec.file ~ ") was not found next to the application. The other documents are listed below.") }}

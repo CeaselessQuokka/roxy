@@ -16,18 +16,29 @@ Why it exists
       way, so the master creates it once (`on_starting`) and hands it to every worker (`post_fork`). The socket
       must be mode 0660 so the deploy user (group roxy) can connect and nobody else can; it is created with
       `umask` applied, so the umask below sets that mode.
-    - A taken port fails loudly. With `reuse_port` the master binds nothing itself, so on its own it would never
-      learn that the port is in use: a second master on a served port (the other color with a copy-pasted
-      ROXY_BIND, a manual start) would quietly share it, and a port another program holds would leave a READY
-      master whose workers fail to bind and are respawned forever (finding mp-3). So `on_starting` first checks
-      the TCP address with a plain bind (no SO_REUSEPORT, so ANY listener on it refuses us) and exits with status 1
-      when it is taken, before systemd hears READY, the way gunicorn fails without `reuse_port`; and `pre_fork`
-      checks again before every new worker (with SO_REUSEPORT, so only a foreign listener refuses us) and stops
-      the master instead of starting a worker that cannot bind. Without ROXY_BIND each color takes its own port
-      from `COLOR_PORTS` (finding mp-4), never blue's.
-    - Low-memory deploy mode (DESIGN.md section 0): on the 909 MB server a deploy may start the idle color with
-      one worker and add the rest after the old color stopped. deploy.sh asks for that with a small marker file;
-      this file reads it.
+    - The port never goes without a listener. A worker that stops (a `max_requests` recycle, a reload) closes its
+      own listener at once, and gunicorn forks the replacement only after the old process exited (up to 20 s of
+      draining plus the 8 s lifespan shutdown). The kernel spreads connections evenly, so both workers of a color
+      reach their request limit at about the same time, and when both stop windows overlapped nothing listened on
+      the color's port: nginx answered 502 to every caller for seconds (finding memory-4; a flood makes it happen
+      every round). So the master also holds one SO_REUSEPORT listener of its own for its whole life
+      (`master_tcp_listeners`, opened in `on_starting`) and hands it to every worker like the Unix socket. While
+      any worker runs, it accepts from that shared socket too (the kernel gives it one share of the connections
+      next to the workers' own); while none does, the kernel queues every new connection there (backlog 2048)
+      and the next worker to start answers them. A recycle then resets only the connections already waiting in
+      the stopping worker's own queue.
+    - A taken port fails loudly. With `reuse_port` gunicorn binds the workers' listeners only after the fork, so
+      on its own it would never learn that the port is in use: a second master on a served port (the other color
+      with a copy-pasted ROXY_BIND, a manual start) would quietly share it, and a port another program holds would
+      leave a READY master whose workers fail to bind and are respawned forever (finding mp-3). So `on_starting`
+      first checks the TCP address with a plain bind (no SO_REUSEPORT, so ANY listener on it refuses us) and exits
+      with status 1 when it is taken, before systemd hears READY, the way gunicorn fails without `reuse_port`; and
+      `pre_fork` checks again before every new worker (with SO_REUSEPORT, so only a foreign listener refuses us)
+      and stops the master instead of starting a worker that cannot bind. Without ROXY_BIND each color takes its
+      own port from `COLOR_PORTS` (finding mp-4), never blue's.
+    - Low-memory deploy mode (CHANGES.md, "Memory sizing for the 1 GB server"): on the 909 MB server a deploy may
+      start the idle color with one worker and add the rest after the old color stopped. deploy.sh asks for that
+      with a small marker file; this file reads it.
     - gunicorn 25.1 and later open a control socket by default under `$XDG_RUNTIME_DIR` or `$HOME/.gunicorn/`.
       Both colors would share that path (same user, same home), so it is pinned per color next to the internal
       socket, with the same 0660 mode. deploy.sh uses it to add workers in low-memory mode (`worker add`, the
@@ -157,7 +168,7 @@ worker_class = "roxy.worker.RoxyUvicornWorker"
 
 # Worker processes: ROXY_WORKERS (2 on the 2 vCPU server, D2). Each worker is one asyncio event loop holding
 # thousands of connections, so this is about CPU cores, not concurrency. In low-memory deploy mode deploy.sh asks
-# for 1 here and adds the rest after the old color stopped (DESIGN.md section 0).
+# for 1 here and adds the rest after the old color stopped (low-memory mode, module docstring).
 workers = start_workers(_full_workers, _marker)
 
 # Each worker opens its own listener on the TCP address with SO_REUSEPORT, and the kernel hands every new
@@ -166,13 +177,16 @@ workers = start_workers(_full_workers, _marker)
 # connection: 4 workers took 70/10/0/0 of 80 fresh connections and 130/30/0/0 of the requests on a 16-connection
 # keep-alive pool (what nginx keeps open), against 21/21/21/17 and 60/59/36/5 with this setting. A second master
 # started on a port already in use would share it silently, so on_starting and pre_fork refuse a taken port (module
-# docstring). Trade-off: connections still waiting in a stopping worker's accept queue are reset (Linux moves them
-# to another worker when net.ipv4.tcp_migrate_req=1), so a single-worker color briefly refuses connections while its
-# worker recycles.
+# docstring). The master holds one more SO_REUSEPORT listener in the same group for its whole life and every worker
+# accepts from it too (`master_tcp_listeners`), so the port has a listener even while every worker is stopping
+# (finding memory-4); it takes one share of the connections, which any worker may accept. Trade-off: connections
+# still waiting in a stopping worker's own accept queue are reset (Linux moves them to another listener when
+# net.ipv4.tcp_migrate_req=1, which is not set).
 reuse_port = True
 
 # The loopback TCP address nginx proxies to (ROXY_BIND; without it the color's own port, 127.0.0.1:8001 for blue
-# and 127.0.0.1:8002 for green, so green never lands on blue's port), opened by every worker itself (reuse_port).
+# and 127.0.0.1:8002 for green, so green never lands on blue's port), opened by every worker itself (reuse_port)
+# and once more by the master (`master_tcp_listeners`).
 # The second listener, the internal Unix socket that only the deploy and ctl.py use (plan 5.8), is not listed here:
 # SO_REUSEPORT does not apply to Unix sockets (newer kernels refuse it, and older ones would let each worker replace
 # the socket file of the one before), so the master creates it once in on_starting and every worker accepts on that
@@ -209,7 +223,11 @@ keepalive = 75
 # v1 hard-coded 2000 and ignored the variable (plan 2.4); v2 honors it.
 max_requests = _max_requests
 
-# Spread recycling by up to 10 percent (plan 4.7 row 110) so both workers never restart at the same moment.
+# Spread recycling by up to 10 percent (plan 4.7 row 110). This does NOT keep the workers of a color from stopping
+# at the same moment: the kernel spreads connections evenly, so both reach their limit within jitter / per-worker
+# rate of each other (at most 20 s at 200 requests a second, a few seconds under a flood), less than a stopping
+# worker drains. The master's own listener (`master_tcp_listeners`) is what keeps the port answering then
+# (finding memory-4); the jitter only spreads the cold starts.
 max_requests_jitter = _max_requests // 10
 
 # Load the app in each worker after forking, never in the master: httpx clients, SQLite connections and the
@@ -325,17 +343,37 @@ def internal_listener(server: Any) -> Any:
     return sock.UnixSocket(INTERNAL_SOCKET, settings, server.log)
 
 
+def master_tcp_listeners(server: Any) -> list[Any]:
+    """The master's own SO_REUSEPORT listener on each TCP address of `bind`, held while the master lives.
+
+    gunicorn's socket helper sets SO_REUSEPORT because the config says `reuse_port`, so these join the same group
+    as the workers' own listeners (same user, so Linux lets them share the port). `post_fork` hands them to every
+    worker, which accepts from them next to its own listener; while no worker runs (both recycling at once), the
+    kernel queues new connections here instead of refusing them, and the next worker answers them (finding
+    memory-4). gunicorn closes them when the master stops (`Arbiter.stop` closes every listener).
+    """
+    from gunicorn import sock
+
+    listeners: list[Any] = []
+    for address in server.cfg.address:
+        if isinstance(address, tuple) and len(address) >= 2:
+            kind = sock.TCP6Socket if ":" in str(address[0]) else sock.TCPSocket
+            listeners.append(kind(address, server.cfg, server.log))
+    return listeners
+
+
 def on_starting(server: Any) -> None:
-    """Refuse a taken TCP port, then create the internal Unix socket once, in the master, before any worker exists.
+    """Refuse a taken TCP port, then create the master's listeners once, before any worker exists: its own share
+    of the TCP port (`master_tcp_listeners`) and the internal Unix socket.
 
     The port check is skipped for a master re-executed by USR2 (`master_pid` set), whose parent legitimately still
-    serves the port. gunicorn keeps the Unix socket in its listener list (logged as "Listening at", closed when the
-    master stops) and, because the list is not empty, creates no other master listener; with `reuse_port` the
-    workers open the TCP listener.
+    serves the port (both masters' listeners carry SO_REUSEPORT, so the new one may join). gunicorn keeps these in
+    its listener list (logged as "Listening at", closed when the master stops) and, because the list is not empty,
+    creates no other master listener; with `reuse_port` every worker also opens a TCP listener of its own.
     """
     if not getattr(server, "master_pid", 0):
         check_ports_free(server)
-    server.LISTENERS = [internal_listener(server)]
+    server.LISTENERS = [*master_tcp_listeners(server), internal_listener(server)]
 
 
 def pre_fork(server: Any, worker: Any) -> None:
@@ -354,7 +392,8 @@ def pre_fork(server: Any, worker: Any) -> None:
 
 
 def post_fork(server: Any, worker: Any) -> None:
-    """Give each new worker the master's internal Unix socket next to its own TCP listener."""
+    """Give each new worker the master's listeners (its share of the TCP port and the internal Unix socket) next to
+    the worker's own TCP listener."""
     for listener in server.LISTENERS:
         if listener not in worker.sockets:
             worker.sockets.append(listener)

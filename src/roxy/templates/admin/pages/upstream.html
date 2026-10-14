@@ -52,6 +52,8 @@
      confirm_label="Clear cooldowns and breakers",
      consequences=[
        "Every open cooldown and circuit breaker ends at once, on every worker, so Roxy may call endpoints Roblox recently refused.",
+       "The cache's per-key 429 markers end with them, so a request Roblox refused with a 429 can reach Roblox again.",
+       "The credential's rest after a Roblox 429 and the rotator's park are cooldowns too: they end as well, so the next credential check may call Roblox with the account at once.",
        "Buckets are not refilled: Roxy keeps its normal pace, so this cannot cause a burst of calls.",
        "If Roblox still limits an endpoint, the next 429 opens its cooldown again.",
        "The reset and the exact counts cleared are written to the audit log, with a marker on the charts.",

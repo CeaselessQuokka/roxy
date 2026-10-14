@@ -8,12 +8,14 @@
   form its history keeps); values, reasons and who changed them are plain text through `caller_text`. A row opens
   `?change=<id>` in the drawer: before and after, who and why, and the revert form, which posts to
   `POST /admin/api/v1/settings/history/{id}/revert` (static/js/api_forms.js: CSRF, "Confirm it is you" for a setting
-  that needs a fresh second factor, the high-risk confirmation on a 422) and is itself audited.
+  that needs a fresh second factor, the high-risk confirmation on a 422) and is itself audited. When the setting was
+  changed again after this change (`now_value`, `settings.py changed_again`: the service's own "changed again"
+  check), the form says first that the revert also undoes those later changes.
   The history of one setting is in the editor's one-setting view (`?key=`, templates/admin/pages/settings/editor.html)
   and in the Audit page (each control's History link); this table is the global one.
   Context: `frame`, then either `table`, `table_only`, `total`, `whole`, `range_description`, or the drawer's
   `change`, `spec`, `when`, `before`, `after`, `before_default`, `after_default`, `revert_url`, `arming`,
-  `needs_fresh_mfa`, `high_risk`, `max_value_chars`, `history_url`.
+  `now_value`, `needs_fresh_mfa`, `high_risk`, `max_value_chars`, `history_url`.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% from "components/table.html" import data_table %}
@@ -51,6 +53,7 @@
     <form class="stack settings-revert" data-api-form data-api-url="{{ revert_href }}" data-api-method="POST"
           data-success="Reverted. The setting has the value it had before this change." data-on-success="refresh" data-refresh="history editor" novalidate>
       <ul class="dialog__consequences">
+        {% if now_value is defined and now_value is not none %}<li><strong>This setting was changed again after this change</strong> (it is now {{ caller_text(now_value or "empty", max_value_chars) }}). Reverting this one also undoes those later changes; to undo only a later one, revert that change instead.</li>{% endif %}
         <li>Puts {{ spec.label if spec else change.key }} back to the value it had right before this change, on every worker within a second.</li>
         <li>The revert is itself a change: it is written to the history and the audit log with your reason.</li>
       </ul>

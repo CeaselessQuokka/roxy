@@ -179,7 +179,7 @@
     </div>
   </div>
   <div class="field">
-    <label class="field__label" for="dlg-client-ban-message">Message the caller gets <span class="muted">(optional)</span></label>
+    <label class="field__label" for="dlg-client-ban-message">Message kept with the ban <span class="muted">(optional, shown on Protection &gt; Bans as evidence; the caller never sees it)</span></label>
     <input class="input" id="dlg-client-ban-message" name="message" maxlength="500" autocomplete="off">
   </div>
   {% endcall %}
@@ -188,10 +188,12 @@
   {% call confirm_dialog("dlg-client-bypass", "Let this address bypass the limits?", action=api_base ~ "/bypass", api=True,
       confirm_label="Bypass", reason=True, on_success=on_success, refresh="ips",
       success="Bypass added.",
-      consequences=["This address skips " ~ bypass_scope.skips ~ " (" ~ bypass_scope.keeps ~ " still apply).", "Use it for your own testing; it expires by itself."]) %}
+      consequences=["This address skips " ~ bypass_scope.skips ~ " (" ~ bypass_scope.keeps ~ " still apply).",
+                    ("Use it for your own testing. Default bypass expiry is 0, so with the hours left empty this entry never expires; type hours to make it end by itself." if bypass_never
+                     else "Use it for your own testing; it expires by itself.")]) %}
   <div class="field">
-    <label class="field__label" for="dlg-client-bypass-hours">For how many hours</label>
-    <input class="input input--num" id="dlg-client-bypass-hours" name="expires_in_h" inputmode="decimal" value="{{ bypass_hours }}" data-json="float">
+    <label class="field__label" for="dlg-client-bypass-hours">For how many hours{% if bypass_never %} <span class="muted">(empty: never expires)</span>{% endif %}</label>
+    <input class="input input--num" id="dlg-client-bypass-hours" name="expires_in_h" inputmode="decimal"{% if bypass_hours %} value="{{ bypass_hours }}"{% endif %} data-json="float">
     <p class="field__error" data-field-error="expires_in_h" hidden></p>
   </div>
   <div class="field">

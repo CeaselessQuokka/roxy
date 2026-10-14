@@ -65,9 +65,17 @@
     {{ kpi_tile("Since the last deploy", duration(fleet.deploy.since_switch_s) if fleet.deploy and fleet.deploy.since_switch_s is not none else "n/a", key="since_deploy_s",
                 help="Time since the deploy last switched colors (the deployed_version file). n/a on a server that was never deployed by the pipeline.") }}
     {% if tarpit %}
-    {{ kpi_tile("Tarpit connections", num(tarpit.active_holds) ~ " of " ~ num(tarpit.connection_budget), key="tarpit_connections",
-                status=("warn" if (tarpit.capacity_used_pct or 0) >= 80 else None), status_label=("Near the budget" if (tarpit.capacity_used_pct or 0) >= 80 else None),
-                help="Connections the tarpit holds right now against tarpit_connection_budget, the most it may hold before refusing at once.") }}
+    {#- Holds stop at the effective cap (`max_concurrent`: the smaller of tarpit_max_concurrent and the connection
+        budget times tarpit_max_capacity_fraction; `abuse/tarpit.py capacity`), so the tile counts against that cap
+        and warns from 80 percent of it. v1's share of the whole budget (`capacity_used_pct`) stays in the help. -#}
+    {% set hold_cap = tarpit.max_concurrent or 0 %}
+    {% set holding = tarpit.active_holds or 0 %}
+    {% set tarpit_full = hold_cap > 0 and holding >= hold_cap %}
+    {% set tarpit_near = hold_cap > 0 and holding >= hold_cap * 0.8 %}
+    {{ kpi_tile("Tarpit connections", num(tarpit.active_holds) ~ " of " ~ num(tarpit.max_concurrent), key="tarpit_connections",
+                status=("warn" if tarpit_near else None),
+                status_label=("Full: refusals answered at once" if tarpit_full else ("Near the cap" if tarpit_near else None)),
+                help="Connections the tarpit holds right now against the most it may hold at once: the smaller of tarpit_max_concurrent and tarpit_connection_budget times tarpit_max_capacity_fraction. Once full, a refusal is answered at once instead of held. As a share of the whole connection budget (" ~ num(tarpit.connection_budget) ~ ", v1's figure) that is " ~ num(tarpit.capacity_used_pct, 1) ~ "%.") }}
     {% endif %}
   </div>
 

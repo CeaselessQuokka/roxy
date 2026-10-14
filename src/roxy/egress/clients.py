@@ -412,7 +412,7 @@ class EgressClients:
         self.override = UpstreamTestOverride.from_environ(str(getattr(env, "env", "production")), self._environ)
         self.events = EventSink(alerts, recorder)
         self.accounting = UsageAccountant(recorder)
-        self.headers = HeaderProfiles(settings, str(getattr(env, "site_origin", "")))
+        self.headers = HeaderProfiles(settings, str(getattr(env, "site_origin", "")), clock=clock.now)
         self.guard_stats = {Egress.DIRECT: GuardStats(), Egress.ROTATOR: GuardStats()}
         self.meters = {egress: ByteMeter(egress.value) for egress in (Egress.DIRECT, Egress.CREDENTIAL, Egress.ROTATOR)}
         credentials_dir = getattr(env, "credentials_dir", None)
@@ -641,9 +641,9 @@ class EgressClients:
                 "request_id": trip.request_id or "",
                 "code_path": trip.purpose,
                 "found_in": trip.location,
-                "runbook": "Leak guard",
             },
             always_send=True,
+            page="egress#trips",  # where the trip is shown and the egress is switched back on; runbook `leak-guard`
         )
         self.events.event(
             "leak_blocked", "critical", "leak_blocked", {"egress": trip.egress.value, "location": trip.location}

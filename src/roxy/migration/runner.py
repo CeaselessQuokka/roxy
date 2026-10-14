@@ -29,7 +29,13 @@ How it works
        is complete (an earlier or this run finished with no error), with an audit row. Later runs report "already
        imported", add only v1 items that no earlier run placed, and never put back what the owner changed or
        deleted in v2 since. A run that finds nothing new writes nothing at all.
-    6. Scrub the report with every secret value read, then hand it back.
+    6. A real run gives every database file in the state directory (main, `-wal`, `-shm`) the directory's owner
+       and group, mode 0640 (lead decision 2, finding ops-3). MIGRATION.md runs the migrator with sudo while
+       /var/lib/roxy belongs to roxy:roxy, so without this the files were root's, and the service (prestart.py,
+       as roxy) could not even read the schema version: the first deploy failed inside the cutover window. The
+       change goes through a descriptor opened with O_NOFOLLOW, never by path: the roxy user owns that directory
+       and could plant a link where root is about to chown.
+    7. Scrub the report with every secret value read, then hand it back.
 
 What to read next
     `roxy/migration/cli.py` (arguments and exit codes), `roxy/migration/ledger.py`, then the step modules in the
@@ -42,8 +48,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import shutil
 import sqlite3
+import stat
 import tempfile
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -84,6 +92,7 @@ from roxy.migration.rules_import import (
 )
 from roxy.migration.secrets_out import write_credential_files
 from roxy.migration.stats_import import import_statistics
+from roxy.migration.times import finite_json
 from roxy.migration.v1_settings import Action, plan_settings
 from roxy.migration.v1_tree import V1Tree, read_v1_tree
 from roxy.rules.service import RulesService
@@ -96,6 +105,11 @@ MARKER_KEY: Final = "v1_import"
 MARKER_VERSION: Final = 2  # 2 added `complete`, `completed_at` and the import ledger
 BYPASS_EXPIRY_KEY: Final = "bypass_default_expiry_h"
 SETTING_HANDLED: Final = frozenset({IMPORTED, ALREADY, KEPT, REMOVED})
+DB_FILE_MODE: Final = 0o640
+"""Mode of every database file after a real run: the service user reads and writes, its group reads (the audit)."""
+DB_FILE_SUFFIXES: Final[tuple[str, ...]] = ("", "-wal", "-shm", "-journal")
+"""The files SQLite keeps for one database: the main file, the write-ahead log, its shared memory index, and the
+rollback journal of a database not in WAL mode."""
 
 _RECENT_STORES: Final[tuple[str, ...]] = (
     "exploit_attempts",
@@ -184,6 +198,53 @@ def _no_v1_files(options: Options) -> str:
 
 
 # --- workspace -------------------------------------------------------------------------------------------------------
+
+
+def give_databases_to_state_owner(state_dir: Path) -> list[str]:
+    """Give every database file in `state_dir` the directory's owner and group, mode 0640 (step 6 above).
+
+    Each file is opened with O_NOFOLLOW and O_NONBLOCK and changed through that descriptor (fchown, fchmod), so a
+    link or a FIFO the directory's owner planted is never followed; anything that is not a regular file is left
+    alone and named. Returns the problems (empty when every file is right), for the report. Not gated on running
+    as root: a migrator run by the directory's own user changes the group the same way where the OS allows it.
+    """
+    problems: list[str] = []
+    try:
+        directory = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        return [f"could not open the state directory to give its databases to its owner ({exc.strerror})"]
+    try:
+        owner = os.fstat(directory)
+        for name in DB_NAMES:
+            for suffix in DB_FILE_SUFFIXES:
+                file_name = f"{name}.db{suffix}"
+                flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+                try:
+                    handle = os.open(file_name, flags, dir_fd=directory)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    problems.append(f"{file_name}: not changed, it could not be opened safely ({exc.strerror})")
+                    continue
+                try:
+                    info = os.fstat(handle)
+                    if not stat.S_ISREG(info.st_mode):
+                        problems.append(f"{file_name}: not a regular file; left alone")
+                        continue
+                    if (info.st_uid, info.st_gid) != (owner.st_uid, owner.st_gid):
+                        os.fchown(handle, owner.st_uid, owner.st_gid)
+                    if stat.S_IMODE(info.st_mode) != DB_FILE_MODE:
+                        os.fchmod(handle, DB_FILE_MODE)
+                except OSError as exc:
+                    problems.append(
+                        f"{file_name}: could not be given to the state directory's owner and group with mode "
+                        f"{DB_FILE_MODE:o} ({exc.strerror}); set them by hand"
+                    )
+                finally:
+                    os.close(handle)
+    finally:
+        os.close(directory)
+    return problems
 
 
 @contextlib.contextmanager
@@ -472,10 +533,9 @@ async def _import_service_state(
     scrubber: SecretScrubber,
     previous: ImportLedger,
 ) -> ImportLedger:
-    plans = plan_service_state(tree.runtime, report, scrubber.clean_known)
-    written = await import_service_state(
-        dbs.control, plans, report, now=int(clock.now()), imported_before=previous.service_state
-    )
+    now = int(clock.now())
+    plans = plan_service_state(tree.runtime, report, scrubber.clean_known, now=now)
+    written = await import_service_state(dbs.control, plans, report, now=now, imported_before=previous.service_state)
     report.changed(written)
     return ImportLedger(service_state=True)
 
@@ -533,7 +593,11 @@ def _not_migrated(tree: V1Tree, report: MigrationReport) -> None:
 
     security = "security reset: every admin signs in again with the v2 login flow"
     report.not_migrated += [
-        {"what": "admin sessions (session epoch)", "count": runtime.get("SessionEpoch", ""), "why": security},
+        {
+            "what": "admin sessions (session epoch)",
+            "count": finite_json(runtime.get("SessionEpoch", "")),  # a NaN here once reached the JSON report
+            "why": security,
+        },
         {"what": "emailed 2FA codes", "count": count("TwoFACodes"), "why": security},
         {"what": "login challenges", "count": count("Challenges"), "why": security},
         {"what": "trusted devices", "count": count("TrustedDevices"), "why": security},
@@ -728,13 +792,18 @@ async def run_migration(options: Options, *, clock: Clock | None = None) -> Migr
     log.info("v1_migration_started", extra={"fields": {"dry_run": options.dry_run}})
     try:
         with workspace(options) as (state_dir, credentials):
-            paths = {name: state_dir / f"{name}.db" for name in DB_NAMES}
-            await asyncio.to_thread(migrate_paths, paths)  # expand migrations, the same runner deploy.sh uses
-            dbs = open_databases({"ROXY_STATE_DIR": str(state_dir)})
             try:
-                await _run_steps(dbs, tree, report, options, credentials, clock, scrubber)
+                paths = {name: state_dir / f"{name}.db" for name in DB_NAMES}
+                await asyncio.to_thread(migrate_paths, paths)  # expand migrations, the same runner deploy.sh uses
+                dbs = open_databases({"ROXY_STATE_DIR": str(state_dir)})
+                try:
+                    await _run_steps(dbs, tree, report, options, credentials, clock, scrubber)
+                finally:
+                    await dbs.close_all()
             finally:
-                await dbs.close_all()
+                if not options.dry_run:  # a dry run works on private copies that are deleted afterwards
+                    for problem in await asyncio.to_thread(give_databases_to_state_owner, state_dir):
+                        report.error(problem)
     finally:
         report.finished_at = int(clock.now())
         report.status = _final_status(report)
@@ -749,6 +818,7 @@ async def run_migration(options: Options, *, clock: Clock | None = None) -> Migr
 __all__ = [
     "MARKER_KEY",
     "Options",
+    "give_databases_to_state_owner",
     "path_refusals",
     "read_tree",
     "resolves_inside",
