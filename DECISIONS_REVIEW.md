@@ -1,11 +1,9 @@
 # Roxy v2 decisions review
 
-Written on 2026-10-13 from branch `remake/v2` at commit 84ab636 (the dashboard review round) plus the fixes of the
-final whole-system review, reconciled with the code as those fixes left it. Before the owner reads it, the lead fills
-every place marked "(to be filled by the lead after the final review)": the final gate numbers, the final review's
-findings and the quiet-machine performance numbers (plan 0.1, 5.4 and 20.2, phase P14). The owner may start reading
-before the quiet-machine numbers are in; they are added when those runs finish, and nothing on the server changes
-before both are done and this document is signed.
+Written on 2026-10-13 and completed on 2026-10-14 from branch `remake/v2` at commit 686fe46 (the final review round,
+gated green: section 6), plan 0.1, 5.4 and 20.2, phase P14. One value is still to come: the quiet-machine performance
+numbers in section 5, added when those runs finish (the owner chose to start reading before them). Nothing on the
+server changes before they are in and this document is signed.
 
 ## 1. How to use this document
 
@@ -169,8 +167,9 @@ Owner instructions still in force during this run (from the handoff notes):
 16. **OWNER (optional): the Luau examples in Studio.** The examples use `const` (in Luau since release 0.711) and the
     guide says to write `local` where Studio refuses it; the type name `HttpResponse` stands in for Studio's own. Both
     were checked with the Luau analyzer, not in Roblox Studio. Paste one home page example into Studio once.
-17. **OWNER (development machine only): scratch space.** About 35 GB of old work folders sit in WSL's `/tmp` and
-    `~/Projects/RoxyGate-wip94`. Nothing in them is needed; they are not deleted without your word.
+17. **OWNER (development machine only): scratch space.** A WSL restart on 2026-10-14 already emptied most of the old
+    work folders in `/tmp` (about 5 GB of test runs remain there); `~/Projects/RoxyGate-wip94` (876 MB) is left.
+    Nothing in them is needed; they are not deleted without your word.
 18. **OWNER: Roblox game server addresses (`roblox_egress_cidrs`, plan 9 threat 6).** Empty by default, and marked
     "PENDING owner verification" in the catalog. While it is empty the bot score never credits a caller as a Roblox
     game server (its signal needs an address inside these ranges besides the `Roblox-Id` and User-Agent), so every
@@ -429,7 +428,7 @@ not be more than 50% higher.
   abuse transaction and the 50 ms worst case of a metrics flush were not met under contention, and the upstream
   transaction was not measured on its own; the dashboard targets (pages under 300 ms, 90-day charts under 500 ms)
   were met with the exceptions below.
-- Quiet-machine numbers: (to be filled by the lead after the final review)
+- Quiet-machine numbers: (being measured on commit 686fe46; added here when the release measurements finish)
 - Known slow spots: the Protection attempts tabs at 90 days (Request filters 0.53 to 0.65 s, over the 500 ms target);
   the Overview at 90 days under load (up to about 0.53 s; quiet it is about 0.27 s); pages above about 150 KiB
   (Overview 185, Security 192, Cache and Clients 159); hourly points over 90 days on four API routes (up to 0.76 s;
@@ -534,4 +533,5 @@ I have read sections 1 to 6. Every row of section 2 carries my decision, and sec
 - Choose one: approved as written / approved with the changes written above
 - Signature:
 
-Prepared by the lead, from commit: (to be filled by the lead after the final review)
+Prepared by the lead, from commit: 686fe46 (the final review round, 2026-10-14). The quiet-machine numbers of section
+5 come from the release measurements on that commit.
