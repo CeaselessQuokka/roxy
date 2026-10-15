@@ -689,10 +689,12 @@ Build status at sign-off:
 
 I have read sections 1 to 6. Every row of section 2 carries my decision, and section 3 carries my values.
 
-- Owner name:
-- Date:
-- Choose one: approved as written / approved with the changes written above
-- Signature:
+- Owner name: the repository owner (approved in the chat of the cutover session)
+- Date: 2026-10-14, about 23:00 US Eastern
+- Choose one: approved with the changes written above (the owner's answers of 2026-10-14; what is not built yet is
+  tracked in `ROADMAP.md`)
+- Signature, in the owner's words: "I approve of your decisions given you honor or write down for the future, the
+  notes I made earlier when I first answered"; with it, the go-ahead for the server preparation while v1 stays live.
 
 Prepared by the lead, from commit: 686fe46 (the final review round, 2026-10-14). The quiet-machine numbers of section
 5 come from the release measurements on that commit. The owner's answers of 2026-10-14 were filled in by the

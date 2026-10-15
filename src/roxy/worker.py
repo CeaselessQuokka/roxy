@@ -2,8 +2,8 @@
 
 What this is
     `RoxyUvicornWorker`, a small subclass of `uvicorn_worker.UvicornWorker` named in `deploy/gunicorn.conf.py`
-    (`worker_class = "roxy.worker.RoxyUvicornWorker"`), and `RoxyServer`, uvicorn's `Server` with one hook at the
-    start of shutdown.
+    (`worker_class = "roxy.worker.RoxyUvicornWorker"`), and `RoxyServer`, uvicorn's `Server` with hooks around its
+    startup (the heap freezes) and at the start of shutdown.
 
 Why it exists
     Plan 5.2. Some uvicorn options cannot be set from a gunicorn config file, only through the worker's
@@ -32,10 +32,13 @@ Why it exists
     lease release never ran (finding SHUTDOWN-HOLD). Two changes fix it: uvicorn's `timeout_graceful_shutdown`
     is set below `graceful_timeout`, and `RoxyServer.shutdown` calls `roxy.lifespan.begin_drain` before uvicorn
     starts waiting, which answers every held refusal at once.
-    Last, it keeps full garbage collections short (finding LOAD-3): once the app started, `RoxyServer.startup`
-    freezes the startup heap (`freeze_startup_heap`, `gc.freeze`), which every full collection otherwise walked
-    again with the event loop stopped (115 to 125 ms each). Only real workers do this; tests that build many apps
-    in one process never freeze anything.
+    Last, it keeps full garbage collections short (finding LOAD-3): `RoxyServer.startup` freezes the startup heap
+    (`freeze_startup_heap`, `gc.freeze`), which every full collection otherwise walked again with the event loop
+    stopped (115 to 125 ms each). Only real workers do this; tests that build many apps in one process never freeze
+    anything. It freezes twice (docs/PERFORMANCE.md, "Startup warm-up (2026-10-14)"): the app as built before its
+    lifespan starts, then what the lifespan made. When the only freeze came after the start, its collection (105 to
+    145 ms) ran with the listeners open and landed in the heartbeat's first window, as did one more automatic full
+    collection during the lifespan.
 
 How it works
     `UvicornWorker.__init__` builds uvicorn's `Config` from gunicorn's settings and then applies `CONFIG_KWARGS`
@@ -48,6 +51,17 @@ How it works
     still running, then runs the lifespan shutdown, which has its own budget.
     `_serve` is uvicorn-worker's, with `RoxyServer` in place of uvicorn's `Server`; when it exits with the boot
     error status and the lifespan recorded a transient failure, the status becomes `TRANSIENT_BOOT_EXIT_CODE`.
+    `RoxyServer.startup` works in three steps. The app it serves (`roxy.asgi`, `main.create_asgi_app`) was built
+    when the worker loaded it, its route tables included (`main.warm_routes`, the one startup warm-up). First,
+    before uvicorn's startup, so before the lifespan starts the loop lag sampler (no heartbeat counts it) and
+    before this worker accepts a connection, it freezes the app as built (about 340,000 objects; the collection
+    before it takes 100 to 140 ms). Then uvicorn's startup runs the lifespan and starts accepting. Last, once the
+    app started, a second freeze takes what the lifespan made (a collection of a few ms, since the app is already
+    frozen). The `startup_heap_frozen` line logs both freezes and the route warm-up (`routes_warmed`, None when
+    the app was not warmed or the walk failed). This mostly moves work rather than removing it: with `reuse_port`
+    the worker's own listener exists from the fork on, so a connection the kernel queued there waits for the whole
+    start (the import with the route warm-up, these steps, the lifespan), as it waited before for the same work
+    done just after the start. What changes is that no request in flight and no heartbeat waits behind it.
 
 What to read next
     `deploy/gunicorn.conf.py`, `roxy/lifespan.py` (`StartupUnavailable`, `begin_drain`, `SHUTDOWN_BUDGET_S`), then
@@ -60,6 +74,7 @@ import gc
 import logging
 import socket
 import sys
+import time
 from typing import Any
 
 from gunicorn.arbiter import Arbiter
@@ -101,28 +116,50 @@ def graceful_shutdown_s(graceful_timeout: float, timeout: float) -> float:
 def freeze_startup_heap() -> int:
     """Collect once, then move every object that exists now out of the garbage collector's sight (`gc.freeze`).
 
-    Called when a worker finished starting (finding LOAD-3). The startup heap (the app, its modules, routes,
-    templates, the settings catalog: about 900,000 blocks) lives as long as the worker, yet every full collection
-    walked all of it again: 115 to 125 ms with the event loop stopped, every minute or two at 10 requests a second
-    and every few seconds at 200, a large part of the tail latency. Frozen objects are never examined again, so a
-    full collection only walks what was created since. The cost is bounded: a cycle of startup objects that
-    becomes garbage later is never collected (the first settings and rules snapshots, replaced once). Returns how
-    many objects were frozen.
+    Called twice by `RoxyServer.startup` (finding LOAD-3): for the app as built, route tables included, before its
+    lifespan, then for what the lifespan added, once the app started. The startup heap (the app, its modules,
+    routes, templates, the settings catalog: about 900,000 blocks) lives as long as the worker, yet every full
+    collection walked all of it again: 115 to 125 ms with the event loop stopped, every minute or two at 10
+    requests a second and every few seconds at 200, a large part of the tail latency. Frozen objects are never
+    examined again, so a full collection only walks what was created since. The cost is bounded: a cycle of
+    startup objects that becomes garbage later is never collected (the first settings and rules snapshots,
+    replaced once). Returns how many objects are frozen in all.
     """
     gc.collect()
     gc.freeze()
     return gc.get_freeze_count()
 
 
+def route_warmup_fields(app: Any) -> dict[str, Any]:
+    """The served app's route warm-up (`main.warm_routes`, kept on `app.state.route_warmup`) for the startup log.
+
+    `routes_warmed` is None for an app that was not warmed (not built by `create_asgi_app`) or whose walk failed:
+    its routes are then built on the first request, as before the warm-up existed.
+    """
+    warmup = getattr(getattr(app, "state", None), "route_warmup", None)
+    return {"routes_warmed": getattr(warmup, "routes", None), "route_warmup_ms": getattr(warmup, "ms", None)}
+
+
 class RoxyServer(Server):
-    """uvicorn's `Server`, which freezes the startup heap once the app started and tells the app that shutdown
-    began before it waits for open requests."""
+    """uvicorn's `Server`, which freezes the app as built before it starts the app, freezes what the start added
+    once it started, and tells the app that shutdown began before it waits for open requests."""
 
     async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        # Before uvicorn's startup (the lifespan, then accepting): the app as built, its route tables included, leaves
+        # every later collection before the heartbeat starts and before this worker serves (module docstring).
+        started = time.perf_counter()
+        frozen_before_lifespan = freeze_startup_heap()
+        freeze_ms = round((time.perf_counter() - started) * 1000, 1)
         await super().startup(sockets=sockets)
         if self.started:
             frozen = freeze_startup_heap()
-            log.info("startup_heap_frozen", extra={"fields": {"objects": frozen}})
+            fields = {
+                "objects": frozen,
+                "frozen_before_lifespan": frozen_before_lifespan,
+                "freeze_before_lifespan_ms": freeze_ms,
+                **route_warmup_fields(self.config.app),
+            }
+            log.info("startup_heap_frozen", extra={"fields": fields})
 
     async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
         lifespan.begin_drain(self.config.app)

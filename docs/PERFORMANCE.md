@@ -139,7 +139,9 @@ The release's last point (taken as the run stopped, the workers still up) is 9 M
 (350.5) while neither worker changed. Growth over the last 15 minutes: the larger worker 1.70 MiB a minute in the
 base, 0.70 in the release; the smaller one 0.09 and 0.03. The base still shows the LOAD-2 growth; the release levels
 off. Replay outcome: release 2 Roblox 429s in 9,469 calls (0.021 percent), 53.0 percent avoided; base 9 in 9,384
-(0.096 percent), 53.4 percent avoided.
+(0.096 percent), 53.4 percent avoided. Event loop lag p99 at the worst heartbeat: release 135.6 and 104.7 ms, base
+31.3 and 3.6 ms; it was one-time startup work in each worker's first minute, which lands there or not by chance,
+fixed since ("Startup warm-up (2026-10-14)" below; minutes 2 and later 1.2 to 2.2 ms in every tree).
 
 **Aged soak, 30 minutes at 200 requests a second (360,287 requests, about a day of samples), no worker recycling,
 side by side** (MiB):
@@ -218,7 +220,9 @@ thin margin: one discovery 429 on avatar outfits (threshold 60 a minute) about a
 cut to 43.4 or 44.1 a minute holds it. A second 429 in a run would be 0.19 percent: **the bar is met by less than
 one 429.** In every run all 2,018 requests were answered (200, or 429 when pacing deferred them), no call carried the
 credential on caller traffic, the stop was graceful and the log had no traceback; each took 218.7 to 220.4 s. The
-34 minute replays of the soak above gave 0.021 percent (release) and 0.096 percent (base).
+34 minute replays of the soak above gave 0.021 percent (release) and 0.096 percent (base). The worst heartbeat of
+the five replays was 68.8 to 249.4 ms: startup work in each worker's first minute, traced and fixed since ("Startup
+warm-up (2026-10-14)" below; its replay read 18.3 / 14.1 ms with the same outcome, 0.097 percent).
 
 ### Quiet run: the other plan 19.4 scenarios and the row size
 
@@ -235,7 +239,10 @@ One run each (`steady cold_burst cooldown_429 flood`, release):
   the first 0.4 s before the first 429 came back, then one probe at 71.5 s (the 3861e65 run sent 2 before the first
   429 came back, then one at 30.4 s and one at 60.5 s); all 1,821 caller requests there got 429 with `Retry-After`
   (732 `upstream_busy`, 1,089 `upstream_cooldown`), p50 3.7, p99 12.3 ms; the other endpoints served 915 of 915 (p50
-  3.2 ms, p99 2,702 ms).
+  3.2 ms, p99 2,702 ms). **Fixed since** ("Startup warm-up (2026-10-14)" below: the 7 calls left together after
+  each worker's first proxy request built the routes): on the integrated tree 1 call before the first 429 came back
+  (at 0.03 s), then one at 30.16 s and one at 60.25 s; all 1,821 caller requests there got 429 `upstream_cooldown`
+  with `Retry-After` (no `upstream_busy`), and the other endpoints served 915 of 915 (p99 924 ms).
 - **Flood:** above (348.7 answers a second, 2 above the GCRA bound).
 - **Row size** (`tests/integration/test_metrics_rowsize.py`): unchanged, 71.4 bytes a minute row (51.0 table, 20.4
   index), 105.4 an hour row, histogram blobs 8.7 and 2.0 bytes on average.
@@ -395,12 +402,97 @@ longer exists and was not measured again.
 9. Flood: an address served above its GCRA bound (0 allowed): 1 and 2 in the two release runs (C7 degraded mode).
 10. Roblox 429 with `Retry-After: 30`: after the first 429, one probe in 89.6 s (at 71.5 s) where the scenario
     expects about one per `Retry-After` (30 s): the endpoint made its next call about 40 s after Roblox allowed it,
-    and callers of it were refused (429 with `Retry-After`) that much longer.
+    and callers of it were refused (429 with `Retry-After`) that much longer. **Fixed since** ("Startup warm-up
+    (2026-10-14)" below): on the integrated tree one call went out before the first 429 and the probes came at
+    30.16 and 60.25 s, when `Retry-After` ended, with no `upstream_busy` answer there. Left: the same late probe
+    whenever 7 or more calls to one endpoint are in flight as its first 429 arrives (a plan 7.3 decision,
+    `ROADMAP.md` item 13).
 
 Met: plan 19.10 row 7 in all five replays (0.097 percent, by less than one 429), memory with recycling under
 `MemoryHigh`, the fleet cap of the tarpit, single-flight in the cold burst, `Retry-After` on every 429 Roxy sent, the
 rollup row size, every chart route at the UI's granularity, and every page at its default range in three of four
 runs.
+
+### Startup warm-up (2026-10-14)
+
+Two of the quiet run's findings, the late cooldown probe (item 10 above) and the replays' event loop lag, had one
+cause: one-time work in each new worker, on the event loop, after it began serving. Two investigators traced them A/B
+against 686fe46 in real gunicorn runs and a skeptic checked each fix with runs of its own; the two fixes were then
+made one startup path. Neither cause came from the final review: 3861e65, 65d4bd5, 84ab636 and 686fe46 all show them.
+
+- **The first proxy request built the routes.** FastAPI 0.142 prepares the routes of an included router lazily, on the
+  first request matched through it, and the admin router's 385 page and API routes stand in front of the proxy
+  catch-all. So each worker's first proxy request built about 390 route contexts (48,000 objects) with the event loop
+  stopped, 250 to 370 ms, and the requests that arrived meanwhile left together. In the cooldown scenario 7 calls to
+  the endpoint Roblox was refusing went out within 30 ms (all inside its burst of 10) before the first 429 came back;
+  7 counted calls put the adaptive cut on its floor (6 a minute, burst 1), and the backlog of those calls at the new
+  pace held the next call to 71.5 s instead of the 30 s `Retry-After`, refusing callers `upstream_busy` meanwhile.
+- **The worst heartbeat was startup work.** The heartbeat's p99 is the maximum of its window while the window holds 50
+  samples or fewer, and the replay's first request comes 5 s after "ready", so a worker's first minute counts the
+  route build above, the LOAD-3 freeze's full collection with the listeners open (105 to 145 ms) and, in 686fe46 only,
+  one more automatic full collection during the lifespan (104 to 133 ms). After the first minute both trees ran alike
+  (1.2 to 2.2 ms in the investigator's runs, 2.3 to 6.9 ms in the skeptic's later ones): there was no steady-state
+  stall. Whether a worker's startup stalls are counted depends on where they fall against the 250 ms sampler and the
+  5 s heartbeat beats, which is why the quiet run's soak read 135.6 / 104.7 ms for the release and 31.3 / 3.6 for the
+  base (3f2ad1c), while two more 3f2ad1c replays read 4.2 / 328.1 and 356.7 / 192.7 ms.
+
+**What changed** (`src/roxy/main.py`, `src/roxy/worker.py`): `main.warm_routes` walks every route with FastAPI's
+`iter_route_contexts`, which builds and keeps the same per-router lists matching uses. `create_asgi_app` runs it, so
+gunicorn's worker (when it loads `roxy.asgi`), plain uvicorn and the tests' in-process clients serve warm routes;
+`create_app` stays lazy for the tests. `RoxyServer.startup` then freezes the app as built, route tables included,
+before the lifespan starts the loop lag sampler and before the worker accepts, and freezes what the lifespan made
+once it started (a collection of 2.9 to 4.3 ms in the skeptic's in-process check, against 102 to 104 ms in the old
+order). The `startup_heap_frozen` line logs both freezes and the warm-up (`routes_warmed`, `route_warmup_ms`). The
+tests count route builds and objects, not time (`tests/unit/test_route_warmup.py`, `tests/unit/test_worker_gc.py`).
+
+Real gunicorn, 2 workers, the harness's production config. The integrated tree ran each scenario once on an idle
+machine (load average 0.2 to 0.7) at 22:27 to 22:33; the lanes' runs are interleaved A/B (medians where several):
+
+| Measure | 686fe46 | Each fix alone (investigator; skeptic) | Both, one path (integrated tree) |
+|---|---|---|---|
+| Cooldown: calls before the first 429 came back | 7, 7, 3 (median 7) | 1, 2, 1 (median 1) | 1, at 0.03 s |
+| Cooldown: the next calls to the 429 endpoint | 71.47; 71.55; 30.64 and 60.73 s | 30.16 and 60.25 s (three runs) | 30.16 and 60.25 s |
+| Cooldown: answers there; learned limit | 731, 732 and 0 `upstream_busy`; 6 a minute burst 1 (twice) | 0 `upstream_busy`; 58.8 burst 4 | all 1,821 `upstream_cooldown` (0 `upstream_busy`); 58.8 burst 4 |
+| Cooldown: the other endpoints' p99 | 2,497, 2,483, 1,653 ms | 926, 1,198, 928 ms | 924 ms (915 of 915 served) |
+| Replay, 200 s: worst heartbeat per worker | 254.8 / 95.9, 315.9 / 120.5 (median 187.7); 145.4 / 128.8, 25.8 / 118.8, 29.7 / 51.3 (median 85.1) | 1.5 / 17.5, 2.1 / 7.1 (median 4.6); 58.9 / 5.1 at load 12, 10.4 / 6.8, 15.7 / 7.5 (median 9.0) | 18.3 / 14.1 ms; later minutes 5.7 to 6.8 |
+| Replay outcome | 0.097 % Roblox 429 | 0.097 % | 0.097 % (1 of 1,032 calls), 48.9 % avoided, 1,668 answered 200 |
+| Worker start, before it accepts | nothing (the freeze's collection, 105 to 145 ms, came after) | the walk and the freeze: 473 to 587 ms | the walk 362 to 387 ms (388 route contexts), the collection and freeze before the lifespan 133 to 142 ms (337,100 objects) |
+
+Every run stopped gracefully with no traceback. The later minutes read 5.7 to 6.8 ms here, like the skeptic's runs of
+both trees in the hour before (2.3 to 6.9 ms), against 1.4 to 1.9 in the investigator's earlier runs: the host, not
+the code.
+
+**What it costs.** Each worker starts about 0.5 s later (above), before it accepts; gunicorn's `timeout` is 30 s and
+the other worker and the master's listener keep serving. It moves work rather than removing it: with `reuse_port` a
+worker's own listener exists from the fork on, so a connection the kernel queued there waits for the whole start, as
+it waited before for the same work done just after the start; what changes is that no request in flight and no
+heartbeat waits behind it. Memory moves earlier, the peak does not: a worker's RSS at start was 161.1 MiB instead of
+147.7 (the route tables it used to build on its first proxy request), a color's PSS at start 12 to 14 MiB higher
+(281 to 283 against 265 to 271 MiB in the skeptic's runs; 291 MiB in this run), and the PSS peak equal by 10.8 minutes
+(325.7 against 326.7 MiB) and at 450 offered. The "fresh worker 147 to 149 MiB" (above) and "a new color with one
+worker (155 MiB at start)" ("Memory per color and the systemd decision") figures are about 13 MiB higher at start; the
+low-memory deploy sum becomes at most about 868 of 909 MB instead of 855, which still fits. A frozen garbage cycle among the app-as-built objects is never collected,
+the bounded class LOAD-3 already accepted (the skeptic unfroze after the lifespan and found 0 such objects).
+
+**Unchanged.** Row 7 (the discovery 429 on avatar outfits at the plan default of 120 a minute, "Finding LOAD-1"). The
+503 `degraded` answers past the write lock ceiling (139 against 40 in "Quiet run: the write lock ceiling") are not
+from the final review either: hot.db write transactions per request are the same in 3f2ad1c, 84ab636 and 686fe46
+(2.13, call site by call site); the budget overruns moved from the fail-open abuse transaction (`abuse_degraded`) to
+the fail-closed upstream reservation (C7) with the perf lane's write path, about the same total. No change: the lever
+is the ceiling, not the budget. With the warm-up the mix shifts a little at 450 offered (skeptic, three interleaved
+rounds): 503 112, 127 and 204 against 149, 186 and 297, `abuse_degraded` 8 to 15 against 2 to 5, all at the onset.
+
+**Left** (`ROADMAP.md` item 13):
+- When 7 or more calls to one endpoint are in flight as Roblox's first 429 arrives (possible inside its burst of 10),
+  the cut still counts them, lands on the floor and holds the next call 71 s (7 calls) to 87 s (10 calls) instead of
+  `Retry-After`. Cutting from the calls up to the refused one would avoid it but learns in 30 percent steps (more
+  429s) for an endpoint whose real limit is below the floor: a plan 7.3 decision.
+- Every counted 429 also records a failure on the host breaker (`src/roxy/upstream/effects.py`), so 5 or more
+  concurrent first calls to one endpoint that all get 429 open the whole host's breaker for 30 to 60 s, while plan
+  7.5 escalates a host only when 3 templates cool down. It predates the final review; a plan 7.10 / 7.5 decision.
+- The heartbeat's p99 is still the window maximum while it holds 50 samples or fewer, so one-time work inside the
+  lifespan still shows in a worker's first minute (some workers keep two stalls of 43 to 74 ms in the lifespan's own
+  startup steps, in every tree; not traced).
 
 ## LOAD-2 and LOAD-3: what grew, what contended, what changed
 
@@ -456,7 +548,8 @@ per worker; 22 MiB on the leader after 35 minutes, 7 MiB on the other worker).
   166 against 173 MiB. The load harness applies a measured tree's `Environment=` lines the way systemd does.
 - `worker.py`: `gc.freeze()` once a worker started, so full collections skip the startup heap. Leader at 10 a
   second: worst full collection 156 ms before, 108 ms after (they run twice as often, each shorter); other worker 151
-  against 124 ms. A modest gain; it changes no memory figure.
+  against 124 ms. A modest gain; it changes no memory figure. (Since 2026-10-14 it freezes twice, the app as built
+  before the lifespan and the rest once started: "Startup warm-up (2026-10-14)".)
 
 **Soak: 35 minutes of the replay (10 requests a second, 2 workers, no worker recycling), three trees side by side**
 (PSS of the whole color, master included; worker RSS leader / other, MiB):
@@ -596,7 +689,7 @@ writes waited 30 to 135 ms at p99 and the fleet answered about 180 to 205 reques
   per 300 (was a read and a write per subject); `abuse/limiter.py save_rows` and `abuse/throttle.py
   save_strike_rows` write their rows with one statement per 150 (was one per row; a key given twice still ends with
   its last values).
-- `worker.py`: `gc.freeze()` (above).
+- `worker.py`: `gc.freeze()` (above; two steps since "Startup warm-up (2026-10-14)").
 - `storage/db.py DbStats`: lock wait and lock hold histograms of every write transaction and the group counts, on the
   System page's metrics pipeline card (`GET /admin/api/v1/system/metrics-pipeline`: `lock_wait_ms`, `hold_ms`,
   `groups`, `grouped_writes`, `largest_group`) and in the harness's steady table.

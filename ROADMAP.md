@@ -547,18 +547,33 @@ hand-made unit drop-in can then be deleted.
 ## 13. Performance items still open
 
 These are not requests of yours: they come from the release measurements of 2026-10-14 (`docs/PERFORMANCE.md`).
-None of them changes what callers get; they make some pages slower, or make Roxy try an endpoint again later than
-Roblox allowed.
+Most of them change nothing callers get; they make some pages slower, or make Roxy try an endpoint again later than
+Roblox allowed. The host breaker item is the exception: it can refuse callers of a whole host for 30 to 60 s.
 
-- **The first proxy request after a worker starts** (under investigation now; it may still land before the cutover).
-  FastAPI prepares all 385 dashboard routes on a worker's first proxy request, which stops that worker for 0.25 to
-  0.45 s after every start, deploy and restart (about every 20,000 requests). Requests queue meanwhile and then leave
-  together: in the test, 7 calls went to Roblox before its first 429 came back (2 before), and after that 429 the
-  endpoint's next try came about 40 s later than Roblox allowed. The fix prepares the routes before the worker serves.
-- **Event loop stalls and "degraded" answers under overload** (under investigation now). In the long soak the event
-  loop lag of the worst worker (p99) reached 105 and 136 ms in two runs, against 4 and 31 ms for the earlier code, and
-  past the write lock ceiling (about 325 answered requests a second) more callers got HTTP 503 "degraded" (a median
-  of 139 a run against 40).
+- **The first proxy request after a worker starts: fixed before the cutover** (`docs/PERFORMANCE.md`, "Startup
+  warm-up (2026-10-14)"). FastAPI prepared all 385 dashboard routes on a worker's first proxy request, which stopped
+  that worker for 0.25 to 0.37 s after every start, deploy and restart (about every 20,000 requests); requests queued
+  meanwhile and then left together. The worker now prepares them before it serves. In the 429 test: 1 call before
+  Roblox's first 429 came back (was 7), then one try at 30 s and one at 60 s, as Roblox asked (was 71.5 s), and no
+  caller was told "busy" there (was 731).
+  **Left:** when 7 or more calls to one endpoint are already on their way as Roblox's first 429 comes back (possible
+  within its burst of 10), Roxy still waits 71 to 87 s instead of the 30 s Roblox asked for before trying that
+  endpoint again (safe for Roblox, slower to recover; changing how the adaptive cut counts is a plan 7.3 decision).
+- **One endpoint's 429s can pause its whole host for 30 to 60 s** (found by the skeptic of that fix; it predates the
+  final review). Every counted 429 also records a failure on the host's breaker (`src/roxy/upstream/effects.py`), and
+  that breaker opens at 5 failures, so 5 or more calls to ONE endpoint that go out together and all get 429 open the
+  breaker for every endpoint of the host for 30 to 60 s, while plan 7.5 lets a whole host cool down only when 3
+  different endpoints of it do. Whether a 429 should count on the host breaker at all needs a plan 7.10 / 7.5
+  decision.
+- **Event loop stalls: fixed before the cutover** (same section). The soak's worst heartbeat (105 and 136 ms) was
+  one-time startup work in each worker's first minute, not a steady stall: the route build above and two full
+  garbage collections with the listeners open. The worker now does that work before it accepts: the worst heartbeat
+  of a 200 s replay was 18.3 and 14.1 ms (was 26 to 316 ms). Each worker starts about 0.5 s later and about 13 MiB
+  higher (the same peak), so the "fresh color" memory figures of the sizing docs are a little low at start.
+  **"Degraded" answers under overload: no change.** Past the write lock ceiling (about 325 answered requests a
+  second) more callers got HTTP 503 "degraded" (a median of 139 a run against 40). Traced: not from the final review;
+  the perf lane's faster write path moved the overruns from the abuse check (which lets the request through) to the
+  upstream reservation (which answers 503, the plan's C7 rule), about the same total. The lever is the ceiling itself.
 - **The quiet-machine misses** (`docs/PERFORMANCE.md`, "Quiet run: every target not met"): the proxy's own time on a
   cache hit and on a miss (p99 above plan 6.7's 8 and 15 ms); the abuse check's database write in the running system
   (p99 above 3 ms); the slowest metrics flush (above 50 ms); the upstream transaction, still not measured on its own;
@@ -575,7 +590,9 @@ Roblox allowed.
   fresh copy, slow after `PRAGMA optimize`), each pinned with `INDEXED BY` and a query plan test.
 - **A machine the size of the server** (2 vCPU, 909 MB): every figure so far comes from the development machine.
 - **The replay's margin:** Roblox 429s in the v1-like replay were 0.097 percent against the 0.1 percent bar, so one
-  more 429 in a run would miss it. The route fix above should widen the margin.
+  more 429 in a run would miss it. The route fix above does not change it: the one 429 is the discovery 429 on avatar
+  outfits at the plan default of 120 a minute (`docs/PERFORMANCE.md`, "Finding LOAD-1" lists the remedies, each a
+  plan decision).
 
 **Size:** S to M each.
 

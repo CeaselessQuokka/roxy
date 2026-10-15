@@ -3690,6 +3690,20 @@ the round's gate report.
   scan every pair row; the reads now name the client index), the Protection attempts tabs (one index range per
   message source, one grouping a page), and the Overview (an existence probe instead of a sum, and narrower reads).
   Read-level numbers: 706 to 70 ms, 330 to 99 ms, 541 to 122 ms at 90 days, and 384 to 191 ms at 90 days.
+- **Startup warm-up** (traced after the quiet-machine run: the late cooldown probe and the replays' worst heartbeat;
+  `docs/PERFORMANCE.md`, "Startup warm-up (2026-10-14)"): a worker's first proxy request built FastAPI's lazily
+  prepared routes (about 390, 250 to 370 ms with the event loop stopped), and the LOAD-3 freeze collected with the
+  listeners open. One startup path now: `main.warm_routes` in `create_asgi_app` (FastAPI's `iter_route_contexts`;
+  gunicorn, plain uvicorn and the tests' clients), then `RoxyServer.startup` freezes the app as built before the
+  lifespan and what the lifespan made after it. Real gunicorn, integrated tree: the cooldown scenario sends 1 call
+  before the first 429 (was 7) and probes at 30.16 and 60.25 s (was 71.5 s), 0 `upstream_busy` (was 731); a 200 s
+  replay's worst heartbeat 18.3 / 14.1 ms (median 187.7 before); row 7 unchanged (0.097 percent). New
+  `tests/unit/test_route_warmup.py`, `tests/unit/test_worker_gc.py` updated; a worker starts about 0.5 s later and
+  about 13 MiB higher (same peak). Gate on top of 5ced056, green at the first run (27.2 minutes; the run left the
+  tree as it found it): **12,241 passed, 0 failed, 2 skipped** (no systemd user manager), **0 xfailed** (unit 6,815
+  with the 9 new tests, every other suite as in the gate below); ruff and ruff format clean (903 files), mypy no
+  issues (379 source files), `check_style.py` OK, the generated docs current, bandit no high and no medium finding
+  (30 low, none in `main.py` or `worker.py`).
 - **The daily digest** (A4): on by default and sent whatever `alert_min_severity` says, with its own switch
   `alert_digest_enabled` next to `alert_digest_hour` (Settings > Alerts).
 - **The public texts** (B13, B15): no bug bounty and no support section by default (v1's texts kept in the settings'

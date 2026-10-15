@@ -22,6 +22,10 @@ How it works
     5. Routers are included in a fixed order, the proxy catch-all last so it never shadows a real page. A
        router module exposes `router` (an `APIRouter`, or a Starlette `Router` for the plain proxy endpoint).
        Modules not written yet are skipped; until the public pages exist a placeholder answers `/`.
+    6. `create_asgi_app` (the server's app) prepares every route before the worker serves (`warm_routes`), so the
+       first proxy request of a new worker does not stop the event loop while FastAPI builds the routes in front
+       of the catch-all. This is the one startup warm-up: gunicorn's worker (`roxy/worker.py`), plain uvicorn and
+       the tests all get it from here, and the worker then freezes the app as built, route tables included.
 
 What to read next
     `roxy/core/middleware.py` (the stack), `roxy/lifespan.py` (startup), `roxy/internal_app.py` (the socket app).
@@ -31,10 +35,13 @@ from __future__ import annotations
 
 import html
 import logging
+import time
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import HTMLResponse
+from fastapi.routing import iter_route_contexts
 from starlette.routing import Router
 from starlette.types import ASGIApp
 
@@ -95,6 +102,45 @@ def include_routers(app: FastAPI, modules: tuple[str, ...] = ROUTER_MODULES) -> 
     return included
 
 
+@dataclass(frozen=True, slots=True)
+class RouteWarmup:
+    """What `warm_routes` did, kept on `app.state.route_warmup` and logged by the worker once it started."""
+
+    routes: int | None
+    """Route contexts walked (about 390); None when the walk failed and the routes are built on first use."""
+    ms: float
+    """How long the walk took, in milliseconds (about 250 to 350 on the development machine)."""
+
+
+def warm_routes(app: FastAPI) -> RouteWarmup:
+    """Prepare every route's request handling state now, before the worker serves (docs/PERFORMANCE.md, "Startup
+    warm-up (2026-10-14)").
+
+    FastAPI (0.142 here) prepares the routes of an included router lazily: the first request matched through the
+    router builds each route's dependency model (its signature, a pydantic adapter per parameter) and keeps it
+    until the routes change. The admin router holds several hundred page and API routes, all in front of the proxy
+    catch-all, so the first proxy request of every new worker built them on the event loop: about 390 routes,
+    48,000 objects and 250 to 370 ms, during which every other request of that worker waited. They then left
+    together: in the plan 19.4 cooldown scenario seven calls to the endpoint Roblox was refusing went out before
+    its first 429 came back (all inside the endpoint's burst of 10), and in the replays it was the largest stall
+    behind the worst heartbeat.
+    FastAPI's public `iter_route_contexts` walks the same per-router lists that matching uses, built the same way
+    and cached on the same router objects, so after it no request builds any. Nothing is served and no state
+    changes beyond FastAPI's own cache. It is an optimization only: if a FastAPI version walks differently, the
+    failure is logged and the routes are built on first use, as before.
+    """
+    started = time.perf_counter()
+    routes: int | None
+    try:
+        routes = sum(1 for _ in iter_route_contexts(app.router.routes))
+    except Exception:  # never stop a worker from booting over a cache warm-up
+        log.warning("route_warmup_failed", exc_info=True)
+        routes = None
+    warmup = RouteWarmup(routes=routes, ms=round((time.perf_counter() - started) * 1000, 1))
+    app.state.route_warmup = warmup
+    return warmup
+
+
 def create_app(env: EnvSettings | None = None, *, clock: Clock | None = None) -> FastAPI:
     """Build the public application. `env` defaults to the process environment; tests pass their own."""
     env = env or EnvSettings()
@@ -127,7 +173,13 @@ def create_app(env: EnvSettings | None = None, *, clock: Clock | None = None) ->
 
 
 def create_asgi_app(env: EnvSettings | None = None, *, clock: Clock | None = None) -> ASGIApp:
-    """The object gunicorn serves: the public app on TCP, the internal app on the Unix socket (plan 5.8)."""
+    """The object gunicorn serves: the public app on TCP, the internal app on the Unix socket (plan 5.8).
+
+    The public app's routes are prepared here (`warm_routes`): gunicorn's worker, plain uvicorn and an in-process
+    client all build this before they serve, so a new worker's first request is as fast as the next one. The
+    internal app's plain Starlette routes are compiled when they are made. Tests that build `create_app` directly
+    keep FastAPI's lazy preparation (it would add about 0.3 s to every test app)."""
     env = env or EnvSettings()
     public = create_app(env, clock=clock)
+    warm_routes(public)
     return ListenerDispatcher(public=public, internal=create_internal_app(public), internal_socket=env.internal_socket)
