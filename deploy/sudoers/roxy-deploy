@@ -1,0 +1,33 @@
+# roxy-deploy: the ONLY commands the deploy user may run as root (plan 9.14).
+#
+# Installed as /etc/sudoers.d/roxy-deploy (root, 0440) after `visudo -cf` accepts it. The deploy user is the
+# dedicated account `roxy-deploy` that GitHub Actions logs in as (LIGHTSAIL_USER). It must NOT be `ubuntu`: on
+# Lightsail that account already has unrestricted sudo, which would make these rules meaningless.
+# The rules allow exactly two root-owned wrappers with validated arguments, and four systemctl verbs on the two
+# Roxy colors. Never add install, cp, nginx, systemctl enable, or a shell: a deploy user that can install an
+# nginx config it controls is effectively root (nginx config can write files as root). Commands are listed with
+# full paths and exact arguments; sudo then refuses anything else, including extra arguments.
+# Requires sudo 1.9.10 or later for the regular expression (Ubuntu 24.04 ships 1.9.15).
+
+# Who these rules are for.
+User_Alias ROXY_DEPLOYERS = roxy-deploy
+
+# The blue/green switch: repoint the active upstream symlink, nginx -t, reload (deploy/tools/roxy-switch-color).
+Cmnd_Alias ROXY_SWITCH = /usr/local/sbin/roxy-switch-color blue, /usr/local/sbin/roxy-switch-color green
+
+# Install the nginx config of a verified commit on main (deploy/tools/roxy-nginx-apply). The argument is a full
+# commit id, optionally followed by --initial-color for the first deploy; the wrapper validates it again.
+Cmnd_Alias ROXY_NGINX = /usr/local/sbin/roxy-nginx-apply ^[0-9a-f]{40}( --initial-color (blue|green))?$
+
+# Start, stop, restart and reload exactly the two Roxy colors (full unit names, as deploy.sh spells them).
+Cmnd_Alias ROXY_UNITS = /usr/bin/systemctl start roxy@blue.service, /usr/bin/systemctl start roxy@green.service, \
+                        /usr/bin/systemctl stop roxy@blue.service, /usr/bin/systemctl stop roxy@green.service, \
+                        /usr/bin/systemctl restart roxy@blue.service, /usr/bin/systemctl restart roxy@green.service, \
+                        /usr/bin/systemctl reload roxy@blue.service, /usr/bin/systemctl reload roxy@green.service
+
+# Reset the environment (sudo's default, stated so it is never relaxed here): no PATH, PYTHON* or LD_* variables
+# from the deploy user reach the root wrappers.
+Defaults:ROXY_DEPLOYERS env_reset
+
+# Never ask for a password (the deploy runs unattended over SSH), and only for the commands above.
+ROXY_DEPLOYERS ALL = (root) NOPASSWD: ROXY_SWITCH, ROXY_NGINX, ROXY_UNITS

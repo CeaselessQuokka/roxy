@@ -1,0 +1,131 @@
+# UP-429-AMPLIFY just under its threshold (format: README.md in this directory).
+#
+# fallback_on_429 is on, but the rotator could take only a quarter of the 429s (it was cooling down the rest of
+# the time), so the episode makes 1.25 calls per caller request that went upstream, under 1.3:
+#
+#   generator              requests  calls each  in the 429 episode (-20m to -10m), GET games.roblox.com/v1/games
+#   light_fallback_ok      100       2           direct 429, retried on the rotator, 200
+#   light_stale_429        300       1           direct 429, no retry, served stale
+#   light_stale_cooldown   200       0           served stale during the cooldown, no call
+#   headshot_hit_episode   300       0           another endpoint, cache hits only
+#
+# 500 calls / 400 requests that went upstream = 1.25 (also 1.25 over the 400 requests that got a 429). No other
+# request went upstream during the episode, so no reading of "calls per caller request" that leaves out requests
+# making no call reaches 1.3. The param's own if-lowered text says "at 1.0 any retry during a 429 episode
+# counts", which fixes that reading; the variants at 1.2 and 1.0 must fire.
+
+format: roxy.insight_fixture/1
+rule: UP-429-AMPLIFY
+case: light_fallback
+description: >
+  fallback_on_429 = 1 retried 100 of 400 direct 429s on the rotator during a 10 minute episode: 1.25 upstream
+  calls per caller request that went upstream, under the 1.3 threshold, so the rule stays quiet. Lowering the
+  threshold to 1.2 or 1.0 makes it fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  fallback_on_429: 1
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games", type: glob, ttl: 60, stale_ttl: 30, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004"]
+  endpoint_template: games.roblox.com/v1/games
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 150, p95: 400, p99: 800}}
+
+traffic:
+  - {name: games_hit_before, profile: hit, window: ["-60m", "-20m"], per_minute: 20}
+  - {name: games_miss_before, profile: miss, window: ["-60m", "-20m"], per_minute: 12}
+  - name: light_fallback_ok
+    window: ["-20m", "-10m"]
+    total: 100
+    egress: rotator
+    outcome: served_upstream
+    reason: upstream_ok
+    status: 200
+    source: relay
+    cache_state: "MISS"
+    upstream_calls: 2
+    latency_ms: {p50: 700, p95: 1500, p99: 2300}
+    upstream_429: {egress: direct, retry_after_s: 30}
+  - name: light_stale_429
+    window: ["-20m", "-10m"]
+    total: 300
+    egress: direct
+    outcome: served_cache
+    reason: cache_stale_error
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    latency_ms: {p50: 90, p95: 200, p99: 350}
+    upstream_429: {egress: direct, retry_after_s: 30}
+  - name: light_stale_cooldown
+    window: ["-20m", "-10m"]
+    total: 200
+    egress: none
+    outcome: served_cache
+    reason: cache_stale_cooldown
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    latency_ms: {p50: 3, p95: 9, p99: 20}
+  - {name: headshot_hit_episode, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-20m", "-10m"], total: 300}
+  - {name: games_hit_after, profile: hit, window: ["-10m", "0m"], per_minute: 20}
+  - {name: games_miss_after, profile: miss, window: ["-10m", "0m"], per_minute: 12}
+
+events:
+  upstream_attempts:
+    # light_fallback_ok (100 requests, 2 calls each)
+    - {window: ["-20m", "-10m"], total: 100, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: 429, kind: first}
+    - {window: ["-20m", "-10m"], total: 100, endpoint_template: games.roblox.com/v1/games, egress: rotator, attempt: 2, status: 200, kind: fallback_429}
+    # light_stale_429 (300 requests, 1 call each)
+    - {window: ["-20m", "-10m"], total: 300, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: 429, kind: first}
+
+state:
+  settings_history:
+    - {at: "-12d", key: fallback_on_429, old: 0, new: 1, source: admin, changed_by: admin, reason: "Incident: retry 429s on the rotator."}
+
+expect:
+  data_checks:
+    - window: ["-20m", "-10m"]
+      requests: 900
+      upstream_calls: 500
+      roblox_429: 400
+      by_reason: {upstream_ok: 100, cache_stale_error: 300, cache_stale_cooldown: 200, cache_hit: 300}
+    - window: ["-60m", "-20m"]
+      roblox_429: 0
+    - window: ["-10m", "0m"]
+      roblox_429: 0
+
+  fires: false
+
+variants:
+  - case: calls_per_request_1_2
+    description: 1.25 calls per request is above a threshold of 1.2.
+    settings: {insight_up_429_amplify_calls_per_request: 1.2}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - {kind: setting, key: fallback_on_429, current: 1, proposed: 0}
+  - case: calls_per_request_1_0
+    description: At 1.0 any retry during a 429 episode counts (the param's own if-lowered text).
+    settings: {insight_up_429_amplify_calls_per_request: 1.0}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - {kind: setting, key: fallback_on_429, current: 1, proposed: 0}

@@ -1,0 +1,59 @@
+# FILTER-COLLATERAL must stay quiet when the filters refuse only abusers.
+#
+#   filter                               refuses                                       places affected
+#   UA rule c0ffee01 "python-requests"   1,200 requests from 10 scrapers (no place)    none
+#   header rule x-scanner / sqlmap       120 probes from one scanner (no place)        none
+#
+# Six legitimate experiences (98.8% of their traffic served) are refused only by ordinary per-IP throttling, which is
+# not a rule (no rule table refuses with `throttle`), so no filter has collateral damage.
+
+format: roxy.insight_fixture/1
+rule: FILTER-COLLATERAL
+case: filter_hits_only_abusers
+description: >
+  A UA rule and a header filter refuse only scrapers and a scanner that send no place id, while six busy experiences
+  are served normally (a few per-IP throttle refusals). FILTER-COLLATERAL must not fire.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  rules_user_agent:
+    - {id: "c0ffee01", needle: "python-requests", mode: contains, kind: burst, scope: ip, limit: 5, period: 60, position: 1, enabled: 1, created_at: "-60d", created_by: admin, x_last_hit_at: "-1m"}
+  rules_header:
+    - {id: 1, canonical_key: "x-scanner|value|contains|sqlmap", scope: value, mode: contains, needle: "sqlmap", header: "x-scanner", enabled: 1, created_at: "-90d", created_by: admin, x_last_hit_at: "-1m"}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  ua_refused: {egress: none, outcome: refused, reason: user_agent_rule, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  header_refused: {egress: none, outcome: refused, reason: header_rule, status: 403, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  legit_places:
+    clients: {cidr: "203.0.113.0/26", count: 50}
+    places: ["1000000221", "1000000222", "1000000223", "1000000224", "1000000225", "1000000226"]
+    user_agent: "Roblox/Linux"
+  scrapers: {clients: {cidr: "192.0.2.0/28", count: 10}, user_agent: "python-requests/2.31.0", endpoint_template: "users.roblox.com/v1/users/{userId}"}
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit_places], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 60}
+  - {name: legit_miss, profile: [miss, legit_places], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 20}
+  - {name: legit_throttled, profile: [throttled, legit_places], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 1}
+  - {name: scraper_served, profile: [miss, scrapers], window: ["-60m", "0m"], per_minute: 10}
+  - {name: scraper_ua_refused, profile: [ua_refused, scrapers], window: ["-60m", "0m"], per_minute: 20}
+  - {name: scanner_refused, profile: header_refused, client_ip: "192.0.2.100", user_agent: "sqlmap/1.8", endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 2}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/26", count: 50}, bot_score: 9}
+    - {clients: {cidr: "192.0.2.0/28", count: 10}, bot_score: 88}
+    - {ip: "192.0.2.100", bot_score: 95}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 6780, by_reason: {user_agent_rule: 1200, header_rule: 120, throttle: 60}}
+    - {window: ["-60m", "0m"], where: {place_id: "1000000221"}, requests: 810, refused: 10}
+  fires: false

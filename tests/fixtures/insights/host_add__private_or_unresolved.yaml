@@ -1,0 +1,105 @@
+# HOST-ADD stays quiet on host probing: hosts that do not resolve publicly, and hosts outside roblox.com
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "One unknown *.roblox.com host requested by >= 5 distinct places or 50 distinct IPs in 24 h, and it
+# resolves publicly". The caller tests are met by every host below; the DNS and domain tests are not. This is the
+# abuse-shaped traffic HOST-ADD must never turn into an allowlist entry (an SSRF door, plan 9.10).
+#
+#   host                          callers (24 h)          DNS (test seam)                     why it stays out
+#   internal-preview.roblox.com   80 IPs, 9 places        10.20.30.40                         private address
+#   localhost.roblox.com          55 IPs, 0 places        127.0.0.1                           loopback
+#   mixed-edge.roblox.com         70 IPs, 6 places        192.0.2.60 and 10.0.0.7             one answer is private
+#   cdn-assets-7.roblox.com       120 IPs, 0 places       NXDOMAIN                            does not resolve
+#   metadata.evil.test            200 IPs, 0 places       (not asked)                         not *.roblox.com
+#
+# The documentation ranges count as public under the test address classifier; 10.0.0.0/8 and 127.0.0.0/8 stay
+# private (tests/fixtures/health/README.md, "Documentation range addresses count as public").
+
+format: roxy.insight_fixture/1
+rule: HOST-ADD
+case: private_or_unresolved
+description: >
+  Many clients probe unknown hosts: two roblox.com names that resolve to private or loopback addresses, one with a
+  mixed public and private answer, one that does not resolve, and one outside roblox.com. Each meets the caller
+  thresholds, but none resolves publicly under roblox.com, so nothing may fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Mozilla/5.0 (X11; Linux x86_64)"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+
+profiles:
+  unknown_host: {egress: none, outcome: refused, reason: host_not_allowed, status: 404, source: roxy, cache_state: "NA", latency_ms: {p50: 1, p95: 3, p99: 6}, bytes: {caller_in: 0, caller_out: 19}}
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", user_agent: "Roblox/Linux", places: ["1000000001", "1000000002", "1000000003"], bytes: {caller_in: 0, caller_out: 1800}}
+
+traffic:
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-6h", "0m"], per_minute: 20}
+  - name: internal_preview
+    profile: unknown_host
+    endpoint_template: internal-preview.roblox.com/admin
+    host: internal-preview.roblox.com
+    path: "internal-preview.roblox.com/admin"
+    window: ["-6h", "0m"]
+    per_minute: 1
+    clients: {cidr: "203.0.113.0/25", count: 80}
+    places: ["1000000041", "1000000042", "1000000043", "1000000044", "1000000045", "1000000046", "1000000047", "1000000048", "1000000049"]
+  - name: localhost_trick
+    profile: unknown_host
+    endpoint_template: localhost.roblox.com/latest/meta-data
+    host: localhost.roblox.com
+    path: "localhost.roblox.com/latest/meta-data"
+    window: ["-3h", "0m"]
+    per_minute: 1
+    clients: {cidr: "198.51.100.128/26", count: 55}
+  - name: mixed_edge
+    profile: unknown_host
+    endpoint_template: mixed-edge.roblox.com/v1/status
+    host: mixed-edge.roblox.com
+    path: "mixed-edge.roblox.com/v1/status"
+    window: ["-6h", "0m"]
+    per_minute: 1
+    clients: {cidr: "198.51.100.0/25", count: 70}
+    places: ["1000000051", "1000000052", "1000000053", "1000000054", "1000000055", "1000000056"]
+  - name: cdn_scan
+    profile: unknown_host
+    endpoint_template: cdn-assets-7.roblox.com/
+    host: cdn-assets-7.roblox.com
+    path: "cdn-assets-7.roblox.com/"
+    window: ["-4h", "0m"]
+    per_minute: 1
+    clients: {cidr: "192.0.2.0/25", count: 120}
+  - name: not_roblox
+    endpoint_template: metadata.evil.test/latest
+    host: metadata.evil.test
+    path: "metadata.evil.test/latest"
+    egress: none
+    outcome: refused
+    reason: not_roblox
+    status: 404
+    source: roxy
+    cache_state: "NA"
+    window: ["-4h", "0m"]
+    per_minute: 1
+    clients: {cidr: "192.0.2.0/24", count: 200}
+
+state:
+  dns:
+    "internal-preview.roblox.com": {answers: ["10.20.30.40"], latency_ms: 21}
+    "localhost.roblox.com": {answers: ["127.0.0.1"], latency_ms: 19}
+    "mixed-edge.roblox.com": {answers: ["192.0.2.60", "10.0.0.7"], latency_ms: 22}
+    "cdn-assets-7.roblox.com": {error: nxdomain, latency_ms: 30}
+
+expect:
+  data_checks:
+    - window: ["-24h", "0m"]
+      refused: 1380
+      by_reason: {host_not_allowed: 1140, not_roblox: 240}
+  fires: false
+
+variants:
+  - case: thresholds_at_one
+    description: Even with both caller tests at 1, none of these hosts resolves publicly under roblox.com.
+    settings: {insight_host_add_min_places: 1, insight_host_add_min_ips: 1}
+    expect: {fires: false}

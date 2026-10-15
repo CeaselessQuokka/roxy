@@ -1,0 +1,70 @@
+{#-
+  Badges, chips, deltas, help dots and keyboard keys.
+
+  What: small inline pieces used by every other component: `badge`, `status_badge`, `severity_badge`, `risk_badge`,
+  `default_badge`, `apply_badge`, `delta`, `help_dot` and `kbd`.
+  Why: plan 14.9 says color is never the only signal, so every status shape here carries an icon AND words, and a
+  delta says "up" or "down" in text for screen readers. Keeping them in one file keeps the vocabulary consistent:
+  "warn" always looks and reads the same.
+  How: tones are `ok`, `warn`, `bad`, `info`, `accent` and `neutral`, each a class in components.css that uses the
+  matching token pair checked by scripts/check_contrast.py.
+-#}
+{% from "components/icon.html" import icon %}
+
+{% set TONE_ICONS = {"ok": "check-circle", "warn": "alert-triangle", "bad": "alert-octagon", "info": "info",
+                     "neutral": "minus", "accent": "sparkle"} %}
+
+{% macro badge(text, tone="neutral", icon_name=None, title=None) -%}
+<span class="badge badge--{{ tone }}"{% if title %} title="{{ title }}"{% endif %}>{% if icon_name %}{{ icon(icon_name) }}{% endif %}<span>{{ text }}</span></span>
+{%- endmacro %}
+
+{% macro status_badge(tone, text) -%}
+{{ badge(text, tone, TONE_ICONS.get(tone, "minus")) }}
+{%- endmacro %}
+
+{% macro severity_badge(severity) -%}
+{%- set map = {"critical": ("bad", "Critical"), "warn": ("warn", "Warning"), "info": ("info", "Info")} -%}
+{%- set tone, words = map.get(severity, ("neutral", severity|capitalize)) -%}
+{{ badge(words, tone, TONE_ICONS[tone]) }}
+{%- endmacro %}
+
+{% macro risk_badge(risk) -%}
+{%- if risk == "high" -%}{{ badge("High risk", "bad", "alert-octagon", "Changing this can break callers or weaken security; a reason and a confirmation are required.") }}
+{%- elif risk == "medium" -%}{{ badge("Medium risk", "warn", "alert-triangle", "Changing this has visible effects; read what happens before saving.") }}
+{%- else -%}{{ badge("Low risk", "neutral", None, "Safe to experiment with; easy to undo.") }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro default_badge(is_default, default_text) -%}
+{%- if is_default -%}{{ badge("Default", "neutral") }}
+{%- else -%}{{ badge("Changed (default " ~ default_text ~ ")", "accent", "sparkle") }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro apply_badge(apply) -%}
+{%- if apply == "restart" -%}{{ badge("Restart required", "warn", "refresh", "Takes effect after the next restart or deploy.") }}
+{%- else -%}{{ badge("Applies live", "neutral", "check", "Every worker picks up the change within about a second.") }}
+{%- endif -%}
+{%- endmacro %}
+
+{#- `delta(12.5, good="up")`: an arrow, the signed percent, and screen reader words. `good` says which direction is
+    an improvement ("up" for hit ratio, "down" for 429s, "neutral" when neither). -#}
+{% macro delta(value, good="up", label="vs the previous period", unit="%", digits=1) -%}
+{%- if value is none -%}
+<span class="delta delta--neutral"><span class="delta__text">n/a</span><span class="sr-only"> no comparison data</span></span>
+{%- else -%}
+{%- set direction = "up" if value > 0 else ("down" if value < 0 else "flat") -%}
+{%- set tone = "neutral" if direction == "flat" or good == "neutral" else ("ok" if direction == good else "bad") -%}
+<span class="delta delta--{{ tone }}">{{ icon("arrow-" ~ direction if direction != "flat" else "minus") }}<span class="delta__text">{% if value > 0 %}+{% endif %}{{ "{:,.{}f}".format(value, digits) }}{{ unit }}</span><span class="sr-only"> {{ "up" if direction == "up" else ("down" if direction == "down" else "unchanged") }} {{ label }}{% if tone == "ok" %}, an improvement{% elif tone == "bad" %}, getting worse{% endif %}</span></span>
+{%- endif -%}
+{%- endmacro %}
+
+{#- A "?" button that shows help on hover, focus or click (static/js/tooltip.js). The words also reach screen
+    readers through aria-describedby while the tip is open, and through the live region when clicked. -#}
+{% macro help_dot(label, text) -%}
+<button type="button" class="help-dot" data-help="{{ text }}" aria-label="Help: {{ label }}">?</button>
+{%- endmacro %}
+
+{% macro kbd(keys) -%}
+<span class="keys">{% for key in keys.split(" ") %}<kbd>{{ key }}</kbd>{% endfor %}</span>
+{%- endmacro %}

@@ -1,0 +1,17 @@
+{#-
+  Cache page, card `endpoints` (`roxy/admin/pages/cache.py endpoints_card`): v1 "Where the cache is working".
+
+  One row per endpoint template (`cache.endpoints_answer`, the `GET /admin/api/v1/cache/endpoints` function): hit
+  ratio (colored and worded when a busy endpoint is below 10% or above 50%), hits, stale serves, revalidations,
+  coalesced, misses, negative hits, the TTL that applies and its rule. A row opens its drawer with "write a rule"
+  and "purge its answers". Templates are caller text: shown as text only. A request of the table itself (search,
+  sort, page; `table_only`) is answered with the table alone, which replaces itself.
+  Context: `frame`, `table`, `table_only`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% if table_only %}{{ data_table(**table) }}{% else %}
+{% call page_card(frame, flush=True, subtitle="A busy endpoint with a hit ratio near zero is the one to act on: every caller asks a slightly different question, so there is nothing to reuse.") %}
+{{ data_table(**table) }}
+{% endcall %}
+{% endif %}

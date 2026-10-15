@@ -1,0 +1,59 @@
+{#-
+  Diff viewer (plan 14.5: before and after for settings, rules and JSON).
+
+  What
+    `diff_fields(rows)` shows changed fields side by side: label, key, before, after (settings, rules, a
+    recommendation's proposed changes). `diff_lines(lines)` shows a line diff of two texts (JSON, rule exports).
+  Why
+    Every change in Roxy is reviewed before it is applied and audited after (plan principle P5). Added and removed
+    lines are marked with "+" and "-" and words for screen readers as well as color (plan 14.9).
+  How
+    rows:  [{"label", "key", "before", "after", "note"}]  (pre-formatted text; None renders "not set")
+    lines: [{"op": "equal|insert|delete|skip", "old": n or None, "new": n or None, "text": str}], as built by
+           `roxy.admin.gallery.diff_lines(before, after)` (difflib, unchanged runs folded to a "skip" row).
+-#}
+{% macro diff_fields(rows, caption="Changes", show_caption=False) -%}
+<div class="table-scroll" role="region" aria-label="{{ caption }}" tabindex="0">
+<table class="diff-table">
+  <caption class="{% if not show_caption %}sr-only{% endif %}">{{ caption }}</caption>
+  <thead><tr><th scope="col">What</th><th scope="col">Before</th><th scope="col">After</th></tr></thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <th scope="row"><span class="diff-table__label">{{ r.label }}</span>{% if r.key %}<code class="diff-table__key">{{ r.key }}</code>{% endif %}{% if r.note %}<span class="diff-table__note">{{ r.note }}</span>{% endif %}</th>
+      <td class="diff-table__before"><span class="sr-only">Before: </span>{% if r.before is none %}<span class="muted">not set</span>{% else %}<del>{{ r.before }}</del>{% endif %}</td>
+      <td class="diff-table__after"><span class="sr-only">After: </span>{% if r.after is none %}<span class="muted">removed</span>{% else %}<ins>{{ r.after }}</ins>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{%- endmacro %}
+
+{% macro diff_lines(lines, title="Line changes", before_label="Before", after_label="After") -%}
+{%- set ns = namespace(added=0, removed=0) -%}
+{%- for l in lines %}{% if l.op == "insert" %}{% set ns.added = ns.added + 1 %}{% elif l.op == "delete" %}{% set ns.removed = ns.removed + 1 %}{% endif %}{% endfor -%}
+<div class="diff">
+  <p class="diff__stats"><span class="diff__stat diff__stat--add">+{{ ns.added }} added</span> <span class="diff__stat diff__stat--del">-{{ ns.removed }} removed</span> <span class="muted">({{ before_label }} to {{ after_label }})</span></p>
+  <div class="table-scroll" role="region" aria-label="{{ title }}" tabindex="0">
+    <table class="diff-lines">
+      <caption class="sr-only">{{ title }}: {{ ns.added }} lines added, {{ ns.removed }} removed</caption>
+      <thead class="sr-only"><tr><th scope="col">{{ before_label }} line</th><th scope="col">{{ after_label }} line</th><th scope="col">Change</th><th scope="col">Text</th></tr></thead>
+      <tbody>
+        {% for l in lines %}
+        {% if l.op == "skip" %}
+        <tr class="diff-lines__skip"><td colspan="4">{{ l.text }}</td></tr>
+        {% else %}
+        <tr class="diff-lines__{{ l.op }}">
+          <td class="diff-lines__no">{{ l.old if l.old is not none else "" }}</td>
+          <td class="diff-lines__no">{{ l.new if l.new is not none else "" }}</td>
+          <td class="diff-lines__mark">{% if l.op == "insert" %}<span aria-hidden="true">+</span><span class="sr-only">added</span>{% elif l.op == "delete" %}<span aria-hidden="true">-</span><span class="sr-only">removed</span>{% else %}<span class="sr-only">unchanged</span>{% endif %}</td>
+          <td class="diff-lines__text"><code>{{ l.text }}</code></td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{%- endmacro %}

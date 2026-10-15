@@ -1,0 +1,31 @@
+format: roxy.health_fixture/1
+check: H-CRED-COOLDOWN
+case: fail
+name: long_cooldown
+description: >
+  Roblox answered a credential call with 429 and Retry-After 300 a few seconds ago: 296 s of credential cooldown
+  remain. 13.2 H-CRED-COOLDOWN: 60 s or more gives fail. The variant is the exact edge: 60 s remaining is not
+  under 60 s, so it fails too.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    credential: {present: true, status: cooling_down, status_at: "-4s", set_at: "-20d", account_id: "1000001"}
+    cooldowns:
+      - {key: credential, until: "+296s", source: retry_after, set_at: "-4s", hits: 2}
+expect:
+  status: fail
+  value: {between: [295, 297]}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  credential_calls: {eq: 0}
+variants:
+  - case: fail
+    name: edge_60s
+    inputs:
+      state:
+        cooldowns:
+          - {key: credential, until: "+60s", source: default, set_at: "-1s", hits: 1}
+    expect:
+      status: fail
+      value: {between: [60, 60.99]}
+      explanation: {present: true}

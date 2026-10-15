@@ -1,0 +1,59 @@
+{#-
+  Preferences (the user menu's "Preferences", DESIGN.md section 9 `user-menu#preferences`).
+
+  Two kinds of choices, said apart in the dialog:
+    * Yours only, kept on the server per admin (`/admin/api/v1/prefs`): the time range and comparison a page opens
+      with, and the time zone times are shown in. Saved with static/js/api_forms.js (JSON, CSRF header).
+    * For every admin (runtime settings, audited, applied fleet-wide): the default theme of admins who never chose
+      one (`ui_default_theme`) and the time zone of the charts and time windows (`ui_timezone`), as inline setting
+      controls placed here by the catalog (`dialog_settings.preferences`).
+  Theme and dense tables are switched in the user menu itself (static/js/theme.js saves them to the prefs API).
+  Context: `prefs` (the admin's effective preferences), `dialog_settings`, `urls.prefs`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/page_card.html" import inline_setting %}
+{% from "admin/_layout/nav.html" import RANGES, COMPARES %}
+{% set u = urls if urls is defined and urls else {} %}
+{% set p = prefs if prefs is defined and prefs else {} %}
+{% set ds = dialog_settings if dialog_settings is defined and dialog_settings else {} %}
+<dialog class="dialog prefs-dialog" id="preferences" aria-labelledby="preferences-title">
+  <header class="dialog__head">
+    <h2 class="dialog__title" id="preferences-title">{{ icon("sliders", cls="dialog__title-icon") }}Preferences</h2>
+    <button type="button" class="icon-btn" data-dialog-close aria-label="Close">{{ icon("x") }}</button>
+  </header>
+  <div class="dialog__body prefs-dialog__body">
+    <section aria-labelledby="prefs-mine-title" class="prefs-dialog__section">
+      <h3 class="prefs-dialog__heading" id="prefs-mine-title">Yours only</h3>
+      <form class="stack" data-api-form data-api-url="{{ u.prefs or '/admin/api/v1/prefs' }}" data-api-method="POST" data-success="Your preferences are saved." novalidate>
+        <div class="field">
+          <label class="field__label" for="pref-range">Time range pages open with</label>
+          <select class="input" id="pref-range" name="default_range" data-json="string">
+            {% for value, short, long in RANGES %}<option value="{{ value }}"{% if p.default_range == value %} selected{% endif %}>{{ long }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label class="field__label" for="pref-compare">Comparison pages open with</label>
+          <select class="input" id="pref-compare" name="compare" data-json="string">
+            {% for value, label in COMPARES %}<option value="{{ value }}"{% if (p.compare or "none") == value %} selected{% endif %}>{{ label }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label class="field__label" for="pref-tz">Show times in this time zone</label>
+          <input class="input" id="pref-tz" name="timezone" value="{{ p.timezone or '' }}" maxlength="64" spellcheck="false" autocomplete="off"
+                 placeholder="Leave empty to follow the dashboard time zone" aria-describedby="pref-tz-hint pref-tz-error" data-json="string">
+          <p class="field__hint" id="pref-tz-hint">An IANA name such as America/New_York. Only how times are shown to you changes.</p>
+          <p class="field__error" id="pref-tz-error" data-field-error="timezone" hidden></p>
+        </div>
+        <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+        <div class="cluster"><button type="submit" class="btn btn--primary">{{ icon("check") }}<span>Save my preferences</span></button></div>
+      </form>
+    </section>
+    {% if ds.preferences %}
+    <section aria-labelledby="prefs-all-title" class="prefs-dialog__section">
+      <h3 class="prefs-dialog__heading" id="prefs-all-title">For every admin</h3>
+      <p class="field__hint">These are runtime settings: a change applies to everyone at once and is written to the audit log.</p>
+      {% for entry in ds.preferences %}{{ inline_setting(entry) }}{% endfor %}
+    </section>
+    {% endif %}
+  </div>
+</dialog>

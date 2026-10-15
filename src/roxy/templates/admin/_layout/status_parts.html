@@ -1,0 +1,29 @@
+{#-
+  The shell's state parts, for `GET /admin/ui/status/parts` (`roxy.admin.pages.core.status_parts`).
+
+  What this is
+    The top bar's Pause, Emergency limit and recommendations bell, the phone bar's bell and sheet button, the
+    service banners and the two control dialogs, rendered from the state as it is now, inside one
+    `[data-shell-parts]` element that carries the new `data-status-sig`, `data-status-digest` and
+    `data-status-next` values.
+
+  Why it exists
+    A page that cannot reload (an unsaved edit, an open dialog, a reload the admin refused at the browser's "Leave
+    site?") must still say what callers get right now: never offer Pause while the proxy is paused, never print an
+    old limit (review findings functional-6 and functional-8), and the bell follows a dismiss or an apply
+    (functional-11). static/js/shell.js swaps every `[data-shell-part]` and each closed control dialog in place.
+
+  How it works
+    The same templates as the page (topbar, mobile_nav, banners, control_dialogs), so the parts cannot drift from a
+    full render; the script takes only the marked elements and the dialogs by id, and leaves an open dialog alone.
+    Context: `status`, `urls`, `dialog_settings`, `recs`, `recs_known` (`roxy.admin.pages.shell.status_parts_context`).
+
+  What to read next
+    static/js/shell.js, admin/_layout/topbar.html, admin/_layout/banners.html, admin/_layout/control_dialogs.html.
+-#}
+<div data-shell-parts data-status-sig="{{ status.signature }}" data-status-digest="{{ status.digest }}" data-status-next="{{ status.next_change or '' }}">
+  {% include "admin/_layout/topbar.html" %}
+  {% include "admin/_layout/banners.html" %}
+  {% include "admin/_layout/mobile_nav.html" %}
+  {% include "admin/_layout/control_dialogs.html" %}
+</div>

@@ -1,0 +1,20 @@
+format: roxy.health_fixture/1
+check: H-TLS
+case: fail
+name: certificate_expired
+description: >
+  users.roblox.com presents an expired certificate, so verification fails during the handshake. 13.2 H-TLS:
+  failure gives fail (an expired certificate is a failed handshake, not a "days left" warning).
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    allowed_roblox_hosts: [games.roblox.com, users.roblox.com, thumbnails.roblox.com, presence.roblox.com]
+  tls:
+    games.roblox.com: {days_left: 61, handshake_ms: 45}
+    users.roblox.com: {error: expired}
+    thumbnails.roblox.com: {days_left: 74, handshake_ms: 48}
+    presence.roblox.com: {days_left: 33, handshake_ms: 50}
+expect:
+  status: fail
+  explanation: {present: true}
+  credential_calls: {eq: 0}

@@ -1,0 +1,100 @@
+# SYS-ERRORS just under its thresholds.
+#
+#   condition                    evidence                                                        threshold
+#   new signature                none: the newest signature is 9 days old                        first seen in 1 h
+#   known signature spike        OSError at capture.py:154: 18 in the last hour against a        5x
+#                                baseline of 4 an hour = 4.5x (4.4x if the baseline includes
+#                                the last hour)
+#   caller-facing 500s           16 internal_error 500s of 4,006 requests in 15 min = 0.40%      0.5%
+#
+# The 500s come from ValueError at respond.py:341, a known bug at one every 2 minutes (30 an hour); its last hour
+# (23 + 16 = 39) is 1.3x its baseline. Traffic and occurrences agree one to one.
+#
+#   variant baseline_multiple_lowered (4): the OSError (4.5x) fires, the ValueError (1.3x) does not
+#   variant caller_500_pct_lowered (0.3): 0.40% of caller-facing 500s is too many
+
+format: roxy.insight_fixture/1
+rule: SYS-ERRORS
+case: under_thresholds
+description: >
+  An error running at 4.5 times its baseline and Roxy's own 500s at 0.40% of the last 15 minutes, with no new
+  signature. SYS-ERRORS must not fire; a 4x multiple or a 0.3% threshold must make it fire.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  internal_error: {egress: none, outcome: failed, reason: internal_error, status: 500, source: roxy, cache_state: "NA", upstream_calls: 0, error: true, latency_ms: 4, bytes: {caller_in: 0, caller_out: 60}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 200}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 66}
+  - name: bug_baseline
+    profile: [internal_error, legit]
+    endpoint_template: "users.roblox.com/v1/users/{userId}"
+    window: ["-60m", "-15m"]
+    series: [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+  - {name: bug_recent, profile: [internal_error, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-15m", "0m"], total: 16}
+
+events:
+  errors:
+    - signature: "OSError at capture.py:154"
+      count: 1900
+      first_seen: "-9d"
+      last_seen: "-200s"
+      source: roxy
+      last_detail: "capture store"
+      module_line: "capture.py:154"
+      traceback_redacted: |
+        File "roxy/metrics/capture.py", line 154, in store
+          blob = zlib.compress(body, level)
+        OSError: [Errno 28] No space left on device
+      occurrences:
+        - {window: ["-7d", "-60m"], every: "15m"}
+        - {window: ["-60m", "0m"], every: "200s"}
+    - signature: "ValueError at respond.py:341"
+      count: 12000
+      first_seen: "-20d"
+      last_seen: "-1m"
+      source: roxy
+      last_detail: "GET users.roblox.com/v1/users/{userId}"
+      module_line: "respond.py:341"
+      traceback_redacted: |
+        File "roxy/proxy/respond.py", line 341, in build
+          length = int(result.upstream_headers["content-length"])
+        ValueError: invalid literal for int() with base 10: ''
+      occurrences:
+        - {window: ["-7d", "-15m"], every: "2m"}
+        - {window: ["-15m", "0m"], total: 16}
+
+expect:
+  data_checks:
+    - {window: ["-15m", "0m"], requests: 4006, by_reason: {internal_error: 16}}
+    - {window: ["-60m", "-15m"], by_reason: {internal_error: 23}}
+  fires: false
+
+variants:
+  - case: baseline_multiple_lowered
+    description: At 4x, the OSError (4.5x its baseline) is a spike; the ValueError (1.3x) is not, and 0.40% of 500s is still under 0.5%.
+    settings: {insight_sys_errors_baseline_multiple: 4}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "capture.py:154", changes_required: [{kind: manual}]}
+  - case: caller_500_pct_lowered
+    description: At 0.3%, 0.40% caller-facing 500s over 15 minutes is too many.
+    settings: {insight_sys_errors_caller_500_pct: 0.3}
+    expect:
+      fires: true
+      recommendations:
+        - {changes_required: [{kind: manual}]}

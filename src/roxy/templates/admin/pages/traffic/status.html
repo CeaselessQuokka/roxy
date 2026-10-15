@@ -1,0 +1,51 @@
+{#-
+  Traffic page, card `status` (`roxy/admin/pages/traffic.py status_card`; plan 14.1 rows 3 and 21, v1 "Status
+  Codes" with "Who returned it?", parity rows 68 and 132).
+
+  v1's four tiles (429s and 5xx from Roblox and from Roxy), v1's verdict (the one to act on is Roblox rate limiting
+  Roxy), the status codes over time (by class, or by who returned them: a small form asks this card's fragment
+  again with `status_view`), and the "Who returned it?" table (`traffic_status_sources`, the API's table) under the
+  five sources in plain words. The tiles and the table read one definition of "who" (`queries.ANSWER_SOURCE_SQL`):
+  a Roblox 5xx passed on after the retries is Roblox's (relayed). A table request (`part` "table") gets the table
+  alone. Context: `frame`, `part`, `table`, and for the card `tiles`, `verdict`, `sources`, `series`,
+  `series_options`, `kind`, `stack`, `status_view`, `views`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/table.html" import data_table %}
+{% from "components/kpi.html" import kpi_tile %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/format.html" import num %}
+{% if part == "table" %}
+{{ data_table(**table) }}
+{% else %}
+{% call page_card(frame) %}
+<div class="kpi-grid traffic-tiles">
+  {% for tile in tiles %}
+  {{ kpi_tile(tile.label, num(tile.value), help=tile.help, key=tile.key, status=tile.tone, status_label=tile.tone_label, baseline=tile.meta) }}
+  {% endfor %}
+</div>
+{{ inline_alert(verdict.tone, verdict.title, verdict.text) }}
+<form class="card-controls" hx-get="{{ frame.fragment_url }}" hx-target="#{{ frame.id }}" hx-swap="outerHTML" hx-trigger="change">
+  <label class="chip-select">
+    <span class="chip-select__label">Chart</span>
+    <select id="traffic-status-view" name="status_view" aria-label="What the status chart shows">
+      {% for value, text in views %}<option value="{{ value }}"{% if value == status_view %} selected{% endif %}>{{ text }}</option>{% endfor %}
+    </select>
+  </label>
+</form>
+{{ series_chart("traffic-status-chart", "Status codes over time" if status_view == "class" else "Answers by who returned them", series=series, summary=("Answers per status class over the range, with the 429s Roxy and Roblox gave." if status_view == "class" else "Answers over the range, stacked by who produced the status the caller got."), size="md", kind=kind, stack=stack, series_options=series_options, y_format="count", empty_text="No answers in this range yet.") }}
+<section class="traffic-sources" aria-labelledby="traffic-sources-title">
+  <h3 class="traffic-sources__title" id="traffic-sources-title">Who returned it?</h3>
+  <p class="traffic-sources__lead">The same codes split by origin. This is the difference between <em>Roblox is rate limiting Roxy</em> (act on it: the address and the account behind Roxy are at risk) and <em>Roxy is rate limiting callers</em> (the system working).</p>
+  <dl class="traffic-legend">
+    {% for key, item in sources.items() %}
+    <div class="traffic-legend__item"><dt>{{ item.label }}</dt><dd>{{ item.help }}</dd></div>
+    {% endfor %}
+  </dl>
+  <div class="traffic-dt">
+  {{ data_table(**table) }}
+  </div>
+</section>
+{% endcall %}
+{% endif %}

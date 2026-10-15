@@ -1,0 +1,31 @@
+{#-
+  The Recommendations page (`roxy/admin/pages/recommendations.py`): review, preview, apply, undo (plan 14.1, 11.3).
+
+  Layout: the list first (the page's main table; a row opens its detail drawer), then the history of actions, the
+  rule catalog (a row opens the rule's tuning drawer) and the engine and dry-run settings side by side. The drawer,
+  the preview panel and the forms in them are fragments of this page's own routes; every action posts JSON to the
+  Recommendations API (static/js/api_forms.js). `?rec=<id>` opens that recommendation's drawer on load
+  (static/js/pages/recommendations.js).
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="#rules">{{ icon("sliders") }}<span>Tune the rules</span></a>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>Open a row to see its evidence and the exact changes. <strong>Preview</strong> replays recent sampled requests under the change (a {{ term("dry-run", "dry run") }}) and shows what Apply will ask for: a reason and a confirmation for a high-risk value, and your second factor for a change to admin security or the credential. <strong>Apply</strong> writes exactly the previewed changes, each through the same audited services as the settings and rule editors; if the recommendation changed since you previewed it, Roxy asks you to preview again. <strong>Undo</strong> puts back exactly what was applied, as long as nobody changed the same setting or rule since.</p>
+<p><strong>Snooze</strong> hides a recommendation until a time; <strong>Dismiss</strong> closes it with a reason, and the same finding stays quiet for a while unless it gets more severe. A badge says when a change is safe for {{ term("auto-apply", "auto-apply") }}; applied changes are watched for a while and rolled back automatically if errors, 429s or latency get worse.</p>
+<p>The list is not limited by the time range; the range in the top bar filters the History card by when an action happened (All shows every action).</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["list"] }}
+{{ cards["history"] }}
+{{ cards["rules"] }}
+{{ cards["engine"] }}
+{{ cards["preview-settings"] }}
+{% endblock %}

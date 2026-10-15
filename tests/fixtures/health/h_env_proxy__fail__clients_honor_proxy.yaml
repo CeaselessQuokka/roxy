@@ -1,0 +1,18 @@
+format: roxy.health_fixture/1
+check: H-ENV-PROXY
+case: fail
+name: clients_honor_proxy
+description: >
+  HTTPS_PROXY is set and the outbound clients are built with trust_env true, so Roblox traffic (including the
+  credential path) would go through a proxy Roxy does not control. 13.2 H-ENV-PROXY: clients honoring them
+  gives fail.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    HTTPS_PROXY: "http://proxy.test:3128"
+    clients_trust_env: true
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {present: true}
+  credential_calls: {eq: 0}

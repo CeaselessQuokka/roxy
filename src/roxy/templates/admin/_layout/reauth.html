@@ -1,0 +1,41 @@
+{#-
+  "Confirm it is you": the fresh second factor dialog (plan 9.6, DESIGN.md 13.1 `reauth_required`).
+
+  Sensitive actions (an admin security or credential setting, the credential replace, full exports, passkeys)
+  need a second factor entered within `admin_reauth_window_s`. When the server answers 403 `reauth_required`
+  (header `Roxy-Reauth: required`), static/js/reauth.js opens this dialog on top of whatever is open, posts the code
+  to `POST /admin/api/v1/auth/reauth` (`{method: "totp" or "recovery", code}`), takes the rotated CSRF token from
+  the answer, and retries the refused request once. A wrong code answers the same 404 as every second factor
+  failure (uniform failure), so the dialog can only say the code did not work.
+  Accessible authentication (WCAG 3.3.8): the code field accepts paste and the browser's one-time-code autofill;
+  no puzzle, no memory test. Context: `urls.reauth`.
+-#}
+{% from "components/icon.html" import icon %}
+{% set u = urls if urls is defined and urls else {} %}
+<dialog class="dialog reauth" id="reauth" aria-labelledby="reauth-title" aria-describedby="reauth-desc" data-reauth-url="{{ u.reauth or '/admin/api/v1/auth/reauth' }}">
+  <form class="dialog__form" data-reauth-form novalidate>
+    <header class="dialog__head">
+      <h2 class="dialog__title" id="reauth-title">{{ icon("lock", cls="dialog__title-icon") }}Confirm it is you</h2>
+      <button type="button" class="icon-btn" data-reauth-cancel aria-label="Cancel">{{ icon("x") }}</button>
+    </header>
+    <div class="dialog__body">
+      <p id="reauth-desc">This action changes something sensitive, so Roxy asks for your second factor again. Nothing has been changed yet; it will be done as soon as the code is accepted.</p>
+      <fieldset class="reauth__method">
+        <legend class="field__label">Use</legend>
+        <label class="radio"><input type="radio" name="method" value="totp" checked><span>A code from your authenticator app</span></label>
+        <label class="radio"><input type="radio" name="method" value="recovery"><span>A recovery code</span></label>
+      </fieldset>
+      <div class="field">
+        <label class="field__label" for="reauth-code">Code</label>
+        <input class="input mono reauth__code" id="reauth-code" name="code" inputmode="numeric" autocomplete="one-time-code"
+               spellcheck="false" autocapitalize="off" maxlength="64" required aria-required="true" aria-describedby="reauth-hint reauth-error">
+        <p class="field__hint" id="reauth-hint">Six digits from the app, or one of your recovery codes. Pasting is fine.</p>
+      </div>
+      <p class="dialog__error" id="reauth-error" data-reauth-error role="alert" hidden></p>
+    </div>
+    <footer class="dialog__foot">
+      <button type="button" class="btn btn--ghost" data-reauth-cancel>Cancel</button>
+      <button type="submit" class="btn btn--primary">{{ icon("check") }}<span>Confirm</span></button>
+    </footer>
+  </form>
+</dialog>

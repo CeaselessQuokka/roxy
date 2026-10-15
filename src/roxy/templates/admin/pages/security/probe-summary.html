@@ -1,0 +1,10 @@
+{#-
+  Security page, card `probe-summary` (`roxy/admin/pages/security.py probe_summary_card`): probes grouped by
+  signature in the range (v1 "Exploit / Probe Summary", plan 14.1 row 28; v1 bug B19 fixed: the probed address is
+  not part of the signature). Each signature links to the probe log filtered by it. Context: `frame`, `table`,
+  `part`, `reset_href`, `range`.
+-#}
+{% from "admin/pages/security/_macros.html" import table_card, reset_action %}
+{% call table_card(frame, table, part, subtitle=range.description, actions=reset_action(reset_href, "probe records")) %}
+<p class="security-intro">Kept apart from the probe log above it: a flood of one kind of probe stays one line here. Open a signature to see its probes.</p>
+{% endcall %}

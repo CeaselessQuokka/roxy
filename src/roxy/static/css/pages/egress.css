@@ -1,0 +1,103 @@
+/*
+ * The Egress page (templates/admin/pages/egress*): usage tiles, the budget, the rotator and the leak guard.
+ *
+ * What this is
+ *   Layout for the page's own pieces: one usage tile per egress, the budget's projection sentence and cycle facts,
+ *   the provider figure form, the rotator card and the leak guard's trip blocks. The gauges, stat tiles and stacked small
+ *   tables are shared (static/css/components.css, page pieces).
+ * Why it exists
+ *   Plan 14.4 and 14.8: tokens only, both themes, and no sideways scroll on a phone.
+ * How it works
+ *   Auto-fill grids fall back to one column on a phone; long values break inside their cells.
+ * What to read next
+ *   static/css/pages/upstream.css, templates/admin/pages/egress.html.
+ */
+
+/* ------------------------------------------------------------------------------------------- the Egress page */
+
+.g3-egress-usage {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-4);
+}
+
+.g3-usage {
+  display: grid;
+  align-content: start;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.g3-usage__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.g3-usage__head .badge {
+  max-width: 100%;
+  white-space: normal;
+}
+
+.g3-usage__title {
+  margin: 0;
+  font-size: var(--fs-3);
+}
+
+.g3-usage__bytes {
+  margin: 0;
+  font-size: var(--fs-5);
+  font-variant-numeric: tabular-nums;
+}
+
+.g3-usage__about {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+}
+
+.g3-usage .kv,
+.g3-cycle,
+.g3-rotator .kv,
+.g3-trip .kv {
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+}
+
+.g3-cycle {
+  margin-bottom: var(--sp-3);
+}
+
+.g3-rotator {
+  display: grid;
+  gap: var(--sp-3);
+}
+
+.g3-rotator__state {
+  margin: 0;
+}
+
+.g3-trip {
+  display: grid;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+
+.g3-reveal {
+  margin-top: var(--sp-2);
+}
+
+@media (max-width: 480px) {
+  .g3-usage .kv,
+  .g3-cycle,
+  .g3-rotator .kv,
+  .g3-trip .kv {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

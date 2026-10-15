@@ -1,0 +1,12 @@
+{#-
+  Icon macro.
+
+  What: `icon("bell")` renders one icon from the inline sprite in admin/_layout/icons.html.
+  Why: icons are decoration next to words, so by default they are hidden from screen readers (`aria-hidden`); pass
+  `label` only when an icon stands alone and must be announced (most icon-only buttons put the label on the button
+  with `aria-label` instead, which is preferred).
+  How: an <svg> with one <use href="#i-NAME">; size and color come from CSS (`.icon`, plus an optional class).
+-#}
+{% macro icon(name, label=None, cls="") -%}
+<svg class="icon{% if cls %} {{ cls }}{% endif %}" {% if label %}role="img" aria-label="{{ label }}"{% else %}aria-hidden="true"{% endif %} focusable="false"><use href="#i-{{ name }}"></use></svg>
+{%- endmacro %}

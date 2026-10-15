@@ -1,0 +1,61 @@
+{#-
+  Security page, card `passkeys` (`roxy/admin/pages/security.py passkeys_card`): your passkeys (plan 9.5: optional;
+  the TOTP second factor stays required, owner decision D5), never their key material. Rename and Delete post to the
+  Security API and need a fresh second factor ("Confirm it is you" asks for it, then the action runs). "Add a
+  passkey" is static/js/pages/security.js: it asks `auth/passkeys/register/options`, lets the browser create the
+  passkey (WebAuthn) and sends it to `auth/passkeys/register/verify`. Passkey names are typed by an admin and shown
+  as text. Context: `frame`, `passkeys`, `max`, `full`, `options_url`, `verify_url`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/format.html" import caller_text, num %}
+{% from "components/icon.html" import icon %}
+{% from "admin/pages/security/_macros.html" import when %}
+{% call page_card(frame, subtitle=num(passkeys|length) ~ " of " ~ max ~ " passkeys") %}
+<p class="security-intro">A passkey signs you in with your device's fingerprint, face or PIN instead of a code. It is optional: your authenticator app keeps working either way.</p>
+{% if passkeys %}
+<ul class="passkey-list" role="list">
+  {% for p in passkeys %}
+  <li class="passkey" data-passkey="{{ p.id }}">
+    <div class="passkey__head">
+      <p class="passkey__name">{{ icon("key") }}{{ caller_text(p.name, 64) }}</p>
+      <p class="passkey__meta muted">Added {{ p.created.text if p.created else "n/a" }}; last used {{ p.used.text if p.used else "never" }}</p>
+    </div>
+    <details class="details-plain passkey__rename">
+      <summary>Rename</summary>
+      <form class="cluster passkey__form" data-api-form data-api-url="{{ p.rename_url }}" data-api-method="PATCH" data-success="The passkey was renamed."
+            data-on-success="refresh" data-refresh="passkeys" novalidate>
+        <div class="field">
+          <label class="field__label" for="passkey-{{ p.id }}-name">New name</label>
+          <input class="input" id="passkey-{{ p.id }}-name" name="name" value="{{ p.name }}" maxlength="64" required autocomplete="off" data-json="string"
+                 aria-describedby="passkey-{{ p.id }}-name-error">
+          <p class="field__error" id="passkey-{{ p.id }}-name-error" data-field-error="name" hidden></p>
+        </div>
+        <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+        <button type="submit" class="btn btn--sm btn--primary" data-action="passkey-rename">Save the name</button>
+      </form>
+    </details>
+    <button type="button" class="btn btn--sm btn--ghost" data-dialog-open="dlg-passkey-{{ p.id }}" data-action="passkey-delete">{{ icon("x") }}<span>Delete</span><span class="sr-only"> {{ p.name }}</span></button>
+    {{ confirm_dialog("dlg-passkey-" ~ p.id, "Delete this passkey?", action=p.rename_url, method="delete", api=True, danger=True,
+                      confirm_label="Delete the passkey",
+                      consequences=["This passkey can no longer sign you in; the device keeps it until you remove it there.",
+                                    "Your authenticator app and other passkeys keep working.",
+                                    "You will be asked for your second factor first."],
+                      success="The passkey was deleted.", on_success="refresh", refresh="passkeys") }}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted security-intro">You have no passkey yet.</p>
+{% endif %}
+<form class="passkey-add stack" data-passkey-add data-options-url="{{ options_url }}" data-verify-url="{{ verify_url }}" novalidate>
+  <div class="field">
+    <label class="field__label" for="passkey-add-name">Name for a new passkey</label>
+    <input class="input" id="passkey-add-name" name="name" maxlength="64" value="Passkey" autocomplete="off" aria-describedby="passkey-add-status">
+  </div>
+  <div class="cluster">
+    <button type="submit" class="btn btn--primary" data-action="passkey-add"{% if full %} disabled{% endif %}>{{ icon("plus") }}<span>Add a passkey</span></button>
+  </div>
+  <p class="muted passkey-add__status" id="passkey-add-status" data-passkey-status role="status">{% if full %}You have the most passkeys allowed; delete one to add another.{% endif %}</p>
+</form>
+{% endcall %}

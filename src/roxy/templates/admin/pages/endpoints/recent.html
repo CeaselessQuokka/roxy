@@ -1,0 +1,37 @@
+{#-
+  Endpoints page, card `recent` (`roxy/admin/pages/endpoints.py recent_card`; v1's "Inspect" of Top Endpoints).
+
+  The latest requests of one endpoint template (the busiest of the range unless another is chosen in the small
+  form, which asks this card's fragment again), from the live records of every worker (the last 15 minutes). The
+  template is caller text: it is an option's text and value (never markup), and it reaches a link only
+  URL-encoded, through `local_href`. Context: `frame`, `chosen`, `options`, `rows`, `notice`, `detail_href`,
+  `live_href`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import local_href %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/icon.html" import icon %}
+{% from "admin/pages/endpoints/_requests.html" import request_table %}
+{% call page_card(frame, notices=[notice] if notice else []) %}
+{% if options %}
+<form class="card-controls ep-controls" hx-get="{{ frame.fragment_url }}" hx-target="#{{ frame.id }}" hx-swap="outerHTML" hx-trigger="change">
+  <label class="chip-select ep-controls__select">
+    <span class="chip-select__label">Endpoint</span>
+    <select id="endpoints-recent-template" name="template" aria-label="Whose recent requests to show (the busiest endpoints of this range)">
+      {% for value, text in options %}<option value="{{ value }}"{% if value == chosen %} selected{% endif %}>{{ text }}</option>{% endfor %}
+    </select>
+  </label>
+  {% set detail = local_href(detail_href) %}{% set live = local_href(live_href) %}
+  {% if detail %}<a class="btn btn--sm btn--ghost" href="{{ detail }}">{{ icon("endpoints") }}<span>Open its drill-down</span></a>{% endif %}
+  {% if live %}<a class="btn btn--sm btn--ghost" href="{{ live }}">{{ icon("live") }}<span>Watch it live</span></a>{% endif %}
+</form>
+{% endif %}
+{% if rows %}
+{{ request_table(rows, "endpoints-recent", "The latest requests of the chosen endpoint, newest first") }}
+<p class="muted ep-note">Live records are kept 15 minutes (at most 50 a second per worker); open a request for its trace and, when it was captured, its headers and bodies.</p>
+{% elif chosen %}
+{{ empty_state("No recent requests for this endpoint", "Live records are kept for 15 minutes. Requests to this endpoint appear here as soon as callers send them.", "inbox") }}
+{% else %}
+{{ empty_state("No endpoints in this range", "Once callers send requests, the busiest endpoint's latest requests are listed here.", "endpoints") }}
+{% endif %}
+{% endcall %}

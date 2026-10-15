@@ -1,0 +1,29 @@
+format: roxy.health_fixture/1
+check: H-DB-INTEGRITY
+case: fail
+name: hot_index_error
+description: >
+  `PRAGMA quick_check` on hot.db reports a damaged index; control.db is fine. 13.2 H-DB-INTEGRITY: errors give
+  fail, with the "Database corrupt" runbook as the fix. The variant puts the error in control.db instead.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  databases:
+    quick_check:
+      control: "ok"
+      hot: "row 3 missing from index limiter_updated_at"
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)database|corrupt"}
+  credential_calls: {eq: 0}
+variants:
+  - case: fail
+    name: control_page_error
+    inputs:
+      databases:
+        quick_check:
+          control: "*** in database main *** Page 12: btreeInitPage() returns error code 11"
+          hot: "ok"
+    expect:
+      status: fail
+      explanation: {present: true}

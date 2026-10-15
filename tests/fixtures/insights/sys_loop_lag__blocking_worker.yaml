@@ -1,0 +1,98 @@
+# SYS-LOOP-LAG: "p99 loop lag > 100 ms for 5 min" (11.5; insight_sys_loop_lag_p99_ms = 100,
+# insight_sys_loop_lag_window_min = 5).
+#
+# Loop lag per stretch comes from `state.workers[].history` (worker_heartbeat keeps only the latest value). Worker
+# 4201 has had a p99 loop lag of 130 ms for the last 6 minutes (12 ms before): something is blocking its event loop,
+# for example a large capture being compressed inline. Worker 4202 is fine at 10 ms. CPU is moderate (55%), so this
+# is blocking, not saturation.
+#
+# Reading used: "for 5 min" means every minute of the last window_min minutes is above the threshold (sustained).
+#   - default window (5 min): the last 5 minutes are all at 130 ms; a 5 minute p99 or average is also 130 ms
+#   - variant window_raised (30 min): 24 of those minutes were at 12 ms, so the lag was not above 100 ms for 30
+#     minutes, and the 30 minute average (33.6 ms) is under 100 too. (A rule that took the p99 of all samples in the
+#     30 minutes would still see 130 ms; that reading ignores "for", and this variant is written against it.)
+#
+# 11.5's change: "find blocking code (link to the slow-path log); lower capture body sizes": a `manual` step, or a
+# smaller capture_max_body. Never safe_auto.
+
+format: roxy.insight_fixture/1
+rule: SYS-LOOP-LAG
+case: blocking_worker
+description: >
+  One worker's p99 event loop lag has been 130 ms for 6 minutes while its CPU is moderate. SYS-LOOP-LAG must raise a
+  manual investigation (or a smaller capture body limit), never a larger one, and not as safe to auto-apply.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  workers:
+    - pid: 4201
+      started_at: "-1d"
+      last_seen: "-2s"
+      requests: 920000
+      proxied: 610000
+      loop_lag_ms_p99: 130
+      open_conns: 120
+      worker_id: "roxy-test:4201:0a1b2c3d"
+      hostname: "roxy-test"
+      color: green
+      master_pid: 4200
+      is_leader: 1
+      x_cpu_pct: 55
+      history:
+        - {window: ["-60m", "-6m"], cpu_pct: 45, loop_lag_ms_p99: 12, open_conns: 110}
+        - {window: ["-6m", "0m"], cpu_pct: 55, loop_lag_ms_p99: 130, open_conns: 120}
+    - pid: 4202
+      started_at: "-1d"
+      last_seen: "-1s"
+      requests: 905000
+      proxied: 600000
+      loop_lag_ms_p99: 10
+      open_conns: 115
+      worker_id: "roxy-test:4202:4e5f6a7b"
+      hostname: "roxy-test"
+      color: green
+      master_pid: 4200
+      is_leader: 0
+      x_cpu_pct: 44
+      history:
+        - {window: ["-60m", "0m"], cpu_pct: 44, loop_lag_ms_p99: 10, open_conns: 112}
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-LOOP-LAG
+      severity: any
+      family: system
+      confidence: medium
+      safe_auto: false
+      changes_required:
+        - any_of:
+            - {kind: manual}
+            - {kind: setting, key: capture_max_body, current: 16384, proposed: {lt: 16384}}
+      changes_forbidden:
+        - {kind: setting, key: capture_max_body, proposed: {gt: 16384}}
+        - {kind: setting, key: {in: [allowed_requests_per_minute, global_bucket_per_min, request_timeout]}}
+      change_kinds_forbidden: [bucket_override, rule_upsert, rule_delete, ban_add, bypass_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_loop_lag_enabled: 0}
+    expect: {fires: false}
+  - case: p99_ms_raised
+    description: At 150 ms the 130 ms lag is acceptable.
+    settings: {insight_sys_loop_lag_p99_ms: 150}
+    expect: {fires: false}
+  - case: window_raised
+    description: Thirty minutes of lag are required and it has lasted six.
+    settings: {insight_sys_loop_lag_window_min: 30}
+    expect: {fires: false}
+  - case: severity_override_info
+    description: insight_sys_loop_lag_severity replaces the computed severity.
+    settings: {insight_sys_loop_lag_severity: info}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: info}

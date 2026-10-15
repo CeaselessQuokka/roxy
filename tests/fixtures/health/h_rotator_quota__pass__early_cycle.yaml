@@ -1,0 +1,42 @@
+format: roxy.health_fixture/1
+check: H-ROTATOR-QUOTA
+case: pass
+name: early_cycle
+description: >
+  Quota 20 GB per month, billing day 1, ui_timezone UTC (so day rows are UTC days). Six and a half days into the
+  October cycle the rotator has used 2.65 GB at about 0.4 GB per day: 87% remains, and the projection for the
+  cycle is about 12.4 GB, no overrun. 13.2 H-ROTATOR-QUOTA: over 30% remaining and no projected overrun gives
+  pass (also when "remaining" is read as the projected remainder at cycle end, 38%). The variant sets the quota
+  to 0, the shipped "unknown" value: there is nothing to compare with, so the check reports n/a (assumption;
+  13.2 lists no n/a for this check).
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    rotator_enabled: 1
+    rotator_weight: 25
+    rotator_quota_gb_per_month: 20
+    rotator_billing_day: 1
+    rotator_price_per_gb_usd: 3
+    ui_timezone: "UTC"
+  state:
+    egress:
+      usage:
+        - &day400 {egress: rotator, granularity: day, at: "2026-10-01", requests: 40000, req_bytes: 8000000, resp_bytes: 392000000, overhead_bytes: 0}
+        - {<<: *day400, at: "2026-10-02"}
+        - {<<: *day400, at: "2026-10-03"}
+        - {<<: *day400, at: "2026-10-04"}
+        - {<<: *day400, at: "2026-10-05"}
+        - {<<: *day400, at: "2026-10-06"}
+        - {egress: rotator, granularity: day, at: "2026-10-07", requests: 25000, req_bytes: 5000000, resp_bytes: 245000000, overhead_bytes: 0}
+expect:
+  status: pass
+  value: {gt: 30}
+  credential_calls: {eq: 0}
+variants:
+  - case: "n/a"
+    name: quota_unknown
+    inputs:
+      settings:
+        rotator_quota_gb_per_month: 0
+    expect:
+      status: "n/a"

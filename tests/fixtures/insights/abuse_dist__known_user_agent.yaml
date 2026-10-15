@@ -1,0 +1,88 @@
+# ABUSE-DIST when the swarm's User-Agent text is known (added by the rules_abuse_system author, P10).
+#
+# The same swarm as abuse_dist__distributed_burst (120 addresses with okhttp/4.12.0 on the users endpoint, SPAM-DIST
+# fired three times), but this time the fingerprint view has recorded the User-Agent text, so the hash in the detection
+# subject (4db9c447c8a3cccc = ua_hash("okhttp/4.12.0"), roxy/abuse/bans.py) names it. The rule can then propose the
+# precise remedy of the 11.5 row: a User-Agent rule with global scope, matching that exact text, one shared allowance
+# for every address that sends it (the per-IP allowance, 10 requests per 50 s by default). The Roblox game-server UA
+# is in the fingerprint table too and must never be the subject of a rule.
+
+format: roxy.insight_fixture/1
+rule: ABUSE-DIST
+case: known_user_agent
+description: >
+  A 120-address okhttp swarm trips SPAM-DIST and the fingerprint table holds the okhttp text. ABUSE-DIST must propose a
+  global-scope User-Agent rule for exactly that text, never one that matches the Roblox User-Agent, and no ban.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+  swarm:
+    clients: {cidr: "198.51.100.0/25", count: 120}
+    user_agent: "okhttp/4.12.0"
+    endpoint_template: "users.roblox.com/v1/users/{userId}"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  - {name: swarm_miss, profile: [miss, swarm], window: ["-15m", "0m"], per_minute: 320}
+  - {name: swarm_hit, profile: [hit, swarm], window: ["-15m", "0m"], per_minute: 80}
+
+events:
+  security:
+    - {at: "-11m", type: spam_detected, severity: info, reason_code: SPAM-DIST, endpoint_template: "users.roblox.com/v1/users/{userId}", detail: {detector: SPAM-DIST, subject: "users.roblox.com/v1/users/{userId}|4db9c447c8a3cccc", value: 120, threshold: 50, window_s: 300, action: recommend, configured_action: recommend, game_server: false, evidence: "120 addresses with one User-Agent sent 2000 requests in 300 s"}}
+    - {at: "-6m", type: spam_detected, severity: info, reason_code: SPAM-DIST, endpoint_template: "users.roblox.com/v1/users/{userId}", detail: {detector: SPAM-DIST, subject: "users.roblox.com/v1/users/{userId}|4db9c447c8a3cccc", value: 120, threshold: 50, window_s: 300, action: recommend, configured_action: recommend, game_server: false, evidence: "120 addresses with one User-Agent sent 2000 requests in 300 s"}}
+    - {at: "-1m", type: spam_detected, severity: info, reason_code: SPAM-DIST, endpoint_template: "users.roblox.com/v1/users/{userId}", detail: {detector: SPAM-DIST, subject: "users.roblox.com/v1/users/{userId}|4db9c447c8a3cccc", value: 120, threshold: 50, window_s: 300, action: recommend, configured_action: recommend, game_server: false, evidence: "120 addresses with one User-Agent sent 2000 requests in 300 s"}}
+
+state:
+  client_scores:
+    - {clients: {cidr: "198.51.100.0/25", count: 120}, bot_score: 64}
+    - {clients: {cidr: "203.0.113.0/26", count: 40}, bot_score: 8}
+  raw:
+    metrics:
+      fingerprint_user_agents:
+        - {ua_hash: "fixture-ua-1", user_agent: "okhttp/4.12.0", count: 6000, first_seen: "-15m", last_seen: "-1m"}
+        - {ua_hash: "fixture-ua-2", user_agent: "Roblox/Linux", count: 3000, first_seen: "-60m", last_seen: "-1m"}
+
+expect:
+  data_checks:
+    - window: ["-5m", "0m"]
+      where: {endpoint_template: "users.roblox.com/v1/users/{userId}"}
+      requests: 2000
+      refused: 0
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: ABUSE-DIST
+      subject_contains: "4db9c447c8a3cccc"
+      severity: any
+      family: abuse
+      confidence: medium
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - any_of:
+            - {kind: filter_add, table: rules_user_agent, proposed: {needle: "okhttp/4.12.0", mode: exact, scope: global}}
+            - {kind: rule_upsert, table: rules_user_agent, proposed: {needle: "okhttp/4.12.0", mode: exact, scope: global}}
+      changes_forbidden:
+        - any_of:
+            - {kind: filter_add, table: rules_user_agent, proposed: {needle: {regex: '(?i)roblox'}}}
+            - {kind: rule_upsert, table: rules_user_agent, proposed: {needle: {regex: '(?i)roblox'}}}
+      change_kinds_forbidden: [ban_add, manual, setting, bypass_add, bucket_override]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_abuse_dist_enabled: 0}
+    expect: {fires: false}

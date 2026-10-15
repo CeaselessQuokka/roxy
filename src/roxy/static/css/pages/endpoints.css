@@ -1,0 +1,317 @@
+/*
+ * The Endpoints page (templates/admin/pages/endpoints*): the recent requests table, the drill-down (in the drawer
+ * and on its own page) and the inline reset.
+ *
+ * What this is
+ *   Layout for the pieces only this page has; the main table, tiles, charts and cards come from components.css.
+ *   Only tokens from tokens.css are used, so both themes follow.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract).
+ * How it works
+ *   The drill-down is narrow in the drawer (560 px) and wide on its page, so its pairs are a grid that collapses
+ *   to one column under 900 px, and its tables scroll inside their own region. Long templates and paths wrap
+ *   anywhere (caller text). Controls grow to the 44 px touch size on a phone (plan 14.8).
+ * What to read next
+ *   static/css/components.css, templates/admin/pages/endpoints/detail.html.
+ */
+
+#recent.page-card--lazy {
+  min-height: 360px;
+}
+
+/* The main table: a template keeps a readable width instead of wrapping every few characters. */
+.dt[data-table="endpoints"] td[data-col="key"] {
+  min-width: 24ch;
+}
+
+/* Ten columns on one screen at 1440 px: a little less space between them than the default table. */
+@media (min-width: 761px) {
+  .dt[data-table="endpoints"] .dt__table th,
+  .dt[data-table="endpoints"] .dt__table td {
+    padding-inline: var(--sp-2);
+  }
+}
+
+.card-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-3);
+}
+
+.ep-controls__select {
+  max-width: 100%;
+}
+
+.ep-controls__select select {
+  min-width: 0;
+  max-width: min(48ch, 70vw);
+  text-overflow: ellipsis;
+}
+
+.ep-note {
+  margin-top: var(--sp-3);
+  font-size: var(--fs-1);
+}
+
+/* The request tables (recent card and drill-down). */
+.ep-requests {
+  container: ep-requests / inline-size;
+}
+
+.ep-requests__table {
+  width: 100%;
+  min-width: 760px;
+}
+
+.ep-requests__table th[scope="row"] {
+  font-weight: var(--fw-regular);
+  white-space: nowrap;
+}
+
+.ep-requests__url {
+  min-width: 24ch;
+  max-width: 40ch;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* A table cell ignores max-width, so the User-Agent is bounded by a block inside it; it wraps (the simple table
+   keeps its cells on one line otherwise). */
+.ep-requests__clip {
+  display: block;
+  max-width: 24ch;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* A narrow region (a phone, or the drawer) turns the request tables into small cards: when (opens the drawer),
+   the request, its status and outcome, the client. The cache state, the time taken and the User-Agent are in the
+   request drawer (plan 14.8). A container query, so the drawer on a wide screen gets the same cards. */
+@container ep-requests (max-width: 700px) {
+  .ep-requests__table {
+    min-width: 0;
+  }
+
+  .ep-requests__table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .ep-requests__table tbody,
+  .ep-requests__table tr {
+    display: block;
+  }
+
+  .ep-requests__table tbody tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) max-content;
+    gap: var(--sp-1) var(--sp-3);
+    padding: var(--sp-3) 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .ep-requests__table tbody th,
+  .ep-requests__table tbody td {
+    display: block;
+    padding: 0;
+    border: 0;
+    text-align: start;
+  }
+
+  .ep-requests__when {
+    grid-column: 1 / -1;
+  }
+
+  .ep-requests__when .link-btn {
+    min-height: var(--target-touch);
+  }
+
+  .ep-requests__url {
+    grid-column: 1;
+    min-width: 0;
+    max-width: none;
+  }
+
+  .ep-requests__status {
+    grid-column: 2;
+    text-align: end;
+  }
+
+  .ep-requests__outcome,
+  .ep-requests__client {
+    grid-column: 1 / -1;
+  }
+
+  .ep-requests__table .ep-requests__cache,
+  .ep-requests__table .ep-requests__took,
+  .ep-requests__table .ep-requests__ua {
+    display: none;
+  }
+}
+
+/* The drill-down. */
+.ep-detail__head {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.ep-detail__name {
+  overflow-wrap: anywhere;
+  font-size: var(--fs-3);
+}
+
+.ep-detail__notice {
+  margin: 0;
+}
+
+/* Links inside sentences and lists are underlined: color is never the only sign of a link (WCAG 1.4.1). */
+.ep-detail a:not(.btn) {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.ep-detail__section {
+  display: grid;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+
+.ep-detail__heading {
+  font-size: var(--fs-3);
+}
+
+.ep-detail__subheading {
+  margin-bottom: var(--sp-2);
+  font-size: var(--fs-2);
+}
+
+.ep-detail__tiles {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.drawer .ep-detail__tiles {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ep-detail__charts,
+.ep-detail__pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-5);
+}
+
+.ep-detail__list {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding-left: var(--sp-5);
+  overflow-wrap: anywhere;
+}
+
+.ep-detail__target {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.ep-detail__target-name {
+  margin-bottom: var(--sp-2);
+  overflow-wrap: anywhere;
+}
+
+.ep-detail__paths td:first-child {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* In the narrow drawer everything stacks. */
+.drawer .ep-detail__charts,
+.drawer .ep-detail__pair {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* The Live page's request drawer, opened from the request tables (the rules live.css has for it there). */
+.lv-request__lead {
+  overflow-wrap: anywhere;
+  font-size: var(--fs-3);
+}
+
+.lv-request__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.lv-request__section {
+  display: grid;
+  gap: var(--sp-2);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.lv-request__heading {
+  font-size: var(--fs-3);
+}
+
+.lv-request__list {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding-left: var(--sp-5);
+}
+
+.lv-request__part > summary {
+  min-height: var(--target-min);
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+}
+
+.lv-request__headers {
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+  font-size: var(--fs-1);
+}
+
+.lv-request__body {
+  max-height: 360px;
+  overflow: auto;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-size: var(--fs-1);
+}
+
+@media (max-width: 1100px) {
+  .ep-detail__tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .ep-detail__charts,
+  .ep-detail__pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .card-controls .chip-select,
+  .card-controls select,
+  .card-controls .btn,
+  .ep-detail__actions .btn {
+    min-height: var(--target-touch);
+  }
+
+  .card-controls .chip-select {
+    flex: 1 1 100%;
+  }
+
+  .card-controls select {
+    flex: 1;
+    max-width: none;
+  }
+}

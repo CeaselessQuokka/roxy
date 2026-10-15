@@ -1,0 +1,75 @@
+# roxy-audit.service: the root permission audit behind health check H-SECRETS-PERMS (plan 17.1).
+#
+# Runs /usr/local/lib/roxy/roxy-audit.py (source: deploy/tools/roxy-audit.py) every 6 hours (roxy-audit.timer) and
+# after each deploy (roxy-audit.path). It checks the owner and mode of the credential files, the env files, the
+# backup directory, the databases, the root wrappers and the sudo rules, records the `systemd-analyze security`
+# exposure score of both colors, and writes /var/lib/roxy/audit/perms.json (0640 root:roxy) for the app to show.
+# It reads only metadata, never file contents. Every directive says why it is here.
+
+[Unit]
+# Shown in `systemctl list-units`.
+Description=Roxy permission audit
+# A failing audit is itself worth an email.
+OnFailure=roxy-alert@%n.service
+
+[Service]
+# Runs to completion and exits.
+Type=oneshot
+# The system Python in isolated mode, from the root-owned tools directory (never from a release).
+ExecStart=/usr/bin/python3 -I /usr/local/lib/roxy/roxy-audit.py
+# Root, because only root can see the metadata of /etc/roxy/credentials (0700) and /var/backups/roxy (0700).
+User=root
+# Reading directory listings and file metadata of other users needs CAP_DAC_READ_SEARCH; giving perms.json and its
+# directory the group roxy needs CAP_CHOWN, and creating (or moving aside) the root-owned audit/ directory inside
+# the roxy-owned state directory needs CAP_DAC_OVERRIDE and CAP_FOWNER. Nothing else.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+# Everything read-only except where the report is written.
+ProtectSystem=strict
+# The only writable path: the state directory, which holds the report directory audit/. The "-" makes it optional:
+# before the first deploy has started a color it may not exist, and a missing path would fail the unit (status
+# 226) and send a false alert; the audit then reports the missing directory instead of writing a report.
+ReadWritePaths=-/var/lib/roxy
+# /home stays invisible.
+ProtectHome=yes
+# A private /tmp.
+PrivateTmp=yes
+# No hardware devices.
+PrivateDevices=yes
+# No privilege escalation.
+NoNewPrivileges=yes
+# No kernel tunables.
+ProtectKernelTunables=yes
+# No kernel modules.
+ProtectKernelModules=yes
+# No kernel log.
+ProtectKernelLogs=yes
+# The cgroup tree is read-only.
+ProtectControlGroups=yes
+# No clock changes.
+ProtectClock=yes
+# No hostname changes.
+ProtectHostname=yes
+# Unix sockets only: systemd-analyze talks to systemd over D-Bus; the audit never uses the network.
+RestrictAddressFamilies=AF_UNIX
+# No new namespaces.
+RestrictNamespaces=yes
+# No realtime scheduling.
+RestrictRealtime=yes
+# No setuid or setgid files.
+RestrictSUIDSGID=yes
+# The execution domain cannot be changed.
+LockPersonality=yes
+# No writable and executable memory.
+MemoryDenyWriteExecute=yes
+# Normal service system calls only.
+SystemCallFilter=@system-service
+# Native system call ABI only.
+SystemCallArchitectures=native
+# The report is written with an explicit mode; anything else stays private.
+UMask=0077
+# A short job on a small box.
+MemoryMax=100M
+# A stuck audit fails and alerts instead of hanging.
+TimeoutStartSec=300
+# The journal tag.
+SyslogIdentifier=roxy-audit

@@ -1,0 +1,35 @@
+format: roxy.health_fixture/1
+check: H-WAL
+case: pass
+name: small_wal_files
+description: >
+  The largest WAL file is metrics.db-wal at 40 MiB and the four together hold 52 MiB, so every reading of "WAL
+  sizes" (largest file or total) is under 64 MiB. 13.2 H-WAL: under 64 MiB gives pass. The variant is the edge
+  case after checkpoints: metrics.db-wal at 63 MiB and the others truncated to 0.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    disk:
+      total_bytes: 40000000000
+      free_bytes: 20000000000
+      files:
+        "control.db": {bytes: 60000000, wal_bytes: 4194304}
+        "hot.db": {bytes: 8000000, wal_bytes: 4194304}
+        "metrics.db": {bytes: 2000000000, wal_bytes: 41943040}
+        "cache.db": {bytes: 500000000, wal_bytes: 4194304}
+expect:
+  status: pass
+  credential_calls: {eq: 0}
+variants:
+  - case: pass
+    name: largest_63_mib
+    inputs:
+      state:
+        disk:
+          files:
+            "control.db": {wal_bytes: 0}
+            "hot.db": {wal_bytes: 0}
+            "metrics.db": {wal_bytes: 66060288}
+            "cache.db": {wal_bytes: 0}
+    expect:
+      status: pass

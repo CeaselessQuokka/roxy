@@ -1,0 +1,201 @@
+"""The dashboard shell in a real browser (P11 core): every page's frame, the controls in it, and the shared flows.
+
+What this is
+    Browser tests against the real app (`dashboard`, tests/e2e/conftest.py) for what every page shares (each page's
+    own file checks it clean, axe clean in both themes at both sizes and without sideways scroll; the "coming soon"
+    placeholder these tests used to check is gone, every page is built): the command palette jumps to a page and
+    offers the LLM export actions; the pause dialog pauses and resumes the proxy through the API; one change reported
+    twice (the form's own reload and the shell's status check) reloads the page once; the inline editor
+    of `pause_message_default` in that dialog reviews and saves the setting; the preferences dialog saves the
+    admin's own preferences; and a change that needs a fresh second factor asks for the code ("Confirm it is you")
+    and then goes through, on the reference page's revert form.
+
+Why it exists
+    The page builders reuse all of this without touching it; these tests are what lets them trust it.
+
+What to read next
+    tests/e2e/test_page_audit.py, static/js/api_forms.js, static/js/settings_api.js, static/js/reauth.js.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pages_harness import SESSION_COOKIE_NAME
+
+
+def test_the_palette_jumps_to_a_page_and_offers_the_llm_export(open_admin: Any) -> None:
+    admin = open_admin("/admin/overview")
+    page = admin.page
+    page.keyboard.press("Control+k")
+    admin.wait("document.querySelector('#palette[open]') !== null")
+    for item in ("#pal-act-llm-copy", "#pal-act-llm-json", "#pal-act-llm-schema", "#pal-act-health"):
+        assert page.locator(item).count() == 1, item
+    assert page.locator("#pal-act-llm-copy").get_attribute("data-url") == "/admin/api/v1/export/llm?format=text"
+    page.keyboard.type("audit")
+    admin.wait("document.querySelector('#pal-page-audit') && !document.querySelector('#pal-page-audit').hidden")
+    page.keyboard.press("Enter")
+    page.wait_for_url("**/admin/audit")
+    admin.settle()
+    admin.assert_clean()
+
+
+def test_copy_for_llm_puts_the_summary_on_the_clipboard(open_admin: Any, dashboard: Any) -> None:
+    admin = open_admin("/admin/audit")
+    page = admin.page
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=dashboard.base_url)
+    page.keyboard.press("Control+k")
+    admin.wait("document.querySelector('#palette[open]') !== null")
+    page.keyboard.type("copy for llm")
+    page.locator("#pal-act-llm-copy").click()
+    admin.wait("document.querySelector('.toast') !== null")
+    text = page.evaluate("navigator.clipboard.readText()")
+    assert len(text) > 100
+    assert "Roxy" in text
+    admin.assert_clean()
+
+
+def test_the_pause_dialog_pauses_and_resumes_through_the_api(open_admin: Any, dashboard: Any) -> None:
+    admin = open_admin("/admin/audit")
+    page = admin.page
+    try:
+        page.locator(".topbar__pause").click()
+        admin.wait("document.querySelector('#dlg-pause[open]') !== null")
+        assert admin.axe() == []
+        page.fill("#dlg-pause-message", "Back after a short test")
+        with page.expect_navigation():
+            page.locator('#dlg-pause .dialog__foot button[type="submit"]').click()
+        admin.settle()
+        assert dashboard.api("GET", "protection/pause").json()["paused"] is True
+        assert "Resume" in page.locator(".topbar__pause").inner_text()
+        assert "Back after a short test" in page.locator("body").inner_text()  # the pause banner
+        page.locator(".topbar__pause").click()
+        admin.wait("document.querySelector('#dlg-pause[open]') !== null")
+        with page.expect_navigation():
+            page.locator('#dlg-pause .dialog__foot button[type="submit"]').click()
+        admin.settle()
+        assert dashboard.api("GET", "protection/pause").json()["paused"] is False
+        admin.assert_clean()
+    finally:
+        dashboard.api("POST", "protection/pause", json={"paused": False})
+
+
+def test_the_emergency_limit_dialog_shows_a_refused_limit_under_its_field(open_admin: Any, dashboard: Any) -> None:
+    """The API names a refused limit by the body's field (`limit`, not the setting `global_throttle_limit`), so the
+    reason shows in the dialog's box under the field and marks it invalid (finding functional-4; v1 bug B16: a bad
+    limit is reported, never ignored), and nothing is switched on."""
+    admin = open_admin("/admin/audit")
+    page = admin.page
+    page.locator(".topbar__limit").click()
+    admin.wait("document.querySelector('#dlg-throttle-all[open]') !== null")
+    page.fill("#dlg-limit-limit", "0")
+    page.locator('#dlg-throttle-all .dialog__foot button[type="submit"]').click()
+    admin.wait("(() => { const box = document.querySelector('#dlg-limit-limit-error'); return box && !box.hidden; })()")
+    assert page.locator("#dlg-limit-limit-error").inner_text().strip()
+    assert page.locator("#dlg-limit-limit").get_attribute("aria-invalid") == "true"
+    described = (page.locator("#dlg-limit-limit").get_attribute("aria-describedby") or "").split()
+    assert "dlg-limit-limit-error" in described
+    assert dashboard.api("GET", "protection/throttle-all").json()["enabled"] is False
+    assert admin.axe() == []
+    admin.assert_clean(expected=["status of 422"])
+
+
+def test_a_change_reported_twice_reloads_the_page_once(open_admin: Any, dashboard: Any) -> None:
+    """A pause from the dialog asked for two reloads: the form's own after the API answered (`api_forms.js`,
+    `data-on-success="reload"`, 300 ms later) and the shell's status check when the stream reported the same change
+    (`shell.js`). In a busy run the second `location.reload()` aborted the navigation of the first (Playwright:
+    `net::ERR_ABORTED`). Both now go through `dom.js reloadPage`, which reloads once: while a reload is pending, the
+    status check starts no other. The second half checks that the status check still reloads on its own."""
+    admin = open_admin("/admin/audit")
+    page = admin.page
+    try:
+        page.evaluate("window.__sameDocument = true")
+        pending = page.evaluate(
+            "import('roxy/dom').then((dom) => { dom.reloadPage({ delayMs: 60000 }); return dom.reloadPending(); })"
+        )
+        assert pending is True
+        assert dashboard.api("POST", "protection/pause", json={"paused": True}).status_code == 200
+        page.wait_for_timeout(3000)  # the settings watcher (1 s) and the stream report the pause well within this
+        assert page.evaluate("window.__sameDocument === true"), "a second reload started while one was pending"
+        admin = open_admin("/admin/audit")  # a fresh page, rendered paused, with no reload pending
+        page = admin.page
+        with page.expect_navigation(timeout=15_000):
+            assert dashboard.api("POST", "protection/pause", json={"paused": False}).status_code == 200
+        admin.settle()
+        assert "Pause" in page.locator(".topbar__pause").inner_text()
+        admin.assert_clean()
+    finally:
+        dashboard.api("POST", "protection/pause", json={"paused": False})
+
+
+def test_the_inline_default_message_editor_reviews_then_saves(open_admin: Any, dashboard: Any) -> None:
+    admin = open_admin("/admin/audit")
+    page = admin.page
+    page.locator(".topbar__pause").click()
+    admin.wait("document.querySelector('#dlg-pause[open]') !== null")
+    page.locator("#dlg-pause details.dialog__extra > summary").click()
+    control = page.locator('#dlg-pause form[data-setting-key="pause_message_default"]')
+    control.locator("[data-setting-input]").fill("Roxy is resting for a moment, try again soon.")
+    control.locator('input[name="reason"]').fill("Browser test of the inline editor")
+    control.locator('button[type="submit"]').click()
+    admin.wait(
+        "document.querySelector('#dlg-pause [data-setting-review]') &&"
+        " !document.querySelector('#dlg-pause [data-setting-review]').hidden"
+    )
+    assert "Roxy is resting" in control.locator("[data-setting-review]").inner_text()
+    assert control.locator("[data-setting-submit-label]").inner_text().strip() == "Save"
+    control.locator('button[type="submit"]').click()
+    admin.wait("document.querySelector('#dlg-pause .setting__saved') !== null")
+    saved = dashboard.api("GET", "settings/pause_message_default").json()["setting"]
+    assert saved["value"] == "Roxy is resting for a moment, try again soon."
+    admin.assert_clean()
+
+
+def test_the_preferences_dialog_saves_my_preferences(open_admin: Any, dashboard: Any) -> None:
+    admin = open_admin("/admin/audit")
+    page = admin.page
+    page.locator(".topbar [data-dialog-open='preferences']").first.dispatch_event("click")
+    admin.wait("document.querySelector('#preferences[open]') !== null")
+    assert admin.axe() == []
+    page.select_option("#pref-range", "7d")
+    page.fill("#pref-tz", "America/New_York")
+    page.locator('#preferences button[type="submit"]').first.click()
+    admin.wait("document.querySelector('.toast') !== null")
+    prefs = dashboard.api("GET", "prefs").json()["prefs"]
+    assert prefs["default_range"] == "7d"
+    assert prefs["timezone"] == "America/New_York"
+    admin.assert_clean()
+    dashboard.api("DELETE", "prefs/default_range")
+    dashboard.api("DELETE", "prefs/timezone")
+
+
+def test_a_change_that_needs_a_fresh_second_factor_asks_for_it_then_goes_through(
+    open_admin: Any, dashboard: Any
+) -> None:
+    dashboard.change_settings({"admin_login_max_failures": 6})
+    changes = dashboard.api(
+        "GET", "audit", params={"action": "setting.update", "target": "setting:admin_login_max_failures"}
+    ).json()
+    entry_id = changes["items"][0]["id"]
+    window = dashboard.api("GET", "settings/admin_reauth_window_s").json()["setting"]["value"]
+    dashboard.clock.advance(int(window) + 1)  # the session lives on (idle timeout 900 s); its factor is old
+    admin = open_admin(f"/admin/audit?entry={entry_id}")
+    page = admin.page
+    try:
+        admin.wait("document.querySelector('#drawer[open] form.audit-revert') !== null")
+        page.fill("#drawer form.audit-revert textarea[name=reason]", "Undo the test change")
+        page.locator('#drawer [data-action="audit-revert"]').click()
+        admin.wait("document.querySelector('#reauth[open]') !== null")
+        assert admin.axe() == []
+        page.fill("#reauth-code", dashboard.next_code())
+        page.locator('#reauth button[type="submit"]').click()
+        admin.wait("document.querySelector('.toast') && /Reverted/.test(document.body.innerText)")
+    finally:
+        # A fresh second factor rotates the session (fixation defense): the browser holds the new cookie now, and
+        # the old one the dashboard fixture used is gone, so the fixture takes the new one for later tests.
+        for cookie in page.context.cookies():
+            if cookie["name"] == SESSION_COOKIE_NAME:
+                dashboard.signed_in.cookie = cookie["value"]
+    value = dashboard.api("GET", "settings/admin_login_max_failures").json()["setting"]["value"]
+    assert int(value) == 5
+    admin.assert_clean(expected=["status of 403"])  # the first attempt, answered reauth_required

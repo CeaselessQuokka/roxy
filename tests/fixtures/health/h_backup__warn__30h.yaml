@@ -1,0 +1,25 @@
+format: roxy.health_fixture/1
+check: H-BACKUP
+case: warn
+name: 30h
+description: >
+  Last night's backup did not run: the newest one is 30 hours old. 13.2 H-BACKUP: under 72 h (and not under
+  26 h) gives warn, with the "Backups" runbook as the fix. The variant is the upper side: 71 h still warns.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  backup: {last_backup_at: "-30h", restore_test: pass}
+expect:
+  status: warn
+  value: {gte: 26, lt: 72}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)backup"}
+  credential_calls: {eq: 0}
+variants:
+  - case: warn
+    name: 71h
+    inputs:
+      backup: {last_backup_at: "-71h"}
+    expect:
+      status: warn
+      value: {gte: 26, lt: 72}
+      explanation: {present: true}

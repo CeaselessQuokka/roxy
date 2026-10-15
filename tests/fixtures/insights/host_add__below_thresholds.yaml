@@ -1,0 +1,93 @@
+# HOST-ADD stays quiet just under both caller tests, and its window really limits what it counts
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: ">= 5 distinct places or 50 distinct IPs in 24 h, and it resolves publicly"
+# (insight_host_add_min_places 5, _min_ips 50, _window_h 24).
+#
+#   adconfiguration.roblox.com (not allowlisted, resolves to 192.0.2.44):
+#     last 6 h:      360 refused requests from 49 distinct IPs and 4 distinct places   <- just under both tests
+#     -29h to -26h:  180 refused requests from 10 other IPs and 2 other places          (outside 24 h)
+#   Over 30 hours: 59 IPs and 6 places, enough for either test.
+
+format: roxy.insight_fixture/1
+rule: HOST-ADD
+case: below_thresholds
+description: >
+  An unknown but public Roblox host was requested by 49 IPs from 4 experiences in the last 24 h: one short of each
+  test, so nothing may fire. Lowering either test by one, or widening the window to 30 h (which adds older
+  callers), must fire it for that host.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  unknown_host: {egress: none, outcome: refused, reason: host_not_allowed, status: 404, source: roxy, cache_state: "NA", latency_ms: {p50: 1, p95: 3, p99: 6}, bytes: {caller_in: 0, caller_out: 19}}
+
+traffic:
+  - name: adconfiguration_recent
+    profile: unknown_host
+    endpoint_template: adconfiguration.roblox.com/v2/sponsored-games
+    host: adconfiguration.roblox.com
+    path: "adconfiguration.roblox.com/v2/sponsored-games"
+    window: ["-6h", "0m"]
+    per_minute: 1
+    clients: {cidr: "198.51.100.0/26", count: 49}
+    places: ["1000000011", "1000000012", "1000000013", "1000000014"]
+  - name: adconfiguration_older
+    profile: unknown_host
+    endpoint_template: adconfiguration.roblox.com/v2/sponsored-games
+    host: adconfiguration.roblox.com
+    path: "adconfiguration.roblox.com/v2/sponsored-games"
+    window: ["-29h", "-26h"]
+    per_minute: 1
+    clients: {cidr: "198.51.100.64/26", count: 10}
+    places: ["1000000015", "1000000016"]
+
+state:
+  dns:
+    "adconfiguration.roblox.com": {answers: ["192.0.2.44"], latency_ms: 18}
+
+expect:
+  data_checks:
+    - window: ["-24h", "0m"]
+      where: {host: adconfiguration.roblox.com}
+      requests: 360
+    - window: ["-30h", "0m"]
+      where: {host: adconfiguration.roblox.com}
+      requests: 540
+  fires: false
+
+variants:
+  - case: min_places_4
+    description: Four places are enough.
+    settings: {insight_host_add_min_places: 4}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "adconfiguration.roblox.com"
+          severity: any
+          safe_auto: false
+          changes_required:
+            - {kind: host_add, proposed: {contains: "adconfiguration.roblox.com"}}
+  - case: min_ips_49
+    description: Forty-nine IPs are enough.
+    settings: {insight_host_add_min_ips: 49}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "adconfiguration.roblox.com", severity: any, safe_auto: false}
+  - case: window_30h
+    description: Over 30 hours the host has 59 IPs and 6 places.
+    settings: {insight_host_add_window_h: 30}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "adconfiguration.roblox.com", severity: any, safe_auto: false}

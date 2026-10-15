@@ -1,0 +1,26 @@
+{#-
+  Clients page, card `activity` (`roxy/admin/pages/clients.py activity_card`): per-client activity records.
+
+  What Roxy keeps per place and per address (minute, hour and day rows, compacted as they age), for how long and
+  how many (the retention and record cap settings, shown with a link to the card where each is changed), and v1's
+  "Clear data" of Callers and Top Talkers: the `activity` reset family through `POST /admin/api/v1/data/resets`,
+  with the typed phrase (one client is reset from its own view instead).
+  Context: `frame`, `kept`, `reset`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import local_href %}
+{% from "admin/pages/cache/_shared.html" import reset_dialog %}
+{% set actions %}<button type="button" class="btn btn--sm btn--ghost" data-dialog-open="{{ reset.id }}" data-action="clients-clear-activity">{{ icon("reset") }}<span>Clear client activity</span></button>{% endset %}
+{% call page_card(frame, actions=actions) %}
+<p class="clients-intro">Roxy counts every request under its place and its address, a minute at a time, and compacts old minutes into hours and days. The tables above read these rows for any range; the oldest are pruned by the retention settings.</p>
+<dl class="kv">
+  {% for item in kept %}
+  {% set href = local_href(item.href) %}
+  <dt>{% if href %}<a href="{{ href }}">{{ item.label }}</a>{% else %}{{ item.label }}{% endif %}</dt>
+  <dd>{{ item.shown }}</dd>
+  {% endfor %}
+</dl>
+<p class="muted clients-note-plain">Change these on the Data page (the links above). To start one client over, open it from a table and use "Reset this client".</p>
+{{ reset_dialog(reset, refresh="places ips activity client-score") }}
+{% endcall %}

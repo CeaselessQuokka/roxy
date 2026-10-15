@@ -1,0 +1,37 @@
+format: roxy.health_fixture/1
+check: H-ROTATOR-SESSION
+case: pass
+name: sticky_then_distinct
+description: >
+  rotator_session_username_template is set, so the check runs: two IP echo requests with one session id both
+  see 198.51.100.31, and a request with a second session id sees 198.51.100.32. 13.2 H-ROTATOR-SESSION: same,
+  then different gives pass. The variant empties the template (the shipped default): sticky sessions are then
+  unavailable (8.2) and the check does not run, stored as n/a without any echo request.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    rotator_enabled: 1
+    rotator_weight: 25
+    rotator_session_mode: sticky_until_429
+    rotator_session_username_template: "{user}__sessid-{session}"
+  upstream:
+    ip_echo:
+      status: 200
+      exit_ip_by_session: ["198.51.100.31", "198.51.100.32"]
+      latency_ms: 500
+      expect_request: {via: rotator, method: GET}
+expect:
+  status: pass
+  calls:
+    ip_echo: {count: 3, via: rotator}
+  credential_calls: {eq: 0}
+variants:
+  - case: "n/a"
+    name: template_empty
+    inputs:
+      settings:
+        rotator_session_username_template: ""
+    expect:
+      status: "n/a"
+      no_calls_to: [ip_echo]
+      credential_calls: {eq: 0}

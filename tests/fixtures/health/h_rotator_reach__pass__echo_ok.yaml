@@ -1,0 +1,26 @@
+format: roxy.health_fixture/1
+check: H-ROTATOR-REACH
+case: pass
+name: echo_ok
+description: >
+  The rotator is enabled and carries traffic (weight 25). The IP echo request through the rotator answers 200
+  in 450 ms and reports exit 198.51.100.23. 13.2 H-ROTATOR-REACH: ok gives pass. The stored value shows the exit
+  IP masked (13.2 "exit IP (masked)"), so the full address must not appear in it. The echo goes through the
+  rotator and nothing goes through the credential.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    rotator_enabled: 1
+    rotator_weight: 25
+  upstream:
+    ip_echo:
+      status: 200
+      exit_ip: "198.51.100.23"
+      latency_ms: 450
+      expect_request: {via: rotator, method: GET}
+expect:
+  status: pass
+  value: {regex: "^(?!.*198\\.51\\.100\\.23)"}
+  calls:
+    ip_echo: {count: 1, via: rotator}
+  credential_calls: {eq: 0}

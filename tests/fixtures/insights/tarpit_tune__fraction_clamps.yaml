@@ -1,0 +1,50 @@
+# TARPIT-TUNE when the capacity fraction, not tarpit_max_concurrent, caps the slots (added by the rules_abuse_system
+# author, P10).
+#
+# The effective cap is min(tarpit_max_concurrent, floor(tarpit_connection_budget x tarpit_max_capacity_fraction))
+# (plan 10.6). Here the budget is the catalog minimum, 100 connections, so the cap is min(50, floor(100 x 0.25) = 25)
+# = 25: the fraction clamps. Raising tarpit_max_concurrent would change nothing.
+#
+#   eligible holds 4,000, holds 3,000, skipped 1,000 = 25% (over 10%); held clients come back after 20 s, unheld
+#   ones after 1.5 s, so holding works
+#   slots needed to hold every eligible refusal: ceil(25 x 4,000 / 3,000) = 34, so the fraction must reach 0.34 (under
+#   its high-risk value 0.4)
+#
+# Tarpit totals come from `state.tarpit` (provider seam); no traffic is needed.
+
+format: roxy.insight_fixture/1
+rule: TARPIT-TUNE
+case: fraction_clamps
+description: >
+  The tarpit skipped 25% of eligible holds and its slots are capped by the connection budget fraction (25 slots), not by
+  tarpit_max_concurrent (50). TARPIT-TUNE must raise tarpit_max_capacity_fraction (to at most 0.4), not
+  tarpit_max_concurrent.
+now: "2026-10-07T15:00:00Z"
+
+settings:
+  tarpit_connection_budget: 100
+
+state:
+  tarpit: {eligible_holds: 4000, skipped: 1000, holds: 3000, gap_with_hold_s: 20.0, gap_without_hold_s: 1.5}
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: TARPIT-TUNE
+      severity: any
+      family: abuse
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: setting, key: tarpit_max_capacity_fraction, current: 0.25, proposed: {gt: 0.25, lte: 0.4}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_tarpit_tune_enabled: 0}
+    expect: {fires: false}
+  - case: skipped_pct_raised
+    description: At 30% the 25% skip rate is acceptable.
+    settings: {insight_tarpit_tune_skipped_pct: 30}
+    expect: {fires: false}

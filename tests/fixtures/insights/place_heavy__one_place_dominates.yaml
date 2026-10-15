@@ -1,0 +1,101 @@
+# PLACE-HEAVY: "a place > 40% of upstream calls over 1 h" (11.5; insight_place_heavy_share_pct = 40,
+# insight_place_heavy_window_min = 60).
+#
+#   place                    upstream calls in the hour       share   last 15 minutes
+#   1000000301 (20 servers)  4,900 (4,800 before 14:40)       57.6%   75 of 975 = 7.7%
+#   1000000302 to 310        3,600 together (400 each)        42.4%
+#
+# Experience 1000000301 ran an event from 14:00 to 14:40 UTC and its servers fetched user profiles at 120 per minute;
+# it has calmed down since. Over the default 60 minute window it has more than 40% of all upstream calls. The
+# variant with a 15 minute window looks only at the quiet part and must not fire.
+#
+# 11.5's change: "enable place limit for it, or a per-place endpoint rule (never an automatic place ban; place ids
+# are claims)". Bans of any kind are forbidden, and the place limit must keep its forger-safe key
+# (place_limit_key = place_prefix; `place` is the high-risk value).
+
+format: roxy.insight_fixture/1
+rule: PLACE-HEAVY
+case: one_place_dominates
+description: >
+  One experience made 57.6% of the upstream calls in the last hour during an in-game event. PLACE-HEAVY must raise one
+  recommendation for that place (a place limit or a per-place endpoint rule), never a ban, and nothing for the nine
+  other places.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  place_301: {clients: {cidr: "203.0.113.0/27", count: 20}, place_id: "1000000301", user_agent: "Roblox/Linux"}
+  other_places:
+    clients: {cidr: "203.0.113.64/26", count: 40}
+    places: ["1000000302", "1000000303", "1000000304", "1000000305", "1000000306", "1000000307", "1000000308", "1000000309", "1000000310"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: p301_event_miss, profile: [miss, place_301], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "-20m"], per_minute: 120}
+  - {name: p301_quiet_miss, profile: [miss, place_301], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-20m", "0m"], per_minute: 5}
+  - {name: p301_hit, profile: [hit, place_301], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 30}
+  - {name: others_miss, profile: [miss, other_places], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 60}
+  - {name: others_hit, profile: [hit, other_places], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 100}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/27", count: 20}, bot_score: 8}
+    - {clients: {cidr: "203.0.113.64/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], upstream_calls: 8500, requests: 16300}
+    - {window: ["-60m", "0m"], where: {place_id: "1000000301"}, upstream_calls: 4900}
+    - {window: ["-60m", "0m"], where: {place_id: "1000000302"}, upstream_calls: 400}
+    - {window: ["-15m", "0m"], upstream_calls: 975}
+    - {window: ["-15m", "0m"], where: {place_id: "1000000301"}, upstream_calls: 75}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: PLACE-HEAVY
+      subject_contains: "1000000301"
+      severity: any
+      family: abuse
+      confidence: medium
+      changes_required:
+        - any_of:
+            - {kind: setting, key: place_limit_enabled, current: 0, proposed: 1}
+            - {kind: rule_upsert, table: rules_endpoint_limit, proposed: {scope: place}}
+            - {kind: filter_add, table: rules_endpoint_limit, proposed: {scope: place}}
+      changes_forbidden:
+        - {kind: setting, key: place_limit_key, proposed: place}
+        - kind: setting
+          key: {in: [allowed_requests_per_minute, global_bucket_per_min, direct_bucket_per_min, endpoint_bucket_default_per_min, host_bucket_default_per_min]}
+        - any_of:
+            - {kind: filter_add, table: {in: [rules_user_agent, rules_header, rules_endpoint_block]}}
+            - {kind: rule_upsert, table: {in: [rules_user_agent, rules_header, rules_endpoint_block]}}
+      change_kinds_forbidden: [ban_add, ban_remove, bucket_override, bypass_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_place_heavy_enabled: 0}
+    expect: {fires: false}
+  - case: share_pct_raised
+    description: At 60% the busiest place (57.6%) is not dominant enough.
+    settings: {insight_place_heavy_share_pct: 60}
+    expect: {fires: false}
+  - case: window_shortened
+    description: Over the last 15 minutes the event is over and the place has 7.7% of the calls.
+    settings: {insight_place_heavy_window_min: 15}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_place_heavy_severity replaces the computed severity.
+    settings: {insight_place_heavy_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "1000000301", severity: critical}

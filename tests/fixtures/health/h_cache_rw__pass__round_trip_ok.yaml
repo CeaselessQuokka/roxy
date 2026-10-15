@@ -1,0 +1,23 @@
+format: roxy.health_fixture/1
+check: H-CACHE-RW
+case: pass
+name: round_trip_ok
+description: >
+  The cache write, read and delete round trip succeeds with no injected delay. 13.2 H-CACHE-RW: ok and under
+  20 ms gives pass. The variant injects 3 ms per step: even a round trip of six steps stays under 20 ms. The
+  check must leave no entry behind and must not touch Roblox.
+now: "2026-10-07T15:00:00Z"
+inputs: {}
+expect:
+  status: pass
+  value: {lt: 20}
+  credential_calls: {eq: 0}
+variants:
+  - case: pass
+    name: three_ms_per_step
+    inputs:
+      faults:
+        cache_rw_latency_ms: 3
+    expect:
+      status: pass
+      value: {lt: 20}

@@ -1,0 +1,106 @@
+/*
+ * Print styles: a dashboard page printed (or saved as PDF) shows its content on white paper, without navigation.
+ *
+ * What this is
+ *   Rules loaded with media="print" only (templates/admin/base.html), so they cost nothing on screen.
+ *
+ * Why it exists
+ *   Owners print or save pages for incident notes and audits. Dark backgrounds waste toner, and sidebars, menus and
+ *   buttons are noise on paper. v1 had print styles too (dashboard notes, section 12).
+ *
+ * How it works
+ *   Forces the light side of every token (color-scheme: light), hides the shell and every interactive control,
+ *   opens the "How to read" panels and data tables, keeps cards and table rows from splitting across pages, and
+ *   prints link targets for links that leave the page. Charts print as the canvas uPlot drew.
+ *
+ * What to read next
+ *   static/css/tokens.css (why color-scheme switches every color at once).
+ */
+
+:root,
+:root[data-theme] {
+  color-scheme: light;
+}
+
+@page {
+  margin: 14mm 12mm;
+}
+
+body {
+  background: #ffffff;
+  color: #000000;
+  font-size: 11pt;
+}
+
+.sidebar,
+.topbar,
+.mobile-nav,
+.app-footer,
+.skip-link,
+.toasts,
+.tip,
+dialog,
+.chart__tools,
+.dt__toolbar,
+.dt__foot,
+.card__actions,
+.page-header__actions,
+.rec__actions,
+.setting__save,
+.setting__links,
+.help-dot,
+.icon-btn,
+.btn,
+.tail__filters,
+.banner .btn {
+  display: none !important;
+}
+
+.shell {
+  display: block;
+}
+
+.main {
+  max-width: none;
+  padding: 0;
+}
+
+.card,
+.kpi,
+.rec,
+.setting,
+.how-to-read {
+  border-color: #c3c9d3;
+  box-shadow: none;
+  break-inside: avoid;
+}
+
+.kpi-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.dt__scroll,
+.tail__viewport {
+  max-height: none;
+  overflow: visible;
+}
+
+.dt__table th {
+  position: static;
+}
+
+.dt__table tr {
+  break-inside: avoid;
+}
+
+/* Closed <details> print open, so explanations and data tables are on paper too. */
+details::details-content {
+  content-visibility: visible;
+  display: block;
+}
+
+.main a[href^="http"]::after {
+  content: " (" attr(href) ")";
+  color: #566070;
+  font-size: 9pt;
+}

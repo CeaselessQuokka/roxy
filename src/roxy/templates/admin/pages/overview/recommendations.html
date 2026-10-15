@@ -1,0 +1,40 @@
+{#-
+  Overview, card `recommendations` (`roxy/admin/pages/overview.py recommendations_card`): the three most severe open
+  recommendations (plan 14.1, parity row 86: v1's threat banner became evidence-backed recommendations).
+
+  Read only: each item opens on the Recommendations page (`?rec=<id>` opens its drawer), where it is previewed,
+  applied, snoozed or dismissed. Titles, subjects and expected impacts can quote endpoint templates built from
+  callers' paths, so they go through `caller_text`. When the engine is off or nothing is open, the card says why.
+  Context: `frame`, `items`, `open`, `open_capped`, `available`, `engine_on`, `interval_s`, `notice`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import severity_badge, badge %}
+{% from "components/format.html" import caller_text, local_href, num %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/icon.html" import icon %}
+{% set more %}{% if open > items|length %}<a class="btn btn--sm btn--ghost" href="/admin/recommendations">{{ icon("bulb") }}<span>All {{ num(open) }}{% if open_capped %}+{% endif %} open</span></a>{% endif %}{% endset %}
+{% call page_card(frame, actions=more if open > items|length else None, notices=[notice] if notice else []) %}
+{% if items %}
+<ol class="ov-recs" role="list">
+  {% for rec in items %}
+  {% set href = local_href(rec.href) %}
+  <li class="ov-rec ov-rec--{{ rec.tone }}" data-rec="{{ rec.id }}">
+    <div class="ov-rec__head">
+      {{ severity_badge(rec.severity) }}
+      <code class="ov-rec__rule">{{ rec.rule_id }}</code>
+      {% if rec.age %}<span class="ov-rec__age muted">{{ icon("clock") }}{{ rec.age }}</span>{% endif %}
+    </div>
+    <p class="ov-rec__title">{% if href %}<a href="{{ href }}">{{ caller_text(rec.title, 240) }}</a>{% else %}{{ caller_text(rec.title, 240) }}{% endif %}</p>
+    {% if rec.expected_impact %}<p class="ov-rec__impact muted">{{ caller_text(rec.expected_impact, 240) }}</p>{% endif %}
+    <p class="ov-rec__meta muted">{{ rec.confidence|capitalize }} confidence, {{ rec.risk }} risk{% if rec.family %}, {{ rec.family }}{% endif %}</p>
+  </li>
+  {% endfor %}
+</ol>
+{% elif not engine_on %}
+{{ empty_state("The recommendations engine is switched off", "Roxy is not looking for problems in its numbers. Switch insights_enabled back on in the engine settings of the Recommendations page.", "bulb", "info", "/admin/recommendations#engine", "Open the engine settings") }}
+{% elif not available %}
+{{ empty_state("Recommendations are not available right now", "The engine could not be read; this card tries again shortly.", "bulb", "neutral") }}
+{% else %}
+{{ empty_state("Nothing needs your attention", "Roxy checks its own numbers every " ~ interval_s ~ " seconds and lists here what it would change, with the evidence. Nothing is open right now.", "bulb", "good", "/admin/recommendations", "See every recommendation") }}
+{% endif %}
+{% endcall %}

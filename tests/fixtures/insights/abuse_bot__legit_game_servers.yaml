@@ -1,0 +1,45 @@
+# ABUSE-BOT must stay quiet on heavy legitimate traffic.
+#
+# 30 Roblox game servers of one large experience each send 1,200 requests in the hour (more than twice the 500 per
+# hour request threshold), from the Roblox UA with place ids; their bot scores are 10. An uptime monitor uses curl
+# (a library UA, so its score is high at 70) but sends one request per minute. Heavy clients are legitimate here and
+# the only bot-like client is light, so no client passes both tests.
+
+format: roxy.insight_fixture/1
+rule: ABUSE-BOT
+case: legit_game_servers
+description: >
+  Thirty game servers at 1,200 requests per hour each with low bot scores, and a light curl monitor with score 70.
+  ABUSE-BOT needs both a high score and heavy traffic, so it must not fire.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  big_game:
+    clients: {cidr: "203.0.113.64/27", count: 30}
+    places: ["1000000021", "1000000022"]
+    user_agent: "Roblox/Linux"
+  monitor: {client_ip: "198.51.100.9", user_agent: "curl/8.5.0"}
+
+traffic:
+  - {name: game_hit, profile: [hit, big_game], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 480}
+  - {name: game_miss, profile: [miss, big_game], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 120}
+  - {name: monitor_miss, profile: [miss, monitor], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 1}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.64/27", count: 30}, bot_score: 10}
+    - {ip: "198.51.100.9", bot_score: 70}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 36060, refused: 0}
+    - {window: ["-60m", "0m"], where: {client_ip: "203.0.113.65"}, requests: 1200}
+    - {window: ["-60m", "0m"], where: {client_ip: "198.51.100.9"}, requests: 60}
+  fires: false

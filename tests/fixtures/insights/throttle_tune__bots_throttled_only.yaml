@@ -1,0 +1,50 @@
+# THROTTLE-TUNE must stay quiet when only non-legitimate clients are throttled.
+#
+#   clients                         bot score   distinct   throttled today
+#   game servers 203.0.113.1-200    12          200        0
+#   scrapers 192.0.2.1-30           88          30         30 (all of them, all day)
+#
+# 30 of the 230 addresses seen today (13%) were throttled, far over 5%, but none of them is legitimate (score under
+# bot_score_legit_max = 30), so the per-IP limit is doing its job. Upstream calls are spread evenly (no address has
+# more than 1% of them) and nobody got `upstream_busy`, so the "too loose" branch does not apply.
+
+format: roxy.insight_fixture/1
+rule: THROTTLE-TUNE
+case: bots_throttled_only
+description: >
+  Thirty scrapers are throttled all day while none of the 200 legitimate game servers is. A rule that ignored bot
+  scores would see 13% of addresses throttled; THROTTLE-TUNE must not fire.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  game_servers:
+    clients: {cidr: "203.0.113.0/24", count: 200}
+    places: ["1000000051", "1000000052", "1000000053", "1000000054", "1000000055", "1000000056"]
+    user_agent: "Roblox/Linux"
+  scrapers: {clients: {cidr: "192.0.2.0/27", count: 30}, user_agent: "python-requests/2.31.0"}
+
+traffic:
+  - {name: game_hit, profile: [hit, game_servers], endpoint_template: games.roblox.com/v1/games, window: ["-24h", "0m"], total: 28800}
+  - {name: game_miss, profile: [miss, game_servers], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-24h", "0m"], total: 11520}
+  - {name: scraper_served, profile: [miss, scrapers], endpoint_template: "catalog.roblox.com/v1/search/items", window: ["-24h", "0m"], total: 2880}
+  - {name: scraper_throttled, profile: [throttled, scrapers], endpoint_template: "catalog.roblox.com/v1/search/items", window: ["-24h", "0m"], total: 14400}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/24", count: 200}, bot_score: 12}
+    - {clients: {cidr: "192.0.2.0/27", count: 30}, bot_score: 88}
+
+expect:
+  data_checks:
+    - {window: ["-24h", "0m"], requests: 57600, refused: 14400, failed: 0}
+    - {window: ["-24h", "0m"], where: {client_ip: "203.0.113.1"}, refused: 0}
+    - {window: ["-24h", "0m"], where: {client_ip: "192.0.2.30"}, refused: 480}
+  fires: false

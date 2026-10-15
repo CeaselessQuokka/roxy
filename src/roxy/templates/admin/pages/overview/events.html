@@ -1,0 +1,13 @@
+{#-
+  Overview, card `events` (`roxy/admin/pages/overview.py events_card`): recent notable events (plan 14.1), the
+  page's main table (its search, sort and page are kept in the address bar).
+
+  Server paged, sorted and searched (`GET /admin/api/v1/overview/events` answers the same rows, and the export menu
+  downloads them through it). Endpoint templates and event details can quote callers' text, so they render as plain
+  text. Context: `frame`, `table`, `total`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% call page_card(frame, flush=True) %}
+{{ data_table(**table) }}
+{% endcall %}

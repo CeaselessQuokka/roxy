@@ -1,0 +1,21 @@
+format: roxy.health_fixture/1
+check: H-DNS
+case: fail
+name: nxdomain
+description: >
+  presence.roblox.com does not resolve (NXDOMAIN); the other hosts are fast and public. 13.2 H-DNS: a failure
+  for any allowed host gives fail.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    allowed_roblox_hosts: [games.roblox.com, users.roblox.com, thumbnails.roblox.com, presence.roblox.com]
+  dns:
+    games.roblox.com: {answers: ["192.0.2.10", "2001:db8::10"], latency_ms: 18}
+    users.roblox.com: {answers: ["192.0.2.11"], latency_ms: 40}
+    thumbnails.roblox.com: {answers: ["198.51.100.40", "198.51.100.41"], latency_ms: 22}
+    presence.roblox.com: {error: nxdomain}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)dns"}
+  credential_calls: {eq: 0}

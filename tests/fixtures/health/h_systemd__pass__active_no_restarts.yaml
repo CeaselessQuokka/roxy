@@ -1,0 +1,20 @@
+format: roxy.health_fixture/1
+check: H-SYSTEMD
+case: pass
+name: active_no_restarts
+description: >
+  `systemctl show roxy@blue roxy@green -p ActiveState,NRestarts,ExecMainStartTimestamp`: blue (the serving
+  color, the one running this check) is active, started two days ago, with 0 restarts; green is inactive because
+  the last deploy stopped the old color (17.4 step 8), which is normal between deploys. 13.2 H-SYSTEMD: active
+  and 0 restarts in 24 h gives pass.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    ROXY_COLOR: blue
+  systemd:
+    show:
+      "roxy@blue": {ActiveState: active, NRestarts: "0", ExecMainStartTimestamp: "-2d"}
+      "roxy@green": {ActiveState: inactive, NRestarts: "0", ExecMainStartTimestamp: "-2d"}
+expect:
+  status: pass
+  credential_calls: {eq: 0}

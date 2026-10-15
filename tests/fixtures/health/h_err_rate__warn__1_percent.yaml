@@ -1,0 +1,78 @@
+format: roxy.health_fixture/1
+check: H-ERR-RATE
+case: warn
+name: 1_percent
+description: >
+  In the last 15 minutes 50 of 5,000 caller requests got a 5xx (35 upstream 503s, 15 timeouts answered 504):
+  1.0%. 13.2 H-ERR-RATE: under 2% (and not under 0.5%) gives warn, with the Errors page as the fix. Stale serves
+  and Roxy's 429s are present and do not count. Excluding cache hits from the denominator would give 1.43%,
+  still a warning.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  traffic_defaults:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    user_agent: "Roblox/Linux"
+  profiles:
+    hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: 4}
+    miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 150, p95: 400, p99: 700}}
+    stale_after_503:
+      egress: direct
+      outcome: served_cache
+      reason: cache_stale_error
+      status: 200
+      source: cache
+      cache_state: "STALE"
+      upstream_calls: 1
+      upstream_status: 503
+      error: true
+      latency_ms: 120
+    cooldown_no_stale:
+      egress: direct
+      outcome: failed
+      reason: upstream_cooldown
+      status: 429
+      source: roxy
+      cache_state: "MISS"
+      upstream_calls: 1
+      upstream_status: 429
+      error: true
+      latency_ms: 85
+      upstream_429: {egress: direct, retry_after_s: 30}
+    upstream_503:
+      egress: direct
+      outcome: failed
+      reason: upstream_5xx
+      status: 503
+      source: roxy
+      cache_state: "MISS"
+      upstream_calls: 2
+      upstream_status: 503
+      error: true
+      latency_ms: 650
+    timeout_504:
+      egress: direct
+      outcome: failed
+      reason: upstream_timeout
+      status: 504
+      source: roxy
+      cache_state: "MISS"
+      upstream_calls: 2
+      error: true
+      latency_ms: 30500
+  traffic:
+    - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], total: 1500}
+    - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], total: 3315}
+    - {name: catalog_cooldown_429, profile: cooldown_no_stale, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-15m", "0m"], total: 60}
+    - {name: groups_stale_503, profile: stale_after_503, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-15m", "0m"], total: 75}
+    - {name: groups_503, profile: upstream_503, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-15m", "0m"], total: 35}
+    - {name: games_timeout, profile: timeout_504, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], total: 15}
+expect:
+  data_checks:
+    - window: ["-15m", "0m"]
+      requests: 5000
+      by_reason: {upstream_5xx: 35, upstream_timeout: 15, cache_stale_error: 75, upstream_cooldown: 60}
+  status: warn
+  value: {gte: 0.5, lt: 2}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)error"}
+  credential_calls: {eq: 0}

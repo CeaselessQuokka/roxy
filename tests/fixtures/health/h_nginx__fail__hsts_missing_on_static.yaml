@@ -1,0 +1,59 @@
+format: roxy.health_fixture/1
+check: H-NGINX
+case: fail
+name: hsts_missing_on_static
+description: >
+  The exact regression 17.2 warns about: the /static/ location declares its own add_header without including
+  the security headers snippet, so nginx drops the inherited HSTS header on static assets. HSTS on
+  /static/<asset> is one of the headers 13.2 names for H-NGINX, so a missing HSTS there is a missing required
+  header: fail.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    tarpit_connection_budget: 4000
+  env:
+    ROXY_NGINX_WORKER_PROCESSES: "2"
+    ROXY_NGINX_WORKER_CONNECTIONS: "4096"
+  upstream:
+    "origin:/":
+      status: 200
+      headers:
+        content-type: "text/html; charset=utf-8"
+        server: "nginx"
+        strict-transport-security: "max-age=63072000; includeSubDomains"
+        x-content-type-options: "nosniff"
+        x-frame-options: "DENY"
+        referrer-policy: "no-referrer"
+      body: "<!doctype html><title>Roxy</title>"
+      latency_ms: 20
+    "origin:/static/**":
+      status: 200
+      headers:
+        content-type: "text/css"
+        server: "nginx"
+        cache-control: "public, immutable"
+      body: "body{margin:0}"
+      latency_ms: 5
+    "origin:/admin":
+      status: 200
+      headers:
+        content-type: "text/html; charset=utf-8"
+        server: "nginx"
+        cache-control: "no-store"
+        strict-transport-security: "max-age=63072000; includeSubDomains"
+        x-content-type-options: "nosniff"
+        x-frame-options: "DENY"
+      body: "<!doctype html><title>Sign in</title>"
+      latency_ms: 25
+    "origin:/internal/version":
+      status: 404
+      headers:
+        server: "nginx"
+        strict-transport-security: "max-age=63072000; includeSubDomains"
+      body: "Not Found"
+      latency_ms: 3
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {present: true}
+  credential_calls: {eq: 0}

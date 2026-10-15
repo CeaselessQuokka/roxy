@@ -1,0 +1,29 @@
+{#-
+  Card: the container every dashboard section lives in.
+
+  What: `{% call card("Cache settings", id="settings") %} ... {% endcall %}` renders a titled <section>. The `id` is
+  the card anchor from DESIGN.md section 9 (`cache#settings`), so links and the settings `pages` field can jump to it.
+  Why: one card shape gives every page the same rhythm (title, optional help, optional subtitle, actions on the
+  right), and a <section> named by its heading is a landmark-like region screen reader users can jump between.
+  How: `actions` is optional HTML from the caller (pass it with `{% set actions %}...{% endset %}`); `flush` removes
+  the body padding for edge-to-edge tables and charts.
+-#}
+{% from "components/badges.html" import help_dot %}
+
+{% macro card(title=None, id=None, level=2, help=None, subtitle=None, actions=None, flush=False, cls="") -%}
+<section class="card{% if cls %} {{ cls }}{% endif %}"{% if id %} id="{{ id }}"{% if title %} aria-labelledby="{{ id }}-title"{% endif %}{% endif %}>
+  {% if title %}
+  <header class="card__head">
+    <div class="card__titles">
+      <h{{ level }} class="card__title"{% if id %} id="{{ id }}-title"{% endif %}>{{ title }}</h{{ level }}>
+      {% if help %}{{ help_dot(title, help) }}{% endif %}
+      {% if subtitle %}<p class="card__sub">{{ subtitle }}</p>{% endif %}
+    </div>
+    {% if actions %}<div class="card__actions">{{ actions }}</div>{% endif %}
+  </header>
+  {% endif %}
+  <div class="card__body{% if flush %} card__body--flush{% endif %}">
+    {{ caller() if caller is defined else "" }}
+  </div>
+</section>
+{%- endmacro %}

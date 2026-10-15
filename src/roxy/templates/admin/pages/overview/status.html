@@ -1,0 +1,24 @@
+{#-
+  Overview, card `status` (`roxy/admin/pages/overview.py status_card`): the status strip of plan 14.1.
+
+  One item per part of Roxy: the proxy, the credential (its state only, never its value), the rotator, the scheduler
+  leader, the workers and the version. Each item says its state in words with an icon and a colored edge (color is
+  never the only signal, plan 14.9) and links to the page that manages it. The texts come from Roxy's own state,
+  never from callers. Context: `frame`, `items` (`{key, label, tone, state, detail, href}`).
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/format.html" import local_href %}
+{% call page_card(frame) %}
+<ul class="ov-status" role="list">
+  {% for item in items %}
+  <li class="ov-status__item ov-status__item--{{ item.tone }}" data-status="{{ item.key }}">
+    <span class="ov-status__label">{{ item.label }}</span>
+    <span class="ov-status__state">{{ status_badge(item.tone, item.state) }}</span>
+    <span class="ov-status__detail">{{ item.detail }}</span>
+    {% set href = local_href(item.href) if item.href else "" %}
+    {% if href %}<a class="ov-status__link" href="{{ href }}">Details<span class="sr-only"> about the {{ item.label|lower }}</span></a>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% endcall %}

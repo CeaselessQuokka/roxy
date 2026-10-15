@@ -1,0 +1,77 @@
+# CACHE-NEG stays quiet just under its threshold, and never counts different missing items as refetches
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "> 100 identical 404 refetches per hour" (insight_cache_neg_min_404_per_hour 100).
+#
+#   cache_error_ttl_seconds = 0. Last 60 min:
+#     one deleted asset polled 96 times: 95 identical refetches (96 if the first fetch is counted), all 404
+#     300 one-off 404s for 300 different users: 0 identical refetches, however many 404s there are
+#   Either way of counting the first fetch, the repeated key stays at or below 96, under 100; a threshold of 90
+#   is exceeded either way.
+
+format: roxy.insight_fixture/1
+rule: CACHE-NEG
+case: below_threshold
+description: >
+  One missing asset was refetched 95 times in the last hour (just under 100), and 300 different missing users
+  were each fetched once. Nothing may fire at the default; at a threshold of 90 the repeated asset fires it.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  cache_error_ttl_seconds: 0
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  not_found: {egress: direct, outcome: served_upstream, reason: upstream_4xx, status: 404, source: relay, cache_state: "MISS", latency_ms: {p50: 110, p95: 260, p99: 500}, bytes: {caller_in: 0, caller_out: 90, upstream_in: 180, upstream_out: 420}}
+
+traffic:
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 800}
+  - name: deleted_asset_poll
+    profile: not_found
+    endpoint_template: "economy.roblox.com/v2/assets/{assetId}/details"
+    places: ["1000000004"]
+    window: ["-48m", "0m"]
+    per_minute: 2
+    samples: {key_space: deleted_asset, keys: 1, body_change_interval_s: 0}
+  - name: missing_users
+    profile: not_found
+    endpoint_template: "users.roblox.com/v1/users/{userId}"
+    window: ["-60m", "0m"]
+    per_minute: 5
+    samples: {key_space: missing_users, keys: 300, body_change_interval_s: 0}
+
+state:
+  settings_history:
+    - {at: "-6d", key: cache_error_ttl_seconds, old: 60, new: 0, source: admin, changed_by: admin, reason: "Match v1."}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: "economy.roblox.com/v2/assets/{assetId}/details"}
+      requests: 96
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: "users.roblox.com/v1/users/{userId}", status: 404}
+      requests: 300
+  fires: false
+
+variants:
+  - case: min_404_per_hour_90
+    description: With 90 as the threshold, the polled asset's 95 identical refetches fire it.
+    settings: {insight_cache_neg_min_404_per_hour: 90}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - severity: any
+          safe_auto: false
+          changes_required:
+            - {kind: setting, key: cache_error_ttl_seconds, current: 0, proposed: {gt: 0}}

@@ -1,0 +1,14 @@
+{#-
+  Recommendations, card `rules` (`roxy/admin/pages/recommendations.py rules_card`): the rule catalog (plan 11.1,
+  11.5): each rule's switch, severity override, open count and whether auto-apply may ever use it.
+
+  A row opens the rule's "Tune this rule" drawer (the fragment-only card `rule-<slug>`): its help text from the rule's
+  docstring, its open recommendations and every catalog setting of the rule, edited inline through the settings API.
+  Context: `frame`, `table`, `implemented`, `total_rules`, `engine_on`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% set subtitle = implemented ~ " of " ~ total_rules ~ " rules are in this build. Open a rule to tune its thresholds or switch it off." %}
+{% call page_card(frame, flush=True, subtitle=subtitle, notices=[] if engine_on else ["The engine is switched off, so no rule runs until insights_enabled is on again."]) %}
+{{ data_table(**table) }}
+{% endcall %}

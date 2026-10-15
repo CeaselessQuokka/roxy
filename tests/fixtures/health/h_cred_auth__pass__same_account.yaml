@@ -1,0 +1,32 @@
+format: roxy.health_fixture/1
+check: H-CRED-AUTH
+case: pass
+name: same_account
+description: >
+  A manual run. GET users.roblox.com/v1/users/authenticated through the credential path answers 200 with the
+  user id whose fingerprint was stored when the credential was set. 13.2 H-CRED-AUTH: 200 and same account gives
+  pass. Exactly one credential call (13.3).
+now: "2026-10-07T15:00:00Z"
+run: {trigger: manual}
+inputs:
+  state:
+    credential:
+      present: true
+      status: active
+      status_at: "-25m"
+      set_at: "-20d"
+      account_id: "1000001"
+      probes:
+        - {at: "-25m", kind: scheduled, status: 200, result: ok}
+  upstream:
+    "https://users.roblox.com/v1/users/authenticated":
+      status: 200
+      json: {id: 1000001, name: "fixture_user", displayName: "Fixture User"}
+      latency_ms: 140
+      expect_request: {via: credential, method: GET}
+expect:
+  status: pass
+  critical: false
+  calls:
+    "https://users.roblox.com/v1/users/authenticated": {count: 1, via: credential}
+  credential_calls: {eq: 1}

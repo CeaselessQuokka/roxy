@@ -1,0 +1,25 @@
+format: roxy.health_fixture/1
+check: H-DB-SIZE
+case: fail
+name: over_budget
+description: >
+  metrics.db reached 11.7 GB: the databases hold 12.27 GB against a 12 GB budget, 102% (95% if a GB is 2^30
+  bytes). 13.2 H-DB-SIZE: 90% or more gives fail.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    storage_total_budget_gb: 12
+  state:
+    disk:
+      total_bytes: 40000000000
+      free_bytes: 15000000000
+      files:
+        "control.db": {bytes: 60000000, wal_bytes: 4194304}
+        "hot.db": {bytes: 8000000, wal_bytes: 4194304}
+        "metrics.db": {bytes: 11700000000, wal_bytes: 4194304}
+        "cache.db": {bytes: 500000000, wal_bytes: 4194304}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)data"}
+  credential_calls: {eq: 0}

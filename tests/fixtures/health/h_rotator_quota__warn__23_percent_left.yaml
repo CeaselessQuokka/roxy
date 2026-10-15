@@ -1,0 +1,64 @@
+format: roxy.health_fixture/1
+check: H-ROTATOR-QUOTA
+case: warn
+name: 23_percent_left
+description: >
+  Late in the cycle (October 28, 3.4 days left): a heavy first three weeks (0.75 GB per day) then almost
+  nothing (0.05 GB per day) leaves 15.38 GB used of 20 GB, 23% remaining (28% if a GB is 2^30 bytes). The
+  projection stays under the quota whether it uses the last 7 days (about 15.6 GB) or the cycle average (about
+  17.3 GB). 13.2 H-ROTATOR-QUOTA: over 10% (and not over 30%) remaining, no overrun, gives warn, with the Egress
+  page as the fix. The variant raises the quota to 40 GB: 62% remaining passes.
+now: "2026-10-28T15:00:00Z"
+inputs:
+  settings:
+    rotator_enabled: 1
+    rotator_weight: 25
+    rotator_quota_gb_per_month: 20
+    rotator_billing_day: 1
+    rotator_price_per_gb_usd: 3
+    ui_timezone: "UTC"
+  state:
+    egress:
+      usage:
+        - &day750 {egress: rotator, granularity: day, at: "2026-10-01", requests: 75000, req_bytes: 15000000, resp_bytes: 735000000, overhead_bytes: 0}
+        - {<<: *day750, at: "2026-10-02"}
+        - {<<: *day750, at: "2026-10-03"}
+        - {<<: *day750, at: "2026-10-04"}
+        - {<<: *day750, at: "2026-10-05"}
+        - {<<: *day750, at: "2026-10-06"}
+        - {<<: *day750, at: "2026-10-07"}
+        - {<<: *day750, at: "2026-10-08"}
+        - {<<: *day750, at: "2026-10-09"}
+        - {<<: *day750, at: "2026-10-10"}
+        - {<<: *day750, at: "2026-10-11"}
+        - {<<: *day750, at: "2026-10-12"}
+        - {<<: *day750, at: "2026-10-13"}
+        - {<<: *day750, at: "2026-10-14"}
+        - {<<: *day750, at: "2026-10-15"}
+        - {<<: *day750, at: "2026-10-16"}
+        - {<<: *day750, at: "2026-10-17"}
+        - {<<: *day750, at: "2026-10-18"}
+        - {<<: *day750, at: "2026-10-19"}
+        - {<<: *day750, at: "2026-10-20"}
+        - &day50 {egress: rotator, granularity: day, at: "2026-10-21", requests: 5000, req_bytes: 1000000, resp_bytes: 49000000, overhead_bytes: 0}
+        - {<<: *day50, at: "2026-10-22"}
+        - {<<: *day50, at: "2026-10-23"}
+        - {<<: *day50, at: "2026-10-24"}
+        - {<<: *day50, at: "2026-10-25"}
+        - {<<: *day50, at: "2026-10-26"}
+        - {<<: *day50, at: "2026-10-27"}
+        - {egress: rotator, granularity: day, at: "2026-10-28", requests: 3000, req_bytes: 600000, resp_bytes: 29400000, overhead_bytes: 0}
+expect:
+  status: warn
+  value: {gt: 10, lte: 30}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)egress"}
+  credential_calls: {eq: 0}
+variants:
+  - case: pass
+    name: quota_raised_to_40
+    inputs:
+      settings:
+        rotator_quota_gb_per_month: 40
+    expect:
+      status: pass

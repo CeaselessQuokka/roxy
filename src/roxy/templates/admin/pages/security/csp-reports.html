@@ -1,0 +1,10 @@
+{#-
+  Security page, card `csp-reports` (`roxy/admin/pages/security.py csp_reports_card`): Content-Security-Policy
+  violation reports in the range, grouped by what was refused (plan 9.2). Any browser or script may post a report,
+  so every text field is caller text. Context: `frame`, `table`, `part`.
+-#}
+{% from "admin/pages/security/_macros.html" import table_card %}
+{% from "components/glossary.html" import term with context %}
+{% call table_card(frame, table, part) %}
+<p class="security-intro">The {{ term("csp", "Content-Security-Policy") }} lets Roxy's pages run only Roxy's own scripts and styles. A report here means a browser refused something on one of Roxy's pages: usually a browser extension, sometimes an attack. A steady stream from one page is worth a look.</p>
+{% endcall %}

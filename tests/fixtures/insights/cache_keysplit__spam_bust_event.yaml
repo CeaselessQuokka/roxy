@@ -1,0 +1,97 @@
+# CACHE-KEYSPLIT fires on its second trigger, a SPAM-BUST detection, when cache.db has no entries to examine
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "v1 Suspect rule (...) or SPAM-BUST".
+#
+#   cache_disk_enabled = 0 (memory tier only), so cache.db holds no entries and the v1 Suspect test has nothing to
+#   group. One client, 198.51.100.77, sent 400 votes requests in 10 minutes, each with a different query (all
+#   misses), and the SPAM-BUST detector (abuse/spam.py, action `recommend` by default) recorded a `spam_detected`
+#   event: 0.98 distinct queries per request over 600 s, threshold 0.9.
+#
+# Reading of the row (report to the lead if the rule author disagrees): SPAM-BUST alone is enough to fire. The
+# detector's event names the client but not the endpoint or the parameter (its detail has no template), so this
+# fixture does not require a particular subject or ignored parameter; it requires a cache-family recommendation
+# that does not ban or filter anyone (bans are ABUSE-SPAM's job) and does not change global cache settings.
+
+format: roxy.insight_fixture/1
+rule: CACHE-KEYSPLIT
+case: spam_bust_event
+description: >
+  With the shared cache tier off there are no cache.db entries to test, but the SPAM-BUST detector fired for a
+  client that sent 400 differently busted votes requests in 10 minutes. The rule must fire on that detection
+  alone, with a cache recommendation rather than a ban.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  cache_disk_enabled: 0
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: votes_hit, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 900}
+  - {name: votes_miss, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 300}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 1200}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 300}
+  - name: votes_busted
+    profile: miss
+    endpoint_template: games.roblox.com/v1/games/votes
+    client_ip: "198.51.100.77"
+    user_agent: "Roblox/WinInet"
+    window: ["-11m", "-1m"]
+    per_minute: 40
+    samples: {key_space: votes_busted, keys: 400, body_change_interval_s: 0}
+
+events:
+  security:
+    - at: "-1m"
+      type: spam_detected
+      severity: info
+      reason_code: spam
+      ip: "198.51.100.77"
+      detail:
+        detector: SPAM-BUST
+        subject: "ip:198.51.100.77"
+        value: 0.98
+        threshold: 0.9
+        window_s: 600
+        action: recommend
+        configured_action: recommend
+        game_server: false
+        evidence: "SPAM-BUST: 0.98 in 600 s (threshold 0.9)"
+
+expect:
+  data_checks:
+    - window: ["-11m", "-1m"]
+      where: {endpoint_template: games.roblox.com/v1/games/votes, cache_state: "MISS"}
+      requests: 450
+  fires: true
+  recommendations:
+    - rule_id: CACHE-KEYSPLIT
+      severity: any
+      family: cache
+      change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, credential_allowlist_remove, routing_rule, host_add, bucket_override]
+      changes_forbidden:
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_max_entries, cache_max_bytes, cache_enabled]}
+        # Real id parameters are never ignored.
+        - {kind: ignored_param_add, proposed: {name: {in: [universeIds, userIds, placeIds, assetIds, groupIds]}}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cache_keysplit_enabled: 0}
+    expect: {fires: false}

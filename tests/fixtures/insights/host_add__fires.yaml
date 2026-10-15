@@ -1,0 +1,125 @@
+# HOST-ADD fires when many callers ask for a real, public Roblox host that is not in the allowlist
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "One unknown *.roblox.com host requested by >= 5 distinct places or 50 distinct IPs in 24 h, and it
+# resolves publicly"; evidence "Host, request count, callers, sample paths"; change "host_add (one click; never
+# automatic)"; confidence Medium. Thresholds: insight_host_add_min_places 5, _min_ips 50, _window_h 24.
+#
+#   strict_host_allowlist = 1 (default) and adconfiguration.roblox.com is not in allowed_roblox_hosts, so every
+#   request for it is refused with `host_not_allowed` (404 "Not a Roblox URL").
+#   Last 6 hours: 360 requests from 60 distinct IPs and 7 distinct places, on 3 paths.
+#   DNS: adconfiguration.roblox.com -> 192.0.2.44 (a documentation address, public under the test classifier).
+#   www.roblox.com: 18 refused requests from 3 IPs and 1 place (resolves publicly, but far below both tests).
+#
+# Adding a host widens the SSRF surface a little, so it is one click and never automatic: safe_auto false, and the
+# allowlist itself (strict_host_allowlist) is never switched off.
+
+format: roxy.insight_fixture/1
+rule: HOST-ADD
+case: fires
+description: >
+  Sixty different callers from seven experiences keep requesting adconfiguration.roblox.com, which resolves to a
+  public address but is missing from allowed_roblox_hosts. The rule must propose adding exactly that host, not
+  the rarely requested www.roblox.com, and never turn the allowlist off.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  unknown_host: {egress: none, outcome: refused, reason: host_not_allowed, status: 404, source: roxy, cache_state: "NA", latency_ms: {p50: 1, p95: 3, p99: 6}, bytes: {caller_in: 0, caller_out: 19}}
+
+traffic:
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-6h", "0m"], per_minute: 20}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-6h", "0m"], per_minute: 8}
+  - name: adconfiguration
+    profile: unknown_host
+    endpoint_template: adconfiguration.roblox.com/v2/sponsored-games
+    host: adconfiguration.roblox.com
+    window: ["-6h", "0m"]
+    per_minute: 1
+    clients: {cidr: "198.51.100.0/26", count: 60}
+    places: ["1000000011", "1000000012", "1000000013", "1000000014", "1000000015", "1000000016", "1000000017"]
+    paths: ["adconfiguration.roblox.com/v2/sponsored-games", "adconfiguration.roblox.com/v2/sponsored-campaigns",
+            "adconfiguration.roblox.com/v2/sponsored-games/eligible"]
+  - name: www
+    profile: unknown_host
+    endpoint_template: "www.roblox.com/users/{userId}/profile"
+    host: www.roblox.com
+    window: ["-90m", "0m"]
+    total: 18
+    clients: {list: ["203.0.113.201", "203.0.113.202", "203.0.113.203"]}
+    places: ["1000000021"]
+    path: "www.roblox.com/users/1000000301/profile"
+
+state:
+  dns:
+    "adconfiguration.roblox.com": {answers: ["192.0.2.44"], latency_ms: 18}
+    "www.roblox.com": {answers: ["192.0.2.80"], latency_ms: 15}
+
+expect:
+  data_checks:
+    - window: ["-24h", "0m"]
+      where: {host: adconfiguration.roblox.com}
+      requests: 360
+      refused: 360
+      by_reason: {host_not_allowed: 360}
+    - window: ["-24h", "0m"]
+      where: {host: www.roblox.com}
+      requests: 18
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: HOST-ADD
+      subject_contains: "adconfiguration.roblox.com"
+      severity: any
+      family: host
+      confidence: medium
+      safe_auto: false
+      change_kinds_required: [host_add]
+      change_kinds_forbidden: [ban_add, filter_add, filter_remove, bypass_add, tarpit_category, routing_rule, bucket_override, credential_allowlist_remove, rule_upsert, ignored_param_add]
+      changes_required:
+        - {kind: host_add, proposed: {contains: "adconfiguration.roblox.com"}}
+      changes_forbidden:
+        - {kind: setting, key: strict_host_allowlist}
+        - {kind: host_add, proposed: {contains: "www.roblox.com"}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_host_add_enabled: 0}
+    expect: {fires: false}
+  - case: both_tests_above_evidence
+    description: 8 places and 61 IPs needed; the host has 7 and 60.
+    settings: {insight_host_add_min_places: 8, insight_host_add_min_ips: 61}
+    expect: {fires: false}
+  - case: places_test_alone
+    description: With the IP test out of reach, 7 places still meet the place test (an "or").
+    settings: {insight_host_add_min_ips: 1000}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "adconfiguration.roblox.com", severity: any}
+  - case: ips_test_alone
+    description: With the place test out of reach, 60 IPs still meet the IP test.
+    settings: {insight_host_add_min_places: 1000}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "adconfiguration.roblox.com", severity: any}
+  - case: severity_override_info
+    description: insight_host_add_severity replaces the computed severity.
+    settings: {insight_host_add_severity: info}
+    expect:
+      fires: true
+      recommendations:
+        - {subject_contains: "adconfiguration.roblox.com", severity: info}

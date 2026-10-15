@@ -1,0 +1,15 @@
+format: roxy.health_fixture/1
+check: H-ENV-PROXY
+case: pass
+name: unset
+description: >
+  The service environment has none of HTTPS_PROXY, ALL_PROXY or HTTP_PROXY, and every outbound client is built
+  with trust_env false. 13.2 H-ENV-PROXY: unset gives pass. NO_PROXY alone changes nothing and is ignored.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    NO_PROXY: "localhost,127.0.0.1"
+    clients_trust_env: false
+expect:
+  status: pass
+  credential_calls: {eq: 0}

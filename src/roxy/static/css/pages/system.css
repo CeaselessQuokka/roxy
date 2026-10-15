@@ -1,0 +1,278 @@
+/*
+ * The System page (templates/admin/pages/system*): the fleet, the facts lists, the plain tables and the drawer.
+ *
+ * What this is
+ *   Layout for the System cards: the deploy colors, the facts lists (`.system-kv`), the plain tables of jobs, writers
+ *   and files, which become stacked card rows on a phone (each cell shows its column name, plan 14.8), long ids and
+ *   paths that wrap instead of widening the page, and the traceback in the error drawer.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract). Only tokens
+ *   from tokens.css are used, so both themes follow.
+ * How it works
+ *   Mobile first. `.system-stack` is a normal table from 720 px; below that every row is a block and every cell a
+ *   line "Column: value" (the label comes from the cell's `data-label`, CSS generated content, not markup).
+ * What to read next
+ *   templates/admin/pages/system/*.html, static/css/components.css (.simple-table, .kv, .table-scroll).
+ */
+
+.system-pair {
+  align-items: start;
+}
+
+/* Links inside running text are underlined: color is never the only signal (WCAG 1.4.1). */
+.card__body p a:not(.btn),
+.card__body li a,
+.card__body dd a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.system-intro,
+.system-note {
+  margin: 0 0 var(--sp-3);
+}
+
+.system-kv {
+  grid-template-columns: minmax(8rem, max-content) minmax(0, 1fr);
+}
+
+.system-kv dd {
+  min-width: 0;
+}
+
+.system-kv .badge,
+.system-list .badge {
+  max-width: 100%;
+  white-space: normal;
+}
+
+@media (max-width: 480px) {
+  .system-kv {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+
+  .system-kv dd {
+    margin-bottom: var(--sp-2);
+  }
+}
+
+.system-id {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.system-sub {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-regular);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.system-section {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.system-section__title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-2);
+}
+
+.system-columns {
+  display: grid;
+  gap: var(--sp-5);
+}
+
+@media (min-width: 900px) {
+  .system-columns {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.system-caption {
+  padding: 0 0 var(--sp-2);
+  color: var(--text-muted);
+  font-size: var(--fs-1);
+  font-weight: var(--fw-semibold);
+  text-align: left;
+}
+
+.system-list {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0;
+  padding-left: 1.25em;
+}
+
+.system-list li {
+  overflow-wrap: anywhere;
+}
+
+.system-list--inline,
+.system-list--grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-4);
+  padding: 0;
+  list-style: none;
+}
+
+.system-list--sizes {
+  padding-left: 1.5em;
+}
+
+.system-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+/* ------------------------------------------------------------------------------------------------ the fleet */
+.system-colors {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.system-color {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.system-color__name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+}
+
+.system-color__facts {
+  margin: var(--sp-1) 0 0;
+  color: var(--text-muted);
+}
+
+@media (min-width: 900px) {
+  .system-colors {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* ------------------------------------------------------------------------------------------------ alerts */
+.system-channels {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.system-channel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.system-channel__name {
+  min-width: 5rem;
+  font-weight: var(--fw-semibold);
+}
+
+.system-channel__needs {
+  font-size: var(--fs-1);
+}
+
+/* ------------------------------------------------------------------------------------------------ plain tables */
+.system-stack-wrap {
+  border-radius: var(--radius);
+}
+
+.system-stack th[scope="row"] {
+  font-weight: var(--fw-semibold);
+  color: var(--text);
+}
+
+.system-stack td,
+.system-stack th {
+  vertical-align: top;
+}
+
+@media (max-width: 719px) {
+  .system-stack,
+  .system-stack tbody,
+  .system-stack tr,
+  .system-stack th[scope="row"],
+  .system-stack td {
+    display: block;
+    width: 100%;
+  }
+
+  .system-stack thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .system-stack tr {
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .system-stack td,
+  .system-stack th[scope="row"] {
+    padding: 2px 0;
+    border: 0;
+    text-align: left;
+    white-space: normal;
+  }
+
+  .system-stack td.num {
+    text-align: left;
+  }
+
+  .system-stack td[data-label]::before {
+    content: attr(data-label) ": ";
+    color: var(--text-muted);
+  }
+}
+
+/* ------------------------------------------------------------------------------------------------ error drawer */
+.system-error__signature {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-weight: var(--fw-semibold);
+  overflow-wrap: anywhere;
+}
+
+.system-trace {
+  max-height: 24rem;
+  margin: 0;
+  padding: var(--sp-3);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-1);
+  white-space: pre;
+}
+
+.system-flush .cluster {
+  justify-content: flex-start;
+}

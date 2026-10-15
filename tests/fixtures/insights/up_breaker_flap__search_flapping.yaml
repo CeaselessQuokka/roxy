@@ -1,0 +1,130 @@
+# UP-BREAKER-FLAP: one breaker opens nine times in an hour (format: README.md in this directory).
+#
+# 11.5: "> 6 openings per hour on one key"; evidence: timeline; change: "Raise breaker_open_s for it; add cache
+# rule"; confidence medium. breaker_open_s is a single global setting (there is no per-key open time), so the
+# raise is a `setting` change and the recommendation is not safe_auto. Catalog search has no cache rule, so a new
+# one (current null) is required for it, and for nothing else.
+#
+#   breaker key                                         openings in the last hour     result
+#   endpoint:catalog.roblox.com/v1/search/items:direct  9 (every 7 minutes)           fires
+#   endpoint:thumbnails.../avatar-headshot:direct       3                             quiet
+#
+# The fixture never sits at exactly 6, so "> 6" and ">= openings_per_hour" agree.
+
+format: roxy.insight_fixture/1
+rule: UP-BREAKER-FLAP
+case: search_flapping
+description: >
+  The circuit breaker for catalog search on the direct path opened nine times in the last hour: Roblox fails a
+  burst of calls, the breaker opens for 30 s, the probe succeeds, and it starts again. The rule must recommend a
+  longer breaker_open_s and a new cache rule for catalog search, not as safe_auto, and nothing for the headshot
+  breaker that opened three times.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, stale_ttl: 120, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: catalog.roblox.com/v1/search/items
+
+profiles:
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 200, p95: 500, p99: 900}}
+
+traffic:
+  - {name: search_ok, profile: miss, window: ["-60m", "0m"], per_minute: 40}
+  - name: search_5xx
+    window: ["-60m", "0m"]
+    total: 45                  # 5 failures before each of the 9 openings
+    egress: direct
+    outcome: failed
+    reason: upstream_5xx
+    status: 503
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 503
+    upstream_calls: 2
+    error: true
+    latency_ms: {p50: 900, p95: 2000, p99: 2400}
+  - name: search_breaker_open
+    window: ["-60m", "0m"]
+    total: 180                 # refused while the breaker was open (no stale copy: there is no cache rule)
+    egress: none
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    error: true
+    latency_ms: 2
+  - {name: headshot_ok, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], per_minute: 30}
+
+state:
+  breakers:
+    - key: "endpoint:catalog.roblox.com/v1/search/items:direct"
+      state: closed
+      opened_at: "-2m"
+      half_open_at: "-90s"
+      failures: 0
+      successes: 0
+      window_start: "-60s"
+      openings: ["-58m", "-51m", "-44m", "-37m", "-30m", "-23m", "-16m", "-9m", "-2m"]
+    - key: "endpoint:thumbnails.roblox.com/v1/users/avatar-headshot:direct"
+      state: closed
+      opened_at: "-12m"
+      half_open_at: "-690s"
+      failures: 0
+      successes: 0
+      window_start: "-10m"
+      openings: ["-50m", "-31m", "-12m"]
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: catalog.roblox.com/v1/search/items}
+      requests: 2625
+      upstream_calls: 2490
+      by_reason: {upstream_5xx: 45, upstream_cooldown: 180}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - subject_contains: "catalog.roblox.com/v1/search/items"
+      confidence: medium
+      family: upstream
+      safe_auto: false
+      change_kinds_required: [setting, rule_upsert]
+      change_kinds_forbidden: [bucket_override, routing_rule, ban_add, credential_allowlist_remove]
+      changes_required:
+        - {kind: setting, key: breaker_open_s, current: 30, proposed: {gt: 30, lte: 600}}
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["catalog.roblox.com/v1/search/items"]}}
+          current: null
+          proposed: {ttl: {gte: 1}}
+      changes_forbidden:
+        - kind: rule_upsert
+          match: {pattern: {matches_targets: ["thumbnails.roblox.com/v1/users/avatar-headshot"]}}
+        - {kind: setting, key: breaker_open_s, proposed: {lte: 30}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_breaker_flap_enabled: 0}
+    expect: {fires: false}
+  - case: openings_per_hour_10
+    description: Nine openings in the hour are below a threshold of 10.
+    settings: {insight_up_breaker_flap_openings_per_hour: 10}
+    expect: {fires: false}
+  - case: openings_per_hour_8
+    description: Nine openings pass a threshold of 8; the headshot breaker (3) still does not.
+    settings: {insight_up_breaker_flap_openings_per_hour: 8}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "catalog.roblox.com/v1/search/items"}

@@ -1,0 +1,32 @@
+{#-
+  Live page, card `capture` (`roxy/admin/pages/live.py capture_card`; parity row 82, v1's capture chip).
+
+  What capture keeps right now (the `GET /admin/api/v1/live/state` answer: captures inside the window, their bytes,
+  the caps, the oldest one) and the live records' limits (15 minutes, the per-worker rate, this worker's ring and
+  the rows it left out, labeled as this worker's). The capture settings sit below, inline, from the catalog
+  (`live#capture`). Refreshed from the stream's `kpi` events at most every 30 seconds (never while a setting is
+  being edited). Context: `frame`, `capture`, `live`, `oldest`, `keep_minutes`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num, bytes as fmt_bytes, duration %}
+{% from "components/badges.html" import status_badge %}
+{% call page_card(frame) %}
+<div class="lv-capture">
+  <p class="lv-capture__state">
+    {% if capture.enabled and capture.max_records and capture.max_bytes and capture.ttl_s %}
+    {{ status_badge("ok", "Capturing") }}
+    <span><strong>{{ num(capture.count) }}</strong> of {{ num(capture.max_records) }} captures, {{ fmt_bytes(capture.bytes) }} of {{ fmt_bytes(capture.max_bytes) }}. Bodies are kept for up to {{ duration(capture.ttl_s) }} or until the caps are reached, whichever comes first.</span>
+    {% else %}
+    {{ status_badge("neutral", "Capture off") }}
+    <span>Turn on capture below to keep redacted copies of requests and their answers.</span>
+    {% endif %}
+  </p>
+  <dl class="kv lv-capture__facts">
+    <dt>Captured now</dt><dd>{{ num(capture.count) }} ({{ fmt_bytes(capture.bytes) }})</dd>
+    <dt>Window</dt><dd>{% if oldest %}the oldest is from <time datetime="{{ oldest.datetime }}">{{ oldest.text }}</time> ({{ oldest.sub }}){% else %}<span class="muted">nothing captured yet</span>{% endif %}</dd>
+    <dt>What is captured</dt><dd>Every refusal and failure; {{ "{:g}".format(capture.sample_served_pct or 0) }}% of served requests. Each body is cut at {{ fmt_bytes(capture.max_body) }}.</dd>
+    <dt>Live records</dt><dd>Kept {{ keep_minutes }} minutes, at most {{ "{:g}".format(live.rows_per_second_per_worker or 0) }} a second per worker.</dd>
+    <dt>This worker</dt><dd>keeps its last {{ num(live.ring_size) }} requests in memory and has left {{ num(live.sampled_out_by_this_worker) }} out of the records while busy <span class="muted">(this worker only)</span>.</dd>
+  </dl>
+</div>
+{% endcall %}

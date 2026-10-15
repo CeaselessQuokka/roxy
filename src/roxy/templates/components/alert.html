@@ -1,0 +1,30 @@
+{#-
+  Inline alerts and toast triggers (plan 14.5: "Toasts and inline alerts; accessible live region announcements").
+
+  What: `inline_alert("warn", "Cache is off", "Turn it on to cut upstream calls.")` renders a callout inside the
+  page. Toasts are not rendered here: they are created by static/js/toast.js into the region in admin/base.html,
+  from a server response header (`HX-Trigger: {"roxy:toast": {"message": "...", "tone": "ok"}}`) or from a button
+  with `data-toast="message"`.
+  Why: an inline alert stays next to the thing it is about; a toast confirms an action that happened. Both are
+  announced politely to screen readers (errors assertively), and neither relies on color alone (icon plus words).
+  How: `role` defaults to none for alerts rendered with the page (announcing static content on load is noise); pass
+  `role="alert"` only for content that appears in response to an action.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import TONE_ICONS %}
+
+{% macro inline_alert(tone, title, body=None, role=None, dismissible=False, actions=None) -%}
+<div class="alert alert--{{ tone }}"{% if role %} role="{{ role }}"{% endif %}>
+  <span class="alert__icon">{{ icon(TONE_ICONS.get(tone, "info")) }}</span>
+  <div class="alert__text">
+    <p class="alert__title">{{ title }}</p>
+    {% if body %}<p class="alert__body">{{ body }}</p>{% endif %}
+    {% if actions %}<p class="alert__actions">{{ actions }}</p>{% endif %}
+  </div>
+  {% if dismissible %}<button type="button" class="icon-btn icon-btn--sm alert__close" data-dismiss aria-label="Dismiss: {{ title }}">{{ icon("x") }}</button>{% endif %}
+</div>
+{%- endmacro %}
+
+{% macro toast_button(label, message, tone="ok", cls="btn") -%}
+<button type="button" class="{{ cls }}" data-toast="{{ message }}" data-toast-tone="{{ tone }}">{{ label }}</button>
+{%- endmacro %}

@@ -1,0 +1,23 @@
+format: roxy.health_fixture/1
+check: H-CRED-AUTH
+case: fail
+name: other_account
+description: >
+  The credential authenticates, but the account id it returns is not the one recorded when the credential was
+  set. 13.2 makes that a critical fail (plan C1: exactly one account).
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    credential: {present: true, status: active, set_at: "-20d", account_id: "1000001"}
+  upstream:
+    "https://users.roblox.com/v1/users/authenticated":
+      status: 200
+      json: {id: 1000002, name: "fixture_user"}
+      latency_ms: 140
+      expect_request: {via: credential, method: GET}
+expect:
+  status: fail
+  critical: true
+  explanation: {present: true}
+  fix_link: {regex: "(?i)credential"}
+  credential_calls: {eq: 1}

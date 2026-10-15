@@ -1,0 +1,17 @@
+format: roxy.health_fixture/1
+check: H-CRED-PRESENT
+case: fail
+name: absent
+description: >
+  No credential is configured: no bootstrap file and no UI-set value (`present: false` writes no
+  credential_meta row and no fake credential file). 13.2 H-CRED-PRESENT: absent gives fail, with the Credential
+  page as the fix. There is no warn state for this check (13.2 lists n/a).
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    credential: {present: false}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)credential"}
+  credential_calls: {eq: 0}

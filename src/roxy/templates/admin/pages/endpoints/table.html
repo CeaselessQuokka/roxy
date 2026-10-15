@@ -1,0 +1,20 @@
+{#-
+  Endpoints page, card `table` (`roxy/admin/pages/endpoints.py table_card`; plan 14.1 row 11, parity rows 74, 89).
+
+  The page's main table: the `GET /admin/api/v1/endpoints` answer of `endpoints_api.table_page`, paged, sorted,
+  searched and filtered on the server with the API's parameter names (its state lives in the address bar), and
+  exported through the API. The template, the methods and the last place are caller text (`caller_text`). A row
+  opens the endpoint's drill-down in the drawer. A table request (`part` "table") gets the table alone.
+  Context: `frame`, `part`, `table`, and for the card `total`, `range_description`, `compare_words`, `filtered`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import num %}
+{% if part == "table" %}
+{{ data_table(**table) }}
+{% else %}
+{% set subtitle = range_description ~ ": " ~ num(total) ~ (" matching endpoint templates" if filtered else " endpoint templates") ~ "; the trend compares with " ~ compare_words ~ "." %}
+{% call page_card(frame, flush=True, subtitle=subtitle) %}
+{{ data_table(**table) }}
+{% endcall %}
+{% endif %}

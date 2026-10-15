@@ -1,0 +1,50 @@
+{#-
+  Protection page, card `ignored-paths` (`roxy/admin/pages/protection.py ignored_paths_card`): row 50.
+
+  What: the ignored paths (`GET /protection/ignored-paths`): answered 404 at once and never counted as probes;
+  "Add a path" (`POST /ignored-paths`); a row opens the path in the drawer with "Remove" (`DELETE /ignored-paths?
+  pattern=...`, the pattern and the reason in the query string).
+  Context: `frame`, `table`, `only`, `api`; for the drawer `detail` {entry, delete_url}.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import caller_text %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/protection/_macros.html" import reason_field, delete_dialog, field_error %}
+{% if detail %}
+{% set e = detail.entry %}
+<div class="prot-drawer stack" data-prot-drawer="ignored">
+  <dl class="kv">
+    <dt>Path</dt><dd>{{ caller_text(e.pattern, 600) }}</dd>
+    <dt>Note</dt><dd>{{ caller_text(e.note, 400) }}</dd>
+  </dl>
+  <div class="cluster"><button type="button" class="btn btn--bad" data-dialog-open="dlg-prot-ignored-del" aria-haspopup="dialog" data-action="ignored-remove">{{ icon("x") }}<span>Remove</span></button></div>
+  {% call delete_dialog("dlg-prot-ignored-del", "Stop ignoring this path?", detail.delete_url,
+                        ["Requests for it go through the normal checks again: a non-Roblox path counts as a probe.",
+                         "The removal is written to the audit log."], "ignored-paths", success="The path is no longer ignored.") %}
+    <input type="hidden" name="pattern" value="{{ e.pattern }}" data-query data-json="never">
+  {% endcall %}
+</div>
+{% elif only %}{{ data_table(**table) }}{% else %}
+{% set actions %}<button type="button" class="btn btn--sm" data-dialog-open="dlg-prot-ignored-add" aria-haspopup="dialog" data-action="ignored-add">{{ icon("plus") }}<span>Add a path</span></button>{% endset %}
+{% call page_card(frame, flush=True, actions=actions, subtitle="Answered 404 at once and never logged as probes.") %}
+<p class="prot-pad">An {{ term("ignored-path", "ignored path") }} is for files browsers and tools ask every site for. It is a pattern without the leading slash; every path under it matches too. Roblox endpoints cannot be ignored.</p>
+{{ data_table(**table) }}
+{% call confirm_dialog("dlg-prot-ignored-add", "Ignore a path", api.create, confirm_label="Add", api=True,
+                       success="Path added.", on_success="refresh", refresh="ignored-paths",
+                       consequences=["Requests for it are answered 404 at once, before the probe checks, and are not logged."]) %}
+  <div class="field">
+    <label class="field__label" for="dlg-prot-ignored-add-pattern">Path</label>
+    <input class="input mono" id="dlg-prot-ignored-add-pattern" name="pattern" required aria-required="true" maxlength="1200" autocomplete="off" spellcheck="false" placeholder="favicon.ico" aria-describedby="dlg-prot-ignored-add-pattern-error">
+    {{ field_error("pattern", "dlg-prot-ignored-add-pattern-error") }}
+  </div>
+  <div class="field">
+    <label class="field__label" for="dlg-prot-ignored-add-note">Note <span class="muted">(private)</span></label>
+    <input class="input" id="dlg-prot-ignored-add-note" name="note" maxlength="300">
+  </div>
+  {{ reason_field("dlg-prot-ignored-add-reason") }}
+{% endcall %}
+{% endcall %}
+{% endif %}

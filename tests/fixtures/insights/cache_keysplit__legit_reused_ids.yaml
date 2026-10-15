@@ -1,0 +1,116 @@
+# CACHE-KEYSPLIT stays quiet on legitimate traffic whose id parameters vary but are reused
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "v1 Suspect rule (>= 5 entries, top param >= 80% distinct, hits <= 10%) or SPAM-BUST".
+#
+#   group                                              entries  top parameter  distinct   hits
+#   GET games.roblox.com/v1/games                          10   universeIds    10 (100%)  379 (3,790%)
+#   GET groups.roblox.com/v2/groups                         8   groupIds        8 (100%)   17 (212%)
+#   GET thumbnails.roblox.com/v1/users/avatar-headshot     10   userIds        10 (100%)  105 (1,050%)
+#
+# Every group has a parameter that is unique per entry, which is normal for id lookups; what makes them
+# legitimate is that the entries are reused (hits far above 10%). A SPAM-ENUM detection (a client walking user
+# ids) is also present: it is not SPAM-BUST, so it must not trigger this rule either.
+
+format: roxy.insight_fixture/1
+rule: CACHE-KEYSPLIT
+case: legit_reused_ids
+description: >
+  Busy id lookups whose cache entries each hold a different id but are hit many times, plus an unrelated SPAM-ENUM
+  detection. No group is split, so nothing may fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 5, pattern: "groups.roblox.com/v2/groups", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 1200}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 300}
+  - {name: groups_hit, profile: hit, endpoint_template: groups.roblox.com/v2/groups, window: ["-60m", "0m"], total: 600}
+  - {name: groups_miss, profile: miss, endpoint_template: groups.roblox.com/v2/groups, window: ["-60m", "0m"], total: 300}
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 2400}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 600}
+  - name: user_walk
+    profile: miss
+    endpoint_template: "users.roblox.com/v1/users/{userId}"
+    client_ip: "198.51.100.90"
+    user_agent: "python-requests/2.32"
+    window: ["-12m", "-2m"]
+    per_minute: 64
+
+events:
+  security:
+    - at: "-2m"
+      type: spam_detected
+      severity: info
+      reason_code: spam
+      ip: "198.51.100.90"
+      detail:
+        detector: SPAM-ENUM
+        subject: "ip:198.51.100.90|users.roblox.com/v1/users/{userId}"
+        value: 640
+        threshold: 500
+        window_s: 600
+        action: recommend
+        configured_action: recommend
+        game_server: false
+        evidence: "SPAM-ENUM: 640 in 600 s (threshold 500)"
+
+state:
+  cache:
+    entries:
+      - {id: "b6c0e43b4ddd88297a6a653e", key: "GET games.roblox.com/v1/games?universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-1m", expires_at: "+4m", stale_until: "+14m", ttl: 300, rule_id: 4, egress: "direct", hits: 41, body_len: 900, bytes: 1100}
+      - {id: "a27c75bd36ddcc384609fcda", key: "GET games.roblox.com/v1/games?universeIds=1000000502", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000502\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-6m", expires_at: "-1m", stale_until: "+9m", ttl: 300, rule_id: 4, egress: "direct", hits: 37, body_len: 900, bytes: 1100}
+      - {id: "e638cd0b9c3538f00a3b35e0", key: "GET games.roblox.com/v1/games?universeIds=1000000503", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000503\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-11m", expires_at: "-6m", stale_until: "+4m", ttl: 300, rule_id: 4, egress: "direct", hits: 52, body_len: 900, bytes: 1100}
+      - {id: "04e6df2d60f0c73f8968d04c", key: "GET games.roblox.com/v1/games?universeIds=1000000504", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000504\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-4m", expires_at: "+1m", stale_until: "+11m", ttl: 300, rule_id: 4, egress: "direct", hits: 18, body_len: 900, bytes: 1100}
+      - {id: "3504d805730077096fd4ed34", key: "GET games.roblox.com/v1/games?universeIds=1000000505", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000505\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-9m", expires_at: "-4m", stale_until: "+6m", ttl: 300, rule_id: 4, egress: "direct", hits: 29, body_len: 900, bytes: 1100}
+      - {id: "b0aedb2df4066430c89ea9a5", key: "GET games.roblox.com/v1/games?universeIds=1000000506", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000506\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-2m", expires_at: "+3m", stale_until: "+13m", ttl: 300, rule_id: 4, egress: "direct", hits: 44, body_len: 900, bytes: 1100}
+      - {id: "539c7f90c0e58a8395034996", key: "GET games.roblox.com/v1/games?universeIds=1000000507", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000507\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-7m", expires_at: "-2m", stale_until: "+8m", ttl: 300, rule_id: 4, egress: "direct", hits: 33, body_len: 900, bytes: 1100}
+      - {id: "de0cb71803461751c2cf8291", key: "GET games.roblox.com/v1/games?universeIds=1000000508", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000508\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-12m", expires_at: "-7m", stale_until: "+3m", ttl: 300, rule_id: 4, egress: "direct", hits: 61, body_len: 900, bytes: 1100}
+      - {id: "3944593e94b7b1e28b11aede", key: "GET games.roblox.com/v1/games?universeIds=1000000509", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000509\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-5m", expires_at: "+0m", stale_until: "+10m", ttl: 300, rule_id: 4, egress: "direct", hits: 25, body_len: 900, bytes: 1100}
+      - {id: "aca0c18cd0b37e8da897d12c", key: "GET games.roblox.com/v1/games?universeIds=1000000510", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000510\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-10m", expires_at: "-5m", stale_until: "+5m", ttl: 300, rule_id: 4, egress: "direct", hits: 39, body_len: 900, bytes: 1100}
+      - {id: "584036a1edab53a690f35a6d", key: "GET groups.roblox.com/v2/groups?groupIds=1000000601", method: "GET", host: "groups.roblox.com", path: "v2/groups", params_json: "{\"params\":[[\"groupIds\",\"1000000601\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-1m", expires_at: "+9m", stale_until: "+19m", ttl: 600, rule_id: 5, egress: "direct", hits: 3, body_len: 900, bytes: 1100}
+      - {id: "d5ad3059c4a12cb4a41545fb", key: "GET groups.roblox.com/v2/groups?groupIds=1000000602", method: "GET", host: "groups.roblox.com", path: "v2/groups", params_json: "{\"params\":[[\"groupIds\",\"1000000602\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-6m", expires_at: "+4m", stale_until: "+14m", ttl: 600, rule_id: 5, egress: "direct", hits: 1, body_len: 900, bytes: 1100}
+      - {id: "8ea087fbe1462e548efdc6b8", key: "GET groups.roblox.com/v2/groups?groupIds=1000000603", method: "GET", host: "groups.roblox.com", path: "v2/groups", params_json: "{\"params\":[[\"groupIds\",\"1000000603\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-11m", expires_at: "-1m", stale_until: "+9m", ttl: 600, rule_id: 5, egress: "direct", hits: 2, body_len: 900, bytes: 1100}
+      - {id: "5a8263fac3606129306e5046", key: "GET groups.roblox.com/v2/groups?groupIds=1000000604", method: "GET", host: "groups.roblox.com", path: "v2/groups", params_json: "{\"params\":[[\"groupIds\",\"1000000604\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-4m", expires_at: "+6m", stale_until: "+16m", ttl: 600, rule_id: 5, egress: "direct", hits: 4, body_len: 900, bytes: 1100}
+      - {id: "d20aa0d6469a036703117c07", key: "GET groups.roblox.com/v2/groups?groupIds=1000000605", method: "GET", host: "groups.roblox.com", path: "v2/groups", params_json: "{\"params\":[[\"groupIds\",\"1000000605\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-9m", expires_at: "+1m", stale_until: "+11m", ttl: 600, rule_id: 5, egress: "direct", hits: 1, body_len: 900, bytes: 1100}
+      - {id: "94ea2a1da0da819e59f18501", key: "GET groups.roblox.com/v2/groups?groupIds=1000000606", method: "GET", host: "groups.roblox.com", path: "v2/groups", params_json: "{\"params\":[[\"groupIds\",\"1000000606\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-2m", expires_at: "+8m", stale_until: "+18m", ttl: 600, rule_id: 5, egress: "direct", hits: 2, body_len: 900, bytes: 1100}
+      - {id: "036e41dab362077ba938b92a", key: "GET groups.roblox.com/v2/groups?groupIds=1000000607", method: "GET", host: "groups.roblox.com", path: "v2/groups", params_json: "{\"params\":[[\"groupIds\",\"1000000607\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-7m", expires_at: "+3m", stale_until: "+13m", ttl: 600, rule_id: 5, egress: "direct", hits: 3, body_len: 900, bytes: 1100}
+      - {id: "ffa3afcbd42dda62e6a9355b", key: "GET groups.roblox.com/v2/groups?groupIds=1000000608", method: "GET", host: "groups.roblox.com", path: "v2/groups", params_json: "{\"params\":[[\"groupIds\",\"1000000608\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-12m", expires_at: "-2m", stale_until: "+8m", ttl: 600, rule_id: 5, egress: "direct", hits: 1, body_len: 900, bytes: 1100}
+      - {id: "1ee68c1fddd83a929b213fbf", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000401", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000401\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-1m", expires_at: "+9m", stale_until: "+19m", ttl: 600, rule_id: 3, egress: "direct", hits: 12, body_len: 900, bytes: 1100}
+      - {id: "9869ffa3e80aba9012b6d1a0", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000402", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000402\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-6m", expires_at: "+4m", stale_until: "+14m", ttl: 600, rule_id: 3, egress: "direct", hits: 9, body_len: 900, bytes: 1100}
+      - {id: "dfba1ca64e46c4b42a97f262", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000403", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000403\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-11m", expires_at: "-1m", stale_until: "+9m", ttl: 600, rule_id: 3, egress: "direct", hits: 15, body_len: 900, bytes: 1100}
+      - {id: "9fc6426e433375774e0a6ee4", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000404", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000404\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-4m", expires_at: "+6m", stale_until: "+16m", ttl: 600, rule_id: 3, egress: "direct", hits: 7, body_len: 900, bytes: 1100}
+      - {id: "311ff56ed02220ec6484a824", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000405", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000405\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-9m", expires_at: "+1m", stale_until: "+11m", ttl: 600, rule_id: 3, egress: "direct", hits: 11, body_len: 900, bytes: 1100}
+      - {id: "ab15ff0ddbc95c42149d0f30", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000406", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000406\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-2m", expires_at: "+8m", stale_until: "+18m", ttl: 600, rule_id: 3, egress: "direct", hits: 8, body_len: 900, bytes: 1100}
+      - {id: "481cf164aed8db124295646b", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000407", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000407\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-7m", expires_at: "+3m", stale_until: "+13m", ttl: 600, rule_id: 3, egress: "direct", hits: 14, body_len: 900, bytes: 1100}
+      - {id: "cf8e44a5e4878095e4695e1a", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000408", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000408\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-12m", expires_at: "-2m", stale_until: "+8m", ttl: 600, rule_id: 3, egress: "direct", hits: 10, body_len: 900, bytes: 1100}
+      - {id: "43b986244ce8851071d8dfe5", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000409", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000409\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-5m", expires_at: "+5m", stale_until: "+15m", ttl: 600, rule_id: 3, egress: "direct", hits: 6, body_len: 900, bytes: 1100}
+      - {id: "8fb163673835421f799d589a", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000410", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000410\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-10m", expires_at: "+0m", stale_until: "+10m", ttl: 600, rule_id: 3, egress: "direct", hits: 13, body_len: 900, bytes: 1100}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 6040
+      served_cache: 4200
+  fires: false
+
+variants:
+  - case: max_hit_pct_100
+    description: Even a 100% hit allowance keeps all three groups quiet (each has more hits than entries).
+    settings: {insight_cache_keysplit_max_hit_pct: 100}
+    expect: {fires: false}

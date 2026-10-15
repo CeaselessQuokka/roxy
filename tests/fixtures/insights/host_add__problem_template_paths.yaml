@@ -1,0 +1,80 @@
+# HOST-ADD on refusals recorded the way the proxy records them: under the fixed problem template
+# (format: tests/fixtures/insights/README.md). Added by the rules_cache_egress author (P10).
+#
+# 11.5 row: "One unknown *.roblox.com host requested by >= 5 distinct places or 50 distinct IPs in 24 h, and it
+# resolves publicly"; change "host_add (one click; never automatic)".
+#
+#   proxy/router.py files every refused target under one fixed template per problem, `(host_not_allowed)`, so a
+#   scanner cannot add endpoint rows; the real host is in the `host` dimension and the requested `host/path` is the
+#   refusal's path (OutcomeEvent.path, kept in the recorder's `refusal` event detail). The other HOST-ADD fixtures
+#   put the host in the template; this one has the production shape, with a path written in mixed case.
+#   assetgame.roblox.com (not allowlisted): 300 refusals in the last 5 hours from 50 IPs (198.51.100.0/26) and
+#   2 places. DNS: 192.0.2.91 (a documentation address, public under the test classifier).
+
+format: roxy.insight_fixture/1
+rule: HOST-ADD
+case: problem_template_paths
+description: >
+  Fifty different callers keep requesting assetgame.roblox.com, which resolves publicly but is not in
+  allowed_roblox_hosts. Their refusals are filed under the `(host_not_allowed)` template, as the proxy files them,
+  with the host only in the requested path. The rule must still find the host and propose adding exactly it.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+
+profiles:
+  unknown_host: {egress: none, outcome: refused, reason: host_not_allowed, status: 404, source: roxy, cache_state: "NA", latency_ms: {p50: 1, p95: 3, p99: 6}, bytes: {caller_in: 0, caller_out: 19}}
+
+traffic:
+  - name: assetgame
+    profile: unknown_host
+    endpoint_template: "(host_not_allowed)"
+    host: assetgame.roblox.com
+    window: ["-5h", "0m"]
+    per_minute: 1
+    clients: {cidr: "198.51.100.0/26", count: 50}
+    places: ["1000000031", "1000000032"]
+    paths: ["AssetGame.roblox.com/Game/GamePass/GamePassHandler.ashx", "assetgame.roblox.com/asset/"]
+
+state:
+  dns:
+    "assetgame.roblox.com": {answers: ["192.0.2.91"], latency_ms: 16}
+
+expect:
+  data_checks:
+    - window: ["-24h", "0m"]
+      where: {host: assetgame.roblox.com}
+      requests: 300
+      refused: 300
+      by_reason: {host_not_allowed: 300}
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: HOST-ADD
+      subject_contains: "assetgame.roblox.com"
+      severity: any
+      family: host
+      safe_auto: false
+      change_kinds_required: [host_add]
+      changes_required:
+        - {kind: host_add, proposed: {contains: "assetgame.roblox.com"}}
+      changes_forbidden:
+        - {kind: setting, key: strict_host_allowlist}
+      evidence:
+        metrics:
+          distinct_ips: 50
+          distinct_places: 2
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_host_add_enabled: 0}
+    expect: {fires: false}
+  - case: both_tests_above_evidence
+    description: 51 IPs or 3 places needed; the host has 50 and 2.
+    settings: {insight_host_add_min_ips: 51, insight_host_add_min_places: 3}
+    expect: {fires: false}

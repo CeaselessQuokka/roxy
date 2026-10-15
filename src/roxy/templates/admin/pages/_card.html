@@ -1,0 +1,10 @@
+{#-
+  The default card (`roxy.admin.pages.kit.DEFAULT_CARD_TEMPLATE`): a card whose page module gives no template of
+  its own. A card that only holds catalog settings (one rule's tuning drawer, a spam detector) needs nothing else;
+  any other card shows that it is still being built, so a missing card is visible, never silently empty.
+  Context: `frame` (kit.card_frame).
+-#}
+{% from "components/page_card.html" import page_card %}
+{% call page_card(frame) %}
+{% if not frame.settings %}<p class="muted">This part of the page is still being built.</p>{% endif %}
+{% endcall %}

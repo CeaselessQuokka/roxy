@@ -1,0 +1,173 @@
+# CACHE-TTL-TUNE proposes longer lifetimes for endpoints whose refetches almost always return the same body
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Refetches returned identical body >= 90% over 24 h with >= 50 refetches (raise); < 50% identical
+# (lower)"; evidence "Change observations"; change "Set rule TTL to the median observed change interval, capped by
+# ttl_tuner_max_s (3600)"; confidence High.
+#
+#   template                                     rule (ttl)     identical, last 24 h           tuner (11.3)
+#   groups.roblox.com/v1/groups/{groupId}        6 (120 s)      23,400 refetches, 93.3%        about 1,800 s
+#   badges.roblox.com/v1/badges/{badgeId}        none (120 s)    9,360 refetches, 100%         never changes
+#   games.roblox.com/v1/games/votes              1 (300 s)       1,600 refetches, 80%          (no change)
+#   thumbnails.roblox.com/v1/users/avatar-headshot 3 (600 s)        40 refetches, 100%         (below 50)
+#   catalog.roblox.com/v1/search/items           2 (120 s)      only on 2026-10-04, 98%        (outside 24 h)
+#
+# Change observations are cache.db day rows; with now at 15:00 the 24 hour window reaches into 2026-10-06, so the
+# rows for 2026-10-06 and 2026-10-07 count and the 2026-10-04 row does not.
+# Request samples: groups has 20 keys fetched every 120 s (its lifetime) whose bodies change every 1,800 s, so a
+# scratch 11.3 tuner measures 1,800 s; badges bodies never change in 6 h of samples, so the proposal is the cap,
+# ttl_tuner_max_s (3,600 s).
+#
+# Expected: one recommendation per raised endpoint, each a rule upsert scoped to that endpoint (update of rule 6;
+# a new rule for badges), never the global cache_ttl_seconds.
+
+format: roxy.insight_fixture/1
+rule: CACHE-TTL-TUNE
+case: fires_raise
+description: >
+  Two endpoints return the same body on at least 90% of more than 50 refetches over 24 h: groups (93%, bodies
+  change about every 30 minutes) and badges (100%, never changes). The rule must propose their measured change
+  interval as the cache lifetime, capped at ttl_tuner_max_s, on a rule for each endpoint, and nothing for the
+  80% endpoint, the endpoint with only 40 refetches, or the endpoint whose observations are older than 24 h.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 2, pattern: "catalog.roblox.com/v1/search/items", type: glob, ttl: 120, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 6, pattern: "groups.roblox.com/v1/groups/*", type: glob, ttl: 120, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  # Samples are attached to the fetches only (the tuner reads fetched bodies; hits carry no body hash), so the
+  # 20 groups keys are each fetched exactly every 120 s and the 8 badges keys every 120 s.
+  - {name: groups_hit, profile: hit, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-6h", "0m"], per_minute: 30}
+  - name: groups_miss
+    profile: miss
+    endpoint_template: "groups.roblox.com/v1/groups/{groupId}"
+    window: ["-6h", "0m"]
+    per_minute: 10
+    samples: {key_space: groups, keys: 20, body_change_interval_s: 1800}
+  - {name: badges_hit, profile: hit, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-6h", "0m"], per_minute: 20}
+  - name: badges_miss
+    profile: miss
+    endpoint_template: "badges.roblox.com/v1/badges/{badgeId}"
+    window: ["-6h", "0m"]
+    per_minute: 4
+    samples: {key_space: badges, keys: 8, body_change_interval_s: 0}
+  - {name: votes_hit, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 1500}
+  - {name: votes_miss, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 500}
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 300}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 6}
+
+events:
+  change_observations:
+    - {endpoint_template: "groups.roblox.com/v1/groups/{groupId}", day: "2026-10-06", refetches: 14400, identical_bodies: 13440}
+    - {endpoint_template: "groups.roblox.com/v1/groups/{groupId}", day: "2026-10-07", refetches: 9000, identical_bodies: 8400}
+    - {endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", day: "2026-10-06", refetches: 5760, identical_bodies: 5760}
+    - {endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", day: "2026-10-07", refetches: 3600, identical_bodies: 3600}
+    - {endpoint_template: games.roblox.com/v1/games/votes, day: "2026-10-06", refetches: 1000, identical_bodies: 800}
+    - {endpoint_template: games.roblox.com/v1/games/votes, day: "2026-10-07", refetches: 600, identical_bodies: 480}
+    - {endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, day: "2026-10-07", refetches: 40, identical_bodies: 40}
+    - {endpoint_template: catalog.roblox.com/v1/search/items, day: "2026-10-04", refetches: 2000, identical_bodies: 1960}
+
+expect:
+  data_checks:
+    - window: ["-6h", "0m"]
+      where: {endpoint_template: "groups.roblox.com/v1/groups/{groupId}"}
+      requests: 14400
+      upstream_calls: 3600
+    - window: ["-6h", "0m"]
+      where: {endpoint_template: "badges.roblox.com/v1/badges/{badgeId}"}
+      requests: 8640
+      upstream_calls: 1440
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CACHE-TTL-TUNE
+      subject_contains: "groups.roblox.com/v1/groups/"
+      severity: any
+      family: cache
+      confidence: high
+      change_kinds_required: [rule_upsert]
+      change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, routing_rule, host_add, bucket_override, ignored_param_add]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["groups.roblox.com/v1/groups/1000000201"]}}
+          current: {ttl: 120}
+          proposed: {ttl: {between: [1500, 2100]}}
+      changes_forbidden:
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_stale_seconds, ttl_tuner_max_s]}
+    - rule_id: CACHE-TTL-TUNE
+      subject_contains: "badges.roblox.com/v1/badges/"
+      severity: any
+      family: cache
+      confidence: high
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["badges.roblox.com/v1/badges/1000000701"]}}
+          current: null
+          proposed: {ttl: {between: [3000, 3600]}}     # no change seen, so the cap
+      changes_forbidden:
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_stale_seconds, ttl_tuner_max_s]}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cache_ttl_tune_enabled: 0}
+    expect: {fires: false}
+  - case: tuner_disabled
+    description: ttl_tuner_enabled = 0 means "no lifetime tuning proposals" (15.3 D and the catalog text).
+    settings: {ttl_tuner_enabled: 0}
+    expect: {fires: false}
+  - case: raise_threshold_99
+    description: At 99% only badges (100%) qualifies; groups (93.3%) does not.
+    settings: {insight_cache_ttl_tune_identical_raise_pct: 99}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "badges.roblox.com/v1/badges/", severity: any}
+  - case: raise_threshold_100_min_refetches_high
+    description: At 100% and 10,000 refetches neither endpoint qualifies (badges has 9,360).
+    settings: {insight_cache_ttl_tune_identical_raise_pct: 100, insight_cache_ttl_tune_min_refetches: 10000}
+    expect: {fires: false}
+  - case: tuner_cap_1200
+    description: ttl_tuner_max_s caps both proposals at 1,200 s.
+    settings: {ttl_tuner_max_s: 1200}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "groups.roblox.com/v1/groups/"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, table: rules_cache, current: {ttl: 120}, proposed: {ttl: {gt: 120, lte: 1200}}}
+        - subject_contains: "badges.roblox.com/v1/badges/"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, table: rules_cache, current: null, proposed: {ttl: {gt: 120, lte: 1200}}}
+  - case: severity_override_info
+    description: insight_cache_ttl_tune_severity replaces the computed severity.
+    settings: {insight_cache_ttl_tune_severity: info}
+    expect:
+      fires: true
+      recommendations:
+        - {subject_contains: "groups.roblox.com/v1/groups/", severity: info}
+        - {subject_contains: "badges.roblox.com/v1/badges/", severity: info}

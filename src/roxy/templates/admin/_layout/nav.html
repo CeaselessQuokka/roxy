@@ -1,0 +1,30 @@
+{#-
+  Navigation model: the dashboard pages, their groups, icons and shortcuts, from the page registry.
+
+  What: `NAV` (groups of pages, in sidebar order), `PAGES` (the same pages flattened, Help last), `HELP_PAGE`,
+  `RANGES` (time range presets, plan 14.2) and `COMPARES` (comparison choices), plus `page_href(id)`.
+  Why: the sidebar, the phone menu, the command palette and the shortcut overlay must list the same pages with the
+  same names. The list itself lives in ONE place, `roxy/admin/pages/registry.py` (read here through the Jinja
+  global `admin_nav()`), which the page routes and the acceptance tests read too. Page ids are the anchors of
+  DESIGN.md section 9.
+  How: imported with `{% from "admin/_layout/nav.html" import NAV, PAGES, RANGES, COMPARES, page_href %}`.
+  Page URLs are `/admin/<id>`; `keys` are the plan 14.6 "g" shortcuts. The range and comparison values are the
+  admin API's own parameter values (`range`, `compare`), so a page URL is also a valid API query.
+-#}
+{% set NAV_MODEL = admin_nav() %}
+{% set NAV = NAV_MODEL["groups"] %}
+{% set HELP_PAGE = NAV_MODEL["help"] %}
+{% set PAGES = NAV_MODEL["pages"] %}
+
+{% set RANGES = [
+  ("live", "Live", "Last 15 minutes, streaming"), ("1h", "1 hour", "Last hour"), ("6h", "6 hours", "Last 6 hours"),
+  ("24h", "24 hours", "Last 24 hours"), ("7d", "7 days", "Last 7 days"), ("30d", "30 days", "Last 30 days"),
+  ("90d", "90 days", "Last 90 days"), ("1y", "1 year", "Last year"), ("all", "All", "All time")
+] %}
+
+{% set COMPARES = [
+  ("none", "No comparison"), ("previous", "Previous period"), ("week", "Same period last week"),
+  ("month", "Same period last month"), ("year", "Same period last year")
+] %}
+
+{% macro page_href(id) -%}/admin/{{ id }}{%- endmacro %}

@@ -1,0 +1,68 @@
+# FILTER-COLLATERAL just under its threshold (other traffic more than 95% served).
+#
+#   place        refused by the block   other traffic   served share of other traffic
+#   1000000211   200                    3,000           2,820 / 3,000 = 94.0%   (just under 95)
+#   1000000212   100                    3,000           2,760 / 3,000 = 92.0%
+#
+# Both places are throttled a fair amount on their own, so the block is not clearly hurting otherwise healthy
+# traffic. The variant lowers the threshold to 90% and both places then count.
+
+format: roxy.insight_fixture/1
+rule: FILTER-COLLATERAL
+case: places_mostly_refused
+description: >
+  An endpoint block refuses requests from two places whose other traffic is 94% and 92% served, under the 95%
+  threshold. FILTER-COLLATERAL must not fire; at a 90% threshold it must flag the block.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  rules_endpoint_block:
+    - {id: 1, pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob, note: "Block avatar scraping", message: "This endpoint is not available through Roxy.", enabled: 1, created_at: "-3d", created_by: admin, x_last_hit_at: "-1m"}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  blocked: {egress: none, outcome: refused, reason: endpoint_blocked, status: 403, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 120}, endpoint_template: "avatar.roblox.com/v1/users/{userId}/avatar"}
+  place_211: {clients: {cidr: "203.0.113.0/27", count: 25}, place_id: "1000000211", user_agent: "Roblox/Linux"}
+  place_212: {clients: {cidr: "203.0.113.32/27", count: 25}, place_id: "1000000212", user_agent: "Roblox/Linux"}
+
+traffic:
+  - {name: p211_hit, profile: [hit, place_211], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2200}
+  - {name: p211_miss, profile: [miss, place_211], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], total: 620}
+  - {name: p211_throttled, profile: [throttled, place_211], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], total: 180}
+  - {name: p211_blocked, profile: [blocked, place_211], window: ["-60m", "0m"], total: 200}
+  - {name: p212_hit, profile: [hit, place_212], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2000}
+  - {name: p212_miss, profile: [miss, place_212], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], total: 760}
+  - {name: p212_throttled, profile: [throttled, place_212], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], total: 240}
+  - {name: p212_blocked, profile: [blocked, place_212], window: ["-60m", "0m"], total: 100}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/27", count: 25}, bot_score: 12}
+    - {clients: {cidr: "203.0.113.32/27", count: 25}, bot_score: 14}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], where: {place_id: "1000000211"}, requests: 3200, refused: 380}
+    - {window: ["-60m", "0m"], where: {place_id: "1000000212"}, requests: 3100, refused: 340}
+  fires: false
+
+variants:
+  - case: served_pct_90
+    description: At 90%, both places (94% and 92%) count as legitimate collateral of the block.
+    settings: {insight_filter_collateral_served_pct: 90}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - any_of:
+                - {kind: rule_upsert, table: rules_endpoint_block, match: {pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob}}
+                - {kind: rule_delete, table: rules_endpoint_block, match: {pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob}}
+                - {kind: filter_remove, table: rules_endpoint_block, match: {pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob}}

@@ -1,0 +1,37 @@
+format: roxy.health_fixture/1
+check: H-BANS
+case: warn
+name: wide_cidr_without_note
+description: >
+  The same ban list as the pass fixture, except that the /8 range ban has no reason text: a CIDR larger than /16
+  without a note. It covers no bypass IP, admin address or top place, so it is not a conflict. 13.2 H-BANS: a
+  CIDR larger than /16 without note is suspicious, which gives warn, with the Protection page as the fix.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  tables:
+    access_list:
+      - {id: 1, kind: bypass, cidr: "198.51.100.7/32", note: "Load test box", expires_at: "+20h", created_by: admin, created_at: "-4h"}
+      - {id: 2, kind: allow_admin, cidr: "198.51.100.10/32", note: "Owner", expires_at: null, created_by: admin, created_at: "-90d"}
+    bans:
+      - {id: 1, subject_type: ip, subject: "203.0.113.66", reason_code: spam, reason_text: "SPAM-RATE: five times the per-IP limit for ten minutes", created_at: "-20m", expires_at: "+40m", created_by: "auto:spam_rate", hits: 340, last_hit_at: "-1m"}
+      - {id: 2, subject_type: cidr, subject: "192.0.2.128/25", reason_code: banned, reason_text: "Scraper fleet in one hosting range; reviewed.", created_at: "-10d", expires_at: null, created_by: admin, hits: 12000, last_hit_at: "-2h"}
+      - {id: 3, subject_type: place, subject: "1000000099", reason_code: banned, reason_text: "Place used only for scraping; reviewed.", created_at: "-5d", expires_at: null, created_by: admin, hits: 900, last_hit_at: "-3h"}
+      - {id: 5, subject_type: cidr, subject: "10.0.0.0/8", reason_code: banned, reason_text: null, created_at: "-1h", expires_at: null, created_by: admin, hits: 0, last_hit_at: null}
+  state:
+    admin_logins:
+      - {at: "-3h", ip: "198.51.100.10", username: owner, successful: true, method: totp}
+  profiles:
+    served: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: 150, user_agent: "Roblox/Linux"}
+  traffic:
+    - name: games_by_place
+      profile: served
+      endpoint_template: games.roblox.com/v1/games
+      window: ["-24h", "0m"]
+      per_minute: 2
+      clients: {cidr: "203.0.113.0/26", count: 40}
+      places: ["1000000001", "1000000001", "1000000001", "1000000002", "1000000003"]
+expect:
+  status: warn
+  explanation: {present: true}
+  fix_link: {regex: "(?i)protection"}
+  credential_calls: {eq: 0}

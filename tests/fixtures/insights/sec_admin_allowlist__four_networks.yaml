@@ -1,0 +1,43 @@
+# SEC-ADMIN-ALLOWLIST just over its network limit (at most 3 networks in 30 days), so it must not fire.
+#
+#   network              successful logins in the last 30 days
+#   198.51.100.0/24      28 (198.51.100.10)
+#   203.0.113.0/24       5  (203.0.113.40)
+#   192.0.2.0/24         2  (192.0.2.60)
+#   2001:db8:5:1::/64    3  (2001:db8:5:1::10, a laptop on an IPv6 network; also its own /48)
+#
+# Four networks under any sensible grouping (IPv4 /24 or /16; IPv6 /64 or /48). The variant allows four networks and
+# the rule must then fire.
+
+format: roxy.insight_fixture/1
+rule: SEC-ADMIN-ALLOWLIST
+case: four_networks
+description: >
+  In the last 30 days the admin logged in from four networks, one more than the limit of three. SEC-ADMIN-ALLOWLIST must
+  not fire; allowing four networks must make it fire.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  admin_logins:
+    - {window: ["-29d", "-1d"], every: "1d", ip: "198.51.100.10", username: owner, successful: true, method: totp}
+    - {window: ["-28d", "-3d"], every: "5d", ip: "203.0.113.40", username: owner, successful: true, method: passkey}
+    - {at: "-20d", ip: "192.0.2.60", username: owner, successful: true, method: totp}
+    - {at: "-12d", ip: "192.0.2.60", username: owner, successful: true, method: totp}
+    - {at: "-9d", ip: "2001:db8:5:1::10", username: owner, successful: true, method: totp}
+    - {at: "-5d", ip: "2001:db8:5:1::10", username: owner, successful: true, method: trusted_device}
+    - {at: "-3h", ip: "2001:db8:5:1::10", username: owner, successful: true, method: trusted_device}
+
+expect:
+  fires: false
+
+variants:
+  - case: max_networks_raised
+    description: Allowing four networks, the four seen qualify and the allowlist is recommended.
+    settings: {insight_sec_admin_allowlist_max_networks: 4}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - safe_auto: false
+          changes_required:
+            - {kind: setting, key: admin_allowlist_enabled, current: 0, proposed: 1}

@@ -1,0 +1,47 @@
+# UP-UA-EXPERIMENT just under its threshold: too few calls per arm (format: README.md in this directory).
+#
+# 11.5: "Medium once n >= 10,000 calls per arm" (`min_calls_per_arm` = 10,000, the gate for naming a winner).
+#
+#   arm                                   calls   Roblox 429s   rate
+#   current direct_user_agent             9,500   67            0.71%
+#   "Roxy/2 (+https://roxy.test)"         9,400   14            0.15%
+#
+# The difference already looks large, but neither arm has 10,000 calls, so the rule must wait. A minimum of
+# 9,400 (variant) lets it name the alternative.
+
+format: roxy.insight_fixture/1
+rule: UP-UA-EXPERIMENT
+case: arms_below_min_calls
+description: >
+  Three days into the experiment each arm has fewer than 10,000 calls. Even though the alternative User-Agent
+  looks better, the rule must not recommend a switch until both arms reach the minimum.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  ua_experiment_enabled: 1
+  ua_experiment_days: 7
+  direct_user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+  ua_experiment_alt_user_agent: "Roxy/2 (+https://roxy.test)"
+
+state:
+  ua_experiment:
+    arms:
+      - {user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36", calls: 9500, roblox_429: 67}
+      - {user_agent: "Roxy/2 (+https://roxy.test)", calls: 9400, roblox_429: 14}
+  settings_history:
+    - {at: "-3d", key: ua_experiment_enabled, old: 0, new: 1, source: admin, changed_by: admin, reason: "D23: measure which UA Roblox limits less."}
+
+expect:
+  fires: false
+
+variants:
+  - case: min_calls_per_arm_9400
+    description: Both arms have at least 9,400 calls, and the alternative's lower 429 rate is clear.
+    settings: {insight_up_ua_experiment_min_calls_per_arm: 9400}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - {kind: setting, key: direct_user_agent, proposed: "Roxy/2 (+https://roxy.test)"}

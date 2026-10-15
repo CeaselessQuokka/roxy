@@ -1,0 +1,113 @@
+# CACHE-PRESSURE stays quiet just under its share, and its window really limits what it counts
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Evictions of entries younger than their TTL > 5% of stores over 1 h"
+# (insight_cache_pressure_young_eviction_pct 5.0, _window_min 60).
+#
+#   cache_max_bytes 64 MiB is the binding cap (every pass starts just above it, about 20,300 entries).
+#   Last 60 min:  6,000 stores, 294 young evictions (4.9%)   <- just under 5%
+#   -120 to -60:  6,000 stores, 750 young evictions (12.5%)  (a burst of large thumbnails)
+#   Over 120 min: 1,044 of 12,000 (8.7%).
+
+format: roxy.insight_fixture/1
+rule: CACHE-PRESSURE
+case: below_threshold
+description: >
+  In the last hour 4.9% of stores were evicted while still fresh, just under the 5% threshold, after a worse hour
+  before that. Nothing may fire at the defaults; a 4.8% threshold or a 120 minute window must fire and propose a
+  larger cache_max_bytes.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  cache_max_bytes: 67108864
+
+tables:
+  rules_cache:
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 3000}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 3000, upstream_in: 3100, upstream_out: 420}}
+
+traffic:
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-120m", "0m"], per_minute: 90}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-120m", "0m"], per_minute: 60}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-120m", "0m"], per_minute: 60}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-120m", "0m"], per_minute: 40}
+
+state:
+  settings_history:
+    - {at: "-10d", key: cache_max_bytes, old: 536870912, new: 67108864, source: admin, changed_by: admin, reason: "Keep cache.db small on the 1 GB server."}
+  disk:
+    total_bytes: 40000000000
+    free_bytes: 31000000000
+    files:
+      "cache.db": {bytes: 69500000, wal_bytes: 4100000}
+  cache:
+    stores:
+      - {at: "-110m", count: 2000}
+      - {at: "-90m", count: 2000}
+      - {at: "-70m", count: 2000}
+      - {at: "-50m", count: 2000}
+      - {at: "-30m", count: 2000}
+      - {at: "-10m", count: 2000}
+    evictions:
+      - {at: "-100m", age_s: 150, ttl_s: 600, count: 250}
+      - {at: "-80m", age_s: 210, ttl_s: 600, count: 250}
+      - {at: "-62m", age_s: 330, ttl_s: 600, count: 250}
+      - {at: "-100m", age_s: 1100, ttl_s: 600, count: 1750}
+      - {at: "-80m", age_s: 900, ttl_s: 300, count: 1750}
+      - {at: "-62m", age_s: 1250, ttl_s: 600, count: 1750}
+      - {at: "-40m", age_s: 260, ttl_s: 600, count: 98}
+      - {at: "-20m", age_s: 140, ttl_s: 300, count: 98}
+      - {at: "-2m", age_s: 410, ttl_s: 600, count: 98}
+      - {at: "-40m", age_s: 1000, ttl_s: 600, count: 1902}
+      - {at: "-20m", age_s: 700, ttl_s: 300, count: 1902}
+      - {at: "-2m", age_s: 1180, ttl_s: 600, count: 1902}
+    passes:
+      - {at: "-100m", entries_before: 20300, bytes_before: 67500000, evicted: 2000, freed_bytes: 6700000}
+      - {at: "-80m", entries_before: 20290, bytes_before: 67490000, evicted: 2000, freed_bytes: 6690000}
+      - {at: "-62m", entries_before: 20310, bytes_before: 67520000, evicted: 2000, freed_bytes: 6710000}
+      - {at: "-40m", entries_before: 20300, bytes_before: 67510000, evicted: 2000, freed_bytes: 6700000}
+      - {at: "-20m", entries_before: 20280, bytes_before: 67480000, evicted: 2000, freed_bytes: 6680000}
+      - {at: "-2m", entries_before: 20320, bytes_before: 67530000, evicted: 2000, freed_bytes: 6720000}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      upstream_calls: 6000
+    - window: ["-120m", "0m"]
+      upstream_calls: 12000
+  fires: false
+
+variants:
+  - case: young_eviction_pct_4_8
+    description: At 4.8% of stores, the last hour's 4.9% is enough.
+    settings: {insight_cache_pressure_young_eviction_pct: 4.8}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - severity: any
+          safe_auto: false
+          changes_required:
+            - {kind: setting, key: cache_max_bytes, current: 67108864, proposed: {gt: 67108864}}
+  - case: window_120
+    description: Over 120 minutes young evictions are 8.7% of stores.
+    settings: {insight_cache_pressure_window_min: 120}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - severity: any
+          safe_auto: false
+          changes_required:
+            - {kind: setting, key: cache_max_bytes, current: 67108864, proposed: {gt: 67108864}}

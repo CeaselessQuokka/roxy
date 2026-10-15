@@ -1,0 +1,52 @@
+{#-
+  Cache page, card `purge` (`roxy/admin/pages/cache.py purge_card`): remove stored answers on purpose.
+
+  One form for every purge scope of `POST /admin/api/v1/cache/purge` except a single entry (the browser's drawer
+  has that): an endpoint pattern (wildcard or regex, the type is honored, v1 bug 5), a host, a cache rule's id, the
+  browser's search text (the same matcher as the browser), or the expired answers (optionally also those still in
+  their stale window). Pressing "Review the purge" fills the shared purge dialog (static/js/pages/cache.js), which
+  says what will happen and sends it; the API writes the audit row first and every worker drops its copies within
+  a second. "Empty the whole cache" opens the typed confirmation. Context: `frame`, `scopes`, `hosts`, `purge_url`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+{% call page_card(frame) %}
+<p class="cache-intro">A {{ term("purge") }} deletes stored answers now; the next caller asking for one goes to Roblox. Use it after Roblox changed something you cached for a long time, or to test a rule.</p>
+<form class="stack cache-form" id="cache-purge-form" data-purge-prepare novalidate>
+  <div class="field-row">
+    <div class="field">
+      <label class="field__label" for="cache-purge-scope">What to purge</label>
+      <select class="input" id="cache-purge-scope" name="scope">
+        {% for value, label in scopes %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label class="field__label" for="cache-purge-value">Value</label>
+      <input class="input mono" id="cache-purge-value" name="value" maxlength="1000" autocomplete="off" spellcheck="false" list="cache-purge-hosts"
+             placeholder="games.roblox.com/v1/games/*/votes" aria-describedby="cache-purge-value-hint cache-purge-value-error">
+      <p class="field__hint" id="cache-purge-value-hint">A pattern like a cache rule's, a host such as games.roblox.com, a rule number, or search text. Leave it empty for expired answers.</p>
+      <p class="field__error" id="cache-purge-value-error" data-purge-error hidden></p>
+      <datalist id="cache-purge-hosts">{% for host in hosts %}<option value="{{ host }}"></option>{% endfor %}</datalist>
+    </div>
+  </div>
+  <div class="field-row">
+    <div class="field">
+      <label class="field__label" for="cache-purge-type">Pattern type</label>
+      <select class="input" id="cache-purge-type" name="type" aria-describedby="cache-purge-type-hint">
+        <option value="glob" selected>Wildcard</option>
+        <option value="regex">Regex</option>
+      </select>
+      <p class="field__hint" id="cache-purge-type-hint">Used for an endpoint pattern only.</p>
+    </div>
+    <div class="field">
+      <span class="field__label" id="cache-purge-stale-label">Expired answers</span>
+      <label class="check"><input type="checkbox" name="include_stale" aria-describedby="cache-purge-stale-label"><span>Also those still inside their stale window</span></label>
+    </div>
+  </div>
+  <div class="cluster">
+    <button type="button" class="btn btn--danger" data-dialog-open="dlg-cache-purge" data-purge-open data-action="cache-purge">{{ icon("x-circle") }}<span>Review the purge</span></button>
+    <button type="button" class="btn btn--bad-soft" data-dialog-open="dlg-cache-purge-all" data-action="cache-purge-all-card">{{ icon("alert-triangle") }}<span>Empty the whole cache</span></button>
+  </div>
+</form>
+{% endcall %}

@@ -1,0 +1,32 @@
+{#-
+  System page, card `leader` (`roxy/admin/pages/system.py leader_card`): who leads the fleet.
+
+  `GET /admin/api/v1/system/leader` (`system_api.leader_state`): the holder of the hot.db `leader` lease, its epoch
+  (the fencing token every leader job writes with), when the lease runs out, and this worker's own view.
+  Context: `frame`, `state`, `holder_is_me`, `since`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num, caller_text %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/system/_macros.html" import when %}
+{% set mine = state.this_worker %}
+{% call page_card(frame) %}
+<div class="stack">
+  <dl class="kv system-kv">
+    <dt>{{ term("leader", "Leader") }}</dt>
+    <dd>{% if state.holder %}<span class="mono system-id">{{ state.holder }}</span>{% if holder_is_me %} {{ badge("this worker", "info") }}{% endif %}{% else %}<span class="muted">No worker holds the lease right now</span>{% endif %}</dd>
+    <dt>{{ term("epoch", "Epoch") }}</dt>
+    <dd>{{ num(state.epoch) if state.epoch is not none else "n/a" }}</dd>
+    <dt>{{ term("lease", "Lease") }}</dt>
+    <dd>{% if state.valid %}{{ status_badge("ok", "Held") }} <span class="muted">runs out in {{ state.expires_in_s }} s unless renewed</span>{% else %}{{ status_badge("bad", "Not held") }} <span class="muted">another worker takes over within 15 s</span>{% endif %}</dd>
+    <dt>This worker</dt>
+    <dd>{{ "Leads the fleet" if mine.is_leader else "Follows the leader" }}{% if mine.epoch is not none %} <span class="muted">(epoch {{ num(mine.epoch) }})</span>{% endif %}</dd>
+    {% if mine.is_leader %}<dt>Leading since</dt><dd>{{ when(since) }}</dd>{% endif %}
+    <dt>Leadership changes</dt>
+    <dd>{{ num(mine.changes) if mine.changes is not none else "n/a" }} <span class="muted">seen by this worker</span></dd>
+    {% if mine.last_error %}<dt>Last error</dt><dd>{{ caller_text(mine.last_error, 300) }}</dd>{% endif %}
+  </dl>
+  <p class="muted">One worker leads at a time and runs the scheduled jobs. Every write a job makes carries the epoch, so a worker that lost the lead without noticing can never overwrite the new leader's work.</p>
+</div>
+{% endcall %}

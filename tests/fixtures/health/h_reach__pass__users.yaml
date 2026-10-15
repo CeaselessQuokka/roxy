@@ -1,0 +1,26 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: users.roblox.com}
+case: pass
+name: users
+description: >
+  The users probe (13.4: GET /v1/users/<public user id>) answers 200 JSON with `id` in 140 ms. 13.2 H-REACH:
+  expected status and under 800 ms gives pass. Anonymous: the credential is never used for a reachability
+  probe, even on the host the credential probe also uses.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    credential: {present: true, status: active, status_at: "-25m", set_at: "-20d", account_id: "1000001"}
+  upstream:
+    "probe:users.roblox.com":
+      status: 200
+      json: {id: 1, name: "fixture_user", displayName: "Fixture User", hasVerifiedBadge: false}
+      latency_ms: 140
+      expect_request: {via: direct, method: GET, headers_absent: [cookie]}
+expect:
+  status: pass
+  value: {present: true}
+  calls:
+    "probe:users.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}
+  no_calls_to: ["https://users.roblox.com/v1/users/authenticated"]

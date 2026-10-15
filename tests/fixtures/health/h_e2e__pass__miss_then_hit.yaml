@@ -1,0 +1,81 @@
+format: roxy.health_fixture/1
+check: H-E2E
+case: pass
+name: miss_then_hit
+description: >
+  The end to end check asks the public origin (nginx, then Roxy) for games.roblox.com/v1/games?universeIds=<fixed
+  public id> twice. Both answers are 200 with Roxy-Request-Id, the security headers and no Server header; the
+  first is a MISS and the second a HIT, so the cache transitioned. 13.2 H-E2E: all as expected gives pass. The
+  variant starts from a cached entry and refreshes it (HIT, then REVALIDATING), which 13.2 also accepts.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "origin:/games.roblox.com/v1/games?*":
+      - status: 200
+        headers:
+          content-type: "application/json; charset=utf-8"
+          roxy-cache: "MISS"
+          roxy-request-id: "01K72Q8M3V5X7Z9B1D3F5H7J9K"
+          roxy-upstream-status: "200"
+          strict-transport-security: "max-age=63072000; includeSubDomains"
+          x-content-type-options: "nosniff"
+          x-frame-options: "DENY"
+          referrer-policy: "no-referrer"
+          cross-origin-opener-policy: "same-origin"
+          permissions-policy: "camera=(), microphone=(), geolocation=(), usb=(), payment=()"
+        json: {data: [{id: 1, rootPlaceId: 2, name: "Fixture Experience", playing: 12}]}
+        latency_ms: 240
+      - status: 200
+        headers:
+          content-type: "application/json; charset=utf-8"
+          roxy-cache: "HIT"
+          roxy-request-id: "01K72Q8M3V5X7Z9B1D3F5H7J9M"
+          strict-transport-security: "max-age=63072000; includeSubDomains"
+          x-content-type-options: "nosniff"
+          x-frame-options: "DENY"
+          referrer-policy: "no-referrer"
+          cross-origin-opener-policy: "same-origin"
+          permissions-policy: "camera=(), microphone=(), geolocation=(), usb=(), payment=()"
+        json: {data: [{id: 1, rootPlaceId: 2, name: "Fixture Experience", playing: 12}]}
+        latency_ms: 9
+expect:
+  status: pass
+  calls:
+    "origin:/games.roblox.com/v1/games?*": {count: 2}
+  credential_calls: {eq: 0}
+variants:
+  - case: pass
+    name: hit_then_revalidating
+    inputs:
+      upstream:
+        "origin:/games.roblox.com/v1/games?*":
+          - status: 200
+            headers:
+              content-type: "application/json; charset=utf-8"
+              roxy-cache: "HIT"
+              roxy-request-id: "01K72Q8M3V5X7Z9B1D3F5H7J9N"
+              strict-transport-security: "max-age=63072000; includeSubDomains"
+              x-content-type-options: "nosniff"
+              x-frame-options: "DENY"
+              referrer-policy: "no-referrer"
+              cross-origin-opener-policy: "same-origin"
+              permissions-policy: "camera=(), microphone=(), geolocation=(), usb=(), payment=()"
+            json: {data: [{id: 1, rootPlaceId: 2, name: "Fixture Experience", playing: 12}]}
+            latency_ms: 8
+          - status: 200
+            headers:
+              content-type: "application/json; charset=utf-8"
+              roxy-cache: "REVALIDATING"
+              roxy-request-id: "01K72Q8M3V5X7Z9B1D3F5H7J9P"
+              strict-transport-security: "max-age=63072000; includeSubDomains"
+              x-content-type-options: "nosniff"
+              x-frame-options: "DENY"
+              referrer-policy: "no-referrer"
+              cross-origin-opener-policy: "same-origin"
+              permissions-policy: "camera=(), microphone=(), geolocation=(), usb=(), payment=()"
+            json: {data: [{id: 1, rootPlaceId: 2, name: "Fixture Experience", playing: 12}]}
+            latency_ms: 10
+    expect:
+      status: pass
+      calls:
+        "origin:/games.roblox.com/v1/games?*": {count: 2}

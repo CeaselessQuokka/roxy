@@ -1,0 +1,25 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: users.roblox.com}
+case: warn
+name: users_429
+description: >
+  The users probe gets a fast 429 with Retry-After 30. 13.2 H-REACH: a 429 gives warn (reachable, but rate
+  limited). With fallback_on_429 at its default 0 there is no retry on another egress, so exactly one call.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:users.roblox.com":
+      status: 429
+      headers: {retry-after: "30"}
+      json: {errors: [{code: 0, message: "Too many requests"}]}
+      latency_ms: 90
+      expect_request: {via: direct, method: GET}
+expect:
+  status: warn
+  value: {regex: "429"}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)upstream"}
+  calls:
+    "probe:users.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}

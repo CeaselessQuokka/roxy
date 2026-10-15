@@ -1,0 +1,90 @@
+"""Check 7, the per-IP throttle: the normal fairness limit (10 requests per 50 s by default) and its strike ladder.
+
+What this is
+    `ThrottleCheck` (plan 4.3 rows 39 and 40, plan 10.2 and 10.4). The decision itself is `roxy/abuse/throttle.py`
+    `evaluate_per_ip`, run inside the pipeline's single hot.db transaction.
+
+Why it exists
+    This is the limit most callers meet. It must be exact across workers (C6), never let the crossing request through
+    (v1 B8), and tell the caller precisely when to come back.
+
+How it works
+    - Skipped for bypass entries. Fresh cache hits count like every other request (`throttle_count_cache_hits`,
+      default 1: the owner reversed D10 on 2026-10-07, because serving a cache hit still costs Roxy resources);
+      with the setting at 0 a fresh cache hit is neither counted nor refused.
+    - Refusal: 429 with the ladder rung's message for the client's strikes, or v1's fallback text when the ladder is
+      empty or the rung has no message; `Retry-After` (the GCRA wait or the rung's penalty, whichever is longer),
+      `Roxy-Throttle-Reset`, `Roxy-Throttled: True`, `Roxy-Requests-Left: 0`. Tarpit category `throttle`.
+    - With `cache_serve_throttled` the refusal carries `allow_fresh_cache_serve`, and the router answers from a fresh
+      cached copy instead (row 60), unless a check after this one (a header filter, auth smuggling, an endpoint
+      block, any static refusal) would refuse the request: the pipeline then clears the flag and the caller gets
+      this throttle refusal (v1 step 4a served the cache before those filters ran; v2 never serves content to a
+      request a filter refuses).
+
+What to read next
+    `roxy/abuse/throttle.py`, then `roxy/abuse/checks/place_limit.py`.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from roxy.abuse.checks.base import Check, Facts, LimitSpec, TxState, throttle_refusal_headers, with_trio
+from roxy.abuse.messages import REASON_PER_IP, throttle_fallback
+from roxy.abuse.verdict import MessageSource, Refuse
+from roxy.core.reasons import ReasonCode
+
+
+class ThrottleCheck(Check):
+    name = "throttle"
+    position = 70
+    label = "Per-IP throttle"
+    kind = "limiter"
+    skipped_by_bypass = True
+    tarpit_category = "throttle"
+
+    def prepare(self, req: Any, facts: Facts) -> Refuse | LimitSpec | None:
+        policy = facts.per_ip
+        if policy is None:
+            return None
+        if getattr(req, "fresh_cache_hit", False) and not facts.flag("throttle_count_cache_hits"):
+            return None  # the admin chose not to count fresh cache hits: neither counted nor refused
+        payload = {
+            "serve_from_cache": facts.flag("cache_serve_throttled") and bool(getattr(req, "fresh_cache_hit", False))
+        }
+        return LimitSpec(
+            self.name,
+            policy.key,
+            "per_ip",
+            limit=policy.limit,
+            window_s=policy.window_s,
+            per_ip=policy,
+            payload=payload,
+        )
+
+    async def check(self, req: Any, tx: TxState) -> Refuse | None:
+        outcome = tx.outcomes.get(self.name)
+        if outcome is None or outcome.admitted or outcome.per_ip is None:
+            return None
+        result = outcome.per_ip
+        text = result.rung.message.strip()
+        source: MessageSource = "custom" if text else "default"
+        if not text:
+            text = throttle_fallback(result.reset_s, outcome.spec.limit)
+        refusal = Refuse(
+            status=429,
+            body=text,
+            reason=ReasonCode.THROTTLE,
+            check=self.name,
+            # The one builder disguised refusals use too: same headers, same order on the wire (plan 10.5).
+            headers=throttle_refusal_headers(result.retry_after_s, result.reset_s),
+            tarpit_category=self.tarpit_category,
+            message_source=source,
+            allow_fresh_cache_serve=bool(outcome.spec.payload and outcome.spec.payload.get("serve_from_cache")),
+            penalty_retry_after_s=result.penalty_s or None,
+            detail=REASON_PER_IP.format(limit=outcome.spec.limit, window=int(outcome.spec.window_s)),
+        )
+        return with_trio(refusal, tx)
+
+
+__all__ = ["ThrottleCheck"]

@@ -1,0 +1,25 @@
+{#-
+  Cache page, card `settings` (`roxy/admin/pages/cache.py settings_card`): the cache settings with v1's explainers.
+
+  Above the catalog settings of `cache#settings` (placed by the page card from the catalog's `pages` field, never
+  listed here): v1's "What happens to one request, using your current settings" timeline (plan 14.7, kept and
+  extended with the revalidation window and coalescing; `cache.explainer` builds it from the SAVED settings, so it
+  changes after a save, as the card refreshes) and v1's "The words used on this page", from docs/glossary.yml.
+  Context: `frame`, `explainer`, `terms`, `glossary` (from the kit).
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/cache/_shared.html" import timeline %}
+{% call page_card(frame) %}
+<div class="cache-explainer stack">
+  <h3 class="cache-explainer__title" id="cache-explainer-title">What happens to one request, using your current settings</h3>
+  <p class="muted">A caller asks for <code class="mono">{{ explainer.example }}</code>, and keeps asking. This follows the saved settings below (endpoint rules can change it per endpoint); it updates after you save a change.</p>
+  {{ timeline(explainer.steps, "cache-explainer-title") }}
+</div>
+<details class="details-plain cache-words">
+  <summary>The words used on this page</summary>
+  <dl class="kv">
+    {% for id in terms %}{% set entry = glossary.get(id) %}{% if entry %}<dt>{{ term(id) }}</dt><dd>{{ entry.definition }}</dd>{% endif %}{% endfor %}
+  </dl>
+</details>
+{% endcall %}

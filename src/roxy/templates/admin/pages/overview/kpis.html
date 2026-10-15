@@ -1,0 +1,17 @@
+{#-
+  Overview, card `kpis` (`roxy/admin/pages/overview.py kpis_card`): the key number tiles (plan 14.1, 11.6; v1's
+  Overview tiles, parity rows 1 and 3).
+
+  Each tile is an admin API tile (`build_kpis`): the value formatted by its metric unit, a sparkline, the delta
+  against the comparison period with words for screen readers, its help from the metric catalog, and a link to the
+  page that explains it. A tile whose data a reset touched (`partial`) shows its notice instead of a delta (plan
+  6.8); any other note (a share, the v1 lifetime baseline) sits under the value and the delta stays.
+  Context: `frame`, `tiles` ([{tile, href, note}]), `compare_label`, `notices`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/kpi.html" import kpi_api %}
+{% call page_card(frame, notices=notices) %}
+<div class="kpi-grid ov-kpis">
+  {% for item in tiles %}{{ kpi_api(item.tile, href=item.href, compare_label=compare_label, baseline=item.note) }}{% endfor %}
+</div>
+{% endcall %}

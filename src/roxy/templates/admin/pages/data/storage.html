@@ -1,0 +1,97 @@
+{#-
+  Data page, card `storage` (`roxy/admin/pages/data.py storage_card`): what Roxy stores (v1 "What's Being Stored",
+  plan 14.1 row 37, parity rows 85 and 133; plan 6.6).
+
+  Three shapes from one template:
+    * the card: four numbers (stored now, share of the storage budget, measured growth per day from the leader's
+      hourly samples, and the 30 day projection), the database files with their WAL, the snapshot and export folders,
+      and the table of every table (server-paged, exportable through `GET /admin/api/v1/data/storage?format=`);
+    * `part=list`: that table alone (its own search, sort and page requests);
+    * `part=detail` (the drawer): one table's numbers, its limits with links to the settings that set them, and its
+      own growth samples.
+  "Measure again" asks the card with `refresh=1` (`measure_storage(refresh=True)`, which never measures twice within
+  10 seconds). Table names come from Roxy's own schema, never from callers.
+  Context: `frame`, `part`, `table`, `detail`, `total_bytes`, `budget_bytes`, `used_pct`, `budget_tone`,
+  `projected_bytes`, `files`, `folders`, `growth`, `measured`, `cached`, `method`, `errors`, `refresh_url`,
+  `human_bytes`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/kpi.html" import kpi_tile %}
+{% from "components/chart.html" import sparkline %}
+{% from "components/format.html" import num %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/badges.html" import badge %}
+{% from "components/icon.html" import icon %}
+{% from "admin/pages/data/_macros.html" import when, setting_ref %}
+
+{% if part == "list" %}
+{{ data_table(**table) }}
+{% elif part == "detail" %}
+{% set d = detail %}{% set r = d.row %}
+<div class="data-detail stack" data-storage-detail>
+  <dl class="kv data-detail__facts">
+    <dt>What it holds</dt><dd>{{ r.label }}</dd>
+    <dt>Table</dt><dd class="mono">{{ r.db }}.{{ r.table }}</dd>
+    <dt>Rows now</dt><dd>{{ num(r.rows) }}</dd>
+    <dt>Bytes on disk</dt><dd>{% if r.bytes is none %}<span class="muted">SQLite cannot tell for this table</span>{% else %}{{ d.human_bytes(r.bytes) }}{% endif %}</dd>
+    <dt>Oldest row</dt><dd>{{ when(d.oldest, "no time column") }}</dd>
+    <dt>Newest row</dt><dd>{{ when(d.newest, "no time column") }}</dd>
+    <dt>Rows added in 7 days</dt><dd>{{ num(r.rows_last_7d) }}</dd>
+    <dt>In 30 days (projected)</dt><dd>{{ num(d.projection.rows) }} rows, {{ d.human_bytes(d.projection.bytes) }}{% if d.projection.method %}<span class="dt__sub">{{ d.projection.method }}</span>{% endif %}</dd>
+    <dt>Rows are kept for</dt><dd>{% if d.age %}{{ d.age }}{% else %}<span class="muted">no age limit</span>{% endif %}{{ setting_ref(d.age_setting) }}</dd>
+    <dt>Row cap</dt><dd>{% if r.row_cap is not none %}{{ num(r.row_cap) }} rows{% else %}<span class="muted">no row cap</span>{% endif %}{{ setting_ref(d.cap_setting) }}</dd>
+    {% if r.retention_rule %}<dt>Rule</dt><dd>{{ r.retention_rule }}</dd>{% endif %}
+    <dt>State</dt><dd><span class="tone tone--{{ d.status.tone }}">{{ d.status.text }}</span></dd>
+  </dl>
+  <section class="data-detail__section" aria-labelledby="data-detail-growth">
+    <h3 class="data-detail__heading" id="data-detail-growth">Measured size over time</h3>
+    {% if d.growth %}
+    <div class="data-detail__spark">{{ sparkline(d.growth_spark, label="Size in MiB of " ~ r.db ~ "." ~ r.table ~ " over the last 30 days", width=320, height=48) }}</div>
+    <div class="table-scroll" role="region" aria-labelledby="data-detail-growth" tabindex="0">
+      <table class="simple-table">
+        <caption class="sr-only">The latest size samples of this table</caption>
+        <thead><tr><th scope="col">Sampled</th><th scope="col" class="num">Bytes</th></tr></thead>
+        <tbody>{% for at, size in d.growth|reverse %}<tr><td>{{ at }}</td><td class="num">{{ d.human_bytes(size) }}</td></tr>{% endfor %}</tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="muted">No size samples of this table yet: the leader samples table sizes every 6 hours, starting 6 hours after it starts leading.</p>
+    {% endif %}
+  </section>
+</div>
+{% else %}
+{% set actions %}<button type="button" class="btn btn--sm btn--ghost" hx-get="{{ refresh_url }}" hx-target="#storage" hx-swap="outerHTML" data-action="storage-measure">{{ icon("refresh") }}<span>Measure again</span></button>{% endset %}
+{% set subtitle = "Measured " ~ (measured.text if measured else "just now") ~ (" (a minute's cache)" if cached else "") %}
+{% call page_card(frame, flush=True, actions=actions, subtitle=subtitle) %}
+<div class="data-storage__summary stack">
+  <div class="kpi-grid">
+    {{ kpi_tile("Stored by Roxy", human_bytes(total_bytes), key="storage_total", help="Every database file with its write-ahead log, plus the snapshots and exports folders.") }}
+    {{ kpi_tile("Storage budget used", ("%.1f%%"|format(used_pct)) if used_pct is not none else "n/a", key="storage_budget_used",
+                status=budget_tone, status_label={"ok": "Within the budget", "warn": "Close to the budget", "bad": "Over the budget"}[budget_tone],
+                help="Stored bytes against storage_total_budget_gb (" ~ human_bytes(budget_bytes) ~ "). An alert is sent from 90%.") }}
+    {{ kpi_tile("Measured growth per day", (("+" if growth.per_day >= 0 else "-") ~ human_bytes(growth.per_day|abs)) if growth.per_day is not none else "n/a", key="storage_growth_per_day",
+                spark=growth.spark if growth.spark|length > 1 else None,
+                help="From the leader's hourly disk samples over the last 30 days" ~ (" (" ~ "%.1f"|format(growth.span_days) ~ " days so far)" if growth.samples else "") ~ ". Not an estimate: what the files really grew.") }}
+    {{ kpi_tile("In 30 days (projected)", human_bytes(projected_bytes), key="storage_projected_30d", help=method) }}
+  </div>
+  {% if growth.per_day is none %}<p class="muted data-note">{% if growth.samples %}The growth needs at least six hours of samples; {{ growth.samples }} so far.{% else %}No disk samples yet: the leader takes one every hour, starting an hour after it starts leading.{% endif %}{% if growth.rollup_rows_per_min is not none %} Traffic rows written: {{ "%.1f"|format(growth.rollup_rows_per_min) }} a minute over the last week.{% endif %}</p>
+  {% elif growth.rollup_rows_per_min is not none %}<p class="muted data-note">Traffic rows written: {{ "%.1f"|format(growth.rollup_rows_per_min) }} a minute over the last week.</p>{% endif %}
+  {% for e in errors %}{{ inline_alert("warn", e.db ~ ".db could not be measured", e.error) }}{% endfor %}
+  <details class="details-plain data-files">
+    <summary>Database files, write-ahead logs and folders</summary>
+    <div class="table-scroll" role="region" aria-label="Database files and folders" tabindex="0">
+      <table class="simple-table data-table">
+        <caption class="sr-only">Database files with their write-ahead log (WAL) and shared memory (SHM) files, and the folders</caption>
+        <thead><tr><th scope="col">File</th><th scope="col" class="num">Database</th><th scope="col" class="num">WAL</th><th scope="col" class="num">SHM</th><th scope="col" class="num">Together</th></tr></thead>
+        <tbody>
+          {% for f in files %}<tr><td data-label="File" class="mono">{{ f.name }}</td><td data-label="Database" class="num">{{ human_bytes(f.bytes) }}</td><td data-label="WAL" class="num">{{ human_bytes(f.wal_bytes) }}</td><td data-label="SHM" class="num">{{ human_bytes(f.shm_bytes) }}</td><td data-label="Together" class="num">{{ human_bytes(f.total) }}</td></tr>{% endfor %}
+          {% for name, size in folders.items() %}<tr><td data-label="Folder" class="mono">{{ name }}/</td><td data-label="Files" class="num">{{ human_bytes(size) }}</td><td data-label="WAL" class="num"><span class="muted">n/a</span></td><td data-label="SHM" class="num"><span class="muted">n/a</span></td><td data-label="Together" class="num">{{ human_bytes(size) }}</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+</div>
+{{ data_table(**table) }}
+{% endcall %}
+{% endif %}

@@ -1,0 +1,92 @@
+{#-
+  The Live page's request drawer (`GET /admin/live/request?id=<request id>`, `roxy/admin/pages/live.py
+  request_context`; plan 14.1 Live "click a row for full trace and capture", parity rows 126 to 128).
+
+  One request as v1's live card showed it (time, outcome, why it was refused, who answered, the cache state and age,
+  Roblox's status, the egress, attempts and retries, how long it took, the place, the User-Agent, the query, the
+  bypass mark), then "why did this request wait?" (the Upstream API's explainer, inferred from what Roxy keeps and
+  saying so), then the capture: request and response headers and bodies as they were captured (already redacted),
+  pretty printed when they are JSON, with a note when a body was cut. Without a capture it says which case it is:
+  never captured (v1's capture-off text) or expired (v1's exact text, with the current window). Every field a
+  caller or Roblox chose is plain text (`caller_text`); the request id is copyable. This is a drawer body (no card
+  frame; the drawer has the heading). Context: see `request_context`.
+-#}
+{% from "components/format.html" import caller_text, local_href, num, duration, bytes as fmt_bytes %}
+{% from "components/icon.html" import icon %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/badges.html" import badge %}
+{% set r = record %}
+<div class="lv-request stack" id="{{ frame.id }}" data-card="{{ frame.id }}" data-live-request="{{ request_id }}">
+  {% if known %}
+  <p class="lv-request__lead"><span class="mono">{{ r.method or "GET" }}</span> <span class="mono">{{ caller_text(r.url or r.template, 400) }}</span></p>
+  <dl class="kv lv-request__facts">
+    <dt>When</dt><dd>{% if when %}<time datetime="{{ when.datetime }}">{{ when.text }}</time> <span class="muted">({{ when.sub }})</span>{% else %}<span class="muted">n/a</span>{% endif %}</dd>
+    <dt>Request id</dt><dd><span class="mono">{{ request_id }}</span> <button type="button" class="link-btn" data-copy="{{ request_id }}">{{ icon("copy") }}<span>Copy</span></button></dd>
+    <dt>Status</dt><dd><span class="mono">{{ r.status if r.status is not none else "n/a" }}</span>{% if r.upstream_status is not none and r.upstream_status != r.status %} <span class="muted">(Roblox answered {{ r.upstream_status }})</span>{% endif %}</dd>
+    <dt>Outcome</dt><dd>{{ outcome_words or "n/a" }}{% if r.reason %} <span class="mono muted">{{ r.reason }}</span>{% endif %}</dd>
+    {% if reason_text %}<dt>{{ "Refused because" if r.outcome == "refused" else "What happened" }}</dt><dd>{{ reason_text }}</dd>{% endif %}
+    {% if source_words %}<dt>Answered by</dt><dd>{{ source_words }}</dd>{% endif %}
+    <dt>Egress</dt><dd>{{ egress_words or "n/a" }}</dd>
+    <dt>Cache</dt><dd>{% if r.cache and r.cache != "NA" %}<span class="mono">{{ r.cache }}</span>{% if r.cache_age_s is not none %} <span class="muted">({{ duration(r.cache_age_s) }} old)</span>{% endif %}{% else %}<span class="muted">not cacheable</span>{% endif %}</dd>
+    <dt>Attempts</dt><dd>{{ r.attempts if r.attempts is not none else "n/a" }}{% if r.retries %} <span class="muted">(+{{ r.retries }} CSRF {{ "retry" if r.retries == 1 else "retries" }})</span>{% endif %}</dd>
+    <dt>Took</dt><dd>{% if took is not none %}{{ "{:,.1f}".format(took) }} ms{% if r.queue_wait_ms %} <span class="muted">(waited {{ "{:,.1f}".format(r.queue_wait_ms) }} ms for a slot)</span>{% endif %}{% else %}n/a{% endif %}</dd>
+    <dt>Client</dt><dd><span class="mono">{{ r.ip or "n/a" }}</span>{% if r.bypass %} {{ badge("Throttle bypass", "info") }}{% endif %}</dd>
+    <dt>Place (Roblox-Id)</dt><dd>{{ caller_text(r.place, 120) }}</dd>
+    <dt>User-Agent</dt><dd>{{ caller_text(r.user_agent, 400) }}</dd>
+    {% if r.query %}<dt>Query</dt><dd class="mono">{{ caller_text(r.query, 600) }}</dd>{% endif %}
+    {% if r.upstream_error %}<dt>Upstream error</dt><dd>{{ caller_text(r.upstream_error, 400) }}</dd>{% endif %}
+  </dl>
+  {% set ep = local_href(endpoint_href) %}
+  {% if ep %}<p class="lv-request__links"><a class="btn btn--sm btn--ghost" href="{{ ep }}">{{ icon("endpoints") }}<span>Open its endpoint</span></a></p>{% endif %}
+  {% else %}
+  {{ inline_alert("info", "This request is no longer in the live records", "Live records are kept for 15 minutes (and are sampled above 50 requests a second per worker). Its trace below may still find Roblox 429s it met.") }}
+  {% endif %}
+
+  <section class="lv-request__section" aria-labelledby="lv-wait-{{ frame.id }}">
+    <h3 class="lv-request__heading" id="lv-wait-{{ frame.id }}">Why did this request wait?</h3>
+    {% if trace %}
+    <ul class="lv-request__list">
+      {% for sentence in trace.reasons or [] %}<li>{{ caller_text(sentence, 600) }}</li>{% endfor %}
+    </ul>
+    {% if trace.full_buckets %}
+    <p class="muted">Full buckets in that minute: {% for bucket in trace.full_buckets %}<span class="mono">{{ caller_text(bucket.key, 160) }}</span> ({{ bucket.fill_pct_peak }}%, {{ num(bucket.rejections) }} refused){{ ", " if not loop.last }}{% endfor %}.</p>
+    {% endif %}
+    {% if trace.roblox_429s %}<p class="muted">Roblox answered 429 to {{ num(trace.roblox_429s|length) }} of its calls.</p>{% endif %}
+    {% else %}
+    <p class="muted">{{ trace_problem or "No trace is available for this request." }}</p>
+    {% endif %}
+  </section>
+
+  <section class="lv-request__section" aria-labelledby="lv-capture-{{ frame.id }}">
+    <h3 class="lv-request__heading" id="lv-capture-{{ frame.id }}">Captured request and answer</h3>
+    {% if capture %}
+    <p class="muted">Captured with headers, the query and both bodies redacted (secrets and keys removed) when the request finished.</p>
+    <details class="lv-request__part" open>
+      <summary>Request headers ({{ request_headers|length }})</summary>
+      {% if request_headers %}
+      <dl class="kv lv-request__headers">{% for name, value in request_headers %}<dt class="mono">{{ caller_text(name, 120) }}</dt><dd class="mono">{{ caller_text(value, 600) }}</dd>{% endfor %}</dl>
+      {% else %}<p class="muted">None.</p>{% endif %}
+    </details>
+    <details class="lv-request__part">
+      <summary>Request body{% if capture.request_body_length %} ({{ fmt_bytes(capture.request_body_length) }}){% endif %}</summary>
+      {% if request_body %}<div class="lv-request__body mono">{{ caller_text(request_body, max_body_chars, block=True) }}</div>{% else %}<p class="muted">No body.</p>{% endif %}
+      {% if capture.request_body_truncated %}<p class="muted">Cut: only the first part of {{ fmt_bytes(capture.request_body_length) }} was kept (capture_max_body).</p>{% endif %}
+    </details>
+    <details class="lv-request__part">
+      <summary>Answer headers ({{ response_headers|length }})</summary>
+      {% if response_headers %}
+      <dl class="kv lv-request__headers">{% for name, value in response_headers %}<dt class="mono">{{ caller_text(name, 120) }}</dt><dd class="mono">{{ caller_text(value, 600) }}</dd>{% endfor %}</dl>
+      {% else %}<p class="muted">None.</p>{% endif %}
+    </details>
+    <details class="lv-request__part" open>
+      <summary>Answer body{% if capture.response_body_length %} ({{ fmt_bytes(capture.response_body_length) }}){% endif %}</summary>
+      {% if response_body %}<div class="lv-request__body mono">{{ caller_text(response_body, max_body_chars, block=True) }}</div>{% else %}<p class="muted">No body.</p>{% endif %}
+      {% if capture.response_body_truncated %}<p class="muted">Cut: only the first part of {{ fmt_bytes(capture.response_body_length) }} was kept (capture_max_body).</p>{% endif %}
+    </details>
+    {% elif missing and missing.code == "not_captured" %}
+    {{ inline_alert("info", "Never captured", missing.message ~ " Refusals and failures are captured while capture is on; served requests only at the sample rate.") }}
+    {% else %}
+    {{ inline_alert("info", "Capture expired", expired_message ~ " The captured bodies aged out of the capture window (currently " ~ duration(window_s) ~ "). Raise capture_max_records or capture_max_bytes on this page to keep more.") }}
+    {% endif %}
+  </section>
+</div>

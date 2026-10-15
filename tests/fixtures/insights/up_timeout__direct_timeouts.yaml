@@ -1,0 +1,113 @@
+# UP-TIMEOUT on the direct path (format: README.md in this directory).
+#
+# 11.5: "if direct: raise request_timeout modestly or check network (health check link)". The rotator is off, so
+# every timeout is on direct. Either a modest raise of request_timeout (15 s now; the fixture reads "modestly" as
+# at most double, 30 s) or a manual "check the network" change passes; lowering it, raising it past 30 s, or
+# moving traffic to the rotator does not. request_timeout is global, so the recommendation is not safe_auto.
+#
+# Last 10 minutes, GET thumbnails.roblox.com/v1/users/avatar-headshot and games.roblox.com/v1/games:
+#
+#   generator               requests  calls  timed-out calls
+#   ok                      1,900     1,900  0
+#   timeout_failed          60        120    120 (504 to the caller)
+#   timeout_retry_ok        40        80     40
+#
+# Timed-out calls 160 of 2,100 (7.6%); requests ending in a timeout 60 of 2,000 (3%); meeting one 100 (5%).
+
+format: roxy.insight_fixture/1
+rule: UP-TIMEOUT
+case: direct_timeouts
+description: >
+  Direct calls to Roblox time out after the 15 s request_timeout on about 8% of calls in the last ten minutes.
+  The rule must recommend a modest request_timeout raise or a manual network check, nothing involving the
+  rotator, and not as safe_auto.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_enabled: 0
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+  egress: direct
+  outcome: served_upstream
+  reason: upstream_ok
+  status: 200
+  source: relay
+  cache_state: "MISS"
+  latency_ms: {p50: 300, p95: 2500, p99: 9000}
+
+profiles:
+  games: {endpoint_template: games.roblox.com/v1/games}
+  timeout_failed:
+    outcome: failed
+    reason: upstream_timeout
+    status: 504
+    source: roxy
+    upstream_calls: 2
+    error: true
+    latency_ms: 30500
+  timeout_retry_ok: {upstream_calls: 2, latency_ms: {p50: 15400, p95: 16000, p99: 16500}}
+
+traffic:
+  - {name: ok_before, window: ["-60m", "-10m"], per_minute: 100}
+  - {name: games_ok_before, profile: games, window: ["-60m", "-10m"], per_minute: 100}
+  - {name: ok, window: ["-10m", "0m"], total: 950}
+  - {name: games_ok, profile: games, window: ["-10m", "0m"], total: 950}
+  - {name: timeout_failed, profile: timeout_failed, window: ["-10m", "0m"], total: 30}
+  - {name: games_timeout_failed, profile: [games, timeout_failed], window: ["-10m", "0m"], total: 30}
+  - {name: timeout_retry_ok, profile: timeout_retry_ok, window: ["-10m", "0m"], total: 20}
+  - {name: games_timeout_retry_ok, profile: [games, timeout_retry_ok], window: ["-10m", "0m"], total: 20}
+
+events:
+  upstream_attempts:
+    - {window: ["-10m", "0m"], total: 30, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, attempt: 1, status: null, kind: first}
+    - {window: ["-10m", "0m"], total: 30, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, attempt: 2, status: null, kind: retry_5xx}
+    - {window: ["-10m", "0m"], total: 30, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: null, kind: first}
+    - {window: ["-10m", "0m"], total: 30, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: null, kind: retry_5xx}
+    - {window: ["-10m", "0m"], total: 20, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, attempt: 1, status: null, kind: first}
+    - {window: ["-10m", "0m"], total: 20, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, attempt: 2, status: 200, kind: retry_5xx}
+    - {window: ["-10m", "0m"], total: 20, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: null, kind: first}
+    - {window: ["-10m", "0m"], total: 20, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: 200, kind: retry_5xx}
+
+state:
+  settings_history:
+    - {at: "-30d", key: rotator_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "No rotator plan yet."}
+
+expect:
+  data_checks:
+    - window: ["-10m", "0m"]
+      requests: 2000
+      upstream_calls: 2100
+      by_reason: {upstream_timeout: 60}
+    - window: ["-60m", "-10m"]
+      by_reason: {upstream_timeout: 0}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - confidence: medium
+      family: upstream
+      safe_auto: false
+      change_kinds_forbidden: [routing_rule, bucket_override, ban_add]
+      changes_required:
+        - any_of:
+            - {kind: setting, key: request_timeout, current: 15, proposed: {gt: 15, lte: 30}}
+            - {kind: manual}
+      changes_forbidden:
+        - {kind: setting, key: request_timeout, proposed: {lte: 15}}
+        - {kind: setting, key: request_timeout, proposed: {gt: 30}}
+        - {kind: setting, key: {in: [rotator_weight, rotator_enabled, rotator_session_mode, direct_weight]}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_timeout_enabled: 0}
+    expect: {fires: false}
+  - case: rate_pct_10
+    description: No reading of the timeout rate reaches 10% (the highest is 7.6% of calls).
+    settings: {insight_up_timeout_rate_pct: 10}
+    expect: {fires: false}

@@ -1,0 +1,60 @@
+format: roxy.health_fixture/1
+check: H-NGINX
+case: pass
+name: headers_present
+description: >
+  Requests to the public origin with the site's Host header: HSTS is present on /, on a /static/ asset and on
+  /admin; the Server header is plain "nginx" with no version (server_tokens off); /internal/version answers
+  404; and tarpit_connection_budget (4000, the default) fits the nginx values the deploy recorded in roxy.env
+  (2 worker processes x 4096 connections / 2 = 4096). 13.2 H-NGINX: all present gives pass.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    tarpit_connection_budget: 4000
+  env:
+    ROXY_NGINX_WORKER_PROCESSES: "2"
+    ROXY_NGINX_WORKER_CONNECTIONS: "4096"
+  upstream:
+    "origin:/":
+      status: 200
+      headers:
+        content-type: "text/html; charset=utf-8"
+        server: "nginx"
+        strict-transport-security: "max-age=63072000; includeSubDomains"
+        x-content-type-options: "nosniff"
+        x-frame-options: "DENY"
+        referrer-policy: "no-referrer"
+      body: "<!doctype html><title>Roxy</title>"
+      latency_ms: 20
+    "origin:/static/**":
+      status: 200
+      headers:
+        content-type: "text/css"
+        server: "nginx"
+        cache-control: "public, immutable"
+        strict-transport-security: "max-age=63072000; includeSubDomains"
+      body: "body{margin:0}"
+      latency_ms: 5
+    "origin:/admin":
+      status: 200
+      headers:
+        content-type: "text/html; charset=utf-8"
+        server: "nginx"
+        cache-control: "no-store"
+        strict-transport-security: "max-age=63072000; includeSubDomains"
+        x-content-type-options: "nosniff"
+        x-frame-options: "DENY"
+      body: "<!doctype html><title>Sign in</title>"
+      latency_ms: 25
+    "origin:/internal/version":
+      status: 404
+      headers:
+        server: "nginx"
+        strict-transport-security: "max-age=63072000; includeSubDomains"
+      body: "Not Found"
+      latency_ms: 3
+expect:
+  status: pass
+  calls:
+    "origin:/internal/version": {count: 1}
+  credential_calls: {eq: 0}

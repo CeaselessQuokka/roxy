@@ -1,0 +1,51 @@
+# SYS-DISK when the disk provider knows file sizes but no table sizes (added by the rules_abuse_system author, P10).
+#
+# Production's disk provider (`insights/context.py DefaultProviders.disk`) measures the database files, their WAL and
+# the export and snapshot folders, but not single tables. Roxy's storage is 10.0e9 bytes, 83% of the 12 GB budget
+# (over 70%), almost all of it metrics.db. Without table sizes the rule names metrics.db's largest part by design, the
+# minute rollups (plan 6.6), and halves retention_minute_days.
+
+format: roxy.insight_fixture/1
+rule: SYS-DISK
+case: files_only
+description: >
+  Roxy uses 83% of its storage budget, nearly all of it in metrics.db, and the provider reports no table sizes.
+  SYS-DISK must propose a lower retention_minute_days, never a higher one, and not as safe to auto-apply.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  disk:
+    total_bytes: 100000000000
+    free_bytes: 70000000000
+    files:
+      "metrics.db": {bytes: 9300000000, wal_bytes: 60000000}
+      "cache.db": {bytes: 500000000, wal_bytes: 40000000}
+      "control.db": {bytes: 30000000, wal_bytes: 4000000}
+      "hot.db": {bytes: 20000000, wal_bytes: 6000000}
+      "exports": {bytes: 30000000, wal_bytes: 0}
+      "snapshots": {bytes: 10000000, wal_bytes: 0}
+    tables: {}
+    growth: []
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-DISK
+      severity: any
+      family: system
+      confidence: high
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: setting, key: retention_minute_days, current: 14, proposed: {lt: 14, gte: 1}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_disk_enabled: 0}
+    expect: {fires: false}
+  - case: budget_pct_raised
+    description: At 90% of the budget the 83% use is acceptable; the disk is mostly free and no growth is known.
+    settings: {insight_sys_disk_budget_pct: 90}
+    expect: {fires: false}

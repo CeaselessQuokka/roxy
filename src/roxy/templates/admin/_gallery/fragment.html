@@ -1,0 +1,39 @@
+{#-
+  Fragments the gallery's htmx requests receive (roxy/admin/gallery.py `_fragment`): a table page, a setting
+  control after a save, drawer details, and the slow demo. Like every htmx fragment, no <script> (plan 9.2).
+-#}
+{% from "components/table.html" import data_table %}
+{% from "components/setting.html" import setting_control %}
+{% from "components/chart.html" import sparkline %}
+{% from "components/format.html" import num, pct %}
+{% from "components/diff.html" import diff_fields %}
+{% from "components/alert.html" import inline_alert %}
+{% if kind == "table" %}
+{{ data_table(**table) }}
+{% elif kind == "setting" %}
+{{ setting_control(spec, value, setting_url, meta=meta|default(none), error=error|default(none), saved=saved|default(false), submitted=submitted|default(none)) }}
+{% elif kind == "drawer" %}
+  {% if row %}
+  <dl class="kv">
+    <dt>Endpoint</dt><dd class="mono">{{ row.endpoint }}</dd>
+    <dt>Host</dt><dd>{{ row.host }}.roblox.com</dd>
+    <dt>Requests</dt><dd>{{ num(row.requests) }}</dd>
+    <dt>Hit ratio</dt><dd>{{ pct(row.hit_ratio) }}</dd>
+    <dt>Upstream calls</dt><dd>{{ num(row.upstream) }}</dd>
+    <dt>Roblox 429s</dt><dd>{{ num(row.r429) }}</dd>
+    <dt>p95 latency</dt><dd>{{ num(row.p95) }} ms</dd>
+  </dl>
+  <p class="muted">Requests over the last day</p>
+  {{ sparkline([4, 6, 5, 9, 7, 8, 12, 11, 14, 13, 16, 15], label="Requests over the last day", width=320, height=48) }}
+  {% elif preview %}
+  {{ inline_alert("info", "Dry run on 4,812 sampled requests from the last hour", "Sampling was 20%, so counts are scaled up five times.") }}
+  {{ diff_fields([{"label": "Simulated hit ratio", "key": None, "before": "18.0%", "after": "71.5%"},
+                  {"label": "Upstream calls per hour", "key": None, "before": "2,640", "after": "752"},
+                  {"label": "Answers that would have been out of date", "key": None, "before": "0.0%", "after": "1.2%"}],
+                 caption="Dry run results", show_caption=True) }}
+  {% else %}
+  <p class="muted">Nothing to show for this row.</p>
+  {% endif %}
+{% elif kind == "slow" %}
+<span>Loaded at {{ at }}.</span>
+{% endif %}

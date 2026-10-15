@@ -1,0 +1,24 @@
+format: roxy.health_fixture/1
+check: H-CONFIG
+case: fail
+name: contradictory_settings
+description: >
+  Stored values tarpit_min_seconds = 30 and tarpit_max_seconds = 20: each is inside its own catalog range, but
+  together they break the min <= max cross rule (13.2's own example of a contradictory setting). The rows are
+  written raw, as a release that changed a rule or a hand edit could leave them; the runtime keeps serving and
+  logs `settings_cross_rules_broken`. Assumption: 13.2 does not map issue kinds to warn or fail; a broken cross
+  rule makes the tarpit's behavior undefined, so this fixture treats it as an error (fail). If the lead rules it
+  a warning, this file is the one to replace.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  state:
+    raw:
+      control:
+        settings:
+          - {key: tarpit_min_seconds, value_json: "30", updated_at: "-3d", updated_by: admin}
+          - {key: tarpit_max_seconds, value_json: "20", updated_at: "-3d", updated_by: admin}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)setting"}
+  credential_calls: {eq: 0}

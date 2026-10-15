@@ -1,0 +1,29 @@
+{#
+  Shared layout of the auth pages (login, enrollment, kill switch). No inline script or style anywhere: one
+  stylesheet from 'self' and one module script carrying this response's CSP nonce (plan 9.2). The dashboard
+  specialist restyles these pages later; ids and data attributes are the contract with static/js/auth.js.
+#}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="light dark">
+  {% if csrf_token %}<meta name="csrf-token" content="{{ csrf_token }}">{% endif %}
+  <title>{% block title %}Roxy Admin{% endblock %}</title>
+  <link rel="icon" href="{{ static_url('public/roxy_favicon.png') }}">
+  <link rel="stylesheet" href="{{ static_url('css/auth.css') }}">
+  {% block scripts %}<script type="module" nonce="{{ csp_nonce }}" src="{{ static_url('js/auth.js') }}"></script>{% endblock %}
+</head>
+<body data-page="{% block page %}{% endblock %}">
+  <main class="auth-page">
+    <div class="auth-card">
+      <div class="auth-brand">
+        <img src="{{ static_url('public/roxy_icon.png') }}" alt="Roxy logo" width="56" height="56">
+      </div>
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+</body>
+</html>

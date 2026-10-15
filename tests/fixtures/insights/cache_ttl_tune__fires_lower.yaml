@@ -1,0 +1,114 @@
+# CACHE-TTL-TUNE proposes a shorter lifetime when most refetches return a different body
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "... < 50% identical (lower)"; change "Set rule TTL to the median observed change interval, capped by
+# ttl_tuner_max_s".
+#
+#   games.roblox.com/v1/games (game details with live player counts), cache rule 4 with a 300 s lifetime.
+#   Change observations, last 24 h: 4,680 refetches, 140 identical (3%).
+#   Request samples: 10 keys, each fetched every 300 s (its lifetime); the bodies change every 150 s, so every
+#   refetch sees a new body.
+#
+# Reading of the row (report to the lead if the rule author disagrees): when every refetch differs, the samples
+# cannot show a change interval shorter than the fetch spacing (the lifetime itself), so "the median observed
+# change interval" computed literally would propose 300 s again. The row says the lifetime must fall, so this
+# fixture requires only a lifetime below the current 300 s on that endpoint's rule; how far below is the rule
+# author's choice (for example the identical share read as a Poisson estimate, 300 / ln(1 / 0.03) = 86 s).
+# A votes endpoint at 75% identical (between the two thresholds) gets nothing.
+
+format: roxy.insight_fixture/1
+rule: CACHE-TTL-TUNE
+case: fires_lower
+description: >
+  Only 3% of refetches of games.roblox.com/v1/games over the last 24 h returned the same body, so its 300 s rule
+  serves outdated player counts most of the time. The rule must propose a shorter lifetime on that endpoint's
+  rule and leave the votes endpoint (75% identical) and the global default alone.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-6h", "0m"], per_minute: 18}
+  - name: games_miss
+    profile: miss
+    endpoint_template: games.roblox.com/v1/games
+    window: ["-6h", "0m"]
+    per_minute: 2
+    samples: {key_space: games, keys: 10, body_change_interval_s: 150}
+  - {name: votes_hit, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 1200}
+  - {name: votes_miss, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], total: 400}
+
+events:
+  change_observations:
+    - {endpoint_template: games.roblox.com/v1/games, day: "2026-10-06", refetches: 2880, identical_bodies: 86}
+    - {endpoint_template: games.roblox.com/v1/games, day: "2026-10-07", refetches: 1800, identical_bodies: 54}
+    - {endpoint_template: games.roblox.com/v1/games/votes, day: "2026-10-06", refetches: 1000, identical_bodies: 750}
+    - {endpoint_template: games.roblox.com/v1/games/votes, day: "2026-10-07", refetches: 600, identical_bodies: 450}
+
+expect:
+  data_checks:
+    - window: ["-6h", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games}
+      requests: 7200
+      upstream_calls: 720
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CACHE-TTL-TUNE
+      subject_contains: "games.roblox.com/v1/games"
+      severity: any
+      family: cache
+      confidence: high
+      change_kinds_required: [rule_upsert]
+      change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, routing_rule, host_add, bucket_override, ignored_param_add]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["games.roblox.com/v1/games"]}}
+          current: {ttl: 300}
+          proposed: {ttl: {gte: 1, lt: 300}}
+      changes_forbidden:
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_stale_seconds, ttl_tuner_max_s]}
+        # The votes rule must not be touched.
+        - {kind: rule_upsert, current: {id: 1}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cache_ttl_tune_enabled: 0}
+    expect: {fires: false}
+  - case: lower_threshold_2
+    description: With "shorter" only below 2% identical, 3% no longer qualifies (and 75% is far from raising).
+    settings: {insight_cache_ttl_tune_identical_lower_pct: 2}
+    expect: {fires: false}
+  - case: lower_threshold_80
+    description: With "shorter" below 80% identical, the 75% votes endpoint is also lowered.
+    settings: {insight_cache_ttl_tune_identical_lower_pct: 80}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "games.roblox.com/v1/games"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, current: {id: 4, ttl: 300}, proposed: {ttl: {lt: 300}}}
+        - subject_contains: "games.roblox.com/v1/games/votes"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, current: {id: 1, ttl: 300}, proposed: {ttl: {lt: 300}}}

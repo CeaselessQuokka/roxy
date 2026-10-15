@@ -1,0 +1,24 @@
+format: roxy.health_fixture/1
+check: H-DB-SIZE
+case: pass
+name: 68_percent_of_budget
+description: >
+  The four databases hold 8.17 GB (8.18 GB with their WAL files) against storage_total_budget_gb = 12 (the
+  default): 68% of the budget whether a GB is read as 10^9 or 2^30 bytes (64% in the second reading). 13.2
+  H-DB-SIZE: under 70% gives pass.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    storage_total_budget_gb: 12
+  state:
+    disk:
+      total_bytes: 40000000000
+      free_bytes: 20000000000
+      files:
+        "control.db": {bytes: 60000000, wal_bytes: 4194304}
+        "hot.db": {bytes: 8000000, wal_bytes: 4194304}
+        "metrics.db": {bytes: 7600000000, wal_bytes: 4194304}
+        "cache.db": {bytes: 500000000, wal_bytes: 4194304}
+expect:
+  status: pass
+  credential_calls: {eq: 0}

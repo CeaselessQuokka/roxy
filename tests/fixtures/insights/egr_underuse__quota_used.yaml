@@ -1,0 +1,160 @@
+# EGR-UNDERUSE stays quiet when the rotator has already used just over 30% of its quota
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "... and < 30% quota used" (insight_egr_underuse_quota_used_max_pct 30).
+#
+#   The same traffic as egr_underuse__fires.yaml: catalog search has 5.0% direct 429s and 1.0% rotator 429s, so
+#   both rate tests pass for it. But the cycle (since 2026-10-01, quota 20 GB) has used 6,207 MB: 31.0%.
+#   Moving more load to the rotator would spend quota that is already being used faster than planned.
+
+format: roxy.insight_fixture/1
+rule: EGR-UNDERUSE
+case: quota_used
+description: >
+  Catalog search would qualify on both 429 rates, but the rotator has already used 31% of this cycle's quota
+  (needs under 30%), so nothing may fire; at a 32% limit it fires for catalog search only.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_quota_gb_per_month: 20
+  rotator_billing_day: 1
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1600}}
+  direct_ok: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1600, upstream_in: 1730, upstream_out: 270}}
+  rotator_ok: {egress: rotator, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 420, p95: 1100, p99: 2000}, bytes: {caller_in: 0, caller_out: 1600, upstream_in: 1730, upstream_out: 270}}
+  direct_429:
+    egress: direct
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 429
+    error: true
+    latency_ms: {p50: 90, p95: 220, p99: 400}
+    bytes: {caller_in: 0, caller_out: 75, upstream_in: 150, upstream_out: 270}
+    upstream_429: {egress: direct, retry_after_s: 20}
+  rotator_429:
+    egress: rotator
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 429
+    error: true
+    latency_ms: {p50: 380, p95: 900, p99: 1600}
+    bytes: {caller_in: 0, caller_out: 75, upstream_in: 150, upstream_out: 270}
+    upstream_429: {egress: rotator, retry_after_s: 20}
+
+traffic:
+  # Every generator uses a per-minute series that repeats every 2 to 15 minutes, so each rate below is the same
+  # over any window of 10 minutes or more that ends at now (11.5 gives this row no window).
+  - {name: search_hit, profile: hit, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-60m", "0m"], total: 2000}
+  - name: search_direct_ok
+    profile: direct_ok
+    endpoint_template: catalog.roblox.com/v1/search/items
+    window: ["-60m", "0m"]
+    series: [48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47, 48, 47]
+  - name: search_direct_429
+    profile: direct_429
+    endpoint_template: catalog.roblox.com/v1/search/items
+    window: ["-60m", "0m"]
+    series: [2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3]
+  - name: search_rotator_ok
+    profile: rotator_ok
+    endpoint_template: catalog.roblox.com/v1/search/items
+    window: ["-60m", "0m"]
+    series: [6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+  - name: search_rotator_429
+    profile: rotator_429
+    endpoint_template: catalog.roblox.com/v1/search/items
+    window: ["-60m", "0m"]
+    series: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  - name: games_direct_ok
+    profile: direct_ok
+    endpoint_template: games.roblox.com/v1/games
+    window: ["-60m", "0m"]
+    series: [32, 33, 33, 33, 33, 33, 32, 33, 33, 33, 33, 33, 32, 33, 33, 33, 33, 33, 32, 33, 33, 33, 33, 33, 32, 33, 33, 33, 33, 33, 32, 33, 33, 33, 33, 33, 32, 33, 33, 33, 33, 33, 32, 33, 33, 33, 33, 33, 32, 33, 33, 33, 33, 33, 32, 33, 33, 33, 33, 33]
+  - name: games_direct_429
+    profile: direct_429
+    endpoint_template: games.roblox.com/v1/games
+    window: ["-60m", "0m"]
+    series: [1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]
+  - {name: games_rotator_ok, profile: rotator_ok, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 2}
+  - name: headshot_direct_ok
+    profile: direct_ok
+    endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+    window: ["-60m", "0m"]
+    series: [24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25, 24, 24, 24, 25]
+  - name: headshot_direct_429
+    profile: direct_429
+    endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+    window: ["-60m", "0m"]
+    series: [1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0]
+  - name: headshot_rotator_ok
+    profile: rotator_ok
+    endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+    window: ["-60m", "0m"]
+    series: [4, 5, 5, 4, 5, 4, 5, 5, 4, 5, 4, 5, 5, 4, 5, 4, 5, 5, 4, 5, 4, 5, 5, 4, 5, 4, 5, 5, 4, 5, 4, 5, 5, 4, 5, 4, 5, 5, 4, 5, 4, 5, 5, 4, 5, 4, 5, 5, 4, 5, 4, 5, 5, 4, 5, 4, 5, 5, 4, 5]
+  - name: headshot_rotator_429
+    profile: rotator_429
+    endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+    window: ["-60m", "0m"]
+    series: [1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0]
+
+state:
+  egress:
+    metering_mode: socket
+    usage:
+      - {egress: rotator, granularity: day, at: "2026-10-01", requests: 515000, req_bytes: 139050000, resp_bytes: 890950000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-02", requests: 515000, req_bytes: 139050000, resp_bytes: 890950000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-03", requests: 515000, req_bytes: 139050000, resp_bytes: 890950000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-04", requests: 515000, req_bytes: 139050000, resp_bytes: 890950000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-05", requests: 515000, req_bytes: 139050000, resp_bytes: 890950000, overhead_bytes: 0}
+      - {egress: rotator, granularity: day, at: "2026-10-06", requests: 515000, req_bytes: 139050000, resp_bytes: 890950000, overhead_bytes: 0}
+      - {egress: rotator, granularity: minute, window: ["-900m", "0m"], per_minute: 1, requests: 15, req_bytes: 4050, resp_bytes: 25950, overhead_bytes: 0}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: catalog.roblox.com/v1/search/items, egress: direct}
+      upstream_calls: 3000
+      roblox_429: 150
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: catalog.roblox.com/v1/search/items, egress: rotator}
+      upstream_calls: 420
+      roblox_429: 4
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: rotator}
+      upstream_calls: 300
+      roblox_429: 24
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games, egress: direct}
+      upstream_calls: 1980
+      roblox_429: 10
+
+  fires: false
+
+variants:
+  - case: quota_used_max_pct_32
+    description: Under 32% of the quota is enough; 31.0% is used, so catalog search fires.
+    settings: {insight_egr_underuse_quota_used_max_pct: 32}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "catalog.roblox.com/v1/search/items"
+          severity: any
+          changes_required:
+            - {kind: routing_rule, match: {pattern: {matches_targets: ["catalog.roblox.com/v1/search/items"]}}, proposed: {mode: prefer_rotator}}
+          changes_forbidden:
+            - {kind: setting, key: {in: [rotator_weight, direct_weight, direct_shift_threshold_pct]}}

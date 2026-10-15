@@ -1,0 +1,21 @@
+format: roxy.health_fixture/1
+check: H-SYSTEMD
+case: warn
+name: recent_restarts
+description: >
+  roxy@blue is active again, but systemd restarted it twice and its current main process started three hours
+  ago (Restart=on-failure after crashes). 13.2 H-SYSTEMD: restarts in the last 24 h give warn, with the runbooks
+  as the fix.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    ROXY_COLOR: blue
+  systemd:
+    show:
+      "roxy@blue": {ActiveState: active, NRestarts: "2", ExecMainStartTimestamp: "-3h"}
+      "roxy@green": {ActiveState: inactive, NRestarts: "0", ExecMainStartTimestamp: "-2d"}
+expect:
+  status: warn
+  explanation: {present: true}
+  fix_link: {regex: "(?i)runbook"}
+  credential_calls: {eq: 0}

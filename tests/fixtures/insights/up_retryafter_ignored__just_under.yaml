@@ -1,0 +1,115 @@
+# UP-RETRYAFTER-IGNORED just under its thresholds (format: README.md in this directory).
+#
+# 11.5: "> 20 times per 10 min"; the param is `min_retries` (20). The fixture never puts a client at exactly 20,
+# so both readings (> and >=) agree, and it counts either "retries after the first refusal" or "requests inside
+# the Retry-After" the same way:
+#
+#   client          episode (cooldown)            requests inside the Retry-After  early retries
+#   198.51.100.23   -8m30s to -3m30s              19                               18
+#   198.51.100.77   -8m30s to -3m30s              16                               15
+#   198.51.100.23   -40m30s to -35m30s (earlier)  19                               18 (outside a 10 min window)
+#
+# Variants: a 40 minute window adds .23's earlier episode (36 early retries); a minimum of 16 is passed by .23.
+
+format: roxy.insight_fixture/1
+rule: UP-RETRYAFTER-IGNORED
+case: just_under
+description: >
+  Two scripts retry a cooling-down key before their Retry-After, 18 and 15 times in the last 10 minutes, and
+  one of them did the same half an hour earlier. No client passes 20 early retries within a 10 minute window, so
+  the rule stays quiet; a wider window or a lower minimum makes it fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_enabled: 0
+
+traffic_defaults:
+  user_agent: "python-requests/2.32.3"
+  places: ["1000000001"]
+  endpoint_template: games.roblox.com/v1/games
+
+profiles:
+  cooldown_429:
+    egress: none
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    error: true
+    latency_ms: 2
+  trigger:
+    egress: direct
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    client_ip: "203.0.113.200"
+    user_agent: "Roblox/Linux"
+    upstream_429: {egress: direct, retry_after_s: 300}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 150, p95: 400, p99: 800}}
+
+traffic:
+  # --- Earlier episode ----------------------------------------------------------------------------------------
+  - {name: trigger_earlier, profile: trigger, window: ["-41m", "-40m"], total: 1, samples: {key_space: trigger_a, keys: 1}}
+  - {name: a_early_earlier, profile: cooldown_429, client_ip: "198.51.100.23", window: ["-40m", "-36m"], total: 19, samples: {key_space: key_a, keys: 1}}
+  # --- Recent episode -----------------------------------------------------------------------------------------
+  - {name: trigger_recent, profile: trigger, window: ["-9m", "-8m"], total: 1, samples: {key_space: trigger_b, keys: 1}}
+  - {name: a_early_recent, profile: cooldown_429, client_ip: "198.51.100.23", window: ["-8m", "-4m"], total: 19, samples: {key_space: key_a, keys: 1}}
+  - {name: b_early_recent, profile: cooldown_429, client_ip: "198.51.100.77", window: ["-8m", "-4m"], total: 16, samples: {key_space: key_b, keys: 1}}
+  # --- Normal traffic -----------------------------------------------------------------------------------------
+  - name: servers_miss
+    profile: miss
+    user_agent: "Roblox/Linux"
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+    window: ["-60m", "0m"]
+    per_minute: 20
+
+state:
+  cooldowns:
+    - {key: "endpoint:games.roblox.com/v1/games:direct", until: "-210s", source: retry_after, set_at: "-510s", hits: 1}
+  settings_history:
+    - {at: "-30d", key: rotator_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "No rotator plan yet."}
+
+expect:
+  data_checks:
+    - window: ["-10m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games, egress: none}
+      requests: 35
+    - window: ["-41m", "-35m"]
+      where: {endpoint_template: games.roblox.com/v1/games, egress: none}
+      requests: 19
+    - window: ["-60m", "0m"]
+      roblox_429: 2
+
+  fires: false
+
+variants:
+  - case: window_40_adds_earlier_episode
+    description: A 40 minute window holds both of 198.51.100.23's episodes, 36 early retries.
+    settings: {insight_up_retryafter_ignored_window_min: 40}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - any_of:
+                - {kind: setting, key: tarpit_on_upstream_cooldown_retry, current: 0, proposed: 1}
+                - {kind: tarpit_category, category: upstream_cooldown_retry, current: 0, proposed: 1}
+  - case: min_retries_16
+    description: 198.51.100.23's 18 early retries pass a minimum of 16.
+    settings: {insight_up_retryafter_ignored_min_retries: 16}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - changes_required:
+            - any_of:
+                - {kind: setting, key: tarpit_on_upstream_cooldown_retry, current: 0, proposed: 1}
+                - {kind: tarpit_category, category: upstream_cooldown_retry, current: 0, proposed: 1}

@@ -1,0 +1,101 @@
+# SYS-ERRORS, first condition: "a new error signature (first seen in the last hour)" (11.5).
+#
+# Error rows use the metrics `errors` table plus `occurrences` (one `error` event per occurrence, README "events").
+# Signatures follow roxy/notify/notifier.py `error_signature`: "<ExceptionType> at <file>:<line>".
+#
+#   signature                         first seen         occurrences                               expected
+#   KeyError at keys.py:212           24.5 minutes ago   14, one a minute, in a background refresh  recommendation
+#   TimeoutError at rotator.py:188    40 days ago        every 30 minutes for 7 days (2 per hour,   none
+#                                                        2 in the last hour: 1x its baseline)
+#
+# The new error happens in a background job, so callers see no 500s: the caller-facing condition is false. 11.5's
+# change is `manual` only (the LLM export carries the traceback and asks for a code fix), so the recommendation has
+# exactly one change, of kind manual, and is never safe_auto.
+
+format: roxy.insight_fixture/1
+rule: SYS-ERRORS
+case: new_signature
+description: >
+  A KeyError never seen before started 25 minutes ago in a background cache refresh, next to an old timeout that
+  happens twice an hour as always. SYS-ERRORS must raise one manual recommendation for the new signature and nothing
+  for the old one.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 200}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 66}
+
+events:
+  errors:
+    - signature: "KeyError at keys.py:212"
+      count: 14
+      first_seen: "-1470s"
+      last_seen: "-690s"
+      source: roxy
+      last_detail: "background refresh of games.roblox.com/v1/games"
+      module_line: "keys.py:212"
+      traceback_redacted: |
+        File "roxy/cache/swr.py", line 88, in refresh
+          key = build_key(entry.method, entry.host, entry.path, entry.query, b"", rule)
+        File "roxy/cache/keys.py", line 212, in build_key
+          ids = params["universeIds"]
+        KeyError: 'universeIds'
+      occurrences:
+        - {window: ["-25m", "-11m"], per_minute: 1}
+    - signature: "TimeoutError at rotator.py:188"
+      count: 2400
+      first_seen: "-40d"
+      last_seen: "-30m"
+      source: roxy
+      last_detail: "rotator exit IP probe"
+      module_line: "rotator.py:188"
+      traceback_redacted: |
+        File "roxy/egress/rotator.py", line 188, in exit_ip_probe
+          response = await self._client.get(url, timeout=timeout)
+        TimeoutError
+      occurrences:
+        - {window: ["-7d", "0m"], every: "30m"}
+
+expect:
+  data_checks:
+    - {window: ["-15m", "0m"], requests: 3990, failed: 0}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-ERRORS
+      subject_contains: "keys.py:212"
+      severity: any
+      family: system
+      confidence: high
+      safe_auto: false
+      exact_changes: true
+      changes_required:
+        - {kind: manual}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_errors_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_info
+    description: insight_sys_errors_severity replaces the computed severity.
+    settings: {insight_sys_errors_severity: info}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "keys.py:212", severity: info}

@@ -1,0 +1,26 @@
+{#-
+  The Help page (`roxy/admin/pages/help.py`): the admin guide, the glossary, the keyboard shortcuts and what every
+  page is for, one card each (registry order). A short "On this page" list jumps to them; the documents (runbooks
+  and guides) open at /admin/help/<document> (templates/admin/pages/help/doc.html).
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="/admin/help/runbooks">{{ icon("book") }}<span>Runbooks</span></a>
+<button type="button" class="btn btn--ghost" data-shortcuts-open>{{ icon("keyboard") }}<span>Shortcut overlay</span></button>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>An alert email's "What to do" link opens the runbook it names; a failed health check's fix link opens the runbook or operations section it names. Both lead into the runbooks document, which you can also read from the top.</p>
+{% endblock %}
+
+{% block cards %}
+<nav class="help-jump card" aria-label="Parts of the Help page">
+  <ul class="help-jump__list">
+    {% for card in view.page.cards if not card.fragment_only %}<li><a href="#{{ card.id }}">{{ card.title }}</a></li>{% endfor %}
+  </ul>
+</nav>
+{% for card_id in card_order %}{{ cards[card_id] }}{% endfor %}
+{% endblock %}

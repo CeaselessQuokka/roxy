@@ -1,0 +1,65 @@
+# FILTER-ADD must stay quiet on busy legitimate clients that are rarely refused.
+#
+#   client            requests per hour   refused per hour   why it is not a FILTER-ADD case
+#   203.0.113.100     3,000               0                  heavy, but cache hits do not count toward the per-IP limit
+#   198.51.100.7      6,000               0                  bypass entry (expires in 6 h): never refused
+#   192.0.2.170       1,080               360                a shared studio network: refused, but far under 1,000
+#   40 game servers   60 each             3 each             ordinary fairness refusals
+#
+# Three hours of data. A rule that counted requests instead of refusals would flag the first two.
+
+format: roxy.insight_fixture/1
+rule: FILTER-ADD
+case: legit_busy_clients
+description: >
+  Three hours of heavy but legitimate traffic: a cached game server at 3,000 requests per hour, a bypassed load
+  tester at 6,000, a shared network refused 360 times an hour, and 40 game servers with occasional refusals. No
+  address is refused more than 1,000 times an hour, so FILTER-ADD must not fire.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  access_list:
+    - {id: 1, kind: bypass, cidr: "198.51.100.7/32", note: "Load test runner", expires_at: "+6h", created_by: admin, created_at: "-4h", x_last_hit_at: "-1m"}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+  big_server: {client_ip: "203.0.113.100", place_id: "1000000001", user_agent: "Roblox/Linux"}
+  load_test: {client_ip: "198.51.100.7", user_agent: "k6/0.52.0", bypass: true}
+  studio_network: {client_ip: "192.0.2.170", user_agent: "RobloxStudio/WinInet", place_id: "1000000008"}
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-180m", "0m"], per_minute: 30}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-180m", "0m"], per_minute: 8}
+  - {name: legit_throttled, profile: [throttled, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-180m", "0m"], per_minute: 2}
+  - {name: big_server_hit, profile: [hit, big_server], endpoint_template: games.roblox.com/v1/games, window: ["-180m", "0m"], per_minute: 45}
+  - {name: big_server_miss, profile: [miss, big_server], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-180m", "0m"], per_minute: 5}
+  - {name: load_test_hit, profile: [hit, load_test], endpoint_template: games.roblox.com/v1/games, window: ["-180m", "0m"], per_minute: 80}
+  - {name: load_test_miss, profile: [miss, load_test], endpoint_template: "thumbnails.roblox.com/v1/users/avatar-headshot", window: ["-180m", "0m"], per_minute: 20}
+  - {name: studio_served, profile: [miss, studio_network], endpoint_template: "develop.roblox.com/v1/universes/{universeId}", window: ["-180m", "0m"], per_minute: 12}
+  - {name: studio_throttled, profile: [throttled, studio_network], endpoint_template: "develop.roblox.com/v1/universes/{universeId}", window: ["-180m", "0m"], per_minute: 6}
+
+state:
+  client_scores:
+    - {ip: "203.0.113.100", bot_score: 12}
+    - {ip: "198.51.100.7", bot_score: 45}
+    - {ip: "192.0.2.170", bot_score: 22}
+    - {clients: {cidr: "203.0.113.0/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - {window: ["-180m", "0m"], requests: 37440, refused: 1440}
+    - {window: ["-60m", "0m"], where: {client_ip: "203.0.113.100"}, requests: 3000, refused: 0}
+    - {window: ["-60m", "0m"], where: {client_ip: "198.51.100.7"}, requests: 6000, refused: 0}
+    - {window: ["-60m", "0m"], where: {client_ip: "192.0.2.170"}, refused: 360}
+  fires: false

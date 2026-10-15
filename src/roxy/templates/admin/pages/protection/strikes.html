@@ -1,0 +1,67 @@
+{#-
+  Protection page, card `strikes` (`roxy/admin/pages/protection.py strikes_card`): the strike board (row 41).
+
+  What: callers carrying strikes, worst first (`GET /protection/strikes`): strikes after decay, the rung they reach
+  ("2 of 4"), whether a penalty is running ("Serving 1 minute 40s" or "Free to call"), when a rung drops ("never"
+  when decay is off), the last strike, and the rung's multiplier and message (hidden columns). "Forgive everyone"
+  wipes every caller's strike history (their running penalties still run out, v1 B19). A row opens the client in
+  the drawer (`detail=<client>`): forgive that client, reset its limits (which also ends the penalty), and links to
+  its Live requests and its client page.
+  Context: `frame`, `table`, `only`, `api`; for the drawer `detail`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num, local_href, caller_text %}
+{% from "components/badges.html" import badge %}
+{% from "admin/pages/protection/_macros.html" import reason_field %}
+{% if detail %}
+{% set d = detail %}
+<div class="prot-drawer stack" data-prot-drawer="strike">
+  <dl class="kv">
+    <dt>Client</dt><dd class="mono">{{ d.client }}</dd>
+    <dt>Strikes</dt><dd>{% if d.exists %}{{ num(d.strikes) }}{% else %}<span class="muted">none recorded</span>{% endif %}</dd>
+    <dt>Rung</dt><dd>{% if d.rung %}{{ d.rung }} of {{ d.rungs }} ({{ "%g"|format(d.multiplier) }} times the throttle window){% else %}<span class="muted">none</span>{% endif %}</dd>
+    {% if d.message %}<dt>Told</dt><dd>{{ caller_text(d.message, 400) }}</dd>{% endif %}
+    <dt>Status</dt><dd>{% if d.throttled %}{{ badge("Serving a penalty", "warn", "clock") }} {{ d.reset_in }} seconds left{% else %}{{ badge("Free to call", "neutral") }}{% endif %}</dd>
+    <dt>Last strike</dt><dd>{% if d.last_strike %}<time datetime="{{ d.last_strike.datetime }}">{{ d.last_strike.text }}</time> <span class="muted">({{ d.last_strike.sub }})</span>{% else %}<span class="muted">n/a</span>{% endif %}</dd>
+    <dt>Drops a rung in</dt><dd>{% if d.decays_in %}{{ d.decays_in }} seconds{% else %}<span class="muted">never</span>{% endif %}</dd>
+  </dl>
+  <p class="cluster">
+    {% set live = local_href(d.live_href) %}{% if live %}<a class="btn btn--sm btn--ghost" href="{{ live }}">{{ icon("live") }}<span>Its live requests</span></a>{% endif %}
+    {% set client = local_href(d.clients_href) %}{% if client %}<a class="btn btn--sm btn--ghost" href="{{ client }}">{{ icon("users") }}<span>Find it on Clients</span></a>{% endif %}
+  </p>
+  <form class="stack prot-drawer__form" data-api-form data-api-url="{{ d.api.forgive }}" data-api-method="POST"
+        data-success="That client is back on a clean sheet." data-on-success="refresh" data-refresh="strikes throttle" novalidate>
+    <h3 class="prot-sub__title">Forgive this client</h3>
+    <p class="muted">Wipes its strike history so its next throttle uses rung 1. A penalty already running still runs out.</p>
+    <input type="hidden" name="ip" value="{{ d.client }}">
+    {{ reason_field("strike-forgive-reason") }}
+    <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    <div class="cluster"><button type="submit" class="btn" data-action="strike-forgive">{{ icon("check") }}<span>Forgive</span></button></div>
+  </form>
+  <form class="stack prot-drawer__form" data-api-form data-api-url="{{ d.api.reset }}" data-api-method="POST"
+        data-success="That client's limits were reset." data-on-success="refresh" data-refresh="strikes throttle throttle-all" novalidate>
+    <h3 class="prot-sub__title">Reset this client's limits</h3>
+    <p class="muted">Deletes its limiter counters and strikes: the running penalty ends now and its allowance is full again.</p>
+    <input type="hidden" name="scope" value="client"><input type="hidden" name="client" value="{{ d.client }}">
+    {{ reason_field("strike-reset-reason", required=True) }}
+    <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    <div class="cluster"><button type="submit" class="btn btn--bad" data-action="strike-reset">{{ icon("reset") }}<span>Reset its limits</span></button></div>
+  </form>
+</div>
+{% elif only %}{{ data_table(**table) }}{% else %}
+{% set actions %}<button type="button" class="btn btn--sm" data-dialog-open="dlg-prot-forgive-all" aria-haspopup="dialog" data-action="forgive-all">{{ icon("check") }}<span>Forgive everyone</span></button>{% endset %}
+{% call page_card(frame, flush=True, actions=actions, subtitle="Strikes wear off with good behavior; forgiving wipes them at once.") %}
+{{ data_table(**table) }}
+{% call confirm_dialog("dlg-prot-forgive-all", "Forgive every caller?", api.forgive, confirm_label="Forgive everyone",
+                       api=True, hidden={"all": "true"}, hidden_types={"all": "bool"}, success="Every caller is back on a clean sheet.",
+                       on_success="refresh", refresh="strikes throttle",
+                       consequences=["Wipes every caller's strike history, putting everyone back on rung 1.",
+                                     "Penalties already running still run out normally (reset the limiter state to end them).",
+                                     "Written to the audit log with the number of callers forgiven."]) %}
+  {{ reason_field("dlg-prot-forgive-all-reason") }}
+{% endcall %}
+{% endcall %}
+{% endif %}

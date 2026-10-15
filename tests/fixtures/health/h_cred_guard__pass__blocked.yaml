@@ -1,0 +1,21 @@
+format: roxy.health_fixture/1
+check: H-CRED-GUARD
+case: pass
+name: blocked
+description: >
+  The leak guard self-test builds a synthetic rotator request that carries the credential and hands it to the
+  guard in-process. The guard blocks it, and nothing is sent anywhere (an unmocked request would fail the
+  test). 13.2 H-CRED-GUARD: blocked gives pass. The guard must stay enabled afterwards: the self-test is not a
+  real trip, so it raises no alert and disables no egress.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    rotator_enabled: 1
+    rotator_weight: 25
+  state:
+    credential: {present: true, status: active, status_at: "-25m", set_at: "-20d", account_id: "1000001"}
+expect:
+  status: pass
+  critical: false
+  credential_calls: {eq: 0}
+  no_calls_to: [ip_echo]

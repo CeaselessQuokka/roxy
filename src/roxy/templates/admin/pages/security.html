@@ -1,0 +1,41 @@
+{#-
+  The Security page (`roxy/admin/pages/security.py`): sign-ins, probes, crawls, fingerprints, CSP reports, and the
+  signed-in admin's sessions, trusted devices, passkeys and recovery codes.
+
+  What: the layout of the page's eleven cards (each rendered by its own template in admin/pages/security/, the same
+  HTML its fragment route answers). The event logs come first (what happened, and what browsers refused), then your
+  own account security, then the two heavy cards that load when scrolled to: the fingerprints (four tables) and
+  the admin access settings.
+  Why: an owner opens this page after a login alert or a probe flood; the logs answer "who tried what" at the top,
+  and the controls that end sessions or revoke devices sit together below them. The heavy cards come last and
+  together, so the first paint stays small on the 1 GB server and they load as the admin reaches them.
+  How: extends admin/_page.html; `how_to_read` adds what the signatures, fingerprints and account controls mean.
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="#sessions">{{ icon("user") }}<span>Your sessions</span></a>
+<a class="btn btn--ghost" href="#fingerprints">{{ icon("search") }}<span>Fingerprints</span></a>
+<a class="btn btn--ghost" href="/admin/audit?{{ {'action': 'auth.*'}|urlencode }}">{{ icon("history") }}<span>Account changes</span></a>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>A probe's signature is the kind of probe without the probed address (for example <code>Invalid URL</code> or <code>HTTP 404 via GET</code>), so a scanner trying a thousand paths stays one line in the summary; the address it tried is in the Target and Path columns. Everything a caller chose (paths, User-Agents, header names and values, CSP report fields) is shown as plain text, exactly as stored and with secrets already removed.</p>
+<p>Fingerprints count what callers send when they pass every check. A header whose values change on almost every request (a trace id) is marked high cardinality: stop recording its values in its details and only its count is kept. The Blocked tab lists what requests refused by a {{ term("request-filter", "request filter") }} carried, so a filter that catches real callers by mistake shows up.</p>
+<p>Your sessions, trusted devices, passkeys and recovery codes are yours alone. Ending a session signs that browser out at once; a trusted device skips only the second factor, never the password. Renaming or deleting a passkey and making new recovery codes ask for your second factor again first.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["logins"] }}
+{{ cards["probes"] }}
+<div class="grid grid--2 security-pair">{{ cards["probe-summary"] }}{{ cards["crawls"] }}</div>
+{{ cards["csp-reports"] }}
+{{ cards["sessions"] }}
+{{ cards["trusted-devices"] }}
+<div class="grid grid--2 security-pair">{{ cards["passkeys"] }}{{ cards["recovery-codes"] }}</div>
+{{ cards["fingerprints"] }}
+{{ cards["admin-access"] }}
+{% endblock %}

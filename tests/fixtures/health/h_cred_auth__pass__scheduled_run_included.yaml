@@ -1,0 +1,37 @@
+format: roxy.health_fixture/1
+check: H-CRED-AUTH
+case: pass
+name: scheduled_run_included
+description: >
+  A scheduled run with health_auto_include_credential = 1: the credential check runs and spends one account
+  call (13.1, 13.3). The variant turns the setting back to its default 0: a scheduled run must then skip the
+  check without calling Roblox. Assumption (13.1 says "skip" without naming a status): the skipped check is
+  still stored, with status n/a, so the run shows why it is missing.
+now: "2026-10-07T15:00:00Z"
+run: {trigger: schedule}
+inputs:
+  settings:
+    health_auto_include_credential: 1
+  state:
+    credential: {present: true, status: active, status_at: "-25m", set_at: "-20d", account_id: "1000001"}
+  upstream:
+    "https://users.roblox.com/v1/users/authenticated":
+      status: 200
+      json: {id: 1000001, name: "fixture_user", displayName: "Fixture User"}
+      latency_ms: 140
+      expect_request: {via: credential, method: GET}
+expect:
+  status: pass
+  calls:
+    "https://users.roblox.com/v1/users/authenticated": {count: 1, via: credential}
+  credential_calls: {eq: 1}
+variants:
+  - case: "n/a"
+    name: scheduled_run_skips_credential
+    inputs:
+      settings:
+        health_auto_include_credential: 0
+    expect:
+      status: "n/a"
+      credential_calls: {eq: 0}
+      no_calls_to: ["https://users.roblox.com/v1/users/authenticated"]

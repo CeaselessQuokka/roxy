@@ -1,0 +1,47 @@
+# CRED-EXPIRING stays quiet for a healthy credential with an old, already fixed rejection and a rate-limited probe
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Probe 401/403, or account warning in response".
+#
+#   -3d:  a probe was rejected with 401 (the old cookie expired).
+#   -2d:  the admin replaced the credential (set_at); every probe since has passed.
+#   -45m: one admin-clicked check was answered 429 (rate limited): not a 401 or 403, and not a sign of expiry.
+#   status: active. No `credential_rotated` events.
+#
+# A rejection from before the current credential was set says nothing about the current one.
+
+format: roxy.insight_fixture/1
+rule: CRED-EXPIRING
+case: healthy
+description: >
+  The current credential, set two days ago after the previous one expired, has passed every probe; one check was
+  rate limited (429). Nothing may fire: the 401 belongs to the replaced credential and a 429 is not a rejection.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+state:
+  credential:
+    present: true
+    status: active
+    status_at: "-2d"
+    set_at: "-2d"
+    account_id: "1000001"
+    probes:
+      - {at: "-74h", kind: liveness, status: 200, result: ok}
+      - {at: "-73h", kind: liveness, status: 401, result: rejected_401}
+      - {at: "-47h", kind: admin_check, status: 200, result: ok}
+      - {at: "-24h", kind: liveness, status: 200, result: ok}
+      - {at: "-120m", kind: liveness, status: 200, result: ok}
+      - {at: "-90m", kind: liveness, status: 200, result: ok}
+      - {at: "-60m", kind: liveness, status: 200, result: ok}
+      - {at: "-45m", kind: admin_check, status: 429, result: rate_limited}
+      - {at: "-30m", kind: liveness, status: 200, result: ok}
+
+expect:
+  fires: false
+
+variants:
+  - case: severity_forced
+    description: Forcing a severity does not make a quiet rule fire.
+    settings: {insight_cred_expiring_severity: critical}
+    expect: {fires: false}

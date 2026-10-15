@@ -1,0 +1,23 @@
+format: roxy.health_fixture/1
+check: H-DNS
+case: fail
+name: private_address
+description: >
+  thumbnails.roblox.com resolves quickly, but to a private RFC 1918 address (a poisoned or split-horizon
+  resolver). 13.2 H-DNS lists "failure or private address" as fail. Plan conflict, reported to the lead and not
+  resolved here by guessing: 9.10 calls the same situation "a warning". This file follows the 13.2 table (the
+  section that defines the check); if the lead rules for 9.10, this file is the one to replace.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    allowed_roblox_hosts: [games.roblox.com, users.roblox.com, thumbnails.roblox.com, presence.roblox.com]
+  dns:
+    games.roblox.com: {answers: ["192.0.2.10", "2001:db8::10"], latency_ms: 18}
+    users.roblox.com: {answers: ["192.0.2.11"], latency_ms: 40}
+    thumbnails.roblox.com: {answers: ["10.20.30.40"], latency_ms: 12}
+    presence.roblox.com: {answers: ["203.0.113.12"], latency_ms: 31}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)dns"}
+  credential_calls: {eq: 0}

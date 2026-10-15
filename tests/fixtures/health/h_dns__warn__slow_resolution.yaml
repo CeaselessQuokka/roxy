@@ -1,0 +1,21 @@
+format: roxy.health_fixture/1
+check: H-DNS
+case: warn
+name: slow_resolution
+description: >
+  All four allowed hosts resolve to public addresses, but users.roblox.com takes 250 ms. 13.2 H-DNS: under
+  500 ms (and not under 100 ms) gives warn, with the "DNS" runbook as the fix.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    allowed_roblox_hosts: [games.roblox.com, users.roblox.com, thumbnails.roblox.com, presence.roblox.com]
+  dns:
+    games.roblox.com: {answers: ["192.0.2.10", "2001:db8::10"], latency_ms: 18}
+    users.roblox.com: {answers: ["192.0.2.11"], latency_ms: 250}
+    thumbnails.roblox.com: {answers: ["198.51.100.40", "198.51.100.41"], latency_ms: 22}
+    presence.roblox.com: {answers: ["203.0.113.12"], latency_ms: 31}
+expect:
+  status: warn
+  explanation: {present: true}
+  fix_link: {regex: "(?i)dns"}
+  credential_calls: {eq: 0}

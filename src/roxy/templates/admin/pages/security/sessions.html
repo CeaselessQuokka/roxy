@@ -1,0 +1,64 @@
+{#-
+  Security page, card `sessions` (`roxy/admin/pages/security.py sessions_card`): your signed-in sessions, newest
+  first (`GET /admin/api/v1/security/sessions`), with End per session, "End every other session" and "Sign out
+  everywhere" (plan 9.6: server-side sessions, the epoch kill switch from the dashboard; v1 had only the emailed
+  link, dashboard.md 1.1 row 4). Each action posts to the Security API with the CSRF header; ending this browser's
+  session (or every session) signs this page out, so the page reloads to the sign-in screen. The session handle is
+  used only in the action URL; the session itself (its cookie) never reaches the page. A browser's User-Agent is
+  shown as caller text. Context: `frame`, `sessions`, `others`, `revoke_others_url`, `revoke_all_url`,
+  `idle_minutes`, `max_hours`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/format.html" import caller_text, num %}
+{% from "components/badges.html" import badge %}
+{% from "components/icon.html" import icon %}
+{% from "admin/pages/security/_macros.html" import when %}
+{% set actions %}
+{% if others %}<button type="button" class="btn btn--sm" data-dialog-open="dlg-sessions-others" data-action="sessions-end-others">{{ icon("logout") }}<span>End every other session</span></button>{% endif %}
+<button type="button" class="btn btn--sm btn--warn-soft" data-dialog-open="dlg-sessions-all" data-action="sessions-sign-out-everywhere">{{ icon("alert-triangle") }}<span>Sign out everywhere</span></button>
+{% endset %}
+{% call page_card(frame, flush=True, actions=actions, subtitle=num(sessions|length) ~ (" session" if sessions|length == 1 else " sessions") ~ " signed in") %}
+<p class="security-intro">A session ends after {{ idle_minutes }} minutes without activity, and after {{ max_hours }} hours at the most. Ending one signs that browser out at once.</p>
+{% if sessions %}
+<div class="table-scroll security-list" role="region" aria-labelledby="sessions-title" tabindex="0">
+  <table class="simple-table security-table">
+    <caption class="sr-only">Your signed-in sessions, newest first</caption>
+    <thead><tr><th scope="col">Browser</th><th scope="col">From</th><th scope="col">Signed in</th><th scope="col">Last active</th><th scope="col">Ends at the latest</th><th scope="col">Second factor</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+    <tbody>
+      {% for s in sessions %}
+      <tr{% if s.current %} class="is-current"{% endif %} data-session-row>
+        <td data-label="Browser">{{ caller_text(s.user_agent, 120) }}{% if s.current %} {{ badge("This browser", "accent", "user") }}{% endif %}</td>
+        <td data-label="From" class="mono">{{ s.ip or "n/a" }}</td>
+        <td data-label="Signed in">{{ when(s.created) }}</td>
+        <td data-label="Last active">{{ when(s.seen) }}</td>
+        <td data-label="Ends at the latest">{{ when(s.expires) }}</td>
+        <td data-label="Second factor">{{ s.mfa_level or "n/a" }}</td>
+        <td data-label="Actions" class="security-table__actions">
+          <form data-api-form data-api-url="{{ s.revoke_url }}" data-api-method="POST"
+                data-success="{{ 'You are signed out here.' if s.current else 'That session was ended.' }}"
+                data-on-success="{{ 'reload' if s.current else 'refresh' }}" data-refresh="sessions" novalidate>
+            <button type="submit" class="btn btn--sm" data-action="session-end">{{ "Sign out here" if s.current else "End" }}<span class="sr-only"> (session from {{ s.ip or "an unknown address" }})</span></button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="muted security-intro">No session is signed in (this page could not have loaded without one; reload it).</p>
+{% endif %}
+{{ confirm_dialog("dlg-sessions-others", "End every other session?", action=revoke_others_url, api=True,
+                  confirm_label="End the other sessions",
+                  consequences=["Every browser signed in as you, except this one, is signed out at once.",
+                                "They can sign in again with your password and second factor.",
+                                "This browser stays signed in."],
+                  success="Every other session was ended.", on_success="refresh", refresh="sessions") }}
+{{ confirm_dialog("dlg-sessions-all", "Sign out everywhere?", action=revoke_all_url, api=True, danger=True,
+                  confirm_label="Sign out everywhere",
+                  consequences=["Every admin session ends at once, this one included (the kill switch).",
+                                "You go back to the sign-in screen; signing in again needs your password and second factor.",
+                                "Use it when you think someone else is signed in as you."],
+                  success="Every session was ended.", on_success="reload") }}
+{% endcall %}

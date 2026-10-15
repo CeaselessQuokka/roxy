@@ -1,0 +1,89 @@
+# TARPIT-TUNE, second branch: "arrival gap unchanged by holding (useless, lower hold)" (11.5).
+#
+# Twenty scanners hit the header filter 1,200 times in the hour. Each scanner opens many connections in parallel, so
+# holding one of them does nothing to the next: the average gap between a held client's attempts is 2.1 s, against
+# 2.0 s for the same clients when they are not held. The tarpit is not saturated (6 of 1,200 eligible holds skipped,
+# 0.5%), so only the second branch applies. The holds cost sockets and nginx connections for no effect.
+#
+# 11.5 does not give a number for "unchanged"; this fixture uses a 5% difference, far inside any reasonable
+# tolerance, and tarpit_tune__saturated uses a 14x difference for "changed". The change must reduce holding (a
+# shorter hold range, the `jitter` type, or switching the header_rule category off) and must not raise any tarpit
+# capacity or hold length.
+
+format: roxy.insight_fixture/1
+rule: TARPIT-TUNE
+case: holding_useless
+description: >
+  The tarpit holds almost every eligible refusal, but the held scanners come back just as fast (2.1 s between
+  attempts with a hold, 2.0 s without). TARPIT-TUNE must recommend holding less (shorter holds, the jitter type, or
+  the header_rule category off), never more, and not as safe to auto-apply.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  rules_header:
+    - {id: 1, canonical_key: "x-scanner|value|contains|sqlmap", scope: value, mode: contains, needle: "sqlmap", header: "x-scanner", enabled: 1, created_at: "-90d", created_by: admin}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  header_refused: {egress: none, outcome: refused, reason: header_rule, status: 403, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  held: {latency_ms: {p0: 8000, p50: 14000, p100: 20000}}
+  scanners: {clients: {cidr: "192.0.2.32/27", count: 20}, user_agent: "sqlmap/1.8", endpoint_template: games.roblox.com/v1/games}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  - {name: scanners_held, profile: [header_refused, held, scanners], window: ["-60m", "0m"], total: 1194}
+  - {name: scanners_skipped, profile: [header_refused, scanners], window: ["-60m", "0m"], total: 6}
+
+state:
+  tarpit: {eligible_holds: 1200, skipped: 6, holds: 1194, gap_with_hold_s: 2.1, gap_without_hold_s: 2.0}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 4200, by_reason: {header_rule: 1200}}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: TARPIT-TUNE
+      severity: any
+      family: abuse
+      confidence: medium
+      safe_auto: false
+      changes_required:
+        - any_of:
+            - {kind: setting, key: tarpit_max_seconds, current: 20, proposed: {lt: 20}}
+            - {kind: setting, key: tarpit_min_seconds, current: 8, proposed: {lt: 8}}
+            - {kind: setting, key: tarpit_default_type, current: hold, proposed: {in: [jitter, drip]}}
+            - {kind: tarpit_category, category: header_rule, current: 1, proposed: 0}
+      changes_forbidden:
+        - {kind: setting, key: tarpit_max_concurrent, proposed: {gt: 50}}
+        - {kind: setting, key: tarpit_max_seconds, proposed: {gt: 20}}
+        - {kind: setting, key: tarpit_min_seconds, proposed: {gt: 8}}
+        - {kind: setting, key: tarpit_max_capacity_fraction, proposed: {gt: 0.25}}
+        - {kind: tarpit_category, proposed: 1}
+      change_kinds_forbidden: [ban_add, ban_remove, bypass_add, bucket_override]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_tarpit_tune_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_tarpit_tune_severity replaces the computed severity.
+    settings: {insight_tarpit_tune_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: critical}

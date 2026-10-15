@@ -1,0 +1,154 @@
+{#-
+  Endpoints page, card `detail` (`roxy/admin/pages/endpoints.py detail_card`): one endpoint template's drill-down,
+  the `GET /admin/api/v1/endpoints/detail` answer. It renders in the drawer (a table row opens it) and as the body
+  of the drill-down page (`/admin/endpoints/template`, `in_page`), so headings start one level lower in the drawer.
+
+  Totals with their change against the comparison (a partial total shows its notice instead, plan 6.8), requests
+  by outcome and latency over time (embedded series), Roblox 429s (by egress, the latest ones), the cache rule and
+  lifetime, who calls it (places and hashed clients over the range; addresses and places in the last 15 minutes),
+  the concrete paths behind the template, its recent requests, and every rule that applies, each linked to the card
+  that manages it. The template, paths, places, User-Agents and rule patterns are caller text: `caller_text`
+  everywhere, and links from data only through `local_href`.
+  Context: `frame`, `name`, `answer`, `tiles`, `compare_words`, `outcome_series`, `u429`, `u429_rows`, `cache`,
+  `range_callers`, `recent_callers`, `paths`, `rows`, `targets`, `limits`, `notices`, `in_page`, `page_href`,
+  `live_href`, `reset_href`, `list_href`.
+-#}
+{% from "components/kpi.html" import kpi_api %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/format.html" import caller_text, local_href, num, duration %}
+{% from "components/icon.html" import icon %}
+{% from "components/empty.html" import empty_state %}
+{% from "admin/pages/endpoints/_requests.html" import request_table %}
+{% set h = 2 if in_page else 3 %}
+{% set sub = h + 1 %}
+<div class="ep-detail stack" id="{{ frame.id }}" data-card="{{ frame.id }}" data-endpoint-detail>
+  <div class="ep-detail__head">
+    <p class="ep-detail__name"><span class="muted">Endpoint template</span> <span class="mono">{{ caller_text(name, 300) }}</span></p>
+    <div class="cluster ep-detail__actions">
+      {% if in_page %}
+      {% set back = local_href(list_href) %}{% if back %}<a class="btn btn--sm btn--ghost" href="{{ back }}">{{ icon("chevron-left") }}<span>All endpoints</span></a>{% endif %}
+      {% else %}
+      {% set full = local_href(page_href) %}{% if full %}<a class="btn btn--sm" href="{{ full }}" data-action="endpoint-page">{{ icon("external") }}<span>Open as a page</span></a>{% endif %}
+      {% endif %}
+      {% set live = local_href(live_href) %}{% if live %}<a class="btn btn--sm btn--ghost" href="{{ live }}">{{ icon("live") }}<span>Watch it live</span></a>{% endif %}
+      {% set reset = local_href(reset_href) %}{% if reset %}<button type="button" class="btn btn--sm btn--ghost" data-drawer-src="{{ reset }}" data-drawer-title="Reset this endpoint's numbers" data-action="endpoint-reset">{{ icon("reset") }}<span>Reset its numbers</span></button>{% endif %}
+    </div>
+  </div>
+  {% for note in notices %}<p class="card__notice ep-detail__notice" role="note">{{ icon("info") }}<span>{{ caller_text(note, 400) }}</span></p>{% endfor %}
+
+  <section class="ep-detail__section" aria-labelledby="ep-totals">
+    <h{{ h }} class="ep-detail__heading" id="ep-totals">Totals in this range</h{{ h }}>
+    <div class="kpi-grid ep-detail__tiles">
+      {% for tile in tiles %}{{ kpi_api(tile, compare_label="vs " ~ compare_words, level=sub) }}{% endfor %}
+    </div>
+  </section>
+
+  <section class="ep-detail__section" aria-labelledby="ep-time">
+    <h{{ h }} class="ep-detail__heading" id="ep-time">Over time</h{{ h }}>
+    <div class="ep-detail__charts">
+      {{ series_chart("ep-outcomes-chart", "Requests by outcome", series=answer.requests_by_outcome, summary="Requests to this endpoint by outcome over the range.", size="sm", kind="area", stack="outcome", series_options=outcome_series, y_format="count", level=sub, empty_text="No requests to this endpoint in this range.") }}
+      {{ series_chart("ep-latency-chart", "Latency percentiles", series=answer.latency, summary="Latency percentiles of this endpoint over the range.", size="sm", kind="line", y_format="ms", level=sub, empty_text="No timed requests to this endpoint in this range.") }}
+    </div>
+  </section>
+
+  <div class="ep-detail__pair">
+    <section class="ep-detail__section" aria-labelledby="ep-429">
+      <h{{ h }} class="ep-detail__heading" id="ep-429">Roblox 429s</h{{ h }}>
+      {% if u429.total %}
+      <p><strong>{{ num(u429.total) }}</strong> in this range{% if u429.by_egress %}: {% for egress, count in u429.by_egress.items() %}{{ num(count) }} through {{ egress }}{{ ", " if not loop.last }}{% endfor %}{% endif %}.</p>
+      <ul class="ep-detail__list">
+        {% for row in u429_rows %}
+        <li>{% if row.when %}<time datetime="{{ row.when.datetime }}">{{ row.when.text }}</time>{% endif %} <span class="muted">through {{ row.egress }}{% if row.retry_after_s is not none %}, Retry-After {{ duration(row.retry_after_s) }}{% endif %}</span>{% if row.drawer %} <button type="button" class="link-btn" data-drawer-src="{{ row.drawer }}" data-drawer-title="Request {{ row.request_id }}">the request</button>{% endif %}</li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="muted">None in this range. Good: Roblox did not ask Roxy to slow down for this endpoint.</p>
+      {% endif %}
+    </section>
+    <section class="ep-detail__section" aria-labelledby="ep-cache">
+      <h{{ h }} class="ep-detail__heading" id="ep-cache">Cache</h{{ h }}>
+      <dl class="kv">
+        <dt>Hit ratio</dt><dd>{% if cache.hit_ratio is not none %}{{ "{:,.1f}".format(cache.hit_ratio * 100) }}%{% else %}<span class="muted">n/a (no cache lookups)</span>{% endif %}</dd>
+        <dt>Lifetime</dt><dd>{{ duration(cache.ttl_s) }}{% if cache.ttl_s == 0 %} (not cached){% endif %}</dd>
+        <dt>Rule</dt><dd>{% if cache.rule %}#{{ cache.rule.id }} <span class="mono">{{ caller_text(cache.rule.pattern, 200) }}</span> <a href="/admin/cache#rules">Cache rules</a>{% else %}<span class="muted">No rule: the default lifetime (cache_ttl_seconds) applies.</span>{% endif %}</dd>
+      </dl>
+    </section>
+  </div>
+
+  <section class="ep-detail__section" aria-labelledby="ep-callers">
+    <h{{ h }} class="ep-detail__heading" id="ep-callers">Who calls it</h{{ h }}>
+    <div class="ep-detail__pair">
+      <div>
+        <h{{ sub }} class="ep-detail__subheading">Over the range <span class="muted">({{ num(range_callers.samples or 0) }} sampled requests)</span></h{{ sub }}>
+        {% if range_callers.places or range_callers.clients %}
+        <ul class="ep-detail__list">
+          {% for row in range_callers.places or [] %}<li>Place {{ caller_text(row.place, 80) }} <span class="muted">{{ num(row.requests) }}</span></li>{% endfor %}
+          {% for row in range_callers.clients or [] %}<li>Client <span class="mono">{{ row.client_hash }}</span> <span class="muted">{{ num(row.requests) }} (address hashed)</span></li>{% endfor %}
+        </ul>
+        {% else %}<p class="muted">No samples in this range (served and failed requests are sampled).</p>{% endif %}
+      </div>
+      <div>
+        <h{{ sub }} class="ep-detail__subheading">In the last 15 minutes</h{{ sub }}>
+        {% if recent_callers.ips or recent_callers.places %}
+        <ul class="ep-detail__list">
+          {% for row in recent_callers.ips or [] %}<li><span class="mono">{{ row.ip }}</span> <span class="muted">{{ num(row.requests) }}</span></li>{% endfor %}
+          {% for row in recent_callers.places or [] %}<li>Place {{ caller_text(row.place, 80) }} <span class="muted">{{ num(row.requests) }}</span></li>{% endfor %}
+        </ul>
+        {% else %}<p class="muted">No requests in the last 15 minutes.</p>{% endif %}
+      </div>
+    </div>
+  </section>
+
+  <section class="ep-detail__section" aria-labelledby="ep-paths">
+    <h{{ h }} class="ep-detail__heading" id="ep-paths">Concrete paths</h{{ h }}>
+    {% if paths %}
+    <div class="table-scroll" role="region" aria-labelledby="ep-paths" tabindex="0">
+      <table class="simple-table ep-detail__paths">
+        <caption class="sr-only">The concrete paths behind this template in the last 15 minutes</caption>
+        <thead><tr><th scope="col">Path</th><th scope="col" class="num">Requests</th><th scope="col">Last seen</th></tr></thead>
+        <tbody>
+          {% for path in paths %}
+          <tr><td class="mono">{{ caller_text(path.path, 300) }}</td><td class="num">{{ num(path.requests) }}</td><td>{% if path.when %}<time datetime="{{ path.when.datetime }}">{{ path.when.text }}</time>{% else %}<span class="muted">n/a</span>{% endif %}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<p class="muted">No requests in the last 15 minutes, so no concrete paths to show.</p>{% endif %}
+  </section>
+
+  <section class="ep-detail__section" aria-labelledby="ep-recent">
+    <h{{ h }} class="ep-detail__heading" id="ep-recent">Recent requests</h{{ h }}>
+    {% if rows %}{{ request_table(rows, "ep-detail-recent", "The latest requests of this endpoint, newest first") }}
+    {% else %}{{ empty_state("No recent requests", "Live records are kept for 15 minutes; requests to this endpoint appear here as they arrive.", "inbox") }}{% endif %}
+  </section>
+
+  <section class="ep-detail__section" aria-labelledby="ep-rules">
+    <h{{ h }} class="ep-detail__heading" id="ep-rules">Rules that apply</h{{ h }}>
+    <p class="muted">Rules match real paths, so each is checked against the template (placeholders stand for any value) and the concrete paths seen.</p>
+    {% for target in targets %}
+    <div class="ep-detail__target">
+      <p class="ep-detail__target-name"><span class="muted">{{ "Template" if target.kind == "template" else "Path" }}</span> <span class="mono">{{ caller_text(target.target, 300) }}</span></p>
+      {% if target.rules or target.ignored %}
+      <ul class="ep-detail__list">
+        {% for item in target.rules %}
+        <li><a href="{{ item.href }}">{{ item.words }}</a> #{{ item.row.id }}: <span class="mono">{{ caller_text(item.row.pattern, 200) }}</span>
+          {%- if item.family == "endpoint_rule" %} <span class="muted">({{ num(item.row.limit) }} per {{ duration(item.row.period) }} per {{ item.row.scope }})</span>
+          {%- elif item.family == "cache_rule" %} <span class="muted">(kept {{ duration(item.row.ttl) }})</span>
+          {%- elif item.family == "routing_rule" %} <span class="muted">({{ item.row.mode }})</span>
+          {%- elif item.family == "credential_allowlist" %} <span class="muted">(the credential may be used{% if item.row.cache_private %}, answers kept private{% endif %})</span>
+          {%- elif item.family == "endpoint_block" %} <span class="muted">(refused)</span>{% endif %}{% if item.row.enabled is defined and not item.row.enabled %} <span class="muted">(switched off)</span>{% endif %}</li>
+        {% endfor %}
+        {% if target.ignored %}<li><a href="/admin/protection#ignored-paths">Ignored path</a>: Roxy answers it without calling Roblox.</li>{% endif %}
+      </ul>
+      {% else %}
+      <p class="muted">No rule applies: the defaults are used.</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+    {% if limits %}
+    <ul class="ep-detail__list">
+      {% for item in limits %}<li><a href="/admin/upstream#buckets">{{ item.words }}</a>: <span class="mono">{{ caller_text(item.row.bucket_key, 200) }}</span> <span class="muted">({{ item.row.per_min }} per minute, burst {{ item.row.burst }})</span></li>{% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+</div>

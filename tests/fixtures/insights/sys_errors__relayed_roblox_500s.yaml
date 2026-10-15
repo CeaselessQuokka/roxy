@@ -1,0 +1,84 @@
+# SYS-ERRORS counts Roxy's OWN server errors ("Detects: Roxy's own server errors", 11.5), not Roblox's.
+#
+# In the last 15 minutes Roblox answered 160 user lookups with 500, and Roxy relayed that status (D4: real upstream
+# status; `reason: upstream_5xx`, `source: relay`). Roxy's own 500s (`internal_error`) stayed at their usual level:
+#
+#   last 15 minutes        4,154 requests
+#   relayed Roblox 500s    160 (3.85%): UP-5XX territory, not a Roxy bug
+#   Roxy's own 500s        4 (0.096%): under 0.5%
+#   every status-500 reply 164 (3.95%): a rule that counted these would fire by mistake
+#
+# Roxy's 500s come from the known ValueError at respond.py:341 (every 2 minutes, 1x its baseline, not new), so no
+# condition holds. The variant lowers the threshold under Roxy's own rate (0.05%) to show the rule does count them.
+
+format: roxy.insight_fixture/1
+rule: SYS-ERRORS
+case: relayed_roblox_500s
+description: >
+  Roblox returned 500 to 3.85% of the last 15 minutes of requests and Roxy relayed it, while Roxy's own 500s stayed at
+  0.1%. SYS-ERRORS must not fire, because relayed upstream errors are not Roxy's server errors.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  internal_error: {egress: none, outcome: failed, reason: internal_error, status: 500, source: roxy, cache_state: "NA", upstream_calls: 0, error: true, latency_ms: 4, bytes: {caller_in: 0, caller_out: 60}}
+  roblox_500: {egress: direct, outcome: failed, reason: upstream_5xx, status: 500, source: relay, cache_state: "MISS", upstream_calls: 1, error: true, latency_ms: {p50: 300, p95: 900, p99: 1500}, bytes: {caller_in: 0, caller_out: 120, upstream_in: 200, upstream_out: 420}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 200}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 66}
+  - {name: roblox_500s, profile: [roblox_500, legit], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-15m", "0m"], total: 160}
+  - name: bug_baseline
+    profile: [internal_error, legit]
+    endpoint_template: "users.roblox.com/v1/users/{userId}"
+    window: ["-60m", "-15m"]
+    series: [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+  - name: bug_recent
+    profile: [internal_error, legit]
+    endpoint_template: "users.roblox.com/v1/users/{userId}"
+    window: ["-15m", "0m"]
+    series: [0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0]
+
+events:
+  errors:
+    - signature: "ValueError at respond.py:341"
+      count: 12000
+      first_seen: "-20d"
+      last_seen: "-2m"
+      source: roxy
+      last_detail: "GET users.roblox.com/v1/users/{userId}"
+      module_line: "respond.py:341"
+      traceback_redacted: |
+        File "roxy/proxy/respond.py", line 341, in build
+          length = int(result.upstream_headers["content-length"])
+        ValueError: invalid literal for int() with base 10: ''
+      occurrences:
+        - {window: ["-7d", "-15m"], every: "2m"}
+        - {window: ["-14m", "-13m"], per_minute: 1}
+        - {window: ["-10m", "-9m"], per_minute: 1}
+        - {window: ["-6m", "-5m"], per_minute: 1}
+        - {window: ["-2m", "-1m"], per_minute: 1}
+
+expect:
+  data_checks:
+    - {window: ["-15m", "0m"], requests: 4154, by_reason: {upstream_5xx: 160, internal_error: 4}}
+  fires: false
+
+variants:
+  - case: caller_500_pct_lowered
+    description: At 0.05%, Roxy's own 0.096% of 500s is too many; this proves the rule counts them while ignoring relayed ones.
+    settings: {insight_sys_errors_caller_500_pct: 0.05}
+    expect:
+      fires: true
+      recommendations:
+        - {changes_required: [{kind: manual}]}

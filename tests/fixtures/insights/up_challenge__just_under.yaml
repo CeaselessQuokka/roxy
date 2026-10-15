@@ -1,0 +1,81 @@
+# UP-CHALLENGE just under its threshold (format: README.md in this directory).
+#
+# 11.5: "> 5 in 15 min" (`min_pages` = 5). The fixture never sits at exactly 5, so both readings agree:
+#
+#   GET catalog.roblox.com/v1/search/items on the rotator
+#   12 to 8 minutes ago     4 challenge pages (403 + challenge header)        inside the 15 minute window
+#   35 to 26 minutes ago    9 challenge pages                                 outside it
+#
+# Variants: a 40 minute window holds all 13; a minimum of 3 is passed by the 4 recent ones.
+
+format: roxy.insight_fixture/1
+rule: UP-CHALLENGE
+case: just_under
+description: >
+  A few rotator exits get the occasional Roblox challenge page on catalog search: 4 in the last 15 minutes and 9
+  in the half hour before. That is under the threshold inside the window, so the rule stays quiet.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_enabled: 1
+  rotator_weight: 50
+  rotator_quota_gb_per_month: 20
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: catalog.roblox.com/v1/search/items
+  outcome: served_upstream
+  source: relay
+  cache_state: "MISS"
+  latency_ms: {p50: 160, p95: 420, p99: 800}
+
+profiles:
+  ok: {reason: upstream_ok, status: 200}
+  challenge: {egress: rotator, reason: upstream_4xx, status: 403}
+
+traffic:
+  - {name: search_direct, profile: ok, egress: direct, window: ["-60m", "0m"], per_minute: 20}
+  - {name: search_rotator_ok, profile: ok, egress: rotator, window: ["-60m", "0m"], per_minute: 15}
+  - {name: challenge_older, profile: challenge, window: ["-35m", "-26m"], per_minute: 1}
+  - {name: challenge_recent, profile: challenge, window: ["-12m", "-8m"], per_minute: 1}
+
+events:
+  upstream_attempts:
+    - {window: ["-35m", "-26m"], per_minute: 1, endpoint_template: catalog.roblox.com/v1/search/items, egress: rotator, attempt: 1, status: 403, kind: first, challenge: true, html_body: true}
+    - {window: ["-12m", "-8m"], per_minute: 1, endpoint_template: catalog.roblox.com/v1/search/items, egress: rotator, attempt: 1, status: 403, kind: first, challenge: true, html_body: true}
+
+expect:
+  data_checks:
+    - window: ["-15m", "0m"]
+      where: {status: 403}
+      requests: 4
+    - window: ["-35m", "-15m"]
+      where: {status: 403}
+      requests: 9
+
+  fires: false
+
+variants:
+  - case: window_40
+    description: A 40 minute window holds all 13 challenge pages.
+    settings: {insight_up_challenge_window_min: 40}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "catalog.roblox.com/v1/search/items"
+          changes_required:
+            - kind: routing_rule
+              match: {pattern: {matches_targets: ["catalog.roblox.com/v1/search/items"]}}
+              proposed: {mode: {in: [prefer_direct, direct_only]}}
+  - case: min_pages_3
+    description: The 4 recent challenge pages pass a minimum of 3.
+    settings: {insight_up_challenge_min_pages: 3}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "catalog.roblox.com/v1/search/items"}

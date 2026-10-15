@@ -1,0 +1,68 @@
+format: roxy.health_fixture/1
+check: H-NGINX
+case: warn
+name: tarpit_budget_disagrees
+description: >
+  Every header is in place, but nginx was reconfigured to 1 worker process with 1024 connections (512 usable
+  for held requests after halving), while tarpit_connection_budget still says 4000. 10.6 and 15.3 F say H-NGINX
+  warns when the setting disagrees with the nginx values in roxy.env, so warn. The variant lowers
+  tarpit_connection_budget to 500, which fits the 512 nginx can hold: pass.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    tarpit_connection_budget: 4000
+  env:
+    ROXY_NGINX_WORKER_PROCESSES: "1"
+    ROXY_NGINX_WORKER_CONNECTIONS: "1024"
+  upstream:
+    "origin:/":
+      status: 200
+      headers:
+        content-type: "text/html; charset=utf-8"
+        server: "nginx"
+        strict-transport-security: "max-age=63072000; includeSubDomains"
+        x-content-type-options: "nosniff"
+        x-frame-options: "DENY"
+        referrer-policy: "no-referrer"
+      body: "<!doctype html><title>Roxy</title>"
+      latency_ms: 20
+    "origin:/static/**":
+      status: 200
+      headers:
+        content-type: "text/css"
+        server: "nginx"
+        cache-control: "public, immutable"
+        strict-transport-security: "max-age=63072000; includeSubDomains"
+      body: "body{margin:0}"
+      latency_ms: 5
+    "origin:/admin":
+      status: 200
+      headers:
+        content-type: "text/html; charset=utf-8"
+        server: "nginx"
+        cache-control: "no-store"
+        strict-transport-security: "max-age=63072000; includeSubDomains"
+        x-content-type-options: "nosniff"
+        x-frame-options: "DENY"
+      body: "<!doctype html><title>Sign in</title>"
+      latency_ms: 25
+    "origin:/internal/version":
+      status: 404
+      headers:
+        server: "nginx"
+        strict-transport-security: "max-age=63072000; includeSubDomains"
+      body: "Not Found"
+      latency_ms: 3
+expect:
+  status: warn
+  explanation: {present: true}
+  fix_link: {present: true}
+  credential_calls: {eq: 0}
+variants:
+  - case: pass
+    name: budget_lowered_to_fit
+    inputs:
+      settings:
+        tarpit_connection_budget: 500
+    expect:
+      status: pass

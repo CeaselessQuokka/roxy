@@ -1,0 +1,64 @@
+# SYS-HEALTH-FAIL: "any fail in the latest run" (11.5; no threshold).
+#
+# Two health runs with the same four checks (`state.health`, stored in health_runs and health_results):
+#
+#   check        scheduled run at 09:00 UTC   manual run at 14:50 UTC (latest)
+#   H-DISK       pass (41% free)              fail (8% free)
+#   H-LATENCY    pass (640 ms)                warn (1,720 ms)
+#   H-BACKUP     pass                         pass
+#   H-WORKERS    pass                         pass
+#
+# Only the failing check of the latest run gets a recommendation; a warn is not a fail. 11.5's change is the
+# "check-specific fix link", which the fixture does not constrain beyond `safe_auto: false` (a pointer to a fix,
+# never an automatic one).
+
+format: roxy.insight_fixture/1
+rule: SYS-HEALTH-FAIL
+case: disk_check_failing
+description: >
+  The latest health run has H-DISK failing and H-LATENCY warning. SYS-HEALTH-FAIL must raise exactly one
+  recommendation, for H-DISK.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  health:
+    runs:
+      - started_at: "-6h"
+        trigger: schedule
+        results:
+          - {check_id: H-DISK, status: pass, value: "41% free", threshold: "pass > 25%, warn > 10%", explanation: "Free space on the state volume.", fix_link: "/admin/system#disk"}
+          - {check_id: H-LATENCY, status: pass, value: "640 ms", threshold: "pass < 1000 ms, warn < 2500 ms", explanation: "p95 upstream latency over the last 15 minutes.", fix_link: "/admin/upstream"}
+          - {check_id: H-BACKUP, status: pass, value: "14 h", threshold: "pass < 26 h, warn < 72 h", explanation: "Age of the last backup and its restore test.", fix_link: "/admin/help#runbook-backups"}
+          - {check_id: H-WORKERS, status: pass, value: "2 of 2 fresh", threshold: "all fresh", explanation: "Worker heartbeats.", fix_link: "/admin/system"}
+      - started_at: "-10m"
+        trigger: manual
+        results:
+          - {check_id: H-DISK, status: fail, value: "8% free", threshold: "pass > 25%, warn > 10%", explanation: "Free space on the state volume is below 10%; writes will start failing when it runs out.", fix_link: "/admin/system#disk"}
+          - {check_id: H-LATENCY, status: warn, value: "1720 ms", threshold: "pass < 1000 ms, warn < 2500 ms", explanation: "p95 upstream latency over the last 15 minutes is high.", fix_link: "/admin/upstream"}
+          - {check_id: H-BACKUP, status: pass, value: "20 h", threshold: "pass < 26 h, warn < 72 h", explanation: "Age of the last backup and its restore test.", fix_link: "/admin/help#runbook-backups"}
+          - {check_id: H-WORKERS, status: pass, value: "2 of 2 fresh", threshold: "all fresh", explanation: "Worker heartbeats.", fix_link: "/admin/system"}
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-HEALTH-FAIL
+      subject_contains: "H-DISK"
+      severity: any
+      family: system
+      confidence: high
+      safe_auto: false
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_health_fail_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_info
+    description: insight_sys_health_fail_severity replaces the computed severity.
+    settings: {insight_sys_health_fail_severity: info}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "H-DISK", severity: info}

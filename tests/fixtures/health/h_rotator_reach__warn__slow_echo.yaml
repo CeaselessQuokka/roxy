@@ -1,0 +1,27 @@
+format: roxy.health_fixture/1
+check: H-ROTATOR-REACH
+case: warn
+name: slow_echo
+description: >
+  The IP echo through the rotator succeeds but takes 6,000 ms (the probe timeout, rotator_probe_timeout_s, is
+  10 s). 13.2 H-ROTATOR-REACH: slow gives warn, with the Egress page as the fix. 13.2 gives no number for
+  "slow"; 6 s is slow under any reading (above the 2,000 ms H-REACH warn edge and above half the probe timeout),
+  so the fixture does not depend on where the implementer draws the line.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    rotator_enabled: 1
+    rotator_weight: 25
+  upstream:
+    ip_echo:
+      status: 200
+      exit_ip: "198.51.100.23"
+      latency_ms: 6000
+      expect_request: {via: rotator, method: GET}
+expect:
+  status: warn
+  explanation: {present: true}
+  fix_link: {regex: "(?i)egress"}
+  calls:
+    ip_echo: {count: 1, via: rotator}
+  credential_calls: {eq: 0}

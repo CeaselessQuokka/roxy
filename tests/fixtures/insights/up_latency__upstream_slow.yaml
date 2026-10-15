@@ -1,0 +1,108 @@
+# UP-LATENCY where Roblox itself is slow (format: README.md in this directory).
+#
+# 11.5: "p95 upstream latency > 1500 ms or p99 > 4000 ms over 30 min (min 200 calls)"; evidence: p50/p95/p99
+# chart, per egress, queue wait share; change: "if upstream time dominates: raise TTL and SWR for top slow
+# endpoints"; "raise a bucket only when it has had zero 429s for 24 h (UP-BUCKET-TUNE evidence), never as a
+# latency fix alone"; confidence medium. Queue wait is zero here and the rotator is unused, so the only fix is
+# TTL plus SWR on the slow endpoint; no bucket, routing or timeout change.
+#
+# Last 30 minutes (percentiles as the rollup histograms report them, plan 6.4 buckets; see data below):
+#
+#   requests that went upstream   calls   p50     p95       p99
+#   avatar (the slow endpoint)    1,200   ~990    ~4,040    ~5,880
+#   games list                    900     ~300    ~1,490    ~2,670
+#   both together                 2,100   ~900    ~3,040    ~4,910
+#
+# Both tests pass (p95 > 1500 and p99 > 4000), with 2,100 calls (min 200). Cache hits (6,000) have no upstream
+# latency and are not part of "upstream latency" (counted in anyway, p95 would still be ~1,860 ms).
+
+format: roxy.insight_fixture/1
+rule: UP-LATENCY
+case: upstream_slow
+description: >
+  Roblox's avatar endpoint has become slow: its p95 is above 3 s and the overall upstream p95 is about 2.8 s,
+  with no time spent waiting in Roxy's queue. The rule must recommend a longer TTL and SWR for the avatar
+  endpoint's cache rule, and must not touch buckets, routing or request_timeout.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "avatar.roblox.com/v1/users/*/avatar", type: glob, ttl: 60, stale_ttl: 0, methods: "GET", origin: admin, created_at: "-30d"}
+    - {id: 2, pattern: "games.roblox.com/v1/games", type: glob, ttl: 60, stale_ttl: 30, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", queue_wait_ms: 0}
+  avatar: {endpoint_template: "avatar.roblox.com/v1/users/{userId}/avatar"}
+  games: {endpoint_template: games.roblox.com/v1/games}
+
+traffic:
+  - {name: avatar_hit, profile: [hit, avatar], window: ["-60m", "0m"], per_minute: 100}
+  - {name: games_hit, profile: [hit, games], window: ["-60m", "0m"], per_minute: 100}
+  - {name: avatar_miss_before, profile: [miss, avatar], window: ["-60m", "-30m"], per_minute: 40, latency_ms: {p50: 180, p95: 450, p99: 900}}
+  - {name: games_miss_before, profile: [miss, games], window: ["-60m", "-30m"], per_minute: 30, latency_ms: {p50: 150, p95: 400, p99: 800}}
+  - {name: avatar_miss_slow, profile: [miss, avatar], window: ["-30m", "0m"], per_minute: 40, latency_ms: {p50: 900, p95: 3200, p99: 5200}}
+  - {name: games_miss, profile: [miss, games], window: ["-30m", "0m"], per_minute: 30, latency_ms: {p50: 300, p95: 1400, p99: 2600}}
+
+expect:
+  data_checks:
+    - window: ["-30m", "0m"]
+      where: {egress: direct}
+      requests: 2100
+      upstream_calls: 2100
+    - window: ["-30m", "0m"]
+      where: {endpoint_template: "avatar.roblox.com/v1/users/{userId}/avatar", cache_state: "MISS"}
+      upstream_calls: 1200
+
+  fires: true
+  others: forbid
+  recommendations:
+    - confidence: medium
+      family: upstream
+      change_kinds_required: [rule_upsert]
+      change_kinds_forbidden: [bucket_override, routing_rule, ban_add, credential_allowlist_remove]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["avatar.roblox.com/v1/users/1000000001/avatar"]}}
+          current: {ttl: 60, stale_ttl: 0}
+          proposed: {ttl: {gt: 60}, stale_ttl: {gte: 1}}
+      changes_forbidden:
+        - kind: setting
+          key:
+            in: [request_timeout, endpoint_bucket_default_per_min, host_bucket_default_per_min, global_bucket_per_min,
+                 direct_bucket_per_min, rotator_weight, cache_ttl_seconds, cache_swr_seconds]
+        - kind: rule_upsert
+          match: {pattern: {matches_targets: ["thumbnails.roblox.com/v1/users/avatar-headshot"]}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_latency_enabled: 0}
+    expect: {fires: false}
+  - case: thresholds_raised
+    description: >
+      A p95 limit of 5,000 ms and a p99 limit of 8,000 ms are above what the histograms show, overall or for the
+      avatar endpoint alone (p95 ~4,040, p99 ~5,880).
+    settings: {insight_up_latency_p95_ms: 5000, insight_up_latency_p99_ms: 8000}
+    expect: {fires: false}
+  - case: p95_alone
+    description: With the p99 test out of reach, the p95 test alone (about 3,040 ms > 1,500 ms) fires.
+    settings: {insight_up_latency_p99_ms: 120000}
+    expect: {fires: true}
+  - case: p99_alone
+    description: >
+      With the overall p95 (about 3,040 ms) under a 4,000 ms limit, the p99 test (about 4,910 ms > 4,000 ms) fires
+      (validate_cross keeps the p95 limit at or below the p99 limit).
+    settings: {insight_up_latency_p95_ms: 4000, insight_up_latency_p99_ms: 4000}
+    expect: {fires: true}
+  - case: min_calls_3000
+    description: 2,100 upstream calls in the window are below a minimum of 3,000.
+    settings: {insight_up_latency_min_calls: 3000}
+    expect: {fires: false}

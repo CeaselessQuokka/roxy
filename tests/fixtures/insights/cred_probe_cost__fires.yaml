@@ -1,0 +1,87 @@
+# CRED-PROBE-COST fires when Roxy's own credential calls exceed the hourly budget
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Internal credential calls > insight_cred_probe_cost_max_per_hour (6) in an hour"; evidence "Probe
+# sources (scheduled, health, admin), counts"; change "Raise credential_probe_interval_min, lower
+# health_auto_interval_h, or disable credential checks in scheduled health runs"; confidence High. The threshold is
+# the ordinary setting insight_cred_probe_cost_max_per_hour (15.3 J), not a generated parameter.
+#
+#   Two days ago credential_probe_interval_min was set to 5 ("notice expiry faster").
+#   Last 120 min: a scheduled liveness probe every 5 minutes with the credential (24 calls); a manual health run at
+#   -35m made 1 credential call and 10 anonymous probe calls (direct egress, not credential calls).
+#   Last 60 min (also the clock hour 14:00 to 15:00): 12 scheduled + 1 health = 13 credential calls, over 6.
+#
+# The dominant source is the scheduled probe, so the remedy is a longer credential_probe_interval_min. Never
+# silence the rule by raising its own threshold, never turn the credential off, and never turn the liveness
+# probe off (0) or make it more frequent.
+
+format: roxy.insight_fixture/1
+rule: CRED-PROBE-COST
+case: fires
+description: >
+  With the liveness probe every 5 minutes, Roxy made 13 calls with the credential in the last hour against a
+  budget of 6. The rule must propose a longer credential_probe_interval_min, attribute the calls to their sources,
+  and not be safe to auto-apply.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  credential_probe_interval_min: 5
+
+events:
+  internal_calls:
+    # Scheduled liveness probes, one every 5 minutes (minutes 0, 5, 10, ... of the window).
+    - window: ["-120m", "0m"]
+      series: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0]
+      purpose: credential_probe
+      trigger: scheduled
+      egress: credential
+      endpoint_template: users.roblox.com/v1/users/authenticated
+      status: 200
+    - {at: "-35m", purpose: health, trigger: health, egress: credential, endpoint_template: users.roblox.com/v1/users/authenticated, status: 200}
+    - {window: ["-35m", "-34m"], total: 10, purpose: health, trigger: health, egress: direct, endpoint_template: games.roblox.com/v1/games, status: 200}
+
+state:
+  credential:
+    present: true
+    status: active
+    status_at: "-30d"
+    set_at: "-30d"
+    account_id: "1000001"
+  settings_history:
+    - {at: "-2d", key: credential_probe_interval_min, old: 30, new: 5, source: admin, changed_by: admin, reason: "Notice credential expiry faster."}
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CRED-PROBE-COST
+      severity: any
+      family: credential
+      confidence: high
+      safe_auto: false
+      change_kinds_required: [setting]
+      change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, host_add, bucket_override, routing_rule, ignored_param_add, rule_upsert, credential_allowlist_remove]
+      changes_required:
+        - {kind: setting, key: credential_probe_interval_min, current: 5, proposed: {gt: 5}}
+      changes_forbidden:
+        - {kind: setting, key: credential_probe_interval_min, proposed: {lte: 5}}
+        - {kind: setting, key: {in: [credential_enabled, insight_cred_probe_cost_max_per_hour, credential_bucket_per_min, credential_probe_reserved_per_min]}}
+        - {kind: setting, key: health_auto_include_credential, proposed: 1}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cred_probe_cost_enabled: 0}
+    expect: {fires: false}
+  - case: max_per_hour_13
+    description: With 13 calls allowed per hour, 13 is not more than the budget.
+    settings: {insight_cred_probe_cost_max_per_hour: 13}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_cred_probe_cost_severity replaces the computed severity.
+    settings: {insight_cred_probe_cost_severity: critical}
+    expect:
+      fires: true
+      recommendations:
+        - {severity: critical}

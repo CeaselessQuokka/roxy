@@ -1,0 +1,86 @@
+# roxy-alert@.service: emails (and optionally posts to a webhook) that a unit failed (plan 17.1, 17.7).
+#
+# Started by OnFailure=roxy-alert@%n.service in roxy@.service, roxy-backup.service and roxy-audit.service, with the
+# failed unit's full name as the instance (for example roxy-alert@roxy@blue.service.service). It is the only layer
+# that can report a kill by the kernel (out of memory) or a signal: those raise no Python exception, so the app's
+# own error email never fires. roxy-deploy-alert.path also starts it as roxy-alert@deploy-failure.service when
+# deploy.sh records a failed deploy. Every directive says why it is here.
+
+[Unit]
+# Shown in `systemctl list-units` and the journal; %i is the failed unit's name.
+Description=Roxy alert: %i failed
+# No OnFailure= here on purpose: an alert about the alert unit could loop. A failed send still shows up in
+# `systemctl --failed`, because the script exits non-zero (v1 always exited 0, so failures were invisible).
+
+[Service]
+# Runs once per failure and exits; systemd waits for it to finish.
+Type=oneshot
+# The system Python, not a release venv: alerts must work when a release is broken or half deployed (plan 17.1).
+# -I (isolated mode) ignores PYTHON* variables and the user site directory, so nothing outside the script runs.
+ExecStart=/usr/bin/python3 -I /usr/local/lib/roxy/alert_on_failure.py %i
+# A throwaway user allocated for each run: the script needs no account of its own and owns nothing but its state.
+DynamicUser=yes
+# Membership in systemd-journal lets it read the failed unit's journal lines (it reads nothing else).
+SupplementaryGroups=systemd-journal
+# /var/lib/roxy-alert keeps one stamp file per unit for the rate limit (one email per unit per 10 minutes, with a
+# count of the alerts suppressed in between). With DynamicUser systemd keeps it under /var/lib/private.
+StateDirectory=roxy-alert
+# Only this service may read the stamp files.
+StateDirectoryMode=0700
+# The mail and webhook secrets as named credentials (plan 9.8), not the positional files.txt lines v1 used.
+# The Gmail app password.
+LoadCredential=smtp_password:/etc/roxy/credentials/smtp_password
+# Recipient and sender addresses (to: and from: lines).
+LoadCredential=alert_emails:/etc/roxy/credentials/alert_emails
+# Optional webhook URL; an empty file means no webhook.
+LoadCredential=alert_webhook_url:/etc/roxy/credentials/alert_webhook_url
+# The script has its own 20 s network timeouts; this bounds the whole run if something else hangs.
+TimeoutStartSec=120
+# No privilege escalation through setuid binaries.
+NoNewPrivileges=yes
+# The whole filesystem is read-only except the state directory above.
+ProtectSystem=strict
+# Home directories are invisible; the script needs none.
+ProtectHome=yes
+# A private /tmp, removed after the run.
+PrivateTmp=yes
+# No hardware devices, only the pseudo devices.
+PrivateDevices=yes
+# No writes to kernel tunables under /proc/sys and /sys.
+ProtectKernelTunables=yes
+# No kernel module loading.
+ProtectKernelModules=yes
+# No access to the kernel log buffer.
+ProtectKernelLogs=yes
+# The cgroup tree is read-only.
+ProtectControlGroups=yes
+# No changes to the system clock.
+ProtectClock=yes
+# No changes to the hostname (the script only reads it for the subject line).
+ProtectHostname=yes
+# SMTP and the webhook need IPv4 and IPv6; systemctl and the journal need Unix sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# No new namespaces.
+RestrictNamespaces=yes
+# No realtime scheduling.
+RestrictRealtime=yes
+# No setuid or setgid files can be created.
+RestrictSUIDSGID=yes
+# The execution domain cannot be changed.
+LockPersonality=yes
+# No writable and executable memory (plain CPython needs none).
+MemoryDenyWriteExecute=yes
+# Normal service system calls only...
+SystemCallFilter=@system-service
+# ...without privileged ones or resource limit changes.
+SystemCallFilter=~@privileged @resources
+# A filtered system call fails with "Operation not permitted" (a readable error) instead of a silent SIGSYS kill.
+SystemCallErrorNumber=EPERM
+# Native system call ABI only (blocks the 32-bit ABI around the filter).
+SystemCallArchitectures=native
+# No capabilities.
+CapabilityBoundingSet=
+# Small and short-lived: a cap keeps a misbehaving run from pressing on the 909 MB server.
+MemoryMax=100M
+# The journal tag for the alert runs themselves.
+SyslogIdentifier=roxy-alert

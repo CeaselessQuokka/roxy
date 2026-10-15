@@ -1,0 +1,211 @@
+/*
+ * Design tokens for the Roxy admin dashboard (plan 14.4).
+ *
+ * What this is
+ *   Every color, size, font and timing the dashboard uses, as CSS custom properties. Components never use a raw
+ *   color: they use a semantic token ("--text-muted", "--bad"), so one edit here restyles the whole dashboard.
+ *
+ * Why it exists
+ *   Two themes (dark is the default, light, and "follow the system") must both meet WCAG 2.2 AA contrast. Keeping
+ *   each token's light and dark value side by side in ONE declaration makes a theme impossible to forget, and lets
+ *   scripts/check_contrast.py read this file and prove every text and mark pair passes (4.5:1 for body text, 3:1 for
+ *   large text, UI component boundaries and chart marks).
+ *
+ * How it works
+ *   Each color is `light-dark(<light value>, <dark value>)`. The browser picks the side that matches the element's
+ *   `color-scheme`, which the root element sets from its `data-theme` attribute: "dark" (and no attribute at all)
+ *   uses the dark side, "light" the light side, and "system" lets the operating system choose. Canvas charts cannot
+ *   read light-dark() from a custom property, so static/js/charts.js resolves a token through a hidden probe
+ *   element (getComputedStyle returns the final rgb color). light-dark() takes colors only, so a shadow keeps its
+ *   offsets outside and only its color inside. Browsers too old for light-dark() get the same values from the
+ *   `@supports not` block at the end of this file.
+ *
+ * What to read next
+ *   static/css/layout.css (the shell), static/css/components.css, then scripts/check_contrast.py.
+ */
+
+:root {
+  /* Dark is the default theme (plan 14.4); the light side of every light-dark() below is unused until a theme
+     attribute or the system asks for it. */
+  color-scheme: dark;
+
+  /* ---------------------------------------------------------------- surfaces and text */
+  --bg:            light-dark(#f4f5f7, #0b0e14);  /* the page plane behind every card */
+  --surface-1:     light-dark(#ffffff, #11151d);  /* cards, the sidebar, the top bar */
+  --surface-2:     light-dark(#f8f9fb, #171c26);  /* inputs, table headers, nested panels */
+  --surface-3:     light-dark(#eef0f3, #1e2430);  /* hover and pressed states, popovers */
+  --border:        light-dark(#e2e5ea, #262d3a);  /* hairline dividers between regions (decorative only) */
+  --border-strong: light-dark(#7f8899, #677186);  /* boundaries that identify a control: 3:1 (WCAG 1.4.11) */
+  --text:          light-dark(#14181f, #e6e9ef);  /* body text: well above 4.5:1 on every surface */
+  --text-muted:    light-dark(#566070, #9ba4b5);  /* secondary text, axis labels, hints: still 4.5:1 */
+  --text-inverse:  light-dark(#ffffff, #0b0e14);  /* text on a solid status color */
+
+  /* ---------------------------------------------------------------- accent (links, selection, primary buttons) */
+  --accent:        light-dark(#2554c7, #7aa2ff);  /* links and selected states: 4.5:1 as text */
+  --accent-bg:     light-dark(#2f5fd0, #4369d9);  /* filled primary buttons */
+  --on-accent:     #ffffff;                       /* text on --accent-bg: 4.5:1 in both themes */
+  --accent-soft:   light-dark(#e6edfb, #1a2540);  /* selected rows, the current nav item */
+
+  /* ---------------------------------------------------------------- status (always paired with an icon and words) */
+  --ok:            light-dark(#157347, #4fcf8b);
+  --ok-soft:       light-dark(#e3f4ea, #112a1f);
+  --warn:          light-dark(#8f5600, #f0b44c);
+  --warn-soft:     light-dark(#fbf0dc, #2b2312);
+  --bad:           light-dark(#c42b35, #ff7b72);
+  --bad-soft:      light-dark(#fbe7e8, #301719);
+  --info:          light-dark(#0b6a92, #5cc8e8);
+  --info-soft:     light-dark(#e2f1f8, #0f2731);
+
+  /* ---------------------------------------------------------------- focus */
+  --focus-ring:    light-dark(#2f63de, #8fb4ff);  /* 3:1 against every surface, so focus is always visible */
+
+  /* ---------------------------------------------------------------- chart series (colorblind-safe order, fixed)
+     Slot order is the colorblind safety mechanism: adjacent slots stay apart under protan and deutan simulation.
+     Light steps are darker than the usual chart palette so every mark is 3:1 on white (plan 14.4); dark steps are
+     the same hues chosen for the dark band. A ninth series is never generated: fold it into "Other". */
+  --series-1:      light-dark(#2a78d6, #3987e5);  /* blue */
+  --series-2:      light-dark(#d4561c, #e0662f);  /* orange */
+  --series-3:      light-dark(#13886a, #199e70);  /* aqua */
+  --series-4:      light-dark(#a67800, #c98500);  /* gold */
+  --series-5:      light-dark(#c4467a, #d55181);  /* magenta */
+  --series-6:      light-dark(#2f7d1f, #3f9a2c);  /* green */
+  --series-7:      light-dark(#4a3aa7, #9085e9);  /* violet */
+  --series-8:      light-dark(#c93a3a, #e66767);  /* red */
+
+  /* ---------------------------------------------------------------- chart chrome (recessive on purpose) */
+  --chart-grid:    light-dark(#e8ebf0, #1f2632);
+  --chart-axis:    light-dark(#c3c9d3, #394252);
+  --chart-cursor:  light-dark(#7f8899, #677186);
+  --chart-select:  light-dark(#2f5fd0, #7aa2ff);   /* drawn with transparency by the zoom selection */
+
+  /* ---------------------------------------------------------------- heatmap (one hue, light to dark magnitude) */
+  --heat-0:        light-dark(#f1f4f9, #151b26);
+  --heat-1:        light-dark(#dbe7f9, #172640);
+  --heat-2:        light-dark(#bcd4f5, #1a3157);
+  --heat-3:        light-dark(#9ec5f4, #1d4275);
+  --heat-4:        light-dark(#6da7ec, #235594);
+  --heat-5:        light-dark(#3987e5, #2c69b3);
+  --heat-6:        light-dark(#256abf, #3d80d0);
+  --heat-7:        light-dark(#184f95, #5c98e0);
+  --heat-8:        light-dark(#0d366b, #9cc4f2);
+
+  /* ---------------------------------------------------------------- typography (system fonts: fast, no external
+     requests; CSP font-src 'self' would also allow a bundled Inter later) */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+  --fs-1: 0.75rem;   /* 12 px: captions, badges, axis ticks */
+  --fs-2: 0.875rem;  /* 14 px: body and tables (the dashboard's base size) */
+  --fs-3: 1rem;      /* 16 px: emphasized body, inputs on touch screens */
+  --fs-4: 1.25rem;   /* 20 px: card titles, KPI values on phones */
+  --fs-5: 1.5rem;    /* 24 px: page titles, KPI values */
+  --fs-6: 2rem;      /* 32 px: hero numbers */
+  --lh-tight: 1.2;
+  --lh: 1.5;
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+
+  /* ---------------------------------------------------------------- spacing (4 px grid) and shape */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;  /* card padding */
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 10px;
+  --radius-pill: 999px;
+  /* light-dark() takes two colors, never a whole shadow (that would make the token invalid: no shadow at all).
+     Dark cards get a transparent shadow on purpose: on a dark page the border carries the edge. */
+  --shadow-pop: 0 8px 24px light-dark(rgb(20 24 31 / 0.14), rgb(0 0 0 / 0.5));
+  --shadow-card: 0 1px 2px light-dark(rgb(20 24 31 / 0.06), transparent);
+
+  /* ---------------------------------------------------------------- layout sizes */
+  --topbar-h: 56px;
+  --sidebar-w: 236px;
+  --sidebar-w-collapsed: 64px;
+  --content-max: 1680px;
+  --target-min: 24px;    /* WCAG 2.5.8 minimum target size */
+  --target-touch: 44px;  /* plan 14.8: every control on a phone */
+  --mobile-nav-h: 64px;
+
+  /* ---------------------------------------------------------------- motion (150 to 200 ms, plan 14.4) */
+  --dur-fast: 150ms;
+  --dur: 200ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* The theme attribute wins in both directions over the operating system preference. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="system"] {
+  color-scheme: light dark;
+}
+
+/* Everyone who asked the system for less motion gets none (plan 14.4). */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur: 0ms;
+  }
+}
+
+/* Browsers without light-dark() (Safari before 17.5, so older iPhones; Chrome before 123): every token above that
+   uses it would be invalid there and the dashboard would have no colors at all, which matters because the owner
+   must be able to run Roxy from a phone (plan 14.8). This block repeats both sides of each such token: dark by
+   default, light for the light theme and for "follow the system" on a light system. It is generated from the
+   declarations above, and tests/unit/ui/test_ui_static.py fails if the two ever disagree, so edit a color above
+   first and then the same value here. Browsers that know light-dark() skip this block entirely. */
+@supports not (color: light-dark(#000, #fff)) {
+  :root {
+    --bg: #0b0e14; --surface-1: #11151d; --surface-2: #171c26; --surface-3: #1e2430; --border: #262d3a;
+    --border-strong: #677186; --text: #e6e9ef; --text-muted: #9ba4b5; --text-inverse: #0b0e14; --accent: #7aa2ff;
+    --accent-bg: #4369d9; --accent-soft: #1a2540; --ok: #4fcf8b; --ok-soft: #112a1f; --warn: #f0b44c;
+    --warn-soft: #2b2312; --bad: #ff7b72; --bad-soft: #301719; --info: #5cc8e8; --info-soft: #0f2731;
+    --focus-ring: #8fb4ff; --series-1: #3987e5; --series-2: #e0662f; --series-3: #199e70; --series-4: #c98500;
+    --series-5: #d55181; --series-6: #3f9a2c; --series-7: #9085e9; --series-8: #e66767; --chart-grid: #1f2632;
+    --chart-axis: #394252; --chart-cursor: #677186; --chart-select: #7aa2ff; --heat-0: #151b26; --heat-1: #172640;
+    --heat-2: #1a3157; --heat-3: #1d4275; --heat-4: #235594; --heat-5: #2c69b3; --heat-6: #3d80d0;
+    --heat-7: #5c98e0; --heat-8: #9cc4f2; --shadow-pop: 0 8px 24px rgb(0 0 0 / 0.5);
+    --shadow-card: 0 1px 2px transparent;
+  }
+
+  :root[data-theme="light"] {
+    --bg: #f4f5f7; --surface-1: #ffffff; --surface-2: #f8f9fb; --surface-3: #eef0f3; --border: #e2e5ea;
+    --border-strong: #7f8899; --text: #14181f; --text-muted: #566070; --text-inverse: #ffffff; --accent: #2554c7;
+    --accent-bg: #2f5fd0; --accent-soft: #e6edfb; --ok: #157347; --ok-soft: #e3f4ea; --warn: #8f5600;
+    --warn-soft: #fbf0dc; --bad: #c42b35; --bad-soft: #fbe7e8; --info: #0b6a92; --info-soft: #e2f1f8;
+    --focus-ring: #2f63de; --series-1: #2a78d6; --series-2: #d4561c; --series-3: #13886a; --series-4: #a67800;
+    --series-5: #c4467a; --series-6: #2f7d1f; --series-7: #4a3aa7; --series-8: #c93a3a; --chart-grid: #e8ebf0;
+    --chart-axis: #c3c9d3; --chart-cursor: #7f8899; --chart-select: #2f5fd0; --heat-0: #f1f4f9; --heat-1: #dbe7f9;
+    --heat-2: #bcd4f5; --heat-3: #9ec5f4; --heat-4: #6da7ec; --heat-5: #3987e5; --heat-6: #256abf;
+    --heat-7: #184f95; --heat-8: #0d366b; --shadow-pop: 0 8px 24px rgb(20 24 31 / 0.14);
+    --shadow-card: 0 1px 2px rgb(20 24 31 / 0.06);
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root[data-theme="system"] {
+      --bg: #f4f5f7; --surface-1: #ffffff; --surface-2: #f8f9fb; --surface-3: #eef0f3; --border: #e2e5ea;
+      --border-strong: #7f8899; --text: #14181f; --text-muted: #566070; --text-inverse: #ffffff; --accent: #2554c7;
+      --accent-bg: #2f5fd0; --accent-soft: #e6edfb; --ok: #157347; --ok-soft: #e3f4ea; --warn: #8f5600;
+      --warn-soft: #fbf0dc; --bad: #c42b35; --bad-soft: #fbe7e8; --info: #0b6a92; --info-soft: #e2f1f8;
+      --focus-ring: #2f63de; --series-1: #2a78d6; --series-2: #d4561c; --series-3: #13886a; --series-4: #a67800;
+      --series-5: #c4467a; --series-6: #2f7d1f; --series-7: #4a3aa7; --series-8: #c93a3a; --chart-grid: #e8ebf0;
+      --chart-axis: #c3c9d3; --chart-cursor: #7f8899; --chart-select: #2f5fd0; --heat-0: #f1f4f9; --heat-1: #dbe7f9;
+      --heat-2: #bcd4f5; --heat-3: #9ec5f4; --heat-4: #6da7ec; --heat-5: #3987e5; --heat-6: #256abf;
+      --heat-7: #184f95; --heat-8: #0d366b; --shadow-pop: 0 8px 24px rgb(20 24 31 / 0.14);
+      --shadow-card: 0 1px 2px rgb(20 24 31 / 0.06);
+    }
+  }
+}

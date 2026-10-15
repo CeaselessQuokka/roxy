@@ -1,0 +1,33 @@
+{#-
+  Protection page, card `refusals` (`roxy/admin/pages/protection.py refusals_card`): v1 "Refusal Reasons" and the
+  clients refused most.
+
+  What: two tabs. By reason: every refusal and failure reason of the range (`GET /admin/api/v1/protection/refusals`,
+  the same rows): count, the newest status and path (caller text), distinct clients (v1's last IP is a client count
+  now, plan 9.15), first and last seen, and where the text callers got came from (row 116: a custom message, the
+  default text, Roxy's failure text or Roblox's own body). Clients refused most (plan 10.9 "top refused clients"):
+  the Clients page's address table (`GET /admin/api/v1/clients/ips`, the same read) sorted by refusals; a row opens
+  the address in the Clients page's drawer, with its actions (ban, bypass). A table request (`table=refusals` or
+  `table=clients`) answers that table alone.
+  Context: `frame`, `tables`, `only`.
+  Context also has `clear` (`protection.py clear_action`): v1's clear button of this section, a plan 6.8 data reset.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, clear_button, clear_dialog %}
+{% if only %}{{ data_table(**tables[only]) }}{% else %}
+{% set actions %}{{ clear_button(clear) }}{% endset %}
+{% call page_card(frame, flush=True, actions=actions, subtitle="Several checks answer with the same 429; the reason says which one fired.") %}
+{% call tabs("prot-refusal-tabs", [("reasons", "By reason"), ("clients", "Clients refused most")], "Refusal views") %}
+  {% call tab_panel("prot-refusal-tabs", "reasons", first=True) %}
+    {{ data_table(**tables.refusals) }}
+    <p class="prot-foot field__hint">Unique clients counts distinct client hashes (a lower bound: refusals folded over the event budget are Unattributed). The Message column says where the text the caller got came from: a custom message an admin wrote, the default text, Roxy's own failure text, or Roblox's body passed on.</p>
+  {% endcall %}
+  {% call tab_panel("prot-refusal-tabs", "clients") %}
+    {{ data_table(**tables.clients) }}
+    <p class="prot-foot field__hint">The same numbers as the address table on the Clients page, most refusals first. Open an address for its requests, its strikes and the actions (ban, bypass).</p>
+  {% endcall %}
+{% endcall %}
+{{ clear_dialog(clear, "refusals endpoint-blocks endpoint-rules request-filters") }}
+{% endcall %}
+{% endif %}

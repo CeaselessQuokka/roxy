@@ -1,0 +1,58 @@
+{#-
+  Security page, card `trusted-devices` (`roxy/admin/pages/security.py trusted_devices_card`): browsers that skip
+  the second factor (v1 Service Controls "Trusted Devices", parity row 100; `GET /admin/api/v1/security/
+  trusted-devices`): whether the feature is on, whether this browser is trusted, every device with Revoke, and
+  "Revoke all" (v1's button, with its warning that this browser needs the full second factor next time too).
+  Context: `frame`, `devices`, `enabled`, `this_device`, `days`, `revoke_all_url`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/format.html" import caller_text, num %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/icon.html" import icon %}
+{% from "admin/pages/security/_macros.html" import when %}
+{% set actions %}
+{% if devices %}<button type="button" class="btn btn--sm btn--warn-soft" data-dialog-open="dlg-trusted-all" data-action="trusted-revoke-all">{{ icon("x-circle") }}<span>Revoke all</span></button>{% endif %}
+{% endset %}
+{% call page_card(frame, flush=True, actions=actions, subtitle="Trusted devices: " ~ num(devices|length)) %}
+<div class="security-intro stack">
+  <p>A trusted device skips the second factor for {{ days }} days after a sign-in where you ticked "Trust this device"; it still needs your password.</p>
+  <p class="cluster">
+    {% if enabled %}{{ status_badge("ok", "Trusted devices are on") }}{% else %}{{ status_badge("neutral", "Trusted devices are off") }}{% endif %}
+    {% if this_device %}{{ status_badge("info", "This browser is trusted (skips the second factor)") }}{% else %}{{ status_badge("neutral", "This browser is not trusted") }}{% endif %}
+  </p>
+  {% if not enabled %}<p class="muted">With the setting off, no device skips the second factor, even one listed here. The switch is in Admin access below.</p>{% endif %}
+</div>
+{% if devices %}
+<div class="table-scroll security-list" role="region" aria-labelledby="trusted-devices-title" tabindex="0">
+  <table class="simple-table security-table">
+    <caption class="sr-only">Your trusted devices</caption>
+    <thead><tr><th scope="col">Device</th><th scope="col">Browser</th><th scope="col">Trusted since</th><th scope="col">Last used</th><th scope="col">Trusted until</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+    <tbody>
+      {% for d in devices %}
+      <tr data-device-row>
+        <td data-label="Device">{{ caller_text(d.name, 80) }}{% if d.this_device %} {{ badge("This browser", "accent", "user") }}{% endif %}</td>
+        <td data-label="Browser">{{ caller_text(d.family, 60) }}</td>
+        <td data-label="Trusted since">{{ when(d.created) }}</td>
+        <td data-label="Last used">{{ when(d.used, "not yet") }}</td>
+        <td data-label="Trusted until">{{ when(d.expires) }}</td>
+        <td data-label="Actions" class="security-table__actions">
+          <form data-api-form data-api-url="{{ d.revoke_url }}" data-api-method="POST" data-success="That device must use the second factor again."
+                data-on-success="refresh" data-refresh="trusted-devices" novalidate>
+            <button type="submit" class="btn btn--sm" data-action="trusted-revoke">Revoke<span class="sr-only"> {{ d.name }}</span></button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="muted security-intro">No device is trusted. Tick "Trust this device" when you sign in to skip the second factor on that browser.</p>
+{% endif %}
+{{ confirm_dialog("dlg-trusted-all", "Revoke every trusted device?", action=revoke_all_url, api=True, danger=True,
+                  confirm_label="Revoke all",
+                  consequences=["Every device, this one included, needs the full second factor at its next sign-in.",
+                                "Nobody is signed out now; sessions keep running until they end."],
+                  success="Every trusted device was revoked.", on_success="refresh", refresh="trusted-devices") }}
+{% endcall %}

@@ -1,0 +1,29 @@
+format: roxy.health_fixture/1
+check: H-ALERTS
+case: pass
+name: smtp_and_discord_ok
+description: >
+  Both alert channels are configured: SMTP answers connect, login and NOOP, and the Discord webhook answers its
+  metadata GET with 200. Nothing is sent on either channel (13.2: "without sending"). 13.2 H-ALERTS: ok gives
+  pass. The variant has the webhook switched off: email alone, and working, also passes.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    alert_webhook_enabled: 1
+  alerts:
+    smtp: {connect: ok, login: ok, noop: ok}
+    webhooks:
+      - {provider: discord, get_status: 200}
+expect:
+  status: pass
+  credential_calls: {eq: 0}
+variants:
+  - case: pass
+    name: email_only
+    inputs:
+      settings:
+        alert_webhook_enabled: 0
+      alerts:
+        webhooks: []
+    expect:
+      status: pass

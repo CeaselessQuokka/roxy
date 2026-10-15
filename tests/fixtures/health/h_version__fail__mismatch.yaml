@@ -1,0 +1,15 @@
+format: roxy.health_fixture/1
+check: H-VERSION
+case: fail
+name: mismatch
+description: >
+  The process runs 3f9c2a1 but the last deploy recorded 8d41e07 (a switch that did not take, or a color left on
+  an old release). 13.2 H-VERSION: mismatch gives fail, with the deploy docs as the fix.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  version: {running_sha: "3f9c2a1", deployed_sha: "8d41e07", advisories: 0}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)deploy"}
+  credential_calls: {eq: 0}

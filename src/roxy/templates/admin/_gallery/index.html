@@ -1,0 +1,285 @@
+{#-
+  The component gallery (development only, served by roxy/admin/gallery.py at /admin/_gallery).
+
+  Every component in templates/components is shown here with sample data inside the real admin shell, so the design
+  system can be reviewed in both themes and at phone width, checked with axe-core, and run under the strict CSP
+  (tests/e2e). Sections are linked from the table of contents at the top. Nothing on this page changes anything:
+  its buttons post to gallery endpoints that only answer with a toast.
+-#}
+{% extends "admin/base.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/card.html" import card %}
+{% from "components/kpi.html" import kpi_tile %}
+{% from "components/chart.html" import timeseries, sparkline %}
+{% from "components/heatmap.html" import heatmap as heatmap_figure %}
+{% from "components/table.html" import data_table %}
+{% from "components/live_tail.html" import live_tail %}
+{% from "components/setting.html" import setting_control %}
+{% from "components/recommendation.html" import recommendation_card %}
+{% from "components/diff.html" import diff_fields, diff_lines as diff_lines_view %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/empty.html" import empty_state %}
+{% from "components/alert.html" import inline_alert, toast_button %}
+{% from "components/glossary.html" import term with context %}
+{% from "components/badges.html" import badge, status_badge, severity_badge, risk_badge, default_badge, apply_badge, delta, help_dot, kbd %}
+
+{% block page_actions %}
+<a class="btn" href="{{ request.url.path }}?theme={{ 'light' if theme != 'light' else 'dark' }}">{{ icon("sun" if theme != "light" else "moon") }}<span>View in {{ "light" if theme != "light" else "dark" }}</span></a>
+{{ toast_button("Show a toast", "Saved. The gallery changes nothing.", "ok", "btn btn--primary") }}
+{% endblock %}
+
+{% block how_to_read %}
+<p>Each section below is one component from <code>templates/components</code>, filled with generated sample data. Use it to review the look in both themes (the account menu switches theme) and at phone width, and to try each interaction with the keyboard alone.</p>
+<ul>
+  <li>Charts: drag across a chart to zoom, or use the zoom buttons; press a legend entry to hide a series; hover for the values of every series.</li>
+  <li>Tables: sort by any column, page, search and filter; every change asks the server for the page you see.</li>
+  <li>Settings: change a value to see validation, the plain-language preview and the save row; a high-risk value asks for a reason.</li>
+</ul>
+{% endblock %}
+
+{% block content %}
+<nav class="gallery-toc" aria-label="Gallery sections">
+  {% for anchor, label in [("g-kpis", "KPI tiles"), ("g-charts", "Charts"), ("g-heatmap", "Heatmap"), ("g-table", "Top-N table"),
+                           ("g-live", "Live tail"), ("g-settings", "Setting controls"), ("g-recs", "Recommendations"),
+                           ("g-diff", "Diff viewer"), ("g-dialogs", "Dialogs"), ("g-empty", "Empty states"),
+                           ("g-feedback", "Toasts and alerts"), ("g-htmx", "Requests and session"), ("g-glossary", "Glossary"),
+                           ("g-banners", "Banners"), ("g-controls", "Buttons and inputs"), ("g-tokens", "Tokens")] %}
+  <a href="#{{ anchor }}">{{ label }}</a>
+  {% endfor %}
+</nav>
+
+<div class="stack-lg">
+  <section class="gallery-section" id="g-kpis" aria-labelledby="g-kpis-title">
+    <h2 id="g-kpis-title">KPI tiles</h2>
+    <div class="kpi-grid">
+      {% for k in kpis %}{{ kpi_tile(**k) }}{% endfor %}
+    </div>
+  </section>
+
+  <section class="gallery-section" id="g-charts" aria-labelledby="g-charts-title">
+    <h2 id="g-charts-title">Charts</h2>
+    <div class="stack">
+      {% call card(None) %}
+        {{ timeseries("chart-traffic", "Requests in vs upstream calls", spec=charts.traffic, summary=charts.traffic.summary,
+                      size="lg", help="Every 10 minutes: requests callers sent to Roxy, and the calls Roxy made to Roblox for them. The dashed lines are the previous 24 hours.") }}
+      {% endcall %}
+      <div class="grid grid--2">
+        {% call card(None) %}
+          {{ timeseries("chart-outcomes", "Outcomes, stacked", spec=charts.outcomes,
+                        help="What happened to each request: served from the cache, served by Roblox, refused by Roxy, or failed.") }}
+        {% endcall %}
+        {% call card(None) %}
+          {{ timeseries("chart-latency", "Latency percentiles", spec=charts.latency,
+                        help="p50, p95 and p99: the times under which half, 95% and 99% of requests finished.") }}
+        {% endcall %}
+        {% call card(None) %}
+          {{ timeseries("chart-429", "Roblox 429s per hour", spec=charts.r429, summary=charts.r429.summary, size="sm") }}
+        {% endcall %}
+        {% call card(None) %}
+          {{ timeseries("chart-remote", "Latency (loaded from a URL)", src="/admin/_gallery/chart.json", size="sm",
+                        summary="Latency percentiles for the last 24 hours, loaded separately from the page.") }}
+        {% endcall %}
+      </div>
+      <p class="muted">Sparklines draw on the server: {{ sparkline([3, 5, 4, 8, 6, 9, 12, 10, 14], label="Sample trend") }}</p>
+    </div>
+  </section>
+
+  <section class="gallery-section" id="g-heatmap" aria-labelledby="g-heatmap-title">
+    <h2 id="g-heatmap-title">Heatmap</h2>
+    {% call card(None) %}
+      {{ heatmap_figure("heat-week", "Requests by hour and weekday", heatmap.rows, heatmap.cols, heatmap["values"],
+                        unit="requests", summary=heatmap.summary, corner="UTC", col_labels_every=3,
+                        help="Darker cells had more requests. Show numbers turns the same grid into a table.") }}
+    {% endcall %}
+  </section>
+
+  <section class="gallery-section" id="g-table" aria-labelledby="g-table-title">
+    <h2 id="g-table-title">Top-N table</h2>
+    {% call card("Top endpoints", id="gallery-endpoints-card", subtitle="Server-side paging, sorting, search, filter chips, column chooser and export. On a phone each row becomes a card.", flush=True) %}
+      {{ data_table(**table) }}
+    {% endcall %}
+  </section>
+
+  <section class="gallery-section" id="g-live" aria-labelledby="g-live-title">
+    <h2 id="g-live-title">Live tail</h2>
+    {{ live_tail("gallery-tail", "/admin/_gallery/stream", title="Live requests (sample stream)", level=3) }}
+  </section>
+
+  <section class="gallery-section" id="g-settings" aria-labelledby="g-settings-title">
+    <h2 id="g-settings-title">Setting controls</h2>
+    <div class="grid grid--2">
+      {% for s in settings %}
+      {{ setting_control(s.spec, s.value, setting_url, meta=s.meta, history_url="/admin/audit?key=" ~ s.spec.key) }}
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="gallery-section" id="g-recs" aria-labelledby="g-recs-title">
+    <h2 id="g-recs-title">Recommendations</h2>
+    <div class="stack">
+      {% for rec in recommendations %}{{ recommendation_card(rec) }}{% endfor %}
+    </div>
+  </section>
+
+  <section class="gallery-section" id="g-diff" aria-labelledby="g-diff-title">
+    <h2 id="g-diff-title">Diff viewer</h2>
+    <div class="grid grid--2">
+      {% call card("Settings diff", id="diff-fields", level=3) %}{{ diff_fields(diff_rows, caption="Settings changed by this recommendation") }}{% endcall %}
+      {% call card("JSON diff", id="diff-json", level=3) %}{{ diff_lines_view(diff_lines, title="Cache rule before and after") }}{% endcall %}
+    </div>
+  </section>
+
+  <section class="gallery-section" id="g-dialogs" aria-labelledby="g-dialogs-title">
+    <h2 id="g-dialogs-title">Dialogs</h2>
+    {% call card(None) %}
+    <div class="cluster">
+      <button type="button" class="btn" data-dialog-open="dlg-demo-revoke" aria-haspopup="dialog">{{ icon("logout") }}<span>Sign out other sessions</span></button>
+      <button type="button" class="btn btn--danger" data-dialog-open="dlg-demo-purge" aria-haspopup="dialog">{{ icon("database") }}<span>Purge the whole cache</span></button>
+      <button type="button" class="btn btn--ghost" data-shortcuts-open>{{ icon("keyboard") }}<span>Keyboard shortcuts</span></button>
+      <button type="button" class="btn btn--ghost" data-palette-open aria-haspopup="dialog">{{ icon("search") }}<span>Command palette</span></button>
+    </div>
+    {% endcall %}
+    {{ confirm_dialog("dlg-demo-revoke", "Sign out every other session?", action_url, confirm_label="Sign them out",
+                      consequences=["Every other browser signed in as you must log in again with password and second factor.",
+                                    "This browser stays signed in."], reason=True) }}
+    {{ confirm_dialog("dlg-demo-purge", "Purge the whole cache?", action_url, confirm_label="Purge everything", danger=True,
+                      type_to_confirm="purge",
+                      consequences=["Every saved answer is deleted at once; the next request for each goes to Roblox.",
+                                    "Expect a burst of upstream calls and possibly Roblox 429s for a few minutes.",
+                                    "Statistics and rules are kept."], reason=True, reason_required=True) }}
+  </section>
+
+  <section class="gallery-section" id="g-empty" aria-labelledby="g-empty-title">
+    <h2 id="g-empty-title">Empty states</h2>
+    <div class="grid grid--3">
+      {% call card(None) %}{{ empty_state("No 429s from Roblox in this range. Good.", "Roblox has not refused any of Roxy's calls since this range began.", tone="good", doc_href="/admin/help#term-retry-after", doc_label="What a 429 means") }}{% endcall %}
+      {% call card(None) %}{{ empty_state("No requests yet", "Requests appear here within a few seconds of the first caller using Roxy.", icon_name="activity") }}{% endcall %}
+      {% call card(None) %}{{ empty_state("Capture is off", "Turn on request capture to keep redacted copies of requests for 15 minutes.", icon_name="eye", tone="info", action_label="Open the setting", action_href="/admin/settings?q=capture") }}{% endcall %}
+    </div>
+  </section>
+
+  <section class="gallery-section" id="g-feedback" aria-labelledby="g-feedback-title">
+    <h2 id="g-feedback-title">Toasts and alerts</h2>
+    <div class="stack">
+      {% call card(None) %}
+      <div class="cluster">
+        {{ toast_button("Success toast", "Cache rule saved.", "ok") }}
+        {{ toast_button("Info toast", "Health check started.", "info") }}
+        {{ toast_button("Warning toast", "The rotator is at 85% of its quota.", "warn") }}
+        {{ toast_button("Error toast", "The setting could not be saved.", "bad") }}
+        <button type="button" class="btn" id="g-server-toast" hx-post="{{ action_url }}" hx-swap="none" hx-vals='{"demo": "toast"}'>{{ icon("refresh") }}<span>Toast from the server</span></button>
+      </div>
+      {% endcall %}
+      <div class="grid grid--2">
+        {{ inline_alert("ok", "Every check passed", "The last health check found nothing to fix.") }}
+        {{ inline_alert("info", "Comparison is on", "Charts show the previous period as dashed lines.") }}
+        {{ inline_alert("warn", "Rotator quota at 85%", "At the current rate the monthly quota runs out in 4 days.", dismissible=True) }}
+        {{ inline_alert("bad", "The leak guard tripped", "The direct path is switched off until you turn it back on.") }}
+      </div>
+    </div>
+  </section>
+
+  <section class="gallery-section" id="g-htmx" aria-labelledby="g-htmx-title">
+    <h2 id="g-htmx-title">Requests and session</h2>
+    {% call card(None) %}
+    <div class="cluster">
+      <button type="button" class="btn" id="g-slow" hx-get="/admin/_gallery/slow" hx-target="#g-slow-out" hx-swap="innerHTML" hx-indicator="#g-slow-spinner">{{ icon("refresh") }}<span>Slow request</span></button>
+      <span class="htmx-indicator" id="g-slow-spinner"><span class="spinner" aria-hidden="true"></span> Loading</span>
+      <span id="g-slow-out" class="muted" aria-live="polite">Not loaded yet.</span>
+    </div>
+    <div class="cluster">
+      <button type="button" class="btn btn--ghost" id="g-expire" hx-get="/admin/_gallery/unauthorized" hx-swap="none">{{ icon("lock") }}<span>Simulate an expired session (401)</span></button>
+    </div>
+    {% endcall %}
+  </section>
+
+  <section class="gallery-section" id="g-glossary" aria-labelledby="g-glossary-title">
+    <h2 id="g-glossary-title">Glossary terms</h2>
+    {% call card(None) %}
+    <p class="prose">When Roblox answers with a {{ term("retry-after", "Retry-After") }} header, Roxy starts a {{ term("cooldown", "cooldown") }} for that endpoint and serves {{ term("stale", "stale") }} answers from the cache, so callers rarely notice. A {{ term("breaker", "circuit breaker") }} stops calls to an endpoint that keeps failing, and {{ term("coalescing", "coalescing") }} makes sure a burst of identical requests costs one {{ term("upstream", "upstream call") }}.</p>
+    <details class="details-plain">
+      <summary>Every term ({{ glossary|length }})</summary>
+      <dl class="glossary-list">
+        {% for entry in glossary.values()|sort(attribute="term") %}
+        <dt id="term-{{ entry.id }}">{{ entry.term }}</dt><dd>{{ entry.definition }}</dd>
+        {% endfor %}
+      </dl>
+    </details>
+    {% endcall %}
+  </section>
+
+  <section class="gallery-section" id="g-banners" aria-labelledby="g-banners-title">
+    <h2 id="g-banners-title">Service banners</h2>
+    <div class="card">{% with status = sample_status %}{% include "admin/_layout/banners.html" %}{% endwith %}</div>
+  </section>
+
+  <section class="gallery-section" id="g-controls" aria-labelledby="g-controls-title">
+    <h2 id="g-controls-title">Buttons, badges and inputs</h2>
+    <div class="grid grid--2">
+      {% call card("Buttons", id="g-buttons", level=3) %}
+      <div class="stack">
+        <div class="cluster">
+          <button type="button" class="btn btn--primary">{{ icon("check") }}<span>Primary</span></button>
+          <button type="button" class="btn">Secondary</button>
+          <button type="button" class="btn btn--ghost">Ghost</button>
+          <button type="button" class="btn btn--danger">Danger</button>
+          <button type="button" class="btn" disabled>Disabled</button>
+        </div>
+        <div class="cluster">
+          <button type="button" class="btn btn--sm">Small</button>
+          <button type="button" class="icon-btn" aria-label="Refresh">{{ icon("refresh") }}</button>
+          <button type="button" class="icon-btn icon-btn--sm" aria-label="More actions">{{ icon("more") }}</button>
+          <button type="button" class="link-btn">Link button</button>
+          {{ kbd("Ctrl K") }} {{ kbd("g s") }}
+        </div>
+      </div>
+      {% endcall %}
+      {% call card("Badges", id="g-badges", level=3) %}
+      <div class="stack">
+        <div class="cluster">{{ status_badge("ok", "Healthy") }}{{ status_badge("warn", "Degraded") }}{{ status_badge("bad", "Failing") }}{{ status_badge("info", "Info") }}{{ badge("Neutral") }}</div>
+        <div class="cluster">{{ severity_badge("critical") }}{{ severity_badge("warn") }}{{ severity_badge("info") }}{{ risk_badge("low") }}{{ risk_badge("medium") }}{{ risk_badge("high") }}</div>
+        <div class="cluster">{{ default_badge(true, "") }}{{ default_badge(false, "120 seconds") }}{{ apply_badge("live") }}{{ apply_badge("restart") }}</div>
+        <div class="cluster">{{ delta(12.5, good="up") }}{{ delta(-8.0, good="up") }}{{ delta(-40.0, good="down") }}{{ delta(0.0) }}{{ delta(none) }} <span>Help dot {{ help_dot("Example", "Help text appears on hover, focus or click.") }}</span></div>
+      </div>
+      {% endcall %}
+      {% call card("Inputs", id="g-inputs", level=3) %}
+      <div class="stack">
+        <div class="field"><label class="field__label" for="g-in-text">Text</label><input class="input" id="g-in-text" value="games.roblox.com/v1/games/votes" aria-describedby="g-in-text-hint"><p class="field__hint" id="g-in-text-hint">Hints sit under the field and are tied to it.</p></div>
+        <div class="field"><label class="field__label" for="g-in-select">Select</label><select class="input" id="g-in-select"><option>Wildcard</option><option>Regex</option></select></div>
+        <div class="field"><label class="field__label" for="g-in-area">Text area</label><textarea class="input" id="g-in-area" rows="2">203.0.113.0/24</textarea></div>
+        <div class="cluster">
+          <label class="check"><input type="checkbox" checked> Checkbox</label>
+          <label class="radio"><input type="radio" name="g-radio" checked> Radio one</label>
+          <label class="radio"><input type="radio" name="g-radio"> Radio two</label>
+          <label class="switch"><input type="checkbox" role="switch" class="switch__input" checked><span class="switch__track" aria-hidden="true"><span class="switch__thumb"></span></span><span class="switch__on">On</span><span class="switch__off">Off</span><span class="sr-only"> Sample switch</span></label>
+        </div>
+      </div>
+      {% endcall %}
+      {% call card("Type scale", id="g-type", level=3) %}
+      <div class="type-scale">
+        <p class="fs-6">32 · 1,284,903</p>
+        <p class="fs-5">24 · Page title</p>
+        <p class="fs-4">20 · Dialog title</p>
+        <p class="fs-3">16 · Card title and emphasized text</p>
+        <p class="fs-2">14 · Body text, tables and controls</p>
+        <p class="fs-1 muted">12 · Captions, badges and axis labels</p>
+        <p class="mono">games.roblox.com/v1/games/{universeId}/votes</p>
+      </div>
+      {% endcall %}
+    </div>
+  </section>
+
+  <section class="gallery-section" id="g-tokens" aria-labelledby="g-tokens-title">
+    <h2 id="g-tokens-title">Color tokens</h2>
+    {% call card(None) %}
+    <div class="token-grid">
+      {% for name in ["bg", "surface-1", "surface-2", "surface-3", "border-strong", "text", "text-muted", "accent", "accent-bg",
+                      "ok", "warn", "bad", "info", "focus-ring", "series-1", "series-2", "series-3", "series-4", "series-5",
+                      "series-6", "series-7", "series-8"] %}
+      <div class="token"><span class="token__chip tk-{{ name }}" aria-hidden="true"></span><code>--{{ name }}</code></div>
+      {% endfor %}
+    </div>
+    {% endcall %}
+  </section>
+</div>
+{% endblock %}

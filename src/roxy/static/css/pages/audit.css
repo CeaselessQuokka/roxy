@@ -1,0 +1,77 @@
+/*
+ * The Audit page (templates/admin/pages/audit*): the entry shown in the drawer.
+ *
+ * What this is
+ *   Layout for one audit entry: the facts list, the field diff with long values wrapping inside their cells, and
+ *   the revert form. Everything else on the page comes from components.css.
+ * Why it exists
+ *   A page's own styles live in static/css/pages/<page>.css, linked only on that page (P11 contract), so the
+ *   shared stylesheets stay small. Only tokens from tokens.css are used, so both themes follow.
+ * How it works
+ *   The drawer is narrow (and full width on a phone), so the facts are a two-column definition list that stacks
+ *   below 480 px, and the diff values may break anywhere (a 2,000 character JSON preview must never widen the page).
+ * What to read next
+ *   static/css/components.css (.kv, .diff-table, .caller-text), templates/admin/pages/audit/entry.html.
+ */
+
+.audit-entry__lead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.audit-entry__facts {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+
+.audit-entry__facts dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.audit-entry__section {
+  display: grid;
+  gap: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--border);
+}
+
+.audit-entry__heading {
+  font-size: var(--fs-3);
+}
+
+.audit-diff {
+  table-layout: fixed;
+  width: 100%;
+}
+
+.audit-diff th,
+.audit-diff td {
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+.audit-diff th[scope="row"] {
+  width: 32%;
+}
+
+.audit-entry__manage {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.audit-revert .dialog__consequences {
+  margin: 0;
+}
+
+@media (max-width: 480px) {
+  .audit-entry__facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .audit-diff th[scope="row"] {
+    width: 40%;
+  }
+}

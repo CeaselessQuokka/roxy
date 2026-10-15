@@ -1,0 +1,71 @@
+{#-
+  Settings page, card `import-export` (`roxy/admin/pages/settings.py import_export_card`): your changes as a file,
+  and loading such a file back (plan 15.2).
+
+  Export: `GET /admin/api/v1/settings/export` (an audited download, static/js/exports.js): every override with the
+  catalog version; secret settings are written as `[redacted]` and an import skips them. Import: the page script
+  (static/js/pages/settings.js) reads the file in the browser (at most 512 KB), asks
+  `POST /settings/import/preview` and shows what would change; nothing changes until "Import these changes", which
+  sends `POST /settings/import` with a reason (always required: an import changes many values at once), the
+  high-risk confirmation when the preview asks for it, and "Confirm it is you" first when a key needs a fresh second
+  factor. Values from the file are shown as text, never markup.
+  Context: `frame`, `export_url`, `preview_url`, `import_url`, `overridden`, `catalog_version`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/icon.html" import icon %}
+{% call page_card(frame) %}
+<div class="settings-io">
+  <section class="settings-io__part stack" aria-labelledby="settings-export-title">
+    <h3 class="settings-io__title" id="settings-export-title">Export</h3>
+    <p>Downloads every setting you changed from its default ({{ num(overridden) }} now) as a JSON file, with the catalog version ({{ catalog_version }}) so an import can tell when the file is older than this release. Secret settings are written as [redacted] and an import skips them.</p>
+    <p><a class="btn" href="{{ export_url }}" data-export download data-action="settings-export">{{ icon("download") }}<span>Download my changes</span></a></p>
+    <p class="muted">The download is written to the audit log.</p>
+  </section>
+  <section class="settings-io__part stack" aria-labelledby="settings-import-title">
+    <h3 class="settings-io__title" id="settings-import-title">Import</h3>
+    <form class="stack" data-settings-import data-preview-url="{{ preview_url }}" data-import-url="{{ import_url }}" novalidate>
+      <div class="field">
+        <label class="field__label" for="settings-import-file">A file exported from Roxy</label>
+        <input type="file" class="input settings-io__file" id="settings-import-file" accept="application/json,.json" data-import-file aria-describedby="settings-import-file-hint">
+        <p class="field__hint" id="settings-import-file-hint">Up to 512 KB. Nothing changes until you have seen the preview and confirmed it.</p>
+      </div>
+      <details class="details-plain">
+        <summary>Or paste the file's text</summary>
+        <div class="field">
+          <label class="field__label" for="settings-import-text">The exported JSON</label>
+          <textarea class="input mono" id="settings-import-text" rows="6" spellcheck="false" data-import-text></textarea>
+        </div>
+      </details>
+      <label class="check"><input type="checkbox" data-import-replace><span>Replace: settings the file does not name go back to their defaults</span></label>
+      <p class="dialog__error" data-import-error role="alert" hidden></p>
+      <div class="cluster"><button type="submit" class="btn btn--primary" data-action="settings-import-preview">{{ icon("eye") }}<span>Preview the import</span></button></div>
+    </form>
+    <div class="settings-import stack" data-import-result hidden>
+      <h4 class="settings-io__subtitle" tabindex="-1" data-import-heading>What the import would change</h4>
+      <p data-import-summary></p>
+      <div class="table-scroll" role="region" aria-label="What the import would change" tabindex="0">
+        <table class="simple-table settings-import__table">
+          <thead><tr><th scope="col">Setting</th><th scope="col">Now</th><th scope="col">In the file</th><th scope="col">Result</th></tr></thead>
+          <tbody data-import-rows></tbody>
+        </table>
+      </div>
+      <ul class="settings-import__problems" data-import-problems hidden></ul>
+      <form class="stack" data-import-apply novalidate>
+        <p class="setting__mfa" data-import-mfa hidden>{{ icon("lock") }}<span data-import-mfa-text></span></p>
+        <div class="field">
+          <label class="field__label" for="settings-import-reason">Reason <span class="muted">(required: it goes in the audit log)</span></label>
+          <textarea class="input" id="settings-import-reason" rows="2" maxlength="500" required aria-required="true" aria-describedby="settings-import-reason-error" data-import-reason></textarea>
+          <p class="field__error" id="settings-import-reason-error" data-import-reason-error hidden></p>
+        </div>
+        <label class="check" data-import-confirm hidden><input type="checkbox" data-import-confirm-box><span>I understand: the file holds high-risk values</span></label>
+        <p class="dialog__error" data-import-apply-error role="alert" hidden></p>
+        <div class="cluster">
+          <button type="submit" class="btn btn--primary" data-action="settings-import" data-import-submit>{{ icon("check") }}<span>Import these changes</span></button>
+          <button type="button" class="btn btn--ghost" data-import-cancel>Cancel</button>
+        </div>
+      </form>
+    </div>
+  </section>
+</div>
+{% endcall %}

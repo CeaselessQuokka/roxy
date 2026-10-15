@@ -1,0 +1,25 @@
+format: roxy.health_fixture/1
+check: H-LEADER
+case: fail
+name: no_leader
+description: >
+  The `leader` lease expired 40 s ago and nobody took it over: its holder (pid 40990) is gone and no live worker
+  reports is_leader. 13.2 H-LEADER: no leader gives fail. The last job runs are from before the lease expired.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    ROXY_WORKERS: "2"
+  state:
+    workers:
+      - {pid: 41001, worker_id: "roxy-test:41001:a1b2c3d4", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-1s", loop_lag_ms_p99: 6, open_conns: 40, is_leader: 0, version: "3f9c2a1"}
+      - {pid: 41002, worker_id: "roxy-test:41002:b2c3d4e5", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-2s", loop_lag_ms_p99: 7, open_conns: 38, is_leader: 0, version: "3f9c2a1", x_self: true}
+      - {pid: 40990, worker_id: "roxy-test:40990:e5f6a7b8", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-55s", loop_lag_ms_p99: 6, open_conns: 0, is_leader: 1, version: "3f9c2a1"}
+    leader:
+      holder: "roxy-test:40990:e5f6a7b8"
+      expires: "-40s"
+      epoch: 6
+      x_jobs: []
+expect:
+  status: fail
+  explanation: {present: true}
+  credential_calls: {eq: 0}

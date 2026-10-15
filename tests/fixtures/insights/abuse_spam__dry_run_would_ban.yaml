@@ -1,0 +1,124 @@
+# ABUSE-SPAM, first trigger in the 11.5 row: "any detector in dry-run that would have fired".
+#
+# The spam detectors are in their default dry run (spam_dry_run = 1), so a detection with action `ban` only writes a
+# `spam_would_ban` event (roxy/abuse/spam.py `_act`). One scraper at 192.0.2.77 sends 90 requests per minute for an
+# hour: 12 per minute pass the per-IP limit (10 per 50 s) and 78 are refused. Over every 10 minute window that is
+# 900 requests (SPAM-RATE limit: 5 x 10 / 50 x 600 = 600) and 780 refusals (SPAM-REFUSED limit: 200), so both
+# detectors would have banned it, every 10 minutes, and nothing happened because dry run is on.
+#
+#   what the rule sees                         where it comes from here
+#   two detectors, five detections each        events.security `spam_would_ban` rows (detail as spam.py writes it)
+#   900 requests and 780 refusals per 10 min   abuser_served (12 per minute) and abuser_throttled (78 per minute)
+#   40 game servers, quiet                     legit_* generators: 75 requests per hour per address, no refusals
+#
+# 11.5 offers three changes ("add ban, enable detector action, or add tarpit category"); the fixture accepts any of
+# them (any_of) but requires that a ban, if proposed, names this one address, and forbids every change the row does
+# not list (global limits, threshold edits, bypass entries).
+
+format: roxy.insight_fixture/1
+rule: ABUSE-SPAM
+case: dry_run_would_ban
+description: >
+  With the spam detectors in dry run, one library client trips SPAM-RATE and SPAM-REFUSED every 10 minutes for an
+  hour and is never banned. ABUSE-SPAM must raise one recommendation for that client (medium confidence) whose
+  change is a ban on that address, arming the detector action, or a tarpit category, and nothing for the 40
+  legitimate game servers sharing the hour.
+now: "2026-10-07T15:00:00Z"
+
+settings:
+  spam_enabled: 1
+  spam_dry_run: 1
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+  scraper:
+    client_ip: "192.0.2.77"
+    user_agent: "python-requests/2.31.0"
+    endpoint_template: "users.roblox.com/v1/users/{userId}"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  - {name: abuser_served, profile: [miss, scraper], window: ["-60m", "0m"], per_minute: 12}
+  - {name: abuser_throttled, profile: [throttled, scraper], window: ["-60m", "0m"], per_minute: 78}
+
+events:
+  security:
+    - {at: "-50m", type: spam_would_ban, severity: warning, reason_code: SPAM-RATE, ip: "192.0.2.77", detail: {detector: SPAM-RATE, subject: "ip:192.0.2.77", value: 900, threshold: 600, window_s: 600, action: ban, configured_action: ban, game_server: false, evidence: "900 requests in 600 s, limit 600"}}
+    - {at: "-50m", type: spam_would_ban, severity: warning, reason_code: SPAM-REFUSED, ip: "192.0.2.77", detail: {detector: SPAM-REFUSED, subject: "ip:192.0.2.77", value: 780, threshold: 200, window_s: 600, action: ban, configured_action: ban, game_server: false, evidence: "780 refused requests in 600 s, limit 200"}}
+    - {at: "-40m", type: spam_would_ban, severity: warning, reason_code: SPAM-RATE, ip: "192.0.2.77", detail: {detector: SPAM-RATE, subject: "ip:192.0.2.77", value: 900, threshold: 600, window_s: 600, action: ban, configured_action: ban, game_server: false, evidence: "900 requests in 600 s, limit 600"}}
+    - {at: "-40m", type: spam_would_ban, severity: warning, reason_code: SPAM-REFUSED, ip: "192.0.2.77", detail: {detector: SPAM-REFUSED, subject: "ip:192.0.2.77", value: 780, threshold: 200, window_s: 600, action: ban, configured_action: ban, game_server: false, evidence: "780 refused requests in 600 s, limit 200"}}
+    - {at: "-30m", type: spam_would_ban, severity: warning, reason_code: SPAM-RATE, ip: "192.0.2.77", detail: {detector: SPAM-RATE, subject: "ip:192.0.2.77", value: 900, threshold: 600, window_s: 600, action: ban, configured_action: ban, game_server: false, evidence: "900 requests in 600 s, limit 600"}}
+    - {at: "-30m", type: spam_would_ban, severity: warning, reason_code: SPAM-REFUSED, ip: "192.0.2.77", detail: {detector: SPAM-REFUSED, subject: "ip:192.0.2.77", value: 780, threshold: 200, window_s: 600, action: ban, configured_action: ban, game_server: false, evidence: "780 refused requests in 600 s, limit 200"}}
+    - {at: "-20m", type: spam_would_ban, severity: warning, reason_code: SPAM-RATE, ip: "192.0.2.77", detail: {detector: SPAM-RATE, subject: "ip:192.0.2.77", value: 900, threshold: 600, window_s: 600, action: ban, configured_action: ban, game_server: false, evidence: "900 requests in 600 s, limit 600"}}
+    - {at: "-20m", type: spam_would_ban, severity: warning, reason_code: SPAM-REFUSED, ip: "192.0.2.77", detail: {detector: SPAM-REFUSED, subject: "ip:192.0.2.77", value: 780, threshold: 200, window_s: 600, action: ban, configured_action: ban, game_server: false, evidence: "780 refused requests in 600 s, limit 200"}}
+    - {at: "-10m", type: spam_would_ban, severity: warning, reason_code: SPAM-RATE, ip: "192.0.2.77", detail: {detector: SPAM-RATE, subject: "ip:192.0.2.77", value: 900, threshold: 600, window_s: 600, action: ban, configured_action: ban, game_server: false, evidence: "900 requests in 600 s, limit 600"}}
+    - {at: "-10m", type: spam_would_ban, severity: warning, reason_code: SPAM-REFUSED, ip: "192.0.2.77", detail: {detector: SPAM-REFUSED, subject: "ip:192.0.2.77", value: 780, threshold: 200, window_s: 600, action: ban, configured_action: ban, game_server: false, evidence: "780 refused requests in 600 s, limit 200"}}
+
+state:
+  client_scores:
+    - {ip: "192.0.2.77", bot_score: 86}
+    - {clients: {cidr: "203.0.113.0/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 8400
+      upstream_calls: 1320
+      refused: 4680
+    - window: ["-10m", "0m"]
+      where: {client_ip: "192.0.2.77"}
+      requests: 900
+      refused: 780
+    - window: ["-60m", "0m"]
+      where: {client_ip: "192.0.2.77", outcome: refused}
+      by_reason: {throttle: 4680}
+
+  fires: true
+  others: forbid               # the 40 game servers must not get a recommendation
+  recommendations:
+    - rule_id: ABUSE-SPAM
+      subject_contains: "192.0.2.77"
+      severity: any
+      family: abuse
+      confidence: medium
+      changes_required:
+        - any_of:
+            - {kind: ban_add, proposed: {subject_type: ip, subject: "192.0.2.77"}}
+            - {kind: setting, key: {in: [spam_dry_run, spam_rate_action, spam_refused_action]}}
+            - {kind: tarpit_category, category: {in: [throttle, spam]}, proposed: 1}
+      changes_forbidden:
+        - {kind: ban_add, proposed: {subject: {regex: '^203\.0\.113\.'}}}
+        - {kind: ban_add, proposed: {subject_type: place}}
+        - kind: setting
+          key:
+            in: [allowed_requests_per_minute, throttle_reset_duration, flood_limit_per_minute, global_throttle_limit,
+                 global_throttle_period, spam_enabled, spam_rate_enabled, spam_refused_enabled, spam_rate_threshold,
+                 spam_refused_threshold]
+      change_kinds_forbidden: [bypass_add, bypass_remove, ban_remove, bucket_override, host_add,
+                               credential_allowlist_remove, routing_rule, rule_delete, filter_remove]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule even with ten would-ban detections.
+    settings: {insight_abuse_spam_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_abuse_spam_severity replaces the computed severity.
+    settings: {insight_abuse_spam_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "192.0.2.77", severity: critical}

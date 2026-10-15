@@ -1,0 +1,31 @@
+{#-
+  Cache page, card `coalescing` (`roxy/admin/pages/cache.py coalescing_card`): identical requests sharing one fetch.
+
+  The range's coalesced answers come from the statistics answer (`cache.stats_answer`, the same number the state
+  chart shows); the single-flight counters are this worker's (`CacheService.state()["Flights"]`), labeled so. The
+  two catalog settings of `cache#coalescing` follow, placed by the page card.
+  Context: `frame`, `coalesced`, `enabled`, `flights`, `inflight`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/badges.html" import badge, status_badge %}
+{% from "components/glossary.html" import term with context %}
+{% call page_card(frame) %}
+<p class="cache-intro">When many callers ask for the same missing answer at the same moment, Roxy sends one request to Roblox and gives its answer to all of them ({{ term("coalescing") }}). Without it, an empty cache produces exactly the burst the cache exists to prevent, at the worst possible moment.</p>
+<div class="grid grid--2">
+  <dl class="kv">
+    <dt>Coalescing</dt><dd>{% if enabled %}{{ status_badge("ok", "on, fleet-wide") }}{% else %}{{ status_badge("warn", "off") }}{% endif %}</dd>
+    <dt>Shared answers in range</dt><dd>{{ num(coalesced) }} <span class="muted">requests got another caller's fetch</span></dd>
+  </dl>
+  <div>
+    <p class="cache-fact__title">Single-flight {{ badge("this worker", "neutral") }}</p>
+    <dl class="kv">
+      <dt>Fetches it led</dt><dd>{{ num(flights.owned) }}</dd>
+      <dt>Followed here</dt><dd>{{ num(flights.followed_local) }}</dd>
+      <dt>Followed another worker</dt><dd>{{ num(flights.followed_remote) }}</dd>
+      <dt>Waits that timed out</dt><dd>{{ num(flights.timeouts) }}</dd>
+      <dt>In flight now</dt><dd>{{ num(inflight) }}</dd>
+    </dl>
+  </div>
+</div>
+{% endcall %}

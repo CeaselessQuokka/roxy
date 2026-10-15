@@ -1,0 +1,101 @@
+# CACHE-KEYSPLIT proposes sorting an id list, not ignoring it, when the split comes from id order
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: change "Add ignored param (one click), or normalization rule (sort id lists)".
+#
+#   GET thumbnails.roblox.com/v1/users/avatar-headshot: 8 entries, 0 hits. The top parameter, userIds, has 8
+#   distinct values (100%), so the v1 Suspect test flags the group. But the values are the same id sets in a
+#   different order: six orders of {1000000401, 1000000402, 1000000403} and two of {1000000404, 1000000405}.
+#   Sorted, they collapse to 2 values. userIds is a known id list parameter (config/defaults.py ID_LIST_PARAMS),
+#   and `sort_csv:<param>` is the normalization flag of cache/keys.py.
+#
+# Ignoring userIds would serve one caller's thumbnails to another, so the fix is a normalization flag on the cache
+# rule of that endpoint. Sorting changes the order of the list Roblox receives, and config/defaults.py marks this
+# endpoint's sorting as unverified ("Needs a recorded response"), so the recommendation is never safe to apply
+# automatically.
+
+format: roxy.insight_fixture/1
+rule: CACHE-KEYSPLIT
+case: id_list_order
+description: >
+  The headshot endpoint's cache is split because callers list the same user ids in different orders. The rule
+  must propose a sort_csv:userIds normalization on that endpoint's cache rule, must never propose ignoring
+  userIds (or any other parameter), and must not mark it safe to auto-apply.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 40}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 760}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 1200}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 300}
+
+state:
+  cache:
+    entries:
+      - {id: "b5a1440ed07bceb425e30b29", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000401%2C1000000402%2C1000000403", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000401,1000000402,1000000403\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-1m", expires_at: "+9m", stale_until: "+19m", ttl: 600, rule_id: 3, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "3511d31f4fe5b7ff53502c52", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000401%2C1000000403%2C1000000402", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000401,1000000403,1000000402\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-6m", expires_at: "+4m", stale_until: "+14m", ttl: 600, rule_id: 3, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "ab62c8c81fcd91f96e1a8ae9", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000402%2C1000000401%2C1000000403", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000402,1000000401,1000000403\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-11m", expires_at: "-1m", stale_until: "+9m", ttl: 600, rule_id: 3, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "3757009877681c06f0ed6d60", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000402%2C1000000403%2C1000000401", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000402,1000000403,1000000401\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-4m", expires_at: "+6m", stale_until: "+16m", ttl: 600, rule_id: 3, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "5400ec40fb75ebf7996b12da", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000403%2C1000000401%2C1000000402", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000403,1000000401,1000000402\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-9m", expires_at: "+1m", stale_until: "+11m", ttl: 600, rule_id: 3, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "38680ec6985e6693208f5b16", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000403%2C1000000402%2C1000000401", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000403,1000000402,1000000401\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-2m", expires_at: "+8m", stale_until: "+18m", ttl: 600, rule_id: 3, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "dc49ae952169e5b9bab4f0b8", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000404%2C1000000405", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000404,1000000405\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-7m", expires_at: "+3m", stale_until: "+13m", ttl: 600, rule_id: 3, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "4058ecd5d4e247aa9d85f960", key: "GET thumbnails.roblox.com/v1/users/avatar-headshot?format=Png&size=150x150&userIds=1000000405%2C1000000404", method: "GET", host: "thumbnails.roblox.com", path: "v1/users/avatar-headshot", params_json: "{\"params\":[[\"userIds\",\"1000000405,1000000404\"],[\"size\",\"150x150\"],[\"format\",\"Png\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-12m", expires_at: "-2m", stale_until: "+8m", ttl: 600, rule_id: 3, egress: "direct", hits: 0, body_len: 900, bytes: 1100}
+      - {id: "b6c0e43b4ddd88297a6a653e", key: "GET games.roblox.com/v1/games?universeIds=1000000501", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000501\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-1m", expires_at: "+4m", stale_until: "+14m", ttl: 300, rule_id: 4, egress: "direct", hits: 41, body_len: 900, bytes: 1100}
+      - {id: "a27c75bd36ddcc384609fcda", key: "GET games.roblox.com/v1/games?universeIds=1000000502", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000502\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-6m", expires_at: "-1m", stale_until: "+9m", ttl: 300, rule_id: 4, egress: "direct", hits: 37, body_len: 900, bytes: 1100}
+      - {id: "e638cd0b9c3538f00a3b35e0", key: "GET games.roblox.com/v1/games?universeIds=1000000503", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000503\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-11m", expires_at: "-6m", stale_until: "+4m", ttl: 300, rule_id: 4, egress: "direct", hits: 52, body_len: 900, bytes: 1100}
+      - {id: "04e6df2d60f0c73f8968d04c", key: "GET games.roblox.com/v1/games?universeIds=1000000504", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000504\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-4m", expires_at: "+1m", stale_until: "+11m", ttl: 300, rule_id: 4, egress: "direct", hits: 18, body_len: 900, bytes: 1100}
+      - {id: "3504d805730077096fd4ed34", key: "GET games.roblox.com/v1/games?universeIds=1000000505", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000505\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-9m", expires_at: "-4m", stale_until: "+6m", ttl: 300, rule_id: 4, egress: "direct", hits: 29, body_len: 900, bytes: 1100}
+      - {id: "b0aedb2df4066430c89ea9a5", key: "GET games.roblox.com/v1/games?universeIds=1000000506", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000506\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-2m", expires_at: "+3m", stale_until: "+13m", ttl: 300, rule_id: 4, egress: "direct", hits: 44, body_len: 900, bytes: 1100}
+      - {id: "539c7f90c0e58a8395034996", key: "GET games.roblox.com/v1/games?universeIds=1000000507", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000507\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-7m", expires_at: "-2m", stale_until: "+8m", ttl: 300, rule_id: 4, egress: "direct", hits: 33, body_len: 900, bytes: 1100}
+      - {id: "de0cb71803461751c2cf8291", key: "GET games.roblox.com/v1/games?universeIds=1000000508", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000508\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-12m", expires_at: "-7m", stale_until: "+3m", ttl: 300, rule_id: 4, egress: "direct", hits: 61, body_len: 900, bytes: 1100}
+      - {id: "3944593e94b7b1e28b11aede", key: "GET games.roblox.com/v1/games?universeIds=1000000509", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000509\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-5m", expires_at: "+0m", stale_until: "+10m", ttl: 300, rule_id: 4, egress: "direct", hits: 25, body_len: 900, bytes: 1100}
+      - {id: "aca0c18cd0b37e8da897d12c", key: "GET games.roblox.com/v1/games?universeIds=1000000510", method: "GET", host: "games.roblox.com", path: "v1/games", params_json: "{\"params\":[[\"universeIds\",\"1000000510\"]],\"stripped\":[]}", status: 200, content_type: "application/json", stored_at: "-10m", expires_at: "-5m", stale_until: "+5m", ttl: 300, rule_id: 4, egress: "direct", hits: 39, body_len: 900, bytes: 1100}
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CACHE-KEYSPLIT
+      subject_contains: "thumbnails.roblox.com/v1/users/avatar-headshot"
+      severity: any
+      family: cache
+      safe_auto: false
+      change_kinds_required: [rule_upsert]
+      change_kinds_forbidden: [ignored_param_add, ban_add, filter_add, bypass_add, tarpit_category, routing_rule, host_add, bucket_override]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["thumbnails.roblox.com/v1/users/avatar-headshot"]}}
+          proposed:
+            normalize_flags: {contains: "sort_csv:userIds"}
+      changes_forbidden:
+        # The games rule (id 4) is a different endpoint whose entries are healthy.
+        - {kind: rule_upsert, current: {id: 4}}
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_max_entries, cache_max_bytes, cache_enabled]}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cache_keysplit_enabled: 0}
+    expect: {fires: false}
+  - case: min_entries_9
+    description: Nine entries needed; the headshot group has eight.
+    settings: {insight_cache_keysplit_min_entries: 9}
+    expect: {fires: false}

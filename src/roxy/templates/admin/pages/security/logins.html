@@ -1,0 +1,10 @@
+{#-
+  Security page, card `logins` (`roxy/admin/pages/security.py logins_card`): every admin sign-in attempt in the
+  range, newest first (v1 "Admin Logins", plan 14.1 row 32; the Result filter is v1's failed logins, parity row 97).
+  A request of the table itself (`part=table`) answers the table alone. Usernames typed at the login form are caller
+  text. Context: `frame`, `table`, `part`, `attempts`, `failures`, `reset_href`, `range`.
+-#}
+{% from "admin/pages/security/_macros.html" import table_card, reset_action %}
+{% from "components/format.html" import num %}
+{% set subtitle = (range.description or "This range") ~ ": " ~ num(attempts) ~ (" attempt" if attempts == 1 else " attempts") ~ ", " ~ num(failures) ~ " failed" %}
+{{ table_card(frame, table, part, subtitle=subtitle, actions=reset_action(reset_href, "sign-in records")) }}

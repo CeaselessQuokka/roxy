@@ -1,0 +1,215 @@
+/*
+  Roxy admin auth pages (login, authenticator enrollment, kill switch). Plain but tidy; the dashboard restyles
+  these later. Loaded from 'self' (the CSP allows style-src 'self'); the pages have no inline style.
+*/
+
+:root {
+  color-scheme: light dark;
+  --auth-bg: #f3f5f8;
+  --auth-card: #ffffff;
+  --auth-text: #18202b;
+  --auth-muted: #4f5b6b;
+  --auth-border: #c9d1dc;
+  --auth-primary: #1f5fbf;
+  --auth-primary-text: #ffffff;
+  --auth-danger: #b42318;
+  --auth-focus: #1f5fbf;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --auth-bg: #0b0f14;
+    --auth-card: #141b24;
+    --auth-text: #d9e2ee;
+    --auth-muted: #9aa8ba;
+    --auth-border: #2c3a4c;
+    --auth-primary: #7cc4ff;
+    --auth-primary-text: #0b0f14;
+    --auth-danger: #ff6b6b;
+    --auth-focus: #7cc4ff;
+  }
+}
+
+[hidden] {
+  display: none !important;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--auth-bg);
+  color: var(--auth-text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 440px;
+  background: var(--auth-card);
+  border: 1px solid var(--auth-border);
+  border-radius: 12px;
+  padding: 28px 24px;
+}
+
+.auth-brand {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 8px;
+}
+
+.auth-title {
+  font-size: 1.5rem;
+  text-align: center;
+  margin: 0 0 20px;
+}
+
+.auth-subtitle {
+  font-size: 1.15rem;
+  margin: 0 0 8px;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.auth-form label {
+  font-weight: 600;
+}
+
+.auth-form input[type="text"],
+.auth-form input[type="password"] {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--auth-border);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font-size: 1rem;
+}
+
+.auth-check,
+.auth-radio {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 6px 0;
+}
+
+.auth-check label,
+.auth-radio label {
+  font-weight: 400;
+}
+
+.auth-methods {
+  border: 1px solid var(--auth-border);
+  border-radius: 8px;
+  margin: 8px 0 12px;
+  padding: 8px 12px;
+}
+
+.auth-button {
+  display: inline-block;
+  padding: 10px 16px;
+  border: 1px solid var(--auth-primary);
+  border-radius: 8px;
+  background: var(--auth-primary);
+  color: var(--auth-primary-text);
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: center;
+  text-decoration: none;
+}
+
+.auth-button:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.auth-secondary {
+  background: transparent;
+  color: var(--auth-primary);
+}
+
+.auth-link-button {
+  margin-top: 12px;
+  width: 100%;
+}
+
+.auth-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.auth-hint {
+  color: var(--auth-muted);
+  margin: 4px 0 12px;
+}
+
+.auth-hint.is-expired {
+  color: var(--auth-danger);
+}
+
+.auth-error {
+  color: var(--auth-danger);
+  margin: 4px 0;
+}
+
+.auth-qr {
+  display: flex;
+  justify-content: center;
+  margin: 12px 0;
+}
+
+.auth-qr img {
+  background: #ffffff;
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.auth-secret,
+.auth-codes {
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.auth-codes {
+  columns: 2;
+  padding-left: 1.5em;
+}
+
+.auth-list {
+  padding-left: 1.25em;
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+[tabindex="-1"]:focus-visible {
+  outline: 3px solid var(--auth-focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

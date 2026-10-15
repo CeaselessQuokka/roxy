@@ -1,0 +1,53 @@
+{#-
+  Traffic page, card `verbs` (`roxy/admin/pages/traffic.py verbs_card`; plan 14.1 row 20, v1 "Requests").
+
+  Requests per HTTP method over time, v1's two split bars (the method mix and answered against refused and failed)
+  as meters with their numbers in words, and v1's "Counts by Method" table (`traffic_verbs`, the API's table; it
+  pages and exports through `GET /admin/api/v1/traffic/verbs/table`). A table request (`part` "table") gets the
+  table alone, so the swap never nests the card inside itself.
+  Context: `frame`, `part`, `table`, and for the card `answer`, `mix`, `outcome_split`, `series_options`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/chart.html" import series_chart %}
+{% from "components/table.html" import data_table %}
+{% from "components/format.html" import num %}
+{% if part == "table" %}
+{{ data_table(**table) }}
+{% else %}
+{% call page_card(frame) %}
+<div class="traffic-beside">
+{{ series_chart("traffic-verbs-chart", "Requests per method", series=answer, summary="Requests per HTTP method over the range.", size="md", kind="line", series_options=series_options, y_format="count", empty_text="No requests in this range yet.") }}
+{% if mix %}
+<div class="traffic-mix">
+  <h3 class="traffic-mix__title" id="traffic-mix-title">Method mix</h3>
+  <ul class="traffic-mix__list" aria-labelledby="traffic-mix-title">
+    {% for row in mix %}
+    <li class="traffic-mix__item">
+      <span class="traffic-mix__name mono">{{ row.method }}</span>
+      <meter class="traffic-mix__bar" min="0" max="100" value="{{ row.share }}" aria-label="{{ row.method }}: {{ '{:,.1f}'.format(row.share) }} percent of requests"></meter>
+      <span class="traffic-mix__value">{{ "{:,.1f}".format(row.share) }}% <span class="muted">({{ num(row.value) }})</span></span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% if outcome_split %}
+  <h3 class="traffic-mix__title" id="traffic-split-title">Answered, refused and failed</h3>
+  <ul class="traffic-mix__list" aria-labelledby="traffic-split-title">
+    {% for row in outcome_split %}
+    <li class="traffic-mix__item traffic-mix__item--{{ row.tone }}">
+      <span class="traffic-mix__name">{{ row.label }}</span>
+      <meter class="traffic-mix__bar" min="0" max="100" value="{{ row.share }}" aria-label="{{ row.label }}: {{ '{:,.1f}'.format(row.share) }} percent of requests"></meter>
+      <span class="traffic-mix__value">{{ "{:,.1f}".format(row.share) }}% <span class="muted">({{ num(row.value) }})</span></span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</div>
+{% else %}
+<p class="muted traffic-mix">The method mix appears once there are requests in this range.</p>
+{% endif %}
+</div>
+<div class="traffic-dt">
+{{ data_table(**table) }}
+</div>
+{% endcall %}
+{% endif %}

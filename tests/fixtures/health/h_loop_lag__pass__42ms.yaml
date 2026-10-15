@@ -1,0 +1,47 @@
+format: roxy.health_fixture/1
+check: H-LOOP-LAG
+case: pass
+name: 42ms
+description: >
+  Over the last 5 minutes the event loop lag p99 is 42 ms on one worker and 31 ms on the other, so the worst is
+  42 ms. 13.2 H-LOOP-LAG: under 50 ms gives pass. Twenty minutes earlier a burst pushed it to 300 ms; that is
+  outside the 5 minute window and must not count.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    ROXY_WORKERS: "2"
+  state:
+    workers:
+      - pid: 41001
+        worker_id: "roxy-test:41001:a1b2c3d4"
+        hostname: roxy-test
+        color: blue
+        master_pid: 41000
+        started_at: "-2d"
+        last_seen: "-1s"
+        loop_lag_ms_p99: 42
+        open_conns: 40
+        is_leader: 1
+        version: "3f9c2a1"
+        x_self: true
+        history:
+          - {window: ["-30m", "-5m"], cpu_pct: 70, loop_lag_ms_p99: 300, open_conns: 60}
+          - {window: ["-5m", "0m"], cpu_pct: 25, loop_lag_ms_p99: 42, open_conns: 40}
+      - pid: 41002
+        worker_id: "roxy-test:41002:b2c3d4e5"
+        hostname: roxy-test
+        color: blue
+        master_pid: 41000
+        started_at: "-2d"
+        last_seen: "-2s"
+        loop_lag_ms_p99: 31
+        open_conns: 38
+        is_leader: 0
+        version: "3f9c2a1"
+        history:
+          - {window: ["-30m", "-5m"], cpu_pct: 68, loop_lag_ms_p99: 280, open_conns: 58}
+          - {window: ["-5m", "0m"], cpu_pct: 22, loop_lag_ms_p99: 31, open_conns: 38}
+expect:
+  status: pass
+  value: {lt: 50}
+  credential_calls: {eq: 0}

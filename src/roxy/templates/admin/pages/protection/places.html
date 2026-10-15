@@ -1,0 +1,17 @@
+{#-
+  Protection page, card `places` (`roxy/admin/pages/protection.py places_card`): limits per experience (D11).
+
+  What: whether per-experience limits are on, what one budget belongs to, and the place limit's refusals in the
+  range; the settings (`protection#places`, also on Clients > Places) sit below.
+  Context: `frame`, `counts`, `enabled`, `per_minute`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/format.html" import num %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/protection/_macros.html" import count_list %}
+{% call page_card(frame) %}
+<p>{% if enabled %}{{ status_badge("ok", "On") }} Each experience may send <strong>{{ num(per_minute) }}</strong> requests per minute across all its servers.{% else %}{{ status_badge("neutral", "Off") }} A {{ term("place-limit", "place limit") }} caps how much one experience (its Roblox-Id header) may send across all of its servers.{% endif %} Place ids come from a header any caller can set, so by default each budget also belongs to the caller's network: a forger cannot use up a real game's budget.</p>
+{{ count_list(counts) }}
+<p class="field__hint">See each experience's traffic on <a href="/admin/clients#places">Clients &gt; Places</a>.</p>
+{% endcall %}

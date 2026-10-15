@@ -1,0 +1,7 @@
+User-agent: *
+Disallow: /admin
+Disallow: /admin/
+Allow: /
+Crawl-delay: 5
+
+Sitemap: https://roxytheproxy.com/sitemap.xml

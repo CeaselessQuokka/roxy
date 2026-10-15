@@ -1,0 +1,90 @@
+# CACHE-OFF fires when the cache master switch is off while callers are being served
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "cache_enabled=0 with traffic"; evidence "Traffic volume, upstream calls"; change "Turn on";
+# confidence High. No thresholds (15.3 J2: only _enabled and _severity).
+#
+#   -4h to -3h: cache on, 60 requests per minute, 70% answered from the cache.
+#   -3h:        an admin sets cache_enabled = 0 while debugging stale answers, and forgets it.
+#   -3h to now: 10,800 requests, every one sent to Roblox (Roxy-Cache: OFF), 0 avoided calls.
+#
+# cache_enabled is a global setting, so the recommendation is never safe to apply automatically.
+
+format: roxy.insight_fixture/1
+rule: CACHE-OFF
+case: fires
+description: >
+  The cache has been switched off for three hours while 60 requests per minute keep arriving, so every request
+  costs an upstream call. The rule must propose turning cache_enabled back on, and nothing else.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  cache_enabled: 0
+
+tables:
+  rules_cache:
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  uncached: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "OFF", latency_ms: {p50: 150, p95: 400, p99: 800}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: headshot_hit_before, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-4h", "-3h"], per_minute: 28}
+  - {name: headshot_miss_before, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-4h", "-3h"], per_minute: 8}
+  - {name: games_hit_before, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-4h", "-3h"], per_minute: 14}
+  - {name: games_miss_before, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-4h", "-3h"], per_minute: 10}
+  - {name: headshot_off, profile: uncached, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-3h", "0m"], per_minute: 36}
+  - {name: games_off, profile: uncached, endpoint_template: games.roblox.com/v1/games, window: ["-3h", "0m"], per_minute: 24}
+
+state:
+  settings_history:
+    - {at: "-3h", key: cache_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Debugging stale game details."}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 3600
+      upstream_calls: 3600
+      avoided_calls: 0
+      served_cache: 0
+    - window: ["-4h", "-3h"]
+      requests: 3600
+      upstream_calls: 1080
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CACHE-OFF
+      severity: any
+      family: cache
+      confidence: high
+      safe_auto: false
+      change_kinds_required: [setting]
+      change_kinds_forbidden: [rule_upsert, rule_delete, ignored_param_add, ban_add, filter_add, bypass_add, tarpit_category, routing_rule, host_add, bucket_override, credential_allowlist_remove]
+      changes_required:
+        - {kind: setting, key: cache_enabled, current: 0, proposed: 1}
+      changes_forbidden:
+        - {kind: setting, key: {ne: cache_enabled}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cache_off_enabled: 0}
+    expect: {fires: false}
+  - case: severity_override_info
+    description: insight_cache_off_severity replaces the computed severity.
+    settings: {insight_cache_off_severity: info}
+    expect:
+      fires: true
+      recommendations:
+        - {severity: info}

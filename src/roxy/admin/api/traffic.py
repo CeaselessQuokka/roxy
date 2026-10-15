@@ -1,0 +1,709 @@
+"""Admin API: the Traffic page (`/admin/api/v1/traffic`, plan 14.1 Traffic row, 14.2, 14.3, parity rows 68 to 70,
+131 and 132).
+
+What this is
+    Charts and tables of what went through Roxy over a time range:
+      * `GET /traffic/requests`: requests over time stacked by outcome (served by Roblox, served from cache,
+        refused, failed, and the OPTIONS requests Roxy answered itself when there were any), with the comparison
+        overlay and chart annotations.
+      * `GET /traffic/bytes`: caller and upstream bytes in and out over time, with totals per egress (14.3).
+      * `GET /traffic/verbs` and `/traffic/verbs/table`: requests by HTTP method (v1 "Counts by Method").
+      * `GET /traffic/status` (`view=class` or `view=source`) and `/traffic/status/sources`: status classes over
+        time, and v1's "Who returned it?" table of status codes by source with the 429 verdict (rows 68, 132).
+      * `GET /traffic/heatmap`: hour of day by weekday in `ui_timezone`.
+      * `GET /traffic/latency` and `/traffic/latency/split`: p50, p95 and p99 over time, and the split per verb,
+        per egress, per host or per outcome (row 131, v1's Proxy Timings toggle).
+      * `GET /traffic/trends`: week over week, month over month and year over year tables with sparklines (14.3).
+
+Why it exists
+    v1 kept 180 minutes of traffic in a JSON file and drew the last 60; everything else was a lifetime counter
+    (rows 69, 70). v2 answers "when?" for every number, compares periods, and keeps the source split that tells
+    "Roblox is rate limiting us" (act now) from "Roxy is rate limiting callers" (the system working).
+
+How it works
+    Thin over `metrics/queries.py` (series, totals, top N, `answer_source_counts`) and `metrics/read_dashboard.py`
+    (the heatmap fold, sparkline windows). Requests by outcome chart the catalog's outcome measures, never the raw
+    `outcome` column (`outcome_lines`, finding truth-6): a local OPTIONS answer is recorded with outcome
+    `served_upstream` and reason `options_local`, and it never reached Roblox, so it is its own line, "Answered by
+    Roxy (OPTIONS)", as the `served_upstream` help promises. Roblox 429s always come from the `upstream_429` log,
+    counted once per upstream attempt, never from caller status codes. "Who returned it?" reads the source through
+    `queries.ANSWER_SOURCE_SQL`: a Roblox 5xx passed on after the retries (`upstream_5xx`) carries Roblox's status
+    and Roxy's text, so it counts as Roblox's (`relay`) in the table and the source series, and never in the
+    `roxy_5xx` tile (finding parity-1). The `roblox_5xx` tile counts every 5xx Roblox answered Roxy's calls for
+    callers, per attempt, retries included (lead decision 11, finding v1parity-1; metrics 0010). A series' reset
+    notices name only resets of the data it reads (`queries.reset_touches`, plan 6.8). Tables page and sort on the
+    server and export as CSV or JSON through the shared `export_table` (audited, formula guarded). Each answer is
+    built by a plain function over the worker context (`requests_answer`, `status_answer`, `status_sources_answer`,
+    ...), which the Traffic dashboard page calls too, so the page and the API can never show different numbers.
+
+What to read next
+    `roxy/admin/api/common.py`, `roxy/metrics/queries.py`, `roxy/admin/api/endpoints.py`.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
+from typing import Annotated, Any, Final
+
+from fastapi import Depends, Query, Request
+
+from roxy.admin.api.common import (
+    AdminSession,
+    Column,
+    ExportFormatDep,
+    TableQuery,
+    TableSpec,
+    TimeRange,
+    TimeRangeDep,
+    annotation_entries,
+    area_router,
+    comparison_resets,
+    export_pages,
+    export_table,
+    page_rows,
+    range_info,
+    reset_notices,
+    series_answer,
+    series_entry,
+    series_from_read_model,
+    table_answer,
+    table_from_read_model,
+    table_params,
+    validation_error,
+)
+from roxy.deps import get_ctx
+from roxy.metrics import queries, read_dashboard
+from roxy.metrics.catalog import METRICS
+
+router = area_router("traffic")
+
+BYTE_METRICS: Final[tuple[str, ...]] = (
+    "caller_bytes_in",
+    "caller_bytes_out",
+    "upstream_bytes_in",
+    "upstream_bytes_out",
+    "cache_bytes_out",
+)
+OUTCOME_MEASURES: Final[tuple[str, ...]] = ("served_upstream", "served_cache", "refused", "failed")
+"""The outcome lines of a requests by outcome chart, in stacking order: the catalog's measures (`metrics/catalog.py`),
+never the raw `outcome` column. The router records a local OPTIONS answer with outcome `served_upstream` and reason
+`options_local` (the closest value of the closed enum), and the `served_upstream` measure leaves it out (finding
+spec-7), so "Served by Roblox" counts only what reached Roblox (finding truth-6)."""
+OUTCOME_READS: Final[tuple[str, ...]] = ("requests", *OUTCOME_MEASURES)
+"""What `outcome_lines` reads: every request, and the four outcome measures."""
+ANSWERED_LOCALLY: Final = "answered_locally"
+ANSWERED_LOCALLY_LABEL: Final = "Answered by Roxy (OPTIONS)"
+ANSWERED_LOCALLY_HELP: Final = (
+    "OPTIONS requests (a browser's preflight check) that Roxy answered itself, without contacting Roblox. They count "
+    "as requests, never as served by Roblox."
+)
+"""The line of requests no outcome measure counts: `requests` minus the four measures, bucket by bucket. The four
+partition every rollup row but those recorded `served_upstream` with reason `options_local`, so this is exactly the
+OPTIONS requests Roxy answered itself (shown only when the range or its comparison has any)."""
+STATUS_METRICS: Final[tuple[str, ...]] = ("caller_2xx", "caller_4xx", "status_5xx", "roxy_429", "roblox_429")
+"""The status chart: the answers callers got (`caller_2xx`, `caller_4xx`, `status_5xx`) and the two 429 sources.
+`status_2xx` and `status_4xx` count Roblox's answers per attempt since lead decision 11 (finding v1parity-1) and are
+unknown for a group by method, so the caller series keep their own keys."""
+LATENCY_METRICS: Final[tuple[str, ...]] = ("p50_ms", "p95_ms", "p99_ms", "queue_wait_p95_ms")
+HEATMAP_METRICS: Final[tuple[str, ...]] = ("requests", "demand", "upstream_calls", "served_cache", "refused", "failed")
+SPLITS: Final[dict[str, str]] = {
+    "method": "method",
+    "verb": "method",
+    "egress": "egress",
+    "host": "host",
+    "outcome": "outcome",
+}
+"""Latency split choices (row 131): `verb` is v1's name for the HTTP method."""
+MAX_SERIES_GROUPS: Final = 10
+TREND_METRICS: Final[tuple[str, ...]] = (
+    "requests",
+    "demand",
+    "avoided",
+    "avoided_pct",
+    "upstream_calls",
+    "roblox_429",
+    "roblox_429_per_10k",
+    "roxy_429",
+    "status_5xx",
+    "errors_hidden",
+    "p95_ms",
+    "caller_bytes_out",
+    "upstream_bytes_in",
+)
+TREND_PERIODS: Final[tuple[tuple[str, str, str], ...]] = (
+    ("week", "Week over week", "7d"),
+    ("month", "Month over month", "30d"),
+    ("year", "Year over year", "1y"),
+)
+"""(key, label, range): each compares the trailing range with the one just before it."""
+
+SOURCE_LABELS: Final[dict[str, tuple[str, str]]] = {
+    "roblox": ("Roblox to caller", "Roblox's own answer, passed to the caller as it came."),
+    "relay": (
+        "Roblox to caller (relayed)",
+        "Roblox's answer passed to the caller after Roxy reformatted it: pretty printed, the browser view, or a "
+        "Roblox server error passed on with Roxy's retry text after the allowed retries.",
+    ),
+    "roxy": ("Roxy (its own answers)", "Statuses Roxy produced: refusals, its own errors, pause, limits."),
+    "cache": ("Cache to caller", "Answers from Roxy's cache: Roblox never saw these requests."),
+    "internal": ("Roxy's own calls", "Roxy's own probes and lookups, not caller traffic."),
+}
+"""v1 SOURCE_LABELS and hints (dashboard.md 4.16), reworded for v2's sources and plan C5."""
+
+VERB_COLUMNS: Final[tuple[Column, ...]] = (
+    Column("key", "Method", "The HTTP method callers used (HEAD is counted as GET, as it runs as GET)."),
+    Column("requests", "Requests", "Every request with this method.", "requests"),
+    Column("served_upstream", "Served by Roblox", METRICS["served_upstream"].description, "requests"),
+    Column("served_cache", "Served from cache", METRICS["served_cache"].description, "requests"),
+    Column("refused", "Refused", METRICS["refused"].description, "requests"),
+    Column("failed", "Failed", METRICS["failed"].description, "requests"),
+    Column("caller_2xx", "2xx", "Successful answers sent to callers.", "requests"),
+    Column("caller_4xx", "4xx", "Client error answers sent to callers.", "requests"),
+    Column("status_5xx", "5xx", "Server error answers sent to callers.", "requests"),
+    Column("p95_ms", "p95", METRICS["p95_ms"].description, "ms"),
+)
+VERBS_SPEC: Final = TableSpec(name="traffic_verbs", columns=VERB_COLUMNS, default_sort="requests")
+
+SOURCES_SPEC: Final = TableSpec(
+    name="traffic_status_sources",
+    columns=(
+        Column("source", "Source", "Who produced the status code the caller received."),
+        Column("source_label", "Who returned it", "The source in plain words.", sortable=False),
+        Column("status", "Status code", "The HTTP status code.", ""),
+        Column("requests", "Requests", "How many requests got this status from this source.", "requests"),
+    ),
+    default_sort="requests",
+)
+
+SPLIT_COLUMNS: Final[tuple[Column, ...]] = (
+    Column("key", "Group", "The verb, egress, host or outcome."),
+    Column("requests", "Requests", "Requests in the group (the latency histogram covers caller traffic).", "requests"),
+    Column("p50_ms", "p50", METRICS["p50_ms"].description, "ms"),
+    Column("p95_ms", "p95", METRICS["p95_ms"].description, "ms"),
+    Column("p99_ms", "p99", METRICS["p99_ms"].description, "ms"),
+    Column("queue_wait_p95_ms", "Queue wait p95", METRICS["queue_wait_p95_ms"].description, "ms", sortable=False),
+    Column("failed", "Failed", METRICS["failed"].description, "requests"),
+)
+SPLIT_SPEC: Final = TableSpec(name="traffic_latency_split", columns=SPLIT_COLUMNS, default_sort="requests")
+
+
+# --------------------------------------------------------------------------------------------- helpers
+
+
+async def _series_answer(
+    ctx: Any,
+    tr: TimeRange,
+    metrics: Sequence[str],
+    *,
+    group_by: str | None = None,
+    labels: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """A section 13 series answer for `metrics` (optionally grouped), with comparison, annotations and notices.
+
+    The plan 6.8 notices name only resets of what the metrics read (`queries.kpi_tables`: the rollups, plus the
+    429 log or the egress usage for the metrics that read those), so clearing the login history never marks a
+    traffic chart as partial.
+    """
+    db = ctx.dbs.metrics
+    tables = {name for metric in metrics for name in queries.kpi_tables(metric)}
+    latency = any(metric in LATENCY_METRICS for metric in metrics)
+    cache = any(metric in queries.CACHE_STATE_KPIS for metric in metrics)
+    kwargs: dict[str, Any] = {"metrics": list(metrics)}
+    if group_by:
+        kwargs.update(group_by=group_by, max_groups=MAX_SERIES_GROUPS)
+    data = await queries.series(db, tr.window, **kwargs)
+    series = [
+        entry for metric in metrics for entry in series_from_read_model(data, metric, label=(labels or {}).get(metric))
+    ]
+    compare_series = None
+    if tr.compare_window is not None:
+        other = await queries.series(db, tr.compare_window, **kwargs)
+        compare_series = [
+            entry
+            for metric in metrics
+            for entry in series_from_read_model(other, metric, label=(labels or {}).get(metric))
+        ]
+    start, end = tr.window.start, tr.window.end
+
+    def marks(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        return (
+            queries.chart_annotations(conn, start, end),
+            queries.reset_annotations(conn, start, end),
+            comparison_resets(conn, tr),
+        )
+
+    annotations, resets, compare_resets = await db.read(marks)
+    touching = [row for row in resets if queries.reset_touches(row, tables, latency=latency, cache=cache)]
+    # The comparison overlay over a reset is partial too (plan 6.8, finding truth-3).
+    behind = [row for row in compare_resets if queries.reset_touches(row, tables, latency=latency, cache=cache)]
+    return series_answer(
+        tr,
+        series,
+        compare_series=compare_series,
+        annotations=annotation_entries(annotations),
+        notices=[*reset_notices(touching, tz=tr.window.tz), *reset_notices(behind, tz=tr.window.tz, comparison=True)],
+    )
+
+
+def _good_direction(metric: str) -> str:
+    spec = METRICS.get(metric)
+    return {"higher": "up", "lower": "down"}.get(spec.better if spec else "neutral", "neutral")
+
+
+def _delta(current: Any, previous: Any) -> tuple[float | None, float | None]:
+    """`queries.change`: the percent divides by the size of the baseline, so its sign follows the change."""
+    return queries.change(current, previous)
+
+
+def _value(points: Sequence[Sequence[Any]], index: int) -> int | float:
+    found = points[index][1] if index < len(points) else None
+    return found if isinstance(found, int | float) else 0
+
+
+def _outcome_split(entries: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """`(the four outcome lines, the answered locally line)` from the ungrouped series of `OUTCOME_READS`.
+
+    Every line of one `queries.series` read has the same buckets in the same order, so the answered locally line is
+    `requests` minus the four measures at each index (never clamped: a difference that is not a local OPTIONS answer
+    would show, plan P6). Keys stay `requests:<outcome>`, the keys of the grouped chart this replaces.
+    """
+    by_key = {str(entry.get("key")): entry for entry in entries}
+    lines: list[dict[str, Any]] = []
+    for measure in OUTCOME_MEASURES:
+        entry = by_key.get(measure) or {}
+        spec = METRICS[measure]
+        lines.append(series_entry(f"requests:{measure}", spec.label, spec.unit, entry.get("points") or ()))
+    every: Sequence[Sequence[Any]] = (by_key.get("requests") or {}).get("points") or ()
+    local: list[list[Any]] = []
+    for index, point in enumerate(every):
+        total = point[1]
+        if not isinstance(total, int | float):
+            local.append([point[0], None])
+            continue
+        local.append([point[0], total - sum(_value(line["points"], index) for line in lines)])
+    return lines, series_entry(f"requests:{ANSWERED_LOCALLY}", ANSWERED_LOCALLY_LABEL, METRICS["requests"].unit, local)
+
+
+def _has_any(line: Mapping[str, Any]) -> bool:
+    return any(isinstance(v, int | float) and v != 0 for _t, v in line.get("points") or ())
+
+
+def outcome_lines(
+    series: Sequence[Mapping[str, Any]], compare: Sequence[Mapping[str, Any]] | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    """Requests by outcome for a chart and its comparison, from series of `OUTCOME_READS` (finding truth-6).
+
+    The four outcome lines always; the answered locally line (`ANSWERED_LOCALLY`) in both when either period has a
+    local OPTIONS answer, so the comparison overlay pairs with it and the lines add up to every request. Used by
+    `requests_answer` and the Endpoints drill-down (`roxy/admin/api/endpoints.py`).
+    """
+    lines, local = _outcome_split(series)
+    other_lines: list[dict[str, Any]] | None = None
+    other_local: dict[str, Any] | None = None
+    if compare is not None:
+        other_lines, other_local = _outcome_split(compare)
+    if _has_any(local) or (other_local is not None and _has_any(other_local)):
+        lines.append(local)
+        if other_lines is not None and other_local is not None:
+            other_lines.append(other_local)
+    return lines, other_lines
+
+
+# --------------------------------------------------------------------------------------------- page helpers
+#
+# The answers below are built by plain functions over the worker context, so the Traffic dashboard page
+# (`roxy/admin/pages/traffic.py`) renders exactly what these routes answer (DESIGN.md 13, one source of truth per
+# number); each route only adds the request plumbing (guards, the time range dependency, exports).
+
+
+async def requests_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """Requests over time stacked by outcome, with the comparison, markers and notices (`GET /traffic/requests`).
+
+    The lines are the outcome measures plus the OPTIONS requests Roxy answered itself (`outcome_lines`), not a group
+    by the raw `outcome` column, which counted those as served by Roblox (finding truth-6).
+    """
+    answer = await _series_answer(ctx, tr, OUTCOME_READS)
+    compare = answer.get("compare")
+    lines, other = outcome_lines(answer["series"], compare["series"] if compare else None)
+    answer["series"] = lines
+    if compare and other is not None:
+        compare["series"] = other
+    return answer
+
+
+async def bytes_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """Caller and upstream bytes over time with totals and wire bytes per egress (`GET /traffic/bytes`)."""
+    answer = await _series_answer(ctx, tr, BYTE_METRICS)
+    window = tr.window
+
+    def read(conn: sqlite3.Connection) -> tuple[dict[str, Any], dict[str, int]]:
+        return queries.totals_sync(conn, window), queries.egress_bytes(conn, window)
+
+    totals, by_egress = await ctx.dbs.metrics.read(read)
+    answer["totals"] = {metric: totals.get(metric) for metric in BYTE_METRICS}
+    answer["by_egress"] = by_egress
+    return answer
+
+
+async def verbs_answer(ctx: Any, tr: TimeRange) -> dict[str, Any]:
+    """Requests over time per HTTP method (`GET /traffic/verbs`)."""
+    return await _series_answer(ctx, tr, ["requests"], group_by="method")
+
+
+async def dimension_table(ctx: Any, spec: TableSpec, dimension: str, tr: TimeRange, tq: TableQuery) -> dict[str, Any]:
+    """One page of a `queries.top_n` table over `dimension` (the verbs and latency split tables)."""
+    data = await queries.top_n(ctx.dbs.metrics, tr.window, dimension, page=tq.metrics_page())
+    return table_from_read_model(spec, tq, data)
+
+
+# --------------------------------------------------------------------------------------------- routes
+
+
+@router.get("/requests")
+async def traffic_requests(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
+    """Requests over time stacked by outcome (plus the comparison and markers)."""
+    return await requests_answer(get_ctx(request), tr)
+
+
+@router.get("/bytes")
+async def traffic_bytes(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
+    """Caller and upstream bytes over time (plan 14.3 definitions), with totals and wire bytes per egress."""
+    return await bytes_answer(get_ctx(request), tr)
+
+
+@router.get("/verbs")
+async def traffic_verbs(request: Request, _admin: AdminSession, tr: TimeRangeDep) -> dict[str, Any]:
+    """Requests over time per HTTP method (v1 "Requests" section, now time-bucketed)."""
+    return await verbs_answer(get_ctx(request), tr)
+
+
+async def _dimension_table(
+    request: Request,
+    admin: Any,
+    spec: TableSpec,
+    dimension: str,
+    tr: TimeRange,
+    tq: TableQuery,
+    fmt: Any,
+) -> Any:
+    """One `queries.top_n` table over `dimension`, paged in the read model, or its export."""
+    ctx = get_ctx(request)
+    db = ctx.dbs.metrics
+    if fmt is not None:
+
+        async def fetch(page: int, size: int) -> tuple[list[Any], int]:
+            data = await queries.top_n(db, tr.window, dimension, page=replace(tq.metrics_page(), page=page, size=size))
+            return list(data["rows"]), int(data["total"])
+
+        return await export_pages(request, admin, spec, fetch, fmt, tq=tq, tr=tr)
+    return await dimension_table(ctx, spec, dimension, tr, tq)
+
+
+@router.get("/verbs/table")
+async def traffic_verbs_table(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(VERBS_SPEC))],
+    fmt: ExportFormatDep,
+) -> Any:
+    """Counts by method: served, refused, failed and status classes per verb (v1 "Counts by Method")."""
+    return await _dimension_table(request, admin, VERBS_SPEC, "method", tr, tq, fmt)
+
+
+@router.get("/status")
+async def traffic_status(
+    request: Request,
+    _admin: AdminSession,
+    tr: TimeRangeDep,
+    view: Annotated[str, Query(max_length=16)] = "class",
+) -> dict[str, Any]:
+    """Status classes over time (`view=class`, with Roxy's and Roblox's 429s), or requests by who produced the
+    caller's status (`view=source`: Roblox, relayed, Roxy, cache, internal; `queries.ANSWER_SOURCE_SQL`)."""
+    return await status_answer(get_ctx(request), tr, view)
+
+
+STATUS_VIEWS: Final[tuple[str, ...]] = ("class", "source")
+
+
+async def status_answer(ctx: Any, tr: TimeRange, view: str) -> dict[str, Any]:
+    """The `GET /traffic/status` series for `view` (`class` or `source`; anything else is a 422)."""
+    if view not in STATUS_VIEWS:
+        raise validation_error({"view": "Choose class or source."}, "The view is not valid.")
+    if view == "source":
+        return await _series_answer(ctx, tr, ["requests"], group_by="answer_source")
+    return await _series_answer(ctx, tr, STATUS_METRICS)
+
+
+def _verdict(roblox_429: int | None, roxy_429: int) -> dict[str, str]:
+    """v1's "Who returned it?" verdict (dashboard.md 4.16), with the C5 replacements and v2's 429 log."""
+    if roblox_429:
+        return {
+            "tone": "bad",
+            "text": f"Roblox has rate-limited Roxy {roblox_429:,} time(s) in this range. This is the one to act on: "
+            "reduce upstream volume (cache, pacing), or the address and the account behind Roxy are at risk.",
+        }
+    if roxy_429:
+        return {
+            "tone": "ok",
+            "text": f"All {roxy_429:,} of the 429s are Roxy's own: Roxy turning callers away, not Roblox turning "
+            "Roxy away. Nothing to do upstream.",
+        }
+    return {"tone": "muted", "text": "No rate limiting recorded from either side in this range."}
+
+
+@router.get("/status/sources")
+async def traffic_status_sources(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(SOURCES_SPEC))],
+    fmt: ExportFormatDep,
+) -> Any:
+    """Status codes by who produced them (rows 68, 132), with v1's four tiles and the 429 verdict.
+
+    The table and the tiles read one definition of "who": a Roblox 5xx passed on after the retries is Roblox's
+    (`relay` in the table), and `roxy_5xx` ("Our own failures") counts only Roxy's own. The `roblox_5xx` tile counts
+    Roblox's 5xx answers per attempt, retries included (lead decision 11).
+    """
+    ctx = get_ctx(request)
+    rows, totals = await status_source_rows(ctx, tr)
+    if fmt is not None:
+        ordered, total = page_rows(rows, _all_rows(tq, len(rows)), search_keys=("source", "source_label"))
+        return await export_table(request, admin, SOURCES_SPEC, ordered, fmt, total=total, tq=tq, tr=tr)
+    return status_sources_answer(tr, tq, rows, totals)
+
+
+async def status_source_rows(ctx: Any, tr: TimeRange) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Every (source, status) row of "Who returned it?" in the range, and the range totals (one metrics.db read)."""
+    window = tr.window
+
+    def read(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        return queries.answer_source_counts(conn, window), queries.totals_sync(conn, window)
+
+    pairs, totals = await ctx.dbs.metrics.read(read)
+    rows: list[dict[str, Any]] = [
+        {
+            "source": str(item["source"]),
+            "source_label": SOURCE_LABELS.get(str(item["source"]), (str(item["source"]), ""))[0],
+            "status": int(item["status"]),
+            "requests": int(item["requests"]),
+        }
+        for item in pairs
+    ]
+    return rows, totals
+
+
+def status_sources_answer(
+    tr: TimeRange, tq: TableQuery, rows: Sequence[dict[str, Any]], totals: dict[str, Any]
+) -> dict[str, Any]:
+    """The `GET /traffic/status/sources` answer for one page of `rows`: the table, v1's four tiles, the verdict."""
+    items, total = page_rows(rows, tq, search_keys=("source", "source_label"))
+    answer = table_answer(SOURCES_SPEC, tq, items, total)
+    answer["tiles"] = {
+        "roblox_429": totals.get("roblox_429"),
+        "roxy_429": totals.get("roxy_429"),
+        "roblox_5xx": totals.get("roblox_5xx"),
+        "roxy_5xx": totals.get("roxy_5xx"),
+    }
+    answer["verdict"] = _verdict(totals.get("roblox_429"), int(totals.get("roxy_429") or 0))
+    answer["sources"] = {key: {"label": label, "help": hint} for key, (label, hint) in SOURCE_LABELS.items()}
+    answer["range"] = tr.info()
+    return answer
+
+
+def _all_rows(tq: TableQuery, count: int) -> TableQuery:
+    """The same sort and search as `tq`, as one page holding every row (exports)."""
+    return replace(tq, page=1, page_size=max(1, count))
+
+
+@router.get("/heatmap")
+async def traffic_heatmap(
+    request: Request,
+    _admin: AdminSession,
+    tr: TimeRangeDep,
+    metric: Annotated[str, Query(max_length=32)] = "requests",
+) -> dict[str, Any]:
+    """Hour of day by weekday in `ui_timezone` for one measure (plan 14.1 Traffic, 14.5 Heatmap).
+
+    The range is read at hour granularity; a range longer than `queries.MAX_POINTS` hours uses its most recent
+    hours, and says so in `notices`.
+    """
+    return await heatmap_answer(get_ctx(request), tr, metric)
+
+
+async def heatmap_answer(ctx: Any, tr: TimeRange, metric: str) -> dict[str, Any]:
+    """The `GET /traffic/heatmap` answer for one measure of `HEATMAP_METRICS` (anything else is a 422)."""
+    if metric not in HEATMAP_METRICS:
+        raise validation_error({"metric": f"Choose one of: {', '.join(HEATMAP_METRICS)}."}, "The metric is not valid.")
+    window = tr.window
+    notices: list[str] = []
+    start = window.start
+    if (window.end - start) // 3600 > queries.MAX_POINTS - 1:
+        start = window.end - (queries.MAX_POINTS - 1) * 3600
+        notices.append(f"Only the most recent {queries.MAX_POINTS - 1} hours of this range are shown.")
+    hourly = queries.resolve_window(None, now=window.end, tz=window.tz, start=start, end=window.end, granularity="hour")
+    data = await queries.series(ctx.dbs.metrics, hourly, metrics=[metric])
+    values = (data.get("groups") or {}).get("all", {}).get(metric, [])
+    return {
+        "range": tr.info(),
+        "read": range_info(hourly),
+        "metric": metric,
+        "label": METRICS[metric].label if metric in METRICS else metric,
+        "unit": METRICS[metric].unit if metric in METRICS else "",
+        "heatmap": read_dashboard.heatmap(data["buckets"], values, window.tz),
+        "notices": notices,
+    }
+
+
+@router.get("/latency")
+async def traffic_latency(
+    request: Request,
+    _admin: AdminSession,
+    tr: TimeRangeDep,
+    split: Annotated[str, Query(max_length=16)] = "none",
+) -> dict[str, Any]:
+    """p50, p95 and p99 latency over time (`split=none`), or p95 per verb, egress, host or outcome (row 131)."""
+    return await latency_answer(get_ctx(request), tr, split)
+
+
+async def latency_answer(ctx: Any, tr: TimeRange, split: str) -> dict[str, Any]:
+    """The `GET /traffic/latency` series for `split` (`none` or a key of `SPLITS`; anything else is a 422)."""
+    if split == "none":
+        answer = await _series_answer(ctx, tr, LATENCY_METRICS)
+    elif split in SPLITS:
+        answer = await _series_answer(ctx, tr, ["p95_ms"], group_by=SPLITS[split])
+    else:
+        choices = ", ".join(("none", *SPLITS))
+        raise validation_error({"split": f"Choose one of: {choices}."}, "The split is not valid.")
+    answer["split"] = split
+    answer["notices"].append(LATENCY_NOTE)
+    return answer
+
+
+LATENCY_NOTE: Final = (
+    "Latency is the time Roxy took to answer, Roblox's time included; it is measured per caller request, so "
+    "Roxy's own probes are not part of it."
+)
+"""What every latency answer says about its numbers (the last of its `notices`; the Traffic page shows it as the
+latency card's note, so the chart's notices list only resets)."""
+
+
+@router.get("/latency/split")
+async def traffic_latency_split(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(SPLIT_SPEC))],
+    fmt: ExportFormatDep,
+    by: Annotated[str, Query(max_length=16)] = "method",
+) -> Any:
+    """Latency percentiles per verb, egress, host or outcome as a table (v1 Proxy Timings, row 131)."""
+    if by not in SPLITS:
+        raise validation_error({"by": f"Choose one of: {', '.join(SPLITS)}."}, "The split is not valid.")
+    answer = await _dimension_table(request, admin, SPLIT_SPEC, SPLITS[by], tr, tq, fmt)
+    if isinstance(answer, dict):
+        answer["by"] = by
+    return answer
+
+
+async def _trend_period(ctx: Any, key: str, label: str, range_key: str) -> dict[str, Any]:
+    now = ctx.clock.now()
+    tz = str(ctx.settings.get("ui_timezone") or "UTC")
+    current = queries.resolve_window(range_key, now=now, tz=tz)
+    previous = queries.comparison_window(current, "previous")
+    spark_window = read_dashboard.sparkline_window(current)
+
+    def read(conn: sqlite3.Connection) -> dict[str, Any]:
+        # Only the trend metrics are summed (the rows show nothing else; plan 6.7, a year of day rows per period).
+        return {
+            "now": queries.totals_sync(conn, current, metrics=TREND_METRICS),
+            "before": queries.totals_sync(conn, previous, metrics=TREND_METRICS),
+            "spark": queries.series_sync(conn, spark_window, metrics=list(TREND_METRICS)),
+            "resets": queries.reset_annotations(conn, current.start, current.end),
+            "baseline_resets": queries.reset_annotations(conn, previous.start, previous.end),
+        }
+
+    data = await ctx.dbs.metrics.read(read)
+    now_totals, before_totals, spark = data["now"], data["before"], data["spark"]
+    values = (spark.get("groups") or {}).get("all", {})
+    rows = []
+    for metric in TREND_METRICS:
+        spec = METRICS.get(metric)
+        delta, delta_pct = _delta(now_totals.get(metric), before_totals.get(metric))
+        row = {
+            "metric": metric,
+            "label": spec.label if spec else metric,
+            "unit": spec.unit if spec else "",
+            "current": now_totals.get(metric),
+            "previous": before_totals.get(metric),
+            "delta": delta,
+            "delta_pct": delta_pct,
+            "good_direction": _good_direction(metric),
+            "sparkline": [[b, v] for b, v in zip(spark["buckets"], values.get(metric, []), strict=False)],
+        }
+        # Plan 6.8 (finding LOGICFIX-1): a reset of this metric's data in either period replaces the delta with a
+        # notice (`partial: true`), as the Overview tiles do.
+        queries.mark_kpi_partial(row, metric, data["resets"], data["baseline_resets"], tz)
+        rows.append(row)
+    reset_rows = queries.touching_resets([*data["resets"], *data["baseline_resets"]], TREND_METRICS)
+    return {
+        "key": key,
+        "label": label,
+        "range": range_info(current),
+        "previous_range": range_info(previous),
+        "sparkline_granularity": spark_window.granularity,
+        "sparkline_range": range_info(spark_window),
+        "rows": rows,
+        "notices": reset_notices(reset_rows, tz=tz),
+    }
+
+
+@router.get("/trends")
+async def traffic_trends(request: Request, _admin: AdminSession) -> dict[str, Any]:
+    """Week over week, month over month and year over year tables for the key metrics, with sparklines (14.3).
+
+    Each period is the trailing range (7, 30 or 365 days) compared with the same length just before it; the
+    global range picker does not apply here.
+    """
+    return await trends_answer(get_ctx(request))
+
+
+async def trends_answer(ctx: Any) -> dict[str, Any]:
+    """The `GET /traffic/trends` answer: the week, month and year periods, each against the one before it."""
+    periods = [await _trend_period(ctx, key, label, range_key) for key, label, range_key in TREND_PERIODS]
+    return {"periods": periods}
+
+
+__all__ = [
+    "ANSWERED_LOCALLY",
+    "ANSWERED_LOCALLY_HELP",
+    "ANSWERED_LOCALLY_LABEL",
+    "BYTE_METRICS",
+    "HEATMAP_METRICS",
+    "LATENCY_NOTE",
+    "OUTCOME_MEASURES",
+    "OUTCOME_READS",
+    "SOURCES_SPEC",
+    "SOURCE_LABELS",
+    "SPLITS",
+    "SPLIT_SPEC",
+    "STATUS_VIEWS",
+    "VERBS_SPEC",
+    "bytes_answer",
+    "dimension_table",
+    "heatmap_answer",
+    "latency_answer",
+    "outcome_lines",
+    "requests_answer",
+    "router",
+    "status_answer",
+    "status_source_rows",
+    "status_sources_answer",
+    "traffic_heatmap",
+    "traffic_trends",
+    "trends_answer",
+    "verbs_answer",
+]

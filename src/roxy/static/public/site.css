@@ -1,0 +1,662 @@
+/*
+ * Roxy public site styles (plan 16.1): one small file for the home page, the user guide and the status page.
+ *
+ * Light theme by default and a dark theme when the visitor's system asks for one (prefers-color-scheme), so the
+ * page follows the device with no script and no stored choice. The dark palette keeps v1's colors. System fonts
+ * only: no web fonts, nothing from another origin. The strict CSP (plan 9.2) allows styles from this file only,
+ * so the templates never use style attributes; every visual state is a class here.
+ */
+
+:root {
+	color-scheme: light dark;
+	--bg: #f5f7fb;
+	--surface: #ffffff;
+	--surface-2: #eef2f7;
+	--code-bg: #f0f3f8;
+	--text: #172030;
+	--text-dim: #3f4a5c;
+	--muted: #5b6678;
+	--border: #d6dde8;
+	--primary: #0a5fbd;
+	--primary-strong: #084c98;
+	--on-primary: #ffffff;
+	--note: #b58900;
+	--warning: #c62828;
+	--ok: #1e8e3e;
+	--degraded: #c77700;
+	--paused: #5d6b82;
+	--hl-keyword: #a3195b;
+	--hl-string: #116329;
+	--hl-number: #9a4600;
+	--hl-comment: #59636f;
+	--hl-builtin: #0a5aad;
+	--hl-type: #6b35b8;
+	--hl-operator: #0b6a70;
+	--shadow: 0 1px 3px rgba(16, 24, 40, 0.08);
+	--radius: 14px;
+	--font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans",
+		sans-serif;
+	--font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root {
+		--bg: #0b0f14;
+		--surface: #11161d;
+		--surface-2: #151b23;
+		--code-bg: #1a212b;
+		--text: #d9e2ee;
+		--text-dim: #b4bfcd;
+		--muted: #8e9aab;
+		--border: #26313f;
+		--primary: #7cc4ff;
+		--primary-strong: #9bd3ff;
+		--on-primary: #03131f;
+		--note: #e6d34a;
+		--warning: #ff6b6b;
+		--ok: #4cc472;
+		--degraded: #f0a73a;
+		--paused: #8b9bb4;
+		--hl-keyword: #ff7ab2;
+		--hl-string: #8ddb8c;
+		--hl-number: #f4a95c;
+		--hl-comment: #96a2b2;
+		--hl-builtin: #7cc4ff;
+		--hl-type: #d2a8ff;
+		--hl-operator: #56d4dd;
+		--shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+	}
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	html {
+		scroll-behavior: smooth;
+	}
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	background: var(--bg);
+	color: var(--text);
+	font: 16px/1.6 var(--font-sans);
+	-webkit-text-size-adjust: 100%;
+}
+
+a {
+	color: var(--primary);
+	text-underline-offset: 2px;
+}
+
+a:hover {
+	color: var(--primary-strong);
+}
+
+:focus-visible {
+	outline: 3px solid var(--primary);
+	outline-offset: 2px;
+}
+
+h1,
+h2,
+h3 {
+	line-height: 1.25;
+	scroll-margin-top: 16px;
+}
+
+h1 {
+	font-size: 2rem;
+	margin: 0 0 0.5rem;
+}
+
+h2 {
+	font-size: 1.35rem;
+	margin: 0;
+}
+
+h3 {
+	font-size: 1.1rem;
+	margin: 1.75rem 0 0.5rem;
+}
+
+code,
+pre {
+	font-family: var(--font-mono);
+	font-size: 0.9em;
+}
+
+code {
+	background: var(--code-bg);
+	border-radius: 6px;
+	padding: 0.1em 0.35em;
+	overflow-wrap: anywhere;
+}
+
+pre {
+	background: var(--code-bg);
+	border: 1px solid var(--border);
+	border-radius: 10px;
+	margin: 0.75rem 0;
+	padding: 14px 16px;
+	overflow-x: auto;
+	line-height: 1.5;
+	tab-size: 4;
+}
+
+pre code {
+	background: none;
+	padding: 0;
+	overflow-wrap: normal;
+	white-space: pre;
+}
+
+hr {
+	border: 0;
+	border-top: 1px solid var(--border);
+	margin: 1.25rem 0;
+}
+
+table {
+	border-collapse: collapse;
+	display: block;
+	margin: 1rem 0;
+	max-width: 100%;
+	overflow-x: auto;
+}
+
+th,
+td {
+	border: 1px solid var(--border);
+	padding: 6px 10px;
+	text-align: left;
+	vertical-align: top;
+}
+
+th {
+	background: var(--surface-2);
+}
+
+.align-center {
+	text-align: center;
+}
+
+.align-right {
+	text-align: right;
+}
+
+/* Layout */
+
+.wrap {
+	margin: 0 auto;
+	max-width: 900px;
+	padding: 0 16px;
+}
+
+.wrap.wide {
+	max-width: 1180px;
+}
+
+main.wrap {
+	padding-bottom: 48px;
+	padding-top: 24px;
+}
+
+.skip-link {
+	background: var(--surface);
+	left: 8px;
+	padding: 8px 12px;
+	position: absolute;
+	top: -48px;
+	z-index: 10;
+}
+
+.skip-link:focus {
+	top: 8px;
+}
+
+.visually-hidden {
+	clip: rect(0 0 0 0);
+	clip-path: inset(50%);
+	height: 1px;
+	overflow: hidden;
+	position: absolute;
+	white-space: nowrap;
+	width: 1px;
+}
+
+.site-header {
+	background: var(--surface);
+	border-bottom: 1px solid var(--border);
+}
+
+.bar {
+	align-items: center;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px 24px;
+	justify-content: space-between;
+	min-height: 56px;
+}
+
+.brand {
+	color: var(--text);
+	font-size: 1.15rem;
+	font-weight: 700;
+	text-decoration: none;
+}
+
+.site-nav {
+	display: flex;
+	gap: 18px;
+}
+
+.site-nav a {
+	text-decoration: none;
+}
+
+.site-nav a[aria-current="page"] {
+	color: var(--text);
+	font-weight: 600;
+}
+
+.site-footer {
+	border-top: 1px solid var(--border);
+	color: var(--muted);
+	padding: 16px 0 32px;
+}
+
+.footer-links {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 16px;
+	margin: 0;
+}
+
+/* Home */
+
+.hero {
+	padding: 24px 0 8px;
+}
+
+.tagline {
+	color: var(--text-dim);
+	font-size: 1.15rem;
+	margin: 0 0 1rem;
+}
+
+.actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px;
+}
+
+.button {
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	display: inline-block;
+	font-weight: 600;
+	padding: 8px 18px;
+	text-decoration: none;
+}
+
+.button-primary {
+	background: var(--primary);
+	border-color: var(--primary);
+	color: var(--on-primary);
+}
+
+.button-primary:hover {
+	background: var(--primary-strong);
+	color: var(--on-primary);
+}
+
+.card {
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	box-shadow: var(--shadow);
+	margin: 20px 0;
+	padding: 18px 20px;
+}
+
+.card > h2 {
+	margin-bottom: 0.75rem;
+}
+
+.card summary {
+	cursor: pointer;
+	list-style: none;
+	position: relative;
+	padding-left: 26px;
+}
+
+.card summary::-webkit-details-marker {
+	display: none;
+}
+
+.card summary::before {
+	border-bottom: 2px solid var(--muted);
+	border-right: 2px solid var(--muted);
+	content: "";
+	height: 9px;
+	left: 4px;
+	position: absolute;
+	top: 0.55em;
+	transform: rotate(-45deg);
+	width: 9px;
+}
+
+.card details[open] > summary::before {
+	transform: rotate(45deg);
+}
+
+.card summary h2 {
+	display: inline;
+}
+
+.card-body {
+	margin-top: 0.75rem;
+}
+
+.lead {
+	color: var(--text-dim);
+	font-size: 1.05rem;
+}
+
+.note,
+.warning {
+	border-left: 4px solid var(--note);
+	padding-left: 14px;
+}
+
+.warning {
+	border-left-color: var(--warning);
+}
+
+.muted {
+	color: var(--muted);
+}
+
+.facts {
+	padding-left: 1.2rem;
+}
+
+.facts li {
+	margin: 0.4rem 0;
+}
+
+/* Code blocks get a Copy button from site.js; the wrapper anchors it. */
+
+.code {
+	position: relative;
+}
+
+.code pre {
+	padding-right: 84px;
+}
+
+.copy-button {
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	color: var(--text);
+	cursor: pointer;
+	font: 600 0.8rem var(--font-sans);
+	padding: 4px 12px;
+	position: absolute;
+	right: 8px;
+	top: 8px;
+}
+
+.copy-button:hover {
+	background: var(--surface-2);
+}
+
+/*
+ * Luau highlighting. roxy/public/luau_highlight.py wraps tokens in spans with one-letter classes inside
+ * <code class="hl">: k keyword, s string, n number, c comment, b built-in, t type, o operator, i the braces of
+ * an interpolation in a backtick string. Every color keeps at least 4.5:1 against --code-bg in both themes
+ * (WCAG 1.4.3; tests/unit/public/test_public_assets.py checks it). Comments are also italic, so they differ by
+ * more than color.
+ */
+.hl .k {
+	color: var(--hl-keyword);
+}
+
+.hl .s {
+	color: var(--hl-string);
+}
+
+.hl .n {
+	color: var(--hl-number);
+}
+
+.hl .c {
+	color: var(--hl-comment);
+	font-style: italic;
+}
+
+.hl .b {
+	color: var(--hl-builtin);
+}
+
+.hl .t {
+	color: var(--hl-type);
+}
+
+.hl .o,
+.hl .i {
+	color: var(--hl-operator);
+}
+
+/* User guide */
+
+.docs-layout {
+	display: grid;
+	gap: 32px;
+	grid-template-columns: minmax(0, 1fr);
+}
+
+.toc {
+	font-size: 0.92rem;
+}
+
+.toc summary {
+	cursor: pointer;
+	font-weight: 700;
+}
+
+.toc ol {
+	list-style: none;
+	margin: 0.5rem 0 0;
+	padding: 0;
+}
+
+.toc li {
+	margin: 0.2rem 0;
+}
+
+.toc a {
+	text-decoration: none;
+}
+
+.toc-level-3 {
+	padding-left: 14px;
+}
+
+.doc {
+	min-width: 0;
+}
+
+/* A guide heading and its section link sit side by side in one wrapper; the link is outside the heading, so a
+   screen reader announces the title once. */
+.heading {
+	align-items: baseline;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0 0.5rem;
+}
+
+.heading > h2,
+.heading > h3 {
+	margin: 0;
+}
+
+.doc .heading-h2 {
+	border-top: 1px solid var(--border);
+	margin: 2.25rem 0 0.75rem;
+	padding-top: 1.25rem;
+}
+
+.doc .heading-h3 {
+	margin: 1.75rem 0 0.5rem;
+}
+
+/* Full strength muted text (5.3:1 light, 6.7:1 dark), never faded: it is still text people need to see. */
+.anchor {
+	color: var(--muted);
+	font-weight: 400;
+	text-decoration: none;
+}
+
+.heading:hover .anchor,
+.anchor:focus-visible {
+	color: var(--primary);
+}
+
+@media (min-width: 960px) {
+	.docs-layout {
+		grid-template-columns: 240px minmax(0, 1fr);
+	}
+
+	.toc {
+		align-self: start;
+		max-height: calc(100vh - 32px);
+		overflow-y: auto;
+		position: sticky;
+		top: 16px;
+	}
+}
+
+/* Status */
+
+.status-banner {
+	border: 1px solid var(--border);
+	border-left: 6px solid var(--ok);
+	border-radius: var(--radius);
+	background: var(--surface);
+	margin: 16px 0;
+	padding: 16px 20px;
+}
+
+.status-banner h2 {
+	align-items: center;
+	display: flex;
+	gap: 10px;
+}
+
+.dot {
+	background: var(--ok);
+	border-radius: 50%;
+	display: inline-block;
+	height: 14px;
+	width: 14px;
+}
+
+.state-degraded {
+	border-left-color: var(--degraded);
+}
+
+.state-degraded .dot {
+	background: var(--degraded);
+}
+
+.state-paused,
+.state-maintenance {
+	border-left-color: var(--paused);
+}
+
+.state-paused .dot,
+.state-maintenance .dot {
+	background: var(--paused);
+}
+
+/*
+ * The 24 hour bar. Color is never the only cue (WCAG 1.4.1): each state also has its own fill pattern, which the
+ * legend swatches repeat, and its own height in the bar (bars stand on a common baseline, tallest when all is
+ * well). Every fill and the "no data" outline keep at least 3:1 against the card in both themes (WCAG 1.4.11).
+ *   operational: solid, full height    degraded: diagonal stripes, 2/3 height
+ *   paused or maintenance: horizontal bands, 1/2 height    no data: dashed outline, no fill, full height
+ */
+.uptime {
+	align-items: end;
+	display: grid;
+	gap: 3px;
+	grid-template-columns: repeat(24, minmax(0, 1fr));
+	list-style: none;
+	margin: 0.75rem 0 0.25rem;
+	padding: 0;
+}
+
+.cell {
+	border-radius: 3px;
+	height: 36px;
+}
+
+.cell-operational {
+	background: var(--ok);
+}
+
+.cell-degraded {
+	background: repeating-linear-gradient(135deg, var(--degraded) 0 4px, var(--surface) 4px 6px);
+}
+
+.cell-paused,
+.cell-maintenance {
+	background: repeating-linear-gradient(0deg, var(--paused) 0 3px, var(--surface) 3px 5px);
+}
+
+.cell-none {
+	background: transparent;
+	border: 1px dashed var(--muted);
+}
+
+.uptime .cell-degraded {
+	height: 24px;
+}
+
+.uptime .cell-paused,
+.uptime .cell-maintenance {
+	height: 18px;
+}
+
+.uptime-axis {
+	color: var(--muted);
+	display: flex;
+	font-size: 0.85rem;
+	justify-content: space-between;
+	margin: 0;
+}
+
+.legend {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 18px;
+	list-style: none;
+	margin: 0.75rem 0 0;
+	padding: 0;
+}
+
+.swatch {
+	border-radius: 3px;
+	display: inline-block;
+	height: 12px;
+	margin-right: 6px;
+	vertical-align: -1px;
+	width: 12px;
+}

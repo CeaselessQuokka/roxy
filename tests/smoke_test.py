@@ -803,7 +803,7 @@ r = client.get("/admin/diagnostics", headers={**IP_MAIN, "Accept": "application/
 rc = r.get_json().get("RetryCounts", {})
 check("No 429 retries recorded", "429" not in (rc.get("ByStatusCode") or {}), rc.get("ByStatusCode"))
 
-# CSRF handshake (a required protocol step for writes) must still work — via Rotate.
+# CSRF handshake (a required protocol step for writes) must still work, via Rotate.
 reset_routing()
 set_method_weights(0, 100)  # force Rotate
 
@@ -1258,7 +1258,7 @@ check(
     r.get_json().get("ExploitAttempts", [])[-3:],
 )
 # A real .ROBLOSECURITY value (Roblox's own literal warning prefix) smuggled via
-# ANY header — not just X-Roblox-Token — must be caught and rejected too.
+# ANY header (not just X-Roblox-Token) must be caught and rejected too.
 n = len(upstream_calls)
 r = api_client.get(
     "/games.roblox.com/v1/auth-test-2",
@@ -1440,7 +1440,7 @@ IP_THR = {"X-Forwarded-For": "10.70.0.1"}
 statuses = [api_client.get(f"/games.roblox.com/v1/thr{i}", headers=IP_THR).status_code for i in range(6)]
 check("Over the shared per-IP limit returns 429", statuses[-1] == 429, statuses)
 # A SECOND worker (independent store object on the SAME file) sees the same count
-# — proving the limit lives in shared state, not per-worker memory.
+# proving the limit lives in shared state, not per-worker memory.
 worker_b = lockfile_module.LockedJSON(lambda: config.THROTTLE_FILE)
 entry_b = worker_b.read().get("Ips", {}).get("10.70.0.1", {})
 check("Per-IP count lives in the shared file (worker B sees it)", entry_b.get("Requests", 0) >= 4, entry_b)
@@ -2027,7 +2027,7 @@ tarpit_module._store.update(lambda data: data.setdefault("Slots", {}).update({"d
 check("An expired lease is not counted as active", tarpit_module.active_holds() == 0)
 check("...and is reclaimed by the next admission", tarpit_module.hold("10.44.2.1", "probe") > 0)
 
-# If the shared file is unavailable, LockedJSON degrades to a throwaway dict —
+# If the shared file is unavailable, LockedJSON degrades to a throwaway dict,
 # which would make every worker think it holds the only slot. Fail closed.
 import lockfile as lockfile_module  # noqa: E402
 
@@ -2122,7 +2122,7 @@ check("Each worker reports its own uptime", row.get("Uptime", 0) >= 0, row)
 check("Each worker reports how many requests it has served", row.get("Requests", 0) > 0, row)
 
 # The two counters must not be the same number. "All" includes the dashboard
-# polling itself, so on an idle proxy it climbs on its own — which reads as
+# polling itself, so on an idle proxy it climbs on its own, which reads as
 # traffic unless proxy requests are counted separately.
 before = workers_module.get_state()
 for _ in range(6):
@@ -2225,7 +2225,7 @@ def clear_all_diag():
     capture_module.reset()
     # The response cache is ON by default, so a section that re-requests a URL an
     # earlier section already fetched would be served from cache and see no
-    # upstream call at all — which reads as "the proxy stopped working" rather
+    # upstream call at all, which reads as "the proxy stopped working" rather
     # than "the cache worked". Sections that mean to test the cache turn it on
     # explicitly.
     cache_module.clear()
@@ -2272,7 +2272,7 @@ sources = diag()["StatusSources"]
 check("Our own 403 is counted under Roxy, not Roblox", sources["Roxy"].get("403") == 1, sources)
 check("...and never leaks into Roblox's column", "403" not in sources["Roblox"], sources)
 
-# A 429 from Roblox and a 429 from us must be distinguishable — this is the whole
+# A 429 from Roblox and a 429 from us must be distinguishable; this is the whole
 # point of the split, because the two demand opposite actions.
 clear_all_diag()
 reset_routing()
@@ -2745,7 +2745,7 @@ check("Both lookup hops go through the proxy stack", len(lookup_calls) == 2, loo
 r = client.post("/admin/lookup/place", headers={**IP_MAIN, "Accept": "application/json"}, json={"id": "not-a-number"})
 check("A non-numeric ID is rejected, not proxied", r.status_code == 400, r.status_code)
 
-# The lookup has to work when the proxy path CANNOT serve — which is exactly
+# The lookup has to work when the proxy path CANNOT serve, which is exactly
 # when it is reached for: you identify whoever is hammering you at the moment
 # the token budget is spent and every method is busy. A tool that only works
 # while nothing is wrong never works when it matters.
@@ -3031,7 +3031,7 @@ rules = r.get_json()["UserAgentRules"]
 check("...keeping its id and taking the new settings", rules[COOLDOWN_ID]["Kind"] == "burst" and rules[COOLDOWN_ID]["Limit"] == 1, rules[COOLDOWN_ID])
 check("...without creating a second rule", len(rules) == 1, rules)
 
-# A "global" rule pools every IP behind one budget — the only thing that works
+# A "global" rule pools every IP behind one budget: the only thing that works
 # on a bot that rotates addresses.
 client.post(
     "/admin/throttle/user_agent",
@@ -3316,8 +3316,8 @@ THROTTLE_URL = "/games.roblox.com/v1/games/throttle-cache"
 runtime.set_setting("cache_serve_throttled", 0)
 runtime.set_setting("allowed_requests_per_minute", 1)
 runtime.set_setting("throttle_reset_duration", 60)
-# A cache HIT still counts toward the per-IP limit — the cache decides where an
-# allowed answer comes from, never who is allowed one — so the quota runs out
+# A cache HIT still counts toward the per-IP limit (the cache decides where an
+# allowed answer comes from, never who is allowed one), so the quota runs out
 # whether the answers came from Roblox or from us.
 refused = None
 for _ in range(4):

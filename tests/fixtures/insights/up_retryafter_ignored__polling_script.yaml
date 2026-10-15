@@ -1,0 +1,175 @@
+# UP-RETRYAFTER-IGNORED: one client hammers a key that is cooling down (format: README.md in this directory).
+#
+# 11.5: "Same client retries the same key within the advertised Retry-After > 20 times per 10 min"; evidence:
+# client list; change: "Enable tarpit_on_upstream_cooldown_retry (10.6, jitter type) or throttle_strike_on_retry";
+# confidence medium. throttle_strike_on_retry is already 1 (its default), so the only change left is the tarpit
+# category, written either as the setting or as a `tarpit_category` change (README "Extensions"). Both are global
+# switches, so the recommendation is not safe_auto. 11.5 also notes this reduces Roxy load, not Roblox 429s: no
+# bucket, ban or routing change belongs here.
+#
+# Timeline (GET games.roblox.com/v1/games, direct only: rotator_enabled = 0, no cache rule, so no stale copy):
+#   -8m30s  a game server's call gets Roblox 429, Retry-After 300 s: cooldown until -3m30s     trigger_429
+#   -8m to -4m  198.51.100.23 asks for the same key every 5 s: 48 requests, all answered 429    poll_early
+#               with Retry-After, 47 of them after it was told to wait (a script ignoring it)
+#   -8m to -7m  40 game servers ask once each for their own key and get 429 with Retry-After    servers_wait
+#   -3m to -2m  the same 40 servers come back after the Retry-After and are served               servers_back
+#   -8m to -4m  198.51.100.77 retries 12 times early (below the threshold; one of the "others")  slow_poll
+
+format: roxy.insight_fixture/1
+rule: UP-RETRYAFTER-IGNORED
+case: polling_script
+description: >
+  While games.roblox.com/v1/games cools down after a Roblox 429 with Retry-After 300 s, one client keeps asking
+  for the same key every 5 seconds (47 early retries in 4 minutes) while 40 game servers wait as told. The rule
+  must recommend enabling the upstream_cooldown_retry tarpit category, without bans, bucket or routing changes,
+  and not as safe_auto.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_enabled: 0
+  tarpit_enabled: 1
+  tarpit_on_upstream_cooldown_retry: 0
+  throttle_strike_on_retry: 1
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  places: ["1000000001"]
+  endpoint_template: games.roblox.com/v1/games
+
+profiles:
+  cooldown_429:
+    egress: none
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    error: true
+    latency_ms: 2
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 150, p95: 400, p99: 800}}
+
+traffic:
+  - name: trigger_429
+    client_ip: "203.0.113.200"
+    window: ["-9m", "-8m"]
+    total: 1
+    egress: direct
+    outcome: failed
+    reason: upstream_cooldown
+    status: 429
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    upstream_429: {egress: direct, retry_after_s: 300}
+    samples: {key_space: trigger, keys: 1}
+  - name: poll_early
+    profile: cooldown_429
+    client_ip: "198.51.100.23"
+    user_agent: "python-requests/2.32.3"
+    window: ["-8m", "-4m"]
+    per_minute: 12
+    samples: {key_space: poll_key, keys: 1}
+  - name: slow_poll
+    profile: cooldown_429
+    client_ip: "198.51.100.77"
+    window: ["-8m", "-4m"]
+    total: 13
+    samples: {key_space: slow_key, keys: 1}
+  - name: servers_wait
+    profile: cooldown_429
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    window: ["-8m", "-7m"]
+    total: 40
+    samples: {key_space: server_keys, keys: 40}
+  - name: servers_back
+    profile: miss
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    window: ["-3m", "-2m"]
+    total: 40
+    samples: {key_space: server_keys, keys: 40}
+  - name: poll_after
+    profile: miss
+    client_ip: "198.51.100.23"
+    user_agent: "python-requests/2.32.3"
+    window: ["-3m", "0m"]
+    per_minute: 1
+    samples: {key_space: poll_key, keys: 1}
+  # Unrelated traffic.
+  - name: headshot_miss
+    profile: miss
+    endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    window: ["-60m", "0m"]
+    per_minute: 20
+
+state:
+  cooldowns:
+    - {key: "endpoint:games.roblox.com/v1/games:direct", until: "-210s", source: retry_after, set_at: "-510s", hits: 1}
+  settings_history:
+    - {at: "-30d", key: rotator_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "No rotator plan yet."}
+
+expect:
+  data_checks:
+    - window: ["-10m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games, reason: upstream_cooldown}
+      requests: 102
+      upstream_calls: 1
+      roblox_429: 1
+    - window: ["-10m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games, egress: none}
+      requests: 101
+    - window: ["-60m", "-10m"]
+      roblox_429: 0
+
+  fires: true
+  others: forbid
+  recommendations:
+    - confidence: medium
+      family: upstream
+      safe_auto: false
+      change_kinds_forbidden: [ban_add, bucket_override, routing_rule, rule_upsert, filter_add, credential_allowlist_remove]
+      changes_required:
+        - any_of:
+            - {kind: setting, key: tarpit_on_upstream_cooldown_retry, current: 0, proposed: 1}
+            - {kind: tarpit_category, category: upstream_cooldown_retry, current: 0, proposed: 1}
+      changes_forbidden:
+        - {kind: setting, key: throttle_strike_on_retry}     # already 1: nothing to enable
+        - {kind: setting, key: tarpit_enabled, proposed: 0}
+        - kind: setting
+          key: {in: [allowed_requests_per_minute, endpoint_bucket_default_per_min, global_bucket_per_min, direct_bucket_per_min]}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_retryafter_ignored_enabled: 0}
+    expect: {fires: false}
+  - case: min_retries_60
+    description: 47 early retries (48 requests) are below a minimum of 60.
+    settings: {insight_up_retryafter_ignored_min_retries: 60}
+    expect: {fires: false}
+  - case: window_3_after_cooldown
+    description: The early retries ended 4 minutes ago; a 3 minute window holds none.
+    settings: {insight_up_retryafter_ignored_window_min: 3}
+    expect: {fires: false}
+  - case: strike_on_retry_off
+    description: With throttle_strike_on_retry off, enabling it is the other change 11.5 allows.
+    settings: {throttle_strike_on_retry: 0}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - safe_auto: false
+          changes_required:
+            - any_of:
+                - {kind: setting, key: tarpit_on_upstream_cooldown_retry, current: 0, proposed: 1}
+                - {kind: tarpit_category, category: upstream_cooldown_retry, current: 0, proposed: 1}
+                - {kind: setting, key: throttle_strike_on_retry, current: 0, proposed: 1}
+  - case: tarpit_category_already_on
+    description: >
+      With the tarpit category already on and throttle_strike_on_retry on, both remedies 11.5 names are in place:
+      there is nothing left to recommend.
+    settings: {tarpit_on_upstream_cooldown_retry: 1}
+    expect: {fires: false}

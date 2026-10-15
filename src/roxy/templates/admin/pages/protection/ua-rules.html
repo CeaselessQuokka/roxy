@@ -1,0 +1,61 @@
+{#-
+  Protection page, card `ua-rules` (`roxy/admin/pages/protection.py ua_rules_card`): v1 "Client rules (by
+  User-Agent)" with its tester (row 44).
+
+  What: the rules in evaluation order (`GET /protection/ua-rules`; the first enabled rule that matches decides),
+  each with its limit, scope, message, its allowed and refused counts and hits in the range; "Add a rule" (`POST
+  /ua-rules`); the Tester tab (`POST /ua-rules/test`, run by static/js/pages/protection.js: which rule would limit
+  a User-Agent, and whether a draft rule would catch it); a row opens the rule in the drawer (edit, switch off,
+  move, remove). The master switch `user_agent_rules_enabled` sits below with this card's settings.
+  Context: `frame`, `table`, `only`, `rules_enabled`, `active`, `api`; for the drawer `detail`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/icon.html" import icon %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/glossary.html" import term with context %}
+{% from "admin/pages/protection/_macros.html" import tabs, tab_panel, reason_field %}
+{% from "admin/pages/protection/_rule_fields.html" import ua_fields %}
+{% if detail %}{% include "admin/pages/protection/_rule_drawer.html" %}
+{% elif only %}{{ data_table(**table) }}{% else %}
+{% set actions %}<button type="button" class="btn btn--sm btn--primary" data-dialog-open="dlg-prot-ua-add" aria-haspopup="dialog" data-action="ua-add">{{ icon("plus") }}<span>Add a rule</span></button>{% endset %}
+{% call page_card(frame, actions=actions, subtitle=(active ~ " client rule" ~ ("s" if active != 1 else "") ~ " active") ~ ("" if rules_enabled else "; every rule is paused by the switch below")) %}
+<p>A {{ term("ua-rule", "User-Agent rule") }} gives one kind of client its own limit: a {{ term("burst", "burst") }} allowance (N requests per P seconds, for a scraper that works in batches) or a {{ term("cooldown", "cooldown") }} (a minimum gap, for a bot that hammers steadily). The first enabled rule that matches decides; the ordinary per-IP limit still applies too. {% if not rules_enabled %}{{ status_badge("warn", "All rules are paused") }}{% endif %}</p>
+{% call tabs("prot-ua-tabs", [("rules", "Rules"), ("tester", "Tester")], "User-Agent rule views") %}
+  {% call tab_panel("prot-ua-tabs", "rules", first=True) %}{{ data_table(**table) }}{% endcall %}
+  {% call tab_panel("prot-ua-tabs", "tester") %}
+  <form class="prot-pad stack prot-tester" data-prot-tester="ua" data-api-url="{{ api.test }}" novalidate>
+    <div class="field">
+      <label class="field__label" for="ua-test-value">User-Agent to try</label>
+      <input class="input mono" id="ua-test-value" name="user_agent" required aria-required="true" maxlength="2000" autocomplete="off" spellcheck="false" placeholder="python-requests/2.31.0" aria-describedby="ua-test-value-error">
+      <p class="field__error" id="ua-test-value-error" data-field-error="user_agent" hidden></p>
+    </div>
+    <details class="details-plain">
+      <summary>Also try a rule I am writing</summary>
+      <div class="field-row">
+        <div class="field">
+          <label class="field__label" for="ua-test-needle">Draft rule text</label>
+          <input class="input mono" id="ua-test-needle" data-draft="needle" maxlength="200" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label class="field__label" for="ua-test-mode">Match</label>
+          <select class="input" id="ua-test-mode" data-draft="mode"><option value="contains">Contains</option><option value="exact">Exact</option><option value="regex">Regex</option></select>
+        </div>
+      </div>
+      <p class="field__hint">The draft is judged with the saved rules but is not saved. Leave the text empty to test the saved rules only.</p>
+    </details>
+    <div class="cluster"><button type="submit" class="btn btn--primary" data-action="ua-test">{{ icon("search") }}<span>Test</span></button></div>
+    <div class="prot-result" data-tester-result aria-live="polite"></div>
+  </form>
+  {% endcall %}
+{% endcall %}
+{% call confirm_dialog("dlg-prot-ua-add", "Add a User-Agent rule", api.create, confirm_label="Add rule", api=True,
+                       success="Rule added.", on_success="refresh", refresh="ua-rules",
+                       consequences=["Requests whose User-Agent matches get this rule's limit from now on, on every worker within a second.",
+                                     "The rule goes to the end of the order; move it earlier from its details."]) %}
+  {{ ua_fields("dlg-prot-ua-add") }}
+  {{ reason_field("dlg-prot-ua-add-reason") }}
+{% endcall %}
+{% endcall %}
+{% endif %}

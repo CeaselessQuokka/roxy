@@ -1,0 +1,50 @@
+format: roxy.health_fixture/1
+check: H-ROTATOR-QUOTA
+case: fail
+name: projected_overrun
+description: >
+  Six and a half days into the cycle the rotator has used 6.6 GB of 20 GB, so 67% remains, but at about 1 GB
+  per day the cycle projects to about 31 GB. 13.2 H-ROTATOR-QUOTA: a projected overrun gives fail even with
+  plenty remaining today. Variants: a 50 GB quota absorbs the projection (about 31 of 50, 87% remaining now)
+  and passes; a 6.8 GB quota leaves under 10% remaining (also when a GB is read as 2^30 bytes) and fails on that alone.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  settings:
+    rotator_enabled: 1
+    rotator_weight: 25
+    rotator_quota_gb_per_month: 20
+    rotator_billing_day: 1
+    rotator_price_per_gb_usd: 3
+    ui_timezone: "UTC"
+  state:
+    egress:
+      usage:
+        - &day1000 {egress: rotator, granularity: day, at: "2026-10-01", requests: 100000, req_bytes: 20000000, resp_bytes: 980000000, overhead_bytes: 0}
+        - {<<: *day1000, at: "2026-10-02"}
+        - {<<: *day1000, at: "2026-10-03"}
+        - {<<: *day1000, at: "2026-10-04"}
+        - {<<: *day1000, at: "2026-10-05"}
+        - {<<: *day1000, at: "2026-10-06"}
+        - {egress: rotator, granularity: day, at: "2026-10-07", requests: 60000, req_bytes: 12000000, resp_bytes: 588000000, overhead_bytes: 0}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)egress"}
+  credential_calls: {eq: 0}
+variants:
+  - case: pass
+    name: quota_raised_to_50
+    inputs:
+      settings:
+        rotator_quota_gb_per_month: 50
+    expect:
+      status: pass
+  - case: fail
+    name: under_10_percent_left
+    inputs:
+      settings:
+        rotator_quota_gb_per_month: 6.8
+    expect:
+      status: fail
+      value: {lt: 10}
+      explanation: {present: true}

@@ -1,0 +1,24 @@
+format: roxy.health_fixture/1
+check: H-WORKERS
+case: warn
+name: one_stale
+description: >
+  Four workers are expected; three beat in the last 5 s and one (pid 41004) last beat 45 s ago, past the 20 s
+  freshness limit, and no replacement has appeared. 13.2 H-WORKERS: one stale gives warn, with the System page
+  as the fix. Four workers keep "one stale" distinct from "none fresh other than self" (with two workers they
+  would be the same situation).
+now: "2026-10-07T15:00:00Z"
+inputs:
+  env:
+    ROXY_WORKERS: "4"
+  state:
+    workers:
+      - {pid: 41001, worker_id: "roxy-test:41001:a1b2c3d4", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-1s", loop_lag_ms_p99: 6, open_conns: 40, is_leader: 1, version: "3f9c2a1", x_self: true}
+      - {pid: 41002, worker_id: "roxy-test:41002:b2c3d4e5", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-2d", last_seen: "-2s", loop_lag_ms_p99: 7, open_conns: 38, is_leader: 0, version: "3f9c2a1"}
+      - {pid: 41003, worker_id: "roxy-test:41003:c3d4e5f6", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-3h", last_seen: "-4s", loop_lag_ms_p99: 5, open_conns: 35, is_leader: 0, version: "3f9c2a1"}
+      - {pid: 41004, worker_id: "roxy-test:41004:d4e5f6a7", hostname: roxy-test, color: blue, master_pid: 41000, started_at: "-9h", last_seen: "-45s", loop_lag_ms_p99: 950, open_conns: 41, is_leader: 0, version: "3f9c2a1"}
+expect:
+  status: warn
+  explanation: {present: true}
+  fix_link: {regex: "(?i)system"}
+  credential_calls: {eq: 0}

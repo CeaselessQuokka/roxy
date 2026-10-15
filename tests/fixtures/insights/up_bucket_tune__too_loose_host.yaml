@@ -1,0 +1,93 @@
+# UP-BUCKET-TUNE, too loose, where the 7.3 correlation check blames the host (format: README.md here).
+#
+# 7.3: "If 3 or more templates of one host 429 within 60 s, it lowers host:<host> instead". Twenty minutes ago
+# three games.roblox.com templates got Roblox 429s within the same minute (two each), and nothing else did. The
+# 429s are attributed to host:games.roblox.com, which runs at its default (host_bucket_default_per_min, 240; no
+# upstream_limits row), so the proposal is that host bucket lowered by 30% to 168 per minute. The three endpoint
+# buckets must not be cut (the host is to blame), and no global default may change.
+
+format: roxy.insight_fixture/1
+rule: UP-BUCKET-TUNE
+case: too_loose_host
+description: >
+  Three games.roblox.com endpoints were rate-limited by Roblox within one minute. The rule must attribute the
+  429s to the host and propose lowering host:games.roblox.com by 30% (240 to 168 per minute), with no change to
+  the endpoints' own buckets.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  adaptive_rate_enabled: 0
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+
+profiles:
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 200, p95: 500, p99: 900}}
+  stale_429:
+    egress: direct
+    outcome: served_cache
+    reason: cache_stale_error
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    upstream_status: 429
+    upstream_calls: 1
+    error: true
+    upstream_429: {egress: direct, retry_after_s: 20}
+
+traffic:
+  - {name: list_ok, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 80}
+  - {name: votes_ok, profile: miss, endpoint_template: games.roblox.com/v1/games/votes, window: ["-60m", "0m"], per_minute: 60}
+  - {name: favorites_ok, profile: miss, endpoint_template: "games.roblox.com/v1/games/{gameId}/favorites/count", window: ["-60m", "0m"], per_minute: 60}
+  - {name: list_429, profile: stale_429, endpoint_template: games.roblox.com/v1/games, window: ["-20m", "-19m"], total: 2}
+  - {name: votes_429, profile: stale_429, endpoint_template: games.roblox.com/v1/games/votes, window: ["-20m", "-19m"], total: 2}
+  - {name: favorites_429, profile: stale_429, endpoint_template: "games.roblox.com/v1/games/{gameId}/favorites/count", window: ["-20m", "-19m"], total: 2}
+  - {name: thumbs_ok, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], per_minute: 50}
+
+state:
+  buckets:
+    - bucket_key: "host:games.roblox.com"
+      per_min: 240
+      burst: 15
+      fill_pct: 60
+      history:
+        - {window: ["-60m", "0m"], fill_pct_peak: 100, attempts: 12006, rejections: 0}
+  cooldowns:
+    - {key: "host:games.roblox.com:direct", until: "-19m", source: retry_after, set_at: "-20m", hits: 3}
+  settings_history:
+    - {at: "-30d", key: adaptive_rate_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "Bucket rates by hand for now."}
+
+expect:
+  data_checks:
+    - window: ["-20m", "-19m"]
+      where: {host: games.roblox.com}
+      roblox_429: 6
+    - window: ["-48h", "0m"]
+      roblox_429: 6
+
+  fires: true
+  others: forbid
+  recommendations:
+    - subject_contains: "games.roblox.com"
+      confidence: medium
+      family: upstream
+      change_kinds_required: [bucket_override]
+      change_kinds_forbidden: [setting, routing_rule, ban_add]
+      exact_changes: true
+      changes_required:
+        - kind: bucket_override
+          bucket_key: "host:games.roblox.com"
+          current: {per_min: 240}
+          proposed: {per_min: {between: [166, 170]}}   # -30%: 168
+      changes_forbidden:
+        - kind: bucket_override
+          bucket_key: {regex: "^endpoint:"}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_bucket_tune_enabled: 0}
+    expect: {fires: false}

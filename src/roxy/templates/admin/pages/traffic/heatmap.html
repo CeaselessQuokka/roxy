@@ -1,0 +1,25 @@
+{#-
+  Traffic page, card `heatmap` (`roxy/admin/pages/traffic.py heatmap_card`; plan 14.1 Traffic, 14.5 Heatmap).
+
+  Hour of day by weekday in `ui_timezone` for one measure (requests by default; demand, upstream calls, served
+  from the cache, refused or failed through the small form, which asks this card's fragment again). The grid is a
+  real table with row and column headers, so "Show numbers" turns the same cells into the accessible table
+  alternative (components/heatmap.html); the summary names the busiest hour and how many of each weekday the range
+  covered (each cell is a sum over them). Long ranges use their most recent hours and say so (the answer's
+  notices). Context: `frame`, `answer`, `rows`, `cols`, `cells`, `label`, `unit`, `metric`, `choices`, `summary`,
+  `covered`, `help`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/heatmap.html" import heatmap %}
+{% call page_card(frame, notices=answer.notices or []) %}
+<form class="card-controls" hx-get="{{ frame.fragment_url }}" hx-target="#{{ frame.id }}" hx-swap="outerHTML" hx-trigger="change">
+  <label class="chip-select">
+    <span class="chip-select__label">Measure</span>
+    <select id="traffic-heatmap-metric" name="metric" aria-label="What the busiest hours grid counts">
+      {% for value, text in choices %}<option value="{{ value }}"{% if value == metric %} selected{% endif %}>{{ text }}</option>{% endfor %}
+    </select>
+  </label>
+</form>
+{{ heatmap("traffic-heatmap-grid", label ~ " by weekday and hour", rows, cols, cells, unit=unit, summary=summary, help=help, corner="Day", col_labels_every=3) }}
+{% if covered %}<p class="muted traffic-note">Each cell adds up that hour over {{ covered }} in this range.</p>{% endif %}
+{% endcall %}

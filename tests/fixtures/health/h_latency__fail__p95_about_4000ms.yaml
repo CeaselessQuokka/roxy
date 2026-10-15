@@ -1,0 +1,56 @@
+format: roxy.health_fixture/1
+check: H-LATENCY
+case: fail
+name: p95_about_4000ms
+description: >
+  Roblox slowed down 15 minutes ago: the upstream calls in the last 15 minutes have a p95 of about 4,000 ms
+  (bucket 3,000 to 5,000 ms). 13.2 H-LATENCY: 2,500 ms or more gives fail. The healthy hour before (p95 about
+  900 ms) must not dilute the result.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  traffic_defaults:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    user_agent: "Roblox/Linux"
+  profiles:
+    hit:
+      egress: none
+      outcome: served_cache
+      reason: cache_hit
+      status: 200
+      source: cache
+      cache_state: "HIT"
+      latency_ms: {p50: 3, p95: 9, p99: 20}
+    miss:
+      egress: direct
+      outcome: served_upstream
+      reason: upstream_ok
+      status: 200
+      source: relay
+      cache_state: "MISS"
+      upstream_calls: 1
+  traffic:
+    - name: games_miss_recent_slow
+      profile: miss
+      endpoint_template: games.roblox.com/v1/games
+      window: ["-15m", "0m"]
+      per_minute: 40
+      latency_ms: {p0: 150, p50: 800, p90: 3200, p95: 4000, p99: 6000, p100: 7000}
+    - {name: games_hit_recent, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-15m", "0m"], per_minute: 25}
+    - name: games_miss_earlier_fast
+      profile: miss
+      endpoint_template: games.roblox.com/v1/games
+      window: ["-75m", "-15m"]
+      per_minute: 40
+      latency_ms: {p0: 60, p50: 400, p90: 760, p95: 900, p99: 990, p100: 1000}
+expect:
+  data_checks:
+    - window: ["-15m", "0m"]
+      requests: 975
+      upstream_calls: 600
+    - window: ["-75m", "-15m"]
+      requests: 2400
+      upstream_calls: 2400
+  status: fail
+  value: {gte: 2500}
+  explanation: {present: true}
+  credential_calls: {eq: 0}

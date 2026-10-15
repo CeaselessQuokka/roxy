@@ -1,0 +1,38 @@
+# SYS-HEALTH-FAIL must stay quiet when the LATEST run has no fail.
+#
+#   check        scheduled run at 09:00 UTC   manual run at 14:50 UTC (latest)
+#   H-BACKUP     fail (never restored)        pass (backup and restore test fixed since)
+#   H-LATENCY    pass                         warn (1,720 ms)
+#   H-DISK       pass                         warn (18% free)
+#   H-WORKERS    pass                         pass
+#
+# The older fail is history and the latest run only warns, so there is nothing for this rule.
+
+format: roxy.insight_fixture/1
+rule: SYS-HEALTH-FAIL
+case: warnings_only
+description: >
+  An older run failed H-BACKUP, but the latest run passes it and only warns on two checks. SYS-HEALTH-FAIL looks at the
+  latest run only and a warn is not a fail, so it must not fire.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  health:
+    runs:
+      - started_at: "-6h"
+        trigger: schedule
+        results:
+          - {check_id: H-BACKUP, status: fail, value: "never", threshold: "pass < 26 h, warn < 72 h", explanation: "No restore test has ever passed.", fix_link: "/admin/help#runbook-backups"}
+          - {check_id: H-LATENCY, status: pass, value: "640 ms", threshold: "pass < 1000 ms, warn < 2500 ms", explanation: "p95 upstream latency over the last 15 minutes.", fix_link: "/admin/upstream"}
+          - {check_id: H-DISK, status: pass, value: "31% free", threshold: "pass > 25%, warn > 10%", explanation: "Free space on the state volume.", fix_link: "/admin/system#disk"}
+          - {check_id: H-WORKERS, status: pass, value: "2 of 2 fresh", threshold: "all fresh", explanation: "Worker heartbeats.", fix_link: "/admin/system"}
+      - started_at: "-10m"
+        trigger: manual
+        results:
+          - {check_id: H-BACKUP, status: pass, value: "2 h", threshold: "pass < 26 h, warn < 72 h", explanation: "Age of the last backup and its restore test.", fix_link: "/admin/help#runbook-backups"}
+          - {check_id: H-LATENCY, status: warn, value: "1720 ms", threshold: "pass < 1000 ms, warn < 2500 ms", explanation: "p95 upstream latency over the last 15 minutes is high.", fix_link: "/admin/upstream"}
+          - {check_id: H-DISK, status: warn, value: "18% free", threshold: "pass > 25%, warn > 10%", explanation: "Free space on the state volume is getting low.", fix_link: "/admin/system#disk"}
+          - {check_id: H-WORKERS, status: pass, value: "2 of 2 fresh", threshold: "all fresh", explanation: "Worker heartbeats.", fix_link: "/admin/system"}
+
+expect:
+  fires: false

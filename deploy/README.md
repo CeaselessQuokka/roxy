@@ -1,0 +1,304 @@
+# Roxy v2 operations files (`deploy/`)
+
+Everything that runs Roxy on the server lives here: the gunicorn config, the systemd units, the nginx site, the
+blue/green deploy and its rollback, the root wrappers the deploy may call through sudo, backups, alerts and the
+permission audit (plan section 17). Every file explains each setting next to the setting itself. This page is the
+map; `MIGRATION.md` (at the repository root) walks through the cutover from v1 step by step. When something breaks on the
+server, `docs/RUNBOOKS.md` (the ops docs the alerts and health checks link to) says how to confirm, fix, verify and
+roll back each case; `docs/PERFORMANCE.md` has the load figures and the quiet-machine rerun commands.
+
+## What is here, and where it goes on the server
+
+| Repository file | Installed as | Owner, mode | Installed by |
+|---|---|---|---|
+| `gunicorn.conf.py`, `prestart.py` | inside each release, `/opt/roxy/releases/<sha>/deploy/` | deploy user, 0644 | `deploy.sh` |
+| `deploy.sh`, `deploy_rollback.sh` | `/opt/roxy/deploy.sh`, `/opt/roxy/deploy_rollback.sh` | deploy user, 0755 | the workflow bootstrap, then each successful deploy |
+| `systemd/roxy@.service` and the other units | `/etc/systemd/system/` | root, 0644 | `install-system.sh` |
+| `systemd/journald-roxy.conf` | `/etc/systemd/journald.conf.d/roxy.conf` | root, 0644 | `install-system.sh` |
+| `tools/alert_on_failure.py`, `tools/backup.sh`, `tools/roxy-audit.py` | `/usr/local/lib/roxy/` | root, 0755 | `install-system.sh` |
+| `tools/roxy-nginx-apply`, `tools/roxy-switch-color` | `/usr/local/sbin/` | root, 0755 | `install-system.sh` |
+| `sudoers/roxy-deploy` | `/etc/sudoers.d/roxy-deploy` | root, 0440 | `install-system.sh` (after `visudo -c`) |
+| `env/*.env.example` | `/etc/roxy/roxy.env`, `blue.env`, `green.env` | root:roxy, 0640 | `install-system.sh` (only when missing) |
+| `nginx/*` | `/etc/nginx/sites-available/roxy-v2.conf` (rendered), `/etc/nginx/roxy-upstream-{blue,green}.conf`, `/etc/nginx/snippets/roxy-security-headers.conf` | root, 0644 | `roxy-nginx-apply`, from the verified commit only |
+
+Made by hand at the cutover (`MIGRATION.md` step 2.10), not from a repository file yet: `/swapfile` (root, 0600) and
+its `/etc/fstab` line, `/etc/sysctl.d/90-roxy.conf` and the drop-in
+`/etc/systemd/system/roxy@.service.d/90-no-swap.conf` (root, 0644). See "Memory, swap and kernel settings on the 909
+MB server" below.
+
+## Server layout (plan 17.3, with two corrections)
+
+| Path | Owner, mode | Purpose |
+|---|---|---|
+| `/opt/roxy/releases/<sha>/` | deploy user, 0755 | One release with its own `.venv` and `build/public/static/` |
+| `/opt/roxy/releases/current-blue`, `current-green` | symlinks | The release each color runs |
+| `/opt/roxy/python/` | deploy user, 0755 | uv-managed Python 3.12 (the service cannot see `/home`, so not under the deploy user's home) |
+| `/opt/roxy/repo.git` | deploy user | Mirror the deploy fetches exact commits from |
+| `/usr/local/lib/roxy/` | root, 0755 | Root-run tools (correction: the plan had `/opt/roxy/tools`; inside a directory the deploy user owns, the deploy user could swap the tools that root runs) |
+| `/usr/local/sbin/roxy-nginx-apply`, `roxy-switch-color` | root, 0755 | The only commands the deploy user may run with sudo |
+| `/etc/roxy/` | root:roxy, 0750 | `roxy.env`, `blue.env`, `green.env`, `nginx-hints.env`, `credentials/` (root, 0700; files 0600). While v1 still lives here the directory stays v1's (see "Running beside v1") |
+| `/var/lib/roxy/` | roxy, 0750 | Databases and `snapshots/` (pre-migration copies); created by `install-system.sh` so the root jobs can start before the first deploy |
+| `/var/lib/roxy/audit/` | root:roxy, 0750 | `perms.json` (roxy-audit) and `backup.json` (backup.sh). Root's own directory inside the roxy user's: the root jobs create it and write it without ever following a link the roxy user could plant |
+| `/var/lib/roxy/ctl-proofs/` | roxy, 0700 | One-use proofs `scripts/ctl.py` writes for the internal socket (made on first use). roxy-audit reports any other owner or mode; the service refuses proofs from it then too |
+| `/var/lib/roxy-deploy/` | deploy user, 0755 | Deploy lock, `deployed_version`, `last_deploy.json`, `last_failure.json`, low-memory markers (correction: the plan put `deployed_version` in `/var/lib/roxy`, which the deploy user cannot write) |
+| `/var/lib/roxy-nginx-apply/` | root, 0755 | The wrapper's own git mirror (0700) and `applied.json` |
+| `/run/roxy-blue/`, `/run/roxy-green/` | roxy, 0750 | `internal.sock` and `gunicorn.ctl`, both 0660 |
+| `/var/backups/roxy/` | root, 0700 | Nightly backups |
+
+## Accounts
+
+- `roxy` runs the service. It owns the databases and nothing else; the code it runs is read-only to it.
+- `roxy-deploy` is the account GitHub Actions logs in as (`LIGHTSAIL_USER`). It is a member of group `roxy` so it can
+  reach the internal sockets, and its only sudo rights are in `sudoers/roxy-deploy`. Do not deploy as `ubuntu`: on
+  Lightsail that account has unrestricted sudo, which would make the sudo rules pointless.
+
+## First setup (summary)
+
+1. `sudo apt install nginx zstd acl` (and `age` for encrypted backups, `rclone` for off-box copies). Let's Encrypt
+   certificates for the site come from certbot as today. `acl` is needed while v1 still owns `/etc/roxy`.
+2. From a checkout of the commit you will deploy: `sudo deploy/install-system.sh`. On the v1 server it leaves
+   v1's `/etc/roxy` as it is (see "Running beside v1").
+3. Edit `/etc/roxy/roxy.env`: set `ROXY_DEPLOY_REPO_URL` to the GitHub repository and check `ROXY_SITE_ORIGIN`.
+4. Put the secrets in `/etc/roxy/credentials/`, one file each, root 0600: `roblox_credential`, `smtp_password`,
+   `alert_emails` (`to:` and `from:` lines), `credential_encryption_key`, `totp_encryption_key`, `ip_hash_key`, and
+   when used `rotator_url`, `alert_webhook_url`, `rclone_config`. Empty means "not configured". The install script
+   lists the required ones that are still missing.
+5. In `/etc/nginx/nginx.conf` set `worker_processes 2;` and, in `events`, `worker_connections 4096;` (plan 17.2; a
+   site file cannot set them). Remove `/etc/nginx/sites-enabled/default`: its `default_server` collides with Roxy's.
+6. The swap file, the kernel settings and the colors' no-swap drop-in, before any color starts (see "Memory, swap
+   and kernel settings on the 909 MB server"; `MIGRATION.md` step 2.10 has the commands).
+7. As `roxy-deploy`, install uv (`curl -LsSf https://astral.sh/uv/install.sh | sh`), then run the first deploy by
+   hand: `/opt/roxy/deploy.sh <full commit sha>`. It starts blue and points nginx at it. While v1's nginx site is
+   still enabled, v1 answers the public host name, so run this first deploy as
+   `ROXY_DEPLOY_PUBLIC_CHECK=0 /opt/roxy/deploy.sh <full commit sha>` (see "Running beside v1").
+
+## How a deploy runs
+
+`deploy.sh <sha>` (see its header for every step): fetch exactly that commit (it must be on `main`), build the
+release and its venv while the live color serves, restart the idle color (its pre-start step snapshots control.db and
+applies the expand migrations as the `roxy` user), wait until its internal socket reports the new version, run
+`scripts/smoke_remote.py`, install the nginx config through `roxy-nginx-apply` if it changed, switch nginx with
+`roxy-switch-color`, watch for 60 s, then stop the old color. The watch makes 12 checks, 5 s apart (a count, not a
+clock reading, so a busy machine or a clock step never shortens it), of the new color's internal socket and
+the public `/health` through nginx, which must be Roxy v2's own answer (it has a `Degraded` key; v1's has not). Any
+failure before the old color stops switches nginx back, re-installs the nginx config the old color ran with (when
+this release had installed its own), and stops the new color; the run exits non-zero and `roxy-deploy-alert.path`
+sends "Roxy: deploy <short sha> failed at step <n>". The repository URL is logged without any `user:password@`
+part. Releases are built with compiled bytecode (`uv sync --compile-bytecode`), because the service cannot write
+bytecode into its read-only release.
+
+A paused color or one in throttle-all (switched on by the owner, or a pause carried over from v1 at the cutover)
+answers the smoke test's proxy request with Roxy's own pause (503) or throttle-all (429) refusal. The smoke test
+accepts exactly that refusal when the color reports the switch, and says so on its `proxy` line, so a deploy (the fix
+you are shipping, say) still goes through while the switch stays on.
+
+Low-memory mode (CHANGES.md, "Plan conflicts and deviations", "Memory sizing for the 1 GB server"): when less than
+700 MB is available before the restart, the idle color starts
+with one worker and grows to `ROXY_WORKERS` after the old color stopped, through the gunicorn control socket (the
+same code as gunicorn's SIGTTIN handler; the deploy user may not signal the `roxy` user's processes). Force it with
+`--low-memory`, or turn it off with `--no-low-memory`.
+
+Build ahead: `/opt/roxy/deploy.sh --build-only <sha>` runs steps 1 and 2 only (fetch, the release's `.venv` and
+static files) while the live site keeps serving; it starts, switches and records nothing. The deploy of the same
+commit then logs `Release ... is already built` and goes straight to step 3, which keeps the venv build (minutes on
+this server) out of a maintenance window such as the cutover. A failed build-only run removes its half-built release
+and sends no deploy alert.
+
+A first deploy that fails after its switch leaves nginx's active-upstream link on blue (the installed site needs the
+file) while blue is stopped and has no release link; the next deploy sees that nothing serves and starts blue again,
+as for a first deploy.
+
+Rollback: `/opt/roxy/deploy_rollback.sh` goes back to the release the other color last ran, with the same health gate;
+`/opt/roxy/deploy_rollback.sh <sha>` goes to any release still in `/opt/roxy/releases` (the newest five are kept).
+"Newest" is the deploy order: every deploy or rollback that starts a release writes the next number into its
+`.roxy-release-sequence`, so file times (which a clock stepping back can reorder) never decide what is removed; a
+release a color runs is never removed.
+
+## Contract migrations (by hand, never automatic)
+
+Expand migrations (new tables, columns, indexes) run automatically in each color's pre-start step. Contract
+migrations (drops and renames, `-- kind: contract`) run "one release later" (plan 17.4 step 3), and only by hand:
+run automatically they would break every kept release older than the one that shipped them, and
+`deploy_rollback.sh <sha>` can start any of the five kept releases. The pre-start step names pending contract
+migrations in the journal (`journalctl -u roxy@blue -u roxy@green | grep "contract migrations pending"`).
+When the release that shipped a contract migration is live and you will not roll back past it, run it as the `roxy`
+user with the live release (here blue; use the color nginx points at):
+
+```
+sudo systemd-run --wait --pipe --uid=roxy --gid=roxy -p UMask=0027 \
+  /opt/roxy/releases/current-blue/.venv/bin/python -m roxy.storage.migrate --expand --contract \
+  --state-dir /var/lib/roxy
+```
+
+Running it as `roxy` keeps every database file (and SQLite's `-wal` and `-shm` files) owned by the service. After
+that, roll back only to releases that contain the same migration file.
+
+## Dependency audit at deploy (health check H-VERSION)
+
+CI's `dependency-audit` job runs pip-audit on the locked dependencies; its counts (all known advisories, the ones with
+a fixed version, and their ids) are outputs of `ci.yml`, and `deploy.yml` passes them to `deploy.sh` as
+`ROXY_ADVISORY_COUNT`, `ROXY_ADVISORY_FIXABLE` and `ROXY_ADVISORY_IDS`. Step 9 writes them, with the commit, to
+`/var/lib/roxy-deploy/advisories.json` (0644, read by the service for H-VERSION) and keeps a copy in the release as
+`.roxy-advisories.json`, which a rollback puts back. A deploy started by hand has no CI result, so the record says
+`"count": null, "source": "not_recorded"` and H-VERSION shows "advisories not recorded"; it never guesses a zero. To
+record an audit for a hand deploy, pass the variables yourself (`ROXY_ADVISORY_COUNT=0 /opt/roxy/deploy.sh <sha>`).
+
+## Operator CLI (`scripts/ctl.py`)
+
+For when the dashboard cannot be reached (nginx down, locked out, under attack). Run it as the `roxy` user with the
+live release, for example on blue:
+
+```
+sudo -u roxy /opt/roxy/releases/current-blue/.venv/bin/python /opt/roxy/releases/current-blue/scripts/ctl.py status
+```
+
+| Command | What it does | Door |
+|---|---|---|
+| `status` | Both colors' internal sockets, pause and throttle-all, config version, leader, active bans, last backup | both |
+| `pause [--reason]`, `resume` | The maintenance switch (503 for every proxy request) | databases |
+| `throttle-all on\|off [--reason]` | The emergency per-IP limit | databases |
+| `purge-cache --all --yes \| --host H \| --pattern P [--regex] \| --id ID \| --rule N \| --expired [--preview]` | A fleet-wide cache purge | databases |
+| `reset preview --scope S ...`, then `reset run ... --digest D --reason R [--confirm PHRASE]` | A Data page reset scope (plan 6.8); the run must match the preview | socket |
+| `export-llm --window 7d --detail full --out FILE` | The plan 12 LLM export, written 0600 | socket |
+| `health-run [--check ID ...] [--include-credential]` | Check Proxy Health (exit 1 when a check fails) | socket |
+| `backup-now [--wait SECONDS]` | Writes `/var/lib/roxy/backup-request`; `roxy-backup-request.path` starts `backup.sh` | databases |
+| `leader`, `jobs` | The leader lease and heartbeats, and the leader's published job status | databases |
+| `bans list`, `bans lift ip 192.0.2.1 --reason R` | The ban list; lift every ban of one subject | databases |
+| `flush-metrics` | Every worker flushes its buffered metrics within about a second | databases |
+| `settings show [KEY ...]`, `settings set KEY=VALUE --reason R [--confirm-high-risk]` | Runtime settings, through the settings service | databases |
+
+- Every change is audited as `cli:<your login name>` (the name behind `sudo`), with the reason you give.
+- The database commands refuse to run as anyone but the databases' owner, because SQLite would create `-wal` and
+  `-shm` files the service cannot open.
+- The socket commands need a running color: nginx's color first, then the other one.
+- A reset, a full-detail export and a health run with the credential check also prove they run as `roxy`, through a
+  one-use file in `/var/lib/roxy/ctl-proofs/`. The deploy user can open the socket, but it can never use those three.
+- A factory reset stays dashboard-only (it needs a fresh second factor). Nothing the CLI prints contains a secret.
+- `--json` prints JSON; exit status 0 done, 1 refused or failed, 2 bad arguments, 3 no database or no color answering.
+
+## Backups and restore
+
+`roxy-backup.timer` runs `backup.sh` nightly at 03:30 (plus up to 15 minutes): control.db and metrics.db (hot.db with
+`ROXY_BACKUP_HOT=1`) are copied with `VACUUM INTO`, checked, compressed, optionally encrypted with `age`, and kept 14
+daily and 8 weekly. The optional off-box copy (`ROXY_BACKUP_REMOTE`, through rclone) only ever sends an encrypted set:
+with a remote set and no age recipient in `ROXY_BACKUP_AGE_RECIPIENTS`, the run keeps its local set, copies nothing
+and fails, so the alert says what to add.
+
+To restore, follow `docs/RUNBOOKS.md` "Restore from backup", in a root shell (`sudo -i`): the sets are root-only
+(`/var/backups/roxy` and each set 0700, files 0600), so a per-command `sudo` cannot `cd` into them. In short: check
+the set (`sha256sum -c SHA256SUMS` inside it), stop both colors, move the damaged file aside, decrypt (`age -d`, when
+encrypted) and decompress (`zstd -d /var/backups/roxy/<date>/control.db.zst -o /var/lib/roxy/control.db`), give the
+file to the service BEFORE anything opens it (`chown roxy:roxy`, mode 0640: zstd keeps the set's root-only mode), run
+`PRAGMA integrity_check` as `roxy`, start the color nginx points at (`/usr/local/sbin/roxy-switch-color --boot`), and
+run the health check. The encryption keys are never in a backup (plan 9.8): if the disk was lost, restore
+`/etc/roxy/credentials/` from the owner's offline copy first, then fetch an off-box set with `rclone --config
+/etc/roxy/credentials/rclone_config copy <remote>:roxy-backups/<date> /var/backups/roxy/<date>`. The on-server
+snapshots in `/var/lib/roxy/snapshots/` (reset, manual and pre-migrate copies) are plain SQLite files and go back the
+same way without the decompression.
+
+"Back up now" runs the same full backup on request: the service or `scripts/ctl.py backup-now` (both the `roxy`
+user, which may not start units) writes `/var/lib/roxy/backup-request`, and `roxy-backup-request.path` starts
+`roxy-backup.service`. `backup.sh` removes the request first thing (without following a link the roxy user could
+plant), skips a requested run within 10 minutes of the last good backup (`ROXY_BACKUP_MIN_GAP_S`), and records how it
+answered under `last_request` in `audit/backup.json`. `install-system.sh` enables the path unit with the timers.
+
+## Running beside v1 during the cutover
+
+v1 (unit `roxy`, user `ubuntu`, port 8000, nginx site `roxy`, state in `/etc/roxy`) and v2 (units `roxy@blue` and
+`roxy@green`, user `roxy`, ports 8001 and 8002, nginx site `roxy-v2.conf`) use different names and ports, so both can
+be installed at once. Things to know:
+
+- `/etc/roxy` belongs to v1 (user `ubuntu`, mode 0700) and v1 rewrites its state files there all the time.
+  `install-system.sh` sees that the directory is not root's and leaves its owner, group and mode exactly as they
+  are; it only adds an ACL entry that lets `roxy-deploy` pass through the directory (`setfacl -m u:roxy-deploy:x`),
+  so the deploy can read the v2 env files (0640 root:roxy) by name. Nobody else gains anything (a `chmod o+x`
+  would let every local account reach any v1 file that was ever created with a looser mode). systemd reads the env
+  files and credentials as root, so the service needs no access to the directory. Without the `acl` package the
+  script stops and changes nothing.
+- Both nginx sites name the same host, and nginx uses the first one it loads (`roxy` sorts before
+  `roxy-v2.conf`), so v1 keeps serving the public name until its site is disabled. The deploy's public checks
+  (the watch's `/health` and the smoke test through nginx) would then reach v1; the watch notices (no `Degraded`
+  key) and fails the deploy. Deploy with `ROXY_DEPLOY_PUBLIC_CHECK=0` until the cutover; the health gate on the
+  new color's own socket and port still runs.
+- At the cutover, after v1 is stopped and its data imported (MIGRATION.md): disable v1's site
+  (`sudo rm /etc/nginx/sites-enabled/roxy && sudo nginx -t && sudo systemctl reload nginx`), then
+  `sudo deploy/install-system.sh --take-over-etc`, which makes `/etc/roxy` root:roxy 0750 and removes the ACL
+  entry. Later deploys run with the public checks on (the default).
+- roxy-audit reports `/etc/roxy` (owned by `ubuntu`) as a finding until the cutover.
+
+## Memory, swap and kernel settings on the 909 MB server
+
+The server has 909 MB of RAM, and had no swap before the cutover. Everything is sized to fit without swap
+(CHANGES.md, "Memory sizing for the 1 GB server"): each color is capped at `MemoryHigh=420M` and `MemoryMax=500M`
+(raised from 320M and 420M by finding
+LOAD-2: a color whose workers recycle every 20,000 requests settles at 365 to 405 MiB of PSS, docs/PERFORMANCE.md
+"Memory per color"), two workers per color, glibc's allocator tuned in `roxy@.service` (`MALLOC_ARENA_MAX=2`, fixed
+mmap and trim thresholds of 128 KiB), and low-memory mode during a deploy. When a color does pass `MemoryMax`, the
+kernel kills one process inside it (the largest, a worker) and `OOMPolicy=continue` keeps the color running: gunicorn
+starts a replacement worker while the other one serves (systemd's default would stop and restart the whole color, a
+502 for every caller meanwhile).
+
+**Never run two warm colors at once.** One color at its hard limit plus a color that just started plus nginx and the
+OS fit in 909 MB; two colors that have both served traffic for a while do not (about 2 x 405 MiB plus 200 MB). The
+deploy and the rollback only ever start the idle color fresh and stop the old one after the watch; do not
+`systemctl start` the idle color by hand while the active one serves. For the same reason prefer `systemctl restart`
+(or a rollback) to `systemctl reload` on a warm color: a reload starts the new workers before the old ones leave, so
+for a moment the color runs four. On this server the deploy runs in low-memory
+mode (the new color starts with one worker) whenever a warm color is active, because less than 700 MB is then
+available; that is expected, not a warning sign.
+
+**A swap file, as a safety net, never as capacity** (owner answer A8). The cutover adds a 1 GiB `/swapfile` with
+`vm.swappiness=10` (MIGRATION.md step 2.10 has the commands with their checks and the undo). `install-system.sh` does
+not do it yet; `ROADMAP.md` item 12 moves it there. Without swap, a short spike (a warm color at its hard limit during
+a deploy, plus certbot, apt or the migrator) goes straight to the kernel's OOM killer, which may pick nginx; with a
+low swappiness the kernel swaps only under real pressure, so the system slows down for a moment instead.
+
+**The colors never swap.** Under cgroup v2, `MemoryMax` counts RAM only. With a swap file and no swap limit, a color
+at `MemoryMax` would be pushed into swap (on Lightsail's network disk: slow for every caller) and would not be
+OOM-killed until the swap ran out, instead of losing one worker that `OOMPolicy=continue` replaces at once, which is
+the behavior every memory test measured. So the same step installs a drop-in that sets `MemorySwapMax=0` (cgroup
+`memory.swap.max` 0) for both colors:
+
+```
+sudo mkdir -p /etc/systemd/system/roxy@.service.d
+printf '[Service]\nMemorySwapMax=0\n' | sudo tee /etc/systemd/system/roxy@.service.d/90-no-swap.conf
+sudo systemctl daemon-reload
+```
+
+`install-system.sh` replaces only `roxy@.service` itself, so the drop-in stays when the script runs again.
+
+The swap file and the kernel settings file (owner answers A7 and A8), as step 2.10 runs them:
+
+```
+sudo fallocate -l 1G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+grep -qs '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+printf 'vm.swappiness = 10\nnet.ipv4.tcp_migrate_req = 1\n' | sudo tee /etc/sysctl.d/90-roxy.conf
+sudo sysctl -p /etc/sysctl.d/90-roxy.conf
+```
+
+To remove them: `sudo swapoff /swapfile && sudo rm /swapfile`, delete the `/swapfile` line of `/etc/fstab`, and
+`sudo rm /etc/sysctl.d/90-roxy.conf`. Watch `free -m` (the System page shows memory): steady swap use means a process
+outside Roxy grew, since the colors cannot swap; `swapon --show` and `ps aux --sort=-rss | head` show which.
+
+**`net.ipv4.tcp_migrate_req=1`** (owner answer A7, on the lead's recommendation). gunicorn runs with `reuse_port`:
+every worker has its own listener on the color's port, next to the master's (finding memory-4). When a worker
+recycles (every 20,000 requests plus jitter) it closes its listener, and at the kernel default (0) the connections
+already waiting in that listener's queue are reset; with 1, Linux (5.14 and later; Ubuntu 24.04 runs 6.8 or newer)
+hands them to another listener of the same port. nginx has one upstream server, so a reset fresh connection is a 502
+for a caller, and nginx opens fresh connections mostly right after a recycle (the recycling worker closes the
+keep-alive connections it held); the stress reproduction reset 4 to 8 percent of them. The setting costs no memory or
+CPU and changes only listeners in a SO_REUSEPORT group, which Linux lets only one user share. Undo:
+`sudo sysctl -w net.ipv4.tcp_migrate_req=0` and remove the line. (The `reuse_port` comment in `gunicorn.conf.py`
+describes both values.)
+
+## Testing these files
+
+`.venv/bin/pytest tests/deploy` runs the real `deploy.sh` in a sandbox with stub `systemctl`, `sudo`, `curl`, `uv` and
+wrappers (every v1 `deploy_test.sh` scenario and the plan 19.9 list), `nginx -t` against nginx 1.18, 1.24 and a
+current release, `systemd-analyze verify` and `security`, the app under the unit's system call filter, live gunicorn
+masters (one leader across colors, low-memory scaling), and the tools. Optional binaries are found on `PATH` or where
+they can be unpacked without root (`apt-get download <package>` then `dpkg -x <deb> ~/.local/<dir>`): nginx in
+`~/.local/nginxroot`, `~/.local/nginx118root` (Ubuntu 22.04 package) and `~/.local/nginxnewroot` (nginx.org
+package); shellcheck, zstd and age in `~/.local/p13tools`. A test whose tool is missing is skipped with the reason.
+Live tests run inside `unshare -rn`, a private network namespace with only loopback, so they can never reach a real
+system.

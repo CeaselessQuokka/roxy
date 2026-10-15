@@ -1,0 +1,1183 @@
+"""The Security page API (`/admin/api/v1/security`): logins, probes, crawls, fingerprints, CSP reports, sessions,
+trusted devices, passkeys and recovery codes.
+
+What this is
+    The routes behind plan 14.1 "Security", in the DESIGN.md section 13 shapes:
+      * Event logs, paged on the server and exportable (parity rows 80, 97): admin logins and failed logins
+        (`result` filter), probes and exploit attempts, the probe summary by signature, crawls by client.
+      * Request fingerprints (rows 79, 134): header names with their value statistics, one header's values,
+        User-Agents and one User-Agent's newest request (v1's drill-down: path, client address, header names), the
+        blocked variants (headers and User-Agents of requests a request filter refused, one exportable table), the
+        ignored headers (values not recorded) with add and remove, and v1's per-header "Clear values" and "Remove"
+        (and "Remove" on the Blocked tab), each audited before it deletes. Headers that carry client addresses
+        (`fingerprints.ADDRESS_HEADERS`) are shipped ignored and can never be recorded again: removing one from
+        the ignored list is refused (422), because their values are never kept whatever the list says.
+      * CSP violation reports (plan 9.2), grouped by what was blocked.
+      * The admin's own sessions (list, revoke one, revoke the others, sign out everywhere), trusted devices (list,
+        revoke one or all), passkeys (list; rename and delete with a fresh second factor) and recovery codes
+        (status; regenerate with a fresh second factor).
+
+Why it exists
+    The auth package already answers these account actions on `/admin/api/v1/auth/*` in v1's shapes for the login
+    pages; the dashboard's Security page reads everything here in one convention (section 13 tables and errors) next
+    to the security event logs. Both surfaces call the same auth functions, so there is one implementation of each
+    action (the session and device functions of `admin/auth/sessions.py` and `trusted_devices.py`, the recovery code
+    and passkey functions of `admin/auth/enrollment.py`), each writing its audit row in the same transaction.
+
+How it works
+    - Logs read `metrics/security_events.py ring` and `summary_by_*`; fingerprints and CSP reports read
+      `metrics/read_security.py`. Stored values are scrubbed or hashed at write time, so nothing here can reveal a
+      secret.
+    - An ignored header is a row of the `ignored_value_headers` rule table (rules service: validation, audit,
+      `config_version`); adding one also deletes the values already stored for it (`metrics/fingerprints.py
+      clear_values`, v1 "No longer recording values"). Removing it starts recording again.
+    - `AuthError` refusals of the auth functions (a busy hasher, shared state down) become section 13 errors with
+      the same status. Passkey rename has no auth function yet: it is one control.db transaction here (update the
+      name, audit row), and the report asks for it to move into `admin/auth/enrollment.py`.
+    - Regenerated recovery codes are the one secret this API returns: shown once, never stored in clear, never
+      logged, and answered with `Cache-Control: no-store` like every admin answer.
+    - The Security dashboard page (`roxy/admin/pages/security.py`) reads through the same helpers the routes use
+      (`ring_fetch`, `header_fetch`, `values_fetch`, `user_agent_fetch`, `csp_fetch`, `table_page`, `listed_page`,
+      `probe_summary_rows`, `crawl_rows`, `blocked_table_rows`, `ignored_rows`, `sessions_answer`, `trusted_answer`,
+      `passkeys_answer`, `recovery_answer`), so the page and the API can never show different numbers (P6).
+
+What to read next
+    `roxy/metrics/security_events.py`, `roxy/metrics/read_security.py`, `roxy/admin/auth/enrollment.py`, then
+    `roxy/admin/api/protection.py`.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import replace
+from typing import Annotated, Any, Final, Literal
+
+from fastapi import Depends, Path, Query, Request
+from pydantic import Field
+from starlette.responses import JSONResponse, Response
+
+from roxy.admin.api.common import (
+    AdminFreshMfa,
+    AdminSession,
+    ApiBody,
+    ApiError,
+    Column,
+    CsrfChecked,
+    ExportFormat,
+    ExportFormatDep,
+    TableQuery,
+    TableSpec,
+    TimeRange,
+    TimeRangeDep,
+    actor_for,
+    add_caller_text,
+    area_router,
+    export_pages,
+    export_table,
+    named,
+    not_found,
+    page_rows,
+    request_id_of,
+    run_mutation,
+    service_errors,
+    table_answer,
+    table_params,
+    validation_error,
+)
+from roxy.admin.api.protection import audit_reason
+from roxy.admin.auth import enrollment, sessions, trusted_devices, webauthn
+from roxy.admin.auth.deps import STATE_SESSION, AdminPrincipal, get_auth, request_info
+from roxy.admin.auth.events import audit_auth
+from roxy.admin.auth.flow import AuthError
+from roxy.admin.auth.responses import clear_session_cookie
+from roxy.config import audit
+from roxy.config.constants import MAX_REASON_LENGTH
+from roxy.config.defaults import IGNORED_ADDRESS_HEADER_NOTE
+from roxy.deps import get_ctx
+from roxy.metrics import read_security, security_events
+from roxy.metrics.fingerprints import ADDRESS_HEADERS, clear_values, keeps_no_values
+from roxy.rules.models import normalize_ua_hash
+from roxy.rules.service import RuleChange, RulesService
+
+router = area_router("security")
+
+MAX_SUMMARY_ROWS: Final = 1000
+"""Grouped summaries read at most this many groups (plan P9); the table pages through them."""
+_AUTH_CODES: Final[dict[int, str]] = {
+    400: "bad_request",
+    401: "unauthorized",
+    403: "forbidden",
+    404: "not_found",
+    409: "conflict",
+    429: "rate_limited",
+    503: "unavailable",
+}
+
+
+# =============================================================================================== helpers
+
+
+def auth_error(error: AuthError) -> ApiError:
+    """An auth refusal (v1-shaped body) as a section 13 error with the same status and headers."""
+    status = error.status if 400 <= error.status <= 599 else 500
+    body = error.body if isinstance(error.body, str) else "The request was refused."
+    return ApiError(status, _AUTH_CODES.get(status, "bad_request"), body, headers=error.headers or None)
+
+
+async def _auth_call[T](call: Awaitable[T]) -> T:
+    try:
+        return await call
+    except AuthError as error:
+        raise auth_error(error) from None
+
+
+def _session_record(request: Request) -> sessions.SessionRecord:
+    record = getattr(request.state, STATE_SESSION, None)
+    if not isinstance(record, sessions.SessionRecord):  # pragma: no cover - the guard always ran first
+        raise not_found()
+    return record
+
+
+Fetch = Callable[[int, int], Awaitable[tuple[Sequence[Any], int]]]
+
+
+async def table_page(spec: TableSpec, tq: TableQuery, fetch: Fetch, *, tr: TimeRange | None = None) -> dict[str, Any]:
+    """One page of a paged read model as the section 13 table answer (the routes' answer without `format=`; the
+    Security page renders the same answer, P6)."""
+    items, total = await fetch(tq.page, tq.page_size)
+    answer = table_answer(spec, tq, items, total)
+    if tr is not None:
+        answer["range"] = tr.info()
+    return answer
+
+
+def listed_page(
+    spec: TableSpec,
+    tq: TableQuery,
+    rows: Sequence[dict[str, Any]],
+    *,
+    search_keys: Sequence[str],
+    tr: TimeRange | None = None,
+) -> dict[str, Any]:
+    """An in-memory list (a grouped summary) searched, sorted and paged as the section 13 table answer."""
+    items, total = page_rows(rows, tq, search_keys=search_keys)
+    answer = table_answer(spec, tq, items, total)
+    if tr is not None:
+        answer["range"] = tr.info()
+    return answer
+
+
+async def _paged(
+    request: Request,
+    admin: AdminPrincipal,
+    spec: TableSpec,
+    tq: TableQuery,
+    fmt: ExportFormat | None,
+    fetch: Fetch,
+    *,
+    tr: TimeRange | None = None,
+    filters: dict[str, Any] | None = None,
+) -> Any:
+    with service_errors():
+        if fmt is not None:
+            return await export_pages(request, admin, spec, fetch, fmt, tq=tq, tr=tr, filters=filters)
+        return await table_page(spec, tq, fetch, tr=tr)
+
+
+async def _listed(
+    request: Request,
+    admin: AdminPrincipal,
+    spec: TableSpec,
+    tq: TableQuery,
+    fmt: ExportFormat | None,
+    rows: Sequence[dict[str, Any]],
+    *,
+    search_keys: Sequence[str],
+    tr: TimeRange | None = None,
+) -> Any:
+    if fmt is not None:
+        everything, total = page_rows(rows, replace(tq, page=1, page_size=max(1, len(rows))), search_keys=search_keys)
+        return await export_table(request, admin, spec, everything, fmt, total=total, tq=tq, tr=tr)
+    return listed_page(spec, tq, rows, search_keys=search_keys, tr=tr)
+
+
+def _only_newest_first(tq: TableQuery) -> None:
+    if tq.order != "desc":
+        raise validation_error({"order": "This log is listed newest first only."}, code="invalid_table_query")
+
+
+# =============================================================================================== logins, probes, crawls
+
+
+LOGIN_SPEC: Final = TableSpec(
+    name="admin_logins",
+    columns=(
+        Column("at_ms", "When", "When the attempt happened (newest first).", "timestamp_ms"),
+        Column("ip", "IP", "Where the attempt came from.", ip=True, sortable=False),
+        Column("successful", "Successful", "Whether the admin got in.", sortable=False),
+        Column("username", "Username", "The account named (failed attempts may name any).", sortable=False,
+               caller_text=True),
+        Column("method", "Method", "The step or factor used.", sortable=False),
+        Column("reason", "Result", "success or failure.", sortable=False),
+    ),
+    default_sort="at_ms",
+)  # fmt: skip
+# The probe log is written by unauthenticated traffic (any scanner on the internet, parity-2), so every text column
+# is caller text; the signature too, because rows recorded before review round 4 (finding secfix-7) may hold the
+# caller's method or path as their signature.
+PROBE_SPEC: Final = TableSpec(
+    name="probes",
+    columns=(
+        Column("at_ms", "When", "When the probe arrived (newest first).", "timestamp_ms"),
+        Column("ip", "IP", "Who sent it.", ip=True, sortable=False),
+        Column("reason", "Signature", "The probe signature (v1 reason, without the probed URL).", sortable=False,
+               caller_text=True),
+        Column("target", "Target", "What was probed (redacted).", sortable=False, caller_text=True),
+        Column("path", "Path", "The path asked for (redacted).", sortable=False, caller_text=True),
+        Column("user_agent", "User-Agent", "Its User-Agent.", sortable=False, caller_text=True),
+        Column("count", "Count", "1, or the number of probes folded into this row over the event budget.", "count",
+               sortable=False),
+    ),
+    default_sort="at_ms",
+)  # fmt: skip
+SUMMARY_SPEC: Final = TableSpec(
+    name="probe_summary",
+    columns=(
+        Column("reason", "Signature", "The probe signature.", caller_text=True),
+        Column("count", "Count", "Probes with this signature in the range.", "count"),
+        Column("first_ms", "First seen", "The first one in the range.", "timestamp_ms"),
+        Column("last_ms", "Last seen", "The latest one.", "timestamp_ms"),
+    ),
+    default_sort="count",
+)
+CRAWL_SPEC: Final = TableSpec(
+    name="crawls",
+    columns=(
+        Column("ip", "IP", "Who fetched robots.txt or sitemap.xml.", ip=True),
+        Column("count", "Count", "Fetches in the range.", "count"),
+        Column("last_ms", "Last fetch", "The latest one.", "timestamp_ms"),
+    ),
+    default_sort="count",
+)
+
+
+def _ring_fetch(
+    request: Request, event_type: str, tr: TimeRange, *, ip: str | None = None, reason: str | None = None
+) -> Fetch:
+    return ring_fetch(get_ctx(request), event_type, tr, ip=ip, reason=reason)
+
+
+def ring_fetch(ctx: Any, event_type: str, tr: TimeRange, *, ip: str | None = None, reason: str | None = None) -> Fetch:
+    """The page reader of one security event log (`security_events.ring`) for the range, newest first."""
+
+    async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
+        data = await ctx.dbs.metrics.read(
+            lambda conn: security_events.ring(
+                conn, event_type, since_ms=tr.window.start * 1000, until_ms=tr.window.end * 1000, ip=ip,
+                reason=reason, limit=size, offset=(page - 1) * size,
+            )
+        )  # fmt: skip
+        return data["items"], int(data["total"])
+
+    return fetch
+
+
+@router.get("/logins")
+async def logins(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(LOGIN_SPEC))],
+    fmt: ExportFormatDep,
+    result: Annotated[Literal["all", "success", "failure"], Query()] = "all",
+    ip: Annotated[str | None, Query(max_length=64)] = None,
+) -> Any:
+    """Admin login attempts, newest first; `result=failure` is the failed logins list (rows 80, 97)."""
+    _only_newest_first(tq)
+    reason = None if result == "all" else result
+    fetch = _ring_fetch(request, security_events.LOGIN, tr, ip=ip or None, reason=reason)
+    return await _paged(request, admin, LOGIN_SPEC, tq, fmt, fetch, tr=tr, filters={"result": result, "ip": ip})
+
+
+@router.get("/probes")
+async def probes(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(PROBE_SPEC))],
+    fmt: ExportFormatDep,
+    ip: Annotated[str | None, Query(max_length=64)] = None,
+    signature: Annotated[str | None, Query(max_length=200)] = None,
+) -> Any:
+    """Probe and exploit attempts, newest first (v1 "Exploit / Probe Attempts", row 80)."""
+    _only_newest_first(tq)
+    fetch = _ring_fetch(request, security_events.PROBE, tr, ip=ip or None, reason=signature or None)
+    return await _paged(request, admin, PROBE_SPEC, tq, fmt, fetch, tr=tr, filters={"ip": ip, "signature": signature})
+
+
+@router.get("/probes/summary")
+async def probe_summary(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(SUMMARY_SPEC))],
+    fmt: ExportFormatDep,
+) -> Any:
+    """Probes grouped by signature in the range (v1 "Exploit / Probe Summary"; v1 bug B19 fixed by signatures)."""
+    with service_errors():
+        rows = await probe_summary_rows(get_ctx(request), tr)
+    return await _listed(request, admin, SUMMARY_SPEC, tq, fmt, rows, search_keys=("reason",), tr=tr)
+
+
+async def probe_summary_rows(ctx: Any, tr: TimeRange, *, limit: int = MAX_SUMMARY_ROWS) -> list[dict[str, Any]]:
+    """Probe signatures in the range with their counts, busiest first (at most `limit` groups)."""
+    start, end = tr.window.start * 1000, tr.window.end * 1000
+    rows: list[dict[str, Any]] = await ctx.dbs.metrics.read(
+        lambda conn: security_events.summary_by_reason(conn, security_events.PROBE, start, end, limit)
+    )
+    return rows
+
+
+async def crawl_rows(ctx: Any, tr: TimeRange) -> list[dict[str, Any]]:
+    """robots.txt and sitemap fetches in the range grouped by client address, busiest first."""
+    start, end = tr.window.start * 1000, tr.window.end * 1000
+    rows: list[dict[str, Any]] = await ctx.dbs.metrics.read(
+        lambda conn: security_events.summary_by_ip(conn, security_events.CRAWL, start, end, MAX_SUMMARY_ROWS)
+    )
+    return rows
+
+
+@router.get("/crawls")
+async def crawls(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(CRAWL_SPEC))],
+    fmt: ExportFormatDep,
+) -> Any:
+    """robots.txt and sitemap fetches by client in the range (v1 "Crawler Activity", row 80)."""
+    with service_errors():
+        rows = await crawl_rows(get_ctx(request), tr)
+    return await _listed(request, admin, CRAWL_SPEC, tq, fmt, rows, search_keys=("ip",), tr=tr)
+
+
+# =============================================================================================== fingerprints
+
+
+HEADER_SPEC: Final = TableSpec(
+    name="fingerprint_headers",
+    columns=(
+        Column("name", "Header name", "Lowercase; a secret-shaped name is shown as fp:<hash>.", caller_text=True),
+        Column("count", "Count", "Requests that carried it.", "count"),
+        Column("value_count", "Values", "Distinct values stored (capped per header).", "count"),
+        Column("unique_ratio", "Unique ratio", "Stored values per request that carried one (1 means always new).",
+               "ratio", sortable=False),
+        Column("values_ignored", "Values ignored", "Its values are not recorded (an ignored header).",
+               sortable=False),
+        Column("high_cardinality", "High cardinality", "90% or more of its values were new (consider ignoring).",
+               sortable=False),
+        Column("first_seen", "First seen", "First request that carried it.", "timestamp"),
+        Column("last_seen", "Last seen", "Latest request that carried it.", "timestamp"),
+    ),
+    default_sort="count",
+)  # fmt: skip
+VALUE_SPEC: Final = TableSpec(
+    name="fingerprint_values",
+    columns=(
+        Column("value", "Value", "Scrubbed; sensitive values are stored as fp:<hash>.", caller_text=True),
+        Column("count", "Count", "Requests that carried it.", "count"),
+        Column("first_seen", "First seen", "First request that carried it.", "timestamp", sortable=False),
+        Column("last_seen", "Last seen", "Latest request that carried it.", "timestamp"),
+    ),
+    default_sort="count",
+)  # fmt: skip
+UA_SPEC: Final = TableSpec(
+    name="fingerprint_user_agents",
+    columns=(
+        Column("user_agent", "User-Agent", "As sent (scrubbed); (none) for requests without one.", caller_text=True),
+        Column("count", "Count", "Requests that sent it.", "count"),
+        Column("first_seen", "First seen", "First request.", "timestamp"),
+        Column("last_seen", "Last seen", "Latest request.", "timestamp"),
+        # v1's User-Agent drill-down (`GET /admin/fingerprints/user_agent`, metrics.db schema 8): the newest request.
+        Column("last_path", "Last path", "Where the newest recorded request of this User-Agent went (host and path, "
+               "no query, scrubbed).", sortable=False, caller_text=True),
+        Column("last_caller", "Last caller", "Client address of that request (hashed in exports unless "
+               "export_include_ips is on).", ip=True, sortable=False),
+        Column("last_header_names", "Last header names", "The header names that request carried, in the order "
+               "sent (names only, never values; a secret-shaped name as fp:<hash>).", sortable=False,
+               caller_text=True),
+        Column("last_detail_at", "Last detail at", "When that request arrived (empty: no request detail was "
+               "recorded for this User-Agent, for example before the upgrade).", "timestamp", sortable=False),
+    ),
+    default_sort="count",
+)  # fmt: skip
+UA_DETAIL_CALLER_TEXT: Final = ("user_agent", "last_path", "last_header_names")
+"""Fields of the User-Agent detail answer holding text a caller chose: shown as plain text, never as markup."""
+BLOCKED_SPEC: Final = TableSpec(
+    name="blocked_fingerprints",
+    columns=(
+        Column("kind", "Type", "header (a header name the refused request carried) or user_agent."),
+        Column(
+            "name",
+            "Header",
+            "The header name, lowercase (caller text; a secret-shaped name was never stored).",
+            caller_text=True,
+        ),
+        Column(
+            "user_agent",
+            "User-Agent",
+            "The User-Agent the refused request sent (caller text, scrubbed).",
+            caller_text=True,
+        ),
+        Column("count", "Count", "Requests a request filter refused with it in the range.", "count"),
+        Column("last_ms", "Last seen", "The latest one in the range.", "timestamp_ms"),
+    ),
+    default_sort="count",
+)
+BLOCKED_CALLER_TEXT: Final = ("name", "user_agent")
+"""Columns of the Blocked tab holding text a caller chose: shown as plain text, never as markup."""
+HEADER_NAME_PATTERN: Final = r"^[^\x00-\x1f\x7f]+$"
+QueryName = Annotated[str | None, Query(alias="name", min_length=1, max_length=120, pattern=HEADER_NAME_PATTERN)]
+"""A header name in the query (`?name=`), which wins over the `{name}` path segment: how the dashboard names a header
+called `.` or `..`, which a browser would resolve out of the path (`common.name_in_path`, finding esc-2)."""
+"""A header name in a path: printable characters only (stored names are lowercased and at most 120 characters)."""
+IGNORED_SPEC: Final = TableSpec(
+    name="ignored_headers",
+    columns=(
+        Column("name", "Header", "Values of this header are not recorded (its count still is).", caller_text=True),
+        Column("why", "Why", "Detected automatically, a default, or added by an admin.", sortable=False),
+        Column("note", "Detail", "The note (an automatic entry says how unique its values were).", sortable=False),
+    ),
+    default_sort="name",
+    default_order="asc",
+)  # fmt: skip
+
+
+def _ignored(ctx: Any) -> frozenset[str]:
+    """Header names whose values are not recorded: the ignore list plus the address headers (never recorded)."""
+    names: frozenset[str] = ctx.rules.snapshot.ignored_value_headers
+    return names | ADDRESS_HEADERS
+
+
+@router.get("/fingerprints/headers")
+async def fingerprint_headers(
+    request: Request,
+    admin: AdminSession,
+    tq: Annotated[TableQuery, Depends(table_params(HEADER_SPEC))],
+    fmt: ExportFormatDep,
+) -> Any:
+    """Header names callers send, with how many distinct values each carried (row 79)."""
+    return await _paged(request, admin, HEADER_SPEC, tq, fmt, header_fetch(get_ctx(request), tq))
+
+
+def header_fetch(ctx: Any, tq: TableQuery) -> Fetch:
+    """The page reader of the header name table (search, sort and paging in SQL, the ignored mark from the rules)."""
+    ignored = _ignored(ctx)
+
+    async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
+        data = await ctx.dbs.metrics.read(
+            lambda conn: read_security.header_names(
+                conn, ignored=ignored, search=tq.q, sort=tq.sort, descending=tq.descending, limit=size,
+                offset=(page - 1) * size,
+            )
+        )  # fmt: skip
+        return data["rows"], int(data["total"])
+
+    return fetch
+
+
+@router.get("/fingerprints/headers/{name}/values")
+async def fingerprint_values(
+    request: Request,
+    admin: AdminSession,
+    name: Annotated[str, Path(min_length=1, max_length=120)],
+    tq: Annotated[TableQuery, Depends(table_params(VALUE_SPEC))],
+    fmt: ExportFormatDep,
+    name_q: QueryName = None,
+) -> Any:
+    """One header's stored values, most frequent first (the v1 drill-down). `?name=` names the header instead of
+    the path (`common.name_in_path`: a name `.` or `..` cannot be a path segment; finding esc-2)."""
+    ctx = get_ctx(request)
+    key = named(name, name_q).lower()
+    answer = await _paged(request, admin, VALUE_SPEC, tq, fmt, values_fetch(ctx, key, tq), filters={"name": key})
+    if isinstance(answer, dict):
+        answer["name"] = key
+        answer["values_ignored"] = key in _ignored(ctx)
+    return answer
+
+
+def values_fetch(ctx: Any, key: str, tq: TableQuery) -> Fetch:
+    """The page reader of one (lowercased) header's stored values."""
+
+    async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
+        data = await ctx.dbs.metrics.read(
+            lambda conn: read_security.header_values(
+                conn, key, sort=tq.sort, descending=tq.descending, limit=size, offset=(page - 1) * size
+            )
+        )
+        return data["rows"], int(data["total"])
+
+    return fetch
+
+
+@router.get("/fingerprints/user-agents")
+async def fingerprint_user_agents(
+    request: Request,
+    admin: AdminSession,
+    tq: Annotated[TableQuery, Depends(table_params(UA_SPEC))],
+    fmt: ExportFormatDep,
+) -> Any:
+    """User-Agents callers send (row 79)."""
+    return await _paged(request, admin, UA_SPEC, tq, fmt, user_agent_fetch(get_ctx(request), tq))
+
+
+def user_agent_fetch(ctx: Any, tq: TableQuery) -> Fetch:
+    """The page reader of the User-Agent table (search, sort and paging in SQL)."""
+
+    async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
+        data = await ctx.dbs.metrics.read(
+            lambda conn: read_security.user_agents(
+                conn, search=tq.q, sort=tq.sort, descending=tq.descending, limit=size, offset=(page - 1) * size
+            )
+        )
+        return data["rows"], int(data["total"])
+
+    return fetch
+
+
+UaHash = Annotated[str, Path(min_length=32, max_length=32, pattern=read_security.UA_HASH_PATTERN)]
+
+
+@router.get("/fingerprints/user-agents/{ua_hash}")
+async def fingerprint_user_agent(request: Request, _admin: AdminSession, ua_hash: UaHash) -> dict[str, Any]:
+    """One User-Agent with its newest recorded request: the path, the client address and the header names it sent
+    (v1 `GET /admin/fingerprints/user_agent`, `.remake/v1notes/dashboard.md` 4.21); 404 for an unknown key."""
+    return await user_agent_detail_answer(get_ctx(request), ua_hash)
+
+
+async def user_agent_detail_answer(ctx: Any, ua_hash: str) -> dict[str, Any]:
+    """The `GET /fingerprints/user-agents/{ua_hash}` answer (the Security page's User-Agent drawer reads the same):
+    `read_security.user_agent_detail` plus `caller_text`. `last_caller` is shown as the Endpoints page's last caller
+    is; the table export (`UA_SPEC`, `ip=True`) hashes it."""
+    with service_errors():
+        found = await ctx.dbs.metrics.read(lambda conn: read_security.user_agent_detail(conn, ua_hash))
+    if found is None:
+        raise not_found("No User-Agent with that key is recorded.")
+    answer: dict[str, Any] = dict(found)
+    # The subject a Protection > Bans "User-Agent hash" ban takes for this row (finding abuse-3): the key names the
+    # stored text, so a User-Agent stored masked or cut at 400 characters cannot be banned from it.
+    try:
+        answer["ban_hash"] = normalize_ua_hash(str(answer.get("ua_hash") or ""))
+    except ValueError:
+        answer["ban_hash"] = None
+    return add_caller_text(answer, UA_DETAIL_CALLER_TEXT)
+
+
+@router.get("/fingerprints/blocked")
+async def fingerprint_blocked(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(BLOCKED_SPEC))],
+    fmt: ExportFormatDep,
+    kind: Annotated[Literal["header", "user_agent"] | None, Query()] = None,
+) -> Any:
+    """Header names and User-Agents of requests a request filter refused in the range (row 134, Blocked tab), as
+    one section 13 table (`kind` picks one of the two lists); `format=csv|json` is v1's blocked fingerprints export
+    (finding parity-14). Blocked requests keep no header values, so there are no value rows."""
+    with service_errors():
+        rows = await blocked_table_rows(get_ctx(request), tr, kind)
+    answer = await _listed(request, admin, BLOCKED_SPEC, tq, fmt, rows, search_keys=("name", "user_agent"), tr=tr)
+    if isinstance(answer, dict):
+        answer["kind"] = kind
+        add_caller_text(answer, BLOCKED_CALLER_TEXT)
+    return answer
+
+
+async def blocked_table_rows(ctx: Any, tr: TimeRange, kind: str | None = None) -> list[dict[str, Any]]:
+    """The Blocked tab's rows in the range (`read_security.blocked_rows`), of one `kind` or both."""
+    start, end = tr.window.start * 1000, tr.window.end * 1000
+    found = await ctx.dbs.metrics.read(lambda conn: read_security.blocked_rows(conn, start, end))
+    return [row for row in found if kind is None or row["kind"] == kind]
+
+
+@router.get("/fingerprints/ignored")
+async def fingerprint_ignored(
+    request: Request,
+    admin: AdminSession,
+    tq: Annotated[TableQuery, Depends(table_params(IGNORED_SPEC))],
+    fmt: ExportFormatDep,
+) -> Any:
+    """Headers whose values are not recorded: detected automatically, a shipped default, or added by an admin."""
+    with service_errors():
+        rows = await ignored_rows(get_ctx(request))
+    return await _listed(request, admin, IGNORED_SPEC, tq, fmt, rows, search_keys=("name", "note"))
+
+
+async def ignored_rows(ctx: Any) -> list[dict[str, Any]]:
+    """The ignored headers (rule table `ignored_value_headers`) with why each is there.
+
+    A shipped default's note starts with `default` (v1's note, and seed version 2's address headers). The headers
+    that carry client addresses are listed even when their row is missing (a database not seeded again yet): their
+    values are never recorded whatever the list says, so `never_recorded` is True and they cannot be recorded again.
+    """
+    stored = await _rules(ctx).list_rows("ignored_value_headers")
+    rows = []
+    seen: set[str] = set()
+    for row in stored:
+        note = str(row.get("note") or "")
+        name = str(row["name"])
+        seen.add(name.lower())
+        default = note == "default" or note.startswith("default:")
+        why = "Detected automatically" if row.get("auto") else ("Default" if default else "Added by an admin")
+        rows.append(
+            {
+                "name": name,
+                "why": why,
+                "note": note,
+                "auto": bool(row.get("auto")),
+                "never_recorded": keeps_no_values(name.lower()),
+            }
+        )
+    for name in sorted(ADDRESS_HEADERS - seen):
+        rows.append(
+            {"name": name, "why": "Default", "note": IGNORED_ADDRESS_HEADER_NOTE, "auto": False, "never_recorded": True}
+        )
+    return rows
+
+
+def _rules(ctx: Any) -> RulesService:
+    return RulesService(ctx.dbs.control, clock=ctx.clock, store=ctx.rules)
+
+
+def _change(change: RuleChange) -> dict[str, Any]:
+    return {
+        "action": change.action,
+        "key": change.key,
+        "changed": change.changed,
+        "item": change.after,
+        "config_version": change.config_version,
+        "audit_id": change.audit_id,
+    }
+
+
+class IgnoreBody(ApiBody):
+    """Stop recording the values of one header (its count is still kept)."""
+
+    name: str = Field(min_length=1, max_length=480)
+    note: str = Field("", max_length=MAX_REASON_LENGTH)
+    reason: str | None = Field(None, max_length=MAX_REASON_LENGTH)
+
+
+@router.post("/fingerprints/ignored")
+async def fingerprint_ignore(
+    request: Request, admin: AdminSession, _csrf: CsrfChecked, body: IgnoreBody
+) -> dict[str, Any]:
+    """Ignore a header's values (rule table `ignored_value_headers`) and delete the values already stored."""
+    ctx = get_ctx(request)
+    row = {"name": body.name, "note": body.note}
+    change = await run_mutation(
+        _rules(ctx).create(
+            "ignored_value_headers", row, actor_for(admin), audit_reason(body.reason), request_id=request_id_of(request)
+        )
+    )
+    name = str(change.key)
+    with service_errors():
+        removed: int = await ctx.dbs.metrics.write(lambda conn: clear_values(conn, name), busy_timeout_ms=2000)
+    answer = _change(change)
+    answer["values_removed"] = removed
+    return answer
+
+
+@router.delete("/fingerprints/ignored/{name}")
+async def fingerprint_unignore(
+    request: Request,
+    admin: AdminSession,
+    _csrf: CsrfChecked,
+    name: Annotated[str, Path(min_length=1, max_length=120)],
+    reason: Annotated[str | None, Query(max_length=MAX_REASON_LENGTH)] = None,
+    name_q: QueryName = None,
+) -> dict[str, Any]:
+    """Record a header's values again (`?name=` instead of the path: `common.name_in_path`, finding esc-2).
+    Refused (422) for a header that carries client addresses: its values are never kept
+    (`fingerprints.ADDRESS_HEADERS`, a privacy rule), so removing it from the list would only mislead."""
+    ctx = get_ctx(request)
+    name = named(name, name_q)
+    if keeps_no_values(name.lower()):
+        text = "This header carries client addresses, so its values are never recorded (privacy)."
+        raise validation_error({"name": text}, text)
+    change = await run_mutation(
+        _rules(ctx).delete(
+            "ignored_value_headers", name.lower(), actor_for(admin), audit_reason(reason),
+            request_id=request_id_of(request),
+        )
+    )  # fmt: skip
+    return _change(change)
+
+
+HeaderName = Annotated[str, Path(min_length=1, max_length=120, pattern=HEADER_NAME_PATTERN)]
+ClearReason = Annotated[str | None, Query(max_length=MAX_REASON_LENGTH)]
+
+
+async def _audit_first(
+    request: Request, admin: AdminPrincipal, action: str, target: str, after: dict[str, Any], reason: str
+) -> int:
+    """The audit row of a fingerprint clear, written BEFORE the delete (plan 9.7 with C7): when control.db cannot
+    take it the answer is 503 and nothing is deleted."""
+    ctx = get_ctx(request)
+    actor = actor_for(admin)
+    request_id = request_id_of(request)
+    now = int(ctx.clock.now())
+
+    def write(conn: sqlite3.Connection) -> int:
+        return audit.record(conn, actor, action, target, None, after, reason or None, request_id, at=now, secret=False)
+
+    with service_errors():
+        audit_id: int = await ctx.dbs.control.write(write)
+    return audit_id
+
+
+@router.delete("/fingerprints/headers/{name}/values")
+async def fingerprint_clear_values(
+    request: Request,
+    admin: AdminSession,
+    _csrf: CsrfChecked,
+    name: HeaderName,
+    reason: ClearReason = None,
+    name_q: QueryName = None,
+) -> dict[str, Any]:
+    """v1 "Clear values" (dashboard.md 4.21, finding parity-11): drop one header's stored values; the header, its
+    count and its recording stay. Audited first (`fingerprints.clear_values`); 404 for a header never recorded."""
+    ctx = get_ctx(request)
+    key = named(name, name_q).lower()
+    text = audit_reason(reason)
+    with service_errors():
+        counts = await ctx.dbs.metrics.read(lambda conn: read_security.header_counts(conn, key))
+    if not counts["headers"] and not counts["values"]:
+        raise not_found("No header with that name is recorded.")
+    audit_id = await _audit_first(
+        request, admin, "fingerprints.clear_values", f"fingerprint_header:{key}", {"values": counts["values"]}, text
+    )
+    with service_errors():
+        removed = await ctx.dbs.metrics.write(
+            lambda conn: read_security.clear_header_values(conn, key), busy_timeout_ms=2000
+        )
+    return {"name": key, "values_removed": removed, "header_kept": bool(counts["headers"]), "audit_id": audit_id}
+
+
+@router.delete("/fingerprints/headers/{name}")
+async def fingerprint_remove_header(
+    request: Request,
+    admin: AdminSession,
+    _csrf: CsrfChecked,
+    name: HeaderName,
+    reason: ClearReason = None,
+    name_q: QueryName = None,
+) -> dict[str, Any]:
+    """v1 "Remove" (dashboard.md 4.21, finding parity-11): drop one header's row and its stored values. Its ignore
+    entry, if any, is a rule and stays; the next request carrying the header records it again. Audited first."""
+    ctx = get_ctx(request)
+    key = named(name, name_q).lower()
+    text = audit_reason(reason)
+    with service_errors():
+        counts = await ctx.dbs.metrics.read(lambda conn: read_security.header_counts(conn, key))
+    if not counts["headers"] and not counts["values"]:
+        raise not_found("No header with that name is recorded.")
+    audit_id = await _audit_first(
+        request, admin, "fingerprints.remove_header", f"fingerprint_header:{key}", counts, text
+    )
+    with service_errors():
+        removed = await ctx.dbs.metrics.write(lambda conn: read_security.remove_header(conn, key), busy_timeout_ms=2000)
+    return {
+        "name": key,
+        "headers_removed": removed["headers"],
+        "values_removed": removed["values"],
+        "audit_id": audit_id,
+    }
+
+
+@router.delete("/fingerprints/blocked/headers/{name}")
+async def fingerprint_remove_blocked_header(
+    request: Request,
+    admin: AdminSession,
+    _csrf: CsrfChecked,
+    name: HeaderName,
+    reason: ClearReason = None,
+    name_q: QueryName = None,
+) -> dict[str, Any]:
+    """v1 "Remove" on the Blocked tab (finding parity-11, the blocked variant): drop one header name's blocked
+    rows. Blocked requests keep no values, so the tab has no "Clear values". Audited first."""
+    ctx = get_ctx(request)
+    key = named(name, name_q).lower()
+    text = audit_reason(reason)
+    with service_errors():
+        requests = await ctx.dbs.metrics.read(lambda conn: read_security.blocked_header_count(conn, key))
+    if not requests:
+        raise not_found("No blocked request carried a header with that name.")
+    audit_id = await _audit_first(
+        request, admin, "fingerprints.remove_blocked_header", f"blocked_header:{key}", {"requests": requests}, text
+    )
+    with service_errors():
+        rows = await ctx.dbs.metrics.write(
+            lambda conn: read_security.remove_blocked_header(conn, key), busy_timeout_ms=2000
+        )
+    return {"name": key, "rows_removed": rows, "requests_removed": requests, "audit_id": audit_id}
+
+
+# =============================================================================================== CSP reports
+
+
+CSP_SPEC: Final = TableSpec(
+    name="csp_reports",
+    columns=(
+        # A CSP report is a POST any browser (or script) can send: every text field is caller text.
+        Column("directive", "Directive", "The CSP directive that refused something.", sortable=False, caller_text=True),
+        Column("blocked", "Blocked", "What the browser refused to load or run.", sortable=False, caller_text=True),
+        Column("document", "Page", "The page it happened on.", sortable=False, caller_text=True),
+        Column("source", "Source file", "The file that tried.", sortable=False, caller_text=True),
+        Column("disposition", "Disposition", "enforce or report.", sortable=False),
+        Column("count", "Count", "Reports in the range.", "count"),
+        Column("last_ms", "Last seen", "The latest report.", "timestamp_ms"),
+    ),
+    default_sort="count",
+)
+
+
+@router.get("/csp-reports")
+async def csp_reports(
+    request: Request,
+    admin: AdminSession,
+    tr: TimeRangeDep,
+    tq: Annotated[TableQuery, Depends(table_params(CSP_SPEC))],
+    fmt: ExportFormatDep,
+    directive: Annotated[str | None, Query(max_length=64, pattern=r"^[a-z-]+$")] = None,
+) -> Any:
+    """Content-Security-Policy violation reports in the range, grouped by what was blocked (plan 9.2)."""
+    fetch = csp_fetch(get_ctx(request), tr, tq, directive or "")
+    return await _paged(request, admin, CSP_SPEC, tq, fmt, fetch, tr=tr, filters={"directive": directive})
+
+
+def csp_fetch(ctx: Any, tr: TimeRange, tq: TableQuery, directive: str = "") -> Fetch:
+    """The page reader of the CSP reports in the range (grouped, sorted and paged in SQL)."""
+    start, end = tr.window.start * 1000, tr.window.end * 1000
+
+    async def fetch(page: int, size: int) -> tuple[Sequence[Any], int]:
+        data = await ctx.dbs.metrics.read(
+            lambda conn: read_security.csp_reports(
+                conn, start, end, directive=directive, sort=tq.sort, descending=tq.descending, limit=size,
+                offset=(page - 1) * size,
+            )
+        )  # fmt: skip
+        return data["rows"], int(data["total"])
+
+    return fetch
+
+
+# =============================================================================================== sessions
+
+
+@router.get("/sessions")
+async def session_list(request: Request, admin: AdminSession) -> dict[str, Any]:
+    """The admin's unexpired sessions, newest first (`current` marks this browser)."""
+    return await sessions_answer(request, admin)
+
+
+async def sessions_answer(request: Request, admin: AdminPrincipal) -> dict[str, Any]:
+    """The `GET /sessions` answer (the Security page reads the same): `id` is the public handle, never the cookie."""
+    auth = get_auth(request)
+    now = int(auth.clock.now())
+    rows = await _auth_call(auth.control_read(lambda conn: sessions.list_for_user(conn, admin.user_id, now)))
+    current = sessions.public_id(admin.session_id)
+    items = [
+        {
+            "id": row["Id"],
+            "created_at": row["CreatedAt"],
+            "last_seen_at": row["LastSeenAt"],
+            "expires_at": row["ExpiresAt"],
+            "ip": row["IP"],
+            "user_agent": row["UserAgent"],
+            "mfa_level": row["MfaLevel"],
+            "current": row["Id"] == current,
+        }
+        for row in rows
+    ]
+    return {"items": items, "total": len(items), "current": current}
+
+
+async def _revoke_sessions(request: Request, admin: AdminPrincipal, mode: str, short_id: str | None) -> Response:
+    """Revoke sessions with the auth package's functions and its audit row, in one control.db transaction."""
+    auth = get_auth(request)
+    info = request_info(request)
+    now = int(auth.clock.now())
+    actions = {
+        "one": "auth.session_revoked",
+        "others": "auth.sessions_revoked_others",
+        "all": "auth.sessions_revoked_all",
+    }
+
+    def write(conn: sqlite3.Connection) -> int:
+        if mode == "one":
+            count = 1 if sessions.revoke_public(conn, admin.user_id, short_id or "") else 0
+        elif mode == "others":
+            count = sessions.revoke_user(conn, admin.user_id, keep=admin.session_id)
+        else:
+            count, _epoch = sessions.revoke_all(conn, now)
+        if count:
+            audit_auth(
+                conn, actions[mode], user_id=admin.user_id, username=admin.username, ip=info.ip,
+                request_id=info.request_id, after={"sessions_ended": count, "session": short_id}, at=now,
+            )  # fmt: skip
+        return count
+
+    count = await _auth_call(auth.control_write(write))
+    if mode == "one" and count == 0:
+        raise not_found("No session of yours has that id.")
+    signed_out = mode == "all" or (mode == "one" and short_id == sessions.public_id(admin.session_id))
+    response = JSONResponse({"revoked": count, "signed_out": signed_out})
+    if signed_out:
+        clear_session_cookie(response)
+    return response
+
+
+@router.post("/sessions/{session_id}/revoke")
+async def session_revoke(
+    request: Request,
+    admin: AdminSession,
+    _csrf: CsrfChecked,
+    session_id: Annotated[str, Path(pattern=r"^[0-9a-f]{16}$")],
+) -> Response:
+    """End one of your sessions (this browser's too, which signs it out)."""
+    return await _revoke_sessions(request, admin, "one", session_id)
+
+
+@router.post("/sessions/revoke-others")
+async def session_revoke_others(request: Request, admin: AdminSession, _csrf: CsrfChecked) -> Response:
+    """End every other session of yours."""
+    return await _revoke_sessions(request, admin, "others", None)
+
+
+@router.post("/sessions/revoke-all")
+async def session_revoke_all(request: Request, admin: AdminSession, _csrf: CsrfChecked) -> Response:
+    """Sign out everywhere (the epoch kill switch from the dashboard), this browser included."""
+    return await _revoke_sessions(request, admin, "all", None)
+
+
+# =============================================================================================== trusted devices
+
+
+@router.get("/trusted-devices")
+async def trusted_list(request: Request, admin: AdminSession) -> dict[str, Any]:
+    """Trusted devices (row 100): name, browser family, last use; `this_device` marks this browser."""
+    return await trusted_answer(request, admin)
+
+
+async def trusted_answer(request: Request, admin: AdminPrincipal) -> dict[str, Any]:
+    """The `GET /trusted-devices` answer (the Security page reads the same)."""
+    auth = get_auth(request)
+    now = int(auth.clock.now())
+    rows = await _auth_call(auth.control_read(lambda conn: trusted_devices.list_for_user(conn, admin.user_id, now)))
+    this_device = None
+    cookie = request.cookies.get(trusted_devices.TRUSTED_COOKIE)
+    if cookie:
+        try:
+            found = await auth.control_read(lambda conn: trusted_devices.find_valid(conn, cookie, admin.ua, now))
+            this_device = found.id if found is not None and found.user_id == admin.user_id else None
+        except AuthError:
+            this_device = None
+    items = [
+        {
+            "id": row["Id"],
+            "name": row["Name"],
+            "family": row["Family"],
+            "created_at": row["CreatedAt"],
+            "last_used_at": row["LastUsedAt"],
+            "expires_at": row["ExpiresAt"],
+            "this_device": row["Id"] == this_device,
+        }
+        for row in rows
+    ]
+    return {
+        "items": items,
+        "total": len(items),
+        "enabled": bool(auth.settings.bool("admin_trusted_devices_enabled")),
+        "this_device": this_device,
+    }
+
+
+async def _revoke_trusted(request: Request, admin: AdminPrincipal, device_id: int | None) -> int:
+    auth = get_auth(request)
+    info = request_info(request)
+    now = int(auth.clock.now())
+
+    def write(conn: sqlite3.Connection) -> int:
+        if device_id is None:
+            count = trusted_devices.revoke_all(conn, admin.user_id)
+        else:
+            count = 1 if trusted_devices.revoke(conn, admin.user_id, device_id) else 0
+        if count:
+            audit_auth(
+                conn,
+                "auth.trusted_devices_revoked_all" if device_id is None else "auth.trusted_device_revoked",
+                user_id=admin.user_id, username=admin.username, ip=info.ip, request_id=info.request_id,
+                after={"revoked": count, "device_id": device_id}, at=now,
+            )  # fmt: skip
+        return count
+
+    count: int = await _auth_call(auth.control_write(write))
+    return count
+
+
+@router.post("/trusted-devices/{device_id}/revoke")
+async def trusted_revoke(
+    request: Request, admin: AdminSession, _csrf: CsrfChecked, device_id: Annotated[int, Path(ge=1, le=2**62)]
+) -> dict[str, Any]:
+    """Revoke one trusted device (it needs the full second factor next time)."""
+    if await _revoke_trusted(request, admin, device_id) == 0:
+        raise not_found("No trusted device of yours has that id.")
+    return {"revoked": 1}
+
+
+@router.post("/trusted-devices/revoke-all")
+async def trusted_revoke_all(request: Request, admin: AdminSession, _csrf: CsrfChecked) -> Response:
+    """Revoke every trusted device, this browser's included (its cookie is cleared too)."""
+    count = await _revoke_trusted(request, admin, None)
+    response = JSONResponse({"revoked": count})
+    response.delete_cookie(trusted_devices.TRUSTED_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+    return response
+
+
+# =============================================================================================== passkeys
+
+
+class PasskeyRename(ApiBody):
+    name: str = Field(min_length=1, max_length=webauthn.MAX_NAME)
+
+
+@router.get("/passkeys")
+async def passkey_list(request: Request, _admin: AdminSession) -> dict[str, Any]:
+    """Your passkeys (never the key material)."""
+    return await passkeys_answer(request)
+
+
+async def passkeys_answer(request: Request) -> dict[str, Any]:
+    """The `GET /passkeys` answer for the request's signed-in admin (the Security page reads the same)."""
+    record = _session_record(request)
+    items = await _auth_call(enrollment.passkey_list(get_auth(request), record))
+    keys = [
+        {"id": item["Id"], "name": item["Name"], "created_at": item["CreatedAt"], "last_used_at": item["LastUsedAt"]}
+        for item in items
+    ]
+    return {"items": keys, "total": len(keys), "max": webauthn.MAX_PASSKEYS_PER_USER}
+
+
+@router.patch("/passkeys/{passkey_id}")
+async def passkey_rename(
+    request: Request,
+    admin: AdminFreshMfa,
+    _csrf: CsrfChecked,
+    passkey_id: Annotated[int, Path(ge=1, le=2**62)],
+    body: PasskeyRename,
+) -> dict[str, Any]:
+    """Rename a passkey (fresh second factor). One transaction: the new name and its audit row."""
+    auth = get_auth(request)
+    info = request_info(request)
+    now = int(auth.clock.now())
+    clean = " ".join(body.name.split())[: webauthn.MAX_NAME]
+    if not clean:
+        raise validation_error({"name": "Give the passkey a name."})
+
+    def write(conn: sqlite3.Connection) -> str | None:
+        row = conn.execute(
+            "SELECT name FROM admin_passkeys WHERE id = ? AND user_id = ?", (passkey_id, admin.user_id)
+        ).fetchone()
+        if row is None:
+            return None
+        before = str(row[0] or "")
+        if before != clean:
+            conn.execute("UPDATE admin_passkeys SET name = ? WHERE id = ? AND user_id = ?", (clean, passkey_id,
+                                                                                            admin.user_id))  # fmt: skip
+            audit_auth(
+                conn, "auth.passkey_renamed", user_id=admin.user_id, username=admin.username, ip=info.ip,
+                request_id=info.request_id, before={"passkey_id": passkey_id, "name": before},
+                after={"passkey_id": passkey_id, "name": clean}, at=now,
+            )  # fmt: skip
+        return before
+
+    before = await _auth_call(auth.control_write(write))
+    if before is None:
+        raise not_found("No passkey of yours has that id.")
+    return {"id": passkey_id, "name": clean, "changed": before != clean}
+
+
+@router.delete("/passkeys/{passkey_id}")
+async def passkey_delete(
+    request: Request,
+    _admin: AdminFreshMfa,
+    _csrf: CsrfChecked,
+    passkey_id: Annotated[int, Path(ge=1, le=2**62)],
+) -> dict[str, Any]:
+    """Delete a passkey (fresh second factor)."""
+    record = _session_record(request)
+    removed = await _auth_call(enrollment.passkey_delete(get_auth(request), request_info(request), record, passkey_id))
+    if not removed:
+        raise not_found("No passkey of yours has that id.")
+    return {"removed": True}
+
+
+# =============================================================================================== recovery codes
+
+
+@router.get("/recovery-codes")
+async def recovery_status(request: Request, _admin: AdminSession) -> dict[str, Any]:
+    """How many recovery codes you have left (never the codes)."""
+    return await recovery_answer(request)
+
+
+async def recovery_answer(request: Request) -> dict[str, Any]:
+    """The `GET /recovery-codes` answer (counts only; the Security page reads the same)."""
+    record = _session_record(request)
+    status = await _auth_call(enrollment.recovery_status(get_auth(request), record))
+    return {"total": status["Total"], "remaining": status["Remaining"]}
+
+
+@router.post("/recovery-codes/regenerate")
+async def recovery_regenerate(request: Request, _admin: AdminFreshMfa, _csrf: CsrfChecked) -> dict[str, Any]:
+    """Replace every recovery code (fresh second factor). The new codes are shown once, here, and never again."""
+    record = _session_record(request)
+    codes = await _auth_call(enrollment.regenerate_recovery(get_auth(request), request_info(request), record))
+    return {"codes": codes, "total": len(codes), "note": "Store these now; they are not shown again."}
+
+
+__all__ = [
+    "BLOCKED_CALLER_TEXT",
+    "BLOCKED_SPEC",
+    "CRAWL_SPEC",
+    "CSP_SPEC",
+    "HEADER_SPEC",
+    "IGNORED_SPEC",
+    "LOGIN_SPEC",
+    "PROBE_SPEC",
+    "SUMMARY_SPEC",
+    "UA_DETAIL_CALLER_TEXT",
+    "UA_SPEC",
+    "VALUE_SPEC",
+    "auth_error",
+    "blocked_table_rows",
+    "crawl_rows",
+    "csp_fetch",
+    "header_fetch",
+    "ignored_rows",
+    "listed_page",
+    "passkeys_answer",
+    "probe_summary_rows",
+    "recovery_answer",
+    "ring_fetch",
+    "router",
+    "sessions_answer",
+    "table_page",
+    "trusted_answer",
+    "user_agent_detail_answer",
+    "user_agent_fetch",
+    "values_fetch",
+]

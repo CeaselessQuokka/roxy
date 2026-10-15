@@ -1,0 +1,31 @@
+format: roxy.health_fixture/1
+check: H-CACHE-HIT
+case: warn
+name: 5_percent_still_only_warns
+description: >
+  In the last hour only 300 of 6,000 caller requests were answered without an upstream call: 5% avoided, below
+  the 10% line. 13.2 H-CACHE-HIT is a warn-only check ("lower (only warn)"), so even this gives warn, never fail.
+  There is no fail fixture for this check.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  traffic_defaults:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    user_agent: "Roblox/Linux"
+  profiles:
+    hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: 4}
+    miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 150, p95: 400, p99: 700}}
+  traffic:
+    - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 300}
+    - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 4200}
+    - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], total: 1500}
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 6000
+      upstream_calls: 5700
+      avoided_calls: 300
+  status: warn
+  value: {lte: 10}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)cache"}
+  credential_calls: {eq: 0}

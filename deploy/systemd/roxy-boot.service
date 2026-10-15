@@ -1,0 +1,25 @@
+# roxy-boot.service: starts the active Roxy color at boot.
+#
+# Neither roxy@blue nor roxy@green is ever enabled, because the color that should run changes with every deploy
+# and the deploy user may not run `systemctl enable` (plan 9.14). This oneshot reads which color nginx points at
+# (/etc/nginx/roxy-active-upstream.conf, a root-owned symlink) and starts that one. Every directive says why.
+
+[Unit]
+# Shown in `systemctl list-units`.
+Description=Start the active Roxy color
+# The color's own unit already waits for the network; ordering after nginx means the first request finds both up.
+After=network-online.target nginx.service
+# Pull in network-online.target so the ordering above is meaningful.
+Wants=network-online.target
+
+[Service]
+# Starts the color and exits; the color unit then runs on its own.
+Type=oneshot
+# The root wrapper validates the symlink target (blue or green only) and runs `systemctl start roxy@<color>`.
+ExecStart=/usr/local/sbin/roxy-switch-color --boot
+# Keep the unit "active" after the start so `systemctl status roxy-boot` shows it ran.
+RemainAfterExit=yes
+
+[Install]
+# Run at every boot with the normal services.
+WantedBy=multi-user.target

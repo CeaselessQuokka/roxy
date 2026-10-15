@@ -1,0 +1,99 @@
+# SYS-DISK, first condition: "total storage > 70% of storage_total_budget_gb" (11.5; insight_sys_disk_budget_pct =
+# 70, storage_total_budget_gb = 12).
+#
+# Disk facts come from `state.disk` (provider seam; README "Extensions" for the meaning of each field). Roxy's
+# storage is the sum of `files` (bytes plus WAL): 9.6e9 bytes, which is 80% of 12 GB, or 74.5% if a rule reads GB as
+# GiB; over 70% either way. The other two conditions are clearly false, so only this one can fire:
+#
+#   30-day projection   growth 9.3e9 -> 9.6e9 over 30 days (0.01e9 a day): 9.9e9 in 30 days, under the budget
+#   free disk           60e9 of 100e9 free (60%), far above 15%
+#   dims per minute     300 on average over 7 days, under insight_sys_disk_dims_per_minute (1500)
+#
+# 11.5's change: "lower retention, raise budget, or VACUUM". Retention may only go down, the budget only up, and a
+# VACUUM is a `manual` step. Every one of these is a global setting or a manual step: never safe_auto.
+
+format: roxy.insight_fixture/1
+rule: SYS-DISK
+case: over_budget_share
+description: >
+  Roxy's databases and files use 9.6e9 bytes against a 12 GB budget (80%), with slow growth and plenty of free disk.
+  SYS-DISK must recommend lower retention, a larger budget or a VACUUM, and never raise a retention or shrink the
+  budget.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  disk:
+    total_bytes: 100000000000
+    free_bytes: 60000000000
+    files:
+      "metrics.db": {bytes: 8500000000, wal_bytes: 60000000}
+      "cache.db": {bytes: 500000000, wal_bytes: 40000000}
+      "control.db": {bytes: 30000000, wal_bytes: 4000000}
+      "hot.db": {bytes: 20000000, wal_bytes: 6000000}
+      "exports": {bytes: 140000000, wal_bytes: 0}
+      "snapshots": {bytes: 300000000, wal_bytes: 0}
+    tables:
+      "metrics.rollup_minute": 5600000000
+      "metrics.request_samples": 1600000000
+      "metrics.events": 700000000
+      "metrics.client_minute": 450000000
+      "cache.entries": 480000000
+    growth:
+      - {at: "-30d", total_bytes: 9300000000}
+      - {at: "-15d", total_bytes: 9450000000}
+      - {at: "now", total_bytes: 9600000000}
+    dims_per_minute_7d_avg: 300
+
+expect:
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: SYS-DISK
+      severity: any
+      family: system
+      confidence: high
+      safe_auto: false
+      changes_required:
+        - any_of:
+            - kind: setting
+              key:
+                in: [retention_minute_days, retention_hour_days, retention_day_days, retention_client_minute_days,
+                     retention_client_hour_days, retention_client_day_days, retention_events_days,
+                     retention_upstream_429_days, retention_errors_days, retention_fingerprints_days,
+                     retention_snapshots_days, retention_exports_days, request_sample_hours, request_sample_max_rows,
+                     events_max_rows]
+            - {kind: setting, key: storage_total_budget_gb, current: 12, proposed: {gt: 12}}
+            - {kind: manual}
+      changes_forbidden:
+        - {kind: setting, key: storage_total_budget_gb, proposed: {lt: 12}}
+        - {kind: setting, key: retention_minute_days, proposed: {gt: 14}}
+        - {kind: setting, key: retention_hour_days, proposed: {gt: 400}}
+        - {kind: setting, key: retention_client_minute_days, proposed: {gt: 3}}
+        - {kind: setting, key: retention_client_hour_days, proposed: {gt: 90}}
+        - {kind: setting, key: retention_events_days, proposed: {gt: 90}}
+        - {kind: setting, key: request_sample_hours, proposed: {gt: 24}}
+        - {kind: setting, key: request_sample_max_rows, proposed: {gt: 3000000}}
+        - {kind: setting, key: {in: [cache_enabled, activity_tracking, capture_enabled, metrics_queue_max]}}
+      change_kinds_forbidden: [bucket_override, rule_upsert, rule_delete, ban_add, bypass_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_sys_disk_enabled: 0}
+    expect: {fires: false}
+  - case: budget_pct_raised
+    description: At 85% of the budget the 80% use (74.5% read as GiB) is acceptable; projection and free disk are fine.
+    settings: {insight_sys_disk_budget_pct: 85}
+    expect: {fires: false}
+  - case: budget_raised
+    description: A 20 GB budget makes the use 48% and the 30-day projection (9.9e9) fits.
+    settings: {storage_total_budget_gb: 20}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_sys_disk_severity replaces the computed severity.
+    settings: {insight_sys_disk_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: critical}

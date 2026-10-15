@@ -1,0 +1,57 @@
+{#-
+  Data page macros (page-local; `roxy/admin/pages/data.py`).
+
+  What: `when(cell)` shows a `fmt.time_cell` as a <time> element; `setting_ref(link)` links a table's limit to the
+  setting that sets it (its inline editor on this page, else the Settings page); `limit_table(rows, caption, ...)`
+  is the table of tables against their limits (retention and record cap cards); `typed_dialog(...)` is a confirm
+  dialog whose typed phrase is itself sent to the API as `confirm` (VACUUM asks for the phrase in its body).
+  Why: `POST /data/vacuum` checks the phrase on the server too, so the admin's own typing is what the API
+  receives (the shared confirm dialog's `confirm_field`).
+  How: plain macros over the shared components; the dialog is `components/dialog.html confirm_dialog` with the
+  `typeConfirm` Alpine component, so the button stays off until the text matches.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/format.html" import num %}
+
+{% from "components/pieces.html" import when as _when %}
+{% macro when(cell, empty="n/a") -%}{{ _when(cell, empty=empty, stacked=True) }}{%- endmacro %}
+
+{% macro setting_ref(link) -%}
+{%- if link %} <a class="data-setting-ref" href="{{ link.href }}">{{ link.label }}</a>{% endif -%}
+{%- endmacro %}
+
+{% macro limit_table(rows, caption, human_bytes, show_age=True) -%}
+<div class="table-scroll data-limits" role="region" aria-label="{{ caption }}" tabindex="0">
+  <table class="simple-table data-table">
+    <caption class="sr-only">{{ caption }}</caption>
+    <thead>
+      <tr>
+        <th scope="col">Table</th><th scope="col" class="num">Rows now</th><th scope="col">Oldest row</th>
+        {% if show_age %}<th scope="col">Kept for</th>{% endif %}<th scope="col">Row cap</th><th scope="col">State</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td data-label="Table"><span class="data-table__label">{{ r.label }}</span><span class="dt__sub mono">{{ r.name }}</span>{% if r.rule %}<span class="dt__sub">{{ r.rule }}</span>{% endif %}</td>
+        <td data-label="Rows now" class="num">{{ num(r.rows) }}</td>
+        <td data-label="Oldest row">{{ when(r.oldest_cell, "no time column") }}</td>
+        {% if show_age %}<td data-label="Kept for">{% if r.age %}{{ r.age }}{% else %}<span class="muted">no age limit</span>{% endif %}{{ setting_ref(r.age_setting) }}</td>{% endif %}
+        <td data-label="Row cap">{% if r.row_cap is not none %}{{ num(r.row_cap) }}{% else %}<span class="muted">none</span>{% endif %}{{ setting_ref(r.cap_setting) }}</td>
+        <td data-label="State"><span class="tone tone--{{ r.status_cell.tone }}">{{ r.status_cell.text }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{%- endmacro %}
+
+{% macro typed_dialog(id, title, action, phrase, consequences=(), confirm_label="Confirm", hidden=None, success="Done.",
+                      refresh="", body=None) -%}
+{%- set types = {} -%}{%- for name in (hidden or {}) %}{% set _ = types.update({name: "string"}) %}{% endfor -%}
+{{ confirm_dialog(id, title, action, confirm_label=confirm_label, danger=True, consequences=consequences, body=body,
+                  type_to_confirm=phrase, confirm_field="confirm", confirm_hint="The button stays off until the text matches.",
+                  reason=True, hidden=hidden, hidden_types=types, api=True, success=success, on_success="refresh",
+                  refresh=refresh, form_attrs={"data-operation": "", "novalidate": ""}) }}
+{%- endmacro %}

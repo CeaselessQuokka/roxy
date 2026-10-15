@@ -1,0 +1,19 @@
+{#-
+  Clients page: one client as a page of its own (`/admin/clients/ip/{ip}`, `/admin/clients/place/{place}`,
+  `roxy/admin/pages/clients.py`). The shell (base.html) with the client view as its body (`body_template`:
+  `clients/client.html`, the drawer's own body, so the two cannot drift); the time range in the top bar applies.
+  The page title names the client; actions reload the page after they succeed.
+-#}
+{% extends "admin/base.html" %}
+{% from "components/icon.html" import icon %}
+{% block page_actions %}
+<a class="btn btn--ghost" href="/admin/clients">{{ icon("users") }}<span>All clients</span></a>
+{% endblock %}
+{% block content %}
+<div class="page-cards stack-lg">
+  <section class="card page-card" aria-labelledby="client-page-title">
+    <header class="card__head"><div class="card__titles"><h2 class="card__title" id="client-page-title">Client details</h2></div></header>
+    <div class="card__body">{% include body_template %}</div>
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,103 @@
+{#-
+  Number formatting macros (text only, safe inside attributes).
+
+  What: `num(1234567)` -> "1,234,567"; `compact(1234567)` -> "1.2M"; `bytes(67108864)` -> "64.0 MiB";
+  `pct(0.4567)` -> "45.7%"; `duration(5400)` -> "1h 30m". A missing value (None) renders "n/a" (plan C5: the v1
+  dash placeholder becomes "n/a").
+  Why: one formatter for every number keeps tiles, tables and charts consistent; static/js/format.js mirrors these
+  rules for numbers formatted in the browser.
+  How: plain Jinja arithmetic and str.format; sizes use binary units (KiB = 1024 bytes) like the settings editor.
+  Also `local_href(url)`: the URL when it is a path on this site ("/admin/audit#4"), else nothing. Links that
+  come from data (table cells, chart annotations) go through it, so a value such as "https://...",
+  "javascript:..." or "//host/..." never becomes a link; the text stays. Browsers read "/\host" like "//host" and
+  drop tabs and line breaks inside a URL ("/<tab>/host" also becomes "//host"), so those are refused too.
+
+  `caller_text(value, limit=200)` is THE way to show text a caller chose (every field an API answer lists in
+  `caller_text`, every `Column(caller_text=True)`: paths, templates, User-Agents, header names, place names,
+  errors quoting them). It is escaped like everything else, isolated for bidirectional text (`dir="auto"`,
+  `unicode-bidi: isolate` in CSS: a right-to-left override inside a User-Agent cannot flip the words around it),
+  marked `translate="no"`, never put into an attribute that is interpreted (no href, src or style), and cut at
+  `limit` characters with a note of the full length (the drawer or the API has the rest).
+  `metric_value(value, unit, key="")` formats a number by its metric unit (`metrics/catalog.py` units).
+  `cell_value(cell)` renders a cell a route built (`{"text", "tone", "sub"}`, the same shape the table macro takes)
+  outside a data table: the text in its tone and the note under it; None is "n/a". An avoided share comes from
+  `admin/pages/fmt.py avoided_cell` this way on every page (a negative share with why it is negative).
+-#}
+{% macro cell_value(cell) -%}
+{%- if cell is none -%}n/a
+{%- else -%}
+{%- if cell.tone -%}<span class="tone tone--{{ cell.tone }}">{{ cell.text }}</span>{%- else -%}{{ cell.text }}{%- endif -%}
+{%- if cell.sub %}<span class="dt__sub">{{ cell.sub }}</span>{% endif -%}
+{%- endif -%}
+{%- endmacro %}
+{% macro caller_text(value, limit=200, block=False) -%}
+{%- if value is none or value == "" -%}<span class="muted">n/a</span>
+{%- else -%}
+{%- set text = value|string -%}
+<{{ "span" if not block else "div" }} class="caller-text{% if block %} caller-text--block{% endif %}" dir="auto" translate="no">{{ text[:limit] }}{% if text|length > limit %}<span class="caller-text__cut"> (first {{ limit }} of {{ "{:,}".format(text|length) }} characters)</span>{% endif %}</{{ "span" if not block else "div" }}>
+{%- endif -%}
+{%- endmacro %}
+
+{% macro metric_value(value, unit="", key="") -%}
+{%- if value is none -%}n/a
+{%- elif value is not number -%}{{ value }}
+{%- elif unit == "bytes" -%}{{ bytes(value) }}
+{%- elif unit == "percent" -%}{{ "{:,.1f}".format(value) }}%
+{%- elif unit == "ratio" and (key.endswith("ratio") or key.endswith("_rate")) -%}{{ pct(value) }}
+{%- elif unit == "ms" -%}{{ "{:,.0f}".format(value) if value >= 10 else "{:,.1f}".format(value) }}
+{%- elif unit in ("seconds", "s") -%}{{ duration(value) }}
+{%- elif value is integer -%}{{ "{:,}".format(value) }}
+{%- else -%}{{ "{:,.2f}".format(value) }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro unit_suffix(unit, key="") -%}
+{%- if unit == "ms" -%}ms
+{%- elif unit == "ratio" and not (key.endswith("ratio") or key.endswith("_rate")) -%}
+{%- elif unit in ("percent", "bytes", "seconds", "s", "ratio", "", "count", "rows") -%}
+{%- else -%}{{ unit }}
+{%- endif -%}
+{%- endmacro %}
+{% macro local_href(url) -%}
+{%- if url is string and url[:1] == "/" and url[1:2] not in ("/", "\\")
+      and "\t" not in url and "\n" not in url and "\r" not in url -%}{{ url }}{%- endif -%}
+{%- endmacro %}
+
+{% macro num(value, digits=0) -%}
+{%- if value is none -%}n/a{%- else -%}{{ "{:,.{}f}".format(value, digits) }}{%- endif -%}
+{%- endmacro %}
+
+{% macro compact(value) -%}
+{%- if value is none -%}n/a
+{%- elif value|abs < 1000 -%}{{ "{:,.0f}".format(value) }}
+{%- elif value|abs < 1000000 -%}{{ "{:.1f}".format(value / 1000) }}k
+{%- elif value|abs < 1000000000 -%}{{ "{:.1f}".format(value / 1000000) }}M
+{%- else -%}{{ "{:.1f}".format(value / 1000000000) }}B
+{%- endif -%}
+{%- endmacro %}
+
+{% macro bytes(value) -%}
+{%- if value is none -%}n/a
+{%- elif value < 1024 -%}{{ "{:,.0f}".format(value) }} B
+{%- elif value < 1048576 -%}{{ "{:.1f}".format(value / 1024) }} KiB
+{%- elif value < 1073741824 -%}{{ "{:.1f}".format(value / 1048576) }} MiB
+{%- elif value < 1099511627776 -%}{{ "{:.1f}".format(value / 1073741824) }} GiB
+{%- else -%}{{ "{:.1f}".format(value / 1099511627776) }} TiB
+{%- endif -%}
+{%- endmacro %}
+
+{% macro pct(ratio, digits=1) -%}
+{%- if ratio is none -%}n/a{%- else -%}{{ "{:.{}f}".format(ratio * 100, digits) }}%{%- endif -%}
+{%- endmacro %}
+
+{% macro duration(seconds) -%}
+{%- if seconds is none -%}n/a
+{%- else -%}
+{%- set s = seconds|int -%}
+{%- if s < 60 -%}{{ s }}s
+{%- elif s < 3600 -%}{{ s // 60 }}m{% if s % 60 %} {{ s % 60 }}s{% endif %}
+{%- elif s < 86400 -%}{{ s // 3600 }}h{% if (s % 3600) // 60 %} {{ (s % 3600) // 60 }}m{% endif %}
+{%- else -%}{{ s // 86400 }}d{% if (s % 86400) // 3600 %} {{ (s % 86400) // 3600 }}h{% endif %}
+{%- endif -%}
+{%- endif -%}
+{%- endmacro %}

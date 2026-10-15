@@ -1,0 +1,40 @@
+{#-
+  Left sidebar (plan 14.1): collapsible, icons plus labels, grouped pages, Help at the bottom.
+
+  The current page gets `aria-current="page"`. Collapsing (the panel button, remembered in this browser by
+  static/js/app.js) hides the labels visually but keeps them as the links' accessible names, and shows them as
+  tooltips. On a phone the sidebar is not shown at all: admin/_layout/mobile_nav.html takes over (plan 14.8).
+  Context: `page.id`, `recs.open` (badge on Recommendations), `env_name`, `version`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "admin/_layout/nav.html" import NAV, HELP_PAGE, page_href %}
+{% set current = page.id if page is defined and page else "" %}
+<nav class="sidebar" id="sidebar" aria-label="Dashboard pages">
+  <div class="sidebar__brand">
+    <a class="brand" href="{{ page_href('overview') }}">{{ icon("logo", cls="brand__mark") }}<span class="brand__name">Roxy</span><span class="brand__tag">Admin</span></a>
+    <button type="button" class="icon-btn icon-btn--sm sidebar__collapse" data-sidebar-toggle aria-expanded="true" aria-controls="sidebar" aria-label="Collapse the sidebar">{{ icon("panel") }}</button>
+  </div>
+  <div class="sidebar__scroll">
+    {% for group in NAV %}
+    <div class="nav-group">
+      <h2 class="nav-group__title" id="nav-{{ group.id }}">{{ group.label }}</h2>
+      <ul class="nav-list" aria-labelledby="nav-{{ group.id }}">
+        {% for item in group["items"] %}
+        <li>
+          <a class="nav-link" href="{{ page_href(item.id) }}" data-tip="{{ item.label }}" data-nav-id="{{ item.id }}"{% if item.id == current %} aria-current="page"{% endif %}>
+            {{ icon(item.icon, cls="nav-link__icon") }}<span class="nav-link__label">{{ item.label }}</span>
+            {% if item.id == "recommendations" and recs is defined and recs and recs.open %}
+            <span class="count-badge{% if recs.critical %} count-badge--bad{% endif %}">{{ recs.open }}<span class="sr-only"> open</span></span>
+            {% endif %}
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endfor %}
+  </div>
+  <div class="sidebar__foot">
+    <a class="nav-link" href="{{ page_href(HELP_PAGE.id) }}" data-tip="Help" data-nav-id="help"{% if current == "help" %} aria-current="page"{% endif %}>{{ icon("help", cls="nav-link__icon") }}<span class="nav-link__label">Help</span></a>
+    <p class="sidebar__meta"><span class="env-dot env-dot--{{ env_name|default('production') }}" aria-hidden="true"></span><span class="nav-link__label">{{ (env_name|default("production"))|capitalize }}{% if version is defined and version %} v{{ version }}{% endif %}</span></p>
+  </div>
+</nav>

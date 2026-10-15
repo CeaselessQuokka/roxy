@@ -1,0 +1,140 @@
+# UP-5XX: a Roblox outage on one endpoint (format: README.md in this directory).
+#
+# 11.5: "5xx rate > 5% over 10 min (min 100 calls)"; evidence: rate, endpoints, timeline; change: "Enable SWR or
+# raise stale window on affected endpoints; open breaker sooner"; confidence medium. The per-endpoint knob for
+# SWR and the stale window is the cache rule's `stale_ttl` (11.2 example and 11.6 card), so the required change
+# is a cache rule for the affected endpoint with stale_ttl above 0. Global cache defaults are not "on affected
+# endpoints" and are forbidden; a breaker setting may come along but only in the "sooner" direction.
+#
+# Last 10 minutes (upstream_max_attempts = 2, the default):
+#
+#   GET games.roblox.com/v1/games      requests  calls  5xx calls
+#   games_ok                           1,000     1,000  0
+#   games_5xx_failed (503 twice)       200       400    400
+#   games_5xx_stale (503, served stale) 100      100    100
+#   games_5xx_retry_ok (503, then 200) 100       200    100
+#   thumbnails and users, all 200      1,200     1,200  0
+#
+# 5xx share of calls: 600 / 2,900 = 20.7% overall, 35.3% on games; of requests that went upstream, 300 / 2,600 =
+# 11.5% ended in a 5xx (failed or stale). Every reading is above 5%, and only games.roblox.com/v1/games is affected.
+
+format: roxy.insight_fixture/1
+rule: UP-5XX
+case: games_outage
+description: >
+  For the last ten minutes Roblox has answered a fifth of all calls to games.roblox.com/v1/games with 503 while
+  thumbnails and users answer normally. The rule must recommend stale-while-revalidate (stale_ttl above 0) for
+  that endpoint's cache rule, may suggest opening breakers sooner, and must not change global cache defaults or
+  other endpoints' rules.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games", type: glob, ttl: 60, stale_ttl: 0, methods: "GET", origin: admin, created_at: "-30d"}
+    - {id: 2, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, stale_ttl: 120, methods: "GET", origin: admin, created_at: "-30d"}
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: games.roblox.com/v1/games
+
+profiles:
+  ok: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 150, p95: 400, p99: 800}}
+  thumbs: {endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot}
+  users: {endpoint_template: "users.roblox.com/v1/users/{userId}"}
+
+traffic:
+  # --- Before the outage ----------------------------------------------------------------------------------------
+  - {name: games_ok_before, profile: ok, window: ["-60m", "-10m"], per_minute: 100}
+  - {name: thumbs_ok_before, profile: [ok, thumbs], window: ["-60m", "-10m"], per_minute: 80}
+  - {name: users_ok_before, profile: [ok, users], window: ["-60m", "-10m"], per_minute: 40}
+  # --- The last 10 minutes --------------------------------------------------------------------------------------
+  - {name: games_ok, profile: ok, window: ["-10m", "0m"], per_minute: 100}
+  - name: games_5xx_failed
+    window: ["-10m", "0m"]
+    per_minute: 20
+    egress: direct
+    outcome: failed
+    reason: upstream_5xx
+    status: 503
+    source: roxy
+    cache_state: "MISS"
+    upstream_status: 503
+    upstream_calls: 2
+    error: true
+    latency_ms: {p50: 900, p95: 2200, p99: 2600}
+  - name: games_5xx_stale
+    window: ["-10m", "0m"]
+    per_minute: 10
+    egress: direct
+    outcome: served_cache
+    reason: cache_stale_error
+    status: 200
+    source: cache
+    cache_state: "STALE"
+    upstream_status: 503
+    upstream_calls: 1
+    error: true
+    latency_ms: {p50: 400, p95: 700, p99: 900}
+  - {name: games_5xx_retry_ok, profile: ok, window: ["-10m", "0m"], per_minute: 10, upstream_calls: 2, latency_ms: {p50: 700, p95: 1500, p99: 2000}}
+  - {name: thumbs_ok, profile: [ok, thumbs], window: ["-10m", "0m"], per_minute: 80}
+  - {name: users_ok, profile: [ok, users], window: ["-10m", "0m"], per_minute: 40}
+
+events:
+  upstream_attempts:
+    # games_5xx_failed: 503, then 503 again (2 attempts).
+    - {window: ["-10m", "0m"], per_minute: 20, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: 503, kind: first}
+    - {window: ["-10m", "0m"], per_minute: 20, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: 503, kind: retry_5xx}
+    # games_5xx_stale: one 503, then served stale.
+    - {window: ["-10m", "0m"], per_minute: 10, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: 503, kind: first}
+    # games_5xx_retry_ok: 503, then 200.
+    - {window: ["-10m", "0m"], per_minute: 10, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: 503, kind: first}
+    - {window: ["-10m", "0m"], per_minute: 10, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: 200, kind: retry_5xx}
+
+expect:
+  data_checks:
+    - window: ["-10m", "0m"]
+      upstream_calls: 2900
+      by_reason: {upstream_5xx: 200, cache_stale_error: 100}
+    - window: ["-10m", "0m"]
+      where: {endpoint_template: games.roblox.com/v1/games}
+      requests: 1400
+      upstream_calls: 1700
+    - window: ["-60m", "-10m"]
+      by_reason: {upstream_5xx: 0, cache_stale_error: 0}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - confidence: medium
+      family: upstream
+      change_kinds_forbidden: [bucket_override, routing_rule, ban_add, credential_allowlist_remove]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["games.roblox.com/v1/games"]}}
+          proposed: {stale_ttl: {gte: 1}}
+      changes_forbidden:
+        - kind: rule_upsert
+          match:
+            pattern:
+              matches_targets: ["thumbnails.roblox.com/v1/users/avatar-headshot", "users.roblox.com/v1/users/1000000001"]
+        - {kind: setting, key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_stale_seconds]}}
+        - {kind: setting, key: breaker_failure_threshold, proposed: {gte: 5}}
+        - {kind: setting, key: breaker_failure_ratio, proposed: {gte: 0.5}}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_up_5xx_enabled: 0}
+    expect: {fires: false}
+  - case: rate_pct_40
+    description: No reading of the 5xx rate reaches 40% (the highest is 35.3%, games calls only).
+    settings: {insight_up_5xx_rate_pct: 40}
+    expect: {fires: false}
+  - case: min_calls_3000
+    description: 2,900 upstream calls in the window (1,700 on games) are below a minimum of 3,000.
+    settings: {insight_up_5xx_min_calls: 3000}
+    expect: {fires: false}

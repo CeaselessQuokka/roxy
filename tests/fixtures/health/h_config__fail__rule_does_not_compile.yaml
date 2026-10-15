@@ -1,0 +1,21 @@
+format: roxy.health_fixture/1
+check: H-CONFIG
+case: fail
+name: rule_does_not_compile
+description: >
+  Cache rule 2 fails to compile (fault `rules_compile_error`, as after a regex engine change or a hand edit), so
+  requests it was meant to match silently fall back to the default TTL. 13.2 H-CONFIG: "rules compile" is one of
+  the three conditions, and a rule that does not compile is an error: fail, with the Settings page as the fix.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  tables:
+    rules_cache:
+      - {id: 1, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-30d"}
+      - {id: 2, pattern: "^groups\\.roblox\\.com/v1/groups/\\d+$", type: regex, ttl: 600, methods: "GET", origin: admin, created_at: "-30d"}
+  faults:
+    rules_compile_error: {table: rules_cache, id: 2}
+expect:
+  status: fail
+  explanation: {present: true}
+  fix_link: {regex: "(?i)setting"}
+  credential_calls: {eq: 0}

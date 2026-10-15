@@ -1,0 +1,23 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: games.roblox.com}
+case: pass
+name: games
+description: >
+  The games probe (13.4: GET /v1/games?universeIds=<public universe id>) answers 200 JSON with `data` in
+  780 ms, just under the 800 ms edge. 13.2 H-REACH: expected status and under 800 ms gives pass. The probe is
+  anonymous (never the credential), bypasses the cache and, with the default weights, leaves on direct.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:games.roblox.com":
+      status: 200
+      json: {data: [{id: 1, rootPlaceId: 2, name: "Fixture Experience", playing: 12}]}
+      latency_ms: 780
+      expect_request: {via: direct, method: GET, headers_absent: [cookie]}
+expect:
+  status: pass
+  value: {present: true}
+  calls:
+    "probe:games.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}

@@ -1,0 +1,205 @@
+"""The gunicorn worker class: uvicorn with proxy header rewriting, the Server header and the access log turned off.
+
+What this is
+    `RoxyUvicornWorker`, a small subclass of `uvicorn_worker.UvicornWorker` named in `deploy/gunicorn.conf.py`
+    (`worker_class = "roxy.worker.RoxyUvicornWorker"`), and `RoxyServer`, uvicorn's `Server` with hooks around its
+    startup (the heap freezes) and at the start of shutdown.
+
+Why it exists
+    Plan 5.2. Some uvicorn options cannot be set from a gunicorn config file, only through the worker's
+    `CONFIG_KWARGS`:
+    - `proxy_headers=False`: otherwise uvicorn's ProxyHeadersMiddleware rewrites `scope["client"]` from
+      `X-Forwarded-For` BEFORE Roxy runs, and `core/client_ip.py` could no longer see that the real peer is
+      nginx; trusting the header from a non-proxy peer is exactly the spoofing hole plan 9.11 closes.
+    - `server_header=False`: no `Server: uvicorn` header (less fingerprinting, plan 9.3).
+    - `date_header=True`: keep the standard Date header.
+    - `timeout_keep_alive=75`: idle keep-alive connections must outlive nginx's upstream `keepalive_timeout 60s`,
+      otherwise nginx reuses a socket the app has just closed and callers see intermittent 502s (plan 17.2).
+    - `lifespan="on"`: a startup failure (for example a database below the required schema) must stop the
+      worker, not be mistaken for "this app has no lifespan".
+    - `access_log=False`: uvicorn's access line prints the raw path and query and the client address. Roxy's
+      own `http_request` log line (core/middleware.py) already records every request with the query redacted,
+      secret path segments masked and the client IP hashed when `log_hash_client_ips` is on (plan 9.15); the
+      uvicorn line would bypass all three.
+    It also changes one exit status. uvicorn-worker exits with gunicorn's "worker failed to boot" status (3) for
+    ANY startup failure, and the gunicorn master answers that status by shutting down completely, taking every
+    healthy worker of the color with it. That is right for a schema that is too old (a bad deploy must stop),
+    but wrong when startup failed only because a shared database was briefly busy (`roxy.lifespan`
+    `StartupUnavailable`): then the worker exits with status 1, and the master just starts a new worker.
+    And it bounds shutdown. On a stop, reload or recycle gunicorn gives a worker `graceful_timeout` (30 s) and
+    then kills it. uvicorn, left alone, waits WITHOUT a limit for every open request before it runs the lifespan
+    shutdown, and a tarpit hold lasts up to 55 s: the kill came first, and the final metrics flush and the leader
+    lease release never ran (finding SHUTDOWN-HOLD). Two changes fix it: uvicorn's `timeout_graceful_shutdown`
+    is set below `graceful_timeout`, and `RoxyServer.shutdown` calls `roxy.lifespan.begin_drain` before uvicorn
+    starts waiting, which answers every held refusal at once.
+    Last, it keeps full garbage collections short (finding LOAD-3): `RoxyServer.startup` freezes the startup heap
+    (`freeze_startup_heap`, `gc.freeze`), which every full collection otherwise walked again with the event loop
+    stopped (115 to 125 ms each). Only real workers do this; tests that build many apps in one process never freeze
+    anything. It freezes twice (docs/PERFORMANCE.md, "Startup warm-up (2026-10-14)"): the app as built before its
+    lifespan starts, then what the lifespan made. When the only freeze came after the start, its collection (105 to
+    145 ms) ran with the listeners open and landed in the heartbeat's first window, as did one more automatic full
+    collection during the lifespan.
+
+How it works
+    `UvicornWorker.__init__` builds uvicorn's `Config` from gunicorn's settings and then applies `CONFIG_KWARGS`
+    on top, so these values win over anything gunicorn would pass (including gunicorn's own `keepalive`).
+    `timeout_graceful_shutdown` depends on gunicorn's settings, so it is set right after:
+    `graceful_shutdown_s(graceful_timeout, timeout)` = the smaller of the two, minus the lifespan's
+    `SHUTDOWN_BUDGET_S` (8 s) and `SHUTDOWN_MARGIN_S` (2 s): 20 s with the production 30 and 30. (gunicorn's
+    `timeout` matters too: uvicorn stops heartbeating once it begins shutting down, so a reload or recycle that
+    waited longer than `timeout` would be killed as a frozen worker.) After that wait uvicorn cancels whatever is
+    still running, then runs the lifespan shutdown, which has its own budget.
+    `_serve` is uvicorn-worker's, with `RoxyServer` in place of uvicorn's `Server`; when it exits with the boot
+    error status and the lifespan recorded a transient failure, the status becomes `TRANSIENT_BOOT_EXIT_CODE`.
+    `RoxyServer.startup` works in three steps. The app it serves (`roxy.asgi`, `main.create_asgi_app`) was built
+    when the worker loaded it, its route tables included (`main.warm_routes`, the one startup warm-up). First,
+    before uvicorn's startup, so before the lifespan starts the loop lag sampler (no heartbeat counts it) and
+    before this worker accepts a connection, it freezes the app as built (about 340,000 objects; the collection
+    before it takes 100 to 140 ms). Then uvicorn's startup runs the lifespan and starts accepting. Last, once the
+    app started, a second freeze takes what the lifespan made (a collection of a few ms, since the app is already
+    frozen). The `startup_heap_frozen` line logs both freezes and the route warm-up (`routes_warmed`, None when
+    the app was not warmed or the walk failed). This mostly moves work rather than removing it: with `reuse_port`
+    the worker's own listener exists from the fork on, so a connection the kernel queued there waits for the whole
+    start (the import with the route warm-up, these steps, the lifespan), as it waited before for the same work
+    done just after the start. What changes is that no request in flight and no heartbeat waits behind it.
+
+What to read next
+    `deploy/gunicorn.conf.py`, `roxy/lifespan.py` (`StartupUnavailable`, `begin_drain`, `SHUTDOWN_BUDGET_S`), then
+    `roxy/asgi.py`.
+"""
+
+from __future__ import annotations
+
+import gc
+import logging
+import socket
+import sys
+import time
+from typing import Any
+
+from gunicorn.arbiter import Arbiter
+from uvicorn.server import Server
+from uvicorn_worker import UvicornWorker
+
+from roxy import lifespan
+
+log = logging.getLogger("roxy.worker")
+
+TRANSIENT_BOOT_EXIT_CODE = 1
+"""Exit status for a startup that failed only on unavailable shared state: gunicorn restarts the worker."""
+
+SHUTDOWN_MARGIN_S = 2.0
+"""Kept free after the lifespan shutdown budget, for closing sockets and the process exit."""
+
+MIN_GRACEFUL_SHUTDOWN_S = 1.0
+
+
+def boot_exit_code(code: object) -> object:
+    """The exit status to use instead of `code`: the boot error becomes 1 when the failure was transient."""
+    if code == Arbiter.WORKER_BOOT_ERROR and lifespan.transient_startup_failure():
+        return TRANSIENT_BOOT_EXIT_CODE
+    return code
+
+
+def graceful_shutdown_s(graceful_timeout: float, timeout: float) -> float:
+    """uvicorn's `timeout_graceful_shutdown`: how long open requests may finish once shutdown began.
+
+    What is left of gunicorn's `graceful_timeout` (and of its `timeout`, the heartbeat watchdog; 0 disables it)
+    after the lifespan shutdown budget and a margin, so the lifespan shutdown always runs before gunicorn's kill.
+    """
+    limit = float(graceful_timeout)
+    if timeout and float(timeout) > 0:
+        limit = min(limit, float(timeout))
+    return max(MIN_GRACEFUL_SHUTDOWN_S, limit - lifespan.SHUTDOWN_BUDGET_S - SHUTDOWN_MARGIN_S)
+
+
+def freeze_startup_heap() -> int:
+    """Collect once, then move every object that exists now out of the garbage collector's sight (`gc.freeze`).
+
+    Called twice by `RoxyServer.startup` (finding LOAD-3): for the app as built, route tables included, before its
+    lifespan, then for what the lifespan added, once the app started. The startup heap (the app, its modules,
+    routes, templates, the settings catalog: about 900,000 blocks) lives as long as the worker, yet every full
+    collection walked all of it again: 115 to 125 ms with the event loop stopped, every minute or two at 10
+    requests a second and every few seconds at 200, a large part of the tail latency. Frozen objects are never
+    examined again, so a full collection only walks what was created since. The cost is bounded: a cycle of
+    startup objects that becomes garbage later is never collected (the first settings and rules snapshots,
+    replaced once). Returns how many objects are frozen in all.
+    """
+    gc.collect()
+    gc.freeze()
+    return gc.get_freeze_count()
+
+
+def route_warmup_fields(app: Any) -> dict[str, Any]:
+    """The served app's route warm-up (`main.warm_routes`, kept on `app.state.route_warmup`) for the startup log.
+
+    `routes_warmed` is None for an app that was not warmed (not built by `create_asgi_app`) or whose walk failed:
+    its routes are then built on the first request, as before the warm-up existed.
+    """
+    warmup = getattr(getattr(app, "state", None), "route_warmup", None)
+    return {"routes_warmed": getattr(warmup, "routes", None), "route_warmup_ms": getattr(warmup, "ms", None)}
+
+
+class RoxyServer(Server):
+    """uvicorn's `Server`, which freezes the app as built before it starts the app, freezes what the start added
+    once it started, and tells the app that shutdown began before it waits for open requests."""
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        # Before uvicorn's startup (the lifespan, then accepting): the app as built, its route tables included, leaves
+        # every later collection before the heartbeat starts and before this worker serves (module docstring).
+        started = time.perf_counter()
+        frozen_before_lifespan = freeze_startup_heap()
+        freeze_ms = round((time.perf_counter() - started) * 1000, 1)
+        await super().startup(sockets=sockets)
+        if self.started:
+            frozen = freeze_startup_heap()
+            fields = {
+                "objects": frozen,
+                "frozen_before_lifespan": frozen_before_lifespan,
+                "freeze_before_lifespan_ms": freeze_ms,
+                **route_warmup_fields(self.config.app),
+            }
+            log.info("startup_heap_frozen", extra={"fields": fields})
+
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        lifespan.begin_drain(self.config.app)
+        await super().shutdown(sockets=sockets)
+
+
+# uvicorn-worker ships no type information, so mypy sees its class as Any; subclassing it is still what we want.
+class RoxyUvicornWorker(UvicornWorker):  # type: ignore[misc]
+    """UvicornWorker with Roxy's fixed uvicorn options (plan 5.2), a bounded shutdown and the transient boot exit
+    status."""
+
+    CONFIG_KWARGS: dict[str, Any] = {
+        **UvicornWorker.CONFIG_KWARGS,  # keep the base class choices (loop and http "auto": uvloop, httptools)
+        "proxy_headers": False,
+        "server_header": False,
+        "date_header": True,
+        "timeout_keep_alive": 75,
+        "lifespan": "on",
+        "access_log": False,
+    }
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Below gunicorn's graceful_timeout, so the lifespan shutdown runs before the master's kill (module docstring).
+        self.config.timeout_graceful_shutdown = graceful_shutdown_s(self.cfg.graceful_timeout, self.cfg.timeout)
+
+    async def _serve(self) -> None:
+        try:
+            await self._serve_with_drain()
+        except SystemExit as exc:
+            code = boot_exit_code(exc.code)
+            if code is exc.code:
+                raise
+            raise SystemExit(code) from None
+
+    async def _serve_with_drain(self) -> None:
+        """uvicorn-worker's `_serve`, with `RoxyServer` instead of uvicorn's `Server`."""
+        self.config.app = self.wsgi
+        server = RoxyServer(config=self.config)
+        self._install_sigquit_handler()
+        await server.serve(sockets=self.sockets)
+        if not server.started:
+            sys.exit(Arbiter.WORKER_BOOT_ERROR)

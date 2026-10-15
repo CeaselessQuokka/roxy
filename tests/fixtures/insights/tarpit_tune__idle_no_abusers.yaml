@@ -1,0 +1,40 @@
+# TARPIT-TUNE must stay quiet when nothing needed holding.
+#
+# A legitimate hour: game servers are served, a few are refused by the per-IP limit (the `throttle` category is off
+# by default, so those refusals are not eligible for the tarpit), and no banned, probing or filtered client shows up.
+# The tarpit made no holds and skipped none, so both ratios are undefined (0 of 0, no gaps): a rule must not divide by
+# zero, and "skipped > 10% of eligible holds" cannot be true with no eligible holds.
+
+format: roxy.insight_fixture/1
+rule: TARPIT-TUNE
+case: idle_no_abusers
+description: >
+  An hour of legitimate traffic with zero eligible holds, zero skips and no gap figures. TARPIT-TUNE must not fire.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  throttled: {egress: none, outcome: refused, reason: throttle, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  - {name: legit_throttled, profile: [throttled, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 45}
+
+state:
+  tarpit: {eligible_holds: 0, skipped: 0, holds: 0, gap_with_hold_s: null, gap_without_hold_s: null}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 3045, refused: 45}
+  fires: false

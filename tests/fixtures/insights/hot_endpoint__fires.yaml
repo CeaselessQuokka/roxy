@@ -1,0 +1,157 @@
+# HOT-ENDPOINT fires when a newly busy endpoint reaches the top 5 by upstream calls without a cache rule
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Endpoint enters top 5 by upstream calls with no cache rule"; evidence "Volume trend"; change "Create a
+# cache rule (TTL from tuner)"; confidence Medium. Threshold: insight_hot_endpoint_top_n 5.
+#
+#   endpoint (upstream calls, last 60 min)               calls  rank  cache rule        traffic since
+#   thumbnails.roblox.com/v1/users/avatar-headshot        2,040     1  3                 -4h (steady)
+#   games.roblox.com/v1/games                             1,620     2  4                 -4h
+#   groups.roblox.com/v1/groups/{groupId}                 1,200     3  6                 -4h
+#   thumbnails.roblox.com/v1/games/icons                  1,150     4  none              -50m  <- the recommendation
+#   catalog.roblox.com/v1/search/items                    1,080     5  2 (added at -2h)  -3h   new, but has a rule
+#   avatar.roblox.com/v1/users/{userId}/currently-wearing   750     6  none              -50m  new, but 6th
+#   users.roblox.com/v1/users/{userId}                      720     7  8                 -4h
+#   badges.roblox.com/v1/badges/{badgeId}                   480     8  7                 -4h
+#
+# The two endpoints without a rule had no traffic at all until 50 minutes ago, so they "enter" the ranking under
+# any reading of the row (compared with the previous hour, the previous day, or ever).
+#
+# Endpoints without a rule are still cached at cache_ttl_seconds (120 s), so their keys are refetched every 120 s.
+# Request samples (fetches only): icons bodies change every 960 s per key, and a scratch 11.3 tuner measures
+# 960 s; that is the proposed lifetime (currently-wearing: 360 s). With ttl_tuner_enabled = 0 the catalog text says new-rule proposals use
+# the standard 300 s instead.
+
+format: roxy.insight_fixture/1
+rule: HOT-ENDPOINT
+case: fires
+description: >
+  thumbnails.roblox.com/v1/games/icons appeared 50 minutes ago and is already fourth by upstream calls with no
+  cache rule. The rule must propose a new cache rule for it, with the lifetime the TTL tuner measures, and nothing for
+  the new endpoint that already has a rule or the new endpoint in sixth place.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 2, pattern: "catalog.roblox.com/v1/search/items", type: glob, ttl: 120, methods: "GET", origin: admin, created_at: "-2h"}
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 6, pattern: "groups.roblox.com/v1/groups/*", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 7, pattern: "badges.roblox.com/v1/badges/*", type: glob, ttl: 3600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 8, pattern: "users.roblox.com/v1/users/*", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-4h", "0m"], per_minute: 100}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-4h", "0m"], per_minute: 34}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-4h", "0m"], per_minute: 60}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-4h", "0m"], per_minute: 27}
+  - {name: icons_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/games/icons, window: ["-50m", "0m"], per_minute: 10}
+  - name: icons_miss
+    profile: miss
+    endpoint_template: thumbnails.roblox.com/v1/games/icons
+    window: ["-50m", "0m"]
+    per_minute: 23
+    samples: {key_space: icons, keys: 46, body_change_interval_s: 960}
+  - {name: group_hit, profile: hit, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-4h", "0m"], per_minute: 40}
+  - {name: group_miss, profile: miss, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-4h", "0m"], per_minute: 20}
+  - {name: search_hit, profile: hit, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-3h", "0m"], per_minute: 12}
+  - {name: search_miss, profile: miss, endpoint_template: catalog.roblox.com/v1/search/items, window: ["-3h", "0m"], per_minute: 18}
+  - {name: wearing_hit, profile: hit, endpoint_template: "avatar.roblox.com/v1/users/{userId}/currently-wearing", window: ["-50m", "0m"], per_minute: 5}
+  - name: wearing_miss
+    profile: miss
+    endpoint_template: "avatar.roblox.com/v1/users/{userId}/currently-wearing"
+    window: ["-50m", "0m"]
+    per_minute: 15
+    samples: {key_space: wearing, keys: 30, body_change_interval_s: 360}
+  - {name: user_hit, profile: hit, endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-4h", "0m"], per_minute: 30}
+  - {name: user_miss, profile: miss, endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-4h", "0m"], per_minute: 12}
+  - {name: badge_hit, profile: hit, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-4h", "0m"], per_minute: 40}
+  - {name: badge_miss, profile: miss, endpoint_template: "badges.roblox.com/v1/badges/{badgeId}", window: ["-4h", "0m"], per_minute: 8}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: thumbnails.roblox.com/v1/games/icons}
+      upstream_calls: 1150
+    - window: ["-60m", "0m"]
+      where: {endpoint_template: "avatar.roblox.com/v1/users/{userId}/currently-wearing"}
+      upstream_calls: 750
+    - window: ["-4h", "-50m"]
+      where: {endpoint_template: thumbnails.roblox.com/v1/games/icons}
+      requests: 0
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: HOT-ENDPOINT
+      subject_contains: "thumbnails.roblox.com/v1/games/icons"
+      severity: any
+      family: cache
+      confidence: medium
+      change_kinds_required: [rule_upsert]
+      change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, routing_rule, host_add, bucket_override, credential_allowlist_remove, ignored_param_add]
+      changes_required:
+        - kind: rule_upsert
+          table: rules_cache
+          match: {pattern: {matches_targets: ["thumbnails.roblox.com/v1/games/icons"], not_matches_targets: ["thumbnails.roblox.com/v1/users/avatar-headshot"]}}
+          current: null
+          proposed: {ttl: {between: [840, 1080]}}
+      changes_forbidden:
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_stale_seconds, cache_max_entries, cache_max_bytes]}
+      dry_run:
+        available: true
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_hot_endpoint_enabled: 0}
+    expect: {fires: false}
+  - case: top_n_3
+    description: Only the three busiest endpoints are checked, and all have rules.
+    settings: {insight_hot_endpoint_top_n: 3}
+    expect: {fires: false}
+  - case: top_n_6
+    description: Checking six endpoints also reaches the new currently-wearing endpoint (360 s changes).
+    settings: {insight_hot_endpoint_top_n: 6}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "thumbnails.roblox.com/v1/games/icons"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, table: rules_cache, current: null, proposed: {ttl: {between: [840, 1080]}}}
+        - subject_contains: "avatar.roblox.com/v1/users/"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, table: rules_cache, current: null, proposed: {ttl: {between: [300, 420]}}}
+  - case: tuner_off_standard_ttl
+    description: With ttl_tuner_enabled = 0, new-rule proposals use the standard 300 s lifetime (catalog text).
+    settings: {ttl_tuner_enabled: 0}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "thumbnails.roblox.com/v1/games/icons"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, table: rules_cache, current: null, proposed: {ttl: 300}}
+  - case: severity_override_warn
+    description: insight_hot_endpoint_severity replaces the computed severity.
+    settings: {insight_hot_endpoint_severity: warn}
+    expect:
+      fires: true
+      recommendations:
+        - {subject_contains: "thumbnails.roblox.com/v1/games/icons", severity: warn}

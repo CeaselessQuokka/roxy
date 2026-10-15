@@ -1,0 +1,101 @@
+# TARPIT-TUNE, first branch: "skipped > 10% of eligible holds (raise cap)" (11.5; insight_tarpit_tune_skipped_pct =
+# 10).
+#
+# Tarpit statistics have no table in schema version 1, so they come from `state.tarpit` (provider seam), covering
+# the hour before `now`. With defaults the effective cap is min(tarpit_max_concurrent 50, floor(4000 x 0.25) = 1000)
+# = 50 (plan 10.6), so tarpit_max_concurrent is the term that clamps.
+#
+#   eligible holds   16,400   refusals in tarpit categories: 12,000 `banned` (tarpit_on_ban = 1) from three banned
+#                             scrapers plus 4,400 `header_rule` (tarpit_on_header_rule = 1) from ten scanners;
+#                             traffic splits each into held (latency 8 to 20 s) and skipped (instant) generators
+#   holds            12,800   50 slots x 3,600 s / 14 s average hold (8 to 20 s) is about 12,857: the cap is full
+#   skipped           3,600   21.95% of eligible, over 10%
+#   arrival gap      22.0 s with a hold, 1.5 s without: holding works, so the second branch does not apply
+#
+# Expected change: raise tarpit_max_concurrent above 50 (it is the clamping term; holds are cheap with async), and
+# not past the catalog maximum of 500. A global setting, so never safe_auto (11.2).
+
+format: roxy.insight_fixture/1
+rule: TARPIT-TUNE
+case: saturated
+description: >
+  The tarpit skipped 22% of eligible holds in the last hour because its 50 slots were always full, while holding
+  clearly slows the abusers (22 s between attempts instead of 1.5 s). TARPIT-TUNE must recommend raising
+  tarpit_max_concurrent, not disabling the tarpit, and must not mark it safe to auto-apply.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  banned: {egress: none, outcome: refused, reason: banned, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  header_refused: {egress: none, outcome: refused, reason: header_rule, status: 403, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  held: {latency_ms: {p0: 8000, p50: 14000, p100: 20000}}     # tarpit_min_seconds 8 to tarpit_max_seconds 20
+  banned_scrapers: {clients: {list: ["192.0.2.10", "192.0.2.11", "192.0.2.12"]}, user_agent: "Go-http-client/1.1", endpoint_template: "catalog.roblox.com/v1/search/items"}
+  scanners: {clients: {cidr: "192.0.2.16/28", count: 10}, user_agent: "sqlmap/1.8", endpoint_template: games.roblox.com/v1/games}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  # Held refusals (12,800) carry the hold in their latency; skipped ones (3,600) were refused at once.
+  - {name: banned_held, profile: [banned, held, banned_scrapers], window: ["-60m", "0m"], total: 9360}
+  - {name: banned_skipped, profile: [banned, banned_scrapers], window: ["-60m", "0m"], total: 2640}
+  - {name: scanners_held, profile: [header_refused, held, scanners], window: ["-60m", "0m"], total: 3440}
+  - {name: scanners_skipped, profile: [header_refused, scanners], window: ["-60m", "0m"], total: 960}
+
+tables:
+  bans:
+    - {id: 1, subject_type: ip, subject: "192.0.2.10", reason_code: manual, created_at: "-2h", expires_at: "+22h", created_by: admin, hits: 12000, last_hit_at: "-1m"}
+    - {id: 2, subject_type: ip, subject: "192.0.2.11", reason_code: manual, created_at: "-2h", expires_at: "+22h", created_by: admin, hits: 12000, last_hit_at: "-1m"}
+    - {id: 3, subject_type: ip, subject: "192.0.2.12", reason_code: manual, created_at: "-2h", expires_at: "+22h", created_by: admin, hits: 12000, last_hit_at: "-1m"}
+  rules_header:
+    - {id: 1, canonical_key: "x-scanner|value|contains|sqlmap", scope: value, mode: contains, needle: "sqlmap", header: "x-scanner", enabled: 1, created_at: "-90d", created_by: admin}
+
+state:
+  tarpit: {eligible_holds: 16400, skipped: 3600, holds: 12800, gap_with_hold_s: 22.0, gap_without_hold_s: 1.5}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 19400, by_reason: {banned: 12000, header_rule: 4400}}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: TARPIT-TUNE
+      severity: any
+      family: abuse
+      confidence: medium
+      safe_auto: false
+      changes_required:
+        - {kind: setting, key: tarpit_max_concurrent, current: 50, proposed: {gt: 50, lte: 500}}
+      changes_forbidden:
+        - {kind: setting, key: tarpit_enabled}
+        - {kind: setting, key: tarpit_max_capacity_fraction, proposed: {gt: 0.4}}
+        - {kind: setting, key: tarpit_connection_budget, proposed: {lt: 4000}}
+      change_kinds_forbidden: [ban_add, ban_remove, bypass_add, bypass_remove, bucket_override, rule_delete, filter_remove]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_tarpit_tune_enabled: 0}
+    expect: {fires: false}
+  - case: skipped_pct_raised
+    description: At 25% the 21.95% skip rate is acceptable, and holding works, so neither branch fires.
+    settings: {insight_tarpit_tune_skipped_pct: 25}
+    expect: {fires: false}
+  - case: severity_override_info
+    description: insight_tarpit_tune_severity replaces the computed severity.
+    settings: {insight_tarpit_tune_severity: info}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {severity: info}

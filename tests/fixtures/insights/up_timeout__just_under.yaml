@@ -1,0 +1,109 @@
+# UP-TIMEOUT just under its threshold (format: README.md in this directory).
+#
+# 11.5: "Timeout rate > 2% over 10 min". In the last 10 minutes both hosts see the same few direct timeouts:
+#
+#   per host (games, thumbnails)   requests  calls  timed-out calls
+#   ok                             988       988    0
+#   timeout_failed (504)           6         12     12
+#   timeout_retry_ok               6         12     6
+#
+# Timed-out calls 36 of 2,024 (1.78%, the same on each host and the only egress); requests ending in a timeout
+# 12 of 2,000 (0.6%), meeting one 24 (1.2%). Every reading is under 2%.
+#
+# Twenty to thirty minutes ago games.roblox.com had a bad patch (150 of 1,000 requests timed out twice); the
+# `window_30` variant brings it in: 336 of 6,174 calls (5.4%), 162 of 6,000 requests ending in a timeout (2.7%).
+
+format: roxy.insight_fixture/1
+rule: UP-TIMEOUT
+case: just_under
+description: >
+  A trickle of direct timeouts, 1.78% of calls in the last ten minutes on every host, stays under the 2%
+  threshold, and an earlier burst is outside the window. The rule stays quiet; a 0.5% threshold or a 30 minute
+  window makes it fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  rotator_enabled: 0
+
+traffic_defaults:
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003"]
+  endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+  egress: direct
+  outcome: served_upstream
+  reason: upstream_ok
+  status: 200
+  source: relay
+  cache_state: "MISS"
+  latency_ms: {p50: 300, p95: 900, p99: 2000}
+
+profiles:
+  games: {endpoint_template: games.roblox.com/v1/games}
+  timeout_failed:
+    outcome: failed
+    reason: upstream_timeout
+    status: 504
+    source: roxy
+    upstream_calls: 2
+    error: true
+    latency_ms: 30500
+  timeout_retry_ok: {upstream_calls: 2, latency_ms: {p50: 15400, p95: 16000, p99: 16500}}
+
+traffic:
+  # --- Earlier: a bad patch on games, then normal ----------------------------------------------------------
+  - {name: games_ok_patch, profile: games, window: ["-30m", "-20m"], total: 850}
+  - {name: games_failed_patch, profile: [games, timeout_failed], window: ["-30m", "-20m"], total: 150}
+  - {name: games_ok_middle, profile: games, window: ["-20m", "-10m"], total: 1000}
+  - {name: thumbs_ok_older, window: ["-30m", "-10m"], total: 2000}
+  # --- The last 10 minutes ----------------------------------------------------------------------------------
+  - {name: thumbs_ok, window: ["-10m", "0m"], total: 988}
+  - {name: thumbs_timeout_failed, profile: timeout_failed, window: ["-10m", "0m"], total: 6}
+  - {name: thumbs_timeout_retry_ok, profile: timeout_retry_ok, window: ["-10m", "0m"], total: 6}
+  - {name: games_ok, profile: games, window: ["-10m", "0m"], total: 988}
+  - {name: games_timeout_failed, profile: [games, timeout_failed], window: ["-10m", "0m"], total: 6}
+  - {name: games_timeout_retry_ok, profile: [games, timeout_retry_ok], window: ["-10m", "0m"], total: 6}
+
+events:
+  upstream_attempts:
+    - {window: ["-10m", "0m"], total: 12, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, attempt: 1, status: null, kind: first}
+    - {window: ["-10m", "0m"], total: 6, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, attempt: 2, status: null, kind: retry_5xx}
+    - {window: ["-10m", "0m"], total: 6, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, egress: direct, attempt: 2, status: 200, kind: retry_5xx}
+    - {window: ["-10m", "0m"], total: 12, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: null, kind: first}
+    - {window: ["-10m", "0m"], total: 6, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: null, kind: retry_5xx}
+    - {window: ["-10m", "0m"], total: 6, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: 200, kind: retry_5xx}
+    - {window: ["-30m", "-20m"], total: 150, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 1, status: null, kind: first}
+    - {window: ["-30m", "-20m"], total: 150, endpoint_template: games.roblox.com/v1/games, egress: direct, attempt: 2, status: null, kind: retry_5xx}
+
+state:
+  settings_history:
+    - {at: "-30d", key: rotator_enabled, old: 1, new: 0, source: admin, changed_by: admin, reason: "No rotator plan yet."}
+
+expect:
+  data_checks:
+    - window: ["-10m", "0m"]
+      requests: 2000
+      upstream_calls: 2024
+      by_reason: {upstream_timeout: 12}
+    - window: ["-30m", "0m"]
+      requests: 6000
+      upstream_calls: 6174
+      by_reason: {upstream_timeout: 162}
+
+  fires: false
+
+variants:
+  - case: rate_pct_0_5
+    description: Every reading of the timeout rate (1.78% of calls, 0.6% or 1.2% of requests) is above 0.5%.
+    settings: {insight_up_timeout_rate_pct: 0.5}
+    expect:
+      fires: true
+      recommendations:
+        - changes_forbidden:
+            - {kind: setting, key: request_timeout, proposed: {lte: 15}}
+            - {kind: setting, key: {in: [rotator_weight, rotator_enabled]}}
+  - case: window_30
+    description: A 30 minute window includes the earlier bad patch on games (5.4% of calls, 2.7% of requests).
+    settings: {insight_up_timeout_window_min: 30}
+    expect: {fires: true}

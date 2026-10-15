@@ -1,0 +1,15 @@
+format: roxy.health_fixture/1
+check: H-TLS-PUBLIC
+case: pass
+name: 22_days
+description: >
+  The public certificate expires in 22 days (Certbot renews at 30, so a renewal is due soon but not late).
+  13.2 H-TLS-PUBLIC: more than 21 days gives pass; 22 is the closest whole day above the edge.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  tls:
+    origin: {days_left: 22, handshake_ms: 40}
+expect:
+  status: pass
+  value: {gt: 21}
+  credential_calls: {eq: 0}

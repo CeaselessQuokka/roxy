@@ -1,0 +1,61 @@
+{#-
+  Macros shared by the Cache and Clients pages (both built by one page builder; roxy/admin/pages/cache.py and
+  roxy/admin/pages/clients.py).
+
+  What
+    `reset_dialog(r, refresh=..., on_success=...)`: the confirm dialog of a plan 6.8 data reset (a metric family
+    such as `cache_stats` or `activity`, or one client). It posts JSON to `POST /admin/api/v1/data/resets` with the
+    scope, the preview digest the server computed for exactly that scope (`data.build_plan(...).digest`), a reason
+    and, when the plan asks for one, the typed phrase (sent as `confirm`, the API checks it again). When it opens,
+    the page script asks `POST /data/resets/preview` for the exact row counts and shows the API's own summary.
+    `fill_note()`: the line a shared confirm dialog shows its target in (the page script writes it as text).
+    `timeline(steps)`: v1's "what happens to one request" steps (strong words and state badges, all plain text).
+  Why
+    A reset cannot be undone, so it gets a deliberate dialog with plain-language consequences and, for a whole
+    family, the typed phrase (plan 6.8, 14.5); the API stays the one place that validates and audits it.
+  How
+    The reset dialog is the shared `components/dialog.html confirm_dialog` (the data-api-form contract of
+    static/js/api_forms.js, the `typeConfirm` Alpine component); no inline style or handler (plan 9.2).
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/badges.html" import badge %}
+
+{% macro reset_dialog(r, refresh="", on_success="refresh") -%}
+{%- set hidden = {"scope": r.scope or "family"} -%}
+{%- set types = {"scope": "string"} -%}
+{%- if r.family %}{% set _ = hidden.update({"families": r.family}) %}{% set _ = types.update({"families": "list"}) %}{% endif -%}
+{%- if r.client_type %}{% set _ = hidden.update({"client_type": r.client_type, "client": r.client}) %}{% set _ = types.update({"client_type": "string", "client": "string"}) %}{% endif -%}
+{% call confirm_dialog(r.id, r.title, "/admin/api/v1/data/resets", confirm_label=r.confirm_label or "Reset", danger=True,
+                       consequences=r.consequences, type_to_confirm=r.phrase, confirm_field="confirm" if r.phrase else None,
+                       reason=True, reason_required=r.phrase is not none and r.phrase != "", hidden=hidden, hidden_types=types,
+                       api=True, success=r.success or "Done. The reset is written to the audit log.", on_success=on_success,
+                       refresh=refresh, dialog_attrs={"data-reset-dialog": ""},
+                       form_attrs={"data-reset-preview": "/admin/api/v1/data/resets/preview"}) %}
+  <p class="muted" data-reset-summary>Roxy counts the rows this would delete when this dialog opens.</p>
+  {% if r.note %}<p class="muted">{{ r.note }}</p>{% endif %}
+  <input type="hidden" name="preview" value="{{ r.digest or '' }}" data-json="string" data-reset-digest>
+  {% if not r.digest %}<p class="field__error">This reset could not be prepared right now; close the dialog and try again in a moment.</p>{% endif %}
+{% endcall %}
+{%- endmacro %}
+
+{% macro fill_note(label="Target") -%}
+<p class="fill-note"><span class="fill-note__label">{{ label }}:</span> <span class="caller-text mono" dir="auto" translate="no" data-fill-label></span></p>
+{%- endmacro %}
+
+{% macro timeline(steps, label_id) -%}
+<ol class="req-timeline" aria-labelledby="{{ label_id }}">
+  {% for step in steps %}
+  <li class="req-timeline__step">
+    <span class="req-timeline__at">{{ step.at }}</span>
+    <p class="req-timeline__what">
+      {%- for part in step.parts -%}
+      {%- if part.strong is defined %}<strong>{{ part.strong }}</strong>
+      {%- elif part.badge is defined %}{{ badge(part.badge, part.tone or "neutral") }}
+      {%- else %}{{ part.text }}{% endif -%}
+      {%- endfor -%}
+    </p>
+  </li>
+  {% endfor %}
+</ol>
+{%- endmacro %}

@@ -1,0 +1,114 @@
+# ABUSE-BOT: "bot score > bot_score_abuse_min (80) with > 500 requests per hour" (11.5; the request threshold is
+# insight_abuse_bot_min_requests_per_hour = 500, the score threshold the catalog setting bot_score_abuse_min).
+#
+#   client           UA                       bot score   requests in the hour   expected
+#   192.0.2.41       Go-http-client/1.1       92          1,200                  recommendation (both tests pass)
+#   192.0.2.42       python-requests/2.31.0   88          300                    none (light: under 500 per hour)
+#   203.0.113.100    Roblox/Linux             12          3,000                  none (heavy but legitimate)
+#   40 game servers  Roblox/Linux             8           75 each                none
+#
+# Bot scores come from `state.client_scores` (the provider seam; production computes them in roxy/abuse/bot.py).
+# Every client with traffic has a score, so no rule has to guess for an unscored client. Neither threshold is hit
+# exactly: 11.5 says "> 80" while the catalog text says "at or above", and the fixture stays clear of that boundary.
+
+format: roxy.insight_fixture/1
+rule: ABUSE-BOT
+case: heavy_bot_clients
+description: >
+  One bot-like client (score 92) sends 1,200 requests in an hour next to a light bot (score 88, 300 requests), a
+  heavy legitimate game server (score 12, 3,000 requests) and 40 ordinary game servers. ABUSE-BOT must recommend a UA
+  rule or a ban for the heavy bot only, never a rule that matches the Roblox game-server UA.
+now: "2026-10-07T15:00:00Z"
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+  big_game_server: {client_ip: "203.0.113.100", place_id: "1000000001", user_agent: "Roblox/Linux"}
+  heavy_bot: {client_ip: "192.0.2.41", user_agent: "Go-http-client/1.1"}
+  light_bot: {client_ip: "192.0.2.42", user_agent: "python-requests/2.31.0"}
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  - {name: big_server_hit, profile: [hit, big_game_server], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 40}
+  - {name: big_server_miss, profile: [miss, big_game_server], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 10}
+  - {name: heavy_bot_hit, profile: [hit, heavy_bot], endpoint_template: "catalog.roblox.com/v1/search/items", window: ["-60m", "0m"], per_minute: 14}
+  - {name: heavy_bot_miss, profile: [miss, heavy_bot], endpoint_template: "catalog.roblox.com/v1/search/items", window: ["-60m", "0m"], per_minute: 6}
+  - {name: light_bot_miss, profile: [miss, light_bot], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-60m", "0m"], per_minute: 5}
+
+state:
+  client_scores:
+    - {ip: "192.0.2.41", bot_score: 92}
+    - {ip: "192.0.2.42", bot_score: 88}
+    - {ip: "203.0.113.100", bot_score: 12}
+    - {clients: {cidr: "203.0.113.0/26", count: 40}, bot_score: 8}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 7500, refused: 0}
+    - {window: ["-60m", "0m"], where: {client_ip: "192.0.2.41"}, requests: 1200}
+    - {window: ["-60m", "0m"], where: {client_ip: "192.0.2.42"}, requests: 300}
+    - {window: ["-60m", "0m"], where: {client_ip: "203.0.113.100"}, requests: 3000}
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: ABUSE-BOT
+      subject_contains: "192.0.2.41"
+      severity: any
+      family: abuse
+      confidence: medium
+      changes_required:
+        - any_of:
+            - {kind: filter_add, table: rules_user_agent, proposed: {needle: {regex: '(?i)go-http-client'}}}
+            - {kind: rule_upsert, table: rules_user_agent, proposed: {needle: {regex: '(?i)go-http-client'}}}
+            - {kind: ban_add, proposed: {subject_type: ip, subject: "192.0.2.41"}}
+            - {kind: ban_add, proposed: {subject_type: ua_hash, subject: "12bd583dd25b868e"}}   # ua_hash("Go-http-client/1.1")
+      changes_forbidden:
+        - {kind: ban_add, proposed: {subject: {in: ["203.0.113.100", "192.0.2.42"]}}}
+        - {kind: ban_add, proposed: {subject: {regex: '^203\.0\.113\.'}}}
+        - {kind: ban_add, proposed: {subject_type: place}}
+        - any_of:
+            - {kind: filter_add, table: rules_user_agent, proposed: {needle: {regex: '(?i)roblox'}}}
+            - {kind: rule_upsert, table: rules_user_agent, proposed: {needle: {regex: '(?i)roblox'}}}
+      change_kinds_forbidden: [setting, bucket_override, bypass_add, bypass_remove, ban_remove, rule_delete, filter_remove, host_add]
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_abuse_bot_enabled: 0}
+    expect: {fires: false}
+  - case: request_threshold_raised
+    description: At 1,500 requests per hour the heavy bot (1,200) no longer qualifies.
+    settings: {insight_abuse_bot_min_requests_per_hour: 1500}
+    expect: {fires: false}
+  - case: score_threshold_raised
+    description: With bot_score_abuse_min at 95 neither bot (92 and 88) counts as abusive.
+    settings: {bot_score_abuse_min: 95}
+    expect: {fires: false}
+  - case: request_threshold_lowered
+    description: At 250 requests per hour the light bot (300 requests, score 88) qualifies too; the heavy legitimate server still does not.
+    settings: {insight_abuse_bot_min_requests_per_hour: 250}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "192.0.2.41", severity: any}
+        - {subject_contains: "192.0.2.42", severity: any}
+  - case: severity_override_critical
+    description: insight_abuse_bot_severity replaces the computed severity.
+    settings: {insight_abuse_bot_severity: critical}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {subject_contains: "192.0.2.41", severity: critical}

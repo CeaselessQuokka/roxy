@@ -1,0 +1,98 @@
+# CRED-ROTATOR-GUARD stays quiet on callers who try to send their own cookie, and on normal credential traffic
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Any trip" (of the leak guard, which only ever looks for Roxy's own credential on an anonymous
+# egress).
+#
+#   Three clients sent 120 requests with a .ROBLOSECURITY cookie or Authorization header of their own; the auth
+#   smuggling check refused each one with 400 before any upstream call (reason auth_smuggling, 10.x and C2). A
+#   SPAM-AUTH detection followed. That is abuse handled by the abuse rules (ABUSE-SPAM), not a leak of Roxy's
+#   credential.
+#   Allowlisted credential traffic went out on the credential path as designed (auth_class cred).
+#   There is no leak_blocked outcome and no leak guard event.
+
+format: roxy.insight_fixture/1
+rule: CRED-ROTATOR-GUARD
+case: smuggling_quiet
+description: >
+  Clients tried to smuggle their own credentials through the proxy and were refused by the auth smuggling check,
+  and allowlisted credential calls ran normally. The leak guard never tripped, so nothing may fire.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  credential_allowlist:
+    - {id: 1, pattern: "economy.roblox.com/v1/users/*/currency", type: glob, methods: "GET", cache_private: 1, identical_anonymous: 0, created_at: "-30d", created_by: admin}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 30}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 10}
+  - name: currency_cred
+    endpoint_template: "economy.roblox.com/v1/users/{userId}/currency"
+    window: ["-60m", "0m"]
+    per_minute: 1
+    auth_class: cred
+    egress: credential
+    outcome: served_upstream
+    reason: upstream_ok
+    status: 200
+    source: relay
+    cache_state: "MISS"
+    bytes: {caller_in: 0, caller_out: 60, upstream_in: 180, upstream_out: 650}
+  - name: smuggling_attempts
+    endpoint_template: "economy.roblox.com/v1/users/{userId}/currency"
+    window: ["-40m", "-20m"]
+    total: 120
+    clients: {list: ["198.51.100.31", "198.51.100.32", "198.51.100.33"]}
+    user_agent: "python-requests/2.32"
+    egress: none
+    outcome: refused
+    reason: auth_smuggling
+    status: 400
+    source: roxy
+    cache_state: "NA"
+    bytes: {caller_in: 0, caller_out: 75}
+
+events:
+  security:
+    - at: "-21m"
+      type: spam_would_ban
+      severity: warning
+      reason_code: spam
+      ip: "198.51.100.31"
+      detail:
+        detector: SPAM-AUTH
+        subject: "ip:198.51.100.31"
+        value: 40
+        threshold: 3
+        window_s: 3600
+        action: ban
+        configured_action: ban
+        game_server: false
+        evidence: "SPAM-AUTH: 40 in 3600 s (threshold 3)"
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      by_reason: {auth_smuggling: 120, leak_blocked: 0}
+      refused: 120
+    - window: ["-60m", "0m"]
+      where: {auth_class: cred}
+      requests: 60
+  fires: false
+
+variants:
+  - case: severity_forced
+    description: Forcing a severity does not make a quiet rule fire.
+    settings: {insight_cred_rotator_guard_severity: critical}
+    expect: {fires: false}

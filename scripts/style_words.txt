@@ -1,0 +1,81 @@
+# Banned spellings for Roxy (plan C5). Read by scripts/check_style.py and roxy/core/style_guard.py, so CI and the
+# owner see the same list.
+#
+# [words] section: one rule per line, "<case-insensitive regular expression> <US replacement>". A pattern matches
+# whole words and their inflections (-s, -es, -d, -ed, -ing, -er, -able, -al, -ful, -less, -ation and a few more;
+# a pattern ending in "e" also matches with the "e" dropped before -ing, -er, -able, -ation). The square brackets
+# are deliberate: the pattern for the British word does not match its own text, so this file passes its own check.
+# A pattern that starts or ends with \b matches only the exact word (for example "enrolled" is fine in US English).
+#
+# [exceptions] section: one case-insensitive regular expression per line. Text it matches is skipped by the word
+# rules (never by the dash rule): URLs, and identifiers or US words that share a stem with a banned pattern.
+
+[words]
+behavio[u]r       behavior
+colo[u]r          color
+hono[u]r          honor
+favo[u]r          favor
+labo[u]r          labor
+neighbo[u]r       neighbor
+humo[u]r          humor
+rumo[u]r          rumor
+flavo[u]r         flavor
+analy[s]e         analyze
+paraly[s]e        paralyze
+cataly[s]e        catalyze
+optimi[s]e        optimize
+organi[s]e        organize
+normali[s]e       normalize
+seriali[s]e       serialize
+initiali[s]e      initialize
+utili[s]e         utilize
+recogni[s]e       recognize
+minimi[s]e        minimize
+maximi[s]e        maximize
+prioriti[s]e      prioritize
+customi[s]e       customize
+summari[s]e       summarize
+authori[s]e       authorize
+categori[s]e      categorize
+finali[s]e        finalize
+cent[r]e          center
+met[r]e           meter
+theat[r]e         theater
+licen[c]e         license
+defen[c]e         defense
+offen[c]e         offense
+catalo[g]ue       catalog
+dialo[g]ue        dialog (UI noun)
+analo[g]ue        analog
+cancel[l]ed       canceled
+cancel[l]ing      canceling
+label[l]ed        labeled
+label[l]ing       labeling
+travel[l]ed       traveled
+travel[l]ing      traveling
+model[l]ed        modeled
+model[l]ing       modeling
+signal[l]ed       signaled
+\benro[l]\b       enroll
+enro[l]ment       enrollment
+\bfulfi[l]\b      fulfill
+program[m]e       program
+arte[f]act        artifact
+\bgr[e]y\b        gray
+judge[m]ent       judgment
+whi[l]st          while
+amon[g]st         among
+alumin[i]um       aluminum
+\bche[q]ue\b      check
+\bty[r]e\b        tire
+
+[exceptions]
+# Links keep the spelling of the page they point at.
+https?://[^\s<>"'()\[\]]+
+\bwww\.[^\s<>"'()\[\]]+
+# US words that share a stem with "program[m]e" or "analy[s]e".
+\bprogramm(?:ed|ing|ers?|able|atic(?:ally)?)\b
+\banaly[s]es\b
+# Python standard library API spelled the British way upstream (asyncio.Task.cancel[l]ed()). Brackets again, so
+# this line does not trip the word rule it makes an exception to.
+\.cancel[l]ed\(\)

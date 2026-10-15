@@ -1,0 +1,69 @@
+# TARPIT-TUNE just under its first threshold, with holding clearly effective.
+#
+#   eligible holds 14,140, holds 12,800 (the 50 slots full), skipped 1,340 = 9.48% (threshold 10%)
+#   arrival gap 22.0 s with a hold, 1.5 s without: holding changes behavior a lot
+#
+# Same abusers as tarpit_tune__saturated with a little less traffic. The variant lowers the threshold to 9% and the
+# first branch then fires with the same change as in the saturated fixture.
+
+format: roxy.insight_fixture/1
+rule: TARPIT-TUNE
+case: under_thresholds
+description: >
+  The tarpit skipped 9.5% of eligible holds (under 10%) and held clients come back 15 times slower than unheld ones.
+  TARPIT-TUNE must not fire; at a 9% threshold it must recommend raising tarpit_max_concurrent.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  bans:
+    - {id: 1, subject_type: ip, subject: "192.0.2.10", reason_code: manual, created_at: "-2h", expires_at: "+22h", created_by: admin, hits: 10340, last_hit_at: "-1m"}
+    - {id: 2, subject_type: ip, subject: "192.0.2.11", reason_code: manual, created_at: "-2h", expires_at: "+22h", created_by: admin, hits: 10340, last_hit_at: "-1m"}
+    - {id: 3, subject_type: ip, subject: "192.0.2.12", reason_code: manual, created_at: "-2h", expires_at: "+22h", created_by: admin, hits: 10340, last_hit_at: "-1m"}
+  rules_header:
+    - {id: 1, canonical_key: "x-scanner|value|contains|sqlmap", scope: value, mode: contains, needle: "sqlmap", header: "x-scanner", enabled: 1, created_at: "-90d", created_by: admin}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  banned: {egress: none, outcome: refused, reason: banned, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  header_refused: {egress: none, outcome: refused, reason: header_rule, status: 403, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  held: {latency_ms: {p0: 8000, p50: 14000, p100: 20000}}
+  banned_scrapers: {clients: {list: ["192.0.2.10", "192.0.2.11", "192.0.2.12"]}, user_agent: "Go-http-client/1.1", endpoint_template: "catalog.roblox.com/v1/search/items"}
+  scanners: {clients: {cidr: "192.0.2.16/28", count: 10}, user_agent: "sqlmap/1.8", endpoint_template: games.roblox.com/v1/games}
+  legit:
+    clients: {cidr: "203.0.113.0/26", count: 40}
+    places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+    user_agent: "Roblox/Linux"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 2400}
+  - {name: legit_miss, profile: [miss, legit], endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], total: 600}
+  - {name: banned_held, profile: [banned, held, banned_scrapers], window: ["-60m", "0m"], total: 9360}
+  - {name: banned_skipped, profile: [banned, banned_scrapers], window: ["-60m", "0m"], total: 980}
+  - {name: scanners_held, profile: [header_refused, held, scanners], window: ["-60m", "0m"], total: 3440}
+  - {name: scanners_skipped, profile: [header_refused, scanners], window: ["-60m", "0m"], total: 360}
+
+state:
+  tarpit: {eligible_holds: 14140, skipped: 1340, holds: 12800, gap_with_hold_s: 22.0, gap_without_hold_s: 1.5}
+
+expect:
+  data_checks:
+    - {window: ["-60m", "0m"], requests: 17140, by_reason: {banned: 10340, header_rule: 3800}}
+  fires: false
+
+variants:
+  - case: skipped_pct_lowered
+    description: At 9% the 9.48% skip rate is too high and the rule asks for a larger cap.
+    settings: {insight_tarpit_tune_skipped_pct: 9}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - safe_auto: false
+          changes_required:
+            - {kind: setting, key: tarpit_max_concurrent, current: 50, proposed: {gt: 50, lte: 500}}

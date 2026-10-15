@@ -1,0 +1,82 @@
+# FILTER-REMOVE must stay quiet when every filter is doing its job.
+#
+#   object                                                last hit    note
+#   UA rule c0ffee01 "python-requests"                    1 min ago   refusing a scraper right now
+#   header rule x-scanner / sqlmap                        1 h ago
+#   endpoint block trades.roblox.com/v1/trades/*          3 h ago
+#   endpoint limit catalog.roblox.com/v1/search/items     1 min ago
+#   bypass 198.51.100.21/32 (uptime monitor, 20 d left)   1 min ago   has an expiry and is used every minute
+#   ban place 1000000300 (permanent, 10 d old)            1 min ago   the busiest place by requests, but every
+#                                                                     request comes from 20 bot-like scrapers (score
+#                                                                     90, python UA): a correct ban, not a
+#                                                                     legitimate place
+#   ban ip 192.0.2.180 (temporary)                        5 min ago
+#
+# The six legitimate places (1000000101 to 1000000106) are not banned at all.
+
+format: roxy.insight_fixture/1
+rule: FILTER-REMOVE
+case: active_filters
+description: >
+  Every rule, bypass entry and ban was hit within the last few hours, the bypass entry expires, and the one place ban
+  covers a place id used only by bot-like scrapers even though it is the busiest place by volume. FILTER-REMOVE must
+  not fire.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  rules_user_agent:
+    - {id: "c0ffee01", needle: "python-requests", mode: contains, kind: burst, scope: ip, limit: 5, period: 60, position: 1, enabled: 1, created_at: "-100d", created_by: admin, x_last_hit_at: "-1m"}
+  rules_header:
+    - {id: 1, canonical_key: "x-scanner|value|contains|sqlmap", scope: value, mode: contains, needle: "sqlmap", header: "x-scanner", enabled: 1, created_at: "-90d", created_by: admin, x_last_hit_at: "-1h"}
+  rules_endpoint_block:
+    - {id: 1, pattern: "trades.roblox.com/v1/trades/*", type: glob, message: "Trades are not available through Roxy.", enabled: 1, created_at: "-60d", created_by: admin, x_last_hit_at: "-3h"}
+  rules_endpoint_limit:
+    - {id: 1, pattern: "catalog.roblox.com/v1/search/items", type: glob, scope: ip, limit: 30, period: 60, enabled: 1, created_at: "-45d", created_by: admin, x_last_hit_at: "-1m"}
+  access_list:
+    - {id: 1, kind: bypass, cidr: "198.51.100.21/32", note: "Uptime monitor", expires_at: "+20d", created_by: admin, created_at: "-10d", x_last_hit_at: "-1m"}
+  bans:
+    - {id: 1, subject_type: place, subject: "1000000300", reason_code: manual, reason_text: "Place id claimed only by scrapers.", created_at: "-10d", expires_at: null, created_by: admin, hits: 360000, last_hit_at: "-1m"}
+    - {id: 2, subject_type: ip, subject: "192.0.2.180", reason_code: manual, reason_text: "Scraper.", created_at: "-2d", expires_at: "+1d", created_by: admin, hits: 900, last_hit_at: "-5m"}
+
+traffic_defaults:
+  auth_class: anon
+  bypass: false
+  error: false
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", upstream_calls: 0, latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", upstream_calls: 1, latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+  banned: {egress: none, outcome: refused, reason: banned, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  ua_refused: {egress: none, outcome: refused, reason: user_agent_rule, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  endpoint_limited: {egress: none, outcome: refused, reason: endpoint_rule, status: 429, source: roxy, cache_state: "NA", upstream_calls: 0, latency_ms: 1, bytes: {caller_in: 0, caller_out: 90}}
+  legit_places:
+    clients: {cidr: "203.0.113.0/26", count: 50}
+    places: ["1000000101", "1000000102", "1000000103", "1000000104", "1000000105", "1000000106"]
+    user_agent: "Roblox/Linux"
+  place_300_scrapers:
+    clients: {cidr: "192.0.2.0/27", count: 20}
+    place_id: "1000000300"
+    user_agent: "python-requests/2.31.0"
+
+traffic:
+  - {name: legit_hit, profile: [hit, legit_places], endpoint_template: games.roblox.com/v1/games, window: ["-24h", "0m"], per_minute: 11}
+  - {name: legit_miss, profile: [miss, legit_places], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-24h", "0m"], per_minute: 4}
+  - {name: legit_catalog_limited, profile: [endpoint_limited, legit_places], endpoint_template: "catalog.roblox.com/v1/search/items", window: ["-10m", "0m"], per_minute: 1}
+  - {name: place_300_banned, profile: [banned, place_300_scrapers], endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-24h", "0m"], per_minute: 25}
+  - {name: python_scraper, profile: ua_refused, client_ip: "192.0.2.181", user_agent: "python-requests/2.31.0", endpoint_template: "users.roblox.com/v1/users/{userId}", window: ["-30m", "0m"], per_minute: 2}
+  - {name: ip_banned, profile: banned, client_ip: "192.0.2.180", user_agent: "Go-http-client/1.1", endpoint_template: "catalog.roblox.com/v1/search/items", window: ["-60m", "-5m"], per_minute: 2}
+  - {name: monitor, profile: miss, client_ip: "198.51.100.21", user_agent: "uptime-probe/1.0", bypass: true, endpoint_template: games.roblox.com/v1/games, window: ["-24h", "0m"], per_minute: 1}
+
+state:
+  client_scores:
+    - {clients: {cidr: "203.0.113.0/26", count: 50}, bot_score: 9}
+    - {clients: {cidr: "192.0.2.0/27", count: 20}, bot_score: 90}
+    - {ip: "192.0.2.180", bot_score: 90}
+    - {ip: "192.0.2.181", bot_score: 88}
+    - {ip: "198.51.100.21", bot_score: 40}
+
+expect:
+  data_checks:
+    - {window: ["-24h", "0m"], where: {place_id: "1000000300"}, requests: 36000, refused: 36000}
+    - {window: ["-24h", "0m"], where: {place_id: "1000000101"}, served_cache: 2640, served_upstream: 960}
+  fires: false

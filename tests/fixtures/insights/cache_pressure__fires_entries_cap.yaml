@@ -1,0 +1,105 @@
+# CACHE-PRESSURE fires when the shared cache's entry cap pushes out entries before their lifetime ends
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Evictions of entries younger than their TTL > 5% of stores over 1 h"; change "Raise cache_max_bytes
+# (disk is plentiful) or cache_max_entries".
+#
+#   cache_max_entries was lowered to 20,000 (from 200,000) ten days ago; cache_max_bytes is the default 512 MiB.
+#   Last 60 min: 6,000 stores, 6,000 evictions, 540 of them younger than their lifetime (9.0% of stores).
+#   Every maintenance pass starts at about 21,000 entries (over the entry cap) and about 27 MB (far under the
+#   byte cap): entries are the binding cap. Raising cache_max_bytes would change nothing, so this case needs
+#   cache_max_entries, the "or" half of the row.
+
+format: roxy.insight_fixture/1
+rule: CACHE-PRESSURE
+case: fires_entries_cap
+description: >
+  With cache_max_entries cut to 20,000, 9% of the entries stored in the last hour were evicted while still fresh,
+  and every eviction pass was forced by the entry cap. The rule must propose a larger cache_max_entries, not a
+  byte cap change, marked not safe for auto-apply.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  cache_max_entries: 20000
+
+tables:
+  rules_cache:
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1300}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1300, upstream_in: 1400, upstream_out: 420}}
+
+traffic:
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], per_minute: 90}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-60m", "0m"], per_minute: 60}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 60}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-60m", "0m"], per_minute: 40}
+
+state:
+  settings_history:
+    - {at: "-10d", key: cache_max_entries, old: 200000, new: 20000, source: admin, changed_by: admin, reason: "Smaller cache while testing."}
+  disk:
+    total_bytes: 40000000000
+    free_bytes: 31000000000
+    files:
+      "cache.db": {bytes: 29000000, wal_bytes: 3900000}
+  cache:
+    stores:
+      - {at: "-55m", count: 1000}
+      - {at: "-45m", count: 1000}
+      - {at: "-35m", count: 1000}
+      - {at: "-25m", count: 1000}
+      - {at: "-15m", count: 1000}
+      - {at: "-5m", count: 1000}
+    evictions:
+      - {at: "-40m", age_s: 170, ttl_s: 600, count: 180}
+      - {at: "-20m", age_s: 220, ttl_s: 600, count: 180}
+      - {at: "-1m", age_s: 90, ttl_s: 300, count: 180}
+      - {at: "-40m", age_s: 1300, ttl_s: 600, count: 1820}
+      - {at: "-20m", age_s: 760, ttl_s: 300, count: 1820}
+      - {at: "-1m", age_s: 1150, ttl_s: 600, count: 1820}
+    passes:
+      - {at: "-40m", entries_before: 21000, bytes_before: 27300000, evicted: 2000, freed_bytes: 2600000}
+      - {at: "-20m", entries_before: 21010, bytes_before: 27310000, evicted: 2000, freed_bytes: 2600000}
+      - {at: "-1m", entries_before: 20990, bytes_before: 27290000, evicted: 2000, freed_bytes: 2600000}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 15000
+      upstream_calls: 6000
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CACHE-PRESSURE
+      severity: any
+      family: cache
+      confidence: high
+      safe_auto: false
+      change_kinds_required: [setting]
+      changes_required:
+        - {kind: setting, key: cache_max_entries, current: 20000, proposed: {gt: 20000, lte: 5000000}}
+      changes_forbidden:
+        - {kind: setting, key: cache_max_bytes}
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_stale_seconds, cache_enabled, cache_disk_enabled]}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cache_pressure_enabled: 0}
+    expect: {fires: false}
+  - case: young_eviction_pct_10
+    description: At 10% of stores, 9.0% young evictions is not enough.
+    settings: {insight_cache_pressure_young_eviction_pct: 10}
+    expect: {fires: false}

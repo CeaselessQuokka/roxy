@@ -1,0 +1,27 @@
+format: roxy.health_fixture/1
+check: H-REACH-<host>
+params: {host: presence.roblox.com}
+case: pass
+name: presence_post
+description: >
+  The presence probe is the one POST probe (13.4: POST /v1/presence/users with one public user id, a read-only
+  batch lookup). It answers 200 JSON in 210 ms. 13.2 H-REACH: expected status and under 800 ms gives pass. The
+  request must be a POST with a JSON body and no cookie.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "probe:presence.roblox.com":
+      status: 200
+      json: {userPresences: [{userPresenceType: 0, lastLocation: "Website", userId: 1}]}
+      latency_ms: 210
+      expect_request:
+        via: direct
+        method: POST
+        headers_present: [content-type]
+        headers_absent: [cookie]
+expect:
+  status: pass
+  value: {present: true}
+  calls:
+    "probe:presence.roblox.com": {count: 1, via: direct}
+  credential_calls: {eq: 0}

@@ -1,0 +1,27 @@
+format: roxy.health_fixture/1
+check: H-TLS-PUBLIC
+case: fail
+name: 5_days
+description: >
+  The public certificate expires in 5 days. 13.2 H-TLS-PUBLIC: 7 days or fewer gives fail, with the
+  "Certificate" runbook as the fix. The variant is the edge: exactly 7 days is not more than 7, so it fails too.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  tls:
+    origin: {days_left: 5, handshake_ms: 40}
+expect:
+  status: fail
+  value: {lte: 7}
+  explanation: {present: true}
+  fix_link: {regex: "(?i)certificate"}
+  credential_calls: {eq: 0}
+variants:
+  - case: fail
+    name: edge_7_days
+    inputs:
+      tls:
+        origin: {days_left: 7}
+    expect:
+      status: fail
+      value: {gt: 6, lte: 7}
+      explanation: {present: true}

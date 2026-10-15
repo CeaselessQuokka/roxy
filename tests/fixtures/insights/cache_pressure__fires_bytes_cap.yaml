@@ -1,0 +1,155 @@
+# CACHE-PRESSURE fires when the shared cache's byte cap pushes out entries before their lifetime ends
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Evictions of entries younger than their TTL > 5% of stores over 1 h"; evidence "Eviction ages";
+# change "Raise cache_max_bytes (disk is plentiful) or cache_max_entries"; confidence High.
+# Thresholds: insight_cache_pressure_young_eviction_pct 5.0, _window_min 60.
+#
+#   cache_max_bytes was lowered to 64 MiB (67,108,864) ten days ago; cache_max_entries is the default 200,000.
+#   Last 60 min: 6,000 stores; 6,000 evictions, of which 420 were younger than their lifetime (7.0% of stores)
+#   and 5,580 were expired entries still inside their stale window.
+#   Previous hour: 6,000 stores, 60 young evictions (1%).
+#   Every maintenance pass (cache/store.py EvictionReport) starts above the byte cap (about 67.5 MB) with about
+#   20,300 entries, far below the entry cap: bytes are the binding cap, so bytes are what must rise.
+#   Disk: 40 GB volume, 31 GB free.
+#
+# Both caps are global settings, so the recommendation is never safe to apply automatically.
+
+format: roxy.insight_fixture/1
+rule: CACHE-PRESSURE
+case: fires_bytes_cap
+description: >
+  After cache_max_bytes was cut to 64 MiB, 7% of the entries stored in the last hour were evicted before they
+  expired, and every eviction pass was forced by the byte cap. The rule must propose a larger cache_max_bytes
+  (not a change to the entry cap, which is not binding), marked not safe for auto-apply.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+settings:
+  cache_max_bytes: 67108864
+
+tables:
+  rules_cache:
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 6, pattern: "groups.roblox.com/v1/groups/*", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 3000}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 3000, upstream_in: 3100, upstream_out: 420}}
+
+traffic:
+  # 100 misses (stores) and 150 hits per minute for two hours.
+  - {name: headshot_hit, profile: hit, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-120m", "0m"], per_minute: 70}
+  - {name: headshot_miss, profile: miss, endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, window: ["-120m", "0m"], per_minute: 50}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-120m", "0m"], per_minute: 50}
+  - {name: games_miss, profile: miss, endpoint_template: games.roblox.com/v1/games, window: ["-120m", "0m"], per_minute: 30}
+  - {name: group_hit, profile: hit, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-120m", "0m"], per_minute: 30}
+  - {name: group_miss, profile: miss, endpoint_template: "groups.roblox.com/v1/groups/{groupId}", window: ["-120m", "0m"], per_minute: 20}
+
+state:
+  settings_history:
+    - {at: "-10d", key: cache_max_bytes, old: 536870912, new: 67108864, source: admin, changed_by: admin, reason: "Keep cache.db small on the 1 GB server."}
+  disk:
+    total_bytes: 40000000000
+    free_bytes: 31000000000
+    files:
+      "cache.db": {bytes: 69500000, wal_bytes: 4100000}
+  cache:
+    stores:
+      - {at: "-115m", count: 1000}
+      - {at: "-105m", count: 1000}
+      - {at: "-95m", count: 1000}
+      - {at: "-85m", count: 1000}
+      - {at: "-75m", count: 1000}
+      - {at: "-65m", count: 1000}
+      - {at: "-55m", count: 1000}
+      - {at: "-45m", count: 1000}
+      - {at: "-35m", count: 1000}
+      - {at: "-25m", count: 1000}
+      - {at: "-15m", count: 1000}
+      - {at: "-5m", count: 1000}
+    evictions:
+      # Previous hour: 60 young (1%), 5,940 expired.
+      - {at: "-90m", age_s: 210, ttl_s: 600, count: 60}
+      - {at: "-110m", age_s: 1100, ttl_s: 600, count: 1980}
+      - {at: "-90m", age_s: 1000, ttl_s: 300, count: 1980}
+      - {at: "-70m", age_s: 1200, ttl_s: 600, count: 1980}
+      # Last hour: 420 young (7.0%), 5,580 expired.
+      - {at: "-50m", age_s: 140, ttl_s: 600, count: 70}
+      - {at: "-40m", age_s: 95, ttl_s: 300, count: 70}
+      - {at: "-30m", age_s: 260, ttl_s: 600, count: 70}
+      - {at: "-20m", age_s: 120, ttl_s: 300, count: 70}
+      - {at: "-10m", age_s: 410, ttl_s: 600, count: 70}
+      - {at: "-1m", age_s: 180, ttl_s: 600, count: 70}
+      - {at: "-50m", age_s: 1100, ttl_s: 600, count: 930}
+      - {at: "-40m", age_s: 700, ttl_s: 300, count: 930}
+      - {at: "-30m", age_s: 1250, ttl_s: 600, count: 930}
+      - {at: "-20m", age_s: 640, ttl_s: 300, count: 930}
+      - {at: "-10m", age_s: 980, ttl_s: 600, count: 930}
+      - {at: "-1m", age_s: 1190, ttl_s: 600, count: 930}
+    passes:
+      - {at: "-110m", entries_before: 20250, bytes_before: 67480000, evicted: 1000, freed_bytes: 3380000}
+      - {at: "-100m", entries_before: 20310, bytes_before: 67520000, evicted: 1000, freed_bytes: 3410000}
+      - {at: "-90m", entries_before: 20280, bytes_before: 67500000, evicted: 1000, freed_bytes: 3390000}
+      - {at: "-80m", entries_before: 20330, bytes_before: 67550000, evicted: 1000, freed_bytes: 3440000}
+      - {at: "-70m", entries_before: 20290, bytes_before: 67490000, evicted: 1000, freed_bytes: 3380000}
+      - {at: "-60m", entries_before: 20300, bytes_before: 67510000, evicted: 1000, freed_bytes: 3400000}
+      - {at: "-50m", entries_before: 20320, bytes_before: 67530000, evicted: 1000, freed_bytes: 3420000}
+      - {at: "-40m", entries_before: 20270, bytes_before: 67470000, evicted: 1000, freed_bytes: 3360000}
+      - {at: "-30m", entries_before: 20310, bytes_before: 67520000, evicted: 1000, freed_bytes: 3410000}
+      - {at: "-20m", entries_before: 20300, bytes_before: 67500000, evicted: 1000, freed_bytes: 3390000}
+      - {at: "-10m", entries_before: 20340, bytes_before: 67560000, evicted: 1000, freed_bytes: 3450000}
+      - {at: "-1m", entries_before: 20290, bytes_before: 67490000, evicted: 1000, freed_bytes: 3380000}
+
+expect:
+  data_checks:
+    - window: ["-60m", "0m"]
+      requests: 15000
+      upstream_calls: 6000
+      served_cache: 9000
+
+  fires: true
+  others: forbid
+  recommendations:
+    - rule_id: CACHE-PRESSURE
+      severity: any
+      family: cache
+      confidence: high
+      safe_auto: false
+      change_kinds_required: [setting]
+      change_kinds_forbidden: [rule_upsert, rule_delete, ignored_param_add, ban_add, filter_add, bypass_add, tarpit_category, routing_rule, host_add, bucket_override, credential_allowlist_remove]
+      changes_required:
+        - {kind: setting, key: cache_max_bytes, current: 67108864, proposed: {gt: 67108864, lte: 17179869184}}
+      changes_forbidden:
+        # Not the binding cap, and never a way to "fix" pressure by caching less.
+        - {kind: setting, key: cache_max_entries}
+        - kind: setting
+          key: {in: [cache_ttl_seconds, cache_swr_seconds, cache_stale_seconds, cache_enabled, cache_disk_enabled]}
+
+variants:
+  - case: disabled
+    description: The per-rule switch silences the rule.
+    settings: {insight_cache_pressure_enabled: 0}
+    expect: {fires: false}
+  - case: young_eviction_pct_7_5
+    description: At 7.5% of stores, 7.0% young evictions is not enough.
+    settings: {insight_cache_pressure_young_eviction_pct: 7.5}
+    expect: {fires: false}
+  - case: window_120
+    description: Over two hours young evictions are 480 of 12,000 stores (4%), under 5%.
+    settings: {insight_cache_pressure_window_min: 120}
+    expect: {fires: false}
+  - case: severity_override_critical
+    description: insight_cache_pressure_severity replaces the computed severity.
+    settings: {insight_cache_pressure_severity: critical}
+    expect:
+      fires: true
+      recommendations:
+        - {severity: critical}

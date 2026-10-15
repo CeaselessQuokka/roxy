@@ -1,0 +1,89 @@
+format: roxy.health_fixture/1
+check: H-E2E
+case: fail
+name: public_origin_502
+description: >
+  nginx answers 502 Bad Gateway for both requests (the active color is not listening). 13.2 H-E2E: non-2xx
+  gives fail. Variants keep the 200 answers and the cache transition but drop a required header: first
+  Roxy-Request-Id (named in 13.2), then HSTS (one of the security headers). Missing headers give fail.
+now: "2026-10-07T15:00:00Z"
+inputs:
+  upstream:
+    "origin:/games.roblox.com/v1/games?*":
+      - status: 502
+        headers:
+          content-type: "text/html"
+          strict-transport-security: "max-age=63072000; includeSubDomains"
+        body: "<html><head><title>502 Bad Gateway</title></head><body>Bad Gateway</body></html>"
+        latency_ms: 4
+expect:
+  status: fail
+  value: {regex: "502"}
+  explanation: {present: true}
+  fix_link: {present: true}
+  credential_calls: {eq: 0}
+variants:
+  - case: fail
+    name: missing_request_id
+    inputs:
+      upstream:
+        "origin:/games.roblox.com/v1/games?*":
+          - status: 200
+            headers:
+              content-type: "application/json; charset=utf-8"
+              roxy-cache: "MISS"
+              strict-transport-security: "max-age=63072000; includeSubDomains"
+              x-content-type-options: "nosniff"
+              x-frame-options: "DENY"
+              referrer-policy: "no-referrer"
+              cross-origin-opener-policy: "same-origin"
+              permissions-policy: "camera=(), microphone=(), geolocation=(), usb=(), payment=()"
+            json: {data: [{id: 1, rootPlaceId: 2, name: "Fixture Experience", playing: 12}]}
+            latency_ms: 240
+          - status: 200
+            headers:
+              content-type: "application/json; charset=utf-8"
+              roxy-cache: "HIT"
+              strict-transport-security: "max-age=63072000; includeSubDomains"
+              x-content-type-options: "nosniff"
+              x-frame-options: "DENY"
+              referrer-policy: "no-referrer"
+              cross-origin-opener-policy: "same-origin"
+              permissions-policy: "camera=(), microphone=(), geolocation=(), usb=(), payment=()"
+            json: {data: [{id: 1, rootPlaceId: 2, name: "Fixture Experience", playing: 12}]}
+            latency_ms: 9
+    expect:
+      status: fail
+      explanation: {present: true}
+  - case: fail
+    name: missing_hsts
+    inputs:
+      upstream:
+        "origin:/games.roblox.com/v1/games?*":
+          - status: 200
+            headers:
+              content-type: "application/json; charset=utf-8"
+              roxy-cache: "MISS"
+              roxy-request-id: "01K72Q8M3V5X7Z9B1D3F5H7J9K"
+              x-content-type-options: "nosniff"
+              x-frame-options: "DENY"
+              referrer-policy: "no-referrer"
+              cross-origin-opener-policy: "same-origin"
+              permissions-policy: "camera=(), microphone=(), geolocation=(), usb=(), payment=()"
+            json: {data: [{id: 1, rootPlaceId: 2, name: "Fixture Experience", playing: 12}]}
+            latency_ms: 240
+          - status: 200
+            headers:
+              content-type: "application/json; charset=utf-8"
+              roxy-cache: "HIT"
+              roxy-request-id: "01K72Q8M3V5X7Z9B1D3F5H7J9M"
+              x-content-type-options: "nosniff"
+              x-frame-options: "DENY"
+              referrer-policy: "no-referrer"
+              cross-origin-opener-policy: "same-origin"
+              permissions-policy: "camera=(), microphone=(), geolocation=(), usb=(), payment=()"
+            json: {data: [{id: 1, rootPlaceId: 2, name: "Fixture Experience", playing: 12}]}
+            latency_ms: 9
+    expect:
+      status: fail
+      explanation: {present: true}

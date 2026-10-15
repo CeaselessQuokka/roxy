@@ -1,0 +1,60 @@
+# SYS-DISK just under all three conditions.
+#
+#   condition                 value                                                threshold
+#   storage vs budget         8.2e9 of 12 GB = 68.3% (63.6% read as GiB)           70%
+#   30-day projection         0.1e9 a day for 30 days: 8.2e9 -> 11.2e9             12 GB budget
+#   free disk                 8.0e9 of 50e9 = 16%                                  15%
+#   dims per minute (7 d)     1,200                                                1,500
+#
+# The variants push one threshold past the evidence at a time; each must make the rule fire.
+
+format: roxy.insight_fixture/1
+rule: SYS-DISK
+case: under_thresholds
+description: >
+  Storage at 68% of the budget, a 30-day projection of 11.2e9 bytes against 12 GB, and 16% free disk: each just on
+  the safe side. SYS-DISK must not fire; a 60% budget threshold or a 20% free-disk floor must make it fire.
+now: "2026-10-07T15:00:00Z"
+
+state:
+  disk:
+    total_bytes: 50000000000
+    free_bytes: 8000000000
+    files:
+      "metrics.db": {bytes: 7100000000, wal_bytes: 60000000}
+      "cache.db": {bytes: 500000000, wal_bytes: 40000000}
+      "control.db": {bytes: 30000000, wal_bytes: 4000000}
+      "hot.db": {bytes: 20000000, wal_bytes: 6000000}
+      "exports": {bytes: 140000000, wal_bytes: 0}
+      "snapshots": {bytes: 300000000, wal_bytes: 0}
+    tables:
+      "metrics.rollup_minute": 4700000000
+      "metrics.request_samples": 1500000000
+      "metrics.events": 600000000
+      "cache.entries": 480000000
+    growth:
+      - {at: "-30d", total_bytes: 5200000000}
+      - {at: "-15d", total_bytes: 6700000000}
+      - {at: "now", total_bytes: 8200000000}
+    dims_per_minute_7d_avg: 1200
+
+expect:
+  fires: false
+
+variants:
+  - case: budget_pct_lowered
+    description: At 60% of the budget, 68.3% (or 63.6%) is too much.
+    settings: {insight_sys_disk_budget_pct: 60}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {safe_auto: false}
+  - case: free_disk_pct_raised
+    description: With a 20% free-disk floor, 16% free is too little.
+    settings: {insight_sys_disk_free_disk_pct: 20}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - {safe_auto: false}

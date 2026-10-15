@@ -1,0 +1,689 @@
+"""Unit tests for roxy.storage.retention (plan 6.10 and 6.5)."""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import os
+import sqlite3
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from roxy.config.catalog import CATALOG
+from roxy.storage import retention
+from roxy.storage.retention import (
+    HOT_TASKS,
+    RETENTION_TASKS,
+    RetentionPolicy,
+    daily_truncate_due,
+    prune_directory,
+    run_hot_prune,
+    run_retention,
+)
+
+DAY = 86_400
+NOW = float(int(time.time()))  # real time: the audit triggers check SQLite's own clock
+
+
+def _count(db: Any, table: str, where: str = "1") -> int:
+    return int(db.read_sync(lambda c: c.execute(f"SELECT count(*) FROM {table} WHERE {where}").fetchone()[0]))
+
+
+def _loop(db: Any, fn: Any, policy: RetentionPolicy, limit: int = 5000) -> int:
+    total = 0
+    while True:
+        deleted = db.write_sync(lambda c: fn(c, NOW, policy, limit))
+        total += deleted
+        if deleted < limit:
+            return total
+
+
+def test_every_plan_6_10_table_has_a_pruner() -> None:
+    covered = {t.table for t in RETENTION_TASKS + HOT_TASKS}
+    plan = {
+        "rollup_minute",
+        "rollup_hour",
+        "rollup_day",
+        "rollup_month",
+        "client_minute",
+        "client_hour",
+        "client_day",
+        "upstream_429",
+        "events",
+        "request_samples",
+        "egress_usage",
+        "recommendations",
+        "recommendation_actions",
+        "health_runs",
+        "captures",
+        "fingerprint_headers",
+        "fingerprint_values",
+        "fingerprint_user_agents",
+        "errors",
+        "anomalies",
+        "worker_heartbeat",
+        "annotations",
+        "audit_log",
+        "settings_history",
+        "admin_sessions",
+        "trusted_devices",
+        "invalidation_tokens",
+        "bans",
+        "lease",
+        "cooldown",
+        "limiter",
+        "job_runs",
+    }
+    assert plan <= covered
+
+
+def test_rollups_by_age_and_forever(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        for table in ("rollup_minute", "rollup_hour", "rollup_day", "rollup_month"):
+            for age_days in (1, 20, 500, 5000):
+                conn.execute(
+                    f"INSERT INTO {table} (bucket_start, dim_hash) VALUES (?, 1)", (int(NOW - age_days * DAY),)
+                )
+
+    dbs.metrics.write_sync(fill)
+    policy = RetentionPolicy()
+    assert _loop(dbs.metrics, retention.prune_rollup_minute, policy) == 3  # older than 14 days
+    assert _loop(dbs.metrics, retention.prune_rollup_hour, policy) == 2  # older than 400 days
+    assert _loop(dbs.metrics, retention.prune_rollup_day, policy) == 0  # 0 = forever
+    assert _loop(dbs.metrics, retention.prune_rollup_month, RetentionPolicy(retention_day_days=1000)) == 1
+
+
+def test_events_age_then_cap_oldest_first(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        rows = [(int((NOW - 100 * DAY) * 1000), "old")] * 5
+        rows += [(int(NOW * 1000) + i, "new") for i in range(20)]
+        conn.executemany("INSERT INTO events (at_ms, type, severity) VALUES (?, ?, 'info')", rows)
+
+    dbs.metrics.write_sync(fill)
+    deleted = _loop(dbs.metrics, retention.prune_events, RetentionPolicy(events_max_rows=12), limit=4)
+    assert deleted == 5 + 8
+    remaining = dbs.metrics.read_sync(lambda c: [r[0] for r in c.execute("SELECT at_ms FROM events ORDER BY id")])
+    assert remaining == [int(NOW * 1000) + i for i in range(8, 20)]  # the newest 12 survive
+
+
+def test_upstream_429_and_request_samples(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        old, new = int((NOW - 91 * DAY) * 1000), int(NOW * 1000)
+        conn.executemany(
+            "INSERT INTO upstream_429 (at_ms, endpoint_template, host, egress) VALUES (?, 't', 'h', 'direct')",
+            [(old,), (new,), (new,)],
+        )
+        conn.executemany(
+            "INSERT INTO request_samples (at_ms, endpoint_template, method) VALUES (?, 't', 'GET')",
+            [(int((NOW - 25 * 3600) * 1000),), (new,)],
+        )
+
+    dbs.metrics.write_sync(fill)
+    assert _loop(dbs.metrics, retention.prune_upstream_429, RetentionPolicy(upstream_429_max_rows=1)) == 2
+    assert _loop(dbs.metrics, retention.prune_request_samples, RetentionPolicy()) == 1
+
+
+def test_settings_history_never_loses_the_newest_row_per_key(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        for i in range(6):
+            for key in ("a", "b"):
+                conn.execute(
+                    "INSERT INTO settings_history (key, new_json, changed_at, changed_by, source) "
+                    "VALUES (?, ?, ?, 'admin', 'admin')",
+                    (key, str(i), int(NOW - (10 - i) * DAY)),
+                )
+
+    dbs.control.write_sync(fill)
+    _loop(dbs.control, retention.prune_settings_history, RetentionPolicy(settings_history_max_rows=1))
+    rows = dbs.control.read_sync(
+        lambda c: sorted(tuple(r) for r in c.execute("SELECT key, new_json FROM settings_history"))
+    )
+    assert rows == [("a", "5"), ("b", "5")]  # over the cap, but the latest of each key always stays
+    _loop(dbs.control, retention.prune_settings_history, RetentionPolicy(retention_settings_history_days=1))
+    assert _count(dbs.control, "settings_history") == 2
+
+
+def test_audit_log_keeps_at_least_400_days(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        for age in (10, 300, 399, 401, 800):
+            conn.execute("INSERT INTO audit_log (at, actor, action) VALUES (?, 'admin', 'x')", (int(NOW - age * DAY),))
+
+    dbs.control.write_sync(fill)
+    # A setting below the minimum is raised to 400 days.
+    assert _loop(dbs.control, retention.prune_audit_log, RetentionPolicy(retention_audit_days=30)) == 2
+    assert _count(dbs.control, "audit_log") == 3
+    assert _count(dbs.control, "audit_prune_gate") == 0  # the gate is closed again
+    assert _loop(dbs.control, retention.prune_audit_log, RetentionPolicy(retention_audit_days=0)) == 0
+    # A clock running in the future cannot push the cutoff past the real 400 days.
+    future = retention.prune_audit_log
+    deleted = dbs.control.write_sync(lambda c: future(c, NOW + 1000 * DAY, RetentionPolicy(), 5000))
+    assert deleted == 0
+    assert _count(dbs.control, "audit_log") == 3
+
+
+def test_recommendations_open_items_are_never_pruned(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        for i, state in enumerate(["open", "snoozed", "dismissed", "applied", "dismissed"]):
+            conn.execute(
+                "INSERT INTO recommendations (id, rule_id, fingerprint, state, severity, payload_json, created_at,"
+                " updated_at) VALUES (?, 'R', ?, ?, 'low', '{}', 0, ?)",
+                (f"rec_{i}", str(i), state, int(NOW - 400 * DAY)),
+            )
+            conn.execute(
+                "INSERT INTO recommendation_actions (recommendation_id, action, at, actor) "
+                "VALUES (?, 'snooze', ?, 'a')",
+                (f"rec_{i}", int(NOW)),
+            )
+
+    dbs.metrics.write_sync(fill)
+    assert _loop(dbs.metrics, retention.prune_recommendations, RetentionPolicy()) == 3
+    states = dbs.metrics.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT state FROM recommendations")))
+    assert states == ["open", "snoozed"]
+    assert _loop(dbs.metrics, retention.prune_recommendation_actions, RetentionPolicy()) == 3
+
+
+def test_health_runs_cap_takes_results_along(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        for i in range(5):
+            run_id = conn.execute(
+                "INSERT INTO health_runs (started_at, trigger) VALUES (?, 'manual')",
+                (int(NOW - (200 if i == 0 else 1) * DAY),),
+            ).lastrowid
+            conn.execute("INSERT INTO health_results (run_id, check_id, status) VALUES (?, 'H-X', 'pass')", (run_id,))
+        conn.execute("INSERT INTO health_results (run_id, check_id, status) VALUES (999, 'H-ORPHAN', 'pass')")
+
+    dbs.metrics.write_sync(fill)
+    _loop(dbs.metrics, retention.prune_health, RetentionPolicy(health_runs_max=2))
+    assert dbs.metrics.read_sync(lambda c: [r[0] for r in c.execute("SELECT id FROM health_runs ORDER BY id")]) == [
+        4,
+        5,
+    ]
+    assert _count(dbs.metrics, "health_results") == 2
+
+
+def test_captures_by_ttl_count_and_bytes(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        conn.execute("INSERT INTO captures (at, bytes) VALUES (?, 10)", (int(NOW - 2000),))
+        for _ in range(6):
+            conn.execute("INSERT INTO captures (at, bytes) VALUES (?, 100)", (int(NOW),))
+
+    dbs.metrics.write_sync(fill)
+    policy = RetentionPolicy(capture_max_records=5, capture_max_bytes=250)
+    assert _loop(dbs.metrics, retention.prune_captures, policy) == 5  # 1 expired, 1 over count, 3 over bytes
+    assert dbs.metrics.read_sync(lambda c: c.execute("SELECT sum(bytes) FROM captures").fetchone()[0]) == 200
+
+
+def test_fingerprints_errors_anomalies_heartbeats_annotations(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        for i in range(4):
+            seen = int(NOW - (100 if i == 0 else i) * DAY)
+            conn.execute(
+                "INSERT INTO fingerprint_headers (name, first_seen, last_seen) VALUES (?, 0, ?)", (f"h{i}", seen)
+            )
+            conn.execute(
+                "INSERT INTO fingerprint_values (value_hash, name, first_seen, last_seen) VALUES (?, 'h', 0, ?)",
+                (f"v{i}", seen),
+            )
+            conn.execute(
+                "INSERT INTO fingerprint_user_agents (ua_hash, user_agent, first_seen, last_seen) "
+                "VALUES (?, 'u', 0, ?)",
+                (f"u{i}", seen),
+            )
+            conn.execute("INSERT INTO errors (signature, first_seen, last_seen) VALUES (?, 0, ?)", (f"e{i}", seen))
+            conn.execute("INSERT INTO anomalies (at, metric) VALUES (?, 'm')", (seen,))
+            conn.execute("INSERT INTO worker_heartbeat (pid, started_at, last_seen) VALUES (?, 0, ?)", (i + 1, seen))
+            conn.execute("INSERT INTO annotations (at, kind, label) VALUES (?, 'deploy', 'x')", (seen,))
+
+    dbs.metrics.write_sync(fill)
+    policy = RetentionPolicy(
+        max_header_name_records=2,
+        max_header_value_records=2,
+        max_user_agent_records=2,
+        max_error_records=2,
+        anomalies_max_rows=2,
+        heartbeat_max_rows=2,
+        annotations_max_rows=2,
+    )
+    assert _loop(dbs.metrics, retention.prune_fingerprint_headers, policy) == 2
+    assert _loop(dbs.metrics, retention.prune_fingerprint_values, policy) == 2
+    assert _loop(dbs.metrics, retention.prune_fingerprint_user_agents, policy) == 2
+    assert _loop(dbs.metrics, retention.prune_errors, policy) == 2
+    assert _loop(dbs.metrics, retention.prune_anomalies, policy) == 2
+    assert _loop(dbs.metrics, retention.prune_worker_heartbeat, policy) == 3  # older than 1 day, then the cap
+    assert _loop(dbs.metrics, retention.prune_annotations, policy) == 2
+    # The least recently seen are the ones removed.
+    names = dbs.metrics.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT name FROM fingerprint_headers")))
+    assert names == ["h1", "h2"]
+
+
+def test_client_rows_beyond_the_top_fold_into_other(dbs) -> None:
+    bucket = int(NOW // 60 * 60) - 120  # a closed minute
+
+    def fill(conn: sqlite3.Connection) -> None:
+        for i in range(8):
+            conn.execute(
+                "INSERT INTO client_minute (bucket_start, client_type, client_key, requests, refused, served, bytes) "
+                "VALUES (?, 'ip', ?, ?, 1, ?, 10)",
+                (bucket, f"198.51.100.{i}", i + 1, i),
+            )
+
+    dbs.metrics.write_sync(fill)
+    total_before = dbs.metrics.read_sync(lambda c: c.execute("SELECT sum(requests) FROM client_minute").fetchone()[0])
+    _loop(dbs.metrics, retention.prune_client_minute, RetentionPolicy(max_ip_activity_records=3))
+    rows = dbs.metrics.read_sync(
+        lambda c: {r[0]: r[1] for r in c.execute("SELECT client_key, requests FROM client_minute")}
+    )
+    assert set(rows) == {"198.51.100.7", "198.51.100.6", "198.51.100.5", "other"}  # top 3 plus one other row
+    assert rows["other"] == 1 + 2 + 3 + 4 + 5
+    total_after = dbs.metrics.read_sync(lambda c: c.execute("SELECT sum(requests) FROM client_minute").fetchone()[0])
+    assert total_after == total_before
+
+
+def test_place_clients_follow_max_caller_records(dbs) -> None:
+    """Spec review 7: places have their own cap (`max_caller_records`), separate from IPs."""
+    bucket = int(NOW // 60 * 60) - 120
+
+    def fill(conn: sqlite3.Connection) -> None:
+        for i in range(8):
+            for ctype, key in (("ip", f"198.51.100.{i}"), ("place", f"{1000 + i}")):
+                conn.execute(
+                    "INSERT INTO client_minute (bucket_start, client_type, client_key, requests, refused, served, "
+                    "bytes) VALUES (?, ?, ?, ?, 0, ?, 10)",
+                    (bucket, ctype, key, i + 1, i + 1),
+                )
+
+    dbs.metrics.write_sync(fill)
+    policy = RetentionPolicy.from_settings({"max_ip_activity_records": 5, "max_caller_records": 2}.get)
+    assert (policy.max_ip_activity_records, policy.max_caller_records) == (5, 2)
+    _loop(dbs.metrics, retention.prune_client_minute, policy)
+
+    def kept(conn: sqlite3.Connection, ctype: str) -> set[str]:
+        sql = "SELECT client_key FROM client_minute WHERE client_type = ? AND client_key != 'other'"
+        return {r[0] for r in conn.execute(sql, (ctype,))}
+
+    assert dbs.metrics.read_sync(lambda c: kept(c, "place")) == {"1007", "1006"}
+    assert len(dbs.metrics.read_sync(lambda c: kept(c, "ip"))) == 5
+
+
+def test_egress_usage_follows_rollup_retention(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        for granularity in ("minute", "hour", "day", "month"):
+            conn.execute(
+                "INSERT INTO egress_usage (bucket_start, egress, granularity) VALUES (?, 'direct', ?)",
+                (int(NOW - 500 * DAY), granularity),
+            )
+
+    dbs.metrics.write_sync(fill)
+    assert _loop(dbs.metrics, retention.prune_egress_usage, RetentionPolicy()) == 2  # minute and hour only
+
+
+def test_control_expiry_tables(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        uid = conn.execute(
+            "INSERT INTO admin_users (username, password_hash, created_at) VALUES ('o', 'h', 0)"
+        ).lastrowid
+        for name, exp in (("s1", NOW - 1), ("s2", NOW + 3600)):
+            conn.execute(
+                "INSERT INTO admin_sessions (id_hash, user_id, created_at, last_seen_at, expires_at, epoch, "
+                "csrf_secret_hash, mfa_level) VALUES (?, ?, 0, 0, ?, 0, 'x', 'full')",
+                (name, uid, int(exp)),
+            )
+            conn.execute(
+                "INSERT INTO trusted_devices (token_hash, user_id, created_at, expires_at) VALUES (?, ?, 0, ?)",
+                (name, uid, int(exp)),
+            )
+            conn.execute(
+                "INSERT INTO invalidation_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+                (name, uid, int(exp)),
+            )
+        for expires in (None, NOW - 31 * DAY, NOW - 1 * DAY):
+            conn.execute(
+                "INSERT INTO bans (subject_type, subject, reason_code, created_at, expires_at, created_by) "
+                "VALUES ('ip', '192.0.2.1', 'spam', 0, ?, 'admin')",
+                (None if expires is None else int(expires),),
+            )
+
+    dbs.control.write_sync(fill)
+    policy = RetentionPolicy()
+    assert _loop(dbs.control, retention.prune_admin_sessions, policy) == 1
+    assert _loop(dbs.control, retention.prune_trusted_devices, policy) == 1
+    assert _loop(dbs.control, retention.prune_invalidation_tokens, policy) == 1
+    assert _loop(dbs.control, retention.prune_bans, policy) == 1  # permanent and recently expired bans stay
+    assert _count(dbs.control, "bans") == 2
+
+
+def test_hot_prune_keeps_the_leader_row_and_live_state(dbs) -> None:
+    now_ms = int(NOW * 1000)
+
+    def fill(conn: sqlite3.Connection) -> None:
+        conn.execute("INSERT INTO lease VALUES ('leader', 'w', 0, 7, NULL)")
+        conn.execute("INSERT INTO lease VALUES ('sf:old', 'w', ?, 1, NULL)", (now_ms - 120_000,))
+        conn.execute("INSERT INTO lease VALUES ('sf:live', 'w', ?, 1, NULL)", (now_ms + 10_000,))
+        conn.execute("INSERT INTO cooldown VALUES ('c:old', ?, 'default', 0, 1)", (now_ms - 7200_000,))
+        conn.execute("INSERT INTO cooldown VALUES ('c:live', ?, 'retry_after', 0, 1)", (now_ms + 1000,))
+        conn.execute("INSERT INTO limiter VALUES ('ip:idle', ?, 0, 0, ?)", (now_ms - 1, int(NOW - 120)))
+        conn.execute("INSERT INTO limiter VALUES ('ip:throttled', ?, 0, 0, ?)", (now_ms + 60_000, int(NOW - 120)))
+        conn.execute("INSERT INTO limiter VALUES ('ip:active', ?, 0, 0, ?)", (now_ms, int(NOW)))
+        conn.execute("INSERT INTO strikes VALUES ('192.0.2.11', 1, ?, 0, 0)", (int(NOW - 4000),))
+        conn.execute("INSERT INTO strikes VALUES ('192.0.2.12', 3, ?, 2, ?)", (int(NOW - 4000), int(NOW + 600)))
+        conn.execute("INSERT INTO job_runs VALUES ('job:x:1', 1, ?, NULL)", (int(NOW - 8 * DAY),))
+        conn.execute("INSERT INTO job_runs VALUES ('job:x:2', 1, ?, NULL)", (int(NOW),))
+        conn.execute("INSERT INTO csrf_cache VALUES ('direct', 't', ?)", (int(NOW - 1),))
+
+    dbs.hot.write_sync(fill)
+
+    results = asyncio.run(run_hot_prune(dbs, RetentionPolicy(), NOW))
+    assert results["hot.lease"] == 1
+    assert results["hot.cooldown"] == 1
+    assert results["hot.limiter"] == 1
+    assert results["hot.strikes"] == 1
+    assert results["hot.job_runs"] == 1
+    assert results["hot.csrf_cache"] == 1
+    leases = dbs.hot.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT name FROM lease")))
+    assert leases == ["leader", "sf:live"]
+
+
+async def test_run_retention_works_in_batches_and_vacuums(dbs) -> None:
+    def fill(conn: sqlite3.Connection) -> None:
+        old = int((NOW - 200 * DAY) * 1000)
+        conn.executemany(
+            "INSERT INTO events (at_ms, type, severity, detail_json) VALUES (?, 't', 'info', ?)",
+            [(old, "x" * 200) for _ in range(12_000)],
+        )
+
+    dbs.metrics.write_sync(fill)
+    writes_before = dbs.metrics.stats.writes
+    results = await run_retention(dbs, RetentionPolicy(), NOW, batch=5000)
+    assert results["metrics.events"] == 12_000
+    assert dbs.metrics.stats.writes - writes_before >= 3  # 5000 + 5000 + 2000, each its own transaction
+    free = dbs.metrics.read_sync(lambda c: c.execute("PRAGMA freelist_count").fetchone()[0])
+    assert free == 0  # incremental_vacuum handed the freed pages back to the file system
+    assert set(results) == {f"{t.db}.{t.table}" for t in RETENTION_TASKS}
+
+
+async def test_custom_writer_is_used_for_every_batch(dbs) -> None:
+    seen: list[str] = []
+
+    async def writer(db: Any, fn: Any) -> int:
+        seen.append(db.name)
+        result: int = await db.write(fn)
+        return result
+
+    await run_retention(dbs, RetentionPolicy(), NOW, writer=writer, vacuum=False)
+    assert set(seen) == {"metrics", "control", "cache"}
+
+
+def test_policy_from_settings_uses_known_keys_and_aliases() -> None:
+    values = {"retention_minute_days": 7, "events_max_rows": 10_000, "throttle_strike_decay_seconds": 900}
+
+    def get(key: str) -> Any:
+        return values[key]
+
+    policy = RetentionPolicy.from_settings(get)
+    assert policy.retention_minute_days == 7
+    assert policy.events_max_rows == 10_000
+    assert policy.strike_idle_s == 900
+    assert policy.retention_hour_days == 400  # unknown to the getter: default kept
+
+
+async def test_maintenance_helpers(dbs) -> None:
+    passive = await dbs.hot.maintenance(retention.checkpoint)
+    assert passive.mode == "PASSIVE"
+    assert not passive.busy
+    assert passive.duration_ms >= 0
+    truncate = await dbs.cache.maintenance(retention.truncate_checkpoint)
+    assert truncate.mode == "TRUNCATE"
+    assert await dbs.control.maintenance(retention.quick_check) == []
+    await dbs.metrics.maintenance(retention.optimize)
+    sizes = await dbs.metrics.maintenance(retention.database_sizes)
+    assert sizes["bytes"] == sizes["pages"] * sizes["page_size"]
+    with pytest.raises(ValueError):
+        await dbs.hot.maintenance(lambda c: retention.checkpoint(c, "BOGUS"))
+
+
+def test_daily_truncate_due() -> None:
+    # 2025-01-15 09:30 UTC is 04:30 in New York (EST).
+    at = 1_736_933_400.0
+    due, day = daily_truncate_due(at, maintenance_hour=4, tz_name="America/New_York", last_run_day=None)
+    assert due
+    assert day == "2025-01-15"
+    assert not daily_truncate_due(at, maintenance_hour=4, tz_name="America/New_York", last_run_day=day)[0]
+    assert not daily_truncate_due(at, maintenance_hour=5, tz_name="America/New_York", last_run_day=None)[0]
+    busy = daily_truncate_due(
+        at, maintenance_hour=4, tz_name="America/New_York", last_run_day=None, last_minute_rate=50, median_rate_24h=10
+    )
+    assert not busy[0]
+    assert daily_truncate_due(at, maintenance_hour=9, tz_name="Not/AZone", last_run_day=None)[0]  # falls back to UTC
+
+
+# --- rows that enforce a limit outlive the limit's longest period (findings AUTH-1, AUTH-2) ---------------------------
+
+
+def test_login_failure_slots_outlive_the_longest_lockout_window(dbs) -> None:
+    """AUTH-1: no admin_login_window_s the catalog accepts is longer than what retention keeps."""
+    assert RetentionPolicy().login_failures_idle_s >= CATALOG["admin_login_window_s"].max
+    assert CATALOG["admin_login_window_s"].max == retention.LOGIN_WINDOW_MAX_S
+
+    def fill(conn: sqlite3.Connection) -> None:
+        for age in (2 * 3600, DAY - 60, DAY + 60):
+            conn.execute(
+                "INSERT INTO login_failures (subject, count, window_start) VALUES (?, 1, ?)",
+                (f"authfail:192.0.2.0/24|abc:{age}", int(NOW - age)),
+            )
+
+    dbs.hot.write_sync(fill)
+    assert _loop(dbs.hot, retention.prune_login_failures, RetentionPolicy()) == 1  # only the one past a day
+    # A policy with a shorter idle still keeps every slot the live window counts: the 2 h old slot stays inside a
+    # 3 h window, the almost day-old one goes.
+    short = RetentionPolicy(login_failures_idle_s=3600, admin_login_window_s=3 * 3600)
+    assert _loop(dbs.hot, retention.prune_login_failures, short) == 1
+    assert _loop(dbs.hot, retention.prune_login_failures, RetentionPolicy(login_failures_idle_s=3600)) == 1
+
+
+def test_policy_from_settings_reads_the_live_lockout_window() -> None:
+    policy = RetentionPolicy.from_settings({"admin_login_window_s": 7200}.get)
+    assert policy.admin_login_window_s == 7200
+    assert policy.login_failures_idle_s == retention.LOGIN_WINDOW_MAX_S
+
+
+def test_alert_dedupe_rows_outlive_the_longest_alert_cooldown(dbs) -> None:
+    """AUTH-2: `alert:` rows stay 45 days, the hourly cap rows a day, and the table has a row cap."""
+
+    def fill(conn: sqlite3.Connection) -> None:
+        rows = [
+            ("alert:quota:95:1", int(NOW - 2 * DAY)),  # a rotator quota alert two days into its cooldown: kept
+            ("alert:old", int(NOW - 46 * DAY)),  # past every cooldown: pruned
+            ("cap:email", int(NOW - 2 * DAY)),  # an hourly cap window from two days ago: pruned
+            ("capdrop:email", int(NOW - 600)),  # recent: kept
+        ]
+        conn.executemany("INSERT INTO email_gate (key, last_sent_at) VALUES (?, ?)", rows)
+
+    dbs.hot.write_sync(fill)
+    assert _loop(dbs.hot, retention.prune_email_gate, RetentionPolicy()) == 2
+    keys = dbs.hot.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT key FROM email_gate")))
+    assert keys == ["alert:quota:95:1", "capdrop:email"]
+    capped = RetentionPolicy(email_gate_max_rows=1)
+    assert _loop(dbs.hot, retention.prune_email_gate, capped) == 1  # the oldest goes first
+    keys = dbs.hot.read_sync(lambda c: [r[0] for r in c.execute("SELECT key FROM email_gate")])
+    assert keys == ["capdrop:email"]
+
+
+# --- the strike ladder and the recommendation quiet periods (findings W2H-2, W2H-3) -----------------------------------
+
+
+@pytest.mark.parametrize("decay_s", [0, 1800, 7])
+def test_a_strike_row_is_pruned_exactly_when_the_ladder_no_longer_counts_it(dbs, decay_s: int) -> None:
+    """W2H-2: the prune agrees with `throttle.effective_strikes` on every row whose penalty is over: a row goes
+    exactly when no strike is left, and a penalized row always stays."""
+    from roxy.abuse.throttle import effective_strikes
+
+    now = int(NOW)
+    rows: dict[str, tuple[int, int, int]] = {}  # ip -> (strikes, last_strike_at, throttled_until)
+    for strikes in range(5):
+        for idle in (0, 1, 6, 7, 13, 14, 1799, 1800, 3599, 3600, 7200, 9000, 100_000):
+            rows[f"ended:{strikes}:{idle}"] = (strikes, now - idle, now - 30)
+            rows[f"penalized:{strikes}:{idle}"] = (strikes, now - idle, now + 30)
+    rows["never_struck"] = (2, 0, 0)  # strikes but no last strike time: `effective_strikes` never decays them
+
+    def fill(conn: sqlite3.Connection) -> None:
+        conn.executemany(
+            "INSERT INTO strikes (ip, strikes, last_strike_at, tier, throttled_until) VALUES (?, ?, ?, 0, ?)",
+            [(ip, s, last, until) for ip, (s, last, until) in rows.items()],
+        )
+
+    dbs.hot.write_sync(fill)
+    policy = RetentionPolicy(strike_idle_s=decay_s)
+    _loop(dbs.hot, retention.prune_strikes, policy)
+    kept = set(dbs.hot.read_sync(lambda c: [r[0] for r in c.execute("SELECT ip FROM strikes")]))
+    for ip, (strikes, last, until) in rows.items():
+        left = effective_strikes(strikes, last, now, decay_s)
+        should_stay = until >= now or left > 0
+        assert (ip in kept) == should_stay, (ip, strikes, last, until, left)
+
+
+def test_strike_rows_are_capped_without_lifting_a_penalty(dbs) -> None:
+    """W2H-2: rows that never fade (decay 0) are bounded by `strikes_max_rows`, oldest last strike first; a row
+    still penalized is never dropped, even when the penalized rows alone exceed the cap."""
+    now = int(NOW)
+
+    def fill(conn: sqlite3.Connection) -> None:
+        for i in range(5):  # strikes left, penalty over
+            conn.execute("INSERT INTO strikes VALUES (?, 3, ?, 3, ?)", (f"192.0.2.{i}", now - 1000 + i, now - 10))
+        for i in range(2):  # penalized
+            conn.execute("INSERT INTO strikes VALUES (?, 3, ?, 3, ?)", (f"198.51.100.{i}", now - 5000, now + 600))
+
+    dbs.hot.write_sync(fill)
+    assert RetentionPolicy().strikes_max_rows == 200_000  # plan 15.4 MAX_TRACKED_THROTTLE_IPS
+    assert _loop(dbs.hot, retention.prune_strikes, RetentionPolicy(strike_idle_s=0, strikes_max_rows=3)) == 4
+    kept = dbs.hot.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT ip FROM strikes")))
+    assert kept == ["192.0.2.4", "198.51.100.0", "198.51.100.1"]  # the newest unpenalized row and both penalized
+    assert _loop(dbs.hot, retention.prune_strikes, RetentionPolicy(strike_idle_s=0, strikes_max_rows=1)) == 1
+    kept = dbs.hot.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT ip FROM strikes")))
+    assert kept == ["198.51.100.0", "198.51.100.1"]  # over the cap, but their penalties are not lifted early
+
+
+def _recommendation_rows(conn: sqlite3.Connection, rows: list[tuple[str, str, int]]) -> None:
+    for rec_id, state, updated_at in rows:
+        conn.execute(
+            "INSERT INTO recommendations (id, rule_id, fingerprint, state, severity, payload_json, created_at,"
+            " updated_at) VALUES (?, 'R', ?, ?, 'warn', '{}', 0, ?)",
+            (rec_id, rec_id, state, updated_at),
+        )
+
+
+def test_quiet_recommendations_outlive_the_retention_and_the_others_do_not(dbs) -> None:
+    """W2H-3: a dismissed or rolled back row inside `dismiss_cooldown_days`, or an applied one inside the watch
+    window, survives a retention shorter than that; every other closed row past the retention goes."""
+    now = int(NOW)
+    policy = RetentionPolicy(retention_recommendations_days=1, dismiss_cooldown_days=90, auto_apply_watch_minutes=60)
+    rows = [
+        ("dismissed_quiet", "dismissed", now - 40 * DAY),
+        ("rolled_back_quiet", "rolled_back", now - 89 * DAY),
+        ("dismissed_over", "dismissed", now - 91 * DAY),
+        ("applied_watched", "applied", now - 2 * DAY + 0),  # past the retention, outside the 60 minute watch
+        ("auto_applied_watched", "auto_applied", now - 30 * 60),  # inside the watch (and the retention)
+        ("expired_old", "expired", now - 2 * DAY),
+        ("resolved_old", "resolved", now - 2 * DAY),
+        ("open_old", "open", now - 400 * DAY),
+    ]
+    dbs.metrics.write_sync(lambda conn: _recommendation_rows(conn, rows))
+    assert _loop(dbs.metrics, retention.prune_recommendations, policy) == 4
+    kept = dbs.metrics.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT id FROM recommendations")))
+    assert kept == ["auto_applied_watched", "dismissed_quiet", "open_old", "rolled_back_quiet"]
+    # A quiet period of 0 (the engine reopens at once) protects nothing.
+    zero = RetentionPolicy(retention_recommendations_days=1, dismiss_cooldown_days=0, auto_apply_watch_minutes=60)
+    assert _loop(dbs.metrics, retention.prune_recommendations, zero) == 2
+    kept = dbs.metrics.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT id FROM recommendations")))
+    assert kept == ["auto_applied_watched", "open_old"]
+
+
+def test_the_closed_recommendation_cap_removes_quiet_rows_last(dbs) -> None:
+    """W2H-3 and plan P9: the cap counts every closed row; rows that are not quiet go first (oldest first), and only
+    quiet rows beyond the cap on their own are removed after them."""
+    now = int(NOW)
+    rows = [(f"quiet_{i}", "dismissed", now - 10 * DAY + i) for i in range(3)]
+    rows += [(f"done_{i}", "resolved", now - 60 + i) for i in range(3)]  # newer than the quiet rows
+    rows += [("open_0", "open", now - 5 * DAY)]
+    dbs.metrics.write_sync(lambda conn: _recommendation_rows(conn, rows))
+    capped = RetentionPolicy(recommendations_max_rows=4, dismiss_cooldown_days=30)
+    assert _loop(dbs.metrics, retention.prune_recommendations, capped) == 2
+    kept = dbs.metrics.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT id FROM recommendations")))
+    assert kept == ["done_2", "open_0", "quiet_0", "quiet_1", "quiet_2"]  # the two oldest resolved rows went
+    tight = RetentionPolicy(recommendations_max_rows=2, dismiss_cooldown_days=30)
+    assert _loop(dbs.metrics, retention.prune_recommendations, tight) == 2  # done_2 first, then the oldest quiet one
+    kept = dbs.metrics.read_sync(lambda c: sorted(r[0] for r in c.execute("SELECT id FROM recommendations")))
+    assert kept == ["open_0", "quiet_1", "quiet_2"]
+
+
+def test_policy_reads_the_live_quiet_periods_and_states_match_the_engine() -> None:
+    """The quiet periods come from the live settings (W2H-3); a policy without settings keeps the catalog maxima,
+    and the state lists are the engine's own (storage cannot import insights, so they are repeated)."""
+    from roxy.insights.models import ACTIVE_STATES, APPLIED_STATES, QUIET_STATES
+
+    assert set(retention.OPEN_RECOMMENDATION_STATES) == set(ACTIVE_STATES)
+    assert set(retention.QUIET_RECOMMENDATION_STATES) == set(QUIET_STATES)
+    assert set(retention.APPLIED_RECOMMENDATION_STATES) == set(APPLIED_STATES)
+    live = RetentionPolicy.from_settings({"dismiss_cooldown_days": 90, "auto_apply_watch_minutes": 45}.get)
+    assert (live.dismiss_cooldown_days, live.auto_apply_watch_minutes) == (90, 45)
+    default = RetentionPolicy()
+    assert default.dismiss_cooldown_days == CATALOG["dismiss_cooldown_days"].max == retention.DISMISS_COOLDOWN_MAX_DAYS
+    assert default.auto_apply_watch_minutes == CATALOG["auto_apply_watch_minutes"].max
+    assert CATALOG["auto_apply_watch_minutes"].max == retention.WATCH_MAX_MINUTES
+
+
+def _constant(node: ast.expr) -> float | None:
+    """The value of a constant number expression such as `40 * 86_400`, else None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int | float) and not isinstance(node.value, bool):
+        return float(node.value)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult | ast.Add):
+        left, right = _constant(node.left), _constant(node.right)
+        if left is None or right is None:
+            return None
+        return left * right if isinstance(node.op, ast.Mult) else left + right
+    return None
+
+
+def test_every_alert_cooldown_fits_in_the_alert_gate_retention() -> None:
+    """The dedupe row must outlive every cooldown an alert can ask for: the alert table, the cooldown settings at
+    their catalog maximum, and every literal `cooldown_s=` handed to an alert in the source (the rotator quota alert
+    passes 40 days)."""
+    from roxy.notify.alerts import ALERT_SPECS
+    from roxy.notify.gate import ALERT_PREFIX
+
+    assert ALERT_PREFIX == retention.ALERT_GATE_PREFIX
+    keep = RetentionPolicy().email_gate_alert_idle_s
+    assert keep == retention.ALERT_GATE_KEEP_S
+    cooldowns = [float(spec.cooldown_s or 0) for spec in ALERT_SPECS.values()]
+    cooldowns += [
+        float(CATALOG[spec.cooldown_setting].max or 0) for spec in ALERT_SPECS.values() if spec.cooldown_setting
+    ]
+    src = Path(retention.__file__).resolve().parents[1]
+    literal: list[tuple[str, float]] = []
+    for path in sorted(src.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and any(k.arg == "cooldown_key" for k in node.keywords):
+                for keyword in node.keywords:
+                    value = _constant(keyword.value) if keyword.arg == "cooldown_s" else None
+                    if value is not None:
+                        literal.append((path.name, value))
+    assert any(name == "rotator.py" for name, _ in literal), "the scan sees the rotator quota alert"
+    cooldowns += [value for _, value in literal]
+    assert max(cooldowns) <= keep, f"an alert cooldown of {max(cooldowns)} s outlives its dedupe row ({keep} s)"
+
+
+def test_prune_directory_by_age_count_and_bytes(tmp_path: Path) -> None:
+    folder = tmp_path / "exports"
+    folder.mkdir()
+    for i in range(6):
+        path = folder / f"f{i}.json"
+        path.write_bytes(b"x" * 100)
+        age = 30 * DAY if i == 0 else (6 - i) * 60
+        os.utime(path, (NOW - age, NOW - age))
+    (folder / "sub").mkdir()
+    deleted = prune_directory(folder, NOW, max_age_days=14, max_files=4, max_bytes=250)
+    assert sorted(p.name for p in deleted) == ["f0.json", "f1.json", "f2.json", "f3.json"]
+    assert sorted(p.name for p in folder.iterdir()) == ["f4.json", "f5.json", "sub"]
+    assert prune_directory(tmp_path / "missing", NOW, max_age_days=1) == []

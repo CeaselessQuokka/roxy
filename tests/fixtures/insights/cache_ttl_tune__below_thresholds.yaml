@@ -1,0 +1,139 @@
+# CACHE-TTL-TUNE stays quiet when each endpoint misses one threshold by a little
+# (format: tests/fixtures/insights/README.md).
+#
+# 11.5 row: "Refetches returned identical body >= 90% over 24 h with >= 50 refetches (raise); < 50% identical
+# (lower)" (insight_cache_ttl_tune_identical_raise_pct 90, _identical_lower_pct 50, _min_refetches 50,
+# _window_h 24).
+#
+#   template                                        rule (ttl)  last 24 h                    misses which test
+#   games.roblox.com/v1/games/votes                 1 (300 s)   1,600 refetches, 89.0%       raise (>= 90%)
+#   thumbnails.roblox.com/v1/users/avatar-headshot  3 (600 s)   49 refetches, 100%           min refetches (50)
+#   games.roblox.com/v1/games                       4 (300 s)   1,600 refetches, 51.0%       lower (< 50%)
+#   catalog.roblox.com/v1/search/items              2 (120 s)   30 refetches today, 100%;    window (24 h)
+#                                                               2,000 at 98% on 2026-10-05
+#
+# The samples agree with the observations: votes keys are fetched every 300 s and change every 2,700 s (88.9%
+# identical; a scratch tuner measures 2,700 s), headshot and search bodies never change, games bodies change every
+# 612 s against a 300 s lifetime (51% identical). Each variant moves one threshold just past the data.
+
+format: roxy.insight_fixture/1
+rule: CACHE-TTL-TUNE
+case: below_thresholds
+description: >
+  Four endpoints each sit just on the quiet side of one CACHE-TTL-TUNE test: 89% identical (raise needs 90%),
+  49 refetches (needs 50), 51% identical (lower needs under 50%), and a strong signal that is older than 24 h.
+  Nothing may fire at the defaults; each variant fires exactly the endpoint next to the threshold it moves.
+now: "2026-10-07T15:00:00Z"
+seed_defaults: false
+
+tables:
+  rules_cache:
+    - {id: 1, pattern: "games.roblox.com/v1/games/votes", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 2, pattern: "catalog.roblox.com/v1/search/items", type: glob, ttl: 120, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 3, pattern: "thumbnails.roblox.com/v1/users/avatar-headshot", type: glob, ttl: 600, methods: "GET", origin: admin, created_at: "-40d"}
+    - {id: 4, pattern: "games.roblox.com/v1/games", type: glob, ttl: 300, methods: "GET", origin: admin, created_at: "-40d"}
+
+traffic_defaults:
+  auth_class: anon
+  user_agent: "Roblox/Linux"
+  clients: {cidr: "203.0.113.0/26", count: 40}
+  places: ["1000000001", "1000000002", "1000000003", "1000000004", "1000000005", "1000000006"]
+
+profiles:
+  hit: {egress: none, outcome: served_cache, reason: cache_hit, status: 200, source: cache, cache_state: "HIT", latency_ms: {p50: 3, p95: 9, p99: 20}, bytes: {caller_in: 0, caller_out: 1800}}
+  miss: {egress: direct, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 140, p95: 380, p99: 750}, bytes: {caller_in: 0, caller_out: 1800, upstream_in: 1900, upstream_out: 420}}
+
+traffic:
+  - {name: votes_hit, profile: hit, endpoint_template: games.roblox.com/v1/games/votes, window: ["-6h", "0m"], per_minute: 8}
+  - name: votes_miss
+    profile: miss
+    endpoint_template: games.roblox.com/v1/games/votes
+    window: ["-6h", "0m"]
+    per_minute: 2
+    samples: {key_space: votes, keys: 10, body_change_interval_s: 2700}
+  - name: headshot_miss
+    profile: miss
+    endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot
+    window: ["-112m", "0m"]
+    series: [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]
+    samples: {key_space: headshot, keys: 7, body_change_interval_s: 0}
+  - {name: games_hit, profile: hit, endpoint_template: games.roblox.com/v1/games, window: ["-6h", "0m"], per_minute: 10}
+  - name: games_miss
+    profile: miss
+    endpoint_template: games.roblox.com/v1/games
+    window: ["-6h", "0m"]
+    per_minute: 2
+    samples: {key_space: games, keys: 10, body_change_interval_s: 612}
+  - name: search_miss
+    profile: miss
+    endpoint_template: catalog.roblox.com/v1/search/items
+    window: ["-70m", "0m"]
+    series: [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]
+    samples: {key_space: search, keys: 5, body_change_interval_s: 0}
+
+events:
+  change_observations:
+    - {endpoint_template: games.roblox.com/v1/games/votes, day: "2026-10-06", refetches: 1000, identical_bodies: 890}
+    - {endpoint_template: games.roblox.com/v1/games/votes, day: "2026-10-07", refetches: 600, identical_bodies: 534}
+    - {endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot, day: "2026-10-07", refetches: 49, identical_bodies: 49}
+    - {endpoint_template: games.roblox.com/v1/games, day: "2026-10-06", refetches: 1000, identical_bodies: 510}
+    - {endpoint_template: games.roblox.com/v1/games, day: "2026-10-07", refetches: 600, identical_bodies: 306}
+    - {endpoint_template: catalog.roblox.com/v1/search/items, day: "2026-10-05", refetches: 2000, identical_bodies: 1960}
+    - {endpoint_template: catalog.roblox.com/v1/search/items, day: "2026-10-07", refetches: 30, identical_bodies: 30}
+
+expect:
+  data_checks:
+    - window: ["-112m", "0m"]
+      where: {endpoint_template: thumbnails.roblox.com/v1/users/avatar-headshot}
+      requests: 56
+      upstream_calls: 56
+    - window: ["-70m", "0m"]
+      where: {endpoint_template: catalog.roblox.com/v1/search/items}
+      requests: 35
+  fires: false
+
+variants:
+  - case: raise_threshold_88
+    description: At 88% the votes endpoint (89%) qualifies for a longer lifetime, about its 2,700 s change interval.
+    settings: {insight_cache_ttl_tune_identical_raise_pct: 88}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "games.roblox.com/v1/games/votes"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, table: rules_cache, current: {id: 1, ttl: 300}, proposed: {ttl: {between: [2300, 3100]}}}
+  - case: min_refetches_49
+    description: With 49 refetches enough, the headshot endpoint (100% identical, never changes) gets the cap.
+    settings: {insight_cache_ttl_tune_min_refetches: 49}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "thumbnails.roblox.com/v1/users/avatar-headshot"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, table: rules_cache, current: {id: 3, ttl: 600}, proposed: {ttl: {gt: 600, lte: 3600}}}
+  - case: lower_threshold_52
+    description: With "shorter" below 52% identical, games (51%) gets a shorter lifetime.
+    settings: {insight_cache_ttl_tune_identical_lower_pct: 52}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "games.roblox.com/v1/games"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, table: rules_cache, current: {id: 4, ttl: 300}, proposed: {ttl: {gte: 1, lt: 300}}}
+  - case: window_72h
+    description: A 72 hour window includes 2026-10-05 (2,000 refetches at 98%), so search qualifies.
+    settings: {insight_cache_ttl_tune_window_h: 72}
+    expect:
+      fires: true
+      others: forbid
+      recommendations:
+        - subject_contains: "catalog.roblox.com/v1/search/items"
+          severity: any
+          changes_required:
+            - {kind: rule_upsert, table: rules_cache, current: {id: 2, ttl: 120}, proposed: {ttl: {gt: 120, lte: 3600}}}

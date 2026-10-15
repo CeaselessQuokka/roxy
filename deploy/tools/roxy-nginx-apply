@@ -1,0 +1,535 @@
+#!/usr/bin/python3 -I
+"""roxy-nginx-apply <sha>: install the nginx config of a verified commit on main, test it, and reload nginx.
+
+What this is
+    A root-owned wrapper installed as /usr/local/sbin/roxy-nginx-apply (root, 0755). deploy.sh runs it through sudo
+    as `sudo /usr/local/sbin/roxy-nginx-apply <sha> [--initial-color blue|green]`; the sudo rules allow exactly
+    that (deploy/sudoers/roxy-deploy). It installs the four files under deploy/nginx/ of commit <sha>: the site
+    template (rendered for this nginx version and the site origin) as sites-available/roxy-v2.conf, the two
+    per-color upstream files, and the security headers snippet. Then `nginx -t`, and a reload only if that passes;
+    on a failed test every file is put back as it was.
+
+Why it exists
+    Plan 9.14: the deploy user must never gain a path to root, and nginx config IS a path to root (the master runs
+    as root and opens log files as root, so a crafted `access_log` line could write any file). So the deploy user
+    never installs nginx config itself. This wrapper is the one door, and it only installs what is on main:
+    - It does not trust the release directory, which the unprivileged deploy user owns and could change (plan
+      17.3 keeps releases deploy-owned so the deploy can build them). It fetches the branch into its own
+      root-only git mirror from the URL in the root-owned /etc/roxy/roxy.env, checks that <sha> is on that branch,
+      and reads the files from git objects (a git object id is a hash of the content, so <sha> pins the bytes).
+    - It also compares those files with the manifest deploy.sh recorded in the release (plan 9.14) and with the
+      release files themselves; a difference means the release was changed after it was built, and it refuses.
+    - Every value rendered into the config (host names, paths) is validated against a strict pattern, so nothing
+      can smuggle nginx syntax in.
+
+How it works
+    1. Arguments: a 40 hex character commit, optionally `--initial-color` (used only when the active-upstream
+       symlink does not exist yet: the first deploy).
+    2. /etc/roxy/roxy.env must be owned by root and not writable by group or others; it names the repository
+       (ROXY_DEPLOY_REPO_URL), the branch (ROXY_DEPLOY_BRANCH, default main) and the site (ROXY_SITE_ORIGIN).
+    3. git fetch into /var/lib/roxy-nginx-apply/repo.git (root 0700, hooks off, only the URL's protocol allowed),
+       `merge-base --is-ancestor <sha> <branch>`, then the deploy/nginx blobs of <sha>.
+    4. Render the template: `{{NAME}}` values and `#@if nginx >= X.Y.Z` / `#@else` / `#@endif` line blocks chosen
+       by `nginx -v`, so the same template passes `nginx -t` on nginx 1.18 (Ubuntu 22.04) and 1.24 or later.
+    5. Write each file atomically (temporary file, then rename), `nginx -t`, `systemctl reload-or-restart nginx`.
+       After a reload, write /etc/roxy/nginx-hints.env with nginx's worker_processes and worker_connections
+       (from `nginx -T`) for the app's tarpit budget check (plan 15.3 L), and record what was applied in
+       /var/lib/roxy-nginx-apply/applied.json (readable by all, so deploy.sh can skip an unchanged config).
+    Everything runs under one lock shared with roxy-switch-color, so a switch and an apply never interleave.
+    The functions take a `Layout` with every path, so tests run them against a temporary tree as a normal user.
+
+What to read next
+    deploy/nginx/roxy.conf.template (what is rendered), deploy/tools/roxy-switch-color, deploy/sudoers/roxy-deploy,
+    then deploy/deploy.sh step 6.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def say(text: str) -> None:
+    """One line on stdout (the journal or the deploy log). A function, not print, so output is explicit."""
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+
+
+def warn(text: str) -> None:
+    """One line on stderr."""
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+
+
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+COLORS = ("blue", "green")
+SOURCE_DIR = "deploy/nginx"
+MANIFEST_NAME = ".roxy-nginx-manifest"
+TEMPLATE_NAME = f"{SOURCE_DIR}/roxy.conf.template"
+SITE_FILE = "roxy-v2.conf"
+
+# Repository path -> installed path relative to the nginx directory. The template is rendered, the rest copied.
+INSTALL_MAP: dict[str, str] = {
+    f"{SOURCE_DIR}/roxy.conf.template": f"sites-available/{SITE_FILE}",
+    f"{SOURCE_DIR}/roxy-upstream-blue.conf": "roxy-upstream-blue.conf",
+    f"{SOURCE_DIR}/roxy-upstream-green.conf": "roxy-upstream-green.conf",
+    f"{SOURCE_DIR}/snippets/roxy-security-headers.conf": "snippets/roxy-security-headers.conf",
+}
+
+HOST_RE = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+PATH_RE = re.compile(r"/[A-Za-z0-9._/-]*")
+PLACEHOLDER_RE = re.compile(r"\{\{([A-Z_]+)\}\}")
+IF_RE = re.compile(r"^\s*#@if\s+nginx\s*>=\s*(\d+)\.(\d+)\.(\d+)\s*$")
+ELSE_RE = re.compile(r"^\s*#@else\s*$")
+ENDIF_RE = re.compile(r"^\s*#@endif\s*$")
+VERSION_RE = re.compile(r"nginx/(\d+)\.(\d+)\.(\d+)")
+
+Version = tuple[int, int, int]
+
+
+class ApplyError(RuntimeError):
+    """A refusal with a message for the operator (the deploy log shows it)."""
+
+
+@dataclass(frozen=True)
+class Layout:
+    """Every path and program the wrapper touches. Production values are the defaults; tests pass their own."""
+
+    roxy_env: Path = Path("/etc/roxy/roxy.env")
+    releases_dir: Path = Path("/opt/roxy/releases")
+    nginx_dir: Path = Path("/etc/nginx")
+    state_dir: Path = Path("/var/lib/roxy-nginx-apply")
+    hints_file: Path = Path("/etc/roxy/nginx-hints.env")
+    log_dir: Path = Path("/var/log/nginx")
+    cert_root: Path = Path("/etc/letsencrypt/live")
+    nginx_cmd: tuple[str, ...] = ("/usr/sbin/nginx",)
+    systemctl_cmd: tuple[str, ...] = ("/usr/bin/systemctl",)
+    git_cmd: tuple[str, ...] = ("/usr/bin/git",)
+    trusted_uid: int = 0
+    env_extra: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def active_link(self) -> Path:
+        return self.nginx_dir / "roxy-active-upstream.conf"
+
+
+# --------------------------------------------------------------------------------------------- small helpers
+
+
+def log(message: str) -> None:
+    """One line on stdout; deploy.sh shows it in the deploy log."""
+    say(f"roxy-nginx-apply: {message}")
+
+
+def proc(cmd: list[str], layout: Layout) -> subprocess.CompletedProcess[bytes]:
+    """Run a command with a minimal, fixed environment (sudo already reset it; this makes it explicit).
+
+    HOME points at the wrapper's own directory and GIT_CONFIG_NOSYSTEM is set, so no user or system git
+    configuration (aliases, hooks, credential helpers) can change what git does here.
+    """
+    env = {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "LC_ALL": "C",
+        "HOME": str(layout.state_dir),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    env.update(layout.env_extra)
+    return subprocess.run(cmd, capture_output=True, env=env, check=False)  # noqa: S603
+
+
+def run(cmd: list[str], layout: Layout) -> bytes:
+    """`proc`, raising ApplyError with the command's own message when it fails. Returns stdout."""
+    result = proc(cmd, layout)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
+        raise ApplyError(f"{Path(cmd[0]).name} {' '.join(cmd[1:3])} failed: {detail[-800:]}")
+    return result.stdout
+
+
+def check_trusted_file(path: Path, trusted_uid: int) -> None:
+    """Refuse a file that the deploy user (or anyone but root) could have written."""
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ApplyError(f"{path} is missing: {exc.strerror}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ApplyError(f"{path} must be a regular file, not a link")
+    if info.st_uid != trusted_uid:
+        raise ApplyError(f"{path} must be owned by uid {trusted_uid}")
+    if info.st_mode & 0o022:
+        raise ApplyError(f"{path} must not be writable by group or others")
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """KEY=VALUE lines, `#` comments, optional matching quotes. Never expanded or executed (unlike `source`)."""
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if re.fullmatch(r"[A-Z_][A-Z0-9_]*", key):
+            values[key] = value
+    return values
+
+
+def parse_nginx_version(text: str) -> Version:
+    """`nginx version: nginx/1.24.0 (Ubuntu)` -> (1, 24, 0)."""
+    match = VERSION_RE.search(text)
+    if match is None:
+        raise ApplyError(f"cannot read the nginx version from {text.strip()[:120]!r}")
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def nginx_version(layout: Layout) -> Version:
+    """The installed nginx version (`nginx -v` prints to stderr)."""
+    result = proc([*layout.nginx_cmd, "-v"], layout)
+    return parse_nginx_version((result.stderr + result.stdout).decode("utf-8", "replace"))
+
+
+# ------------------------------------------------------------------------------------------------- render
+
+
+def site_values(env: Mapping[str, str], layout: Layout) -> dict[str, str]:
+    """The values rendered into the template, each validated so it cannot carry nginx syntax."""
+    origin = env.get("ROXY_SITE_ORIGIN", "https://roxytheproxy.com").strip().rstrip("/")
+    match = re.fullmatch(r"https://([A-Za-z0-9.-]+)", origin)
+    if match is None:
+        raise ApplyError(f"ROXY_SITE_ORIGIN must look like https://example.com (no port or path), got {origin!r}")
+    host = match.group(1).lower()
+    if not HOST_RE.fullmatch(host):
+        raise ApplyError(f"ROXY_SITE_ORIGIN has an invalid host name {host!r}")
+    names_raw = env.get("ROXY_NGINX_SERVER_NAMES", "").split()
+    names = [name.lower() for name in names_raw] or [host] + ([] if host.startswith("www.") else [f"www.{host}"])
+    for name in names:
+        if not HOST_RE.fullmatch(name):
+            raise ApplyError(f"ROXY_NGINX_SERVER_NAMES has an invalid host name {name!r}")
+    if host not in names:
+        names.insert(0, host)
+    values = {
+        "CANONICAL_HOST": host,
+        "SERVER_NAMES": " ".join(dict.fromkeys(names)),
+        "CERT_DIR": str(layout.cert_root / host),
+        "NGINX_DIR": str(layout.nginx_dir),
+        "LOG_DIR": str(layout.log_dir),
+        "RELEASES_DIR": str(layout.releases_dir),
+    }
+    for key in ("CERT_DIR", "NGINX_DIR", "LOG_DIR", "RELEASES_DIR"):
+        if not PATH_RE.fullmatch(values[key]):
+            raise ApplyError(f"{key} {values[key]!r} contains characters nginx config cannot take safely")
+    return values
+
+
+def render_site(template: str, *, version: Version, values: Mapping[str, str], header: str = "") -> str:
+    """Render the site template: keep the `#@if` branch that matches `version`, then fill `{{NAME}}` values."""
+    out: list[str] = []
+    state: str | None = None  # None outside a block, "if" or "else" inside one
+    keep = True
+    for number, line in enumerate(template.splitlines(), start=1):
+        if (match := IF_RE.match(line)) is not None:
+            if state is not None:
+                raise ApplyError(f"template line {number}: nested #@if is not supported")
+            wanted = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            state, keep = "if", version >= wanted
+            continue
+        if ELSE_RE.match(line):
+            if state != "if":
+                raise ApplyError(f"template line {number}: #@else without #@if")
+            state, keep = "else", not keep
+            continue
+        if ENDIF_RE.match(line):
+            if state is None:
+                raise ApplyError(f"template line {number}: #@endif without #@if")
+            state, keep = None, True
+            continue
+        if line.lstrip().startswith("#@"):
+            raise ApplyError(f"template line {number}: unknown directive {line.strip()!r}")
+        if keep:
+            out.append(line)
+    if state is not None:
+        raise ApplyError("template ends inside an #@if block")
+
+    def fill(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in values:
+            raise ApplyError(f"template uses an unknown value {{{{{name}}}}}")
+        return values[name]
+
+    text = PLACEHOLDER_RE.sub(fill, "\n".join(out) + "\n")
+    if "{{" in text or "}}" in text:
+        raise ApplyError("template has a malformed {{...}} placeholder")
+    return header + text
+
+
+# --------------------------------------------------------------------------------------- verified sources
+
+
+def manifest_text(files: Mapping[str, bytes]) -> str:
+    """The manifest deploy.sh writes with `sha256sum`: `<hex>  <path>` lines sorted by path."""
+    return "".join(f"{hashlib.sha256(files[path]).hexdigest()}  {path}\n" for path in sorted(files))
+
+
+def git_env_args(url: str) -> list[str]:
+    """git options for an untrusted fetch: no hooks, no prompts, and only the protocol the configured URL uses."""
+    protocol = "https" if url.startswith("https://") else "file"
+    return [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        f"protocol.{protocol}.allow=always",
+        "-c",
+        "credential.helper=",
+    ]
+
+
+def fetch_verified(layout: Layout, url: str, branch: str, sha: str) -> dict[str, bytes]:
+    """Every file under deploy/nginx in commit `sha`, read from the root-only mirror after checking that `sha` is
+    on `branch`. Refuses links and executables (only plain files may be installed)."""
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch):
+        raise ApplyError(f"ROXY_DEPLOY_BRANCH {branch!r} is not a plain branch name")
+    if not (url.startswith("https://") or url.startswith("/") or url.startswith("file://")):
+        raise ApplyError("ROXY_DEPLOY_REPO_URL must be an https URL")
+    mirror = layout.state_dir / "repo.git"
+    git = [*layout.git_cmd, *git_env_args(url), f"--git-dir={mirror}"]
+    if not (mirror / "HEAD").exists():
+        layout.state_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        run([*layout.git_cmd, "init", "--quiet", "--bare", str(mirror)], layout)
+        os.chmod(mirror, 0o700)  # the mirror is root's alone
+    run([*git, "fetch", "--quiet", "--no-tags", "--prune", url, f"+refs/heads/{branch}:refs/heads/{branch}"], layout)
+    if proc([*git, "cat-file", "-e", f"{sha}^{{commit}}"], layout).returncode != 0:
+        raise ApplyError(f"commit {sha} does not exist in {url}")
+    if proc([*git, "merge-base", "--is-ancestor", sha, f"refs/heads/{branch}"], layout).returncode != 0:
+        raise ApplyError(f"commit {sha} is not on {branch}; refusing to install its nginx config")
+    listing = run([*git, "ls-tree", "-r", "-z", "--full-tree", sha, "--", SOURCE_DIR], layout)
+    files: dict[str, bytes] = {}
+    for entry in listing.split(b"\0"):
+        if not entry:
+            continue
+        meta, _, path_bytes = entry.partition(b"\t")
+        mode, kind, object_id = meta.decode().split()
+        path = path_bytes.decode("utf-8")
+        if kind != "blob" or mode != "100644":
+            raise ApplyError(f"{path} in {sha} is not a plain file (mode {mode}); refusing")
+        files[path] = run([*git, "cat-file", "blob", object_id], layout)
+    missing = sorted(set(INSTALL_MAP) - set(files))
+    if missing:
+        raise ApplyError(f"commit {sha} is missing {', '.join(missing)}")
+    return files
+
+
+def read_no_follow(path: Path) -> bytes:
+    """Read a file the deploy user owns without following a symlink at its last component (root must never be
+    pointed at another file, even only to compare it), and only if it is a regular file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(0, "not a regular file")
+        chunks = []
+        while chunk := os.read(fd, 65536):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def check_release(layout: Layout, sha: str, files: Mapping[str, bytes]) -> None:
+    """The release deploy.sh built must match the verified files: its manifest and the files on disk."""
+    release = layout.releases_dir / sha
+    if release.is_symlink() or not release.is_dir():
+        raise ApplyError(f"release {release} does not exist (deploy.sh builds it first)")
+    manifest_path = release / MANIFEST_NAME
+    try:
+        recorded = read_no_follow(manifest_path).decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ApplyError(f"cannot read {manifest_path}: {exc}") from exc
+    if recorded != manifest_text(files):
+        raise ApplyError(f"the release manifest {manifest_path} does not match commit {sha}; refusing")
+    for path, content in files.items():
+        try:
+            on_disk = read_no_follow(release / path)
+        except OSError as exc:
+            raise ApplyError(f"release file {path} is unreadable or a link: {exc.strerror}") from exc
+        if on_disk != content:
+            raise ApplyError(f"release file {path} differs from commit {sha}; refusing")
+
+
+# ------------------------------------------------------------------------------------------------ install
+
+
+@contextlib.contextmanager
+def locked(layout: Layout) -> Iterator[None]:
+    """One apply or switch at a time (the same lock file as roxy-switch-color)."""
+    layout.state_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    with open(layout.state_dir / "lock", "a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def write_atomic(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Write a file so nginx never reads half of it: temporary file in the same directory, fsync, rename."""
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def replace_symlink(link: Path, target: Path) -> None:
+    """Point `link` at `target` atomically (a new symlink renamed over the old one)."""
+    tmp = link.with_name(f".{link.name}.new")
+    with contextlib.suppress(FileNotFoundError):
+        tmp.unlink()
+    os.symlink(target, tmp)
+    os.replace(tmp, link)
+
+
+def nginx_test(layout: Layout) -> tuple[bool, str]:
+    """`nginx -t`: (passed, output)."""
+    result = proc([*layout.nginx_cmd, "-t"], layout)
+    return result.returncode == 0, (result.stderr + result.stdout).decode("utf-8", "replace").strip()
+
+
+def nginx_hints(layout: Layout) -> dict[str, int]:
+    """worker_processes and worker_connections from the effective config (`nginx -T`), for the app's checks."""
+    result = proc([*layout.nginx_cmd, "-T"], layout)
+    text = result.stdout.decode("utf-8", "replace")
+    hints: dict[str, int] = {}
+    for key, name in (
+        ("worker_processes", "ROXY_NGINX_WORKER_PROCESSES"),
+        ("worker_connections", "ROXY_NGINX_WORKER_CONNECTIONS"),
+    ):
+        match = re.search(rf"^\s*{key}\s+(\S+?)\s*;", text, re.MULTILINE)
+        if match is None:
+            continue
+        value = match.group(1)
+        if value == "auto":
+            hints[name] = os.cpu_count() or 1
+        elif value.isdigit():
+            hints[name] = int(value)
+    return hints
+
+
+def install(
+    layout: Layout, sha: str, files: Mapping[str, bytes], rendered_site: str, *, initial_color: str | None
+) -> None:
+    """Write the files, test, reload; on a failed test put every file back as it was."""
+    previous: dict[Path, bytes | None] = {}
+    contents = dict(files)
+    contents[TEMPLATE_NAME] = rendered_site.encode("utf-8")
+    for source, relative in INSTALL_MAP.items():
+        target = layout.nginx_dir / relative
+        previous[target] = target.read_bytes() if target.exists() else None
+        write_atomic(target, contents[source])
+    enabled = layout.nginx_dir / "sites-enabled" / SITE_FILE
+    created_enabled = not enabled.is_symlink() and not enabled.exists()
+    if created_enabled:
+        enabled.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        os.symlink(Path("..") / "sites-available" / SITE_FILE, enabled)
+    created_link = not layout.active_link.is_symlink()
+    if created_link:
+        if layout.active_link.exists():
+            raise ApplyError(f"{layout.active_link} exists but is not a symlink; fix it by hand")
+        color = initial_color or "blue"
+        replace_symlink(layout.active_link, layout.nginx_dir / f"roxy-upstream-{color}.conf")
+        log(f"no active color yet: pointing {layout.active_link.name} at {color}")
+    passed, output = nginx_test(layout)
+    if not passed:
+        for target, old in previous.items():
+            if old is None:
+                target.unlink(missing_ok=True)
+            else:
+                write_atomic(target, old)
+        if created_enabled:
+            enabled.unlink(missing_ok=True)
+        if created_link:
+            layout.active_link.unlink(missing_ok=True)
+        raise ApplyError(f"nginx -t failed; the previous config was restored:\n{output}")
+    run([*layout.systemctl_cmd, "reload-or-restart", "nginx"], layout)
+    hints = nginx_hints(layout)
+    if hints:
+        text = "".join(f"{name}={value}\n" for name, value in sorted(hints.items()))
+        header = "# Written by roxy-nginx-apply from `nginx -T` after each apply; do not edit (plan 15.3 L).\n"
+        write_atomic(layout.hints_file, (header + text).encode("utf-8"), 0o644)
+    record = {
+        "sha": sha,
+        "manifest_sha256": hashlib.sha256(manifest_text(files).encode("utf-8")).hexdigest(),
+        "applied_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    write_atomic(layout.state_dir / "applied.json", (json.dumps(record, indent=2) + "\n").encode("utf-8"), 0o644)
+
+
+def apply(layout: Layout, sha: str, *, initial_color: str | None = None) -> None:
+    """The whole command: verify, render, install, test, reload."""
+    if not SHA_RE.fullmatch(sha):
+        raise ApplyError("the commit must be 40 lowercase hex characters")
+    if initial_color is not None and initial_color not in COLORS:
+        raise ApplyError("--initial-color must be blue or green")
+    check_trusted_file(layout.roxy_env, layout.trusted_uid)
+    env = read_env_file(layout.roxy_env)
+    url = env.get("ROXY_DEPLOY_REPO_URL", "")
+    if not url or "OWNER/REPO" in url:
+        raise ApplyError(f"ROXY_DEPLOY_REPO_URL is not set in {layout.roxy_env} (replace the OWNER/REPO placeholder)")
+    branch = env.get("ROXY_DEPLOY_BRANCH", "main") or "main"
+    with locked(layout):
+        files = fetch_verified(layout, url, branch, sha)
+        check_release(layout, sha, files)
+        version = nginx_version(layout)
+        values = site_values(env, layout)
+        header = (
+            f"# Rendered by roxy-nginx-apply from {SOURCE_DIR}/roxy.conf.template at {sha[:12]} for nginx "
+            f"{'.'.join(map(str, version))}. Do not edit: the next deploy replaces this file.\n"
+        )
+        rendered = render_site(files[TEMPLATE_NAME].decode("utf-8"), version=version, values=values, header=header)
+        install(layout, sha, files, rendered, initial_color=initial_color)
+    log(f"installed the nginx config of {sha[:12]} (nginx {'.'.join(map(str, version))}) and reloaded nginx")
+
+
+def main(argv: list[str] | None = None, layout: Layout | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="roxy-nginx-apply", description="Install the nginx config of a commit.")
+    parser.add_argument("sha", help="the full 40 character commit id")
+    parser.add_argument("--initial-color", choices=COLORS, help="color for a first deploy (no active symlink yet)")
+    args = parser.parse_args(argv)
+    try:
+        apply(layout or Layout(), args.sha, initial_color=args.initial_color)
+    except ApplyError as exc:
+        warn(f"roxy-nginx-apply: {exc}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        warn("roxy-nginx-apply: must run as root (through sudo)")
+        raise SystemExit(1)
+    raise SystemExit(main())

@@ -1,0 +1,27 @@
+# SEC-BYPASS-FOREVER must stay quiet when every bypass entry has an expiry, however far away.
+#
+#   access_list entry                      kind          expires
+#   198.51.100.30/32 "partner relay"       bypass        in 300 days (long, but set)
+#   198.51.100.31/32 "uptime monitor"      bypass        in 1 hour
+#   203.0.113.0/24                         allow_admin   never (not a bypass entry)
+#   192.0.2.0/28 "scanner range"           deny          never (not a bypass entry)
+#
+# "Any bypass with no expiry" has no smaller case than none, so this is the just-under scenario.
+
+format: roxy.insight_fixture/1
+rule: SEC-BYPASS-FOREVER
+case: all_entries_expire
+description: >
+  Both bypass entries expire (one in 300 days, one in an hour); the never-expiring entries are an admin allowlist entry
+  and a deny entry. SEC-BYPASS-FOREVER must not fire.
+now: "2026-10-07T15:00:00Z"
+
+tables:
+  access_list:
+    - {id: 1, kind: bypass, cidr: "198.51.100.30/32", note: "Partner relay", expires_at: "+300d", created_by: admin, created_at: "-65d", x_last_hit_at: "-5m"}
+    - {id: 2, kind: bypass, cidr: "198.51.100.31/32", note: "Uptime monitor", expires_at: "+1h", created_by: admin, created_at: "-23h", x_last_hit_at: "-1m"}
+    - {id: 3, kind: allow_admin, cidr: "203.0.113.0/24", note: "Office", expires_at: null, created_by: admin, created_at: "-60d"}
+    - {id: 4, kind: deny, cidr: "192.0.2.0/28", note: "Scanner range", expires_at: null, created_by: admin, created_at: "-30d"}
+
+expect:
+  fires: false
