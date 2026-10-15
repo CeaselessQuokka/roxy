@@ -626,3 +626,73 @@ Nothing to build; listed so they are not lost.
 Known before your answers, and recorded in `CHANGES.md`, "Known limitations and follow-ups": roles for several
 admins (D22), Open Cloud API keys (D19), a written procedure to replace the encryption keys, and a source of
 "anonymous against account" comparisons for the shadow report.
+
+## 17. Requests from the first day live (2026-10-15)
+
+Asked for after v2 went live on 2026-10-15. Item 17.1 was built the same day; the rest are queued in the order
+listed.
+
+### 17.1 Under construction pages (built 2026-10-15)
+
+> "can you please add an option in the admin panel somewhere for me to disable view of the home page, docs
+> (guide), and status pages? It will replace them with an "under construction page" so I can take time to review
+> the docs"
+
+Built: three switches on the Settings page, Public site card (home, guide, status), an editable message, and an
+admin view of the real page with a "See what the public sees" button. The admin guide explains them.
+
+### 17.2 Sending the account's cookie for chosen endpoints: presets and a checklist
+
+> "can we widen where we send our Roblox token so we are able to get that sort of data? Let's disable it for
+> sensitive endpoints, but it would quite nice to have a place in the admin panel to do this as well. Different
+> presets of what to allow, but also a way to individually check and uncheck endpoints to be enabled to have the
+> token sent. We can polish this feature later"
+
+- **Your decision (D1 relaxed, 2026-10-15):** the cookie may go with callers' requests for chosen, harmless GET
+  endpoints. It already works today, one row at a time, on the Credential page, Allowlist card (GET and HEAD only,
+  a fresh authenticator code and a reason per row). The first row: `friends.roblox.com/v1/users/*/followings`,
+  which Roblox answers only for signed-in accounts (401 on all 144 anonymous calls in the first 16 hours).
+- **To build:** presets (for example "Public profile data that needs a sign-in") and a checklist of the endpoints
+  Roxy has seen, each with a switch, with the sensitive ones (anything about the account itself, money, trades,
+  messages, settings, and every request that is not GET or HEAD) locked off; the private endpoint guard of item 1
+  feeds the list.
+- **Size:** M (the allowlist, the tester and the audit already exist).
+
+### 17.3 Deploy from the dashboard, and auto-deploy on or off
+
+> "It would also be cool to have on the admin panel a button to click that will auto redeploy based off a branch
+> that updates based off the current state of the GitHub repo. So I can see how different builds deploy, and also
+> disable or enable auto deploying from main branch"
+
+- A System page card: pick a branch (or a commit) and deploy it, with the deploy's log as it runs; a switch that
+  turns automatic deploys from `main` off and on (GitHub Actions asks the server whether to deploy).
+- Needs care: the service account must never gain the deploy account's rights, so the dashboard asks a small root
+  helper (like the existing backup request) to start the deploy.
+- **Size:** L.
+
+### 17.4 A server upkeep script
+
+> "a shell file I can run that updates the whole server to the latest version of ubuntu and other stuff to get it
+> all updated and safe for libraries used too [...] updates the output as it goes so you know what it's doing"
+
+- One command (`roxy-upkeep`): Ubuntu security and package updates with their output, the certificate check, old
+  kernels and logs cleaned, a known vulnerability check of the running release's Python libraries, and a clear
+  "a reboot is needed" with a safe reboot only when you choose. Python libraries themselves are updated through the
+  repository (`uv.lock`) and a normal deploy.
+- **Size:** S to M. **Next after the push-to-deploy setup.**
+
+### 17.5 A private repository
+
+> "I want to make this repo private, so I would like to be able to support taking those steps"
+
+- The server downloads the code anonymously today. Before the repository goes private: a read-only deploy key on
+  the server, the deploy tools taught to fetch with it (the nginx tool accepts only an https address today), one
+  deploy through the key, then the switch to private. GitHub Actions keeps working on a private repository.
+- **Size:** S. **Do not switch the repository to private before this is done.**
+
+### 17.6 The regular expression budget on slower hardware
+
+Found while making GitHub's CI pass: Roxy accepts a rule's regular expression only if its slowest test match takes
+under 25 ms (half the 50 ms limit per match). On this development PC the slowest accepted patterns take about 14
+ms; on GitHub's runners, and probably on the 2 vCPU production server, about 25 to 30 ms. Decide whether the budget
+should scale with the server's speed or be halved. **Size:** S.

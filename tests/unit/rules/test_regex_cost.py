@@ -17,6 +17,9 @@ How it works
     Verdicts go through `validate_regex` and `validate_pattern` (the paths admin writes take). Measurements run the
     compiled pattern the way rules run it (`search` on the `regex` module) on runs of single characters, short
     units and the pattern's own literal pieces, each with and without a killer character, and keep the slowest.
+    The model was calibrated on the development machine, so "well inside the timeout" (under half of it) is scaled
+    by how much slower this machine runs the regex engine (`tests/cpu_speed.py`: 1 there; a GitHub-hosted runner
+    is about twice as slow per core, which puts `\\w+\\b`, 13 ms on the development machine, past 25 ms).
 
 What to read next
     `src/roxy/rules/regex_cost.py`, `src/roxy/rules/match.py`, `tests/security/test_ingress_redos.py`,
@@ -31,6 +34,7 @@ import time
 
 import pytest
 
+from cpu_speed import scaled, slowdown
 from roxy.config.catalog import CATALOG
 from roxy.rules import regex_cost
 from roxy.rules.match import (
@@ -254,4 +258,7 @@ def test_accepted_patterns_fail_long_inputs_well_inside_the_timeout(pattern: str
                 rx.search(target, timeout=1.0)
             best = min(best, time.perf_counter() - started)
         worst = max(worst, best)
-    assert worst < REGEX_MATCH_TIMEOUT_S / 2, f"{pattern!r} took {worst * 1000:.1f} ms"
+    assert worst < scaled(REGEX_MATCH_TIMEOUT_S / 2), (
+        f"{pattern!r} took {worst * 1000:.1f} ms (this machine runs the regex engine {slowdown():.2f} times as slow "
+        "as the development machine)"
+    )

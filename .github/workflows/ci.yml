@@ -1,13 +1,14 @@
 # Continuous integration for Roxy v2 (plan 9.14, 17.4, 19.9 and the 19.10 acceptance rows).
 #
-# What runs (one job each, in parallel):
+# What runs (one job each, in parallel; the two longest suites as several jobs, each running a share of the test
+# files picked by `pytest --shard K/N`, tests/ci_shards.py, so every job stays well inside its time limit):
 #   lint              ruff (lint and format), mypy, the generated settings reference (gen_settings_docs --check),
 #                     the LLM export schema (regenerated and compared, then checked as a draft 2020-12 schema) and the
 #                     v1 parity table (gen_v1_parity --check: every v1 check mapped, every cited test id collected)
 #   style             scripts/check_style.py on the repository and on REMAKE_PLAN.md, and the tests that check
 #                     rendered pages (public pages, sign-in pages, the user guide, the design system)
-#   unit              tests/unit, tests/health, tests/insights and every other suite without a job of its own
-#   integration       tests/integration
+#   unit              tests/unit, tests/health, tests/insights and every other suite without a job of its own (2 jobs)
+#   integration       tests/integration (6 jobs)
 #   multiprocess      tests/multiprocess (real gunicorn masters with 1, 2 and 4 workers)
 #   security          tests/security and bandit (medium severity or higher fails)
 #   migration         tests/migration (the v1 migrator against fixture trees)
@@ -129,9 +130,15 @@ jobs:
           tests/unit/ui/test_ui_static.py::test_design_system_files_pass_the_style_check
 
   unit:
-    name: Unit tests (and every suite without a job of its own)
+    name: Unit tests (and every suite without a job of its own; shard ${{ matrix.shard }})
     runs-on: ubuntu-24.04
+    # In one process these suites take about 25 minutes on the busy dev machine and a hosted runner is slower per
+    # core, which left one job little margin under this limit; two jobs each run a share of the files (`--shard`).
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1/2", "2/2"]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -143,18 +150,28 @@ jobs:
           enable-cache: true
       - name: Install locked dependencies
         run: uv sync --frozen
-      - name: Pytest (unit, health checks, recommendation rules, the LLM export, and any new suite)
+      - name: Pytest (unit, health checks, recommendation rules, the LLM export, and any new suite; this job's shard)
         # Everything under tests/ except the suites the jobs below run, so a new test directory runs here by
         # default instead of silently never running in CI. tests/load runs on the staging VM (plan 19.4).
+        env:
+          SHARD: ${{ matrix.shard }}
         run: >-
           uv run --frozen pytest -p no:cacheprovider tests
           --ignore=tests/integration --ignore=tests/multiprocess --ignore=tests/security --ignore=tests/migration
-          --ignore=tests/deploy --ignore=tests/e2e --ignore=tests/load
+          --ignore=tests/deploy --ignore=tests/e2e --ignore=tests/load --shard "$SHARD"
 
   integration:
-    name: Integration tests
+    name: Integration tests (shard ${{ matrix.shard }})
     runs-on: ubuntu-24.04
+    # In one process the suite takes about 50 minutes on the dev machine and longer on a hosted runner, past this
+    # limit (the single job was canceled at 30 minutes). `--shard K/N` (tests/ci_shards.py) gives each job of the
+    # matrix a share of the test files, balanced by test functions; together the jobs run every collected test
+    # once, new files included.
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1/6", "2/6", "3/6", "4/6", "5/6", "6/6"]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -166,8 +183,10 @@ jobs:
           enable-cache: true
       - name: Install locked dependencies
         run: uv sync --frozen
-      - name: Pytest (integration, respx mock Roblox)
-        run: uv run --frozen pytest -p no:cacheprovider tests/integration
+      - name: Pytest (integration, respx mock Roblox; this job's shard of the test files)
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: uv run --frozen pytest -p no:cacheprovider tests/integration --shard "$SHARD"
 
   multiprocess:
     name: Multi-process tests

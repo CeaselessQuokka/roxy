@@ -1,0 +1,24 @@
+{#
+	The admin's view of a page under construction (roxy/public/construction.py), two macros base.html calls:
+	`admin_banner(preview)` above the site header of the REAL page, and `public_notice(preview)`, the small fixed
+	notice on the under-construction page an admin asked to see (`?view=public`). Only a live admin session ever
+	gets either one; everyone else gets neither, so the public page stays exactly what the public sees.
+	Plain links, no script and no style attribute (the strict CSP); the look is site.css (`.preview-*`). Each is an
+	`aside` landmark with its own name, so a screen reader can find it and tell it from the page.
+#}
+{% macro admin_banner(preview) -%}
+		<aside class="preview-banner" aria-label="Admin preview">
+			<div class="wrap preview-bar">
+				<p><strong>Admins only:</strong> the public currently sees the under-construction page for this page.</p>
+				<p class="preview-actions">
+					<a class="button button-primary" href="{{ preview.public_view_url }}">See what the public sees</a>
+					<a href="{{ preview.settings_url }}">Change it in Settings</a>
+				</p>
+			</div>
+		</aside>
+{%- endmacro %}
+{% macro public_notice(preview) -%}
+		<aside class="preview-notice" aria-label="Admin preview">
+			<p>You are viewing this page as the public sees it. <a href="{{ preview.admin_view_url }}">Back to admin view</a></p>
+		</aside>
+{%- endmacro %}

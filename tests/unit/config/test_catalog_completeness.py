@@ -543,6 +543,11 @@ PLAN_K = [
     "site_footer_text",
     "ui_timezone",
     "ui_default_theme",
+    # Added to the plan table after the cutover (owner request, 2026-10-15): pages under construction.
+    "public_home_under_construction",
+    "public_docs_under_construction",
+    "public_status_under_construction",
+    "site_construction_text",
 ]
 
 # Table -> (keys, the Settings page groups those keys may live in).

@@ -9,7 +9,7 @@ What this is
     small pure helpers the routes are built from, so tests can call them directly: `render_site_text`,
     `find_user_guide`, `render_guide`, `home_examples`, `code_block`, `live_limits`, `count_text`,
     `parse_pause_state`, `parse_throttle_all`, `classify_hour`, `read_rate_limited`, `canonical_page_path` and
-    `build_sitemap`.
+    `build_sitemap`, and `construction_page` (the under-construction page, `roxy/public/construction.py`).
 
 Why it exists
     v1's home page hard-coded "10 requests every 50 seconds" and "made using Python and Flask", and both drifted
@@ -80,11 +80,17 @@ How it works
       v1's bytes for `/` and adds `/docs` and `/status` (only while that page is enabled), with `lastmod` set to
       the build date: the newest modification time of the public templates, assets, this module and the guide,
       which is the install time of a release. Both are read once per process, at startup.
+    - Under construction (owner request, 2026-10-15): while `public_home_under_construction`,
+      `public_docs_under_construction` or `public_status_under_construction` is on, that page answers the public
+      with `construction_page` (503, Retry-After, noindex, the `site_construction_text` message) and a signed-in
+      admin with the real page plus a banner; `?view=public` shows an admin the public page with a notice. The rules
+      (who is an admin, the headers) are `roxy/public/construction.py`. The sitemap leaves a page under construction
+      out; robots.txt does not change. A status page that is switched off stays a 404, under construction or not.
 
 What to read next
     `roxy/templates/public/base.html` (the page shell and its nonce script tag), `docs/USER_GUIDE.md`,
-    `roxy/public/luau_highlight.py`, `roxy/public/csp_report.py`, then `roxy/core/templating.py` and
-    `roxy/core/security_headers.py`.
+    `roxy/public/luau_highlight.py`, `roxy/public/csp_report.py`, `roxy/public/construction.py`, then
+    `roxy/core/templating.py` and `roxy/core/security_headers.py`.
 """
 
 from __future__ import annotations
@@ -99,7 +105,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -124,6 +130,7 @@ from roxy.abuse.throttle_all import ThrottleAllState
 from roxy.core.reasons import Egress
 from roxy.core.scope import catalog_default
 from roxy.core.templating import STATIC_DIR, TEMPLATES_DIR, Templates
+from roxy.public import construction
 from roxy.public.luau_highlight import SCOPE_CLASS, highlight
 from roxy.upstream.cooldowns import CooldownSource, egress_key, endpoint_key, host_key
 
@@ -986,9 +993,14 @@ SITEMAP_DOCS: Final = SitemapEntry("/docs", "weekly", "0.8")
 SITEMAP_STATUS: Final = SitemapEntry("/status", "hourly", "0.3")
 
 
-def build_sitemap(lastmod: str, *, include_status: bool = True) -> bytes:
-    """sitemap.xml in v1's exact layout (tab indented, final newline), plus `/docs` and `/status` (plan row 13)."""
+def build_sitemap(lastmod: str, *, include_status: bool = True, leave_out: Collection[str] = ()) -> bytes:
+    """sitemap.xml in v1's exact layout (tab indented, final newline), plus `/docs` and `/status` (plan row 13).
+
+    `leave_out` names the paths of pages under construction: a page that answers 503 is not one to point search
+    engines at, and it comes back with the next crawl of the sitemap once its switch is off.
+    """
     entries = [SITEMAP_HOME, SITEMAP_DOCS] + ([SITEMAP_STATUS] if include_status else [])
+    entries = [entry for entry in entries if entry.path not in leave_out]
     lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
     for entry in entries:
         lines += [
@@ -1361,18 +1373,44 @@ def templates_for(request: Request) -> Templates:
 
 
 def common_context(get: Getter, page: str) -> dict[str, Any]:
-    """Values every public page uses: the footer, the navigation and the current page name."""
+    """Values every public page uses: the footer, the navigation, the current page name, and the admin preview of a
+    page under construction (`preview`, None for everyone else; `construction.Preview`)."""
     return {
         "page": page,
         "status_enabled": bool(get("public_status_page_enabled")),
         "footer_html": render_site_text(str(get("site_footer_text")), inline=True),
         "canonical_origin": CANONICAL_ORIGIN,
+        "preview": None,
     }
 
 
-def _page(request: Request, template: str, context: Mapping[str, Any]) -> Response:
+def _page(
+    request: Request, template: str, context: Mapping[str, Any], preview: construction.Preview | None = None
+) -> Response:
+    """Render a public page. For an admin's view of a page under construction (`preview`), the context carries the
+    preview (base.html shows the banner) and the answer gets that view's headers (`Preview.headers`)."""
+    if preview is not None:
+        context = {**context, "preview": preview}
     response = templates_for(request).render(request, template, context)
     response.headers["cache-control"] = PAGE_CACHE_CONTROL
+    if preview is not None:
+        response.headers.update(preview.headers())
+    return response
+
+
+async def construction_page(request: Request, get: Getter, preview: construction.Preview) -> Response:
+    """The under-construction page (503) for a page whose switch is on: the public's answer, and an admin's with
+    `?view=public` (then with the small "back to admin view" notice). Counted as a visit of that page."""
+    context = {
+        **common_context(get, preview.target.page),
+        "preview": preview,
+        "construction": preview.target,
+        "message_html": render_site_text(str(get(construction.MESSAGE_KEY))),
+    }
+    response = templates_for(request).render(
+        request, "public/construction.html", context, status_code=preview.status_code, headers=preview.headers()
+    )
+    await record_visit(request, preview.target.page)
     return response
 
 
@@ -1437,8 +1475,12 @@ _guide_missing_logged = False
 
 @router.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 async def home(request: Request) -> Response:
-    """The home page: what Roxy is, a quick start, live limits, and the `site_*` texts (plan 16.1)."""
+    """The home page: what Roxy is, a quick start, live limits, and the `site_*` texts (plan 16.1); the
+    under-construction page instead while `public_home_under_construction` is on (except for a signed-in admin)."""
     get = settings_getter(request)
+    preview = await construction.preview_for(request, get, PAGE_HOME)
+    if preview is not None and not preview.real_page:
+        return await construction_page(request, get, preview)
     context = {
         **common_context(get, PAGE_HOME),
         "limits": live_limits(get),
@@ -1449,7 +1491,7 @@ async def home(request: Request) -> Response:
         "hosting_html": render_site_text(str(get("site_hosting_note"))),
         "support_html": render_site_text(str(get("site_support_links"))),
     }
-    response = _page(request, "public/home.html", context)
+    response = _page(request, "public/home.html", context, preview)
     await record_visit(request, PAGE_HOME)
     return response
 
@@ -1503,8 +1545,13 @@ router.add_api_route(
 
 @router.api_route("/docs", methods=["GET", "HEAD"], include_in_schema=False)
 async def docs(request: Request) -> Response:
-    """The user guide (`docs/USER_GUIDE.md`) with live values, a table of contents and heading anchors."""
+    """The user guide (`docs/USER_GUIDE.md`) with live values, a table of contents and heading anchors; the
+    under-construction page instead while `public_docs_under_construction` is on (except for a signed-in admin)."""
     global _guide_missing_logged
+    get = settings_getter(request)
+    preview = await construction.preview_for(request, get, PAGE_DOCS)
+    if preview is not None and not preview.real_page:
+        return await construction_page(request, get, preview)
     guide = await served_guide(request)
     if guide is None:
         # Only an app whose startup did not load the guide gets here (the lifespan refuses to start without it).
@@ -1513,24 +1560,28 @@ async def docs(request: Request) -> Response:
             _guide_missing_logged = True
             log.error("user_guide_missing", extra={"fields": {"path": str(USER_GUIDE_PATH)}})
         raise HTTPException(status_code=503, detail="Service Unavailable")
-    get = settings_getter(request)
     context = {
         **common_context(get, PAGE_DOCS),
         "guide_title": guide.title,
         "toc": guide.toc,
         "guide_html": guide.html(guide_values(get, guide.names)),
     }
-    response = _page(request, "public/docs.html", context)
+    response = _page(request, "public/docs.html", context, preview)
     await record_visit(request, PAGE_DOCS)
     return response
 
 
 @router.api_route("/status", methods=["GET", "HEAD"], include_in_schema=False)
 async def status(request: Request) -> Response:
-    """Coarse public status, or 404 while `public_status_page_enabled` is 0 (plan 15.3 K)."""
+    """Coarse public status, or 404 while `public_status_page_enabled` is 0 (plan 15.3 K); the under-construction
+    page instead while `public_status_under_construction` is on (except for a signed-in admin). A page that is
+    switched off is not under construction: the 404 comes first, for admins too."""
     get = settings_getter(request)
     if not bool(get("public_status_page_enabled")):
         raise HTTPException(status_code=404, detail="Not Found")
+    preview = await construction.preview_for(request, get, PAGE_STATUS)
+    if preview is not None and not preview.real_page:
+        return await construction_page(request, get, preview)
     ctx = getattr(request.app.state, "ctx", None)
     view = await status_cache(request).get(ctx)
     context = {
@@ -1541,7 +1592,7 @@ async def status(request: Request) -> Response:
         "cache_ttl_text": count_text(get("cache_ttl_seconds"), "second"),
         "legend": [(state, STATE_TEXT[state][0]) for state in ("operational", "degraded", "paused", HOUR_NO_DATA)],
     }
-    response = _page(request, "public/status.html", context)
+    response = _page(request, "public/status.html", context, preview)
     await record_visit(request, PAGE_STATUS)
     return response
 
@@ -1557,10 +1608,12 @@ async def robots_txt(request: Request) -> Response:
 
 @router.api_route("/sitemap.xml", methods=["GET", "HEAD"], include_in_schema=False)
 async def sitemap_xml(request: Request) -> Response:
-    """The sitemap with `/`, `/docs` and (while enabled) `/status`, `lastmod` from the build date."""
+    """The sitemap with `/`, `/docs` and (while enabled) `/status`, `lastmod` from the build date; a page under
+    construction is left out."""
     get = settings_getter(request)
     lastmod = build_date(await _cached_value(build_time))
-    body = build_sitemap(lastmod, include_status=bool(get("public_status_page_enabled")))
+    away = [target.path for target in construction.pages_under_construction(get)]
+    body = build_sitemap(lastmod, include_status=bool(get("public_status_page_enabled")), leave_out=away)
     response = Response(content=body, media_type="application/xml; charset=utf-8")
     await record_crawl(request)
     await record_visit(request, PAGE_SITEMAP)

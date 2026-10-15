@@ -13,7 +13,8 @@ What this is
       * `history`: every settings change (the API's history table, filtered by the top bar range, source and
         search); a row opens the change in the drawer with its revert form (`POST /settings/history/{id}/revert`).
       * `import-export`: download your changes as JSON (audited) and load such a file back with a preview first.
-      * `alerts` and `public-site`: the settings the catalog places there, with a sentence on each.
+      * `alerts` and `public-site`: the settings the catalog places there, with a sentence on each; the public site
+        card also links each page under construction (`roxy/public/construction.py`).
 
 Why it exists
     Plan 15.2's editor features, with plan P6: the listing is `settings_api.settings_listing`, the history
@@ -51,6 +52,7 @@ from roxy.config import catalog
 from roxy.config.catalog import NON_PAGE_HOMES
 from roxy.config.runtime import same_value
 from roxy.config.spec import GROUP_LABELS, Group, Risk, SettingSpec
+from roxy.public import construction
 
 page = Page("settings", default_range="all")
 router = page.router
@@ -463,8 +465,9 @@ async def alerts_card(view: PageView) -> dict[str, Any]:
 
 @page.card("public-site", lazy=True)
 async def public_site_card(view: PageView) -> dict[str, Any]:
-    """The public site settings (placed by the catalog), with links to the pages they change."""
-    return {}
+    """The public site settings (placed by the catalog), with links to the pages they change and to each page under
+    construction (`roxy/public/construction.py`), where the owner sees the real page with the admin banner."""
+    return {"under_construction": construction.pages_under_construction(view.ctx.settings.get)}
 
 
 __all__ = [

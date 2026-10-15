@@ -19,6 +19,8 @@ How it works
       `EnvSettings` from them, falling back to a plain object while `config/env.py` does not exist yet.
     - `app` and `client` skip the test cleanly while `roxy.main.create_app` cannot be imported yet.
     - Tests marked `live` run only with `ROXY_LIVE_TESTS=1`, and then without the guard. Agents never set it.
+    - `--shard K/N` keeps only shard K of N of the collected test files (`tests/ci_shards.py`): CI runs the unit
+      job's suites and the integration suite as N parallel jobs each.
     - The database thread guard (`tests/db_threads.py`): a module whose tests leave a database open fails at its
       end, naming the test that opened it, and a database thread still running when the session ends fails the
       run (a forgotten database once broke a later test that counts database threads).
@@ -41,6 +43,7 @@ from typing import Any
 
 import pytest
 
+import ci_shards
 import db_threads
 from roxy.core.clock import FakeClock
 
@@ -105,14 +108,34 @@ def _live_tests_enabled() -> bool:
     return os.environ.get("ROXY_LIVE_TESTS") == "1"
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--shard",
+        default=None,
+        metavar="K/N",
+        help="run only shard K of N of the collected test files (tests/ci_shards.py; CI splits long suites)",
+    )
+
+
+@pytest.hookimpl(trylast=True)  # after every other hook changed the list: the shards split the final collection
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip tests marked `live` unless ROXY_LIVE_TESTS=1 (never in CI, never by the implementing agents)."""
-    if _live_tests_enabled():
-        return
-    skip_live = pytest.mark.skip(reason="live test: set ROXY_LIVE_TESTS=1 to run (never in CI)")
-    for item in items:
-        if "live" in item.keywords:
-            item.add_marker(skip_live)
+    """Skip tests marked `live` unless ROXY_LIVE_TESTS=1 (never in CI, never by the implementing agents), then keep
+    only this run's shard of the test files when `--shard K/N` is given."""
+    if not _live_tests_enabled():
+        skip_live = pytest.mark.skip(reason="live test: set ROXY_LIVE_TESTS=1 to run (never in CI)")
+        for item in items:
+            if "live" in item.keywords:
+                item.add_marker(skip_live)
+    shard = config.getoption("shard")
+    if shard:
+        try:
+            index, count = ci_shards.parse_shard(shard)
+        except ValueError as exc:
+            raise pytest.UsageError(str(exc)) from exc
+        kept, dropped = ci_shards.split(items, [item.nodeid for item in items], index, count)
+        if dropped:
+            config.hook.pytest_deselected(items=dropped)
+        items[:] = kept
 
 
 @pytest.fixture(autouse=True)

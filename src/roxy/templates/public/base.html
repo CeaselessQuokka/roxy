@@ -5,7 +5,13 @@
 	response's nonce, styles come only from the hashed stylesheet in /static (no style attributes, no <style>
 	blocks), and nothing loads from another origin. Child templates fill the blocks `head` (title and meta tags),
 	`head_extra` (data blocks such as JSON-LD), `main_class` and `content`.
+
+	`preview` (roxy/public/construction.py `Preview`, None for every visitor but an admin) is a signed-in admin's view
+	of a page under construction: the real page gets the admin banner above the site header, and the
+	under-construction page an admin asked to see gets the small fixed notice (public/_preview.html) and the
+	`previewing` body class, which keeps room below the footer so the notice never covers it.
 #}
+{% from "public/_preview.html" import admin_banner, public_notice %}
 <!DOCTYPE html>
 <html lang="en">
 	<head>
@@ -17,8 +23,11 @@
 		<link rel="icon" type="image/png" href="{{ static_url('public/roxy_favicon.png') }}" />
 		{% block head_extra %}{% endblock %}
 	</head>
-	<body>
+	<body{% if preview and preview.admin_as_public %} class="previewing"{% endif %}>
 		<a class="skip-link" href="#main">Skip to content</a>
+		{% if preview and preview.real_page %}
+{{ admin_banner(preview) }}
+		{% endif %}
 		<header class="site-header">
 			<div class="wrap bar">
 				<a class="brand" href="/">Roxy Proxy</a>
@@ -50,6 +59,9 @@
 				</p>
 			</div>
 		</footer>
+		{% if preview and preview.admin_as_public %}
+{{ public_notice(preview) }}
+		{% endif %}
 		<script type="module" nonce="{{ csp_nonce }}" src="{{ static_url('public/site.js') }}"></script>
 	</body>
 </html>

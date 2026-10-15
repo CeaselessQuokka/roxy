@@ -21,8 +21,10 @@ Why it exists
 How it works
     The same measurement as `test_ingress_redos.py test_accepted_patterns_never_need_the_timeout`: run the real
     compiled pattern (`compile_pattern`, `text_matches`) on the input and require less than half the per-match
-    timeout and no timeout counted. Regex inputs are a full header value (8 KiB, the default `max_header_bytes`),
-    the input a User-Agent or header rule sees; the glob input is a path at the catalog maximum `max_url_length`.
+    timeout (scaled by how much slower this machine runs the regex engine than the development machine the cost
+    model was calibrated on, `tests/cpu_speed.py`) and no timeout counted. Regex inputs are a full header value
+    (8 KiB, the default `max_header_bytes`), the input a User-Agent or header rule sees; the glob input is a path
+    at the catalog maximum `max_url_length`.
     Fixed in the review round: the model sizes inputs at 8192, charges short repeats by the lengths they can give
     back, and judges globs on their compiled regex, so every slow shape here is refused (asserted), while the
     controls and a two-wildcard glob that cannot fail late (`*-*`) stay accepted and fast.
@@ -38,6 +40,7 @@ import time
 
 import pytest
 
+from cpu_speed import scaled, slowdown
 from roxy.rules import match
 from roxy.rules.match import (
     PatternValidationError,
@@ -69,7 +72,10 @@ def _assert_fast(run: object, label: str) -> None:
     run()  # type: ignore[operator]
     elapsed = time.perf_counter() - started
     assert regex_timeouts_total() == before, f"{label} hit the per-match timeout"
-    assert elapsed < match.REGEX_MATCH_TIMEOUT_S / 2, f"{label} took {elapsed * 1000:.0f} ms"
+    assert elapsed < scaled(match.REGEX_MATCH_TIMEOUT_S / 2), (
+        f"{label} took {elapsed * 1000:.0f} ms (this machine runs the regex engine {slowdown():.2f} times as slow as "
+        "the development machine)"
+    )
 
 
 @pytest.mark.parametrize(("pattern", "target"), SLOW_ACCEPTED_REGEXES, ids=[p for p, _ in SLOW_ACCEPTED_REGEXES])

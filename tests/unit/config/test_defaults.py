@@ -32,6 +32,7 @@ from roxy.config.defaults import (
     v1_builtin_tier_rows,
 )
 from roxy.config.runtime import read_config_version
+from roxy.config.settings.routing import RETIRED_ROBLOX_HOSTS
 from roxy.core.clock import FakeClock
 from roxy.migration.text import clean_admin_text
 from roxy.rules.models import CacheRuleIn, ThrottleTierIn
@@ -90,7 +91,10 @@ def test_ignored_params_are_the_v1_suggestions_without_v() -> None:
 
 
 def test_allowed_hosts_match_plan_9_10_and_the_catalog() -> None:
-    assert tuple(f"{name}.roblox.com" for name in PLAN_9_10_HOSTS) == defaults.ALLOWED_ROBLOX_HOSTS
+    # Plan 9.10's list, less the hosts Roblox has since shut down (docs/RETIRED_ROBLOX_HOSTS.md).
+    plan_hosts = tuple(f"{name}.roblox.com" for name in PLAN_9_10_HOSTS)
+    assert set(RETIRED_ROBLOX_HOSTS) <= set(plan_hosts)
+    assert tuple(h for h in plan_hosts if h not in RETIRED_ROBLOX_HOSTS) == defaults.ALLOWED_ROBLOX_HOSTS
     assert list(defaults.ALLOWED_ROBLOX_HOSTS) == catalog.DEFAULTS["allowed_roblox_hosts"]
 
 

@@ -37,6 +37,11 @@ _HOSTS = "upstream#hosts"
 _ROTATOR = "egress#rotator"
 _BUDGET = "egress#budget"
 
+# Hosts Roblox has shut down since plan 9.10 was written: left out of the shipped list below and recorded, with
+# the evidence, in docs/RETIRED_ROBLOX_HOSTS.md. A retired name no longer resolves, so allowing it only made Check
+# Proxy Health fail (H-DNS, H-TLS) and gave its callers errors.
+RETIRED_ROBLOX_HOSTS: tuple[str, ...] = ("points.roblox.com",)
+
 # The shipped host allowlist (plan 9.10 and 15.5), stored as full host names so the SSRF check is a plain
 # set membership test after the host has been lowercased and stripped of one trailing dot. The v1 migrator
 # unions this list with every roblox.com host seen in v1 data (plan 18.3).
@@ -65,7 +70,7 @@ DEFAULT_ALLOWED_ROBLOX_HOSTS: tuple[str, ...] = tuple(
         "gamejoin",
         "trades",
         "notifications",
-        "points",
+        # "points" is retired: docs/RETIRED_ROBLOX_HOSTS.md (the name no longer resolves, 2026-10-15).
         "billing",
         "itemconfiguration",
         "contacts",

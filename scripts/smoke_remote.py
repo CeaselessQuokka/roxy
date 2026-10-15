@@ -4,7 +4,10 @@ What this is
     `python scripts/smoke_remote.py --color green --expect-version <sha>` checks a freshly started color on the
     server it runs on, before any caller reaches it:
       internal_version  the internal Unix socket answers /internal/version with the expected commit and color
-      home              GET / on the color's TCP port is 200 HTML
+      home              GET / on the color's TCP port is 200 HTML. While the owner keeps the home page under
+                        construction (`public_home_under_construction`, an owner's switch like a pause), Roxy's own
+                        under-construction page is the right answer: 503 HTML carrying `Roxy-Under-Construction:
+                        True` and Retry-After, which still proves the public pages render; the check says so
       health            GET /health is 200
       admin_login       GET /admin (the login page) is 200 HTML
       internal_hidden   GET /internal/version on the TCP port is an immediate 404 from the app itself (internal
@@ -160,6 +163,20 @@ def switch_refusal(response: httpx.Response) -> str | None:
     return reason
 
 
+CONSTRUCTION_MARKER = "roxy-under-construction"
+"""The header only Roxy's under-construction page carries (`roxy/public/construction.py MARKER_HEADER`)."""
+
+
+def under_construction(response: httpx.Response) -> bool:
+    """True when `response` is exactly Roxy's under-construction page: 503 HTML with the marker and Retry-After."""
+    return (
+        response.status_code == 503
+        and (response.headers.get(CONSTRUCTION_MARKER) or "").strip().lower() == "true"
+        and "retry-after" in response.headers
+        and response.headers.get("content-type", "").startswith("text/html")
+    )
+
+
 def static_asset(release_root: Path) -> str | None:
     """The URL of one hashed asset from the release's manifest, or None when there is none."""
     try:
@@ -200,6 +217,9 @@ def run_checks(
 
         def home() -> str:
             response = tcp.get("/")
+            if under_construction(response):
+                # The owner's switch, not a fault: the page rendered through the same templates as the home page.
+                return "503 text/html: the owner's under-construction page (public_home_under_construction is on)"
             require(response.status_code == 200, f"status {response.status_code}")
             content_type = response.headers.get("content-type", "")
             require(content_type.startswith("text/html"), f"content-type {content_type!r}")

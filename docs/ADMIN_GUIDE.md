@@ -5363,8 +5363,9 @@ follow the runbook the alerts link to rather than raising the limit. The [Alerts
 
 ### The Public site card
 
-The nine settings that change what visitors and callers see. No feature page has them, so apart from the All
-settings card this card is the only place to edit them. The card loads as it scrolls into view.
+The thirteen settings that change what visitors and callers see. No feature page has them, so apart from the All
+settings card this card is the only place to edit them. The card loads as it scrolls into view. While a page is
+under construction, the card's introduction links it ("Under construction now: ..."), so you can open it from here.
 
 | Setting | Key | What it changes |
 |---|---|---|
@@ -5375,13 +5376,49 @@ settings card this card is the only place to edit them. The card loads as it scr
 | Support and 'also by the author' text | `site_support_links` | The "Support me" section of the home page, with links to your other projects. Empty by default: the home page leaves the section out. |
 | No login required and white hats text | `site_white_hats_text` | The home page section that warns visitors never to send their .ROBLOSECURITY cookie. |
 | Public status page | `public_status_page_enabled` | Turns the public `/status` page on (the default) or off. |
+| Home page under construction | `public_home_under_construction` | Off by default. On, visitors to `/` get the under-construction page instead of the home page; you still see the real page while signed in. See [Putting a page under construction](#putting-a-page-under-construction). |
+| User guide under construction | `public_docs_under_construction` | The same for the user guide (`/docs`). |
+| Status page under construction | `public_status_under_construction` | The same for the status page (`/status`). While the status page is turned off, `/status` stays a 404 for everyone, whatever this says. |
+| Under construction message | `site_construction_text` | The message on the under-construction page, by default "Roxy's site is being updated. Check back soon." Up to 500 characters. |
 | Allow browsers on any website (CORS) | `public_cors_allow_any_origin` | Off by default and high risk: on, any website can use Roxy from its visitors' browsers as a free API. Game servers never need it. |
 | v1-style upstream errors (always 500) | `compat_collapse_upstream_errors` | Off by default (medium risk): callers get Roblox's real status, such as 404, or 429 with a Retry-After header (owner decision D4). On brings back v1's "every upstream failure is a 500". |
 
 The texts take plain paragraphs (a blank line starts a new one) and https links written as `[label](https://...)`;
-anything else, HTML included, is shown exactly as typed. Each text holds up to 2,000 characters and, like every text
-setting, may not contain an em or en dash. After a change, open the home page (`/`) or the status page (`/status`)
-to check the result.
+anything else, HTML included, is shown exactly as typed. Each home page text holds up to 2,000 characters (the
+under-construction message 500) and, like every text setting, may not contain an em or en dash. After a change, open
+the home page (`/`) or the status page (`/status`) to check the result.
+
+### Putting a page under construction
+
+When you want to rework the home page, the user guide or the status page without the public reading it meanwhile,
+turn on its switch on this card: **Home page under construction**, **User guide under construction** or **Status
+page under construction**. Each page has its own switch, and the change takes effect at once, like every setting
+(it is in the change history and the audit log, and you can revert it there).
+
+- **What the public sees.** A short page in the site's style: "Roxy's user guide is under construction" (or the home
+  page, or the status page), your message from **Under construction message**, and a line saying the proxy keeps
+  working. It answers with HTTP 503 and `Retry-After: 3600`, which tells search engines the page is away for a while,
+  not gone, and it asks them not to index the stand-in. The page also leaves `sitemap.xml` until you turn the switch
+  off. Search engines keep a page through a short absence; one left under construction for many days may drop out
+  of search results for a while.
+- **What you see.** Open the page while you are signed in to the dashboard (the links on this card are the easy way)
+  and you get the real page, with a banner at the top: "Admins only: the public currently sees the
+  under-construction page for this page." Its button **See what the public sees** shows you exactly the public page,
+  with a small notice in the bottom corner, "You are viewing this page as the public sees it", and a **Back to admin
+  view** link.
+- **How Roxy knows it is you.** Your dashboard sign-in, checked again on every visit: nothing else is handed out. So
+  signing out, revoking the session on the Security page or the kill switch shows you the public page on the next
+  load, and so does a session that expired (after `admin_session_idle_timeout_s`, 15 minutes by default, without
+  using the dashboard; reading the pages one after another counts as using it). With the admin allowlist on, only
+  allowlisted networks get the admin view. A link to Roxy you follow from another site (Discord, the DevForum) does
+  not carry your sign-in, because the session cookie is only sent from Roxy's own pages; open the page from the
+  dashboard or type its address instead.
+- **What never changes.** Only these three pages. The proxy, `/health`, `/robots.txt`, the favicon, the dashboard and
+  the sign-in page answer as always, so game servers and uptime monitors notice nothing. Deploys keep working too: the
+  deploy's smoke test accepts the under-construction page as the answer of `/` (it carries the header
+  `Roxy-Under-Construction: True`), as it accepts a pause.
+
+Turn the switch off again when you are done; the page is back for everyone on the next load.
 
 ### Settings only the server can set
 

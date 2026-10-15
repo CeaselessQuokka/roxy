@@ -18,7 +18,9 @@ How it works
     time, because imported v1 patterns are stored without being judged again (CHANGES.md), so the budget tests build
     such rows directly, as the migrator does. Time is measured with `time.perf_counter`; the bounds are several
     times wider than what a correct implementation needs, so the probes do not flake on a slow machine, and a
-    broken bound misses them by a lot.
+    broken bound misses them by a lot. "Under half the per-match timeout" is a bound the cost model was calibrated
+    for on the development machine, so it is scaled by how much slower this machine runs the regex engine
+    (`tests/cpu_speed.py`; 1 there, about 2 on a GitHub-hosted runner).
 
 What to read next
     `roxy/rules/match.py`, then `test_ingress_refusal_order.py`.
@@ -33,6 +35,7 @@ from typing import Any
 import pytest
 from ingress_support import CLIENT_IP, CatalogSettings, make_proxy_app, proxy_request, raw_asgi_request
 
+from cpu_speed import scaled, slowdown
 from roxy.abuse.pipeline import AbusePipeline
 from roxy.cache.policy import CacheSettings, request_policy
 from roxy.cache.service import CacheService
@@ -144,7 +147,10 @@ def test_accepted_patterns_never_need_the_timeout(pattern: str, target: str) -> 
         started = time.perf_counter()
         run()
         elapsed = time.perf_counter() - started
-        assert elapsed < match.REGEX_MATCH_TIMEOUT_S / 2, f"{pattern!r} took {elapsed * 1000:.0f} ms"
+        assert elapsed < scaled(match.REGEX_MATCH_TIMEOUT_S / 2), (
+            f"{pattern!r} took {elapsed * 1000:.0f} ms (this machine runs the regex engine {slowdown():.2f} times "
+            "as slow as the development machine)"
+        )
     assert regex_timeouts_total() == before, f"{pattern!r} hit the per-match timeout"
 
 

@@ -2334,6 +2334,8 @@ Rules not listed (CACHE-OFF, CRED-PROBE-COST (its threshold is in J), CRED-EXPIR
 | `compat_collapse_upstream_errors` (new) | v1 compatibility for upstream failures (7.13) | n/a (v1 behavior) -> 0 (D4) | 0: real upstream status and `Retry-After`; 1: v1 "500 for every upstream failure" (old scripts that only check for 200 or 500 keep working, but they retry immediately and feed more 429s) | n/a | n/a | Live |
 | `public_cors_allow_any_origin` (new) | CORS on the public proxy (D20) | n/a -> 0 | 0: no CORS headers; 1: `Access-Control-Allow-Origin: *` on GET only, never with credentials (browsers on any site can use Roxy as a free API) | n/a | n/a | Live |
 | `public_status_page_enabled` (new) | `/status` coarse health page | n/a -> 1 | 0, 1 | n/a | 0 returns 404 for `/status` | Live |
+| `public_home_under_construction`, `public_docs_under_construction`, `public_status_under_construction` (new, owner request 2026-10-15, after the cutover) | Take `/`, `/docs` or `/status` off the public site while the owner reviews it (`roxy/public/construction.py`) | n/a -> 0 | 0, 1: 1 answers the public with an "under construction" page (503, `Retry-After`, noindex, left out of the sitemap); a signed-in admin still sees the real page with a banner and a button that shows the public page | n/a | n/a | Live |
+| `site_construction_text` (new, owner request 2026-10-15) | The message of the "under construction" page | n/a -> "Roxy's site is being updated. Check back soon." | string up to 500 characters; links must be https | n/a | n/a | Live |
 | `site_contact_name`, `site_bug_bounty_text`, `site_hosting_note`, `site_support_links`, `site_white_hats_text`, `site_footer_text` (new, D18) | Editable home page copy (16.1) | hard-coded -> current home page text (C5 rewritten) | strings up to 2000 characters; links must be https | n/a | n/a | Live |
 | `ui_timezone` (new) | Timezone for day and month rollups and all dashboard times (6.4) | n/a -> America/New_York (PENDING) | IANA zone name | n/a | n/a (changing it affects only buckets compacted afterwards) | Live |
 | `ui_default_theme` (new) | Theme for admins who have not chosen one (per-admin choice lives in `admin_prefs`) | n/a -> `dark` | `dark`; `light`; `system`: follow the browser | n/a | n/a | Live |
@@ -2521,7 +2523,7 @@ Every key appears on the Settings page under its group and inline on the cards b
 | `insights_*`, `auto_apply_*`, `recommendation_expiry_days`, `dismiss_cooldown_days`, `insight_cred_probe_cost_max_per_hour` | Recommendations > Engine |
 | `insight_<rule_id>_*` | Recommendations > rule drawer "Tune this rule" |
 | `pause_message_default` | Top bar pause dialog |
-| `compat_collapse_upstream_errors`, `public_cors_allow_any_origin`, `public_status_page_enabled`, `site_*` | Settings > Public site (`site_*` also previewed live) |
+| `compat_collapse_upstream_errors`, `public_cors_allow_any_origin`, `public_status_page_enabled`, `public_*_under_construction`, `site_*` | Settings > Public site (`site_*` also previewed live) |
 | `ui_timezone`, `ui_default_theme` | User menu > Preferences |
 
 ---

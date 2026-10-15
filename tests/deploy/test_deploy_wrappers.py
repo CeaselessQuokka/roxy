@@ -42,6 +42,7 @@ from deploy_sandbox import (
     git,
     load_script,
     nginx_binaries,
+    ubuntu_nginx_conf,
     write_exec,
 )
 
@@ -358,7 +359,9 @@ def test_apply_with_the_real_nginx(tree: WrapperTree, apply_mod: ModuleType, tmp
     if binary is None or not can_unshare():
         pytest.skip("needs the nginx 1.24 binary and unprivileged user namespaces")
     prefix = tmp_path / "etc-nginx"
-    build_prefix(prefix, base.read_text() if base.is_file() else "", namespaced=True)
+    # Ubuntu's nginx.conf from the unpacked package, or its directives when nginx came from apt (CI): an empty base
+    # config has no events section and nginx -t refuses it.
+    build_prefix(prefix, ubuntu_nginx_conf(base), namespaced=True)
     for path in (
         prefix / "roxy-active-upstream.conf",
         prefix / "snippets" / "roxy-security-headers.conf",

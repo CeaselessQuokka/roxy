@@ -3724,6 +3724,35 @@ the round's gate report.
   regenerated), the Alerts card's intro, the README's link to `ROADMAP.md`, and the remaining performance follow-ups
   in `ROADMAP.md` item 13.
 
+### After the cutover
+
+Changes made while v2 is live (it went live on 2026-10-15), newest last.
+
+- **Pages under construction** (owner request, 2026-10-15: "an option in the admin panel somewhere for me to disable
+  view of the home page, docs (guide), and status pages", replaced by an "under construction page", seen as the real
+  page by an admin with a clear sign and a button showing what everyone else sees). Four new settings on Settings >
+  Public site, added to plan 15.3 K first: `public_home_under_construction`, `public_docs_under_construction` and
+  `public_status_under_construction` (off, low risk) and `site_construction_text` (the message, up to 500
+  characters, the `site_*` rules). While a switch is on, that page answers the public with a 503 page in the site's
+  style (`Retry-After: 3600`, noindex, `Cache-Control: no-store`, `Roxy-Under-Construction: True`) and leaves the
+  sitemap; robots.txt, the proxy, `/health`, the favicon, static files and `/admin` do not change, and a status page
+  that is switched off stays a 404. A signed-in admin gets the real page with an "Admins only" banner and a "See what
+  the public sees" button (`?view=public`: the public page plus a fixed "Back to admin view" notice), always
+  `Cache-Control: private, no-store`. Deviation from the lead's design, which assumed the session cookie was scoped to
+  `/admin` and planned a separate signed preview pass: the cookie is already `__Host-roxy_session` with `Path=/` and
+  `SameSite=Strict`, so the admin is recognized by that session itself, checked on the server on every visit (the
+  allowlist, the Origin, `AuthService.load_session`, no first-login session); no new cookie, key, route or database
+  change, and a sign-out, a revoke or the kill switch ends the admin view at once. The deploy's smoke test accepts
+  the under-construction page as the answer of `/` (`scripts/smoke_remote.py`), as it accepts a pause. Code:
+  `src/roxy/public/construction.py`, `src/roxy/public/pages.py`, `templates/public/construction.html` and
+  `_preview.html`; docs: the admin guide's "Putting a page under construction", `docs/SECURITY.md` (Sessions),
+  `docs/SETTINGS.md` regenerated. Tests: `tests/unit/public/test_public_construction_logic.py`,
+  `tests/integration/test_public_construction.py`, `tests/e2e/test_public_construction_e2e.py`, one more loop test
+  in `tests/integration/test_rr_public_loop_io.py` and the smoke test's cases. Sharded gate on top of d69f1b4
+  (29 minutes): 12,312 passed, 2 skipped, 2 failed, both `tests/unit/test_gen_v1_parity.py`, which fail on main
+  without this change (main's v1 `tests/smoke_test.py` carries the 2026-10-09 hotfix checks: 744 call sites, the
+  test pins 735, and 9 parity rows have no text yet).
+
 ## Parity checklist (plan section 4)
 
 Every row of plan section 4 (C3, plan 18.1 item 5) with its status and the tests that prove it. **covered**: the

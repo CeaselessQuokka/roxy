@@ -660,3 +660,62 @@ main.wrap {
 	vertical-align: -1px;
 	width: 12px;
 }
+
+/*
+ * Under construction (roxy/public/construction.py). `.construction` is the page the public gets while a page's switch
+ * is on. The two `.preview-*` parts are only ever sent to a signed-in admin: the banner above the real page, and the
+ * small notice fixed to the bottom corner of the public page an admin asked to see; `.previewing` keeps room below
+ * the footer so that notice never covers the last line. Borders carry the accent color, text keeps the page colors.
+ */
+.construction {
+	padding: 24px 0 8px;
+}
+
+.preview-banner {
+	background: var(--surface-2);
+	border-bottom: 3px solid var(--note);
+}
+
+.preview-bar {
+	align-items: center;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px 20px;
+	justify-content: space-between;
+	padding-bottom: 10px;
+	padding-top: 10px;
+}
+
+.preview-bar p {
+	margin: 0;
+}
+
+.preview-actions {
+	align-items: center;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px 16px;
+}
+
+.preview-notice {
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-left: 4px solid var(--note);
+	border-radius: 10px;
+	bottom: 16px;
+	box-shadow: var(--shadow);
+	font-size: 0.92rem;
+	left: 16px;
+	max-width: calc(100% - 32px);
+	padding: 8px 14px;
+	position: fixed;
+	z-index: 20;
+}
+
+.preview-notice p {
+	margin: 0;
+}
+
+.previewing {
+	padding-bottom: 72px;
+}

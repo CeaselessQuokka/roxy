@@ -1,0 +1,25 @@
+{#
+	The under-construction page (roxy/public/construction.py; owner request, 2026-10-15): what the public gets, with
+	HTTP 503 and Retry-After, instead of `/`, `/docs` or `/status` while that page's switch is on. It names the site
+	and the page, shows the owner's message (`site_construction_text`, already escaped HTML from render_site_text) and
+	says what still works. `noindex` here and in the X-Robots-Tag header: search engines must not index the stand-in.
+	An admin who asked to see this page (`?view=public`) gets exactly this page plus the notice base.html adds.
+#}
+{% extends "public/base.html" %}
+{% block head %}
+		<title>Under construction: {{ construction.title }}</title>
+		<meta name="description" content="{{ construction.title }} is being updated and will be back soon." />
+		<meta name="robots" content="noindex" />
+{% endblock %}
+{% block content %}
+			<section class="construction" aria-labelledby="page-title">
+				<h1 id="page-title">{{ construction.title }} is under construction</h1>
+				<div class="site-text lead">
+					{{ message_html }}
+				</div>
+				<p>
+					Only this page is affected: the Roxy proxy keeps answering game servers as usual, and monitors can keep
+					polling <a href="/health"><code>/health</code></a>.
+				</p>
+			</section>
+{% endblock %}

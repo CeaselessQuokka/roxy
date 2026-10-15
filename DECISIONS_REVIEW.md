@@ -248,13 +248,14 @@ answers later.
 
     **Answer (B16):** "Yessir, it will deploy from main": `CeaselessQuokka/roxy`, the repository v1 deploys from
     (`MIGRATION.md` steps 2.3 and 2.6).
-15. **OWNER (optional): the Roblox host list.** The plan asked that each of the 33 hosts in `allowed_roblox_hosts` be
-    checked against Roblox's documentation. This run could not reach roblox.com, so the list ships as the plan wrote
-    it; the migrator adds every host seen in v1's data, and the HOST-ADD recommendation proposes hosts callers keep
-    asking for (`upstream#hosts`). Two more network facts were assumed for the same reason: Roblox's web API paths
-    ignore the case of their letters (Roxy now paces an endpoint as one, in every letter case; if a Roblox host were
-    case sensitive the cost is slower pacing, never extra calls), and the addresses Roblox's game servers call from
-    are not filled in (item 18).
+15. **OWNER (optional): the Roblox host list.** The plan asked that each of the 33 hosts in `allowed_roblox_hosts`
+    (32 since `points.roblox.com` was retired on 2026-10-15: `docs/RETIRED_ROBLOX_HOSTS.md`) be checked against
+    Roblox's documentation. This run could not reach roblox.com, so the list ships as the plan wrote it; the
+    migrator adds every host seen in v1's data, and the HOST-ADD recommendation proposes hosts callers keep asking
+    for (`upstream#hosts`). Two more network facts were assumed for the same reason: Roblox's web API paths ignore
+    the case of their letters (Roxy now paces an endpoint as one, in every letter case; if a Roblox host were case
+    sensitive the cost is slower pacing, never extra calls), and the addresses Roblox's game servers call from are
+    not filled in (item 18).
 
     **Answer:** not part of the 2026-10-14 list (optional). The list ships as written.
 16. **OWNER (optional): the Luau examples in Studio.** The examples use `const` (in Luau since release 0.711) and the

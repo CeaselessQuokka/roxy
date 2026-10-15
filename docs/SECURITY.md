@@ -364,6 +364,14 @@ covers your own address needs an explicit confirmation.
   default, revokes trusted devices. nginx never logs that path.
 - Trusted devices skip only the second factor, never the password, and are bound to the browser and operating
   system they were issued to.
+- The public pages read the same cookie for one purpose only (owner request, 2026-10-15): while a page is under
+  construction (`public_home_under_construction`, `public_docs_under_construction`,
+  `public_status_under_construction`), a request carrying a live session that is not a first login, from a network
+  allowed to reach `/admin` and without a foreign `Origin`, gets the real page with an admin banner instead of the 503
+  stand-in (`src/roxy/public/construction.py`). Nothing is granted or stored for it: the session is checked on every
+  request, so signing out or the kill switch ends the admin view at once, and every such answer is
+  `Cache-Control: private, no-store`. With the switches off the public pages never look at the cookie
+  (`tests/integration/test_public_construction.py::test_signing_out_ends_the_admin_view_at_once`).
 
 Tests: `tests/security/test_auth_cookies.py::test_session_and_trusted_cookie_flags`,
 `tests/security/test_auth_sessions.py::test_login_never_adopts_a_planted_session_id`,

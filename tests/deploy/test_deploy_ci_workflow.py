@@ -5,7 +5,8 @@ What this is
     command (lint, types, unit, integration, multiprocess, security, migration, the deploy sandbox, Playwright,
     the writing style on the repository and on rendered pages, gitleaks, pip-audit, shellcheck, `nginx -t` with the
     distro nginx of Ubuntu 22.04 and 24.04 and `systemd-analyze verify` in containers, the generated settings
-    reference, the LLM export schema and the v1 parity table); every test directory runs in some job; every test
+    reference, the LLM export schema and the v1 parity table); every test directory runs in some job, and the
+    shards of a split job (unit, integration) add up to its whole suite; every test
     id and script the workflow names exists; actions are pinned by commit; the token is read only; checkout keeps
     no credentials; uv always installs the lock; and the deploy job keeps its `if: false`.
 
@@ -116,6 +117,26 @@ def test_every_test_directory_runs_in_ci() -> None:
     assert ignored == {*dedicated, "tests/load"}
     for directory, job in dedicated.items():
         assert directory in job_text(job), f"{directory} is ignored by the unit job but job {job} does not run it"
+
+
+@pytest.mark.parametrize("name", ["unit", "integration"])
+def test_the_shards_of_a_split_job_cover_its_whole_suite(name: str) -> None:
+    """The unit and integration jobs are matrices of `--shard K/N` jobs (tests/ci_shards.py): K runs from 1 to N
+    exactly once with one N, so together they run every test of the suite (a missing K would silently drop a share
+    of it), and one failing shard does not cancel the others."""
+    job = CI["jobs"][name]
+    assert job["strategy"]["fail-fast"] is False
+    shards = [re.fullmatch(r"(\d+)/(\d+)", str(value)) for value in job["strategy"]["matrix"]["shard"]]
+    assert all(shards), job["strategy"]["matrix"]["shard"]
+    counts = {int(match.group(2)) for match in shards if match}
+    assert len(counts) == 1, counts
+    (count,) = counts
+    assert count > 1
+    assert sorted(int(match.group(1)) for match in shards if match) == list(range(1, count + 1))
+    step = next(step for step in job["steps"] if "pytest" in str(step.get("run", "")))
+    assert step["env"]["SHARD"] == "${{ matrix.shard }}"
+    assert str(step["run"]).rstrip().endswith('--shard "$SHARD"')
+    assert "${{ matrix.shard }}" in job["name"], "each shard shows its own name in the checks list"
 
 
 def test_actions_are_pinned_by_commit() -> None:

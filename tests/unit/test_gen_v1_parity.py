@@ -133,12 +133,14 @@ def test_every_check_of_the_real_v1_suites_has_one_row() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "check"
     )
     assert [c.line for c in smoke] == independent
-    assert len(smoke) == 735  # .remake/v1notes/smoke.md section 1: 735 call sites (759 runs)
-    assert len({c.section_id for c in smoke}) == 117
+    # .remake/v1notes/smoke.md section 1 read 735 call sites (759 runs) in 117 sections; the v1 dashboard fix
+    # (12616fd, merged into main with v2) added section S118 with 9 more call sites (768 runs).
+    assert len(smoke) == 744
+    assert len({c.section_id for c in smoke}) == 118
     assert len(deploy) == 46
     assert len({c.section_id for c in deploy}) == 9
     counts = gen.counts_by_section(gen.Row(c) for c in smoke)
-    assert (counts["S001"], counts["S067"], counts["S117"]) == (4, 28, 11)
+    assert (counts["S001"], counts["S067"], counts["S117"], counts["S118"]) == (4, 28, 11, 9)
 
 
 # ------------------------------------------------------------------------------------------------ cells

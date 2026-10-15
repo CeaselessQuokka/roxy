@@ -21,11 +21,16 @@ How it works
     plain text, blank lines separate paragraphs, and links are written as `[label](https://...)`; only https
     links become links, and HTML is shown as text, never rendered. `site_contact_name` is the exception: it sits
     inside sentences, so it is always plain text.
+    The three `public_*_under_construction` switches and `site_construction_text` (owner request, 2026-10-15) take
+    the home page, the user guide or the status page off the public site while the owner reviews it: visitors get
+    an "under construction" page with that message, and a signed-in admin still sees the real page with a banner
+    (`roxy/public/construction.py`).
 
 What to read next
     `roxy/config/spec.py` (field meanings), plan 16.1 (where each `site_*` text appears on `/`), plan 7.13 (the
     caller status table that `compat_collapse_upstream_errors` changes), plan 9.4 (CORS) and 6.4 (why the
-    timezone matters for day and month rollups).
+    timezone matters for day and month rollups), then `roxy/public/construction.py` for the under-construction
+    switches.
 """
 
 from roxy.config.spec import Apply, Group, OptionSpec, Risk, RiskCondition, RiskOp, SettingSpec, SettingType
@@ -97,6 +102,71 @@ _SUPPORT_V1 = (
 )
 
 _FOOTER_DEFAULT = "Roxy Proxy 2025-Present"
+
+# --- pages under construction (owner request 2026-10-15) --------------------------------------------------------
+# "can you please add an option in the admin panel somewhere for me to disable view of the home page, docs (guide),
+# and status pages? It will replace them with an "under construction page" so I can take time to review the docs."
+
+_CONSTRUCTION_KEYS = (
+    "public_home_under_construction",
+    "public_docs_under_construction",
+    "public_status_under_construction",
+    "site_construction_text",
+)
+_CONSTRUCTION_TEXT_MAX = 500
+_CONSTRUCTION_TEXT_DEFAULT = "Roxy's site is being updated. Check back soon."
+_CONSTRUCTION_SEEN_BY_ADMINS = (
+    "While you are signed in to the dashboard you still see the real page, with a banner at the top saying what the "
+    "public sees instead and a button that shows you exactly that. "
+)
+_CONSTRUCTION_ANSWER = (
+    "HTTP 503 with Retry-After, which tells search engines the page is away for a while, not gone; a page left "
+    "under construction for many days may still drop out of search results"
+)
+_CONSTRUCTION_NOT_AFFECTED = (
+    "The proxy, /health, the sign-in page, robots.txt and the other public pages are not affected."
+)
+
+
+def _other_construction_keys(key: str) -> tuple[str, ...]:
+    """The other under-construction settings, so each one links to its neighbors in the editor."""
+    return tuple(k for k in _CONSTRUCTION_KEYS if k != key)
+
+
+def _construction_switch(key: str, label: str, path: str, page_name: str, extra_note: str = "") -> SettingSpec:
+    """One page's under-construction switch: the three differ only in the page they take off the public site."""
+    return SettingSpec(
+        key=key,
+        group=Group.PUBLIC_SITE,
+        label=label,
+        type=SettingType.BOOL,
+        default=0,
+        description=(
+            f"Takes the public {page_name} ({path}) off the public site while you review or rework it: visitors get "
+            "a short 'under construction' page with the message in site_construction_text instead. "
+            + _CONSTRUCTION_SEEN_BY_ADMINS
+            + _CONSTRUCTION_NOT_AFFECTED
+        ),
+        pages=_PUBLIC_SITE,
+        if_enabled=(
+            f"Visitors to {path} get the under-construction page ({_CONSTRUCTION_ANSWER}), and {path} leaves "
+            "sitemap.xml. Signed-in admins see the real page with the admin banner. Game servers calling the proxy "
+            "see no change."
+        ),
+        if_disabled=f"Everyone sees the normal {page_name} at {path}.",
+        risk=Risk.LOW,
+        apply=Apply.LIVE,
+        related_settings=_other_construction_keys(key),
+        notes=(
+            "Owner request (2026-10-15): take a page off the public site while reviewing it, see it as an admin with "
+            "a clear sign that the public sees something else, and see exactly what the public sees with one button. "
+            "The admin is recognized by the dashboard's own session cookie, checked on the server on every visit, so "
+            "signing out, revoking the session or the kill switch ends the admin view at once; the session must be "
+            "live (an idle dashboard session expires after admin_session_idle_timeout_s). The deploy's smoke test "
+            "accepts the under-construction page as the answer of / (it carries the header Roxy-Under-Construction: "
+            "True). " + extra_note
+        ).strip(),
+    )
 
 
 SETTINGS: list[SettingSpec] = [
@@ -216,6 +286,42 @@ SETTINGS: list[SettingSpec] = [
         ),
         risk=Risk.LOW,
         apply=Apply.LIVE,
+    ),
+    # ---------------------------------------------------------------- pages under construction (2026-10-15)
+    _construction_switch("public_home_under_construction", "Home page under construction", "/", "home page"),
+    _construction_switch("public_docs_under_construction", "User guide under construction", "/docs", "user guide"),
+    _construction_switch(
+        "public_status_under_construction",
+        "Status page under construction",
+        "/status",
+        "status page",
+        extra_note=(
+            "While public_status_page_enabled is off, /status answers 404 Not Found for everyone, admins included, "
+            "whatever this switch says: a page that is turned off is not under construction."
+        ),
+    ),
+    SettingSpec(
+        key="site_construction_text",
+        group=Group.PUBLIC_SITE,
+        label="Under construction message",
+        type=SettingType.STRING,
+        default=_CONSTRUCTION_TEXT_DEFAULT,
+        max_length=_CONSTRUCTION_TEXT_MAX,
+        description=(
+            "The message visitors read on the 'under construction' page that replaces a public page while its "
+            "switch (home page, user guide or status page under construction) is on. Keep it short and plain; the "
+            "page already says which page is under construction and that the proxy keeps working."
+        ),
+        pages=_PUBLIC_SITE,
+        risk=Risk.LOW,
+        apply=Apply.LIVE,
+        related_settings=_other_construction_keys("site_construction_text"),
+        notes=(
+            "Owner request (2026-10-15); the default is the lead's wording in the owner's plain style. Shown on the "
+            "under-construction page only. Plain text: blank lines separate paragraphs, and links are written as "
+            "[label](https://...). Only https links are allowed, and HTML is shown as text, never rendered. Must not "
+            "contain em or en dash characters (style rule C5)."
+        ),
     ),
     # ---------------------------------------------------------------- home page text (D18)
     SettingSpec(

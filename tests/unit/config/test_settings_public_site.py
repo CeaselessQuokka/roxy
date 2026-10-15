@@ -2,8 +2,9 @@
 
 These pin plan 15.3 K: every key is present with the plan default, every default is valid against its own
 limits, the help text an admin needs is filled in, the `site_*` defaults follow the owner's answers B13 and B15
-(2026-10-14: the contact says where, no bug bounty, no support links), and nothing breaks the style rule C5. The
-v1 home page links are checked on the page itself (tests/integration/test_public_pages.py).
+(2026-10-14: the contact says where, no bug bounty, no support links), the under-construction switches and their
+message follow the owner's request of 2026-10-15, and nothing breaks the style rule C5. The v1 home page links are
+checked on the page itself (tests/integration/test_public_pages.py).
 """
 
 import dataclasses
@@ -25,7 +26,17 @@ EXPECTED_K_DEFAULTS: dict[str, Any] = {
     "public_status_page_enabled": 1,
     "ui_timezone": "America/New_York",
     "ui_default_theme": "dark",
+    # Owner request 2026-10-15: pages under construction, every switch off, and the page's message.
+    "public_home_under_construction": 0,
+    "public_docs_under_construction": 0,
+    "public_status_under_construction": 0,
+    "site_construction_text": "Roxy's site is being updated. Check back soon.",
 }
+CONSTRUCTION_SWITCHES = (
+    "public_home_under_construction",
+    "public_docs_under_construction",
+    "public_status_under_construction",
+)
 EXPECTED_SITE_KEYS = [
     "site_contact_name",
     "site_bug_bounty_text",
@@ -155,6 +166,39 @@ def test_owner_answers_b13_b15_contact_no_bounty_no_support_links() -> None:
     assert "rewards from $10-$250 USD depending on severity" in by_key["site_bug_bounty_text"].notes
     assert "You never have to donate or pay anything" in by_key["site_support_links"].notes
     assert "https://devforum" not in by_key["site_support_links"].notes  # no link in the paste (v1 had none there)
+
+
+def test_under_construction_switches_and_message() -> None:
+    """Owner request (2026-10-15): three independent low-risk switches, all off, each naming its page, and a short
+    message that follows the site text rules (https links only, no pasted secret, no dash)."""
+    from roxy.config.catalog import SettingValidationError, validate_value
+    from roxy.config.secret_text import PASTE_REFUSED_MESSAGE
+    from roxy.core.redact import TOKEN_PREFIX
+
+    by_key = _by_key()
+    for key, path in zip(CONSTRUCTION_SWITCHES, ("/", "/docs", "/status"), strict=True):
+        spec = by_key[key]
+        assert spec.type == SettingType.BOOL
+        assert spec.default == 0
+        assert spec.risk == Risk.LOW
+        assert spec.pages == ("settings#public-site",)
+        assert f"({path})" in spec.description
+        assert "under construction" in spec.label
+        assert "site_construction_text" in spec.related_settings
+        assert "503" in spec.if_enabled
+        assert "Retry-After" in spec.if_enabled
+    assert "404" in by_key["public_status_under_construction"].notes  # a switched-off status page stays 404
+    message = by_key["site_construction_text"]
+    assert message.max_length == 500
+    assert message.risk == Risk.LOW
+    assert set(message.related_settings) == set(CONSTRUCTION_SWITCHES)
+    assert validate_value("site_construction_text", "Back soon. [News](https://example.com/news)")
+    for bad in ("Back soon, see http://example.com", "javascript:alert(1)", "Back soon " + chr(0x2014) + " sorry"):
+        with pytest.raises(SettingValidationError):
+            validate_value("site_construction_text", bad)
+    for pasted in (TOKEN_PREFIX + "A" * 60, ".ROBLOSECURITY=" + "B" * 40):
+        with pytest.raises(SettingValidationError, match=re.escape(PASTE_REFUSED_MESSAGE[:40])):
+            validate_value("site_construction_text", f"Back soon. {pasted}")
 
 
 def test_pause_message_limit_and_v1_default() -> None:

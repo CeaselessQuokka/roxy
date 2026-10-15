@@ -508,7 +508,8 @@ def test_no_setting_here_is_secret() -> None:
 def test_default_host_allowlist() -> None:
     hosts = _by_key()["allowed_roblox_hosts"].default
     assert hosts == list(routing.DEFAULT_ALLOWED_ROBLOX_HOSTS)
-    assert len(hosts) == 33
+    assert len(hosts) == 32  # plan 9.10 shipped 33; points.roblox.com is retired (docs/RETIRED_ROBLOX_HOSTS.md)
+    assert "points.roblox.com" not in hosts
     assert len(set(hosts)) == len(hosts)
     for host in hosts:
         assert ROBLOX_HOST.fullmatch(host), host

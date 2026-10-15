@@ -20,7 +20,8 @@ Why it exists
     - Finding public-2 (fixed): `/docs` statted `docs/USER_GUIDE.md` on every request (`pages.load_guide`), on
       the loop. Now the lifespan renders the guide on a thread and the route serves it from `app.state`.
     Since the lifespan does all the file work up front, even the FIRST visit after startup makes no file system
-    call on the loop (`test_rr_public_first_visits_make_no_file_system_call_on_the_loop`).
+    call on the loop (`test_rr_public_first_visits_make_no_file_system_call_on_the_loop`), and the same holds for the
+    pages under construction (owner request, 2026-10-15), for a visitor and for a signed-in admin.
 
 How it works
     `os.stat`, `builtins.open` and `io.open` are wrapped. A call counts when it runs on the loop thread while the
@@ -50,6 +51,7 @@ import pytest
 
 _WATCHED_FILES = (
     f"{os.sep}roxy{os.sep}public{os.sep}pages.py",
+    f"{os.sep}roxy{os.sep}public{os.sep}construction.py",
     f"{os.sep}roxy{os.sep}core{os.sep}templating.py",
 )
 PAGES = ("/", "/docs", "/status", "/sitemap.xml", "/robots.txt")
@@ -161,4 +163,50 @@ async def test_rr_public_first_visits_make_no_file_system_call_on_the_loop(
     watch.active = False
     assert statuses == {**dict.fromkeys(paths, 200), "/static/public/no.0123456789.css": 404}, statuses
     print("\nfile system calls on the loop on first visits:", watch.hits)
+    assert watch.hits == []
+
+
+def _admin_session_cookie(app: Any) -> str:
+    """A live admin session written straight into control.db: an account, then a full (TOTP level) session row."""
+    from roxy.admin.auth import sessions, users
+
+    ctx = app.state.ctx
+    now = int(ctx.clock.now())
+
+    def write(conn: Any) -> str:
+        user_id = users.insert_user(conn, username="loopcheck", password_hash="not-a-real-hash", now=now)
+        token, _ = sessions.create(conn, user_id=user_id, ip=None, ua=None, mfa_level="totp", now=now, max_age_s=3600)
+        return token
+
+    token: str = ctx.dbs.control.write_sync(write)
+    return f"{sessions.SESSION_COOKIE}={token}"
+
+
+async def test_rr_public_construction_pages_make_no_file_system_call_on_the_loop(
+    app: Any, client: httpx.AsyncClient, watch: Watch
+) -> None:
+    """Owner request (2026-10-15): with every page under construction, a visitor's 503 page, an admin's real page
+    with the banner and an admin's public view also read memory only, on their first visit; the admin check reads
+    control.db through the database read pool (`roxy/public/construction.py`), never on the loop's thread."""
+    from roxy.config.audit import Actor
+    from roxy.config.settings_service import SettingsService
+
+    ctx = app.state.ctx
+    service = SettingsService(ctx.dbs.control, runtime=ctx.settings, clock=ctx.clock)
+    switches = ("public_home_under_construction", "public_docs_under_construction", "public_status_under_construction")
+    await service.update(dict.fromkeys(switches, 1), Actor("cli", "loop-io-test"), "loop io test")
+    await ctx.settings.reload()
+    admin = {"Cookie": _admin_session_cookie(app)}
+    headers = {"User-Agent": "Mozilla/5.0", "X-Forwarded-For": "203.0.113.42"}
+    viewers = (("visitor", {}, ""), ("admin", admin, ""), ("admin public view", admin, "?view=public"))
+    statuses: dict[str, int] = {}
+    watch.active = True
+    for path in ("/", "/docs", "/status"):
+        for who, extra, query in viewers:
+            watch.page = f"{who} {path}{query}"
+            statuses[watch.page] = (await client.get(path + query, headers={**headers, **extra})).status_code
+    watch.active = False
+    for page, status in statuses.items():
+        assert status == (200 if page.startswith("admin /") else 503), (page, status)
+    print("\nfile system calls on the loop on under-construction visits:", watch.hits)
     assert watch.hits == []

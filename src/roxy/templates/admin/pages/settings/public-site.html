@@ -4,9 +4,15 @@
 
   The settings come from the catalog (anchor `settings#public-site`; these have no feature page of their own) and
   follow below this sentence. The site texts allow plain paragraphs and https links written as [label](url).
-  Context: `frame`.
+  `under_construction` lists the pages whose under-construction switch is on (`roxy/public/construction.py`), each
+  linked, so the owner can open the real page (with the admin banner) straight from here.
+  Context: `frame`, `under_construction`.
 -#}
 {% from "components/page_card.html" import page_card %}
 {% call page_card(frame) %}
-<p class="muted">These change what visitors and callers see: the texts of the <a href="/">home page</a>, the <a href="/status">status page</a> and the footer, and how errors and cross-site requests are answered. Texts take plain paragraphs and https links written as [label](https://...); anything else is shown as typed.</p>
+<p class="muted">These change what visitors and callers see: the texts of the <a href="/">home page</a>, the <a href="/docs">user guide</a>, the <a href="/status">status page</a> and the footer, and how errors and cross-site requests are answered. Texts take plain paragraphs and https links written as [label](https://...); anything else is shown as typed.</p>
+<p class="muted">A page under construction shows visitors a short "under construction" page with your message instead. While you are signed in you still see the real page, with a banner at the top and a button that shows you exactly what the public sees.</p>
+{% if under_construction %}
+<p>Under construction now: {% for target in under_construction %}<a href="{{ target.path }}">{{ target.title }}</a>{% if not loop.last %}, {% endif %}{% endfor %}.</p>
+{% endif %}
 {% endcall %}

@@ -284,6 +284,46 @@ def test_a_switch_refusal_the_color_does_not_report_fails(
     assert [name for name, (status, _) in found.items() if status == "FAIL"] == ["proxy"]
 
 
+UNDER_CONSTRUCTION = (
+    503,
+    {"Content-Type": "text/html; charset=utf-8", "Roxy-Under-Construction": "True", "Retry-After": "3600"},
+    b"<html>Roxy's home page is under construction</html>",
+)
+
+
+def test_the_owners_under_construction_home_page_passes_the_home_check_and_says_so(
+    smoke: ModuleType, color: Any, release: Path
+) -> None:
+    """Owner request (2026-10-15): while `public_home_under_construction` is on, `/` answers Roxy's own 503
+    under-construction page. That is the owner's switch, like a pause, so a deploy must not fail on it."""
+    fake, target = color
+    fake.answers["/"] = UNDER_CONSTRUCTION
+    found = results(smoke, target, release)
+    assert found["home"][0] == "PASS", found["home"]
+    assert "under-construction" in found["home"][1]
+    assert [name for name, (status, _) in found.items() if status == "FAIL"] == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (503, {"Content-Type": "text/html; charset=utf-8", "Retry-After": "3600"}, b"<html>down</html>"),  # no marker
+        (503, {"Content-Type": "text/html", "Roxy-Under-Construction": "True"}, b"<html></html>"),  # no Retry-After
+        (503, {**UNDER_CONSTRUCTION[1], "Content-Type": "application/json"}, b"{}"),  # not HTML
+        (500, UNDER_CONSTRUCTION[1], UNDER_CONSTRUCTION[2]),  # not a 503
+        (503, {**UNDER_CONSTRUCTION[1], "Roxy-Under-Construction": "False"}, UNDER_CONSTRUCTION[2]),
+    ],
+)
+def test_an_answer_that_only_looks_under_construction_fails_the_home_check(
+    smoke: ModuleType, color: Any, release: Path, answer: tuple[int, dict[str, str], bytes]
+) -> None:
+    fake, target = color
+    fake.answers["/"] = answer
+    found = results(smoke, target, release)
+    assert found["home"][0] == "FAIL", found["home"]
+    assert [name for name, (status, _) in found.items() if status == "FAIL"] == ["home"]
+
+
 def test_strict_cache_needs_a_hit(smoke: ModuleType, color: Any, release: Path) -> None:
     fake, target = color
     fake.proxy_states = ["MISS", "MISS"]
