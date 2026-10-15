@@ -65,6 +65,18 @@ def test_cooldown_keys_severity_and_channels() -> None:
     assert refused.cooldown_key == "rollback_failed:r1"
 
 
+def test_only_the_digest_is_scheduled_and_make_alert_copies_the_flag() -> None:
+    # Owner answer A4 (2026-10-14): the digest has its own switch (alert_digest_enabled), so it is the one
+    # `scheduled` alert, which alert_min_severity and the hourly cap never hold back. No other type may be.
+    assert [kind for kind, spec in ALERT_SPECS.items() if spec.scheduled] == ["digest"]
+    digest = make_alert("digest", summary="s", n=1, day="2026-10-15")
+    assert digest.scheduled
+    assert not digest.always_send  # scheduled is its own flag, not a new admin login style "always send"
+    assert digest.severity == "info"  # the subject, severity and cooldown key are unchanged (plan 17.7)
+    assert (digest.cooldown_key, digest.cooldown_s) == ("digest:2026-10-15", 86_400)
+    assert not make_alert("test_alert", summary="s").scheduled
+
+
 def test_parameters_cannot_inject_headers_and_bad_input_fails_loudly() -> None:
     alert = make_alert("error", summary="s", signature="a\r\nBcc: someone@example.invalid")
     assert "\n" not in alert.subject

@@ -123,6 +123,20 @@ SPARK_METRICS: Final[tuple[str, ...]] = (
     "errors_hidden",
 )
 CHART_METRICS: Final[tuple[str, ...]] = ("requests", "demand", "upstream_calls", "served_cache")
+OUTCOME_METRICS: Final[tuple[str, ...]] = ("requests", "served_upstream")
+"""What the Outcomes card shows of each outcome row (`build_breakdown`): its requests and, for `served_upstream`, the
+requests that reached Roblox (the rest were answered locally)."""
+ENDPOINT_KEYS: Final[tuple[str, ...]] = (
+    "key",
+    "requests",
+    "demand",
+    "upstream_calls",
+    "avoided_pct",
+    "hit_ratio",
+    "roblox_429",
+    "p95_ms",
+)
+"""The Top endpoints card's columns (`build_breakdown`); the read sums what they need and nothing else."""
 TOP_ROWS: Final = 10
 EVENT_ROWS: Final = 20
 TOP_RECOMMENDATIONS: Final = 3
@@ -451,10 +465,11 @@ async def build_kpis(ctx: Any, tr: TimeRange) -> dict[str, Any]:
         return {
             "kpis": queries.kpis_sync(conn, window, now=now, compare=compare),
             "spark": queries.series_sync(conn, spark_window, metrics=list(SPARK_METRICS)),
-            "hour_spark": queries.series_sync(conn, hour, metrics=["requests", "failed"]),
-            # The trailing hour and the hour before it, read once each: both "last hour" tiles come from them.
-            "hour": queries.totals_sync(conn, hour),
-            "previous_hour": queries.totals_sync(conn, before),
+            "hour_spark": queries.series_sync(conn, hour, metrics=list(queries.LAST_HOUR_MEASURES)),
+            # The trailing hour and the hour before it, read once each: both "last hour" tiles come from them (their
+            # two counts only: no histogram is decoded for them).
+            "hour": queries.totals_sync(conn, hour, metrics=queries.LAST_HOUR_MEASURES),
+            "previous_hour": queries.totals_sync(conn, before, metrics=queries.LAST_HOUR_MEASURES),
             "rotator": _rotator_today(conn, now, tz),
             "fleet": heartbeat.fleet_view(conn, now),
             "legacy": read_dashboard.legacy_baseline(conn),
@@ -577,10 +592,13 @@ async def build_visitors(ctx: Any, tr: TimeRange) -> dict[str, Any]:
     spark_window = read_dashboard.sparkline_window(window)
 
     def read(conn: sqlite3.Connection) -> tuple[Any, ...]:
+        # The range's numbers come from the sparkline's own pass over the visit events where its buckets tile the
+        # range (`visit_reads`: one walk of the events instead of two at 90 days; plan 6.7, final review perf lane).
+        series, current = read_dashboard.visit_reads(conn, spark_window, window)
         return (
-            queries.visitor_kpis(conn, window),
+            current,
             queries.visitor_kpis(conn, other),
-            read_dashboard.visit_series(conn, spark_window),
+            series,
             queries.reset_annotations(conn, window.start, window.end),
             queries.reset_annotations(conn, other.start, other.end),
         )
@@ -652,9 +670,13 @@ async def build_breakdown(ctx: Any, tr: TimeRange) -> dict[str, Any]:
     top_page = queries.Page(size=TOP_ROWS, sort="requests")
 
     def read(conn: sqlite3.Connection) -> dict[str, Any]:
+        # Each table sums only the numbers its card shows (`top_n_sync(metrics=)`): the outcome counts decode no
+        # histogram, the endpoint rows only the latency one (plan 6.7; final review perf lane).
         return {
-            "outcomes": queries.top_n_sync(conn, window, "outcome", page=queries.Page(size=10, sort="requests")),
-            "endpoints": queries.endpoint_table_sync(conn, window, page=top_page),
+            "outcomes": queries.top_n_sync(
+                conn, window, "outcome", page=queries.Page(size=10, sort="requests"), metrics=OUTCOME_METRICS
+            ),
+            "endpoints": queries.endpoint_table_sync(conn, window, page=top_page, metrics=ENDPOINT_KEYS[1:]),
             "places": queries.client_table_sync(conn, window, "place", now=now, page=top_page),
         }
 
@@ -674,11 +696,10 @@ async def build_breakdown(ctx: Any, tr: TimeRange) -> dict[str, Any]:
             # nothing reached Roblox for them, so they are shown apart (P6, finding spec-7).
             item["answered_locally"] = int(row["requests"]) - int(row["served_upstream"])
         outcomes.append(item)
-    endpoint_keys = ("key", "requests", "demand", "upstream_calls", "avoided_pct", "hit_ratio", "roblox_429", "p95_ms")
     place_keys = ("key", "requests", "refused", "served", "refused_pct", "rate1", "rate5", "rate60", "top_endpoint")
     return {
         "outcomes": {"total": total, "items": outcomes},
-        "top_endpoints": [{k: row.get(k) for k in endpoint_keys} for row in data["endpoints"]["rows"]],
+        "top_endpoints": [{k: row.get(k) for k in ENDPOINT_KEYS} for row in data["endpoints"]["rows"]],
         "top_places": [{k: row.get(k) for k in place_keys} for row in data["places"]["rows"]],
     }
 

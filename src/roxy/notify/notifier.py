@@ -15,12 +15,13 @@ Why it exists
 
 How it works
     1. Severity: an alert below `alert_min_severity` is dropped unless it is `always_send` (new admin login, leak
-       guard trip).
+       guard trip) or `scheduled` (the daily digest, which has its own switch, `alert_digest_enabled`).
     2. Channels: email when the mail credentials exist; webhook when `alert_webhook_enabled` = 1 and the
        `alert_webhook_url` credential exists; intersected with the alert's own channels.
-    3. Gate (`gate.decide`, one hot.db transaction): dedupe by cooldown key, then the hourly cap per channel.
-       If hot.db cannot be written, `gate.MemoryGate` applies the same rules in this worker's memory instead
-       (plan C7: alerts degrade open rather than go silent). The hourly cap still holds, at this worker's share
+    3. Gate (`gate.decide`, one hot.db transaction): dedupe by cooldown key, then the hourly cap per channel
+       (`always_send`, leak guard and `scheduled` alerts are never capped; the digest is one a day). If hot.db
+       cannot be written, `gate.MemoryGate` applies the same rules in this worker's memory instead (plan C7:
+       alerts degrade open rather than go silent). The hourly cap still holds, at this worker's share
        (`alert_rate_limit_per_hour // ROXY_WORKERS`, at least 1), so the fleet stays within the setting; dedupe
        becomes per worker, so each worker may then send its own copy of an alert, at most once per cooldown key
        per gap. What the memory gate decided is merged into hot.db (`gate.merge`, inside the next shared
@@ -261,7 +262,9 @@ class Notifier:
         return channels
 
     def passes_severity(self, alert: Alert) -> bool:
-        if alert.always_send:
+        """Whether `alert_min_severity` lets `alert` through. `always_send` alerts and `scheduled` reports (the daily
+        digest: its own switch decides, owner answer A4) always pass; every other alert is compared by rank."""
+        if alert.always_send or alert.scheduled:
             return True
         minimum = str(self._setting("alert_min_severity") or "warn")
         return _SEVERITY_RANK.get(alert.severity, 0) >= _SEVERITY_RANK.get(minimum, 1)
@@ -273,7 +276,9 @@ class Notifier:
 
     async def _decide(self, alert: Alert, channels: list[str], now: int) -> gate.GateDecision:
         cooldown_s = self._cooldown_for(alert)
-        uncapped = alert.always_send or alert.type == "leak_guard"
+        # A scheduled report (the digest) is uncapped too: it is at most one a day, and its day is claimed before the
+        # send, so a capped send would lose that day's digest. Dedupe by its `digest:<day>` key still applies.
+        uncapped = alert.always_send or alert.type == "leak_guard" or alert.scheduled
         cap = self._cap()
         if self._db is not None:
             # What the memory gate decided during an outage goes into the same transaction, BEFORE this decision,

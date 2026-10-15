@@ -30,7 +30,8 @@ How it works
       `sum(coalesce(json_extract(detail_json, '$.count'), 1))`.
     - Refusal events beyond the recorder's per-minute budget lose their per-occurrence detail (no path, no client
       hash); `refusal_attempts` groups those under their endpoint template and reports them as `unattributed`, so
-      the client count is a lower bound and says so.
+      the client count is a lower bound and says so. It reads one reason's events by the reason index
+      (`ATTEMPTS_SOURCE`) and groups them once per page.
     - Only fixed column names reach the SQL text; detail keys are checked against a strict pattern first. Every
       query has a row bound (plan P9).
 
@@ -48,7 +49,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
 from roxy.metrics import read_history, read_producers
-from roxy.metrics.queries import Window, bucket_starts, collect, trailing_rate
+from roxy.metrics.queries import REFUSAL_EVENT_TYPES, Window, bucket_starts, collect, trailing_rate
 from roxy.metrics.read_clients import client_pieces, latest_user_agents
 from roxy.metrics.rollups import bucket_floor, zone
 
@@ -104,6 +105,16 @@ name or value, and matched text; finding v1parity-5)."""
 _MATCH_STAMP_DIGITS: Final = 15
 """`at_ms`, then the event id, each zero-padded to this width in front of `detail.matched`, so the largest text of a
 group is its newest refusal (the id breaks a tie within one millisecond)."""
+ATTEMPTS_SOURCE: Final = "events INDEXED BY events_refusal_sources"
+"""Where `refusal_attempts` reads: the refusal and failure events by reason, message source and time (metrics
+migration 0009). Left to choose, SQLite took `events_type_at` and walked every refusal of the window to keep one
+reason's (1.09 million rows over 90 days at plan 6.6's volume, about 270 ms a statement, so the Request filters and
+Endpoint blocks tabs missed plan 6.7's 500 ms at 90 days), or skip-scanned this index without its reason. Named,
+with the reason's message sources listed (`_reason_sources`), each source is one index range of the window: the cost
+is the reason's events in the window. `INDEXED BY` fails loudly if the index is ever renamed."""
+MAX_ATTEMPT_SOURCES: Final = 32
+"""Most message sources `_reason_sources` lists (Roxy writes five: custom, default, roxy, roblox and none); past it
+the attempts read tests the time of every entry of the reason instead (the same rows, read less directly)."""
 
 
 def _bounded(limit: int, cap: int = MAX_PAGE_ROWS) -> int:
@@ -328,6 +339,24 @@ def tier_hits(conn: sqlite3.Connection, start_ms: int, end_ms: int) -> dict[int,
 # -------------------------------------------------------------------------------------------------- attempts
 
 
+def _reason_sources(conn: sqlite3.Connection, reason: str) -> list[Any] | None:
+    """The message sources of one reason's kept refusal and failure events (a loose index scan of
+    `events_refusal_sources`, one seek each), or None past `MAX_ATTEMPT_SOURCES`. `detail_message_source` is never
+    NULL (metrics migration 0009 makes a missing or unreadable one ''), so these values cover every event."""
+    first = (
+        f"SELECT min(detail_message_source) FROM {ATTEMPTS_SOURCE} "  # noqa: S608 (constants)
+        f"WHERE {REFUSAL_EVENT_TYPES} AND reason_code = ?"
+    )
+    found: list[Any] = []
+    value = conn.execute(first, (reason,)).fetchone()[0]
+    while value is not None:
+        if len(found) >= MAX_ATTEMPT_SOURCES:
+            return None
+        found.append(value)
+        value = conn.execute(f"{first} AND detail_message_source > ?", (reason, value)).fetchone()[0]
+    return found
+
+
 def refusal_attempts(
     conn: sqlite3.Connection,
     reason: str,
@@ -350,14 +379,31 @@ def refusal_attempts(
     refusals carry none). For the request filters (`rule_table` `MATCHED_RULE_TABLE`) also v1's Last Header,
     Triggered By and Matched Text: `last_header`, `last_field` (`key` or `value`) and `last_text` of the newest
     refusal of the row that recorded what its filter matched (`detail.matched`, finding v1parity-5; None without one).
+
+    One grouping per call: the page and the number of groups come from the same statement (`count(*) OVER ()`, a
+    window function, is taken over every group before the LIMIT); only a page past the last group asks for the count
+    again. The events are this reason's index ranges of the window (`ATTEMPTS_SOURCE`), never every refusal of it.
     """
     order = ATTEMPT_SORTS.get(sort)
     if order is None:
         raise ValueError(f"cannot sort attempts by {sort!r}")
     if rule_table is not None and rule_table not in ATTEMPT_RULE_TABLES:
         raise ValueError(f"no attempts tab reads rule table {rule_table!r}")
-    where = "type = ? AND reason_code = ? AND at_ms >= ? AND at_ms < ?"
-    params: list[Any] = [REFUSAL_EVENT, reason, int(start_ms), int(end_ms)]
+    sources = _reason_sources(conn, reason)
+    if sources is not None and not sources:
+        return {"total": 0, "rows": []}  # no refusal or failure event of this reason is kept
+    # The literal types repeat the partial index's WHERE term (SQLite needs it before it uses the index).
+    where = f"{REFUSAL_EVENT_TYPES} AND type = ? AND reason_code = ?"
+    params: list[Any] = [REFUSAL_EVENT, reason]
+    if sources is not None:
+        # reason = ?, source IN (...), then the time range: one index range per source (`ATTEMPTS_SOURCE`).
+        where += f" AND detail_message_source IN ({', '.join('?' for _ in sources)}) AND at_ms >= ? AND at_ms < ?"
+        params += [*sources, int(start_ms), int(end_ms)]
+    else:
+        # Too many sources to list: every entry of the reason, its time tested on the index entry before the row
+        # is read (the unary plus keeps SQLite from trading the reason for a skip scan on the time).
+        where += " AND +at_ms >= ? AND +at_ms < ?"
+        params += [int(start_ms), int(end_ms)]
     path_expr = "coalesce(json_extract(detail_json, '$.path'), endpoint_template, '')"
     having = ""
     if search:
@@ -377,17 +423,24 @@ def refusal_attempts(
         "count(DISTINCT ip_hash) AS clients, "
         f"sum(CASE WHEN ip_hash IS NULL THEN coalesce(json_extract(detail_json, '$.count'), 1) ELSE 0 END) "
         "AS unattributed, group_concat(DISTINCT json_extract(detail_json, '$.method')) AS methods, "
-        f"{rule_ids} AS rule_ids, {matched} AS last_matched, max(at_ms) AS last_ms FROM events WHERE {where} "
-        f"GROUP BY path{having}"
+        f"{rule_ids} AS rule_ids, {matched} AS last_matched, max(at_ms) AS last_ms FROM {ATTEMPTS_SOURCE} "
+        f"WHERE {where} GROUP BY path{having}"
     )
     select_params: list[Any] = [f"$.rules.{rule_table}"] if rule_table is not None else []
     group_params = [*select_params, *params, search.lower()] if search else [*select_params, *params]
-    total = int(conn.execute(f"SELECT count(*) FROM ({grouped})", group_params).fetchone()[0])  # noqa: S608
     direction = "DESC" if descending else "ASC"
+    skip = max(0, int(offset))
     rows = conn.execute(
-        f"SELECT * FROM ({grouped}) ORDER BY {order} {direction}, path LIMIT ? OFFSET ?",  # noqa: S608  # allowlisted
-        (*group_params, _bounded(limit), max(0, int(offset))),
+        f"SELECT *, count(*) OVER () AS group_total FROM ({grouped}) "  # noqa: S608  # allowlisted
+        f"ORDER BY {order} {direction}, path LIMIT ? OFFSET ?",
+        (*group_params, _bounded(limit), skip),
     ).fetchall()
+    if rows:
+        total = int(rows[0]["group_total"])
+    elif skip:  # a page past the last group: no row carries the count
+        total = int(conn.execute(f"SELECT count(*) FROM ({grouped})", group_params).fetchone()[0])  # noqa: S608
+    else:
+        total = 0
     items = []
     for row in rows:
         item: dict[str, Any] = {
@@ -618,6 +671,7 @@ def counts_by(rows: Sequence[Mapping[str, Any]], key: str) -> dict[str, int]:
 
 
 __all__ = [
+    "ATTEMPTS_SOURCE",
     "ATTEMPT_SORTS",
     "CHECK_REASONS",
     "MAX_GROUPS",

@@ -156,33 +156,35 @@ in order. Every module opens with a docstring that says what it is, why it exist
 ## Owner decisions applied
 
 Plan 0.3 asked the owner 23 questions. The value each one has in v2 (`DECISIONS_REVIEW.md` section 2 has where each
-lives, what changing it costs, and the owner's signature; PENDING means the plan's recommended default was used):
+lives, what changing it costs, the owner's answer and signature). "Agreed by the owner (2026-10-14)" means the plan's
+recommended default was used and the owner's answers of that day kept it; the requests the owner added on top wait
+for v2.x updates and are tracked in `ROADMAP.md`:
 
 | | Decision | Value used | Status |
 |---|---|---|---|
-| D1 | Caller traffic and the credential | Never: the allowlist ships empty; only Roxy's own checks use the credential | Decided by the owner (2026-10-07) |
-| D2 | Process model | gunicorn with uvicorn workers, `ROXY_WORKERS=2` per color | PENDING, default used (and the owner's instruction) |
-| D3 | Shared store | SQLite in WAL mode, four files, no Redis | PENDING, default used |
-| D4 | Status callers see when Roblox fails | Roblox's real status plus `Roxy-Upstream-Status`; `compat_collapse_upstream_errors` 0 | Decided by the owner (2026-10-07) |
-| D5 | Admin second factor | Authenticator app mandatory, passkeys optional, 10 recovery codes; a one-time emailed code for the imported admin's first sign-in; `admin_email_code_enabled` 0 | Decided by the owner (2026-10-07) |
-| D6 | Admin network allowlist | Off (`admin_allowlist_enabled` 0) | PENDING, default used |
-| D7 | Auto-apply safe recommendations | Off (`insights_auto_apply` 0) | PENDING, default used |
-| D8 | Body capture | On: refused and failed requests always, 20% of served ones, 15 minutes, 64 MiB, 16 KiB a body, redacted | PENDING, default used |
-| D9 | Old admin API paths | Not kept; public addresses unchanged | PENDING, default used |
-| D10 | Cache hits and the per-IP limit | They count (`throttle_count_cache_hits` 1) | Decided by the owner (2026-10-07), reversing the plan's default |
-| D11 | Per-experience limits | Observe and recommend (`place_limit_enabled` 0, 600 a minute ready) | PENDING, default used |
-| D12 | DataImpulse quota and price | 0 (unknown) until the owner fills them in | PENDING, the owner's values are needed |
-| D13 | When the rotator is used | Anonymous calls only, as spillover; `rotator_weight` 0 | PENDING, default used |
-| D14 | Alert channels | Email (Gmail app password); webhook possible, off | PENDING, default used |
-| D15 | Off-box backups | Nightly local backups; off-box (rclone) only when configured, and only encrypted | PENDING, default used |
-| D16 | Retention | Minute 14 days, hour 400 days, day and month for ever, 2,000,000 events, captures 15 minutes | PENDING, default used |
-| D17 | Old statistics | Settings changed from v1's defaults and every rule imported; v1 lifetime counters as one legacy snapshot | PENDING, default used |
-| D18 | Home page texts naming people or prices | Kept, as editable `site_*` settings marked for the owner's check | PENDING, default used |
-| D19 | Open Cloud API keys | Not built | PENDING, default used |
-| D20 | CORS on the public proxy | None (`public_cors_allow_any_origin` 0) | PENDING, default used |
-| D21 | HSTS preload | No preload; nginx sends HSTS without it | PENDING, default used |
-| D22 | Admin roles | One role, every admin is a full admin | PENDING, default used |
-| D23 | Upstream User-Agent | Browser-like; the A/B experiment is built and off, and a run ends after `ua_experiment_days` | PENDING, default used |
+| D1 | Caller traffic and the credential | Never: the allowlist ships empty; only Roxy's own checks use the credential | Decided by the owner (2026-10-07); confirmed 2026-10-14, plus a v2.x request (`ROADMAP.md` item 1) |
+| D2 | Process model | gunicorn with uvicorn workers, `ROXY_WORKERS=2` per color | Agreed by the owner (2026-10-14) |
+| D3 | Shared store | SQLite in WAL mode, four files, no Redis | Agreed by the owner (2026-10-14) |
+| D4 | Status callers see when Roblox fails | Roblox's real status plus `Roxy-Upstream-Status`; `compat_collapse_upstream_errors` 0 | Decided by the owner (2026-10-07); confirmed 2026-10-14 |
+| D5 | Admin second factor | Authenticator app mandatory, passkeys optional, 10 recovery codes; a one-time emailed code for the imported admin's first sign-in; `admin_email_code_enabled` 0 | Decided by the owner (2026-10-07); confirmed 2026-10-14 |
+| D6 | Admin network allowlist | Off (`admin_allowlist_enabled` 0) | Agreed by the owner (2026-10-14) |
+| D7 | Auto-apply safe recommendations | Off (`insights_auto_apply` 0) | Agreed by the owner (2026-10-14) |
+| D8 | Body capture | On: refused and failed requests always, 20% of served ones, 15 minutes, 64 MiB, 16 KiB a body, redacted | Agreed by the owner (2026-10-14) |
+| D9 | Old admin API paths | Not kept; public addresses unchanged | Agreed by the owner (2026-10-14) |
+| D10 | Cache hits and the per-IP limit | They count (`throttle_count_cache_hits` 1) | Decided by the owner (2026-10-07), reversing the plan's default; confirmed 2026-10-14 |
+| D11 | Per-experience limits | Observe and recommend (`place_limit_enabled` 0, 600 a minute ready) | Agreed by the owner (2026-10-14), plus a v2.x request (`ROADMAP.md` item 11) |
+| D12 | DataImpulse quota and price | A prepaid pool: 5 GB bought, 4,775.43 MB left on 2026-10-14. Until the prepaid mode (`ROADMAP.md` item 2), the monthly quota holds the balance left at the cutover (`MIGRATION.md` 5.1) | Decided by the owner (2026-10-14) |
+| D13 | When the rotator is used | Anonymous calls only, as spillover; `rotator_weight` 0 | Agreed by the owner (2026-10-14) |
+| D14 | Alert channels | Email (Gmail app password); webhook possible, off | Agreed by the owner (2026-10-14) |
+| D15 | Off-box backups | Nightly local backups; off-box (rclone) only when configured, and only encrypted | Agreed by the owner (2026-10-14) |
+| D16 | Retention | Minute 14 days, hour 400 days, day and month for ever, 2,000,000 events, captures 15 minutes | Agreed by the owner (2026-10-14) |
+| D17 | Old statistics | Settings changed from v1's defaults and every rule imported; v1 lifetime counters as one legacy snapshot | Agreed by the owner (2026-10-14), plus a v2.x request (`ROADMAP.md` item 8) |
+| D18 | Home page texts naming people or prices | Kept as editable `site_*` settings; no bug bounty and no support section by default, contact "CeaselessQuokka on the DevForums or Twitter" (B13, B15) | Agreed by the owner (2026-10-14), texts changed (B13, B15) |
+| D19 | Open Cloud API keys | Not built | Agreed by the owner (2026-10-14) |
+| D20 | CORS on the public proxy | None (`public_cors_allow_any_origin` 0) | Agreed by the owner (2026-10-14) |
+| D21 | HSTS preload | No preload; nginx sends HSTS without it | Agreed by the owner (2026-10-14) |
+| D22 | Admin roles | One role, every admin is a full admin | Agreed by the owner (2026-10-14) |
+| D23 | Upstream User-Agent | Browser-like; the A/B experiment is built, off by default, and switched on by the owner after the cutover (A6); a run ends after `ua_experiment_days` | Agreed by the owner (2026-10-14) |
 
 ## Ops changes
 
@@ -211,6 +213,13 @@ lives, what changing it costs, and the owner's signature; PENDING means the plan
   0600), backups in `/var/backups/roxy` (root, 0700), root tools in `/usr/local/lib/roxy`.
 - **Migrations.** Expand migrations run as `roxy` in the new color's pre-start step after a snapshot of control.db;
   contract migrations are manual (`deploy/README.md`); workers never migrate.
+- **Swap and kernel settings** (owner answers A7 and A8, 2026-10-14). A 1 GiB swap file with `vm.swappiness` 10, a
+  drop-in that sets `MemorySwapMax=0` for both colors (so a color at `MemoryMax` still loses one worker instead of
+  swapping), and `net.ipv4.tcp_migrate_req` 1 (connections waiting on a recycling worker move to another listener
+  instead of being reset). By hand at the cutover (`MIGRATION.md` step 2.10, `deploy/README.md`, "Memory, swap and
+  kernel settings on the 909 MB server") until `install-system.sh` does it (`ROADMAP.md` item 12).
+- **The v1 backup** (owner answer B16). Before v2 is merged into `main`, the owner tags and branches v1's `main`
+  (12616fd) as `v1-final` and `v1-backup` (`MIGRATION.md` step 1.4).
 - **Details:** "Operations (P13; `deploy/`)" under Wave 3a, "P11 lane: memory and the hot.db write lock", and the
   final review's ops entries below.
 
@@ -3653,6 +3662,54 @@ files of passing regression tests and no scratch test file exists.
 - Open: the quiet-machine reruns of the performance figures and the docs screenshots with clean data (after this
   review); the owner's sign-off of `DECISIONS_REVIEW.md`; then the cutover (`MIGRATION.md`).
 
+### Pre-cutover round (2026-10-14)
+
+After the release measurements (419fcdc: the quiet-machine numbers, the clean screenshots, the single-process run
+green) the owner answered the to-do list made from `DECISIONS_REVIEW.md`, then said anything that adds a lot of time
+waits for v2.x, so v2 goes live as soon as possible. This round applies the small answers; the lanes' details are in
+the round's gate report.
+
+- **Owner answers applied** (`DECISIONS_REVIEW.md`: the Decision column, each section 3 item, and "Owner answers of
+  2026-10-14"): every decision agreed as built, with new requests on D1, D11, D12 and D17; v1 stays as it is (the
+  Tier 0 hotfix is not merged); the DataImpulse plan is a prepaid pool (4,775.43 MB left that day), guarded until the
+  prepaid mode by the monthly quota set to the balance left at the cutover; the cutover steps in `MIGRATION.md`: the
+  v1 backup tag and branch before the merge (1.4), the swap file and `tcp_migrate_req` by hand (2.10), the DataImpulse
+  balance written down when v1 stops (4.1), and the owner's choices after the first sign-in (5.1: a test alert, the
+  User-Agent experiment on, the quota guard, what the console can do for the admin account).
+- **Moved to `ROADMAP.md`**, each with the owner's words, the lead's reading, a rough size and what stands in for it:
+  the private endpoint guard (D1, with the owner's clarification: see what the caller sent and what Roblox answered,
+  then block, throttle or allow), rules at every depth (D11), the prepaid balance mode (D12), per-card clears, Start
+  fresh, the v1 snapshot and chart windows (D17), times in the device's zone (A3), account management (A9), the
+  plain-words "How Roxy is doing" (A10), the digest preview and the User-Agent experiment's counter (A4, A6), the
+  Roblox game server ranges preset with its research and the setup guide (B17), two small safety checks, swap and
+  kernel settings in `install-system.sh`, the open performance items, and the docs screenshots. Also left out of this
+  round, and recorded there: writing down the v1 part of merged fingerprint and error counts at the import
+  (`ROADMAP.md` item 8 says what that costs).
+- **Three dashboard performance fixes** (traced after the quiet-machine run; `docs/PERFORMANCE.md`, "Third pass"):
+  Clients > IP addresses and Protection > Refusal reasons (SQLite's planner statistics made each address's peer count
+  scan every pair row; the reads now name the client index), the Protection attempts tabs (one index range per
+  message source, one grouping a page), and the Overview (an existence probe instead of a sum, and narrower reads).
+  Read-level numbers: 706 to 70 ms, 330 to 99 ms, 541 to 122 ms at 90 days, and 384 to 191 ms at 90 days.
+- **The daily digest** (A4): on by default and sent whatever `alert_min_severity` says, with its own switch
+  `alert_digest_enabled` next to `alert_digest_hour` (Settings > Alerts).
+- **The public texts** (B13, B15): no bug bounty and no support section by default (v1's texts kept in the settings'
+  notes), and the contact "CeaselessQuokka on the DevForums or Twitter" on the home page, in the user guide, in
+  `docs/SECURITY.md` and in rungs 3 and 4 of the default throttle ladder. v1 saves its ladder even when nobody
+  edited it, so the import now treats a v1 ladder equal to v1's built-in one as v1's default
+  (`migration/rules_import.py import_ladder`, `config/defaults.py v1_builtin_tier_rows`): v2's ladder, with the new
+  rung 3 and 4 wording, stays at the cutover.
+- Gate (2026-10-14, the round's working tree on top of 419fcdc): green at the first run. The whole suite as ten
+  parallel pytest processes plus the multi-process and load suites alone (27.5 minutes): **12,232 passed, 0 failed,
+  2 skipped** (no systemd user manager on the development machine), **0 xfailed** (deploy 436, e2e 844, health 194,
+  insights 917, integration 1,804, load 38, migration 124, multiprocess 97, parity 57, review_final 114, review_p11
+  71, security 730, unit 6,806); ruff and ruff format clean (902 files), mypy no issues (379 source files),
+  `check_style.py` OK, `gen_settings_docs.py --check` and `gen_v1_parity.py --check` current (781 rows, 0 problems),
+  bandit no high and no medium finding (30 low, none in a file this round changed); the run left the tree as it found
+  it. Integrated by the gate from the lanes' requests: the ladder import fix above, the admin guide's digest and public
+  site rows, the recommendation severity text (the digest counts open recommendations; `docs/SETTINGS.md`
+  regenerated), the Alerts card's intro, the README's link to `ROADMAP.md`, and the remaining performance follow-ups
+  in `ROADMAP.md` item 13.
+
 ## Parity checklist (plan section 4)
 
 Every row of plan section 4 (C3, plan 18.1 item 5) with its status and the tests that prove it. **covered**: the
@@ -3900,11 +3957,12 @@ tables, settings and actions that prove the section), and fails when a page it n
 What v2 knowingly ships with, and what is left for after the cutover. `DECISIONS_REVIEW.md` section 5 asks the owner
 to accept these (or name the ones that must be fixed first).
 
-- **Measured on the development machine only.** Every performance figure so far comes from the shared development
-  machine (`docs/PERFORMANCE.md`); the quiet-machine reruns of the perf lane, the row 7 replay, the dashboard page
-  scenario and the recommendations evaluation run after this review, and the docs screenshots are taken again then
-  with clean data (they show the test data's hostile sample text today).
-- **Known slow spots:** the Protection attempts tabs at 90 days (532 to 649 ms); pages above about 150 KiB (Overview
+- **Measured on the development machine only.** Every performance figure so far comes from the development machine
+  (`docs/PERFORMANCE.md`); the quiet-machine reruns ran on 2026-10-14 ("Quiet-machine reference run"), still not on
+  a machine the size of the server, and the docs screenshots were taken again with clean data. The targets they
+  missed are `ROADMAP.md` item 13.
+- **Known slow spots:** the Protection attempts tabs at 90 days (532 to 649 ms; fixed at read level in the
+  pre-cutover round, the page figures to confirm); pages above about 150 KiB (Overview
   185, Security 192, Cache and Clients 159); hourly points over 90 days on four API routes (up to 759 ms, which the
   dashboard never asks for); the endpoint drill-down at 90 days doubled in one quiet run for no reason found; the
   abuse transaction's p99 above plan 6.7's 3 ms under contention (GIL waits); the cache-lifetime tuner sorts a day of
@@ -3924,16 +3982,22 @@ to accept these (or name the ones that must be fixed first).
   until rewritten; in compatibility mode a follower in another worker gets Roxy's busy text, not Roblox's body;
   resetting a User-Agent to its default during an experiment run restarts the run for the recommendation but not for
   the traffic split; 4 to 8 percent of fresh connections made at the moment a worker recycles are reset (connections
-  already in that worker's queue; `net.ipv4.tcp_migrate_req` stays at the kernel default, an owner decision).
+  already in that worker's queue) at the kernel default of `net.ipv4.tcp_migrate_req`, which the cutover sets to 1
+  by hand (owner answer A7, `MIGRATION.md` step 2.10; the effect is not measured yet).
 - **Not measurable offline:** the 33 default `allowed_roblox_hosts` were not checked against Roblox's documentation
   (plan 9.10; no network to Roblox during the build); that Roblox's web API routes ignore letter case (the pacing key
-  assumes it); the addresses of Roblox's game servers (`roblox_egress_cidrs` ships empty).
-- **Deferred features:** a per-side counter for the User-Agent experiment (it counts the request samples of at most
-  the last 24 hours); a producer of `credential_comparison` events (so the shadow report and CRED-UNUSED have no v2
-  input; harmless while the credential allowlist is empty); roles for several admins (D22); Open Cloud keys (D19).
-- **Owner items:** a vulnerability contact for `docs/SECURITY.md`; the DataImpulse quota, price and session template;
-  the Tier 0 v1 hotfix (commit 3453d66, never merged: live v1 sends the credential with caller traffic until the
-  cutover); a key rotation procedure for `ip_hash_key`, `credential_encryption_key` and `totp_encryption_key` (plan
-  9.15; none is written yet).
+  assumes it); the addresses of Roblox's game servers (`roblox_egress_cidrs` ships empty; researched since from public
+  records, owner answer B17, and planned as an optional preset: `ROADMAP.md` item 7).
+- **Deferred features:** everything the owner asked for on 2026-10-14 that does not ship with v2.0 (`ROADMAP.md`,
+  with the suggested order of the v2.x updates), including a per-side counter for the User-Agent experiment (it
+  counts the request samples of at most the last 24 hours); a producer of `credential_comparison` events (so the
+  shadow report and CRED-UNUSED have no v2 input; harmless while the credential allowlist is empty); roles for
+  several admins (D22); Open Cloud keys (D19).
+- **Owner items:** the DataImpulse price (the plan is prepaid; `ROADMAP.md` item 2 lists the open questions); the
+  answers to C20 to C27 of the to-do list (backups, the Actions key, the window and the cutover day, "I'll reply to
+  later"); a key rotation procedure for `ip_hash_key`, `credential_encryption_key` and `totp_encryption_key` (plan
+  9.15; none is written yet). Answered on 2026-10-14: the vulnerability contact (CeaselessQuokka on the DevForums or
+  Twitter, no bug bounty), the session template (empty), and the Tier 0 v1 hotfix (not merged: live v1 sends the
+  credential with caller traffic until the cutover).
 - **After the cutover:** delete v1's code (`app/`, `Tooling/`, v1's tests and `requirements.txt`) once v1 is
   decommissioned (`MIGRATION.md` 5.6).

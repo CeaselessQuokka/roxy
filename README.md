@@ -11,6 +11,8 @@ through the rotator), kind to Roblox and fully observable from its admin dashboa
 - [`DECISIONS_REVIEW.md`](DECISIONS_REVIEW.md): the decisions the owner signs before v2 goes live (D1 to D23, the
   values only the owner can give, the known limitations).
 - [`MIGRATION.md`](MIGRATION.md): the cutover from v1 to v2, step by step, with the rollback to v1.
+- [`ROADMAP.md`](ROADMAP.md): what the owner asked for after v2.0 (v2.x), each with its size and what stands in for
+  it until it ships.
 - [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md): for game developers who call Roxy (also served at `/docs`).
 - [`docs/ADMIN_GUIDE.md`](docs/ADMIN_GUIDE.md): for the owner who runs Roxy, one chapter per dashboard page (also on
   the dashboard's Help page, one chapter at a time).

@@ -156,7 +156,7 @@ async def test_the_public_privacy_chapter_says_what_roxy_records(client: Any) ->
     assert response.status_code == 200
     page = response.text
     start = page.find('id="10-privacy"')
-    end = page.find('id="11-security-reports-and-bug-bounty"')
+    end = page.find('id="11-reporting-a-security-problem"')
     assert 0 <= start < end
     chapter = html.unescape(re.sub(r"<[^>]+>", " ", page[start:end]))
     chapter = re.sub(r"\s+", " ", chapter)

@@ -409,7 +409,12 @@ H-ROTATOR-SESSION or H-ROTATOR-QUOTA warn or fail; the Egress page shows the rot
 1. Run direct only. The direct path is the default (`rotator_weight` is 0), so with the rotator off Roxy keeps
    serving from the server's own address. Set `rotator_enabled` to 0 if it should not be used at all for now.
 2. Quota: buy more and raise `rotator_quota_gb_per_month`, or lower what goes through the rotator (weight, routing
-   rules).
+   rules). The DataImpulse plan is a prepaid pool, not a monthly allowance (owner answers D12 and B11), and until the
+   prepaid balance mode ships (`ROADMAP.md`, item 2) the quota holds the balance left: `MIGRATION.md` step 5.1,
+   "Owner choices after the first sign-in", sets it to the balance at the cutover and `rotator_billing_day` to the
+   cutover day. So after a top-up, and on each billing day (the count starts again from zero then, as if the pool
+   had refilled), set `rotator_quota_gb_per_month` to the balance DataImpulse shows, in GB of 1,000 MB, rounded down
+   to one decimal.
 3. A wrong or changed URL: replace it on the Egress page (`PUT /admin/api/v1/rotator/url`, fresh second factor). The
    value is stored encrypted and never shown again.
 
@@ -419,8 +424,9 @@ quota.
 **Roll back.** Turn `rotator_enabled` back on; `DELETE /admin/api/v1/rotator/url` goes back to the bootstrap URL in
 `/etc/roxy/credentials/rotator_url`.
 
-**Prevent.** Set the quota and the alert percentages (`rotator_budget_alert_pcts`) to what you pay for, and read the
-EGR recommendations.
+**Prevent.** Set the quota and the alert percentages (`rotator_budget_alert_pcts`) to what you pay for (for the
+prepaid pool: the balance left, entered again on each billing day), keep `rotator_weight` at 0 unless you mean to
+spend the pool on ordinary traffic, and read the EGR recommendations.
 
 ## Service down
 
@@ -1028,13 +1034,17 @@ recommendation's changes name it), with a reason; or wait until the rule propose
 
 ## Daily digest
 
-**Symptoms.** The email "Roxy daily digest: <n> open recommendations". It is a summary, not an incident.
+**Symptoms.** The email "Roxy daily digest: <n> open recommendations". It is a summary, not an incident. It is on by
+default (`alert_digest_enabled`, owner answer A4) and goes out once a day at `alert_digest_hour` in the dashboard
+time zone (`ui_timezone`), whatever `alert_min_severity` says.
 
 **Confirm.** The Recommendations page (`GET /admin/api/v1/recommendations`) and the Health page.
 
 **Likely causes.** Not applicable.
 
-**Fix.** Read the open recommendations; preview and apply, snooze or dismiss each one.
+**Fix.** Read the open recommendations; preview and apply, snooze or dismiss each one. To change the hour or stop the
+digest, edit `alert_digest_hour` or `alert_digest_enabled` on the Settings page, Alerts card. If no digest arrives
+while it is on, the "Alert channels down" runbook applies.
 
 **Verify.** The count goes down over the following days.
 

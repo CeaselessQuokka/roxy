@@ -534,6 +534,20 @@ def status_faq(get: Getter) -> str:
     return Markup(health)  # noqa: S704 (constant text only)
 
 
+def bounty_sentence(get: Getter) -> str:
+    """Chapter 11's last sentence: a reward only while `site_bug_bounty_text` has one to show.
+
+    The owner has no bug bounty for now (answers B13 and B15, 2026-10-14), so the text ships empty and the home page
+    hides it; the guide must not promise a reward the home page no longer names.
+    """
+    if str(get("site_bug_bounty_text")).strip():
+        return Markup(  # constant text only: no setting value goes into it
+            'Serious reports are rewarded; the current reward range is on the <a href="/#tokenSafetyHeading">home '
+            "page</a>."
+        )
+    return "There is no bug bounty at the moment, but every report is read and appreciated."
+
+
 GUIDE_VALUES: Final[dict[str, Callable[[Getter], str]]] = {
     # Limits (chapter 4).
     "window_requests": lambda g: count_text(g("allowed_requests_per_minute"), "request"),
@@ -568,6 +582,7 @@ GUIDE_VALUES: Final[dict[str, Callable[[Getter], str]]] = {
     "capture_rule": capture_rule,
     # Contact and FAQ (chapters 11 and 12).
     "contact_name": lambda g: str(g("site_contact_name")),
+    "bounty_sentence": bounty_sentence,
     "cors_faq": cors_faq,
     "status_faq": status_faq,
 }

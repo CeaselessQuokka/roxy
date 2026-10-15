@@ -16,7 +16,8 @@ What this is
         429s it drew (the `upstream_429` log).
       * `endpoint_recency(conn, window, templates)`: v1 Top Endpoints' Methods, Last Request, Last Status and Last
         Caller columns for one page of templates (rollups, refined by the newest Live row).
-      * `visit_series(conn, window)`: visitor classes per bucket (sparklines of the Visitors card, row 130).
+      * `visit_series(conn, window)`: visitor classes per bucket (sparklines of the Visitors card, row 130), and
+        `visit_reads(conn, spark_window, window)`: those sparklines and the card's numbers, in one pass when it can.
       * `heatmap(buckets, values, tz)`: hour of day by weekday, folded from hourly buckets (plan 14.1 Traffic).
       * `sparkline_window(window)`: the same time range at a granularity with at most `SPARK_POINTS` buckets.
 
@@ -564,15 +565,54 @@ def _visit_keys(page: Any, visitor: Any) -> list[str]:
     return []
 
 
-def visit_series(conn: sqlite3.Connection, window: Window) -> dict[str, Any]:
-    """`{buckets, values: {key: [n per bucket]}}` for the Visitors card's sparklines (row 130)."""
-    unit_ms = 60_000 if window.granularity == "minute" else 3_600_000
-    rows = conn.execute(
+def _visit_unit_ms(window: Window) -> int:
+    """The bucket `_visit_rows` sums visits in: minutes for a minute series, else hours (UTC, re-bucketed after)."""
+    return 60_000 if window.granularity == "minute" else 3_600_000
+
+
+def _visit_rows(conn: sqlite3.Connection, window: Window) -> list[sqlite3.Row]:
+    """`(b, page, visitor, n)`: the visit events of `window` summed by `_visit_unit_ms` bucket, page and visitor."""
+    unit_ms = _visit_unit_ms(window)
+    rows: list[sqlite3.Row] = conn.execute(
         f"SELECT (at_ms / {unit_ms}) * {unit_ms // 1000} AS b, json_extract(detail_json, '$.page') AS page, "  # noqa: S608
         "json_extract(detail_json, '$.visitor') AS visitor, sum(coalesce(json_extract(detail_json, '$.count'), 1)) "
         "AS n FROM events WHERE type = 'visit' AND at_ms >= ? AND at_ms < ? GROUP BY b, page, visitor",
         (window.start * 1000, window.end * 1000),
     ).fetchall()
+    return rows
+
+
+def visit_series(conn: sqlite3.Connection, window: Window) -> dict[str, Any]:
+    """`{buckets, values: {key: [n per bucket]}}` for the Visitors card's sparklines (row 130)."""
+    return _visit_series_of(_visit_rows(conn, window), window)
+
+
+def visit_reads(
+    conn: sqlite3.Connection, spark_window: Window, window: Window
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """The Visitors card's sparklines and numbers: `(visit_series(conn, spark_window), queries.visitor_kpis(conn,
+    window))`, read in one pass over the visit events when the sparkline's rows tile `window` exactly.
+
+    Why: each of the two reads walks every visit event of its range through `events_type_at` and parses its JSON,
+    one table page per event (about 70,000 events and 80 ms each over 90 days at plan 6.6's volume), and these two,
+    one after the other, were the longest read of the Overview at 90 days (final review perf lane, plan 6.7). The
+    sparkline's range always holds the card's (`sparkline_window`), and its SQL buckets (`_visit_unit_ms`: whole
+    UTC minutes or hours) sum exactly the events of `window` when both ends of `window` fall on a bucket edge: the
+    7, 30 and 90 day ranges in a zone with a whole-hour offset (they start and end on whole hours or local
+    midnights). Otherwise (the 6 and 24 hour ranges start on a minute; a half-hour zone's hours and days start on a
+    half hour) it reads twice, as before.
+    """
+    unit_s = _visit_unit_ms(spark_window) // 1000
+    inside_spark = spark_window.start <= window.start and window.end <= spark_window.end
+    if not (inside_spark and window.start % unit_s == 0 and window.end % unit_s == 0):
+        return visit_series(conn, spark_window), queries.visitor_kpis(conn, window)
+    rows = _visit_rows(conn, spark_window)
+    inside = ((row["page"], row["visitor"], row["n"]) for row in rows if window.start <= int(row["b"]) < window.end)
+    return _visit_series_of(rows, spark_window), queries.visit_totals(inside)
+
+
+def _visit_series_of(rows: Sequence[sqlite3.Row], window: Window) -> dict[str, Any]:
+    """`visit_series` from its `_visit_rows`."""
     starts = queries.bucket_starts(window)
     index = {start: i for i, start in enumerate(starts)}
     values = {key: [0] * len(starts) for key in VISIT_KEYS}
@@ -668,5 +708,6 @@ __all__ = [
     "recent_live",
     "sparkline_window",
     "ulid_ms",
+    "visit_reads",
     "visit_series",
 ]

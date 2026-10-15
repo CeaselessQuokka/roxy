@@ -38,6 +38,7 @@ from roxy.core.redact import SecretRegistry
 from roxy.metrics import disk_history
 from roxy.metrics.recorder import MetricsRecorder, OutcomeEvent
 from roxy.notify import producers
+from roxy.notify.alerts import make_alert
 from roxy.notify.mail import MailConfig, MailSender
 from roxy.notify.notifier import Notifier
 from roxy.scheduler.jobs import JobRegistry
@@ -337,7 +338,10 @@ async def test_backup_stale_then_failed_share_one_cooldown(world: World, tmp_pat
 async def test_daily_digest_once_at_the_digest_hour_by_email_only(world: World) -> None:
     now = world.clock.now()
     hour = datetime.fromtimestamp(now, UTC).hour
-    world.settings.values.update(alert_min_severity="info", alert_digest_hour=hour, ui_timezone="UTC")
+    # The catalog defaults otherwise: alert_digest_enabled 1 and alert_min_severity warn (owner answer A4: the
+    # digest is on and the severity filter does not hold it back).
+    world.settings.values.update(alert_digest_hour=hour, ui_timezone="UTC")
+    assert (world.settings.get("alert_digest_enabled"), world.settings.get("alert_min_severity")) == (1, "warn")
 
     def seed(conn: Any) -> None:
         for rec_id, rule, severity, state in (
@@ -383,12 +387,106 @@ async def test_daily_digest_once_at_the_digest_hour_by_email_only(world: World) 
     assert world.webhook.payloads == []
     assert (await producers.send_digest(world.ctx, now, claim=claim))["digest"] == "already_sent"
     assert (await producers.send_digest(world.ctx, now + 3600))["digest"] == "not_due"
-    world.settings.values["alert_min_severity"] = "warn"
-    assert (await producers.send_digest(world.ctx, now))["digest"] == "skipped"  # info is below warn
-    world.settings.values["alert_digest_hour"] = -1
+    world.settings.values["alert_digest_enabled"] = 0
     assert (await producers.send_digest(world.ctx, now))["digest"] == "off"
     assert claimed == [datetime.fromtimestamp(now, UTC).date().isoformat()]
     assert_no_caller_text(world)
+
+
+def _digest_due(world: World, **settings: Any) -> float:
+    """Make the digest due now (its hour is the fake clock's UTC hour) and return now."""
+    now = world.clock.now()
+    world.settings.values.update(alert_digest_hour=datetime.fromtimestamp(now, UTC).hour, ui_timezone="UTC")
+    world.settings.values.update(settings)
+    return now
+
+
+async def test_the_digest_is_sent_while_alert_min_severity_is_critical(world: World) -> None:
+    # Owner answer A4: "On", whatever the alert level filter says (the digest is an info-level message).
+    now = _digest_due(world, alert_min_severity="critical")
+    report = await producers.send_digest(world.ctx, now)
+    assert (report["digest"], report["sent"], report["skipped"]) == ("built", ["email"], None)
+    assert world.mail.subjects() == ["Roxy daily digest: 0 open recommendations"]
+    test_alert = await world.ctx.alerts.send(make_alert("test_alert", summary="s"))
+    assert test_alert.skipped == "severity"  # only the digest passes the filter: other info alerts do not
+
+
+async def test_the_digest_is_sent_when_the_hourly_cap_is_reached(world: World) -> None:
+    # The day is claimed before the send, so a capped digest would be lost for the day: the cap never holds it back.
+    now = _digest_due(world, alert_rate_limit_per_hour=1)
+    notifier = world.ctx.alerts
+    assert (await notifier.send(make_alert("disk", summary="s", pct=91))).sent  # uses the hour's one message
+    assert (await notifier.send(make_alert("caller_5xx", summary="s", rate=3))).skipped == "capped"
+    claimed: list[str] = []
+
+    async def claim(day: str) -> bool:
+        claimed.append(day)
+        return True
+
+    report = await producers.send_digest(world.ctx, now, claim=claim)
+    assert report["sent"] == ["email"]
+    assert world.mail.subjects()[-1] == "Roxy daily digest: 0 open recommendations"
+    assert "Suppressed since last alert: 1" in world.mail.bodies()[-1]  # the held-back alert is still reported
+    assert claimed == [datetime.fromtimestamp(now, UTC).date().isoformat()]
+
+
+async def test_the_digest_is_not_sent_or_claimed_when_switched_off(world: World) -> None:
+    now = _digest_due(world, alert_digest_enabled=0, alert_min_severity="info")
+    claimed: list[str] = []
+
+    async def claim(day: str) -> bool:
+        claimed.append(day)
+        return True
+
+    assert await producers.send_digest(world.ctx, now, claim=claim) == {"digest": "off"}
+    assert claimed == []  # switched back on later the same hour, that day's digest can still go out
+    assert world.mail.messages == []
+    world.settings.values["alert_digest_enabled"] = 1
+    assert (await producers.send_digest(world.ctx, now, claim=claim))["sent"] == ["email"]
+
+
+async def test_the_digest_goes_out_once_a_day_across_two_leaders(world: World, dbs: Any) -> None:
+    """Leader A claims the day in hot.db `job_runs` and sends; its lease expires within the hour and leader B (a
+    new epoch, its own worker and notifier on the same hot.db) runs the job again: the claim stops it, and without a
+    claim the gate's `digest:<day>` key does."""
+    from roxy.scheduler.leader import LEADER_LEASE, JobContext
+    from roxy.storage import leases
+
+    now = _digest_due(world)
+    ttl_ms = 30_000
+
+    def take(holder: str) -> int:
+        def acquire(conn: Any) -> int:
+            grant = leases.acquire(conn, LEADER_LEASE, holder, ttl_ms, world.clock.now_ms())
+            assert grant is not None, holder
+            return grant.epoch
+
+        return int(dbs.hot.write_sync(acquire))
+
+    def job(holder: str, epoch: int) -> JobContext:
+        return JobContext(epoch=epoch, now=world.clock.now(), holder=holder, hot=dbs.hot, job_name=producers.JOB_DIGEST)
+
+    leader_a = job("worker-a", take("worker-a"))
+    first = await producers.send_digest(world.ctx, leader_a.now, claim=leader_a.claim)
+    assert first["sent"] == ["email"]
+    world.clock.advance(ttl_ms / 1000 + 1)  # A's lease runs out; still the digest hour
+    mail_b = RecordingTransport()  # worker B: its own notifier and mailbox, the same hot.db
+    notifier_b = Notifier(
+        hot_db=dbs.hot,
+        settings=world.settings,
+        site_origin="https://roxy.example",
+        mail=MailSender(CONFIG, transport=mail_b),
+        webhook=None,
+        clock=world.clock,
+    )
+    ctx_b = SimpleNamespace(dbs=dbs, settings=world.settings, env=world.ctx.env, alerts=notifier_b, clock=world.clock)
+    leader_b = job("worker-b", take("worker-b"))
+    assert leader_b.epoch == leader_a.epoch + 1
+    assert datetime.fromtimestamp(leader_b.now, UTC).hour == datetime.fromtimestamp(now, UTC).hour
+    assert (await producers.send_digest(ctx_b, leader_b.now, claim=leader_b.claim))["digest"] == "already_sent"
+    unclaimed = await producers.send_digest(ctx_b, leader_b.now)
+    assert unclaimed["skipped"] == "deduped"  # the gate's `digest:<day>` key, shared in hot.db
+    assert len(world.mail.messages) + len(mail_b.messages) == 1
 
 
 # ---------------------------------------------------------------------------------------- bodies and jobs

@@ -318,7 +318,7 @@ SEVERITY_OPTIONS: Final[tuple[OptionSpec, ...]] = (
         "Critical",
         "Always report this rule's findings as critical (urgent): listed first on the Recommendations page and in "
         "the bell. Roxy sends no alert for a recommendation, so a rule you must never miss needs the page checked "
-        "(or alert_min_severity at info, which also emails the daily digest).",
+        "(the daily digest, on by default, also counts the open ones).",
     ),
 )
 

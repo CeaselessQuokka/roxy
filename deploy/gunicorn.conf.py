@@ -180,8 +180,8 @@ workers = start_workers(_full_workers, _marker)
 # docstring). The master holds one more SO_REUSEPORT listener in the same group for its whole life and every worker
 # accepts from it too (`master_tcp_listeners`), so the port has a listener even while every worker is stopping
 # (finding memory-4); it takes one share of the connections, which any worker may accept. Trade-off: connections
-# still waiting in a stopping worker's own accept queue are reset (Linux moves them to another listener when
-# net.ipv4.tcp_migrate_req=1, which is not set).
+# still waiting in a stopping worker's own accept queue are reset at the kernel default (Linux moves them to another
+# listener when net.ipv4.tcp_migrate_req=1, which the server sets by hand from the cutover: MIGRATION.md 2.10).
 reuse_port = True
 
 # The loopback TCP address nginx proxies to (ROXY_BIND; without it the color's own port, 127.0.0.1:8001 for blue

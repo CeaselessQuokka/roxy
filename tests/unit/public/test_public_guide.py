@@ -53,7 +53,7 @@ OUTLINE = [
     "8. Good citizen checklist",
     "9. What Roxy will not do",
     "10. Privacy",
-    "11. Security reports and bug bounty",
+    "11. Reporting a security problem",  # plan 16.2 "Security reports and bug bounty"; no bounty for now (B13)
     "12. FAQ",
 ]
 
@@ -443,6 +443,31 @@ def test_guide_states_the_url_limit_and_its_414(catalog_get: Callable[..., Gette
     page = flat(rendered_guide(catalog_get(max_url_length=2048)))
     assert "may be up to 2,048 characters long; a longer one is answered with <code>414</code>." in page
     assert "<td>414</td>" in page
+
+
+def test_guide_promises_a_reward_only_while_the_bounty_text_has_one(catalog_get: Callable[..., Getter]) -> None:
+    """Owner answers B13 and B15 (2026-10-14): no bug bounty for now. `site_bug_bounty_text` ships empty and the
+    home page hides it, so chapter 11 says there is none; a text brings the reward sentence and its link back."""
+    default = flat(rendered_guide(catalog_get()))
+    chapter = default.split('id="11-reporting-a-security-problem"', 1)[1].split('id="12-faq"', 1)[0]
+    assert "There is no bug bounty at the moment, but every report is read and appreciated." in chapter
+    assert "rewarded" not in default
+    assert "bounty" not in default.replace("There is no bug bounty at the moment", "")
+    with_bounty = flat(rendered_guide(catalog_get(site_bug_bounty_text="Rewards from 10 USD.")))
+    assert (
+        'Serious reports are rewarded; the current reward range is on the <a href="/#tokenSafetyHeading">home page</a>.'
+    ) in with_bounty
+    assert "There is no bug bounty" not in with_bounty
+
+
+def test_guide_names_where_to_reach_the_contact(catalog_get: Callable[..., Getter]) -> None:
+    """Owner answers B13 and B15: "contact CeaselessQuokka on either the DevForums or Twitter" (chapters 11, 12)."""
+    page = flat(rendered_guide(catalog_get()))
+    reports = page.split('id="11-reporting-a-security-problem"', 1)[1].split('id="12-faq"', 1)[0]
+    assert "report it privately to CeaselessQuokka on the DevForums or Twitter before telling anyone else" in reports
+    faq = page.split('id="12-faq"', 1)[1]
+    assert "Ask CeaselessQuokka on the DevForums or Twitter, and say what your experience needs" in faq
+    assert "send the request id to CeaselessQuokka on the DevForums or Twitter." in faq
 
 
 def test_guide_links_to_status_only_while_it_is_enabled(catalog_get: Callable[..., Getter]) -> None:

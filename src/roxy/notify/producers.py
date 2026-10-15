@@ -6,7 +6,7 @@ What this is
     `send_digest`, plus `integrity_alert` (called by the daily `quick_check` of `scheduler/jobs.py` through
     `integrity_hook`). `register_jobs(registry, ctx)` adds the leader jobs that run them: `alerts_rates` (both rate
     alerts, every minute), `alerts_storage` and `alerts_backup` (every 30 minutes) and `alerts_digest` (polls every
-    5 minutes, sends once a day at `alert_digest_hour`).
+    5 minutes, sends once a day at `alert_digest_hour` while `alert_digest_enabled` is on).
 
 Why it exists
     The alert catalog (`notify/alerts.py`) defined `roblox_429`, `caller_5xx`, `disk`, `db_integrity`,
@@ -25,7 +25,9 @@ How it works
       Storage alerts from 90 percent of `storage_total_budget_gb` (the catalog: "an alert at 90 percent"), warn
       below the budget and critical over it. A backup is stale after `BACKUP_STALE_H` hours without a good one (the
       H-BACKUP pass band), and failed when the newest record of `backup.sh` is a failure. The digest goes out once
-      per local day at `alert_digest_hour` (`-1`: off; `ui_timezone`), claimed in hot.db `job_runs` first.
+      per local day at `alert_digest_hour` (in `ui_timezone`) while `alert_digest_enabled` is 1 (the default, owner
+      answer A4), claimed in hot.db `job_runs` first. It is a `scheduled` alert, so `alert_min_severity` and the
+      hourly cap never hold it back: its own switch decides.
     - Alert bodies hold Roxy's own words and numbers only: reason codes, status codes, rule and check ids, egress
       names, the normalized endpoint templates the dashboard shows, file names, sizes. Never a caller's raw text, a
       client address or a secret; the notifier redacts every field again on top.
@@ -434,20 +436,20 @@ def digest_facts(conn: sqlite3.Connection, now: float, tz: str) -> dict[str, Any
 
 async def send_digest(ctx: Any, now: float, *, claim: Callable[[str], Awaitable[bool]] | None = None) -> dict[str, Any]:
     """Plan 17.7 "Daily digest": `Roxy daily digest: <n> open recommendations`, once per local day at
-    `alert_digest_hour` (`-1` turns it off). `claim(day)` records the day in hot.db `job_runs` first (at most once
-    per day across leadership changes); the gate's `digest:<day>` key dedupes as well."""
-    hour = int(_setting(ctx, "alert_digest_hour"))
-    if hour < 0:
+    `alert_digest_hour` while `alert_digest_enabled` is 1 (owner answer A4: on by default, whatever
+    `alert_min_severity` says; the spec is `scheduled`, so the notifier neither filters nor caps it). `claim(day)`
+    records the day in hot.db `job_runs` first (at most once per day across leadership changes); the gate's
+    `digest:<day>` key dedupes as well."""
+    if not bool(_setting(ctx, "alert_digest_enabled")):
         return {"digest": "off"}
+    hour = int(_setting(ctx, "alert_digest_hour"))
     tz = str(_setting(ctx, "ui_timezone") or "UTC")
     local = datetime.fromtimestamp(now, zone(tz))
     if local.hour != hour:
         return {"digest": "not_due", "local_hour": local.hour}
     day = local.date().isoformat()
-    notifier = getattr(ctx, "alerts", None)
-    probe = make_alert("digest", summary="", n=0, day=day)
-    if notifier is None or not notifier.passes_severity(probe):
-        return {"digest": "skipped", "reason": "alert_min_severity" if notifier is not None else "no_notifier"}
+    if getattr(ctx, "alerts", None) is None:
+        return {"digest": "skipped", "reason": "no_notifier"}  # checked before the claim, so the day is not lost
     if claim is not None and not await claim(day):
         return {"digest": "already_sent", "day": day}
     facts = await ctx.dbs.metrics.read(lambda conn: digest_facts(conn, now, tz))

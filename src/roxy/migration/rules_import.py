@@ -62,7 +62,12 @@ from roxy.abuse.throttle_all import ThrottleAllState
 from roxy.config import audit
 from roxy.config.audit import Actor
 from roxy.config.constants import MAX_RULE_MESSAGE, MAX_RULE_NOTE, MAX_THROTTLE_TIERS
-from roxy.config.defaults import IGNORED_VALUE_HEADER_NOTE, IGNORED_VALUE_HEADERS, throttle_tier_rows
+from roxy.config.defaults import (
+    IGNORED_VALUE_HEADER_NOTE,
+    IGNORED_VALUE_HEADERS,
+    throttle_tier_rows,
+    v1_builtin_tier_rows,
+)
 from roxy.config.runtime import bump_config_version
 from roxy.core.clock import SYSTEM_CLOCK
 from roxy.migration.report import (
@@ -670,14 +675,15 @@ async def import_ladder(
     scrub: Callable[[str], str] = _no_scrub,
     imported_before: bool = False,
 ) -> tuple[int, bool]:
-    """Replace the v2 ladder with the v1 one, unless v1 used its defaults, the v2 ladder was edited, or an earlier
+    """Replace the v2 ladder with the v1 one, unless v1 used its defaults (no saved ladder, or v1's untouched
+    built-in one, `v1_builtin_tier_rows`), the v2 ladder was edited, or an earlier
     run already imported it (`imported_before`, from the import ledger: a ladder the owner flattened or changed in
     v2 after the import stays as it is). Returns (rows changed, whether the ladder counts as handled)."""
     tiers = runtime.get("ThrottleTiers")
     if not isinstance(tiers, list):
         report.ladder = {
             "status": SKIPPED,
-            "detail": "v1 used its built-in ladder; the v2 built-in ladder (same rungs, C5 message) stays.",
+            "detail": "v1 used its built-in ladder; the v2 built-in ladder (same rungs, C5 messages) stays.",
         }
         return 0, False
     spec = RULE_TABLES["throttle_tiers"]
@@ -711,9 +717,16 @@ async def import_ladder(
             notes.append(f"rung {index} left out: {_messages(exc)}")
     current = await db.read(lambda conn: fetch_all(conn, spec))
     defaults = [to_columns(spec, ThrottleTierIn.model_validate(row)) for row in throttle_tier_rows()]
+    v1_default = rows == [to_columns(spec, ThrottleTierIn.model_validate(row)) for row in v1_builtin_tier_rows()]
+    if v1_default:
+        # v1 saved its ladder even when nobody had edited it, so v1's untouched built-in ladder arrives as a list.
+        # It is v1's default, not the owner's choice: v2's built-in ladder (rungs 3 and 4 say where to reach the
+        # contact, owner answers B13 and B15) stands in for it, and the checks below treat it as v2's defaults.
+        rows = defaults
     detail = "; ".join(notes)
     if current == rows:
-        report.ladder = {"status": ALREADY, "rungs": len(rows), "detail": detail or "the v2 ladder matches v1"}
+        same = "v1 used its built-in ladder; the v2 built-in ladder stays" if v1_default else "the v2 ladder matches v1"
+        report.ladder = {"status": ALREADY, "rungs": len(rows), "detail": detail or same}
         return 0, True
     if imported_before:
         report.ladder = {

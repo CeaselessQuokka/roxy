@@ -148,7 +148,8 @@ def test_the_texts_never_promise_recommendation_emails_the_defaults_do_not_send(
     digest = ALERT_SPECS["digest"]
     default_min = str(catalog.defaults()["alert_min_severity"])
     rank = {"info": 0, "warn": 1, "critical": 2}
-    digest_sent = digest.always_send or rank[digest.severity] >= rank[default_min]
+    # A `scheduled` report (owner answer A4: its own switch, alert_digest_enabled) is never filtered by severity.
+    digest_sent = digest.always_send or digest.scheduled or rank[digest.severity] >= rank[default_min]
     hour = next(spec for spec in ALERT_SETTINGS if spec.key == "alert_digest_hour")
     if not digest_sent and "alert_min_severity" not in hour.description:
         problems.append("alert_digest_hour: " + hour.description)

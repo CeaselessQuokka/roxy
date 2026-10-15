@@ -21,6 +21,11 @@ roll back each case; `docs/PERFORMANCE.md` has the load figures and the quiet-ma
 | `env/*.env.example` | `/etc/roxy/roxy.env`, `blue.env`, `green.env` | root:roxy, 0640 | `install-system.sh` (only when missing) |
 | `nginx/*` | `/etc/nginx/sites-available/roxy-v2.conf` (rendered), `/etc/nginx/roxy-upstream-{blue,green}.conf`, `/etc/nginx/snippets/roxy-security-headers.conf` | root, 0644 | `roxy-nginx-apply`, from the verified commit only |
 
+Made by hand at the cutover (`MIGRATION.md` step 2.10), not from a repository file yet: `/swapfile` (root, 0600) and
+its `/etc/fstab` line, `/etc/sysctl.d/90-roxy.conf` and the drop-in
+`/etc/systemd/system/roxy@.service.d/90-no-swap.conf` (root, 0644). See "Memory, swap and kernel settings on the 909
+MB server" below.
+
 ## Server layout (plan 17.3, with two corrections)
 
 | Path | Owner, mode | Purpose |
@@ -60,7 +65,9 @@ roll back each case; `docs/PERFORMANCE.md` has the load figures and the quiet-ma
    lists the required ones that are still missing.
 5. In `/etc/nginx/nginx.conf` set `worker_processes 2;` and, in `events`, `worker_connections 4096;` (plan 17.2; a
    site file cannot set them). Remove `/etc/nginx/sites-enabled/default`: its `default_server` collides with Roxy's.
-6. As `roxy-deploy`, install uv (`curl -LsSf https://astral.sh/uv/install.sh | sh`), then run the first deploy by
+6. The swap file, the kernel settings and the colors' no-swap drop-in, before any color starts (see "Memory, swap
+   and kernel settings on the 909 MB server"; `MIGRATION.md` step 2.10 has the commands).
+7. As `roxy-deploy`, install uv (`curl -LsSf https://astral.sh/uv/install.sh | sh`), then run the first deploy by
    hand: `/opt/roxy/deploy.sh <full commit sha>`. It starts blue and points nginx at it. While v1's nginx site is
    still enabled, v1 answers the public host name, so run this first deploy as
    `ROXY_DEPLOY_PUBLIC_CHECK=0 /opt/roxy/deploy.sh <full commit sha>` (see "Running beside v1").
@@ -219,10 +226,11 @@ be installed at once. Things to know:
   entry. Later deploys run with the public checks on (the default).
 - roxy-audit reports `/etc/roxy` (owned by `ubuntu`) as a finding until the cutover.
 
-## Memory and swap on the 909 MB server
+## Memory, swap and kernel settings on the 909 MB server
 
-The server has 909 MB of RAM and no swap. Everything is sized to fit without swap (CHANGES.md, "Memory sizing for the
-1 GB server"): each color is capped at `MemoryHigh=420M` and `MemoryMax=500M` (raised from 320M and 420M by finding
+The server has 909 MB of RAM, and had no swap before the cutover. Everything is sized to fit without swap
+(CHANGES.md, "Memory sizing for the 1 GB server"): each color is capped at `MemoryHigh=420M` and `MemoryMax=500M`
+(raised from 320M and 420M by finding
 LOAD-2: a color whose workers recycle every 20,000 requests settles at 365 to 405 MiB of PSS, docs/PERFORMANCE.md
 "Memory per color"), two workers per color, glibc's allocator tuned in `roxy@.service` (`MALLOC_ARENA_MAX=2`, fixed
 mmap and trim thresholds of 128 KiB), and low-memory mode during a deploy. When a color does pass `MemoryMax`, the
@@ -239,19 +247,49 @@ for a moment the color runs four. On this server the deploy runs in low-memory
 mode (the new color starts with one worker) whenever a warm color is active, because less than 700 MB is then
 available; that is expected, not a warning sign.
 
-Adding a small swap file is still recommended as a safety net, not as capacity:
+**A swap file, as a safety net, never as capacity** (owner answer A8). The cutover adds a 1 GiB `/swapfile` with
+`vm.swappiness=10` (MIGRATION.md step 2.10 has the commands with their checks and the undo). `install-system.sh` does
+not do it yet; `ROADMAP.md` item 12 moves it there. Without swap, a short spike (a warm color at its hard limit during
+a deploy, plus certbot, apt or the migrator) goes straight to the kernel's OOM killer, which may pick nginx; with a
+low swappiness the kernel swaps only under real pressure, so the system slows down for a moment instead.
+
+**The colors never swap.** Under cgroup v2, `MemoryMax` counts RAM only. With a swap file and no swap limit, a color
+at `MemoryMax` would be pushed into swap (on Lightsail's network disk: slow for every caller) and would not be
+OOM-killed until the swap ran out, instead of losing one worker that `OOMPolicy=continue` replaces at once, which is
+the behavior every memory test measured. So the same step installs a drop-in that sets `MemorySwapMax=0` (cgroup
+`memory.swap.max` 0) for both colors:
+
+```
+sudo mkdir -p /etc/systemd/system/roxy@.service.d
+printf '[Service]\nMemorySwapMax=0\n' | sudo tee /etc/systemd/system/roxy@.service.d/90-no-swap.conf
+sudo systemctl daemon-reload
+```
+
+`install-system.sh` replaces only `roxy@.service` itself, so the drop-in stays when the script runs again.
+
+The swap file and the kernel settings file (owner answers A7 and A8), as step 2.10 runs them:
 
 ```
 sudo fallocate -l 1G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
-echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
-echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/90-roxy-swap.conf && sudo sysctl --system
+grep -qs '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+printf 'vm.swappiness = 10\nnet.ipv4.tcp_migrate_req = 1\n' | sudo tee /etc/sysctl.d/90-roxy.conf
+sudo sysctl -p /etc/sysctl.d/90-roxy.conf
 ```
 
-Why: without swap, a short spike (a warm color at its hard limit during a deploy, plus certbot or apt) goes straight
-to the kernel's OOM killer, which may pick nginx. With a low swappiness the kernel only swaps under real pressure,
-and `MemoryMax` still bounds each color's RAM (cgroup memory limits do not count swap), so a runaway color is
-throttled and swapped, then restarted by systemd, instead of taking the box down. Watch `free -m` on the System page;
-steady swap use means the budget is wrong and `cache_memory_bytes` is the first knob to lower.
+To remove them: `sudo swapoff /swapfile && sudo rm /swapfile`, delete the `/swapfile` line of `/etc/fstab`, and
+`sudo rm /etc/sysctl.d/90-roxy.conf`. Watch `free -m` (the System page shows memory): steady swap use means a process
+outside Roxy grew, since the colors cannot swap; `swapon --show` and `ps aux --sort=-rss | head` show which.
+
+**`net.ipv4.tcp_migrate_req=1`** (owner answer A7, on the lead's recommendation). gunicorn runs with `reuse_port`:
+every worker has its own listener on the color's port, next to the master's (finding memory-4). When a worker
+recycles (every 20,000 requests plus jitter) it closes its listener, and at the kernel default (0) the connections
+already waiting in that listener's queue are reset; with 1, Linux (5.14 and later; Ubuntu 24.04 runs 6.8 or newer)
+hands them to another listener of the same port. nginx has one upstream server, so a reset fresh connection is a 502
+for a caller, and nginx opens fresh connections mostly right after a recycle (the recycling worker closes the
+keep-alive connections it held); the stress reproduction reset 4 to 8 percent of them. The setting costs no memory or
+CPU and changes only listeners in a SO_REUSEPORT group, which Linux lets only one user share. Undo:
+`sudo sysctl -w net.ipv4.tcp_migrate_req=0` and remove the line. (The `reuse_port` comment in `gunicorn.conf.py`
+describes both values.)
 
 ## Testing these files
 

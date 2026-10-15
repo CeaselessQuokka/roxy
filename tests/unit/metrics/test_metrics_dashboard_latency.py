@@ -11,7 +11,11 @@ What this is
     - `refusal_reasons` (newest status and path per reason by index) equals the window-function read, and
       `returned_reasons` equals its `message_source` column summed;
     - the multi-type event reads (`notable_events`, `recent_events`) read through `events_type_at`, and
-      `recent_live` answers from the index when no live row is left.
+      `recent_live` answers from the index when no live row is left;
+    - the Overview's reads after the final review perf lane: `requests_recorded` (the "since when" notice of the
+      Roblox answer tiles probes for a request instead of summing the range; bounded work, a primary key search),
+      the KPI totals and the Outcomes and Top endpoints tables summing only what their cards show, and
+      `visit_reads` (the Visitors card's numbers from the sparkline's rows when they tile the range).
 
 Why it exists
     Each change trades how a number is read for speed; the number must not move (one source of truth, P6).
@@ -430,3 +434,188 @@ async def test_reason_counts_are_the_refusal_table_columns(rolled: Any) -> None:
 
     for table, fast in await rolled.metrics.read(read):
         assert fast == table
+
+
+# ------------------------------------------------------------------------------------------- the Overview's reads
+
+
+def _vm_steps(conn: sqlite3.Connection, fn: Any) -> tuple[Any, int]:
+    """`fn(conn)` and how many SQLite virtual machine instructions it ran (counted in steps of 100): the work a read
+    does, measured without a clock."""
+    steps = 0
+
+    def tick() -> int:
+        nonlocal steps
+        steps += 1
+        return 0  # never interrupt
+
+    conn.set_progress_handler(tick, 100)
+    try:
+        return fn(conn), steps * 100
+    finally:
+        conn.set_progress_handler(None, 0)
+
+
+def _statements(conn: sqlite3.Connection, fn: Any) -> tuple[Any, list[str]]:
+    """`fn(conn)` and the SQL statements it ran."""
+    seen: list[str] = []
+    conn.set_trace_callback(seen.append)
+    try:
+        return fn(conn), seen
+    finally:
+        conn.set_trace_callback(None)
+
+
+@pytest.mark.parametrize("key", ["1h", "6h", "24h", "7d", "30d"])
+@pytest.mark.parametrize("shift", [0, 2 * 3600 + 17 * 60, 86_400 + 600, 5 * 86_400])
+async def test_requests_recorded_answers_what_the_requests_sum_answers(rolled: Any, key: str, shift: int) -> None:
+    def check(conn: sqlite3.Connection) -> tuple[bool, int]:
+        window = q.resolve_window(key, now=END + 30 - shift, tz=NY)
+        return q.requests_recorded(conn, window), q.totals_sync(conn, window, metrics=("requests",))["requests"]
+
+    recorded, requests = await rolled.metrics.read(check)
+    assert recorded == (requests > 0)
+
+
+async def test_the_since_notice_probes_for_a_request_instead_of_summing_the_range(rolled: Any) -> None:
+    """Final review perf lane: `answers_notice` summed every request before the upgrade to learn whether there was
+    one (12 ms of each 90 day Overview KPI read with history); it now probes the same pieces and stops at the first
+    request, so its work stays small however long the range and however much traffic it holds."""
+    since = END - 600  # the counting began after three days of traffic
+    rolled.metrics.write_sync(
+        lambda conn: conn.execute(
+            "UPDATE schema_version SET applied_at = ? WHERE version = ?", (since, q.ANSWERS_SCHEMA_VERSION)
+        )
+    )
+    now = END + 30
+
+    def read(conn: sqlite3.Connection) -> tuple[dict[str, Any], list[str]]:
+        out = {}
+        for key in ("24h", "7d"):
+            window = q.resolve_window(key, now=now, tz=NY)
+            cut = since - since % 60
+            before = q.Window(window.start, cut, "minute" if cut - window.start <= 86_400 else "hour", NY)
+            notice, probed = _vm_steps(conn, lambda c, window=window: q.answers_notice(c, [window], now=now))
+            total, summed = _vm_steps(conn, lambda c, before=before: q.totals_sync(c, before, metrics=("requests",)))
+            out[key] = (notice, probed, total["requests"], summed)
+        plans = []
+        for table in q.LEVEL_ORDER:
+            sql = "EXPLAIN QUERY PLAN " + q.REQUESTS_PROBE_SQL.format(table=table)
+            plans.append(" | ".join(str(tuple(row)[-1]) for row in conn.execute(sql, (0, 1))))
+        return out, plans
+
+    found, plans = await rolled.metrics.read(read)
+    for key, (notice, probed, requests, summed) in found.items():
+        assert notice is not None, key
+        assert "counted since" in notice, key
+        assert requests > 0, key
+        # The sum walks every row of the range; the probe reads a few rows whatever the range holds.
+        assert probed * 10 < summed, (key, probed, summed)
+    for table, plan in zip(q.LEVEL_ORDER, plans, strict=True):
+        assert f"SEARCH {table} USING PRIMARY KEY" in plan, plan  # a range of the time key, never a table scan
+
+
+@pytest.mark.parametrize("key", ["24h", "7d"])
+async def test_the_overview_reads_sum_only_what_their_cards_show(
+    rolled: Any, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """Final review perf lane: the KPI totals, the last hour and the Outcomes and Top endpoints tables sum only the
+    numbers their cards show (no queue wait histogram anywhere, no histogram at all for the outcome counts), and
+    every number the cards show is the one the full sums give."""
+    from roxy.admin.api import overview as ov
+
+    now = END + 30
+
+    def read(conn: sqlite3.Connection) -> dict[str, Any]:
+        window = q.resolve_window(key, now=now, tz=NY)
+        page = q.Page(size=10, sort="requests")
+        kpis, kpi_sql = _statements(conn, lambda c: q.kpis_sync(c, window, now=now, compare="previous"))
+        outcomes, outcome_sql = _statements(
+            conn, lambda c: q.top_n_sync(c, window, "outcome", page=page, metrics=ov.OUTCOME_METRICS)
+        )
+        endpoints, endpoint_sql = _statements(
+            conn, lambda c: q.endpoint_table_sync(c, window, page=page, metrics=ov.ENDPOINT_KEYS[1:])
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(q, "measures_for", lambda wanted: (None, None))  # every measure and histogram
+            full_kpis = q.kpis_sync(conn, window, now=now, compare="previous")
+        return {
+            "kpis": (kpis, full_kpis, kpi_sql),
+            "outcomes": (outcomes, q.top_n_sync(conn, window, "outcome", page=page), outcome_sql),
+            "endpoints": (endpoints, q.endpoint_table_sync(conn, window, page=page), endpoint_sql),
+        }
+
+    found = await rolled.metrics.read(read)
+    kpis, full_kpis, kpi_sql = found["kpis"]
+    assert kpis == full_kpis
+    assert kpis["tiles"]["requests"]["value"] > 0
+    assert kpis["tiles"]["p95_ms"]["value"] is not None
+    assert not any("queue_wait_hist" in sql for sql in kpi_sql)
+    for name, metrics in (("outcomes", ov.OUTCOME_METRICS), ("endpoints", ov.ENDPOINT_KEYS[1:])):
+        narrowed, full, statements = found[name]
+        assert narrowed["total"] == full["total"] > 1, name
+        assert [row["key"] for row in narrowed["rows"]] == [row["key"] for row in full["rows"]], name
+        shown = [{metric: row[metric] for metric in metrics} for row in full["rows"]]
+        assert [{metric: row[metric] for metric in metrics} for row in narrowed["rows"]] == shown, name
+        assert not any("queue_wait_hist" in sql for sql in statements), name
+    assert not any("latency_hist" in sql for sql in found["outcomes"][2])  # two counts: no histogram decoded
+    assert any("latency_hist" in sql for sql in found["endpoints"][2])  # the p95 column needs the latency one
+
+
+VISIT_KINDS: list[tuple[str, str | None]] = [
+    ("home", "human"),
+    ("home", "crawler"),
+    ("home", "unknown"),
+    ("home", None),
+    ("admin", None),
+    ("robots", "crawler"),
+    ("sitemap", "crawler"),
+]
+
+
+def _visit(at_ms: int, page: str, visitor: str | None, count: int | None) -> tuple[Any, ...]:
+    detail: dict[str, Any] = {"page": page}
+    if visitor is not None:
+        detail["visitor"] = visitor
+    if count is not None:
+        detail["count"] = count
+    return _event(at_ms, "visit", "", detail, template="")
+
+
+@pytest.mark.parametrize("tz", ["UTC", NY, "Asia/Kolkata"])
+@pytest.mark.parametrize("now", [END, END + 30, END + 1830])
+async def test_the_visitors_card_reads_once_and_gives_the_two_reads_numbers(dbs: Any, tz: str, now: int) -> None:
+    """Final review perf lane: `visit_reads` takes the card's numbers from the sparkline's rows when their buckets
+    tile the range (one walk of the visit events instead of two at 90 days); the numbers and the sparklines are
+    exactly the two separate reads', ends of the range included, and a range they cannot tile reads twice."""
+    rng = random.Random(29)
+    rows = [
+        _visit(END * 1000 - rng.randrange(100 * 86_400_000), *rng.choice(VISIT_KINDS), rng.choice([None, 1, 2, 5]))
+        for _ in range(3000)
+    ]
+    rows += [_visit(END * 1000 - rng.randrange(20 * 86_400_000), "admin", None, -1) for _ in range(40)]  # discounts
+    windows = {key: q.resolve_window(key, now=now, tz=tz) for key in ("1h", "6h", "24h", "7d", "30d", "90d")}
+    for window in windows.values():  # events on and next to both ends of each range
+        for edge in (window.start, window.end):
+            rows += [_visit(edge * 1000 + offset, "home", "human", 3) for offset in (-1, 0, 1)]
+    dbs.metrics.write_sync(lambda conn: _insert(conn, rows))
+
+    def read(conn: sqlite3.Connection) -> dict[str, Any]:
+        out = {}
+        for key, window in windows.items():
+            spark = read_dashboard.sparkline_window(window)
+            both, statements = _statements(conn, lambda c, s=spark, w=window: read_dashboard.visit_reads(c, s, w))
+            apart = (read_dashboard.visit_series(conn, spark), q.visitor_kpis(conn, window))
+            tiled = window.start % 3600 == 0 and window.end % 3600 == 0
+            if spark.granularity == "minute":
+                tiled = window.start % 60 == 0 and window.end % 60 == 0
+            out[key] = (both, apart, sum("type = 'visit'" in sql for sql in statements), tiled)
+        return out
+
+    found = await dbs.metrics.read(read)
+    for key, (both, apart, reads, tiled) in found.items():
+        assert both == apart, (key, tz, now)
+        assert sum(apart[1].values()) > 0, key
+        assert reads == (1 if tiled else 2), (key, tz, now, reads)
+    if tz != "Asia/Kolkata":
+        assert found["90d"][3], "a 90 day range in a whole-hour zone is read once"

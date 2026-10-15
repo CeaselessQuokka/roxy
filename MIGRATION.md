@@ -101,12 +101,49 @@ That fix is commit 12616fd (branch `fix/v1-diagnostics-nan`), and you pushed it 
 nothing is owed here. Step 1.4's merge must keep it: a merge, never a force push.
 
 The other v1 change, the Tier 0 safety hotfix (commit 3453d66, branch `hotfix/v1-phase-minus-1`, which stops v1
-sending the credential with caller traffic), was never merged. Whether to merge it before the cutover is your
-decision in `DECISIONS_REVIEW.md`; the cutover does not need it.
+sending the credential with caller traffic), was never merged. You decided on 2026-10-14 to keep v1 as it is (answer
+A2 in `DECISIONS_REVIEW.md`), so it stays unmerged; the cutover does not need it.
 
-### 1.4 v2 on the main branch
+### 1.4 v2 on the main branch, after a backup of v1
 
-`deploy.sh` deploys only commits that are on `main`, so v2 must be merged into `main` before the cutover.
+`deploy.sh` deploys only commits that are on `main`, so v2 must be merged into `main` before the cutover. Back up v1
+on GitHub first (your answer B16), then merge.
+
+**First, OWNER: tag and branch v1.** On your own computer, in a clone of the repository (the one v1 deploys from,
+`https://github.com/CeaselessQuokka/roxy`; `git clone` it if you have no copy), with your own GitHub account:
+
+```sh
+git fetch origin
+git rev-parse origin/main
+git merge-base --is-ancestor 12616fd origin/main && echo "main has the v1 dashboard fix"
+git tag -a v1-final -m "Roxy v1 as it ran before v2 was merged" origin/main
+git branch --no-track v1-backup origin/main
+git push origin v1-final v1-backup
+git ls-remote origin refs/tags/v1-final refs/heads/v1-backup
+```
+
+- `rev-parse` should print `12616fd8c8e85b4ae2d2488e2fd0e9bdb36a5590` (commit 12616fd, where `main` was on
+  2026-10-12). If it prints something else, `git log --oneline 12616fd..origin/main` lists what was added since: tag
+  `main` as it is only if those are v1 changes you know.
+- The `merge-base` line must print its sentence, and the last command must list the tag and the branch.
+- The tag `v1-final` never moves: it is v1 exactly as it ran. The branch `v1-backup` is where a v1 fix would go if you
+  ever need one. Pushing either deploys nothing: v1's workflow runs only for pushes to `main`.
+- Optional: in the repository's GitHub settings, add a rule that forbids deleting or force-pushing `v1-final` and
+  `v1-backup`.
+
+**Getting v1 back from the backup.**
+
+- To run v1 again on the server you need neither: v1's own files stay on the server, stopped, for 30 days after the
+  switch, and [section 6](#6-rollback-to-v1) starts v1 again from them.
+- v1's code as it ran is the tag: `git clone --branch v1-final https://github.com/CeaselessQuokka/roxy roxy-v1` makes
+  a copy of it anywhere (GitHub asks you to sign in if the repository is private). On the server it is also inside
+  the archive `/root/roxy-v1-backup.tar.gz` of step 2.1.
+- A v1 fix goes on the branch `v1-backup`, never on `main`.
+- Never move `main` back to v1, and never force-push it: after the merge `main` holds v2 and v1's fix 12616fd, and
+  every push to it deploys v2 once section 5.2 is done. Never run v1's `~/UpdateBuild.sh` again either: it clones
+  `main`, which is v2 from now on (section 5.3).
+
+**Then, OWNER: merge.**
 
 - **OWNER:** merge `remake/v2` into `main` (a merge, never a force push: it must keep 12616fd). Before you push,
   check that the merged workflow is v2's guarded one:
@@ -139,13 +176,21 @@ colors: the new color starts fresh, with one worker when less than 700 MB is ava
 deploy is a warm color at its 500 MiB limit, plus a new one-worker color (about 155 MiB at start), plus about 200 MB
 for the operating system and nginx: 855 of 909 MB. Step 4.2 checks the 200 MB on the real server.
 
+Your answers of 2026-10-14 (`DECISIONS_REVIEW.md`, "Owner answers of 2026-10-14") agree to every other decision as
+built. What they add to the cutover: the v1 backup on GitHub (step 1.4), a swap file and two kernel settings (step
+2.10), the DataImpulse balance written down when v1 stops (step 4.1), and your choices after the first sign-in (step
+5.1: a test alert, the User-Agent experiment on, a guard for the prepaid DataImpulse pool). The larger requests come
+as v2.x updates after the cutover; `ROADMAP.md` tracks every one of them.
+
 ### 1.6 What to have at hand
 
 - An SSH session to the server as `ubuntu` (two are handy during the window).
 - The mailbox of v1's admin address (the first line of v1's emails file): the first sign-in emails a code there.
 - An authenticator app on your phone or in your password manager.
 - An `age` key pair made on your own computer (step 2.9).
+- A clone of the repository on your own computer and your GitHub account, to back up v1 and merge v2 (step 1.4).
 - Rights to change the repository's GitHub secrets and workflow files (section 5.2).
+- Your DataImpulse dashboard, to read the balance left when v1 stops (step 4.1).
 
 ## 2. Prepare the server
 
@@ -192,7 +237,8 @@ git rev-parse HEAD
 ```
 
 - **OWNER:** replace `OWNER/REPO` with the repository (v1's `Tooling/UpdateBuild.sh` deploys from
-  `CeaselessQuokka/roxy`), and `<sha>` with the commit of step 1.4. The last command must print that commit.
+  `CeaselessQuokka/roxy`, and you confirmed v2 deploys from the same repository's `main`: answer B16), and `<sha>`
+  with the commit of step 1.4. The last command must print that commit.
 - Root runs the install script and the migrator from this checkout. It belongs to `ubuntu`, which already has full
   sudo, so running it as root gives no one new power. Never run them as root from `/opt/roxy`: the deploy account
   owns that directory.
@@ -296,8 +342,9 @@ the groups of `roxy-deploy`. If you ever ran `install-system.sh` from an older c
 sudo nano /etc/roxy/roxy.env
 ```
 
-- `ROXY_DEPLOY_REPO_URL`: replace `OWNER/REPO` with the repository. The nginx wrapper refuses to run while the
-  placeholder is there, and a deploy started by hand has no repository to fetch from.
+- `ROXY_DEPLOY_REPO_URL`: replace `OWNER/REPO` with the repository (`CeaselessQuokka/roxy`, answer B16). The nginx
+  wrapper refuses to run while the placeholder is there, and a deploy started by hand has no repository to fetch
+  from.
 - `ROXY_SITE_ORIGIN`: your public origin. Its certificate must be in `/etc/letsencrypt/live/<host>/`
   (`sudo ls /etc/letsencrypt/live/` lists the hosts; v1 uses the same certificate).
 - `ROXY_WORKERS=2`: keep it (section 1.5).
@@ -347,10 +394,17 @@ exit
 ### 2.9 Offline copy of the keys (key escrow)
 
 Backups never contain the keys of step 2.4. If the disk is lost without a copy of them, every secret v2 encrypted
-(authenticator secrets, a cookie or rotator URL set from the dashboard) is lost too. Make the copy now:
+(authenticator secrets, a cookie or rotator URL set from the dashboard) is lost too. Make the copy now.
 
-- **OWNER:** on your own computer, `age-keygen -o roxy-escrow-key.txt`. It prints the public key (`age1...`). Keep
-  `roxy-escrow-key.txt` offline; it never goes to the server.
+Where you run it and how it works (your question C19): `age` is a small, free encryption tool. You make a lock and
+key pair on your own computer, never on the server. The public key (it starts with `age1`) is the lock: the server
+uses it to lock a copy of Roxy's secret keys, and anyone may see it. The file `roxy-escrow-key.txt` is the only key
+that opens the copy: keep it off the server, for example on a USB stick or in your password manager. If the server's
+disk ever dies, the locked copy plus that file is how you get back in.
+
+- **OWNER:** on your own computer, install `age` (on Windows, in PowerShell: `winget install FiloSottile.age`), then
+  run `age-keygen -o roxy-escrow-key.txt`. It prints the public key (`age1...`). Keep `roxy-escrow-key.txt` offline;
+  it never goes to the server.
 - On the server:
 
 ```sh
@@ -362,7 +416,7 @@ sudo tar -C /etc/roxy -cf - credentials | age -r <your age public key> > ~/roxy-
 - Test it on your computer: `age -d -i roxy-escrow-key.txt roxy-credentials.tar.age | tar -tf -` lists the files.
 - Make a new copy whenever a file in `/etc/roxy/credentials` changes. The keys never change by themselves.
 
-### 2.10 Memory: measure, and decide on swap
+### 2.10 Memory: measure, then add swap and two kernel settings
 
 ```sh
 free -m
@@ -372,9 +426,86 @@ systemctl show roxy -p MemoryCurrent
 The `used` column minus v1's `MemoryCurrent` (in bytes) is roughly what the operating system and nginx use. The
 memory plan assumes about 200 MB; step 4.2 measures it exactly with v1 stopped.
 
-**OWNER:** swap. The server has no swap and the memory plan fits without it. `deploy/README.md` ("Memory and swap on
-the 909 MB server") still recommends a 1 GB swap file with a low swappiness as a safety net, and gives the commands.
-If you want it, add it now, never during the window.
+**Swap and two kernel settings (your answers A7 and A8).** Do this now, on any day before the window, never during
+it. `install-system.sh` does not do it yet (`ROADMAP.md`, item 12), so it is the commands below, by hand. What each
+part is, in plain words:
+
+- **Swap** is disk space Linux may borrow when memory is completely full. Without it, a full memory makes Linux kill
+  a process to free some, and it may pick nginx. With a small swap file the system slows down for a moment instead.
+  The 1 GiB file is a safety net for the operating system, apt, certbot and the migrator, never extra room for Roxy.
+- **`vm.swappiness` 10** tells Linux to use that disk only under real memory pressure (Ubuntu's default is 60). The
+  disk is network storage on Lightsail, so swapping is slow and should stay rare.
+- **Roxy's colors never swap (`MemorySwapMax=0`).** Each color keeps its limits (`MemoryHigh=420M`,
+  `MemoryMax=500M`), and those limits count memory only, not swap. Without this line a color at its limit would be
+  pushed into the slow swap and slow every caller down, instead of losing one worker that gunicorn replaces at once
+  (`OOMPolicy=continue`), which is what every memory test measured. The line goes into a small extra file next to the
+  unit (a drop-in), so the colors behave exactly as tested.
+- **`net.ipv4.tcp_migrate_req` 1** (the lead's recommendation, which you asked for). Each worker of a color has its
+  own queue of new connections. When a worker restarts (about every 20,000 requests), the connections still waiting in
+  its queue are reset today: 4 to 8 percent of new connections at that moment in the test, each one a 502 for a
+  caller. With the setting, Linux hands them to the other worker instead. It costs no memory or CPU and needs Linux
+  5.14 or newer (Ubuntu 24.04 runs 6.8 or newer).
+
+Check first:
+
+```sh
+swapon --show
+ls -l /swapfile
+df -h /
+cat /proc/sys/net/ipv4/tcp_migrate_req
+```
+
+`swapon --show` must print nothing (no swap yet), `ls` must say there is no such file, `df` must show at least 5 GB
+available (the file takes 1 GiB), and the last line prints `0` (the kernel knows the setting; it is off). If swap is
+already active, skip the four swap commands below and do the rest.
+
+Add them:
+
+```sh
+sudo fallocate -l 1G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+grep -qs '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+printf 'vm.swappiness = 10\nnet.ipv4.tcp_migrate_req = 1\n' | sudo tee /etc/sysctl.d/90-roxy.conf
+sudo sysctl -p /etc/sysctl.d/90-roxy.conf
+sudo mkdir -p /etc/systemd/system/roxy@.service.d
+printf '[Service]\nMemorySwapMax=0\n' | sudo tee /etc/systemd/system/roxy@.service.d/90-no-swap.conf
+sudo systemctl daemon-reload
+```
+
+- The `fstab` line makes the swap file come back after a reboot, `/etc/sysctl.d/90-roxy.conf` does the same for the
+  two settings, and the drop-in applies to both colors. `install-system.sh` replaces only `roxy@.service` itself, so
+  the drop-in stays when it runs again (step 5.4).
+- If `fallocate` fails, or `swapon` says the file has holes, make the file the slow way and go on from `chmod`:
+  `sudo rm /swapfile` and `sudo dd if=/dev/zero of=/swapfile bs=1M count=1024`.
+- v1 is not affected: its unit has no swap limit, which only helps it.
+
+Check them:
+
+```sh
+swapon --show
+free -m
+sysctl vm.swappiness net.ipv4.tcp_migrate_req
+systemctl cat roxy@blue.service | grep MemorySwapMax
+```
+
+You should see a line starting `/swapfile file 1024M`; a `Swap:` line in `free -m` with about 1023 total;
+`vm.swappiness = 10` and `net.ipv4.tcp_migrate_req = 1`; and `MemorySwapMax=0`. After any reboot the same checks
+show the same.
+
+Undo, if you ever want to (v1 and v2 both work without them):
+
+```sh
+sudo swapoff /swapfile
+sudo rm /swapfile
+sudo sed -i '\|^/swapfile |d' /etc/fstab
+sudo rm /etc/sysctl.d/90-roxy.conf
+sudo sysctl -w vm.swappiness=60 net.ipv4.tcp_migrate_req=0
+```
+
+`swapoff` moves what is in swap back into memory, so run it when the `Swap:` used in `free -m` is smaller than the
+memory available. The drop-in can stay: without swap it changes nothing.
 
 ## 3. Dry run of the migrator
 
@@ -435,7 +566,11 @@ The sections come in this order. Each item says what to look for and what to do.
   because v2 treats a bypass that never ends as a risk. An address you still want exempt after the cutover day must
   be bypassed again on the Protection page (Bypass card) with the expiry you choose. A rule whose text holds a
   secret is refused. Under it, `throttle_tiers` is the escalation ladder; a rung whose text held a secret is kept
-  with `[redacted]` and a warning.
+  with `[redacted]` and a warning. v1 saves its ladder even when nobody edited it; a v1 ladder equal to v1's built-in
+  one counts as v1's default, so v2's own ladder stays (its rungs 3 and 4 already say "on the DevForums or Twitter",
+  your answers B13 and B15) and the report says `already_imported`. Only if you had edited v1's ladder and an imported
+  rung tells callers just to "contact CeaselessQuokka", add "on the DevForums or Twitter" on the Protection page
+  after the switch.
 - **Pause and throttle-all.** v1's pause and emergency limit, and what v2 will start with. If v1 is paused when the
   window's copy is taken, v2 starts paused; with throttle-all on, v2 starts with the emergency limit (section 3.3).
 - **Text rewrites (plan C5).** Every admin-written text (messages, reasons, notes) whose em or en dash was replaced;
@@ -520,6 +655,9 @@ systemctl is-active roxy
   memory (about 345 MB): v1 and a v2 color do not fit the 909 MB server together. The plan's window paused v1
   instead; a pause would also be carried into v2.
 - `is-active` must print `inactive`. From now until step 4.8, callers get 502 from nginx.
+- **OWNER:** open your DataImpulse dashboard and write down the traffic balance it shows (for example 4,775.43 MB,
+  the figure of 2026-10-14) and the time. Neither v1 nor v2 uses the rotator now, so this figure is exact. Step 5.1
+  ("Owner choices after the first sign-in") turns it into the guard for the prepaid pool.
 
 ### 4.2 Memory with Roxy stopped
 
@@ -527,11 +665,11 @@ systemctl is-active roxy
 free -m
 ```
 
-Read the `used` value on the `Mem:` line: that is the operating system and nginx alone. The plan assumes about 200
-MB; at 200 MB or less it holds as written. It must be **at most about 250 MB**: 909 MB minus a color at its 500 MiB
-limit minus a new one-worker color (155 MiB) leaves 254 MB for everything else, which is the deploy worst case of
-section 1.5. Between 200 and 250 MB it still fits, with less room to spare. Write the number down for
-`DECISIONS_REVIEW.md`.
+Read the `used` value on the `Mem:` line: that is the operating system and nginx alone (the `Swap:` line of step
+2.10 should show little or nothing used). The plan assumes about 200 MB; at 200 MB or less it holds as written. It
+must be **at most about 250 MB**: 909 MB minus a color at its 500 MiB limit minus a new one-worker color (155 MiB)
+leaves 254 MB for everything else, which is the deploy worst case of section 1.5. Between 200 and 250 MB it still
+fits, with less room to spare. Write the number down for `DECISIONS_REVIEW.md`.
 
 If it is higher, something else uses the memory (`ps aux --sort=-rss | head` shows the largest processes).
 **OWNER:** go on only if you understand why; otherwise start v1 again (section 6.3) and sort it out first.
@@ -718,6 +856,9 @@ roxyctl health-run --include-credential
 - Expected: H-SECRETS-PERMS reports that `/etc/roxy` belongs to `ubuntu` (until section 5.4). H-VERSION passes, and
   its value says "advisories not recorded" (normal after a deploy started by hand). Anything else that fails or
   warns: open its runbook in `docs/RUNBOOKS.md` (the check's fix link on the Health page goes there too).
+- The health run only logs in to the alert channels. A real test email follows after your first sign-in (step 5.1,
+  "Owner choices after the first sign-in", item 1): you kept v1's alert email setup as it is (answer B14), and the
+  test proves it still works.
 
 The alias names blue. After a later deploy the live color may be green: `readlink /etc/nginx/roxy-active-upstream.conf`
 tells you which.
@@ -742,7 +883,9 @@ What to watch, where, what good looks like, and when to act (the runbooks named 
   ends only one worker (the unit sets `OOMPolicy=continue`; gunicorn starts another and the color keeps serving), so
   look for it in the journal (`journalctl -u roxy@blue | grep -i "out of memory"`) as well as in `NRestarts`.
 - **Free memory.** `free -m`. Good: `available` stays above about 200 MB (909 minus a color at its 500 MiB limit
-  minus about 200 for the system). Below that: the System page, Workers card, shows which worker grew.
+  minus about 200 for the system), and the `Swap:` line shows little or nothing used. Below that: the System page,
+  Workers card, shows which worker grew. Steady swap use means something outside Roxy grew (the colors cannot swap,
+  step 2.10): `ps aux --sort=-rss | head` shows what.
 - **Roblox 429s.** The Overview tile "Roblox 429s per 10,000 requests" (with "v1 lifetime baseline" under it) and the
   Upstream page, Roblox 429s card. Good: below the v1 baseline. H-429-RATE warns at 0.5% of upstream calls and fails
   at 2%; the alert "Roxy: Roblox is rate-limiting us" fires at 2% for 10 minutes. Then follow the "Roblox is
@@ -752,8 +895,9 @@ What to watch, where, what good looks like, and when to act (the runbooks named 
   in 15 minutes and fails at 2% (a deliberate pause is left out of it): the "Caller errors" runbook.
 - **Anonymous answers (there was no shadow week, section 1.2).** The Overview's "4xx from Roblox" tile (every answer
   Roblox gave Roxy's calls, retries included) and the Endpoints page. Good: no rise in 401 or 403. A rise means some
-  endpoint answers only signed-in callers: note which (Endpoints page) for a later D1 review. Do not add it to the
-  credential allowlist without deciding D1 again.
+  endpoint answers only signed-in callers: note which (Endpoints page) for the private endpoint guard (D1,
+  `ROADMAP.md` item 1). Do not add it to the credential allowlist: your D1 answer keeps your account off callers'
+  requests.
 - **Workers and leader.** The System page, Workers and Leader cards, or `roxyctl leader`. Good: two workers, one
   leader, fresh heartbeats. Otherwise: the "Workers or leader missing" runbook.
 
@@ -762,8 +906,9 @@ about 15 minutes, or if v2 itself (not Roblox) keeps answering callers with 5xx.
 is a tuning matter first (the Recommendations page), not a reason to roll back.
 
 The next day: the nightly backup ran (`sudo cat /var/lib/roxy/audit/backup.json`), H-SYSTEMD passes after 24 hours
-without restarts, and the daily digest email arrived if you turned the info level on (the setting
-`alert_min_severity` is `warn` by default, and the digest is an info message).
+without restarts, and the daily digest email arrived. The digest is on by default (`alert_digest_enabled`, your
+answer A4), goes out at `alert_digest_hour` (9:00, New York time), and is sent whatever `alert_min_severity` says;
+both are on the Settings page, Alerts card.
 
 ## 5. After the switch
 
@@ -799,6 +944,79 @@ It asks for a password twice, shows the authenticator QR code in the terminal, a
 10 recovery codes once. For an existing account use `--reset-mfa` (new authenticator) or `--reset-password` instead
 of `--email`.
 
+#### Your admin account until the account page ships
+
+Your v1 admin name and password come over at the cutover (`--import-admin-password`, steps 3.1 and 4.4; your answer
+A9), and the first sign-in above adds your authenticator. Changing your name, password or email in the dashboard
+comes later (`ROADMAP.md`, item 4). Until then the console script `scripts/create_admin.py`, run through
+`systemd-run` exactly as above, is the only way, and this is all it can do:
+
+| You want | Options after `--username <your admin name>` | What else happens |
+|---|---|---|
+| A new password | `--reset-password` | It asks for the new password twice and checks it: 14 to 1,024 characters, not a common password, not containing the username, not just one or two repeated characters. Every session of the account ends; your authenticator and trusted devices stay. |
+| A new email address (where emailed codes go) | `--email <address>` together with `--reset-password` or `--reset-mfa` | The email cannot change on its own. With `--reset-password` you may type your current password twice as the new one, if it meets the rules. |
+| A new authenticator (a lost phone) | `--reset-mfa` | A new QR code in the terminal, a first code to confirm it, and 10 new recovery codes; your passkeys, trusted devices and sessions are removed. |
+| A second admin | `--username <new name> --email <address>` with no reset option | A password, an authenticator and 10 recovery codes for the new account. The script refuses a name that already exists. |
+
+What it cannot do: change the sign-in name of an account (a second admin under the new name is the only way, and
+neither the console nor the dashboard can delete the old one), list the accounts, or delete one. Every change it
+makes is written to the audit log.
+
+#### Owner choices after the first sign-in
+
+Once you are in, apply your answers of 2026-10-14 that are settings. Each change is written to the audit log, and
+the Settings page's search finds every setting named below.
+
+1. **A test alert (answer B14).** Settings page, Alerts card: press "Send test alert"
+   (`POST /admin/api/v1/system/alerts/test`). The email must reach v1's alert address within a minute or two. If it
+   does not, follow the "Alert channels down" runbook in `docs/RUNBOOKS.md`.
+2. **The User-Agent experiment: on (answers D23 and A6).** Upstream page, Routing card: switch
+   `ua_experiment_enabled` on. A run starts at the moment you switch it on (that is why it is not on by default),
+   splits direct traffic between the browser-like User-Agent and `ua_experiment_alt_user_agent` for
+   `ua_experiment_days` (7 days), then ends by itself. The UP-UA-EXPERIMENT recommendation compares the two sides.
+   Until each side has its own counter (`ROADMAP.md`, item 6) it estimates them from the last 24 hours of request
+   samples, so the week may end without a clear answer; switching it off and on again starts a new run.
+3. **The public site texts (answers B13 and B15): check them.** This release ships your answers as the defaults: no
+   bug bounty paragraph, no support section, and the contact "CeaselessQuokka on the DevForums or Twitter" on the home
+   page, in the user guide and in rungs 3 and 4 of v2's own throttle ladder. Open your site's home page and look. If a
+   text is not as you want it, change it on the Settings page, Public site card: an empty `site_bug_bounty_text` or
+   `site_support_links` hides its section, and `site_contact_name` holds the contact. The footer stays.
+4. **The time zone (answer A3): nothing to do.** `ui_timezone` stays `America/New_York`. Times in each device's own
+   zone come later (`ROADMAP.md`, item 9); meanwhile, on a device that is not on New York time, pick a zone in the
+   user menu's Preferences.
+5. **The rotator session template (answer B12): nothing to do.** `rotator_session_username_template` stays empty, so
+   every rotator call gets a new IP address, as you prefer.
+6. **A guard for the prepaid DataImpulse pool (answers D12 and B11), until the prepaid mode ships.** Egress page,
+   Budget card:
+   - `rotator_quota_gb_per_month`: the balance you wrote down in step 4.1, in GB, rounded down to one decimal. Roxy
+     counts 1 GB as 1,000 MB, so 4,775.43 MB becomes 4.7. Rounding down leaves a small reserve (about 75 MB here) for
+     the difference between Roxy's count and DataImpulse's.
+   - `rotator_billing_day`: the day of the month of the cutover (1 to 28; on the 29th to the 31st use 28). Roxy's
+     count starts at 00:00 UTC that day (the evening before, New York time), and nothing used the rotator through v2
+     before the cutover, so it starts right.
+   - Leave `rotator_budget_alert_pcts` (50, 80 and 95) and `rotator_hard_stop_pct` (100) as they are: Roxy emails you
+     when half, 80 and 95 percent of the balance are used, and stops using the rotator at 100 percent. Callers are
+     then served direct only, never refused for it.
+   - Optional, a second guard: `rotator_daily_cap_mb` 100 keeps any one day under 100 MB.
+
+   Why this is only a stand-in: you bought a prepaid pool (5 GB, no monthly allowance), but Roxy's budget today is
+   monthly. On each billing day it starts counting from zero again, as if the balance had refilled. So once a month,
+   on that day, read the balance on DataImpulse and enter it again in `rotator_quota_gb_per_month` (the alerts start
+   over with it). The prepaid mode (`ROADMAP.md`, item 2) replaces all of this with the balance you enter, a stop at
+   a small reserve and a "lasts until" date.
+
+   How much it matters: little, at the defaults. With `rotator_weight` 0 (D13) the rotator carries traffic only while
+   the direct path cools down after Roblox 429s, while its rate bucket is more than 80 percent full, or when a routing
+   rule asks for it. v1 sent a quarter of its traffic through the rotator (its weight was 25) and used about 225 MB in
+   at least 3 months; v2 should use far less. The guard is there for a runaway (a long cooldown under heavy traffic),
+   not for normal use.
+7. **Optional: refuse sign-in endpoints now.** Protection page, Endpoint blocks: add `auth.roblox.com` (the whole
+   service) with the message "This endpoint needs a signed-in Roblox account, and Roxy never signs in for callers, so
+   it is not available through this proxy." That stops login and password reset attempts through your server's
+   address until the private endpoint guard ships (`ROADMAP.md`, item 1). It refuses every address of that service,
+   including its few public ones (such as checking whether a username is valid): leave it out if a game you know
+   uses them.
+
 ### 5.2 Enable the deploy workflow
 
 Until now `.github/workflows/deploy.yml` has `if: false` on its deploy job, so pushes to `main` only run CI. Turn it
@@ -824,6 +1042,9 @@ sha> failed at step <n>"; see the "Deploy failed" runbook.
 There is nothing to disable: v2's `.github/workflows/deploy.yml` replaced v1's file at the merge (step 1.4), so v1's
 "Deploy to Lightsail" workflow no longer exists on `main`. Do not disable the workflow in GitHub's settings: it is the
 same file, now v2's. On the server, `~/UpdateBuild.sh` stays until section 5.6; nothing runs it any more.
+
+**Never run `~/UpdateBuild.sh` again:** it clones `main`, which is v2 now, and would lay v2's tree out as if it were
+v1. v1 comes back from its own files on the server (section 6), and its code is the tag `v1-final` (step 1.4).
 
 **OWNER:** if v1's Actions key had its own line in `/home/ubuntu/.ssh/authorized_keys` (a key used only by GitHub),
 remove that line, so no automation can log in as `ubuntu` again. Keep your own key.
@@ -858,7 +1079,8 @@ sudo systemctl start roxy-audit.service
 - Settings page: decide by hand the keys the report showed as never imported (section 3.2), and reword any text the
   report's "Text rewrites" table changed badly.
 - If the report said your password is under the v2 policy (14 or more characters), set a new one with the command of
-  section 5.1 and `--reset-password` instead of `--email` (there is no password change page).
+  section 5.1 and `--reset-password` instead of `--email` (there is no password change page yet: section 5.1, "Your
+  admin account until the account page ships").
 - Run `sudo certbot renew --dry-run` once: certificate renewal must still work with v2's nginx site. v2's site
   answers renewal challenges (`/.well-known/acme-challenge/`) from `/var/www/letsencrypt`, the webroot of
   `certbot renew --webroot -w /var/www/letsencrypt`. If the dry run fails, see the "Certificate" runbook.
@@ -889,7 +1111,10 @@ Then:
 5. Remove v1's code and helpers from your home: `~/Roxy`, `~/SiteEnv`, `~/Tooling`, `~/UpdateBuild.sh`,
    `~/alert_on_failure.py` and `~/roxy-hotfix-backup-20261009`.
 6. Remove the copies that hold v1's secrets: `/root/roxy-v1-final` and `/root/roxy-v1-backup.tar.gz`. **OWNER:** keep
-   an offline copy of the archive first if you want one.
+   an offline copy of the archive first if you want one, and keep `/root/roxy-v1-final` until the private endpoint
+   guard's report of what callers read through v1 with your cookie has run (`ROADMAP.md` item 1) AND the v1 snapshot
+   work of D17 has shipped (`ROADMAP.md` item 8): v2 adds its own counts on top of the fingerprint and error counts it
+   imported from v1, so v1's share can be told apart later only from v1's own `roxy_data.json` in that copy.
 
 Keep the migration reports in `/root` (`roxy-credentials-report`, `roxy-migration-dry-run` and
 `roxy-migration-final`; secrets are masked in them) and the toolbox `~/roxy-v2-src` (move it to the live commit before
@@ -915,6 +1140,10 @@ v2 wrote ever reaches v1. Going back loses, from v1's point of view:
 - **The cache** is gone; v1 has its own.
 
 v2's databases and credential files stay on disk, unused, so you can try again later (section 6.7).
+
+v1 comes back from its own files on the server, never from GitHub: do not run `~/UpdateBuild.sh` (it clones `main`,
+which is v2 now). If v1's files on the server were ever lost, its code is the tag `v1-final` (step 1.4) and its
+configuration and code are in `/root/roxy-v1-backup.tar.gz` (step 2.1).
 
 ### 6.2 During preparation (sections 1 to 3)
 

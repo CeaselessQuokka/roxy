@@ -14,9 +14,13 @@ Why it exists
 How it works
     Plain data, collected and checked by `roxy/config/catalog.py`. The `site_*` defaults are the v1 home page
     text, carried over with the style rule C5 applied (no em or en dash characters, US spelling) and with the
-    stale "Python and Flask" line rewritten. Format contract for every `site_*` value, which the public page
-    renderer must honor: plain text, blank lines separate paragraphs, and links are written as
-    `[label](https://...)`; only https links become links, and HTML is shown as text, never rendered.
+    stale "Python and Flask" line rewritten. The owner confirmed them on 2026-10-14 (answers B13 and B15) with
+    three changes: no bug bounty and no support links for now (both defaults are empty, and an empty text hides
+    its part of the home page; v1's wording is kept in each setting's notes), and the contact names where to
+    reach CeaselessQuokka. Format contract for every `site_*` value, which the public page renderer must honor:
+    plain text, blank lines separate paragraphs, and links are written as `[label](https://...)`; only https
+    links become links, and HTML is shown as text, never rendered. `site_contact_name` is the exception: it sits
+    inside sentences, so it is always plain text.
 
 What to read next
     `roxy/config/spec.py` (field meanings), plan 16.1 (where each `site_*` text appears on `/`), plan 7.13 (the
@@ -63,14 +67,20 @@ _WHITE_HATS_DEFAULT = (
     "token is one you never send."
 )
 
-_BUG_BOUNTY_DEFAULT = (
+# Owner answers B13 and B15 (2026-10-14): "No bug bounty, no support link, but if they need something extra or are
+# having an issue to contact CeaselessQuokka on either the DevForums or Twitter". The contact therefore says where
+# to reach the name, and the two texts below ship empty (hidden). v1's wording stays in their notes, so bringing a
+# section back is a paste, not a rewrite.
+_CONTACT_DEFAULT = "CeaselessQuokka on the DevForums or Twitter"
+
+_BUG_BOUNTY_V1 = (
     "If you're a White Hat and find a vulnerability, I'm offering rewards from $10-$250 USD depending on "
     "severity. Any serious exploit report is always paid and appreciated. I'm still learning web development, so "
     "there may be a lot of issues."
 )
 
 # D18: the v1 text said "Roxy was made using Python and Flask", which is stale for v2. Only that sentence is
-# rewritten; the hosting and cost facts are the owner's v1 text, to be confirmed (pending_owner_verification).
+# rewritten; the hosting and cost facts are the owner's v1 text, confirmed by the owner on 2026-10-14 (B15).
 _HOSTING_DEFAULT = (
     "Roxy is written in Python using FastAPI and Uvicorn. It is hosted using the second tier option of Lightsail "
     "on AWS, which means there is 2TB of transfer data per month. So if the site goes down that is probably why. "
@@ -79,11 +89,11 @@ _HOSTING_DEFAULT = (
     "instance) + 15 USD per year (for the domain). Which comes out to be exactly $99 per year."
 )
 
-_SUPPORT_DEFAULT = (
+# v1's "Support Me" paragraph. v1's plugin link was in the home page introduction, and it is there again
+# (templates/public/home.html), so this text never needs it.
+_SUPPORT_V1 = (
     "You never have to donate or pay anything; just using anything I make is enough support for me. If you ever "
-    "make something with something I create, please tag me in it, I'd love to see it! :D\n\n"
-    "Also by the author: [Bundle and Character/Outfit Inserter (shameful plug(in))]"
-    "(https://devforum.roblox.com/t/bundle-and-characteroutfit-inserter-free-plugin/3972083)"
+    "make something with something I create, please tag me in it, I'd love to see it! :D"
 )
 
 _FOOTER_DEFAULT = "Roxy Proxy 2025-Present"
@@ -211,22 +221,27 @@ SETTINGS: list[SettingSpec] = [
     SettingSpec(
         key="site_contact_name",
         group=Group.PUBLIC_SITE,
-        label="Contact name",
+        label="Contact name and where to reach them",
         type=SettingType.STRING,
-        default="CeaselessQuokka",
+        default=_CONTACT_DEFAULT,
         max_length=_SITE_TEXT_MAX,
         description=(
-            "The name the public site tells visitors to contact about problems, vulnerability reports or more "
-            "request bandwidth. Use a public handle, never a private email address or phone number."
+            "Who the public site tells visitors to contact, and where, when they need something extra, have an "
+            "issue, found a vulnerability or need more request bandwidth. It completes sentences such as 'Contact "
+            "CeaselessQuokka on the DevForums or Twitter.' on the home page and in the user guide, so write the "
+            "name followed by where to reach it. Use public handles and places, never a private email address or "
+            "phone number."
         ),
         pages=_PUBLIC_SITE,
         risk=Risk.LOW,
         apply=Apply.LIVE,
         related_settings=_other_site_keys("site_contact_name"),
-        pending_owner_verification=True,
         notes=(
-            "Default is the name v1 used in its default throttle messages ('contact CeaselessQuokka'); the v1 "
-            "home page itself spoke in the first person. " + _SITE_FORMAT_NOTE
+            "Owner answers B13 and B15 (2026-10-14): contact CeaselessQuokka on the DevForums or Twitter. v1 named "
+            "only 'CeaselessQuokka' (in its default throttle messages; the v1 home page spoke in the first person). "
+            "The default throttle ladder's rungs 3 and 4 name the same contact in their own text, which is edited "
+            "on the Protection page. Shown as plain text on the home page and in the user guide, so links are not "
+            "supported here, and HTML is shown as text. Must not contain em or en dash characters (style rule C5)."
         ),
     ),
     SettingSpec(
@@ -244,28 +259,31 @@ SETTINGS: list[SettingSpec] = [
         risk=Risk.LOW,
         apply=Apply.LIVE,
         related_settings=_other_site_keys("site_white_hats_text"),
-        pending_owner_verification=True,
-        notes="v1 section 'No Login Required & White Hats', first half. " + _SITE_FORMAT_NOTE,
+        notes=(
+            "v1 section 'No Login Required & White Hats', first half; confirmed by the owner on 2026-10-14 (B15). "
+            + _SITE_FORMAT_NOTE
+        ),
     ),
     SettingSpec(
         key="site_bug_bounty_text",
         group=Group.PUBLIC_SITE,
         label="Bug bounty text",
         type=SettingType.STRING,
-        default=_BUG_BOUNTY_DEFAULT,
+        default="",
         max_length=_SITE_TEXT_MAX,
         description=(
             "The bug bounty paragraph on the home page: what security researchers can earn for reporting a "
-            "vulnerability. It names amounts of money, so keep it current."
+            "vulnerability. Empty (the default) means there is no bug bounty: the home page leaves the paragraph "
+            "out and the user guide says there is no bug bounty at the moment. A text here names amounts of "
+            "money, so keep it current."
         ),
         pages=_PUBLIC_SITE,
         risk=Risk.LOW,
         apply=Apply.LIVE,
         related_settings=_other_site_keys("site_bug_bounty_text"),
-        pending_owner_verification=True,
         notes=(
-            "v1 section 'No Login Required & White Hats', reward paragraph. The '$10-$250' range already used a "
-            "plain hyphen. " + _SITE_FORMAT_NOTE
+            "Owner answers B13 and B15 (2026-10-14): no bug bounty for now, so the default is empty. v1's "
+            "paragraph, to paste back if the bounty returns: '" + _BUG_BOUNTY_V1 + "' " + _SITE_FORMAT_NOTE
         ),
     ),
     SettingSpec(
@@ -283,11 +301,10 @@ SETTINGS: list[SettingSpec] = [
         risk=Risk.LOW,
         apply=Apply.LIVE,
         related_settings=_other_site_keys("site_hosting_note"),
-        pending_owner_verification=True,
         notes=(
             "v1 section 'Roxy Internals'. The v1 sentence 'Roxy was made using Python and Flask' was stale and is "
-            "rewritten for v2 (owner decision D18); the owner should confirm the hosting tier, transfer allowance "
-            "and costs, which do not include any rotating proxy plan. " + _SITE_FORMAT_NOTE
+            "rewritten for v2 (owner decision D18); the owner confirmed the hosting tier, transfer allowance and "
+            "costs on 2026-10-14 (B15). They do not include any rotating proxy plan. " + _SITE_FORMAT_NOTE
         ),
     ),
     SettingSpec(
@@ -295,20 +312,22 @@ SETTINGS: list[SettingSpec] = [
         group=Group.PUBLIC_SITE,
         label="Support and 'also by the author' text",
         type=SettingType.STRING,
-        default=_SUPPORT_DEFAULT,
+        default="",
         max_length=_SITE_TEXT_MAX,
         description=(
-            "The 'Support me' section of the home page, including the 'Also by the author' links to the "
-            "author's other projects."
+            "The 'Support me' section of the home page, for example how to support the author and 'Also by the "
+            "author' links to the author's other projects. Empty (the default) leaves the whole section out."
         ),
         pages=_PUBLIC_SITE,
         risk=Risk.LOW,
         apply=Apply.LIVE,
         related_settings=_other_site_keys("site_support_links"),
-        pending_owner_verification=True,
         notes=(
-            "v1 section 'Support Me' plus the plugin link from the v1 intro; test_v1_home_links_survive expects "
-            "that link on the home page. " + _SITE_FORMAT_NOTE
+            "Owner answers B13 and B15 (2026-10-14): no support links for now, so the default is empty and the "
+            "section is hidden. v1's 'Support Me' text, to paste back if you want the section again: '"
+            + _SUPPORT_V1
+            + "' v1's plugin link is not part of it: it is in the home page introduction, where v1 had it "
+            "(test_v1_home_links_survive). " + _SITE_FORMAT_NOTE
         ),
     ),
     SettingSpec(
@@ -323,8 +342,10 @@ SETTINGS: list[SettingSpec] = [
         risk=Risk.LOW,
         apply=Apply.LIVE,
         related_settings=_other_site_keys("site_footer_text"),
-        pending_owner_verification=True,
-        notes="v1 footer, unchanged (it already used a plain hyphen). " + _SITE_FORMAT_NOTE,
+        notes=(
+            "v1 footer, unchanged (it already used a plain hyphen); the owner kept it on 2026-10-14 (B15). "
+            + _SITE_FORMAT_NOTE
+        ),
     ),
     # ---------------------------------------------------------------- dashboard-wide preferences
     SettingSpec(

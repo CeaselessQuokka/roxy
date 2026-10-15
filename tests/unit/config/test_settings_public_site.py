@@ -1,8 +1,9 @@
 """Catalog content tests for settings group K (Public site and compatibility) plus `ui_timezone`/`ui_default_theme`.
 
 These pin plan 15.3 K: every key is present with the plan default, every default is valid against its own
-limits, the help text an admin needs is filled in, the v1 home page links survive in the `site_*` defaults, and
-nothing breaks the style rule C5.
+limits, the help text an admin needs is filled in, the `site_*` defaults follow the owner's answers B13 and B15
+(2026-10-14: the contact says where, no bug bounty, no support links), and nothing breaks the style rule C5. The
+v1 home page links are checked on the page itself (tests/integration/test_public_pages.py).
 """
 
 import dataclasses
@@ -36,11 +37,12 @@ EXPECTED_SITE_KEYS = [
 EXPECTED_KEYS = set(EXPECTED_K_DEFAULTS) | set(EXPECTED_SITE_KEYS)
 DASHBOARD_KEYS = {"ui_timezone", "ui_default_theme"}
 
+# Owner answers B13 and B15 (2026-10-14): no bug bounty and no support links for now. An empty text hides its part
+# of the home page, so these two ship empty; every other text has a default.
+EMPTY_BY_DEFAULT = {"site_bug_bounty_text", "site_support_links"}
+
 # DESIGN.md section 9 anchors that this group may use.
 ALLOWED_PAGES = {"settings#public-site", "topbar#pause", "user-menu#preferences"}
-
-# Outbound links in the v1 home page that plan 16.1 routes into a `site_*` setting.
-V1_LINKS_IN_SITE_TEXT = ["https://devforum.roblox.com/t/bundle-and-characteroutfit-inserter-free-plugin/3972083"]
 
 DASHES = (chr(0x2014), chr(0x2013))  # em dash, en dash
 BRITISH = [
@@ -112,7 +114,7 @@ def test_spec_complete_and_default_valid(spec: SettingSpec) -> None:
                 assert option.description.strip()
         case SettingType.STRING:
             assert isinstance(spec.default, str)
-            assert spec.default.strip()
+            assert (spec.default == "") if spec.key in EMPTY_BY_DEFAULT else spec.default.strip()
             assert spec.max_length is not None
             assert len(spec.default) <= spec.max_length
         case _:
@@ -132,15 +134,27 @@ def test_site_text_limits_and_https_links() -> None:
     for key in EXPECTED_SITE_KEYS:
         spec = by_key[key]
         assert spec.max_length == 2000
-        assert spec.pending_owner_verification  # D18: the owner confirms names, prices and hosting facts
+        assert not spec.pending_owner_verification  # D18 texts confirmed by the owner (B13, B15, 2026-10-14)
         for url in re.findall(r"https?://[^\s)\]]+", spec.default):
             assert url.startswith("https://"), f"{key}: {url}"
         assert "<" not in spec.default, f"{key}: HTML is not part of the format"
-    joined = " ".join(by_key[key].default for key in EXPECTED_SITE_KEYS)
-    for link in V1_LINKS_IN_SITE_TEXT:
-        assert link in joined
     assert "Flask" not in by_key["site_hosting_note"].default  # stale v1 text rewritten (D18)
-    assert by_key["site_footer_text"].default == "Roxy Proxy 2025-Present"
+    assert by_key["site_footer_text"].default == "Roxy Proxy 2025-Present"  # B15: the footer stays
+
+
+def test_owner_answers_b13_b15_contact_no_bounty_no_support_links() -> None:
+    """The owner's words: "No bug bounty, no support link, but if they need something extra or are having an issue
+    to contact CeaselessQuokka on either the DevForums or Twitter"."""
+    by_key = _by_key()
+    assert by_key["site_contact_name"].default == "CeaselessQuokka on the DevForums or Twitter"
+    for key in EMPTY_BY_DEFAULT:
+        spec = by_key[key]
+        assert spec.default == ""
+        assert "Empty (the default)" in spec.description
+    # v1's wording stays in the notes, so bringing a section back is a paste.
+    assert "rewards from $10-$250 USD depending on severity" in by_key["site_bug_bounty_text"].notes
+    assert "You never have to donate or pay anything" in by_key["site_support_links"].notes
+    assert "https://devforum" not in by_key["site_support_links"].notes  # no link in the paste (v1 had none there)
 
 
 def test_pause_message_limit_and_v1_default() -> None:

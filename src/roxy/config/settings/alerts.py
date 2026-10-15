@@ -2,8 +2,9 @@
 
 What this is
     The catalog entries for alert pacing (`error_email_cooldown`, `email_cooldown`, `alert_rate_limit_per_hour`),
-    alert routing (`alert_min_severity`, `alert_webhook_enabled`), the daily digest (`alert_digest_hour`) and
-    the scheduled health check that feeds alerts (`health_auto_interval_h`, `health_auto_include_credential`).
+    alert routing (`alert_min_severity`, `alert_webhook_enabled`), the daily digest (`alert_digest_enabled`,
+    `alert_digest_hour`) and the scheduled health check that feeds alerts (`health_auto_interval_h`,
+    `health_auto_include_credential`).
 
 Why it exists
     An alert that never arrives hides an outage; an alert that arrives two hundred times hides everything else.
@@ -16,7 +17,9 @@ How it works
     (`roxy/notify/`) reads the live values on every send: each alert carries a cooldown key, and the gap between
     two sends of one key is enforced fleet-wide through the `email_gate` table, so two worker processes never
     both send the same alert (plan C6). The webhook URL itself is a secret held as the systemd credential
-    `alert_webhook_url`, never a setting, so nothing here is sensitive.
+    `alert_webhook_url`, never a setting, so nothing here is sensitive. The daily digest has its own switch
+    (`alert_digest_enabled`, on by default: owner answer A4, 2026-10-14), so `alert_min_severity` and the hourly
+    cap never hold it back (`notify/alerts.py`, the `scheduled` flag).
 
 What to read next
     `roxy/config/spec.py` for the field meanings, then `roxy/notify/` for the alert types and their cooldown keys
@@ -112,7 +115,7 @@ SETTINGS: list[SettingSpec] = [
         description=(
             "The most alert messages Roxy sends to each channel (email, webhook) in one hour. Alerts over the limit "
             "are held back and counted, and the next message that goes out says 'N alerts suppressed'. Credential "
-            "leak guard alerts are never held back."
+            "leak guard alerts, new admin login emails and the daily digest (one a day) are never held back."
         ),
         pages=_ALERT_PAGES,
         if_raised=(
@@ -138,7 +141,7 @@ SETTINGS: list[SettingSpec] = [
             OptionSpec(
                 "info",
                 "Info and above",
-                "Everything, including new admin logins and the daily digest. Noisy, but nothing is filtered out.",
+                "Everything, info-level alerts included. Noisy, but nothing is filtered out.",
             ),
             OptionSpec(
                 "warn",
@@ -156,7 +159,7 @@ SETTINGS: list[SettingSpec] = [
         description=(
             "The lowest alert severity sent to any channel; alerts below it are not sent. New admin login emails "
             "are always sent, whatever this says, because they carry the link that ends a session you did not "
-            "start."
+            "start. The daily digest is not filtered either: it has its own switch, alert_digest_enabled."
         ),
         pages=_ALERT_PAGES,
         risk=Risk.MEDIUM,
@@ -169,7 +172,7 @@ SETTINGS: list[SettingSpec] = [
             ),
         ),
         apply=Apply.LIVE,
-        related_settings=("alert_rate_limit_per_hour", "alert_webhook_enabled", "alert_digest_hour"),
+        related_settings=("alert_rate_limit_per_hour", "alert_webhook_enabled", "alert_digest_enabled"),
         related_recommendations=("SEC-DEFAULTS",),
         notes="New in v2; v1 sent every alert it had.",
     ),
@@ -198,6 +201,29 @@ SETTINGS: list[SettingSpec] = [
             "low-severity message, and the H-ALERTS health check tests the channel without sending where it can."
         ),
     ),
+    # --- Daily digest (owner answer A4, 2026-10-14: on, easy to edit, whatever alert_min_severity says) ---------
+    SettingSpec(
+        key="alert_digest_enabled",
+        group=Group.ALERTS,
+        label="Send the daily digest",
+        type=SettingType.BOOL,
+        default=1,
+        description=(
+            "Emails a daily summary: open recommendations, failing health checks and Roblox rate limiting numbers. "
+            "It is sent whatever alert_min_severity says, at alert_digest_hour in the dashboard time zone, and the "
+            "hourly alert limit never holds it back (it is one email a day)."
+        ),
+        pages=_ALERT_PAGES,
+        if_enabled="One email a day at alert_digest_hour.",
+        if_disabled="No daily summary; alerts still arrive as they happen.",
+        risk=Risk.LOW,
+        apply=Apply.LIVE,
+        related_settings=("alert_digest_hour", "ui_timezone", "alert_min_severity"),
+        notes=(
+            "New in v2. Owner answer A4 (2026-10-14): on. The digest is sent by email only (plan 17.7); this switch, "
+            "not alert_min_severity, decides whether it goes out."
+        ),
+    ),
     SettingSpec(
         key="alert_digest_hour",
         group=Group.ALERTS,
@@ -205,22 +231,24 @@ SETTINGS: list[SettingSpec] = [
         type=SettingType.INT,
         default=9,
         unit="hour of day",
-        min=-1,
+        min=0,
         max=23,
         step=1,
         description=(
-            "The hour of the day (0 to 23, in the dashboard time zone) at which Roxy emails a daily digest of open "
-            "recommendations, failing health checks and the Roblox rate limiting numbers. -1 turns the digest off. "
-            "The digest is an info-level message, so it is emailed only while alert_min_severity is info (the "
-            "default, warn, holds it back)."
+            "The hour (0 to 23) at which the daily digest is emailed, in the dashboard time zone (ui_timezone, New "
+            "York by default). It is sent whatever alert_min_severity says. Switch the digest off with "
+            "alert_digest_enabled."
         ),
         pages=_ALERT_PAGES,
         if_raised="The digest arrives later in the day.",
-        if_lowered="The digest arrives earlier in the day; -1 turns it off.",
+        if_lowered="The digest arrives earlier in the day.",
         risk=Risk.LOW,
         apply=Apply.LIVE,
-        related_settings=("ui_timezone", "alert_min_severity"),
-        notes="New in v2. The digest is sent by email only and is an info-level message (plan 17.7).",
+        related_settings=("alert_digest_enabled", "ui_timezone", "alert_min_severity"),
+        notes=(
+            "New in v2. The digest is sent by email only (plan 17.7). Before owner answer A4 (2026-10-14), -1 here "
+            "turned the digest off; alert_digest_enabled is the switch now."
+        ),
     ),
     # --- Scheduled health runs -----------------------------------------------------------------------
     SettingSpec(

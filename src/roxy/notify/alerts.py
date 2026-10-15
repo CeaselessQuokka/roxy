@@ -19,6 +19,10 @@ How it works
       `email_cooldown`); the notifier reads it live on every send.
     - `always_send` alerts (new admin login, leak guard trip) ignore `alert_min_severity` and the hourly cap.
       Leak guard alerts are never capped (plan 17.7).
+    - `scheduled` alerts are reports with their own on and off switch, not incidents: today only the daily digest
+      (`alert_digest_enabled`, owner answer A4: on, whatever `alert_min_severity` says). The switch decides whether
+      one goes out, so the notifier neither filters it by `alert_min_severity` nor holds it back with the hourly cap
+      (at most one a day; a capped send would lose that day's digest, because its day is claimed first).
     - Severity is `info`, `warn` or `critical` (the `alert_min_severity` options).
 
 What to read next
@@ -43,7 +47,8 @@ class Alert:
     """One alert (DESIGN.md 11.6). Fields after `always_send` are v2 additions with safe defaults.
 
     `body`, when set, replaces the generated body (the login alert keeps v1's exact text); it is still redacted,
-    except for `link`, which is built by Roxy from `ROXY_SITE_ORIGIN`.
+    except for `link`, which is built by Roxy from `ROXY_SITE_ORIGIN`. `scheduled` marks a scheduled report with its
+    own switch (the daily digest): not filtered by alert_min_severity and not counted in the hourly cap.
     """
 
     type: str
@@ -58,6 +63,7 @@ class Alert:
     channels: tuple[str, ...] = CHANNELS
     body: str | None = None
     runbook: str | None = None
+    scheduled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +96,9 @@ class AlertSpec:
     page: str = ""
     """The dashboard path an alert of this type links when its producer passes no link (plan 17.7 "Where"); the
     notifier turns a path into an absolute link with `ROXY_SITE_ORIGIN` (final review brain-13)."""
+    scheduled: bool = False
+    """A scheduled report with its own switch (the daily digest): not filtered by alert_min_severity and not counted
+    in the hourly cap. Its producer checks the switch before building it (owner answer A4)."""
 
 
 ALERT_SPECS: dict[str, AlertSpec] = {
@@ -248,6 +257,8 @@ ALERT_SPECS: dict[str, AlertSpec] = {
             runbook="login-throttled",
         ),
         AlertSpec(
+            # Owner answer A4 (2026-10-14): on by default and sent whatever alert_min_severity says; its own switch
+            # is alert_digest_enabled (`notify/producers.py send_digest`), so it is the one scheduled alert.
             "digest",
             "Roxy daily digest: {n} open recommendations",
             "info",
@@ -255,6 +266,7 @@ ALERT_SPECS: dict[str, AlertSpec] = {
             DAY_S,
             channels=("email",),
             runbook="daily-digest",
+            scheduled=True,
         ),
     )
 }
@@ -300,4 +312,5 @@ def make_alert(
         channels=spec.channels,
         body=body,
         runbook=spec.runbook or None,
+        scheduled=spec.scheduled,
     )

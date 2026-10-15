@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import sqlite3
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 import pytest
 
 from roxy.config import catalog, defaults
-from roxy.config.constants import CLIENT_ADDRESS_HEADERS
+from roxy.config.constants import CLIENT_ADDRESS_HEADERS, MAX_RULE_MESSAGE, MAX_RULE_NOTE
 from roxy.config.defaults import (
     CACHE_RULES,
     DEFAULT_TIER_MESSAGE,
@@ -28,11 +29,15 @@ from roxy.config.defaults import (
     seed_control_defaults,
     seed_defaults,
     throttle_tier_rows,
+    v1_builtin_tier_rows,
 )
 from roxy.config.runtime import read_config_version
 from roxy.core.clock import FakeClock
+from roxy.migration.text import clean_admin_text
 from roxy.rules.models import CacheRuleIn, ThrottleTierIn
 from roxy.rules.store import build_rules_snapshot
+
+REPO = Path(__file__).resolve().parents[3]
 
 PLAN_9_10_HOSTS = [
     "games",
@@ -99,6 +104,49 @@ def test_throttle_ladder_is_v1_with_the_c5_message() -> None:
         model = ThrottleTierIn(**row)
         assert model.action == "throttle"
         assert model.ban_minutes is None
+
+
+def test_ladder_rungs_that_name_the_contact_say_where() -> None:
+    """Owner answers B13 and B15 (2026-10-14): callers contact CeaselessQuokka on the DevForums or Twitter."""
+    naming = [tier.message for tier in THROTTLE_TIERS if "CeaselessQuokka" in tier.message]
+    assert len(naming) == 2
+    for message in naming:
+        assert "CeaselessQuokka on the DevForums or Twitter" in message
+        assert len(message) <= MAX_RULE_MESSAGE
+        ThrottleTierIn.model_validate({"position": 1, "multiplier": 1.0, "message": message})  # the API's own check
+
+
+def _v1_builtin_ladder() -> list[dict[str, Any]]:
+    """v1 config.DEFAULT_THROTTLE_TIERS, read from the v1 source in app/ (the ground truth) without importing it."""
+    tree = ast.parse((REPO / "app" / "config.py").read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "DEFAULT_THROTTLE_TIERS" for target in node.targets
+        ):
+            return [dict(tier) for tier in ast.literal_eval(node.value)]
+    raise AssertionError("app/config.py has no DEFAULT_THROTTLE_TIERS")
+
+
+def test_v1_builtin_tier_rows_are_v1s_ladder_after_c5() -> None:
+    """The migrator recognizes an untouched v1 ladder by this copy, so it must be v1's ladder exactly as the
+    migration's C5 rewrite turns it into v2 text (rung 1's em dash), differing from v2's only in rungs 3 and 4."""
+    v1 = [
+        {
+            "position": index,
+            "multiplier": float(tier["Multiplier"]),
+            "message": clean_admin_text(tier["Message"], MAX_RULE_MESSAGE).text,
+            "note": clean_admin_text(tier["Note"], MAX_RULE_NOTE).text,
+        }
+        for index, tier in enumerate(_v1_builtin_ladder(), start=1)
+    ]
+    assert v1_builtin_tier_rows() == v1
+    changed = [
+        old["position"]
+        for old, new in zip(v1_builtin_tier_rows(), throttle_tier_rows(), strict=True)
+        if old["message"] != new["message"]
+    ]
+    assert changed == [3, 4]
+    assert all(old["note"] == new["note"] for old, new in zip(v1, throttle_tier_rows(), strict=True))
 
 
 def test_v1_value_headers_and_paths() -> None:

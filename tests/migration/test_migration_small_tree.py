@@ -87,6 +87,9 @@ async def test_migration_small_tree(v1: Any, ws: Any, migrate: Any, fake_clock: 
     assert [row["multiplier"] for row in tiers] == [1.0, 2.0, 4.0, 8.0]
     assert tiers[0]["message"] == DEFAULT_TIER_MESSAGE
     assert report.ladder["status"] == ALREADY  # the v1 default ladder, after C5, is the v2 default ladder
+    # v1 saved its untouched ladder too; v2's rungs 3 and 4 (owner answers B13 and B15) stay instead of v1's wording.
+    assert "on the DevForums or Twitter" in tiers[2]["message"]
+    assert "on the DevForums or Twitter" in tiers[3]["message"]
 
     state = {row["key"]: json.loads(row["value_json"]) for row in rows(control, "SELECT * FROM service_state")}
     assert state["pause"]["paused"] is False

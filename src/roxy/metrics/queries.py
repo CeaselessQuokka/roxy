@@ -24,10 +24,12 @@ How it works
       to `rollup_minute`, which is always current. So a 30 day chart reads hours plus the last few minutes, and
       nothing is counted twice. A sum over the whole window (totals, KPI tiles, top-N tables) reads the coarsest
       rows that tile it instead (`cover_pieces`: whole days, whole hours, minutes only at the edges), and a chart
-      sums only the measures its metrics read (`measures_for`); both for plan 6.7's dashboard targets.
-    - One SQL statement per level computes every measure as a conditional sum over the joined `dims` row (for
-      example `demand`, `refused`, `roxy_429`) plus the histogram sums; Python then re-buckets, derives ratios
-      and percentiles. Filter and group columns are checked against a fixed list before they reach SQL.
+      (or a total or top-N table read with `metrics`, as the Overview's KPI tiles and tables are) sums only
+      the measures its metrics read (`measures_for`); both for plan 6.7's dashboard targets.
+    - One SQL statement per level computes the measures asked for (every one by default) as conditional sums over
+      the joined `dims` row (for example `demand`, `refused`, `roxy_429`) plus the histogram sums; Python then
+      re-buckets, derives ratios and percentiles. Filter and group columns are checked against a fixed list before
+      they reach SQL.
     - Honest definitions (P6) live in `metrics/catalog.py`; this module implements them: `avoided` is demand
       minus upstream calls for caller traffic; `errors_hidden` counts stale serves after an upstream failure;
       "who returned it" reads the source through `ANSWER_SOURCE_SQL` (a Roblox 5xx passed on after the retries is
@@ -953,8 +955,11 @@ def totals_sync(
     metrics: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """All measures summed over the window (one KPI value per measure), or with `metrics` only those (the answer
-    then holds just those keys; `measures_for` decides what is summed)."""
-    measures, hists = measures_for(metrics) if metrics is not None else (None, None)
+    then holds just those keys; `measures_for` decides what is summed). `rotator_bytes` is read from `egress_usage`
+    below, so asking for it narrows the rollup sums like any metric they compute."""
+    measures, hists = (None, None)
+    if metrics is not None:
+        measures, hists = measures_for([metric for metric in metrics if metric != "rotator_bytes"])
     data = collect(conn, window, filters=filters, bucketed=False, measures=measures, hists=hists)
     totals = Totals.zero()
     for item in data.values():
@@ -972,6 +977,29 @@ def totals_sync(
             return out
     out["rotator_bytes"] = egress_bytes(conn, window).get("rotator", 0)
     return out
+
+
+REQUESTS_PROBE_SQL = "SELECT 1 FROM {table} WHERE bucket_start >= ? AND bucket_start < ? AND requests > 0 LIMIT 1"
+"""One rollup level asked whether it holds a request in a range (`requests_recorded`): a range search of the level's
+primary key (`bucket_start` first) that stops at the first row with a request."""
+
+
+def requests_recorded(conn: sqlite3.Connection, window: Window) -> bool:
+    """Whether the rollups hold any request in `window`: what `totals_sync(conn, window, metrics=("requests",))`
+    answers with a count above zero (a request count is never negative), asked of the same pieces (`total_pieces`)
+    with one existence probe each (`REQUESTS_PROBE_SQL`) instead of a sum.
+
+    Why: `answers_notice` asks it of every KPI read (each Overview load and KPI refresh). On an install that upgraded
+    with history, the window before the upgrade is most of the range, and the sum read every day, hour and minute row
+    of it to learn whether one was there (12 ms of the 90 day KPI card at plan 6.6's volume, final review perf
+    lane). A probe stops at the first row with a request, so its work does not grow with the range or the traffic.
+    """
+    for table, lo, hi in total_pieces(conn, window):
+        # `table` is one of `LEVEL_ORDER` (`total_pieces` names nothing else), never caller text.
+        found = conn.execute(REQUESTS_PROBE_SQL.format(table=table), (lo, hi)).fetchone()
+        if found is not None:
+            return True
+    return False
 
 
 def answer_source_counts(conn: sqlite3.Connection, window: Window) -> list[dict[str, Any]]:
@@ -1056,6 +1084,8 @@ moved to the `cleared` state, requests kept; finding parity-8) makes them partia
 CACHE_STATE_PART = "cache_state"
 LAST_HOUR_KPIS: tuple[str, ...] = ("requests_last_hour", "failures_last_hour")
 """Tiles of the trailing hour, whatever range is selected (the Overview's v1 tiles 10 and 11)."""
+LAST_HOUR_MEASURES: tuple[str, ...] = ("requests", "failed")
+"""The measures the last-hour tiles count (`requests_last_hour`, `failures_last_hour`), in that order."""
 
 
 def kpi_tables(key: str) -> tuple[str, ...]:
@@ -1170,11 +1200,16 @@ def kpis_sync(conn: sqlite3.Connection, window: Window, *, now: float, compare: 
     misleading number. Other tiles keep their delta. The page `notices` list only resets that touched a tile.
     The last-hour tiles (`LAST_HOUR_KPIS`: `requests_last_hour`, `failures_last_hour`) are checked over their hour
     and the hour before (the Overview compares the two).
+
+    Each total sums only what its tiles show (`totals_sync(metrics=)`): the KPI keys need the latency histograms for
+    `p95_ms` but never the queue wait ones, and the last hour needs two counts. Decoding every histogram blob of a
+    90 day window in Python was most of the KPI card's time and holds the GIL the page's other reader thread needs
+    (plan 6.7; final review perf lane).
     """
-    current = totals_sync(conn, window)
+    current = totals_sync(conn, window, metrics=KPI_KEYS)
     last_hour = Window(int(now) - 3600, int(now) + 1, "minute", window.tz)
     tiles: dict[str, Any] = {key: {"value": current.get(key)} for key in KPI_KEYS}
-    hour_totals = totals_sync(conn, last_hour)
+    hour_totals = totals_sync(conn, last_hour, metrics=LAST_HOUR_MEASURES)
     tiles["requests_last_hour"] = {"value": hour_totals["requests"]}
     # v1's twin tile (finding parity-2): failed outcomes in the same trailing hour, so the live stream carries it.
     tiles["failures_last_hour"] = {"value": hour_totals["failed"]}
@@ -1183,7 +1218,7 @@ def kpis_sync(conn: sqlite3.Connection, window: Window, *, now: float, compare: 
     result: dict[str, Any] = {"window": _window_dict(window), "tiles": tiles}
     if compare:
         other = comparison_window(window, compare)
-        previous = totals_sync(conn, other)
+        previous = totals_sync(conn, other, metrics=KPI_KEYS)
         for key in KPI_KEYS:
             tiles[key].update(_delta(current.get(key), previous.get(key)))
         result["compare"] = {"mode": compare, "window": _window_dict(other)}
@@ -1247,7 +1282,7 @@ def answers_notice(conn: sqlite3.Connection, windows: Iterable[Window], *, now: 
         if window.start >= end:
             continue
         before = Window(window.start, end, "minute" if end - window.start <= 86_400 else "hour", window.tz)
-        if int(totals_sync(conn, before, metrics=("requests",)).get("requests") or 0) > 0:
+        if requests_recorded(conn, before):
             return (
                 f"Roblox's answers are counted since {_when(since, window.tz)}; requests before then are not in "
                 "this number."
@@ -1364,13 +1399,22 @@ def top_rows_sync(
     *,
     filters: Mapping[str, Any] | None = None,
     search: str = "",
+    metrics: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Every row of `top_n_sync` (one per value of `dimension`, every measure), unsorted and unpaged: one read for
-    a caller that needs them all (the insights rules, gaps_insights G7: paging re-ran the whole aggregate per page)."""
-    data = collect(conn, window, filters=filters, group_by=dimension, bucketed=False)
+    a caller that needs them all (the insights rules, gaps_insights G7: paging re-ran the whole aggregate per page).
+
+    With `metrics`, each row holds only those numbers and `key`, and only what they read is summed (`measures_for`,
+    as `totals_sync`): a card that shows two counts decodes no histogram (the Overview's Outcomes card spent most of
+    its 90 day read decoding latency and queue wait blobs it never shows; final review perf lane). The rows are the
+    same groups either way."""
+    measures, hists = measures_for(metrics) if metrics is not None else (None, None)
+    data = collect(conn, window, filters=filters, group_by=dimension, bucketed=False, measures=measures, hists=hists)
     found_429 = _count_429(conn, window, group_col=dimension, bucketed=False, filters=filters)
     counts_429 = found_429 or {}
-    found_answers = _count_answers(conn, window, group_col=dimension, bucketed=False, filters=filters)
+    found_answers = None
+    if _wants_answers(metrics):
+        found_answers = _count_answers(conn, window, group_col=dimension, bucketed=False, filters=filters)
     answer_counts = found_answers or {}
     rows: list[dict[str, Any]] = []
     # The rows are the groups callers' traffic or the 429 log made; Roblox's answers fill them in (a group with answers
@@ -1382,6 +1426,9 @@ def top_rows_sync(
             roblox_429=counts_429.get((None, key), 0) if found_429 is not None else None,
             answers=answer_counts.get((None, key), (0, 0, 0)) if found_answers is not None else None,
         )
+        if metrics is not None:
+            # A measure left out of the sums reads 0 in `Totals`, so what was not asked for is not shown either.
+            row = {metric: row.get(metric) for metric in metrics}
         row["key"] = key
         if search and search.lower() not in str(key).lower():
             continue
@@ -1396,20 +1443,31 @@ def top_n_sync(
     *,
     page: Page | None = None,
     filters: Mapping[str, Any] | None = None,
+    metrics: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """One row per value of `dimension` with every measure, sorted and paged on the server."""
+    """One row per value of `dimension` with every measure (or only `metrics` and the sort key, see
+    `top_rows_sync`), sorted and paged on the server."""
     page = (page or Page()).checked()
-    return _paged(top_rows_sync(conn, window, dimension, filters=filters, search=page.search), page)
+    if metrics is not None and page.sort != "key":
+        metrics = list(dict.fromkeys((*metrics, page.sort)))  # the rows are ordered by it
+    return _paged(top_rows_sync(conn, window, dimension, filters=filters, search=page.search, metrics=metrics), page)
 
 
 async def top_n(db: Database, window: Window, dimension: str, **kwargs: Any) -> dict[str, Any]:
     return await db.read(lambda conn: top_n_sync(conn, window, dimension, **kwargs))
 
 
-def endpoint_table_sync(conn: sqlite3.Connection, window: Window, *, page: Page | None = None,
-                        filters: Mapping[str, Any] | None = None) -> dict[str, Any]:  # fmt: skip
-    """The Endpoints page table: per template volume, upstream calls, hit ratio, 429s, latency (plan 14.1)."""
-    return top_n_sync(conn, window, "endpoint_template", page=page, filters=filters)
+def endpoint_table_sync(
+    conn: sqlite3.Connection,
+    window: Window,
+    *,
+    page: Page | None = None,
+    filters: Mapping[str, Any] | None = None,
+    metrics: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """The Endpoints page table: per template volume, upstream calls, hit ratio, 429s, latency (plan 14.1); with
+    `metrics`, only those columns (`top_n_sync`)."""
+    return top_n_sync(conn, window, "endpoint_template", page=page, filters=filters, metrics=metrics)
 
 
 async def endpoint_table(db: Database, window: Window, **kwargs: Any) -> dict[str, Any]:
@@ -2149,6 +2207,13 @@ def visitor_kpis(conn: sqlite3.Connection, window: Window) -> dict[str, int]:
         "WHERE type = 'visit' AND at_ms >= ? AND at_ms < ? GROUP BY page, visitor",
         (window.start * 1000, window.end * 1000),
     ).fetchall()
+    return visit_totals((r["page"], r["visitor"], r["n"]) for r in rows)
+
+
+def visit_totals(rows: Iterable[tuple[Any, Any, Any]]) -> dict[str, int]:
+    """The Visitors card's numbers from `(page, visitor, n)` sums of visit events: `visitor_kpis` sums them by page
+    and visitor, `read_dashboard.visit_reads` from the sparkline's rows (any split of the same events adds up to the
+    same numbers; the owner's discounted admin visits are clamped at zero once, on the total)."""
     out = {
         "human_visitors": 0,
         "crawler_visitors": 0,
@@ -2158,9 +2223,8 @@ def visitor_kpis(conn: sqlite3.Connection, window: Window) -> dict[str, int]:
         "robots_crawls": 0,
         "sitemap_crawls": 0,
     }
-    for r in rows:
-        n = int(r["n"] or 0)
-        page, visitor = r["page"], r["visitor"]
+    for page, visitor, count in rows:
+        n = int(count or 0)
         if page == "home":
             out["home_visits"] += n
             if visitor in ("human", "crawler", "unknown"):

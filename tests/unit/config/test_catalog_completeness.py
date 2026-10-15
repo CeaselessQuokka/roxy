@@ -299,6 +299,7 @@ PLAN_H = [
     "email_cooldown",
     "alert_webhook_enabled",
     "alert_min_severity",
+    "alert_digest_enabled",  # owner answer A4 (2026-10-14): the digest's own switch, on by default
     "alert_digest_hour",
     "alert_rate_limit_per_hour",
     "health_auto_interval_h",

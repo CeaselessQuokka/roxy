@@ -251,8 +251,8 @@ The release at 200 requests a second: the three interleaved steady runs and the 
 | Abuse transaction p50 under 0.5 ms, p99 under 3 ms at 200 rps | running system: hot.db writes p50 0.15 to 0.45 ms, p99 22.8 to 92.3 ms (sampled), lock hold p99 in the 10 to 50 ms buckets; the hot.db write alone (four processes at 200 a second): p50 0.18, p99 1.32 ms | p50 met; **p99 not met** in the running system |
 | Upstream transaction p99 under 3 ms at 20 misses a second | not separated from the abuse writes | **not measured** |
 | Metrics flush of 2 s of traffic under 50 ms | p50 20.9 to 33.4 ms, max 176 to 873 ms (sampled) | p50 met; **max not met** |
-| Dashboard first render under 300 ms | see "Quiet run: dashboard pages": every page at its default range under 300 ms at p95 except Overview in the quiet unpinned run (377 ms; first load after a start 430 ms); two cards over 300 ms at p95 in every run; Overview at 90 days 323 to 510 ms at p95 | **not met** for Overview (one run at the default range, every run at 90 days) and two cards |
-| Any chart query over 90 days under 500 ms | every chart route at the UI's granularity 205.2 ms or less at p95; two Protection cards and Overview at 90 days on 2 CPUs with load over; hourly points (API only) over | met for the UI's chart routes; **not met** for the cards and hourly points listed below |
+| Dashboard first render under 300 ms | see "Quiet run: dashboard pages": every page at its default range under 300 ms at p95 except Overview in the quiet unpinned run (377 ms; first load after a start 430 ms); two cards over 300 ms at p95 in every run; Overview at 90 days 323 to 510 ms at p95 | **not met** for Overview (one run at the default range, every run at 90 days) and two cards; the two cards and the Overview's reads fixed since at read level ("Dashboard pages" > "Third pass"), the page run is pending |
+| Any chart query over 90 days under 500 ms | every chart route at the UI's granularity 205.2 ms or less at p95; two Protection cards and Overview at 90 days on 2 CPUs with load over; hourly points (API only) over | met for the UI's chart routes; **not met** for the cards and hourly points listed below (the two Protection cards and the Overview's reads fixed since at read level, "Third pass") |
 
 ### Quiet run: dashboard pages
 
@@ -295,7 +295,8 @@ run:
 | Audit (1) | 26 / 29 | 24 / 26 | 30 / 50 | 28 / 38 | log 12 / 13 |
 
 Fragments over 300 ms at p95, in every run: Clients > IP addresses (747, 656, 833 and 725 ms in the order of the
-columns) and Protection > Refusal reasons (389, 343, 547 and 491 ms).
+columns) and Protection > Refusal reasons (389, 343, 547 and 491 ms). Both are traced and fixed since (see "Slower
+than the second pass" below).
 
 Pages at `range=90d`, p50 / p95 in ms, 3 rounds:
 
@@ -324,15 +325,32 @@ day cards and routes over 500 ms at p95 (4, 3, 9 and 5 in the four runs):
 | Traffic bytes, status by source, verbs, hourly points | under 500 | under 500 | 573, 526 and 521 at p95 | under 500 |
 
 **Slower than the second pass** (the gaps lane's "after", 2026-10-11, on a busier machine and another template of
-the same volume, so the drop is not the machine):
+the same volume, so the drop is not the machine). All three were traced and fixed after this run ("Dashboard pages" >
+"Third pass" below); the fixes are measured at read level on this run's template, so the page figures here stay
+those of the run until the page scenario runs again:
 
 - Clients > IP addresses at the default range: 630 to 723 ms p50 (656 to 833 at p95) against 92 / 98 quiet then; the
-  Clients whole view 920 to 1,044 ms p50 against 384. Not traced in this run; the final review made the client tables
-  stream in key order through a bounded heap (finding memory-2, `CHANGES.md` "Final review"), the first suspect.
-- Protection > Refusal reasons at the default range: 335 to 400 ms p50 (343 to 547 at p95) against 123 / 132; cause
-  not traced.
+  Clients whole view 920 to 1,044 ms p50 against 384. **Cause: planner statistics, not memory-2.** The `sqlite_stat1`
+  rows `PRAGMA optimize` wrote for the client tables made SQLite skip-scan `client_minute_pair_place` for each
+  address's peer count (every pair row of the window, 23 to 26 ms an address); 84ab636, before the final review, is
+  as slow on the same database. **Fixed:** the address peer reads name `client_*_client` with `INDEXED BY` and read
+  only the key: the card's read 706 to 70 ms p50 (794 to 95 at p95); expected on the page about 90 ms p50.
+- Protection > Refusal reasons at the default range: 335 to 400 ms p50 (343 to 547 at p95) against 123 / 132.
+  **Cause: the same.** The card's second table ("Addresses Roxy refused most") is the Clients address read with
+  peers for 10 addresses; the reasons table itself takes 35 ms. **Fixed by the same change:** the card's reads 330
+  to 99 ms; expected on the page about 140 ms p50.
+- The attempts tabs at 90 days (Request filters 548 to 616 ms p50, Endpoint blocks 486 to 526 in three runs, below;
+  open since the second pass). **Cause:** SQLite walked every refusal of the window (1.09 million) to keep one
+  reason's, twice (count, then page). **Fixed:** one reason's index ranges of `events_refusal_sources` and one
+  grouping a page: Request filters 541 to 122 ms, Endpoint blocks 478 to 78, Endpoint rules 380 to 0 at read level.
 - Overview at 90 days: 313 to 491 ms p50 against 263 / 265 quiet in the earlier passes; Overview at the default
-  range in the quiet unpinned run, p95 377 ms against 174 (p50 163 against 140).
+  range in the quiet unpinned run, p95 377 ms against 174 (p50 163 against 140). **Cause:** one final review cost
+  (the Roblox tiles' "since" notice summed the range's requests from before metrics 0010: 12.4 ms at 90 days); the
+  rest is this run's time of day (17.6 hours into the local day: about 16 percent more `rollup_hour` rows in a 90 day
+  sum than in the second pass) and the machine; the 377 ms is one sample of 20 that landed in the leader during a
+  931 ms recommendations evaluation. **Fixed and cut further:** an existence probe for the notice (2.2 ms), and the
+  Overview's reads sum only what their cards show: every eager card on two reader threads 384 to 191 ms at 90 days,
+  136 to 99 at 24 hours; expected on the page about 190 to 200 ms at 90 days.
 
 ### Quiet run: the recommendations evaluation
 
@@ -363,14 +381,17 @@ longer exists and was not measured again.
 4. A metrics flush under 50 ms: the longest sampled flush 176 to 873 ms (the median 20.9 to 33.4 ms meets it).
 5. The upstream transaction, p99 under 3 ms at 20 misses a second: still not measured on its own.
 6. Dashboard first render under 300 ms: Overview at p95 377 ms in the quiet unpinned run and 430 ms on the first
-   load after a start; Overview at 90 days 323 to 510 ms at p95 in every run.
+   load after a start; Overview at 90 days 323 to 510 ms at p95 in every run. Since the run (read level, "Third
+   pass"): the Overview's reads at 90 days 384 to 191 ms; the 377 ms was one sample during a recommendations
+   evaluation in the leader, which can still happen.
 7. Cards over 300 ms at p95 at the default range, in every run: Clients > IP addresses 656 to 833 ms and Protection >
-   Refusal reasons 343 to 547 ms, both much slower than in the second pass.
+   Refusal reasons 343 to 547 ms, both much slower than in the second pass. Since the run: traced to the planner
+   statistics and fixed (read level: 706 to 70 ms and 330 to 99 ms).
 8. 90 days under 500 ms: Protection > Request filters 554 to 628 ms at p95 in every run, Endpoint blocks 525 to 545
-   ms in three runs, the Overview page 510 ms on 2 CPUs with load; at hourly points (an API option the UI never
-   sends) Traffic latency 610 to 826 ms and Traffic latency by egress 586 to 989 ms in every run, Upstream latency
-   603 ms on 2 CPUs with load and 525 ms with load, and on 2 CPUs with load Traffic bytes 573, status by source 526
-   and verbs 521 ms.
+   ms in three runs (since the run, read level: 541 to 122 ms and 478 to 78 ms), the Overview page 510 ms on 2 CPUs
+   with load (its reads since cut by half); at hourly points (an API option the UI never sends) Traffic latency 610
+   to 826 ms and Traffic latency by egress 586 to 989 ms in every run, Upstream latency 603 ms on 2 CPUs with load
+   and 525 ms with load, and on 2 CPUs with load Traffic bytes 573, status by source 526 and verbs 521 ms.
 9. Flood: an address served above its GCRA bound (0 allowed): 1 and 2 in the two release runs (C7 degraded mode).
 10. Roblox 429 with `Retry-After: 30`: after the first 429, one probe in 89.6 s (at 71.5 s) where the scenario
     expects about one per `Retry-After` (30 s): the endpoint made its next call about 40 s after Roblox allowed it,
@@ -1035,7 +1056,8 @@ A second pass on 2026-10-11 (the P11 gaps lane) fixed the misses the first one l
 before and after numbers on a freshly seeded template, and "Against the targets" and "Still open" are the state after
 it. "Results", "Before and after" and "What was slow" are the first pass. The release's quiet-machine reference run
 (2026-10-14) is "Quiet run: dashboard pages" above; it found two cards much slower than after the second pass (the
-Clients address table and the Protection refusals card, "Still open" below).
+Clients address table and the Protection refusals card) and the Overview slower at 90 days; "Third pass" below traces
+and fixes them (read-level measurements until the page scenario runs again), and "Still open" is the state after it.
 
 ### Running it again (quiet machine)
 
@@ -1363,16 +1385,105 @@ The cost: the indexes take 405 MiB at this volume (metrics.db 1,391 to 1,796 MiB
 holding the metrics.db write lock (the old color's flushes wait and requeue); a metrics flush of 2 s at 200 requests a
 second (160 events, 1,200 client upserts) takes 6.3 ms instead of 3.4 ms with the writer's 8 MiB cache.
 
+### Third pass: the quiet run's regressions traced and fixed (2026-10-14)
+
+After the quiet-machine reference run, one investigator per regression worked on that run's kept template (opened
+read only, never written), each against 84ab636 (before the final review) and 686fe46 (the release code), and a
+second agent per fix measured it again. **These are read-level measurements, not page scenario figures:** the real
+read functions timed in one process with the trees interleaved (for the Overview, its eager cards at once on two
+reader threads, as a page runs them), while the release's full test run used the same machine. They stand as
+estimates until the next page scenario run (`--reuse-template` on a copy of the kept template, see "Running it again
+(quiet machine)" above). Every fixed read gives the answers of the read it replaces (the tests below; on the template
+the answers were byte-identical JSON).
+
+**What was found.** None of the three regressions came from the final review's client table change (memory-2):
+84ab636 and 686fe46 take the same time on the same database.
+
+1. **Planner statistics (Clients > IP addresses and Protection > Refusal reasons).** `PRAGMA optimize` (run when the
+   writer closes and by the daily maintenance) had written `sqlite_stat1` rows for the client tables of the release's
+   template; the 2026-10-11 template never had them for its `*_pair_place` indexes. With them SQLite 3.45 answered
+   each address's peer count (the "Places" column) with a skip-scan of `client_minute_pair_place` that reads every
+   pair row of the window (about 440,000 at 24 hours): 23 to 26 ms an address, against 0.05 ms for the address's own
+   key range of `client_minute_client`. The IP addresses card counts the peers of 25 addresses; the Refusal reasons
+   card's second table ("Addresses Roxy refused most") runs the same read for 10. A production database gets the
+   same statistics from its own optimize.
+2. **The attempts tabs at 90 days** (open since the second pass). `read_protection.refusal_attempts` let SQLite pick
+   `events_type_at`, so it walked every refusal of the window (1.09 million over 90 days) to keep one reason's, and it
+   ran that grouping twice (the count, then the page): about 270 ms a statement.
+3. **The Overview.** One code regression of the final review: `queries.answers_notice` (decision 11) summed every
+   request recorded before metrics migration 0010 inside the range only to learn whether there was one. The template
+   predates its own 0010 stamp, so that was the whole range: 12.4 ms of the 90 day KPI card, 2.5 ms at 24 hours. The
+   rest of the 90 day gap is not code: the time of day of the run (a 90 day sum reads the current local day from
+   `rollup_hour`: 17.6 hours into the day against 0.6 in the second pass, about 16 percent more rows) and the machine
+   (cards the final review did not touch were 5 to 9 percent slower in the pinned run). The default range p95 of 377
+   ms is one sample of 20 that landed in the leader worker during a recommendations evaluation of 931 ms; the other
+   rounds took 155 to 223 ms.
+
+**What changed.**
+
+- `metrics/read_client_extras.py`: an address's peer reads (`peer_counts`, and `peer_list` for an address) name
+  `<level>_client` with `INDEXED BY` and select only the key, so each piece is a covering key range whatever the
+  statistics say. The place side keeps `*_pair_place`.
+- `metrics/read_protection.py`: `refusal_attempts` reads `events INDEXED BY events_refusal_sources`, one index range
+  per message source of the reason (the sources come from a loose index scan, at most 32; past that it reads every
+  entry of the reason, still by reason), and groups once per page (`count(*) OVER ()`; only a page past the last group
+  counts again).
+- `metrics/queries.py`, `metrics/read_dashboard.py`, `admin/api/overview.py`: `answers_notice` probes each piece for
+  one row with a request (`requests_recorded`, a primary key range that stops at the first one). To reach the targets
+  anyway, the Overview's reads sum only what their cards show (the KPI totals and the last hour skip histograms they
+  never show, Outcomes sums no histogram, Top endpoints only the latency one) and the Visitors card walks its visit
+  events once instead of twice at 7, 30 and 90 days in a whole-hour time zone (`visit_reads`).
+
+Read-level results in ms, median (and p95 where it was taken), 686fe46 as released against the fix:
+
+| Read | Before | After |
+|---|---|---|
+| Clients > IP addresses card's read, 24 hours (25 rows with peers) | 706 / 794 | 70 / 95 |
+| The same read at 7, 30 and 90 days | 216, 873 and 86 | 67, 267 and 49 |
+| One address's peer list (its Places, the drill-down) | 602 to 623 | 2.7 to 2.8 |
+| Peer counts of one export page of 250 addresses | 5,934 to 5,968 | 12.8 to 13.2 |
+| Protection > Refusal reasons card's reads, default range (reasons 35, refused addresses 294) | 330 | 99 |
+| Protection > Request filters attempts, 90 days | 541 | 122 / 132 |
+| Protection > Endpoint blocks attempts, 90 days | 478 | 78 / 81 |
+| Protection > Endpoint rules attempts, 90 days (the template has no event of that reason) | 380 | 0.0 |
+| The three attempts reads at 24 hours | 15, 13 and 11 | 4.2, 2.3 and 0.0 |
+| Overview builders at 90 days: KPIs, the breakdown (Outcomes, Top endpoints, Top places), Visitors | 137, 153 and 179 | 81, 73 and 91 |
+| Overview, every eager card on two reader threads, 90 days | 384 | 191 |
+| The same, 24 hours | 136 | 99 |
+
+The two Overview emulation rows come from two runs (before: n = 18; after: n = 24, where 84ab636 gave 351 and 126);
+the second agent's interleaved rerun gave 297 against 164 at 90 days (p95 304 against 171) and 133 against 106 at 24
+hours. **Expected at page level** (estimated from the reads, not measured): the IP addresses card about 90 ms p50 and
+115 at p95 (723 / 747 in the quiet run) and the Clients whole view about 410 ms p50 (1,044); the Refusal reasons card
+about 140 ms p50 (375 / 389); Request filters at 90 days about 190 ms (616 / 628) and Endpoint blocks about 125 ms
+(526 / 532); the Overview about 190 to 200 ms at 90 days (353 / 358) and about 135 ms p50 at the default range.
+
+Tests, none of them timing based: `tests/unit/metrics/test_metrics_client_extras.py`
+(`test_peer_counts_keep_their_index_ranges_whatever_the_planner_statistics` loads plan-size `sqlite_stat1` rows and
+checks every statement's `EXPLAIN QUERY PLAN`; it fails with the `INDEXED BY` removed), the new
+`tests/unit/metrics/test_metrics_attempts_read.py` (the answers equal the old two-statement read over windows, sorts,
+searches and pages; one grouping a page through `events_refusal_sources`), and "the Overview's reads" in
+`tests/unit/metrics/test_metrics_dashboard_latency.py` (the probe answers what the sum answered, the notice does under
+a tenth of the sum's work, the narrowed reads equal the full ones, the Visitors card reads once).
+
+What it costs: `INDEXED BY` makes a statement fail ("no such index") if `client_*_client` (metrics 0001) or
+`events_refusal_sources` (0009) is ever renamed or dropped; the plan tests catch that. An address's key range reads
+its pair rows of the whole level and tests the time inside the index (89 to 990 rows an address here, bounded by the
+per-bucket caps and retention). `count(*) OVER ()` keeps every group of the window before the page is cut (SQLite
+spills it to a temporary file past its cache); a page past the last group still runs two groupings, as every page did
+before.
+
 ### Still open
 
 After the second pass:
 
 - **The attempts tabs of Protection at 90 days** (Request filters 532 to 649 ms at p95, Endpoint blocks 469 to 497,
-  Endpoint rules 368 to 391): `read_protection.refusal_attempts` groups one reason's refusal events by the JSON path
-  (and methods and rule ids) and runs that grouping twice (a count and a page). One materialized grouping, or
-  indexed `detail_path` and `detail_method` columns, would halve it or better (the metrics read model owners).
+  Endpoint rules 368 to 391): **fixed in the third pass** at read level (one reason's index ranges of
+  `events_refusal_sources`, one grouping a page): Request filters 541 to 122 ms, Endpoint blocks 478 to 78, Endpoint
+  rules 380 to 0. Left: the page scenario confirmation (expected about 190 and 125 ms).
 - **Overview at 90 days under load:** 341 / 493 ms with load on 2 CPUs, 302 / 526 unpinned (the visitors card and the
-  KPI sparklines); quiet it is 263 / 265.
+  KPI sparklines); quiet it is 263 / 265. The third pass made the Overview's reads cheaper (two reader threads, every
+  eager card at 90 days: 384 to 191 ms at read level); the loaded runs are not measured again yet.
 - **Hourly points over 90 days** (API only): the two Traffic latency charts 573 to 759 ms at p95, Upstream latency
   and the endpoint drill-down up to 546 and 714 ms with load. The UI never asks for them.
 - **HTML weight above about 150 KiB:** Overview 185, Security 192, Cache and Clients 159 KiB (their eager KPI tiles,
@@ -1386,12 +1497,43 @@ After the second pass:
   entries, not a full cache.db; the request samples cover one day. Both passes ran on the development machine, not
   the production plan size; the quiet-machine rerun is done ("Quiet run: dashboard pages"), the plan size is not.
 
-Found by the quiet-machine reference run (2026-10-14, release a77122f):
+Found by the quiet-machine reference run (2026-10-14, release a77122f), then traced and fixed in the third pass
+(read-level measurements; the page figures stay those of the run until the page scenario runs again):
 
-- **Clients > IP addresses at the default range** takes 630 to 723 ms (p50; 656 to 833 at p95) against 92 / 98 after
-  the second pass, and the Clients whole view 920 to 1,044 ms against 384. Not traced; the final review's change to
-  the client tables (they stream in key order through a bounded heap, finding memory-2) is the first suspect.
-- **Protection > Refusal reasons at the default range** takes 335 to 400 ms (p50; 343 to 547 at p95) against 123 /
-  132 after the second pass. Not traced.
-- **Overview at 90 days** is over 300 ms in every run (313 to 491 ms p50, up to 510 at p95 on 2 CPUs with load), and
-  the quiet unpinned run had one Overview p95 at the default range of 377 ms.
+- **Clients > IP addresses at the default range** took 630 to 723 ms (p50; 656 to 833 at p95) against 92 / 98 after
+  the second pass, and the Clients whole view 920 to 1,044 ms against 384. **Traced: planner statistics, not
+  memory-2.** With the `sqlite_stat1` rows `PRAGMA optimize` wrote, SQLite skip-scanned `client_minute_pair_place`
+  for each address's peer count (every pair row of the window, about 25 ms an address). **Fixed:** the address peer
+  reads name `client_*_client` with `INDEXED BY` and read only the key: the card's read 706 to 70 ms p50 (95 at p95),
+  one address's peer list 0.6 s to 3 ms, an export page of 250 addresses 6 s to 13 ms. Expected on the page: about 90
+  ms p50 for the card, about 410 ms for the whole view.
+- **Protection > Refusal reasons at the default range** took 335 to 400 ms (p50; 343 to 547 at p95) against 123 /
+  132 after the second pass. **Traced: the same cause.** The reasons table itself takes 35 ms in every tree; the card's
+  second table ("Addresses Roxy refused most") is the Clients address read with peers for 10 addresses. **Fixed by
+  the same change:** the card's reads 330 to 99 ms; expected on the page about 140 ms p50.
+- **Overview at 90 days** was over 300 ms in every run (313 to 491 ms p50, up to 510 at p95 on 2 CPUs with load), and
+  the quiet unpinned run had one Overview p95 at the default range of 377 ms. **Traced:** one final review cost (the
+  Roblox tiles' "since" notice summed every request before metrics 0010 in the range: 12.4 ms at 90 days, now an
+  existence probe, 2.2 ms); the rest is the time of day of the run (more `rollup_hour` rows of the current day) and
+  the machine; the 377 ms is one sample that landed in the leader during a recommendations evaluation. **Fixed and
+  cut further:** the Overview's reads sum only what their cards show and Visitors reads its events once: every eager
+  card on two reader threads 384 to 191 ms at 90 days and 136 to 99 at 24 hours. Expected on the page: about 190 to
+  200 ms at 90 days, about 135 ms p50 at the default range.
+
+Left after the third pass:
+
+- **The page scenario has not run on the fixed code.** Every figure above is read level. To confirm: copy the kept
+  template to a fresh work directory (the kept one must not be written) and run `--reuse-template --rounds 20
+  --rounds-90d 3 --runs quiet,quiet@0-1` on an export of the fixed tree ("Running it again (quiet machine)").
+- **A page that lands in the leader during the recommendations evaluation** (0.6 to 0.9 s every 30 s here) can still
+  pass 300 ms at p95 in one sample of 20; the Overview is now about a quarter cheaper, so the overlap costs less. A
+  fix belongs to the scheduler or the insights evaluation (for example yielding between rules), not to the pages.
+- **The page scenario's template predates its own metrics 0010 stamp and holds almost no Roblox answer rows** (the
+  harness backfills outcomes, never `record_attempts`), so it neither reflects production for the "since" notice nor
+  measures the Roblox answer reads at volume. Stamping 0010 at the start of the data, or recording attempts while
+  backfilling, would fix that before the next pass.
+- **Plans that depend on the planner statistics.** The release template was the first with `sqlite_stat1` rows for
+  the 0009 indexes; the third pass pinned the read whose plan flipped (address peers) and the attempts read (which
+  never had a good plan), and found the other Overview and Protection reads as fast as before on that template. A
+  read that is fast on a fresh copy and slow after `PRAGMA optimize` is this kind of regression; its fix is an
+  `INDEXED BY` and an `EXPLAIN QUERY PLAN` test.

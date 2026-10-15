@@ -123,6 +123,8 @@ class DefaultTier:
 # The v1 rung 1 message contained an em dash; plan C5's exceptions table gives this replacement.
 DEFAULT_TIER_MESSAGE: Final = "Too many requests; please slow down."
 
+# Rungs 3 and 4 name the contact. v1 said only "contact CeaselessQuokka"; the owner's answers B13 and B15
+# (2026-10-14) add where: "on either the DevForums or Twitter" (the same contact as `site_contact_name`).
 THROTTLE_TIERS: Final[tuple[DefaultTier, ...]] = (
     DefaultTier(1.0, DEFAULT_TIER_MESSAGE, "First strike: probably just fast."),
     DefaultTier(
@@ -133,16 +135,30 @@ THROTTLE_TIERS: Final[tuple[DefaultTier, ...]] = (
     DefaultTier(
         4.0,
         "You have been harshly throttled due to bot behavior. The proxy is happy for you to scrape data, but please "
-        "respect its limits. If you need more request bandwidth, contact CeaselessQuokka.",
+        "respect its limits. If you need more request bandwidth, contact CeaselessQuokka on the DevForums or "
+        "Twitter.",
         "Third strike: says what to do about it.",
     ),
     DefaultTier(
         8.0,
-        "You are still ignoring the proxy's limits, so the wait has been extended again. Contact CeaselessQuokka if "
-        "you need more request bandwidth.",
+        "You are still ignoring the proxy's limits, so the wait has been extended again. Contact CeaselessQuokka on "
+        "the DevForums or Twitter if you need more request bandwidth.",
         "Fourth strike and beyond: the last rung repeats.",
     ),
 )
+
+# v1's own wording of rungs 3 and 4 (v1 config.DEFAULT_THROTTLE_TIERS), which named no channel. v1 saved its ladder
+# even when nobody had edited it, so an untouched v1 ladder reaches the migrator as data, not as "no ladder".
+_V1_RUNG_MESSAGES: Final[dict[int, str]] = {
+    3: (
+        "You have been harshly throttled due to bot behavior. The proxy is happy for you to scrape data, but please "
+        "respect its limits. If you need more request bandwidth, contact CeaselessQuokka."
+    ),
+    4: (
+        "You are still ignoring the proxy's limits, so the wait has been extended again. Contact CeaselessQuokka if "
+        "you need more request bandwidth."
+    ),
+}
 
 
 def throttle_tier_rows() -> list[dict[str, Any]]:
@@ -151,6 +167,19 @@ def throttle_tier_rows() -> list[dict[str, Any]]:
         {"position": index, "multiplier": tier.multiplier, "message": tier.message, "note": tier.note}
         for index, tier in enumerate(THROTTLE_TIERS, start=1)
     ]
+
+
+def v1_builtin_tier_rows() -> list[dict[str, Any]]:
+    """v1's built-in ladder as it reads after the C5 rewrite, in the shape of `throttle_tier_rows()`.
+
+    It is the v2 ladder with v1's rung 3 and 4 messages (rung 1's em dash is already the C5 replacement). The
+    migrator can compare an imported v1 ladder with it: a ladder equal to this one is v1's default, not a choice
+    the owner made, so the v2 built-in ladder (with the owner's contact wording) should stay instead of it.
+    """
+    rows = throttle_tier_rows()
+    for row in rows:
+        row["message"] = _V1_RUNG_MESSAGES.get(row["position"], row["message"])
+    return rows
 
 
 # --- Cache rules and the POST allowlist (plan 15.5) ------------------------------------------------------------------
@@ -556,4 +585,5 @@ __all__ = [
     "seed_control_defaults",
     "seed_defaults",
     "throttle_tier_rows",
+    "v1_builtin_tier_rows",
 ]

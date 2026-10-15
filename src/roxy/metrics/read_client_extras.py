@@ -24,9 +24,10 @@ How it works
     - Pair keys are `<ip>|<place>` (`rollups.pair_key`); IP keys never hold the separator, so a key splits at its
       first one. Counting distinct peers across levels is one SQL statement over the union of the pieces, so a peer
       seen in an hour row and again in a minute row counts once. The `other` row of each bucket is skipped.
-    - For IP rows the pair rows are found by key range (`<ip>|` to `<ip>}`, the index on client_type and key); for
-      place rows by the key's place part, an index range of `*_pair_place` (metrics migration 0009, a partial index
-      on that expression; it was a scan of every pair row of the window, the Clients page's slowest read, plan 6.7).
+    - For IP rows the pair rows are found by key range (`<ip>|` to `<ip>}`, the index on client_type and key, named
+      with `INDEXED BY` so the planner statistics cannot trade it for a skip-scan, see `KEY_INDEX`); for place rows by
+      the key's place part, an index range of `*_pair_place` (metrics migration 0009, a partial index on that
+      expression; it was a scan of every pair row of the window, the Clients page's slowest read, plan 6.7).
     - Peer counts come from the pair rows the top-N caps kept (`max_ip_activity_records` per bucket): under a flood
       of pairs they are lower bounds, and `PEERS_BASIS` says so.
     - Everything is bounded: keys in chunks of `KEY_CHUNK`, lists to `MAX_PEERS`, scores to the keys asked for.
@@ -59,18 +60,45 @@ PEERS_BASIS: Final = (
 SCORE_BASIS: Final = "recorded: the largest score any worker computed in the client's latest scored hour"
 _NEXT_SEPARATOR: Final = chr(ord(PAIR_SEPARATOR) + 1)
 """The character after the separator: `<ip>|` <= key < `<ip>}` is every pair key of one IP."""
+KEY_INDEX: Final = "{table}_client"
+"""The index an IP's pair rows are read through (`client_*_client`: type, key, time; metrics migration 0001).
+
+It is named with `INDEXED BY` because the planner left it once the client tables had statistics. `PRAGMA optimize`
+(on the writer's close and in the daily maintenance, plan 6.5) analyzes them, and `sqlite_stat1` then shows thousands
+of pair rows per place on `*_pair_place` (9,136 at plan 6.6's volume), so SQLite skip-scans that index for an IP
+(every place, then the window's time range: its rows come in place order, which `count(DISTINCT <place>)` likes)
+instead of reading the IP's own key range. That reads every pair row of the window for each address: 25 ms an
+address instead of 0.1 ms, 0.6 to 0.7 s for the 25 rows of Clients > IP addresses, 0.6 s for one address's peer list
+and 6 s for an export page of 250 addresses (measured on the template of the 2026-10-14 quiet-machine run; the
+2026-10-11 pass measured the card at 92 ms on a template whose 0009 indexes had no statistics yet). With the name the
+plan no longer depends on what was analyzed, and a missing index fails the statement instead of scanning."""
+ROW_COLUMNS: Final = "client_key, requests, refused, served, bucket_start"
+"""What `_union` selects for a list of peers with their numbers (`peer_list`)."""
+KEY_COLUMNS: Final = "client_key"
+"""What `_union` selects for a count of peers (`peer_counts`): only the key, so every piece is read from its index
+alone (a covering index; a UNION ALL of several levels is not flattened into the count, so each column it selects
+that the index lacks is one more table lookup per pair row)."""
 
 
-def _union(pieces: Sequence[tuple[str, int, int]], where: str, where_params: Sequence[Any]) -> tuple[str, list[Any]]:
-    """`SELECT client_key, requests, refused, served, bucket_start` of the pair rows of every piece matching
-    `where` (bound `where_params`), as one UNION ALL with its parameters in order."""
+def _union(
+    pieces: Sequence[tuple[str, int, int]],
+    where: str,
+    where_params: Sequence[Any],
+    *,
+    key_range: bool = False,
+    columns: str = ROW_COLUMNS,
+) -> tuple[str, list[Any]]:
+    """`SELECT <columns>` (`ROW_COLUMNS` or `KEY_COLUMNS`) of the pair rows of every piece matching `where` (bound
+    `where_params`), as one UNION ALL with its parameters in order. `key_range` says `where` is a range of pair keys
+    (`_ip_ranges`), read through `KEY_INDEX`."""
     parts: list[str] = []
     params: list[Any] = []
     for table, lo, hi in pieces:
+        source = f"{table} INDEXED BY {KEY_INDEX.format(table=table)}" if key_range else table
         # The pair type is written as a literal: it repeats the WHERE term of the `*_pair_place` partial indexes
         # (metrics migration 0009), which SQLite needs before it uses a partial index.
         parts.append(
-            f"SELECT client_key, requests, refused, served, bucket_start FROM {table} "  # noqa: S608 (client table names)
+            f"SELECT {columns} FROM {source} "  # noqa: S608 (client table names and the column constants above)
             f"WHERE client_type = '{PAIR_CLIENT_TYPE}' AND bucket_start >= ? AND bucket_start < ? AND client_key != ? "
             f"AND ({where})"
         )
@@ -117,9 +145,10 @@ def peer_counts(
     if client_type == "ip":
         # One statement per address, each an indexed range (`client_minute_client` is ordered by type, key, time):
         # SQLite does not turn an OR of ranges into index seeks, so one statement with them all read every pair row
-        # of the window (0.2 s for a page of 25 addresses at plan 6.6's volume; plan 6.7).
+        # of the window (0.2 s for a page of 25 addresses at plan 6.6's volume; plan 6.7). The index is named
+        # (`KEY_INDEX`): with statistics the planner skip-scanned `*_pair_place` instead, 0.6 s for the same page.
         for key in wanted:
-            union, params = _union(pieces, *_ip_ranges([key]))
+            union, params = _union(pieces, *_ip_ranges([key]), key_range=True, columns=KEY_COLUMNS)
             row = conn.execute(f"SELECT count(DISTINCT {peer}) FROM ({union})", params).fetchone()  # noqa: S608
             if row is not None and row[0]:
                 out[key] = int(row[0])
@@ -127,7 +156,7 @@ def peer_counts(
     for first in range(0, len(wanted), KEY_CHUNK):
         chunk = wanted[first : first + KEY_CHUNK]
         where, where_params = _matching(client_type, chunk, own)
-        union, params = _union(pieces, where, where_params)
+        union, params = _union(pieces, where, where_params, columns=KEY_COLUMNS)
         rows = conn.execute(
             f"SELECT {own} AS k, count(DISTINCT {peer}) AS n FROM ({union}) GROUP BY k",  # noqa: S608 (constants)
             params,
@@ -153,7 +182,7 @@ def peer_list(
     if not key or key == OTHER_KEY or not pieces:
         return {"total": 0, "items": [], "basis": PEERS_BASIS}
     where, where_params = _matching(client_type, [key], own)
-    union, params = _union(pieces, where, where_params)
+    union, params = _union(pieces, where, where_params, key_range=client_type == "ip")
     grouped = (
         f"SELECT {peer} AS peer, sum(requests) AS requests, sum(refused) AS refused, sum(served) AS served, "  # noqa: S608
         f"max(bucket_start) AS last_seen FROM ({union}) WHERE {own} = ? GROUP BY peer"

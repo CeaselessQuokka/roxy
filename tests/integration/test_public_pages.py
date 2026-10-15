@@ -252,11 +252,59 @@ async def test_home_uses_details_for_collapsibles_and_site_text(client: httpx.As
     text = (await client.get("/")).text
     assert text.count("<details open>") >= 4
     assert "<summary><h2" in text
-    assert "$10-$250 USD" in text  # site_bug_bounty_text default
     assert "FastAPI and Uvicorn" in text  # site_hosting_note default (D18 rewrite)
     assert "Python and Flask" not in text
     assert "<small>Roxy Proxy 2025-Present</small>" in text  # site_footer_text default
     assert "CeaselessQuokka" in text  # site_contact_name default
+
+
+def _flat_text(page: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", page)))
+
+
+async def test_home_follows_the_owner_answers_on_contact_bounty_and_support(client: httpx.AsyncClient) -> None:
+    """Owner answers B13 and B15 (2026-10-14): "No bug bounty, no support link, but if they need something extra or
+    are having an issue to contact CeaselessQuokka on either the DevForums or Twitter"; the footer stays. Both texts
+    ship empty, and an empty text leaves no heading, rule or sentence behind."""
+    page = (await client.get("/")).text
+    text = _flat_text(page)
+    assert "Need something extra, or having an issue? Contact CeaselessQuokka on the DevForums or Twitter." in text
+    assert "White Hats can read about vulnerability reporting below" in text  # no "and rewards"
+    assert "reward" not in text.lower()
+    assert "bounty" not in text.lower()
+    assert "$10-$250" not in text
+    safety = page.split('id="tokenSafetyHeading"', 1)[1].split("</section>", 1)[0]
+    assert "<hr" not in safety
+    assert safety.count('class="site-text') == 1  # the white hats text only
+    assert '<a href="/docs#11-reporting-a-security-problem">guide</a>' in safety
+    assert "supportHeading" not in page
+    assert "Support Me" not in page
+    assert "donate" not in text
+    assert "<small>Roxy Proxy 2025-Present</small>" in page
+
+
+async def test_home_shows_the_bounty_and_support_sections_when_their_texts_are_set(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    await update_settings(
+        app,
+        {
+            "site_bug_bounty_text": "Rewards from 10 USD for serious reports.",
+            "site_support_links": "Tag me in what you make. [My plugin](https://example.com/plugin)",
+        },
+    )
+    page = (await client.get("/")).text
+    text = _flat_text(page)
+    assert "White Hats can read about vulnerability reporting and rewards below" in text
+    safety = page.split('id="tokenSafetyHeading"', 1)[1].split("</section>", 1)[0]
+    assert "<hr />" in safety
+    assert "<p>Rewards from 10 USD for serious reports.</p>" in safety
+    support = page.split('id="supportHeading"', 1)[1].split("</section>", 1)[0]
+    assert ">Support Me</h2>" in support
+    assert '<a href="https://example.com/plugin">My plugin</a>' in support
+    docs = _flat_text((await client.get("/docs")).text)
+    assert "Serious reports are rewarded" in docs
+    assert "There is no bug bounty" not in docs
 
 
 async def test_home_site_text_settings_are_live_and_escaped(app: FastAPI, client: httpx.AsyncClient) -> None:

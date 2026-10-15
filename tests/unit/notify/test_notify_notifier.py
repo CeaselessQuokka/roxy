@@ -65,7 +65,7 @@ def _notifier(
 
 async def test_severity_routing(dbs: Any, fake_clock: FakeClock) -> None:
     notifier, mail = _notifier(dbs, fake_clock)
-    assert (await notifier.send(make_alert("digest", summary="s", n=1, day="d"))).skipped == "severity"
+    assert (await notifier.send(make_alert("test_alert", summary="s"))).skipped == "severity"  # info is below warn
     assert (await notifier.send(make_alert("roblox_429", summary="s", rate=3))).sent == ("email",)
     # always_send ignores alert_min_severity (new admin login, info level).
     critical_only, mail2 = _notifier(dbs, fake_clock, settings=Settings(alert_min_severity="critical"))
@@ -73,6 +73,29 @@ async def test_severity_routing(dbs: Any, fake_clock: FakeClock) -> None:
     assert (await critical_only.send(make_alert("caller_5xx", summary="s", rate=3))).skipped == "severity"
     assert mail.subjects() == ["Roxy: Roblox is rate-limiting us (3%)"]
     assert mail2.subjects() == ["Roxy Admin Login"]
+
+
+async def test_the_digest_passes_any_severity_filter_and_the_hourly_cap_but_nothing_else_does(
+    dbs: Any, fake_clock: FakeClock
+) -> None:
+    # Owner answer A4: the digest goes out whatever alert_min_severity says (its own switch decides), and the hourly
+    # cap never holds it back (one a day; its day is claimed before the send). Only the digest gets that.
+    notifier, mail = _notifier(dbs, fake_clock, settings=Settings(alert_min_severity="critical"))
+    assert notifier.passes_severity(make_alert("digest", summary="s", n=1, day="d"))
+    assert not notifier.passes_severity(make_alert("test_alert", summary="s"))  # info, not scheduled
+    assert not notifier.passes_severity(make_alert("roblox_429", summary="s", rate=3))  # warn under critical
+    capped, mail2 = _notifier(dbs, fake_clock, settings=Settings(alert_rate_limit_per_hour=2))
+    results = [await capped.send(make_alert("error", summary="s", signature=f"E{i}")) for i in range(3)]
+    assert [r.skipped for r in results] == [None, None, "capped"]
+    digest = await capped.send(make_alert("digest", summary="daily", n=1, day="2026-10-15"))
+    assert digest.sent == ("email",)
+    assert digest.suppressed == 1  # the first message out still reports the storm
+    assert (await capped.send(make_alert("error", summary="s", signature="E9"))).skipped == "capped"  # cap kept
+    again = await capped.send(make_alert("digest", summary="daily", n=1, day="2026-10-15"))
+    assert again.skipped == "deduped"  # the `digest:<day>` key still dedupes: one a day
+    assert (await notifier.send(make_alert("digest", summary="daily", n=1, day="2026-10-16"))).sent == ("email",)
+    assert mail.subjects() == ["Roxy daily digest: 1 open recommendations"]
+    assert mail2.subjects()[-1] == "Roxy daily digest: 1 open recommendations"
 
 
 async def test_two_workers_send_one_alert(dbs: Any, fake_clock: FakeClock) -> None:

@@ -1264,8 +1264,8 @@ A row opens the rule's **Tune** drawer:
   risk and history. Every rule has **rule enabled** (`insight_<rule>_enabled`, on by default) and **severity**
   (`insight_<rule>_severity`: Automatic, the recommended default, keeps the rule's own severity; Info, Warn or
   Critical force one level). The severity orders the Recommendations page and the bell; Roxy sends no alert for a
-  recommendation, so a rule you must never miss needs the page checked (or `alert_min_severity` at info, which also
-  emails the daily digest that counts open recommendations). Most rules also have thresholds, for example
+  recommendation, so a rule you must never miss needs the page checked (the daily digest, on by default, also counts
+  the open ones). Most rules also have thresholds, for example
   **UP-429-ENDPOINT: Roblox 429s on one
   endpoint** (`insight_up_429_endpoint_min_429s`, 20 by default). Change a value, press **Review**, check the
   before and after, add a reason if you like, and save; it is in force on every worker within a second and written
@@ -5341,8 +5341,9 @@ ticked if you want an exact match).
 
 ### The Alerts card
 
-Where alerts go and how often. The same six settings are on System > Alerts; change them in either place. Alerts are
-deduplicated by their cooldown and capped per hour across all workers; a leak guard alert is never held back. The
+Where alerts go and how often. The same seven settings are on System > Alerts; change them in either place. Alerts
+are deduplicated by their cooldown and capped per hour across all workers; a leak guard alert and the daily digest
+are never held back. The
 channels themselves (the email password and addresses, the webhook address) are credentials on the server, not
 settings: System > Alerts shows which exist. **Send test alert** posts one real low-severity message to every
 configured channel (one a minute, within the hourly cap; see [Testing that alerts arrive](#testing-that-alerts-arrive)).
@@ -5351,7 +5352,8 @@ configured channel (one a minute, within the hourly cap; see [Testing that alert
 |---|---|---|---|
 | Lowest alert severity sent | `alert_min_severity` | Warnings and above | Alerts below this level are not sent. "Info and above" is noisy; "Critical only" is high risk because slow problems (Roblox rate limiting, a failed backup, a filling disk) would reach you late. New admin login emails are always sent. |
 | Alert limit per hour | `alert_rate_limit_per_hour` | 20 messages per channel per hour | Alerts over the limit are held back and counted; the next message says how many were suppressed. |
-| Daily digest hour | `alert_digest_hour` | 9 | The hour (in the dashboard time zone) of the daily digest email: open recommendations, failing health checks and the Roblox rate limiting numbers. -1 turns it off. The digest is info, so it is emailed only while `alert_min_severity` is info. |
+| Send the daily digest | `alert_digest_enabled` | On | Emails a daily summary: open recommendations, failing health checks and the Roblox rate limiting numbers. It is sent whatever `alert_min_severity` says, and the hourly limit never holds it back (it is one email a day). Switch it off here. |
+| Daily digest hour | `alert_digest_hour` | 9 | The hour (0 to 23, in the dashboard time zone, New York by default) at which the daily digest is emailed. |
 | Send alerts to webhook | `alert_webhook_enabled` | Off | Also post alerts to a webhook (for example a Discord channel). The address is the server credential `alert_webhook_url`. |
 | Credential alert cooldown | `email_cooldown` | 600 seconds | The least time between two alerts about the Roblox credential. |
 | Error alert cooldown | `error_email_cooldown` | 300 seconds | The least time between two alerts about the same Roxy error, shared by every worker. |
@@ -5366,11 +5368,11 @@ settings card this card is the only place to edit them. The card loads as it scr
 
 | Setting | Key | What it changes |
 |---|---|---|
-| Bug bounty text | `site_bug_bounty_text` | The bug bounty paragraph on the home page. It names amounts of money, so keep it current. |
-| Contact name | `site_contact_name` | Who the public site tells visitors to contact. Use a public handle, never a private email address or phone number. |
+| Bug bounty text | `site_bug_bounty_text` | The bug bounty paragraph on the home page. Empty by default (no bug bounty): the home page leaves the paragraph out and the user guide says there is none. A text you set names amounts of money, so keep it current; v1's paragraph is in the setting's notes. |
+| Contact name and where to reach them | `site_contact_name` | Who the public site tells visitors to contact, and where (by default "CeaselessQuokka on the DevForums or Twitter"). It completes "Contact ..." sentences. Plain text: use public handles and places only, never a private email address or phone number. |
 | Footer text | `site_footer_text` | The small line at the bottom of every public page. |
 | Hosting and costs note | `site_hosting_note` | The "Roxy internals" section of the home page. |
-| Support and 'also by the author' text | `site_support_links` | The "Support me" section of the home page, with links to your other projects. |
+| Support and 'also by the author' text | `site_support_links` | The "Support me" section of the home page, with links to your other projects. Empty by default: the home page leaves the section out. |
 | No login required and white hats text | `site_white_hats_text` | The home page section that warns visitors never to send their .ROBLOSECURITY cookie. |
 | Public status page | `public_status_page_enabled` | Turns the public `/status` page on (the default) or off. |
 | Allow browsers on any website (CORS) | `public_cors_allow_any_origin` | Off by default and high risk: on, any website can use Roxy from its visitors' browsers as a free API. Game servers never need it. |
@@ -6676,7 +6678,7 @@ runbook the alert belongs to.
 | `Roxy: auto-applied change rolled back` | warn | a change Roxy applied by itself made things worse, so Roxy undid it | once a day per recommendation | [Auto-applied change rolled back](/admin/help/runbooks#auto-applied-change-rolled-back) |
 | `Roxy: auto-applied change could not be rolled back` | critical | the same, but the undo was refused, so the change is still in place | once a day per recommendation | [Auto-applied change rolled back](/admin/help/runbooks#auto-applied-change-rolled-back) |
 | `Roxy: login attempts throttled globally` | warn | more than `admin_login_global_max_per_min` (30) sign-in attempts in one minute | once an hour | [Login attempts throttled](/admin/help/runbooks#login-attempts-throttled) |
-| `Roxy daily digest: <n> open recommendations` | info | at `alert_digest_hour` (9, in the dashboard time zone): open recommendations, the latest health run's failing checks and the Roblox 429 numbers of the last 24 hours | once a day | [Daily digest](/admin/help/runbooks#daily-digest) |
+| `Roxy daily digest: <n> open recommendations` | info | while `alert_digest_enabled` is on (the default), at `alert_digest_hour` (9, in the dashboard time zone): open recommendations, the latest health run's failing checks and the Roblox 429 numbers of the last 24 hours | once a day, never held back by the hourly cap | [Daily digest](/admin/help/runbooks#daily-digest) |
 | `Roxy DOWN: <unit> failed on <host>` | critical | a Roxy color, the nightly backup or the file permission audit failed under systemd | once per unit every 10 minutes | [Service down](/admin/help/runbooks#service-down) |
 | `Roxy: deploy <short sha> failed at step <n>` | critical | a deploy stopped at one of its steps | once per commit every 10 minutes | [Deploy failed](/admin/help/runbooks#deploy-failed) |
 | `Roxy: test alert` | the lowest severity sent | you pressed Send test alert on the Settings page's Alerts card | once a minute | none: nothing needs doing |
@@ -6684,9 +6686,8 @@ runbook the alert belongs to.
 ### What keeps alerts quiet
 
 - **Severity.** `alert_min_severity` (default warn) is the lowest severity sent. The admin login email and the leak
-  guard alert are always sent, whatever it says. The daily digest is info, so under the default it is not sent at
-  all; set `alert_min_severity` to info if you want it (and `alert_digest_hour` to -1 if you never do). The digest is
-  the only alert that info adds, because the admin login email is sent anyway. Critical only is marked high risk,
+  guard alert are always sent, whatever it says. The daily digest has its own switch, `alert_digest_enabled` (on by
+  default), and is sent whatever this says. Critical only is marked high risk,
   because slow problems (rate limiting, failing backups, a filling disk) raise only warnings.
 - **Cooldowns.** Once an alert goes out, the same alert waits its gap from the table before it is sent again. Two of
   those gaps are settings: `error_email_cooldown` (300 s, the error and all upstream methods alerts) and
@@ -6981,8 +6982,8 @@ allowlist keeps you out ([Admin locked out](/admin/help/runbooks#admin-locked-ou
   `roxyctl flush-metrics`
 - `settings show` and `settings set`: read settings (all of them, or the keys you name), or change them through the
   same checks as the Settings page, as `KEY=VALUE` pairs; a high-risk setting or value also needs `--reason` and
-  `--confirm-high-risk`. Example: `roxyctl settings show alert_min_severity`,
-  then `roxyctl settings set alert_min_severity=info --reason "send the daily digest"`
+  `--confirm-high-risk`. Example: `roxyctl settings show alert_digest_hour`,
+  then `roxyctl settings set alert_digest_hour=7 --reason "the daily digest before work"`
 
 ### Which commands need the roxy user
 

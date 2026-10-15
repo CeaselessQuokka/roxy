@@ -669,15 +669,14 @@ capture is on, like refused ones.
 Only Roxy's admin can see this data, and it is used only to run and protect the service. Never put personal
 data in a URL you send through Roxy.
 
-## 11. Security reports and bug bounty
+## 11. Reporting a security problem
 
-If you find a vulnerability, report it privately to {{ contact_name }} before telling anyone else. Include what
-you did, what happened, and the `Roxy-Request-Id` of a request that shows it. Never include your own
-`ROBLOSECURITY` cookie or anyone else's.
+If you find a vulnerability, report it privately to {{ contact_name }} before telling anyone else: a private
+message, never a public post. Include what you did, what happened, and the `Roxy-Request-Id` of a request that
+shows it. Never include your own `ROBLOSECURITY` cookie or anyone else's.
 
 Please do not test against other people's data, and do not run floods or anything else that slows Roxy down for
-everyone. Serious reports are rewarded; the current reward range is on the
-[home page](/#tokenSafetyHeading).
+everyone. {{ bounty_sentence }}
 
 ## 12. FAQ
 

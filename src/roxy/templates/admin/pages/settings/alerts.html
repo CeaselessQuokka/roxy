@@ -10,7 +10,7 @@
 {% from "components/page_card.html" import page_card %}
 {% from "components/icon.html" import icon %}
 {% call page_card(frame) %}
-<p class="muted">Every alert is deduplicated by its cooldown and capped per hour across all workers; a leak guard alert is never held back. The email and webhook channels are credentials on the server: <a href="/admin/system#alerts">System &gt; Alerts</a> shows which are configured.</p>
+<p class="muted">Every alert is deduplicated by its cooldown and capped per hour across all workers; a leak guard alert and the daily digest are never held back. The email and webhook channels are credentials on the server: <a href="/admin/system#alerts">System &gt; Alerts</a> shows which are configured.</p>
 <form class="cluster" data-api-form data-api-url="{{ test_url }}" data-api-method="POST" novalidate>
   <input type="hidden" name="reason" value="Send test alert" data-json="string">
   <button type="submit" class="btn btn--sm" data-action="alerts-test">{{ icon("bell") }}<span>Send test alert</span></button>

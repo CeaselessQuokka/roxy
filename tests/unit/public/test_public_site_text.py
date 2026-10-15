@@ -63,11 +63,12 @@ def test_inline_mode_for_the_footer() -> None:
 
 
 def test_default_site_texts_render() -> None:
-    support = str(render_site_text(CATALOG["site_support_links"].default))
-    assert f'href="{PLUGIN_URL}"' in support
     assert str(render_site_text(CATALOG["site_footer_text"].default, inline=True)) == "Roxy Proxy 2025-Present"
-    bounty = str(render_site_text(CATALOG["site_bug_bounty_text"].default))
-    assert "$10-$250 USD" in bounty
+    # Owner answers B13 and B15: no bug bounty and no support links, so both render to nothing (the home page
+    # then leaves their parts out).
+    assert str(render_site_text(CATALOG["site_bug_bounty_text"].default)) == ""
+    assert str(render_site_text(CATALOG["site_support_links"].default)) == ""
+    assert str(render_site_text(" \n\n \n")) == ""  # blank text counts as empty too
 
 
 def test_is_https_url() -> None:

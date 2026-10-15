@@ -551,15 +551,17 @@ Tests: `tests/unit/egress/test_egress_guard.py::test_guard_transport_refuses_and
 
 Thank you for taking the time. Please:
 
-1. **Do not open a public issue** and do not post details anywhere public. Contact the maintainer privately, for
-   example through the repository's private vulnerability reporting on GitHub if it is turned on, or through a
-   private message to the maintainer.
+1. **Report it privately to CeaselessQuokka**, in a private message on the Roblox Developer Forum (the DevForums)
+   or on Twitter. Do not open a public issue, and do not post details anywhere public: not in a forum thread, a
+   reply or a tweet.
 2. Describe what you found, how to reproduce it, and what an attacker could do with it. A request (with any real
    secret removed) and the `Roxy-Request-Id` of a response help a lot.
 3. **Never include a real credential, cookie, password or key,** yours or anyone else's. If you saw one, say where,
    not what.
 4. Test only against your own copy of Roxy. Do not flood the public service, try other people's accounts, or try to
    reach the Roblox account Roxy holds.
+
+There is no bug bounty at the moment, so reports are not paid, but every report is read and appreciated.
 
 What happens next, for the maintainer: confirm the report, check the audit log and the events for signs it was
 used, fix it with a test that fails before the fix, and follow the runbook that matches the impact (for a

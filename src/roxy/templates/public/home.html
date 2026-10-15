@@ -3,7 +3,9 @@
 	keywords, robots, theme color, canonical link, Open Graph and Twitter tags, JSON-LD); tests compare them with
 	the v1 template in tests/fixtures/v1/home_page.html. Section ids are v1's, so old links such as
 	`/#tokenSafetyHeading` still land on the right heading. Texts that name people, prices or hosting facts come
-	from the `site_*` settings (D18) and are already escaped HTML; every limit comes from the live settings.
+	from the `site_*` settings (D18) and are already escaped HTML; every limit comes from the live settings. An empty
+	bug bounty or support text leaves its part out (owner answers B13 and B15, 2026-10-14: both ship empty), so no
+	heading or sentence is left pointing at nothing.
 	The Luau snippets (`examples.*`) are the files in templates/public/examples/, highlighted on the server by
 	pages.home_examples() into complete `<pre tabindex="0"><code class="language-luau hl">` blocks (escaped, no
 	inline style). Every `<pre>` is a tab stop, because a block that scrolls sideways must be reachable with the
@@ -90,12 +92,14 @@
 						<p>
 							Why did I make Roxy? Because
 							<a href="https://devforum.roblox.com/t/roproxycom-a-free-rotating-proxy-for-roblox-apis/1508367">Roproxy</a>
-							throttles about 60 seconds per request, and I wanted something a bit faster for my own projects. I
-							figured if I'm going to make the proxy anyway, I may as well share it.
+							throttles about 60 seconds per request, and I wanted something a bit faster for my own projects,
+							specifically my
+							<a href="https://devforum.roblox.com/t/bundle-and-characteroutfit-inserter-free-plugin/3972083">Bundle and Character/Outfit Inserter (shameful plug(in))</a>
+							plugin. I figured if I'm going to make the proxy anyway, I may as well share it.
 						</p>
 						<p>
-							Found a problem or a security issue? Please tell {{ contact_name }}. White Hats can read about
-							vulnerability reporting and rewards <a href="#tokenSafetyHeading">below</a>.
+							Need something extra, or having an issue? Contact {{ contact_name }}. White Hats can read about
+							vulnerability reporting{% if bug_bounty_html %} and rewards{% endif %} <a href="#tokenSafetyHeading">below</a>.
 						</p>
 					</div>
 				</details>
@@ -220,11 +224,13 @@
 				<div class="site-text warning">
 					{{ white_hats_html }}
 				</div>
+				{% if bug_bounty_html %}
 				<hr />
 				<div class="site-text">
 					{{ bug_bounty_html }}
 				</div>
-				<p>How to report a vulnerability is explained in the <a href="/docs#11-security-reports-and-bug-bounty">guide</a>.</p>
+				{% endif %}
+				<p>How to report a vulnerability is explained in the <a href="/docs#11-reporting-a-security-problem">guide</a>.</p>
 			</section>
 
 			<section class="card" aria-labelledby="internalsHeading">
@@ -233,6 +239,7 @@
 					{{ hosting_html }}
 				</div>
 			</section>
+			{% if support_html %}
 
 			<section class="card" aria-labelledby="supportHeading">
 				<h2 id="supportHeading">Support Me</h2>
@@ -240,4 +247,5 @@
 					{{ support_html }}
 				</div>
 			</section>
+			{% endif %}
 {% endblock %}

@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from roxy.config.settings.alerts import SETTINGS
-from roxy.config.spec import Apply, Group, SettingSpec, SettingType
+from roxy.config.spec import Apply, Group, Risk, SettingSpec, SettingType
 
 # key -> (v2 default, min, max) from the plan 15.3 H table. None means "not a number range".
 EXPECTED: dict[str, tuple[Any, float | None, float | None]] = {
@@ -23,7 +23,8 @@ EXPECTED: dict[str, tuple[Any, float | None, float | None]] = {
     "email_cooldown": (600, 60, 86400),
     "alert_webhook_enabled": (0, None, None),
     "alert_min_severity": ("warn", None, None),
-    "alert_digest_hour": (9, -1, 23),
+    "alert_digest_enabled": (1, None, None),  # owner answer A4 (2026-10-14): on
+    "alert_digest_hour": (9, 0, 23),  # -1 no longer means off: alert_digest_enabled is the switch
     "alert_rate_limit_per_hour": (20, 1, 1000),
     "health_auto_interval_h": (6, 0, 168),
     "health_auto_include_credential": (0, None, None),
@@ -41,6 +42,7 @@ EXPECTED_PAGES: dict[str, tuple[str, ...]] = {
     "email_cooldown": ("settings#alerts", "system#alerts"),
     "alert_webhook_enabled": ("settings#alerts", "system#alerts"),
     "alert_min_severity": ("settings#alerts", "system#alerts"),
+    "alert_digest_enabled": ("settings#alerts", "system#alerts"),
     "alert_digest_hour": ("settings#alerts", "system#alerts"),
     "alert_rate_limit_per_hour": ("settings#alerts", "system#alerts"),
     "health_auto_interval_h": ("health#schedule",),
@@ -183,6 +185,37 @@ def test_quiet_severity_is_flagged() -> None:
     # Plan 15.3 H: "critical" means slow problems are learned about late.
     assert BY_KEY["alert_min_severity"].is_high_risk_value("critical")
     assert BY_KEY["alert_min_severity"].is_high_risk_value("info") is None
+
+
+def test_the_daily_digest_is_on_by_default_and_its_texts_say_the_severity_filter_does_not_hold_it_back() -> None:
+    # Owner answer A4 (2026-10-14): the digest is on, easy to edit, and sent whatever alert_min_severity says.
+    switch = BY_KEY["alert_digest_enabled"]
+    assert switch.type is SettingType.BOOL
+    assert switch.default == 1
+    assert switch.risk is Risk.LOW
+    assert "whatever alert_min_severity says" in switch.description
+    assert "alert_digest_hour" in switch.related_settings
+    hour = BY_KEY["alert_digest_hour"]
+    assert "alert_digest_enabled" in hour.description  # where to switch it off instead of the old -1
+    assert "-1 turns" not in hour.description + hour.if_lowered
+    assert "whatever alert_min_severity says" in hour.description
+    assert "alert_digest_enabled" in hour.related_settings
+    severity = BY_KEY["alert_min_severity"]
+    assert "daily digest is not filtered" in severity.description
+    assert "alert_digest_enabled" in severity.related_settings
+    info = next(option for option in severity.options if option.value == "info")
+    assert "digest" not in info.description  # info is no longer what sends the digest
+    assert "daily digest" in BY_KEY["alert_rate_limit_per_hour"].description  # never held back by the cap either
+
+
+def test_the_digest_switch_sits_next_to_its_hour_on_the_alerts_cards() -> None:
+    # Cards list the settings placed on them sorted by key (`admin/pages/registry.py ANCHOR_SETTINGS`): the two
+    # digest keys share a prefix, so the switch is shown right above the hour on Settings > Alerts and System > Alerts.
+    from roxy.admin.pages import registry
+
+    for anchor in ("settings#alerts", "system#alerts"):
+        keys = [spec.key for spec in registry.settings_for(anchor)]
+        assert keys.index("alert_digest_hour") == keys.index("alert_digest_enabled") + 1, (anchor, keys)
 
 
 def test_credential_probe_cost_links() -> None:
