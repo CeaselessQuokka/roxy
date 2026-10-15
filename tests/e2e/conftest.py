@@ -11,10 +11,11 @@ What this is
     (`tests/pages_harness.py`: the real app with its lifespan on a FREE loopback port, its own temporary state, a
     local Roblox stand-in, an
     admin signed in through the real password and TOTP steps, and seeded traffic, audit rows, a recommendation and
-    a health run), one per test session. `open_admin(path, theme=..., width=..., height=...)` opens a page in a
-    fresh browser context that carries that admin's session cookie and records CSP violations, console errors and
-    page errors (`AdminPage.problems()`); `AdminPage.settle()` scrolls every lazy card into view and waits for htmx,
-    `AdminPage.axe()` runs axe-core, `AdminPage.shot(name)` saves a full-page screenshot to
+    a health run), one per test session (`clean_dashboard`: the same seeded with ordinary text instead of hostile
+    text, for the documentation screenshots only). `open_admin(path, theme=..., width=..., height=...)` opens a
+    page in a fresh browser context that carries that admin's session cookie and records CSP violations, console
+    errors and page errors (`AdminPage.problems()`); `AdminPage.settle()` scrolls every lazy card into view and
+    waits for htmx, `AdminPage.axe()` runs axe-core, `AdminPage.shot(name)` saves a full-page screenshot to
     `.remake/p11_reports/shots/<page>_<theme>_<width>.png`. `pages_harness` `VIEWPORTS` and `THEMES` are the sizes
     and themes every page is checked in (plan 14.9: 1440x900 and 390x844, dark and light).
 
@@ -273,7 +274,18 @@ _ANIMATIONS_DONE = """() => document.getAnimations().every(
 
 
 _RUNNING_DASHBOARDS: list[tuple[Any, Any]] = []
-"""The session's dashboard server (and its databases) while it runs: at most one."""
+"""The session's dashboard servers (and their databases) while they run: the hostile-seeded one, plus the clean one
+when the documentation screenshots ask for it (`clean_dashboard`)."""
+
+
+def _start_dashboard(*, hostile: bool) -> Any:
+    from pages_harness import DashboardServer
+
+    server = DashboardServer.start(seed=True, hostile=hostile)
+    databases = server.ctx.dbs
+    db_threads.share(databases, "tests/e2e dashboard (session)" if hostile else "tests/e2e clean dashboard (session)")
+    _RUNNING_DASHBOARDS.append((server, databases))
+    return server
 
 
 @pytest.fixture(scope="session")
@@ -284,12 +296,22 @@ def dashboard() -> Iterator[Any]:
     below), not when the whole session ends: it is a full app (leader jobs, its hot.db and metrics.db), and kept
     running it slowed every later test and broke one that counts database threads (finding G8). Its databases are
     `db_threads.share`d meanwhile, so the root conftest's guard lets them outlive each module."""
-    from pages_harness import DashboardServer
+    server = _start_dashboard(hostile=True)
+    try:
+        yield server
+    finally:
+        _stop_dashboards()
 
-    server = DashboardServer.start(seed=True)
-    databases = server.ctx.dbs
-    db_threads.share(databases, "tests/e2e dashboard (session)")
-    _RUNNING_DASHBOARDS.append((server, databases))
+
+@pytest.fixture(scope="session")
+def clean_dashboard() -> Iterator[Any]:
+    """The same dashboard seeded with ordinary text instead of the hostile set (`DashboardServer`, `hostile=False`).
+
+    Only the documentation screenshots use it: with `ROXY_SCREENSHOTS=1`, tests/e2e/test_docs_screenshots.py and
+    tests/e2e/test_phone_flows.py override `dashboard` with it, so no picture in docs/screenshots/ shows an XSS
+    payload. Every other run (and every other test) keeps the hostile seed; this server starts only when asked for
+    and stops with the other one (`pytest_runtest_teardown`)."""
+    server = _start_dashboard(hostile=False)
     try:
         yield server
     finally:

@@ -5,13 +5,15 @@ of plan 6.7, the replay of a v1-like traffic profile that plan 19.10 row 7 accep
 used against the 1 GB server, and how many bytes one metrics rollup row takes (plan 6.6). It also says how to run
 every measurement again.
 
-Every figure below was measured on 2026-10-09 and 2026-10-10 on a development machine (WSL 2), not on the production
-plan size, and while other agents ran test suites and their own load runs on the same machine (load average mostly
-between 1 and 8). Counts (calls, 429s, avoided shares) and memory are reliable; **latency and throughput figures are
-indicative only**, and every before and after comparison below was measured at the same time on the same machine
-(interleaved runs, or soaks side by side). The lead reruns the numbers on a quiet machine before release with the
-commands in "Running it again". The section "LOAD-2 and LOAD-3: what grew, what contended, what changed" records the
-perf lane's findings and fixes; the older sections keep the figures of the code before them (commit 3861e65).
+**The release reference figures are in "Quiet-machine reference run (2026-10-14, commit a77122f)"**: every
+measurement of this page run again on the release commit on a quiet machine, with each target it misses listed.
+Every other figure below was measured on 2026-10-09 to 2026-10-11 on a development machine (WSL 2), not on the
+production plan size, and while other agents ran test suites and their own load runs on the same machine (load
+average mostly between 1 and 8); those sections are kept as history. Counts (calls, 429s, avoided shares) and memory
+are reliable; **latency and throughput figures of the busy runs are indicative only**, and every before and after
+comparison below was measured at the same time on the same machine (interleaved runs, or soaks side by side). The
+section "LOAD-2 and LOAD-3: what grew, what contended, what changed" records the perf lane's findings and fixes; the
+older sections keep the figures of the code before them (commit 3861e65).
 
 ## Running it again
 
@@ -96,6 +98,288 @@ scenario's state, gunicorn log and the mock's call log (`<work>/replay/mock_call
 a setting and `--worker-env KEY=VALUE` the workers' environment for a "what if" run (marked in the table as not a
 reference run), and `--steady-connections N` gives the steady scenario's client more connections, so at a rate the
 server cannot keep up with, the server (not the client's pool) sets the answered rate.
+
+## Quiet-machine reference run (2026-10-14, commit a77122f)
+
+The release reference figures. Measured on 2026-10-14 from 15:39 to 17:48 EDT on the development machine of "The
+machine" below (WSL 2; kernel 6.18.54.1-microsoft-standard-WSL2 that day; Python 3.12.3, gunicorn 26.2.0, uvicorn
+0.54.0, uvloop 0.23.0, httptools 0.8.0, httpx 0.28.1), commit a77122f, whose code is that of 686fe46 (the gated final
+review round; a77122f changes only `DECISIONS_REVIEW.md`). Every run measured a `git archive` export of the commit
+with the commands of "Running it again" above and of "Dashboard pages" > "Running it again (quiet machine)" below, in
+this order: the memory soak and write lock ceiling block (base 3f2ad1c against the release, 89 minutes), the five
+replays with one run of the other scenarios and the row size test (24 minutes), the dashboard page scenario (15
+minutes), and one recommendations evaluation timed on a copy of the page scenario's template, as "The
+recommendations evaluation: one read per window" describes (seconds).
+
+**Machine state.** Nothing else ran inside WSL: no test suite, server, browser or other load run (checked with `ps`
+before each step), and nothing was left running after it. The 1 minute load average was 0.21 at the start; it stayed
+at 0.04 to 0.96 (median 0.23) through the two 10 a second soaks and at 0.05 to 1.24 (median 0.17) through the five
+replays; the aged soaks (two colors at 200 a second at once) and the steady and flood runs (one color at a time, up
+to 1,000 requests a second offered) raised it to 0.5 to 3.9 by themselves, and the page runs to 0.6 to 1.8. On the
+Windows host, outside WSL, a few desktop applications stayed open (Roblox Studio the busiest, about half of one
+logical CPU when sampled); the host used 6 to 8 percent of its CPU in total before the start. This is a quiet
+development machine, not the production plan size (2 vCPU, 909 MB): read its latency figures as the quiet reference
+of this machine, and its counts and memory as the figures that transfer.
+
+### Quiet run: memory per color (LOAD-2)
+
+**Replay soak, 10 requests a second for 34 minutes (`--scale 10`), base and release side by side** (PSS of the
+whole color, master included; worker RSS, the larger worker first, MiB):
+
+| Minute | Color, base | Color, release | Workers, base | Workers, release |
+|---|---|---|---|---|
+| 0 | 261.6 | 273.6 | 143 / 143 | 149 / 149 |
+| 5 | 307.7 | 315.4 | 179 / 155 | 177 / 164 |
+| 10 | 329.8 | 331.9 | 199 / 157 | 192 / 166 |
+| 20 | 351.5 | 343.3 | 218 / 159 | 202 / 168 |
+| 30 | 369.9 | 349.6 | 236 / 160 | 208 / 168 |
+| 34 (end) | 378.0 | 359.8 | 244 / 160 | 209 / 168 |
+
+The release's last point (taken as the run stopped, the workers still up) is 9 MiB above the point 24 s before it
+(350.5) while neither worker changed. Growth over the last 15 minutes: the larger worker 1.70 MiB a minute in the
+base, 0.70 in the release; the smaller one 0.09 and 0.03. The base still shows the LOAD-2 growth; the release levels
+off. Replay outcome: release 2 Roblox 429s in 9,469 calls (0.021 percent), 53.0 percent avoided; base 9 in 9,384
+(0.096 percent), 53.4 percent avoided.
+
+**Aged soak, 30 minutes at 200 requests a second (360,287 requests, about a day of samples), no worker recycling,
+side by side** (MiB):
+
+| Minute | Color, base | Color, release | Larger worker, base | Larger worker, release | Smaller worker, base | Smaller worker, release |
+|---|---|---|---|---|---|---|
+| 0 | 243.9 | 267.7 | 135 | 147 | 135 | 146 |
+| 3.5 (about 20,000 requests a worker) | 409.1 | 388.1 | 259 | 232 | 179 | 185 |
+| 10 | 523.6 | 421.4 | 366 | 253 | 187 | 198 |
+| 20 | 676.0 | 440.5 | 507 | 266 | 199 | 204 |
+| 30 | 796.3 | 455.9 | 618 | 276 | 208 | 209 |
+| Peak (sampled every 0.5 s) | 820.3 | 470.1 | 643 | 293 | 232 | 236 |
+
+Release: 200.1 answered a second, every answer a 200, cache hit p99 60 ms, Roxy's own p95 / p99 46 / 80 ms, 28
+`abuse_degraded` lines and no publish failure. Base: 200.1 a second, 2 HTTP 503, cache hit p99 503 ms, 303
+`abuse_degraded` and 57 publish failures. Without recycling the release color still grows at this rate: 1.5 MiB a
+minute between minutes 20 and 30 (the larger worker 1.0, the smaller 0.5).
+
+**Against the units (`MemoryHigh=420M`, `MemoryMax=500M`) and the 909 MB server:**
+
+| Case | Quiet reference (release) | Against |
+|---|---|---|
+| 10 a second, workers recycling every 20,000 requests (about every 67 minutes) | 350.5 MiB at 34 minutes, about 0.5 MiB a minute at the end: about 368 MiB at 67 minutes | under `MemoryHigh` 420 |
+| 200 a second, workers recycling every 20,000 requests (about every 3.5 minutes) | 388.1 MiB at 3.5 minutes (405 on the busy machine) | under `MemoryHigh` 420, 32 MiB left |
+| 200 a second with no recycling | 421.4 MiB at 10 minutes, 455.9 at 30, peak 470.1 | over `MemoryHigh` after about 10 minutes; under `MemoryMax` 500 |
+| The short peaks of "Memory per color and the systemd decision" on top (up to about 70 MiB) | 388 + 70 = 458 MiB | under `MemoryMax` 500 |
+| One color at `MemoryMax` beside nginx and the OS; a deploy in low-memory mode (a fresh worker starts at 147 to 149 MiB RSS) | 700 and 855 MB, as before | 909 |
+
+The sizing of "Memory per color and the systemd decision" holds on the quiet machine as long as workers recycle
+(`ROXY_MAX_REQUESTS` 20,000). Without recycling a color crosses `MemoryHigh` after about 10 minutes at 200 a second,
+which is why that limit must stay.
+
+### Quiet run: the write lock ceiling (LOAD-3)
+
+The steady runs alternated between the two trees, three of each (medians and ranges):
+
+| Steady scenario | Answered a second | Cache hit p99 | Miss overhead p99 | Roxy's own p95 / p99 | HTTP 503 | `abuse_degraded`, publish failures |
+|---|---|---|---|---|---|---|
+| 200 offered, base | 202.1 (202.1 to 202.1) | 23.8 ms (20.9 to 45.3) | 92.2 ms (76.5 to 99.7) | 62.6 / 653 ms | 0 | 2, 0 (up to 9, 0) |
+| 200 offered, release | 202.1 (202.0 to 202.1) | 22.9 ms (22.5 to 139.9) | 50.1 ms (47.2 to 202.4) | 48.3 / 338 ms | 0 | 0, 0 |
+| 450 offered, 400 connections, base | **252.1 (202.8 to 262.7)** | 34.9 s | 36.9 s | 952 / 2,677 ms | 40 (12 to 185) | 92, 245 |
+| 450 offered, release | **324.5 (295.4 to 400.2)** | 27.5 s | 27.4 s | 362 / 2,646 ms | 139 (64 to 140) | 9, 229 |
+
+**The ceiling** (answered a second when 450 are offered): **about 252 for the base and 325 for the release on the
+quiet machine (+29 percent at the medians)**; the busy machine gave 179 and 286. Past the ceiling the release answered
+more requests and ran out of hot.db budget less often (`abuse_degraded` 9 against 92), but it gave more HTTP 503
+`degraded` answers (139 against 40, medians) and about as many single-flight publish failures (229 against 245). The
+workers used 44 to 70 percent of a core each in the release, 36 to 49 in the base. The release's hot.db lock at 200
+offered: wait p99 in the 5 to 20 ms buckets, hold p99 in the 10 to 50 ms buckets (longest hold 20 to 200 ms); at 450,
+wait and hold p99 in the 20 ms bucket, groups of up to 64 writes.
+
+**Flood** (1,000 a second offered from 50 addresses, tarpit on), release against base: 337.8 answers a second against
+198.5 (all 20,312 within 60.1 s against 102.3 s), `abuse_degraded` 14 against 300, the most any address was served
+above its GCRA bound 1 against 6, tarpit holds at once 50 in both (the fleet cap). The flood of the scenarios run
+below gave 348.7 answers a second, 22 `abuse_degraded` and 2 above the bound.
+
+**hot.db writes alone** (`tests/multiprocess/test_storage_mp.py`): two processes, 4,400 writes a second one
+transaction each, 20,622 grouped; four processes at 200 writes a second (Poisson), p50 0.18 and p99 1.32 ms a write;
+four processes saturated, p99 5.94 ms; one process saturated, p99 0.36 ms.
+
+### Quiet run: plan 19.10 row 7
+
+The five 200 s replays of the release (production defaults, 10 a second from 300 addresses, 2,018 requests of
+demand each):
+
+| Run | Upstream calls | Roblox 429s | 429 share | Avoided | Served from cache | Deferred | Avatar outfits' busiest minute |
+|---|---|---|---|---|---|---|---|
+| 1 | 1,029 | 1 (at 60.9 s) | 0.097 % | 49.0 % | 32.0 % | 17.0 % | 61 / 60 |
+| 2 | 1,029 | 1 (at 56.5 s) | 0.097 % | 49.0 % | 31.9 % | 17.1 % | 61 / 60 |
+| 3 | 1,029 | 1 (at 60.5 s) | 0.097 % | 49.0 % | 31.9 % | 17.2 % | 61 / 60 |
+| 4 | 1,030 | 1 (at 60.5 s) | 0.097 % | 49.0 % | 31.7 % | 17.3 % | 61 / 60 |
+| 5 | 1,029 | 1 (at 60.5 s) | 0.097 % | 49.0 % | 32.1 % | 17.0 % | 61 / 60 |
+
+Every run meets row 7 (Roblox 429s below 0.1 percent of upstream calls, at least 40 percent avoided), each by the same
+thin margin: one discovery 429 on avatar outfits (threshold 60 a minute) about a minute in, after which the adaptive
+cut to 43.4 or 44.1 a minute holds it. A second 429 in a run would be 0.19 percent: **the bar is met by less than
+one 429.** In every run all 2,018 requests were answered (200, or 429 when pacing deferred them), no call carried the
+credential on caller traffic, the stop was graceful and the log had no traceback; each took 218.7 to 220.4 s. The
+34 minute replays of the soak above gave 0.021 percent (release) and 0.096 percent (base).
+
+### Quiet run: the other plan 19.4 scenarios and the row size
+
+One run each (`steady cold_burst cooldown_429 flood`, release):
+
+- **Steady, 200 a second:** 202.1 answered a second, all 12,133 answers 200; cache hit p50 / p95 / p99 2.5 / 7.9 /
+  16.6 ms; miss overhead p50 6.7, p99 32.8 ms; Roxy's own p95 / p99 47 / 381 ms; metrics flush p50 30.8, max 388 ms
+  (sampled); hot.db write p50 0.15, p99 92 ms (sampled); 31.0 and 23.5 percent of a core per worker; no
+  `abuse_degraded`; color PSS peak 359.7 MiB.
+- **Cold cache burst** (2,500 requests at once for 100 keys): 100 upstream calls, none answered 429; first answers
+  1,888 served and 612 paced (429 `upstream_busy`, `Retry-After` on every one, at most 5 s); 2,353 of 2,500 served
+  after one retry; every answer within 34.5 s; Roxy's own p50 14 ms, p99 4,819 ms.
+- **Roblox answers 429 with `Retry-After: 30` on one endpoint:** 8 upstream calls there in 90 s, 7 of them sent in
+  the first 0.4 s before the first 429 came back, then one probe at 71.5 s (the 3861e65 run sent 2 before the first
+  429 came back, then one at 30.4 s and one at 60.5 s); all 1,821 caller requests there got 429 with `Retry-After`
+  (732 `upstream_busy`, 1,089 `upstream_cooldown`), p50 3.7, p99 12.3 ms; the other endpoints served 915 of 915 (p50
+  3.2 ms, p99 2,702 ms).
+- **Flood:** above (348.7 answers a second, 2 above the GCRA bound).
+- **Row size** (`tests/integration/test_metrics_rowsize.py`): unchanged, 71.4 bytes a minute row (51.0 table, 20.4
+  index), 105.4 an hour row, histogram blobs 8.7 and 2.0 bytes on average.
+
+### Quiet run: plan 6.7 targets at a glance
+
+The release at 200 requests a second: the three interleaved steady runs and the scenarios run (four runs).
+
+| Target (6.7) | Quiet reference (release) | Status |
+|---|---|---|
+| Proxy overhead p99 under 8 ms on a hit at 200 rps, 2 workers | p99 16.6 to 139.9 ms (22.9 the median of the interleaved three), p95 7.9 to 39.5, p50 2.5 to 3.9 ms | **not met** |
+| Proxy overhead p99 under 15 ms on a miss | p99 32.8 to 202.4 ms (50.1 the median of three), p50 6.7 to 10.5 ms | **not met** |
+| Abuse transaction p50 under 0.5 ms, p99 under 3 ms at 200 rps | running system: hot.db writes p50 0.15 to 0.45 ms, p99 22.8 to 92.3 ms (sampled), lock hold p99 in the 10 to 50 ms buckets; the hot.db write alone (four processes at 200 a second): p50 0.18, p99 1.32 ms | p50 met; **p99 not met** in the running system |
+| Upstream transaction p99 under 3 ms at 20 misses a second | not separated from the abuse writes | **not measured** |
+| Metrics flush of 2 s of traffic under 50 ms | p50 20.9 to 33.4 ms, max 176 to 873 ms (sampled) | p50 met; **max not met** |
+| Dashboard first render under 300 ms | see "Quiet run: dashboard pages": every page at its default range under 300 ms at p95 except Overview in the quiet unpinned run (377 ms; first load after a start 430 ms); two cards over 300 ms at p95 in every run; Overview at 90 days 323 to 510 ms at p95 | **not met** for Overview (one run at the default range, every run at 90 days) and two cards |
+| Any chart query over 90 days under 500 ms | every chart route at the UI's granularity 205.2 ms or less at p95; two Protection cards and Overview at 90 days on 2 CPUs with load over; hourly points (API only) over | met for the UI's chart routes; **not met** for the cards and hourly points listed below |
+
+### Quiet run: dashboard pages
+
+Run as "Dashboard pages" > "Running it again (quiet machine)" writes it: a template seeded by the release (202 s; the
+same volume as before, metrics.db 1,877 MiB), then four runs of 20 rounds and 3 rounds at 90 days. Every run: all
+2,466 requests answered 200 and joined to their log lines, both workers answered, a clean stop, no traceback; the
+copy's expand migrations had nothing to do (0.1 s); the load runs answered 201.2 and 200.8 proxy requests a second
+beside the pages, all 200. Peak worker RSS 207 and 201 MiB quiet, 210 and 201 on 2 CPUs, 265 and 221 on 2 CPUs with
+load, 256 and 226 with load.
+
+Page server time at the default range, p50 / p95 in ms, 20 rounds per run:
+
+| Page | quiet | quiet@0-1 | load@0-1 | load | First load (quiet) | HTML | First paint |
+|---|---|---|---|---|---|---|---|
+| Overview | 163 / **377** | 144 / 160 | 198 / 244 | 171 / 257 | 430 | 187 KiB | 222 KiB |
+| Traffic | 76 / 84 | 70 / 77 | 88 / 119 | 87 / 118 | 80 | 92 KiB | 126 KiB |
+| Upstream | 68 / 70 | 63 / 76 | 71 / 103 | 70 / 82 | 70 | 131 KiB | 164 KiB |
+| Cache | 80 / 85 | 70 / 78 | 86 / 141 | 91 / 184 | 85 | 160 KiB | 195 KiB |
+| Clients | 156 / 164 | 142 / 144 | 160 / 191 | 158 / 176 | 164 | 160 KiB | 194 KiB |
+| Protection | 30 / 33 | 27 / 29 | 33 / 49 | 36 / 69 | 33 | 119 KiB | 156 KiB |
+| Live | 13 / 14 | 11 / 13 | 17 / 31 | 17 / 30 | 13 | 129 KiB | 163 KiB |
+| Security | 22 / 29 | 20 / 27 | 27 / 35 | 32 / 71 | 34 | 192 KiB | 227 KiB |
+| Settings | 10 / 12 | 9 / 16 | 11 / 27 | 12 / 23 | 34 | 156 KiB | 192 KiB |
+| Audit | 14 / 16 | 13 / 15 | 15 / 27 | 15 / 20 | 21 | 130 KiB | 162 KiB |
+
+Whole view (the page plus every fragment, server time summed), p50 / p95 in ms, and the slowest card of the quiet
+run:
+
+| Page | quiet | quiet@0-1 | load@0-1 | load | Slowest card (quiet) |
+|---|---|---|---|---|---|
+| Overview (9 fragments) | 642 / 869 | 573 / 797 | 707 / 800 | 688 / 958 | top endpoints 124 / 133 |
+| Traffic (7) | 787 / 823 | 718 / 774 | 921 / 993 | 927 / 1,040 | trends 189 / 196 |
+| Upstream (15) | 391 / 401 | 362 / 377 | 443 / 639 | 444 / 541 | latency 98 / 103 |
+| Cache (10) | 398 / 417 | 363 / 395 | 504 / 618 | 486 / 780 | ratios 88 / 95 |
+| Clients (5) | 1,044 / 1,068 | 920 / 945 | 1,021 / 1,209 | 1,017 / 1,106 | **IP addresses 723 / 747** |
+| Protection (27) | 622 / 650 | 562 / 584 | 699 / 869 | 685 / 868 | **refusals 375 / 389** |
+| Live (2) | 25 / 29 | 23 / 25 | 38 / 56 | 38 / 51 | tail 10 / 13 |
+| Security (11) | 72 / 87 | 67 / 75 | 91 / 107 | 90 / 134 | probes 12 / 14 |
+| Settings (5) | 32 / 44 | 30 / 36 | 41 / 61 | 39 / 49 | editor 8 / 17 |
+| Audit (1) | 26 / 29 | 24 / 26 | 30 / 50 | 28 / 38 | log 12 / 13 |
+
+Fragments over 300 ms at p95, in every run: Clients > IP addresses (747, 656, 833 and 725 ms in the order of the
+columns) and Protection > Refusal reasons (389, 343, 547 and 491 ms).
+
+Pages at `range=90d`, p50 / p95 in ms, 3 rounds:
+
+| Page | quiet | quiet@0-1 | load@0-1 | load | Slowest card (quiet) |
+|---|---|---|---|---|---|
+| Overview | **353 / 358** | **313 / 323** | **491 / 510** | **359 / 403** | visitors 198 / 199 |
+| Traffic | 28 / 28 | 26 / 31 | 33 / 37 | 33 / 33 | heatmap 198 / 199 |
+| Upstream | 171 / 175 | 154 / 160 | 211 / 251 | 186 / 233 | retries 170 / 172 |
+| Cache | 103 / 106 | 99 / 99 | 123 / 166 | 118 / 119 | stats 103 / 107 |
+| Clients | 65 / 66 | 58 / 59 | 69 / 83 | 72 / 75 | IP addresses 96 / 98 |
+| Protection | 95 / 114 | 88 / 89 | 106 / 119 | 106 / 121 | **Request filters 616 / 628** |
+| Live, Security, Settings, Audit (p50) | 10 to 23 | 9 to 21 | 11 to 33 | 13 to 29 | 20 ms or less |
+
+Chart series routes over 90 days: at the granularity the UI asks for, every route 205.2 ms or less at p95 in every
+run (the slowest: Overview KPI tiles 142 to 205, the Traffic heatmap 192 to 202, the endpoint drill-down 103 to 140). 90
+day cards and routes over 500 ms at p95 (4, 3, 9 and 5 in the four runs):
+
+| Card or route | quiet | quiet@0-1 | load@0-1 | load |
+|---|---|---|---|---|
+| Protection > Request filters, 90 days | 616 / 628 | 548 / 554 | 593 / 624 | 589 / 614 |
+| Protection > Endpoint blocks, 90 days | 526 / 532 | under 500 | 486 / 545 | 503 / 525 |
+| Overview page, 90 days | under 500 | under 500 | 491 / 510 | under 500 |
+| Traffic latency, hourly points (API only) | 676 / 700 | 604 / 610 | 765 / 826 | 801 / 821 |
+| Traffic latency by egress, hourly points | 632 / 662 | 576 / 586 | 648 / 730 | 778 / 989 |
+| Upstream latency, hourly points | 443 / 455 | 404 / 412 | 570 / 603 | 482 / 525 |
+| Traffic bytes, status by source, verbs, hourly points | under 500 | under 500 | 573, 526 and 521 at p95 | under 500 |
+
+**Slower than the second pass** (the gaps lane's "after", 2026-10-11, on a busier machine and another template of
+the same volume, so the drop is not the machine):
+
+- Clients > IP addresses at the default range: 630 to 723 ms p50 (656 to 833 at p95) against 92 / 98 quiet then; the
+  Clients whole view 920 to 1,044 ms p50 against 384. Not traced in this run; the final review made the client tables
+  stream in key order through a bounded heap (finding memory-2, `CHANGES.md` "Final review"), the first suspect.
+- Protection > Refusal reasons at the default range: 335 to 400 ms p50 (343 to 547 at p95) against 123 / 132; cause
+  not traced.
+- Overview at 90 days: 313 to 491 ms p50 against 263 / 265 quiet in the earlier passes; Overview at the default
+  range in the quiet unpinned run, p95 377 ms against 174 (p50 163 against 140).
+
+### Quiet run: the recommendations evaluation
+
+Timed as "The recommendations evaluation: one read per window" describes: one `InsightsEngine.evaluate` of every
+rule at the time of the last sample plus 30 s, on a copy of the page scenario's template above (477,328 request
+samples: the "Day" state), the process pinned to one CPU with `taskset`, two processes of two evaluations each; then
+one traced evaluation, unpinned, for the memory peak.
+
+| | Day, release (quiet reference) | Day after, 2026-10-11 (history) |
+|---|---|---|
+| Wall time | 0.60 to 0.63 s | 0.57 to 0.62 s |
+| CPU of the process (every thread) | 0.58 to 0.61 s | 0.56 to 0.60 s |
+| CPU of the event loop's thread | 0.03 to 0.04 s | 0.03 to 0.05 s |
+| Longest loop stall | 14 to 29 ms (one stall over 20 ms in four evaluations) | 5 to 17 ms |
+| Peak traced memory of one evaluation | 14.1 MiB | 15.3 MiB |
+
+9 recommendations, no rule failed; the costliest rules UP-QUEUE-SAT (0.21 s of CPU), HOT-ENDPOINT (0.09 to 0.10 s)
+and THROTTLE-TUNE (0.08 to 0.09 s). The first evaluation of each process cost the same as the second (0.62 to 0.63
+s): the copy had just been made, so the files were in the OS page cache. The replay state of the earlier table no
+longer exists and was not measured again.
+
+### Quiet run: every target not met
+
+1. Plan 6.7 proxy overhead on a cache hit, p99 under 8 ms at 200 a second: 16.6 to 139.9 ms.
+2. On a miss, p99 under 15 ms: 32.8 to 202.4 ms.
+3. The abuse transaction, p99 under 3 ms at 200 a second: hot.db writes in the running system p99 22.8 to 92.3 ms
+   (lock hold p99 in the 10 to 50 ms buckets); the write alone meets it (1.32 ms).
+4. A metrics flush under 50 ms: the longest sampled flush 176 to 873 ms (the median 20.9 to 33.4 ms meets it).
+5. The upstream transaction, p99 under 3 ms at 20 misses a second: still not measured on its own.
+6. Dashboard first render under 300 ms: Overview at p95 377 ms in the quiet unpinned run and 430 ms on the first
+   load after a start; Overview at 90 days 323 to 510 ms at p95 in every run.
+7. Cards over 300 ms at p95 at the default range, in every run: Clients > IP addresses 656 to 833 ms and Protection >
+   Refusal reasons 343 to 547 ms, both much slower than in the second pass.
+8. 90 days under 500 ms: Protection > Request filters 554 to 628 ms at p95 in every run, Endpoint blocks 525 to 545
+   ms in three runs, the Overview page 510 ms on 2 CPUs with load; at hourly points (an API option the UI never
+   sends) Traffic latency 610 to 826 ms and Traffic latency by egress 586 to 989 ms in every run, Upstream latency
+   603 ms on 2 CPUs with load and 525 ms with load, and on 2 CPUs with load Traffic bytes 573, status by source 526
+   and verbs 521 ms.
+9. Flood: an address served above its GCRA bound (0 allowed): 1 and 2 in the two release runs (C7 degraded mode).
+10. Roblox 429 with `Retry-After: 30`: after the first 429, one probe in 89.6 s (at 71.5 s) where the scenario
+    expects about one per `Retry-After` (30 s): the endpoint made its next call about 40 s after Roblox allowed it,
+    and callers of it were refused (429 with `Retry-After`) that much longer.
+
+Met: plan 19.10 row 7 in all five replays (0.097 percent, by less than one 429), memory with recycling under
+`MemoryHigh`, the fleet cap of the tarpit, single-flight in the cold burst, `Retry-After` on every 429 Roxy sent, the
+rollup row size, every chart route at the UI's granularity, and every page at its default range in three of four
+runs.
 
 ## LOAD-2 and LOAD-3: what grew, what contended, what changed
 
@@ -225,7 +509,8 @@ scenario's template). "Day" is the dashboard scenario's seeded day (`tests/load/
 | Peak traced memory of one evaluation | 39.3 MiB | 15.3 MiB | 35.9 MiB | 11.3 MiB |
 
 The first evaluation after a start costs about 1.1 s (cold page caches). The largest read left is the tuner's SQL
-over a day of samples (0.18 s on the day, 0.3 s on the replay, outside the GIL).
+over a day of samples (0.18 s on the day, 0.3 s on the replay, outside the GIL). The release measured the same way on
+the quiet machine: "Quiet run: the recommendations evaluation" (0.60 to 0.63 s on the day, 14.1 MiB).
 
 ### Memory per color and the systemd decision
 
@@ -249,6 +534,11 @@ The units now hold each color at `MemoryHigh=420M` and `MemoryMax=500M` (were 32
 to work, so the rule is in the deploy instead: the new color always starts fresh and the old one stops after the
 60 s watch (`deploy/README.md` "Never run two warm colors at once"). `test_memory_numbers_fit_the_909_mb_server`
 checks the rows above. The swap file of `deploy/README.md` stays recommended as a safety net.
+
+The quiet-machine reference run of the release (2026-10-14, "Quiet run: memory per color (LOAD-2)") confirms the
+table with workers recycling: 350.5 MiB after 34 minutes at 10 a second and 388.1 MiB at 3.5 minutes at 200 a second
+(the 405 above was the busy machine); without recycling a color passes `MemoryHigh` after about 10 minutes at 200 a
+second (421.4 MiB) and peaked at 470.1 MiB in 30 minutes.
 
 ### LOAD-3: what contends
 
@@ -333,7 +623,8 @@ addresses, tarpit on): 347 answers a second after against 203 to 208 before, `ab
 and the most any address was served above its GCRA bound 1 against 4 (both from the C7 degraded mode while budgets
 ran out, open issue below). Two processes doing only hot.db writes
 (`test_group_commit_throughput_under_two_process_contention`): about 4,500 writes a second one transaction each,
-18,000 to 19,800 grouped.
+18,000 to 19,800 grouped. On the quiet machine (2026-10-14, "Quiet run: the write lock ceiling (LOAD-3)") the ceiling
+was about 252 before and 325 after (+29 percent), and the flood 198.5 against 337.8 answers a second.
 
 ### Open (LOAD-2 and LOAD-3)
 
@@ -427,12 +718,16 @@ from the cache or a shared fetch and the share deferred by pacing.
 | Python and packages | Python 3.12.3, gunicorn 26.2.0, uvicorn 0.54.0, uvloop 0.23.0, httptools 0.8.0, httpx 0.28.1 |
 | Load | load average 0.6 to 8 from other agents' test runs, 34 for the two deliberate busy-machine replays |
 | Roxy measured | `git archive` of commit 3861e65 (`--tree`), except where a row says "working tree" |
+| Quiet-machine reference run (2026-10-14) | `git archive` of a77122f; kernel 6.18.54.1-microsoft-standard-WSL2; nothing else running in WSL (see "Quiet-machine reference run (2026-10-14, commit a77122f)") |
 
 Production is a 2 vCPU burstable Lightsail instance with 909 MB of memory and no swap (`docs/ARCHITECTURE.md`,
 "Memory sizing for the 1 GB server"). Throughput and latency on it will differ; per-process memory figures transfer
 better (see the memory section for the one caveat).
 
 ## Results of the plan 19.4 scenarios (indicative)
+
+History; the release's quiet-machine runs of these scenarios are in "Quiet run: the write lock ceiling (LOAD-3)" and
+"Quiet run: the other plan 19.4 scenarios and the row size" above.
 
 One run of each scenario, 2026-10-09 15:46 to 15:55, Roxy 3861e65, while a 20 minute replay and other agents'
 test suites ran (load average 7 to 8). The steady scenario was run again at 16:07, when the machine was quieter
@@ -525,6 +820,9 @@ runs out at all without other load.
 
 ### Plan 6.7 targets at a glance
 
+History: commit 3861e65 on the busy machine. The release's quiet-machine reference is "Quiet run: plan 6.7 targets at
+a glance" above.
+
 | Target (6.7) | Measured here (indicative; quieter run, busy run in brackets) | Status |
 |---|---|---|
 | Proxy overhead p99 under 8 ms on a hit at 200 rps, 2 workers | p99 26.9 ms (278), p50 3.0 ms | not met on this machine; rerun quietly |
@@ -541,7 +839,8 @@ Python overhead (a few hundred microseconds) and, on WSL, the 9.5 percent fast m
 
 10 requests a second for 200 s from 300 game server addresses, Poisson arrivals, from an empty cache, against the
 mock's per-endpoint thresholds, production defaults. Accepted when Roblox 429s stay below 0.1 percent of upstream
-calls and the avoided-call share is at least 40 percent.
+calls and the avoided-call share is at least 40 percent. The release's five quiet-machine replays (2026-10-14) are in
+"Quiet run: plan 19.10 row 7" above: 0.097 percent in every run, met by less than one 429. The runs below are history.
 
 ### Every run
 
@@ -734,7 +1033,9 @@ vCPU burstable instance whose cores are slower than this machine's: read the pin
 
 A second pass on 2026-10-11 (the P11 gaps lane) fixed the misses the first one left; "Second pass" below has its
 before and after numbers on a freshly seeded template, and "Against the targets" and "Still open" are the state after
-it. "Results", "Before and after" and "What was slow" are the first pass.
+it. "Results", "Before and after" and "What was slow" are the first pass. The release's quiet-machine reference run
+(2026-10-14) is "Quiet run: dashboard pages" above; it found two cards much slower than after the second pass (the
+Clients address table and the Protection refusals card, "Still open" below).
 
 ### Running it again (quiet machine)
 
@@ -881,7 +1182,8 @@ Every run: all 2,466 requests answered 200 and joined to their log lines, a clea
 
 ### Against the targets
 
-After the second pass (below):
+After the second pass (below), on the busier machine of 2026-10-11; the quiet-machine reference of the release is in
+"Quiet run: plan 6.7 targets at a glance" and "Quiet run: dashboard pages" above:
 
 | Target (6.7) | Measured | Status |
 |---|---|---|
@@ -1082,4 +1384,14 @@ After the second pass:
   evaluation: one read per window" above); under load in the after run it took 0.6 to 3.2 s.
 - **The harness's limits:** the seed is one day copied back, so every day has the same shape; the cache holds 3,000
   entries, not a full cache.db; the request samples cover one day. Both passes ran on the development machine, not
-  the production plan size: rerun on a quiet machine (and the plan size) before release.
+  the production plan size; the quiet-machine rerun is done ("Quiet run: dashboard pages"), the plan size is not.
+
+Found by the quiet-machine reference run (2026-10-14, release a77122f):
+
+- **Clients > IP addresses at the default range** takes 630 to 723 ms (p50; 656 to 833 at p95) against 92 / 98 after
+  the second pass, and the Clients whole view 920 to 1,044 ms against 384. Not traced; the final review's change to
+  the client tables (they stream in key order through a bounded heap, finding memory-2) is the first suspect.
+- **Protection > Refusal reasons at the default range** takes 335 to 400 ms (p50; 343 to 547 at p95) against 123 /
+  132 after the second pass. Not traced.
+- **Overview at 90 days** is over 300 ms in every run (313 to 491 ms p50, up to 510 at p95 on 2 CPUs with load), and
+  the quiet unpinned run had one Overview p95 at the default range of 377 ms.

@@ -23,7 +23,11 @@ What this is
       * `DashboardServer.start(...)`: the real app (`create_app` with its lifespan) on a FREE loopback port in a
         thread, its own temporary state, a fast password hasher, an admin signed in through the real password and
         TOTP steps (`login()` returns the session cookie), and the seeded data. Seven page builders run their tests
-        at the same time, so nothing here uses a fixed port or a shared directory.
+        at the same time, so nothing here uses a fixed port or a shared directory. `hostile=False` seeds the same
+        rows with ordinary text instead of the hostile set (the documentation screenshots only).
+      * `save_compact_screenshot(page, path)` and `compact_png(browser, png)`: a screenshot written as an 8-bit
+        palette PNG (the documentation copies in docs/screenshots/), with no image library: the test browser does
+        the pixel work and the standard library writes the file.
 
 Why it exists
     Plan 19.2 and the P11 test rules: every page is tested against the real app, the real guards and the real read
@@ -46,15 +50,19 @@ What to read next
 from __future__ import annotations
 
 import asyncio
+import base64
 import html as html_lib
 import ipaddress
 import json
+import math
 import re
 import secrets
 import socket
+import struct
 import tempfile
 import threading
 import time
+import zlib
 from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -81,6 +89,24 @@ RAW_MARKERS: Final[tuple[str, ...]] = (
     'onfocus="alert(1)',
 )
 """What must never appear unescaped in a rendered page."""
+
+HOSTILE_SIGNS: Final[tuple[str, ...]] = (
+    "onerror=alert(1)",
+    "alert('roxy')",
+    "alert(document.cookie)",
+    'onfocus="alert(1)',
+    "L" * 64,
+    "\u202eevil",
+    "{{ 7*7 }}",
+)
+"""Pieces of the hostile text set that ordinary text never contains (even escaped and shown as text)."""
+
+
+def hostile_text_in(text: str) -> list[str]:
+    """The pieces of the hostile set that `text` (a page's visible text) shows: none on the clean seed, which is
+    what the documentation screenshots check before they take a picture."""
+    return [sign for sign in HOSTILE_SIGNS if sign in text]
+
 
 _LINK_ATTR = re.compile(r"""\b(?:href|src|action|formaction|xlink:href)\s*=\s*["']?\s*javascript:""", re.IGNORECASE)
 
@@ -346,34 +372,34 @@ class PlannedRequest:
     note: str = ""
 
 
-def traffic_plan() -> list[PlannedRequest]:
-    """The seeding plan: served, cached (repeats), refused, probed, a Roblox 429, a Roblox 503, several IPs, places
-    and User-Agents, IPv6, and the hostile text set in paths, User-Agents and Roblox-Id headers."""
-    plan: list[PlannedRequest] = []
-    for _ in range(6):
-        plan.append(
+def _odd_requests(hostile: bool) -> list[PlannedRequest]:
+    """The plan's unusual callers: the hostile text set in paths, User-Agents and Roblox-Id headers, or (clean, for
+    the documentation screenshots) ordinary values in the same places with the same outcomes."""
+    if not hostile:
+        return [
+            PlannedRequest("/phpmyadmin/index.php", f"{DOC_NETS[2]}.42", note="probe: not Roblox"),
             PlannedRequest(
-                "/games.roblox.com/v1/games?universeIds=1",
-                f"{DOC_NETS[0]}.10",
-                place=PLACES[0],
-                note="served then cached",
-            )
-        )
-    for i in range(4):
-        plan.append(
-            PlannedRequest(
-                f"/users.roblox.com/v1/users/{100 + i}",
-                f"{DOC_NETS[1]}.{20 + i}",
-                user_agent="RobloxGameServer/1.0",
-                place=PLACES[1],
+                "/games.roblox.com/v1/games/votes?universeIds=1",
+                f"{DOC_NETS[0]}.50",
+                user_agent="RobloxStudio/WinInet",
+                place=PLACES[2],
                 note="served",
-            )
-        )
-    plan += [
-        PlannedRequest("/thumbnails.roblox.com/v1/too-many?size=48x48", f"{DOC_NETS[2]}.30", note="Roblox 429"),
-        PlannedRequest("/catalog.roblox.com/v1/fail/items", f"{DOC_NETS[2]}.31", note="Roblox 503"),
-        PlannedRequest("/wp-login.php", f"{DOC_NETS[2]}.40", user_agent="curl/8.0", note="probe: not Roblox"),
-        PlannedRequest("/.env", f"{DOC_NETS[2]}.41", user_agent="python-requests/2.31", note="probe"),
+            ),
+            PlannedRequest(
+                "/games.roblox.com/v1/games?universeIds=2", f"{DOC_NETS[0]}.51", place=PLACES[2], note="served"
+            ),
+            PlannedRequest(
+                "/games.roblox.com/v1/games?universeIds=3",
+                f"{DOC_NETS[0]}.52",
+                user_agent="RobloxGameServer/2.0 (linux; x64; build 650.0.0.6500811)",  # no browser marker
+                note="a longer User-Agent",
+            ),
+            PlannedRequest(
+                "/games.roblox.com/v1/games?universeIds=4", f"{DOC_NETS[0]}.53", user_agent="Roblox/Android"
+            ),
+            PlannedRequest("/games.roblox.com/v1/games?universeIds=5", "2001:db8::7", user_agent="Roblox/iOS"),
+        ]
+    return [
         PlannedRequest("/" + HOSTILE["js_url"], f"{DOC_NETS[2]}.42", note="probe with a javascript: URL"),
         PlannedRequest(
             "/games.roblox.com/v1/games/" + HOSTILE["img"] + "/votes",
@@ -408,6 +434,39 @@ def traffic_plan() -> list[PlannedRequest]:
             note="IPv6 and an attribute break",
         ),
     ]
+
+
+def traffic_plan(*, hostile: bool = True) -> list[PlannedRequest]:
+    """The seeding plan: served, cached (repeats), refused, probed, a Roblox 429, a Roblox 503, several IPs, places
+    and User-Agents, IPv6, and the hostile text set in paths, User-Agents and Roblox-Id headers (`hostile=False`:
+    ordinary text there instead, see `_odd_requests`)."""
+    plan: list[PlannedRequest] = []
+    for _ in range(6):
+        plan.append(
+            PlannedRequest(
+                "/games.roblox.com/v1/games?universeIds=1",
+                f"{DOC_NETS[0]}.10",
+                place=PLACES[0],
+                note="served then cached",
+            )
+        )
+    for i in range(4):
+        plan.append(
+            PlannedRequest(
+                f"/users.roblox.com/v1/users/{100 + i}",
+                f"{DOC_NETS[1]}.{20 + i}",
+                user_agent="RobloxGameServer/1.0",
+                place=PLACES[1],
+                note="served",
+            )
+        )
+    plan += [
+        PlannedRequest("/thumbnails.roblox.com/v1/too-many?size=48x48", f"{DOC_NETS[2]}.30", note="Roblox 429"),
+        PlannedRequest("/catalog.roblox.com/v1/fail/items", f"{DOC_NETS[2]}.31", note="Roblox 503"),
+        PlannedRequest("/wp-login.php", f"{DOC_NETS[2]}.40", user_agent="curl/8.0", note="probe: not Roblox"),
+        PlannedRequest("/.env", f"{DOC_NETS[2]}.41", user_agent="python-requests/2.31", note="probe"),
+    ]
+    plan += _odd_requests(hostile)
     for i in range(14):  # one client over the per-IP limit (10 per 50 s): throttle refusals
         plan.append(
             PlannedRequest(
@@ -435,8 +494,9 @@ def request_headers(item: PlannedRequest) -> dict[str, str | bytes]:
     return headers
 
 
-def roblox_answer(host: str, path: str) -> tuple[int, dict[str, str], bytes]:
-    """What the Roblox stand-in answers for a host and path (status, headers, JSON body)."""
+def roblox_answer(host: str, path: str, *, hostile: bool = True) -> tuple[int, dict[str, str], bytes]:
+    """What the Roblox stand-in answers for a host and path (status, headers, JSON body); the game's names are the
+    hostile text set, or made-up ordinary names with `hostile=False`."""
     if "/too-many" in path:
         body = json.dumps({"errors": [{"code": 0, "message": "Too many requests"}]}).encode()
         return 429, {"Content-Type": "application/json", "Retry-After": "5"}, body
@@ -447,9 +507,9 @@ def roblox_answer(host: str, path: str) -> tuple[int, dict[str, str], bytes]:
             {
                 "id": 1,
                 "rootPlaceId": int(PLACES[0]),
-                "name": HOSTILE["img"],
-                "creator": {"id": 7, "name": HOSTILE["script"], "type": "User"},
-                "description": HOSTILE["js_url"],
+                "name": HOSTILE["img"] if hostile else "Example Obby",
+                "creator": {"id": 7, "name": HOSTILE["script"] if hostile else "Example Studio", "type": "User"},
+                "description": HOSTILE["js_url"] if hostile else "A made-up game for the dashboard tests.",
             }
         ],
         "universeId": 1,
@@ -458,21 +518,49 @@ def roblox_answer(host: str, path: str) -> tuple[int, dict[str, str], bytes]:
     return 200, {"Content-Type": "application/json"}, json.dumps(payload).encode()
 
 
-async def seed_audit(ctx: Any, clock: Any) -> dict[str, Any]:
+CLEAN_AUDIT: Final[dict[str, str]] = {
+    "reason_1": "Raise the cache lifetime: game pages refetch too often",
+    "reason_2": "Again, a little higher after a day of traffic",
+    "reason_3": "A friendlier message for the weekly maintenance window",
+    "pattern": "catalog.roblox.com/v1/fail/*",
+    "note": "Roblox answers 503 here",
+    "message": "This endpoint is paused while Roblox fixes it.",
+    "rule_reason": "Every call failed for an hour",
+    "ban_subject": "198.51.100.99",
+    "ban_reason": "Sent the same request 400 times a minute",
+}
+"""The ordinary texts `seed_audit(..., hostile=False)` writes where the hostile set goes otherwise."""
+
+
+async def seed_audit(ctx: Any, clock: Any, *, hostile: bool = True) -> dict[str, Any]:
     """Audit rows with hostile text: settings changes through the real `SettingsService` (hostile reasons; one
     revertible change), and rows written by `config.audit.record` with hostile targets and documents (the targets
-    of a rule or a ban carry caller-chosen patterns in production)."""
+    of a rule or a ban carry caller-chosen patterns in production). `hostile=False` writes the same rows with the
+    ordinary texts of `CLEAN_AUDIT` (the documentation screenshots)."""
     from roxy.config import audit
     from roxy.config.audit import Actor
     from roxy.config.settings_service import SettingsService
 
+    text = (
+        {
+            "reason_1": "Raise the cache lifetime " + HOSTILE["img"],
+            "reason_2": "Again " + HOSTILE["js_url"],
+            "reason_3": HOSTILE["long"][:400],
+            "pattern": HOSTILE["img"],
+            "note": HOSTILE["script"],
+            "message": HOSTILE["js_url"],
+            "rule_reason": HOSTILE["attr"],
+            "ban_subject": HOSTILE["js_url"],
+            "ban_reason": HOSTILE["jinja"],
+        }
+        if hostile
+        else CLEAN_AUDIT
+    )
     service = SettingsService(ctx.dbs.control, runtime=ctx.settings, clock=clock)
     admin = Actor("admin", "owner", "203.0.113.200")
-    await service.update({"cache_ttl_seconds": 150}, admin, "Raise the cache lifetime " + HOSTILE["img"], "admin")
-    await service.update({"cache_ttl_seconds": 180}, admin, "Again " + HOSTILE["js_url"], "admin")
-    await service.update(
-        {"pause_message_default": "Back soon, after maintenance."}, admin, HOSTILE["long"][:400], "admin"
-    )
+    await service.update({"cache_ttl_seconds": 150}, admin, text["reason_1"], "admin")
+    await service.update({"cache_ttl_seconds": 180}, admin, text["reason_2"], "admin")
+    await service.update({"pause_message_default": "Back soon, after maintenance."}, admin, text["reason_3"], "admin")
     await ctx.settings.reload()
     now = int(clock.now())
 
@@ -482,10 +570,10 @@ async def seed_audit(ctx: Any, clock: Any) -> dict[str, Any]:
                 conn,
                 admin,
                 "rule.create",
-                "rules_endpoint_block:" + HOSTILE["img"],
+                "rules_endpoint_block:" + text["pattern"],
                 None,
-                {"pattern": HOSTILE["img"], "note": HOSTILE["script"], "message": HOSTILE["js_url"]},
-                HOSTILE["attr"],
+                {"pattern": text["pattern"], "note": text["note"], "message": text["message"]},
+                text["rule_reason"],
                 "SEEDAUDIT0000000000000001",
                 at=now - 120,
             ),
@@ -493,9 +581,9 @@ async def seed_audit(ctx: Any, clock: Any) -> dict[str, Any]:
                 conn,
                 Actor("system", "spam-detector", None),
                 "ban.create",
-                "bans:" + HOSTILE["js_url"],
+                "bans:" + text["ban_subject"],
                 None,
-                {"subject": HOSTILE["unicode"], "reason": HOSTILE["jinja"]},
+                {"subject": HOSTILE["unicode"] if hostile else text["ban_subject"], "reason": text["ban_reason"]},
                 None,
                 None,
                 at=now - 60,
@@ -518,8 +606,9 @@ async def seed_audit(ctx: Any, clock: Any) -> dict[str, Any]:
     return {"record_ids": ids}
 
 
-async def seed_recommendation(ctx: Any, clock: Any, *, severity: str = "critical") -> str:
-    """One open recommendation with hostile text in its subject, title and explanation (the engine's writer)."""
+async def seed_recommendation(ctx: Any, clock: Any, *, severity: str = "critical", hostile: bool = True) -> str:
+    """One open recommendation with hostile text in its subject, title and explanation (the engine's writer), or
+    with the wording the UP-429-ENDPOINT rule itself uses (`hostile=False`, the documentation screenshots)."""
     from roxy.config.insight_params import INSIGHT_RULES
     from roxy.core.ids import new_id
     from roxy.insights import simulate
@@ -529,18 +618,30 @@ async def seed_recommendation(ctx: Any, clock: Any, *, severity: str = "critical
     now = clock.now()
     rule_id = "UP-429-ENDPOINT"
     spec = INSIGHT_RULES[rule_id]
-    subject = "games.roblox.com/v1/games/" + HOSTILE["img"]
+    if hostile:
+        subject = "games.roblox.com/v1/games/" + HOSTILE["img"]
+        title = "Roblox refuses " + HOSTILE["script"]
+        explanation = "Plain words " + HOSTILE["js_url"]
+        impact = "Fewer calls " + HOSTILE["unicode"]
+    else:
+        subject = "games.roblox.com/v1/games/votes"
+        title = f"Roblox is rate-limiting {subject} (GET) on the direct path"
+        explanation = (
+            f"In the last 60 minutes Roblox returned 50 rate-limit responses (429) for GET {subject}, 100% of all "
+            "429s and 12.5% of this endpoint's upstream calls. A longer cache lifetime means fewer calls reach Roblox."
+        )
+        impact = "Fewer Roblox 429s on this endpoint: most answers are reused instead of fetched again."
     rec = Recommendation(
         rule_id=rule_id,
         family=spec.family,
         subject=subject,
-        title="Roblox refuses " + HOSTILE["script"],
+        title=title,
         severity=severity,
         confidence="high",
-        explanation="Plain words " + HOSTILE["js_url"],
+        explanation=explanation,
         evidence=Evidence(window_from=now - 3600, window_to=now, sample_size=50).add("roblox_429", 50, "responses"),
         changes=[ProposedChange("setting", key="cache_ttl_seconds", current=180, proposed=300)],
-        expected_impact="Fewer calls " + HOSTILE["unicode"],
+        expected_impact=impact,
         risk="low",
     )
     rec.id = new_id("rec", clock)
@@ -554,18 +655,18 @@ async def seed_recommendation(ctx: Any, clock: Any, *, severity: str = "critical
     return str(rec.id)
 
 
-async def seed_health_run(ctx: Any, clock: Any) -> int:
-    """One finished health run with a pass, a warn and a fail (the health store's writers; never a real run)."""
+async def seed_health_run(ctx: Any, clock: Any, *, hostile: bool = True) -> int:
+    """One finished health run with a pass, a warn and a fail (the health store's writers; never a real run); the
+    warn's text carries hostile text unless `hostile=False`."""
     from roxy import __version__
     from roxy.health import store
     from roxy.health.model import CheckResult, Status
 
     now = int(clock.now())
+    low_hits = "The hit ratio is low " + (HOSTILE["img"] if hostile else "for an hour: 41% of calls were reused.")
     results = [
         CheckResult("H-DB-INTEGRITY", Status.PASS, "ok", "ok", "Every database passed its quick check.", ""),
-        CheckResult(
-            "H-CACHE-HIT", Status.WARN, "41%", "60%", "The hit ratio is low " + HOSTILE["img"], "/admin/cache#settings"
-        ),
+        CheckResult("H-CACHE-HIT", Status.WARN, "41%", "60%", low_hits, "/admin/cache#settings"),
         CheckResult(
             "H-REACH", Status.FAIL, "timeout", "200", "games.roblox.com did not answer.", "/admin/upstream#health"
         ),
@@ -709,7 +810,7 @@ def bound_socket() -> socket.socket:
     return sock
 
 
-def roblox_mock_app() -> Any:
+def roblox_mock_app(*, hostile: bool = True) -> Any:
     """A Starlette app playing every Roblox host (`roblox_answer`), and recording what it was asked."""
     from starlette.applications import Starlette
     from starlette.requests import Request
@@ -723,7 +824,7 @@ def roblox_mock_app() -> Any:
         path = request.url.path
         if len(calls) < 10_000:
             calls.append((request.method, host, path))
-        status, headers, body = roblox_answer(host, path)
+        status, headers, body = roblox_answer(host, path, hostile=hostile)
         return Response(body, status_code=status, headers=headers)
 
     app = Starlette(routes=[Route("/{path:path}", answer, methods=["GET", "POST", "HEAD"])])
@@ -740,10 +841,10 @@ class RobloxMock:
     server: _ThreadServer
 
     @classmethod
-    def start(cls) -> RobloxMock:
+    def start(cls, *, hostile: bool = True) -> RobloxMock:
         sock = bound_socket()
         port = sock.getsockname()[1]
-        app = roblox_mock_app()
+        app = roblox_mock_app(hostile=hostile)
         server = _ThreadServer(app, sock, lifespan="off", name="roblox-mock")
         server.start()
         return cls(base_url=f"http://127.0.0.1:{port}", app=app, server=server)
@@ -806,6 +907,8 @@ class DashboardServer:
     admin: Any = None
     signed_in: SignedIn | None = None
     seeded: dict[str, Any] = field(default_factory=dict)
+    hostile: bool = True
+    """Seeded with the hostile text set (every test), or with ordinary text (the documentation screenshots)."""
     _last_step: int = 0
 
     SESSION_COOKIE = SESSION_COOKIE_NAME
@@ -819,8 +922,12 @@ class DashboardServer:
         return self.base_url
 
     @classmethod
-    def start(cls, *, seed: bool = True, settings: Mapping[str, Any] | None = None) -> DashboardServer:
-        """Start everything (see the module docstring). `settings` are applied before seeding."""
+    def start(
+        cls, *, seed: bool = True, settings: Mapping[str, Any] | None = None, hostile: bool = True
+    ) -> DashboardServer:
+        """Start everything (see the module docstring). `settings` are applied before seeding. `hostile=False`
+        seeds (and has the Roblox stand-in answer) ordinary text instead of the hostile set: the documentation
+        screenshots use it, so no picture shows an XSS payload; every test keeps the hostile seed."""
         import os
 
         from auth_harness import fast_hasher
@@ -829,7 +936,7 @@ class DashboardServer:
         from roxy.main import create_app
 
         install_loopback_guard()
-        roblox = RobloxMock.start()
+        roblox = RobloxMock.start(hostile=hostile)
         state = Path(tempfile.mkdtemp(prefix="roxy-pages-"))
         (state / "state").mkdir(mode=0o750)
         (state / "state").chmod(0o750)  # like systemd's StateDirectory (the app warns about a looser mode)
@@ -871,7 +978,9 @@ class DashboardServer:
                 os.environ.pop(TEST_UPSTREAM_ENV, None)
             else:
                 os.environ[TEST_UPSTREAM_ENV] = saved
-        running = cls(base_url=base, app=app, clock=clock, server=server, roblox=roblox, state_dir=state)
+        running = cls(
+            base_url=base, app=app, clock=clock, server=server, roblox=roblox, state_dir=state, hostile=hostile
+        )
         running.change_settings({**SEED_SETTINGS, **dict(settings or {})})
         running.make_admin()
         running.signed_in = running.login()
@@ -990,7 +1099,7 @@ class DashboardServer:
         """Send the seeding plan through the real proxy; returns the statuses."""
         statuses: list[int] = []
         with self.http() as client:
-            for item in plan if plan is not None else traffic_plan():
+            for item in plan if plan is not None else traffic_plan(hostile=self.hostile):
                 response = client.request(item.method, item.path, headers=request_headers(item))
                 statuses.append(response.status_code)
         return statuses
@@ -1011,9 +1120,9 @@ class DashboardServer:
         statuses = self.send_traffic()
         self.flush()
         self.seeded["statuses"] = statuses
-        self.seeded["audit"] = self.run(seed_audit(self.ctx, self.clock))
-        self.seeded["recommendation"] = self.run(seed_recommendation(self.ctx, self.clock))
-        self.seeded["health_run"] = self.run(seed_health_run(self.ctx, self.clock))
+        self.seeded["audit"] = self.run(seed_audit(self.ctx, self.clock, hostile=self.hostile))
+        self.seeded["recommendation"] = self.run(seed_recommendation(self.ctx, self.clock, hostile=self.hostile))
+        self.seeded["health_run"] = self.run(seed_health_run(self.ctx, self.clock, hostile=self.hostile))
         self.flush()
         return self.seeded
 
@@ -1043,8 +1152,194 @@ def wait_until(predicate: Callable[[], bool], timeout_s: float = 10.0, step_s: f
     return predicate()
 
 
+# ============================================================================================ documentation pictures
+
+PALETTE_COLORS: Final = 256
+"""Colors of a documentation screenshot's palette: the most an 8-bit palette PNG holds."""
+
+_PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
+
+# Runs in a blank page of the test browser (no page CSP applies to `page.evaluate`). The browser decodes the
+# screenshot (a canvas), counts its colors in a table indexed by the 24-bit color, and picks the palette: every
+# color when there are few enough, otherwise a median cut that always splits the box with the largest squared error
+# at the cut leaving the least error, refined by a few k-means rounds over the distinct colors. Each pixel becomes
+# the index of its nearest palette color (no dithering: flat interface colors stay flat) in rows with filter 0
+# (none, the usual choice for palette images), deflated by the browser's CompressionStream.
+_COMPACT_PNG_JS: Final = """async ({png, colors}) => {
+  const text = atob(png), bytes = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+  const bitmap = await createImageBitmap(new Blob([bytes], {type: "image/png"}),
+                                         {colorSpaceConversion: "none", premultiplyAlpha: "none"});
+  const width = bitmap.width, height = bitmap.height;
+  const canvas = new OffscreenCanvas(width, height);
+  const g = canvas.getContext("2d", {willReadFrequently: true});
+  g.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  const rgba = g.getImageData(0, 0, width, height).data;
+  const table = new Int32Array(1 << 24);
+  for (let j = 0; j < rgba.length; j += 4) {
+    if (rgba[j + 3] !== 255) return {opaque: false};
+    table[(rgba[j] << 16) | (rgba[j + 1] << 8) | rgba[j + 2]]++;
+  }
+  let k = 0;
+  for (let c = 0; c < table.length; c++) if (table[c]) k++;
+  const color = new Int32Array(k), weight = new Float64Array(k);
+  for (let c = 0, i = 0; c < table.length; c++) if (table[c]) { color[i] = c; weight[i++] = table[c]; }
+  const channel = [(c) => c >> 16, (c) => (c >> 8) & 255, (c) => c & 255];
+  const [red, green, blue] = channel;
+  const pal = new Int32Array(colors * 3);
+  let count = 0;
+  const nearest = (c) => {
+    const r = red(c), gr = green(c), b = blue(c);
+    let best = 0, least = Infinity;
+    for (let p = 0; p < count; p++) {
+      const d = (pal[3 * p] - r) ** 2 + (pal[3 * p + 1] - gr) ** 2 + (pal[3 * p + 2] - b) ** 2;
+      if (d < least) { least = d; best = p; }
+    }
+    return best;
+  };
+  if (k <= colors) {
+    for (let i = 0; i < k; i++) pal.set([red(color[i]), green(color[i]), blue(color[i])], 3 * count++);
+  } else {
+    const order = new Int32Array(k);
+    for (let i = 0; i < k; i++) order[i] = i;
+    const error = (w, r, gr, b, q) => (w ? q - (r * r + gr * gr + b * b) / w : 0);
+    const box = (lo, hi) => {
+      const s = [0, 0, 0, 0, 0];
+      for (let i = lo; i < hi; i++) {
+        const c = color[order[i]], w = weight[order[i]], r = red(c), gr = green(c), b = blue(c);
+        s[0] += w; s[1] += w * r; s[2] += w * gr; s[3] += w * b; s[4] += w * (r * r + gr * gr + b * b);
+      }
+      return {lo, hi, s, error: hi - lo > 1 ? error(...s) : 0};
+    };
+    const boxes = [box(0, k)];
+    while (boxes.length < colors) {
+      let pick = -1;
+      for (let b = 0; b < boxes.length; b++) {
+        if (boxes[b].error > 0 && (pick < 0 || boxes[b].error > boxes[pick].error)) pick = b;
+      }
+      if (pick < 0) break;
+      const {lo, hi, s} = boxes[pick];
+      let axis = 0, widest = -1;
+      for (let a = 0; a < 3; a++) {
+        let m = 0, q = 0;
+        for (let i = lo; i < hi; i++) {
+          const v = channel[a](color[order[i]]), w = weight[order[i]];
+          m += w * v; q += w * v * v;
+        }
+        const variance = q / s[0] - (m / s[0]) ** 2;
+        if (variance > widest) { widest = variance; axis = a; }
+      }
+      const key = channel[axis];
+      order.subarray(lo, hi).sort((x, y) => key(color[x]) - key(color[y]));
+      let w = 0, r = 0, gr = 0, b = 0, q = 0, cut = -1, least = Infinity;
+      for (let i = lo; i < hi - 1; i++) {
+        const c = color[order[i]], cw = weight[order[i]], cr = red(c), cg = green(c), cb = blue(c);
+        w += cw; r += cw * cr; gr += cw * cg; b += cw * cb; q += cw * (cr * cr + cg * cg + cb * cb);
+        if (key(c) === key(color[order[i + 1]])) continue;
+        const total = error(w, r, gr, b, q) + error(s[0] - w, s[1] - r, s[2] - gr, s[3] - b, s[4] - q);
+        if (total < least) { least = total; cut = i + 1; }
+      }
+      if (cut < 0) { boxes[pick].error = 0; continue; }
+      boxes.splice(pick, 1, box(lo, cut), box(cut, hi));
+    }
+    for (const {s} of boxes) pal.set([1, 2, 3].map((n) => Math.round(s[n] / s[0])), 3 * count++);
+    for (let round = 0; round < (k > 400000 ? 1 : 4); round++) {
+      const acc = new Float64Array(count * 4);
+      for (let i = 0; i < k; i++) {
+        const c = color[i], p = 4 * nearest(c), cw = weight[i];
+        acc[p] += cw; acc[p + 1] += cw * red(c); acc[p + 2] += cw * green(c); acc[p + 3] += cw * blue(c);
+      }
+      for (let p = 0; p < count; p++) {
+        if (acc[4 * p]) pal.set([1, 2, 3].map((n) => Math.round(acc[4 * p + n] / acc[4 * p])), 3 * p);
+      }
+    }
+  }
+  let squared = 0, worst = 0;
+  for (let i = 0; i < k; i++) {
+    const c = color[i], p = nearest(c);
+    const dr = pal[3 * p] - red(c), dg = pal[3 * p + 1] - green(c), db = pal[3 * p + 2] - blue(c);
+    squared += weight[i] * (dr * dr + dg * dg + db * db);
+    worst = Math.max(worst, Math.abs(dr), Math.abs(dg), Math.abs(db));
+    table[c] = p;
+  }
+  const stride = width + 1, raw = new Uint8Array(height * stride);
+  for (let y = 0, j = 0; y < height; y++) {
+    for (let x = 0, o = y * stride + 1; x < width; x++, j += 4) {
+      raw[o++] = table[(rgba[j] << 16) | (rgba[j + 1] << 8) | rgba[j + 2]];
+    }
+  }
+  const packed = await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream("deflate"))).blob();
+  const data = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).slice(String(reader.result).indexOf(",") + 1));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(packed);
+  });
+  return {opaque: true, width, height, palette: Array.from(pal.subarray(0, 3 * count)), data, unique: k, squared,
+          worst};
+}"""
+
+
+def _png_chunk(kind: bytes, body: bytes) -> bytes:
+    """One PNG chunk: length, type, data and the CRC-32 of type and data (PNG specification, section 5.3)."""
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+
+
+def compact_png(browser: Any, png: bytes, colors: int = PALETTE_COLORS) -> tuple[bytes, dict[str, Any]]:
+    """A screenshot (an opaque truecolor PNG) as an 8-bit palette PNG of at most `colors` colors, and what that cost.
+
+    Playwright writes truecolor PNGs; a dashboard page has a few flat colors plus the shades of anti-aliased text
+    and charts, so a palette keeps the picture readable at about a third of the size, without a dependency (no
+    Pillow): the browser that took the screenshot does the pixel work (`_COMPACT_PNG_JS`) and the standard library
+    writes the file (zlib at level 9). The stats: distinct colors in the screenshot, palette size, the peak
+    signal-to-noise ratio in dB (None when the palette holds every color: lossless) and the largest channel error."""
+    page = browser.new_page()
+    try:
+        out = page.evaluate(_COMPACT_PNG_JS, {"png": base64.b64encode(png).decode("ascii"), "colors": colors})
+    finally:
+        page.close()
+    assert out["opaque"], "a documentation screenshot must be opaque (a palette PNG here carries no alpha)"
+    width, height = int(out["width"]), int(out["height"])
+    rows = zlib.decompress(base64.b64decode(out["data"]))
+    assert len(rows) == height * (width + 1), "the browser returned rows of the wrong size"
+    packer = zlib.compressobj(9, zlib.DEFLATED, 15, 9)  # level 9 and the largest window and memory: smallest file
+    data = b"".join(
+        (
+            _PNG_SIGNATURE,
+            _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 3, 0, 0, 0)),  # 8-bit, palette, no interlace
+            _png_chunk(b"PLTE", bytes(out["palette"])),
+            _png_chunk(b"IDAT", packer.compress(rows) + packer.flush()),
+            _png_chunk(b"IEND", b""),
+        )
+    )
+    mean_squared = float(out["squared"]) / (3 * width * height)
+    stats = {
+        "unique_colors": int(out["unique"]),
+        "palette": len(out["palette"]) // 3,
+        "psnr_db": round(10 * math.log10(255**2 / mean_squared), 1) if mean_squared else None,
+        "max_error": int(out["worst"]),
+        "truecolor_bytes": len(png),
+        "bytes": len(data),
+    }
+    return data, stats
+
+
+def save_compact_screenshot(page: Any, path: Path, **options: Any) -> dict[str, Any]:
+    """Screenshot `page` (`options` go to `page.screenshot`) and write it to `path` as a palette PNG
+    (`compact_png`, whose stats are returned): what the documentation copies in docs/screenshots/ are."""
+    browser = page.context.browser
+    assert browser is not None, "a page of a launched browser (not a persistent context)"
+    data, stats = compact_png(browser, page.screenshot(**options))
+    path.write_bytes(data)
+    return stats
+
+
 __all__ = [
+    "CLEAN_AUDIT",
     "HOSTILE",
+    "HOSTILE_SIGNS",
+    "PALETTE_COLORS",
     "PLACES",
     "RAW_MARKERS",
     "SEED_SETTINGS",
@@ -1058,12 +1353,15 @@ __all__ = [
     "SignedIn",
     "assert_inert",
     "bound_socket",
+    "compact_png",
+    "hostile_text_in",
     "install_loopback_guard",
     "make_fake_credentials",
     "parse_html",
     "remove_loopback_guard",
     "request_headers",
     "roblox_answer",
+    "save_compact_screenshot",
     "seed_audit",
     "seed_health_run",
     "seed_recommendation",

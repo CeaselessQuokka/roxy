@@ -428,7 +428,33 @@ not be more than 50% higher.
   abuse transaction and the 50 ms worst case of a metrics flush were not met under contention, and the upstream
   transaction was not measured on its own; the dashboard targets (pages under 300 ms, 90-day charts under 500 ms)
   were met with the exceptions below.
-- Quiet-machine numbers: (being measured on commit 686fe46; added here when the release measurements finish)
+- Quiet-machine numbers (measured 2026-10-14 on a77122f, which has the code of 686fe46, on the development machine
+  with nothing else running in it; still not a server of the production size; `docs/PERFORMANCE.md`, "Quiet-machine
+  reference run"). "p50" is the median request, "p95" the time 95 of every 100 stay under. **Memory per color:** 350
+  MiB after 34 minutes at 10 requests a second (about 368 MiB by the time a worker recycles, at 67 minutes) and 388
+  MiB at 200 a second when a worker recycles (3.5 minutes): both under `MemoryHigh` 420M; one color at `MemoryMax`
+  500M beside nginx and the operating system is about 700 of the 909 MB, a deploy about 855. Without recycling a color
+  passes `MemoryHigh` after about 10 minutes at 200 a second and peaked at 470 MiB in 30 minutes (under `MemoryMax`),
+  so `ROXY_MAX_REQUESTS` must stay at 20,000 or lower. **Write lock ceiling:** about 325 answered requests a second
+  when 450 are offered (252 for the code before the performance fixes, +29%); past it, 64 to 140 callers a run got
+  HTTP 503. **Plan 19.10 row 7:** 0.097% Roblox 429s in all five replays (one 429 in about 1,030 calls; the bar is
+  0.1%) and 49.0% of calls avoided (the bar is 40%): met, but by less than one 429, so one more 429 in a run would
+  fail it. **Dashboard pages against plan 6.7:** every page under 300 ms at p95 at its default range in three of four
+  runs, and every chart the dashboard draws over 90 days under 206 ms; the exceptions are in the misses below.
+  **Recommendations evaluation:** 0.60 to 0.63 s of one CPU at a day's volume, a 14 MiB peak, every 30 s on the leader
+  (the same as before).
+- Quiet-machine misses, every target not met: (1) proxy overhead on a cache hit p99 16.6 to 140 ms (target 8 ms);
+  (2) on a miss p99 32.8 to 202 ms (target 15 ms); (3) the abuse transaction p99 23 to 92 ms in the running system
+  (target 3 ms; the database write alone takes 1.3 ms); (4) the slowest metrics flush 176 to 873 ms (target 50 ms; the
+  median, 21 to 33 ms, meets it); (5) the upstream transaction is still not measured on its own; (6) the Overview page
+  377 ms at p95 in one run (430 ms on its first load after a start) and 313 to 491 ms (p50) at 90 days in every run
+  (target 300 ms); (7) two cards over 300 ms at p95 in every run, Clients > IP addresses 656 to 833 ms and
+  Protection > Refusal reasons 343 to 547 ms, several times slower than in the earlier measurement (92 and 123 ms at
+  p50), cause not traced (the final review's client table change, memory-2, is the first suspect); (8) at 90 days
+  Protection > Request filters 554 to 628 ms and Endpoint blocks 525 to 545 ms, and hourly points the dashboard never
+  asks for up to 989 ms (target 500 ms); (9) under a flood one address got 1 or 2 requests past its rate limit
+  (target 0); (10) after a Roblox 429 with `Retry-After: 30`, Roxy called that endpoint again only after about 71 s,
+  about 40 s later than Roblox allowed.
 - Known slow spots: the Protection attempts tabs at 90 days (Request filters 0.53 to 0.65 s, over the 500 ms target);
   the Overview at 90 days under load (up to about 0.53 s; quiet it is about 0.27 s); pages above about 150 KiB
   (Overview 185, Security 192, Cache and Clients 159); hourly points over 90 days on four API routes (up to 0.76 s;

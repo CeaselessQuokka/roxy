@@ -18,7 +18,9 @@ What this is
     review, and with `ROXY_SCREENSHOTS=1` the dark theme's to `docs/screenshots/phone_<flow>_<step>.png` (as
     tests/e2e/test_docs_screenshots.py does, so an ordinary run leaves the repository alone; the second entry of a
     flow adds only its own first step there). At the end of each flow no CSP report reached the server either
-    (`GET /security/csp-reports`).
+    (`GET /security/csp-reports`). As in test_docs_screenshots.py, `ROXY_SCREENSHOTS=1` also runs the flows on the
+    dashboard seeded with ordinary text (`clean_dashboard`) and writes the documentation copies as palette PNGs
+    (`pages_harness.save_compact_screenshot`); an ordinary run keeps the hostile seed.
 
 Why it exists
     The page tests check each page at phone width; only a flow shows that the controls a phone needs are reachable,
@@ -48,13 +50,30 @@ from typing import Any
 
 import pytest
 
-from pages_harness import SESSION_COOKIE_NAME, THEMES, VIEWPORTS, seed_recommendation
+from pages_harness import (
+    SESSION_COOKIE_NAME,
+    THEMES,
+    VIEWPORTS,
+    hostile_text_in,
+    save_compact_screenshot,
+    seed_recommendation,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 DOCS_SHOTS = REPO / "docs" / "screenshots"
 REVIEW_SHOTS = REPO / ".remake" / "p11_reports" / "shots"
 WRITE_DOCS = os.environ.get("ROXY_SCREENSHOTS") == "1"
 """Write the documentation copies (the dark theme's steps) only when asked, as test_docs_screenshots.py does."""
+
+if WRITE_DOCS:
+
+    @pytest.fixture(scope="module")
+    def dashboard(clean_dashboard: Any) -> Any:
+        """The documentation pictures come from the dashboard seeded with ordinary text (tests/e2e/conftest.py);
+        without `ROXY_SCREENSHOTS=1` this override does not exist and the module uses the shared hostile seed."""
+        return clean_dashboard
+
+
 WIDTH, HEIGHT = VIEWPORTS["phone"]
 TOUCH_PX = 44
 """Plan 14.8: every control reachable with a touch target of at least 44 by 44 px."""
@@ -111,6 +130,9 @@ class Phone:
     run_axe: Callable[[Any], list[dict[str, Any]]]
     docs_steps: Collection[str] | None = None
     """The steps whose dark screenshot goes to docs/screenshots (None: every step)."""
+    properties: list[tuple[str, object]] | None = None
+    """The test's `user_properties` (what `record_property` writes to): each documentation copy's palette stats
+    (`--junitxml` shows them)."""
     console: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     taps: list[str] = field(default_factory=list)
@@ -205,14 +227,18 @@ class Phone:
 
     def shot(self, name: str) -> None:
         """The screen as the phone shows it (the viewport, not the whole page): every step for the review, and the
-        dark theme's documentation copy when asked (`ROXY_SCREENSHOTS=1`, see the module docstring)."""
+        dark theme's documentation copy when asked (`ROXY_SCREENSHOTS=1`, a palette PNG: see the module docstring)."""
         REVIEW_SHOTS.mkdir(parents=True, exist_ok=True)
         stem = f"phone_{self.flow}_{name}"
         self.page.screenshot(path=str(REVIEW_SHOTS / f"{stem}_{self.theme}.png"), full_page=False)
         wanted = self.docs_steps is None or name in self.docs_steps
         if WRITE_DOCS and self.theme == "dark" and wanted:
             DOCS_SHOTS.mkdir(parents=True, exist_ok=True)
-            self.page.screenshot(path=str(DOCS_SHOTS / f"{stem}.png"), full_page=False)
+            shown = hostile_text_in(self.page.locator("body").inner_text())
+            assert shown == [], f"{stem}: hostile text {shown} in a documentation picture"
+            stats = save_compact_screenshot(self.page, DOCS_SHOTS / f"{stem}.png", full_page=False)
+            if self.properties is not None:
+                self.properties.append((f"screenshot {stem}", stats))
 
 
 def csp_reports(dashboard: Any) -> int:
@@ -224,7 +250,9 @@ def csp_reports(dashboard: Any) -> int:
 
 
 @pytest.fixture
-def phone(browser: Any, dashboard: Any, wait_js: Any, axe: Any) -> Iterator[Callable[..., Phone]]:
+def phone(
+    browser: Any, dashboard: Any, wait_js: Any, axe: Any, request: pytest.FixtureRequest
+) -> Iterator[Callable[..., Phone]]:
     """`phone(flow, theme, docs_steps=None)`: a fresh touch context at 390 by 844, signed in, the theme saved as the
     admin's own."""
     contexts: list[Any] = []
@@ -257,7 +285,8 @@ def phone(browser: Any, dashboard: Any, wait_js: Any, axe: Any) -> Iterator[Call
         )
         page = context.new_page()
         page.set_default_timeout(15_000)
-        record = Phone(page, theme, flow, dashboard.base_url, wait_js, axe, docs_steps)
+        properties = request.node.user_properties  # what `record_property` appends to, without its xunit2 warning
+        record = Phone(page, theme, flow, dashboard.base_url, wait_js, axe, docs_steps, properties)
         page.add_init_script(CSP_RECORDER)
         page.on("console", lambda message: record.console.append(f"{message.type}: {message.text}"))
         page.on("pageerror", lambda error: record.errors.append(str(error)))
@@ -349,7 +378,9 @@ def drawer_of(rec_id: str) -> str:
 @pytest.mark.parametrize("entry", ["overview", "bell"])
 def test_apply_a_recommendation_from_a_phone_then_undo_it(phone: Any, dashboard: Any, theme: str, entry: str) -> None:
     reports = csp_reports(dashboard)
-    rec_id: str = dashboard.run(seed_recommendation(dashboard.ctx, dashboard.clock, severity="critical"))
+    # Hostile text in an ordinary run (the shared seed); ordinary text on the documentation's clean dashboard.
+    recommendation = seed_recommendation(dashboard.ctx, dashboard.clock, severity="critical", hostile=dashboard.hostile)
+    rec_id: str = dashboard.run(recommendation)
     before = dashboard.api("GET", "settings/cache_ttl_seconds").json()["setting"]["value"]
     # The bell entry adds only its own first step to the documentation (the drawer steps are the same).
     flow = phone("apply", theme) if entry == "overview" else phone("apply_bell", theme, docs_steps={"1_list"})
