@@ -352,26 +352,37 @@ async def test_head_shares_get_and_view_options_do_not_split(cache: CacheService
 CURRENCY = b"/economy.roblox.com/v1/user/currency"
 
 
-def credential_rules(private: int) -> Any:
-    return rules_snapshot(
-        credential_allowlist=[
-            {"pattern": "economy.roblox.com/v1/user/currency", "methods": ["GET"], "cache_private": private}
-        ]
-    )
+GAMES = "games.roblox.com/v1/games"
+"""`games GET /v1/games`: ALLOW_TOKEN in the shipped endpoint policy, shared (`cache_private` off)."""
 
 
-def test_policy_auth_class_follows_the_allowlist_and_private_is_never_keyed() -> None:
+def policy_rules(verdict: str | None, private: int = 0) -> Any:
+    """The shipped policy, with an admin override on `games GET /v1/games` when `verdict` is given."""
+    if verdict is None:
+        return rules_snapshot()
+    override = {"endpoint_id": "games:GET:/v1/games", "verdict": verdict, "cache_private": private}
+    return rules_snapshot(policy_overrides=[override])
+
+
+def test_policy_auth_class_follows_the_endpoint_policy_and_private_is_never_keyed() -> None:
+    """The auth class is the policy's: ALLOW_TOKEN keys CRED, an ALLOW_ANON override or a BLOCK row keys ANON, and
+    an override with `cache_private` is never keyed at all. CRED and ANON keys never share an id or a flight."""
     from roxy.cache.policy import CacheSettings
 
     cs = CacheSettings.read(FakeSettings())
-    anon = request_policy("GET", "economy.roblox.com/v1/user/currency", {}, cs, rules_snapshot())
-    shared = request_policy("GET", "economy.roblox.com/v1/user/currency", {}, cs, credential_rules(0))
-    private = request_policy("GET", "economy.roblox.com/v1/user/currency", {}, cs, credential_rules(1))
-    assert (anon.auth_class, shared.auth_class) == (AuthClass.ANON, AuthClass.CRED)
+    shipped = request_policy("GET", GAMES, {}, cs, policy_rules(None))
+    anon = request_policy("GET", GAMES, {}, cs, policy_rules("ALLOW_ANON"))
+    blocked = request_policy("GET", "economy.roblox.com/v1/user/currency", {}, cs, policy_rules(None))
+    private = request_policy("GET", GAMES, {}, cs, policy_rules("ALLOW_TOKEN", 1))
+    assert (shipped.auth_class, anon.auth_class, blocked.auth_class) == (AuthClass.CRED, AuthClass.ANON, AuthClass.ANON)
+    assert shipped.cacheable
+    assert not shipped.private
     assert not private.cacheable
     assert private.private
-    key_anon = build_key("GET", "economy.roblox.com", "/v1/user/currency", [], b"")
-    key_cred = build_key("GET", "economy.roblox.com", "/v1/user/currency", [], b"", auth_class=AuthClass.CRED)
+    for method in ("PUT", "PATCH", "DELETE"):  # never the credential's class, whatever the override says
+        assert request_policy(method, GAMES, {}, cs, policy_rules("ALLOW_TOKEN")).auth_class is AuthClass.ANON
+    key_anon = build_key("GET", "games.roblox.com", "/v1/games", [], b"")
+    key_cred = build_key("GET", "games.roblox.com", "/v1/games", [], b"", auth_class=AuthClass.CRED)
     assert key_anon.id != key_cred.id
     assert key_anon.flight_key != key_cred.flight_key
     leaked = ok('{"robux":1}', auth_class=AuthClass.CRED)
@@ -381,8 +392,8 @@ def test_policy_auth_class_follows_the_allowlist_and_private_is_never_keyed() ->
 async def test_same_worker_follower_never_receives_a_credential_answer_for_an_anonymous_key(dbs: Any) -> None:
     """Defense in depth (cache/service.py docstring: an answer fetched with the credential belongs to its own
     request). The trigger in production is any disagreement between the cache's policy (rules at peek time) and
-    the upstream's routing (rules at fetch time): for example a `cache_private` allowlist row added between the two,
-    or an allowlist regex cut off by the match timeout in one place and not the other. The follower joined the
+    the upstream's routing (rules at fetch time): for example an admin override with `cache_private` added between
+    the two, or a verdict changed from ALLOW_ANON to ALLOW_TOKEN in between. The follower joined the
     owner's flight in the same worker; when the owner's answer comes back with the credential, the follower makes
     its own call (anonymous here, the rules have settled) instead of receiving it. Fixed ingress finding (F2)."""
     gate = asyncio.Event()

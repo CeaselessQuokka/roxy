@@ -95,7 +95,8 @@ def test_a_post_off_by_cache_post_requests_keeps_its_identity() -> None:
     assert not request_policy("PUT", batch, {}, _cs(cache_post_requests="all"), rules).key_when_off
     assert not request_policy("POST", batch, {}, _cs(cache_enabled=0, cache_post_requests="off"), rules).key_when_off
     private = rules_snapshot(
-        credential_allowlist=[{"pattern": batch, "methods": ["POST"], "cache_private": 1}], cache_rules=rule_rows
+        policy_overrides=[{"endpoint_id": "users:POST:/v1/users", "verdict": "ALLOW_TOKEN", "cache_private": 1}],
+        cache_rules=rule_rows,
     )
     assert not request_policy("POST", batch, {}, _cs(cache_post_requests="off"), private).key_when_off
     # An OFF policy never stores, whatever rule it carries.
@@ -136,21 +137,20 @@ def test_rule_lifetimes() -> None:
     assert not never.coalesce  # nothing would be stored, so nobody waits for an owner
 
 
-def test_credential_allowlist_sets_auth_class_and_private_is_off() -> None:
+def test_a_credential_grant_sets_auth_class_and_private_is_off() -> None:
     rules = rules_snapshot(
-        credential_allowlist=[
-            {"pattern": "users.roblox.com/v1/users/authenticated", "methods": ["GET"], "cache_private": 1},
-            {"pattern": "economy.roblox.com/v1/user/currency", "methods": ["GET"], "cache_private": 0},
-        ]
+        policy_overrides=[{"endpoint_id": "users:GET:/v1/users/{userId}", "verdict": "ALLOW_TOKEN", "cache_private": 1}]
     )
-    private = request_policy("GET", "users.roblox.com/v1/users/authenticated", {}, _cs(), rules)
+    private = request_policy("GET", "users.roblox.com/v1/users/1", {}, _cs(), rules)
     assert not private.cacheable
     assert private.private
     assert private.auth_class is AuthClass.CRED
     assert private.off_reason == "private_credential"
-    shared = request_policy("GET", "economy.roblox.com/v1/user/currency", {}, _cs(), rules)
+    shared = request_policy("GET", "games.roblox.com/v1/games", {}, _cs(), rules)  # shipped ALLOW_TOKEN, shared
     assert shared.cacheable
     assert shared.auth_class is AuthClass.CRED
+    blocked = request_policy("GET", "users.roblox.com/v1/users/authenticated", {}, _cs(), rules)
+    assert blocked.auth_class is AuthClass.ANON  # a blocked endpoint never has a credential key
 
 
 def test_caller_no_cache_only_when_respected() -> None:

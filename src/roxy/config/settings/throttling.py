@@ -991,7 +991,8 @@ SETTINGS: list[SettingSpec] = [
             "skips the flood limit, the spam detectors, the emergency limit (throttle-all), the per-IP limit, "
             "place limits, the browser challenge, the bot score block, User-Agent rules, endpoint rules and the "
             "tarpit, but is still subject to pause, bans, endpoint blocks, request filters, ignored paths, unsafe "
-            "URL refusals, the Roblox host check and credential smuggling refusals. 0 means new entries never expire."
+            "URL refusals, the Roblox host check, credential smuggling refusals and the endpoint policy. 0 means new "
+            "entries never expire."
         ),
         if_raised=(
             "Entries last longer before they must be renewed, so forgotten load-test or office entries keep "

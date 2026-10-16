@@ -1,0 +1,60 @@
+{#-
+  Endpoint policy page, card `summary` (`roxy/admin/pages/policy.py summary_card`), from `GET /admin/api/v1/policy`
+  (the same function): how many endpoints have each verdict now (overrides and category switches applied), the
+  overrides and switches in force, the last 24 hours (refused before Roblox, unknown endpoints and their requests,
+  shadow mode, caller sign-in attempts), the shipped seed, whether the credential is on and its rate, and the old
+  credential allowlist rows (no longer read) with what the policy does for each now. "Reset to shipped defaults"
+  posts to `POST /admin/api/v1/policy/reset` (a fresh second factor and a reason). The three `endpoint_policy_*`
+  settings are below (the kit's settings block, `policy#summary`).
+  Context: `frame`, `answer`, `tiles`, `switches`, `legacy`, `settings_now`, `enforced`, `reset_url`, `changed_href`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num, caller_text %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% from "components/pieces.html" import stat %}
+{% set reset %}<button type="button" class="btn btn--sm btn--ghost" data-dialog-open="dlg-policy-reset" data-action="policy-reset-all">{{ icon("reset") }}<span>Reset to shipped defaults</span></button>{% endset %}
+{% call page_card(frame, actions=reset) %}
+<p class="policy-state">
+  {% if enforced %}{{ status_badge("ok", "Enforced") }} <span>Blocked endpoints are refused before Roblox with status {{ settings_now.endpoint_policy_block_status }}.</span>
+  {% else %}{{ status_badge("warn", "Shadow mode") }} <span>Refuse blocked endpoints is off: blocked endpoints are sent without Roxy's account and counted under Shadow mode, never refused.</span>{% endif %}
+</p>
+<dl class="g3-stats" data-policy-counts>
+  {% for t in tiles %}{{ stat(t.label, num(t.count), "endpoints", t.tone if t.tone in ("ok", "warn", "bad") else "") }}{% endfor %}
+  {{ stat("Changed from the defaults", num(answer.overrides), (switches|length) ~ " category switches in force") }}
+</dl>
+<h3 class="g3-subhead">Last 24 hours</h3>
+<dl class="g3-stats" data-policy-day>
+  {{ stat("Refused before Roblox", num(answer.last_24h.refused), "requests to blocked endpoints") }}
+  {{ stat("Unknown endpoints", num(answer.last_24h.unknown_endpoints), num(answer.last_24h.unknown_requests) ~ " requests") }}
+  {{ stat("Shadow mode", num(answer.last_24h.would_block), "requests it would have refused") }}
+  {{ stat("Caller sign-in attempts", num(answer.last_24h.auth_attempts), "refused, never stored", "bad" if answer.last_24h.auth_attempts else "") }}
+</dl>
+<dl class="kv policy-facts">
+  <dt>Overrides</dt><dd>{% if answer.overrides %}{{ num(answer.overrides) }} endpoints have your own verdict. <a class="link" href="{{ changed_href }}">Show the changed endpoints</a>{% else %}None: every endpoint has its shipped default or its category's switch.{% endif %}</dd>
+  <dt>Category switches</dt><dd>{% if switches %}{% for s in switches %}{{ s.label }}: {{ s.state }}{% if not loop.last %}; {% endif %}{% endfor %}{% else %}None: every category uses each endpoint's own default.{% endif %}</dd>
+  <dt>Shipped defaults</dt><dd>{{ num(answer.seed.operations) }} endpoints on {{ num(answer.seed.hosts) }} hosts, reviewed on {{ answer.seed.generated_on or "n/a" }}{% if answer.seed.source_commit %} <span class="muted">(Roblox reference <span class="mono">{{ answer.seed.source_commit }}</span>)</span>{% endif %}</dd>
+  <dt>Roxy's account</dt><dd>{% if settings_now.credential_enabled %}On: endpoints marked "Sent with Roxy's account" use it, at most {{ num(settings_now.credential_bucket_per_min) }} calls a minute (<a class="link" href="/admin/credential#budget">Credential budget</a>).{% else %}Off (credential_enabled is 0): no request carries it, whatever the policy says.{% endif %}</dd>
+</dl>
+<h3 class="g3-subhead">The old credential allowlist</h3>
+{% if legacy %}
+<p class="muted g3-note">These rows were the credential allowlist. Roxy no longer reads them; this is what the policy does with each path now (a GET).</p>
+<ul class="policy-legacy">
+  {% for row in legacy %}
+  <li><span class="mono">{{ caller_text(row.pattern, 200) }}</span>{% if not row.enabled %} <span class="muted">(was switched off)</span>{% endif %}:
+    {% if row.verdict_cell %}<span class="tone tone--{{ row.verdict_cell.tone }}">{{ row.verdict_cell.text }}</span>{% else %}<span class="muted">not a Roblox endpoint the policy can match</span>{% endif %}
+    {% if row.drawer %} <button type="button" class="link-btn" data-drawer-src="{{ row.drawer }}" data-drawer-title="Endpoint">Open its endpoint</button>{% endif %}</li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted g3-note">No allowlist rows were left over: nothing to compare.</p>
+{% endif %}
+<p class="muted g3-note">{{ answer.help.loosen }}</p>
+{{ confirm_dialog("dlg-policy-reset", "Reset the endpoint policy to its shipped defaults?", action=reset_url, method="post", api=True, danger=True,
+                  confirm_label="Reset to shipped defaults",
+                  consequences=["Every override (" ~ answer.overrides ~ ") and every category switch (" ~ (switches|length) ~ ") is removed: each endpoint gets its shipped default again, on every worker within a second.",
+                                "Endpoints you blocked by hand that are allowed by default are sent again, so this asks for a code from your authenticator app.",
+                                "Every removed row is kept in the audit log with your reason."],
+                  reason=True, reason_required=True, success="The shipped defaults are back.", on_success="refresh", refresh="summary categories endpoints") }}
+{% endcall %}

@@ -4,7 +4,7 @@ What this is
     `default_checks()` returns a fresh, position-ordered list of every check object:
     pause -> bans and deny list -> bypass -> flood -> spam -> throttle-all -> per-IP throttle -> place limit ->
     challenge -> bot score -> User-Agent rules -> ignored path -> unsafe URL -> not Roblox / host allowlist ->
-    auth smuggling -> header filters -> endpoint blocks -> endpoint rate rules.
+    auth smuggling -> endpoint policy -> header filters -> endpoint blocks -> endpoint rate rules.
 
 Why it exists
     The order is part of the contract: it decides which refusal a caller sees when several apply (a throttled
@@ -28,6 +28,7 @@ from roxy.abuse.checks.base import Check
 from roxy.abuse.checks.blocks import BlockCheck
 from roxy.abuse.checks.bypass import BypassCheck
 from roxy.abuse.checks.challenge import BotScoreCheck, ChallengeCheck
+from roxy.abuse.checks.endpoint_policy import EndpointPolicyCheck
 from roxy.abuse.checks.endpoint_rules import EndpointRuleCheck
 from roxy.abuse.checks.flood import FloodCheck
 from roxy.abuse.checks.header_rules import HeaderRuleCheck
@@ -56,6 +57,7 @@ PIPELINE_ORDER: tuple[str, ...] = (
     "unsafe_url",
     "not_roblox",
     "auth_smuggling",
+    "endpoint_policy",
     "header_rule",
     "endpoint_blocked",
     "endpoint_rule",
@@ -81,6 +83,7 @@ def default_checks() -> list[Check]:
         UnsafeUrlCheck(),
         NotRobloxCheck(),
         AuthSmugglingCheck(),
+        EndpointPolicyCheck(),
         HeaderRuleCheck(),
         BlockCheck(),
         EndpointRuleCheck(),

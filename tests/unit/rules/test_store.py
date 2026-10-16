@@ -91,61 +91,45 @@ async def test_rule_families_load_in_order(dbs: Any, service: RulesService) -> N
     assert not snapshot.is_ignored_path("robots.txt.bak")
 
 
-async def test_credential_allowlist_checks_the_method(dbs: Any, service: RulesService) -> None:
-    await service.create(
-        "credential_allowlist",
-        {"pattern": "users.roblox.com/v1/users/authenticated", "cache_private": True, "methods": ["GET", "HEAD"]},
-        ADMIN,
-    )
-    await service.create(
-        "credential_allowlist", {"pattern": "economy.roblox.com/v1/user/*", "cache_private": True}, ADMIN
-    )
+async def test_the_endpoint_policy_decides_the_credential(dbs: Any, service: RulesService) -> None:
+    """D1 revised: `credential_rule_for` answers from the endpoint policy (seed plus control.db overrides)."""
     snapshot = _snapshot(dbs)
-    rule = snapshot.credential_rule_for("users.roblox.com/v1/users/authenticated", "head")
-    assert rule is not None
-    assert rule.methods == ("GET", "HEAD")
-    assert rule.cache_private is True
-    assert snapshot.credential_rule_for("economy.roblox.com/v1/user/currency", "HEAD") is None
-    assert snapshot.credential_rule_for("economy.roblox.com/v1/user/currency", "GET") is not None
+    grant = snapshot.credential_rule_for("games.roblox.com/v1/games", "GET")  # shipped ALLOW_TOKEN
+    assert grant is not None
+    assert grant.methods == ("GET",)
+    assert snapshot.credential_rule_for("games.roblox.com/v1/games", "head") is not None
+    assert snapshot.credential_rule_for("users.roblox.com/v1/users/authenticated", "GET") is None  # BLOCK
+    assert snapshot.credential_rule_for("users.roblox.com/v1/usernames/users", "POST") is not None  # a batch read
+    assert snapshot.credential_rule_for("users.roblox.com/v1/usernames/users", "PUT") is None
+
+
+async def test_overrides_and_category_switches_load_into_the_snapshot(dbs: Any, service: RulesService) -> None:
+    row = {"endpoint_id": "games:GET:/v1/games", "verdict": "ALLOW_ANON", "note": "test"}
+    await service.upsert("endpoint_policy_override", row, ADMIN, "test")
+    switch = {"category": "login-session-security", "state": "block_all"}
+    await service.upsert("endpoint_policy_category", switch, ADMIN, "test")
+    snapshot = _snapshot(dbs)
+    assert snapshot.counts()["endpoint_policy_overrides"] == 1
     assert snapshot.credential_rule_for("games.roblox.com/v1/games", "GET") is None
+    assert snapshot.endpoint_policy.category_state("login-session-security") == "block_all"
+    await service.update("endpoint_policy_override", "games:GET:/v1/games", {"enabled": False}, ADMIN, "test")
+    assert _snapshot(dbs).credential_rule_for("games.roblox.com/v1/games", "GET") is not None
 
 
-async def test_credential_allowlist_grants_exactly_what_a_row_names(dbs: Any, service: RulesService) -> None:
-    """Lead decision F3: no implicit subpaths for the allowlist (globs), whole-path matches for regexes; a row
-    that wants the paths below it says so with an explicit wildcard. Other tables keep v1's subpath rule."""
-    rows = [
-        {"pattern": "economy.roblox.com/v1/user/currency", "cache_private": True},
-        {"pattern": "economy.roblox.com/v1/groups/*", "cache_private": True},
-        {"pattern": r"economy\.roblox\.com/v1/bundles/\d+", "type": "regex", "cache_private": True},
-        {"pattern": r"economy\.roblox\.com/v1/assets/\d+(?:/.*)?", "type": "regex", "cache_private": True},
-    ]
-    for row in rows:
-        await service.create("credential_allowlist", row, ADMIN)
-    await service.create("rules_cache", {"pattern": "economy.roblox.com/v1/user/currency", "ttl": 60}, ADMIN)
-    snapshot = _snapshot(dbs)
-    granted = {
-        "economy.roblox.com/v1/user/currency": True,
-        "/economy.roblox.com/v1/user/currency/": True,  # the same path with one trailing slash
-        "ECONOMY.ROBLOX.COM/V1/USER/CURRENCY": True,
-        "economy.roblox.com/v1/user/currency/history": False,
-        "economy.roblox.com/v1/user/currency/history/transactions": False,
-        "economy.roblox.com/v1/user/currencyx": False,
-        "economy.roblox.com/v1/user": False,
-        "economy.roblox.com/v1/groups/7": True,  # explicit wildcard: one segment below
-        "economy.roblox.com/v1/groups": False,
-        "economy.roblox.com/v1/groups/7/roles": False,
-        "economy.roblox.com/v1/bundles/12": True,
-        "economy.roblox.com/v1/bundles/12/details": False,  # a regex must match the whole path
-        "economy.roblox.com/v1/bundles/12x": False,
-        "x.economy.roblox.com/v1/bundles/12": False,
-        "economy.roblox.com/v1/assets/5": True,
-        "economy.roblox.com/v1/assets/5/owners/page/2": True,  # the regex says so explicitly
-        "economy.roblox.com/v1/assets/5x": False,
-    }
-    seen = {target: snapshot.credential_rule_for(target, "GET") is not None for target in granted}
-    assert seen == granted
-    # Every other rule family keeps v1's implicit subpath rule (plan 4.8 row 111).
-    assert snapshot.cache_rule_for("economy.roblox.com/v1/user/currency/history") is not None
+async def test_an_override_for_an_unknown_endpoint_id_is_refused(service: RulesService) -> None:
+    from roxy.rules.service import RuleValidationError
+
+    with pytest.raises(RuleValidationError):
+        await service.upsert(
+            "endpoint_policy_override", {"endpoint_id": "users:GET:/v1/nope", "verdict": "BLOCK"}, ADMIN, "test"
+        )
+    with pytest.raises(RuleValidationError):  # the account never goes with DELETE
+        await service.upsert(
+            "endpoint_policy_override",
+            {"endpoint_id": "unknown:DELETE:users.roblox.com/v9/x", "verdict": "ALLOW_TOKEN"},
+            ADMIN,
+            "test",
+        )
 
 
 def test_cidr_set_prefers_the_most_specific_active_network() -> None:

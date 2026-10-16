@@ -350,13 +350,21 @@ REFUSALS = [
         "auth_smuggling",
         respond.Refusal(
             400,
-            "Requests requiring authentication are not allowed with this proxy.",
+            (
+                "Roxy refused this request because it carried a Roblox login cookie or API key. Never send yours: "
+                "Roxy uses its own account. If that was your real .ROBLOSECURITY cookie, sign out of all sessions on "
+                "roblox.com to invalidate it. Roxy did not store it."
+            ),
             ReasonCode.AUTH_SMUGGLING,
             headers=dict(TRIO),
             tarpit_category="auth_attempt",
         ),
         400,
-        b'"Requests requiring authentication are not allowed with this proxy."\n',
+        (
+            b'"Roxy refused this request because it carried a Roblox login cookie or API key. Never send yours: '
+            b"Roxy uses its own account. If that was your real .ROBLOSECURITY cookie, sign out of all sessions on "
+            b'roblox.com to invalidate it. Roxy did not store it."\n'
+        ),
         {**TRIO_TEXT, "Roxy-Refusal": "auth_smuggling"},
     ),
     RefusalGolden(
@@ -1139,7 +1147,11 @@ async def test_real_abuse_pipeline_through_the_route(golden: SimpleNamespace, db
 
     smuggled = await golden.call("GET", GAMES, headers={"X-Roblox-Token": "anything"})
     assert smuggled.status_code == 400
-    assert smuggled.content == b'"Requests requiring authentication are not allowed with this proxy."\n'
+    assert smuggled.content == (
+        b'"Roxy refused this request because it carried a Roblox login cookie or API key. Never send yours: Roxy uses '
+        b'its own account. If that was your real .ROBLOSECURITY cookie, sign out of all sessions on roblox.com to '
+        b'invalidate it. Roxy did not store it."\n'
+    )
 
     statuses = [(await golden.call("GET", GAMES)).status_code for _ in range(4)]
     assert 429 in statuses

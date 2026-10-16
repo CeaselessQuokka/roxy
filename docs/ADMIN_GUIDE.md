@@ -151,8 +151,9 @@ worker switches to the new value within a second, and Roxy checks it once, right
 section of the Credential chapter has the step by step renewal and what to do when a check finds a different
 account.
 
-By default (owner decision D1) the credential's allowlist is empty, so no caller's request ever carries it. Roxy uses
-it only for its own checks, about 50 to 60 calls a day: the scheduled check every `credential_probe_interval_min`
+Caller requests carry it only for the endpoints the [Endpoint policy](#endpoint-policy) page sends with Roxy's
+account (owner decision D1, revised on 2026-10-16); every other endpoint goes out anonymously or is refused. Roxy also
+uses it for its own checks, about 50 to 60 calls a day: the scheduled check every `credential_probe_interval_min`
 minutes (30 by default) and the checks you start.
 
 What it protects against: Roxy holds exactly one Roblox account and never sends it through the rotator. Many accounts
@@ -435,8 +436,8 @@ A few words first:
 4. **Routing.** Roxy picks the egress. Ordinary traffic goes direct (`direct_weight` 100 against `rotator_weight`
    0). The rotator only takes spillover: while direct is cooling down, when the direct bucket is more than 80
    percent booked (`direct_shift_threshold_pct`), or when a routing rule asks for it (owner decision D13). The
-   credential is used only for endpoints on its allowlist, which is empty (owner decision D1). The Routing card of
-   the [Upstream](#upstream) page shows the rules.
+   credential is used only for the endpoints the [Endpoint policy](#endpoint-policy) sends with Roxy's account. The
+   Routing card of the [Upstream](#upstream) page shows the rules.
 5. **Buckets.** Before a call leaves, it books one slot in four buckets at once: the global bucket, its egress's
    bucket, its Roblox host's bucket and its endpoint's bucket. See "How a bucket paces calls" below.
 6. **The queue.** A call whose slot lies in the future sleeps in its worker's queue until then. How long a request
@@ -474,7 +475,7 @@ The defaults:
 | Every upstream call | `global` | 600 a minute | 30 | one call every 100 ms |
 | Direct path | `egress:direct` | 300 a minute | 20 | one every 200 ms |
 | Rotator | `egress:rotator` | 300 a minute | 20 | one every 200 ms |
-| Credential, allowlisted endpoints | `egress:credential` | 18 a minute (20 minus the 2 reserved) | 2 (the credential burst of 3 minus 1) | one every 3.3 s |
+| Credential, caller requests sent with the account | `egress:credential` | 18 a minute (20 minus the 2 reserved) | 2 (the credential burst of 3 minus 1) | one every 3.3 s |
 | Credential, Roxy's own checks | `egress:credential:probe` | 2 a minute | 1 | one every 30 s |
 | Each Roblox host | `host:<host>` | 240 a minute | 15 | one about every 270 ms; never more than 240 in a minute |
 | Each endpoint template | `endpoint:<template>` | 120 a minute | 10 | one about every 550 ms; never more than 120 in a minute |
@@ -486,7 +487,7 @@ path rate and burst (`direct_bucket_per_min`, `direct_bucket_burst`), Rotator ra
 (`endpoint_bucket_default_per_min`, `endpoint_bucket_default_burst`), all on the Upstream page's Buckets card; and
 Credential rate limit, Credential burst and Reserved rate for credential checks (`credential_bucket_per_min`,
 `credential_bucket_burst`, `credential_probe_reserved_per_min`) on the Credential page's Budget card. The credential
-burst is shared by the two credential buckets: allowlisted traffic gets it minus 1 and Roxy's checks 1 (at a burst of
+burst is shared by the two credential buckets: caller traffic gets it minus 1 and Roxy's checks 1 (at a burst of
 1, a check also takes the traffic's slot), so no more than the burst ever leaves on the account back to back. One
 host or one endpoint can get a rate and burst of its own (an override) on the Buckets card.
 
@@ -1015,7 +1016,7 @@ A rule is a small piece of code that looks at one kind of problem. Roxy has 50 o
 - **cache** (7): low hit ratios, cache times that can rise or must fall, cache busting parameters, a cache that is
   too small or switched off, repeated Roblox 404 or 400 answers, and busy endpoints without a cache rule.
 - **egress** (4): the rotator quota, rotator use, burned exit addresses and the provider's byte count.
-- **credential** (4): a credential that is rejected or expiring, allowlist entries that work as well without it,
+- **credential** (4): a credential that is rejected or expiring, endpoints sent with it that work as well without it,
   leak guard blocks, and Roxy's own credential checks spending the account's calls.
 - **abuse** (6): spam detector findings, bot-like heavy clients, distributed attacks, the tarpit, the per-address
   throttle and one experience taking most of the upstream calls.
@@ -1184,10 +1185,9 @@ ones already written are put back, so a recommendation is applied completely or 
 - **Reason**: optional and saved in the audit log, except when a change gives a setting a high-risk value: then the
   reason is required and you also tick "I understand: ... will take a high-risk value".
 - **Second factor**: when a change touches an admin security or credential setting (or one of the two settings
-  that need it on their own, `health_auto_include_credential` and `export_include_ips`), an admin allowlist entry,
-  or adds or changes a credential allowlist row, the form says so, and Roxy asks you to confirm it is you
-  ([Step 4](#step-4-save-the-recovery-codes)) before it finishes the apply by itself. Removing a credential allowlist
-  row needs no code.
+  that need it on their own, `health_auto_include_credential` and `export_include_ips`) or an admin allowlist
+  entry, the form says so, and Roxy asks you to confirm it is you ([Step 4](#step-4-save-the-recovery-codes)) before
+  it finishes the apply by itself.
 - **Exactly as previewed**: the form sends a fingerprint of the changes you saw. If the rule rewrote the proposal in
   the meantime, nothing is applied and Roxy says "This recommendation changed since you previewed it"; preview again.
 - After the apply, the drawer reloads showing **Applied** and a **Watch window** of `auto_apply_watch_minutes`
@@ -1204,8 +1204,7 @@ like the settings editor does, under the same rules:
 - It never arms the spam detectors (puts `spam_dry_run` back to 0): arming is done only on the Protection page, which
   first shows who would be banned. The undo form says so and the undo is refused while that is the case; arm them
   there, then undo again if you still need to.
-- Like Apply, it asks for your second factor when what it writes back touches admin security or the credential
-  (undoing the removal of a credential allowlist row creates that row again, so it asks too).
+- Like Apply, it asks for your second factor when what it writes back touches admin security or the credential.
 
 Undo is refused when someone changed the same setting or rule since the apply (the message names it): Roxy never
 overwrites a later edit. Change that value by hand on its page instead.
@@ -1310,7 +1309,7 @@ every evaluation interval and applies one by itself only when every guardrail ho
 - It is marked **Safe to auto-apply**: every change touches one row only (one endpoint's cache rule or pacing
   bucket, one client), and a new rule covers exactly one endpoint. A global setting is never applied automatically.
 - Its risk is **low**, and the rules evaluated it within the last two evaluation intervals (a stale card waits).
-- It never touches the credential allowlist, a bypass entry, a manual step, an admin security or credential setting,
+- It never touches the endpoint policy, a bypass entry, a manual step, an admin security or credential setting,
   the rotator quota, or the engine's own settings, and never bans more than one address.
 - No number moves by more than the **Largest automatic step** (50% by default) in one change: a cache time of 300
   seconds can move to at most 450 or down to 150. A change that creates a new rule is measured from the value the
@@ -1459,15 +1458,16 @@ each egress, connection overhead included, so it does not match the Roblox lines
 "No calls to Roblox in this range." means no egress was used.
 
 What normal looks like: bytes to callers are usually larger than bytes from Roblox, because the cache hands out one
-copy many times. The credential row stays small or absent: by the owner's decision the credential is used only for
-Roxy's own checks (its allowlist is empty).
+copy many times. The credential row carries the endpoints the [Endpoint policy](#endpoint-policy) sends with Roxy's
+account, plus Roxy's own checks; it is paced by the credential bucket, so it never grows faster than that.
 
 What to do when it looks wrong:
 
 - **Rotator bytes grow.** They cost money. Check the budget on the [Egress](#egress) page (`/admin/egress#budget`).
   Runbook: [Rotator down or quota exhausted](/admin/help/runbooks#rotator-down-or-quota-exhausted).
-- **Credential bytes grow.** Caller traffic may be going out with the Roblox account. Check that the allowlist on
-  the [Credential](#credential) page (`/admin/credential#allowlist`) is empty.
+- **Credential bytes grow.** More caller traffic goes out with the Roblox account. Check which endpoints the
+  [Endpoint policy](#endpoint-policy) page (`/admin/policy#endpoints`) sends with it, and the account's pace on the
+  [Credential](#credential) page.
 - **Bytes from callers jump while requests do not.** Callers send large bodies. The By verb card and the [Live](#live)
   page show which requests.
 
@@ -1799,8 +1799,8 @@ What to do when it looks wrong:
   [Roblox is rate-limiting us](/admin/help/runbooks#roblox-is-rate-limiting-us).
 - **Many refusals from one client.** Filter by that client, then act from the [Clients](#clients) or
   [Protection](#protection) page. Runbook: [Under attack](/admin/help/runbooks#under-attack).
-- **Caller requests with the egress `credential`.** With an empty credential allowlist this should not happen. Check
-  the [Credential](#credential) page.
+- **Caller requests with the egress `credential`.** Normal for endpoints the [Endpoint policy](#endpoint-policy)
+  sends with Roxy's account. One you did not expect: find it with that page's Tester.
 - **The state stays on Reconnecting.** Reload the page. If the dashboard itself does not load, see
   [Service down](/admin/help/runbooks#service-down).
 
@@ -2024,8 +2024,8 @@ What is worrying, and what to do:
   [All upstream paths unavailable](/admin/help/runbooks#all-upstream-paths-unavailable).
 - **Failures, timeouts or a p95 above one second** (H-LATENCY warns from 1,000 ms and fails from 2,500 ms): Request
   failures and Hosts say where; then [Upstream slow or unreachable](/admin/help/runbooks#upstream-slow-or-unreachable).
-- **Credential calls not made by Roxy itself**: an endpoint was added to the credential allowlist; check the
-  Credential page.
+- **Credential calls growing fast**: more caller traffic to endpoints sent with Roxy's account; check the
+  Endpoint policy page and the Credential page's Budget.
 - **Challenge or HTML answers above 0**: see the Challenges and HTML answers card.
 - **The gauge at "busy" or "full" most of the time**: callers wait for slots; see Buckets and Queue.
 
@@ -2112,9 +2112,9 @@ comes from, its reservations and refusals in the range, a "Fill now" gauge, and 
 override yours ("Set by" admin), even when the adaptive controller had set it, so the controller never raises it
 again. For the global and egress buckets the drawer names the settings their rate and burst come from, by label and
 key, and links the card that edits them: the Buckets card for global, direct and the rotator, the Credential page's
-Budget card for the two credential buckets. It also says how each credential bucket is made: the allowlisted
-callers' bucket runs at the credential rate limit minus the reserve, with the credential burst minus 1; Roxy's own
-checks run at the reserve, with a burst of 1.
+Budget card for the two credential buckets. It also says how each credential bucket is made: the bucket of the
+caller requests sent with the account runs at the credential rate limit minus the reserve, with the credential burst
+minus 1; Roxy's own checks run at the reserve, with a burst of 1.
 
 **Adaptive rate controller.** An On or Off badge (`adaptive_rate_enabled`), one sentence on how it works, how many
 rates it holds now, and its changes in the range, newest first: When, Change (**Lowered** or **Raised**), Bucket, Rate
@@ -2279,7 +2279,8 @@ refuses hosts outside roblox.com.
 
 Which egress each call takes. The card starts with the decision in four steps, filled in with the current values:
 
-1. An endpoint on the credential allowlist uses the credential (GET and HEAD only, never through the rotator).
+1. An endpoint the endpoint policy sends with Roxy's account uses the credential (GET, HEAD and POST only, never
+   through the rotator).
 2. A routing rule below may pin an endpoint to an egress, within what is available.
 3. Otherwise direct and the rotator are drawn by weight (direct 100, rotator 0 by default), and above 80 percent
    direct bucket fill the weight shifts toward the rotator when it is on.
@@ -2434,8 +2435,8 @@ quota is used and what it will cost, and whether the rotator is healthy. The thr
   traffic leaves this way, and it costs nothing.
 - **Rotator**: anonymous calls through the DataImpulse [rotator](/admin/help#term-rotator), from changing exit
   addresses. Every byte is billed against a monthly [quota](/admin/help#term-quota).
-- **Credential**: calls that carry the one Roblox account. They always leave direct, never through the rotator, and
-  only Roxy's own checks use them unless the credential allowlist names an endpoint (owner decision D1).
+- **Credential**: calls that carry the one Roblox account. They always leave direct, never through the rotator: the
+  endpoints the [Endpoint policy](#endpoint-policy) sends with Roxy's account, and Roxy's own checks.
 
 Two buttons sit at the top: **Upstream** and **Credential** open those pages. Bytes on this page are decimal (1 GB is
 1,000,000,000 bytes), the unit DataImpulse bills in. Exit addresses are masked to their network unless you reveal
@@ -2468,9 +2469,9 @@ request and answer sizes plus a TLS allowance per connection" (a fallback; the c
 chart **Upstream calls per egress** stacks each egress's calls over time.
 
 - **Normal:** almost every call direct; the rotator near 0 (its weight is 0, so it only takes spillover); the
-  credential a small, steady number (about 50 to 60 calls a day: its checks).
+  credential a steady share, never above its bucket's pace (its checks, plus the endpoints sent with the account).
 - **Worrying:** a large rotator share you did not plan (direct was cooling down a lot, or a routing rule sends traffic
-  there; see Upstream > Cooldowns and Routing), or credential calls growing (the allowlist is not empty).
+  there; see Upstream > Cooldowns and Routing), or credential calls growing fast (see the Endpoint policy page).
 
 ### Budget
 
@@ -3159,8 +3160,8 @@ The buttons at the top of the card:
 - **Purge all** opens "Empty the whole cache?" (see Purge below).
 
 **The inspector drawer.** Click a row to see one stored answer: its state and status (and a "fetched with the
-credential" badge for an answer fetched with the Roblox credential, which only happens when the credential allowlist
-on the Credential page is not empty), when it was stored, until when it is fresh, until when it is usable if Roblox
+credential" badge for an answer fetched with the Roblox credential, for an endpoint the Endpoint policy sends with
+Roxy's account), when it was stored, until when it is fresh, until when it is usable if Roblox
 fails, its lifetime, age, reuse count, size, which egress path fetched it ("Fetched via"), what Roblox said, its
 rule, the parameters left out of its key, the request body of a POST, and the stored body itself (pretty printed when
 it is JSON; very long bodies are cut). Anything in a body that looks like a secret is shown as `[redacted]`.
@@ -3352,7 +3353,8 @@ minutes come from the live records; the callers over the range come from request
      page;
    - a cache rule ("kept" for how long), on the Cache page;
    - a routing rule (its mode), on the Upstream page;
-   - a credential allowlist entry ("the credential may be used"), on the Credential page;
+   - the endpoint policy sending it with Roxy's account ("the credential may be used"), on the Endpoint policy
+     page;
    - an [ignored path](/admin/help#term-ignored-path): "Roxy answers it without calling Roblox.", on the
      Protection page.
 
@@ -3360,8 +3362,8 @@ minutes come from the live records; the callers over the range come from request
    a bucket override for the endpoint's host ("Its host's bucket") or for the endpoint itself ("Its own bucket")
    shows its rate per minute and its burst, linked to the Upstream page's buckets.
 
-A credential allowlist entry should not appear here: by the owner's decision the allowlist stays empty and the
-credential is used only for Roxy's own checks. If one does, review it on the [Credential](#credential) page.
+The endpoint policy's line shows for endpoints sent with Roxy's account. To see why, or to change it, open the
+endpoint on the [Endpoint policy](#endpoint-policy) page.
 
 ### Resetting one endpoint's numbers
 
@@ -4883,9 +4885,8 @@ before you apply it: a network you use rarely may be missing.
 ### Replacing the credential
 
 The one Roblox credential is not managed here. Its rules (exactly one credential, never rotated or switched by Roxy,
-used for Roxy's own probes and for callers only on endpoints you add to the credential allowlist, which owner
-decision D1 keeps empty, and replaced only by hand with a fresh second factor) are in the [Credential](#credential)
-chapter.
+used for Roxy's own probes and for the endpoints the [Endpoint policy](#endpoint-policy) sends with Roxy's account,
+and replaced only by hand with a fresh second factor) are in the [Credential](#credential) chapter.
 
 ### On a phone
 
@@ -4895,6 +4896,184 @@ logs: When, Result or Signature, and IP); tap the first line to see every column
 Trusted devices tables become one labeled block per session or device, with its button at the end. The fingerprint
 tabs wrap two to a row, and the facts of the Admin access card and of a fingerprint drawer stack under their labels.
 On a touch screen every button and tab is at least 44 pixels tall.
+
+## Endpoint policy
+
+The Endpoint policy page (`/admin/policy`) decides which Roblox endpoints Roxy forwards, which of them carry Roxy's own
+Roblox account (the [credential](/admin/help#term-credential)), and which it refuses before Roblox. The owner decided
+on 2026-10-16 (owner decision D1, revised) that Roxy sends its account with caller requests, except for the endpoints
+this policy blocks. It replaces the credential allowlist the Credential page used to have.
+
+Every operation in Roblox's own API reference (992 of them, on 35 hosts) has exactly one verdict:
+
+| Verdict | What Roxy does |
+|---|---|
+| Sent with Roxy's account | Forwards the request with the account. Public data, or data that needs a sign-in but is about other users or public things (catalog search, followers lists, badges of a user). |
+| Sent without an account | Forwards the request, never with the account. Useful anonymously, but the account would make the answer describe Roxy's own account (ownership flags, "has voted", friend states) or would send the session where it has no business. |
+| Blocked | Refuses the request before Roblox, whatever the caller sends. Sign-in, account security, the account's private data, changes to the account, money, trades, groups, creator tools and every Open Cloud route that takes only an API key. |
+
+Roxy ships a reviewed default for each one, with a **risk** from 1 to 4: what a stranger could do with Roxy's account
+through that endpoint. 1 is harmless, 2 low, 3 meaningful (private data, a change of state, a reason for Roblox to flag
+the account) and 4 critical (session takeover, money, logout, anything irreversible).
+
+One request gets one verdict, first match wins:
+
+1. A caller who sent their own Roblox cookie, API key or sign-in token is refused, whatever the policy says (see
+   Caller sign-in attempts below).
+2. Your override for that endpoint (with one exception: "Send without the account" on its category takes the
+   account away even from an endpoint you set to "Sent with Roxy's account").
+3. The switch of its category ("Block all", or "Send without the account").
+4. The shipped default.
+5. A default for hosts Roblox does not document (`gamejoin`, `billing`, `engagementpayouts` and `voice` are blocked;
+   `search` and `translations` are sent without the account).
+6. An endpoint Roblox does not document: a write (anything but GET or HEAD) is blocked; a read is sent without the
+   account, unless its path holds a word that account endpoints use (`login`, `settings`, `robux`, `/my/` and a few
+   dozen more), which blocks it.
+
+Then a few query guards can block one request of an allowed endpoint: a games server list for friend servers
+(`serverType` 1 or `Friend`) and group roles with `includePrivate`, because both answer with what only Roxy's account
+may see.
+
+The account is only ever sent with GET, HEAD or POST, always from the server's own address, never through the
+rotator, and at the pace of its bucket (`credential_bucket_per_min`). An endpoint Roblox answers without a sign-in
+goes out anonymously instead when the account is busy or cooling down; one that only answers signed-in users waits
+for the account, or gets the "busy" 429.
+
+**Who may do what.** Tightening (blocking, or sending without the account; a category's "Block all" or "Send without
+the account") takes effect at once with your session. Loosening (anything that sends more to Roblox, or sends the
+account where it was not sent; a category back to Defaults) asks you to confirm it is you
+([Step 4](#step-4-save-the-recovery-codes)) and a reason. Loosening a risk 4 endpoint also asks you to type its path.
+**Reset to shipped defaults** asks for a reason and your second factor. Every change is written to the audit log and
+reaches every worker within a second. **Policy history** at the top opens the Audit page filtered to every change of
+the policy.
+
+**When to use this page**
+
+- A caller says an endpoint they need is refused with "Roxy does not forward this Roblox endpoint": find it with the
+  Tester, read why in its drawer, and loosen it only if the reason no longer holds.
+- The account is throttled by Roblox (the recommendation UP-429-CREDENTIAL, or "Cooling down" on the Credential page):
+  switch Public data to "Send without the account" until it recovers.
+- An alert or the Summary shows caller sign-in attempts: read Caller sign-in attempts.
+- Before you switch the policy on for real after a deploy: read Shadow mode.
+
+### Time range on this page
+
+Summary, Categories, Endpoints and the Tester show the policy now; the Summary's "Last 24 hours" and the Endpoints
+table's "Refused (24 h)" always cover the last 24 hours. Unknown endpoints seen, Caller sign-in attempts and Shadow
+mode cover the time range in the top bar. Nothing on this page draws a comparison.
+
+### Summary
+
+A badge says whether the policy is **Enforced** (blocked endpoints are refused before Roblox, with the status of
+`endpoint_policy_block_status`) or in **Shadow mode** (`endpoint_policy_enforce` is off: blocked endpoints are sent
+without the account and counted, never refused). Then:
+
+- How many endpoints have each verdict now, with your overrides and the category switches applied, and how many are
+  changed from the defaults.
+- **Last 24 hours**: requests refused before Roblox, unknown endpoints (and their requests), what shadow mode would
+  have refused, and caller sign-in attempts.
+- **Overrides**, **Category switches**, **Shipped defaults** (how many endpoints, on how many hosts, and the date
+  they were reviewed) and **Roxy's account** (whether `credential_enabled` is on, and its rate a minute).
+- **The old credential allowlist**: the rows the allowlist held before this page existed. Roxy no longer reads them;
+  each line says what the policy does with that path now (a GET), so you can check nothing you relied on changed.
+
+**Reset to shipped defaults** removes every override and every category switch.
+
+- **Normal:** Enforced, a handful of overrides you can explain, no caller sign-in attempts.
+- **Worrying:** Shadow mode long after a deploy; overrides nobody remembers (open Policy history); sign-in attempts
+  (see below).
+
+Settings for this card: Refuse blocked endpoints (`endpoint_policy_enforce`, on), Status code for blocked endpoints
+(`endpoint_policy_block_status`, 403; 404 or 500 are the other choices) and Message for blocked endpoints
+(`endpoint_policy_block_message`, the text callers get with the refusal).
+
+### Categories
+
+One row per category, the policy's toggle groups: Sign-in and account security, Who the account is, The account's
+private data, Changing the account, Social actions, Group actions, Robux, purchases and trades, The account's
+inventory, Changing the avatar, Creator tools, Creator private data, Ads, Open Cloud (API key only), Other and Public
+data. Each row shows its switch, how many endpoints it holds with each verdict, and its highest risk. Open a row for
+its description, the counts now and by default, a link to its endpoints in the Endpoints table, and its switch:
+
+- **Defaults**: each endpoint keeps its own verdict.
+- **Block all**: every endpoint of the category is blocked.
+- **Send without the account** (only for a category with endpoints sent with the account, which today is Public
+  data): every allowed endpoint of the category goes out anonymously. This is the panic switch when Roblox throttles
+  the account.
+
+"Block all" never overrides an endpoint that has its own override; "Send without the account" does, because it
+only ever takes the account away. An endpoint Roblox does not document can be sent with the account on GET only. There is no "allow all": loosening is one endpoint at
+a time, with a reason.
+
+### Endpoints
+
+Every endpoint in Roblox's reference: the page's main table. Search looks in the path, Roblox's summary, the host and
+the reason for the verdict; the filters are host, category, verdict, risk, method, Roblox sign-in ("Only answers
+signed-in users", "Answers anyone; a sign-in changes the answer", "No sign-in listed", "Open Cloud API key or OAuth
+only") and Changed. Search, filters, sort and page are kept in the address bar, so a link such as
+`/admin/policy?category=ads#endpoints` opens the table filtered.
+
+Columns: **Method**, **Host**, **Path**, **What Roblox says it does**, **Verdict** (in words; "Your override" or
+"Category switch" under it when it is not the default), **Default**, **Risk**, **Category**, **Refused (24 h)** and
+**Roblox docs**, two links that open Roblox's own documentation in a new tab: "Roblox feature docs" (the feature
+page, when Roblox has one) and "Roblox domain docs" (the page of its host). The column chooser adds Roblox sign-in.
+
+Press a row to open it in a drawer: what Roblox says it does and what sign-in it accepts, its verdict now and where
+that came from, its shipped default and the reason for it, notes from the review, its risk and category, your note,
+its refusals in the last 24 hours, the two documentation links and a link to every change of it in the audit log.
+**Set its verdict**: pick a verdict (sent with the account is offered only for GET, HEAD and POST endpoints), tick
+"Keep the answers private" when an answer sent with the account must never be cached or shared between callers, add a
+note and a reason, and save. When the verdict you pick is looser than the one now, the form says it will ask for your
+second factor, and on a risk 4 endpoint it asks you to type the endpoint's path. **Back to default** removes your
+override.
+
+Below the table, tick rows and use **Block selected** (a reason; tightening needs no code) or **Reset selected to
+default** (asks for your second factor when a default is looser than the override it replaces). The boxes select rows
+on the page shown; the box in the header selects the whole page.
+
+### Tester
+
+Paste a URL in any form: a Roxy URL (`https://<your Roxy>/games.roblox.com/v1/...`), a roblox.com URL or host and
+path, a query included; pick a method and press **What does the policy do?**. Nothing is sent to Roblox. The answer
+shows the request, the matched endpoint (with a button to open it) or "Not in Roblox's reference" (with a button to
+set a verdict for it), each step of the order above with what it said, the final verdict and where it came from,
+whether Roxy's account goes with it and whether it falls back to the anonymous path, and what happens: "Refused before
+Roblox", "Shadow mode" or "Forwarded". It also warns when the host is not one of the allowed Roblox hosts, which Roxy
+refuses anyway.
+
+### Unknown endpoints seen
+
+Endpoints callers asked for in the range that Roblox's reference does not list, written as
+`unknown:<METHOD>:<host>/<path template>`, with the verdict Roxy gave them, the requests and the last one, and the
+verdict they have now. **Set verdict** opens a drawer to give one its own verdict (sending it with the account, or
+sending what was blocked, asks for your second factor and a reason); **Back to the rule** removes that override. Roblox
+adds endpoints without notice, so look here now and then and decide.
+
+### Caller sign-in attempts
+
+Callers who sent their own Roblox `.ROBLOSECURITY` cookie, an `Authorization` header, an API key or an
+`X-Roblox-Token`, newest first. Every one was refused with a message telling the caller never to send it. Columns:
+When, IP, What (the kind), Where (header, cookie, query or body), Name, **Looks real**, **Fingerprint**, Endpoint,
+User-Agent and Count. Roxy never stores what the caller sent, only the fingerprint, a keyed hash: rows with the same
+fingerprint are the same secret sent again.
+
+"Yes: this caller leaked a live cookie" in red means the value had Roblox's warning prefix and a real cookie's
+length: a real person just sent their live session through somebody's game. A notice above the table says so. Whoever
+owns it should sign out of every session on roblox.com to make it useless; the address and User-Agent help find who
+sent it.
+
+### Shadow mode
+
+What the policy would have refused while Refuse blocked endpoints (`endpoint_policy_enforce`) was off, per endpoint,
+with the requests and the last one. Shadow mode sends a blocked endpoint's request without Roxy's account instead of
+refusing it, so you can see what enforcing would break before you switch it on. The table fills only while the setting
+is off; once it is on, everything blocked is refused and counted in the Summary instead.
+
+### On a phone
+
+The category rows wrap their summary line. Below 640 px the Endpoints table turns each row into a small card with its
+key columns (Method, Host) and opens the rest in the drawer; the documentation links and the select box stay on the
+card. The drawer's facts become one column below 480 px.
 
 ## Health
 
@@ -5495,7 +5674,7 @@ into a block with its column names.
 ## Credential
 
 The Credential page (`/admin/credential`) shows the one Roblox account Roxy may use: whether it works, how hard it is
-used, what it may be used for, and how to replace it safely. The [credential](/admin/help#term-credential) is the
+used, and how to replace it safely. The [credential](/admin/help#term-credential) is the
 account's `.ROBLOSECURITY` cookie. Its value is never shown anywhere: only its last characters and a fingerprint (a
 keyed hash that identifies a value without revealing it).
 
@@ -5505,13 +5684,14 @@ Two rules shape the page:
   own. Roblox ties rate limits and abuse scoring to the account and the server address together, so several accounts
   behind one address look like account farming. The credential always leaves from the server's own address, never
   through the rotator.
-- **Callers never get it (owner decision D1).** The credential allowlist is empty, so no caller request ever carries
-  the account. Only Roxy's own checks use it: about 50 to 60 calls a day.
+- **The endpoint policy decides who gets it (owner decision D1, revised 2026-10-16).** Caller requests carry the
+  account only for the endpoints the [Endpoint policy](#endpoint-policy) page sends with it; Roxy's own checks use it
+  too, about 50 to 60 calls a day.
 
 The button at the top, **Credential history**, opens the Audit page filtered to every credential change.
 
-Checking, replacing and deleting the credential, adding or changing an allowlist row, and changing any setting on
-this page ask you to confirm it is you ([Step 4](#step-4-save-the-recovery-codes)). Every one of these actions is
+Checking, replacing and deleting the credential, and changing any setting on this page, ask you to confirm it is
+you ([Step 4](#step-4-save-the-recovery-codes)). Every one of these actions is
 written to the audit log; the value itself never is, only its fingerprint and masked form.
 
 **When to use this page**
@@ -5523,11 +5703,11 @@ written to the audit log; the value itself never is, only its fingerprint and ma
 - The alert "Roxy: Roblox sent a new credential cookie" arrived:
   [Credential rotated by Roblox](/admin/help/runbooks#credential-rotated-by-roblox).
 - You need to renew the cookie, or you set Roxy up for the first time: the Replace card.
-- You consider letting callers use the account for one endpoint: the Allowlist card (read it all first).
+- You want to know or change which endpoints use the account: the [Endpoint policy](#endpoint-policy) page.
 
 ### Time range on this page
 
-Status and Allowlist show the state now; the "Calls with the credential" lines of Status cover the time range in the
+Status shows the state now; the "Calls with the credential" lines of Status cover the time range in the
 top bar. Budget shows its buckets now, their reservations and refusals in the range, and fixed totals for the last
 hour and the last 24 hours. Probes lists the latest 50 checks of the last 90 days. Nothing on this page draws a
 comparison.
@@ -5574,10 +5754,10 @@ credential was cooling down") or switched off. The result appears on this card a
 still waiting for its slot after 40 s, the page stops waiting and the result shows up there a little later.
 
 - **Normal:** "Working", the same account as before, no cooldown, the last probe OK within the last 30 minutes, and
-  every credential call made by Roxy itself.
+  credential calls within the account's pace.
 - **Worrying:** "Rejected" or "None loaded" (follow [Credential rejected](/admin/help/runbooks#credential-rejected));
   "Cooling down" (wait; see [Credential cooling down](/admin/help/runbooks#credential-cooling-down)); "A different
-  account" (see Replace); calls not made by Roxy itself (the allowlist is not empty).
+  account" (see Replace); many failed calls for callers (see the Endpoint policy page for what is sent with it).
 
 Settings for this card (each asks for a fresh second factor, like every credential setting): Use the Roblox
 credential (`credential_enabled`, on), Credential check interval (`credential_probe_interval_min`, 30 minutes; 0
@@ -5590,77 +5770,39 @@ while you look into a leak guard alert; it keeps the stored value.
 
 v1's "Token Safety Budget": how fast the account may be used. Two fill gauges:
 
-- **Allowlisted callers (the credential rate limit minus the reserve)**: the credential bucket for allowlisted
-  traffic only. Its rate is `credential_bucket_per_min` minus the reserved share: 18 a minute (one every 3.3 s), with
-  the credential burst minus 1 (2 by default).
-- **Reserved for Roxy's credential checks**: Roxy's own checks, kept apart so a check never waits behind allowlisted
-  traffic and allowlisted traffic can never use up the checks' share: 2 a minute, burst 1. The two bursts add up to
-  the credential burst, so no more than that many calls ever leave on the account back to back.
+- **Callers sent with the account (the credential rate limit minus the reserve)**: the credential bucket for caller
+  requests the endpoint policy sends with the account. Its rate is `credential_bucket_per_min` minus the reserved
+  share: 18 a minute (one every 3.3 s), with the credential burst minus 1 (2 by default). When it has no slot, an
+  endpoint Roblox answers without a sign-in goes out anonymously instead; one that only answers signed-in users waits.
+- **Reserved for Roxy's credential checks**: Roxy's own checks, kept apart so a check never waits behind caller
+  traffic and caller traffic can never use up the checks' share: 2 a minute, burst 1. The two bursts add up to the
+  credential burst, so no more than that many calls ever leave on the account back to back.
 
 Under each gauge: its reservations, refusals and peak fill in the range. Then two totals: **Last hour** and **Last 24
 hours**, each split into calls for callers and probes (the 24 hours also give the busiest hour's probes), next to
-what to expect: "about 50 to 60 credential calls a day with an empty allowlist". Credential calls also pass the
+what to expect for the checks: "about 50 to 60 credential calls a day". Credential calls also pass the
 global, host and endpoint buckets of the Upstream page.
 
 - **Normal:** about 2 probes an hour (one every 30 minutes, a few more when you run Check credential or a health
-  check that includes the credential), 0 calls for callers, gauges at "room to spare".
-- **Worrying:** calls for callers above 0 when the allowlist should be empty; more than 6 probe calls in an hour (the
-  recommendation CRED-PROBE-COST); refusals on the account bucket (allowlisted callers waiting).
+  check that includes the credential), calls for callers below the account's pace, the probe gauge at "room to
+  spare".
+- **Worrying:** more than 6 probe calls in an hour (the recommendation CRED-PROBE-COST); the callers' gauge full most
+  of the time, or Roblox 429s on the account (the recommendation UP-429-CREDENTIAL: lower the pace, or send the
+  busiest endpoints without the account on the Endpoint policy page).
 
 Settings for this card (each asks for a fresh second factor): Credential rate limit (`credential_bucket_per_min`, 20
 a minute; high risk above 60), Credential burst (`credential_bucket_burst`, 3, shared as above: at 1, a check also
-takes the allowlisted callers' slot; high risk above 10), Reserved rate
+takes the callers' slot; high risk above 10), Reserved rate
 for credential checks (`credential_probe_reserved_per_min`, 2; it must stay below the rate limit) and Credential rest
 after a 429 (`credential_cooldown_default_s`, 60 s; high risk below 15; the same setting is also on the Upstream
 page's Cooldowns card). v1 allowed about 88 account calls a minute with no pacing, so its whole budget could leave in
 about one second; keep these low and raise them only with a reason.
 
-### Allowlist
+### Which endpoints use it
 
-The endpoints the credential may be used for: the page's main table. A notice above it repeats owner decision D1:
-callers never get the credential; every row is an exception that sends the owner's one Roblox account for every
-caller request that matches it, from the server address only. With no rows the table says "No endpoint may use the
-credential", the default.
-
-Columns by default: **Id**, **Pattern** (host and path), **Methods** (GET, HEAD or both, never anything else),
-**Private** ("Private", or "Shared with credential calls"), **Enabled** and Note; the column chooser adds Type,
-Anonymous allowed, Created and Created by. Search, sort, page and export work as on every table, and they are kept in
-the address bar.
-
-**Allow an endpoint** opens the form:
-
-- **Endpoint pattern** and **Pattern type** (Glob with `*` and `?`, or Regular expression). A row grants exactly the
-  path it names: a glob has no implicit subpaths and `*` stays inside one segment; a regular expression must match the
-  whole path. Add an explicit wildcard (for example `.../currency/*`) to grant the paths below.
-- **Methods**: GET only, GET and HEAD, or HEAD only.
-- **May the account's answers be cached?** You must choose. "No: keep them private": the account's answers are never
-  stored, shared, refreshed in the background or served stale, so every matching request makes its own credential
-  call. "Yes": an answer is cached as a credential answer and served only to requests that would also use the
-  credential.
-- **Note**, **In force at once**, and a **Reason** (required, saved in the audit log).
-
-**Allow this endpoint** asks you to confirm it is you, then every worker follows the row within a second. At most
-50 rows.
-
-Press a row to open it in a drawer. **Save the row** changes it (a reason and a fresh second factor again).
-**Remove the row** (a dialog with an optional reason) needs no second factor, because removing a row only narrows
-what the account is used for: callers get the anonymous answer again on every worker within a second, and the audit
-log keeps the row. To undo an added row, remove it; to undo a removal, add the row again by hand from what the audit
-log kept. "Anonymous allowed" is shown but not edited here: it is set only from a CRED-UNUSED recommendation, which
-shows that the endpoint answers the same without the account.
-
-**Test a path**: a host and path without the query, and a method (GET, HEAD or POST); **May it use the credential?**
-answers "Uses the credential" (which row grants it, and whether its answers stay private) or "Anonymous" (for POST
-it adds "The credential is used for GET and HEAD only.").
-
-Before you add a row, know what it means: every matching caller request spends a call on your account, from your
-server's address, at the account's slow pace (18 a minute shared by every allowlisted endpoint). An allowlisted
-endpoint is never sent anonymously instead (unless its row says "Anonymous allowed"): while the credential is
-cooling down or rejected, its callers get 503 "All request methods are busy right now; please try again shortly."
-with a `Retry-After` (the cooldown left, or 300 s when it was rejected), and when the account's bucket has no slot in
-time they get the "busy" 429. Add a row only for an endpoint that answers
-nothing useful without the account, and remove it when it is no longer needed. If an allowlisted call gets a Roblox
-401, Roxy confirms it with one more check before it marks the credential rejected.
+The Credential page used to have an Allowlist card. It is gone: since owner decision D1 was revised (2026-10-16),
+the [Endpoint policy](#endpoint-policy) page decides which caller requests carry the account, and its Summary card
+lists the old allowlist rows with what the policy does with each now.
 
 ### Probes
 
@@ -5730,9 +5872,8 @@ a cookie of the right account. Never switch back and forth between accounts.
 
 ### On a phone
 
-Below 900 px wide the Status and Budget cards stack into one column. Below 640 px the Allowlist table turns each
-row into a small card with its key columns (Id, Pattern, Private) and opens the rest of a row in the drawer. Below
-600 px the Probes table turns each row into a block of labeled lines. The Status lists become one column below 480 px.
+Below 900 px wide the Status and Budget cards stack into one column. Below 600 px the Probes table turns each row
+into a block of labeled lines. The Status lists become one column below 480 px.
 
 ## Data
 
@@ -6155,7 +6296,8 @@ removal, and `blocked_header:<name>` for a removal from the Blocked fingerprints
 - Action: Any action, then each family (such as `setting.*` or `auth.*`) with its count, then each action seen.
 - Who: Anyone, then each kind (such as `admin:*`), then each actor seen with its count.
 - Target: Any target, Settings, Cache rules, Endpoint blocks, Endpoint rules, User-Agent rules, Request filters,
-  Routing rules, Upstream limits, Credential allowlist, Access lists, Bans, The credential (value, replace, delete),
+  Routing rules, Upstream limits, Endpoint policy: endpoint verdicts, Endpoint policy: category switches,
+  Credential allowlist (before the endpoint policy), Access lists, Bans, The credential (value, replace, delete),
   Credential status changes, Credential account checks, Everything about the credential, allowlist included,
   Downloads, Data resets, Backups and VACUUM runs.
 
@@ -7127,8 +7269,8 @@ term with a dotted underline anywhere in the dashboard shows its definition on h
 (`/admin/help#term-<id>`). The definitions live in one file, `docs/glossary.yml`, which feeds both the dashboard's
 hover texts and the Help page, so they never disagree. The ten terms a new owner meets first:
 
-- [Credential](/admin/help#term-credential): the single Roblox .ROBLOSECURITY cookie Roxy owns, used only for
-  Roxy's own probes and an explicit allowlist, and never sent through the rotator.
+- [Credential](/admin/help#term-credential): the single Roblox .ROBLOSECURITY cookie Roxy owns, used for Roxy's own
+  probes and the endpoints the endpoint policy sends with it, and never sent through the rotator.
 - [Egress](/admin/help#term-egress): the path a request leaves Roxy through on its way to Roblox: direct,
   credential or rotator.
 - [DataImpulse / rotator](/admin/help#term-rotator): a paid rotating residential proxy service Roxy can use as an

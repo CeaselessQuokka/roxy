@@ -55,6 +55,7 @@ class ReasonCode(StrEnum):
     NOT_ROBLOX = "not_roblox"
     HOST_NOT_ALLOWED = "host_not_allowed"
     AUTH_SMUGGLING = "auth_smuggling"
+    ENDPOINT_POLICY = "endpoint_policy"
     HEADER_RULE = "header_rule"
     ENDPOINT_BLOCKED = "endpoint_blocked"
     ENDPOINT_RULE = "endpoint_rule"
@@ -126,6 +127,7 @@ _REFUSALS = frozenset(
         ReasonCode.NOT_ROBLOX,
         ReasonCode.HOST_NOT_ALLOWED,
         ReasonCode.AUTH_SMUGGLING,
+        ReasonCode.ENDPOINT_POLICY,
         ReasonCode.HEADER_RULE,
         ReasonCode.ENDPOINT_BLOCKED,
         ReasonCode.ENDPOINT_RULE,

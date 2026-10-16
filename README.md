@@ -75,6 +75,7 @@ seeded traffic (which deliberately includes hostile text such as `<script>` tags
 | Clients | See who calls Roxy, by experience (place) and by address, how fast, how often they are refused, and act on one of them. | [dark](docs/screenshots/clients.png) |
 | Protection | Decide which callers Roxy turns away and how: limits, bans, filters, spam detectors and the tarpit. | [dark](docs/screenshots/protection.png), [light](docs/screenshots/protection-light.png) |
 | Security | See who signs in, who probes Roxy for weaknesses, what clients send, and manage your sessions, devices and second factors. | [dark](docs/screenshots/security.png) |
+| Endpoint policy | Decide which Roblox endpoints Roxy forwards, which of them carry Roxy's own Roblox account, and which it refuses before Roblox. | [dark](docs/screenshots/policy.png) |
 | **Operate** | | |
 | Health | Run Check Proxy Health, watch each check finish, and compare the result with earlier runs. | [dark](docs/screenshots/health.png) |
 | Settings | Find and change any runtime setting, see what changed and why, and export or import your changes. | [dark](docs/screenshots/settings.png) |

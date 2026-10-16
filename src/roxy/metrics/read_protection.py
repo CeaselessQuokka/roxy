@@ -69,6 +69,7 @@ CHECK_REASONS: Final[dict[str, tuple[str, ...]]] = {
     "unsafe_url": ("unsafe_url",),
     "not_roblox": ("not_roblox", "host_not_allowed"),
     "auth_smuggling": ("auth_smuggling",),
+    "endpoint_policy": ("endpoint_policy",),
     "header_rule": ("header_rule",),
     "endpoint_blocked": ("endpoint_blocked",),
     "endpoint_rule": ("endpoint_rule",),

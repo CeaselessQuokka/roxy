@@ -1,0 +1,17 @@
+{#-
+  Endpoint policy page, card `would-block` (`roxy/admin/pages/policy.py would_block_card`), from
+  `GET /admin/api/v1/policy/would-block` over the page's time range (the same function): the blocked endpoints
+  callers reached while Refuse blocked endpoints (`endpoint_policy_enforce`) was off. Shadow mode sends them (never
+  with Roxy's account) and counts them here, so the owner can see what enforcing would refuse before switching it
+  on. The endpoint is built from the caller's path: caller text. Context: `frame`, `table`, `enforced`, `range`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/badges.html" import status_badge %}
+{% call page_card(frame, flush=True, subtitle=range.description) %}
+<div class="g3-pad">
+  <p class="g3-note">{% if enforced %}{{ status_badge("ok", "Enforced") }} Refuse blocked endpoints is on, so this table only holds what arrived while it was off.{% else %}{{ status_badge("warn", "Shadow mode is on") }} Refuse blocked endpoints is off: blocked endpoints are sent without Roxy's account and counted here instead of refused.{% endif %}</p>
+  <p class="muted g3-note">This table fills only while endpoint_policy_enforce is off. Switch it on in the Summary card's settings once nothing here should be sent.</p>
+</div>
+<div class="g3-table-host" hx-select="#{{ table.id }}">{{ data_table(**table) }}</div>
+{% endcall %}

@@ -6,9 +6,10 @@ What this is
     by `CacheService.peek`, and the proxy route as a whole.
 
 Why it exists
-    Admins write regular expressions (endpoint blocks and rate rules, cache rules, the credential allowlist, User-
-    Agent and header rules); callers choose the text they run on (a path of up to `max_url_length` characters, a
-    User-Agent or any header of up to `max_header_bytes`). A pattern that backtracks badly lets one caller freeze a
+    Admins write regular expressions (endpoint blocks and rate rules, cache rules, routing rules, User-Agent and
+    header rules; the endpoint policy that grants the credential uses seed templates, not admin regexes); callers
+    choose the text they run on (a path of up to `max_url_length` characters, a User-Agent or any header of up to
+    `max_header_bytes`). A pattern that backtracks badly lets one caller freeze a
     worker's event loop. The validator, the 50 ms per-match timeout and the 200 ms per-request budget are the three
     defenses; these probes check each and fail when a request can cost more than the budget.
 
@@ -53,7 +54,7 @@ from roxy.rules.match import (
     validate_pattern,
     validate_regex,
 )
-from roxy.rules.models import BanRow, CacheRuleRow, CredentialAllowlistRow, EndpointBlockRow, HeaderRuleRow
+from roxy.rules.models import BanRow, CacheRuleRow, EndpointBlockRow, HeaderRuleRow, RoutingRuleRow
 from roxy.rules.store import BanIndex, RulesSnapshot
 
 MAX_TARGET = 4096 - len("/games.roblox.com/")
@@ -179,14 +180,31 @@ def test_timed_out_header_and_ua_regexes_refuse() -> None:
     assert text_matches("regex", pattern, target, on_timeout=True)
 
 
-def test_timed_out_credential_allowlist_regex_never_grants_the_credential() -> None:
+def test_the_credential_grant_runs_no_admin_regex_and_a_slow_rule_never_grants_it() -> None:
+    """D1 revised: the credential grant is the endpoint policy's (seed templates, no admin regex), so a slow stored
+    regex in any other family (routing, cache, blocks) can neither grant the credential nor slow the grant down.
+    The slow probe's own target is an unknown operation (ALLOW_ANON: no grant, ANON key), and the same caller text
+    as the id of a granted template (`users GET /v1/users/{userId}`) gets its grant in well under the timeout,
+    without a single regex timeout."""
     pattern, target = ACCEPTED_BUT_SLOW[0]
     snapshot = _slow_snapshot(
-        credential_allowlist=(
-            CredentialAllowlistRow(id=1, pattern=pattern, type="regex", methods=("GET",), cache_private=False),
-        )
+        routing_rules=(RoutingRuleRow(id=1, pattern=pattern, type="regex", mode="rotator_only"),),
+        cache_rules=(CacheRuleRow(id=1, pattern=pattern, type="regex", ttl=60),),
+        endpoint_blocks=(EndpointBlockRow(id=1, pattern=pattern + "z", type="regex"),),
     )
-    assert snapshot.credential_rule_for("games.roblox.com/" + target, "GET") is None
+    before = regex_timeouts_total()
+    for method in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"):
+        started = time.perf_counter()
+        assert snapshot.credential_rule_for("games.roblox.com/" + target, method) is None, method
+        assert time.perf_counter() - started < scaled(match.REGEX_MATCH_TIMEOUT_S / 2), method
+    granted_target = "users.roblox.com/v1/users/" + target
+    started = time.perf_counter()
+    grant = snapshot.credential_rule_for(granted_target, "GET")
+    assert time.perf_counter() - started < scaled(match.REGEX_MATCH_TIMEOUT_S / 2)
+    assert grant is not None
+    assert grant.endpoint_id == "users:GET:/v1/users/{userId}"
+    assert snapshot.credential_rule_for(granted_target, "DELETE") is None
+    assert regex_timeouts_total() == before  # the grant itself never ran an admin regex
     cs = CacheSettings.read(FakeSettings())
     assert request_policy("GET", "games.roblox.com/" + target, {}, cs, snapshot).auth_class is AuthClass.ANON
 

@@ -50,6 +50,15 @@ parts and questions below are taken from them.
 
 ## 1. D1: the private endpoint guard ("probably private info")
 
+**Status (2026-10-16): mostly superseded by the endpoint policy.** The owner revised D1 (Roxy sends its own account
+with every request except blocked endpoints; `DECISIONS_REVIEW.md`, the D1 note under section 2). The built-in list
+of sign-in endpoints, the refusal before Roblox, the per-endpoint and per-category choices, the "would Roxy refuse
+this address?" tester and the refusal counts below are built as the Endpoint policy page (`docs/endpoint_policy/`,
+`src/roxy/policy/`), over all 992 operations of Roblox's reference instead of 71 rows. Still open from this item:
+learning new sign-in endpoints from repeated Roblox 401s, the "probably private info" flag on the account's answers
+(with its view of the request and the answer), "throttle it" and "ignore for N minutes" from a flag, and the v1
+migration report section. Unknown endpoints callers ask for are already listed for review.
+
 **You said (D1):**
 
 > "No, calling traffic (`from` source (calling traffic) `to` Roxy) carry credentials. They should also be barred from

@@ -2,23 +2,25 @@
 
 What this is
     Variants of finding cred-3 ("credential redirect hops matched raw and never path-validated"), fixed by sending
-    every hop through `proxy/validate.py parse_redirect` and matching the credential allowlist on the hop's decoded
+    every hop through `proxy/validate.py parse_redirect` and asking for a credential grant on the hop's decoded
     target. The fix test uses two Locations (`%2E%2E` dot segments and `%2F` slashes). Here: double encoding, mixed
     case hex, IIS `%u` escapes, overlong UTF-8, backslashes, a tab inside the host, a lookalike or punycode host, a
     trailing dot, user info and fragment tricks, scheme and port changes, a CR LF in the path, a triple slash, and
-    hops to an allowed host the allowlist does not name (Roxy's own probe endpoint among them).
+    hops to endpoints the endpoint policy does not grant (Roxy's own probe endpoint, a BLOCK row, in any letter
+    case; an ALLOW_ANON row), next to one hop whose target is granted (D1 revised: that one keeps the cookie).
 
 Why it exists
-    The credential is the one secret Roxy sends to Roblox. A hop the caller validator would refuse, or one the
-    allowlist does not grant, must never be followed with the cookie, and what is fetched must be exactly what was
-    checked (plan C2 item 7, 9.10). A neighbor spelling of the original repro is the usual way such a fix is undone.
+    The credential is the one secret Roxy sends to Roblox. A hop the caller validator would refuse, or one whose target
+    the endpoint policy does not grant (ALLOW_TOKEN), must never be followed with the cookie, and what is fetched must
+    be exactly what was checked (plan C2 item 7, 9.10). A neighbor spelling of the original repro is the usual way such
+    a fix is undone.
 
 How it works
     The corpus calls `parse_redirect` directly and requires either a refusal, or an accepted hop whose rebuilt URL
     stays on the current host and parses back to the same target (checked == fetched). The app probe uses
-    `confinement_harness.running_app` like the cred-3 fix test: allowlisted start endpoints answer 302s to the
-    variant Locations, and every request the mock received with the cookie must be a caller-valid URL that an
-    allowlist row grants.
+    `confinement_harness.running_app` like the cred-3 fix test: ALLOW_TOKEN start endpoints of the shipped policy
+    (`users GET /v1/users/{userId}`) answer 302s to the variant Locations; the mock must receive the cookie on
+    the starts and the one granted hop only, and no other hop at all.
 
 What to read next
     `src/roxy/proxy/validate.py` (`parse_redirect`, `parse_upstream_url`), `src/roxy/upstream/service.py`
@@ -92,19 +94,27 @@ def test_cred3_accepted_odd_locations_stay_on_the_host_and_are_fetched_as_checke
     assert (again.ok, again.target) == (True, parsed.target)
 
 
+USERS = "users.roblox.com"
 HOPS = {
-    # allowlisted start path -> where Roblox's 302 points
-    "/v1/user/currency/a": "/v1/user/currency/%252E%252E/%252E%252E/v2/secret?via=double",
-    "/v1/user/currency/b": "/v1/user/currency/%2e%2E/%2E%2e/v2/secret?via=mixed",
-    "/v1/user/currency/c": f"https://users.roblox.com{PROBE_PATH}?via=probe_endpoint",
-    "/v1/user/currency/d": f"https:///users.roblox.com{PROBE_PATH}?via=triple_slash",
-    "/v1/user/currency/e": f"https://{ECONOMY.upper()}/V2/USER/SECRET?via=uppercase",
+    # ALLOW_TOKEN start path on users.roblox.com (`users GET /v1/users/{userId}`) -> where Roblox's 302 points
+    "/v1/users/201": "/v1/users/%252E%252E/%252E%252E/v2/secret?via=double",
+    "/v1/users/202": "/v1/users/%2e%2E/%2E%2e/v2/secret?via=mixed",
+    "/v1/users/203": f"https://{USERS}{PROBE_PATH}?via=probe_endpoint",
+    "/v1/users/204": f"https:///{USERS}{PROBE_PATH}?via=triple_slash",
+    "/v1/users/205": f"https://{USERS.upper()}{PROBE_PATH.upper()}?via=uppercase",
+    "/v1/users/206": f"https://{USERS}/v1/display-names/validate?via=anon_endpoint",
+    "/v1/users/207": f"https://{USERS}/v1/users/999?via=granted",
 }
+GRANTED_HOP = "/v1/users/999?via=granted"
+"""The one hop whose own target is ALLOW_TOKEN: followed, and it alone keeps the cookie (D1 revised)."""
 
 
-async def test_cred3_variant_hops_never_carry_the_cookie_off_the_allowlist(
+async def test_cred3_variant_hops_never_carry_the_cookie_to_a_target_without_a_grant(
     env: Any, credentials_dir: Path, fake_secrets: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Hops a caller could not have sent are refused; valid hops to a BLOCK endpoint (Roxy's own probe endpoint,
+    in any letter case) or an ALLOW_ANON endpoint are not followed on the credential egress; a valid hop to an
+    ALLOW_TOKEN endpoint is followed with the cookie."""
     async with running_app(env, credentials_dir, fake_secrets, monkeypatch) as run:
         respond = run.fixture().MockResponse
         for start, location in HOPS.items():
@@ -112,16 +122,15 @@ async def test_cred3_variant_hops_never_carry_the_cookie_off_the_allowlist(
                 status=302, body=b"", headers=[("Location", location), ("Content-Type", "application/json")]
             )
         await run.activate_credential()
-        await run.rule(
-            "credential_allowlist",
-            {"pattern": r"economy\.roblox\.com/v1/user/currency(?:/.*)?", "type": "regex", "cache_private": True},
-        )
-        statuses = []
+        statuses = {}
         for start in HOPS:
             run.clock.advance(5)
-            statuses.append((await run.get(f"/{ECONOMY}{start}")).status_code)
+            statuses[start] = (await run.get(f"/{USERS}{start}")).status_code
         cookie_paths = [r.path for r in run.cookie_requests() if r.path.split("?")[0] != PROBE_PATH]
-        assert sorted(path.split("?")[0] for path in cookie_paths) == sorted(HOPS)  # only the allowlisted starts
-        assert statuses == [302] * len(HOPS)  # Roblox's own 3xx relayed, never a followed hop
+        assert sorted(cookie_paths) == sorted([*HOPS, GRANTED_HOP])  # the starts, and the one granted hop
+        assert all(r.header("X-Exit-Ip") is None for r in run.cookie_requests())
+        assert statuses == {start: 200 if GRANTED_HOP in HOPS[start] else 302 for start in HOPS}
+        followed = [r.path for r in run.mock_requests() if "via=" in r.path]
+        assert followed == [GRANTED_HOP]  # no other hop was fetched, with the cookie or without
         probe_calls = [r for r in run.cookie_requests() if r.path.split("?")[0] == PROBE_PATH]
         assert all("via=" not in r.path for r in probe_calls)  # the probe endpoint was never reached by a hop

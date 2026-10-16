@@ -22,10 +22,10 @@ How it works
       probes excluded), "requests" are caller requests. Per-call statuses come from the attempts table; where an
       attempt row is missing, the caller rollups give a lower bound (for example every call of a request that
       failed with `upstream_5xx` was a 5xx), and the larger of the two is used.
-    - Changes are scoped wherever the plan allows (`bucket_override`, `rule_upsert`, `routing_rule`,
-      `credential_allowlist_remove`); global settings appear only where 11.5 names one, and then the engine marks the
-      recommendation not `safe_auto`. The credential is never a fallback target (7.9), places are never banned, and
-      no rule here ever proposes moving traffic onto the credential.
+    - Changes are scoped wherever the plan allows (`bucket_override`, `rule_upsert`, `routing_rule`); the endpoint
+      policy is only ever changed by hand (`manual`); global settings appear only where 11.5 names one, and then the
+      engine marks the recommendation not `safe_auto`. The credential is never a fallback target (7.9), places are
+      never banned, and no rule here ever proposes moving traffic onto the credential.
 
 What to read next
     `roxy/insights/rules/base.py` (the authoring guide), `roxy/insights/rules/core.py` (UP-429-ENDPOINT and the
@@ -758,8 +758,8 @@ class Up429Credential(Rule):
     Fires when calls made with the Roblox account got at least `min_429s` Roblox 429s within the last day. Each one
     means Roblox is limiting the account itself, so the recommendation lowers `credential_bucket_per_min` (by
     `adaptive_decrease_pct`, always above the rate reserved for Roxy's own probes) and, for each limited endpoint
-    whose allowlist row records that anonymous calls return the identical body, removes it from the credential
-    allowlist. The credential is never replaced or switched (C1); `credential_bucket_per_min` is a global
+    that Roblox also answers without a sign-in, suggests sending it without the account (a manual change on the
+    Endpoint policy page). The credential is never replaced or switched (C1); `credential_bucket_per_min` is a global
     setting, so this is never applied automatically.
     """
 
@@ -800,21 +800,22 @@ class Up429Credential(Rule):
             changes.append(setting_change(ctx, "credential_bucket_per_min", cut))
         removed: list[str] = []
         for template in sorted(per_template, key=lambda t: -per_template[t]):
-            row = ctx.rules.credential_rule_for(template, "GET")
+            row = ctx.rules.credential_rule_for(template, "GET") or ctx.rules.credential_rule_for(template, "POST")
             if row is None or not row.identical_anonymous or len(changes) >= MAX_CHANGES:
                 continue
             removed.append(template)
             changes.append(
-                ProposedChange(
-                    "credential_allowlist_remove",
-                    table="credential_allowlist",
-                    match={"pattern": row.pattern, "type": row.type},
-                    current=rule_columns(row),
+                manual(
+                    f"On Endpoint policy, set {getattr(row, 'endpoint_id', template)} to 'Sent without an account': "
+                    "Roblox answers it without a sign-in too."
                 )
             )
         if not changes:
             changes.append(
-                manual("Reduce the allowlisted credential traffic: the credential bucket is already at its floor.")
+                manual(
+                    "Send less traffic with the account: the credential bucket is already at its floor. On Endpoint "
+                    "policy, switch the busiest endpoints (or the Public data category) to 'Sent without an account'."
+                )
             )
         names = ", ".join(sorted(per_template)[:NAMES_SHOWN])
         explanation = (
@@ -823,14 +824,14 @@ class Up429Credential(Rule):
         )
         if cut is not None:
             explanation += (
-                f"Lowering credential_bucket_per_min from {current:g} to {cut} paces allowlisted calls below that "
+                f"Lowering credential_bucket_per_min from {current:g} to {cut} paces the account's calls below that "
                 f"limit (Roxy's own probes keep their reserved {ctx.setting('credential_probe_reserved_per_min')} per "
                 "minute). "
             )
         if removed:
             explanation += (
-                f"{', '.join(removed)} returns the identical body without the account, so it should not use the "
-                "credential at all."
+                f"{', '.join(removed)} answers without a sign-in too, so it can be sent without the account (Endpoint "
+                "policy page)."
             )
         return [
             self.recommendation(
@@ -1111,11 +1112,11 @@ class Up4xxSpike(Rule):
     For each endpoint template with at least `min_calls` upstream calls in the last `window_min` minutes, compares
     the share of calls Roblox answered 400, 401 or 403 (CSRF challenges excluded) with the same share over the 7
     days before. It fires when the share exceeds `baseline_multiple` times the baseline with at least
-    `min_responses` such answers. The fix depends on which path fails: an allowlisted credential endpoint that
-    answers 401 is removed from the allowlist (check the credential too); when only the anonymous path fails and
-    the credential path works for the same template, the owner decides about the allowlist (manual, never
-    automatic); when every path fails, the endpoint gets a negative cache rule (so callers stop paying for the
-    error) or, for answers the cache cannot store (401), an endpoint block with a clear message.
+    `min_responses` such answers. The fix depends on which path fails: an endpoint sent with the account that
+    answers 401 should be sent without it (manual, on the Endpoint policy page; check the credential too); when
+    only the anonymous path fails and the credential path works for the same template, the owner decides on the
+    policy (manual, never automatic); when every path fails, the endpoint gets a negative cache rule (so callers stop
+    paying for the error) or, for answers the cache cannot store (401), an endpoint block with a clear message.
     """
 
     id = "UP-4XX-SPIKE"
@@ -1229,26 +1230,24 @@ class Up4xxSpike(Rule):
         if allow_row is not None and cred["unauthorized"]:
             branch = "credential_401"
             changes = [
-                ProposedChange(
-                    "credential_allowlist_remove",
-                    table="credential_allowlist",
-                    match={"pattern": allow_row.pattern, "type": allow_row.type},
-                    current=rule_columns(allow_row),
+                manual(
+                    f"On Endpoint policy, set {getattr(allow_row, 'endpoint_id', template)} to 'Sent without an "
+                    "account' (or Blocked): Roblox refuses the account there."
                 )
             ]
             meta = await ctx.credential_meta()
             explanation = (
-                f"The allowlisted endpoint {template} answered {cred['unauthorized']:,} credential calls with 401 in "
-                f"the last {round(window.span / 60)} minutes ({rate:.1f}% rejected against {base_rate:.1f}% over the "
-                "previous 7 days). Removing it from the credential allowlist stops sending the account to an endpoint "
-                "that refuses it. Check the credential too: " + probe_text(meta)
+                f"{template}, which Roxy sends with its account, answered {cred['unauthorized']:,} credential calls "
+                f"with 401 in the last {round(window.span / 60)} minutes ({rate:.1f}% rejected against "
+                f"{base_rate:.1f}% over the previous 7 days). Sending it without the account (Endpoint policy) stops "
+                "sending the account to an endpoint that refuses it. Check the credential too: " + probe_text(meta)
             )
         elif anon_rejected and cred["ok"] and not cred["rejected"]:
             branch = "anonymous_only"
             changes = [
                 manual(
-                    f"Decide whether {template} belongs on the credential allowlist: anonymous calls are refused "
-                    "while calls with the account succeed. Roxy never adds an endpoint to the allowlist on its own."
+                    f"Decide on Endpoint policy whether {template} is sent with Roxy's account: anonymous calls are "
+                    "refused while calls with the account succeed. Roxy never loosens the policy on its own."
                 )
             ]
             explanation = (

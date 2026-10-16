@@ -2,9 +2,10 @@
 
 What this is
     `RulesSnapshot` holds every rule family of control.db (endpoint blocks and rate rules, cache rules, UA rules,
-    header filters, routing rules, upstream limits, the credential allowlist, the throttle ladder, ignored
-    params, headers and paths, the access lists and the active bans) as frozen row models plus the lookup
-    structures the hot path needs: specificity-sorted `PatternIndex`es, ordered tuples, sets, and CIDR indexes.
+    header filters, routing rules, upstream limits, the endpoint policy overrides and category switches, the
+    throttle ladder, ignored params, headers and paths, the access lists and the active bans) as frozen row models
+    plus the lookup structures the hot path needs: specificity-sorted `PatternIndex`es, ordered tuples, sets, CIDR
+    indexes, and the compiled `EndpointPolicy` (the shipped seed with the admin's changes applied).
     `RulesStore` owns the current snapshot of one worker and swaps in a new one when `config_version` changes.
 
 Why it exists
@@ -32,6 +33,7 @@ What to read next
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import ipaddress
 import logging
@@ -46,6 +48,9 @@ from pydantic import ValidationError
 
 from roxy.config.runtime import read_config_version
 from roxy.core.clock import SYSTEM_CLOCK, Clock
+from roxy.policy.engine import CredentialGrant, EndpointPolicy, OverrideEntry
+from roxy.policy.matcher import TemplateIndex
+from roxy.policy.seed import Verdict, load_seed
 from roxy.rules import re_compat
 from roxy.rules.match import PatternIndex, precompile_text_regex
 from roxy.rules.models import (
@@ -54,9 +59,10 @@ from roxy.rules.models import (
     BanRow,
     CacheIgnoredParamRow,
     CacheRuleRow,
-    CredentialAllowlistRow,
     EndpointBlockRow,
     EndpointLimitRow,
+    EndpointPolicyCategoryRow,
+    EndpointPolicyOverrideRow,
     HeaderRuleRow,
     IgnoredPathRow,
     IgnoredValueHeaderRow,
@@ -236,11 +242,30 @@ class BanIndex:
         return len(self.rows)
 
 
+@functools.cache
+def _seed_index() -> TemplateIndex:
+    """The compiled templates of the shipped seed: built once per process, shared by every snapshot."""
+    return TemplateIndex(load_seed().rows)
+
+
+def build_endpoint_policy(
+    overrides: Iterable[EndpointPolicyOverrideRow], categories: Iterable[EndpointPolicyCategoryRow]
+) -> EndpointPolicy:
+    """The policy for one snapshot: the shipped seed with the enabled overrides and the category switches."""
+    entries = (
+        OverrideEntry(row.endpoint_id, Verdict(row.verdict), bool(row.cache_private), row.note)
+        for row in overrides
+        if row.enabled
+    )
+    states = {row.category: row.state for row in categories}
+    return EndpointPolicy(load_seed(), entries, states, index=_seed_index())
+
+
 # --- the snapshot -----------------------------------------------------------------------------------------------------
 
 
 class _PatternRow(Protocol):
-    """A row keyed by an endpoint pattern (blocks, endpoint rules, cache rules, routing, credential allowlist)."""
+    """A row keyed by an endpoint pattern (blocks, endpoint rules, cache rules, routing rules)."""
 
     @property
     def id(self) -> int: ...
@@ -259,8 +284,8 @@ def _index[R: _PatternRow](rows: Iterable[R], *, on_timeout: bool = False, exact
     """Enabled rows only, sorted by specificity (then id) so the first match is v1's winner.
 
     `on_timeout=True` for rules that refuse or limit traffic: a pattern match cut off by the regex timeout then
-    counts as a match, so a slow pattern can never be used to slip past them (security review M4). `exact=True`
-    for the credential allowlist: a row grants exactly the paths it names, never the paths below them (F3).
+    counts as a match, so a slow pattern can never be used to slip past them (security review M4). `exact=True`:
+    a row matches exactly the paths it names, never the paths below them (F3).
     """
     return PatternIndex(
         ((row.id, row.pattern, row.type, row) for row in rows if row.enabled), on_timeout=on_timeout, exact=exact
@@ -280,7 +305,8 @@ class RulesSnapshot:
     header_rules: tuple[HeaderRuleRow, ...] = ()  # insertion order (id), the v1 order
     routing_rules: tuple[RoutingRuleRow, ...] = ()
     upstream_limits: Mapping[str, UpstreamLimitRow] = field(default_factory=lambda: MappingProxyType({}))
-    credential_allowlist: tuple[CredentialAllowlistRow, ...] = ()
+    policy_overrides: tuple[EndpointPolicyOverrideRow, ...] = ()
+    policy_categories: tuple[EndpointPolicyCategoryRow, ...] = ()
     throttle_tiers: tuple[ThrottleTierRow, ...] = ()  # rung 1 first
     cache_ignored_param_rows: tuple[CacheIgnoredParamRow, ...] = ()
     ignored_value_header_rows: tuple[IgnoredValueHeaderRow, ...] = ()
@@ -293,7 +319,7 @@ class RulesSnapshot:
     endpoint_limit_index: PatternIndex[EndpointLimitRow] = field(init=False)
     cache_rule_index: PatternIndex[CacheRuleRow] = field(init=False)
     routing_index: PatternIndex[RoutingRuleRow] = field(init=False)
-    credential_index: PatternIndex[CredentialAllowlistRow] = field(init=False)
+    endpoint_policy: EndpointPolicy = field(init=False)
     ignored_path_index: PatternIndex[IgnoredPathRow] = field(init=False)
     enabled_ua_rules: tuple[UserAgentRuleRow, ...] = field(init=False)
     enabled_header_rules: tuple[HeaderRuleRow, ...] = field(init=False)
@@ -307,8 +333,8 @@ class RulesSnapshot:
         set_(self, "endpoint_limit_index", _index(self.endpoint_limits, on_timeout=True))
         set_(self, "cache_rule_index", _index(self.cache_rules))
         set_(self, "routing_index", _index(self.routing_rules))
-        # Least privilege for the one credential (C1, D1): exact grants, and a timed-out match never grants it.
-        set_(self, "credential_index", _index(self.credential_allowlist, exact=True))
+        # The endpoint policy (D1 revised): the one place that decides whether a request may carry the credential.
+        set_(self, "endpoint_policy", build_endpoint_policy(self.policy_overrides, self.policy_categories))
         set_(
             self,
             "ignored_path_index",
@@ -348,17 +374,13 @@ class RulesSnapshot:
         """The most specific enabled routing rule covering `target` (plan 7.2 step 2)."""
         return self.routing_index.best(target)
 
-    def credential_rule_for(self, target: str, method: str) -> CredentialAllowlistRow | None:
-        """The allowlist entry letting `method` on `target` use the credential, or None (plan 7.2 step 1).
+    def credential_rule_for(self, target: str, method: str) -> CredentialGrant | None:
+        """The grant letting `method` on `target` carry the credential, or None (plan 7.2 step 1, D1 revised).
 
-        Entries match exactly (`rules/match.py`, finding F3): `economy.roblox.com/v1/user/currency` grants that
-        path only, not `/v1/user/currency/<anything>`. The most specific matching entry decides: if it does not
-        list the method, the answer is None (a less specific entry never widens a more specific one).
+        Only an ALLOW_TOKEN verdict of the endpoint policy grants it, and only for GET, HEAD or POST
+        (`roxy/policy/engine.py`). The upstream, the cache and the insights all ask here, so they always agree.
         """
-        rule = self.credential_index.best(target)
-        if rule is None or method.upper() not in rule.methods:
-            return None
-        return rule
+        return self.endpoint_policy.credential_grant(target, method)
 
     def is_ignored_path(self, path: str) -> bool:
         """Whether `path` (without the leading slash) is answered 404 without logging (row 50)."""
@@ -378,7 +400,8 @@ class RulesSnapshot:
             "header_rules": len(self.header_rules),
             "routing_rules": len(self.routing_rules),
             "upstream_limits": len(self.upstream_limits),
-            "credential_allowlist": len(self.credential_allowlist),
+            "endpoint_policy_overrides": len(self.policy_overrides),
+            "endpoint_policy_categories": len(self.policy_categories),
             "throttle_tiers": len(self.throttle_tiers),
             "cache_ignored_params": len(self.cache_ignored_param_rows),
             "ignored_value_headers": len(self.ignored_value_header_rows),
@@ -440,7 +463,8 @@ def build_rules_snapshot(conn: sqlite3.Connection, now: float) -> RulesSnapshot:
         header_rules=tuple(rows("rules_header")),
         routing_rules=tuple(rows("rules_routing")),
         upstream_limits=MappingProxyType(upstream),
-        credential_allowlist=tuple(rows("credential_allowlist")),
+        policy_overrides=tuple(rows("endpoint_policy_override")),
+        policy_categories=tuple(rows("endpoint_policy_category")),
         throttle_tiers=tuple(rows("throttle_tiers")),
         cache_ignored_param_rows=tuple(rows("cache_ignored_params")),
         ignored_value_header_rows=tuple(rows("ignored_value_headers")),

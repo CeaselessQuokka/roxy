@@ -24,9 +24,9 @@ How it works
       "never cache this endpoint"), `negative_ttl` replaces `cache_error_ttl_seconds`, and `stale_ttl` replaces
       the stale-while-revalidate window `cache_swr_seconds` (plan 7.6 "rule-overridable"; the shipped presence
       rule uses it for its 15 s SWR window).
-    - The credential (plan 6.9, 9.13): a request whose endpoint is on the credential allowlist has auth class
-      `cred`. When that allowlist row says `cache_private`, the request is never cached, coalesced, revalidated
-      or served stale: it is `OFF`.
+    - The credential (plan 6.9, 9.13): a request the endpoint policy sends with the account (a credential grant)
+      has auth class `cred`. When that grant says `cache_private`, the request is never cached, coalesced,
+      revalidated or served stale: it is `OFF`.
     - Stored (row 56, plan 7.7): any Roblox 2xx under a positive lifetime and within `cache_max_body` bytes;
       Roblox 400, 403 (only when it is not a CSRF challenge), 404 and 410 for the error lifetime; a Roblox 429 as a
       marker until the cooldown ends (when `cache_negative_429` is on), never as content; 5xx, timeouts and every

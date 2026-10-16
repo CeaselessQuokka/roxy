@@ -155,9 +155,11 @@ def chapters() -> list[dict[str, Any]]:
         },
         {
             "title": "Protection",
-            "text": "The order of the checks, which tool to use for which problem, and what the tarpit does.",
+            "text": "The order of the checks, which tool to use for which problem, what the tarpit does, and which "
+            "Roblox endpoints Roxy forwards and with which account.",
             "links": [
                 link("Protection", "/admin/protection"),
+                link("Endpoint policy", "/admin/policy"),
                 link("Runbook: Under attack", "/admin/help/runbooks#under-attack"),
             ],
         },

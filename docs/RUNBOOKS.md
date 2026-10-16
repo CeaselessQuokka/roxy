@@ -204,7 +204,7 @@ and hosts get them (`GET /admin/api/v1/upstream/hosts`), the active cooldowns
 - One popular endpoint is fetched from Roblox too often: its cache lifetime is short, or callers add a changing
   parameter (a cache buster) so every request is a miss.
 - An endpoint or host bucket allows more than Roblox accepts.
-- Traffic is going out with the credential (the credential allowlist is not empty).
+- Too much traffic is going out with the credential (the endpoint policy sends public reads with it).
 - Through the rotator: individual exit addresses were limited (Roxy only cools down an endpoint on the rotator after
   three different exits got 429s).
 
@@ -221,8 +221,8 @@ and hosts get them (`GET /admin/api/v1/upstream/hosts`), the active cooldowns
    override, `PATCH /admin/api/v1/upstream-limits/{bucket_key}` for an existing one; keys look like
    `endpoint:<template>` or `host:<host>`). Adaptive rate control already lowers a bucket after a 429 while
    `adaptive_rate_enabled` is on.
-5. Check the credential allowlist (`GET /admin/api/v1/credential-allowlist`). It should be empty unless you decided
-   otherwise (owner decision D1).
+5. Check what goes out with the credential: the Endpoint policy page (`GET /admin/api/v1/policy`). Switching the
+   Public data category to "Send without account" takes the account off every caller request at once.
 6. Do not clear the cooldowns to make the 429s go away. A cooldown is Roblox telling Roxy to wait; Roxy already
    serves stale data during a cooldown when it has some.
 
@@ -313,13 +313,15 @@ H-CRED-COOLDOWN warns or fails.
 from; the cooldown row `credential` is on the Upstream page (`GET /admin/api/v1/upstream/cooldowns`); recent
 credential calls are on `GET /admin/api/v1/credential/budget`.
 
-**Likely causes.** Roblox answered 429 on a credential call: allowlisted traffic was too fast, probes ran too often,
+**Likely causes.** Roblox answered 429 on a credential call: caller traffic sent with it was too fast, probes ran too often,
 or the account hit a limit of its own.
 
 **Fix.**
 
 1. Wait. During the cooldown no worker uses the credential, which is exactly what Roblox asked for.
-2. Lower `credential_bucket_per_min` if allowlisted traffic caused it, and review the credential allowlist.
+2. Lower `credential_bucket_per_min` if caller traffic caused it; on Endpoint policy, send the busiest endpoints
+   without the account. Endpoints Roblox answers without a sign-in already go out anonymously while the account
+   rests.
 3. Raise `credential_probe_interval_min` if probes caused it (recommendation CRED-PROBE-COST says so when it applies).
 4. Avoid "Reset upstream state" (`POST /admin/api/v1/upstream/reset`): it clears every cooldown, the credential's
    included, and the next call may be refused again with a longer wait.
@@ -328,8 +330,8 @@ or the account hit a limit of its own.
 
 **Roll back.** Revert the settings from the Settings history.
 
-**Prevent.** Keep the allowlist small and the credential bucket modest; plan 13.3 expects about 50 to 60 credential
-calls a day with an empty allowlist.
+**Prevent.** Keep the credential bucket modest; Roxy's own checks use about 50 to 60 credential calls a day (plan
+13.3), and caller traffic beyond the bucket goes out anonymously instead of waiting.
 
 ## Credential rotated by Roblox
 
@@ -832,7 +834,7 @@ authenticator).
 3. Sign in, regenerate the recovery codes (`POST /admin/api/v1/security/recovery-codes/regenerate`) and review
    passkeys (`GET /admin/api/v1/security/passkeys`).
 4. Read the Audit page (`GET /admin/api/v1/audit`) for anything the session changed, and revert it: settings from
-   their history, rules and bans by hand, the credential allowlist (`GET /admin/api/v1/credential-allowlist`), the
+   their history, rules and bans by hand, the endpoint policy (`GET /admin/api/v1/policy`), the
    rotator URL. The credential value is never shown on any page, but check whether it was replaced.
 5. If the server itself (not only the dashboard) may be compromised, treat every file in `/etc/roxy/credentials/`
    as exposed: replace the Roblox credential once ([Credential rejected](#credential-rejected)) and change the

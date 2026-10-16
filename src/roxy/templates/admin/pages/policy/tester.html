@@ -1,0 +1,24 @@
+{#-
+  Endpoint policy page, card `tester` (`roxy/admin/pages/policy.py tester_card`): paste a URL in any form (Roxy's
+  `https://<roxy>/<host>/<path>`, a roblox.com URL, or `host/path`, a query included) and pick a method; the answer
+  comes from `/admin/policy/test` (the API's `target_answer`) and is swapped in under the form. Nothing is sent to
+  Roblox. Context: `frame`, `methods`, `max_chars`, `url`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% call page_card(frame) %}
+<form class="stack g3-form g3-tester" role="search" aria-label="Test what the endpoint policy does with a URL" hx-get="{{ url }}" hx-target="#policy-test-result" hx-swap="innerHTML">
+  <div class="field-row">
+    <div class="field policy-tester__target">
+      <label class="field__label" for="policy-test-target">URL <span class="muted">(a Roxy URL, a roblox.com URL, or host and path)</span></label>
+      <input class="input mono" type="text" id="policy-test-target" name="target" required maxlength="{{ max_chars }}" autocomplete="off" spellcheck="false" placeholder="https://games.roblox.com/v1/games/1818/servers/Public">
+    </div>
+    <div class="field">
+      <label class="field__label" for="policy-test-method">Method</label>
+      <select class="input" id="policy-test-method" name="method">{% for m in methods %}<option value="{{ m }}"{% if loop.first %} selected{% endif %}>{{ m }}</option>{% endfor %}</select>
+    </div>
+  </div>
+  <div class="cluster"><button type="submit" class="btn" data-action="policy-test">{{ icon("search") }}<span>What does the policy do?</span></button><span class="muted">Nothing is sent to Roblox.</span></div>
+  <div id="policy-test-result" class="g3-tester__result" aria-live="polite"></div>
+</form>
+{% endcall %}

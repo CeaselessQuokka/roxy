@@ -1,13 +1,13 @@
 """End-to-end pipeline tests: the fully wired application, from the caller's bytes to Roblox and back.
 
 What this is
-    Tests that drive `create_app(env)` with its real lifespan (every wave 2 package wired: notifier, egress,
-    recorder, upstream, cache with single-flight, abuse, proxy) over temporary databases, with `respx` playing
-    Roblox behind the real egress clients. They cover every refusal golden through the real abuse pipeline, every
-    plan 7.13 row (with `compat_collapse_upstream_errors` off and on where it changes the answer), the cache states
-    HIT, MISS, REVALIDATING, STALE (after a failure and during a cooldown), COALESCED, negative caching and the POST
-    allowlist, plan 19.5 item 4 (the end-to-end recording proxy) and item 10
-    (`test_cred_response_never_served_to_other_auth_class`) through the full app, and the two answers that must
+    Tests that drive `create_app(env)` with its real lifespan (every wave 2 package wired: notifier, egress, recorder,
+    upstream, cache with single-flight, abuse, proxy) over temporary databases, with `respx` playing Roblox behind the
+    real egress clients. They cover every refusal golden through the real abuse pipeline, every plan 7.13 row (with
+    `compat_collapse_upstream_errors` off and on where it changes the answer), the cache states HIT, MISS, REVALIDATING,
+    STALE (after a failure and during a cooldown), COALESCED, negative caching and the POST allowlist, the endpoint
+    policy (refusals and which requests carry the credential), plan 19.5 item 4 (the end-to-end recording proxy) and
+    item 10 (`test_cred_response_never_served_to_other_auth_class`) through the full app, and the two answers that must
     never enter the proxy pipeline: an unknown admin path (row 15) and `/internal` on the public port.
 
 Why it exists
@@ -47,6 +47,7 @@ import pytest
 
 from roxy.abuse.pause import set_pause
 from roxy.abuse.throttle_all import set_throttle_all
+from roxy.cache.policy import CacheSettings, request_policy
 from roxy.config.audit import Actor
 from roxy.config.settings_service import SettingsService
 from roxy.core.clock import FakeClock
@@ -404,7 +405,11 @@ async def test_refusal_auth_smuggling(e2e: E2E) -> None:
     expect(
         response,
         400,
-        wire("Requests requiring authentication are not allowed with this proxy."),
+        wire(
+            "Roxy refused this request because it carried a Roblox login cookie or API key. Never send yours: "
+            "Roxy uses its own account. If that was your real .ROBLOSECURITY cookie, sign out of all sessions on "
+            "roblox.com to invalidate it. Roxy did not store it."
+        ),
         {**UNCOUNTED, "Roxy-Refusal": "auth_smuggling"},
         JSON,
     )
@@ -813,16 +818,22 @@ async def test_row_egress_disabled(e2e: E2E) -> None:
 
 
 async def test_row_credential_unavailable(e2e: E2E) -> None:
-    await e2e.rule("credential_allowlist", {"pattern": "economy.roblox.com/v1/user/currency", "cache_private": True})
+    """A rejected credential: a sign-in-only ALLOW_TOKEN endpoint (`games GET /v1/games/multiget-place-details`)
+    answers 503 without any call (never anonymous instead, plan 6.9); an endpoint Roblox also answers signed out
+    (`games GET /v1/games`, `identical_anonymous`) is answered anonymously (D1 revised, BRIEF.md 5.4)."""
     await e2e.ctx.egress.credential.mark_rejected("e2e test")
-    route = e2e.route("economy.roblox.com", "/v1/user/currency").mock(return_value=json_response({"robux": 1}))
-    response = await e2e.get("/economy.roblox.com/v1/user/currency")
+    route = e2e.route(GAMES, "/v1/games/multiget-place-details").mock(return_value=json_response({"data": []}))
+    response = await e2e.get(f"/{GAMES}/v1/games/multiget-place-details?placeIds=1")
     assert response.status_code == 503
     assert response.content == BUSY
     headers = roxy_headers(response)
     assert headers["roxy-refusal"] == "credential_unavailable"
     assert headers["retry-after"] == "300"
     assert route.call_count == 0  # never anonymous instead (plan 6.9)
+    listing = e2e.route(GAMES, GAMES_PATH).mock(return_value=json_response({"data": []}))
+    assert (await e2e.get(games(31))).status_code == 200
+    assert listing.call_count == 1
+    assert "cookie" not in listing.calls.last.request.headers  # anonymous, never the rejected cookie
 
 
 async def test_row_degraded_shared_state(e2e: E2E, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1015,11 +1026,15 @@ async def test_cache_post_allowlist(e2e: E2E) -> None:
     other = await e2e.request("POST", "/thumbnails.roblox.com/v1/batch", json=[*payload, {"targetId": 2}])
     assert [roxy_headers(r)["roxy-cache"] for r in (first, second, other)] == ["MISS", "HIT", "MISS"]
     assert batch.call_count == 2
-    write = e2e.route(GAMES, "/v1/games/list").mock(return_value=json_response({"ok": True}))
+    assets = e2e.route("assetdelivery.roblox.com", "/v1/assets/batch").mock(return_value=json_response([]))
     for _ in range(2):
-        response = await e2e.request("POST", f"/{GAMES}/v1/games/list", json={"a": 1})
+        response = await e2e.request("POST", "/assetdelivery.roblox.com/v1/assets/batch", json=[{"assetId": 1}])
         assert roxy_headers(response)["roxy-cache"] == "OFF"
-    assert write.call_count == 2  # a POST outside the allowlist is never cached
+    assert assets.call_count == 2  # a POST outside the allowlist is never cached
+    write = e2e.route(GAMES, "/v1/games/list").mock(return_value=json_response({"ok": True}))
+    response = await e2e.request("POST", f"/{GAMES}/v1/games/list", json={"a": 1})
+    assert (response.status_code, roxy_headers(response)["roxy-refusal"]) == (403, "endpoint_policy")
+    assert write.call_count == 0  # an unknown write never reaches Roblox (endpoint policy)
 
 
 async def test_outcomes_reach_the_rollups(e2e: E2E) -> None:
@@ -1047,8 +1062,9 @@ async def test_outcomes_reach_the_rollups(e2e: E2E) -> None:
 
 async def test_cred_response_never_served_to_other_auth_class(e2e: E2E) -> None:
     """Plan 6.9 and 19.5 item 10 through the full app: an answer fetched with the credential is never served to a
-    request that would not itself use the credential (after the owner removes the allowlist row), whether as a hit,
-    a coalesced flight, a stale-while-revalidate serve or a stale serve."""
+    request that would not itself use the credential (after an admin override turns the shipped ALLOW_TOKEN
+    `games GET /v1/games` into ALLOW_ANON), whether as a hit, a coalesced flight, a stale-while-revalidate serve or
+    a stale serve."""
     secret = f".ROBLOSECURITY={e2e.credential}"
     e2e.route("users.roblox.com", "/v1/users/authenticated").mock(
         return_value=json_response({"id": 1, "name": "owner"})
@@ -1059,7 +1075,7 @@ async def test_cred_response_never_served_to_other_auth_class(e2e: E2E) -> None:
     gate.set()
     seen: list[bool] = []
 
-    async def currency(request: httpx.Request) -> httpx.Response:
+    async def listing(request: httpx.Request) -> httpx.Response:
         with_cookie = request.headers.get("cookie") == secret
         seen.append(with_cookie)
         await gate.wait()
@@ -1067,26 +1083,27 @@ async def test_cred_response_never_served_to_other_auth_class(e2e: E2E) -> None:
             return json_response({"robux": "secret"})
         return json_response({"robux": "anonymous"})
 
-    e2e.route("economy.roblox.com", "/v1/user/currency").mock(side_effect=currency)
-    path = "/economy.roblox.com/v1/user/currency"
-    row = await e2e.rule(
-        "credential_allowlist", {"pattern": "economy.roblox.com/v1/user/currency", "cache_private": False}
-    )
-    rule_id = row.after["id"] if hasattr(row, "after") and isinstance(row.after, dict) else row.id
+    e2e.route(GAMES, GAMES_PATH).mock(side_effect=listing)
+    path = games(1)
+    anonymous_override = {"endpoint_id": "games:GET:/v1/games", "verdict": "ALLOW_ANON", "note": "e2e"}
 
     # Hits: the credential answer is cached under the credential class only.
     cred = await e2e.get(path)
     assert cred.content == b'{"robux":"secret"}'
     assert (await e2e.get(path)).content == b'{"robux":"secret"}'
     assert seen == [True]
-    await e2e.rules().delete("credential_allowlist", rule_id, ADMIN, "e2e test")
+    await e2e.rule("endpoint_policy_override", anonymous_override)
     anon = await e2e.get(path)
     assert anon.content == b'{"robux":"anonymous"}'
     assert roxy_headers(anon)["roxy-cache"] == "MISS"
     assert seen == [True, False]
 
     # Stale-while-revalidate and stale serves: each class only ever sees its own copy.
-    e2e.clock.advance(150)  # both entries expired, inside the SWR window
+    plan = request_policy(
+        "GET", f"{GAMES}{GAMES_PATH}", {}, CacheSettings.read(e2e.ctx.settings), e2e.ctx.rules.snapshot
+    )
+    assert plan.swr_s > 1
+    e2e.clock.advance(plan.ttl_s + 1)  # both entries expired, inside the SWR window
     revalidating = await e2e.get(path)
     assert revalidating.content == b'{"robux":"anonymous"}'
     assert await wait_for(lambda: len(seen) == 3)
@@ -1095,13 +1112,10 @@ async def test_cred_response_never_served_to_other_auth_class(e2e: E2E) -> None:
     # Coalescing: a credential flight in progress is never joined by an anonymous request.
     e2e.clock.advance(2000)  # every entry is past its stale window
     gate.clear()
-    readd = await e2e.rule(
-        "credential_allowlist", {"pattern": "economy.roblox.com/v1/user/currency", "cache_private": False}
-    )
-    readd_id = readd.after["id"] if hasattr(readd, "after") and isinstance(readd.after, dict) else readd.id
+    await e2e.rules().delete("endpoint_policy_override", "games:GET:/v1/games", ADMIN, "e2e test")  # shipped again
     cred_task = asyncio.create_task(e2e.get(path))
     assert await wait_for(lambda: len(seen) == 4)
-    await e2e.rules().delete("credential_allowlist", readd_id, ADMIN, "e2e test")
+    await e2e.rule("endpoint_policy_override", anonymous_override)
     anon_task = asyncio.create_task(e2e.get(path))
     assert await wait_for(lambda: len(seen) == 5)  # its own upstream call, not a follower of the credential flight
     gate.set()
@@ -1181,22 +1195,15 @@ async def through_rotator(
 
 
 async def test_end_to_end_recording_proxy(through_rotator: tuple[E2E, Any, Any]) -> None:
-    """Plan 19.5 item 4 through the full app: caller traffic of every kind plus the health checks' credential
-    probe and guard self-test, with the rotator pointed at a recording forward proxy. Not one recorded byte may
-    contain the credential, a 24-character piece of it, or its cookie name."""
+    """Plan 19.5 item 4 through the full app: caller traffic of every kind (ALLOW_TOKEN reads with the credential,
+    ALLOW_ANON and unknown reads through the rotator) plus the health checks' credential probe and guard
+    self-test, with the rotator pointed at a recording forward proxy. Not one recorded byte may contain the
+    credential, a 24-character piece of it, or its cookie name; the cookie goes straight to Roblox (never through
+    the proxy) on ALLOW_TOKEN operations and the probe only."""
     e2e, proxy, mock = through_rotator
     fixture = load_fixture("recording_proxy")
     mock.routes["/v1/users/authenticated"] = fixture.MockResponse(body=b'{"id":1,"name":"owner"}')
     mock.routes["/v1/users/404404"] = fixture.MockResponse(status=404, body=b'{"errors":[]}')
-    statuses = []
-    for path in (games(1), games(1), games(2), "/users.roblox.com/v1/users/404404", "/groups.roblox.com/v1/groups/9"):
-        statuses.append((await e2e.get(path)).status_code)
-    batch = await e2e.request("POST", "/thumbnails.roblox.com/v1/batch", json=[{"targetId": 1}])
-    statuses.append(batch.status_code)
-    marker_body = json.dumps({"x": fixture.TOKEN_PREFIX}).encode()  # the public warning text, not the secret
-    marker = await e2e.request("POST", "/thumbnails.roblox.com/v1/batch", content=marker_body)
-    assert marker.status_code == 400  # refused at ingress: never reaches any egress (plan C2 item 5)
-    assert statuses == [200, 200, 200, 404, 200, 200]
 
     # The health check's credential work: the probe (credential path, direct) and the guard self-test.
     probe = await e2e.ctx.egress.credential.probe("admin_check", fetch=e2e.ctx.upstream.credential_probe_fetch)
@@ -1204,16 +1211,38 @@ async def test_end_to_end_recording_proxy(through_rotator: tuple[E2E, Any, Any])
     self_test = await e2e.ctx.egress.self_test_leak_guard()
     assert getattr(self_test, "ok", getattr(self_test, "passed", True))
 
-    # Last: a credential piece in a caller body is stopped by the rotator's guard before anything is sent.
-    leak = await e2e.request("POST", "/thumbnails.roblox.com/v1/batch", json=[{"note": e2e.credential[-40:]}])
+    statuses = []
+    granted = (games(1), games(1), games(2), "/users.roblox.com/v1/users/404404", "/groups.roblox.com/v1/groups/9")
+    anonymous = ("/users.roblox.com/v1/display-names/validate?displayName=a", f"/{GAMES}/v1/games/1/sneaky")
+    for path in (*granted, *anonymous):
+        e2e.clock.advance(5)  # the credential bucket (burst 3, 20 per minute) refills, as real time would
+        statuses.append((await e2e.get(path)).status_code)
+    e2e.clock.advance(5)
+    batch = await e2e.request("POST", "/thumbnails.roblox.com/v1/batch", json=[{"targetId": 1}])
+    statuses.append(batch.status_code)
+    marker_body = json.dumps({"x": fixture.TOKEN_PREFIX}).encode()  # the public warning text, not the secret
+    marker = await e2e.request("POST", "/thumbnails.roblox.com/v1/batch", content=marker_body)
+    assert marker.status_code == 400  # refused at ingress: never reaches any egress (plan C2 item 5)
+    assert statuses == [200, 200, 200, 404, 200, 200, 200, 200]
+
+    # Last: a credential piece in an anonymous caller body is stopped by the rotator's guard before anything is
+    # sent (`assetdelivery POST /v1/assets/batch` is ALLOW_ANON).
+    leak = await e2e.request("POST", "/assetdelivery.roblox.com/v1/assets/batch", json=[{"note": e2e.credential[-40:]}])
     assert leak.status_code == 503
+    assert not any(r.path.startswith("/v1/assets/batch") for r in mock.requests)
 
     proxy.wait_settled()
     recorded = proxy.all_recorded()
     assert len(proxy.exchanges) >= 1
     assert b"games.roblox.com" in recorded  # the caller traffic really went through the rotator
     assert fixture.leak_findings(recorded, e2e.credential) == []
-    # The credential went straight to the mock (the credential client, never the rotator), exactly once.
+    # The credential went straight to the mock (the credential client, never the rotator): the probe once, and
+    # the ALLOW_TOKEN caller requests (the second `games(1)` is a cache hit). Never an anonymous request.
     cookie_requests = [r for r in mock.requests if (r.header("Cookie") or "").startswith(".ROBLOSECURITY=")]
-    assert len(cookie_requests) == 1
-    assert cookie_requests[0].path.startswith("/v1/users/authenticated")
+    assert all(r.header("X-Exit-Ip") is None for r in cookie_requests)
+    paths = sorted(r.path.split("?")[0] for r in cookie_requests)
+    assert paths == sorted(
+        ["/v1/users/authenticated", "/v1/games", "/v1/games", "/v1/users/404404", "/v1/groups/9", "/v1/batch"]
+    )
+    assert not any(r.header("Cookie") for r in mock.requests if r.header("X-Exit-Ip"))
+    assert any(r.header("X-Exit-Ip") and r.path.startswith("/v1/display-names/validate") for r in mock.requests)

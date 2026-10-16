@@ -362,19 +362,21 @@ class _NullRecorder:
 class _UpReq:
     deadline_at: float
     request_id: str = "review"
-    host: str = "economy.roblox.com"
-    path: str = "/v1/user/currency"
+    host: str = "games.roblox.com"
+    path: str = "/v1/games/multiget-place-details"
     method: str = "GET"
     query: Sequence[tuple[str, str]] = field(default_factory=list)
     body: bytes = b""
     content_type: str | None = None
     headers: Mapping[str, str] = field(default_factory=dict)
-    template: str = "economy.roblox.com/v1/user/currency"
+    template: str = "games.roblox.com/v1/games/multiget-place-details"
 
 
 async def test_review_locked_hot_db_credential_never_used(paths: dict[str, str], procs: list[Any]) -> None:
-    """C7: an allowlisted credential endpoint while hot.db is write-locked gets `degraded`, and nothing is sent
-    with the credential (or anonymously instead). The control after the lock proves the credential would be used."""
+    """C7: ALLOW_TOKEN endpoints while hot.db is write-locked get `degraded`, and nothing is sent with the
+    credential (or anonymously instead): a sign-in-only one (`games GET /v1/games/multiget-place-details`, made
+    `cache_private` by an override) and one Roblox also answers signed out (`games GET /v1/games`, which may
+    fall back to anonymous, but never unpaced). The control after the lock proves the credential would be used."""
     from roxy.config.audit import Actor
     from roxy.config.runtime import load_runtime_settings
     from roxy.rules.service import RulesService
@@ -388,8 +390,8 @@ async def test_review_locked_hot_db_credential_never_used(paths: dict[str, str],
     dbs = open_databases(env)
     clock = SystemClock()
     await RulesService(dbs.control).create(
-        "credential_allowlist",
-        {"pattern": "economy.roblox.com/v1/user/currency", "cache_private": True},
+        "endpoint_policy_override",
+        {"endpoint_id": "games:GET:/v1/games/multiget-place-details", "verdict": "ALLOW_TOKEN", "cache_private": True},
         Actor("cli", "review"),
         "review test",
     )
@@ -411,9 +413,15 @@ async def test_review_locked_hot_db_credential_never_used(paths: dict[str, str],
             locked = await service.fetch(
                 _UpReq(deadline_at=time.monotonic() + 60), priority=Priority.INTERACTIVE, stale_available=False
             )
+            fallback = await service.fetch(
+                _UpReq(deadline_at=time.monotonic() + 60, path="/v1/games", template="games.roblox.com/v1/games"),
+                priority=Priority.INTERACTIVE,
+                stale_available=False,
+            )
         finally:
             lock.stop()
         assert locked.reason is ReasonCode.DEGRADED
+        assert fallback.reason is ReasonCode.DEGRADED
         assert egress.sent == []
         control = await service.fetch(
             _UpReq(deadline_at=time.monotonic() + 60), priority=Priority.INTERACTIVE, stale_available=False

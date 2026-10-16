@@ -147,6 +147,8 @@ TABLE_WORDS: Final[dict[str, str]] = {
     "rules_routing": "routing rule",
     "upstream_limits": "upstream limit",
     "credential_allowlist": "credential allowlist row",
+    "endpoint_policy_override": "endpoint policy verdict",
+    "endpoint_policy_category": "endpoint policy category switch",
     "access_list": "access list entry",
     "bans": "ban",
     "cache_ignored_params": "ignored parameter",

@@ -67,7 +67,7 @@ def internal_endpoints(credential_probe_url: str, ip_echo_url: str = "") -> list
         {
             "Purpose": "credential_confirm",
             "URL": credential_probe_url,
-            "What": "Confirm a 401 on an allowlisted endpoint before the credential is marked rejected",
+            "What": "Confirm a 401 on an endpoint sent with the account before the credential is marked rejected",
         },
         {
             "Purpose": "rotator_probe",

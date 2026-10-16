@@ -1,0 +1,18 @@
+{#-
+  Endpoint policy page, card `attempts` (`roxy/admin/pages/policy.py attempts_card`), from
+  `GET /admin/api/v1/policy/attempts` over the page's time range (the same function): callers who sent their own
+  Roblox cookie, API key or sign-in token, newest first. Every one was refused. A row whose value had the warning
+  prefix and a real cookie's length says so in red: that person just leaked a live cookie. The fingerprint is a keyed
+  hash, so the same secret sent twice has the same fingerprint and repeats line up; the value itself is never
+  stored. Name, endpoint and User-Agent are caller text. Context: `frame`, `table`, `real`, `range`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/table.html" import data_table %}
+{% from "components/alert.html" import inline_alert %}
+{% call page_card(frame, flush=True, subtitle=range.description) %}
+<div class="g3-pad stack">
+  <p class="muted g3-note">Roxy never stores what the caller sent, only a fingerprint (a keyed hash): rows with the same fingerprint are the same secret sent again. Every one of these requests was refused.</p>
+  {% if real %}{{ inline_alert("bad", "A caller sent a real Roblox cookie", "Rows marked \"Yes: this caller leaked a live cookie\" carried a .ROBLOSECURITY value with the warning prefix and a real cookie's length. Whoever owns it should sign out of every session on roblox.com to make it useless; its address and User-Agent help find who sent it.") }}{% endif %}
+</div>
+<div class="g3-table-host" hx-select="#{{ table.id }}">{{ data_table(**table) }}</div>
+{% endcall %}

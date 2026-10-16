@@ -87,8 +87,9 @@ control.db rows keyed by table name, with column names exactly as in `storage/mi
 loader checks every key against `PRAGMA table_info`.
 
 Allowed tables: `rules_endpoint_block`, `rules_endpoint_limit`, `rules_cache`, `rules_user_agent`, `rules_header`,
-`rules_routing`, `upstream_limits`, `credential_allowlist`, `throttle_tiers`, `cache_ignored_params`,
-`ignored_value_headers`, `ignored_paths`, `access_list` (bypass, admin allowlist and deny entries: `kind`,
+`rules_routing`, `upstream_limits`, `credential_allowlist` (still loadable, but it grants nothing since owner
+decision D1 was revised; see "Credential grants come from the endpoint policy" below), `throttle_tiers`,
+`cache_ignored_params`, `ignored_value_headers`, `ignored_paths`, `access_list` (bypass, admin allowlist and deny entries: `kind`,
 `cidr`, `expires_at` null for never) and `bans` (with `hits` and `last_hit_at`). Not allowed here, because they
 have their own section or hold secrets: `settings` (use `settings`), `settings_history` and `audit_log` (use
 `state.settings_history`), `service_state`, `credential_meta` (use `state`), `credential_store`, `rotator_store`,
@@ -389,9 +390,9 @@ are ignored, as for every change matcher):
 | `bucket_override` | As in the example above: `bucket_key`, `current: {per_min, burst}`, `proposed: {per_min, burst}`. When no `upstream_limits` row exists, `current` holds the default the bucket runs at. |
 | `rule_upsert`, `rule_delete` | `table` (`rules_cache`, `rules_endpoint_block`, ...), `match: {pattern, type}`, `current` (null for a new row, else the row's columns), `proposed` (columns). |
 | `routing_rule` | Like `rule_upsert` on `rules_routing`: `match: {pattern, type}`, `current`, `proposed: {mode}` with a `rules_routing.mode` value. |
-| `credential_allowlist_remove` | `match: {pattern, type}` of the allowlist row to remove. |
+| `credential_allowlist_remove` | Retired with the credential allowlist (owner decision D1 revised); no rule proposes it any more. Fixtures may still list it in `change_kinds_forbidden`. |
 | `tarpit_category` | `category` (a name from `roxy.config.constants.TARPIT_CATEGORIES`, for example `upstream_cooldown_retry`), `current` and `proposed` (0 or 1, the category's switch). |
-| `manual` | `kind` only. |
+| `manual` | `kind`, and `text` (the step shown to the admin; match it with `contains`). |
 
 **Data the UP-* fixtures put in `events.upstream_attempts`.** One row per HTTP call that a caller request made
 beyond what its OutcomeEvent shows: retries after a 429 (`kind: fallback_429`), 5xx or timeout retries
@@ -436,9 +437,21 @@ integer" fill rule never applies to it.
 
 **`state.x_credential_comparisons`** (CRED-UNUSED; an `x_` key, so it goes to a provider): answers to the same
 request on the anonymous path and on the credential path, the "Comparison" evidence of 11.5 (the 18.4 shadow
-comparison kept running for allowlisted templates). Single rows or row generators of
+comparison kept running for templates sent with the account). Single rows or row generators of
 `{endpoint_template, method, anon_status, cred_status, identical}`; `identical` means both answered 2xx with the
 same body hash. No module records these yet; the CRED-UNUSED author decides how production produces them.
+
+**Credential grants come from the endpoint policy.** Since owner decision D1 was revised (2026-10-16), whether a
+request carries Roxy's account is decided by the endpoint policy (`roxy/policy/`, shipped verdicts in
+`roxy/policy/endpoint_policy_seed.json`), not by `credential_allowlist` rows, and a fixture cannot change it (the
+override tables are not in the allowed list). A fixture that needs an operation sent with the account picks a
+template whose seed verdict is ALLOW_TOKEN: `games.roblox.com/v1/games/{universeId}/favorites/count` needs no
+sign-in, so its grant is `identical_anonymous`;
+`inventory.roblox.com/v2/collectible-items/{collectibleItemId}/owners` needs one. For an operation never sent with the account it picks a verdict of ALLOW_ANON
+(`inventory.roblox.com/v1/users/{userId}/places/inventory`) or BLOCK (all of `economy.roblox.com`). The rules
+propose a policy change as a `manual` change whose text names the seed id, for example "On Endpoint policy, set
+games:GET:/v1/games/{universeId}/favorites/count to 'Sent without an account'." The CRED-UNUSED, UP-429-CREDENTIAL
+and UP-4XX-SPIKE fixtures that relied on allowlist rows were rewritten this way when the owner revised D1.
 
 **Event types used in `events.security`.** `spam_detected` and `spam_would_ban` with detail `{detector, subject,
 value, threshold, window_s, action, configured_action, game_server, evidence}` (`abuse/spam.py`); `credential_rotated`

@@ -80,8 +80,12 @@ ROXY_HEADERS = [
 # Plan 16.2 chapter 7, row by row (code, meaning).
 STATUS_ROWS = [
     ("200 to 299", "Success (from Roblox or cache)"),
-    ("400", "Bad request, or you sent authentication (not allowed)"),
-    ("403", "Endpoint blocked by Roxy (`Roxy-Blocked`) or Roblox refused"),
+    ("400", "Bad request, or you sent your own login cookie or API key"),
+    (
+        "403",
+        "Endpoint blocked by Roxy (`Roxy-Blocked: policy` for an account endpoint, `True` for one the admin "
+        "blocked), or Roblox refused",
+    ),
     ("404", "Not found at Roblox, or not a supported Roblox URL"),
     ("413, 431", "Request too large"),
     ("429", "Rate limited by Roxy (your client) or Roblox is rate-limiting (`Roxy-Upstream-Cooldown`)"),

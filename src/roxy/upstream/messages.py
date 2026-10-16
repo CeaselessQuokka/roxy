@@ -41,7 +41,11 @@ FAILED_MESSAGE: Final = "Upstream request failed; please try again later."
 INTERNAL_ERROR_MESSAGE: Final = "Internal Server Error"
 """v1 index.py:2179: an unexpected exception inside Roxy."""
 
-AUTH_SMUGGLING_MESSAGE: Final = "Requests requiring authentication are not allowed with this proxy."
+AUTH_SMUGGLING_MESSAGE: Final = (
+    "Roxy refused this request because it carried a Roblox login cookie or API key. Never send yours: Roxy uses "
+    "its own account. If that was your real .ROBLOSECURITY cookie, sign out of all sessions on roblox.com to "
+    "invalidate it. Roxy did not store it."
+)
 """v1 index.py:1414: the guard saw a public credential marker on an anonymous request (plan C2 item 5)."""
 
 NOT_ROBLOX_MESSAGE: Final = "Not a Roblox URL"

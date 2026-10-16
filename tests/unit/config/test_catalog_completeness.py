@@ -79,6 +79,9 @@ PLAN_B = [
     "credential_probe_url",
     "credential_probe_reserved_per_min",
     "credential_cooldown_default_s",
+    "endpoint_policy_enforce",
+    "endpoint_policy_block_status",
+    "endpoint_policy_block_message",
 ]
 
 # --- plan 15.3 C. Upstream pacing and resilience -----------------------------------------------------------------

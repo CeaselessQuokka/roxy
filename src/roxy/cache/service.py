@@ -45,11 +45,11 @@ How it works
     Every refetch of a key that had a body before feeds `change_observations` (identical body or not) for TTL
     tuning (F10). An answer fetched with the credential belongs to its own request alone (plan 6.9, C2) when the
     rules moved between the peek and the routing: the upstream used the credential for a key that is not a
-    credential key, or fetched it under an allowlist row that is `cache_private` (`UpstreamResult.private`, or the
+    credential key, or fetched it under a grant that is `cache_private` (`UpstreamResult.private`, or the
     row as it is when the answer arrives). Such an answer is never stored, never handed to a follower in this
     worker or another (they compete again and make their own call), and never served stale or by a refresh.
     Pattern matching runs under `roxy.rules.match.regex_budget` (plan 9.9): the policy lookup in `peek` (cache
-    rules and the credential allowlist), the availability check and every upstream call made for a request, so a
+    rules and the endpoint policy), the availability check and every upstream call made for a request, so a
     stored slow regex costs at most the budget, never one timeout per rule. Budgets nest: inside the router's
     request budget these blocks spend from it instead of starting their own.
 
@@ -275,10 +275,10 @@ class _OwnerValue:
 
 def _private_to(result: Any, key: CacheKey) -> bool:
     """True when `result` was fetched with the credential and belongs to its own request alone (plan 6.9, C2):
-    the key is not a credential key, or the upstream fetched it under a `cache_private` allowlist row (or none),
+    the key is not a credential key, or the upstream fetched it under a `cache_private` grant (or none),
     which it reports as `result.private`.
 
-    The upstream routes with its own read of the rules, so an allowlist row added, changed to `cache_private` (or a
+    The upstream routes with its own read of the rules, so a grant added, changed to `cache_private` (or a
     regex timing out differently) between `peek` and the fetch can send the request with the credential under a
     privacy the key does not show (findings F2 and cred-4). Such an answer is never stored, coalesced, revalidated
     or stale-served to anyone else.
@@ -624,7 +624,7 @@ class CacheService:
         if not callable(check):
             return None
         try:
-            with regex_budget():  # availability matches the credential allowlist (plan 9.9)
+            with regex_budget():  # availability asks the endpoint policy (plan 9.9)
                 info = check(req)
             if inspect.isawaitable(info):
                 info = await info
@@ -829,7 +829,7 @@ class CacheService:
         return _OwnerValue(result, content, decision), Deferred(finish)
 
     def _row_now_private(self, req: Any, result: Any) -> bool:
-        """A credential answer whose allowlist row is `cache_private` (or gone) in the rules as they are now.
+        """A credential answer whose grant is `cache_private` (or gone) in the rules as they are now.
 
         Defense in depth for `_private_to` (finding cred-4): when an admin marks an endpoint private while a flight
         runs (the reason the switch exists), the answer is kept to its own request even if the upstream fetched it
@@ -838,7 +838,7 @@ class CacheService:
         """
         if AuthClass(getattr(result, "auth_class", AuthClass.ANON)) is not AuthClass.CRED:
             return False
-        with regex_budget():  # the allowlist may hold regex rows (plan 9.9); nested in the request's budget
+        with regex_budget():  # kept for the request's budget (plan 9.9); nested in the request's budget
             row = self._snapshot().credential_rule_for(_target_of(req), canonical_method(str(req.method)))
         return row is None or bool(row.cache_private)
 
@@ -1040,7 +1040,7 @@ class CacheService:
         async def fetch(start: FlightStart) -> tuple[_OwnerValue, FlightOutcome | Deferred]:
             # The refresh task copied the context of the request that started it: its own regex budget (plan
             # 9.9), never what is left of that request's, which may already be spent. `_absorb` matches the
-            # credential allowlist again (`_row_now_private`), so it runs inside the same budget.
+            # endpoint policy again (`_row_now_private`), so it runs inside the same budget.
             with regex_budget(fresh=True):
                 result = await self._call_upstream(
                     detached,

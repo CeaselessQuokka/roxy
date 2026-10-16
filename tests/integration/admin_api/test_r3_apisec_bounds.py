@@ -14,7 +14,7 @@ What this is
         most `common.MAX_CONCURRENT_EXPORTS` (2) downloads at once, from the first read to the last byte sent
         (the `format` dependency holds a slot), and answers 429 `rate_limited` beyond, as the LLM export does.
       * apisec-7 (fixed): an integer path id larger than SQLite's 64-bit range (`/routing-rules/{rule_id}`,
-        `/credential-allowlist/{row_id}`, `/cache/rules/{rule_id}`, `/health/runs/{run_id}`) reached the database
+        `/cache/rules/{rule_id}`, `/health/runs/{run_id}`) reached the database
         unbounded; sqlite3 raised `OverflowError`, the answer was the unhandled 500 and every such request fired the
         owner's "Roxy Error" alert. They are `common.RowId` now (`Path(ge=1, le=2**62)`, 422), and an
         `OverflowError` anywhere in an area route is a 422 (`common.service_error`).
@@ -33,7 +33,7 @@ How it works
 What to read next
     `roxy/admin/api/data.py` (`back_up_now`, `snapshot_feasibility`, `take_snapshot`), `roxy/storage/retention.py`
     (`prune_directory`), `roxy/admin/api/common.py` (`export_table`, `collect_pages`), `roxy/admin/api/export_llm.py`
-    (the 2-build bound), `roxy/admin/api/routing_rules.py`, `credential_allowlist.py`, `cache.py`, `health.py`.
+    (the 2-build bound), `roxy/admin/api/routing_rules.py`, `policy.py`, `cache.py`, `health.py`.
 """
 
 from __future__ import annotations
@@ -154,8 +154,6 @@ async def test_a_refused_download_gives_its_slot_back(api: Any, api_app: Any, mo
 HUGE_ID_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", f"routing-rules/{HUGE_ID}"),
     ("DELETE", f"routing-rules/{HUGE_ID}"),
-    ("GET", f"credential-allowlist/{HUGE_ID}"),
-    ("DELETE", f"credential-allowlist/{HUGE_ID}"),
     ("DELETE", f"cache/rules/{HUGE_ID}"),
     ("GET", f"health/runs/{HUGE_ID}"),
     ("GET", f"health/runs/{HUGE_ID}/compare"),
@@ -205,3 +203,29 @@ def build_api_router_for(area: Any) -> Any:
     outer = APIRouter(prefix=common.API_PREFIX)
     outer.include_router(area)
     return outer
+
+
+async def test_policy_ids_and_lists_are_bounded(api: Any) -> None:
+    """The endpoint policy area (which replaced the credential allowlist and its integer row ids) takes string ids:
+    each is bounded (500 characters), a bulk change names at most `MAX_BULK` of them, and a tester target is bounded
+    like a routing rule's. Every refusal is a section 13 422, never a 500 and never a database read."""
+    from roxy.admin.api.policy import MAX_BULK
+
+    long_id = "users:GET:/" + "x" * 600
+    calls = (
+        ("GET", "policy/endpoints/detail", {"id": long_id}, None),
+        ("PUT", "policy/endpoints", None, {"endpoint_id": long_id, "verdict": "BLOCK", "reason": "x"}),
+        ("DELETE", "policy/endpoints", None, {"endpoint_id": long_id, "reason": "x"}),
+        (
+            "PUT",
+            "policy/endpoints",
+            None,
+            {"endpoint_ids": ["users:GET:/v1/users/{userId}"] * (MAX_BULK + 1), "verdict": "BLOCK", "reason": "x"},
+        ),
+        ("GET", "policy/test", {"target": "users.roblox.com/" + "y" * 3000}, None),
+        ("GET", "policy/endpoints", {"risk": HUGE_ID}, None),
+    )
+    for method, path, params, body in calls:
+        response = await api.request(method, path, params=params, json=body)
+        assert response.status_code == 422, (method, path, response.status_code, response.text[:200])
+        assert response.json()["error"]["code"] == "validation_failed", (method, path, response.text[:200])

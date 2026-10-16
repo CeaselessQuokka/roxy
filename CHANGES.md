@@ -3752,6 +3752,50 @@ Changes made while v2 is live (it went live on 2026-10-15), newest last.
   (29 minutes): 12,312 passed, 2 skipped, 2 failed, both `tests/unit/test_gen_v1_parity.py`, which fail on main
   without this change (main's v1 `tests/smoke_test.py` carries the 2026-10-09 hotfix checks: 744 call sites, the
   test pins 735, and 9 parity rows have no text yet).
+- **The endpoint policy: Roxy's own account on every request but blocked ones** (owner decision D1 revised on
+  2026-10-16, `DECISIONS_REVIEW.md` the D1 note; design and research in `docs/endpoint_policy/`). The owner's words:
+  send "our token with every request", except APIs that "require your auth to act on your account or require an
+  auth to act on any account", which are "blocked entirely, nothing routed", and block and log any caller who
+  attaches their own cookie or other sign-in; an admin page to add or remove categories or single endpoints with
+  sensible defaults and links to Roblox's docs; and no more "authenticated requests are not allowed" notes on the
+  home page. What was built:
+  - A reviewed policy for all 992 operations of Roblox's API reference on 35 hosts (from the `openapi.json` the
+    Creator Hub reference is rendered from), each with a verdict (BLOCK 779, sent with the account 161, sent
+    without it 52), a category, a risk from 1 to 4, a reason and two documentation links:
+    `src/roxy/policy/endpoint_policy_seed.json`, reviewed copy and catalog in `docs/endpoint_policy/`, and
+    `scripts/endpoint_policy_inventory.py` to find drift when Roblox changes its API. Six hosts Roxy allows that
+    Roblox does not document get a host default (`gamejoin`, `billing`, `engagementpayouts`, `voice` blocked).
+  - `roxy.policy` (seed, template matcher, engine) and the `endpoint_policy` check at position 145: a blocked
+    operation answers 403 (`endpoint_policy_block_status`, `endpoint_policy_block_message`, `Roxy-Blocked: policy`,
+    reason `endpoint_policy`, no tarpit) before anything reaches Roblox; `endpoint_policy_enforce` off is a shadow
+    mode that only counts what would be refused. Unknown operations: every method but GET and HEAD is blocked,
+    GETs whose path holds an account word are blocked, other unknown GETs go out without the account and are listed
+    for review. Query guards block friend server lists and private group roles.
+  - The credential decision: `RulesSnapshot.credential_rule_for` now answers from the policy (ALLOW_TOKEN only,
+    GET, HEAD or POST only; no override can put the account on PUT, PATCH or DELETE). POST batch reads such as
+    `users POST /v1/usernames/users` may carry it. An operation Roblox also answers without a sign-in falls back
+    to the anonymous path when the account is busy or cooling down, so the 20 per minute credential bucket never
+    turns into caller 429s for them; sign-in-only operations wait or get 429/503 as before.
+  - Callers' own sign-in: `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `X-Api-Token`, `Api-Key` and a
+    `.RBXID` cookie are now refused too (400), with a new refusal text that tells a caller who leaked a real cookie
+    to sign out of all sessions. Each attempt is an `auth_attempt` event (what, where, whether it looks like a real
+    cookie, a keyed fingerprint; never the value).
+  - Control.db migration `0002_endpoint_policy` (expand): `endpoint_policy_override` and `endpoint_policy_category`
+    hold only the admin's changes, so a release never undoes them. `credential_allowlist` is no longer read (a later
+    contract migration drops it); its rows are listed on the new page with what the policy does for each.
+  - The Endpoint policy page (`/admin/policy`) and API (`/admin/api/v1/policy`): summary, category switches,
+    every endpoint with filters and Roblox doc links, a tester, unknown endpoints seen, caller sign-in attempts and
+    shadow mode hits. Loosening needs a fresh second factor and a reason (a risk 4 endpoint also its path typed);
+    tightening does not. The Credential page's Allowlist card and its API are removed.
+  - Insights: CRED-UNUSED, UP-429-CREDENTIAL and UP-4XX-SPIKE now advise a manual change on the Endpoint policy page
+    instead of removing allowlist rows.
+  - Public text: the home page, `site_white_hats_text` (default), and the user guide (new "Blocked endpoints"
+    section) say Roxy signs requests with its own account and blocks account endpoints. Docs: `docs/SECURITY.md`
+    (The endpoint policy), `docs/RUNBOOKS.md`, the admin guide, the glossary, `docs/SETTINGS.md` regenerated,
+    `ROADMAP.md` item 1 marked mostly superseded.
+  Tests: `tests/unit/policy/`, `tests/unit/abuse/test_abuse_endpoint_policy.py`,
+  `tests/security/test_endpoint_policy_bypass.py`, the page and API tests, and the confinement and routing tests
+  rewritten for grants instead of allowlist rows.
 
 ## Parity checklist (plan section 4)
 

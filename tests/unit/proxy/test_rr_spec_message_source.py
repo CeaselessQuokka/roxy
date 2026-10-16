@@ -34,7 +34,15 @@ from roxy.proxy import respond
 
 GAMES = "/games.roblox.com/v1/games?universeIds=1"
 CASES = [
-    (ReasonCode.AUTH_SMUGGLING, 400, b'"Requests requiring authentication are not allowed with this proxy."\n'),
+    (
+        ReasonCode.AUTH_SMUGGLING,
+        400,
+        (
+            b'"Roxy refused this request because it carried a Roblox login cookie or API key. Never send yours: '
+            b"Roxy uses its own account. If that was your real .ROBLOSECURITY cookie, sign out of all sessions on "
+            b'roblox.com to invalidate it. Roxy did not store it."\n'
+        ),
+    ),
     (ReasonCode.HOST_NOT_ALLOWED, 404, b'"Not a Roblox URL"\n'),
 ]
 

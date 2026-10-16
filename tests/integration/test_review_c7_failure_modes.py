@@ -47,8 +47,17 @@ from roxy.storage.db import Database
 
 ADMIN = Actor("admin", "review")
 GAMES = "games.roblox.com"
-ECONOMY = "economy.roblox.com"
-CURRENCY = "/v1/user/currency"
+DETAILS = "/v1/games/multiget-place-details"
+"""`games GET /v1/games/multiget-place-details`: ALLOW_TOKEN and sign-in only (never sent anonymously instead)."""
+PRIVATE_DETAILS = {
+    "endpoint_id": "games:GET:/v1/games/multiget-place-details",
+    "verdict": "ALLOW_TOKEN",
+    "cache_private": True,
+}
+"""An override that keeps the cache (and its single-flight leases in hot.db) out of the credential tests."""
+ASSETS = "assetdelivery.roblox.com"
+BATCH = "/v1/assets/batch"
+"""`assetdelivery POST /v1/assets/batch`: ALLOW_ANON, and a POST the cache never stores."""
 
 
 def read_only(db: Database, on: bool) -> None:
@@ -173,19 +182,26 @@ async def test_review_readonly_hot_tarpit_never_holds(app: App) -> None:
 
 
 async def test_review_readonly_hot_credential_never_used(app: App) -> None:
-    """C7: an allowlisted credential endpoint while hot.db is read-only answers 503 `degraded` and sends nothing
-    (not with the credential, not anonymously). After hot.db recovers the credential is used again (control)."""
+    """C7: ALLOW_TOKEN endpoints while hot.db is read-only answer 503 `degraded` and send nothing (not with the
+    credential, not anonymously), sign-in-only or not. After hot.db recovers the credential is used again
+    (control)."""
     await app.activate_credential()
-    await app.rule("credential_allowlist", {"pattern": f"{ECONOMY}{CURRENCY}", "cache_private": True})
-    route = app.roblox.route(host=ECONOMY, path=CURRENCY).mock(return_value=httpx.Response(200, json={"robux": 5}))
+    await app.rule("endpoint_policy_override", PRIVATE_DETAILS)
+    route = app.roblox.route(host=GAMES, path=DETAILS).mock(return_value=httpx.Response(200, json={"data": []}))
     read_only(app.ctx.dbs.hot, True)
-    response = await app.get(f"/{ECONOMY}{CURRENCY}")
+    response = await app.get(f"/{GAMES}{DETAILS}?placeIds=1")
     assert response.status_code == 503
     assert response.headers["roxy-refusal"] == "degraded"
     assert response.headers["retry-after"] == "10"
     assert route.call_count == 0
+    # An ALLOW_TOKEN endpoint Roblox also answers signed out falls back to anonymous when the account cannot take
+    # it, but not unpaced: without hot.db there is no bucket for either path, so it is refused the same way.
+    listing = app.roblox.route(host=GAMES, path="/v1/games").mock(return_value=httpx.Response(200, json={"data": []}))
+    fallback = await app.get(f"/{GAMES}/v1/games?universeIds=5")
+    assert (fallback.status_code, fallback.headers["roxy-refusal"]) == (503, "degraded")
+    assert listing.call_count == 0
     read_only(app.ctx.dbs.hot, False)
-    recovered = await app.get(f"/{ECONOMY}{CURRENCY}")
+    recovered = await app.get(f"/{GAMES}{DETAILS}?placeIds=1")
     assert recovered.status_code == 200
     assert route.call_count == 1
     assert route.calls[0].request.headers.get("cookie") == f".ROBLOSECURITY={app.credential}"
@@ -211,22 +227,22 @@ async def test_review_429_during_hot_outage_still_cools_down(app: App, path: str
 
     if path == "credential":
         await app.activate_credential()
-        await app.rule("credential_allowlist", {"pattern": f"{ECONOMY}{CURRENCY}", "cache_private": True})
-        app.roblox.route(host=ECONOMY, path=CURRENCY).mock(side_effect=answer)
-        first = await app.get(f"/{ECONOMY}{CURRENCY}")
+        await app.rule("endpoint_policy_override", PRIVATE_DETAILS)
+        app.roblox.route(host=GAMES, path=DETAILS).mock(side_effect=answer)
+        first = await app.get(f"/{GAMES}{DETAILS}?placeIds=1")
     else:
         # A POST is not cacheable here (cache_post_requests = allowlist), so no single-flight lease is involved.
-        app.roblox.route(host=GAMES, path="/v1/games/multiget").mock(side_effect=answer)
-        first = await app.post(f"/{GAMES}/v1/games/multiget", json.dumps({"ids": [1]}).encode())
+        app.roblox.route(host=ASSETS, path=BATCH).mock(side_effect=answer)
+        first = await app.post(f"/{ASSETS}{BATCH}", json.dumps([{"assetId": 1}]).encode())
     # The caller learns about the 429 (never `degraded`: Roblox did answer), with Roblox's own wait.
     assert (first.status_code, first.headers.get("retry-after")) == (429, "60")
     assert first.headers.get("roxy-refusal") == "upstream_cooldown"
     read_only(hot, False)
     app.clock.advance(5)  # 5 s later: still well inside Roblox's Retry-After of 60 s
     if path == "credential":
-        second = await app.get(f"/{ECONOMY}{CURRENCY}")
+        second = await app.get(f"/{GAMES}{DETAILS}?placeIds=1")
     else:
-        second = await app.post(f"/{GAMES}/v1/games/multiget", json.dumps({"ids": [1]}).encode())
+        second = await app.post(f"/{ASSETS}{BATCH}", json.dumps([{"assetId": 1}]).encode())
     print(f"\n{path}: first {first.status_code}, second {second.status_code}, calls {calls}")
     assert len(calls) == 1, f"Roblox was called again inside its Retry-After: {calls}"
     expected = (503, "credential_unavailable") if path == "credential" else (429, "upstream_cooldown")
@@ -234,7 +250,7 @@ async def test_review_429_during_hot_outage_still_cools_down(app: App, path: str
     assert second.headers.get("retry-after") == "55"  # the cooldown's real remaining time
     # hot.db took the cooldown when it came back, so every other worker honors it too.
     egress = "credential" if path == "credential" else "direct"
-    template = f"{ECONOMY}{CURRENCY}" if path == "credential" else f"{GAMES}/v1/games/multiget"
+    template = f"{GAMES}{DETAILS}" if path == "credential" else f"{ASSETS}{BATCH}"
 
     def keys(conn: Any) -> set[str]:
         return {row[0] for row in conn.execute("SELECT key FROM cooldown WHERE until_ms > ?", (app.clock.now_ms(),))}

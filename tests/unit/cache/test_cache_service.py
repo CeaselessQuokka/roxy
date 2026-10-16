@@ -429,12 +429,12 @@ async def test_private_credential_endpoint_is_never_stored_or_coalesced(dbs: Any
     service = make_service(dbs, clock, upstream)
     service._rules = StaticRules(
         rules_snapshot(
-            credential_allowlist=[
-                {"pattern": "users.roblox.com/v1/users/authenticated", "methods": ["GET"], "cache_private": 1}
+            policy_overrides=[
+                {"endpoint_id": "users:GET:/v1/users/{userId}", "verdict": "ALLOW_TOKEN", "cache_private": 1}
             ]
         )
     )
-    results = [await call(service, "users.roblox.com/v1/users/authenticated") for _ in range(2)]
+    results = [await call(service, "users.roblox.com/v1/users/1") for _ in range(2)]
     assert all(r.cache_state is CacheState.OFF for r in results)
     assert upstream.count == 2
     count = dbs.cache.read_sync(lambda conn: conn.execute("SELECT count(*) FROM entries").fetchone()[0])

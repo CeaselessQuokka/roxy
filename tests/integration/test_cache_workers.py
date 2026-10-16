@@ -156,13 +156,12 @@ async def test_purge_all_makes_old_rows_misses_before_they_are_deleted(
 
 async def test_cred_response_never_served_to_other_auth_class(dbs: Any, second_dbs: Any, clock: FakeClock) -> None:
     """Plan 6.9: a credential answer and an anonymous answer of one URL never share an entry, a flight, an SWR
-    refresh or a stale serve. Worker `cred` has the endpoint on its credential allowlist (cache_private 0);
-    worker `anon` does not (as after the admin removed the allowlist row)."""
-    cred_rules = rules_snapshot(
-        credential_allowlist=[
-            {"pattern": "economy.roblox.com/v1/user/currency", "methods": ["GET"], "cache_private": 0}
-        ]
-    )
+    refresh or a stale serve. Worker `cred` sees an ALLOW_TOKEN endpoint policy override for the endpoint
+    (shared, `cache_private` 0); worker `anon` sees ALLOW_ANON (as in the second after an admin changed the
+    verdict, before every worker reloaded)."""
+    endpoint = "economy:GET:/v1/user/currency"
+    cred_rules = rules_snapshot(policy_overrides=[{"endpoint_id": endpoint, "verdict": "ALLOW_TOKEN"}])
+    anon_rules = rules_snapshot(policy_overrides=[{"endpoint_id": endpoint, "verdict": "ALLOW_ANON"}])
     gate = asyncio.Event()
     gate.set()
     up_cred = FakeUpstream(
@@ -170,7 +169,7 @@ async def test_cred_response_never_served_to_other_auth_class(dbs: Any, second_d
     )
     up_anon = FakeUpstream(lambda req, n: ok(f'{{"robux":"anon-{n}"}}'), gate=gate)
     cred = worker(dbs, clock, "cred", up_cred, cred_rules)
-    anon = worker(second_dbs, clock, "anon", up_anon)
+    anon = worker(second_dbs, clock, "anon", up_anon, anon_rules)
 
     # Hits: each class gets only its own entry.
     first_cred = await call(cred, CURRENCY)

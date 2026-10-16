@@ -2605,7 +2605,8 @@ RULE_EXPORT_TABLES: Final[tuple[str, ...]] = (
     "rules_header",
     "rules_routing",
     "upstream_limits",
-    "credential_allowlist",
+    "endpoint_policy_override",
+    "endpoint_policy_category",
     "throttle_tiers",
     "cache_ignored_params",
     "ignored_value_headers",
@@ -2613,8 +2614,9 @@ RULE_EXPORT_TABLES: Final[tuple[str, ...]] = (
     "access_list",
     "bans",
 )
-"""Plan 12.3 `rules`: cache, endpoint, block, UA, header and routing rules, bucket overrides, the credential
-allowlist, tiers, ignored parameters, headers and paths, bypass and deny entries, active bans."""
+"""Plan 12.3 `rules`: cache, endpoint, block, UA, header and routing rules, bucket overrides, the endpoint policy's
+overrides and category switches, tiers, ignored parameters, headers and paths, bypass and deny entries, active
+bans."""
 
 _EGRESSES: Final = frozenset(str(member.value) for member in reasons.Egress)
 _PIPELINE_KEYS: Final[tuple[str, ...]] = (

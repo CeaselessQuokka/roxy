@@ -4,8 +4,10 @@ What this is
     Probes for plan 9.15, 19.5 items 11 and 12 and 19.7 ("inject secrets into requests and assert logs, captures,
     exports are clean"), run through the whole app with `ROXY_LOG_LEVEL=debug`, every served request captured and
     sampled. `test_credential_activity_leaves_no_trace` exercises everything Roxy itself does with the credential
-    (probe, an allowlisted credential request, Roblox rotating the cookie, an admin replace, the guard
-    self-test) plus ordinary caller traffic on all three egresses, then scans every byte the service wrote.
+    (probe, caller requests the endpoint policy grants it to (ALLOW_TOKEN GET, HEAD and a POST batch read),
+    Roblox rotating the cookie, an admin replace, the guard self-test) plus ordinary caller traffic on all three
+    egresses and refused requests (a BLOCK endpoint, a host that is not Roblox), then scans every byte the service
+    wrote.
     `test_injected_credential_piece_is_scrubbed_everywhere` (finding F4) has a caller send a piece of the
     credential in places that are not request content (a path segment that is not id-shaped, a host label, the
     User-Agent, the `Roblox-Id` header) and scans every record written about those requests.
@@ -47,8 +49,9 @@ from roxy.core.reasons import Egress
 from roxy.core.redact import TOKEN_PREFIX
 from roxy.metrics.capture import decode_record
 
-ECONOMY = "economy.roblox.com"
-CURRENCY = "/v1/user/currency"
+GAMES = "games.roblox.com"
+LIST = "/v1/games"
+"""`games GET /v1/games`: ALLOW_TOKEN in the shipped endpoint policy (D1 revised), so it goes out with the cookie."""
 
 
 def database_bytes(state_dir: Path) -> dict[str, bytes]:
@@ -105,28 +108,36 @@ async def test_credential_activity_leaves_no_trace(
         fixture = run.fixture()
         await capture_everything(run)
         await run.activate_credential()
-        run.mock.routes[CURRENCY] = fixture.MockResponse(
+        run.mock.routes[LIST] = fixture.MockResponse(
             body=b'{"robux": 5}',
             headers=[
                 ("Content-Type", "application/json"),
                 ("Set-Cookie", f".ROBLOSECURITY={rotated}; domain=.roblox.com; path=/; secure; HttpOnly"),
             ],
         )
-        await run.rule("credential_allowlist", {"pattern": f"{ECONOMY}{CURRENCY}", "cache_private": True})
+        # `cache_private`: every caller request makes its own credential call, and each answer rotates the cookie.
+        await run.rule(
+            "endpoint_policy_override",
+            {"endpoint_id": "games:GET:/v1/games", "verdict": "ALLOW_TOKEN", "cache_private": 1},
+        )
         await run.rule("rules_routing", {"pattern": "games.roblox.com/v1/rotated", "mode": "rotator_only"})
         caller_paths = [
-            f"/{ECONOMY}{CURRENCY}",  # the credential path (allowlisted), and Roblox rotates the cookie
-            "/games.roblox.com/v1/games?universeIds=1",  # direct
-            "/games.roblox.com/v1/rotated?universeIds=2",  # rotator
+            f"/{GAMES}{LIST}",  # the credential path (ALLOW_TOKEN), and Roblox rotates the cookie
+            "/users.roblox.com/v1/usernames/users",  # the credential path for POST (an ALLOW_TOKEN batch read)
+            "/users.roblox.com/v1/display-names/validate?displayName=a",  # direct (ALLOW_ANON)
+            "/games.roblox.com/v1/rotated?universeIds=2",  # rotator (an unknown read)
             "/users.roblox.com/v1/users/404404",
-            "/evil.example.com/x",  # refused
+            "/economy.roblox.com/v1/user/currency",  # refused: BLOCK
+            "/evil.example.com/x",  # refused: not Roblox
         ]
         for path in caller_paths:
             for method in ("GET", "HEAD", "POST"):
                 run.clock.advance(5)
                 kwargs: dict[str, Any] = {"content": b'{"ids":[1]}'} if method == "POST" else {}
                 await run.request(method, path, **kwargs)
-        assert any(r.header("Cookie") for r in run.mock.requests if r.path.startswith(CURRENCY))
+        assert any(r.header("Cookie") for r in run.mock.requests if r.path.startswith(LIST))
+        assert any(r.header("Cookie") and r.method == "POST" for r in run.mock.requests)
+        assert any(r.header("X-Exit-Ip") for r in run.mock.requests)  # the rotator really carried traffic
         assert (await run.ctx.egress.self_test_leak_guard()).status in ("pass", "warn")
         # A bug that puts the cookie (or its bare secret part) in an exception message: the 500 path writes the
         # errors table, a log line with the traceback, an event and an alert; all of them must be scrubbed.
@@ -144,7 +155,7 @@ async def test_credential_activity_leaves_no_trace(
         await run.ctx.egress.credential.replace(replacement, ADMIN, reason="confinement probe")
         await run.activate_credential()
         run.clock.advance(5)
-        await run.get(f"/{ECONOMY}{CURRENCY}?after=replace")
+        await run.get(f"/{GAMES}{LIST}?after=replace")
         await run.ctx.recorder.flush()
         blobs: dict[str, bytes | str] = {}
         blobs["live ring"] = json.dumps(run.ctx.recorder.live.snapshot(limit=5000), default=str)
@@ -170,7 +181,7 @@ def injections(piece: str) -> list[tuple[str, str, dict[str, str], dict[str, Any
     `Roblox-Id` header, which becomes the place id."""
     return [
         ("GET", f"/games.roblox.com/v1/games?universeIds=1&k={piece}", {}, {}),
-        ("POST", "/games.roblox.com/v1/games/list", {"X-Note": piece}, {"content": json.dumps({"k": piece})}),
+        ("POST", "/assetdelivery.roblox.com/v1/assets/batch", {"X-Note": piece}, {"content": json.dumps({"k": piece})}),
         ("GET", f"/games.roblox.com/v1/x.{piece}", {}, {}),
         ("GET", f"/{piece.lower()}.roblox.com/v1/games", {}, {}),
         ("GET", "/games.roblox.com/v1/games?universeIds=4", {"User-Agent": f"Roblox/{piece}"}, {}),

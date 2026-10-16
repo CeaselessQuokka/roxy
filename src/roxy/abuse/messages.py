@@ -47,7 +47,11 @@ UA_COOLDOWN_DEFAULT: Final = "This client is limited to one request every {coold
 NOT_FOUND: Final = "Not Found"
 INVALID_URL: Final = "Invalid URL"
 NOT_A_ROBLOX_URL: Final = "Not a Roblox URL"
-AUTH_SMUGGLING: Final = "Requests requiring authentication are not allowed with this proxy."
+AUTH_SMUGGLING: Final = (
+    "Roxy refused this request because it carried a Roblox login cookie or API key. Never send yours: Roxy uses "
+    "its own account. If that was your real .ROBLOSECURITY cookie, sign out of all sessions on roblox.com to "
+    "invalidate it. Roxy did not store it."
+)
 ENDPOINT_BLOCKED: Final = "This endpoint is currently blocked."
 ENDPOINT_RULE_DEFAULT: Final = "This endpoint is rate-limited for you; try again in {retry} seconds."
 
@@ -75,6 +79,7 @@ REASON_HEADER_RULE: Final = "Filter {rule_id} (matched {header})"
 REASON_AUTH_TOKEN_HEADER: Final = "X-Roblox-Token header"  # noqa: S105 (a v1 reason string, not a secret)
 REASON_AUTH_HEADER_VALUE: Final = '"{name}" header carried a ROBLOSECURITY-shaped value'
 REASON_AUTH_COOKIE_NAME: Final = "cookie named .ROBLOSECURITY"
+REASON_AUTH_API_KEY: Final = '"{name}" header carried an API key or sign-in token'
 REASON_AUTH_QUERY: Final = "query string carried a ROBLOSECURITY-shaped value"
 REASON_AUTH_BODY: Final = "request body carried a ROBLOSECURITY-shaped value"
 REASON_FLOOD: Final = "Flood limit {limit} per 60s"

@@ -1,0 +1,83 @@
+{#-
+  Endpoint policy page, one endpoint in the drawer (`GET /admin/policy/endpoint?id=`; `roxy/admin/api/policy.py
+  item_of`): what Roblox says it does and what it accepts, why the shipped default is what it is, the notes of the
+  review, its verdict now and where that came from, your override's note, refusals in 24 hours, Roblox's two
+  documentation pages and its audit history. The form sets a verdict (PUT `/admin/api/v1/policy/endpoints`, a reason;
+  loosening asks for a code from your authenticator app, and loosening a risk 4 endpoint also needs its path typed in
+  `confirm`, shown by static/js/pages/policy.js when the chosen verdict is looser than now). "Back to default"
+  (DELETE) removes the override. Context: `item`, `verdict`, `default`, `risk`, `source_words`, `options`,
+  `current_rank`, `url`, `history_url`, `category_href`, `help`, `error`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/format.html" import num, caller_text %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% if error %}
+<div data-card-error>{{ inline_alert("bad", "This endpoint could not be loaded", error) }}</div>
+{% else %}
+<div class="stack g3-drawer" data-policy-endpoint="{{ item.id }}">
+  <p class="g3-drawer__lead">{{ status_badge(verdict.tone, verdict.text) }} <span class="mono">{{ item.method }} {{ item.host }}{{ item.path }}</span></p>
+  <dl class="kv policy-facts">
+    <dt>Roblox says</dt><dd>{{ item.summary or "No summary" }}{% if item.deprecated %} <span class="muted">(deprecated)</span>{% endif %}</dd>
+    <dt>Roblox sign-in</dt><dd>{{ item.roblox_auth_words }}{% if item.requires_login %} <span class="muted">(no anonymous fallback when sent with the account)</span>{% endif %}</dd>
+    <dt>Verdict now</dt><dd>{{ verdict.text }}, from {{ source_words }}</dd>
+    <dt>Shipped default</dt><dd>{{ default.text }}</dd>
+    <dt>Why</dt><dd>{{ item.rationale or "n/a" }}</dd>
+    {% if item.notes %}<dt>Notes</dt><dd>{{ item.notes }}</dd>{% endif %}
+    <dt>Risk</dt><dd><span class="tone tone--{{ risk.tone }}">{{ risk.text }}</span> <span class="muted">(what a stranger could do with Roxy's account through it)</span></dd>
+    <dt>Category</dt><dd><a class="link" href="{{ category_href }}">{{ item.category_label }}</a></dd>
+    {% if item.source == "override" %}<dt>Your note</dt><dd>{{ caller_text(item.override_note, 500) if item.override_note else "n/a" }}{% if item.cache_private %} <span class="muted">(answers kept private)</span>{% endif %}</dd>{% endif %}
+    <dt>Refused (24 h)</dt><dd>{{ num(item.refused_24h) }}</dd>
+    <dt>Roblox docs</dt>
+    <dd class="policy-docs">{% if item.feature_doc %}<a class="link" href="{{ item.feature_doc }}" target="_blank" rel="noopener noreferrer">Roblox feature docs{{ icon("external") }}<span class="sr-only"> (opens in a new tab)</span></a>{% else %}<span class="muted">No feature page</span>{% endif %}
+      {% if item.domain_doc %}<a class="link" href="{{ item.domain_doc }}" target="_blank" rel="noopener noreferrer">Roblox domain docs{{ icon("external") }}<span class="sr-only"> (opens in a new tab)</span></a>{% endif %}</dd>
+    <dt>History</dt><dd><a class="link" href="{{ history_url }}">{{ icon("history") }}<span>Every change to this endpoint in the audit log</span></a></dd>
+  </dl>
+  <section class="g3-section" aria-labelledby="policy-edit-title">
+    <h3 class="g3-subhead" id="policy-edit-title">Set its verdict</h3>
+    <form class="stack g3-form" data-api-form data-api-url="{{ url }}" data-api-method="PUT" data-policy-verdict data-current-rank="{{ current_rank }}" data-risk="{{ item.risk }}"
+          data-success="Verdict saved. Every worker follows it within a second." data-on-success="refresh" data-refresh="endpoints summary categories" novalidate>
+      <input type="hidden" name="endpoint_id" value="{{ item.id }}" data-json="string">
+      <div class="field">
+        <label class="field__label" for="policy-edit-verdict">Verdict</label>
+        <select class="input" id="policy-edit-verdict" name="verdict" data-json="string">
+          {% for o in options %}<option value="{{ o.value }}" data-rank="{{ o.rank }}"{% if o.value == item.verdict %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
+        </select>
+      </div>
+      <p class="muted g3-note" data-policy-loosen hidden>{{ icon("key") }} This loosens the policy: Roxy asks for a current code from your authenticator app.</p>
+      <label class="check"><input type="checkbox" name="cache_private" value="1" data-json="bool"{% if item.cache_private %} checked{% endif %}><span>Keep the answers private <span class="muted">(only matters when sent with Roxy's account: never cached or shared between callers)</span></span></label>
+      <div class="field">
+        <label class="field__label" for="policy-edit-note">Note <span class="muted">(optional, shown here)</span></label>
+        <input class="input" type="text" id="policy-edit-note" name="note" maxlength="500" value="{{ item.override_note }}" autocomplete="off" data-json="string">
+      </div>
+      {% if item.risk >= 4 %}
+      <div class="field" data-policy-confirm hidden>
+        <label class="field__label" for="policy-edit-confirm">Type the path <span class="mono">{{ item.path }}</span> to loosen this risk 4 endpoint</label>
+        <input class="input mono" type="text" id="policy-edit-confirm" name="confirm" maxlength="600" autocomplete="off" spellcheck="false" data-json="string" aria-describedby="policy-edit-confirm-error">
+        <p class="field__error" id="policy-edit-confirm-error" data-field-error="confirm" hidden></p>
+      </div>
+      {% endif %}
+      <div class="field">
+        <label class="field__label" for="policy-edit-reason">Reason <span class="muted">(required, saved in the audit log)</span></label>
+        <textarea class="input" id="policy-edit-reason" name="reason" rows="2" maxlength="500" required data-json="string" aria-describedby="policy-edit-reason-error"></textarea>
+        <p class="field__error" id="policy-edit-reason-error" data-field-error="reason" hidden></p>
+      </div>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      <div class="cluster">
+        <button type="submit" class="btn btn--primary" data-action="policy-verdict-save">{{ icon("check") }}<span>Save the verdict</span></button>
+        {% if item.source == "override" %}<button type="button" class="btn btn--ghost" data-dialog-open="dlg-policy-default">{{ icon("reset") }}<span>Back to default</span></button>{% endif %}
+      </div>
+      <p class="muted g3-note">{{ help.loosen }}</p>
+    </form>
+  </section>
+  {% if item.source == "override" %}
+  {{ confirm_dialog("dlg-policy-default", "Put this endpoint back to its default?", action=url, method="delete", api=True,
+                    confirm_label="Back to default", hidden={"endpoint_id": item.id}, hidden_types={"endpoint_id": "string"},
+                    consequences=["Your override is removed: the endpoint gets its shipped default (" ~ default.text ~ "), or its category's switch when one is in force, on every worker within a second.",
+                                  "When the default is looser than your override, Roxy asks for a code from your authenticator app first.",
+                                  "The override as it was is kept in the audit log."],
+                    reason=True, success="The endpoint is back to its default.", on_success="refresh", refresh="endpoints summary categories") }}
+  {% endif %}
+</div>
+{% endif %}

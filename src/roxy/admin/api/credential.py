@@ -7,8 +7,8 @@ What this is
         the value came from, and the texts the page shows before a replace or an account switch.
       * `GET /credential/probes`: the last probes (Roxy's own calls with the credential) and the last result.
       * `GET /credential/budget`: the credential bucket and the reserved probe sub-bucket now, and how many
-        credential calls were made in the last hour and day (plan 13.3: about 50 to 60 a day with an empty
-        allowlist).
+        credential calls were made in the last hour and day (plan 13.3: Roxy's own checks use about 50 to
+        60 a day).
       * `POST /credential/check`: probe now ("Check credential"). Fresh second factor (it spends a call on the
         account). One probe at a time fleet-wide; paced by the reserved probe bucket; a 429 means "rate limited",
         never "expired" (parity row 25).
@@ -38,7 +38,7 @@ How it works
 
 What to read next
     `roxy/egress/credential.py` (`CredentialManager`), `roxy/upstream/service.py` (`credential_probe_fetch`),
-    `roxy/admin/api/credential_allowlist.py` (what the credential may be used for).
+    `roxy/admin/api/policy.py` (which caller requests the credential goes with).
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ PROBE_TIMEOUT_S: Final = 40.0
 """Longest an admin request waits for a probe answer; a probe that is still queued for its bucket slot finishes on
 its own and the page reads the result later (`pending`)."""
 
-EXPECTED_DAILY_CALLS: Final = "about 50 to 60 credential calls a day with an empty allowlist (plan 13.3)"
+EXPECTED_DAILY_CALLS: Final = "about 50 to 60 credential calls a day for Roxy's own checks (plan 13.3)"
 
 C1_WARNING: Final = (
     "Roxy uses exactly one Roblox account. Replacing the credential switches every credential call to the new "
@@ -241,7 +241,10 @@ async def status_answer(ctx: Any) -> dict[str, Any]:
         "probe_interval_min": ctx.settings.get("credential_probe_interval_min"),
         "probe_url": ctx.settings.get("credential_probe_url"),
         "texts": texts(),
-        "d1": "Owner decision D1: callers never get the credential; only Roxy's own probes use it by default.",
+        "d1": (
+            "Owner decision D1 (revised 2026-10-16): Roxy sends its own account with caller requests the Endpoint "
+            "policy marks 'sent with Roxy's account', never to a blocked endpoint, and never through the rotator."
+        ),
         "settings_card": "credential#status",
     }
 

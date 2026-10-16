@@ -401,7 +401,7 @@ class BucketDefaults:
     """Every default rate of plan 7.3 / 15.3 B and C, read once per request from the runtime settings.
 
     The account's limits are split between two buckets that together never exceed them: the reserved probe
-    sub-bucket gets `credential_probe_reserved_per_min` and a burst of `CREDENTIAL_PROBE_BURST`, allowlisted traffic
+    sub-bucket gets `credential_probe_reserved_per_min` and a burst of `CREDENTIAL_PROBE_BURST`, caller traffic
     the rest of `credential_bucket_per_min` and of `credential_bucket_burst` (plan 7.3: the probe share is part of
     the account's bucket; finding constraints-6: both bursts used to be the whole setting, so 5 account calls could
     leave back to back where the setting allows 3). With a burst of 1 there is nothing to split: a probe then also
@@ -412,7 +412,7 @@ class BucketDefaults:
     global_: LimitPair
     direct: LimitPair
     rotator: LimitPair
-    credential: LimitPair  # allowlisted credential traffic: the account's rate and burst minus the probe share
+    credential: LimitPair  # caller traffic sent with the credential: the account's rate and burst minus the probe share
     credential_probe: LimitPair  # the reserved probe sub-bucket
     host: LimitPair
     endpoint: LimitPair
@@ -485,7 +485,7 @@ def specs_for(
     """The buckets one call through `egress` to `template` on `host` must take a slot in (plan 7.3 table).
 
     `credential_probe=True` (Roxy's own credential probes) uses the reserved sub-bucket instead of the shared
-    credential bucket, so probes never queue behind allowlisted traffic and traffic never starves probes. The two
+    credential bucket, so probes never queue behind caller traffic and traffic never starves probes. The two
     buckets split the account's burst (`BucketDefaults`); only with a burst of 1, where nothing can be split, does a
     probe also take a slot in the traffic bucket (appended last: the egress bucket stays the second spec).
     """

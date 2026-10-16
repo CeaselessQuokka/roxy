@@ -1,0 +1,60 @@
+{#-
+  Endpoint policy page, an unknown endpoint in the drawer (`GET /admin/policy/unknown-row?id=unknown:<METHOD>:<template>`;
+  `roxy/admin/api/policy.py unknown_item`): the verdict the unknown endpoint rule gives it and why, the verdict it
+  has now, and the form that sets one (PUT `/admin/api/v1/policy/endpoints` with its `unknown:` id and a reason;
+  sending it with Roxy's account, or sending what was blocked, asks for a code first). "Back to the rule" (DELETE)
+  removes your override. The template comes from a caller's path: caller text.
+  Context: `item`, `verdict`, `default`, `options`, `current_rank`, `url`, `history_url`, `help`, `error`.
+-#}
+{% from "components/icon.html" import icon %}
+{% from "components/alert.html" import inline_alert %}
+{% from "components/badges.html" import status_badge %}
+{% from "components/format.html" import caller_text %}
+{% from "components/dialog.html" import confirm_dialog %}
+{% if error %}
+<div data-card-error>{{ inline_alert("bad", "This endpoint could not be loaded", error) }}</div>
+{% else %}
+<div class="stack g3-drawer" data-policy-unknown>
+  <p class="g3-drawer__lead">{{ status_badge(verdict.tone, verdict.text) }} <span class="mono">{{ item.method }} {{ caller_text(item.template, 400) }}</span></p>
+  <dl class="kv policy-facts">
+    <dt>In Roblox's reference</dt><dd>{{ "Yes: open it from the Endpoints table instead" if item.known else "No" }}</dd>
+    <dt>Verdict now</dt><dd>{{ verdict.text }}{% if item.changed %}, your override{% if item.override_note %}: {{ caller_text(item.override_note, 300) }}{% endif %}{% endif %}</dd>
+    <dt>The unknown endpoint rule</dt><dd>{{ default.text }}{% if item.default_reason %}: {{ item.default_reason }}{% endif %}</dd>
+    <dt>History</dt><dd><a class="link" href="{{ history_url }}">{{ icon("history") }}<span>Every change to this endpoint in the audit log</span></a></dd>
+  </dl>
+  <form class="stack g3-form" data-api-form data-api-url="{{ url }}" data-api-method="PUT" data-policy-verdict data-current-rank="{{ current_rank }}" data-risk="{{ item.risk }}"
+        data-success="Verdict saved. Every worker follows it within a second." data-on-success="refresh" data-refresh="unknown summary" novalidate>
+    <input type="hidden" name="endpoint_id" value="{{ item.id }}" data-json="string">
+    <div class="field">
+      <label class="field__label" for="policy-unknown-verdict">Verdict</label>
+      <select class="input" id="policy-unknown-verdict" name="verdict" data-json="string">
+        {% for o in options %}<option value="{{ o.value }}" data-rank="{{ o.rank }}"{% if o.value == item.verdict %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
+      </select>
+    </div>
+    <p class="muted g3-note" data-policy-loosen hidden>{{ icon("key") }} This loosens the policy: Roxy asks for a current code from your authenticator app.</p>
+    <div class="field">
+      <label class="field__label" for="policy-unknown-note">Note <span class="muted">(optional)</span></label>
+      <input class="input" type="text" id="policy-unknown-note" name="note" maxlength="500" value="{{ item.override_note }}" autocomplete="off" data-json="string">
+    </div>
+    <div class="field">
+      <label class="field__label" for="policy-unknown-reason">Reason <span class="muted">(required, saved in the audit log)</span></label>
+      <textarea class="input" id="policy-unknown-reason" name="reason" rows="2" maxlength="500" required data-json="string" aria-describedby="policy-unknown-reason-error"></textarea>
+      <p class="field__error" id="policy-unknown-reason-error" data-field-error="reason" hidden></p>
+    </div>
+    <p class="field__error" data-field-error="endpoint_id" hidden></p>
+    <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+    <div class="cluster">
+      <button type="submit" class="btn btn--primary" data-action="policy-unknown-save">{{ icon("check") }}<span>Save the verdict</span></button>
+      {% if item.changed %}<button type="button" class="btn btn--ghost" data-dialog-open="dlg-policy-unknown-default">{{ icon("reset") }}<span>Back to the rule</span></button>{% endif %}
+    </div>
+    <p class="muted g3-note">{{ help.loosen }}</p>
+  </form>
+  {% if item.changed %}
+  {{ confirm_dialog("dlg-policy-unknown-default", "Give this endpoint the unknown endpoint rule's verdict again?", action=url, method="delete", api=True,
+                    confirm_label="Back to the rule", hidden={"endpoint_id": item.id}, hidden_types={"endpoint_id": "string"},
+                    consequences=["Your override is removed: the endpoint gets " ~ default.text ~ " again, on every worker within a second.",
+                                  "The override as it was is kept in the audit log."],
+                    reason=True, success="The endpoint follows the unknown endpoint rule again.", on_success="refresh", refresh="unknown summary") }}
+  {% endif %}
+</div>
+{% endif %}

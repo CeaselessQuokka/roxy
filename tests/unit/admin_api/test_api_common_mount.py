@@ -59,7 +59,7 @@ def test_api_module_list_is_the_planned_one() -> None:
     assert API_MODULES == (
         "settings", "audit", "prefs", "data", "export", "export_llm", "system", "protection", "clients", "security",
         "overview", "traffic", "endpoints", "live", "cache", "upstream", "upstream_limits", "routing_rules", "egress",
-        "rotator", "credential", "credential_allowlist", "lookup", "health", "recommendations",
+        "rotator", "credential", "policy", "lookup", "health", "recommendations",
     )  # fmt: skip
     assert SSE_MODULE == "roxy.admin.sse"
 

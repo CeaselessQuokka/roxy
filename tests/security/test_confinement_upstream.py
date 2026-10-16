@@ -1,12 +1,15 @@
-"""The upstream service under random states never routes a caller to the credential off the allowlist.
+"""The upstream service under random states never routes a caller to the credential without a grant.
 
 What this is
-    A seeded randomized probe of `UpstreamService.fetch` (plan 19.5 item 6, at the service level rather than the
-    pure `routing.decide` level): random methods, targets, allowlist rows (methods, `cache_private`,
-    `identical_anonymous`), routing rules, weights, `fallback_on_429`, retry counts, credential states (active,
-    unknown, rejected, cooling down), and a random answer for every attempt (2xx, a redirect to an allowlisted or
-    other URL, a CSRF challenge, 429, 5xx, timeouts, connect errors, egress refusals, leak guard and smuggling
-    refusals). After each fetch, every call the service handed to the egress is checked.
+    A seeded randomized probe of `UpstreamService.fetch` (plan 19.5 item 6, at the service level rather than the pure
+    `routing.decide` level): random methods, targets, credential grants (methods GET, HEAD and POST, `cache_private`,
+    `identical_anonymous`), routing rules, weights, `fallback_on_429`, retry counts, credential states (active, unknown,
+    rejected, cooling down), and a random answer for every attempt (2xx, a redirect to a granted or other URL, a CSRF
+    challenge, 429, 5xx, timeouts, connect errors, egress refusals, leak guard and smuggling refusals). After each
+    fetch, every call the service handed to the egress is checked. Since D1 revised a grant is the endpoint policy's
+    ALLOW_TOKEN verdict (`RulesSnapshot.credential_rule_for`); here the grants are the test's own
+    (`upstream_fakes.GrantSnapshot`), because this probe is about what the upstream does GIVEN a grant, and
+    `tests/security/test_confinement_routing.py` proves the same invariants with the real policy.
 
 Why it exists
     `decide` is proven in isolation by the unit property test. The service adds retries, reroutes after an egress
@@ -16,10 +19,12 @@ Why it exists
 How it works
     Uses the upstream unit fakes (`tests/unit/upstream/upstream_fakes.py`, loaded by path): `FakeEgress` records
     `(egress, OutboundRequest)` for every send. Invariants per fetch:
-      1. a credential send is a GET or HEAD whose URL matches an allowlist row for the caller's method;
+      1. a credential send is a GET, HEAD or POST (never PUT, PATCH or DELETE) whose URL has a grant for the
+         caller's method, redirect hops included;
       2. a credential send never uses Roxy's probe purpose (which would skip the "active" requirement);
       3. no send of any egress carries a `Cookie` header added by the upstream layer;
-      4. an allowlisted request (credential-eligible, without `identical_anonymous`) never goes out anonymously.
+      4. a sign-in-only granted request (credential-eligible, without `identical_anonymous`) never goes out
+         anonymously; 5. a request without a grant never uses the credential egress at all.
     Each case has its own fake clock far from the previous one and clears cooldowns and breakers first, so the
     shared buckets never starve later cases.
 
@@ -44,7 +49,7 @@ from roxy.upstream.routing import CREDENTIAL_METHODS
 
 fakes = load_fixture("upstream_fakes", "unit/upstream")
 
-ALLOWLISTED = "economy.roblox.com/v1/user/currency"
+GRANTED = "economy.roblox.com/v1/user/currency"
 TARGETS = (
     ("economy.roblox.com", "/v1/user/currency"),
     ("economy.roblox.com", "/V1/User/Currency"),
@@ -63,7 +68,7 @@ LOCATIONS = (
     "/v1/other",
     "https://evil.example.com/x",
 )
-ROUTING_PATTERNS = ("economy.roblox.com", ALLOWLISTED, "games.roblox.com/v1/games")
+ROUTING_PATTERNS = ("economy.roblox.com", GRANTED, "games.roblox.com/v1/games")
 ROUTING_MODES = ("prefer_direct", "prefer_rotator", "direct_only", "rotator_only")
 CASES = 400
 
@@ -94,7 +99,7 @@ def answer_for(rng: random.Random) -> Any:
     return fakes.answer(404, b"{}")
 
 
-async def test_random_states_never_route_a_caller_to_the_credential_off_the_allowlist(dbs: Any) -> None:
+async def test_random_states_never_route_a_caller_to_the_credential_without_a_grant(dbs: Any) -> None:
     rng = random.Random(20261007)
     tally: Counter[str] = Counter()
     for case in range(CASES):
@@ -109,13 +114,13 @@ async def test_random_states_never_route_a_caller_to_the_credential_off_the_allo
         )
         rules = fakes.FakeRules()
         listed = rng.random() < 0.7
-        identical = listed and rng.random() < 0.3
+        identical = listed and rng.random() < 0.4
         if listed:
             rules.allow_credential(
-                ALLOWLISTED,
+                GRANTED,
                 cache_private=rng.random() < 0.5,
                 identical_anonymous=identical,
-                methods=rng.choice(["GET", "HEAD", "GET,HEAD"]),
+                methods=rng.choice(["GET", "HEAD", "GET,HEAD", "POST", "GET,HEAD,POST"]),
             )
         for _ in range(rng.randint(0, 2)):
             pattern = rng.choice(ROUTING_PATTERNS)
@@ -128,9 +133,9 @@ async def test_random_states_never_route_a_caller_to_the_credential_off_the_allo
         ctx = fakes.make_ctx(dbs, clock, egress, settings=settings, rules=rules, worker_id=f"case-{case}")
         service = fakes.make_service(ctx, seed=case)
         await service.reset_state()
-        # Biased toward GET and HEAD on the allowlisted endpoint's spellings, so the credential path is exercised
+        # Biased toward GET, HEAD and POST on the granted endpoint's spellings, so the credential path is exercised
         # often enough for invariants 1, 2 and 4 to mean something.
-        method = rng.choice((*METHODS, "GET", "GET", "HEAD", "HEAD"))
+        method = rng.choice((*METHODS, "GET", "GET", "HEAD", "HEAD", "POST"))
         host, path = rng.choice((*TARGETS, *TARGETS[:3], *TARGETS[:3]))
         body = b'{"a":1}' if method in ("POST", "PUT", "PATCH", "DELETE") else b""
         req = fakes.request(service, method=method, host=host, path=path, body=body, query=[])
@@ -146,6 +151,8 @@ async def test_random_states_never_route_a_caller_to_the_credential_off_the_allo
             parts = urlsplit(out.url)
             target = f"{(parts.hostname or '').lower()}{parts.path or '/'}"
             assert out.method in CREDENTIAL_METHODS, (case, out.method)
+            assert out.method not in ("PUT", "PATCH", "DELETE"), (case, out.method)
+            tally[f"credential:{out.method}"] += 1
             assert snapshot.credential_rule_for(target, method) is not None, (case, out.url)
             assert out.purpose != PURPOSE_CREDENTIAL_PROBE, (case, out.purpose)
         if eligible and not identical:
@@ -155,6 +162,7 @@ async def test_random_states_never_route_a_caller_to_the_credential_off_the_allo
             assert Egress.CREDENTIAL not in egress.egresses(), (case, method, host, path)
     # The battery reached the interesting places (otherwise the invariants above are vacuous).
     assert tally["sent:credential"] > 20
+    assert tally["credential:POST"] > 3  # a granted POST batch read really went out with the credential
     assert tally["sent:direct"] > 50
     assert tally["sent:rotator"] > 20
     assert tally["upstream_ok"] > 20

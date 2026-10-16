@@ -1,7 +1,7 @@
 """The dashboard pages core (P11): registry, routes and guards, the shell context, conventions and static rules.
 
 What this is
-    Integration tests against the real app (`pages_app`, a signed-in `page`): the registry of the 18 pages and the
+    Integration tests against the real app (`pages_app`, a signed-in `page`): the registry of the 19 pages and the
     v1 section map, the pages router (every page answers, guarded like the API, every page is built,
     `/admin/dashboard` is the Overview), the shell (navigation from the registry, theme and density from the
     admin's preferences, the time range from the URL, banners with the live caller texts, the bell, the palette's
@@ -45,7 +45,7 @@ STATIC = REPO / "src" / "roxy" / "static"
 # ============================================================================================ registry
 
 
-def test_the_registry_has_the_18_pages_of_plan_14_1_in_the_catalog_vocabulary() -> None:
+def test_the_registry_has_the_19_pages_in_the_catalog_vocabulary() -> None:
     assert sorted(p.id for p in PAGES) == sorted(CATALOG_PAGES)
     for spec in PAGES:
         assert spec.purpose.endswith("."), spec.id
@@ -89,9 +89,9 @@ def test_the_v1_section_map_has_37_rows_with_unique_tests_and_known_cards() -> N
 
 
 def test_every_registered_page_is_built() -> None:
-    """P11 acceptance: all 18 pages have their module (the pages router imports each one; nothing is a placeholder)."""
+    """P11 acceptance: all 19 pages have their module (the pages router imports each one; nothing is a placeholder)."""
     assert registry.built_pages() == tuple(p.id for p in PAGES)
-    assert len(PAGES) == 18
+    assert len(PAGES) == 19
 
 
 def test_navigation_model_lists_every_page_once_with_help_last() -> None:

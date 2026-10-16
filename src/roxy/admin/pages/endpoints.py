@@ -134,7 +134,7 @@ RULE_FAMILIES: Final[tuple[tuple[str, str, str], ...]] = (
     ("endpoint_rule", "Endpoint rule (a rate limit)", "/admin/protection#endpoint-rules"),
     ("cache_rule", "Cache rule", "/admin/cache#rules"),
     ("routing_rule", "Routing rule", "/admin/upstream#routing"),
-    ("credential_allowlist", "Credential allowlist", "/admin/credential#allowlist"),
+    ("credential_allowlist", "Endpoint policy: sent with Roxy's account", "/admin/policy#endpoints"),
 )
 """Rule families of the drill-down: the answer's key, the words, and the card that manages them (DESIGN.md 9)."""
 COMPARE_WORDS: Final[dict[str, str]] = {

@@ -124,6 +124,7 @@ PAGES: Final[tuple[str, ...]] = (
     "health",
     "settings",
     "credential",
+    "policy",
     "data",
     "audit",
     "system",
@@ -145,6 +146,7 @@ CARD_ANCHORS: Final[frozenset[str]] = frozenset(
         "egress#budget",
         "credential#status",
         "credential#budget",
+        "policy#summary",
         "cache#settings",
         "cache#coalescing",
         "recommendations#preview-settings",
@@ -1075,7 +1077,7 @@ def validate_cross(values: Mapping[str, Any], *, catalog: Mapping[str, SettingSp
             CrossIssue(
                 ("credential_probe_reserved_per_min", "credential_bucket_per_min"),
                 f"credential_probe_reserved_per_min ({_format_number(reserved)}) must be below "
-                f"credential_bucket_per_min ({_format_number(bucket)}), or allowlisted traffic gets no share",
+                f"credential_bucket_per_min ({_format_number(bucket)}), or caller traffic gets no share",
                 "credential_reserve",
             )
         )

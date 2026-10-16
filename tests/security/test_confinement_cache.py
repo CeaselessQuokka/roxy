@@ -3,8 +3,8 @@
 What this is
     Probes against `CacheService` (real temp SQLite files, a scripted upstream) for the case the defenses exist
     for: the upstream used the credential (`auth_class=cred`) for a request whose cache key is anonymous. That
-    happens when the rules snapshot moves between the cache's `peek` (no allowlist row yet) and the upstream's
-    routing (row present), or when an allowlist regex hits its time limit in one evaluation and not the other.
+    happens when the rules snapshot moves between the cache's `peek` (no credential grant yet) and the
+    upstream's routing (an admin override to ALLOW_TOKEN landed in between, D1 revised).
     Each probe checks one way the answer could reach anonymous requests: stored as an entry (later hits, stale
     and stale-while-revalidate serves), shared with followers in another worker, shared with followers in the
     same worker (finding F2, fixed), and a run of requests that all keep reaching the credential.
@@ -17,8 +17,9 @@ Why it exists
 
 How it works
     `FakeUpstream` from `roxy.cache.testing` answers with a credential-class result after a gate opens; the
-    requests are built with `make_request`, so their keys are anonymous (empty allowlist). Two `CacheService`
-    objects over the same databases stand in for two workers.
+    requests are built with `make_request` for `economy GET /v1/user/currency`, which the shipped endpoint
+    policy blocks, so the cache's own policy grants nothing and every key is anonymous. Two `CacheService` objects
+    over the same databases stand in for two workers.
 
 What to read next
     `src/roxy/cache/service.py` (`_absorb`, `_serve_flight`), `src/roxy/cache/policy.py` (`store_decision`),
@@ -52,7 +53,7 @@ def make_service(dbs: Any, clock: FakeClock, upstream: FakeUpstream, worker: str
     return CacheService(
         dbs=dbs,
         settings=FakeSettings(),
-        rules=StaticRules(rules_snapshot()),  # empty allowlist: every key here is anonymous
+        rules=StaticRules(rules_snapshot()),  # the shipped policy: no grant for TARGET, every key is anonymous
         clock=clock,
         upstream=upstream,
         worker_id=worker,

@@ -378,7 +378,8 @@ async def test_follower_never_takes_an_older_entry_from_cache_db_for_a_fresh_cop
 # --- credential answers fetched under a cache_private row stay private (finding cred-4) --------------------------
 
 
-CURRENCY = "economy.roblox.com/v1/user/currency"
+CURRENCY = "users.roblox.com/v1/users/1"  # an endpoint the policy sends with the account
+_GRANT = "users:GET:/v1/users/{userId}"
 
 
 @pytest.mark.parametrize("how", ["upstream_says_private", "row_flipped_before_the_answer"])
@@ -389,8 +390,10 @@ async def test_answer_fetched_under_a_private_row_is_never_coalesced(
     private: the upstream fetched it under a `cache_private` row (`UpstreamResult.private`), or the row is private
     by the time the answer arrives. Nobody else gets it: not a follower in this worker, not one in another, not
     the store. Each request makes its own credential call."""
-    rules = StaticRules(rules_snapshot(credential_allowlist=[{"pattern": CURRENCY, "cache_private": 0}]))
-    private_rules = rules_snapshot(credential_allowlist=[{"pattern": CURRENCY, "cache_private": 1}], version=2)
+    shared_row = {"endpoint_id": _GRANT, "verdict": "ALLOW_TOKEN", "cache_private": 0}
+    private_row = {"endpoint_id": _GRANT, "verdict": "ALLOW_TOKEN", "cache_private": 1}
+    rules = StaticRules(rules_snapshot(policy_overrides=[shared_row]))
+    private_rules = rules_snapshot(policy_overrides=[private_row], version=2)
     flag = how == "upstream_says_private"
     numbers = itertools.count(1)  # one numbering across both workers' upstreams
 
