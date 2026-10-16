@@ -1,0 +1,32 @@
+{#-
+  The Endpoint policy page (`roxy/admin/pages/policy.py`): which Roblox endpoints callers may use, and with which
+  account (owner decision D1 revised 2026-10-16).
+
+  Layout: the summary first (what the policy does now, with its three settings), then the categories and the
+  endpoints table (the page's main table: its filters live in the address, so `?category=ads#endpoints` opens it
+  filtered), the tester, and the three logs of the time range (unknown endpoints, caller sign-in attempts, shadow
+  mode). `how_to_read` extends the registry's text with where the records are kept.
+-#}
+{% extends "admin/_page.html" %}
+{% from "components/icon.html" import icon %}
+{% from "components/glossary.html" import term with context %}
+
+{% block page_actions %}
+<a class="btn btn--ghost" href="/admin/audit?target=endpoint_policy%2A">{{ icon("history") }}<span>Policy history</span></a>
+{% endblock %}
+
+{% block how_to_read %}
+{% for paragraph in page.how_to_read %}<p>{{ paragraph }}</p>{% endfor %}
+<p>Sending an endpoint with Roxy's account uses the one Roblox {{ term("credential") }}: it always leaves from the server's own address, never through the {{ term("rotator") }}, and is paced by its {{ term("bucket") }}. An endpoint Roblox answers without a sign-in falls back to the anonymous path when the account is busy or cooling down; one that only answers signed-in users waits for the account instead.</p>
+<p>A caller who sends their own Roblox cookie, API key or sign-in token is refused whatever the policy says, and listed under Caller sign-in attempts. Roxy never stores the value, only a keyed fingerprint that groups repeats of the same secret.</p>
+{% endblock %}
+
+{% block cards %}
+{{ cards["summary"] }}
+{{ cards["categories"] }}
+{{ cards["endpoints"] }}
+{{ cards["tester"] }}
+{{ cards["unknown"] }}
+{{ cards["attempts"] }}
+{{ cards["would-block"] }}
+{% endblock %}

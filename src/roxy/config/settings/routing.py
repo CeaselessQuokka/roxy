@@ -7,8 +7,9 @@ What this is
 
 Why it exists
     Roxy can reach Roblox three ways (plan 7.1): `direct` (anonymous, from the server's own IP address),
-    `credential` (from the server IP with the one Roblox login cookie, allowlisted endpoints only) and `rotator`
-    (anonymous, through the paid DataImpulse proxy pool, a different exit IP per session). Most of what makes
+    `credential` (from the server IP with the one Roblox login cookie, only for endpoints the endpoint policy
+    sends with the account) and `rotator` (anonymous, through the paid DataImpulse proxy pool, a different exit IP
+    per session). Most of what makes
     Roxy cheap, safe and kind to Roblox is decided here: how traffic is shared between the free direct path and
     the paid rotator, how rotator sessions behave and what they may cost, which Roblox hosts are reachable at
     all (the SSRF defense), how often a failed call may be retried, and which identity Roxy presents to Roblox.

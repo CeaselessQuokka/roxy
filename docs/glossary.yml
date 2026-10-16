@@ -88,7 +88,7 @@ terms:
     source: plan
   - id: credential
     term: Credential
-    definition: The single Roblox .ROBLOSECURITY cookie Roxy owns. It is used only for Roxy's own probes and an explicit allowlist, and it never travels through the rotator.
+    definition: The single Roblox .ROBLOSECURITY cookie Roxy owns. It is sent with caller requests the endpoint policy marks ALLOW_TOKEN and with Roxy's own probes, never to a blocked endpoint, and it never travels through the rotator.
     source: plan
   - id: csp
     term: CSP

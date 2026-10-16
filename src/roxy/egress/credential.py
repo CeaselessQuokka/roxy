@@ -36,7 +36,7 @@ How it works
     bootstrap value, through `delete_ui_value`) therefore stays known to every redaction point for the worker's
     whole life, however many values are pasted in between.
     Status is `unknown` (never probed), `active`, `rejected`, or (computed) `cooling_down` while the fleet-wide
-    cooldown row `credential` in hot.db is in the future. Ordinary allowlisted traffic needs `active`; probes may
+    cooldown row `credential` in hot.db is in the future. Ordinary caller traffic needs `active`; probes may
     run while `unknown` or `rejected` (that is how a status is established) but never during a cooldown.
     Changes bump `service_state.credential_version`; every worker refreshes once a second and, before every
     credential request, re-reads the version, status and cooldown, so a replacement or a 429 cooldown applies
@@ -58,7 +58,7 @@ How it works
     `account_changed` instead of claiming the same account (finding docs_a-1).
     `authorize(request)` is the only place the cookie is attached: after those checks, after validating that the
     target is https on an allowed Roblox host, and after the leak guard's own inspection of the request (a caller
-    who sends a 24+ character piece of the credential on an allowlisted endpoint is refused as auth smuggling, so
+    who sends a 24+ character piece of the credential on a granted endpoint is refused as auth smuggling, so
     the piece is never sent next to the cookie nor stored in a cache key, finding cred-5), as a per-request
     `Cookie` header (no cookie jar anywhere).
     `observe_set_cookie` sees `Set-Cookie` headers the credential client dropped; a `.ROBLOSECURITY` one means
@@ -1115,7 +1115,7 @@ class CredentialManager:
         return pending is not None and pending[0] == self._slot.fingerprint
 
     def available(self) -> bool:
-        """True when allowlisted traffic may use the credential now (active, not cooling down, state readable)."""
+        """True when caller traffic may use the credential now (active, not cooling down, state readable)."""
         return self._effective_status() == ACTIVE
 
     def probe_allowed(self) -> bool:
@@ -1202,7 +1202,7 @@ class CredentialManager:
         """The leak guard's inspection, on the credential path, before the cookie is attached (finding cred-5).
 
         The credential client has no guard transport (it carries the cookie by design), so without this a caller
-        who already holds a piece of the credential could send it in the query of an allowlisted endpoint: it would
+        who already holds a piece of the credential could send it in the query of a granted endpoint: it would
         go to Roblox next to the cookie and into the cache key text stored in cache.db. A piece of the credential
         (or a public marker) is refused as auth smuggling: nothing is sent, nothing is stored, and the egress stays
         enabled (no trip: the credential path never carries anonymous traffic to disable).

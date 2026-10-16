@@ -2,14 +2,14 @@
 
 What this is
     Four recommendation rules about the one Roblox credential (plan C1, C2): the credential is rejected, mismatched
-    or being rotated by Roblox; an allowlisted endpoint answers the same without it; the leak guard caught the
+    or being rotated by Roblox; an endpoint sent with it answers the same without it; the leak guard caught the
     credential on an anonymous egress; and Roxy's own credential checks spend too much of the account's budget.
 
 Why it exists
     The credential is the riskiest thing Roxy holds (plan 1, P1). These rules make its trouble visible within a
     run, and they are deliberately conservative: Roxy never replaces, switches or disables the credential by itself
-    (C1), so CRED-EXPIRING and CRED-ROTATOR-GUARD only ever propose a manual step, CRED-UNUSED proposes removing an
-    allowlist entry (less account exposure, never more), and CRED-PROBE-COST proposes fewer probes, never none.
+    (C1), so CRED-EXPIRING, CRED-ROTATOR-GUARD and CRED-UNUSED only ever propose a manual step (CRED-UNUSED: send an
+    endpoint without the account, less exposure, never more), and CRED-PROBE-COST proposes fewer probes, never none.
 
 How it works
     - Probe history is the `credential_probe` events (`egress/credential.py`: `{kind, result, status}` per probe),
@@ -83,6 +83,11 @@ def _probe_rejected(detail: Mapping[str, Any]) -> bool:
     return status in REJECTED_STATUSES or result.startswith(REJECTED) or result == MISMATCH
 
 
+def _grant_key(grant: Any) -> str:
+    """The operation a credential grant is for: its endpoint policy id (the pattern for a grant without one)."""
+    return str(getattr(grant, "endpoint_id", "") or grant.pattern)
+
+
 # ------------------------------------------------------------------------------------------------ CRED-EXPIRING
 
 
@@ -146,7 +151,7 @@ class CredExpiring(Rule):
                 problem = f"Roblox rejected it (last check: {result})"
             title = "The Roblox credential is rejected: renew it"
             severity = "critical"
-            impact = "Allowlisted credential endpoints and the credential checks work again."
+            impact = "Endpoints sent with the account and the credential checks work again."
             explanation = (
                 f"The credential set on {evidence.details['set_at'] or 'an unknown date'} no longer works: {problem}. "
                 f"Of {len(probes)} checks since it was set, {rejected} failed. Roxy has stopped using it and never "
@@ -155,7 +160,7 @@ class CredExpiring(Rule):
         else:
             title = "Roblox is replacing the credential cookie: renew it"
             severity = "warn"
-            impact = "Allowlisted credential endpoints and the credential checks keep working after Roblox retires it."
+            impact = "Endpoints sent with the account and the credential checks keep working after Roblox retires it."
             explanation = (
                 f"Roblox sent a replacement credential cookie {extra.counted(len(warnings), 'time')} since the "
                 "credential was set "
@@ -188,57 +193,65 @@ class CredExpiring(Rule):
 
 @register
 class CredUnused(Rule):
-    """An endpoint on the credential allowlist answers the same without the credential.
+    """An endpoint Roxy sends with its account answers the same without it.
 
-    For each enabled credential allowlist row, counts the side-by-side comparisons of the same request on the
-    anonymous path and on the credential path (the comparison producer's events of the last day, plus what a
-    provider supplies). With at least `min_comparisons` comparisons of which at least `identical_pct` percent
-    returned the same body, it proposes removing that row: every credential call is account exposure (plan D1),
-    and an endpoint that does not need the login should not carry it. Rows whose anonymous answers differ stay.
+    For each operation the endpoint policy sends with the account (an ALLOW_TOKEN verdict), counts the side-by-side
+    comparisons of the same request on the anonymous path and on the credential path (the comparison producer's
+    events of the last day, plus what a provider supplies). With at least `min_comparisons` comparisons of which at
+    least `identical_pct` percent returned the same body, it suggests sending that operation without the account
+    (a manual change on the Endpoint policy page): every credential call spends the account's budget (plan D1
+    revised), and an endpoint that answers the same without the login does not need it. Operations whose anonymous
+    answers differ stay as they are.
     """
 
     id = "CRED-UNUSED"
-    safe_auto = False  # the allowlist is a credential setting (plan 11.4: auto-apply never touches the credential)
+    safe_auto = False  # the policy is a credential choice (plan 11.4: auto-apply never touches the credential)
 
     def minimum_evidence(self, ctx: InsightContext) -> int:
         return self.int_param(ctx, "min_comparisons")
 
     async def evaluate(self, ctx: InsightContext) -> list[Recommendation]:
-        rows = [row for row in ctx.rules.credential_allowlist if row.enabled]
-        if not rows:
-            return []
         window = ctx.window(hours=COMPARISON_WINDOW_H)
         comparisons = await extra.credential_comparisons(ctx, window)
-        per_row: dict[int, list[dict[str, Any]]] = {}
+        # Keyed by the operation, not `row.id`: every admin-granted operation the seed does not list has id 0.
+        per_row: dict[str, list[dict[str, Any]]] = {}
+        grants: dict[str, Any] = {}
         for item in comparisons:
             template = str(item.get("endpoint_template") or "")
             method = str(item.get("method") or "GET").upper()
             row = ctx.rules.credential_rule_for(template, method) if template else None
             if row is not None and row.enabled:
-                per_row.setdefault(int(row.id), []).append(item)
+                per_row.setdefault(_grant_key(row), []).append(item)
+                grants.setdefault(_grant_key(row), row)
+        rows = list(grants.values())
+        if not rows:
+            return []
         minimum = self.param(ctx, "min_comparisons")
         needed = self.param(ctx, "identical_pct")
         out: list[Recommendation] = []
-        calls: dict[int, int] | None = None
-        for row in sorted(rows, key=lambda r: int(r.id)):
-            items = per_row.get(int(row.id), [])
+        calls: dict[str, int] | None = None
+        for row in sorted(rows, key=_grant_key):
+            items = per_row.get(_grant_key(row), [])
             total = sum(int(i.get("count") or 1) for i in items)
             same = sum(int(i.get("count") or 1) for i in items if bool(i.get("identical")))
             if total <= 0 or total < minimum or same * 100.0 < needed * total:
                 continue
             if calls is None:
                 calls = await self._credential_calls(ctx, window)
-            out.append(self._recommend(ctx, window, row, items, total, same, calls.get(int(row.id), 0)))
+            out.append(self._recommend(ctx, window, row, items, total, same, calls.get(_grant_key(row), 0)))
         return out
 
     @staticmethod
-    async def _credential_calls(ctx: InsightContext, window: Any) -> dict[int, int]:
-        """Upstream calls made with the credential in the window, per allowlist row (rollups, `auth_class` cred)."""
-        out: dict[int, int] = {}
+    async def _credential_calls(ctx: InsightContext, window: Any) -> dict[str, int]:
+        """Upstream calls made with the credential in the window, per granted operation (rollups, `auth_class` cred)."""
+        out: dict[str, int] = {}
         for template, row in (await ctx.by_template(window, {"auth_class": "cred"})).items():
-            allowed = ctx.rules.credential_rule_for(str(template), "GET")
+            allowed = ctx.rules.credential_rule_for(str(template), "GET") or ctx.rules.credential_rule_for(
+                str(template), "POST"
+            )
             if allowed is not None:
-                out[int(allowed.id)] = out.get(int(allowed.id), 0) + int(row.get("upstream_calls") or 0)
+                key = _grant_key(allowed)
+                out[key] = out.get(key, 0) + int(row.get("upstream_calls") or 0)
         return out
 
     def _recommend(
@@ -262,37 +275,33 @@ class CredUnused(Rule):
         evidence.add("identical_pct", round(same * 100.0 / total, 2), "percent")
         evidence.add("credential_calls", calls, "calls")
         evidence.details["anon_cred_status_pairs"] = statuses
-        evidence.links.append("/admin/credential#allowlist")
-        current = {
-            "id": int(row.id),
+        evidence.links.append("/admin/policy#endpoints")
+        endpoint_id = str(getattr(row, "endpoint_id", row.pattern))
+        evidence.details["policy_row"] = {
+            "endpoint_id": endpoint_id,
             "pattern": row.pattern,
-            "type": row.type,
             "methods": ",".join(row.methods),
             "cache_private": bool(row.cache_private),
-            "identical_anonymous": bool(row.identical_anonymous),
-            "note": row.note,
+            "anonymous_fallback": bool(row.identical_anonymous),
         }
-        evidence.details["allowlist_row"] = current
         return self.recommendation(
             ctx,
             subject=row.pattern,
-            title=f"{row.pattern} works without the credential: remove it from the allowlist",
+            title=f"{row.pattern} works without the credential: send it without Roxy's account",
             severity="warn",
             confidence="medium",
             explanation=(
                 f"In {total:,} side-by-side comparisons, {same:,} anonymous answers for {row.pattern} were identical "
-                f"to the credential's ({same * 100.0 / total:.0f}%). Every call that carries the credential is account "
-                "exposure (plan D1), so an endpoint that answers the same without it should not be on the allowlist. "
-                "Removing the row sends these calls anonymously; the credential itself is untouched."
+                f"to the credential's ({same * 100.0 / total:.0f}%). Every call that carries the credential spends the "
+                "account's budget, so an endpoint that answers the same without it does not need it. Setting it to "
+                "'Sent without an account' on Endpoint policy sends these calls anonymously; the credential itself is "
+                "untouched."
             ),
             evidence=evidence,
             changes=[
                 ProposedChange(
-                    "credential_allowlist_remove",
-                    table="credential_allowlist",
-                    match={"id": int(row.id), "pattern": row.pattern, "type": row.type},
-                    current=current,
-                    proposed=None,
+                    "manual",
+                    text=f"On Endpoint policy, set {endpoint_id} to 'Sent without an account'.",
                 )
             ],
             expected_impact=(

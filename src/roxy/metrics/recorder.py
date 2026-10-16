@@ -81,6 +81,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import json
 import logging
 import random
@@ -93,7 +94,7 @@ from typing import Any, TypeVar, cast
 
 from roxy.core.clock import SYSTEM_CLOCK, Clock
 from roxy.core.header_text import header_text
-from roxy.core.iphash import ip_hash
+from roxy.core.iphash import derived_key, ip_hash
 from roxy.core.reasons import AuthClass, CacheState, Egress, Outcome, ReasonCode, Source
 from roxy.core.redact import MASK, is_secret_field, is_sensitive_key, redact_label, redact_text
 from roxy.metrics import histograms, security_events, visitors
@@ -2174,6 +2175,41 @@ class MetricsRecorder:
                         summary_detail={})  # fmt: skip
         except Exception:
             self._count_error("record_probe")
+
+    def record_auth_attempt(
+        self,
+        ip: str,
+        attempt: Any,
+        *,
+        method: str,
+        endpoint_id: str,
+        user_agent: str | None = None,
+        place: str | None = None,
+    ) -> None:
+        """A caller sent their own sign-in (`abuse/checks/auth_smuggling.py AuthAttempt`): what, where, and a keyed
+        fingerprint of the value (HMAC with a key derived from the IP hash key, so the same secret sent twice groups
+        together and nothing can be checked offline). The value itself is never written anywhere."""
+        try:
+            value = str(getattr(attempt, "value", "") or "")
+            fingerprint = None
+            if value and self.ip_hash_key is not None:
+                key = derived_key(self.ip_hash_key, "auth_attempt")
+                fingerprint = hmac.new(key, value.encode("utf-8", "replace"), hashlib.sha256).hexdigest()[:16]
+            signature, detail = security_events.auth_attempt_detail(
+                ip,
+                kind=str(attempt.kind),
+                where=str(attempt.where),
+                name=str(attempt.name),
+                looks_real=bool(attempt.looks_real),
+                fingerprint=fingerprint,
+                method=method,
+                endpoint_id=endpoint_id,
+                user_agent=header_text(user_agent) or None,
+            )
+            self._event(_now_ms(self.clock), security_events.AUTH_ATTEMPT, "warn", signature, detail, ip=ip,
+                        place=place, summary_detail={})  # fmt: skip
+        except Exception:
+            self._count_error("record_auth_attempt")
 
     def record_limit_refusal(
         self,

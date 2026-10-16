@@ -14,8 +14,9 @@ Why it exists
 How it works
     Real components over the test's databases (`dbs`): `SpamDetectors` with its caps shrunk by monkeypatch, two
     `CacheService` instances sharing hot.db and cache.db (two workers), the real proxy route with the real
-    `CacheService` and `AbusePipeline` plus a fake upstream that matches the credential allowlist the way
-    `upstream/service.py` does, and a Starlette app with the public `/internal` guard before the proxy route.
+    `CacheService` and `AbusePipeline` plus a fake upstream that matches the routing rules and asks the endpoint policy
+    for a credential grant the way `upstream/service.py` does, and a Starlette app with the public `/internal` guard
+    before the proxy route.
 
 What to read next
     `tests/security/test_ingress_exhaustion.py`, `test_ingress_cache_poisoning.py`, `test_ingress_redos.py`, then
@@ -45,7 +46,7 @@ from roxy.core.reasons import AuthClass, CacheState
 from roxy.internal_app import PublicInternalNotFound
 from roxy.proxy.router import router as proxy_router
 from roxy.rules.match import REGEX_REQUEST_BUDGET_S, regex_budget, regex_timeouts_total
-from roxy.rules.models import CacheRuleRow, CredentialAllowlistRow
+from roxy.rules.models import CacheRuleRow, RoutingRuleRow
 from roxy.rules.store import RulesSnapshot
 
 # --- spam_windows: the fleet-wide row cap holds with many clients, not only the per-client fold -----------------------
@@ -142,9 +143,11 @@ SLOW = r"x+x+x+y"
 TARGET_TEXT = "x" * (4096 - len("/games.roblox.com/") - 64)
 
 
-class AllowlistMatchingUpstream(FakeUpstream):
-    """A fake upstream that matches the credential allowlist the way `upstream/service.py _run` does (inside a
-    nested `regex_budget()`, which keeps the request's), then answers."""
+class RoutingMatchingUpstream(FakeUpstream):
+    """A fake upstream that matches the routing rules and asks for a credential grant the way
+    `upstream/service.py _run` does (inside a nested `regex_budget()`, which keeps the request's), then answers.
+    Routing rules are the admin regexes the upstream phase runs since D1 revised: the credential grant is the
+    endpoint policy's seed templates, which run no admin regex."""
 
     def __init__(self, rules: RulesSnapshot) -> None:
         super().__init__()
@@ -152,22 +155,22 @@ class AllowlistMatchingUpstream(FakeUpstream):
 
     async def fetch(self, req: Any, **kwargs: Any) -> Any:
         with regex_budget():
+            self.rules.routing_rule_for(f"{req.host}{req.path}")
             self.rules.credential_rule_for(f"{req.host}{req.path}", "GET")
         return await super().fetch(req, **kwargs)
 
 
 async def test_an_allowed_request_spends_one_regex_budget_across_peek_and_upstream(dbs: Any) -> None:
     """Fix pass 1 (ReDoS: cache peek outside the budget) was tested with a refused caller. An allowed caller runs
-    the cache policy (slow stored cache rules, enough to spend the whole budget) and then the upstream allowlist
+    the cache policy (slow stored cache rules, enough to spend the whole budget) and then the upstream routing
     match (slow stored rows) in the cache's own nested `regex_budget()`. Sharing one budget, the request costs
     about one budget; two separate budgets would cost at least two (0.4 s), which the bound below excludes."""
     clock = FakeClock()
     cache_rules = tuple(CacheRuleRow(id=i, pattern=SLOW + "(?:q)?" * i, type="regex", ttl=60) for i in range(1, 9))
-    allowlist = tuple(
-        CredentialAllowlistRow(id=i, pattern=SLOW + "(?:w)?" * i, type="regex", methods=("GET",), cache_private=True)
-        for i in range(1, 9)
+    routing = tuple(
+        RoutingRuleRow(id=i, pattern=SLOW + "(?:w)?" * i, type="regex", mode="prefer_direct") for i in range(1, 9)
     )
-    upstream = AllowlistMatchingUpstream(RulesSnapshot(version=1, loaded_at=0.0, credential_allowlist=allowlist))
+    upstream = RoutingMatchingUpstream(RulesSnapshot(version=1, loaded_at=0.0, routing_rules=routing))
     settings = CatalogSettings({"tarpit_enabled": 0})
     pipeline = AbusePipeline(
         settings=settings, rules=RulesSnapshot.empty(), hot_db=dbs.hot, control_db=dbs.control, clock=clock

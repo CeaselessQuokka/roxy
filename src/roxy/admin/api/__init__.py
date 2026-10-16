@@ -94,7 +94,7 @@ API_MODULES: Final[tuple[str, ...]] = (
     "egress",
     "rotator",
     "credential",
-    "credential_allowlist",
+    "policy",
     "lookup",
     "health",
     "recommendations",

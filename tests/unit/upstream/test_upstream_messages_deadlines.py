@@ -22,7 +22,11 @@ def test_exact_caller_texts() -> None:
     assert messages.BUSY_MESSAGE == "All request methods are busy right now; please try again shortly."
     assert messages.FAILED_MESSAGE == "Upstream request failed; please try again later."
     assert messages.INTERNAL_ERROR_MESSAGE == "Internal Server Error"
-    assert messages.AUTH_SMUGGLING_MESSAGE == "Requests requiring authentication are not allowed with this proxy."
+    assert messages.AUTH_SMUGGLING_MESSAGE == (
+        "Roxy refused this request because it carried a Roblox login cookie or API key. Never send yours: Roxy uses "
+        "its own account. If that was your real .ROBLOSECURITY cookie, sign out of all sessions on roblox.com to "
+        "invalidate it. Roxy did not store it."
+    )
     assert messages.MESSAGE_CONTENT_TYPE == "text/plain; charset=utf-8"
     for text in (messages.BUSY_MESSAGE, messages.FAILED_MESSAGE):
         assert chr(0x2014) not in text

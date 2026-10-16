@@ -1,0 +1,39 @@
+{#-
+  Endpoint policy page, the tester's answer (`GET /admin/policy/test?target=&method=`, swapped in under the tester
+  form; `roxy/admin/api/policy.py target_answer`): the normalized target, the matched row or "not in Roblox's
+  reference", each precedence step with what it said, the final verdict, whether Roxy's account goes with it and
+  whether it falls back to the anonymous path, and whether the request would be refused (or only counted, in shadow
+  mode). The host, path and an unknown endpoint's id come from the pasted URL: caller text.
+  Context: `answer`, `verdict`, `default`, `risk`, `source_words`, `row_drawer`, `unknown_drawer`, `block_status`,
+  `error`.
+-#}
+{% from "components/format.html" import caller_text %}
+{% from "components/badges.html" import status_badge %}
+{% if error %}
+<p class="field__error" role="alert">{{ error }}</p>
+{% else %}
+<div class="stack policy-test" data-policy-test data-verdict="{{ answer.verdict }}">
+  <p class="policy-test__verdict">{{ status_badge(verdict.tone, verdict.text) }} <span class="mono">{{ answer.method }} {{ caller_text(answer.host, 120) }}{{ caller_text(answer.path, 300) }}</span></p>
+  <dl class="kv policy-facts">
+    <dt>Matched</dt>
+    <dd>{% if answer.row %}<span class="mono">{{ answer.row.method }} {{ answer.row.host }}{{ answer.row.path }}</span>: {{ answer.row.summary or "no summary" }} <span class="muted">({{ answer.row.category_label }})</span>
+        {% if row_drawer %} <button type="button" class="link-btn" data-drawer-src="{{ row_drawer }}" data-drawer-title="Endpoint">Open this endpoint</button>{% endif %}
+      {% else %}Not in Roblox's reference <span class="muted">(<span class="mono">{{ caller_text(answer.endpoint_id, 300) }}</span>)</span>
+        {% if unknown_drawer %} <button type="button" class="link-btn" data-drawer-src="{{ unknown_drawer }}" data-drawer-title="Unknown endpoint">Set a verdict for it</button>{% endif %}
+      {% endif %}</dd>
+    <dt>Steps</dt>
+    <dd><ol class="policy-steps">{% for step in answer.steps %}<li><span class="policy-steps__name">{{ step.step }}</span>: {{ step.says }}</li>{% endfor %}</ol></dd>
+    <dt>Verdict</dt><dd>{{ verdict.text }}, from {{ source_words }}{% if answer.verdict != answer.default_verdict %} <span class="muted">(default: {{ default.text }})</span>{% endif %}. Risk {{ risk.text }}.</dd>
+    <dt>Why</dt><dd>{{ answer.reason }}</dd>
+    <dt>Roxy's account</dt>
+    <dd>{% if answer.credential %}Sent with it{% if answer.credential.anonymous_fallback %}; when the account is busy or cooling down, the request goes without it instead of failing{% else %}; Roblox only answers signed-in users here, so it waits for the account (or gets 429) and never falls back{% endif %}{% if answer.credential.cache_private %}; its answers are kept private{% endif %}.
+        {% elif answer.verdict == "BLOCK" %}Never sent.
+        {% else %}Not sent: the request goes out anonymously.{% endif %}</dd>
+    <dt>What happens</dt>
+    <dd>{% if answer.refused %}{{ status_badge("bad", "Refused before Roblox") }} with status {{ block_status }}.
+        {% elif answer.shadow %}{{ status_badge("warn", "Shadow mode") }} The policy would refuse it, but Refuse blocked endpoints is off: it is sent without Roxy's account and counted under Shadow mode.
+        {% else %}{{ status_badge("ok", "Forwarded") }}{% endif %}
+        {% if not answer.host_allowed %} <span class="muted">This host is not in the allowed Roblox hosts, so Roxy refuses it anyway as not a Roblox URL.</span>{% endif %}</dd>
+  </dl>
+</div>
+{% endif %}

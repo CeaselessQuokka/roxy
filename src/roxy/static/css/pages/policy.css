@@ -1,0 +1,149 @@
+/*
+ * The Endpoint policy page (templates/admin/pages/policy*): counts, category rows, the endpoints table's select
+ * boxes and documentation links, the bulk forms and the tester's steps.
+ *
+ * What this is
+ *   Layout for the page's own pieces. Tables, stat tiles, forms, badges and drawers are shared
+ *   (static/css/components.css); this file only places what the page adds: the category rows (a summary line that
+ *   wraps on a phone), the narrow select column, the two links per row, and the tester's numbered steps.
+ * Why it exists
+ *   Plan 14.4 and 14.8: tokens only, both themes, and no sideways scroll on a phone (the table scrolls inside its
+ *   own region; long paths break inside their cell).
+ * How it works
+ *   Flex and grid with gaps from the spacing tokens; no inline style anywhere (the CSP forbids it).
+ * What to read next
+ *   static/css/pages/credential.css, templates/admin/pages/policy.html.
+ */
+
+/* ------------------------------------------------------------------------------------------- summary */
+
+.policy-state {
+  margin: 0 0 var(--sp-3);
+}
+
+.policy-state .badge {
+  max-width: 100%;
+  white-space: normal;
+}
+
+.policy-facts {
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+}
+
+.policy-facts dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.policy-legacy {
+  display: grid;
+  gap: var(--sp-1);
+  margin: 0 0 var(--sp-3);
+  padding-left: var(--sp-4);
+}
+
+.policy-legacy li {
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------------------------------- categories */
+
+.policy-categories {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.policy-category {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-2) var(--sp-3);
+}
+
+.policy-category__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-1) var(--sp-3);
+  cursor: pointer;
+}
+
+.policy-category__name {
+  font-weight: 600;
+}
+
+.policy-category__body {
+  margin-top: var(--sp-3);
+}
+
+.policy-category__table {
+  max-width: 28rem;
+}
+
+.policy-choice {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.policy-choice legend {
+  margin-bottom: var(--sp-1);
+  padding: 0;
+}
+
+/* ------------------------------------------------------------------------------------------- endpoints */
+
+.policy-pick {
+  width: 2.5rem;
+}
+
+.policy-path {
+  overflow-wrap: anywhere;
+}
+
+.policy-docs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-3);
+}
+
+.policy-docs .icon {
+  margin-left: var(--sp-1);
+}
+
+.policy-bulk {
+  border-top: 1px solid var(--border);
+}
+
+.policy-bulk__count {
+  margin: 0 0 var(--sp-2);
+  font-weight: 600;
+}
+
+/* ------------------------------------------------------------------------------------------- tester */
+
+.policy-tester__target {
+  flex: 1 1 20rem;
+  min-width: 0;
+}
+
+.policy-test__verdict {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.policy-steps {
+  margin: 0;
+  padding-left: var(--sp-4);
+}
+
+.policy-steps__name {
+  font-weight: 600;
+}
+
+@media (max-width: 480px) {
+  .policy-facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

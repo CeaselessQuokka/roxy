@@ -1,0 +1,54 @@
+{#-
+  Endpoint policy page, card `categories` (`roxy/admin/pages/policy.py categories_card`), from
+  `GET /admin/api/v1/policy/categories` (the same function): one row per category with its description, its switch
+  in words, how many endpoints have each verdict now and by default, and its highest risk. Opening a row shows the
+  switch form (`PUT /admin/api/v1/policy/categories/<key>` with a state and a reason: Block all and Send without the
+  account only tighten, so the session and CSRF are enough; going back to Defaults loosens, so the shared form
+  handler asks for a code) and a link to the Endpoints card filtered to the category.
+  Context: `frame`, `items`, `help`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num %}
+{% call page_card(frame) %}
+<p class="muted g3-note">A switch acts on every endpoint of its category that has no override of its own. {{ help.loosen }}</p>
+<div class="policy-categories" data-policy-categories>
+  {% for c in items %}
+  <details class="details-plain policy-category" id="category-{{ c.key }}" data-category="{{ c.key }}">
+    <summary class="policy-category__head">
+      <span class="policy-category__name">{{ c.label }}</span>
+      <span class="policy-category__state{% if c.state != 'defaults' %} tone tone--warn{% endif %}">{{ c.state_label }}</span>
+      <span class="policy-category__counts muted">{{ num(c.operations) }} endpoints{% for n in c.counts if n.now %}, {{ num(n.now) }} {{ n.label|lower }}{% endfor %}</span>
+      <span class="tone tone--{{ c.risk.tone }}">Highest risk {{ c.risk.text }}</span>
+    </summary>
+    <div class="policy-category__body stack">
+      <p>{{ c.description }}</p>
+      <table class="g3-table policy-category__table">
+        <caption class="sr-only">{{ c.label }}: endpoints per verdict</caption>
+        <thead><tr><th scope="col">Verdict</th><th scope="col" class="num">Now</th><th scope="col" class="num">By default</th></tr></thead>
+        <tbody>
+          {% for n in c.counts %}<tr><th scope="row">{{ n.label }}</th><td class="num">{{ num(n.now) }}</td><td class="num">{{ num(n.default) }}</td></tr>{% endfor %}
+        </tbody>
+      </table>
+      <p><a class="link" href="{{ c.endpoints_href }}">Show the {{ num(c.operations) }} endpoints of {{ c.label }}</a></p>
+      <form class="stack g3-form" data-api-form data-api-url="{{ c.url }}" data-api-method="PUT"
+            data-success="Switch saved. Every worker follows it within a second." data-on-success="refresh" data-refresh="categories summary endpoints" novalidate>
+        <fieldset class="field policy-choice">
+          <legend class="field__label">Switch for {{ c.label }}</legend>
+          {% for choice in c.choices %}
+          <label class="radio"><input type="radio" name="state" value="{{ choice.value }}" data-json="string"{% if choice.value == c.state %} checked{% endif %}><span>{{ choice.label }}: {{ help.states[choice.value] }}</span></label>
+          {% endfor %}
+        </fieldset>
+        <div class="field">
+          <label class="field__label" for="category-{{ c.key }}-reason">Reason <span class="muted">(required, saved in the audit log)</span></label>
+          <input class="input" type="text" id="category-{{ c.key }}-reason" name="reason" maxlength="500" required data-json="string" autocomplete="off" aria-describedby="category-{{ c.key }}-reason-error">
+          <p class="field__error" id="category-{{ c.key }}-reason-error" data-field-error="reason" hidden></p>
+        </div>
+        <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+        <div class="cluster"><button type="submit" class="btn btn--primary" data-action="policy-category-save">{{ icon("check") }}<span>Save the switch</span></button></div>
+      </form>
+    </div>
+  </details>
+  {% endfor %}
+</div>
+{% endcall %}

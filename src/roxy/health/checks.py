@@ -238,7 +238,9 @@ async def check_cred_present(env: CheckEnv) -> CheckResult:
     return env.result(
         Status.FAIL,
         "absent",
-        finding="No Roblox credential is loaded, so allowlisted endpoints and the credential probes cannot work."
+        finding=(
+            "No Roblox credential is loaded, so endpoints sent with the account and the credential probes cannot work."
+        )
         + problem,
         detail={"problem": status.problem},
     )
@@ -315,9 +317,15 @@ async def check_cred_cooldown(env: CheckEnv) -> CheckResult:
         return env.result(Status.PASS, "0 s remaining", measured=0.0, unit="s")
     status = Status.WARN if remaining < CRED_COOLDOWN_FAIL_S else Status.FAIL
     finding = (
-        "Roblox rate-limited the account recently, so allowlisted traffic waits until the cooldown ends."
+        (
+            "Roblox rate-limited the account recently, so caller traffic goes out anonymously (or waits, for "
+            "sign-in-only endpoints) until the cooldown ends."
+        )
         if status is Status.WARN
-        else "The account is cooling down for a minute or more; allowlisted endpoints answer from cache or 503."
+        else (
+            "The account is cooling down for a minute or more; sign-in-only endpoints answer from cache or 503, the "
+            "rest go out anonymously."
+        )
     )
     return env.result(status, value, finding=finding, measured=remaining, unit="s")
 
@@ -1630,7 +1638,8 @@ SPECS: Final[tuple[CheckSpec, ...]] = (
     _spec(
         "H-CRED-PRESENT", "Credential configured", "present or not", "pass: present; fail: absent",
         "/admin/credential#status", "Credential page",
-        "Roxy keeps exactly one Roblox credential (plan C1). Allowlisted endpoints and the credential probes need it.",
+        "Roxy keeps exactly one Roblox credential (plan C1). Endpoints sent with the account and the credential "
+        "probes need it.",
         CheckKind.LOCAL, check_cred_present,
     ),
     _spec(

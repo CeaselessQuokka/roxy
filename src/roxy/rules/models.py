@@ -68,6 +68,8 @@ from roxy.config.constants import (
     MAX_CREDENTIAL_ALLOWLIST_RULES,
     MAX_DENY_ENTRIES,
     MAX_ENDPOINT_BLOCKS,
+    MAX_ENDPOINT_POLICY_CATEGORIES,
+    MAX_ENDPOINT_POLICY_OVERRIDES,
     MAX_ENDPOINT_RULES,
     MAX_HEADER_RULES,
     MAX_IGNORED_PATHS,
@@ -474,6 +476,76 @@ class CredentialAllowlistIn(_PatternModel):
         return _methods(value, ("GET", "HEAD"))
 
 
+_UNKNOWN_ENDPOINT = re.compile(r"unknown:(GET|POST|PUT|PATCH|DELETE):[a-z0-9.-]+\.roblox\.com/[^\s]{0,400}")
+
+
+class EndpointPolicyOverrideIn(_Model):
+    """An admin's verdict for one Roblox operation (D1 revised; `roxy/policy/engine.py` for how it applies).
+
+    `endpoint_id` is a seed id (`users:GET:/v1/users/{userId}`) or `unknown:<METHOD>:<template>` for an operation
+    Roblox does not document. The credential never goes with PUT, PATCH or DELETE, so ALLOW_TOKEN is refused there.
+    """
+
+    endpoint_id: str = Field(min_length=3, max_length=500)
+    verdict: Literal["BLOCK", "ALLOW_TOKEN", "ALLOW_ANON"]
+    cache_private: bool = False
+    note: Note = ""
+    enabled: bool = True
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def _upper_verdict(cls, value: Any) -> Any:
+        return value.strip().upper() if isinstance(value, str) else value
+
+    @field_validator("endpoint_id")
+    @classmethod
+    def _endpoint(cls, value: str) -> str:
+        from roxy.policy.seed import load_seed  # local: the policy package imports nothing from here
+
+        text = value.strip()
+        if _CONTROL_ALL.search(text):
+            raise ValueError("The endpoint id contains a control character")
+        if text.startswith("unknown:"):
+            if not _UNKNOWN_ENDPOINT.fullmatch(text):
+                raise ValueError("An unlisted endpoint is unknown:<METHOD>:<host>/<path template>")
+            return text
+        if text not in load_seed().by_id:
+            raise ValueError("No Roblox endpoint has that id; pick one from the Endpoints card")
+        return text
+
+    @model_validator(mode="after")
+    def _token_methods(self) -> EndpointPolicyOverrideIn:
+        method = self.endpoint_id.split(":", 2)[1]  # `users:GET:/...` and `unknown:GET:host/...` alike
+        if self.verdict == "ALLOW_TOKEN" and method not in METHOD_ORDER:
+            raise ValueError("Roxy's account is only ever sent with GET, HEAD or POST")
+        if self.verdict == "ALLOW_TOKEN" and self.endpoint_id.startswith("unknown:") and method != "GET":
+            raise ValueError("An endpoint Roblox does not document carries Roxy's account on GET only")
+        return self
+
+
+class EndpointPolicyCategoryIn(_Model):
+    """The switch of one category of the endpoint policy (`roxy/policy/seed.py CATEGORY_STATES`)."""
+
+    category: str = Field(min_length=1, max_length=64)
+    state: Literal["defaults", "block_all", "strip_credential"]
+    note: Note = ""
+
+    @field_validator("category")
+    @classmethod
+    def _category(cls, value: str) -> str:
+        from roxy.policy.seed import CATEGORIES
+
+        text = value.strip().lower()
+        if text not in CATEGORIES:
+            raise ValueError("Unknown category")
+        return text
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _lower_state(cls, value: Any) -> Any:
+        return _lower(value)
+
+
 class ThrottleTierIn(_Model):
     """One rung of the escalation ladder (rows 40, 125; plan 10.4). Rung `position` 1 is the first strike."""
 
@@ -791,6 +863,26 @@ class CredentialAllowlistRow(_Row):
     updated_by: str | None = None
 
 
+class EndpointPolicyOverrideRow(_Row):
+    endpoint_id: str
+    verdict: str
+    cache_private: Flag = False
+    note: Text = ""
+    enabled: Flag = True
+    created_at: int | None = None
+    created_by: str | None = None
+    updated_at: int | None = None
+    updated_by: str | None = None
+
+
+class EndpointPolicyCategoryRow(_Row):
+    category: str
+    state: str
+    note: Text = ""
+    updated_at: int | None = None
+    updated_by: str | None = None
+
+
 class ThrottleTierRow(_Row):
     position: int
     multiplier: float
@@ -965,6 +1057,27 @@ RULE_TABLES: Final[dict[str, RuleTable]] = {
             duplicate_of=("pattern",),
         ),
         RuleTable(
+            "endpoint_policy_override",
+            "endpoint policy overrides",
+            "endpoint_id",
+            EndpointPolicyOverrideIn,
+            EndpointPolicyOverrideRow,
+            MAX_ENDPOINT_POLICY_OVERRIDES,
+            "endpoint_id",
+            pk_auto=False,
+        ),
+        RuleTable(
+            "endpoint_policy_category",
+            "endpoint policy categories",
+            "category",
+            EndpointPolicyCategoryIn,
+            EndpointPolicyCategoryRow,
+            MAX_ENDPOINT_POLICY_CATEGORIES,
+            "category",
+            pk_auto=False,
+            created=False,
+        ),
+        RuleTable(
             "throttle_tiers",
             "throttle rungs",
             "position",
@@ -1103,6 +1216,10 @@ __all__ = [
     "EndpointBlockRow",
     "EndpointLimitIn",
     "EndpointLimitRow",
+    "EndpointPolicyCategoryIn",
+    "EndpointPolicyCategoryRow",
+    "EndpointPolicyOverrideIn",
+    "EndpointPolicyOverrideRow",
     "HeaderRuleIn",
     "HeaderRuleRow",
     "IgnoredPathIn",

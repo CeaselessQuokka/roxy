@@ -33,7 +33,7 @@ from typing import Any
 
 from roxy.config import catalog
 from roxy.core.reasons import AuthClass, Egress, ReasonCode
-from roxy.rules.models import CacheIgnoredParamRow, CacheRuleRow, CredentialAllowlistRow
+from roxy.rules.models import CacheIgnoredParamRow, CacheRuleRow, EndpointPolicyOverrideRow
 from roxy.rules.store import RulesSnapshot
 
 _FORWARDABLE_ACCEPT = frozenset({"application/json", "*/*"})
@@ -64,7 +64,7 @@ class FakeResult:
     cacheable: bool = True
     negative_ttl_s: int | None = None
     private: bool = False
-    """The upstream fetched it with the credential under a `cache_private` allowlist row (or none): plan 6.9."""
+    """The upstream fetched it with the credential under a `cache_private` grant (or none): plan 6.9."""
 
 
 def ok(body: bytes | str = b"{}", *, status: int = 200, **fields: Any) -> FakeResult:
@@ -217,24 +217,22 @@ class StaticRules:
 def rules_snapshot(
     *,
     cache_rules: Iterable[Mapping[str, Any]] = (),
-    credential_allowlist: Iterable[Mapping[str, Any]] = (),
+    policy_overrides: Iterable[Mapping[str, Any]] = (),
     ignored_params: Iterable[str] = (),
     version: int = 1,
 ) -> RulesSnapshot:
-    """Build a snapshot from plain dicts (ids are assigned in order when missing)."""
+    """Build a snapshot from plain dicts (ids are assigned in order when missing). `policy_overrides` are endpoint
+    policy override rows (`endpoint_id`, `verdict`, optional `cache_private`) on top of the shipped seed."""
     cache = [
         CacheRuleRow.model_validate({"id": index, "type": "glob", **row}) for index, row in enumerate(cache_rules, 1)
     ]
-    credential = [
-        CredentialAllowlistRow.model_validate({"id": index, "type": "glob", **row})
-        for index, row in enumerate(credential_allowlist, 1)
-    ]
+    overrides = [EndpointPolicyOverrideRow.model_validate(dict(row)) for row in policy_overrides]
     ignored = [CacheIgnoredParamRow(name=name) for name in ignored_params]
     return RulesSnapshot(
         version=version,
         loaded_at=0.0,
         cache_rules=tuple(cache),
-        credential_allowlist=tuple(credential),
+        policy_overrides=tuple(overrides),
         cache_ignored_param_rows=tuple(ignored),
     )
 

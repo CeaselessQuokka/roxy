@@ -881,7 +881,7 @@ _RULES: tuple[InsightRuleSpec, ...] = (
     InsightRuleSpec(
         rule_id="CRED-UNUSED",
         family="credential",
-        title="An endpoint on the credential allowlist works just as well without it",
+        title="An endpoint sent with Roxy's account works just as well without it",
         params=(
             ParamSpec(
                 name="min_comparisons",
@@ -1498,8 +1498,8 @@ PARAM_DEFINITIONS: dict[str, str] = {
         "provider's dashboard, in percent of the provider's figure."
     ),
     "CRED-UNUSED.min_comparisons": (
-        "How many times one allowlisted endpoint must have been answered both anonymously and with the account, "
-        "for comparison, before the rule judges whether it needs the account."
+        "How many times one endpoint sent with the account must have been answered both anonymously and with "
+        "the account, for comparison, before the rule judges whether it needs the account."
     ),
     "CRED-UNUSED.identical_pct": (
         "The share of those comparisons in which the anonymous answer had the same body as the account's; at or "

@@ -17,7 +17,10 @@ Along the way Roxy:
 
 - keeps copies of popular answers (a cache), so many requests are answered instantly without asking Roblox again;
 - shares Roblox's rate limits fairly between every game that uses it, with a limit for each IP address;
-- refuses requests that carry login cookies or tokens, because Roxy only handles public data.
+- signs requests with Roxy's own Roblox account, so endpoints that only answer signed-in users (followers
+  lists, some catalog and badge reads) work without you sending anything;
+- blocks endpoints that act on an account or read its private data, and refuses requests that carry your own
+  login cookie or API key (chapter 9).
 
 Roxy is free and needs no account and no API key.
 
@@ -608,8 +611,8 @@ game.
 | Code | Meaning | What to do |
 |---|---|---|
 | 200 to 299 | Success (from Roblox or cache) | Use the body |
-| 400 | Bad request, or you sent authentication (not allowed) | Fix the request; never send cookies or tokens |
-| 403 | Endpoint blocked by Roxy (`Roxy-Blocked`) or Roblox refused | Do not retry; check the message |
+| 400 | Bad request, or you sent your own login cookie or API key | Fix the request; never send cookies or keys |
+| 403 | Endpoint blocked by Roxy (`Roxy-Blocked: policy` for an account endpoint, `True` for one the admin blocked), or Roblox refused | Do not retry; check the message |
 | 404 | Not found at Roblox, or not a supported Roblox URL | Check the URL format |
 | 413, 431 | Request too large | Send smaller bodies or fewer headers |
 | 414 | URL too long (chapter 2 gives the limit) | Send fewer ids per request, or use a POST batch endpoint |
@@ -634,18 +637,36 @@ body and the `Roxy-Upstream-Status` header.
 - Batch requests: one request for 50 ids instead of 50 requests.
 - {{ retry_tip }}
 - Add random jitter to retries, so your servers do not all retry at the same moment.
-- Never send cookies, tokens or passwords. Roxy refuses them, and no proxy should ever see them.
+- Never send cookies, API keys, tokens or passwords. Roxy refuses them, and no proxy should ever see them.
 - Let Roblox identify your experience: Roblox adds the `Roblox-Id` header to game server requests on its own;
   do not remove it.
 - {{ status_tip }}
 
 ## 9. What Roxy will not do
 
-- **No authenticated requests on your behalf.** Roxy never sends anyone's login cookie for you, and it refuses
-  requests that carry one (`400`).
-- **No writes that need login**, such as changing a group or buying an item.
+- **Never your account.** Roxy signs requests with its own Roblox account, never with yours. A request that
+  carries your `.ROBLOSECURITY` cookie, an Open Cloud API key or any other sign-in (`Authorization`,
+  `X-Api-Key`) is refused (`400`), and Roxy does not keep the value. If you sent a real cookie by mistake, sign
+  out of all sessions on roblox.com to make it useless.
+- **Nothing that acts on an account.** Buying, trading, messaging, following, joining groups, changing settings,
+  signing in or out, and every other endpoint that acts on the signed-in account or reads its private data is
+  blocked (see below).
 - **No hosts other than Roblox.** Roxy is not a general web proxy.
 - {{ cors_rule_item }}
+
+### Blocked endpoints
+
+Roxy keeps a reviewed list of every endpoint in Roblox's web API reference, and blocks the ones that would let a
+caller use Roxy's account against itself: sign-in and security (login, logout, two-step verification, sessions),
+the account's private data (email, phone, inbox, notifications, Robux, trades, settings), anything that changes the
+account or spends Robux, group and creator administration, ads, and Open Cloud routes that need an API key. A
+blocked endpoint answers `403` with the header `Roxy-Blocked: policy` and a short message, and nothing reaches
+Roblox. Do not retry it: it will not start working.
+
+Everything else, which covers the public reads games use (users, groups, games, catalog, thumbnails, badges,
+inventory of public users, presence, friends and followers lists), works as usual. A few public endpoints whose
+answers would describe Roxy's own account (ownership flags, "has voted") are sent without the account, which
+gives you the same answer anyone would get.
 
 ## 10. Privacy
 
@@ -700,7 +721,8 @@ It came from Roxy's cache (`Roxy-Cache: HIT` or `STALE`). See chapter 5 for how 
 
 ### Can Roxy use my account?
 
-No. Roxy only handles public data and refuses any request that carries a login cookie or token.
+No. Roxy uses its own account, never yours, and refuses any request that carries a login cookie, API key or
+token. It cannot act on any account: endpoints that would are blocked.
 
 ### Can I get a higher limit?
 

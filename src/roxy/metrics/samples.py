@@ -55,6 +55,7 @@ LIMIT_STREAM_ORDER: Final[tuple[str, ...]] = (
     "not_roblox",
     "host_not_allowed",
     "auth_smuggling",
+    "endpoint_policy",
     "header_rule",
     "endpoint_blocked",
     "endpoint_rule",

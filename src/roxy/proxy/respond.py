@@ -88,7 +88,11 @@ UPSTREAM_FAILED_TEXT = DEADLINE_BODY  # "Upstream request failed; please try aga
 INTERNAL_ERROR_TEXT = INTERNAL_ERROR_BODY  # "Internal Server Error"
 INVALID_URL_TEXT = "Invalid URL"
 NOT_ROBLOX_TEXT = "Not a Roblox URL"
-AUTH_SMUGGLING_TEXT = "Requests requiring authentication are not allowed with this proxy."
+AUTH_SMUGGLING_TEXT = (
+    "Roxy refused this request because it carried a Roblox login cookie or API key. Never send yours: Roxy uses "
+    "its own account. If that was your real .ROBLOSECURITY cookie, sign out of all sessions on roblox.com to "
+    "invalidate it. Roxy did not store it."
+)
 
 # --- media types ----------------------------------------------------------------------------------------------------
 

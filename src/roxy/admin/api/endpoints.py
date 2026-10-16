@@ -8,8 +8,8 @@ What this is
     * `GET /endpoints/detail?template=...`: the drill-down of one template: totals with deltas, requests by
       outcome and latency over time, its Roblox 429s, who calls it (places and hashed clients over the range,
       addresses and places in the last 15 minutes), the concrete paths behind the template, its most recent
-      requests, and every rule that applies to it (blocks, rate rules, cache rule, routing, credential allowlist,
-      ignored paths, upstream bucket overrides).
+      requests, and every rule that applies to it (blocks, rate rules, cache rule, routing, the endpoint policy's
+      grant of Roxy's account under the old key `credential_allowlist`, ignored paths, upstream bucket overrides).
     * `GET /endpoints/recent?template=...`: just the recent requests (the drill-down's refresh).
 
 Why it exists
@@ -37,7 +37,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, is_dataclass, replace
 from typing import Annotated, Any, Final
 
 from fastapi import Depends, Query, Request
@@ -330,10 +330,15 @@ def _host_of(template: str) -> str:
 
 
 def _row_dict(row: Any) -> dict[str, Any] | None:
+    """A rule row as a dict: a pydantic row, a dataclass (the endpoint policy's `CredentialGrant`) or a mapping."""
     if row is None:
         return None
     dump = getattr(row, "model_dump", None)
-    return dict(dump()) if callable(dump) else dict(row)
+    if callable(dump):
+        return dict(dump())
+    if is_dataclass(row) and not isinstance(row, type):
+        return asdict(row)
+    return dict(row)
 
 
 def applicable_rules(snapshot: Any, template: str, concrete: list[str]) -> dict[str, Any]:

@@ -337,6 +337,11 @@ MAX_UPSTREAM_LIMITS: Final[int] = 2500
 # Reason: the credential is used by as few endpoints as possible (D1: none by default); 50 entries is far more than
 # any real need. The `credential_allowlist` table is the only allowlist (no setting, spec review 3).
 MAX_CREDENTIAL_ALLOWLIST_RULES: Final[int] = 50
+# Reason: one override per Roblox operation at most (the seed lists about 1,000) plus operations Roblox does not
+# document that an admin reviewed; looked up in a dictionary, so the size costs nothing per request.
+MAX_ENDPOINT_POLICY_OVERRIDES: Final[int] = 2000
+# Reason: one row per category of `roxy/policy/seed.py CATEGORIES` (15 today), with room for new ones.
+MAX_ENDPOINT_POLICY_CATEGORIES: Final[int] = 50
 # Reason: matched on every request, and v1 had two entries. The `ignored_paths` table is the only list (no
 # setting, spec review 4).
 MAX_IGNORED_PATHS: Final[int] = 100
@@ -405,6 +410,8 @@ __all__ = [
     "MAX_CREDENTIAL_ALLOWLIST_RULES",
     "MAX_DENY_ENTRIES",
     "MAX_ENDPOINT_BLOCKS",
+    "MAX_ENDPOINT_POLICY_CATEGORIES",
+    "MAX_ENDPOINT_POLICY_OVERRIDES",
     "MAX_ENDPOINT_RECENT_BODY",
     "MAX_ENDPOINT_RECENT_REQUESTS",
     "MAX_ENDPOINT_RULES",

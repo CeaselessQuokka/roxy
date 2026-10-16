@@ -1,35 +1,35 @@
-# CRED-UNUSED fires for a credential allowlist entry whose endpoint answers identically without the credential
-# (format: tests/fixtures/insights/README.md).
+# CRED-UNUSED fires for an operation the endpoint policy sends with Roxy's account when that operation answers
+# identically without the account (format: tests/fixtures/insights/README.md).
 #
-# 11.5 row: "Anonymous calls to the same template succeed with same body"; evidence "Comparison"; change "Remove
-# from credential allowlist"; confidence Medium. Thresholds: insight_cred_unused_min_comparisons 20,
+# 11.5 row: "Anonymous calls to the same template succeed with same body"; evidence "Comparison"; confidence
+# Medium. Owner decision D1 (revised 2026-10-16) replaced the credential allowlist with the endpoint policy
+# (src/roxy/policy/endpoint_policy_seed.json), so the change is now a manual step on the Endpoint policy page:
+# set the operation to 'Sent without an account'. Thresholds: insight_cred_unused_min_comparisons 20,
 # _identical_pct 100.
 #
 # Comparisons are side-by-side answers to the same request on both paths (state.x_credential_comparisons, see the
 # README extensions; 11.5 does not say where they come from or over what window, so all of them fall in the last
 # 40 minutes, inside any window a rule could choose).
 #
-#   allowlist row                                         comparisons  identical  anonymous answer
-#   1  games.roblox.com/v1/games/*/favorites/count                 40   40 (100%)  200, same body      -> remove
-#   2  economy.roblox.com/v1/users/*/currency                      30    0 (0%)    401 (needs login)   -> keep
+#   operation (seed verdict)                                           comparisons  identical  anonymous answer
+#   games:GET:/v1/games/{universeId}/favorites/count (ALLOW_TOKEN)              40  40 (100%)  200, same body  -> fire
+#   badges:GET:/v1/users/{userId}/badges (ALLOW_TOKEN, sign-in needed)          30   0 (0%)    401             -> keep
+#   economy.roblox.com/v1/users/{userId}/currency (BLOCK)                       30  30 (100%)  200, same body  -> none
 #
-# Removing an allowlist entry lowers account risk (fewer calls carry the credential); the currency endpoint
-# really needs the credential and must stay.
+# Sending an operation without the account lowers account risk (fewer calls carry the credential). The badges
+# operation really needs the account and must stay. The economy host is blocked by the policy, so Roxy never
+# sends it with the account: its comparisons (left over from before the policy) must not produce anything.
 
 format: roxy.insight_fixture/1
 rule: CRED-UNUSED
 case: fires
 description: >
-  The favorites count endpoint is on the credential allowlist, but in 40 of 40 comparisons the anonymous path
-  returned the same body. The rule must propose removing that allowlist row only, and keep the currency row, whose
-  anonymous answers are 401.
+  The endpoint policy sends the game favorites count with Roxy's account, but in 40 of 40 comparisons the
+  anonymous path returned the same body. The rule must propose sending that operation without the account (a
+  manual change on Endpoint policy) and nothing for the badges operation, whose anonymous answers are 401, or for
+  the blocked currency operation, which never carries the account.
 now: "2026-10-07T15:00:00Z"
 seed_defaults: false
-
-tables:
-  credential_allowlist:
-    - {id: 1, pattern: "games.roblox.com/v1/games/*/favorites/count", type: glob, methods: "GET", cache_private: 1, identical_anonymous: 0, note: "Added during an anonymous outage.", created_at: "-30d", created_by: admin}
-    - {id: 2, pattern: "economy.roblox.com/v1/users/*/currency", type: glob, methods: "GET", cache_private: 1, identical_anonymous: 0, note: "Owner's own balance widget.", created_at: "-30d", created_by: admin}
 
 traffic_defaults:
   user_agent: "Roblox/Linux"
@@ -40,9 +40,9 @@ profiles:
   cred_miss: {auth_class: cred, egress: credential, outcome: served_upstream, reason: upstream_ok, status: 200, source: relay, cache_state: "MISS", latency_ms: {p50: 160, p95: 420, p99: 800}, bytes: {caller_in: 0, caller_out: 300, upstream_in: 420, upstream_out: 650}}
 
 traffic:
-  # Both rows are cache_private, so every caller request is its own credential call (6.9).
+  # Every caller request here is its own credential call (cache misses).
   - {name: favorites_cred, profile: cred_miss, endpoint_template: "games.roblox.com/v1/games/{universeId}/favorites/count", window: ["-60m", "0m"], per_minute: 16}
-  - {name: currency_cred, profile: cred_miss, endpoint_template: "economy.roblox.com/v1/users/{userId}/currency", window: ["-60m", "0m"], per_minute: 2}
+  - {name: badges_cred, profile: cred_miss, endpoint_template: "badges.roblox.com/v1/users/{userId}/badges", window: ["-60m", "0m"], per_minute: 2}
 
 state:
   credential:
@@ -53,7 +53,8 @@ state:
     account_id: "1000001"
   x_credential_comparisons:
     - {window: ["-40m", "0m"], per_minute: 1, endpoint_template: "games.roblox.com/v1/games/{universeId}/favorites/count", method: GET, anon_status: 200, cred_status: 200, identical: true}
-    - {window: ["-30m", "0m"], per_minute: 1, endpoint_template: "economy.roblox.com/v1/users/{userId}/currency", method: GET, anon_status: 401, cred_status: 200, identical: false}
+    - {window: ["-30m", "0m"], per_minute: 1, endpoint_template: "badges.roblox.com/v1/users/{userId}/badges", method: GET, anon_status: 401, cred_status: 200, identical: false}
+    - {window: ["-30m", "0m"], per_minute: 1, endpoint_template: "economy.roblox.com/v1/users/{userId}/currency", method: GET, anon_status: 200, cred_status: 200, identical: true}
 
 expect:
   data_checks:
@@ -70,13 +71,13 @@ expect:
       severity: any
       family: credential
       confidence: medium
-      change_kinds_required: [credential_allowlist_remove]
+      change_kinds_required: [manual]
       change_kinds_forbidden: [ban_add, filter_add, bypass_add, tarpit_category, host_add, bucket_override, routing_rule, ignored_param_add]
       changes_required:
-        - kind: credential_allowlist_remove
-          match: {pattern: {matches_targets: ["games.roblox.com/v1/games/1000000801/favorites/count"]}}
+        - {kind: manual, text: {contains: "set games:GET:/v1/games/{universeId}/favorites/count to 'Sent without an account'"}}
       changes_forbidden:
-        - {kind: credential_allowlist_remove, match: {pattern: {matches_targets: ["economy.roblox.com/v1/users/1000000001/currency"]}}}
+        - {kind: manual, text: {contains: "badges:GET:/v1/users/{userId}/badges"}}
+        - {kind: manual, text: {contains: "currency"}}
         - {kind: setting, key: {in: [credential_enabled, credential_bucket_per_min, credential_probe_interval_min]}}
 
 variants:
@@ -85,11 +86,11 @@ variants:
     settings: {insight_cred_unused_enabled: 0}
     expect: {fires: false}
   - case: min_comparisons_41
-    description: 41 comparisons needed; the favorites row has 40.
+    description: 41 comparisons needed; the favorites operation has 40.
     settings: {insight_cred_unused_min_comparisons: 41}
     expect: {fires: false}
   - case: identical_pct_50
-    description: Even a 50% identical requirement leaves the currency row alone (0 of 30 identical).
+    description: Even a 50% identical requirement leaves the badges operation alone (0 of 30 identical).
     settings: {insight_cred_unused_identical_pct: 50}
     expect:
       fires: true

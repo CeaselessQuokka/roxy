@@ -1,0 +1,34 @@
+{#-
+  Endpoint policy page, card `unknown` (`roxy/admin/pages/policy.py unknown_card`), from
+  `GET /admin/api/v1/policy/unknown` over the page's time range (the same function): operations callers asked for
+  that Roblox's reference does not list, as `unknown:<METHOD>:<template>`, with the verdict Roxy gave them, the
+  verdict they have now, the requests and the last one. "Set verdict" opens `/admin/policy/unknown-row?id=` in the
+  drawer. The endpoint is built from the caller's path: caller text. Context: `frame`, `table`, `rows`, `range`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num, caller_text %}
+{% from "components/pieces.html" import when %}
+{% from "admin/pages/policy/_table.html" import policy_table %}
+{% call page_card(frame, flush=True, subtitle=range.description) %}
+<div class="g3-pad"><p class="muted g3-note">Writes Roblox does not document are blocked. Reads are sent without Roxy's account, unless the path looks like an account endpoint (it holds words such as login, settings or robux), which blocks them. Review each one and give it a verdict.</p></div>
+<div class="g3-table-host" hx-select="#{{ table.id }}">
+{% call(row) policy_table(table, rows) %}
+{%- if row is none -%}
+<th scope="col" data-col="action"><span class="th-label">Verdict now</span></th>
+{%- else -%}
+{%- for c in table.columns -%}
+<td data-col="{{ c.key }}" data-label="{{ c.label }}" class="{% if c.num %}num{% endif %}"{% if c.key_col or loop.first %} data-key{% endif %}{% if c.hidden %} hidden{% endif %}>
+  {%- if c.key == "endpoint_id" -%}<span class="mono">{{ caller_text(row.endpoint_id, 300) }}</span>
+  {%- elif c.key == "verdict" -%}{% if row.given %}<span class="tone tone--{{ row.given.tone }}">{{ row.given.text }}</span>{% else %}<span class="muted">n/a</span>{% endif %}
+  {%- elif c.key == "count" -%}{{ num(row.count) }}
+  {%- elif c.key == "last_ms" -%}{{ when(row.when) }}
+  {%- endif -%}
+</td>
+{%- endfor -%}
+<td data-col="action" data-label="Verdict now">{% if row.now %}<span class="tone tone--{{ row.now.tone }}">{{ row.now.text }}</span>{% if row.changed %}<span class="dt__sub">Your override</span>{% endif %}{% endif %}
+  {% if row.drawer %}<button type="button" class="btn btn--sm" data-drawer-src="{{ row.drawer }}" data-drawer-title="Unknown endpoint" data-action="policy-unknown-set">{{ icon("sliders") }}<span>Set verdict</span></button>{% endif %}</td>
+{%- endif -%}
+{% endcall %}
+</div>
+{% endcall %}

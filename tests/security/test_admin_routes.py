@@ -9,7 +9,8 @@ What this is
       * signed in with a second factor older than `admin_reauth_window_s`: every sensitive route answers 403 with
         `Roxy-Reauth: required` and the section 13 code `reauth_required`, including the routes that ask for the
         fresh factor only for their sensitive variant (a health run with the credential check, the full LLM export,
-        applying a recommendation that touches the admin's security).
+        applying a recommendation that touches the admin's security, loosening the endpoint policy); tightening
+        the endpoint policy works with that stale factor.
     The intentional exceptions are listed by name, each with its reason: the login steps, the kill-switch link,
     `/csp-report`, the enrollment routes a bootstrap session may use, the development-only component gallery and
     the admin catch-all. A new route that is not guarded, or a new fresh-MFA route, fails a test until it is
@@ -98,8 +99,6 @@ SENSITIVE: dict[tuple[str, str], str] = {
     ("DELETE", f"{API}/credential/ui-value"): "Delete the credential's dashboard value (C1 account switch).",
     ("POST", f"{API}/credential/confirm-account"): "Confirm an account switch (C1).",
     ("POST", f"{API}/credential/check"): "Spends a call on the Roblox account (13.3).",
-    ("POST", f"{API}/credential-allowlist"): "Widens what the credential is used for (D1, C1).",
-    ("PATCH", f"{API}/credential-allowlist/{{row_id}}"): "Changes what the credential is used for (D1, C1).",
     ("PUT", f"{API}/rotator/url"): "Replace the rotator URL (plan 9.6).",
     ("DELETE", f"{API}/rotator/url"): "Revert the rotator URL (plan 9.6).",
     ("POST", f"{API}/egress/{{name}}/enable"): "Re-enable an egress the leak guard switched off (C2).",
@@ -107,7 +106,11 @@ SENSITIVE: dict[tuple[str, str], str] = {
     ("DELETE", f"{API}/protection/access/allow_admin/{{entry_id}}"): "The admin network allowlist (D6).",
     ("POST", f"{API}/protection/spam/arm"): "Arms the spam auto-ban after the collateral preview (plan 10.3).",
 }
-"""Routes guarded by `require_admin("fresh_mfa")` itself, each with its reason."""
+"""Routes guarded by `require_admin("fresh_mfa")` itself, each with its reason. The endpoint policy routes are not
+here: they ask for the fresh factor inside the handler, for loosening only (D1 revised), and are checked with the
+conditional routes in `test_sensitive_routes_answer_reauth_required_without_a_fresh_second_factor`."""
+
+POLICY = f"{API}/policy"
 
 TASK_SENSITIVE: frozenset[tuple[str, str]] = frozenset(
     {
@@ -384,6 +387,43 @@ async def _security_recommendation(site: Site) -> tuple[str, str]:
     return rec.id, changes_digest(rec.changes)
 
 
+POLICY_TIGHTENING: list[tuple[str, str, dict[str, Any]]] = [
+    ("PUT", f"{POLICY}/endpoints", {"endpoint_id": "games:GET:/v1/games", "verdict": "BLOCK", "reason": "r"}),
+    ("PUT", f"{POLICY}/categories/ads", {"state": "block_all", "reason": "r"}),
+]
+"""Endpoint policy changes that send less to Roblox: allowed with a stale second factor."""
+
+POLICY_LOOSENING: list[tuple[str, str, dict[str, Any], str]] = [
+    (
+        "PUT",
+        f"{POLICY}/endpoints",
+        {"json": {"endpoint_id": "users:GET:/v1/display-names/validate", "verdict": "ALLOW_TOKEN", "reason": "r"}},
+        "endpoint policy: ALLOW_ANON to ALLOW_TOKEN",
+    ),
+    (
+        "PUT",
+        f"{POLICY}/endpoints",
+        {"json": {"endpoint_id": "economy:GET:/v1/user/currency", "verdict": "ALLOW_ANON", "reason": "r"}},
+        "endpoint policy: BLOCK to ALLOW_ANON",
+    ),
+    (
+        "PUT",
+        f"{POLICY}/endpoints",
+        {"json": {"endpoint_ids": ["economy:GET:/v1/user/currency"], "verdict": "ALLOW_TOKEN", "reason": "r"}},
+        "endpoint policy: bulk BLOCK to ALLOW_TOKEN",
+    ),
+    (
+        "DELETE",
+        f"{POLICY}/endpoints",
+        {"json": {"endpoint_id": "games:GET:/v1/games", "reason": "r"}},
+        "endpoint policy: reset a BLOCK override on an ALLOW_TOKEN row",
+    ),
+    ("PUT", f"{POLICY}/categories/ads", {"json": {"state": "defaults", "reason": "r"}}, "category: block_all off"),
+    ("POST", f"{POLICY}/reset", {"json": {"reason": "r"}}, "endpoint policy: reset everything"),
+]
+"""Endpoint policy changes that send more to Roblox, or send Roxy's account where it was not sent (D1 revised)."""
+
+
 async def test_sensitive_routes_answer_reauth_required_without_a_fresh_second_factor(site: Site) -> None:
     harness = site.harness
     rec_id, digest = await _security_recommendation(site)
@@ -399,9 +439,14 @@ async def test_sensitive_routes_answer_reauth_required_without_a_fresh_second_fa
         ),
         ("PUT", f"{API}/settings/admin_allowlist_enabled", {"json": {"value": 1}}, "admin allowlist switch"),
         ("PUT", f"{API}/settings/credential_enabled", {"json": {"value": 0}}, "credential setting"),
+        *POLICY_LOOSENING,
     ]
     token = await harness.csrf()
     site.make_mfa_stale()
+    # Tightening the endpoint policy needs no fresh factor (D1 revised); undoing it below is loosening and does.
+    for method, path, body in POLICY_TIGHTENING:
+        response = await site.send(harness.http, method, path, csrf=token, json=body)
+        assert response.status_code == 200, (method, path, response.status_code, response.text[:200])
     failures: list[str] = []
     requests: list[tuple[str, str, dict[str, Any], str]] = [
         (method, concrete(path), {}, path) for method, path in SENSITIVE

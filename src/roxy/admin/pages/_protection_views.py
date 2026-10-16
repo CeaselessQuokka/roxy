@@ -49,6 +49,7 @@ REASON_LABELS: Final[dict[str, str]] = {
     "not_roblox": "Not a Roblox URL",
     "host_not_allowed": "Host not allowed",
     "auth_smuggling": "Sent a credential (auth smuggling)",
+    "endpoint_policy": "Blocked by the endpoint policy",
     "header_rule": "Request filter",
     "endpoint_blocked": "Endpoint block",
     "endpoint_rule": "Endpoint rule",
@@ -118,6 +119,7 @@ CHECK_ELSEWHERE: Final[dict[str, tuple[str, str]]] = {
     "unsafe_url": ("Security > Probes", "/admin/security#probes"),
     "not_roblox": ("Security > Probes", "/admin/security#probes"),
     "auth_smuggling": ("Security > Probes", "/admin/security#probes"),
+    "endpoint_policy": ("Endpoint policy", "/admin/policy"),
 }
 
 KIND_LABELS: Final[dict[str, str]] = {

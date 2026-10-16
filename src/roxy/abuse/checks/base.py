@@ -107,6 +107,7 @@ class Facts:
     score_cache: int | None = None
     pairs_cache: list[tuple[str, str]] | None = None
     matches: dict[str, str] = field(default_factory=dict)  # control.db table -> the row this request matched
+    policy: Any = None  # the endpoint policy's decision (`roxy/policy/engine.py PolicyDecision`), once checked
 
     def note_match(self, table: str, row_id: Any, *, decisive: bool = False) -> None:
         """A rule row of `table` matched this request (module docstring, "Rule hits"). Memory only, no I/O.

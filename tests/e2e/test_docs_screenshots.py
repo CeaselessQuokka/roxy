@@ -1,7 +1,7 @@
 """The documentation screenshots of every dashboard page (`docs/screenshots/`), taken from the seeded dashboard.
 
 What this is
-    One browser test per dashboard page of the registry (`roxy.admin.pages.registry.PAGES`, 18 pages): the page opens
+    One browser test per dashboard page of the registry (`roxy.admin.pages.registry.PAGES`, 19 pages): the page opens
     in the dark theme at 1440x900 on the seeded dashboard (`dashboard`, tests/e2e/conftest.py: the real app, traffic
     sent through the real proxy, audit rows, a recommendation and a health run), every lazy card loads, every chart
     finishes, and a full-page screenshot is written. Overview and Protection are taken in the light theme too. With

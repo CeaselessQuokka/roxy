@@ -63,9 +63,9 @@ def _other_site_keys(key: str) -> tuple[str, ...]:
 # --- v1 home page text, C5-checked (plan 16.1 says where each lands on the v2 `/` page) ---------------------
 
 _WHITE_HATS_DEFAULT = (
-    "Roxy is built for public, unauthenticated Roblox web API calls only; it does not support requests that "
-    "require you to be logged in, and it will refuse any request that carries anything that looks like a real "
-    "Roblox .ROBLOSECURITY session cookie.\n\n"
+    "You never need to log in to use Roxy: it signs requests with its own Roblox account, so you never send yours. "
+    "Endpoints that act on an account or read its private data are blocked, and Roxy refuses any request that "
+    "carries anything that looks like a Roblox .ROBLOSECURITY cookie or an Open Cloud API key.\n\n"
     "Never send your ROBLOSECURITY token to Roxy, or to any third-party proxy. Sharing it lets someone log in as "
     "you and take your account, Robux, and items; no exceptions, no matter how trustworthy a service looks or "
     "claims to be. Even a secure, open-source server can't prove what's actually running on it. The only safe "
@@ -358,16 +358,17 @@ SETTINGS: list[SettingSpec] = [
         default=_WHITE_HATS_DEFAULT,
         max_length=_SITE_TEXT_MAX,
         description=(
-            "The 'No login required' section of the home page: it explains that Roxy only handles public requests "
-            "and warns visitors never to send their .ROBLOSECURITY cookie to Roxy or any other proxy."
+            "The 'No login required' section of the home page: it explains that Roxy signs requests with its own "
+            "account and blocks account endpoints, and warns visitors never to send their .ROBLOSECURITY cookie to "
+            "Roxy or any other proxy."
         ),
         pages=_PUBLIC_SITE,
         risk=Risk.LOW,
         apply=Apply.LIVE,
         related_settings=_other_site_keys("site_white_hats_text"),
         notes=(
-            "v1 section 'No Login Required & White Hats', first half; confirmed by the owner on 2026-10-14 (B15). "
-            + _SITE_FORMAT_NOTE
+            "v1 section 'No Login Required & White Hats', first half; confirmed by the owner on 2026-10-14 (B15); "
+            "the first paragraph changed with D1 revised on 2026-10-16. " + _SITE_FORMAT_NOTE
         ),
     ),
     SettingSpec(

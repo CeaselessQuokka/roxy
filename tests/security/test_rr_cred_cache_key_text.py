@@ -5,9 +5,9 @@ What this is
     A variant of finding F4 ("credential piece in labels", fixed by scrubbing every caller-supplied label with
     `redact_label`). The F4 probe's injections all go out on an anonymous egress, where the leak guard refuses
     them before anything is fetched, so nothing is ever cached. The credential client has no guard (by design: it
-    carries the cookie), so the same injection on an allowlisted endpoint whose row is shared (`cache_private=0`)
-    is fetched, and its cache key (`GET economy.roblox.com/v1/user/currency?k=<piece> @cred`) is written to
-    cache.db's `entries.key` column verbatim: key text is never scrubbed.
+    carries the cookie), so the same injection on an ALLOW_TOKEN endpoint whose grant is shared (`cache_private`
+    off, as every shipped row is) was fetched, and its cache key (`GET games.roblox.com/v1/games?k=<piece> @cred`)
+    was written to cache.db's `entries.key` column verbatim: key text is never scrubbed.
 
 Why it exists
     Plan 9.15 and 19.7 ("inject secrets into requests and assert logs, captures, exports are clean"), and the F4 probe
@@ -16,11 +16,13 @@ Why it exists
     Roblox next to the cookie, where the anonymous path would have refused it as a leak.
 
 How it works
-    `confinement_harness.running_app` runs the real app; the credential is activated by Roxy's own probe and one
-    shared allowlist row is added. The caller sends a 40 character run of the credential's secret part as a query
-    value, the cache settles (answers come before the cache.db write), and every SQLite file is scanned with
-    `leak_scan`. Fixed in the review round: the credential path refuses the piece before the cookie is attached;
-    the control request shows the row is otherwise fetched with the cookie and stored.
+    `confinement_harness.running_app` runs the real app; the credential is activated by Roxy's own probe, and the
+    shipped endpoint policy grants it to `games GET /v1/games` (D1 revised). The caller sends a 40 character run of the
+    credential's secret part as a query value, the cache settles (answers come before the cache.db write), and every
+    SQLite file is scanned with `leak_scan`. Fixed in the review round: the credential path refuses the piece before the
+    cookie is attached; the control request shows the endpoint is otherwise fetched with the cookie and stored. The
+    piece request is not sent anonymously either (this endpoint may fall back to anonymous when the account is busy,
+    never when the request itself is refused).
 
 What to read next
     `src/roxy/cache/keys.py` (`build_key`), `src/roxy/cache/service.py` (`_absorb`, `_finish`),
@@ -39,29 +41,30 @@ from confinement_harness import leak_scan, running_app, secret_part
 from roxy.core.reasons import Egress
 from roxy.core.redact import TOKEN_PREFIX
 
-ECONOMY = "economy.roblox.com"
-CURRENCY = "/v1/user/currency"
+GAMES = "games.roblox.com"
+ENDPOINT = "/v1/games"
 
 
 async def test_credential_piece_on_the_credential_path_never_reaches_cache_db(
     env: Any, credentials_dir: Path, fake_secrets: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Fixed in the review round: `CredentialManager.authorize` runs the leak guard's inspection before the cookie
-    is attached, so the request carrying the piece is refused as auth smuggling (400): nothing goes to Roblox next
-    to the cookie, nothing is cached, and no egress is tripped. A clean request to the same row is still fetched
-    with the cookie and stored, so the probe is not vacuous."""
+    is attached, so the request carrying the piece is refused as auth smuggling (400): nothing goes to Roblox,
+    with the cookie or without, nothing is cached, and no egress is tripped. A clean request to the same endpoint
+    is still fetched with the cookie and stored, so the probe is not vacuous."""
     piece = secret_part(fake_secrets["roblox_credential"])[30:70]
     async with running_app(env, credentials_dir, fake_secrets, monkeypatch) as run:
         await run.activate_credential()
-        await run.rule("credential_allowlist", {"pattern": f"{ECONOMY}{CURRENCY}", "cache_private": False})
         run.clock.advance(5)
-        refused = await run.get(f"/{ECONOMY}{CURRENCY}", params={"k": piece})
+        refused = await run.get(f"/{GAMES}{ENDPOINT}", params={"k": piece})
         run.clock.advance(5)
-        control = await run.get(f"/{ECONOMY}{CURRENCY}", params={"k": "plain"})
+        control = await run.get(f"/{GAMES}{ENDPOINT}", params={"k": "plain"})
         await run.ctx.cache.settle()
         assert (refused.status_code, refused.headers.get("Roxy-Refusal")) == (400, "auth_smuggling")
-        sent = [r.path for r in run.cookie_requests() if r.path.startswith(CURRENCY)]
-        assert sent == [f"{CURRENCY}?k=plain"]  # only the clean request went out with the cookie
+        sent = [r.path for r in run.cookie_requests() if r.path.startswith(ENDPOINT)]
+        assert sent == [f"{ENDPOINT}?k=plain"]  # only the clean request went out with the cookie
+        reached = [r.path for r in run.mock_requests() if r.path.startswith(ENDPOINT)]
+        assert reached == [f"{ENDPOINT}?k=plain"]  # and the piece went nowhere, not even anonymously
         assert not run.ctx.egress.tripped(Egress.DIRECT)
         assert not run.ctx.egress.tripped(Egress.ROTATOR)
         assert control.status_code == 200

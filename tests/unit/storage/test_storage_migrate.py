@@ -450,7 +450,7 @@ def test_migrate_is_idempotent_and_records_versions(env) -> None:
         second = migrate_all(dbs)
         assert all(ran == [] for ran in second.values())
         rows = dbs.control.read_sync(lambda c: c.execute("SELECT version, name FROM schema_version").fetchall())
-        assert [tuple(r) for r in rows] == [(1, "initial")]
+        assert [tuple(r) for r in rows] == [(1, "initial"), (2, "endpoint_policy")]
         metrics_rows = dbs.metrics.read_sync(lambda c: c.execute("SELECT version, name FROM schema_version").fetchall())
         assert [tuple(r) for r in metrics_rows] == [
             (1, "initial"),
@@ -558,7 +558,7 @@ def test_auto_migrate_only_in_development(tmp_path: Path) -> None:
         assert auto_migrate(prod_dbs, production) is False
         assert not (tmp_path / "p" / "control.db").exists()
         assert auto_migrate(dev_dbs, development) is True
-        assert check_schema(dev_dbs)["control"] == 1
+        assert check_schema(dev_dbs)["control"] == 2
     finally:
         prod_dbs.close_all_sync()
         dev_dbs.close_all_sync()

@@ -1,5 +1,5 @@
-"""The Credential page API and the credential allowlist, in the real app (plan C1, C2, D1, 6.9, 9.13, 13.3, parity rows
-25 to 27).
+"""The Credential page API in the real app (plan C1, C2, D1, 6.9, 9.13, 13.3, parity rows 25 to 27). Which caller
+requests carry the credential is the endpoint policy's (`tests/integration/admin_api/test_api_policy.py`).
 
 Roblox's `users/authenticated` probe is played by `respx` and answers a different account id for each cookie, so the
 account fingerprint comparison of plan C1 is real. Every test that handles a credential value also checks that
@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import secrets
-import time
 from typing import Any
 
 import httpx
@@ -88,9 +87,7 @@ def test_leak_scan_finds_every_window_and_ignores_public_text() -> None:
 # ================================================================================================= guards
 
 
-@pytest.mark.parametrize(
-    "path", ["credential", "credential/probes", "credential/budget", "credential-allowlist", "credential-allowlist/1"]
-)
+@pytest.mark.parametrize("path", ["credential", "credential/probes", "credential/budget"])
 async def test_every_credential_read_needs_a_session(anon_api: Any, path: str) -> None:
     response = await anon_api.get(path)
     assert response.status_code == 401, (path, response.text)
@@ -103,9 +100,6 @@ async def test_every_credential_read_needs_a_session(anon_api: Any, path: str) -
         ("POST", "credential/replace"),
         ("DELETE", "credential/ui-value"),
         ("POST", "credential/confirm-account"),
-        ("POST", "credential-allowlist"),
-        ("PATCH", "credential-allowlist/1"),
-        ("DELETE", "credential-allowlist/1"),
     ],
 )
 async def test_every_credential_write_needs_the_csrf_header(api: Any, method: str, path: str) -> None:
@@ -150,7 +144,7 @@ async def test_status_check_probes_and_budget(
     assert budget["probe_bucket"]["key"] == "egress:credential:probe"
     assert budget["probe_bucket"]["per_min"] == api_app.ctx.settings.get("credential_probe_reserved_per_min")
     assert budget["last_hour"]["probe_calls"] == 1
-    assert budget["last_hour"]["caller_calls"] == 0  # D1: the allowlist is empty
+    assert budget["last_hour"]["caller_calls"] == 0  # no caller request went out with the account here
     assert "50 to 60" in budget["expected"]
     _no_leaks(api, api_app, caplog, {"bootstrap": bootstrap})
 
@@ -247,110 +241,3 @@ async def test_replace_and_return_to_the_bootstrap_account_with_typed_confirmati
     (confirm_row,) = _audit(api_app, "credential.confirm_account")
     assert json.loads(confirm_row["after_json"]) == {"account_id_fingerprint": deleted["account"]["probed"]}
     _no_leaks(api, api_app, caplog, {"bootstrap": bootstrap, "new value": new_value})
-
-
-# ================================================================================================ allowlist
-
-
-async def test_allowlist_requires_the_cache_private_choice_and_grants_exactly(
-    api_app: Any, api: Any, api_json: Any, section13: Any
-) -> None:
-    base = {"pattern": "economy.roblox.com/v1/user/currency", "reason": "currency for the shop"}
-    fields = section13(await api.post("credential-allowlist", json=base), 422, "validation_failed")
-    assert "cache_private" in fields  # required, no default (plan 9.13)
-    section13(await api.post("credential-allowlist", json=base | {"cache_private": "yes"}), 422, "validation_failed")
-    section13(
-        await api.post("credential-allowlist", json=base | {"cache_private": True, "methods": ["POST"]}),
-        422,
-        "validation_failed",
-    )
-    section13(
-        await api.post("credential-allowlist", json=base | {"cache_private": True, "reason": ""}),
-        422,
-        "validation_failed",
-    )
-    evidence = await api.post("credential-allowlist", json=base | {"cache_private": True, "identical_anonymous": True})
-    section13(evidence, 422, "evidence_required")
-    api.make_mfa_stale()
-    section13(await api.post("credential-allowlist", json=base | {"cache_private": True}), 403, "reauth_required")
-    await api.fresh_mfa()
-
-    created = await api.post("credential-allowlist", json=base | {"cache_private": True, "methods": ["HEAD", "GET"]})
-    assert created.status_code == 201, created.text
-    row = created.json()["item"]
-    assert (row["pattern"], row["methods"], row["cache_private"], row["identical_anonymous"]) == (
-        base["pattern"],
-        ["GET", "HEAD"],
-        True,
-        False,
-    )
-    assert "Owner decision D1" in created.json()["help"]["d1"]
-    section13(await api.post("credential-allowlist", json=base | {"cache_private": False}), 409, "conflict")
-
-    granted = api_json(await api.get("credential-allowlist/test", params={"target": base["pattern"]}))
-    assert (granted["granted"], granted["cache_private"], granted["rule"]["id"]) == (True, True, row["id"])
-    below = api_json(await api.get("credential-allowlist/test", params={"target": base["pattern"] + "/more"}))
-    assert below["granted"] is False  # exact grants: no implicit subpaths (CHANGES.md, finding F3)
-    post = api_json(await api.get("credential-allowlist/test", params={"target": base["pattern"], "method": "POST"}))
-    assert post["granted"] is False
-
-    listed = api_json(await api.get("credential-allowlist"))
-    assert listed["total"] == 1
-    assert "never stored" in listed["help"]["cache_private"]
-    (audit_row,) = _audit(api_app, "rule.create")
-    assert audit_row["target"] == f"credential_allowlist:{row['id']}"
-    assert audit_row["reason"] == "currency for the shop"
-
-
-async def test_identical_anonymous_needs_cred_unused_evidence(
-    api_app: Any, api: Any, api_json: Any, section13: Any
-) -> None:
-    pattern = "economy.roblox.com/v1/user/currency"
-    created = await api.post(
-        "credential-allowlist", json={"pattern": pattern, "cache_private": False, "reason": "shop"}
-    )
-    row_id = created.json()["item"]["id"]
-    path = f"credential-allowlist/{row_id}"
-    section13(await api.patch(path, json={"identical_anonymous": True, "reason": "same"}), 422, "evidence_required")
-    unknown = await api.patch(path, json={"identical_anonymous": True, "recommendation_id": "rec_NONE", "reason": "x"})
-    section13(unknown, 422, "evidence_required")
-    section13(
-        await api.patch(path, json={"note": "n", "recommendation_id": "rec_X", "reason": "x"}), 422, "validation_failed"
-    )
-    section13(await api.patch(path, json={"note": "n"}), 422, "validation_failed")  # the reason is required
-
-    now = int(time.time())
-    payload = {
-        "rule_id": "CRED-UNUSED",
-        "changes": [{"kind": "credential_allowlist_remove", "table": "credential_allowlist", "match": {"id": row_id}}],
-        "evidence": {"sample_size": 25, "metrics": [{"name": "identical_pct", "value": 100, "unit": "percent"}]},
-    }
-    for rec_id, state in (("rec_DISMISSED", "dismissed"), ("rec_OPEN", "open")):
-        await api_app.ctx.dbs.metrics.write(
-            lambda conn, rec_id=rec_id, state=state: conn.execute(
-                "INSERT INTO recommendations (id, rule_id, fingerprint, state, severity, payload_json, created_at, "
-                "updated_at) VALUES (?, 'CRED-UNUSED', 'fp', ?, 'warn', ?, ?, ?)",
-                (rec_id, state, json.dumps(payload), now, now),
-            )
-        )
-    dismissed = await api.patch(
-        path, json={"identical_anonymous": True, "recommendation_id": "rec_DISMISSED", "reason": "same"}
-    )
-    section13(dismissed, 422, "evidence_required")
-    patched = api_json(
-        await api.patch(
-            path, json={"identical_anonymous": True, "recommendation_id": "rec_OPEN", "reason": "same body"}
-        )
-    )
-    assert patched["item"]["identical_anonymous"] is True
-    (update,) = _audit(api_app, "rule.update")
-    assert update["reason"] == "same body [CRED-UNUSED evidence rec_OPEN, 25 samples]"
-    cleared = api_json(await api.patch(path, json={"identical_anonymous": False, "reason": "not any more"}))
-    assert cleared["item"]["identical_anonymous"] is False
-
-    # Removing a row narrows what the account is used for: the session is enough, even with a stale factor.
-    api.make_mfa_stale()
-    deleted = api_json(await api.delete(path, json={"reason": "not needed"}))
-    assert deleted["deleted"]["id"] == row_id
-    section13(await api.get(path), 404, "not_found")
-    assert api_app.ctx.rules.snapshot.credential_rule_for(pattern, "GET") is None

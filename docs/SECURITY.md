@@ -138,8 +138,11 @@ each holds even if another fails (`src/roxy/egress/clients.py`):
    `roxy.egress.clients.CredentialClient` (no proxy, the cookie per request) and
    `roxy.egress.clients.RotatorClient` (through the proxy, no cookie). Only `src/roxy/egress/credential.py` reads
    the secret, and only `roxy.egress.credential.CredentialManager.authorize` attaches it, after checking that the
-   target is https on an allowed Roblox host, the method is GET or HEAD, and the endpoint is on the credential
-   allowlist (empty by default, owner decision D1).
+   target is https on an allowed Roblox host and the method is GET, HEAD or POST. Which caller requests may carry it
+   is decided by the endpoint policy (owner decision D1, revised 2026-10-16): only operations with an ALLOW_TOKEN
+   verdict (`roxy.policy.engine.EndpointPolicy.credential_grant`); every operation that acts on an account, reads
+   its private data or touches sign-in flows is refused before Roblox (`roxy.abuse.checks.endpoint_policy`), and no
+   override can put the credential on a PUT, PATCH or DELETE. See [The endpoint policy](#the-endpoint-policy).
 2. **No environment proxies.** Every client is built with `trust_env=False`, so `HTTPS_PROXY`, `ALL_PROXY` and
    `.netrc` are ignored, and every TLS context has key logging off (`roxy.egress.metering.tls_context`), so
    `SSLKEYLOGFILE` cannot record session keys.
@@ -150,7 +153,7 @@ each holds even if another fails (`src/roxy/egress/clients.py`):
    are refused at ingress (auth smuggling, 400) and never switch an egress off.
 6. **Cookie jars that refuse cookies** (`roxy.egress.guard.NoStoreCookieJar`) on every client.
 7. **Redirects are followed by hand,** at most three, each hop validated again; the cookie is checked again for every
-   hop and never follows a redirect off the allowlist.
+   hop and never follows a redirect to a hop without its own grant (and never after a POST).
 8. **Noisy HTTP libraries are pinned to WARNING** (`roxy.core.logging.configure_logging`), so DEBUG logging never
    prints request headers, and the redaction filter runs on the root handler.
 
@@ -163,7 +166,7 @@ Tests (plan 19.5, all must pass):
 `tests/security/test_credential_suite.py::test_clients_ignore_env_proxies`,
 `tests/security/test_credential_suite.py::test_end_to_end_recording_proxy`,
 `tests/security/test_credential_suite.py::test_credential_path_has_no_proxy`,
-`tests/unit/upstream/test_upstream_routing.py::test_routing_never_selects_credential_for_non_allowlisted`,
+`tests/unit/upstream/test_upstream_routing.py::test_routing_never_selects_credential_without_grant`,
 `tests/security/test_credential_suite.py::test_only_credential_module_reads_secret`,
 `tests/integration/test_cache_workers.py::test_cred_response_never_served_to_other_auth_class`,
 `tests/security/test_credential_suite.py::test_secret_replace_leaves_no_trace`,
@@ -171,7 +174,32 @@ Tests (plan 19.5, all must pass):
 `tests/security/test_rr_cred_tls_keylog.py::test_credential_client_never_logs_tls_keys_from_the_environment`.
 
 A credential answer is also kept apart in the cache: credential keys end in ` @cred`, so they never share an id
-with an anonymous key, and an allowlist row marked `cache_private` is never stored, coalesced or served stale.
+with an anonymous key, and an operation an admin marked `cache_private` is never stored, coalesced or served stale.
+
+### The endpoint policy
+
+Roxy sends its own Roblox account with caller requests (owner decision D1, revised 2026-10-16), so the one thing
+that must never happen is a caller using that account against itself. The endpoint policy
+(`src/roxy/policy/`, design in `docs/endpoint_policy/BRIEF.md`) ships a reviewed verdict for each of the 992
+operations in Roblox's web API reference: BLOCK (refused before Roblox), ALLOW_TOKEN (sent with the account) or
+ALLOW_ANON (sent, never with it). Rules that hold whatever an admin changes:
+
+- Sign-in, session, two-step, password, ticket and OAuth flows, the account's private data, writes acting as the
+  account, money, group and creator administration are BLOCK by default; loosening any of them needs a fresh second
+  factor and a reason, and a risk 4 one also needs its path typed (`roxy.admin.api.policy`).
+- Matching is the seed's own template index: letter case, a trailing slash and a `:verb` inside a segment cannot
+  move a request off its row, and a parameter segment matches any value so an odd id cannot escape a BLOCK row.
+  An operation Roblox does not document is BLOCK for every method but GET and HEAD, and BLOCK for a GET whose path
+  holds an account word (a "my" segment, logout, password and the like); other unknown reads go out without the
+  account.
+- `Set-Cookie` is never relayed and a rotated cookie is caught by `observe_set_cookie`, so even a session refresh
+  endpoint that slipped through could not hand a caller a new cookie.
+- A caller's own sign-in (`.ROBLOSECURITY` or `.RBXID`, the warning prefix anywhere, `Authorization`,
+  `Proxy-Authorization`, `X-Api-Key`, `X-Api-Token`, `Api-Key`, `X-Roblox-Token`) is refused with 400 and recorded
+  as an `auth_attempt` event with a keyed fingerprint of the value, never the value
+  (`roxy.metrics.recorder.MetricsRecorder.record_auth_attempt`).
+
+Tests: `tests/unit/policy/`, `tests/security/test_endpoint_policy_bypass.py`.
 
 ### C3. Feature parity
 
@@ -217,7 +245,7 @@ When shared state cannot be read or written (`roxy.storage.db.SharedStateUnavail
 
 | Area | Behavior | Code | Test |
 |---|---|---|---|
-| Credential | Not used; an allowlisted request gets 503 with `Retry-After` (it goes anonymous only when its allowlist row says `identical_anonymous`) | `roxy.egress.credential.CredentialManager.authorize` | `tests/unit/egress/test_egress_credential.py::test_unreadable_shared_state_means_no_credential`, `tests/security/test_confinement_routing.py::test_shared_state_unavailable_never_uses_the_credential` |
+| Credential | Not used; a request the policy sends with the account goes out anonymously when Roblox also answers it without a sign-in, else gets 503 with `Retry-After` | `roxy.egress.credential.CredentialManager.authorize` | `tests/unit/egress/test_egress_credential.py::test_unreadable_shared_state_means_no_credential`, `tests/security/test_confinement_routing.py::test_shared_state_unavailable_never_uses_the_credential` |
 | Tarpit | Never holds; the refusal is instant | `roxy.abuse.tarpit.Tarpit.plan` | `tests/unit/abuse/test_abuse_tarpit.py::test_fails_closed_without_shared_state` |
 | Per-IP limit | Each worker enforces `limit // workers` in memory, merged back into hot.db later | `src/roxy/abuse/pipeline.py`, `roxy.abuse.limiter.degraded_limit` | `tests/integration/test_review_c7_failure_modes.py::test_review_readonly_hot_per_ip_limit_is_limit_over_workers`, `tests/multiprocess/test_rr_mp_degraded.py::test_rr_mp_leaving_degraded_mode_never_refills_the_allowance` |
 | Admin login | Refused with 503 and a clear message, never a 500 and never a session from a failed step | `roxy.admin.auth.flow.UNAVAILABLE_TEXT`, `src/roxy/admin/auth/deps.py` | `tests/security/test_auth_c7_unavailable.py::test_login_answers_503_within_one_busy_timeout_while_hot_db_is_locked`, `tests/security/test_auth_c7_unavailable.py::test_second_factor_step_answers_503_while_control_db_is_locked`, `tests/security/test_auth_c7_unavailable.py::test_no_login_step_ever_answers_500_when_a_database_refuses` |
@@ -347,7 +375,7 @@ covers your own address needs an explicit confirmation.
   `admin_session_max_age_s` (12 hours). Polling, the live stream and an unattended tab do not count as use; the
   dashboard's heartbeat counts only when there was keyboard or pointer input.
 - Sensitive actions need a second factor entered within `admin_reauth_window_s` (600 s): replacing or checking the
-  credential, changing the credential allowlist, replacing the rotator URL, re-enabling an egress after a leak guard
+  credential, loosening the endpoint policy, replacing the rotator URL, re-enabling an egress after a leak guard
   trip, managing passkeys and recovery codes, the admin allowlist, arming the spam auto-ban, the factory reset, the
   full LLM export, and a health run that spends a credential call. The list is pinned by
   `tests/security/test_admin_routes.py::test_fresh_mfa_routes_are_exactly_the_documented_sensitive_ones`.

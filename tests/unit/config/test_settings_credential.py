@@ -34,6 +34,12 @@ EXPECTED_DEFAULTS: dict[str, Any] = {
     "credential_probe_url": "https://users.roblox.com/v1/users/authenticated",
     "credential_probe_reserved_per_min": 2,
     "credential_cooldown_default_s": 60,
+    "endpoint_policy_enforce": 1,
+    "endpoint_policy_block_status": "403",
+    "endpoint_policy_block_message": (
+        "Roxy does not forward this Roblox endpoint because it acts on a signed-in account or returns private "
+        "account data. See the Roxy guide for the list of blocked endpoints."
+    ),
 }
 
 # (min, max) from the plan table.
@@ -47,6 +53,7 @@ EXPECTED_RANGES: dict[str, tuple[float, float]] = {
 
 # DESIGN.md section 9: the only anchors a `pages` entry may use.
 KNOWN_ANCHORS = {
+    "policy#summary",
     "topbar#pause",
     "topbar#throttle-all",
     "user-menu#preferences",
@@ -214,8 +221,9 @@ def test_required_text_present(spec: SettingSpec) -> None:
 def test_pages_are_known_anchors(spec: SettingSpec) -> None:
     for page in spec.pages:
         assert page in KNOWN_ANCHORS or page.startswith("recommendations#rule-"), page
-    # Plan 15.6: every credential_* key lives on the Credential page.
-    assert any(page.startswith("credential#") for page in spec.pages)
+    # Plan 15.6: every credential_* key lives on the Credential page; the endpoint_policy_* keys on their own page.
+    home = "policy#" if spec.key.startswith("endpoint_policy_") else "credential#"
+    assert any(page.startswith(home) for page in spec.pages)
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=lambda s: s.key)

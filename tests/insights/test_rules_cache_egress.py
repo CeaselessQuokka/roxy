@@ -44,6 +44,7 @@ from roxy.insights import providers_rules_cache_egress as extra
 from roxy.insights.models import Recommendation
 from roxy.insights.rules import load_rules
 from roxy.insights.rules.cache import is_id_name, looks_like_buster
+from roxy.rules.store import build_rules_snapshot
 
 PREFIXES = (
     "cache_low_hit__",
@@ -336,10 +337,37 @@ async def test_comparison_events_count_for_cred_unused(fresh: list[LoadedFixture
     detail = {"endpoint_template": template, "method": "GET", "anon_status": 200, "cred_status": 200, "identical": True}
     _event(state, state.now - 60, extra.COMPARISON_EVENT, None, detail)
     recs = await _evaluate(state)
-    assert [r.subject for r in recs] == ["games.roblox.com/v1/games/*/favorites/count"]
+    assert [r.subject for r in recs] == [template]  # the seed row's template of the ALLOW_TOKEN operation
     assert recs[0].evidence.metric("comparisons") == 20
-    assert recs[0].change_kinds == ("credential_allowlist_remove",)
-    assert recs[0].changes[0].table == "credential_allowlist"  # what the allowlist API's evidence check reads
+    assert recs[0].change_kinds == ("manual",)  # D1 revised: the admin changes the endpoint policy by hand
+    assert "set games:GET:/v1/games/{universeId}/favorites/count to" in str(recs[0].changes[0].text)
+    assert recs[0].evidence.details["policy_row"]["anonymous_fallback"] is True  # no sign-in needed in the seed
+
+
+async def test_cred_unused_keeps_admin_granted_unknown_operations_apart(fresh: list[LoadedFixture]) -> None:
+    state = await _load(fresh, "cred_unused__below_thresholds")
+    # Two operations the seed does not list, both set to ALLOW_TOKEN by an admin. Their grants share id 0, so the
+    # rule must group comparisons by the operation: one answers the same anonymously, the other does not.
+    same, differs = "games.roblox.com/v9/fixture-same", "games.roblox.com/v9/fixture-differs"
+    policy = state.engine.rules_source.endpoint_policy
+    ids = {target: policy.decide_target(target, "GET").endpoint_id for target in (same, differs)}
+    state.dbs.control.write_sync(
+        lambda conn: conn.executemany(
+            "INSERT INTO endpoint_policy_override (endpoint_id, verdict, created_at, created_by) "
+            "VALUES (?, 'ALLOW_TOKEN', ?, 'fixture')",
+            [(endpoint_id, int(state.now)) for endpoint_id in ids.values()],
+        )
+    )
+    state.engine.rules_source = state.dbs.control.read_sync(lambda conn: build_rules_snapshot(conn, state.now))
+    for n in range(20):
+        for target, identical in ((same, True), (differs, False)):
+            detail = {"endpoint_template": target, "method": "GET", "anon_status": 200 if identical else 401,
+                      "cred_status": 200, "identical": identical}  # fmt: skip
+            _event(state, state.now - 60 - n, extra.COMPARISON_EVENT, None, detail)
+    recs = await _evaluate(state)
+    assert len(recs) == 1
+    assert f"set {ids[same]} to" in str(recs[0].changes[0].text)
+    assert recs[0].evidence.metric("comparisons") == 20
 
 
 async def test_host_add_reads_the_host_from_the_refusal_path(fresh: list[LoadedFixture]) -> None:

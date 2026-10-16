@@ -1,15 +1,16 @@
-# CRED-UNUSED stays quiet when each allowlist row misses one threshold by a little
+# CRED-UNUSED stays quiet when each operation sent with the account misses one threshold by a little
 # (format: tests/fixtures/insights/README.md).
 #
 # 11.5 row: "Anonymous calls to the same template succeed with same body" (insight_cred_unused_min_comparisons
-# 20, _identical_pct 100).
+# 20, _identical_pct 100). Both operations are ALLOW_TOKEN in the endpoint policy seed
+# (src/roxy/policy/endpoint_policy_seed.json), so Roxy sends them with its account.
 #
-#   allowlist row                                    comparisons  identical      misses
-#   1  games.roblox.com/v1/games/*/favorites/count            19   19 (100%)      comparisons (>= 20)
-#   2  thumbnails.roblox.com/v1/assets                        25   24 (96%)       identical share (100%)
+#   operation (seed verdict ALLOW_TOKEN)               comparisons  identical      misses
+#   games:GET:/v1/games/{universeId}/favorites/count            19   19 (100%)      comparisons (>= 20)
+#   thumbnails:GET:/v1/assets                                   25   24 (96%)       identical share (100%)
 #
-# Row 2's one difference is a 200 on both paths with different bodies (the credential path returned a
-# signed-in-only thumbnail state), which is exactly why 100% is the default.
+# The thumbnails operation's one difference is a 200 on both paths with different bodies (the credential path
+# returned a signed-in-only thumbnail state), which is exactly why 100% is the default.
 # All comparisons fall in the last 25 minutes, so the counts are the same for any window of 25 minutes or more
 # (11.5 gives the row no window; see cred_unused__fires.yaml).
 
@@ -17,16 +18,11 @@ format: roxy.insight_fixture/1
 rule: CRED-UNUSED
 case: below_thresholds
 description: >
-  One allowlist row has only 19 identical comparisons (20 needed); the other has 25 comparisons with one
-  difference (96%, 100% needed). Nothing may fire at the defaults; each variant fires exactly the row next to the
-  threshold it moves.
+  One operation sent with the account has only 19 identical comparisons (20 needed); the other has 25
+  comparisons with one difference (96%, 100% needed). Nothing may fire at the defaults; each variant fires exactly
+  the operation next to the threshold it moves.
 now: "2026-10-07T15:00:00Z"
 seed_defaults: false
-
-tables:
-  credential_allowlist:
-    - {id: 1, pattern: "games.roblox.com/v1/games/*/favorites/count", type: glob, methods: "GET", cache_private: 1, identical_anonymous: 0, created_at: "-30d", created_by: admin}
-    - {id: 2, pattern: "thumbnails.roblox.com/v1/assets", type: glob, methods: "GET", cache_private: 1, identical_anonymous: 0, created_at: "-30d", created_by: admin}
 
 traffic_defaults:
   user_agent: "Roblox/Linux"
@@ -57,7 +53,7 @@ expect:
 
 variants:
   - case: min_comparisons_19
-    description: Nineteen comparisons are enough; the favorites row (19 of 19 identical) fires.
+    description: Nineteen comparisons are enough; the favorites operation (19 of 19 identical) fires.
     settings: {insight_cred_unused_min_comparisons: 19}
     expect:
       fires: true
@@ -66,9 +62,9 @@ variants:
         - subject_contains: "favorites/count"
           severity: any
           changes_required:
-            - {kind: credential_allowlist_remove, match: {pattern: {matches_targets: ["games.roblox.com/v1/games/1000000801/favorites/count"]}}}
+            - {kind: manual, text: {contains: "set games:GET:/v1/games/{universeId}/favorites/count to 'Sent without an account'"}}
   - case: identical_pct_96
-    description: 96% identical is enough; the assets row (24 of 25) fires.
+    description: 96% identical is enough; the thumbnails operation (24 of 25) fires.
     settings: {insight_cred_unused_identical_pct: 96}
     expect:
       fires: true
@@ -77,4 +73,4 @@ variants:
         - subject_contains: "thumbnails.roblox.com/v1/assets"
           severity: any
           changes_required:
-            - {kind: credential_allowlist_remove, match: {pattern: {matches_targets: ["thumbnails.roblox.com/v1/assets"]}}}
+            - {kind: manual, text: {contains: "set thumbnails:GET:/v1/assets to 'Sent without an account'"}}

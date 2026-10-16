@@ -20,7 +20,7 @@ Why it exists
          credential (and disables that egress fleet-wide) or a public auth marker (refused, egress stays on);
       5. every client's cookie jar refuses to store or send cookies, and its jar cannot be swapped;
       6. redirects are followed by hand, at most 3, each hop re-validated (https, allowed Roblox host); the
-         cookie is re-checked and re-attached per hop, so it can never follow a redirect off the allowlist;
+         cookie is re-checked and re-attached per hop, so it can never follow a redirect to a hop without a grant;
       7. `Set-Cookie` is stripped from every response; on the credential path a `.ROBLOSECURITY` one raises the
          "Roblox rotated the cookie" alert and is never stored.
 
@@ -108,6 +108,7 @@ from roxy.egress.models import (
 )
 from roxy.egress.rotator import STICKY_UNTIL_429, RotatorPool
 from roxy.egress.targets import UpstreamTestOverride, check_echo_target, check_roblox_target, endpoint_label
+from roxy.policy.engine import CREDENTIAL_METHODS as POLICY_CREDENTIAL_METHODS
 from roxy.storage.db import Databases, SharedStateUnavailable
 
 log = logging.getLogger("roxy.egress.clients")
@@ -133,7 +134,8 @@ DROPPED_RESPONSE_HEADERS = frozenset(
 )
 """Never returned: cookies (C2 item 7, 9.13), and framing headers that no longer describe the decoded body."""
 
-CREDENTIAL_METHODS = frozenset({"GET", "HEAD"})
+CREDENTIAL_METHODS = POLICY_CREDENTIAL_METHODS
+"""GET, HEAD and POST: the endpoint policy grants POST only for the batch reads it marks ALLOW_TOKEN."""
 
 DISABLED_KEY_PREFIX = "egress_disabled:"
 """control.db `service_state` keys `egress_disabled:direct` and `egress_disabled:rotator`: a leak guard trip."""
@@ -798,8 +800,8 @@ class EgressClients:
         logical, is_roblox = self._check_target(egress, out.url, out.purpose)
         method = out.method.upper()
         if credential and method not in CREDENTIAL_METHODS:
-            # The allowlist table only admits GET and HEAD (D1, 9.13); a write never carries the account cookie.
-            raise TargetNotAllowed(egress, "the credential is used only for GET and HEAD")
+            # The endpoint policy grants the credential for GET, HEAD and POST reads only (D1 revised, 9.13).
+            raise TargetNotAllowed(egress, "the credential is used only for GET, HEAD and POST")
         content = out.content
         identity = session_id if egress is Egress.ROTATOR else out.identity
         headers = merge_outbound(self.headers.api_headers(egress, identity), out.headers)
@@ -885,7 +887,7 @@ class EgressClients:
             candidate = logical.join(location)
             next_url, is_roblox = self._check_target(egress, candidate, out.purpose)
         except (TargetNotAllowed, httpx.InvalidURL, ValueError):
-            # Not allowed: the 3xx itself is the answer. The cookie never follows a redirect off the allowlist.
+            # Not allowed: the 3xx itself is the answer. The cookie never follows a redirect to a hop without a grant.
             return None
         if not is_roblox:
             return None

@@ -7,19 +7,20 @@ What this is
 
 Why it exists
     v1 sent 75 % of all traffic with the operator's cookie to any Roblox URL with any verb (plan 2.4, critical),
-    picked a method at random, and fell through to the other method on failures. v2 rules (plan 7.2, D1, D13, C2):
-    the credential is used ONLY for an endpoint on the credential allowlist, only for GET or HEAD, and only while it
-    is active and not cooling down; everything else is anonymous, from the server IP (`direct`) by default, through
-    the rotator only when direct cannot serve or a routing rule prefers it. A property test
-    (`test_routing_never_selects_credential_for_non_allowlisted`, plan 19.5 item 6) checks the first rule over
-    random inputs.
+    picked a method at random, and fell through to the other method on failures. v2 rules (plan 7.2, D1 revised
+    2026-10-16, D13, C2): the credential is used ONLY for an endpoint the endpoint policy marks ALLOW_TOKEN
+    (`roxy/policy/engine.py`), only for GET, HEAD or POST, and only while it is active and not cooling down;
+    everything else is anonymous, from the server IP (`direct`) by default, through the rotator only when direct
+    cannot serve or a routing rule prefers it. A property test (`test_routing_never_selects_credential_without_grant`,
+    plan 19.5 item 6) checks the first rule over random inputs.
 
 How it works, in the order of plan 7.2
-    1. Credential: eligible when the request matched an allowlist row, the method is GET or HEAD, and the
-       credential is not excluded. If it is usable and its buckets can grant in time, use it. If not, an
-       allowlisted endpoint is NEVER sent anonymously instead (plan 6.9), unless the row says
-       `identical_anonymous=1`; the answer is `credential_unavailable` (503) or `upstream_busy` (429).
-       A non-allowlisted request never even considers the credential: it is not among the candidates.
+    1. Credential: eligible when the request has a credential grant (an ALLOW_TOKEN verdict), the method is one
+       of `CREDENTIAL_METHODS`, and the credential is not excluded. If it is usable and its buckets can grant in
+       time, use it. If not, the request goes out anonymously instead when the grant says `identical_anonymous`
+       (Roblox answers that endpoint without a sign-in too); a sign-in-only endpoint is never sent anonymously
+       (plan 6.9) and gets `credential_unavailable` (503) or `upstream_busy` (429). A request without a grant
+       never even considers the credential: it is not among the candidates.
     2. A routing rule (`prefer_direct`, `prefer_rotator`, `direct_only`, `rotator_only`) is honored within
        availability.
     3. An anonymous egress is available when it is enabled, has no active cooldown, its breaker admits a call, and
@@ -46,8 +47,8 @@ from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
 
 from roxy.core.reasons import AuthClass, Egress, ReasonCode
+from roxy.policy.engine import CREDENTIAL_METHODS
 
-CREDENTIAL_METHODS: Final = frozenset({"GET", "HEAD"})
 ANONYMOUS_EGRESSES: Final[tuple[Egress, ...]] = (Egress.DIRECT, Egress.ROTATOR)
 ROUTING_MODES: Final = frozenset({"prefer_direct", "prefer_rotator", "direct_only", "rotator_only"})
 
@@ -91,7 +92,7 @@ class EgressAvailability:
 
 @dataclass(frozen=True, slots=True)
 class CredentialRule:
-    """The parts of a `credential_allowlist` row that routing needs (see `rules/models.py`)."""
+    """The parts of a credential grant that routing needs (`roxy/policy/engine.py CredentialGrant`)."""
 
     rule_id: int
     cache_private: bool
@@ -107,7 +108,7 @@ class RouteRequest:
     """Everything about the request and the settings that routing needs."""
 
     method: str
-    credential_rule: CredentialRule | None = None  # the allowlist row the request matched (None: not allowlisted)
+    credential_rule: CredentialRule | None = None  # the request's credential grant (None: no ALLOW_TOKEN verdict)
     credential_usable: bool = False  # credential enabled, active, not cooling down (checked by the caller)
     credential_rejected: bool = False
     credential_cooldown_s: float = 0.0  # the credential manager's own cooldown (it may know one hot.db does not)
@@ -133,7 +134,7 @@ class RouteDecision:
 
 
 def credential_eligible(route: RouteRequest) -> bool:
-    """Plan 7.2 step 1: only an allowlisted endpoint, only GET or HEAD, only when not excluded."""
+    """Plan 7.2 step 1: only a granted endpoint, only `CREDENTIAL_METHODS`, only when not excluded."""
     return (
         route.credential_rule is not None
         and route.method.upper() in CREDENTIAL_METHODS
@@ -180,12 +181,12 @@ def _credential_decision(route: RouteRequest, state: EgressAvailability | None) 
     if usable and state is not None:
         blocked = state.blocked_by(route.max_wait_s)
         if blocked is None:
-            return RouteDecision(Egress.CREDENTIAL, (Egress.CREDENTIAL,), auth_class=AuthClass.CRED, note="allowlisted")
+            return RouteDecision(Egress.CREDENTIAL, (Egress.CREDENTIAL,), auth_class=AuthClass.CRED, note="granted")
     else:
         blocked = "unavailable"
     rule = route.credential_rule
     if rule is not None and rule.identical_anonymous:
-        return None  # CRED-UNUSED evidence: the anonymous answer is identical, so anonymous is allowed
+        return None  # Roblox answers this endpoint without a sign-in too: anonymous is allowed
     if blocked == "bucket" and state is not None:
         return RouteDecision(
             None, reason=ReasonCode.UPSTREAM_BUSY, retry_after_s=state.bucket_wait_s, note="credential bucket busy"
@@ -217,8 +218,8 @@ def decide(
     rule = route.credential_rule
     if rule is not None and route.method.upper() in CREDENTIAL_METHODS:
         if Egress.CREDENTIAL in route.exclude:
-            # The credential refused this request already (disabled, rejected, cooling down at send time). An
-            # allowlisted endpoint still never goes out anonymously instead (plan 6.9), unless identical_anonymous.
+            # The credential refused this request already (disabled, rejected, cooling down at send time). A
+            # sign-in-only endpoint still never goes out anonymously instead (plan 6.9), unless identical_anonymous.
             if not rule.identical_anonymous:
                 return RouteDecision(
                     None, reason=ReasonCode.CREDENTIAL_UNAVAILABLE, note="credential unavailable at send time"

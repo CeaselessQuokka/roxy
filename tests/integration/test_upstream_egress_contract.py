@@ -121,11 +121,13 @@ async def test_credential_probe_hook_is_paced_by_the_probe_bucket(wired: Any, mo
     assert mock.requests[-1].header("Cookie")  # the credential path attaches the cookie itself
 
 
-async def test_allowlisted_get_uses_the_credential_and_never_anonymous(wired: Any, mock: Any) -> None:
+async def test_granted_get_uses_the_credential_and_never_anonymous(wired: Any, mock: Any) -> None:
+    """A sign-in-only grant (no `identical_anonymous`, a test grant: the endpoint policy is not the subject here):
+    the credential, and no anonymous substitute when it is rejected."""
     mock.routes["/v1/users/authenticated"] = harness.MockResponse(body=json.dumps({"id": 42}).encode())
     manager = wired._ctx.egress.credential
     await manager.probe("admin_check", fetch=wired.credential_probe_fetch)
-    # Allowlist rows grant exactly what they name (finding F3): `/v1/users/1` needs the explicit wildcard.
+    # A grant covers exactly what it names (finding F3): the test grant names `/v1/users/<one segment>`.
     wired._ctx.rules.allow_credential("users.roblox.com/v1/users/*")
     mock.routes["/v1/users/1"] = harness.MockResponse(body=b'{"id":1}')
     result = await get(wired, host="users.roblox.com", path="/v1/users/1", query=[])
@@ -138,7 +140,7 @@ async def test_allowlisted_get_uses_the_credential_and_never_anonymous(wired: An
     assert len(mock.requests) == count  # no anonymous substitute
 
 
-async def test_non_allowlisted_never_carries_the_cookie(wired: Any, mock: Any) -> None:
+async def test_without_a_grant_never_carries_the_cookie(wired: Any, mock: Any) -> None:
     mock.routes["/v1/users/authenticated"] = harness.MockResponse(body=json.dumps({"id": 42}).encode())
     manager = wired._ctx.egress.credential
     await manager.probe("admin_check", fetch=wired.credential_probe_fetch)

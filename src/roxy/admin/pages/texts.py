@@ -167,6 +167,7 @@ CHECK_WORDS: Final[dict[str, str]] = {
     "unsafe_url": "unsafe URL refusals",
     "not_roblox": "the Roblox host check",
     "auth_smuggling": "credential smuggling refusals",
+    "endpoint_policy": "the endpoint policy",
     "header_rule": "request filters",
     "endpoint_blocked": "endpoint blocks",
     "endpoint_rule": "endpoint rules",

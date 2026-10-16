@@ -1,4 +1,4 @@
-"""The dashboard page registry: the 18 pages of plan 14.1, their cards, and the v1 section map they must cover.
+"""The dashboard page registry: the 19 pages (plan 14.1 plus Endpoint policy), their cards, and the v1 section map.
 
 What this is
     Pure data plus a few lookups, read by the sidebar, the phone menu, the command palette, the shortcut overlay,
@@ -460,6 +460,36 @@ _PAGES: Final[tuple[PageSpec, ...]] = (
         ),
     ),
     PageSpec(
+        id="policy",
+        title="Endpoint policy",
+        group="defense",
+        icon="filter",
+        about="Which Roblox endpoints callers may use, and with which account",
+        purpose="Decide which Roblox endpoints Roxy forwards, which of them carry Roxy's own Roblox account, and "
+        "which it refuses before Roblox.",
+        how_to_read=(
+            "Every Roblox endpoint in Roblox's own reference has one verdict: sent with Roxy's account, sent without "
+            "an account, or blocked (refused before Roblox, whatever the caller sends). Roxy ships a reviewed "
+            "default for each one, with a risk from 1 (harmless) to 4 (session, money or irreversible).",
+            "One verdict per request, first match wins: your override for that endpoint, then the switch of its "
+            "category, then the shipped default (\"Send without the account\" beats overrides too: it is the panic "
+            "switch). An endpoint Roblox does not document is blocked for writes and sent "
+            "without the account for reads, unless its path looks like an account endpoint.",
+            "Tightening (blocking, or sending without the account) takes effect at once. Loosening asks for a "
+            "current code from your authenticator app and a reason; loosening a risk 4 endpoint also asks you to "
+            "type its path. Every change is in the audit log and reaches every worker within a second.",
+        ),
+        cards=(
+            _c("summary", "Summary", "What the policy does now, what changed from its defaults, the last 24 hours."),
+            _c("categories", "Categories", "The switch of each group of endpoints: defaults, block all, no account."),
+            _c("endpoints", "Endpoints", "Every Roblox endpoint with its verdict, risk and links to Roblox's docs."),
+            _c("tester", "Tester", "Paste a URL to see the verdict Roxy gives it, step by step."),
+            _c("unknown", "Unknown endpoints seen", "Endpoints callers asked for that Roblox does not document."),
+            _c("attempts", "Caller sign-in attempts", "Callers who sent their own Roblox cookie, API key or token."),
+            _c("would-block", "Shadow mode", "What the policy would have refused while it was not enforced."),
+        ),
+    ),
+    PageSpec(
         id="health",
         title="Health",
         group="operate",
@@ -505,19 +535,18 @@ _PAGES: Final[tuple[PageSpec, ...]] = (
         title="Credential",
         group="operate",
         icon="key",
-        about="The one Roblox credential: status, budget and allowlist",
-        purpose="Check the one Roblox account Roxy may use, what it is used for, and replace it safely when needed.",
+        about="The one Roblox credential: status, budget and probes",
+        purpose="Check the one Roblox account Roxy may use, how hard it is used, and replace it safely when needed.",
         how_to_read=(
             "Roxy holds exactly one Roblox credential and never rotates or switches accounts on its own, because "
             "many accounts from one address look like account farming to Roblox.",
             "The status shows whether the credential works and when it was last checked; the value itself is "
-            "never shown, only its last characters. The allowlist names the only endpoints it may be used for.",
+            "never shown, only its last characters. Which endpoints send it is decided on the Endpoint policy page.",
         ),
         cards=(
             _c("status", "Status", "Whether the credential works, its masked value and its cooldowns."),
             _c("budget", "Budget", "Calls the credential may make per minute and the probes' share."),
             _c("probes", "Probes", "The latest checks of the credential."),
-            _c("allowlist", "Allowlist", "Endpoints the credential may be used for."),
             _c("replace", "Replace", "Replace the credential, or go back to the bootstrap value."),
         ),
     ),
@@ -996,9 +1025,10 @@ V1_SECTIONS: Final[tuple[V1Section, ...]] = (
         (
             V1Check("credential", "status"),
             V1Check("credential", "budget"),
-            V1Check("credential", "allowlist", _t("credential_allowlist")),
+            V1Check("policy", "endpoints", _t("endpoint_policy")),
         ),
-        "Correction: the three tiles lived in Service Health and Force revalidate in Tools.",
+        "Correction: the three tiles lived in Service Health and Force revalidate in Tools. Which endpoints use the "
+        "token is the Endpoint policy page since D1 was revised (2026-10-16).",
     ),
     V1Section(20, "Requests (per verb)", "traffic_verbs", (V1Check("traffic", "verbs", _t("traffic_verbs")),)),
     V1Section(

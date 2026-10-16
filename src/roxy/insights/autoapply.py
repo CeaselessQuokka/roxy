@@ -30,7 +30,7 @@ How it works (the guardrails, plan 11.4)
       `auto_apply_max_step_pct` percent per change; security, admin and credential settings are never touched.
       Numeric rule values (a bucket's rate, a cache rule's TTL) obey the same step limit against their current value;
       a NEW cache rule's TTL against the lifetime its endpoint has today (`in_force_values`).
-    - Never a ban of more than one address, never the credential allowlist, never a bypass entry, never the
+    - Never a ban of more than one address, never the endpoint policy, never a bypass entry, never the
       rotator quota.
     - Every apply starts a watch window of `auto_apply_watch_minutes` with a baseline of the same length before it;
       `watch()` compares error rate, Roblox 429 rate, p95 latency and refused rate after the change with that

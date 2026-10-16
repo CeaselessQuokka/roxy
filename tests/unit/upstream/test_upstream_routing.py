@@ -151,18 +151,25 @@ def test_direct_only_never_spills_to_rotator() -> None:
 # --- the credential (plan 7.2 step 1, D1, 6.9) -----------------------------------------------------------------------
 
 
-def test_allowlisted_get_uses_the_credential() -> None:
+def test_granted_get_uses_the_credential() -> None:
     decision = decide(RouteRequest(method="GET", credential_rule=RULE, credential_usable=True), ALL)
     assert decision.egress is Egress.CREDENTIAL
     assert decision.auth_class is AuthClass.CRED
     assert decision.candidates == (Egress.CREDENTIAL,)  # never an anonymous fallback candidate
 
 
-@pytest.mark.parametrize("method", ["POST", "PATCH", "PUT", "DELETE", "OPTIONS"])
-def test_allowlisted_write_never_uses_the_credential(method: str) -> None:
+@pytest.mark.parametrize("method", ["PATCH", "PUT", "DELETE", "OPTIONS"])
+def test_a_write_never_uses_the_credential(method: str) -> None:
     route = RouteRequest(method=method, credential_rule=RULE, credential_usable=True)
     assert credential_eligible(route) is False
     assert decide(route, ALL).egress is Egress.DIRECT
+
+
+def test_a_granted_post_batch_read_uses_the_credential() -> None:
+    # The endpoint policy grants POST only for batch reads it marks ALLOW_TOKEN (D1 revised, 2026-10-16).
+    route = RouteRequest(method="POST", credential_rule=RULE, credential_usable=True)
+    assert credential_eligible(route) is True
+    assert decide(route, ALL).egress is Egress.CREDENTIAL
 
 
 def test_unusable_credential_never_falls_back_anonymous() -> None:
@@ -220,7 +227,7 @@ availability = st.builds(
 
 @given(
     method=st.sampled_from(["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE", "get", "OPTIONS"]),
-    allowlisted=st.booleans(),
+    granted=st.booleans(),
     usable=st.booleans(),
     identical=st.booleans(),
     mode=st.sampled_from([None, "prefer_direct", "prefer_rotator", "direct_only", "rotator_only", "bogus"]),
@@ -230,9 +237,9 @@ availability = st.builds(
     seed=st.integers(0, 10_000),
 )
 @settings(max_examples=600, deadline=None)
-def test_routing_never_selects_credential_for_non_allowlisted(
+def test_routing_never_selects_credential_without_grant(
     method: str,
-    allowlisted: bool,
+    granted: bool,
     usable: bool,
     identical: bool,
     mode: str | None,
@@ -241,9 +248,10 @@ def test_routing_never_selects_credential_for_non_allowlisted(
     states: list[EgressAvailability],
     seed: int,
 ) -> None:
-    """Plan 19.5 item 6: whatever the states say, the credential is chosen only for an allowlisted GET or HEAD
-    while it is usable and not excluded; and an allowlisted endpoint never silently goes anonymous instead."""
-    rule = CredentialRule(1, cache_private=True, identical_anonymous=identical) if allowlisted else None
+    """Plan 19.5 item 6: whatever the states say, the credential is chosen only for a granted GET, HEAD or POST
+    (an ALLOW_TOKEN verdict of the endpoint policy) while it is usable and not excluded; and a sign-in-only endpoint
+    never silently goes anonymous instead."""
+    rule = CredentialRule(1, cache_private=True, identical_anonymous=identical) if granted else None
     route = RouteRequest(
         method=method,
         credential_rule=rule,
@@ -257,12 +265,12 @@ def test_routing_never_selects_credential_for_non_allowlisted(
     decision = decide(route, by_egress, random.Random(seed))
     chosen = [decision.egress, *decision.candidates]
     if Egress.CREDENTIAL in chosen:
-        assert allowlisted
-        assert method.upper() in ("GET", "HEAD")
+        assert granted
+        assert method.upper() in ("GET", "HEAD", "POST")
         assert usable
         assert Egress.CREDENTIAL not in exclude
         assert decision.candidates == (Egress.CREDENTIAL,)
-    if allowlisted and method.upper() in ("GET", "HEAD") and not identical:
+    if granted and method.upper() in ("GET", "HEAD", "POST") and not identical:
         assert decision.egress in (None, Egress.CREDENTIAL)  # no anonymous substitute (plan 6.9)
     for egress in decision.candidates:
         assert egress not in exclude

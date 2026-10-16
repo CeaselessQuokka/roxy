@@ -2,7 +2,7 @@
 
 What this is
     `router` (built on first access) holds, in order: the shared routes of `core.py` (`/admin/dashboard`, the shell's
-    `/admin/ui/*` endpoints), then the router of each of the 18 pages of `registry.PAGES` (`roxy.admin.pages.<id>`;
+    `/admin/ui/*` endpoints), then the router of each of the 19 pages of `registry.PAGES` (`roxy.admin.pages.<id>`;
     every page is built, and a missing page module fails the startup instead of hiding behind a placeholder). Its
     lifespan
     (`dashboard_lifespan`) loads `docs/glossary.yml` at startup (a missing glossary fails the worker's startup and

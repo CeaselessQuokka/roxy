@@ -12,7 +12,7 @@ What this is
     card's inline settings.
 
 Why it exists
-    Seven builders write eighteen pages in parallel. The kit makes the safe way the easy way: a card renders the
+    Seven builders write nineteen pages in parallel. The kit makes the safe way the easy way: a card renders the
     same template for the first paint and for every fragment (they cannot drift), every card gets its catalog
     settings and its help text from the registry, a card that fails shows an inline error instead of turning the
     page into a 500, the shell (top bar, banners, dialogs) is built once per page by `shell.build_shell`, and page

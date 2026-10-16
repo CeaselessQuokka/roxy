@@ -19,7 +19,8 @@ from roxy.core.reasons import (
 
 DESIGN_REFUSALS = (
     "paused, banned, deny_list, flood, spam, throttle_all, throttle, place_limit, user_agent_rule, ignored_path, "
-    "unsafe_url, not_roblox, host_not_allowed, auth_smuggling, header_rule, endpoint_blocked, endpoint_rule, "
+    "unsafe_url, not_roblox, host_not_allowed, auth_smuggling, endpoint_policy, header_rule, endpoint_blocked, "
+    "endpoint_rule, "
     "body_too_large, headers_too_large, url_too_long, method_not_allowed, challenge, bot_score"
 )
 DESIGN_FAILURES = (

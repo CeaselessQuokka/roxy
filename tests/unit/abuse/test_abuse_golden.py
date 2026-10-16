@@ -474,7 +474,11 @@ async def test_auth_smuggling(pipeline_with: Callable[..., AbusePipeline]) -> No
     req = FakeReq().with_headers([("User-Agent", "Roblox/Linux"), ("X-Roblox-Token", "")])
     refusal = await refuse(pipeline_with(), req)
     assert refusal.status == 400
-    assert refusal.encoded_body() == b'"Requests requiring authentication are not allowed with this proxy."\n'
+    assert refusal.encoded_body() == (
+        b'"Roxy refused this request because it carried a Roblox login cookie or API key. Never send yours: Roxy uses '
+        b"its own account. If that was your real .ROBLOSECURITY cookie, sign out of all sessions on roblox.com to "
+        b'invalidate it. Roxy did not store it."\n'
+    )
     assert refusal.detail == "X-Roblox-Token header"
     assert refusal.tarpit_category == "auth_attempt"
     assert refusal.headers["Roxy-Refusal"] == "auth_smuggling"

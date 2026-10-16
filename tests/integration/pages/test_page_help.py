@@ -279,7 +279,7 @@ async def test_every_chapter_of_the_guide_renders_as_its_own_page(page: Any) -> 
     """One page per `##` chapter: the shell, one h1, the chapter's own heading, unique ids, clean markup (no inline
     script or style: the CSP), the contents with this chapter's sections, and Previous and Next in the guide's order."""
     book = _book()
-    assert len(book.chapters) == 26
+    assert len(book.chapters) == 27
     for chapter in book.chapters:
         path = GUIDE if chapter.first else f"{GUIDE}/{chapter.slug}"
         response = await page.get(path)
@@ -305,7 +305,7 @@ async def test_every_chapter_of_the_guide_renders_as_its_own_page(page: Any) -> 
         title = doc.select_one("title").text()
         assert title.startswith(book.title if chapter.first else f"{chapter.title}: {book.title}"), title
         if not chapter.first:
-            assert f"Chapter {chapter.number} of 26" in doc.select_one(".page-header__purpose").text()
+            assert f"Chapter {chapter.number} of 27" in doc.select_one(".page-header__purpose").text()
 
 
 async def test_every_in_guide_link_lands_on_its_target(page: Any) -> None:

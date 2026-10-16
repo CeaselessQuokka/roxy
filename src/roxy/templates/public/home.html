@@ -173,10 +173,12 @@
 					<summary><h2 id="generalTipsHeader">General Tips (Highly Recommended Reading)</h2></summary>
 					<div class="card-body">
 						<p class="note">
-							Roxy is for <strong>public, unauthenticated</strong> Roblox web API calls only; it does not support
-							requests that need you to be logged in, and it will reject any request that looks like it carries a
-							Roblox <code>.ROBLOSECURITY</code> cookie. Never send your <code>ROBLOSECURITY</code> token to Roxy (or
-							to any third-party proxy). More info <a href="#tokenSafetyHeading">below</a> for why.
+							Roxy sends your request to Roblox signed in with <strong>Roxy's own Roblox account</strong>, so endpoints that
+							only answer signed-in users (like followers lists) work too. Endpoints that act on an account or read its
+							private data (buying, trading, messaging, settings, sign-in) are <a href="/docs#blocked-endpoints">blocked</a>
+							and answer <code>403</code>. Never send your own <code>.ROBLOSECURITY</code> cookie or Open Cloud API key to
+							Roxy (or to any third-party proxy); Roxy refuses any request that carries one. More info
+							<a href="#tokenSafetyHeading">below</a> for why.
 						</p>
 						<p>
 							It is highly encouraged to have caching on your end to make fewer requests, and also have instant
@@ -190,7 +192,7 @@
 							<li><code>Retry-After</code>: How many seconds to wait before trying again, on <code>429</code> and <code>503</code> answers.</li>
 							<li><code>Roxy-Cache</code>: Whether the answer came from Roxy's cache (<code>HIT</code>) or from Roblox (<code>MISS</code>).</li>
 							<li><code>Roxy-Paused</code>: Only present when the proxy is temporarily paused for maintenance.</li>
-							<li><code>Roxy-Blocked</code>: Only present when the endpoint you requested has been blocked by the admin.</li>
+							<li><code>Roxy-Blocked</code>: Only present when the endpoint you requested is blocked (<code>policy</code> for the built-in list of account endpoints, <code>True</code> for one the admin blocked).</li>
 							<li><code>Roxy-Endpoint-Limited</code>: Only present when a per-endpoint rate limit rejected your request.</li>
 						</ul>
 						<p>Every header is described in the <a href="/docs#6-response-headers-reference">guide</a>.</p>
@@ -203,12 +205,12 @@
 					<summary><h2 id="otherMethodsHeading">POST / PATCH / PUT / DELETE Requests</h2></summary>
 					<div class="card-body">
 						<p class="note">
-							Most (if not all) <code>POST</code>/<code>PATCH</code>/<code>PUT</code>/<code>DELETE</code> endpoints on
-							Roblox's API require you to be logged in. Roxy
-							<a href="#tokenSafetyHeading">does not support authenticated requests</a>, so these methods only work
-							against the small number of public, unauthenticated endpoints Roblox exposes, such as batch lookups. If
-							you need to write data as a specific account, you'll need to call Roblox directly with your own
-							authenticated client, and unfortunately that isn't something Roxy can do for you.
+							Most <code>POST</code>/<code>PATCH</code>/<code>PUT</code>/<code>DELETE</code> endpoints on Roblox's API
+							change something on an account (buy, trade, follow, post, save settings). Roxy never acts on an account,
+							so those are <a href="/docs#blocked-endpoints">blocked</a>. What works are the read-only ones that use
+							<code>POST</code> to send a list, such as batch lookups of users, presence, thumbnails and catalog items. If
+							you need to write data as a specific account, call Roblox directly with your own client; Roxy can't do
+							that for you.
 						</p>
 						<p>
 							The calling convention is the same as <code>GET</code>, with a different <code>Method</code> and a JSON

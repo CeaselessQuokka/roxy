@@ -46,6 +46,9 @@ PROBE = "probe"
 LOGIN = "login"
 CRAWL = "crawl"
 THROTTLED = "throttled"
+AUTH_ATTEMPT = "auth_attempt"
+"""A caller sent their own Roblox cookie, API key or sign-in token (D1 revised; Endpoint policy page). The detail
+names what was sent and where, and a keyed fingerprint of the value (never the value itself)."""
 SECURITY_TYPES: tuple[str, ...] = (PROBE, LOGIN, CRAWL, THROTTLED)
 
 CAP_SETTINGS: dict[str, str] = {
@@ -53,6 +56,7 @@ CAP_SETTINGS: dict[str, str] = {
     LOGIN: "max_login_records",
     CRAWL: "max_crawl_records",
     THROTTLED: "max_throttle_records",
+    AUTH_ATTEMPT: "max_exploit_records",
 }
 """Per-type row caps (plan 15.3 I: 5000 each by default, 0 keeps none)."""
 
@@ -121,6 +125,38 @@ def probe_detail(ip: str, reason: str, user_agent: str | None, path: str | None 
     if path:
         detail["path"] = redact_text(path.split("?", 1)[0])[:MAX_TARGET_CHARS]
     return redact_text(signature), detail
+
+
+def auth_attempt_detail(
+    ip: str,
+    *,
+    kind: str,
+    where: str,
+    name: str,
+    looks_real: bool,
+    fingerprint: str | None,
+    method: str,
+    endpoint_id: str,
+    user_agent: str | None,
+) -> tuple[str, dict[str, Any]]:
+    """`(signature, detail)` for a caller sign-in attempt. Never takes the value: only its keyed fingerprint.
+
+    The signature is Roxy's own words (`api_key in header`), never caller text, so a caller cannot mint summary rows
+    (v1 bug B19); the header, cookie or parameter name goes to the detail, cut to a token's characters.
+    """
+    safe_name = re.sub(r"[^a-z0-9._-]", "", (name or "").lower())[:64]
+    detail: dict[str, Any] = {
+        "ip": (ip or "unknown")[:64],
+        "kind": kind[:32],
+        "where": where[:16],
+        "name": safe_name,
+        "looks_real": bool(looks_real),
+        "fingerprint": fingerprint or "",
+        "method": method_class(method),
+        "endpoint": redact_text(endpoint_id)[:MAX_TARGET_CHARS],
+        "user_agent": (user_agent or "")[:MAX_UA_CHARS],
+    }
+    return f"{kind[:32]} in {where[:16]}", detail
 
 
 def login_detail(ip: str, successful: bool, username: str | None = None, method: str = "") -> dict[str, Any]:

@@ -1,0 +1,83 @@
+{#-
+  Endpoint policy page, card `endpoints` (`roxy/admin/pages/policy.py endpoints_card`): every Roblox operation in
+  Roblox's reference with its verdict, from `GET /admin/api/v1/policy/endpoints` (the same function). The page's main
+  table: search, filters (host, category, verdict, risk, method, Roblox sign-in, changed), sort and page live in the
+  address. Each row has two links that open Roblox's own documentation in a new tab (the feature page, when Roblox
+  has one, and the domain page), and opens its drawer (`/admin/policy/endpoint?id=`) to set a verdict.
+  Bulk actions: select rows, then "Block selected" (PUT with `endpoint_ids`, verdict BLOCK: tightening, the session
+  and CSRF are enough) or "Reset selected to default" (DELETE with `endpoint_ids`: when that loosens any of them,
+  the shared form handler asks for a code first). static/js/pages/policy.js copies the selected ids into the forms.
+  Context: `frame`, `table`, `rows`, `bulk_url`, `filtered`.
+-#}
+{% from "components/page_card.html" import page_card %}
+{% from "components/icon.html" import icon %}
+{% from "components/format.html" import num %}
+{% from "admin/pages/policy/_table.html" import policy_table %}
+
+{% macro tone(cell) -%}<span class="tone tone--{{ cell.tone }}">{{ cell.text }}</span>{%- endmacro %}
+
+{% macro doc_links(row) -%}
+<span class="policy-docs">
+  {%- if row.feature_doc %}<a class="link" href="{{ row.feature_doc }}" target="_blank" rel="noopener noreferrer">Roblox feature docs{{ icon("external") }}<span class="sr-only"> (opens in a new tab)</span></a>{% else %}<span class="muted">No feature page</span>{% endif -%}
+  {%- if row.domain_doc %}<a class="link" href="{{ row.domain_doc }}" target="_blank" rel="noopener noreferrer">Roblox domain docs{{ icon("external") }}<span class="sr-only"> (opens in a new tab)</span></a>{% endif -%}
+</span>
+{%- endmacro %}
+
+{% call page_card(frame, flush=True) %}
+<div class="g3-pad">
+  <p class="muted g3-note">Every endpoint in Roblox's own reference, with what Roxy does with it now. Open a row to read why, see its history and change it. Changed rows say so next to their verdict.</p>
+</div>
+<div class="g3-table-host" hx-select="#{{ table.id }}">
+{% call(row) policy_table(table, rows, select=True) %}
+{%- if row is none -%}
+<th scope="col" data-col="docs"><span class="th-label">Roblox docs</span></th>
+{%- else -%}
+{%- for c in table.columns -%}
+<td data-col="{{ c.key }}" data-label="{{ c.label }}" class="{% if c.num %}num{% endif %}"{% if c.key_col or loop.first %} data-key{% endif %}{% if c.hidden %} hidden{% endif %}>
+  {%- if c.key == "method" -%}<button type="button" class="link-btn mono" data-dt-open>{{ row.method }}</button>
+  {%- elif c.key == "host" -%}<span class="mono">{{ row.host }}</span>
+  {%- elif c.key == "path" -%}<span class="mono policy-path">{{ row.path }}</span>
+  {%- elif c.key == "summary" -%}{{ row.summary or "n/a" }}{% if row.deprecated %} <span class="muted">(deprecated)</span>{% endif %}
+  {%- elif c.key == "verdict" -%}{{ tone(row.verdict_cell) }}{% if row.changed %}<span class="dt__sub">{{ "Your override" if row.source == "override" else "Category switch" }}</span>{% endif %}
+  {%- elif c.key == "default_verdict" -%}{{ tone(row.default_cell) }}
+  {%- elif c.key == "risk" -%}{{ tone(row.risk_cell) }}
+  {%- elif c.key == "category" -%}{{ row.category_label }}
+  {%- elif c.key == "roblox_auth" -%}{{ row.roblox_auth_words }}
+  {%- elif c.key == "refused_24h" -%}{{ num(row.refused_24h) }}
+  {%- endif -%}
+</td>
+{%- endfor -%}
+<td data-col="docs" data-label="Roblox docs">{{ doc_links(row) }}</td>
+{%- endif -%}
+{% endcall %}
+</div>
+<div class="policy-bulk g3-pad" data-policy-bulk-host>
+  <p class="policy-bulk__count" aria-live="polite"><span data-policy-picked-count>0</span> selected on this page</p>
+  <div class="grid grid--2">
+    <form class="stack g3-form" data-api-form data-api-url="{{ bulk_url }}" data-api-method="PUT" data-policy-bulk
+          data-success="The selected endpoints are blocked. Every worker follows within a second." data-on-success="refresh" data-refresh="endpoints summary categories" novalidate>
+      <input type="hidden" name="verdict" value="BLOCK" data-json="string">
+      <textarea name="endpoint_ids" hidden data-json="list" data-policy-picked aria-hidden="true"></textarea>
+      <div class="field">
+        <label class="field__label" for="policy-bulk-block-reason">Reason <span class="muted">(required, saved in the audit log)</span></label>
+        <input class="input" type="text" id="policy-bulk-block-reason" name="reason" maxlength="500" required data-json="string" autocomplete="off" aria-describedby="policy-bulk-block-reason-error">
+        <p class="field__error" id="policy-bulk-block-reason-error" data-field-error="reason" hidden></p>
+      </div>
+      <p class="field__error" data-field-error="endpoint_ids" hidden></p>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      <div class="cluster"><button type="submit" class="btn btn--danger" data-action="policy-block-selected">{{ icon("x-circle") }}<span>Block selected</span></button><span class="muted">Tightening needs no code.</span></div>
+    </form>
+    <form class="stack g3-form" data-api-form data-api-url="{{ bulk_url }}" data-api-method="DELETE" data-policy-bulk
+          data-success="The selected endpoints are back to their default." data-on-success="refresh" data-refresh="endpoints summary categories" novalidate>
+      <textarea name="endpoint_ids" hidden data-json="list" data-policy-picked aria-hidden="true"></textarea>
+      <div class="field">
+        <label class="field__label" for="policy-bulk-reset-reason">Reason <span class="muted">(saved in the audit log)</span></label>
+        <input class="input" type="text" id="policy-bulk-reset-reason" name="reason" maxlength="500" data-json="string" autocomplete="off">
+      </div>
+      <p class="field__error" data-field-error="endpoint_ids" hidden></p>
+      <p class="dialog__error" data-dialog-error role="alert" hidden></p>
+      <div class="cluster"><button type="submit" class="btn" data-action="policy-reset-selected">{{ icon("reset") }}<span>Reset selected to default</span></button><span class="muted">Asks for a code when a default is looser than now.</span></div>
+    </form>
+  </div>
+</div>
+{% endcall %}

@@ -291,7 +291,11 @@ def test_upstream_guard_refusal_renders_as_v1_refusal(fakes: Any) -> None:
     result = respond.ProxyResult(reason=ReasonCode.AUTH_SMUGGLING, status=400)
     rendered = respond.render(fakes.make_req(), result)
     assert rendered.status == 400
-    assert rendered.body == b'"Requests requiring authentication are not allowed with this proxy."\n'
+    assert rendered.body == (
+        b'"Roxy refused this request because it carried a Roblox login cookie or API key. Never send yours: Roxy uses '
+        b"its own account. If that was your real .ROBLOSECURITY cookie, sign out of all sessions on roblox.com to "
+        b'invalidate it. Roxy did not store it."\n'
+    )
     assert rendered.outcome is Outcome.REFUSED
 
 

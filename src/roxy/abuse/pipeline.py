@@ -85,6 +85,7 @@ from roxy.abuse.bot import SIGNALS, ClientTracker, has_game_server_signature, qu
 from roxy.abuse.bypass import bypass_entry
 from roxy.abuse.challenge import challenge_key
 from roxy.abuse.checks import default_checks
+from roxy.abuse.checks.auth_smuggling import inspect_auth_attempt
 from roxy.abuse.checks.base import (
     TABLE_ACCESS_LIST,
     Check,
@@ -94,6 +95,12 @@ from roxy.abuse.checks.base import (
     TxState,
     live_setting,
     trio_headers,
+)
+from roxy.abuse.checks.endpoint_policy import (
+    POLICY_BLOCKED_EVENT,
+    POLICY_UNKNOWN_EVENT,
+    POLICY_WOULD_BLOCK_EVENT,
+    decision_for,
 )
 from roxy.abuse.checks.probe import probe_signature
 from roxy.abuse.limiter import (
@@ -1087,6 +1094,17 @@ class AbusePipeline:
             # Every rule row this request matched (blocks, rate rules, header and User-Agent rules, bypass, deny and
             # ban entries): per rule per minute in memory, flushed by the recorder (FILTER-REMOVE, SEC-BYPASS-FOREVER).
             note_rule_hits(self.recorder, facts.matches, at_s=int(facts.now))
+        decision = facts.policy
+        if decision is not None:
+            detail = {"endpoint_id": decision.endpoint_id, "verdict": decision.verdict.value}
+            if decision.row is None:
+                # An operation Roblox does not document: listed on the Endpoint policy page for review.
+                self._aggregate(POLICY_UNKNOWN_EVENT, detail, facts)
+            if decision.blocked and not refused:
+                # Shadow mode (endpoint_policy_enforce off): what the policy would have refused.
+                self._aggregate(POLICY_WOULD_BLOCK_EVENT, detail, facts)
+            if isinstance(verdict, Refuse) and verdict.check == "endpoint_policy":
+                self._aggregate(POLICY_BLOCKED_EVENT, detail, facts)
         per_ip = next((o.per_ip for o in tx.outcomes.values() if o.per_ip is not None), None)
         if per_ip is not None and per_ip.new_strike and per_ip.rung.index:
             tier = per_ip.rung.index
@@ -1100,6 +1118,8 @@ class AbusePipeline:
         reason = verdict.reason if isinstance(verdict, Refuse) else None
         if isinstance(verdict, Refuse) and (reason in PROBE_REASONS or reason == ReasonCode.AUTH_SMUGGLING):
             self._probe(req, facts, verdict)
+        if isinstance(verdict, Refuse) and reason == ReasonCode.AUTH_SMUGGLING:
+            self._auth_attempt(req, facts)
         probe = reason in PROBE_REASONS or facts.probe_signature is not None
         bypass = bool(getattr(req, "bypass", False))
         query = list(getattr(req, "query", None) or ())
@@ -1187,6 +1207,30 @@ class AbusePipeline:
             record(facts.ip or facts.limit_key, text, user_agent, ("/" + target)[:PROBE_TEXT_CHARS])
         except Exception:
             log.exception("abuse_event_failed", extra={"fields": {"kind": "probe"}})
+
+    def _auth_attempt(self, req: Any, facts: Facts) -> None:
+        """A caller sent their own sign-in: the Endpoint policy page's Caller sign-in attempts card (D1 revised).
+
+        Memory only, like a probe: the recorder keeps a keyed fingerprint of the value, never the value.
+        """
+        record = getattr(self.recorder, "record_auth_attempt", None)
+        if record is None:
+            return
+        try:
+            attempt = inspect_auth_attempt(req, facts.int("max_body_bytes"))
+            if attempt is None:
+                return
+            decision = decision_for(req, facts) if getattr(req, "target_problem", None) is None else None
+            record(
+                facts.ip or facts.limit_key,
+                attempt,
+                method=str(getattr(req, "method", "") or ""),
+                endpoint_id=decision.endpoint_id if decision is not None else "",
+                user_agent=str(getattr(req, "user_agent", "") or "") or None,
+                place=getattr(req, "place_id", None),
+            )
+        except Exception:
+            log.exception("abuse_event_failed", extra={"fields": {"kind": "auth_attempt"}})
 
     def _throttled(self, ip: str, tier: int, strikes: int) -> None:
         """`record_throttled`: a client that just became throttled (v1 `throttled_ips`, plan row 80)."""

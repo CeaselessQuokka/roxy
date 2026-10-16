@@ -130,13 +130,13 @@ async def test_up_429_credential_numbers() -> None:
     assert rec.subject == "credential"
     setting = _change(rec, "setting", key="credential_bucket_per_min")
     assert (setting.current, setting.proposed) == (20, 14)
-    removed = _change(rec, "credential_allowlist_remove")
-    assert removed.match == {"pattern": "games.roblox.com/v1/games/*/favorites/count", "type": "glob"}
-    assert removed.current["id"] == 3
+    (anonymous,) = [c for c in rec.changes if c.kind == "manual"]  # one per limited operation that needs no sign-in
+    assert "set games:GET:/v1/games/{universeId}/favorites/count to 'Sent without an account'" in str(anonymous.text)
     (allowlisted,) = await run_case("up_429_credential__allowlisted_endpoint")
     assert allowlisted.evidence.metric("credential_429") == 3
     assert allowlisted.evidence.metric("retry_after_max_s") == 60
     assert allowlisted.evidence.metric("credential_bucket_fill_peak_pct") == 100
+    assert [c.kind for c in allowlisted.changes] == ["setting"]  # the operation needs a sign-in: it keeps the account
 
 
 async def test_up_429_amplify_numbers() -> None:

@@ -2077,6 +2077,9 @@ Notation: "v1 -> v2" shows the old default and the new default (same value means
 | `credential_probe_url` (was constant `TOKEN_PROBE_URL`) | Liveness endpoint; must return the account's user id so H-CRED-AUTH can confirm it is the same account | `accountinformation.roblox.com/v1/birthdate` -> `users.roblox.com/v1/users/authenticated` | a GET URL on an allowed host | n/a | n/a | Live |
 | `credential_probe_reserved_per_min` (new) | Share of the credential bucket reserved for Roxy's own probes (7.3, 13.3) | n/a -> 2 | 1 to 10 (must be below `credential_bucket_per_min`) | Probes never wait; less left for allowlisted traffic | Probes may wait behind each other | Live |
 | `credential_cooldown_default_s` (was `token_expiration_cooldown`) | Cooldown after a credential 429 with no Retry-After | 15 -> 60 | 5 to 3600 | Longer rest for the account | Returns sooner (risk of repeat 429s) | Live |
+| `endpoint_policy_enforce` (new, D1 revised 2026-10-16) | Refuse endpoints the endpoint policy blocks (0 = shadow mode: forward without the account and count) | n/a -> 1 | 0, 1 | n/a | Blocked endpoints reach Roblox anonymously | Live |
+| `endpoint_policy_block_status` (new, D1 revised 2026-10-16) | Status code of a blocked endpoint | n/a -> 403 | 403, 404, 500 | n/a | n/a | Live |
+| `endpoint_policy_block_message` (new, D1 revised 2026-10-16) | Body of a blocked endpoint's refusal | n/a -> a sentence | up to 400 characters | n/a | n/a | Live |
 
 #### C. Upstream pacing and resilience
 

@@ -15,8 +15,9 @@ Why it exists
 
 How it works (one fetch)
     1. Normalize the target (`host`, `/path`, endpoint template, URL with the caller's query in order) and read
-       the settings and rules snapshots once. The credential allowlist (exact grants) and routing rule lookups
-       run under `regex_budget` (plan 9.9); a match cut off by it never grants the credential.
+       the settings and rules snapshots once. The credential grant (the endpoint policy's ALLOW_TOKEN verdict,
+       `roxy/policy/engine.py`) and routing rule lookups run under `regex_budget` (plan 9.9); a match cut off by it
+       never grants the credential.
     2. Route (`_route`): one hot.db READ gives every relevant cooldown, breaker and bucket TAT; `routing.decide`
        picks an egress; `buckets.reserve` takes the slot in ONE hot.db WRITE transaction that also inserts the
        single-flight lease (when the cache passed a hook), re-checks cooldowns, takes the half-open probe lease of
@@ -31,7 +32,7 @@ How it works (one fetch)
        the request deadline. A CSRF 403 is retried once with the new token (a new bucket slot); a 3xx is followed
        here, not by the egress, so every hop takes a bucket slot, and only to a URL that passes the same checks as
        a caller's own path (`proxy/validate.py parse_redirect`: an allowed Roblox host, no encoded slash or
-       dot segment) and, on the credential path, whose decoded path the allowlist grants; a Location that does
+       dot segment) and, on the credential path, whose decoded path has its own grant; a Location that does
        not parse or pass is simply not followed. A CSRF retry is recorded for the Upstream page (`record_retry`,
        row 117).
     5. Classify (`status.py`; `pages.py` flags a challenge or an HTML page on a JSON endpoint on the call's trace
@@ -81,6 +82,7 @@ from roxy.core.clock import Clock
 from roxy.core.ids import new_request_id
 from roxy.core.reasons import AuthClass, Egress, ReasonCode
 from roxy.metrics.recorder import note_attempts, note_reservation
+from roxy.policy.engine import READ_METHODS
 from roxy.proxy import scrub
 from roxy.proxy.validate import parse_redirect
 from roxy.rules.match import regex_budget
@@ -238,7 +240,7 @@ class UpstreamResult:
     negative_ttl_s: int | None = None
     cooldown_source: str = ""  # added: why a cooldown answer lasts as long as it does (Upstream page explainer)
     private: bool = False
-    """Fetched with the credential under a `cache_private` allowlist row, or with no row (probes): the answer
+    """Fetched with the credential under a `cache_private` grant, or with no grant (probes): the answer
     belongs to its own request and is never stored or handed to a follower (plan 6.9, 9.13; review finding cred-4).
     Only the upstream knows the row it actually routed under; the cache also re-reads the row when the answer
     arrives (`CacheService._row_now_private`)."""
@@ -707,8 +709,8 @@ class UpstreamService:
         if not is_roblox_https_url(url, allowed):
             raise ValueError("internal_fetch needs an https URL on an allowed roblox.com host")
         upper = method.upper()
-        if use_credential and upper not in routing.CREDENTIAL_METHODS:
-            raise ValueError("the credential is only ever used for GET or HEAD (plan D1)")
+        if use_credential and upper not in READ_METHODS:
+            raise ValueError("Roxy's own credential calls are only ever GET or HEAD (plan D1)")
         parts = urlsplit(url)
         host = (parts.hostname or "").lower().rstrip(".")
         path = parts.path or "/"
@@ -741,8 +743,11 @@ class UpstreamService:
         rules = self._rules()
         egresses = [Egress.DIRECT, Egress.ROTATOR]
         method = str(getattr(req, "method", "GET")).upper()
-        if rules is not None and self._credential_row(rules, target, method) is not None:
-            egresses = [Egress.CREDENTIAL]  # an allowlisted endpoint is only ever fetched with the credential
+        grant = self._credential_row(rules, target, method) if rules is not None else None
+        if grant is not None:
+            # A granted endpoint is fetched with the credential first; one Roblox also answers without a sign-in
+            # falls back to the anonymous egresses when the account cannot take it (`identical_anonymous`).
+            egresses = [Egress.CREDENTIAL, *(egresses if grant.identical_anonymous else ())]
         enabled_list = [egress for egress in egresses if self._egress_enabled(egress, cfg)[0]]
         if not enabled_list:
             return Availability(False, 0.0, 60.0, ("all egress disabled",))
@@ -906,7 +911,7 @@ class UpstreamService:
 
     @staticmethod
     def _credential_row(rules: Any, target: str, method: str) -> Any:
-        """The credential allowlist row for `target`, matched under the request's regex budget (plan 9.9).
+        """The credential grant for `target` (the endpoint policy), matched under the request's regex budget (plan 9.9).
 
         A match cut off by the timeout or a spent budget never grants the credential (fail closed, C1).
         """
@@ -992,7 +997,7 @@ class UpstreamService:
                 if not (cfg.fallback_on_429 and mode != "internal_cred" and state.attempts < cfg.max_attempts):
                     return result
                 if egress is Egress.CREDENTIAL and not (credential_rule and credential_rule.identical_anonymous):
-                    return result  # an allowlisted endpoint never falls back to anonymous (plan 6.9)
+                    return result  # a sign-in-only endpoint never falls back to anonymous (plan 6.9)
                 if state.shared_unwritable:
                     return result  # the fallback could not be paced (C7): Roblox's 429 goes back as it is
                 state.exclude.update({egress, Egress.CREDENTIAL})  # never onto the credential (plan 7.9)
@@ -1632,7 +1637,7 @@ class UpstreamService:
         Every hop is re-validated with the caller path's own checks (`proxy/validate.py parse_redirect`, which
         resolves the Location and runs `parse_upstream_url`; plan 9.10 "redirects are re-validated"): https on port
         443, an allowed Roblox host, and a path without encoded slashes, `%`, `?` or `#` in a segment and without
-        `.` or `..` segments (v1 bug B4). The credential allowlist is matched on the hop's decoded, normalized
+        `.` or `..` segments (v1 bug B4). The credential grant is decided on the hop's decoded, normalized
         target, exactly as a caller path is, and the URL followed is the one rebuilt from that parse, so what is
         fetched is what was checked (finding cred-3: the raw, still encoded path let a `*` or `(?:/.*)?` grant
         `.../%2E%2E/%2E%2E/v2/secret`, which a server that decodes before removing dot segments serves as an
@@ -1640,7 +1645,7 @@ class UpstreamService:
         parse (`//[`) is the `unsafe_url` problem of `parse_redirect` (ingress review).
         """
         location = exchange.headers.get("location", "").strip()
-        if not location or call.method not in routing.CREDENTIAL_METHODS:
+        if not location or call.method not in READ_METHODS:
             return None
         cfg = call.cfg
         parsed = parse_redirect(
@@ -1659,7 +1664,7 @@ class UpstreamService:
             if call.mode != "internal_cred" and (
                 call.rules is None or self._credential_row(call.rules, new_target, call.method) is None
             ):
-                return None  # never carry the credential off the allowlist (plan C2 item 7)
+                return None  # never carry the credential to a hop without its own grant (plan C2 item 7)
             if call.mode == "internal_cred" and new_target != call.rules_target:
                 return None
         return target
@@ -1720,7 +1725,7 @@ class UpstreamService:
             if exchange.kind is AttemptKind.REDIRECT and hops < MAX_REDIRECT_HOPS:
                 target = self._redirect_url(call, egress, url, exchange)
                 if target is None:
-                    # Not followed (malformed, not an allowed Roblox host, off the allowlist): Roblox's own 3xx
+                    # Not followed (malformed, not an allowed Roblox host, without its own grant): Roblox's own 3xx
                     # answer goes back like any other answer, after the normal bookkeeping below.
                     call.trace.note("redirect not followed")
                     break

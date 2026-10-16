@@ -10,20 +10,22 @@ What this is
 
 Why it exists
     The review has to prove invariants across package boundaries: a caller request (any verb, path encoding,
-    routing rule or fallback) never leaves with the cookie, the cookie never goes through the rotator, the
-    credential never lands in a log, a database row, a capture or an admin answer. Only the real objects wired
+    routing rule or fallback) leaves with the cookie only when the endpoint policy says ALLOW_TOKEN for it (D1
+    revised), a BLOCK endpoint never leaves at all, the cookie never goes through the rotator, the credential never
+    lands in a log, a database row, a capture or an admin answer. Only the real objects wired
     together can show that, and only a mock that records every request (headers included) can show what was sent.
 
 How it works
     `running_app` sets the development-only egress override (`ROXY_TEST_UPSTREAM_BASE` sends direct and credential
     traffic to the mock; `ROXY_TEST_ROTATOR_PROXY` sends rotator traffic through the recording proxy, which also
-    forwards to the mock), removes the mail and webhook credentials (alerts go to the log), builds `create_app`
-    with a `FakeClock`, runs the lifespan, and turns the tarpit off. Requests rotated through documentation
+    forwards to the mock), removes the mail and webhook credentials (alerts go to the log), builds `create_app` with a
+    `FakeClock`, runs the lifespan, and turns the tarpit off. The endpoint policy is the shipped seed; a test changes
+    verdicts with `rule("endpoint_policy_override", ...)` like an admin would. Requests rotated through documentation
     address ranges (RFC 5737) in `X-Forwarded-For` so per-IP limits never interfere. Requests that went through the
     proxy carry its `X-Exit-Ip` header at the mock, so a test can tell the rotator path apart from the server IP.
-    `leak_scan` uses the same sampling idea as the leak guard: a 24 character run of the secret always contains one
-    of the secret's 12 character pieces that start at a multiple of 12, so the blob is searched for those pieces
-    first (fast, C level) and only a hit is confirmed against every 24 character window around it.
+    `leak_scan` uses the same sampling idea as the leak guard: a 24 character run of the secret always contains one of
+    the secret's 12 character pieces that start at a multiple of 12, so the blob is searched for those pieces first
+    (fast, C level) and only a hit is confirmed against every 24 character window around it.
 
 What to read next
     `tests/security/test_confinement_routing.py` (the main battery), `tests/fixtures/recording_proxy.py` (the
@@ -62,7 +64,8 @@ WINDOW = 24
 PIECE = 12
 NETS = ("192.0.2", "198.51.100", "203.0.113")  # documentation ranges (RFC 5737): never real clients
 PROBE_PATH = "/v1/users/authenticated"
-"""The default `credential_probe_url` path (Roxy's own credential probe, the one allowed credential use, D1)."""
+"""The default `credential_probe_url` path: Roxy's own credential probe. The endpoint policy blocks it for callers
+(`users GET /v1/users/authenticated` is BLOCK), so a cookie request to it is always Roxy's own."""
 
 
 def load_fixture(name: str, folder: str = "fixtures") -> ModuleType:

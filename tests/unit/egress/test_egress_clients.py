@@ -147,7 +147,7 @@ async def test_credential_path_attaches_the_cookie_and_drops_set_cookie(
     assert [alert.subject for alert in notifier.alerts] == ["Roxy: Roblox sent a new credential cookie"]
     assert egress.credential.status().fingerprint == egress.credential.fingerprint_of(secret)
     count = len(mock_upstream.requests)
-    for method in ("POST", "PUT", "DELETE"):  # the account cookie never rides on a write (D1, 9.13)
+    for method in ("PUT", "PATCH", "DELETE"):  # the account cookie never rides on a write (D1, 9.13)
         with pytest.raises(TargetNotAllowed):
             await egress.send(Egress.CREDENTIAL, out("https://users.roblox.com/v1/users/1", method, content=b"{}"))
     assert len(mock_upstream.requests) == count

@@ -10,7 +10,9 @@ Why it exists
     scoring to the account, so these settings keep account use tiny, evenly paced and visible, and every value
     an admin can choose explains what it does to the account before it is saved (plan P3 and 15.1). In v1 the
     account carried 75% of cache misses in unpaced bursts, which plan 2.5 ranks as the top cause of the Roblox
-    429s; decision D1 confines it to Roxy's own probes plus an allowlist that starts empty.
+    429s. Decision D1 (revised 2026-10-16) sends it only for endpoints the endpoint policy marks "sent with Roxy's
+    account" (`roxy/policy/`), paced by these settings, with an anonymous fallback when the account is busy. The
+    three `endpoint_policy_*` settings at the end decide how blocked endpoints are refused.
 
 How it works
     `SETTINGS` is a plain list of frozen `SettingSpec` objects. `roxy/config/catalog.py` collects it with the
@@ -27,12 +29,13 @@ What to read next
     `roxy/upstream/buckets.py` (where these values are used).
 """
 
-from roxy.config.spec import Apply, Group, Risk, RiskCondition, RiskOp, SettingSpec, SettingType
+from roxy.config.spec import Apply, Group, OptionSpec, Risk, RiskCondition, RiskOp, SettingSpec, SettingType
 
 # Dashboard anchors (DESIGN.md section 9, plan 15.6). Every `credential_*` key lives on the Credential page.
 _STATUS = "credential#status"
 _BUDGET = "credential#budget"
 _COOLDOWNS = "upstream#cooldowns"
+_POLICY = "policy#summary"
 
 # The v2 liveness endpoint (plan 13.4): it answers with the logged-in account's user id, which lets the
 # H-CRED-AUTH check confirm the cookie still belongs to the same account (C1), not just that it works.
@@ -49,21 +52,21 @@ SETTINGS: list[SettingSpec] = [
         type=SettingType.BOOL,
         default=1,
         description=(
-            "Master switch for Roxy's single Roblox account cookie (the credential). When on, Roxy may send it "
-            "for its own liveness checks and for endpoints on the credential allowlist, which is empty by "
-            "default, so public traffic never carries it. When off, no request Roxy makes to Roblox carries "
-            "the account."
+            "Master switch for Roxy's single Roblox account cookie (the credential). When on, Roxy sends it "
+            "for its own liveness checks and with caller requests to endpoints the endpoint policy marks 'sent "
+            "with Roxy's account' (public reads such as catalog search and followers lists). Blocked endpoints "
+            "never reach Roblox at all. When off, no request Roxy makes to Roblox carries the account."
         ),
         pages=(_STATUS,),
         if_enabled=(
             "Scheduled liveness checks run every credential_probe_interval_min minutes and the Credential page "
-            "shows whether the account still works. Requests to allowlisted endpoints (none by default) go out "
-            "from the server's own IP with the account, paced by the credential rate limit."
+            "shows whether the account still works. Requests to endpoints sent with the account go out from the "
+            "server's own IP with it, paced by the credential rate limit."
         ),
         if_disabled=(
             "The account is never sent. Liveness checks and the credential health checks stop, so an expired "
-            "or rejected cookie is not noticed until this is turned back on. Requests to allowlisted endpoints "
-            "go out without the account, so endpoints that need a logged-in account fail for callers. The "
+            "or rejected cookie is not noticed until this is turned back on. Requests the policy would send with "
+            "the account go out without it, so endpoints that need a logged-in account fail for callers. The "
             "stored credential is kept; turning this off does not delete or replace it."
         ),
         risk=Risk.MEDIUM,
@@ -91,19 +94,20 @@ SETTINGS: list[SettingSpec] = [
         description=(
             "The steady pace at which Roxy may send requests that carry the Roblox account, shared by all "
             "workers. Requests are spaced evenly (at 20 per minute, one every 3 seconds) instead of being "
-            "allowed in clumps, and every credential call counts: allowlisted traffic, liveness checks, health "
+            "allowed in clumps, and every credential call counts: caller traffic, liveness checks, health "
             "checks and admin lookups."
         ),
         pages=(_BUDGET,),
         if_raised=(
-            "Allowlisted endpoints wait less, but the account makes more calls per minute from one server IP, "
+            "More caller requests carry the account, but the account makes more calls per minute from one server IP, "
             "which raises the chance of Roblox 429 answers on the account and of Roblox treating it as "
             "automated. v1 allowed about 88 per minute, and that account traffic was the largest cause of its "
             "Roblox 429s."
         ),
         if_lowered=(
-            "The account is quieter and safer. Allowlisted requests wait longer for a turn, and when the wait "
-            "runs out callers get a 429 with Retry-After instead of an answer. The value must stay above "
+            "The account is quieter and safer. More caller requests go out anonymously instead; a request to an "
+            "endpoint that only answers signed-in users waits longer for a turn, and when the wait runs out the "
+            "caller gets a 429 with Retry-After instead of an answer. The value must stay above "
             "credential_probe_reserved_per_min so Roxy's own checks keep their reserved share."
         ),
         risk=Risk.MEDIUM,
@@ -146,7 +150,7 @@ SETTINGS: list[SettingSpec] = [
             "How many credential requests may go out back to back before the even pacing of "
             "credential_bucket_per_min applies. It lets a short cluster of calls through without waiting while "
             "the average stays at the configured rate. The burst is shared with Roxy's own credential checks: "
-            "allowlisted traffic gets this burst minus 1 and the checks' reserved sub-bucket gets 1 (at 1, a "
+            "caller traffic gets this burst minus 1 and the checks' reserved sub-bucket gets 1 (at 1, a "
             "check also takes the traffic's slot), so no more than this many account calls ever leave back to "
             "back."
         ),
@@ -158,7 +162,7 @@ SETTINGS: list[SettingSpec] = [
         ),
         if_lowered=(
             "Account calls are spread out more smoothly. At 1, every credential call waits its full turn (3 "
-            "seconds apart at the default rate), so allowlisted callers may wait longer."
+            "seconds apart at the default rate), so callers may wait longer."
         ),
         risk=Risk.MEDIUM,
         high_risk_if=(
@@ -196,7 +200,7 @@ SETTINGS: list[SettingSpec] = [
         pages=(_STATUS,),
         if_raised=(
             "Fewer account calls (48 per day at 30 minutes, 24 at 60), but an expired or rejected cookie is "
-            "noticed later, so allowlisted endpoints may fail for longer before you are alerted."
+            "noticed later, so endpoints sent with the account may fail for longer before you are alerted."
         ),
         if_lowered=(
             "Expiry is noticed sooner, at the cost of more account calls: every 5 minutes is 288 calls per day "
@@ -224,7 +228,7 @@ SETTINGS: list[SettingSpec] = [
         notes=(
             "Scheduled health runs call Roblox with the account only when health_auto_include_credential is 1. "
             "With credential_enabled at 0 no check runs, whatever this value is. Expected account use at the "
-            "defaults with an empty allowlist is about 50 to 60 calls per day."
+            "defaults, counting only Roxy's own checks, is about 50 to 60 calls per day."
         ),
     ),
     SettingSpec(
@@ -277,16 +281,16 @@ SETTINGS: list[SettingSpec] = [
         step=1,
         description=(
             "The part of credential_bucket_per_min kept for Roxy's own credential checks (scheduled liveness "
-            "checks and health checks), in a separate sub-bucket. A check never waits behind allowlisted "
-            "traffic, and allowlisted traffic can never use up the checks' share; it gets the rest of the rate."
+            "checks and health checks), in a separate sub-bucket. A check never waits behind caller "
+            "traffic, and caller traffic can never use up the checks' share; it gets the rest of the rate."
         ),
         pages=(_BUDGET,),
         if_raised=(
             "More checks can run in the same minute without waiting, but less of the credential rate is left "
-            "for allowlisted endpoints (at 20 per minute with a reserve of 5, only 15 remain)."
+            "for caller traffic (at 20 per minute with a reserve of 5, only 15 remain)."
         ),
         if_lowered=(
-            "More of the credential rate goes to allowlisted traffic. When several checks start together, for "
+            "More of the credential rate goes to caller traffic. When several checks start together, for "
             "example a health run during a scheduled check, they wait behind each other, which only delays "
             "the result."
         ),
@@ -308,13 +312,13 @@ SETTINGS: list[SettingSpec] = [
         description=(
             "How long Roxy stops using the credential, on every worker, after Roblox answers a credential "
             "request with 429 (too many requests) and no Retry-After header. When Roblox does say how long to "
-            "wait, Roxy waits that long instead. During the rest, allowlisted endpoints answer 503 with "
-            "Retry-After."
+            "wait, Roxy waits that long instead. During the rest, caller requests go out anonymously, and "
+            "endpoints that only answer signed-in users answer 503 with Retry-After."
         ),
         pages=(_BUDGET, _COOLDOWNS),
         if_raised=(
-            "The account rests longer after a 429, which makes a repeat 429 less likely, but allowlisted "
-            "endpoints are unavailable to callers for longer."
+            "The account rests longer after a 429, which makes a repeat 429 less likely, but endpoints that "
+            "only answer signed-in users are unavailable to callers for longer."
         ),
         if_lowered=(
             "The account is used again sooner after a 429. Coming back too early tends to earn another 429, "
@@ -344,5 +348,97 @@ SETTINGS: list[SettingSpec] = [
             "an extra account call to re-check the cookie. In v2 the rest is shared by every worker and a 429 "
             "is never mistaken for an expired cookie. The meaning changed, so the v1 value is never imported."
         ),
+    ),
+    # --- The endpoint policy (D1 revised 2026-10-16, docs/endpoint_policy/BRIEF.md) ---------------------------
+    SettingSpec(
+        key="endpoint_policy_enforce",
+        group=Group.CREDENTIAL,
+        label="Refuse blocked endpoints",
+        type=SettingType.BOOL,
+        default=1,
+        description=(
+            "Whether Roxy refuses caller requests to endpoints the endpoint policy blocks (sign-in, account, "
+            "money and creator endpoints). Blocked endpoints never carry Roxy's account either way: this only "
+            "decides whether they are refused, or forwarded without the account and recorded as 'would block'."
+        ),
+        pages=(_POLICY,),
+        if_enabled=(
+            "Callers asking for a blocked endpoint get the refusal set by endpoint_policy_block_status and "
+            "endpoint_policy_block_message, and nothing reaches Roblox."
+        ),
+        if_disabled=(
+            "Shadow mode: blocked endpoints are forwarded without the account (like any anonymous request) and "
+            "each one is recorded as 'would block' on the Endpoint policy page, so you can see what the policy "
+            "would refuse before you turn it on. Roblox answers most of them with 401."
+        ),
+        risk=Risk.MEDIUM,
+        high_risk_if=(
+            RiskCondition(
+                RiskOp.EQ,
+                0,
+                "Strangers can then reach login, logout and account endpoints through Roxy's server address "
+                "(without Roxy's account), which Roblox may hold against that address.",
+            ),
+        ),
+        apply=Apply.LIVE,
+        related_settings=("endpoint_policy_block_status", "endpoint_policy_block_message", "credential_enabled"),
+        related_recommendations=("SEC-DEFAULTS",),
+    ),
+    SettingSpec(
+        key="endpoint_policy_block_status",
+        group=Group.CREDENTIAL,
+        label="Status code for blocked endpoints",
+        type=SettingType.ENUM,
+        default="403",
+        options=(
+            OptionSpec(
+                "403",
+                "403 Forbidden",
+                "The honest answer: Roxy understood the request and will not forward it. HTTP libraries and Roblox "
+                "games do not retry a 403.",
+            ),
+            OptionSpec(
+                "404",
+                "404 Not Found",
+                "Treats a blocked endpoint as if it did not exist through Roxy. Not retried either, but it hides "
+                "that the endpoint was refused on purpose.",
+            ),
+            OptionSpec(
+                "500",
+                "500 Internal Server Error",
+                "Looks like a Roxy failure. Many HTTP libraries and Roblox games retry a 500, so one blocked call "
+                "can turn into a loop, and these refusals count as server errors on Health and Overview.",
+            ),
+        ),
+        description="The HTTP status code a caller gets for an endpoint the endpoint policy blocks.",
+        pages=(_POLICY,),
+        risk=Risk.LOW,
+        high_risk_if=(
+            RiskCondition(
+                RiskOp.EQ,
+                "500",
+                "Callers retry 500 answers, and they show up as server errors in Roxy's own health numbers.",
+            ),
+        ),
+        apply=Apply.LIVE,
+        related_settings=("endpoint_policy_enforce", "endpoint_policy_block_message"),
+        related_recommendations=("SEC-DEFAULTS",),
+    ),
+    SettingSpec(
+        key="endpoint_policy_block_message",
+        group=Group.CREDENTIAL,
+        label="Message for blocked endpoints",
+        type=SettingType.STRING,
+        default=(
+            "Roxy does not forward this Roblox endpoint because it acts on a signed-in account or returns private "
+            "account data. See the Roxy guide for the list of blocked endpoints."
+        ),
+        max_length=400,
+        description="The body of the refusal a caller gets for an endpoint the endpoint policy blocks.",
+        pages=(_POLICY,),
+        risk=Risk.LOW,
+        apply=Apply.LIVE,
+        related_settings=("endpoint_policy_block_status",),
+        notes="Callers see this text. Must not contain em or en dash characters (style rule C5).",
     ),
 ]

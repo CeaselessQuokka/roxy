@@ -21,7 +21,9 @@ import httpx
 from roxy.config import catalog
 from roxy.core.clock import FakeClock
 from roxy.core.reasons import Egress
-from roxy.rules.models import CredentialAllowlistRow, RoutingRuleRow, UpstreamLimitRow
+from roxy.policy.engine import CredentialGrant
+from roxy.rules.match import PatternIndex
+from roxy.rules.models import RoutingRuleRow, UpstreamLimitRow
 from roxy.rules.store import RulesSnapshot
 from roxy.upstream.service import UpstreamService
 
@@ -91,23 +93,42 @@ class FakeSettings:
         return list(self._values[key])
 
 
+@dataclass(frozen=True, slots=True)
+class GrantSnapshot(RulesSnapshot):
+    """A rules snapshot whose credential grants are the test's own, not the endpoint policy's.
+
+    The upstream tests are about what the upstream does GIVEN a grant (routing, fallback, privacy, redirects), so a
+    grant is exactly what the test asked for with `FakeRules.allow_credential` (an exact glob per row, methods per
+    row), and no endpoint carries the credential otherwise. The policy itself is tested in `tests/unit/policy/`.
+    """
+
+    test_grants: tuple[CredentialGrant, ...] = ()
+
+    def credential_rule_for(self, target: str, method: str) -> CredentialGrant | None:
+        index = PatternIndex(((g.id, g.pattern, "glob", g) for g in self.test_grants), exact=True)
+        grant = index.best(target)
+        if grant is None or method.upper() not in grant.methods:
+            return None
+        return grant
+
+
 class FakeRules:
     """A rules store over hand-made rows (`snapshot` is a property, like `RulesStore`)."""
 
     def __init__(self) -> None:
-        self.credential_rows: list[CredentialAllowlistRow] = []
+        self.credential_rows: list[CredentialGrant] = []
         self.routing_rows: list[RoutingRuleRow] = []
         self.limits: dict[str, UpstreamLimitRow] = {}
         self._version = 0
         self._snapshot = self._build()
 
     def _build(self) -> RulesSnapshot:
-        return RulesSnapshot(
+        return GrantSnapshot(
             version=self._version,
             loaded_at=0.0,
             routing_rules=tuple(self.routing_rows),
-            credential_allowlist=tuple(self.credential_rows),
             upstream_limits=MappingProxyType(dict(self.limits)),
+            test_grants=tuple(self.credential_rows),
         )
 
     def rebuild(self) -> None:
@@ -122,11 +143,11 @@ class FakeRules:
         self, pattern: str, *, cache_private: bool = True, identical_anonymous: bool = False, methods: str = "GET"
     ) -> None:
         self.credential_rows.append(
-            CredentialAllowlistRow(
+            CredentialGrant(
                 id=len(self.credential_rows) + 1,
                 pattern=pattern,
-                type="glob",
-                methods=methods,
+                endpoint_id=f"test:{pattern}",
+                methods=tuple(part.strip().upper() for part in methods.split(",") if part.strip()),
                 cache_private=cache_private,
                 identical_anonymous=identical_anonymous,
             )
