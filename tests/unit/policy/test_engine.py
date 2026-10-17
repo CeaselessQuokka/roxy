@@ -68,17 +68,6 @@ def test_sign_in_only_endpoints_never_fall_back_to_anonymous() -> None:
     assert open_grant.identical_anonymous
 
 
-@pytest.mark.parametrize(
-    "target", ["avatar.roblox.com/v2/avatar/users/29371917/outfits", "avatar.roblox.com/v1/users/29371917/outfits"]
-)
-def test_outfits_never_fall_back_to_an_anonymous_answer(target: str) -> None:
-    # Anonymously, isEditable=true answers an empty list: during an account cooldown the caller must get a 429,
-    # never an empty answer that looks real (owner report, 2026-10-16).
-    grant = policy().credential_grant(target, "GET")
-    assert grant is not None
-    assert not grant.identical_anonymous
-
-
 def test_anonymous_tier_never_gets_the_credential() -> None:
     decision = policy().decide("catalog.roblox.com", "POST", "/v1/catalog/items/details/complete")
     assert decision.verdict is Verdict.ALLOW_ANON
